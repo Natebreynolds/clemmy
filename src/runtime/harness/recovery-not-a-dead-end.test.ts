@@ -52,6 +52,23 @@ test('THE 148817 CASE: the surface admits the tools recovery advice names', () =
   assert.ok(permitted.has('file_query'));
 });
 
+test('after a failed command, the model may re-read the local files it was told to check', () => {
+  // The projection of a non-mutating business call that failed: the carrier
+  // and one search are named, and the failure says to check the current state.
+  const permitted = hostNoProgressRecoveryToolNames(
+    createNoProgressConsequence({
+      stage: 'execution:unknown_read', recovery: 'repair_model', effectState: 'known_terminal',
+      recoveryToolNames: ['work_call', 'tool_search'],
+    }),
+    ['read_file', 'list_files', 'work_call', 'write_file', 'http_read', 'delegated_task_correct', 'workflow_create'],
+  );
+  assert.ok(permitted.has('read_file'), 'the failure says to check the current state; reading the file is that check');
+  assert.ok(permitted.has('list_files'));
+  for (const other of ['write_file', 'http_read', 'delegated_task_correct', 'workflow_create']) {
+    assert.ok(!permitted.has(other), `${other} is not a local re-read and stays out of this recovery`);
+  }
+});
+
 test('retained-result readers do not smuggle in writes', () => {
   const permitted = hostNoProgressRecoveryToolNames(
     consequence(['file_query']),

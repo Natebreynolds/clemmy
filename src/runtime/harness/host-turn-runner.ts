@@ -684,7 +684,7 @@ import {
   isPlainOrClementineLocalTool,
 } from './runtime-tool-identity.js';
 import { classifyDiscoveryCall } from './discovery-boundary.js';
-import { hostControlFrameFor, hostReadOnlyExecutionContractFor, isRegistryDeclaredTool, isRegistryDeclaredRead } from '../../tools/tool-registry.js';
+import { hostControlFrameFor, hostReadOnlyExecutionContractFor, isRegistryDeclaredTool, isRegistryDeclaredRead, registeredToolReadRevision } from '../../tools/tool-registry.js';
 import { readPersistedHealth } from '../../integrations/cli-catalog/auth-health.js';
 import {
   isHostPlanRequiredWorkCall,
@@ -1192,6 +1192,14 @@ export function hostNoProgressRecoveryToolNames(
     // A retained reader crosses nothing, so it is admissible on every
     // recovery surface regardless of how the last call settled.
     if (toolReadsRetainedOutput(bare)) return true;
+    // LOOKING AT THE LOCAL FILES AGAIN IS ALWAYS PERMITTED IN RECOVERY.
+    //
+    // A step whose effect is unknown, such as a shell command that exited
+    // non-zero, says to check the current state before running it again.
+    // Reading a local path is how that check is made: it crosses nothing and
+    // changes nothing. Refusing it left the model unable to follow the
+    // failure's own advice, and each refused read became the next failure.
+    if (registeredToolReadRevision(bare)?.source === 'local_path') return true;
     if (consequence.effectState !== 'not_started' || consequence.recovery !== 'repair_model') return false;
     // The failed spelling is not necessarily a published callable. Keep the
     // configured discovery/carrier doors available so the model can recover
