@@ -35,6 +35,8 @@ export interface FromClemRow {
   answer?: { kind: 'words'; questionId: string } | { kind: 'yes_no'; planProposalId: string };
   /** Marks a finding seen; its heartbeat counts it acknowledged. */
   done?: { notificationId: string };
+  /** A part of Clementine Clem offers to help set up, and where it lives. */
+  setup?: { ability: string; place: string; placeName: string };
 }
 
 export interface FromClemPulse {
@@ -64,6 +66,11 @@ export interface FromClemInput {
   /** Rows the owner moved to later: hidden until then, still covered, so they
    *  do not reappear in Home's other lists meanwhile. */
   later?: (key: string) => boolean;
+  /** The one part Clem offers to help set up next, if any. */
+  setup?: {
+    ability: string; name: string; unlocks: string; detail: string;
+    state: 'not_set_up' | 'needs_attention'; place: string; placeName: string; since: string;
+  } | null;
 }
 
 /** Bumped when what she is asked to say changes, so every item is said again. */
@@ -144,9 +151,21 @@ export function buildFromClem(input: FromClemInput): FromClem {
     covers.planProposalIds.push(plan.id);
   }
 
+  if (input.setup) {
+    const setup = input.setup;
+    rows.push({
+      key: `setup:${setup.ability}`, heartbeat: 'setup', heartbeatTitle: 'Set up next',
+      at: setup.since, asks: false,
+      text: setup.state === 'needs_attention' ? `${setup.name} needs attention` : `${setup.name} is not set up yet`,
+      detail: `${setup.detail} It gives you: ${setup.unlocks}. Set it up in ${setup.placeName}.`,
+      setup: { ability: setup.ability, place: setup.place, placeName: setup.placeName },
+    });
+  }
+
   // What waits on the owner comes first, newest first within it; then what
-  // she is only telling them, newest first.
-  rows.sort((a, b) => Number(b.asks) - Number(a.asks) || b.at.localeCompare(a.at));
+  // she is only telling them, newest first; then what she offers to set up.
+  rows.sort((a, b) => Number(Boolean(a.setup)) - Number(Boolean(b.setup))
+    || Number(b.asks) - Number(a.asks) || b.at.localeCompare(a.at));
   const voicedRows: FromClemRow[] = rows.map((row) => {
     const voiceDigest = fromClemVoiceDigest(row);
     const said = input.voiced?.(row.key, voiceDigest);

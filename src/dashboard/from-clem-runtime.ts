@@ -29,6 +29,8 @@ const VOICE_FILE = path.join(BASE_DIR, 'state', 'from-clem-voice.json');
  *  of its own, so the voice pass rewriting its file never drops one. */
 const LATER_FILE = path.join(BASE_DIR, 'state', 'from-clem-later.json');
 
+const FOREVER = '9999-12-31T00:00:00.000Z';
+
 function loadLater(): Record<string, string> {
   try {
     if (!existsSync(LATER_FILE)) return {};
@@ -47,10 +49,11 @@ export function nextMorning(nowMs: number): string {
   return next.toISOString();
 }
 
-/** Hide one row until the next morning. Expired entries are dropped on write. */
-export function moveFromClemRowToLater(key: string, nowMs = Date.now()): void {
+/** Hide one row until the next morning, or for good when the owner said
+ *  never. Expired entries are dropped on write. */
+export function moveFromClemRowToLater(key: string, nowMs = Date.now(), forever = false): void {
   const until = Object.fromEntries(Object.entries(loadLater()).filter(([, at]) => Date.parse(at) > nowMs));
-  until[key] = nextMorning(nowMs);
+  until[key] = forever ? FOREVER : nextMorning(nowMs);
   mkdirSync(path.dirname(LATER_FILE), { recursive: true });
   const tmp = `${LATER_FILE}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify({ version: 1, until }, null, 2));
@@ -133,6 +136,9 @@ export async function readFromClem(): Promise<FromClem> {
     import('../agents/plan-proposals.js'),
   ]);
   const needsYouRef = needsYouReferents();
+  const later = laterNow();
+  const { readSetupSuggestion } = await import('./from-clem-setup.js');
+  const setup = await readSetupSuggestion(later).catch(() => null);
   return buildFromClem({
     heartbeats: (await listHeartbeats()).map((row) => ({
       id: row.id, title: row.title, enabled: row.enabled,
@@ -151,7 +157,8 @@ export async function readFromClem(): Promise<FromClem> {
     })),
     asksOwner: (notification) => notificationNeedsYou(notification, needsYouRef),
     voiced: voiced(loadVoices()),
-    later: laterNow(),
+    later,
+    setup,
   });
 }
 
@@ -375,8 +382,9 @@ export interface FromClemReplyDeps {
   approvePlan: (planProposalId: string) => boolean;
   rejectPlan: (planProposalId: string, reason: string) => boolean;
   snoozePlan: (planProposalId: string) => void;
-  /** Hide the row until the next morning; the item itself is untouched. */
-  later: (key: string) => void;
+  /** Hide the row until the next morning, or for good; the item itself is
+   *  untouched. */
+  later: (key: string, forever?: boolean) => void;
   startTurn: (input: { title: string; message: string; displayMessage: string }) => string;
 }
 
@@ -398,6 +406,9 @@ export interface FromClemReplyRequest {
   requestId?: string;
   /** The version of the item the owner was looking at when they replied. */
   seenDigest?: string;
+  /** A button whose meaning is fixed ("Not now", "Don't suggest this")
+   *  carries its decision, so there is nothing to read. */
+  decision?: 'do_it' | 'done' | 'not_now' | 'never';
 }
 
 const replyQueues = new Map<string, Promise<unknown>>();
@@ -411,7 +422,7 @@ export function replyToFromClem(key: string, text: string, deps: FromClemReplyDe
   // Replies to one item are taken one at a time, so a second reply (another
   // device, a second tap) is read against what the first one already did.
   const prior = replyQueues.get(key) ?? Promise.resolve();
-  const run = prior.catch(() => undefined).then(() => replyOnce(key, text, deps, requestId, request.seenDigest));
+  const run = prior.catch(() => undefined).then(() => replyOnce(key, text, deps, requestId, request.seenDigest, request.decision));
   replyQueues.set(key, run);
   run.finally(() => { if (replyQueues.get(key) === run) replyQueues.delete(key); }).catch(() => undefined);
   if (requestId) {
@@ -423,7 +434,10 @@ export function replyToFromClem(key: string, text: string, deps: FromClemReplyDe
   return run;
 }
 
-async function replyOnce(key: string, text: string, deps: FromClemReplyDeps, requestId: string | undefined, seenDigest: string | undefined): Promise<FromClemReplyOutcome> {
+async function replyOnce(
+  key: string, text: string, deps: FromClemReplyDeps, requestId: string | undefined, seenDigest: string | undefined,
+  decided?: FromClemReplyRequest['decision'],
+): Promise<FromClemReplyOutcome> {
   const reply = text.trim();
   const row = (await deps.read()).rows.find((candidate) => candidate.key === key);
   if (!row || !reply) return { outcome: 'gone' };
@@ -432,13 +446,18 @@ async function replyOnce(key: string, text: string, deps: FromClemReplyDeps, req
   if (row.answer?.kind === 'words') {
     return deps.answerQuestion(row.answer.questionId, reply, requestId) ? { outcome: 'answered', questionId: row.answer.questionId } : { outcome: 'gone' };
   }
-  const port = deps.port();
-  if (!port?.readClemReply) return { outcome: 'unclear', decision: 'unclear' };
   const said = row.say ?? row.text;
-  // Reading the owner's reply is work in her thread.
-  const read = await withOwnModelRequestAttribution({ sessionId: CLEM_THREAD_ID }, () => port.readClemReply!({
-    purpose: CLEM_REPLY_PURPOSE, said, facts: factsOf(row), reply, evidenceDigest: row.voiceDigest,
-  }));
+  let read: { decision: ClemReplyResult['decision']; instruction?: string | null };
+  if (decided) {
+    read = { decision: decided, instruction: null };
+  } else {
+    const port = deps.port();
+    if (!port?.readClemReply) return { outcome: 'unclear', decision: 'unclear' };
+    // Reading the owner's reply is work in her thread.
+    read = await withOwnModelRequestAttribution({ sessionId: CLEM_THREAD_ID }, () => port.readClemReply!({
+      purpose: CLEM_REPLY_PURPOSE, said, facts: factsOf(row), reply, evidenceDigest: row.voiceDigest,
+    }));
+  }
   // Reading the reply took a while: act only on the item as it was read.
   const current = (await deps.read()).rows.find((candidate) => candidate.key === key);
   if (!current) return { outcome: 'gone' };
@@ -462,6 +481,9 @@ async function replyOnce(key: string, text: string, deps: FromClemReplyDeps, req
     case 'done':
       if (planId) return deps.rejectPlan(planId, reply) ? { outcome: 'declined', decision: read.decision } : { outcome: 'gone' };
       if (notificationId) deps.markRead(notificationId);
+      // An offer with no record behind it leaves until tomorrow; done for real
+      // means the part is set up, and it stops being offered.
+      if (!notificationId && row.setup) deps.later(row.key);
       return { outcome: 'cleared', decision: read.decision };
     case 'not_now':
       // Later is later: the item comes back tomorrow morning, never cleared.
@@ -469,6 +491,7 @@ async function replyOnce(key: string, text: string, deps: FromClemReplyDeps, req
       deps.later(row.key);
       return { outcome: 'later', decision: read.decision };
     case 'never':
+      if (row.setup) { deps.later(row.key, true); return { outcome: 'cleared', decision: read.decision }; }
       if (planId) deps.rejectPlan(planId, reply);
       if (notificationId) deps.markRead(notificationId);
       deps.addRule(row.heartbeat, reply);

@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
+import { appPlaceHref } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
 import { decidePlanProposal, markNotificationRead } from '@/lib/inbox';
 import { recentPulses, replyFromClem, replyOutcomeText, type FromClem, type FromClemRow } from '@/lib/from-clem';
@@ -48,8 +49,9 @@ export function FromClemPane({
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [showAll, setShowAll] = useState<{ waiting: boolean; updates: boolean }>({ waiting: false, updates: false });
   const rows = data?.rows ?? [];
-  const waiting = rows.filter((row) => row.asks);
-  const updates = rows.filter((row) => !row.asks);
+  const waiting = rows.filter((row) => row.asks && !row.setup);
+  const updates = rows.filter((row) => !row.asks && !row.setup);
+  const offers = rows.filter((row) => row.setup);
   const pulses = recentPulses(data?.pulses ?? []);
 
   const act = (
@@ -74,7 +76,7 @@ export function FromClemPane({
     );
   };
 
-  const reply = (row: FromClemRow, text: string) => act(row, 'answer', () => replyFromClem(row.key, text, row.voiceDigest), (result) => {
+  const reply = (row: FromClemRow, text: string, decision?: 'do_it' | 'done' | 'not_now' | 'never') => act(row, 'answer', () => replyFromClem(row.key, text, row.voiceDigest, decision), (result) => {
     const outcome = result as Awaited<ReturnType<typeof replyFromClem>>;
     return { text: replyOutcomeText(outcome, row.heartbeatTitle), ...(outcome.outcome === 'started' ? { sessionId: outcome.sessionId } : {}) };
   });
@@ -202,6 +204,41 @@ export function FromClemPane({
     );
   };
 
+  // An offer to help set something up: go there, have Clem walk you through
+  // it, or move it out of the way.
+  const offerRow = (row: FromClemRow) => {
+    const state = states[row.key] ?? {};
+    const href = row.setup ? appPlaceHref(row.setup.place, 'desktop') : null;
+    const busy = Boolean(state.busy);
+    return (
+      <PaneRow key={row.key} className="flex-col items-stretch gap-2 py-3.5">
+        <p className="text-body text-fg">{row.say || row.text}</p>
+        {!row.say && row.detail && <p className="text-small text-muted">{row.detail}</p>}
+        {state.notice ? notice(state) : (
+          <div className="flex flex-wrap items-center gap-2">
+            {href && row.setup && (
+              <Link to={href} className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-small font-semibold text-primary-fg hover:bg-primary-hover active:bg-primary-press">
+                Open {row.setup.placeName}
+              </Link>
+            )}
+            <Button size="sm" variant="secondary" className="h-8 px-3 text-small" disabled={busy}
+              onClick={() => reply(row, 'Help me set it up', 'do_it')}>
+              Help me set it up
+            </Button>
+            <button type="button" disabled={busy} onClick={() => reply(row, 'Not now', 'not_now')}
+              className="rounded-sm px-1 text-small font-medium text-muted hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+              Not now
+            </button>
+            <button type="button" disabled={busy} onClick={() => reply(row, "Don't suggest this", 'never')}
+              className="rounded-sm px-1 text-small font-medium text-muted hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+              Don’t suggest this
+            </button>
+          </div>
+        )}
+      </PaneRow>
+    );
+  };
+
   const group = (label: string, list: FromClemRow[], shown: number, which: 'waiting' | 'updates', render: (row: FromClemRow) => React.ReactElement) => {
     if (list.length === 0) return null;
     const all = showAll[which];
@@ -266,6 +303,12 @@ export function FromClemPane({
         <>
           {group('Waiting on you', waiting, WAITING_SHOWN, 'waiting', waitingRow)}
           {group('Updates', updates, UPDATES_SHOWN, 'updates', updateRow)}
+          {offers.length > 0 && (
+            <div className="flex flex-col gap-1.5">
+              <h3 className="text-caption font-semibold uppercase tracking-wide text-faint">Set up next</h3>
+              <PaneCard>{offers.map(offerRow)}</PaneCard>
+            </div>
+          )}
         </>
       )}
       {rows.length > 0 && pulses.length > 0 && (

@@ -18,6 +18,8 @@ export interface FromClemRow {
   voiceDigest: string;
   answer?: { kind: 'words'; questionId: string } | { kind: 'yes_no'; planProposalId: string };
   done?: { notificationId: string };
+  /** A part of Clementine Clem offers to help set up, and where it lives. */
+  setup?: { ability: string; place: string; placeName: string };
 }
 
 export interface FromClemPulse {
@@ -47,9 +49,9 @@ export type FromClemReplyOutcome =
 /** The owner's reply to one row, in their own words. One reply, one id: a
  *  retried send is the same answer, and the version the owner saw goes with
  *  it, so a changed item is shown again rather than acted on. */
-export const replyFromClem = (key: string, text: string, voiceDigest?: string) =>
+export const replyFromClem = (key: string, text: string, voiceDigest?: string, decision?: 'do_it' | 'done' | 'not_now' | 'never') =>
   apiPost<FromClemReplyOutcome>('/api/console/home/from-clem/reply', {
-    key, text, requestId: newReplyId(), ...(voiceDigest ? { voiceDigest } : {}),
+    key, text, requestId: newReplyId(), ...(voiceDigest ? { voiceDigest } : {}), ...(decision ? { decision } : {}),
   });
 
 function newReplyId(): string {

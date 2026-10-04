@@ -14371,6 +14371,7 @@ export function registerConsoleRoutes(
     if (!key || !text) { res.status(400).json({ error: 'key and text are required' }); return; }
     const requestId = typeof req.body?.requestId === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(req.body.requestId) ? req.body.requestId : undefined;
     const seenDigest = typeof req.body?.voiceDigest === 'string' ? req.body.voiceDigest.slice(0, 64) : undefined;
+    const decision = (['do_it', 'done', 'not_now', 'never'] as const).find((value) => value === req.body?.decision);
     try {
       const [{ readFromClem, replyToFromClem, startFromClemTurn, moveFromClemRowToLater }, { addRule, HEARTBEAT_IDS }, { peekTurnSemanticModelPort }] = await Promise.all([
         import('./from-clem-runtime.js'),
@@ -14398,9 +14399,9 @@ export function registerConsoleRoutes(
         },
         rejectPlan: (planProposalId, reason) => Boolean(rejectPlanProposal(planProposalId, reason)),
         snoozePlan: (planProposalId) => { void snoozeHomeItem(`plan:${planProposalId}`, DEFAULT_SNOOZE_HOURS); },
-        later: (rowKey) => moveFromClemRowToLater(rowKey),
+        later: (rowKey, forever) => moveFromClemRowToLater(rowKey, Date.now(), forever),
         startTurn: (input) => startFromClemTurn(input),
-      }, { ...(requestId ? { requestId } : {}), ...(seenDigest ? { seenDigest } : {}) });
+      }, { ...(requestId ? { requestId } : {}), ...(seenDigest ? { seenDigest } : {}), ...(decision ? { decision } : {}) });
       res.json(result);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
