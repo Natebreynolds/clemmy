@@ -217,24 +217,35 @@ export function registerAutonomyActionTools(server: McpServer): void {
     'work_item_settle',
     [
       'Settle one item of your work list (declared with run_worker\'s workManifest) that you finished yourself instead of through a worker.',
-      'Name the item and cite the call ids of your own successful calls that did it; the host checks each one settled successfully in this run.',
+      'Name the item and cite the call ids of your own successful calls that did it; the host checks each one settled successfully in this run. Call it with no call ids to see your successful calls to cite.',
       'An item you finished outside the work list otherwise stays open, and your run reads as unfinished.',
     ].join(' '),
     {
       item: z.string().min(1).max(500),
-      call_ids: z.array(z.string().min(1).max(200)).min(1).max(20),
+      call_ids: z.array(z.string().min(1).max(200)).max(20).nullable().optional(),
       note: z.string().max(600).nullable().optional(),
     },
     async ({ item, call_ids, note }) => {
       if (harnessRunContextStorage.getStore()?.workerScope) {
         return textResult('A worker returns its item to the run that started it; that run settles it.');
       }
-      const sessionId = getToolOutputContext()?.sessionId;
+      const ctx = getToolOutputContext();
+      const sessionId = ctx?.sessionId;
       if (!sessionId) return textResult('No run is open to settle work in; nothing was settled.');
+      const sourceUserSeq = typeof ctx?.sourceUserSeq === 'number' ? ctx.sourceUserSeq : undefined;
       const { settleWorkItemFromOwnCalls } = await import('../runtime/harness/work-manifest.js');
-      const settled = settleWorkItemFromOwnCalls({ sessionId, item, callIds: call_ids, ...(note ? { note } : {}) });
+      // What this run still owes, as its own declarations named it, so an
+      // item from a declaration refused before any worker started can settle.
+      const owed = sourceUserSeq
+        ? (await import('../runtime/harness/local-work-completion.js')).pendingAcceptedLocalWork({ sessionId, sourceUserSeq })?.owed
+        : undefined;
+      const callIds = call_ids ?? [];
+      const settled = settleWorkItemFromOwnCalls({
+        sessionId, item, callIds, ...(note ? { note } : {}),
+        ...(sourceUserSeq ? { sourceUserSeq } : {}), ...(owed ? { owed } : {}),
+      });
       return textResult(settled.ok
-        ? `Settled "${settled.label}" (${settled.phases.join(', ') || 'no open phase'}) from ${call_ids.length} of your own calls.`
+        ? `Settled "${settled.label}" (${settled.phases.join(', ') || 'no open phase'}) from ${callIds.length} of your own calls.`
         : settled.reason);
     },
   );

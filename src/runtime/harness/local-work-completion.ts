@@ -14,6 +14,15 @@ import { chatAutoContinueCap, chatAutoContinueDecision } from './continue-direct
 export interface PendingLocalWork {
   reason: string;
   missing: string[];
+  /** Each missing item as the work list names it. */
+  owed?: OwedLocalWorkItem[];
+}
+
+export interface OwedLocalWorkItem {
+  manifestId: string;
+  contractVersion: string;
+  phase: string;
+  itemId: string;
 }
 
 /** The existing event ledger owns continuation expenditure, including across
@@ -83,7 +92,7 @@ export function pendingAcceptedLocalWork(input: {
   const declaredAgainAfter = (manifestId: string, seq: number): boolean => ownedEvents.some((event) => (
     event.type === 'work_manifest_declared' && event.role === 'system' && event.seq > seq
     && event.data.sourceUserSeq === input.sourceUserSeq && event.data.manifestId === manifestId));
-  const missing = new Set<string>();
+  const missing = new Map<string, OwedLocalWorkItem>();
   for (const row of admissions) {
     const frame = JSON.parse(row.frame_history_json) as AgentInputItem[];
     if (acceptedModelBatchHistoryDigest(frame) !== row.frame_history_digest) continue;
@@ -118,13 +127,16 @@ export function pendingAcceptedLocalWork(input: {
         // its existing manifest checkpoint and a real result receipt. Mere later
         // preflight/read handles, or successful prose, cannot discharge it.
         if (state?.status === 'succeeded' && state.evidence.some((ref) => settledItemEvidence(input, ref, eventBySeq))) continue;
-        missing.add(`${descriptor.id}/${descriptor.phase}/${itemId}`);
+        missing.set(`${descriptor.id}/${descriptor.phase}/${itemId}`, {
+          manifestId: descriptor.id, contractVersion: descriptor.contractVersion, phase: descriptor.phase, itemId,
+        });
       }
     }
   }
   return missing.size > 0 ? {
     reason: `${missing.size} accepted local work item(s) have no successful item result. Retained partial results remain available; resume the remaining items.`,
-    missing: [...missing],
+    missing: [...missing.keys()],
+    owed: [...missing.values()],
   } : null;
 }
 

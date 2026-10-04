@@ -750,14 +750,50 @@ export function settleWorkItemFromOwnCalls(input: {
   item: string;
   callIds: readonly string[];
   note?: string;
+  /** Exact accepted user row of the run. */
+  sourceUserSeq?: number;
+  /** Items this run still owes, as its own run_worker declarations named
+   *  them, including declarations refused before any worker started. */
+  owed?: ReadonlyArray<{ manifestId: string; contractVersion: string; phase: string; itemId: string }>;
 }): SettleOwnWorkItemResult {
   const wanted = input.item.trim().toLowerCase();
   if (!wanted) return { ok: false, reason: 'Name the work item to settle.' };
+  // An item answers to its id, label and aliases, and to the full
+  // "work list/phase/item" name the run is shown when items are still owed.
+  const findMatches = () => summarizeWorkManifests(input.sessionId).flatMap((manifest) => manifest.items
+    .filter((item) => [
+      item.id, item.label, ...item.aliases,
+      ...manifest.phases.map((phase) => `${manifest.manifestId}/${phase.id}/${item.id}`),
+    ].some((name) => name.trim().toLowerCase() === wanted))
+    .map((item) => ({ manifest, item })));
+  let matches = findMatches();
+  if (matches.length === 0) {
+    // A declaration refused before any worker started still owes its items,
+    // but no work list was ever recorded for them. Record that list now, from
+    // the declaration itself, so the run can settle what it did inline.
+    const owed = (input.owed ?? []).filter((entry) => (
+      `${entry.manifestId}/${entry.phase}/${entry.itemId}`.toLowerCase() === wanted
+      || entry.itemId.toLowerCase() === wanted));
+    if (owed.length === 1) {
+      const target = owed[0]!;
+      const siblings = (input.owed ?? []).filter((entry) => entry.manifestId === target.manifestId
+        && entry.phase === target.phase && entry.contractVersion === target.contractVersion);
+      const existing = summarizeWorkManifest(input.sessionId, target.manifestId);
+      declareWorkManifest({
+        sessionId: input.sessionId,
+        ...(input.sourceUserSeq ? { sourceUserSeq: input.sourceUserSeq } : {}),
+        manifestId: target.manifestId,
+        contractVersion: target.contractVersion,
+        phases: [{ id: target.phase }],
+        items: siblings.map((entry) => ({ id: entry.itemId })),
+        ...(existing ? { mode: 'extend' as const } : {}),
+      });
+      matches = findMatches().filter((match) => match.manifest.manifestId === target.manifestId
+        && match.item.id === target.itemId);
+    }
+  }
   const manifests = summarizeWorkManifests(input.sessionId);
   if (manifests.length === 0) return { ok: false, reason: 'This run has no work list to settle.' };
-  const matches = manifests.flatMap((manifest) => manifest.items
-    .filter((item) => [item.id, item.label, ...item.aliases].some((name) => name.trim().toLowerCase() === wanted))
-    .map((item) => ({ manifest, item })));
   if (matches.length === 0) {
     const open = manifests.flatMap((manifest) => manifest.items.filter((item) => !item.complete).map((item) => item.label || item.id));
     return { ok: false, reason: `No work item is named "${input.item.trim()}". Open items: ${open.slice(0, 10).join('; ') || 'none'}.` };
@@ -766,7 +802,15 @@ export function settleWorkItemFromOwnCalls(input: {
   const { manifest, item } = matches[0]!;
   if (item.complete) return { ok: false, reason: `"${item.label || item.id}" is already complete.` };
   const callIds = [...new Set(input.callIds.map((id) => id.trim()).filter(Boolean))].slice(0, 20);
-  if (callIds.length === 0) return { ok: false, reason: 'Cite the call ids of your own calls that did this item.' };
+  if (callIds.length === 0) {
+    const own = ownSuccessfulWorkCalls(input.sessionId, input.sourceUserSeq);
+    return {
+      ok: false,
+      reason: own.length > 0
+        ? `Cite the call ids of your own calls that did "${item.label || item.id}". Your successful work calls in this run: ${own.join('; ')}.`
+        : 'Cite the call ids of your own calls that did this item. This run has no successful work call yet.',
+    };
+  }
   const settled = new Map<string, { outcome: string; business: number }>();
   const read = openEventLog().prepare(`
     SELECT logical_tool_call_id AS id, outcome_kind AS outcome, business_call AS business
@@ -799,6 +843,36 @@ export function settleWorkItemFromOwnCalls(input: {
     });
   }
   return { ok: true, manifestId: manifest.manifestId, itemId: item.id, label: item.label || item.id, phases };
+}
+
+/** This run's own succeeded work calls, newest first, as "id (tool: what)". */
+function ownSuccessfulWorkCalls(sessionId: string, sourceUserSeq?: number): string[] {
+  const db = openEventLog();
+  const rows = db.prepare(`
+    SELECT logical_tool_call_id AS id
+      FROM logical_call_settlements
+     WHERE session_id = ? AND outcome_kind = 'succeeded' AND business_call = 1
+       ${sourceUserSeq ? 'AND source_user_seq = ?' : ''}
+     ORDER BY settled_at DESC
+     LIMIT 12
+  `).all(...(sourceUserSeq ? [sessionId, sourceUserSeq] : [sessionId])) as Array<{ id: string }>;
+  const called = db.prepare(`
+    SELECT data_json AS dataJson FROM events
+     WHERE session_id = ? AND type = 'tool_called' AND json_extract(data_json, '$.callId') = ?
+     ORDER BY seq DESC LIMIT 1
+  `);
+  return rows.map(({ id }) => {
+    let what = '';
+    try {
+      const data = JSON.parse((called.get(sessionId, id) as { dataJson: string } | undefined)?.dataJson ?? '{}') as Record<string, unknown>;
+      const raw = typeof data.args === 'string' ? data.args : typeof data.arguments === 'string' ? data.arguments : '';
+      let args: Record<string, unknown> = {};
+      try { args = JSON.parse(raw) as Record<string, unknown>; } catch { /* a preview of the raw text below */ }
+      const target = ['path', 'file', 'url', 'query', 'command'].map((key) => args[key]).find((value) => typeof value === 'string');
+      what = `${typeof data.tool === 'string' ? data.tool : 'call'}${target ? `: ${String(target).slice(0, 90)}` : ''}`;
+    } catch { /* the id alone still settles */ }
+    return what ? `${id} (${what})` : id;
+  });
 }
 
 export function reviseWorkContract(input: ReviseWorkContractInput): EventRow {

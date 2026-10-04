@@ -9893,6 +9893,31 @@ test('a run settles a work item it finished itself only from its own successful 
   assert.equal(again.ok, false, 'a complete item is not settled twice');
 });
 
+test('a run settles an item owed by a declaration that never started, and is shown its calls to cite', async () => {
+  const { summarizeWorkManifests, settleWorkItemFromOwnCalls } = await import('./work-manifest.js');
+  const run = acceptJudgedSource('settle-owed-item', 'TEST FIXTURE: write two briefs');
+  const sessionId = run.session.id;
+  const sourceUserSeq = run.context.sourceUserSeq;
+  // What a refused run_worker declaration still owes: no work list was ever
+  // recorded for it, because no worker started.
+  const owed = [
+    { manifestId: 'fixture-briefs', contractVersion: '1', phase: 'write-brief', itemId: 'alpha' },
+    { manifestId: 'fixture-briefs', contractVersion: '1', phase: 'write-brief', itemId: 'beta' },
+  ];
+  assert.deepEqual(summarizeWorkManifests(sessionId), []);
+  settleFixtureCall({ ...run.context, turn: 1 }, 'settle-owed-write', {
+    tool: 'write_file', execution: 'local_execution', mutating: true, succeeded: true });
+  const shown = settleWorkItemFromOwnCalls({ sessionId, sourceUserSeq, item: 'fixture-briefs/write-brief/alpha', callIds: [], owed });
+  assert.equal(shown.ok, false);
+  if (!shown.ok) assert.match(shown.reason, /Your successful work calls in this run: logical:settle-owed-write/);
+  const settled = settleWorkItemFromOwnCalls({ sessionId, sourceUserSeq, item: 'alpha', callIds: ['logical:settle-owed-write'], owed });
+  assert.equal(settled.ok, true, settled.ok ? '' : settled.reason);
+  const [manifest] = summarizeWorkManifests(sessionId);
+  assert.equal(manifest!.manifestId, 'fixture-briefs');
+  assert.deepEqual(manifest!.items.map((item) => item.id).sort(), ['alpha', 'beta']);
+  assert.equal(manifest!.remaining, 1, 'the item nobody did is still owed');
+});
+
 test('a review protects what the turn did: a write it tried, a plan, or a read-only answer', async () => {
   const { completionReviewStakes, settledSourceArtifacts } = await import('./host-turn-runner.js');
   const { sourceAttemptedWrites } = await import('./host-completion-work.js');
