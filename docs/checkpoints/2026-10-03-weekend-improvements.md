@@ -1049,3 +1049,31 @@ spend more time on it — the two cheap changes below stay, no more SDK work.
   completion check 312 runs, median ~9 s from last work to verdict, p90
   ~60 s; depth full 189 / fast 68; judges Sonnet 5 164, GLM 68, Grok 31,
   Jev 27. Proposal to owner: review depth by stakes + a quick-check role.
+
+### Owner: "Depth by stakes + fast role", "Freeze now, remove later"
+
+- **SDK lanes frozen** (memory project_sdk_lanes_frozen_1004): no fixes to
+  Clem's Claude SDK brain/worker/workflow-step paths; removal later in one
+  revertible commit after an import audit; coding agents, model discovery
+  and the client version keep the SDK.
+- **d76cf77cd — review depth by stakes.** `sourceWritesAtStake`: the full
+  completion review counts writes that reached outside (provider
+  execution), failed or were refused, or changed local state that cannot be
+  restored (shell edits, workers). A succeeded `write_file` (a local
+  artifact capability, non-destructive, prior bytes kept) takes the read
+  depth, still confirmed at full depth before any send-back. 429 host +
+  judge tests. WAVE 65 INSTALLED.
+- **f89f5797f / f2ba9141f / ef0c99003 / efddec1c4 — Quick checks role.**
+  `quick` model role: default = the fast model of the brain's family
+  (codex → gpt-5.6-luna, claude → claude-haiku-4-5, all-in BYO → the BYO
+  judge); bindable only from Settings; never moved by the learned route
+  policy; never an agent's model. `turn_semantics` and
+  `calendar_read_operation` run on it; a quick model that cannot answer
+  falls back to the brain for that call; usage still records as
+  interpretation. Settings › Models shows "Quick checks" on the Mac and the
+  phone (shared words in @clem/chat-engine). 345 semantic + 237 settings UI
+  tests. WAVES 66 (ef0c99003) and 67 (efddec1c4) INSTALLED, verified; live
+  role = gpt-5.6-luna (codex, default); desktop + phone rows captured
+  headless (no page errors; the phone test device revoked).
+- Not yet seen live: an interpretation call on the quick model (it runs
+  only when a chat holds an unfinished task).
