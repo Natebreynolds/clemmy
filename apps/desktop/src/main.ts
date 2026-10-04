@@ -44,6 +44,7 @@ import {
   workspaceInitialFrameLoadMayProceed,
   workspaceTopLevelNavigationMustBeBlocked,
 } from './workspace-navigation-policy.js';
+import { createBrowserViewerNavigationGuard, isBrowserViewerNavigationUrl } from './browser-viewer-navigation-policy.js';
 import {
   applyUpdate,
   checkForUpdatesNow,
@@ -631,6 +632,7 @@ function isExternalProtocol(rawUrl: string): boolean {
 }
 
 function guardWindow(win: BrowserWindow, allowed: RendererSurface[]): void {
+  const browserViewNavigation = createBrowserViewerNavigationGuard();
   function allowedUrl(rawUrl: string): boolean {
     const surface = senderSurface(rawUrl);
     return Boolean(surface && allowed.includes(surface));
@@ -644,6 +646,9 @@ function guardWindow(win: BrowserWindow, allowed: RendererSurface[]): void {
     if (isExternalHttpUrl(url)) void shell.openExternal(url);
   };
   win.webContents.setWindowOpenHandler(({ url }) => {
+    // Provider viewer URLs contain bearer capabilities. Keep them in their
+    // bound iframe; a rejected popup must never hand one to the OS browser.
+    if (isBrowserViewerNavigationUrl(url)) return { action: 'deny' };
     if (workspaceTopLevelNavigationMustBeBlocked(url)) {
       // `_blank` / window.open does not emit will-navigate. Apply the same
       // raw-Workspace deny here so localhost authored content is never handed
@@ -655,6 +660,10 @@ function guardWindow(win: BrowserWindow, allowed: RendererSurface[]): void {
     return { action: 'deny' };
   });
   win.webContents.on('will-navigate', (event, url) => {
+    if ([url, event.frame?.url, event.initiator?.url].some(isBrowserViewerNavigationUrl)) {
+      event.preventDefault();
+      return;
+    }
     if (workspaceTopLevelNavigationMustBeBlocked(url)) {
       // Never replace the privileged dashboard document with agent-authored
       // content or hand that private localhost URL to the default browser.
@@ -666,6 +675,19 @@ function guardWindow(win: BrowserWindow, allowed: RendererSurface[]): void {
   // Sub-frame navigations (the Workspace iframe). Without this a tel: click in a
   // Workspace view navigates the iframe to tel: and blanks it.
   win.webContents.on('will-frame-navigate', (event) => {
+    browserViewNavigation.prune(new Set(win.webContents.mainFrame.framesInSubtree.map(frame => frame.frameTreeNodeId)));
+    const browserViewDecision = browserViewNavigation.navigation({
+      targetUrl: event.url,
+      isMainFrame: event.isMainFrame,
+      frame: event.frame,
+      initiator: event.initiator,
+      mainFrame: win.webContents.mainFrame,
+      trustedOrigins: dashboardOrigins(),
+    });
+    if (browserViewDecision !== 'unhandled') {
+      if (browserViewDecision === 'block') event.preventDefault();
+      return;
+    }
     const navigation = {
       frameUrl: event.frame?.url,
       initiatorUrl: event.initiator?.url,
@@ -685,6 +707,37 @@ function guardWindow(win: BrowserWindow, allowed: RendererSurface[]): void {
     }
     guardNav(event, event.url);
   });
+  win.webContents.on('will-redirect', (event) => {
+    const decision = browserViewNavigation.redirect({
+      targetUrl: event.url,
+      isMainFrame: event.isMainFrame,
+      frame: event.frame,
+      initiator: event.initiator,
+      mainFrame: win.webContents.mainFrame,
+      trustedOrigins: dashboardOrigins(),
+    });
+    if (decision === 'block') event.preventDefault();
+  });
+  const settleBrowserViewNavigation = (isMainFrame: boolean, processId: number, routingId: number, mainDocumentCommitted = false) => {
+    if (isMainFrame) {
+      if (mainDocumentCommitted) browserViewNavigation.clear();
+      return;
+    }
+    const frames = win.webContents.mainFrame.framesInSubtree;
+    const frame = frames.find(frame => frame.processId === processId && frame.routingId === routingId);
+    browserViewNavigation.settled(processId, routingId, frame?.frameTreeNodeId);
+    browserViewNavigation.prune(new Set(frames.map(frame => frame.frameTreeNodeId)));
+  };
+  win.webContents.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame, processId, routingId) => {
+    settleBrowserViewNavigation(isMainFrame, processId, routingId, true);
+  });
+  win.webContents.on('did-fail-load', (_event, _code, _text, _url, isMainFrame, processId, routingId) => {
+    settleBrowserViewNavigation(isMainFrame, processId, routingId);
+  });
+  win.webContents.on('did-fail-provisional-load', (_event, _code, _text, _url, isMainFrame, processId, routingId) => {
+    settleBrowserViewNavigation(isMainFrame, processId, routingId);
+  });
+  win.webContents.on('destroyed', () => browserViewNavigation.clear());
 }
 
 function clearClementineLiveRetryTimer(): void {
