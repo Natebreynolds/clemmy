@@ -1,7 +1,7 @@
 import { BrowserbaseConnection } from '../components/BrowserbaseConnection';
 import { useEffect, useState } from 'preact/hooks';
 import { Fragment } from 'preact';
-import { accountStatus, creditRefusalSentence, presentUsageMeters } from '@clem/chat-engine';
+import { CHECKER_ROLE_WORDS, accountStatus, checkerBackupAutomaticLabel, creditRefusalSentence, presentUsageMeters } from '@clem/chat-engine';
 import {
   forgetLearnedWriteKind,
   getApprovalMode,
@@ -49,6 +49,7 @@ import {
   judgeFallbackChoices,
   judgeFallbackSelection,
   judgeFallbackValue,
+  modelLabel,
 } from '../lib/model-roles';
 import { ScreenNotice } from '../components/ScreenNotice';
 import {
@@ -700,7 +701,7 @@ function FallbackJudgeRow({ settings, onChanged }: {
           <span class="settings-row-note" id="judge-fallback-description">Used only when the checker cannot complete a review. A completed verdict is kept.</span>
         </span>
         <select id="judge-fallback-model" class="settings-select" aria-label="Backup checker model" aria-describedby="judge-fallback-description judge-fallback-status" disabled={busy} value={judgeFallbackValue(fallback)} onChange={(event) => void save(event.currentTarget.value)}>
-          <option value="automatic">Automatic</option>
+          <option value="automatic">{checkerBackupAutomaticLabel(settings.checker, (modelId) => modelLabel(modelId, settings))}</option>
           <option value="off">No fallback</option>
           {choices.map((model) => <option key={model.id} value={`model:${model.id}`} disabled={!model.available}>{model.label}{!model.available ? ' (unavailable)' : ''}</option>)}
         </select>
@@ -709,7 +710,9 @@ function FallbackJudgeRow({ settings, onChanged }: {
         {busy ? 'Saving…' : unavailable
           ? `Your saved choice is unavailable. ${fallback.reason || 'Connect it again or choose another fallback.'}`
           : saved ? 'Saved. Applies to new requests.'
-          : fallback.mode === 'off' ? 'The checker reviews without a backup.' : 'Applies to new requests.'}
+          : fallback.mode === 'off' ? 'The checker reviews without a backup.'
+          : fallback.mode === 'automatic' && settings.checker && settings.checker.automaticBackups.length === 0 ? CHECKER_ROLE_WORDS.backupNone
+          : 'Applies to new requests.'}
       </p>
       {error ? <p class="error card-note" role="alert">{error}</p> : null}
     </div>

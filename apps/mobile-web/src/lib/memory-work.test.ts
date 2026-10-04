@@ -595,7 +595,7 @@ test('Settings lists the memory row, and the picker warns about providers only f
     'the memory row says whose model Automatic borrows, from the daemon');
   const sheet = read('../components/RoleSheet.tsx');
   assert.match(sheet, /role === 'judge' \|\| role === 'writer' \? sameFamilyWarning\(settings\) : null/);
-  assert.match(sheet, /roleAutomaticText\(role, resolved\)/);
+  assert.match(sheet, /roleAutomaticText\(role, resolved, settings\)/);
 });
 
 test('memory-work code names no model and no provider, and the fixture never ships', () => {

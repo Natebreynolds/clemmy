@@ -1,4 +1,4 @@
-import { readBrainSelectionResponse, type BrainSelectionResponse, type MemoryModelProblem } from '@clem/chat-engine';
+import { readBrainSelectionResponse, type BrainSelectionResponse, type CheckerFacts, type MemoryModelProblem } from '@clem/chat-engine';
 import { apiGet, apiPost, apiDelete, api } from './api';
 
 // ─── Scoped send-trust ───────────────────────────────────────────────────────
@@ -206,6 +206,9 @@ export type MemoryResolvedRole = ResolvedRole & {
 };
 export interface ModelRolesSnapshot {
   judgeFallback?: JudgeFallbackSetting;
+  /** Whether the checker is independent of the work, whether it could be, and
+   *  what an Automatic backup would use. Absent on older daemons. */
+  checker?: CheckerFacts;
   // writer, memory and quick are absent on daemons that predate those roles.
   roles: { brain: ResolvedRole; worker: ResolvedRole; judge: ResolvedRole; writer?: ResolvedRole; memory?: MemoryResolvedRole; quick?: ResolvedRole };
   bindings: { role: ModelRoleName; modelId: string; whenIntent?: string; source: string }[];
@@ -366,6 +369,7 @@ export interface JudgeMetricLaneSnapshot {
   avgMs: number;
   maxMs: number;
   fastDecisions?: number;
+  jevDecisions?: number;
   lastOutcome?: JudgeMetricOutcome;
   lastDurationMs?: number;
   lastModelId?: string;

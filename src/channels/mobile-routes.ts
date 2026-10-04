@@ -5978,7 +5978,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const { effectiveBrainValue, modelRoleOptionCatalogSnapshot } = await import('../runtime/harness/model-role-options.js');
     const { codexRescueSettingsSnapshot } = await import('../runtime/harness/codex-rescue-settings.js');
     const { judgeFallbackSettingsSnapshot } = await import('../runtime/harness/judge-fallback-settings.js');
-    const { judgeReviewsOwnFamily } = await import('../runtime/harness/debate-model.js');
+    const { checkerSettingsFacts, judgeReviewsOwnFamily } = await import('../runtime/harness/debate-model.js');
     const { memoryRoleSettingsView } = await import('../memory/memory-model-route.js');
     const { getActiveAuthMode } = await import('../config.js');
     const catalog = modelRoleOptionCatalogSnapshot();
@@ -6005,6 +6005,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       roleOptions: catalog.roleOptions,
       judgeFallback: judgeFallbackSettingsSnapshot(catalog),
       judgeReviewsOwnFamily: judgeReviewsOwnFamily(),
+      // The desktop's checker facts: independence, and what Automatic backs up with.
+      checker: checkerSettingsFacts(),
       // Exact connected Codex ids only. The phone never derives provider
       // identity or accepts credentials; console and mobile share one
       // validation + persistence owner for OPENAI_MODEL_RESCUE.

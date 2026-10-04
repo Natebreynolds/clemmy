@@ -1,8 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { CHECKER_ROLE_WORDS, checkerBackupAutomaticLabel, checkerOnlyProviderText } from '@clem/chat-engine';
 import type { ModelSettings } from './api';
 import {
   brainSummary,
+  roleAutomaticText,
+  roleNote,
   describeModel,
   inactiveNote,
   isChosen,
@@ -45,10 +48,14 @@ test('fallback selection distinguishes automatic, off and exact model ids withou
   assert.equal(snapshot.roles?.judge?.modelId, 'claude-model-a');
 });
 
+// A checker outside the catalogs, so the backup lists below are whole.
+const otherChecker = { modelId: 'claude-checker', provider: 'claude', source: 'default' } as const;
+
 test('fallback catalog preserves a saved missing model without offering worker-only choices', () => {
   const snapshot = settings({
     judgeFallback: { mode: 'model', modelId: 'disconnected-model', available: false },
     roleOptions: { judge: [groups[0]!], worker: groups },
+    roles: { ...settings().roles, judge: otherChecker },
   });
   const choices = judgeFallbackChoices(snapshot);
   assert.deepEqual(choices, [
@@ -56,7 +63,8 @@ test('fallback catalog preserves a saved missing model without offering worker-o
     { id: 'disconnected-model', label: 'disconnected-model', available: false },
   ]);
   assert.equal(judgeFallbackValue(snapshot.judgeFallback!), 'model:disconnected-model');
-  assert.equal(judgeFallbackChoices(settings({ judgeFallback: { mode: 'model', modelId: 'claude-model-a', available: false } }))[0]?.available, false);
+  assert.equal(judgeFallbackChoices(settings({ judgeFallback: { mode: 'model', modelId: 'claude-model-a', available: false },
+    roles: { ...settings().roles, judge: otherChecker } }))[0]?.available, false);
   assert.deepEqual(judgeFallbackChoices(settings({ roleOptions: { worker: groups } })), []);
 });
 
@@ -64,11 +72,17 @@ test('fallback reviewers remain independent of restrictions on the primary judge
   const snapshot = settings({
     roleOptions: { judge: [groups[0]!], worker: groups },
     judgeFallback: { mode: 'automatic', options: groups },
+    roles: { ...settings().roles, judge: otherChecker },
   });
   assert.deepEqual(judgeFallbackChoices(snapshot).map((model) => model.id), ['claude-model-a', 'codex-model-b', 'hosted-model-c'],
     'connected Codex is offered even when the primary judge list excludes it');
   assert.deepEqual(judgeFallbackChoices({ ...snapshot, judgeFallback: { mode: 'automatic', options: [] } }), [],
     'an explicit empty catalog does not fall back to primary judge options');
+});
+
+test('the checker is never offered as its own backup', () => {
+  const snapshot = settings({ judgeFallback: { mode: 'automatic', options: groups } });
+  assert.deepEqual(judgeFallbackChoices(snapshot).map((model) => model.id), ['codex-model-b', 'hosted-model-c']);
 });
 
 test('a saved choice is the owner\'s; defaults and learned picks are automatic', () => {
@@ -138,4 +152,30 @@ test('the same-provider warning appears only for a choice the owner made', () =>
   });
   assert.match(sameFamilyWarning(writerChosen) ?? '', /same provider/);
   assert.equal(sameFamilyWarning({ ...writerChosen, judgeReviewsOwnFamily: false }), null);
+});
+
+test('with one provider connected, Checks the work says so instead of claiming another provider', () => {
+  const onlyCodex = settings({
+    roles: { ...settings().roles, judge: { modelId: 'codex-model-b', provider: 'codex', source: 'default' } },
+    checker: { reviewsOwnFamily: true, otherFamilyConnected: false, automaticBackups: [] },
+  });
+  const words = checkerOnlyProviderText('codex');
+  assert.match(words, /Only Codex is connected/);
+  assert.equal(roleAutomaticText('judge', onlyCodex.roles!.judge, onlyCodex), words);
+  assert.equal(roleNote('judge', onlyCodex), words, 'the row says it, not only the picker');
+  // A writer choice would normally ask for a checker from another provider;
+  // with none connected there is nothing to pick.
+  const chosenWriter = { ...onlyCodex, roles: { ...onlyCodex.roles, writer: { modelId: 'codex-model-b', provider: 'codex', source: 'settings' as const } } };
+  assert.equal(sameFamilyWarning(chosenWriter), null);
+  assert.equal(sameFamilyWarning({ ...chosenWriter, checker: { ...chosenWriter.checker!, otherFamilyConnected: true } }),
+    CHECKER_ROLE_WORDS.sameFamilyWarning);
+});
+
+test('an independent checker keeps the other-provider words, and the backup names what it would use', () => {
+  const both = settings({ checker: { reviewsOwnFamily: false, otherFamilyConnected: true, automaticBackups: [{ modelId: 'codex-model-b', provider: 'codex' }] } });
+  assert.equal(roleAutomaticText('judge', both.roles!.judge, both), CHECKER_ROLE_WORDS.automaticIndependent);
+  assert.equal(roleNote('judge', both), null);
+  assert.equal(checkerBackupAutomaticLabel(both.checker, (id) => id), 'Automatic · codex-model-b');
+  assert.equal(checkerBackupAutomaticLabel({ ...both.checker!, automaticBackups: [] }, (id) => id), 'Automatic · nothing else connected');
+  assert.equal(checkerBackupAutomaticLabel(undefined, (id) => id), 'Automatic', 'an older daemon names nothing');
 });

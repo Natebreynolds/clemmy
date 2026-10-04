@@ -145,7 +145,7 @@ async function judgeRevisionWithJev(input: {
       return { verdict: 'unverified', confidence: answer?.confidence, reason: 'the fast judge was not sure', judge: 'jev', durationMs };
     }
     const applied = answer.choice === 'applied';
-    try { recordJudgeMetric({ lane: 'revision', outcome: applied ? 'passed' : 'blocked', durationMs, modelId: 'jev', fast: true }); } catch { /* metrics never block */ }
+    try { recordJudgeMetric({ lane: 'revision', outcome: applied ? 'passed' : 'blocked', durationMs, modelId: 'jev', fast: true, jev: true }); } catch { /* metrics never block */ }
     return {
       verdict: applied ? 'applied' : 'not_applied',
       confidence: answer.confidence,

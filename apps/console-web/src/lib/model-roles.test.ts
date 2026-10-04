@@ -32,9 +32,13 @@ test('fallback selection distinguishes automatic, off and exact catalog ids', ()
   assert.throws(() => judgeFallbackSelection('unrecognized'), /Choose/);
 });
 
+// A checker outside the catalogs, so the backup lists below are whole.
+const otherChecker = { modelId: 'claude-sonnet-5', provider: 'claude', source: 'default' } as const;
+
 test('fallback choices use only the judge catalog and preserve an unavailable saved choice', () => {
   const snapshot: ModelRolesSnapshot = {
     ...mr,
+    roles: { ...mr.roles, judge: otherChecker },
     roleOptions: { worker: mr.available, judge: [mr.available[0]!] },
     judgeFallback: { mode: 'model', modelId: 'removed-model', available: false, reason: 'Not connected' },
   };
@@ -44,13 +48,14 @@ test('fallback choices use only the judge catalog and preserve an unavailable sa
   assert.equal(judgeFallbackValue(snapshot.judgeFallback!), 'model:removed-model');
   assert.equal(judgeFallbackChoices({ ...snapshot, judgeFallback: { mode: 'model', modelId: 'gpt-5.6-terra', available: false } })[0]?.available, false,
     'backend unavailability wins even when a cached catalog still lists the model');
-  assert.deepEqual(judgeFallbackChoices({ ...mr, judgeFallback: { mode: 'automatic' } }), [],
+  assert.deepEqual(judgeFallbackChoices({ ...mr, roles: { ...mr.roles, judge: otherChecker }, judgeFallback: { mode: 'automatic' } }), [],
     'an absent judge catalog does not expose worker-only models');
 });
 
 test('fallback reviewers use their own connected catalog independently of primary brain routing', () => {
   const snapshot: ModelRolesSnapshot = {
     ...mr,
+    roles: { ...mr.roles, judge: otherChecker },
     roleOptions: { worker: mr.available, judge: [mr.available[1]!] },
     judgeFallback: { mode: 'automatic', options: mr.available },
   };
@@ -58,6 +63,11 @@ test('fallback reviewers use their own connected catalog independently of primar
     'connected Codex remains a fallback even when absent from the primary judge options');
   assert.deepEqual(judgeFallbackChoices({ ...snapshot, judgeFallback: { mode: 'automatic', options: [] } }), [],
     'an explicitly empty fallback catalog must not revive the primary list');
+});
+
+test('the checker is never offered as its own backup', () => {
+  const snapshot: ModelRolesSnapshot = { ...mr, judgeFallback: { mode: 'automatic', options: mr.available } };
+  assert.deepEqual(judgeFallbackChoices(snapshot).map((model) => model.id), ['glm-5.3']);
 });
 
 test('a brain option value splits into the door call and names its provider', () => {

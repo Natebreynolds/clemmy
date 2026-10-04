@@ -499,7 +499,7 @@ import { CodexRescueSettingsError, persistCodexRescueModel } from '../runtime/ha
 import { modelDiscoveryStatus, refreshModelDiscoveryNow } from '../runtime/harness/model-discovery.js';
 import { getRateLimitSnapshot, classifyCodexQuota } from '../runtime/harness/rate-limit-store.js';
 import { getClaudeUsageSnapshot } from '../runtime/harness/claude-usage.js';
-import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces, getFusionHealthSnapshot } from '../runtime/harness/debate-model.js';
+import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces, getFusionHealthSnapshot, checkerSettingsFacts } from '../runtime/harness/debate-model.js';
 import { getJudgeMetricsSnapshot } from '../runtime/harness/judge-family.js';
 import { summarizeApprovalAction, extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import {
@@ -8789,6 +8789,9 @@ export function registerConsoleRoutes(
       available: catalog.available,
       roleOptions: catalog.roleOptions,
       judgeFallback: judgeFallbackSettingsSnapshot(catalog),
+      // Whether the checker is independent of the work, whether it could be,
+      // and what an Automatic backup would really use.
+      checker: checkerSettingsFacts(),
       brainOptions: catalog.brainOptions,
       effectiveBrain: effectiveBrain(),
       effectiveBrainValue: effectiveBrainValue(),

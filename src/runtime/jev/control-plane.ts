@@ -1329,6 +1329,6 @@ async function recordJevJudgeMetric(
 ): Promise<void> {
   try {
     const { recordJudgeMetric } = await import('../harness/judge-family.js');
-    recordJudgeMetric({ lane, outcome, durationMs, modelId, fast: true });
+    recordJudgeMetric({ lane, outcome, durationMs, modelId, fast: true, jev: true });
   } catch { /* metrics never block the gate */ }
 }

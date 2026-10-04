@@ -1,4 +1,4 @@
-import { readCompletionReviewResponse, type MemoryModelProblem, type MemoryScope, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
+import { readCompletionReviewResponse, type CheckerFacts, type MemoryModelProblem, type MemoryScope, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
 import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.js';
 /**
  * Minimal fetch wrapper. All requests go same-origin (the PWA is
@@ -1851,6 +1851,9 @@ export interface ModelSettings {
   roleOptions?: Partial<Record<ModelRoleName, RoleModelGroup[]>>;
   /** The selected checker would review its own family's answers. */
   judgeReviewsOwnFamily?: boolean;
+  /** Whether the checker is independent of the work, whether it could be, and
+   *  what an Automatic backup would use. Absent on older daemons. */
+  checker?: CheckerFacts;
 }
 
 /** Paired mobile endpoint; independent of model choice and Second opinion. */

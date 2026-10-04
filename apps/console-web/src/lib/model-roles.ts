@@ -108,7 +108,10 @@ export function judgeFallbackSelection(value: string): JudgeFallbackSelection {
 
 export function judgeFallbackChoices(mr: ModelRolesSnapshot): Array<ModelChoice & { available: boolean }> {
   const setting = mr.judgeFallback;
-  const rows = flatChoices(setting?.options ?? mr.roleOptions?.judge).map((model) => ({
+  // The checker cannot stand in for itself, so its own model is no backup;
+  // a saved choice of it still shows, as unavailable, below.
+  const checker = mr.roles.judge.modelId;
+  const rows = flatChoices(setting?.options ?? mr.roleOptions?.judge).filter((model) => model.id !== checker).map((model) => ({
     ...model,
     available: !(setting?.mode === 'model' && setting.modelId === model.id && setting.available === false),
   }));

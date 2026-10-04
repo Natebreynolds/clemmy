@@ -5,7 +5,7 @@ import { Link, useLocation } from 'react-router-dom';
 import { AlertTriangle, Check, ChevronRight, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, ROLE_WORDS, useModelRoles } from '@/lib/model-roles';
-import { QUICK_ROLE_WORDS, memoryModelUnavailableText, memoryRoleAutomaticText, modelDisplayName } from '@clem/chat-engine';
+import { CHECKER_ROLE_WORDS, QUICK_ROLE_WORDS, checkerAutomaticText, checkerBackupAutomaticLabel, checkerSameFamilyWarning, jevFirstChecksText, memoryModelUnavailableText, memoryRoleAutomaticText, modelDisplayName } from '@clem/chat-engine';
 import { memoryTimeFormat } from '@/lib/memory-work';
 import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -134,6 +134,14 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const writer = mr.roles.writer;
   const judgeSharesWriterFamily = Boolean(writer && writer.source !== 'default' && writer.provider !== 'byo'
     && mr.roles.judge.provider === writer.provider);
+  // The daemon says whether the checker reviews its own provider's work and
+  // whether another provider could; with only one provider there is nothing
+  // to pick, so the page says that instead of asking for another family.
+  const checkerFacts = mr.checker;
+  const judge = mr.roles.judge;
+  const judgeAutomaticNote = judge.source === 'default' ? checkerAutomaticText(checkerFacts, judge.provider) : null;
+  const judgeFamilyWarning = checkerFacts ? checkerSameFamilyWarning(checkerFacts) : judgeSharesWriterFamily
+    ? CHECKER_ROLE_WORDS.sameFamilyWarning : null;
   // "Keeps your memory": Settings-only, shown when the daemon knows the role.
   // Automatic names the memory route's OWN model (never the checker's); a
   // chosen model that is gone leaves learning waiting, and the row says so.
@@ -203,16 +211,18 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
           </Select>,
           <>
             {inactive('writer')}
-            {judgeSharesWriterFamily && (
-              <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />The checker is from the same family as the writer, so it reviews its own family’s work. Pick a checker from another family.</div>
-            )}
+
           </>)}
         {row(ROLE_WORDS.judge.title, ROLE_WORDS.judge.hint,
           <Select disabled={busy === 'judge'} value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId} onChange={(e) => void r.onRole('judge', e.target.value)} aria-label="Model that checks the work">
-            <option value="__default__">Automatic · a fast model from another provider</option>
+            <option value="__default__">Automatic{judge.source === 'default' && judge.modelId ? ` · ${modelDisplayName(judge.modelId)}` : ''}</option>
             {judgeFlat.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
           </Select>,
           <>
+            {judgeAutomaticNote && <div className="mt-1 text-caption text-muted">{judgeAutomaticNote}</div>}
+            {judgeFamilyWarning && (
+              <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden /><span className="min-w-0">{judgeFamilyWarning}</span></div>
+            )}
             {inactive('judge')}
             {/* The owner connected a typed fast checker, watched it serve real
                 verdicts, and found nothing about it on the page that claims to
@@ -222,12 +232,8 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
                 without being told. Naming the arrangement is the honest fix.
                 Shown only once it has actually served — a count from the
                 ledger, never a claim that it is configured. */}
-            {(judgeMetrics?.total?.fastDecisions ?? 0) > 0 && (
-              <div className="mt-1 text-caption text-muted">
-                A fast checker answered first on{' '}
-                <span className="text-fg">{judgeMetrics?.total?.fastDecisions}</span>{' '}
-                {judgeMetrics?.total?.fastDecisions === 1 ? 'check' : 'checks'} — this model backstops it.
-              </div>
+            {(judgeMetrics?.total?.jevDecisions ?? 0) > 0 && (
+              <div className="mt-1 text-caption text-muted">{jevFirstChecksText(judgeMetrics?.total?.jevDecisions ?? 0)}</div>
             )}
             {secondOpinionOn && judgeSameAsBrain && (
               <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />The checker is the same model that does the work, so a second opinion adds little.</div>
@@ -235,14 +241,16 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
           </>)}
         {fallback && row(ROLE_WORDS.fallback.title, ROLE_WORDS.fallback.hint,
           <Select disabled={busy !== null} value={judgeFallbackValue(fallback)} onChange={(event) => void r.onJudgeFallback(event.target.value)} aria-label="Backup checker model" aria-describedby="judge-fallback-note">
-            <option value="automatic">Automatic</option>
+            <option value="automatic">{checkerBackupAutomaticLabel(checkerFacts, modelDisplayName)}</option>
             <option value="off">No fallback</option>
             {fallbackChoices.map((model) => <option key={`jf-${model.provider}-${model.id}`} value={`model:${model.id}`} disabled={!model.available}>{model.label}{model.provider ? ` · ${PROVIDER_LABEL[model.provider] ?? model.provider}` : ''}{!model.available ? ' (unavailable)' : ''}</option>)}
           </Select>,
           <div id="judge-fallback-note" className={`mt-1 text-caption ${fallbackUnavailable ? 'text-warning' : 'text-muted'}`} role={busy === 'judge-fallback' ? 'status' : undefined}>
             {busy === 'judge-fallback' ? 'Saving…' : fallbackUnavailable
               ? `Your saved choice is unavailable. ${fallback.reason || 'Connect it again or choose another fallback.'}`
-              : fallback.mode === 'off' ? 'The checker reviews without a backup.' : 'Applies to new requests.'}
+              : fallback.mode === 'off' ? 'The checker reviews without a backup.'
+              : fallback.mode === 'automatic' && checkerFacts && checkerFacts.automaticBackups.length === 0 ? CHECKER_ROLE_WORDS.backupNone
+              : 'Applies to new requests.'}
           </div>)}
         {memory && (
           <div

@@ -1,4 +1,4 @@
-import { MEMORY_ROLE_WORDS, QUICK_ROLE_WORDS, memoryModelUnavailableText, memoryRoleAutomaticText } from '@clem/chat-engine';
+import { CHECKER_ROLE_WORDS, MEMORY_ROLE_WORDS, QUICK_ROLE_WORDS, checkerAutomaticText, checkerSameFamilyWarning, memoryModelUnavailableText, memoryRoleAutomaticText } from '@clem/chat-engine';
 import { clockText } from './memory-work';
 import type { JudgeFallbackSelection, JudgeFallbackSetting, ModelRoleName, ModelSettings, ResolvedBrain, RoleModelGroup } from './api';
 
@@ -14,7 +14,10 @@ export function judgeFallbackSelection(value: string): JudgeFallbackSelection {
 
 export function judgeFallbackChoices(settings: ModelSettings): Array<{ id: string; label: string; available: boolean }> {
   const setting = settings.judgeFallback;
-  const rows = (setting?.options ?? settings.roleOptions?.judge ?? []).flatMap((group) => group.models.map((model) => ({
+  // The checker cannot stand in for itself, so its own model is no backup;
+  // a saved choice of it still shows, as unavailable, below.
+  const checker = settings.roles?.judge?.modelId;
+  const rows = (setting?.options ?? settings.roleOptions?.judge ?? []).flatMap((group) => group.models.filter((model) => model.id !== checker).map((model) => ({
     id: model.id,
     label: `${group.label} — ${modelName(model.label, group.label)}`,
     available: !(setting?.mode === 'model' && setting.modelId === model.id && setting.available === false),
@@ -53,7 +56,8 @@ export const ROLE_COPY: Record<ModelsRow, {
   judge: {
     title: 'Checks the work',
     explain: 'Reviews finished work before Clem calls it done.',
-    automatic: 'Clem picks a fast model from a different provider than the one writing.',
+    // Only when the checker really is from another provider: see roleAutomaticText.
+    automatic: CHECKER_ROLE_WORDS.automaticIndependent,
   },
   worker: {
     title: 'Helps in parallel',
@@ -130,8 +134,16 @@ export function modelLabel(modelId: string, settings: ModelSettings | null | und
 
 /** The note under "Automatic" in a role's picker. Keeps your memory borrows
  *  another role's model, and the daemon says whose. */
-export function roleAutomaticText(role: ModelRoleName, resolved?: Partial<Pick<ResolvedBrain, 'follows' | 'modelId'>>): string {
-  return role === 'memory' ? memoryRoleAutomaticText(resolved?.follows ?? null, resolved?.modelId || null) : ROLE_COPY[role].automatic;
+export function roleAutomaticText(
+  role: ModelRoleName,
+  resolved?: Partial<Pick<ResolvedBrain, 'follows' | 'modelId' | 'provider'>>,
+  settings?: Pick<ModelSettings, 'checker'> | null,
+): string {
+  if (role === 'memory') return memoryRoleAutomaticText(resolved?.follows ?? null, resolved?.modelId || null);
+  // Checks the work comes from another provider only when one is connected;
+  // the daemon says which, and the warning speaks when a choice undoes it.
+  if (role === 'judge') return checkerAutomaticText(settings?.checker, resolved?.provider ?? '') ?? '';
+  return ROLE_COPY[role].automatic;
 }
 
 /** The brain as its picker names it. */
@@ -163,6 +175,12 @@ export function roleSummary(role: ModelRoleName, settings: ModelSettings): strin
  *  it (the same words the picker and the desktop use). */
 export function roleNote(role: ModelRoleName, settings: ModelSettings): string | null {
   const resolved = settings.roles?.[role];
+  // With one provider connected the checker reviews its own provider's work;
+  // the row says so where the owner reads it, not only inside the picker.
+  if (role === 'judge' && resolved?.modelId && !isChosen(resolved)
+    && settings.checker?.reviewsOwnFamily && !settings.checker.otherFamilyConnected) {
+    return roleAutomaticText('judge', resolved, settings) || null;
+  }
   if (role !== 'memory' || !resolved?.modelId || isChosen(resolved) || !resolved.follows) return null;
   return memoryRoleAutomaticText(resolved.follows, resolved.modelId);
 }
@@ -195,7 +213,8 @@ export function inactiveNote(resolved: ResolvedBrain | undefined, settings: Mode
 /** Warn only when the owner made a choice the checker's independence depends
  *  on: Clem's own pick already avoids the writer's family when it can. */
 export function sameFamilyWarning(settings: ModelSettings): string | null {
-  if (!settings.judgeReviewsOwnFamily) return null;
   if (!isChosen(settings.roles?.judge) && !isChosen(settings.roles?.writer)) return null;
-  return 'The model checking the work comes from the same provider as the one writing it, so the check is less independent. Pick a checker from a different provider.';
+  // There is no other provider to pick until one is connected.
+  if (settings.checker) return checkerSameFamilyWarning(settings.checker);
+  return settings.judgeReviewsOwnFamily ? CHECKER_ROLE_WORDS.sameFamilyWarning : null;
 }

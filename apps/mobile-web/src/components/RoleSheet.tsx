@@ -144,7 +144,7 @@ export function RoleSheet({ role, settings, review, reviewBusy, reviewError, onT
             <span class="brain-dot ok" aria-hidden="true" />
             <span class="role-row-main">
               <span class="brain-row-label">Automatic</span>
-              <span class="role-row-note">{roleAutomaticText(role, resolved)}</span>
+              <span class="role-row-note">{roleAutomaticText(role, resolved, settings)}</span>
             </span>
             <span class="brain-row-note">{busyKey === 'automatic' ? 'Saving…' : chosen ? '' : 'Current'}</span>
           </button>

@@ -267,12 +267,12 @@ export function ModelPicker({ sessionId, agentId, applyAgent, className }: {
             <span><span className="block text-small font-semibold text-fg">Checks the work</span><span className="block text-caption text-faint">reviews · everywhere</span></span>
             <RoleSelect
               label="Model that checks the work"
-              title={mr.roles.judge.source === 'default' ? 'Automatic · a fast model from another provider' : `${roleLabel(mr, 'judge')} · ${PROVIDER_LABEL[judgeProv] ?? judgeProv}`}
+              title={mr.roles.judge.source === 'default' ? `Automatic · ${roleLabel(mr, 'judge')}` : `${roleLabel(mr, 'judge')} · ${PROVIDER_LABEL[judgeProv] ?? judgeProv}`}
               disabled={busy}
               value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId}
               onChange={(v) => void roles.onRole('judge', v)}
             >
-              <option value="__default__">Automatic · a fast model from another provider</option>
+              <option value="__default__">Automatic{mr.roles.judge.source === 'default' ? ` · ${roleLabel(mr, 'judge')}` : ''}</option>
               {roles.judges.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
             </RoleSelect>
           </div>

@@ -1354,6 +1354,32 @@ export function judgeReviewsOwnFamily(): boolean {
   }
 }
 
+/** What Settings says about the checker, read from the rules that pick it. */
+export interface CheckerSettingsFacts {
+  /** The checker reviews work written by its own provider family. */
+  reviewsOwnFamily: boolean;
+  /** A provider family other than the one whose work is checked is signed in. */
+  otherFamilyConnected: boolean;
+  /** What the Automatic backup would try after the checker, in order. Empty
+   *  when nothing else is connected that could check the work. */
+  automaticBackups: Array<{ modelId: string; provider: string }>;
+}
+
+export function checkerSettingsFacts(): CheckerSettingsFacts {
+  let otherFamilyConnected = false;
+  try {
+    const work = boundWriterModel() ?? resolveRoleModel('brain');
+    otherFamilyConnected = (claudeAvailable() && work.provider !== 'claude')
+      || (codexAvailable() && work.provider !== 'codex');
+  } catch { /* a page names only what it can show */ }
+  let automaticBackups: CheckerSettingsFacts['automaticBackups'] = [];
+  try {
+    automaticBackups = resolveBoundaryJudgeChain({ fallbackMode: 'automatic' }).slice(1)
+      .map((lane) => ({ modelId: lane.modelId, provider: lane.judgeFamily }));
+  } catch { /* no lane could be built */ }
+  return { reviewsOwnFamily: judgeReviewsOwnFamily(), otherFamilyConnected, automaticBackups };
+}
+
 export function executedBrainFamily(configured: ModelProviderClass): ModelProviderClass {
   const store = harnessRunContextStorage.getStore();
   const sessionId = store?.sessionId;
@@ -1484,9 +1510,11 @@ export function resolveBoundaryJudge(
  * throws: a provider that can't build a model is simply skipped. Kill-switch off
  * ⇒ only the preferred lane (pre-J1 single-lane behavior).
  */
-export function resolveBoundaryJudgeChain(): BoundaryJudgeRouting[] {
+export function resolveBoundaryJudgeChain(
+  options: { fallbackMode?: 'automatic' } = {},
+): BoundaryJudgeRouting[] {
   const selection = captureBoundaryJudgeSelection();
-  const fallbackMode = boundaryJudgeFallbackMode(selection);
+  const fallbackMode = options.fallbackMode ?? boundaryJudgeFallbackMode(selection);
   const chain: BoundaryJudgeRouting[] = [];
   const seen = new Set<string>();
   const push = (r: BoundaryJudgeRouting | null): void => {
