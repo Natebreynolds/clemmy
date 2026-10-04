@@ -126,3 +126,34 @@ test('nothing goes deeper than Clem → lead → workers', () => {
   assert.match(depth.LEAD_DOES_NOT_HAND_ON, /run_worker/);
   assert.match(depth.WORKER_STARTS_NOTHING, /does not start other workers/);
 });
+
+test('a job handed to an agent keeps the plan scope but leaves the split across workers to the agent', async () => {
+  const { registerBackgroundTaskTools } = await import('../tools/background-task-tools.js');
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const { getBackgroundTask } = await import('../execution/background-tasks.js');
+  type Handler = (input: Record<string, unknown>) => Promise<{ content?: Array<{ text?: string }> }>;
+  const handlers = new Map<string, Handler>();
+  registerBackgroundTaskTools({ tool(name: string, _d: string, _s: unknown, handler: Handler) { handlers.set(name, handler); } } as never);
+  const dispatch = handlers.get('dispatch_background_task')!;
+  const p = project('Lead Fixture Wrapper');
+  const lead = agent('Wrapper Lead');
+  projects.saveAssignment(p.id, { agentId: lead.id, lead: true });
+  const chat = createSession({ id: 'lead-wrapper-chat', kind: 'chat' });
+  setSessionProject(chat.id, p.id, { by: 'owner' } as never);
+  const run = async (sessionId: string) => {
+    const out = await withToolOutputContext({ sessionId }, () => dispatch({
+      objective: 'Build the fixture audit.', handoff_note: 'Handing this over.', plan: '- Gather the data\n- Write the audit',
+      success_criteria: [], context_refs: [], max_minutes: 15,
+    }));
+    const taskId = (out.content?.[0]?.text ?? '').match(/task (bg-[a-zA-Z0-9_-]+)/)?.[1];
+    assert.ok(taskId, out.content?.[0]?.text);
+    return getBackgroundTask(taskId!)!;
+  };
+  const handed = await run(chat.id);
+  assert.equal(handed.delegation?.agentId, lead.id);
+  assert.match(handed.prompt, /how you split the work across your workers is yours to decide/);
+  assert.doesNotMatch(handed.prompt, /do NOT re-derive a different approach/);
+  const plain = await run(createSession({ id: 'plain-wrapper-chat', kind: 'chat' }).id);
+  assert.equal(plain.delegation, undefined);
+  assert.match(plain.prompt, /do NOT re-derive a different approach/, 'an ordinary background job keeps the strict plan');
+});

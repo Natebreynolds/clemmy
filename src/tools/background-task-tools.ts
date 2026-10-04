@@ -457,19 +457,6 @@ export function registerBackgroundTaskTools(server: McpServer): void {
           + `do NOT process items yourself this turn, and do NOT repeat this message or the plan id verbatim.`,
         );
       }
-      const composedPrompt = [
-        `Objective: ${objective}`,
-        '',
-        'Agreed plan (execute these steps — this was settled with the user; do NOT re-derive a different approach):',
-        plan,
-        success_criteria && success_criteria.length > 0
-          ? `\nSuccess criteria (the run is done only when ALL hold):\n- ${success_criteria.join('\n- ')}`
-          : '',
-        context_refs && context_refs.length > 0
-          ? `\nLoad this context FIRST, before producing any artifact:\n- ${context_refs.join('\n- ')}`
-          : '',
-      ].filter(Boolean).join('\n');
-
       // Who does the work and in which project is decided once, before any
       // task exists. A name that is not saved, or an agent that is not
       // assigned to the project, starts nothing.
@@ -487,6 +474,23 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       if (delegated.kind === 'refuse') {
         return textResult(JSON.stringify({ ok: false, code: 'delegation_refused', detail: delegated.reason }));
       }
+
+      const composedPrompt = [
+        `Objective: ${objective}`,
+        '',
+        // An agent handed the job keeps the plan's scope, sources and limits;
+        // how the work is split across its workers is its own call.
+        delegated.kind === 'bound'
+          ? 'Agreed plan (its scope, sources and limits were settled with the user — keep to them; how you split the work across your workers is yours to decide):'
+          : 'Agreed plan (execute these steps — this was settled with the user; do NOT re-derive a different approach):',
+        plan,
+        success_criteria && success_criteria.length > 0
+          ? `\nSuccess criteria (the run is done only when ALL hold):\n- ${success_criteria.join('\n- ')}`
+          : '',
+        context_refs && context_refs.length > 0
+          ? `\nLoad this context FIRST, before producing any artifact:\n- ${context_refs.join('\n- ')}`
+          : '',
+      ].filter(Boolean).join('\n');
 
       const originRoute = backgroundRouteForOriginSession(sessionId);
       const task = enqueueDurableChatTask({
