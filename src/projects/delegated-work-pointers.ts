@@ -11,6 +11,7 @@
 import { listBackgroundTasks, type BackgroundTaskRecord } from '../execution/background-tasks.js';
 import { getSession } from '../runtime/harness/eventlog.js';
 import { sessionProjectState } from './session-project-state.js';
+import { RETAINED_WORK_TERMINAL_HEADER } from '../runtime/harness/retained-work-checkpoint.js';
 
 const SHOWN = 4;
 const RECENT_MS = 14 * 24 * 60 * 60 * 1000;
@@ -30,17 +31,28 @@ function standing(task: BackgroundTaskRecord): string {
   }
 }
 
+const STOPPED: ReadonlySet<string> = new Set(['blocked', 'failed', 'aborted', 'interrupted']);
+
+/** Why it stopped, without the saved-work handles that follow the reason. */
+function stopReason(text: string): string {
+  const cut = text.indexOf(RETAINED_WORK_TERMINAL_HEADER);
+  return (cut >= 0 ? text.slice(0, cut) : text).replace(/\s+/g, ' ').trim().slice(0, 200);
+}
+
 function line(task: BackgroundTaskRecord): string {
   const delegation = task.delegation!;
   const owner = delegation.agentName ?? 'Clem';
   const where = delegation.projectName ? ` in ${delegation.projectName}` : '';
   const version = (task.contractVersion ?? 1) > 1 ? `, request v${task.contractVersion}` : '';
   const follows = delegation.followsTaskId ? `, follows ${delegation.followsTaskId}` : '';
+  // Where the work lands is known from the start, so a question or a change
+  // about it can name the output even while the task is paused or stopped.
   const result = task.status === 'done'
     ? [delegation.artifactDestination ? `result at: ${delegation.artifactDestination}` : '',
       task.resultPath ? `full report: ${task.resultPath}` : '',
       task.result ? `report began: ${task.result.replace(/\s+/g, ' ').trim().slice(0, 240)}` : ''].filter(Boolean).join('; ')
-    : '';
+    : [delegation.artifactDestination ? `Its output goes to: ${delegation.artifactDestination} (may be partial)` : '',
+      STOPPED.has(task.status) && task.error && stopReason(task.error) ? `stopped because: ${stopReason(task.error)}` : ''].filter(Boolean).join('; ');
   return `- ${task.id} "${task.title.slice(0, 100)}": ${owner}${where}, ${standing(task)}${version}${follows}${result ? `. ${result}` : ''}`;
 }
 

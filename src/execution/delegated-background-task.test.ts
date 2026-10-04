@@ -312,6 +312,22 @@ test('work moved to the background from a project finds its agent once, when it 
   assert.equal(delegatedWorkPointers(createSession({ id: 'promoted-outsider', kind: 'chat' }).id), '');
 });
 
+test('the conversation is told where unfinished delegated work lands and why it stopped', async () => {
+  for (const existing of tasks.listBackgroundTasks({ includeArchived: true })) tasks.archiveBackgroundTask(existing.id);
+  const { delegatedWorkPointers } = await import('../projects/delegated-work-pointers.js');
+  const origin = createSession({ id: 'paused-output-origin', kind: 'chat' });
+  const task = tasks.createBackgroundTask({ title: 'Build the briefing page', prompt: 'Objective: Build the briefing page', originSessionId: origin.id, source: 'desktop',
+    delegation: { agentId: analyst.id, agentName: analyst.name, agentCreatedAt: analyst.createdAt, projectId: sales.id, projectName: sales.name,
+      assignedBy: 'clem', artifactDestination: '/tmp/briefing-page' } });
+  assert.match(delegatedWorkPointers(origin.id), /waiting to start\. Its output goes to: \/tmp\/briefing-page \(may be partial\)/);
+  tasks.markBackgroundTaskRunning(task.id);
+  const { RETAINED_WORK_TERMINAL_HEADER } = await import('../runtime/harness/retained-work-checkpoint.js');
+  tasks.markBackgroundTaskFailed(task.id, `Two evidence items failed.\n${RETAINED_WORK_TERMINAL_HEADER}\n- handle-1`, 'interrupted');
+  const pointers = delegatedWorkPointers(origin.id);
+  assert.match(pointers, /Its output goes to: \/tmp\/briefing-page \(may be partial\); stopped because: Two evidence items failed\./);
+  assert.doesNotMatch(pointers, /handle-1/, 'the reason, without the saved-work handles');
+});
+
 test('the agent running a delegated job checks in with the conversation that handed it over, under its own name', async () => {
   const origin = createSession({ id: 'lead-check-in-origin', kind: 'chat' });
   const task = tasks.createBackgroundTask({ title: 'Build the fixture audit', prompt: 'Objective: Build the fixture audit', originSessionId: origin.id, source: 'desktop',
