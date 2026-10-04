@@ -950,3 +950,41 @@ test('recorded three-prospect draft request keeps its three independent worker p
   assert.match(detected.exactMembers![1], /Priya Nair/);
   assert.match(detected.exactMembers![2], /Marcus Bell/);
 });
+
+test('a delegated job counts its objective and plan, never the host checklist below them', () => {
+  const checklist = [
+    'Success criteria (the run is done only when ALL hold):',
+    '- Every customer listed in sources.txt is accounted for',
+    "- Each written brief is grounded in that customer's source file",
+    '- Briefs are written and read back for verification',
+    '- The completion report lists exact files written and any gaps',
+    '',
+    'Load this context FIRST, before producing any artifact:',
+    '- /fixtures/project/CLAUDE.md',
+    '- /fixtures/project/sources.txt',
+  ].join('\n');
+  const proseJob = [
+    'Objective: Write a short source-based brief for every customer in sources.txt',
+    '',
+    'Agreed plan (its scope, sources and limits were settled with the user — keep to them; how you split the work across your workers is yours to decide):',
+    'Read sources.txt to enumerate the customers. For each one, read its source file and write a short brief.',
+    '',
+    checklist,
+  ].join('\n');
+  assert.equal(detectMultiItemIntent(proseJob).isMultiItem, false, 'six checklist bullets are not six work items');
+  const sessionId = openTurn('quantified-delegated-checklist', 'execution', proseJob);
+  const decision = gate({ sessionId, items: ['harbor', 'lantern', 'willow', 'copper'], workManifest: descriptor('briefs') });
+  assert.equal(decision.ok, true, decision.error);
+
+  const listedJob = [
+    'Objective: Write one brief for each of these three firms',
+    '',
+    'Agreed plan (execute these steps — this was settled with the user; do NOT re-derive a different approach):',
+    '1. Alder Law',
+    '2. Birch Law',
+    '3. Cedar Law',
+    '',
+    checklist,
+  ].join('\n');
+  assert.equal(detectMultiItemIntent(listedJob).itemCount, 3, 'a list the plan names is still the universe');
+});

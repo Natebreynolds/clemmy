@@ -1,4 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { DELEGATED_JOB_CONTEXT_HEADING, DELEGATED_JOB_CRITERIA_HEADING, DELEGATED_JOB_OBJECTIVE_PREFIX } from '../runtime/harness/delegated-job-prompt.js';
 import { z } from 'zod';
 import {
   getBackgroundTaskStatus,
@@ -476,7 +477,7 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       }
 
       const composedPrompt = [
-        `Objective: ${objective}`,
+        `${DELEGATED_JOB_OBJECTIVE_PREFIX}${objective}`,
         '',
         // An agent handed the job keeps the plan's scope, sources and limits;
         // how the work is split across its workers is its own call.
@@ -485,10 +486,10 @@ export function registerBackgroundTaskTools(server: McpServer): void {
           : 'Agreed plan (execute these steps — this was settled with the user; do NOT re-derive a different approach):',
         plan,
         success_criteria && success_criteria.length > 0
-          ? `\nSuccess criteria (the run is done only when ALL hold):\n- ${success_criteria.join('\n- ')}`
+          ? `\n${DELEGATED_JOB_CRITERIA_HEADING}\n- ${success_criteria.join('\n- ')}`
           : '',
         context_refs && context_refs.length > 0
-          ? `\nLoad this context FIRST, before producing any artifact:\n- ${context_refs.join('\n- ')}`
+          ? `\n${DELEGATED_JOB_CONTEXT_HEADING}\n- ${context_refs.join('\n- ')}`
           : '',
       ].filter(Boolean).join('\n');
 

@@ -5,6 +5,7 @@
  * exact same conservative signal without loading memory, MCP, health, or
  * embedding subsystems into a worker process.
  */
+import { delegatedJobWorkText } from './delegated-job-prompt.js';
 
 export const READ_RE = /\b(?:find|pull|query|search|scrape|crawl|research|audit|summarize|analyze|gather|inspect)\b/i;
 export const WRITE_RE =
@@ -105,6 +106,13 @@ const ORIGINAL_REQUEST_MARKER_RE = /(?:^|\n)[ \t]*Original request:[ \t]*\r?\n/g
  * genuinely distinct numbered lists retain both universes.
  */
 function canonicalMultiItemObjective(input: string): string {
+  const objective = envelopeObjective(input);
+  // A delegated job's prompt ends with the host's checklist (success criteria,
+  // context to load) as bullet lines; only its objective and plan are work.
+  return delegatedJobWorkText(objective) ?? objective;
+}
+
+function envelopeObjective(input: string): string {
   if (!DURABLE_BACKGROUND_ENVELOPE_RE.test(input)) return input;
   const markers = [...input.matchAll(new RegExp(
     ORIGINAL_REQUEST_MARKER_RE.source,
