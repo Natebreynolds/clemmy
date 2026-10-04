@@ -32,6 +32,9 @@ interface Props {
   follows?: string | null;
   /** The tasks the host already lists, so a follow-up is never drawn twice. */
   listed?: ReadonlySet<string>;
+  /** In a conversation the report arrives as Clem's own message; the card
+   *  does not say it twice. */
+  hideReport?: boolean;
 }
 
 const ITEM_WORDS: Record<'done' | 'working' | 'failed' | 'waiting', string> = {
@@ -47,7 +50,7 @@ function newest(given: DelegatedTask, settled: DelegatedTask | null): DelegatedT
   return settled.updatedAt.localeCompare(given.updatedAt) > 0 ? settled : given;
 }
 
-export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNeedsYou, hideProject, hideOwner, follows, listed }: Props) {
+export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNeedsYou, hideProject, hideOwner, follows, listed, hideReport }: Props) {
   const [settled, setSettled] = useState<DelegatedTask | null>(null);
   // The task a correction started, shown in place until the host lists it.
   const [followUp, setFollowUp] = useState<DelegatedTask | null>(null);
@@ -261,7 +264,7 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
         </ul>
       ) : null}
 
-      {view.report ? (
+      {view.report && !hideReport ? (
         <div class="task-report">
           {/* The report is markdown, like a chat reply. */}
           <div class="bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(view.report) }} />

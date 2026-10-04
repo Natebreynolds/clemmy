@@ -339,6 +339,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       onChanged={() => void refreshTasks()}
       onOpenRun={onOpenRun}
       onOpenNeedsYou={onOpenNeedsYou}
+      hideReport
     />
   );
 
