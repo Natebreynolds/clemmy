@@ -326,3 +326,24 @@ test('worker call_tool advances its sealed revision once and refuses outside reb
     else process.env.CLEMMY_WORKER_SLIM_TOOLS = priorSlim;
   }
 });
+
+test('a slim worker leased external tools keeps its own discovery door first-class', async () => {
+  const session = createSession({ kind: 'agent', title: 'leased worker' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Gather one evidence block.' } });
+  const planning = {
+    authority: { scope: 'primary_model_planning_catalog_v1' },
+    identity: { sessionId: session.id, sourceUserSeq: source.seq },
+    capabilities: [], digest: '0'.repeat(64), effectCeiling: 'read', withheld: [],
+  } as never;
+  // The parent resolves the lease against its own scope and hands the exact
+  // result to the worker, as the run_worker path does.
+  const lease = { reason: 'worker typed exact external MCP lease', authority: 'exact' as const,
+    allowedServerSlugs: ['fixture'], allowedToolNames: ['fixture__api_request'], maxTools: 1 };
+  const leased = await buildWorkerAgent({ sessionId: session.id, sourceUserSeq: source.seq, hostFreshPlanning: planning,
+    mcpToolScope: lease as never, workerInput: { objective: 'Gather one evidence block.', item: 'one' } as never });
+  const leasedNames = leased.tools.map((tool) => (tool as { name?: string }).name);
+  assert.ok(leasedNames.includes('tool_search'), `leased worker discovers through its own tool_search: ${leasedNames.join(',')}`);
+  const plain = await buildWorkerAgent({ sessionId: session.id, sourceUserSeq: source.seq });
+  const plainNames = plain.tools.map((tool) => (tool as { name?: string }).name);
+  assert.ok(!plainNames.includes('tool_search'), 'a worker with no lease keeps the slim surface');
+});

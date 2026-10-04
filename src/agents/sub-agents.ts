@@ -269,11 +269,17 @@ export async function buildWorkerAgent(options: {
     ].join('\n');
   } else if (workerSlimToolsEnabled()) {
     const names = tools.map((t) => (t as { name?: string }).name ?? '').filter(Boolean);
+    // A worker leased external tools by its parent discovers them through its
+    // own tool_search, which carries the leased sources (below); call_tool's
+    // built-in discovery has none, so that door stays first-class here.
+    const alwaysLoaded = options.hostFreshPlanning && externalMcpScope
+      ? new Set([...WORKER_ALWAYS_LOADED, 'tool_search'])
+      : WORKER_ALWAYS_LOADED;
     const surface = resolveToolSurface({
       surface: 'worker',
       lane: 'worker',
       availableNames: names,
-      alwaysLoadedNames: WORKER_ALWAYS_LOADED,
+      alwaysLoadedNames: alwaysLoaded,
       deferralEnabled: true,
       reason: 'worker schema-on-demand',
     });
@@ -305,11 +311,12 @@ export async function buildWorkerAgent(options: {
     // The external tools the parent leased this worker are discoverable here
     // through the same provider sources the parent's discovery uses, so the
     // worker can prove and call them; the lease bounds what it can find.
+    const door = actionWork ? 'work_call' : 'call_tool';
     const leasedSources = externalMcpScope
-      ? buildAuthorizedToolSearchCandidateSources(externalMcpScope, options.hostFreshPlanning.identity, actionWork ? 'work_call' : 'call_tool')
+      ? buildAuthorizedToolSearchCandidateSources(externalMcpScope, options.hostFreshPlanning.identity, door)
       : undefined;
     tools = tools.map((toolRef) => ((toolRef as { name?: string }).name === 'tool_search'
-      ? buildScopedLocalToolSearch(names, 'work_call', undefined, leasedSources, disclosure)
+      ? buildScopedLocalToolSearch(names, door, undefined, leasedSources, disclosure)
       : toolRef));
   }
 
