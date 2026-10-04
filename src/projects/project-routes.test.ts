@@ -134,7 +134,11 @@ test('a project made on the desktop is the same project on the phone, with the s
   assert.ok(listEvents(chat.id, { types: ['delegated_task_state'] }).some((event) => event.data.phase === 'revised' && event.data.contractVersion === 2));
 
   // It asks; the project shows one decision; answered on the phone, settled on the desktop.
-  tasks.markBackgroundTaskAwaitingInput(task.id, 'q-region', 'Which region should the briefing cover?', { options: ['East', 'West'] });
+  // The run's retained-work listing rides after its question; the owner is asked only the question.
+  tasks.markBackgroundTaskAwaitingInput(task.id, 'q-region',
+    'Which region should the briefing cover?\n\nRetained work (durable checkpoint):\n- Source/tool list_files: completed result retained as rh_0123456789abcdef.',
+    { options: ['East', 'West'] });
+  assert.equal((await phone('get', `/api/delegated-tasks/${task.id}`)).body.task.question.text, 'Which region should the briefing cover?');
   const waiting = (await desktop('get', `/api/console/project-records/${id}`)).body.overview;
   assert.deepEqual(waiting.decisions.map((row: any) => [row.kind, row.taskId, row.detail, row.owner, row.options]),
     [['question', task.id, 'Which region should the briefing cover?', 'Route Analyst', ['East', 'West']]]);
@@ -184,6 +188,25 @@ test('a project made on the desktop is the same project on the phone, with the s
   const other = createSession({ id: 'route-chat-2', kind: 'chat' });
   assert.deepEqual((await phone('post', `/api/chat/sessions/${other.id}/project`, { projectId: id })).body, { error: 'PROJECT_ARCHIVED' });
   void getSession;
+});
+
+test('a job shows the files its workers saved and the items they were given', async () => {
+  const { appendEvent } = await import('../runtime/harness/eventlog.js');
+  const job = tasks.createBackgroundTask({ title: 'Write the fixture notes', prompt: 'Objective: Write the fixture notes',
+    originSessionId: createSession({ kind: 'chat' }).id, source: 'desktop',
+    delegation: { agentId: analyst.id, agentName: analyst.name, agentCreatedAt: analyst.createdAt, projectId: null, projectName: null, assignedBy: 'owner' } as never });
+  tasks.markBackgroundTaskRunning(job.id);
+  const worker = createSession({ kind: 'chat' });
+  for (const item of ['alpha', 'beta']) {
+    appendEvent({ sessionId: job.runSessionId, turn: 0, role: 'system', type: 'worker_started', data: { item, childSessionId: worker.id } });
+  }
+  appendEvent({ sessionId: worker.id, turn: 0, role: 'system', type: 'deliverable_saved', data: { name: 'alpha.md', dir: 'notes' } });
+  appendEvent({ sessionId: job.runSessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: 'alpha', ok: true } });
+  const view = (await phone('get', `/api/delegated-tasks/${job.id}`)).body.task;
+  assert.deepEqual(view.files, [{ name: 'alpha.md', dir: 'notes' }]);
+  assert.deepEqual(view.work, { done: 1, total: 2, partial: true, items: [
+    { id: 'alpha', label: 'alpha', state: 'done' }, { id: 'beta', label: 'beta', state: 'working' },
+  ] });
 });
 
 test('an assignment whose agent is gone still says who it was, and says it is unavailable', async () => {

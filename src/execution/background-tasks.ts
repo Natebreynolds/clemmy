@@ -1,4 +1,5 @@
 import '../runtime/harness/memory-scope-binding.js';
+import { RETAINED_WORK_TERMINAL_HEADER } from '../runtime/harness/retained-work-checkpoint.js';
 import { randomBytes } from 'node:crypto';
 import { getSavedClis } from '../runtime/saved-clis.js';
 import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
@@ -3324,11 +3325,15 @@ export function markBackgroundTaskAwaitingInput(
 ): BackgroundTaskRecord | null {
   if (!prepareWorkerSettlementForCas(id)) return null;
   const taskAtPause = getBackgroundTask(id);
+  // The owner is asked the question; the retained-work listing after it is
+  // for the run that resumes, which keeps it in the task's result.
+  const retainedAt = question.indexOf(RETAINED_WORK_TERMINAL_HEADER);
+  const ownerQuestion = (retainedAt > 0 ? question.slice(0, retainedAt) : question).trim() || question;
   const pendingQuestionOptions = opts.options !== undefined
     ? cleanBackgroundQuestionOptions(opts.options)
-    : matchingBackgroundQuestionOptions(taskAtPause, questionId, question);
-  const reportDetail = progressPreservingPauseDetail(question, opts);
-  const notificationBody = progressPreservingPauseDetail(question, opts, 2000);
+    : matchingBackgroundQuestionOptions(taskAtPause, questionId, ownerQuestion);
+  const reportDetail = progressPreservingPauseDetail(ownerQuestion, opts);
+  const notificationBody = progressPreservingPauseDetail(ownerQuestion, opts, 2000);
   const blockedOnCli = detectBlockedOnCli(opts.blockerType, opts.blockerReason, rosterCliCommands());
   const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, (task) => ({
     ...clearParkedBackgroundState(),
@@ -3337,7 +3342,7 @@ export function markBackgroundTaskAwaitingInput(
     error: opts.blockerReason ? clean(opts.blockerReason, 1000) : undefined,
     pendingQuestionId: questionId,
     ...(blockedOnCli ? { blockedOnCli } : {}),
-    pendingQuestion: question.slice(0, RESULT_TRUNCATE_CHARS),
+    pendingQuestion: ownerQuestion.slice(0, RESULT_TRUNCATE_CHARS),
     ...(pendingQuestionOptions.length > 0 ? { pendingQuestionOptions } : {}),
     result: (opts.resultText ?? question).slice(0, RESULT_TRUNCATE_CHARS),
     outcomeSnapshot: buildBackgroundTaskOutcomeSnapshot(task, 'needs_input', {

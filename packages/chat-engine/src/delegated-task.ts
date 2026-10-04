@@ -59,6 +59,8 @@ export interface DelegatedTaskWork {
   done: number;
   total: number;
   items: Array<{ id: string; label: string; state: 'done' | 'working' | 'failed' | 'waiting'; note?: string }>;
+  /** What its workers were given rather than a declared list: maybe not the whole job. */
+  partial?: true;
 }
 
 export type DelegatedTaskTone = 'live' | 'warning' | 'success' | 'danger' | 'neutral';
@@ -193,7 +195,8 @@ export function delegatedTaskCard(task: DelegatedTask, options: { resultChars?: 
     ? { text: task.question.text.trim(), options: (task.question.options ?? []).filter((option) => typeof option === 'string' && option.trim().length > 0) }
     : null;
   const work = task.work && task.work.total > 0 ? task.work : null;
-  const missing = work ? work.items.filter((item) => item.state !== 'done') : [];
+  // Only a declared work list knows what is missing; its workers' items may not be the whole job.
+  const missing = work && !work.partial ? work.items.filter((item) => item.state !== 'done') : [];
   const missingWords = missing.length > 0
     ? `${missing.length} of ${work!.total} not done: ${missing.slice(0, 3).map((item) => item.label).join(', ')}${missing.length > 3 ? `, and ${missing.length - 3} more` : ''}.`
     : '';
@@ -208,7 +211,7 @@ export function delegatedTaskCard(task: DelegatedTask, options: { resultChars?: 
     taskId: task.taskId,
     title: task.title?.trim() || 'Untitled task',
     owner,
-    progress: work ? { ...work, label: `${work.done} of ${work.total} done` } : null,
+    progress: work ? { ...work, label: work.partial ? `${work.done} done so far` : `${work.done} of ${work.total} done` } : null,
     now: task.phase === 'working'
       ? (working.length > 0 ? `Working on ${working.slice(0, 3).join(', ')}${working.length > 3 ? ` and ${working.length - 3} more` : ''}.` : null)
       : null,

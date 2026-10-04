@@ -71,12 +71,36 @@ export interface DelegatedTaskWorkView {
   done: number;
   total: number;
   items: Array<{ id: string; label: string; state: 'done' | 'working' | 'failed' | 'waiting'; note?: string }>;
+  /** The items are what its workers were given, not a declared work list,
+   *  so they may not be the whole job. */
+  partial?: true;
+}
+
+/** Without a declared work list, the items its workers were given, each with
+ *  its latest result. */
+function workerItemsView(runSessionId: string): DelegatedTaskWorkView | null {
+  const items = new Map<string, DelegatedTaskWorkView['items'][number]>();
+  try {
+    for (const event of listEvents(runSessionId, { types: ['worker_started', 'worker_result'] })) {
+      const data = event.data as { item?: unknown; ok?: unknown };
+      if (event.role !== 'system' || typeof data.item !== 'string' || !data.item.trim()) continue;
+      const label = data.item.trim();
+      items.set(label, {
+        id: label,
+        label,
+        state: event.type === 'worker_started' ? 'working' : data.ok === true ? 'done' : 'failed',
+      });
+    }
+  } catch { return null; }
+  if (items.size === 0) return null;
+  const list = [...items.values()].slice(0, 40);
+  return { done: list.filter((item) => item.state === 'done').length, total: items.size, items: list, partial: true };
 }
 
 /** The job's latest work list as the owner reads it: each item and where it stands. */
 function workView(runSessionId: string): DelegatedTaskWorkView | null {
   const manifest = summarizeWorkManifest(runSessionId);
-  if (!manifest || manifest.items.length === 0) return null;
+  if (!manifest || manifest.items.length === 0) return workerItemsView(runSessionId);
   const items = manifest.items.slice(0, 40).map((item) => {
     const phases = Object.values(item.phases);
     const failed = phases.find((phase) => phase.status === 'failed');
@@ -94,11 +118,18 @@ function workView(runSessionId: string): DelegatedTaskWorkView | null {
   return { done: manifest.items.filter((item) => item.complete).length, total: manifest.items.length, items };
 }
 
-/** The files a job saved, by name, newest last. */
+/** The files a job saved, by name, newest last: its own and its workers'. */
 function filesView(runSessionId: string): Array<{ name: string; dir: string | null }> {
   const files = new Map<string, { name: string; dir: string | null }>();
   try {
-    for (const event of listEvents(runSessionId, { types: ['deliverable_saved'] })) {
+    const sessions = [runSessionId];
+    for (const event of listEvents(runSessionId, { types: ['worker_started'] })) {
+      const child = (event.data as { childSessionId?: unknown }).childSessionId;
+      if (event.role === 'system' && typeof child === 'string' && child.trim() && !sessions.includes(child)) sessions.push(child);
+    }
+    const saved = sessions.flatMap((sessionId) => listEvents(sessionId, { types: ['deliverable_saved'] }))
+      .sort((a, b) => a.seq - b.seq);
+    for (const event of saved) {
       const data = event.data as { name?: unknown; dir?: unknown };
       if (typeof data.name !== 'string' || !data.name.trim()) continue;
       const dir = typeof data.dir === 'string' && data.dir.trim() ? data.dir.trim() : null;
@@ -165,7 +196,7 @@ export function delegatedTaskView(task: BackgroundTaskRecord): DelegatedTaskView
     artifactDestination: delegation?.artifactDestination ?? null,
     followsTaskId: delegation?.followsTaskId ?? null,
     question: task.status === 'awaiting_input' && task.pendingQuestionId && task.pendingQuestion
-      ? { id: task.pendingQuestionId, text: task.pendingQuestion.slice(0, 2_000), options: (task.pendingQuestionOptions ?? []).slice(0, 8) }
+      ? { id: task.pendingQuestionId, text: (ownerFacingError(task.pendingQuestion) ?? '').slice(0, 2_000), options: (task.pendingQuestionOptions ?? []).slice(0, 8) }
       : null,
     approvalId: task.status === 'awaiting_approval' ? cardApprovalId(task.pendingApprovalId) : null,
     resultPreview: task.result ? task.result.slice(0, 1_200) : null,
