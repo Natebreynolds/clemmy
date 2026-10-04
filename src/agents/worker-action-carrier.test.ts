@@ -278,7 +278,7 @@ test('a worker per-item write binds to the parent contract and reaches its inner
   assert.doesNotMatch(rendered, /work_binding_required|ExpectedWorkBindingRequiredError/,
     'the delegated item no longer dies on a wall with no door');
   assert.doesNotMatch(rendered, /work_universe_unsealed|work_dependency_pending/, rendered);
-  assert.deepEqual(written, [{ ...args, mode: null, append: null }],
+  assert.deepEqual(written, [{ ...args, mode: null, append: null, find: null }],
     'the exact schema-valid business arguments reached the inner tool once');
 
   const binding = eventlog.openEventLog().prepare(`
@@ -389,7 +389,7 @@ test('a schema-invalid worker write crosses no effect boundary and repairs under
   // A real next tool call repairs the arguments while keeping this same worker,
   // accepted source, sealed producer and requirement/member identity.
   await invoke(args, `worker-repaired-${task.label}`);
-  assert.deepEqual(written, [{ ...args, mode: null, append: null }]);
+  assert.deepEqual(written, [{ ...args, mode: null, append: null, find: null }]);
   assert.deepEqual(bindings(), [{
     universe_item_id: 'lead-001',
     effect_kind: 'local_write',

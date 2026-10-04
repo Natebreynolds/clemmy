@@ -80,7 +80,7 @@ function exactMatch(
   return matches.length === 1 ? matches[0]! : null;
 }
 
-test('write_file declares three split local authority refs with truthful risk', async () => {
+test('write_file declares four split local authority refs with truthful risk', async () => {
   const declaration = registry.TOOL_REGISTRY.find((entry) => entry.name === 'write_file');
   assert.ok(declaration, 'write_file registry row exists exactly once');
   const observed = await observedWriteFileVariants();
@@ -110,6 +110,12 @@ test('write_file declares three split local authority refs with truthful risk', 
       destructive: false,
       destinationPosture: 'named_existing',
     },
+    {
+      capabilityRef: 'cap:local:write_file:replace',
+      reversibility: 'reversible',
+      destructive: false,
+      destinationPosture: 'named_existing',
+    },
   ]);
 });
 
@@ -122,6 +128,7 @@ test('write_file variant selection exactly mirrors append-over-mode runtime prec
     ['nullable create default', { ...base, mode: null, append: null }, 'create'],
     ['mode append', { ...base, mode: 'append', append: null }, 'append'],
     ['mode overwrite', { ...base, mode: 'overwrite', append: null }, 'overwrite'],
+    ['mode replace', { ...base, mode: 'replace', append: null, find: 'old' }, 'replace'],
     ['append flag wins over create mode', { ...base, mode: 'create', append: true }, 'append'],
     ['append flag wins over overwrite mode', { ...base, mode: 'overwrite', append: true }, 'append'],
     ['false append flag wins over create mode', { ...base, mode: 'create', append: false }, 'overwrite'],
