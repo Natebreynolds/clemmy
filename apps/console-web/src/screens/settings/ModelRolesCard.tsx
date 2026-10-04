@@ -282,9 +282,13 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
         )}
         {quick && row(ROLE_WORDS.quick.title, ROLE_WORDS.quick.hint,
           <Select disabled={busy === 'quick'} value={quick.source === 'default' ? '__default__' : quick.modelId} onChange={(e) => void r.onRole('quick', e.target.value)} aria-label="Model for quick checks">
-            <option value="__default__">{QUICK_ROLE_WORDS.automatic}{quick.source === 'default' && quick.modelId ? ` · ${modelDisplayName(quick.modelId)}` : ''}</option>
+            <option value="__default__">Automatic{quick.source === 'default' && quick.modelId ? ` · ${modelDisplayName(quick.modelId)}` : ''}</option>
             {r.quicks.map((m) => <option key={`q-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
-          </Select>, inactive('quick'))}
+          </Select>,
+          <>
+            {quick.source === 'default' && <div className="mt-1 text-caption text-muted">{QUICK_ROLE_WORDS.automatic}</div>}
+            {inactive('quick')}
+          </>)}
         <details className="group border-t border-border">
           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-small text-muted hover:text-fg">
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" aria-hidden />
