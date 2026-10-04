@@ -5999,6 +5999,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         // Who keeps the memory: the memory route's own model, never the
         // checker's row, plus whose model it borrows when automatic.
         memory: memoryRoleSettingsView(),
+        // Who makes the quick checks before work starts.
+        quick: resolveRoleModel('quick'),
       },
       roleOptions: catalog.roleOptions,
       judgeFallback: judgeFallbackSettingsSnapshot(catalog),

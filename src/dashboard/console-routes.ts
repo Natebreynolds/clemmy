@@ -8781,6 +8781,7 @@ export function registerConsoleRoutes(
         // The memory route's own resolution (never the checker's row, which
         // can name a different model), with whose model it borrows.
         memory: memoryRoleSettingsView(),
+        quick: resolveRoleModel('quick'),
       },
       bindings: readDurableBindings(),
       available: catalog.available,

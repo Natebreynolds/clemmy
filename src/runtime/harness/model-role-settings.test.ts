@@ -69,6 +69,7 @@ test('the writer, the judge, the workers and the memory model are bindable here;
   assert.equal(isBindableModelRole('judge'), true);
   assert.equal(isBindableModelRole('worker'), true);
   assert.equal(isBindableModelRole('memory'), true);
+  assert.equal(isBindableModelRole('quick'), true);
   assert.equal(isBindableModelRole('brain'), false);
   assert.equal(isBindableModelRole('Writer'), false);
   assert.equal(isBindableModelRole(undefined), false);
@@ -136,6 +137,27 @@ test('a role-wide judge keeps the legacy judge branch in step; an intent-scoped 
   assert.equal(process.env.CLEMMY_DEBATE_JUDGE, undefined);
   assert.equal(persistedEnv('CLEMMY_DEBATE_JUDGE'), '');
   assert.deepEqual(readDurableBindings().map((binding) => binding.whenIntent ?? null), ['legal']);
+});
+
+test('the quick-check model defaults to a fast model of the brain\'s family, binds from Settings, and survives a read', () => {
+  resetBindings();
+  const automatic = resolveRoleModel('quick');
+  assert.equal(automatic.source, 'default');
+  assert.notEqual(automatic.modelId, resolveRoleModel('brain').modelId,
+    'quick checks do not wait on the brain\'s own reasoning');
+  assert.equal(automatic.provider, resolveRoleModel('brain').provider, 'and bill where the brain bills');
+  const catalog = modelRoleOptionCatalogSnapshot();
+  assert.ok(catalog.roleOptions.quick.length > 0, 'the picker offers connected models');
+  assert.throws(
+    () => persistModelRoleSetting({ role: 'quick', modelId: 'not-a-connected-model', source: 'settings' }),
+    (err: unknown) => err instanceof ModelRoleSettingError && err.code === 'MODEL_UNAVAILABLE',
+  );
+  persistModelRoleSetting({ role: 'quick', modelId: 'glm-5.2', source: 'settings' });
+  assert.deepEqual(readDurableBindings(), [{ role: 'quick', modelId: 'glm-5.2', scope: 'durable', source: 'settings' }]);
+  assert.equal(resolveRoleModel('quick').modelId, 'glm-5.2');
+  persistModelRoleSetting({ role: 'quick', clear: true, source: 'settings' });
+  assert.deepEqual(readDurableBindings(), []);
+  assert.equal(resolveRoleModel('quick').source, 'default');
 });
 
 test('the memory model binds through the same owner, touches no side key, and survives a read', () => {

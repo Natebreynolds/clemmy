@@ -257,14 +257,15 @@ const CALENDAR_READ_OPERATION_SYSTEM = [
 export function semanticModelRoleForPurpose(
   purpose: ConfiguredSemanticPurpose,
 ): ModelRole {
+  // Reading what a message asks before work starts, and picking a provider's
+  // calendar operation from names and descriptions, are quick checks: they
+  // run on the owner's quick-check model and the judge verifies what matters.
+  if (purpose === 'turn_semantics' || purpose === 'calendar_read_operation') return 'quick';
   // Noticing is Clem thinking on her own behalf, so it runs on the brain the
   // owner chose for her, never on a premium judge unbidden.
-  return purpose === 'turn_semantics' || purpose === 'noticing_proposal' || purpose === 'noticing_answer'
+  return purpose === 'noticing_proposal' || purpose === 'noticing_answer'
     // Clem's own words to the owner, and reading their reply, are her voice.
-    || purpose === 'clem_voice' || purpose === 'clem_reply'
-    // Picking a provider's calendar operation from names and descriptions is
-    // a cheap classification; the recipe that follows stays on the judge.
-    || purpose === 'calendar_read_operation' ? 'brain' : 'judge';
+    || purpose === 'clem_voice' || purpose === 'clem_reply' ? 'brain' : 'judge';
 }
 
 /**
@@ -486,13 +487,17 @@ export function tokensFromAgentRun(result: unknown): { inputTokens: number; outp
 }
 
 /** The usage role and channel a semantic call records: a judge purpose is a
- *  review; interpretation is not a brain round and declares no role. */
+ *  review, a quick check is a quick check; Clem's own thinking is not a brain
+ *  round and declares no role. */
 export function semanticUsageAttribution(
   purpose: ConfiguredSemanticPurpose,
 ): { role?: UsageRequestRole; channel: string } {
-  return semanticModelRoleForPurpose(purpose) === 'judge'
+  const role = semanticModelRoleForPurpose(purpose);
+  return role === 'judge'
     ? { role: 'reviewer', channel: `judge:${purpose}` }
-    : { channel: `semantic:${purpose}` };
+    : role === 'quick'
+      ? { role: 'quick', channel: `quick:${purpose}` }
+      : { channel: `semantic:${purpose}` };
 }
 
 function recordSemanticModelUsage(input: {

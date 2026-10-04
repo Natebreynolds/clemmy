@@ -59,9 +59,12 @@ import {
  *  memory = the background memory work (learning from finished conversations,
  *  settling conflicting facts, nightly patterns, skills, profile, imports); it
  *  never grades another model's work, and only Settings binds it.
+ *  quick = Clem's quick checks before work starts, such as whether a message
+ *  continues an earlier task; a fast model of the brain's own family by
+ *  default, and only Settings binds it.
  *  (debate's draftA is intentionally NOT a registry role — it stays the flagship
  *  and the user never touches it.) */
-export type ModelRole = 'brain' | 'worker' | 'judge' | 'writer' | 'memory';
+export type ModelRole = 'brain' | 'worker' | 'judge' | 'writer' | 'memory' | 'quick';
 
 /** A user-set role→model assignment (from the Models UI or a chat rule). */
 export interface RoleBinding {
@@ -268,7 +271,8 @@ export function readDurableBindings(): RoleBinding[] {
         ((b as RoleBinding).role === 'worker' ||
           (b as RoleBinding).role === 'judge' ||
           (b as RoleBinding).role === 'writer' ||
-          (b as RoleBinding).role === 'memory') &&
+          (b as RoleBinding).role === 'memory' ||
+          (b as RoleBinding).role === 'quick') &&
         typeof (b as RoleBinding).modelId === 'string' &&
         (b as RoleBinding).modelId.length > 0,
     );
@@ -371,6 +375,13 @@ export function defaultForRole(role: ModelRole): string {
   }
   const byo = getByoBackendConfig();
   const mode = getModelRoutingMode();
+
+  // Quick checks take the fast model of the brain's own family, so they bill
+  // where the brain bills and never wait on the brain's own reasoning.
+  if (role === 'quick') {
+    if (mode === 'all_in' && byo.configured) return byo.judgeId || byo.primaryId;
+    return getActiveAuthMode() === 'claude_oauth' ? boundaryClaudeJudgeModel() : codexSafeFast();
+  }
 
   // In all-in BYO mode the registered provider routes every role to the BYO
   // backend, even if a legacy caller still asks for a gpt-* tier. Make the role
@@ -498,9 +509,9 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
   // policy table / kill-switch off ⇒ falls through byte-identically. The writer
   // is only ever the owner's explicit choice or the brain itself: the policy
   // only drifts toward cheaper models, which is the opposite of its purpose.
-  // Memory is the owner's visible choice or today's automatic route, never a
-  // drifting one, and it has no task outcome to learn from.
-  if (role !== 'writer' && role !== 'memory') try {
+  // Memory and quick checks are the owner's visible choice or their automatic
+  // default, never a drifting one, and have no task outcome to learn from.
+  if (role !== 'writer' && role !== 'memory' && role !== 'quick') try {
     const pick = pickRoutePolicyModel(role, querySlug || undefined, modelId,
       (candidateId) => validateRoleModelBinding(role, candidateId).ok);
     if (pick) {

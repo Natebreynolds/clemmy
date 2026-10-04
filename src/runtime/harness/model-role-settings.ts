@@ -11,7 +11,7 @@ import { readDurableBindings, type ModelRole, type RoleBinding } from './model-r
 export type BindableModelRole = Exclude<ModelRole, 'brain'>;
 
 export function isBindableModelRole(value: unknown): value is BindableModelRole {
-  return value === 'worker' || value === 'judge' || value === 'writer' || value === 'memory';
+  return value === 'worker' || value === 'judge' || value === 'writer' || value === 'memory' || value === 'quick';
 }
 
 export type ModelRoleSettingErrorCode =

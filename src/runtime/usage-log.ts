@@ -440,7 +440,7 @@ export function acceptedSourceIdentity(sessionId: string, sourceUserSeq?: number
  *  judges, watchers, completion/goal reviews; router = Jev routing calls;
  *  writer = the chosen model writing the final answer from gathered evidence;
  *  memory = background memory work (the memory model role). */
-export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router' | 'writer' | 'memory';
+export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router' | 'writer' | 'memory' | 'quick';
 
 export interface UsageParentTurn {
   sessionId: string;

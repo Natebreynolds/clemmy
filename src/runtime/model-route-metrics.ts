@@ -35,11 +35,11 @@ export const MODEL_ROUTE_METRICS_TABLES = [
 
 export type ModelRouteMetricsTableName = (typeof MODEL_ROUTE_METRICS_TABLES)[number];
 
-export type ModelRouteRole = 'brain' | 'worker' | 'judge' | 'writer' | 'memory';
+export type ModelRouteRole = 'brain' | 'worker' | 'judge' | 'writer' | 'memory' | 'quick';
 
 /** Every route role the decision and policy tables admit. A role missing here
  *  is dropped silently by `INSERT OR IGNORE` (the writer never had a row). */
-export const MODEL_ROUTE_ROLES: readonly ModelRouteRole[] = ['brain', 'worker', 'judge', 'writer', 'memory'];
+export const MODEL_ROUTE_ROLES: readonly ModelRouteRole[] = ['brain', 'worker', 'judge', 'writer', 'memory', 'quick'];
 const ROUTE_ROLE_CHECK = `CHECK (role IN (${MODEL_ROUTE_ROLES.map((role) => `'${role}'`).join(',')}))`;
 export type ModelRouteOutcomeStatus = 'success' | 'failed' | 'fallback' | 'cancelled';
 export type ModelRouteDecisionSource = 'default' | 'binding' | 'intent_binding' | 'explicit' | 'fallback' | 'policy';

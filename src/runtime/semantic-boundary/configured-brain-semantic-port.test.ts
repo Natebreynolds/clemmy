@@ -7,10 +7,13 @@ import {
 } from './configured-brain-semantic-port.js';
 import type { TurnSemanticHostViewV1 } from './turn-semantic-proposal.js';
 
-test('semantic interpretation uses the brain while write judgment uses the judge role', () => {
-  assert.equal(semanticModelRoleForPurpose('turn_semantics'), 'brain');
+test('reading what a message asks is a quick check, write judgment stays on the judge, and Clem\'s own voice stays on the brain', () => {
+  assert.equal(semanticModelRoleForPurpose('turn_semantics'), 'quick');
+  assert.equal(semanticModelRoleForPurpose('calendar_read_operation'), 'quick');
   assert.equal(semanticModelRoleForPurpose('turn_semantics_effect_judge'), 'judge');
   assert.equal(semanticModelRoleForPurpose('turn_semantics_plan_grounding'), 'judge');
+  assert.equal(semanticModelRoleForPurpose('clem_voice'), 'brain');
+  assert.equal(semanticModelRoleForPurpose('noticing_proposal'), 'brain');
 });
 
 test('configured brain receives bounded host capability descriptors, not only IDs', async () => {

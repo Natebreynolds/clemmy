@@ -114,7 +114,7 @@ export function savedRoleModelIdsForProvider(raw: string, provider: ModelProvide
       if (!value || typeof value !== 'object') continue;
       const binding = value as { role?: unknown; modelId?: unknown };
       if (binding.role !== 'worker' && binding.role !== 'judge' && binding.role !== 'writer'
-        && binding.role !== 'memory') continue;
+        && binding.role !== 'memory' && binding.role !== 'quick') continue;
       if (typeof binding.modelId !== 'string') continue;
       const id = binding.modelId.trim();
       if (!id || ids.includes(id)) continue;
@@ -579,6 +579,7 @@ export interface ModelRoleOptionCatalogSnapshot {
     judge: AvailableModelGroup[];
     writer: AvailableModelGroup[];
     memory: AvailableModelGroup[];
+    quick: AvailableModelGroup[];
   };
   brainOptions: BrainOption[];
   providerSnapshots: ByoProviderSnapshot[];
@@ -597,6 +598,7 @@ export function modelRoleOptionCatalogSnapshot(): ModelRoleOptionCatalogSnapshot
       judge: connectedModelGroupsForRoleFromContext('judge', context, available),
       writer: connectedModelGroupsForRoleFromContext('writer', context, available),
       memory: connectedModelGroupsForRoleFromContext('memory', context, available),
+      quick: connectedModelGroupsForRoleFromContext('quick', context, available),
     },
     brainOptions: brainOptionsFromContext(context, available),
     providerSnapshots: getByoProviderSnapshotsFromRoutingSnapshot(context.byo),
