@@ -982,3 +982,11 @@ spend more time on it — the two cheap changes below stay, no more SDK work.
 - **Workflow report-back: not a gap.** A run's report envelope is immutable
   for the run's life (one terminal report per run); parks go through the
   awaiting-input question path; a re-run is a new run with its own report.
+- **Combined the other agent's browser-viewer fix — 68ecfabf6** (from
+  codex/browserbase-live-view, uncommitted there, byte for byte; see
+  docs/checkpoints/2026-10-03-browserbase-native-viewer-fix.md). Desktop
+  shell only, so it ships in a signed whole-app build, not a hotpatch —
+  together with the wave 59 quit-step deadlines and the update disk-space
+  guard. Verified here: 21 tests, desktop + preload typecheck, the Electron
+  smoke script (7/7). Blocker: a signed build needs ~15 GB free; the disk
+  has ~1.9 GB and deletions need the owner's go.
