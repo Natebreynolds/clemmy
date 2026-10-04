@@ -174,3 +174,9 @@ test('a task that follows another says which, and the ended one names what follo
   assert.deepEqual(delegatedTaskFollowUps(finished, [finished, next, later]).map((row) => row.taskId), ['bg-3', 'bg-2']);
   assert.deepEqual(delegatedTaskFollowUps(next, [finished, next, later]), []);
 });
+
+test('a paused task says why it stopped', () => {
+  const paused = delegatedTaskCard(task({ phase: 'paused', error: 'This step reached its time budget. Completed work is saved.' }));
+  assert.equal(paused.problem, 'This step reached its time budget. Completed work is saved.');
+  assert.equal(delegatedTaskCard(task({ phase: 'working', error: 'stale' })).problem, null, 'a working task shows no problem');
+});

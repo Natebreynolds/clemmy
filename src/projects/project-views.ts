@@ -7,6 +7,7 @@
  * from a record: the project store, the task record, the session table, the
  * approval registry. Nothing is inferred from what an agent said.
  */
+import { RETAINED_WORK_TERMINAL_HEADER } from '../runtime/harness/retained-work-checkpoint.js';
 import { getAgentRecord } from '../agents/agent-record.js';
 import {
   getBackgroundTask, listBackgroundTasks, type BackgroundTaskRecord,
@@ -80,6 +81,16 @@ function phaseOf(task: BackgroundTaskRecord): DelegatedTaskPhaseView {
   }
 }
 
+/** Why a task stopped, as the owner reads it: the retained-work handle listing
+ * is for the model that resumes the work. */
+function ownerFacingError(error: string | undefined): string | null {
+  const text = (error ?? '').trim();
+  if (!text) return null;
+  const cut = text.indexOf(RETAINED_WORK_TERMINAL_HEADER);
+  const owner = (cut >= 0 ? text.slice(0, cut) : text).trim();
+  return owner ? owner.slice(0, 600) : null;
+}
+
 export function delegatedTaskView(task: BackgroundTaskRecord): DelegatedTaskView {
   const delegation = task.delegation;
   const revisions = (task.contractRevisions ?? []).slice(-12).map((revision) => ({
@@ -111,7 +122,7 @@ export function delegatedTaskView(task: BackgroundTaskRecord): DelegatedTaskView
     approvalId: task.status === 'awaiting_approval' ? cardApprovalId(task.pendingApprovalId) : null,
     resultPreview: task.result ? task.result.slice(0, 1_200) : null,
     resultPath: task.resultPath ?? null,
-    error: task.error ? task.error.slice(0, 600) : null,
+    error: ownerFacingError(task.error),
     checkIns: (task.checkIns ?? []).slice(-12).map((entry) => ({ at: entry.at, note: entry.note.slice(0, 600) })),
     originSessionId: task.originSessionId ?? null,
     runSessionId: task.runSessionId,

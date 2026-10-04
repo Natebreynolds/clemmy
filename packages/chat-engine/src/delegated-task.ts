@@ -148,7 +148,8 @@ export function delegatedTaskCard(task: DelegatedTask, options: { resultChars?: 
     question,
     approvalId: task.phase === 'needs_you' ? task.approvalId ?? null : null,
     result: task.phase === 'finished' && task.resultPreview?.trim() ? opening(task.resultPreview, options.resultChars ?? 360) : null,
-    problem: task.phase === 'failed' && task.error?.trim() ? opening(task.error, 360) : null,
+    // A task that stopped short, failed or paused, says why.
+    problem: (task.phase === 'failed' || task.phase === 'paused') && task.error?.trim() ? opening(task.error, 360) : null,
     followsTaskId: task.followsTaskId?.trim() || null,
     steer: task.phase === 'finished'
       ? {
