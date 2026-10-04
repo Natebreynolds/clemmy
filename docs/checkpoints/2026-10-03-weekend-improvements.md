@@ -854,3 +854,17 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   DataForSEO request had run (all refused pre-dispatch). Open: host-written
   facts beside a worker result (which calls ran / were refused) so a lead
   cannot be misled by a worker's prose.
+- Wave 56 = f6c4b3114 installed 19:33 PT via recipe 56b (first 56 attempt
+  refused: the installed-tree patcher's unanchored pgrep matched my own
+  waiting command, which named the bundle path → app left closed ~10.5 min;
+  relaunched by bundle path; trap recorded). Owner's answer delivered via
+  the answer route (works since wave 55).
+- **Live proof (02:34Z):** re-run workers now discover the leased tool
+  (discovery 3 sources / 2 candidates) and call it: competitors-miami 4 and
+  competitors-orlando 4 successful DataForSEO calls, competitors-newyork 2,
+  maps-office-newyork 1. Durable manifest resume reused 7 earlier items.
+- Remaining worker limits seen: (a) a request shape not yet learned as a
+  read is WORKER_COMPOSE_ONLY for a worker (learning happens only in the
+  parent's own calls); (b) DeepSeek serps workers spent 18 responses with
+  one tool call → max_turns (model/item sizing); (c) manifest resume reuses
+  "ok" items whose output holds no real data (worker honesty).
