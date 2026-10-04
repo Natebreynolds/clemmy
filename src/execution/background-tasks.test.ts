@@ -4650,3 +4650,26 @@ test('a job whose brain is turned away while its account shows room waits, retri
     __setClaudeUsageForTests(null);
   }
 });
+
+test('a step that uses its own active-time budget continues into the next step instead of parking the job', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({ title: 'Long market audit', prompt: 'run the long market audit', maxMinutes: 240 });
+  let calls = 0;
+  const stubAssistant = {
+    getRuntime() { return {} as never; },
+    async respond(request: { sessionId: string }) {
+      calls += 1;
+      if (calls === 1) {
+        // What the host leaves when the step's own active-time budget runs out.
+        appendEvent({ sessionId: request.sessionId, turn: 1, role: 'system', type: 'conversation_completed',
+          data: { reason: 'blocked', blockedReason: 'wall_clock' } });
+        return { text: 'This task reached its configured active-time limit. Completed work is saved.', sessionId: request.sessionId, stoppedReason: 'blocked' as const };
+      }
+      return { text: 'Audit finished and saved.', sessionId: request.sessionId, stoppedReason: 'success' as const };
+    },
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(calls, 2, 'the job took its next step');
+  assert.notEqual(getBackgroundTask(task.id)?.status, 'blocked');
+});

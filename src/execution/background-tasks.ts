@@ -5259,6 +5259,17 @@ function activationBrainRefusal(runSessionId: string, activationStartedAt: strin
   }
 }
 
+/** Whether this activation stopped because its own active-time budget, the
+ * per-step budget, ran out, read from the activation's terminal. */
+function activationStepBudgetSpent(runSessionId: string, activationStartedAt: string): boolean {
+  try {
+    const terminal = listHarnessEventsForRefute(runSessionId, { types: ['conversation_completed'], desc: true, limit: 1 })[0];
+    return Boolean(terminal && terminal.createdAt >= activationStartedAt && terminal.data?.blockedReason === 'wall_clock');
+  } catch {
+    return false;
+  }
+}
+
 /** Whether the account behind this run's brain has room by its own fresh
  * usage reading. Only an account Clem can read can answer yes. */
 function brainAccountHasRoom(runSessionId: string): boolean {
@@ -6349,6 +6360,12 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          break;
 	        }
 
+	        // A step that used its own active-time budget is a checkpoint: the
+	        // next step is a new source with a fresh step budget, still inside the
+	        // task's own time limit and continue caps.
+	        if (response.stoppedReason === 'blocked' && activationStepBudgetSpent(task.runSessionId, activationStartedAt)) {
+	          response = { ...response, stoppedReason: 'max-turns-with-grace' };
+	        }
 	        if (response.stoppedReason !== 'max-turns-with-grace') break;
 	        // Stage 4 — a turn-budget stop whose token WINDOW is also exhausted
 	        // must park as a budget park, not burn free auto-continues + judge
