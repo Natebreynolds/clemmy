@@ -125,7 +125,7 @@ async function dispatchCodingTask(input: DispatchInput): Promise<ReturnType<type
   if (!project) {
     return refusal(
       'coding_project_not_on_roster',
-      `"${input.project}" is not one of the user's projects. Check workspace_list, or have the user add the folder under Connect → Projects.`,
+      `"${input.project}" is not one of the user's projects. Check workspace_list, or have the user add the folder under Connect → Code folders.`,
     );
   }
   const { readProjectRepo, codingRunBranchName, codingRunWorktreePath } = await import('../execution/coding-run-git.js');

@@ -55,3 +55,29 @@ test('the phone Workspace route is linked only where the surface serves it', () 
   assert.match(renderMarkdown(md), /<a href="\/m\/\?tab=spaces&amp;workspace=daily-brief">Open it<\/a>/);
   assert.doesNotMatch(renderMarkdown(md, { workspaceLinks: false }), /<a /);
 });
+
+test('a place Clem links opens inside the app on the surface that asks for it', () => {
+  const desktop = renderMarkdown('Set it up in [Open Meetings](app:meetings).', { appPlaceLinks: 'desktop' });
+  assert.match(desktop, /<a href="\/meetings" class="app-place-link" data-app-place="meetings">Open Meetings<\/a>/);
+  assert.doesNotMatch(desktop, /target="_blank"/);
+  const settings = renderMarkdown('[Open Models](app:models)', { appPlaceLinks: 'phone' });
+  assert.match(settings, /href="\/m\/\?tab=settings&amp;section=models"/);
+});
+
+test('a Mac-only place reads as text on the phone, and unknown or unasked places are plain labels', () => {
+  assert.match(renderMarkdown('[Open Meetings](app:meetings)', { appPlaceLinks: 'phone' }),
+    /<span class="app-place-elsewhere">Open Meetings \(on your Mac\)<\/span>/);
+  const unknown = renderMarkdown('[Open Vault](app:vault)', { appPlaceLinks: 'desktop' });
+  assert.doesNotMatch(unknown, /<a /);
+  assert.match(unknown, /Open Vault/);
+  assert.doesNotMatch(unknown, /app:vault/);
+  const unasked = renderMarkdown('[Open Meetings](app:meetings)');
+  assert.doesNotMatch(unasked, /<a /);
+  assert.match(unasked, /Open Meetings/);
+});
+
+test('a place link label is escaped like every other reply text', () => {
+  const html = renderMarkdown('[<img src=x onerror=alert(1)>](app:meetings)', { appPlaceLinks: 'desktop' });
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /&lt;img/);
+});

@@ -317,6 +317,7 @@ const ALWAYS_READ = new Set<string>([
   'goal_list',
   'tool_choice_recall',
   'user_profile_read',
+  'app_guide',
   'desktop_status',
   'local_cli_list',
   'list_files',

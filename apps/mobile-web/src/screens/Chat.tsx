@@ -805,7 +805,7 @@ function MessageRow({
     return (
       <div class="turn turn-assistant" aria-label="Progress update">
         {speaker ? <div class="reply-speaker">{speaker}</div> : null}
-        <div class="reply bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text) }} />
+        <div class="reply bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text, { appPlaceLinks: 'phone' }) }} />
       </div>
     );
   }
@@ -938,7 +938,7 @@ function MessageRow({
               withdrawn) until the next draft or the reply replaces it. */}
           <div
             class={`reply bubble-md${thinking && !draftStatus ? ' reply-writing' : ''}${message.answerDraft?.phase === 'withdrawn' ? ' reply-withdrawn' : ''}`}
-            dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text) }}
+            dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text, { appPlaceLinks: 'phone' }) }}
           />
           {draftStatus ? (
             <p class={`reply-draft-status${message.answerDraft?.withdrawn === 'review' ? ' is-correcting' : ''}`} role="status">

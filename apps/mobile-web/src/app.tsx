@@ -241,6 +241,22 @@ export function App() {
     return () => window.removeEventListener('popstate', syncLocation);
   }, []);
 
+  // A place Clem links in a reply opens inside the app: the URL changes and
+  // the same sync above moves the shell, with no page load.
+  useEffect(() => {
+    const openPlace = (event: MouseEvent) => {
+      const link = (event.target as Element | null)?.closest?.('a[data-app-place]');
+      const href = link?.getAttribute('href');
+      if (!href) return;
+      event.preventDefault();
+      userNavigated.current = true;
+      window.history.pushState(null, '', href);
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    };
+    document.addEventListener('click', openPlace);
+    return () => document.removeEventListener('click', openPlace);
+  }, []);
+
   // Needs-you is shell state, not Home state. Polling here keeps the header
   // pill and the switcher truthful while the user is in Chat, Memory, or a
   // deep detail — ONE count from ONE source for every surface.

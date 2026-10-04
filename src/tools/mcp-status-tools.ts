@@ -98,7 +98,7 @@ export function registerMcpStatusTools(server: McpServer): void {
       'If an enabled server matches and auth env is present, its tools are callable. Use mcp_list_tools(server_name, query) to get their EXACT callable `<server>__<tool>` names and the best match\'s real input schema; never guess a vendor tool name.',
       'The source "imported MCP config" means the server definition came from another local MCP client config, but Clementine still runs these through the OpenAI Agents SDK.',
       'Secrets are never returned; only env variable names are shown.',
-      'Each server reports a connection `state` (connected/connecting/degraded/unavailable) and `unsetEnvKeys` (declared credential names with NO value yet). To self-heal: if a server is degraded/unavailable, call mcp_reconnect; if it is missing config, call mcp_add; to edit a server, call mcp_configure. If unsetEnvKeys is non-empty, the USER must enter those credential values in the dashboard (Settings → MCP Servers) — you cannot set secrets.',
+      'Each server reports a connection `state` (connected/connecting/degraded/unavailable) and `unsetEnvKeys` (declared credential names with NO value yet). To self-heal: if a server is degraded/unavailable, call mcp_reconnect; if it is missing config, call mcp_add; to edit a server, call mcp_configure. If unsetEnvKeys is non-empty, the USER must enter those credential values in the dashboard (Connect → MCP servers) — you cannot set secrets.',
     ].join(' '),
     {
       query: z.string().optional().describe('Short CATEGORY filter ("seo", "dataforseo", "browser", "supabase", "email", "web", "hosting") — NOT the user\'s question text. Omit to list all configured servers.'),

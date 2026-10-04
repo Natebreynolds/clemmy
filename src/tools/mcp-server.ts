@@ -40,6 +40,7 @@ import { registerExtractStructuredTools } from './extract-structured-tools.js';
 import { registerBatchTools } from './batch-tools.js';
 import { registerExecutionTools } from './execution-tools.js';
 import { registerProfileTools } from './profile-tools.js';
+import { registerAppGuideTools } from './app-guide-tools.js';
 import { registerCapabilityTools } from './capability-tools.js';
 import { registerHarnessStatusTools } from './harness-status-tools.js';
 import { registerCliTools } from './cli-tools.js';
@@ -556,6 +557,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerAutonomyActionTools(server);
   registerExecutionTools(server);
   registerProfileTools(server);
+  registerAppGuideTools(server);
   registerCapabilityTools(server);
   registerHarnessStatusTools(server);
   registerCliTools(server);

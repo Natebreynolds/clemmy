@@ -49,6 +49,7 @@ import { registerTimeSlotsTools } from './time-slots-tools.js';
 import { registerExtractStructuredTools } from './extract-structured-tools.js';
 import { registerPlanTools } from './plan-tools.js';
 import { registerProfileTools } from './profile-tools.js';
+import { registerAppGuideTools } from './app-guide-tools.js';
 import { registerRecallTools } from './recall-tools.js';
 import { registerMeetingAnalysisTools } from './meeting-analysis-tools.js';
 import { registerMeetingReadTools } from './meeting-read-tools.js';
@@ -326,6 +327,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerAutonomyActionTools(server);
   registerExecutionTools(server);
   registerProfileTools(server);
+  registerAppGuideTools(server);
   registerRecallTools(server);
   registerMeetingAnalysisTools(server);
   registerMeetingReadTools(server);

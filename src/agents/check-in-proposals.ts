@@ -184,7 +184,7 @@ export function proposeCheckInTemplate(input: ProposeInput): CheckInTemplateProp
       `Trigger: ${proposal.trigger}${proposal.schedule ? ` · cron ${proposal.schedule}` : ''}`,
       `Question: ${proposal.questionTemplate.slice(0, 240)}`,
       '',
-      'Approve from Settings → Proactive Check-Ins.',
+      'Approve it in Needs you.',
     ].join('\n'),
     createdAt: now,
     read: false,

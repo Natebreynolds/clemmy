@@ -74,7 +74,7 @@ export function VoiceOverlay() {
         <div className="mt-3 max-w-md text-center">
           <p className="text-body text-muted">{error}</p>
           <div className="mt-4 flex justify-center gap-2">
-            <Link to="/connect"><Button variant="secondary" size="sm">Add your OpenAI key</Button></Link>
+            <Link to="/settings#account-openai"><Button variant="secondary" size="sm">Add your OpenAI key</Button></Link>
             <Button size="sm" onClick={close}>Close</Button>
           </div>
         </div>

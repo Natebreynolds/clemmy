@@ -974,7 +974,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         body:
           `${server.name} failed to connect ${failureCount} times in a row. ` +
           `Last error: ${errorObj.message.slice(0, 200)}. ` +
-          `Reconnect from Settings → MCP Servers or check the server's config.`,
+          `Reconnect from Connect → MCP servers or check the server's config.`,
         kind: 'system',
         silent: true,
         metadata: { slug, failureCount, lastError: errorObj.message },
@@ -1084,7 +1084,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         `(${health!.failureCount} consecutive failures: ${(health!.lastError?.message ?? 'unknown error').slice(0, 160)}). ` +
         `Tools from this server are temporarily unavailable. ` +
         `If you need a capability from this server, tell the user the data source is offline ` +
-        `and propose an alternative or ask them to reconnect via Settings → MCP Servers.`;
+        `and propose an alternative or ask them to reconnect via Connect → MCP servers.`;
     return {
       name: namespaceToolName(slug, 'unavailable'),
       description,
@@ -1397,7 +1397,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
           userMessage:
             `${server.name} is offline (${health?.failureCount ?? '?'} consecutive failures: ` +
             `${health?.lastError?.message?.slice(0, 160) ?? 'unknown error'}). ` +
-            `Reconnect via Settings → MCP Servers or use an alternative source.`,
+            `Reconnect via Connect → MCP servers or use an alternative source.`,
           operatorMessage: `mcp.server_unavailable slug=${slug} failureCount=${health?.failureCount ?? 'n/a'}`,
           context: {
             slug,

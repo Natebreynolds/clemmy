@@ -16309,7 +16309,7 @@ function handleRunError(
     markCodexAuthDead(message);
     const friendly =
       'Your Codex sign-in expired or was revoked, so I can’t reach the model right now. '
-      + 'Re-authenticate in Settings → Credentials → RE-AUTHENTICATE '
+      + 'Sign in again in Settings › Model accounts '
       + '(or run `clementine auth login-native`), then try again.';
     safeAppend({
       sessionId,

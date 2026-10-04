@@ -565,7 +565,7 @@ export function registerAutonomyActionTools(server: McpServer): void {
       'Use when you notice a recurring rhythm in the user\'s work — weekly deploys,',
       'daily standups, monthly reviews, or a condition that should trigger a nudge.',
       'You DO NOT auto-install the template — the user reviews and approves from',
-      'Settings → Proactive Check-Ins. Frame the rationale clearly: what pattern',
+      'Needs you. Frame the rationale clearly: what pattern',
       'you noticed, why this template would help, when it would fire.',
       '',
       'Trigger kinds:',
@@ -596,7 +596,7 @@ export function registerAutonomyActionTools(server: McpServer): void {
           `Proposal queued: ${proposal.id}.`,
           `Name: ${proposal.name}`,
           `Trigger: ${proposal.trigger}${proposal.schedule ? ` (cron: ${proposal.schedule})` : ''}`,
-          'The user has been notified and can approve from Settings → Proactive Check-Ins.',
+          'The user has been notified and can approve it in Needs you.',
         ].join('\n'));
       } catch (err) {
         return textResult(`Propose failed: ${err instanceof Error ? err.message : String(err)}`);

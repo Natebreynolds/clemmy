@@ -5420,9 +5420,9 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
           message:
             'Composio is configured, but NO apps are connected yet — so there are no toolkits to search. ' +
             'A tool only becomes searchable after its app is connected. Connect the app you need from the ' +
-            'dashboard (Integrations → connect), then retry. Do not conclude the capability is unavailable.',
+            'Connect page (Apps), then retry. Do not conclude the capability is unavailable.',
           nextStep:
-            'Tell the user which app to connect (or point them to the dashboard Integrations page), then retry ' +
+            'Tell the user which app to connect (or point them to the Connect page), then retry ' +
             'composio_search_tools once it is connected.',
         }, { context, details, toolName: 'composio_search_tools' });
       }

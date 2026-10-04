@@ -1515,6 +1515,12 @@ input, textarea, select { font: inherit; font-size: 16px; }
   color: var(--fg-2);
 }
 .bubble-md a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.bubble-md a.app-place-link {
+  display: inline-flex; align-items: center; gap: 0.35em; min-height: 32px; padding: 0 0.85em;
+  border: 1px solid var(--line-strong); border-radius: 999px; background: var(--accent-soft);
+  color: var(--fg); font-weight: 600; text-decoration: none; white-space: nowrap;
+}
+.bubble-md a.app-place-link::after { content: '\2192'; color: var(--accent); }
 .bubble-md strong { font-weight: 700; }
 
 /* ── activity rows ──────────────────────────────────────────────── */

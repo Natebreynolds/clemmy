@@ -13,10 +13,16 @@
  * practice, and a flat list renders those fine too).
  */
 
+import { appPlace, appPlaceHref } from './app-places.js';
+
 export interface RenderMarkdownOptions {
   /** Activate the same-origin mobile Workspace route. Only the phone serves
    *  it; elsewhere it stays text so model output cannot navigate the app. */
   workspaceLinks?: boolean;
+  /** Turn `[label](app:<place>)` into an in-app link for this surface. The
+   *  owner moves only by tapping it, and only to a listed place; without this
+   *  option, or for an unknown place, the label stays plain text. */
+  appPlaceLinks?: 'desktop' | 'phone';
 }
 
 function escapeHtml(text: string): string {
@@ -45,6 +51,13 @@ function renderInline(escaped: string, options: RenderMarkdownOptions): string {
     return `\u0000${held.length - 1}\u0000`;
   };
   out = out.replace(/`([^`\n]+)`/g, (_m, code: string) => hold(`<code>${code}</code>`));
+  out = out.replace(/\[([^\]\n]+)\]\(app:([a-z][a-z-]{0,40})\)/g, (_m, label: string, id: string) => {
+    const surface = options.appPlaceLinks;
+    if (!surface || !appPlace(id)) return hold(label);
+    const href = appPlaceHref(id, surface);
+    if (!href) return hold(`<span class="app-place-elsewhere">${label} (on your Mac)</span>`);
+    return hold(`<a href="${escapeHtml(href)}" class="app-place-link" data-app-place="${id}">${label}</a>`);
+  });
   out = out.replace(
     /\[([^\]\n]+)\]\((https?:\/\/[^)\s]+|\/m\/\?tab=spaces&amp;workspace=[a-z0-9][a-z0-9-]{0,61}[a-z0-9])\)/g,
     (match, label: string, href: string) => {

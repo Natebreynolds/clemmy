@@ -369,6 +369,8 @@ test('B1 guardrail sets: INVARIANT members after the derive flip (the runaway-wr
 
 test('host_v1 pure-local read execution is a small positive registry contract', () => {
   const expected = new Set([
+    // Clem's map of the app reads only the host's own setup state.
+    'app_guide',
     'home_get',
     'list_files',
     'meeting_search',

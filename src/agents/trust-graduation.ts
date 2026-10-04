@@ -746,7 +746,7 @@ function buildRationale(c: TrustCandidate): string {
     `across ${c.evidence.distinctDays} days with no rejections, revocations, or failures. `,
     `Want me to auto-send to that exact scope going forward instead of asking each time? `,
     `It stays under the ${SEND_TRUST_MAX_RECIPIENTS}-recipient mass-send floor, every send is still audited, `,
-    `and you can revoke it anytime in Settings → Autonomy.`,
+    `and you can revoke it anytime under Autonomy.`,
   ].join('');
 }
 

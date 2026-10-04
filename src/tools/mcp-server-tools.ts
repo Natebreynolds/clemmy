@@ -3,7 +3,7 @@
  * recover, create, and reconfigure external MCP servers at runtime — WITHOUT
  * ever writing a raw secret. Credentials stay human-only: these tools declare /
  * surface which env keys a server needs (by NAME); the human enters the actual
- * values in the dashboard (Settings → MCP Servers). Clementine creates the MCP,
+ * values in the dashboard (Connect → MCP servers). Clementine creates the MCP,
  * then the user enters credentials in the dashboard.
  *
  * Gating (src/agents/tool-taxonomy.ts): mcp_reconnect = read (recovery, no
@@ -99,7 +99,7 @@ export function registerMcpServerTools(server: McpServer): void {
     [
       'Create a NEW external MCP server configuration. APPROVAL-GATED (admin).',
       'Declares the server (name/type/command|url/args/description) and the NAMES of any env/credential keys it needs — but writes NO secret values.',
-      'After it is created, the user enters the credential VALUES in the dashboard (Settings → MCP Servers); you cannot set secrets from here.',
+      'After it is created, the user enters the credential VALUES in the dashboard (Connect → MCP servers); you cannot set secrets from here.',
       'Returns the missing credential key names + the dashboard next step. Use mcp_configure to edit an existing server.',
     ].join(' '),
     {
@@ -137,7 +137,7 @@ export function registerMcpServerTools(server: McpServer): void {
       return textResult([
         `Created MCP server "${name}" (${type}).`,
         envKeys.length
-          ? `It needs credentials before it can connect: ${envKeys.join(', ')}. Ask the user to enter these in the dashboard (Settings → MCP Servers → ${name}), then call mcp_reconnect.`
+          ? `It needs credentials before it can connect: ${envKeys.join(', ')}. Ask the user to enter these in the dashboard (Connect → MCP servers → ${name}), then call mcp_reconnect.`
           : 'No credentials declared. It should connect on the next tool call.',
       ].join(' '));
     },

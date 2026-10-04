@@ -3,7 +3,7 @@ import { ApprovalReview } from './ApprovalReview';
 import { PlanReview } from './PlanReview';
 import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
 import { answerDraftStatus, hiddenCardDecision, renderMarkdown, APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
@@ -76,11 +76,20 @@ function approvalFieldLabel(name: string): string {
  * caret (styles.css `.chat-prose.is-streaming`).
  */
 function ReplyProse({ text, streaming, failed }: { text: string; streaming?: boolean; failed?: boolean }) {
+  const navigate = useNavigate();
   return (
     <div
       className={cn('chat-prose min-w-0', streaming && 'is-streaming', failed && 'text-danger')}
+      // A place Clem links opens inside the app, never as a page load.
+      onClick={(event) => {
+        const link = (event.target as Element).closest?.('a[data-app-place]');
+        const href = link?.getAttribute('href');
+        if (!href) return;
+        event.preventDefault();
+        navigate(href);
+      }}
       // eslint-disable-next-line react/no-danger -- renderMarkdown escapes all input first
-      dangerouslySetInnerHTML={{ __html: renderMarkdown(text, { workspaceLinks: false }) }}
+      dangerouslySetInnerHTML={{ __html: renderMarkdown(text, { workspaceLinks: false, appPlaceLinks: 'desktop' }) }}
     />
   );
 }
