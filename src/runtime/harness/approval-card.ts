@@ -137,3 +137,53 @@ export function emitApprovalRequestedCard(input: {
     return false;
   }
 }
+
+/**
+ * Every conversation that shows an approval card learns it was decided, so the
+ * card leaves the chat however it was answered: on the card, in Needs you, on
+ * the other device, or by its time running out. A card whose run is parked on
+ * it is left to that run, which records the decision as it resumes.
+ */
+export function settleApprovalCardsForDecision(row: approvalRegistry.PendingApprovalRow): number {
+  const decision = row.resolution === 'approved' ? 'approve'
+    : row.resolution === 'rejected' || row.resolution === 'cancelled_by_user'
+      || row.resolution === 'cancelled_by_system' ? 'reject'
+    : row.resolution === 'expired' ? 'expired'
+    : null;
+  if (row.status === 'pending' || !decision) return 0;
+  const db = openEventLog();
+  const shown = db.prepare(`
+    SELECT DISTINCT session_id AS sessionId FROM events
+     WHERE type = 'approval_requested' AND json_extract(data_json, '$.approvalId') = ?
+  `).all(row.approvalId) as Array<{ sessionId: string }>;
+  const already = db.prepare(`
+    SELECT 1 FROM events
+     WHERE session_id = ? AND type IN ('approval_resolved', 'approval_parked')
+       AND json_extract(data_json, '$.approvalId') = ?
+     LIMIT 1
+  `);
+  let settled = 0;
+  for (const { sessionId } of shown) {
+    if (already.get(sessionId, row.approvalId)) continue;
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'approval_resolved',
+      data: { approvalId: row.approvalId, tool: row.tool, decision, resolution: row.resolution },
+    });
+    settled += 1;
+  }
+  return settled;
+}
+
+let cardSettlementInstalled = false;
+
+/** Settle cards as decisions land. Idempotent; called once by the daemon. */
+export function initApprovalCardSettlement(): void {
+  if (cardSettlementInstalled) return;
+  cardSettlementInstalled = true;
+  approvalRegistry.onApprovalResolved((row) => {
+    try { settleApprovalCardsForDecision(row); } catch { /* a card copy never blocks a decision */ }
+  });
+}

@@ -116,3 +116,26 @@ test('conversational approvals stay on the prompt-binding seam', () => {
   );
   assert.equal(approvals.inspectResumableApproval(resumeKey).state, 'none');
 });
+
+test('a decided card leaves every conversation that shows it, once, unless a parked run owns it', () => {
+  const owner = eventlog.createSession({ kind: 'chat' });
+  const asked = eventlog.createSession({ kind: 'chat' });
+  const parked = eventlog.createSession({ kind: 'chat' });
+  const card = cards.registerResumableApprovalCardAtomically({
+    sessionId: owner.id, resumeKey: `settle:${owner.id}`, subject: 'Let Clem use a fixture server', tool: null, args: {},
+  });
+  assert.equal(cards.emitApprovalRequestedCard({ sessionId: asked.id, approvalId: card.row.approvalId }), true);
+  assert.equal(cards.emitApprovalRequestedCard({ sessionId: parked.id, approvalId: card.row.approvalId }), true);
+  eventlog.appendEvent({ sessionId: parked.id, turn: 0, role: 'system', type: 'approval_parked', data: { approvalId: card.row.approvalId } });
+
+  const resolved = approvals.resolve(card.row.approvalId, 'approved', 'desktop-chat-card');
+  assert.ok(resolved.row);
+  assert.equal(cards.settleApprovalCardsForDecision(resolved.row!), 2);
+  for (const session of [owner, asked]) {
+    const settled = eventlog.listEvents(session.id, { types: ['approval_resolved'] });
+    assert.equal(settled.length, 1);
+    assert.equal((settled[0]!.data as { decision?: string }).decision, 'approve');
+  }
+  assert.equal(eventlog.listEvents(parked.id, { types: ['approval_resolved'] }).length, 0, 'the parked run records its own decision');
+  assert.equal(cards.settleApprovalCardsForDecision(resolved.row!), 0, 'never twice');
+});

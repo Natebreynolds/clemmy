@@ -54,6 +54,7 @@ import {
   workflowCards,
   type WorkflowCardData,
   APPROVAL_ANSWER_WORDS,
+  hiddenCardDecision,
 } from '@clem/chat-engine';
 import {
   answerModelRuleOffer,
@@ -514,7 +515,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     setError(null);
     haptic(decision === 'approve' ? 'success' : 'warning');
     try {
-      await engine.send(reply);
+      // The card shows the decision; the exchange itself stays out of sight.
+      await engine.send(reply, undefined, { cardDecision: { approvalId, decision } });
     } finally {
       setApprovalActing(null);
     }
@@ -814,7 +816,13 @@ function MessageRow({
     ? (planOutcome[message.planProposalId] ?? message.planProposalStatus ?? 'pending')
     : undefined;
 
+  // A card tap and the host's reply to it are the card's business, not the
+  // conversation's; only a decision that failed to land is shown.
+  if (hiddenCardDecision(message)) return null;
+
   if (message.approval) {
+    // A decided card has done its job and leaves the conversation.
+    if (message.approval.resolution === 'approved' || message.approval.resolution === 'declined') return null;
     const approvalId = message.approval.approvalId;
     // Clem's own question, when her checker wrote one: the card reads like a
     // question card — her words, why, the exact content, answers to tap.
@@ -897,8 +905,6 @@ function MessageRow({
           <div class="approval-reason">Open “Needs you” from the menu to act on this.</div>
         ) : message.approval.resolution === 'changed' ? (
           <div class="approval-reason">You asked for a change — the revised version is below. Nothing was sent from this one.</div>
-        ) : message.approval.resolution === 'declined' ? (
-          <div class="approval-reason">Declined — nothing was sent.</div>
         ) : message.approval.resolution === 'expired' ? (
           <div class="approval-reason">Expired without an answer — it did not run.</div>
         ) : null}

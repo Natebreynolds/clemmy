@@ -43,8 +43,8 @@ export interface PendingMcpToolEffectProposal {
   approvalId: string;
   resumeKey: string;
   proposedAt: string;
-  /** Clem's question and why, as the card shows them. */
-  preview?: { ask: string; why: string };
+  /** The card's preview: Clem's question and why, and what approving does. */
+  preview?: { operation: string; fields: Array<{ name: string; value: string }>; ask: string; why: string };
   labels: Array<{ tool: string; rawDefinitionDigest: string; label: McpToolEffectLabel }>;
 }
 

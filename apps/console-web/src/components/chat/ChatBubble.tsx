@@ -5,7 +5,7 @@ import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { answerDraftStatus, renderMarkdown, APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
+import { answerDraftStatus, hiddenCardDecision, renderMarkdown, APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -353,6 +353,13 @@ export function ChatBubble({
       setDecisionError(error instanceof Error && error.message.trim() ? error.message.trim() : 'Couldn’t set this aside.');
     }
   };
+
+  // A card tap sent from the phone and the host's reply to it belong to the
+  // card, not the conversation; only one that failed to land is shown. A
+  // decided card has done its job and leaves the conversation.
+  if (hiddenCardDecision(message)) return null;
+  if (message.status === 'awaiting-approval'
+    && (message.approval?.resolution === 'approved' || message.approval?.resolution === 'declined')) return null;
 
   if (isUser) {
     return (

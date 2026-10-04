@@ -118,7 +118,7 @@ function cardArgs(labels: PendingMcpToolEffectProposal['labels']): Record<string
 function showCardIn(
   sessionId: string,
   row: approvalRegistry.PendingApprovalRow,
-  preview: { ask: string; why: string },
+  preview: NonNullable<PendingMcpToolEffectProposal['preview']>,
 ): void {
   if (sessionId === row.sessionId) return;
   try {
@@ -188,7 +188,11 @@ async function propose(input: {
 
   const asking = labels.some((entry) => entry.label === 'delete' || entry.label === 'send');
   const subject = `Let Clem use ${serverName}'s tools`;
+  const args = cardArgs(labels);
   const preview = {
+    // The card's own shape: what is asked, why, and exactly what approving does.
+    operation: `use ${serverName} tools`,
+    fields: Object.entries(args).map(([name, value]) => ({ name, value })),
     ask: `Can I start using ${serverName}?`,
     why: clipped(`${serverName} doesn't say which of its ${labels.length} tools only look things up and which change things, so I read each one and sorted them.${
       asking ? ' Anything that deletes or sends still asks you each time.' : ''
@@ -208,7 +212,7 @@ async function propose(input: {
     sessionId: owner.id,
     subject,
     tool: null,
-    args: cardArgs(labels),
+    args,
     ttlMs: MCP_TOOL_EFFECT_PROPOSAL_OPEN_MS,
     resumeKey,
     extra: { preview },

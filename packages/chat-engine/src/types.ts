@@ -53,6 +53,23 @@ export const APPROVAL_ANSWER_WORDS = {
 
 export type ApprovalResolution = 'approved' | 'declined' | 'changed' | 'expired';
 
+export interface CardDecision {
+  approvalId: string;
+  decision: 'approve' | 'reject';
+}
+
+/** The decision a card tap carried, from the host's record of the message. */
+export function cardDecisionOf(data: Record<string, unknown>): CardDecision | null {
+  if (data.source !== 'mobile_approval' || typeof data.approvalId !== 'string' || !data.approvalId.trim()) return null;
+  if (data.decision !== 'approve' && data.decision !== 'reject') return null;
+  return { approvalId: data.approvalId, decision: data.decision };
+}
+
+/** Whether a message is a card decision that should stay out of sight. */
+export function hiddenCardDecision(message: { cardDecision?: CardDecision; pending?: string; status?: string }): boolean {
+  return Boolean(message.cardDecision) && message.pending !== 'failed' && message.status !== 'failed';
+}
+
 /** The card state an approval_resolved event records, or undefined. */
 export function approvalResolutionFrom(data: Record<string, unknown>): ApprovalResolution | undefined {
   if (data.changeRequested === true) return 'changed';
@@ -274,6 +291,10 @@ export interface ChatMessage {
   text: string;
   /** Durable task placement, learned from a real accepted user event. */
   acceptedSource?: { sessionId: string; sourceUserSeq: number; turn: number };
+  /** A tap on an approval card sent through the conversation, or the host's
+   *  reply to that tap. The card itself shows the decision, so neither is
+   *  drawn unless the decision failed to land. */
+  cardDecision?: CardDecision;
   /** Ambient progress, never a terminal reply or a completed work receipt. */
   checkIn?: true;
   checkInSeq?: number;

@@ -15,7 +15,7 @@ import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type
 import type { ChatAttachment,
   ChatMessage, ConnectionState, EngineSnapshot, HarnessEvent, MessageStatus,
 } from './types.js';
-import { approvalPreviewFrom, approvalResolutionFrom } from './types.js';
+import { approvalPreviewFrom, approvalResolutionFrom, cardDecisionOf, type CardDecision } from './types.js';
 import { reduceFeed } from './reduce-lifecycle.js';
 import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
 import { terminalCompletionPresentation } from './terminal-presentation.js';
@@ -140,6 +140,8 @@ export class ChatEngine {
   private connection: ConnectionState = 'idle';
   private stream: ChatStreamHandle | null = null;
   private activeAssistantId: string | null = null;
+  /** Card taps seen in this session, by their accepted source. */
+  private readonly cardDecisionsBySource = new Map<number, CardDecision>();
   private listeners = new Set<(snapshot: EngineSnapshot) => void>();
   private disposed = false;
   private cursor = 0;
@@ -272,7 +274,13 @@ export class ChatEngine {
     this.emit();
   }
 
-  async send(text: string, selectedMode?: TaskMode, options: { attachments?: ChatAttachment[]; connectionResume?: { connectionRequestId: string; clientRequestId: string } } = {}): Promise<void> {
+  async send(text: string, selectedMode?: TaskMode, options: {
+    attachments?: ChatAttachment[];
+    connectionResume?: { connectionRequestId: string; clientRequestId: string };
+    /** The message answers an approval card: the card shows the decision,
+     *  so this exchange stays out of the transcript unless it fails. */
+    cardDecision?: CardDecision;
+  } = {}): Promise<void> {
     if (options.connectionResume && this.busy) throw new Error('Another turn is running. Check the connection again when it finishes.');
     const taskMode = snapshotTaskMode(options.connectionResume ? undefined : selectedMode);
     if (this.busy && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, this.snapshot().activeTaskMode))) {
@@ -334,16 +342,18 @@ export class ChatEngine {
       requestSessionId: this.sessionId,
       idempotencyKey,
       ...(options.connectionResume ? { connectionRequestId: options.connectionResume.connectionRequestId } : {}),
+      ...(options.cardDecision ? { cardDecision: options.cardDecision } : {}),
     };
     const assistant: ChatMessage = {
       id: nextLocalId(),
       role: 'assistant',
       text: '',
       status: 'thinking',
+      ...(options.cardDecision ? { cardDecision: options.cardDecision } : {}),
       ...(taskMode ? { taskMode, ...(taskMode.kind === 'plan' ? { progress: 'Investigating with read-only tools…' } : {}) } : {}),
       activity: [],
     };
-    this.messages = [...this.messages, userMessage, assistant];
+    this.messages = [...(options.cardDecision ? withCardDecided(this.messages, options.cardDecision) : this.messages), userMessage, assistant];
     this.activeAssistantId = assistant.id;
     this.activeSourceFloorSeq = this.cursor;
     this.activeSourceUserSeq = null;
@@ -631,6 +641,11 @@ export class ChatEngine {
         // What the person typed is the bubble; `text` may carry folded
         // attachment contents meant for the model, never for the screen.
         const text = userVisibleText(d);
+        const cardDecision = cardDecisionOf(d);
+        if (cardDecision) {
+          this.cardDecisionsBySource.set(event.seq, cardDecision);
+          this.messages = withCardDecided(this.messages, cardDecision);
+        }
         if (!text) return;
         const acceptedSource = acceptedConversationSource(event, this.sessionId);
         if (
@@ -658,7 +673,8 @@ export class ChatEngine {
         } else if (!this.messages.some((m) => m.role === 'user' && (acceptedSource
           ? m.acceptedSource?.sourceUserSeq === event.seq && m.acceptedSource.sessionId === acceptedSource.sessionId
           : m.text === text && sameTaskMode(m.taskMode, readTaskMode(d.taskMode)) && m.pending === undefined))) {
-          this.messages = [...this.messages, { id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode), acceptedSource }];
+          this.messages = [...this.messages, { id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode), acceptedSource,
+            ...(cardDecision ? { cardDecision } : {}) }];
         }
         break;
       }
@@ -850,7 +866,21 @@ export class ChatEngine {
         });
       }
     }
+    if (event.type === 'conversation_completed') this.tagCardDecisionReply(event);
     this.emit();
+  }
+
+  /** The host's reply to a card tap from another surface is the tap's too. */
+  private tagCardDecisionReply(event: HarnessEvent): void {
+    const source = sourceUserSeqOf(event);
+    const cardDecision = source === null ? undefined : this.cardDecisionsBySource.get(source);
+    if (!cardDecision) return;
+    this.messages = this.messages.map((message) => (
+      message.role === 'assistant' && !message.cardDecision
+        && (message.acceptedSource?.sourceUserSeq === source || message.id === `a-${event.seq}`)
+        ? { ...message, cardDecision }
+        : message
+    ));
   }
 
   /** The active reply's own text. A live answer draft is never read as it. */
@@ -900,6 +930,16 @@ export function inFlightTurnSince(events: readonly HarnessEvent[]): number | nul
 
 /** Rebuild a message list from a session's persisted, public-projected
  *  events — the transcript a reopened chat renders instantly. */
+/** The card a tap decided reads as decided at once, before the host's record. */
+function withCardDecided(messages: readonly ChatMessage[], decision: CardDecision): ChatMessage[] {
+  const resolution = decision.decision === 'approve' ? 'approved' as const : 'declined' as const;
+  return messages.map((message) => (
+    message.approval?.approvalId === decision.approvalId && !message.approval.resolution
+      ? { ...message, approval: { ...message.approval, resolution } }
+      : message
+  ));
+}
+
 export function foldTranscript(events: readonly HarnessEvent[], sessionId?: string | null): ChatMessage[] {
   const messages: ChatMessage[] = [];
   let activity: ChatMessage['activity'] = [];
@@ -914,6 +954,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
   let currentSourceUserSeq: number | null = null;
   const taskModesBySource = new Map<number, TaskMode>();
   const planRefsBySource = new Map<number, NonNullable<ChatMessage['planArtifactRef']>>();
+  const cardDecisionsBySource = new Map<number, CardDecision>();
   for (const event of events) {
     const d = (event.data ?? {}) as Record<string, unknown>;
     if (readLiveApprovalControl(event)) {
@@ -925,8 +966,14 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
     switch (event.type) {
       case 'user_input_received': {
         const text = userVisibleText(d);
+        const cardDecision = cardDecisionOf(d);
+        if (cardDecision) {
+          cardDecisionsBySource.set(event.seq, cardDecision);
+          const decided = withCardDecided(messages, cardDecision);
+          messages.splice(0, messages.length, ...decided);
+        }
         if (text) messages.push({ id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode),
-          acceptedSource: acceptedConversationSource(event, sessionId) });
+          acceptedSource: acceptedConversationSource(event, sessionId), ...(cardDecision ? { cardDecision } : {}) });
         currentSourceUserSeq = event.seq;
         const mode = readTaskMode(d.taskMode);
         if (mode) taskModesBySource.set(event.seq, mode);
@@ -966,11 +1013,13 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         const awaitingMessage = awaitingIndex === undefined
           ? undefined
           : messages[awaitingIndex];
+        const cardDecision = sourceUserSeq === null ? undefined : cardDecisionsBySource.get(sourceUserSeq);
         const terminalMessage: ChatMessage = {
           id: delegatedMessage?.id ?? awaitingMessage?.id ?? `a-${event.seq}`,
           role: 'assistant',
           text: presentation.text,
           status: presentation.status,
+          ...(cardDecision ? { cardDecision } : {}),
           taskMode: taskModesBySource.get(sourceUserSeq ?? currentSourceUserSeq ?? -1),
           planArtifactRef: readPlanRevisionRef(d.planArtifactRef ?? d.artifact) ?? (sourceUserSeq === null ? undefined : planRefsBySource.get(sourceUserSeq)),
           ...(planProposalId ? {
