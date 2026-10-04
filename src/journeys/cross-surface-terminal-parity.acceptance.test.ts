@@ -126,7 +126,7 @@ const HELD_OWNERSHIP: HeldOwnership = {
   reason: 'peer_in_progress',
 };
 
-const HELD_REPLY = 'This exact task is still owned by Clem\'s recovery system. I did not start a duplicate attempt; the existing work will continue from its durable checkpoint.';
+const HELD_REPLY = 'I\'m still working on this and will post the result here when it\'s done.';
 
 const CASES: readonly ParityFixture[] = [
   {

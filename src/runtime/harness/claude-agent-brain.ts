@@ -2030,7 +2030,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     if (dispatched.kind === 'held') {
       return {
         sessionId,
-        text: 'This exact task is still owned by Clem\'s recovery system. I did not start a duplicate attempt; the existing work will continue from its durable checkpoint.',
+        text: 'I\'m still working on this and will post the result here when it\'s done.',
         stoppedReason: 'in-progress',
         raw: { transport: 'claude_agent_sdk_brain', typedExecution: dispatched.hold },
       };

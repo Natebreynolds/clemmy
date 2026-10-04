@@ -1313,7 +1313,7 @@ const RESTART_OWNED_WORKFLOW_DISPATCH_REPLY =
   'Background work was admitted for this request, but its dispatch still needs exact recovery before it can run. I preserved the original request and will resume that same work rather than creating a replacement.';
 
 const TYPED_EXECUTION_HELD_REPLY =
-  'This exact task is still owned by Clem\'s recovery system. I did not start a duplicate attempt; the existing work will continue from its durable checkpoint.';
+  'I\'m still working on this and will post the result here when it\'s done.';
 
 function connectionOwnershipChangedResponse(sessionId: string): AssistantResponse {
   return { sessionId, stoppedReason: 'in-progress',
