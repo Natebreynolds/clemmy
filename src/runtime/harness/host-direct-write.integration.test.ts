@@ -1582,3 +1582,154 @@ test('approved checkpoint recovery survives real process exit and a second reope
   assert.equal(recovered.modelCalls, 1);
   assert.equal(replayed.modelCalls, 0);
 });
+
+// A result checkpoint that can never be written must still end the turn. The
+// timer that re-enters a held turn is the only owner left once the request
+// has answered "held", so when the retry budget runs out it publishes the
+// typed stop, which closes the run attempt in the same write.
+test('a turn whose result checkpoint keeps failing ends with one public stop and a closed attempt', async () => {
+  const fixture = await directWriteFixture('work_call', 'bounded', 'exhausted-checkpoint', false, 'args_json', 1, {
+    operationId: 'research_request', schema: RESEARCH_SCHEMA, payloads: [RESEARCH_PAYLOAD],
+  });
+  assert.ok(fixture);
+  const { runConversation } = await import('./loop.js');
+  const { HarnessSession } = await import('./session.js');
+  const agent = await fixture.useProductionAgent();
+  const attempt = eventlog.beginRunAttempt(fixture.session.id, { runId: `exhausted-checkpoint-${fixture.source.seq}` });
+  eventlog.recordRunAttemptUserInput(attempt, { turn: fixture.source.turn, role: 'user', data: fixture.source.data },
+    { existingEventSeq: fixture.source.seq, armRunInFlight: true });
+  const db = eventlog.openEventLog();
+  db.exec(`CREATE TEMP TRIGGER reject_exhausted_result_checkpoint
+    BEFORE INSERT ON logical_model_result_projection_receipts
+    WHEN NEW.session_id = '${fixture.session.id}' AND NEW.call_id = 'exact-draft'
+    BEGIN SELECT RAISE(ABORT, 'fixture result checkpoint unavailable'); END`);
+  // The provider answered but its result could not be stored, so the call is
+  // never settled as succeeded and stays open on its revoked lease.
+  db.exec(`CREATE TEMP TRIGGER reject_exhausted_success_settlement
+    BEFORE INSERT ON logical_call_settlements
+    WHEN NEW.session_id = '${fixture.session.id}' AND NEW.logical_tool_call_id = 'exact-draft'
+      AND NEW.outcome_kind = 'succeeded'
+    BEGIN SELECT RAISE(ABORT, 'fixture result authority unavailable'); END`);
+  const terminals = () => eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
+    .filter(event => event.data.sourceUserSeq === fixture.source.seq);
+  try {
+    const first = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
+      sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true, runAttemptId: attempt.attemptId,
+      suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+    assert.equal(first.status, 'held', JSON.stringify(first));
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && terminals().length === 0) await new Promise(resolve => setTimeout(resolve, 50));
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS reject_exhausted_result_checkpoint');
+    db.exec('DROP TRIGGER IF EXISTS reject_exhausted_success_settlement');
+  }
+  const detail = () => JSON.stringify(eventlog.listEvents(fixture.session.id).slice(-16)
+    .map(event => ({ type: event.type, data: JSON.stringify(event.data).slice(0, 240) })));
+  assert.equal(terminals().length, 1, detail());
+  const presentation = terminals()[0]!.data.presentation as { status?: string } | undefined;
+  assert.equal(presentation?.status, 'blocked', detail());
+  assert.equal(eventlog.getActiveRunAttempt(fixture.session.id), null, 'the stop closes the run attempt');
+  assert.equal(HarnessSession.load(fixture.session.id)?.loadRecoveryState(), null);
+  assert.equal(fixture.counts().providerCalls, 1, 'the landed call never repeats');
+});
+
+test('a chat request whose result checkpoint keeps failing ends with one public stop through the bridge', async () => {
+  const fixture = await directWriteFixture('work_call', 'bounded', 'exhausted-checkpoint-bridge', false, 'args_json', 1, {
+    operationId: 'research_request', schema: RESEARCH_SCHEMA, payloads: [RESEARCH_PAYLOAD],
+  });
+  assert.ok(fixture);
+  await fixture.useProductionAgent();
+  const { runConversationContinuingPastToolCallsLimit } = await import('./loop.js');
+  const { HarnessSession } = await import('./session.js');
+  const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
+  const { respondPreferHarness, _setBridgeImplsForTests } = await import('./respond-bridge.js');
+  const db = eventlog.openEventLog();
+  db.exec(`CREATE TEMP TRIGGER reject_exhausted_bridge_checkpoint
+    BEFORE INSERT ON logical_model_result_projection_receipts
+    WHEN NEW.session_id = '${fixture.session.id}' AND NEW.call_id = 'exact-draft'
+    BEGIN SELECT RAISE(ABORT, 'fixture result checkpoint unavailable'); END`);
+  db.exec(`CREATE TEMP TRIGGER reject_exhausted_bridge_success_settlement
+    BEFORE INSERT ON logical_call_settlements
+    WHEN NEW.session_id = '${fixture.session.id}' AND NEW.logical_tool_call_id = 'exact-draft'
+      AND NEW.outcome_kind = 'succeeded'
+    BEGIN SELECT RAISE(ABORT, 'fixture result authority unavailable'); END`);
+  _setBridgeImplsForTests({
+    configure: async () => ({ ok: true }),
+    buildAgent: async options => buildOrchestratorAgent({ ...options, model: fixture.model as never, allowToolJit: true }),
+    runConversation: async options => runConversationContinuingPastToolCallsLimit({ ...options,
+      makeRunner: () => fixture.runner as never }),
+  });
+  let closed = false;
+  let sourceSeq = 0;
+  const terminals = () => eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
+    .filter(event => event.data.sourceUserSeq === sourceSeq);
+  try {
+    const response = await respondPreferHarness('home', { sessionId: fixture.session.id, message: fixture.prompt,
+      channel: 'cli', userId: 'console', runId: 'exhausted-checkpoint-bridge-run', shouldCancel: () => closed },
+    async () => { throw new Error('legacy responder cannot run'); });
+    closed = true;
+    sourceSeq = eventlog.listEvents(fixture.session.id, { types: ['user_input_received'] }).at(-1)!.seq;
+    assert.equal(response.stoppedReason, 'in-progress', JSON.stringify(response));
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && terminals().length === 0) await new Promise(resolve => setTimeout(resolve, 50));
+  } finally {
+    _setBridgeImplsForTests({});
+    db.exec('DROP TRIGGER IF EXISTS reject_exhausted_bridge_checkpoint');
+    db.exec('DROP TRIGGER IF EXISTS reject_exhausted_bridge_success_settlement');
+  }
+  const detail = () => JSON.stringify(eventlog.listEvents(fixture.session.id).slice(-16)
+    .map(event => ({ type: event.type, data: JSON.stringify(event.data).slice(0, 240) })));
+  assert.equal(terminals().length, 1, detail());
+  assert.equal(eventlog.getActiveRunAttempt(fixture.session.id), null, 'the stop closes the run attempt');
+  assert.equal(HarnessSession.load(fixture.session.id)?.loadRecoveryState(), null);
+});
+
+test('a held turn whose recovery cannot publish its stop is answered once the open call settles', async () => {
+  const fixture = await directWriteFixture('work_call', 'bounded', 'unowned-stop', false, 'args_json', 1, {
+    operationId: 'research_request', schema: RESEARCH_SCHEMA, payloads: [RESEARCH_PAYLOAD],
+  });
+  assert.ok(fixture);
+  const { runConversation, HELD_TURN_UNOWNED_STOP_TEXT } = await import('./loop.js');
+  const agent = await fixture.useProductionAgent();
+  const attempt = eventlog.beginRunAttempt(fixture.session.id, { runId: `unowned-stop-${fixture.source.seq}` });
+  eventlog.recordRunAttemptUserInput(attempt, { turn: fixture.source.turn, role: 'user', data: fixture.source.data },
+    { existingEventSeq: fixture.source.seq, armRunInFlight: true });
+  const db = eventlog.openEventLog();
+  db.exec(`CREATE TEMP TRIGGER reject_unowned_result_checkpoint
+    BEFORE INSERT ON logical_model_result_projection_receipts
+    WHEN NEW.session_id = '${fixture.session.id}' AND NEW.call_id = 'exact-draft'
+    BEGIN SELECT RAISE(ABORT, 'fixture result checkpoint unavailable'); END`);
+  // Every settlement is refused for a while, so the turn's own stop cannot
+  // publish and the recovery timer is left holding a turn with no checkpoint.
+  db.exec(`CREATE TEMP TRIGGER reject_unowned_settlement
+    BEFORE INSERT ON logical_call_settlements
+    WHEN NEW.session_id = '${fixture.session.id}' AND NEW.logical_tool_call_id = 'exact-draft'
+    BEGIN SELECT RAISE(ABORT, 'fixture settlement unavailable'); END`);
+  const terminals = () => eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
+    .filter(event => event.data.sourceUserSeq === fixture.source.seq);
+  const stoppedAtSite = () => eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+    .some(event => event.data.kind === 'host_blocked_terminal_site' && event.data.sourceUserSeq === fixture.source.seq);
+  try {
+    const first = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
+      sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true, runAttemptId: attempt.attemptId,
+      suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+    assert.equal(first.status, 'held', JSON.stringify(first));
+    const stopDeadline = Date.now() + 20_000;
+    while (Date.now() < stopDeadline && !stoppedAtSite()) await new Promise(resolve => setTimeout(resolve, 50));
+    assert.ok(stoppedAtSite(), 'the retry budget ran out');
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(terminals().length, 0, 'the stop waits while its call cannot settle');
+    db.exec('DROP TRIGGER IF EXISTS reject_unowned_settlement');
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && terminals().length === 0) await new Promise(resolve => setTimeout(resolve, 50));
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS reject_unowned_result_checkpoint');
+    db.exec('DROP TRIGGER IF EXISTS reject_unowned_settlement');
+  }
+  assert.equal(terminals().length, 1);
+  const presentation = terminals()[0]!.data.presentation as { status?: string; text?: string } | undefined;
+  assert.equal(presentation?.status, 'blocked');
+  assert.equal(presentation?.text, HELD_TURN_UNOWNED_STOP_TEXT);
+  assert.equal(eventlog.getActiveRunAttempt(fixture.session.id), null, 'the stop closes the run attempt');
+  assert.equal(fixture.counts().providerCalls, 1, 'the landed call never repeats');
+});

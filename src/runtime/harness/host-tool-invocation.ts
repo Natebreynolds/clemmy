@@ -446,7 +446,7 @@ export interface HostToolInvocationRecoverySweep {
  * crossings retain their physical reconciliation truth.
  */
 export function reconcileRevokedHostToolInvocations(
-  options: { limit?: number } = {},
+  options: { limit?: number; sessionId?: string } = {},
 ): HostToolInvocationRecoverySweep {
   const limit = Math.max(1, Math.min(1_000, Math.trunc(options.limit ?? 100)));
   type Candidate = {
@@ -473,6 +473,7 @@ export function reconcileRevokedHostToolInvocations(
          AND call.logical_tool_call_id = lease.logical_tool_call_id
        WHERE lease.revoked_at IS NOT NULL
          AND COALESCE(lease.revocation_reason, '') != ?
+         AND (? IS NULL OR lease.session_id = ?)
          AND lease.source_user_seq IS NOT NULL
          AND lease.accepted_task_id IS NOT NULL
          AND lease.logical_tool_call_id IS NOT NULL
@@ -487,7 +488,8 @@ export function reconcileRevokedHostToolInvocations(
        ORDER BY lease.revoked_at, lease.session_id, lease.source_user_seq,
                 lease.logical_tool_call_id, lease.scope_id, lease.lease_id
        LIMIT ?
-    `).all(DURABLE_HOST_CONTINUATION_PENDING_REVOCATION, limit) as Candidate[];
+    `).all(DURABLE_HOST_CONTINUATION_PENDING_REVOCATION, options.sessionId ?? null,
+      options.sessionId ?? null, limit) as Candidate[];
   } catch (error) {
     return {
       scanned: 0,

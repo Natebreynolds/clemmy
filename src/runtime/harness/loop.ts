@@ -71,7 +71,9 @@ import {
   type EventRow,
   type KillRequestTarget,
   type SessionRow,
+  AcceptedTaskTerminalPublicationError,
 } from './eventlog.js';
+import { reconcileRevokedHostToolInvocations } from './host-tool-invocation.js';
 import { isUnattendedSession } from './unattended-session.js';
 import { autonomousSendConsentPresentation } from './autonomous-send-consent.js';
 import { destinationCardSuffix } from './destination-gate.js';
@@ -1366,7 +1368,7 @@ function reduceStandardConversationTerminal(input: {
       break;
   }
 
-  const committed = commitTurnOutcome(outcome, {
+  const committed = commitStopSettlingRevokedCalls(outcome, () => commitTurnOutcome(outcome, {
     legacyReason,
     metadata: {
       steps: result.steps,
@@ -1377,12 +1379,44 @@ function reduceStandardConversationTerminal(input: {
       ...(blockedReason ? { blockedReason } : {}),
       ...(blockedDetail ? { blockedDetail } : {}),
     },
-  });
+  }));
   return {
     ...result,
     status: runConversationStatusForPresentation(committed.presentation),
     publicPresentation: committed.presentation,
   };
+}
+
+/**
+ * A STOP ALWAYS REACHES THE PERSON.
+ *
+ * Publishing a stop closes the turn's call authority, which refuses while a
+ * call is still open. A call whose dispatch generation the runner already
+ * revoked will never settle by itself; the periodic reaper settles it later
+ * without redispatch, but by then nothing owns the turn and its reply is never
+ * published. Settle those calls the same way, then publish. A completed
+ * answer keeps the strict rule: its evidence must already be settled.
+ */
+function commitStopSettlingRevokedCalls<T>(
+  outcome: Pick<TurnOutcome, 'status' | 'identity'>,
+  commit: () => T,
+): T {
+  try {
+    return commit();
+  } catch (error) {
+    if (outcome.status === 'done'
+      || !(error instanceof AcceptedTaskTerminalPublicationError)
+      || error.status !== 'not_ready') throw error;
+    const sweep = reconcileRevokedHostToolInvocations({ sessionId: outcome.identity.sessionId });
+    logger.warn({
+      sessionId: outcome.identity.sessionId,
+      sourceUserSeq: outcome.identity.sourceUserSeq,
+      reason: error.reason,
+      settled: sweep.settled,
+      held: sweep.held,
+    }, 'stop waited on open calls; settled revoked calls before publishing');
+    return commit();
+  }
 }
 
 export const _testOnly_reduceStandardConversationTerminal = reduceStandardConversationTerminal;
@@ -6180,6 +6214,7 @@ function scheduleHostCheckpointRecovery(
     if (scheduledHostRecoveries.get(key) !== scheduled) return;
     void (async () => {
       let retry = false;
+      let failed = false;
       try {
         const session = HarnessSession.load(options.sessionId);
         const recoveryBlob = session?.loadRecoveryState();
@@ -6205,17 +6240,21 @@ function scheduleHostCheckpointRecovery(
           mcpToolScope: session.loadRecoveryMcpToolScope() ?? options.mcpToolScope,
         });
         retry = result.status === 'held' && result.hold?.wake !== 'connection';
-      } catch {
+      } catch (error) {
+        logger.warn({ err: error, sessionId: options.sessionId, sourceUserSeq, attempt },
+          'held turn recovery activation threw');
+        failed = true;
         // Retry only while this exact source still owns a readable checkpoint.
         retry = true;
         if (options.connectionExecutionLeaseOwner && options.runAttemptId) {
           try {
             assertConnectionExecutionOwned({ sessionId: options.sessionId, deliverySourceUserSeq: sourceUserSeq,
               attemptId: options.runAttemptId, leaseOwner: options.connectionExecutionLeaseOwner });
-          } catch { retry = false; /* a new executor must acquire its own lease */ }
+          } catch { retry = false; failed = false; /* a new executor must acquire its own lease */ }
         }
       } finally {
         if (scheduledHostRecoveries.get(key) === scheduled) scheduledHostRecoveries.delete(key);
+        let rescheduled = false;
         if (retry) {
           try {
             const blob = HarnessSession.load(options.sessionId)?.loadRecoveryState();
@@ -6223,15 +6262,70 @@ function scheduleHostCheckpointRecovery(
             if (held?.sessionId === options.sessionId && (held.sourceUserSeq === sourceUserSeq
               || readRecoveryActivation(options.sessionId)?.sourceUserSeq === sourceUserSeq)) {
               scheduleHostCheckpointRecovery(options, sourceUserSeq, attempt + 1);
+              rescheduled = true;
             }
           } catch { /* unreadable private state is not wake authority */ }
         }
+        // The request already answered "held", so this timer is the turn's
+        // only owner. An activation that threw after giving up its checkpoint
+        // still owes the person a reply.
+        if (failed && !rescheduled) publishStopForUnownedHeldTurn(options, sourceUserSeq);
       }
     })();
   }, delayMs);
   timer.unref?.();
   const scheduled: ScheduledHostRecovery = { timer, attempt };
   scheduledHostRecoveries.set(key, scheduled);
+}
+
+export const HELD_TURN_UNOWNED_STOP_TEXT =
+  'I stopped before finishing this request because I could not save where I was. Anything I already did is kept. Ask me to continue and I will check what finished and do only the rest.';
+const UNOWNED_STOP_PUBLISH_ATTEMPTS = 8;
+
+/**
+ * Publish the typed stop for a held turn whose recovery threw after its
+ * checkpoint was gone. Nothing else will answer it: the request returned
+ * "held" and restart recovery runs only at boot. The publication settles the
+ * run attempt in the same write. A refused publication retries on a bounded
+ * backoff (the open call it waits on may still be settling) and then logs.
+ */
+function publishStopForUnownedHeldTurn(
+  options: RunConversationOptions,
+  sourceUserSeq: number,
+  attempt = 0,
+): void {
+  const key = `${options.sessionId}:${sourceUserSeq}`;
+  try {
+    if (activeHostConversations.has(key) || scheduledHostRecoveries.has(key)) return;
+    const answered = listEvents(options.sessionId, { types: ['conversation_completed'], sinceSeq: sourceUserSeq })
+      .some((event) => event.data.sourceUserSeq === sourceUserSeq);
+    if (answered) return;
+    const blob = HarnessSession.load(options.sessionId)?.loadRecoveryState();
+    if (blob && HostRecoveryState.isHostState(blob)
+      && HostRecoveryState.fromString(blob).sourceUserSeq === sourceUserSeq) return;
+    const accepted = acceptedUserEvent(options.sessionId, sourceUserSeq);
+    const identity = standardTurnIdentity({ sessionId: options.sessionId, turn: accepted.turn, sourceUserSeq });
+    const presentation = commitStopSettlingRevokedCalls({ status: 'blocked', identity }, () => commitStandardBlockedTerminal({
+      sessionId: options.sessionId,
+      sourceUserSeq,
+      turn: accepted.turn,
+      text: HELD_TURN_UNOWNED_STOP_TEXT,
+      legacyReason: 'blocked',
+      metadata: { blockedReason: 'held_turn_recovery_failed' },
+    }));
+    emitRuntimeTerminalEvent(options.sessionId, { sessionId: options.sessionId, status: 'blocked', steps: 0,
+      lastTurn: accepted.turn, publicPresentation: presentation });
+    clearRunInFlightAfterTerminal(options.sessionId, options.runAttemptId, sourceUserSeq);
+  } catch (error) {
+    if (attempt + 1 >= UNOWNED_STOP_PUBLISH_ATTEMPTS) {
+      logger.error({ err: error, sessionId: options.sessionId, sourceUserSeq, attempts: attempt + 1 },
+        'held turn ended without a published stop');
+      return;
+    }
+    const timer = setTimeout(() => publishStopForUnownedHeldTurn(options, sourceUserSeq, attempt + 1),
+      Math.min(30_000, 1_000 * (2 ** attempt)));
+    timer.unref?.();
+  }
 }
 
 export async function runConversation(
