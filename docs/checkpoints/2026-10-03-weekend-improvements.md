@@ -898,3 +898,15 @@ Tests to write: gate predicate (lease/effect/mode matrix), child coverage
 for a leased external op, needs_user hand-back in a worker, and a controlled
 live fixture (a generic read-shaped request tool leased to workers, never
 learned) proving workers run it and the type becomes a learned read.
+- **Built (fe92de967):** workerMayActAsLead (host-tool-invocation.ts) — a
+  worker's external write proceeds past WORKER_COMPOSE_ONLY only for a tool
+  in its exact lease, effect external_write (never admin), boundary
+  host_owned_external, owner in Auto (`ownerRunsInAutoMode`, shared with the
+  consent mode). Coverage needed no change: external MCP calls carry a
+  catalog_manifest binding and evaluateUncoveredHostMutationConsent builds
+  exact coverage from it (the lead's DataForSEO writes recorded
+  exact_carrier_bounded_work). A worker's consent `needs_user` returns the
+  WORKER_COMPOSE_ONLY hand-back instead of recording an invisible approval.
+  Learning unchanged (observeSettledRequestEffect runs for any session).
+  Tests: predicate matrix + 1606 consent/host-runner/worker tests (0 fail).
+  Live proof pending (needs an unlearned read-shaped request in a worker).
