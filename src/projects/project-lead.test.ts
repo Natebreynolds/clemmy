@@ -106,6 +106,9 @@ test('Clem is told who leads; the lead is told to plan and run workers; a worker
   const forClem = bindProject(p).context;
   assert.match(forClem, /Fixture Planner leads this project/);
   assert.match(forClem, /dispatch_background_task/);
+  assert.match(forClem, /Do quick work yourself: answer, look something up, or make a small change to a file\./,
+    'a quick edit is not a job: Clem does it rather than starting a worker');
+  assert.doesNotMatch(forClem, /run_worker/);
   const forLead = bindProject(p, { agentId: lead.id }).context;
   assert.match(forLead, /You lead this project/);
   assert.match(forLead, /run_worker/);

@@ -114,8 +114,9 @@ export function bindProject(project: ProjectRecord, options: { agentId?: string 
         + 'Check in at real decisions and when a wave finishes, then deliver the finished work.');
   } else if (lead && leadName) {
     lines.push('', `### ${leadName} leads this project`,
-      `Hand a whole job in this project to ${leadName} with dispatch_background_task (agent ${leadName}, this project): `
-        + `${leadName} plans it, runs its own workers, and checks in here. Use run_worker only for one small, self-contained item.`);
+      'Do quick work yourself: answer, look something up, or make a small change to a file. '
+        + `Hand a whole job in this project to ${leadName} with dispatch_background_task (agent ${leadName}, this project): `
+        + `${leadName} plans it, runs its own workers, and checks in here. A change to work ${leadName} is doing or did goes to that task.`);
   }
 
   const pinnedSkills: string[] = [];
