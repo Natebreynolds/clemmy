@@ -325,6 +325,20 @@ function exactDirectMcpResultPayload(value: unknown): ExactMcpResultPayload | nu
     const textAgrees = textPayloads.every((candidate) => (
       structured !== null && exactJsonValueMatches(candidate.payload, structured)
     ));
+    // Some servers return a tool's text output as the structured copy wrapped
+    // in a one-key object (often as the same JSON in a string). That copy says
+    // what the text says, and the text is the addressable one. Any other
+    // difference between the copies is still a conflict.
+    const first = textPayloads[0];
+    if (first && structuredIsValid && textPayloadsAgree && !textAgrees
+      && structuredWrapsValue(structured!, first.payload)) {
+      return {
+        payload: first.payload,
+        pathPrefix: `content.${first.index}.text`,
+        isError: typeof envelope.isError === 'boolean' ? envelope.isError : undefined,
+        malformed: !contentIsValid || !isErrorIsValid,
+      };
+    }
     return {
       payload: structuredIsValid && textPayloadsAgree && textAgrees ? structured : null,
       pathPrefix: structuredIsValid && textPayloadsAgree && textAgrees
@@ -343,6 +357,18 @@ function exactDirectMcpResultPayload(value: unknown): ExactMcpResultPayload | nu
     isError: typeof envelope.isError === 'boolean' ? envelope.isError : undefined,
     malformed: !contentIsValid || !isErrorIsValid || !textPayloadsAgree,
   };
+}
+
+/** A one-key structured copy whose value is the text copy's value, or that
+ *  value serialized as JSON text. */
+function structuredWrapsValue(structured: Record<string, unknown>, value: unknown): boolean {
+  const keys = Object.keys(structured);
+  if (keys.length !== 1) return false;
+  const wrapped = structured[keys[0]!];
+  if (exactJsonValueMatches(wrapped, value)) return true;
+  if (typeof wrapped !== 'string') return false;
+  const parsed = parseMcpTextPayload(wrapped);
+  return parsed !== null && exactJsonValueMatches(parsed, value);
 }
 
 function claimsMcpResultEnvelope(value: unknown): boolean {
