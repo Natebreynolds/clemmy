@@ -119,7 +119,7 @@ test('Discord reports a typed hold promptly without settling its durable owner',
   assert.equal(loopEntries.length, 1);
   const [{ sessionId, sourceUserSeq }] = loopEntries;
   assert.equal(initial.length, 1, 'Discord owns one placeholder for the held request');
-  assert.ok(edits.some((text) => /did not start a duplicate attempt/i.test(text)),
+  assert.ok(edits.some((text) => /still working on this and will post the result here/i.test(text)),
     'the placeholder is promptly replaced with the canonical nonterminal acknowledgement');
   assert.deepEqual(typedHolds.at(-1), HOLD, 'the transport receives the exact typed owner/wake/reason');
   assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0,

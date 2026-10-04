@@ -4143,7 +4143,7 @@ test('respondViaHarness: typed peer/recovery ownership stays nonterminal and pre
   });
 
   assert.equal(response.stoppedReason, 'in-progress');
-  assert.match(response.text, /did not start a duplicate attempt/i);
+  assert.match(response.text, /still working on this and will post the result here/i);
   assert.deepEqual((response.raw as { typedExecution?: unknown }).typedExecution, {
     owner: 'host',
     wake: 'peer',
