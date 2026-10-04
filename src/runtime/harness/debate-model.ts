@@ -1439,6 +1439,9 @@ export function resolveBoundaryJudge(
   }
   const model = buildJudgeForRole(checker, claudeAvailable(), codexAvailable(), captured, recording);
   if (model) {
+    // A default checker of the author's own family is the only checker there
+    // is, wherever it was chosen, so it gets the deliberate deadline too.
+    const selfJudge = sameJudgeFamily(checker, reviewedAuthor, captured);
     return {
       model,
       modelId: checker.modelId,
@@ -1454,10 +1457,10 @@ export function resolveBoundaryJudge(
       // Live Grok4.6 returned a valid verdict just after the cheap-checker
       // deadline despite being explicitly selected. Keep the default checker
       // deadline for unselected routes and honour explicit deadline overrides.
-      timeoutMs: hasExplicitJudgeBinding(checker)
+      timeoutMs: hasExplicitJudgeBinding(checker) || selfJudge
         ? exactJudgeBoundaryTimeoutMs()
         : boundaryJudgeTimeoutMs(),
-      selfJudge: sameJudgeFamily(checker, reviewedAuthor, captured),
+      selfJudge,
     };
   }
   if (hasExplicitJudgeBinding(checker)) {

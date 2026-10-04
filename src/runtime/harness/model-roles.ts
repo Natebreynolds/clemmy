@@ -437,7 +437,17 @@ export function defaultForRole(role: ModelRole): string {
         explicitJudgeChoice: getRuntimeEnv('CLEMMY_DEBATE_JUDGE', '') || '',
       });
       if (crossFamily) return crossFamily;
-      return judgeChoice() === 'claude' ? getDebateCheckerModel() : codexSafePrimary();
+      // On Automatic the default checker family must be signed in to check
+      // anything. When it is not, the work is checked by the fast checker of
+      // the brain's own family, and that is the model the role names. A family
+      // the owner chose stays named as chosen.
+      const choice = judgeChoice();
+      if (!(getRuntimeEnv('CLEMMY_DEBATE_JUDGE', '') || '').trim()) {
+        const signedIn = debateBrainsAvailable();
+        if (choice === 'claude' && !signedIn.claude && brainProvider === 'codex') return boundaryCodexJudgeModel();
+        if (choice !== 'claude' && !signedIn.codex && brainProvider === 'claude') return boundaryClaudeJudgeModel();
+      }
+      return choice === 'claude' ? getDebateCheckerModel() : codexSafePrimary();
     }
     case 'worker':
     default:
