@@ -290,3 +290,9 @@ test('unknown provenance is disclosed, never rendered as fresh', () => {
   assert.equal(staleSuffix({ updatedAtMs: 0, nowMs: 10_000_000, live: false }), ' — last reading, age unknown');
   assert.equal(staleSuffix({ updatedAtMs: NaN, nowMs: 10_000_000, live: false }), ' — last reading, age unknown');
 });
+
+test('updates while you were away count only what is unread', async () => {
+  const { awayCounts } = await import('./home-model');
+  const item = (read: boolean) => ({ kind: 'done', title: 'Report sent', panel: 'activity', read } as never);
+  assert.deepEqual(awayCounts([item(false), item(true), item(true)]), { updates: 1, attention: 0 });
+});

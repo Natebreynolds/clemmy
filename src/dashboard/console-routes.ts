@@ -14372,7 +14372,7 @@ export function registerConsoleRoutes(
     const requestId = typeof req.body?.requestId === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(req.body.requestId) ? req.body.requestId : undefined;
     const seenDigest = typeof req.body?.voiceDigest === 'string' ? req.body.voiceDigest.slice(0, 64) : undefined;
     try {
-      const [{ readFromClem, replyToFromClem, startFromClemTurn }, { addRule, HEARTBEAT_IDS }, { peekTurnSemanticModelPort }] = await Promise.all([
+      const [{ readFromClem, replyToFromClem, startFromClemTurn, moveFromClemRowToLater }, { addRule, HEARTBEAT_IDS }, { peekTurnSemanticModelPort }] = await Promise.all([
         import('./from-clem-runtime.js'),
         import('../agents/heartbeats.js'),
         import('../runtime/semantic-boundary/turn-semantic-port-registry.js'),
@@ -14398,6 +14398,7 @@ export function registerConsoleRoutes(
         },
         rejectPlan: (planProposalId, reason) => Boolean(rejectPlanProposal(planProposalId, reason)),
         snoozePlan: (planProposalId) => { void snoozeHomeItem(`plan:${planProposalId}`, DEFAULT_SNOOZE_HOURS); },
+        later: (rowKey) => moveFromClemRowToLater(rowKey),
         startTurn: (input) => startFromClemTurn(input),
       }, { ...(requestId ? { requestId } : {}), ...(seenDigest ? { seenDigest } : {}) });
       res.json(result);

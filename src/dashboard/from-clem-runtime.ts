@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../tools/shared.js';
-import { buildFromClem, type FromClem, type FromClemRow } from './from-clem.js';
+import { buildFromClem, fromClemItemDigest, fromClemSaidUnderEarlierRubric, type FromClem, type FromClemRow } from './from-clem.js';
 import { needsYouReferents, notificationNeedsYou } from './needs-you.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
@@ -25,6 +25,45 @@ import { withOwnModelRequestAttribution } from '../runtime/usage-log.js';
 
 const logger = pino({ name: 'clementine.from-clem' });
 const VOICE_FILE = path.join(BASE_DIR, 'state', 'from-clem-voice.json');
+/** Items the owner moved to later, by row key → when they come back. A file
+ *  of its own, so the voice pass rewriting its file never drops one. */
+const LATER_FILE = path.join(BASE_DIR, 'state', 'from-clem-later.json');
+
+function loadLater(): Record<string, string> {
+  try {
+    if (!existsSync(LATER_FILE)) return {};
+    const raw = JSON.parse(readFileSync(LATER_FILE, 'utf-8')) as { version?: number; until?: Record<string, string> };
+    return raw.version === 1 && raw.until && typeof raw.until === 'object' ? raw.until : {};
+  } catch {
+    return {};
+  }
+}
+
+/** The next morning at eight, local time: "not now" means it comes back then. */
+export function nextMorning(nowMs: number): string {
+  const next = new Date(nowMs);
+  next.setDate(next.getDate() + 1);
+  next.setHours(8, 0, 0, 0);
+  return next.toISOString();
+}
+
+/** Hide one row until the next morning. Expired entries are dropped on write. */
+export function moveFromClemRowToLater(key: string, nowMs = Date.now()): void {
+  const until = Object.fromEntries(Object.entries(loadLater()).filter(([, at]) => Date.parse(at) > nowMs));
+  until[key] = nextMorning(nowMs);
+  mkdirSync(path.dirname(LATER_FILE), { recursive: true });
+  const tmp = `${LATER_FILE}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ version: 1, until }, null, 2));
+  renameSync(tmp, LATER_FILE);
+}
+
+function laterNow(nowMs = Date.now()): (key: string) => boolean {
+  const until = loadLater();
+  return (key) => {
+    const at = until[key];
+    return Boolean(at) && Date.parse(at!) > nowMs;
+  };
+}
 const MAX_VOICES_PER_PASS = 4;
 const VOICE_PASS_MS = 60_000;
 const FIRST_VOICE_PASS_DELAY_MS = 45_000;
@@ -37,7 +76,8 @@ const VOICE_RETRY_MAX_MS = 6 * 60 * 60_000;
 
 // ── her words, kept ───────────────────────────────────────────────────────────
 /** `posted` is the digest last posted to her thread, so a message lands there once. */
-interface VoiceEntry { digest: string; message: string; model: string; at: string; posted?: string }
+/** `posted` names the item (fromClemItemDigest) last posted to her thread. */
+interface VoiceEntry { digest: string; message: string; choices?: string[]; model: string; at: string; posted?: string }
 /** One item that could not be said backs off on its own; the rest are still said. */
 interface VoiceFailure { digest: string; count: number; at: string }
 /** `primer` is the digest of the raised-context text her thread last received. */
@@ -65,9 +105,11 @@ function saveVoices(file: VoiceFile): void {
   renameSync(tmp, VOICE_FILE);
 }
 function voiced(file: VoiceFile) {
-  return (key: string, digest: string): string | undefined => {
+  return (key: string, digest: string): { message: string; choices?: string[] } | undefined => {
     const entry = file.entries[key];
-    return entry && entry.digest === digest ? entry.message : undefined;
+    return entry && entry.digest === digest
+      ? { message: entry.message, ...(entry.choices?.length ? { choices: entry.choices } : {}) }
+      : undefined;
   };
 }
 
@@ -109,6 +151,7 @@ export async function readFromClem(): Promise<FromClem> {
     })),
     asksOwner: (notification) => notificationNeedsYou(notification, needsYouRef),
     voiced: voiced(loadVoices()),
+    later: laterNow(),
   });
 }
 
@@ -217,9 +260,17 @@ export async function voiceFromClemRows(
           evidenceDigest: row.voiceDigest,
         }));
         if (!result.message) { unsaid('no message'); continue; }
+        const prior = file.entries[row.key];
+        // Already in her thread when the item is unchanged: posted for this
+        // item, or posted under an earlier rubric's words for it.
+        const postedItem = prior?.posted && (prior.posted === fromClemItemDigest(row)
+          || (prior.posted === prior.digest && fromClemSaidUnderEarlierRubric(row, prior.digest)))
+          ? fromClemItemDigest(row) : undefined;
         file.entries[row.key] = {
-          digest: row.voiceDigest, message: result.message.slice(0, 600), model: result.modelIdentity,
-          at: new Date(nowMs).toISOString(),
+          digest: row.voiceDigest, message: result.message.slice(0, 600),
+          ...(result.choices?.length ? { choices: result.choices.slice(0, 3).map((choice) => choice.slice(0, 40)) } : {}),
+          model: result.modelIdentity, at: new Date(nowMs).toISOString(),
+          ...(postedItem ? { posted: postedItem } : {}),
         };
         delete failures[row.key];
         written += 1;
@@ -236,9 +287,12 @@ export async function voiceFromClemRows(
   const thread = deps.thread === undefined ? productionClemThread : deps.thread;
   if (thread) {
     try {
+      // An item is posted once. Saying it again in new words (a changed
+      // rubric) is not news; a changed item is.
       const unposted = rows.filter((row) => {
         const entry = file.entries[row.key];
-        return entry && entry.digest === row.voiceDigest && entry.posted !== entry.digest;
+        return entry && entry.digest === row.voiceDigest && entry.posted !== fromClemItemDigest(row)
+          && entry.posted !== entry.digest;
       }).sort((a, b) => a.at.localeCompare(b.at));
       if (unposted.length > 0) {
         thread.ensure();
@@ -247,7 +301,7 @@ export async function voiceFromClemRows(
           const entry = file.entries[row.key]!;
           const postKey = `${row.key}:${entry.digest}`;
           if (!already.has(postKey)) thread.post({ key: row.key, heartbeat: row.heartbeat, text: entry.message, postKey });
-          entry.posted = entry.digest;
+          entry.posted = fromClemItemDigest(row);
           changed = true;
         }
       }
@@ -321,6 +375,8 @@ export interface FromClemReplyDeps {
   approvePlan: (planProposalId: string) => boolean;
   rejectPlan: (planProposalId: string, reason: string) => boolean;
   snoozePlan: (planProposalId: string) => void;
+  /** Hide the row until the next morning; the item itself is untouched. */
+  later: (key: string) => void;
   startTurn: (input: { title: string; message: string; displayMessage: string }) => string;
 }
 
@@ -408,8 +464,9 @@ async function replyOnce(key: string, text: string, deps: FromClemReplyDeps, req
       if (notificationId) deps.markRead(notificationId);
       return { outcome: 'cleared', decision: read.decision };
     case 'not_now':
-      if (planId) { deps.snoozePlan(planId); return { outcome: 'later', decision: read.decision }; }
-      if (notificationId) deps.markRead(notificationId);
+      // Later is later: the item comes back tomorrow morning, never cleared.
+      if (planId) deps.snoozePlan(planId);
+      deps.later(row.key);
       return { outcome: 'later', decision: read.decision };
     case 'never':
       if (planId) deps.rejectPlan(planId, reply);

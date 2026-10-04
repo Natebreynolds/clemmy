@@ -273,10 +273,13 @@ export function clockLabel(iso?: string): string {
     .replace(/\s?(AM|PM)$/i, (m) => m.toLowerCase());
 }
 
+/** What came in while the owner was away: unread only. A read update was
+ *  already seen, and the list's own length is a display cap, not a count. */
 export function awayCounts(items: readonly HomeFeedItem[]): { updates: number; attention: number } {
   let updates = 0;
   let attention = 0;
   for (const item of items) {
+    if (item.read === true) continue;
     if (awayOutcome(item) === 'warning') attention += 1;
     else updates += 1;
   }

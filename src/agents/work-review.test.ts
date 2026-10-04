@@ -62,15 +62,15 @@ test('candidates: failures and long waits are raised, grouped by what they are a
     'run_waiting:weekly-review',
   ]);
   const failed = c.find((x) => x.key === 'run_failed:r-fail')!;
-  assert.match(failed.detail, /friday-dashboard-daily-refresh failed 3 h ago: Salesforce query timed out/);
+  assert.match(failed.detail, /friday-dashboard-daily-refresh failed (at|on) .+?: Salesforce query timed out/);
   assert.match(failed.offer, /look at what went wrong/);
-  assert.match(c.find((x) => x.key === 'run_failed:r-error')!.detail, /inbox-sweep failed 2 h ago: IMAP login refused/, 'a record stored as error is a failure');
+  assert.match(c.find((x) => x.key === 'run_failed:r-error')!.detail, /inbox-sweep failed (at|on) .+?: IMAP login refused/, 'a record stored as error is a failure');
   const wait = c.find((x) => x.kind === 'run_waiting')!;
-  assert.match(wait.detail, /2 runs of weekly-review are waiting on you, the oldest since 5 h ago/);
+  assert.match(wait.detail, /2 runs of weekly-review are waiting on you, the oldest since \S+/);
   assert.deepEqual(wait.refs, ['r-wait-old', 'r-wait-old-2']);
   const standup = c.find((x) => x.key === 'chat_waiting:workflow: daily-standup-email')!;
   assert.equal(standup.count, 2);
-  assert.match(standup.detail, /2 conversations about "Workflow: daily-standup-email" are waiting for your answer, the oldest since 3 days ago/);
+  assert.match(standup.detail, /2 conversations about "Workflow: daily-standup-email" are waiting for your answer, the oldest since \S+/);
   // A failure older than the last tick is not raised again on the next tick.
   const later = deriveWorkReviewCandidates(observation, DEFAULT_WORK_REVIEW_CONFIG, NOW, NOW - 60 * 60_000);
   assert.equal(later.some((x) => x.kind === 'run_failed'), false);
@@ -223,7 +223,7 @@ test('the notification reads as the item, and a read failure is a recorded error
   const c = deriveWorkReviewCandidates(observation, DEFAULT_WORK_REVIEW_CONFIG, NOW, null).find((x) => x.kind === 'chat_waiting')!;
   const n = buildWorkReviewNotification(c, iso(0), 'quiet');
   assert.equal(n.title, 'Still waiting: Send the leadership email');
-  assert.match(n.body, /waiting for your approval since 26 h ago/);
+  assert.match(n.body, /waiting for your approval since \S+/);
   assert.equal(n.kind, 'execution');
   const h = harness({});
   h.deps.observe = async () => { throw new Error('disk gone'); };
@@ -252,4 +252,17 @@ test('a failure a later successful run of the same workflow superseded stops ask
   assert.ok(h.markedRead.includes(failed.notificationId!), 'the card leaves Needs you and From Clem');
   // Another workflow's failure is untouched.
   assert.equal(h.state.items['run_failed:r-error'].retiredAt, undefined);
+});
+
+test('stored times stay true: a clock time today, a weekday this week, a date before that', async () => {
+  const { formatWhen } = await import('./work-review.js');
+  const now = new Date(2026, 8, 26, 15, 0).getTime();
+  assert.match(formatWhen(now - 60 * 60_000, now, 'at'), /^at 2:00\sPM$/);
+  assert.match(formatWhen(now - 60 * 60_000, now, 'since'), /^since 2:00\sPM$/);
+  const twoDays = new Date(2026, 8, 24, 9, 30).getTime();
+  assert.match(formatWhen(twoDays, now, 'at'), /^on Thursday at 9:30\sAM$/);
+  assert.equal(formatWhen(twoDays, now, 'since'), 'since Thursday');
+  const older = new Date(2026, 8, 10, 9, 30).getTime();
+  assert.equal(formatWhen(older, now, 'at'), 'on Sep 10');
+  assert.equal(formatWhen(older, now, 'since'), 'since Sep 10');
 });

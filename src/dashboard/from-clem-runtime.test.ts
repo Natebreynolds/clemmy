@@ -22,7 +22,7 @@ const { voiceFromClemRows, replyToFromClem } = await import('./from-clem-runtime
 const { modelUsageAttributionStorage } = await import('../runtime/usage-log.js');
 type FromClemReplyDeps = Parameters<typeof replyToFromClem>[2];
 
-const stream = (voiced?: (key: string, digest: string) => string | undefined, readIds: ReadonlySet<string> = new Set()) => buildFromClem({
+const stream = (voiced?: (key: string, digest: string) => { message: string; choices?: string[] } | undefined, readIds: ReadonlySet<string> = new Set()) => buildFromClem({
   heartbeats: [
     { id: 'calendar', title: 'Calendar watch', enabled: true },
     { id: 'work-review', title: 'Work review', enabled: true },
@@ -57,7 +57,7 @@ test('she writes each item once, a few per pass, again when it changes, and forg
   // The stream now carries her words; the record's own words stay as facts.
   const fs = await import('node:fs');
   const kept = JSON.parse(fs.readFileSync(path.join(TMP, 'state', 'from-clem-voice.json'), 'utf8')) as { entries: Record<string, { digest: string; message: string }> };
-  const voicedStream = stream((key, digest) => (kept.entries[key]?.digest === digest ? kept.entries[key]!.message : undefined));
+  const voicedStream = stream((key, digest) => (kept.entries[key]?.digest === digest ? { message: kept.entries[key]!.message } : undefined));
   const calendar = voicedStream.rows.find((row) => row.key === 'notif:cal')!;
   assert.equal(calendar.say, 'I saw: Cancelled: Interview');
   assert.equal(calendar.text, 'Cancelled: Interview');
@@ -100,10 +100,44 @@ test('what she writes lands in her own thread once, oldest first, and the thread
   assert.equal(posts.length, 4);
 });
 
+test('saying an item again in new words does not post it to her thread again; a changed item does', async () => {
+  const fs = await import('node:fs');
+  const { fromClemVoiceDigest } = await import('./from-clem.js');
+  const file = path.join(TMP, 'state', 'from-clem-voice.json');
+  const rows = stream().rows;
+  const cal = rows.find((row) => row.key === 'notif:cal')!;
+  // Written and posted under the previous rubric's words.
+  const earlier = fromClemVoiceDigest(cal, 2);
+  fs.writeFileSync(file, JSON.stringify({ version: 1, entries: {
+    'notif:cal': { digest: earlier, message: 'Old words', model: 'fixture-brain', at: '2026-10-01T12:01:00.000Z', posted: earlier },
+  } }));
+  const posts: string[] = [];
+  const thread = { ensure: () => {}, postedKeys: () => new Set<string>(), post: (m: { key: string }) => { posts.push(m.key); }, primer: () => true };
+  const port = () => ({
+    async voiceProactiveItem(call: { item: { title: string; waitingOnOwner: boolean }; evidenceDigest: string }) {
+      return { message: `New words: ${call.item.title}`, ...(call.item.waitingOnOwner ? { choices: ['Do it', 'Drop it'] } : {}),
+        evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture-brain' };
+    },
+  });
+  await voiceFromClemRows(rows, { port: port as never, max: 10, thread });
+  assert.ok(!posts.includes('notif:cal'), 'the calendar item was already in her thread');
+  const kept = JSON.parse(fs.readFileSync(file, 'utf8')) as { entries: Record<string, { message: string; choices?: string[] }> };
+  assert.equal(kept.entries['notif:cal']!.message, 'New words: Cancelled: Interview');
+  assert.deepEqual(kept.entries['notif:wr']!.choices, ['Do it', 'Drop it'], 'an item waiting on the owner keeps her answers');
+  // The stream offers her answers only where the owner is asked.
+  const voicedStream = stream((key) => (kept.entries[key] ? { message: kept.entries[key]!.message, ...(kept.entries[key]!.choices ? { choices: kept.entries[key]!.choices } : {}) } : undefined));
+  assert.equal(voicedStream.rows.find((row) => row.key === 'notif:wr')?.choices?.length, 2);
+  assert.equal(voicedStream.rows.find((row) => row.key === 'notif:cal')?.choices, undefined);
+  // A changed item is news again.
+  const changed = rows.map((row) => (row.key === 'notif:cal' ? { ...row, at: '2026-10-02T09:00:00.000Z', voiceDigest: fromClemVoiceDigest({ ...row, at: '2026-10-02T09:00:00.000Z' }) } : row));
+  await voiceFromClemRows(changed, { port: port as never, max: 10, thread });
+  assert.ok(posts.includes('notif:cal'));
+});
+
 function deps(over: Partial<FromClemReplyDeps> = {}, decision: { decision: string; instruction?: string } = { decision: 'done' }) {
   const log: string[] = [];
   const all: FromClemReplyDeps = {
-    read: async () => stream((key) => (key === 'notif:cal' ? 'Your 4:00 interview was cancelled; that hour is free.' : undefined)),
+    read: async () => stream((key) => (key === 'notif:cal' ? { message: 'Your 4:00 interview was cancelled; that hour is free.' } : undefined)),
     port: () => ({
       async readClemReply(call) {
         log.push(`read:${call.said}|${call.reply}`);
@@ -116,6 +150,7 @@ function deps(over: Partial<FromClemReplyDeps> = {}, decision: { decision: strin
     approvePlan: (id) => { log.push(`approve:${id}`); return true; },
     rejectPlan: (id, reason) => { log.push(`reject:${id}:${reason}`); return true; },
     snoozePlan: (id) => { log.push(`snooze:${id}`); },
+    later: (key) => { log.push(`later:${key}`); },
     startTurn: (input) => { log.push(`turn:${input.displayMessage}:${input.message}`); return 'sess-1'; },
     ...over,
   };
@@ -159,6 +194,11 @@ test('a suggestion: do it approves it, with an instruction it becomes a conversa
   run = deps({}, { decision: 'not_now' });
   assert.equal((await replyToFromClem('plan:plan1', 'later', run.all)).outcome, 'later');
   assert.ok(run.log.includes('snooze:plan1'));
+  // "Not now" on a finding moves it to later; it is never cleared.
+  run = deps({}, { decision: 'not_now' });
+  assert.equal((await replyToFromClem('notif:cal', 'not now', run.all)).outcome, 'later');
+  assert.ok(run.log.includes('later:notif:cal'));
+  assert.ok(!run.log.some((line) => line.startsWith('read-notif:')), 'a finding moved to later stays unread');
 
   run = deps({}, { decision: 'done' });
   assert.equal((await replyToFromClem('plan:plan1', 'no thanks', run.all)).outcome, 'declined');
@@ -316,4 +356,22 @@ test('a heartbeat\'s latest check counts as failed only when its error belongs t
   assert.equal(lastCheckFailed('2026-10-02T10:00:40.000Z', '2026-10-02T10:00:00.000Z'), true, 'error recorded as the check started');
   assert.equal(lastCheckFailed('2026-10-02T10:30:00.000Z', '2026-10-02T10:00:00.000Z'), false, 'an older failure, since checked cleanly');
   assert.equal(lastCheckFailed('not a date', '2026-10-02T10:00:00.000Z'), false);
+});
+
+test('an item moved to later is hidden until the next morning and stays covered meanwhile', async () => {
+  const { moveFromClemRowToLater, nextMorning, readFromClem } = await import('./from-clem-runtime.js');
+  const now = new Date(2026, 9, 4, 15, 0).getTime();
+  const morning = new Date(nextMorning(now));
+  assert.equal(morning.getDate(), 5);
+  assert.equal(morning.getHours(), 8);
+  moveFromClemRowToLater('notif:cal', now);
+  const hidden = stream(undefined, new Set());
+  assert.ok(hidden.rows.some((row) => row.key === 'notif:cal'), 'the stream helper itself is unfiltered');
+  const { buildFromClem: build } = await import('./from-clem.js');
+  const later = build({ heartbeats: [], noticingProposals: [], planProposals: [], asksOwner: () => false,
+    notifications: [{ id: 'cal', kind: 'execution', title: 'Cancelled: Interview', body: '', createdAt: '2026-10-01T12:00:00.000Z', read: false, metadata: { watch: 'calendar', itemKey: 'k1' } }],
+    later: (key) => key === 'notif:cal' });
+  assert.equal(later.rows.length, 0);
+  assert.deepEqual(later.covers.notificationIds, ['cal']);
+  assert.equal(typeof readFromClem, 'function');
 });

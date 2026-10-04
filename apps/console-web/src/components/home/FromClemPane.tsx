@@ -15,14 +15,18 @@ interface RowState {
   notice?: { tone: 'success' | 'error'; text: string; sessionId?: string };
 }
 
+/** How many rows each group shows before "Show more" opens the rest in place. */
+const WAITING_SHOWN = 5;
+const UPDATES_SHOWN = 3;
+
 /**
- * From Clem: what Clem's heartbeats brought you, in their own words, in one
- * place. What waits on you comes first. Each message reads on its own; opening
- * one shows what it is about and answers it right here — in your words for a
- * proposal, yes or no for a suggestion, Done for a finding. With
- * nothing to say, the pane still shows when each heartbeat last looked and
- * what it found, so a quiet Clem reads as a watching one. How often she looks
- * lives one level down, in Heartbeats.
+ * From Clem: what Clem's heartbeats brought you, in her words, in two groups.
+ * What waits on you comes first, each with the answers she offers as buttons
+ * and your own words one tap away; then updates, each cleared with Done. A
+ * group longer than a glance opens the rest in place, never on another page.
+ * With nothing to say, the pane still shows when each heartbeat last looked,
+ * so a quiet Clem reads as a watching one. How often she looks lives in
+ * Heartbeats.
  */
 export function FromClemPane({
   headingId,
@@ -30,23 +34,22 @@ export function FromClemPane({
   loading,
   error,
   onRetry,
-  maxRows = 4,
 }: {
   headingId: string;
   data?: FromClem;
   loading: boolean;
   error: boolean;
   onRetry: () => void;
-  maxRows?: number;
 }) {
   const qc = useQueryClient();
   const [states, setStates] = useState<Record<string, RowState>>({});
-  // One item open at a time: its source, its reply box and its quick answers.
-  // Closed items are a message to read, not a form. Drafts outlive closing.
+  // One reply box open at a time. Drafts outlive closing.
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [showAll, setShowAll] = useState<{ waiting: boolean; updates: boolean }>({ waiting: false, updates: false });
   const rows = data?.rows ?? [];
-  const asks = rows.filter((row) => row.asks).length;
+  const waiting = rows.filter((row) => row.asks);
+  const updates = rows.filter((row) => !row.asks);
   const pulses = recentPulses(data?.pulses ?? []);
 
   const act = (
@@ -60,6 +63,7 @@ export function FromClemPane({
       (result) => {
         const said = typeof success === 'string' ? { text: success } : success(result);
         setStates((all) => ({ ...all, [row.key]: { notice: { tone: 'success', ...said } } }));
+        setOpenKey((key) => (key === row.key ? null : key));
         void qc.invalidateQueries({ queryKey: ['home-from-clem'] });
         void qc.invalidateQueries({ queryKey: ['command-center'] });
       },
@@ -75,54 +79,159 @@ export function FromClemPane({
     return { text: replyOutcomeText(outcome, row.heartbeatTitle), ...(outcome.outcome === 'started' ? { sessionId: outcome.sessionId } : {}) };
   });
 
-  const quick = (row: FromClemRow, state: RowState) => {
+  /** The answers on the row itself: hers when she offered some, else the
+   *  record's own (yes/no for a suggestion). */
+  const answers = (row: FromClemRow, state: RowState) => {
+    const busy = Boolean(state.busy);
+    if (row.choices?.length) {
+      return row.choices.map((choice, index) => (
+        <Button key={choice} size="sm" variant={index === 0 ? 'primary' : 'secondary'} className="h-8 px-3 text-small"
+          disabled={busy} onClick={() => reply(row, choice)}>
+          {choice}
+        </Button>
+      ));
+    }
     if (row.answer?.kind === 'yes_no') {
       const id = row.answer.planProposalId;
-      return (
-        <>
-          <Button size="sm" className="h-8 px-3 text-small" disabled={Boolean(state.busy)}
-            onClick={() => act(row, 'yes', () => decidePlanProposal(id, 'approve'), 'Approved.')}>
-            {state.busy === 'yes' ? 'Sending…' : 'Yes'}
-          </Button>
-          <Button size="sm" variant="secondary" className="h-8 px-3 text-small" disabled={Boolean(state.busy)}
-            onClick={() => act(row, 'no', () => decidePlanProposal(id, 'reject'), 'Declined.')}>
-            No
-          </Button>
-        </>
-      );
+      return [
+        <Button key="yes" size="sm" className="h-8 px-3 text-small" disabled={busy}
+          onClick={() => act(row, 'yes', () => decidePlanProposal(id, 'approve'), 'Approved.')}>
+          {state.busy === 'yes' ? 'Sending…' : 'Yes'}
+        </Button>,
+        <Button key="no" size="sm" variant="secondary" className="h-8 px-3 text-small" disabled={busy}
+          onClick={() => act(row, 'no', () => decidePlanProposal(id, 'reject'), 'Declined.')}>
+          No
+        </Button>,
+      ];
     }
-    if (row.done) {
-      const id = row.done.notificationId;
-      return (
-        <Button size="sm" variant="secondary" className="h-8 px-3 text-small" disabled={Boolean(state.busy)}
-          onClick={() => act(row, 'done', () => markNotificationRead(id), 'Cleared.')}>
-          {state.busy === 'done' ? 'Saving…' : 'Done'}
-        </Button>
-      );
-    }
-    return null;
+    return [];
   };
 
-  const actions = (row: FromClemRow, state: RowState) => (
-    <div className="flex flex-col gap-2">
-      <AnswerRow
-        busy={state.busy === 'answer'}
-        placeholder="Reply to Clem…"
-        value={drafts[row.key] ?? ''}
-        onValueChange={(text) => setDrafts((all) => ({ ...all, [row.key]: text }))}
-        autoFocus
-        onAnswer={(text) => { if (text.trim()) reply(row, text.trim()); }}
-      />
-      {quick(row, state) && <div className="flex flex-wrap items-center gap-2">{quick(row, state)}</div>}
-    </div>
+  const notice = (state: RowState) => state.notice && (
+    <p role="status" className={cn('text-small', state.notice.tone === 'error' ? 'text-warning' : 'text-muted')}>
+      {state.notice.text}
+      {state.notice.sessionId && (
+        <>{' '}<Link to={`/chat/${encodeURIComponent(unifiedChatSessionId(state.notice.sessionId))}`} className="font-semibold text-primary hover:underline">Open</Link></>
+      )}
+    </p>
   );
+
+  const meta = (row: FromClemRow) => (
+    <span className="flex items-center gap-2 text-caption text-faint">
+      <span className="font-semibold text-muted">{row.heartbeatTitle}</span>
+      <span aria-hidden>·</span>
+      <span>{agoLabel(row.at)}</span>
+      {drafts[row.key]?.trim() && openKey !== row.key && <span className="ml-auto text-muted">Draft saved</span>}
+    </span>
+  );
+
+  // What the message is about: the record behind it, shown on request.
+  const source = (row: FromClemRow) => (row.say ? [row.text, row.detail] : [row.detail]).filter(Boolean).join(' · ');
+
+  const waitingRow = (row: FromClemRow) => {
+    const state = states[row.key] ?? {};
+    const open = openKey === row.key;
+    const offered = answers(row, state);
+    return (
+      <PaneRow key={row.key} className="flex-col items-stretch gap-2 py-3.5">
+        {meta(row)}
+        <p className="text-body text-fg">{row.say || row.text}</p>
+        {open && source(row) && <p className="whitespace-pre-line text-small text-muted">{source(row)}</p>}
+        {state.notice ? notice(state) : (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              {offered}
+              <button type="button" aria-expanded={open} onClick={() => setOpenKey(open ? null : row.key)}
+                className="rounded-sm px-1 text-small font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+                {open ? 'Close' : offered.length > 0 ? 'Reply in your words' : 'Reply'}
+              </button>
+            </div>
+            {open && (
+              <AnswerRow
+                busy={state.busy === 'answer'}
+                placeholder="Reply to Clem…"
+                value={drafts[row.key] ?? ''}
+                onValueChange={(text) => setDrafts((all) => ({ ...all, [row.key]: text }))}
+                autoFocus
+                onAnswer={(text) => { if (text.trim()) reply(row, text.trim()); }}
+              />
+            )}
+          </>
+        )}
+      </PaneRow>
+    );
+  };
+
+  const updateRow = (row: FromClemRow) => {
+    const state = states[row.key] ?? {};
+    const open = openKey === row.key;
+    const done = row.done;
+    return (
+      <PaneRow key={row.key} className="flex-col items-stretch gap-1.5 py-3.5">
+        <button type="button" aria-expanded={open} onClick={() => setOpenKey(open ? null : row.key)}
+          className="flex flex-col items-stretch gap-1 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+          {meta(row)}
+          <span className={cn('text-body text-fg', !open && 'line-clamp-2')}>{row.say || row.text}</span>
+        </button>
+        {open && source(row) && <p className="whitespace-pre-line text-small text-muted">{source(row)}</p>}
+        {state.notice ? notice(state) : (
+          <div className="flex flex-wrap items-center gap-2">
+            {done && (
+              <Button size="sm" variant="secondary" className="h-8 px-3 text-small" disabled={Boolean(state.busy)}
+                onClick={() => act(row, 'done', () => markNotificationRead(done.notificationId), 'Cleared.')}>
+                {state.busy === 'done' ? 'Saving…' : 'Done'}
+              </Button>
+            )}
+            {open ? (
+              <AnswerRow
+                busy={state.busy === 'answer'}
+                placeholder="Tell Clem what to do with it…"
+                value={drafts[row.key] ?? ''}
+                onValueChange={(text) => setDrafts((all) => ({ ...all, [row.key]: text }))}
+                onAnswer={(text) => { if (text.trim()) reply(row, text.trim()); }}
+              />
+            ) : (
+              <button type="button" onClick={() => setOpenKey(row.key)}
+                className="rounded-sm px-1 text-small font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+                Read more
+              </button>
+            )}
+          </div>
+        )}
+      </PaneRow>
+    );
+  };
+
+  const group = (label: string, list: FromClemRow[], shown: number, which: 'waiting' | 'updates', render: (row: FromClemRow) => React.ReactElement) => {
+    if (list.length === 0) return null;
+    const all = showAll[which];
+    const visible = all ? list : list.slice(0, shown);
+    return (
+      <div className="flex flex-col gap-1.5">
+        <h3 className="text-caption font-semibold uppercase tracking-wide text-faint">
+          {label}{list.length > 1 ? ` · ${list.length}` : ''}
+        </h3>
+        <PaneCard>
+          {visible.map(render)}
+          {list.length > shown && (
+            <PaneRow className="justify-center text-small">
+              <button type="button" onClick={() => setShowAll((now) => ({ ...now, [which]: !all }))}
+                className="rounded-sm font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+                {all ? 'Show fewer' : `Show ${list.length - shown} more`}
+              </button>
+            </PaneRow>
+          )}
+        </PaneCard>
+      </div>
+    );
+  };
 
   return (
     <section aria-labelledby={headingId} className="flex min-w-0 flex-col gap-2.5">
       <SectionHeader
         id={headingId}
         label="From Clem"
-        count={asks}
+        count={waiting.length}
         aside={(
           <>
             <Link to={`/chat/${encodeURIComponent(unifiedChatSessionId('clem'))}`} className="rounded-sm font-semibold text-primary hover:underline">Her thread</Link>
@@ -131,12 +240,12 @@ export function FromClemPane({
           </>
         )}
       />
-      <PaneCard>
-        {loading && !data ? (
-          <RowSkeleton rows={2} tall />
-        ) : error && !data ? (
-          <LoadFailedLine what="what Clem noticed" onRetry={onRetry} />
-        ) : rows.length === 0 ? (
+      {loading && !data ? (
+        <PaneCard><RowSkeleton rows={2} tall /></PaneCard>
+      ) : error && !data ? (
+        <PaneCard><LoadFailedLine what="what Clem noticed" onRetry={onRetry} /></PaneCard>
+      ) : rows.length === 0 ? (
+        <PaneCard>
           <PaneRow className="flex-col items-stretch gap-1.5 py-3.5">
             <p className="text-body text-fg">Nothing from Clem right now.</p>
             {pulses.length > 0 ? (
@@ -152,56 +261,13 @@ export function FromClemPane({
               <p className="text-small text-muted">Her heartbeats haven’t looked at anything yet.</p>
             )}
           </PaneRow>
-        ) : (
-          rows.slice(0, maxRows).map((row) => {
-            const state = states[row.key] ?? {};
-            const open = openKey === row.key;
-            // What the message is about: the record behind it, shown on request.
-            const source = (row.say ? [row.text, row.detail] : [row.detail]).filter(Boolean).join(' · ');
-            const drafted = Boolean(drafts[row.key]?.trim());
-            return (
-              <PaneRow key={row.key} className="flex-col items-stretch gap-1.5 py-3.5">
-                <button
-                  type="button"
-                  aria-expanded={open}
-                  onClick={() => setOpenKey(open ? null : row.key)}
-                  className="flex flex-col items-stretch gap-1 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-                >
-                  <span className="flex items-center gap-2 text-caption text-faint">
-                    <span className="font-semibold text-muted">{row.heartbeatTitle}</span>
-                    <span aria-hidden>·</span>
-                    <span>{agoLabel(row.at)}</span>
-                    {row.asks && (
-                      <span className="ml-auto inline-flex items-center gap-1.5 text-muted">
-                        <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-primary" />
-                        {drafted && !open ? 'Draft saved' : 'Waiting on you'}
-                      </span>
-                    )}
-                  </span>
-                  <span className={cn('text-body text-fg', !open && 'line-clamp-2')}>{row.say || row.text}</span>
-                  {!open && !state.notice && (
-                    <span className="text-small font-medium text-primary">{row.asks ? 'Reply' : 'Read more'}</span>
-                  )}
-                </button>
-                {open && source && <p className="whitespace-pre-line text-small text-muted">{source}</p>}
-                {state.notice ? (
-                  <p role="status" className={cn('text-small', state.notice.tone === 'error' ? 'text-warning' : 'text-muted')}>
-                    {state.notice.text}
-                    {state.notice.sessionId && (
-                      <>{' '}<Link to={`/chat/${encodeURIComponent(unifiedChatSessionId(state.notice.sessionId))}`} className="font-semibold text-primary hover:underline">Open</Link></>
-                    )}
-                  </p>
-                ) : open ? actions(row, state) : null}
-              </PaneRow>
-            );
-          })
-        )}
-        {rows.length > maxRows && (
-          <PaneRow className="justify-center text-small">
-            <Link to="/inbox" className="font-semibold text-primary hover:underline">{rows.length - maxRows} more in Needs you</Link>
-          </PaneRow>
-        )}
-      </PaneCard>
+        </PaneCard>
+      ) : (
+        <>
+          {group('Waiting on you', waiting, WAITING_SHOWN, 'waiting', waitingRow)}
+          {group('Updates', updates, UPDATES_SHOWN, 'updates', updateRow)}
+        </>
+      )}
       {rows.length > 0 && pulses.length > 0 && (
         <p className="text-caption text-faint">
           Last looked: {pulses.map((pulse) => `${pulse.title} ${agoLabel(pulse.lastAt)}`).join(' · ')}

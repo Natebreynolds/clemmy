@@ -301,6 +301,9 @@ export interface ClemVoiceCall {
 }
 export interface ClemVoiceResult {
   message: string | null;
+  /** Short answers the owner can tap, in their words; only for an item
+   *  waiting on them. */
+  choices?: string[];
   evidenceDigest: string;
   modelIdentity: string;
 }

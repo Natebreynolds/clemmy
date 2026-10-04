@@ -24,6 +24,8 @@ export interface FromClemRow {
   asks: boolean;
   /** Clem's own words about it, once she has written them. */
   say?: string;
+  /** Short answers she offers for an item waiting on the owner. */
+  choices?: string[];
   /** The record's own words: what the heartbeat wrote. */
   text: string;
   detail?: string;
@@ -58,15 +60,34 @@ export interface FromClemInput {
   /** Heartbeat items that are still waiting on the owner (the Needs you rule). */
   asksOwner: (notification: NotificationRecord) => boolean;
   /** Clem's words already written for this row, if any. */
-  voiced?: (key: string, voiceDigest: string) => string | undefined;
+  voiced?: (key: string, voiceDigest: string) => { message: string; choices?: string[] } | undefined;
+  /** Rows the owner moved to later: hidden until then, still covered, so they
+   *  do not reappear in Home's other lists meanwhile. */
+  later?: (key: string) => boolean;
 }
 
 /** Bumped when what she is asked to say changes, so every item is said again. */
-const VOICE_RUBRIC = 2;
+const VOICE_RUBRIC = 3;
+
+type VoicedItem = Pick<FromClemRow, 'heartbeat' | 'text' | 'detail' | 'asks' | 'at'>;
+
+/** The item itself: posted to her thread once per item, however often it is
+ *  said again in new words. */
+export function fromClemItemDigest(row: VoicedItem): string {
+  return createHash('sha256').update(JSON.stringify([row.heartbeat, row.text, row.detail ?? '', row.asks, row.at])).digest('hex').slice(0, 24);
+}
 
 /** What she would be speaking about: a changed item is said again. */
-export function fromClemVoiceDigest(row: Pick<FromClemRow, 'heartbeat' | 'text' | 'detail' | 'asks' | 'at'>): string {
-  return createHash('sha256').update(JSON.stringify([VOICE_RUBRIC, row.heartbeat, row.text, row.detail ?? '', row.asks, row.at])).digest('hex').slice(0, 24);
+export function fromClemVoiceDigest(row: VoicedItem, rubric = VOICE_RUBRIC): string {
+  return createHash('sha256').update(JSON.stringify([rubric, row.heartbeat, row.text, row.detail ?? '', row.asks, row.at])).digest('hex').slice(0, 24);
+}
+
+/** Whether words written under an earlier rubric were about this same item. */
+export function fromClemSaidUnderEarlierRubric(row: VoicedItem, digest: string): boolean {
+  for (let rubric = 1; rubric < VOICE_RUBRIC; rubric += 1) {
+    if (fromClemVoiceDigest(row, rubric) === digest) return true;
+  }
+  return false;
 }
 
 const str = (value: unknown): string => (typeof value === 'string' ? value : '');
@@ -123,13 +144,15 @@ export function buildFromClem(input: FromClemInput): FromClem {
     covers.planProposalIds.push(plan.id);
   }
 
-  // A stream: newest first. What waits on the owner says so on its row; a
-  // fresh finding is never buried under days-old reminders.
-  rows.sort((a, b) => b.at.localeCompare(a.at));
+  // What waits on the owner comes first, newest first within it; then what
+  // she is only telling them, newest first.
+  rows.sort((a, b) => Number(b.asks) - Number(a.asks) || b.at.localeCompare(a.at));
   const voicedRows: FromClemRow[] = rows.map((row) => {
     const voiceDigest = fromClemVoiceDigest(row);
-    const say = input.voiced?.(row.key, voiceDigest);
-    return { ...row, voiceDigest, ...(say ? { say } : {}) };
+    const said = input.voiced?.(row.key, voiceDigest);
+    return { ...row, voiceDigest,
+      ...(said ? { say: said.message } : {}),
+      ...(said?.choices?.length && row.asks ? { choices: said.choices } : {}) };
   });
   // A check that failed says when it looked, never what went wrong: the
   // reason is the heartbeat's own page's to explain, in its own words, and a
@@ -138,5 +161,5 @@ export function buildFromClem(input: FromClemInput): FromClem {
     heartbeat: row.id, title: row.title, enabled: row.enabled,
     ...(row.lastFinding ? { lastAt: row.lastFinding.at, ...(row.lastFinding.failed ? {} : { summary: row.lastFinding.summary }) } : {}),
   }));
-  return { rows: voicedRows, pulses, covers };
+  return { rows: input.later ? voicedRows.filter((row) => !input.later!(row.key)) : voicedRows, pulses, covers };
 }

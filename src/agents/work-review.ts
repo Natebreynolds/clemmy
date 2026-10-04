@@ -209,15 +209,22 @@ function ms(iso: string | undefined): number | null {
   return Number.isFinite(t) ? t : null;
 }
 
-export function formatAgo(thenMs: number, nowMs: number): string {
-  const diff = Math.max(0, nowMs - thenMs);
-  const min = Math.round(diff / 60_000);
-  if (min < 2) return 'just now';
-  if (min < 60) return `${min} min ago`;
-  const h = Math.round(min / 60);
-  if (h < 36) return `${h} h ago`;
-  const d = Math.round(h / 24);
-  return `${d} day${d === 1 ? '' : 's'} ago`;
+/**
+ * When something happened, in words that stay true after they are stored: a
+ * clock time today, a weekday within the week, a date before that. An age
+ * ("2 h ago", "just now") is wrong the moment the text is read later.
+ */
+export function formatWhen(thenMs: number, nowMs: number, mode: 'at' | 'since'): string {
+  const then = new Date(thenMs);
+  const now = new Date(nowMs);
+  const time = then.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  if (then.toDateString() === now.toDateString()) return `${mode} ${time}`;
+  if (nowMs - thenMs < 6 * 86_400_000 && thenMs <= nowMs) {
+    const day = then.toLocaleDateString('en-US', { weekday: 'long' });
+    return mode === 'at' ? `on ${day} at ${time}` : `since ${day}`;
+  }
+  const date = then.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  return mode === 'at' ? `on ${date}` : `since ${date}`;
 }
 
 function short(text: string, max = 140): string {
@@ -253,7 +260,7 @@ export function deriveWorkReviewCandidates(
         key: `run_failed:${run.runId}`,
         kind: 'run_failed',
         subject: run.workflow,
-        detail: `${run.workflow} failed ${formatAgo(finished, nowMs)}${run.error ? `: ${short(run.error, 160)}` : '.'}`,
+        detail: `${run.workflow} failed ${formatWhen(finished, nowMs, 'at')}${run.error ? `: ${short(run.error, 160)}` : '.'}`,
         ref: { type: 'workflow_run', id: run.runId },
         refs: [run.runId],
         count: 1,
@@ -279,8 +286,8 @@ export function deriveWorkReviewCandidates(
       kind: 'run_waiting',
       subject: workflow,
       detail: n === 1
-        ? `${workflow} has been waiting on you since ${formatAgo(group.oldest, nowMs)}${group.connection ? ' for a connection' : ''}.`
-        : `${n} runs of ${workflow} are waiting on you, the oldest since ${formatAgo(group.oldest, nowMs)}${group.connection ? ', one for a connection' : ''}.`,
+        ? `${workflow} has been waiting on you ${formatWhen(group.oldest, nowMs, 'since')}${group.connection ? ' for a connection' : ''}.`
+        : `${n} runs of ${workflow} are waiting on you, the oldest ${formatWhen(group.oldest, nowMs, 'since')}${group.connection ? ', one for a connection' : ''}.`,
       ref: { type: 'workflow_run', id: group.runs[0].runId },
       refs: group.runs.map((r) => r.runId),
       count: n,
@@ -310,8 +317,8 @@ export function deriveWorkReviewCandidates(
       kind: 'chat_waiting',
       subject: group.chats[0].title,
       detail: n === 1
-        ? `"${title}" has been waiting for your ${what} since ${formatAgo(group.oldest, nowMs)}.`
-        : `${n} conversations about "${title}" are waiting for your ${what}, the oldest since ${formatAgo(group.oldest, nowMs)}.`,
+        ? `"${title}" has been waiting for your ${what} ${formatWhen(group.oldest, nowMs, 'since')}.`
+        : `${n} conversations about "${title}" are waiting for your ${what}, the oldest ${formatWhen(group.oldest, nowMs, 'since')}.`,
       ref: { type: 'chat_run', id: group.chats[0].runId },
       refs: group.chats.map((c) => c.runId),
       count: n,
@@ -327,7 +334,7 @@ export function deriveWorkReviewCandidates(
       key: `draft_unsent:${draft.dir}/${draft.name}`,
       kind: 'draft_unsent',
       subject: draft.name,
-      detail: `${draft.name} has been sitting in ${draft.dir} since ${formatAgo(at, nowMs)}, unsent.`,
+      detail: `${draft.name} has been sitting in ${draft.dir} ${formatWhen(at, nowMs, 'since')}, unsent.`,
       ref: { type: 'draft', id: `${draft.dir}/${draft.name}` },
       refs: [`${draft.dir}/${draft.name}`],
       count: 1,

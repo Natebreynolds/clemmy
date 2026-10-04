@@ -11,6 +11,8 @@ export interface FromClemRow {
   asks: boolean;
   /** Clem's own words about it, once she has written them. */
   say?: string;
+  /** Short answers she offers for an item waiting on the owner. */
+  choices?: string[];
   text: string;
   detail?: string;
   voiceDigest: string;
@@ -63,7 +65,7 @@ export function replyOutcomeText(outcome: FromClemReplyOutcome, heartbeatTitle: 
     case 'approved': return 'Approved.';
     case 'declined': return 'Declined.';
     case 'cleared': return 'Cleared.';
-    case 'later': return 'Moved to later.';
+    case 'later': return 'Back tomorrow morning.';
     case 'rule_added': return `Saved as a rule for ${heartbeatTitle}.`;
     case 'unclear': return 'That didn’t settle it. Try “do it”, “not now” or “never”, or say what you want.';
     case 'changed': return 'This changed while you were replying. Have another look.';
