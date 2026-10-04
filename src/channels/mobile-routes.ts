@@ -2830,6 +2830,31 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  // From Clem on the phone: the same stream and the same reply as the Mac
+  // (dashboard/from-clem-runtime.ts, dashboard/from-clem-reply-route.ts).
+  router.get('/api/home/from-clem', requireMobileSession, async (_req, res) => {
+    try {
+      const { readFromClem } = await import('../dashboard/from-clem-runtime.js');
+      res.json(await readFromClem());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  router.post('/api/home/from-clem/reply', requireMobileSession, async (req, res) => {
+    try {
+      const { handleFromClemReply } = await import('../dashboard/from-clem-reply-route.js');
+      const result = await handleFromClemReply(req.body, {
+        surface: 'mobile',
+        ...(deps.assistant ? { runQueuedTask: () => {
+          processBackgroundTasks(deps.assistant!, 1).catch(() => { /* the queued task is still there */ });
+        } } : {}),
+      });
+      res.status(result.status).json(result.json);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   router.get('/api/inbox/summary', requireMobileSession, async (_req, res) => {
     try {
       // ONE definition for every surface (dashboard/needs-you.ts): the desktop

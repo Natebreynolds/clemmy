@@ -2076,3 +2076,52 @@ export async function setHeartbeatNotify(id: string, notify: 'quiet' | 'push'): 
     method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ notify }),
   });
 }
+
+// ─── From Clem (server: src/dashboard/from-clem.ts) ────────────────────────
+
+export interface FromClemRow {
+  key: string;
+  heartbeat: string;
+  heartbeatTitle: string;
+  at: string;
+  asks: boolean;
+  /** Clem's own words about it, once she has written them. */
+  say?: string;
+  /** Short answers she offers for an item waiting on the owner. */
+  choices?: string[];
+  text: string;
+  detail?: string;
+  voiceDigest: string;
+  answer?: { kind: 'words'; questionId: string } | { kind: 'yes_no'; planProposalId: string };
+  done?: { notificationId: string };
+  /** A part of Clementine Clem offers to help set up, and where it lives. */
+  setup?: { ability: string; place: string; placeName: string };
+}
+
+export interface FromClem {
+  rows: FromClemRow[];
+  pulses: Array<{ heartbeat: string; title: string; enabled: boolean; lastAt?: string; summary?: string }>;
+  covers: { questionIds: string[]; planProposalIds: string[]; notificationIds: string[] };
+}
+
+export type FromClemReplyOutcome =
+  | { outcome: 'gone' | 'changed' | 'unclear' }
+  | { outcome: 'started'; sessionId: string }
+  | { outcome: 'approved' | 'declined' | 'cleared' | 'later' | 'rule_added' }
+  | { outcome: 'answered'; questionId: string };
+
+export async function getFromClem(): Promise<FromClem> {
+  return api('/m/api/home/from-clem');
+}
+
+/** One reply, one id: a retried send is the same answer. A button whose
+ *  meaning is fixed carries its decision. */
+export async function replyFromClem(
+  key: string, text: string, voiceDigest?: string, decision?: 'do_it' | 'done' | 'not_now' | 'never',
+): Promise<FromClemReplyOutcome> {
+  const random = globalThis.crypto?.randomUUID?.();
+  const requestId = random ? random.replace(/-/g, '') : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+  return api('/m/api/home/from-clem/reply', { method: 'POST', body: JSON.stringify({
+    key, text, requestId, ...(voiceDigest ? { voiceDigest } : {}), ...(decision ? { decision } : {}),
+  }) });
+}

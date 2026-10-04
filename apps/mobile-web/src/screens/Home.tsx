@@ -43,6 +43,7 @@ import {
   type WorkspaceDestinationChooser,
   listChatSessions,
   markInboxNotificationRead,
+  getFromClem,
   type ChatSession,
 } from '../lib/api';
 import { greetingName, timeGreeting } from '../lib/greeting';
@@ -60,6 +61,7 @@ import { useWorkingNow } from '../lib/working-now';
 import { chatHasNews, chatSeenBaseline } from '@clem/chat-engine';
 import { ChatStateMark } from '../components/ChatStateMark';
 import { HomeTiles } from '../components/HomeTiles';
+import { FromClem } from '../components/FromClem';
 
 const POLL_MS = 6_000;
 const MAX_NEEDS_ROWS = 3;
@@ -76,6 +78,8 @@ interface Props {
   onAsk: (draft: string, attachments?: ChatAttachment[]) => void;
   /** Open a recent conversation from the Recent stack. */
   onOpenChat: (session: ChatSession) => void;
+  /** Open a conversation by id: Clem's own thread, from From Clem. */
+  onOpenThread: (sessionId: string, title: string) => void;
   onOpenInbox: () => void;
   onOpenWorkspace: (id: string) => void;
   /** Open a run's own screen. Every surface that shows running work must be
@@ -122,7 +126,7 @@ const EMPTY: HomeData = {
 
 
 export function Home({
-  name, onAsk, onOpenChat, onOpenInbox, onOpenWorkspace, onOpenActivity, onCustomize,
+  name, onAsk, onOpenChat, onOpenThread, onOpenInbox, onOpenWorkspace, onOpenActivity, onCustomize,
   needsYouCount, needsYouCountKnown, needsYouCountLive, needsYouCountAge,
 }: Props) {
   const { prefs } = useHomePreferences();
@@ -162,7 +166,21 @@ export function Home({
     return merged;
   }, []);
   const { data, loading, error, offline, refresh } = useScreenData(loadHome, { intervalMs: POLL_MS });
-  const { approvals, plans, workspaceChoosers, questions, notifications, reminders } = data ?? lastGood.current;
+  const loaded = data ?? lastGood.current;
+  // What Clem's heartbeats brought, in her words. Home's other lists leave out
+  // what she already shows, so nothing appears twice.
+  const fromClem = useScreenData(() => getFromClem(), { intervalMs: 20_000, resourceKey: 'home-from-clem' });
+  const covers = fromClem.data?.covers;
+  const covered = (ids: string[] | undefined) => new Set(ids ?? []);
+  const coveredQuestions = covered(covers?.questionIds);
+  const coveredPlans = covered(covers?.planProposalIds);
+  const coveredNotifications = covered(covers?.notificationIds);
+  const approvals = loaded.approvals;
+  const workspaceChoosers = loaded.workspaceChoosers;
+  const reminders = loaded.reminders;
+  const plans = loaded.plans.filter((row) => !coveredPlans.has(row.id));
+  const questions = loaded.questions.filter((row) => !coveredQuestions.has(row.id));
+  const notifications = loaded.notifications.filter((row) => !coveredNotifications.has(row.id));
 
   // Recent conversations, read while Today is on screen so one that is still
   // working shows it, and one that finished since you looked says so. A
@@ -358,6 +376,9 @@ export function Home({
         onRetry={() => { void refresh(); void workingNow.refresh(); }}
         hasData={needsYouCount + workingView.total + dayRows.length + recent.length > 0}
       />
+
+      <FromClem data={fromClem.data ?? null} onChanged={() => { void fromClem.refresh(); void refresh(); }}
+        onOpenThread={() => onOpenThread('clem', 'Clem')} />
 
       <HomeTiles onOpenWorkspace={onOpenWorkspace} onAsk={onAsk} />
 

@@ -892,6 +892,7 @@ export function App() {
               onOpenRun={openRun}
               onAsk={(draft, attachments) => goToChat({ draft, attachments, autoSend: true })}
               onOpenChat={(session) => goToChat({ session, sessionId: session.id, title: session.title })}
+              onOpenThread={(sessionId, title) => goToChat({ sessionId, title })}
               onOpenInbox={() => navigateTo('inbox')}
               onOpenWorkspace={openWorkspace}
               onOpenActivity={() => navigateTo('activity')}

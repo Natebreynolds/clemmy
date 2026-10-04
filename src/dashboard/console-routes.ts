@@ -14366,43 +14366,13 @@ export function registerConsoleRoutes(
   // The owner's reply to one From Clem row, in their own words.
   app.post('/api/console/home/from-clem/reply', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
-    const text = typeof req.body?.text === 'string' ? req.body.text.trim().slice(0, 4_000) : '';
-    if (!key || !text) { res.status(400).json({ error: 'key and text are required' }); return; }
-    const requestId = typeof req.body?.requestId === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(req.body.requestId) ? req.body.requestId : undefined;
-    const seenDigest = typeof req.body?.voiceDigest === 'string' ? req.body.voiceDigest.slice(0, 64) : undefined;
-    const decision = (['do_it', 'done', 'not_now', 'never'] as const).find((value) => value === req.body?.decision);
     try {
-      const [{ readFromClem, replyToFromClem, startFromClemTurn, moveFromClemRowToLater }, { addRule, HEARTBEAT_IDS }, { peekTurnSemanticModelPort }] = await Promise.all([
-        import('./from-clem-runtime.js'),
-        import('../agents/heartbeats.js'),
-        import('../runtime/semantic-boundary/turn-semantic-port-registry.js'),
-      ]);
-      const result = await replyToFromClem(key, text, {
-        read: readFromClem,
-        port: () => peekTurnSemanticModelPort(),
-        answerQuestion: (questionId, answer, replyId) => {
-          const answered = answerInboxQuestion({ id: questionId, answer, requestId: `desktop-from-clem:${replyId ?? `${Date.now()}:${randomBytes(6).toString('hex')}`}`, surface: 'desktop' });
-          return answered.status === 'answered' || answered.status === 'resuming';
-        },
-        markRead: (notificationId) => { markNotificationRead(notificationId); },
-        addRule: (heartbeat, rule) => {
-          if ((HEARTBEAT_IDS as readonly string[]).includes(heartbeat)) addRule(heartbeat as (typeof HEARTBEAT_IDS)[number], rule, 'owner');
-        },
-        approvePlan: (planProposalId) => {
-          const existing = getPlanProposal(planProposalId);
-          if (!existing || planProposalNeedsUserInput(existing)) return false;
-          const approved = approvePlanAndQueueBackgroundTask(planProposalId, {});
-          if (!approved) return false;
-          setImmediate(() => { processBackgroundTasks(assistant, 1).catch(() => { /* the queued task is still there */ }); });
-          return true;
-        },
-        rejectPlan: (planProposalId, reason) => Boolean(rejectPlanProposal(planProposalId, reason)),
-        snoozePlan: (planProposalId) => { void snoozeHomeItem(`plan:${planProposalId}`, DEFAULT_SNOOZE_HOURS); },
-        later: (rowKey, forever) => moveFromClemRowToLater(rowKey, Date.now(), forever),
-        startTurn: (input) => startFromClemTurn(input),
-      }, { ...(requestId ? { requestId } : {}), ...(seenDigest ? { seenDigest } : {}), ...(decision ? { decision } : {}) });
-      res.json(result);
+      const { handleFromClemReply } = await import('./from-clem-reply-route.js');
+      const result = await handleFromClemReply(req.body, {
+        surface: 'desktop',
+        runQueuedTask: () => { processBackgroundTasks(assistant, 1).catch(() => { /* the queued task is still there */ }); },
+      });
+      res.status(result.status).json(result.json);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

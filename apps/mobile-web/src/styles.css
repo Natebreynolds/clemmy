@@ -3732,6 +3732,14 @@ textarea:focus-visible,
 .home-btn:active:not(:disabled) { transform: scale(0.97); background: var(--bg-2); }
 .home-btn:disabled { opacity: 0.5; }
 .home-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+a.home-btn { text-decoration: none; }
+/* From Clem: her groups on Home (components/FromClem.tsx). */
+.from-clem-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.from-clem-thread { min-height: 44px; padding: 0 4px; border: 0; background: none; color: var(--accent); font: inherit; font-size: var(--t-sm); font-weight: 600; }
+.from-clem-group { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.from-clem-group-head { margin: 0; color: var(--fg-3); font-size: var(--t-xs); font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.from-clem-reply { display: flex; gap: 8px; width: 100%; }
+.from-clem-reply .cz-input { flex: 1 1 auto; min-width: 0; }
 .home-btn-primary:active:not(:disabled) { background: var(--accent-deep); }
 .home-row-receipt { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; color: var(--accent-2); font-size: var(--t-sm); font-weight: 700; }
 .home-row-receipt svg { width: 16px; height: 16px; }
