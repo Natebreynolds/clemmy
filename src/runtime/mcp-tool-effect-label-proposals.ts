@@ -27,7 +27,8 @@ import {
   type PendingMcpToolEffectProposal,
 } from './mcp-tool-effect-labels.js';
 import * as approvalRegistry from './harness/approval-registry.js';
-import { registerResumableApprovalCardAtomically } from './harness/approval-card.js';
+import { emitApprovalRequestedCard, registerResumableApprovalCardAtomically } from './harness/approval-card.js';
+import { createSession, openEventLog } from './harness/eventlog.js';
 import {
   completeViaConfiguredBrain,
   MCP_TOOL_EFFECT_LABELS_SYSTEM,
@@ -113,6 +114,24 @@ function cardArgs(labels: PendingMcpToolEffectProposal['labels']): Record<string
   return args;
 }
 
+/** Put the card in the conversation that needed the tools, once. */
+function showCardIn(
+  sessionId: string,
+  row: approvalRegistry.PendingApprovalRow,
+  preview: { ask: string; why: string },
+): void {
+  if (sessionId === row.sessionId) return;
+  try {
+    const shown = openEventLog().prepare(`
+      SELECT 1 FROM events
+       WHERE session_id = ? AND type = 'approval_requested'
+         AND json_extract(data_json, '$.approvalId') = ?
+       LIMIT 1
+    `).get(sessionId, row.approvalId);
+    if (!shown) emitApprovalRequestedCard({ sessionId, approvalId: row.approvalId, extra: { preview } });
+  } catch { /* the card still waits in Needs you */ }
+}
+
 async function propose(input: {
   serverSlug: string;
   sessionId: string;
@@ -126,7 +145,11 @@ async function propose(input: {
   const resumeKey = `${RESUME_KEY_PREFIX}${input.serverSlug}:${proposalDigest}`;
 
   const prior = approvalRegistry.inspectResumableApproval(resumeKey);
-  if (prior.state === 'pending') return { status: 'already_pending', approvalId: prior.row.approvalId, tools: tools.length };
+  if (prior.state === 'pending') {
+    const pending = readMcpToolEffectLabelFile().pending[prior.row.approvalId];
+    if (pending?.preview) showCardIn(input.sessionId, prior.row, pending.preview);
+    return { status: 'already_pending', approvalId: prior.row.approvalId, tools: tools.length };
+  }
   if (prior.state === 'rejected' || prior.state === 'cancelled') {
     const decidedAt = Date.parse(prior.row.resolvedAt ?? prior.row.requestedAt);
     if (Number.isFinite(decidedAt) && Date.now() - decidedAt < REJECTION_STANDS_MS) return { status: 'declined_recently' };
@@ -164,22 +187,33 @@ async function propose(input: {
   });
 
   const asking = labels.some((entry) => entry.label === 'delete' || entry.label === 'send');
+  const subject = `Let Clem use ${serverName}'s tools`;
+  const preview = {
+    ask: `Can I start using ${serverName}?`,
+    why: clipped(`${serverName} doesn't say which of its ${labels.length} tools only look things up and which change things, so I read each one and sorted them.${
+      asking ? ' Anything that deletes or sends still asks you each time.' : ''
+    }`, 260),
+  };
+  // The decision is about a server, not a step of the conversation it came up
+  // in. The approval belongs to its own session and the chat only shows the
+  // card: a pending approval owned by a chat holds that chat, so every next
+  // message would start a new branch until the owner answered.
+  const owner = createSession({
+    kind: 'execution',
+    userId: 'clem',
+    title: subject,
+    metadata: { source: 'mcp_tool_effect_labels', serverSlug: input.serverSlug },
+  });
   const card = registerResumableApprovalCardAtomically({
-    sessionId: input.sessionId,
-    subject: `Let Clem use ${serverName}'s tools`,
+    sessionId: owner.id,
+    subject,
     tool: null,
     args: cardArgs(labels),
     ttlMs: MCP_TOOL_EFFECT_PROPOSAL_OPEN_MS,
     resumeKey,
-    extra: {
-      preview: {
-        ask: `Can I start using ${serverName}?`,
-        why: clipped(`${serverName} doesn't say which of its ${labels.length} tools only look things up and which change things, so I read each one and sorted them.${
-          asking ? ' Anything that deletes or sends still asks you each time.' : ''
-        }`, 260),
-      },
-    },
+    extra: { preview },
   });
+  showCardIn(input.sessionId, card.row, preview);
   const file = readMcpToolEffectLabelFile();
   file.pending[card.row.approvalId] = {
     serverSlug: input.serverSlug,
@@ -187,6 +221,7 @@ async function propose(input: {
     approvalId: card.row.approvalId,
     resumeKey,
     proposedAt: new Date().toISOString(),
+    preview,
     labels,
   };
   writeMcpToolEffectLabelFile({ ...file, servers: { ...file.servers }, pending: { ...file.pending } });

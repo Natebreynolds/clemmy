@@ -119,6 +119,9 @@ test('Clem proposes one card, the stricter reading wins, and approval makes the 
   const approvalId = (first as { approvalId: string }).approvalId;
   const row = approvals.get(approvalId)!;
   assert.equal(row.tool, null);
+  // The approval is not the chat's: a pending approval a chat owns holds it.
+  assert.notEqual(row.sessionId, session.id);
+  assert.deepEqual(approvals.listPending({ sessionId: session.id, status: 'pending' }), []);
   assert.deepEqual(row.args, {
     'looks things up': 'list sites',
     'sends (asks you each time)': 'create site, delete site',
@@ -132,6 +135,16 @@ test('Clem proposes one card, the stricter reading wins, and approval makes the 
   // Nothing is callable while the card waits.
   const [waiting] = list('hosting', [listSites]);
   assert.equal(waiting?.annotations, undefined);
+
+  // Asked again from another conversation: the same card, shown there too, once.
+  const elsewhere = eventlog.createSession({ kind: 'chat' });
+  for (let i = 0; i < 2; i += 1) {
+    const again = await proposals.proposeMcpToolEffectLabels({ serverSlug: 'hosting', sessionId: elsewhere.id });
+    assert.deepEqual(again, { status: 'already_pending', approvalId, tools: 3 });
+  }
+  const shownElsewhere = eventlog.listEvents(elsewhere.id, { types: ['approval_requested'] });
+  assert.equal(shownElsewhere.length, 1);
+  assert.equal((shownElsewhere[0]!.data as { approvalId?: string }).approvalId, approvalId);
 
   proposals.initMcpToolEffectLabelApprovals();
   approvals.resolve(approvalId, 'approved', 'desktop-chat-card');
