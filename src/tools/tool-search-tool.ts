@@ -24,6 +24,7 @@ import { hostStructuralPlanningControlLookup } from './structural-control-lookup
 import { maybeDiscoveryAdvisory } from '../runtime/harness/discovery-advisory.js';
 import { invalidArgumentsTextResult, textResult } from './shared.js';
 import { isEffectDecidedPerCall } from './tool-registry.js';
+import { mcpToolEffectApprovalOpen } from '../runtime/mcp-tool-effect-labels.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalogEntriesLexically, toolSchemaSearchText, type RankedCatalogEntry } from '../agents/tool-catalog.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
@@ -401,6 +402,16 @@ function sayCallableNow(names: readonly string[], carriedByWorkCall: (name: stri
 }
 
 /** Said on the row of a built-in whose effect is decided per call. */
+export const AWAITING_OWNER_TOOL_LABELS_NOTE = 'This tool\'s server does not declare what its tools do, so the owner has a card asking them to approve how each of its tools is used. It becomes callable once they approve. Tell the owner the work is waiting on that card; do not repeat discovery or substitute another provider.';
+
+/** A connected server's tool that waits on the owner's approval of what its
+ *  server's tools do. */
+function awaitsOwnerToolLabels(name: string): boolean {
+  const bare = name.startsWith('mcp__') ? name.slice('mcp__'.length) : name;
+  const separator = bare.indexOf('__');
+  return separator > 0 && mcpToolEffectApprovalOpen(bare.slice(0, separator));
+}
+
 export const PER_CALL_EFFECT_DISPATCH_NOTE = 'A call that only reads or computes runs now: invoke it as the inner name and args_json of work_call, with the tool\'s own name as requirement_id. A call that changes files, or that leaves this machine, is a different effect and is not carried by this example.';
 
 export function renderCarrierInvocationExample(
@@ -1684,7 +1695,11 @@ export function registerToolSearchTool(
             ...reason,
           };
         }
-        return { planningRefStatus: 'unsupported_unmaterialized' as const, ...reason };
+        return {
+          planningRefStatus: 'unsupported_unmaterialized' as const,
+          ...reason,
+          ...(awaitsOwnerToolLabels(name) ? { dispatchNote: AWAITING_OWNER_TOOL_LABELS_NOTE } : {}),
+        };
       };
 
       // Planning disclosure materializes exact host refs, which can mean one
@@ -1976,6 +1991,7 @@ export function registerToolSearchTool(
           if (callableNow.length > 0) {
             return `None of these can be CITED in plan_task, but ${sayCallableNow(callableNow, (name) => localPlanningRowStatus(name).dispatchScope !== undefined)} Each result carries its schema. Call what you need instead of re-searching; only refine discovery if none of them does the job.`;
           }
+          if (rows.some((row) => awaitsOwnerToolLabels(row.name))) return AWAITING_OWNER_TOOL_LABELS_NOTE;
           return 'No returned candidate was materialized into an exact host capabilityRef. Do not cite these results in plan_task; refine discovery, choose another live result, or ask the user only for a genuinely missing connection/account/target choice.';
         }
         return invocationHint(hasSchemaHandles);

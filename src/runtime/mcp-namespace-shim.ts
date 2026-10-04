@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { recordDeclaredMcpToolEffect } from './mcp-declared-effects.js';
+import { mcpToolEffectLabelStamp, withApprovedMcpToolEffect } from './mcp-tool-effect-labels.js';
 import type { MCPServer } from '@openai/agents';
 import pino from 'pino';
 import { decideToolApproval } from '../agents/tool-taxonomy.js';
@@ -872,6 +873,8 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
   }
 
   let cachedTools: MCPTool[] | null = null;
+  // The owner's approved tool labels the cached list was built with.
+  let cachedLabelStamp = '';
   let cachedToolToServer: Map<string, MCPServer> | null = null;
   // Successful tool counts must be recorded before markServerConnected()
   // publishes health. Deriving them from cachedTools was racy: listTools marks
@@ -1182,7 +1185,10 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         routing.set(stub.name, server);
         continue;
       }
-      for (const tool of list) {
+      for (const listed of list) {
+        // A tool its server leaves undeclared takes the owner's approved label
+        // here, where every reader of the listing passes, so all of them agree.
+        const tool = withApprovedMcpToolEffect(slug, listed);
         const namespaced = namespaceToolName(slug, tool.name);
         if (routing.has(namespaced)) {
           // Astronomically unlikely after slug resolution, but defensive.
@@ -1278,17 +1284,20 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     async listToolsAuthoritative(): Promise<MCPTool[]> {
       // Exact acquisition pays the existing bounded connect/list cost. The
       // fast advertisement path can still return a connecting placeholder.
+      const labelStamp = mcpToolEffectLabelStamp();
       const { tools, routing, allConnected } = await buildFlattenedTools(true);
       if (!allConnected) throw new Error('MCP authoritative tool inventory is unavailable');
       cachedTools = cacheToolsList ? tools : null;
+      cachedLabelStamp = labelStamp;
       cachedToolToServer = routing;
       return tools;
     },
 
     async listTools(): Promise<MCPTool[]> {
-      if (cacheToolsList && cachedTools && cachedToolToServer) {
+      if (cacheToolsList && cachedTools && cachedToolToServer && cachedLabelStamp === mcpToolEffectLabelStamp()) {
         return cachedTools;
       }
+      const labelStamp = mcpToolEffectLabelStamp();
       const { tools, routing, allConnected } = await buildFlattenedTools();
       // Cache the flattened surface ONLY when stable. In skip-unconnected mode
       // a partial surface (some servers still warming) must NOT be cached, or a
@@ -1302,6 +1311,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       if (shouldCache) {
         cachedTools = tools;
         cachedToolToServer = routing;
+        cachedLabelStamp = labelStamp;
       } else {
         // We still need the routing map for the immediately-following
         // callTool, so cache transiently — invalidated on next listTools.

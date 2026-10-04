@@ -2227,17 +2227,27 @@ export function buildAuthorizedToolSearchCandidateSources(
       // Non-read operations keep their metadata and existing exact native
       // disclosure path. Failure to acquire a read never invents a read proof.
       if (acquired.status === 'blocked') {
-        // Workflow call_tool discovery has no foreground planning publisher.
         // Generic MCP operations (including APIs supporting reads and writes)
-        // cannot acquire a read-only proof, but still need the same exact live
-        // materialization used by foreground disclosure. This installs the
-        // observed effect/account/schema/port, never a synthetic read grant;
-        // the invocation gate still evaluates the actual requested call.
-        if (carrier === 'call_tool' && discoveryStillActive(guard)) {
-          await createProductionMcpReadCarrier({ serverName }).materializeExact({
+        // cannot acquire a read-only proof, but still need their exact live
+        // definition installed: workflow call_tool discovery has no planning
+        // publisher, and the foreground publisher only reopens an installed
+        // catalog entry, never mints one. Without this a newly connected
+        // server's write operations were listed but never callable. This
+        // installs the observed effect/account/schema/port, never a synthetic
+        // read grant; the invocation gate still evaluates the actual call.
+        if (discoveryStillActive(guard)) {
+          const materialized = await createProductionMcpReadCarrier({ serverName }).materializeExact({
             operationId: operation,
             inputSchema: candidate.schema,
           });
+          // A server that never says what its tools do: Clem proposes how to
+          // read them and the owner approves once. The search does not wait.
+          if (materialized.status === 'blocked' && materialized.reason === 'unknown_effect') {
+            const sessionId = planningIdentity.sessionId;
+            void import('../runtime/mcp-tool-effect-label-proposals.js')
+              .then((proposals) => proposals.proposeMcpToolEffectLabels({ serverSlug: serverName, sessionId }))
+              .catch(() => undefined);
+          }
           if (!discoveryStillActive(guard)) return null;
         }
         return candidate;

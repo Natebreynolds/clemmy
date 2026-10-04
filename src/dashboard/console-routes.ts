@@ -392,6 +392,7 @@ import {
   SPACE_DATA_RUNNER_TRUST_TOOL,
 } from '../spaces/space-execution-policy.js';
 import { initApprovalFocusReconciliation } from '../runtime/harness/approval-focus-reconcile.js';
+import { initMcpToolEffectLabelApprovals } from '../runtime/mcp-tool-effect-label-proposals.js';
 import {
   appendEvent as appendHarnessEvent,
   beginRunAttempt,
@@ -3851,6 +3852,7 @@ export function registerConsoleRoutes(
     });
   } catch { /* eventlog startup recovery is best-effort; request-time TTL still applies */ }
   initApprovalFocusReconciliation();
+  initMcpToolEffectLabelApprovals();
 
   // Missing-bundle /console fallback (2026-07-21: the 1.35 MB legacy inlined-
   // HTML renderer + its /console-legacy route were DELETED — it was a second,
