@@ -7,7 +7,7 @@ import os from 'node:os';
 const fixtureHome = mkdtempSync(path.join(os.tmpdir(), 'clem-semantic-usage-'));
 Object.assign(process.env, { CLEMENTINE_HOME: fixtureHome, CLEMMY_TEST_ISOLATED_HOME: '1',
   OPENAI_AGENTS_DISABLE_TRACING: '1', MCP_AUTO_IMPORT_ENABLED: 'false', EMBEDDINGS_DISABLED: 'true' });
-const { Usage, setDefaultModelProvider } = await import('@openai/agents');
+const { Usage, setDefaultModelProvider, getDefaultModelSettings } = await import('@openai/agents');
 const { completeViaConfiguredBrain, configuredBrainSemanticPort } = await import('./configured-brain-semantic-port.js');
 const { withRawClaudeUsageRecording } = await import('../harness/claude-model.js');
 const { createSession, appendEvent, getSessionTokensUsed, closeEventLog } = await import('../harness/eventlog.js');
@@ -194,10 +194,11 @@ test('the account-routing verdict reaches its model with no extended thinking; e
   assert.equal(requests[0]?.modelSettings?.reasoning?.effort, 'none');
   await completeViaConfiguredBrain({ purpose: 'turn_semantics_effect_judge', system: 'fixture', user: '{}',
     schemaName: 'SourceEffectJudgeV1' }).catch(() => undefined);
-  // Same judge model, no tier asked. (The fixture's reply does not fit the
-  // effect schema, so a brain fallback may follow with its SDK defaults.)
+  // Same judge model, no tier asked: the request carries only the SDK's own
+  // default for that model. (The fixture's reply does not fit the effect
+  // schema, so a brain fallback may follow with its SDK defaults.)
   assert.equal(modelIds[1], modelIds[0]);
-  assert.equal(requests[1]?.modelSettings?.reasoning, undefined);
+  assert.deepEqual(requests[1]?.modelSettings?.reasoning, getDefaultModelSettings(modelIds[1]).reasoning);
 });
 
 // Nested calls used to inherit the brain scope's role and the brain round's
