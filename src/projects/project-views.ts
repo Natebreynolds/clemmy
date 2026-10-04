@@ -20,7 +20,8 @@ import { pagesMadeInProject, type ProjectPageView } from './local-pages.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
 import { slugifyServerName } from '../runtime/mcp-namespace-shim.js';
 import { listCodingRuns } from '../execution/coding-run-store.js';
-import { openEventLog } from '../runtime/harness/eventlog.js';
+import { listEvents, openEventLog } from '../runtime/harness/eventlog.js';
+import { summarizeWorkManifest } from '../runtime/harness/work-manifest.js';
 import {
   getProject, listAssignments, listAssignmentsForAgent, listProjects, listResources,
   type ProjectAssignment, type ProjectRecord, type ProjectResource,
@@ -53,6 +54,10 @@ export interface DelegatedTaskView {
   error: string | null;
   /** What the agent said as it worked, newest last. */
   checkIns: Array<{ at: string; note: string }>;
+  /** The job's work list, each item and where it stands; null when it kept none. */
+  work: DelegatedTaskWorkView | null;
+  /** The files it saved, by name, newest last. */
+  files: Array<{ name: string; dir: string | null }>;
   originSessionId: string | null;
   runSessionId: string;
   createdAt: string;
@@ -60,6 +65,49 @@ export interface DelegatedTaskView {
   completedAt: string | null;
   updatedAt: string;
   controls: { canSteer: boolean; canStop: boolean; canResume: boolean; canAnswer: boolean };
+}
+
+export interface DelegatedTaskWorkView {
+  done: number;
+  total: number;
+  items: Array<{ id: string; label: string; state: 'done' | 'working' | 'failed' | 'waiting'; note?: string }>;
+}
+
+/** The job's latest work list as the owner reads it: each item and where it stands. */
+function workView(runSessionId: string): DelegatedTaskWorkView | null {
+  const manifest = summarizeWorkManifest(runSessionId);
+  if (!manifest || manifest.items.length === 0) return null;
+  const items = manifest.items.slice(0, 40).map((item) => {
+    const phases = Object.values(item.phases);
+    const failed = phases.find((phase) => phase.status === 'failed');
+    const state: DelegatedTaskWorkView['items'][number]['state'] = item.complete ? 'done'
+      : phases.some((phase) => phase.status === 'running') ? 'working'
+      : failed ? 'failed'
+      : 'waiting';
+    return {
+      id: item.id,
+      label: item.label || item.id,
+      state,
+      ...(state === 'failed' && failed?.reason ? { note: failed.reason.slice(0, 200) } : {}),
+    };
+  });
+  return { done: manifest.items.filter((item) => item.complete).length, total: manifest.items.length, items };
+}
+
+/** The files a job saved, by name, newest last. */
+function filesView(runSessionId: string): Array<{ name: string; dir: string | null }> {
+  const files = new Map<string, { name: string; dir: string | null }>();
+  try {
+    for (const event of listEvents(runSessionId, { types: ['deliverable_saved'] })) {
+      const data = event.data as { name?: unknown; dir?: unknown };
+      if (typeof data.name !== 'string' || !data.name.trim()) continue;
+      const dir = typeof data.dir === 'string' && data.dir.trim() ? data.dir.trim() : null;
+      const key = `${dir ?? ''}/${data.name}`;
+      files.delete(key);
+      files.set(key, { name: data.name.trim(), dir });
+    }
+  } catch { /* the card shows what it can */ }
+  return [...files.values()].slice(-8);
 }
 
 const TERMINAL: ReadonlySet<string> = new Set(['done', 'failed', 'aborted', 'interrupted']);
@@ -124,6 +172,8 @@ export function delegatedTaskView(task: BackgroundTaskRecord): DelegatedTaskView
     resultPath: task.resultPath ?? null,
     error: ownerFacingError(task.error),
     checkIns: (task.checkIns ?? []).slice(-12).map((entry) => ({ at: entry.at, note: entry.note.slice(0, 600) })),
+    work: workView(task.runSessionId),
+    files: filesView(task.runSessionId),
     originSessionId: task.originSessionId ?? null,
     runSessionId: task.runSessionId,
     createdAt: task.createdAt,

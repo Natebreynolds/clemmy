@@ -40,6 +40,10 @@ export interface DelegatedTask {
   error: string | null;
   /** What the agent said as it worked, newest last. Absent from older Macs. */
   checkIns?: Array<{ at: string; note: string }>;
+  /** The job's work list, each item and where it stands. Absent from older Macs. */
+  work?: DelegatedTaskWork | null;
+  /** The files it saved, by name, newest last. Absent from older Macs. */
+  files?: Array<{ name: string; dir: string | null }>;
   originSessionId: string | null;
   runSessionId: string;
   /** The ended task this one carries a correction to; null when it follows none. */
@@ -49,6 +53,12 @@ export interface DelegatedTask {
   completedAt: string | null;
   updatedAt: string;
   controls: { canSteer: boolean; canStop: boolean; canResume: boolean; canAnswer: boolean };
+}
+
+export interface DelegatedTaskWork {
+  done: number;
+  total: number;
+  items: Array<{ id: string; label: string; state: 'done' | 'working' | 'failed' | 'waiting'; note?: string }>;
 }
 
 export type DelegatedTaskTone = 'live' | 'warning' | 'success' | 'danger' | 'neutral';
@@ -121,6 +131,23 @@ export interface DelegatedTaskCardView {
   /** The finished task this one carries a correction to; null when it follows none. */
   followsTaskId: string | null;
   controls: { steer: boolean; stop: boolean; resume: boolean; answer: boolean };
+  /** "3 of 4 done", with each item and where it stands; null without a work list. */
+  progress: (DelegatedTaskWork & { label: string }) | null;
+  /** What it is doing right now, while it works. */
+  now: string | null;
+  /** The newest thing it said as it worked, and how many came before. */
+  latest: { at: string; note: string; earlier: number } | null;
+  /** Its report, in markdown: what it found or why it stopped short. */
+  report: string | null;
+  /** The files it saved, by name. */
+  files: Array<{ name: string; dir: string | null }>;
+  /**
+   * A job never ends without a clear direction: when it stopped short, or
+   * finished with items missing, this says what is missing and the one thing
+   * that moves it on. Null while it works, when it finished everything, and
+   * when its question already asks.
+   */
+  next: { text: string; action: 'resume' | 'correct' | 'approve' } | null;
   /**
    * The words for correcting it. Work still open is steered: the same task
    * takes the change at its next step. Work that finished is corrected: the
@@ -130,6 +157,34 @@ export interface DelegatedTaskCardView {
   steer: { control: string; note: string; startsNewTask: boolean };
 }
 
+/**
+ * The one direction a job that is not working gives: what is missing and the
+ * single thing that moves it on. A question or an approval it waits on is its
+ * own direction; a job that finished everything needs none.
+ */
+function nextDirection(task: DelegatedTask, input: { missingWords: string; owner: string }): DelegatedTaskCardView['next'] {
+  switch (task.phase) {
+    case 'needs_you':
+      return task.question?.text?.trim() ? null : { text: `${input.owner} is waiting for your approval before going on.`, action: 'approve' };
+    case 'paused':
+      return {
+        text: `${input.missingWords ? `${input.missingWords} ` : ''}It stopped before finishing. Resume it to go on, or correct it first.`,
+        action: 'resume',
+      };
+    case 'failed':
+      return {
+        text: `${input.missingWords ? `${input.missingWords} ` : ''}It did not finish. Resume it to try again, or correct it first.`,
+        action: task.controls?.canResume ? 'resume' : 'correct',
+      };
+    case 'stopped':
+      return { text: 'You stopped this. Correct it to start it again with your changes.', action: 'correct' };
+    case 'finished':
+      return input.missingWords ? { text: `${input.missingWords} Correct this to finish them.`, action: 'correct' } : null;
+    default:
+      return null;
+  }
+}
+
 /** The card's words, from one task view. */
 export function delegatedTaskCard(task: DelegatedTask, options: { resultChars?: number } = {}): DelegatedTaskCardView {
   const phase = phaseWords(task.phase);
@@ -137,10 +192,30 @@ export function delegatedTaskCard(task: DelegatedTask, options: { resultChars?: 
   const question = task.phase === 'needs_you' && task.question?.text?.trim()
     ? { text: task.question.text.trim(), options: (task.question.options ?? []).filter((option) => typeof option === 'string' && option.trim().length > 0) }
     : null;
+  const work = task.work && task.work.total > 0 ? task.work : null;
+  const missing = work ? work.items.filter((item) => item.state !== 'done') : [];
+  const missingWords = missing.length > 0
+    ? `${missing.length} of ${work!.total} not done: ${missing.slice(0, 3).map((item) => item.label).join(', ')}${missing.length > 3 ? `, and ${missing.length - 3} more` : ''}.`
+    : '';
+  const working = work ? work.items.filter((item) => item.state === 'working').map((item) => item.label) : [];
+  const checkIns = task.checkIns ?? [];
+  const last = checkIns.at(-1);
+  const report = task.resultPreview?.trim()
+    || (task.phase === 'failed' || task.phase === 'paused' || task.phase === 'stopped' ? task.error?.trim() : '')
+    || null;
+  const owner = delegatedTaskOwner(task);
   return {
     taskId: task.taskId,
     title: task.title?.trim() || 'Untitled task',
-    owner: delegatedTaskOwner(task),
+    owner,
+    progress: work ? { ...work, label: `${work.done} of ${work.total} done` } : null,
+    now: task.phase === 'working'
+      ? (working.length > 0 ? `Working on ${working.slice(0, 3).join(', ')}${working.length > 3 ? ` and ${working.length - 3} more` : ''}.` : null)
+      : null,
+    latest: last ? { at: last.at, note: last.note, earlier: checkIns.length - 1 } : null,
+    report: report ? opening(report, options.resultChars ?? 360) : null,
+    files: (task.files ?? []).slice(-8),
+    next: nextDirection(task, { missingWords, owner }),
     project: task.project ? (task.project.name?.trim() || null) : null,
     phase,
     request: version > 1 ? `Request v${version}` : null,

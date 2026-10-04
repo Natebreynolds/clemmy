@@ -9,7 +9,7 @@
  * own route, and settles to the task the Mac answers with.
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { delegatedTaskCard, delegatedTaskCheckIns, delegatedTaskCorrection, delegatedTaskFollowsLine, type DelegatedTask } from '@clem/chat-engine';
+import { delegatedTaskCard, delegatedTaskCorrection, delegatedTaskFollowsLine, renderMarkdown, type DelegatedTask } from '@clem/chat-engine';
 import { answerDelegatedTask, refusedTask, steerDelegatedTask } from '../lib/project-api';
 import { refusalIsStale, refusalWords } from '../lib/project-words';
 import { haptic } from '../lib/native-bridge';
@@ -33,6 +33,13 @@ interface Props {
   /** The tasks the host already lists, so a follow-up is never drawn twice. */
   listed?: ReadonlySet<string>;
 }
+
+const ITEM_WORDS: Record<'done' | 'working' | 'failed' | 'waiting', string> = {
+  done: 'Done',
+  working: 'Working',
+  failed: 'Not done',
+  waiting: 'Waiting',
+};
 
 /** The newer of what the host passed and what a control was answered with. */
 function newest(given: DelegatedTask, settled: DelegatedTask | null): DelegatedTask {
@@ -123,7 +130,10 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
   };
 
   const waiting = view.phase.tone === 'warning' && task.phase === 'needs_you';
-  const hasControls = Boolean(onOpenRun) || view.controls.steer || view.controls.stop || view.controls.resume;
+  // The direction's own controls are not drawn twice below it.
+  const steerInRow = view.controls.steer && !view.next;
+  const resumeInRow = view.controls.resume && view.next?.action !== 'resume';
+  const hasControls = Boolean(onOpenRun) || steerInRow || view.controls.stop || resumeInRow;
 
   const card = (
     <article class={`task-card task-${view.phase.tone}${waiting ? ' task-waiting' : ''}`} aria-busy={busy !== null}>
@@ -144,16 +154,36 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
         </p>
       ) : null}
 
-      {delegatedTaskCheckIns(task).length > 0 ? (
-        <ol class="task-checkins" aria-label={`What ${view.owner} said as it worked`}>
-          {delegatedTaskCheckIns(task).map((entry) => (
-            <li key={`${entry.at}-${entry.note.slice(0, 24)}`}>
-              <span class="task-checkin-who">{view.owner}</span>
-              <time class="task-checkin-when" dateTime={entry.at}> · {relativeTime(entry.at)}</time>
-              <p class="task-checkin-note">{entry.note}</p>
-            </li>
-          ))}
-        </ol>
+      {/* Where it stands first: how much is done, then the one thing that
+          moves it on when it is not working. */}
+      {view.progress ? (
+        <div class="task-progress">
+          <div class="task-progress-bar" aria-hidden="true">
+            {view.progress.items.length > 0 && view.progress.items.length <= 12
+              ? view.progress.items.map((item) => <i key={item.id} class={`task-seg task-seg-${item.state}`} />)
+              : <i class="task-seg task-seg-done" style={{ flex: `0 0 ${Math.round((view.progress.done / Math.max(1, view.progress.total)) * 100)}%` }} />}
+          </div>
+          <span class="task-progress-label">{view.progress.label}</span>
+        </div>
+      ) : null}
+
+      {view.next ? (
+        <div class="task-next">
+          <p class="task-next-text">{view.next.text}</p>
+          <div class="task-actions">
+            {view.next.action === 'resume' && view.controls.resume ? (
+              <RunControl target={{ kind: 'delegated-task', taskId: task.taskId }} resumable onChanged={onChanged} />
+            ) : null}
+            {view.next.action === 'approve' && onOpenNeedsYou ? (
+              <button type="button" class="btn-approve task-send" onClick={() => { haptic('light'); onOpenNeedsYou(); }}>Review</button>
+            ) : null}
+            {view.controls.steer && mode !== 'steer' ? (
+              <button type="button" class={view.next.action === 'correct' ? 'btn-approve task-send' : 'btn-quiet'} onClick={() => { haptic('light'); setError(null); setMode('steer'); }}>
+                {view.next.action === 'correct' ? view.steer.control : 'Correct it first'}
+              </button>
+            ) : null}
+          </div>
+        </div>
       ) : null}
 
       {view.question ? (
@@ -194,8 +224,58 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
         </div>
       ) : null}
 
-      {view.result ? <p class="task-result">{view.result}</p> : null}
-      {view.problem ? <p class="task-problem">{view.problem}</p> : null}
+      {view.now ? <p class="task-now">{view.now}</p> : null}
+
+      {view.latest ? (
+        <div class="task-latest">
+          <p class="task-checkin-note">{view.latest.note}</p>
+          <span class="task-checkin-when">{view.owner} · <time dateTime={view.latest.at}>{relativeTime(view.latest.at)}</time></span>
+          {view.latest.earlier > 0 ? (
+            <details class="task-earlier">
+              <summary>Earlier updates ({view.latest.earlier})</summary>
+              <ol class="task-checkins">
+                {(task.checkIns ?? []).slice(0, -1).reverse().map((entry) => (
+                  <li key={`${entry.at}-${entry.note.slice(0, 24)}`}>
+                    <time class="task-checkin-when" dateTime={entry.at}>{relativeTime(entry.at)}</time>
+                    <p class="task-checkin-note">{entry.note}</p>
+                  </li>
+                ))}
+              </ol>
+            </details>
+          ) : null}
+        </div>
+      ) : null}
+
+      {view.progress && view.progress.items.length > 0 ? (
+        <ul class="task-items" aria-label={view.progress.label}>
+          {view.progress.items.slice(0, 6).map((item) => (
+            <li key={item.id} class={`task-item task-item-${item.state}`}>
+              <i class="task-item-mark" aria-hidden="true" />
+              <span class="task-item-label">{item.label}</span>
+              <span class="task-item-state">{ITEM_WORDS[item.state]}{item.note ? ` · ${item.note}` : ''}</span>
+            </li>
+          ))}
+          {view.progress.items.length > 6 ? (
+            <li class="task-item task-item-more">and {view.progress.items.length - 6} more</li>
+          ) : null}
+        </ul>
+      ) : null}
+
+      {view.report ? (
+        <div class="task-report">
+          {/* The report is markdown, like a chat reply. */}
+          <div class="bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(view.report) }} />
+          {onOpenRun ? (
+            <button type="button" class="link-btn" onClick={() => { haptic('light'); onOpenRun(task.runSessionId); }}>Full report</button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {view.files.length > 0 ? (
+        <div class="task-files" aria-label="Files it saved">
+          {view.files.map((file) => <span key={`${file.dir ?? ''}/${file.name}`} class="task-file" title={file.dir ?? undefined}>{file.name}</span>)}
+        </div>
+      ) : null}
 
       {mode === 'steer' ? (
         <form class="inbox-reply task-steer" onSubmit={(event) => { event.preventDefault(); sendSteer(); }}>
@@ -223,12 +303,12 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
           {onOpenRun ? (
             <button type="button" class="btn-quiet" onClick={() => { haptic('light'); onOpenRun(task.runSessionId); }}>Open</button>
           ) : null}
-          {view.controls.steer ? (
+          {steerInRow ? (
             <button type="button" class="btn-quiet" onClick={() => { haptic('light'); setError(null); setMode('steer'); }}>
               {view.steer.control}
             </button>
           ) : null}
-          {view.controls.resume ? (
+          {resumeInRow ? (
             <RunControl target={{ kind: 'delegated-task', taskId: task.taskId }} resumable onChanged={onChanged} />
           ) : null}
           {view.controls.stop ? (

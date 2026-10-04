@@ -10,6 +10,9 @@
 export const DELEGATED_JOB_OBJECTIVE_PREFIX = 'Objective: ';
 export const DELEGATED_JOB_CRITERIA_HEADING = 'Success criteria (the run is done only when ALL hold):';
 export const DELEGATED_JOB_CONTEXT_HEADING = 'Load this context FIRST, before producing any artifact:';
+/** A job never ends without a clear direction for the owner. */
+export const DELEGATED_JOB_DIRECTION =
+  'If something stops you finishing every part, finish the rest, then ask the owner the one decision that lets you finish (offer the choices) instead of ending the job.';
 
 /** What the job is asked to do: its objective and plan, without the host's
  *  checklist sections. Null for text that is not a delegated job prompt. */

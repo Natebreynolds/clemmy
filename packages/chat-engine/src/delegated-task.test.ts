@@ -180,3 +180,61 @@ test('a paused task says why it stopped', () => {
   assert.equal(paused.problem, 'This step reached its time budget. Completed work is saved.');
   assert.equal(delegatedTaskCard(task({ phase: 'working', error: 'stale' })).problem, null, 'a working task shows no problem');
 });
+
+const briefs = {
+  done: 3,
+  total: 4,
+  items: [
+    { id: 'harbor', label: 'harbor-bakery', state: 'done' as const },
+    { id: 'lantern', label: 'lantern-books', state: 'done' as const },
+    { id: 'copper', label: 'copper-kettle', state: 'done' as const },
+    { id: 'willow', label: 'willow-florist', state: 'failed' as const, note: 'no source file' },
+  ],
+};
+
+test('a job that is not working never ends without a clear direction', () => {
+  const paused = delegatedTaskCard(task({ phase: 'paused', status: 'blocked', work: briefs,
+    controls: { canSteer: true, canStop: false, canResume: true, canAnswer: false } }));
+  assert.equal(paused.progress?.label, '3 of 4 done');
+  assert.match(paused.next?.text ?? '', /1 of 4 not done: willow-florist\. It stopped before finishing/);
+  assert.equal(paused.next?.action, 'resume');
+
+  const finishedWithGap = delegatedTaskCard(task({ phase: 'finished', status: 'done', work: briefs }));
+  assert.match(finishedWithGap.next?.text ?? '', /willow-florist\. Correct this to finish them\./);
+  assert.equal(finishedWithGap.next?.action, 'correct');
+
+  const failed = delegatedTaskCard(task({ phase: 'failed', status: 'failed',
+    controls: { canSteer: true, canStop: false, canResume: false, canAnswer: false } }));
+  assert.equal(failed.next?.action, 'correct', 'nothing to resume: correcting it is the way on');
+
+  const stopped = delegatedTaskCard(task({ phase: 'stopped', status: 'aborted' }));
+  assert.equal(stopped.next?.action, 'correct');
+
+  const approval = delegatedTaskCard(task({ phase: 'needs_you', status: 'awaiting_approval', approvalId: 'apr-1' }));
+  assert.equal(approval.next?.action, 'approve');
+  const asked = delegatedTaskCard(task({ phase: 'needs_you', status: 'awaiting_input', question: { id: 'q', text: 'Skip it?', options: [] } }));
+  assert.equal(asked.next, null, 'the question is its own direction');
+
+  const complete = delegatedTaskCard(task({ phase: 'finished', status: 'done', work: { ...briefs, done: 4, items: briefs.items.map((item) => ({ ...item, state: 'done' as const })) } }));
+  assert.equal(complete.next, null, 'a job that finished everything needs no direction');
+  assert.equal(delegatedTaskCard(task()).next, null, 'a working job is its own progress');
+});
+
+test('a working job says what it is on now, and only its newest update shows', () => {
+  const card = delegatedTaskCard(task({
+    work: { done: 1, total: 3, items: [
+      { id: 'a', label: 'alpha', state: 'done' }, { id: 'b', label: 'beta', state: 'working' }, { id: 'c', label: 'gamma', state: 'waiting' },
+    ] },
+    checkIns: [{ at: '2026-09-29T09:00:30.000Z', note: 'Read the sources.' }, { at: '2026-09-29T09:00:50.000Z', note: 'Writing now.' }],
+    files: [{ name: 'alpha.md', dir: 'notes' }],
+  }));
+  assert.equal(card.now, 'Working on beta.');
+  assert.deepEqual(card.latest, { at: '2026-09-29T09:00:50.000Z', note: 'Writing now.', earlier: 1 });
+  assert.deepEqual(card.files, [{ name: 'alpha.md', dir: 'notes' }]);
+});
+
+test('a job that stopped short reports what it found, from its own report', () => {
+  const card = delegatedTaskCard(task({ phase: 'paused', status: 'blocked', resultPreview: null,
+    error: 'I wrote **3 of 4** briefs; willow-florist has no source file.' }));
+  assert.match(card.report ?? '', /\*\*3 of 4\*\*/, 'kept as markdown for the card to render');
+});

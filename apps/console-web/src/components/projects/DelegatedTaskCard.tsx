@@ -15,8 +15,8 @@ import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, ChevronRight, CornerDownRight, Play, Square } from 'lucide-react';
 import {
-  delegatedTaskCard, delegatedTaskCheckIns, delegatedTaskChosenBy, delegatedTaskCorrections, delegatedTaskFollowUps, delegatedTaskFollowsLine,
-  type DelegatedTaskTone,
+  delegatedTaskCard, delegatedTaskChosenBy, delegatedTaskCorrections, delegatedTaskFollowUps, delegatedTaskFollowsLine,
+  renderMarkdown, type DelegatedTaskTone,
 } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
 import { Input, Textarea } from '@/components/ui/Field';
@@ -42,6 +42,13 @@ function moment(iso: string | null): string {
     : '';
 }
 
+
+const ITEM_WORDS: Record<'done' | 'working' | 'failed' | 'waiting', string> = {
+  done: 'Done',
+  working: 'Working',
+  failed: 'Not done',
+  waiting: 'Waiting',
+};
 export function DelegatedTaskCard({
   task,
   onChanged,
@@ -218,16 +225,63 @@ export function DelegatedTaskCard({
         </p>
       )}
 
-      {delegatedTaskCheckIns(shown).length > 0 && (
-        <ol className="mt-2.5 space-y-1.5 border-l-2 border-border pl-3" aria-label={`What ${card.owner} said as it worked`}>
-          {delegatedTaskCheckIns(shown).map((entry) => (
-            <li key={`${entry.at}-${entry.note.slice(0, 24)}`} className="text-small text-muted">
-              <span className="font-semibold text-fg">{card.owner}</span>
-              <span className="text-faint"> · {moment(entry.at)}</span>
-              <p className="mt-0.5 whitespace-pre-wrap break-words text-fg">{entry.note}</p>
-            </li>
-          ))}
-        </ol>
+      {/* Where it stands first: how much is done, then the one thing that
+          moves it on when it is not working. */}
+      {card.progress && (
+        <div className="mt-2.5 flex items-center gap-2">
+          <div className="flex h-1.5 min-w-0 flex-1 gap-1 overflow-hidden rounded-full bg-subtle" aria-hidden>
+            {card.progress.items.length > 0 && card.progress.items.length <= 12
+              ? card.progress.items.map((item) => (
+                <i key={item.id} className={cn('h-1.5 flex-1 rounded-full', item.state === 'done' ? 'bg-success' : item.state === 'working' ? 'bg-primary' : item.state === 'failed' ? 'bg-warning' : 'bg-border-strong')} />
+              ))
+              : <i className="h-1.5 rounded-full bg-success" style={{ width: `${Math.round((card.progress.done / Math.max(1, card.progress.total)) * 100)}%` }} />}
+          </div>
+          <span className="shrink-0 text-caption font-semibold text-muted">{card.progress.label}</span>
+        </div>
+      )}
+      {card.next && (
+        <div className="mt-2.5 rounded-md bg-warning-tint px-3 py-2.5">
+          <p className="text-small text-fg">{card.next.text}</p>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {card.next.action === 'resume' && card.controls.resume && (
+              <Button size="sm" className="h-8" disabled={busy !== null} onClick={() => { void run('resume', () => resumeTask(shown.taskId)); }}>
+                <Play className="h-3.5 w-3.5" aria-hidden /> {busy === 'resume' ? 'Resuming…' : 'Resume'}
+              </Button>
+            )}
+            {card.next.action === 'approve' && card.approvalId && (
+              <Link to={`/inbox?tab=needs&select=${encodeURIComponent(card.approvalId)}`} className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-small font-semibold text-primary-fg hover:bg-primary-hover active:bg-primary-press">Review</Link>
+            )}
+            {card.controls.steer && (
+              <Button
+                size="sm" variant={card.next.action === 'correct' ? 'primary' : 'secondary'} className="h-8" disabled={busy !== null}
+                aria-expanded={panel === 'steer'} aria-controls={steerId}
+                onClick={() => setPanel((open) => (open === 'steer' ? null : 'steer'))}
+              >
+                <CornerDownRight className="h-3.5 w-3.5" aria-hidden /> {card.next.action === 'correct' ? card.steer.control : 'Correct it first'}
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
+      {card.now && <p className="mt-2.5 text-small text-fg">{card.now}</p>}
+      {card.latest && (
+        <div className="mt-2.5 border-l-2 border-border pl-3 text-small">
+          <p className="whitespace-pre-wrap break-words text-fg">{card.latest.note}</p>
+          <p className="mt-0.5 text-caption text-faint">{card.owner} · {moment(card.latest.at)}</p>
+          {card.latest.earlier > 0 && (
+            <details className="mt-1">
+              <summary className="cursor-pointer text-caption font-semibold text-muted">Earlier updates ({card.latest.earlier})</summary>
+              <ol className="mt-1.5 space-y-1.5">
+                {(shown.checkIns ?? []).slice(0, -1).reverse().map((entry) => (
+                  <li key={`${entry.at}-${entry.note.slice(0, 24)}`} className="text-small text-muted">
+                    <span className="text-faint">{moment(entry.at)}</span>
+                    <p className="mt-0.5 whitespace-pre-wrap break-words text-fg">{entry.note}</p>
+                  </li>
+                ))}
+              </ol>
+            </details>
+          )}
+        </div>
       )}
 
       {card.question && !hideQuestion && (
@@ -281,19 +335,43 @@ export function DelegatedTaskCard({
         </p>
       )}
 
-      {card.result && !hideResult && (
-        <p className="mt-2 line-clamp-4 whitespace-pre-wrap text-small text-muted">{card.result}</p>
+      {card.progress && card.progress.items.length > 0 && (
+        <ul className="mt-2.5 divide-y divide-border rounded-md border border-border" aria-label={card.progress.label}>
+          {card.progress.items.slice(0, 8).map((item) => (
+            <li key={item.id} className="flex min-w-0 items-center gap-2.5 px-3 py-2 text-small">
+              <i aria-hidden className={cn('h-2.5 w-2.5 shrink-0 rounded-full border-2', item.state === 'done' ? 'border-success bg-success' : item.state === 'working' ? 'border-primary' : item.state === 'failed' ? 'border-warning bg-warning' : 'border-border-strong')} />
+              <span className="min-w-0 flex-1 break-words text-fg">{item.label}</span>
+              <span className={cn('shrink-0 text-caption', item.state === 'failed' ? 'font-semibold text-warning' : 'text-muted')}>
+                {ITEM_WORDS[item.state]}{item.note ? ` · ${item.note}` : ''}
+              </span>
+            </li>
+          ))}
+          {card.progress.items.length > 8 && <li className="px-3 py-2 text-caption text-muted">and {card.progress.items.length - 8} more</li>}
+        </ul>
       )}
-      {card.problem && <p className="mt-2 whitespace-pre-wrap text-small text-danger">{card.problem}</p>}
+      {card.report && !hideResult && (
+        <div
+          className="chat-prose mt-2.5 min-w-0 text-small"
+          // eslint-disable-next-line react/no-danger -- renderMarkdown escapes all input first
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(card.report, { workspaceLinks: false }) }}
+        />
+      )}
+      {card.files.length > 0 && (
+        <div className="mt-2.5 flex flex-wrap gap-1.5" aria-label="Files it saved">
+          {card.files.map((file) => (
+            <span key={`${file.dir ?? ''}/${file.name}`} title={file.dir ?? undefined} className="inline-flex h-7 items-center rounded-full border border-border bg-subtle px-2.5 text-caption text-fg">{file.name}</span>
+          ))}
+        </div>
+      )}
 
-      {(card.controls.steer || card.controls.stop || card.controls.resume || hasDetails) && (
+      {((card.controls.steer && !card.next) || card.controls.stop || (card.controls.resume && card.next?.action !== 'resume') || hasDetails) && (
         <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
-          {card.controls.resume && (
+          {card.controls.resume && card.next?.action !== 'resume' && (
             <Button size="sm" variant="secondary" className="h-8" disabled={busy !== null} onClick={() => { void run('resume', () => resumeTask(shown.taskId)); }}>
               <Play className="h-3.5 w-3.5" aria-hidden /> {busy === 'resume' ? 'Resuming…' : 'Resume'}
             </Button>
           )}
-          {card.controls.steer && (
+          {card.controls.steer && !card.next && (
             <Button
               size="sm" variant="secondary" className="h-8" disabled={busy !== null}
               aria-expanded={panel === 'steer'} aria-controls={steerId}

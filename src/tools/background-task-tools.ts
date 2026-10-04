@@ -1,5 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { DELEGATED_JOB_CONTEXT_HEADING, DELEGATED_JOB_CRITERIA_HEADING, DELEGATED_JOB_OBJECTIVE_PREFIX } from '../runtime/harness/delegated-job-prompt.js';
+import { DELEGATED_JOB_CONTEXT_HEADING, DELEGATED_JOB_CRITERIA_HEADING, DELEGATED_JOB_DIRECTION, DELEGATED_JOB_OBJECTIVE_PREFIX } from '../runtime/harness/delegated-job-prompt.js';
 import { z } from 'zod';
 import {
   getBackgroundTaskStatus,
@@ -485,6 +485,7 @@ export function registerBackgroundTaskTools(server: McpServer): void {
           ? 'Agreed plan (its scope, sources and limits were settled with the user — keep to them; how you split the work across your workers is yours to decide):'
           : 'Agreed plan (execute these steps — this was settled with the user; do NOT re-derive a different approach):',
         plan,
+        DELEGATED_JOB_DIRECTION,
         success_criteria && success_criteria.length > 0
           ? `\n${DELEGATED_JOB_CRITERIA_HEADING}\n- ${success_criteria.join('\n- ')}`
           : '',

@@ -32,6 +32,7 @@ import {
   type HarnessEvent,
 } from '@clem/chat-engine';
 import { getRun, runDetailPath } from '../lib/api';
+import { DelegatedTaskCard } from '../components/DelegatedTaskCard';
 import { ChatBackButton } from '../components/ChatBackButton';
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
@@ -135,6 +136,10 @@ export function Run({ sessionId, onBack }: Props) {
               {controllable ? <RunControl key={run.id} target={{ kind: 'run', runId: run.id }} onChanged={() => void refresh()} /> : null}
             </div>
 
+            {/* A job is its card: where it stands, what moves it on, what it
+                made and what it reported, the same card the chat shows. */}
+            {run.delegatedTask ? <DelegatedTaskCard task={run.delegatedTask} onChanged={() => void refresh()} /> : null}
+
             {/* What it changed in the world. First, because it is the thing a
                 person most needs to know and the hardest to take back. */}
             {writes.length > 0 ? (
@@ -153,7 +158,7 @@ export function Run({ sessionId, onBack }: Props) {
             ) : null}
 
             {/* What it left behind. */}
-            {run.deliverables.length > 0 ? (
+            {!run.delegatedTask && run.deliverables.length > 0 ? (
               <section class="home-section">
                 <h2 class="section-head">What it produced</h2>
                 {run.deliverables.map((file, i) => (
@@ -166,12 +171,19 @@ export function Run({ sessionId, onBack }: Props) {
               </section>
             ) : null}
 
-            {reply ? (
+            {!run.delegatedTask && reply ? (
               <section class="home-section">
                 <h2 class="section-head">What it reported</h2>
                 {/* The report is written in markdown, the same as a chat reply. */}
                 <div class="run-reply bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(reply) }} />
               </section>
+            ) : null}
+
+            {run.delegatedTask && reply ? (
+              <details class="wf-raw-log">
+                <summary class="wf-steps-summary">Full report</summary>
+                <div class="run-reply bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(reply) }} />
+              </details>
             ) : null}
 
             <details class="wf-raw-log" open={working}>
