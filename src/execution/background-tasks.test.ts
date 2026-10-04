@@ -1531,6 +1531,8 @@ test('a resumed background task journals the accepted answer through the bridge 
     assert.equal(accepted[0]?.data.modelDirectiveApplied, true);
     assert.match(privateMessage, /Resume THIS SAME task/);
     assert.match(privateMessage, /## Durable Task Contract/);
+    assert.ok(privateMessage.includes(`${task.prompt}\n\n${answer}`),
+      'the turn\'s accepted input is carried verbatim in what the model receives, or the request provenance check refuses it');
     assert.doesNotMatch(String(accepted[0]?.data.text), /Resume THIS SAME task|Durable Task Contract|Original request:/);
     assert.equal(getBackgroundTask(task.id)?.prompt, task.prompt, 'answering must not rewrite the task contract');
     assert.equal(getBackgroundTask(task.id)?.inputResolution, undefined, 'the resolution remains single-consumption state');

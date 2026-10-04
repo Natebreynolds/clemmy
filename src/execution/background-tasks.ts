@@ -1628,9 +1628,17 @@ function buildWorkerInputResumePrompt(task: BackgroundTaskRecord, answer: string
     'Use the prior run session state, but preserve the origin session facts below if the continuation is picked up by a different model/backend.',
     renderOriginLineageBlock(task),
     '',
+    // The accepted input of this turn is the request followed by the answer;
+    // it is carried here exactly as accepted so the turn's own input is
+    // visible in what the model receives.
     'Original request:',
-    task.prompt,
+    acceptedInputResumeText(task, answer),
   ].filter(Boolean).join('\n');
+}
+
+/** The accepted input of a turn that resumes a task with the user's answer. */
+function acceptedInputResumeText(task: BackgroundTaskRecord, answer: string): string {
+  return `${task.prompt}\n\n${answer}`;
 }
 
 const RESUME_PROMPT_UNWRAP_LIMIT = 8;
@@ -6242,7 +6250,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      const resume = task.inputResolution;
 	      const continuation = task.continueResolution;
 	      const acceptedContractVersion = task.contractVersion ?? 1;
-	      const acceptedUserMessage = resume ? `${task.prompt}\n\n${resume.answer}` : task.prompt;
+	      const acceptedUserMessage = resume ? acceptedInputResumeText(task, resume.answer) : task.prompt;
 	      let workerMessage = resume
 	        ? buildWorkerInputResumePrompt(task, resume.answer)
 	        : continuation
