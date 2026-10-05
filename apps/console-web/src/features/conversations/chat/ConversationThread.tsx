@@ -1,5 +1,6 @@
 import { CliSessions } from '@/components/chat/CliSessions';
 import { CloudBrowserWorkspace } from '@/components/chat/CloudBrowserDock';
+import { FileDockWorkspace } from '@/components/chat/FileDock';
 import { isRunKind } from '@/lib/run-presentation';
 import { RunThread } from './RunThread';
 import type { TaskMode } from '@/lib/task-mode';
@@ -151,6 +152,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
 
   return (
     <CloudBrowserWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)}>
+    <FileDockWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)}>
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
@@ -187,6 +189,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
         <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} agentSlot={takesAgent ? <><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} started /><AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} started /></> : undefined} agentId={takesAgent ? agentChoice.chosen?.id ?? null : undefined} applyAgent={takesAgent ? () => agentChoice.prepare(chat.sessionId.current, chat.busy) : undefined} placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : undefined} />
       </div>
     </div>
+    </FileDockWorkspace>
     </CloudBrowserWorkspace>
   );
 }

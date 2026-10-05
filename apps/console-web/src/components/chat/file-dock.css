@@ -1,0 +1,32 @@
+.file-dock-workspace {
+  display:flex;
+  flex:1;
+  min-height:0;
+  min-width:0;
+  height:100%}
+.file-dock-conversation {
+  display:flex;
+  flex:1;
+  min-width:0;
+  min-height:0;
+  flex-direction:column}
+.file-dock-panel {
+  display:flex;
+  flex-direction:column;
+  min-height:0;
+  width:46%;
+  min-width:340px;
+  max-width:900px;
+  background:var(--bg-surface);
+  border-left:1px solid var(--border)}
+@media(max-width:950px) {
+  .file-dock-workspace.is-open {
+  flex-direction:column}
+.file-dock-panel {
+  width:100%;
+  min-width:0;
+  max-width:none;
+  max-height:55%;
+  border-left:0;
+  border-top:1px solid var(--border)}
+}

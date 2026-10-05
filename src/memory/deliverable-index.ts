@@ -158,6 +158,22 @@ export function listFileDeliverablesUnder(roots: readonly string[], limit = 200)
   }
 }
 
+/** Files recorded as written by any of these sessions, newest first. */
+export function listFileDeliverablesForSessions(sessionIds: readonly string[], limit = 200): DeliverableRecord[] {
+  const sessions = [...new Set(sessionIds.map((id) => id.trim()).filter(Boolean))].slice(0, 50);
+  if (sessions.length === 0) return [];
+  try {
+    const db = ensureTable();
+    return db.prepare(`
+      SELECT id, created_at AS createdAt, kind, target, title, why, session_id AS sessionId, lane
+      FROM deliverables WHERE kind = 'file' AND session_id IN (${sessions.map(() => '?').join(', ')})
+      ORDER BY created_at DESC LIMIT ?
+    `).all(...sessions, Math.max(1, Math.min(limit, 500))) as DeliverableRecord[];
+  } catch {
+    return [];
+  }
+}
+
 export interface DeliveredArtifact {
   kind: string;
   title: string;

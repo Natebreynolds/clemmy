@@ -23,12 +23,16 @@ import { openFile, resolveDeliverablePath } from '@/lib/files';
 import { findSessionPage, isPageName, type ProjectPageView } from '@/lib/projects';
 import { TurnEvidenceLine } from '@/components/chat/TurnEvidenceLine';
 import { PagePreviewPanel } from '@/components/chat/PagePreviewPanel';
+import { useFileDock } from '@/components/chat/FileDock';
+import { sameSessionFile } from '@/lib/session-files';
 
-/** A file she saved this turn, as something you can open. The harness names
- *  the latest file by basename; the path is resolved on demand and the button
+/** A file she saved this turn, as something you can open. In a conversation
+ *  the whole card opens it beside the conversation, wherever she saved it;
+ *  elsewhere the path is resolved in Clem's own folder and the button
  *  disappears when no single file matches. */
 function DeliverableCard({ row, sessionId }: { row: ActivityItem; sessionId?: string }) {
   const file = row.deliverable;
+  const dock = useFileDock();
   const [state, setState] = useState<'idle' | 'working' | 'unavailable'>('idle');
   const [problem, setProblem] = useState('');
   // A page written into a linked local project lies outside Clem's own
@@ -47,6 +51,40 @@ function DeliverableCard({ row, sessionId }: { row: ActivityItem; sessionId?: st
   }, [sessionId, name, folder]);
   if (!file) return null;
   const count = row.count ?? 1;
+  const fileRef = sessionId ? { sessionId, name, folder } : null;
+  if (dock && (page || fileRef)) {
+    const docked = dock.item;
+    const showing = page
+      ? docked?.kind === 'page' && docked.page.id === page.page.id
+      : docked?.kind === 'file' && sameSessionFile(docked.ref, fileRef);
+    const title = page ? projectPageTitle(page.page) : name;
+    return (
+      <button
+        type="button"
+        onClick={() => (showing ? dock.close()
+          : dock.open(page ? { kind: 'page', projectId: page.projectId, page: page.page } : { kind: 'file', ref: fileRef! }))}
+        aria-pressed={showing}
+        aria-label={`${showing ? 'Close' : 'Open'} ${title} beside the conversation`}
+        className={cn(
+          'flex min-w-0 items-center gap-3 rounded-md border bg-surface px-3 py-2.5 text-left transition-colors hover:bg-subtle active:scale-press',
+          showing ? 'border-primary' : 'border-border',
+        )}
+      >
+        <span className="grid h-9 w-9 shrink-0 place-items-center rounded-sm bg-success-tint text-success">
+          <FileText className="h-[18px] w-[18px]" aria-hidden />
+        </span>
+        <span className="flex min-w-0 flex-1 flex-col leading-tight">
+          <span className="truncate text-small font-semibold text-fg" title={title}>{title}</span>
+          <span className="truncate text-caption text-faint">
+            {page ? projectPagePlace(page.page) : count > 1 ? `Latest of ${count} files saved` : 'Saved'}
+          </span>
+        </span>
+        <span className="shrink-0 rounded-sm border border-border-strong px-3 py-1 text-caption font-semibold text-fg">
+          {showing ? 'Close' : page ? 'View' : 'Open'}
+        </span>
+      </button>
+    );
+  }
   if (page) {
     const title = projectPageTitle(page.page);
     return (

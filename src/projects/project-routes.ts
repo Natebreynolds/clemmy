@@ -10,6 +10,7 @@
  * serves local code folders.
  */
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import type { Request, Response } from 'express';
 import { getAgentRecord } from '../agents/agent-record.js';
 import {
@@ -28,6 +29,7 @@ import {
 import { setSessionProject } from './session-project.js';
 import { chooseLocalProject, localProjects } from './local-projects.js';
 import { localPageContentPolicy, pageImageIsBlank, pageMadeBySession, pageOfProject, pagesMadeInProject, readPageDocument } from './local-pages.js';
+import { readSessionFile, sessionFileImageType } from './session-files.js';
 import { moveFact } from './memory-scope-views.js';
 
 type Handler = (req: Request, res: Response) => void | Promise<void>;
@@ -57,6 +59,12 @@ function body(req: Request): Record<string, unknown> {
 function param(req: Request, name: string): string {
   const value = (req.params as Record<string, unknown>)[name];
   return String(Array.isArray(value) ? value[0] : value ?? '').trim();
+}
+
+/** A conversation id as the surfaces send it, with or without its lane prefix. */
+function sessionParam(req: Request): string {
+  const raw = param(req, 'sessionId');
+  return raw.startsWith('harness:') ? raw.slice('harness:'.length) : raw;
 }
 
 function strings(value: unknown): string[] | undefined {
@@ -119,6 +127,7 @@ const REASON_STATUS: Record<string, number> = {
   name_required: 400, name_taken: 409, not_found: 404, archived: 409,
   project_not_found: 404, project_archived: 409, agent_required: 400,
   page_not_found: 404, page_too_large: 413, page_not_rendered: 503, not_supported_here: 501,
+  file_not_found: 404, file_not_an_image: 415, file_not_openable: 415,
   resource_incomplete: 400, too_many_resources: 409, conflicting_account: 409,
 };
 
@@ -374,6 +383,39 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
     if (!found) { refuse(res, 'page_not_found'); return; }
     res.json(found);
   });
+
+  // A file the conversation's own work saved, by the name and folder its card
+  // shows, for the panel beside the conversation. Text comes with it.
+  add('get', `${mount.sessions}/:sessionId/file`, (req, res) => {
+    const found = readSessionFile(sessionParam(req), String(req.query.name ?? ''), String(req.query.folder ?? ''));
+    if (!found.ok) { refuse(res, found.reason); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ file: mount.origin === 'console' ? found.view : { ...found.view, openable: false } });
+  });
+
+  // The same file's picture, when it is one.
+  add('get', `${mount.sessions}/:sessionId/file/image`, (req, res) => {
+    const found = readSessionFile(sessionParam(req), String(req.query.name ?? ''), String(req.query.folder ?? ''));
+    if (!found.ok) { refuse(res, found.reason); return; }
+    const mimeType = sessionFileImageType(found.file);
+    if (found.view.kind !== 'image' || !mimeType) { refuse(res, 'file_not_an_image'); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ file: found.view, image: readFileSync(found.file).toString('base64'), mimeType });
+  });
+
+  if (mount.origin === 'console') {
+    // Open the file in the app made for its type, on this machine. Scripts,
+    // apps and installers are never opened: opening one runs it.
+    add('post', `${mount.sessions}/:sessionId/file/open`, (req, res) => {
+      if (!fromThisMachine(req)) { res.status(403).json({ error: 'THIS_MACHINE_ONLY' }); return; }
+      const found = readSessionFile(sessionParam(req), String(req.query.name ?? ''), String(req.query.folder ?? ''));
+      if (!found.ok) { refuse(res, found.reason); return; }
+      if (!found.view.openable) { refuse(res, 'file_not_openable'); return; }
+      const opened = openPage(found.file);
+      if (!opened.ok) { refuse(res, opened.reason); return; }
+      res.json({ ok: true, file: found.view });
+    });
+  }
 
   add('get', `${mount.sessions}/:sessionId/delegated-tasks`, (req, res) => {
     const raw = param(req, 'sessionId');
