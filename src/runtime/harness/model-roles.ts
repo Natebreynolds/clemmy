@@ -382,11 +382,20 @@ export function codexSafeFast(): string {
 // The memory role's automatic model is the memory route's own answer: it
 // builds on the boundary checker (debate-model), which imports this module, so
 // the route registers its reader here instead of this module importing it.
-let memoryAutomaticModelReader: (() => string | null) | null = null;
+// The reader lives on a function declaration, which exists before any of this
+// module runs: the route registers while an import cycle is still loading this
+// module, when a `let` would not yet exist and a later initialiser would erase
+// the registration.
+function memoryAutomaticModelSlot(): void { /* holds the registered reader */ }
+type MemoryAutomaticModelSlot = { read?: (() => string | null) | null };
 
 /** Called once by src/memory/memory-model-route.ts. `null` unregisters (tests). */
 export function registerMemoryAutomaticModel(read: (() => string | null) | null): void {
-  memoryAutomaticModelReader = read;
+  (memoryAutomaticModelSlot as unknown as MemoryAutomaticModelSlot).read = read;
+}
+
+function memoryAutomaticModelReader(): string | null {
+  return (memoryAutomaticModelSlot as unknown as MemoryAutomaticModelSlot).read?.() ?? null;
 }
 
 export function defaultForRole(role: ModelRole): string {
@@ -397,7 +406,7 @@ export function defaultForRole(role: ModelRole): string {
   // (nothing can run memory work yet), the checker's default stands in.
   if (role === 'memory') {
     try {
-      const automatic = memoryAutomaticModelReader?.();
+      const automatic = memoryAutomaticModelReader();
       if (automatic) return automatic;
     } catch { /* an unresolvable automatic route reads as the checker default */ }
     return defaultForRole('judge');
