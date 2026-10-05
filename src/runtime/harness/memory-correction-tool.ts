@@ -8,7 +8,7 @@ import { openEventLog } from './eventlog.js';
 import { assertDispatchLeaseCurrent, currentDispatchLease } from './dispatch-lease.js';
 import { getToolOutputContext } from './tool-output-context.js';
 import { retainedFactObservation } from './memory-fact-read-evidence.js';
-import { findRetainedCorrectionAssessment, readMemoryRequirementSource,
+import { findRetainedCorrectionAssessment, intakeReplacementsForSource, readMemoryRequirementSource,
   retainMemoryRequirementAssessment } from './memory-completion-obligation.js';
 
 export const memoryCorrectionInputSchema = z.object({
@@ -47,6 +47,11 @@ export async function executeMemoryCorrection(input: {
     readCallId: input.correct.readCallId });
   if (observation.digest !== input.correct.expectedDigest || observation.kind !== input.kind) {
     throw new Error('The target version or kind differs from the original read. Reopen the fact before correcting it.');
+  }
+  // The owner's message itself already replaced this fact when it was saved.
+  const applied = intakeReplacementsForSource(identity).find(row => row.replaced.id === observation.id);
+  if (applied) {
+    return { status: 'already_in_effect' as const, reason: `Already in effect: when this message was saved, fact ${applied.replaced.id} was replaced by fact ${applied.by.id} ("${applied.by.content}") in the same scope. Nothing further to change.` };
   }
   if (input.keepFor && !sameScope(observation.scope,
     input.keepFor === 'everywhere' ? null : source.memoryScope)) {

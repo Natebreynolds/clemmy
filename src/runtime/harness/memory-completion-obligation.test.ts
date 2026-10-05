@@ -312,3 +312,69 @@ test('two target corrections retain both obligations and redeem each original pr
   events.closeEventLog(); memoryDb.closeMemoryDb();
   assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified', 'both original grants survive an aggregate completion packet and reopen');
 });
+
+// Intake names the facts it stores by the accepted source they came from.
+function intakeReplacement(identity: ReturnType<typeof source>) {
+  const old = facts.rememberFact({ kind: 'project', content: `Fixture ${identity.sessionId}: report heading HAZEL RIDGE.`, scope: null,
+    occurredAt: new Date(Date.parse(identity.retained.occurredAt) - 60_000).toISOString() });
+  const by = facts.rememberFact({ kind: 'project', content: `Fixture ${identity.sessionId}: report heading LILAC GROVE.`, scope: null,
+    sessionId: identity.sessionId, occurredAt: identity.retained.occurredAt,
+    sourceUri: `conversation://${encodeURIComponent(identity.sessionId)}/${encodeURIComponent(`auto-capture:user-source:${identity.sourceUserSeq}`)}` });
+  assert.equal(facts.markFactSupersededBy(old.id, by.id, { validTo: identity.retained.occurredAt }), true);
+  return { old, by };
+}
+const replacedAssessment = { version: 1 as const, kind: 'replaced' as const, corrections: [],
+  reason: 'The owner\'s correction already replaced the saved heading in its scope.' };
+
+test('a correction this request\'s own intake already made completes without a second write', async () => {
+  const identity = source('Correction: the report heading is LILAC GROVE, not HAZEL RIDGE.');
+  const { old, by } = intakeReplacement(identity);
+  assert.deepEqual(memory.intakeReplacementsForSource(identity.retained).map(row => [row.replaced.id, row.by.id]), [[old.id, by.id]]);
+  retain(identity, { version: 1, kind: 'unresolved', corrections: [], reason: 'No exact target was bound yet.' });
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified');
+  const count = memoryDb.openMemoryDb().prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get();
+  const done = await runHost(identity, { done: true, reason: 'The heading change is in effect.', memoryRequirement: replacedAssessment });
+  assert.equal(done.outcome.terminal, undefined);
+  assert.equal(done.calls, 1);
+  assert.match(done.contexts[0]?.memoryRequirementContext ?? '', new RegExp(`"intakeReplacements":\\[\\{"replaced":\\{"id":${old.id},`));
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.assessment.kind, 'replaced');
+  assert.deepEqual(memoryDb.openMemoryDb().prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get(), count, 'nothing else was written');
+  events.closeEventLog(); memoryDb.closeMemoryDb();
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified', 'reopen re-proves it from memory state');
+  scope.stampMemoryScope('fact', by.id, { projectId: 'different-project', agentKey: null });
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified', 'a replacement outside the old scope is not the correction');
+});
+
+test('a replacement is only this request\'s own intake retiring the old fact', async () => {
+  const identity = source('Correction: the report heading is LILAC GROVE, not HAZEL RIDGE.');
+  const other = source('Correction: the report heading is LILAC GROVE, not HAZEL RIDGE.');
+  intakeReplacement(other);
+  const beside = facts.rememberFact({ kind: 'project', content: `Fixture ${identity.sessionId}: heading LILAC GROVE beside an old one.`, scope: null,
+    sessionId: identity.sessionId,
+    sourceUri: `conversation://${encodeURIComponent(identity.sessionId)}/${encodeURIComponent(`auto-capture:user-source:${identity.sourceUserSeq}`)}` });
+  assert.equal(facts.getFact(beside.id)?.active, true);
+  assert.deepEqual(memory.intakeReplacementsForSource(identity.retained), [], 'another request\'s replacement and a new fact beside an active old one are not listed');
+  assert.throws(() => retain(identity, replacedAssessment), /No replacement made by this request/);
+  retain(identity, { version: 1, kind: 'unresolved', corrections: [], reason: 'No exact target was bound yet.' });
+  const result = await runHost(identity, { done: true, reason: 'Claimed replaced.', memoryRequirement: replacedAssessment });
+  assert.equal(result.outcome.terminal?.status, 'blocked');
+  assert.equal(result.outcome.terminal?.reason, 'memory_correction_unverified');
+  assert.doesNotMatch(result.outcome.finalOutput ?? '', /memory requirement|bound to its original fact/i, 'the owner reads words, not the review reason');
+});
+
+test('a bound correction whose target this request\'s intake retired is complete', () => {
+  const identity = source(); const fixture = observed(identity);
+  retain(identity, fixture.assessment, 'prewrite');
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified');
+  const by = facts.rememberFact({ kind: 'project', content: fixture.observation.content.replace('HAZEL RIDGE', 'LILAC GROVE'), scope: null,
+    sessionId: identity.sessionId, occurredAt: identity.retained.occurredAt,
+    sourceUri: `conversation://${encodeURIComponent(identity.sessionId)}/${encodeURIComponent(`auto-capture:user-source:${identity.sourceUserSeq}`)}` });
+  assert.equal(facts.markFactSupersededBy(fixture.fact.id, by.id, { validTo: identity.retained.occurredAt }), true);
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified');
+  const kept = retain(identity, replacedAssessment);
+  assert.equal(kept.assessment.kind, 'correct', 'the bound correction stays the requirement');
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.assessment.kind, 'correct');
+  const unbound = source(); const unboundFixture = observed(unbound);
+  retain(unbound, unboundFixture.assessment, 'prewrite');
+  assert.throws(() => retain(unbound, replacedAssessment), /No replacement made by this request/);
+});

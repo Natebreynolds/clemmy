@@ -795,6 +795,7 @@ export function registerMemoryTools(server: McpServer): void {
           }
           try {
             const result = await executeMemoryCorrection({ kind, content, correct, keepFor });
+            if (result.status === 'already_in_effect') return textResult(result.reason);
             if (result.status === 'refused') {
               return nonWriteTextResult('memory_correction_refused', result.reason,
                 { classification: { kind: 'invalid_arguments' } });
