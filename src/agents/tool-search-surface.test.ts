@@ -180,7 +180,9 @@ test('ON: first-class = structural + hot set; non-hot discovery moves to the cat
   assert.ok((data.firstClassCount ?? 0) > 0, 'firstClassCount recorded');
   assert.ok((data.catalogCount ?? 0) > 0, 'catalogCount recorded');
   assert.ok((data.estCatalogTokens ?? 0) > 0, 'estCatalogTokens recorded');
-  assert.ok((data.firstClassCount ?? 999) <= 16, 'the small schema kernel includes the three native filesystem readers');
+  // Seventeen with Clem's app guide, whose schema the lean desk defers: the
+  // round-one bytes it adds are held by the lean-rounds ratchet, not this count.
+  assert.ok((data.firstClassCount ?? 999) <= 17, 'the small schema kernel includes the three native filesystem readers');
 });
 
 test('ON: an excluded tool is absent from both first-class and deferred reachability', async () => {
