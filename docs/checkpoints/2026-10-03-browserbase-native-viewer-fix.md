@@ -10,7 +10,7 @@ The same failure was reproduced with Electron 43 using a local dashboard and a s
 
 ## Source and installed state
 
-- Worktree: `/Users/nathan.reynolds/.codex/worktrees/browserbase-live-view/clementine-next`.
+- Worktree: `~/.codex/worktrees/browserbase-live-view/clementine-next`.
 - Branch: `codex/browserbase-live-view`. Changes remain uncommitted for review/integration.
 - Base was advanced to the newly installed `633f0094a4373d703043000af5b3c7ca1c33596c`, preserving the other agent's latest runtime changes. There is no desktop-source delta between the earlier `9e14f2c02` base and this commit.
 - Latest private authenticated running identity: `633f0094a4373d703043000af5b3c7ca1c33596c`, fingerprint `7a436b8e5de9b567135a274a5ddd0ff3ff793cc02b7f32d64969883c6660d2ae`, schema/expected schema 92, daemon instance `74b02350-44d4-43a3-afe1-d906b5977d04`, no cutover hold.
