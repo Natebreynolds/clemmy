@@ -443,13 +443,28 @@ export function watchForLateCompletion(
 }
 
 /**
+ * A replay as the idle live strip may use it. Activity from another session
+ * (a helper, a workflow step, a background job) that came before this
+ * conversation's latest finished turn was already reported by that turn:
+ * replayed, it is history and must not read as work running now. The
+ * conversation's own frames are kept.
+ */
+export function unreportedReplay(sessionId: string, events: readonly HarnessEvent[]): HarnessEvent[] {
+  const own = (ev: HarnessEvent) => !ev.sessionId || ev.sessionId === sessionId;
+  const settled = events.reduce((latest, ev) => (
+    own(ev) && ev.type === 'conversation_completed' && ev.seq > latest ? ev.seq : latest), 0);
+  return events.filter((ev) => own(ev) || ev.seq > settled);
+}
+
+/**
  * Idle-chat window onto delegated work (2026-08-04). When a turn promotes its
  * work to a background task, the run continues under `background:<taskId>` and
  * the server bridges that task's activity-shaped public events onto the origin
  * session's stream. This subscription is how the idle chat sees them: it
  * listens ONLY for bridged frames (sessionId present and ≠ the subscribed
- * session) and ignores replay + own-session frames entirely, so it can never
- * interfere with the per-turn stream's transcript or terminal handling.
+ * session) and ignores own-session frames, so it can never interfere with the
+ * per-turn stream's transcript or terminal handling. From the replay it takes
+ * only work not yet reported (unreportedReplay).
  * Keeping this EventSource open while the chat is on screen also registers the
  * viewer presence the terminal report-back uses to decide whether a finished
  * run still owes an out-of-band ping.
@@ -481,7 +496,7 @@ export function subscribeDelegatedActivity(
     es.addEventListener('replay', (e) => {
       try {
         const payload = JSON.parse((e as MessageEvent).data) as { events?: HarnessEvent[] };
-        for (const ev of payload.events ?? []) handleForeign(ev);
+        for (const ev of unreportedReplay(sessionId, payload.events ?? [])) handleForeign(ev);
       } catch { /* malformed frame — skip */ }
     });
     es.addEventListener('event', (e) => {

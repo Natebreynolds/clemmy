@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isTerminalEvent, runHarnessStream, subscribeDelegatedActivity } from './chat';
+import { isTerminalEvent, runHarnessStream, subscribeDelegatedActivity, unreportedReplay } from './chat';
 
 test('chat stream keeps budget-limit telemetry non-terminal', () => {
   assert.equal(isTerminalEvent('conversation_limit_exceeded'), false);
@@ -110,4 +110,24 @@ test('delegated-activity subscription forwards only bridged frames from the prom
       window: previousWindow,
     });
   }
+});
+
+test('reopening a chat never shows a finished turn\'s helper as working now', () => {
+  const own = 'sess-desktop-origin';
+  const replay = [
+    { seq: 10, turn: 1, role: 'user', type: 'user_input_received', sessionId: own, data: {} },
+    { seq: 11, turn: 1, role: 'agent', type: 'deliverable_saved', sessionId: 'sess-worker-helper', data: { name: 'brief.md' } },
+    { seq: 12, turn: 1, role: 'agent', type: 'tool_called', sessionId: 'sess-worker-helper', data: {} },
+    { seq: 13, turn: 1, role: 'Clem', type: 'conversation_completed', sessionId: own, data: {} },
+    { seq: 14, turn: 2, role: 'user', type: 'user_input_received', sessionId: own, data: {} },
+    { seq: 15, turn: 2, role: 'agent', type: 'tool_called', sessionId: 'sess-worker-next', data: {} },
+  ];
+  assert.deepEqual(unreportedReplay(own, replay).map((ev) => ev.seq), [10, 13, 14, 15],
+    'a helper of the finished turn is history; the running turn\'s helper still shows');
+  const finished = replay.slice(0, 4);
+  assert.deepEqual(unreportedReplay(own, finished).filter((ev) => ev.sessionId !== own), [],
+    'after the last turn finished, nothing from another session reads as running');
+  const untagged = [{ seq: 1, turn: 1, role: 'Clem', type: 'conversation_completed', data: {} },
+    { seq: 0, turn: 1, role: 'agent', type: 'tool_called', sessionId: 'background:task-1', data: {} }];
+  assert.deepEqual(unreportedReplay(own, untagged).map((ev) => ev.seq), [1], 'an untagged frame is the conversation\'s own');
 });
