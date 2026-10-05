@@ -118,7 +118,8 @@ export function pendingAcceptedLocalWork(input: {
         const packetKey = workerPacketKey({ ...packet, item });
         const latestWorker = [...ownedEvents].reverse().find((event) => event.type === 'worker_result'
           && event.role === 'system' && event.data.packetKey === packetKey && event.data.item === item);
-        if (latestWorker?.data.ok === true) continue;
+        if (latestWorker?.data.ok === true && latestWorker.data.backedByWork !== false
+          && latestWorker.data.retryRequiresReconciliation !== true) continue;
         const itemId = descriptor.aliases?.find((entry) => entry.alias === item)?.itemId ?? item;
         const state = manifest?.contractVersion === descriptor.contractVersion
           ? manifest.items.find((entry) => entry.id === itemId)?.phases[descriptor.phase]
@@ -149,7 +150,8 @@ function settledItemEvidence(
   if (seq) {
     const event = events.get(Number(seq[1]));
     if (!event || event.role !== 'system') return false;
-    if (ref.kind === 'worker_result') return event.type === 'worker_result' && event.data.ok === true;
+    if (ref.kind === 'worker_result') return event.type === 'worker_result' && event.data.ok === true
+      && event.data.backedByWork !== false && event.data.retryRequiresReconciliation !== true;
     return ref.kind === 'tool_result' && event.type === 'tool_returned'
       && event.data.sourceUserSeq === input.sourceUserSeq && event.data.accounting === 'top_level'
       && (event.data.successfulBusinessResult === true || event.data.successfulAuthoringResult === true);

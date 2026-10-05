@@ -340,6 +340,10 @@ function captureEvidenceBestEffort(fact: ConsolidatedFact, input: RememberInput)
 function captureDirectFactEntityLinksBestEffort(fact: ConsolidatedFact, input: RememberInput): void {
   if (input.derivedFrom?.callId || input.derivedFrom?.sessionId) return;
   try {
+    // Entity observations and recency are shared globally. A local fact may
+    // keep its own evidence, but cannot enrich that registry automatically.
+    // Consult the committed scope; ambient settings need not match this fact.
+    if (!isEverywhere(memoryScopeOf('fact', fact.id))) return;
     const evidence = getFactEvidence(fact.id).find((item) => item.excerpt.trim().length > 0 && (item.status === 'available' || item.status === 'partial'));
     if (!evidence) return;
     // A unique alias today can prefix a new identity not registered yet.

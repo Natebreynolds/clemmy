@@ -14,6 +14,7 @@ const contexts = await import('./source-session-context.js');
 const plans = await import('./plan-artifacts.js');
 const branches = await import('./accepted-source-session-branch.js');
 const schema = await import('./eventlog-schema.js');
+const { restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
 const { withSessionProofCascade } = await import('./retained-session-proof-schema.js');
 const { closeMemoryDb } = await import('../../memory/db.js');
 beforeEach(() => log.resetEventLog());
@@ -224,6 +225,7 @@ test('a failed final session delete rolls back every earlier cascade', () => {
  * Existing public APIs create all data first. No execution proof is invented. */
 function downgradeProofTablesToV82() {
   const db = log.openEventLog();
+  restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture(db);
   const tables: Array<[string, string]> = [
     ['reviewed_plan_execution_observers_v1', 'session_id, source_user_seq, claim_id, source_digest'],
     ['reviewed_plan_execution_claims_v1', 'claim_id, plan_id, revision, session_id, source_user_seq, claim_json, event_id'],

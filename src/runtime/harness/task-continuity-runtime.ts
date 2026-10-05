@@ -75,6 +75,7 @@ import {
   type TurnSourceStrategyBindingV1,
 } from './turn-control.js';
 import { currentInputSuppressesPriorTask } from './current-task-authority.js';
+import { withoutRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 
 const ANSWER_MAX_CHARS = 280;
 const ANSWER_MAX_WORDS = 24;
@@ -666,7 +667,8 @@ export function persistCommittedClarificationContinuity(input: {
   // Normalized text is for comparison only.
   const questionText = typeof awaiting.data.question === 'string' ? awaiting.data.question.trim() : '';
   const question = normalized(questionText);
-  const deliveredQuestion = normalized(presentation.text);
+  // Match the public question; its host checkpoint remains in durable evidence.
+  const deliveredQuestion = normalized(withoutRetainedWorkCheckpoint(presentation.text));
   // The packet must describe the question the user actually saw. An internal
   // Q1 followed by a delivered Q2 cannot let a reply to Q2 inherit Q1's task,
   // options, recipient, or effect authority.
@@ -1709,7 +1711,7 @@ export function inspectDurableMaterialSourceContinuation(input: {
         && presentation.status === 'needs_input'
         && presentation.kind === 'question'
         && presentation.needs?.kind === 'input'
-        && normalized(presentation.text) === normalized(context.question);
+        && normalized(withoutRetainedWorkCheckpoint(presentation.text)) === normalized(context.question);
     } catch {
       return false;
     }

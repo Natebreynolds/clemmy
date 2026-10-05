@@ -679,6 +679,23 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): P
   // acquireRefreshLock (e.g. a state-dir mkdir EACCES) still returns ok:false
   // rather than rejecting the caller's model request.
   let lockFd: number | null = null;
+  let refreshGrant: LocalAuthState['codexOauth'];
+  const grantIsCurrent = (current: LocalAuthState): boolean => {
+    const grant = current.codexOauth;
+    return grant?.accessToken === refreshGrant?.accessToken
+      && grant?.refreshToken === refreshGrant?.refreshToken
+      && grant?.idToken === refreshGrant?.idToken
+      && grant?.accountId === refreshGrant?.accountId
+      && grant?.lastRefresh === refreshGrant?.lastRefresh;
+  };
+  const supersededResult = (current: LocalAuthState): { ok: boolean; message: string; terminal?: boolean } => {
+    if (getCodexAuthDead()) {
+      return { ok: false, terminal: true, message: 'The current Codex sign-in requires re-authentication; an obsolete refresh was discarded.' };
+    }
+    return current.codexOauth?.accessToken && current.codexOauth.refreshToken
+      ? { ok: true, message: 'Codex sign-in changed during refresh; keeping the current credentials.' }
+      : { ok: false, message: 'Codex sign-in was cleared during refresh; the obsolete result was discarded.' };
+  };
   try {
     // 2. Cross-process lock — only one process refreshes at a time.
     lockFd = await acquireRefreshLock();
@@ -690,6 +707,9 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): P
     if (!refreshToken) {
       return { ok: false, message: 'No locally stored native refresh token is available.' };
     }
+    // A model request can mark the grant dead while this caller waits on the
+    // refresh lock. Do not spend a refresh token after that newer rejection.
+    if (getCodexAuthDead()) return supersededResult(local);
     // 3. Skip if a sibling just refreshed — reuse their token instead of POSTing
     // the now-rotated RT again (which would trip reuse-detection). Two signals:
     //   (a) value-based — the on-disk RT changed vs the one we meant to spend
@@ -705,6 +725,7 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): P
     if (rotatedWhileWaiting || (!force && refreshedWithinSkipWindow(local.codexOauth?.lastRefresh))) {
       return { ok: true, message: 'Token was just refreshed by another holder; reusing it.' };
     }
+    refreshGrant = local.codexOauth;
     const tokens = await refreshTokenImpl(refreshToken);
     // Persist to CLEMENTINE'S OWN vault only. We deliberately do NOT write the
     // rotated token back to ~/.codex/auth.json (the external Codex CLI's file):
@@ -714,8 +735,14 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): P
     // Re-load at write time (not the pre-refresh snapshot): the provider
     // round-trip above is slow, and a sibling grant (xaiOauth, …) connected
     // meanwhile must survive this rotation.
+    const current = loadLocalAuthState();
+    // The refresh lock serializes refreshes, not login/import/clear. Reject a
+    // superseded completion before it can restore an old account or clear the
+    // replacement's DEAD latch. Check and save are synchronous in this process;
+    // the reread is not atomic against uncoordinated cross-process writers.
+    if (!grantIsCurrent(current) || getCodexAuthDead()) return supersededResult(current);
     saveLocalAuthState({
-      ...loadLocalAuthState(),
+      ...current,
       importedAt: new Date().toISOString(),
       source: local.source ?? 'native',
       codexOauth: {
@@ -728,6 +755,12 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): P
     });
     return { ok: true, message: 'Native ChatGPT/Codex tokens refreshed.' };
   } catch (error) {
+    // A rejection of an obsolete grant says nothing about the current one.
+    // In particular, do not latch DEAD after a login or clear won the race.
+    if (refreshGrant) {
+      const current = loadLocalAuthState();
+      if (!grantIsCurrent(current) || getCodexAuthDead()) return supersededResult(current);
+    }
     const message = error instanceof Error ? error.message : String(error);
     const status = (error as { status?: number } | null)?.status;
     const kind = classifyCodexAuthError({ message, status });

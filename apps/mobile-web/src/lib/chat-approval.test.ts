@@ -50,7 +50,7 @@ test('an approval with no id cannot be acted on from the transcript', () => {
 
 test('a decided approval hides the buttons', () => {
   const messages = [
-    { role: 'assistant', text: 'Waiting on you' },
+    { role: 'assistant', text: 'Waiting on you', approval: { approvalId: 'apr-70i3', resolution: 'approved' } },
     { role: 'user', text: 'Approve apr-70i3' },
   ];
   assert.equal(chatApprovalDecided(messages, 'apr-70i3'), true);
@@ -67,7 +67,7 @@ test('a FAILED send brings the buttons back rather than stranding the user', () 
 });
 
 test('a decision on a DIFFERENT approval does not hide these buttons', () => {
-  const messages = [{ role: 'user', text: 'Approve apr-other' }];
+  const messages = [{ role: 'assistant', text: '', approval: { approvalId: 'apr-other', resolution: 'approved' } }];
   assert.equal(chatApprovalDecided(messages, 'apr-70i3'), false);
 });
 
@@ -75,9 +75,22 @@ test('an assistant message quoting the phrase is not a decision', () => {
   // The model narrating "Approve apr-70i3" must never count as the user acting.
   const messages = [{ role: 'assistant', text: 'Approve apr-70i3' }];
   assert.equal(chatApprovalDecided(messages, 'apr-70i3'), false,
-    'only a USER turn decides');
+    'prose is not recorded approval evidence');
 });
 
 test('no id means never decided, so the fallback copy always shows', () => {
   assert.equal(chatApprovalDecided([{ role: 'user', text: 'Approve ' }], null), false);
+});
+
+
+test('an accepted answer with a failed decision does not disable the pending card on replay', () => {
+  assert.equal(chatApprovalDecided([
+    { role: 'assistant', text: '', approval: { approvalId: 'apr-70i3' } },
+    { role: 'user', text: 'Approve apr-70i3' },
+    { role: 'assistant', text: 'Could not record that decision.' },
+  ], 'apr-70i3'), false);
+});
+
+test('a sending answer does not confer a decision before the host resolves it', () => {
+  assert.equal(chatApprovalDecided([{ role: 'user', text: 'Approve apr-70i3', pending: 'sending' }], 'apr-70i3'), false);
 });

@@ -13,7 +13,6 @@ const {
   getLocalToolCatalog,
   getLocalRuntimeTools,
   getLocalDeferredDispatchTools,
-  recoverMemoryRememberRequiredPrefix,
   describeInvalidToolInput,
   buildLocalToolErrorFunction,
   buildScopedLocalToolSearch,
@@ -468,43 +467,146 @@ test('local runtime tools include autonomy, execution, run tracking, and profile
   }
 });
 
-test('memory input recovery salvages only a complete safe kind/content prefix', () => {
-  const raw = '{"kind":"project","content":"The Falcon codeword is \\"tangerine-osprey-42\\".",'
-    + '"entities":null,"relationships":[{"validFrom":"2026-07-26\'}]}garbage';
-  const recovered = recoverMemoryRememberRequiredPrefix({
-    name: 'InvalidToolInputError',
-    toolInvocation: { input: raw },
-  });
-  assert.deepEqual(recovered, {
-    kind: 'project',
-    content: 'The Falcon codeword is "tangerine-osprey-42".',
-  });
+async function memoryRecoveryFixture(handler: (input: Record<string, unknown>) => Promise<unknown>) {
+  const { z } = await import('zod');
+  const { normalizeShapeForResponses } = await import('./local-runtime-tools.js');
+  const parameters = {
+    kind: z.enum(['user', 'project', 'feedback', 'reference', 'constraint']), content: z.string().min(3),
+    sessionId: z.string().optional(), sourcePath: z.string().optional(),
+    keepFor: z.enum(['here', 'everywhere']).optional(),
+    entities: z.array(z.object({ name: z.string() })).optional(),
+    relationships: z.array(z.object({ subject: z.string() })).optional(),
+  };
+  const strict = z.strictObject(normalizeShapeForResponses(parameters));
+  return {
+    run: buildLocalToolErrorFunction({ name: 'memory_remember', description: 'memory recovery test', parameters, handler }),
+    error(raw: string, nominal = true) {
+      let problem: unknown;
+      try { const parsed = strict.safeParse(JSON.parse(raw)); problem = parsed.success ? new Error('fixture expected invalid input') : parsed.error; }
+      catch (error) { problem = error; }
+      return Object.assign(nominal ? new ModelBehaviorError('Invalid JSON input for tool') : new Error('Invalid JSON input for tool'), {
+        name: 'InvalidToolInputError', originalError: problem, toolInvocation: { input: raw },
+      });
+    },
+  };
+}
 
-  assert.equal(recoverMemoryRememberRequiredPrefix({
-    name: 'InvalidToolInputError',
-    toolInvocation: { input: '{"kind":"constraint","content":"Never send mail from prod",' },
-  }), null, 'hard constraints are never recovered from partial input');
-  assert.equal(recoverMemoryRememberRequiredPrefix({
-    name: 'InvalidToolInputError',
-    toolInvocation: { input: '{"kind":"project","content":"unterminated' },
-  }), null, 'an incomplete required field is never guessed');
+test('memory recovery refuses malformed JSON with complete scope and provenance instead of saving a prefix', async () => {
+  let calls = 0;
+  const fixture = await memoryRecoveryFixture(async () => { calls += 1; return 'must not execute'; });
+  for (const ownership of [
+    { keepFor: 'here' }, { sessionId: 'foreign-fixture-session' },
+    { sourcePath: 'file:///controlled-fixture-evidence' },
+  ]) {
+    const raw = JSON.stringify({ kind: 'user', content: 'The standing title is Indigo Meadow.', ...ownership }).slice(0, -1)
+      + ',"relationships":[{"subject":"unterminated';
+    const result = await fixture.run(undefined, fixture.error(raw));
+    assert.ok(result instanceof InvalidArgumentsPreDispatchResult, 'invalid memory input must remain a nominal pre-dispatch refusal');
+    assert.match(String(result), /preserving.*keepFor, sessionId and sourcePath/);
+    assert.doesNotMatch(String(result), /only the required kind and content|annotations were ignored/);
+    assert.deepEqual(attemptSignalsFromTypedResult(result), { preDispatch: true, argumentValidationFailed: true, schemaAvailable: true });
+  }
+  assert.equal(calls, 0);
 });
 
-test('memory_remember executes once from a valid prefix when optional annotations are malformed', async () => {
-  const memoryTool = getLocalRuntimeTools()
-    .find((candidate) => (candidate as { name?: string }).name === 'memory_remember');
-  assert.ok(memoryTool && memoryTool.type === 'function');
-  const marker = `Recovered memory marker ${Date.now()}-falcon.`;
-  const malformed = JSON.stringify({ kind: 'project', content: marker }).slice(0, -1)
-    + ',"entities":null,"relationships":[{"validFrom":"2026-07-26\'}]}garbage';
+test('memory recovery refuses valid JSON with invalid annotations without dropping requested graph work', async () => {
+  let calls = 0;
+  const fixture = await memoryRecoveryFixture(async () => { calls += 1; return 'must not execute'; });
+  const raw = JSON.stringify({ kind: 'project', content: 'Mara owns the release handbook.', keepFor: 'here',
+    sessionId: 'bound-fixture', sourcePath: 'file:///controlled-evidence', entities: [{ name: 42 }] });
+  const result = await fixture.run(undefined, fixture.error(raw));
+  assert.ok(result instanceof InvalidArgumentsPreDispatchResult, 'invalid memory input must remain a nominal pre-dispatch refusal');
+  assert.match(String(result), /Preserve requested graph work/); assert.equal(calls, 0);
+});
 
-  const output = await memoryTool.invoke(
-    new RunContext({ sessionId: 'local-runtime-memory-recovery' }),
-    malformed,
-  );
-  assert.match(String(output), /Remembered|Reinforced an existing fact|Already known/);
-  assert.match(String(output), /Recovered valid kind\/content/);
-  assert.doesNotMatch(String(output), /InvalidToolInputError/);
+test('memory recovery only fills omitted nullable fields and retains every supplied argument', async () => {
+  let calls = 0; let received: Record<string, unknown> | undefined;
+  const fixture = await memoryRecoveryFixture(async input => { calls += 1; received = input; return 'Saved controlled fact.'; });
+  const supplied = { kind: 'user', content: 'Mara owns the release handbook.', keepFor: 'here',
+    sessionId: 'bound-fixture', sourcePath: 'file:///controlled-evidence', entities: [{ name: 'Mara' }] };
+  const result = await fixture.run(undefined, fixture.error(JSON.stringify(supplied)));
+  assert.equal(calls, 1); assert.deepEqual(received, { ...supplied, relationships: null });
+  assert.equal(String(result), 'Saved controlled fact.');
+});
+
+test('memory recovery preserves a nominal no-write scope refusal from the handler', async () => {
+  const { nonWriteTextResult } = await import('./shared.js');
+  const { HostLocalNonWriteResult } = await import('../runtime/harness/attempt-settlement.js');
+  let calls = 0;
+  const fixture = await memoryRecoveryFixture(async () => {
+    calls += 1; return nonWriteTextResult('memory_session_mismatch', 'Not remembered: wrong session.',
+      { classification: { kind: 'invalid_arguments' } });
+  });
+  const result = await fixture.run(undefined, fixture.error(JSON.stringify({ kind: 'project', content: 'A durable scoped fact.',
+    sessionId: 'foreign-fixture-session', keepFor: 'here' })));
+  assert.equal(calls, 1); assert.ok(result instanceof HostLocalNonWriteResult, 'scope refusal must remain nominal no-write');
+  assert.equal(result.status, 'memory_session_mismatch');
+  assert.deepEqual(result.classification, { kind: 'invalid_arguments' });
+});
+
+for (const effect of ['acknowledged', 'uncertain'] as const) {
+  test(`memory recovery preserves ${effect} failure effect rather than interpolating it into success`, async () => {
+    const { executionFailureTextResult } = await import('./shared.js');
+    const fixture = await memoryRecoveryFixture(async () => executionFailureTextResult('The requested graph is incomplete.', effect));
+    const result = await fixture.run(undefined, fixture.error(JSON.stringify({ kind: 'project', content: 'A durable scoped fact.', keepFor: 'here' })));
+    assert.ok(result instanceof HostLocalExecutionFailureResult, 'partial failure must retain nominal effect truth'); assert.equal(result.effect, effect);
+    assert.equal(String(result), 'The requested graph is incomplete.');
+    assert.deepEqual(attemptSignalsFromTypedResult(result), { executionFailed: true, acknowledged: effect === 'acknowledged' });
+  });
+}
+
+test('memory recovery retains producer graph-partial diagnostic without adding a success notice', async () => {
+  const { textResult } = await import('./shared.js');
+  const text = 'MEMORY_GRAPH_INCOMPLETE: the fact was saved, but requested annotations were not fully grounded.';
+  const fixture = await memoryRecoveryFixture(async () => textResult(text));
+  const result = await fixture.run(undefined, fixture.error(JSON.stringify({ kind: 'project', content: 'A durable scoped fact.' })));
+  assert.equal(String(result), text);
+});
+
+test('memory nullable recovery fills an omitted enum but never replaces supplied invalid fields or required content', async () => {
+  let calls = 0;
+  let received: Record<string, unknown> | undefined;
+  const fixture = await memoryRecoveryFixture(async input => { calls += 1; received = input; return 'Saved controlled fact.'; });
+  const content = 'The standing report title is Harbor Lantern.';
+  const output = await fixture.run(undefined, fixture.error(JSON.stringify({ kind: 'project', content })));
+  assert.equal(String(output), 'Saved controlled fact.');
+  assert.deepEqual(received, { kind: 'project', content, sessionId: null, sourcePath: null,
+    keepFor: null, entities: null, relationships: null });
+  assert.equal(calls, 1);
+  for (const input of [
+    { kind: 'project', content, keepFor: 'somewhere_else' },
+    { kind: 'project', content, keepFor: 42 },
+    { kind: 'project' },
+    { kind: 'project', content, extra: 'must not disappear' },
+  ]) {
+    const refused = await fixture.run(undefined, fixture.error(JSON.stringify(input)));
+    assert.ok(refused instanceof InvalidArgumentsPreDispatchResult, 'only absent schema-permitted nullables can be repaired');
+    assert.equal(calls, 1, 'invalid supplied values or missing required content must not invoke the handler');
+  }
+});
+
+test('forged or runtime memory errors do not invoke recovery or claim no effect', async () => {
+  let calls = 0;
+  const fixture = await memoryRecoveryFixture(async () => { calls += 1; return 'must not execute'; });
+  const raw = JSON.stringify({ kind: 'project', content: 'A durable scoped fact.' });
+  for (const error of [fixture.error(raw, false), new Error('failure after a possible memory effect')]) {
+    const result = await fixture.run(undefined, error);
+    assert.equal(typeof result, 'string'); assert.match(String(result), /^An error occurred while running the tool/);
+    assert.doesNotMatch(String(result), /no memory was saved|Recovered valid/);
+  }
+  assert.equal(calls, 0);
+});
+
+test('actual memory SDK registration refuses malformed optional input without saving any prefix', async () => {
+  const memoryTool = getLocalRuntimeTools().find(candidate => (candidate as { name?: string }).name === 'memory_remember');
+  assert.ok(memoryTool && memoryTool.type === 'function');
+  const { openMemoryDb } = await import('../memory/db.js');
+  const marker = `Scoped malformed fixture ${Date.now()}-moth.`;
+  const raw = JSON.stringify({ kind: 'user', content: marker, keepFor: 'here', sessionId: 'controlled-fixture',
+    sourcePath: 'file:///controlled-source' }).slice(0, -1) + ',"relationships":[{"subject":"broken';
+  const output = await memoryTool.invoke(new RunContext({ sessionId: 'local-runtime-memory-recovery' }), raw);
+  assert.ok(output instanceof InvalidArgumentsPreDispatchResult, 'actual SDK invalid memory arguments must not save a prefix');
+  assert.equal((openMemoryDb().prepare('SELECT COUNT(*) AS n FROM consolidated_facts WHERE content = ?').get(marker) as { n: number }).n, 0);
 });
 
 test('a direct read refused for an identifier under another name runs with the completed arguments', async () => {

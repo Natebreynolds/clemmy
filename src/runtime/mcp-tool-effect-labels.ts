@@ -14,7 +14,7 @@
  * process lists the same server's tools and all of them must agree.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 
@@ -64,13 +64,15 @@ function emptyFile(): McpToolEffectLabelFile {
   return { version: 1, servers: {}, pending: {} };
 }
 
-export function readMcpToolEffectLabelFile(): McpToolEffectLabelFile {
+export function readMcpToolEffectLabelFile(options: { strict?: boolean } = {}): McpToolEffectLabelFile {
   const file = labelFilePath();
   try {
-    if (!existsSync(file)) return emptyFile();
     const stat = statSync(file);
     if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.value;
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as Partial<McpToolEffectLabelFile>;
+    if (!parsed || parsed.version !== 1 || !parsed.servers || typeof parsed.servers !== 'object'
+      || Array.isArray(parsed.servers) || !parsed.pending || typeof parsed.pending !== 'object'
+      || Array.isArray(parsed.pending)) throw new Error('Tool effect label store is malformed');
     const value: McpToolEffectLabelFile = {
       version: 1,
       servers: parsed.servers && typeof parsed.servers === 'object' ? parsed.servers : {},
@@ -78,8 +80,10 @@ export function readMcpToolEffectLabelFile(): McpToolEffectLabelFile {
     };
     cached = { mtimeMs: stat.mtimeMs, size: stat.size, value };
     return value;
-  } catch {
-    // An unreadable store grants nothing: every tool keeps its own evidence.
+  } catch (error) {
+    // Listing fails closed. A projection writer must not mistake a broken
+    // existing store for an empty one and erase unrelated approved labels.
+    if (options.strict && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     return emptyFile();
   }
 }

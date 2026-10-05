@@ -62,9 +62,47 @@ export function resolveInstalledAppBundle(candidates, readDaemonVersion) {
   return found[0];
 }
 
+/** In-place patching cannot preserve an app's resource seal. Reject every
+ * app/Contents target, including damaged or unsigned bundles; signature failure
+ * is never permission to modify one. Install a signed whole bundle instead. */
+export function assertMutableInstallTarget(targetPath) {
+  const target = path.resolve(targetPath);
+  const rejectAppContents = (candidate) => {
+    const parts = candidate.split(path.sep);
+    if (parts.some((part, index) => /\.app$/i.test(part) && /^contents$/i.test(parts[index + 1] ?? ''))) {
+      throw new Error(`Refusing in-place installation inside an app bundle: ${target}. Use the signed whole-bundle installation path (scripts/hotpatch-installed.sh).`);
+    }
+  };
+  // A link out of a bundle still leaves a sealed directory entry to replace.
+  rejectAppContents(target);
+  let ancestor = target;
+  const missing = [];
+  for (;;) {
+    try {
+      fs.lstatSync(ancestor);
+    } catch (error) {
+      const parent = path.dirname(ancestor);
+      if (error.code !== 'ENOENT' || parent === ancestor) {
+        throw new Error(`Cannot verify installation target: ${target}`, { cause: error });
+      }
+      missing.unshift(path.basename(ancestor));
+      ancestor = parent;
+      continue;
+    }
+    // Resolve existing ancestors even when the final asset directory is new.
+    // A dangling/looping link or unreadable ancestor is not an unsigned target.
+    let canonical;
+    try { canonical = fs.realpathSync(ancestor); }
+    catch (error) { throw new Error(`Cannot verify installation target: ${target}`, { cause: error }); }
+    rejectAppContents(path.join(canonical, ...missing));
+    return;
+  }
+}
+
 export function installDaemonPatch({ sourceDist, targetDist }, fileOps = fs) {
   const source = path.resolve(sourceDist);
   const target = path.resolve(targetDist);
+  assertMutableInstallTarget(target);
   if (source === target || source.startsWith(`${target}${path.sep}`) || target.startsWith(`${source}${path.sep}`)) {
     throw new Error('Source and installation must be separate directories.');
   }
@@ -111,6 +149,7 @@ export function installDaemonPatch({ sourceDist, targetDist }, fileOps = fs) {
 export function installBundledAssetDirectory({ sourceDir, targetDir }, fileOps = fs) {
   const source = path.resolve(sourceDir);
   const target = path.resolve(targetDir);
+  assertMutableInstallTarget(target);
   if (source === target || source.startsWith(`${target}${path.sep}`) || target.startsWith(`${source}${path.sep}`)) {
     throw new Error('Source and installation must be separate directories.');
   }

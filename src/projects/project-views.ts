@@ -74,6 +74,24 @@ export interface DelegatedTaskWorkView {
   /** The items are what its workers were given, not a declared work list,
    *  so they may not be the whole job. */
   partial?: true;
+  /** Full-list aggregates when display rows are bounded. */
+  remaining?: { count: number; labels: string[] };
+  running?: { count: number; labels: string[] };
+}
+
+function boundedWorkView(items: DelegatedTaskWorkView['items'], partial = false): DelegatedTaskWorkView {
+  const missing = items.filter((item) => item.state !== 'done');
+  const running = items.filter((item) => item.state === 'working');
+  return {
+    done: items.length - missing.length, total: items.length,
+    // Keep actionable rows visible even when earlier completed rows fill the card.
+    items: items.length > 40 ? [...missing, ...items.filter((item) => item.state === 'done')].slice(0, 40) : items,
+    ...(partial ? { partial: true as const } : {}),
+    ...(items.length > 40 ? {
+      remaining: { count: missing.length, labels: missing.slice(0, 3).map((item) => item.label) },
+      running: { count: running.length, labels: running.slice(0, 3).map((item) => item.label) },
+    } : {}),
+  };
 }
 
 /** Without a declared work list, the items its workers were given, each with
@@ -82,26 +100,26 @@ function workerItemsView(runSessionId: string): DelegatedTaskWorkView | null {
   const items = new Map<string, DelegatedTaskWorkView['items'][number]>();
   try {
     for (const event of listEvents(runSessionId, { types: ['worker_started', 'worker_result'] })) {
-      const data = event.data as { item?: unknown; ok?: unknown };
+      const data = event.data as { item?: unknown; ok?: unknown; backedByWork?: unknown; retryRequiresReconciliation?: unknown };
       if (event.role !== 'system' || typeof data.item !== 'string' || !data.item.trim()) continue;
       const label = data.item.trim();
       items.set(label, {
         id: label,
         label,
-        state: event.type === 'worker_started' ? 'working' : data.ok === true ? 'done' : 'failed',
+        state: event.type === 'worker_started' ? 'working'
+          : data.ok === true && data.backedByWork !== false && data.retryRequiresReconciliation !== true ? 'done' : 'failed',
       });
     }
   } catch { return null; }
   if (items.size === 0) return null;
-  const list = [...items.values()].slice(0, 40);
-  return { done: list.filter((item) => item.state === 'done').length, total: items.size, items: list, partial: true };
+  return boundedWorkView([...items.values()], true);
 }
 
 /** The job's latest work list as the owner reads it: each item and where it stands. */
 function workView(runSessionId: string): DelegatedTaskWorkView | null {
   const manifest = summarizeWorkManifest(runSessionId);
   if (!manifest || manifest.items.length === 0) return workerItemsView(runSessionId);
-  const items = manifest.items.slice(0, 40).map((item) => {
+  const items = manifest.items.map((item) => {
     const phases = Object.values(item.phases);
     const failed = phases.find((phase) => phase.status === 'failed');
     const state: DelegatedTaskWorkView['items'][number]['state'] = item.complete ? 'done'
@@ -115,7 +133,7 @@ function workView(runSessionId: string): DelegatedTaskWorkView | null {
       ...(state === 'failed' && failed?.reason ? { note: failed.reason.slice(0, 200) } : {}),
     };
   });
-  return { done: manifest.items.filter((item) => item.complete).length, total: manifest.items.length, items };
+  return boundedWorkView(items);
 }
 
 /** The files a job saved, by name, newest last: its own and its workers'. */

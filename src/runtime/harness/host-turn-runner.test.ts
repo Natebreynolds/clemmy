@@ -9696,10 +9696,10 @@ for (const staleKind of ['call', 'answer'] as const) test(`owner steering during
 });
 
 /** A real accepted source whose text is the request the judge measures against. */
-function acceptJudgedSource(label: string, text: string) {
+function acceptJudgedSource(label: string, text: string, sourceData: Record<string, unknown> = {}) {
   const session = eventlog.createSession({ id: `host-judged-${++acceptedSerial}-${label}`, kind: 'chat' });
   const source = eventlog.appendEvent({
-    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text },
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text, ...sourceData },
   });
   const parent = {
     sessionId: session.id,
@@ -9722,6 +9722,282 @@ function runJudgedHost(
     { maxTurns: 6, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: judgeCompletion } as never,
   ));
 }
+
+test('durable memory completion obligation keeps an unresolved correction out of conversational success', async (t) => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  let reviews = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    reviews += 1;
+    return { done: false, blocked: true, reason: 'The requested project-memory correction has not been saved.' };
+  });
+  const session = eventlog.createSession({ id: `memory-required-correction-${++acceptedSerial}`, kind: 'chat' });
+  const input = 'Correction: the report heading is now Willow, replacing Birch. The other convention is unchanged. Remember the correction for future chats in this project only.';
+  const model = stubModel([[textMsg('The report heading is now Willow, replacing Birch. The other convention is unchanged.')]]);
+  const result = await runConversation({
+    sessionId: session.id, input, turnEngine: 'host_v1', maxSteps: 1, maxTurns: 4,
+    judgeCompletion: true,
+    buildAgent: async () => ({ model, instructions: 'base system', tools: [] } as never),
+    makeRunner: () => throwingRunner() as never,
+  });
+  const events = eventlog.listEvents(session.id);
+  const source = events.find(event => event.type === 'user_input_received' && event.data.synthetic !== true);
+  assert.ok(source);
+  assert.equal(events.filter(event => event.type === 'tool_called').length, 0);
+  assert.equal(events.filter(event => event.type === 'memory_signals_captured').length, 0,
+    'the referential directive is not itself a safe automatic fact');
+  assert.equal(reviews, 1, 'an explicit memory request still needs completion evidence when automatic capture refuses its reference');
+  assert.equal(events.some(event => event.type === 'completion_review_skipped'
+    && event.data.sourceUserSeq === source.seq && event.data.reason === 'conversation_without_work'), false);
+  assert.notEqual(result.publicPresentation?.status, 'done',
+    'the real terminal cannot certify the requested durable correction without any memory work');
+});
+
+test('durable memory completion obligation does not turn privacy or current-task controls into writes', async (t) => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const { explicitMemoryInstructionFor } = await import('../../memory/auto-capture.js');
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  _setHostObjectiveJudgeForTests(async () => {
+    // Existing lexical policy may review the word "save" even in a privacy
+    // instruction. The regression is an invented memory obligation/write,
+    // not whether that pre-existing optional review runs.
+    return { done: true, reason: 'The user excluded durable memory; acknowledgement suffices.' };
+  });
+  for (const input of [
+    'Remember that the heading is Willow for this task only.',
+    'Remember that the heading is Willow. Do not save this to memory.',
+  ]) {
+    assert.equal(explicitMemoryInstructionFor(input), null);
+    const session = eventlog.createSession({ id: `memory-excluded-control-${++acceptedSerial}`, kind: 'chat' });
+    const model = stubModel([[textMsg('Understood.')]]);
+    const result = await runConversation({
+      sessionId: session.id, input, turnEngine: 'host_v1', maxSteps: 1, maxTurns: 4,
+      judgeCompletion: true,
+      buildAgent: async () => ({ model, instructions: 'base system', tools: [] } as never),
+      makeRunner: () => throwingRunner() as never,
+    });
+    assert.equal(result.publicPresentation?.status, 'done');
+    assert.equal(eventlog.listEvents(session.id, { types: ['tool_called', 'memory_signals_captured'] }).length, 0);
+  }
+});
+
+for (const review of ['failed-open', 'unavailable', 'disabled'] as const) {
+  test(`durable memory completion obligation holds a clear correction when review is ${review}`, async (t) => {
+    const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+    const { explicitMemoryInstructionFor } = await import('../../memory/auto-capture.js');
+    t.after(() => _setHostObjectiveJudgeForTests(null));
+    let reviews = 0;
+    _setHostObjectiveJudgeForTests(async () => {
+      reviews += 1;
+      if (review === 'unavailable') throw new Error('controlled reviewer unavailable');
+      return { done: true, failedOpen: true, reviewFailure: 'unavailable', reason: 'controlled reviewer unavailable' };
+    });
+    const input = 'Small correction for later: the project report heading is Willow. Birch is retired.';
+    assert.ok(explicitMemoryInstructionFor(input));
+    const fixture = acceptJudgedSource(`memory-${review}`, input);
+    // Work attributed to a different source is not evidence for this request.
+    eventlog.appendEvent({ sessionId: fixture.session.id, turn: 0, role: 'tool', type: 'tool_called',
+      data: { sourceUserSeq: fixture.source.seq - 1, tool: 'memory_remember', callId: 'prior-memory' } });
+    const model = scriptedRecordingModel([[textMsg('The heading is Willow now.')]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const result = await runJudgedHost(fixture, agent, review !== 'disabled');
+    assert.equal(reviews, review === 'disabled' ? 0 : 1);
+    assert.equal(model.calls(), 1, 'failed-open review does not invent a new retry allowance');
+    assert.equal(result.terminal?.status, 'blocked');
+    assert.equal(result.terminal?.reason, 'memory_work_unverified');
+    assert.match(String(result.finalOutput), /memory change is still unfinished/);
+    assert.doesNotMatch(String(result.finalOutput), /heading is Willow now/);
+  });
+}
+
+test('durable memory completion obligation retains the existing bounded repair allowance', async (t) => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  let reviews = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    reviews += 1;
+    return { done: false, reason: 'The requested memory change has no saved evidence.' };
+  });
+  const fixture = acceptJudgedSource('memory-bounded-repair',
+    'Correction: the report heading is now Willow, replacing Birch. Remember the correction for future chats in this project only.');
+  const model = scriptedRecordingModel([
+    [textMsg('I saved the project heading as Willow.')],
+    [textMsg('I updated the project memory to use Willow.')],
+    [textMsg('I saved the corrected heading for future chats.')],
+  ]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await runJudgedHost(fixture, agent, true);
+  assert.equal(reviews, 3, 'initial review plus the existing two repair continuations');
+  assert.equal(model.calls(), 3);
+  assert.equal(result.terminal?.status, 'blocked');
+  assert.equal(result.terminal?.reason, 'memory_work_unverified');
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
+});
+
+/** Reproduce the automatic layer's durable source/candidate/fact rows without
+ * starting its scheduler or calling a consolidation model. */
+async function retainAutomaticMemoryForHost(
+  fixture: ReturnType<typeof acceptJudgedSource>,
+  promote: boolean,
+) {
+  const { selectAutoMemoryCandidates, automaticMemoryOriginsForCapture, autoCaptureProvenanceFromAcceptedEvent } = await import('../../memory/auto-capture.js');
+  const { enqueueAutoCaptureCandidates, drainDurableConsolidationCandidates } = await import('../../memory/durable-consolidation.js');
+  const { captureFreshSourceSessionContext } = await import('./source-session-context.js');
+  assert.ok(captureFreshSourceSessionContext(fixture.context), 'the fixture uses the actual frozen accepted task context');
+  const input = { message: fixture.source.data.text as string, sessionId: fixture.session.id,
+    sourceEventId: `user-source:${fixture.source.seq}`,
+    sourceProvenance: autoCaptureProvenanceFromAcceptedEvent(fixture.source) };
+  const candidates = selectAutoMemoryCandidates(input.message, 3);
+  assert.ok(candidates.length > 0);
+  const queued = enqueueAutoCaptureCandidates({ ...input, candidates,
+    origins: automaticMemoryOriginsForCapture(input, candidates) });
+  assert.ok(queued.episodeId && queued.callId);
+  if (promote) {
+    const drained = await drainDurableConsolidationCandidates({ ids: queued.candidateIds,
+      limit: queued.candidateIds.length,
+      resolver: async () => ({decision:'ADD'}),
+      standingReviewer: async (ownerText, _candidate, _mode, origin) => {
+        assert.ok(origin, 'the reviewer receives the immutable origin');
+        assert.equal(ownerText, input.message);
+        assert.equal(origin.source.context?.sourceUserSeq, fixture.source.seq);
+        return {scope:'standing',reason:'controlled source-bound consolidation',destinationDecision:{
+          durability:'standing',claim:origin.claim,destination:'kind_default',destinationSpans:[],
+          reason:'controlled full-source review found no explicit destination instruction',
+        }};
+      },
+    });
+    assert.equal(drained.promoted, queued.candidateIds.length);
+    assert.equal(drained.retried, 0);
+    assert.equal(drained.expired, 0);
+    assert.equal(drained.skipped, 0);
+  }
+  return queued;
+}
+
+test('durable memory completion obligation reuses verified automatic evidence without another save', async (t) => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const { verifiedMemoryConsolidationEvidence } = await import('./durable-memory-intake-receipt.js');
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  let reviews = 0;
+  _setHostObjectiveJudgeForTests(async (_objective, _reply, options) => {
+    reviews += 1;
+    assert.match(options?.toolCallSummary ?? '', /Automatic memory consolidation for THIS accepted request/);
+    assert.match(options?.toolCallSummary ?? '', /"verified":true/);
+    return { done: true, reason: 'The retained memory fact matches this controlled request.',
+      memoryRequirement: { version: 1, kind: 'retain', corrections: [], reason: 'The owner asks to retain a new project heading.' } };
+  });
+  const fixture = acceptJudgedSource('memory-automatic-complete',
+    'Remember that this project report heading is Willow for future chats.');
+  await retainAutomaticMemoryForHost(fixture, true);
+  const before = verifiedMemoryConsolidationEvidence(fixture.context);
+  assert.ok(before?.length && before.every(result => result.verified));
+  const model = scriptedRecordingModel([[textMsg('The project heading is remembered.')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await runJudgedHost(fixture, agent, true);
+  assert.equal(result.terminal, undefined);
+  assert.equal(model.calls(), 1);
+  assert.equal(reviews, 1);
+  assert.deepEqual(verifiedMemoryConsolidationEvidence(fixture.context), before);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
+});
+
+test('durable memory completion obligation holds pending intake without a duplicate-save repair', async (t) => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const { verifiedMemoryConsolidationEvidence } = await import('./durable-memory-intake-receipt.js');
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  let reviews = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    reviews += 1;
+    return { done: true, failedOpen: true, reviewFailure: 'unavailable', reason: 'controlled reviewer unavailable' };
+  });
+  const fixture = acceptJudgedSource('memory-automatic-pending',
+    'Remember that this project report heading is Cedar for future chats.');
+  await retainAutomaticMemoryForHost(fixture, false);
+  const before = verifiedMemoryConsolidationEvidence(fixture.context);
+  assert.ok(before?.length && before.every(result => result.status === 'pending' && !result.verified));
+  const model = scriptedRecordingModel([[textMsg('The project heading is remembered.')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await runJudgedHost(fixture, agent, true);
+  assert.equal(result.terminal?.status, 'blocked');
+  assert.equal(result.terminal?.reason, 'memory_consolidation_pending');
+  assert.match(String(result.finalOutput), /update is still pending/);
+  assert.equal(model.calls(), 1, 'automatic intake never asks the model to repeat its save');
+  assert.equal(reviews, 0, 'pending automatic work holds before optional review can fail open');
+  assert.deepEqual(verifiedMemoryConsolidationEvidence(fixture.context), before);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
+});
+
+test('durable memory completion obligation holds pending Remember exactly wording before a positive judge', async (t) => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const { verifiedMemoryConsolidationEvidence } = await import('./durable-memory-intake-receipt.js');
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  let reviews = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    reviews += 1;
+    return { done: true, reason: 'Controlled positive completion review.' };
+  });
+  const fixture = acceptJudgedSource('memory-exact-marker-pending',
+    'Remember exactly: my smoke marker is MEMTOK-999999. Confirm.');
+  const queued = await retainAutomaticMemoryForHost(fixture, false);
+  const before = verifiedMemoryConsolidationEvidence(fixture.context);
+  assert.ok(before?.length && before.every(result => result.status === 'pending' && !result.verified));
+  const candidateRows = () => memoryDatabase.openMemoryDb().prepare(`
+    SELECT * FROM memory_reflection_candidates WHERE session_id = ? ORDER BY id
+  `).all(fixture.session.id);
+  const rowsBefore = candidateRows();
+  assert.equal(rowsBefore.length, queued.candidateIds.length);
+  const model = scriptedRecordingModel([[textMsg('Confirmed: your smoke marker is MEMTOK-999999.')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await runJudgedHost(fixture, agent, true);
+  assert.equal(result.terminal?.status, 'blocked');
+  assert.equal(result.terminal?.reason, 'memory_consolidation_pending');
+  assert.match(String(result.finalOutput), /update is still pending/);
+  assert.equal(model.calls(), 1, 'pending intake does not ask the model to save again');
+  assert.equal(reviews, 0, 'a positive judge cannot certify pending consolidation');
+  assert.deepEqual(verifiedMemoryConsolidationEvidence(fixture.context), before);
+  assert.deepEqual(candidateRows(), rowsBefore, 'the source retains exactly its original pending candidates');
+  assert.equal(eventlog.listEvents(fixture.session.id, {
+    types: ['tool_called', 'durable_memory_intake_receipt'],
+  }).length, 0, 'pending intake produces neither a duplicate save call nor a completion receipt');
+});
+
+test('durable memory completion obligation does not borrow a synthetic source or separate steer intake', async (t) => {
+  const { _setHostObjectiveJudgeForTests, acceptedObjectiveForSource } = await import('./host-turn-runner.js');
+  const { appendSteerNote } = await import('./steer-notes.js');
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  _setHostObjectiveJudgeForTests(async () => ({ done: true, reason: 'Controlled existing review, not memory fulfillment proof.' }));
+  const machine = acceptJudgedSource('memory-synthetic-control',
+    'Remember that this project heading is Willow.', { synthetic: true });
+  const steered = acceptJudgedSource('memory-steer-identity-control', 'What is seven plus six?');
+  const note = appendSteerNote(steered.session.id, 'Remember that this project heading is Willow for future chats.');
+  eventlog.appendEvent({ sessionId: steered.session.id, turn: 0, role: 'system', type: 'user_steer_note_delivered',
+    data: { noteSeqs: [note.seq] } });
+  assert.match(acceptedObjectiveForSource(steered.context) ?? '', /Remember that this project heading/);
+  const replaced = acceptJudgedSource('memory-replaced-control', 'Remember that this project heading is Willow.');
+  const replacement = appendSteerNote(replaced.session.id, 'Stop that; answer only 13.');
+  eventlog.appendEvent({ sessionId: replaced.session.id, turn: 0, role: 'system', type: 'user_steer_note_delivered',
+    data: { noteSeqs: [replacement.seq] } });
+  for (const fixture of [machine, steered, replaced]) {
+    const model = scriptedRecordingModel([[textMsg('Understood.')]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    if (fixture === machine) {
+      await assert.rejects(() => runJudgedHost(fixture, agent, true),
+        { code: 'accepted_source_missing' }, 'existing model provenance refuses the synthetic source before dispatch');
+      assert.equal(model.calls(), 0);
+      continue;
+    }
+    const result = await runJudgedHost(fixture, agent, true);
+    assert.equal(result.terminal, undefined, 'the new floor cannot assign another carrier to this source');
+    assert.equal(model.calls(), 1);
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called', 'memory_signals_captured'] }).length, 0);
+  }
+});
 
 test('the host explanation survives an enabled completion judge without claiming task completion', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
@@ -9871,11 +10147,11 @@ test('a run settles a work item it finished itself only from its own successful 
   settleFixtureCall({ ...run.context, turn: 1 }, 'settle-failed-call', {
     tool: 'fixture__lookup', execution: 'provider_execution', mutating: false, succeeded: false });
   for (const callIds of [['logical:settle-failed-call'], ['logical:no-such-call']]) {
-    const refused = settleWorkItemFromOwnCalls({ sessionId, item: 'block b', callIds });
+    const refused = settleWorkItemFromOwnCalls({ sessionId, sourceUserSeq: run.context.sourceUserSeq, item: 'block b', callIds });
     assert.equal(refused.ok, false);
     if (!refused.ok) assert.match(refused.reason, /not successful work calls of this run/);
   }
-  const unknown = settleWorkItemFromOwnCalls({ sessionId, item: 'block z', callIds: ['logical:settle-failed-call'] });
+  const unknown = settleWorkItemFromOwnCalls({ sessionId, sourceUserSeq: run.context.sourceUserSeq, item: 'block z', callIds: ['logical:settle-failed-call'] });
   assert.equal(unknown.ok, false);
   if (!unknown.ok) assert.match(unknown.reason, /No work item is named "block z"\. Open items: block b\./);
   assert.equal(summarizeWorkManifests(sessionId)[0]!.remaining, 1, 'nothing was settled by a refusal');
@@ -9883,13 +10159,13 @@ test('a run settles a work item it finished itself only from its own successful 
   // The run's own successful call settles the item, and the run is complete.
   settleFixtureCall({ ...run.context, turn: 1 }, 'settle-own-call', {
     tool: 'fixture__lookup', execution: 'provider_execution', mutating: false, succeeded: true });
-  const settled = settleWorkItemFromOwnCalls({ sessionId, item: 'block b', callIds: ['logical:settle-own-call'] });
+  const settled = settleWorkItemFromOwnCalls({ sessionId, sourceUserSeq: run.context.sourceUserSeq, item: 'block b', callIds: ['logical:settle-own-call'] });
   assert.equal(settled.ok, true, settled.ok ? '' : settled.reason);
   const [manifest] = summarizeWorkManifests(sessionId);
   assert.equal(manifest!.remaining, 0);
   assert.deepEqual(manifest!.items.find((item) => item.id === 'b')!.phases.gather!.evidence,
     [{ kind: 'tool_result', ref: 'logical:settle-own-call' }]);
-  const again = settleWorkItemFromOwnCalls({ sessionId, item: 'b', callIds: ['logical:settle-own-call'] });
+  const again = settleWorkItemFromOwnCalls({ sessionId, sourceUserSeq: run.context.sourceUserSeq, item: 'b', callIds: ['logical:settle-own-call'] });
   assert.equal(again.ok, false, 'a complete item is not settled twice');
 });
 
@@ -12666,4 +12942,39 @@ for (const decision of ['approve', 'reject'] as const) test(`grouped external ap
       approvalId: cards[0]!.approvalId, decision, agent: agent as never, makeRunner: throwingRunner as never });
     assert.equal(mcp.sends(), decision === 'approve' ? 2 : 0, 'repeat click/reopen cannot replay completed effects');
   } finally { mcp.restore(); }
+});
+
+
+test('inline work settlement binds exact accepted source and a single phase, and repairs stale evidence', async () => {
+  const { declareWorkManifest, checkpointWorkItem, summarizeWorkManifest, settleWorkItemFromOwnCalls } = await import('./work-manifest.js');
+  const run = acceptJudgedSource('phase-source-settlement', 'TEST FIXTURE: gather, transform and verify unfamiliar data');
+  const sessionId = run.session.id;
+  const sourceUserSeq = run.context.sourceUserSeq;
+  declareWorkManifest({ sessionId, sourceUserSeq, manifestId: 'transform', contractVersion: 1,
+    phases: [{ id: 'gather' }, { id: 'transform', dependsOn: ['gather'] }, { id: 'verify', dependsOn: ['transform'] }], items: [{ id: 'row-a' }] });
+  settleFixtureCall({ ...run.context, turn: 1 }, 'phase-read', { tool: 'read_file', execution: 'local_execution', mutating: false, succeeded: true });
+  const callIds = ['logical:phase-read'];
+  const settle = (extra: { phase?: string; sourceUserSeq?: number; callIds?: string[] } = {}) => settleWorkItemFromOwnCalls({ sessionId, sourceUserSeq, item: 'row-a', callIds, ...extra });
+  assert.equal(settleWorkItemFromOwnCalls({ sessionId, item: 'row-a', phase: 'gather', callIds }).ok, false, 'no ambient session-wide evidence');
+  assert.equal(settleWorkItemFromOwnCalls({ sessionId, sourceUserSeq, item: 'transform/gather/row-a', phase: 'transform', callIds }).ok, false, 'conflicting selectors cannot settle another phase');
+  const missingPhase = settle();
+  assert.equal(missingPhase.ok, false, 'a read cannot complete all three phases');
+  assert.equal(settle({ phase: 'verify' }).ok, false, 'dependencies must finish first');
+  assert.equal(settle({ phase: 'gather', sourceUserSeq: sourceUserSeq + 100 }).ok, false, 'same session, wrong accepted source');
+  assert.equal(summarizeWorkManifest(sessionId, 'transform')!.completed, 0);
+  assert.equal(settle({ phase: 'gather' }).ok, true);
+  let item = summarizeWorkManifest(sessionId, 'transform')!.items[0]!;
+  assert.equal(item.phases.gather!.status, 'succeeded');
+  assert.equal(item.phases.transform!.status, 'pending');
+  assert.equal(item.phases.verify!.status, 'pending');
+  assert.equal(settle({ phase: 'gather' }).ok, false, 'valid evidence is idempotent');
+  // Historical unredeemable success must not make inline repair impossible.
+  checkpointWorkItem({ sessionId, manifestId: 'transform', contractVersion: 1, phase: 'transform', itemId: 'row-a',
+    status: 'succeeded', evidence: [{ kind: 'tool_result', ref: 'logical:old-unredeemable' }] });
+  settleFixtureCall({ ...run.context, turn: 1 }, 'phase-write', { tool: 'write_file', execution: 'local_execution', mutating: true, succeeded: true });
+  assert.equal(settle({ phase: 'transform', callIds: ['logical:phase-write'] }).ok, true);
+  assert.equal(settle({ phase: 'transform', callIds: ['logical:phase-write'] }).ok, false, 'corrected receipt is retained for replay');
+  item = summarizeWorkManifest(sessionId, 'transform')!.items[0]!;
+  assert.equal(item.phases.verify!.status, 'pending');
+  assert.ok(item.phases.transform!.evidence.some((ref) => ref.ref === 'logical:phase-write'));
 });

@@ -2141,6 +2141,21 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
       })();
     },
   },
+  {
+    // v37 — automatic memory keeps its destination authority per candidate.
+    // NULL is legacy/unknown, never an implicit global destination. Older
+    // readers must refuse this schema rather than drain rows without this
+    // contract. This migration does not repair or reclassify historical facts.
+    version: 37,
+    run: (db: Database.Database) => {
+      db.transaction(() => {
+        const columns = db.prepare('PRAGMA table_info(memory_reflection_candidates)').all() as Array<{ name: string }>;
+        if (!columns.some(column => column.name === 'destination_json')) {
+          db.exec('ALTER TABLE memory_reflection_candidates ADD COLUMN destination_json TEXT');
+        }
+      }).immediate();
+    },
+  },
 ];
 
 /**

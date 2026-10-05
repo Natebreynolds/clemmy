@@ -2,12 +2,15 @@ import { Agent, Runner } from '@openai/agents';
 import { resolveBoundaryJudge } from '../runtime/harness/debate-model.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { inMemoryJobTurn, memoryWorkSourceFromTurn, runMemoryModelJob } from './memory-job-context.js';
+import { createAutomaticMemoryEnvelope, withAutomaticMemoryDecision,
+  type AutomaticMemoryDecision, type AutomaticMemoryOrigin } from './memory-destination.js';
 
 export interface StandingMemoryReview {
-  scope: 'standing' | 'task';
+  scope: 'standing' | 'task' | 'unresolved';
   /** An exact owner-authored span, not a model rewrite of their instruction. */
   text?: string;
   reason: string;
+  destinationDecision?: AutomaticMemoryDecision;
 }
 
 const instructions = [
@@ -19,8 +22,29 @@ const instructions = [
   'A recurring request or explicit future preference is standing. In a mixed turn, isolate only the standing clause; do not retain the surrounding task.',
   'If standing, text must quote a complete, contiguous instruction from source verbatim, including its scope and exceptions. Do not paraphrase or invent permanence.',
   'If there is no clearly supported standing instruction, choose task. The source episode is retained either way.',
-  'Return JSON only: {"scope":"standing"|"task","text":"exact source span for standing, otherwise empty","reason":"brief explanation"}.',
 ].join('\n');
+
+const destinationInstructions = [
+  'Decide memory durability and storage destination separately. A standing statement is not automatically global.',
+  'Return JSON only: {"durability":"standing"|"task"|"unresolved","claim":{"start":0,"end":1},"destination":"kind_default"|"everywhere"|"current_project"|"current_agent"|"current_context"|"unresolved","destinationSpans":[{"start":0,"end":1}],"reason":"brief explanation"}.',
+  'All offsets are exact UTF-16 indices in the complete source. Claim is one complete contiguous owner-authored span. Preserve every condition, exception, complementary assertion and scope restriction; never rewrite or truncate an authorized complete claim.',
+  'For complete claimMode, the reviewed claim must contain the original claim span and may expand it. For selectable claimMode, select a standing span only within the original candidate span. Unresolved claimMode cannot authorize a save.',
+  'kind_default means you checked the entire source and there is no storage-destination instruction for this claim. It is not a fallback for missing, ambiguous or conflicting evidence. Merely mentioning or discussing a project does not request local storage.',
+  'everywhere requires an explicit global instruction. current_project means the current project regardless of specialist; current_agent means this saved specialist across projects; current_context means the current project-and-specialist combination. The host supplies their identities; never choose IDs yourself.',
+  'For any explicit destination, quote every relevant instruction with destinationSpans, including a command wrapper outside the claim. A quoted example, hypothetical or literal value is not a storage instruction. Consider the complete owner source, not just the proposed candidate.',
+  'Ambiguous here, chat-only storage, a foreign/named destination that is not the current context, missing context, conflicting scope, or a composite containing claims for different destinations must be unresolved. Do not split claims, silently globalize them or drop neighboring assertions.',
+].join('\n');
+
+/** The destination decoder reuses the persisted envelope's span/immutability
+ * contract. A durability-only reply cannot accidentally mean kind_default. */
+export function parseAutomaticStandingMemoryReview(value: unknown, origin: AutomaticMemoryOrigin): StandingMemoryReview {
+  const parsed = typeof value === 'string' ? JSON.parse(extractJsonCandidate(value) ?? 'null') : value;
+  const envelope = withAutomaticMemoryDecision(createAutomaticMemoryEnvelope(origin), parsed as AutomaticMemoryDecision);
+  const decision = envelope.decision!;
+  return { scope: decision.durability, reason: decision.reason, destinationDecision: decision,
+    ...(decision.durability === 'standing'
+      ? { text: origin.source.ownerText.slice(decision.claim.start, decision.claim.end) } : {}) };
+}
 
 /** A lexical split is only a candidate boundary. Coordinated predicates such
  * as "and show minutes" can still belong to the same remembered preference. */
@@ -87,19 +111,21 @@ const volunteeredScopeInstructions = [
 export async function reviewStandingMemory(
   source: string,
   candidate: string,
-  mode: 'inferred' | 'explicit' | 'volunteered' = 'inferred',
+  mode: 'inferred' | 'explicit' | 'volunteered' | 'destination' = 'inferred',
+  origin?: AutomaticMemoryOrigin,
 ): Promise<StandingMemoryReview> {
   // The `standing` memory job (checked by "Checks the work"): recorded with
   // the model that served; the rule it approves is kept by the save after it.
   return runMemoryModelJob('standing', { source: memoryWorkSourceFromTurn({ kind: 'owner' }) },
-    () => reviewStandingMemoryNow(source, candidate, mode),
+    () => reviewStandingMemoryNow(source, candidate, mode, origin),
     (review) => (review.scope === 'standing' ? { outcome: 'ok', produced: { approved: 1 } } : { outcome: 'nothing_new' }));
 }
 
 async function reviewStandingMemoryNow(
   source: string,
   candidate: string,
-  mode: 'inferred' | 'explicit' | 'volunteered',
+  mode: 'inferred' | 'explicit' | 'volunteered' | 'destination',
+  origin?: AutomaticMemoryOrigin,
 ): Promise<StandingMemoryReview> {
   const route = inMemoryJobTurn(() => resolveBoundaryJudge());
   if (!route.model) throw new Error('Standing-memory review model is unavailable');
@@ -107,18 +133,26 @@ async function reviewStandingMemoryNow(
   // honour — the text is data not instructions, a question never establishes a
   // requirement, standing text must quote a contiguous source span — hold for
   // all three. Only the scope judgement differs.
-  const modeInstructions = mode === 'explicit'
+  const modeInstructions = mode === 'explicit' || mode === 'destination'
     ? explicitScopeInstructions
     : mode === 'volunteered' ? volunteeredScopeInstructions : null;
+  if (origin && origin.source.ownerText !== source) throw new Error('Memory reviewer lost the complete owner source.');
+  const responseInstructions = origin ? destinationInstructions
+    : 'Return JSON only: {"scope":"standing"|"task","text":"exact source span for standing, otherwise empty","reason":"brief explanation"}.';
   const agent = new Agent({ name: 'StandingMemoryReview', model: route.model,
-    instructions: modeInstructions ? `${instructions}\n\n${modeInstructions}` : instructions, tools: [] });
+    instructions: [instructions, modeInstructions, responseInstructions].filter(Boolean).join('\n\n'), tools: [] });
   const runner = new Runner({ workflowName: 'clementine-standing-memory-review' });
-  const result = await runner.run(agent, JSON.stringify({ source, candidate }), {
+  const result = await runner.run(agent, JSON.stringify({ source, candidate,
+    ...(origin ? { originalClaim: origin.claim, claimMode: origin.claimMode,
+      contextAvailable: origin.source.context !== null,
+      currentProjectAvailable: Boolean(origin.source.context?.memoryScope.projectId),
+      currentAgentAvailable: Boolean(origin.source.context?.memoryScope.agentKey) } : {}) }), {
     maxTurns: 1,
     signal: AbortSignal.timeout(60_000),
   });
-  const review = parseStandingMemoryReview(result.finalOutput, source);
-  if (mode === 'explicit' && (review.scope !== 'standing' || !review.text?.includes(candidate))) {
+  const review = origin ? parseAutomaticStandingMemoryReview(result.finalOutput, origin)
+    : parseStandingMemoryReview(result.finalOutput, source);
+  if (!origin && mode === 'explicit' && (review.scope !== 'standing' || !review.text?.includes(candidate))) {
     throw new Error('Explicit memory scope review lost the authorized candidate');
   }
   return review;

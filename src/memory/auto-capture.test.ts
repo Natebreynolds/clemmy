@@ -129,6 +129,56 @@ test('extractAutoMemoryCandidates keeps explicit remember for personal facts', (
   assert.equal(candidates[0]?.content, 'my preferred contract reviewer is Taylor Example.');
 });
 
+test('referential remember requests preserve intent without automatically promoting the reference', () => {
+  const messages = [
+    'Correction for this project Orchard: the heading is INDIGO MEADOW, replacing COPPER HORIZON. The footnote CHARTER LAMP stays unchanged. Remember the correction only here in this project, and confirm both current conventions.',
+    'The footnote stays CHARTER LAMP. The heading is now INDIGO MEADOW. Remember that change.',
+    'Remember it only here, and confirm both conventions.',
+    'Remember these details for later.',
+    'Remember this:',
+    'Remember this: that correction.',
+    'Remember both conventions for future chats in this project only.',
+    'Remember the correction for future conversations in this project only.',
+    'Remember these current conventions only in this project for future chats.',
+    'Remember for later: the correction.',
+    'Remember for future reference that change.',
+    'Remember the correction. Then draft a report.',
+    'Remember the update, and then review the checklist.',
+    'Remember this only here. Then draft a report.',
+    'Remember that. Then draft a report.',
+  ];
+  for (const message of messages) {
+    assert.ok(explicitMemoryInstructionFor(message), 'the owner still requested memory work');
+    assert.deepEqual(extractAutoMemoryCandidates(message), [], message);
+  }
+});
+
+test('an unresolved reference cannot fall back into the unjudged owner capture queue', () => {
+  const message = 'Remember the correction only here in this project, and confirm both current conventions.';
+  const captured = captureInteractionSignals({ message, sessionId: 'reference-intake', sourceEventId: 'user-source:71',
+    sourceProvenance: { authority: 'accepted_user_input', sessionId: 'reference-intake', eventId: 'reference-event',
+      seq: 71, role: 'user', type: 'user_input_received', data: { text: message } } });
+  assert.deepEqual(captured.candidates, []);
+  assert.deepEqual(captured.queuedCandidateIds ?? [], []);
+  assert.equal(captured.episodeId ?? null, null);
+});
+
+test('reference refusal leaves self-contained facts, quoted literals, reminders and future corrections available', () => {
+  for (const [message, expected] of [
+    ['Remember that the heading is INDIGO MEADOW.', 'the heading is INDIGO MEADOW.'],
+    ['Remember this: the heading is INDIGO MEADOW.', 'the heading is INDIGO MEADOW.'],
+    ['Remember exactly: "that"', 'that'],
+    ['Remember `INDIGO`', 'INDIGO'],
+    ['Remember to check spelling.', 'Remember to check spelling.'],
+    ['Remember the correction is INDIGO, replacing COPPER.', 'the correction is INDIGO, replacing COPPER.'],
+    ['Remember for later: the heading is INDIGO MEADOW.', 'the heading is INDIGO MEADOW.'],
+    ['Small correction for later: the heading is INDIGO MEADOW.', 'Small correction for later: the heading is INDIGO MEADOW.'],
+    ['Small correction for later: the heading is INDIGO MEADOW. Remember the correction.', 'Small correction for later: the heading is INDIGO MEADOW. Remember the correction.'],
+  ]) {
+    assert.equal(extractAutoMemoryCandidates(message!)[0]?.content, expected, message);
+  }
+});
+
 test('extractAutoMemoryCandidates keeps explicit "remember exactly" smoke facts', () => {
   const candidates = extractAutoMemoryCandidates('Remember exactly: my smoke marker is MEMTOK-123456. Confirm.');
 

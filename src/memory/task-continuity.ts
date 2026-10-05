@@ -14,6 +14,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { openEventLog } from '../runtime/harness/eventlog.js';
+import { withoutRetainedWorkCheckpoint } from '../runtime/harness/retained-work-checkpoint.js';
+import { presentationEventFromCompletionData } from '../runtime/harness/turn-outcome.js';
 import {
   strategicMetaActionFromVisibleLabel,
   type StrategicMetaAction,
@@ -716,7 +718,17 @@ function exactPublicDeliveryBinding(input: {
     : null;
   const sourceUserSeq = Number(awaitingData.sourceUserSeq);
   const terminalSourceUserSeq = Number(identity?.sourceUserSeq ?? terminalData.sourceUserSeq);
-  const terminalQuestion = normalizedVisibleText(presentation?.text ?? terminalData.reply);
+  let terminalText = presentation?.text ?? terminalData.reply;
+  // Only typed input questions use the same checkpoint-free text the public
+  // presenter delivers. Other terminal shapes retain the original exact check.
+  try {
+    const typed = presentationEventFromCompletionData(terminalData);
+    if (typed?.identity.sessionId === input.sessionId
+      && typed.status === 'needs_input' && typed.kind === 'question' && typed.needs?.kind === 'input') {
+      terminalText = withoutRetainedWorkCheckpoint(typed.text);
+    }
+  } catch { /* Malformed typed rows never gain public-question normalization. */ }
+  const terminalQuestion = normalizedVisibleText(terminalText);
   const awaitingQuestion = normalizedVisibleText(awaitingData.question);
   const awaitingOptions = Array.isArray(awaitingData.options)
     ? awaitingData.options.map(normalizedVisibleText).filter(Boolean)

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { browserCloseResultMessage, createBrowserViewerLeases, type CloudBrowserResource, type CloudBrowserView } from './cloud-browser.js';
-import { browserViewTarget, startBrowserViewLifecycle, type BrowserBoundView, type BrowserViewClock, type BrowserViewIssue } from './browser-view-lifecycle.js';
+import { browserViewTarget, startBrowserViewLifecycle, type BrowserBoundView, type BrowserViewClock, type BrowserViewDiagnostic, type BrowserViewIssue } from './browser-view-lifecycle.js';
 
 const resource: CloudBrowserResource = {
   id: 'browser-a', conversationId: 'task-a', provider: 'browserbase', providerSessionId: 'provider-a', projectId: 'project-a',
@@ -33,12 +33,14 @@ function fixture(overrides: Partial<CloudBrowserResource> = {}) {
   let frame: BrowserBoundView | null = null;
   const issues: BrowserViewIssue[] = [], shown: BrowserBoundView[] = [], calls: Array<{ resource: CloudBrowserResource; target?: string; id: string }> = [], detached: string[] = [];
   const events: string[] = [];
+  const diagnostics: BrowserViewDiagnostic[] = [];
   const response = (id: string, targetId = 'page-a'): CloudBrowserView => ({ url: 'https://www.browserbase.com/live?token=synthetic', viewerLeaseId: id, targetId,
     controlVersion: requested.controlVersion, expiresAt: new Date(clock.now() + 60_000).toISOString() });
   const behavior = {
     view: async (_resource: CloudBrowserResource, targetId: string | undefined, id: string): Promise<CloudBrowserView> => response(id, targetId),
     remove: async (_id: string): Promise<void> => undefined,
     detach: async (): Promise<CloudBrowserResource> => requested,
+    diagnostic: (entry: BrowserViewDiagnostic): void => { diagnostics.push(entry); },
   };
   const leases = createBrowserViewerLeases({ detach: async (_resource, id) => {
     assert.notEqual(frame?.viewerLeaseId, id, 'iframe must be removed before acknowledgment');
@@ -50,8 +52,9 @@ function fixture(overrides: Partial<CloudBrowserResource> = {}) {
     show: (value) => { frame = value; shown.push(value); events.push(`show:${value.viewerLeaseId}`); },
     remove: async (id) => { await behavior.remove(id); if (frame?.viewerLeaseId === id) frame = null; events.push(`remove:${id}`); },
     issue: (issue) => issues.push(issue),
+    diagnostic: (entry) => behavior.diagnostic(entry),
   });
-  return { clock, requested, behavior, response, leases, start, calls, detached, shown, issues, events,
+  return { clock, requested, behavior, response, leases, start, calls, detached, shown, issues, events, diagnostics,
     frame: () => frame, active: (value: boolean) => { active = value; }, busy: (value: boolean) => { busy = value; } };
 }
 
@@ -94,6 +97,91 @@ test('disconnect storms get one automatic reconnect per binding and cannot keep 
   await t.clock.advance(1000); assert.equal(t.calls.length, 2);
   life.disconnected('lease-2'); await t.clock.advance(180_000);
   assert.equal(t.calls.length, 2); assert.deepEqual(t.issues, ['connection']); assert.equal(t.frame(), null); await life.stop();
+});
+
+test('an already-expired disconnect renews even when its message runs before the expiry timer', async () => {
+  const t = fixture(); const life = t.start(); await settle();
+  for (let i = 1; i <= 3; i++) {
+    // Simulate a delayed timer task: the message wins task scheduling, but the
+    // clock already proves this exact capability expired.
+    t.clock.time += 60_000;
+    life.disconnected(`lease-${i}`); life.disconnected(`lease-${i}`); await settle();
+    assert.equal(t.calls.length, i + 1);
+  }
+  assert.deepEqual(t.issues, []);
+  assert.equal(t.diagnostics.filter(row => row.event === 'expired' && row.trigger === 'expired_disconnect').length, 3);
+  assert.ok(t.diagnostics.every(row => row.reconnectCount === 0));
+  await life.stop(); await t.clock.advance(120_000); assert.equal(t.calls.length, 4);
+});
+
+test('expiry does not restore a consumed reconnect allowance and an early disconnect still fails boundedly', async () => {
+  const t = fixture(); const life = t.start(); await settle();
+  life.disconnected('lease-1'); await t.clock.advance(1000); assert.equal(t.calls.length, 2);
+  t.clock.time += 60_000;
+  life.disconnected('lease-2'); await settle(); assert.equal(t.calls.length, 3);
+  await t.clock.advance(59_999);
+  life.disconnected('lease-3'); await t.clock.advance(120_000);
+  assert.equal(t.calls.length, 3); assert.deepEqual(t.issues, ['connection']); assert.equal(t.frame(), null);
+  assert.equal(t.diagnostics.filter(row => row.event === 'reconnect_scheduled').length, 1);
+  await life.stop();
+});
+
+test('disconnect messages caused by removing expired or stopped frames cannot spend retries', async () => {
+  const t = fixture(); const life = t.start(); await settle();
+  t.behavior.remove = async (id) => { life.disconnected(id); };
+  await t.clock.advance(120_000); assert.equal(t.calls.length, 3);
+  life.disconnected('lease-1'); await settle(); assert.equal(t.calls.length, 3);
+  await life.stop(); await t.clock.advance(120_000);
+  assert.equal(t.calls.length, 3); assert.deepEqual(t.issues, []);
+  assert.equal(t.diagnostics.filter(row => row.event === 'reconnect_scheduled').length, 0);
+});
+
+test('expired disconnect retains a busy human lease until cleanup acknowledges its return', async () => {
+  const t = fixture({ controller: 'human' }); const life = t.start(); await settle(); t.busy(true);
+  t.clock.time += 60_000; life.disconnected('lease-1'); await settle();
+  assert.equal(t.frame(), null); assert.equal(t.calls.length, 1); assert.equal(t.detached.length, 0);
+  const ack = deferred<CloudBrowserResource>(); t.behavior.detach = () => ack.promise;
+  t.busy(false); life.resume(); await settle(); assert.equal(t.calls.length, 1);
+  ack.resolve({ ...t.requested, controlVersion: 2 }); await settle();
+  assert.equal(t.calls.length, 1); assert.deepEqual(t.issues, ['binding']);
+  const confirmed = t.diagnostics.find(row => row.event === 'detach_acknowledged' && row.viewerLeaseId === 'lease-1');
+  assert.equal(confirmed?.detachAcknowledged, true); assert.equal(confirmed?.trigger, 'expired_disconnect');
+  await life.stop();
+});
+
+test('lifecycle trace retains safe refusal and cleanup facts without raw provider fields', async () => {
+  const t = fixture(); const life = t.start(); await settle();
+  const accepted = t.diagnostics.find(row => row.event === 'mint_accepted');
+  assert.equal(accepted?.viewerLeaseId, 'lease-1'); assert.equal(accepted?.controlVersion, 1);
+  assert.equal(accepted?.targetId, 'page-a'); assert.equal(accepted?.expiresAt, t.clock.now() + 60_000);
+  const secret = 'never-record-this-provider-payload';
+  t.behavior.view = async () => { throw Object.assign(new Error(secret), {
+    status: 409, body: { code: 'provider_limit', effect: 'none', error: secret, url: `https://www.browserbase.com/live?token=${secret}` },
+    credential: secret,
+  }); };
+  await t.clock.advance(60_000);
+  const refused = t.diagnostics.find(row => row.event === 'mint_failed');
+  assert.equal(refused?.trigger, 'expiry'); assert.equal(refused?.status, 409);
+  assert.equal(refused?.errorCode, 'provider_limit'); assert.equal(refused?.effect, 'none');
+  const ackIndex = t.diagnostics.findIndex(row => row.event === 'detach_acknowledged' && row.viewerLeaseId === 'lease-1');
+  const mintIndex = t.diagnostics.findIndex(row => row.event === 'mint_requested' && row.viewerLeaseId === 'lease-2');
+  assert.ok(ackIndex >= 0 && mintIndex > ackIndex);
+  assert.ok(!JSON.stringify(t.diagnostics).includes(secret));
+  assert.ok(!JSON.stringify(t.diagnostics).includes('https:'));
+  assert.ok(!JSON.stringify(t.diagnostics).includes('synthetic'));
+  assert.deepEqual(t.issues, ['connection']); await life.stop();
+});
+
+test('unknown diagnostic strings and a broken diagnostic sink cannot affect lease authority', async () => {
+  const t = fixture({ id: 'https://example.com/private?secret=hidden', focusTargetId: 'https://example.com/hidden' });
+  t.behavior.view = async () => { throw Object.assign(new Error('hidden'), { status: 'hidden', body: { code: 'hidden', effect: 'hidden' } }); };
+  const life = t.start(); await t.clock.advance(180_000);
+  assert.equal(t.calls.length, 2); assert.deepEqual(t.issues, ['connection']);
+  assert.ok(t.diagnostics.every(row => row.resourceId === null && row.targetId === null && row.status === null && row.errorCode === null && row.effect === null));
+  assert.ok(!JSON.stringify(t.diagnostics).includes('hidden')); await life.stop();
+  const noisy = fixture(); noisy.behavior.diagnostic = () => { throw new Error('broken sink'); };
+  const healthy = noisy.start(); await noisy.clock.advance(60_000);
+  assert.equal(noisy.calls.length, 2); assert.deepEqual(noisy.issues, []); await healthy.stop();
 });
 
 test('hidden or closed view cancels renewal and a late response is detached without ever attaching', async () => {

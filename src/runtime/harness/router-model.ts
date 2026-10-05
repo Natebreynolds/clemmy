@@ -31,6 +31,7 @@ import { ClaudeModelProvider, claudeHarnessModelSupportsTools } from './claude-m
 import { resolveProvider } from './model-wire-registry.js';
 import { codexModelsAvailable, claudeModelsAvailable } from './model-role-options.js';
 import { withModelFallback, type FallbackTarget } from './fallback-model.js';
+import { isPinnedWorkerModel } from './pinned-worker-model.js';
 import { maybeWrapWithFaultInjection } from './fault-inject.js';
 import { harnessRunContextStorage } from './brackets.js';
 import type { ByoBackendConfig } from '../../config.js';
@@ -230,6 +231,10 @@ export class RouterModelProvider implements ModelProvider {
 
   getModel(modelName?: string): Model {
     const primary = this.resolvePrimary(modelName);
+    const exactWorker = typeof modelName === 'string' && isPinnedWorkerModel(modelName);
+    if (exactWorker && primary.label !== modelName) {
+      throw new Error(`The saved agent requires ${modelName}, but that exact model is unavailable. No substitute was started.`);
+    }
     // Dev-only fault injection (no-op unless CLEMMY_FAULT_INJECT_BRAIN names this
     // provider): wrap the resolved primary so a live transient failure can be
     // forced to prove cross-brain fallover. The lazily-built fallover targets in
@@ -274,7 +279,7 @@ export class RouterModelProvider implements ModelProvider {
       }),
     }));
     let resolved: Model;
-    if (!brainFalloverEnabled()) {
+    if (exactWorker || !brainFalloverEnabled()) {
       // The kill-switch disables cross-brain switching, not the completion
       // invariant. Keep the lone primary behind the same graph boundary so a
       // reasoning-only completion becomes a typed failure instead of an

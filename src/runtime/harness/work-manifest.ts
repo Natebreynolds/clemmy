@@ -1,4 +1,6 @@
 import { appendEvent, getSession, listEvents, openEventLog, type EventRow } from './eventlog.js';
+import { acceptedTaskIdFor } from './attempt-identity.js';
+import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 
 export type WorkItemStatus =
   | 'pending'
@@ -741,16 +743,18 @@ export type SettleOwnWorkItemResult =
  * One item of a run's work list, settled from the run's own calls when the
  * run did the item itself instead of through a worker. Every cited call must
  * be a business call of this run that settled succeeded; nothing else counts
- * as evidence. The item's open phases under the current contract take those
- * calls as their evidence. An item finished outside the work list otherwise
- * stays open, and the run reads as unfinished however complete it is.
+ * as evidence. One explicitly identified phase takes those calls as its
+ * evidence; one receipt must never silently complete all phases. An item
+ * finished outside the work list otherwise stays open, and the run reads as
+ * unfinished however complete it is.
  */
 export function settleWorkItemFromOwnCalls(input: {
   sessionId: string;
   item: string;
+  phase?: string;
   callIds: readonly string[];
   note?: string;
-  /** Exact accepted user row of the run. */
+  /** Exact accepted user row of the run. Missing identity cannot settle work. */
   sourceUserSeq?: number;
   /** Items this run still owes, as its own run_worker declarations named
    *  them, including declarations refused before any worker started. */
@@ -758,6 +762,10 @@ export function settleWorkItemFromOwnCalls(input: {
 }): SettleOwnWorkItemResult {
   const wanted = input.item.trim().toLowerCase();
   if (!wanted) return { ok: false, reason: 'Name the work item to settle.' };
+  if (!Number.isSafeInteger(input.sourceUserSeq) || (input.sourceUserSeq ?? 0) <= 0) {
+    return { ok: false, reason: 'An exact accepted request is required to settle work. Nothing was settled.' };
+  }
+  const sourceUserSeq = input.sourceUserSeq!;
   // An item answers to its id, label and aliases, and to the full
   // "work list/phase/item" name the run is shown when items are still owed.
   const findMatches = () => summarizeWorkManifests(input.sessionId).flatMap((manifest) => manifest.items
@@ -800,7 +808,17 @@ export function settleWorkItemFromOwnCalls(input: {
   }
   if (matches.length > 1) return { ok: false, reason: `"${input.item.trim()}" names more than one work item; use its exact id.` };
   const { manifest, item } = matches[0]!;
-  if (item.complete) return { ok: false, reason: `"${item.label || item.id}" is already complete.` };
+  const pathPhase = manifest.phases.find((phase) =>
+    `${manifest.manifestId}/${phase.id}/${item.id}`.toLowerCase() === wanted)?.id;
+  if (pathPhase && input.phase?.trim() && input.phase.trim() !== pathPhase) {
+    return { ok: false, reason: 'The item path and phase name disagree. Nothing was settled.' };
+  }
+  const namedPhase = input.phase?.trim() || pathPhase;
+  const phase = namedPhase ? manifest.phases.find((entry) => entry.id === namedPhase)
+    : manifest.phases.length === 1 ? manifest.phases[0] : undefined;
+  if (!phase) return { ok: false, reason: `Name the one phase these calls prove for "${item.label || item.id}": ${manifest.phases.map((entry) => entry.id).join(', ')}. Nothing was settled.` };
+  const unmet = phase.dependsOn.filter((id) => item.phases[id]?.status !== 'succeeded');
+  if (unmet.length > 0) return { ok: false, reason: `Settle the required earlier phases first: ${unmet.join(', ')}. Nothing was settled.` };
   const callIds = [...new Set(input.callIds.map((id) => id.trim()).filter(Boolean))].slice(0, 20);
   if (callIds.length === 0) {
     const own = ownSuccessfulWorkCalls(input.sessionId, input.sourceUserSeq);
@@ -815,20 +833,32 @@ export function settleWorkItemFromOwnCalls(input: {
   const read = openEventLog().prepare(`
     SELECT logical_tool_call_id AS id, outcome_kind AS outcome, business_call AS business
       FROM logical_call_settlements
-     WHERE session_id = ? AND logical_tool_call_id = ?
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
   `);
   for (const id of callIds) {
-    const row = read.get(input.sessionId, id) as { id: string; outcome: string; business: number } | undefined;
+    const row = read.get(input.sessionId, sourceUserSeq, id) as { id: string; outcome: string; business: number } | undefined;
     if (row) settled.set(id, { outcome: row.outcome, business: row.business });
   }
   const unproven = callIds.filter((id) => {
     const row = settled.get(id);
-    return !row || row.outcome !== 'succeeded' || row.business !== 1;
+    return !row || row.outcome !== 'succeeded' || row.business !== 1
+      || redeemSuccessfulSettlementResultForHost({
+        sessionId: input.sessionId, sourceUserSeq,
+        acceptedTaskId: acceptedTaskIdFor(input.sessionId, sourceUserSeq), logicalToolCallId: id,
+      }).status !== 'ok';
   });
   if (unproven.length > 0) {
     return { ok: false, reason: `These calls are not successful work calls of this run: ${unproven.join(', ')}. Nothing was settled.` };
   }
-  const phases = manifest.phases.map((phase) => phase.id).filter((phase) => item.phases[phase]?.status !== 'succeeded');
+  const previous = item.phases[phase.id];
+  if (previous?.status === 'succeeded' && previous.evidence.length > 0
+    && previous.evidence.some((ref) => ref.kind !== 'tool_result' || redeemSuccessfulSettlementResultForHost({
+      sessionId: input.sessionId, sourceUserSeq,
+      acceptedTaskId: acceptedTaskIdFor(input.sessionId, sourceUserSeq), logicalToolCallId: ref.ref,
+    }).status === 'ok')) {
+    return { ok: false, reason: `"${item.label || item.id}" (${phase.id}) is already complete.` };
+  }
+  const phases = [phase.id];
   const evidence = callIds.map((id) => ({ kind: 'tool_result' as const, ref: id }));
   for (const phase of phases) {
     checkpointWorkItem({

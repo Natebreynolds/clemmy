@@ -113,7 +113,9 @@ export type WorkerAgentRequest =
 
 /**
  * One decision per run_worker call: which saved agent the workers run as, and
- * which model that asks for when the caller named none. An unknown agent is
+ * which model the packet proposes. A different packet model is not an owner
+ * override: routeWorkerModel must check it against the exact accepted source
+ * before replacing pinnedModel. An unknown agent is
  * refused before any worker starts, with the saved names listed, the same way
  * an unknown model is.
  */

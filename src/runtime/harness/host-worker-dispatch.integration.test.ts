@@ -117,7 +117,13 @@ for (const variant of ['boundary', 'full', 'partial', 'uniform', 'recover'] as c
           const failed = variant === 'uniform'
             || (variant === 'partial' && packet.item === 'audit-8')
             || (variant === 'recover' && packet.item === 'audit-8' && children.filter((item) => item === 'audit-8').length === 1);
-          const text = failed ? `ERROR: fixture child read failed for ${packet.item}.` : `ITEM=${packet.item} NONCE=fixture-${packet.item}`;
+          // A normal-looking worker account cannot turn its failed required
+          // read into a retained success. Other variants retain the explicit
+          // ERROR envelope to cover both ways a child can fail.
+          const text = failed
+            ? variant === 'partial' ? `I completed the requested read for ${packet.item}.`
+              : `ERROR: fixture child read failed for ${packet.item}.`
+            : `ITEM=${packet.item} NONCE=fixture-${packet.item}`;
           return { responseId: `child-${packet.item}-${childSteps}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
             output: childSteps === 1
               ? [{ type: 'function_call', callId: `child-read-${packet.item}`, name: 'read_file', arguments: JSON.stringify({ path: failed ? `${noncePath}.missing` : noncePath, max_chars: null }) }]
@@ -211,6 +217,17 @@ for (const variant of ['boundary', 'full', 'partial', 'uniform', 'recover'] as c
     assert.equal(receipts.length, variant === 'recover' ? 9 : 8);
     const incomplete = variant === 'partial' || variant === 'uniform';
     assert.equal(receipts.filter((receipt) => receipt.data.ok === true).length, variant === 'partial' ? 7 : variant === 'uniform' ? 0 : 8);
+    if (variant === 'partial') {
+      const rejected = receipts.find((receipt) => receipt.data.item === 'audit-8');
+      assert.equal(rejected?.data.ok, false, 'the durable worker result must reject unsupported success prose');
+      assert.equal(rejected?.data.retryRequiresReconciliation, false, 'a failed read adds no effect that would block a narrow retry');
+      const started = eventlog.listEvents(session.id, { types: ['worker_started'] })
+        .find((event) => event.data.item === 'audit-8' && typeof event.data.childSessionId === 'string');
+      assert.ok(started, 'the failed item has exact child/source identity');
+      const childAttempt = eventlog.getRunAttemptBySourceUserSeq(
+        String(started.data.childSessionId), Number(started.data.childSourceUserSeq));
+      assert.equal(childAttempt?.status, 'failed', 'child attempt agrees with the evidence-qualified parent receipt');
+    }
     if (incomplete) {
       assert.equal(outcome.terminal?.status, 'blocked');
       assert.equal(outcome.terminal?.reason, 'local_work_incomplete');

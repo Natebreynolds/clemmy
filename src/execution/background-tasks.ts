@@ -75,6 +75,7 @@ import { resolveWriteEvidence } from '../runtime/harness/work-report.js';
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
 import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent, listEvents as listHarnessEventsForRefute, getSessionTokensUsed } from '../runtime/harness/eventlog.js';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
+import { resolveBackgroundBudgetGrant, type BackgroundBudgetGrant } from './background-budget-grant.js';
 import { budgetLineFor, resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from '../runtime/harness/run-token-budget.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
@@ -307,6 +308,8 @@ export interface BackgroundTaskRecord {
    *  off until the limit plausibly cleared. */
   transientRetry?: { attempts: number; notBefore: string; lastError: string };
   maxMinutes: number;
+  /** Runtime-owned allowance, retained across automatic retries and restarts. */
+  budgetGrant?: BackgroundBudgetGrant;
   /** Stage 4 — optional per-task run token budget (UNCACHED tokens, soft
    *  ceiling; parks awaiting_continue when the window is exhausted). Absent
    *  ⇒ the preset/env default applies. */
@@ -2438,18 +2441,33 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
     if (!observed || observed.status !== 'pending') return null;
     backgroundTaskStartCasHookForTests();
   }
-  const updated = updateBackgroundTaskWhere(id, (task) => task.status === 'pending', {
-    status: 'running',
-    startedAt: nowIso(),
-    error: undefined,
-    outcomeSnapshot: undefined,
-    pendingApprovalId: undefined,
-    // Clear the parked-question MARKER but preserve inputResolution — the drain
-    // reads inputResolution to resume with the answer (mirrors how
-    // approvalResolution survives markBackgroundTaskRunning).
-    pendingQuestionId: undefined,
-    pendingQuestion: undefined,
-    pendingQuestionOptions: undefined,
+  const updated = updateBackgroundTaskWhere(id, (task) => task.status === 'pending', (task) => {
+    const ownerGrant = (task.continueResolution && task.continueResolution.auto !== true)
+      || task.inputResolution || task.approvalResolution;
+    const allowance = resolveBackgroundBudgetGrant({
+      retained: task.budgetGrant, runSessionId: task.runSessionId,
+      requiresRetainedGrant: Boolean(task.transientRetry) || (!ownerGrant && Boolean(task.startedAt || task.completedAt
+        || task.continueResolution?.auto)),
+      nowMs: Date.now(), maxMinutes: task.maxMinutes,
+      tokensUsed: getSessionTokensUsed(task.runSessionId),
+      tokenCeiling: resolveRunTokenCeiling({ override: task.maxTokens, budget: getHarnessBudgetSettings() }),
+    });
+    return {
+      // Commit the initial grant with the running claim: even a process death
+      // before provider dispatch cannot turn the next activation into a new grant.
+      ...('grant' in allowance ? { budgetGrant: allowance.grant } : {}),
+      status: 'running',
+      startedAt: nowIso(),
+      error: undefined,
+      outcomeSnapshot: undefined,
+      pendingApprovalId: undefined,
+      // Clear the parked-question MARKER but preserve inputResolution — the drain
+      // reads inputResolution to resume with the answer (mirrors how
+      // approvalResolution survives markBackgroundTaskRunning).
+      pendingQuestionId: undefined,
+      pendingQuestion: undefined,
+      pendingQuestionOptions: undefined,
+    };
   });
   // The worker has the run. Recorded as a durable fact rather than a ladder
   // rung because it races the foreground's own terminal and neither order is
@@ -5177,6 +5195,7 @@ function reattachBackgroundTaskInPlace(
     outcomeSnapshot: undefined,
     resumeCount: (latest.resumeCount ?? 0) + 1,
     restartRecovery,
+    ...(mode !== 'automatic_restart' ? { budgetGrant: undefined, transientRetry: undefined } : {}),
     continueResolution: {
       queuedAt: nowIso(),
       reason,
@@ -5311,6 +5330,10 @@ export function queueBackgroundTaskApprovalResolution(approvalId: string, approv
     latest.status === 'awaiting_approval' && latest.pendingApprovalId === approvalId
   ), {
     status: 'pending',
+    // An accepted owner resolution opens the existing new-drain window; time
+    // waiting for the human must not expire its resumed activation.
+    budgetGrant: undefined,
+    transientRetry: undefined,
     pendingApprovalId: approvalId,
     approvalResolution: {
       approvalId,
@@ -5359,6 +5382,10 @@ export function queueBackgroundTaskInputResolution(
     latest.status === 'awaiting_input' && latest.pendingQuestionId === questionId
   ), {
     status: 'pending',
+    // An accepted owner resolution opens the existing new-drain window; time
+    // waiting for the human must not expire its resumed activation.
+    budgetGrant: undefined,
+    transientRetry: undefined,
     pendingQuestionId: questionId,
     inputResolution: {
       questionId,
@@ -5432,6 +5459,7 @@ export function queueBackgroundTaskContinue(
     latest.status === 'awaiting_continue' && latest.resumedIntoTaskId === undefined
   ), (latest) => ({
     status: 'pending',
+    ...(!opts.auto ? { budgetGrant: undefined, transientRetry: undefined } : {}),
     continueResolution: {
       queuedAt: now,
       reason: clean(opts.reason ?? latest.error ?? 'Continue requested.', 700),
@@ -5764,6 +5792,8 @@ export async function reconcileSettledBackgroundTaskInputs(): Promise<number> {
   return reconciled;
 }
 
+class BackgroundTaskBudgetExpiredError extends AgentRuntimeCancelledError {}
+
 export async function processBackgroundTasks(assistant: ClementineAssistant, limit?: number): Promise<number> {
   try {
     backgroundDrainsInFlight += 1;
@@ -5814,26 +5844,6 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	    processed += 1;
 	    logger.info({ taskId: task.id, title: task.title }, 'Background task started');
 
-	    // Work that came from a project with nobody named: ask once which of
-	    // the agents assigned there it belongs to, and keep the answer.
-	    if (task.delegation?.agentChoice === 'open') {
-	      try {
-	        const { settleOpenAgentChoice } = await import('../projects/inherited-delegation.js');
-	        const settled = await settleOpenAgentChoice(task);
-	        const updated = updateBackgroundTaskWhere(task.id, (current) => current.status === 'running', {
-	          delegation: settled.delegation,
-	          ...(settled.model ? { model: settled.model } : {}),
-	        });
-	        if (updated) {
-	          task = updated;
-	          ensureDelegatedRunSession(task);
-	          if (task.delegation?.agentId) publishDelegatedTaskState(task, 'started');
-	        }
-	      } catch (error) {
-	        logger.warn({ taskId: task.id, error: error instanceof Error ? error.message : String(error) },
-	          'Could not decide who a task belongs to; it runs in its project without an agent');
-	      }
-	    }
 
 	    // Launching a background task authorizes its reversible work. Exact
 	    // irreversible sends remain owned by the concrete approval card because
@@ -5887,8 +5897,73 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      metadata: { status: 'running' },
 	    });
 
+        const parkBudgetOrSettleCancellation = (reason: string, progress: string, message: string): boolean => {
+          const parked = markBackgroundTaskAwaitingContinue(task.id, reason, progress);
+          if (parked) {
+            finishRun(run.id, { status: 'cancelled', message });
+            return true;
+          }
+          const latest = getBackgroundTask(task.id);
+          if (latest?.status === 'cancelling' || latest?.status === 'aborted') {
+            markBackgroundTaskFailed(task.id, latest.cancellationReason ?? latest.error ?? 'Cancelled by user.', 'aborted');
+            finishRun(run.id, { status: 'cancelled', message: `Background task ${task.id} was cancelled at a safe checkpoint.` });
+            clearLedger(task.runSessionId);
+            return false;
+          }
+          throw new Error(`Background task ${task.id} lost its budget-pause transition; latest durable state is ${latest?.status ?? 'missing'}.`);
+        };
+
 	    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+        let budgetDeadlineRequested = false;
 	    try {
+          // Persist before any provider activation. A legacy automatic retry
+          // without a provable grant parks instead of silently resetting spend.
+          const allowance = resolveBackgroundBudgetGrant({
+            retained: task.budgetGrant, runSessionId: task.runSessionId, requiresRetainedGrant: true,
+            nowMs: Date.now(), maxMinutes: task.maxMinutes,
+            tokensUsed: getSessionTokensUsed(task.runSessionId),
+            tokenCeiling: resolveRunTokenCeiling({ override: task.maxTokens, budget: getHarnessBudgetSettings() }),
+          });
+          if ('reason' in allowance) {
+            parkBudgetOrSettleCancellation('unverified task budget', allowance.reason, allowance.reason);
+            continue;
+          }
+          const { wallClockDeadlineMs, runTokenBaseline, runTokenCeiling } = allowance.grant;
+          const runTokenWindowExhausted = (): boolean => runTokenBudgetEnforcementEnabled()
+            && runTokenCeiling > 0 && getSessionTokensUsed(task.runSessionId) - runTokenBaseline >= runTokenCeiling;
+          const stopAtExpiredDeadline = (): void => {
+            // This is a budget pause before dispatch, not a user Stop. Do not
+            // enter cancelling: its guard must keep refusing resumable parks.
+            if (Date.now() >= wallClockDeadlineMs) throw new BackgroundTaskBudgetExpiredError();
+          };
+          stopAtExpiredDeadline();
+          if (runTokenWindowExhausted()) {
+            parkBudgetOrSettleCancellation('token budget', 'The task token budget is spent. Progress is saved; choose Continue to grant a new window.',
+              'Task token budget spent before provider retry; progress preserved.');
+            continue;
+          }
+	      // Work that came from a project with nobody named: ask once which of
+	      // the agents assigned there it belongs to, and keep the answer.
+	      if (task.delegation?.agentChoice === 'open') {
+	        try {
+	          const { settleOpenAgentChoice } = await import('../projects/inherited-delegation.js');
+	          const settled = await settleOpenAgentChoice(task);
+	          const updated = updateBackgroundTaskWhere(task.id, (current) => current.status === 'running', {
+	            delegation: settled.delegation,
+	            ...(settled.model ? { model: settled.model } : {}),
+	          });
+	          if (updated) {
+	            task = updated;
+	            ensureDelegatedRunSession(task);
+	            if (task.delegation?.agentId) publishDelegatedTaskState(task, 'started');
+	          }
+	        } catch (error) {
+	          logger.warn({ taskId: task.id, error: error instanceof Error ? error.message : String(error) },
+	            'Could not decide who a task belongs to; it runs in its project without an agent');
+	        }
+	      }
+
+
 	      let toolCount = 0;
 	      let latestActivitySummary = '';
 	      let lastProgressCheckInAt = Date.now();
@@ -6279,24 +6354,13 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      // only after that exact text has been built; a newer revision racing
 	      // this transition remains pending for the next boundary.
 	      task = markPendingContractRevisionApplied(task);
-	      const wallClockDeadlineMs = Date.now() + task.maxMinutes * 60_000;
-	      // Stage 4 — aggregate run token budget: one durable window per drain
-	      // iteration. The baseline is captured HERE (not per auto-continue), so
-	      // the ceiling genuinely aggregates across the whole unattended chain;
-	      // a user continue re-queues the task and a NEW drain iteration opens a
-	      // fresh window structurally (no counter reset, no re-park loop).
-	      const runTokenCeiling = resolveRunTokenCeiling({ override: task.maxTokens, budget: getHarnessBudgetSettings() });
-	      const runTokenBaseline = getSessionTokensUsed(task.runSessionId);
-	      const runTokenWindowExhausted = (): boolean =>
-	        runTokenBudgetEnforcementEnabled()
-	        && runTokenCeiling > 0
-	        && (getSessionTokensUsed(task.runSessionId) - runTokenBaseline) >= runTokenCeiling;
 	      let autoContinueAttempts = 0;
 	      let toolCountAtLastCap = 0; // Wave 3: tool activity at each budget cycle
 	      let response: AssistantResponse;
 	      let contractSuperseded = false;
 	      let activationStartedAt = nowIso();
 	      while (true) {
+            stopAtExpiredDeadline();
 	        // CANON-ONE-LOOP: background tasks (incl. the mobile chat lane) run the
 	        // gated harness loop; the test executor above defaults to this bridge.
 	        // The shouldCancel
@@ -6331,16 +6395,10 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          displayMessage: acceptedUserMessage,
 	          runId: run.id,
 	          shouldCancel: () => {
-	            if (Date.now() > wallClockDeadlineMs) {
-	              const cancelling = updateBackgroundTaskWhere(task.id, (latest) => latest.status === 'running', {
-	                  status: 'cancelling',
-	                  cancellationRequestedAt: new Date().toISOString(),
-	                  cancellationReason: `Exceeded soft max runtime of ${task.maxMinutes} minutes. Re-queue with a higher cap to continue.`,
-	              });
-	              if (cancelling) return true;
-	              const latest = getBackgroundTask(task.id);
-	              return !latest || latest.status !== 'running';
-	            }
+                if (Date.now() >= wallClockDeadlineMs) {
+                  budgetDeadlineRequested = true;
+                  return true;
+                }
 	            const latest = getBackgroundTask(task.id);
 	            return latest?.status === 'cancelling' || latest?.status === 'aborted';
 	          },
@@ -6580,19 +6638,15 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      // mid-work, discarding a resumable run). The granted minutes are spent
 	      // — stop spending — but the work is preserved and one resume/"continue"
 	      // picks it back up. A genuine user cancel still aborts.
-	      const timeBudgetPause = cancelled
-	        && /Exceeded soft max runtime/i.test(latestTask?.cancellationReason ?? '');
+	      const timeBudgetPause = (error instanceof BackgroundTaskBudgetExpiredError || budgetDeadlineRequested)
+          && latestTask?.status === 'running';
 	      if (timeBudgetPause) {
-	        markBackgroundTaskAwaitingContinue(
-	          task.id,
-	          `time budget (${task.maxMinutes} minutes)`,
-	          `Paused at its ${task.maxMinutes}-minute time budget. Progress is saved — resume (or reply "continue") to keep going; finished work stays done.`,
-	        );
-	        finishRun(run.id, {
-	          status: 'cancelled',
-	          message: `Paused at its ${task.maxMinutes}-minute time budget; resumable with progress preserved.`,
-	        });
-	        logger.info({ taskId: task.id, maxMinutes: task.maxMinutes }, 'Background task paused at its time budget (resumable)');
+            const parked = parkBudgetOrSettleCancellation(
+              `time budget (${task.maxMinutes} minutes)`,
+              `Paused at its ${task.maxMinutes}-minute time budget. Progress is saved — resume (or reply "continue") to keep going; finished work stays done.`,
+              `Paused at its ${task.maxMinutes}-minute time budget; resumable with progress preserved.`,
+            );
+            if (parked) logger.info({ taskId: task.id, maxMinutes: task.maxMinutes }, 'Background task paused at its time budget (resumable)');
 	        continue;
 	      }
 	      markBackgroundTaskFailed(

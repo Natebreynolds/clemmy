@@ -238,3 +238,19 @@ test('a job that stopped short reports what it found, from its own report', () =
     error: 'I wrote **3 of 4** briefs; willow-florist has no source file.' }));
   assert.match(card.report ?? '', /\*\*3 of 4\*\*/, 'kept as markdown for the card to render');
 });
+
+
+test('large work lists keep full missing and running counts after display truncation', () => {
+  const rows = Array.from({ length: 40 }, (_, i) => ({ id: `row-${i}`, label: `Row ${i}`, state: 'done' as const }));
+  const gap = delegatedTaskCard(task({ phase: 'finished', status: 'done', work: {
+    done: 40, total: 41, items: rows, remaining: { count: 1, labels: ['Last transformation'] }, running: { count: 0, labels: [] },
+  } }));
+  assert.equal(gap.progress?.label, '40 of 41 done');
+  assert.match(gap.next?.text ?? '', /1 of 41 not done: Last transformation/);
+  assert.equal(gap.next?.action, 'correct');
+  const legacy = delegatedTaskCard(task({ phase: 'finished', status: 'done', work: { done: 40, total: 41, items: rows } }));
+  assert.match(legacy.next?.text ?? '', /1 of 41 not done/);
+  const working = delegatedTaskCard(task({ work: { done: 0, total: 100, items: [],
+    remaining: { count: 100, labels: ['A', 'B', 'C'] }, running: { count: 60, labels: ['A', 'B', 'C'] } } }));
+  assert.equal(working.now, 'Working on A, B, C and 57 more.');
+});

@@ -9,6 +9,7 @@ const fixtureHome = mkdtempSync(path.join(os.tmpdir(), 'clem-source-composition-
 process.env.CLEMENTINE_HOME = fixtureHome;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.EMBEDDINGS_DISABLED = 'true';
+process.env.CLEMMY_EMBED_AT_WRITE = 'off';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 mkdirSync(path.join(fixtureHome, 'state'), { recursive: true });
 const log = await import('./eventlog.js');
@@ -33,7 +34,7 @@ function captureFresh(input: { sessionId: string; sourceUserSeq: number }) {
   return context;
 }
 let serial = 0;
-function fixture(attached = true) {
+function fixture(attached = true, text = 'Inspect the controlled task.') {
   const id = ++serial;
   const made = agents.createAgentRecord({ name: `Context Specialist ${id}`, instructions: `ORIGINAL_CRAFT_${id}`, createdFrom: 'console' });
   assert.ok(made.ok); if (!made.ok) throw new Error('fixture agent');
@@ -44,7 +45,7 @@ function fixture(attached = true) {
     assert.ok(setSessionAgent(session.id, made.agent.id, { by: 'owner' }).ok);
     assert.ok(setSessionProject(session.id, project.project.id, { by: 'owner' }).ok);
   }
-  const source = log.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Inspect the controlled task.' } });
+  const source = log.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
   return { id, agent: made.agent, project: project.project, sessionId: session.id, sourceUserSeq: source.seq };
 }
 
@@ -81,6 +82,63 @@ test('reopen keeps original agent, project, memory reads, learning and reviewer 
   assert.doesNotMatch(stored.identity_json, /ORIGINAL_CRAFT|ORIGINAL_PROJECT|Inspect the controlled task/);
   assert.ok(stored.identity_json.length < 2000, 'identity is references/digests, not a copied prompt');
 });
+
+for (const kind of ['user', 'constraint'] as const) {
+  test(`registered ${kind} memory stays in the accepted scope after selection changes and reopen`, async () => {
+    const { registerMemoryTools } = await import('../../tools/memory-tools.js');
+    const { z } = await import('zod');
+    const facts = await import('../../memory/facts.js');
+    const { openMemoryDb } = await import('../../memory/db.js');
+    const { harnessRunContextStorage, ToolCallsCounter } = await import('./brackets.js');
+    let remember: ((input: Record<string, unknown>) => Promise<unknown>) | undefined;
+    registerMemoryTools({ tool(name: string, _description: string,
+      shape: import('zod').ZodRawShape, handler: (input: unknown) => Promise<unknown>) {
+      if (name === 'memory_remember') remember = input => handler(z.object(shape).parse(input));
+    } } as never);
+    assert.ok(remember);
+    const task = fixture(true, `Remember this recurring ${kind} convention only in this project.`);
+    const original = captureFresh(task);
+    const other = fixture();
+    const content = `Retained scope fixture ${task.id}: keep the recurring report marker COPPER MEADOW.`;
+    // A fact with the exact same text in another scope is not a duplicate.
+    // Seeding the intended scope also avoids asking a semantic resolver.
+    const prior = facts.rememberFact({ kind, content, sessionId: task.sessionId, scope: original.memoryScope });
+    setSessionAgent(task.sessionId, other.agent.id, { by: 'owner' });
+    setSessionProject(task.sessionId, other.project.id, { by: 'owner' });
+    memoryBinding._forgetPinnedMemoryScopesForTests(); memoryBinding.forgetSessionMemoryScope();
+    closeMemoryDb(); log.closeEventLog();
+    const fetchBefore = globalThis.fetch;
+    let networkCalls = 0;
+    globalThis.fetch = (async () => { networkCalls += 1; throw new Error('memory scope fixture forbids network'); }) as typeof fetch;
+    try {
+      const save = async (identity: { sessionId: string; sourceUserSeq: number }) =>
+        contexts.withAcceptedSourceSessionContext(identity, execution => harnessRunContextStorage.run({
+          ...execution, counter: new ToolCallsCounter(4),
+        }, () => remember!({ kind, content, keepFor: 'here' })));
+      const result = await save(task);
+      assert.match(JSON.stringify(result), /Reinforced|Already known|Remembered/);
+      const rows = () => openMemoryDb().prepare('SELECT id, active FROM consolidated_facts WHERE content = ? ORDER BY id')
+        .all(content) as Array<{ id: number; active: number }>;
+      assert.deepEqual(rows(), [{ id: prior.id, active: 1 }], 'reopen must not save an everywhere or newly selected copy');
+      assert.deepEqual(memory.memoryScopeOf('fact', prior.id), original.memoryScope);
+      assert.equal(memory.scopeOfSession(task.sessionId)?.projectId, other.project.id, 'the UI selection remains moved');
+
+      const next = log.appendEvent({ sessionId: task.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+        data: { text: 'Remember the same report marker only in this newly selected project.' } });
+      const nextIdentity = { sessionId: task.sessionId, sourceUserSeq: next.seq };
+      const nextContext = captureFresh(nextIdentity);
+      assert.equal(nextContext.memoryScope.projectId, other.project.id);
+      await save(nextIdentity);
+      const after = rows();
+      assert.equal(after.length, 2, 'a fresh accepted source uses its own selected scope');
+      assert.ok(after.every(row => row.active === 1));
+      const added = after.find(row => row.id !== prior.id)!;
+      assert.deepEqual(memory.memoryScopeOf('fact', added.id), nextContext.memoryScope);
+      assert.deepEqual(memory.memoryScopeOf('fact', prior.id), original.memoryScope);
+      assert.equal(networkCalls, 0);
+    } finally { globalThis.fetch = fetchBefore; }
+  });
+}
 
 test('explicit absence survives later agent/project selection; new requests use the new selection', () => {
   const task = fixture(false);

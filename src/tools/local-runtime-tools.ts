@@ -76,6 +76,8 @@ import {
   isSdkToolInputValidationError,
   textResult,
   localNonWriteStatus,
+  localNonWriteClassification,
+  localExecutionFailureEffect,
 } from './shared.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { toolOutputContextFromSdk, withToolOutputContext } from '../runtime/harness/tool-output-context.js';
@@ -138,9 +140,9 @@ function resultToText(
         // reported, in a field, that it changed nothing. Flattening it into the
         // failure carrier lost that distinction and the status token with it.
         const nonWrite = localNonWriteStatus(result);
-        if (nonWrite) return new HostLocalNonWriteResult(formatted, nonWrite);
+        if (nonWrite) return new HostLocalNonWriteResult(formatted, nonWrite, localNonWriteClassification(result));
         if ((result as { isError?: unknown }).isError === true) {
-          return new HostLocalExecutionFailureResult(formatted);
+          return new HostLocalExecutionFailureResult(formatted, localExecutionFailureEffect(result));
         }
         if (images.length > 0) {
           return [
@@ -158,102 +160,6 @@ function resultToText(
   } catch {
     return formatRecallableToolText(String(result));
   }
-}
-
-interface JsonStringToken {
-  value: string;
-  end: number;
-}
-
-function skipJsonWhitespace(input: string, start: number): number {
-  let cursor = start;
-  while (cursor < input.length && /\s/.test(input[cursor] ?? '')) cursor += 1;
-  return cursor;
-}
-
-/** Read one fully valid JSON string without requiring the rest of the object to
- * parse. This lets the boundary retain an already-complete required prefix when
- * corruption occurs later in optional annotations. */
-function readJsonStringToken(input: string, start: number): JsonStringToken | null {
-  const first = skipJsonWhitespace(input, start);
-  if (input[first] !== '"') return null;
-  let cursor = first + 1;
-  while (cursor < input.length) {
-    const char = input[cursor];
-    if (char === '"') {
-      const raw = input.slice(first, cursor + 1);
-      try {
-        const value = JSON.parse(raw) as unknown;
-        return typeof value === 'string' ? { value, end: cursor + 1 } : null;
-      } catch {
-        return null;
-      }
-    }
-    if (char === '\\') {
-      cursor += 1;
-      if (cursor >= input.length) return null;
-      if (input[cursor] === 'u') {
-        const hex = input.slice(cursor + 1, cursor + 5);
-        if (!/^[0-9a-f]{4}$/i.test(hex)) return null;
-        cursor += 4;
-      }
-    } else if ((char?.charCodeAt(0) ?? 0) < 0x20) {
-      return null;
-    }
-    cursor += 1;
-  }
-  return null;
-}
-
-function consumeJsonPunctuation(input: string, start: number, expected: string): number | null {
-  const cursor = skipJsonWhitespace(input, start);
-  return input[cursor] === expected ? cursor + 1 : null;
-}
-
-/**
- * Narrow recovery for the only safe case observed in live proof:
- * memory_remember produced a valid, schema-ordered `kind` + `content` prefix,
- * then malformed an OPTIONAL graph annotation. Saving that already-grounded
- * local fact is safer and cheaper than asking the model to repeat the mutation.
- *
- * This is intentionally NOT generic JSON repair:
- *   - requires the exact leading object shape emitted by our schema;
- *   - accepts only ordinary, idempotent fact kinds (never a hard constraint);
- *   - requires kind/content to be complete JSON strings and within schema bounds;
- *   - discards every optional field rather than guessing how to repair it.
- * Any other corruption follows the SDK's normal visible retry path.
- */
-export function recoverMemoryRememberRequiredPrefix(error: unknown): Record<string, unknown> | null {
-  if (!error || typeof error !== 'object') return null;
-  const name = (error as { name?: unknown }).name;
-  const toolInvocation = (error as { toolInvocation?: unknown }).toolInvocation;
-  if (name !== 'InvalidToolInputError' || !toolInvocation || typeof toolInvocation !== 'object') return null;
-  const raw = (toolInvocation as { input?: unknown }).input;
-  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 20_000) return null;
-
-  let cursor = consumeJsonPunctuation(raw, 0, '{');
-  if (cursor === null) return null;
-  const kindKey = readJsonStringToken(raw, cursor);
-  if (!kindKey || kindKey.value !== 'kind') return null;
-  cursor = consumeJsonPunctuation(raw, kindKey.end, ':');
-  if (cursor === null) return null;
-  const kind = readJsonStringToken(raw, cursor);
-  if (!kind) return null;
-  cursor = consumeJsonPunctuation(raw, kind.end, ',');
-  if (cursor === null) return null;
-  const contentKey = readJsonStringToken(raw, cursor);
-  if (!contentKey || contentKey.value !== 'content') return null;
-  cursor = consumeJsonPunctuation(raw, contentKey.end, ':');
-  if (cursor === null) return null;
-  const content = readJsonStringToken(raw, cursor);
-  if (!content) return null;
-  const next = raw[skipJsonWhitespace(raw, content.end)];
-  if (next !== ',' && next !== '}') return null;
-
-  const safeKinds = new Set(['user', 'project', 'feedback', 'reference']);
-  const cleanContent = content.value.trim();
-  if (!safeKinds.has(kind.value) || cleanContent.length < 3 || cleanContent.length > 800) return null;
-  return { kind: kind.value, content: cleanContent };
 }
 
 // v0.5.22 — moved the body of this normalizer to
@@ -403,7 +309,7 @@ function invalidLocalToolInputResult(
  * SDK default text (downstream failure detection keys on that prefix);
  * input-validation errors append schema guidance and ride the nominal
  * invalid-arguments carrier (same bytes in `.output`), and memory_remember
- * keeps its narrow required-prefix recovery. */
+ * keeps only schema-preserving omitted-nullable recovery. */
 
 /** An errorFunction may return a REFUSAL, or — when the input was repaired
  *  from the tool's own schema — a genuine tool result of any local kind. */
@@ -448,7 +354,6 @@ export function recoverOmittedNullableFields(
   const omitted = first.error.issues.filter((issue) => (
     issue.path.length > 0
     && issue.path.every((key) => typeof key === 'string' || typeof key === 'number')
-    && /received undefined/i.test(issue.message)
   ));
   if (omitted.length === 0 || omitted.length !== first.error.issues.length) return null;
 
@@ -461,6 +366,9 @@ export function recoverOmittedNullableFields(
     }
     const key = issue.path.at(-1)!;
     if (!parent || typeof parent !== 'object' || typeof key !== 'string' || Object.hasOwn(parent, key)) return null;
+    // Actual absence is authoritative. Nullable enums and unions do not all
+    // describe undefined with the same Zod error wording. The complete schema
+    // validation below still rejects null for a genuinely required field.
     // Define an own property: even a schema's unusual key must not mutate a
     // prototype. Never construct missing parents or guess array elements.
     Object.defineProperty(parent, key, { value: null, enumerable: true, configurable: true, writable: true });
@@ -497,11 +405,24 @@ export function buildLocalToolErrorFunction(
 ): (runContext: unknown, error: unknown) => Promise<LocalToolErrorFunctionResult> {
   return async (runContext: unknown, error: unknown): Promise<LocalToolErrorFunctionResult> => {
     if (localTool.name === 'memory_remember') {
-      const recovered = recoverMemoryRememberRequiredPrefix(error);
+      // Only the SDK's nominal validation refusal proves the body did not
+      // execute. Runtime failures keep their existing error truth, never a
+      // newly asserted no-effect guarantee or an automatic repair invocation.
+      if (!isSdkToolInputValidationError(error)) {
+        const details = error instanceof Error ? error.toString() : String(error);
+        return `An error occurred while running the tool. Please try again. Error: ${details}`;
+      }
+      // A memory save may carry scope, source provenance and requested graph
+      // work. A valid required prefix cannot authorize dropping those fields.
+      const normalizedShape = normalizeShapeForResponses(localTool.parameters);
+      const recovered = recoverOmittedNullableFields(error, z.strictObject(normalizedShape));
       if (!recovered) {
         return invalidLocalToolInputResult(
           error,
-          'memory_remember input was invalid. Retry once with only the required kind and content fields; omit optional graph annotations.',
+          'memory_remember input was invalid and no memory was saved by this call. '
+          + 'Repair the invalid arguments while preserving the intended kind, content, correct, keepFor, sessionId and sourcePath. '
+          + 'Preserve requested graph work; correct unsupported annotations or report what cannot be saved. '
+          + 'Do not drop scope or provenance fields to make the call pass.',
         );
       }
       const details = error && typeof error === 'object'
@@ -509,10 +430,9 @@ export function buildLocalToolErrorFunction(
         : undefined;
       return withToolOutputContext(
         toolOutputContextFromSdk(localTool.name, runContext, details),
-        async () => {
-          const result = resultToText(await localTool.handler(recovered));
-          return `${result}\n[Recovered valid kind/content; malformed optional graph annotations were ignored.]`;
-        },
+        // Preserve nominal no-write and failure/effect carriers. Appending a
+        // notice through string interpolation would launder them into success.
+        async () => resultToText(await localTool.handler(recovered)),
       );
     }
     // Proceeding turns a refusal into a real invocation, so only completions
@@ -565,7 +485,7 @@ function localToolToRuntimeTool(localTool: CapturedLocalTool): Tool<RuntimeConte
     ),
     // Input-validation failures return the violated paths + a tool_search
     // pointer (see buildLocalToolErrorFunction); execution errors keep the
-    // SDK's default text; memory_remember keeps its required-prefix recovery.
+    // SDK's default text; memory_remember keeps only exact omitted-nullable recovery.
     errorFunction: buildLocalToolErrorFunction(localTool) as unknown as SdkStringErrorFunction,
   });
 }

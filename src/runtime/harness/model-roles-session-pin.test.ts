@@ -188,3 +188,19 @@ test('releaseSessionBrainPin clears the pin (session lifecycle end)', () => {
     assert.equal(pinnedBrainForSession('sess-release'), null);
   });
 });
+
+
+test('automatic Quick follows a session brain backend despite a concurrent global BYO switch', () => {
+  withEnv({ AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in', CLEMMY_MODEL_ROLES: undefined,
+    BYO_MODEL_BASE_URL: 'https://a.example.test', BYO_MODEL_API_KEY: 'fixture-a',
+    BYO_MODEL_ID: 'fixture-a-brain', BYO_MODEL_JUDGE_ID: 'fixture-a-quick',
+    BYO_PROVIDERS: JSON.stringify([{ id: 'fixtureb', label: 'B', baseURL: 'https://b.example.test', modelIds: ['fixture-b-brain'] }]),
+    BYO_PROVIDER_FIXTUREB_API_KEY: 'fixture-b', BYO_BRAIN_MODEL_ID: 'fixture-b-brain',
+  }, () => {
+    inSessionTurn('quick-byo-pin', () => resolveRoleModel('brain'));
+    process.env.BYO_BRAIN_MODEL_ID = '';
+    const current = inSessionTurn('quick-byo-pin', () => resolveRoleModel('quick'));
+    assert.equal(current.modelId, 'fixture-b-brain');
+    assert.equal(resolveRoleModel('quick').modelId, 'fixture-a-quick');
+  });
+});

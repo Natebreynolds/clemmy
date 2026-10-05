@@ -22,6 +22,7 @@
  * switch CLEMMY_MODEL_ROLES_REGISTRY (default on; off ⇒ defaults only, bindings
  * ignored).
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   getRuntimeEnv,
   getActiveAuthMode,
@@ -40,6 +41,8 @@ import { resolveProvider, type ModelProviderClass } from './model-wire-registry.
 import {
   resolveDeclaredByoProviderForModel,
   resolveEffectiveProviderForModel,
+  resolveByoProviderForModel,
+  isByoModelNotServed,
 } from './byo-providers.js';
 import { slugifyIntent } from '../../memory/tool-choice-store.js';
 import { modelUsageAttributionStorage } from '../usage-log.js';
@@ -99,6 +102,32 @@ export interface ResolvedRoleModel {
   exactHeavyweightPin?: boolean;
   /** Set when the learned route policy won: the evidence behind the pick. */
   policy?: { score: number; defaultScore: number; sampleCount: number; policyVersion: number };
+}
+
+interface AcceptedTurnBrainModel {
+  sessionId: string;
+  sourceUserSeq: number;
+  modelId: string;
+}
+
+const acceptedTurnBrainModel = new AsyncLocalStorage<AcceptedTurnBrainModel>();
+
+/** Carry the bridge's already-selected model into preparation before the
+ * foreground agent is built. This is routing context only: it neither creates
+ * usage attribution nor changes the owner's settings or session affinity. */
+export function withAcceptedTurnBrainModel<T>(input: AcceptedTurnBrainModel, work: () => T): T {
+  if (!input.sessionId || input.sessionId === 'unknown' || !Number.isSafeInteger(input.sourceUserSeq)
+    || input.sourceUserSeq <= 0 || !input.modelId.trim()) throw new Error('Brain routing needs an exact accepted source and model.');
+  return acceptedTurnBrainModel.run({ ...input }, work);
+}
+
+function scopedAcceptedBrain(): ResolvedRoleModel | null {
+  const brain = acceptedTurnBrainModel.getStore();
+  const source = modelUsageAttributionStorage.getStore();
+  // Another accepted input or a source-less job must not borrow its caller's
+  // model merely because it inherited an asynchronous scope.
+  if (!brain || source?.sessionId !== brain.sessionId || source.sourceUserSeq !== brain.sourceUserSeq) return null;
+  return { modelId: brain.modelId, provider: resolveEffectiveProviderForModel(brain.modelId), source: 'session' };
 }
 
 /** Kill-switch. off ⇒ resolveRoleModel returns ONLY the provider-derived default
@@ -376,11 +405,23 @@ export function defaultForRole(role: ModelRole): string {
   const byo = getByoBackendConfig();
   const mode = getModelRoutingMode();
 
-  // Quick checks take the fast model of the brain's own family, so they bill
-  // where the brain bills and never wait on the brain's own reasoning.
+  // Automatic Quick follows the effective brain's backend. An extra BYO
+  // backend without a fast tier keeps that brain; an explicit Quick binding
+  // remains an owner choice handled by resolveRoleModel.
   if (role === 'quick') {
-    if (mode === 'all_in' && byo.configured) return byo.judgeId || byo.primaryId;
-    return getActiveAuthMode() === 'claude_oauth' ? boundaryClaudeJudgeModel() : codexSafeFast();
+    const activeBrain = resolveRoleModel('brain');
+    if (activeBrain.provider === 'byo') {
+      const brain = activeBrain.modelId;
+      const owner = resolveByoProviderForModel(brain);
+      // Extra backends do not declare a separate fast tier. Keep the chosen
+      // brain there rather than borrowing the default backend's model/key.
+      // A default backend may supply its own explicitly configured judge.
+      const candidate = owner?.baseURL === byo.baseURL && owner?.apiKey === byo.apiKey
+        ? byo.judgeId || brain : brain;
+      return isByoModelNotServed(candidate) ? brain : candidate;
+    }
+    if (activeBrain.provider === 'claude') return boundaryClaudeJudgeModel();
+    return resolveEffectiveProviderForModel(MODELS.fast) === 'codex' ? MODELS.fast : boundaryCodexJudgeModel();
   }
 
   // In all-in BYO mode the registered provider routes every role to the BYO
@@ -473,6 +514,11 @@ export function defaultForRole(role: ModelRole): string {
  * before this change.
  */
 export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRoleModel {
+  // The bridge dispatches explicit request/saved-agent models ahead of role
+  // defaults. Quick's automatic choice and semantic fallback need that same
+  // effective brain; explicit Quick bindings still win in their own lookup.
+  const acceptedBrain = role === 'brain' ? scopedAcceptedBrain() : null;
+  if (acceptedBrain) return acceptedBrain;
   const roleBindings = readDurableBindings().filter((b) => b.role === role);
   const querySlug = intent ? slugifyIntent(intent) : '';
   const intentMatch = querySlug

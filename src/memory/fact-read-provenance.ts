@@ -4,11 +4,12 @@ import type { ConsolidatedFact } from './facts.js';
 export function formatFactRead(
   fact: ConsolidatedFact,
   lookup: (id: number) => ConsolidatedFact | null,
+  options?: { omitFactBody?: boolean },
 ): string {
   const status = (row: ConsolidatedFact) => `${row.active ? 'active' : 'inactive'}${row.supersededByFactId ? `; superseded by fact:${row.supersededByFactId}` : ''}`;
   const inferred = (fact.derivationDepth ?? 0) > 0 || fact.derivedFrom?.tool === 'recursive_reflection';
   const lines = [
-    `[fact:${fact.id}] ${fact.kind}: ${fact.content}`,
+    ...(options?.omitFactBody ? [] : [`[fact:${fact.id}] ${fact.kind}: ${fact.content}`]),
     `Status: ${status(fact)}.`,
     ...(inferred ? ['Provenance: inferred pattern, not an explicit user rule; verify source scope before applying.'] : []),
   ];

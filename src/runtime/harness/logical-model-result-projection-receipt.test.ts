@@ -22,6 +22,7 @@ writeFileSync(path.join(HOME, 'state', 'machine-id'), 'machine-logical-projectio
 
 const eventlog = await import('./eventlog.js');
 const schema = await import('./eventlog-schema.js');
+const { restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
 const authority = await import('./accepted-turn-call-authority.js');
 const checkpoints = await import('./accepted-model-batch-checkpoint.js');
 const identities = await import('./attempt-identity.js');
@@ -675,6 +676,7 @@ test('v69 backfills exact ready structured projections without copying their pay
   const raw = new Database(eventlog.HARNESS_DB_PATH);
   try {
     raw.pragma('foreign_keys = ON');
+    restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture(raw);
     raw.exec(`DROP TABLE logical_model_result_projection_receipts`);
     raw.prepare(`DELETE FROM schema_version WHERE version >= 69`).run();
     const beforeCheckpoint = raw.prepare(`

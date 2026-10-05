@@ -315,12 +315,13 @@ export function uniformFailureSignature(texts: Array<string | null | undefined>)
  * @openai/agents runner surfaces as "An error occurred while running the
  * tool…" with no prefix — live 2026-07-22, five workers died on a provider
  * 400 and were all counted ok (a no-hollow-done violation). Hollow/empty
- * output is failure for the same reason.
+ * output is failure for the same reason. A host-qualified PARTIAL retains
+ * useful work but is not a successfully completed item either.
  */
 export function workerResultIndicatesFailure(text: string | null | undefined): boolean {
   const t = (text ?? '').trim();
   if (!t) return true;
-  if (/^\s*ERROR:/i.test(t)) return true;
+  if (/^\s*(?:ERROR|PARTIAL):/i.test(t)) return true;
   return /an error occurred while running the tool/i.test(t);
 }
 

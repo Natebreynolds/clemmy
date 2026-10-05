@@ -10168,6 +10168,48 @@ test('runConversation: a generic acknowledgement after successful tool work comp
   );
 });
 
+/** Offline memory fixtures settle through the real source-bound pipeline.
+ * The loop still owns graph admission, V2 receipt issuance and publication. */
+async function prepareMemoryLoopFixture(sessionId: string, message: string, pending = false) {
+  const memory = await import('../../memory/db.js');
+  const capture = await import('../../memory/auto-capture.js');
+  const queue = await import('../../memory/durable-consolidation.js');
+  const contexts = await import('./source-session-context.js');
+  const review = await import('../../memory/standing-memory-review.js');
+  memory.resetMemoryDb();
+  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: message } });
+  assert.ok(contexts.captureFreshSourceSessionContext({ sessionId, sourceUserSeq: source.seq }), 'fixture retains accepted owner context');
+  const candidates = capture.selectAutoMemoryCandidates(message);
+  assert.ok(candidates.length > 0, 'fixture has an admitted memory claim');
+  const input = { message, sessionId, sourceEventId: `user-source:${source.seq}`,
+    sourceProvenance: capture.autoCaptureProvenanceFromAcceptedEvent(source) };
+  const origins = capture.automaticMemoryOriginsForCapture(input, candidates);
+  assert.ok(origins.every(origin => origin && origin.claimMode !== 'unresolved'), 'fixture claims have exact source offsets');
+  const queued = queue.enqueueAutoCaptureCandidates({ ...input, candidates, origins });
+  if (pending) {
+    // A future technical retry stays durable but cannot dispatch a provider in
+    // the loop's ordinary immediate-drain microtask.
+    const update = memory.openMemoryDb().prepare('UPDATE memory_reflection_candidates SET next_attempt_at = ? WHERE id = ?');
+    for (const id of queued.candidateIds) update.run('2999-01-01T00:00:00.000Z', id);
+  } else {
+    const drained = await queue.drainDurableConsolidationCandidates({ ids: queued.candidateIds,
+      resolver: async () => ({ decision: 'ADD' }),
+      standingReviewer: async (_source, _candidate, _mode, origin) => {
+        assert.ok(origin, 'review requires the actual producer origin');
+        return review.parseAutomaticStandingMemoryReview({ durability: 'standing', claim: origin.claim,
+          destination: 'kind_default', destinationSpans: [], reason: 'Controlled complete fixture claim and checked default' }, origin);
+      },
+    });
+    assert.equal(drained.promoted, queued.candidateIds.length, 'actual canonical consolidation completed');
+    for (const id of queued.candidateIds) {
+      const saved = memory.openMemoryDb().prepare(`SELECT f.active FROM memory_reflection_candidates c
+        JOIN consolidated_facts f ON f.id = c.resulting_fact_id WHERE c.id = ? AND c.status = 'promoted'`).get(id) as { active: number } | undefined;
+      assert.equal(saved?.active, 1, 'positive fixture owns an actual active fact');
+    }
+  }
+  return { sourceUserSeq: source.seq, candidateIds: queued.candidateIds };
+}
+
 test('runConversation: a generic acknowledgement after durable auto-capture completes without a forced tool', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
@@ -10177,10 +10219,13 @@ test('runConversation: a generic acknowledgement after durable auto-capture comp
     return { history: items, lastResponseId: undefined, finalOutput: 'Noted.' };
   };
 
+  const message = 'Remember this: my durable harness marker is AUTO-CAPTURE-ACK-42.';
+  const memoryFixture = await prepareMemoryLoopFixture(sess.id, message);
   const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
-    input: 'Remember this: my durable harness marker is AUTO-CAPTURE-ACK-42.',
+    input: message,
+    sourceUserSeq: memoryFixture.sourceUserSeq,
     makeRunner: makeRunnerStub,
     runRunner,
   });
@@ -10195,6 +10240,30 @@ test('runConversation: a generic acknowledgement after durable auto-capture comp
   assert.equal(listEventsForConv(sess.id, { types: ['tool_called'] }).length, 0);
 });
 
+test('runConversation: pending automatic memory cannot publish a completed acknowledgement', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const message = 'Remember this: my durable harness marker is PENDING-CAPTURE-ACK-43.';
+  const memoryFixture = await prepareMemoryLoopFixture(sess.id, message, true);
+  const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: message,
+    sourceUserSeq: memoryFixture.sourceUserSeq, maxSteps: 1, judgeCompletion: true,
+    judgeFn: async () => ({ done: true, reason: 'A fake positive review cannot certify a pending save.' }),
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, items) => ({ history: items, lastResponseId: undefined,
+      finalOutput: { summary: 'Noted.', reply: 'Noted.', done: true, nextAction: 'completed', reason: null } }),
+  });
+  assert.notEqual(result.status, 'completed', 'pending intake is not completed memory work');
+  const capture = listEventsForConv(sess.id, { types: ['memory_signals_captured'] }).at(-1);
+  assert.equal(capture?.data.conversationOnly, false);
+  assert.equal(capture?.data.hostReceiptId, null);
+  assert.equal(listEventsForConv(sess.id, { types: ['tool_called'] }).length, 0, 'pending hold does not repeat the memory save');
+  const memory = await import('../../memory/db.js');
+  for (const id of memoryFixture.candidateIds) {
+    const row = memory.openMemoryDb().prepare('SELECT status, resulting_fact_id FROM memory_reflection_candidates WHERE id = ?').get(id) as { status: string; resulting_fact_id: number | null };
+    assert.deepEqual(row, { status: 'pending', resulting_fact_id: null });
+  }
+});
+
 test('runConversation: a natural provider-authored memory acknowledgement does not enter the stall judge', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
@@ -10206,10 +10275,13 @@ test('runConversation: a natural provider-authored memory acknowledgement does n
     return { history: items, lastResponseId: undefined, finalOutput: reply };
   };
 
+  const message = "Remember this: Cedar's current release number is Cedar-9012. A natural acknowledgement is enough.";
+  const memoryFixture = await prepareMemoryLoopFixture(sess.id, message);
   const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
-    input: "Remember this: Cedar's current release number is Cedar-9012. A natural acknowledgement is enough.",
+    input: message,
+    sourceUserSeq: memoryFixture.sourceUserSeq,
     judgeCompletion: true,
     judgeFn: async () => {
       judgeCalls += 1;
@@ -10273,10 +10345,12 @@ test('runConversation: parsed structured remember and correction acknowledgement
       };
     };
 
+    const memoryFixture = await prepareMemoryLoopFixture(sess.id, fixture.message);
     const result = await runConversation({
       agent: makeAgentStub(),
       sessionId: sess.id,
       input: fixture.message,
+      sourceUserSeq: memoryFixture.sourceUserSeq,
       judgeCompletion: true,
       judgeFn: async () => {
         judgeCalls += 1;
@@ -10409,10 +10483,13 @@ test('runConversation: unsafe receipt presentations retain ordinary recovery in 
             },
       });
 
+      const message = `Small correction for later: Cedar's current release is UNSAFE-PROSE-${replyIndex}. A natural acknowledgement is enough.`;
+      const memoryFixture = await prepareMemoryLoopFixture(sess.id, message);
       const result = await runConversation({
         agent: makeAgentStub(),
         sessionId: sess.id,
-        input: `Small correction for later: Cedar's current release is UNSAFE-PROSE-${replyIndex}. A natural acknowledgement is enough.`,
+        input: message,
+        sourceUserSeq: memoryFixture.sourceUserSeq,
         maxSteps: 1,
         judgeCompletion: true,
         judgeFn: async () => {
@@ -10500,6 +10577,7 @@ test('runConversation: a receipt marker cannot be borrowed from another accepted
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'Create a local release note.',
+    suppressMemoryCapture: true,
     maxSteps: 1,
     judgeCompletion: true,
     judgeFn: async () => {
@@ -10546,10 +10624,12 @@ test('runConversation: compound question, admin, tool, and write clauses cannot 
       },
     });
 
+    const memoryFixture = await prepareMemoryLoopFixture(sess.id, message);
     await runConversation({
       agent: makeAgentStub(),
       sessionId: sess.id,
       input: message,
+      sourceUserSeq: memoryFixture.sourceUserSeq,
       maxSteps: 1,
       judgeCompletion: true,
       judgeFn: async () => {
@@ -10583,10 +10663,13 @@ test('runConversation: memory capture cannot hide unfinished work in a compound 
     return { history: items, lastResponseId: undefined, finalOutput: reply };
   };
 
+  const message = 'Remember this: my compound marker is MIXED-MEMORY-9013, and create a local note afterward.';
+  const memoryFixture = await prepareMemoryLoopFixture(sess.id, message);
   await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
-    input: 'Remember this: my compound marker is MIXED-MEMORY-9013, and create a local note afterward.',
+    input: message,
+    sourceUserSeq: memoryFixture.sourceUserSeq,
     makeRunner: makeRunnerStub,
     runRunner,
   });

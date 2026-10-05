@@ -12,7 +12,7 @@ process.env.CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT = 'off';
 const eventlog = await import('./eventlog.js');
 const continuity = await import('../../memory/task-continuity.js');
 const runtime = await import('./task-continuity-runtime.js');
-const { commitTurnOutcome } = await import('./delivery-committer.js');
+const { commitTurnOutcome, completionDataForTurnOutcome } = await import('./delivery-committer.js');
 const { presentationEventFromCompletionData, turnOutcomeId } = await import('./turn-outcome.js');
 const { discoveryGovernor } = await import('./discovery-governor.js');
 const attemptIdentity = await import('./attempt-identity.js');
@@ -22,6 +22,9 @@ const capabilityCandidates = await import('../read-path/capability-candidates.js
 const { recordAcceptedSourceGraph } = await import('./record-accepted-source-graph.js');
 const turnControl = await import('./turn-control.js');
 const sourceAdmission = await import('./source-strategy-admission.js');
+const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+
+const RETAINED_CHECKPOINT = '\n\nRetained work (durable checkpoint):\n- Source/tool read_file: 1 record retained as rh_fixture_read.\nExternal write state: no settled external-write attempt is recorded.';
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -49,6 +52,7 @@ function commitClarification(input: {
   sessionId: string;
   sourceSeq: number;
   question?: string;
+  deliveredText?: string;
   options?: string[];
   source?: string;
   reason?: string;
@@ -95,16 +99,60 @@ function commitClarification(input: {
     },
   });
   const identity = { sessionId: input.sessionId, turn: 1, sourceUserSeq: input.sourceSeq };
-  return commitTurnOutcome({
+  const outcome = {
     version: 2,
     id: turnOutcomeId(identity),
     identity,
     status: 'needs_input',
     resumable: true,
     needs: { kind: 'input' },
-    presentation: { kind: 'question', text: question },
-  });
+    presentation: { kind: 'question', text: input.deliveredText ?? question },
+  } as const;
+  if (input.deliveredText !== undefined) {
+    const terminalEvent = eventlog.appendEvent({ sessionId: input.sessionId, turn: 1,
+      role: 'system', type: 'conversation_completed', data: completionDataForTurnOutcome(outcome) });
+    runtime.persistCommittedClarificationContinuity({ terminalEvent,
+      presentation: presentationEventFromCompletionData(terminalEvent.data)! });
+    return;
+  }
+  return commitTurnOutcome(outcome);
 }
+
+test('retained-work clarification binds the public question and survives durable reopen without changing raw evidence', () => {
+  const sessionId = 'continuity-retained-work-question';
+  const source = accepted(sessionId, 'Inspect the synthetic note and ask before choosing a correction.');
+  const question = 'Which correction should I make?';
+  const raw = question + RETAINED_CHECKPOINT;
+  commitClarification({ sessionId, sourceSeq: source.seq, question,
+    deliveredText: raw, options: ['Correct the title', 'Correct the date'], awaitingTurn: 3 });
+  const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] })[0]!;
+  assert.equal((terminal.data.presentation as { text: string }).text, raw);
+  assert.equal((projectHarnessEventForPublic(terminal)?.data.presentation as { text: string }).text, question);
+  const packet = continuity.peekTaskContinuityPacket({ sessionId });
+  assert.equal(packet.status, 'available');
+  if (packet.status !== 'available') return;
+  assert.equal(packet.packet.pause.question, question);
+  assert.deepEqual(packet.packet.pause.options, ['Correct the title', 'Correct the date']);
+  eventlog.closeEventLog();
+  assert.deepEqual(new continuity.TaskContinuityStore().peek({ sessionId }), packet);
+  assert.deepEqual(eventlog.listEvents(sessionId, { types: ['conversation_completed'] })[0], terminal,
+    'projection and restart preserve the raw terminal and its retained receipt references');
+});
+
+test('retained-work suffix does not excuse changed visible prose or a foreign awaiting source', () => {
+  for (const [suffix, delivered, foreign] of [
+    ['extra-prose', 'Which correction should I make? Also publish the note.', false],
+    ['different-question', 'Should I publish the note?', false],
+    ['foreign-source', 'Which correction should I make?', true],
+  ] as const) {
+    const sessionId = `continuity-retained-work-${suffix}`;
+    const source = accepted(sessionId, 'Inspect the synthetic note.');
+    commitClarification({ sessionId, sourceSeq: source.seq, question: 'Which correction should I make?',
+      deliveredText: delivered + RETAINED_CHECKPOINT,
+      ...(foreign ? { awaitingSourceSeq: source.seq + 99 } : {}), options: ['Title', 'Date'] });
+    assert.deepEqual(continuity.peekTaskContinuityPacket({ sessionId }), { status: 'none' }, suffix);
+  }
+});
 
 test('typed clarification terminal creates a bounded exact-source packet only after commit', () => {
   const sessionId = 'continuity-terminal';
@@ -455,7 +503,7 @@ test('a public slot answer resumes private task context while hidden option ordi
   assert.equal(discoveryGovernor.getTaskState({ sessionId, sourceUserSeq: answer.seq })?.policy.knownCapability, true);
 });
 
-test('an exact material-source answer inherits and re-promotes the durable parent binding', async () => {
+test('an exact material-source answer after a retained checkpoint re-promotes the durable parent binding', async () => {
   const sessionId = 'continuity-material-source-binding';
   const objective = 'Find five Pismo Beach restaurants and create one new Google Sheet.';
   const question = 'I will use the exact Apify restaurant source and create one new Google Sheet. Use that source?';
@@ -530,15 +578,18 @@ test('an exact material-source answer inherits and re-promotes the durable paren
     },
   });
   const identity = { sessionId, turn: 1, sourceUserSeq: source.seq };
-  commitTurnOutcome({
+  const terminalEvent = eventlog.appendEvent({ sessionId, turn: 1, role: 'system', type: 'conversation_completed', data: completionDataForTurnOutcome({
     version: 2,
     id: turnOutcomeId(identity),
     identity,
     status: 'needs_input',
     resumable: true,
     needs: { kind: 'input' },
-    presentation: { kind: 'question', text: question },
-  });
+    presentation: { kind: 'question', text: question + RETAINED_CHECKPOINT },
+  }) });
+  runtime.persistCommittedClarificationContinuity({ terminalEvent,
+    presentation: presentationEventFromCompletionData(terminalEvent.data)! });
+  eventlog.closeEventLog();
   const answerText = 'Use Apify as the restaurant source.';
   const answer = accepted(sessionId, answerText);
   const crowded = Array.from({ length: 12 }, (_, index) => ({

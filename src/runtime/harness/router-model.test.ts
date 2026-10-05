@@ -5,6 +5,7 @@ import { RouterModelProvider, brainFalloverFirstByteMsForProvider, routedPrimary
 import { resetByoModelCache } from './byo-model.js';
 import { ToolCallsCounter, withHarnessRunContext } from './brackets.js';
 import { modelFirstByteStallMs } from './model-stall-policy.js';
+import { withPinnedWorkerModel } from './pinned-worker-model.js';
 
 const ENV_KEYS = [
   'AUTH_MODE',
@@ -28,6 +29,31 @@ function withEnv(vars: Record<string, string>, fn: () => void): void {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]!; }
   }
 }
+
+test('an exact worker pin refuses provider model collapse before any request', () => {
+  withEnv({ AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_BASE_URL: 'https://byo.example.test/v1',
+    BYO_MODEL_ID: 'byo-primary', BYO_MODEL_API_KEY: 'fixture-key', CLEMMY_BRAIN_FALLOVER: 'on' }, () => {
+    assert.throws(() => withPinnedWorkerModel('codex-test-fast', () => new RouterModelProvider().getModel('codex-test-fast')),
+      /exact model is unavailable/);
+  });
+});
+
+test('an exact worker pin cannot execute another connected model after provider failure', async () => {
+  const calls: string[] = [];
+  const leaf = (id: string) => ({
+    async getResponse() { calls.push(id); throw Object.assign(new Error('provider overloaded'), { status: 503 }); },
+    async *getStreamedResponse() { throw new Error('unused'); },
+  });
+  const router = new RouterModelProvider({
+    codex: { getModel: (id: string) => leaf(id) } as never,
+    claude: { getModel: (id: string) => leaf(id) } as never,
+    resolveEffectiveProvider: () => 'codex', codexAvailable: () => true, claudeAvailable: () => true,
+  });
+  const model = withPinnedWorkerModel('gpt-5.6-luna', () => router.getModel('gpt-5.6-luna'));
+  await assert.rejects(model.getResponse({ input: [], modelSettings: {}, tools: [], handoffs: [], outputType: 'text' } as never));
+  assert.ok(calls.length > 0);
+  assert.deepEqual([...new Set(calls)], ['gpt-5.6-luna']);
+});
 
 test('BYO gets a LONGER fallover deadline, never an absent one', () => {
   // This asserted `undefined` for BYO, to protect a real concern: the BYO

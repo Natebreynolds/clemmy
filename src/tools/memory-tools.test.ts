@@ -21,6 +21,7 @@ const { reviewForgetRequest, registerMemoryTools } = await import('./memory-tool
 const { LOCAL_MCP_TOOL_NAMES } = await import('./catalog.js');
 const { openMemoryDb, resetMemoryDb, closeMemoryDb } = await import('../memory/db.js');
 const { rememberFact, getFact } = await import('../memory/facts.js');
+const { parseFactObservation } = await import('../memory/fact-observation.js');
 const { loadFactEntityEdges } = await import('../memory/relations.js');
 const { appendFactRecallTrace } = await import('../memory/recall-trace.js');
 const { recordRecallRun } = await import('../memory/recall-usage.js');
@@ -115,10 +116,17 @@ test('memory_read dereferences the fact and policy refs exposed by recall primer
   assert.ok(read);
 
   const factResult = await read!({ target: `fact:${stored.id}` });
-  assert.equal(
-    factResult.content[0]?.text,
-    `[fact:${stored.id}] project: The Clementine launch crew includes Avery, Jordan, and Morgan.\nStatus: active.`,
-  );
+  const envelope = JSON.parse(factResult.content[0]!.text);
+  assert.equal(envelope.protocol, 'fact_observation_v1');
+  assert.equal(envelope.readCallId, null, 'a direct fixture read has no admitted correction authority');
+  const observation = parseFactObservation(envelope.observation);
+  assert.equal(observation.id, stored.id);
+  assert.equal(observation.kind, 'project');
+  assert.equal(observation.content, 'The Clementine launch crew includes Avery, Jordan, and Morgan.');
+  assert.deepEqual(observation.scope, { projectId: null, agentKey: null });
+  assert.equal(observation.active, true);
+  assert.equal(observation.supersededByFactId, null);
+  assert.equal(envelope.provenance, 'Status: active.');
 
   const policyResult = await read!({ target: `policy:${stored.id}` });
   assert.equal(policyResult.content[0]?.text, factResult.content[0]?.text);
@@ -242,7 +250,9 @@ test('memory_remember exposes unresolved prior facts to the current brain instea
   const handler = registeredToolHandlers().get('memory_remember')!;
   const result = await handler({ kind: 'user', content: 'Northlight prospect drafts use Subject, Observation, Relevance, Permission. Permission starts May I send.' });
   assert.match(result.content[0].text, /unresolved/i);
-  assert.match(result.content[0].text, /memory_forget/);
+  assert.match(result.content[0].text, /memory_read/);
+  assert.match(result.content[0].text, /memory_remember\.correct/);
+  assert.doesNotMatch(result.content[0].text, /use memory_forget/);
   assert.ok(result.content[0].text.includes(`[fact:${first.id}]`));
   assert.ok(result.content[0].text.includes(`[fact:${second.id}]`));
   assert.equal(getFact(first.id)?.active, true, 'no unjudged automatic deletion');

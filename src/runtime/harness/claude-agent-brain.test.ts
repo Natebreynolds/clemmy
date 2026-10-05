@@ -240,6 +240,59 @@ function installPreparedClaudeWorkflowDispatch(input: {
   }));
 }
 
+/** Use the real source/context/queue/consolidation stores, with provider-free
+ * decisions, before testing the SDK's receipt presentation boundary. */
+let fixtureAutomaticMemorySerial = 0;
+async function retainAutomaticMemoryForClaude(sessionId: string, message: string, promote = true) {
+  const { captureFreshSourceSessionContext } = await import('./source-session-context.js');
+  const { selectAutoMemoryCandidates, automaticMemoryOriginsForCapture, autoCaptureProvenanceFromAcceptedEvent } =
+    await import('../../memory/auto-capture.js');
+  const { enqueueAutoCaptureCandidates, drainDurableConsolidationCandidates } =
+    await import('../../memory/durable-consolidation.js');
+  const runId = `sdk-memory-fixture:${++fixtureAutomaticMemorySerial}`;
+  const attempt = beginRunAttempt(sessionId, { runId });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: (listEvents(sessionId, { types: ['user_input_received'] }).at(-1)?.turn ?? 0) + 1,
+    role: 'user', data: { text: message, displayText: message, runId },
+  });
+  assert.ok(captureFreshSourceSessionContext({ sessionId, sourceUserSeq: source.seq }));
+  const input = { message, sessionId, sourceEventId: `user-source:${source.seq}`,
+    occurredAt: source.createdAt, sourceProvenance: autoCaptureProvenanceFromAcceptedEvent(source) };
+  const candidates = selectAutoMemoryCandidates(message, 3);
+  assert.ok(candidates.length > 0);
+  const origins = automaticMemoryOriginsForCapture(input, candidates);
+  assert.ok(origins.every(Boolean), 'each queued claim is bound to the real accepted source and frozen context');
+  const queued = enqueueAutoCaptureCandidates({ ...input, candidates, origins });
+  assert.equal(queued.candidateIds.length, candidates.length);
+  if (promote) {
+    const result = await drainDurableConsolidationCandidates({
+      ids: queued.candidateIds, limit: queued.candidateIds.length,
+      resolver: async () => ({ decision: 'ADD' }),
+      standingReviewer: async (ownerText, _candidate, _mode, origin) => {
+        assert.ok(origin);
+        assert.equal(ownerText, message);
+        assert.equal(origin.source.context?.sourceUserSeq, source.seq);
+        return { scope: 'standing', reason: 'controlled source-bound fixture', destinationDecision: {
+          durability: 'standing', claim: origin.claim, destination: 'kind_default', destinationSpans: [],
+          reason: 'controlled review found no explicit destination instruction',
+        } };
+      },
+    });
+    assert.equal(result.promoted, queued.candidateIds.length, JSON.stringify(result));
+    assert.equal(result.retried + result.expired + result.skipped, 0);
+  } else {
+    // Model a worker that already owns this queue lease. SDK redelivery must
+    // leave it pending rather than launch a competing review/save in a microtask.
+    for (const id of queued.candidateIds) {
+      const leased = openMemoryDb().prepare(`UPDATE memory_reflection_candidates
+        SET processing_started_at = ?, attempt_count = 1 WHERE id = ? AND status = 'pending'`)
+        .run(new Date().toISOString(), id);
+      assert.equal(leased.changes, 1);
+    }
+  }
+  return { sourceUserSeq: source.seq, runId, channel: 'desktop' as const };
+}
+
 beforeEach(() => {
   currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(null);
   resetEventLog();
@@ -956,7 +1009,8 @@ test('SDK brain gives a receipt-backed acknowledgement-only correction zero tool
     return { done: true, reason: 'the receipt already satisfies the request' };
   });
 
-  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+  const retained = await retainAutomaticMemoryForClaude(sessionId, message);
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId, ...retained });
 
   assert.equal(response.text, providerReply);
   assert.equal(runCalls, 1);
@@ -967,7 +1021,7 @@ test('SDK brain gives a receipt-backed acknowledgement-only correction zero tool
     { who: 'user', text: 'Keep our conversations warm and direct.' },
     { who: 'assistant', text: 'Absolutely — warm, direct, and still me.' },
   ], 'the complete conversational history remains available to Claude');
-  assert.match(capturedSystemAppend, /Cedar-12/, 'the cacheable personalized prefix remains stable during asynchronous consolidation');
+  assert.match(capturedSystemAppend, /Cedar-12/, 'the cacheable personalized prefix remains stable while fresh receipt evidence supplies the correction');
   assert.match(capturedSystemAppend, /plain, warm, specific/i, 'the core conversational voice contract remains present');
   assert.match(capturedTurnContext, /supersedes any older conflicting value/i);
   assert.match(capturedTurnContext, /already durably queued/i);
@@ -1028,7 +1082,8 @@ test('SDK brain seals an unsafe receipt presentation behind a deterministic fall
     return { done: true, reason: 'receipt complete' };
   });
 
-  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+  const retained = await retainAutomaticMemoryForClaude(sessionId, message);
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId, ...retained });
 
   assert.equal(prompts.length, 1, 'presentation policy cannot mint a second model step');
   assert.equal(prompts[0], message);
@@ -1067,7 +1122,8 @@ test('SDK brain byte-preserves safe receipt acknowledgements outside a fixed ope
       };
     });
 
-    const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+    const retained = await retainAutomaticMemoryForClaude(sessionId, message);
+    const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId, ...retained });
 
     assert.equal(runCalls, 1, `fixture ${index} needs no style repair`);
     assert.equal(response.text, reply, `fixture ${index} remains byte-identical`);
@@ -1097,7 +1153,8 @@ test('SDK brain replaces a false denial after durable memory intake without anot
     };
   });
 
-  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+  const retained = await retainAutomaticMemoryForClaude(sessionId, message);
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId, ...retained });
 
   assert.equal(runCalls, 1);
   assert.equal(response.text, "Got it — I'll remember that.");
@@ -1122,7 +1179,8 @@ test('SDK brain replaces an unrelated completed-effect claim without another mod
     };
   });
 
-  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+  const retained = await retainAutomaticMemoryForClaude(sessionId, message);
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId, ...retained });
 
   assert.equal(runCalls, 1);
   assert.equal(response.text, "Got it — I'll remember that.");
@@ -1148,7 +1206,8 @@ test('SDK brain falls back safely when the sealed receipt repair is still unsafe
     };
   });
 
-  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+  const retained = await retainAutomaticMemoryForClaude(sessionId, message);
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId, ...retained });
 
   assert.equal(runCalls, 1, 'receipt presentation policy cannot re-enter the model');
   assert.equal(response.text, "Got it — I'll remember that.");
@@ -1192,9 +1251,11 @@ test('SDK brain preserves an explicit caller tool allowlist on an acknowledgemen
     };
   });
 
+  const retained = await retainAutomaticMemoryForClaude(sessionId, message);
   await respondViaClaudeAgentSdkBrain('home', {
     message,
     sessionId,
+    ...retained,
     allowedToolNames: ['memory_recall_all'],
   });
 
@@ -1236,9 +1297,11 @@ test('SDK brain keeps receipt semantics when the caller already supplied an expl
     };
   });
 
+  const retained = await retainAutomaticMemoryForClaude(sessionId, message);
   await respondViaClaudeAgentSdkBrain('home', {
     message,
     sessionId,
+    ...retained,
     allowedToolNames: [],
   });
 
@@ -1303,7 +1366,8 @@ test('SDK brain replaces malformed receipt presentation without reopening tools 
       return { done: true, reason: 'unused' };
     });
 
-    const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId: fixture.sessionId });
+    const retained = await retainAutomaticMemoryForClaude(fixture.sessionId, message);
+    const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId: fixture.sessionId, ...retained });
 
     assert.equal(response.text, fixture.expected);
     assert.equal(response.stoppedReason, 'success');
@@ -1339,7 +1403,8 @@ test('SDK brain reduces a receipt presentation provider failure without cross-br
     throw new ClaudeSdkProviderOverloadError('API Error: 529 overloaded_error', false);
   });
 
-  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
+  const retained = await retainAutomaticMemoryForClaude(sessionId, message);
+  const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId, ...retained });
 
   assert.equal(calls, 1);
   assert.equal(response.text, "Got it — I'll remember that.");
@@ -1350,23 +1415,32 @@ test('SDK brain reduces a receipt presentation provider failure without cross-br
   assert.equal(listEvents(sessionId, { types: ['tool_called'] }).length, 0);
 });
 
-test('SDK brain auto-captures explicit remember turns even when the model skips memory_remember', async () => {
+for (const pending of [
+  { name: 'original exact wording', message: 'Remember exactly: my smoke marker is MEMTOK-999999. Confirm.', acknowledgementOnly: false },
+  { name: 'receipt eligible wording', message: 'Remember this: my smoke marker is MEMTOK-999999. Just confirm.', acknowledgementOnly: true },
+]) test(`SDK brain keeps a still-pending automatic memory capture non-done: ${pending.name}`, async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
-  createSession({ id: 'brain-autocap-remember', kind: 'chat', title: 'm' });
-  setClaudeAgentSdkBrainRunForTest(async () => ({
-    text: 'Saved — your smoke marker is MEMTOK-999999.',
-    sessionId: 'sdk',
-    model: 'm',
-    toolUses: [],
-  }));
-
-  await respondViaClaudeAgentSdkBrain('home', {
-    message: 'Remember exactly: my smoke marker is MEMTOK-999999. Confirm.',
-    sessionId: 'brain-autocap-remember',
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  const sessionId = `brain-autocap-remember-${pending.acknowledgementOnly}`;
+  const message = pending.message;
+  createSession({ id: sessionId, kind: 'chat', title: 'm' });
+  const retained = await retainAutomaticMemoryForClaude(sessionId, message, false);
+  assert.equal(durableMemoryReceiptAllowsConversationOnly({ message,
+    candidates: [{ reason: 'explicit remember request' }], queuedCandidateCount: 1,
+    episodeId: `auto-capture:user-source:${retained.sourceUserSeq}` }), pending.acknowledgementOnly,
+  'this is only a shape distinction; neither pending fixture has saved evidence');
+  let runCalls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    runCalls += 1;
+    return { text: 'Saved — your smoke marker is MEMTOK-999999.', sessionId: 'sdk', model: 'm', toolUses: [] };
   });
 
-  const events = listEvents('brain-autocap-remember');
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message, sessionId, ...retained,
+  });
+
+  const events = listEvents(sessionId);
   const captured = events.find((event) => event.type === 'memory_signals_captured');
   assert.ok(captured, 'SDK brain emitted memory capture telemetry for the explicit remember turn');
   assert.equal((captured!.data as { factCount?: number }).factCount, 1);
@@ -1377,8 +1451,20 @@ test('SDK brain auto-captures explicit remember turns even when the model skips 
   assert.ok(
     events.findIndex((event) => event.type === 'memory_signals_captured') <
       events.findIndex((event) => event.type === 'conversation_completed'),
-    'capture telemetry is recorded before the final saved reply',
+    'capture telemetry is recorded before the terminal verdict',
   );
+  assert.equal(captured!.data.conversationOnly, false);
+  assert.equal(captured!.data.hostReceiptId, null);
+  assert.equal(response.stoppedReason, 'unverified');
+  const terminal = events.filter(event => event.type === 'conversation_completed').at(-1);
+  assert.equal((terminal?.data.presentation as { status?: string } | undefined)?.status, 'blocked');
+  assert.notEqual(response.text, 'Saved — your smoke marker is MEMTOK-999999.');
+  assert.equal(runCalls, 1, 'pending consolidation must not prompt a duplicate-save repair');
+  assert.equal(events.filter(event => event.type === 'tool_called').length, 0);
+  assert.equal(events.filter(event => event.type === 'durable_memory_intake_receipt').length, 0);
+  const rows = openMemoryDb().prepare(`SELECT status, resulting_fact_id FROM memory_reflection_candidates
+    WHERE session_id = ? AND call_id = ?`).all(sessionId, `auto-capture:user-source:${retained.sourceUserSeq}`);
+  assert.deepEqual(rows, [{ status: 'pending', resulting_fact_id: null }]);
 });
 
 test('SDK brain durably captures an exact pre-recorded source once and isolates compound-decline memory authority', async () => {

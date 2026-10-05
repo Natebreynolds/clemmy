@@ -1,7 +1,7 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { claudeAvailable } from './harness/judge-family.js';
@@ -554,14 +554,14 @@ test('an expired CLI-owned credential still fails closed once the bounded wait e
 // refresh threw the new token away and the next one was invalid_grant.
 
 function vaultFixture(refreshToken: string) {
-  let stored = { accessToken: 'sk-ant-oat01-expired-vault', refreshToken, expiresAt: Date.now() - 60_000, source: 'vault' as const };
+  let stored: { accessToken: string; refreshToken: string; expiresAt: number; source: 'vault' } | null = { accessToken: 'sk-ant-oat01-expired-vault', refreshToken, expiresAt: Date.now() - 60_000, source: 'vault' };
   const saved: Array<{ accessToken: string; refreshToken?: string }> = [];
   __test__.setVaultTokenReaderForTests(() => stored);
   __test__.setSaveRefreshedTokensForTests((tokens) => {
     saved.push(tokens);
     stored = { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken ?? refreshToken, expiresAt: tokens.expiresAt ?? Date.now() + 3_600_000, source: 'vault' };
   });
-  return { saved, replace: (next: typeof stored) => { stored = next; } };
+  return { saved, replace: (next: NonNullable<typeof stored>) => { stored = next; }, clear: () => { stored = null; } };
 }
 
 function resetRefreshFixture() {
@@ -634,3 +634,118 @@ test('an invalid_grant for a token another refresh already replaced does not kil
     resetRefreshFixture();
   }
 });
+
+
+function delayedClaudeRefresh<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+for (const change of ['replace', 'clear', 'same-refresh-token-new-access'] as const) {
+  for (const outcome of ['success', 'terminal'] as const) {
+    test(`Claude supersession: ${change} wins over a delayed ${outcome} refresh`, async () => {
+      __test__.resetDegradedStateForTests();
+      const fixture = vaultFixture('original-refresh-fixture');
+      __test__.setRawCredentialReaderForTests(() => null);
+      const entered = delayedClaudeRefresh<void>();
+      const provider = delayedClaudeRefresh<{ accessToken: string; refreshToken: string; expiresAt: number }>();
+      __test__.setRefreshClaudeTokensForTests(async () => { entered.resolve(); return provider.promise; });
+      try {
+        const pending = loadFreshClaudeAccessToken();
+        const observed = pending.then((value) => ({ value, error: null }), (error: unknown) => ({ value: null, error }));
+        await entered.promise;
+        if (change === 'clear') fixture.clear();
+        else fixture.replace({ accessToken: 'sk-ant-oat01-replacement-fixture', refreshToken: change === 'replace' ? 'replacement-refresh-fixture' : 'original-refresh-fixture', expiresAt: FUTURE, source: 'vault' });
+        if (outcome === 'success') provider.resolve({ accessToken: 'sk-ant-oat01-old-result-fixture', refreshToken: 'old-rotation-fixture', expiresAt: FUTURE });
+        else provider.reject(new Error('Claude token refresh failed (400): invalid_grant'));
+        const result = await observed;
+        assert.equal(fixture.saved.length, 0, 'obsolete refresh must not persist');
+        if (change === 'clear') assert.ok(result.error instanceof ClaudeAuthError && result.error.kind === 'missing', 'cleared credentials must stay missing');
+        else assert.equal(result.value === 'sk-ant-oat01-replacement-fixture', true, 'use the current credential under existing selection policy');
+        assert.equal(claudeVaultRefreshDead(), false, 'do not mark a replacement grant dead');
+        assert.equal(existsSync(path.join(TMP, 'claude-auth-dead.json')), false, 'no stale durable dead marker after replacement/clear');
+        assert.equal(existsSync(path.join(TMP, 'claude-auth-degraded.json')), false, 'no stale fallback/degraded marker');
+      } finally { resetRefreshFixture(); }
+    });
+  }
+}
+
+
+for (const change of ['replace', 'clear'] as const) {
+  test(`Claude supersession: ${change} during fallback readiness does not inherit a stale degraded marker`, async () => {
+    resetKeychainFixture();
+    __test__.resetDegradedStateForTests();
+    const fixture = vaultFixture('fallback-original-fixture');
+    const entered = delayedClaudeRefresh<void>();
+    const probe = delayedClaudeRefresh<{ raw: string }>();
+    __test__.setKeychainProbeForTests(async () => { entered.resolve(); return probe.promise; });
+    __test__.setRefreshClaudeTokensForTests(async () => { throw new Error('temporary provider failure'); });
+    try {
+      const pending = loadFreshClaudeAccessToken();
+      await entered.promise;
+      if (change === 'clear') fixture.clear();
+      else fixture.replace({ accessToken: 'sk-ant-oat01-replacement-fixture', refreshToken: 'replacement-fixture', expiresAt: FUTURE, source: 'vault' });
+      probe.resolve({ raw: cliPayload(FUTURE, 'sk-ant-oat01-cli-current-fixture') });
+      const result = await pending;
+      assert.equal(result === (change === 'clear' ? 'sk-ant-oat01-cli-current-fixture' : 'sk-ant-oat01-replacement-fixture'), true, 'current source policy wins');
+      assert.equal(fixture.saved.length, 0);
+      assert.equal(existsSync(path.join(TMP, 'claude-auth-degraded.json')), false, 'old vault failure cannot mark the new state degraded');
+    } finally { resetRefreshFixture(); resetKeychainFixture(); }
+  });
+
+  test(`Claude supersession: ${change} after caller timeout defeats background refresh completion`, async () => {
+    __test__.resetDegradedStateForTests();
+    const fixture = vaultFixture('background-original-fixture');
+    __test__.setRawCredentialReaderForTests(() => cliPayload(FUTURE, 'sk-ant-oat01-cli-current-fixture'));
+    __test__.setRefreshWaitMsForTests(10);
+    const provider = delayedClaudeRefresh<{ accessToken: string; refreshToken: string; expiresAt: number }>();
+    __test__.setRefreshClaudeTokensForTests(async () => provider.promise);
+    // waitAtMost intentionally unrefs its timer; keep this controlled delayed
+    // provider fixture alive until the caller's timeout has actually occurred.
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      assert.equal(await loadFreshClaudeAccessToken() === 'sk-ant-oat01-cli-current-fixture', true, 'caller uses existing fallback while the original grant is current');
+      if (change === 'clear') fixture.clear();
+      else fixture.replace({ accessToken: 'sk-ant-oat01-replacement-fixture', refreshToken: 'replacement-fixture', expiresAt: FUTURE, source: 'vault' });
+      provider.resolve({ accessToken: 'sk-ant-oat01-obsolete-result-fixture', refreshToken: 'obsolete-rotation-fixture', expiresAt: FUTURE });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(fixture.saved.length, 0, 'background completion cannot restore the superseded grant');
+    } finally { clearTimeout(keepAlive); resetRefreshFixture(); }
+  });
+}
+
+
+for (const outcome of ['terminal', 'timeout'] as const) {
+  test(`Claude supersession: coalesced waiter uses the originating grant for ${outcome}`, async () => {
+    __test__.resetDegradedStateForTests();
+    const fixture = vaultFixture('shared-refresh-fixture');
+    __test__.setRawCredentialReaderForTests(() => null);
+    __test__.setRefreshWaitMsForTests(15);
+    const entered = delayedClaudeRefresh<void>();
+    const provider = delayedClaudeRefresh<{ accessToken: string; refreshToken: string; expiresAt: number }>();
+    let calls = 0;
+    __test__.setRefreshClaudeTokensForTests(async () => { calls += 1; entered.resolve(); return provider.promise; });
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      const first = loadFreshClaudeAccessToken();
+      await entered.promise;
+      fixture.replace({ accessToken: 'sk-ant-oat01-replacement-fixture', refreshToken: 'shared-refresh-fixture', expiresAt: Date.now() + 120_000, source: 'vault' });
+      const second = loadFreshClaudeAccessToken();
+      if (outcome === 'terminal') provider.reject(new Error('Claude token refresh failed (400): invalid_grant'));
+      const results = await Promise.all([first, second]);
+      assert.equal(calls, 1, 'never spend the same rotating refresh token twice');
+      assert.equal(results.every(value => value === 'sk-ant-oat01-replacement-fixture'), true, 'both waiters use current credentials');
+      assert.equal(claudeVaultRefreshDead(), false, 'old shared error cannot poison the replacement');
+      assert.equal(existsSync(path.join(TMP, 'claude-auth-dead.json')), false);
+      assert.equal(existsSync(path.join(TMP, 'claude-auth-degraded.json')), false);
+    } finally {
+      provider.resolve({ accessToken: 'sk-ant-oat01-obsolete-result-fixture', refreshToken: 'obsolete-rotation-fixture', expiresAt: FUTURE });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(fixture.saved.length, 0, 'shared background work stays superseded');
+      clearTimeout(keepAlive);
+      resetRefreshFixture();
+    }
+  });
+}

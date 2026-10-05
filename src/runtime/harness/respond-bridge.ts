@@ -116,7 +116,7 @@ import {
 } from '../../config.js';
 import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import { falloverBrainModelIds, type BrainProviderClass } from './model-role-options.js';
-import { resolveRoleModel } from './model-roles.js';
+import { resolveRoleModel, withAcceptedTurnBrainModel } from './model-roles.js';
 import { withRouteDiagnostics, routeDiagnosticsFromResponse } from './response-route.js';
 import { acceptedResponseRoute } from './accepted-response-route.js';
 import { resolveWriteEvidence, synthesizeTurnReport, synthesizeWorkReport } from './work-report.js';
@@ -1593,6 +1593,7 @@ export async function respondViaHarness(
   let detachProgressRelay: () => void = () => {};
   let requestAttemptStatus: 'completed' | 'cancelled' | 'failed' = 'failed';
   let preserveRequestAttemptOwnership = false;
+  const modelForRun = opts.modelOverride ?? (config.honorModel && request.model ? request.model : undefined);
   try {
   return await withAcceptedSourceSessionContext({ sessionId, sourceUserSeq: sourceUserEvent.seq }, async execution => {
   const resumesExecutionCheckpoint = execution.sourceUserSeq !== sourceUserEvent.seq;
@@ -1622,30 +1623,39 @@ export async function respondViaHarness(
   // Caller-supplied semantic context is stripped when no valid packet exists.
   const hostOwnsTurn = Boolean(opts.turnEngine && isHostTurnEngine(opts.turnEngine));
   const callerSourceStrategyBinding = request.turnCandidates?.sourceStrategyBinding;
-  if (hostOwnsTurn && !resumesExecutionCheckpoint) {
-    await prepareCheckedHostClarificationAnswer({
-      sessionId: request.sessionId,
-      sourceUserSeq: sourceUserEvent.seq,
-      turn: sourceUserEvent.turn,
-      surface,
+  const prepareContinuity = async () => {
+    if (hostOwnsTurn && !resumesExecutionCheckpoint) {
+      await prepareCheckedHostClarificationAnswer({
+        sessionId: request.sessionId,
+        sourceUserSeq: sourceUserEvent.seq,
+        turn: sourceUserEvent.turn,
+        surface,
+      });
+      // A reply that bound no answer: Jev reads whether it tries to answer
+      // (reask) or asks something back (the brain replies, step on hold).
+      await classifyUnsettledOpenQuestionReply({
+        sessionId: request.sessionId,
+        sourceUserSeq: sourceUserEvent.seq,
+      });
+    }
+    markPreparation('clarification_checked');
+    const typedClassification = !resumesExecutionCheckpoint && semanticPortParticipated(request.sessionId, sourceUserEvent.seq)
+      ? (typedClassificationFromLastInterpretation(request.sessionId, sourceUserEvent.seq) ?? { keepOpen: true as const })
+      : undefined;
+    const requestBeforeContinuity = request;
+    if (!resumesExecutionCheckpoint) request = await enrichAcceptedRequestWithTaskContinuity(request, sourceUserEvent.seq, {
+      ...(hostOwnsTurn ? { continuationOnly: true, resolveCandidates: false } : {}),
+      typedClassification,
     });
-    // A reply that bound no answer: Jev reads whether it tries to answer
-    // (reask) or asks something back (the brain replies, step on hold).
-    await classifyUnsettledOpenQuestionReply({
-      sessionId: request.sessionId,
-      sourceUserSeq: sourceUserEvent.seq,
-    });
-  }
-  markPreparation('clarification_checked');
-  const typedClassification = !resumesExecutionCheckpoint && semanticPortParticipated(request.sessionId, sourceUserEvent.seq)
-    ? (typedClassificationFromLastInterpretation(request.sessionId, sourceUserEvent.seq) ?? { keepOpen: true as const })
-    : undefined;
-  const requestBeforeContinuity = request;
-  if (!resumesExecutionCheckpoint) request = await enrichAcceptedRequestWithTaskContinuity(request, sourceUserEvent.seq, {
-    ...(hostOwnsTurn ? { continuationOnly: true, resolveCandidates: false } : {}),
-    typedClassification,
-  });
-  markPreparation('continuity_resolved');
+    markPreparation('continuity_resolved');
+    return { typedClassification, requestBeforeContinuity };
+  };
+  // Preparation precedes the foreground model/usage scope. Carry only the
+  // already-authorized route through this boundary; later worker and memory
+  // jobs keep their own routing even when attributed to this accepted source.
+  const { typedClassification, requestBeforeContinuity } = await (modelForRun
+    ? withAcceptedTurnBrainModel({ sessionId, sourceUserSeq: execution.sourceUserSeq, modelId: modelForRun }, prepareContinuity)
+    : prepareContinuity());
   // Keep the literal Q/B user item byte-exact. The exact durable packet and
   // admitted visible option may mint one transient system steer; caller-
   // supplied semantic context was stripped/rebuilt at the boundary above.
@@ -1864,7 +1874,6 @@ export async function respondViaHarness(
   }
 
   detachProgressRelay = attachLegacyProgressRelay(request);
-    const modelForRun = opts.modelOverride ?? (config.honorModel && request.model ? request.model : undefined);
     // A verified clarification continuation may carry a richer private query
     // for retrieval/tool ranking. The actual user turn remains request.message
     // all the way into runConversation and the provider prompt.

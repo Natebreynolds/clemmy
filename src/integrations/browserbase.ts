@@ -36,7 +36,11 @@ export interface BrowserbaseOperationReceipt {
 export interface BrowserbaseOperationResponse { resource: BrowserbaseResource; result: Record<string, unknown>; receipt: BrowserbaseOperationReceipt; }
 /** Nominal error identity, never a provider/caller JSON assertion of no effect. */
 export class BrowserbaseServiceError extends Error {
-  constructor(public readonly code: string, public readonly effect: 'none' | 'uncertain' = 'none') { super(code); this.name = 'BrowserbaseServiceError'; }
+  readonly httpStatus?: number;
+  constructor(public readonly code: string, public readonly effect: 'none' | 'uncertain' = 'none', httpStatus?: number) {
+    super(code); this.name = 'BrowserbaseServiceError';
+    if (typeof httpStatus === 'number' && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599) this.httpStatus = httpStatus;
+  }
 }
 const ERROR_TEXT: Record<string, string> = {
   credential_rejected: "Browserbase didn't accept the saved API key, so no browser was started. Copy the API key from Browserbase (Settings → API Keys) and save it again in Clem's Browserbase connection.",
@@ -58,6 +62,8 @@ const DEFAULT_IDLE_SECONDS = 900, DEFAULT_SESSION_TIMEOUT_SECONDS = 7200;
 const EARLIER_DEFAULTS = { idleSeconds: 300, sessionTimeoutSeconds: 1800 };
 interface PendingOperation { id: string; operation: string; targetId: string | null; controlVersion: number; startedAt: number; }
 interface PrivateResource extends Omit<BrowserbaseResource, 'elapsedSeconds'> {
+  /** Safe transport diagnostic retained for exact refused-create replay. */
+  errorHttpStatus?: number;
   requestKey: string; credentialIdentity: string; lastActivityAt: number; expiresAt: number; pending?: PendingOperation;
   lastEffect?: { operation: string; effect: 'confirmed' | 'uncertain'; targetId: string | null; at: number };
   viewerLeases?: Array<{ id: string; targetId: string | null; controlVersion: number; expiresAt: number; mode: 'human' | 'watch'; detached: boolean }>;
@@ -234,9 +240,9 @@ export class BrowserbaseService {
     resource.updatedAt = this.iso();
   }
   private serviceError(error: unknown, effect: 'none' | 'uncertain' = 'none'): BrowserbaseServiceError {
-    if (error instanceof BrowserbaseServiceError) return new BrowserbaseServiceError(error.code, effect === 'uncertain' ? effect : error.effect);
+    if (error instanceof BrowserbaseServiceError) return new BrowserbaseServiceError(error.code, effect === 'uncertain' ? effect : error.effect, error.httpStatus);
     if (error instanceof BrowserbaseCdpError) return new BrowserbaseServiceError(error.code, error.effect);
-    if (error instanceof BrowserbaseClientError) return new BrowserbaseServiceError(error.code, error.dispatched && effect === 'uncertain' ? 'uncertain' : 'none');
+    if (error instanceof BrowserbaseClientError) return new BrowserbaseServiceError(error.code, error.dispatched && effect === 'uncertain' ? 'uncertain' : 'none', error.httpStatus);
     return new BrowserbaseServiceError('browser_service_unavailable', effect);
   }
   async status(): Promise<{ configured: boolean; credentialConfigured: boolean; credentialStatus: 'available' | 'missing' | 'unavailable' | 'not_checked'; projectId: string | null; idleSeconds: number; sessionTimeoutSeconds: number; activeResources: number; privacy: { logSession: false; recordSession: false } }> {
@@ -288,7 +294,15 @@ export class BrowserbaseService {
       if (!input.conversationId || input.conversationId.length > 200 || !input.requestId || input.requestId.length > 500 || (input.recording !== undefined && typeof input.recording !== 'boolean')) throw new BrowserbaseServiceError('invalid_arguments');
       const requestKey = hash(JSON.stringify([input.conversationId, input.requestId]));
       const prior = this.store.resources.find(value => value.requestKey === requestKey);
-      if (prior) { if (prior.recording !== Boolean(input.recording)) throw new BrowserbaseServiceError('request_conflict'); return this.public(prior); }
+      if (prior) {
+        if (prior.recording !== Boolean(input.recording)) throw new BrowserbaseServiceError('request_conflict');
+        // A definite create refusal remains a refusal on replay. Keep its
+        // reservation: changing call IDs or arguments must not buy a session.
+        if (prior.state === 'stopped' && !prior.providerSessionId && !prior.pending && prior.errorCode) {
+          throw new BrowserbaseServiceError(prior.errorCode, 'none', prior.errorHttpStatus);
+        }
+        return this.public(prior);
+      }
       const policy = this.store.policy; if (!policy) throw new BrowserbaseServiceError('configuration_missing');
       const { api, credentialIdentity } = await this.api();
       // One open browser at a time holds the saved sign-in profile: two
@@ -305,7 +319,7 @@ export class BrowserbaseService {
         resource.providerSessionId = created.sessionId; resource.pending = undefined; this.settleProvider(resource, created); this.persist('uncertain'); return this.public(resource);
       } catch (error) {
         const failed = this.serviceError(error, 'uncertain');
-        resource.state = failed.effect === 'none' ? 'stopped' : 'uncertain'; resource.errorCode = failed.code; resource.updatedAt = this.iso();
+        resource.state = failed.effect === 'none' ? 'stopped' : 'uncertain'; resource.errorCode = failed.code; resource.errorHttpStatus = failed.httpStatus; resource.updatedAt = this.iso();
         if (failed.effect === 'none') resource.pending = undefined;
         this.persist(failed.effect); throw failed;
       }

@@ -12,6 +12,8 @@ import type { AcceptedModelBatchRef } from './accepted-model-batch-checkpoint.js
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-accepted-model-batch-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
+process.env.EMBEDDINGS_DISABLED = 'true';
+process.env.CLEMMY_EMBED_AT_WRITE = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-accepted-model-batch\n', 'utf8');
 
@@ -49,7 +51,9 @@ const connectionActivation = await import('./connection-execution-activation.js'
 const recoveryActivation = await import('./recovery-activation.js');
 const connectionClosure = await import('./connection-execution-closure-proof.js');
 
-test.after(() => {
+test.after(async () => {
+  (await import('../../memory/db.js')).closeMemoryDb();
+  (await import('../../projects/project-record.js'))._closeProjectStoreForTests();
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -107,8 +111,9 @@ function fixture(text: string, mode: 'normal' | 'plan' | 'execute' = 'normal') {
 
 type Fixture = ReturnType<typeof fixture>;
 
-async function connectionPauseFixture() {
+async function connectionPauseFixture(beforeCheckpoint?: (task: Fixture) => void) {
   const task = fixture('Inspect the controlled CRM after connection.', 'execute');
+  beforeCheckpoint?.(task);
   const batch = await settledConnectionBatch(task);
   const agent = connectionAgent(task);
   hostProgress.bindHostConnectionProgress(agent, recordedHostProgress(task, batch));
@@ -123,8 +128,8 @@ async function connectionPauseFixture() {
   return { task, batch, agent, pause, binding, outcome };
 }
 
-async function connectionActivationFixture() {
-  const f = await connectionPauseFixture();
+async function connectionActivationFixture(beforeCheckpoint?: (task: Fixture) => void) {
+  const f = await connectionPauseFixture(beforeCheckpoint);
   const originalAttempt = eventlog.beginRunAttempt(f.task.sessionId, { runId: `original-${f.task.sourceUserSeq}` });
   eventlog.recordRunAttemptUserInput(originalAttempt, { turn: 1, role: 'user', data: { text: f.task.text } },
     { existingEventSeq: f.task.sourceUserSeq, armRunInFlight: true });
@@ -362,6 +367,145 @@ test('connection activation retains the exact task and canonical recovery behind
   assert.deepEqual(projectHarnessEventForPublic(marker)?.data, {}, 'recovery proof does not become card text or a brain prompt');
   assert.equal(physicalRows(f.task, 'call:connection-search').length, 1);
   leases.revokeDispatchLease(f.task.parentLease);
+});
+
+test('memory save after verified connection continuation uses the original scope through the SDK and host settlement', async () => {
+  const agents = await import('../../agents/agent-record.js');
+  const projects = await import('../../projects/project-record.js');
+  const { setSessionAgent } = await import('../../agents/session-agent.js');
+  const { setSessionProject } = await import('../../projects/session-project.js');
+  const scopeBinding = await import('./memory-scope-binding.js');
+  const memory = await import('../../memory/memory-scope.js');
+  const facts = await import('../../memory/facts.js');
+  const memoryDb = await import('../../memory/db.js');
+  const { getLocalRuntimeTools } = await import('../../tools/local-runtime-tools.js');
+  const { RunContext } = await import('@openai/agents');
+  const remember = getLocalRuntimeTools().find(tool => tool.name === 'memory_remember');
+  assert.ok(remember && remember.type === 'function');
+  const a = projects.createProject({ name: 'Retained memory checkpoint A' });
+  const b = projects.createProject({ name: 'Retained memory checkpoint B' });
+  const agent = agents.createAgentRecord({ name: 'Retained memory checkpoint agent', instructions: 'Controlled fixture.', createdFrom: 'console' });
+  assert.ok(a.ok && b.ok && agent.ok);
+  if (!a.ok || !b.ok || !agent.ok) throw new Error('memory continuation fixture');
+  const f = await connectionActivationFixture(task => {
+    assert.ok(setSessionProject(task.sessionId, a.project.id, { by: 'owner' }).ok);
+    assert.ok(setSessionAgent(task.sessionId, agent.agent.id, { by: 'owner' }).ok);
+  });
+  const original = sessionContext.readSourceSessionContext(f.task)!;
+  assert.ok(original);
+  const content = 'The retained checkpoint recurring report marker is SAPPHIRE CEDAR.';
+  const prior = facts.rememberFact({ kind: 'user', content, sessionId: f.task.sessionId, scope: original.memoryScope });
+  assert.ok(setSessionProject(f.task.sessionId, b.project.id, { by: 'owner' }).ok);
+  assert.ok(setSessionAgent(f.task.sessionId, null, { by: 'owner' }).ok);
+  scopeBinding._forgetPinnedMemoryScopesForTests(); scopeBinding.forgetSessionMemoryScope();
+  memoryDb.closeMemoryDb(); eventlog.closeEventLog();
+  const active = connectionActivation.activateConnectionExecution(f.input);
+  const input = { kind: 'user', content, keepFor: 'here', sessionId: null, sourcePath: null, entities: null, relationships: null };
+  const fetchBefore = globalThis.fetch;
+  let networkCalls = 0;
+  let invokes = 0;
+  globalThis.fetch = (async () => { networkCalls += 1; throw new Error('memory continuation fixture forbids network'); }) as typeof fetch;
+  try {
+    const save = () => sessionContext.withAcceptedSourceSessionContext({ sessionId: f.task.sessionId, sourceUserSeq: active.source.seq }, execution => {
+      assert.equal(execution.sourceUserSeq, f.task.sourceUserSeq);
+      assert.deepEqual(memory.scopeOfSession(f.task.sessionId), original.memoryScope);
+      return runCall({ task: f.task, callId: 'retained-memory-here', toolName: 'memory_remember', args: input,
+        effect: 'host_only', localEnvelope: true, boundary: 'host_owned_local', businessCall: false, deadlineMs: 5_000,
+        invoke: async () => { invokes += 1; return remember.invoke(new RunContext(execution), JSON.stringify(input)); } });
+    });
+    const first = await save();
+    assert.equal(first.settlement.outcome.kind, 'succeeded');
+    assert.equal(first.settlement.creditedProgress, false, 'a control save is not positive business or memory-fulfillment proof');
+    const rows = memoryDb.openMemoryDb().prepare('SELECT id, active FROM consolidated_facts WHERE content = ?').all(content);
+    assert.deepEqual(rows, [{ id: prior.id, active: 1 }]);
+    assert.deepEqual(memory.memoryScopeOf('fact', prior.id), original.memoryScope);
+    eventlog.closeEventLog();
+    const replay = await save();
+    assert.equal(replay.settlement.duplicate, true);
+    assert.equal(invokes, 1, 'retained exact call is not saved again after reopen');
+    assert.equal(networkCalls, 0);
+    assert.equal(sessionContext.readSourceSessionContext({ sessionId: f.task.sessionId, sourceUserSeq: active.source.seq }), null,
+      'the setup control cannot become a new memory owner');
+    assert.equal(memory.scopeOfSession(f.task.sessionId)?.projectId, b.project.id, 'the changed UI selection is preserved');
+  } finally { globalThis.fetch = fetchBefore; leases.revokeDispatchLease(f.task.parentLease); }
+});
+
+test('memory SDK scope and syntax refusals retain negative host settlement with no memory effects', async () => {
+  const { getLocalRuntimeTools } = await import('../../tools/local-runtime-tools.js');
+  const { RunContext } = await import('@openai/agents');
+  const { HostLocalNonWriteResult, InvalidArgumentsPreDispatchResult } = await import('./attempt-settlement.js');
+  const memoryDb = await import('../../memory/db.js');
+  await import('./memory-scope-binding.js');
+  const remember = getLocalRuntimeTools().find(tool => tool.name === 'memory_remember');
+  assert.ok(remember && remember.type === 'function');
+  const task = fixture('Remember the recurring report convention only here.');
+  const content = 'The scope-refusal recurring report marker is SILVER WALNUT.';
+  const input = { kind: 'user', content, keepFor: 'here', sessionId: 'foreign-memory-scope', sourcePath: null, entities: null, relationships: null };
+  const snapshot = () => {
+    const db = memoryDb.openMemoryDb();
+    return ['consolidated_facts', 'memory_episodes', 'fact_evidence', 'fact_validity_intervals', 'memory_scopes',
+      'entities', 'entity_observations', 'entity_aliases', 'entity_identifiers', 'fact_entities', 'entity_edges',
+      'entity_edge_evidence', 'entity_edge_validity_intervals', 'memory_policies'].map(name => [name,
+      db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name)
+        ? db.prepare(`SELECT * FROM ${name} ORDER BY rowid`).all() : null]);
+  };
+  const before = snapshot();
+  const fetchBefore = globalThis.fetch;
+  let networkCalls = 0;
+  let invokes = 0;
+  globalThis.fetch = (async () => { networkCalls += 1; throw new Error('memory refusal fixture forbids network'); }) as typeof fetch;
+  try {
+    for (const syntaxError of [false, true]) {
+      const raw = syntaxError ? JSON.stringify(input).slice(0, -1) + ',"relationships":[{"subject":"broken' : JSON.stringify(input);
+      const callId = `memory-refusal-${syntaxError ? 'syntax' : 'foreign-scope'}`;
+      const invoke = () => runCall({ task, callId, toolName: 'memory_remember', args: syntaxError ? { raw } : input,
+        effect: 'host_only', localEnvelope: true, boundary: 'host_owned_local', businessCall: false, deadlineMs: 5_000,
+        invoke: async () => {
+          invokes += 1;
+          const value = await remember.invoke(new RunContext({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq }), raw);
+          assert.ok(syntaxError ? value instanceof InvalidArgumentsPreDispatchResult : value instanceof HostLocalNonWriteResult);
+          if (value instanceof HostLocalNonWriteResult) assert.equal(value.status, 'memory_session_mismatch');
+          return value;
+        } });
+      const refused = await invoke();
+      assert.equal(refused.settlement.outcome.kind, 'invalid_arguments');
+      assert.equal(refused.settlement.outcome.directive.action, 'repair_arguments');
+      assert.equal(refused.settlement.creditedProgress, false);
+      assert.equal(refused.settlement.resultHandleId, undefined, 'a refusal does not create redeemable successful memory evidence');
+      // The host reserves before entering the SDK. A returned refusal therefore
+      // has a terminal HOST row, not provider traffic or proof of a mutation.
+      const ledger = () => {
+        const db = eventlog.openEventLog();
+        const key = [task.sessionId, task.sourceUserSeq, callId];
+        return {
+          physical: db.prepare(`SELECT state, execution_site, tool_name FROM physical_dispatches
+            WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ? ORDER BY ordinal`).all(...key),
+          frozen: db.prepare(`SELECT terminal_state, execution_site, tool_name FROM logical_call_settlement_crossings
+            WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ? ORDER BY ordinal`).all(...key),
+          settlement: db.prepare(`SELECT execution_kind, outcome_kind, business_call, credited_progress,
+            physical_crossing_count, host_crossing_count, result_handle_id FROM logical_call_settlements
+            WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`).get(...key),
+        };
+      };
+      const settledLedger = ledger();
+      assert.deepEqual(settledLedger, {
+        physical: [{ state: 'returned', execution_site: 'host', tool_name: 'memory_remember' }],
+        frozen: [{ terminal_state: 'returned', execution_site: 'host', tool_name: 'memory_remember' }],
+        settlement: { execution_kind: syntaxError ? 'refused_pre_dispatch' : 'local_execution',
+          outcome_kind: 'invalid_arguments', business_call: 0, credited_progress: 0,
+          physical_crossing_count: 0, host_crossing_count: 1, result_handle_id: null },
+      });
+      assert.deepEqual(snapshot(), before, 'facts, episodes, scopes, policies and graph must remain unchanged');
+      const callsBeforeReplay = invokes;
+      // Failed logical calls are not successful replayable results. Their
+      // original identity fails closed; an authorized repair is a new call.
+      await assert.rejects(invoke, /settled logical outcome invalid_arguments is not replayable/);
+      assert.equal(invokes, callsBeforeReplay, 'exact refusal replay must not execute a lossy save');
+      assert.deepEqual(ledger(), settledLedger, 'replay retains the same negative settlement and host reservation');
+      assert.deepEqual(snapshot(), before);
+    }
+    assert.equal(networkCalls, 0);
+  } finally { globalThis.fetch = fetchBefore; leases.revokeDispatchLease(task.parentLease); }
 });
 
 test('repeated device continuation and reopen do not install an old checkpoint after adoption', async () => {

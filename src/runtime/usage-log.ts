@@ -54,6 +54,14 @@ export interface UsageEvent {
   kindReason?: string;
   /** Model name (gpt-5.4, gpt-5.4-mini, text-embedding-3-small, etc.). */
   model: string;
+  /** Final outgoing request model after adapter/SDK overrides. Independent of
+   *  the selected pin and provider-reported model; never normalized to match. */
+  requestModel?: string;
+  /** Configured backend registry ID. Does not identify an account or grant. */
+  backendId?: string;
+  /** Model explicitly named by the provider response. Absent when unreported;
+   *  unlike legacy `model`, this field never falls back to the request. */
+  providerReportedModel?: string;
   /** Explicit request role (brain/worker/reviewer/router/writer/memory) and
    *  how it was set (`explicit` call, attribution `scope`, `channel`
    *  convention, or `unset`). Rollups group by this, never by model name or
@@ -581,12 +589,22 @@ export function usageRoleFromChannel(channel: string | undefined): UsageRequestR
   return undefined;
 }
 
+function usageModelIdentity(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(value) && !value.includes('://');
+}
+function usageBackendIdentity(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(value);
+}
+
 export function recordModelUsage(args: {
   sessionId: string;
   channel?: string;
   /** Explicit request role; wins over the attribution scope's role. */
   role?: UsageRequestRole;
   model: string;
+  requestModel?: string;
+  backendId?: string;
+  providerReportedModel?: string;
   /** Declared by the adapter that owns the wire format. Absent = 'unknown'
    *  (legacy): visible, uncertifiable, conservatively debited. */
   cacheDialect?: CacheDialectProvenance;
@@ -691,6 +709,12 @@ export function recordModelUsage(args: {
     kind: resolution.kind,
     kindReason: resolution.reason,
     model: args.model,
+    // Identity metadata is additive; it never changes model grouping, cache
+    // arithmetic, accepted-source ownership, or account attribution. Reject
+    // content/URL-shaped values instead of persisting or rewriting them.
+    ...(usageModelIdentity(args.requestModel) ? { requestModel: args.requestModel } : {}),
+    ...(usageBackendIdentity(args.backendId) ? { backendId: args.backendId } : {}),
+    ...(usageModelIdentity(args.providerReportedModel) ? { providerReportedModel: args.providerReportedModel } : {}),
     cacheDialect: args.cacheDialect ?? 'unknown' as const,
     // Sealed at persistence: an unsealable (content-shaped) envelope is
     // dropped, never appended raw.

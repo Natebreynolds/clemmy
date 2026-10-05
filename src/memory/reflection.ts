@@ -1365,6 +1365,10 @@ export interface ConsolidateOutcome {
 }
 
 export interface ConsolidateOptions {
+  /** Optional synchronous write boundary for a leased producer. The caller
+   * validates ownership and executes the callback in one memory transaction.
+   * Ordinary consolidation keeps its existing behavior when omitted. */
+  runMutation?: <T>(run: () => T) => T;
   /** Tier A1 novelty fast-path: if the most-similar existing fact's cosine
    *  similarity is strictly below this value, skip the LLM conflict
    *  resolver and ADD directly (the candidate is clearly novel). Omit to
@@ -1565,27 +1569,36 @@ function newerExplicitCorrectionFor(candidate: ConsolidateCandidate): Consolidat
     .sort((a, b) => (factTimeMs(b) ?? 0) - (factTimeMs(a) ?? 0))[0] ?? null;
 }
 
+async function recordConsolidationConflict(
+  input: { candidateFactId: number; similarFactIds: number[] },
+  runMutation: NonNullable<ConsolidateOptions['runMutation']>,
+): Promise<void> {
+  let record: typeof import('./conflict-retry.js').recordUnresolvedConflict;
+  try { record = (await import('./conflict-retry.js')).recordUnresolvedConflict; }
+  catch { return; }
+  // The ownership error belongs outside the optional-bookkeeping catch.
+  runMutation(() => { try { record(input); } catch { /* existing best-effort ledger */ } });
+}
+
 async function retireLateFactBehindNewerCorrection(
   candidate: ConsolidateCandidate,
   fact: ConsolidatedFact,
+  runMutation: NonNullable<ConsolidateOptions['runMutation']>,
 ): Promise<ConsolidatedFact | null> {
   const winner = newerExplicitCorrectionFor(candidate);
   if (!winner || winner.id === fact.id) return null;
-  const retired = markFactSupersededBy(fact.id, winner.id, {
+  const retired = runMutation(() => markFactSupersededBy(fact.id, winner.id, {
     validTo: winner.validFrom ?? winner.createdAt,
     // The winner is not an inferred string: isStoredExplicitUserCorrection
     // requires direct conversation provenance, trust=1, and explicit wording.
     allowPinned: true,
     transferPin: true,
-  });
+  }));
   if (!retired) {
     // Build on the existing confident-ADD ledger rather than inventing a
     // second repair subsystem. Candidate means "the correction that wins";
     // similar contains the exact older row maintenance must revisit.
-    try {
-      const { recordUnresolvedConflict } = await import('./conflict-retry.js');
-      recordUnresolvedConflict({ candidateFactId: winner.id, similarFactIds: [fact.id] });
-    } catch { /* the source fact remains durable even if bookkeeping fails */ }
+    await recordConsolidationConflict({ candidateFactId: winner.id, similarFactIds: [fact.id] }, runMutation);
   }
   return winner;
 }
@@ -1737,6 +1750,7 @@ async function consolidateFactInner(
   ctx: ConsolidateContext = {},
   opts: ConsolidateOptions = {},
 ): Promise<ConsolidateOutcome> {
+  const runMutation: NonNullable<ConsolidateOptions['runMutation']> = opts.runMutation ?? (run => run());
   const out: ConsolidateOutcome = { action: 'ignore', written: 0, updated: 0, deleted: 0, noop: 0, importanceAdded: 0 };
 
   // INCIDENT QUARANTINE (2026-07-31 live poison): a DERIVED complaint about
@@ -1761,7 +1775,7 @@ async function consolidateFactInner(
   // Best-effort: a pin failure must never break consolidation.
   const maybePin = (id: number | undefined | null): void => {
     if (!candidate.pin || !id) return;
-    try { setFactPinned(id, true); } catch { /* best-effort */ }
+    runMutation(() => { try { setFactPinned(id, true); } catch { /* best-effort */ } });
   };
 
   const reportRemainingCorrection = async (): Promise<void> => {
@@ -1776,10 +1790,7 @@ async function consolidateFactInner(
       factIds,
       reason: 'The correction was saved, but other related facts remain active and need comparison with the user instruction.',
     };
-    try {
-      const { recordUnresolvedConflict } = await import('./conflict-retry.js');
-      recordUnresolvedConflict({ candidateFactId: out.factId, similarFactIds: factIds });
-    } catch { /* Foreground callers still receive the unresolved candidates. */ }
+    await recordConsolidationConflict({ candidateFactId: out.factId, similarFactIds: factIds }, runMutation);
   };
 
   const rememberInput: RememberInput = {
@@ -1800,13 +1811,13 @@ async function consolidateFactInner(
     fact: ConsolidatedFact;
     supersededByNewerCorrection: ConsolidatedFact | null;
   }> => {
-    const fact = rememberFact(rememberInput);
-    const supersededByNewerCorrection = await retireLateFactBehindNewerCorrection(candidate, fact);
+    const fact = runMutation(() => rememberFact(rememberInput));
+    const supersededByNewerCorrection = await retireLateFactBehindNewerCorrection(candidate, fact, runMutation);
     // A late stale pin must not be re-applied after the causal guard retired it.
     // When necessary markFactSupersededBy transfers an existing standing pin to
     // the direct user correction.
     if (supersededByNewerCorrection && candidate.pin) {
-      try { setFactPinned(supersededByNewerCorrection.id, true); } catch { /* best-effort */ }
+      runMutation(() => { try { setFactPinned(supersededByNewerCorrection.id, true); } catch { /* best-effort */ } });
     } else if (!supersededByNewerCorrection) {
       maybePin(fact.id);
     }
@@ -1821,7 +1832,7 @@ async function consolidateFactInner(
         ? related[0]
         : null;
     if (!target) return false;
-    const corrected = supersedeFact(target.id, {
+    const corrected = runMutation(() => supersedeFact(target.id, {
       content: candidate.text,
       trustLevel: candidate.trustLevel,
       importance: candidate.importance,
@@ -1833,7 +1844,7 @@ async function consolidateFactInner(
       derivationDepth: candidate.derivationDepth,
       derivedFromFactIds: candidate.derivedFromFactIds,
       evidence: candidate.evidence,
-    });
+    }));
     if (!corrected) return false;
     out.action = 'supersede';
     out.factId = corrected.id;
@@ -1931,7 +1942,7 @@ async function consolidateFactInner(
     topSim >= GROUND_TRUTH_CONFLICT_SIM &&
     (scored[0].fact.trustLevel ?? 1.0) <= 0.6
   ) {
-    const updated = supersedeFact(scored[0].fact.id, {
+    const updated = runMutation(() => supersedeFact(scored[0].fact.id, {
       content: candidate.text,
       trustLevel: candidate.trustLevel,
       importance: candidate.importance,
@@ -1943,7 +1954,7 @@ async function consolidateFactInner(
       derivationDepth: candidate.derivationDepth,
       derivedFromFactIds: candidate.derivedFromFactIds,
       evidence: candidate.evidence,
-    });
+    }));
     if (updated) {
       out.action = 'supersede';
       out.factId = updated.id;
@@ -2030,8 +2041,9 @@ async function consolidateFactInner(
     // metadata without minting another fact. Otherwise two different meetings
     // can corroborate the same person/project claim, yet only the first source
     // survives—a provenance loss disguised as successful deduplication.
-    if (out.factId) {
-      const target = getFact(out.factId);
+    const noopFactId = out.factId;
+    if (noopFactId) runMutation(() => {
+      const target = getFact(noopFactId);
       if (target) {
         updateFact(target.id, {
           trustLevel: candidate.trustLevel,
@@ -2059,7 +2071,7 @@ async function consolidateFactInner(
           });
         }
       }
-    }
+    });
     out.noop = 1;
     await reportRemainingCorrection();
     return out;
@@ -2083,7 +2095,8 @@ async function consolidateFactInner(
   }
 
   if (pinnedTargetId === null && decision.decision === 'DELETE' && typeof decision.target_id === 'number') {
-    const replacement = supersedeFact(decision.target_id, {
+    const targetId = decision.target_id;
+    const replacement = runMutation(() => supersedeFact(targetId, {
       content: candidate.text,
       trustLevel: candidate.trustLevel,
       importance: candidate.importance,
@@ -2095,7 +2108,7 @@ async function consolidateFactInner(
       derivationDepth: candidate.derivationDepth,
       derivedFromFactIds: candidate.derivedFromFactIds,
       evidence: candidate.evidence,
-    });
+    }));
     if (replacement) {
       maybePin(replacement.id);
       out.action = 'supersede';
@@ -2109,12 +2122,13 @@ async function consolidateFactInner(
   }
 
   if (pinnedTargetId === null && decision.decision === 'UPDATE' && typeof decision.target_id === 'number') {
+    const targetId = decision.target_id;
     // Re-enforce the schema's rewrite cap (finalOutput is cast, not parsed).
     const rewrite =
       decision.rewrite && decision.rewrite.length <= CONFLICT_REWRITE_MAX_CHARS
         ? decision.rewrite
         : undefined;
-    const updated = supersedeFact(decision.target_id, {
+    const updated = runMutation(() => supersedeFact(targetId, {
       content: rewrite || candidate.text,
       // Tool-derived candidates keep the historical 0.6; user candidates
       // pass 1.0. updateFact MAX-merges trust, so user always wins.
@@ -2128,7 +2142,7 @@ async function consolidateFactInner(
       derivationDepth: candidate.derivationDepth,
       derivedFromFactIds: candidate.derivedFromFactIds,
       evidence: candidate.evidence,
-    });
+    }));
     if (updated) {
       out.action = 'supersede';
       out.factId = updated.id;
@@ -2188,13 +2202,7 @@ async function consolidateFactInner(
         reason: decision.unresolvedReason ?? 'No valid conflict decision was applied to the related facts.',
       };
     }
-    try {
-      const { recordUnresolvedConflict } = await import('./conflict-retry.js');
-      recordUnresolvedConflict({
-        candidateFactId: added.id,
-        similarFactIds: factIds,
-      });
-    } catch { /* the queue is a safety net; the ADD itself already stands */ }
+    await recordConsolidationConflict({ candidateFactId: added.id, similarFactIds: factIds }, runMutation);
   }
   return out;
 }

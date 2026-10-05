@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { before, beforeEach, test } from 'node:test';
+import { after, before, beforeEach, test } from 'node:test';
 import { rmSync } from 'node:fs';
 
 const TEST_HOME = '/tmp/clemmy-test-durable-consolidation';
@@ -10,10 +10,57 @@ delete process.env.OPENAI_API_KEY;
 
 const { openMemoryDb, closeMemoryDb, resetMemoryDb } = await import('./db.js');
 const {
-  drainDurableConsolidationCandidates,
-  enqueueAutoCaptureCandidates,
+  drainDurableConsolidationCandidates: drainActual,
+  enqueueAutoCaptureCandidates: enqueueLegacy,
 } = await import('./durable-consolidation.js');
-const { extractAutoMemoryCandidates } = await import('./auto-capture.js');
+const { extractAutoMemoryCandidates, automaticMemoryOriginsForCapture, autoCaptureProvenanceFromAcceptedEvent,
+  uniqueAutomaticMemorySpan } = await import('./auto-capture.js');
+const log = await import('../runtime/harness/eventlog.js');
+const { captureFreshSourceSessionContext } = await import('../runtime/harness/source-session-context.js');
+const { createAutomaticMemoryOrigin } = await import('./memory-destination.js');
+const { parseAutomaticStandingMemoryReview } = await import('./standing-memory-review.js');
+import type { AutomaticMemoryOrigin } from './memory-destination.js';
+import type { EnqueueAutoCaptureInput } from './durable-consolidation.js';
+
+// These are consolidation compatibility fixtures, not producer admission
+// tests. Give each positive fixture a real accepted source/context; handcrafted
+// candidate classifications still exercise the historical causal resolver cases.
+const accepted = new Map<string, ReturnType<typeof log.appendEvent>>();
+function enqueueAutoCaptureCandidates(input: EnqueueAutoCaptureInput) {
+  const key = `${input.sessionId}:${input.sourceEventId}`;
+  let event = accepted.get(key);
+  if (!event) {
+    if (!log.getSession(input.sessionId)) log.createSession({ id: input.sessionId, kind: 'chat' });
+    event = log.appendEvent({ sessionId: input.sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: input.message } });
+    if (input.occurredAt) {
+      // Controlled fixture source chronology is the causal assertion under test.
+      log.openEventLog().prepare('UPDATE events SET created_at = ? WHERE id = ?').run(input.occurredAt, event.id);
+      event = { ...event, createdAt: input.occurredAt };
+    }
+    accepted.set(key, event);
+  }
+  assert.equal(event.data.text, input.message, 'redelivery must retain fixture owner text');
+  const context = captureFreshSourceSessionContext({ sessionId: input.sessionId, sourceUserSeq: event.seq });
+  assert.ok(context);
+  const sourceEventId = `user-source:${event.seq}`;
+  const derived = automaticMemoryOriginsForCapture({ ...input, sourceEventId,
+    sourceProvenance: autoCaptureProvenanceFromAcceptedEvent(event) }, input.candidates);
+  const origins = input.candidates.map((candidate, index) => {
+    if (derived[index]?.claimMode !== 'unresolved' && derived[index]) return derived[index]!;
+    const claimText = candidate.content.replace(/^(?:Standing rule \(enforced\)|Standing prohibition|Clementine requirement|Connected-app context|Standing instruction|Standing product feedback|User preference): /, '');
+    const span = uniqueAutomaticMemorySpan(input.message, claimText);
+    assert.ok(span, 'handcrafted fixture candidate must quote a unique exact owner claim');
+    return createAutomaticMemoryOrigin({ source: { authority: 'accepted_user_input', sessionId: input.sessionId,
+      eventId: event!.id, eventSeq: event!.seq, eventType: 'user_input_received', ownerText: input.message,
+      context: { sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: context.digest, memoryScope: context.memoryScope } },
+      claim: span, claimMode: 'complete', candidate: { kind: candidate.kind, text: candidate.content } });
+  });
+  return enqueueLegacy({ ...input, sourceEventId, origins });
+}
+function drainDurableConsolidationCandidates(options: Parameters<typeof drainActual>[0] = {}) {
+  return drainActual({ resolver: async () => ({ decision: 'ADD' }), ...options });
+}
+
 const { getFactEvidence } = await import('./temporal-memory.js');
 const { readReflectionCandidateHealth } = await import('./reflection-candidates.js');
 const { buildMemoryNeighborhood } = await import('../dashboard/memory-graph.js');
@@ -21,7 +68,81 @@ const { getFact, getFactAt } = await import('./facts.js');
 const { stableContextGeneration } = await import('../runtime/stable-context-generation.js');
 
 before(() => { rmSync(TEST_HOME, { recursive: true, force: true }); });
-beforeEach(() => { resetMemoryDb(); });
+beforeEach(() => { resetMemoryDb(); accepted.clear(); });
+after(() => { closeMemoryDb(); log.closeEventLog(); });
+
+for (const pronounWithTask of [false, true]) for (const pinnedWrapper of [false, true]) test(`legacy pending referential capture cannot supersede existing scoped facts after reopen (pinned=${pinnedWrapper}, pronoun=${pronounWithTask})`, async () => {
+  const { rememberFact } = await import('./facts.js');
+  const { withMemorySettledFor, memoryScopeOf } = await import('./memory-scope.js');
+  const scope = { projectId: 'project-reference-A', agentKey: 'agent-reference@created' };
+  const otherScope = { projectId: 'project-reference-B', agentKey: 'agent-reference@created' };
+  const oldText = 'For this project, both standing conventions remain here: heading COPPER HORIZON; footnote CHARTER LAMP.';
+  const old = withMemorySettledFor(scope, () => rememberFact({ kind: 'project', content: oldText, sessionId: 'reference-drain' }));
+  const other = withMemorySettledFor(otherScope, () => rememberFact({ kind: 'project', content: oldText, sessionId: 'other-reference-drain' }));
+  const message = pronounWithTask ? 'Remember this only here. Then draft a report.'
+    : 'Correction for this project: the heading is INDIGO MEADOW, replacing COPPER HORIZON. The footnote CHARTER LAMP stays unchanged. Remember the correction only here in this project, and confirm both current conventions.';
+  const legacyContent = pronounWithTask ? 'only here.' : 'the correction only here in this project, and confirm both current conventions.';
+  const queued = withMemorySettledFor(scope, () => enqueueLegacy({ message, sessionId: 'reference-drain',
+    sourceEventId: 'user-source:71', candidates: [{ kind: pinnedWrapper ? 'feedback' : 'project',
+      content: `${pinnedWrapper ? 'Standing prohibition: ' : ''}${legacyContent}`,
+      reason: pinnedWrapper ? 'safety-critical prohibition (auto-pinned)' : 'explicit remember request',
+      ...(pinnedWrapper ? { pin: true } : {}) }] }));
+  closeMemoryDb();
+  let resolverCalls = 0;
+  let reviewCalls = 0;
+  const result = await drainDurableConsolidationCandidates({ ids: queued.candidateIds,
+    resolver: async () => { resolverCalls++; return { decision: 'ADD' as const }; },
+    standingReviewer: async (_source, candidate) => { reviewCalls++; return { scope: 'standing' as const, text: candidate, reason: 'fixture' }; } });
+  assert.equal(result.promoted, 0);
+  assert.equal(result.skipped, 1);
+  assert.equal(resolverCalls, 0);
+  assert.equal(reviewCalls, 0, 'an unresolved reference is not a factual review candidate');
+  for (const fact of [old, other]) {
+    assert.equal(getFact(fact.id)?.active, true);
+    assert.equal(getFact(fact.id)?.content, oldText);
+    assert.equal(getFact(fact.id)?.supersededByFactId, null);
+  }
+  assert.deepEqual(memoryScopeOf('fact', old.id), scope);
+  assert.deepEqual(memoryScopeOf('fact', other.id), otherScope);
+  assert.deepEqual(memoryScopeOf('episode', queued.episodeId!), scope);
+  const row = openMemoryDb().prepare('SELECT status, reason, resulting_fact_id FROM memory_reflection_candidates WHERE id = ?')
+    .get(queued.candidateIds[0]) as { status: string; reason: string; resulting_fact_id: number | null };
+  assert.deepEqual(row, { status: 'rejected', reason: 'destination_legacy', resulting_fact_id: null });
+  const episode = openMemoryDb().prepare('SELECT evidence_excerpt, call_id FROM memory_episodes WHERE id = ?')
+    .get(queued.episodeId) as { evidence_excerpt: string; call_id: string };
+  assert.equal(episode.evidence_excerpt, message);
+  assert.equal(episode.call_id, 'auto-capture:user-source:71');
+  assert.equal((await drainDurableConsolidationCandidates({ ids: queued.candidateIds })).selected, 0, 'replay cannot promote the rejected legacy reference');
+});
+
+test('a substantive supported future correction remains promotable when its full claim ends with a remember reference', async () => {
+  const message = 'Small correction for later: the heading is INDIGO MEADOW. Remember the correction.';
+  const candidates = extractAutoMemoryCandidates(message);
+  assert.equal(candidates[0]?.content, message);
+  assert.equal(candidates[0]?.reason, 'explicit durable correction');
+  const queued = enqueueAutoCaptureCandidates({ message, sessionId: 'reference-substantive-correction',
+    sourceEventId: 'user-source:72', candidates });
+  closeMemoryDb();
+  const result = await drainDurableConsolidationCandidates({ ids: queued.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }), standingReviewer: keepsTheAuthorizedClaim });
+  assert.equal(result.promoted, 1);
+  const row = openMemoryDb().prepare('SELECT resulting_fact_id FROM memory_reflection_candidates WHERE id = ?')
+    .get(queued.candidateIds[0]) as { resulting_fact_id: number };
+  assert.equal(getFact(row.resulting_fact_id)?.content, message);
+});
+
+test('a quoted reference-shaped literal remains promotable from its exact source', async () => {
+  const message = 'Remember exactly: "the correction"';
+  const queued = enqueueAutoCaptureCandidates({ message, sessionId: 'reference-quoted-literal',
+    sourceEventId: 'user-source:73', candidates: extractAutoMemoryCandidates(message) });
+  assert.equal(queued.candidateIds.length, 1);
+  const result = await drainDurableConsolidationCandidates({ ids: queued.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }), standingReviewer: keepsTheAuthorizedClaim });
+  assert.equal(result.promoted, 1);
+  const row = openMemoryDb().prepare('SELECT resulting_fact_id FROM memory_reflection_candidates WHERE id = ?')
+    .get(queued.candidateIds[0]) as { resulting_fact_id: number };
+  assert.equal(getFact(row.resulting_fact_id)?.content, '"the correction"', 'raw exact claim retains its literal delimiters');
+});
 
 test('auto capture durably records the exact source and replay payload before consolidation', () => {
   const queued = enqueueAutoCaptureCandidates({
@@ -76,11 +197,11 @@ test('auto capture durably records the exact source and replay payload before co
  * remembered claim, return it unchanged." The drain still enforces that the
  * returned span is present in the source, so the assertions keep their teeth.
  */
-const keepsTheAuthorizedClaim = async (_source: string, candidate: string) => ({
-  scope: 'standing' as const,
-  text: candidate,
-  reason: 'test stub — explicit claim already complete',
-});
+const keepsTheAuthorizedClaim = async (_source: string, _candidate: string, _mode?: unknown, origin?: AutomaticMemoryOrigin) => {
+  assert.ok(origin, 'positive fixture requires a frozen typed origin');
+  return parseAutomaticStandingMemoryReview({ durability: 'standing', claim: origin.claim,
+    destination: 'kind_default', destinationSpans: [], reason: 'Controlled complete fixture claim, checked kind default' }, origin);
+};
 
 test('compound explicit memory queues only the isolated claim while retaining the exact source episode', async () => {
   const message = 'Remember this: Cedar is Cedar-17. Also give me three launch ideas. Just confirm.';
@@ -141,7 +262,7 @@ test('maintenance replay promotes one canonical fact with the original user-turn
     SELECT status, reason, resulting_fact_id FROM memory_reflection_candidates WHERE id = ?
   `).get(queued.candidateIds[0]) as { status: string; reason: string; resulting_fact_id: number };
   assert.equal(candidate.status, 'promoted');
-  assert.equal(candidate.reason, 'consolidation:add;people_observed=1;person_links=1;person_failures=0');
+  assert.equal(candidate.reason, 'consolidation:add');
   const evidence = getFactEvidence(candidate.resulting_fact_id);
   assert.equal(evidence.length, 1);
   assert.equal(evidence[0]?.episodeId, queued.episodeId);
@@ -763,20 +884,28 @@ for (const validSource of [true, false]) {
     const message = 'Use short paragraphs in every future report.';
     createSession({id:sessionId, kind:'chat'});
     const source = appendEvent({sessionId, turn:1, role:'user', type:'user_input_received', data:{text:message}});
-    const queued = enqueueAutoCaptureCandidates({sessionId, message,
-      sourceEventId:`user-source:${validSource ? source.seq : source.seq + 1000000}`,
-      candidates:[{kind:'user', content:message, reason:'standing instruction (marker + concrete target)'}]});
+    const context = captureFreshSourceSessionContext({ sessionId, sourceUserSeq: source.seq });
+    assert.ok(context);
+    const claimSeq = validSource ? source.seq : source.seq + 1000000;
+    const origin = createAutomaticMemoryOrigin({ source: { authority: 'accepted_user_input', sessionId, eventId: source.id,
+      eventSeq: claimSeq, eventType: 'user_input_received', ownerText: message,
+      context: { sessionId, sourceUserSeq: claimSeq, digest: context.digest, memoryScope: context.memoryScope } },
+      claim: { start: 0, end: message.length }, claimMode: 'complete', candidate: { kind: 'user', text: message } });
+    const queued = enqueueLegacy({sessionId, message, sourceEventId:`user-source:${claimSeq}`,
+      candidates:[{kind:'user', content:message, reason:'standing instruction (marker + concrete target)'}], origins: [origin]});
     closeMemoryDb(); // Drain from persisted intake, with no original async scope.
     const model = `durable-accounting-model-${validSource}`;
     await withModelUsageAttribution({sessionId:'unrelated-active-chat', sourceUserSeq:999, attemptId:'unrelated-attempt'}, () =>
-      drainDurableConsolidationCandidates({ids:queued.candidateIds, standingReviewer:async () =>
+      drainDurableConsolidationCandidates({ids:queued.candidateIds, standingReviewer:async (_source, _candidate, _mode, frozen) =>
         runMemoryJob('standing', {}, async () => {
           assert.equal(modelUsageAttributionStorage.getStore()?.sessionId, '');
           recordModelUsage({sessionId:'unknown', model, cacheDialect:'inclusive', inputTokens:17, outputTokens:3});
-          return {scope:'task' as const, reason:'fixture only'};
+          assert.ok(frozen);
+          return parseAutomaticStandingMemoryReview({ durability:'task', claim:frozen.claim, destination:'unresolved', destinationSpans:[], reason:'fixture only' }, frozen);
         }, () => ({outcome:'nothing_new'}))}));
     const rows = readUsageEventsForDate().filter(row => row.model === model);
-    assert.equal(rows.length, 1);
+    assert.equal(rows.length, validSource ? 1 : 0, 'an invalid source cannot dispatch a memory review');
+    if (!validSource) return;
     assert.equal(rows[0].trace?.acceptedSource, validSource ? `${sessionId}:${source.seq}` : undefined);
     assert.equal(rows[0].trace?.attemptId, undefined, 'maintenance must not invent a parent attempt');
     assert.match(rows[0].source, /^memory:standing:/);

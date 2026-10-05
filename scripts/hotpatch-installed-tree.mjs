@@ -14,6 +14,7 @@
  *   node --import tsx scripts/patch-web-assets.mjs [--no-relaunch]
  */
 import {
+  assertMutableInstallTarget,
   inspectDaemonBuild,
   installBundledAssetDirectory,
   installDaemonPatch,
@@ -67,6 +68,19 @@ async function idleSeconds() {
   }
 }
 
+const home = process.env.HOME ?? '';
+const installed = resolveInstalledAppBundle(
+  process.env.CLEMENTINE_APP_PATH
+    ? [process.env.CLEMENTINE_APP_PATH]
+    : ['/Applications/Clementine.app', path.join(home, 'Applications', 'Clementine.app')],
+  (bundle) => JSON.parse(
+    fs.readFileSync(path.join(bundle, 'Contents/Resources/daemon/package.json'), 'utf8'),
+  ).version,
+);
+const APP = installed.bundle;
+// Refuse sealed resources before even checking or stopping the running app.
+assertMutableInstallTarget(path.join(APP, 'Contents/Resources/daemon/dist'));
+
 const IDLE_REQUIRED_SECONDS = 90;
 
 if (running()) {
@@ -93,16 +107,6 @@ if (running()) {
   console.log('quit cleanly.\n');
 }
 
-const home = process.env.HOME ?? '';
-const installed = resolveInstalledAppBundle(
-  process.env.CLEMENTINE_APP_PATH
-    ? [process.env.CLEMENTINE_APP_PATH]
-    : ['/Applications/Clementine.app', path.join(home, 'Applications', 'Clementine.app')],
-  (bundle) => JSON.parse(
-    fs.readFileSync(path.join(bundle, 'Contents/Resources/daemon/package.json'), 'utf8'),
-  ).version,
-);
-const APP = installed.bundle;
 console.log(`target ${APP} (was ${installed.version})\n`);
 
 const { stamp } = inspectDaemonBuild(path.join(REPO, 'dist'));

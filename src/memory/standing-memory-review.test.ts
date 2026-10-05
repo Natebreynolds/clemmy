@@ -34,3 +34,21 @@ test('invented standing text and malformed classifications remain retryable erro
     assert.throws(() => parseStandingMemoryReview(value, source));
   }
 });
+
+
+test('automatic review requires checked destination and complete raw claim, preserving old durability parser', async () => {
+  const { createAutomaticMemoryOrigin } = await import('./memory-destination.js');
+  const { parseAutomaticStandingMemoryReview } = await import('./standing-memory-review.js');
+  const source = 'Remember this: heading is BLUE and footnote is GOLD, only in this project.';
+  const origin = createAutomaticMemoryOrigin({ source: { authority: 'accepted_user_input', sessionId: 'review-source',
+    eventId: 'event-1', eventSeq: 1, eventType: 'user_input_received', ownerText: source,
+    context: { sessionId: 'review-source', sourceUserSeq: 1, digest: 'a'.repeat(64), memoryScope: { projectId: 'project-A', agentKey: null } } },
+    claim: { start: 15, end: source.length }, claimMode: 'complete', candidate: { kind: 'user', text: source.slice(15) } });
+  assert.throws(() => parseAutomaticStandingMemoryReview({ scope: 'standing', text: source.slice(15), reason: 'missing destination' }, origin));
+  const decision = { durability: 'standing', claim: origin.claim, destination: 'current_project',
+    destinationSpans: [{ start: source.indexOf('only'), end: source.length }], reason: 'Explicit current project' };
+  assert.equal(parseAutomaticStandingMemoryReview(decision, origin).text, source.slice(15));
+  assert.throws(() => parseAutomaticStandingMemoryReview({ ...decision, claim: { start: 15, end: source.indexOf(' and') } }, origin));
+  assert.throws(() => parseAutomaticStandingMemoryReview({ ...decision, destinationSpans: [] }, origin));
+  assert.throws(() => parseAutomaticStandingMemoryReview({ ...decision, projectId: 'model-selected-foreign-project' }, origin));
+});

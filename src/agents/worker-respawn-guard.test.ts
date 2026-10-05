@@ -21,13 +21,37 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { normalizeWorkerItemKey, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } = await import('./worker-respawn-guard.js');
+const { normalizeWorkerItemKey, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled, workerPacketRequiresReconciliation } = await import('./worker-respawn-guard.js');
 const { workerPacketKey } = await import('./worker-job-packet.js');
 const { resetEventLog, createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
 const { summarizeFanoutCoverage } = await import('../runtime/harness/fanout-ledger.js');
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
+test('rejected output with a prior effect is neither successful reuse nor permission to repeat the packet', () => {
+  const session = createSession({ kind: 'execution' });
+  const result = (data: Record<string, unknown>) => appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'worker_result', data });
+  result({ packetKey: 'fixture-research', ok: true });
+  result({ packetKey: 'fixture-research', ok: false, retryRequiresReconciliation: true });
+  assert.equal(workerAlreadyCompletedForPacket(session.id, 'fixture-research'), false, 'latest host rejection supersedes earlier claimed success');
+  assert.equal(workerPacketRequiresReconciliation(session.id, 'fixture-research'), true, 'the retained effect still prevents replay');
+  result({ packetKey: 'failed-read-only', ok: false, retryRequiresReconciliation: false });
+  assert.equal(workerPacketRequiresReconciliation(session.id, 'failed-read-only'), false);
+  result({ packetKey: 'legacy-mixed', ok: true, retryRequiresReconciliation: true });
+  assert.equal(workerAlreadyCompletedForPacket(session.id, 'legacy-mixed'), false);
+  result({ packetKey: 'conflicting-receipts', ok: true });
+  result({ packetKey: 'conflicting-receipts', ok: false, retryRequiresReconciliation: false });
+  assert.equal(workerAlreadyCompletedForPacket(session.id, 'conflicting-receipts'), false);
+  assert.equal(workerPacketRequiresReconciliation(session.id, 'conflicting-receipts'), true,
+    'a later read-only failure cannot erase earlier potentially completed effects');
+  const chat = createSession({ kind: 'chat' });
+  appendEvent({ sessionId: chat.id, turn: 1, role: 'system', type: 'worker_result',
+    data: { packetKey: 'effect-packet', sourceUserSeq: 10, ok: false, retryRequiresReconciliation: true } });
+  assert.equal(workerPacketRequiresReconciliation(chat.id, 'effect-packet', 10), true);
+  assert.equal(workerPacketRequiresReconciliation(chat.id, 'effect-packet', 20), false,
+    'an intentional new accepted chat request is not a replay of the previous request');
 });
 
 test('normalizeWorkerItemKey: domain anchor defeats trailing-parenthetical drift', () => {

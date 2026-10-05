@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { recoveryActivationOwner, type RecoveryActivationOwner } from './recovery-activation.js';
 import type { AgentInputItem } from '@openai/agents';
 import type { McpToolScope } from '../mcp-tool-scope.js';
@@ -53,6 +54,23 @@ import { SOURCE_APPROVAL_CHECKPOINTS_KEY, hostApprovalCheckpointSource, sourceAp
 
 const META_CONVERSATION = '__conversation';
 const META_INTERRUPT = '__interrupt_state';
+// Kept beside the replay snapshot so compaction/protocol repair cannot erase
+// exact synthetic-report delivery identities. Never passed to a provider.
+const META_SYNTHETIC_TURNS = '__synthetic_user_turns';
+const META_INTERRUPT_SYNTHETIC_TURNS = '__interrupt_synthetic_turns';
+interface SyntheticUserTurn { id: string; text: string }
+function syntheticUserTurns(row: SessionRow): SyntheticUserTurn[] {
+  const raw = row.metadata[META_SYNTHETIC_TURNS];
+  return Array.isArray(raw) ? raw.filter((entry): entry is SyntheticUserTurn =>
+    entry !== null && typeof entry === 'object' && typeof entry.id === 'string' && typeof entry.text === 'string') : [];
+}
+interface SyntheticObservation { observedIds: string[] }
+function syntheticObservation(value: unknown): SyntheticObservation | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const v = value as Partial<SyntheticObservation>;
+  return Array.isArray(v.observedIds) && v.observedIds.every(id => typeof id === 'string')
+    ? v as SyntheticObservation : undefined;
+}
 // Exact external-connector authority in force when the SDK paused. Approval
 // resumes rebuild an Agent, so without this sibling record a scoped/local-only
 // turn silently reopened the legacy allow-all MCP surface after approval.
@@ -61,6 +79,7 @@ const META_INTERRUPT_MCP_SCOPE = '__interrupt_mcp_scope';
 // separate key prevents UI/card owners from treating host bookkeeping as a
 // user decision while still surviving daemon restart.
 const META_RECOVERY = '__host_recovery_state';
+const META_RECOVERY_SYNTHETIC_TURNS = '__host_recovery_synthetic_turns';
 const META_RECOVERY_MCP_SCOPE = '__host_recovery_mcp_scope';
 /** Exact activation that owns the installed recovery blob. */
 const META_RECOVERY_OWNER = '__host_recovery_owner';
@@ -112,6 +131,8 @@ export interface PersistedConversation {
   items: AgentInputItem[];
   lastResponseId: string | undefined;
   updatedAt: string;
+  /** Private workflow activation deduplication; public sessions use sibling metadata. */
+  syntheticTurnIds?: string[];
 }
 
 export interface RecordTurnResultInput {
@@ -126,7 +147,63 @@ export interface RecordCompletedTurnResultInput extends RecordTurnResultInput {
 }
 
 export class HarnessSession {
-  private constructor(private row: SessionRow) {}
+  private observedSyntheticTurnIds: Set<string>;
+  private constructor(private row: SessionRow) {
+    this.observedSyntheticTurnIds = new Set(syntheticUserTurns(row).map(entry => entry.id));
+  }
+
+  private syntheticObservation(): SyntheticObservation {
+    return { observedIds: [...this.observedSyntheticTurnIds] };
+  }
+
+  private saveInterruptSyntheticObservation(serialized: string): void {
+    const hash = createHash('sha256').update(serialized).digest('hex');
+    openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(metadata_json,
+      '$.${META_INTERRUPT_SYNTHETIC_TURNS}.${hash}', json(?)) WHERE id = ?`)
+      .run(JSON.stringify(this.syntheticObservation()), this.row.id);
+  }
+
+  private observeInterrupt(serialized: string | null): string | null {
+    if (!serialized) return serialized;
+    const hash = createHash('sha256').update(serialized).digest('hex');
+    const index = this.row.metadata[META_INTERRUPT_SYNTHETIC_TURNS] as Record<string, unknown> | undefined;
+    const observation = syntheticObservation(index?.[hash]);
+    if (observation) {
+      this.observedSyntheticTurnIds = new Set(observation.observedIds);
+    }
+    return serialized;
+  }
+
+  /** Merge only arrivals newer than the snapshot this writer read. Historical
+   * reports deliberately compacted by that writer must never be reinjected. */
+  private preserveUnobservedSyntheticTurns(snapshot: PersistedConversation,
+    observation = this.syntheticObservation()): PersistedConversation {
+    const current = getSession(this.row.id);
+    if (!current) throw new Error(`session not found: ${this.row.id}`);
+    const observed = new Set(observation.observedIds);
+    const unseen = syntheticUserTurns(current).filter(entry => !observed.has(entry.id));
+    const currentItems = (current.metadata[META_CONVERSATION] as Partial<PersistedConversation> | undefined)?.items;
+    // Exact current-snapshot provenance, not report-word equivalence. A writer
+    // may reuse an already-merged snapshot (plus a new suffix) without another
+    // read. An older basis is still older even if its reports use the same words.
+    if (Array.isArray(currentItems) && currentItems.length > 0 && currentItems.length <= snapshot.items.length
+      && currentItems.every((item, index) => JSON.stringify(item) === JSON.stringify(snapshot.items[index]))) return snapshot;
+    return { ...snapshot, items: [...snapshot.items,
+      ...unseen.map(entry => ({ role: 'user', content: entry.text } as AgentInputItem))] };
+  }
+
+  private persistConversationSnapshot(snapshot: PersistedConversation): void {
+    const active = workflowParentActivation(this.row.id);
+    if (active) { active.conversation = snapshot; return; }
+    openEventLog().transaction(() => {
+      const merged = this.preserveUnobservedSyntheticTurns(snapshot);
+      const written = openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(
+        metadata_json, '$.__conversation', json(?)), updated_at = ? WHERE id = ?`)
+        .run(JSON.stringify(merged), snapshot.updatedAt, this.row.id);
+      if (written.changes !== 1) throw new Error(`session not found: ${this.row.id}`);
+    }).immediate();
+    this.refresh();
+  }
 
   private selectedApprovalSource?: number;
 
@@ -206,6 +283,9 @@ export class HarnessSession {
 
   /** Replay items to feed back into `Runner.run(agent, items, opts)`. */
   toInputItems(): AgentInputItem[] {
+    if (!workflowParentActivation(this.row.id)) {
+      this.observedSyntheticTurnIds = new Set(syntheticUserTurns(this.row).map(entry => entry.id));
+    }
     return this.conversation().items;
   }
 
@@ -219,9 +299,16 @@ export class HarnessSession {
     const active = workflowParentActivation(this.row.id);
     if (active) return { status: 'ready', disposition: 'ready', migration: 'none',
       history: active.conversation.items, providerHistory: active.conversation.items };
-    const prepared = preparePersistedSessionConversationProtocol({ sessionId: this.row.id });
-    this.refresh();
-    return prepared;
+    // The replay history and its observed report identities must describe the
+    // same snapshot, even when another process injects an outcome concurrently.
+    return openEventLog().transaction(() => {
+      const prepared = preparePersistedSessionConversationProtocol({ sessionId: this.row.id });
+      this.refresh();
+      if (prepared.status === 'ready') {
+        this.observedSyntheticTurnIds = new Set(syntheticUserTurns(this.row).map(entry => entry.id));
+      }
+      return prepared;
+    }).immediate();
   }
 
   /** Pass via `RunConfig.previousResponseId` to reuse Responses API state. */
@@ -258,22 +345,12 @@ export class HarnessSession {
    */
   updateConversationSnapshot(items: AgentInputItem[]): void {
     const snapshot: PersistedConversation = {
+      ...this.conversation(),
       items,
       lastResponseId: this.conversation().lastResponseId,
       updatedAt: new Date().toISOString(),
     };
-    const active = workflowParentActivation(this.row.id);
-    if (active) { active.conversation = snapshot; return; }
-    // Compaction may await a model while other owners update this session.
-    // Commit only our conversation field, preserving their newer metadata.
-    const written = openEventLog().prepare(
-      `UPDATE sessions
-          SET metadata_json = json_set(metadata_json, '$.__conversation', json(?)),
-              updated_at = ?
-        WHERE id = ?`,
-    ).run(JSON.stringify(snapshot), snapshot.updatedAt, this.row.id);
-    if (written.changes !== 1) throw new Error(`session not found: ${this.row.id}`);
-    this.refresh();
+    this.persistConversationSnapshot(snapshot);
   }
 
   /**
@@ -283,19 +360,39 @@ export class HarnessSession {
    * background workflow/task OUTCOME reaches the ORCHESTRATOR's reasoning: the
    * orchestrator replays toInputItems() (the harness snapshot), NOT the PWA
    * SessionStore where enqueue*OutcomeTurn also writes. Idempotent by
-   * `idPrefix` so a terminal-retry / re-drain can't double-inject. Returns true
+   * exact `identity` when supplied, otherwise the legacy `idPrefix`. Returns true
    * when it injected, false when a matching turn was already staged.
    */
-  injectSyntheticUserTurn(idPrefix: string, text: string): boolean {
-    const items = this.toInputItems();
-    const already = items.some((it) => {
-      const role = (it as { role?: unknown }).role;
-      const content = (it as { content?: unknown }).content;
-      return role === 'user' && typeof content === 'string' && content.startsWith(idPrefix);
-    });
-    if (already) return false;
-    this.updateConversationSnapshot([...items, { role: 'user', content: text } as AgentInputItem]);
-    return true;
+  injectSyntheticUserTurn(idPrefix: string, text: string, identity?: string): boolean {
+    const inject = (): boolean => {
+      const active = workflowParentActivation(this.row.id);
+      if (!active) this.refresh();
+      const items = this.conversation().items;
+      const reports = syntheticUserTurns(this.row);
+      const ids = active ? active.conversation.syntheticTurnIds ?? [] : reports.map(entry => entry.id);
+      const already = identity ? ids.includes(identity) : items.some((it) => {
+        const { role, content } = it as { role?: unknown; content?: unknown };
+        return role === 'user' && typeof content === 'string' && content.startsWith(idPrefix);
+      });
+      if (already) return false;
+      const nextItems = [...items, { role: 'user', content: text } as AgentInputItem];
+      if (active) {
+        // A private workflow snapshot is not a committed public delivery.
+        active.conversation = { ...active.conversation, items: nextItems,
+          syntheticTurnIds: identity ? [...ids, identity] : ids, updatedAt: new Date().toISOString() };
+      } else {
+        const snapshot: PersistedConversation = { ...this.conversation(), items: nextItems, updatedAt: new Date().toISOString() };
+        const written = openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(
+          metadata_json, '$.__conversation', json(?), '$.__synthetic_user_turns', json(?)), updated_at = ? WHERE id = ?`)
+          .run(JSON.stringify(snapshot), JSON.stringify(identity ? [...reports, { id: identity, text }] : reports), snapshot.updatedAt, this.row.id);
+        if (written.changes !== 1) throw new Error(`session not found: ${this.row.id}`);
+        this.refresh();
+      }
+      return true;
+    };
+    // Read/dedup/history + identity commit share a writer transaction, including
+    // replay after a crash between the passive event and snapshot injection.
+    return openEventLog().transaction(inject).immediate();
   }
 
   /**
@@ -325,18 +422,13 @@ export class HarnessSession {
    * boundary even when no semantic events fired this turn.
    */
   recordTurnResult(input: RecordTurnResultInput): void {
-    const meta = { ...this.row.metadata };
     const snapshot: PersistedConversation = {
+      ...this.conversation(),
       items: input.history,
       lastResponseId: input.lastResponseId,
       updatedAt: new Date().toISOString(),
     };
-    const active = workflowParentActivation(this.row.id);
-    if (active) active.conversation = snapshot;
-    else {
-      meta[META_CONVERSATION] = snapshot;
-      this.row = updateSession(this.row.id, { metadata: meta });
-    }
+    this.persistConversationSnapshot(snapshot);
     appendEvent({
       sessionId: this.row.id,
       turn: input.turn,
@@ -363,6 +455,7 @@ export class HarnessSession {
   recordCompletedTurnResult(input: RecordCompletedTurnResultInput): void {
     const db = openEventLog();
     const snapshot: PersistedConversation = {
+      ...this.conversation(),
       items: input.history,
       lastResponseId: input.lastResponseId,
       updatedAt: new Date().toISOString(),
@@ -375,12 +468,12 @@ export class HarnessSession {
       // writing a stale in-memory metadata object here would erase it.
       const active = workflowParentActivation(this.row.id);
       if (active) active.conversation = snapshot;
-      else db.prepare(
-        `UPDATE sessions
-            SET metadata_json = json_set(metadata_json, '$.__conversation', json(?)),
-                updated_at = ?
-          WHERE id = ?`,
-      ).run(JSON.stringify(snapshot), snapshot.updatedAt, this.row.id);
+      else {
+        const merged = this.preserveUnobservedSyntheticTurns(snapshot);
+        db.prepare(`UPDATE sessions SET metadata_json = json_set(
+          metadata_json, '$.__conversation', json(?)), updated_at = ? WHERE id = ?`)
+          .run(JSON.stringify(merged), snapshot.updatedAt, this.row.id);
+      }
 
       turnEnded = insertInternalEventInTransaction(db, {
         sessionId: this.row.id,
@@ -448,6 +541,7 @@ export class HarnessSession {
           checkpoint: { serialized, mcpToolScope: options.mcpToolScope ?? null } });
         if (!result.updated) throw new Error('Approval interrupt changed before it could be saved');
         this.projectSourceApproval();
+        this.saveInterruptSyntheticObservation(serialized);
       }).immediate();
       this.refresh();
       this.selectedApprovalSource = sourceUserSeq;
@@ -471,6 +565,7 @@ export class HarnessSession {
       const result = updated.run(serialized, new Date().toISOString(), this.row.id, expected,
         expectedScope == null ? null : JSON.stringify(expectedScope));
       if (result.changes !== 1) throw new Error('Approval interrupt changed before it could be saved');
+      this.saveInterruptSyntheticObservation(serialized);
       if (scope !== null) openEventLog().prepare(`UPDATE sessions SET metadata_json =
         json_set(metadata_json, '$.${META_INTERRUPT_MCP_SCOPE}', json(?)) WHERE id = ?`).run(scope, this.row.id);
     }).immediate();
@@ -488,16 +583,16 @@ export class HarnessSession {
     if (sourceUserSeq !== undefined) this.selectedApprovalSource = sourceUserSeq;
     if (this.selectedApprovalSource !== undefined) {
       const snapshot = sourceApprovalSnapshotFromMetadata(this.row.metadata, this.selectedApprovalSource);
-      if (snapshot.revision !== null) return snapshot.checkpoint?.serialized ?? null;
+      if (snapshot.revision !== null) return this.observeInterrupt(snapshot.checkpoint?.serialized ?? null);
       const legacy = this.row.metadata[META_INTERRUPT];
-      return typeof legacy === 'string'
-        && hostApprovalCheckpointSource(legacy, this.row.id) === this.selectedApprovalSource ? legacy : null;
+      return this.observeInterrupt(typeof legacy === 'string'
+        && hostApprovalCheckpointSource(legacy, this.row.id) === this.selectedApprovalSource ? legacy : null);
     }
     const raw = this.row.metadata[META_INTERRUPT];
-    if (typeof raw === 'string') return raw;
+    if (typeof raw === 'string') return this.observeInterrupt(raw);
     const storedSource = this.defaultStoredApprovalSource();
-    return storedSource === undefined ? null
-      : sourceApprovalSnapshotFromMetadata(this.row.metadata, storedSource).checkpoint?.serialized ?? null;
+    return this.observeInterrupt(storedSource === undefined ? null
+      : sourceApprovalSnapshotFromMetadata(this.row.metadata, storedSource).checkpoint?.serialized ?? null);
   }
 
   /** Exact MCP scope captured beside the currently parked RunState. */
@@ -607,8 +702,11 @@ export class HarnessSession {
     // ONE nested expression touching only our own keys. `json_set` leaves every
     // unrelated field alone, so a concurrent writer's metadata survives. Built
     // outward, so the textual order of the placeholders matches `bound`.
-    let expr = `json_set(metadata_json, '$.${META_RECOVERY}', ?)`;
-    const bound: unknown[] = [serialized];
+    let expr = `json_set(metadata_json, '$.${META_RECOVERY}', ?, '$.${META_RECOVERY_SYNTHETIC_TURNS}', json(?))`;
+    const bound: unknown[] = [serialized, JSON.stringify({
+      stateHash: createHash('sha256').update(serialized).digest('hex'),
+      ...this.syntheticObservation(),
+    })];
     if (ownerToken !== null) {
       expr = `json_set(${expr}, '$.${META_RECOVERY_OWNER}', json(?))`;
       bound.push(ownerToken);
@@ -873,26 +971,38 @@ export class HarnessSession {
   }): boolean {
     const db = openEventLog();
     const snapshot: PersistedConversation = {
+      ...this.conversation(),
       items: input.history,
       lastResponseId: input.lastResponseId,
       updatedAt: new Date().toISOString(),
     };
-    const adopted = db.prepare(`
+    const adopted = db.transaction(() => {
+      const current = getSession(this.row.id);
+      const retained = current?.metadata[META_RECOVERY_SYNTHETIC_TURNS] as { stateHash?: unknown } | undefined;
+      // New checkpoints retain their exact replay basis across restart. Legacy
+      // checkpoints lack that provenance; do not infer IDs from wording.
+      const observation = retained?.stateHash === createHash('sha256').update(input.serializedState).digest('hex')
+        ? syntheticObservation(retained) : undefined;
+      const merged = this.preserveUnobservedSyntheticTurns(snapshot, observation);
+      const written = db.prepare(`
       UPDATE sessions
          SET metadata_json = json_remove(
                json_set(metadata_json, '$.__conversation', json(?)),
                '$.__host_recovery_state',
-               '$.__host_recovery_mcp_scope'
+               '$.__host_recovery_mcp_scope',
+               '$.__host_recovery_synthetic_turns'
              ),
              updated_at = ?
        WHERE id = ?
          AND json_extract(metadata_json, '$.__host_recovery_state') = ?
     `).run(
-      JSON.stringify(snapshot),
+      JSON.stringify(merged),
       snapshot.updatedAt,
       this.row.id,
       input.serializedState,
     );
+      return written;
+    }).immediate();
     this.refresh();
     return adopted.changes === 1;
   }

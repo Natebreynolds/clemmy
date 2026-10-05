@@ -218,14 +218,16 @@ export function registerAutonomyActionTools(server: McpServer): void {
     [
       'Settle one item of your work list (declared with run_worker\'s workManifest) that you finished yourself instead of through a worker.',
       'Name the item and cite the call ids of your own successful calls that did it; the host checks each one settled successfully in this run. Call it with no call ids to see your successful calls to cite.',
+      'Settle one phase at a time. For a list with multiple phases, provide phase or use the exact work-list/phase/item name. Calls must prove that item and phase; a read is not evidence of an unwritten artifact.',
       'An item you finished outside the work list otherwise stays open, and your run reads as unfinished.',
     ].join(' '),
     {
       item: z.string().min(1).max(500),
+      phase: z.string().min(1).max(160).nullable().optional(),
       call_ids: z.array(z.string().min(1).max(200)).max(20).nullable().optional(),
       note: z.string().max(600).nullable().optional(),
     },
-    async ({ item, call_ids, note }) => {
+    async ({ item, phase, call_ids, note }) => {
       if (harnessRunContextStorage.getStore()?.workerScope) {
         return textResult('A worker returns its item to the run that started it; that run settles it.');
       }
@@ -241,7 +243,7 @@ export function registerAutonomyActionTools(server: McpServer): void {
         : undefined;
       const callIds = call_ids ?? [];
       const settled = settleWorkItemFromOwnCalls({
-        sessionId, item, callIds, ...(note ? { note } : {}),
+        sessionId, item, callIds, ...(phase ? { phase } : {}), ...(note ? { note } : {}),
         ...(sourceUserSeq ? { sourceUserSeq } : {}), ...(owed ? { owed } : {}),
       });
       return textResult(settled.ok

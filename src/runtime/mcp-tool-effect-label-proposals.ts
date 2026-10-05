@@ -24,6 +24,7 @@ import {
   undeclaredMcpTools,
   writeMcpToolEffectLabelFile,
   type McpToolEffectLabel,
+  type McpToolEffectLabelFile,
   type PendingMcpToolEffectProposal,
 } from './mcp-tool-effect-labels.js';
 import * as approvalRegistry from './harness/approval-registry.js';
@@ -60,6 +61,7 @@ const defaultReadLabels: ReadLabels = async ({ purpose, user }) => (await comple
 })).raw;
 
 let readLabels: ReadLabels = defaultReadLabels;
+let writeLabels = writeMcpToolEffectLabelFile;
 const inFlight = new Map<string, Promise<McpToolEffectProposalResult>>();
 
 function clipped(text: string, max: number): string {
@@ -95,9 +97,9 @@ function readingFrom(raw: unknown, ids: ReadonlySet<string>): Map<string, McpToo
   return reading;
 }
 
-function cardArgs(labels: PendingMcpToolEffectProposal['labels']): Record<string, string> {
+function cardArgs(labels: PendingMcpToolEffectProposal['labels'], incompleteTools: ReadonlySet<string>): Record<string, string> {
   const group = (label: McpToolEffectLabel) => labels
-    .filter((entry) => entry.label === label)
+    .filter((entry) => entry.label === label && !incompleteTools.has(entry.tool))
     .map((entry) => words(entry.tool))
     .join(', ');
   const args: Record<string, string> = {};
@@ -110,6 +112,10 @@ function cardArgs(labels: PendingMcpToolEffectProposal['labels']): Record<string
   for (const [heading, label] of groups) {
     const tools = group(label);
     if (tools) args[heading] = tools;
+  }
+  if (incompleteTools.size > 0) {
+    args['not fully checked (asks you each time)'] = labels.filter((entry) => incompleteTools.has(entry.tool))
+      .map((entry) => words(entry.tool)).join(', ');
   }
   return args;
 }
@@ -132,6 +138,44 @@ function showCardIn(
   } catch { /* the card still waits in Needs you */ }
 }
 
+/** The atomic card event is the durable source; the shared JSON file is its
+ * replayable projection. Older cards can still recover from their pending
+ * file entry. Never use a later proposal to apply an earlier approval. */
+function storedProposal(
+  row: approvalRegistry.PendingApprovalRow,
+  file: McpToolEffectLabelFile,
+): PendingMcpToolEffectProposal | null {
+  const event = openEventLog().prepare(`
+    SELECT data_json FROM events
+     WHERE session_id = ? AND type = 'approval_requested'
+       AND json_extract(data_json, '$.approvalId') = ?
+     ORDER BY seq ASC LIMIT 1
+  `).get(row.sessionId, row.approvalId) as { data_json: string } | undefined;
+  const durable = event ? JSON.parse(event.data_json).mcpToolEffectProposal : null;
+  const proposal = durable ? { ...durable, approvalId: row.approvalId } : file.pending[row.approvalId];
+  if (!proposal || proposal.resumeKey !== row.resumeKey || proposal.approvalId !== row.approvalId
+    || typeof proposal.serverSlug !== 'string' || !proposal.serverSlug
+    || typeof proposal.serverName !== 'string' || typeof proposal.proposedAt !== 'string'
+    || !Array.isArray(proposal.labels) || proposal.labels.length === 0
+    || !proposal.labels.every((entry: PendingMcpToolEffectProposal['labels'][number]) => entry
+      && typeof entry.tool === 'string' && entry.tool.length > 0
+      && typeof entry.rawDefinitionDigest === 'string' && /^[a-f0-9]{64}$/.test(entry.rawDefinitionDigest)
+      && MCP_TOOL_EFFECT_LABELS.includes(entry.label))) return null;
+  return proposal;
+}
+
+function projectPendingProposal(row: approvalRegistry.PendingApprovalRow): void {
+  openEventLog().transaction(() => {
+    const current = approvalRegistry.get(row.approvalId);
+    if (!current || current.status !== 'pending') return;
+    const file = readMcpToolEffectLabelFile({ strict: true });
+    const proposal = storedProposal(current, file);
+    if (proposal) {
+      writeLabels({ ...file, pending: { ...file.pending, [current.approvalId]: proposal } });
+    }
+  }).immediate();
+}
+
 async function propose(input: {
   serverSlug: string;
   sessionId: string;
@@ -146,9 +190,17 @@ async function propose(input: {
 
   const prior = approvalRegistry.inspectResumableApproval(resumeKey);
   if (prior.state === 'pending') {
-    const pending = readMcpToolEffectLabelFile().pending[prior.row.approvalId];
+    const pending = storedProposal(prior.row, readMcpToolEffectLabelFile());
+    projectPendingProposal(prior.row);
     if (pending?.preview) showCardIn(input.sessionId, prior.row, pending.preview);
     return { status: 'already_pending', approvalId: prior.row.approvalId, tools: tools.length };
+  }
+  if (prior.state === 'approved' || prior.state === 'consumed') {
+    settleMcpToolEffectLabelDecision(prior.row);
+    const stored = readMcpToolEffectLabelFile().servers[input.serverSlug];
+    if (tools.every((tool) => stored?.[tool.tool]?.rawDefinitionDigest === tool.rawDefinitionDigest)) {
+      return { status: 'nothing_to_propose' };
+    }
   }
   if (prior.state === 'rejected' || prior.state === 'cancelled') {
     const decidedAt = Date.parse(prior.row.resolvedAt ?? prior.row.requestedAt);
@@ -157,6 +209,10 @@ async function propose(input: {
 
   const serverName = serverDisplayName(input.serverSlug);
   const ids = new Map(tools.map((tool, index) => [`t${index + 1}`, tool]));
+  const incompleteDefinitions = new Set([...ids.entries()].filter(([, tool]) => (
+    tool.description.length > MAX_DESCRIPTION_CHARS
+    || JSON.stringify(tool.inputSchema ?? null).length > MAX_SCHEMA_CHARS
+  )).map(([id]) => id));
   const user = [
     `Connected server: ${serverName}`,
     'Tools:',
@@ -171,32 +227,35 @@ async function propose(input: {
   const readings = (await Promise.allSettled([
     readLabels({ purpose: 'mcp_tool_effect_labels', user }),
     readLabels({ purpose: 'mcp_tool_effect_labels_second', user }),
-  ])).map((settled) => (settled.status === 'fulfilled' ? readingFrom(settled.value, idSet) : null))
-    .filter((reading): reading is Map<string, McpToolEffectLabel> => reading !== null);
-  if (readings.length === 0) return { status: 'unread' };
+  ])).map((settled) => (settled.status === 'fulfilled' ? readingFrom(settled.value, idSet) : null));
+  if (readings.every((reading) => reading === null)) return { status: 'unread' };
 
+  const incompleteTools = new Set<string>();
   const labels: PendingMcpToolEffectProposal['labels'] = [...ids.entries()].map(([id, tool]) => {
-    // A tool neither reading answered for is proposed as the strictest kind:
-    // the owner still sees it, and every call of it asks.
-    let label: McpToolEffectLabel | null = null;
-    for (const reading of readings) {
-      const read = reading.get(id);
-      if (read) label = label ? stricterLabel(label, read) : read;
-    }
-    return { tool: tool.tool, rawDefinitionDigest: tool.rawDefinitionDigest, label: label ?? 'send' };
+    // A relaxed label requires two complete readings of this exact tool.
+    // A missing/failed reader or clipped definition is uncertainty, never
+    // evidence that the tool is safe to call without asking each time.
+    const first = readings[0]?.get(id);
+    const second = readings[1]?.get(id);
+    const fullyChecked = first && second && !incompleteDefinitions.has(id);
+    if (!fullyChecked) incompleteTools.add(tool.tool);
+    const label: McpToolEffectLabel = fullyChecked ? stricterLabel(first, second) : 'send';
+    return { tool: tool.tool, rawDefinitionDigest: tool.rawDefinitionDigest, label };
   });
 
   const asking = labels.some((entry) => entry.label === 'delete' || entry.label === 'send');
   const subject = `Let Clem use ${serverName}'s tools`;
-  const args = cardArgs(labels);
+  const args = cardArgs(labels, incompleteTools);
   const preview = {
     // The card's own shape: what is asked, why, and exactly what approving does.
     operation: `use ${serverName} tools`,
     fields: Object.entries(args).map(([name, value]) => ({ name, value })),
     ask: `Can I start using ${serverName}?`,
-    why: clipped(`${serverName} doesn't say which of its ${labels.length} tools only look things up and which change things, so I read each one and sorted them.${
-      asking ? ' Anything that deletes or sends still asks you each time.' : ''
-    }`, 260),
+    why: clipped(incompleteTools.size > 0
+      ? `${incompleteTools.size} of ${labels.length} tools could not be fully checked. Each still asks you each time; its effects need a full check. The others were checked and sorted from their definitions.`
+      : `${serverName} doesn't say which of its ${labels.length} tools only look things up and which change things, so I read each one and sorted them.${
+        asking ? ' Anything that deletes or sends still asks you each time.' : ''
+      }`, 260),
   };
   // The decision is about a server, not a step of the conversation it came up
   // in. The approval belongs to its own session and the chat only shows the
@@ -208,6 +267,8 @@ async function propose(input: {
     title: subject,
     metadata: { source: 'mcp_tool_effect_labels', serverSlug: input.serverSlug },
   });
+  const proposal = { serverSlug: input.serverSlug, serverName, resumeKey,
+    proposedAt: new Date().toISOString(), preview, labels };
   const card = registerResumableApprovalCardAtomically({
     sessionId: owner.id,
     subject,
@@ -215,20 +276,12 @@ async function propose(input: {
     args,
     ttlMs: MCP_TOOL_EFFECT_PROPOSAL_OPEN_MS,
     resumeKey,
-    extra: { preview },
+    extra: { preview, mcpToolEffectProposal: proposal },
   });
   showCardIn(input.sessionId, card.row, preview);
-  const file = readMcpToolEffectLabelFile();
-  file.pending[card.row.approvalId] = {
-    serverSlug: input.serverSlug,
-    serverName,
-    approvalId: card.row.approvalId,
-    resumeKey,
-    proposedAt: new Date().toISOString(),
-    preview,
-    labels,
-  };
-  writeMcpToolEffectLabelFile({ ...file, servers: { ...file.servers }, pending: { ...file.pending } });
+  // If projection fails, the already-committed card retains the complete
+  // proposal. Startup or the next request can project it without new reads.
+  projectPendingProposal(card.row);
   logger.info({ serverSlug: input.serverSlug, approvalId: card.row.approvalId, tools: labels.length },
     'proposed tool effect labels for owner approval');
   return {
@@ -263,67 +316,97 @@ export function proposeMcpToolEffectLabels(input: {
   return started;
 }
 
-/** Record the owner's decision on one label card. Exactly once per approval,
- *  across processes: the registry's claim is the one that counts. */
+/** Apply the exact human-approved proposal idempotently, then mark it applied.
+ * The SQLite writer lock serializes competing projections. A crash before
+ * consumption leaves the immutable proposal available for another attempt;
+ * reapplying these labels has no external effect. */
 export function settleMcpToolEffectLabelDecision(row: approvalRegistry.PendingApprovalRow): boolean {
   if (!row.resumeKey?.startsWith(RESUME_KEY_PREFIX) || row.status === 'pending') return false;
-  const file = readMcpToolEffectLabelFile();
-  const proposal = file.pending[row.approvalId];
-  if (!proposal || proposal.resumeKey !== row.resumeKey) return false;
-  const pending = { ...file.pending };
-  delete pending[row.approvalId];
-  if (!approvalRegistry.approvalDecidedByPerson(row)) {
-    writeMcpToolEffectLabelFile({ ...file, pending });
-    return false;
+  return openEventLog().transaction(() => {
+    const current = approvalRegistry.get(row.approvalId);
+    if (!current || current.resumeKey !== row.resumeKey || current.status === 'pending') return false;
+    const file = readMcpToolEffectLabelFile({ strict: true });
+    if (current.consumedAt && !file.pending[current.approvalId]) return false;
+    const proposal = storedProposal(current, file);
+    if (!proposal) return false;
+    const pending = { ...file.pending };
+    delete pending[current.approvalId];
+    if (current.presentation || !approvalRegistry.approvalDecidedByPerson(current)) {
+      if (file.pending[current.approvalId]) writeLabels({ ...file, pending });
+      return false;
+    }
+    const decidedAt = current.resolvedAt!;
+    const serverLabels = { ...(file.servers[proposal.serverSlug] ?? {}) };
+    for (const entry of proposal.labels) {
+      const existing = serverLabels[entry.tool];
+      // Recovery of an older grant must not replace a later owner decision.
+      if (existing && (existing.decidedAt > decidedAt
+        || (existing.decidedAt === decidedAt && existing.approvalId !== current.approvalId))) continue;
+      serverLabels[entry.tool] = {
+        label: entry.label, rawDefinitionDigest: entry.rawDefinitionDigest,
+        approvalId: current.approvalId, decidedAt,
+      };
+    }
+    writeLabels({ version: 1, servers: { ...file.servers, [proposal.serverSlug]: serverLabels }, pending });
+    if (!current.consumedAt) {
+      const claim = approvalRegistry.claimResumableApproval(current.resumeKey!, current.approvalId);
+      if (claim.state !== 'approved') throw new Error('Tool label approval application could not be recorded');
+    }
+    logger.info({ serverSlug: proposal.serverSlug, approvalId: current.approvalId, tools: proposal.labels.length },
+      'owner approved tool effect labels');
+    return true;
+  }).immediate();
+}
+
+/** Repair interrupted card projection and application without asking again.
+ * Legacy consumed-before-write rows remain recoverable while their pending
+ * file proposal exists. New rows retain their proposal in the atomic card. */
+export function reconcileMcpToolEffectLabelApprovals(): void {
+  const ids = new Set(Object.keys(readMcpToolEffectLabelFile().pending));
+  const rows = openEventLog().prepare(`
+    SELECT approval_id FROM pending_approvals
+     WHERE resume_key LIKE ? AND (status = 'pending' OR (resolution = 'approved' AND consumed_at IS NULL))
+  `).all(`${RESUME_KEY_PREFIX}%`) as Array<{ approval_id: string }>;
+  for (const row of rows) ids.add(row.approval_id);
+  for (const approvalId of ids) {
+    try {
+      const row = approvalRegistry.get(approvalId);
+      if (!row) continue;
+      if (row.status === 'pending') projectPendingProposal(row);
+      else settleMcpToolEffectLabelDecision(row);
+    } catch (error) {
+      logger.warn({ approvalId, err: error instanceof Error ? error.message : String(error) },
+        'tool effect label decision awaits projection retry');
+    }
   }
-  const claim = approvalRegistry.claimResumableApproval(row.resumeKey, row.approvalId);
-  if (claim.state !== 'approved') {
-    if (claim.state !== 'pending') writeMcpToolEffectLabelFile({ ...file, pending });
-    return false;
-  }
-  const decidedAt = new Date().toISOString();
-  const serverLabels = { ...(file.servers[proposal.serverSlug] ?? {}) };
-  for (const entry of proposal.labels) {
-    serverLabels[entry.tool] = {
-      label: entry.label,
-      rawDefinitionDigest: entry.rawDefinitionDigest,
-      approvalId: row.approvalId,
-      decidedAt,
-    };
-  }
-  writeMcpToolEffectLabelFile({
-    version: 1,
-    servers: { ...file.servers, [proposal.serverSlug]: serverLabels },
-    pending,
-  });
-  logger.info({ serverSlug: proposal.serverSlug, approvalId: row.approvalId, tools: proposal.labels.length },
-    'owner approved tool effect labels');
-  return true;
 }
 
 let initialized = false;
+const onLabelDecision = (row: approvalRegistry.PendingApprovalRow) => { settleMcpToolEffectLabelDecision(row); };
 
 /** Listen for label decisions, and settle any made while the app was down. */
 export function initMcpToolEffectLabelApprovals(): void {
   if (initialized) return;
   initialized = true;
-  approvalRegistry.onApprovalResolved((row) => { settleMcpToolEffectLabelDecision(row); });
+  approvalRegistry.onApprovalResolved(onLabelDecision);
   setImmediate(() => {
-    try {
-      for (const approvalId of Object.keys(readMcpToolEffectLabelFile().pending)) {
-        const row = approvalRegistry.get(approvalId);
-        if (row && row.status !== 'pending') settleMcpToolEffectLabelDecision(row);
-      }
-    } catch (error) {
+    try { reconcileMcpToolEffectLabelApprovals(); }
+    catch (error) {
       logger.warn({ err: error instanceof Error ? error.message : String(error) },
         'tool effect label decisions could not be settled at start');
     }
   });
 }
 
+/** Inject only the projection boundary for interrupted-write tests. */
+export function _setMcpToolEffectLabelWriterForTests(writer: typeof writeMcpToolEffectLabelFile | null): void {
+  writeLabels = writer ?? writeMcpToolEffectLabelFile;
+}
+
 /** Tests only. */
 export function _setMcpToolEffectLabelReaderForTests(reader: ReadLabels | null): void {
   readLabels = reader ?? defaultReadLabels;
+  writeLabels = writeMcpToolEffectLabelFile;
   inFlight.clear();
   initialized = false;
 }

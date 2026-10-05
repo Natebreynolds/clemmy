@@ -11465,6 +11465,71 @@ const MIGRATIONS: EventLogMigration[] = [
         'logical model result projection requires exact accepted source/call lineage');
     END;`,
   },
+  {
+    version: 93,
+    // Version the existing receipt store without rewriting historical proof.
+    // V1 remains readable history; only V2 can establish new memory completion.
+    // Rebuild is needed because SQLite cannot widen a CHECK in place.
+    sql: '',
+    backfill: (db) => {
+      if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").get()) return;
+      const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'durable_memory_intake_receipts'")
+        .get() as { sql: string } | undefined;
+      if (!row?.sql) throw new Error('schema v93 prerequisite missing: durable_memory_intake_receipts');
+      if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'durable_memory_intake_receipts_v93'").get()) {
+        throw new Error('schema v93 refuses a preexisting replacement receipt table');
+      }
+      const prefixCheck = "CHECK (length(receipt_id) = 81 AND receipt_id LIKE 'memory-intake:v1:%')";
+      const protocolCheck = 'CHECK (protocol_version = 1)';
+      if (!row.sql.includes(prefixCheck) || !row.sql.includes(protocolCheck)) {
+        throw new Error('schema v93 requires the exact historical memory receipt checks');
+      }
+      const quote = (name: string) => `"${name.replace(/"/g, '""')}"`;
+      // The canonical predecessor has no inbound receipt FKs. Refuse an
+      // extension before DROP TABLE: an ON DELETE CASCADE child could otherwise
+      // disappear without leaving a violation for a post-rebuild check to see.
+      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;
+      for (const table of tables) {
+        const inbound = db.prepare(`PRAGMA foreign_key_list(${quote(table.name)})`).all() as Array<{ table: string }>;
+        if (inbound.some(foreignKey => foreignKey.table.toLowerCase() === 'durable_memory_intake_receipts')) {
+          throw new Error('schema v93 refuses unsupported inbound memory receipt foreign keys');
+        }
+      }
+      const replacement = row.sql
+        .replace(/^CREATE TABLE(?: IF NOT EXISTS)?\s+durable_memory_intake_receipts\b/i,
+          'CREATE TABLE durable_memory_intake_receipts_v93')
+        .replace(prefixCheck, `CHECK (length(receipt_id) = 81 AND (
+          (protocol_version = 1 AND receipt_id LIKE 'memory-intake:v1:%') OR
+          (protocol_version = 2 AND receipt_id LIKE 'memory-intake:v2:%')))`)
+        .replace(protocolCheck, 'CHECK (protocol_version IN (1, 2))');
+      if (!replacement.startsWith('CREATE TABLE durable_memory_intake_receipts_v93')) {
+        throw new Error('schema v93 cannot identify the historical memory receipt declaration');
+      }
+      // Drop/recreate dependent triggers from their ORIGINAL SQL. Renaming the
+      // old table first would rewrite authority triggers to the temporary name.
+      const triggers = db.prepare(`SELECT name, sql FROM sqlite_master WHERE type = 'trigger'
+        AND (tbl_name = 'durable_memory_intake_receipts' OR sql LIKE '%durable_memory_intake_receipts%')
+        ORDER BY name`).all() as Array<{ name: string; sql: string }>;
+      const indexes = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'index'
+        AND tbl_name = 'durable_memory_intake_receipts' AND sql IS NOT NULL ORDER BY name`)
+        .all() as Array<{ sql: string }>;
+      const columns = (db.prepare('PRAGMA table_info(durable_memory_intake_receipts)').all() as Array<{ name: string }>)
+        .map(column => quote(column.name)).join(', ');
+      for (const trigger of triggers) db.exec(`DROP TRIGGER ${quote(trigger.name)}`);
+      db.exec(replacement);
+      db.exec(`INSERT INTO durable_memory_intake_receipts_v93 (${columns})
+        SELECT ${columns} FROM durable_memory_intake_receipts`);
+      db.exec('DROP TABLE durable_memory_intake_receipts');
+      db.exec('ALTER TABLE durable_memory_intake_receipts_v93 RENAME TO durable_memory_intake_receipts');
+      for (const index of indexes) db.exec(index.sql);
+      for (const trigger of triggers) db.exec(trigger.sql);
+      // This rebuild must preserve its own relationships. Unrelated degraded
+      // history (including v32's retained missing-source run attempts) remains
+      // unchanged; it is neither repaired nor newly blocked by this migration.
+      const violations = db.pragma('foreign_key_check(durable_memory_intake_receipts)');
+      if (!Array.isArray(violations) || violations.length > 0) throw new Error('schema v93 memory receipt foreign-key validation failed');
+    },
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

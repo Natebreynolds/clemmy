@@ -79,13 +79,22 @@ export function workerAlreadyCompletedForPacket(sessionId: string, packetKey: st
     const kind = getSession(sessionId)?.kind;
     if (!kind || kind === 'chat') return false;
     const results = listEvents(sessionId, { types: ['worker_result'] });
-    return results.some((e) => {
-      const d = e.data as { ok?: unknown; packetKey?: unknown } | undefined;
-      return d?.ok === true && typeof d.packetKey === 'string' && d.packetKey === packetKey;
-    });
+    const latest = results.filter((e) => e.data.packetKey === packetKey).at(-1);
+    return latest?.data.ok === true && latest.data.backedByWork !== false && latest.data.retryRequiresReconciliation !== true;
   } catch {
     return false;
   }
+}
+
+/** An unverified answer never makes already-dispatched effects safe to repeat. */
+export function workerPacketRequiresReconciliation(sessionId: string, packetKey: string, sourceUserSeq?: number): boolean {
+  const chat = getSession(sessionId)?.kind === 'chat';
+  const results = listEvents(sessionId, { types: ['worker_result'] }).filter((event) =>
+    event.data.packetKey === packetKey && (!chat || event.data.sourceUserSeq === sourceUserSeq));
+  if (results.some((event) => event.data.retryRequiresReconciliation === true)) return true;
+  // A newer rejection invalidates success reuse, not the earlier effects.
+  // Reconcile that contradiction before starting the same packet again.
+  return results.at(-1)?.data.ok === false && results.slice(0, -1).some((event) => event.data.ok === true);
 }
 
 // ── Fan-out uniform-failure memo (2026-07-22) ────────────────────────────────

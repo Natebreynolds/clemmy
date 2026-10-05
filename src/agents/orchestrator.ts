@@ -141,7 +141,7 @@ import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js'
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import { describeMissingWorkerItems, resolveWorkerMaxTurns, uniformFailureSignature, workerPacketKey, WorkerToolCallSchema, workerCallItems, workerItemContexts, workerContextForItem, workerResultIndicatesFailure, type WorkerToolInput, type WorkerToolCall } from './worker-job-packet.js';
-import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from './worker-respawn-guard.js';
+import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled, workerPacketRequiresReconciliation } from './worker-respawn-guard.js';
 import { acquireWorkerSlot, workerBatchPoolWidth } from './worker-concurrency.js';
 import {
   completedWorkerBatchPacket,
@@ -205,7 +205,8 @@ import { HarnessSession } from '../runtime/harness/session.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 import { toolNameOffered } from '../tools/browser-backend.js';
 import { parentActionsNote } from './worker-parent-actions.js';
-import { renderWorkerCallRecord, type WorkerCallRecord } from '../runtime/harness/worker-call-record.js';
+import { renderWorkerCallRecord, qualifyWorkerOutput, type WorkerCallRecord } from '../runtime/harness/worker-call-record.js';
+import { withPinnedWorkerModel } from '../runtime/harness/pinned-worker-model.js';
 import { delegatedJobOwnerWords } from '../projects/delegated-owner-words.js';
 
 /**
@@ -454,6 +455,7 @@ export function isCommitSafeWorkerFallover(err: unknown): boolean {
 interface ChatWorkerModelRoute {
   model?: string;
   trace?: WorkerRouteTrace;
+  exactModel?: boolean;
 }
 
 /** The executed model/provider recorded by the child run for this item (a
@@ -2606,7 +2608,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (workerRoute.kind === 'refuse') {
         return refuseWorkerPacketBeforeDispatch(workerRoute.reason, workerRoute.shapes);
       }
-      const decidedRoute: ChatWorkerModelRoute = { model: workerRoute.model, trace: workerRoute.trace };
+      const decidedRoute: ChatWorkerModelRoute = { model: workerRoute.model, trace: workerRoute.trace, exactModel: workerRoute.exactModel };
       const withRouteNote = (text: string): string => (workerRoute.hostNote ? `${workerRoute.hostNote}\n\n${text}` : text);
       const offerAfterSuccess = (anySucceeded: boolean): void => {
         if (!anySucceeded || !workerRoute.offer || !routeSessionId) return;
@@ -2723,7 +2725,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           throw error;
         }
         const previewRoute = decidedRoute;
-        const previewModel = getSessionWorkerModelOverride(manifestSessionId)
+        const previewModel = (previewRoute.exactModel ? previewRoute.model : getSessionWorkerModelOverride(manifestSessionId))
           ?? previewRoute.model
           ?? resolveRoleModel('worker').modelId;
         const previewProvider = resolveEffectiveProviderForModel(previewModel);
@@ -2815,7 +2817,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // Self-heal: uniform "unknown model" = the endpoint's real catalog
         // speaking — memo the dead id and invite an immediate retry (see
         // worker-tools.ts twin).
-        if (uniform && looksLikeUnknownModelError(uniform)) {
+        if (!workerRoute.exactModel && uniform && looksLikeUnknownModelError(uniform)) {
           const deadModel = resolveRoleModel('worker', call.intent || undefined).modelId;
           markByoModelNotServed(deadModel);
           const healed = repairByoRoutedModelId(deadModel);
@@ -2830,7 +2832,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // Classify on RAW texts, never the normalized signature — normalization
         // rewrites "429" to "<n>" and blinded this branch to real Moonshot 429s
         // (live 2026-07-22: 30/30 workers died rate-limited, no bench, no switch).
-        if (uniform && (workerFailureLooksRateLimited(uniform) || failedItems.some((f) => workerFailureLooksRateLimited(f.text)))) {
+        if (!workerRoute.exactModel && uniform && (workerFailureLooksRateLimited(uniform) || failedItems.some((f) => workerFailureLooksRateLimited(f.text)))) {
           const benched = resolveRoleModel('worker', call.intent || undefined).modelId;
           markWorkerModelCoolingDown(benched);
           const next = pickWorkerModelWithFallover([benched, resolveRoleModel('worker').modelId, DEFAULT_CODEX_FAST_MODEL]);
@@ -2898,7 +2900,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     const parent = harnessRunContextStorage.getStore();
     const sessionId = parent?.sessionId ?? extractSessionId(ctx) ?? '';
     const sourceUserSeq = parent?.sourceUserSeq ?? extractSourceUserSeq(ctx);
-    if (!sessionId || !sourceUserSeq) return 'ERROR: worker packet has no accepted parent source.';
+    if (!sessionId || !sourceUserSeq) {
+      onCallRecord?.({ byTool: {}, businessCallSucceeded: false, businessCallAttempted: false, effectsMayHaveRun: false });
+      return 'ERROR: worker packet has no accepted parent source.';
+    }
     const scope = workerPacketMcpToolScope({ buildScope: mcpToolScope,
       runtimeScope: parent?.mcpToolScope, resolvedTools: packet.resolvedTools,
       externalMcpToolNames: packet.externalMcpToolNames }) ?? null;
@@ -2952,19 +2957,19 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const parentLogicalCallId = currentLogicalCall()?.logicalToolCallId ?? null;
       // Workflow-level worker pin (owner ask, 2026-07-24): a step session
       // registered by the workflow runner overrides the global worker role.
-      let workerModel = getSessionWorkerModelOverride(sessionId)
+      let workerModel = (route.exactModel ? route.model : getSessionWorkerModelOverride(sessionId))
         ?? route.model
         ?? resolveRoleModel('worker').modelId;
       let workerProvider = resolveEffectiveProviderForModel(workerModel);
       // A byo-routed id no BYO provider serves would 400 on dispatch — repair to
       // the backend's real primary id (no-op for owned ids / non-byo providers).
-      if (workerProvider === 'byo') workerModel = repairByoRoutedModelId(workerModel);
+      if (workerProvider === 'byo' && !route.exactModel) workerModel = repairByoRoutedModelId(workerModel);
       // Fleet resilience: a rate-limited worker model is benched for a cooldown
       // window — route this item to the next healthy candidate instead of
       // burning a slot on a known-429 model. Chain stays inside the models this
       // session already legitimately uses (routed → default worker binding →
       // session primary), so provider-isolation promises hold.
-      const workerPick = pickWorkerModelWithFallover([
+      const workerPick = route.exactModel ? { model: workerModel, falloverFrom: undefined } : pickWorkerModelWithFallover([
         workerModel,
         resolveRoleModel('worker').modelId,
         DEFAULT_CODEX_FAST_MODEL,
@@ -3026,19 +3031,19 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         reason?: string;
         preRun?: boolean;
         checkpointManifest?: boolean;
-        /** From the host's record: false when the worker tried business work
-         * and none of it succeeded. */
+        /** False when the host's work evidence does not support completion. */
         backedByWork?: boolean;
+        retryRequiresReconciliation?: boolean;
       }): void => {
         if (!sessionId) return;
         const { preRun, checkpointManifest = true, backedByWork, ...eventData } = data;
-        // A success whose business calls all failed or never ran is the
-        // worker's account alone; it is not kept for reuse, so a rerun redoes it.
+        // Unverified work is not successful reuse. Its effect receipts still
+        // stand, and may require reconciliation instead of a fresh worker.
         const banked = data.ok && backedByWork !== false;
         let resultEvent: ReturnType<typeof appendEvent> | undefined;
         batchLease?.assertCurrent();
         try {
-          resultEvent = appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, ...executedWorkerRoute(sessionId, input.item, { packetKey, parentLogicalCallId }), packetKey, toolCallId, parentLogicalCallId, sourceUserSeq, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}) } });
+          resultEvent = appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, ok: banked, ...(backedByWork === undefined ? {} : { backedByWork }), ...executedWorkerRoute(sessionId, input.item, { packetKey, parentLogicalCallId }), packetKey, toolCallId, parentLogicalCallId, sourceUserSeq, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}) } });
         } catch { /* durable trace is best-effort */ }
         if (manifestBinding && checkpointManifest) {
           batchLease?.assertCurrent();
@@ -3092,7 +3097,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       };
       const appendWorkerResultFromOutput = (
         output: unknown,
-        data: { model?: string | null; toolUses?: string[]; tokens?: number; backedByWork?: boolean } = {},
+        data: { model?: string | null; toolUses?: string[]; tokens?: number; backedByWork?: boolean; retryRequiresReconciliation?: boolean } = {},
       ): void => {
         const text = typeof output === 'string' ? output : String(output ?? '');
         const ok = !workerResultIndicatesFailure(text);
@@ -3212,6 +3217,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // recoverable — else fall through and re-execute rather than pass a
       // placeholder off as success (F4); the duplicate-send wall backstops any
       // repeated send. Fail-open; kill-switch CLEMMY_WORKER_RESUME_IDEMPOTENCY.
+      if (sessionId && workerPacketRequiresReconciliation(sessionId, packetKey, sourceUserSeq)) {
+        return `ERROR: this worker packet has unverified output and prior actions that may already have completed. Inspect its retained result and receipts, then repair only the missing work inline. The worker was not restarted; do not repeat writes or sends.`;
+      }
       if (workerResumeIdempotencyEnabled() && sessionId && workerAlreadyCompletedForPacket(sessionId, packetKey)) {
         const ctx = getToolOutputContext();
         const parentRunId = ctx?.workflowRunId || sessionId;
@@ -3341,20 +3349,20 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // worker returns an "ERROR:" envelope NORMALLY (the same signal the
           // in-memory honest-partial ledger reads), so the durable coverage map
           // must agree or it would over-report success after a restart.
-          const workerOk = !workerResultIndicatesFailure(sdkResult.text);
-          recordWorkerSubagent(sdkResult.text ?? '', sdkResult.model ?? workerModel);
+          const qualifiedText = qualifyWorkerOutput(sdkResult.text ?? '', sdkResult.callRecord);
+          const workerOk = !workerResultIndicatesFailure(qualifiedText);
+          recordWorkerSubagent(qualifiedText, sdkResult.model ?? workerModel);
           appendWorkerResult({
             item: input.item,
             ok: workerOk,
-            reason: workerOk ? undefined : (sdkResult.text ?? '').split('\n')[0]?.slice(0, 200),
+            reason: workerOk ? undefined : qualifiedText.split('\n')[0]?.slice(0, 200),
+            retryRequiresReconciliation: !workerOk && sdkResult.callRecord?.effectsMayHaveRun !== false,
             model: sdkResult.model ?? workerModel,
             toolUses: sdkResult.toolUses,
             tokens: workerResultTokens(sdkResult.usage),
-            ...(sdkResult.callRecord
-              ? { backedByWork: sdkResult.callRecord.businessCallSucceeded || !sdkResult.callRecord.businessCallAttempted }
-              : {}),
+            backedByWork: workerOk,
           });
-          return await reduceReturn(sdkResult.text ?? '', false, sdkResult.callRecord);
+          return await reduceReturn(qualifiedText, false, sdkResult.callRecord);
         } catch (err) {
           if (isWorkerBatchGenerationCancellation(err, batchLease?.signal)) throw err;
           // Claude SDK worker overloaded OR its auth expired BEFORE committing
@@ -3362,11 +3370,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // nested worker lane on the next brain (Codex→GLM via RouterModelProvider,
           // which handles any further hop). committed=true → rethrow (a re-run could
           // double-act). Kill-switch CLEMMY_BRAIN_FALLOVER.
-          const next = (workerBrainFalloverEnabled() && isCommitSafeWorkerFallover(err))
+          const next = (!route.exactModel && workerBrainFalloverEnabled() && isCommitSafeWorkerFallover(err))
             ? falloverWorkerModelIds('claude')[0]
             : undefined;
           if (!next) {
-            appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(err) });
+            appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(err),
+              retryRequiresReconciliation: (err as { committed?: unknown } | null)?.committed === true });
             recordWorkerSubagent(`ERROR: ${workerResultReason(err)}`, workerModel);
             throw err;
           }
@@ -3378,6 +3387,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           if (!runContext) throw new Error('run_worker requires an SDK run context');
           try {
             assertWorkerMayStart();
+            let callRecord: WorkerCallRecord | undefined;
             const output = await invokeWorkerWithOwnBudget(
               input,
               next.modelId,
@@ -3386,14 +3396,19 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               resolveWorkerMaxTurns(input.intent, workerMaxTurns),
               batchLease?.dispatchLease,
               batchLease?.signal,
+              (record) => { callRecord = record; },
             );
             batchLease?.assertCurrent();
-            recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), next.modelId);
-            appendWorkerResultFromOutput(output, { model: next.modelId, toolUses: [] });
-            return await reduceReturn(output);
+            const qualifiedText = qualifyWorkerOutput(String(output ?? ''), callRecord);
+            const failed = workerResultIndicatesFailure(qualifiedText);
+            recordWorkerSubagent(qualifiedText, next.modelId);
+            appendWorkerResultFromOutput(qualifiedText, { model: next.modelId, toolUses: [],
+              retryRequiresReconciliation: failed && callRecord?.effectsMayHaveRun !== false });
+            return await reduceReturn(qualifiedText, false, callRecord);
           } catch (fallbackErr) {
             if (isWorkerBatchGenerationCancellation(fallbackErr, batchLease?.signal)) throw fallbackErr;
-            appendWorkerResult({ item: input.item, ok: false, model: next.modelId, toolUses: [], reason: workerResultReason(fallbackErr) });
+            appendWorkerResult({ item: input.item, ok: false, model: next.modelId, toolUses: [], reason: workerResultReason(fallbackErr),
+              retryRequiresReconciliation: (fallbackErr as { committed?: unknown } | null)?.committed === true });
             recordWorkerSubagent(`ERROR: ${workerResultReason(fallbackErr)}`, next.modelId);
             throw fallbackErr;
           }
@@ -3425,7 +3440,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       try {
         assertWorkerMayStart();
         let callRecord: WorkerCallRecord | undefined;
-        const output = await invokeWorkerWithOwnBudget(
+        const output = await withPinnedWorkerModel(route.exactModel ? workerModel : undefined, () => invokeWorkerWithOwnBudget(
           input,
           workerModel,
           runContext,
@@ -3434,18 +3449,22 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           batchLease?.dispatchLease,
           batchLease?.signal,
           (record) => { callRecord = record; },
-        );
+        ));
         batchLease?.assertCurrent();
-        recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), workerModel);
-        appendWorkerResultFromOutput(output, {
+        const qualifiedText = qualifyWorkerOutput(typeof output === 'string' ? output : String(output ?? ''), callRecord);
+        const outputFailed = workerResultIndicatesFailure(qualifiedText);
+        recordWorkerSubagent(qualifiedText, workerModel);
+        appendWorkerResultFromOutput(qualifiedText, {
           model: workerModel,
+          retryRequiresReconciliation: outputFailed && callRecord?.effectsMayHaveRun !== false,
           toolUses: callRecord ? Object.keys(callRecord.byTool).filter((tool) => (callRecord!.byTool[tool]?.succeeded ?? 0) > 0) : [],
-          ...(callRecord ? { backedByWork: callRecord.businessCallSucceeded || !callRecord.businessCallAttempted } : {}),
+          backedByWork: !outputFailed,
         });
-        return await reduceReturn(output, false, callRecord);
+        return await reduceReturn(qualifiedText, false, callRecord);
       } catch (err) {
         if (isWorkerBatchGenerationCancellation(err, batchLease?.signal)) throw err;
-        appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(err) });
+        appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(err),
+          retryRequiresReconciliation: (err as { committed?: unknown } | null)?.committed === true });
         recordWorkerSubagent(`ERROR: ${workerResultReason(err)}`, workerModel);
         // Infra-shaped failure (credentials/auth/provider config): every sibling
         // dies identically — return an actionable envelope instead of a raw

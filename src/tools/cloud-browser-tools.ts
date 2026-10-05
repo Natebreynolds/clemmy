@@ -2,7 +2,10 @@ import { createHash } from 'node:crypto';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { CLOUD_BROWSER_PARAMETERS, parseCloudBrowserArguments, type CloudBrowserOperationName } from './cloud-browser-contract.js';
-import { textResult, nonWriteTextResult } from './shared.js';
+import {
+  textResult, nonWriteTextResult, executionFailureTextResult,
+  LocalNonWriteError, LocalExecutionFailureError, type LocalNonWriteClassification,
+} from './shared.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
@@ -41,13 +44,26 @@ export async function executeCloudBrowserTool(name: CloudBrowserOperationName, r
       // This chat's open browser is rejoined, never bought twice.
       const open = (await service.list(conversationId)).find((item) => item.providerSessionId && (item.state === 'active' || item.state === 'starting'));
       const resource = open ?? await service.create({ conversationId, requestId, recording: false });
+      if (resource.state === 'uncertain') throw new BrowserbaseServiceError(resource.errorCode ?? 'create_outcome_unknown', 'uncertain');
       if (resource.state !== 'active' || resource.controller !== 'agent' || resource.returnPending) {
         return { resource: resourceForTool(resource), ...(open ? { rejoined: true } : {}),
           ...(resource.controller === 'human' ? { note: 'The owner has control of this browser. Wait until they return it to Clem.' } : {}) };
       }
       // The page handle comes back with the browser, so the next step can act
       // on it directly; a url opens there in the same call.
-      const tabs = await service.agentOperation(resource.id, conversationId, { operation: 'tabs', args: {}, expectedVersion: resource.controlVersion }, currentToolAbortSignal());
+      let tabs;
+      try {
+        tabs = await service.agentOperation(resource.id, conversationId, { operation: 'tabs', args: {}, expectedVersion: resource.controlVersion }, currentToolAbortSignal());
+      } catch (error) {
+        // Creation/rejoin already succeeded. Failure of the following read
+        // cannot certify that this whole call changed nothing.
+        const failure = error instanceof BrowserbaseServiceError ? error : null;
+        throw new LocalExecutionFailureError(JSON.stringify({
+          resource: resourceForTool(resource), ...(open ? { rejoined: true } : {}),
+          observation: { ok: false, effect: failure?.effect ?? 'uncertain',
+            error: 'The browser is open, but its pages could not be observed. Check cloud_browser_tabs before continuing.' },
+        }), 'acknowledged');
+      }
       const pages = tabs.resource.pages;
       const page = pages.find((item) => item.targetId === tabs.resource.focusTargetId) ?? pages[0];
       const handles = { resource: resourceForTool(tabs.resource), ...(open ? { rejoined: true } : {}),
@@ -75,9 +91,25 @@ export async function executeCloudBrowserTool(name: CloudBrowserOperationName, r
     }, currentToolAbortSignal());
     return { ...response, resource: resourceForTool(response.resource) };
   } catch (error) {
-    if (error instanceof BrowserbaseServiceError && error.effect === 'none') throw hostPreDispatchRefusal(browserbaseErrorText(error.code));
+    // No effect is not proof that provider I/O never began. Preserve the same
+    // nominal recovery cause on both MCP and direct reviewed-storage lanes.
+    if (error instanceof BrowserbaseServiceError) {
+      if (error.effect === 'none') throw new LocalNonWriteError(browserbaseErrorText(error.code), error.code, browserFailureClassification(error));
+      throw new LocalExecutionFailureError('Cloud browser operation did not settle. Inspect its status; do not repeat a possible write.', 'uncertain');
+    }
     throw error;
   }
+}
+
+function browserFailureClassification(error: BrowserbaseServiceError): LocalNonWriteClassification {
+  const kind = ['credential_rejected', 'credential_missing', 'credential_changed'].includes(error.code)
+    ? 'auth_failure'
+    : ['provider_limit', 'project_not_found', 'configuration_missing', 'human_controls_browser', 'control_return_pending'].includes(error.code)
+      ? 'input_required'
+      : ['invalid_arguments', 'invalid_request', 'control_version_changed', 'request_conflict'].includes(error.code)
+        ? 'invalid_arguments'
+        : 'unknown';
+  return { kind, ...(error.httpStatus !== undefined ? { providerStatus: error.httpStatus } : {}) };
 }
 
 export function registerCloudBrowserTools(server: McpServer): void {
@@ -94,6 +126,10 @@ export function registerCloudBrowserTools(server: McpServer): void {
     server.tool(name, descriptions[name], CLOUD_BROWSER_PARAMETERS[name], async (args: Record<string, unknown>) => {
       try { return textResult(JSON.stringify(await executeCloudBrowserTool(name, args))); }
       catch (error) {
+        if (error instanceof LocalNonWriteError) {
+          return nonWriteTextResult(error.status, error.message, { classification: error.classification });
+        }
+        if (error instanceof LocalExecutionFailureError) return executionFailureTextResult(error.message, error.effect);
         const { isHostPreDispatchRefusal } = await import('../runtime/harness/host-pre-dispatch-refusal.js');
         if (isHostPreDispatchRefusal(error) && error instanceof Error) return nonWriteTextResult('cloud_browser_not_dispatched', error.message);
         return textResult('Cloud browser operation did not settle. Inspect its status; do not repeat a possible write.', { isError: true });

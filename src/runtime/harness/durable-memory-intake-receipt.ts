@@ -11,11 +11,16 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
   autoCaptureProvenanceFromAcceptedEvent,
-  extractAutoMemoryCandidates,
+  automaticMemoryOriginsForCapture,
+  selectAutoMemoryCandidates,
   isEligibleAutoCaptureSourceProvenance,
 } from '../../memory/auto-capture.js';
 import { openMemoryDb } from '../../memory/db.js';
-import { reflectionCandidateHash } from '../../memory/reflection-candidates.js';
+import {
+  automaticMemoryCandidateIdentity, automaticMemoryDecisionDigest, automaticMemoryEnvelopeDigest,
+  parseAutomaticMemoryEnvelope, resolveAutomaticMemoryDestination, type AutomaticMemoryEnvelope,
+} from '../../memory/memory-destination.js';
+import type { MemoryScope } from '../../memory/memory-scope.js';
 import {
   insertInternalEventInTransaction,
   openEventLog,
@@ -25,7 +30,7 @@ import {
 import { durableMemoryReceiptAllowsConversationOnly } from './durable-memory-receipt.js';
 import { expectedTaskFor } from './resolution-ledger.js';
 
-export const DURABLE_MEMORY_INTAKE_RECEIPT_PROTOCOL = 1 as const;
+export const DURABLE_MEMORY_INTAKE_RECEIPT_PROTOCOL = 2 as const;
 
 interface MemoryEpisodeEvidenceRow {
   id: string;
@@ -57,6 +62,9 @@ interface MemoryCandidateEvidenceRow {
   authority: string | null;
   source_uri: string | null;
   pin: number;
+  destination_json: string | null;
+  resulting_fact_id: number | null;
+  reason: string | null;
 }
 
 interface HostReceiptRow {
@@ -97,7 +105,7 @@ interface HostAuthorityRow {
 }
 
 export interface DurableMemoryIntakeReceiptV1 {
-  protocol: typeof DURABLE_MEMORY_INTAKE_RECEIPT_PROTOCOL;
+  protocol: 1;
   kind: 'durable_memory_intake';
   identity: {
     sessionId: string;
@@ -132,12 +140,35 @@ export interface DurableMemoryIntakeReceiptV1 {
   evidenceDigest: string;
 }
 
+/** V1 recorded intake only. V2 is a bounded source/destination/storage proof,
+ * not a claim that every semantic requirement of a memory task was fulfilled. */
+export interface DurableMemoryIntakeReceiptV2 extends Omit<DurableMemoryIntakeReceiptV1, 'protocol' | 'candidates'> {
+  protocol: typeof DURABLE_MEMORY_INTAKE_RECEIPT_PROTOCOL;
+  candidates: Array<DurableMemoryIntakeReceiptV1['candidates'][number] & {
+    destination: {
+      envelope: AutomaticMemoryEnvelope;
+      envelopeDigest: string;
+      decisionDigest: string;
+      scope: MemoryScope;
+      claimTextDigest: string;
+    };
+    fact: {
+      id: number;
+      active: true;
+      contentDigest: string;
+      updatedAt: string;
+      scope: MemoryScope;
+      evidence: Array<{ ordinal: number; excerptDigest: string; createdAt: string }>;
+    };
+  }>;
+}
+
 export type IssueDurableMemoryIntakeReceiptResult =
   | {
       status: 'issued' | 'replayed';
       receiptId: string;
       receiptEventId: string;
-      receipt: DurableMemoryIntakeReceiptV1;
+      receipt: DurableMemoryIntakeReceiptV2;
     }
   | {
       status: 'ineligible' | 'missing' | 'conflict' | 'storage_error';
@@ -149,7 +180,7 @@ export type RedeemDurableMemoryIntakeReceiptResult =
       status: 'redeemed';
       receiptId: string;
       receiptEventId: string;
-      receipt: DurableMemoryIntakeReceiptV1;
+      receipt: DurableMemoryIntakeReceiptV2;
     }
   | {
       status: 'missing' | 'ineligible' | 'conflict' | 'storage_error';
@@ -215,7 +246,7 @@ function readReceiptRow(sessionId: string, sourceUserSeq: number): HostReceiptRo
 }
 
 type DerivedEvidence = {
-  receipt: DurableMemoryIntakeReceiptV1;
+  receipt: DurableMemoryIntakeReceiptV2;
   receiptId: string;
   receiptJson: string;
   sourceTurn: number;
@@ -225,323 +256,216 @@ type DeriveResult =
   | { status: 'ok'; evidence: DerivedEvidence }
   | { status: 'missing' | 'ineligible' | 'conflict' | 'storage_error'; reason: string };
 
-/** Re-read both stores. No caller-provided capture result or telemetry bit can
- * influence this decision. */
-function deriveExactEvidence(input: {
-  sessionId: string;
-  sourceUserSeq: number;
-}): DeriveResult {
+interface VerifiedIntake {
+  source: { id: string; turn: number };
+  message: string;
+  captureMessage: string;
+  callId: string;
+  sourceUri: string;
+  episode: MemoryEpisodeEvidenceRow;
+  candidates: ReturnType<typeof selectAutoMemoryCandidates>;
+  rows: Array<MemoryCandidateEvidenceRow & { envelope: AutomaticMemoryEnvelope }>;
+}
+
+type IntakeResult = { status: 'ok'; intake: VerifiedIntake }
+  | { status: 'missing' | 'ineligible' | 'conflict' | 'storage_error'; reason: string };
+
+/** Re-derive the frozen queue identities from the actual owner event and its
+ * retained context. Candidate hashes alone are not authorization. */
+function readVerifiedIntake(input: { sessionId: string; sourceUserSeq: number }, graphInputHash?: string, completionOnly = false): IntakeResult {
   if (!input.sessionId || !Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) {
     return { status: 'conflict', reason: 'accepted source identity is invalid' };
   }
   try {
-    const expected = expectedTaskFor(input.sessionId, input.sourceUserSeq);
-    if (expected.status !== 'ok') {
-      return {
-        status: expected.status === 'missing' ? 'missing' : 'conflict',
-        reason: expected.reason,
-      };
-    }
-    if (expected.graph.classification.route !== 'act') {
-      return { status: 'ineligible', reason: 'accepted graph is not an action turn' };
-    }
-    const eventDb = openEventLog();
-    const source = eventDb.prepare(`
-      SELECT id, session_id, seq, turn, role, type, data_json
-        FROM events
-       WHERE session_id = ? AND seq = ?
-    `).get(input.sessionId, input.sourceUserSeq) as {
-      id: string;
-      session_id: string;
-      seq: number;
-      turn: number;
-      role: string;
-      type: string;
-      data_json: string;
-    } | undefined;
+    const source = openEventLog().prepare(`SELECT id, session_id, seq, turn, role, type, data_json
+      FROM events WHERE session_id = ? AND seq = ?`).get(input.sessionId, input.sourceUserSeq) as {
+        id: string; session_id: string; seq: number; turn: number; role: string; type: string; data_json: string;
+      } | undefined;
     if (!source) return { status: 'missing', reason: 'accepted user source is missing' };
-    let sourceData: unknown;
-    try { sourceData = JSON.parse(source.data_json); } catch {
-      return { status: 'conflict', reason: 'accepted user source is malformed' };
-    }
-    if (!record(sourceData)) return { status: 'conflict', reason: 'accepted user source is malformed' };
-    const sourceProvenance = autoCaptureProvenanceFromAcceptedEvent({
-      sessionId: source.session_id,
-      id: source.id,
-      seq: source.seq,
-      role: source.role,
-      type: source.type,
-      data: sourceData,
-    });
-    if (!isEligibleAutoCaptureSourceProvenance(sourceProvenance, {
-      sessionId: input.sessionId,
-      sourceEventId: `user-source:${input.sourceUserSeq}`,
-    })) {
+    const data: unknown = JSON.parse(source.data_json);
+    if (!record(data)) return { status: 'conflict', reason: 'accepted user source is malformed' };
+    const sourceEventId = `user-source:${input.sourceUserSeq}`;
+    const provenance = autoCaptureProvenanceFromAcceptedEvent({ sessionId: source.session_id,
+      id: source.id, seq: source.seq, role: source.role, type: source.type, data });
+    if (source.type !== 'user_input_received' || !isEligibleAutoCaptureSourceProvenance(provenance, { sessionId: input.sessionId, sourceEventId })) {
       return { status: 'ineligible', reason: 'accepted source is not genuine user memory authority' };
     }
-    const message = acceptedSourceText(sourceData);
+    const message = acceptedSourceText(data);
     if (!message) return { status: 'conflict', reason: 'accepted user source has no display text' };
     const normalizedMessage = normalizeMessage(message);
-    const graphInputHash = expected.graph.source?.inputHash;
-    // The graph hashes accepted text before memory whitespace normalization.
-    // Bind those original bytes first, then verify the normalized intake below.
-    let captureMessage = digest(message.trim()) === graphInputHash
-      ? normalizedMessage
-      : '';
-    let candidates = captureMessage
-      ? extractAutoMemoryCandidates(captureMessage, 3)
-      : [];
-    // Ordinary non-memory actions remain ineligible without demanding a
-    // memory episode. Only a graph whose semantic input differs from the full
-    // accepted sentence needs the episode-backed fresh-clause recovery below.
-    if (captureMessage && candidates.length === 0) {
-      return { status: 'ineligible', reason: 'accepted graph input produced no durable memory candidates' };
-    }
-    const sourceEventIdentity = `user-source:${input.sourceUserSeq}`;
-    const callId = `auto-capture:${sourceEventIdentity}`;
-    const sourceUri = `conversation://${encodeURIComponent(input.sessionId)}/${encodeURIComponent(callId)}`;
-    const memoryDb = openMemoryDb();
-    const episodes = memoryDb.prepare(`
-      SELECT id, kind, source_app, session_id, call_id, source_uri,
-             content_hash, evidence_excerpt, status, subtype, metadata_json
-        FROM memory_episodes
-       WHERE session_id = ? AND call_id = ?
-       ORDER BY id
-    `).all(input.sessionId, callId) as MemoryEpisodeEvidenceRow[];
-    if (episodes.length !== 1) {
-      return {
-        status: episodes.length === 0 ? 'missing' : 'conflict',
-        reason: `exact auto-capture episode count is ${episodes.length}`,
-      };
-    }
-    const episode = episodes[0]!;
-    // A compound clarification answer keeps the complete conversational
-    // sentence in the immutable accepted event, while the verified turn graph
-    // and auto-memory admission intentionally operate on only the independent
-    // fresh clause. Bind that narrower capture to the graph's content address
-    // instead of re-learning (or requiring) the declined parent clause. The
-    // episode bytes are never sufficient on their own: they must hash to the
-    // accepted graph semantic input and remain an exact substring of the
-    // accepted user message.
-    const normalizedEpisodeMessage = normalizeMessage(episode.evidence_excerpt ?? '');
-    captureMessage ||= normalizedEpisodeMessage
-        && normalizedMessage.includes(normalizedEpisodeMessage)
-        && digest(normalizedEpisodeMessage) === graphInputHash
-        ? normalizedEpisodeMessage
-        : '';
-    if (!captureMessage) {
-      return {
-        status: 'conflict',
-        reason: 'auto-capture episode is not bound to the accepted graph semantic input',
-      };
-    }
-    candidates = extractAutoMemoryCandidates(captureMessage, 3);
-    if (candidates.length === 0) {
-      return { status: 'ineligible', reason: 'accepted graph input produced no durable memory candidates' };
-    }
-    let metadata: unknown;
-    try { metadata = JSON.parse(episode.metadata_json); } catch {
-      return { status: 'conflict', reason: 'auto-capture episode metadata is malformed' };
-    }
-    const expectedMetadata = { candidateCount: candidates.length, sourceEventId: sourceEventIdentity };
-    const expectedContentHash = digest(captureMessage);
-    if (
-      episode.kind !== 'user_turn'
-      || episode.source_app !== 'Conversation'
-      || episode.session_id !== input.sessionId
-      || episode.call_id !== callId
-      || episode.source_uri !== sourceUri
-      || episode.subtype !== 'auto_capture'
-      || episode.status !== 'available'
-      || episode.evidence_excerpt !== captureMessage
-      || episode.content_hash !== expectedContentHash
-      || !isDeepStrictEqual(metadata, expectedMetadata)
-    ) {
-      return { status: 'conflict', reason: 'auto-capture episode does not exactly match the accepted source' };
-    }
-    const rows = memoryDb.prepare(`
-      SELECT id, episode_id, session_id, call_id, candidate_hash, kind, text,
-             importance, status, source_type, intake_reason, trust_level,
-             authority, source_uri, pin
-        FROM memory_reflection_candidates
-       WHERE session_id = ? AND call_id = ?
-       ORDER BY id
-    `).all(input.sessionId, callId) as MemoryCandidateEvidenceRow[];
-    if (rows.length !== candidates.length) {
-      return {
-        status: rows.length === 0 ? 'missing' : 'conflict',
-        reason: `exact auto-capture candidate count is ${rows.length}, expected ${candidates.length}`,
-      };
-    }
-    const expectedByHash = new Map(candidates.map((candidate) => [
-      reflectionCandidateHash(candidate.content),
-      candidate,
-    ]));
-    const normalizedRows: DurableMemoryIntakeReceiptV1['candidates'] = [];
-    for (const row of rows) {
-      const candidate = expectedByHash.get(row.candidate_hash);
-      if (
-        !candidate
-        || row.episode_id !== episode.id
-        || row.session_id !== input.sessionId
-        || row.call_id !== callId
-        || row.candidate_hash !== reflectionCandidateHash(row.text)
-        || row.kind !== candidate.kind
-        || row.text !== candidate.content.trim()
-        || row.importance !== 5
-        || !['pending', 'promoted', 'rejected', 'expired'].includes(row.status)
-        || row.source_type !== 'auto_capture'
-        || row.intake_reason !== candidate.reason
-        || row.trust_level !== 1
-        || row.authority !== 'user'
-        || row.source_uri !== sourceUri
-        || row.pin !== (candidate.pin ? 1 : 0)
-      ) {
-        return { status: 'conflict', reason: 'an auto-capture candidate row is not exact' };
-      }
-      normalizedRows.push({
-        id: row.id,
-        hash: row.candidate_hash,
-        kind: row.kind,
-        textDigest: digest(row.text),
-        intakeReason: row.intake_reason,
-        pinned: row.pin === 1,
-      });
-    }
-    normalizedRows.sort((left, right) => left.hash.localeCompare(right.hash) || left.id - right.id);
-    if (!durableMemoryReceiptAllowsConversationOnly({
-      message: captureMessage,
-      candidates,
-      queuedCandidateCount: rows.length,
-      episodeId: episode.id,
-    })) {
-      return {
-        status: 'ineligible',
-        reason: 'accepted source is not an acknowledgement-only durable-memory action',
-      };
-    }
-    const candidateDigest = digest(canonicalize(normalizedRows));
-    const evidenceDigest = digest(canonicalize({
-      sourceEventId: source.id,
-      sourceMessageDigest: digest(normalizedMessage),
-      episodeId: episode.id,
-      callId,
-      episodeContentHash: episode.content_hash,
-      candidateDigest,
-    }));
-    const receipt: DurableMemoryIntakeReceiptV1 = {
-      protocol: DURABLE_MEMORY_INTAKE_RECEIPT_PROTOCOL,
-      kind: 'durable_memory_intake',
-      identity: {
-        sessionId: input.sessionId,
-        sourceUserSeq: input.sourceUserSeq,
-        acceptedTaskId: expected.expectation.acceptedTaskId,
-      },
-      graph: {
-        graphEventId: expected.expectation.graphEventId,
-        graphId: expected.expectation.graphId,
-        graphHash: expected.expectation.graphHash,
-      },
-      source: {
-        eventId: source.id,
-        eventIdentity: sourceEventIdentity,
-        messageDigest: digest(normalizedMessage),
-      },
-      memory: {
-        episodeId: episode.id,
-        callId,
-        episodeContentHash: episode.content_hash,
-        sourceUri,
-      },
-      candidates: normalizedRows,
-      candidateDigest,
-      evidenceDigest,
-    };
-    const receiptJson = canonicalize(receipt);
-    return {
-      status: 'ok',
-      evidence: {
-        receipt,
-        receiptJson,
-        receiptId: `memory-intake:v1:${digest(receiptJson)}`,
-        sourceTurn: source.turn,
-      },
-    };
-  } catch (error) {
-    return { status: 'storage_error', reason: boundedReason(error) };
-  }
-}
-
-/** Informational model context only. Does not issue a completion receipt or
- * settle the accepted task; all source/episode/candidate checks still apply. */
-function verifiedMemoryIntakeRows(input: { sessionId: string; sourceUserSeq: number }): {
-  episodeId: string; rows: Array<MemoryCandidateEvidenceRow & { resulting_fact_id?: number | null; reason?: string | null }>;
-} | null {
-  try {
-    if (!input.sessionId || !Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) return null;
-    const row = openEventLog().prepare('SELECT id, session_id, seq, role, type, data_json FROM events WHERE session_id = ? AND seq = ?')
-      .get(input.sessionId, input.sourceUserSeq) as { id: string; session_id: string; seq: number; role: string; type: string; data_json: string } | undefined;
-    if (!row) return null;
-    const data: unknown = JSON.parse(row.data_json);
-    if (!record(data)) return null;
-    const sourceEventId = `user-source:${input.sourceUserSeq}`;
-    const provenance = autoCaptureProvenanceFromAcceptedEvent({ id: row.id, sessionId: row.session_id, seq: row.seq, role: row.role, type: row.type, data });
-    if (!isEligibleAutoCaptureSourceProvenance(provenance, { sessionId: input.sessionId, sourceEventId })) return null;
-    const message = normalizeMessage(acceptedSourceText(data));
-    const candidates = extractAutoMemoryCandidates(message, 3);
-    if (!candidates.length) return null;
     const callId = `auto-capture:${sourceEventId}`;
     const sourceUri = `conversation://${encodeURIComponent(input.sessionId)}/${encodeURIComponent(callId)}`;
-    const db = openMemoryDb();
-    const episodes = db.prepare('SELECT * FROM memory_episodes WHERE session_id = ? AND call_id = ?').all(input.sessionId, callId) as MemoryEpisodeEvidenceRow[];
-    if (episodes.length !== 1) return null;
-    const episode = episodes[0]!;
-    if (episode.kind !== 'user_turn' || episode.source_app !== 'Conversation' || episode.subtype !== 'auto_capture'
-      || episode.status !== 'available' || episode.source_uri !== sourceUri || episode.evidence_excerpt !== message
-      || episode.content_hash !== digest(message)
-      || !isDeepStrictEqual(JSON.parse(episode.metadata_json), { candidateCount: candidates.length, sourceEventId })) return null;
-    const rows = db.prepare('SELECT * FROM memory_reflection_candidates WHERE session_id = ? AND call_id = ?').all(input.sessionId, callId) as MemoryCandidateEvidenceRow[];
-    if (rows.length !== candidates.length) return null;
-    const byHash = new Map(candidates.map(candidate => [reflectionCandidateHash(candidate.content), candidate]));
-    for (const candidateRow of rows) {
-      const candidate = byHash.get(candidateRow.candidate_hash);
-      if (!candidate || candidateRow.episode_id !== episode.id || candidateRow.source_type !== 'auto_capture'
-        || candidateRow.authority !== 'user' || candidateRow.trust_level !== 1 || candidateRow.source_uri !== sourceUri
-        || !['pending', 'promoted'].includes(candidateRow.status) || candidateRow.text !== candidate.content.trim()
-        || candidateRow.candidate_hash !== reflectionCandidateHash(candidateRow.text)
-        || candidateRow.kind !== candidate.kind || candidateRow.intake_reason !== candidate.reason
-        || candidateRow.importance !== 5 || candidateRow.pin !== (candidate.pin ? 1 : 0)) return null;
+    const fullSourceIsGraphInput = !graphInputHash || digest(message.trim()) === graphInputHash;
+    // Negative classification must precede storage lookup: ordinary work does
+    // not need an automatic-memory episode. The nonempty source identity only
+    // supplies this pure predicate's structural argument; a true result grants
+    // no authority and still requires every episode/candidate/fact check below.
+    // A narrowed graph input cannot borrow this full-source classification.
+    if (completionOnly && fullSourceIsGraphInput) {
+      const sourceCandidates = selectAutoMemoryCandidates(normalizedMessage, 3);
+      if (!durableMemoryReceiptAllowsConversationOnly({ message: normalizedMessage, candidates: sourceCandidates,
+        queuedCandidateCount: sourceCandidates.length, episodeId: callId })) {
+        return { status: 'ineligible', reason: 'accepted source is not an acknowledgement-only durable-memory action' };
+      }
     }
-    return { episodeId: episode.id, rows };
-  } catch { return null; }
+    const db = openMemoryDb();
+    const episodes = db.prepare('SELECT * FROM memory_episodes WHERE session_id = ? AND call_id = ?')
+      .all(input.sessionId, callId) as MemoryEpisodeEvidenceRow[];
+    if (episodes.length !== 1) return { status: episodes.length ? 'conflict' : 'missing', reason: `exact auto-capture episode count is ${episodes.length}` };
+    const episode = episodes[0]!;
+    // A graph-bound fresh clause can narrow extraction, never the owner bytes
+    // used to interpret its destination. Raw source text remains in each origin.
+    const excerpt = normalizeMessage(episode.evidence_excerpt ?? '');
+    const captureMessage = fullSourceIsGraphInput ? normalizedMessage
+      : excerpt && normalizedMessage.includes(excerpt) && digest(excerpt) === graphInputHash ? excerpt : '';
+    if (!captureMessage) return { status: 'conflict', reason: 'auto-capture episode is not bound to the accepted graph semantic input' };
+    // recordMemoryEpisode normalizes and retains only its prescribed 2,000
+    // character excerpt. Full source/claim authority remains in the origin;
+    // an unavailable long narrowed clause cannot be recovered from this prefix.
+    const expectedExcerpt = captureMessage.slice(0, 2000);
+    const candidates = selectAutoMemoryCandidates(captureMessage, 3);
+    if (!candidates.length) return { status: 'ineligible', reason: 'accepted input produced no durable memory candidates' };
+    if (episode.kind !== 'user_turn' || episode.source_app !== 'Conversation'
+      || episode.session_id !== input.sessionId || episode.call_id !== callId
+      || episode.source_uri !== sourceUri || episode.subtype !== 'auto_capture' || episode.status !== 'available'
+      || episode.evidence_excerpt !== expectedExcerpt || episode.content_hash !== digest(expectedExcerpt)
+      || !isDeepStrictEqual(JSON.parse(episode.metadata_json), { candidateCount: candidates.length, sourceEventId })) {
+      return { status: 'conflict', reason: 'auto-capture episode does not exactly match the accepted source' };
+    }
+    // Ineligible means another task shape may use ordinary verification. An
+    // admitted acknowledgement-only memory instruction with missing storage
+    // proof instead remains a verification gap, never that fallback door.
+    if (completionOnly && !durableMemoryReceiptAllowsConversationOnly({ message: captureMessage, candidates,
+      queuedCandidateCount: candidates.length, episodeId: episode.id })) {
+      return { status: 'ineligible', reason: 'accepted source is not an acknowledgement-only durable-memory action' };
+    }
+    const origins = automaticMemoryOriginsForCapture({ message: captureMessage, sessionId: input.sessionId,
+      sourceEventId, sourceProvenance: provenance }, candidates);
+    if (origins.some(origin => !origin || !origin.source.context
+      || origin.source.context.sessionId !== input.sessionId || origin.source.context.sourceUserSeq !== input.sourceUserSeq)) {
+      return { status: 'missing', reason: 'automatic intake lacks exact retained accepted-source context' };
+    }
+    const expected = new Map(origins.map((origin, index) => [automaticMemoryCandidateIdentity(origin!), { origin: origin!, candidate: candidates[index]! }]));
+    if (expected.size !== candidates.length) return { status: 'conflict', reason: 'automatic intake has ambiguous claim identity' };
+    const rows = db.prepare('SELECT * FROM memory_reflection_candidates WHERE session_id = ? AND call_id = ? ORDER BY id')
+      .all(input.sessionId, callId) as MemoryCandidateEvidenceRow[];
+    if (rows.length !== candidates.length) return { status: rows.length ? 'conflict' : 'missing',
+      reason: `exact auto-capture candidate count is ${rows.length}, expected ${candidates.length}` };
+    const verified: VerifiedIntake['rows'] = [];
+    for (const row of rows) {
+      const admission = expected.get(row.candidate_hash);
+      if (!admission || row.destination_json === null) return { status: 'missing', reason: 'legacy or unbound candidate is not fresh completion evidence' };
+      const envelope = parseAutomaticMemoryEnvelope(row.destination_json);
+      const candidate = admission.candidate;
+      if (!isDeepStrictEqual(envelope.origin, admission.origin)
+        || row.candidate_hash !== automaticMemoryCandidateIdentity(envelope.origin)
+        || row.episode_id !== episode.id || row.session_id !== input.sessionId || row.call_id !== callId
+        || row.kind !== candidate.kind || row.text !== candidate.content.trim() || row.importance !== 5
+        || !['pending', 'promoted', 'rejected', 'expired'].includes(row.status)
+        || row.source_type !== 'auto_capture' || row.intake_reason !== candidate.reason
+        || row.trust_level !== 1 || row.authority !== 'user' || row.source_uri !== sourceUri
+        || row.pin !== (candidate.pin ? 1 : 0)) return { status: 'conflict', reason: 'an automatic candidate differs from its frozen accepted origin' };
+      verified.push({ ...row, envelope });
+      expected.delete(row.candidate_hash);
+    }
+    return { status: 'ok', intake: { source, message, captureMessage, callId, sourceUri, episode, candidates, rows: verified } };
+  } catch (error) { return { status: 'storage_error', reason: boundedReason(error) }; }
+}
+
+function canonicalResult(intake: VerifiedIntake, row: VerifiedIntake['rows'][number]) {
+  const db = openMemoryDb();
+  const destination = resolveAutomaticMemoryDestination(row.envelope);
+  const fact = Number.isSafeInteger(row.resulting_fact_id) && Number(row.resulting_fact_id) > 0
+    ? db.prepare('SELECT id, content, active, updated_at FROM consolidated_facts WHERE id = ?').get(row.resulting_fact_id) as
+      { id: number; content: string; active: number; updated_at: string } | undefined : undefined;
+  const links = fact ? db.prepare(`SELECT ordinal, excerpt, created_at FROM fact_evidence
+    WHERE fact_id = ? AND episode_id = ? AND source_uri = ? ORDER BY ordinal`)
+    .all(fact.id, intake.episode.id, intake.sourceUri) as Array<{ ordinal: number; excerpt: string; created_at: string }> : [];
+  // Everywhere is represented by no scope row. Read the actual store directly;
+  // neither today's session metadata nor a scope-cache fallback is evidence.
+  const hasScopes = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_scopes'").get());
+  if (fact && !hasScopes) throw new Error('canonical memory scope store is unavailable');
+  const scopeRow = fact ? db.prepare("SELECT scope_project_id, scope_agent_key FROM memory_scopes WHERE target_kind = 'fact' AND target_id = ?")
+    .get(String(fact.id)) as { scope_project_id: string | null; scope_agent_key: string | null } | undefined : undefined;
+  const scope: MemoryScope = { projectId: scopeRow?.scope_project_id ?? null, agentKey: scopeRow?.scope_agent_key ?? null };
+  const complete = Boolean(fact && fact.content.length <= 12000);
+  const scopeMatches = destination.status === 'resolved' && isDeepStrictEqual(scope, destination.scope);
+  const verified = row.status === 'promoted' && destination.status === 'resolved'
+    && fact?.active === 1 && links.length > 0 && complete && scopeMatches;
+  return { destination, fact, links, scope, complete, scopeMatches, verified };
+}
+
+/** Re-read both stores; pending intake never occupies the host completion slot. */
+function deriveExactEvidence(input: { sessionId: string; sourceUserSeq: number }): DeriveResult {
+  try {
+    return openMemoryDb().transaction((): DeriveResult => {
+      const expected = expectedTaskFor(input.sessionId, input.sourceUserSeq);
+      if (expected.status !== 'ok') return { status: expected.status === 'missing' ? 'missing' : 'conflict', reason: expected.reason };
+      if (expected.graph.classification.route !== 'act') return { status: 'ineligible', reason: 'accepted graph is not an action turn' };
+      const graphInputHash = expected.graph.source?.inputHash;
+      if (!graphInputHash || !/^[a-f0-9]{64}$/.test(graphInputHash)) return { status: 'conflict', reason: 'accepted graph lacks its exact input digest' };
+      const loaded = readVerifiedIntake(input, graphInputHash, true);
+      if (loaded.status !== 'ok') return loaded;
+      const intake = loaded.intake;
+      if (!durableMemoryReceiptAllowsConversationOnly({ message: intake.captureMessage, candidates: intake.candidates,
+        queuedCandidateCount: intake.rows.length, episodeId: intake.episode.id })) {
+        return { status: 'ineligible', reason: 'accepted source is not an acknowledgement-only durable-memory action' };
+      }
+      const normalizedRows: DurableMemoryIntakeReceiptV2['candidates'] = [];
+      for (const row of intake.rows) {
+        const result = canonicalResult(intake, row);
+        const decisionDigest = automaticMemoryDecisionDigest(row.envelope);
+        if (!result.verified || !result.fact || result.destination.status !== 'resolved' || !decisionDigest) {
+          return { status: 'missing', reason: 'automatic consolidation is pending, unresolved, inactive, unlinked or outside its exact destination' };
+        }
+        normalizedRows.push({ id: row.id, hash: row.candidate_hash, kind: row.kind, textDigest: digest(row.text),
+          intakeReason: row.intake_reason!, pinned: row.pin === 1,
+          destination: { envelope: row.envelope, envelopeDigest: automaticMemoryEnvelopeDigest(row.envelope),
+            decisionDigest, scope: result.destination.scope, claimTextDigest: digest(result.destination.claimText) },
+          fact: { id: result.fact.id, active: true, contentDigest: digest(result.fact.content), updatedAt: result.fact.updated_at,
+            scope: result.scope, evidence: result.links.map(link => ({ ordinal: link.ordinal, excerptDigest: digest(link.excerpt), createdAt: link.created_at })) },
+        });
+      }
+      normalizedRows.sort((left, right) => left.hash.localeCompare(right.hash) || left.id - right.id);
+      const candidateDigest = digest(canonicalize(normalizedRows));
+      const sourceMessageDigest = digest(intake.message);
+      const evidenceDigest = digest(canonicalize({ sourceEventId: intake.source.id, sourceMessageDigest,
+        episodeId: intake.episode.id, callId: intake.callId, episodeContentHash: intake.episode.content_hash, candidateDigest }));
+      const receipt: DurableMemoryIntakeReceiptV2 = { protocol: DURABLE_MEMORY_INTAKE_RECEIPT_PROTOCOL, kind: 'durable_memory_intake',
+        identity: { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, acceptedTaskId: expected.expectation.acceptedTaskId },
+        graph: { graphEventId: expected.expectation.graphEventId, graphId: expected.expectation.graphId, graphHash: expected.expectation.graphHash },
+        source: { eventId: intake.source.id, eventIdentity: `user-source:${input.sourceUserSeq}`, messageDigest: sourceMessageDigest },
+        memory: { episodeId: intake.episode.id, callId: intake.callId, episodeContentHash: intake.episode.content_hash, sourceUri: intake.sourceUri },
+        candidates: normalizedRows, candidateDigest, evidenceDigest };
+      const receiptJson = canonicalize(receipt);
+      return { status: 'ok', evidence: { receipt, receiptJson, receiptId: `memory-intake:v2:${digest(receiptJson)}`, sourceTurn: intake.source.turn } };
+    })();
+  } catch (error) { return { status: 'storage_error', reason: boundedReason(error) }; }
 }
 
 export function verifiedMemoryIntakeContext(input: { sessionId: string; sourceUserSeq: number }): string | null {
-  if (!verifiedMemoryIntakeRows(input)) return null;
-  return '[Verified memory intake] The automatic layer has already durably captured the memory claims in this accepted request. Do not duplicate those claims through memory_remember or discovery/readback solely to save them again. Consolidation may still be pending; intake alone does not prove every canonical fact has been updated. Acknowledge the captured request accurately and continue any separate requested work. This notice does not complete the task.';
+  const loaded = readVerifiedIntake(input);
+  if (loaded.status !== 'ok' || loaded.intake.rows.some(row => !['pending', 'promoted'].includes(row.status))) return null;
+  return '[Verified memory intake] The automatic layer has durably queued these exact accepted claims and their original context. Do not duplicate those claims through memory_remember solely to save them again while consolidation is pending. Destination or canonical-fact qualification may still be unresolved; this intake is not saved-memory or completion proof. Report pending work accurately and continue any separate requested work.';
 }
 
-/** Current canonical results of this exact source's automatic consolidation.
- * Intake alone, inactive facts and absent source links are explicitly unverified. */
+/** Current storage evidence only: exact source, reviewed destination, active
+ * fact and evidence link. Semantic completeness remains a separate review. */
 export function verifiedMemoryConsolidationEvidence(input: { sessionId: string; sourceUserSeq: number }) {
-  const intake = verifiedMemoryIntakeRows(input);
-  if (!intake) return null;
   try {
-    const db = openMemoryDb();
-    return intake.rows.map(row => {
-      const fact = Number.isSafeInteger(row.resulting_fact_id) && Number(row.resulting_fact_id) > 0
-        ? db.prepare('SELECT id, content, active, updated_at FROM consolidated_facts WHERE id = ?').get(row.resulting_fact_id) as { id: number; content: string; active: number; updated_at: string } | undefined
-        : undefined;
-      const linked = fact ? Boolean(db.prepare('SELECT 1 FROM fact_evidence WHERE fact_id = ? AND episode_id = ? AND source_uri = ? LIMIT 1').get(fact.id, intake.episodeId, row.source_uri)) : false;
-      const complete = Boolean(fact && fact.content.length <= 12000);
-      return {
-        candidateId: row.id, candidate: row.text, status: row.status, disposition: row.reason ?? null,
-        verified: row.status === 'promoted' && fact?.active === 1 && linked && complete,
-        sourceLinked: linked,
-        fact: fact ? { id: fact.id, active: fact.active === 1, content: fact.content.slice(0, 12000),
-          contentComplete: complete, contentDigest: digest(fact.content), updatedAt: fact.updated_at } : null,
-      };
-    });
+    return openMemoryDb().transaction(() => {
+      const loaded = readVerifiedIntake(input);
+      if (loaded.status !== 'ok') return null;
+      return loaded.intake.rows.map(row => {
+        const result = canonicalResult(loaded.intake, row);
+        return { candidateId: row.id, candidate: row.text, status: row.status, disposition: row.reason ?? null,
+          verified: result.verified, sourceLinked: result.links.length > 0,
+          destinationStatus: result.destination.status, scopeMatches: result.scopeMatches,
+          originDigest: row.envelope.originDigest, decisionDigest: automaticMemoryDecisionDigest(row.envelope),
+          fact: result.fact ? { id: result.fact.id, active: result.fact.active === 1, content: result.fact.content.slice(0, 12000),
+            contentComplete: result.complete, contentDigest: digest(result.fact.content), updatedAt: result.fact.updated_at, scope: result.scope } : null };
+      });
+    })();
   } catch { return null; }
 }
 
@@ -567,6 +491,40 @@ function exactReceiptRow(
     && row.candidate_digest === receipt.candidateDigest
     && row.evidence_digest === receipt.evidenceDigest
     && row.receipt_json === evidence.receiptJson;
+}
+
+/** Keep the issued proof immutable while tolerating additive corroboration.
+ * Updated timestamps are not fact identity. Every original source-link ordinal
+ * and excerpt must still exist, and all content/scope/origin/decision fields
+ * remain exact. A later unrelated fact cannot redeem the original receipt. */
+function compatibleReceiptEvidence(row: HostReceiptRow, current: DerivedEvidence): DerivedEvidence | null {
+  try {
+    if (row.protocol_version !== DURABLE_MEMORY_INTAKE_RECEIPT_PROTOCOL) return null;
+    const old: unknown = JSON.parse(row.receipt_json);
+    if (!record(old) || !Array.isArray(old.candidates) || old.candidates.length !== current.receipt.candidates.length) return null;
+    const candidates: DurableMemoryIntakeReceiptV2['candidates'] = [];
+    for (const [index, candidate] of current.receipt.candidates.entries()) {
+      const previous: unknown = old.candidates[index];
+      if (!record(previous) || !record(previous.fact) || typeof previous.fact.updatedAt !== 'string'
+        || !previous.fact.updatedAt || !Array.isArray(previous.fact.evidence) || !previous.fact.evidence.length) return null;
+      const links: DurableMemoryIntakeReceiptV2['candidates'][number]['fact']['evidence'] = [];
+      for (const link of previous.fact.evidence) {
+        if (!record(link) || !Number.isSafeInteger(link.ordinal) || typeof link.excerptDigest !== 'string'
+          || typeof link.createdAt !== 'string' || !link.createdAt
+          || !candidate.fact.evidence.some(now => now.ordinal === link.ordinal && now.excerptDigest === link.excerptDigest)) return null;
+        links.push({ ordinal: Number(link.ordinal), excerptDigest: link.excerptDigest, createdAt: link.createdAt });
+      }
+      candidates.push({ ...candidate, fact: { ...candidate.fact, updatedAt: previous.fact.updatedAt, evidence: links } });
+    }
+    const candidateDigest = digest(canonicalize(candidates));
+    const receipt = { ...current.receipt, candidates, candidateDigest, evidenceDigest: digest(canonicalize({
+      sourceEventId: current.receipt.source.eventId, sourceMessageDigest: current.receipt.source.messageDigest,
+      episodeId: current.receipt.memory.episodeId, callId: current.receipt.memory.callId,
+      episodeContentHash: current.receipt.memory.episodeContentHash, candidateDigest })) };
+    const receiptJson = canonicalize(receipt);
+    const evidence = { receipt, receiptJson, receiptId: `memory-intake:v2:${digest(receiptJson)}`, sourceTurn: current.sourceTurn };
+    return exactReceiptRow(row, evidence) ? evidence : null;
+  } catch { return null; }
 }
 
 function exactReceiptEvent(
@@ -599,13 +557,24 @@ function exactReceiptEvent(
     && isDeepStrictEqual(data.receipt, evidence.receipt);
 }
 
+/** Once normalized authority exists, loss of its evidence is a conflict.
+ * It cannot re-enter the ordinary non-memory completion fallback. */
+function boundReceiptFailure(input: { sessionId: string; sourceUserSeq: number },
+  failure: Exclude<DeriveResult, { status: 'ok' }>): Exclude<DeriveResult, { status: 'ok' }> {
+  if (failure.status === 'storage_error' || failure.status === 'conflict') return failure;
+  try {
+    return readReceiptRow(input.sessionId, input.sourceUserSeq)
+      ? { status: 'conflict', reason: `bound memory receipt lost current qualification: ${failure.reason}` } : failure;
+  } catch (error) { return { status: 'storage_error', reason: boundedReason(error) }; }
+}
+
 /** Mint once, only from exact host-observed durable evidence. */
 export function issueDurableMemoryIntakeReceipt(input: {
   sessionId: string;
   sourceUserSeq: number;
 }): IssueDurableMemoryIntakeReceiptResult {
   const derived = deriveExactEvidence(input);
-  if (derived.status !== 'ok') return derived;
+  if (derived.status !== 'ok') return boundReceiptFailure(input, derived);
   let mirror: EventRow | null = null;
   try {
     const db = openEventLog();
@@ -615,7 +584,8 @@ export function issueDurableMemoryIntakeReceipt(input: {
          WHERE session_id = ? AND source_user_seq = ?
       `).get(input.sessionId, input.sourceUserSeq) as HostReceiptRow | undefined;
       if (existing) {
-        if (!exactReceiptRow(existing, derived.evidence)) {
+        const compatible = compatibleReceiptEvidence(existing, derived.evidence);
+        if (!compatible) {
           return { status: 'conflict', reason: 'a different host receipt already claims this accepted source' };
         }
         const authority = db.prepare(`
@@ -640,7 +610,7 @@ export function issueDurableMemoryIntakeReceipt(input: {
           status: 'replayed',
           receiptId: existing.receipt_id,
           receiptEventId: existing.receipt_event_id,
-          receipt: derived.evidence.receipt,
+          receipt: compatible.receipt,
         };
       }
       const authority = db.prepare(`
@@ -705,7 +675,7 @@ export function issueDurableMemoryIntakeReceipt(input: {
            source_event_id, source_message_digest, episode_id, call_id,
            episode_content_hash, candidate_count, candidate_digest,
            evidence_digest, receipt_json, receipt_event_id, issued_at)
-        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         derived.evidence.receiptId,
         input.sessionId,
@@ -770,11 +740,12 @@ export function redeemDurableMemoryIntakeReceipt(input: {
   sourceUserSeq: number;
 }): RedeemDurableMemoryIntakeReceiptResult {
   const derived = deriveExactEvidence(input);
-  if (derived.status !== 'ok') return derived;
+  if (derived.status !== 'ok') return boundReceiptFailure(input, derived);
   try {
     const row = readReceiptRow(input.sessionId, input.sourceUserSeq);
     if (!row) return { status: 'missing', reason: 'durable memory host receipt is missing' };
-    if (!exactReceiptRow(row, derived.evidence)) {
+    const compatible = compatibleReceiptEvidence(row, derived.evidence);
+    if (!compatible) {
       return { status: 'conflict', reason: 'durable memory host receipt no longer matches exact evidence' };
     }
     const authority = readAuthority(input.sessionId, input.sourceUserSeq);
@@ -810,14 +781,14 @@ export function redeemDurableMemoryIntakeReceipt(input: {
     if (crossings.logical_n !== 0 || crossings.dispatch_n !== 0) {
       return { status: 'conflict', reason: 'durable memory host receipt has competing tool work' };
     }
-    if (!exactReceiptEvent(row, derived.evidence)) {
+    if (!exactReceiptEvent(row, compatible)) {
       return { status: 'conflict', reason: 'durable memory host receipt event is missing or tampered' };
     }
     return {
       status: 'redeemed',
       receiptId: row.receipt_id,
       receiptEventId: row.receipt_event_id,
-      receipt: derived.evidence.receipt,
+      receipt: compatible.receipt,
     };
   } catch (error) {
     return { status: 'storage_error', reason: boundedReason(error) };

@@ -7,10 +7,16 @@ import {
   UNJUDGED_OWNER_STATEMENT_REASON,
 } from './durable-consolidation.js';
 import { extractNamedResource } from './focus.js';
-import { saveUserProfile, type UserProfile } from '../runtime/user-profile.js';
+import type { UserProfile } from '../runtime/user-profile.js';
+import { openEventLog } from '../runtime/harness/eventlog.js';
+import { readSourceSessionContext } from '../runtime/harness/source-session-context.js';
+import { currentSourceSessionContext } from '../runtime/harness/source-session-context-scope.js';
+import { createAutomaticMemoryOrigin, type AutomaticMemoryOrigin,
+  type AutomaticMemoryOriginInput, type MemoryDestinationSpan } from './memory-destination.js';
 import { getRuntimeEnv } from '../config.js';
 import { isHarnessInjectedInput } from '../runtime/harness/objective-judge.js';
 import { EXPLICIT_MEMORY_INSTRUCTION_RE, isSelfContainedComputation } from '../assistant/message-intent.js';
+import { hasUnresolvedExplicitMemoryReference, isUnresolvedMemoryReferencePayload } from './unresolved-memory-reference.js';
 import pino from 'pino';
 
 /** Defense-in-depth (2026-06-23): auto-memory must learn only from REAL user
@@ -213,6 +219,138 @@ export function captureMessageIsOwnerAuthored(
   if (!candidate) return false;
   return acceptedOwnerTexts(provenance.data)
     .some((text) => normalizeOwnerText(text).includes(candidate));
+}
+
+/** Extraction keeps offsets privately so the public candidate shape stays
+ * compatible. Offsets always describe the complete source claim, even when
+ * the old display candidate has a host wrapper or preview-length cap. */
+const candidateSourceSpans = new WeakMap<AutoMemoryCandidate, { source: string; span: MemoryDestinationSpan }>();
+const instructionSourceSpans = new WeakMap<ExplicitMemoryInstructionParse, MemoryDestinationSpan>();
+
+function normalizedSourceView(source: string): { text: string; starts: number[]; ends: number[] } {
+  let text = '';
+  const starts: number[] = [];
+  const ends: number[] = [];
+  for (const match of source.matchAll(/\s+|[^\s]/gu)) {
+    const token = /^\s/u.test(match[0]) ? ' ' : match[0];
+    for (let unit = 0; unit < token.length; unit++) {
+      text += token[unit]; starts.push(match.index + (token.length > 1 ? unit : 0));
+      ends.push(match.index + (token.length > 1 ? unit + 1 : match[0].length));
+    }
+  }
+  return { text, starts, ends };
+}
+
+/** Whitespace-only fallback for callers supplying a narrowed source. Never
+ * choose an arbitrary repeated occurrence when its original offset was lost. */
+export function uniqueAutomaticMemorySpan(source: string, text: string): MemoryDestinationSpan | null {
+  const wanted = normalizeOwnerText(text);
+  if (!wanted) return null;
+  const view = normalizedSourceView(source);
+  const start = view.text.indexOf(wanted);
+  if (start < 0 || view.text.indexOf(wanted, start + 1) >= 0) return null;
+  return { start: view.starts[start]!, end: view.ends[start + wanted.length - 1]! };
+}
+
+function rawNormalizedSpan(source: string, normalized: string, span: MemoryDestinationSpan): MemoryDestinationSpan | null {
+  const view = normalizedSourceView(source);
+  // clean() only trims whitespace and enclosing literal delimiters. Locate
+  // that complete cleaned view by its known enclosing trim, not a claim search.
+  let start = view.text.length - view.text.trimStart().length;
+  let end = view.text.trimEnd().length;
+  while (end - start >= 2 && /["'`]/.test(view.text[start]!) && view.text[start] === view.text[end - 1]) {
+    start++; end--;
+    while (start < end && /\s/.test(view.text[start]!)) start++;
+    while (end > start && /\s/.test(view.text[end - 1]!)) end--;
+  }
+  if (view.text.slice(start, end) !== normalized || span.start < 0 || span.end > normalized.length || span.end <= span.start) return null;
+  return { start: view.starts[start + span.start]!, end: view.ends[start + span.end - 1]! };
+}
+
+function automaticMemorySource(input: {
+  message: string; sessionId: string; sourceEventId?: string; sourceProvenance: AutoCaptureSourceProvenance;
+}): AutomaticMemoryOriginInput['source'] | null {
+  const provenance = input.sourceProvenance;
+  if (provenance.authority === 'direct_user_input') {
+    return { authority: 'direct_user_input', sessionId: input.sessionId, eventId: null, eventSeq: null,
+      eventType: 'direct_user_input', ownerText: input.message, context: null };
+  }
+  try {
+    const row = openEventLog().prepare('SELECT id, seq, role, type, data_json FROM events WHERE session_id = ? AND seq = ?')
+      .get(input.sessionId, provenance.seq) as { id: string; seq: number; role: string; type: string; data_json: string } | undefined;
+    if (!row || row.id !== provenance.eventId || row.role !== provenance.role || row.type !== provenance.type) return null;
+    const data = JSON.parse(row.data_json) as Record<string, unknown>;
+    const actual = autoCaptureProvenanceFromAcceptedEvent({ ...row, sessionId: input.sessionId, data });
+    if (!isEligibleAutoCaptureSourceProvenance(actual, input)) return null;
+    const ownerText = acceptedOwnerText(data);
+    if (!ownerText || automaticOwnerPrivacyRefused(ownerText) || ownerText !== acceptedOwnerText(provenance.data)
+      || !normalizeOwnerText(ownerText).includes(normalizeOwnerText(input.message))) return null;
+    // A steer belongs to its own owner row, but inherits only the currently
+    // verified execution context. It cannot masquerade as an accepted task.
+    const active = currentSourceSessionContext(input.sessionId);
+    const context = row.type === 'user_input_received'
+      ? readSourceSessionContext({ sessionId: input.sessionId, sourceUserSeq: row.seq })
+      : active ? readSourceSessionContext(active, active.digest) : null;
+    return { authority: 'accepted_user_input', sessionId: input.sessionId, eventId: row.id, eventSeq: row.seq,
+      eventType: row.type as 'user_input_received' | 'user_steer_note', ownerText,
+      context: context ? { sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq,
+        digest: context.digest, memoryScope: { ...context.memoryScope } } : null };
+  } catch { return null; }
+}
+
+/** Reopen the retained source, never today's session scope. A missing source,
+ * changed owner bytes, or replaced project/agent leaves intake unqualified. */
+export function automaticMemoryOriginSourceIsCurrent(origin: AutomaticMemoryOrigin): boolean {
+  const source = origin.source;
+  if (source.authority !== 'accepted_user_input' || !source.context) return false;
+  try {
+    const row = openEventLog().prepare('SELECT id, seq, role, type, data_json FROM events WHERE session_id = ? AND seq = ?')
+      .get(source.sessionId, source.eventSeq) as { id: string; seq: number; role: string; type: string; data_json: string } | undefined;
+    if (!row || row.id !== source.eventId || row.type !== source.eventType) return false;
+    const data = JSON.parse(row.data_json) as Record<string, unknown>;
+    const provenance = autoCaptureProvenanceFromAcceptedEvent({ ...row, sessionId: source.sessionId, data });
+    const token = row.type === 'user_steer_note' ? 'user-steer' : 'user-source';
+    if (!isEligibleAutoCaptureSourceProvenance(provenance, { sessionId: source.sessionId, sourceEventId: `${token}:${row.seq}` })
+      || acceptedOwnerText(data) !== source.ownerText || automaticOwnerPrivacyRefused(source.ownerText)) return false;
+    const context = readSourceSessionContext(source.context, source.context.digest);
+    return context !== null && context.memoryScope.projectId === source.context.memoryScope.projectId
+      && context.memoryScope.agentKey === source.context.memoryScope.agentKey;
+  } catch { return false; }
+}
+
+/** Shared with exact-source intake verification. Wrappers belong to the host,
+ * not to the owner's claim. Unknown mappings retain the full source as held
+ * evidence, never as a license to save a rewritten or truncated claim. */
+export function automaticMemoryOriginsForCapture(input: {
+  message: string; sessionId: string; sourceEventId?: string; sourceProvenance: AutoCaptureSourceProvenance;
+}, candidates: readonly AutoMemoryCandidate[]): Array<AutomaticMemoryOrigin | null> {
+  const source = automaticMemorySource(input);
+  if (!source) return candidates.map(() => null);
+  return candidates.map(candidate => {
+    const retained = candidateSourceSpans.get(candidate);
+    const narrowed = normalizeOwnerText(source.ownerText) === normalizeOwnerText(input.message)
+      ? { start: 0, end: source.ownerText.length } : uniqueAutomaticMemorySpan(source.ownerText, input.message);
+    let exact: MemoryDestinationSpan | null = null;
+    if (retained?.source === input.message && narrowed) {
+      // Map the known extraction interval through the narrowed view. The whole
+      // narrowed view must be unique; a repeated claim within it is unambiguous.
+      const local = normalizedSourceView(input.message);
+      const first = local.starts.findIndex(offset => offset === retained.span.start);
+      const last = local.ends.lastIndexOf(retained.span.end);
+      const raw = normalizedSourceView(source.ownerText.slice(narrowed.start, narrowed.end));
+      const localStart = local.text.length - local.text.trimStart().length;
+      const rawStart = raw.text.length - raw.text.trimStart().length;
+      if (first >= localStart && last >= first && local.text.trim() === raw.text.trim()) {
+        exact = { start: narrowed.start + raw.starts[first - localStart + rawStart]!,
+          end: narrowed.start + raw.ends[last - localStart + rawStart]! };
+      }
+    }
+    const complete = candidate.reason === 'explicit remember request' || candidate.reason === 'explicit durable correction'
+      || candidate.pin === true;
+    return createAutomaticMemoryOrigin({ source, claim: exact ?? { start: 0, end: source.ownerText.length },
+      claimMode: exact ? complete ? 'complete' : 'selectable' : 'unresolved',
+      candidate: { kind: candidate.kind, text: candidate.content } });
+  });
 }
 
 function emptyAutoCaptureResult(): AutoCaptureResult {
@@ -477,49 +615,136 @@ function explicitRememberCommandStart(text: string): number | null {
 }
 
 function stripTerminalMemoryFraming(text: string): string {
-  return text
-    .replace(
-      /\s+(?:then\s+)?(?:just\s+)?confirm(?:\s+only)?\s+(?:(?:you(?:'ve| have)\s+)?(?:noted|saved|remembered)\s+it|after\s+it\s+is\s+(?:noted|saved|stored|remembered))(?:\s*[—,:;-]\s*nothing\s+else)?[.!?]*$/i,
-      '',
-    )
+  const framing: Array<{ pattern: RegExp; retainFirst?: boolean }> = [
+    { pattern: /\s+(?:then\s+)?(?:just\s+)?confirm(?:\s+only)?\s+(?:(?:you(?:'ve| have)\s+)?(?:noted|saved|remembered)\s+it|after\s+it\s+is\s+(?:noted|saved|stored|remembered))(?:\s*[—,:;-]\s*nothing\s+else)?[.!?]*$/i },
     // Durability/next-conversation wording describes the requested storage
     // contract, not the claim itself. The source episode keeps the full turn.
-    .replace(
-      /\s+this\s+is\s+(?:a\s+)?durable\s+(?:fact|memory)\s+that\s+(?:must|should|needs?\s+to)\s+be\s+available\s+in\s+(?:a|the)\s+new\s+(?:conversation|session)[.!?]*$/i,
-      '',
-    )
+    { pattern: /\s+this\s+is\s+(?:a\s+)?durable\s+(?:fact|memory)\s+that\s+(?:must|should|needs?\s+to)\s+be\s+available\s+in\s+(?:a|the)\s+new\s+(?:conversation|session)[.!?]*$/i },
     // A standalone final sentence is framing; "I need to confirm" is not.
-    .replace(/(?<=[.!?])\s+(?:just\s+)?confirm[.!?]*$/i, '')
-    .replace(/([.!?]["'`]?)\s+(?:please\s+)?(?:briefly\s+|just\s+)?acknowledge(?:\s+(?:it|this))?[.!?]*$/i, '$1')
-    .replace(
-      /(?<=[.!?])\s+(?:a|an)\s+(?:(?:natural|brief|short|simple)\s+)?(?:acknowledg(?:e)?ment|confirmation|reply)\s+(?:is|will\s+be)\s+(?:enough|sufficient)[.!?]*$/i,
-      '',
-    )
-    .trim();
+    { pattern: /(?<=[.!?])\s+(?:just\s+)?confirm[.!?]*$/i },
+    { pattern: /([.!?]["'`]?)\s+(?:please\s+)?(?:briefly\s+|just\s+)?acknowledge(?:\s+(?:it|this))?[.!?]*$/i, retainFirst: true },
+    { pattern: /(?<=[.!?])\s+(?:a|an)\s+(?:(?:natural|brief|short|simple)\s+)?(?:acknowledg(?:e)?ment|confirmation|reply)\s+(?:is|will\s+be)\s+(?:enough|sufficient)[.!?]*$/i },
+  ];
+  let result = text;
+  for (const { pattern, retainFirst } of framing) {
+    const match = pattern.exec(result);
+    if (!match) continue;
+    const boundary = match.index + (retainFirst ? match[1]!.length : 0);
+    if (!memoryLiteralMask(result)[boundary]) result = result.slice(0, boundary);
+  }
+  return result.trim();
 }
 
 interface MemoryClauseIsolation {
+  sourceSpan?: MemoryDestinationSpan;
   memoryContent: string;
   hasSecondaryWork: boolean;
 }
 
+/** Literal spans cannot grant a clause boundary. An unmatched delimiter keeps
+ * the rest protected; apostrophes inside words are not quotation delimiters. */
+function memoryLiteralMask(text: string): boolean[] {
+  const mask = Array<boolean>(text.length).fill(false);
+  const word = (value: string | undefined) => Boolean(value && /[\p{L}\p{N}_]/u.test(value));
+  let closing = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '\\') {
+      if (closing) { mask[i] = true; if (i + 1 < text.length) mask[++i] = true; continue; }
+      // An escaped quote outside a known literal is ambiguous, not permission
+      // to split later command-looking words out of its content.
+      if (/["'`“‘]/.test(text[i + 1] ?? '')) { mask.fill(true, i); break; }
+    }
+    if ((ch === "'" || ch === '’') && word(text[i - 1]) && word(text[i + 1])) {
+      mask[i] = Boolean(closing); continue;
+    }
+    if (closing) {
+      mask[i] = true;
+      if (text.startsWith(closing, i)) {
+        for (let n = 1; n < closing.length; n++) mask[i + n] = true;
+        i += closing.length - 1; closing = '';
+      }
+      continue;
+    }
+    if ((ch === "'" || ch === '’') && word(text[i - 1])) continue;
+    if (ch === '`') {
+      closing = /^`+/.exec(text.slice(i))![0];
+      for (let n = 0; n < closing.length; n++) mask[i + n] = true;
+      i += closing.length - 1;
+    } else if (ch === '"' || ch === "'" || ch === '“' || ch === '‘') {
+      closing = ch === '“' ? '”' : ch === '‘' ? '’' : ch; mask[i] = true;
+    }
+  }
+  return mask;
+}
+
+function memoryClauses(text: string): Array<{ start: number; text: string; unquoted: string }> {
+  const mask = memoryLiteralMask(text);
+  const clauses: Array<{ start: number; text: string; unquoted: string }> = [];
+  let start = 0;
+  const append = (end: number) => {
+    const raw = text.slice(start, end);
+    const unquoted = raw.split('').map((ch, n) => mask[start + n] ? ' ' : ch).join('');
+    clauses.push({ start, text: raw.trim(), unquoted: unquoted.trim() }); start = end;
+  };
+  for (const match of text.matchAll(/[.!?;](?:["'`”’]+)?\s+/g)) {
+    const end = match.index! + match[0].length;
+    if (!mask[end - 1]) append(end);
+  }
+  if (start < text.length) append(text.length);
+  return clauses;
+}
+
+const MEMORY_ACKNOWLEDGEMENT_CLAUSE_RE = /^(?:please\s+)?(?:(?:briefly|just)\s+)?confirm(?:\s+only)?\s+(?:what\s+you\s+(?:saved|stored|remembered|noted)|(?:that\s+)?you(?:'ve|\s+have)\s+(?:saved|stored|remembered|noted)\s+(?:it|this|that))[.!?;]*$/i;
+const MEMORY_NEGATED_ACTION_CLAUSE_RE = /^(?:(?:for|in|during)\s+this\s+(?:task|request|run|turn)\s*,?\s*)?(?:please\s+)?(?:do\s+not|don'?t)\s+(?:create|change|delete|edit|send|write|save|store|modify|update|publish|post|contact|use)\b[^.!?]*[.!?;]?$/i;
+// A complete acknowledgement may own generic no-work response restrictions,
+// never an arbitrary prohibition with a named object, recipient or condition.
+const MEMORY_GENERIC_RESOURCE_SOURCE = '(?:(?:any|new|existing|external|local)\\s+)*(?:files|documents|projects?|settings|messages|emails)';
+const MEMORY_GENERIC_ACTION_SOURCE = `(?:create|change|delete|edit|send|write|modify|update)\\s+${MEMORY_GENERIC_RESOURCE_SOURCE}`;
+const MEMORY_GENERIC_RESPONSE_RESTRICTION_RE = new RegExp(`^(?:please\\s+)?(?:do\\s+not|don'?t)\\s+${MEMORY_GENERIC_ACTION_SOURCE}(?:\\s*(?:,\\s*(?:(?:or|and)\\s+)?|(?:or|and)\\s+)(?:${MEMORY_GENERIC_ACTION_SOURCE}|${MEMORY_GENERIC_RESOURCE_SOURCE}))*[.!?;]?$`, 'i');
+
+/** Only remove a contiguous task-only suffix, never splice neighboring claims
+ * together. Bare "Confirm both" and substantive procedures remain untouched. */
+function boundedMemoryTaskTail(text: string): number | null {
+  const clauses = memoryClauses(text);
+  const acknowledgement = (clause: typeof clauses[number]) => clause.text === clause.unquoted
+    && MEMORY_ACKNOWLEDGEMENT_CLAUSE_RE.test(clause.text);
+  const negative = (clause: typeof clauses[number]) => clause.text === clause.unquoted
+    && MEMORY_NEGATED_ACTION_CLAUSE_RE.test(clause.unquoted)
+    && !PERSISTENT_SCOPE_RE.test(clause.unquoted)
+    && !/\b(?:is|are|was|were|has|have|means|equals)\b/i.test(clause.unquoted);
+  for (let i = 1; i < clauses.length; i++) {
+    const first = clauses[i]!;
+    const ack = acknowledgement(first);
+    if (!ack && !(negative(first) && EXPLICIT_EPHEMERAL_SCOPE_RE.test(first.unquoted))) continue;
+    // A complete confirmation request owns only a generic no-work response
+    // restriction. Named targets/conditions and later facts remain ambiguous.
+    if (clauses.slice(i).every(clause => acknowledgement(clause)
+      || (negative(clause) && (EXPLICIT_EPHEMERAL_SCOPE_RE.test(clause.unquoted)
+        || (ack && MEMORY_GENERIC_RESPONSE_RESTRICTION_RE.test(clause.text)))))) return first.start;
+  }
+  return null;
+}
+
 function isolateMemoryFromSecondaryWork(text: string): MemoryClauseIsolation {
+  const mask = memoryLiteralMask(text);
   const matches = [
-    SECONDARY_MEMORY_SENTENCE_RE.exec(text),
-    SECONDARY_MEMORY_INDIRECT_SENTENCE_RE.exec(text),
-    SECONDARY_MEMORY_TRANSITION_RE.exec(text),
-    SECONDARY_MEMORY_CONDITIONAL_RE.exec(text),
-  ].filter((match): match is RegExpExecArray => Boolean(match?.index !== undefined));
-  if (matches.length === 0) {
+    SECONDARY_MEMORY_SENTENCE_RE,
+    SECONDARY_MEMORY_INDIRECT_SENTENCE_RE,
+    SECONDARY_MEMORY_TRANSITION_RE,
+    SECONDARY_MEMORY_CONDITIONAL_RE,
+  ].map(pattern => [...text.matchAll(new RegExp(pattern.source, 'gi'))]
+    .find(match => !mask[match.index!]))
+    .filter((match): match is RegExpExecArray => Boolean(match?.index !== undefined));
+  const taskTail = boundedMemoryTaskTail(text);
+  const boundaries = [
+    ...matches.map(match => (match.index ?? 0) + (match[1]?.length ?? 0)),
+    ...(taskTail === null ? [] : [taskTail]),
+  ];
+  if (boundaries.length === 0) {
     return { memoryContent: text.trim(), hasSecondaryWork: false };
   }
-  const boundary = matches.reduce((earliest, match) => (
-    (match.index ?? Number.POSITIVE_INFINITY) < (earliest.index ?? Number.POSITIVE_INFINITY)
-      ? match
-      : earliest
-  ));
-  const punctuationLength = boundary[1]?.length ?? 0;
-  const isolated = text.slice(0, (boundary.index ?? 0) + punctuationLength).trim();
+  const isolated = text.slice(0, Math.min(...boundaries)).trim();
   return {
     memoryContent: isolated || text.trim(),
     hasSecondaryWork: Boolean(isolated),
@@ -536,7 +761,10 @@ function parseRememberInstruction(text: string): MemoryClauseIsolation | null {
   const content = leader ? command.replace(leader, '') : command;
 
   const isolated = isolateMemoryFromSecondaryWork(stripTerminalMemoryFraming(content));
+  const claimStart = commandStart + (leader ? command.match(leader)![0].length : 0)
+    + (content.length - content.trimStart().length);
   return {
+    sourceSpan: { start: claimStart, end: claimStart + isolated.memoryContent.length },
     memoryContent: isolated.memoryContent || text,
     hasSecondaryWork: commandStart > 0 || isolated.hasSecondaryWork,
   };
@@ -560,6 +788,16 @@ function explicitMemoryInstructionIsSuppressed(
   if (commandStart === null) return true;
   const beforeCommand = text.slice(0, commandStart);
   return !TASK_SCOPED_MEMORY_OPTOUT_RE.test(beforeCommand);
+}
+
+/** A narrowed graph clause cannot discard the owner's broader privacy
+ * boundary. Reuse the complete-turn policy, including its existing named
+ * task-only exception, rather than reinterpreting opt-out wording here. */
+function automaticOwnerPrivacyRefused(ownerText: string): boolean {
+  const text = clean(ownerText, Infinity);
+  if (!MEMORY_CAPTURE_OPTOUT_RE.test(text)) return false;
+  const parsed = parseExplicitMemoryInstruction(text);
+  return !parsed || explicitMemoryInstructionIsSuppressed(text, parsed);
 }
 
 // A user can explicitly revise durable knowledge without repeating the word
@@ -603,19 +841,23 @@ export function parseExplicitMemoryInstruction(message: string): ExplicitMemoryI
   if (!text) return null;
   if (isExplicitDurableCorrectionRequest(text)) {
     const isolated = isolateMemoryFromSecondaryWork(stripTerminalMemoryFraming(text));
-    return {
+    const parsed: ExplicitMemoryInstructionParse = {
       kind: 'future_reference_correction',
       memoryContent: isolated.memoryContent || text,
       hasSecondaryWork: isolated.hasSecondaryWork,
     };
+    instructionSourceSpans.set(parsed, { start: 0, end: parsed.memoryContent.length });
+    return parsed;
   }
   const remembered = parseRememberInstruction(text);
   if (!remembered) return null;
-  return {
+  const parsed: ExplicitMemoryInstructionParse = {
     kind: 'remember',
     memoryContent: remembered.memoryContent,
     hasSecondaryWork: remembered.hasSecondaryWork,
   };
+  if (remembered.sourceSpan) instructionSourceSpans.set(parsed, remembered.sourceSpan);
+  return parsed;
 }
 
 /** The one gate every caller shares for "is this message an explicit memory
@@ -628,10 +870,55 @@ export function explicitMemoryInstructionFor(message: string): ExplicitMemoryIns
   return parsed && !explicitMemoryInstructionIsSuppressed(text, parsed) ? parsed : null;
 }
 
+/** Automatic intake cannot turn a referential storage directive into a claim.
+ * Reuse the ordinary clause boundary as well as the unstripped command so a
+ * separate task after it does not make the reference self-contained. */
+export function unresolvedAutomaticMemoryReference(message: string): boolean {
+  const text = clean(message, Infinity);
+  const instruction = parseExplicitMemoryInstruction(text);
+  const commandStart = explicitRememberCommandStart(text);
+  const isolatedCommand = commandStart === null ? '' : isolateMemoryFromSecondaryWork(
+    stripTerminalMemoryFraming(text.slice(commandStart)),
+  ).memoryContent;
+  return instruction?.kind === 'remember'
+    && (hasUnresolvedExplicitMemoryReference(text)
+      || hasUnresolvedExplicitMemoryReference(isolatedCommand)
+      || isUnresolvedMemoryReferencePayload(instruction.memoryContent));
+}
+
 function explicitRememberKind(content: string): ConsolidatedFactKind {
   // A literal project/tooling context should not be mislabeled as a personal
   // preference merely because the user used the word "remember".
   return PROJECT_TERMS.test(content) ? 'project' : 'user';
+}
+
+/** Explicit memory authority belongs to the isolated claim and its command
+ * wrapper. Separate current work cannot contribute a pin or sender constraint.
+ * A genuine preceding rule is retained as its contiguous owner source span. */
+function explicitMemoryAuthority(text: string, instruction: ExplicitMemoryInstructionParse): {
+  content: string; prohibition: boolean; constraint: boolean; ambiguous: boolean;
+} {
+  const start = instruction.kind === 'remember' ? explicitRememberCommandStart(text) : null;
+  const command = start === null ? '' : text.slice(start);
+  const leader = EXPLICIT_REMEMBER_LEADERS.map(pattern => pattern.exec(command)?.[0]).find(Boolean) ?? '';
+  // Only an entire command-level prefix supplies durability. A preceding task
+  // mentioning future reference cannot lend that authority to the claim.
+  const durablePrefix = start === null ? '' : text.slice(0, start)
+    .match(/^\s*(?:for future reference|going forward|from now on)\s*,\s*$/i)?.[0] ?? '';
+  const claimAuthority = `${durablePrefix}${PERSISTENT_SCOPE_RE.test(leader) ? leader : ''}${instruction.memoryContent}`;
+  const prefix = start === null ? [] : memoryClauses(text.slice(0, start));
+  const rules = prefix.filter(clause => !EXPLICIT_EPHEMERAL_SCOPE_RE.test(clause.unquoted)
+    && !TASK_SCOPED_MEMORY_OPTOUT_RE.test(clause.unquoted)
+    && (isSafetyProhibition(clause.text) || isEnforceableSenderConstraint(clause.text)));
+  const nonRules = prefix.filter(clause => clause.text && !/^(?:and|also|then)[,:]?$/i.test(clause.text) && !rules.includes(clause));
+  const claimStart = instructionSourceSpans.get(instruction)?.start ?? -1;
+  const ambiguous = rules.length > 0 && (nonRules.length > 0 || claimStart < 0);
+  return {
+    content: rules.length > 0 && !ambiguous ? text.slice(0, claimStart + instruction.memoryContent.length).trim() : instruction.memoryContent,
+    prohibition: isSafetyProhibition(claimAuthority) || rules.some(clause => isSafetyProhibition(clause.text)),
+    constraint: isEnforceableSenderConstraint(claimAuthority) || rules.some(clause => isEnforceableSenderConstraint(clause.text)),
+    ambiguous,
+  };
 }
 
 function addCandidate(candidates: AutoMemoryCandidate[], candidate: AutoMemoryCandidate): void {
@@ -712,10 +999,15 @@ export function durableCaptureRefused(message: string): boolean {
   const text = clean(message, Infinity);
   if (!text) return false;
   if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(text)) return true;
+  // A request to remember "that correction" is still a memory request, but
+  // its object is not a fact. Refuse both direct capture and the unmatched
+  // owner fallback; the brain keeps the full input to resolve through tools.
+  if (unresolvedAutomaticMemoryReference(text)) return true;
   // An isolated "remember X" clause is explicit durable authority and overrides
   // the whole-turn task/probe scopes below — but never the harness check above,
   // which is about whether these are the owner's words in the first place.
-  if (explicitMemoryInstructionFor(text)) return false;
+  const explicitInstruction = explicitMemoryInstructionFor(text);
+  if (explicitInstruction) return explicitMemoryAuthority(text, explicitInstruction).ambiguous;
   // One-off validation/probe prompts often contain durable-looking words such as
   // "instead of" or "must", but they describe this smoke turn, not user memory.
   // An explicit current-task scope likewise belongs in working memory, even when
@@ -723,7 +1015,7 @@ export function durableCaptureRefused(message: string): boolean {
   return isOneOffValidationOrToolProbe(text) || EXPLICIT_EPHEMERAL_SCOPE_RE.test(text);
 }
 
-export function extractAutoMemoryCandidates(message: string, maxCandidates = 3): AutoMemoryCandidate[] {
+function extractNormalizedAutoMemoryCandidates(message: string, maxCandidates = 3): AutoMemoryCandidate[] {
   const text = clean(message, Infinity);
   if (!text || LOW_SIGNAL.test(text)) return [];
   // Don't fold a pasted workflow definition into facts (it pollutes the store
@@ -739,9 +1031,10 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // suppression check keeps same-content and turn-wide privacy language
   // authoritative.
   const explicitMemoryInstruction = explicitMemoryInstructionFor(text);
+  const explicitAuthority = explicitMemoryInstruction ? explicitMemoryAuthority(text, explicitMemoryInstruction) : null;
 
   const candidates: AutoMemoryCandidate[] = [];
-  const prohibition = isSafetyProhibition(text);
+  const prohibition = explicitAuthority?.prohibition ?? isSafetyProhibition(text);
   const taskRequest = looksLikeOneOffTaskRequest(text);
   const persistentScope = PERSISTENT_SCOPE_RE.test(text);
   const explicitPreference = EXPLICIT_PREFERENCE_CUES.test(text);
@@ -753,10 +1046,10 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // round-trip a kind:'user'/'feedback' fact could never reach. Emitted FIRST; the
   // feedback branch below is gated on this so the same rule isn't also stored as a
   // plain (un-enforced) preference.
-  if (isEnforceableSenderConstraint(text)) {
+  if (explicitAuthority?.constraint ?? isEnforceableSenderConstraint(text)) {
     addCandidate(candidates, {
       kind: 'constraint',
-      content: `Standing rule (enforced): ${text}`,
+      content: `Standing rule (enforced): ${explicitAuthority?.content ?? text}`,
       reason: 'enforceable sender/account routing rule',
       pin: true,
     });
@@ -769,7 +1062,7 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // without a model conflict-resolution call. A following live request is not
   // part of that fact; only the source episode keeps the complete user turn.
   if (explicitDurableCorrection && explicitMemoryInstruction && !capturedConstraint) {
-    const content = explicitMemoryInstruction.memoryContent;
+    const content = explicitAuthority?.content ?? explicitMemoryInstruction.memoryContent;
     addCandidate(candidates, {
       kind: explicitRememberKind(content),
       content,
@@ -784,7 +1077,7 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // heuristics previously stored a second, truncated "Clementine requirement:
   // Remember this..." wrapper before memory_remember wrote the clean claim.
   if (explicitRemember && explicitMemoryInstruction && !capturedConstraint) {
-    const content = explicitMemoryInstruction.memoryContent;
+    const content = explicitAuthority?.content ?? explicitMemoryInstruction.memoryContent;
     if (prohibition) {
       addCandidate(candidates, {
         kind: 'feedback',
@@ -920,6 +1213,42 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   return candidates.slice(0, maxCandidates);
 }
 
+/** Retain the original extraction interval before wrappers, normalization or
+ * candidate previews can discard it. Repeated literal text is never searched. */
+export function extractAutoMemoryCandidates(message: string, maxCandidates = 3): AutoMemoryCandidate[] {
+  const text = clean(message, Infinity);
+  // Split only separate, unquoted, command-shaped memory clauses. Each match
+  // supplies its original interval; identical claims in different commands
+  // keep separate identities. Semantic splitting stays with the reviewer.
+  const instruction = explicitMemoryInstructionFor(text);
+  const clauses = instruction?.kind === 'remember' ? memoryClauses(text) : [];
+  const commands = clauses.filter(clause => {
+    const command = explicitRememberCommandStart(clause.text);
+    return command !== null && !memoryLiteralMask(clause.text)[command]
+      && explicitMemoryInstructionFor(clause.text)?.kind === 'remember';
+  });
+  const cuts = !durableCaptureRefused(text) && commands.length > 1
+    ? [0, ...commands.slice(1).map(clause => clause.start), text.length] : [0, text.length];
+  const candidates: AutoMemoryCandidate[] = [];
+  for (let n = 0; n < cuts.length - 1; n++) {
+    const rawBlock = text.slice(cuts[n]!, cuts[n + 1]!);
+    const blockStart = cuts[n]! + rawBlock.length - rawBlock.trimStart().length;
+    const block = rawBlock.trim();
+    const selected = extractNormalizedAutoMemoryCandidates(block, maxCandidates);
+    const parsed = explicitMemoryInstructionFor(block);
+    const authority = parsed ? explicitMemoryAuthority(block, parsed) : null;
+    const span = parsed ? instructionSourceSpans.get(parsed) : undefined;
+    const blockSpan = span && authority
+      ? { start: authority.content === parsed!.memoryContent ? span.start : 0, end: span.end }
+      : { start: 0, end: block.length };
+    const rawSpan = rawNormalizedSpan(message, text,
+      { start: blockStart + blockSpan.start, end: blockStart + blockSpan.end });
+    if (rawSpan) for (const candidate of selected) candidateSourceSpans.set(candidate, { source: message, span: rawSpan });
+    candidates.push(...selected);
+  }
+  return candidates.slice(0, maxCandidates);
+}
+
 export type AutoMemoryAdmissionScope = 'ephemeral' | 'durable' | 'standing_policy';
 
 export interface AutoMemoryAdmissionDecision {
@@ -995,6 +1324,30 @@ function unjudgedOwnerStatement(message: string): AutoMemoryCandidate[] {
   return [{ kind: 'user', content: text, reason: UNJUDGED_OWNER_STATEMENT_REASON }];
 }
 
+/** Deterministic producer selection, also replayed by exact-source receipt
+ * verification. It carries no completed-save authority. */
+export function selectAutoMemoryCandidates(message: string, maxCandidates = 3): AutoMemoryCandidate[] {
+  if ((autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(message)) || isSelfContainedComputation(message)) return [];
+  const matched = extractAutoMemoryCandidates(message, maxCandidates);
+  if (matched.length > 0) {
+    // Several heuristics may label the same entire claim. Keep the producer's
+    // first classification (constraints already have priority), not competing
+    // rows for one immutable claim. Distinct source intervals never collapse.
+    const spans = new Set<string>();
+    return matched.filter(candidate => {
+      const span = candidateSourceSpans.get(candidate)?.span;
+      const key = span ? `${span.start}:${span.end}` : `${candidate.kind}:${candidate.content}`;
+      if (spans.has(key)) return false;
+      spans.add(key); return true;
+    });
+  }
+  const candidates = unjudgedOwnerStatement(message);
+  const start = message.length - message.trimStart().length;
+  for (const candidate of candidates) candidateSourceSpans.set(candidate,
+    { source: message, span: { start, end: message.trimEnd().length } });
+  return candidates;
+}
+
 export function captureInteractionSignals(input: {
   message: string;
   sessionId?: string;
@@ -1029,13 +1382,7 @@ export function captureInteractionSignals(input: {
   if (isSelfContainedComputation(input.message)) {
     return emptyAutoCaptureResult();
   }
-  const matched = extractAutoMemoryCandidates(input.message, input.maxFacts ?? 3);
-  // When no pattern matched, that is not evidence the owner said nothing worth
-  // keeping — only that they did not phrase it the way the battery expects.
-  // Hand the message to the model reviewer the drain already runs rather than
-  // discarding it. `task` drops it exactly as today; `standing` is a preference
-  // that no phrasing could reach before.
-  const candidates = matched.length > 0 ? matched : unjudgedOwnerStatement(input.message);
+  const candidates = selectAutoMemoryCandidates(input.message, input.maxFacts ?? 3);
 
   // Persist the exact source turn + replayable claim rows synchronously, then
   // run the semantic conflict resolver off the response path. A daemon restart
@@ -1047,12 +1394,15 @@ export function captureInteractionSignals(input: {
   let callId: string | null = null;
   if (candidates.length > 0 && input.sessionId) {
     try {
+      const origins = automaticMemoryOriginsForCapture({ ...input, sessionId: input.sessionId }, candidates);
+      if (origins.some(origin => origin === null)) throw new Error('Automatic memory source could not be reopened.');
       const queued = enqueueAutoCaptureCandidates({
         message: input.message,
         sessionId: input.sessionId,
         sourceEventId: input.sourceEventId,
         occurredAt: input.occurredAt,
         candidates,
+        origins,
       });
       queuedCandidateIds = queued.candidateIds;
       episodeId = queued.episodeId;
@@ -1076,15 +1426,8 @@ export function captureInteractionSignals(input: {
     }
   }
 
-  const profilePatch = extractProfilePatchFromMessage(input.message);
-  let profile: UserProfile | undefined;
-  if (profilePatch) {
-    try {
-      profile = saveUserProfile(profilePatch);
-    } catch {
-      // Profile adaptation is opportunistic, not critical path.
-    }
-  }
+  // Profile changes are durable memory too. They follow the checked reviewed
+  // destination in the drain, never an unreviewed whole-message side channel.
 
   return {
     candidates,
@@ -1092,7 +1435,5 @@ export function captureInteractionSignals(input: {
     queuedCandidateIds,
     episodeId,
     callId,
-    profilePatch,
-    profile,
   };
 }

@@ -344,3 +344,29 @@ test('the owner sees who each memory is for, by name, and can move it', async ()
   assert.equal((await desktop('post', `/api/console/memory/facts/${inProject.id}/scope`, { projectId: 'prj_aaaaaaaaaaaaaa', agentId: null })).body.error, 'PROJECT_NOT_FOUND');
   assert.equal((await desktop('post', '/api/console/memory/facts/nope/scope', {})).status, 400);
 });
+
+
+test('large delegated jobs count every worker and expose an incomplete item beyond row forty', async () => {
+  const { appendEvent } = await import('../runtime/harness/eventlog.js');
+  const { declareWorkManifest, checkpointWorkItem } = await import('../runtime/harness/work-manifest.js');
+  const job = tasks.createBackgroundTask({ title: 'Transform fixture data', prompt: 'Objective: Transform fixture data',
+    originSessionId: createSession({ kind: 'chat' }).id, source: 'desktop',
+    delegation: { agentId: analyst.id, agentName: analyst.name, agentCreatedAt: analyst.createdAt, projectId: null, projectName: null, assignedBy: 'owner' } as never });
+  tasks.markBackgroundTaskRunning(job.id);
+  for (let i = 0; i < 100; i++) appendEvent({ sessionId: job.runSessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: `row-${i}`, ok: true } });
+  let view = (await phone('get', `/api/delegated-tasks/${job.id}`)).body.task;
+  assert.equal(view.work.done, 100);
+  assert.equal(view.work.total, 100);
+  assert.equal(view.work.items.length, 40);
+  declareWorkManifest({ sessionId: job.runSessionId, manifestId: 'transform', contractVersion: 1,
+    phases: [{ id: 'convert' }], items: Array.from({ length: 41 }, (_, i) => ({ id: `row-${i}` })) });
+  for (let i = 0; i < 41; i++) checkpointWorkItem({ sessionId: job.runSessionId, manifestId: 'transform', contractVersion: 1,
+    phase: 'convert', itemId: `row-${i}`, status: i < 40 ? 'succeeded' : 'failed',
+    ...(i < 40 ? { evidence: [{ kind: 'artifact' as const, ref: `fixture:row-${i}` }] } : { reason: 'Missing source' }) });
+  view = (await desktop('get', `/api/console/delegated-tasks/${job.id}`)).body.task;
+  assert.equal(view.work.done, 40);
+  assert.equal(view.work.total, 41);
+  assert.deepEqual(view.work.remaining, { count: 1, labels: ['row-40'] });
+  assert.equal(view.work.items[0].id, 'row-40');
+  assert.equal(view.work.items[0].state, 'failed');
+});

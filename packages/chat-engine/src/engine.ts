@@ -353,7 +353,7 @@ export class ChatEngine {
       ...(taskMode ? { taskMode, ...(taskMode.kind === 'plan' ? { progress: 'Investigating with read-only tools…' } : {}) } : {}),
       activity: [],
     };
-    this.messages = [...(options.cardDecision ? withCardDecided(this.messages, options.cardDecision) : this.messages), userMessage, assistant];
+    this.messages = [...this.messages, userMessage, assistant];
     this.activeAssistantId = assistant.id;
     this.activeSourceFloorSeq = this.cursor;
     this.activeSourceUserSeq = null;
@@ -644,7 +644,6 @@ export class ChatEngine {
         const cardDecision = cardDecisionOf(d);
         if (cardDecision) {
           this.cardDecisionsBySource.set(event.seq, cardDecision);
-          this.messages = withCardDecided(this.messages, cardDecision);
         }
         if (!text) return;
         const acceptedSource = acceptedConversationSource(event, this.sessionId);
@@ -930,16 +929,6 @@ export function inFlightTurnSince(events: readonly HarnessEvent[]): number | nul
 
 /** Rebuild a message list from a session's persisted, public-projected
  *  events — the transcript a reopened chat renders instantly. */
-/** The card a tap decided reads as decided at once, before the host's record. */
-function withCardDecided(messages: readonly ChatMessage[], decision: CardDecision): ChatMessage[] {
-  const resolution = decision.decision === 'approve' ? 'approved' as const : 'declined' as const;
-  return messages.map((message) => (
-    message.approval?.approvalId === decision.approvalId && !message.approval.resolution
-      ? { ...message, approval: { ...message.approval, resolution } }
-      : message
-  ));
-}
-
 export function foldTranscript(events: readonly HarnessEvent[], sessionId?: string | null): ChatMessage[] {
   const messages: ChatMessage[] = [];
   let activity: ChatMessage['activity'] = [];
@@ -969,8 +958,6 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         const cardDecision = cardDecisionOf(d);
         if (cardDecision) {
           cardDecisionsBySource.set(event.seq, cardDecision);
-          const decided = withCardDecided(messages, cardDecision);
-          messages.splice(0, messages.length, ...decided);
         }
         if (text) messages.push({ id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode),
           acceptedSource: acceptedConversationSource(event, sessionId), ...(cardDecision ? { cardDecision } : {}) });

@@ -1,5 +1,7 @@
 import { withAcceptedSourceSessionContext } from './source-session-context.js';
-import { workerCallRecord, type WorkerCallRecord } from './worker-call-record.js';
+import { qualifyWorkerOutput, workerCallRecord, type WorkerCallRecord } from './worker-call-record.js';
+import { expectedWorkPlanLines } from './expected-work-admission.js';
+import { loadExpectedWorkContract } from './expected-work-contract.js';
 import { parseTaskMode } from './task-mode.js';
 import { creditDelegatedExpectedWork, delegableExpectedWorkForItem, delegateExpectedWorkToChild, type DelegableExpectedWork } from './expected-work-delegation.js';
 import { discoveryGovernor } from './discovery-governor.js';
@@ -12,7 +14,7 @@ import { Runner, type Agent } from '@openai/agents';
 import type { RuntimeContextValue } from '../../types.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import type { DispatchLeaseRef } from './dispatch-lease.js';
-import { buildWorkerJobPrompt, workerPacketKey, type WorkerToolInput } from '../../agents/worker-job-packet.js';
+import { buildWorkerJobPrompt, workerPacketKey, workerResultIndicatesFailure, type WorkerToolInput } from '../../agents/worker-job-packet.js';
 import { normalizeWorkerOutput } from '../../agents/worker-output.js';
 import { prepareWorkerResultShares } from './worker-retained-results.js';
 import { resolveLocalRetainedOutputRead } from './retained-output-read.js';
@@ -45,6 +47,10 @@ export async function runPacketWorkerWithHost(input: {
   /** The host's record of the calls this worker made, once it has run. */
   onCallRecord?: (record: WorkerCallRecord) => void;
 }): Promise<string> {
+  const notStarted = (reason: string): string => {
+    input.onCallRecord?.({ byTool: {}, businessCallSucceeded: false, businessCallAttempted: false, effectsMayHaveRun: false, successfulRead: false });
+    return reason;
+  };
   const parent = harnessRunContextStorage.getStore();
   const parentTaskId = acceptedTaskIdFor(input.parentSessionId, input.sourceUserSeq);
   const parentCall = currentLogicalCall();
@@ -52,7 +58,7 @@ export async function runPacketWorkerWithHost(input: {
     sinceSeq: input.sourceUserSeq - 1, types: ['user_input_received'], limit: 1,
   }).find((event) => event.seq === input.sourceUserSeq && event.role === 'user');
   if (!source || !parentCall || parentCall.acceptedTaskId !== parentTaskId) {
-    return 'ERROR: worker packet has no exact accepted parent call; no worker ran.';
+    return notStarted('ERROR: worker packet has no exact accepted parent call; no worker ran.');
   }
   const inheritedMode = parseTaskMode(source.data.taskMode);
   let retainedResultShares;
@@ -62,7 +68,7 @@ export async function runPacketWorkerWithHost(input: {
       return resolved.receipt ?? getToolOutput(input.parentSessionId, resolved.callId);
     });
   } catch (error) {
-    return `ERROR: ${error instanceof Error ? error.message : String(error)} No worker ran.`;
+    return notStarted(`ERROR: ${error instanceof Error ? error.message : String(error)} No worker ran.`);
   }
   const packetKey = workerPacketKey(input.input);
   const packetDigest = createHash('sha256').update(JSON.stringify(input.input)).digest('hex');
@@ -122,6 +128,31 @@ export async function runPacketWorkerWithHost(input: {
     data: { ...lineage, model: input.modelId, provider: resolveEffectiveProviderForModel(input.modelId),
       role: input.input.intent, childSessionId: session.id, childSourceUserSeq: childSource.seq, childAttemptId: attempt.attemptId } });
   let completed = false;
+  // Qualify before closing the child attempt so it agrees with the parent
+  // receipt/reuse disposition. Preserve the worker's prose as partial evidence.
+  const withCallRecord = (reply: string): string => {
+    let record: WorkerCallRecord | undefined;
+    try {
+      record = workerCallRecord(session.id, childSource.seq);
+      const contract = loadExpectedWorkContract(session.id, childSource.seq);
+      if (delegable || contract.status !== 'missing') {
+        // A missing/corrupt child freeze must not erase a known delegated
+        // requirement. A valid zero-work contract remains tool-free, so
+        // it cannot override failed business-call evidence either.
+        if (contract.status !== 'ok') record.requiredWork = 'pending';
+        else if (delegable || contract.contract.operations.length > 0) {
+          const requirements = expectedWorkPlanLines({ sessionId: session.id, sourceUserSeq: childSource.seq });
+          record.requiredWork = requirements.length > 0
+            && requirements.length === contract.contract.operations.length
+            && requirements.every((line) => line.state === 'satisfied') ? 'satisfied' : 'pending';
+        }
+      }
+    } catch { record = undefined; /* missing evidence cannot certify completion */ }
+    try { if (record) input.onCallRecord?.(record); } catch { /* evidence delivery cannot promote completion */ }
+    const qualified = qualifyWorkerOutput(reply, record);
+    completed = !workerResultIndicatesFailure(qualified);
+    return qualified;
+  };
   try {
     return await withAcceptedSourceSessionContext({ sessionId: session.id, sourceUserSeq: childSource.seq }, () => withHarnessRunContext({
       // The child's own accepted turn: plan_task (a delegated child plans its
@@ -238,26 +269,17 @@ export async function runPacketWorkerWithHost(input: {
           } });
         }
       } catch { /* attribution is best-effort telemetry, never a result */ }
-      // The host's record of what the worker did goes to the caller, which
-      // sets it beside the reply; the reply itself stays the worker's own.
-      const withCallRecord = (reply: string): string => {
-        try {
-          input.onCallRecord?.(workerCallRecord(session.id, childSource.seq));
-        } catch { /* the record is evidence beside the reply, never the reply */ }
-        return reply;
-      };
       if (outcome.hold || outcome.hasInterruptions || outcome.terminal) {
         return withCallRecord(`ERROR: worker ${input.input.item}: ${outcome.terminal?.reason ?? outcome.hold?.reason ?? 'worker_requires_parent_action'}. ${String(outcome.finalOutput ?? '')}`);
       }
       const text = normalizeWorkerOutput(outcome.finalOutput);
-      completed = !/^\s*(?:ERROR|PARTIAL):/i.test(text);
       input.onParentActions?.(workerComposeOnlyActions({ sessionId: session.id, sinceSeq: childSource.seq }));
       return withCallRecord(text);
     }), { newlyAccepted: true });
   } catch (error) {
     // A child failure is an item result, never an exception that can poison
     // the parent's still-open coordinator call or force checkpoint re-entry.
-    return `ERROR: worker ${input.input.item}: ${error instanceof Error ? error.message : String(error)}`;
+    return withCallRecord(`ERROR: worker ${input.input.item}: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     finishRunAttempt(attempt, completed ? 'completed' : 'failed');
   }

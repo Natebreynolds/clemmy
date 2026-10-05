@@ -133,19 +133,54 @@ export function invalidArgumentsTextResult(
  * structured failure and lands on `unknown` — inert — instead of the
  * `succeeded, mutating=1` that made the ledger show a write that never happened.
  */
-const NON_WRITE_TEXT_RESULTS = new WeakMap<object, string>();
+/** A producer-owned no-effect failure can need something other than argument
+ * repair. This metadata is deliberately nominal; serialized lookalikes carry
+ * neither no-effect proof nor retry authority. */
+export interface LocalNonWriteClassification {
+  kind: 'invalid_arguments' | 'input_required' | 'auth_failure' | 'unknown';
+  providerStatus?: number;
+}
+/** The same nominal no-effect fact on a throwing internal adapter boundary. */
+export class LocalNonWriteError extends Error {
+  constructor(message: string, readonly status: string, readonly classification: LocalNonWriteClassification) {
+    super(message); this.name = 'LocalNonWriteError';
+  }
+}
+
+export type LocalFailureEffect = 'uncertain' | 'acknowledged';
+/** A failed operation can retain a known earlier effect without claiming the
+ * whole task succeeded. Only host code can mint this nominal fact. */
+export class LocalExecutionFailureError extends Error {
+  constructor(message: string, readonly effect: LocalFailureEffect) {
+    super(message); this.name = 'LocalExecutionFailureError';
+  }
+}
+const EXECUTION_FAILURE_EFFECTS = new WeakMap<object, LocalFailureEffect>();
+export function executionFailureTextResult(text: string, effect: LocalFailureEffect): TextToolResult {
+  const result = textResult(text, { isError: true });
+  EXECUTION_FAILURE_EFFECTS.set(result, effect);
+  return result;
+}
+export function localExecutionFailureEffect(result: unknown): LocalFailureEffect | undefined {
+  return result && typeof result === 'object' ? EXECUTION_FAILURE_EFFECTS.get(result) : undefined;
+}
+
+const NON_WRITE_TEXT_RESULTS = new WeakMap<object, { status: string; classification?: LocalNonWriteClassification }>();
 
 export function nonWriteTextResult(
   status: string,
   text: string,
-  options?: { maxChars?: number },
+  options?: { maxChars?: number; classification?: LocalNonWriteClassification },
 ): TextToolResult {
   const result = textResult(text, {
     ...(options?.maxChars === undefined ? {} : { maxChars: options.maxChars }),
     isError: true,
   });
   const token = /^[a-z0-9_]{1,32}$/.test(status) ? status : 'non_write';
-  NON_WRITE_TEXT_RESULTS.set(result, token);
+  NON_WRITE_TEXT_RESULTS.set(result, {
+    status: token,
+    ...(options?.classification ? { classification: Object.freeze({ ...options.classification }) } : {}),
+  });
   // Deliberately NO serialized `ok:false` marker. It looks identical to an
   // ordinary failed write, so reading it back as no-effect proof would let a
   // mutation of unknown fate be retried. The local bridge carries this outcome
@@ -156,7 +191,12 @@ export function nonWriteTextResult(
 /** The status token of an in-process non-write outcome, or null. */
 export function localNonWriteStatus(result: unknown): string | null {
   if (!result || typeof result !== 'object') return null;
-  return NON_WRITE_TEXT_RESULTS.get(result as object) ?? null;
+  return NON_WRITE_TEXT_RESULTS.get(result as object)?.status ?? null;
+}
+
+export function localNonWriteClassification(result: unknown): LocalNonWriteClassification | undefined {
+  if (!result || typeof result !== 'object') return undefined;
+  return NON_WRITE_TEXT_RESULTS.get(result as object)?.classification;
 }
 
 export type SdkToolInputValidationError = ModelBehaviorError & {

@@ -601,3 +601,38 @@ test('CONTRACT: an explicit durable worker binding WINS over MODEL_ROUTING_MODE=
     assert.equal(r.source, 'settings');
   });
 });
+
+
+test('automatic Quick stays on the selected BYO backend; explicit binding remains an owner choice', async () => {
+  const { resolveByoProviderForModel, markByoModelNotServed, clearByoNotServedForTest } = await import('./byo-providers.js');
+  const env = {
+    AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://backend-a.example.test', BYO_MODEL_API_KEY: 'fixture-a',
+    BYO_MODEL_ID: 'fixture-a-brain', BYO_MODEL_JUDGE_ID: 'fixture-a-quick',
+    BYO_PROVIDERS: JSON.stringify([{ id: 'fixtureb', label: 'Backend B', baseURL: 'https://backend-b.example.test', modelIds: ['fixture-b-brain'] }]),
+    BYO_PROVIDER_FIXTUREB_API_KEY: 'fixture-b', BYO_BRAIN_MODEL_ID: 'fixture-b-brain',
+    CLEMMY_MODEL_ROLES: undefined,
+  };
+  withEnv(env, () => {
+    assert.equal(resolveRoleModel('quick').modelId, 'fixture-b-brain');
+    const brain = resolveByoProviderForModel(resolveRoleModel('brain').modelId)!;
+    const quick = resolveByoProviderForModel(resolveRoleModel('quick').modelId)!;
+    assert.equal(quick.providerId, brain.providerId);
+    assert.equal(quick.baseURL, brain.baseURL);
+    assert.equal(quick.apiKey, brain.apiKey);
+    // An unavailable default-backend helper must never pull B's check back to A.
+    markByoModelNotServed('fixture-a-quick');
+    try { assert.equal(resolveRoleModel('quick').modelId, 'fixture-b-brain'); }
+    finally { clearByoNotServedForTest(); }
+  });
+  withEnv({ ...env, CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'quick', modelId: 'fixture-a-quick', scope: 'durable', source: 'settings' }]) }, () => {
+    assert.equal(resolveRoleModel('quick').modelId, 'fixture-a-quick');
+    assert.equal(resolveRoleModel('quick').source, 'settings');
+  });
+  withEnv({ ...env, BYO_BRAIN_MODEL_ID: '' }, () => {
+    assert.equal(resolveRoleModel('quick').modelId, 'fixture-a-quick');
+    markByoModelNotServed('fixture-a-quick');
+    try { assert.equal(resolveRoleModel('quick').modelId, 'fixture-a-brain'); }
+    finally { clearByoNotServedForTest(); }
+  });
+});

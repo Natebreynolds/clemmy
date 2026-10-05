@@ -38,28 +38,17 @@ interface TranscriptMessage {
   role: string;
   text: string;
   pending?: string;
+  approval?: { approvalId?: string | null; resolution?: string };
 }
 
-/**
- * Has this approval already been decided in this transcript?
- *
- * Derived from the messages themselves rather than a latched flag, so it is
- * correct after a reload, and so a send that FAILED (marked `pending:
- * 'failed'`) brings the buttons back instead of stranding the user with a
- * decision that never landed.
- */
+/** A sent answer is a request, not a recorded decision. Keep a failed or
+ * unfinished answer actionable on replay; the UI's busy state gates taps
+ * while delivery is in progress. */
 export function chatApprovalDecided(
   messages: readonly TranscriptMessage[],
   approvalId: string | null | undefined,
 ): boolean {
-  const sent = [
-    chatApprovalReply('approve', approvalId),
-    chatApprovalReply('reject', approvalId),
-  ].filter((value): value is string => value !== null);
-  if (sent.length === 0) return false;
-  return messages.some((message) => (
-    message.role === 'user'
-    && message.pending !== 'failed'
-    && sent.includes(message.text)
-  ));
+  if (!approvalId) return false;
+  return messages.some((message) => message.approval?.approvalId === approvalId
+    && Boolean(message.approval.resolution));
 }

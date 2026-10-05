@@ -598,6 +598,40 @@ test('SDK-brain handler does not suppress an intentional repeated packet in chat
   }
 });
 
+test('SDK-brain handler rejects failed-read plus failure-file success and preserves its effect on replay', async () => {
+  const sessionId = 'sess-handler-unverified-effect';
+  const priorAuthMode = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = 'claude_oauth';
+  createSession({ id: sessionId, kind: 'execution' });
+  const handler = captureRunWorker();
+  const input = packet('fixture-item');
+  let dispatches = 0;
+  try {
+    await withInnerSdk(async (options) => {
+      dispatches += 1;
+      const runScopeId = (options as { trackerScopeId: string }).trackerScopeId;
+      for (const data of [
+        { effectiveTool: 'fixture_reader', ok: false, effect: 'read' },
+        { effectiveTool: 'write_file', ok: true, effect: 'write' },
+      ]) appendEvent({ sessionId, turn: 1, role: 'system', type: 'tool_returned',
+        data: { runScopeId, accounting: 'top_level', topologyRole: 'business', ...data } });
+      return { text: 'The requested research is complete and its report is saved.', toolUses: ['fixture_reader', 'write_file'] };
+    }, async () => {
+      const first = await withToolOutputContext({ sessionId }, () => handler(input));
+      assert.match(first.content[0].text, /^PARTIAL:/);
+      const replay = await withToolOutputContext({ sessionId }, () => handler(input));
+      assert.match(replay.content[0].text, /^ERROR:.*prior actions/);
+    });
+    assert.equal(dispatches, 1, 'rejecting the worker account cannot repeat its completed file write');
+    const result = listEvents(sessionId, { types: ['worker_result'] }).at(-1);
+    assert.equal(result?.data.ok, false);
+    assert.equal(result?.data.retryRequiresReconciliation, true);
+  } finally {
+    if (priorAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = priorAuthMode;
+  }
+});
+
 test('SDK-brain handler still reuses an exact packet replay inside one execution run', async () => {
   const sessionId = 'sess-handler-execution-replay';
   const priorAuthMode = process.env.AUTH_MODE;

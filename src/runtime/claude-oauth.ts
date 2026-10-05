@@ -451,15 +451,32 @@ let refreshWaitMs = 15_000;
  *  new token away, and the next refresh with the old one is invalid_grant: the
  *  grant died exactly that way on 10-02 after four 15 s timeouts in a network
  *  blip. The request now keeps going after callers stop waiting, and whatever
- *  it returns is saved. One refresh per token at a time; callers share it. */
+ *  it returns is saved while that grant is still current. One refresh per
+ *  token at a time; callers share it. */
 const REFRESH_DEADLINE_MS = 120_000;
-const inflightVaultRefreshes = new Map<string, Promise<void>>();
+interface PendingVaultRefresh {
+  grant: ClaudeOAuthTokens & { refreshToken: string };
+  promise: Promise<void>;
+}
+const inflightVaultRefreshes = new Map<string, PendingVaultRefresh>();
 
-function refreshVaultGrantOnce(refreshToken: string, scopes: string[] | undefined): Promise<void> {
+function claudeRefreshGrantIsCurrent(grant: ClaudeOAuthTokens): boolean {
+  const current = getVaultClaudeTokens();
+  return current?.accessToken === grant.accessToken
+    && current?.refreshToken === grant.refreshToken;
+}
+
+function refreshVaultGrantOnce(grant: ClaudeOAuthTokens & { refreshToken: string }): PendingVaultRefresh {
+  const { refreshToken, scopes } = grant;
   const existing = inflightVaultRefreshes.get(refreshToken);
   if (existing) return existing;
   const run = refreshClaudeTokensImpl(refreshToken, { timeoutMs: REFRESH_DEADLINE_MS })
     .then((refreshed) => {
+      // A login/clear may finish while the provider is rotating the old grant.
+      // No await separates this check and save, so same-process writers cannot
+      // interleave. The durable reread also detects other-process replacements
+      // already visible here; it is not an atomic cross-process compare-and-swap.
+      if (!claudeRefreshGrantIsCurrent(grant)) return;
       saveRefreshedTokensImpl({
         accessToken: refreshed.accessToken,
         refreshToken: refreshed.refreshToken ?? refreshToken, // persist the ROTATED token
@@ -469,10 +486,12 @@ function refreshVaultGrantOnce(refreshToken: string, scopes: string[] | undefine
       logger.info('Claude subscription token refreshed');
     })
     .finally(() => { inflightVaultRefreshes.delete(refreshToken); });
-  // A caller that stopped waiting is not listening; the outcome is still saved.
+  // A caller that stopped waiting is not listening; a still-current rotation
+  // must nevertheless be saved, or the next refresh would reuse its spent token.
   run.catch(() => {});
-  inflightVaultRefreshes.set(refreshToken, run);
-  return run;
+  const pending = { grant, promise: run };
+  inflightVaultRefreshes.set(refreshToken, pending);
+  return pending;
 }
 
 function waitAtMost<T>(work: Promise<T>, ms: number): Promise<T> {
@@ -484,8 +503,11 @@ function waitAtMost<T>(work: Promise<T>, ms: number): Promise<T> {
   return Promise.race([work, deadline]).finally(() => { if (timer) clearTimeout(timer); });
 }
 
-async function tryClaudeCodeFallback(reason: string): Promise<string | null> {
+async function tryClaudeCodeFallback(reason: string, expectedVaultGrant?: ClaudeOAuthTokens): Promise<string | null> {
   await ensureClaudeCodeReadiness();
+  // A fresh vault sign-in (or its completed rotation) wins over a fallback
+  // whose readiness probe was still pending. Never mark that new grant degraded.
+  if (expectedVaultGrant && !claudeRefreshGrantIsCurrent(expectedVaultGrant)) return null;
   const cli = getClaudeCodeTokens();
   if (!cli) return null;
   try {
@@ -552,25 +574,30 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
     tokens.expiresAt && tokens.expiresAt <= Date.now() + REFRESH_BEFORE_MS
   ) {
     const refreshToken = tokens.refreshToken; // narrowed non-empty by the guard above
+    let refreshGrant = { ...tokens, refreshToken };
     if (isVaultRefreshTokenMarkedDead(refreshToken)) {
       // Grant already rejected as invalid_grant — skip the doomed network refresh
       // and go straight to fallback. Recovers automatically once a re-auth writes
       // a new token (saveClaudeTokens clears the dead marker).
-      const fallback = await tryClaudeCodeFallback('vault_refresh_dead');
-      if (fallback) return fallback;
+      const fallback = await tryClaudeCodeFallback('vault_refresh_dead', refreshGrant);
+      if (!claudeRefreshGrantIsCurrent(refreshGrant)) tokens = getStoredClaudeTokens();
+      else if (fallback) return fallback;
     } else {
       try {
-        await waitAtMost(refreshVaultGrantOnce(refreshToken, tokens.scopes), refreshWaitMs);
+        const pending = refreshVaultGrantOnce(refreshGrant);
+        // A replacement access token can still share the rotating refresh
+        // token. Coalesce the POST, but attribute errors/timeouts to the grant
+        // that started it, never to a later waiter's credential snapshot.
+        refreshGrant = pending.grant;
+        await waitAtMost(pending.promise, refreshWaitMs);
         tokens = getStoredClaudeTokens();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        const current = getStoredClaudeTokens();
-        const rotatedElsewhere = current?.source === 'vault' && Boolean(current.refreshToken)
-          && current.refreshToken !== refreshToken && Boolean(current.accessToken?.startsWith(OAT_PREFIX));
-        if (rotatedElsewhere) {
-          // Another refresh already replaced this token; its rejection of the
-          // old one says nothing about the grant. Use the new one.
-          tokens = current;
+        const superseded = !claudeRefreshGrantIsCurrent(refreshGrant);
+        if (superseded) {
+          // An obsolete error must neither poison the replacement nor return a
+          // cleared access token. Keep the existing current-source selection.
+          tokens = getStoredClaudeTokens();
         } else if (isPermanentGrantFailure(err)) {
           // Mark the grant dead so we stop re-attempting it every request. Log
           // ONCE, loudly, with the fix — not once per call.
@@ -583,9 +610,10 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
           // Transient (timeout / 5xx / network) — keep retrying on the next call.
           logger.warn({ err: msg }, 'Claude token refresh failed (transient) — will retry');
         }
-        if (!rotatedElsewhere) {
-          const fallback = await tryClaudeCodeFallback('vault_refresh_failed');
-          if (fallback) return fallback;
+        if (!superseded) {
+          const fallback = await tryClaudeCodeFallback('vault_refresh_failed', refreshGrant);
+          if (!claudeRefreshGrantIsCurrent(refreshGrant)) tokens = getStoredClaudeTokens();
+          else if (fallback) return fallback;
         }
       }
     }
@@ -596,7 +624,8 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
     const fallbackAllowed =
       err instanceof ClaudeAuthError && (err.kind === 'expired' || err.kind === 'missing');
     if (tokens?.source === 'vault' && fallbackAllowed) {
-      const fallback = await tryClaudeCodeFallback(err.kind);
+      const fallback = await tryClaudeCodeFallback(err.kind, tokens);
+      if (!claudeRefreshGrantIsCurrent(tokens)) return loadFreshClaudeAccessToken();
       if (fallback) return fallback;
     }
     throw err;

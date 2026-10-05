@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { automaticMemoryCandidateIdentity, automaticMemoryDecisionDigest, automaticMemoryEnvelopeDigest,
+  parseAutomaticMemoryEnvelope, resolveAutomaticMemoryDestination } from '../../memory/memory-destination.js';
 import { BASE_DIR, REAL_DEFAULT_CLEMENTINE_HOME } from '../../config.js';
 import { prepareCached } from '../sqlite-statement-cache.js';
 import { actionBus } from '../action-bus.js';
@@ -2275,6 +2277,7 @@ interface TerminalPublicationMemoryReceiptRow {
 function assertExactDurableMemoryHostReceipt(
   db: Database.Database,
   authority: TerminalPublicationAuthorityRow,
+  options: { requireCurrentProtocol?: boolean } = {},
 ): TerminalPublicationMemoryReceiptRow {
   assertExactTerminalPublicationGraphStructure(db, authority);
   if (
@@ -2295,7 +2298,8 @@ function assertExactDurableMemoryHostReceipt(
   `).get(authority.session_id, authority.source_user_seq) as TerminalPublicationMemoryReceiptRow | undefined;
   if (
     !row
-    || row.protocol_version !== 1
+    || ![1, 2].includes(row.protocol_version)
+    || (options.requireCurrentProtocol === true && row.protocol_version !== 2)
     || row.receipt_id !== authority.host_completion_receipt_id
     || row.receipt_event_id !== authority.host_completion_event_id
     || row.accepted_task_id !== authority.accepted_task_id
@@ -2317,9 +2321,9 @@ function assertExactDurableMemoryHostReceipt(
   const canonical = terminalPublicationCanonicalize(receipt);
   if (
     row.receipt_json !== canonical
-    || row.receipt_id !== `memory-intake:v1:${createHash('sha256').update(canonical).digest('hex')}`
+    || row.receipt_id !== `memory-intake:v${row.protocol_version}:${createHash('sha256').update(canonical).digest('hex')}`
     || !terminalPublicationRecord(receipt)
-    || receipt.protocol !== 1
+    || receipt.protocol !== row.protocol_version
     || receipt.kind !== 'durable_memory_intake'
     || !terminalPublicationRecord(receipt.identity)
     || !terminalPublicationRecord(receipt.graph)
@@ -2342,6 +2346,58 @@ function assertExactDurableMemoryHostReceipt(
     || receipt.evidenceDigest !== row.evidence_digest
   ) {
     throw new AcceptedTaskTerminalPublicationError('conflict', 'durable memory host receipt content address is invalid');
+  }
+  // V1 is preserved historical intake. New done publication requires V2's
+  // immutable destination/storage snapshot. This is structural storage proof,
+  // not semantic fulfillment; current memory state is re-redeemed upstream.
+  if (row.protocol_version === 2) {
+    const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+    const isHash = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+    try {
+      if (receipt.candidates.length < 1 || receipt.source.eventIdentity !== `user-source:${row.source_user_seq}`
+        || receipt.memory.callId !== `auto-capture:user-source:${row.source_user_seq}`
+        || receipt.memory.sourceUri !== `conversation://${encodeURIComponent(row.session_id)}/${encodeURIComponent(row.call_id)}`
+        || receipt.candidateDigest !== hash(terminalPublicationCanonicalize(receipt.candidates))
+        || receipt.evidenceDigest !== hash(terminalPublicationCanonicalize({ sourceEventId: row.source_event_id,
+          sourceMessageDigest: row.source_message_digest, episodeId: row.episode_id, callId: row.call_id,
+          episodeContentHash: row.episode_content_hash, candidateDigest: row.candidate_digest }))) throw new Error('snapshot identity');
+      const seen = new Set<string>();
+      for (const candidate of receipt.candidates) {
+        if (!terminalPublicationRecord(candidate) || !terminalPublicationRecord(candidate.destination)
+          || !terminalPublicationRecord(candidate.fact)) throw new Error('snapshot shape');
+        const destination = candidate.destination;
+        const envelope = parseAutomaticMemoryEnvelope(destination.envelope);
+        const origin = envelope.origin;
+        const resolved = resolveAutomaticMemoryDestination(envelope);
+        const fact = candidate.fact;
+        if (resolved.status !== 'resolved' || !envelope.decision || origin.source.authority !== 'accepted_user_input'
+          || origin.source.eventType !== 'user_input_received' || origin.source.eventId !== row.source_event_id
+          || origin.source.sessionId !== row.session_id || origin.source.eventSeq !== row.source_user_seq
+          || origin.source.context?.sessionId !== row.session_id || origin.source.context.sourceUserSeq !== row.source_user_seq
+          || hash(origin.source.ownerText) !== row.source_message_digest
+          || destination.envelopeDigest !== automaticMemoryEnvelopeDigest(envelope)
+          || destination.decisionDigest !== automaticMemoryDecisionDigest(envelope)
+          || destination.claimTextDigest !== hash(resolved.claimText)
+          || !isDeepStrictEqual(destination.scope, resolved.scope) || !isDeepStrictEqual(fact.scope, resolved.scope)
+          || !Number.isSafeInteger(candidate.id) || Number(candidate.id) <= 0
+          || candidate.hash !== automaticMemoryCandidateIdentity(origin) || seen.has(String(candidate.hash))
+          || candidate.kind !== origin.candidate.kind || candidate.textDigest !== hash(origin.candidate.text)
+          || typeof candidate.intakeReason !== 'string' || typeof candidate.pinned !== 'boolean'
+          || !Number.isSafeInteger(fact.id) || Number(fact.id) <= 0 || fact.active !== true
+          || !isHash(fact.contentDigest) || typeof fact.updatedAt !== 'string' || !fact.updatedAt
+          || !Array.isArray(fact.evidence) || !fact.evidence.length) throw new Error('snapshot binding');
+        const ordinals = new Set<number>();
+        for (const link of fact.evidence) {
+          if (!terminalPublicationRecord(link) || !Number.isSafeInteger(link.ordinal) || Number(link.ordinal) < 0
+            || ordinals.has(Number(link.ordinal)) || !isHash(link.excerptDigest)
+            || typeof link.createdAt !== 'string' || !link.createdAt) throw new Error('snapshot evidence');
+          ordinals.add(Number(link.ordinal));
+        }
+        seen.add(String(candidate.hash));
+      }
+    } catch {
+      throw new AcceptedTaskTerminalPublicationError('conflict', 'durable memory V2 destination/fact snapshot is invalid');
+    }
   }
   const receiptEvents = db.prepare(`
     SELECT id, data_json FROM events
@@ -2810,7 +2866,7 @@ function closeAcceptedTaskTerminalPublicationInTransaction(input: {
     return presentation;
   }
   if (authority.host_completion_receipt_id) {
-    assertExactDurableMemoryHostReceipt(input.db, authority);
+    assertExactDurableMemoryHostReceipt(input.db, authority, { requireCurrentProtocol: true });
     if (authority.state !== 'manifested_verifying') {
       throw new AcceptedTaskTerminalPublicationError(
         authority.state === 'armed' ? 'not_ready' : 'conflict',

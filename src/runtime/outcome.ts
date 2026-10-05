@@ -21,7 +21,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { SessionStore } from '../memory/session-store.js';
 import { HarnessSession } from './harness/session.js';
-import { appendEvent, getSession as getHarnessSession, listEvents, openEventLog, type EventRow } from './harness/eventlog.js';
+import { appendEvent, getEvent, getSession as getHarnessSession, listEvents, openEventLog, type EventRow } from './harness/eventlog.js';
 import { appendGoalLedgerForSession } from '../agents/plan-proposals.js';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import pino from 'pino';
@@ -286,22 +286,33 @@ function sessionStoreHasOutcome(store: SessionStore, sessionId: string, outcome:
   return store.get(sessionId).turns.some((t) => typeof t.text === 'string' && isDuplicateOutcomeText(t.text, outcome, ctx, renderedText));
 }
 
-function harnessEventLogHasOutcome(sessionId: string, outcome: Outcome, ctx: DeliverContext, renderedText: string): boolean {
-  try {
-    return listEvents(sessionId, { types: ['user_input_received'], desc: true, limit: 200 })
-      .some((event) => typeof event.data?.text === 'string'
-        && isDuplicateOutcomeText(event.data.text, outcome, ctx, renderedText)
-        && sameOutcomeStop(event.data, ctx, renderedText));
-  } catch {
-    return false;
-  }
+function outcomeReportIdentity(outcome: Outcome, ctx: DeliverContext): string | undefined {
+  if (!ctx.stopId && !ctx.deliveryId) return undefined;
+  return createHash('sha256').update(JSON.stringify({
+    sourceLabel: ctx.sourceLabel, sourceId: ctx.sourceId, status: outcome.status,
+    ...(ctx.stopId ? { stopId: ctx.stopId } : { deliveryId: ctx.deliveryId }),
+  })).digest('hex');
 }
 
-/** An earlier report covers this one only when it reported the same stop (its
- * recorded stop, or the very same words). */
-function sameOutcomeStop(data: Record<string, unknown>, ctx: DeliverContext, renderedText: string): boolean {
-  if (!ctx.stopId) return true;
-  return data.outcomeStopId === ctx.stopId || data.text === renderedText;
+function retainedPassiveOutcome(sessionId: string, outcome: Outcome, ctx: DeliverContext, text: string): EventRow | undefined {
+  if (ctx.stopId || ctx.deliveryId) {
+    const identityField = ctx.deliveryId ? 'outcomeDeliveryId' : 'outcomeStopId';
+    const row = openEventLog().prepare(`SELECT id FROM events
+      WHERE session_id = ? AND type = 'user_input_received' AND json_valid(data_json)
+        AND json_extract(data_json, '$.synthetic') = 1 AND json_extract(data_json, '$.source') = 'outcome'
+        AND json_extract(data_json, '$.sourceLabel') = ? AND json_extract(data_json, '$.sourceId') = ?
+        AND json_extract(data_json, '$.status') = ? AND json_extract(data_json, '$.deliveryPhase') = 'passive'
+        AND json_extract(data_json, '$.${identityField}') = ? ORDER BY seq ASC LIMIT 1`)
+      .get(sessionId, ctx.sourceLabel, ctx.sourceId, outcome.status, ctx.deliveryId ?? ctx.stopId) as { id: string } | undefined;
+    return row ? getEvent(row.id) ?? undefined : undefined;
+  }
+  return listEvents(sessionId, { types: ['user_input_received'], desc: true, limit: 200 })
+    .find(event => typeof event.data.text === 'string' && isDuplicateOutcomeText(event.data.text, outcome, ctx, text));
+}
+
+function stageOutcomeSnapshot(sessionId: string, outcome: Outcome, ctx: DeliverContext, text: string): void {
+  try { HarnessSession.load(sessionId)?.injectSyntheticUserTurn(outcomePrefix(ctx), text, outcomeReportIdentity(outcome, ctx)); }
+  catch { /* a snapshot write must never affect run state; replay repairs the gap */ }
 }
 
 function hasExactOutcomeDelivery(sessionId: string, outcome: Outcome, ctx: DeliverContext, text: string): boolean {
@@ -314,7 +325,8 @@ function hasExactOutcomeDelivery(sessionId: string, outcome: Outcome, ctx: Deliv
   const data = JSON.parse(row.data_json);
   if (row.session_id !== sessionId || data.synthetic !== true || data.source !== 'outcome'
     || data.sourceLabel !== ctx.sourceLabel || data.sourceId !== ctx.sourceId
-    || data.status !== outcome.status || data.deliveryPhase !== 'passive' || data.text !== text) {
+    || data.status !== outcome.status || data.deliveryPhase !== 'passive' || data.text !== text
+    || (ctx.stopId !== undefined && data.outcomeStopId !== ctx.stopId)) {
     throw new Error('Outcome delivery identity conflicts with its retained destination or content.');
   }
   return true;
@@ -416,20 +428,28 @@ async function fireProactiveReportTurn(sessionId: string, outcome: Outcome, ctx:
 }
 
 export function publishProactiveOutcome(sessionId: string, outcome: Outcome, ctx: DeliverContext): void {
-  const text = renderPublicOutcomeText(outcome, ctx);
+  const passive = ctx.stopId ? retainedPassiveOutcome(sessionId, outcome, ctx, renderOutcomeText(outcome, ctx)) : undefined;
+  const renderedText = typeof passive?.data.publicReportText === 'string'
+    ? passive.data.publicReportText : renderPublicOutcomeText(outcome, ctx);
   const digest = createHash('sha256').update(JSON.stringify({
-    sourceLabel: ctx.sourceLabel, sourceId: ctx.sourceId, status: outcome.status, text,
+    sourceLabel: ctx.sourceLabel, sourceId: ctx.sourceId, status: outcome.status,
+    ...(ctx.stopId ? { stopId: ctx.stopId } : { text: renderedText }),
   })).digest('hex');
   // A crash between acceptance and publication reuses the same identity. The
   // committer is idempotent; another status or another question is a new report.
-  const source = listEvents(sessionId, { types: ['user_input_received'] }).find((event) => (
+  const source = openEventLog().transaction(() => listEvents(sessionId, { types: ['user_input_received'] }).find((event) => (
     event.data.synthetic === true && event.data.source === 'outcome'
     && event.data.deliveryPhase === 'report' && event.data.outcomeDigest === digest
   )) ?? appendEvent({
     sessionId, turn: 0, role: 'user', type: 'user_input_received',
-    data: { text, synthetic: true, source: 'outcome', sourceLabel: ctx.sourceLabel,
-      sourceId: ctx.sourceId, status: outcome.status, deliveryPhase: 'report', outcomeDigest: digest },
-  });
+    data: { text: renderedText, synthetic: true, source: 'outcome', sourceLabel: ctx.sourceLabel,
+      sourceId: ctx.sourceId, status: outcome.status, deliveryPhase: 'report', outcomeDigest: digest,
+      ...(ctx.stopId ? { outcomeStopId: ctx.stopId } : {}), resumable: passive ? passive.data.resumable === true : outcome.resumable === true },
+  })).immediate();
+  // The first accepted report owns presentation as well as identity. Wording
+  // changes on replay must not conflict with its already committed terminal.
+  const text = source.data.text as string;
+  const resumable = source.data.resumable === undefined ? outcome.resumable === true : source.data.resumable === true;
   const identity = { sessionId, sourceUserSeq: source.seq, turn: source.turn };
   const base = { version: 2 as const, id: turnOutcomeId(identity), identity };
   const terminal: TurnOutcome = outcome.status === 'done'
@@ -437,7 +457,7 @@ export function publishProactiveOutcome(sessionId: string, outcome: Outcome, ctx
     : outcome.status === 'needs_input'
       ? { ...base, status: 'needs_input', resumable: true, needs: { kind: 'input' }, presentation: { kind: 'question', text } }
       : outcome.status === 'blocked'
-        ? { ...base, status: 'blocked', resumable: outcome.resumable === true, presentation: { kind: 'blocked', text } }
+        ? { ...base, status: 'blocked', resumable, presentation: { kind: 'blocked', text } }
         : { ...base, status: 'failed', resumable: false, presentation: { kind: 'error', text } };
   commitTurnOutcome(terminal);
 }
@@ -602,42 +622,27 @@ export function deliverOutcomeWithAcknowledgement(
     // that loses the original harness transcript on reopen.
     const harnessRow = getHarnessSession(sessionId);
     if (harnessRow) {
-      if (ctx.deliveryId ? hasExactOutcomeDelivery(sessionId, outcome, ctx, text)
-        : harnessEventLogHasOutcome(sessionId, outcome, ctx, text)) {
-        return { acknowledged: true, written: false, disposition: 'already_delivered' };
-      }
-      try { appendEvent({
-        sessionId,
-        turn: 0,
-        role: 'user',
-        type: 'user_input_received',
-        data: {
-          text,
-          synthetic: true,
-          source: 'outcome',
-          sourceLabel: ctx.sourceLabel,
-          sourceId: ctx.sourceId,
-          status: outcome.status,
-          deliveryPhase: 'passive',
+      const delivery = openEventLog().transaction(() => {
+        if (ctx.deliveryId) hasExactOutcomeDelivery(sessionId, outcome, ctx, text);
+        const retained = retainedPassiveOutcome(sessionId, outcome, ctx, text);
+        if (retained) return { written: false, text: retained.data.text as string };
+        appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_input_received', data: {
+          text, synthetic: true, source: 'outcome', sourceLabel: ctx.sourceLabel, sourceId: ctx.sourceId,
+          status: outcome.status, deliveryPhase: 'passive', publicReportText: renderPublicOutcomeText(outcome, ctx),
           ...(ctx.deliveryId ? { outcomeDeliveryId: ctx.deliveryId } : {}),
           ...(ctx.stopId ? { outcomeStopId: ctx.stopId } : {}),
           ...(outcome.evidence ? { evidence: outcome.evidence } : {}),
           ...(outcome.blocker ? { blocker: outcome.blocker } : {}),
           ...(outcome.nextAction ? { nextAction: outcome.nextAction } : {}),
           ...(outcome.resumable !== undefined ? { resumable: outcome.resumable } : {}),
-        },
-      }); } catch (error) {
-        // Another process may have committed this exact delivery after our
-        // lookup. Only its verified row counts as an acknowledgement.
-        if (ctx.deliveryId && hasExactOutcomeDelivery(sessionId, outcome, ctx, text)) {
-          return { acknowledged: true, written: false, disposition: 'already_delivered' };
-        }
-        throw error;
+        } });
+        return { written: true, text };
+      }).immediate();
+      stageOutcomeSnapshot(sessionId, outcome, ctx, delivery.text);
+      if (!delivery.written) {
+        if (ctx.stopId || ctx.deliveryId) maybeScheduleProactiveReport(sessionId, outcome, ctx);
+        return { acknowledged: true, written: false, disposition: 'already_delivered' };
       }
-      try {
-        const hs = HarnessSession.load(sessionId);
-        if (hs) hs.injectSyntheticUserTurn(idPrefix, text);
-      } catch { /* a harness snapshot write must never affect run state */ }
       logger.info({ sourceId: ctx.sourceId, sessionId, status: outcome.status, store: 'harness' }, 'Outcome delivered to origin session');
       appendGoalEvidence(sessionId, outcome, ctx);
       maybeScheduleProactiveReport(sessionId, outcome, ctx);

@@ -16,7 +16,9 @@ import {
   type WorkerBatchExecutionResult,
   type WorkerBatchExecutionLease,
 } from '../agents/worker-batch-execution.js';
-import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from '../agents/worker-respawn-guard.js';
+import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled, workerPacketRequiresReconciliation } from '../agents/worker-respawn-guard.js';
+import { withPinnedWorkerModel, isPinnedWorkerModel } from '../runtime/harness/pinned-worker-model.js';
+import { qualifyWorkerOutput, type WorkerCallRecord } from '../runtime/harness/worker-call-record.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { routeWorkerModel } from '../runtime/harness/worker-model-route.js';
 import { resolveWorkerAgentRequest } from '../agents/agent-binding.js';
@@ -328,7 +330,8 @@ export function registerWorkerTools(server: McpServer): void {
             },
             execute: async (spec, lease) => {
               try {
-                const out = await runOneWorker(spec.input, manifestBinding, lease);
+                const out = await withPinnedWorkerModel(workerRoute.exactModel ? workerRoute.model : undefined,
+                  () => runOneWorker(spec.input, manifestBinding, lease));
                 return String((out as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '');
               } catch (err) {
                 if (err instanceof KillRequested || isWorkerBatchGenerationCancellation(err, lease.signal)) throw err;
@@ -375,7 +378,7 @@ export function registerWorkerTools(server: McpServer): void {
         // teaching us its real catalog — memo the dead id so the repair
         // translates it, and invite an IMMEDIATE retry instead of declaring
         // fan-out down (one failed round maximum).
-        if (uniform && looksLikeUnknownModelError(uniform)) {
+        if (!workerRoute.exactModel && uniform && looksLikeUnknownModelError(uniform)) {
           const deadRoute = resolveSdkBrainWorker(call.intent || undefined);
           markByoModelNotServed(deadRoute.modelId);
           const healed = repairByoRoutedModelId(deadRoute.modelId);
@@ -388,7 +391,7 @@ export function registerWorkerTools(server: McpServer): void {
         // healthy candidate (spawn-time selection above does the switch).
         // RAW texts, not the normalized signature (429 → <n> blinding; see
         // orchestrator twin, live 2026-07-22).
-        if (uniform && (workerFailureLooksRateLimited(uniform) || failed.some((f) => workerFailureLooksRateLimited(f.text)))) {
+        if (!workerRoute.exactModel && uniform && (workerFailureLooksRateLimited(uniform) || failed.some((f) => workerFailureLooksRateLimited(f.text)))) {
           const benchedRoute = resolveSdkBrainWorker(call.intent || undefined);
           markWorkerModelCoolingDown(benchedRoute.modelId);
           const next = pickWorkerModelWithFallover([
@@ -428,10 +431,10 @@ export function registerWorkerTools(server: McpServer): void {
           ...(durableReuseGuidance ? [durableReuseGuidance] : []),
         ].join('\n\n')));
       }
-      const singleResult = await runOneWorker(
+      const singleResult = await withPinnedWorkerModel(workerRoute.exactModel ? workerRoute.model : undefined, () => runOneWorker(
         { ...packetBase, item: callItems[0] } as WorkerToolInput,
         manifestBinding,
-      );
+      ));
       const singleText = String(singleResult.content?.[0]?.text ?? '');
       offerAfterSuccess(!workerResultIndicatesFailure(singleText));
       const reusedReceipt = allRequestedItemsReused && manifestBinding;
@@ -490,11 +493,12 @@ export function registerWorkerTools(server: McpServer): void {
         reason?: string,
         model?: string,
         checkpointManifest = true,
+        retryRequiresReconciliation = false,
       ): void => {
         let resultEvent: ReturnType<typeof appendEvent> | undefined;
         batchLease?.assertCurrent();
         try {
-          resultEvent = appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, packetKey, sourceUserSeq, parentLogicalCallId: getToolOutputContext()?.callId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
+          resultEvent = appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, retryRequiresReconciliation, packetKey, sourceUserSeq, parentLogicalCallId: getToolOutputContext()?.callId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
         } catch { /* durable trace is best-effort */ }
         if (manifestBinding && checkpointManifest) {
           batchLease?.assertCurrent();
@@ -576,6 +580,9 @@ export function registerWorkerTools(server: McpServer): void {
         }
       } catch { /* fail-open to the older packet-key guard */ }
 
+      if (workerPacketRequiresReconciliation(sessionId, packetKey, sourceUserSeq)) {
+        return textResult('ERROR: this worker has unverified output and prior actions that may already have completed. Inspect its retained receipts and repair only the missing work inline; do not repeat writes or sends.');
+      }
       // Wave 4 Stage 1 — durable-resume idempotency (checked BEFORE the fuzzy
       // cap-guard: an exact-packet ok match is a STRONGER signal than the
       // domain-collapsing cap match, and must win so a worker that genuinely
@@ -631,7 +638,11 @@ export function registerWorkerTools(server: McpServer): void {
       }
 
       const route = resolveSdkBrainWorker(input.intent || undefined, input.model || undefined);
-      let workerModel = getSessionWorkerModelOverride(getToolOutputContext()?.sessionId) ?? route.modelId;
+      const exactModel = Boolean(input.model && isPinnedWorkerModel(input.model));
+      if (exactModel && route.modelId !== input.model) {
+        return textResult(`ERROR: the saved agent requires ${input.model}, which this worker lane cannot serve. No substitute was started.`);
+      }
+      let workerModel = (exactModel ? input.model! : getSessionWorkerModelOverride(getToolOutputContext()?.sessionId)) ?? route.modelId;
       const transport = route.claudeLane ? 'claude_agent_sdk' : 'cross_provider';
       // Visible warning when a configured non-Claude worker model is IGNORED
       // (CLEMMY_SDK_BRAIN_CROSS_WORKER=off) — replaces today's silent fallback so
@@ -658,13 +669,13 @@ export function registerWorkerTools(server: McpServer): void {
       let workerProvider = resolveEffectiveProviderForModel(workerModel);
       // A byo-routed id no BYO provider serves would 400 on dispatch — repair to
       // the backend's real primary id (no-op for owned ids / non-byo providers).
-      if (workerProvider === 'byo' && !route.claudeLane) workerModel = repairByoRoutedModelId(workerModel);
+      if (workerProvider === 'byo' && !route.claudeLane && !exactModel) workerModel = repairByoRoutedModelId(workerModel);
       // Fleet resilience: skip a rate-limit-benched worker model at spawn time
       // (routed → default worker binding → small Claude rescue). Cross-lane pick only
       // applies off the pure-Claude lane; the Claude lane's own model is already
       // the last-resort candidate.
       let benchFalloverFrom: string | undefined;
-      if (!route.claudeLane) {
+      if (!route.claudeLane && !exactModel) {
         const pick = pickWorkerModelWithFallover([
           workerModel,
           resolveSdkBrainWorker(undefined).modelId,
@@ -755,7 +766,7 @@ export function registerWorkerTools(server: McpServer): void {
         // of the module graph — mirrors inner-dispatch's runtime imports).
         assertWorkerMayStart();
         const sinceSeq = route.claudeLane ? sessionHighWater(sessionId) : 0;
-        const result: { text: string; model?: string; parentActions?: string[] } = route.claudeLane
+        const result: { text: string; model?: string; parentActions?: string[]; callRecord?: WorkerCallRecord } = route.claudeLane
           ? await runClaudeAgentSdkWorker(
               input,
               workerModel,
@@ -785,6 +796,7 @@ export function registerWorkerTools(server: McpServer): void {
           : result.parentActions ?? [];
         const parentNote = parentActionsNote(parentActions);
         if (parentNote) result.text = `${result.text}\n\n${parentNote}`;
+        result.text = qualifyWorkerOutput(result.text, result.callRecord);
         const ok = !workerResultIndicatesFailure(result.text);
         // #6: the SDK-brain worker surfaces a turn-cap as ERROR text, but the
         // hooks.ts worker_capped emit only fires in the nested lane — so the
@@ -828,7 +840,8 @@ export function registerWorkerTools(server: McpServer): void {
         // Persist the work-product before the manifest success checkpoint. This
         // ordering closes the restart window where the ledger said "succeeded"
         // but the payload needed for safe reuse had not reached disk yet.
-        recordResult(ok, ok ? undefined : firstLine(result.text), result.model ?? workerModel);
+        recordResult(ok, ok ? undefined : firstLine(result.text), result.model ?? workerModel, true,
+          !ok && result.callRecord?.effectsMayHaveRun !== false);
         // Stage 3 reduce tier: past ~8 results the return compresses to a
         // parked digest + shard summaries; small fan-outs are byte-identical.
         return textResult(await buildWorkerReturn({
@@ -840,7 +853,8 @@ export function registerWorkerTools(server: McpServer): void {
         }));
       } catch (err) {
         if (err instanceof KillRequested || isWorkerBatchGenerationCancellation(err, batchLease?.signal)) throw err;
-        recordResult(false, firstLine(err), workerModel);
+        recordResult(false, firstLine(err), workerModel, true,
+          (err as { committed?: unknown } | null)?.committed === true);
         // A THROWN worker (crashed before returning a result) was invisible in the
         // Agents panel — the success path above records, this one didn't. Record it
         // as a failed specialist so a crashed worker still shows up. Fail-open.

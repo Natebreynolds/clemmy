@@ -1,4 +1,4 @@
-import { recordVisible, scopeOfSession } from '../memory/memory-scope.js';
+import { memoryScopeOf, recordVisible, sameScope, scopeOfSession } from '../memory/memory-scope.js';
 
 function factMayBeSeen(id: number): boolean {
   return recordVisible('fact', id);
@@ -20,9 +20,12 @@ import { applyMemoryFix, detectMemoryHealCandidates, listProposedMemoryFixes, re
 import { looksLikeHighConfidenceTransientRequest } from '../memory/memory-quality.js';
 import { WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { addNotification } from '../runtime/notifications.js';
-import { readText, replaceFile, resolveMemoryTarget, textResult } from './shared.js';
+import { readText, replaceFile, resolveMemoryTarget, textResult, nonWriteTextResult } from './shared.js';
 import type { ConsolidatedFact } from '../memory/facts.js';
 import { formatFactRead } from '../memory/fact-read-provenance.js';
+import { readFactObservation } from '../memory/fact-correction.js';
+import { currentLogicalCall } from '../runtime/harness/attempt-identity.js';
+import { executeMemoryCorrection, memoryCorrectionInputSchema } from '../runtime/harness/memory-correction-tool.js';
 import { openMemoryDb, type EntityType } from '../memory/db.js';
 import { upsertEntity, type EntityIdentifierInput } from '../memory/entity-identity.js';
 import { addFactEntityLinks, recordGroundedEntityRelationship, type EntityRelationshipOutcome } from '../memory/relations.js';
@@ -125,20 +128,29 @@ export function reviewForgetRequest(
 
 /** One visible card per standing-rule change — never silent. Best-effort. */
 function notifyStandingRuleChange(
-  action: 'unpinned' | 'pinned' | 'forgotten',
+  action: 'unpinned' | 'pinned' | 'forgotten' | 'corrected',
   fact: Pick<ConsolidatedFact, 'id' | 'kind' | 'content'>,
+  receipt?: { id: string; occurredAt: string },
 ): void {
   try {
     addNotification({
-      id: `${Date.now()}-standing-rule-${action}-${fact.id}`,
+      id: receipt?.id ?? `${Date.now()}-standing-rule-${action}-${fact.id}`,
       kind: 'system',
       title: `Standing rule ${action}: fact #${fact.id}`,
-      body: `Clem ${action} ${fact.kind === 'constraint' ? 'a CONSTRAINT' : 'a pinned fact'} via a memory tool call:\n\n"${fact.content.slice(0, 280)}"\n\nIf you didn't ask for this, say "re-pin fact #${fact.id}" (or "restore fact #${fact.id}" if it was forgotten).`,
-      createdAt: new Date().toISOString(),
+      body: `Clem ${action} ${fact.kind === 'constraint' ? 'a CONSTRAINT' : 'a pinned fact'} via a memory tool call:\n\n"${fact.content.slice(0, 280)}"\n\n${action === 'corrected'
+        ? 'The correction kept its original scope and pin. If this was not intended, ask Clem to review the correction history before changing it again.'
+        : `If you didn't ask for this, say "re-pin fact #${fact.id}" (or "restore fact #${fact.id}" if it was forgotten).`}`,
+      createdAt: receipt?.occurredAt ?? new Date().toISOString(),
       read: false,
       metadata: { factId: fact.id, kind: fact.kind, action, source: 'memory-tools-guard' },
     });
-  } catch { /* notification must never block the tool */ }
+  } catch (error) {
+    // A correction remains committed if delivery fails. An interrupted call
+    // that has not settled can replay this idempotent card. A settled error
+    // stays blocked; it must not be reported as no effect or retried blindly.
+    if (receipt) throw error;
+    /* Existing pin/unpin/forget notifications remain best-effort. */
+  }
 }
 
 // Tier A1 — when CLEMMY_REMEMBER_RECONCILE=on, the agent's explicit
@@ -521,7 +533,14 @@ export function reconcileAutoCapturedRememberFact(input: {
 
   const now = new Date().toISOString();
   const tx = db.transaction(() => {
-    for (const match of matches) {
+    // Literal equality is not permission to move a remembered claim. In
+    // particular, an explicit local copy must not retire its global rule or
+    // a claim from an earlier project in the same conversation. Read both
+    // canonical scopes in the mutation transaction, before transferring any
+    // evidence, pin, history or intake ownership.
+    const destinationScope = memoryScopeOf('fact', input.factId!);
+    const reconciled = matches.filter(match => sameScope(memoryScopeOf('fact', match.id), destinationScope));
+    for (const match of reconciled) {
       // Preserve the exact source-turn episode on the curated fact. The direct
       // row may also carry system-of-record evidence; INSERT OR IGNORE keeps
       // both sources without replacing either one.
@@ -552,11 +571,13 @@ export function reconcileAutoCapturedRememberFact(input: {
         WHERE resulting_fact_id = ?
       `).run(input.factId, match.id);
     }
+    return reconciled;
   });
-  tx();
+  const reconciled = tx();
+  if (reconciled.length === 0) return 0;
   syncMemoryPolicyForFact(input.factId);
-  for (const match of matches) syncMemoryPolicyForFact(match.id);
-  return matches.length;
+  for (const match of reconciled) syncMemoryPolicyForFact(match.id);
+  return reconciled.length;
 }
 
 function formatMemoryFix(fix: ProposedMemoryFix): string {
@@ -605,9 +626,22 @@ export function registerMemoryTools(server: McpServer): void {
       const durableRef = /^(?:fact|policy):(\d+)$/i.exec(target.trim());
       if (durableRef) {
         const id = Number(durableRef[1]);
+        let observation: ReturnType<typeof readFactObservation> = null;
+        let observationUnavailable = false;
+        // Observe before the legacy reader, which may initialize a missing
+        // scope table. This call must not convert missing scope to global proof.
+        try { observation = readFactObservation(id); } catch { observationUnavailable = true; }
         const fact = getFact(id);
         if (!fact) return textResult(`Durable memory reference not found: ${target}`);
-        return textResult(formatFactRead(fact, getFact));
+        if (observationUnavailable) {
+          // Historical memories remain readable when their exact correction
+          // state cannot be certified. Such prose is not a correction handle.
+          return textResult(`${formatFactRead(fact, getFact)}\nExact stored scope and version could not be verified; this read cannot authorize a correction.`);
+        }
+        if (!observation) return textResult(`Durable memory reference unavailable: ${target}`);
+        return textResult(JSON.stringify({ protocol: 'fact_observation_v1',
+          readCallId: currentLogicalCall()?.logicalToolCallId ?? null, observation,
+          provenance: formatFactRead(fact, getFact, { omitFactBody: true }) }));
       }
       const resolved = resolveMemoryTarget(target);
       return textResult(readText(resolved, `No readable Clementine vault memory for target: ${target}. This lookup is limited to the memory vault; it does not establish whether the requested local filesystem path exists. Use read_file to inspect a local workspace file.`));
@@ -711,7 +745,7 @@ export function registerMemoryTools(server: McpServer): void {
 
   server.tool(
     'memory_remember',
-    'Record a durable fact in long-term memory. One-off commands, questions, and task requests are rejected; put those in task/focus/working memory instead. Use for user preferences (kind=user), project context (project), standing feedback (feedback), or external references (reference). Default to the small kind + content payload. Add entities/relationships only when a stable real-world identity relation itself matters (for example a person works at a company); omit graph annotations for codewords, secrets, labels, dates, and generic object-value pairs. Only controlled predicates and relationships supported verbatim by the durable fact are accepted. Include an alias, identifier, or time bound only when it is literally present in content; unsupported annotations are rejected. Use kind=constraint for an ENFORCEABLE standing rule that must HARD-GATE tool dispatch — a sender/account/destination routing rule ("always send Outlook mail from billing@acme-co.example", "only write Salesforce in the sandbox org") or a never-do guardrail ("never post to the prod channel"). A constraint is auto-pinned and is checked by the dispatch gate on every matching tool call, so reserve it for rules that should BLOCK a wrong action, not general preferences. Idempotent — re-recording the same fact bumps its score.',
+    'Record a durable fact in long-term memory, or use correct to replace an observed fact while preserving its stored scope and untouched clauses. Read the original first; a second saved fact does not establish a correction. One-off commands, questions, and task requests are rejected; put those in task/focus/working memory instead. Use for user preferences (kind=user), project context (project), standing feedback (feedback), or external references (reference). Default to the small kind + content payload. Add entities/relationships only when a stable real-world identity relation itself matters (for example a person works at a company); omit graph annotations for codewords, secrets, labels, dates, and generic object-value pairs. Only controlled predicates and relationships supported verbatim by the durable fact are accepted. Include an alias, identifier, or time bound only when it is literally present in content; unsupported annotations are rejected. Use kind=constraint for an ENFORCEABLE standing rule that must HARD-GATE tool dispatch — a sender/account/destination routing rule ("always send Outlook mail from billing@acme-co.example", "only write Salesforce in the sandbox org") or a never-do guardrail ("never post to the prod channel"). A constraint is auto-pinned and is checked by the dispatch gate on every matching tool call, so reserve it for rules that should BLOCK a wrong action, not general preferences. Idempotent — re-recording the same fact bumps its score.',
     {
       kind: z.enum(FACT_KINDS as unknown as [string, ...string[]]),
       // Retain the fact as authored. A short prompt/display projection must
@@ -719,6 +753,7 @@ export function registerMemoryTools(server: McpServer): void {
       content: z.string().min(3),
       sessionId: z.string().optional(),
       sourcePath: z.string().optional(),
+      correct: memoryCorrectionInputSchema.optional().describe('For an owner-requested correction, first memory_read the original fact, then pass its readCallId, observation.digest as expectedDigest and exact unique before/after edits. Set kind to the original kind and content to the full edited original. The original scope and every untouched clause are preserved. Omit sourcePath and graph annotations. A generic save is not a correction.'),
       keepFor: z.enum(['everywhere', 'here']).optional().describe('Who the memory is for. "here": only the project and agent this conversation is working in. "everywhere": every conversation. Omit to let the kind decide: facts about the owner and standing rules are for everywhere; project facts, references and corrections are for here.'),
       entities: z.array(z.object({
         type: z.enum(MEMORY_ENTITY_TYPES),
@@ -740,8 +775,54 @@ export function registerMemoryTools(server: McpServer): void {
         validTo: z.string().max(64).optional(),
       })).max(12).optional(),
     },
-    async ({ kind, content, sessionId, sourcePath, keepFor, entities, relationships }) => {
+    async ({ kind, content, sessionId, sourcePath, correct, keepFor, entities, relationships }) => {
       try {
+        const activeSessionId = harnessRunContextStorage.getStore()?.sessionId?.trim();
+        const requestedSessionId = sessionId?.trim();
+        if (activeSessionId && requestedSessionId && requestedSessionId !== activeSessionId) {
+          return nonWriteTextResult('memory_session_mismatch',
+            'Not remembered: this call belongs to the active conversation. Omit sessionId or use the active conversation; a tool argument cannot retarget its memory.',
+            { classification: { kind: 'invalid_arguments' } });
+        }
+        // Standalone callers retain explicit session selection. Verified
+        // continuations already bind their execution owner's conversation.
+        const effectiveSessionId = activeSessionId || requestedSessionId;
+        if (correct) {
+          if (sourcePath || entities?.length || relationships?.length) {
+            return nonWriteTextResult('memory_correction_arguments',
+              'Correct the existing fact without sourcePath or graph annotations; its source and scope must remain verifiable.',
+              { classification: { kind: 'invalid_arguments' } });
+          }
+          try {
+            const result = await executeMemoryCorrection({ kind, content, correct, keepFor });
+            if (result.status === 'refused') {
+              return nonWriteTextResult('memory_correction_refused', result.reason,
+                { classification: { kind: 'invalid_arguments' } });
+            }
+            if ((result.status === 'corrected' || result.status === 'replayed') && result.currentStateMatches) {
+              bumpStableContextGeneration();
+              if (result.proof.before.pinned || result.proof.before.kind === 'constraint') {
+                notifyStandingRuleChange('corrected', result.proof.before,
+                  { id: `standing-rule-correction:${result.proof.episodeId}`, occurredAt: result.proof.occurredAt });
+              }
+            }
+            return textResult(JSON.stringify({ protocol: 'fact_correction_v1', ...result }));
+          } catch (error) {
+            // An exception may arrive after a committed replacement. Do not
+            // claim no effect or encourage a fresh write from an unknown state.
+            return textResult(`Correction outcome could not be verified: ${error instanceof Error ? error.message : String(error)}. Inspect the original fact and its successor before attempting another change.`,
+              { isError: true });
+          }
+        }
+        const currentScope = keepFor === 'here' ? scopeOfSession(effectiveSessionId) : null;
+        // Copy before any await; the binding prefers frozen accepted-source
+        // identity. A known base-Clem scope is distinct from unknown null.
+        const hereScope = currentScope ? { projectId: currentScope.projectId, agentKey: currentScope.agentKey } : null;
+        if (keepFor === 'here' && !hereScope) {
+          return nonWriteTextResult('memory_scope_unavailable',
+            'Not remembered: the current project and agent scope is unavailable. Restore that context before saving this memory here.',
+            { classification: { kind: 'input_required' } });
+        }
         if (looksLikeHighConfidenceTransientRequest(content)) {
           return textResult(
             'Not remembered: this reads like a one-time command, question, or task request rather than durable memory. '
@@ -752,7 +833,6 @@ export function registerMemoryTools(server: McpServer): void {
         // public remember operation must pass through the same semantic
         // duplicate/conflict resolver, evidence capture, and temporal history
         // path or reliability depends on deployment configuration.
-        const effectiveSessionId = sessionId?.trim() || harnessRunContextStorage.getStore()?.sessionId;
         const inferredSource = sourcePath ? null : inferRememberedToolSource(effectiveSessionId, content);
         const outcome = await consolidateFact(
           {
@@ -768,10 +848,10 @@ export function registerMemoryTools(server: McpServer): void {
             ...(inferredSource ? { derivedFrom: inferredSource } : {}),
             ...(keepFor === 'everywhere'
               ? { scope: null }
-              // A rule, or something true of the owner, holds everywhere. It is
-              // narrowed to one project only by the owner, in Memory.
-              : keepFor === 'here' && kind !== 'constraint' && kind !== 'user'
-                ? { scope: scopeOfSession(effectiveSessionId) ?? null }
+              // Explicit here applies to every kind. Omission retains the
+              // existing kind defaults; reconciliation cannot move old facts.
+              : keepFor === 'here'
+                ? { scope: hereScope! }
                 : {}),
           },
           { noveltyFastPathSim: REMEMBER_NOVELTY_FAST_PATH_SIM },
@@ -815,7 +895,7 @@ export function registerMemoryTools(server: McpServer): void {
           ? `\nMemory conflict unresolved: ${outcome.unresolvedConflict!.reason}\n`
             + `The new fact is saved as [fact:${outcome.factId}], but these related facts are still active:\n`
             + unresolvedFacts.map(fact => `[fact:${fact.id}] ${fact.kind}: ${fact.content}`).join('\n')
-            + '\nCompare these records with the owner’s actual instruction. For a requested correction, use memory_forget (soft deletion) on only the exact superseded facts; preserve complementary facts and unrelated instructions. Do not claim the correction is fully applied while its contradictory prior facts remain active.'
+            + '\nCompare these records with the owner’s actual instruction. For a requested correction, open the original with memory_read and use memory_remember.correct with that retained read and exact edits, preserving its stored scope and unchanged content. A separately saved duplicate may prevent an exact replacement; report that unresolved conflict instead of deleting the original or claiming completion. Do not claim the correction is fully applied while its contradictory prior facts remain active.'
           : '';
         return textResult(`${verb} (${kind}): ${content}${graph.summary}${reconciliation}${warning}${conflict}`);
       } catch (err) {

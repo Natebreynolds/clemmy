@@ -94,3 +94,129 @@ test('shipped built-in skills are installed beside the daemon with a verified co
   assert.equal(first.backup, null, 'a bundle with no packaged skills yet has nothing to retain');
   assert.equal(fs.readFileSync(path.join(fresh, 'workspace-builder', 'SKILL.md'), 'utf8'), 'new skill');
 });
+
+// Only synthetic directories are used; subprocesses are forbidden in the CLI check.
+const REFUSED_BUNDLE = /Refusing in-place installation inside an app bundle/;
+const REFUSED_UNVERIFIABLE = /Cannot verify installation target/;
+
+function forbiddenMutations() {
+  const calls = [];
+  const operations = { ...fs };
+  for (const name of ['mkdtempSync', 'mkdirSync', 'cpSync', 'renameSync', 'rmSync', 'writeFileSync']) {
+    operations[name] = () => { calls.push(name); throw new Error(`unexpected mutation: ${name}`); };
+  }
+  return { calls, operations };
+}
+
+function rejectsBothInstallers(f, target, expected = REFUSED_BUNDLE) {
+  for (const install of [
+    (ops) => installDaemonPatch({ sourceDist: f.sourceDist, targetDist: target }, ops),
+    (ops) => installBundledAssetDirectory({ sourceDir: f.sourceDist, targetDir: target }, ops),
+  ]) {
+    const spy = forbiddenMutations();
+    assert.throws(() => install(spy.operations), expected);
+    assert.deepEqual(spy.calls, [], 'refusal must precede staging, copying, backup, and cleanup');
+  }
+}
+
+test('both installers reject app resources regardless of seal health or presence', async t => {
+  for (const seal of ['present', 'damaged', 'absent']) {
+    await t.test(seal, t => {
+      const f = fixture(t);
+      const contents = path.join(f.root, 'Clementine.app', 'Contents');
+      const target = path.join(contents, 'Resources', 'daemon', 'dist');
+      fs.mkdirSync(target, { recursive: true });
+      fs.writeFileSync(path.join(target, 'index.js'), 'working app bytes');
+      if (seal !== 'absent') {
+        fs.mkdirSync(path.join(contents, '_CodeSignature'));
+        fs.writeFileSync(path.join(contents, '_CodeSignature', 'CodeResources'), seal === 'present' ? 'synthetic seal marker' : 'invalid');
+      }
+      rejectsBothInstallers(f, target);
+      assert.equal(fs.readFileSync(path.join(target, 'index.js'), 'utf8'), 'working app bytes');
+      assert.deepEqual(fs.readdirSync(path.dirname(target)), ['dist']);
+    });
+  }
+});
+
+test('case-insensitive app/Contents spelling and absent target suffixes cannot bypass refusal', t => {
+  const f = fixture(t);
+  const parent = path.join(f.root, 'Clementine.APP', 'cOnTeNtS');
+  fs.mkdirSync(parent, { recursive: true });
+  rejectsBothInstallers(f, path.join(parent, 'Resources', 'missing', 'dist'));
+  assert.deepEqual(fs.readdirSync(parent), []);
+});
+
+test('aliases into bundle resources are rejected for existing and missing targets', t => {
+  const f = fixture(t);
+  const contents = path.join(f.root, 'Clementine.app', 'Contents');
+  fs.mkdirSync(path.join(contents, 'dist'), { recursive: true });
+  const alias = path.join(f.root, 'ordinary-looking-alias');
+  fs.symlinkSync(contents, alias, 'dir');
+  rejectsBothInstallers(f, path.join(alias, 'dist'));
+  rejectsBothInstallers(f, path.join(alias, 'not-yet-created', 'dist'));
+  assert.deepEqual(fs.readdirSync(contents), ['dist']);
+});
+
+test('a symlink out of an app does not allow replacing the sealed symlink entry', t => {
+  const f = fixture(t);
+  const contents = path.join(f.root, 'Clementine.app', 'Contents');
+  fs.mkdirSync(contents, { recursive: true });
+  const target = path.join(contents, 'dist');
+  fs.symlinkSync(f.targetDist, target, 'dir');
+  rejectsBothInstallers(f, target);
+  assert.ok(fs.lstatSync(target).isSymbolicLink());
+  assert.equal(fs.readFileSync(path.join(f.targetDist, 'index.js'), 'utf8'), 'old daemon');
+});
+
+test('dangling or looping target ancestors fail closed without staging', t => {
+  const f = fixture(t);
+  const dangling = path.join(f.root, 'dangling');
+  fs.symlinkSync(path.join(f.root, 'Missing.app', 'Contents'), dangling, 'dir');
+  rejectsBothInstallers(f, path.join(dangling, 'dist'), REFUSED_UNVERIFIABLE);
+  const loop = path.join(f.root, 'loop');
+  fs.symlinkSync(loop, loop, 'dir');
+  rejectsBothInstallers(f, path.join(loop, 'dist'), REFUSED_UNVERIFIABLE);
+});
+
+test('ordinary non-bundle aliases and similar directory names retain verified installation', t => {
+  const f = fixture(t);
+  const ordinary = path.join(f.root, 'project.app-assets', 'Contents');
+  fs.mkdirSync(path.join(ordinary, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(ordinary, 'dist', 'index.js'), 'old alias daemon');
+  const alias = path.join(f.root, 'ordinary-alias');
+  fs.symlinkSync(ordinary, alias, 'dir');
+  const patched = installDaemonPatch({ sourceDist: f.sourceDist, targetDist: path.join(alias, 'dist') });
+  assert.equal(fs.readFileSync(path.join(ordinary, 'dist', 'index.js'), 'utf8'), 'new daemon');
+  assert.equal(fs.readFileSync(path.join(patched.backup, 'index.js'), 'utf8'), 'old alias daemon');
+  const assets = installBundledAssetDirectory({ sourceDir: f.sourceDist, targetDir: path.join(alias, 'assets') });
+  assert.equal(assets.backup, null);
+  assert.equal(fs.readFileSync(path.join(ordinary, 'assets', 'index.js'), 'utf8'), 'new daemon');
+});
+
+test('tree CLI rejects a synthetic app before process checks, quit, staging, or relaunch', async t => {
+  const f = fixture(t);
+  const bundle = path.join(f.root, 'Clementine.app');
+  const daemon = path.join(bundle, 'Contents', 'Resources', 'daemon');
+  fs.mkdirSync(daemon, { recursive: true });
+  fs.writeFileSync(path.join(daemon, 'package.json'), JSON.stringify({ version: '0.0.0' }));
+  const moduleUrl = new URL('./hotpatch-installed-tree.mjs', import.meta.url);
+  const source = fs.readFileSync(moduleUrl, 'utf8');
+  // Evaluate the actual CLI body with inert subprocess bindings. This never
+  // invokes a real process inspector, AppleScript, runtime, or installed app.
+  const body = source.replace(/^import[\s\S]*?from ['"][^'"]+['"];\s*$/gm, '')
+    .replaceAll('import.meta.url', JSON.stringify(moduleUrl.href));
+  const helpers = await import('./hotpatch-daemon.mjs');
+  const { Script } = await import('node:vm');
+  const { createHash } = await import('node:crypto');
+  const { fileURLToPath } = await import('node:url');
+  const commands = [];
+  const result = new Script(`(async () => { ${body}\n})()`).runInNewContext({
+    ...helpers, fs, path, createHash, fileURLToPath,
+    process: { argv: ['node', moduleUrl.pathname], env: { HOME: f.root, CLEMENTINE_APP_PATH: bundle }, exit(code) { throw new Error(`unexpected exit ${code}`); } },
+    console: { log() {}, error() {} },
+    execFileSync(command) { commands.push(command); throw new Error(`unexpected subprocess: ${command}`); },
+  });
+  await assert.rejects(result, REFUSED_BUNDLE);
+  assert.deepEqual(commands, []);
+  assert.deepEqual(fs.readdirSync(daemon), ['package.json']);
+});

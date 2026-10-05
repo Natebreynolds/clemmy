@@ -143,6 +143,11 @@ const downgradedBodies = new WeakSet<object>();
 // records its schema here.
 const downgradedSchemas = new WeakMap<object, unknown>();
 
+/** Immutable scalar identity captured after the SDK/providerData merge and
+ * compat rewrites. Kept off the wire and off all prompt/content telemetry. */
+interface ByoRequestIdentity { requestModel?: string; backendId?: string }
+const requestIdentities = new WeakMap<object, Readonly<ByoRequestIdentity>>();
+
 /** Observed-once-per-body report that the harness chose an effort tier and this
  *  wire had no way to carry it. Telemetry only — it never touches the body and
  *  never blocks a turn. */
@@ -310,6 +315,8 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
 type CreateFn = (params: Record<string, unknown>, options?: unknown) => Promise<unknown>;
 
 export interface WrapCompletionsCreateOptions {
+  /** Explicit registry identity, never an endpoint, account, key or grant. */
+  backendId?: string;
   /**
    * Interactive (non-structured) streams pass through to the SDK as they
    * arrive. Default false: reply text still streams, but the rest of each
@@ -437,7 +444,7 @@ async function reAskForJson(
     // This is a real second provider call, not a local repair. Charge it to the
     // same accepted turn so correction cost cannot disappear from efficiency
     // comparisons (and promote its response id into the exact trace).
-    recordByoUsage(c, relaxed.model, undefined, reAskStartedAt, { reasoningEffort: relaxed.reasoning_effort });
+    recordByoUsage(c, relaxed.model, undefined, reAskStartedAt, { reasoningEffort: relaxed.reasoning_effort, identity: requestIdentities.get(relaxed) });
     return c?.choices?.[0]?.message?.content ?? null;
   } catch {
     return null;
@@ -746,9 +753,9 @@ export function wrapCompletionsCreate(
   return async (params: Record<string, unknown>, options?: unknown) => {
     try {
       const placed = wrapOptions.promptLayout
-        ? withMeasuredPromptLayout(original, params, wrapOptions.promptLayout.baseURL)
+        ? withMeasuredPromptLayout(original, params, wrapOptions.promptLayout.baseURL, wrapOptions.backendId)
         : params;
-      return await wrappedCompletionsCreate(original, placed, options, nativeChatCompletionsStream);
+      return await wrappedCompletionsCreate(original, placed, options, nativeChatCompletionsStream, wrapOptions.backendId);
     } catch (err) {
       noteContextOverflow(err, (params as { model?: unknown }).model);
       throw err;
@@ -769,6 +776,7 @@ function withMeasuredPromptLayout(
   original: CreateFn,
   params: Record<string, unknown>,
   baseURL: string,
+  backendId?: string,
 ): Record<string, unknown> {
   try {
     const model = typeof params.model === 'string' ? params.model : '';
@@ -780,8 +788,9 @@ function withMeasuredPromptLayout(
       baseURL,
       model,
       create: original,
-      onUsage: (completion, startedAt) => recordByoUsage(
+      onUsage: (completion, startedAt, requestModel) => recordByoUsage(
         completion as CompatCompletion, model, PROMPT_LAYOUT_PROBE_CONTEXT, startedAt,
+        { identity: { requestModel, backendId } },
       ),
     });
     if (promptLayoutFor(baseURL, model) !== 'turn_anchor') return params;
@@ -796,9 +805,14 @@ async function wrappedCompletionsCreate(
   params: Record<string, unknown>,
   options: unknown,
   nativeChatCompletionsStream: boolean,
+  backendId?: string,
 ): Promise<unknown> {
   {
     const relaxed = relaxRequestForCompatBackend(params) as Record<string, unknown>;
+    requestIdentities.set(relaxed, Object.freeze({
+      ...(typeof relaxed.model === 'string' ? { requestModel: relaxed.model } : {}),
+      ...(backendId ? { backendId } : {}),
+    }));
     const structured = downgradedBodies.has(relaxed as object);
 
     if (relaxed.stream === true) {
@@ -822,7 +836,7 @@ async function wrappedCompletionsCreate(
         const stream = await original({ ...relaxed, stream_options: { ...streamOptions, include_usage: true } }, options);
         return liftReasoningStream(stream, (usageChunk) => recordByoUsage(
           usageChunk, relaxed.model, harnessContext, streamStartedAt,
-          { reasoningEffort: relaxed.reasoning_effort, firstTokenAt: first.at },
+          { reasoningEffort: relaxed.reasoning_effort, firstTokenAt: first.at, identity: requestIdentities.get(relaxed) },
         ), () => { first.at ??= Date.now(); });
       }
       // Reply text needs no repair, so it streams even where the rest of the
@@ -835,7 +849,7 @@ async function wrappedCompletionsCreate(
     const completion = (await original(relaxed, options)) as CompatCompletion;
     liftReasoning(completion);
     promoteReasoningFinal(completion);
-    recordByoUsage(completion, relaxed.model, undefined, plainStartedAt, { reasoningEffort: relaxed.reasoning_effort });
+    recordByoUsage(completion, relaxed.model, undefined, plainStartedAt, { reasoningEffort: relaxed.reasoning_effort, identity: requestIdentities.get(relaxed) });
     const msg = completion?.choices?.[0]?.message;
     if (Array.isArray(msg?.tool_calls) && msg!.tool_calls!.length > 0) {
       repairToolCallArguments(completion, relaxed.tools);
@@ -888,7 +902,7 @@ async function finishedCompletionStream(
 ): Promise<AsyncGenerator<unknown>> {
   liftReasoning(completion);
   promoteReasoningFinal(completion);
-  recordByoUsage(completion, relaxed.model, undefined, startedAt, { reasoningEffort: relaxed.reasoning_effort });
+  recordByoUsage(completion, relaxed.model, undefined, startedAt, { reasoningEffort: relaxed.reasoning_effort, identity: requestIdentities.get(relaxed) });
   const msg = completion?.choices?.[0]?.message;
   if (isToolOrEmpty(msg)) {
     repairToolCallArguments(completion, relaxed.tools);
@@ -999,7 +1013,7 @@ async function* replyTextStream(
   const completion = streamed.completion();
   liftReasoning(completion);
   promoteReasoningFinal(completion);
-  recordByoUsage(completion, relaxed.model, harnessContext, owner.startedAt, { reasoningEffort: relaxed.reasoning_effort });
+  recordByoUsage(completion, relaxed.model, harnessContext, owner.startedAt, { reasoningEffort: relaxed.reasoning_effort, identity: requestIdentities.get(relaxed) });
   const msg = completion.choices?.[0]?.message;
   if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) repairToolCallArguments(completion, relaxed.tools);
   const content = typeof msg?.content === 'string' ? msg.content : '';
@@ -1176,7 +1190,7 @@ function recordByoUsage(
   fallbackModel?: unknown,
   context: ReturnType<typeof harnessRunContextStorage.getStore> = harnessRunContextStorage.getStore(),
   startedAt?: number,
-  wire?: { reasoningEffort?: unknown; firstTokenAt?: number },
+  wire?: { reasoningEffort?: unknown; firstTokenAt?: number; identity?: Readonly<ByoRequestIdentity> },
 ): void {
   try {
     const u = (completion as { usage?: Record<string, unknown> })?.usage;
@@ -1197,6 +1211,9 @@ function recordByoUsage(
       sourceUserSeq: harnessContext?.sourceUserSeq,
       attemptId: harnessContext?.runAttemptId,
       model: (completion as { model?: string })?.model || (typeof fallbackModel === 'string' ? fallbackModel : 'byo'),
+      requestModel: wire?.identity?.requestModel,
+      backendId: wire?.identity?.backendId,
+      providerReportedModel: typeof completion?.model === 'string' && completion.model ? completion.model : undefined,
       cacheDialect: 'inclusive', // OpenAI-compatible wire: prompt/input ⊇ cached
       inputTokens,
       cachedInputTokens: cached,
@@ -1231,8 +1248,10 @@ function clientKey(byo: ByoBackendConfig): string {
   // A rotation with the same suffix is a different credential. Keep the full
   // digest private to this in-memory cache; never log it or persist the key.
   // Static and refreshable auth must not inherit each other's cached client.
+  // Nor may two configured backends sharing endpoint/credential inherit the
+  // first backend's provenance (or its provider-specific request behavior).
   const credentialDigest = createHash('sha256').update(byo.apiKey, 'utf8').digest('hex');
-  return `${byo.baseURL}::${credentialDigest}::${byo.refreshBearer ? 'refreshable' : 'static'}`;
+  return JSON.stringify([byo.baseURL, credentialDigest, byo.refreshBearer ? 'refreshable' : 'static', byo.providerId ?? null]);
 }
 
 const CREDIT_BODY_READ_MAX = 4_000;
@@ -1308,6 +1327,7 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   // Shadow the prototype method on this instance: relax the request + repair
   // structured JSON responses. The SDK calls client.chat.completions.create.
   (completions as unknown as { create: CreateFn }).create = wrapCompletionsCreate(original, {
+    backendId: byo.providerId,
     nativeChatCompletionsStream: byoBackendStreamsChatCompletions(byo),
     promptLayout: { baseURL: byo.baseURL },
   });

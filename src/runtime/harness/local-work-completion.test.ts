@@ -326,3 +326,15 @@ test('local continuation preserves preset and cap guards and only new item recei
     else process.env.CLEMMY_CHAT_AUTO_CONTINUE_CAP = previousCap;
   }
 });
+
+
+test('worker prose success cannot discharge rejected evidence or a pending effect reconciliation', () => {
+  for (const rejection of [{ backedByWork: false }, { retryRequiresReconciliation: true }]) {
+    const identity = fixture();
+    const packet = JSON.parse(CAPTURED_ARGUMENTS);
+    for (const item of workerCallItems(packet)!) events.appendEvent({ ...identity, role: 'system', type: 'worker_result', data: {
+      item, ok: true, ...rejection, packetKey: workerPacketKey({ ...packet, item }), toolCallId: CALL_ID,
+    } });
+    assert.equal(publish(identity, 'Worker replies all say done.').presentation.status, 'blocked');
+  }
+});

@@ -300,7 +300,7 @@ export interface PromptLayoutProbeInput {
   /** The provider's unwrapped chat-completions create. */
   create: CreateFn;
   /** Every probe response, so its spend is recorded like any other call. */
-  onUsage?: (completion: unknown, startedAt: number) => void;
+  onUsage?: (completion: unknown, startedAt: number, requestModel?: string) => void;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 }
@@ -311,8 +311,9 @@ export async function measurePromptLayout(input: PromptLayoutProbeInput): Promis
   const rounds: PromptLayoutRound[] = [];
   const send = async (body: Record<string, unknown>): Promise<{ prompt: number; cached: number }> => {
     const startedAt = now();
+    const requestModel = typeof body.model === 'string' ? body.model : undefined;
     const completion = await input.create(body);
-    input.onUsage?.(completion, startedAt);
+    input.onUsage?.(completion, startedAt, requestModel);
     await sleep(PROBE_SPACING_MS);
     return usageOf(completion);
   };

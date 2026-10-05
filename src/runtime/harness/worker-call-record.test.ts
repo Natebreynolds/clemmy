@@ -11,7 +11,7 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-worker-ca
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
 const { appendEvent, createSession } = await import('./eventlog.js');
-const { workerCallRecord, workerScopeCallRecord, renderWorkerCallRecord } = await import('./worker-call-record.js');
+const { workerCallRecord, workerScopeCallRecord, renderWorkerCallRecord, qualifyWorkerOutput } = await import('./worker-call-record.js');
 
 test('the host record says which business calls ran, failed or never reached the provider', () => {
   const session = createSession({ kind: 'agent', title: 'record fixture' });
@@ -36,7 +36,31 @@ test('the host record says which business calls ran, failed or never reached the
   const text = renderWorkerCallRecord(record);
   assert.match(text, /written by Clementine, not the worker/);
   assert.match(text, /fixture__api_request: 0 succeeded; 1 failed; 2 refused before dispatch — no request reached the provider/);
-  assert.match(text, /the record is right: rerun the item/);
+  assert.match(text, /Preserve completed actions and repair only the missing work/);
+  assert.match(qualifyWorkerOutput('The research is complete; report saved.', record), /^PARTIAL:.*fixture__api_request/);
+  assert.equal(record.effectsMayHaveRun, true, 'saving a failure file is still an effect that must not repeat');
+});
+
+test('an unsuccessful read needs requirement-bound recovery; output saves and same-tool siblings are insufficient', () => {
+  const session = createSession({ kind: 'agent', title: 'qualified output' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Read the exact record.' } });
+  const settle = (tool: string, kind: string, mutating: boolean) => appendEvent({ sessionId: session.id, turn: 1, role: 'system',
+    type: 'tool_attempt_settled', data: { sourceUserSeq: source.seq, tool, kind, businessCall: true, mutating, dispatchState: 'dispatched' } });
+  const plain = 'A complete account.';
+  assert.equal(qualifyWorkerOutput(plain, workerCallRecord(session.id, source.seq)), plain);
+  settle('fixture__read', 'failed', false);
+  let record = workerCallRecord(session.id, source.seq);
+  assert.equal(record.effectsMayHaveRun, false, 'a failed read may be retried');
+  assert.match(qualifyWorkerOutput(plain, record), /^PARTIAL:/);
+  settle('write_file', 'succeeded', true);
+  record = workerCallRecord(session.id, source.seq);
+  assert.match(qualifyWorkerOutput(plain, record), /^PARTIAL:/);
+  assert.equal(record.effectsMayHaveRun, true);
+  settle('fixture__read', 'succeeded', false);
+  record = workerCallRecord(session.id, source.seq);
+  assert.match(qualifyWorkerOutput(plain, record), /^PARTIAL:/, 'the same tool name does not establish the same target or requirement');
+  assert.equal(qualifyWorkerOutput(plain, { ...record, requiredWork: 'satisfied' }), plain);
+  assert.match(qualifyWorkerOutput(plain, undefined), /^PARTIAL:.*record is unavailable/);
 });
 
 test('a worker that ran no business tool is recorded as such', () => {
@@ -61,4 +85,34 @@ test('an agent-SDK worker gets the same record from its scoped calls in the pare
   assert.deepEqual(record.byTool, { fixture__api_request: { succeeded: 0, failed: 1, refusedBeforeDispatch: 0 } });
   assert.equal(record.businessCallSucceeded, false);
   assert.equal(record.businessCallAttempted, true, 'tried business work that never succeeded');
+});
+
+
+test('a discharged requirement permits alternate-tool recovery; an unmet requirement stays partial without failures', () => {
+  const byTool = { fixture__old_read: { succeeded: 0, failed: 1, refusedBeforeDispatch: 0 },
+    fixture__replacement: { succeeded: 1, failed: 0, refusedBeforeDispatch: 0 } };
+  const record = { byTool, businessCallSucceeded: true, businessCallAttempted: true };
+  assert.equal(qualifyWorkerOutput('The requested evidence is complete.', { ...record, requiredWork: 'satisfied' }), 'The requested evidence is complete.');
+  assert.match(qualifyWorkerOutput('Recovered via another reader.', { ...record, successfulRead: true }), /^PARTIAL:.*requirement-bound recovery/);
+  assert.match(qualifyWorkerOutput('Done.', { ...record, byTool: {}, requiredWork: 'pending' }), /^PARTIAL:.*requirements/);
+});
+
+test('a missing required source stays partial when sibling reads and a directory listing succeed', () => {
+  const record = { byTool: {
+    read_file: { succeeded: 3, failed: 1, refusedBeforeDispatch: 0 },
+    list_files: { succeeded: 1, failed: 0, refusedBeforeDispatch: 0 },
+  }, businessCallSucceeded: true, businessCallAttempted: true, successfulRead: true };
+  const reply = '**Coverage: partial, 3 of 4 files read.** The fourth source is unavailable.';
+  assert.match(qualifyWorkerOutput(reply, record), /^PARTIAL:.*requirement-bound recovery/);
+  assert.ok(qualifyWorkerOutput(reply, record).endsWith(reply), 'keep useful evidence for the parent');
+  assert.equal(qualifyWorkerOutput('All four requirements now have evidence.', { ...record, requiredWork: 'satisfied' }),
+    'All four requirements now have evidence.', 'actual discharged requirements permit recovery, not successful-call counts');
+});
+
+test('successful sibling work cannot erase a refused call without a discharged requirement', () => {
+  const record = { byTool: { reader: { succeeded: 1, failed: 0, refusedBeforeDispatch: 1 } },
+    businessCallSucceeded: true, businessCallAttempted: true, successfulRead: true };
+  assert.match(qualifyWorkerOutput('Some work completed.', record), /^PARTIAL:/);
+  assert.equal(qualifyWorkerOutput('Read succeeded.', { ...record, byTool: { reader: { succeeded: 1, failed: 0, refusedBeforeDispatch: 0 } } }),
+    'Read succeeded.');
 });

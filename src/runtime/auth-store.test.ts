@@ -28,6 +28,8 @@ const {
   classifyCodexAuthError,
   isCodexAuthDead,
   clearCodexAuthDead,
+  clearImportedAuth,
+  markCodexAuthDead,
   accessTokenExpiresSoon,
   accessTokenExpMs,
   assertCodexAccessTokenCanCoverCall,
@@ -377,3 +379,81 @@ test('importing Codex CLI auth preserves a connected xAI grant', async () => {
   assert.equal(storedRefreshToken(), 'RT_cli_import');
   assert.ok(getStoredXaiOAuthTokens(), 'the xAI grant survives the CLI import');
 });
+
+
+// Refresh completion belongs to the exact credential snapshot that started it.
+// These barriers let a login/clear win while the fake provider is still pending.
+function deferredRefresh<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+for (const change of ['replace', 'clear', 'same-refresh-token-new-access'] as const) {
+  for (const outcome of ['success', 'terminal', 'transient'] as const) {
+    test(`Codex supersession: ${change} wins over a delayed ${outcome} refresh`, async () => {
+      writeStoredAuth(tenMinAgo());
+      const entered = deferredRefresh<void>();
+      const provider = deferredRefresh<{ accessToken: string; refreshToken: string; idToken: string; accountId: string; lastRefresh: string }>();
+      __setRefreshTokenImplForTests(async () => { entered.resolve(); return provider.promise; });
+      const pending = refreshStoredNativeOAuth({ force: true });
+      await entered.promise;
+      if (change === 'replace') writeNativeVault('replacement-fixture');
+      else if (change === 'same-refresh-token-new-access') writeNativeVault('RT1');
+      else clearImportedAuth();
+      const expectedBytes = existsSync(AUTH_FILE) ? readFileSync(AUTH_FILE, 'utf8') : null;
+      if (outcome === 'success') provider.resolve({ accessToken: 'old-result-fixture', refreshToken: 'old-rotation-fixture', idToken: 'old-id-fixture', accountId: 'old-account-fixture', lastRefresh: new Date().toISOString() });
+      else provider.reject(Object.assign(new Error(outcome === 'terminal' ? 'invalid_grant' : 'temporary provider failure'), { status: outcome === 'terminal' ? 401 : 503 }));
+      const result = await pending;
+      assert.equal(existsSync(AUTH_FILE) ? readFileSync(AUTH_FILE, 'utf8') === expectedBytes : expectedBytes === null, true, 'the replacement/clear must remain intact');
+      assert.equal(result.ok, change !== 'clear', 'only a still-present replacement can be reused');
+      assert.notEqual(result.terminal, true, 'an obsolete refresh must not mark the current grant terminal');
+      assert.equal(isCodexAuthDead(), false, 'no stale dead latch');
+      assert.equal(existsSync(LOCK_FILE), false, 'the refresh lock is released');
+    });
+  }
+}
+
+test('Codex supersession: old successful refresh preserves a newer grant dead latch and sibling state', async () => {
+  writeStoredAuth(tenMinAgo());
+  const entered = deferredRefresh<void>();
+  const provider = deferredRefresh<{ accessToken: string; refreshToken: string; idToken: string; accountId: string; lastRefresh: string }>();
+  __setRefreshTokenImplForTests(async () => { entered.resolve(); return provider.promise; });
+  const pending = refreshStoredNativeOAuth({ force: true });
+  await entered.promise;
+  writeNativeVault('replacement-fixture');
+  const { saveXaiOAuthTokens } = await import('./auth-store.js');
+  saveXaiOAuthTokens({ accessToken: 'sibling-access-fixture', refreshToken: 'sibling-refresh-fixture' });
+  markCodexAuthDead('replacement rejected');
+  const expectedBytes = readFileSync(AUTH_FILE, 'utf8');
+  provider.resolve({ accessToken: 'old-result-fixture', refreshToken: 'old-rotation-fixture', idToken: 'old-id-fixture', accountId: 'old-account-fixture', lastRefresh: new Date().toISOString() });
+  const result = await pending;
+  assert.equal(readFileSync(AUTH_FILE, 'utf8') === expectedBytes, true, 'all replacement and sibling bytes survive');
+  assert.equal(isCodexAuthDead(), true, 'old success cannot heal a newer rejected grant');
+  assert.equal(result.ok, false);
+  assert.equal(result.terminal, true, 'current rejection remains authoritative');
+});
+
+
+for (const outcome of ['success', 'terminal', 'transient'] as const) {
+  test(`Codex supersession: a newer DEAD latch for unchanged credentials defeats delayed ${outcome}`, async () => {
+    writeStoredAuth(tenMinAgo());
+    const entered = deferredRefresh<void>();
+    const provider = deferredRefresh<{ accessToken: string; refreshToken: string; idToken: string; accountId: string; lastRefresh: string }>();
+    __setRefreshTokenImplForTests(async () => { entered.resolve(); return provider.promise; });
+    const pending = refreshStoredNativeOAuth({ force: true });
+    await entered.promise;
+    const expectedBytes = readFileSync(AUTH_FILE, 'utf8');
+    markCodexAuthDead('current grant rejected while refresh pending');
+    const expectedDeadBytes = readFileSync(DEAD_FILE, 'utf8');
+    if (outcome === 'success') provider.resolve({ accessToken: 'old-result-fixture', refreshToken: 'old-rotation-fixture', idToken: 'old-id-fixture', accountId: 'old-account-fixture', lastRefresh: new Date().toISOString() });
+    else provider.reject(Object.assign(new Error(outcome === 'terminal' ? 'invalid_grant' : 'temporary provider failure'), { status: outcome === 'terminal' ? 401 : 503 }));
+    const result = await pending;
+    assert.equal(readFileSync(AUTH_FILE, 'utf8') === expectedBytes, true, 'newer rejection blocks obsolete healing');
+    assert.equal(isCodexAuthDead(), true);
+    assert.equal(readFileSync(DEAD_FILE, 'utf8') === expectedDeadBytes, true, 'the newer terminal reason remains unchanged');
+    assert.equal(result.ok, false);
+    assert.equal(result.terminal, true);
+  });
+}

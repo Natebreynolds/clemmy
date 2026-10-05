@@ -33,6 +33,7 @@ globalThis.fetch = async () => { throw new Error('Connection closure fixtures mu
 
 const log = await import('./eventlog.js');
 const { applyHarnessMigrations } = await import('./eventlog-schema.js');
+const { restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
 const plans = await import('./plan-artifacts.js');
 const publisher = await import('../../tools/publish-plan.js');
 const semantic = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
@@ -300,6 +301,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   // The meter already observed this source. Rehearsing an older table
   // migration must not pretend the independent usage meter was installed now.
   const meterInstalledAt = db.prepare('SELECT applied_at FROM schema_version WHERE version = 84').get()!.applied_at;
+  restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture(db);
   db.pragma('foreign_keys = OFF');
   try {
     db.transaction(() => {

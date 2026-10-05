@@ -78,6 +78,8 @@ export type WorkerModelDecision =
       /** One line for the brain when the helper's model differs from the packet's. */
       hostNote?: string;
       offer?: WorkerModelOffer;
+      /** A saved owner pin or a checked per-request override must survive dispatch. */
+      exactModel?: boolean;
     };
 
 export interface WorkerModelRouteInput {
@@ -151,7 +153,7 @@ function productionRequestText(sessionId: string, sourceUserSeq: number): string
   try {
     const source = listEvents(sessionId, {
       sinceSeq: sourceUserSeq - 1, types: ['user_input_received'], limit: 1,
-    }).find((event) => event.seq === sourceUserSeq);
+    }).find((event) => event.seq === sourceUserSeq && event.role === 'user');
     const text = (source?.data as { text?: unknown } | undefined)?.text;
     return typeof text === 'string' ? text : '';
   } catch {
@@ -204,7 +206,8 @@ function listForRefusal(catalog: readonly WorkerModelOption[]): string {
 export async function routeWorkerModel(input: WorkerModelRouteInput): Promise<WorkerModelDecision> {
   const item = input.item ?? '';
   const intent = input.intent?.trim() ?? '';
-  const requested = input.model?.trim() ?? '';
+  const pinned = input.ownerPinnedModel?.trim() ?? '';
+  const requested = input.model?.trim() || pinned;
   const sessionId = input.sessionId?.trim() || undefined;
   let def: ReturnType<WorkerRouteDeps['defaultWorker']>;
   try {
@@ -233,6 +236,10 @@ export async function routeWorkerModel(input: WorkerModelRouteInput): Promise<Wo
 
   try {
     const catalog = deps.catalog();
+    const pinnedChoice = pinned ? exactCatalogMatch(catalog, pinned) : undefined;
+    if (pinned && !pinnedChoice) {
+      return { kind: 'refuse', reason: `The saved agent's model "${pinned}" is not connected. No substitute was started.`, shapes: ['model:pinned_unavailable'] };
+    }
     const routingOn = deps.intentRoutingEnabled();
     const rules = routingOn ? deps.intentRules() : [];
     const intentSlug = intent ? slugifyIntent(intent) : '';
@@ -248,11 +255,11 @@ export async function routeWorkerModel(input: WorkerModelRouteInput): Promise<Wo
     let resolved = requested ? exactCatalogMatch(catalog, requested) : undefined;
     let brainId = '';
     try { brainId = deps.brainModelId(); } catch { brainId = ''; }
-    const pinned = input.ownerPinnedModel?.trim() ?? '';
-    const pinnedId = pinned ? (exactCatalogMatch(catalog, pinned)?.id ?? pinned) : '';
+    const pinnedId = pinnedChoice?.id ?? '';
     const ownerChosen = new Set([brainId, def.modelId, pinnedId, ...rules.map((rule) => rule.modelId)].filter(Boolean));
     const needWhich = Boolean(requested && !resolved);
-    const needAsked = Boolean(requested && (needWhich || (resolved && !ownerChosen.has(resolved.id))));
+    let overridesPin = Boolean(pinnedId && resolved?.id !== pinnedId);
+    const needAsked = Boolean(requested && (needWhich || overridesPin || (resolved && !ownerChosen.has(resolved.id))));
     const ruleCandidates = !exactRule && rules.length > 0 ? rules.slice(0, WORKER_RULE_WINDOW) : [];
     const shownCatalog = catalog.slice(0, WORKER_CATALOG_WINDOW);
 
@@ -301,10 +308,14 @@ export async function routeWorkerModel(input: WorkerModelRouteInput): Promise<Wo
 
     let answers: Record<string, unknown> | null = null;
     let decisionId: string | undefined;
+    let acceptedRequestAvailable = false;
     if (Object.keys(questions).length > 0) {
-      const text = sessionId && input.sourceUserSeq
-        ? (input.requestText ?? deps.requestText(sessionId, input.sourceUserSeq))
-        : (input.requestText ?? '');
+      const acceptedText = sessionId && Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
+        ? deps.requestText(sessionId, input.sourceUserSeq!) : '';
+      acceptedRequestAvailable = Boolean(acceptedText.trim());
+      // A packet or caller-provided paraphrase cannot establish permission to
+      // replace an owner's saved specialist pin.
+      const text = pinned ? acceptedText : input.requestText ?? acceptedText;
       const result = await deps.ask({
         state: {
           request: text.replace(/\s+/g, ' ').trim().slice(0, 3_000),
@@ -348,9 +359,10 @@ export async function routeWorkerModel(input: WorkerModelRouteInput): Promise<Wo
     }
 
     let askCheck: WorkerAskCheck = 'not_needed';
+    overridesPin = Boolean(pinnedId && resolved?.id !== pinnedId);
     let gatedNote: string | undefined;
     if (requested && resolved) {
-      if (ownerChosen.has(resolved.id)) {
+      if (ownerChosen.has(resolved.id) && !overridesPin) {
         askCheck = 'not_needed';
       } else if (!answers) {
         // A check that could not run is not a "no": the brain's pick stands
@@ -359,6 +371,12 @@ export async function routeWorkerModel(input: WorkerModelRouteInput): Promise<Wo
       } else {
         const asked = (answers.asked as NoulAnswer | undefined)?.noul;
         askCheck = typeof asked === 'number' && asked >= WORKER_MODEL_ASKED_SURE ? 'asked' : 'not_asked';
+      }
+      if (pinnedId && overridesPin && !acceptedRequestAvailable) askCheck = 'unavailable';
+      if (pinnedId && overridesPin && askCheck !== 'asked') {
+        return finish({ kind: 'route', model: pinnedId, provider: deps.providerFor(pinnedId), exactModel: true,
+          trace: baseTrace(pinnedId, deps.providerFor(pinnedId), 'agent', { askCheck }),
+          hostNote: `The saved agent stays on ${pinnedId}; the accepted request did not establish a different model choice.` }, 'agent');
       }
       if (askCheck !== 'not_asked') {
         const provider = deps.providerFor(resolved.id);
@@ -371,6 +389,7 @@ export async function routeWorkerModel(input: WorkerModelRouteInput): Promise<Wo
           model: resolved.id,
           provider,
           trace: baseTrace(resolved.id, provider, 'packet', { decidedBy, askCheck }),
+          ...(pinnedId ? { exactModel: true } : {}),
           ...(decidedBy === 'jev' ? { hostNote: `Host routing: "${requested.slice(0, 80)}" is the connected model ${resolved.id}; the helper ran on it.` } : {}),
           ...(offer ? { offer } : {}),
         }, 'packet');
@@ -415,6 +434,7 @@ export async function routeWorkerModel(input: WorkerModelRouteInput): Promise<Wo
 
     return finish(defaultRoute({ askCheck }, withGate(labelFor(catalog, def.modelId))), 'default');
   } catch {
+    if (pinned) return { kind: 'refuse', reason: `The saved agent's model "${pinned}" could not be verified. No substitute was started.`, shapes: ['model:pinned_unavailable'] };
     return defaultRoute();
   }
 }

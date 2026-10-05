@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { foldTranscript } from './engine.js';
+import { ChatEngine, foldTranscript } from './engine.js';
 import { cardDecisionOf, hiddenCardDecision, type HarnessEvent } from './types.js';
 
 const event = (seq: number, type: string, data: Record<string, unknown> = {}): HarnessEvent => ({ seq, type, sessionId: 'chat', data });
@@ -23,7 +23,8 @@ test('a card tap is read only from the host record of the message', () => {
 
 test('a card tap and its reply stay out of the transcript, and the card reads as decided', () => {
   for (const decision of ['approve', 'reject'] as const) {
-    const rows = foldTranscript([card, tap(decision), reply('done')], 'chat');
+    const resolved = event(8, 'approval_resolved', { approvalId: 'apr-card', decision });
+    const rows = foldTranscript([card, tap(decision), reply('done'), resolved], 'chat');
     const shown = rows.filter((row) => !hiddenCardDecision(row));
     assert.equal(shown.length, 1, 'only the card itself remains');
     assert.equal(shown[0]!.approval?.resolution, decision === 'approve' ? 'approved' : 'declined');
@@ -35,4 +36,44 @@ test('a tap whose decision failed to land stays visible', () => {
   const failed = rows.find((row) => row.role === 'assistant' && row.cardDecision);
   assert.ok(failed);
   assert.equal(hiddenCardDecision(failed!), false);
+  assert.equal(rows.find((row) => row.approval)?.approval?.resolution, undefined, 'the failed decision leaves the card actionable');
+});
+
+
+test('a request or successful turn without resolution evidence never decides the card', () => {
+  for (const suffix of [[], [reply('done')]]) {
+    const rows = foldTranscript([card, tap('approve'), ...suffix], 'chat');
+    assert.equal(rows.find((row) => row.approval)?.approval?.resolution, undefined);
+  }
+});
+
+test('a decision recorded before a later run failure stays decided', () => {
+  const rows = foldTranscript([card, tap('approve'),
+    event(7, 'approval_resolved', { approvalId: 'apr-card', decision: 'approve' }), reply('failed')], 'chat');
+  assert.equal(rows.find((row) => row.approval)?.approval?.resolution, 'approved');
+});
+
+test('an offline tap and discarding its failed echo retain the actionable card', async () => {
+  const calls: string[] = [];
+  const engine = new ChatEngine({
+    sessionId: 'chat',
+    api: {
+      loadSession: async () => ({ events: [card], latestSeq: 5 }),
+      send: async (input) => { calls.push(input.idempotencyKey); throw new Error('offline'); },
+    },
+    transport: { connect: async () => ({ close() {} }), fetchRecent: async () => ({ events: [] }) },
+  });
+  try {
+    await engine.open();
+    const sending = engine.send('Approve apr-card', undefined, { cardDecision: { approvalId: 'apr-card', decision: 'approve' } });
+    assert.equal(engine.snapshot().messages.find((row) => row.approval)?.approval?.resolution, undefined);
+    await sending;
+    const failed = engine.snapshot().messages.find((row) => row.pending === 'failed');
+    assert.ok(failed);
+    assert.equal(hiddenCardDecision(failed!), false);
+    assert.equal(calls.length, 4);
+    assert.equal(new Set(calls).size, 1, 'every attempt keeps its exact request identity');
+    engine.discard(failed!.id);
+    assert.equal(engine.snapshot().messages.find((row) => row.approval)?.approval?.resolution, undefined);
+  } finally { engine.dispose(); }
 });

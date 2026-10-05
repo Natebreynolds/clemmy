@@ -1,3 +1,4 @@
+import { MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS, parseMemoryRequirementPacket, type MemoryRequirementAssessmentV1 } from './memory-completion-obligation.js';
 import type { ResolvedRoleModel } from './model-roles.js';
 import { classifyModelError } from './resilient-model.js';
 import { READ_SCOPE_EVIDENCE_RUBRIC } from '../../agents/clem-rubric.js';
@@ -106,6 +107,8 @@ export const JUDGE_SYSTEM_PROMPT = [
  */
 
 export interface ObjectiveJudgeVerdict {
+  /** Semantic obligation only; the host separately verifies correction effects. */
+  memoryRequirement?: MemoryRequirementAssessmentV1;
   done: boolean;
   reason: string;
   repairScope?: 'reply_format' | 'claims';
@@ -555,6 +558,8 @@ export function composeJudgedObjective(input: string, priorUserMessages: string[
 /** Retained framework references plus execution evidence. The effective
  * accepted objective governs which requirements apply; loading adds no work. */
 export interface SkillExecutionContext {
+  /** Exact-source memory branch. Missing typed output cannot qualify its completion. */
+  memoryRequirementContext?: string;
   skills: SessionSkill[];
   toolCallSummary: string;
   /** Accepted chat session, used to attribute a Jev fast-path verdict. */
@@ -1113,7 +1118,7 @@ interface CompletionJudgeRun {
   reviewDepth?: 'full' | 'fast';
   reviewConfirmation?: 'upheld' | 'overruled' | 'unavailable';
   /** Parsed verdict from the first attempt to answer, or null. */
-  verdict: { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean; repairScope?: 'reply_format' | 'claims' } | null;
+  verdict: { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean; repairScope?: 'reply_format' | 'claims'; memoryRequirement?: MemoryRequirementAssessmentV1 } | null;
   /** null-verdict cause for metrics/fail semantics: pure deadline miss vs
    *  parse failure vs transport error. */
   failure: 'timeout' | 'invalid' | 'error' | null;
@@ -1354,20 +1359,25 @@ async function runCompletionJudge(
   skillContext?: SkillExecutionContext,
   judge: { lane?: JudgeMetricLane; timeoutMs?: number } = {},
 ): Promise<CompletionJudgeRun> {
-  const prompt = buildObjectiveJudgePrompt(objective, assistantResponse, skillContext);
+  const basePrompt = buildObjectiveJudgePrompt(objective, assistantResponse, skillContext);
+  const prompt = skillContext?.memoryRequirementContext
+    ? `${basePrompt}\n\n${skillContext.memoryRequirementContext}\n\n${MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS}` : basePrompt;
   const checksCoverage = coverageReviewed(skillContext);
   const results = skillContext?.verifiedReadResults ?? [];
   // What the verdict rests on is read from the same output the verdict line
   // is, so the two can never come from different answers.
-  type Parsed = NonNullable<ReturnType<typeof parseCompletionVerdict>> & { needsAllOf?: string[] | null };
+  type Parsed = NonNullable<ReturnType<typeof parseCompletionVerdict>> & { needsAllOf?: string[] | null; memoryRequirement?: MemoryRequirementAssessmentV1 };
   const parse = (output: unknown): Parsed | null => {
     const verdict = parseCompletionVerdict(output);
-    return verdict && checksCoverage ? { ...verdict, needsAllOf: parseNeedsAllOf(output) } : verdict;
+    if (!verdict) return null;
+    const memoryRequirement = skillContext?.memoryRequirementContext ? parseMemoryRequirementPacket(output) : null;
+    return { ...verdict, ...(checksCoverage ? { needsAllOf: parseNeedsAllOf(output) } : {}),
+      ...(memoryRequirement ? { memoryRequirement } : {}) };
   };
   const hedged = (reviewPrompt: string, depth: ReviewDepthRequest) => {
     const timeoutMs = judge.timeoutMs ?? depth.timeoutMs;
     return runHedgedJudge(
-      JUDGE_SYSTEM_PROMPT,
+      skillContext?.memoryRequirementContext ? `${JUDGE_SYSTEM_PROMPT}\n\n${MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS}` : JUDGE_SYSTEM_PROMPT,
       reviewPrompt,
       parse,
       (v) => v.done,
@@ -1419,7 +1429,8 @@ async function runCompletionJudge(
     // full: the acceptance does not stand. The assistant can read every record
     // or say what it checked; both are one revision away.
     if (assessment.status === 'insufficient') {
-      run.verdict = { done: false, repairScope: 'claims', reason: reviewCoverageFinding(assessment).slice(0, VERDICT_REASON_MAX_CHARS) };
+      run.verdict = { done: false, repairScope: 'claims', reason: reviewCoverageFinding(assessment).slice(0, VERDICT_REASON_MAX_CHARS),
+        ...(run.verdict?.memoryRequirement ? { memoryRequirement: run.verdict.memoryRequirement } : {}) };
       return { ...run, evidenceCoverage: { ...coverageRecord(assessment, lookups, followUp), returnedForCorrection: true } };
     }
     return { ...run, evidenceCoverage: coverageRecord(assessment, lookups, followUp) };
@@ -1728,7 +1739,8 @@ export async function judgeObjectiveComplete(
   // Work that wrote to an app or file is closed only by the configured
   // reviewer: that review is the check that what was written is right.
   const reviewsWrite = skillContext?.reviewStakes === 'write';
-  if (!reviewsPlan && !reviewsWrite && (coverage.complete || directionQuestion)) {
+  const reviewsMemory = Boolean(skillContext?.memoryRequirementContext);
+  if (!reviewsPlan && !reviewsWrite && !reviewsMemory && (coverage.complete || directionQuestion)) {
     const jevPromise = askJev(true);
     const hedge = setTimeout(startJudge, JEV_HEDGE_DELAY_MS);
     hedge.unref?.();
@@ -1773,7 +1785,7 @@ export async function judgeObjectiveComplete(
     // One direction only: a Jev DONE still fails open below, because "the
     // reviewer was unreachable" must never be delivered as "this was reviewed".
     // failedOpen stays set, so nothing downstream claims a completed review.
-    if (!jevSaid && !reviewsPlan) {
+    if (!jevSaid && !reviewsPlan && !reviewsMemory) {
       const late = await askJev();
       if (late) noteJev(late, false);
     }
@@ -1805,6 +1817,7 @@ export async function judgeObjectiveComplete(
   return {
     done: run.verdict.done,
     reason: run.verdict.reason,
+    ...(run.verdict.memoryRequirement ? { memoryRequirement: run.verdict.memoryRequirement } : {}),
     ...(jevAttempt ? { jevAttempt } : {}),
     ...(run.verdict.repairScope ? { repairScope: run.verdict.repairScope } : {}),
     selfJudge: run.routing?.selfJudge === true,

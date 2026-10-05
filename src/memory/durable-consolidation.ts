@@ -1,17 +1,21 @@
 import { createHash } from 'node:crypto';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { modelUsageAttributionStorage, withModelUsageAttribution, type ModelUsageAttributionContext } from '../runtime/usage-log.js';
-import { openMemoryDb, type ConsolidatedFactKind } from './db.js';
+import { openMemoryDb, type ConsolidatedFactKind, type MemoryEpisodeRow } from './db.js';
 import { consolidateFact, type ConsolidateOptions } from './reflection.js';
 import {
   recordReflectionCandidate,
-  resolveReflectionCandidateById,
+  recordAutomaticMemoryCandidates, readAutomaticMemoryCandidate,
+  commitAutomaticMemoryDecision, readOwnedAutomaticMemoryDecision,
 } from './reflection-candidates.js';
 import { recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
-import { EVERYWHERE, memoryScopeOf, type MemoryScope } from './memory-scope.js';
+import { EVERYWHERE, isEverywhere, memoryScopeOf, sameScope, stampMemoryScope, withMemorySettledFor } from './memory-scope.js';
+import { automaticMemoryDecisionDigest, resolveAutomaticMemoryDestination, type AutomaticMemoryOrigin } from './memory-destination.js';
+import { saveUserProfile } from '../runtime/user-profile.js';
+import { getFact } from './facts.js';
 import { attachGroundedUserPeople, attachGroundedUserProjects } from './grounded-user-entities.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
-import { explicitMemoryNeedsScopeReview, reviewStandingMemory } from './standing-memory-review.js';
+import { reviewStandingMemory } from './standing-memory-review.js';
 
 const AUTO_CAPTURE_SOURCE = 'auto_capture' as const;
 const AUTO_CAPTURE_MAX_ATTEMPTS = 8;
@@ -22,35 +26,6 @@ const EXPLICIT_STABLE_CONTEXT_REASONS = new Set([
   'explicit remember request',
   'explicit durable correction',
 ]);
-
-/**
- * Intake reason for an owner message that the phrasing patterns in auto-capture
- * did not match. It carries no claim that the message IS durable — it says the
- * opposite: nothing has judged this yet, so route it to the model reviewer
- * below instead of promoting it.
- *
- * This exists because the patterns decided durability from ENGLISH SHAPE (a
- * first-person possessive plus a stative verb from a fixed list), so a
- * preference stated any other way was dropped as ephemeral and no path ever saw
- * it again. Widening the patterns has repeatedly cost recall elsewhere — the
- * battery already carries a guard added after "can I have the body of the
- * emails" was stored because "I have" matched. The reviewer answers 'task',
- * which drops the message exactly as today, or 'standing', which is currently
- * unreachable no matter how plainly the owner states a preference.
- */
-/**
- * What a memory settled later is kept for: what the conversation was working
- * in when it was said, which its episode recorded then. The conversation may
- * have moved to another project by the time this runs.
- */
-function learnedInScope(kind: ConsolidatedFactKind, episodeId: string | null | undefined): { scope?: MemoryScope } {
-  if (kind === 'user' || kind === 'constraint' || !episodeId) return {};
-  try {
-    return { scope: memoryScopeOf('episode', episodeId) ?? EVERYWHERE };
-  } catch {
-    return {};
-  }
-}
 
 export const UNJUDGED_OWNER_STATEMENT_REASON = 'owner statement — model decides durability';
 
@@ -71,6 +46,8 @@ export interface EnqueueAutoCaptureInput {
   sourceEventId?: string;
   occurredAt?: string;
   candidates: DurableAutoCaptureCandidate[];
+  /** Missing origins are legacy intake and may never authorize promotion. */
+  origins?: Array<AutomaticMemoryOrigin | null>;
 }
 
 export interface EnqueueAutoCaptureResult {
@@ -134,45 +111,68 @@ export function enqueueAutoCaptureCandidates(input: EnqueueAutoCaptureInput): En
 
   const db = openMemoryDb();
   const callId = autoCaptureCallId(input);
-  const occurredAt = input.occurredAt ?? new Date().toISOString();
+  const source = input.origins?.[0]?.source;
+  const sourceTime = source?.authority === 'accepted_user_input'
+    ? (openEventLog().prepare('SELECT created_at FROM events WHERE session_id = ? AND seq = ? AND id = ?')
+      .get(source.sessionId, source.eventSeq, source.eventId) as { created_at: string } | undefined)?.created_at : undefined;
+  if (sourceTime && input.occurredAt && input.occurredAt !== sourceTime) throw new Error('Automatic memory source time changed.');
+  const occurredAt = sourceTime ?? input.occurredAt ?? new Date().toISOString();
   const sourceUri = `conversation://${encodeURIComponent(input.sessionId)}/${encodeURIComponent(callId)}`;
   let episodeId = '';
   const candidateIds: number[] = [];
 
   const tx = db.transaction(() => {
-    const episode = recordMemoryEpisode({
-      kind: 'user_turn',
-      subtype: AUTO_CAPTURE_SOURCE,
-      title: 'User-stated durable memory candidates',
-      metadata: { candidateCount: input.candidates.length, sourceEventId: input.sourceEventId ?? null },
-      sourceApp: 'Conversation',
-      sessionId: input.sessionId,
-      callId,
-      sourceUri,
-      occurredAt,
-      content: message,
-      status: 'available',
+    const metadata = { candidateCount: input.candidates.length, sourceEventId: input.sourceEventId ?? null };
+    const excerpt = message.replace(/\s+/g, ' ').trim().slice(0, 2_000);
+    const expectedId = `call:${createHash('sha256').update(`${input.sessionId}:${callId}`).digest('hex').slice(0, 24)}`;
+    const prior = db.prepare('SELECT * FROM memory_episodes WHERE id = ?').get(expectedId) as MemoryEpisodeRow | undefined;
+    const retainedScope = source?.context?.memoryScope;
+    if (prior && (prior.kind !== 'user_turn' || prior.subtype !== AUTO_CAPTURE_SOURCE
+      || prior.session_id !== input.sessionId || prior.call_id !== callId || prior.source_app !== 'Conversation'
+      || prior.source_uri !== sourceUri || prior.title !== 'User-stated durable memory candidates'
+      || prior.status !== 'available' || prior.evidence_excerpt !== excerpt
+      || prior.content_hash !== createHash('sha256').update(excerpt).digest('hex')
+      || prior.metadata_json !== JSON.stringify(metadata)
+      || ((sourceTime || input.occurredAt) && prior.occurred_at !== occurredAt)
+      || (retainedScope && (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_scopes'").get()
+        || !sameScope(memoryScopeOf('episode', prior.id), retainedScope))))) {
+      throw new Error('Automatic memory episode conflicts with its frozen source.');
+    }
+    const createEpisode = () => recordMemoryEpisode({
+      kind: 'user_turn', subtype: AUTO_CAPTURE_SOURCE, title: 'User-stated durable memory candidates', metadata,
+      sourceApp: 'Conversation', sessionId: input.sessionId, callId, sourceUri, occurredAt,
+      content: message, status: 'available',
     });
+    // A replay never upserts the source episode, including its original scope,
+    // occurrence/ingestion timestamps and bounded (2,000 character) excerpt.
+    const episode = prior ?? (source ? withMemorySettledFor(retainedScope ?? EVERYWHERE, createEpisode) : createEpisode());
+    if (!prior && retainedScope) {
+      // Include global scope: this initializes the canonical scope store even
+      // in a new empty home and does not swallow a failed scope write.
+      stampMemoryScope('episode', episode.id, retainedScope, { sessionId: input.sessionId });
+      if (!sameScope(memoryScopeOf('episode', episode.id), retainedScope)) throw new Error('Automatic memory episode scope did not persist.');
+    }
     episodeId = episode.id;
-    for (const candidate of input.candidates) {
-      candidateIds.push(recordReflectionCandidate({
-        episodeId: episode.id,
-        sessionId: input.sessionId,
-        callId,
-        kind: candidate.kind,
-        text: candidate.content,
-        importance: candidate.importance ?? 5,
-        sourceType: AUTO_CAPTURE_SOURCE,
-        intakeReason: candidate.reason,
-        trustLevel: 1,
-        authority: 'user',
-        sourceUri,
-        pin: candidate.pin,
-        now: occurredAt,
-      }));
+    const entries = input.candidates.map(candidate => ({
+      episodeId: episode.id, sessionId: input.sessionId, callId,
+      kind: candidate.kind, text: candidate.content, importance: candidate.importance ?? 5,
+      intakeReason: candidate.reason, trustLevel: 1, sourceUri, pin: candidate.pin, now: occurredAt,
+    }));
+    if (input.origins) {
+      if (input.origins.length !== entries.length || input.origins.some(origin => origin === null)) {
+        throw new Error('Automatic memory intake has no exact origin for every candidate.');
+      }
+      candidateIds.push(...recordAutomaticMemoryCandidates(entries.map((entry, index) => ({
+        ...entry, origin: input.origins![index]!,
+      })), db));
+    } else {
+      // Preserve historical rows without retroactively granting new authority.
+      candidateIds.push(...entries.map(entry => recordReflectionCandidate({
+        ...entry, sourceType: AUTO_CAPTURE_SOURCE, authority: 'user',
+      })));
     }
   });
-  tx();
+  tx.immediate();
   return { episodeId, candidateIds, callId };
 }
 
@@ -230,6 +230,10 @@ function candidateUsageScope(row: PendingAutoCaptureRow): ModelUsageAttributionC
   };
 }
 
+class LostAutomaticMemoryOwnership extends Error {
+  constructor() { super('Automatic memory processing ownership changed.'); }
+}
+
 /** Process durable user-statement candidates. Claims are leased before any
  * model call, retried with bounded backoff, and resolved against the canonical
  * fact id. A failed immediate microtask therefore becomes visible queued work
@@ -271,111 +275,118 @@ export async function drainDurableConsolidationCandidates(options: {
     result.claimed += 1;
     const attempt = row.attempt_count + 1;
     const usageScope = candidateUsageScope(row);
+    const claim = { attemptCount: attempt, processingStartedAt: now };
+    const settle = (status: 'promoted' | 'rejected', reason: string, factId: number | null = null): boolean =>
+      Number(db.prepare(`UPDATE memory_reflection_candidates SET status = ?, reason = ?, resulting_fact_id = ?,
+        resolved_at = ?, processing_started_at = NULL, next_attempt_at = NULL
+        WHERE id = ? AND status = 'pending' AND attempt_count = ? AND processing_started_at = ?`)
+        .run(status, reason.slice(0, 240), factId, now, row.id, attempt, now).changes) === 1;
     try {
-      const sourceText = row.evidence_excerpt?.trim() ?? '';
-      if (!sourceText) throw new Error('durable source episode has no evidence excerpt');
-      let candidateText = row.text;
-      const explicitScopeReview = EXPLICIT_STABLE_CONTEXT_REASONS.has(row.intake_reason ?? '')
-        && explicitMemoryNeedsScopeReview(sourceText, row.text);
-      if (row.intake_reason === 'standing instruction (marker + concrete target)'
-        || row.intake_reason === 'project requirement signal'
-        || row.intake_reason === UNJUDGED_OWNER_STATEMENT_REASON
-        || explicitScopeReview) {
-        // An unjudged owner statement is a different question from the other
-        // two. Here nothing has yet decided the text is memory-worthy, and the
-        // owner was asking for something else when they said it — so the base
-        // instructions' demand for an explicit future/recurring marker rejects
-        // ordinary preferences. `volunteered` asks whether the statement is
-        // about the task or about how the owner wants things done.
-        const reviewMode = explicitScopeReview
-          ? 'explicit'
-          : row.intake_reason === UNJUDGED_OWNER_STATEMENT_REASON ? 'volunteered' : 'inferred';
-        const review = await withModelUsageAttribution(usageScope, () =>
-          (options.standingReviewer ?? reviewStandingMemory)(sourceText, row.text, reviewMode));
-        if (explicitScopeReview && (review.scope !== 'standing' || !review.text?.includes(row.text))) {
-          throw new Error('Explicit memory scope review lost the authorized candidate');
-        }
-        if (review.scope === 'task') {
-          resolveReflectionCandidateById({ id: row.id, status: 'rejected',
-            reason: `task_scoped:${review.reason}`, now });
-          result.skipped += 1;
-          continue;
-        }
-        if (!review.text || !sourceText.includes(review.text)) throw new Error('Standing review lost its source span');
-        candidateText = review.text;
+      const stored = readAutomaticMemoryCandidate(row.id, db);
+      if (stored.status !== 'valid') {
+        settle('rejected', `destination_${stored.status}`);
+        result.skipped += 1; continue;
       }
+      const origin = stored.envelope.origin;
+      const owner = { id: row.id, originDigest: stored.envelope.originDigest, claim };
+      const { automaticMemoryOriginSourceIsCurrent, extractProfilePatchFromMessage } = await import('./auto-capture.js');
+      if (!automaticMemoryOriginSourceIsCurrent(origin)) {
+        settle('rejected', 'destination_source_unavailable');
+        result.skipped += 1; continue;
+      }
+      if (origin.claimMode === 'unresolved') {
+        settle('rejected', 'destination_claim_unresolved');
+        result.skipped += 1; continue;
+      }
+      let envelope = stored.envelope;
+      if (!envelope.decision) {
+        // Every admitted claim needs a destination decision. Share the same
+        // review call that already judges inferred/compound durability.
+        const mode = EXPLICIT_STABLE_CONTEXT_REASONS.has(row.intake_reason) || origin.claimMode === 'complete'
+          ? 'destination' : row.intake_reason === UNJUDGED_OWNER_STATEMENT_REASON ? 'volunteered' : 'inferred';
+        const review = await withModelUsageAttribution(usageScope, () =>
+          (options.standingReviewer ?? reviewStandingMemory)(origin.source.ownerText, row.text, mode, origin));
+        if (!review.destinationDecision || review.scope !== review.destinationDecision.durability) {
+          throw new Error('Automatic memory review omitted its checked destination decision.');
+        }
+        const committed = commitAutomaticMemoryDecision({ ...owner, decision: review.destinationDecision }, db);
+        if (committed.status === 'conflict') throw new Error('Automatic memory destination decision conflicts with its complete source claim.');
+        if (committed.status !== 'committed' && committed.status !== 'replayed') {
+          result.skipped += 1; continue;
+        }
+        envelope = committed.envelope;
+      }
+      const destination = resolveAutomaticMemoryDestination(envelope);
+      if (destination.status !== 'resolved') {
+        settle('rejected', `destination_${destination.status}:${destination.reason}`);
+        result.skipped += 1; continue;
+      }
+      const decisionDigest = automaticMemoryDecisionDigest(envelope);
+      const runMutation: NonNullable<ConsolidateOptions['runMutation']> = action => db.transaction(() => {
+        const current = readOwnedAutomaticMemoryDecision(owner, db);
+        if (current.status !== 'owned' || automaticMemoryDecisionDigest(current.envelope) !== decisionDigest
+          || !automaticMemoryOriginSourceIsCurrent(origin)) throw new LostAutomaticMemoryOwnership();
+        return action();
+      }).immediate();
+      // Check immediately before entering async consolidation, and at every
+      // later mutation through its synchronous transaction hook.
+      runMutation(() => undefined);
+      const sourceText = origin.source.ownerText;
+      const candidateText = destination.claimText;
       const excerpt = selectSupportingExcerpt(sourceText, candidateText);
       const outcome = await withModelUsageAttribution(usageScope, () => consolidateFact({
-        kind: row.kind,
-        text: candidateText,
-        importance: row.importance,
-        trustLevel: row.trust_level ?? 1,
-        authority: row.authority ?? 'user',
-        sourceApp: 'Conversation',
-        sourceUri: row.source_uri ?? row.episode_source_uri ?? undefined,
-        occurredAt: row.occurred_at,
-        pin: row.pin === 1,
-        evidence: {
-          episodeId: row.episode_id,
-          excerpt,
-          sourceUri: row.source_uri ?? row.episode_source_uri,
-        },
-      }, { sessionId: row.session_id, ...learnedInScope(row.kind, row.episode_id) },
-      options.resolver ? { resolver: options.resolver } : {}));
-      const people = attachGroundedUserPeople({
-        factId: outcome.factId,
-        episodeId: row.episode_id,
-        sourceText,
-        sourceUri: row.source_uri ?? row.episode_source_uri,
+        kind: row.kind, text: candidateText, importance: row.importance,
+        trustLevel: row.trust_level ?? 1, authority: row.authority ?? 'user',
+        sourceApp: 'Conversation', sourceUri: row.source_uri ?? row.episode_source_uri ?? undefined,
+        occurredAt: row.occurred_at, pin: row.pin === 1,
+        evidence: { episodeId: row.episode_id, excerpt, sourceUri: row.source_uri ?? row.episode_source_uri },
+      }, { sessionId: row.session_id, scope: destination.scope }, {
+        ...(options.resolver ? { resolver: options.resolver } : {}), runMutation,
+      }));
+      runMutation(() => {
+        // Enrichment also uses the reviewed claim and scope, not unrelated
+        // task text elsewhere in the source turn.
+        if (isEverywhere(destination.scope)) withMemorySettledFor(destination.scope, () => {
+          attachGroundedUserPeople({ factId: outcome.factId, episodeId: row.episode_id,
+            sourceText: candidateText, sourceUri: row.source_uri ?? row.episode_source_uri });
+          attachGroundedUserProjects({ factId: outcome.factId, episodeId: row.episode_id,
+            sourceText: candidateText, sourceUri: row.source_uri ?? row.episode_source_uri });
+        });
+        const fact = outcome.factId ? getFact(outcome.factId) : null;
+        // A profile has global reach. It may adapt only from an actually saved
+        // current global claim with affirmative default/global destination.
+        // Whole-source privacy and current-task guards remain authoritative.
+        if (fact?.active && !outcome.unresolvedConflict && isEverywhere(destination.scope)
+          && sameScope(memoryScopeOf('fact', fact.id), destination.scope)
+          && fact.content.replace(/\s+/g, ' ').trim() === candidateText.replace(/\s+/g, ' ').trim()
+          && (envelope.decision!.destination === 'everywhere' || envelope.decision!.destination === 'kind_default')
+          && extractProfilePatchFromMessage(sourceText)) {
+          const patch = extractProfilePatchFromMessage(candidateText);
+          if (patch) saveUserProfile(patch);
+        }
+        if (!settle('promoted', `consolidation:${outcome.action}`, outcome.factId ?? null)) throw new LostAutomaticMemoryOwnership();
       });
-      const projects = attachGroundedUserProjects({
-        factId: outcome.factId,
-        episodeId: row.episode_id,
-        sourceText,
-        sourceUri: row.source_uri ?? row.episode_source_uri,
-      });
-      const projectDecision = projects.extracted > 0
-        ? `;projects_observed=${projects.observed};project_links=${projects.linked};project_failures=${projects.failures.length}`
-        : '';
-      const entityDecision = people.extracted > 0
-        ? `;people_observed=${people.observed};person_links=${people.linked};person_failures=${people.failures.length}`
-        : '';
-      resolveReflectionCandidateById({
-        id: row.id,
-        status: 'promoted',
-        reason: `consolidation:${outcome.action}${entityDecision}${projectDecision}`,
-        resultingFactId: outcome.factId,
-        now,
-      });
-      // Stable-prefix freezing deliberately defers incidental reflection churn,
-      // but these rows are explicit user memory edits. Bump only after the
-      // canonical fact transition commits, never at enqueue time where an
-      // asynchronous resolver could race and re-freeze the superseded value.
-      if (
-        outcome.action !== 'ignore'
-        && EXPLICIT_STABLE_CONTEXT_REASONS.has(row.intake_reason)
-      ) {
-        bumpStableContextGeneration();
-      }
+      if (outcome.action !== 'ignore' && EXPLICIT_STABLE_CONTEXT_REASONS.has(row.intake_reason)) bumpStableContextGeneration();
       result.promoted += 1;
     } catch (error) {
+      if (error instanceof LostAutomaticMemoryOwnership) { result.skipped += 1; continue; }
       const message = (error instanceof Error ? error.message : String(error)).slice(0, 500);
       if (attempt >= AUTO_CAPTURE_MAX_ATTEMPTS) {
-        db.prepare(`
+        const changed = db.prepare(`
           UPDATE memory_reflection_candidates
           SET status = 'expired', reason = 'retry_exhausted', resolved_at = ?,
               processing_started_at = NULL, next_attempt_at = NULL, last_error = ?
-          WHERE id = ? AND status = 'pending'
-        `).run(now, message, row.id);
-        result.expired += 1;
+          WHERE id = ? AND status = 'pending' AND attempt_count = ? AND processing_started_at = ?
+        `).run(now, message, row.id, attempt, now);
+        if (Number(changed.changes) === 1) result.expired += 1; else result.skipped += 1;
       } else {
         const nextAttemptAt = new Date(Date.parse(now) + retryDelayMs(attempt)).toISOString();
-        db.prepare(`
+        const changed = db.prepare(`
           UPDATE memory_reflection_candidates
           SET processing_started_at = NULL, next_attempt_at = ?, last_error = ?
-          WHERE id = ? AND status = 'pending'
-        `).run(nextAttemptAt, message, row.id);
-        result.retried += 1;
+          WHERE id = ? AND status = 'pending' AND attempt_count = ? AND processing_started_at = ?
+        `).run(nextAttemptAt, message, row.id, attempt, now);
+        if (Number(changed.changes) === 1) result.retried += 1; else result.skipped += 1;
       }
     }
   }

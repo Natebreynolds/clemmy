@@ -13,12 +13,17 @@
  *   2. ENACT the resulting `RecoveryDirective`: move the discovery budget,
  *      credit progress, and hand the caller a typed outcome to act on.
  */
-import { localNonWriteStatus } from '../../tools/shared.js';
+import {
+  localNonWriteStatus, localNonWriteClassification, localExecutionFailureEffect,
+  LocalNonWriteError, LocalExecutionFailureError,
+  type LocalNonWriteClassification, type LocalFailureEffect,
+} from '../../tools/shared.js';
 import { learnedReadRequest } from './execution-gate.js';
 import { openEventLog } from './eventlog.js';
 import { acceptedTaskIdFor, settlementIdentityFor } from './attempt-identity.js';
 import {
   classifyAttemptOutcome,
+  recoveryDirectiveFor,
   type AttemptOutcome,
   type AttemptSignals,
 } from './attempt-outcome.js';
@@ -116,7 +121,7 @@ export class HostLocalExecutionFailureResult {
   readonly executionKind = 'local_execution' as const;
   readonly outcomeKind = 'failed' as const;
 
-  constructor(readonly output: string) {}
+  constructor(readonly output: string, readonly effect?: LocalFailureEffect) {}
 
   toString(): string {
     return this.output;
@@ -146,18 +151,18 @@ export class HostLocalExecutionFailureResult {
  * reclassified as repairable and safe to retry. A failed write may already have
  * changed something; the one thing worse than failing is doing it twice.
  *
- * The two accepted carriers are unforgeable by construction: the bridge class
- * and the producer's module-private identity. Both are only ever attached where
- * the tool returned BEFORE attempting any write.
+ * Only the bridge/error classes and the producer's module-private identity
+ * qualify. Their host producer must establish that the requested write did
+ * not take effect; this does not assert that no transport request occurred.
  */
 function localResultTypedNegative(
   result: unknown,
-): { status?: string } | null {
+): { status?: string; classification?: LocalNonWriteClassification } | null {
   // Survives the local bridge's text flattening.
-  if (result instanceof HostLocalNonWriteResult) return { status: result.status };
+  if (result instanceof HostLocalNonWriteResult || result instanceof LocalNonWriteError) return { status: result.status, classification: result.classification };
   if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
   const nominal = localNonWriteStatus(result);
-  return nominal ? { status: nominal } : null;
+  return nominal ? { status: nominal, classification: localNonWriteClassification(result) } : null;
 }
 
 /**
@@ -177,7 +182,11 @@ function localResultTypedNegative(
 export class HostLocalNonWriteResult {
   readonly executionKind = 'local_execution' as const;
 
-  constructor(readonly output: string, readonly status: string) {}
+  constructor(
+    readonly output: string,
+    readonly status: string,
+    readonly classification?: LocalNonWriteClassification,
+  ) {}
 
   toString(): string {
     return this.output;
@@ -218,8 +227,9 @@ export function attemptSignalsFromTypedResult(result: unknown): AttemptSignals {
   if (result instanceof CancelledPreDispatchResult) {
     return { preDispatch: true, cancelled: true, errorName: result.errorName };
   }
-  if (result instanceof HostLocalExecutionFailureResult) {
-    return { executionFailed: true };
+  const failureEffect = result instanceof HostLocalExecutionFailureResult ? result.effect : localExecutionFailureEffect(result);
+  if (result instanceof HostLocalExecutionFailureResult || failureEffect !== undefined) {
+    return { executionFailed: true, ...(failureEffect ? { acknowledged: failureEffect === 'acknowledged' } : {}) };
   }
   // A locally constructed policy refusal may return corrective bytes to the
   // model/MCP client without throwing. The nominal base class prevents provider
@@ -702,6 +712,11 @@ function signalsFromResult(result: unknown): AttemptSignals {
  *  lose the reason entirely by rendering it to prose. */
 function signalsFromThrown(thrown: unknown): AttemptSignals {
   if (thrown === undefined || thrown === null) return {};
+  // Apply the nominal negative only after stronger lane facts have been
+  // classified, exactly as for the returned carrier. In particular an already
+  // retained uncertain effect must never become repairable here.
+  if (thrown instanceof LocalNonWriteError) return {};
+  if (thrown instanceof LocalExecutionFailureError) return { executionFailed: true, acknowledged: thrown.effect === 'acknowledged' };
   const signals: AttemptSignals = {};
   const asRecord = record(thrown) ?? (thrown instanceof Error ? (thrown as unknown as Record<string, unknown>) : null);
 
@@ -1275,7 +1290,7 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     // its returned text describes is not a write of unknown fate.
     const returnedFailure = extracted.envelopeSuccessful === false
       && !(input.thrown === undefined && localResultTypedNegative(input.result));
-    if (input.thrown !== undefined || returnedFailure) extracted.acknowledged = false;
+    if ((input.thrown !== undefined && !(input.thrown instanceof LocalNonWriteError)) || returnedFailure) extracted.acknowledged = false;
   }
   // THE PROVIDER'S OWN REPLY CONFIRMS A WRITE IT ACKNOWLEDGES. A returned
   // mutation whose structured reply names what it created or changed (the
@@ -1383,7 +1398,9 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // execution_failed, mutating=1` instead of the repairable
   // `invalid_arguments / host_reported:duplicate`, and the model gave up on a
   // step it could have repaired in one call.
-  const typedNegative = returnedLocalResult ? localResultTypedNegative(input.result) : null;
+  const typedNegative = input.thrown instanceof LocalNonWriteError
+    ? localResultTypedNegative(input.thrown)
+    : returnedLocalResult ? localResultTypedNegative(input.result) : null;
   // NEVER lift preserved uncertainty. `uncertain_write` is the deliberate
   // answer when a mutation's fate cannot be observed, and its directive
   // requires reconciliation before any retry. Replacing it with a repairable
@@ -1391,12 +1408,24 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // proof the first one did nothing.
   const preservesUncertainty = outcome.kind === 'uncertain_write';
   if (typedNegative && !preservesUncertainty) {
-    outcome = classifyAttemptOutcome({
+    const classified = classifyAttemptOutcome({
       ...extracted,
       hostExecuted: true,
       hostReportedFailure: true,
       ...(typedNegative.status ? { hostFailureStatus: typedNegative.status } : {}),
     });
+    // No-effect proof does not imply malformed arguments. Keep the producer's
+    // bounded nominal recovery class through local MCP text flattening. This
+    // does not assert pre-dispatch: a provider may have refused after I/O.
+    const classification = typedNegative.classification;
+    const kind = classification?.kind;
+    const providerStatus = classification?.providerStatus;
+    outcome = classified.kind === 'invalid_arguments' && classified.detail?.startsWith('host_reported')
+      && kind && ['invalid_arguments', 'input_required', 'auth_failure', 'unknown'].includes(kind)
+      ? { ...classified, kind, evidence: 'nominal', directive: recoveryDirectiveFor(kind),
+        ...(typeof providerStatus === 'number' && Number.isInteger(providerStatus)
+          && providerStatus >= 100 && providerStatus <= 599 ? { providerStatus } : {}) }
+      : classified;
   } else if (returnedLocalResult && outcome.kind === 'unknown' && extracted.executionFailed !== true) {
     outcome = classifyAttemptOutcome({ ...extracted, hostExecuted: true });
   } else if (

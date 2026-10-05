@@ -168,6 +168,7 @@ test('workerResultIndicatesFailure catches unprefixed runner errors and hollow o
   const { workerResultIndicatesFailure } = await import('./worker-job-packet.js');
   const { equal } = await import('node:assert/strict');
   equal(workerResultIndicatesFailure('ERROR: worker failed'), true);
+  equal(workerResultIndicatesFailure('PARTIAL: completion remains unverified; preserve successful effects.'), true);
   equal(workerResultIndicatesFailure('An error occurred while running the tool. Please try again. Error: Error: 400 Unknown Model, please check the model code.'), true);
   equal(workerResultIndicatesFailure(''), true);
   equal(workerResultIndicatesFailure('   '), true);

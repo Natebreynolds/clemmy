@@ -9,6 +9,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 
 const eventlog = await import('../runtime/harness/eventlog.js');
 const continuity = await import('./task-continuity.js');
+const { presentationEventForOutcome, turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -143,6 +144,94 @@ test('hidden awaiting options cannot enter a continuity packet without public de
     },
   }), /exact public delivery binding/);
   assert.deepEqual(continuity.peekTaskContinuityPacket({ sessionId: owner.id }), { status: 'none' });
+});
+
+function retainedQuestionBinding(suffix: string, changes: {
+  visible?: string; shape?: 'done' | 'approval' | 'continue' | 'blocked';
+  foreignSource?: boolean; legacy?: boolean;
+} = {}) {
+  const owner = session(`retained-${suffix}`);
+  const origin = accepted(owner.id, 'Inspect the synthetic local note.');
+  const question = 'Which correction should I make?';
+  const options = ['Correct the title', 'Correct the date'];
+  const raw = (changes.visible ?? question)
+    + '\n\nRetained work (durable checkpoint):\n- Source/tool read_file: 1 record retained as rh_fixture_read.\nExternal write state: no settled external-write attempt is recorded.';
+  const awaiting = eventlog.appendEvent({ sessionId: owner.id, turn: 3, role: 'Clem', type: 'awaiting_user_input',
+    data: { sourceUserSeq: changes.foreignSource ? origin.seq + 99 : origin.seq, question, options, purpose: 'clarification' } });
+  const identity = { sessionId: owner.id, turn: 1, sourceUserSeq: origin.seq };
+  const base = { version: 2 as const, id: turnOutcomeId(identity), identity };
+  const presentation = presentationEventForOutcome(changes.shape === 'done'
+    ? { ...base, status: 'done', resumable: false, presentation: { kind: 'answer', text: raw } }
+    : changes.shape === 'blocked'
+      ? { ...base, status: 'blocked', resumable: true, presentation: { kind: 'blocked', text: raw } }
+      : changes.shape === 'approval'
+        ? { ...base, status: 'needs_input', resumable: true, needs: { kind: 'approval' }, presentation: { kind: 'approval', text: raw, approvalId: 'fixture-approval' } }
+        : changes.shape === 'continue'
+          ? { ...base, status: 'needs_input', resumable: true, needs: { kind: 'continue' }, presentation: { kind: 'continue', text: raw } }
+          : { ...base, status: 'needs_input', resumable: true, needs: { kind: 'input' }, presentation: { kind: 'question', text: raw } });
+  const terminal = eventlog.appendEvent({ sessionId: owner.id, turn: 1, role: 'system', type: 'conversation_completed',
+    data: { sourceUserSeq: origin.seq, reply: raw, ...(!changes.legacy ? { presentation,
+      turnOutcome: { version: 2, id: presentation.outcomeId, status: presentation.status,
+        resumable: presentation.resumable, ...(presentation.needs ? { needs: presentation.needs } : {}) },
+    } : {}) } });
+  const input = { sessionId: owner.id, originatingSourceUserSeq: origin.seq,
+    pause: { kind: 'clarification' as const, question, options },
+    publicDeliveryBinding: { awaitingEventId: awaiting.id, terminalEventId: terminal.id } };
+  return { owner, origin, terminal, raw, input };
+}
+
+test('exact typed public question binding survives retained-work terminal and store restart', () => {
+  const { owner, terminal, raw, input } = retainedQuestionBinding('restart');
+  const packet = continuity.createTaskContinuityPacket(input);
+  eventlog.closeEventLog();
+  const store = new continuity.TaskContinuityStore();
+  assert.deepEqual(store.peek({ sessionId: owner.id }), { status: 'available', packet });
+  const reply = accepted(owner.id, 'Correct the title');
+  eventlog.closeEventLog();
+  const consumed = new continuity.TaskContinuityStore().consume(consumeInput(owner.id, reply.seq));
+  assert.equal(consumed.status, 'consumed');
+  if (consumed.status === 'consumed') assert.equal(consumed.packet.packetId, packet.packetId);
+  const readback = eventlog.listEvents(owner.id, { types: ['conversation_completed'] })[0]!;
+  assert.deepEqual(readback, terminal);
+  assert.equal((readback.data.presentation as { text: string }).text, raw);
+});
+
+test('retained-work projection does not bind altered public questions, hidden options, foreign sources or other shapes', () => {
+  for (const [suffix, changes] of [
+    ['extra-visible-prose', { visible: 'Which correction should I make? Also publish the note.' }],
+    ['different-question', { visible: 'Should I publish the note?' }],
+    ['foreign-source', { foreignSource: true }],
+    ['done', { shape: 'done' }],
+    ['approval', { shape: 'approval' }],
+    ['continue', { shape: 'continue' }],
+    ['blocked', { shape: 'blocked' }],
+    ['legacy', { legacy: true }],
+  ] as const) {
+    const { input } = retainedQuestionBinding(suffix, changes);
+    assert.throws(() => continuity.createTaskContinuityPacket(input), /exact public ask and terminal/, suffix);
+  }
+  const { input } = retainedQuestionBinding('hidden-option');
+  assert.throws(() => continuity.createTaskContinuityPacket({ ...input,
+    pause: { ...input.pause, options: ['Publish the note', 'Correct the date'] },
+  }), /exact public ask and terminal/);
+});
+
+test('malformed typed-looking terminals cannot authorize retained-work stripping in the store', () => {
+  for (const corruption of ['version', 'missing-outcome', 'mismatched-outcome', 'missing-text', 'foreign-session'] as const) {
+    const { terminal, input } = retainedQuestionBinding(`malformed-${corruption}`);
+    const data = structuredClone(terminal.data);
+    const presentation = data.presentation as Record<string, unknown>;
+    if (corruption === 'version') presentation.version = 99;
+    if (corruption === 'missing-outcome') delete data.turnOutcome;
+    if (corruption === 'mismatched-outcome') (data.turnOutcome as Record<string, unknown>).status = 'done';
+    if (corruption === 'missing-text') delete presentation.text;
+    if (corruption === 'foreign-session') (presentation.identity as Record<string, unknown>).sessionId = 'foreign-session';
+    // Model old/corrupted persisted bytes; ordinary event publication already
+    // validates the pair and correctly refuses these shapes at append time.
+    eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+      .run(JSON.stringify(data), terminal.id);
+    assert.throws(() => continuity.createTaskContinuityPacket(input), /exact public ask and terminal/, corruption);
+  }
 });
 
 test('rejects raw arguments or other unsupported capability payload fields', () => {

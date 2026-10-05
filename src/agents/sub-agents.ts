@@ -450,6 +450,7 @@ export interface CrossProviderWorkerResult {
   toolUses: string[];
   /** Outside actions refused in this worker because only its parent may run them. */
   parentActions?: string[];
+  callRecord?: import('../runtime/harness/worker-call-record.js').WorkerCallRecord;
 }
 
 /**
@@ -483,17 +484,20 @@ export async function runCrossProviderWorker(
   })();
   const maxTurns = guard ? resolveWorkerMaxTurns(input.intent, base) : base;
   if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
-    return { text: 'ERROR: worker packet has no accepted parent source.', model: modelId, toolUses: [] };
+    return { text: 'ERROR: worker packet has no accepted parent source.', model: modelId, toolUses: [],
+      callRecord: { byTool: {}, businessCallSucceeded: false, businessCallAttempted: false, effectsMayHaveRun: false } };
   }
   let parentActions: string[] = [];
+  let callRecord: import('../runtime/harness/worker-call-record.js').WorkerCallRecord | undefined;
   const text = await runPacketWorkerWithHost({
     onParentActions: (tools) => { parentActions = tools; },
+    onCallRecord: (record) => { callRecord = record; },
     input, modelId, parentSessionId: sessionId, sourceUserSeq: sourceUserSeq!, maxTurns,
     mcpToolScope: effectiveMcpToolScope ?? null, dispatchLease, signal: abortSignal,
     buildAgent: ({ delegatedExpectedWork, ...child }) => buildWorkerAgent({ model: modelId, workerInput: input,
       mcpToolScope: effectiveMcpToolScope, ...child, ...(delegatedExpectedWork ? { delegatedExpectedWork: true } : {}) }),
   });
-  return { text, model: modelId, toolUses: [], ...(parentActions.length > 0 ? { parentActions } : {}) };
+  return { text, model: modelId, toolUses: [], ...(callRecord ? { callRecord } : {}), ...(parentActions.length > 0 ? { parentActions } : {}) };
 }
 
 /**

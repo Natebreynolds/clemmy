@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { openMemoryDb } from './db.js';
+import {
+  automaticMemoryCandidateIdentity, automaticMemoryEnvelopeDigest, createAutomaticMemoryEnvelope,
+  parseAutomaticMemoryEnvelope, withAutomaticMemoryDecision,
+  type AutomaticMemoryOrigin, type AutomaticMemoryEnvelope, type AutomaticMemoryDecision,
+} from './memory-destination.js';
 
 export type ReflectionCandidateStatus = 'pending' | 'promoted' | 'rejected' | 'expired';
 export type ReflectionCandidateSourceType = 'tool_reflection' | 'recursive_reflection' | 'auto_capture' | 'meeting_analysis' | 'manual' | 'import';
@@ -253,6 +258,158 @@ function recordReflectionCandidateInDatabase(
 
 export function recordReflectionCandidate(input: RecordReflectionCandidateInput): number {
   return recordReflectionCandidateInDatabase(openMemoryDb(), input);
+}
+
+export interface RecordAutomaticMemoryCandidateInput extends Omit<RecordReflectionCandidateInput, 'sourceType' | 'authority'> {
+  origin: AutomaticMemoryOrigin;
+}
+
+export interface AutomaticMemoryCandidateRow {
+  id: number; episode_id: string | null; session_id: string; call_id: string;
+  candidate_hash: string; kind: string; text: string; importance: number;
+  status: ReflectionCandidateStatus; reason: string | null; resulting_fact_id: number | null;
+  source_type: ReflectionCandidateSourceType; intake_reason: string | null;
+  trust_level: number | null; authority: string | null; source_uri: string | null; pin: number;
+  attempt_count: number; processing_started_at: string | null; destination_json: string | null;
+}
+
+export type AutomaticMemoryCandidateRead =
+  | { status: 'missing' }
+  | { status: 'legacy'; row: AutomaticMemoryCandidateRow }
+  | { status: 'conflict'; row: AutomaticMemoryCandidateRow; reason: string }
+  | { status: 'valid'; row: AutomaticMemoryCandidateRow; envelope: AutomaticMemoryEnvelope };
+
+function decodeAutomaticMemoryCandidate(row: AutomaticMemoryCandidateRow | undefined): AutomaticMemoryCandidateRead {
+  if (!row) return { status: 'missing' };
+  if (row.source_type !== 'auto_capture') return { status: 'conflict', row, reason: 'Candidate is not automatic owner intake.' };
+  if (row.destination_json === null) return { status: 'legacy', row };
+  try {
+    const envelope = parseAutomaticMemoryEnvelope(row.destination_json);
+    if (row.session_id !== envelope.origin.source.sessionId
+      || row.candidate_hash !== automaticMemoryCandidateIdentity(envelope.origin)
+      || row.kind !== envelope.origin.candidate.kind || row.text !== envelope.origin.candidate.text
+      || row.authority !== 'user') throw new Error('Automatic memory row differs from its immutable origin.');
+    return { status: 'valid', row, envelope };
+  } catch {
+    return { status: 'conflict', row, reason: 'Automatic memory destination envelope is inconsistent.' };
+  }
+}
+
+export function readAutomaticMemoryCandidate(id: number, db: Database.Database = openMemoryDb()): AutomaticMemoryCandidateRead {
+  const row = db.prepare('SELECT * FROM memory_reflection_candidates WHERE id = ?').get(id) as AutomaticMemoryCandidateRow | undefined;
+  return decodeAutomaticMemoryCandidate(row);
+}
+
+/** Freeze the complete extraction set at once. Redelivery cannot add a new
+ * reviewer-selected span or replace origin bytes after a session moved. */
+export function recordAutomaticMemoryCandidates(
+  inputs: RecordAutomaticMemoryCandidateInput[], db: Database.Database = openMemoryDb(),
+): number[] {
+  if (inputs.length === 0) return [];
+  const first = inputs[0]!;
+  const expected = inputs.map(input => {
+    const envelope = createAutomaticMemoryEnvelope(input.origin);
+    if (input.sessionId !== first.sessionId || input.callId !== first.callId
+      || input.sessionId !== envelope.origin.source.sessionId
+      || input.kind !== envelope.origin.candidate.kind || input.text !== envelope.origin.candidate.text) {
+      throw new Error('Automatic memory intake does not match its owner source.');
+    }
+    const source = envelope.origin.source;
+    if (source.authority === 'accepted_user_input') {
+      const token = source.eventType === 'user_steer_note' ? 'user-steer' : 'user-source';
+      if (input.callId !== `auto-capture:${token}:${source.eventSeq}`) throw new Error('Automatic memory call is not its accepted owner event.');
+    }
+    return { input, envelope, key: automaticMemoryCandidateIdentity(envelope.origin) };
+  });
+  const sourceBytes = JSON.stringify(expected[0]!.envelope.origin.source);
+  if (expected.some(value => JSON.stringify(value.envelope.origin.source) !== sourceBytes)
+    || new Set(expected.map(value => value.key)).size !== expected.length) {
+    throw new Error('Automatic memory intake has conflicting source or claim identities.');
+  }
+  const tx = db.transaction(() => {
+    const prior = db.prepare('SELECT * FROM memory_reflection_candidates WHERE session_id = ? AND call_id = ? ORDER BY id')
+      .all(first.sessionId, first.callId) as AutomaticMemoryCandidateRow[];
+    if (prior.length > 0) {
+      if (prior.length !== expected.length) throw new Error('Automatic memory extraction changed after durable intake.');
+      return expected.map(({ input, envelope, key }) => {
+        const found = decodeAutomaticMemoryCandidate(prior.find(row => row.candidate_hash === key));
+        if (found.status !== 'valid' || found.envelope.originDigest !== envelope.originDigest
+          || found.row.episode_id !== (input.episodeId ?? null)
+          || found.row.intake_reason !== (input.intakeReason?.slice(0, 240) ?? null)
+          || found.row.importance !== Math.max(1, Math.min(10, input.importance))
+          || found.row.trust_level !== (input.trustLevel ?? null)
+          || found.row.source_uri !== (input.sourceUri ?? null) || found.row.pin !== (input.pin ? 1 : 0)) {
+          throw new Error('Automatic memory replay conflicts with its frozen intake.');
+        }
+        return found.row.id;
+      });
+    }
+    const insert = db.prepare(`INSERT INTO memory_reflection_candidates
+      (episode_id, session_id, call_id, candidate_hash, kind, text, importance,
+       status, reason, resulting_fact_id, created_at, resolved_at, source_type,
+       intake_reason, trust_level, authority, source_uri, pin, destination_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'auto_capture', ?, ?, 'user', ?, ?, ?)`);
+    return expected.map(({ input, envelope, key }) => {
+      const now = input.now ?? new Date().toISOString();
+      const status = input.status ?? 'pending';
+      return Number(insert.run(input.episodeId ?? null, input.sessionId, input.callId, key,
+        input.kind, input.text, Math.max(1, Math.min(10, input.importance)), status,
+        input.reason?.slice(0, 240) ?? null, now, status === 'rejected' ? now : null,
+        input.intakeReason?.slice(0, 240) ?? null, input.trustLevel ?? null, input.sourceUri ?? null,
+        input.pin ? 1 : 0, JSON.stringify(envelope)).lastInsertRowid);
+    });
+  });
+  return tx.immediate();
+}
+
+export function recordAutomaticMemoryCandidate(input: RecordAutomaticMemoryCandidateInput, db: Database.Database = openMemoryDb()): number {
+  return recordAutomaticMemoryCandidates([input], db)[0]!;
+}
+
+/** The existing lease's incremented attempt and start timestamp together
+ * identify this processing owner, including after a stale lease is reclaimed. */
+export interface AutomaticMemoryProcessingClaim { attemptCount: number; processingStartedAt: string }
+export interface AutomaticMemoryDecisionOwner {
+  id: number; originDigest: string; claim: AutomaticMemoryProcessingClaim;
+}
+export type OwnedAutomaticMemoryDecision =
+  | { status: 'owned'; row: AutomaticMemoryCandidateRow; envelope: AutomaticMemoryEnvelope }
+  | { status: 'lost_ownership' | 'legacy' | 'conflict' };
+
+export function readOwnedAutomaticMemoryDecision(
+  input: AutomaticMemoryDecisionOwner, db: Database.Database = openMemoryDb(),
+): OwnedAutomaticMemoryDecision {
+  const found = readAutomaticMemoryCandidate(input.id, db);
+  if (found.status === 'legacy' || found.status === 'conflict') return { status: found.status };
+  if (found.status === 'missing' || found.row.status !== 'pending'
+    || !Number.isSafeInteger(input.claim.attemptCount) || input.claim.attemptCount < 1
+    || !input.claim.processingStartedAt || found.row.attempt_count !== input.claim.attemptCount
+    || found.row.processing_started_at !== input.claim.processingStartedAt) return { status: 'lost_ownership' };
+  if (found.envelope.originDigest !== input.originDigest) return { status: 'conflict' };
+  return { status: 'owned', row: found.row, envelope: found.envelope };
+}
+
+export function commitAutomaticMemoryDecision(
+  input: AutomaticMemoryDecisionOwner & { decision: AutomaticMemoryDecision }, db: Database.Database = openMemoryDb(),
+): { status: 'committed' | 'replayed'; envelope: AutomaticMemoryEnvelope }
+  | { status: 'lost_ownership' | 'legacy' | 'conflict' } {
+  return db.transaction(() => {
+    const current = readOwnedAutomaticMemoryDecision(input, db);
+    if (current.status !== 'owned') return current;
+    let next: AutomaticMemoryEnvelope;
+    try { next = withAutomaticMemoryDecision(current.envelope, input.decision); }
+    catch { return { status: 'conflict' as const }; }
+    if (current.envelope.decision !== null) {
+      return automaticMemoryEnvelopeDigest(current.envelope) === automaticMemoryEnvelopeDigest(next)
+        ? { status: 'replayed' as const, envelope: current.envelope } : { status: 'conflict' as const };
+    }
+    const changed = db.prepare(`UPDATE memory_reflection_candidates SET destination_json = ?
+      WHERE id = ? AND source_type = 'auto_capture' AND status = 'pending'
+        AND attempt_count = ? AND processing_started_at = ? AND destination_json = ?`)
+      .run(JSON.stringify(next), input.id, input.claim.attemptCount, input.claim.processingStartedAt, current.row.destination_json);
+    return Number(changed.changes) === 1
+      ? { status: 'committed' as const, envelope: next } : { status: 'lost_ownership' as const };
+  }).immediate();
 }
 
 export function resolveReflectionCandidate(input: {

@@ -21,6 +21,12 @@ export interface WorkerCallRecord {
   businessCallSucceeded: boolean;
   /** The worker tried business work: something settled or was refused. */
   businessCallAttempted: boolean;
+  /** A dispatched mutation may already have landed; failed output never licenses replay. */
+  effectsMayHaveRun?: boolean;
+  /** Host discharge oracle for the child's frozen requirements, when present. */
+  requiredWork?: 'satisfied' | 'pending';
+  /** Successful non-mutating business evidence; an alternate reader may recover a failed lookup. */
+  successfulRead?: boolean;
 }
 
 const CARRIER_NAMES = new Set(['call_tool', 'work_call', 'composio_execute_tool']);
@@ -42,12 +48,16 @@ export function workerCallRecord(sessionId: string, sourceUserSeq: number): Work
   const byTool: Record<string, WorkerToolTally> = {};
   const tally = (tool: string): WorkerToolTally => (byTool[tool] ??= { succeeded: 0, failed: 0, refusedBeforeDispatch: 0 });
   let businessCallSucceeded = false;
+  let effectsMayHaveRun = false;
+  let successfulRead = false;
   for (const event of listEvents(sessionId, { sinceSeq: sourceUserSeq - 1, types: ['tool_attempt_settled', 'guardrail_tripped'] })) {
     const data = event.data;
     if (typeof data.sourceUserSeq === 'number' && data.sourceUserSeq !== sourceUserSeq) continue;
     if (event.type === 'tool_attempt_settled') {
       if (data.businessCall !== true || typeof data.tool !== 'string') continue;
+      if (data.mutating !== false && data.dispatchState !== 'not_started') effectsMayHaveRun = true;
       if (data.kind === 'succeeded') {
+        if (data.mutating === false) successfulRead = true;
         tally(data.tool).succeeded += 1;
         businessCallSucceeded = true;
       } else {
@@ -60,7 +70,7 @@ export function workerCallRecord(sessionId: string, sourceUserSeq: number): Work
       }
     }
   }
-  return { byTool, businessCallSucceeded, businessCallAttempted: Object.keys(byTool).length > 0 };
+  return { byTool, businessCallSucceeded, businessCallAttempted: Object.keys(byTool).length > 0, effectsMayHaveRun, successfulRead };
 }
 
 /**
@@ -72,20 +82,46 @@ export function workerCallRecord(sessionId: string, sourceUserSeq: number): Work
 export function workerScopeCallRecord(sessionId: string, runScopeId: string, afterSeq: number): WorkerCallRecord {
   const byTool: Record<string, WorkerToolTally> = {};
   let businessCallSucceeded = false;
+  let effectsMayHaveRun = false;
+  let successfulRead = false;
   for (const event of listEvents(sessionId, { sinceSeq: afterSeq, types: ['tool_returned'] })) {
     const data = event.data;
     if (data.runScopeId !== runScopeId || data.accounting !== 'top_level' || data.topologyRole !== 'business') continue;
     const tool = typeof data.effectiveTool === 'string' ? data.effectiveTool : typeof data.tool === 'string' ? data.tool : '';
     if (!tool) continue;
+    // Legacy SDK records do not consistently carry an effect. Unknown is not
+    // evidence that replaying a completed call would be harmless.
+    if (data.effect !== 'read' && data.mutating !== false) effectsMayHaveRun = true;
     const tally = (byTool[tool] ??= { succeeded: 0, failed: 0, refusedBeforeDispatch: 0 });
     if (data.ok === false) {
       tally.failed += 1;
     } else {
+      if (data.effect === 'read' || data.mutating === false) successfulRead = true;
       tally.succeeded += 1;
       businessCallSucceeded = true;
     }
   }
-  return { byTool, businessCallSucceeded, businessCallAttempted: Object.keys(byTool).length > 0 };
+  return { byTool, businessCallSucceeded, businessCallAttempted: Object.keys(byTool).length > 0, effectsMayHaveRun, successfulRead };
+}
+
+/** A successful sibling call is not evidence that a failed requirement was
+ * recovered. Only a discharged frozen contract can qualify that recovery:
+ * tool-name tallies cannot tell whether a second read recovered the missing
+ * source or read an unrelated item. Keep the partial output for the parent,
+ * without banking it as successful work that can be reused as complete.
+ * This is a structural floor, not a semantic proof of the requested result. */
+export function qualifyWorkerOutput(text: string, record: WorkerCallRecord | undefined): string {
+  if (/^\s*(?:ERROR|PARTIAL):/i.test(text)) return text;
+  // A successful alternate operation can discharge the same frozen requirement.
+  // Tool-name tallies must never overrule that stronger evidence.
+  if (record?.requiredWork === 'satisfied') return text;
+  const unresolved = record ? Object.entries(record.byTool)
+    .filter(([, tally]) => tally.failed + tally.refusedBeforeDispatch > 0)
+    .map(([tool]) => tool) : [];
+  if (record && unresolved.length === 0 && record.requiredWork !== 'pending') return text;
+  const reason = record?.requiredWork === 'pending' ? 'frozen work requirements remain undischarged'
+    : record ? `failed or refused calls lack requirement-bound recovery evidence: ${unresolved.join(', ')}` : 'the host call record is unavailable';
+  return `PARTIAL: worker completion needs verification: ${reason}. Preserve completed actions and repair only the missing work; do not repeat writes or sends.\n\nWorker account (unverified):\n${text}`;
 }
 
 /** The record as the parent reads it beside the worker's own reply. */
@@ -101,6 +137,6 @@ export function renderWorkerCallRecord(record: WorkerCallRecord): string {
   return [
     '[Host record of this worker\'s calls — written by Clementine, not the worker]',
     ...(lines.length > 0 ? lines : ['- No business tool ran.']),
-    'Where the worker\'s account disagrees with this record, the record is right: rerun the item with a correction rather than relying on that account.',
+    'Where the worker\'s account disagrees with this record, the record is right. Preserve completed actions and repair only the missing work; do not repeat writes or sends.',
   ].join('\n');
 }
