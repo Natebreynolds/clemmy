@@ -66,7 +66,7 @@ test('the drain routes the unjudged marker to the model reviewer', async () => {
   // silent promotion. If this marker stops appearing in it, unmatched owner
   // messages would be written to memory unjudged — strictly worse than the
   // regex gate it replaced.
-  const routing = drain.slice(drain.indexOf('const explicitScopeReview'));
+  const routing = drain.slice(drain.indexOf('if (!envelope.decision)'));
   const conditionEnd = routing.indexOf('const review =');
   assert.ok(conditionEnd > 0, 'the reviewer call site moved; re-anchor this test');
   assert.ok(
@@ -98,32 +98,45 @@ test('an unjudged owner statement reaches the reviewer in volunteered mode', asy
     enqueueAutoCaptureCandidates,
     UNJUDGED_OWNER_STATEMENT_REASON: reason,
   } = await import('./durable-consolidation.js');
+  const log = await import('../runtime/harness/eventlog.js');
+  const contexts = await import('../runtime/harness/source-session-context.js');
+  const capture = await import('./auto-capture.js');
+  const { parseAutomaticStandingMemoryReview } = await import('./standing-memory-review.js');
 
+  // Admitted the way a live turn admits it: from the owner's accepted message,
+  // with its exact origin, so the drain may review it at all.
   const message = 'how many open deals do we have. quick note, i like numbers first and the commentary after';
-  const queued = enqueueAutoCaptureCandidates({
-    message,
-    sessionId: 'volunteered-mode-routing',
-    sourceEventId: 'turn:volunteered',
-    occurredAt: '2026-09-21T04:00:00.000Z',
-    candidates: [{ kind: 'user', content: message, reason }],
-  });
+  const session = log.createSession({ id: 'volunteered-mode-routing', kind: 'chat' });
+  const event = log.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: message } });
+  contexts.captureFreshSourceSessionContext({ sessionId: session.id, sourceUserSeq: event.seq });
+  const input = { message, sessionId: session.id, sourceEventId: `user-source:${event.seq}`,
+    sourceProvenance: capture.autoCaptureProvenanceFromAcceptedEvent(event) };
+  // Selected the way a live turn selects it, so its claim keeps its exact span.
+  const candidates = capture.selectAutoMemoryCandidates(message);
+  assert.deepEqual(candidates.map((candidate) => candidate.reason), [reason], 'an unmatched statement is admitted unjudged');
+  const origins = capture.automaticMemoryOriginsForCapture(input, candidates);
+  assert.ok(origins.every(Boolean), 'the accepted message reopens as the origin');
+  const queued = enqueueAutoCaptureCandidates({ ...input, occurredAt: event.createdAt, candidates, origins });
 
   const modes: string[] = [];
   const recordingReviewer = async (
-    _source: string,
-    candidate: string,
-    mode: 'inferred' | 'explicit' | 'volunteered' = 'inferred',
+    source: string,
+    _candidate: string,
+    mode: 'inferred' | 'explicit' | 'volunteered' | 'destination' = 'inferred',
+    origin?: Parameters<typeof parseAutomaticStandingMemoryReview>[1],
   ) => {
     modes.push(mode);
-    return { scope: 'standing' as const, text: candidate, reason: 'test stub' };
+    assert.ok(origin);
+    return parseAutomaticStandingMemoryReview({ durability: 'standing', claim: origin.claim, destination: 'kind_default',
+      destinationSpans: [], reason: 'test stub' }, origin);
   };
 
   await drainDurableConsolidationCandidates({
     ids: queued.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
-    standingReviewer: recordingReviewer,
+    standingReviewer: recordingReviewer as never,
   });
-
+  assert.equal(modes.length, 1, `reviewed once: ${JSON.stringify(modes)}`);
   assert.deepEqual(modes, ['volunteered'],
     'a statement nothing has judged yet must not be reviewed under the instructions '
     + 'that assume an explicit memory marker');

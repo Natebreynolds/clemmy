@@ -180,6 +180,9 @@ export class HarnessSession {
     observation = this.syntheticObservation()): PersistedConversation {
     const current = getSession(this.row.id);
     if (!current) throw new Error(`session not found: ${this.row.id}`);
+    // A runner that handed back no history list has nothing to merge into;
+    // its snapshot is kept exactly as it came, as before synthetic turns.
+    if (!Array.isArray(snapshot.items)) return snapshot;
     const observed = new Set(observation.observedIds);
     const unseen = syntheticUserTurns(current).filter(entry => !observed.has(entry.id));
     const currentItems = (current.metadata[META_CONVERSATION] as Partial<PersistedConversation> | undefined)?.items;

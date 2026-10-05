@@ -34,6 +34,40 @@ import {
 import { promoteReflectionCandidateById, reconcileKnownPendingCandidates } from '../../memory/candidate-review.js';
 import type { EvalCase, EvalRunOutcome } from './eval-case.js';
 
+/**
+ * An automatic capture admitted the way a live turn admits it: the owner's
+ * message is an accepted source with its session context retained, and each
+ * selected claim carries its exact origin. Without that, the drain has no
+ * source to reopen and rejects the row.
+ */
+async function acceptedCapture(sessionId: string, message: string) {
+  const log = await import('../harness/eventlog.js');
+  const contexts = await import('../harness/source-session-context.js');
+  const capture = await import('../../memory/auto-capture.js');
+  if (!log.getSession(sessionId)) log.createSession({ id: sessionId, kind: 'chat' });
+  const prior = log.listEvents(sessionId, { types: ['user_input_received'] })
+    .find((event) => event.data.text === message);
+  const event = prior ?? log.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: message } });
+  if (!prior) contexts.captureFreshSourceSessionContext({ sessionId, sourceUserSeq: event.seq });
+  const input = { message, sessionId, sourceEventId: `user-source:${event.seq}`,
+    sourceProvenance: capture.autoCaptureProvenanceFromAcceptedEvent(event) };
+  const candidates = capture.selectAutoMemoryCandidates(message);
+  const origins = capture.automaticMemoryOriginsForCapture(input, candidates);
+  if (candidates.length === 0 || origins.some((origin) => origin === null)) throw new Error('the eval message was not admitted');
+  return { ...input, occurredAt: event.createdAt, candidates, origins: origins as NonNullable<(typeof origins)[number]>[] };
+}
+
+/** Every admitted claim is reviewed for its destination. The corpus runs with
+ *  no model, so a reviewer that keeps the claim where its kind puts it stands in. */
+async function keepWhereItsKindGoes(source: string, _text: string, _mode?: unknown, origin?: unknown) {
+  const { parseAutomaticStandingMemoryReview } = await import('../../memory/standing-memory-review.js');
+  const exact = origin as Parameters<typeof parseAutomaticStandingMemoryReview>[1];
+  if (source !== exact.source.ownerText) throw new Error('review source differs from its origin');
+  return parseAutomaticStandingMemoryReview({ durability: 'standing', claim: exact.claim, destination: 'kind_default',
+    destinationSpans: [], reason: 'controlled review' }, exact);
+}
+const reviewed = { standingReviewer: keepWhereItsKindGoes as never };
+
 export type MemoryEvalDimension =
   | 'direct_recall'
   | 'multi_session_reasoning'
@@ -958,25 +992,15 @@ export function buildMemoryIntegrityEvalCases(reset: () => void): EvalCase[] {
       label: 'memory:capture_replay',
       run: async () => {
         reset();
-        const input = {
-          message: 'My preferred contract reviewer is Sarah Chen.',
-          sessionId: 'memory-eval-auto-capture',
-          sourceEventId: 'turn:9',
-          occurredAt: '2026-07-15T20:00:00.000Z',
-          candidates: [{
-            kind: 'user' as const,
-            content: 'My preferred contract reviewer is Sarah Chen.',
-            reason: 'durable first-person declarative',
-          }],
-        };
+        const input = await acceptedCapture('memory-eval-auto-capture', 'My preferred contract reviewer is Sarah Chen.');
         const queued = enqueueAutoCaptureCandidates(input);
         // The original process exits after durable intake but before its
         // microtask starts. A fresh database handle represents daemon restart.
         closeMemoryDb();
         openMemoryDb();
-        const replay = await drainDurableConsolidationCandidates({ ids: queued.candidateIds });
+        const replay = await drainDurableConsolidationCandidates({ ids: queued.candidateIds, ...reviewed });
         const redelivery = enqueueAutoCaptureCandidates(input);
-        const duplicateReplay = await drainDurableConsolidationCandidates({ ids: redelivery.candidateIds });
+        const duplicateReplay = await drainDurableConsolidationCandidates({ ids: redelivery.candidateIds, ...reviewed });
         const db = openMemoryDb();
         const candidate = db.prepare(`
           SELECT status, resulting_fact_id, attempt_count
@@ -1022,21 +1046,11 @@ export function buildMemoryIntegrityEvalCases(reset: () => void): EvalCase[] {
       label: 'memory:identity_resolution',
       run: async () => {
         reset();
-        const input = {
-          message: 'My CFO is Dana Wilson (dana.wilson@acme.example).',
-          sessionId: 'memory-eval-user-person',
-          sourceEventId: 'turn:12',
-          occurredAt: '2026-07-15T20:30:00.000Z',
-          candidates: [{
-            kind: 'user' as const,
-            content: 'My CFO is Dana Wilson (dana.wilson@acme.example).',
-            reason: 'durable first-person declarative',
-          }],
-        };
+        const input = await acceptedCapture('memory-eval-user-person', 'My CFO is Dana Wilson (dana.wilson@acme.example).');
         const queued = enqueueAutoCaptureCandidates(input);
-        const first = await drainDurableConsolidationCandidates({ ids: queued.candidateIds });
+        const first = await drainDurableConsolidationCandidates({ ids: queued.candidateIds, ...reviewed });
         const redelivery = enqueueAutoCaptureCandidates(input);
-        const replay = await drainDurableConsolidationCandidates({ ids: redelivery.candidateIds });
+        const replay = await drainDurableConsolidationCandidates({ ids: redelivery.candidateIds, ...reviewed });
         const db = openMemoryDb();
         const candidate = db.prepare(`
           SELECT status, resulting_fact_id FROM memory_reflection_candidates WHERE id = ?

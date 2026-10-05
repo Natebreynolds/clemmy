@@ -10,6 +10,7 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const eventlog = await import('../runtime/harness/eventlog.js');
+const contexts = await import('../runtime/harness/source-session-context.js');
 const memory = await import('./db.js');
 const capture = await import('./auto-capture.js');
 const consolidation = await import('./durable-consolidation.js');
@@ -33,6 +34,9 @@ function acceptedSource(text: string, extra: Record<string, unknown> = {}) {
     type: 'user_input_received',
     data: { text, ...extra },
   });
+  // Accepted the way a live turn is: its session context is retained, so an
+  // automatic capture from it can be reopened and reviewed.
+  contexts.captureFreshSourceSessionContext({ sessionId: session.id, sourceUserSeq: source.seq });
   return { sessionId: session.id, source, provenance: capture.autoCaptureProvenanceFromAcceptedEvent(source) };
 }
 
@@ -96,10 +100,21 @@ test('owner authorship admits a narrower clause and either accepted text, and no
 
 // The ordinary capture path also drains its own candidates in a microtask, so
 // settle on the rows' recorded status rather than on one drain's count.
+/** Every admitted claim is reviewed for its destination; with no model in the
+ *  test, a reviewer that keeps the claim where its kind puts it stands in. */
+async function keepWhereItsKindGoes(source: string, _text: string, _mode?: unknown, origin?: unknown) {
+  const { parseAutomaticStandingMemoryReview } = await import('./standing-memory-review.js');
+  const exact = origin as Parameters<typeof parseAutomaticStandingMemoryReview>[1];
+  assert.equal(source, exact.source.ownerText);
+  return parseAutomaticStandingMemoryReview({ durability: 'standing', claim: exact.claim, destination: 'kind_default',
+    destinationSpans: [], reason: 'controlled review' }, exact);
+}
+
 async function promote(ids: number[]): Promise<void> {
   const placeholders = ids.map(() => '?').join(',');
   for (let attempt = 0; attempt < 50; attempt += 1) {
-    await consolidation.drainDurableConsolidationCandidates({ ids, limit: ids.length });
+    await consolidation.drainDurableConsolidationCandidates({ ids, limit: ids.length,
+      resolver: async () => ({ decision: 'ADD' as const }), standingReviewer: keepWhereItsKindGoes as never });
     const rows = memory.openMemoryDb().prepare(
       `SELECT status FROM memory_reflection_candidates WHERE id IN (${placeholders})`,
     ).all(...ids) as Array<{ status: string }>;
