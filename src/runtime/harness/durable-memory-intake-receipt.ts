@@ -443,9 +443,28 @@ function deriveExactEvidence(input: { sessionId: string; sourceUserSeq: number }
   } catch (error) { return { status: 'storage_error', reason: boundedReason(error) }; }
 }
 
+/** The reason the automatic layer gives a statement nobody has judged yet:
+ *  it was volunteered for background review, not stated as something to keep. */
+export const VOLUNTEERED_FOR_REVIEW_REASON = 'owner statement — model decides durability';
+
+/** Whether this source's verified intake holds a claim the owner stated as
+ *  something to keep (a remember request, a correction, a preference or a
+ *  standing instruction), rather than only statements volunteered for review. */
+export function verifiedIntakeHasOwnerStatedMemory(input: { sessionId: string; sourceUserSeq: number }): boolean {
+  try {
+    const loaded = readVerifiedIntake(input);
+    return loaded.status === 'ok'
+      && loaded.intake.rows.some(row => row.intake_reason !== null && row.intake_reason !== VOLUNTEERED_FOR_REVIEW_REASON);
+  } catch { return false; }
+}
+
 export function verifiedMemoryIntakeContext(input: { sessionId: string; sourceUserSeq: number }): string | null {
   const loaded = readVerifiedIntake(input);
   if (loaded.status !== 'ok' || loaded.intake.rows.some(row => !['pending', 'promoted'].includes(row.status))) return null;
+  // The notice stops a duplicate save of what the owner stated to keep. A
+  // statement volunteered for background review was not, so an ordinary
+  // question carries no memory notice.
+  if (!loaded.intake.rows.some(row => row.intake_reason !== null && row.intake_reason !== VOLUNTEERED_FOR_REVIEW_REASON)) return null;
   return '[Verified memory intake] The automatic layer has durably queued these exact accepted claims and their original context. Do not duplicate those claims through memory_remember solely to save them again while consolidation is pending. Destination or canonical-fact qualification may still be unresolved; this intake is not saved-memory or completion proof. Report pending work accurately and continue any separate requested work.';
 }
 

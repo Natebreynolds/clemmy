@@ -6,7 +6,7 @@ import { retainConnectionExecutionProgress } from './connection-execution-progre
 import { assertHostConnectionProgress, bindHostConnectionProgress, clearHostConnectionProgress, type HostConnectionProgress } from './host-connection-progress.js';
 import { declaresWorkflowDispatchReceipt } from './workflow-dispatch-commit.js';
 import { responseFormatRepairPacket } from './response-format-repair.js';
-import { verifiedMemoryIntakeContext, verifiedMemoryConsolidationEvidence } from './durable-memory-intake-receipt.js';
+import { verifiedIntakeHasOwnerStatedMemory, verifiedMemoryIntakeContext, verifiedMemoryConsolidationEvidence } from './durable-memory-intake-receipt.js';
 import { hostModelOutputPreview } from './host-model-output-preview.js';
 import { workflowActivationSuccessor } from './workflow-activation-successor.js';
 import { expectedWorkPlanLines } from './expected-work-admission.js';
@@ -4366,8 +4366,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // It cannot waive an already-retained correction; the old zero-work and
       // pending-intake floors remain independent and unchanged.
       if (!enabled) return false;
+      // Memory work the owner asked for, stated, or the turn performed. A
+      // statement the automatic layer volunteered for background review is not
+      // this turn's memory work, so an ordinary question is reviewed as an
+      // ordinary answer.
       return explicitMemoryCompletionRequired() || sourceHasMemoryToolActivity(identity)
-        || Boolean(verifiedMemoryConsolidationEvidence(identity)?.length);
+        || (Boolean(verifiedMemoryConsolidationEvidence(identity)?.length) && verifiedIntakeHasOwnerStatedMemory(identity));
     } catch { return true; } // Unknown evidence cannot waive the requirement branch.
   };
   const memoryRequirementCompletion = (includeReview = true): ReturnType<typeof memoryCorrectionCompletion> => {

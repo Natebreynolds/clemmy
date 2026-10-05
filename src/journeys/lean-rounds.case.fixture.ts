@@ -349,7 +349,12 @@ let reviews = 0;
 mock.method(CodexModelProvider.prototype, 'getModel', () => ({
   async getResponse() {
     reviews += 1;
-    return { usage: new Usage(), responseId: `review-${reviews}`, output: [textMessage('DONE: the reply answers the request from the settled results.')] };
+    // The reviewer answers as it is told to: the verdict, and the one memory
+    // requirement line (ignored unless the review asked for it).
+    return { usage: new Usage(), responseId: `review-${reviews}`, output: [textMessage([
+      'DONE: the reply answers the request from the settled results.',
+      'MEMORY_REQUIREMENT: {"version":1,"kind":"none","corrections":[],"reason":"a lookup asks nothing to be remembered"}',
+    ].join('\n'))] };
   },
   async *getStreamedResponse() { throw new Error('completion review uses the one-turn nonstreaming Runner'); },
 }) as never);

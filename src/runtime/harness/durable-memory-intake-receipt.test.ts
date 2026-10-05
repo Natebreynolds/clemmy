@@ -831,3 +831,8 @@ test('a still-pending admitted memory instruction cannot publish a conversationa
   assert.equal(result.presentation.status,'blocked');
   assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) n FROM durable_memory_intake_receipts WHERE session_id=?').get(task.sessionId) as {n:number}).n,0);
 });
+
+test('the receipt reads volunteered statements by the same reason the drain writes', async () => {
+  const { UNJUDGED_OWNER_STATEMENT_REASON } = await import('../../memory/durable-consolidation.js');
+  assert.equal(receipts.VOLUNTEERED_FOR_REVIEW_REASON, UNJUDGED_OWNER_STATEMENT_REASON);
+});
