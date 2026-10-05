@@ -62,12 +62,81 @@ export function resolveInstalledAppBundle(candidates, readDaemonVersion) {
   return found[0];
 }
 
+/** The native parts of a bundle: what launches, declares and seals it. A
+ * guarded patch never writes them and proves they did not change. */
+export const SEALED_SHELL_PARTS = Object.freeze([
+  'Contents/MacOS/Clementine',
+  'Contents/Info.plist',
+  'Contents/Resources/app.asar',
+  'Contents/_CodeSignature/CodeResources',
+]);
+
+const GUARDED_PATCHES = new WeakSet();
+
+/**
+ * Everywhere this bundle's updater can stage an install that applies on quit,
+ * read from the bundle itself: its download cache (app-update.yml) and its
+ * installer's staging (named for the bundle id). Unreadable names refuse,
+ * since an unknown staging place cannot be proven empty.
+ */
+export function updaterStagingPaths({ app, home }, fileOps = fs) {
+  const bundle = path.resolve(app);
+  const cacheDir = /^updaterCacheDirName:\s*['"]?([^'"\n]+?)['"]?\s*$/m
+    .exec(fileOps.readFileSync(path.join(bundle, 'Contents/Resources/app-update.yml'), 'utf8'))?.[1];
+  const bundleId = /<key>CFBundleIdentifier<\/key>\s*<string>([^<]+)<\/string>/
+    .exec(fileOps.readFileSync(path.join(bundle, 'Contents/Info.plist'), 'utf8'))?.[1];
+  if (!cacheDir || !bundleId) throw new Error(`Refusing a guarded patch: cannot read where ${bundle} stages updates.`);
+  const caches = path.join(home, 'Library', 'Caches');
+  const shipIt = path.join(caches, `${bundleId}.ShipIt`);
+  const shipItUpdates = fileOps.existsSync(shipIt)
+    ? fileOps.readdirSync(shipIt).filter((name) => name.startsWith('update.')).map((name) => path.join(shipIt, name))
+    : [];
+  return [
+    path.join(caches, cacheDir, 'pending'),
+    path.join(caches, cacheDir, 'update.zip'),
+    path.join(shipIt, 'ShipItState.plist'),
+    ...shipItUpdates,
+  ];
+}
+
+/**
+ * Proof that patching an installed app's runtime resources in place is safe.
+ *
+ * A bundle patched while the updater replaces its native parts during the same
+ * quit relaunches as neither the signed release nor the patch, and macOS calls
+ * it damaged. A guarded patch is allowed only when nothing can do that: the app
+ * is not running, no update is staged to apply on quit, and every native part
+ * is byte-identical to the snapshot the caller took before quitting. Anything
+ * unproven refuses.
+ */
+export function verifyGuardedSealedPatch({ app, shellSnapshot, updaterStagingPaths, isRunning }, fileOps = fs) {
+  const bundle = path.resolve(app);
+  if (isRunning()) throw new Error(`Refusing a guarded patch: ${bundle} is still running.`);
+  const staged = updaterStagingPaths.filter((candidate) => fileOps.existsSync(candidate));
+  if (staged.length > 0) throw new Error(`Refusing a guarded patch: an update is staged to apply on quit (${staged.join(', ')}).`);
+  const digest = (rel) => createHash('sha256').update(fileOps.readFileSync(path.join(bundle, rel))).digest('hex');
+  for (const rel of SEALED_SHELL_PARTS) {
+    if (typeof shellSnapshot?.[rel] !== 'string') throw new Error(`Refusing a guarded patch: no pre-quit snapshot of ${rel}.`);
+    if (digest(rel) !== shellSnapshot[rel]) throw new Error(`Refusing a guarded patch: ${rel} changed since the pre-quit snapshot.`);
+  }
+  // The install guard compares resolved paths, so the proof names both.
+  const proof = Object.freeze({ app: bundle, canonical: fileOps.realpathSync(bundle) });
+  GUARDED_PATCHES.add(proof);
+  return proof;
+}
+
 /** In-place patching cannot preserve an app's resource seal. Reject every
  * app/Contents target, including damaged or unsigned bundles; signature failure
- * is never permission to modify one. Install a signed whole bundle instead. */
-export function assertMutableInstallTarget(targetPath) {
+ * is never permission to modify one. The one exception is a guarded patch
+ * (verifyGuardedSealedPatch) of that app's runtime resources, never its native
+ * parts. Otherwise install a signed whole bundle. */
+export function assertMutableInstallTarget(targetPath, guarded) {
   const target = path.resolve(targetPath);
+  const runtimes = guarded && GUARDED_PATCHES.has(guarded)
+    ? [guarded.app, guarded.canonical].map((root) => path.join(root, 'Contents', 'Resources', 'daemon') + path.sep)
+    : [];
   const rejectAppContents = (candidate) => {
+    if (runtimes.some((runtime) => candidate.startsWith(runtime))) return;
     const parts = candidate.split(path.sep);
     if (parts.some((part, index) => /\.app$/i.test(part) && /^contents$/i.test(parts[index + 1] ?? ''))) {
       throw new Error(`Refusing in-place installation inside an app bundle: ${target}. Use the signed whole-bundle installation path (scripts/hotpatch-installed.sh).`);
@@ -99,10 +168,10 @@ export function assertMutableInstallTarget(targetPath) {
   }
 }
 
-export function installDaemonPatch({ sourceDist, targetDist }, fileOps = fs) {
+export function installDaemonPatch({ sourceDist, targetDist, guarded }, fileOps = fs) {
   const source = path.resolve(sourceDist);
   const target = path.resolve(targetDist);
-  assertMutableInstallTarget(target);
+  assertMutableInstallTarget(target, guarded);
   if (source === target || source.startsWith(`${target}${path.sep}`) || target.startsWith(`${source}${path.sep}`)) {
     throw new Error('Source and installation must be separate directories.');
   }
@@ -146,10 +215,10 @@ export function installDaemonPatch({ sourceDist, targetDist }, fileOps = fs) {
  * skill from this directory on every boot, so shipping new code without it
  * leaves a skill the new code names absent from the installation.
  */
-export function installBundledAssetDirectory({ sourceDir, targetDir }, fileOps = fs) {
+export function installBundledAssetDirectory({ sourceDir, targetDir, guarded }, fileOps = fs) {
   const source = path.resolve(sourceDir);
   const target = path.resolve(targetDir);
-  assertMutableInstallTarget(target);
+  assertMutableInstallTarget(target, guarded);
   if (source === target || source.startsWith(`${target}${path.sep}`) || target.startsWith(`${source}${path.sep}`)) {
     throw new Error('Source and installation must be separate directories.');
   }

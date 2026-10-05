@@ -3,7 +3,16 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { installBundledAssetDirectory, installDaemonPatch, resolveInstalledAppBundle } from './hotpatch-daemon.mjs';
+import { createHash } from 'node:crypto';
+import {
+  SEALED_SHELL_PARTS,
+  assertMutableInstallTarget,
+  installBundledAssetDirectory,
+  installDaemonPatch,
+  resolveInstalledAppBundle,
+  updaterStagingPaths,
+  verifyGuardedSealedPatch,
+} from './hotpatch-daemon.mjs';
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'daemon-patch-'));
@@ -219,4 +228,130 @@ test('tree CLI rejects a synthetic app before process checks, quit, staging, or 
   await assert.rejects(result, REFUSED_BUNDLE);
   assert.deepEqual(commands, []);
   assert.deepEqual(fs.readdirSync(daemon), ['package.json']);
+});
+
+// A synthetic bundle with every native part, an updater config, and a runtime.
+function guardedFixture(t) {
+  const f = fixture(t);
+  const app = path.join(f.root, 'Fixture.app');
+  const home = path.join(f.root, 'home');
+  const write = (rel, text) => {
+    fs.mkdirSync(path.dirname(path.join(app, rel)), { recursive: true });
+    fs.writeFileSync(path.join(app, rel), text);
+  };
+  write('Contents/MacOS/Clementine', 'native launcher');
+  write('Contents/Info.plist', '<dict>\n  <key>CFBundleIdentifier</key>\n  <string>com.example.fixture</string>\n</dict>');
+  write('Contents/Resources/app.asar', 'packaged shell');
+  write('Contents/_CodeSignature/CodeResources', 'seal');
+  write('Contents/Resources/app-update.yml', "provider: github\nupdaterCacheDirName: '@fixture-updater'\n");
+  write('Contents/Resources/daemon/dist/index.js', 'old daemon');
+  fs.mkdirSync(path.join(home, 'Library', 'Caches'), { recursive: true });
+  const snapshot = Object.fromEntries(SEALED_SHELL_PARTS.map((rel) => [
+    rel, createHash('sha256').update(fs.readFileSync(path.join(app, rel))).digest('hex'),
+  ]));
+  const prove = (overrides = {}) => verifyGuardedSealedPatch({
+    app, shellSnapshot: snapshot, updaterStagingPaths: updaterStagingPaths({ app, home }), isRunning: () => false, ...overrides,
+  });
+  return { ...f, app, home, snapshot, prove, daemonDist: path.join(app, 'Contents/Resources/daemon/dist') };
+}
+
+test('a guarded patch replaces only the proven app runtime and keeps rollback', t => {
+  const g = guardedFixture(t);
+  const guarded = g.prove();
+  const patched = installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded });
+  assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'new daemon');
+  assert.equal(fs.readFileSync(path.join(patched.backup, 'index.js'), 'utf8'), 'old daemon');
+  fs.mkdirSync(path.join(g.app, 'Contents/Resources/daemon/apps/web'), { recursive: true });
+  const assets = installBundledAssetDirectory({ sourceDir: g.sourceDist, targetDir: path.join(g.app, 'Contents/Resources/daemon/apps/web/dist'), guarded });
+  assert.equal(assets.backup, null);
+  assert.doesNotThrow(() => g.prove(), 'native parts are still the snapshot after the patch');
+});
+
+test('without a proof the same runtime target is still refused', t => {
+  const g = guardedFixture(t);
+  rejectsBothInstallers(g, g.daemonDist);
+  const forged = Object.freeze({ app: g.app });
+  assert.throws(() => assertMutableInstallTarget(g.daemonDist, forged), REFUSED_BUNDLE, 'a look-alike object is not a proof');
+  assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'old daemon');
+});
+
+test('a proof never reaches native parts, other resources, or another bundle', t => {
+  const g = guardedFixture(t);
+  const guarded = g.prove();
+  for (const rel of ['Contents/MacOS', 'Contents/Resources/app.asar.unpacked/dist', 'Contents/_CodeSignature', 'Contents/Resources', 'Contents/Resources/daemon']) {
+    assert.throws(() => assertMutableInstallTarget(path.join(g.app, rel), guarded), REFUSED_BUNDLE, rel);
+  }
+  assert.throws(() => assertMutableInstallTarget(path.join(g.app, 'Contents/Resources/daemon-other/dist'), guarded), REFUSED_BUNDLE);
+  const other = path.join(g.root, 'Other.app', 'Contents', 'Resources', 'daemon', 'dist');
+  fs.mkdirSync(other, { recursive: true });
+  assert.throws(() => assertMutableInstallTarget(other, guarded), REFUSED_BUNDLE);
+  const alias = path.join(g.app, 'Contents/Resources/daemon/escape');
+  fs.symlinkSync(path.join(g.app, 'Contents/MacOS'), alias, 'dir');
+  assert.throws(() => assertMutableInstallTarget(path.join(alias, 'dist'), guarded), REFUSED_BUNDLE, 'a link out of the runtime resolves to native parts');
+});
+
+test('a guarded patch refuses a running app, a staged update, or a changed or missing snapshot', async t => {
+  await t.test('running', t => {
+    const g = guardedFixture(t);
+    assert.throws(() => g.prove({ isRunning: () => true }), /still running/);
+  });
+  for (const [name, stage] of [
+    ['downloaded update', (home) => fs.mkdirSync(path.join(home, 'Library/Caches/@fixture-updater/pending'), { recursive: true })],
+    ['downloaded zip', (home) => { fs.mkdirSync(path.join(home, 'Library/Caches/@fixture-updater'), { recursive: true }); fs.writeFileSync(path.join(home, 'Library/Caches/@fixture-updater/update.zip'), 'zip'); }],
+    ['installer state', (home) => { fs.mkdirSync(path.join(home, 'Library/Caches/com.example.fixture.ShipIt'), { recursive: true }); fs.writeFileSync(path.join(home, 'Library/Caches/com.example.fixture.ShipIt/ShipItState.plist'), 'state'); }],
+    ['unpacked installer update', (home) => fs.mkdirSync(path.join(home, 'Library/Caches/com.example.fixture.ShipIt/update.abc123'), { recursive: true })],
+  ]) {
+    await t.test(name, t => {
+      const g = guardedFixture(t);
+      stage(g.home);
+      assert.throws(() => g.prove(), /an update is staged to apply on quit/);
+    });
+  }
+  for (const rel of SEALED_SHELL_PARTS) {
+    await t.test(`changed ${rel}`, t => {
+      const g = guardedFixture(t);
+      fs.appendFileSync(path.join(g.app, rel), '\n<!-- replaced during quit -->');
+      assert.throws(() => g.prove(), /changed since the pre-quit snapshot/);
+    });
+  }
+  await t.test('incomplete snapshot', t => {
+    const g = guardedFixture(t);
+    const { ['Contents/Info.plist']: _omitted, ...partial } = g.snapshot;
+    assert.throws(() => g.prove({ shellSnapshot: partial }), /no pre-quit snapshot of Contents\/Info\.plist/);
+  });
+  await t.test('unreadable updater config', t => {
+    const g = guardedFixture(t);
+    fs.rmSync(path.join(g.app, 'Contents/Resources/app-update.yml'));
+    assert.throws(() => updaterStagingPaths({ app: g.app, home: g.home }), /no such file/);
+    fs.writeFileSync(path.join(g.app, 'Contents/Resources/app-update.yml'), 'provider: github\n');
+    assert.throws(() => updaterStagingPaths({ app: g.app, home: g.home }), /cannot read where/);
+  });
+});
+
+test('tree CLI with a guarded snapshot refuses a changed shell before staging or relaunch', async t => {
+  const g = guardedFixture(t);
+  fs.writeFileSync(path.join(g.app, 'Contents/Resources/daemon/package.json'), JSON.stringify({ version: '0.0.0' }));
+  const snapshotFile = path.join(g.root, 'native-before.json');
+  fs.writeFileSync(snapshotFile, JSON.stringify({ ...g.snapshot, 'Contents/Resources/app.asar': '0'.repeat(64) }));
+  const moduleUrl = new URL('./hotpatch-installed-tree.mjs', import.meta.url);
+  const body = fs.readFileSync(moduleUrl, 'utf8').replace(/^import[\s\S]*?from ['"][^'"]+['"];\s*$/gm, '')
+    .replaceAll('import.meta.url', JSON.stringify(moduleUrl.href));
+  const helpers = await import('./hotpatch-daemon.mjs');
+  const { Script } = await import('node:vm');
+  const { fileURLToPath } = await import('node:url');
+  const commands = [];
+  const result = new Script(`(async () => { ${body}\n})()`).runInNewContext({
+    ...helpers, fs, path, createHash, fileURLToPath,
+    process: { argv: ['node', moduleUrl.pathname, '--no-relaunch', '--guarded-shell-snapshot', snapshotFile], env: { HOME: g.home, CLEMENTINE_APP_PATH: g.app }, exit(code) { throw new Error(`unexpected exit ${code}`); } },
+    console: { log() {}, error() {} },
+    execFileSync(command) {
+      commands.push(command);
+      if (command === 'pgrep') throw Object.assign(new Error('no match'), { status: 1 });
+      throw new Error(`unexpected subprocess: ${command}`);
+    },
+  });
+  await assert.rejects(result, /changed since the pre-quit snapshot/);
+  assert.deepEqual([...new Set(commands)], ['pgrep'], 'only the process check runs; no quit, no relaunch');
+  assert.deepEqual(fs.readdirSync(path.join(g.app, 'Contents/Resources/daemon')).sort(), ['dist', 'package.json']);
+  assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'old daemon');
 });

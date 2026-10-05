@@ -11,7 +11,12 @@
  * Must run from a process holding macOS "App Management" permission: the bundle
  * carries com.apple.provenance, so anything without that grant gets EPERM.
  *
- *   node --import tsx scripts/patch-web-assets.mjs [--no-relaunch]
+ * App bundles are refused unless --guarded-shell-snapshot names the native-part
+ * hashes the caller recorded before quitting the app itself; the patch then
+ * runs only while that proof holds (verifyGuardedSealedPatch) and re-proves it
+ * after writing.
+ *
+ *   node --import tsx scripts/hotpatch-installed-tree.mjs [--no-relaunch] [--guarded-shell-snapshot <file>]
  */
 import {
   assertMutableInstallTarget,
@@ -19,6 +24,8 @@ import {
   installBundledAssetDirectory,
   installDaemonPatch,
   resolveInstalledAppBundle,
+  updaterStagingPaths,
+  verifyGuardedSealedPatch,
 } from './hotpatch-daemon.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -28,6 +35,9 @@ import { fileURLToPath } from 'node:url';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RELAUNCH = !process.argv.includes('--no-relaunch');
+const SNAPSHOT_FLAG = process.argv.indexOf('--guarded-shell-snapshot');
+const SHELL_SNAPSHOT = SNAPSHOT_FLAG >= 0 ? process.argv[SNAPSHOT_FLAG + 1] : null;
+if (SNAPSHOT_FLAG >= 0 && !SHELL_SNAPSHOT) throw new Error('--guarded-shell-snapshot needs the pre-quit snapshot file.');
 
 function treeDigest(root) {
   const h = createHash('sha256');
@@ -79,7 +89,20 @@ const installed = resolveInstalledAppBundle(
 );
 const APP = installed.bundle;
 // Refuse sealed resources before even checking or stopping the running app.
-assertMutableInstallTarget(path.join(APP, 'Contents/Resources/daemon/dist'));
+// A guarded patch is proven after the caller's quit instead, so this script
+// never quits the app itself on that path.
+if (!SHELL_SNAPSHOT) assertMutableInstallTarget(path.join(APP, 'Contents/Resources/daemon/dist'));
+else if (running()) {
+  console.error('REFUSED: a guarded patch runs only after the caller has quit Clementine by its bundle path.');
+  process.exit(1);
+}
+const proveGuard = () => verifyGuardedSealedPatch({
+  app: APP,
+  shellSnapshot: JSON.parse(fs.readFileSync(SHELL_SNAPSHOT, 'utf8')),
+  updaterStagingPaths: updaterStagingPaths({ app: APP, home }),
+  isRunning: running,
+});
+const guarded = SHELL_SNAPSHOT ? proveGuard() : undefined;
 
 const IDLE_REQUIRED_SECONDS = 90;
 
@@ -116,6 +139,7 @@ const report = { patchedAt: new Date().toISOString(), bundle: APP, wasVersion: i
 const daemon = installDaemonPatch({
   sourceDist: path.join(REPO, 'dist'),
   targetDist: path.join(APP, 'Contents/Resources/daemon/dist'),
+  guarded,
 });
 report.parts.daemon = { digest: daemon.digest, backup: daemon.backup ?? null };
 console.log(`daemon        ${daemon.digest.slice(0, 16)}  prior: ${daemon.backup ?? '(none)'}`);
@@ -128,7 +152,7 @@ const trees = [
 ];
 for (const [name, sourceDir, targetDir] of trees) {
   const built = treeDigest(sourceDir);
-  const result = installBundledAssetDirectory({ sourceDir, targetDir });
+  const result = installBundledAssetDirectory({ sourceDir, targetDir, guarded });
   const served = treeDigest(targetDir);
   const match = built === served;
   report.parts[name] = { built, served, match, backup: result.backup ?? null };
@@ -138,6 +162,13 @@ for (const [name, sourceDir, targetDir] of trees) {
     fs.writeFileSync(path.join(REPO, 'output/ui-hotpatch-receipt.json'), JSON.stringify(report, null, 2) + '\n');
     process.exit(2);
   }
+}
+
+if (guarded) {
+  // The patch wrote only runtime resources; prove the native parts still match.
+  proveGuard();
+  report.guardedShell = 'unchanged';
+  console.log('native parts   unchanged after the patch');
 }
 
 fs.mkdirSync(path.join(REPO, 'output'), { recursive: true });
