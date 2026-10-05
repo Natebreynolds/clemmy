@@ -2662,8 +2662,11 @@ test('compound decline memory admission is fresh-clause-only and idempotent acro
     runRunner,
   });
 
-  assert.equal((await run()).status, 'completed');
-  assert.equal((await run()).status, 'completed', 'a fresh physical run can re-drive the same durable source');
+  // Nothing reviews the captured claim in this test, so the turn may not claim
+  // it saved: it stops honestly with the memory still pending, and a second
+  // physical run re-drives the same durable source to the same stop.
+  assert.equal((await run()).status, 'blocked');
+  assert.equal((await run()).status, 'blocked', 'a fresh physical run can re-drive the same durable source');
 
   const expectedCallId = `auto-capture:user-source:${accepted.seq}`;
   const episodes = openMemoryDb().prepare(`
