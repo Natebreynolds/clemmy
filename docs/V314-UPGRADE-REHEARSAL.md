@@ -9,9 +9,9 @@ exercises the installed product against the same disposable migrated home. The
 only model endpoint is a loopback fixture server. Every path remains below the
 operating system's temporary directory.
 
-## Current candidate: harness schema v92
+## Current candidate: harness schema v93
 
-Target reviewed: 2026-10-02. The migration authority is
+Target reviewed: 2026-10-05. The migration authority is
 `src/runtime/harness/eventlog-schema.ts`; retained-proof migration details live
 in `src/runtime/harness/retained-session-proof-schema.ts`.
 
@@ -32,6 +32,7 @@ execute saved scripts, or replay completed effects.
 | 90 | Replace the batch admission and checkpoint UPDATE fences with fences that allow only an exact inline-to-object storage conversion, and add `accepted_model_history_conversion_v1` cursors. | No row is converted by the migration. A conversion must reproduce the original bytes exactly; every semantic column, DELETE fence and digest stays unchanged, and a no-op or downgrade update is still refused. |
 | 91 | Add three partial expression indexes on `events` for read receipts and settlements. | Lookup only: no event is copied, rewritten or deduplicated; duplicate receipts remain detectable. |
 | 92 | Recreate the host and logical result-receipt lineage triggers to read the admitted frame through `accepted_model_batch_admissions_readable_v1`. | Every lineage condition is unchanged; a frame held as an object is found exactly as an inline one. No receipt is created or altered by the migration. |
+| 93 | Rebuild `durable_memory_intake_receipts` so its checks admit protocol 2 receipts (`memory-intake:v2:` ids) beside protocol 1, recreating its indexes and triggers from their original SQL. | Every v1 receipt is copied column for column and stays readable history; only a v2 receipt can establish new memory completion. The migration refuses an unexpected predecessor declaration, a preexisting replacement table or inbound foreign keys, and fails if the rebuilt table has a foreign-key violation. |
 
 A second open must preserve the resulting schema and rows. The rehearsal must
 reach the exported current schema version and compare both migrated boots.
@@ -70,7 +71,7 @@ v3.14 graph; any installed dependency drift refuses exact-tag execution.
 
 | Store | v3.14.0 | Current target | Upgrade behavior | Rehearsed |
 |---|---:|---:|---|---|
-| `state/harness.db` | migration 20 | exported `HARNESS_SCHEMA_VERSION` (currently 92) | numbered, transactional migrations 21 through current; contiguous ledger required | Yes, using a real v20 database created by tag APIs |
+| `state/harness.db` | migration 20 | exported `HARNESS_SCHEMA_VERSION` (currently 93) | numbered, transactional migrations 21 through current; contiguous ledger required | Yes, using a real v20 database created by tag APIs |
 | `state/memory.db` | migration 32 | exported `MEMORY_SCHEMA_VERSION` | numbered migrations 33 through current; opening an old DB must first make an immutable pre-migration backup | Yes, including backup existence and second-open idempotence |
 | `state/workspaces.db` | `PRAGMA user_version=3` | 5 | v4 adds workflow binding/run projection/partition tables; v5 adds the canonical-entity projection head; Space remains a read model | Yes, with a v3 Space and dataset observation |
 | `state/workflow-triggers.db` | schema contract 4 | 4 | additive shape validation; no release-boundary version change | Yes, with exact cron and event triggers compiled by v3.14 |
