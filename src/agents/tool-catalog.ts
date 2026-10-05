@@ -141,6 +141,10 @@ export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
   // pre-dispatch on the host Plan lane (live 2026-09-14: scorpion-outbound).
   // The schema is a single name field — same class as ask_user_question.
   'skill_read',
+  // Clem's map of the app (what is set up, where each part lives). The owner
+  // asks "how do I…" without naming a tool, so it is named on every turn; its
+  // desk declaration keeps the schema off until it is used.
+  'app_guide',
 ]);
 
 /**

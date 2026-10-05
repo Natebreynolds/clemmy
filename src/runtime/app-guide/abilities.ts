@@ -215,7 +215,7 @@ const STATE_HEADINGS: Array<[AbilityState, string]> = [
 ];
 
 /** The guide as Clem reads it: abilities by state, then every place. */
-export function appGuideText(abilities: readonly AppAbility[]): string {
+export function appGuideText(abilities: readonly AppAbility[], options: { places?: boolean } = {}): string {
   const lines: string[] = ['What is set up in Clementine right now, and where each part lives.'];
   for (const [state, heading] of STATE_HEADINGS) {
     const rows = abilities.filter((ability) => ability.state === state);
@@ -225,8 +225,10 @@ export function appGuideText(abilities: readonly AppAbility[]): string {
       lines.push(`- ${ability.name}: ${ability.detail} Gives: ${ability.unlocks}. Place: ${ability.place}`);
     }
   }
-  lines.push('', 'Places (id: name, what it is for):');
-  for (const place of APP_PLACES) lines.push(`- ${place.id}: ${place.name}, ${place.purpose}${place.phone ? '' : ' (Mac only)'}`);
+  if (options.places !== false) {
+    lines.push('', 'Places (id: name, what it is for):');
+    for (const place of APP_PLACES) lines.push(`- ${place.id}: ${place.name}, ${place.purpose}${place.phone ? '' : ' (Mac only)'}`);
+  }
   lines.push('', 'To send the owner to a place, link it in your reply as [Open <name>](app:<id>); they tap it to go there. Say what to do once they are there.');
   return lines.join('\n');
 }

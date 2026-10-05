@@ -71,3 +71,9 @@ test('the guide lists every place and tells Clem how to link one', () => {
   assert.match(text, /\[Open <name>\]\(app:<id>\)/);
   assert.match(text, /meetings: Meetings, Recorded meetings and their summaries \(Mac only\)/);
 });
+
+test('the guide can leave the place list out when only what is set up matters', () => {
+  const text = appGuideText(appAbilitiesFromFacts(BLANK), { places: false });
+  assert.match(text, /Not set up:/);
+  assert.doesNotMatch(text, /Places \(id: name/);
+});

@@ -125,6 +125,7 @@ test(`a turn with no identified target follows the owner's no-signal rule (NO_TA
 /** Per deferred tool: arguments (a reader opens the workspace_roots output
  * retained by the turn's first call) and the handler's own answer. */
 const REACH: Record<string, { args: (context: MoveContext) => Record<string, unknown>; handler: RegExp; needsOutput?: boolean }> = {
+  app_guide: { args: () => ({ places: false }), handler: /What is set up in Clementine right now/ },
   check_in: { args: () => ({ note: 'Reading your workspace roots now.' }), handler: /Check-in posted to the conversation/ },
   file_query: { args: ({ callId }) => ({ query: 'workspace roots', call_id: callId(0) }), handler: /"source":"tool output [^"]*-c0","totalChunks":1/, needsOutput: true },
   recall_tool_result: { args: ({ callId }) => ({ call_id: callId(0) }), handler: /Recalled chars 0–\d+ of \d+[\s\S]*tool=workspace_roots/, needsOutput: true },
