@@ -376,7 +376,12 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
       return outcome('unsupported_capability', 'structured', `http_${status}`, status);
     }
     if (TRANSIENT_STATUS.has(status)) return outcome('transient', 'structured', `http_${status}`, status);
-    if (status >= 200 && status < 300 && signals.emptyResult) {
+    // A mutation that succeeded with nothing to return (a DELETE's 204, a
+    // provider's `{}`) is acknowledged work, not an empty answer to shop
+    // around: live 2026-10-06 a successful Outlook draft delete settled as
+    // empty_result → try_sibling_candidate, and Clem asked the owner to
+    // check Outlook by hand for a draft she had just verified was gone.
+    if (status >= 200 && status < 300 && signals.emptyResult && signals.mutating !== true) {
       return outcome('empty_result', 'structured', `http_${status}`);
     }
     if (status >= 200 && status < 300) return outcome('succeeded', 'structured', `http_${status}`);
@@ -391,9 +396,10 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
     return outcome('unknown', 'structured', 'mcp_is_error');
   }
   if (signals.envelopeSuccessful === true || signals.providerReportedError === false) {
-    return signals.emptyResult
+    return signals.emptyResult && signals.mutating !== true
       ? outcome('empty_result', 'structured', 'envelope_empty')
-      : outcome('succeeded', 'structured', signals.providerNoChange === true ? 'envelope_no_change' : 'envelope');
+      : outcome('succeeded', 'structured', signals.providerNoChange === true ? 'envelope_no_change'
+        : signals.emptyResult ? 'envelope_acknowledged_empty' : 'envelope');
   }
   if (signals.envelopeSuccessful === false) {
     // A structured failure is real, but WHY it failed is not stated. Keep the
