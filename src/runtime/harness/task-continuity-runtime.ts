@@ -433,6 +433,16 @@ export async function classifyUnsettledOpenQuestionReply(input: {
       reading: reading.kind ?? (reading.failedOpen ? 'unavailable' : 'unsure'),
       ...(typeof reading.confidence === 'number' ? { confidence: reading.confidence } : {}),
     };
+    // A plain go-ahead settles the question. Re-asking whatever the quick
+    // model still lists as open ("same wording as before, or fresh?") after
+    // the person said go is a hoop: live 2026-10-06, "Looks right, go." ended
+    // on a residual question. Jev tells a go-ahead from a partial answer; the
+    // brain takes the go-ahead: carry on, choose sensible defaults for what is
+    // left, say what was assumed, and ask only if something truly blocks.
+    if (reading.kind === 'affirms' && (reading.confidence ?? 0) >= OPEN_QUESTION_ANSWER_SURE) {
+      route = 'respond';
+      recordedReading = { ...recordedReading, partialAnswer: true };
+    }
   }
   let revision: ProposedClarificationRevision | undefined;
   if (route === 'reask' && !skipRevision) {
@@ -1733,7 +1743,7 @@ function partialAnswerContinuationInput(input: {
     '[host-directive]',
     partial
       ? 'The user answered part of your open question and may have changed something you proposed; an independent check found that not every decision is settled yet. Keep every answer and change they gave exactly as they stated it, including ranges. The pending step stays on hold: do not create, change, write, send, publish or delete anything for it, and do not treat a general "approved" as supplying a missing fact. Acknowledge what they supplied, then ask only for what is still missing, in your own words.'
-      : 'The user replied to your open question. No checked reading of how the reply changes the question is available, so read it yourself from the exact text above. If it answers or approves, the question is settled: carry the work on from the root task plus that answer, under whatever hold the root task itself set (a task that says to plan and not do it yet stays a plan). If it changes what you proposed, apply the change exactly as stated and show the result in the form you were asked for. If it truly does not answer, ask again in your own words. Never say the reply was recorded but could not be verified.',
+      : 'The user replied to your open question. No checked reading of how the reply changes the question is available, so read it yourself from the exact text above. If it answers or approves, the question is settled: carry the work on from the root task plus that answer, under whatever hold the root task itself set (a task that says to plan and not do it yet stays a plan); for anything your question left open that the reply did not pick, choose a sensible default and say what you assumed rather than asking again. If it changes what you proposed, apply the change exactly as stated and show the result in the form you were asked for. If it truly does not answer, ask again in your own words. Never say the reply was recorded but could not be verified.',
   ].join('\n');
   dismissTaskContinuityPacket({ sessionId: input.sessionId, reason: 'no_longer_needed' });
   return steer;

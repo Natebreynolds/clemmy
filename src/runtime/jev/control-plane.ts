@@ -427,7 +427,7 @@ export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, 
   };
 }
 
-export type OpenQuestionReplyKind = 'answers' | 'asks' | 'other';
+export type OpenQuestionReplyKind = 'answers' | 'affirms' | 'asks' | 'other';
 
 export interface OpenQuestionReplyReading {
   /** null when Jev was unavailable or not sure. */
@@ -461,9 +461,10 @@ export async function classifyOpenQuestionReplyWithJev(
     questions: {
       reply: {
         type: 'choice',
-        instructions: 'Clem paused to ask the user something before continuing, and the user replied. What does the reply do? A mixed reply that answers or changes ANY asked decision is answers even when it also asks a question; asks is a question back without an answer or amendment.',
+        instructions: 'Clem paused to ask the user something before continuing, and the user replied. What does the reply do? A mixed reply that answers or changes ANY asked decision is answers even when it also asks a question; a plain go-ahead that adds no fact, option or change is affirms; asks is a question back without an answer or amendment.',
         criteria: {
           answers: 'It answers or changes at least one decision Clem asked about: picks an option, supplies requested detail, accepts or declines, corrects an answer, or amends the proposed scope. Choose this for partial or mixed answers even when the same reply also asks a question. It does not mean every required decision is settled.',
+          affirms: 'It simply tells Clem to go ahead with what she proposed or already has ("yes", "go", "looks right, do it"), supplying no new fact, option or change.',
           asks: 'It only asks Clem a question or asks for clarification before deciding, and supplies no answer or amendment to any asked decision.',
           other: 'It talks about something else or starts different work.',
           none: 'Not sure.',
@@ -476,7 +477,7 @@ export async function classifyOpenQuestionReplyWithJev(
   });
   if (!result.ok) return { kind: null, failedOpen: true };
   const answer = result.answers.reply as ChoiceAnswer | undefined;
-  const kind = answer && (answer.choice === 'answers' || answer.choice === 'asks' || answer.choice === 'other')
+  const kind = answer && (answer.choice === 'answers' || answer.choice === 'affirms' || answer.choice === 'asks' || answer.choice === 'other')
     ? answer.choice as OpenQuestionReplyKind
     : null;
   noteJevDecisionOutcome(result.decisionId, kind ?? 'none', {
