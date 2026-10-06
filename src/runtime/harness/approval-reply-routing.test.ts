@@ -179,11 +179,10 @@ test('missing, malformed, multiple and queued references never fall back to a pl
   assert.equal(pending.getPendingAction(action.id)?.status, 'approval_requested');
 });
 
-test('a queued exact payload is declined in words like any other card; approving it in words waits on the executor', async () => {
+test('a queued exact payload is approved or declined in words like any other card, never amended in place', async () => {
   // Live 2026-10-06: "Yes, go ahead." to a waiting `ssh localhost` card
-  // started a fresh turn that queued a second copy of the command. Routing
-  // the approve then hit the listener's `not_action` failure on a
-  // chat-queued action, so only the decline is routed until that is fixed.
+  // started a fresh turn that queued a second copy of the command; once
+  // routed, the resume compiles the decision as the control source it is.
   const session = eventlog.createSession({ id: `approval-reply-queued-${++serial}`, kind: 'chat' });
   const action = pending.queuePendingAction({ title: 'Run `ssh localhost echo hi`', summary: 'Runs once', kind: 'shell_command',
     toolName: 'run_shell_command', payload: { command: 'ssh localhost echo hi' }, sessionId: session.id });
@@ -191,7 +190,7 @@ test('a queued exact payload is declined in words like any other card; approving
     args: { pendingActionId: action.id } });
   reading = { choice: 'approves', confidence: 0.95 };
   assert.deepEqual(await routeReplyToPendingApproval({ sessionId: session.id, text: 'Yes, go ahead.', parsed: null }),
-    null, 'an approve in words stays with conversation until the queued-action executor runs chat-queued actions');
+    { intent: { decision: 'approve', approvalId: queued.approvalId } });
   reading = { choice: 'declines', confidence: 0.95 };
   assert.deepEqual(await routeReplyToPendingApproval({ sessionId: session.id, text: 'No, skip it.', parsed: null }),
     { intent: { decision: 'reject', approvalId: queued.approvalId } });

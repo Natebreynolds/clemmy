@@ -3937,14 +3937,22 @@ export async function prepareDurableAcceptedTurnCompile(
   };
 }
 
-/** The hidden control source an approval resume mints: synthetic, and named
- * as such. Only that exact shape is compiled without the semantic port. */
-function isSyntheticApprovalResumeSource(identity: Pick<TurnIdentity, 'sessionId' | 'sourceUserSeq'>): boolean {
+/** An owner's decision on a card, however it arrived: the hidden control
+ * source an approval resume mints (synthetic, named as such), or the
+ * owner's own words that the chat or phone admission read as a decision on
+ * one exact card (`approvalId` + `decision` stamped at admission). Live
+ * 2026-10-06: "Yes, go ahead." to a queued `ssh` card carried both stamps,
+ * was still read by the semantic model as small talk, and the resume was
+ * refused as "not an action turn" while nothing ran. Only these exact shapes
+ * are compiled without the semantic port. */
+function isApprovalDecisionSource(identity: Pick<TurnIdentity, 'sessionId' | 'sourceUserSeq'>): boolean {
   try {
     const source = listEvents(identity.sessionId, { types: ['user_input_received'] })
       .find((event) => event.seq === identity.sourceUserSeq);
-    return Boolean(source && source.data.synthetic === true && source.data.source === 'approval_resume'
-      && typeof source.data.approvalId === 'string');
+    if (!source || typeof source.data.approvalId !== 'string') return false;
+    if (source.data.synthetic === true && source.data.source === 'approval_resume') return true;
+    return source.data.decision === 'approve'
+      && (source.data.source === 'desktop_approval' || source.data.source === 'mobile_approval');
   } catch {
     return false;
   }
@@ -3962,7 +3970,7 @@ export async function admitAndCompileAcceptedSource(input: {
   // it will run; read by a semantic model that source is small talk, and the
   // resume was then refused as "not an action turn" while the approved
   // command never ran (live 2026-09-30). Compile it as the action it is.
-  if (input.surface === 'approval_resume' && isSyntheticApprovalResumeSource(input.identity)) {
+  if (input.surface === 'approval_resume' && isApprovalDecisionSource(input.identity)) {
     const shadow = recordTurnGraphShadow({
       identity: input.identity,
       surface: input.surface,

@@ -63,6 +63,35 @@ test('a synthetic approval-resume source compiles as an action turn even when th
   assert.ok(activation.status === 'activated' || activation.status === 'replayed', JSON.stringify(activation));
 });
 
+test('the owner\'s own words, stamped as a decision on one card, compile as the action too', async () => {
+  // Live 2026-10-06: "Yes, go ahead." to a queued `ssh` card carried
+  // approvalId + decision from the chat admission, was still read by the
+  // semantic model as small talk, and the resume was refused as "not an
+  // action turn" while nothing ran.
+  let asked = 0;
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { asked += 1; throw new Error('the model must not be asked to read a decision'); },
+  } as never);
+  for (const source of ['desktop_approval', 'mobile_approval'] as const) {
+    const { sessionId, sourceUserSeq } = acceptedSource({
+      text: 'Yes, go ahead.', displayText: 'Yes, go ahead.', source, approvalId: 'apr-test2', decision: 'approve',
+    });
+    const event = await recordAcceptedSourceGraph({
+      identity: { sessionId, turn: 0, sourceUserSeq }, surface: 'approval_resume', acceptedText: 'Yes, go ahead.',
+    });
+    assert.ok(event, `${source}: the decision was admitted`);
+    assert.equal(asked, 0, 'no semantic model call');
+    assert.equal(turnGraphFromShadowEvent(event)?.classification.route, 'act');
+    const activation = activateActionExpectedWork({ sessionId, sourceUserSeq });
+    assert.ok(activation.status === 'activated' || activation.status === 'replayed', JSON.stringify(activation));
+  }
+  // A decline is not a run: it still goes to the ordinary path.
+  const declined = acceptedSource({ text: 'No, skip it.', source: 'desktop_approval', approvalId: 'apr-test3', decision: 'reject' });
+  await recordAcceptedSourceGraph({ identity: { sessionId: declined.sessionId, turn: 0, sourceUserSeq: declined.sourceUserSeq },
+    surface: 'approval_resume', acceptedText: 'No, skip it.' }).catch(() => null);
+  assert.equal(asked, 1, 'a decline is interpreted as before');
+});
+
 test('an ordinary source on the same surface still goes to the semantic port', async () => {
   let asked = 0;
   semanticPorts.installTurnSemanticModelPort({

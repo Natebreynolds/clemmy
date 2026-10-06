@@ -105,14 +105,10 @@ export async function routeReplyToPendingApproval(input: {
     const selected = selectAddressedApproval(waiting, targets[0]);
     if (selected.kind !== 'selected') return fallback;
     const row = selected.row;
-    // A queued exact payload (a shell command, a send) can be DECLINED in
-    // words like any other card. Approving it in words is not routed yet: the
-    // registry listener runs a chat-queued action through the turn's
-    // expected-work graph and fails `not_action` on a question turn (live
-    // 2026-10-06, twice; the card button depends on the same path), which
-    // left an approval-resume attempt stranded. Until that executor is
-    // fixed, an approve reading stays with conversation; a change is a fresh
-    // action and a new card.
+    // A queued exact payload (a shell command, a send) is approved or
+    // declined in words like any other card; the resume compiles the owner's
+    // decision as the control source it is. It cannot be amended in place: a
+    // change is a fresh action and a new card.
     const queued = pendingActionIdFromArgs(row.args) !== null;
     // Mobile supplies no parsed intent for bare declines. Preserve that
     // control after target selection without spending a semantic model call.
@@ -126,7 +122,7 @@ export async function routeReplyToPendingApproval(input: {
     const current = approvalRegistry.get(row.approvalId);
     if (!current || !approvalRegistry.isActionable(current)) return fallback;
     const sure = reading.kind !== null && (reading.confidence ?? 0) >= APPROVAL_REPLY_SURE;
-    if (queued && (reading.kind === 'changes' || reading.kind === 'approves')) return fallback;
+    if (queued && reading.kind === 'changes') return fallback;
     if (sure && reading.kind === 'changes') {
       return { intent: { decision: 'reject', approvalId: row.approvalId }, changeRequest: text };
     }
