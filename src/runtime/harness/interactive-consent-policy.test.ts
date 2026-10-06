@@ -397,6 +397,23 @@ test('a planning source refuses every external effect without a card, including 
 });
 
 
+test('a published workflow\'s run proceeds on the workflow\'s approval for any external effect; the gates above it still stand', () => {
+  const send = call({ effect: 'external_write', accountId: 'selected-account',
+    risk: { reversibility: 'irreversible', consequence: 'send', destructive: false },
+    semanticBasis: { kind: 'current_external_definition', digest: digest('8') } });
+  assert.deepEqual(evaluateInteractiveConsentV1(input(send, { workflowApproval: true })), {
+    kind: 'proceed', basis: 'workflow_approval', authorityDigest: digest('1'), reservationKey: 'contract-1\0requirement-1',
+  });
+  // Coverage, scope, reservation, crossing, checkpoint and protection are not waived by the workflow.
+  assert.deepEqual(evaluateInteractiveConsentV1(input(send, { workflowApproval: true, coverage: null })), { kind: 'repair', reason: 'coverage_missing' });
+  assert.deepEqual(evaluateInteractiveConsentV1(input(send, { workflowApproval: true, reservationAlreadyClaimed: true })), { kind: 'repair', reason: 'cardinality_spent' });
+  assert.equal(evaluateInteractiveConsentV1(input(send, { workflowApproval: true, crossing: 'possibly_started' })).kind, 'reconcile');
+  assert.equal(evaluateInteractiveConsentV1(input(send, { workflowApproval: true, explicitHumanCheckpoint: { subjectDigest: digest('3') } as never })).kind, 'needs_user');
+  assert.deepEqual(evaluateInteractiveConsentV1(input(call({ ...send, safety: 'protected' }), { workflowApproval: true })), { kind: 'refuse', reason: 'protected_target' });
+  // Without the workflow, the same send asks.
+  assert.equal(evaluateInteractiveConsentV1(input(send)).kind, 'needs_user');
+});
+
 test('an exact destructive, irreversible local change always asks the owner, in Auto and Ask, and never runs as a planning probe', () => {
   // Live 10-02: a workflow delete the owner asked for now reaches consent;
   // what consent does with it is this: one exact approval, nothing silent.

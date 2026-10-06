@@ -219,6 +219,11 @@ export type InteractiveConsentDecisionV1 =
          * preparation; the plan binds the arguments that worked. */
         | 'plan_preparation_probe'
         | 'exact_user_grant'
+        /** A published workflow's run: the owner approved the workflow, and
+         * its accepted work carries that approval end to end (owner
+         * 2026-10-06). Human-in-the-loop steps pause as explicit checkpoints
+         * above; nothing else in the run asks. */
+        | 'workflow_approval'
         | 'settled_replay';
       authorityDigest: string;
       reservationKey?: string;
@@ -281,6 +286,8 @@ export interface EvaluateInteractiveConsentInputV1 {
   mode?: 'auto' | 'ask';
   /** Ask mode only: the owner already approved this operation once. */
   learnedExternalWrite?: boolean;
+  /** The call runs inside a published workflow's step session. */
+  workflowApproval?: boolean;
 }
 
 function sameDestination(
@@ -491,6 +498,25 @@ export function evaluateInteractiveConsentV1(
       kind: 'proceed',
       basis: 'exact_user_grant',
       authorityDigest: input.userGrant!.grantDigest,
+      reservationKey: input.coverage.reservationKey,
+    };
+  }
+
+  // A published workflow works end to end without the owner: the owner
+  // approved the workflow, so its exact accepted work (coverage, scope and
+  // reservation already checked above) carries that approval for every
+  // external effect, a sheet update or a send alike. Owner 2026-10-06, after
+  // an hourly sheet update sat on a first-time card: "a workflow that is
+  // approved on an external write … should carry the approval from the
+  // workflow; the whole point of workflows is that they work end to end
+  // without the user." A human-in-the-loop step is the explicit checkpoint
+  // gate above; protected targets, uncertain crossings and surprise writes
+  // were answered above as well.
+  if (input.workflowApproval) {
+    return {
+      kind: 'proceed',
+      basis: 'workflow_approval',
+      authorityDigest: input.coverage.requirementDigest,
       reservationKey: input.coverage.reservationKey,
     };
   }

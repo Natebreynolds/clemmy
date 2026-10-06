@@ -384,7 +384,7 @@ function mintHostConsentGrantAdmission(input: {
   consentSubject: HostInteractiveConsentSubjectV1;
   durableApproval: NonNullable<Parameters<typeof evaluatePreparedHostWorkCallConsent>[0]['durableApproval']>;
   userGrant: ExactUserGrantV1;
-  consentMode?: { mode: 'auto' | 'ask'; learnedExternalWrite: boolean };
+  consentMode?: { mode: 'auto' | 'ask'; learnedExternalWrite: boolean; workflowApproval?: boolean };
 }): HostConsentGrantAdmissionV1 | null {
   try {
     if (
@@ -1173,18 +1173,17 @@ export { ownerRunsInAutoMode };
 function consentModeForCall(
   call: CapabilityRiskAttestationV1,
   identity: { sessionId: string },
-): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean } {
+): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean; workflowApproval?: boolean } {
   const mode: 'auto' | 'ask' = ownerRunsInAutoMode() ? 'auto' : 'ask';
   // A connected-app change asks the first time in both modes (owner
   // 2026-10-06), so what was learned is read in Auto too; otherwise every
   // call would ask forever.
   if (call.effect !== 'external_write') return { mode, learnedExternalWrite: false };
-  // A workflow run works under the workflow's own approval: the owner
-  // accepted it when they published it. Live 2026-10-06, an hourly sheet
-  // update sat on a first-time card an hour after the rule went in; owner:
-  // approved workflows need no approval cards. Sends, deletes and the other
-  // high-consequence shapes still ask, as they did before.
-  if (workflowRunSession(identity.sessionId)) return { mode, learnedExternalWrite: true };
+  // A workflow run works under the workflow's own approval, end to end: the
+  // owner accepted it when they published it, and its human-in-the-loop
+  // steps are the only pauses. Live 2026-10-06, an hourly sheet update sat
+  // on a first-time card an hour after the rule went in.
+  if (workflowRunSession(identity.sessionId)) return { mode, learnedExternalWrite: false, workflowApproval: true };
   let learned = false;
   try { learned = hasApprovedWriteKind(call.operationId, call.accountId); } catch { learned = false; }
   return { mode, learnedExternalWrite: learned };

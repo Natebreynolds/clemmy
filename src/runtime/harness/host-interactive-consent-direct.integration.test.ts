@@ -265,15 +265,25 @@ test('a carrier-bounded call in Plan mode is the typed Plan refusal too: nothing
   assert.equal(act.result.status === 'decided' && act.result.decision.kind === 'proceed' ? act.result.decision.basis : null, 'exact_carrier_bounded_work');
 });
 
-test('a published workflow\'s run makes an ordinary connected-app change on the workflow\'s own approval; a send in it still asks', async () => {
-  // Owner 2026-10-06: approved workflows need no approval cards. Live: an
-  // hourly sheet update sat on a first-time card an hour after the card rule.
-  const run = await exactCall('draft', { sessionId: `workflow:trigger-${randomUUID()}:main`, sessionKind: 'workflow' });
-  assert.equal(run.result.status === 'decided' && run.result.decision.kind === 'proceed' ? run.result.decision.basis : JSON.stringify(run.result), 'exact_reversible_work');
-  const byKind = await exactCall('bounded', { sessionId: `step-${randomUUID()}`, sessionKind: 'workflow' });
-  assert.equal(byKind.result.status === 'decided' && byKind.result.decision.kind === 'proceed' ? byKind.result.decision.basis : JSON.stringify(byKind.result), 'exact_carrier_bounded_work');
-  const send = await exactCall('send', { sessionId: `workflow:trigger-${randomUUID()}:main`, sessionKind: 'workflow' });
-  assert.equal(send.result.status === 'decided' ? send.result.decision.kind : null, 'needs_user');
+test('a published workflow\'s run carries the workflow\'s approval for every external effect, with no card', async () => {
+  // Owner 2026-10-06: a workflow approved on an external write carries that
+  // approval; workflows work end to end without the user (human-in-the-loop
+  // steps are the explicit pauses). Live: an hourly sheet update sat on a
+  // first-time card an hour after the card rule.
+  for (const [kind, session] of [
+    ['draft', { sessionId: `workflow:trigger-${randomUUID()}:main`, sessionKind: 'workflow' as const }],
+    ['bounded', { sessionId: `step-${randomUUID()}`, sessionKind: 'workflow' as const }],
+    ['send', { sessionId: `workflow:trigger-${randomUUID()}:main`, sessionKind: 'workflow' as const }],
+    ['delete', { sessionId: `workflow:trigger-${randomUUID()}:main`, sessionKind: 'workflow' as const }],
+    ['unknown', { sessionId: `workflow:trigger-${randomUUID()}:main`, sessionKind: 'workflow' as const }],
+  ] as const) {
+    const run = await exactCall(kind, session);
+    assert.equal(run.result.status === 'decided' && run.result.decision.kind === 'proceed' ? run.result.decision.basis : JSON.stringify(run.result), 'workflow_approval', kind);
+    assert.equal(run.result.status === 'decided' ? run.result.consentSubject : 'x', undefined, `${kind}: no card in a workflow run`);
+  }
+  // The same send from a chat session still asks.
+  const chat = await exactCall('send');
+  assert.equal(chat.result.status === 'decided' ? chat.result.decision.kind : null, 'needs_user');
 });
 
 for (const kind of ['draft', 'send', 'delete', 'admin', 'unknown', 'bounded'] as const) {

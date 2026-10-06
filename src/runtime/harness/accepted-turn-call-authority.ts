@@ -2650,12 +2650,14 @@ function workflowV3AutoReceiptMatchesAuthority(
       readiness: { kind: 'ready' },
       crossing: 'not_started',
       reservationAlreadyClaimed: false,
+      workflowApproval: true,
     });
     if (
       reproduced.kind !== 'proceed'
       || (reproduced.basis !== 'exact_ordinary_work'
         && reproduced.basis !== 'exact_reversible_work'
-        && reproduced.basis !== 'exact_carrier_bounded_work')
+        && reproduced.basis !== 'exact_carrier_bounded_work'
+        && reproduced.basis !== 'workflow_approval')
       || closedCanonicalJson(reproduced) !== closedCanonicalJson(receipt.decision)
     ) return false;
     return closedCanonicalJson(workflowV3AutoReceipt({
@@ -2863,6 +2865,9 @@ export function evaluateWorkflowV3AutoConsent(input: {
       authorityBindingDigest: authority.authorityBindingDigest,
     })}`,
   }) });
+  // A published workflow's action carries the workflow's approval (owner
+  // 2026-10-06): the workflow works end to end without the owner, and its
+  // human-in-the-loop steps are the only pauses.
   const decision = evaluateInteractiveConsentV1({
     call,
     coverage,
@@ -2870,6 +2875,7 @@ export function evaluateWorkflowV3AutoConsent(input: {
     readiness: { kind: 'ready' },
     crossing: 'not_started',
     reservationAlreadyClaimed: false,
+    workflowApproval: true,
   });
   journalInteractiveConsentDecision({
     sessionId: authority.sessionId, sourceUserSeq: null, call, decision,
@@ -2882,7 +2888,8 @@ export function evaluateWorkflowV3AutoConsent(input: {
     decision.kind !== 'proceed'
     || (decision.basis !== 'exact_ordinary_work'
       && decision.basis !== 'exact_reversible_work'
-      && decision.basis !== 'exact_carrier_bounded_work')
+      && decision.basis !== 'exact_carrier_bounded_work'
+      && decision.basis !== 'workflow_approval')
   ) return { status: 'decided', decision, call, coverage };
 
   const receipt = workflowV3AutoReceipt({ authority, call, coverage, decision });
