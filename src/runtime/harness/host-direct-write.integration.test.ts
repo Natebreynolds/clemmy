@@ -891,7 +891,9 @@ test('a carrier-declared non-destructive generic call is answered by the harness
 // a non-mutating settlement whose returned text is ordinary retained evidence,
 // and the turn continues to the next model round. The Act-mode case above
 // keeps reserving and settling the identical call as a write.
-test('a carrier-bounded call in Plan mode dispatches once as a preparation probe and is accounted like a read', async () => {
+test('a carrier-bounded call in Plan mode is the typed Plan refusal: nothing dispatches, no card, and the turn goes on', async () => {
+  // Owner 2026-10-06: in Plan mode Clem identifies the tools without
+  // committing writes. The one-off "preparation probe" execution is gone.
   const providerText = 'Ok. 20000 rows returned for the fixture research query.';
   const fixture = await directWriteFixture('call_tool', 'bounded', 'plan-probe', false, 'args_json', 1, {
     operationId: 'generic_request',
@@ -903,30 +905,18 @@ test('a carrier-bounded call in Plan mode dispatches once as a preparation probe
   assert.ok(fixture);
   const outcome = await fixture.run();
   const detail = () => JSON.stringify({ terminal: outcome.terminal, output: outcome.finalOutput, history: outcome.history });
-  assert.equal(Boolean(outcome.hasInterruptions), false, 'no human card for a preparation probe');
-  assert.notEqual(outcome.terminal, 'exact_checkpoint_admission_exhausted', detail());
-  assert.equal(fixture.counts().providerCalls, 1, detail());
-  assert.equal(fixture.counts().modelCalls, 2, 'the turn proceeds to the next model round');
-  assert.ok(JSON.stringify(fixture.modelInputs[1]).includes(providerText), 'the provider text reaches the model unchanged');
+  assert.equal(Boolean(outcome.hasInterruptions), false, 'no human card in Plan, ever');
+  assert.equal(fixture.counts().providerCalls, 0, `nothing crosses during planning: ${detail()}`);
+  assert.ok(!JSON.stringify(fixture.modelInputs).includes(providerText), 'no provider text can reach the model');
   const decided = eventlog.listEvents(fixture.session.id, { types: ['interactive_consent_decided'] });
-  assert.equal(decided.length, 1, 'the consent journal row stays');
-  assert.equal(decided[0]!.data.basis, 'plan_preparation_probe');
+  assert.equal(decided.filter((event) => event.data.basis === 'plan_preparation_probe').length, 0, 'the probe basis is gone');
   for (const type of ['external_write', 'external_write_orphaned', 'external_write_succeeded', 'external_write_failed'] as const) {
-    assert.equal(eventlog.listEvents(fixture.session.id, { types: [type] }).length, 0, `${type} is never booked for a probe`);
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: [type] }).length, 0, `${type} is never booked in Plan`);
   }
-  const settledAll = eventlog.listEvents(fixture.session.id, { types: ['tool_attempt_settled'] });
-  const settled = settledAll.filter((event) => event.data.callId === 'exact-draft');
-  assert.equal(settled.length, 1, JSON.stringify(settledAll.map(e => e.data)));
-  assert.equal(settled[0]!.data.mutating, false);
-  assert.equal(settled[0]!.data.kind, 'succeeded');
-  assert.notEqual(settled[0]!.data.action, 'stop_and_explain');
-  const row = eventlog.openEventLog().prepare(`SELECT outcome_kind, mutating, recovery_action FROM logical_call_settlements
+  const row = eventlog.openEventLog().prepare(`SELECT outcome_kind, mutating FROM logical_call_settlements
     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
     .get(fixture.session.id, fixture.source.seq, 'exact-draft') as Record<string, unknown> | undefined;
-  assert.ok(row, 'the settlement is durable');
-  assert.equal(row.outcome_kind, 'succeeded');
-  assert.equal(row.mutating, 0);
-  assert.notEqual(row.recovery_action, 'stop_and_explain');
+  if (row) assert.notEqual(row.outcome_kind, 'succeeded', 'a refused planning call never settles as done work');
 });
 
 // A generic API-request call the host could not prove read-only is booked as a
