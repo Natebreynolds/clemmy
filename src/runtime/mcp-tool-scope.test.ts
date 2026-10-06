@@ -26,6 +26,42 @@ function tool(name: string, description = ''): any {
   return { name, description, inputSchema: { type: 'object', properties: {} } };
 }
 
+test('negated browser mentions do not advertise a browser task or change catalog authority', () => {
+  for (const userInput of [
+    'Do not use the browser.',
+    'Do not save standing memory, use the browser, send messages, change settings or modify other content.',
+    'Don’t use the browser or crawl a website.',
+    'Prepare a synthetic batch report at /tmp/report.txt with five lines. Confirm quantity 10–12 cases before writing. Do not use the browser.',
+  ]) {
+    const scope = resolveMcpToolScope({ userInput });
+    assert.doesNotMatch(scope.reason, /web\/browser intent|seo\/web-audit intent/, userInput);
+    assert.ok(!(scope.allowedServerSlugs ?? []).includes('browser'), userInput);
+    assert.ok(!(scope.priorityKeywords ?? []).includes('navigate'), userInput);
+    assert.equal(mcpToolScopeAuthority(scope), 'catalog', 'relevance is not permission');
+  }
+});
+
+test('browser advertisement preserves affirmative mentions after unrelated prohibitions', () => {
+  for (const userInput of [
+    'Do not send messages. Use the browser to read the page.',
+    'Do not send messages; use the browser to read the page.',
+    'Do not send messages, but use the browser to read the page.',
+    'Do not send messages. Instead use the browser.',
+    'Use the browser; do not send messages.',
+    'Not only use the browser, also read the local file.',
+    'Update the report. Do not send it; use the browser to check the page.',
+  ]) {
+    const scope = resolveMcpToolScope({ userInput });
+    assert.match(scope.reason, /web\/browser intent/, userInput);
+    assert.ok(scope.allowedServerSlugs?.includes('browser'), userInput);
+  }
+  const denied = resolveMcpToolScope({
+    userInput: 'Do not use BrowserMCP; read the local file.',
+    configuredServerNames: ['BrowserMCP', 'OtherService'],
+  });
+  assert.deepEqual(denied.deniedServerSlugs, ['browsermcp'], 'literal connector authority remains authoritative');
+});
+
 // ── Continuity-aware scope (the "chatbot feel" fix) ──────────────────────────
 
 test('isToolScopeContinuation: confirmations/go-aheads are continuations; fresh topics are not', () => {

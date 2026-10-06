@@ -22,7 +22,7 @@ import {
 } from '../../config.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
 import { getStoredXaiOAuthTokens } from '../xai-auth-bridge.js';
-import { claudeAvailable } from './judge-family.js';
+import { claudeAvailable, codexAvailable } from './judge-family.js';
 import pino from 'pino';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -287,6 +287,7 @@ export interface ByoRoutingSnapshot {
   readonly workerModel: string;
   readonly defaultBackend: Readonly<ByoBackendConfig>;
   readonly claudeAvailable: boolean;
+  readonly codexAvailable: boolean;
   readonly providers: readonly ByoRoutingProviderSnapshot[];
   readonly ownersForModel: (modelId: string) => readonly ByoRoutingProviderSnapshot[];
   readonly configuredOwnersForModel: (modelId: string) => readonly ByoRoutingProviderSnapshot[];
@@ -345,6 +346,7 @@ export function captureByoRoutingSnapshot(): ByoRoutingSnapshot {
     workerModel,
     defaultBackend,
     claudeAvailable: claudeAvailable(),
+    codexAvailable: codexAvailable(),
     providers,
     ownersForModel: (modelId: string) => frozenOwners.get(modelId) ?? none,
     configuredOwnersForModel: (modelId: string) => frozenConfiguredOwners.get(modelId) ?? none,
@@ -373,6 +375,24 @@ function providerList(owners: readonly ByoRoutingProviderSnapshot[]): string {
   return owners.map(({ provider }) => provider.label || provider.id).join(', ');
 }
 
+/** A named declaration is ownership even while its credential is unavailable.
+ * Dropping disconnected rows from routing lets the same saved model id switch
+ * to a subscription or another key. Legacy default slots keep their existing
+ * ambient behavior; they are not durable named-provider bindings. */
+function namedByoOwnershipRefusal(modelId: string, snapshot: ByoRoutingSnapshot): string | undefined {
+  const named = snapshot.ownersForModel(modelId).filter(({ provider }) => provider.id !== 'default');
+  if (named.length > 1) {
+    return `Model ${modelId} is declared by multiple BYO providers (${providerList(named)}). `
+      + 'Provider-qualified model identity is required; a missing key cannot choose a different provider.';
+  }
+  const owner = named[0];
+  if (owner && !owner.backend.configured) {
+    return `Model ${modelId} is declared by BYO provider ${providerList(named)}, but that provider is not connected. `
+      + 'Reconnect that provider or explicitly change the model binding before continuing.';
+  }
+  return undefined;
+}
+
 /** Why an unqualified model id cannot be routed safely. Model ids are legacy
  * identity; until persisted bindings become provider-qualified, duplicate ids
  * must fail closed rather than silently choosing a key/endpoint. `all_in` is
@@ -398,6 +418,8 @@ export function unqualifiedModelCollisionReasonFromSnapshot(
     return `Model ${id} is exposed by multiple connected BYO providers (${providerList(owners)}). `
       + 'Provider-qualified model identity is required; remove the duplicate model id before selecting or binding it.';
   }
+  const namedRefusal = namedByoOwnershipRefusal(id, snapshot);
+  if (namedRefusal) return namedRefusal;
   const builtIn = resolveProvider(id);
   if (mode !== 'all_in' && owners.length === 1 && builtIn !== 'byo') {
     const label = builtIn === 'codex' ? 'Codex' : 'Claude';
@@ -444,16 +466,15 @@ export function resolveEffectiveProviderForModelFromSnapshot(
   assertUnambiguousModelRoutingFromSnapshot(id, snapshot, mode);
   const owners = snapshot.configuredOwnersForModel(id);
   if (mode === 'all_in') {
-    // Explicit claude ids dispatch on the claude lane (2026-07-24, second
-    // pass): the all-in collapse silently rewrote a workflow's Sonnet pin to
-    // the BYO primary at the wire (requested claude-sonnet-5 → resolved
-    // glm-5.2) — an honest system may refuse, but never silently substitute.
-    // Safe NOW because the per-request transport router (v2.7.3) makes the
-    // claude harness lane tool-capable; the text-only crash class that
-    // justified the collapse is retired. gpt-shaped ids keep the collapse
-    // (the 2026-07-22 undeclared-worker-default guard); a disconnected
-    // Claude falls through to the collapse as before.
-    if (owners.length === 0 && resolveProvider(id) === 'claude' && snapshot.claudeAvailable) return 'claude';
+    // Connected subscription models keep their own lane. Otherwise an agent's
+    // explicit GPT pin could be labelled GPT while the router paid the BYO
+    // primary. Exact declared BYO ownership still wins, including the legacy
+    // worker slot; disconnected ambient defaults retain their prior collapse.
+    if (owners.length === 0) {
+      const provider = resolveProvider(id);
+      if (provider === 'claude' && snapshot.claudeAvailable) return 'claude';
+      if (provider === 'codex' && snapshot.codexAvailable) return 'codex';
+    }
     if (snapshot.defaultBackend.configured || owners.length === 1) return 'byo';
   }
   if (owners.length === 1) return 'byo';
@@ -499,6 +520,13 @@ export function repairByoRoutedModelId(modelId: string): string {
   const id = (modelId || '').trim();
   if (!id) return id;
   const snapshot = captureByoRoutingSnapshot();
+  const namedRefusal = namedByoOwnershipRefusal(id, snapshot);
+  if (namedRefusal) throw new Error(namedRefusal);
+  const namedOwner = snapshot.ownersForModel(id).find(({ provider }) => provider.id !== 'default');
+  if (namedOwner && isByoModelNotServed(id)) {
+    throw new Error(`Model ${id} is declared by BYO provider ${namedOwner.provider.label || namedOwner.provider.id} `
+      + 'and is marked unavailable. Repair cannot change its backend; explicitly change the model binding before continuing.');
+  }
   if (!isByoModelNotServed(id) && snapshot.configuredOwnersForModel(id).length > 0) return id;
   const cfg = snapshot.defaultBackend;
   const primary = cfg.configured && cfg.primaryId ? cfg.primaryId : id;

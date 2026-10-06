@@ -115,10 +115,26 @@ export function intakeReplacementsForSource(source: { sessionId: string; sourceU
     return [{ replaced, by }];
   });
 }
+/** Source-bound intake may establish a semantic replacement on its own. Once
+ * an exact correction is bound, its complete original and stored scope remain
+ * the postcondition; retiring the target id alone cannot fulfill that work. */
+export function intakeReplacementMatchesExactCorrection(replacement: IntakeReplacement,
+  baseline: FactObservationV1, expectedContent: string): boolean {
+  return replacement.replaced.id === baseline.id
+    && replacement.replaced.kind === baseline.kind && replacement.replaced.content === baseline.content
+    && isDeepStrictEqual(replacement.replaced.scope, baseline.scope)
+    && replacement.by.kind === baseline.kind && replacement.by.content === expectedContent
+    && isDeepStrictEqual(replacement.by.scope, baseline.scope);
+}
 function intakeReplacedAll(source: MemoryRequirementSource, corrections: readonly MemoryCorrectionRequirementV1[]): boolean {
-  const replaced = new Set(intakeReplacementsForSource(source).map(row => row.replaced.id));
+  const replacements = intakeReplacementsForSource(source);
   return corrections.length > 0
-    && corrections.every(row => replaced.has((correctionIdentity(source, row) as { targetId: number }).targetId));
+    && corrections.every(correction => {
+      correctionIdentity(source, correction); // original active version and exact patches
+      const baseline = retainedFactObservation({ ...source, readCallId: correction.readCallId });
+      const next = applyExactFactPatches(baseline.content, correction.edits).content;
+      return replacements.some(row => intakeReplacementMatchesExactCorrection(row, baseline, next));
+    });
 }
 function checkedSource(source: MemoryRequirementSource): MemoryRequirementSource {
   const current = readMemoryRequirementSource(source, source.objective);
@@ -213,7 +229,7 @@ export function retainMemoryRequirementAssessment(input: {
     const prior = readRetainedMemoryRequirement(source);
     if (prior?.assessment.kind === 'correct') {
       // The retained correction stays the requirement; completion accepts its
-      // targets once this request's intake has retired each of them.
+      // targets once this request's intake has made each exact replacement.
       if (assessment.kind === 'replaced' && intakeReplacedAll(source, prior.assessment.corrections)) return prior;
       if (assessment.kind !== 'correct') throw new Error('A retained correction cannot be waived by this assessment.');
       correctionUnion(source, [...prior.assessment.corrections, ...proposed]); // conflict/size fence
@@ -269,8 +285,8 @@ export function memoryCorrectionCompletion(source: MemoryRequirementSource): Mem
     if (!retained) return { status: 'unverified', reason: 'The memory requirement has not been checked.' };
     if (retained.assessment.kind === 'none' || retained.assessment.kind === 'retain') return { status: 'not_required', assessmentDigest: retained.assessmentDigest };
     if (retained.assessment.kind === 'unresolved') return { status: 'unverified', reason: 'The requested memory change is not yet bound to its original fact and exact changes.' };
-    const intake = intakeReplacementsForSource(source);
     if (retained.assessment.kind === 'replaced') {
+      const intake = intakeReplacementsForSource(source);
       return intake.length > 0 ? { status: 'verified', assessmentDigest: retained.assessmentDigest }
         : { status: 'unverified', reason: 'The original memory has not been verified as superseded by the owner\'s correction.' };
     }
@@ -278,16 +294,17 @@ export function memoryCorrectionCompletion(source: MemoryRequirementSource): Mem
       FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ? AND tool_name = 'memory_remember'`)
       .all(source.sessionId, source.sourceUserSeq) as Array<{ callId: string; argumentDigest: string }>;
     return openMemoryDb().transaction((): MemoryCorrectionCompletion => {
+      const intake = intakeReplacementsForSource(source);
       for (const correction of retained.assessment.corrections) {
         const baseline = retainedFactObservation({ ...source, readCallId: correction.readCallId });
         if (baseline.digest !== correction.expectedDigest) throw new Error('The retained correction baseline differs from its read.');
-        // This request's own intake already retired the target in its scope;
-        // no write was made, so no prewrite grant is redeemed.
-        if (intake.some(row => row.replaced.id === baseline.id)) continue;
+        const next = applyExactFactPatches(baseline.content, correction.edits).content;
+        // Intake can satisfy the same exact postcondition without another
+        // write, but cannot discard any unchanged part or move its scope.
+        if (intake.some(row => intakeReplacementMatchesExactCorrection(row, baseline, next))) continue;
         const approval = findRetainedCorrectionAssessment(source, correction);
         if (!approval) return { status: 'unverified',
           reason: 'The exact correction has no retained prewrite owner-intent assessment.' };
-        const next = applyExactFactPatches(baseline.content, correction.edits).content;
         let matched = false;
         for (const call of calls) {
           const result = redeemSuccessfulSettlementResultForHost({ ...source, logicalToolCallId: call.callId });

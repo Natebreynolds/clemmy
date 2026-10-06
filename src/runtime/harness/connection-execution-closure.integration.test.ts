@@ -41,6 +41,7 @@ const reviewed = await import('./reviewed-plan-runtime.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
 const manifestStores = await import('./capability-manifest-store.js');
 const { RouterModelProvider } = await import('./router-model.js');
+const { isPinnedWorkerModel } = await import('./pinned-worker-model.js');
 const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
 const brackets = await import('./brackets.js');
 const host = await import('./host-turn-runner.js');
@@ -199,6 +200,11 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   let beforeModelResponse: ((index: number) => void) | undefined;
   const model: Model = {
     async getResponse() {
+      if (scenario === 'bridge-home' && modelCalls >= 3) {
+        await Promise.resolve();
+        assert.equal(isPinnedWorkerModel(modelId), true,
+          'the resumed foreground response retains exact checkpoint model authority');
+      }
       if (modelCalls === 3) await beforeFinalResponse?.();
       beforeModelResponse?.(modelCalls);
       const output = frames[modelCalls++];

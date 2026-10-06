@@ -2,8 +2,9 @@
  * Host-owned rendering and ownership for non-final control states.
  *
  * A pause is not a generic failed turn. `blocked`, `needs_input`, and
- * `uncertain` always have an owner and a wake condition, and they always have
+ * `uncertain` have a declared owner and wake condition, and they always have
  * a deterministic user-safe sentence the host can publish without a model.
+ * A declared wake is not proof that a physical retry/reconciliation is armed.
  * Optional authoring may polish that sentence; empty, malformed, or timed-out
  * author output must not convert a valid control state into `failed`.
  */
@@ -72,35 +73,43 @@ export function renderTypedControlState(input: {
   hold?: TypedControlHold;
   needs?: TurnNeed;
 }): string {
+  if (input.status === 'blocked' && !input.hold) {
+    return 'The next step is blocked, so this request is unfinished. The cause is not confirmed yet. Ask me to check the blocker and any completed work before continuing.';
+  }
   const hold = input.hold ?? defaultHoldForControlState({
     status: input.status,
     ...(input.needs ? { needs: input.needs } : {}),
   });
   if (input.status === 'uncertain' || hold.wake.kind === 'host_reconcile') {
-    return 'An external effect may already have happened. I have not retried it. I will reconcile this exact request and continue; nothing new was started.';
+    return 'An external effect may already have happened, so this request is still unfinished. Ask me to check the outcome of this exact request before continuing.';
   }
   if (input.status === 'needs_input') {
+    if (input.needs?.kind === 'continue') {
+      return 'This request is unfinished and needs your decision to continue. Use Continue here when you are ready.';
+    }
     if (hold.wake.kind === 'user_connection') {
-      return 'I understood the task, but a required connection is missing. Connect it — I will continue this exact request. Nothing was started.';
+      return 'A required connection is missing, so this request is unfinished. Complete the requested connection, then ask me to continue this exact request.';
     }
     if (hold.wake.kind === 'user_approval') {
-      return 'This next step needs your approval before I can continue. Approve or reject here — I will resume this exact request.';
+      return 'The next step needs your approval, so this request is unfinished. Review the approval request and approve or reject it here.';
     }
-    return 'I need something only you can provide before this can continue. Answer here — I will resume this exact request.';
+    return 'This request is unfinished because it needs more information from you. Ask me to check what information is still missing before continuing this exact request.';
   }
   switch (hold.hold) {
     case 'budget_exhausted':
-      return 'This run hit a host budget and is parked. I will continue this exact request when the budget renews. Nothing further will execute until then.';
+      return 'This run hit a host budget, so this request is unfinished. Ask me to check the saved progress and remaining budget before continuing this exact request.';
     case 'lease_unavailable':
-      return 'Another activation still holds this work. I am waiting on that owner; I will continue this exact request when the lease is free.';
+      return 'Another activation holds this work, so this request is unfinished. Ask me to check that owner and the completed work before continuing this exact request.';
     case 'reconciliation_pending':
-      return 'An external effect may already have happened. I have not retried it. I will reconcile this exact request and continue.';
+      return 'An external effect may already have happened, so this request is unfinished. Ask me to check the outcome of this exact request before continuing.';
     case 'admission_refused':
     case 'capability_identity_mismatch':
-      return 'I could not admit this plan against the live catalog. That is a host defect, not a missing connection. Nothing was started; I have logged it for repair.';
+      return 'I could not admit this plan against the live catalog, so this request is unfinished. Ask me to check the blocker and any completed work before continuing.';
     case 'observation_unavailable':
+      return 'A required observation is unavailable, so this request is unfinished. Ask me to check the missing evidence and any completed work before continuing.';
     case 'provider_unavailable':
+      return 'A required provider is unavailable, so this request is unfinished. Ask me to check the provider and any completed work before continuing.';
     default:
-      return 'Work is paused on a host-owned dependency. I will continue this exact request when it clears. Nothing further will execute until then.';
+      return 'A host dependency is blocking this request, so it is unfinished. Ask me to check the blocker and any completed work before continuing.';
   }
 }

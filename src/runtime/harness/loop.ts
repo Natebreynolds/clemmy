@@ -1,9 +1,10 @@
+import { observeHeldStopPublicationOwner, sealHeldStopPublication, drainHeldStopPublication, drainHeldStopPublications, heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_TEXT, HeldStopPublicationSupersededError, type HeldStopPublicationTicket } from './held-stop-publication.js';
 import { MODEL_REFUSED_BLOCKED_REASON, refusedModelPublicText, refusedRequestedModel } from './model-refusal.js';
 import './memory-scope-binding.js';
 import { retainConnectionExecutionProgress } from './connection-execution-progress.js';
 import { captureFreshSourceSessionContext, withAcceptedSourceSessionContext, readSourceSessionContext } from './source-session-context.js';
 import { currentSourceSessionContext, withSourceSessionContext } from './source-session-context-scope.js';
-import { readApprovalRecoveryActivation, readConnectionRecoveryActivation, readRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
+import { completionEvidenceSource, readApprovalRecoveryActivation, readConnectionRecoveryActivation, readRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
 import { assertConnectionExecutionOwned, renewConnectionExecutionLease,
   CONNECTION_EXECUTION_LEASE_RENEW_MS } from './connection-execution-activation.js';
 import { rebuildSourceConnectionAgent } from './connection-agent-rebuild.js';
@@ -129,6 +130,7 @@ import {
   measureAdvertisedToolSurface,
   measureToolPromptSurface,
   promptComponentsFromComposition,
+  promptCompositionRequestOrdinal,
   recordPromptComposition,
   summarizePromptComposition,
   type PromptReadingPublisher,
@@ -160,6 +162,11 @@ import { synthesizeTurnReport } from './work-report.js';
 import {
   approvalPreviewProjection,
   PUBLIC_RUN_FAILURE_TEXT,
+  PUBLIC_BLOCKED_NEXT_STEP_TEXT,
+  PUBLIC_CODEX_AUTH_EXPIRED_TEXT,
+  publicRunFailureKind,
+  publicRunFailureText,
+  type PublicRunFailureKind,
   PUBLIC_VAULT_NOT_READY_TEXT,
   publicProviderCapacityText,
   publicAsyncWorkDispatchedData,
@@ -233,6 +240,7 @@ import { actionBus } from '../action-bus.js';
 import { addNotification } from '../notifications.js';
 import { classifyCodexAuthError, markCodexAuthDead, isCodexAuthDead } from '../auth-store.js';
 import { BoundaryError } from '../boundary-error.js';
+import { CodexModelError } from './codex-model.js';
 import { classifyModelError } from './resilient-model.js';
 import { recentCreditRefusalNotice } from './provider-billing.js';
 import { isProviderCreditRefusal } from '../../shared/provider-capacity.js';
@@ -388,6 +396,7 @@ import {
 import {
   MISSING_REPLY_USER_FALLBACK,
   STRUCTURED_OUTPUT_RECOVERY_FALLBACK,
+  isStructuredOutputRecoveryFallback,
   STALL_OUTPUT_PATTERN,
   isPlainTextContractDirective,
   replyFulfillsVerbatimRequest,
@@ -982,79 +991,99 @@ function acceptResumeConversationInput(opts: ResumeConversationInput): number {
 /** Narrow test seam for exact approval-response source ownership. */
 export const _acceptResumeConversationInputForTest = acceptResumeConversationInput;
 
-/** Narrow test seam for the newest-ask terminal question selection. */
-export const _terminalQuestionTextForTest = (result: RunConversationResult): string =>
-  terminalQuestionText(result);
+/** Read-only display evidence. A numeric turn, question or card never grants
+ * dispatch authority. Only the exact accepted source, or its existing verified
+ * approval/connection continuation, may supply a public stop's dependencies. */
+function stopDisplaySource(input: { sessionId: string; sourceUserSeq: number }): number | null {
+  if (!Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) return null;
+  const db = openEventLog();
+  if (!db.prepare("SELECT 1 FROM events WHERE session_id = ? AND seq = ? AND type = 'user_input_received' AND role = 'user'")
+    .get(input.sessionId, input.sourceUserSeq)) return null;
+  const execution = completionEvidenceSource(input);
+  if (execution.sourceUserSeq !== input.sourceUserSeq) return execution.sourceUserSeq;
+  const checkpoint = readApprovalRecoveryActivation(input.sessionId);
+  return checkpoint?.sourceUserSeq === input.sourceUserSeq
+    ? checkpoint.approvalContinuation?.requestSourceUserSeq ?? input.sourceUserSeq
+    : input.sourceUserSeq;
+}
 
-function terminalQuestionText(result: RunConversationResult): string {
-  const eventQuestion = (() => {
-    try {
-      // desc+limit returns the newest window in CHRONOLOGICAL order, so
-      // .find() here picked the OLDEST matching ask — a byte-identical
-      // 18-minute-old clarifying question was re-delivered as the terminal
-      // (live 2026-08-09; the user re-answered and poisoned the run). Take
-      // the newest match, same as task-continuity-runtime.
-      const event = listEvents(result.sessionId, { types: ['awaiting_user_input'], desc: true, limit: 40 })
-        .filter((candidate) => candidate.turn === result.lastTurn)
-        .at(-1);
-      return event ? publicReplyText(event.data.question, '') : '';
-    } catch { return ''; }
-  })();
-  return eventQuestion
+function stopDisplayEvents(input: {
+  sessionId: string; sourceUserSeq: number; turn: number;
+  type: 'awaiting_user_input' | 'approval_requested';
+}): EventRow[] {
+  try {
+    const executionSource = stopDisplaySource(input);
+    if (executionSource === null) return [];
+    // Filter before reading the window: unrelated chat traffic cannot crowd out
+    // this source's question or its pending siblings. Legacy unbound rows confer
+    // no identity. An old ask predating the answered card cannot be reoffered.
+    const rows = openEventLog().prepare(`SELECT id FROM events
+      WHERE session_id = ? AND type = ? AND role = 'Clem'
+        AND json_type(data_json, '$.sourceUserSeq') = 'integer'
+        AND json_extract(data_json, '$.sourceUserSeq') IN (?, ?)
+      ORDER BY seq ASC`).all(input.sessionId, input.type, input.sourceUserSeq, executionSource) as Array<{ id: string }>;
+    return rows.flatMap(row => {
+      const event = getEvent(row.id);
+      if (!event || event.seq <= Number(event.data.sourceUserSeq)) return [];
+      if (input.type === 'awaiting_user_input') {
+        return event.seq > input.sourceUserSeq && event.turn === input.turn ? [event] : [];
+      }
+      // A validated approval continuation can still have pending sibling cards
+      // from its original pause. Resolved/consumed cards are excluded below.
+      return event.turn === input.turn
+        || (executionSource !== input.sourceUserSeq && event.data.sourceUserSeq === executionSource)
+        ? [event] : [];
+    });
+  } catch { return []; }
+}
+
+export function terminalQuestionEventForAcceptedSource(input: {
+  sessionId: string; sourceUserSeq: number; turn: number;
+}): EventRow | null {
+  return stopDisplayEvents({ ...input, type: 'awaiting_user_input' }).at(-1) ?? null;
+}
+
+/** Narrow test seam for newest-ask terminal question selection. */
+export const _terminalQuestionTextForTest = (result: RunConversationResult, sourceUserSeq: number): string =>
+  terminalQuestionText(result, sourceUserSeq);
+
+function terminalQuestionText(result: RunConversationResult, sourceUserSeq: number): string {
+  const event = terminalQuestionEventForAcceptedSource({ sessionId: result.sessionId, sourceUserSeq, turn: result.lastTurn });
+  return (event ? publicReplyText(event.data.question, '') : '')
     || publicReplyText(result.lastDecision?.reply, '')
     || publicReplyText(result.lastDecision?.summary, '')
     || 'I need your input before I can continue.';
 }
 
-function exactPendingApprovalForTerminal(input: {
-  result: RunConversationResult;
-  approvalIdHint?: string;
-}): approvalRegistry.PendingApprovalRow | null {
-  const candidateIds: string[] = [];
-  if (input.approvalIdHint?.trim()) candidateIds.push(input.approvalIdHint.trim());
-  try {
-    for (const event of listEvents(input.result.sessionId, {
-      types: ['approval_requested'],
-      desc: true,
-      limit: 80,
-    })) {
-      if (event.turn !== input.result.lastTurn) continue;
-      const approvalId = typeof event.data.approvalId === 'string'
-        ? event.data.approvalId.trim()
-        : '';
-      if (approvalId) candidateIds.push(approvalId);
-    }
-  } catch { /* no registry-backed event means question, never invented approval */ }
-
-  const rows = [...new Set(candidateIds)]
-    .map((approvalId) => approvalRegistry.get(approvalId))
-    .filter((row): row is approvalRegistry.PendingApprovalRow => Boolean(
-      row
-      && row.sessionId === input.result.sessionId
-      && approvalRegistry.isActionable(row),
-    ));
-  // A public approval outcome names one exact authority. Several pending
-  // approvals for the same turn each keep their own card; the terminal names
-  // the OLDEST so the pause is typed as an approval pause (the host call
-  // authority stays open while its calls wait) instead of a question that
-  // tries to close an authority still owning unsettled work — which threw at
-  // publication and failed the turn the moment a plan batched four writes.
-  if (rows.length === 0) return null;
-  return rows[rows.length - 1] ?? null;
+/** Display projection only: the registry and paused executor still own every
+ * decision/effect. An approval hint is usable only with a source-bound carrier. */
+export function pendingApprovalsForAcceptedSource(input: {
+  sessionId: string; sourceUserSeq: number; turn: number; approvalIdHint?: string;
+}): approvalRegistry.PendingApprovalRow[] {
+  const events = stopDisplayEvents({ ...input, type: 'approval_requested' });
+  const candidateIds = events.flatMap(event => typeof event.data.approvalId === 'string' && event.data.approvalId.trim()
+    ? [event.data.approvalId.trim()] : []);
+  const hint = input.approvalIdHint?.trim();
+  if (hint && candidateIds.includes(hint)) candidateIds.unshift(hint);
+  return [...new Set(candidateIds)].flatMap(id => {
+    const row = approvalRegistry.get(id);
+    return row && row.sessionId === input.sessionId && approvalRegistry.isActionable(row)
+      && events.some(event => event.data.approvalId === id && approvalCarrierMatches(event, row)
+        && (!row.presentation || row.presentation.sourceUserSeq === event.data.sourceUserSeq))
+      ? [row] : [];
+  });
 }
 
-function pendingApprovalCountForTurn(result: RunConversationResult): number {
-  try {
-    const ids = new Set<string>();
-    for (const event of listEvents(result.sessionId, { types: ['approval_requested'], desc: true, limit: 80 })) {
-      if (event.turn !== result.lastTurn) continue;
-      const approvalId = typeof event.data.approvalId === 'string' ? event.data.approvalId.trim() : '';
-      if (!approvalId) continue;
-      const row = approvalRegistry.get(approvalId);
-      if (row && row.sessionId === result.sessionId && approvalRegistry.isActionable(row)) ids.add(approvalId);
-    }
-    return ids.size;
-  } catch { return 0; }
+function exactPendingApprovalForTerminal(input: {
+  result: RunConversationResult; sourceUserSeq: number; approvalIdHint?: string;
+}): approvalRegistry.PendingApprovalRow | null {
+  const rows = pendingApprovalsForAcceptedSource({ sessionId: input.result.sessionId,
+    sourceUserSeq: input.sourceUserSeq, turn: input.result.lastTurn, approvalIdHint: input.approvalIdHint });
+  return rows.at(-1) ?? null;
+}
+
+function pendingApprovalCountForTurn(result: RunConversationResult, sourceUserSeq: number): number {
+  return pendingApprovalsForAcceptedSource({ sessionId: result.sessionId, sourceUserSeq, turn: result.lastTurn }).length;
 }
 
 interface DeferredToolCallsLimitAuthority {
@@ -1184,11 +1213,25 @@ function reduceStandardConversationTerminal(input: {
     case 'awaiting_approval': {
       const approval = exactPendingApprovalForTerminal({
         result,
+        sourceUserSeq,
         approvalIdHint: input.approvalIdHint,
       });
-      const question = terminalQuestionText(result);
-      if (approval) {
-        const pendingCount = pendingApprovalCountForTurn(result);
+      const dependency = approval ? approvalRegistry.projectPendingApprovalUserDependency(approval) : null;
+      if (dependency?.kind === 'input') {
+        // Conversational consent is still enforced by the registry, but its
+        // public dependency is the frozen ordinary question, never a card id.
+        outcome = {
+          version: 2,
+          id: turnOutcomeId(identity),
+          identity,
+          status: 'needs_input',
+          resumable: true,
+          needs: { kind: 'input' },
+          presentation: { kind: 'question', text: dependency.question },
+        };
+        legacyReason = 'awaiting_user_input';
+      } else if (approval) {
+        const pendingCount = pendingApprovalCountForTurn(result, sourceUserSeq);
         const approvalText = publicReplyText(
           result.lastDecision?.reply,
           pendingCount > 1
@@ -1213,14 +1256,14 @@ function reduceStandardConversationTerminal(input: {
           status: 'needs_input',
           resumable: true,
           needs: { kind: 'input' },
-          presentation: { kind: 'question', text: question },
+          presentation: { kind: 'question', text: 'I could not find a valid approval for this exact request, so it is still unfinished. Ask me to check the required approval and any completed work before continuing.' },
         };
         legacyReason = 'awaiting_user_input';
       }
       break;
     }
     case 'awaiting_user_input': {
-      const question = terminalQuestionText(result);
+      const question = terminalQuestionText(result, sourceUserSeq);
       const parked = parkObservedConnectionWithCheckpoint({
         sessionId: result.sessionId,
         sourceUserSeq,
@@ -1323,7 +1366,7 @@ function reduceStandardConversationTerminal(input: {
           // A committed public presentation already returned above, so the
           // admission reason is what is left to carry the explanation.
           text: publicReplyText(result.error, '')
-            || 'I could not admit this turn, so I stopped before using any tools.',
+            || PUBLIC_BLOCKED_NEXT_STEP_TEXT,
         },
       };
       legacyReason = 'blocked';
@@ -1342,7 +1385,9 @@ function reduceStandardConversationTerminal(input: {
         resumable: false,
         presentation: {
           kind: 'error',
-          text: /authority_seal_key_missing|authority seal key is missing/.test(String(result.error ?? ''))
+          text: result.failureKind
+            ? publicRunFailureText(result.failureKind)
+            : /authority_seal_key_missing|authority seal key is missing/.test(String(result.error ?? ''))
             ? PUBLIC_VAULT_NOT_READY_TEXT
             : publicProviderCapacityText(result.error) ?? PUBLIC_RUN_FAILURE_TEXT,
         },
@@ -1770,7 +1815,8 @@ export function reofferUnresolvedAcceptedSourceClarification(input: {
     && event.data.source === 'continuation_unresolved_reoffer'
     && event.data.sourceUserSeq === input.sourceUserSeq
     && event.data.continuityParentPacketId === prepared.parentPacketId
-    && event.data.question === prepared.question
+    && event.data.question === prepared.publicText
+    && JSON.stringify(event.data.clarificationAnnotation ?? null) === JSON.stringify(prepared.annotation ?? null)
     && sameOptions(event.data.options)
   )) ?? appendEvent({
     sessionId: input.sessionId,
@@ -1778,12 +1824,13 @@ export function reofferUnresolvedAcceptedSourceClarification(input: {
     role: 'Clem',
     type: 'awaiting_user_input',
     data: {
-      question: prepared.question,
+      question: prepared.publicText,
       options: [...prepared.options],
       purpose: 'clarification',
       source: 'continuation_unresolved_reoffer',
       sourceUserSeq: input.sourceUserSeq,
       continuityParentPacketId: prepared.parentPacketId,
+      ...(prepared.annotation ? { clarificationAnnotation: prepared.annotation } : {}),
     },
   });
   const identity = standardTurnIdentity(input);
@@ -1794,7 +1841,7 @@ export function reofferUnresolvedAcceptedSourceClarification(input: {
     status: 'needs_input',
     resumable: true,
     needs: { kind: 'input' },
-    presentation: { kind: 'question', text: prepared.question },
+    presentation: { kind: 'question', text: prepared.publicText },
   }, {
     legacyReason: 'awaiting_user_input',
     metadata: {
@@ -1809,7 +1856,7 @@ export function reofferUnresolvedAcceptedSourceClarification(input: {
     || committed.presentation.needs?.kind !== 'input'
     || committed.presentation.identity.sessionId !== input.sessionId
     || committed.presentation.identity.sourceUserSeq !== input.sourceUserSeq
-    || committed.presentation.text !== prepared.question
+    || committed.presentation.text !== prepared.publicText
   ) {
     throw new Error('exact unresolved clarification terminal replay contradicted its accepted source');
   }
@@ -1829,8 +1876,8 @@ export function reofferUnresolvedAcceptedSourceClarification(input: {
     steps: 0,
     lastTurn: input.turn,
     lastDecision: {
-      summary: prepared.question,
-      reply: prepared.question,
+      summary: prepared.publicText,
+      reply: prepared.publicText,
       done: false,
       nextAction: 'awaiting_user_input',
       reason: 'continuation_unresolved_reoffer',
@@ -2806,7 +2853,7 @@ function exactActionableApprovalRow(
 }
 
 function registerAndEmitApprovalsOnce(
-  options: { sessionId: string; turn: number },
+  options: { sessionId: string; turn: number; sourceUserSeq?: number },
   session: HarnessSession,
   interruptions: InterruptionInfo[],
 ): RegisteredApprovalSurface[] {
@@ -3017,6 +3064,8 @@ function registerAndEmitApprovalsOnce(
                 }) ?? undefined,
               }),
             approvalId: row.approvalId,
+            ...(Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+              ? { sourceUserSeq: options.sourceUserSeq } : {}),
             ...(registered.interruption.consentCall
               ? { consentCall: registered.interruption.consentCall }
               : {}),
@@ -3101,7 +3150,7 @@ function registerAndEmitApprovalsOnce(
 }
 
 function registerAndEmitApprovals(
-  options: { sessionId: string; turn: number },
+  options: { sessionId: string; turn: number; sourceUserSeq?: number },
   session: HarnessSession,
   interruptions: InterruptionInfo[],
 ): RegisteredApprovalSurface[] {
@@ -3255,7 +3304,7 @@ export function recoverParkedApprovalSurfaces(
         continue;
       }
       const surfaces = registerAndEmitApprovals(
-        { sessionId: candidate.id, turn: 0 },
+        { sessionId: candidate.id, turn: 0, sourceUserSeq: pausedHostApprovalSource(state, candidate.id) },
         session,
         recoverable,
       );
@@ -3635,6 +3684,8 @@ export interface RunTurnResult {
   status: RunTurnStatus;
   finalOutput?: unknown;
   error?: string;
+  /** Closed host boundary reason; raw/provider text never supplies it. */
+  failureKind?: PublicRunFailureKind;
   /** A host-owned factual terminal that has no user-supplied continuation. */
   blockedResumable?: false;
   /** SAY WHY: the host's machine reason for a blocked terminal (for example
@@ -3929,6 +3980,8 @@ export interface RunConversationResult {
   lastDecision?: OrchestratorDecisionShape;
   lastTurn: number;
   error?: string;
+  /** Preserve the exact model boundary reason through terminal reduction. */
+  failureKind?: PublicRunFailureKind;
   /** Preserve a host proof that the blocked terminal is not user-resumable. */
   blockedResumable?: false;
   /** The host's machine reason/detail for a blocked terminal (see RunTurnResult). */
@@ -4352,6 +4405,7 @@ function hostActivationConversationResult(
     lastTurn: turnResult.turn,
     ...(lastDecision ? { lastDecision } : {}),
     ...(turnResult.error ? { error: turnResult.error } : {}),
+    ...(turnResult.failureKind ? { failureKind: turnResult.failureKind } : {}),
     ...(turnResult.blockedResumable === false ? { blockedResumable: false as const } : {}),
     ...(turnResult.blockedReason ? { blockedReason: turnResult.blockedReason } : {}),
     ...(turnResult.blockedDetail ? { blockedDetail: turnResult.blockedDetail } : {}),
@@ -6215,6 +6269,7 @@ function scheduleHostCheckpointRecovery(
     void (async () => {
       let retry = false;
       let failed = false;
+      let publicationTicket: HeldStopPublicationTicket | null = null;
       try {
         const session = HarnessSession.load(options.sessionId);
         const recoveryBlob = session?.loadRecoveryState();
@@ -6224,6 +6279,7 @@ function scheduleHostCheckpointRecovery(
         const continuationOwner = readRecoveryActivation(options.sessionId);
         if (recovery.sessionId !== options.sessionId || (recovery.sourceUserSeq !== sourceUserSeq
           && continuationOwner?.sourceUserSeq !== sourceUserSeq)) return;
+        publicationTicket = observeHeldStopPublicationOwner({ sessionId: options.sessionId, sourceUserSeq, runAttemptId: options.runAttemptId });
         const source = acceptedUserEvent(options.sessionId, sourceUserSeq);
         const sourceText = typeof source.data.text === 'string' ? source.data.text : options.input;
         const {
@@ -6253,7 +6309,6 @@ function scheduleHostCheckpointRecovery(
           } catch { retry = false; failed = false; /* a new executor must acquire its own lease */ }
         }
       } finally {
-        if (scheduledHostRecoveries.get(key) === scheduled) scheduledHostRecoveries.delete(key);
         let rescheduled = false;
         if (retry) {
           try {
@@ -6261,6 +6316,7 @@ function scheduleHostCheckpointRecovery(
             const held = blob ? HostRecoveryState.fromString(blob) : undefined;
             if (held?.sessionId === options.sessionId && (held.sourceUserSeq === sourceUserSeq
               || readRecoveryActivation(options.sessionId)?.sourceUserSeq === sourceUserSeq)) {
+              if (scheduledHostRecoveries.get(key) === scheduled) scheduledHostRecoveries.delete(key);
               scheduleHostCheckpointRecovery(options, sourceUserSeq, attempt + 1);
               rescheduled = true;
             }
@@ -6269,7 +6325,12 @@ function scheduleHostCheckpointRecovery(
         // The request already answered "held", so this timer is the turn's
         // only owner. An activation that threw after giving up its checkpoint
         // still owes the person a reply.
-        if (failed && !rescheduled) publishStopForUnownedHeldTurn(options, sourceUserSeq);
+        if (failed && !rescheduled && publicationTicket) {
+          retainHeldStopPublication(options.sessionId, sourceUserSeq, publicationTicket, scheduled);
+        } else {
+          if (scheduledHostRecoveries.get(key) === scheduled) scheduledHostRecoveries.delete(key);
+          if (failed && !rescheduled) publishStopForUnownedHeldTurn(options, sourceUserSeq);
+        }
       }
     })();
   }, delayMs);
@@ -6278,9 +6339,62 @@ function scheduleHostCheckpointRecovery(
   scheduledHostRecoveries.set(key, scheduled);
 }
 
-export const HELD_TURN_UNOWNED_STOP_TEXT =
-  'I stopped before finishing this request because I could not save where I was. Anything I already did is kept. Ask me to continue and I will check what finished and do only the rest.';
+export const HELD_TURN_UNOWNED_STOP_TEXT = HELD_STOP_PUBLICATION_TEXT;
 const UNOWNED_STOP_PUBLISH_ATTEMPTS = 8;
+
+const heldPublicationAdapter = {
+  isExecuting: (sessionId: string, sourceUserSeq: number) => {
+    const key = `${sessionId}:${sourceUserSeq}`;
+    return activeHostConversations.has(key) || scheduledHostRecoveries.has(key);
+  },
+  commit: (identity: TurnIdentity, text: string) => {
+    commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'blocked', resumable: true,
+      presentation: { kind: 'blocked', text } }, { legacyReason: 'blocked', metadata: { blockedReason: 'held_turn_recovery_failed' } });
+  },
+};
+/** Daemon lifecycle observation only; never enters a conversation executor. */
+export function drainPendingHeldStopPublications(): number {
+  return drainHeldStopPublications(heldPublicationAdapter);
+}
+function retainedPublicationResult(sessionId: string, sourceUserSeq: number): RunConversationResult {
+  const accepted = acceptedUserEvent(sessionId, sourceUserSeq);
+  return { sessionId, status: 'held', steps: 0, lastTurn: accepted.turn,
+    hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' } };
+}
+function retainHeldStopPublication(sessionId: string, sourceUserSeq: number, ticket: HeldStopPublicationTicket,
+  owner: ScheduledHostRecovery, persistenceAttempt = 0): void {
+  const key = `${sessionId}:${sourceUserSeq}`;
+  if (scheduledHostRecoveries.get(key) !== owner) return;
+  try {
+    sealHeldStopPublication(ticket);
+  } catch (error) {
+    if (error instanceof HeldStopPublicationSupersededError) {
+      if (scheduledHostRecoveries.get(key) === owner) scheduledHostRecoveries.delete(key);
+      return; // the verified newer owner is untouched; no publication or sweep
+    }
+    // No durable transfer is claimed. Retain the exact volatile owner and only
+    // retry persistence; never reactivate a model or lost checkpoint.
+    logger.warn({ sessionId, sourceUserSeq, persistenceAttempt }, 'held stop publication intent could not be retained');
+    if (persistenceAttempt + 1 >= UNOWNED_STOP_PUBLISH_ATTEMPTS) return;
+    const timer = setTimeout(() => retainHeldStopPublication(sessionId, sourceUserSeq, ticket, next, persistenceAttempt + 1),
+      Math.min(30_000, 1_000 * (2 ** persistenceAttempt)));
+    timer.unref?.();
+    const next: ScheduledHostRecovery = { timer, attempt: persistenceAttempt };
+    scheduledHostRecoveries.set(key, next);
+    return;
+  }
+  // Preserve the original transfer boundary's single structural reconciliation
+  // after the publication intent exists. This existing reaper is session-scoped
+  // and can settle other already-revoked generations; it does not run tool
+  // bodies. The durable publication watcher never sweeps or retries execution.
+  if (heldStopPublicationOwnsSource(sessionId, sourceUserSeq)) {
+    try { reconcileRevokedHostToolInvocations({ sessionId }); }
+    catch { logger.warn({ sessionId, sourceUserSeq }, 'held stop awaits canonical revoked-call reconciliation'); }
+  }
+  if (scheduledHostRecoveries.get(key) === owner) scheduledHostRecoveries.delete(key);
+  drainHeldStopPublication(sessionId, sourceUserSeq, heldPublicationAdapter);
+}
+
 
 /**
  * Publish the typed stop for a held turn whose recovery threw after its
@@ -6331,6 +6445,10 @@ function publishStopForUnownedHeldTurn(
 export async function runConversation(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
+  if (options.sourceUserSeq && heldStopPublicationOwnsSource(options.sessionId, options.sourceUserSeq)) {
+    const replay = replayedRunConversationResult(acceptedUserEvent(options.sessionId, options.sourceUserSeq));
+    return replay ?? retainedPublicationResult(options.sessionId, options.sourceUserSeq);
+  }
   if (options.sourceUserSeq && acceptedUserEvent(options.sessionId, options.sourceUserSeq).data.source === 'connection_continuation') {
     return runConnectionConversation(options);
   }
@@ -7609,6 +7727,8 @@ async function runConversationCore(
         turnResult.infraTransientUserMessage ?? '',
         undefined,
         turnResult.error ?? '',
+        // Legacy active-source inference is not an exact display binding.
+        options.sourceUserSeq,
       );
       return {
         sessionId: options.sessionId,
@@ -8004,6 +8124,7 @@ async function runConversationCore(
         lastDecision,
         lastTurn,
         error: turnResult.error,
+        ...(turnResult.failureKind ? { failureKind: turnResult.failureKind } : {}),
         ...(turnResult.blockedResumable === false ? { blockedResumable: false as const } : {}),
         ...(turnResult.blockedReason ? { blockedReason: turnResult.blockedReason } : {}),
         ...(turnResult.blockedDetail ? { blockedDetail: turnResult.blockedDetail } : {}),
@@ -8785,7 +8906,7 @@ async function runConversationCore(
       // MAX_STALL_RETRIES → after exhaustion the fallback below stands.
       if (
         !stallInfo &&
-        turnResult.finalOutput === STRUCTURED_OUTPUT_RECOVERY_FALLBACK &&
+        isStructuredOutputRecoveryFallback(turnResult.finalOutput) &&
         stallRetriesUsed < MAX_STALL_RETRIES
       ) {
         stallRetriesUsed += 1;
@@ -10282,7 +10403,7 @@ async function runConversationCore(
           turn: turnResult.turn,
           role: 'Clem',
           type: 'awaiting_user_input',
-          data: { question: ask, source: 'decision_awaiting_approval' },
+          data: { question: ask, source: 'decision_awaiting_approval', sourceUserSeq: activeSourceUserSeq },
         });
         const goalForApproval = safeActiveGoal(options.sessionId);
         if (goalForApproval) {
@@ -10605,7 +10726,7 @@ function emitLimitExceededWithContinuePrompt(opts: {
     sessionId: opts.sessionId,
     sourceUserSeq: opts.sourceUserSeq,
     turn: opts.turn,
-    text: checkpointReply,
+    text: `${checkpointReply} Ask me to continue the unfinished work.`,
     legacyReason: 'step_budget_parked',
     metadata: {
       steps: opts.steps,
@@ -12042,12 +12163,15 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
   // request's provenance row by ordinal. A host re-entry resumes the count
   // from the provenance the source already has.
   let compositionOrdinal = 0;
-  const nextCompositionOrdinal = (): number => {
+  const nextCompositionOrdinal = (dispatched?: number): number => {
     let recorded = 1;
     if (sourceUserSeq) {
       try { recorded = nextModelRequestOrdinal(options.sessionId, sourceUserSeq); } catch { recorded = 1; }
     }
-    compositionOrdinal = Math.max(compositionOrdinal + 1, recorded);
+    // A changed request is measured after its provenance has settled the
+    // actual bytes. Accept only that source's latest recorded ordinal, never
+    // an arbitrary caller-supplied position or a duplicate/older reading.
+    compositionOrdinal = promptCompositionRequestOrdinal(compositionOrdinal, recorded, dispatched);
     return compositionOrdinal;
   };
   const modelInputFilter = ((args: {
@@ -12279,7 +12403,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
       if (harnessContext) harnessContext.promptComponents = promptComponentsFromComposition(composition);
       const model = replaced ? replaced.model : routedModelIdForBudget;
       recordPromptComposition(options.sessionId, 'host', composition, sourceUserSeq, {
-        requestOrdinal: nextCompositionOrdinal(),
+        requestOrdinal: nextCompositionOrdinal(replaced?.requestOrdinal),
         ...(model ? { model } : {}),
       });
     };
@@ -12686,7 +12810,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
         mcpToolScope: harnessCtx?.mcpToolScope,
       });
       registerAndEmitApprovals(
-        { sessionId: options.sessionId, turn },
+        { sessionId: options.sessionId, turn, sourceUserSeq },
         session,
         outcome.interruptions ?? [],
       );
@@ -13155,7 +13279,7 @@ export async function resumePendingApproval(
     if (needsRegistration.length > 0) {
       try {
         repairedSurfaces = registerAndEmitApprovals(
-          { sessionId: options.sessionId, turn },
+          { sessionId: options.sessionId, turn, sourceUserSeq: resumeSourceUserSeq },
           session,
           needsRegistration,
         );
@@ -13592,7 +13716,7 @@ export async function resumePendingApproval(
         mcpToolScope: resumeAgentScopeBinding.bound ? resumeAgentScopeBinding.scope : undefined,
       });
       registerAndEmitApprovals(
-        { sessionId: options.sessionId, turn },
+        { sessionId: options.sessionId, turn, sourceUserSeq: resumeSourceUserSeq },
         session,
         outcome.interruptions ?? [],
       );
@@ -13776,6 +13900,9 @@ export async function runConversationFromResume(
   opts: Parameters<typeof runConversationFromResumeOwned>[0],
 ): Promise<RunConversationResult> {
   const source = existingResumeConversationSource(opts);
+  if (source && heldStopPublicationOwnsSource(opts.sessionId, source.seq)) {
+    return replayedRunConversationResult(source) ?? retainedPublicationResult(opts.sessionId, source.seq);
+  }
   if (source) {
     const active = activeHostConversations.get(`${opts.sessionId}:${source.seq}`);
     if (active) return active;
@@ -14440,6 +14567,7 @@ async function runConversationFromResumeCore(opts: {
       lastDecision,
       lastTurn,
       error: firstResult.error,
+      ...(firstResult.failureKind ? { failureKind: firstResult.failureKind } : {}),
       ...(firstResult.hold ? { hold: firstResult.hold } : {}),
       ...(firstResult.limitKind ? { limitKind: firstResult.limitKind } : {}),
     };
@@ -14908,7 +15036,7 @@ async function runConversationFromResumeCore(opts: {
           turn: lastTurn,
           role: 'Clem',
           type: 'awaiting_user_input',
-          data: { question: ask, source: 'decision_awaiting_approval' },
+          data: { question: ask, source: 'decision_awaiting_approval', sourceUserSeq: activeSourceUserSeq },
         });
       }
       return {
@@ -15094,6 +15222,7 @@ async function runConversationFromResumeCore(opts: {
         lastDecision,
         lastTurn,
         error: turnResult.error,
+        ...(turnResult.failureKind ? { failureKind: turnResult.failureKind } : {}),
         ...(turnResult.blockedResumable === false ? { blockedResumable: false as const } : {}),
         ...(turnResult.blockedReason ? { blockedReason: turnResult.blockedReason } : {}),
         ...(turnResult.blockedDetail ? { blockedDetail: turnResult.blockedDetail } : {}),
@@ -15318,33 +15447,16 @@ function isKillBeforeStart(
   }
 }
 
-/** A Codex OAuth revocation/expiry (HTTP 401 token_revoked) surfaced from the
- *  model call. The token can't recover by retrying — the user must re-auth — so
- *  we surface a clear instruction instead of the raw provider JSON. */
-export function isCodexAuthRevoked(err: unknown, message: string): boolean {
-  // Auth is genuinely dead only when the refresh token itself was rejected
-  // (which latches DEAD inside refreshStoredNativeOAuth) or the error carries a
-  // real revoke marker (token_revoked / invalid_grant / refresh_token_reused).
-  // A bare model-call 401 is NOT a revoke: streamCodex already force-refreshed
-  // and retried it, so reaching here with a marker-less 401 means a transient
-  // failure — classify it 'model' so it falls through to normal retryable-error
-  // handling instead of permanently bricking auth on a one-off blip.
-  //
-  // The DEAD latch is a fact about CODEX auth, not about this error: while it
-  // is set, every brain's every failure reaches here, and an unconditional
-  // short-circuit rebrands unrelated errors (a BYO Together 402, a GLM 5xx) as
-  // "Codex sign-in expired" — terminal, real cause masked (observed live
-  // 2026-07-07: GLM run hard-failed with the Codex re-auth message while the
-  // actual error was a Together credit-limit 402). Only let the latch decide
-  // when the error itself is auth-shaped; anything else falls through to
-  // normal classification and stays recoverable.
-  const status = (err as { status?: number } | null)?.status;
-  const authShaped =
-    status === 401
-    || status === 403
-    || /codex|token_revoked|invalid_grant|refresh_token|oauth/i.test(message);
-  if (isCodexAuthDead() && authShaped) return true;
-  return classifyCodexAuthError({ message, status, source: 'model' }) === 'terminal';
+/** Codex re-authentication requires positive host-owned error origin. A stale
+ * Codex dead latch says nothing about a foreign provider's 401/403 or prose. */
+export function isCodexAuthRevoked(err: unknown, _message: string): boolean {
+  if (err instanceof BoundaryError && err.kind === 'codex.auth_expired') return true;
+  if (!(err instanceof CodexModelError)) return false;
+  // A bare Codex model 401 is still transient unless the existing refresh
+  // path has already proved its grant dead. Non-auth errors remain non-auth
+  // even when their own diagnostic contains the words Codex or OAuth.
+  if (isCodexAuthDead() && (err.status === 401 || err.status === 403)) return true;
+  return classifyCodexAuthError({ message: err.message, status: err.status, source: 'model' }) === 'terminal';
 }
 
 // Transient model/codex error kinds where switching to a DIFFERENT brain can
@@ -15872,6 +15984,7 @@ function emitInfraTransientAsk(
   userMessage: string,
   operatorMessage: string | undefined,
   rawMessage: string,
+  sourceUserSeq?: number,
 ): void {
   const userMsg = userMessage || 'A backend error interrupted this turn.';
   let retryContext: Record<string, unknown> | null = null;
@@ -15898,6 +16011,7 @@ function emitInfraTransientAsk(
       question: `${userMsg} Should I retry the same call, switch approach, or stop here?`,
       options: ['Retry', 'Switch approach', 'Stop'],
       source: 'infra_error_recovery',
+      ...(acceptedInfraRecoverySource(sourceUserSeq) ? { sourceUserSeq } : {}),
       boundaryKind: kind,
       operatorMessage: clip(operatorMessage ?? rawMessage, 400),
       retry_context: retryContext,
@@ -16149,6 +16263,7 @@ function handleRunError(
           `The \`${toolName}\` tool timed out after ${timeoutMs}ms. Should I retry (the same call), switch approach, or stop here?`,
         options: ['Retry', 'Switch approach', 'Stop'],
         source: 'infra_error_recovery',
+        ...(acceptedInfraRecoverySource(opts.sourceUserSeq) ? { sourceUserSeq: opts.sourceUserSeq } : {}),
         boundaryKind: 'tool.timeout',
         operatorMessage: clip(normalizeError(err), 400),
         retry_context: retryContext,
@@ -16289,7 +16404,7 @@ function handleRunError(
         bumpTurnNumber(sessionId, turn);
         return { sessionId, turn, status: 'failed', error: message };
       }
-      emitInfraTransientAsk(sessionId, turn, err.kind, err.userMessage ?? '', err.operatorMessage, message);
+      emitInfraTransientAsk(sessionId, turn, err.kind, err.userMessage ?? '', err.operatorMessage, message, opts.sourceUserSeq);
       bumpTurnNumber(sessionId, turn);
       // Session stays active so the next user message resumes it; do
       // NOT mark failed. Status returned to caller is
@@ -16307,16 +16422,15 @@ function handleRunError(
     // Latch auth DEAD so background loops (execution controller, cron, autonomy)
     // stop replaying the revoked token and park until a re-auth clears it.
     markCodexAuthDead(message);
-    const friendly =
-      'Your Codex sign-in expired or was revoked, so I can’t reach the model right now. '
-      + 'Sign in again in Settings › Model accounts '
-      + '(or run `clementine auth login-native`), then try again.';
+    // The classifier above admits only a proven Codex model/auth boundary.
+    const failureKind = 'codex.auth_expired' as const;
+    const friendly = PUBLIC_CODEX_AUTH_EXPIRED_TEXT;
     safeAppend({
       sessionId,
       turn,
       role: 'system',
       type: 'run_failed',
-      data: { error: friendly, reason: 'codex_auth_revoked' },
+      data: { error: friendly, reason: 'codex_auth_revoked', ...(failureKind ? { failureKind } : {}) },
     });
     try {
       addNotification({
@@ -16331,19 +16445,20 @@ function handleRunError(
     } catch { /* notification is best-effort */ }
     session.markStatus('failed');
     bumpTurnNumber(sessionId, turn);
-    return { sessionId, turn, status: 'failed', error: friendly };
+    return { sessionId, turn, status: 'failed', error: friendly, ...(failureKind ? { failureKind } : {}) };
   }
 
+  const failureKind = publicRunFailureKind(err);
   safeAppend({
     sessionId,
     turn,
     role: 'system',
     type: 'run_failed',
-    data: { error: clip(message, 400) },
+    data: { error: clip(message, 400), ...(failureKind ? { failureKind } : {}) },
   });
   session.markStatus('failed');
   bumpTurnNumber(sessionId, turn);
-  return { sessionId, turn, status: 'failed', error: message };
+  return { sessionId, turn, status: 'failed', error: message, ...(failureKind ? { failureKind } : {}) };
 }
 
 function bumpTurnNumber(sessionId: string, turn: number): void {

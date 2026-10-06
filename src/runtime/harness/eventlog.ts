@@ -257,6 +257,9 @@ export const EVENT_TYPES = [
   // {model, routeKind, surface}. The durable answer to "who actually served
   // this?" — brain-matrix assertions, fallover forensics, route-policy audit.
   'turn_model_routed',
+  // Source-bound adapter metadata only; never completion evidence or a public
+  // lifecycle event. No prompt, output prose, tool arguments or credentials.
+  'model_stream_diagnostic',
   // Exact model/tool-loop owner selected at the RunRunnerFn boundary. This is
   // distinct from turn_model_routed: a provider can be routed through the
   // shared harness while the legacy SDK or Clem's host engine owns stepping.
@@ -1192,7 +1195,13 @@ export function summarizeSessionForSignal(session: SessionRow): HarnessSessionSi
   };
 }
 
+/** Only the host publication controller may mutate this private namespace. */
+export const HELD_STOP_PUBLICATION_METADATA_KEY = '__held_stop_publication_debt';
+
 export function createSession(input: CreateSessionInput): SessionRow {
+  if (input.metadata && Object.hasOwn(input.metadata, HELD_STOP_PUBLICATION_METADATA_KEY)) {
+    throw new Error('Held-stop publication metadata is reserved for the host.');
+  }
   const db = openEventLog();
   const id = input.id ?? `sess-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
   const now = nowIso();
@@ -1400,12 +1409,20 @@ export function updateSession(sessionId: string, patch: SessionPatch): SessionRo
   const db = openEventLog();
   const current = getSession(sessionId);
   if (!current) throw new Error(`session not found: ${sessionId}`);
+  if (!current.metadata || typeof current.metadata !== 'object' || Array.isArray(current.metadata)) {
+    throw new Error('Session metadata is not a valid object; publication ownership is unknown.');
+  }
   const next: SessionRow = {
     ...current,
     ...patch,
     metadata: patch.metadata ?? current.metadata,
     updatedAt: nowIso(),
   };
+  const nextMetadataJson = JSON.stringify(next.metadata);
+  const serializedMetadata: unknown = typeof nextMetadataJson === 'string' ? JSON.parse(nextMetadataJson) : null;
+  if (!serializedMetadata || typeof serializedMetadata !== 'object' || Array.isArray(serializedMetadata)) {
+    throw new Error('Session metadata replacement must serialize to an object.');
+  }
   // Stage 4: tokens_used is a CONCURRENT counter written by
   // accrueSessionTokens on every model completion. A read-modify-write here
   // (status/title patches racing worker increments) would write back a stale
@@ -1416,7 +1433,12 @@ export function updateSession(sessionId: string, patch: SessionPatch): SessionRo
     `UPDATE sessions SET
        status = ?, title = ?, objective = ?, token_budget = ?,
        tokens_used = CASE WHEN ? THEN ? ELSE tokens_used END,
-       current_plan_id = ?, metadata_json = ?, updated_at = ?
+       current_plan_id = ?, metadata_json = CASE
+         WHEN json_type(metadata_json, '$.__held_stop_publication_debt') IS NULL
+           THEN json_remove(?, '$.__held_stop_publication_debt')
+         ELSE json_set(?, '$.__held_stop_publication_debt',
+           json_extract(metadata_json, '$.__held_stop_publication_debt'))
+       END, updated_at = ?
      WHERE id = ?`,
   ).run(
     next.status,
@@ -1426,11 +1448,14 @@ export function updateSession(sessionId: string, patch: SessionPatch): SessionRo
     patchesTokensUsed ? 1 : 0,
     next.tokensUsed,
     next.currentPlanId,
-    JSON.stringify(next.metadata),
+    nextMetadataJson,
+    nextMetadataJson,
     next.updatedAt,
     sessionId,
   );
-  return patchesTokensUsed ? next : { ...next, tokensUsed: getSessionTokensUsed(sessionId) };
+  // The protected namespace and concurrent token counter come from the write,
+  // never from the caller's potentially stale metadata snapshot.
+  return getSession(sessionId)!;
 }
 
 /** Stage 4 (aggregate run budget): atomic, race-safe token accrual — never a

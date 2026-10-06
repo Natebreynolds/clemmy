@@ -17,6 +17,9 @@ import {
   unqualifiedModelCollisionReasonFromSnapshot,
   recordDiscoveredProviderModels,
   readDiscoveredProviderModels,
+  repairByoRoutedModelId,
+  markByoModelNotServed,
+  clearByoNotServedForTest,
 } from './byo-providers.js';
 
 // These read process.env (getRuntimeEnv checks process.env before BASE_DIR/.env),
@@ -207,6 +210,86 @@ test('declared ownership recognizes BYO ids that resemble built-in providers wit
     BYO_MODEL_API_KEY: 'key',
   }, () => {
     assert.equal(resolveDeclaredByoProviderForModel('gpt-4o-mini')?.baseURL, ZAI, 'distinct default judge id is genuine ownership');
+  });
+});
+
+test('named declaration disconnection refuses subscription-shaped and custom ids in every routing mode', () => {
+  withEnv({
+    ...DEFAULT_ENV,
+    BYO_PROVIDERS: JSON.stringify([{ id: 'together', label: 'Disconnected named owner', baseURL: TOGETHER,
+      modelIds: ['gpt-6.1-sol', 'claude-sonnet-5', 'owned-custom-model'] }]),
+  }, () => {
+    // Exercise both captured subscription-availability branches without a
+    // provider/auth call; missing named ownership must take precedence.
+    const snapshot = { ...captureByoRoutingSnapshot(), claudeAvailable: true, codexAvailable: true };
+    for (const model of ['gpt-6.1-sol', 'claude-sonnet-5', 'owned-custom-model']) {
+      for (const mode of ['off', 'worker', 'all_in'] as const) {
+        assert.match(unqualifiedModelCollisionReasonFromSnapshot(model, snapshot, mode) ?? '',
+          /declared.*Disconnected named owner.*not connected/);
+        assert.throws(() => resolveEffectiveProviderForModelFromSnapshot(model, snapshot, mode), /not connected/);
+      }
+      assert.throws(() => resolveDeclaredByoProviderForModelFromSnapshot(model, snapshot), /not connected/);
+      assert.throws(() => resolveByoProviderForModelFromSnapshot(model, snapshot), /not connected/);
+    }
+    assert.equal(resolveEffectiveProviderForModelFromSnapshot('gpt-6-sol', snapshot, 'all_in'), 'codex');
+    assert.equal(resolveEffectiveProviderForModelFromSnapshot('claude-undeclared', snapshot, 'all_in'), 'claude');
+    assert.equal(resolveDeclaredByoProviderForModelFromSnapshot('gpt-6-sol', snapshot), undefined,
+      'a named provider does not claim an undeclared subscription');
+  });
+});
+
+test('named declaration ownership is captured coherently, and the next snapshot sees key loss', () => {
+  withEnv({
+    ...DEFAULT_ENV,
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_PROVIDERS: JSON.stringify([{ id: 'together', label: 'Named owner', baseURL: TOGETHER,
+      modelIds: ['gpt-6.1-sol'] }]),
+    BYO_PROVIDER_TOGETHER_API_KEY: 'synthetic-owner-key',
+  }, () => {
+    const connected = captureByoRoutingSnapshot();
+    process.env.BYO_PROVIDER_TOGETHER_API_KEY = '';
+    assert.equal(resolveDeclaredByoProviderForModelFromSnapshot('gpt-6.1-sol', connected)?.providerId, 'together');
+    assert.equal(resolveEffectiveProviderForModelFromSnapshot('gpt-6.1-sol', connected), 'byo');
+    const disconnected = captureByoRoutingSnapshot();
+    assert.throws(() => resolveDeclaredByoProviderForModelFromSnapshot('gpt-6.1-sol', disconnected), /not connected/);
+    assert.throws(() => resolveEffectiveProviderForModelFromSnapshot('gpt-6.1-sol', disconnected), /not connected/);
+  });
+});
+
+test('a disconnected legacy default alone keeps existing undeclared subscription routing', () => {
+  withEnv({ BYO_MODEL_BASE_URL: TOGETHER, BYO_MODEL_ID: 'gpt-6.1-sol', MODEL_ROUTING_MODE: 'all_in' }, () => {
+    const snapshot = { ...captureByoRoutingSnapshot(), codexAvailable: true, claudeAvailable: true };
+    assert.equal(resolveEffectiveProviderForModelFromSnapshot('gpt-6.1-sol', snapshot), 'codex');
+    assert.equal(resolveDeclaredByoProviderForModelFromSnapshot('gpt-6.1-sol', snapshot), undefined);
+    assert.equal(unqualifiedModelCollisionReasonFromSnapshot('gpt-6.1-sol', snapshot), undefined);
+  });
+});
+
+test('named-owned unavailable model repair refuses replacement and preserves legacy repair', () => {
+  withEnv({
+    ...DEFAULT_ENV,
+    MODEL_ROUTING_MODE: 'all_in',
+    OPENAI_MODEL_WORKER: 'gpt-5.4',
+    BYO_PROVIDERS: JSON.stringify([{ id: 'together', label: 'Exact named owner', baseURL: TOGETHER,
+      modelIds: ['owned-custom-model'] }]),
+    BYO_PROVIDER_TOGETHER_API_KEY: 'synthetic-owner-key',
+  }, () => {
+    clearByoNotServedForTest();
+    try {
+      assert.equal(repairByoRoutedModelId('owned-custom-model'), 'owned-custom-model');
+      markByoModelNotServed('owned-custom-model');
+      assert.throws(() => repairByoRoutedModelId('owned-custom-model'),
+        /declared.*Exact named owner.*marked unavailable/);
+
+      assert.equal(repairByoRoutedModelId('unowned-custom-model'), 'glm-5.2');
+      assert.equal(repairByoRoutedModelId('gpt-5.4'), 'gpt-5.4', 'legacy worker ownership still passes through');
+      markByoModelNotServed('gpt-5.4');
+      assert.equal(repairByoRoutedModelId('gpt-5.4'), 'glm-5.2', 'legacy rejection still permits default repair');
+      markByoModelNotServed('glm-5.2');
+      assert.equal(repairByoRoutedModelId('gpt-5.4'), 'gpt-5.4', 'legacy repair never picks another marked-unavailable id');
+    } finally {
+      clearByoNotServedForTest();
+    }
   });
 });
 

@@ -1,3 +1,4 @@
+import { heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_PENDING_TEXT } from './held-stop-publication.js';
 import './memory-scope-binding.js';
 import { providerCapacityErrorText } from '../../shared/provider-capacity.js';
 import { redactSensitiveText } from '../security.js';
@@ -48,7 +49,8 @@ import { readSourceConnectionCheckpoint } from './source-connection-checkpoints.
  *     best-effort from harness events for legacy progress surfaces.
  */
 import { runConversation,
-  runConversationContinuingPastToolCallsLimit, verifiedWorkflowRunDispatchReceipts, type RunConversationOptions } from './loop.js';
+  runConversationContinuingPastToolCallsLimit, verifiedWorkflowRunDispatchReceipts, terminalQuestionEventForAcceptedSource,
+  pendingApprovalsForAcceptedSource, type RunConversationOptions } from './loop.js';
 import { currentAcceptedReadAuthority } from '../read-path/accepted-read-authority.js';
 import {
   resolveTurnCapabilityCandidates,
@@ -81,7 +83,9 @@ import {
   type PendingWorkflowChatDispatchOwnership,
 } from '../../tools/workflow-run-queue.js';
 import { buildOrchestratorAgent } from '../../agents/orchestrator.js';
-import { sessionAgentAnsweringModel } from '../../agents/session-agent-model.js';
+import { sessionAgentExecutionModel, type SessionAgentModel, type UnavailableSessionAgentModel } from '../../agents/session-agent-model.js';
+import { withPinnedWorkerModel } from './pinned-worker-model.js';
+import { BoundaryError } from '../boundary-error.js';
 import { executionLaneToolSearchEnabled } from '../../agents/tool-catalog.js';
 import { configureHarnessRuntime } from './codex-client.js';
 import {
@@ -104,7 +108,7 @@ import {
   type EventRow,
 } from './eventlog.js';
 import { sessionAgentFields, sessionProjectFields } from './session-composition.js';
-import { listPending, projectPendingApprovalUserDependency } from './approval-registry.js';
+import { projectPendingApprovalUserDependency } from './approval-registry.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkUnparseableToolCall } from './claude-agent-brain.js';
 import { buildContinueInput } from './continue-directive.js';
 import { ClaudeSdkCapacityExhaustedError, ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
@@ -129,12 +133,16 @@ import type { AssistantRequest, AssistantResponse, AssistantRouteDiagnostics, To
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
 import {
   PUBLIC_RUN_FAILURE_TEXT,
+  PUBLIC_BLOCKED_NEXT_STEP_TEXT,
+  publicRunFailureKind,
+  publicRunFailureText,
   publicProviderCapacityText,
   publicAsyncWorkDispatchedData,
   publicCompletionText,
   publicReplyText,
 } from './public-presentation.js';
 import { commitTurnOutcome } from './delivery-committer.js';
+import { renderTypedControlState } from './typed-control-state.js';
 import {
   presentationEventFromCompletionData,
   turnOutcomeId,
@@ -409,8 +417,15 @@ async function blockedPreRunResponse(
   request: AssistantRequest,
   userText: string,
   details?: Record<string, unknown>,
+  /** Host-only unavailable saved-pin refusal. It has no execution graph to
+   * interpret: accepting the source and committing the block are sufficient. */
+  unavailableSavedPin?: UnavailableSessionAgentModel,
 ): Promise<AssistantResponse> {
   const route = routeForHarness(surface, request);
+  if (unavailableSavedPin) {
+    route.effectiveModel = unavailableSavedPin.modelId ?? unavailableSavedPin.savedModel ?? undefined;
+    route.provider = providerFor(route.effectiveModel);
+  }
   let committedText = PUBLIC_RUN_FAILURE_TEXT;
   let terminalCommitted = false;
   let preflightAttempt: ReturnType<typeof beginRunAttempt> | null = null;
@@ -458,7 +473,7 @@ async function blockedPreRunResponse(
         source: `bridge:${surface}`,
       },
     }, { existingEventSeq: request.sourceUserSeq, armRunInFlight: true });
-    await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
+    if (!unavailableSavedPin) await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
     // recordRunAttemptUserInput atomically accepted this source and armed
     // restart ownership. A failed terminal therefore cannot become live-only.
     const identity: TurnIdentity = {
@@ -500,6 +515,20 @@ async function blockedPreRunResponse(
     ...route,
     transport: 'harness_preflight_block',
   });
+}
+
+function unavailableSavedAgentResponse(surface: HarnessSurface, request: AssistantRequest,
+  choice: UnavailableSessionAgentModel): Promise<AssistantResponse> {
+  const agent = choice.agentName ? `“${choice.agentName}”` : 'this saved agent';
+  const model = choice.modelId ?? choice.savedModel;
+  const text = model
+    ? `I could not start ${agent} because its saved model “${model}” is unavailable. Connect that model in Settings > Models or choose a different model for this conversation, then try again.`
+    : `I could not verify the saved model for ${agent}. Check the agent's saved model or choose a model for this conversation, then try again.`;
+  return blockedPreRunResponse(surface, request, text, {
+    reason: 'saved_agent_model_unavailable', savedAgentId: choice.agentId,
+    savedAgentName: choice.agentName, savedModel: choice.savedModel,
+    requiredModel: choice.modelId, modelCheck: choice.reason,
+  }, choice);
 }
 
 function responseForWarmReadPolicyConflict(
@@ -670,9 +699,9 @@ function attachLegacyProgressRelay(request: AssistantRequest): () => void {
 /** The actual clarifying question (+ options, numbered) from the latest
  *  awaiting_user_input event — what the user must SEE to answer. Returns null
  *  when no such event exists (caller falls back to the decision text). */
-function awaitingQuestionText(sessionId: string): string | null {
+function awaitingQuestionText(sessionId: string, sourceUserSeq: number, turn: number): string | null {
   try {
-    const [ev] = listEvents(sessionId, { types: ['awaiting_user_input'], limit: 1, desc: true });
+    const ev = terminalQuestionEventForAcceptedSource({ sessionId, sourceUserSeq, turn });
     if (!ev) return null;
     const data = ev.data as { question?: unknown; options?: unknown };
     const question = publicReplyText(data.question, '');
@@ -696,7 +725,7 @@ function awaitingQuestionText(sessionId: string): string | null {
  * always learns what happened. Thin wrapper over the shared synthesizer (also used at
  * the loop's terminal-reply choke points). `afterSeq` scopes to this request's events.
  * Returns null only for a TOTAL non-response (no writes, no tools) — the caller then
- * shows the genuine "send that again" fallback.
+ * explains the unfinished request and asks the owner to check before continuing.
  */
 export function synthesizeCompletedWorkReport(sessionId: string, afterSeq?: number): string | null {
   return synthesizeTurnReport(sessionId, afterSeq);
@@ -730,8 +759,8 @@ function commitRecoveryCandidateTerminal(input: {
     });
   }
   const text = input.completedReason === 'no_structured_output'
-    ? 'I could not produce a safe final answer for that turn. The turn is closed; the activity log has the technical details.'
-    : 'The run stopped before it produced a safe final answer. The run is closed; the activity log has the technical details.';
+    ? 'I could not produce a safe final answer, so this request is still unfinished. Ask me to check what completed and what remains before continuing.'
+    : 'The run stopped before it produced a safe final answer, so this request is still unfinished. Ask me to check what completed and what remains before continuing.';
   const committed = commitTurnOutcomeImpl({
     version: 2,
     id: turnOutcomeId(identity),
@@ -1424,6 +1453,7 @@ function commitBridgeFailedTerminal(input: {
     ? ''
     : redactSensitiveText(providerCapacityErrorText(input.error)).replace(/\s+/g, ' ').trim().slice(0, 300);
   const capacityText = detail ? publicProviderCapacityText(detail) : null;
+  const failureKind = publicRunFailureKind(input.error);
   const identity = logicalTurnIdentity({
     sessionId: input.request.sessionId,
     sourceUserSeq: input.turn.sourceUserSeq,
@@ -1435,7 +1465,7 @@ function commitBridgeFailedTerminal(input: {
     identity,
     status: 'failed',
     resumable: false,
-    presentation: { kind: 'error', text: capacityText ?? PUBLIC_RUN_FAILURE_TEXT },
+    presentation: { kind: 'error', text: failureKind ? publicRunFailureText(failureKind) : capacityText ?? PUBLIC_RUN_FAILURE_TEXT },
   }, {
     legacyReason: input.reason,
     // Raw exception text stays in the private logs; only a provider's usage
@@ -1493,6 +1523,20 @@ export async function respondViaHarness(
   const sessionId = request.sessionId;
   const acceptedSourceUserSeq = opts.sourceUserSeq ?? request.sourceUserSeq;
   const displayMessage = request.displayMessage ?? request.message;
+  // A saved publication owner precedes model selection, semantic preparation,
+  // connection acquisition and physical-attempt creation. An exact source
+  // number alone is not a bearer token; validate its accepted visible input.
+  if (acceptedSourceUserSeq && heldStopPublicationOwnsSource(sessionId, acceptedSourceUserSeq)) {
+    const exactRequest = { ...request, sourceUserSeq: acceptedSourceUserSeq };
+    const publicationSource = acceptedSourceIdentityForReplay(exactRequest);
+    if (!publicationSource) throw new Error('Held-stop publication replay does not match its accepted request.');
+    const terminal = exactTerminalReplayForRequest(exactRequest);
+    if (terminal) return withRouteDiagnostics(responseForExactTerminalReplayUnderPolicy(surface, request, terminal),
+      routeForAcceptedHarness(surface, request, opts.modelOverride, publicationSource));
+    return withRouteDiagnostics({ sessionId, text: HELD_STOP_PUBLICATION_PENDING_TEXT,
+      stoppedReason: 'in-progress', turnsUsed: publicationSource.turn },
+      routeForAcceptedHarness(surface, request, opts.modelOverride, publicationSource));
+  }
   const connection = retainedConnectionForRequest({ ...request, sourceUserSeq: acceptedSourceUserSeq });
   if (connection) {
     if (request.taskMode && taskModeDigest(request.taskMode)
@@ -1517,9 +1561,15 @@ export async function respondViaHarness(
   // A conversation switched to a saved agent the owner pinned a model to
   // answers on that model, until the owner picks one for this conversation
   // (session-agent-model.ts). A resumed connection keeps its own model.
+  let savedAgentPin: SessionAgentModel | undefined;
   if (config.kind === 'chat' && !connection && !opts.modelOverride) {
-    const agentModel = sessionAgentAnsweringModel(sessionId);
-    if (agentModel) opts = { ...opts, modelOverride: agentModel.modelId };
+    const choice = sessionAgentExecutionModel(sessionId);
+    if (choice.kind === 'unavailable') return unavailableSavedAgentResponse(surface,
+      { ...request, sourceUserSeq: acceptedSourceUserSeq }, choice);
+    if (choice.kind === 'pinned') {
+      savedAgentPin = choice;
+      opts = { ...opts, modelOverride: choice.modelId };
+    }
   }
 
   if (!getSession(sessionId)) {
@@ -1926,7 +1976,7 @@ export async function respondViaHarness(
     // model ids + a rebuild factory so a transient model/codex error mid-turn
     // re-dispatches to the next brain instead of immediately asking. Best-effort
     // + gated by CLEMMY_BRAIN_FALLOVER; absence = today's ask behavior.
-    const fallover = config.kind === 'chat' && !connection
+    const fallover = config.kind === 'chat' && !connection && !savedAgentPin
       ? buildChatFalloverWiring({
           userInput: request.message,
           sessionId,
@@ -1982,7 +2032,10 @@ export async function respondViaHarness(
         data: { sourceUserSeq: sourceUserEvent.seq, lane: 'respond_bridge',
           stages: preparationStages, totalMs: preparationStages.harness_dispatch_entered } });
     } catch { /* Diagnostics never change dispatch or completion behavior. */ }
-    const result = await runConversationImpl({
+    // The exact saved choice (or a resumed execution's frozen checkpoint
+    // model) spans lazy construction and every awaited foreground response.
+    const exactForegroundModel = savedAgentPin?.modelId ?? connection?.checkpoint.agent?.modelId;
+    const result = await withPinnedWorkerModel(exactForegroundModel, () => runConversationImpl({
       buildAgent,
       sessionId,
       input: request.message,
@@ -2013,7 +2066,7 @@ export async function respondViaHarness(
       reuseRecordedUserInput: true,
       falloverModelIds: fallover.falloverModelIds,
       rebuildAgentForBrain: fallover.rebuildAgentForBrain,
-    });
+    }));
     requestAttemptStatus = result.status === 'killed'
       ? 'cancelled'
       : result.status === 'failed'
@@ -2225,17 +2278,25 @@ export async function respondViaHarness(
           // question itself (observed live 2026-07-03). Prefer a reply that
           // actually asks; else render the awaiting_user_input event's question
           // + options verbatim.
-          text: (replyText && /\?/.test(replyText) ? replyText : awaitingQuestionText(sessionId))
+          text: (replyText && /\?/.test(replyText) ? replyText : awaitingQuestionText(sessionId, sourceUserEvent.seq, result.lastTurn))
             || replyText
-            || '(no reply produced)',
+            || renderTypedControlState({ status: 'needs_input', needs: { kind: 'input' } }),
           sessionId,
           stoppedReason: 'awaiting-input',
           turnsUsed: result.lastTurn,
         }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
       case 'awaiting_approval': {
-        const pending = listPending({ sessionId, status: 'pending' });
-        const first = pending[0];
-        const dependency = first ? projectPendingApprovalUserDependency(first) : null;
+        const pending = pendingApprovalsForAcceptedSource({ sessionId, sourceUserSeq: sourceUserEvent.seq, turn: result.lastTurn });
+        const first = pending.at(-1);
+        if (!first) {
+          return withRouteDiagnostics({
+            text: 'I could not find a valid approval for this exact request, so it is still unfinished. Ask me to check the required approval and any completed work before continuing.',
+            sessionId,
+            stoppedReason: 'awaiting-input',
+            turnsUsed: result.lastTurn,
+          }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
+        }
+        const dependency = projectPendingApprovalUserDependency(first);
         if (dependency?.kind === 'input') {
           return withRouteDiagnostics({
             text: dependency.question,
@@ -2261,13 +2322,12 @@ export async function respondViaHarness(
         // chose to REST. The old fire-and-forget drain here synthesized a
         // user_input_received to fake re-entry — a stall wearing a banner
         // (live mszlpidc: "pass 1 of 200" with no logged next-step claim and
-        // no continue dispatch). The park copy states progress is saved; it
-        // never asks the user to type `continue` — any next user message
-        // re-enters from the checkpoint.
+        // no continue dispatch). The park copy gives an ordinary user-message
+        // next step; it does not promise an automatic dispatch or add a control.
         return withRouteDiagnostics({
           text: replyText || (result.limitKind === 'token_budget'
-            ? 'I hit this run\'s token budget before finishing. Progress is checkpointed — I\'ll pick up from here.'
-            : 'I hit the run budget before finishing. Progress is checkpointed — I\'ll pick up from here.'),
+            ? 'I hit this run\'s token budget before finishing. Progress is checkpointed. Ask me to continue the unfinished work.'
+            : 'I hit the run budget before finishing. Progress is checkpointed. Ask me to continue the unfinished work.'),
           sessionId,
           stoppedReason: result.limitKind === 'token_budget' ? 'token-budget' : 'max-turns-with-grace',
           turnsUsed: result.lastTurn,
@@ -2286,7 +2346,7 @@ export async function respondViaHarness(
       case 'blocked':
         return withRouteDiagnostics({
           text: result.error
-            || 'I could not admit this turn, so I stopped before using any tools.',
+            || PUBLIC_BLOCKED_NEXT_STEP_TEXT,
           sessionId,
           // This machine terminal says the requested effect may already be
           // settled and only its final authoritative readback failed. Preserve
@@ -2298,6 +2358,13 @@ export async function respondViaHarness(
           turnsUsed: result.lastTurn,
         }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
       case 'failed':
+        // Preserve only the closed host result carrier through the existing
+        // catch/ownership path; error text cannot grant a known public reason.
+        if (result.failureKind === 'model.empty_completion' || result.failureKind === 'codex.auth_expired') {
+          throw new BoundaryError({ kind: result.failureKind, retryable: false,
+            userMessage: publicRunFailureText(result.failureKind),
+            operatorMessage: result.error || `harness run ${result.status}` });
+        }
       default:
         throw new Error(result.error || `harness run ${result.status}`);
     }
@@ -2457,6 +2524,12 @@ async function respondPreferHarnessOnce(
       { reason: 'non_filterable_excludes', excludeToolNames: request.excludeToolNames, nonFilterableExcludes: unsafe },
     );
   }
+  // Refuse a dead saved pin before runtime configuration or any semantic
+  // classifier can dispatch. Exact terminal replay and retained connection
+  // recovery above keep their existing owners and model choices.
+  const savedAgentChoice = !connection && SURFACE_CONFIG[surface].kind === 'chat'
+    ? sessionAgentExecutionModel(request.sessionId) : { kind: 'default' as const };
+  if (savedAgentChoice.kind === 'unavailable') return unavailableSavedAgentResponse(surface, request, savedAgentChoice);
   let auth: { ok: boolean; reason?: string };
   const runtimeConfigurationStartedAt = performance.now();
   try {
@@ -2502,7 +2575,8 @@ async function respondPreferHarnessOnce(
   // Deliberately no pre-brain provider read runs at this boundary. The typed
   // resolver components remain dormant until they can enter through the same
   // durable carrier and physical-authority kernel as every other provider I/O.
-  const useStandaloneClaudeExecutionBrain = allowStandaloneClaudeInteractiveBrainForTests
+  const useStandaloneClaudeExecutionBrain = savedAgentChoice.kind !== 'pinned'
+    && allowStandaloneClaudeInteractiveBrainForTests
     && claudeAgentSdkBrainEnabled(surface);
   if (useStandaloneClaudeExecutionBrain) {
     // Production never enters this branch. Tests can still exercise the
@@ -2620,7 +2694,7 @@ async function respondPreferHarnessOnce(
             : commitBridgeBlockedTerminal({
                 request,
                 turn,
-                text: 'The turn stopped before it produced a safe final answer. The turn is closed; the activity log has the technical details.',
+                text: 'The turn stopped before it produced a safe final answer, so this request is still unfinished. Ask me to check what completed and what remains before continuing.',
                 reason: 'narration_giveup',
                 metadata: { transport: 'claude_agent_sdk_brain' },
                 resumable: false,

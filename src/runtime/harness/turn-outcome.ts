@@ -14,7 +14,6 @@ import { parseNarratedEnvelope } from './envelope-narration.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import { looksLikeCompactDecisionProtocol } from './presentation-hygiene.js';
 import {
-  defaultHoldForControlState,
   isTypedControlStatus,
   renderTypedControlState,
 } from './typed-control-state.js';
@@ -215,10 +214,6 @@ function publicTextForOutcome(outcome: TurnOutcome): string {
     if (isTypedControlStatus(outcome.status) && error instanceof UnsafePresentationError) {
       return renderTypedControlState({
         status: outcome.status,
-        hold: defaultHoldForControlState({
-          status: outcome.status,
-          ...(outcome.status === 'needs_input' ? { needs: outcome.needs } : {}),
-        }),
         ...(outcome.status === 'needs_input' ? { needs: outcome.needs } : {}),
       });
     }

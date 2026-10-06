@@ -699,6 +699,30 @@ test('classifyOpenQuestionReplyWithJev reads a reply to Clem\'s question as one 
   assert.deepEqual(await classifyOpenQuestionReplyWithJev(input), { kind: null, failedOpen: true });
 });
 
+test('mixed answers plus a question reach the answers lane without claiming every decision was settled', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const posted: Record<string, any>[] = [];
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted.push(JSON.parse(String(init.body)));
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+      reply: { type: 'choice', choice: 'answers', confidence: 0.97, probabilities: { answers: 0.97 } },
+    }, usage: { input_tokens: 70, output_tokens: 4 } }) };
+  });
+  const reply = 'Use the weekly report and change the first batch to 14 to 18 notes. Can I attach the report?';
+  assert.deepEqual(await classifyOpenQuestionReplyWithJev({
+    question: 'Which report? I suggest six notes. What should trigger escalation?', reply,
+  }), { kind: 'answers', confidence: 0.97, failedOpen: false });
+  const body = posted[0]!;
+  assert.equal(posted.length, 1);
+  assert.equal(body.state.userReplied, reply);
+  assert.match(body.questions.reply.instructions, /ANY asked decision is answers even when it also asks a question/);
+  assert.match(body.questions.reply.criteria.answers, /partial or mixed answers/);
+  assert.match(body.questions.reply.criteria.answers, /does not mean every required decision is settled/);
+  assert.match(body.questions.reply.criteria.asks, /supplies no answer or amendment/);
+  // This validates the request contract with a mocked transport. The live
+  // mixed-language fixture must independently qualify Jev's actual reading.
+});
+
 
 test('labelIdentifierWithJev names an id only when Jev is sure, and never offers the id itself', async () => {
   _setTypesafeKeyForTests('ts_test');

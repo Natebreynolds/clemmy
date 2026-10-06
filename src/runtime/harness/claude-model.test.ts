@@ -20,6 +20,8 @@ import {
 } from './claude-model.js';
 import { ClaudeHeadlessModel, setClaudeHeadlessCliAvailableForTest } from './claude-headless-model.js';
 import { resolveModelCapability } from './model-wire-registry.js';
+import { harnessRunContextStorage } from './brackets.js';
+import type { RawClaudeStreamDiagnostic } from './claude-stream-diagnostics.js';
 
 const ID = "You are Claude Code, Anthropic's official CLI for Claude.".replace('Claude', 'Claude'); // exact identity
 const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -106,6 +108,192 @@ test('raw Claude usage rows are inclusive: the adapter reports fresh input, cach
   const canonical = canonicalCacheAccounting(recorded[0] as never);
   assert.equal(canonical.cachedReadTokens, 9_688);
   assert.equal(canonical.uncachedInputTokens, 4_229, 'uncached is the total minus what the cache served');
+});
+
+for (const shape of ['empty', 'refusal', 'text', 'tool'] as const) {
+  test(`raw Claude diagnostics preserve real adapter ${shape} metadata without content or another request`, async () => {
+    const { aisdk } = await import('@openai/agents-extensions/ai-sdk');
+    const { createAnthropic } = await import('@ai-sdk/anthropic');
+    let calls = 0;
+    const rawStop = shape === 'refusal' ? 'refusal' : shape === 'tool' ? 'tool_use' : 'end_turn';
+    const blocks = [
+      { type: 'message_start', message: { id: 'msg_diagnostic_fixture', type: 'message', role: 'assistant',
+        model: 'claude-sonnet-5-20261005', content: [], stop_reason: null, stop_sequence: null,
+        usage: { input_tokens: 42, output_tokens: 1 } } },
+      { type: 'content_block_start', index: 0, content_block: shape === 'tool'
+        ? { type: 'tool_use', id: 'toolu_fixture', name: 'read_file', input: {} }
+        : { type: 'text', text: '' } },
+      ...(shape === 'text' ? [{ type: 'content_block_delta', index: 0,
+        delta: { type: 'text_delta', text: 'PRIVATE_TEXT_é' } }] : []),
+      ...(shape === 'tool' ? [{ type: 'content_block_delta', index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"path":"PRIVATE_TOOL_ARGUMENT"}' } }] : []),
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: rawStop, stop_sequence: null }, usage: { output_tokens: 7 } },
+      { type: 'message_stop' },
+    ];
+    const provider = createAnthropic({ apiKey: 'fixture-only', fetch: async () => {
+      calls += 1;
+      return new Response(blocks.map((block) => `event: ${block.type}\ndata: ${JSON.stringify(block)}\n\n`).join(''),
+        { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    const usage: Array<Record<string, unknown>> = [];
+    const diagnostics: RawClaudeStreamDiagnostic[] = [];
+    const wrapped = withRawClaudeUsageRecording(aisdk(provider('claude-sonnet-5')), 'claude-sonnet-5',
+      (entry) => usage.push(entry as unknown as Record<string, unknown>), () => {},
+      (entry) => diagnostics.push(entry));
+    const owner = { sessionId: 'claude-diagnostic-owner', sourceUserSeq: 44, turn: 2, runAttemptId: 'attempt:fixture' };
+    const stream = harnessRunContextStorage.run(owner as never, () => wrapped.getStreamedResponse({
+      input: 'PRIVATE_PROMPT', tools: [], handoffs: [], outputType: 'text', modelSettings: {}, tracing: false,
+    } as never));
+    // Creation owns attribution; a later drain must not rebind it or observe a
+    // mutation to the original async-local context object.
+    owner.sourceUserSeq = 999;
+    const events: any[] = [];
+    await harnessRunContextStorage.run({ sessionId: 'wrong-drain-owner', sourceUserSeq: 888 } as never, async () => {
+      for await (const event of stream) events.push(event);
+    });
+    assert.equal(calls, 1);
+    assert.equal(diagnostics.length, 1);
+    assert.equal(usage.length, 1);
+    const diagnostic = diagnostics[0]!;
+    assert.equal(diagnostic.sessionId, 'claude-diagnostic-owner');
+    assert.equal(diagnostic.sourceUserSeq, 44);
+    assert.equal(diagnostic.turn, 2);
+    assert.equal(diagnostic.attemptId, 'attempt:fixture');
+    assert.equal(diagnostic.transport, 'raw_messages');
+    assert.equal(diagnostic.settlement, 'completed');
+    assert.equal(diagnostic.requestModel, 'claude-sonnet-5');
+    assert.equal(diagnostic.providerReportedModel, 'claude-sonnet-5-20261005');
+    assert.equal(diagnostic.responseId, 'msg_diagnostic_fixture');
+    assert.equal(diagnostic.eventTypeCounts.response_done, 1);
+    assert.equal(diagnostic.sawResponseDone, true);
+    assert.equal(usage[0]?.model, 'claude-sonnet-5', 'existing usage grouping remains the requested model');
+    assert.equal(usage[0]?.requestModel, 'claude-sonnet-5');
+    assert.equal(usage[0]?.providerReportedModel, 'claude-sonnet-5-20261005');
+    assert.equal(usage[0]?.sourceUserSeq, 44);
+    assert.equal(usage[0]?.account, undefined, 'response metadata cannot invent a billed account');
+    const done = events.find((event) => event.type === 'response_done').response;
+    assert.equal(done.providerData.model, 'claude-sonnet-5-20261005');
+    assert.deepEqual(done.providerData.finishReason, {
+      unified: shape === 'refusal' ? 'content-filter' : shape === 'tool' ? 'tool-calls' : 'stop', raw: rawStop,
+    });
+    if (shape === 'text') {
+      assert.equal(diagnostic.contentBytes.providerTextDelta, Buffer.byteLength('PRIVATE_TEXT_é'));
+      assert.equal(diagnostic.contentBytes.outputTextDelta, Buffer.byteLength('PRIVATE_TEXT_é'));
+      assert.equal(diagnostic.contentBytes.finalText, Buffer.byteLength('PRIVATE_TEXT_é'));
+      assert.equal(done.output[0].content[0].text, 'PRIVATE_TEXT_é');
+    } else {
+      assert.equal(diagnostic.contentBytes.finalText, 0);
+      if (shape === 'tool') {
+        assert.equal(diagnostic.outputItemTypeCounts.function_call, 1);
+        assert.equal(done.output[0].arguments, '{"path":"PRIVATE_TOOL_ARGUMENT"}');
+      } else {
+        assert.equal(diagnostic.eventTypeCounts['model.text-start'], 1);
+        assert.equal(diagnostic.eventTypeCounts['model.text-end'], 1);
+        assert.deepEqual(done.output, [], 'diagnostics do not manufacture output');
+      }
+    }
+    assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE_|fixture-only/);
+  });
+}
+
+test('raw Claude diagnostics are bounded, source-bound, and best effort on errors or early close', async () => {
+  const diagnostics: RawClaudeStreamDiagnostic[] = [];
+  const failure = new Error('PRIVATE_ERROR');
+  const metadataEvents = [
+    { type: 'model', event: { type: 'response-metadata', modelId: 'https://PRIVATE_MODEL', id: 'PRIVATE_ID', metadata: 'PRIVATE_METADATA' } },
+    { type: 'model', event: { type: 'finish', finishReason: { unified: 'PRIVATE_REASON', nested: 'PRIVATE_METADATA' } } },
+    ...Array.from({ length: 100 }, (_, index) => ({ type: 'model', event: { type: `PRIVATE_EVENT_${index}` } })),
+  ];
+  const wrapped = withRawClaudeUsageRecording({
+    getResponse: async () => { throw failure; },
+    getStreamedResponse: async function* () { yield* metadataEvents; throw failure; },
+  } as never, 'claude-sonnet-5', () => {}, () => {}, (entry) => diagnostics.push(entry));
+  const create = () => harnessRunContextStorage.run({ sessionId: 'diagnostic-error', sourceUserSeq: 45 } as never,
+    () => wrapped.getStreamedResponse({} as never));
+  await assert.rejects(async () => { for await (const _ of create()) { /* consume */ } }, (error) => error === failure);
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostics[0]?.settlement, 'error');
+  assert.equal(diagnostics[0]?.eventTypeCounts['model.other'], 100);
+  assert.equal(diagnostics[0]?.unrecognizedModelMetadata, true);
+  assert.equal(diagnostics[0]?.unrecognizedFinishMetadata, true);
+  assert.equal(diagnostics[0]?.providerReportedModel, undefined);
+  assert.equal(diagnostics[0]?.finishReason, undefined);
+  assert.doesNotMatch(JSON.stringify(diagnostics), /PRIVATE_/);
+  assert.ok(JSON.stringify(diagnostics[0]).length < 2_000, 'unknown event names cannot grow the diagnostic vocabulary');
+  for await (const _ of create()) break;
+  assert.equal(diagnostics.length, 2, 'early close writes only one further record');
+  assert.equal(diagnostics[1]?.settlement, 'closed');
+  await assert.rejects(async () => { for await (const _ of wrapped.getStreamedResponse({} as never)) { /* no owner */ } });
+  assert.equal(diagnostics.length, 2, 'unattributed streams cannot mint a source diagnostic');
+  await assert.rejects(async () => {
+    const invalidOwnerStream = harnessRunContextStorage.run({ sessionId: 'x'.repeat(300), sourceUserSeq: 47 } as never,
+      () => wrapped.getStreamedResponse({} as never));
+    for await (const _ of invalidOwnerStream) { /* consume */ }
+  });
+  assert.equal(diagnostics.length, 2, 'oversized source identities cannot create unbounded diagnostics');
+  const brokenRecorder = withRawClaudeUsageRecording({
+    getResponse: async () => { throw failure; },
+    getStreamedResponse: async function* () { yield { type: 'response_done', response: { output: [], usage: {} } }; },
+  } as never, 'claude-sonnet-5', () => {}, () => {}, () => { throw new Error('diagnostic persistence failed'); });
+  const events: unknown[] = [];
+  await harnessRunContextStorage.run({ sessionId: 'diagnostic-error', sourceUserSeq: 46 } as never, async () => {
+    for await (const event of brokenRecorder.getStreamedResponse({} as never)) events.push(event);
+  });
+  assert.equal(events.length, 1, 'failed diagnostic storage cannot break a completed stream');
+});
+
+test('raw Claude metadata projection preserves existing final metadata and output bytes', async () => {
+  const original = { id: 'msg_existing_fixture', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'PRIVATE_TEXT' }] }],
+    providerData: { model: 'claude-existing-fixture', finishReason: 'length', privateField: 'PRIVATE_METADATA' } };
+  const before = JSON.stringify(original);
+  const usage: Array<Record<string, unknown>> = [];
+  const wrapped = withRawClaudeUsageRecording({
+    getResponse: async () => original,
+    getStreamedResponse: async function* () {
+      yield { type: 'model', event: { type: 'response-metadata', id: original.id, modelId: 'claude-provider-fixture' } };
+      yield { type: 'model', event: { type: 'finish', finishReason: { unified: 'stop', raw: 'end_turn' } } };
+      yield { type: 'response_done', response: original };
+    },
+  } as never, 'claude-request-fixture', (entry) => usage.push(entry as unknown as Record<string, unknown>), () => {});
+  const events: any[] = [];
+  for await (const event of wrapped.getStreamedResponse({} as never)) events.push(event);
+  const done = events.find((event) => event.type === 'response_done').response;
+  assert.equal(JSON.stringify(original), before, 'observation cannot mutate the inner response');
+  assert.deepEqual(done.output, original.output);
+  assert.equal(done.id, original.id);
+  assert.equal(done.providerData.model, 'claude-existing-fixture');
+  assert.equal(done.providerData.finishReason, 'length', 'do not erase an existing termination field');
+  assert.equal(done.providerData.providerReportedModel, 'claude-provider-fixture');
+  assert.equal(usage[0]?.requestModel, 'claude-request-fixture');
+  assert.equal(usage[0]?.providerReportedModel, 'claude-provider-fixture');
+});
+
+test('raw Claude diagnostics persist once in the exact source trace and stay off the public event plane', async () => {
+  const { createSession, appendEvent, listEvents } = await import('./eventlog.js');
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const session = createSession({ kind: 'chat', channel: 'test', title: 'Raw Claude metadata fixture' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'fixture' } });
+  const wrapped = withRawClaudeUsageRecording({
+    getResponse: async () => { throw new Error('unused'); },
+    getStreamedResponse: async function* () {
+      yield { type: 'model', event: { type: 'response-metadata', id: 'msg_persisted_fixture', modelId: 'claude-sonnet-5' } };
+      yield { type: 'model', event: { type: 'finish', finishReason: { unified: 'stop', raw: 'end_turn' } } };
+      yield { type: 'response_done', response: { output: [], usage: {} } };
+    },
+  } as never, 'claude-sonnet-5', () => {}, () => {});
+  await harnessRunContextStorage.run({ sessionId: session.id, sourceUserSeq: source.seq, turn: 1,
+    runAttemptId: 'attempt:durable-fixture' } as never, async () => {
+    for await (const _ of wrapped.getStreamedResponse({} as never)) { /* consume */ }
+  });
+  const rows = listEvents(session.id).filter((row) => row.type === 'model_stream_diagnostic');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.data.sourceUserSeq, source.seq);
+  assert.equal(rows[0]?.data.attemptId, 'attempt:durable-fixture');
+  assert.equal(rows[0]?.data.responseId, 'msg_persisted_fixture');
+  assert.equal(rows[0]?.turn, 1);
+  assert.equal(projectHarnessEventForPublic(rows[0]!), null, 'diagnostic metadata is never a public lifecycle event');
 });
 
 test('envelope: x-api-key is STRIPPED and OAuth Bearer is set (the billing guard)', () => {

@@ -461,10 +461,10 @@ export async function classifyOpenQuestionReplyWithJev(
     questions: {
       reply: {
         type: 'choice',
-        instructions: 'Clem paused to ask the user something before continuing, and the user replied. What does the reply do?',
+        instructions: 'Clem paused to ask the user something before continuing, and the user replied. What does the reply do? A mixed reply that answers or changes ANY asked decision is answers even when it also asks a question; asks is a question back without an answer or amendment.',
         criteria: {
-          answers: 'It answers or decides what Clem asked: picks an option, gives the requested detail, says yes or no, or corrects an earlier answer.',
-          asks: 'It asks Clem a question or asks for clarification before deciding.',
+          answers: 'It answers or changes at least one decision Clem asked about: picks an option, supplies requested detail, accepts or declines, corrects an answer, or amends the proposed scope. Choose this for partial or mixed answers even when the same reply also asks a question. It does not mean every required decision is settled.',
+          asks: 'It only asks Clem a question or asks for clarification before deciding, and supplies no answer or amendment to any asked decision.',
           other: 'It talks about something else or starts different work.',
           none: 'Not sure.',
         },

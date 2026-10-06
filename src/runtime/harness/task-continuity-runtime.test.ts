@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import type { ClarificationRevisionInput } from '../semantic-boundary/clarification-revision.js';
 
 const PRIOR_HOME = process.env.CLEMENTINE_HOME;
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-task-continuity-runtime-'));
@@ -23,6 +25,8 @@ const { recordAcceptedSourceGraph } = await import('./record-accepted-source-gra
 const turnControl = await import('./turn-control.js');
 const sourceAdmission = await import('./source-strategy-admission.js');
 const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+const revisionAdapter = await import('../semantic-boundary/clarification-revision.js');
+const usageLog = await import('../usage-log.js');
 
 const RETAINED_CHECKPOINT = '\n\nRetained work (durable checkpoint):\n- Source/tool read_file: 1 record retained as rh_fixture_read.\nExternal write state: no settled external-write attempt is recorded.';
 
@@ -1766,6 +1770,12 @@ function seedSemanticReading(
   validationOutcome: 'admitted' | 'invalid',
   raw: Record<string, unknown>,
 ) {
+  // A persisted model reading also records durable participation in the real
+  // admission boundary; exercise the same consuming guard in this fixture.
+  eventlog.openEventLog().prepare(`INSERT OR REPLACE INTO turn_semantics_dispositions
+    (session_id, source_user_seq, participation, outcome, created_at)
+    VALUES (?, ?, 'participated', ?, ?)`)
+    .run(sessionId, sourceUserSeq, validationOutcome === 'admitted' ? 'admitted' : 'blocked', new Date().toISOString());
   const event = eventlog.appendEvent({
     sessionId, turn: 1, role: 'system', type: 'turn_semantics_interpreted',
     data: { purpose: 'turn_semantics', sourceUserSeq, inputHash: 'a', audienceHash: 'b', policyRevision: 'c', validationOutcome, raw },
@@ -1781,6 +1791,313 @@ function heldDraft(sessionId: string) {
   commitClarification({ sessionId, sourceSeq: origin.seq, question: HELD_DRAFT_QUESTION });
   return origin;
 }
+
+const COMPOUND_QUESTION = 'Which report should I use? What does LPI mean and what triggers it? Should the local summary contain 10 rows every weekday at 07:30?';
+const MIXED_REPLY = 'Yes all works perfectly. Use the Northstar report. Make the first batch 30 or 40 rows instead; I can provide the report if it helps.';
+const RESIDUAL_QUESTION = 'What does LPI mean, and what should trigger it?';
+
+async function fixtureRevision(input: ClarificationRevisionInput) {
+  return revisionAdapter.proposeClarificationRevision(input, {
+    complete: async () => ({ raw: {
+      kind: 'revision', acknowledgment: 'I kept the Northstar report, weekday timing, and your first-batch range of 30 or 40 rows.',
+      question: RESIDUAL_QUESTION, options: [], decisions: [
+        { id: 'report', questionQuote: 'Which report should I use?', disposition: 'answered',
+          claim: 'Northstar report', replyQuote: 'Use the Northstar report.', residualQuote: null },
+        { id: 'meaning', questionQuote: 'What does LPI mean and what triggers it?', disposition: 'unresolved',
+          claim: null, replyQuote: null, residualQuote: RESIDUAL_QUESTION },
+        { id: 'batch', questionQuote: 'Should the local summary contain 10 rows every weekday at 07:30?', disposition: 'amended',
+          claim: 'First batch 30 or 40 rows; proposed weekday timing accepted.',
+          replyQuote: 'Make the first batch 30 or 40 rows instead', residualQuote: null },
+      ],
+    }, modelIdentity: 'fixture-quick', inputTokens: 10, outputTokens: 4, latencyMs: 1, usageRecorded: true }),
+    evaluate: async () => ({ ok: true, model: 'fixture-jev', answers: { grounded_revision: { type: 'noul', noul: 0.99 } },
+      usage: { input_tokens: 20, output_tokens: 2 }, decisionId: 'fixture-revision-check' }),
+  });
+}
+
+async function fixtureCompleteness(input: ClarificationRevisionInput, score: number) {
+  return revisionAdapter.checkClarificationAnswerCompleteness(input, async () => ({ ok: true,
+    model: 'fixture-jev', answers: { complete_answer: { type: 'noul', noul: score } },
+    usage: { input_tokens: 10, output_tokens: 1 }, decisionId: 'fixture-completeness' }));
+}
+
+test('a partial confirmation and amendment revise only the remaining question and retain the literal replies through final consumption', async () => {
+  const { reofferUnresolvedAcceptedSourceClarification } = await import('./loop.js');
+  for (const outcome of ['admitted', 'invalid', 'provided', 'selected'] as const) {
+    const sessionId = `continuity-compound-${outcome}`;
+    const origin = accepted(sessionId, 'Create one local summary after all required details are confirmed. Ask about report, LPI and batch size first.');
+    commitClarification({ sessionId, sourceSeq: origin.seq, question: COMPOUND_QUESTION,
+      ...(outcome === 'selected' ? { options: ['Northstar report', 'Another report'] } : {}) });
+    const before = continuity.peekTaskContinuityPacket({ sessionId });
+    assert.equal(before.status, 'available');
+    if (before.status !== 'available') continue;
+    const reply = accepted(sessionId, MIXED_REPLY);
+    const firstSlot = before.packet.pause.slot!;
+    seedSemanticReading(sessionId, reply.seq, outcome === 'invalid' ? 'invalid' : 'admitted', outcome === 'provided' || outcome === 'selected'
+      ? { version: 1, relation: 'answer_open_slot', targetGoal: { goalId: firstSlot.goalId, baseRevision: firstSlot.revision },
+          goal: null, work: null, slotAnswers: [{ kind: outcome === 'selected' ? 'option' : 'value', questionId: firstSlot.questionId,
+            slotKey: firstSlot.slotKey, ...(outcome === 'selected' ? { optionId: 'opt-1' } : { value: MIXED_REPLY }) }],
+          rationale: 'The old opaque slot accepts the partial reply without assessing other required decisions.' }
+      : AMBIGUOUS_READING);
+    for (let i = 0; i < 60; i++) eventlog.appendEvent({ sessionId, turn: reply.turn, role: 'system',
+      type: 'guardrail_tripped', data: { kind: 'unrelated-fixture-guard', sourceUserSeq: reply.seq, index: i } });
+    let revisions = 0;
+    runtime._setOpenQuestionReplyClassifierForTests(async () => ({ kind: 'answers', confidence: 0.99, failedOpen: false }));
+    runtime._setClarificationRevisionProposerForTests(async (input) => { revisions++; return fixtureRevision(input); });
+    runtime._setClarificationAnswerCompletenessForTests(input => fixtureCompleteness(input,
+      input.acceptedReply === MIXED_REPLY ? 0.05 : 0.99));
+    try {
+      if (outcome === 'provided' || outcome === 'selected') {
+        const bypass = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: MIXED_REPLY }, reply.seq,
+          { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'provided' } });
+        assert.equal(bypass.taskContinuation, undefined, 'a first opaque-slot value cannot skip all-decision completeness');
+      }
+      const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+      assert.equal(route?.route, 'revise');
+      const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: MIXED_REPLY }, reply.seq,
+        { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true } });
+      assert.equal(enriched.taskContinuation, undefined, 'partial answers do not consume or mint execution context');
+      assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
+      const stopped = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn });
+      assert.equal(stopped?.steps, 0, 'the host holds before entering executing work');
+      assert.equal(stopped?.status, 'awaiting_user_input');
+      assert.match(stopped?.lastDecision?.reply ?? '', /Northstar/);
+      assert.match(stopped?.lastDecision?.reply ?? '', /30 or 40/);
+      assert.ok((stopped?.lastDecision?.reply ?? '').endsWith(RESIDUAL_QUESTION));
+      assert.doesNotMatch(stopped?.lastDecision?.reply ?? '', /10 rows|Which report should/);
+      const pending = continuity.peekTaskContinuityPacket({ sessionId });
+      assert.equal(pending.status, 'available');
+      if (pending.status !== 'available') continue;
+      assert.equal(pending.packet.parentPacketId, before.packet.packetId);
+      assert.equal(pending.packet.rootSourceUserSeq, origin.seq);
+      assert.deepEqual(pending.packet.pause.slot, before.packet.pause.slot);
+      await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+      const replay = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn });
+      assert.equal(replay?.publicPresentation?.text, stopped?.publicPresentation?.text);
+      assert.equal(revisions, 1, 'an exact-source replay does not ask either reviewer again');
+      assert.equal(eventlog.listEvents(sessionId, { types: ['conversation_completed'] })
+        .filter(row => row.data.sourceUserSeq === reply.seq).length, 1);
+      const finalText = 'LPI means local priority indicator; trigger it for a requested callback. Make the first batch exactly 40 rows.';
+      const final = accepted(sessionId, finalText);
+      const slot = pending.packet.pause.slot!;
+      seedSemanticReading(sessionId, final.seq, 'admitted', {
+        version: 1, relation: 'answer_open_slot', targetGoal: { goalId: slot.goalId, baseRevision: slot.revision },
+        goal: null, work: null, slotAnswers: [{ kind: 'value', questionId: slot.questionId, slotKey: slot.slotKey, value: finalText }],
+        rationale: 'All residual details are supplied by the exact next accepted source.',
+      });
+      assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: final.seq }))?.route, 'settled');
+      const resolved = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: finalText }, final.seq,
+        { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'provided' } });
+      assert.ok(resolved.taskContinuation, 'only the subsequent fully checked answer consumes the pending edge');
+      assert.ok(resolved.taskContinuation.parentInput.includes(MIXED_REPLY), 'the changed quantity and named report survive');
+      assert.ok(resolved.taskContinuation.parentInput.includes(COMPOUND_QUESTION), 'the exact timing accepted by yes survives beside its literal question');
+      assert.ok(resolved.taskContinuation.parentInput.includes('weekday at 07:30'));
+      assert.ok(resolved.semanticTaskInput?.includes(finalText));
+      const replayedContext = runtime.rehydrateConsumedClarificationContext({ sessionId, sourceUserSeq: final.seq, answer: finalText });
+      assert.deepEqual(replayedContext, resolved.taskContinuation, 'consumed replay derives the same exact chained source capsule');
+      assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0, 'question revision performs no task effects');
+    } finally {
+      runtime._setOpenQuestionReplyClassifierForTests(null);
+      runtime._setClarificationRevisionProposerForTests(null);
+      runtime._setClarificationAnswerCompletenessForTests(null);
+    }
+  }
+});
+
+test('a fully answered first clarification uses one exact completeness receipt and preserves legacy consumed replay', async () => {
+  const sessionId = 'continuity-first-complete-answer';
+  const origin = accepted(sessionId, 'Create a local summary using the source label I choose.');
+  commitClarification({ sessionId, sourceSeq: origin.seq, question: 'Which source label should I use?' });
+  const open = continuity.peekTaskContinuityPacket({ sessionId });
+  assert.equal(open.status, 'available');
+  if (open.status !== 'available') return;
+  const text = 'Use Cedar Batch Log.';
+  const reply = accepted(sessionId, text);
+  const slot = open.packet.pause.slot!;
+  seedSemanticReading(sessionId, reply.seq, 'admitted', { version: 1, relation: 'answer_open_slot',
+    targetGoal: { goalId: slot.goalId, baseRevision: slot.revision }, goal: null, work: null,
+    slotAnswers: [{ kind: 'value', questionId: slot.questionId, slotKey: slot.slotKey, value: text }],
+    rationale: 'The one required source-label decision is answered.' });
+  let checks = 0;
+  runtime._setClarificationAnswerCompletenessForTests(async input => { checks++; return fixtureCompleteness(input, 0.99); });
+  try {
+    assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }))?.route, 'settled');
+    const result = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: text }, reply.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'provided' } });
+    assert.ok(result.taskContinuation);
+    assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }))?.route, 'settled');
+    assert.deepEqual(runtime.rehydrateConsumedClarificationContext({ sessionId, sourceUserSeq: reply.seq, answer: text }), result.taskContinuation);
+    assert.equal(checks, 1, 'exact replay uses the receipt rather than another model call');
+  } finally { runtime._setClarificationAnswerCompletenessForTests(null); }
+});
+
+test('an interrupted exact-source clarification reading holds honestly without automatically repeating provider entry', async () => {
+  const sessionId = 'continuity-reading-claimed-crash';
+  const origin = accepted(sessionId, 'Create a local summary only after all details are confirmed.');
+  commitClarification({ sessionId, sourceSeq: origin.seq, question: COMPOUND_QUESTION });
+  const pending = continuity.peekTaskContinuityPacket({ sessionId });
+  assert.equal(pending.status, 'available');
+  if (pending.status !== 'available') return;
+  const reply = accepted(sessionId, MIXED_REPLY);
+  seedSemanticReading(sessionId, reply.seq, 'invalid', AMBIGUOUS_READING);
+  const exactInput = { rootTask: origin.data.text, deliveredQuestion: pending.packet.pause.question,
+    deliveredOptions: pending.packet.pause.options, acceptedReply: MIXED_REPLY, sessionId, sourceUserSeq: reply.seq };
+  eventlog.appendEvent({ sessionId, turn: reply.turn, role: 'system', type: 'guardrail_tripped', data: {
+    kind: 'open_question_reply_reading_claimed', sourceUserSeq: reply.seq, parentPacketId: pending.packet.packetId,
+    parentSlot: pending.packet.pause.slot ?? null, sourceDigest: createHash('sha256').update(JSON.stringify(exactInput)).digest('hex'),
+    answerCompletenessRequired: false,
+  } });
+  let calls = 0;
+  runtime._setClarificationRevisionProposerForTests(async () => { calls++; throw new Error('cannot repeat a possibly paid entry'); });
+  try {
+    const reading = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    assert.equal(reading?.route, 'reask');
+    assert.equal(reading?.revisionUnavailable, true);
+    assert.match(runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: reply.seq })?.publicText ?? '', /reply is recorded.*couldn’t verify/s);
+    assert.equal(calls, 0);
+  } finally { runtime._setClarificationRevisionProposerForTests(null); }
+});
+
+test('a definition without its requested trigger stays pending even when the old slot interpreter supplied a provided answer', async () => {
+  const { reofferUnresolvedAcceptedSourceClarification } = await import('./loop.js');
+  const sessionId = 'continuity-residual-incomplete';
+  const origin = accepted(sessionId, 'Create one local summary only after all details are confirmed.');
+  commitClarification({ sessionId, sourceSeq: origin.seq, question: COMPOUND_QUESTION });
+  const reply = accepted(sessionId, MIXED_REPLY);
+  seedSemanticReading(sessionId, reply.seq, 'invalid', AMBIGUOUS_READING);
+  runtime._setClarificationRevisionProposerForTests(fixtureRevision);
+  runtime._setClarificationAnswerCompletenessForTests(input => fixtureCompleteness(input, 0.05));
+  try {
+    await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn });
+    const pending = continuity.peekTaskContinuityPacket({ sessionId });
+    assert.equal(pending.status, 'available');
+    if (pending.status !== 'available') return;
+    const text = 'LPI means local priority indicator.';
+    const partial = accepted(sessionId, text);
+    const slot = pending.packet.pause.slot!;
+    seedSemanticReading(sessionId, partial.seq, 'admitted', { version: 1, relation: 'answer_open_slot',
+      targetGoal: { goalId: slot.goalId, baseRevision: slot.revision }, goal: null, work: null,
+      slotAnswers: [{ kind: 'value', questionId: slot.questionId, slotKey: slot.slotKey, value: text }],
+      rationale: 'An old opaque slot accepts the supplied text without assessing the other required detail.' });
+    const bypass = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: text }, partial.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'provided' } });
+    assert.equal(bypass.taskContinuation, undefined, 'a direct caller cannot skip completeness for a revised pending question');
+    runtime._setClarificationRevisionProposerForTests(input => revisionAdapter.proposeClarificationRevision(input, {
+      complete: async () => ({ raw: { kind: 'revision', acknowledgment: 'I kept the meaning of LPI.',
+        question: 'What should trigger LPI?', options: [], decisions: [
+          { id: 'meaning', questionQuote: 'What does LPI mean', disposition: 'answered', claim: 'local priority indicator',
+            replyQuote: 'LPI means local priority indicator.', residualQuote: null },
+          { id: 'trigger', questionQuote: 'what should trigger it?', disposition: 'unresolved', claim: null,
+            replyQuote: null, residualQuote: 'What should trigger LPI?' },
+        ] }, modelIdentity: 'fixture-quick', inputTokens: 10, outputTokens: 4, latencyMs: 1, usageRecorded: true }),
+      evaluate: async () => ({ ok: true, model: 'fixture-jev', answers: { grounded_revision: { type: 'noul', noul: 0.99 } },
+        usage: { input_tokens: 20, output_tokens: 2 }, decisionId: 'fixture-trigger' }),
+    }));
+    assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: partial.seq }))?.route, 'revise');
+    const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: text }, partial.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'provided' } });
+    assert.equal(enriched.taskContinuation, undefined);
+    const stopped = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: partial.seq, turn: partial.turn });
+    assert.equal(stopped?.steps, 0);
+    assert.ok(stopped?.lastDecision?.reply?.endsWith('What should trigger LPI?'));
+    assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
+    assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
+  } finally {
+    runtime._setClarificationRevisionProposerForTests(null);
+    runtime._setClarificationAnswerCompletenessForTests(null);
+  }
+});
+
+test('a clarification revision review failure retains the reply and honestly holds instead of declaring consent', async () => {
+  const sessionId = 'continuity-compound-review-unavailable';
+  const origin = accepted(sessionId, 'Prepare one local artifact only after every required decision is answered.');
+  commitClarification({ sessionId, sourceSeq: origin.seq, question: COMPOUND_QUESTION });
+  const reply = accepted(sessionId, MIXED_REPLY);
+  seedSemanticReading(sessionId, reply.seq, 'invalid', AMBIGUOUS_READING);
+  let calls = 0;
+  runtime._setClarificationRevisionProposerForTests(async () => { calls++; return { status: 'unavailable', stage: 'review', reason: 'review_timeout' }; });
+  try {
+    const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    assert.equal(route?.route, 'reask');
+    const question = runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: reply.seq });
+    assert.match(question?.publicText ?? '', /reply is recorded.*couldn’t verify/s);
+    assert.ok(question?.question.includes(COMPOUND_QUESTION), 'unreviewed residual fields cannot erase required decisions');
+    const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: MIXED_REPLY }, reply.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true } });
+    assert.equal(enriched.taskContinuation, undefined);
+    await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    assert.equal(calls, 1, 'unavailable review is a retained exact-source result, not an infinite automatic retry');
+  } finally { runtime._setClarificationRevisionProposerForTests(null); }
+});
+
+test('open-question reply reading records the checked accepted source without borrowing a foreign attempt', async () => {
+  for (const ambient of ['none', 'current', 'foreign-source', 'foreign-session'] as const) {
+    const sessionId = `continuity-reply-reading-usage-${ambient}`;
+    const origin = heldDraft(sessionId);
+    const reply = accepted(sessionId, QUESTION_BACK);
+    seedSemanticReading(sessionId, reply.seq, 'admitted', AMBIGUOUS_READING);
+    const foreign = ambient === 'foreign-session'
+      ? accepted(`${sessionId}-other`, 'An unrelated accepted request.') : origin;
+    const outer = ambient === 'none' ? undefined : {
+      sessionId: ambient === 'foreign-session' ? foreign.sessionId : sessionId,
+      sourceUserSeq: ambient === 'current' ? reply.seq : foreign.seq,
+      attemptId: String((ambient === 'current' ? reply : foreign).data.attemptId),
+      promptComponents: { enclosingFrame: 1_000 },
+      usageJobId: `fixture-enclosing-job-${ambient}`,
+      usageParentTurn: { sessionId: foreign.sessionId, sourceUserSeq: foreign.seq,
+        attemptId: String(foreign.data.attemptId) },
+      role: 'brain' as const,
+      channel: 'semantic:enclosing-frame',
+      ownRequest: true,
+    };
+    const responseId = `fixture-reply-reading-${ambient}`;
+    let calls = 0;
+    let classifierScope: import('../usage-log.js').ModelUsageAttributionContext | undefined;
+    runtime._setOpenQuestionReplyClassifierForTests(async (input, opts) => {
+      calls += 1;
+      assert.deepEqual(input, { question: HELD_DRAFT_QUESTION, reply: QUESTION_BACK });
+      // The real Jev client records session identity and relies on this
+      // call's usage scope for the exact accepted source and optional attempt.
+      await Promise.resolve();
+      classifierScope = usageLog.modelUsageAttributionStorage.getStore();
+      usageLog.recordModelUsage({ sessionId: opts?.sessionId ?? 'jev',
+        channel: 'jev-open-question-reply', role: 'router', model: 'fixture-jev',
+        cacheDialect: 'none', inputTokens: 7, outputTokens: 1, ok: true, responseId });
+      return { kind: 'asks', confidence: 0.93, failedOpen: false };
+    });
+    try {
+      const classify = async () => {
+        const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+        assert.equal(route?.route, 'respond');
+        assert.equal(usageLog.modelUsageAttributionStorage.getStore(), outer,
+          'the narrow classifier scope restores the enclosing owner');
+        return route;
+      };
+      const route = outer ? await usageLog.withModelUsageAttribution(outer, classify) : await classify();
+      const rows = usageLog.readUsageEventsForDate().filter(row => row.responseId === responseId);
+      assert.equal(rows.length, 1);
+      const row = rows[0]!;
+      assert.equal(row.source, sessionId);
+      assert.equal(row.trace?.acceptedSource, `${sessionId}:${reply.seq}`);
+      assert.equal(row.trace?.logicalTurnId, `turn:${reply.seq}`);
+      assert.equal(row.trace?.attemptId, ambient === 'current' ? outer?.attemptId : undefined,
+        'an attempt is retained only for the same whole accepted-source tuple');
+      assert.equal(row.role, 'router');
+      assert.equal(row.inputTokens, 7);
+      assert.equal(row.outputTokens, 1);
+      assert.equal(row.promptComponents, undefined,
+        'this Jev request must not reuse the enclosing frame\'s prompt estimates');
+      assert.deepEqual(classifierScope, { sessionId, sourceUserSeq: reply.seq,
+        attemptId: ambient === 'current' ? outer?.attemptId : undefined },
+      'the narrow request carries only its exact owner and verified optional attempt');
+      assert.deepEqual(await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }), route);
+      assert.equal(calls, 1, 'a retained reading does not produce another billed call');
+    } finally {
+      runtime._setOpenQuestionReplyClassifierForTests(null);
+    }
+  }
+});
 
 test('a question back to Clem\'s open question goes to the brain with the step on hold, never a verbatim reask', async () => {
   const sessionId = 'continuity-question-back';
@@ -1852,6 +2169,7 @@ test('only a sure attempt to answer is re-asked verbatim; an unsure, other or mi
     const reply = accepted(sessionId, 'Sorry platform');
     seedSemanticReading(sessionId, reply.seq, 'admitted', AMBIGUOUS_READING);
     runtime._setOpenQuestionReplyClassifierForTests(async () => reading);
+    runtime._setClarificationRevisionProposerForTests(async () => ({ status: 'no_revision', reason: 'no_progress' }));
     try {
       const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
       assert.equal(route?.route, expected, label);
@@ -1863,11 +2181,12 @@ test('only a sure attempt to answer is re-asked verbatim; an unsure, other or mi
       }
     } finally {
       runtime._setOpenQuestionReplyClassifierForTests(null);
+      runtime._setClarificationRevisionProposerForTests(null);
     }
   }
 });
 
-test('an unreadable reply keeps the reask and never asks Jev', async () => {
+test('an unreadable reply cannot become a choice-classifier answer and retains an honest hold', async () => {
   const sessionId = 'continuity-reply-unreadable';
   heldDraft(sessionId);
   const reply = accepted(sessionId, 'which channel?');
@@ -1877,12 +2196,14 @@ test('an unreadable reply keeps the reask and never asks Jev', async () => {
     asked += 1;
     return { kind: 'asks', confidence: 0.99, failedOpen: false };
   });
+  runtime._setClarificationRevisionProposerForTests(async () => ({ status: 'unavailable', stage: 'proposal', reason: 'interpretation_unavailable' }));
   try {
-    assert.equal(await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }), null);
+    assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }))?.route, 'reask');
     assert.equal(asked, 0);
-    assert.ok(runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: reply.seq }));
+    assert.match(runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: reply.seq })?.publicText ?? '', /reply is recorded.*couldn’t verify/s);
   } finally {
     runtime._setOpenQuestionReplyClassifierForTests(null);
+    runtime._setClarificationRevisionProposerForTests(null);
   }
 });
 
@@ -1897,6 +2218,7 @@ test('the loop\'s reask and the respond bridge both go through the recorded repl
     const reply = accepted(sessionId, label === 'asks' ? QUESTION_BACK : 'Sorry platform');
     seedSemanticReading(sessionId, reply.seq, 'admitted', AMBIGUOUS_READING);
     runtime._setOpenQuestionReplyClassifierForTests(async () => reading);
+    runtime._setClarificationRevisionProposerForTests(async () => ({ status: 'no_revision', reason: 'no_progress' }));
     try {
       await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
       const reoffered = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn });
@@ -1908,6 +2230,7 @@ test('the loop\'s reask and the respond bridge both go through the recorded repl
       }
     } finally {
       runtime._setOpenQuestionReplyClassifierForTests(null);
+      runtime._setClarificationRevisionProposerForTests(null);
     }
   }
   const { readFileSync } = await import('node:fs');
@@ -1954,5 +2277,284 @@ test('a side conversation while a question is open goes to the brain, and planni
       'planning no longer refuses the turn that answers a question back');
   } finally {
     runtime._setOpenQuestionReplyClassifierForTests(null);
+  }
+});
+
+test('unavailable clarification keeps a bounded reference and exact public history across two failed sources and replay', async () => {
+  const { reofferUnresolvedAcceptedSourceClarification } = await import('./loop.js');
+  const { CLARIFICATION_UNAVAILABLE_NOTICE, MAX_CLARIFICATION_PUBLIC_CHARS } = await import('./clarification-public-annotation.js');
+  const sessionId = 'continuity-annotation-two-failures';
+  const origin = accepted(sessionId, 'Prepare one local report after its required details are confirmed.');
+  const options = ['Northstar report', 'Another report'];
+  commitClarification({ sessionId, sourceSeq: origin.seq, question: COMPOUND_QUESTION, options });
+  const captures: ClarificationRevisionInput[] = [];
+  runtime._setClarificationRevisionProposerForTests(async input => {
+    captures.push(input); return { status: 'unavailable', stage: 'review', reason: 'review_timeout' };
+  });
+  try {
+    const replies = [MIXED_REPLY, 'LPI means local priority indicator. I have not given its trigger yet.'];
+    let parent = continuity.peekTaskContinuityPacket({ sessionId });
+    assert.equal(parent.status, 'available');
+    for (const text of replies) {
+      const reply = accepted(sessionId, text);
+      seedSemanticReading(sessionId, reply.seq, 'invalid', AMBIGUOUS_READING);
+      assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }))?.route, 'reask');
+      const result = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn });
+      const publicText = result?.publicPresentation?.text ?? '';
+      assert.equal(result?.status, 'awaiting_user_input');
+      assert.equal(result?.steps, 0);
+      assert.equal(publicText, CLARIFICATION_UNAVAILABLE_NOTICE + COMPOUND_QUESTION);
+      assert.ok(publicText.length <= MAX_CLARIFICATION_PUBLIC_CHARS);
+      assert.equal(publicText.split(CLARIFICATION_UNAVAILABLE_NOTICE).length - 1, 1, 'host notices never become reference data');
+      assert.doesNotMatch(publicText, /Nothing new was started|will resume|all.*settled/);
+      const successor = continuity.peekTaskContinuityPacket({ sessionId });
+      assert.equal(successor.status, 'available');
+      if (successor.status !== 'available' || parent.status !== 'available') return;
+      assert.equal(successor.packet.pause.question, COMPOUND_QUESTION);
+      assert.deepEqual(successor.packet.pause.options, options);
+      assert.equal(successor.packet.parentPacketId, parent.packet.packetId);
+      assert.deepEqual(successor.packet.pause.slot, parent.packet.pause.slot);
+      assert.equal(successor.packet.rootSourceUserSeq, origin.seq);
+      assert.equal(successor.packet.publicQuestion?.text, publicText);
+      const before = eventlog.listEvents(sessionId, { types: ['conversation_completed', 'awaiting_user_input'] });
+      await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+      assert.equal(reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn })?.publicPresentation?.text, publicText);
+      assert.deepEqual(eventlog.listEvents(sessionId, { types: ['conversation_completed', 'awaiting_user_input'] }), before);
+      parent = successor;
+    }
+    assert.equal(captures.length, 2, 'one proposal per new accepted source, no replay retry');
+    assert.equal(captures[1]?.deliveredQuestion, COMPOUND_QUESTION, 'decision quotes use the whole verified reference');
+    assert.equal(captures[1]?.deliveredPublicQuestion, CLARIFICATION_UNAVAILABLE_NOTICE + COMPOUND_QUESTION);
+    assert.ok(captures[1]?.deliveredQuestionAnnotation);
+    assert.deepEqual(captures[1]?.deliveredOptions, options);
+    assert.ok(captures[1]?.rootTask.includes(MIXED_REPLY));
+    assert.equal(captures[1]?.acceptedReply, replies[1]);
+    assert.equal(parent.status, 'available');
+    if (parent.status !== 'available') return;
+    const chain = continuity.readTaskContinuityClarificationSources({ sessionId, packetId: parent.packet.packetId });
+    assert.equal(chain.status, 'verified');
+    if (chain.status !== 'verified') return;
+    assert.equal(chain.replies[1]?.previousDeliveredQuestion, CLARIFICATION_UNAVAILABLE_NOTICE + COMPOUND_QUESTION,
+      'literal history preserves what was publicly delivered');
+    assert.equal(chain.replies[1]?.previousReferenceQuestion, COMPOUND_QUESTION);
+    assert.deepEqual(chain.replies.map(reply => reply.text), replies);
+    assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
+  } finally { runtime._setClarificationRevisionProposerForTests(null); }
+});
+
+test('unavailable clarification preserves every reference byte at the 4000 boundary without dropping its notice', async () => {
+  const { reofferUnresolvedAcceptedSourceClarification } = await import('./loop.js');
+  const { CLARIFICATION_UNAVAILABLE_NOTICE } = await import('./clarification-public-annotation.js');
+  runtime._setClarificationRevisionProposerForTests(async () => ({ status: 'unavailable', stage: 'proposal', reason: 'interpretation_invalid' }));
+  try {
+    for (const length of [3_999, 4_000]) {
+      const sessionId = `continuity-annotation-bound-${length}`;
+      const suffix = ' Required final detail: café trigger?';
+      const question = 'Q'.repeat(length - suffix.length) + suffix;
+      const origin = accepted(sessionId, 'Ask for the final detail before creating the local report.');
+      commitClarification({ sessionId, sourceSeq: origin.seq, question });
+      const reply = accepted(sessionId, 'I supplied some details; the rest is still open.');
+      seedSemanticReading(sessionId, reply.seq, 'invalid', AMBIGUOUS_READING);
+      await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+      const result = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn });
+      assert.equal(result?.publicPresentation?.text, CLARIFICATION_UNAVAILABLE_NOTICE + question);
+      const retained = continuity.peekTaskContinuityPacket({ sessionId });
+      assert.equal(retained.status, 'available');
+      if (retained.status !== 'available') continue;
+      assert.equal(retained.packet.pause.question, question);
+      assert.equal(retained.packet.pause.question.length, length);
+      assert.equal(retained.packet.publicQuestion?.text.endsWith(suffix), true);
+    }
+    const sessionId = 'continuity-annotation-over-bound';
+    const source = accepted(sessionId, 'Ask before doing work.');
+    assert.throws(() => continuity.createTaskContinuityPacket({ sessionId, originatingSourceUserSeq: source.seq,
+      pause: { kind: 'clarification', question: 'Q'.repeat(4_001) } }), /exceeds 4000/);
+  } finally { runtime._setClarificationRevisionProposerForTests(null); }
+});
+
+test('unavailable clarification annotation cannot replace a question through forged provenance or matching prose', async () => {
+  const { reofferUnresolvedAcceptedSourceClarification } = await import('./loop.js');
+  const { CLARIFICATION_UNAVAILABLE_NOTICE, clarificationReferenceDigest } = await import('./clarification-public-annotation.js');
+  const sessionId = 'continuity-annotation-forgery';
+  const literal = CLARIFICATION_UNAVAILABLE_NOTICE + 'This wording is actual task data. Which destination?';
+  const origin = accepted(sessionId, 'Keep the literal wording when asking.');
+  commitClarification({ sessionId, sourceSeq: origin.seq, question: literal });
+  const reply = accepted(sessionId, 'I have not selected the destination.');
+  seedSemanticReading(sessionId, reply.seq, 'invalid', AMBIGUOUS_READING);
+  runtime._setClarificationRevisionProposerForTests(async () => ({ status: 'unavailable', stage: 'review', reason: 'not_grounded' }));
+  try {
+    await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    const result = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn });
+    assert.equal(result?.publicPresentation?.text, CLARIFICATION_UNAVAILABLE_NOTICE + literal, 'matching prose is never stripped');
+    const packet = continuity.peekTaskContinuityPacket({ sessionId });
+    assert.equal(packet.status, 'available');
+    if (packet.status !== 'available') return;
+    assert.equal(packet.packet.pause.question, literal);
+    const awaiting = eventlog.listEvents(sessionId, { types: ['awaiting_user_input'] }).find(row => row.data.sourceUserSeq === reply.seq)!;
+    const original = JSON.stringify(awaiting.data);
+    const annotation = awaiting.data.clarificationAnnotation as Record<string, unknown>;
+    for (const mutation of [
+      { ...annotation, sourceUserSeq: origin.seq },
+      { ...annotation, parentPacketId: packet.packet.packetId },
+      { ...annotation, readingEventId: origin.id },
+      { ...annotation, referenceSha256: clarificationReferenceDigest('Which destination?', []) },
+      { ...annotation, version: 2 },
+      { ...annotation, extra: true },
+    ]) {
+      eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+        .run(JSON.stringify({ ...awaiting.data, clarificationAnnotation: mutation }), awaiting.id);
+      assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'malformed');
+      eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?').run(original, awaiting.id);
+      assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
+    }
+    const reading = eventlog.getEvent(String(annotation.readingEventId))!;
+    const originalReading = JSON.stringify(reading.data);
+    for (const data of [
+      { ...reading.data, route: 'settled' },
+      { ...reading.data, revisionUnavailable: false },
+      { ...reading.data, parentSlot: { questionId: 'unrelated-slot' } },
+      { ...reading.data, sourceUserSeq: origin.seq },
+    ]) {
+      eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?').run(JSON.stringify(data), reading.id);
+      assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'malformed');
+      eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?').run(originalReading, reading.id);
+      assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
+    }
+    assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
+  } finally { runtime._setClarificationRevisionProposerForTests(null); }
+});
+
+test('a verified revision after unavailable reading receives the exact reference and no_progress remains pending', async () => {
+  const { reofferUnresolvedAcceptedSourceClarification } = await import('./loop.js');
+  for (const next of ['revision', 'no_progress'] as const) {
+    const sessionId = `continuity-annotation-positive-${next}`;
+    const origin = accepted(sessionId, 'Prepare one local artifact after required facts are supplied.');
+    commitClarification({ sessionId, sourceSeq: origin.seq, question: COMPOUND_QUESTION });
+    const first = accepted(sessionId, 'Keep holding; I need to check.');
+    seedSemanticReading(sessionId, first.seq, 'invalid', AMBIGUOUS_READING);
+    runtime._setClarificationRevisionProposerForTests(async () => ({ status: 'unavailable', stage: 'proposal', reason: 'interpretation_unavailable' }));
+    try {
+      await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: first.seq });
+      reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: first.seq, turn: first.turn });
+      const second = accepted(sessionId, MIXED_REPLY);
+      seedSemanticReading(sessionId, second.seq, 'invalid', AMBIGUOUS_READING);
+      runtime._setClarificationRevisionProposerForTests(async input => {
+        assert.equal(input.deliveredQuestion, COMPOUND_QUESTION);
+        assert.ok(input.deliveredPublicQuestion && input.deliveredQuestionAnnotation);
+        return next === 'revision' ? fixtureRevision(input) : { status: 'no_revision', reason: 'no_progress' };
+      });
+      const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: second.seq });
+      assert.equal(route?.route, next === 'revision' ? 'revise' : 'reask');
+      assert.equal(route?.revisionUnavailable, undefined);
+      const result = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: second.seq, turn: second.turn });
+      assert.equal(result?.status, 'awaiting_user_input');
+      if (next === 'revision') {
+        assert.ok(result?.publicPresentation?.text.endsWith(RESIDUAL_QUESTION));
+        assert.doesNotMatch(result?.publicPresentation?.text ?? '', /couldn’t verify|10 rows/);
+      } else assert.equal(result?.publicPresentation?.text, COMPOUND_QUESTION);
+      assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
+      assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
+    } finally { runtime._setClarificationRevisionProposerForTests(null); }
+  }
+});
+
+
+test('unavailable clarification retains only a bounded exact-source diagnostic and never promotes it to public cause or authority', async () => {
+  const { reofferUnresolvedAcceptedSourceClarification } = await import('./loop.js');
+  const { CLARIFICATION_UNAVAILABLE_NOTICE } = await import('./clarification-public-annotation.js');
+  for (const mode of ['exact', 'wrong-source', 'unexpected-content'] as const) {
+    const sessionId = `continuity-annotation-diagnostic-${mode}`;
+    const origin = accepted(sessionId, 'Hold the local artifact until I answer the required facts.');
+    commitClarification({ sessionId, sourceSeq: origin.seq, question: COMPOUND_QUESTION });
+    const reply = accepted(sessionId, MIXED_REPLY);
+    seedSemanticReading(sessionId, reply.seq, 'invalid', AMBIGUOUS_READING);
+    const diagnostic = { version: 1 as const, sessionId,
+      sourceUserSeq: mode === 'wrong-source' ? origin.seq : reply.seq,
+      kind: 'wire_envelope_invalid' as const, phase: 'wire_envelope_validation' as const,
+      deadlineFired: false, sdkRunStarted: true, sdkRunReturned: true, usageRecordedAtFailure: true,
+      ...(mode === 'unexpected-content' ? { errorMessage: 'private diagnostic content' } : {}),
+    };
+    runtime._setClarificationRevisionProposerForTests(async () => ({ status: 'unavailable', stage: 'proposal', reason: 'interpretation_invalid', diagnostic }));
+    try {
+      await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+      const reading = eventlog.listEvents(sessionId, { types: ['guardrail_tripped'] })
+        .find(row => row.data.kind === 'open_question_reply_classified' && row.data.sourceUserSeq === reply.seq)!;
+      assert.deepEqual(reading.data.revisionDiagnostic, mode === 'exact' ? diagnostic : undefined);
+      const result = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn });
+      assert.equal(result?.publicPresentation?.text, CLARIFICATION_UNAVAILABLE_NOTICE + COMPOUND_QUESTION);
+      assert.equal(result?.status, 'awaiting_user_input');
+      assert.equal(result?.steps, 0);
+      assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
+      assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
+    } finally { runtime._setClarificationRevisionProposerForTests(null); }
+  }
+});
+
+test('local structural rejection is source-bound diagnostic evidence and its replay cannot settle or recheck the question', async () => {
+  const { reofferUnresolvedAcceptedSourceClarification } = await import('./loop.js');
+  const { CLARIFICATION_UNAVAILABLE_NOTICE } = await import('./clarification-public-annotation.js');
+  for (const mode of ['exact', 'wrong-source', 'wrong-input', 'unexpected-content'] as const) {
+    const sessionId = `continuity-structural-diagnostic-${mode}`;
+    const origin = accepted(sessionId, 'Hold the local report until its required facts are supplied.');
+    commitClarification({ sessionId, sourceSeq: origin.seq, question: COMPOUND_QUESTION });
+    const reply = accepted(sessionId, MIXED_REPLY);
+    seedSemanticReading(sessionId, reply.seq, 'invalid', AMBIGUOUS_READING);
+    let proposals = 0;
+    let reviews = 0;
+    let diagnostic: unknown;
+    runtime._setClarificationRevisionProposerForTests(async input => {
+      proposals++;
+      const result = await revisionAdapter.proposeClarificationRevision(input, {
+        complete: async () => ({ raw: {
+          kind: 'revision', acknowledgment: '', question: RESIDUAL_QUESTION, options: [], decisions: [
+            { id: 'source', questionQuote: 'private-wire-sentinel-not-delivered', disposition: 'answered',
+              claim: 'Northstar report', replyQuote: 'Use the Northstar report.', residualQuote: null },
+            { id: 'meaning', questionQuote: 'What does LPI mean and what triggers it?', disposition: 'unresolved',
+              claim: null, replyQuote: null, residualQuote: RESIDUAL_QUESTION },
+          ],
+        }, modelIdentity: 'fixture-quick', inputTokens: 10, outputTokens: 4, latencyMs: 1, usageRecorded: true }),
+        evaluate: async () => {
+          reviews++;
+          throw new Error('A structurally invalid proposal must not reach independent review');
+        },
+      });
+      assert.equal(result.status, 'unavailable');
+      if (result.status !== 'unavailable') return result;
+      assert.equal(result.reason, 'interpretation_unbound');
+      assert.ok(result.structuralDiagnostic);
+      const safe = result.structuralDiagnostic!;
+      const projected = {
+        ...safe,
+        ...(mode === 'wrong-source' ? { sourceUserSeq: origin.seq } : {}),
+        ...(mode === 'wrong-input' ? { inputDigest: '0'.repeat(64) } : {}),
+        ...(mode === 'unexpected-content' ? { proposalText: 'private-wire-sentinel-not-delivered' } : {}),
+      };
+      diagnostic = projected;
+      return { ...result, structuralDiagnostic: projected };
+    });
+    try {
+      const first = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+      const again = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+      assert.equal(first?.route, 'reask');
+      assert.deepEqual(again, first);
+      assert.equal(proposals, 1);
+      assert.equal(reviews, 0);
+      const readings = eventlog.listEvents(sessionId, { types: ['guardrail_tripped'] })
+        .filter(row => row.data.kind === 'open_question_reply_classified' && row.data.sourceUserSeq === reply.seq);
+      assert.equal(readings.length, 1);
+      assert.deepEqual(readings[0].data.revisionStructuralDiagnostic, mode === 'exact' ? diagnostic : undefined);
+      assert.doesNotMatch(JSON.stringify(readings[0].data), /private-wire-sentinel/);
+      const result = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn });
+      assert.equal(result?.publicPresentation?.text, CLARIFICATION_UNAVAILABLE_NOTICE + COMPOUND_QUESTION);
+      assert.equal(result?.status, 'awaiting_user_input');
+      assert.equal(result?.steps, 0);
+      const packet = continuity.peekTaskContinuityPacket({ sessionId });
+      assert.equal(packet.status, 'available');
+      if (packet.status === 'available') {
+        assert.equal(packet.packet.originatingSourceUserSeq, reply.seq);
+        assert.equal(packet.packet.rootSourceUserSeq, origin.seq);
+      }
+      assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
+    } finally { runtime._setClarificationRevisionProposerForTests(null); }
   }
 });

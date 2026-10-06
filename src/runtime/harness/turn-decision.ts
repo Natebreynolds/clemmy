@@ -27,10 +27,22 @@ import { looksLikeToolUnavailableSelfReport } from './tool-unavailable-text.js';
 import type { OrchestratorDecisionShape } from './loop.js';
 
 export const MISSING_REPLY_USER_FALLBACK =
-  "I didn't produce a visible reply there. Please send that again and I'll retry.";
+  "I couldn't provide a visible reply, so I can't confirm this request is complete. Ask me to check what completed and what remains before continuing.";
 
 export const STRUCTURED_OUTPUT_RECOVERY_FALLBACK =
+  "Clementine couldn't prepare a usable reply. Ask me to check what completed and what remains before continuing.";
+
+// Historical rows still contain the old sentinel. Keep its classification,
+// while new public copy never asks the owner to repeat potentially completed work.
+const LEGACY_STRUCTURED_OUTPUT_RECOVERY_FALLBACK =
   "Clementine produced a response that couldn't be structured. Please ask again.";
+const STALLED_WORK_USER_FALLBACK =
+  'This request is still unfinished. Ask me to check what completed and what remains before continuing.';
+
+export function isStructuredOutputRecoveryFallback(text: unknown): boolean {
+  return text === STRUCTURED_OUTPUT_RECOVERY_FALLBACK
+    || text === LEGACY_STRUCTURED_OUTPUT_RECOVERY_FALLBACK;
+}
 
 // The draft-present retry directive below EXPLICITLY forbids tool calls and
 // demands a user-facing text reply. A turn that receives such a directive and
@@ -422,7 +434,7 @@ function looksLikeHallucinatedToolTranscript(trimmed: string): boolean {
  *  "malformed" verdict for substantive non-empty text — see FAIL-OPEN above. */
 function parseDecisionText(text: string): OrchestratorDecisionShape | null {
   const trimmed = text.trim();
-  if (!trimmed || trimmed === STRUCTURED_OUTPUT_RECOVERY_FALLBACK) return null;
+  if (!trimmed || isStructuredOutputRecoveryFallback(trimmed)) return null;
 
   // Back-compat / graceful transition: a model still emitting the JSON envelope
   // as text parses cleanly rather than being shown to the user as raw JSON.
@@ -658,9 +670,7 @@ export function evaluateStructuredDecisionStall(opts: {
     return {
       signal: 'A_zero_tools',
       rawOutput: '',
-      userVisibleMessage:
-        `_(Clementine produced an empty turn that deferred to a hand-off that no longer ` +
-        `exists, with zero tool calls. The harness will retry and force the actual tool action.)_`,
+      userVisibleMessage: STALLED_WORK_USER_FALLBACK,
       detail: {
         kind: 'structured_narration_deferral',
         rawOutput: '',
@@ -689,9 +699,7 @@ export function evaluateStructuredDecisionStall(opts: {
     return {
       signal: 'A_zero_tools',
       rawOutput: combined.slice(0, 220),
-      userVisibleMessage:
-        `_(Clementine claimed tool access was unavailable but made zero tool calls. ` +
-        `The harness will retry and force an actual tool action.)_`,
+      userVisibleMessage: STALLED_WORK_USER_FALLBACK,
       detail: {
         kind: 'structured_tool_unavailable',
         rawOutput: combined.slice(0, 220),
@@ -719,9 +727,7 @@ export function evaluateStructuredDecisionStall(opts: {
     return {
       signal: 'A_zero_tools',
       rawOutput: combined.slice(0, 220),
-      userVisibleMessage:
-        `_(Clementine said it was acting but made zero tool calls and deferred to a ` +
-        `hand-off that no longer exists. The harness will retry and force the actual tool action.)_`,
+      userVisibleMessage: STALLED_WORK_USER_FALLBACK,
       detail: {
         kind: 'structured_narration_deferral',
         rawOutput: combined.slice(0, 220),
@@ -757,9 +763,7 @@ export function evaluateStructuredDecisionStall(opts: {
     return {
       signal: 'A_zero_tools',
       rawOutput: combined.slice(0, 220),
-      userVisibleMessage:
-        `_(Clementine claimed action was completed but made zero tool calls. ` +
-        `The harness will retry and require the actual tools.)_`,
+      userVisibleMessage: STALLED_WORK_USER_FALLBACK,
       detail: {
         kind: 'structured_zero_tool_claim',
         rawOutput: combined.slice(0, 220),
@@ -881,9 +885,7 @@ export function evaluateProgress(opts: {
       return {
         signal: 'A_zero_tools',
         rawOutput: trimmed.slice(0, 220),
-        userVisibleMessage:
-          `_(The model wrote a fake tool call transcript instead of calling the tool. ` +
-          `Output: "${trimmed.slice(0, 160)}…". The harness will retry and require a real tool call.)_`,
+        userVisibleMessage: STALLED_WORK_USER_FALLBACK,
         detail: {
           rawOutput: trimmed.slice(0, 220),
           fakeToolTranscript: true,
@@ -898,9 +900,7 @@ export function evaluateProgress(opts: {
       return {
         signal: 'A_zero_tools',
         rawOutput: trimmed.slice(0, 220),
-        userVisibleMessage:
-          `_(The model claimed tool access was unavailable but made zero tool calls. ` +
-          `The harness will retry and require a real tool call.)_`,
+        userVisibleMessage: STALLED_WORK_USER_FALLBACK,
         detail: {
           kind: 'tool_unavailable_self_report',
           rawOutput: trimmed.slice(0, 220),
@@ -914,9 +914,7 @@ export function evaluateProgress(opts: {
       return {
         signal: 'A_zero_tools',
         rawOutput: trimmed,
-        userVisibleMessage:
-          `_(The sub-agent ended its turn without taking any action. The model said "${trimmed}" but made zero tool calls. ` +
-          `Re-send your request with a more specific directive — e.g. name the toolkit, the field, or the file you want it to touch.)_`,
+        userVisibleMessage: STALLED_WORK_USER_FALLBACK,
         detail: {
           rawOutput: trimmed,
           toolCalls: effectiveToolCalls,
@@ -949,9 +947,7 @@ export function evaluateProgress(opts: {
       return {
         signal: 'A_zero_tools',
         rawOutput: trimmed.slice(0, 220),
-        userVisibleMessage:
-          `_(The sub-agent announced work it was about to do but didn't actually call the tool. ` +
-          `Output: "${trimmed.slice(0, 160)}…". Re-send your request — if it keeps stalling, name the exact tool you want it to use.)_`,
+        userVisibleMessage: STALLED_WORK_USER_FALLBACK,
         detail: {
           rawOutput: trimmed.slice(0, 220),
           toolCalls: effectiveToolCalls,
@@ -1028,9 +1024,7 @@ export function evaluateProgress(opts: {
         if (info.count >= 3) {
           return {
             signal: 'B_repeated_tool',
-            userVisibleMessage:
-              `_(I'm not making progress — I just re-ran \`${info.toolName}\` with the same arguments ${info.count} times in a row. ` +
-              `What did you mean by the request? A different keyword, a specific record id, or a clarification will get past this.)_`,
+            userVisibleMessage: STALLED_WORK_USER_FALLBACK,
             detail: {
               toolName: info.toolName,
               argsExcerpt: info.argsExcerpt,
@@ -1080,9 +1074,7 @@ export function evaluateProgress(opts: {
         if (count >= 2) {
           return {
             signal: 'C_handoff_pingpong',
-            userVisibleMessage:
-              `_(${pair.replace('↔', ' and ')} are handing the work back and forth without making progress. ` +
-              `The directive is probably ambiguous — clarify what you want and which agent should own it.)_`,
+            userVisibleMessage: STALLED_WORK_USER_FALLBACK,
             detail: {
               agentPair: pair,
               repeatCount: count,
@@ -1207,7 +1199,7 @@ export function classifyTurnText(
   evidence: { toolCalls: number; priorSubstantiveWork?: boolean; contractTurn?: boolean },
 ): { kind: TurnTextKind; decision: OrchestratorDecisionShape | null } {
   const trimmed = text.trim();
-  if (!trimmed || trimmed === STRUCTURED_OUTPUT_RECOVERY_FALLBACK) {
+  if (!trimmed || isStructuredOutputRecoveryFallback(trimmed)) {
     return { kind: 'empty', decision: null };
   }
 

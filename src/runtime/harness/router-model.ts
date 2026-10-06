@@ -7,9 +7,9 @@
  *   - `gpt-5*` / `o*` ids → Codex.
  *   - `claude-*` ids      → Claude subscription adapter.
  *   - any other id        → BYO OpenAI-compatible backend.
- *   - all_in mode         → every role on BYO; a stray built-in model id falls
- *                           back to the BYO primary so a misconfig can't
- *                           silently hit a dead Codex seat.
+ *   - all_in mode         → declared BYO models keep their backend; connected
+ *                           subscription ids keep their own lane. Undeclared,
+ *                           disconnected built-in defaults use the BYO primary.
  *
  * This is what makes the role→model registry real: a role can name a model from
  * any connected provider, and the provider dispatch follows the model id rather
@@ -177,13 +177,18 @@ export function routedPrimaryModel(
   assertUnambiguousModelRouting(name, mode);
 
   // Provider selection has ONE truth. In particular, the canonical classifier
-  // honors an explicit connected Claude id even while the ambient default is
-  // BYO all-in. The old router reimplemented all-in first and silently changed
-  // `claude-sonnet-5` into the BYO primary after workflow/session resolution
-  // had already selected Claude, so route metadata said Claude while GLM was
-  // billed. Keep all-in's fallback-to-primary behavior only when the canonical
-  // classifier actually chose BYO (disconnected/stale built-in ids included).
-  const effectiveProvider = (deps.resolveEffectiveProvider ?? resolveEffectiveProviderForModel)(name);
+  // honors connected subscription ids even while the ambient default is BYO
+  // all-in. Reimplementing all-in first can silently change an explicit agent
+  // pin into the BYO primary after session resolution selected the pin. Keep
+  // fallback-to-primary only when the canonical classifier actually chose BYO
+  // (disconnected/stale built-in defaults included).
+  const effectiveProvider = !requested && mode === 'all_in' && resolveProvider(name) === 'codex'
+    && getByoBackendConfig().configured
+    // No model was selected for this call: retain the existing all-in default.
+    // An explicit subscription choice (including a saved agent pin) follows
+    // the canonical classifier instead of inheriting this ambient collapse.
+    ? 'byo'
+    : (deps.resolveEffectiveProvider ?? resolveEffectiveProviderForModel)(name);
   switch (effectiveProvider) {
     case 'claude':
       return { requested: name, provider: 'claude', modelId: name };
@@ -338,7 +343,8 @@ export class RouterModelProvider implements ModelProvider {
       resolveEffectiveProvider: this.resolveEffectiveProvider,
       codexAvailable: this.codexAvailable,
     });
-    const allowOverloadFallback = harnessRunContextStorage.getStore()?.workerScope !== true;
+    const allowOverloadFallback = harnessRunContextStorage.getStore()?.workerScope !== true
+      && !(typeof modelName === 'string' && isPinnedWorkerModel(modelName));
     switch (routed.provider) {
       case 'claude':
         if (routed.via === 'claude_no_codex') {

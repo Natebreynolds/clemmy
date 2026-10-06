@@ -51,6 +51,26 @@ const COLLECTION_ITEM_NOUNS = new Set([
   'rows', 'records', 'entries', 'items', 'fields', 'columns', 'cells', 'lines',
 ]);
 const COUNT_CONNECTOR_WORDS = new Set(['a', 'an', 'and', 'for', 'from', 'in', 'of', 'on', 'or', 'the', 'to', 'with']);
+
+/** A range/ceiling describes a quantity, not an exact independent-work set.
+ * Mask only the counting view, keeping offsets and the owner's source intact.
+ * Otherwise COUNT_PLURAL_RE can turn the upper endpoint in "10–12 cases"
+ * into twelve jobs. An explicit list still supplies its own exact members. */
+function exactCardinalityText(text: string): string {
+  const number = String.raw`(?:\d{1,3}(?:,\d{3})+|\d+|(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[- ](?:one|two|three|four|five|six|seven|eight|nine))?)`;
+  const ranges = new RegExp(String.raw`\b(?:between\s+${number}\s+and\s+${number}|${number}\s*(?:[-\u2010-\u2015\u2212]|\b(?:to|through)\b)\s*${number})\b`, 'gi');
+  const bounds = new RegExp(String.raw`\b(?:up to|at most|at least|no more than|no fewer than|minimum of|maximum of|approximately|roughly|around)\s+${number}\b`, 'gi');
+  return text.replace(ranges, (match) => ' '.repeat(match.length))
+    .replace(bounds, (match) => ' '.repeat(match.length));
+}
+
+function countedClause(text: string, index: number): string {
+  const before = text.slice(0, Math.max(0, index));
+  const start = Math.max(...['.', '!', '?', ';', ':', '\n'].map((mark) => before.lastIndexOf(mark))) + 1;
+  const rest = text.slice(Math.max(0, index));
+  const end = rest.search(/[.!?;:\n]/);
+  return text.slice(start, end < 0 ? undefined : index + end);
+}
 const SINGLE_PARENT_RE =
   /\b(?:create|build|draft|write|produce|generate|compile|assemble|export|make(?:\s+me)?)\s+(?:one|a|an|the(?!\s+following\b)|my|our|your|this|that|single)\s+[a-z][\w-]*/i;
 const LIST_SINGLE_CONTAINER_RE =
@@ -210,6 +230,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
   try {
     const rawText = (typeof input === 'string' ? input : '').trim();
     const text = canonicalMultiItemObjective(rawText);
+    const countText = exactCardinalityText(text);
     if (text.length < 4) return NO_MULTI_ITEM;
     const actionText = positiveActionSignalText(text);
 
@@ -258,7 +279,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
       let lastMarked: { n: number; noun: string; index: number; end: number } | null = null;
       const markedCountRe = new RegExp(MARKED_COUNT_PLURAL_RE.source, 'gi');
       let markedMatch: RegExpExecArray | null;
-      while ((markedMatch = markedCountRe.exec(text)) !== null) {
+      while ((markedMatch = markedCountRe.exec(countText)) !== null) {
         const itemCount = Number.parseInt(markedMatch[1].replace(/,/g, ''), 10);
         const noun = markedMatch[2].toLowerCase();
         if (
@@ -275,7 +296,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
         };
       }
       let match: RegExpExecArray | null;
-      while ((match = globalCountRe.exec(text)) !== null) {
+      while ((match = globalCountRe.exec(countText)) !== null) {
         const itemCount = Number.parseInt(match[1].replace(/,/g, ''), 10);
         const noun = match[2].toLowerCase();
         if (
@@ -331,7 +352,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
         countEndIndex = picked.end;
       } else {
         const markedNounRe = new RegExp(MARKED_COUNT_NOUN_RE.source, 'i');
-        const markedNoun = markedNounRe.exec(text);
+        const markedNoun = markedNounRe.exec(countText);
         if (markedNoun) {
           const itemCount = Number.parseInt(markedNoun[1]!.replace(/,/g, ''), 10);
           const noun = markedNoun[2]!.toLowerCase();
@@ -350,7 +371,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
           }
         }
         if (count < 3) {
-          const pronounCount = COUNT_OF_PRONOUN_RE.exec(text);
+          const pronounCount = COUNT_OF_PRONOUN_RE.exec(countText);
           if (pronounCount) {
             const itemCount = Number.parseInt(pronounCount[1]!.replace(/,/g, ''), 10);
             if (Number.isSafeInteger(itemCount) && itemCount >= 3) {
@@ -429,6 +450,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
       && (
         singleParentRequirements
         || countIndex < singleParent.index
+        || (!laterIndependentAction && !READ_RE.test(parentToCount) && !DEEP_WORK_RE.test(parentToCount))
         || (
           !laterIndependentAction
           && SINGLE_PARENT_SOURCE_RE.test(text.slice(Math.max(0, countIndex - 48), countIndex))
@@ -439,9 +461,21 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
     }
 
     const explicitParallelRequest = EXPLICIT_PARALLEL_RE.test(actionText);
-    const sameShapeWork = READ_RE.test(actionText)
-      || WRITE_RE.test(actionText)
-      || DEEP_WORK_RE.test(actionText)
+    // A file/report verb in another sentence cannot turn a quantity field
+    // into per-item work. Count-only prose needs an operation in its own
+    // clause; lists and explicit per-item grammar supply their own structure.
+    const operationText = enumerated || explicitPerTarget
+      ? actionText : positiveActionSignalText(countedClause(text, countIndex));
+    // "I found these 18 firms. Should I research them?" binds the operation
+    // to the preceding set explicitly; an unrelated later write does not.
+    const countedTarget = kind ? `|(?:these|those)\\s+${kind.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` : '';
+    const anaphoricOperation = new RegExp(
+      `(?:${READ_RE.source}|${DEEP_WORK_RE.source})\\s+(?:all\\s+of\\s+)?(?:them${countedTarget})\\b`, 'i',
+    ).test(positiveActionSignalText(afterCount));
+    const sameShapeWork = READ_RE.test(operationText)
+      || DEEP_WORK_RE.test(operationText)
+      || (enumerated && WRITE_RE.test(operationText))
+      || anaphoricOperation
       || explicitParallelRequest
       || explicitPerTarget
       // Do not make arbitrary user verbs wait for a harness vocabulary update.

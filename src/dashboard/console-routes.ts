@@ -3349,18 +3349,14 @@ function normalizeConsoleHomeLegacyIdentity(sessionId: string): void {
   ) {
     throw new Error('legacy Home session has conflicting continuity identity');
   }
-  const nextMetadata = {
-    ...metadata,
-    source: metadata.source === 'workspace' ? 'workspace' : 'desktop',
-    ingressProvider: 'desktop',
-    channelId: sessionId,
-    userId: 'desktop',
-  };
   openEventLog().prepare(`
     UPDATE sessions
-       SET user_id = 'desktop', metadata_json = ?, updated_at = ?
+       SET user_id = 'desktop', metadata_json = json_set(COALESCE(metadata_json, '{}'),
+         '$.source', ?, '$.ingressProvider', 'desktop', '$.channelId', ?, '$.userId', 'desktop'),
+         updated_at = ?
      WHERE id = ?
-  `).run(JSON.stringify(nextMetadata), new Date().toISOString(), sessionId);
+  `).run(metadata.source === 'workspace' ? 'workspace' : 'desktop', sessionId,
+    new Date().toISOString(), sessionId);
 }
 
 /**

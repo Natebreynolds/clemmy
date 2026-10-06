@@ -7,7 +7,10 @@
  * whole point is that "she tells me when she's done" cannot depend on which
  * button the user pressed before the work started.
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import fs, { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -18,7 +21,9 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { appendEvent, createSession } = await import('./eventlog.js');
+const { appendEvent, createSession, getSession, listEvents, summarizeSessionForSignal } = await import('./eventlog.js');
+const { BASE_DIR } = await import('../../config.js');
+const { actionBus } = await import('../action-bus.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
 const {
@@ -413,13 +418,13 @@ test('typed failed terminal is labeled failed, never completed', async () => {
   assert.equal(notification.metadata?.needsAttention, true);
 });
 
-test('pending report survives a process restart during the grace window', async () => {
+test('pending report survives watcher replacement during the grace window', async () => {
   stopWatcher = startTerminalReportBackWatcher({ graceMs: 45_000, now: () => 1_000 });
   const sessionId = 'sess-pending-restart';
   const { startSeq } = seedRun(sessionId, 12, '', '');
 
-  // Stop tears down every in-memory timer/listener, as a process exit would.
-  // The replacement watcher sees the durable row after its original deadline.
+  // Stop tears down timers/listeners. This same-process replacement sees the
+  // durable row after its original deadline without resetting process allowance.
   stopWatcher();
   stopWatcher = startTerminalReportBackWatcher({ graceMs: 45_000, now: () => 100_000 });
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -430,7 +435,7 @@ test('pending report survives a process restart during the grace window', async 
   assert.equal(matches.length, 1, 'restart reconciliation delivers the stable source exactly once');
 });
 
-test('watched decision survives a process restart during the grace window', async () => {
+test('watched decision survives watcher replacement during the grace window', async () => {
   stopWatcher = startTerminalReportBackWatcher({ graceMs: 45_000, now: () => 1_000 });
   const sessionId = 'sess-watched-restart';
   const { startSeq } = seedRun(sessionId, 12, '', '');
@@ -450,6 +455,229 @@ test('watched decision survives a process restart during the grace window', asyn
     false,
     'durable seen marker prevents a duplicate page after restart',
   );
+});
+
+const OUTBOX_PATH = path.join(BASE_DIR, 'state', 'terminal-report-back-outbox.json');
+const NOTIFICATIONS_PATH = path.join(BASE_DIR, 'state', 'notifications.json');
+
+function pendingReportIds(): string[] {
+  return (JSON.parse(fs.readFileSync(OUTBOX_PATH, 'utf8')) as Array<{ id: string }>).map((row) => row.id);
+}
+
+/** Fail the real atomic persistence seam without replacing report or delivery logic. */
+function interceptRename(fail: (destination: fs.PathLike) => boolean): () => void {
+  const original = fs.renameSync;
+  fs.renameSync = (source, destination) => {
+    if (fail(destination)) throw new Error('controlled transient atomic rename failure');
+    original(source, destination);
+  };
+  syncBuiltinESMExports();
+  return () => { fs.renameSync = original; syncBuiltinESMExports(); };
+}
+
+test('report persistence retries in the same process with the same source and notification id', (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-report-retry-recovered';
+  const { startSeq, terminalSeq } = seedRun(sessionId, 12, '', '');
+  const notificationId = `foreground-report-back-${sessionId}-${startSeq}`;
+  let notificationWrites = 0;
+  const restore = interceptRename((destination) => (
+    String(destination) === NOTIFICATIONS_PATH && ++notificationWrites === 1
+  ));
+  try {
+    t.mock.timers.tick(0);
+    assert.equal(notificationWrites, 1);
+    assert.equal(listNotifications(100).some((row) => row.id === notificationId), false);
+    assert.deepEqual(pendingReportIds(), [`${sessionId}:${startSeq}`]);
+    const terminal = listEvents(sessionId).find((row) => row.seq === terminalSeq)!;
+    // Replay the published signal, not a second canonical terminal row (which
+    // the event log correctly rejects for this same logical source).
+    actionBus.emit({ kind: 'harness.public_event', sessionId, event: terminal,
+      session: summarizeSessionForSignal(getSession(sessionId)!) });
+    t.mock.timers.tick(999);
+    assert.equal(notificationWrites, 1, 'duplicate terminal does not bypass retry backoff');
+    t.mock.timers.tick(1);
+    const notifications = listNotifications(100).filter((row) => row.id === notificationId);
+    assert.equal(notifications.length, 1, 'same watcher delivers once after persistence recovers');
+    assert.equal(notificationWrites, 2);
+    assert.deepEqual(pendingReportIds(), []);
+    assert.equal(listEvents(sessionId, { types: ['tool_called'] }).length, 12, 'delivery retries create no new task work');
+    t.mock.timers.tick(60_000);
+    assert.equal(notificationWrites, 2, 'successful acknowledgement releases the retry owner');
+  } finally { restore(); stopWatcher?.(); stopWatcher = null; t.mock.timers.reset(); }
+});
+
+test('report cleanup retry reuses the persisted notification without a second created signal', (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-report-retry-cleanup';
+  const { startSeq } = seedRun(sessionId, 12, '', '');
+  const notificationId = `foreground-report-back-${sessionId}-${startSeq}`;
+  let created = 0;
+  const unsubscribe = actionBus.subscribe((event) => {
+    if (event.kind === 'notification.created' && event.notification.id === notificationId) created += 1;
+  });
+  let cleanupWrites = 0;
+  const restore = interceptRename((destination) => (
+    String(destination) === OUTBOX_PATH && ++cleanupWrites === 1
+  ));
+  try {
+    t.mock.timers.tick(0);
+    assert.equal(created, 1);
+    assert.deepEqual(pendingReportIds(), [`${sessionId}:${startSeq}`]);
+    t.mock.timers.tick(1_000);
+    assert.equal(cleanupWrites, 2, 'same process acknowledges the already persisted notification');
+    assert.deepEqual(pendingReportIds(), []);
+    assert.equal(created, 1, 'cleanup never emits a second notification');
+    assert.equal(listNotifications(100).filter((row) => row.id === notificationId).length, 1);
+  } finally { restore(); unsubscribe(); stopWatcher?.(); stopWatcher = null; t.mock.timers.reset(); }
+});
+
+test('report retry budget survives watcher generations; a fresh process can reconcile the durable row', (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-report-retry-exhausted';
+  const { startSeq, terminalSeq } = seedRun(sessionId, 12, '', '');
+  let writes = 0;
+  const restore = interceptRename((destination) => {
+    if (String(destination) !== NOTIFICATIONS_PATH) return false;
+    writes += 1;
+    return true;
+  });
+  try {
+    for (const elapsed of [0, 1_000, 5_000, 15_000]) t.mock.timers.tick(elapsed);
+    assert.equal(writes, 4, 'one initial attempt plus three delayed retries');
+    const terminal = listEvents(sessionId).find((row) => row.seq === terminalSeq)!;
+    actionBus.emit({ kind: 'harness.public_event', sessionId, event: terminal,
+      session: summarizeSessionForSignal(getSession(sessionId)!) });
+    t.mock.timers.tick(60 * 60_000);
+    assert.equal(writes, 4, 'no hot loop or renewed budget on duplicate source');
+    assert.deepEqual(pendingReportIds(), [`${sessionId}:${startSeq}`], 'exhaustion leaves durable restart recovery');
+    stopWatcher();
+    stopWatcher = null;
+    restore();
+    stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+    t.mock.timers.tick(60_000);
+    assert.deepEqual(pendingReportIds(), [`${sessionId}:${startSeq}`], 'same-process watcher replacement cannot replenish exhausted allowance');
+    const notificationId = `foreground-report-back-${sessionId}-${startSeq}`;
+    assert.equal(listNotifications(100).some((row) => row.id === notificationId), false);
+    stopWatcher();
+    stopWatcher = null;
+
+    // A separate Node process has fresh process-local allowance and reads the
+    // same disposable fixture's durable row. This is fresh-process outbox
+    // recovery, not an installed-app restart or a remote push delivery test.
+    const script = `
+      import assert from 'node:assert/strict';
+      import { readFileSync } from 'node:fs';
+      const { startTerminalReportBackWatcher } = await import(${JSON.stringify(new URL('./terminal-report-back.ts', import.meta.url).href)});
+      const { actionBus } = await import(${JSON.stringify(new URL('../action-bus.ts', import.meta.url).href)});
+      const { listNotifications } = await import(${JSON.stringify(new URL('../notifications.ts', import.meta.url).href)});
+      const id = ${JSON.stringify(notificationId)};
+      let unsubscribe;
+      const ready = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('fresh-process report did not arrive')), 5000);
+        unsubscribe = actionBus.subscribe(event => {
+          if (event.kind === 'notification.created' && event.notification.id === id) {
+            clearTimeout(timeout); resolve();
+          }
+        });
+      });
+      const stop = startTerminalReportBackWatcher({ graceMs: 0 });
+      try {
+        await ready;
+        assert.deepEqual(JSON.parse(readFileSync(${JSON.stringify(OUTBOX_PATH)}, 'utf8')), []);
+        const count = listNotifications(100).filter(row => row.id === id).length;
+        assert.equal(count, 1);
+        console.log(JSON.stringify({ pid: process.pid, notificationId: id, count }));
+      } finally { stop(); unsubscribe(); }
+    `;
+    const child = spawnSync(process.execPath, [
+      '--import', new URL('../../../scripts/test-isolation-preload.mjs', import.meta.url).href,
+      '--import', 'tsx', '--input-type=module', '-e', script,
+    ], {
+      cwd: fileURLToPath(new URL('../../../', import.meta.url)),
+      env: { ...process.env, CLEMENTINE_HOME: BASE_DIR, CLEMMY_ALLOW_LIVE_HOME_TESTS: '0', CLEMMY_TEST_DISABLE_LIVE_MODELS: '1' },
+      encoding: 'utf8', timeout: 15_000,
+    });
+    assert.equal(child.status, 0, child.stderr || child.error?.message);
+    const result = JSON.parse(child.stdout.trim().split('\n').at(-1)!);
+    assert.notEqual(result.pid, process.pid);
+    assert.equal(result.notificationId, notificationId);
+    assert.equal(result.count, 1);
+    assert.deepEqual(pendingReportIds(), []);
+    assert.equal(listNotifications(100).filter((row) => row.id === notificationId).length, 1);
+  } finally { restore(); stopWatcher?.(); stopWatcher = null; t.mock.timers.reset(); }
+});
+
+test('watcher replacement preserves remaining report allowance and its pending backoff', (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-report-retry-remaining';
+  const { startSeq } = seedRun(sessionId, 12, '', '');
+  let writes = 0;
+  const restore = interceptRename((destination) => (
+    String(destination) === NOTIFICATIONS_PATH && ++writes <= 2
+  ));
+  try {
+    t.mock.timers.tick(0);
+    assert.equal(writes, 1);
+    stopWatcher();
+    stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+    t.mock.timers.tick(999);
+    assert.equal(writes, 1, 'watcher replacement does not skip the existing delay');
+    t.mock.timers.tick(1);
+    assert.equal(writes, 2);
+    stopWatcher();
+    stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+    t.mock.timers.tick(4_999);
+    assert.equal(writes, 2, 'second generation retains the second backoff, not the first');
+    t.mock.timers.tick(1);
+    assert.equal(writes, 3);
+    assert.deepEqual(pendingReportIds(), []);
+    assert.equal(listNotifications(100).filter((row) => row.id === `foreground-report-back-${sessionId}-${startSeq}`).length, 1);
+  } finally { restore(); stopWatcher?.(); stopWatcher = null; t.mock.timers.reset(); }
+});
+
+test('a viewer arriving during report retry still suppresses notification and acknowledges the outbox', (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-report-retry-viewer';
+  const { startSeq } = seedRun(sessionId, 12, '', '');
+  let writes = 0;
+  const restore = interceptRename((destination) => (
+    String(destination) === NOTIFICATIONS_PATH && ++writes === 1
+  ));
+  try {
+    t.mock.timers.tick(0);
+    const detach = attachSessionViewer(sessionId);
+    detach();
+    t.mock.timers.tick(1_000);
+    assert.equal(writes, 1, 'viewer observation is rechecked before retry delivery');
+    assert.deepEqual(pendingReportIds(), []);
+    assert.equal(listNotifications(100).some((row) => row.id === `foreground-report-back-${sessionId}-${startSeq}`), false);
+  } finally { restore(); stopWatcher?.(); stopWatcher = null; t.mock.timers.reset(); }
+});
+
+test('watcher shutdown cancels scheduled report retries while preserving the durable row', (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-report-retry-shutdown';
+  const { startSeq } = seedRun(sessionId, 12, '', '');
+  let writes = 0;
+  const restore = interceptRename((destination) => (
+    String(destination) === NOTIFICATIONS_PATH && ++writes === 1
+  ));
+  try {
+    t.mock.timers.tick(0);
+    stopWatcher();
+    stopWatcher = null;
+    t.mock.timers.tick(60_000);
+    assert.equal(writes, 1, 'stopped watcher cannot emit or reschedule');
+    assert.deepEqual(pendingReportIds(), [`${sessionId}:${startSeq}`]);
+    assert.equal(listNotifications(100).some((row) => row.id === `foreground-report-back-${sessionId}-${startSeq}`), false);
+  } finally { restore(); stopWatcher?.(); stopWatcher = null; t.mock.timers.reset(); }
 });
 
 test('a run long enough to outgrow a read window still reports back', () => {

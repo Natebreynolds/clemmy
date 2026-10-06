@@ -17,6 +17,7 @@
  * desktop clients can adopt the boundary without a protocol rewrite.
  */
 import { getRunAttemptSourceUserEvent, listEvents, type EventRow } from './eventlog.js';
+import { BoundaryError } from '../boundary-error.js';
 import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 import {
   parseNarratedEnvelope,
@@ -148,12 +149,36 @@ const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
 const DECISION_KEYS = new Set(['summary', 'reply', 'done', 'nextaction', 'reason']);
 const RAW_TOOL_OR_REASONING_PROTOCOL_RE = /(?:<\/?(?:analysis|reasoning|invoke|tool_call)\b|\[tool\s*:|"tool_call"\s*:)/i;
 const SAFE_TERMINAL_FALLBACK =
-  'I finished the turn, but the final reply was not safe to display. The activity log has the technical details.';
+  'The final reply was not safe to display. I cannot confirm this request is complete. Check the activity log for available details.';
+const LEGACY_MISSING_REPLY_FALLBACK =
+  'I do not have a final reply to confirm this request is complete. Ask me to check what completed and what remains before continuing.';
 /** The host could not seal a model request because its local vault has no
  *  seal key. Live 2026-09-08: a desktop user's every first message died as
  *  "Something went wrong" while the only trace was a boot-time warning. */
 export const PUBLIC_VAULT_NOT_READY_TEXT = 'Clementine\'s local vault isn\'t ready, so no model request can start. Quit and reopen Clementine; if this keeps happening, tell me and I\'ll walk you through repairing the home folder.';
-export const PUBLIC_RUN_FAILURE_TEXT = 'Something went wrong on that turn. Please try again; the technical details are available in the activity log.';
+export const PUBLIC_RUN_FAILURE_TEXT = 'I couldn\'t finish this request. The error\'s cause is not confirmed yet. Ask me to check what completed and what remains before retrying.';
+export const PUBLIC_MODEL_EMPTY_COMPLETION_TEXT = 'I did not receive a usable reply or next step from the model, so this request is still unfinished. Ask me to continue the unfinished work, or choose another model.';
+
+export const PUBLIC_CODEX_AUTH_EXPIRED_TEXT = 'Your Codex sign-in expired or was revoked, so this request is still unfinished. Sign in again in Settings > Model accounts, then ask me to continue the unfinished work.';
+
+export const PUBLIC_BLOCKED_NEXT_STEP_TEXT = 'The next step is blocked, so this request is still unfinished. Ask me to check the blocker and any completed work before continuing.';
+
+/** A closed host-authored reason, carried independently of private error text.
+ * A raw string or a provider object's similarly named property is not authority
+ * to explain a failure as an empty completion or expired Codex sign-in. */
+export type PublicRunFailureKind = 'model.empty_completion' | 'codex.auth_expired';
+
+export function publicRunFailureKind(error: unknown): PublicRunFailureKind | undefined {
+  return error instanceof BoundaryError && (error.kind === 'model.empty_completion' || error.kind === 'codex.auth_expired')
+    ? error.kind
+    : undefined;
+}
+
+export function publicRunFailureText(kind?: PublicRunFailureKind): string {
+  return kind === 'model.empty_completion' ? PUBLIC_MODEL_EMPTY_COMPLETION_TEXT
+    : kind === 'codex.auth_expired' ? PUBLIC_CODEX_AUTH_EXPIRED_TEXT
+      : PUBLIC_RUN_FAILURE_TEXT;
+}
 /**
  * A model account that has used up its allowance or credit is not a mystery
  * failure: its owner can fix it, and trying again unchanged meets the same
@@ -238,8 +263,9 @@ export function isHostAuthorityHeldReason(reason: string): boolean {
   return HOST_AUTHORITY_HELD_RE.test(reason ?? '');
 }
 
-/** Map an internal held/recovery reason onto user-facing copy. Never leaks
- *  digests, account IDs, or "could not interpret" for host-authority stops. */
+/** Legacy reason text identifies only a topic to check, not evidence of a
+ * provider call, effects, retry safety, approval, or an armed recovery owner.
+ * Keep those facts with typed authority and keep private details out of copy. */
 export function heldExecutionTextForInternalReason(
   reason: string,
   kind: PublicHeldKind = /uncertain|reconcil/i.test(reason) ? 'uncertain' : 'blocked',
@@ -255,17 +281,19 @@ export function heldExecutionTextForInternalReason(
               ? (/unsupported.?write/i.test(text) ? 'unsupported_write' : 'reconciliation')
               : /settle|storage_error|conflict/i.test(text) ? 'settlement'
                 : 'semantic';
-  const providerCallOccurred = /reserved|started|provider (?:call|outcome|crossing)|reconcil|settle/i.test(text);
-  const externalChangePossible = kind === 'uncertain'
-    || /provider outcome is unknown|already reserved|external change/i.test(text);
-  return publicHeldExecutionText({
-    kind,
-    cause,
-    providerCallOccurred,
-    externalChangePossible,
-    retrySafe: !externalChangePossible && cause !== 'reconciliation' && cause !== 'settlement',
-    willResumeAutomatically: cause === 'settlement',
-  });
+  const lead = kind === 'uncertain'
+    ? 'I cannot confirm the outcome, so this request is still unfinished.'
+    : 'The next step is blocked, so this request is still unfinished.';
+  const check = cause === 'account'
+    ? 'the required account'
+    : cause === 'schema' || cause === 'provider_identity'
+      ? 'the capability details'
+      : cause === 'observation'
+        ? 'the missing observation'
+        : cause === 'reconciliation' || cause === 'unsupported_write' || cause === 'settlement'
+          ? 'the recorded execution state'
+          : 'the blocker';
+  return `${lead} Ask me to check ${check} and any completed work for this exact request before continuing.`;
 }
 
 const PUBLIC_CONVERSATION_PREAMBLE_KEYS = new Set([
@@ -612,9 +640,12 @@ export function publicCompletionText(
 ): string {
   try {
     const typedPresentation = presentationEventFromCompletionData(data);
+    const missingReply = data.reply === undefined || data.reply === null
+      || (typeof data.reply === 'string' && !data.reply.trim());
     return typedPresentation?.text
       || publicReplyText(data.reply, '')
-      || fallback;
+      || (missingReply && fallback === SAFE_TERMINAL_FALLBACK
+        ? LEGACY_MISSING_REPLY_FALLBACK : fallback);
   } catch {
     // A row that claims the typed contract but contradicts it is not legacy.
     // Its duplicated reply/summary fields came from the same invalid write and

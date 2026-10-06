@@ -41,6 +41,9 @@ const {
   isPlainTextContractDirective,
   requestedVerbatimReply,
   replyFulfillsVerbatimRequest,
+  MISSING_REPLY_USER_FALLBACK,
+  STRUCTURED_OUTPUT_RECOVERY_FALLBACK,
+  isStructuredOutputRecoveryFallback,
 } = await import('./turn-decision.js');
 const { appendEvent, createSession, resetEventLog } = await import('./eventlog.js');
 
@@ -405,10 +408,57 @@ test('empty string → empty', () => {
 });
 
 test('the structured-output recovery sentinel → empty (routes to the retry path)', () => {
-  const sentinel = "Clementine produced a response that couldn't be structured. Please ask again.";
-  const { kind, decision } = classifyTurnText(sentinel, { toolCalls: 0 });
-  assert.equal(kind, 'empty');
-  assert.equal(decision, null);
+  for (const sentinel of [STRUCTURED_OUTPUT_RECOVERY_FALLBACK,
+    "Clementine produced a response that couldn't be structured. Please ask again."]) {
+    const { kind, decision } = classifyTurnText(sentinel, { toolCalls: 0 });
+    assert.equal(kind, 'empty');
+    assert.equal(decision, null);
+    assert.equal(toOrchestratorDecision(sentinel), null);
+    assert.equal(isStructuredOutputRecoveryFallback(sentinel), true);
+  }
+  assert.match(STRUCTURED_OUTPUT_RECOVERY_FALLBACK, /check what completed and what remains before continuing/);
+  assert.doesNotMatch(STRUCTURED_OUTPUT_RECOVERY_FALLBACK, /ask again|resend|re-send|I.ll retry|automatically/);
+});
+
+test('recovery sentinel recognition stays exact and does not claim substantive or structured output', () => {
+  for (const output of [null, undefined, {}, { reply: STRUCTURED_OUTPUT_RECOVERY_FALLBACK },
+    'The report contains three sections.', `Quoted message: ${STRUCTURED_OUTPUT_RECOVERY_FALLBACK}`,
+    ` ${STRUCTURED_OUTPUT_RECOVERY_FALLBACK}`]) {
+    assert.equal(isStructuredOutputRecoveryFallback(output), false);
+  }
+});
+
+test('a missing structured reply requests a progress check without resubmission or a retry promise', () => {
+  const output = { summary: 'PRIVATE decision bookkeeping', done: false, nextAction: 'abandoned', reply: '' };
+  const stalled = evaluateProgress({ finalOutput: JSON.stringify(output), toolCalls: 1, sessionId: 'missing-reply-floor' });
+  assert.equal(stalled?.signal, 'D_decision_json');
+  assert.equal(stalled?.detail.summary, output.summary, 'private diagnostics remain available');
+  assert.equal(stalled?.userVisibleMessage, MISSING_REPLY_USER_FALLBACK);
+  assert.match(stalled!.userVisibleMessage, /check what completed and what remains before continuing/);
+  assert.doesNotMatch(stalled!.userVisibleMessage, /PRIVATE|resend|re-send|send that again|I.ll retry|automatically|nothing changed|no tools/);
+
+  const report = 'Created the draft. Delivery is still pending. Please confirm the recipient.';
+  const withReport = evaluateProgress({ finalOutput: JSON.stringify({ ...output, reply: report }), toolCalls: 1, sessionId: 'missing-reply-floor' });
+  assert.equal(withReport?.signal, 'D_decision_json');
+  assert.equal(withReport?.userVisibleMessage, report, 'specific completed/remaining work takes precedence');
+});
+
+test('stall copy keeps its classification and private evidence without predicting effects or retries', () => {
+  const outputs = ['Continuing.', "I'll run the search now.", '**run_shell_command**\n```\nPRIVATE command\n```'];
+  for (const finalOutput of outputs) {
+    const stalled = evaluateProgress({ finalOutput, toolCalls: 0, sessionId: 'stall-copy-floor' });
+    assert.equal(stalled?.signal, 'A_zero_tools', finalOutput);
+    assert.equal(stalled?.detail.rawOutput, finalOutput);
+    assert.match(stalled!.userVisibleMessage, /still unfinished.*check what completed and what remains/);
+    assert.doesNotMatch(stalled!.userVisibleMessage, /PRIVATE|Re-send|retry|will resume|automatically|zero tool|nothing changed/);
+  }
+  const deferred = evaluateStructuredDecisionStall({
+    decision: { summary: '', reply: '', reason: '', done: false, nextAction: 'awaiting_handoff_result' }, toolCalls: 0,
+  });
+  assert.equal(deferred?.detail.kind, 'structured_narration_deferral');
+  assert.equal(deferred?.detail.silent, true);
+  assert.match(deferred!.userVisibleMessage, /still unfinished.*check what completed and what remains/);
+  assert.doesNotMatch(deferred!.userVisibleMessage, /retry|automatically|zero tool|no longer exists/);
 });
 
 // ── Long future-tense real answer ────────────────────────────────────────────

@@ -55,6 +55,28 @@ test('an exact worker pin cannot execute another connected model after provider 
   assert.deepEqual([...new Set(calls)], ['gpt-5.6-luna']);
 });
 
+test('a foreground exact Claude pin disables internal overload substitution; ordinary foreground keeps it', () => {
+  withEnv({ AUTH_MODE: 'claude_oauth', MODEL_ROUTING_MODE: 'off', CLEMMY_BRAIN_FALLOVER: 'off' }, () => {
+    const requests: Array<{ model?: string; allowOverloadFallback?: boolean }> = [];
+    const router = new RouterModelProvider({
+      claude: { getModel(model, options) {
+        requests.push({ model, allowOverloadFallback: options?.allowOverloadFallback });
+        return {} as never;
+      } },
+      codex: { getModel: () => { throw new Error('Unexpected Codex construction'); } },
+      resolveEffectiveProvider: () => 'claude',
+    });
+    // The same host-issued exact-model authority can name a foreground saved
+    // agent; workerScope is deliberately absent on both calls.
+    withPinnedWorkerModel('claude-opus-5-5', () => router.getModel('claude-opus-5-5'));
+    router.getModel('claude-opus-5-5');
+    assert.deepEqual(requests, [
+      { model: 'claude-opus-5-5', allowOverloadFallback: false },
+      { model: 'claude-opus-5-5', allowOverloadFallback: true },
+    ]);
+  });
+});
+
 test('BYO gets a LONGER fallover deadline, never an absent one', () => {
   // This asserted `undefined` for BYO, to protect a real concern: the BYO
   // adapter completes non-streaming and emits one synthetic chunk, so its

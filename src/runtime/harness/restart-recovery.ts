@@ -1,3 +1,4 @@
+import { heldStopPublicationOwnsSource } from './held-stop-publication.js';
 import { readConnectionRecoveryActivation, readRecoveryActivation } from './recovery-activation.js';
 import { promoteConnectionExecutionCheckpoint } from './connection-execution-activation.js';
 import { WORKFLOW_PARENT_LEASE_PREFIX } from './workflow-parent-activation.js';
@@ -1422,6 +1423,12 @@ export function recoverInterruptedChatRuns(
       // external-write/age checks still decide whether resume is safe.
     }
     const recoveryIdentity = ownerIdentity ?? recoveryTurnIdentity(row.id, interruptedAttempt);
+    if ((recoveryIdentity && heldStopPublicationOwnsSource(row.id, recoveryIdentity.sourceUserSeq))
+      || (!recoveryIdentity && Object.hasOwn(row.metadata, '__held_stop_publication_debt'))) {
+      record.errors.push('publication_only_owner_pending');
+      records.push(record);
+      continue; // no primer, claim, notification, terminal or task dispatch
+    }
     // Read before this scan writes anything for the interruption.
     const alreadyAnnounced = interruptionAlreadyAnnounced(row.id, since);
     let acceptedInput: string | null = null;

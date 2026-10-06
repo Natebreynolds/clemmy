@@ -16,6 +16,8 @@ import type Database from 'better-sqlite3';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { withoutRetainedWorkCheckpoint } from '../runtime/harness/retained-work-checkpoint.js';
 import { presentationEventFromCompletionData } from '../runtime/harness/turn-outcome.js';
+import { renderClarificationUnavailable, validateClarificationUnavailableAnnotation,
+  type ClarificationUnavailableAnnotationV1 } from '../runtime/harness/clarification-public-annotation.js';
 import {
   strategicMetaActionFromVisibleLabel,
   type StrategicMetaAction,
@@ -24,6 +26,8 @@ import {
 export const TASK_CONTINUITY_PACKET_VERSION = 1 as const;
 export const DEFAULT_TASK_CONTINUITY_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 export const MAX_TASK_CONTINUITY_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
+export const MAX_CLARIFICATION_SOURCE_CHAIN_PACKETS = 16;
+export const MAX_CLARIFICATION_SOURCE_CHAIN_CHARS = 32_000;
 
 export type TaskContinuityPauseKind = 'clarification' | 'approval' | 'recovery';
 export type TaskContinuityEffectClass = 'read' | 'write' | 'unknown';
@@ -76,6 +80,8 @@ export interface TaskContinuityPacket {
       predecessorRefs?: readonly string[];
     };
   };
+  /** Verified display only; pause.question remains the exact decision reference. */
+  publicQuestion?: { text: string; annotation: ClarificationUnavailableAnnotationV1 };
   capabilities: TaskContinuityCapabilityEvidence[];
   createdAt: string;
   expiresAt: string;
@@ -208,6 +214,62 @@ export type ConsumedTaskContinuityLookupResult =
   | { status: 'ambiguous' }
   | { status: 'malformed'; packetId: string }
   | { status: 'invalid_source'; packetId?: string };
+
+/** Literal accepted-source evidence only. These bytes do not assert that any
+ * part of a compound question was answered or authorize a task/effect. */
+export interface TaskContinuityClarificationSource {
+  readonly sourceUserSeq: number;
+  readonly sourceEventId: string;
+  readonly text: string;
+  readonly dataHash: string;
+}
+
+/** The exact public question a literal human source followed. Still evidence
+ * only: agreement with its text never grants execution or effect authority. */
+export interface TaskContinuityClarificationReplySource extends TaskContinuityClarificationSource {
+  readonly previousDeliveredQuestion: string;
+  /** Present only after exact host annotation/source/parent/public-byte verification. */
+  readonly previousReferenceQuestion?: string;
+  readonly previousQuestionAnnotation?: ClarificationUnavailableAnnotationV1;
+  readonly previousDeliveredOptions: readonly string[];
+  readonly previousDeliveredAwaitingEventId: string;
+  readonly previousDeliveredTerminalEventId: string;
+}
+
+export interface ReadTaskContinuityClarificationSourcesInput {
+  sessionId: string;
+  packetId: string;
+  /** Exact durable final edge for replay after consume. When supplied, the
+   * leaf must already be consumed by this source; ancestors remain superseded.
+   * This is never a generic permission to read consumed/retired chains. */
+  consumingSourceUserSeq?: number;
+  /** Open-only exact incoming edge, before successor publication/consumption.
+   * Mutually exclusive with consumingSourceUserSeq. A later human source makes
+   * this edge stale rather than authority to replay an earlier answer. */
+  nextReplySourceUserSeq?: number;
+}
+
+export type TaskContinuityClarificationSourcesResult =
+  | {
+      readonly status: 'verified';
+      readonly packetId: string;
+      readonly root: TaskContinuityClarificationSource;
+      /** In human-source order, including the current packet's originating
+       * reply. The final answer that has not created a packet is not included. */
+      readonly replies: readonly TaskContinuityClarificationReplySource[];
+      readonly packetIds: readonly string[];
+      readonly nextReply?: TaskContinuityClarificationReplySource;
+      /** Exact already-accepted final edge, read in the same sealed snapshot. */
+      readonly consumedReply?: TaskContinuityClarificationReplySource;
+    }
+  | {
+      readonly status: 'refused';
+      readonly reason: 'invalid_input' | 'unavailable' | 'unknown_packet'
+        | 'ambiguous_leaf' | 'retired_hop' | 'expired_hop' | 'malformed_chain'
+        | 'nonclarification_hop' | 'control_source' | 'slot_changed'
+        | 'unbound_supersession' | 'source_chain_limit' | 'consumed_leaf_mismatch'
+        | 'next_reply_mismatch' | 'unbound_public_question';
+    };
 
 interface RawPacketRow {
   packet_id: string;
@@ -701,6 +763,7 @@ function exactPublicDeliveryBinding(input: {
   options: readonly string[];
   awaitingEventId: string | null;
   terminalEventId: string | null;
+  parentPacketId?: string | null;
 }): boolean {
   if (!input.awaitingEventId || !input.terminalEventId) return input.options.length === 0;
   const awaiting = rawEventById(input.db, input.sessionId, input.awaitingEventId);
@@ -728,6 +791,39 @@ function exactPublicDeliveryBinding(input: {
       terminalText = withoutRetainedWorkCheckpoint(typed.text);
     }
   } catch { /* Malformed typed rows never gain public-question normalization. */ }
+  const annotationValue = awaitingData.clarificationAnnotation;
+  if (annotationValue !== undefined) {
+    const annotation = validateClarificationUnavailableAnnotation(annotationValue, {
+      sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+      parentPacketId: input.parentPacketId ?? '',
+    }, input.question, input.options);
+    if (!annotation || awaitingData.source !== 'continuation_unresolved_reoffer'
+      || awaitingData.continuityParentPacketId !== annotation.parentPacketId) return false;
+    const parent = input.db.prepare('SELECT * FROM task_continuity_packets WHERE session_id = ? AND packet_id = ?')
+      .get(input.sessionId, annotation.parentPacketId) as RawPacketRow | undefined;
+    const reading = rawEventById(input.db, input.sessionId, annotation.readingEventId);
+    const readingData = parsedEventData(reading);
+    // The annotation names an already-retained failed reading. Its text or
+    // digest alone cannot replace a pending question or invent a new one.
+    if (!parent || parent.pause_kind !== 'clarification' || parent.pause_question !== input.question
+      || parent.pause_options_json !== JSON.stringify(input.options)
+      || !reading || reading.type !== 'guardrail_tripped'
+      || reading.seq <= input.sourceUserSeq || reading.seq >= awaiting.seq
+      || readingData?.sourceUserSeq !== input.sourceUserSeq
+      || readingData.parentPacketId !== annotation.parentPacketId
+      || JSON.stringify(readingData.parentSlot ?? null) !== JSON.stringify(parsePauseSlotJson(parent.pause_slot_json) ?? null)
+      || !((readingData.kind === 'open_question_reply_classified' && readingData.route === 'reask'
+        && readingData.revisionUnavailable === true)
+        || readingData.kind === 'open_question_reply_reading_claimed')) return false;
+    let typed;
+    try { typed = presentationEventFromCompletionData(terminalData); } catch { return false; }
+    const rendered = renderClarificationUnavailable(input.question);
+    return typed?.identity.sessionId === input.sessionId && typed.identity.sourceUserSeq === input.sourceUserSeq
+      && typed.status === 'needs_input' && typed.kind === 'question' && typed.needs?.kind === 'input'
+      && sourceUserSeq === input.sourceUserSeq && terminalSourceUserSeq === input.sourceUserSeq
+      && terminalText === rendered && awaitingData.question === rendered
+      && JSON.stringify(awaitingData.options ?? []) === JSON.stringify(input.options);
+  }
   const terminalQuestion = normalizedVisibleText(terminalText);
   const awaitingQuestion = normalizedVisibleText(awaitingData.question);
   const awaitingOptions = Array.isArray(awaitingData.options)
@@ -981,6 +1077,7 @@ function rowToPacket(db: Database.Database, row: RawPacketRow): TaskContinuityPa
     options,
     awaitingEventId: row.public_awaiting_event_id,
     terminalEventId: row.public_terminal_event_id,
+    parentPacketId: row.parent_packet_id,
   })) return null;
   const hasAnyLineage = row.root_source_user_seq !== null
     || row.root_source_event_id !== null
@@ -1024,6 +1121,10 @@ function rowToPacket(db: Database.Database, row: RawPacketRow): TaskContinuityPa
     };
   }
   const slot = parsePauseSlotJson(row.pause_slot_json);
+  const publicAsk = row.public_awaiting_event_id ? parsedEventData(rawEventById(db, sessionId, row.public_awaiting_event_id)) : null;
+  const annotation = publicAsk?.clarificationAnnotation === undefined ? null
+    : validateClarificationUnavailableAnnotation(publicAsk.clarificationAnnotation,
+      { sessionId, sourceUserSeq: sourceSeq, parentPacketId: row.parent_packet_id ?? '' }, question, options);
   return {
     version: TASK_CONTINUITY_PACKET_VERSION,
     packetId: row.packet_id,
@@ -1038,6 +1139,7 @@ function rowToPacket(db: Database.Database, row: RawPacketRow): TaskContinuityPa
       ...(optionIntents.length > 0 ? { optionIntents } : {}),
       ...(slot ? { slot } : {}),
     },
+    ...(annotation ? { publicQuestion: { text: renderClarificationUnavailable(question), annotation } } : {}),
     capabilities,
     createdAt: createdAt.iso,
     expiresAt: expiresAt.iso,
@@ -1132,8 +1234,226 @@ function consumedLookupResult(
   };
 }
 
+function deliveredClarificationForReply(
+  db: Database.Database,
+  row: RawPacketRow,
+  packet: TaskContinuityPacket,
+  reply: TaskContinuityClarificationSource,
+): TaskContinuityClarificationReplySource | null {
+  if (!row.public_awaiting_event_id || !row.public_terminal_event_id) return null;
+  const awaiting = rawEventById(db, packet.sessionId, row.public_awaiting_event_id);
+  const terminal = rawEventById(db, packet.sessionId, row.public_terminal_event_id);
+  const awaitingData = parsedEventData(awaiting);
+  const terminalData = parsedEventData(terminal);
+  if (!awaiting || !terminal || !awaitingData || !terminalData
+    || awaiting.seq <= packet.originatingSourceUserSeq || terminal.seq >= reply.sourceUserSeq
+    || (awaitingData.purpose !== undefined && awaitingData.purpose !== 'clarification')) return null;
+  // rowToPacket already checked the paired source/question/options binding.
+  // Retain the public bytes, not a normalized/internal question description.
+  let question: unknown = terminalData.reply;
+  try {
+    const typed = presentationEventFromCompletionData(terminalData);
+    if (typed) {
+      if (typed.identity.sessionId !== packet.sessionId || typed.status !== 'needs_input'
+        || typed.kind !== 'question' || typed.needs?.kind !== 'input') return null;
+      question = withoutRetainedWorkCheckpoint(typed.text);
+    } else if (terminalData.presentation !== undefined || terminalData.turnOutcome !== undefined) return null;
+  } catch { return null; }
+  const options = awaitingData.options ?? [];
+  if (typeof question !== 'string' || !question.trim() || !Array.isArray(options)
+    || options.length > MAX_PAUSE_OPTIONS || options.some(option => typeof option !== 'string')) return null;
+  return Object.freeze({ ...reply, previousDeliveredQuestion: question,
+    ...(packet.publicQuestion ? { previousReferenceQuestion: packet.pause.question,
+      previousQuestionAnnotation: packet.publicQuestion.annotation } : {}),
+    previousDeliveredOptions: Object.freeze([...options] as string[]),
+    previousDeliveredAwaitingEventId: awaiting.id, previousDeliveredTerminalEventId: terminal.id });
+}
+
+function clarificationSourcesResult(
+  db: Database.Database,
+  input: ReadTaskContinuityClarificationSourcesInput,
+  nowMs: number,
+): TaskContinuityClarificationSourcesResult {
+  const refuse = (reason: Extract<TaskContinuityClarificationSourcesResult,
+    { status: 'refused' }>['reason']): TaskContinuityClarificationSourcesResult => ({ status: 'refused', reason });
+  let proofTime = nowMs;
+  let consumedLiteral: TaskContinuityClarificationSource | undefined;
+  if (input.consumingSourceUserSeq !== undefined) {
+    const consumed = consumedLookupResult(db, input.sessionId, input.consumingSourceUserSeq);
+    if (consumed.status !== 'consumed' || consumed.packet.packetId !== input.packetId) return refuse('consumed_leaf_mismatch');
+    const adjacent = nextAcceptedSource(db, input.sessionId, consumed.packet.originatingSourceUserSeq);
+    proofTime = canonicalIso(consumed.consumedAt, 'consumedAt').ms;
+    if (adjacent?.seq !== consumed.consumingSourceUserSeq
+      || adjacent.eventId !== consumed.consumingSourceEventId
+      || proofTime < Date.parse(adjacent.createdAt)
+      || proofTime < Date.parse(consumed.packet.createdAt)
+      || proofTime >= Date.parse(consumed.packet.expiresAt)) return refuse('consumed_leaf_mismatch');
+    const raw = rawSource(db, input.sessionId, consumed.consumingSourceUserSeq);
+    const consumer = acceptedSourceFromRow(raw);
+    const data = parsedEventData(raw);
+    if (isClarificationControlSource(data)) return refuse('control_source');
+    if (!consumer || !data || typeof data.text !== 'string' || !data.text.trim()) return refuse('consumed_leaf_mismatch');
+    consumedLiteral = Object.freeze({ sourceUserSeq: consumer.seq, sourceEventId: consumer.eventId,
+      text: data.text, dataHash: consumer.dataHash });
+  } else {
+    const open = openPacketRows(db, input.sessionId);
+    if (open.length !== 1 || open[0]!.packet_id !== input.packetId) {
+      const exists = db.prepare('SELECT 1 FROM task_continuity_packets WHERE session_id = ? AND packet_id = ?')
+        .get(input.sessionId, input.packetId);
+      return refuse(!exists ? 'unknown_packet' : open.length > 1 ? 'ambiguous_leaf' : 'retired_hop');
+    }
+  }
+  const rows: RawPacketRow[] = [];
+  const packets: TaskContinuityPacket[] = [];
+  const sources: TaskContinuityClarificationSource[] = [];
+  const seen = new Set<string>();
+  let nextId: string | null = input.packetId;
+  let chars = 0;
+  while (nextId !== null) {
+    if (seen.has(nextId)) return refuse('malformed_chain');
+    if (rows.length >= MAX_CLARIFICATION_SOURCE_CHAIN_PACKETS) return refuse('source_chain_limit');
+    seen.add(nextId);
+    const row = db.prepare('SELECT * FROM task_continuity_packets WHERE session_id = ? AND packet_id = ?')
+      .get(input.sessionId, nextId) as RawPacketRow | undefined;
+    if (!row) return refuse('unknown_packet');
+    if (row.pause_kind !== 'clarification') return refuse('nonclarification_hop');
+    const exactConsumedLeaf = rows.length === 0 && input.consumingSourceUserSeq !== undefined;
+    if ((!exactConsumedLeaf && row.consumed_at !== null)
+      || row.expired_at !== null || row.dismissed_at !== null) return refuse('retired_hop');
+    const packet = rowToPacket(db, row);
+    if (!packet) return refuse('malformed_chain');
+    if ((row.pause_slot_json !== null && !packet.pause.slot)
+      || (packet.pause.slot && packet.pause.slot.revision < 0)) return refuse('malformed_chain');
+    if (Date.parse(packet.expiresAt) <= proofTime) return refuse('expired_hop');
+    const child = packets.at(-1);
+    if (child) {
+      // create() records supersession and the successor in the same write.
+      // An old open/retired row or a guessed parent cannot stand in for that
+      // exact receipt, even when the visible question happens to match.
+      if (row.superseded_at !== child.createdAt
+        || Date.parse(packet.createdAt) > Date.parse(child.createdAt)
+        || Date.parse(child.createdAt) >= Date.parse(packet.expiresAt)
+        || Date.parse(child.expiresAt) > Date.parse(packet.expiresAt)) return refuse('unbound_supersession');
+      const a = packet.pause.slot;
+      const b = child.pause.slot;
+      if (!a || !b || a.goalId !== b.goalId || a.revision !== b.revision
+        || a.questionId !== b.questionId || a.slotKey !== b.slotKey) return refuse('slot_changed');
+    } else if (row.superseded_at !== null) return refuse('retired_hop');
+    const raw = rawSource(db, input.sessionId, packet.originatingSourceUserSeq);
+    const accepted = acceptedSourceFromRow(raw);
+    const data = parsedEventData(raw);
+    if (isClarificationControlSource(data)) return refuse('control_source');
+    if (!accepted || !data || typeof data.text !== 'string' || !data.text.trim()) return refuse('malformed_chain');
+    chars += data.text.length;
+    if (chars > MAX_CLARIFICATION_SOURCE_CHAIN_CHARS) return refuse('source_chain_limit');
+    rows.push(row);
+    packets.push(packet);
+    sources.push(Object.freeze({ sourceUserSeq: accepted.seq, sourceEventId: accepted.eventId,
+      text: data.text, dataHash: accepted.dataHash }));
+    nextId = packet.parentPacketId ?? null;
+  }
+  const rootPacket = packets.at(-1)!;
+  const root = sources.at(-1)!;
+  // rowToPacket proves each immediate source/event/audience/adjacency edge.
+  // Reproduce the same literal root across the complete chain rather than
+  // accepting a locally valid suffix that silently loses an earlier reply.
+  if (rootPacket.rootSourceUserSeq !== undefined || rootPacket.rootSourceEventId !== undefined
+    || rootPacket.parentPacketId !== undefined
+    || packets.some(packet => packet !== rootPacket && (
+      packet.rootSourceUserSeq !== root.sourceUserSeq || packet.rootSourceEventId !== root.sourceEventId))) {
+    return refuse('malformed_chain');
+  }
+  const replies: TaskContinuityClarificationReplySource[] = [];
+  for (let index = sources.length - 2; index >= 0; index -= 1) {
+    const reply = deliveredClarificationForReply(db, rows[index + 1]!, packets[index + 1]!, sources[index]!);
+    if (!reply) return refuse('unbound_public_question');
+    chars += reply.previousDeliveredQuestion.length
+      + reply.previousDeliveredOptions.reduce((total, option) => total + option.length, 0);
+    if (chars > MAX_CLARIFICATION_SOURCE_CHAIN_CHARS) return refuse('source_chain_limit');
+    replies.push(reply);
+  }
+  let nextReply: TaskContinuityClarificationReplySource | undefined;
+  if (input.nextReplySourceUserSeq !== undefined) {
+    const leaf = packets[0]!;
+    const candidate = acceptedSource(db, input.sessionId, input.nextReplySourceUserSeq);
+    const adjacent = nextAcceptedSource(db, input.sessionId, leaf.originatingSourceUserSeq);
+    const leafOrigin = acceptedSource(db, input.sessionId, leaf.originatingSourceUserSeq);
+    const rootOrigin = acceptedSource(db, input.sessionId, root.sourceUserSeq);
+    if (!candidate || adjacent?.seq !== candidate.seq || adjacent.eventId !== candidate.eventId
+      || !leafOrigin || !rootOrigin || !sameAcceptedAudience(leafOrigin, candidate)
+      || !sameAcceptedAudience(rootOrigin, candidate)) return refuse('next_reply_mismatch');
+    // An exact earlier source is not the current incoming edge once another
+    // non-synthetic human source exists. Malformed later rows also fail closed.
+    const later = db.prepare(`SELECT 1 FROM events
+      WHERE session_id = ? AND seq > ? AND type = 'user_input_received' AND role = 'user'
+        AND CASE WHEN json_valid(data_json)
+          THEN json_type(data_json, '$.synthetic') IS NOT 'true' ELSE 1 END
+      LIMIT 1`).get(input.sessionId, candidate.seq);
+    if (later) return refuse('next_reply_mismatch');
+    const data = parsedEventData(rawSource(db, input.sessionId, candidate.seq));
+    if (isClarificationControlSource(data)) return refuse('control_source');
+    if (!data || typeof data.text !== 'string' || !data.text.trim()) return refuse('next_reply_mismatch');
+    const literal = Object.freeze({ sourceUserSeq: candidate.seq, sourceEventId: candidate.eventId,
+      text: data.text, dataHash: candidate.dataHash });
+    nextReply = deliveredClarificationForReply(db, rows[0]!, leaf, literal) ?? undefined;
+    if (!nextReply) return refuse('unbound_public_question');
+    chars += nextReply.text.length + nextReply.previousDeliveredQuestion.length
+      + nextReply.previousDeliveredOptions.reduce((total, option) => total + option.length, 0);
+    if (chars > MAX_CLARIFICATION_SOURCE_CHAIN_CHARS) return refuse('source_chain_limit');
+  }
+  let consumedReply: TaskContinuityClarificationReplySource | undefined;
+  if (consumedLiteral) {
+    consumedReply = deliveredClarificationForReply(db, rows[0]!, packets[0]!, consumedLiteral) ?? undefined;
+    if (!consumedReply) return refuse('unbound_public_question');
+    chars += consumedReply.text.length + consumedReply.previousDeliveredQuestion.length
+      + consumedReply.previousDeliveredOptions.reduce((total, option) => total + option.length, 0);
+    if (chars > MAX_CLARIFICATION_SOURCE_CHAIN_CHARS) return refuse('source_chain_limit');
+  }
+  return Object.freeze({ status: 'verified', packetId: input.packetId, root,
+    replies: Object.freeze(replies), packetIds: Object.freeze(packets.map(packet => packet.packetId).reverse()),
+    ...(nextReply ? { nextReply } : {}), ...(consumedReply ? { consumedReply } : {}) });
+}
+
+function isClarificationControlSource(data: Record<string, unknown> | null): boolean {
+  const sourceKind = typeof data?.source === 'string' ? data.source.trim().toLowerCase() : '';
+  return data?.approvalId !== undefined || data?.decision !== undefined
+    || ['channel_send_consent', 'approval_resume', 'mobile_approval', 'connection_continuation',
+      'restart_recovery', 'host_checkpoint_recovery', 'stall_retry'].includes(sourceKind);
+}
+
 export class TaskContinuityStore {
   constructor(private readonly databaseProvider: DatabaseProvider = openEventLog) {}
+
+  /** SELECT-only snapshot. Unlike peek/consume this never creates schema,
+   * expires a row, repairs history, or claims an answer. */
+  readClarificationSources(
+    input: ReadTaskContinuityClarificationSourcesInput,
+    options: TaskContinuityClockOptions = {},
+  ): TaskContinuityClarificationSourcesResult {
+    let sessionId: string;
+    let packetId: string;
+    let nowMs: number;
+    let consumingSourceUserSeq: number | undefined;
+    let nextReplySourceUserSeq: number | undefined;
+    try {
+      sessionId = normalizedSessionId(input.sessionId);
+      packetId = boundedString(input.packetId, 'packetId', 128);
+      nowMs = canonicalIso(options.now ?? new Date().toISOString(), 'now').ms;
+      if (input.consumingSourceUserSeq !== undefined) {
+        consumingSourceUserSeq = positiveSeq(input.consumingSourceUserSeq, 'consumingSourceUserSeq');
+      }
+      if (input.nextReplySourceUserSeq !== undefined) {
+        if (input.consumingSourceUserSeq !== undefined) throw new Error('clarification source modes are exclusive');
+        nextReplySourceUserSeq = positiveSeq(input.nextReplySourceUserSeq, 'nextReplySourceUserSeq');
+      }
+    } catch { return { status: 'refused', reason: 'invalid_input' }; }
+    try {
+      const db = this.databaseProvider();
+      return db.transaction(() => clarificationSourcesResult(db, { sessionId, packetId,
+        ...(consumingSourceUserSeq !== undefined ? { consumingSourceUserSeq } : {}),
+        ...(nextReplySourceUserSeq !== undefined ? { nextReplySourceUserSeq } : {}) }, nowMs))();
+    } catch { return { status: 'refused', reason: 'unavailable' }; }
+  }
 
   create(
     input: CreateTaskContinuityPacketInput,
@@ -1214,6 +1534,7 @@ export class TaskContinuityStore {
         options: pauseOptions,
         awaitingEventId,
         terminalEventId,
+        parentPacketId: lineage?.parentPacketId,
       })) {
         throw new Error('Task continuity pause options are not bound to the exact public ask and terminal.');
       }
@@ -1505,6 +1826,13 @@ export function readConsumedTaskContinuityPacket(
   options: TaskContinuityClockOptions = {},
 ): ConsumedTaskContinuityLookupResult {
   return taskContinuityStore.readConsumed(input, options);
+}
+
+export function readTaskContinuityClarificationSources(
+  input: ReadTaskContinuityClarificationSourcesInput,
+  options: TaskContinuityClockOptions = {},
+): TaskContinuityClarificationSourcesResult {
+  return taskContinuityStore.readClarificationSources(input, options);
 }
 
 export function dismissTaskContinuityPacket(

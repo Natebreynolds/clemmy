@@ -1689,7 +1689,8 @@ test('a held turn whose recovery cannot publish its stop is answered once the op
     operationId: 'research_request', schema: RESEARCH_SCHEMA, payloads: [RESEARCH_PAYLOAD],
   });
   assert.ok(fixture);
-  const { runConversation, HELD_TURN_UNOWNED_STOP_TEXT } = await import('./loop.js');
+  const { runConversation, HELD_TURN_UNOWNED_STOP_TEXT, drainPendingHeldStopPublications } = await import('./loop.js');
+  const { reconcileRevokedHostToolInvocations } = await import('./host-tool-invocation.js');
   const agent = await fixture.useProductionAgent();
   const attempt = eventlog.beginRunAttempt(fixture.session.id, { runId: `unowned-stop-${fixture.source.seq}` });
   eventlog.recordRunAttemptUserInput(attempt, { turn: fixture.source.turn, role: 'user', data: fixture.source.data },
@@ -1719,9 +1720,18 @@ test('a held turn whose recovery cannot publish its stop is answered once the op
     assert.ok(stoppedAtSite(), 'the retry budget ran out');
     await new Promise(resolve => setTimeout(resolve, 300));
     assert.equal(terminals().length, 0, 'the stop waits while its call cannot settle');
+    const pendingDebt = (eventlog.getSession(fixture.session.id)!.metadata[eventlog.HELD_STOP_PUBLICATION_METADATA_KEY] as Record<string, { attemptsUsed: number }>)[String(fixture.source.seq)];
+    assert.equal(pendingDebt?.attemptsUsed, 0, 'known open-call waiting consumes no publication credit');
     db.exec('DROP TRIGGER IF EXISTS reject_unowned_settlement');
+    // The real daemon's existing reaper owns structural settlement. The new
+    // publication-only watcher must never do this sweep or execute the body.
+    const reconciled = reconcileRevokedHostToolInvocations({ sessionId: fixture.session.id });
+    assert.ok(reconciled.settled > 0);
     const deadline = Date.now() + 20_000;
-    while (Date.now() < deadline && terminals().length === 0) await new Promise(resolve => setTimeout(resolve, 50));
+    while (Date.now() < deadline && terminals().length === 0) {
+      drainPendingHeldStopPublications();
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
   } finally {
     db.exec('DROP TRIGGER IF EXISTS reject_unowned_result_checkpoint');
     db.exec('DROP TRIGGER IF EXISTS reject_unowned_settlement');

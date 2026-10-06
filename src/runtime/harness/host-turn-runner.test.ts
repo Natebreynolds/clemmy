@@ -6059,6 +6059,60 @@ test('explicit cancelled with a valid tool call executes nothing', async () => {
   );
 });
 
+test('provider filter explains the stop while retaining prior work and rejecting a complete tool frame', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const fixture = acceptHostCanarySource('filtered-complete-call', 'Read the local workspace once.');
+  let retainedBodies = 0;
+  let rejectedBodies = 0;
+  let rejectedApprovalChecks = 0;
+  const retainedCallId = 'retained-before-filter';
+  const rejectedCallId = 'rejected-filter-call';
+  const model = explicitStopModel([
+    { finishReason: 'tool_use', output: [toolCall(retainedCallId, 'list_files', {})] },
+    { finishReason: 'content-filter', output: [toolCall(rejectedCallId, 'filtered_action', { privateMarker: REJECTED_TEXT })] },
+  ]);
+  const read = brackets.wrapToolForHarness({
+    type: 'function', name: 'list_files', description: 'Read a synthetic local listing.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    needsApproval: async () => false,
+    invoke: async () => { retainedBodies += 1; return { entries: ['retained-result.txt'] }; },
+  });
+  const rejected = {
+    type: 'function', name: 'filtered_action', description: 'Must never be reached.',
+    parameters: {
+      type: 'object', properties: { privateMarker: { type: 'string' } },
+      required: ['privateMarker'], additionalProperties: false,
+    },
+    needsApproval: async () => { rejectedApprovalChecks += 1; return true; },
+    invoke: async () => { rejectedBodies += 1; return 'must-not-run'; },
+  };
+  const agent = { model, tools: [read, rejected] };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  try {
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(outcome.terminal?.status, 'blocked');
+    assert.equal(outcome.terminal?.reason, 'provider_content_filter');
+    assert.equal(model.calls(), 2, 'the rejected frame does not start another model request');
+    assert.equal(retainedBodies, 1, 'prior work completed once');
+    assert.equal(rejectedApprovalChecks, 0, 'rejected content cannot reach the approval boundary');
+    assert.equal(rejectedBodies, 0, 'a complete filtered call is never executed');
+    assert.equal(outcome.lastResponseId, 'explicit-resp-1', 'the last accepted response remains authoritative');
+    const history = JSON.stringify(outcome.history);
+    assert.match(history, /retained-before-filter/);
+    assert.match(history, /retained-result\.txt/);
+    assert.doesNotMatch(history, /rejected-filter-call|filtered_action|PARTIAL-REJECTED-BYTES-DO-NOT-REPLAY/);
+    assert.doesNotMatch(JSON.stringify(outcome.finalOutput), /filtered_action|PARTIAL-REJECTED-BYTES-DO-NOT-REPLAY/);
+    assert.equal(String(outcome.finalOutput).split('\n\n', 1)[0],
+      'The provider blocked this response. I did not execute any calls from it, and earlier completed work remains recorded. Review or revise your instructions before continuing.');
+    assert.match(String(outcome.finalOutput), /Retained work \(durable checkpoint\):[\s\S]*Source\/tool list_files:/,
+      'the existing retained-work summary remains attached to the reason-specific explanation');
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
 test('a future stop spelling blocks rather than being inferred from shape', async () => {
   const model = explicitStopModel([
     { finishReason: 'provider_specific_future_state', output: [textMsg(REJECTED_TEXT)] },
@@ -6073,6 +6127,8 @@ test('a future stop spelling blocks rather than being inferred from shape', asyn
   assert.equal(outcome.terminal?.status, 'blocked');
   assert.equal(outcome.terminal?.reason, 'provider_unrecognized_stop');
   assert.ok(!JSON.stringify(outcome.history).includes(REJECTED_TEXT));
+  assert.equal(outcome.finalOutput,
+    'The model finished this step without a complete assistant answer or executable tool request. I stopped at the durable checkpoint instead of treating an empty or filtered response as completed work.');
 });
 
 test('shape inference still admits a normal completion when metadata is absent', async () => {

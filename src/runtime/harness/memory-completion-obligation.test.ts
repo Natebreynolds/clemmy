@@ -32,6 +32,10 @@ const authorities = await import('./accepted-turn-call-authority.js');
 const hostBindings = await import('./host-call-capability-binding.js');
 const contracts = await import('./logical-call-contract.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
+const logical = await import('./attempt-identity.js');
+const leases = await import('./dispatch-lease.js');
+const toolContext = await import('./tool-output-context.js');
+const correctionTool = await import('./memory-correction-tool.js');
 
 after(() => {
   host._setHostObjectiveJudgeForTests(null);
@@ -59,8 +63,8 @@ function source(text = ownerText) {
   assert.ok(retained);
   return { ...identity, retained };
 }
-function settle(identity: ReturnType<typeof source>, name: string, callId: string,
-  payload: unknown | (() => unknown), args: Record<string, unknown> = {}) {
+function attested<T>(identity: ReturnType<typeof source>, name: string, callId: string,
+  args: Record<string, unknown>, work: () => T): T {
   const task = { ...identity, acceptedTaskId: identity.retained.acceptedTaskId };
   const root = authorities.acceptedTurnCallAuthorityFor(identity.sessionId, identity.sourceUserSeq);
   assert.equal(root.status, 'ok');
@@ -79,7 +83,12 @@ function settle(identity: ReturnType<typeof source>, name: string, callId: strin
     authorityDigest: root.authority.authorityDigest, authorityRevision: root.authority.revision,
     surfaceDigest: root.authority.surfaceDigest, catalogRevisionDigest: root.authority.catalogRevisionDigest!,
     bindingRevisionDigest: root.authority.bindingRevisionDigest! };
-  return authorities.withHostCallAttestation({ ...base, bindingDigest: hostBindings.hostCallAttestationBindingDigest(base) }, () => {
+  return authorities.withHostCallAttestation({ ...base, bindingDigest: hostBindings.hostCallAttestationBindingDigest(base) }, work);
+}
+function settle(identity: ReturnType<typeof source>, name: string, callId: string,
+  payload: unknown | (() => unknown), args: Record<string, unknown> = {}) {
+  const task = { ...identity, acceptedTaskId: identity.retained.acceptedTaskId };
+  return attested(identity, name, callId, args, () => {
     const opened = dispatch.beginPhysicalDispatch({
       identity: { ...task, logicalToolCallId: callId, physicalDispatchId: `dispatch:${callId}`, ordinal: 0 },
       tool: name, args, executionSite: 'host',
@@ -98,8 +107,9 @@ function settle(identity: ReturnType<typeof source>, name: string, callId: strin
     return value;
   });
 }
-function observed(identity: ReturnType<typeof source>, callId = `original-read-${serial}`) {
-  const fact = facts.rememberFact({ kind: 'project', content: `Fixture ${identity.sessionId} (${callId}): report heading HAZEL RIDGE; footer COPPER KITE.`, scope: null,
+function observed(identity: ReturnType<typeof source>, callId = `original-read-${serial}`,
+  storedScope: { projectId: string | null; agentKey: string | null } | null = null) {
+  const fact = facts.rememberFact({ kind: 'project', content: `Fixture ${identity.sessionId} (${callId}): report heading HAZEL RIDGE; footer COPPER KITE.`, scope: storedScope,
     occurredAt: new Date(Date.parse(identity.retained.occurredAt) - 60_000).toISOString() });
   const observation = factState.readFactObservation(fact.id);
   assert.ok(observation);
@@ -377,4 +387,86 @@ test('a bound correction whose target this request\'s intake retired is complete
   const unbound = source(); const unboundFixture = observed(unbound);
   retain(unbound, unboundFixture.assessment, 'prewrite');
   assert.throws(() => retain(unbound, replacedAssessment), /No replacement made by this request/);
+});
+
+function replaceObservedAtIntake(identity: ReturnType<typeof source>, fixture: ReturnType<typeof observed>,
+  content = fixture.observation.content.replace('HAZEL RIDGE', 'LILAC GROVE'), kind: 'project' | 'reference' = 'project') {
+  const by = facts.rememberFact({ kind, content, scope: fixture.observation.scope,
+    sessionId: identity.sessionId, occurredAt: identity.retained.occurredAt,
+    sourceUri: `conversation://${encodeURIComponent(identity.sessionId)}/${encodeURIComponent(`auto-capture:user-source:${identity.sourceUserSeq}`)}` });
+  assert.equal(facts.markFactSupersededBy(fixture.fact.id, by.id, { validTo: identity.retained.occurredAt }), true);
+  return by;
+}
+
+test('a bound correction rejects intake that drops unchanged bytes, changes kind or moves the stored scope', () => {
+  for (const variation of ['lost-footer', 'wrong-heading', 'changed-prefix', 'changed-kind', 'moved-scope'] as const) {
+    const identity = source(); const fixture = observed(identity);
+    retain(identity, fixture.assessment, 'prewrite');
+    const expected = fixture.observation.content.replace('HAZEL RIDGE', 'LILAC GROVE');
+    const content = variation === 'lost-footer' ? expected.replace('; footer COPPER KITE.', '.')
+      : variation === 'wrong-heading' ? expected.replace('LILAC GROVE', 'ANOTHER HEADING')
+      : variation === 'changed-prefix' ? expected.replace('Fixture', 'Record') : expected;
+    const by = replaceObservedAtIntake(identity, fixture, content, variation === 'changed-kind' ? 'reference' : 'project');
+    if (variation === 'moved-scope') {
+      // Both rows still agree with each other, which passes the ordinary
+      // semantic intake scope check, but disagree with the retained original.
+      scope.stampMemoryScope('fact', fixture.fact.id, { projectId: 'moved-project', agentKey: null });
+      scope.stampMemoryScope('fact', by.id, { projectId: 'moved-project', agentKey: null });
+    }
+    assert.equal(memory.intakeReplacementsForSource(identity.retained).some(row => row.replaced.id === fixture.fact.id), true,
+      `${variation} reaches the former id-only bypass`);
+    const count = memoryDb.openMemoryDb().prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get();
+    assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified', variation);
+    assert.throws(() => retain(identity, replacedAssessment), /cannot be waived/, variation);
+    events.closeEventLog(); memoryDb.closeMemoryDb();
+    assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified', `${variation} survives reopen`);
+    assert.deepEqual(memoryDb.openMemoryDb().prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get(), count,
+      'verification never mints another successor');
+  }
+});
+
+async function invokeCorrection(identity: ReturnType<typeof source>, args: Parameters<typeof correctionTool.executeMemoryCorrection>[0]) {
+  const callId = `manual-intake-check-${serial}`;
+  const lease = leases.activateDispatchLease({ sessionId: identity.sessionId, scopeId: `manual:${identity.sessionId}` });
+  return attested(identity, 'memory_remember', callId, args, () =>
+    logical.withLogicalToolCall({ ...identity, tool: 'memory_remember', logicalToolCallId: callId, args }, () =>
+      leases.runWithDispatchLease(lease, () =>
+        toolContext.withToolOutputContext({ ...identity, callId, toolName: 'memory_remember' }, () =>
+          correctionTool.executeMemoryCorrection(args)))));
+}
+
+test('manual correction validates all exact arguments before accepting a matching intake replacement', async () => {
+  for (const variation of ['exact', 'read-after-intake', 'content-mismatch', 'invalid-patch', 'scope-move', 'lost-footer', 'moved-scope'] as const) {
+    const identity = source();
+    const fixture = observed(identity, `manual-read-${serial}`,
+      variation === 'scope-move' ? { projectId: 'original-stored-project', agentKey: null } : null);
+    const expected = fixture.observation.content.replace('HAZEL RIDGE', 'LILAC GROVE');
+    const by = replaceObservedAtIntake(identity, fixture,
+      variation === 'lost-footer' ? expected.replace('; footer COPPER KITE.', '.') : expected);
+    if (variation === 'moved-scope') {
+      scope.stampMemoryScope('fact', fixture.fact.id, { projectId: 'moved-project', agentKey: null });
+      scope.stampMemoryScope('fact', by.id, { projectId: 'moved-project', agentKey: null });
+    }
+    let correction = fixture.correction;
+    if (variation === 'read-after-intake') {
+      const observation = factState.readFactObservation(fixture.fact.id);
+      assert.ok(observation); assert.equal(observation.active, false);
+      const readCallId = `retired-read-${serial}`;
+      settle(identity, 'memory_read', readCallId, JSON.stringify({ protocol: 'fact_observation_v1', readCallId,
+        observation, provenance: 'The original fact was read after this source retired it.' }));
+      correction = { ...correction, readCallId, expectedDigest: observation.digest };
+    }
+    const args = { kind: 'project', content: variation === 'content-mismatch' ? 'A different saved fact.' : expected,
+      correct: variation === 'invalid-patch' ? { ...correction, edits: [{ before: 'MISSING TEXT', after: 'LILAC GROVE' }] } : correction,
+      ...(variation === 'scope-move' ? { keepFor: 'here' as const } : {}) };
+    assert.equal(memory.intakeReplacementsForSource(identity.retained).some(row => row.replaced.id === fixture.fact.id), true,
+      `${variation} reaches the former argument-validation bypass`);
+    const count = memoryDb.openMemoryDb().prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get();
+    if (variation === 'exact' || variation === 'read-after-intake') assert.equal((await invokeCorrection(identity, args)).status, 'already_in_effect');
+    else await assert.rejects(scope.withMemoryReadScope('unrestricted', () => invokeCorrection(identity, args)), variation === 'content-mismatch' ? /content must equal/
+      : variation === 'invalid-patch' ? /match exactly once/
+      : variation === 'scope-move' ? /original stored scope/ : /does not match the exact edited original/, variation);
+    assert.deepEqual(memoryDb.openMemoryDb().prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get(), count,
+      'a fast-return check neither writes another fact nor enters provider review');
+  }
 });

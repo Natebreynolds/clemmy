@@ -8,8 +8,38 @@ import {
   publicAsyncWorkDispatchedData,
   publicCompletionText,
   publicReplyText,
+  PUBLIC_RUN_FAILURE_TEXT,
+  PUBLIC_MODEL_EMPTY_COMPLETION_TEXT,
+  PUBLIC_CODEX_AUTH_EXPIRED_TEXT,
+  publicRunFailureKind,
+  publicRunFailureText,
 } from './public-presentation.js';
+import { BoundaryError } from '../boundary-error.js';
 import { __setToolkitCatalogForTests } from '../../integrations/composio/toolkit-identity.js';
+
+test('typed empty stop accepts only the closed host boundary reason and publishes no raw diagnostic', () => {
+  const known = new BoundaryError({ kind: 'model.empty_completion', retryable: true,
+    userMessage: 'private or misleading provider words', operatorMessage: 'PRIVATE DIAGNOSTIC' });
+  assert.equal(publicRunFailureKind(known), 'model.empty_completion');
+  assert.equal(publicRunFailureText(publicRunFailureKind(known)), PUBLIC_MODEL_EMPTY_COMPLETION_TEXT);
+  for (const untyped of ['model.empty_completion', { kind: 'model.empty_completion' },
+    Object.assign(new Error('empty completion'), { kind: 'model.empty_completion' }),
+    new BoundaryError({ kind: 'runtime.unknown', retryable: false, userMessage: 'empty completion', operatorMessage: 'model.empty_completion' })]) {
+    assert.equal(publicRunFailureKind(untyped), undefined);
+    assert.equal(publicRunFailureText(publicRunFailureKind(untyped)), PUBLIC_RUN_FAILURE_TEXT);
+  }
+  assert.equal(publicRunFailureText('untrusted_future_kind' as never), PUBLIC_RUN_FAILURE_TEXT);
+  assert.match(PUBLIC_RUN_FAILURE_TEXT, /cause.*not.*confirmed/i);
+  assert.match(PUBLIC_RUN_FAILURE_TEXT, /what completed.*what remains.*before retrying/i);
+  assert.doesNotMatch(PUBLIC_MODEL_EMPTY_COMPLETION_TEXT, /PRIVATE|no tools|nothing changed|quota|sign.in/i);
+  const auth = new BoundaryError({ kind: 'codex.auth_expired', retryable: false,
+    userMessage: 'PRIVATE AUTH MESSAGE', operatorMessage: 'PRIVATE AUTH DIAGNOSTIC' });
+  assert.equal(publicRunFailureKind(auth), 'codex.auth_expired');
+  assert.equal(publicRunFailureText(publicRunFailureKind(auth)), PUBLIC_CODEX_AUTH_EXPIRED_TEXT);
+  assert.equal(publicRunFailureKind(Object.assign(new Error('token_revoked'), { kind: 'codex.auth_expired' })), undefined);
+  assert.match(PUBLIC_CODEX_AUTH_EXPIRED_TEXT, /sign.in expired or was revoked.*unfinished.*Settings > Model accounts.*continue the unfinished work/i);
+  assert.doesNotMatch(PUBLIC_CODEX_AUTH_EXPIRED_TEXT, /PRIVATE|login-native|try again|no tools|nothing changed/i);
+});
 
 test('a verdict names the model that ruled, and only a well-formed model id reaches the chat', () => {
   const ruled = projectHarnessEventForPublic(event('verdict_recorded', {
@@ -627,7 +657,28 @@ test('nested reply payloads are revalidated and plain summaries never gain publi
     summary: 'Asked the model to inspect the account and wait.',
   }));
   assert.ok(summaryOnly);
-  assert.match(String(summaryOnly.data.reply), /final reply was not safe to display/i);
+  assert.match(String(summaryOnly.data.reply), /do not have a final reply.*check what completed and what remains/i);
+  assert.doesNotMatch(String(summaryOnly.data.reply), /inspect the account|I finished|retry|automatically/i);
+});
+
+test('legacy missing reply gives a progress-check next step without changing stop control or specific reports', () => {
+  const source = { delivered: false, reason: 'blocked', sourceUserSeq: 19, runId: 'run-existing', attemptId: 'attempt-existing' };
+  const projected = projectHarnessEventForPublic(event('conversation_completed', { ...source, reply: '', summary: 'PRIVATE internal failure' }));
+  assert.ok(projected);
+  assert.match(String(projected.data.reply), /cannot|do not have/i);
+  assert.match(String(projected.data.reply), /check what completed and what remains before continuing/i);
+  assert.doesNotMatch(String(projected.data.reply), /PRIVATE|I finished|send.*again|retry|automatically|nothing changed/i);
+  for (const [key, value] of Object.entries(source)) assert.equal(projected.data[key], value);
+  const presentation = projected.data.presentation as Record<string, unknown>;
+  assert.equal(presentation.status, 'blocked');
+  assert.equal(presentation.resumable, false);
+  assert.equal(presentation.needs, undefined);
+  assert.equal(projected.data.turnOutcome, undefined);
+
+  const report = 'The local report is saved. Publishing is unfinished; confirm the destination.\n\nRetained work (durable checkpoint): report saved.';
+  assert.equal(projectHarnessEventForPublic(event('conversation_completed', { ...source, reply: report }))?.data.reply, report);
+  assert.equal(publicCompletionText({ reply: '' }, ''), '', 'an explicit empty extraction fallback remains empty');
+  assert.equal(publicCompletionText({ reply: '<invoke name="private_tool">' }, ''), '');
 });
 
 test('public event batches preserve durable sequence cursors while dropping private rows', () => {

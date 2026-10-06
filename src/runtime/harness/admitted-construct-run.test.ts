@@ -20,9 +20,11 @@ const {
   runAdmittedConstructVertical,
   runAdmittedTurnGraph,
   setAdmittedGraphRunFault,
+  safeTypedTerminalText,
 } = await import('./admitted-construct-run.js');
 const { catalogFromConstructProviders } = await import('./construct-provider-catalog.fixture.js');
 const { redeemRawResult } = await import('./result-handle.js');
+const { presentationEventForOutcome, turnOutcomeId } = await import('./turn-outcome.js');
 type TurnGraphIR = import('../graph/turn-graph-ir.js').TurnGraphIR;
 type TurnSemanticModelPort = import('../semantic-boundary/turn-semantic-model-port.js').TurnSemanticModelPort;
 
@@ -53,6 +55,40 @@ installTurnSemanticModelPort({
   },
 } satisfies TurnSemanticModelPort);
 test.after(() => installTurnSemanticModelPort(null));
+
+test('typed construct stop floors explain unfinished work without inventing effects or automatic recovery', () => {
+  const blocked = safeTypedTerminalText('blocked', 'PRIVATE verify sink detail');
+  assert.match(blocked, /next step is blocked.*still unfinished.*check the blocker and any completed work/i);
+  assert.doesNotMatch(blocked, /PRIVATE|nothing changed|no (?:external change|provider call)|automatically|resend|try again/i);
+  const paused = safeTypedTerminalText('needs_input', 'PRIVATE paused node');
+  assert.match(paused, /paused.*still unfinished.*check what completed and what remains/i);
+  assert.doesNotMatch(paused, /PRIVATE|safe checkpoint|nothing changed|automatically|resend/i);
+  const failed = safeTypedTerminalText('failed', 'PRIVATE crash reason');
+  assert.match(failed, /cause.*not confirmed.*check what completed and what remains/i);
+  assert.doesNotMatch(failed, /PRIVATE|nothing changed|automatically/i);
+});
+
+test('expected-work storage failures keep the construct terminal blocked without claiming an automatic wake', () => {
+  // These are the catch-path strings used before construct execution when
+  // freeze/activation fails but committing the blocked terminal succeeds.
+  // Exercise its real renderer and projection; this is not an injected DB fault.
+  const identity = { sessionId: 'construct-storage-copy', turn: 3, sourceUserSeq: 52 };
+  for (const operation of ['freeze', 'activation']) {
+    const text = safeTypedTerminalText('blocked', `expected-work ${operation} storage_error: database is locked`);
+    const presentation = presentationEventForOutcome({
+      version: 2, id: turnOutcomeId(identity), identity,
+      status: 'blocked', resumable: false,
+      presentation: { kind: 'blocked', text },
+    });
+    assert.match(presentation.text, /unfinished.*check the recorded execution state.*completed work.*exact request/i);
+    assert.doesNotMatch(presentation.text, /automatically|wait for recovery|will wait|No provider call|No external change|retry is|approve|storage_error|database/i);
+    assert.equal(presentation.status, 'blocked');
+    assert.equal(presentation.kind, 'blocked');
+    assert.equal(presentation.resumable, false);
+    assert.equal(presentation.needs, undefined);
+    assert.deepEqual(presentation.identity, identity);
+  }
+});
 
 const POLICY = {
   version: 'turn-policy-v1' as const,

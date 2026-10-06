@@ -359,6 +359,9 @@ export interface ReplacedPromptRequest {
   instructions?: string;
   advertisedTools: readonly unknown[];
   model?: string;
+  /** Successful exact-source dispatch provenance, when publication follows
+   * its insertion. Observation only; never an execution or billing grant. */
+  requestOrdinal?: number;
 }
 
 /** Publishes one request's reading. Called with no argument, it publishes the
@@ -366,6 +369,15 @@ export interface ReplacedPromptRequest {
  *  it measures and publishes that one. A sender that decides after the filter
  *  what it sends holds the publisher and calls it once, when it has decided. */
 export type PromptReadingPublisher = (replaced?: ReplacedPromptRequest) => void;
+
+/** Bind delayed publication to the just-recorded exact-source request.
+ * An absent, stale, or arbitrary ordinal keeps the existing next-request
+ * behavior. This chooses a metadata join key, never a token allowance. */
+export function promptCompositionRequestOrdinal(previous: number, nextRecorded: number, dispatched?: number): number {
+  if (typeof dispatched === 'number' && Number.isSafeInteger(dispatched)
+    && dispatched > previous && dispatched === nextRecorded - 1) return dispatched;
+  return Math.max(previous + 1, nextRecorded);
+}
 
 /** Which model request a reading describes. */
 export interface PromptCompositionRequest {

@@ -758,6 +758,7 @@ import {
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
 import { loadShippedImplementations } from './shipped-implementation-identity.js';
 import { inspectDurableMaterialSourceContinuation, rehydrateConsumedClarificationContext } from './task-continuity-runtime.js';
+import { projectClarificationPromptContext } from './clarification-prompt-context.js';
 import {
   sourceStrategyBindingsEqual,
   turnPreflightDecisionsEqual,
@@ -940,6 +941,9 @@ export const HOST_MODEL_STALL_BLOCKED_TEXT =
 
 export const HOST_MODEL_INCOMPLETE_BLOCKED_TEXT =
   'The model finished this step without a complete assistant answer or executable tool request. I stopped at the durable checkpoint instead of treating an empty or filtered response as completed work.';
+
+export const HOST_MODEL_FILTERED_BLOCKED_TEXT =
+  'The provider blocked this response. I did not execute any calls from it, and earlier completed work remains recorded. Review or revise your instructions before continuing.';
 
 export const HOST_UNSUPPORTED_CAPABILITY_BLOCKED_TEXT =
   'This turn includes an execution capability that the host runner cannot yet project without losing authority or fidelity. I stopped before contacting the model or executing a tool.';
@@ -5139,7 +5143,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     formatWorkerModelId?: string,
     exactModel?: Model,
     answerDraft?: AnswerDraftStep,
+    finalRequestReading?: PromptReadingPublisher,
   ): Promise<Awaited<ReturnType<typeof codexOneStep>>> => {
+    let publishedFinalReading = false;
     const ambient = harnessRunContextStorage.getStore();
     const killTarget = ambient?.runAttemptId
       ? { attemptId: ambient.runAttemptId, sourceUserSeq: ambient.sourceUserSeq }
@@ -5322,6 +5328,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
                       '[clem] model_request_optional_layer_removed:',
                       provenance.removedOptionalLayer,
                     );
+                  }
+                  // A clarification supplement changes the filter's request.
+                  // Publish the actual admitted bytes, after provenance has
+                  // removed any unproven optional primer, using existing math.
+                  if (finalRequestReading && !publishedFinalReading) {
+                    publishedFinalReading = true;
+                    // The supplemented host path supplies an item array.
+                    // For the SDK's wider string union, use its exact
+                    // toAgentInputList string representation for observation;
+                    // leave the dispatched request untouched.
+                    finalRequestReading({ input: typeof request.input === 'string'
+                      ? [{ type: 'message', role: 'user', content: request.input }] : request.input,
+                      ...(request.systemInstructions !== undefined ? { instructions: request.systemInstructions } : {}),
+                      advertisedTools: request.tools,
+                      requestOrdinal: provenance.record.requestOrdinal,
+                      ...(typeof modelId === 'string' ? { model: modelId } : {}) });
                   }
                 },
               }
@@ -9795,6 +9817,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     let modelInput: AgentInputItem[] = [];
     let instructions: string | undefined;
     let publishReading: PromptReadingPublisher | undefined;
+    let finalRequestReading: PromptReadingPublisher | undefined;
     if (!consumingRecoveredFrame) {
       modelInput = structuredClone(history);
       // Match Agent.getSystemPrompt semantics: dynamic instructions are
@@ -9827,6 +9850,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ? instructions
           : filtered.instructions;
       }
+      const filteredInputLength = modelInput.length;
       // Accepted owner guidance is a final instruction layer, not provider
       // result bytes. Read it only after the input filter has budgeted results;
       // replay adopted notes on reopen without changing canonical history.
@@ -9897,10 +9921,27 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         journalHostGuide('response_format_repair', { modelId: formatWorkerModelId,
           promptChars: formatRepair.text.length, tools: 0 });
       }
+      if (hostProduction && !hostWriterForStep && !formatWorkerModelId) {
+        const clarification = projectClarificationPromptContext({ ...exactHostIdentity(),
+          input: modelInput.slice(0, filteredInputLength) });
+        if (clarification.status === 'refused') {
+          journalHostGuide('clarification_prompt_context_refused', { reason: clarification.reason });
+          // Approval recovery may already have settled work above. Preserve
+          // those receipts; this guard prevents only further model/tool work.
+          return blockedOutcome(
+            'The task is unfinished because I could not verify the complete clarification history for this step. Ask me to check the saved answers and completed work before continuing.',
+            'clarification_prompt_context_unavailable',
+          );
+        }
+        if (clarification.status === 'projected' && clarification.changed) {
+          modelInput = [...clarification.input, ...modelInput.slice(filteredInputLength)];
+          finalRequestReading = publishReading;
+        }
+      }
       // The reading describes the request this step sends: the composed one,
       // or the writer's or format repair's own, which carries no tools.
       const replacedBy = hostWriterForStep?.author.modelId ?? formatWorkerModelId;
-      (publishReading as PromptReadingPublisher | undefined)?.(hostWriterForStep || formatWorkerModelId
+      if (!finalRequestReading) (publishReading as PromptReadingPublisher | undefined)?.(hostWriterForStep || formatWorkerModelId
         ? { input: modelInput, ...(instructions !== undefined ? { instructions } : {}), advertisedTools: [],
           ...(replacedBy ? { model: replacedBy } : {}) }
         : undefined);
@@ -9939,6 +9980,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       } else {
         step = await runOneModelStep(
           modelInput, instructions, formatWorkerModelId ? [] : modelStepSchemas, formatWorkerModelId, undefined, answerDraft,
+          finalRequestReading,
         );
         if (formatWorkerModelId && step.toolCalls.length > 0) {
           throw new UnsupportedHostCapabilityError('response_format_repair_tool_call');
@@ -10101,7 +10143,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         continue;
       }
       return blockedOutcome(
-        HOST_MODEL_INCOMPLETE_BLOCKED_TEXT,
+        admission.reason === 'provider_content_filter'
+          ? HOST_MODEL_FILTERED_BLOCKED_TEXT
+          : HOST_MODEL_INCOMPLETE_BLOCKED_TEXT,
         admission.reason,
       );
     }

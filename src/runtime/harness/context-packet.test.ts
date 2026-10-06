@@ -1096,6 +1096,15 @@ test('packet suppresses agent-system guidance for workflow turns', () => {
   assert.doesNotMatch(packet.text, /AGENT SYSTEM GUIDANCE/);
 });
 
+test('a report quantity and prohibited browser do not inject execution guidance', () => {
+  const input = 'Prepare a synthetic batch report at /Users/nathan.reynolds/.codex/worktrees/specialist-binding-next/clementine-next/output/clarification-live/artifacts/compound-trigger-20b8bf6f/report.txt, with exactly five plain-text lines labeled Source:, RGL:, Quantity:, Timing:, and Trigger:. Before creating or changing any file, ask me to confirm source label CEDAR BATCH LOG, what RGL means and what condition triggers it, quantity 10–12 cases, and timing 2026-10-06 09:00 America/Los_Angeles. Hold file changes until every detail is settled. This report only describes RGL; do not run any batch action. This is a current task only; do not save standing memory, use the browser, send messages, change settings or modify other content.';
+  const packet = buildAgentContextPacket(input, NO_MEMORY, { sessionKind: 'chat', sessionId: 'sess-report-quantity' });
+  assert.equal(packet.multiItem.detected, false);
+  assert.equal(packet.multiItem.offered, false);
+  assert.doesNotMatch(packet.text, /Fan-out directive|Do NOT serialize|full 12-item|web\/browser intent/);
+  assert.ok(!packet.toolScope.allowedServerSlugs?.includes('browser'));
+});
+
 test('packet injects the IMPERATIVE fan-out directive for chat sessions with N>=8', () => {
   const packet = buildAgentContextPacket(
     'Research these 10 prospects and capture each firm’s SEO posture.',

@@ -32,6 +32,7 @@ import { DASHBOARD_CRON_RUNS_DIR, buildDashboardSnapshot, loadCronJobs, loadWork
 // in the dashboard's Live Runs feed 404s and the inspector shows
 // "Run not found".
 import {
+  HELD_STOP_PUBLICATION_METADATA_KEY,
   createSession as harnessCreateSession,
   countMatchingEvents as harnessCountMatchingEvents,
   getHarnessChatRequestReceipt,
@@ -2875,7 +2876,9 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
           : ((session as { title?: unknown }).title ?? '(Clementine session)') as string,
         input: currentInput || ((session as { objective?: unknown }).objective ?? '') as string,
         objective: currentInput || ((session as { objective?: unknown }).objective ?? undefined) as string | undefined,
-        metadata: (session as { metadata?: Record<string, unknown> }).metadata,
+        // Publication ownership stays private; preserve every other metadata field.
+        metadata: session.metadata && Object.fromEntries(Object.entries(session.metadata)
+          .filter(([key]) => key !== HELD_STOP_PUBLICATION_METADATA_KEY)),
         status,
         outputPreview,
         createdAt: (session as { createdAt?: unknown }).createdAt as string | undefined,

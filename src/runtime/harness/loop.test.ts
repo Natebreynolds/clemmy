@@ -88,6 +88,7 @@ const {
   recordRunAttemptUserInput,
 } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
+const { MISSING_REPLY_USER_FALLBACK, STRUCTURED_OUTPUT_RECOVERY_FALLBACK } = await import('./turn-decision.js');
 const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, recoverParkedApprovalSurfaces, _acceptResumeConversationInputForTest, finalizeDeferredToolCallsLimitTerminal, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, claimOrphanedToolCompletions, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText, _terminalQuestionTextForTest } = await import('./loop.js');
 const {
   isSafeDurableMemoryReceiptPresentation,
@@ -6197,12 +6198,12 @@ test('runConversation: exhausted empty-reply completion uses safe fallback, not 
   });
   assert.ok(['completed', 'awaiting_user_input'].includes(result.status));
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
-  assert.equal(completed.data.summary, "I didn't produce a visible reply there. Please send that again and I'll retry.");
+  assert.equal(completed.data.summary, MISSING_REPLY_USER_FALLBACK);
   assert.equal(completed.data.internalSummary, undefined, 'internal model summaries do not share the public terminal row');
   assert.equal((completed.data.turnOutcome as { status?: string }).status, 'done');
   assert.equal(completed.data.missingReply, true);
   const step = listEventsForConv(sess.id, { types: ['conversation_step'] }).at(-1)!;
-  assert.equal((step.data.decision as { summary?: string }).summary, "I didn't produce a visible reply there. Please send that again and I'll retry.");
+  assert.equal((step.data.decision as { summary?: string }).summary, MISSING_REPLY_USER_FALLBACK);
   assert.doesNotMatch(String(completed.data.summary), /marked the turn complete|Internal log|Greeted user/);
 });
 
@@ -8612,6 +8613,43 @@ test('honest-completion: RESUME path judges promise-shaped final replies before 
   assert.match(String(completed.data.blockedReason), /no records were returned/i);
 });
 
+test('typed empty stop on the first approval-resume turn retains exact control source and immutable replay', async () => {
+  resetEventLog();
+  const { PUBLIC_MODEL_EMPTY_COMPLETION_TEXT, projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const agent = new Agent({ name: 'ResumeEmptyStopTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-empty-stop' });
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+    toolName: 'composio_execute_tool', callId: 'approved-once', argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
+  }]));
+  const approval = approvalRegistry.register({ sessionId: sess.id, subject: 'one local fixture action',
+    tool: 'composio_execute_tool', args: { tool_slug: 'X', arguments: '{}' } });
+  let calls = 0;
+  const options = { agent, sessionId: sess.id, approvalId: approval.approvalId, decision: 'approve' as const,
+    resolver: 'unit-test', makeRunner: makeRunnerStub,
+    runRunner: async () => { calls += 1; throw new BoundaryError({ kind: 'model.empty_completion', retryable: true,
+      userMessage: 'PRIVATE RESUME MESSAGE', operatorMessage: 'PRIVATE_RESUME_EMPTY_DIAGNOSTIC' }); } };
+  const result = await runConversationFromResume(options);
+  const accepted = listEventsForConv(sess.id, { types: ['user_input_received'] })
+    .find(event => event.data.source === 'approval_resume')!;
+  assert.ok(accepted, 'the resumed control edge has its own exact accepted source');
+  assert.equal(calls, 1);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.publicPresentation?.text, PUBLIC_MODEL_EMPTY_COMPLETION_TEXT);
+  assert.equal(result.publicPresentation?.identity.sourceUserSeq, accepted.seq);
+  assert.equal(result.publicPresentation?.resumable, false);
+  const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(result.failureKind, 'model.empty_completion');
+  assert.equal(listEventsForConv(sess.id, { types: ['run_failed'] }).at(-1)?.data.failureKind, 'model.empty_completion');
+  assert.equal(terminal.data.failureDetail, 'PRIVATE_RESUME_EMPTY_DIAGNOSTIC');
+  assert.doesNotMatch(JSON.stringify(projectHarnessEventForPublic(terminal)), /PRIVATE|failureDetail/);
+  const replay = await runConversationFromResume({ ...options, sourceUserSeq: accepted.seq });
+  assert.deepEqual(replay.publicPresentation, result.publicPresentation);
+  assert.equal(calls, 1, 'exact source replay cannot repeat the approved dispatch');
+  assert.equal(listEventsForConv(sess.id, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(listEventsForConv(sess.id, { types: ['external_write', 'external_write_succeeded'] }).length, 0,
+    'authored failure guidance does not dispatch an effect');
+});
+
 test('resume budget exit emits the paired blocked conversation_completed (a bare limit event hangs the chat dock / Discord)', async () => {
   resetEventLog();
   const agent = new Agent({ name: 'ResumeBudgetTest', instructions: 'test' });
@@ -9880,50 +9918,68 @@ test('toOrchestratorDecision: empty / recovery-sentinel output stays null (stall
   );
 });
 
-test('runConversation: synthetic parse retry classifies against the original tool-backed ask', async () => {
-  resetEventLog();
-  // The "acme" shorthand only scopes Outlook because the user has a
-  // pinned-calendar constraint naming that label — seed it so this test
-  // proves the full data-driven chain (constraint fact → label → tool scope).
-  rememberFact({
-    kind: 'constraint',
-    content: 'For Acme calendar lookups, use Outlook connection ca_LoopTestRoute1 as the Acme calendar connection.',
-  });
-  const sess = HarnessSession.create({ kind: 'chat' });
-  const runner = scriptedRunner([
-    { finalOutput: "Clementine produced a response that couldn't be structured. Please ask again." },
-    {
-      finalOutput: {
-        summary: 'Recovered the Acme calendar check.',
-        reply: 'Recovered with Outlook calendar tools available.',
-        done: true,
-        nextAction: 'completed',
-        reason: null,
+const recoverySentinelCases = [
+  ['legacy', "Clementine produced a response that couldn't be structured. Please ask again."],
+  ['current', STRUCTURED_OUTPUT_RECOVERY_FALLBACK],
+] as const;
+
+for (const [sentinelName, sentinel] of recoverySentinelCases) {
+  test(`runConversation: synthetic parse retry classifies against the original tool-backed ask (${sentinelName})`, async () => {
+    resetEventLog();
+    // The "acme" shorthand only scopes Outlook because the user has a
+    // pinned-calendar constraint naming that label — seed it so this test
+    // proves the full data-driven chain (constraint fact → label → tool scope).
+    rememberFact({
+      kind: 'constraint',
+      content: 'For Acme calendar lookups, use Outlook connection ca_LoopTestRoute1 as the Acme calendar connection.',
+    });
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const runner = scriptedRunner([
+      { finalOutput: sentinel },
+      {
+        finalOutput: {
+          summary: 'Recovered the Acme calendar check.',
+          reply: 'Recovered with Outlook calendar tools available.',
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
       },
-    },
-  ]);
+    ]);
 
-  const result = await runConversation(withSettledWork({
-    agent: makeAgentStub(),
-    sessionId: sess.id,
-    input: 'Check my acme for tomorrow',
-    makeRunner: makeRunnerStub,
-    runRunner: runner,
-  }));
+    let modelCalls = 0;
+    const countedRunner: RunRunnerFn = async (...args) => { modelCalls += 1; return runner(...args); };
+    const result = await runConversation(withSettledWork({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Check my acme for tomorrow',
+      makeRunner: makeRunnerStub,
+      runRunner: countedRunner,
+    }));
 
-  assert.equal(result.status, 'completed');
-  const packets = listEventsForConv(sess.id, { types: ['agent_context_packet'] });
-  assert.ok(packets.length >= 2, 'expected original turn plus synthetic retry turn');
-  const retryPacket = packets[1].data as {
-    inputPreview?: string;
-    toolScope?: { allowedServerSlugs?: string[]; reason?: string };
-  };
-  assert.match(retryPacket.inputPreview ?? '', /Check my acme for tomorrow/i);
-  assert.ok(
-    (retryPacket.toolScope?.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)),
-    'retry must preserve Outlook calendar reach from the original user ask',
-  );
-});
+    assert.equal(result.status, 'completed');
+    assert.equal(modelCalls, 2, 'one bounded retry, then the scripted recovery');
+    const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+    assert.equal(retries.length, 1);
+    assert.equal(retries[0].data.signal, 'D_decision_unparsed');
+    assert.equal(retries[0].data.emptyOutput, true);
+    const accepted = listEventsForConv(sess.id, { types: ['user_input_received'] }).filter(event => event.data.synthetic !== true);
+    assert.equal(accepted.length, 1, 'synthetic recovery does not accept a replacement user request');
+    const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+    assert.equal(terminal.data.sourceUserSeq, accepted[0].seq, 'the recovered result still belongs to the original request');
+    const packets = listEventsForConv(sess.id, { types: ['agent_context_packet'] });
+    assert.ok(packets.length >= 2, 'expected original turn plus synthetic retry turn');
+    const retryPacket = packets[1].data as {
+      inputPreview?: string;
+      toolScope?: { allowedServerSlugs?: string[]; reason?: string };
+    };
+    assert.match(retryPacket.inputPreview ?? '', /Check my acme for tomorrow/i);
+    assert.ok(
+      (retryPacket.toolScope?.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)),
+      'retry must preserve Outlook calendar reach from the original user ask',
+    );
+  });
+}
 
 test('runConversation: malformed decision AFTER real tool work RETRIES instead of dying (D_decision_unparsed)', async () => {
   // Repro from a live website build+deploy: the Orchestrator did real
@@ -10021,7 +10077,7 @@ test('runConversation: sub-agent stall ("Continuing." with zero tool calls) is f
   assert.equal(completedEvents[0].data.reason, 'sub_agent_stalled');
   assert.match(
     completedEvents[0].data.summary as string,
-    /sub-agent ended its turn without taking any action/,
+    /still unfinished.*check what completed and what remains before continuing/,
   );
   assert.equal(
     (completedEvents[0].data.stallDetail as { rawOutput: string }).rawOutput,
@@ -10078,7 +10134,7 @@ test('runConversation: future-tense sub-agent stall after discovery tools is fla
   assert.equal(completedEvents[0].data.reason, 'sub_agent_stalled');
   assert.match(
     completedEvents[0].data.summary as string,
-    /announced work it was about to do but didn't actually call the tool/,
+    /still unfinished.*check what completed and what remains before continuing/,
   );
   const detail = completedEvents[0].data.stallDetail as {
     totalToolCalls: number;
@@ -12050,43 +12106,83 @@ test('runConversation: a SHORT announcement repeated across retries is still a s
 // Synthetic Casey mailbox regression: an EMPTY/unstructured turn (items:1,
 // lastResponseId:null, zero tools) dropped straight to "couldn't be structured.
 // Please ask again." with no retry. It must be re-prompted instead.
-test('runConversation: an EMPTY zero-tool turn is RETRIED, then recovers (not dropped as "couldn\'t be structured")', async () => {
-  resetEventLog();
-  const sess = HarnessSession.create({ kind: 'chat' });
-  // The empty-response sentinel runTurn synthesizes for an items:1/lastResponseId:null model turn.
-  const EMPTY_SENTINEL = "Clementine produced a response that couldn't be structured. Please ask again.";
-  let i = 0;
-  const scripted: unknown[] = [
-    EMPTY_SENTINEL, // turn 1: empty model response
-    { summary: 'Located the fixture message.', reply: 'Found it — the email from Casey arrived at 10:00am.', done: true, nextAction: 'completed', reason: null },
-  ];
-  const runRunner: RunRunnerFn = async (_r, _a, items) => {
-    settleFixtureRead(sess.id);
-    const output = scripted[i] ?? scripted[scripted.length - 1];
-    i += 1;
-    return { history: items, lastResponseId: undefined, finalOutput: output };
-  };
-  const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'find the fixture email from Casey', makeRunner: makeRunnerStub, runRunner });
-  assert.equal(result.status, 'completed');
-  const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
-  assert.ok(retries.some((e) => (e.data as { emptyOutput?: boolean }).emptyOutput === true), 'the empty turn was retried');
-  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
-  assert.match(String((completed.at(-1)!.data as { summary?: string }).summary ?? ''), /Casey/);
-  assert.ok(!completed.some((e) => (e.data as { reason?: string }).reason === 'no_structured_output'), 'did not give up with "couldn\'t be structured"');
-});
+for (const [sentinelName, sentinel] of recoverySentinelCases) {
+  test(`runConversation: an EMPTY zero-tool turn is RETRIED, then recovers (${sentinelName})`, async () => {
+    resetEventLog();
+    const sess = HarnessSession.create({ kind: 'chat' });
+    // The empty-response sentinel runTurn synthesizes for an items:1/lastResponseId:null model turn.
+    const EMPTY_SENTINEL = sentinel;
+    let i = 0;
+    const scripted: unknown[] = [
+      EMPTY_SENTINEL, // turn 1: empty model response
+      { summary: 'Located the fixture message.', reply: 'Found it — the email from Casey arrived at 10:00am.', done: true, nextAction: 'completed', reason: null },
+    ];
+    const runRunner: RunRunnerFn = async (_r, _a, items) => {
+      settleFixtureRead(sess.id);
+      const output = scripted[i] ?? scripted[scripted.length - 1];
+      i += 1;
+      return { history: items, lastResponseId: undefined, finalOutput: output };
+    };
+    const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'find the fixture email from Casey', makeRunner: makeRunnerStub, runRunner });
+    assert.equal(result.status, 'completed');
+    const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+    assert.equal(retries.length, 1, 'exactly one retry uses the existing finite allowance');
+    assert.equal(retries[0].data.emptyOutput, true);
+    assert.equal(retries[0].data.signal, 'D_decision_unparsed');
+    assert.equal(i, 2, 'one initial call and one successful recovery');
+    const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+    assert.match(String((completed.at(-1)!.data as { summary?: string }).summary ?? ''), /Casey/);
+    assert.ok(!completed.some((e) => (e.data as { reason?: string }).reason === 'no_structured_output'), 'did not give up with an unstructured reply');
+    const accepted = listEventsForConv(sess.id, { types: ['user_input_received'] }).filter(event => event.data.synthetic !== true);
+    assert.equal(accepted.length, 1);
+    assert.equal(completed.at(-1)!.data.sourceUserSeq, accepted[0].seq);
+    assert.equal(listEventsForConv(sess.id, { types: ['conversation_recovery_candidate'] }).length, 0, 'successful recovery does not leave another terminal proposal');
+  });
 
-test('runConversation: a PERSISTENTLY empty response exhausts retries then completes (bounded — no infinite loop)', async () => {
+  test(`runConversation: a PERSISTENTLY empty response exhausts retries then completes (${sentinelName}, bounded)`, async () => {
+    resetEventLog();
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const EMPTY_SENTINEL = sentinel;
+    let modelCalls = 0;
+    const runRunner: RunRunnerFn = async (_r, _a, items) => {
+      modelCalls += 1;
+      return { history: items, lastResponseId: undefined, finalOutput: EMPTY_SENTINEL };
+    };
+    const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'do the thing', makeRunner: makeRunnerStub, runRunner });
+    assert.equal(result.status, 'completed');
+    assert.equal(modelCalls, 2, 'persistent emptiness cannot reset the one-retry allowance');
+    const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+    assert.equal(retries.length, 1);
+    assert.equal(retries[0].data.signal, 'D_decision_unparsed');
+    assert.equal(retries[0].data.emptyOutput, true);
+    const candidates = listEventsForConv(sess.id, { types: ['conversation_recovery_candidate'] });
+    assert.equal(candidates.length, 1, 'one exact-source private recovery proposal after exhaustion');
+    assert.equal(candidates[0].data.reason, 'no_structured_output');
+    const accepted = listEventsForConv(sess.id, { types: ['user_input_received'] }).filter(event => event.data.synthetic !== true);
+    assert.equal(accepted.length, 1);
+    assert.equal(candidates[0].data.sourceUserSeq, accepted[0].seq);
+    assert.equal(listEventsForConv(sess.id, { types: ['conversation_completed'] }).length, 0, 'the exhausted proposal is never published as a terminal');
+    assert.ok(HarnessSession.load(sess.id)?.runInFlightSince(), 'the bridge-recoverable candidate leaves restart recovery armed');
+  });
+}
+
+test('runConversation: substantive zero-tool output does not enter structured-output recovery', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
-  const EMPTY_SENTINEL = "Clementine produced a response that couldn't be structured. Please ask again.";
-  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: EMPTY_SENTINEL });
-  const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'do the thing', makeRunner: makeRunnerStub, runRunner });
+  let modelCalls = 0;
+  const reply = 'A retry runs the failed step again; a progress check first reads what already completed.';
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    modelCalls += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: reply };
+  };
+  const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id,
+    input: 'Explain the difference between a retry and a progress check.', makeRunner: makeRunnerStub, runRunner });
   assert.equal(result.status, 'completed');
-  assert.ok(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length >= 1, 'it retried before giving up');
-  const candidates = listEventsForConv(sess.id, { types: ['conversation_recovery_candidate'] });
-  assert.ok(candidates.some((e) => (e.data as { reason?: string }).reason === 'no_structured_output'), 'the private recovery candidate stands after retries exhaust');
-  assert.equal(listEventsForConv(sess.id, { types: ['conversation_completed'] }).length, 0, 'the exhausted proposal is never published as a terminal');
-  assert.ok(HarnessSession.load(sess.id)?.runInFlightSince(), 'the bridge-recoverable candidate leaves restart recovery armed');
+  assert.equal(modelCalls, 1);
+  assert.equal(result.lastDecision?.reply, reply);
+  assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0);
+  assert.equal(listEventsForConv(sess.id, { types: ['conversation_recovery_candidate'] }).length, 0);
+  assert.equal(listEventsForConv(sess.id, { types: ['tool_called'] }).length, 0);
 });
 
 test('runConversation: a durable terminal commit failure throws and leaves restart recovery armed', async () => {
@@ -12387,53 +12483,108 @@ test('runConversation: source-claiming legacy or corrupt terminals stop before m
   }
 });
 
-test('isCodexAuthRevoked: a real revoke marker is terminal; a BARE model 401 is NOT (refresh-and-retry, no brick)', async () => {
+
+test('isCodexAuthRevoked: a real Codex revoke marker is terminal; a bare Codex model 401 is not', async () => {
   const { markCodexAuthDead, clearCodexAuthDead, isCodexAuthDead } = await import('../auth-store.js');
+  const { CodexModelError } = await import('./codex-model.js');
   clearCodexAuthDead();
-  assert.equal(isCodexAuthDead(), false, 'precondition: auth not latched dead');
+  try {
+    assert.equal(isCodexAuthDead(), false);
+    for (const message of ['Encountered invalidated oauth token for user, failing request', 'token_revoked', 'Codex /responses returned 401: invalid_grant', 'refresh_token_reused']) {
+      assert.equal(isCodexAuthRevoked(new CodexModelError(message, 401), message), true);
+    }
+    const bare = new CodexModelError('Codex /responses returned 401 Unauthorized', 401);
+    assert.equal(isCodexAuthRevoked(bare, bare.message), false, 'a bare model-call 401 is not permanent token revocation');
+    markCodexAuthDead('fixture refresh-token revocation');
+    assert.equal(isCodexAuthRevoked(bare, bare.message), true, 'the existing Codex dead latch still diagnoses a genuine Codex auth rejection');
+    const forbidden = new CodexModelError('Codex request forbidden', 403);
+    assert.equal(isCodexAuthRevoked(forbidden, forbidden.message), true);
+    clearCodexAuthDead();
+    assert.equal(isCodexAuthRevoked(new CodexModelError('Codex /responses returned 429', 429), 'Codex /responses returned 429'), false);
+    assert.equal(isCodexAuthRevoked(new Error('scripted_throw'), 'scripted_throw'), false);
+    assert.equal(isCodexAuthRevoked(null, 'some tool failed'), false);
+  } finally { clearCodexAuthDead(); }
+});
 
-  // Real revoke markers ARE terminal (these genuinely mean re-login).
-  assert.equal(isCodexAuthRevoked(new Error('Encountered invalidated oauth token for user, failing request'), 'Encountered invalidated oauth token for user, failing request'), true);
-  assert.equal(isCodexAuthRevoked({}, 'token_revoked'), true);
-  assert.equal(isCodexAuthRevoked({ status: 401 }, 'Codex /responses returned 401: invalid_grant'), true, 'a 401 carrying a revoke marker is terminal');
-
-  // THE FIX: a marker-less model 401 (access-token expiry / edge reject) must
-  // NOT be classified as a revoke — streamCodex already force-refreshed+retried
-  // it, so latching DEAD here is the bug that bricked users on a transient blip.
-  assert.equal(isCodexAuthRevoked({ status: 401 }, 'Codex /responses returned 401 Unauthorized'), false, 'a bare 401 no longer bricks auth');
-
-  // …unless auth is genuinely DEAD (the refresh token itself was rejected, which
-  // latches DEAD inside refreshStoredNativeOAuth) — then even a bare 401 is terminal.
-  markCodexAuthDead('refresh token revoked');
-  assert.equal(isCodexAuthRevoked({ status: 401 }, 'Codex /responses returned 401 Unauthorized'), true, 'once DEAD-latched, surface re-auth');
-
-  // 2026-07-07 regression: the DEAD latch is a fact about CODEX auth, not a
-  // verdict on every error. While latched, a DIFFERENT brain's unrelated
-  // failure must NOT be rebranded as "Codex sign-in expired" (observed live:
-  // a GLM/Together run hard-failed with the Codex re-auth message while the
-  // real error was a Together credit-limit 402 — terminal + cause masked).
-  assert.equal(
-    isCodexAuthRevoked({ status: 402 }, '402 Credit limit exceeded, please add credits'),
-    false,
-    'latched + non-auth-shaped (BYO 402) stays recoverable',
-  );
-  assert.equal(
-    isCodexAuthRevoked(new Error('model backend timeout'), 'model backend timeout'),
-    false,
-    'latched + generic model error stays recoverable',
-  );
-  // …while codex-lane / auth-shaped errors still hit the latch.
-  assert.equal(
-    isCodexAuthRevoked({ status: 403 }, 'forbidden'),
-    true,
-    'latched + auth-shaped (403) surfaces re-auth',
-  );
+test('CODEX-ORIGIN foreign auth prose, status and class-name spoof cannot borrow the Codex dead latch', async () => {
+  const { markCodexAuthDead, clearCodexAuthDead } = await import('../auth-store.js');
+  const { CodexModelError } = await import('./codex-model.js');
   clearCodexAuthDead();
+  markCodexAuthDead('fixture real Codex refresh-token rejection');
+  try {
+    const foreign = [
+      Object.assign(new Error('Foreign backend invalid_grant'), { status: 401 }),
+      Object.assign(new Error('Foreign backend forbidden'), { status: 403 }),
+      new Error('token_revoked invalid_grant refresh_token_reused OAuth Codex'),
+      Object.assign(new Error('token_revoked'), { name: 'CodexModelError', status: 401 }),
+      { name: 'CodexModelError', message: 'token_revoked', status: 401 },
+      new BoundaryError({ kind: 'model.auth_expired', retryable: false, userMessage: 'Foreign account rejected.', operatorMessage: 'Foreign backend invalid_grant' }),
+    ];
+    for (const error of foreign) assert.equal(isCodexAuthRevoked(error, normalizeError(error)), false, 'untrusted error spelling/status carries no Codex origin');
+    for (const status of [402,429,503]) {
+      const error = new CodexModelError(`Codex OAuth-backed request returned ${status}`, status);
+      assert.equal(isCodexAuthRevoked(error, error.message), false, 'even real Codex non-auth errors cannot inherit auth revocation from its dead latch');
+    }
+    const typed = new BoundaryError({ kind: 'codex.auth_expired', retryable: false, userMessage: 'Known Codex auth failure.', operatorMessage: 'Typed origin without prose markers' });
+    assert.equal(isCodexAuthRevoked(typed, typed.message), true, 'the host-typed Codex auth boundary is positive origin');
+  } finally { clearCodexAuthDead(); }
+});
 
-  // Not auth: a 429 rate limit or a generic failure must NOT be misclassified.
-  assert.equal(isCodexAuthRevoked({ status: 429 }, 'Codex /responses returned 429'), false);
-  assert.equal(isCodexAuthRevoked(new Error('scripted_throw'), 'scripted_throw'), false);
-  assert.equal(isCodexAuthRevoked(null, 'some tool failed'), false);
+test('CODEX-ORIGIN foreign invalid_grant never latches or notifies Codex at the production catch', async () => {
+  resetEventLog();
+  const { clearCodexAuthDead, isCodexAuthDead } = await import('../auth-store.js');
+  const { getNotification } = await import('../notifications.js');
+  clearCodexAuthDead();
+  try {
+    const before = getNotification('codex-auth-revoked');
+    const session = HarnessSession.create({ kind: 'chat' });
+    const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Current local request.' } });
+    let calls = 0;
+    const result = await runTurn({ agent: makeAgentStub(), sessionId: session.id, sourceUserSeq: source.seq,
+      input: 'Current local request.', makeRunner: makeRunnerStub, runRunner: async () => {
+        calls += 1;
+        throw Object.assign(new Error('Foreign backend invalid_grant PRIVATE_PROVIDER_DETAIL'), { status: 401 });
+      } });
+    assert.equal(calls, 1);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.failureKind, undefined);
+    assert.equal(isCodexAuthDead(), false, 'a foreign failure cannot poison Codex authentication');
+    assert.deepEqual(getNotification('codex-auth-revoked'), before, 'the foreign failure emits no Codex reconnect notification');
+    assert.equal(listEvents(session.id, { types: ['run_failed'] }).at(-1)?.data.reason, undefined);
+    assert.equal(listEvents(session.id, { types: ['tool_called', 'external_write'] }).length, 0);
+  } finally { clearCodexAuthDead(); }
+});
+
+
+test('CODEX-ORIGIN genuine Codex rejection retains public reconnect guidance and exact-source replay', async () => {
+  resetEventLog();
+  const { clearCodexAuthDead, isCodexAuthDead } = await import('../auth-store.js');
+  const { getNotification } = await import('../notifications.js');
+  const { CodexModelError } = await import('./codex-model.js');
+  const { PUBLIC_CODEX_AUTH_EXPIRED_TEXT, projectHarnessEventForPublic } = await import('./public-presentation.js');
+  clearCodexAuthDead();
+  try {
+    const session = HarnessSession.create({ kind: 'chat' });
+    const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Please answer.' } });
+    let calls = 0;
+    const options = { agent: makeAgentStub(), sessionId: session.id, sourceUserSeq: source.seq, reuseRecordedUserInput: true,
+      input: 'Please answer.', judgeCompletion: false, makeRunner: makeRunnerStub, runRunner: async () => {
+        calls += 1;
+        throw new CodexModelError('Codex /responses returned 401: token_revoked PRIVATE_PROVIDER_DETAIL', 401);
+      } };
+    const result = await runConversation(options);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.failureKind, 'codex.auth_expired');
+    assert.equal(result.publicPresentation?.identity.sourceUserSeq, source.seq);
+    assert.equal(result.publicPresentation?.text, PUBLIC_CODEX_AUTH_EXPIRED_TEXT);
+    assert.equal(isCodexAuthDead(), true);
+    assert.equal(getNotification('codex-auth-revoked')?.body, PUBLIC_CODEX_AUTH_EXPIRED_TEXT);
+    assert.deepEqual((await runConversation(options)).publicPresentation, result.publicPresentation);
+    assert.equal(calls, 1, 'reconnect guidance must not retry the failed source');
+    const terminal = listEvents(session.id, { types: ['conversation_completed'] }).at(-1)!;
+    assert.doesNotMatch(JSON.stringify(projectHarnessEventForPublic(terminal)), /PRIVATE_PROVIDER_DETAIL|token_revoked|login-native/);
+    assert.equal(listEvents(session.id, { types: ['tool_called', 'external_write'] }).length, 0);
+  } finally { clearCodexAuthDead(); }
 });
 
 // ─── 2026-06-12: async workflow dispatch is a complete deliverable ───────────
@@ -14093,20 +14244,219 @@ const RECOVERY_SUMMARY_REPLY =
 // CHRONOLOGICAL order, so a .find() over it picks the OLDEST matching ask.
 // Live 2026-08-09: a byte-identical 18-minute-old clarifying question was
 // re-delivered as the terminal; the user re-answered and poisoned the run.
+
+// STOP-Q-SOURCE: a physical turn number is not an accepted-request identity.
+test('STOP-Q-SOURCE canonical terminal ignores a foreign same-turn ask and preserves exact-source replay', async () => {
+  resetEventLog();
+  const { _testOnly_reduceStandardConversationTerminal: reduce } = await import('./loop.js');
+  const session = HarnessSession.create({ kind: 'chat' });
+  const first = appendEvent({ sessionId: session.id, turn: 3, role: 'user', type: 'user_input_received', data: { text: 'First request.' } });
+  const second = appendEvent({ sessionId: session.id, turn: 3, role: 'user', type: 'user_input_received', data: { text: 'Second request.' } });
+  appendEvent({ sessionId: session.id, turn: 3, role: 'Clem', type: 'awaiting_user_input', data: { sourceUserSeq: second.seq, question: 'Which output format for the second request?' } });
+  appendEvent({ sessionId: session.id, turn: 3, role: 'Clem', type: 'awaiting_user_input', data: { sourceUserSeq: first.seq, question: 'PRIVATE_FOREIGN: Which account for the first request?' } });
+  const effect = appendEvent({ sessionId: session.id, turn: 3, role: 'system', type: 'external_write_succeeded', data: { sourceUserSeq: second.seq, callId: 'settled-once', shapeKey: 'LOCAL_SAVE' } });
+  const input = { sourceUserSeq: second.seq, result: { sessionId: session.id, status: 'awaiting_user_input' as const, steps: 1, lastTurn: 3 } };
+  const result = reduce(input);
+  assert.equal(result.publicPresentation?.text, 'Which output format for the second request?');
+  assert.equal(result.publicPresentation?.identity.sourceUserSeq, second.seq);
+  assert.deepEqual(reduce({ ...input, result }).publicPresentation, result.publicPresentation);
+  assert.deepEqual(listEvents(session.id, { types: ['external_write_succeeded'] }), [effect]);
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(listEvents(session.id, { types: ['tool_called'] }).length, 0);
+});
+
+test('STOP-Q-SOURCE canonical approval target and count exclude foreign cards and unbound hints', async () => {
+  resetEventLog();
+  const { _testOnly_reduceStandardConversationTerminal: reduce } = await import('./loop.js');
+  const session = HarnessSession.create({ kind: 'chat' });
+  const first = appendEvent({ sessionId: session.id, turn: 3, role: 'user', type: 'user_input_received', data: { text: 'First request.' } });
+  const second = appendEvent({ sessionId: session.id, turn: 3, role: 'user', type: 'user_input_received', data: { text: 'Second request.' } });
+  const cards = ['second-one', 'second-two', 'FOREIGN-CARD'].map(subject => approvalRegistry.register({ sessionId: session.id, subject, tool: 'local_fixture', args: { subject } }));
+  cards.forEach((card,index) => appendEvent({ sessionId: session.id, turn: 3, role: 'Clem', type: 'approval_requested', data: { approvalId: card.approvalId, sourceUserSeq: index === 2 ? first.seq : second.seq } }));
+  const result = reduce({ sourceUserSeq: second.seq, approvalIdHint: cards[2]!.approvalId, result: { sessionId: session.id, status: 'awaiting_approval', steps: 1, lastTurn: 3 } });
+  assert.equal(result.publicPresentation?.needs?.kind, 'approval');
+  assert.equal(result.publicPresentation?.approvalId, cards[1]!.approvalId);
+  assert.match(result.publicPresentation?.text ?? '', /^2 approvals are waiting/);
+  assert.doesNotMatch(result.publicPresentation?.text ?? '', /FOREIGN-CARD|3 approvals/);
+  assert.equal(approvalRegistry.get(cards[2]!.approvalId)?.status, 'pending', 'selection never resolves or executes another request');
+  assert.equal(listEvents(session.id, { types: ['tool_called', 'approval_resolved', 'external_write'] }).length, 0);
+});
+
+test('STOP-Q-SOURCE canonical terminal fails closed for legacy unbound asks and cards', async () => {
+  resetEventLog();
+  const { _testOnly_reduceStandardConversationTerminal: reduce } = await import('./loop.js');
+  const session = HarnessSession.create({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 3, role: 'user', type: 'user_input_received', data: { text: 'Current request.' } });
+  const card = approvalRegistry.register({ sessionId: session.id, subject: 'UNBOUND-LEGACY', tool: 'local_fixture', args: {} });
+  appendEvent({ sessionId: session.id, turn: 3, role: 'Clem', type: 'approval_requested', data: { approvalId: card.approvalId } });
+  appendEvent({ sessionId: session.id, turn: 3, role: 'Clem', type: 'awaiting_user_input', data: { question: 'UNBOUND-LEGACY: approve the old effect?' } });
+  const result = reduce({ sourceUserSeq: source.seq, approvalIdHint: card.approvalId, result: { sessionId: session.id, status: 'awaiting_approval', steps: 1, lastTurn: 3,
+    lastDecision: { summary: 'UNBOUND-LEGACY needs approval.', reply: `Approve or reject UNBOUND-LEGACY card ${card.approvalId} here.`, done: false, nextAction: 'awaiting_approval' } } });
+  assert.notEqual(result.publicPresentation?.needs?.kind, 'approval');
+  assert.equal(result.publicPresentation?.approvalId, undefined);
+  assert.match(result.publicPresentation?.text ?? '', /could not find a valid approval for this exact request.*still unfinished.*Ask me to check the required approval and any completed work before continuing/);
+  assert.doesNotMatch(result.publicPresentation?.text ?? '', new RegExp(`UNBOUND-LEGACY|approve or reject|${card.approvalId}`, 'i'));
+  assert.equal(approvalRegistry.get(card.approvalId)?.status, 'pending');
+  assert.equal(listEvents(session.id, { types: ['approval_resolved', 'tool_called'] }).length, 0);
+});
+
+
+
+test('STOP-Q-SOURCE verified approval lineage retains pending siblings, not the answered card or an old ask', async () => {
+  resetEventLog();
+  const { _testOnly_reduceStandardConversationTerminal: reduce, terminalQuestionEventForAcceptedSource: questionForSource } = await import('./loop.js');
+  const session = HarnessSession.create({ kind: 'chat' });
+  const request = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Original request.' } });
+  const selected = approvalRegistry.register({ sessionId: session.id, subject: 'Answered action', tool: 'local_fixture', args: { effect: 'answered' } });
+  const sibling = approvalRegistry.register({ sessionId: session.id, subject: 'Pending sibling', tool: 'local_fixture', args: { effect: 'sibling' } });
+  for (const card of [selected,sibling]) appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'approval_requested', data: { sourceUserSeq: request.seq, approvalId: card.approvalId } });
+  appendEvent({ sessionId: session.id, turn: 2, role: 'Clem', type: 'awaiting_user_input', data: { sourceUserSeq: request.seq, question: 'STALE answered question?' } });
+  assert.equal(approvalRegistry.resolve(selected.approvalId, 'approved', 'unit-test').ok, true);
+  const control = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Approve answered action.', synthetic: true, source: 'approval_resume', approvalId: selected.approvalId, decision: 'approve' } });
+  appendEvent({ sessionId: session.id, turn: 2, role: 'system', type: 'run_resumed', data: { reviewContinuationVersion: 1, executionSourceUserSeq: request.seq, deliverySourceUserSeq: control.seq, approvalId: selected.approvalId, decision: 'approve' } });
+  assert.equal(questionForSource({ sessionId: session.id, sourceUserSeq: control.seq, turn: 2 }), null, 'answering a card cannot resurrect the pre-answer question');
+  const fresh = appendEvent({ sessionId: session.id, turn: 2, role: 'Clem', type: 'awaiting_user_input', data: { sourceUserSeq: request.seq, question: 'Which format for the remaining work?' } });
+  assert.equal(questionForSource({ sessionId: session.id, sourceUserSeq: control.seq, turn: 2 })?.id, fresh.id);
+  const result = reduce({ sourceUserSeq: control.seq, approvalIdHint: selected.approvalId, result: { sessionId: session.id, status: 'awaiting_approval', steps: 1, lastTurn: 2 } });
+  assert.equal(result.publicPresentation?.approvalId, sibling.approvalId, 'the validated continuation can still display its pending sibling from turn 1');
+  assert.equal(result.publicPresentation?.identity.sourceUserSeq, control.seq);
+  assert.equal(approvalRegistry.get(selected.approvalId)?.resolution, 'approved');
+  assert.equal(approvalRegistry.get(sibling.approvalId)?.status, 'pending');
+  assert.equal(listEvents(session.id, { types: ['tool_called', 'external_write'] }).length, 0, 'display lineage grants no dispatch');
+});
+
+test('STOP-Q-SOURCE mismatched approval control cannot borrow the original request display evidence', async () => {
+  resetEventLog();
+  const { terminalQuestionEventForAcceptedSource: questionForSource, pendingApprovalsForAcceptedSource: approvalsForSource } = await import('./loop.js');
+  const session = HarnessSession.create({ kind: 'chat' });
+  const request = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Original request.' } });
+  const card = approvalRegistry.register({ sessionId: session.id, subject: 'Original pending', tool: 'local_fixture', args: {} });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'approval_requested', data: { sourceUserSeq: request.seq, approvalId: card.approvalId } });
+  const control = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { synthetic: true, source: 'approval_resume', approvalId: 'wrong-card', decision: 'approve' } });
+  appendEvent({ sessionId: session.id, turn: 2, role: 'system', type: 'run_resumed', data: { reviewContinuationVersion: 1, executionSourceUserSeq: request.seq, deliverySourceUserSeq: control.seq, approvalId: card.approvalId, decision: 'approve' } });
+  appendEvent({ sessionId: session.id, turn: 2, role: 'Clem', type: 'awaiting_user_input', data: { sourceUserSeq: request.seq, question: 'PRIVATE original request question?' } });
+  assert.equal(questionForSource({ sessionId: session.id, sourceUserSeq: control.seq, turn: 2 }), null);
+  assert.deepEqual(approvalsForSource({ sessionId: session.id, sourceUserSeq: control.seq, turn: 2, approvalIdHint: card.approvalId }), []);
+  assert.equal(approvalRegistry.get(card.approvalId)?.status, 'pending');
+});
+
+
+
+test('STOP-Q-SOURCE fresh interruption binds its approval carrier to the known accepted source', async () => {
+  resetEventLog();
+  const { pendingApprovalsForAcceptedSource: approvalsForSource } = await import('./loop.js');
+  const session = HarnessSession.create({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Local fixture action.' } });
+  const unrelated = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Newer unrelated request.' } });
+  const result = await runTurn({ agent: makeAgentStub(), sessionId: session.id, sourceUserSeq: source.seq, input: 'Local fixture action.',
+    makeRunner: makeRunnerStub, runRunner: async () => ({ history: [], hasInterruptions: true,
+      serializedState: '{"$schema":1,"items":[]}', interruptions: [{ toolName: 'request_approval', rawArgs: '{"subject":"Local exact action"}', args: { subject: 'Local exact action' } }] }) });
+  assert.equal(result.status, 'awaiting_approval');
+  const event = listEvents(session.id, { types: ['approval_requested'] }).at(-1)!;
+  assert.equal(event.data.sourceUserSeq, source.seq, 'never use the session newest input as the known run source');
+  assert.equal(approvalsForSource({ sessionId: session.id, sourceUserSeq: source.seq, turn: result.turn })[0]?.approvalId, event.data.approvalId);
+  assert.deepEqual(approvalsForSource({ sessionId: session.id, sourceUserSeq: unrelated.seq, turn: result.turn }), []);
+  assert.equal(listEvents(session.id, { types: ['approval_resolved', 'external_write'] }).length, 0);
+});
+
+test('STOP-Q-SOURCE validated approval recovery checkpoint preserves display lineage before resumed marker', async () => {
+  resetEventLog();
+  const { pendingApprovalsForAcceptedSource: approvalsForSource } = await import('./loop.js');
+  const session = HarnessSession.create({ kind: 'chat' });
+  const request = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Original request.' } });
+  const answered = approvalRegistry.register({ sessionId: session.id, subject: 'Answered action', tool: 'local_fixture', args: { effect: 'answered' } });
+  const sibling = approvalRegistry.register({ sessionId: session.id, subject: 'Pending sibling', tool: 'local_fixture', args: { effect: 'sibling' } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'approval_requested', data: { sourceUserSeq: request.seq, approvalId: sibling.approvalId } });
+  assert.equal(approvalRegistry.resolve(answered.approvalId, 'approved', 'unit-test').ok, true);
+  const control = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { synthetic: true, source: 'approval_resume', approvalId: answered.approvalId, decision: 'approve' } });
+  assert.deepEqual(approvalsForSource({ sessionId: session.id, sourceUserSeq: control.seq, turn: 2 }), [], 'an accepted control alone is not original-source evidence');
+  const saved = session.saveRecoveryState(JSON.stringify({ __clemHostRecovery: 1, sessionId: session.id, sourceUserSeq: request.seq }), {
+    owner: { sourceUserSeq: control.seq, approvalContinuation: { requestSourceUserSeq: request.seq, approvalId: answered.approvalId, decision: 'approve' } },
+  });
+  assert.equal(saved.installed, true);
+  assert.equal(approvalsForSource({ sessionId: session.id, sourceUserSeq: control.seq, turn: 2 })[0]?.approvalId, sibling.approvalId);
+  assert.equal(approvalRegistry.get(answered.approvalId)?.resolution, 'approved');
+  assert.equal(listEvents(session.id, { types: ['run_resumed', 'tool_called', 'external_write'] }).length, 0);
+});
+
+
+
+test('STOP-Q-CONSENT canonical conversational consent keeps its frozen question and hides formal approval authority', async () => {
+  resetEventLog();
+  const { _testOnly_reduceStandardConversationTerminal: reduce } = await import('./loop.js');
+  const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const session = HarnessSession.create({ kind: 'chat', channel: 'discord', userId: 'fixture-consent-user', metadata: { channelId: 'fixture-consent-channel', userId: 'fixture-consent-user' } });
+  const originReplyTarget = { type: 'discord_channel' as const, channelId: 'fixture-consent-channel' };
+  const request = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Prepare the reviewed local fixture.', originReplyTarget, originReplyTargetDigest: exactOriginDeliveryTargetDigest(originReplyTarget) } });
+  const question = 'The reviewed local fixture is ready. May I save this exact version?';
+  const card = approvalRegistry.register({ sessionId: session.id, channel: 'discord', channelId: 'fixture-consent-channel', subject: 'Save reviewed local fixture', tool: 'local_fixture', args: { effect: 'fixture-save' },
+    presentation: { version: 1, kind: 'autonomous_send_consent', question, actionLabel: 'file', target: 'fixture-local-output', subject: 'Reviewed local fixture', bodyPreview: 'Exact local fixture.', resultUrl: null,
+      sourceUserSeq: request.seq, originReplyTarget, originReplyTargetDigest: exactOriginDeliveryTargetDigest(originReplyTarget), conversationKey: 'discord:fixture-consent-channel', audienceUserId: 'fixture-consent-user' } });
+  assert.equal(approvalRegistry.isFormalApprovalSurface(card), false);
+  const carrier = appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'approval_requested', data: { sourceUserSeq: request.seq, approvalId: card.approvalId, approvalPresentation: 'conversation', question } });
+  assert.ok(approvalRegistry.bindConversationalApprovalPrompt({ approvalId: card.approvalId, promptEventId: carrier.id, promptEventSeq: carrier.seq }));
+  const foreign = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Unrelated newer request.' } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: { sourceUserSeq: foreign.seq, question: 'PRIVATE_FOREIGN choose another account?' } });
+  const result = reduce({ sourceUserSeq: request.seq, result: { sessionId: session.id, status: 'awaiting_approval', steps: 1, lastTurn: 1,
+    lastDecision: { summary: 'Pending.', reply: `Use formal card ${card.approvalId}.`, done: false, nextAction: 'awaiting_approval' } } });
+  assert.equal(result.publicPresentation?.kind, 'question');
+  assert.equal(result.publicPresentation?.needs?.kind, 'input');
+  assert.equal(result.publicPresentation?.text, question);
+  assert.equal(result.publicPresentation?.approvalId, undefined);
+  assert.equal(result.publicPresentation?.identity.sourceUserSeq, request.seq);
+  const terminal = listEvents(session.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.doesNotMatch(JSON.stringify(projectHarnessEventForPublic(terminal)), new RegExp(`${card.approvalId}|PRIVATE_FOREIGN|Use formal card`));
+  assert.equal(approvalRegistry.get(card.approvalId)?.status, 'pending');
+  assert.equal(listEvents(session.id, { types: ['approval_resolved', 'tool_called', 'external_write'] }).length, 0, 'a question confers no decision or effect authority');
+});
+
+test('STOP-Q-PRODUCER infrastructure and tool-timeout asks retain known source and reason despite a newer foreign input', async () => {
+  const { ToolTimeout } = await import('./brackets.js');
+  const { _testOnly_reduceStandardConversationTerminal: reduce } = await import('./loop.js');
+    for (const kind of ['infrastructure', 'tool-timeout'] as const) {
+      resetEventLog();
+      const session = HarnessSession.create({ kind: 'chat' });
+      const request = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Current request.' } });
+      const foreign = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Newer unrelated request.' } });
+      // Reach the attended ask after its existing one quiet retry; this test
+      // binds presentation only and never changes production retry policy.
+      appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'infra_auto_recover', data: { sourceUserSeq: request.seq, logicalErrorEpisodeId: `fixture-${kind}`, attempt: 1, max: 1 } });
+      let calls = 0;
+      const result = await runTurn({ agent: makeAgentStub(), sessionId: session.id, sourceUserSeq: request.seq, input: 'Current request.', makeRunner: makeRunnerStub,
+        runRunner: async () => { calls += 1;
+          if (kind === 'tool-timeout') throw new ToolTimeout('local_fixture_read', 1234);
+          throw new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: 'The model connection timed out.', operatorMessage: 'PRIVATE_TRANSPORT_DETAIL' });
+        } });
+      assert.equal(calls, 1, 'source binding never adds a model attempt or changes retry policy');
+      assert.equal(result.status, 'awaiting_user_input');
+      const ask = listEvents(session.id, { types: ['awaiting_user_input'] }).at(-1)!;
+      assert.equal(ask.data.sourceUserSeq, request.seq, 'the new ask carries the already-known request identity, not the newest input');
+      appendEvent({ sessionId: session.id, turn: result.turn, role: 'Clem', type: 'awaiting_user_input', data: { sourceUserSeq: foreign.seq, question: 'PRIVATE_FOREIGN which account?' } });
+      const terminal = reduce({ sourceUserSeq: request.seq, result: { sessionId: session.id, status: 'awaiting_user_input', steps: 1, lastTurn: result.turn } });
+      assert.equal(terminal.publicPresentation?.text, ask.data.question);
+      assert.match(terminal.publicPresentation?.text ?? '', kind === 'tool-timeout' ? /local_fixture_read.*timed out after 1234ms/ : /model connection timed out/);
+      assert.doesNotMatch(terminal.publicPresentation?.text ?? '', /PRIVATE_FOREIGN|PRIVATE_TRANSPORT_DETAIL/);
+      assert.equal(terminal.publicPresentation?.identity.sourceUserSeq, request.seq);
+      assert.equal(listEvents(session.id, { types: ['tool_called', 'external_write'] }).length, 0);
+    }
+});
+
 test('terminalQuestionText picks the NEWEST awaiting ask for the turn, never a stale replay', () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
+  const source = appendEvent({ sessionId: sess.id, turn: 3, role: 'user', type: 'user_input_received', data: { text: 'Current request.' } });
   appendEvent({
     sessionId: sess.id, turn: 3, role: 'Clem', type: 'awaiting_user_input',
-    data: { question: 'Which keyword should I use: alpha or beta?' },
+    data: { sourceUserSeq: source.seq, question: 'Which keyword should I use: alpha or beta?' },
   });
   appendEvent({
     sessionId: sess.id, turn: 3, role: 'Clem', type: 'awaiting_user_input',
-    data: { question: 'One more thing before I dispatch: which sheet tab?' },
+    data: { sourceUserSeq: source.seq, question: 'One more thing before I dispatch: which sheet tab?' },
   });
   const text = _terminalQuestionTextForTest({
     sessionId: sess.id, status: 'awaiting_user_input', steps: 1, lastTurn: 3,
-  } as never);
+  } as never, source.seq);
   assert.match(text, /which sheet tab/i);
   assert.doesNotMatch(text, /alpha or beta/i);
 });

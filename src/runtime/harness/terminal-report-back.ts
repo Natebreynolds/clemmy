@@ -547,15 +547,31 @@ function markPendingReportsSeen(sessionId: string, seenAtMs: number): void {
 }
 
 type Timer = ReturnType<typeof setTimeout>;
-const armed = new Map<string, Timer>();
+interface ArmedTerminalReport {
+  timer: Timer | null;
+  allowance: ReportRetryAllowance;
+}
+interface ReportRetryAllowance {
+  attemptsUsed: number;
+  nextAttemptAtMs: number | null;
+}
+// Delivery-only retries: bounded work for a transient notification/outbox write
+// failure, never another conversation attempt. Exhaustion leaves the durable
+// row for a fresh process's startup reconciliation. Timer ownership ends with a
+// watcher, but allowance belongs to the validated durable source for this whole
+// process, so stop/start or duplicate terminals cannot renew it or skip backoff.
+const REPORT_BACK_RETRY_DELAYS_MS = [1_000, 5_000, 15_000] as const;
+const armed = new Map<string, ArmedTerminalReport>();
+const retryAllowances = new Map<string, ReportRetryAllowance>();
 
-function processPendingTerminalReport(id: string): void {
+/** True means acknowledged; false retains ownership of the same durable row. */
+function processPendingTerminalReport(id: string): boolean {
   const pending = loadPendingTerminalReports().find((item) => item.id === id);
-  if (!pending) return;
+  if (!pending) return true;
   try {
     if (getNotification(notificationIdForPending(pending))) {
       removePendingTerminalReport(id);
-      return;
+      return true;
     }
     const seenByViewer = pending.seenAtMs !== undefined
       || sessionViewerSeenSince(pending.sessionId, pending.terminatedAtMs);
@@ -571,7 +587,7 @@ function processPendingTerminalReport(id: string): void {
     });
     if (!facts || !decideTerminalReportBack(facts).deliver) {
       removePendingTerminalReport(id);
-      return;
+      return true;
     }
     emitTerminalReportBack(
       facts,
@@ -582,20 +598,52 @@ function processPendingTerminalReport(id: string): void {
     // Notification first, then outbox acknowledgement. A crash between these
     // writes replays the stable notification id and cannot duplicate delivery.
     removePendingTerminalReport(id);
+    return true;
   } catch {
-    // Keep the durable row. Watcher startup will reconcile it after restart.
+    // Keep the durable row and its bounded in-process retry owner. Startup
+    // reconciliation still owns recovery if retries exhaust or the app exits.
+    return false;
   }
 }
 
 function armPendingTerminalReport(pending: PendingTerminalReport, now: () => number): void {
   if (armed.has(pending.id)) return;
-  const delay = Math.max(0, Math.min(2_147_483_647, pending.dueAtMs - now()));
-  const timer = setTimeout(() => {
-    armed.delete(pending.id);
-    processPendingTerminalReport(pending.id);
-  }, delay);
-  timer.unref?.();
-  armed.set(pending.id, timer);
+  const allowance = retryAllowances.get(pending.id)
+    ?? { attemptsUsed: 0, nextAttemptAtMs: pending.dueAtMs };
+  retryAllowances.set(pending.id, allowance);
+  const owner: ArmedTerminalReport = { timer: null, allowance };
+  const schedule = (delay: number): void => {
+    const timer = setTimeout(() => {
+      if (armed.get(pending.id) !== owner) return;
+      owner.timer = null;
+      // Charge the attempt and retain its next deadline before notification
+      // subscribers can synchronously stop/start the watcher during emission.
+      const retryDelay = REPORT_BACK_RETRY_DELAYS_MS[allowance.attemptsUsed++];
+      allowance.nextAttemptAtMs = retryDelay === undefined ? null : now() + retryDelay;
+      const acknowledged = processPendingTerminalReport(pending.id);
+      if (acknowledged) {
+        if (retryAllowances.get(pending.id) === allowance) {
+          retryAllowances.delete(pending.id);
+          const current = armed.get(pending.id);
+          // A replacement watching this same acknowledged row has no work
+          // left. Never cancel an owner bound to a different allowance.
+          if (current?.allowance === allowance) {
+            if (current.timer !== null) clearTimeout(current.timer);
+            armed.delete(pending.id);
+          }
+        }
+        return;
+      }
+      if (armed.get(pending.id) !== owner) return;
+      if (allowance.nextAttemptAtMs !== null) schedule(Math.max(0, allowance.nextAttemptAtMs - now()));
+    }, delay);
+    timer.unref?.();
+    owner.timer = timer;
+  };
+  armed.set(pending.id, owner);
+  if (allowance.nextAttemptAtMs !== null) {
+    schedule(Math.max(0, Math.min(2_147_483_647, allowance.nextAttemptAtMs - now())));
+  }
 }
 
 function decodeOwnedPresentation(event: EventRow): PresentationEvent | null {
@@ -612,6 +660,7 @@ function decodeOwnedPresentation(event: EventRow): PresentationEvent | null {
 /** Test-only reset for the file-backed outbox. Watchers must be stopped first. */
 export function resetTerminalReportBackOutboxForTest(): void {
   try { unlinkSync(REPORT_BACK_OUTBOX_FILE); } catch { /* absent is already reset */ }
+  retryAllowances.clear();
 }
 
 /**
@@ -681,7 +730,9 @@ export function startTerminalReportBackWatcher(options: {
     if (pending) armPendingTerminalReport(pending, now);
   });
   return () => {
-    for (const timer of armed.values()) clearTimeout(timer);
+    for (const owner of armed.values()) {
+      if (owner.timer !== null) clearTimeout(owner.timer);
+    }
     armed.clear();
     unsubscribe();
     unsubscribeViewers();

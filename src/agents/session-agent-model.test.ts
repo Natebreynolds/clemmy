@@ -20,7 +20,7 @@ writeFileSync(path.join(HOME, 'state', 'machine-id'), 'session-agent-model\n');
 const { createAgentRecord } = await import('./agent-record.js');
 const { setSessionAgent } = await import('./session-agent.js');
 const { createSession } = await import('../runtime/harness/eventlog.js');
-const { sessionAgentAnsweringModel, recordBrainChosenForSession, nextAnsweringAgentModel } = await import('./session-agent-model.js');
+const { sessionAgentAnsweringModel, sessionAgentExecutionModel, savedAgentModelExecutionLive, recordBrainChosenForSession, nextAnsweringAgentModel } = await import('./session-agent-model.js');
 
 after(() => { rmSync(HOME, { recursive: true, force: true }); });
 
@@ -50,7 +50,7 @@ test('switching to an agent pinned to a model answers on that model; the owner\'
   assert.equal(sessionAgentAnsweringModel(session.id, live)?.modelId, 'claude-opus-5-5');
 });
 
-test('a pinned model that is not signed in, or an agent with no model, answers on the owner\'s model', () => {
+test('a pinned model that is not signed in leaves a stable preview, while an unpinned agent has no model override', () => {
   const pinned = createAgentRecord({ name: 'Model Test Signed Out', handles: 'x', model: 'claude-opus-5-5' });
   const unpinned = createAgentRecord({ name: 'Model Test Unpinned', handles: 'x' });
   assert.ok(pinned.ok && unpinned.ok);
@@ -61,6 +61,61 @@ test('a pinned model that is not signed in, or an agent with no model, answers o
   const b = createSession({ id: 'sess-agent-model-3', kind: 'chat', channel: 'desktop', title: 't' });
   setSessionAgent(b.id, unpinned.agent.id, { by: 'owner' });
   assert.equal(sessionAgentAnsweringModel(b.id, live), null);
+});
+
+test('session execution distinguishes an unavailable saved pin from an unpinned default', () => {
+  const deps = { metadataOf: () => ({ agentId: 'saved-agent', agentName: 'Specialist' }),
+    agentModel: () => ({ name: 'Specialist', model: ' claude-opus-5-5 ' }), live: () => false };
+  assert.deepEqual(sessionAgentExecutionModel('selection', deps), { kind: 'unavailable',
+    modelId: 'claude-opus-5-5', savedModel: 'claude-opus-5-5', agentId: 'saved-agent', agentName: 'Specialist', reason: 'not_connected' });
+  assert.equal(sessionAgentAnsweringModel('selection', deps), null, 'picker remains nonthrowing');
+  assert.equal(sessionAgentExecutionModel('selection', { ...deps,
+    live: () => { throw new Error('Provider state is unavailable.'); } }).kind, 'unavailable');
+  assert.deepEqual(sessionAgentExecutionModel('selection', { ...deps,
+    agentModel: () => ({ name: 'Specialist', model: null }) }), { kind: 'default' });
+  assert.deepEqual(sessionAgentExecutionModel('selection', { ...deps, metadataOf: () => null }), { kind: 'default' });
+});
+
+test('session execution preserves a later owner model-chip choice without checking the former pin', () => {
+  const switchedAt = '2026-10-05T12:00:00.000Z';
+  for (const brainChosenAt of [switchedAt, '2026-10-05T12:00:01.000Z']) {
+    assert.deepEqual(sessionAgentExecutionModel('selection', {
+      metadataOf: () => ({ agentId: 'saved-agent', agentSetAt: switchedAt, brainChosenAt }),
+      agentModel: () => { throw new Error('The owner override should avoid the saved model lookup.'); },
+    }), { kind: 'default' });
+  }
+});
+
+test('session execution resolves a role pin exactly and refuses an inactive role binding without its default substitute', () => {
+  const deps = { metadataOf: () => ({ agentId: 'role-agent' }),
+    agentModel: () => ({ name: 'Role Specialist', model: ' Worker ' }), live: (modelId: string) => modelId === 'gpt-5.5',
+    roleModel: (role: string) => { assert.equal(role, 'worker'); return { modelId: 'gpt-5.5' }; } };
+  assert.deepEqual(sessionAgentExecutionModel('selection', deps), { kind: 'pinned',
+    modelId: 'gpt-5.5', agentId: 'role-agent', agentName: 'Role Specialist' });
+  const inactive = { ...deps, roleModel: () => ({ modelId: 'gpt-5.5', inactiveBinding: {
+    modelId: 'claude-opus-5-5', provider: 'claude' as const, source: 'settings' as const, reason: 'Disconnected.' } }) };
+  assert.deepEqual(sessionAgentExecutionModel('selection', { ...inactive,
+    live: () => { throw new Error('An inactive pin must not try its default substitute.'); } }), {
+    kind: 'unavailable', modelId: 'claude-opus-5-5', savedModel: 'Worker',
+    agentId: 'role-agent', agentName: 'Role Specialist', reason: 'not_connected' });
+  assert.equal(sessionAgentAnsweringModel('selection', inactive)?.modelId, 'gpt-5.5', 'the existing role preview stays stable');
+});
+
+test('saved agent model execution uses canonical ownership and refuses model collapse or unavailable credentials', () => {
+  assert.equal(savedAgentModelExecutionLive('gpt-owned-by-byo', {
+    route: () => ({ modelId: 'gpt-owned-by-byo', provider: 'byo' }),
+    live: (modelId, provider) => { assert.equal(modelId, 'gpt-owned-by-byo'); assert.equal(provider, 'byo'); return true; },
+  }), true, 'a declared GPT-shaped BYO model checks the owning backend');
+  assert.equal(savedAgentModelExecutionLive('gpt-5.5', {
+    route: () => ({ modelId: 'byo-default', provider: 'byo' }),
+    live: () => { throw new Error('A model collapse must not check or dispatch the substitute.'); },
+  }), false);
+  assert.equal(savedAgentModelExecutionLive('gpt-5.5', {
+    route: () => ({ modelId: 'gpt-5.5', provider: 'codex' }), live: () => false,
+  }), false, 'a genuinely disconnected Codex choice remains unavailable');
+  assert.equal(savedAgentModelExecutionLive('ambiguous-choice', {
+    route: () => { throw new Error('Two connected backends claim this name.'); }, live: () => true,
+  }), false);
 });
 
 test('the model chip reads what answers the next message, including an agent choice not yet sent', () => {

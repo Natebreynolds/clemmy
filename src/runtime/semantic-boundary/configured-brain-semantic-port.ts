@@ -3,9 +3,11 @@
  * lanes install this same adapter; they do not grow vendor-specific schemas.
  */
 import { Agent, Runner } from '@openai/agents';
+import { APIError } from 'openai';
 import { z } from 'zod';
 import { extractJsonCandidate } from '../harness/json-repair.js';
 import { resolveRoleModel } from '../harness/model-roles.js';
+import { withPinnedWorkerModel } from '../harness/pinned-worker-model.js';
 import type { ModelRole } from '../harness/model-roles.js';
 import type { ReasoningEffort } from '../harness/reasoning-effort.js';
 import {
@@ -51,12 +53,20 @@ import type {
 import { installTurnSemanticModelPort } from './turn-semantic-port-registry.js';
 import { CalendarReadRecipeV1Schema } from '../../agents/calendar-read-recipe.js';
 import { NoticingAnswerWireV1Schema } from '../../agents/noticing.js';
+import { ClarificationRevisionV1Schema } from './clarification-revision.js';
+import { retainClarificationFailureDiagnostic, type ClarificationFailureDiagnostic } from './clarification-failure-diagnostic.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'configured-brain-semantic-port' });
 
+// The Agents SDK serializes ZodObject output types, not root unions. Keep the
+// strict revision union inside a transport-only object and unwrap it below;
+// otherwise BYO receives json_object without the revision's actual schema.
+const ClarificationRevisionWireSchema = z.object({ result: ClarificationRevisionV1Schema }).strict();
+
 export type ConfiguredSemanticPurpose =
   | 'turn_semantics'
+  | 'clarification_revision'
   | 'turn_semantics_effect_judge'
   | 'turn_semantics_plan_grounding'
   | 'turn_semantics_account_selection'
@@ -76,7 +86,7 @@ export interface ConfiguredBrainSemanticComplete {
     purpose: ConfiguredSemanticPurpose;
     system: string;
     user: string;
-    schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1';
+    schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1';
   }): Promise<{
     raw: unknown;
     modelIdentity: string;
@@ -302,7 +312,7 @@ export function semanticModelRoleForPurpose(
   // Reading what a message asks before work starts, and picking a provider's
   // calendar operation from names and descriptions, are quick checks: they
   // run on the owner's quick-check model and the judge verifies what matters.
-  if (purpose === 'turn_semantics' || purpose === 'calendar_read_operation') return 'quick';
+  if (purpose === 'turn_semantics' || purpose === 'calendar_read_operation' || purpose === 'clarification_revision') return 'quick';
   // A second reading of what a server's tools do comes from a different model
   // than the checker's first one.
   if (purpose === 'mcp_tool_effect_labels_second') return 'quick';
@@ -326,6 +336,28 @@ export function semanticReasoningForPurpose(
   return purpose === 'turn_semantics_account_selection' ? 'none' : undefined;
 }
 
+function retainClarificationFailure(error: unknown, observations: Pick<ClarificationFailureDiagnostic,
+  'phase' | 'deadlineFired' | 'sdkRunStarted' | 'sdkRunReturned' | 'usageRecordedAtFailure'>, sdkInvalidOutput = false): void {
+  const source = modelUsageAttributionStorage.getStore();
+  if (!source?.sessionId || !Number.isSafeInteger(source.sourceUserSeq)) return;
+  // Only the actual SDK HTTP error supplies status. A message or lookalike
+  // object's name/status cannot establish a provider response.
+  const status = error instanceof APIError && Number.isInteger(error.status)
+    && error.status! >= 400 && error.status! <= 599 ? error.status : undefined;
+  const invalid = error instanceof SyntaxError || error instanceof z.ZodError;
+  const kind: ClarificationFailureDiagnostic['kind'] = observations.deadlineFired ? 'deadline'
+    : status !== undefined ? 'http_error'
+    : (sdkInvalidOutput || invalid) && observations.phase === 'sdk_output_validation' ? 'sdk_output_invalid'
+    : invalid && observations.phase === 'wire_envelope_validation' ? 'wire_envelope_invalid'
+    : 'unknown';
+  retainClarificationFailureDiagnostic(error, {
+    version: 1, sessionId: source.sessionId, sourceUserSeq: source.sourceUserSeq!,
+    ...(source.attemptId ? { attemptId: source.attemptId } : {}),
+    ...observations, kind,
+    ...(kind === 'http_error' ? { httpStatus: status } : {}),
+  });
+}
+
 async function completeStructured(input: {
   purpose: ConfiguredSemanticPurpose;
   system: string;
@@ -346,10 +378,24 @@ async function completeStructured(input: {
   // the supposedly independent gate self-approval by construction.
   const wantedRole = semanticModelRoleForPurpose(input.purpose);
   const reasoning = semanticReasoningForPurpose(input.purpose);
-  const firstRole = resolveRoleModel(wantedRole);
+  let firstRole: ReturnType<typeof resolveRoleModel>;
+  try {
+    firstRole = resolveRoleModel(wantedRole);
+    if (input.purpose === 'clarification_revision' && firstRole.inactiveBinding) {
+      throw new Error('The selected quick-check binding is unavailable for clarification revision');
+    }
+  } catch (error) {
+    if (input.purpose === 'clarification_revision') retainClarificationFailure(error, {
+      phase: 'model_selection', deadlineFired: false, sdkRunStarted: false, sdkRunReturned: false,
+    });
+    throw error;
+  }
   // A quick check that runs long is no quicker than the brain: past its
   // deadline it is cancelled and the call falls back like any other failure.
   return runOnRole(firstRole, wantedRole === 'quick' ? quickCheckDeadlineMs : undefined).catch(async (error) => {
+    // A nonexecuting clarification repair has one selected Quick call. Failure
+    // stays unavailable; an unrequested brain retry changes identity and cost.
+    if (input.purpose === 'clarification_revision') throw error;
     // The judge role is cross-family by default, so it can be bound to a model
     // whose sign-in is expired or whose provider is down while the brain that
     // is running this very turn is fine. A review that cannot run is not a
@@ -373,10 +419,21 @@ async function completeStructured(input: {
   async function runOnRole(role: ReturnType<typeof resolveRoleModel>, deadlineMs?: number) {
   const started = Date.now();
   const deadline = deadlineMs ? new AbortController() : null;
-  const timer = deadline ? setTimeout(() => deadline.abort(new Error(`quick check passed its ${deadlineMs} ms deadline`)), deadlineMs) : null;
+  let deadlineFired = false;
+  let sdkRunStarted = false;
+  let sdkRunReturned = false;
+  let sdkInvalidOutput = false;
+  let usageRecordedAtFailure: boolean | undefined;
+  let phase: ClarificationFailureDiagnostic['phase'] = 'model_selection';
+  const timer = deadline ? setTimeout(() => {
+    deadlineFired = true;
+    deadline.abort(new Error(`quick check passed its ${deadlineMs} ms deadline`));
+  }, deadlineMs) : null;
   try {
   const agent = new Agent({
-    name: input.purpose === 'turn_semantics'
+    name: input.purpose === 'clarification_revision'
+      ? 'clarification-revision'
+      : input.purpose === 'turn_semantics'
       ? 'turn-semantics'
       : input.purpose === 'turn_semantics_account_selection'
         ? 'turn-semantics-account-selection'
@@ -394,17 +451,43 @@ async function completeStructured(input: {
   const runner = new Runner({ workflowName: `clementine-${input.purpose}` });
   // Its own request: the enclosing turn's role and prompt measurements do not
   // describe this call, so it records the purpose's role and its own sizes.
-  const { value: result, recorded: usageRecorded } = await observeModelUsageRecording(
-    () => withOwnModelRequestAttribution({
+  const observed = await observeModelUsageRecording(async () => {
+    // Returning the failure locally keeps this same accounting observer readable
+    // even when Runner rejects. Rethrow the original error immediately below.
+    try {
+      const value = await withOwnModelRequestAttribution({
       ...semanticUsageAttribution(input.purpose),
       promptComponents: {
         instructions: estimateTokens(input.system),
         history: estimateTokens(input.user),
       },
-    }, () => withinDeadline(runner.run(agent, input.user, { maxTurns: 1, ...(deadline ? { signal: deadline.signal } : {}) }), deadline)),
-  );
+    }, () => withPinnedWorkerModel(input.purpose === 'clarification_revision' ? role.modelId : undefined,
+      () => {
+        phase = 'sdk_run';
+        sdkRunStarted = true;
+        return withinDeadline(runner.run(agent, input.user, {
+          maxTurns: 1, ...(deadline ? { signal: deadline.signal } : {}),
+          ...(input.purpose === 'clarification_revision' ? { errorHandlers: {
+            invalidFinalOutput: () => {
+              // Observe the SDK's typed boundary without reading output/runData.
+              // Returning undefined preserves its default original-error throw.
+              sdkInvalidOutput = true;
+              phase = 'sdk_output_validation';
+            },
+          } } : {}),
+        }), deadline);
+      }));
+      sdkRunReturned = true;
+      return { ok: true as const, value };
+    } catch (error) { return { ok: false as const, error }; }
+  });
+  usageRecordedAtFailure = observed.recorded;
+  if (!observed.value.ok) throw observed.value.error;
+  const result = observed.value.value;
+  const usageRecorded = observed.recorded;
   const tokens = tokensFromAgentRun(result);
   const latencyMs = Date.now() - started;
+  phase = 'sdk_output_validation';
   const final = result.finalOutput;
   if (final && typeof final === 'object') {
     return {
@@ -432,6 +515,12 @@ async function completeStructured(input: {
     latencyMs,
     usageRecorded,
   };
+  } catch (error) {
+    if (input.purpose === 'clarification_revision') retainClarificationFailure(error, {
+      phase, deadlineFired, sdkRunStarted, sdkRunReturned,
+      ...(usageRecordedAtFailure !== undefined ? { usageRecordedAtFailure } : {}),
+    }, sdkInvalidOutput);
+    throw error;
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -559,9 +648,9 @@ function recordSemanticModelUsage(input: {
   cachedInputTokens?: number;
   latencyMs: number;
   usageRecorded?: boolean;
-}): void {
-  if (input.usageRecorded) return;
-  if (input.inputTokens + input.outputTokens <= 0) return;
+}): boolean {
+  if (input.usageRecorded) return true;
+  if (input.inputTokens + input.outputTokens <= 0) return false;
   const attribution = modelUsageAttributionStorage.getStore();
   const own = semanticUsageAttribution(input.purpose);
   // The fallback row describes the same own request the completion ran as, so
@@ -586,6 +675,7 @@ function recordSemanticModelUsage(input: {
       durationMs: input.latencyMs,
     });
   });
+  return true;
 }
 
 /** Production complete: one tool-less call on the configured brain/judge role. */
@@ -593,7 +683,7 @@ export async function completeViaConfiguredBrain(input: {
   purpose: ConfiguredSemanticPurpose;
   system: string;
   user: string;
-  schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1';
+  schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1';
 }): Promise<{
   raw: unknown;
   modelIdentity: string;
@@ -603,11 +693,16 @@ export async function completeViaConfiguredBrain(input: {
   latencyMs: number;
   usageRecorded?: boolean;
 }> {
-  return completeStructured({
+  const clarificationWire = input.schemaName === 'ClarificationRevisionV1';
+  const result = await completeStructured({
     purpose: input.purpose,
-    system: input.system,
+    system: clarificationWire
+      ? `${input.system}\nFor this structured transport, put the ClarificationRevisionV1 value in the sole top-level "result" field.`
+      : input.system,
     user: input.user,
-    schema: input.schemaName === 'SourceAccountJudgeV1'
+    schema: clarificationWire
+      ? ClarificationRevisionWireSchema
+      : input.schemaName === 'SourceAccountJudgeV1'
       ? SourceAccountJudgeV1Schema
       : input.schemaName === 'CalendarReadRecipeV1'
       ? CalendarReadRecipeAnswerV1Schema
@@ -637,6 +732,21 @@ export async function completeViaConfiguredBrain(input: {
         // the sole judge. See TurnSemanticProposalV1WireSchema's doc.
         : TurnSemanticProposalV1WireSchema,
   });
+  let usageRecorded = result.usageRecorded;
+  if (input.purpose === 'clarification_revision') {
+    usageRecorded = recordSemanticModelUsage({ ...result, purpose: input.purpose });
+  }
+  if (clarificationWire) {
+    try { result.raw = ClarificationRevisionWireSchema.parse(result.raw).result; }
+    catch (error) {
+      retainClarificationFailure(error, { phase: 'wire_envelope_validation', deadlineFired: false,
+        sdkRunStarted: true, sdkRunReturned: true,
+        ...(usageRecorded !== undefined ? { usageRecordedAtFailure: usageRecorded } : {}),
+      });
+      throw error;
+    }
+  }
+  return result;
 }
 
 export function installConfiguredBrainSemanticPort(): void {

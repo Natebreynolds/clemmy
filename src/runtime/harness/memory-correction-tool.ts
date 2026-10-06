@@ -8,7 +8,8 @@ import { openEventLog } from './eventlog.js';
 import { assertDispatchLeaseCurrent, currentDispatchLease } from './dispatch-lease.js';
 import { getToolOutputContext } from './tool-output-context.js';
 import { retainedFactObservation } from './memory-fact-read-evidence.js';
-import { findRetainedCorrectionAssessment, intakeReplacementsForSource, readMemoryRequirementSource,
+import { findRetainedCorrectionAssessment, intakeReplacementMatchesExactCorrection,
+  intakeReplacementsForSource, readMemoryRequirementSource,
   retainMemoryRequirementAssessment } from './memory-completion-obligation.js';
 
 export const memoryCorrectionInputSchema = z.object({
@@ -48,11 +49,6 @@ export async function executeMemoryCorrection(input: {
   if (observation.digest !== input.correct.expectedDigest || observation.kind !== input.kind) {
     throw new Error('The target version or kind differs from the original read. Reopen the fact before correcting it.');
   }
-  // The owner's message itself already replaced this fact when it was saved.
-  const applied = intakeReplacementsForSource(identity).find(row => row.replaced.id === observation.id);
-  if (applied) {
-    return { status: 'already_in_effect' as const, reason: `Already in effect: when this message was saved, fact ${applied.replaced.id} was replaced by fact ${applied.by.id} ("${applied.by.content}") in the same scope. Nothing further to change.` };
-  }
   if (input.keepFor && !sameScope(observation.scope,
     input.keepFor === 'everywhere' ? null : source.memoryScope)) {
     throw new Error('A correction retains the original stored scope. Omit keepFor; a scope move is a separate request.');
@@ -60,6 +56,15 @@ export async function executeMemoryCorrection(input: {
   const replacement = applyExactFactPatches(observation.content, input.correct.edits);
   if (replacement.content !== input.content) {
     throw new Error('content must equal the exact edited original, preserving every unchanged part.');
+  }
+  // Validate the admitted arguments before accepting intake as the exact
+  // requested operation. The same target id is insufficient on its own.
+  const applied = intakeReplacementsForSource(identity).find(row => row.replaced.id === observation.id);
+  if (applied) {
+    if (!intakeReplacementMatchesExactCorrection(applied, observation, replacement.content)) {
+      throw new Error('The replacement saved by this request does not match the exact edited original in its stored scope. Reopen the facts before correcting them.');
+    }
+    return { status: 'already_in_effect' as const, reason: `Already in effect: when this message was saved, fact ${applied.replaced.id} was replaced by fact ${applied.by.id} ("${applied.by.content}") in the same scope. Nothing further to change.` };
   }
   let assessment = findRetainedCorrectionAssessment(source, input.correct);
   if (!assessment) {

@@ -39,6 +39,7 @@ const {
 } = await import('../harness/loop.js');
 const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
 const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
+const { checkClarificationAnswerCompleteness } = await import('./clarification-revision.js');
 
 const PARENT = 'Run my platform 59 flow please';
 const QUESTION = 'You asked me to run platform 59, but the exact saved workflow is platform-49-slack-channel-review. What should I do next?';
@@ -46,7 +47,15 @@ const OPTIONS = ['Show me its definition', 'Skip'];
 const ANSWER = 'Sorry platform 49';
 const REPLY_TARGET = { type: 'origin_chat' } as const;
 
+continuity._setClarificationAnswerCompletenessForTests(input => {
+  assert.equal(input.acceptedReply, ANSWER, 'only the exact corrected workflow fixture gets an adequate-answer receipt');
+  return checkClarificationAnswerCompleteness(input, async () => ({ ok: true, model: 'fixture-clarification-adequacy',
+    answers: { complete_answer: { type: 'noul', noul: 0.99 } }, usage: { input_tokens: 1, output_tokens: 1 },
+    decisionId: 'workflow-name-exact-answer' }));
+});
+
 test.after(() => {
+  continuity._setClarificationAnswerCompletenessForTests(null);
   installTurnSemanticModelPort(null);
   eventlog.closeEventLog();
   rmSync(HOME, { recursive: true, force: true });
@@ -173,6 +182,9 @@ test('ordinary clarification shortcuts accept a bounded correction without grant
   assert.equal(prepared, 'admitted');
   const typed = typedClassificationFromLastInterpretation(session.id, answer.seq);
   assert.deepEqual(typed, { disposition: 'provided' });
+
+  assert.equal((await continuity.classifyUnsettledOpenQuestionReply({ sessionId: session.id,
+    sourceUserSeq: answer.seq }))?.route, 'settled');
 
   const enriched = await continuity.enrichAcceptedRequestWithTaskContinuity({
     sessionId: session.id,
@@ -547,6 +559,8 @@ test(`${relation} without an answer reoffers the exact question as an adjacent a
     surface: 'home',
   }), 'admitted');
   const correctedTyped = typedClassificationFromLastInterpretation(session.id, corrected.seq);
+  assert.equal((await continuity.classifyUnsettledOpenQuestionReply({ sessionId: session.id,
+    sourceUserSeq: corrected.seq }))?.route, 'settled');
   const resolved = await continuity.enrichAcceptedRequestWithTaskContinuity({
     sessionId: session.id,
     sourceUserSeq: corrected.seq,

@@ -3040,3 +3040,45 @@ test('readSessionDispatchEvidence: a step session\'s own ledger says whether re-
     sessions: 0, openLogicalCalls: 0, settledCalls: 0, mutatingSettlements: 0, uncertainSettlements: 0, physicalCrossings: 0, unsettledDispatches: 0,
   });
 });
+
+
+test('held-stop namespace cannot be minted through ordinary session metadata', () => {
+  const key = '__held_stop_publication_debt';
+  assert.throws(() => createSession({ id: 'held-debt-injection', kind: 'chat', metadata: { [key]: { injected: true } } }), /reserved|publication/i);
+  assert.equal(getSession('held-debt-injection'), null);
+  createSession({ id: 'held-debt-update-injection', kind: 'chat' });
+  const result = updateSession('held-debt-update-injection', { metadata: { unrelated: 'kept', [key]: { injected: true } } });
+  assert.equal(result.metadata[key], undefined);
+  assert.equal(result.metadata.unrelated, 'kept');
+  assert.equal(getSession(result.id)?.metadata[key], undefined);
+});
+
+test('held-stop namespace preserves spent debt across stale metadata and cannot resurrect acknowledged debt', () => {
+  const key = '__held_stop_publication_debt';
+  const session = createSession({ id: 'held-debt-stale', kind: 'chat', metadata: { unrelated: 'before' } });
+  const stale = { ...session.metadata };
+  const spent = { '41': { revision: 8, attemptsUsed: 8 } };
+  openEventLog().prepare('UPDATE sessions SET metadata_json = json_set(metadata_json, ?, json(?)) WHERE id = ?')
+    .run(`$.${key}`, JSON.stringify(spent), session.id);
+  const result = updateSession(session.id, { metadata: { ...stale, unrelated: 'after' } });
+  assert.deepEqual(result.metadata[key], spent, 'returned metadata reflects the protected stored allowance');
+  assert.deepEqual(getSession(session.id)?.metadata[key], spent);
+  assert.equal(result.metadata.unrelated, 'after');
+  const staleWithDebt = { ...result.metadata };
+  openEventLog().prepare('UPDATE sessions SET metadata_json = json_remove(metadata_json, ?) WHERE id = ?').run(`$.${key}`, session.id);
+  const acknowledged = updateSession(session.id, { metadata: staleWithDebt });
+  assert.equal(acknowledged.metadata[key], undefined, 'a cached acknowledged debt never returns');
+  assert.equal(getSession(session.id)?.metadata[key], undefined);
+});
+
+test('held-stop namespace rejects scalar and array metadata replacements without erasing its allowance', () => {
+  const session = createSession({ id: 'held-stop-invalid-replacements', kind: 'chat', metadata: { stable: 'before' } });
+  const key = '__held_stop_publication_debt';
+  openEventLog().prepare('UPDATE sessions SET metadata_json = json_set(metadata_json, ?, json(?)) WHERE id = ?')
+    .run(`$.${key}`, JSON.stringify({ 41: { revision: 8, attemptsUsed: 8, state: 'parked' } }), session.id);
+  const retained = getSession(session.id)!.metadata;
+  for (const invalid of [[], 'invalid', 7, false, { toJSON: () => [] }]) {
+    assert.throws(() => updateSession(session.id, { metadata: invalid as never }), /serialize to an object/);
+    assert.deepEqual(getSession(session.id)!.metadata, retained);
+  }
+});

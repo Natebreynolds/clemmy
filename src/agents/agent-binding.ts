@@ -130,11 +130,24 @@ export function resolveWorkerAgentRequest(call: { agent?: string | null; model?:
       shapes: ['agent:not_saved'],
     };
   }
-  const pinnedModel = binding.model
-    ? (agentModelIsRole(binding.model)
-      ? resolveRoleModel(binding.model.trim().toLowerCase() as ModelRole).modelId
-      : binding.model)
-    : undefined;
+  let pinnedModel = binding.model || undefined;
+  if (agentModelIsRole(binding.model)) {
+    const role = binding.model.trim().toLowerCase() as ModelRole;
+    const resolved = resolveRoleModel(role);
+    // Role readers may return a healthy default alongside the failed saved
+    // binding. A specialist's owner pin cannot turn that default into the
+    // saved choice. Packet model text carries no accepted owner authority at
+    // this seam; the ordinary route gate handles verified overrides of live
+    // pins after this binding has preserved their original constraint.
+    if (resolved.inactiveBinding) {
+      return {
+        kind: 'refuse',
+        reason: `The saved agent "${binding.agent.name}" requires the ${role} model "${resolved.inactiveBinding.modelId}", but that saved model is unavailable. No substitute was started. Reconnect its model or change the saved role choice before retrying.`,
+        shapes: ['model:pinned_unavailable'],
+      };
+    }
+    pinnedModel = resolved.modelId;
+  }
   const model = call.model || pinnedModel;
   return { kind: 'bound', binding, model, ...(pinnedModel ? { pinnedModel } : {}) };
 }

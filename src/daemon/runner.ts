@@ -2769,6 +2769,11 @@ export async function startDaemon(
   // through the same harness spine a user's `continue` uses (2026-07-09: users
   // sat on "reply continue" banners after every restart; the resume path itself
   // was live-verified to work). Write-touched / stale runs keep the manual banner.
+  try {
+    const { drainPendingHeldStopPublications } = await import('../runtime/harness/loop.js');
+    const published = drainPendingHeldStopPublications();
+    if (published) logger.info({ published }, 'Recovered held-stop publication owners before chat restart');
+  } catch { logger.warn('Held-stop publication recovery remains pending'); }
   const recoveredChats = reportInterruptedChatRuns(
     Date.now,
     dispatchInterruptedChatResume,
@@ -3595,6 +3600,12 @@ export async function startDaemon(
           'Immutable plan preparation recovery tick failed closed',
         );
       }
+    });
+    await withDaemonRuntimePhase('daemon.loop.held_stop_publication', { tickCount }, async () => {
+      try {
+        const { drainPendingHeldStopPublications } = await import('../runtime/harness/loop.js');
+        drainPendingHeldStopPublications();
+      } catch { /* publication-only ownership remains durable for a later pass */ }
     });
     await withDaemonRuntimePhase('daemon.loop.async_read_refinement_recovery', { tickCount }, async () => {
       try {

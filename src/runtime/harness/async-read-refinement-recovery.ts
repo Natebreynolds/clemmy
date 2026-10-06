@@ -3,6 +3,7 @@ import type { AgentInputItem } from '@openai/agents';
 import { ASYNC_READ_REFINEMENT_RECOVERY_CURSOR_TABLE } from './async-read-refinement-schema.js';
 import { HostRecoveryState } from './host-turn-runner.js';
 import { openEventLog } from './eventlog.js';
+import { heldStopPublicationHoldsExecutionSource } from './held-stop-publication.js';
 
 interface PendingAsyncReadRecoveryRow {
   intent_recorded_at: string;
@@ -128,6 +129,15 @@ function pendingRows(
               AND lease.revoked_at IS NULL
          )
          AND json_type(session.metadata_json, '$.__host_recovery_state') IS NULL
+         AND CASE
+           WHEN json_type(session.metadata_json, '$.__held_stop_publication_debt') IS NULL THEN 1
+           WHEN json_type(session.metadata_json, '$.__held_stop_publication_debt') != 'object' THEN 0
+           ELSE NOT EXISTS (
+             SELECT 1 FROM json_each(session.metadata_json, '$.__held_stop_publication_debt') debt
+              WHERE debt.key = CAST(intent.source_user_seq AS TEXT)
+                 OR debt.type != 'object'
+                 OR json_extract(debt.value, '$.origin.executionSourceUserSeq') = intent.source_user_seq
+           ) END
          ${afterWhere}
        ORDER BY intent.recorded_at, intent.session_id, intent.source_user_seq,
                 intent.start_logical_tool_call_id
@@ -209,6 +219,10 @@ export function claimPendingAsyncReadRefinementRecoveries(
   let replayed = 0;
   let held = 0;
   for (const row of rows) {
+    if (heldStopPublicationHoldsExecutionSource(row.session_id, row.source_user_seq)) {
+      held += 1;
+      continue;
+    }
     const history = parsedHistory(row.pre_history_json);
     const frameHistory = parsedHistory(row.frame_history_json);
     if (!history || !frameHistory) {
@@ -243,6 +257,15 @@ export function claimPendingAsyncReadRefinementRecoveries(
                updated_at = ?
          WHERE id = ?
            AND json_type(metadata_json, '$.__host_recovery_state') IS NULL
+           AND CASE
+             WHEN json_type(metadata_json, '$.__held_stop_publication_debt') IS NULL THEN 1
+             WHEN json_type(metadata_json, '$.__held_stop_publication_debt') != 'object' THEN 0
+             ELSE NOT EXISTS (
+               SELECT 1 FROM json_each(metadata_json, '$.__held_stop_publication_debt') debt
+                WHERE debt.key = CAST(? AS TEXT)
+                   OR debt.type != 'object'
+                   OR json_extract(debt.value, '$.origin.executionSourceUserSeq') = ?
+             ) END
            AND EXISTS (
              SELECT 1 FROM logical_tool_calls call
               WHERE call.session_id = ? AND call.source_user_seq = ?
@@ -301,6 +324,8 @@ export function claimPendingAsyncReadRefinementRecoveries(
         blob,
         new Date().toISOString(),
         row.session_id,
+        row.source_user_seq,
+        row.source_user_seq,
         row.session_id,
         row.source_user_seq,
         row.start_logical_tool_call_id,

@@ -1,10 +1,13 @@
 import { createHash } from 'node:crypto';
+import { clarificationReferenceDigest, renderClarificationUnavailable,
+  type ClarificationUnavailableAnnotationV1 } from './clarification-public-annotation.js';
 import {
   consumeTaskContinuityPacket,
   createTaskContinuityPacket,
   dismissTaskContinuityPacket,
   peekTaskContinuityPacket,
   readConsumedTaskContinuityPacket,
+  readTaskContinuityClarificationSources,
   type TaskContinuityCapabilityEvidence,
   type TaskContinuityFrozenResolution,
   type TaskContinuityPacket,
@@ -31,6 +34,9 @@ import { discoveryGovernor } from './discovery-governor.js';
 import {
   appendEvent,
   getSession,
+  getEvent,
+  openEventLog,
+  withEventPublicationTransaction,
   getTurnGraphEventForSource,
   listEvents,
   type EventRow,
@@ -76,6 +82,17 @@ import {
 } from './turn-control.js';
 import { currentInputSuppressesPriorTask } from './current-task-authority.js';
 import { withoutRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
+import { modelUsageAttributionStorage, withModelUsageAttribution } from '../usage-log.js';
+import { validatedClarificationFailureDiagnostic } from '../semantic-boundary/clarification-failure-diagnostic.js';
+import { validatedClarificationStructuralDiagnostic } from '../semantic-boundary/clarification-structural-diagnostic.js';
+import {
+  proposeClarificationRevision,
+  validatedClarificationRevision,
+  checkClarificationAnswerCompleteness,
+  validatedClarificationAnswerCompleteness,
+  type ClarificationRevisionInput,
+  type ProposedClarificationRevision,
+} from '../semantic-boundary/clarification-revision.js';
 
 const ANSWER_MAX_CHARS = 280;
 const ANSWER_MAX_WORDS = 24;
@@ -91,6 +108,8 @@ export const CLARIFICATION_RESOLVER_VERSION = 'clarification-resolver-v2' as con
  * columns already freeze resolverVersion, so this needs no schema widening. */
 export const SEMANTIC_CLARIFICATION_RESOLVER_VERSION =
   'clarification-resolver-v3-semantic-projection' as const;
+export const CHAINED_CLARIFICATION_RESOLVER_VERSION =
+  'clarification-resolver-v4-checked-reply-chain' as const;
 
 /**
  * Fresh host turns do not persist a graph before their model loop, but an
@@ -134,6 +153,8 @@ export interface UnresolvedClarificationReofferV1 {
   readonly parentPacketId: string;
   readonly rootSourceUserSeq: number;
   readonly question: string;
+  readonly publicText: string;
+  readonly annotation?: ClarificationUnavailableAnnotationV1;
   readonly options: readonly string[];
   readonly slot?: TaskContinuityPacket['pause']['slot'];
   readonly capabilities: readonly Readonly<
@@ -145,22 +166,129 @@ export interface UnresolvedClarificationReofferV1 {
 }
 
 const OPEN_QUESTION_REPLY_RECORD = 'open_question_reply_classified';
+const OPEN_QUESTION_REPLY_CLAIM = 'open_question_reply_reading_claimed';
 
 interface OpenQuestionReplyRoute {
-  /** `reask`: an answer the host could not bind; `respond`: the brain replies. */
-  route: 'reask' | 'respond';
+  /** A revision remains a pending question. It never enters executing work. */
+  route: 'reask' | 'respond' | 'revise' | 'settled';
   parentPacketId: string;
+  revision?: ProposedClarificationRevision;
+  revisionUnavailable?: boolean;
+  unavailableReadingEventId?: string;
+  answerCompletenessRequired?: boolean;
 }
 
 /** The host's recorded reading of this exact accepted reply, if it made one. */
 function openQuestionReplyRouteFor(sessionId: string, sourceUserSeq: number): OpenQuestionReplyRoute | null {
-  const event = listEvents(sessionId, { sinceSeq: sourceUserSeq, types: ['guardrail_tripped'], limit: 50 })
-    .find((row) => row.data.kind === OPEN_QUESTION_REPLY_RECORD && row.data.sourceUserSeq === sourceUserSeq);
+  // Filter the exact record before limiting. Unrelated guardrails cannot hide
+  // the retained interpretation and trigger another paid call on retry.
+  let row = openEventLog().prepare(`SELECT id FROM events WHERE session_id = ? AND seq > ?
+    AND type = 'guardrail_tripped' AND json_extract(data_json, '$.kind') = ?
+    AND json_extract(data_json, '$.sourceUserSeq') = ? ORDER BY seq LIMIT 1`)
+    .get(sessionId, sourceUserSeq, OPEN_QUESTION_REPLY_RECORD, sourceUserSeq) as { id: string } | undefined;
+  if (!row) {
+    row = openEventLog().prepare(`SELECT id FROM events WHERE session_id = ? AND seq > ?
+      AND type = 'guardrail_tripped' AND json_extract(data_json, '$.kind') = ?
+      AND json_extract(data_json, '$.sourceUserSeq') = ? ORDER BY seq LIMIT 1`)
+      .get(sessionId, sourceUserSeq, OPEN_QUESTION_REPLY_CLAIM, sourceUserSeq) as { id: string } | undefined;
+    if (row) {
+      const claim = getEvent(row.id);
+      const packet = peekTaskContinuityPacket({ sessionId });
+      const edge = packet.status === 'available' ? clarificationRevisionInputFor(packet.packet, sourceUserSeq) : null;
+      if (packet.status !== 'available' || !edge || claim?.data.parentPacketId !== packet.packet.packetId
+        || JSON.stringify(claim.data.parentSlot ?? null) !== JSON.stringify(packet.packet.pause.slot ?? null)
+        || claim.data.sourceDigest !== createHash('sha256').update(JSON.stringify(edge)).digest('hex')) return null;
+      // No automatic retry after a crash between provider entry and retained
+      // result. The literal reply remains available to a new owner response.
+      return { route: 'reask', parentPacketId: packet.packet.packetId, revisionUnavailable: true, unavailableReadingEventId: row.id,
+        ...(claim.data.answerCompletenessRequired === true ? { answerCompletenessRequired: true } : {}) };
+    }
+  }
+  const event = row ? getEvent(row.id) : null;
   const route = event?.data.route;
   const parentPacketId = event?.data.parentPacketId;
-  return (route === 'reask' || route === 'respond') && typeof parentPacketId === 'string'
-    ? { route, parentPacketId }
-    : null;
+  if ((route !== 'reask' && route !== 'respond' && route !== 'revise' && route !== 'settled') || typeof parentPacketId !== 'string') return null;
+  if (route === 'settled') {
+    const open = peekTaskContinuityPacket({ sessionId });
+    const consumed = open.status !== 'available' ? readConsumedTaskContinuityPacket({ sessionId, consumingSourceUserSeq: sourceUserSeq }) : null;
+    const packet = open.status === 'available' ? open.packet : consumed?.status === 'consumed' ? consumed.packet : null;
+    if (!packet || packet.packetId !== parentPacketId
+      || JSON.stringify(event?.data.parentSlot ?? null) !== JSON.stringify(packet.pause.slot ?? null)) return null;
+    const input = clarificationRevisionInputFor(packet, sourceUserSeq, consumed?.status === 'consumed');
+    const checked = input ? validatedClarificationAnswerCompleteness(input, event?.data.completeness) : null;
+    return checked?.status === 'complete' ? { route, parentPacketId } : null;
+  }
+  if (route === 'revise') {
+    const packet = peekTaskContinuityPacket({ sessionId });
+    if (packet.status !== 'available'
+      || JSON.stringify(event?.data.parentSlot ?? null) !== JSON.stringify(packet.packet.pause.slot ?? null)) return null;
+    // Once the exact successor exists, its persisted bytes are the display
+    // replay. Do not re-interpret B against B's own successor question.
+    if (packet.status === 'available' && packet.packet.originatingSourceUserSeq === sourceUserSeq
+      && packet.packet.parentPacketId === parentPacketId) return { route, parentPacketId };
+    if (packet.status !== 'available' || packet.packet.packetId !== parentPacketId) return null;
+    const input = clarificationRevisionInputFor(packet.packet, sourceUserSeq);
+    const revision = input ? validatedClarificationRevision(input, event?.data.revision) : null;
+    return revision ? { route, parentPacketId, revision } : null;
+  }
+  return { route, parentPacketId,
+    ...(event?.data.revisionUnavailable === true ? { revisionUnavailable: true, unavailableReadingEventId: event.id } : {}),
+    ...(event?.data.answerCompletenessRequired === true ? { answerCompletenessRequired: true } : {}) };
+}
+
+function clarificationParentInputFromChain(packet: TaskContinuityPacket, consumingSourceUserSeq?: number): string | null {
+  const chain = readTaskContinuityClarificationSources({ sessionId: packet.sessionId, packetId: packet.packetId,
+    ...(consumingSourceUserSeq !== undefined ? { consumingSourceUserSeq } : {}) });
+  if (chain.status !== 'verified') return null;
+  return clarificationParentInputFromVerifiedChain(chain);
+}
+
+function clarificationParentInputFromVerifiedChain(
+  chain: Extract<ReturnType<typeof readTaskContinuityClarificationSources>, { status: 'verified' }>,
+): string | null {
+  const text = chain.replies.length === 0 ? chain.root.text : [
+    '[task-clarification-history:v1]', '[original-task]', chain.root.text,
+    ...chain.replies.flatMap((reply) => ['[delivered-clarification]', reply.previousDeliveredQuestion,
+      '[visible-options]', JSON.stringify(reply.previousDeliveredOptions), '[accepted-clarification-reply]', reply.text]),
+  ].join('\n');
+  return text.length <= MAX_CLARIFICATION_PARENT_CHARS ? text : null;
+}
+
+function clarificationRevisionInputFor(packet: TaskContinuityPacket, sourceUserSeq: number, consumed = false): ClarificationRevisionInput | null {
+  const edge = readTaskContinuityClarificationSources({ sessionId: packet.sessionId, packetId: packet.packetId,
+    ...(consumed ? { consumingSourceUserSeq: sourceUserSeq } : { nextReplySourceUserSeq: sourceUserSeq }) });
+  if (edge.status !== 'verified') return null;
+  // Compose the reading from one verified source snapshot. The actual public
+  // Q/options may retain spacing that the internal pause normalizes.
+  const rootTask = clarificationParentInputFromVerifiedChain(edge);
+  const reply = consumed ? edge.consumedReply : edge.nextReply;
+  const acceptedReply = reply?.text;
+  if (!rootTask || typeof acceptedReply !== 'string' || !acceptedReply.trim()) return null;
+  return { rootTask, deliveredQuestion: reply!.previousReferenceQuestion ?? reply!.previousDeliveredQuestion,
+    ...(reply!.previousQuestionAnnotation ? { deliveredPublicQuestion: reply!.previousDeliveredQuestion,
+      deliveredQuestionAnnotation: reply!.previousQuestionAnnotation } : {}),
+    deliveredOptions: [...reply!.previousDeliveredOptions], acceptedReply,
+    sessionId: packet.sessionId, sourceUserSeq };
+}
+
+function hasCheckedRevisionChain(packet: TaskContinuityPacket): boolean {
+  if (!packet.parentPacketId) return false;
+  return Boolean(openEventLog().prepare(`SELECT 1 FROM events WHERE session_id = ? AND seq > ?
+    AND type = 'guardrail_tripped' AND json_extract(data_json, '$.kind') IN (?, ?)
+    AND json_extract(data_json, '$.sourceUserSeq') > ? AND json_extract(data_json, '$.sourceUserSeq') <= ? LIMIT 1`)
+    .get(packet.sessionId, packet.rootSourceUserSeq ?? packet.originatingSourceUserSeq,
+      OPEN_QUESTION_REPLY_CLAIM, OPEN_QUESTION_REPLY_RECORD,
+      packet.rootSourceUserSeq ?? packet.originatingSourceUserSeq, packet.originatingSourceUserSeq));
+}
+
+let clarificationCompletenessForTests: typeof checkClarificationAnswerCompleteness | null = null;
+export function _setClarificationAnswerCompletenessForTests(check: typeof checkClarificationAnswerCompleteness | null): void {
+  clarificationCompletenessForTests = check;
+}
+
+let clarificationRevisionProposerForTests: typeof proposeClarificationRevision | null = null;
+export function _setClarificationRevisionProposerForTests(proposer: typeof proposeClarificationRevision | null): void {
+  clarificationRevisionProposerForTests = proposer;
 }
 
 /** A reply the brain answers keeps the open question it replied to. */
@@ -197,16 +325,34 @@ export async function classifyUnsettledOpenQuestionReply(input: {
 }): Promise<OpenQuestionReplyRoute | null> {
   const recorded = openQuestionReplyRouteFor(input.sessionId, input.sourceUserSeq);
   if (recorded) return recorded;
-  if (readPersistedSemanticInterpretation(input.sessionId, input.sourceUserSeq)?.validationOutcome !== 'admitted') {
-    return null;
-  }
+  const interpretation = readPersistedSemanticInterpretation(input.sessionId, input.sourceUserSeq);
+  // Preserve the historical nonparticipating lane. A missing interpreter is
+  // not a new model failure receipt; normal host ingress records participation
+  // before reading the accepted source and uses the checked path below.
+  if (!interpretation && !semanticPortParticipated(input.sessionId, input.sourceUserSeq)) return null;
+  const unreadable = interpretation?.validationOutcome !== 'admitted';
   const current = peekTaskContinuityPacket({ sessionId: input.sessionId });
   if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return null;
   if (current.packet.originatingSourceUserSeq === input.sourceUserSeq) return null;
   const sideConversation = taskRelationFromLastInterpretation(input.sessionId, input.sourceUserSeq) === 'conversation';
+  const relation = taskRelationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
   const typed = typedClassificationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
   const unbound = typed !== undefined && 'keepOpen' in typed && typed.metaAction === undefined;
-  if (!sideConversation && !unbound) return null;
+  const continuing = relation === 'continue_goal' && unresolvedOpenSlotTargetFromLastInterpretation(input.sessionId, input.sourceUserSeq) !== null;
+  const raw = interpretation?.raw && typeof interpretation.raw === 'object' && !Array.isArray(interpretation.raw)
+    ? interpretation.raw as Record<string, unknown> : null;
+  const target = raw?.targetGoal && typeof raw.targetGoal === 'object'
+    ? raw.targetGoal as Record<string, unknown> : null;
+  const amending = relation === 'amend_goal' && current.packet.pause.slot !== undefined
+    && target?.goalId === current.packet.pause.slot.goalId
+    && target?.baseRevision === current.packet.pause.slot.revision;
+  const boundAnswer = !unreadable && typed !== undefined && 'disposition' in typed
+    && (typed.disposition === 'provided' || typed.disposition === 'selected');
+  // A single opaque slot can represent several required decisions. The
+  // model checks the whole delivered question even on the first reply;
+  // code must not equate a typed value with all decisions being supplied.
+  const completenessRequired = boundAnswer;
+  if (!unreadable && !sideConversation && !unbound && !continuing && !amending && !completenessRequired) return null;
   if (!nextRealSourceIs({
     sessionId: input.sessionId,
     originatingSourceUserSeq: current.packet.originatingSourceUserSeq,
@@ -215,14 +361,59 @@ export async function classifyUnsettledOpenQuestionReply(input: {
   const source = realAcceptedSource(input.sessionId, input.sourceUserSeq);
   const reply = typeof source?.data.text === 'string' ? source.data.text.trim() : '';
   if (!source || !reply) return null;
+  const sourceEdge = clarificationRevisionInputFor(current.packet, input.sourceUserSeq);
+  if (!sourceEdge) return null;
+  const claimed = withEventPublicationTransaction(() => {
+    const prior = openEventLog().prepare(`SELECT 1 FROM events WHERE session_id = ? AND seq > ?
+      AND type = 'guardrail_tripped' AND json_extract(data_json, '$.kind') = ?
+      AND json_extract(data_json, '$.sourceUserSeq') = ? LIMIT 1`)
+      .get(input.sessionId, input.sourceUserSeq, OPEN_QUESTION_REPLY_CLAIM, input.sourceUserSeq);
+    if (prior) return false;
+    appendEvent({ sessionId: input.sessionId, turn: source.turn, role: 'system', type: 'guardrail_tripped',
+      data: { kind: OPEN_QUESTION_REPLY_CLAIM, sourceUserSeq: input.sourceUserSeq,
+        parentPacketId: current.packet.packetId, parentSlot: current.packet.pause.slot ?? null,
+        sourceDigest: createHash('sha256').update(JSON.stringify(sourceEdge)).digest('hex'),
+        answerCompletenessRequired: completenessRequired } });
+    return true;
+  });
+  if (!claimed) return openQuestionReplyRouteFor(input.sessionId, input.sourceUserSeq);
   let route: OpenQuestionReplyRoute['route'] = 'respond';
   let recordedReading: Record<string, unknown> = { reading: 'side_conversation' };
-  if (!sideConversation) {
+  let skipRevision = false;
+  if (completenessRequired) {
+    const answer = Array.isArray(raw?.slotAnswers) ? raw.slotAnswers[0] as Record<string, unknown> | undefined : undefined;
+    const slot = current.packet.pause.slot;
+    const sameSlot = slot && target?.goalId === slot.goalId && target?.baseRevision === slot.revision
+      && answer?.questionId === slot.questionId && answer?.slotKey === slot.slotKey;
+    const checkedInput = sameSlot ? clarificationRevisionInputFor(current.packet, input.sourceUserSeq) : null;
+    const check = checkedInput
+      ? await (clarificationCompletenessForTests ?? checkClarificationAnswerCompleteness)(checkedInput)
+        .catch(() => ({ status: 'unavailable' as const, reason: 'review_failed' }))
+      : { status: 'unavailable' as const, reason: 'exact_answer_edge_unavailable' };
+    const verified = checkedInput && check.status !== 'unavailable'
+      ? validatedClarificationAnswerCompleteness(checkedInput, check.receipt) : null;
+    route = verified?.status === 'complete' ? 'settled' : 'reask';
+    skipRevision = check.status === 'unavailable' || verified === null;
+    recordedReading = { reading: 'checked_residual_answer', answerCompletenessRequired: true,
+      ...(verified ? { completeness: verified.receipt } : { revisionUnavailable: true }),
+    };
+  } else if (unreadable || amending || continuing) {
+    route = 'reask';
+    recordedReading = { reading: unreadable ? 'interpretation_unavailable' : relation };
+  } else if (!sideConversation) {
     const classify = openQuestionReplyClassifierForTests ?? classifyOpenQuestionReplyWithJev;
-    const reading: Awaited<ReturnType<typeof classifyOpenQuestionReplyWithJev>> = await classify(
-      { question: current.packet.pause.question, reply },
+    const inherited = modelUsageAttributionStorage.getStore();
+    const sameSource = inherited?.sessionId === input.sessionId && inherited.sourceUserSeq === input.sourceUserSeq;
+    // This reading precedes the foreground usage scope. Its checked source
+    // owns the call; an enclosing attempt belongs only to the same tuple.
+    const reading: Awaited<ReturnType<typeof classifyOpenQuestionReplyWithJev>> = await withModelUsageAttribution({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      attemptId: sameSource ? inherited?.attemptId : undefined,
+    }, () => classify(
+      { question: sourceEdge.deliveredQuestion, reply: sourceEdge.acceptedReply },
       { sessionId: input.sessionId },
-    ).catch(() => ({ kind: null, failedOpen: true }));
+    )).catch(() => ({ kind: null, failedOpen: true }));
     // A verbatim reask needs the exact reoffer to exist; without it, reply.
     if (
       reading.kind === 'answers'
@@ -234,7 +425,33 @@ export async function classifyUnsettledOpenQuestionReply(input: {
       ...(typeof reading.confidence === 'number' ? { confidence: reading.confidence } : {}),
     };
   }
-  appendEvent({
+  let revision: ProposedClarificationRevision | undefined;
+  if (route === 'reask' && !skipRevision) {
+    const revisionInput = clarificationRevisionInputFor(current.packet, input.sourceUserSeq);
+    const proposal = revisionInput
+      ? await (clarificationRevisionProposerForTests ?? proposeClarificationRevision)(revisionInput)
+        .catch(() => ({ status: 'unavailable' as const, stage: 'proposal', reason: 'proposal_failed' }))
+      : { status: 'unavailable' as const, stage: 'context', reason: 'exact_source_chain_unavailable' };
+    if (proposal.status === 'proposed' && revisionInput) {
+      revision = validatedClarificationRevision(revisionInput, proposal.revision) ?? undefined;
+      if (revision) route = 'revise';
+    }
+    const failureDiagnostic = proposal.status === 'unavailable' && 'diagnostic' in proposal
+      ? validatedClarificationFailureDiagnostic(proposal.diagnostic, input) : null;
+    const structuralDiagnostic = revisionInput && proposal.status === 'unavailable'
+      && proposal.stage === 'proposal' && proposal.reason === 'interpretation_unbound'
+      && 'structuralDiagnostic' in proposal
+      ? validatedClarificationStructuralDiagnostic(proposal.structuralDiagnostic, revisionInput) : null;
+    recordedReading = { ...recordedReading,
+      ...(failureDiagnostic ? { revisionDiagnostic: failureDiagnostic } : {}),
+      ...(structuralDiagnostic ? { revisionStructuralDiagnostic: structuralDiagnostic } : {}),
+      revisionStatus: revision ? 'proposed' : proposal.status,
+      ...(!revision && (proposal.status === 'unavailable' || proposal.status === 'proposed'
+        || proposal.reason === 'not_grounded') ? { revisionUnavailable: true } : {}),
+      ...(!revision && proposal.status !== 'proposed' ? { revisionReason: proposal.reason } : {}),
+    };
+  }
+  const retainedReading = appendEvent({
     sessionId: input.sessionId,
     turn: source.turn,
     role: 'system',
@@ -243,11 +460,16 @@ export async function classifyUnsettledOpenQuestionReply(input: {
       kind: OPEN_QUESTION_REPLY_RECORD,
       sourceUserSeq: input.sourceUserSeq,
       parentPacketId: current.packet.packetId,
+      parentSlot: current.packet.pause.slot ?? null,
       route,
       ...recordedReading,
+      ...(revision ? { revision } : {}),
     },
   });
-  return { route, parentPacketId: current.packet.packetId };
+  return { route, parentPacketId: current.packet.packetId,
+    ...(revision ? { revision } : {}),
+    ...(recordedReading.revisionUnavailable === true ? { revisionUnavailable: true, unavailableReadingEventId: retainedReading.id } : {}),
+    ...(recordedReading.answerCompletenessRequired === true ? { answerCompletenessRequired: true } : {}) };
 }
 
 /**
@@ -265,6 +487,18 @@ export function unresolvedClarificationReofferForAcceptedSource(input: {
   if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return null;
   // The brain answers this reply; a verbatim reask would leave it unanswered.
   if (repliedOpenQuestionPacket(input.sessionId, input.sourceUserSeq, current.packet)) return null;
+  const recordedReply = openQuestionReplyRouteFor(input.sessionId, input.sourceUserSeq);
+  const checkedRevision = recordedReply?.route === 'revise'
+    && (recordedReply.parentPacketId === current.packet.packetId
+      || (current.packet.originatingSourceUserSeq === input.sourceUserSeq
+        && current.packet.parentPacketId === recordedReply.parentPacketId));
+  const retainedAnswer = recordedReply?.route === 'reask' && recordedReply.answerCompletenessRequired
+    && (recordedReply.parentPacketId === current.packet.packetId
+      || (current.packet.originatingSourceUserSeq === input.sourceUserSeq
+        && current.packet.parentPacketId === recordedReply.parentPacketId));
+  const retainedAmendment = recordedReply?.route === 'reask'
+    && recordedReply.parentPacketId === current.packet.packetId
+    && taskRelationFromLastInterpretation(input.sessionId, input.sourceUserSeq) === 'amend_goal';
   const typed = typedClassificationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
   const unresolved = unresolvedOpenSlotTargetFromLastInterpretation(
     input.sessionId,
@@ -272,7 +506,7 @@ export function unresolvedClarificationReofferForAcceptedSource(input: {
   );
   const continuing = unresolved !== null
     && taskRelationFromLastInterpretation(input.sessionId, input.sourceUserSeq) === 'continue_goal';
-  if (!continuing && (!typed || !('keepOpen' in typed) || typed.metaAction !== undefined)) return null;
+  if (!checkedRevision && !retainedAnswer && !retainedAmendment && !continuing && (!typed || !('keepOpen' in typed) || typed.metaAction !== undefined)) return null;
   // The host could not READ the answer at all (the projection was rejected or
   // never persisted). That is not the user's fault and never a reason to park
   // the session: the open question is re-asked so the next answer stays
@@ -283,7 +517,7 @@ export function unresolvedClarificationReofferForAcceptedSource(input: {
   const openSlot = current.packet.pause.slot;
   if (
     !openSlot
-    || (!unresolved && !unreadable)
+    || (!checkedRevision && !retainedAnswer && !retainedAmendment && !unresolved && !unreadable)
     || (
       unresolved
       && unresolved.target !== null
@@ -305,14 +539,28 @@ export function unresolvedClarificationReofferForAcceptedSource(input: {
       consumingSourceUserSeq: input.sourceUserSeq,
     })
   ) return null;
+  const revision = checkedRevision ? recordedReply?.revision : undefined;
+  const question = revision
+    ? [revision.acknowledgment, revision.question].filter(Boolean).join('\n\n')
+    : packet.pause.question;
+  const annotation: ClarificationUnavailableAnnotationV1 | undefined = replay
+    ? packet.publicQuestion?.annotation
+    : recordedReply?.revisionUnavailable && recordedReply.unavailableReadingEventId
+      ? Object.freeze({ version: 1, kind: 'clarification_reading_unavailable',
+        sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+        parentPacketId: packet.packetId, readingEventId: recordedReply.unavailableReadingEventId,
+        referenceSha256: clarificationReferenceDigest(question, packet.pause.options) })
+      : undefined;
+  const publicText = annotation ? renderClarificationUnavailable(question) : question;
   return Object.freeze({
     version: 1,
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
-    parentPacketId: packet.packetId,
+    parentPacketId: replay && packet.parentPacketId ? packet.parentPacketId : packet.packetId,
     rootSourceUserSeq: packet.rootSourceUserSeq ?? packet.originatingSourceUserSeq,
-    question: packet.pause.question,
-    options: Object.freeze([...packet.pause.options]),
+    question, publicText,
+    ...(annotation ? { annotation } : {}),
+    options: Object.freeze([...(revision ? revision.options : packet.pause.options)]),
     ...(packet.pause.slot ? { slot: Object.freeze({ ...packet.pause.slot }) } : {}),
     capabilities: Object.freeze(packet.capabilities.map((row) => Object.freeze({
       ...row,
@@ -684,6 +932,17 @@ export function persistCommittedClarificationContinuity(input: {
   const options = (Array.isArray(awaiting.data.options) ? awaiting.data.options : [])
     .map((option) => normalized(option))
     .filter(Boolean);
+  const recordedRevision = openQuestionReplyRouteFor(source.sessionId, source.seq);
+  if (awaiting.data.source === 'continuation_unresolved_reoffer'
+    && typeof awaiting.data.continuityParentPacketId === 'string'
+    && recordedRevision !== null) {
+    // Repair only the exact committed display edge after a crash between the
+    // terminal and successor CAS. The retained checked reply is revalidated;
+    // an arbitrary public question cannot supersede a pending packet here.
+    return finalizeUnresolvedClarificationReoffer({ sessionId: source.sessionId,
+      sourceUserSeq: source.seq, parentPacketId: awaiting.data.continuityParentPacketId,
+      awaitingEventId: awaiting.id, terminalEventId: terminalEvent.id });
+  }
   const current = peekTaskContinuityPacket({ sessionId: source.sessionId });
   // The schema normally makes this impossible. If storage was copied or its
   // uniqueness invariant was damaged, never let a newly committed question
@@ -1076,7 +1335,8 @@ function frozenResolutionFor(input: {
   answer: string;
   classification: ClarificationAnswerClassification;
   resolverVersion?: typeof CLARIFICATION_RESOLVER_VERSION
-    | typeof SEMANTIC_CLARIFICATION_RESOLVER_VERSION;
+    | typeof SEMANTIC_CLARIFICATION_RESOLVER_VERSION
+    | typeof CHAINED_CLARIFICATION_RESOLVER_VERSION;
 }): TaskContinuityFrozenResolution | null {
   const semanticInput = retrievalQueryForClassification(
     input.parentInput,
@@ -1112,7 +1372,9 @@ function clarificationContextFromPacket(input: {
   const rootSourceUserSeq = input.packet.rootSourceUserSeq
     ?? input.packet.originatingSourceUserSeq;
   const parent = realAcceptedSource(input.sessionId, rootSourceUserSeq);
-  const parentInput = normalized(parent?.data.text);
+  const parentInput = input.frozenResolution.resolverVersion === CHAINED_CLARIFICATION_RESOLVER_VERSION
+    ? clarificationParentInputFromChain(input.packet, input.sourceUserSeq)
+    : normalized(parent?.data.text);
   if (!parentInput || parentInput.length > MAX_CLARIFICATION_PARENT_CHARS) return null;
   const classification: ClarificationAnswerClassification = {
     disposition: input.frozenResolution.disposition,
@@ -1128,9 +1390,11 @@ function clarificationContextFromPacket(input: {
     question: input.packet.pause.question,
     answer: input.answer,
     classification,
-    resolverVersion: input.frozenResolution.resolverVersion === SEMANTIC_CLARIFICATION_RESOLVER_VERSION
-      ? SEMANTIC_CLARIFICATION_RESOLVER_VERSION
-      : CLARIFICATION_RESOLVER_VERSION,
+    resolverVersion: input.frozenResolution.resolverVersion === CHAINED_CLARIFICATION_RESOLVER_VERSION
+      ? CHAINED_CLARIFICATION_RESOLVER_VERSION
+      : input.frozenResolution.resolverVersion === SEMANTIC_CLARIFICATION_RESOLVER_VERSION
+        ? SEMANTIC_CLARIFICATION_RESOLVER_VERSION
+        : CLARIFICATION_RESOLVER_VERSION,
   });
   if (
     !frozenResolution
@@ -1140,6 +1404,7 @@ function clarificationContextFromPacket(input: {
     || (
       input.frozenResolution.resolverVersion !== CLARIFICATION_RESOLVER_VERSION
       && input.frozenResolution.resolverVersion !== SEMANTIC_CLARIFICATION_RESOLVER_VERSION
+      && input.frozenResolution.resolverVersion !== CHAINED_CLARIFICATION_RESOLVER_VERSION
     )
     || input.frozenResolution.semanticInputHash !== frozenResolution.semanticInputHash
   ) return null;
@@ -1251,6 +1516,12 @@ function consumeContinuationContext(input: {
     dismissTaskContinuityPacket({ sessionId: input.sessionId, reason: 'invalidated' });
     return null;
   }
+  const replyRoute = openQuestionReplyRouteFor(input.sessionId, input.sourceUserSeq);
+  const checkedAnswer = semanticPortParticipated(input.sessionId, input.sourceUserSeq)
+    && input.typedClassification && 'disposition' in input.typedClassification
+    && (input.typedClassification.disposition === 'provided' || input.typedClassification.disposition === 'selected');
+  if ((hasCheckedRevisionChain(packet) || checkedAnswer) && replyRoute?.route !== 'settled') return null;
+  if (replyRoute?.parentPacketId === packet.packetId && (replyRoute.route === 'reask' || replyRoute.route === 'revise')) return null;
   if (input.typedClassification && 'keepOpen' in input.typedClassification) {
     return null;
   }
@@ -1297,17 +1568,19 @@ function consumeContinuationContext(input: {
   }
   const rootSourceUserSeq = packet.rootSourceUserSeq
     ?? packet.originatingSourceUserSeq;
-  const parentInput = normalized(realAcceptedSource(
-    input.sessionId,
-    rootSourceUserSeq,
-  )?.data.text);
+  const checkedChain = hasCheckedRevisionChain(packet);
+  const parentInput = checkedChain
+    ? clarificationParentInputFromChain(packet)
+    : normalized(realAcceptedSource(input.sessionId, rootSourceUserSeq)?.data.text);
   if (!parentInput || parentInput.length > MAX_CLARIFICATION_PARENT_CHARS) return null;
   const resolution = frozenResolutionFor({
     parentInput,
     question: packet.pause.question,
     answer: input.answer,
     classification,
-    ...(input.typedClassification
+    ...(checkedChain
+      ? { resolverVersion: CHAINED_CLARIFICATION_RESOLVER_VERSION }
+      : input.typedClassification
       ? { resolverVersion: SEMANTIC_CLARIFICATION_RESOLVER_VERSION }
       : {}),
   });
@@ -2275,6 +2548,14 @@ export async function enrichAcceptedRequestWithTaskContinuity(
       taskContinuationResolved: true,
       turnCandidates: resolved,
     };
+  }
+  const pendingReplyRoute = openQuestionReplyRouteFor(request.sessionId, sourceUserSeq);
+  if (pendingReplyRoute && (pendingReplyRoute.route === 'reask' || pendingReplyRoute.route === 'revise')) {
+    // A display revision cannot turn an amendment into an execution graph or
+    // dismiss the remaining decisions. The exact pending packet stays open;
+    // the host publishes its needs-input successor before building an agent.
+    const { semanticTaskInput: _semantic, taskContinuation: _context, ...safe } = request;
+    return { ...safe, taskContinuationResolved: true };
   }
   if (options.typedClassification && 'keepOpen' in options.typedClassification) {
     const metaInput = verifiedMetaContinuationInput({

@@ -37,11 +37,16 @@ test('every non-final control state has an owner and a wake condition', () => {
 
 test('deterministic copy never depends on a model sentence', () => {
   const blocked = renderTypedControlState({ status: 'blocked' });
-  assert.match(blocked, /continue this exact request/i);
+  assert.match(blocked, /unfinished.*cause is not confirmed.*check the blocker/i);
+  assert.doesNotMatch(blocked, /provider|connection/i, 'Default hold is not observation of a failed provider.');
   const question = renderTypedControlState({ status: 'needs_input', needs: { kind: 'input' } });
-  assert.match(question, /resume this exact request/i);
+  assert.match(question, /unfinished.*information.*check what information is still missing/i);
   const uncertain = renderTypedControlState({ status: 'uncertain' });
-  assert.match(uncertain, /have not retried/i);
+  assert.match(uncertain, /may already have happened.*unfinished.*check the outcome/i);
+  for (const text of [blocked, question, uncertain]) {
+    assert.doesNotMatch(text, /I will (?:continue|resume|reconcile)|nothing (?:new )?was started|have not retried/i,
+      'A declared control state cannot certify an armed wake or historical effect receipt.');
+  }
 });
 
 function identity(sessionId: string) {
@@ -61,7 +66,8 @@ test('an empty or unsafe author on a control state still publishes the host sent
   const published = presentationEventForOutcome(blocked);
   assert.equal(published.status, 'blocked');
   assert.ok(published.text.trim().length > 0);
-  assert.match(published.text, /continue this exact request/i);
+  assert.match(published.text, /unfinished.*cause is not confirmed.*check the blocker/i);
+  assert.doesNotMatch(published.text, /provider|connection|I will continue/i);
 
   const questionId = identity('sess-author-outage-question');
   const question: TurnOutcome = {
@@ -75,7 +81,49 @@ test('an empty or unsafe author on a control state still publishes the host sent
   };
   const asked = presentationEventForOutcome(question);
   assert.equal(asked.status, 'needs_input');
-  assert.match(asked.text, /resume this exact request/i);
+  assert.match(asked.text, /unfinished.*check what information is still missing/i);
+});
+
+test('an unsafe Continue author preserves the real control instead of asking for new information', () => {
+  const id = identity('sess-author-outage-continue');
+  const outcome: TurnOutcome = {
+    version: 2,
+    id: turnOutcomeId(id),
+    identity: id,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'continue' },
+    presentation: { kind: 'continue', text: '' },
+  };
+  const event = presentationEventForOutcome(outcome);
+  assert.equal(event.status, 'needs_input');
+  assert.equal(event.kind, 'continue');
+  assert.equal(event.resumable, true);
+  assert.deepEqual(event.identity, id);
+  assert.deepEqual(event.needs, { kind: 'continue' });
+  assert.match(event.text, /unfinished.*Use Continue here/i);
+  assert.doesNotMatch(event.text, /information|send.*again|I will continue/i);
+});
+
+test('blocked fallback reports only declared facts and leaves its wake and owner unchanged', () => {
+  const cases = [
+    ['budget_exhausted', /budget/],
+    ['lease_unavailable', /activation holds/],
+    ['reconciliation_pending', /effect may already/],
+    ['admission_refused', /could not admit/],
+    ['capability_identity_mismatch', /could not admit/],
+    ['observation_unavailable', /observation is unavailable/],
+    ['provider_unavailable', /provider is unavailable/],
+  ] as const;
+  for (const [reason, expectedFact] of cases) {
+    const hold = defaultHoldForControlState({ status: 'blocked', hold: reason });
+    const original = structuredClone(hold);
+    const text = renderTypedControlState({ status: 'blocked', hold });
+    assert.match(text, expectedFact);
+    assert.match(text, /unfinished.*Ask me to check/);
+    assert.doesNotMatch(text, /I will (?:continue|resume|reconcile)|nothing .*started|have not retried|host defect/);
+    assert.deepEqual(hold, original, 'Rendering cannot change the typed wake or owner.');
+  }
 });
 
 test('a completed answer with empty or unsafe author still fails closed', () => {

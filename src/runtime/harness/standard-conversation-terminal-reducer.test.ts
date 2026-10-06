@@ -2,6 +2,7 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { after, beforeEach, test } from 'node:test';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-standard-terminal-reducer-'));
@@ -12,8 +13,182 @@ const eventlog = await import('./eventlog.js');
 const {
   _testOnly_reduceStandardConversationTerminal: reduceStandardConversationTerminal,
   modelCheckInForExhaustedTurn,
+  runConversation,
 } = await import('./loop.js');
 const { MISSING_REPLY_USER_FALLBACK } = await import('./turn-decision.js');
+const { BoundaryError } = await import('../boundary-error.js');
+const { CodexModelError } = await import('./codex-model.js');
+const { projectHarnessEventForPublic, PUBLIC_CODEX_AUTH_EXPIRED_TEXT, PUBLIC_BLOCKED_NEXT_STEP_TEXT } = await import('./public-presentation.js');
+
+const EMPTY_STOP_TEXT = 'I did not receive a usable reply or next step from the model, so this request is still unfinished. Ask me to continue the unfinished work, or choose another model.';
+
+test('typed empty stop survives the production result carrier and replay preserves a settled effect receipt', async () => {
+  const sessionId = 'typed-empty-effect-replay';
+  const source = acceptedSource(sessionId);
+  let calls = 0;
+  const options = {
+    sessionId, sourceUserSeq: source.sourceUserSeq, reuseRecordedUserInput: true,
+    agent: {} as never, input: 'Please answer this request.', judgeCompletion: false,
+    makeRunner: () => new EventEmitter() as never,
+    runRunner: async () => {
+      calls += 1;
+      const reserved = eventlog.appendEvent({ sessionId, turn: source.turn, role: 'system', type: 'external_write',
+        data: { sourceUserSeq: source.sourceUserSeq, callId: 'effect-once', preDispatch: true, shapeKey: 'LOCAL_SAVE' } });
+      eventlog.appendEvent({ sessionId, turn: source.turn, role: 'system', type: 'external_write_succeeded',
+        parentEventId: reserved.id, data: { sourceUserSeq: source.sourceUserSeq, callId: 'effect-once', shapeKey: 'LOCAL_SAVE' } });
+      throw new BoundaryError({ kind: 'model.empty_completion', retryable: true,
+        userMessage: 'PRIVATE PROVIDER MESSAGE', operatorMessage: 'PRIVATE_EMPTY_DIAGNOSTIC' });
+    },
+  };
+  const failed = await runConversation(options);
+  assert.equal(failed.publicPresentation?.text, EMPTY_STOP_TEXT);
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.publicPresentation?.resumable, false);
+  assert.equal(failed.publicPresentation?.identity.sourceUserSeq, source.sourceUserSeq);
+  const effects = eventlog.listEvents(sessionId, { types: ['external_write', 'external_write_succeeded'] });
+  assert.equal(effects.length, 2);
+  const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(failed.failureKind, 'model.empty_completion');
+  assert.equal(eventlog.listEvents(sessionId, { types: ['run_failed'] }).at(-1)?.data.failureKind, 'model.empty_completion');
+  assert.equal(terminal.data.failureDetail, 'PRIVATE_EMPTY_DIAGNOSTIC');
+  assert.doesNotMatch(JSON.stringify(projectHarnessEventForPublic(terminal)), /PRIVATE_EMPTY_DIAGNOSTIC|failureDetail/);
+  assert.doesNotMatch(failed.publicPresentation?.text ?? '', /PRIVATE|no tools|nothing changed|usage|sign.in/i);
+  const replay = await runConversation(options);
+  assert.equal(calls, 1, 'reading the exact failed winner must not re-run the model or effect');
+  assert.deepEqual(replay.publicPresentation, failed.publicPresentation);
+  assert.deepEqual(eventlog.listEvents(sessionId, { types: ['external_write', 'external_write_succeeded'] }), effects);
+  assert.equal(eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+});
+
+test('generic blocked stop preserves the exact source and settled receipt without asserting no effects', () => {
+  const sessionId = 'blocked-effect-source';
+  const source = acceptedSource(sessionId);
+  const reserved = eventlog.appendEvent({ sessionId, turn: source.turn, role: 'system', type: 'external_write',
+    data: { sourceUserSeq: source.sourceUserSeq, callId: 'prior-write', preDispatch: true, shapeKey: 'LOCAL_SAVE' } });
+  const settled = eventlog.appendEvent({ sessionId, turn: source.turn, role: 'system', type: 'external_write_succeeded',
+    parentEventId: reserved.id, data: { sourceUserSeq: source.sourceUserSeq, callId: 'prior-write', shapeKey: 'LOCAL_SAVE' } });
+  const input = { sourceUserSeq: source.sourceUserSeq,
+    result: { sessionId, status: 'blocked' as const, steps: 1, lastTurn: source.turn } };
+  const result = reduceStandardConversationTerminal(input);
+  assert.equal(result.publicPresentation?.text, PUBLIC_BLOCKED_NEXT_STEP_TEXT);
+  assert.equal(result.publicPresentation?.status, 'blocked');
+  assert.equal(result.publicPresentation?.resumable, true);
+  assert.equal(result.publicPresentation?.identity.sourceUserSeq, source.sourceUserSeq);
+  assert.doesNotMatch(result.publicPresentation?.text ?? '', /no tools|nothing changed|before using any tools/i);
+  assert.deepEqual(reduceStandardConversationTerminal(input).publicPresentation, result.publicPresentation);
+  assert.deepEqual(eventlog.listEvents(sessionId, { types: ['external_write_succeeded'] }), [settled]);
+  assert.equal(eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  const next = eventlog.appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Next.' } });
+  const named = reduceStandardConversationTerminal({ sourceUserSeq: next.seq,
+    result: { sessionId, status: 'blocked', steps: 1, lastTurn: 2, error: 'The saved model is unavailable. Choose another model.' } });
+  assert.equal(named.publicPresentation?.text, 'The saved model is unavailable. Choose another model.');
+});
+
+test('proven Codex revocation retains reconnect instructions across result, exact-source replay and unrelated failure', async () => {
+  const { clearCodexAuthDead, isCodexAuthDead } = await import('../auth-store.js');
+  clearCodexAuthDead();
+  try {
+    const sessionId = 'codex-revoked-result-carrier';
+    const source = acceptedSource(sessionId);
+    let calls = 0;
+    const options = { sessionId, sourceUserSeq: source.sourceUserSeq, reuseRecordedUserInput: true,
+      agent: {} as never, input: 'Please answer this request.', judgeCompletion: false,
+      makeRunner: () => new EventEmitter() as never,
+      runRunner: async () => { calls += 1; throw new CodexModelError('Codex /responses returned 401: token_revoked PRIVATE', 401); } };
+    const failed = await runConversation(options);
+    assert.equal(failed.publicPresentation?.text, PUBLIC_CODEX_AUTH_EXPIRED_TEXT);
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.publicPresentation?.resumable, false);
+    assert.equal(failed.publicPresentation?.identity.sourceUserSeq, source.sourceUserSeq);
+    assert.equal(isCodexAuthDead(), true, 'the existing revocation branch still latches auth');
+    const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)!;
+    assert.equal(failed.failureKind, 'codex.auth_expired');
+    assert.equal(eventlog.listEvents(sessionId, { types: ['run_failed'] }).at(-1)?.data.failureKind, 'codex.auth_expired');
+    assert.doesNotMatch(JSON.stringify(projectHarnessEventForPublic(terminal)), /PRIVATE|token_revoked|login-native|failureDetail/);
+    assert.deepEqual((await runConversation(options)).publicPresentation, failed.publicPresentation);
+    assert.equal(calls, 1, 'exact failed source replay never retries revoked auth');
+    const next = eventlog.appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Different request.' } });
+    const unrelated = await runConversation({ ...options, sourceUserSeq: next.seq, input: 'Different request.',
+      runRunner: async () => { throw new Error('PRIVATE unrelated tool failure'); } });
+    assert.match(unrelated.publicPresentation?.text ?? '', /cause.*not.*confirmed/i);
+    assert.doesNotMatch(unrelated.publicPresentation?.text ?? '', /sign.in|token_revoked|PRIVATE/i);
+    assert.equal(unrelated.publicPresentation?.identity.sourceUserSeq, next.seq);
+    assert.equal(eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)?.data.failureKind, undefined);
+  } finally { clearCodexAuthDead(); }
+});
+
+test('foreign auth-shaped failures cannot inherit a confident Codex public reason from its dead latch', async () => {
+  const { clearCodexAuthDead, markCodexAuthDead } = await import('../auth-store.js');
+  clearCodexAuthDead();
+  markCodexAuthDead('fixture-only existing Codex revocation');
+  try {
+    for (const status of [401, 403]) {
+      const sessionId = `foreign-auth-dead-codex-${status}`;
+      const source = acceptedSource(sessionId);
+      let calls = 0;
+      const options = { sessionId, sourceUserSeq: source.sourceUserSeq, reuseRecordedUserInput: true,
+        agent: {} as never, input: 'Please answer this request.', judgeCompletion: false,
+        makeRunner: () => new EventEmitter() as never,
+        runRunner: async () => { calls += 1; throw Object.assign(new Error('BYO provider rejected its own key PRIVATE'), { status }); } };
+      const result = await runConversation(options);
+      assert.equal(result.status, 'failed');
+      assert.equal(result.failureKind, undefined, 'the legacy classifier is not Codex origin proof');
+      assert.match(result.publicPresentation?.text ?? '', /cause.*not.*confirmed/i);
+      assert.match(result.publicPresentation?.text ?? '', /what completed.*what remains.*before retrying/i);
+      assert.doesNotMatch(result.publicPresentation?.text ?? '', /Codex|sign.in|PRIVATE|no tools|nothing changed/i);
+      assert.equal(result.publicPresentation?.identity.sourceUserSeq, source.sourceUserSeq);
+      assert.deepEqual((await runConversation(options)).publicPresentation, result.publicPresentation);
+      assert.equal(calls, 1);
+      assert.equal(eventlog.listEvents(sessionId, { types: ['run_failed'] }).at(-1)?.data.failureKind, undefined);
+    }
+  } finally { clearCodexAuthDead(); }
+});
+
+test('typed empty stop is source-bound and raw or previous failure wording has no typed authority', () => {
+  const sessionId = 'typed-empty-source-isolation';
+  const first = acceptedSource(sessionId);
+  const firstResult = reduceStandardConversationTerminal({ sourceUserSeq: first.sourceUserSeq,
+    result: { sessionId, status: 'failed', steps: 1, lastTurn: first.turn,
+      failureKind: 'model.empty_completion', error: 'private first failure' } });
+  assert.equal(firstResult.publicPresentation?.text, EMPTY_STOP_TEXT);
+  const next = eventlog.appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Another request.' } });
+  eventlog.appendEvent({ sessionId, turn: 2, role: 'system', type: 'run_failed',
+    data: { sourceUserSeq: first.sourceUserSeq, failureKind: 'model.empty_completion', error: 'old empty completion' } });
+  const second = reduceStandardConversationTerminal({ sourceUserSeq: next.seq,
+    result: { sessionId, status: 'failed', steps: 1, lastTurn: next.turn,
+      error: 'model.empty_completion: PRIVATE_EMPTY_DIAGNOSTIC' } });
+  assert.match(second.publicPresentation?.text ?? '', /cause.*not.*confirmed/i);
+  assert.match(second.publicPresentation?.text ?? '', /what completed.*what remains.*before retrying/i);
+  assert.doesNotMatch(second.publicPresentation?.text ?? '', /PRIVATE|model finished|no tools|nothing changed/i);
+  assert.equal(second.publicPresentation?.identity.sourceUserSeq, next.seq);
+  assert.equal(eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)?.data.failureKind, undefined);
+});
+
+test('public budget stop gives an ordinary next action at the exact source without another dispatch', async () => {
+  const sessionId = 'budget-stop-next-action';
+  const source = acceptedSource(sessionId);
+  let calls = 0;
+  const result = await runConversation({ sessionId, sourceUserSeq: source.sourceUserSeq,
+    reuseRecordedUserInput: true, agent: {} as never, input: 'Please answer this request.',
+    judgeCompletion: false, maxSteps: 1, makeRunner: () => new EventEmitter() as never,
+    runRunner: async (_runner, _agent, items) => {
+      calls += 1;
+      return { history: items, finalOutput: 'CONTINUE: There is more work remaining.', toolCalls: 3 } as never;
+    } });
+  assert.equal(calls, 1, 'publishing guidance does not spend another model turn');
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.publicPresentation?.status, 'blocked');
+  assert.equal(result.publicPresentation?.kind, 'blocked');
+  assert.equal(result.publicPresentation?.resumable, true);
+  assert.equal(result.publicPresentation?.identity.sourceUserSeq, source.sourceUserSeq);
+  assert.match(result.publicPresentation?.text ?? '', /step budget.*more work remaining/i);
+  assert.match(result.publicPresentation?.text ?? '', /Ask me to continue the unfinished work\./);
+  const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(terminal.data.reason, 'step_budget_parked');
+  assert.equal(terminal.data.sourceUserSeq, source.sourceUserSeq);
+  assert.equal((terminal.data.turnOutcome as { needs?: unknown }).needs, undefined, 'no synthetic Continue control');
+  assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called', 'external_write', 'external_write_succeeded'] }).length, 0);
+});
 
 beforeEach(() => {
   eventlog.resetEventLog();
@@ -316,7 +491,8 @@ test('a model account out of usage or credit is named, with the provider words; 
   assert.match(shaped, /used up its usage/);
   assert.doesNotMatch(shaped, /provider said|usage_limit_reached|\{/, 'a structured payload is not quoted');
   const other = reduceFailed('capacity-other', 'socket hang up');
-  assert.match(other, /Something went wrong/);
+  assert.match(other, /cause.*not.*confirmed/i);
+  assert.match(other, /what completed.*what remains.*before retrying/i);
   assert.doesNotMatch(other, /socket/);
 });
 

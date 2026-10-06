@@ -53,6 +53,7 @@ import {
 } from './artifact-ledger.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import {
+  PUBLIC_BLOCKED_NEXT_STEP_TEXT,
   PUBLIC_RUN_FAILURE_TEXT,
   heldExecutionTextForInternalReason,
   isHostAuthorityHeldReason,
@@ -152,13 +153,13 @@ export interface ConstructRunResult {
   error?: string;
 }
 
-function safeTypedTerminalText(
+export function safeTypedTerminalText(
   status: 'blocked' | 'failed' | 'uncertain' | 'needs_input',
   internalReason = '',
 ): string {
   if (status === 'failed') return PUBLIC_RUN_FAILURE_TEXT;
   if (status === 'needs_input') {
-    return 'This task is paused at a safe checkpoint. Tell me to continue when you are ready.';
+    return 'This task is paused and still unfinished. Ask me to check what completed and what remains before continuing.';
   }
   if (status === 'uncertain') {
     return renderTypedControlState({ status: 'uncertain' });
@@ -166,7 +167,7 @@ function safeTypedTerminalText(
   if (isHostAuthorityHeldReason(internalReason)) {
     return heldExecutionTextForInternalReason(internalReason, 'blocked');
   }
-  return 'I could not safely complete and verify every required step, so I stopped without reporting the task as done. The technical details are available in the activity log.';
+  return PUBLIC_BLOCKED_NEXT_STEP_TEXT;
 }
 
 export type AdmittedGraphRunFault =

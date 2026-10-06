@@ -51,6 +51,8 @@ import { withConversationProtocolBoundaryAssertion } from './conversation-protoc
 import { recordModelUsage } from '../usage-log.js';
 import { recordWindowAcceptance } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
+import { appendEvent } from './eventlog.js';
+import { RawClaudeStreamObservation, rawClaudeReportedModel, rawClaudeTraceIdentity, type RawClaudeStreamDiagnostic } from './claude-stream-diagnostics.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-model' });
@@ -1076,15 +1078,18 @@ export function rawClaudeUsageFields(response: ModelResponse): RawClaudeUsageFie
 /** Outermost raw-Messages accounting wrapper. It sits outside resilience so a
  * successful logical model call is recorded once, while the returned Usage
  * already includes the adapter's provider-reported cache details. */
+type RawClaudeCallContext = Pick<NonNullable<ReturnType<typeof harnessRunContextStorage.getStore>>,
+  'sessionId' | 'sourceUserSeq' | 'runAttemptId' | 'promptComponents' | 'turn'>;
 class RawClaudeUsageRecordingModel implements Model {
   constructor(
     private readonly inner: Model,
     private readonly modelId: string,
     private readonly usageRecorder: typeof recordModelUsage,
     private readonly windowRecorder: typeof recordWindowAcceptance,
+    private readonly diagnosticRecorder: (entry: RawClaudeStreamDiagnostic) => void,
   ) {}
 
-  private record(response: ModelResponse, startedAt: number): void {
+  private record(response: ModelResponse, startedAt: number, context: RawClaudeCallContext | undefined = harnessRunContextStorage.getStore()): void {
     try {
       const fields = rawClaudeUsageFields(response);
       if (fields.inputTokens === 0 && fields.outputTokens === 0) return;
@@ -1094,12 +1099,15 @@ class RawClaudeUsageRecordingModel implements Model {
       if (fields.inputTokens > 0 && fields.cachedInputTokens <= fields.inputTokens) {
         try { this.windowRecorder(this.modelId, fields.inputTokens); } catch { /* best effort */ }
       }
-      const context = harnessRunContextStorage.getStore();
+      const providerReportedModel = rawClaudeReportedModel(response.providerData?.providerReportedModel)
+        ?? rawClaudeReportedModel(response.providerData?.model);
       this.usageRecorder({
         sessionId: context?.sessionId ?? 'unknown',
         sourceUserSeq: context?.sourceUserSeq,
         attemptId: context?.runAttemptId,
         model: this.modelId,
+        requestModel: this.modelId,
+        ...(providerReportedModel ? { providerReportedModel } : {}),
         // The adapter reports Anthropic usage as a total: fresh input, cache
         // writes and cache reads together, with the reads broken out. The raw
         // wire's input_tokens excludes reads; this usage does not.
@@ -1120,20 +1128,69 @@ class RawClaudeUsageRecordingModel implements Model {
     return response;
   }
 
-  async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
-    const startedAt = Date.now();
-    let recorded = false;
-    for await (const event of this.inner.getStreamedResponse(request)) {
-      if (!recorded && event.type === 'response_done') {
-        const response = (event as unknown as { response?: ModelResponse }).response;
-        if (response) {
-          recorded = true;
-          this.record(response, startedAt);
+  getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+    // Capture before returning the iterable: the host may drain it outside the
+    // original async-local scope. Never join a later session to this source.
+    const current = harnessRunContextStorage.getStore();
+    const context: RawClaudeCallContext | undefined = current && {
+      sessionId: current.sessionId, sourceUserSeq: current.sourceUserSeq,
+      runAttemptId: current.runAttemptId, turn: current.turn, promptComponents: current.promptComponents,
+    };
+    const self = this;
+    return (async function* () {
+      const startedAt = Date.now();
+      const observation = new RawClaudeStreamObservation();
+      let recorded = false;
+      let settlement: RawClaudeStreamDiagnostic['settlement'] = 'closed';
+      try {
+        for await (const event of self.inner.getStreamedResponse(request)) {
+          try { observation.observe(event); } catch { /* diagnostics never control the stream */ }
+          let outgoing = event;
+          if (event.type === 'response_done') {
+            const response = (event as unknown as { response?: ModelResponse }).response;
+            if (response) {
+              let enriched = response;
+              try { enriched = observation.enrich(response); } catch { /* metadata projection is best effort */ }
+              outgoing = { ...event, response: { ...event.response, providerData: enriched.providerData } } as StreamEvent;
+              if (!recorded) {
+                recorded = true;
+                self.record(enriched, startedAt, context);
+              }
+            }
+          }
+          yield outgoing;
+        }
+        settlement = 'completed';
+      } catch (error) {
+        settlement = 'error';
+        throw error;
+      } finally {
+        // Exactly one best-effort record for this observed wrapper call,
+        // including throw/consumer-close. Inner hidden retries are not counted.
+        if (context && rawClaudeTraceIdentity(context.sessionId) && context.sessionId !== 'unknown'
+          && Number.isSafeInteger(context.sourceUserSeq) && (context.sourceUserSeq ?? 0) > 0) {
+          try {
+            self.diagnosticRecorder({
+              kind: 'raw_claude_stream', transport: 'raw_messages',
+              sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq!,
+              turn: Number.isSafeInteger(context.turn) && (context.turn ?? 0) >= 0 ? context.turn! : 0,
+              ...(rawClaudeTraceIdentity(context.runAttemptId) ? { attemptId: context.runAttemptId } : {}),
+              ...(rawClaudeReportedModel(self.modelId) ? { requestModel: self.modelId } : {}),
+              elapsedMs: Math.max(0, Date.now() - startedAt), settlement,
+              ...observation.summary(),
+            });
+          } catch { /* diagnostics never change a result or its error */ }
         }
       }
-      yield event;
-    }
+    })();
   }
+}
+
+function recordRawClaudeStreamDiagnostic(entry: RawClaudeStreamDiagnostic): void {
+  appendEvent({
+    sessionId: entry.sessionId, turn: entry.turn, role: 'system', type: 'model_stream_diagnostic',
+    data: { ...entry },
+  });
 }
 
 /** Testable/public decorator seam for the raw Claude transport. The optional
@@ -1144,8 +1201,9 @@ export function withRawClaudeUsageRecording(
   modelId: string,
   usageRecorder: typeof recordModelUsage = recordModelUsage,
   windowRecorder: typeof recordWindowAcceptance = recordWindowAcceptance,
+  diagnosticRecorder: (entry: RawClaudeStreamDiagnostic) => void = recordRawClaudeStreamDiagnostic,
 ): Model {
-  return new RawClaudeUsageRecordingModel(inner, modelId, usageRecorder, windowRecorder);
+  return new RawClaudeUsageRecordingModel(inner, modelId, usageRecorder, windowRecorder, diagnosticRecorder);
 }
 
 /** Per-request transport router (owner question, 2026-07-24: "why can't

@@ -67,7 +67,8 @@ const capabilityHealth = await import('./capability-health.js');
 // eslint-disable-next-line import/first
 const { actionBus } = await import('../action-bus.js');
 // eslint-disable-next-line import/first
-const { PUBLIC_RUN_FAILURE_TEXT } = await import('./public-presentation.js');
+const { PUBLIC_RUN_FAILURE_TEXT, projectHarnessEventForPublic } = await import('./public-presentation.js');
+const { BoundaryError } = await import('../boundary-error.js');
 // eslint-disable-next-line import/first
 const { HarnessSession } = await import('./session.js');
 // eslint-disable-next-line import/first
@@ -76,6 +77,8 @@ const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { presentationEventForOutcome, turnOutcomeId } = await import('./turn-outcome.js');
 // eslint-disable-next-line import/first
 const { inspectDurableMaterialSourceContinuation } = await import('./task-continuity-runtime.js');
+const continuityRuntime = await import('./task-continuity-runtime.js');
+const { checkClarificationAnswerCompleteness } = await import('../semantic-boundary/clarification-revision.js');
 // eslint-disable-next-line import/first
 const schemaCache = await import('../../tools/composio-schema-cache.js');
 // eslint-disable-next-line import/first
@@ -170,6 +173,11 @@ function stubAnswerPresentation(
  * says this exact accepted source answered an open slot with a value. The
  * production bridge reads this durable claim; an unlinked event is ignored. */
 function recordTypedProvidedAnswer(source: import('./eventlog.js').EventRow): void {
+  const pending = peekTaskContinuityPacket({ sessionId: source.sessionId });
+  assert.equal(pending.status, 'available');
+  if (pending.status !== 'available') return;
+  const slot = pending.packet.pause.slot!;
+  assert.ok(slot);
   const inputHash = createHash('sha256').update(`input:${source.id}`).digest('hex');
   const audienceHash = createHash('sha256').update(`audience:${source.sessionId}`).digest('hex');
   const policyRevision = createHash('sha256').update('typed-answer-policy').digest('hex');
@@ -193,10 +201,12 @@ function recordTypedProvidedAnswer(source: import('./eventlog.js').EventRow): vo
       validationOutcome: 'admitted',
       repairAttempted: false,
       raw: {
+        version: 1,
         relation: 'answer_open_slot',
+        targetGoal: { goalId: slot.goalId, baseRevision: slot.revision },
         work: null,
         goal: null,
-        slotAnswers: [{ kind: 'value', value: source.data.text }],
+        slotAnswers: [{ kind: 'value', questionId: slot.questionId, slotKey: slot.slotKey, value: source.data.text }],
       },
     },
   });
@@ -217,6 +227,14 @@ function recordTypedProvidedAnswer(source: import('./eventlog.js').EventRow): vo
   );
   semanticDisposition.recordSemanticParticipation(source.sessionId, source.seq, 'participated');
   semanticDisposition.recordSemanticDispositionOutcome(source.sessionId, source.seq, 'admitted');
+  continuityRuntime._setClarificationAnswerCompletenessForTests(input => {
+    assert.equal(input.sessionId, source.sessionId);
+    assert.equal(input.sourceUserSeq, source.seq);
+    assert.equal(input.acceptedReply, source.data.text);
+    return checkClarificationAnswerCompleteness(input, async () => ({ ok: true, model: 'fixture-source-answer-adequacy',
+      answers: { complete_answer: { type: 'noul', noul: 0.99 } }, usage: { input_tokens: 1, output_tokens: 1 },
+      decisionId: 'exact-replacement-source-answer' }));
+  });
 }
 
 function fakeRun(result: Record<string, unknown>): never {
@@ -348,6 +366,7 @@ function appendActiveWorkflowDispatch(source: import('./eventlog.js').EventRow, 
 }
 
 beforeEach(() => {
+  continuityRuntime._setClarificationAnswerCompletenessForTests(null);
   resetEventLog();
   runtimeConfig._setRuntimeConfigCaptureObserverForTest(null);
   setClaudeAgentSdkBrainRunForTest(null);
@@ -379,6 +398,7 @@ beforeEach(() => {
 });
 
 after(() => {
+  continuityRuntime._setClarificationAnswerCompletenessForTests(null);
   runtimeConfig._setRuntimeConfigCaptureObserverForTest(null);
   setClaudeAgentSdkBrainRunForTest(null);
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -1799,8 +1819,12 @@ test('respondPreferHarness: a conversation switched to an agent pinned to a mode
   const { createAgentRecord } = await import('../../agents/agent-record.js');
   const { setSessionAgent } = await import('../../agents/session-agent.js');
   const agentModel = await import('../../agents/session-agent-model.js');
+  const { isPinnedWorkerModel } = await import('./pinned-worker-model.js');
+  const { _setFalloverChainForTest } = await import('./respond-bridge.js');
   agentModel._setSessionAgentModelDepsForTests({ live: () => true });
   t.after(() => agentModel._setSessionAgentModelDepsForTests({}));
+  _setFalloverChainForTest(['gpt-5.5']);
+  t.after(() => _setFalloverChainForTest(null));
   const saved = createAgentRecord({ name: 'Bridge Pinned Agent', handles: 'Answers on its own model', model: 'claude-sonnet-4-6' });
   assert.ok(saved.ok);
   if (!saved.ok) return;
@@ -1810,9 +1834,17 @@ test('respondPreferHarness: a conversation switched to an agent pinned to a mode
   const builtWith: Array<string | undefined> = [];
   _setBridgeImplsForTests({
     configure: okConfigure,
-    buildAgent: (async (input: { model?: string }) => { builtWith.push(input.model); return FAKE_AGENT; }) as never,
-    runConversation: (async (opts: { sessionId: string; buildAgent?: (identity: unknown) => Promise<unknown> }) => {
+    buildAgent: (async (input: { model?: string }) => {
+      assert.equal(isPinnedWorkerModel('claude-sonnet-4-6'), true, 'lazy construction keeps the exact pin');
+      builtWith.push(input.model); return FAKE_AGENT;
+    }) as never,
+    runConversation: (async (opts: { sessionId: string; buildAgent?: (identity: unknown) => Promise<unknown>;
+      falloverModelIds?: string[]; rebuildAgentForBrain?: unknown }) => {
+      assert.equal(opts.falloverModelIds, undefined);
+      assert.equal(opts.rebuildAgentForBrain, undefined);
       await opts.buildAgent?.(stubBuildIdentity(opts as never));
+      await Promise.resolve();
+      assert.equal(isPinnedWorkerModel('claude-sonnet-4-6'), true, 'the awaited foreground response keeps the exact pin');
       return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1,
         lastDecision: { reply: 'answered as the agent', done: true, nextAction: 'completed' } };
     }) as never,
@@ -1824,6 +1856,76 @@ test('respondPreferHarness: a conversation switched to an agent pinned to a mode
   assert.deepEqual(builtWith, ['claude-sonnet-4-6'], 'the turn is built on the agent\'s model');
   const routed = listEvents(sessionId, { types: ['turn_model_routed'] });
   assert.equal(routed.at(-1)?.data.model, 'claude-sonnet-4-6');
+  assert.equal(isPinnedWorkerModel('claude-sonnet-4-6'), false, 'the caller does not inherit foreground pin authority');
+});
+
+test('saved agent model unavailable commits its exact-source block before any model or tool dispatch and replays it', async (t) => {
+  const { createAgentRecord } = await import('../../agents/agent-record.js');
+  const { setSessionAgent } = await import('../../agents/session-agent.js');
+  const agentModel = await import('../../agents/session-agent-model.js');
+  agentModel._setSessionAgentModelDepsForTests({ live: () => false });
+  t.after(() => agentModel._setSessionAgentModelDepsForTests({}));
+  const saved = createAgentRecord({ name: 'Unavailable Specialist', handles: 'Controlled fixture', model: 'claude-opus-5-5' });
+  assert.ok(saved.ok); if (!saved.ok) return;
+  const sessionId = 'unavailable-agent-exact-source';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop' });
+  setSessionAgent(sessionId, saved.agent.id, { by: 'owner' });
+  let work = 0;
+  _setBridgeImplsForTests({
+    configure: (async () => { work++; throw new Error('Configuration must not run.'); }) as never,
+    buildAgent: (async () => { work++; throw new Error('Model construction must not run.'); }) as never,
+    runConversation: (async () => { work++; throw new Error('Model dispatch must not run.'); }) as never,
+    resolveTurnCandidates: (async () => { work++; throw new Error('Capability resolution must not run.'); }) as never,
+  });
+  const request = { sessionId, message: 'Draft the controlled local plan.', channel: 'desktop', runId: 'unavailable-agent-attempt' };
+  const response = await respondPreferHarness('home', request, async () => { work++; throw new Error('Legacy must not run.'); });
+  assert.equal(response.stoppedReason, 'blocked');
+  assert.match(response.text, /Unavailable Specialist/); assert.match(response.text, /claude-opus-5-5/);
+  assert.notEqual(response.text, PUBLIC_RUN_FAILURE_TEXT);
+  const source = listEvents(sessionId, { types: ['user_input_received'] });
+  assert.equal(source.length, 1);
+  const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal((terminals[0]?.data.presentation as { identity: { sourceUserSeq: number }; status: string }).identity.sourceUserSeq, source[0]!.seq);
+  assert.equal((terminals[0]?.data.presentation as { status: string }).status, 'blocked');
+  for (const type of ['turn_model_routed', 'turn_graph_shadow', 'tool_called', 'provider_call_started'] as const)
+    assert.equal(listEvents(sessionId, { types: [type as never] }).length, 0, type);
+  for (const table of ['logical_tool_calls', 'physical_dispatches']) assert.equal(
+    (openEventLog().prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE session_id = ?`).get(sessionId) as { n: number }).n, 0, table);
+  const replay = await respondPreferHarness('home', { ...request, sourceUserSeq: source[0]!.seq }, async () => { throw new Error('Legacy must not run.'); });
+  assert.equal(replay.text, response.text); assert.equal(replay.stoppedReason, 'blocked');
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(work, 0);
+});
+
+test('saved agent model unavailable does not defeat a later owner model-chip choice or explicit model override', async (t) => {
+  const { createAgentRecord } = await import('../../agents/agent-record.js');
+  const { setSessionAgent } = await import('../../agents/session-agent.js');
+  const agentModel = await import('../../agents/session-agent-model.js');
+  const { isPinnedWorkerModel } = await import('./pinned-worker-model.js');
+  agentModel._setSessionAgentModelDepsForTests({ live: () => false });
+  t.after(() => agentModel._setSessionAgentModelDepsForTests({}));
+  const saved = createAgentRecord({ name: 'Unavailable Override Specialist', handles: 'Controlled fixture', model: 'claude-opus-5-5' });
+  assert.ok(saved.ok); if (!saved.ok) return;
+  process.env.AUTH_MODE = 'codex_oauth'; process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.5';
+  const builtWith: Array<string | undefined> = [];
+  _setBridgeImplsForTests({ configure: okConfigure,
+    buildAgent: (async (input: { model?: string }) => { builtWith.push(input.model); return FAKE_AGENT; }) as never,
+    runConversation: (async (opts: { sessionId: string; buildAgent?: (identity: unknown) => Promise<unknown> }) => {
+      await opts.buildAgent?.(stubBuildIdentity(opts as never));
+      assert.equal(isPinnedWorkerModel('gpt-5.5'), false);
+      return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+        lastDecision: { reply: 'owner choice answered', done: true, nextAction: 'completed' } };
+    }) as never,
+  });
+  const owner = createSession({ id: 'unavailable-agent-owner-override', kind: 'chat', channel: 'desktop' });
+  setSessionAgent(owner.id, saved.agent.id, { by: 'owner' });
+  agentModel.recordBrainChosenForSession(owner.id, new Date(Date.now() + 1_000));
+  assert.equal((await respondPreferHarness('home', { message: 'hi', sessionId: owner.id }, async () => { throw new Error('Legacy must not run.'); })).text, 'owner choice answered');
+  const checkpoint = createSession({ id: 'unavailable-agent-checkpoint-override', kind: 'chat', channel: 'desktop' });
+  setSessionAgent(checkpoint.id, saved.agent.id, { by: 'owner' });
+  assert.equal((await respondViaHarness('home', { message: 'hi', sessionId: checkpoint.id }, { modelOverride: 'gpt-5.5', turnEngine: 'host_v1' })).text, 'owner choice answered');
+  assert.deepEqual(builtWith, [undefined, 'gpt-5.5']);
 });
 
 test('respondPreferHarness: shared Claude host binds an exact compound decline without legacy graph entry', async (t) => {
@@ -4000,6 +4102,61 @@ test('respondPreferHarness: harness run errors commit one failed terminal — no
   assert.equal(listEvents('bridge-t4', { types: ['conversation_completed'] }).length, 1);
 });
 
+test('typed empty stop in the bridge uses the exact public failure winner without a retry dispatch', async () => {
+  const sessionId = 'bridge-typed-empty-stop';
+  let calls = 0;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder,
+    runConversation: (async () => {
+      calls += 1;
+      throw new BoundaryError({ kind: 'model.empty_completion', retryable: true,
+        userMessage: 'PRIVATE USER MESSAGE', operatorMessage: 'PRIVATE EMPTY DIAGNOSTIC' });
+    }) as never });
+  const response = await respondViaHarness('webhook', { sessionId, message: 'Answer once.' });
+  assert.equal(calls, 1);
+  assert.equal(response.stoppedReason, 'error');
+  assert.equal(response.text, 'I did not receive a usable reply or next step from the model, so this request is still unfinished. Ask me to continue the unfinished work, or choose another model.');
+  assert.doesNotMatch(response.text, /PRIVATE|no tools|nothing changed|usage|sign.in/i);
+  const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  const presentation = terminals[0].data.presentation as { identity: { sourceUserSeq: number }; status: string; resumable: boolean };
+  assert.equal(presentation.status, 'failed');
+  assert.equal(presentation.resumable, false);
+  assert.equal(presentation.identity.sourceUserSeq, terminals[0].data.sourceUserSeq);
+});
+
+test('raw empty-completion text or an untrusted kind property cannot grant a typed bridge failure', async () => {
+  const sessionId = 'bridge-untyped-empty-stop';
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder,
+    runConversation: (async () => { throw Object.assign(new Error('PRIVATE model.empty_completion'), { kind: 'model.empty_completion' }); }) as never });
+  const response = await respondViaHarness('webhook', { sessionId, message: 'Answer once.' });
+  assert.match(response.text, /cause.*not.*confirmed/i);
+  assert.match(response.text, /what completed.*what remains.*before retrying/i);
+  assert.doesNotMatch(response.text, /PRIVATE|model finished|no tools|nothing changed/i);
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)?.data.failureKind, undefined);
+});
+
+test('closed failed result carriers retain their public reason through bridge compatibility without dispatching again', async () => {
+  const { PUBLIC_MODEL_EMPTY_COMPLETION_TEXT, PUBLIC_CODEX_AUTH_EXPIRED_TEXT } = await import('./public-presentation.js');
+  for (const [failureKind, expected] of [
+    ['model.empty_completion', PUBLIC_MODEL_EMPTY_COMPLETION_TEXT],
+    ['codex.auth_expired', PUBLIC_CODEX_AUTH_EXPIRED_TEXT],
+  ] as const) {
+    const sessionId = `bridge-failed-result-${failureKind}`;
+    let calls = 0;
+    _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder,
+      runConversation: (async () => { calls += 1; return {
+        sessionId, status: 'failed', steps: 1, lastTurn: 1, failureKind, error: 'PRIVATE COMPATIBILITY FAILURE',
+      }; }) as never });
+    const response = await respondViaHarness('webhook', { sessionId, message: 'Answer once.' });
+    assert.equal(calls, 1);
+    assert.equal(response.text, expected);
+    assert.equal(response.stoppedReason, 'error');
+    const terminal = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)!;
+    assert.equal((terminal.data.presentation as { identity: { sourceUserSeq: number } }).identity.sourceUserSeq, terminal.data.sourceUserSeq);
+    assert.doesNotMatch(JSON.stringify(projectHarnessEventForPublic(terminal)), /PRIVATE|failureDetail/);
+  }
+});
+
 test('a corrupt typed terminal rolls back atomically and recovery publishes one safe failure', async () => {
   const sessionId = 'bridge-corrupt-terminal-winner';
   _setBridgeImplsForTests({
@@ -4482,13 +4639,14 @@ test('respondViaHarness sanitizes legacy pause results before returning them syn
   _setBridgeImplsForTests({
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
-    runConversation: (async (opts: { sessionId: string }) => {
+    runConversation: (async (opts: { sessionId: string; sourceUserSeq: number }) => {
       appendEvent({
         sessionId: opts.sessionId,
         turn: 1,
         role: 'Clem',
         type: 'awaiting_user_input',
         data: {
+          sourceUserSeq: opts.sourceUserSeq,
           question: 'Which tenant should I use?',
           options: ['Acme', 'Tool call: composio_execute_tool\n{"secret":true}'],
         },
@@ -4668,7 +4826,10 @@ test('respondViaHarness: awaiting_approval maps to pending-approval stoppedReaso
   _setBridgeImplsForTests({
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
-    runConversation: fakeRun({ status: 'awaiting_approval', lastDecision: null }),
+    runConversation: (async (opts: { sourceUserSeq: number }) => {
+      appendEvent({ sessionId: 'bridge-t6', turn: 1, role: 'Clem', type: 'approval_requested', data: { sourceUserSeq: opts.sourceUserSeq, approvalId: formal.approvalId } });
+      return { sessionId: 'bridge-t6', status: 'awaiting_approval', steps: 1, lastTurn: 1, lastDecision: null };
+    }) as never,
   });
   const res = await respondViaHarness('background', { message: 'do it', sessionId: 'bridge-t6' });
   assert.equal(res.stoppedReason, 'pending-approval');
@@ -4689,7 +4850,7 @@ test('respondViaHarness: a conversational approval projects only its frozen ordi
     userId,
     metadata: { channelId, userId },
   });
-  const row = approvalRegistry.register({
+  const register = (sourceUserSeq: number) => approvalRegistry.register({
     sessionId,
     channel: 'discord',
     channelId,
@@ -4704,21 +4865,23 @@ test('respondViaHarness: a conversational approval projects only its frozen ordi
       subject: 'Reviewed sheet',
       bodyPreview: 'The reviewed sheet is attached.',
       resultUrl: 'https://docs.google.com/spreadsheets/d/proof/edit',
-      sourceUserSeq: 1,
+      sourceUserSeq,
       originReplyTarget,
       originReplyTargetDigest: exactOriginDeliveryTargetDigest(originReplyTarget),
       conversationKey: `discord:${channelId}`,
       audienceUserId: userId,
     },
   });
-  assert.equal(approvalRegistry.isFormalApprovalSurface(row), false);
   _setBridgeImplsForTests({
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
-    runConversation: fakeRun({
-      status: 'awaiting_approval',
-      lastDecision: { summary: 'Approval pending.', reply: 'Use the approval card.', done: false },
-    }),
+    runConversation: (async (opts: { sourceUserSeq: number }) => {
+      const row = register(opts.sourceUserSeq);
+      assert.equal(approvalRegistry.isFormalApprovalSurface(row), false);
+      appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'approval_requested', data: { sourceUserSeq: opts.sourceUserSeq, approvalId: row.approvalId, approvalPresentation: 'conversation', question } });
+      return { sessionId, status: 'awaiting_approval', steps: 1, lastTurn: 1,
+        lastDecision: { summary: 'Approval pending.', reply: 'Use the approval card.', done: false } };
+    }) as never,
   });
 
   const res = await respondViaHarness('background', { message: 'prepare it', sessionId });
@@ -4735,6 +4898,91 @@ test('respondViaHarness: limit_exceeded maps to max-turns-with-grace', async () 
   });
   const res = await respondViaHarness('webhook', { message: 'big task', sessionId: 'bridge-t7' });
   assert.equal(res.stoppedReason, 'max-turns-with-grace');
+});
+
+test('presentation-less budget stop names ordinary continuation without another model or effect dispatch', async () => {
+  for (const limitKind of ['token_budget', 'max_steps'] as const) {
+    const sessionId = `bridge-budget-guidance-${limitKind}`;
+    let calls = 0;
+    let routedSource = 0;
+    _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder,
+      runConversation: (async (opts: { sessionId: string; sourceUserSeq?: number }) => {
+        calls += 1;
+        routedSource = opts.sourceUserSeq ?? 0;
+        return { sessionId, status: 'limit_exceeded', limitKind, steps: 1, lastTurn: 1 };
+      }) as never });
+    const response = await respondViaHarness('webhook', { sessionId, message: 'Continue this fixture work.' });
+    assert.equal(calls, 1);
+    assert.equal(response.stoppedReason, limitKind === 'token_budget' ? 'token-budget' : 'max-turns-with-grace');
+    assert.match(response.text, /budget before finishing.*Ask me to continue the unfinished work/i);
+    assert.doesNotMatch(response.text, /I.ll pick up|automatically|no tools|nothing changed/i);
+    assert.equal(routedSource, listEvents(sessionId, { types: ['user_input_received'] })[0].seq);
+    assert.equal(listEvents(sessionId, { types: ['tool_called', 'external_write', 'external_write_succeeded'] }).length, 0);
+    assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0,
+      'legacy presentation-less guidance does not manufacture a new terminal or control');
+  }
+});
+
+test('recovery closed stops give exact-source unfinished guidance and replay without dispatching again', async () => {
+  process.env.CLEMMY_BRAIN_FALLOVER = 'off';
+  for (const completedReason of ['no_structured_output', 'sub_agent_stalled'] as const) {
+    const sessionId = `bridge-recovery-guidance-${completedReason}`;
+    let calls = 0;
+    _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder,
+      runConversation: (async () => { calls += 1; return { sessionId, status: 'completed',
+        steps: 1, lastTurn: 1, completedReason, lastDecision: { summary: 'PRIVATE RECOVERY SUMMARY', reply: null, done: true } }; }) as never });
+    const request = { sessionId, runId: `run:${sessionId}`, message: 'Finish the fixture request.' };
+    const response = await respondPreferHarness('webhook', request, async () => { throw new Error('No legacy dispatch authorized.'); });
+    assert.equal(calls, 1);
+    assert.match(response.text, /safe final answer.*still unfinished.*Ask me to check what completed and what remains before continuing/i);
+    assert.doesNotMatch(response.text, /PRIVATE|automatically|no tools|nothing changed/i);
+    const source = listEvents(sessionId, { types: ['user_input_received'] })[0];
+    const terminal = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)!;
+    const presentation = terminal.data.presentation as { identity: { sourceUserSeq: number }; status: string; resumable: boolean };
+    assert.equal(presentation.identity.sourceUserSeq, source.seq);
+    assert.equal(presentation.status, 'blocked');
+    assert.equal(presentation.resumable, false);
+    assert.equal(terminal.data.reason, completedReason);
+    assert.doesNotMatch(JSON.stringify(projectHarnessEventForPublic(terminal)), /PRIVATE|failureDetail/);
+    const replay = await respondPreferHarness('webhook', { ...request, sourceUserSeq: source.seq }, async () => { throw new Error('No legacy dispatch authorized.'); });
+    assert.equal(replay.text, response.text);
+    assert.equal(calls, 1);
+    assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+    assert.equal(listEvents(sessionId, { types: ['tool_called', 'external_write', 'external_write_succeeded'] }).length, 0);
+  }
+});
+
+test('narration closed stop keeps exact-source guidance private diagnostics and immutable replay', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'off';
+  const { ClaudeSdkNarrationGiveUpError } = await import('./claude-agent-brain.js');
+  const sessionId = 'bridge-narration-guidance';
+  let calls = 0;
+  let harnessCalls = 0;
+  _setBridgeImplsForTests({ allowStandaloneClaudeInteractiveBrainForTests: true,
+    configure: okConfigure, buildAgent: fakeAgentBuilder,
+    runConversation: (async () => { harnessCalls += 1; throw new Error('No fallback dispatch authorized.'); }) as never,
+    claudeAgentBrain: (async () => { calls += 1; throw new ClaudeSdkNarrationGiveUpError('PRIVATE NARRATION ERROR'); }) as never });
+  const request = { sessionId, runId: `run:${sessionId}`, message: 'Finish the fixture request.' };
+  const response = await respondPreferHarness('home', request, async () => { throw new Error('No legacy dispatch authorized.'); });
+  assert.equal(calls, 1);
+  assert.equal(harnessCalls, 0);
+  assert.match(response.text, /safe final answer.*still unfinished.*Ask me to check what completed and what remains before continuing/i);
+  const source = listEvents(sessionId, { types: ['user_input_received'] })[0];
+  const terminal = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)!;
+  const presentation = terminal.data.presentation as { identity: { sourceUserSeq: number }; status: string; resumable: boolean };
+  assert.equal(presentation.identity.sourceUserSeq, source.seq);
+  assert.equal(presentation.status, 'blocked');
+  assert.equal(presentation.resumable, false);
+  assert.equal(terminal.data.reason, 'narration_giveup');
+  assert.doesNotMatch(JSON.stringify(projectHarnessEventForPublic(terminal)), /PRIVATE|failureDetail|no tools|nothing changed/i);
+  const replay = await respondPreferHarness('home', { ...request, sourceUserSeq: source.seq }, async () => { throw new Error('No legacy dispatch authorized.'); });
+  assert.equal(replay.text, response.text);
+  assert.equal(calls, 1);
+  assert.equal(harnessCalls, 0);
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(listEvents(sessionId, { types: ['tool_called', 'external_write', 'external_write_succeeded'] }).length, 0);
 });
 
 test('respondViaHarness: failed status reduces to a durable safe error terminal', async () => {
@@ -4876,8 +5124,9 @@ test('parse-exhaustion completion re-runs ONCE on the next brain instead of ship
     sessionId: 'parse-exhaustion-no-recurse',
   });
   assert.equal(calls, 2, 'exactly one recovery hop — never a loop');
-  assert.doesNotMatch(deadEnd.text, /ask me|continue|retry|resume/i,
-    'an exhausted cross-brain recovery closes factually instead of assigning a continuation to the user');
+  assert.match(deadEnd.text, /still unfinished.*Ask me to check what completed and what remains before continuing/i);
+  assert.doesNotMatch(deadEnd.text, /automatically|I.ll pick up|no tools|nothing changed/i,
+    'guidance does not promise automatic recovery or claim that no effect occurred');
   const deadEndCompletions = listEvents('parse-exhaustion-no-recurse', { types: ['conversation_completed'] });
   assert.equal(deadEndCompletions.length, 1, 'the exhausted recovery commits one terminal');
   assert.equal(
@@ -4908,17 +5157,133 @@ test('narration give-up is fallover-eligible; without fallover it ships the grac
   }
 });
 
+
+test('STOP-Q-SOURCE presentationless bridge chooses the current-source newest question and options', async () => {
+  const sessionId = 'stop-source-question';
+  createSession({ id: sessionId, kind: 'chat' });
+  const old = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Older request.' } });
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string; sourceUserSeq: number }) => {
+      appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: { sourceUserSeq: opts.sourceUserSeq, question: 'Which format for this request?', options: ['Plain text', 'Table'] } });
+      appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: { sourceUserSeq: old.seq, question: 'PRIVATE_FOREIGN: which account?', options: ['Foreign account'] } });
+      return { sessionId, status: 'awaiting_user_input', steps: 1, lastTurn: 1, lastDecision: null };
+    }) as never });
+  const result = await respondViaHarness('webhook', { message: 'Current request.', sessionId });
+  assert.match(result.text, /^Which format for this request\?/);
+  assert.match(result.text, /1\. Plain text\n2\. Table/);
+  assert.doesNotMatch(result.text, /PRIVATE_FOREIGN|Foreign account/);
+  assert.equal(result.stoppedReason, 'awaiting-input');
+  assert.equal(listEvents(sessionId, { types: ['tool_called', 'external_write'] }).length, 0);
+});
+
+for (const binding of ['unbound', 'foreign'] as const) {
+  test(`STOP-Q-SOURCE missing-current-question ${binding} ask has a safe unfinished next-action floor`, async () => {
+    const sessionId = `stop-missing-question-${binding}`;
+    createSession({ id: sessionId, kind: 'chat' });
+    const old = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Older request.' } });
+    let calls = 0;
+    let acceptedSource = 0;
+    _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder,
+      runConversation: (async (opts: { sourceUserSeq: number }) => {
+        calls += 1;
+        acceptedSource = opts.sourceUserSeq;
+        appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: {
+          ...(binding === 'foreign' ? { sourceUserSeq: old.seq } : {}),
+          question: 'PRIVATE_OTHER_REQUEST: which private tenant?',
+          options: ['Tool call: private_tool\n{"secret":"PRIVATE_OPTION"}'],
+        } });
+        return { sessionId, status: 'awaiting_user_input', steps: 1, lastTurn: 1,
+          lastDecision: { summary: 'summary: PRIVATE_DIAGNOSTIC\ndone: false\nreason: private internal detail', done: false, nextAction: 'awaiting_user_input' } };
+      }) as never });
+    const result = await respondViaHarness('webhook', { message: 'Current request.', sessionId });
+    assert.match(result.text, /unfinished because it needs more information from you/);
+    assert.match(result.text, /Ask me to check what information is still missing before continuing this exact request/);
+    assert.doesNotMatch(result.text, /PRIVATE_|private tenant|tool call|summary:|done:|reason:|no reply produced|approve|no tools|nothing changed/i);
+    assert.equal(result.stoppedReason, 'awaiting-input');
+    assert.equal(result.turnsUsed, 1);
+    assert.equal(result.pendingApprovalId, undefined);
+    const current = listEvents(sessionId, { types: ['user_input_received'] }).find(event => event.seq === acceptedSource);
+    assert.equal(current?.data.text, 'Current request.', 'the floor belongs to the current accepted request');
+    assert.notEqual(acceptedSource, old.seq);
+    assert.equal(calls, 1, 'presentation adds no continuation or retry dispatch');
+    assert.equal(listEvents(sessionId, { types: ['tool_called', 'external_write', 'external_write_succeeded', 'approval_resolved'] }).length, 0);
+  });
+}
+
+test('STOP-Q-SOURCE missing-current-question retains a substantive current reply unchanged', async () => {
+  const sessionId = 'stop-missing-question-current-reply';
+  createSession({ id: sessionId, kind: 'chat' });
+  const old = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Older request.' } });
+  const reply = 'Please provide the destination workspace before I can finish this request.';
+  let calls = 0;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder,
+    runConversation: (async () => {
+      calls += 1;
+      appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: { sourceUserSeq: old.seq, question: 'PRIVATE_FOREIGN: which account?' } });
+      return { sessionId, status: 'awaiting_user_input', steps: 1, lastTurn: 1,
+        lastDecision: { reply, done: false, nextAction: 'awaiting_user_input' } };
+    }) as never });
+  const result = await respondViaHarness('webhook', { message: 'Current request.', sessionId });
+  assert.equal(result.text, reply, 'a substantive reply from this run is preserved even without a question mark');
+  assert.equal(result.stoppedReason, 'awaiting-input');
+  assert.equal(result.turnsUsed, 1);
+  assert.equal(result.pendingApprovalId, undefined);
+  assert.equal(calls, 1);
+  assert.equal(listEvents(sessionId, { types: ['tool_called', 'external_write', 'approval_resolved'] }).length, 0);
+});
+
+test('STOP-Q-SOURCE presentationless bridge approval cannot expose an unrelated pending card', async () => {
+  const sessionId = 'stop-source-approval';
+  createSession({ id: sessionId, kind: 'chat' });
+  const old = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Older request.' } });
+  let foreignApprovalId = '';
+  let currentApprovalId = '';
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sourceUserSeq: number }) => {
+      const own = approvalRegistry.register({ sessionId, subject: 'Current local effect', tool: 'local_fixture', args: { effect: 'current' } });
+      currentApprovalId = own.approvalId;
+      appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'approval_requested', data: { sourceUserSeq: opts.sourceUserSeq, approvalId: own.approvalId } });
+      const foreign = approvalRegistry.register({ sessionId, subject: 'PRIVATE_FOREIGN', tool: 'local_fixture', args: { effect: 'foreign' } });
+      foreignApprovalId = foreign.approvalId;
+      appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'approval_requested', data: { sourceUserSeq: old.seq, approvalId: foreign.approvalId } });
+      return { sessionId, status: 'awaiting_approval', steps: 1, lastTurn: 1, lastDecision: null };
+    }) as never });
+  const result = await respondViaHarness('webhook', { message: 'Current request.', sessionId });
+  assert.equal(result.pendingApprovalId, currentApprovalId);
+  assert.match(result.text, /Current local effect/);
+  assert.doesNotMatch(result.text, /PRIVATE_FOREIGN/);
+  assert.equal(approvalRegistry.get(foreignApprovalId)?.status, 'pending');
+  assert.equal(listEvents(sessionId, { types: ['tool_called', 'approval_resolved', 'external_write'] }).length, 0);
+});
+
+
+test('STOP-Q-SOURCE presentationless bridge has no approval control or approval instruction for unbound cards', async () => {
+  const sessionId = 'stop-unbound-approval';
+  createSession({ id: sessionId, kind: 'chat' });
+  const legacy = approvalRegistry.register({ sessionId, subject: 'PRIVATE_LEGACY', tool: 'local_fixture', args: {} });
+  appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'approval_requested', data: { approvalId: legacy.approvalId } });
+  appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: { question: 'PRIVATE_LEGACY approve this?' } });
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder,
+    runConversation: fakeRun({ status: 'awaiting_approval', lastDecision: { summary: 'PRIVATE_LEGACY needs approval.', reply: `Approve or reject PRIVATE_LEGACY card ${legacy.approvalId} here.`, done: false, nextAction: 'awaiting_approval', reason: null } }) });
+  const result = await respondViaHarness('webhook', { message: 'Current request.', sessionId });
+  assert.equal(result.pendingApprovalId, undefined);
+  assert.equal(result.stoppedReason, 'awaiting-input');
+  assert.match(result.text, /could not find a valid approval for this exact request/);
+  assert.match(result.text, /still unfinished.*Ask me to check the required approval and any completed work before continuing/);
+  assert.doesNotMatch(result.text, new RegExp(`PRIVATE_LEGACY|approve or reject|${legacy.approvalId}`, 'i'));
+  assert.equal(approvalRegistry.get(legacy.approvalId)?.status, 'pending');
+  assert.equal(listEvents(sessionId, { types: ['approval_resolved', 'tool_called', 'external_write'] }).length, 0);
+});
+
 test('awaiting_user_input surfaces THE QUESTION (+ numbered options), never the "asked a question" summary', async () => {
   const sessionId = 'ask-question-visible';
   createSession({ id: sessionId, kind: 'chat' });
-  appendEvent({
-    sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input',
-    data: { question: 'Which pipeline do you mean, and where should the update go?', options: ['Sales pipeline → email', 'Sales pipeline → Slack', 'Just clean it up'] },
-  });
-  const run = (async (opts: { sessionId: string }) => ({
-    sessionId: opts.sessionId, status: 'awaiting_user_input', steps: 1, lastTurn: 1,
-    lastDecision: { summary: 'Asked a clarifying question to identify the pipeline.', reply: null, done: false, nextAction: 'awaiting_user_input', reason: null },
-  })) as never;
+  const run = (async (opts: { sessionId: string; sourceUserSeq: number }) => {
+    appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input',
+      data: { sourceUserSeq: opts.sourceUserSeq, question: 'Which pipeline do you mean, and where should the update go?', options: ['Sales pipeline → email', 'Sales pipeline → Slack', 'Just clean it up'] } });
+    return { sessionId: opts.sessionId, status: 'awaiting_user_input', steps: 1, lastTurn: 1,
+      lastDecision: { summary: 'Asked a clarifying question to identify the pipeline.', reply: null, done: false, nextAction: 'awaiting_user_input', reason: null } };
+  }) as never;
   _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: run });
 
   const res = await respondViaHarness('webhook', { message: 'clean up my pipeline and tell the team', sessionId });
@@ -5274,4 +5639,43 @@ test('a source context restoration failure settles the bridge attempt and clears
   assert.equal(HarnessSession.load(session.id)?.runInFlightSince(), null);
   assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
   assert.doesNotMatch(response.text, /Different craft|digest|composition|sqlite/i);
+});
+
+test('held publication early bridge replay fences exact source before preparation and leaves a different request independent', async () => {
+  const { HostRecoveryState } = await import('./host-turn-runner.js');
+  const { observeHeldStopPublicationOwner, sealHeldStopPublication, HELD_STOP_PUBLICATION_PENDING_TEXT } = await import('./held-stop-publication.js');
+  const session = createSession({ id: 'held-publication-bridge', kind: 'chat' });
+  const attempt = beginRunAttempt(session.id, { runId: 'held-publication-bridge-run' });
+  const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Finish the controlled local work.' } }, { armRunInFlight: true });
+  const harness = HarnessSession.load(session.id)!;
+  const checkpoint = new HostRecoveryState(session.id, source.seq, 'admit', [{ role: 'user', content: source.data.text }] as never,
+    [{ type: 'function_call', callId: 'fixture-call', name: 'session_history', arguments: '{}' }] as never,
+    [], undefined, undefined, 'host_v1_read_only', undefined, 0).toString();
+  harness.saveRecoveryState(checkpoint);
+  const ticket = observeHeldStopPublicationOwner({ sessionId: session.id, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId })!;
+  assert.ok(ticket); harness.clearRecoveryState(); sealHeldStopPublication(ticket);
+  const calls = { configure: 0, build: 0, candidates: 0, execute: 0 };
+  _setBridgeImplsForTests({
+    configure: (() => { calls.configure++; return okConfigure(); }) as never,
+    buildAgent: ((...args: unknown[]) => { calls.build++; return (fakeAgentBuilder as any)(...args); }) as never,
+    resolveTurnCandidates: (async () => { calls.candidates++; return { candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false }; }) as never,
+    runConversation: (async () => { calls.execute++; return { status: 'completed', lastDecision: { reply: 'Independent source reply.', done: true, nextAction: 'completed' } }; }) as never,
+  });
+  const attemptsBefore = openEventLog().prepare('SELECT * FROM run_attempts WHERE session_id=?').all(session.id);
+  const pending = await respondViaHarness('webhook', { sessionId: session.id, message: String(source.data.text), sourceUserSeq: source.seq }, { turnEngine: 'host_v1' });
+  assert.equal(pending.stoppedReason, 'in-progress'); assert.equal(pending.text, HELD_STOP_PUBLICATION_PENDING_TEXT);
+  assert.deepEqual(calls, { configure: 0, build: 0, candidates: 0, execute: 0 });
+  assert.deepEqual(openEventLog().prepare('SELECT * FROM run_attempts WHERE session_id=?').all(session.id), attemptsBefore);
+  await assert.rejects(respondViaHarness('webhook', { sessionId: session.id, message: 'Different text using the same source.', sourceUserSeq: source.seq }, { turnEngine: 'host_v1' }), /does not match/);
+  assert.deepEqual(calls, { configure: 0, build: 0, candidates: 0, execute: 0 });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn, attemptId: attempt.attemptId, runId: attempt.runId! };
+  commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'blocked', resumable: true,
+    presentation: { kind: 'blocked', text: 'The exact controlled request remains unfinished. Check what remains.' } });
+  const replay = await respondViaHarness('webhook', { sessionId: session.id, message: String(source.data.text), sourceUserSeq: source.seq }, { turnEngine: 'host_v1' });
+  assert.equal(replay.text, 'The exact controlled request remains unfinished. Check what remains.');
+  assert.deepEqual(calls, { configure: 0, build: 0, candidates: 0, execute: 0 });
+  const other = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'An independent request.' } });
+  const response = await respondViaHarness('webhook', { sessionId: session.id, message: 'An independent request.', sourceUserSeq: other.seq }, { turnEngine: 'host_v1' });
+  assert.equal(response.text, 'Independent source reply.'); assert.equal(calls.execute, 1);
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).filter(e => e.data.sourceUserSeq === source.seq).length, 1);
 });

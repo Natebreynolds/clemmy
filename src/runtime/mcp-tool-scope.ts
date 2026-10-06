@@ -373,11 +373,32 @@ function canonicalMcpServerAliasLocal(value: string): string {
   }
 }
 
-const URL_RE = /\bhttps?:\/\/[^\s)]+/i;
 const SEO_RE =
   /\b(seo|audit|ranking|rankings|serp|keyword|keywords|backlink|backlinks|domain authority|organic traffic|search visibility|site health|technical audit|crawl|meta title|meta description|schema markup)\b/i;
 const WEB_RE =
   /\b(scrape|crawl|website|web page|webpage|article|news|browser|search the web|look up|research online|recent article)\b/i;
+
+/** Positive relevance only. A prohibited capability is not a tool suggestion.
+ * Keep the original source for consent; this does not change authority. Each
+ * mention is checked independently so a later affirmative clause survives. */
+function hasAffirmativeCapabilityMention(input: string, pattern: RegExp): boolean {
+  input = input.replace(/’/g, "'"); // Same-width recognition view; never stored as source.
+  const mentions = input.matchAll(new RegExp(pattern.source, 'gi'));
+  for (const mention of mentions) {
+    const start = clauseStart(input, mention.index!);
+    const prefix = input.slice(start, mention.index!);
+    // A contrast opens a new relevance clause, but "but not" is a refusal.
+    const contrast = [...prefix.matchAll(/\b(?:but(?!\s+not\b)|however|instead)\b/gi)].at(-1);
+    const local = input.slice(start + (contrast ? contrast.index! + contrast[0].length : 0));
+    const index = mention.index! - start - (contrast ? contrast.index! + contrast[0].length : 0);
+    const negatives = markerPositions(local, NEGATIVE_MARKER_RE)
+      .filter((position) => !/^not\s+only\b/i.test(local.slice(position)));
+    const negative = accessNegativeBefore(negatives, index, local);
+    const exception = nearestBefore(markerPositions(local, EXCEPTION_MARKER_RE), index, local);
+    if (negative < 0 || exception > negative) return true;
+  }
+  return false;
+}
 const DATEISH_RE =
   /\b(today|tomorrow|tonight|this (?:morning|afternoon|evening|week)|next (?:week|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|\d{1,2}\/\d{1,2}|\d{4}-\d{2}-\d{2}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/i;
 // Match only adapter-compiled hint data. The shared scope kernel never maps a
@@ -641,10 +662,11 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   const scopes: McpToolScope[] = [];
 
   const isLocalContextFollowup = LOCAL_CONTEXT_FOLLOWUP_RE.test(input);
-  const hasFreshExternalIntent = FRESH_EXTERNAL_RE.test(input) || FRESH_EXTERNAL_DATA_RE.test(input);
+  const hasFreshExternalIntent = hasAffirmativeCapabilityMention(input, FRESH_EXTERNAL_RE)
+    || hasAffirmativeCapabilityMention(input, FRESH_EXTERNAL_DATA_RE);
   const hasNegatedFreshExternalIntent = NEGATED_FRESH_EXTERNAL_RE.test(input) || NEGATED_EXTERNAL_WINDOW_RE.test(input);
-  const wantsSeo = SEO_RE.test(input) || (URL_RE.test(input) && /\baudit\b/i.test(input));
-  const wantsWeb = WEB_RE.test(input);
+  const wantsSeo = hasAffirmativeCapabilityMention(input, SEO_RE);
+  const wantsWeb = hasAffirmativeCapabilityMention(input, WEB_RE);
   const adapterScopeCandidates = resolveComposioMcpScopeCandidates(input);
   const wantsGoogleSheets = GOOGLE_SHEETS_RE.test(input);
   const wantsGithub = GITHUB_RE.test(input);
@@ -655,6 +677,7 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   if (
     isLocalContextFollowup
     && !hasNamedExternalSystemIntent
+    && !wantsWeb
     && (hasNegatedFreshExternalIntent || !hasFreshExternalIntent)
   ) {
     // Nothing here needs a connector, so advertise none — but the user never
