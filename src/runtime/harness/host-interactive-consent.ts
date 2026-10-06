@@ -1172,7 +1172,10 @@ export { ownerRunsInAutoMode };
  */
 function consentModeForCall(call: CapabilityRiskAttestationV1): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean } {
   const mode: 'auto' | 'ask' = ownerRunsInAutoMode() ? 'auto' : 'ask';
-  if (mode === 'auto' || call.effect !== 'external_write') return { mode, learnedExternalWrite: false };
+  // A connected-app change asks the first time in both modes (owner
+  // 2026-10-06), so what was learned is read in Auto too; otherwise every
+  // call would ask forever.
+  if (call.effect !== 'external_write') return { mode, learnedExternalWrite: false };
   let learned = false;
   try { learned = hasApprovedWriteKind(call.operationId, call.accountId); } catch { learned = false; }
   return { mode, learnedExternalWrite: learned };

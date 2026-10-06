@@ -740,11 +740,12 @@ function binaryIsNetworkMutation(binary: string, rest: string): boolean {
     case 'aws':
       return /^\s*s3\s+(cp|sync|mv)\b[\s\S]*\ss3:\/\//i.test(rest)
         || /^\s*s3api\s+(put|delete|copy)-/i.test(rest)
+        || /^\s*(ssm\s+start-session|lambda\s+invoke|ecs\s+run-task)\b/i.test(rest)
         || /^\s*\S+\s+(create|update|put|delete|terminate|deregister|associate|disassociate|enable|disable|attach|detach|start|stop|reboot|run-instances|publish|send)\b/i.test(rest);
     case 'docker':
       return /^\s*push\b/i.test(rest);
     case 'kubectl':
-      return /^\s*(apply|create|delete|edit|patch|replace|rollout|scale|cordon|drain|run)\b/i.test(rest);
+      return /^\s*(apply|create|delete|edit|patch|replace|rollout|scale|cordon|drain|run|exec|cp)\b/i.test(rest);
     case 'terraform':
     case 'tofu':
       return /^\s*(apply|destroy|import)\b/i.test(rest) || /^\s*state\s+(rm|mv|push)\b/i.test(rest);
@@ -752,6 +753,24 @@ function binaryIsNetworkMutation(binary: string, rest: string): boolean {
       return /\b(create|charge|payments?|refund)\b/i.test(rest);
     case 'twilio':
       return /\bmessages?:create\b/i.test(rest);
+    // Commands that run on another machine or change a hosted service. Live
+    // 2026-10-06: `railway link` + `railway ssh … 'node scripts/backup.js'`
+    // ran against a production service through the shell with no card.
+    case 'ssh':
+      // Any host target is a session on another machine; the quoted remote
+      // command was stripped above, so `ssh user@host "…"` is just the host.
+      return rest.trim().split(/\s+/).some((token) => token.length > 0 && !token.startsWith('-'));
+    case 'railway':
+      return /^\s*(ssh|run|up|deploy|redeploy|link|unlink|rollback|down|delete)\b/i.test(rest)
+        || /^\s*(variables?|vars?)\s+(set|delete|unset)\b/i.test(rest)
+        || /^\s*service\s+(delete|create)\b/i.test(rest);
+    case 'fly':
+    case 'flyctl':
+      return /^\s*(ssh|deploy|machines?|scale|secrets\s+(set|unset|import)|apps\s+(destroy|create))\b/i.test(rest);
+    case 'heroku':
+      return /^\s*(run|config:(set|unset)|ps:(scale|restart|stop)|releases:rollback|apps:(destroy|create))\b/i.test(rest);
+    case 'gcloud':
+      return /^\s*(compute\s+ssh|run\s+deploy|app\s+deploy|functions\s+deploy|sql\s+(import|export))\b/i.test(rest);
     case 'scp':
     case 'rsync':
       return /\s[\w.-]+@[\w.-]+:/.test(rest) || /\s[\w.-]+:\S/.test(rest);

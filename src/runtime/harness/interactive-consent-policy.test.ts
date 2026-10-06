@@ -317,13 +317,21 @@ test('a carrier-bounded unnamed consequence with exact coverage is ordinary acce
   const bounded = call({ effect: 'external_write', accountId: 'selected-account',
     risk: { reversibility: 'ordinary_non_destructive', consequence: 'unknown', destructive: false },
     semanticBasis: { kind: 'current_external_definition', digest: digest('8') } });
-  assert.deepEqual(evaluateInteractiveConsentV1(input(bounded)), {
+  // Owner 2026-10-06: a change in a connected app asks the first time, in
+  // Auto as well as Ask, and the approval teaches the kind.
+  const first = evaluateInteractiveConsentV1(input(bounded));
+  assert.equal(first.kind, 'needs_user');
+  if (first.kind === 'needs_user') {
+    assert.equal(first.teaches, 'external_write_kind');
+    assert.match(first.reason, /first time/i);
+  }
+  assert.deepEqual(evaluateInteractiveConsentV1(input(bounded, { learnedExternalWrite: true })), {
     kind: 'proceed',
     basis: 'exact_carrier_bounded_work',
     authorityDigest: digest('1'),
     reservationKey: 'contract-1\0requirement-1',
   });
-  // Carrier silent: the exact-call card stays.
+  // Carrier silent: the exact-call card stays, and it is the carrier's card, not the first-time one.
   const silent = call({ ...bounded, risk: { ...bounded.risk, reversibility: 'unknown' } });
   const carded = evaluateInteractiveConsentV1(input(silent));
   assert.equal(carded.kind, 'needs_user');
@@ -385,7 +393,8 @@ test('a planning source probes a carrier-bounded call once without coverage and 
   assert.equal(evaluateInteractiveConsentV1(input(bounded, { coverage: null, preparationProbe: true, crossing: 'started' })).kind, 'reconcile');
   // Without the planning flag nothing changed: no coverage repairs, coverage proceeds on the carrier bound.
   assert.deepEqual(evaluateInteractiveConsentV1(input(bounded, { coverage: null })), { kind: 'repair', reason: 'coverage_missing' });
-  assert.equal((evaluateInteractiveConsentV1(input(bounded)) as { basis?: string }).basis, 'exact_carrier_bounded_work');
+  assert.equal((evaluateInteractiveConsentV1(input(bounded, { learnedExternalWrite: true })) as { basis?: string }).basis, 'exact_carrier_bounded_work');
+  assert.equal(evaluateInteractiveConsentV1(input(bounded)).kind, 'needs_user');
 });
 
 

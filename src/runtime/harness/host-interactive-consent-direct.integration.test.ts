@@ -42,6 +42,13 @@ after(() => {
  * definition declares destructive:false, so its consequence stays unknown and
  * its reversibility is ordinary_non_destructive. In Plan mode that shape is
  * the one preparation probe; everything else is the typed Plan refusal. */
+/** The owner approved this kind once already (operation on this account). */
+async function withLearnedKind<T>(operationId: string, fn: () => Promise<T>): Promise<T> {
+  const scopes = await import('../../agents/plan-scope.js');
+  scopes.recordApprovedWriteKind({ operationId, accountId: 'account:direct:owner', approvalId: 'apr-direct-consent-learned' });
+  try { return await fn(); } finally { scopes.forgetApprovedWriteKind(operationId, 'account:direct:owner'); }
+}
+
 async function exactCall(kind: 'draft' | 'send' | 'delete' | 'admin' | 'unknown' | 'bounded',
   options: { taskMode?: { version: 1; kind: 'plan' } } = {}) {
   const sessionId = `direct-consent-${randomUUID()}`;
@@ -174,7 +181,8 @@ for (const kind of ['send', 'unknown'] as const) test(`the exact approved direct
 test('cached schema fallback is exact and a started crossing is reconcile-only', async () => {
   const { request } = await exactCall('draft');
   schemaCache.rememberToolSchema(request.attestation.operationId, inputSchema, Date.now(), '1');
-  const cached = await consent.evaluateUncoveredHostMutationConsent({ attestation: request.attestation, args: request.args });
+  const cached = await withLearnedKind('EXAMPLE_CREATE_DRAFT', () =>
+    consent.evaluateUncoveredHostMutationConsent({ attestation: request.attestation, args: request.args }));
   assert.equal(cached.status === 'decided' ? cached.decision.kind : null, 'proceed');
   const started = authority.withHostCallAttestation(request.attestation, () => dispatch.beginPhysicalDispatch({
     identity: { sessionId: request.attestation.sessionId, sourceUserSeq: request.attestation.sourceUserSeq,
@@ -189,8 +197,12 @@ test('cached schema fallback is exact and a started crossing is reconcile-only',
     { kind: 'reconcile', reason: 'possible_effect', retry: 'never_blind' });
 });
 
-test('an exact graph-neutral reversible draft reaches the existing reducer without an approval card', async () => {
-  const { result } = await exactCall('draft');
+test('an exact graph-neutral reversible draft reaches the existing reducer without an approval card once its kind is learned', async () => {
+  // First time (owner 2026-10-06): one card that teaches the kind, in Auto too.
+  const first = await exactCall('draft');
+  assert.equal(first.result.status === 'decided' ? first.result.decision.kind : null, 'needs_user', JSON.stringify(first.result));
+  assert.equal(first.result.status === 'decided' && first.result.decision.kind === 'needs_user' ? first.result.decision.teaches : null, 'external_write_kind');
+  const { result } = await withLearnedKind('EXAMPLE_CREATE_DRAFT', () => exactCall('draft'));
   assert.equal(result.status, 'decided', JSON.stringify(result));
   if (result.status !== 'decided') return;
   assert.equal(result.decision.kind, 'proceed', JSON.stringify(result));
@@ -251,8 +263,10 @@ test('a carrier-bounded call in Plan mode proceeds once as a preparation probe a
   assert.equal(receipts[0]!.data.operationId, 'EXAMPLE_REQUEST');
   assert.equal(receipts[0]!.data.sourceUserSeq, request.attestation.sourceUserSeq);
   assert.deepEqual(receipts[0]!.data.carrierHints, { destructive: false });
-  // The same shape outside Plan is ordinary carrier-bounded work, unchanged.
-  const act = await exactCall('bounded');
+  // The same shape outside Plan asks once (owner 2026-10-06) and then is ordinary carrier-bounded work.
+  const unlearned = await exactCall('bounded');
+  assert.equal(unlearned.result.status === 'decided' ? unlearned.result.decision.kind : null, 'needs_user');
+  const act = await withLearnedKind('EXAMPLE_REQUEST', () => exactCall('bounded'));
   assert.equal(act.result.status === 'decided' && act.result.decision.kind === 'proceed' ? act.result.decision.basis : null, 'exact_carrier_bounded_work');
 });
 
@@ -269,7 +283,7 @@ for (const kind of ['draft', 'send', 'delete', 'admin', 'unknown'] as const) {
   });
 }
 
-test('Ask mode: an ordinary connected-app change asks once, the approval teaches the kind, and Auto never asks', async () => {
+test('an ordinary connected-app change asks once in Ask and in Auto, and the approval teaches the kind', async () => {
   const policy = await import('../../agents/proactivity-policy.js');
   const scopes = await import('../../agents/plan-scope.js');
   policy.saveProactivityPolicy({ autoApproveScope: 'strict' });
@@ -320,7 +334,11 @@ test('Ask mode: an ordinary connected-app change asks once, the approval teaches
   } finally {
     policy.saveProactivityPolicy({ autoApproveScope: 'yolo' });
   }
-  // Auto: the same draft proceeds, as before.
+  // Auto (owner 2026-10-06, "non-disruptive writes should get a card"): the
+  // same draft asks the first time here too; a learned kind runs without one.
   const auto = await exactCall('draft');
-  assert.equal(auto.result.status === 'decided' && auto.result.decision.kind === 'proceed' ? auto.result.decision.basis : null, 'exact_reversible_work');
+  assert.equal(auto.result.status === 'decided' ? auto.result.decision.kind : null, 'needs_user');
+  assert.equal(auto.result.status === 'decided' && auto.result.decision.kind === 'needs_user' ? auto.result.decision.teaches : null, 'external_write_kind');
+  const learnedAuto = await withLearnedKind('EXAMPLE_CREATE_DRAFT', () => exactCall('draft'));
+  assert.equal(learnedAuto.result.status === 'decided' && learnedAuto.result.decision.kind === 'proceed' ? learnedAuto.result.decision.basis : null, 'exact_reversible_work');
 });

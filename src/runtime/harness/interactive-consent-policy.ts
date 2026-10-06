@@ -533,20 +533,24 @@ export function evaluateInteractiveConsentV1(
     };
   }
 
-  // Ask mode: an ordinary change in a connected app waits for the owner the
-  // first time. The approval teaches the kind (this operation on this
-  // account), so it is asked once, never on every call. Everything above
-  // still decides first: a send, a delete, an irreversible or administrative
-  // change asks in both modes; local work never reaches this line.
-  if (input.mode === 'ask' && call.effect === 'external_write' && !input.learnedExternalWrite) {
-    return {
-      kind: 'needs_user',
-      need: 'approval',
-      subjectDigest: call.bindingDigest,
-      reason: 'Ask mode: this change in a connected app runs after you approve it. Approving it once teaches Clem this kind of change.',
-      teaches: 'external_write_kind',
-    };
-  }
+  // An ordinary change in a connected app waits for the owner the first
+  // time, in Auto as well as Ask. The approval teaches the kind (this
+  // operation on this account), so it is asked once, never on every call.
+  // Owner 2026-10-06, after a fixture turn put a reminder in their Slack and
+  // another ran a production backup through the shell with no card: "Non
+  // disruptive writes should get a card where Clem says in plain English
+  // what she's doing." Everything above still decides first: a send, a
+  // delete, an irreversible or administrative change asks every time; local
+  // work never reaches this line; a call the carrier cannot classify keeps
+  // its own card below.
+  const firstTimeExternalWrite = call.effect === 'external_write' && !input.learnedExternalWrite;
+  const firstTimeCard = (): InteractiveConsentDecisionV1 => ({
+    kind: 'needs_user',
+    need: 'approval',
+    subjectDigest: call.bindingDigest,
+    reason: 'This changes something in a connected app, and it is the first time Clem does this kind of change for you. It runs after you approve it; approving once teaches her the kind.',
+    teaches: 'external_write_kind',
+  });
 
   // A carrier that declares the operation non-destructive bounds an otherwise
   // unnamed consequence; with exact coverage, no send/delete evidence in the
@@ -558,6 +562,7 @@ export function evaluateInteractiveConsentV1(
     && call.risk.consequence === 'unknown'
     && call.risk.reversibility === 'ordinary_non_destructive'
   ) {
+    if (firstTimeExternalWrite) return firstTimeCard();
     return {
       kind: 'proceed',
       basis: 'exact_carrier_bounded_work',
@@ -588,6 +593,7 @@ export function evaluateInteractiveConsentV1(
     return { kind: 'repair', reason: 'scope_mismatch' };
   }
 
+  if (firstTimeExternalWrite) return firstTimeCard();
   return {
     kind: 'proceed',
     basis: call.risk.reversibility === 'reversible'

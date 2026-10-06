@@ -432,3 +432,21 @@ test('heredoc BODIES are document content, never commands (2026-08-04 markdown-p
   assert.equal(real.isPublish, true);
   assert.equal(real.isProd, true);
 });
+
+test('classifyShellNetworkMutation: commands that run on another machine are sends', () => {
+  // Live 2026-10-06: `railway link` + `railway ssh … node scripts/backup.js`
+  // reached a production service through the shell with no card.
+  for (const cmd of [
+    "railway ssh --service vertical-sales 'node scripts/backup.js'",
+    'railway link --project vertical-sales --environment production --service vertical-sales',
+    'railway up', 'railway redeploy --service api',
+    'ssh deploy@prod.example.com "systemctl restart api"', 'ssh prod ./rotate.sh',
+    'fly deploy', 'flyctl ssh console', 'heroku run rake db:migrate', 'kubectl exec -it web -- sh',
+    'kubectl apply -f deploy.yaml', 'gcloud compute ssh web-1 --command "uptime"', 'aws s3 sync ./out s3://bucket',
+  ]) assert.equal(classifyShellNetworkMutation(cmd).isNetworkMutation, true, `should flag: ${cmd}`);
+  for (const cmd of [
+    'railway status', 'railway logs --service api', 'railway service', 'railway --version', 'railway link --help',
+    'ssh -V', 'fly status', 'heroku logs --tail', 'kubectl get pods', 'gcloud config list', 'aws s3 ls s3://bucket',
+  ]) assert.equal(classifyShellNetworkMutation(cmd).isNetworkMutation, false, `should pass: ${cmd}`);
+  assert.equal(classifyShellNetworkMutation("railway ssh --service api 'uptime'").shapeKey, 'shell:railway');
+});
