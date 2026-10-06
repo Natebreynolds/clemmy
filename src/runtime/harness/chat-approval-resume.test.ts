@@ -34,6 +34,7 @@ const {
 const { _setApprovedCallDispatchForTests } = await import('../../execution/pending-action-executor.js');
 const { pendingActionApprovalView } = await import('./pending-action-view.js');
 const { HarnessSession } = await import('./session.js');
+const { recordTurnGraphShadow, turnGraphFromShadowEvent } = await import('../graph/turn-graph-shadow.js');
 const {
   handleResolvedApprovalForChatResume,
   startChatApprovalResume,
@@ -517,4 +518,60 @@ test('a dispatch failure is swallowed (the grant stays consumable for a manual c
   );
   assert.equal(retriedAttempt, firstAttempt, 'retry reuses the same pre-bound physical attempt');
   assert.match(chatApprovalResumeDirective('s', 't'), /approval-resume/);
+});
+
+test('an approved card whose persisted graph can never activate is retired once, not re-drained on every boot', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const action = queuePendingAction({
+    title: 'Run ssh localhost echo hi',
+    summary: 'Runs one remote command.',
+    kind: 'shell_command',
+    toolName: 'run_shell_command',
+    payload: { command: 'ssh localhost echo hi', cwd: '/tmp' },
+    sessionId: sess.id,
+  });
+  const row = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'Run ssh localhost echo hi',
+    tool: 'request_approval',
+    args: { pendingActionId: action.id, pendingAction: pendingActionApprovalView(action) },
+  });
+  appendEvent({
+    sessionId: sess.id, turn: 0, role: 'system', type: 'approval_parked',
+    data: { approvalId: row.approvalId, tool: 'request_approval', pendingActionId: action.id },
+  });
+  // The owner's own words, stamped as the decision on this card — but the
+  // graph persisted for them (by an older compile) is conversation, and a
+  // persisted graph is immutable.
+  const accepted = appendEvent({
+    sessionId: sess.id, turn: 3, role: 'user', type: 'user_input_received',
+    data: { text: 'Thanks, yes.', displayText: 'Thanks, yes.', approvalId: row.approvalId, decision: 'approve', source: 'desktop_approval' },
+  });
+  const stale = recordTurnGraphShadow({ identity: { sessionId: sess.id, turn: 3, sourceUserSeq: accepted.seq } });
+  assert.ok(stale, 'a graph was persisted for the decision');
+  assert.notEqual(turnGraphFromShadowEvent(stale!)?.classification.route, 'act', 'the fixture graph is not an action');
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  const dispatched = recordingDispatch();
+  const directives: string[] = [];
+
+  assert.equal(
+    await handleResolvedApprovalForChatResume(resolved, async (_sessionId, directive) => { directives.push(directive); }),
+    true,
+    'the card settled instead of staying consumable',
+  );
+  assert.equal(dispatched.length, 0, 'nothing ran');
+  assert.equal(directives.length, 0, 'no model turn');
+  assert.equal(getPendingAction(action.id)?.status, 'cancelled', 'the stored action is retired');
+  const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
+    .find((event) => event.data.sourceUserSeq === accepted.seq);
+  assert.ok(terminal, 'the decision has a visible ending');
+  assert.match(String(terminal!.data.reply), /couldn't run "Run ssh localhost echo hi" after you approved it/);
+  assert.equal(terminal!.data.turnOutcome?.status, 'failed');
+  // A later boot drain finds nothing to redo.
+  _resetChatApprovalResumeForTest();
+  assert.equal(
+    await handleResolvedApprovalForChatResume(approvalRegistry.get(row.approvalId)!, async () => { throw new Error('must not resume'); }),
+    false,
+  );
+  assert.equal(dispatched.length, 0);
 });

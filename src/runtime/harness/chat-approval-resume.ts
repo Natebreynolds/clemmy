@@ -45,7 +45,8 @@ import {
   type RunAttemptRef,
 } from './eventlog.js';
 import { HarnessSession } from './session.js';
-import { getPendingAction, type PendingActionRecord } from './pending-actions.js';
+import { getPendingAction, recordPendingActionResult, type PendingActionRecord } from './pending-actions.js';
+import { BoundaryError } from '../boundary-error.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { publicUserInputText } from './public-presentation.js';
 import { freshExternalWriteEvidenceStatus } from './tool-evidence.js';
@@ -459,10 +460,30 @@ async function executeApprovedLinkedActionAndSettle(
       sessionId: source.sessionId,
       sourceUserSeq: source.seq,
     });
-    requireActionExpectedWorkActivation({
-      sessionId: source.sessionId,
-      sourceUserSeq: source.seq,
-    });
+    try {
+      requireActionExpectedWorkActivation({
+        sessionId: source.sessionId,
+        sourceUserSeq: source.seq,
+      });
+    } catch (err) {
+      // The persisted graph for this decision is immutable, so a refusal that
+      // reads it as not-an-action is permanent: every boot re-drained the same
+      // approved card, failed the same way and kept it "consumable" (live
+      // 2026-10-06, two cards re-failing on each daemon start). Nothing ran
+      // and nothing can; end the card visibly instead of spinning on it.
+      if (!(err instanceof BoundaryError) || err.retryable) throw err;
+      logger.warn({ approvalId: row.approvalId, pendingActionId: approvedPendingAction.id, err: err.operatorMessage },
+        'approved card can never activate — retiring it as not run');
+      recordPendingActionResult(
+        approvedPendingAction.id,
+        'cancelled',
+        `Not run: the stored action could not be activated after approval (${err.operatorMessage}).`,
+      );
+      return await settleConversationalSource(row, source, {
+        status: 'failed',
+        text: `I couldn't run "${approvedPendingAction.title}" after you approved it: the action I had stored no longer lines up with that card, so nothing ran. Ask me again and I'll prepare a fresh one.`,
+      });
+    }
     for (let attempt = 0; attempt <= CONVERSATIONAL_TRANSITION_RETRY_MS.length; attempt += 1) {
       const execution = await withHarnessRunContext({
         sessionId: source.sessionId,
