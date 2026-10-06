@@ -437,6 +437,61 @@ export function settleAdmittedLogicalCallPreDispatchDisposition(input: {
   };
 }
 
+/**
+ * A STOP MUST BE ABLE TO PUBLISH.
+ *
+ * A logical call the model admitted but the host never dispatched (no lease,
+ * no physical crossing) can only settle through its runner, and the runner is
+ * gone once the kill latch lands. Live 2026-10-06: a 12-file fan-out was
+ * stopped mid-way; one write_file call stayed `open` with no lease, the stop
+ * could not publish ("host call authority still owns unsettled work"), the
+ * attempt stayed active with an expired lease and "continue where you left
+ * off" was filed as a note to a dead run. Settle such calls as cancelled
+ * before dispatch, exactly once, so the cancelled terminal can publish.
+ * A call that holds a lease or crossed physically is never touched here.
+ */
+export function settleUndispatchedOpenCallsOnStop(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  lane?: SettleToolAttemptInput['lane'];
+}): { settled: number; held: number; reasons: string[] } {
+  const rows = openEventLog().prepare(`
+    SELECT c.logical_tool_call_id AS logicalToolCallId, c.tool_name AS toolName, c.accepted_task_id AS acceptedTaskId,
+           c.argument_digest AS argumentDigest
+      FROM logical_tool_calls c
+     WHERE c.session_id = ? AND c.source_user_seq = ? AND c.state = 'open'
+       AND NOT EXISTS (SELECT 1 FROM run_dispatch_leases l
+                        WHERE l.session_id = c.session_id AND l.logical_tool_call_id = c.logical_tool_call_id)
+       AND NOT EXISTS (SELECT 1 FROM physical_dispatches p
+                        WHERE p.session_id = c.session_id AND p.logical_tool_call_id = c.logical_tool_call_id)
+  `).all(input.sessionId, input.sourceUserSeq) as Array<{ logicalToolCallId: string; toolName: string; acceptedTaskId: string; argumentDigest: string }>;
+  let settled = 0;
+  let held = 0;
+  const reasons: string[] = [];
+  for (const row of rows) {
+    const outcome: AttemptOutcome = {
+      ...classifyAttemptOutcome({ preDispatch: true, cancelled: true }),
+      detail: 'stop:cancelled_before_dispatch',
+    };
+    const committed = commitLogicalCallSettlement({
+      identity: {
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId: row.acceptedTaskId,
+        logicalToolCallId: row.logicalToolCallId,
+      },
+      contract: { toolName: row.toolName, argumentDigest: row.argumentDigest },
+      execution: { kind: 'refused_pre_dispatch' },
+      outcome,
+      recovery: { businessCall: false, mutating: false },
+      observer: { lane: input.lane ?? 'agents_runner', callId: row.logicalToolCallId },
+    });
+    if (committed.status === 'committed' || committed.status === 'replayed') settled += 1;
+    else { held += 1; reasons.push(`${committed.status}: ${'reason' in committed ? committed.reason : ''}`); }
+  }
+  return { settled, held, reasons };
+}
+
 export function settleAdmittedLogicalCallPreDispatchRefusal(input: {
   sessionId: string;
   sourceUserSeq: number;

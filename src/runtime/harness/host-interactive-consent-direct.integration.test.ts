@@ -327,6 +327,25 @@ test('a learned kind skips the card only for the change the owner asked for; uns
   }
 });
 
+test('a stop settles an admitted call the host never dispatched as cancelled, so the stop can publish', async () => {
+  // Live 2026-10-06: a 12-file fan-out stopped mid-way left one write_file
+  // call open with no lease; the stop could not publish and "continue" went
+  // to a dead run.
+  const settlement = await import('./attempt-settlement.js');
+  const { request } = await withLearnedKind('EXAMPLE_CREATE_DRAFT', () => exactCall('draft'));
+  const { sessionId, sourceUserSeq, logicalToolCallId } = request.attestation;
+  const db = eventlog.openEventLog();
+  const state = () => (db.prepare('SELECT state FROM logical_tool_calls WHERE session_id = ? AND logical_tool_call_id = ?')
+    .get(sessionId, logicalToolCallId) as { state: string } | undefined)?.state;
+  assert.equal(state(), 'open', 'admitted, never dispatched');
+  const first = settlement.settleUndispatchedOpenCallsOnStop({ sessionId, sourceUserSeq });
+  assert.deepEqual({ settled: first.settled, held: first.held }, { settled: 1, held: 0 }, JSON.stringify(first));
+  assert.notEqual(state(), 'open');
+  // Exactly once: a second stop finds nothing to settle.
+  const again = settlement.settleUndispatchedOpenCallsOnStop({ sessionId, sourceUserSeq });
+  assert.deepEqual({ settled: again.settled, held: again.held }, { settled: 0, held: 0 });
+});
+
 for (const kind of ['draft', 'send', 'delete', 'admin', 'unknown', 'bounded'] as const) {
   test(`a ${kind} in Plan mode returns the typed Plan refusal from consent and dispatches nothing`, async () => {
     const { result, request } = await exactCall(kind, { taskMode: PLAN });

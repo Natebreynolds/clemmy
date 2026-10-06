@@ -74,6 +74,7 @@ import {
   type SessionRow,
   AcceptedTaskTerminalPublicationError,
 } from './eventlog.js';
+import { settleUndispatchedOpenCallsOnStop } from './attempt-settlement.js';
 import { reconcileRevokedHostToolInvocations } from './host-tool-invocation.js';
 import { isUnattendedSession } from './unattended-session.js';
 import { autonomousSendConsentPresentation } from './autonomous-send-consent.js';
@@ -1453,13 +1454,22 @@ function commitStopSettlingRevokedCalls<T>(
       || !(error instanceof AcceptedTaskTerminalPublicationError)
       || error.status !== 'not_ready') throw error;
     const sweep = reconcileRevokedHostToolInvocations({ sessionId: outcome.identity.sessionId });
+    // A call the model admitted but the host never dispatched has no lease to
+    // revoke and no runner left to settle it (live 2026-10-06: a stop during a
+    // fan-out left one such write_file open and the stop never published).
+    const undispatched = settleUndispatchedOpenCallsOnStop({
+      sessionId: outcome.identity.sessionId,
+      sourceUserSeq: outcome.identity.sourceUserSeq,
+    });
     logger.warn({
       sessionId: outcome.identity.sessionId,
       sourceUserSeq: outcome.identity.sourceUserSeq,
       reason: error.reason,
       settled: sweep.settled,
       held: sweep.held,
-    }, 'stop waited on open calls; settled revoked calls before publishing');
+      cancelledBeforeDispatch: undispatched.settled,
+      heldBeforeDispatch: undispatched.held,
+    }, 'stop waited on open calls; settled revoked and undispatched calls before publishing');
     return commit();
   }
 }

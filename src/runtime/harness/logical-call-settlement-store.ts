@@ -60,7 +60,9 @@ export interface CommitLogicalCallSettlementInput {
     acceptedTaskId: string;
     logicalToolCallId: string;
   };
-  contract: { toolName: string; args?: unknown };
+  /** A stop that cancels a never-dispatched call holds the admitted digest,
+   * not the args; it may present that digest. It must still match the row. */
+  contract: { toolName: string; args?: unknown; argumentDigest?: string };
   execution: { kind: LogicalCallExecutionKind };
   /** Exact returned bytes. Required for a successful provider crossing. */
   result?: {
@@ -737,11 +739,13 @@ export function commitLogicalCallSettlement(
       if (recovery.requirementId && recovery.requirementId.length > 256) {
         return conflict(db, identity, 'requirement identity exceeds its durable bound');
       }
-      const contract = durableLogicalCallContract(
-        identity.acceptedTaskId,
-        input.contract.toolName,
-        input.contract.args,
-      );
+      const contract = input.contract.args === undefined && typeof input.contract.argumentDigest === 'string'
+        ? { toolName: input.contract.toolName, argumentDigest: input.contract.argumentDigest }
+        : durableLogicalCallContract(
+          identity.acceptedTaskId,
+          input.contract.toolName,
+          input.contract.args,
+        );
       if (!contract) return conflict(db, identity, 'logical call contract is unsafe');
       const progressDigest = progressKeyDigest(identity.acceptedTaskId, recovery.progressIdentity);
       if (
