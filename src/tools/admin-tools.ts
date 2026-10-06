@@ -12,7 +12,7 @@ import {
   textResult,
   invalidArgumentsTextResult,
 } from './shared.js';
-import { appendTimer, resolveTimerFireAt, type TimerEntry } from '../runtime/timers.js';
+import { appendTimer, cancelTimers, listPendingTimers, resolveTimerFireAt, type TimerEntry } from '../runtime/timers.js';
 import { timerProspectiveDefinition } from '../runtime/prospective-adapters.js';
 import { upsertProspectiveIntention } from '../runtime/prospective-intentions.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
@@ -178,11 +178,34 @@ export function registerAdminTools(server: McpServer): void {
       catch { /* daemon reconciliation repairs the index on its next tick */ }
 
       return textResult(
-        `Reminder scheduled (${timer.id}) for ${resolved.confirmationTarget}: "${message}" — `
+        // The person reads a time and their words, never a timer id.
+        `Reminder set for ${resolved.confirmationTarget}: "${message}" — `
         + (delivery === 'local'
           ? 'it will appear only in the app inbox, with no external delivery (after reopening if the app is closed).'
           : 'it will fire as a notification (late-but-never-lost if the app is closed or the Mac sleeps).'),
       );
+    },
+  );
+
+  server.tool(
+    'cancel_timer',
+    'Cancel a pending reminder that was set with set_timer. Give some words from the reminder message (or its id); with only one reminder pending, no selector is needed. Use all=true to clear every pending reminder.',
+    {
+      message: z.string().optional().describe('Words from the reminder message, e.g. "oven" or "move the car".'),
+      id: z.string().optional().describe('Exact reminder id, when known.'),
+      all: z.boolean().optional().describe('Cancel every pending reminder.'),
+    },
+    async ({ message, id, all }) => {
+      const pending = listPendingTimers();
+      if (pending.length === 0) return textResult('No reminders are pending, so there is nothing to cancel.');
+      const when = (timer: TimerEntry) => new Date(timer.fireAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      const cancelled = cancelTimers({ ...(id ? { id } : {}), ...(message ? { messageIncludes: message } : {}), ...(all ? { all: true } : {}) });
+      if (cancelled.length === 0) {
+        return textResult(`I could not tell which reminder to cancel. Pending: ${pending.map((timer) => `"${timer.message}" at ${when(timer)}`).join('; ')}. Say which one.`);
+      }
+      return textResult(cancelled.length === 1
+        ? `Cancelled the reminder "${cancelled[0]!.message}" (was due ${when(cancelled[0]!)}); it will not fire.`
+        : `Cancelled ${cancelled.length} reminders: ${cancelled.map((timer) => `"${timer.message}"`).join(', ')}. None of them will fire.`);
     },
   );
 

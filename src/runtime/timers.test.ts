@@ -341,3 +341,18 @@ test('a corrupt store is quarantined + surfaced, never silently emptied', () => 
 test('an empty/absent store is a cheap no-op', () => {
   assert.equal(fireDueTimers(NOW), 0);
 });
+
+test('cancel_timer removes the chosen pending reminder and nothing else', async () => {
+  // Live 2026-10-06: "Cancel that reminder" had no tool; the turn ended blocked.
+  const { cancelTimers, listPendingTimers } = await import('./timers.js');
+  writeTimers([]);
+  const now = Date.now();
+  appendTimer({ id: 'timer-aaaa0001', message: 'Check the oven', fireAt: now + 4 * 60_000, createdAt: now - 2 });
+  appendTimer({ id: 'timer-aaaa0002', message: 'Move the car', fireAt: now + 5 * 60_000, createdAt: now - 1 });
+  assert.deepEqual(cancelTimers({}, now).map((t) => t.id), [], 'two pending and no selector: nothing is guessed');
+  assert.deepEqual(cancelTimers({ messageIncludes: 'oven' }, now).map((t) => t.id), ['timer-aaaa0001']);
+  assert.deepEqual(listPendingTimers(now).map((t) => t.id), ['timer-aaaa0002']);
+  assert.deepEqual(cancelTimers({}, now).map((t) => t.id), ['timer-aaaa0002'], 'one pending and no selector: that one');
+  assert.deepEqual(readTimers(), []);
+  assert.deepEqual(cancelTimers({ all: true }, now), [], 'nothing pending cancels nothing');
+});

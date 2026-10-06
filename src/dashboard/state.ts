@@ -63,7 +63,7 @@ function toolCategory(name: string): string {
   if (name.startsWith('memory_') || name === 'working_memory' || name.startsWith('note_')) return 'Memory';
   if (name.startsWith('task_') || name.includes('plan') || name === 'discover_work' || name.startsWith('goal_')) return 'Planning';
   if (name.startsWith('team_') || name.includes('agent') || name.includes('delegation')) return 'Agents';
-  if (name.startsWith('cron_') || name.startsWith('workflow_') || name === 'set_timer' || name === 'trigger_cron_job' || name === 'add_cron_job') return 'Automation';
+  if (name.startsWith('cron_') || name.startsWith('workflow_') || name === 'set_timer' || name === 'cancel_timer' || name === 'trigger_cron_job' || name === 'add_cron_job') return 'Automation';
   return 'Core';
 }
 

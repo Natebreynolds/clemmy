@@ -135,6 +135,7 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   // so asking for a second approval would add friction without protecting an
   // external system.
   'set_timer',
+  'cancel_timer',
   'goal_upsert',
   // Current focus — local SQLite attention pointer. Pure local writes,
   // no external surface. Pausing for approval on these would force the

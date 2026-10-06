@@ -21,7 +21,7 @@ import { addNotification } from './notifications.js';
 import { withFileLockSyncStrict } from './atomic-json.js';
 import {
   claimProspectiveIntention,
-  prospectiveIntentionId,
+  cancelProspectiveIntention, prospectiveIntentionId,
   recordProspectiveCue,
   recordProspectiveOutcome,
 } from './prospective-intentions.js';
@@ -234,4 +234,42 @@ export function fireDueTimers(now: number = Date.now()): number {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'timer firing pass failed');
     return 0;
   }
+}
+
+/** Reminders that have not fired yet, newest first. */
+export function listPendingTimers(now: number = Date.now()): TimerEntry[] {
+  return readTimers()
+    .filter((timer) => typeof timer.fireAt === 'number' && timer.fireAt > now)
+    .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+}
+
+/** Cancel pending reminders: by id, by words from the message (the newest
+ * match when several fit), everything, or — with no selector — the only one
+ * pending. Nothing is cancelled when the choice is not clear. Live 2026-10-06:
+ * "Cancel that reminder" had no tool at all; Clem searched for one for three
+ * minutes and ended blocked. */
+export function cancelTimers(
+  selector: { id?: string; messageIncludes?: string; all?: boolean },
+  now: number = Date.now(),
+): TimerEntry[] {
+  return withFileLockSyncStrict(TIMERS_FILE, () => {
+    const timers = readTimers();
+    const pending = timers.filter((timer) => typeof timer.fireAt === 'number' && timer.fireAt > now);
+    let picked: TimerEntry[];
+    if (selector.id) picked = pending.filter((timer) => timer.id === selector.id);
+    else if (selector.all) picked = pending;
+    else if (selector.messageIncludes?.trim()) {
+      const words = selector.messageIncludes.trim().toLowerCase();
+      picked = pending.filter((timer) => timer.message.toLowerCase().includes(words));
+      if (picked.length > 1) picked = [picked.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))[0]!];
+    } else picked = pending.length === 1 ? pending : [];
+    if (picked.length === 0) return [];
+    const ids = new Set(picked.map((timer) => timer.id));
+    writeTimersUnlocked(timers.filter((timer) => !ids.has(timer.id)));
+    for (const timer of picked) {
+      try { cancelProspectiveIntention(prospectiveIntentionId('timer', timer.id), 'cancelled_by_user', new Date(now)); }
+      catch { /* the timer file is the execution authority; the index reconciles */ }
+    }
+    return picked;
+  });
 }

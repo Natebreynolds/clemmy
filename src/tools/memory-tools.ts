@@ -1139,7 +1139,9 @@ export function registerMemoryTools(server: McpServer): void {
       const ok = forgetFact(id, { hard });
       if (ok) bumpStableContextGeneration();
       if (ok && fact.kind === 'constraint') notifyStandingRuleChange('forgotten', fact);
-      return textResult(ok ? `Forgot fact #${id}${hard ? ' (hard delete)' : ''}.` : `No fact found with id ${id}.`);
+      // The person hears what was forgotten, not a row number.
+      const excerpt = fact.content.length > 90 ? `${fact.content.slice(0, 87)}…` : fact.content;
+      return textResult(ok ? `Forgot it: "${excerpt}"${hard ? ' (removed for good)' : ' (no longer used; recoverable)'}.` : `No fact found with id ${id}.`);
     },
   );
 
