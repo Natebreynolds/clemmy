@@ -481,8 +481,12 @@ export async function classifyUnsettledOpenQuestionReply(input: {
   // reading). A sure answer the quick model read as no progress is re-asked
   // verbatim as before; a reply nothing could interpret, or a completeness
   // check that could not run, keeps the honest hold.
+  // A reply the quick semantic reading could not admit is still the person's
+  // exact words; when the revision check is unavailable too, the brain reads
+  // them (owner 2026-10-06: no canned hold). The verbatim re-ask on a
+  // no-progress revision stands; only an unrunnable completeness check holds.
   const brainReadsReply = completenessRequired || amending || continuing
-    || (recordedReading.reading === 'answers' && recordedReading.revisionUnavailable === true);
+    || ((recordedReading.reading === 'answers' || unreadable) && recordedReading.revisionUnavailable === true);
   if (route === 'reask' && !revision && !skipRevision && brainReadsReply) {
     route = 'respond';
     recordedReading = { ...recordedReading, partialAnswer: true };
