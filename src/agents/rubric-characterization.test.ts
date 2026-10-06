@@ -186,8 +186,8 @@ const GOLDEN = {
   // offers to keep it; set_model_role is for a rule the user asks for.
   instructions: { len: 31898, sha16: '4c366210ce5868a0' },
   native: { len: 31005, sha16: '6eca30da1942d4f1' },
-  claudeBrain: { len: 9118, sha16: 'e06124ef4d5e6cf2' },
-  lean: { len: 11123, sha16: '27e1f4f506289421' },
+  claudeBrain: { len: 9384, sha16: 'ee7846000e14c638' },
+  lean: { len: 11389, sha16: 'b6b16fcac7b2ddd1' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
