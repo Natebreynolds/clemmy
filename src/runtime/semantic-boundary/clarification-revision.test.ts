@@ -115,7 +115,7 @@ test('exact visible-option anchors preserve a compound amendment only after one 
   const reviewCall = fixture.calls[1]!.input as { state: Record<string, unknown>; timeoutMs: number; decisionContext: Record<string, unknown> };
   assert.deepEqual(reviewCall.state.deliveredOptions, optionInput.deliveredOptions);
   assert.equal(reviewCall.state.acceptedReply, optionInput.acceptedReply);
-  assert.equal(reviewCall.timeoutMs, 4_000);
+  assert.equal(reviewCall.timeoutMs, 12_000, 'Jev took 9 s under load on 2026-10-06; the 4 s bound made a good reading a review_timeout');
   assert.equal(reviewCall.decisionContext.inputDigest, result.revision.inputDigest);
   assert.equal(reviewCall.decisionContext.proposalDigest, result.revision.proposalDigest);
   assert.equal(result.revision.inputDigest, sha({ sessionId: optionInput.sessionId, sourceUserSeq: optionInput.sourceUserSeq,

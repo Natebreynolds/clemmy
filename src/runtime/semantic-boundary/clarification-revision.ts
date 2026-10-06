@@ -353,7 +353,7 @@ export async function checkClarificationAnswerCompleteness(
       checked = await evaluate({
         state,
         questions: { complete_answer: { type: 'noul', instructions: COMPLETENESS_INSTRUCTIONS + annotationInstructions(input) } },
-        timeoutMs: 4_000,
+        timeoutMs: CLARIFICATION_REVIEW_TIMEOUT_MS,
         sessionId: input.sessionId,
         channel: 'jev:clarification_answer_completeness',
         decisionContext: { sourceUserSeq: input.sourceUserSeq, inputDigest },
@@ -405,6 +405,12 @@ export function validatedClarificationRevision(
     ...(revision.anchorPolicy !== undefined ? { anchorPolicy: revision.anchorPolicy } : {}), proposed })) return null;
   return revision;
 }
+
+/** Jev answers these in under a second on a quiet machine and took 9 s under
+ * load on 2026-10-06, when the 4 s bound turned a good reading into
+ * `review_timeout` and the canned hold. The proposal's own 20 s deadline still
+ * bounds the whole check. */
+const CLARIFICATION_REVIEW_TIMEOUT_MS = 12_000;
 
 /** One proposal (two only when the first merely passed its deadline) and one
  * independent check at most; no repair. Persistence/replay belongs to the
@@ -470,7 +476,7 @@ export async function proposeClarificationRevision(
       checked = await ports.evaluate({
         state: { ...state, proposed, inputDigest, proposalDigest },
         questions: { grounded_revision: { type: 'noul', instructions: GROUNDING_INSTRUCTIONS + annotationInstructions(input) } },
-        timeoutMs: 4_000,
+        timeoutMs: CLARIFICATION_REVIEW_TIMEOUT_MS,
         sessionId: input.sessionId,
         channel: 'jev:clarification_revision',
         decisionContext: { sourceUserSeq: input.sourceUserSeq, inputDigest, proposalDigest },

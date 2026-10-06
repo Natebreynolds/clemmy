@@ -795,7 +795,6 @@ function validateRelationMatrix(
   //    is the pathology behind the near-zero bind rate) but a separate change
   //    with its own blast radius. It does not belong in this fix.
   const carriesNoWork = workRequestsNothing(proposal.work);
-  const suppliedNoWork = proposal.work === null;
   switch (proposal.relation) {
     case 'conversation':
       if (proposal.targetGoal !== null || proposal.goal !== null || !carriesNoWork || !noAnswers) {
@@ -844,12 +843,18 @@ function validateRelationMatrix(
       return;
     case 'amend_goal':
       requireExactActiveGoal(proposal, host, issues);
-      if (proposal.goal === null || suppliedNoWork || !noAnswers) {
+      // The amended GOAL is what this relation carries; the projection reads
+      // nothing else from it and the work is planned again from the new goal.
+      // Demanding a work replacement here rejected a correct reading (live
+      // 2026-10-06: "make it about the Q4 retreat, under 80 words, Nov 14"
+      // came back as amend_goal with the new objective and work: null, was
+      // refused twice, and the owner got the canned hold).
+      if (proposal.goal === null || !noAnswers) {
         issue(
           issues,
           'illegal_relation_payload',
           '',
-          'amend_goal requires a full semantic goal and work replacement and cannot also settle a slot',
+          'amend_goal requires a full semantic goal and cannot also settle a slot',
         );
       }
       return;

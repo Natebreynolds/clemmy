@@ -1652,3 +1652,15 @@ test('destination repair uses the shown creator and lifecycle contract instead o
   const wrong = destinationMismatchRepair({ reason: 'capability_ref_destination_mismatch', draft, capabilities: [receipt, toggle] });
   assert.doesNotMatch(wrong ?? '', /can consume the artifact created by/);
 });
+
+test('an amendment carries the new goal and may leave work to be planned again', () => {
+  // Live 2026-10-06: "make it about the Q4 retreat, under 80 words, Nov 14"
+  // came back as amend_goal with the new objective and work: null; requiring a
+  // work replacement refused it twice and the owner got the canned hold.
+  const result = validateTurnSemanticProposalV1(proposal({
+    relation: 'amend_goal',
+    targetGoal: activeGoal,
+    work: null,
+  }), host());
+  assert.equal(result.ok, true, JSON.stringify(result));
+});
