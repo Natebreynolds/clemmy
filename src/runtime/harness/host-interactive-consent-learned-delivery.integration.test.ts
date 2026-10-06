@@ -18,6 +18,10 @@ import { after, beforeEach, test } from 'node:test';
 
 const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-learned-delivery-consent-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
+// These fixtures exercise dispatch, recovery and transport, not the first-time
+// card (owner 2026-10-06): every connected-app kind counts as already approved.
+const { _setApprovedWriteKindsForTests } = await import('../../agents/plan-scope.js');
+_setApprovedWriteKindsForTests('all');
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 const eventlog = await import('./eventlog.js');

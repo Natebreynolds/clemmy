@@ -72,7 +72,7 @@ import {
   currentCapabilityManifest,
 } from './capability-manifest.js';
 import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
-import { hasApprovedWriteKind, recordApprovedWriteKind } from '../../agents/plan-scope.js';
+import { hasApprovedWriteKind, recordApprovedWriteKind, approvedWriteKindsForTestsMode } from '../../agents/plan-scope.js';
 import { ownerRunsInAutoMode } from './worker-lead-authority.js';
 import {
   loadHostCallCapabilityBinding,
@@ -1208,6 +1208,7 @@ async function learnedKindAppliesToRequest(input: {
   if (input.call.effect !== 'external_write') return undefined;
   if (typeof input.sourceUserSeq !== 'number') return undefined;
   if (workflowRunSession(input.sessionId)) return undefined;
+  if (approvedWriteKindsForTestsMode() === 'all') return undefined;
   let learned = false;
   try { learned = hasApprovedWriteKind(input.call.operationId, input.call.accountId); } catch { learned = false; }
   if (!learned) return undefined;

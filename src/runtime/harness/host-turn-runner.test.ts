@@ -20,6 +20,10 @@ import { BoundaryError } from '../boundary-error.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-host-turn-runner-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+// These fixtures exercise dispatch, recovery and transport, not the first-time
+// card (owner 2026-10-06): every connected-app kind counts as already approved.
+const { _setApprovedWriteKindsForTests } = await import('../../agents/plan-scope.js');
+_setApprovedWriteKindsForTests('all');
 delete process.env.OPENAI_API_KEY;
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 process.env.CLEMMY_UNIFIED_RECALL = 'off';

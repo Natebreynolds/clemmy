@@ -8,6 +8,10 @@ import { after, test } from 'node:test';
 
 const fixtureHome = mkdtempSync(path.join(os.tmpdir(), 'clem-outreach-batch-'));
 process.env.CLEMENTINE_HOME = fixtureHome;
+// These fixtures exercise dispatch, recovery and transport, not the first-time
+// card (owner 2026-10-06): every connected-app kind counts as already approved.
+const { _setApprovedWriteKindsForTests } = await import('../../agents/plan-scope.js');
+_setApprovedWriteKindsForTests('all');
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 process.env.HARNESS_TOOL_BRACKETS = 'on';

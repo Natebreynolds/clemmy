@@ -910,10 +910,17 @@ function liveApprovedWriteKinds(file: ScopesFile, now: number): ApprovedWriteKin
   });
 }
 
+/** Test seam: fixtures that exercise dispatch, recovery and transport — not
+ * the first-time card — run as if the owner had approved every kind. */
+let approvedWriteKindsForTests: 'all' | null = null;
+export function _setApprovedWriteKindsForTests(mode: 'all' | null): void { approvedWriteKindsForTests = mode; }
+export function approvedWriteKindsForTestsMode(): 'all' | null { return approvedWriteKindsForTests; }
+
 /** Whether the owner already approved this kind of change; a hit renews it. */
 export function hasApprovedWriteKind(operationId: string, accountId: string | null): boolean {
   const exact = operationId.trim();
   if (!exact) return false;
+  if (approvedWriteKindsForTests === 'all') return true;
   return withScopesStateMutation(() => {
     const file = readAll();
     const now = Date.now();

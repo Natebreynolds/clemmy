@@ -15,6 +15,10 @@ const PROCESS_HOME = process.env.CLEM_APPROVED_CHECKPOINT_FIXTURE_HOME;
 if (PROCESS_HOME) assert.ok(path.resolve(PROCESS_HOME).startsWith(path.resolve(os.tmpdir()) + path.sep));
 const TEST_HOME = PROCESS_HOME ?? mkdtempSync(path.join(os.tmpdir(), 'clem-host-direct-write-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
+// These fixtures exercise dispatch, recovery and transport, not the first-time
+// card (owner 2026-10-06): every connected-app kind counts as already approved.
+const { _setApprovedWriteKindsForTests } = await import('../../agents/plan-scope.js');
+_setApprovedWriteKindsForTests('all');
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.HARNESS_TOOL_BRACKETS = 'on';
 process.env.CLEMMY_TURN_ENGINE = 'host_v1';
