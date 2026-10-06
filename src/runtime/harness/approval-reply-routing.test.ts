@@ -174,8 +174,29 @@ test('missing, malformed, multiple and queued references never fall back to a pl
     assert.deepEqual(await routeReplyToPendingApproval({ sessionId: card.sessionId, text, parsed: { decision: 'approve' } }),
       { intent: null }, text);
   }
-  assert.equal(asked.length, before);
+  // Only the queued-card amendment reaches Jev now (and still never resolves it).
+  assert.ok(asked.length - before <= 1, 'ambiguous or malformed references never ask Jev to guess a target');
   assert.equal(pending.getPendingAction(action.id)?.status, 'approval_requested');
+});
+
+test('a queued exact payload is approved or declined in words like any other card, never amended in place', async () => {
+  // Live 2026-10-06: "Yes, go ahead." to a waiting `ssh localhost` card
+  // started a fresh turn that queued a second copy of the command.
+  const session = eventlog.createSession({ id: `approval-reply-queued-${++serial}`, kind: 'chat' });
+  const action = pending.queuePendingAction({ title: 'Run `ssh localhost echo hi`', summary: 'Runs once', kind: 'shell_command',
+    toolName: 'run_shell_command', payload: { command: 'ssh localhost echo hi' }, sessionId: session.id });
+  const queued = registry.register({ sessionId: session.id, subject: 'Run `ssh localhost echo hi`', tool: 'pending_action_execute',
+    args: { pendingActionId: action.id } });
+  reading = { choice: 'approves', confidence: 0.95 };
+  assert.deepEqual(await routeReplyToPendingApproval({ sessionId: session.id, text: 'Yes, go ahead.', parsed: null }),
+    { intent: { decision: 'approve', approvalId: queued.approvalId } });
+  reading = { choice: 'declines', confidence: 0.95 };
+  assert.deepEqual(await routeReplyToPendingApproval({ sessionId: session.id, text: 'No, skip it.', parsed: null }),
+    { intent: { decision: 'reject', approvalId: queued.approvalId } });
+  reading = { choice: 'changes', confidence: 0.95 };
+  assert.deepEqual(await routeReplyToPendingApproval({ sessionId: session.id, text: 'run it with -v instead', parsed: null }),
+    null, 'a queued payload is never amended in place');
+  assert.equal(pending.getPendingAction(action.id)?.status, 'approval_requested', 'routing describes a control; it resolves nothing');
 });
 
 test('unavailable or unsure interpretation never restores a legacy prefix decision', async () => {
