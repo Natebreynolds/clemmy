@@ -506,8 +506,7 @@ import { summarizeApprovalAction, extractApprovalContentPreview, type ApprovalCo
 import {
   pendingActionApprovalView,
   pendingActionApprovalViewFromArgs,
-  type PendingActionApprovalView,
-} from '../runtime/harness/pending-action-view.js';
+  type PendingActionApprovalView, pendingActionIdFromArgs } from '../runtime/harness/pending-action-view.js';
 import {
   getPendingAction,
   markPendingActionApprovalResolved,
@@ -3594,6 +3593,11 @@ function tryCommitLiveApprovalControl(input: {
    * card's question back in one line instead of starting a turn. */
   confirm?: { approvalId: string; leaning: 'approves' | 'declines'; question: string };
   confirmEligible?: boolean;
+  /** A decision in words on a card that links a queued exact payload (a shell
+   * command, a send). Resolving the row is the human decision; the registry
+   * listener runs the stored action under its own source, exactly as the
+   * card button does. The parked re-drive is never entered for it. */
+  queuedEligible?: boolean;
 }): Record<string, unknown> | null {
   const result = commitLiveApprovalControl({
     sessionId: input.sessionId, requestId: input.requestId,
@@ -3633,9 +3637,34 @@ function tryCommitLiveApprovalControl(input: {
         const linked = pendingActionApprovalViewFromArgs(row.args);
         const parked = listHarnessEvents(input.sessionId, { types: ['approval_parked'] })
           .some((event) => event.data.approvalId === row.approvalId);
+        if (linked?.id && linked.approvalId === row.approvalId) {
+          // Live 2026-10-06: "Yes, go ahead." to a waiting `ssh localhost`
+          // card resolved it and then entered the parked re-drive, which
+          // armed authority and went silent — no terminal, nothing ran. The
+          // card button never takes that path: it resolves the row and the
+          // registry listener runs the stored action. Do the same here.
+          if (!input.queuedEligible) return null;
+          const preflight = exactPendingActionApprovalPreflight(row, intent.decision);
+          if (preflight.kind !== 'ok') return null;
+          return {
+            sourceData: { approvalId: row.approvalId, decision: intent.decision, queued: preflight.pendingActionId },
+            commit: (source, resolveDecision) => {
+              const result = resolveDecision(row.approvalId,
+                intent.decision === 'approve' ? 'approved' : 'rejected', 'chat-dock-user');
+              const text = !result.ok
+                ? 'That approval was no longer pending. Nothing else was approved or rejected.'
+                : intent.decision === 'approve'
+                  ? 'Approved — running it now.'
+                  : 'Understood — I won’t run it.';
+              commitConsoleTerminal({ identity: { sessionId: input.sessionId, turn: source.turn, sourceUserSeq: source.seq },
+                text, status: 'done', legacyReason: 'queued_action_decision_resolved',
+                metadata: { steps: 0, liveApprovalControl: source.data.liveApprovalControl } });
+            },
+          };
+        }
         // Parked work resumes through its existing execution owner. An in-place
         // wait only needs a registry decision; it must not acquire another lease.
-        if (parked || (linked?.id && linked.approvalId === row.approvalId)) return null;
+        if (parked) return null;
       }
       return {
         sourceData: row ? { approvalId: row.approvalId, decision: intent.decision } : {},
@@ -17142,6 +17171,9 @@ export function registerConsoleRoutes(
         inputHash: payloadHash, text: input, intent,
         eligible: !explicitTaskMode && !proposedEarlyRoute && !isPausedOnApproval
           && registryApprovalPending && attachmentIds.length === 0,
+        queuedEligible: !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0
+          && approvalRegistry.listPending({ sessionId, status: 'pending' })
+            .some((row) => approvalRegistry.isFormalApprovalSurface(row) && pendingActionIdFromArgs(row.args) !== null),
         // A leaning reply asks the card's question back whether the card's
         // turn is parked on a checkpoint or waiting in the registry; it only
         // writes the question, never a decision or a new turn.
