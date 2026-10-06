@@ -5,6 +5,7 @@ import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { APPROVAL_REPLY_SURE, classifyApprovalReplyWithJev } from '../jev/control-plane.js';
 import { approvalReplyTargets, parseApprovalIntent } from './approval-intent.js';
 import { selectAddressedApproval } from './approval-addressing.js';
+import { openEventLog } from './eventlog.js';
 
 export interface ApprovalReplyRoute {
   /** Null suppresses a supplied decision while preserving normal conversation. */
@@ -12,19 +13,59 @@ export interface ApprovalReplyRoute {
   /** An amendment rejects the frozen call and gives the model the owner's
    * exact words. The revised call needs its own approval. */
   changeRequest?: string;
+  /** The reply leans one way but Jev is not sure enough to act on it. Clem
+   * asks the card's question back in one line; nothing else starts. Live
+   * 2026-10-06: "Yes, delete the draft." to a card reading "Delete Outlook
+   * message · message_id: AAMk…" scored approves 0.70, fell through to a
+   * fresh turn, and that turn minted an identical card — four times over. */
+  confirm?: { approvalId: string; leaning: 'approves' | 'declines'; question: string };
+}
+
+/** A reading that leans one way is worth a one-line confirmation; below this
+ * the reply is conversation. */
+export const APPROVAL_REPLY_LEANING = 0.5;
+
+/** The card's own words — the question Clem asked and why — as recorded when
+ * the card was shown. The registry row keeps the call; the chat event keeps
+ * the plain-English framing the owner actually read. */
+export function pendingApprovalWords(approvalId: string): { ask?: string; why?: string } {
+  try {
+    const row = openEventLog().prepare(`
+      SELECT data_json FROM events
+       WHERE type = 'approval_requested' AND json_extract(data_json, '$.approvalId') = ?
+       ORDER BY seq DESC LIMIT 1
+    `).get(approvalId) as { data_json: string } | undefined;
+    if (!row) return {};
+    const preview = (JSON.parse(row.data_json) as { preview?: { ask?: unknown; why?: unknown } }).preview;
+    return {
+      ...(typeof preview?.ask === 'string' && preview.ask.trim() ? { ask: preview.ask.trim() } : {}),
+      ...(typeof preview?.why === 'string' && preview.why.trim() ? { why: preview.why.trim() } : {}),
+    };
+  } catch {
+    return {};
+  }
 }
 
 export function isExactApprovalDecision(text: string): boolean {
   return parseApprovalIntent(text) !== null;
 }
 
-/** What the card will do, as Jev reads it: the operation and its fields. */
+/** What the card will do, as Jev reads it: the question Clem asked in her
+ * own words (when the card recorded one), then the operation and its fields.
+ * Fields alone can be opaque — "Delete Outlook message · message_id: AAMk…"
+ * — and an owner who answers "yes, delete the draft" is answering the
+ * question, not the id. */
 export function describePendingApproval(row: approvalRegistry.PendingApprovalRow): string {
+  const words = pendingApprovalWords(row.approvalId);
+  const framing = [
+    ...(words.ask ? [`Clem asked: ${words.ask}`] : []),
+    ...(words.why ? [`Why: ${words.why}`] : []),
+  ];
   const preview = approvalRegistry.isApprovalGroup(row)
     ? approvalPreviewProjection(row.args?.preview)?.preview
     : row.tool ? approvalCallPreview({ toolName: row.tool, args: row.args, rawArgs: '' })
     : null;
-  if (!preview) return row.subject;
+  if (!preview) return [...framing, row.subject].join('\n').slice(0, 2_000);
   const fields = preview.fields.filter(field => !preview.items || field.name !== 'Prepared actions').map((field) => (
     `${field.name}: ${field.label ? `${field.label} (${field.value})` : field.value}`
   ));
@@ -32,7 +73,7 @@ export function describePendingApproval(row: approvalRegistry.PendingApprovalRow
     `${index + 1}. ${item.operation}`,
     ...item.fields.map(field => `${field.name}: ${field.label ? `${field.label} (${field.value})` : field.value}`),
   ].join('\n'));
-  return [preview.operation, ...fields, ...members].join('\n').slice(0, 2_000);
+  return [...framing, preview.operation, ...fields, ...members].join('\n').slice(0, 2_000);
 }
 
 /** Exact decisions use the existing deterministic executor without a model
@@ -91,6 +132,15 @@ export async function routeReplyToPendingApproval(input: {
     // card, and a "yes but…" is still read as a change, never an approval.
     if (sure && reading.kind === 'approves') {
       return { intent: { decision: 'approve', approvalId: row.approvalId } };
+    }
+    // Leaning yes or no, not sure: ask the card's question back in one line.
+    // A fresh turn here re-plans the same action and mints a duplicate card.
+    if ((reading.kind === 'approves' || reading.kind === 'declines') && (reading.confidence ?? 0) >= APPROVAL_REPLY_LEANING) {
+      const ask = pendingApprovalWords(row.approvalId).ask;
+      const question = ask
+        ? `Just to be sure — ${ask.replace(/^can i /i, 'should I ').replace(/\?+$/, '')}?`
+        : `Just to be sure — should I go ahead with "${row.subject}"?`;
+      return { intent: null, confirm: { approvalId: row.approvalId, leaning: reading.kind, question } };
     }
     return fallback;
   } catch {

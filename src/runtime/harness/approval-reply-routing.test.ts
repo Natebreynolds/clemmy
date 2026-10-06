@@ -93,7 +93,13 @@ test('a sure plain-words yes to the card approves it; unsure or qualified replie
   reading = { choice: 'approves', confidence: 0.6 };
   assert.deepEqual(
     await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'go ahead but make it shorter', parsed: { decision: 'approve' } }),
-    { intent: null }, 'an unsure reading leaves the card waiting instead of sending the old text',
+    { intent: null, confirm: { approvalId: card.approvalId, leaning: 'approves', question: 'Just to be sure — should I go ahead with "Send Slack message"?' } },
+    'an unsure reading never sends the old text; Clem asks the card\'s question back',
+  );
+  reading = { choice: 'approves', confidence: 0.3 };
+  assert.deepEqual(
+    await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'go ahead but make it shorter', parsed: { decision: 'approve' } }),
+    { intent: null }, 'below the leaning bar the reply is conversation',
   );
   reading = { choice: 'approves', confidence: 0.95 };
   assert.deepEqual(
@@ -260,4 +266,23 @@ test('Jev receives structured grouped action content without execution keys', ()
   ] });
   assert.match(describePendingApproval(group), /Second event/);
   assert.doesNotMatch(describePendingApproval(group), /private-key|__host_approval_group__/);
+});
+
+test('Jev reads the question Clem asked on the card, and an unsure yes becomes that question asked back', async () => {
+  // Live 2026-10-06: "Yes, delete the draft." to "Delete Outlook message ·
+  // message_id: AAMk…" read approves 0.70; a fresh turn then minted the same
+  // card four times. The card's own ask is what the owner answered.
+  const card = waitingCard();
+  eventlog.appendEvent({ sessionId: card.sessionId, turn: 0, role: 'system', type: 'approval_requested',
+    data: { approvalId: card.approvalId, tool: 'work_call', subject: 'Send Slack message',
+      preview: { operation: 'Send Slack message', fields: [], ask: 'Can I send this Slack message to the fixture channel?', why: 'It posts in your connected Slack.' } } });
+  const row = registry.get(card.approvalId)!;
+  const described = describePendingApproval(row);
+  assert.ok(described.startsWith('Clem asked: Can I send this Slack message to the fixture channel?\nWhy: It posts in your connected Slack.\n'), described);
+  reading = { choice: 'declines', confidence: 0.7 };
+  assert.deepEqual(
+    await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'hmm, maybe not', parsed: null }),
+    { intent: null, confirm: { approvalId: card.approvalId, leaning: 'declines', question: 'Just to be sure — should I send this Slack message to the fixture channel?' } },
+  );
+  assert.ok(asked.at(-1)!.includes('Clem asked: Can I send this Slack message'), 'the ask reached Jev');
 });

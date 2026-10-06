@@ -3590,12 +3590,32 @@ function tryCommitLiveApprovalControl(input: {
   text: string;
   eligible: boolean;
   intent: ReturnType<typeof parseApprovalIntent>;
+  /** Jev read the reply as leaning yes or no but not surely: Clem asks the
+   * card's question back in one line instead of starting a turn. */
+  confirm?: { approvalId: string; leaning: 'approves' | 'declines'; question: string };
+  confirmEligible?: boolean;
 }): Record<string, unknown> | null {
   const result = commitLiveApprovalControl({
     sessionId: input.sessionId, requestId: input.requestId,
     runId: `desktop:${harnessChatStableDigest(input.requestId).slice(0, 40)}`,
     inputHash: input.inputHash, text: input.text,
     prepare: () => {
+      if (input.confirm && input.confirmEligible) {
+        const confirm = input.confirm;
+        const row = approvalRegistry.get(confirm.approvalId);
+        if (!row || !approvalRegistry.isActionable(row)) return null;
+        return {
+          sourceData: { approvalId: confirm.approvalId, confirm: confirm.leaning },
+          commit: (source) => {
+            const options = ['Yes', 'No'];
+            appendHarnessEvent({ sessionId: input.sessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
+              data: { sourceUserSeq: source.seq, reason: 'approval_confirmation_required', question: confirm.question, options } });
+            commitConsoleTerminal({ identity: { sessionId: input.sessionId, turn: source.turn, sourceUserSeq: source.seq },
+              text: confirm.question, status: 'needs_input', legacyReason: 'awaiting_user_input',
+              metadata: { steps: 0, liveApprovalControl: source.data.liveApprovalControl } });
+          },
+        };
+      }
       if (!input.eligible || !input.intent) return null;
       const intent = input.intent;
       if (intent.approvalId && getBackgroundTaskByApprovalId(intent.approvalId)?.status === 'awaiting_approval') {
@@ -17102,6 +17122,7 @@ export function registerConsoleRoutes(
     // call and carries the owner's words into one fresh call and a new card.
     let intent = parsedIntent;
     let approvalChangeRequest: string | undefined;
+    let approvalConfirm: { approvalId: string; leaning: 'approves' | 'declines'; question: string } | undefined;
     // Registry-owned cards (a chat turn waiting on a work_call) get the same
     // reading as an SDK interrupt. Live 2026-10-05: "Yes, delete it." to a
     // waiting delete card was never read, started a fresh turn on a successor
@@ -17112,6 +17133,7 @@ export function registerConsoleRoutes(
       if (routed) {
         intent = routed.intent;
         approvalChangeRequest = routed.changeRequest;
+        approvalConfirm = routed.confirm;
       }
     }
 
@@ -17119,7 +17141,11 @@ export function registerConsoleRoutes(
       const control = tryCommitLiveApprovalControl({ sessionId, requestId: requestIdentity.requestId,
         inputHash: payloadHash, text: input, intent,
         eligible: !explicitTaskMode && !proposedEarlyRoute && !isPausedOnApproval
-          && registryApprovalPending && attachmentIds.length === 0 });
+          && registryApprovalPending && attachmentIds.length === 0,
+        // A leaning reply asks the card's question back whether the card's
+        // turn is parked on a checkpoint or waiting in the registry; it only
+        // writes the question, never a decision or a new turn.
+        ...(approvalConfirm ? { confirm: approvalConfirm, confirmEligible: !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0 } : {}) });
       if (control) { res.status(202).json(control); return; }
     } catch (error) {
       console.error('live approval control could not commit:', error);
