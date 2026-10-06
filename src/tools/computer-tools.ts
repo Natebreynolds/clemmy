@@ -1384,7 +1384,15 @@ export async function executeLocalFileWrite(input: z.infer<z.ZodObject<typeof WR
   }
   catch (error) {
     if (error instanceof LocalFileRevisionConflict) return new InvalidArgumentsPreDispatchResult(error.message) as unknown as string;
-    if (error instanceof LocalFileCreateConflict && !options?.preserveCreateConflict) return error.message;
+    // A refused create changed nothing and names its repair (mode=overwrite
+    // or append). As plain prose it settled as a SUCCEEDED MUTATION that owed
+    // a file receipt it could never have: live 2026-10-05, a report written
+    // create → refused → overwrite ended "blocked" with the final file exact,
+    // because the refusal was counted as unresolved work. Same typed
+    // not-started carrier as every other revision conflict.
+    if (error instanceof LocalFileCreateConflict && !options?.preserveCreateConflict) {
+      return new InvalidArgumentsPreDispatchResult(error.message) as unknown as string;
+    }
     throw error;
   }
   if (!options?.recoveryOnly) teeFileDeliverable(filePath);

@@ -164,7 +164,9 @@ async function invokeWrite(input: { path: string; content: string; mode?: 'creat
   );
   // Legacy acknowledgement checks stay readable; the raw receipt and its
   // current-byte verification are exercised in local-file-revision.test.ts.
-  return String(result).replace(/^\[clementine:host-local-write-commit:v1\] [^\n]+\n/, '')
+  // A typed pre-dispatch refusal carries its text in `output`.
+  const text = typeof result === 'string' ? result : ((result as { output?: string }).output ?? String(result));
+  return text.replace(/^\[clementine:host-local-write-commit:v1\] [^\n]+\n/, '')
     .split('\n\n').filter(part => !part.startsWith('Previous bytes retained at ')).join('\n\n');
 }
 
@@ -559,4 +561,23 @@ test('a command whose only job is waiting is refused; real work that happens to 
   assert.equal(longBlockingSleepSeconds('python3 analyze.py --window 90'), null, 'a number is not a sleep');
   // Aggregate waits count: three chained sleeps are still just waiting.
   assert.equal(longBlockingSleepSeconds('sleep 5; sleep 5; sleep 5; echo done'), 15);
+});
+
+test('a refused create is a typed not-started refusal, never a settled mutation', async () => {
+  // Live 2026-10-05: create → "Refused to overwrite" → overwrite left the final
+  // file exact, yet the turn ended blocked because the refusal, returned as
+  // prose, settled as a succeeded write owing a receipt. The nominal carrier is
+  // what the settlement reads; the model still gets the repair text.
+  const { executeLocalFileWrite } = await import('./computer-tools.js');
+  const { InvalidArgumentsPreDispatchResult, attemptSignalsFromTypedResult } = await import('../runtime/harness/attempt-settlement.js');
+  const file = path.join(tmpHome, 'refused-create.md');
+  assert.equal(await invokeWrite({ path: file, content: 'first', mode: null }), `Wrote ${file} (5 chars).`);
+  const refused = await executeLocalFileWrite({ path: file, content: 'second', mode: 'create', append: null, find: null });
+  assert.ok(refused instanceof InvalidArgumentsPreDispatchResult, 'typed, not prose');
+  assert.match((refused as unknown as { output: string }).output, /Refused to overwrite existing file.*mode="overwrite"/);
+  assert.deepEqual(attemptSignalsFromTypedResult(refused), { preDispatch: true, argumentValidationFailed: true, schemaAvailable: true });
+  assert.equal(readFileSync(file, 'utf-8'), 'first\n');
+  // The sibling revision conflict already rode this carrier; both agree.
+  const replaced = await executeLocalFileWrite({ path: file, content: 'x', mode: 'replace', append: null, find: 'absent passage' });
+  assert.ok(replaced instanceof InvalidArgumentsPreDispatchResult);
 });
