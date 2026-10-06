@@ -286,6 +286,47 @@ test('a published workflow\'s run carries the workflow\'s approval for every ext
   assert.equal(chat.result.status === 'decided' ? chat.result.decision.kind : null, 'needs_user');
 });
 
+test('a learned kind skips the card only for the change the owner asked for; unsure or unavailable keeps the learned kind', async () => {
+  // Owner 2026-10-06: "draft a note … put it in note.md" → "Looks right, go"
+  // made an Outlook draft nobody asked for, silently, on a kind learned that
+  // morning. Jev reads the request against the change; a sure "not
+  // requested" keeps the card.
+  const jev = await import('../jev/client.js');
+  let reading: { choice: string; confidence: number } | null = null;
+  jev._setTypesafeKeyForTests('ts_test');
+  jev._setSystemOneFetchForTests(async () => {
+    if (!reading) throw new Error('jev down');
+    const { choice, confidence } = reading;
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+      requested: { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } },
+    }, usage: { input_tokens: 50, output_tokens: 3 } }) };
+  });
+  try {
+    await withLearnedKind('EXAMPLE_CREATE_DRAFT', async () => {
+      reading = { choice: 'not_requested', confidence: 0.95 };
+      const extra = await exactCall('draft');
+      assert.equal(extra.result.status === 'decided' ? extra.result.decision.kind : null, 'needs_user', JSON.stringify(extra.result));
+      assert.equal(extra.result.status === 'decided' && extra.result.decision.kind === 'needs_user' ? extra.result.decision.teaches : null, 'external_write_kind');
+      reading = { choice: 'requested', confidence: 0.95 };
+      const asked = await exactCall('draft');
+      assert.equal(asked.result.status === 'decided' && asked.result.decision.kind === 'proceed' ? asked.result.decision.basis : JSON.stringify(asked.result), 'exact_reversible_work');
+      reading = { choice: 'not_requested', confidence: 0.5 };
+      const unsure = await exactCall('draft');
+      assert.equal(unsure.result.status === 'decided' && unsure.result.decision.kind === 'proceed' ? unsure.result.decision.basis : JSON.stringify(unsure.result), 'exact_reversible_work');
+      reading = null;
+      const down = await exactCall('draft');
+      assert.equal(down.result.status === 'decided' && down.result.decision.kind === 'proceed' ? down.result.decision.basis : JSON.stringify(down.result), 'exact_reversible_work');
+      const readings = eventlog.listEvents(extra.request.attestation.sessionId, { types: ['guardrail_tripped'] })
+        .filter((event) => event.data.kind === 'learned_kind_request_reading');
+      assert.equal(readings.length, 1);
+      assert.equal(readings[0]!.data.applies, false);
+    });
+  } finally {
+    jev._setSystemOneFetchForTests(undefined);
+    jev._setTypesafeKeyForTests(undefined);
+  }
+});
+
 for (const kind of ['draft', 'send', 'delete', 'admin', 'unknown', 'bounded'] as const) {
   test(`a ${kind} in Plan mode returns the typed Plan refusal from consent and dispatches nothing`, async () => {
     const { result, request } = await exactCall(kind, { taskMode: PLAN });

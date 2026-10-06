@@ -39,7 +39,8 @@ import {
   type HostConsentCarrierEvidence,
   type HostConsentSemanticSourceEvidence,
 } from './host-consent-evidence.js';
-import { appendEvent, getEvent, getSession, openEventLog } from './eventlog.js';
+import { appendEvent, getEvent, getSession, listEvents, openEventLog } from './eventlog.js';
+import { REQUESTED_WRITE_SURE, classifyRequestedExternalWriteWithJev } from '../jev/control-plane.js';
 import {
   loadDurableAuthorizedLocalPlanningDefinition,
   localPlanningArgumentsMatch,
@@ -1173,6 +1174,7 @@ export { ownerRunsInAutoMode };
 function consentModeForCall(
   call: CapabilityRiskAttestationV1,
   identity: { sessionId: string },
+  learnedApplies?: boolean,
 ): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean; workflowApproval?: boolean } {
   const mode: 'auto' | 'ask' = ownerRunsInAutoMode() ? 'auto' : 'ask';
   // A connected-app change asks the first time in both modes (owner
@@ -1186,7 +1188,59 @@ function consentModeForCall(
   if (workflowRunSession(identity.sessionId)) return { mode, learnedExternalWrite: false, workflowApproval: true };
   let learned = false;
   try { learned = hasApprovedWriteKind(call.operationId, call.accountId); } catch { learned = false; }
+  // A learned kind skips the card only for the change the owner asked for
+  // (owner 2026-10-06, after "Looks right, go" made an Outlook draft nobody
+  // requested on a kind learned that morning). Jev read the request against
+  // this change; a sure "not requested" keeps the card. Unavailable or unsure
+  // keeps the learned kind, so a Jev outage never adds cards.
+  if (learned && learnedApplies === false) learned = false;
   return { mode, learnedExternalWrite: learned };
+}
+
+/** Was this exact change part of what the owner asked for? Only consulted
+ * when the kind is learned (one bounded Jev read); undefined = no reading. */
+async function learnedKindAppliesToRequest(input: {
+  sessionId: string;
+  sourceUserSeq: number | null | undefined;
+  call: CapabilityRiskAttestationV1;
+  args: unknown;
+}): Promise<boolean | undefined> {
+  if (input.call.effect !== 'external_write') return undefined;
+  if (typeof input.sourceUserSeq !== 'number') return undefined;
+  if (workflowRunSession(input.sessionId)) return undefined;
+  let learned = false;
+  try { learned = hasApprovedWriteKind(input.call.operationId, input.call.accountId); } catch { learned = false; }
+  if (!learned) return undefined;
+  let ownerAsked = '';
+  try {
+    const accepted = listEvents(input.sessionId, {
+      sinceSeq: input.sourceUserSeq - 1, types: ['user_input_received'], limit: 1,
+    }).find((event) => event.seq === input.sourceUserSeq);
+    const display = typeof accepted?.data.displayText === 'string' ? accepted.data.displayText : '';
+    ownerAsked = (display.trim() ? display : typeof accepted?.data.text === 'string' ? accepted.data.text : '').trim();
+  } catch { ownerAsked = ''; }
+  if (!ownerAsked) return undefined;
+  let argsText = '';
+  try { argsText = JSON.stringify(input.args ?? {}); } catch { argsText = ''; }
+  const change = `${input.call.operationId}\n${argsText.slice(0, 1_500)}`;
+  let reading: Awaited<ReturnType<typeof classifyRequestedExternalWriteWithJev>>;
+  try {
+    reading = await classifyRequestedExternalWriteWithJev({ ownerAsked, change }, { sessionId: input.sessionId });
+  } catch {
+    return undefined;
+  }
+  const sure = reading.kind !== null && (reading.confidence ?? 0) >= REQUESTED_WRITE_SURE;
+  try {
+    appendEvent({ sessionId: input.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: {
+      kind: 'learned_kind_request_reading', sourceUserSeq: input.sourceUserSeq,
+      operationId: input.call.operationId, reading: reading.kind ?? (reading.failedOpen ? 'unavailable' : 'unsure'),
+      ...(typeof reading.confidence === 'number' ? { confidence: reading.confidence } : {}),
+      applies: sure && reading.kind === 'not_requested' ? false : sure && reading.kind === 'requested' ? true : null,
+    } });
+  } catch { /* telemetry never blocks consent */ }
+  if (sure && reading.kind === 'not_requested') return false;
+  if (sure && reading.kind === 'requested') return true;
+  return undefined;
 }
 
 /** The step session of a published workflow: kind 'workflow', deterministic `workflow:` id. */
@@ -1202,10 +1256,11 @@ function reduceHostConsentEvidence(input: {
   crossing: InteractiveConsentCrossing;
   reservationAlreadyClaimed: boolean;
   durableApproval?: DurableHostConsentApproval;
+  learnedApplies?: boolean;
 }) {
   const { call, coverage, crossing, reservationAlreadyClaimed } = input;
   const preparationProbe = planPreparationProbe(input.identity);
-  const consentMode = consentModeForCall(call, input.identity);
+  const consentMode = consentModeForCall(call, input.identity, input.learnedApplies);
   const ungrantedDecision = evaluateInteractiveConsentV1({
     call, coverage, userGrant: null, readiness: { kind: 'ready' },
     crossing, reservationAlreadyClaimed, preparationProbe, ...consentMode,
@@ -1344,9 +1399,12 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
     reservationKey: reservationKey({ prepared, cardinality }),
   }) });
   const reservationAlreadyClaimed = priorReservationExists(prepared);
+  const learnedApplies = await learnedKindAppliesToRequest({
+    sessionId: prepared.sessionId, sourceUserSeq: prepared.sourceUserSeq, call, args: prepared.targetArgs,
+  });
   const { decision, consentSubject, userGrant, consentMode } = reduceHostConsentEvidence({
     identity: prepared, call, coverage, crossing, reservationAlreadyClaimed,
-    durableApproval: input.durableApproval,
+    durableApproval: input.durableApproval, learnedApplies,
   });
   journalInteractiveConsentDecision({
     sessionId: prepared.sessionId, sourceUserSeq: prepared.sourceUserSeq,
@@ -1510,9 +1568,12 @@ export async function evaluateUncoveredHostMutationConsent(input: {
         logicalToolCallId: binding.logicalToolCallId, argumentDigest: binding.effectiveArgumentDigest }),
     }) });
     const crossing = crossingFor(binding) ?? 'possibly_started';
+    const learnedApplies = await learnedKindAppliesToRequest({
+      sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq, call, args: input.args,
+    });
     const { decision, consentSubject } = reduceHostConsentEvidence({
       identity: binding, call, coverage, crossing, reservationAlreadyClaimed: false,
-      durableApproval: input.durableApproval,
+      durableApproval: input.durableApproval, learnedApplies,
     });
     journalInteractiveConsentDecision({
       sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq,
@@ -1655,7 +1716,9 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       sessionId: attestation.sessionId,
       sourceUserSeq: attestation.sourceUserSeq,
     }),
-    ...consentModeForCall(call, { sessionId: attestation.sessionId }),
+    ...consentModeForCall(call, { sessionId: attestation.sessionId }, await learnedKindAppliesToRequest({
+      sessionId: attestation.sessionId, sourceUserSeq: attestation.sourceUserSeq, call, args: input.args,
+    })),
   });
   return { status: 'decided', decision, call, coverage };
 }

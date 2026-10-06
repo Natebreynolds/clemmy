@@ -543,6 +543,63 @@ export async function classifyApprovalReplyWithJev(
   return { kind, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
 }
 
+export type RequestedWriteKind = 'requested' | 'not_requested' | 'other';
+
+export interface RequestedWriteReading {
+  /** null when Jev was unavailable or not sure. */
+  kind: RequestedWriteKind | null;
+  confidence?: number;
+  failedOpen: boolean;
+}
+
+/** Skipping a card on a learned kind is a decision about an external write,
+ *  so the host takes Jev's reading only when it is sure. */
+export const REQUESTED_WRITE_SURE = 0.85;
+const REQUESTED_WRITE_TIMEOUT_MS = 1_500;
+
+/**
+ * The owner approved this kind of connected-app change before, so it may run
+ * without a card — but only when it is what they asked for this time. Live
+ * 2026-10-06: "draft a note … put it in note.md" → "Looks right, go" made an
+ * Outlook draft nobody asked for, silently, on a kind learned that morning.
+ * One choice over the owner's request and the change Clem is about to make.
+ */
+export async function classifyRequestedExternalWriteWithJev(
+  input: { ownerAsked: string; change: string },
+  opts: { timeoutMs?: number; sessionId?: string } = {},
+): Promise<RequestedWriteReading> {
+  const result = await evaluateSystemOne({
+    state: {
+      ownerAsked: clipMiddle(input.ownerAsked.trim(), 2_000).text,
+      clemIsAboutTo: clipMiddle(input.change.trim(), 1_500).text,
+    },
+    questions: {
+      requested: {
+        type: 'choice',
+        instructions: 'The owner approved this kind of change in a connected app before. Does what the owner asked for this time call for this exact change?',
+        criteria: {
+          requested: 'Yes — the owner asked for this change, or it is plainly the way to do what they asked.',
+          not_requested: 'No — the owner did not ask for this; it is an extra step Clem added on her own.',
+          other: 'The request is about something else entirely.',
+          none: 'Not sure.',
+        },
+      },
+    },
+    timeoutMs: Math.min(REQUESTED_WRITE_TIMEOUT_MS, opts.timeoutMs ?? REQUESTED_WRITE_TIMEOUT_MS),
+    sessionId: opts.sessionId,
+    channel: 'jev-requested-write',
+  });
+  if (!result.ok) return { kind: null, failedOpen: true };
+  const answer = result.answers.requested as ChoiceAnswer | undefined;
+  const kind = answer && ['requested', 'not_requested', 'other'].includes(answer.choice)
+    ? answer.choice as RequestedWriteKind
+    : null;
+  noteJevDecisionOutcome(result.decisionId, kind ?? 'none', {
+    ...(answer ? { choice: answer.choice, confidence: answer.confidence } : {}),
+  });
+  return { kind, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
+}
+
 /** A card that names the wrong person is worse than one that shows the id,
  *  so the host shows a name only when Jev is sure of it. */
 export const APPROVAL_LABEL_SURE = 0.8;
