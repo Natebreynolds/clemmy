@@ -1232,8 +1232,16 @@ test('production native MCP definitions drive provider-neutral read, ordinary-wr
         assert.equal(decision.kind, 'proceed');
         if (decision.kind === 'proceed') assert.equal(decision.basis, 'no_effect');
       } else if (caseInput.decision === 'ordinary') {
-        assert.equal(decision.kind, 'proceed');
-        if (decision.kind === 'proceed') assert.equal(decision.basis, 'exact_ordinary_work');
+        // Owner 2026-10-06: an ordinary connected-app change asks once, in
+        // Auto as well as Ask; the approval teaches the kind.
+        assert.equal(decision.kind, 'needs_user');
+        if (decision.kind === 'needs_user') assert.equal(decision.teaches, 'external_write_kind');
+        const learned = consent.evaluateInteractiveConsentV1({
+          call, coverage, userGrant: null, readiness: { kind: 'ready' },
+          crossing: 'not_started', reservationAlreadyClaimed: false, learnedExternalWrite: true,
+        });
+        assert.equal(learned.kind, 'proceed');
+        if (learned.kind === 'proceed') assert.equal(learned.basis, 'exact_ordinary_work');
       } else {
         assert.equal(decision.kind, 'needs_user');
         if (decision.kind === 'needs_user') assert.equal(decision.need, 'approval');

@@ -1097,9 +1097,31 @@ export function commitTurnOutcome(
       const acceptedReadPlanStillPending = pendingAcceptedReadPlan({
         ...completionEvidenceSource(requested.identity),
       }) !== null;
+      // The completion reviewer that already read THIS reply with sufficient
+      // evidence is a judge too. Live 2026-10-06: "run this command and tell
+      // me what happened" ran it, it failed as asked, the reviewer passed the
+      // account of the failure — and the turn still ended BLOCKED because the
+      // judge-unavailable policy saw "a business call failed and nothing
+      // succeeded". The one deterministic floor (an uncertain irreversible
+      // write) and the structural holds stand; a reviewed account delivers.
+      const reviewedVerdict = completionVerdictForAcceptedSource({
+        ...completionEvidenceSource(requested.identity),
+      });
+      const reviewedReplyDigest = createHash('sha256')
+        .update(mutationTruthOutcome.presentation.text, 'utf8').digest('hex');
+      const reviewedDelivers = options.terminalJudgeDisposition === 'deliver'
+        || Boolean(reviewedVerdict
+          && reviewedVerdict.fulfills
+          && reviewedVerdict.failedOpen !== true
+          && reviewedVerdict.blocked !== true
+          && reviewedVerdict.evidenceCoverage === 'sufficient'
+          && reviewedVerdict.replyDigest === reviewedReplyDigest);
+      const structuralHold = settlementAudit.status === 'in_flight'
+        || settlementAudit.status === 'storage_error'
+        || settlementAudit.status === 'write_projection_missing';
       const mustHold = assessment.localWorkIncomplete || acceptedReadPlanStillPending
-        || (options.terminalJudgeDisposition === 'deliver'
-          ? deliveryMustHoldForHuman(settlementAudit)
+        || (reviewedDelivers
+          ? deliveryMustHoldForHuman(settlementAudit) || structuralHold
           : deliveryMustHoldWhenJudgeUnavailable(settlementAudit));
       if (mustHold) {
         effectiveOutcome = unverifiedCompletionOutcome(

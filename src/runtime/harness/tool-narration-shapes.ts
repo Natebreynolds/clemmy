@@ -14,8 +14,16 @@
  * recommend", "the arguments we set") never false-flag.
  */
 export function looksLikeToolCallShape(text: string): boolean {
-  const t = (text || '').trim();
-  if (!t) return false;
+  const whole = (text || '').trim();
+  if (!whole) return false;
+  // A fenced code block inside prose is content the model is SHOWING ("the
+  // exact call I'd make", a config sample), not a call it is narrating
+  // instead of making. Live 2026-10-06: a plan-mode reply that named the
+  // tool and showed its JSON payload in a ```json fence was refused whole,
+  // and the owner got the one-line summary. Only a reply that is nothing
+  // but the fence is judged by what the fence holds.
+  const prose = whole.replace(FENCED_CODE_BLOCK_RE, ' ').trim();
+  const t = prose || whole;
   return (
     // "Tool: x" / "Tool call: x" / "**Tool call: x**" headers, incl. behind a hallucinated
     // wrapper tag ("<system>Tool call: …</system>").
@@ -46,6 +54,9 @@ export function looksLikeToolCallShape(text: string): boolean {
     || HARNESS_DIRECTIVE_MARKER_RE.test(t)
   );
 }
+
+/** ```lang … ``` fences, including unterminated trailing ones. */
+const FENCED_CODE_BLOCK_RE = /```[^\n]*\n[\s\S]*?(?:```|$)/g;
 
 /** Marker wrapping model-facing steering inside an otherwise factual tool
  *  result. Never appears in text meant for a person. */

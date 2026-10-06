@@ -1063,3 +1063,34 @@ test('an answer to a card reaches every surface as the owner\'s words; the decis
   const typed = projectHarnessEventForPublic({ ...event('user_input_received', { text: 'approve the plan please' }), role: 'user' });
   assert.equal(typed?.data.displayText, undefined, 'words the owner typed are shown as typed');
 });
+
+test('a fenced JSON payload shown inside a prose reply is content, not a narrated tool call', async () => {
+  const { looksLikeToolCallShape } = await import('./tool-narration-shapes.js');
+  const { publicReplyText } = await import('./public-presentation.js');
+  // Live 2026-10-06: a plan-mode reply ("Plan, don't do … tell me which tool
+  // you'd use and what you'd send") named the tool and showed the exact call;
+  // the whole reply was refused and the owner saw its first line only.
+  const plan = [
+    'Plan only — nothing sent, nothing created.',
+    '',
+    "**Tool I'd use**",
+    '`composio_execute_tool` with `tool_slug: SLACK_CREATE_A_REMINDER`. Then a read-back to confirm it landed.',
+    '',
+    '**Exact call**',
+    '```json',
+    '{',
+    '  "tool_slug": "SLACK_CREATE_A_REMINDER",',
+    '  "arguments": { "text": "send the deck", "time": "1791561600" }',
+    '}',
+    '```',
+    '',
+    'Say the word and I will create it.',
+  ].join('\n');
+  assert.equal(looksLikeToolCallShape(plan), false);
+  assert.equal(publicReplyText(plan, ''), plan);
+  // A reply that IS nothing but the printed call is still refused.
+  const bare = '```json\n{"tool_slug": "SLACK_CREATE_A_REMINDER", "arguments": {"text": "x"}}\n```';
+  assert.equal(looksLikeToolCallShape(bare), true);
+  assert.equal(looksLikeToolCallShape('{"tool_slug": "SLACK_CREATE_A_REMINDER", "arguments": {}}'), true);
+  assert.equal(looksLikeToolCallShape('Tool call: slack_send_message\n{"channel": "x"}'), true);
+});
