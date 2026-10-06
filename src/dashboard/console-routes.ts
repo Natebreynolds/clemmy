@@ -3642,7 +3642,11 @@ function tryCommitLiveApprovalControl(input: {
               ? 'That approval was no longer pending. Nothing else was approved or rejected.'
               : approvedRunner
                 ? `Approved ${row!.approvalId}. The Workspace refresh will resume through its saved execution; its result will report whether the data was saved.`
-                : `${intent.decision === 'approve' ? 'Approved' : 'Rejected'} ${row!.approvalId} — continuing.`;
+                // Clem's words, not a card id: the person answered the card's
+                // own question and reads the decision back in the same voice.
+                : intent.decision === 'approve'
+                  ? 'Approved — doing that now.'
+                  : 'Understood — I won’t do that.';
             if (standalone) reason = approvedRunner ? 'workspace_runner_approval_refresh_started' : 'workspace_approval_resolved';
           }
           commitConsoleTerminal({ identity: { sessionId: input.sessionId, turn: source.turn, sourceUserSeq: source.seq },
@@ -17098,7 +17102,11 @@ export function registerConsoleRoutes(
     // call and carries the owner's words into one fresh call and a new card.
     let intent = parsedIntent;
     let approvalChangeRequest: string | undefined;
-    if (!connectionContext && isPausedOnApproval && !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0 && input.trim()) {
+    // Registry-owned cards (a chat turn waiting on a work_call) get the same
+    // reading as an SDK interrupt. Live 2026-10-05: "Yes, delete it." to a
+    // waiting delete card was never read, started a fresh turn on a successor
+    // session and minted a second card for the same action.
+    if (!connectionContext && (isPausedOnApproval || registryApprovalPending) && !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0 && input.trim()) {
       const routed = await routeReplyToPendingApproval({ sessionId, text: input, parsed: parsedIntent })
         .catch(() => null);
       if (routed) {

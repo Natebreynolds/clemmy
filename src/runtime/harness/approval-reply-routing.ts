@@ -83,6 +83,15 @@ export async function routeReplyToPendingApproval(input: {
     if (sure && reading.kind === 'declines') {
       return { intent: { decision: 'reject', approvalId: row.approvalId } };
     }
+    // The card asks a question in Clem's words; a plain-words yes to it is
+    // the owner's decision. Until 2026-10-05 only an exact typed word or the
+    // button approved, so "Yes, delete it." to "Can I delete the recurring
+    // job…?" started a fresh turn that minted a duplicate card. Owner:
+    // build typed approval. Jev must be sure, the reply must address this one
+    // card, and a "yes but…" is still read as a change, never an approval.
+    if (sure && reading.kind === 'approves') {
+      return { intent: { decision: 'approve', approvalId: row.approvalId } };
+    }
     return fallback;
   } catch {
     // The caller's catch-to-null must not resurrect a qualified approval when

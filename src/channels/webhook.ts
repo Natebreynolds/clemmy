@@ -1356,6 +1356,23 @@ async function resolveApprovalOrQueueBackgroundContinuation(
       queuedTaskId: queued.id,
     };
   }
+  // A registry-owned card (a chat turn waiting on a work_call) is not an SDK
+  // runtime approval: the runtime answered "Approval … not found" and this
+  // route returned 500 for a real pending card (live 2026-10-05). Decide the
+  // registry row the way a person surface does; its resolution hook resumes
+  // the waiting work.
+  const registryRow = approvalRegistry.get(approvalId);
+  if (registryRow && registryRow.status === 'pending') {
+    const resolved = approvalRegistry.resolve(approvalId, approved ? 'approved' : 'rejected', 'api-approvals-route');
+    return {
+      approvalId,
+      status: resolved.ok ? (approved ? 'approved' as const : 'rejected' as const) : 'already_resolved' as const,
+      sessionId: registryRow.sessionId,
+      text: resolved.ok
+        ? `${approved ? 'Approved' : 'Rejected'}: ${registryRow.subject}.`
+        : 'That approval was no longer pending.',
+    };
+  }
   return assistant.getRuntime().resolveApproval(approvalId, approved);
 }
 

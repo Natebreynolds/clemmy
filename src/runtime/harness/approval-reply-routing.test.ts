@@ -75,11 +75,16 @@ test('a sure change rejects the exact card and carries the owner\'s words; a sur
   );
 });
 
-test('qualified replies never gain approval authority from Jev alone', async () => {
+test('a sure plain-words yes to the card approves it; unsure or qualified replies do not', async () => {
+  // Owner 2026-10-05: "Yes, delete it." to "Can I delete the recurring job…?"
+  // had started a fresh turn and minted a duplicate card. A sure reading of
+  // a plain yes is the decision; "yes but…" stays a change; unsure waits.
   const card = waitingCard();
   reading = { choice: 'approves', confidence: 0.97 };
-  assert.equal(await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'yes that looks perfect, send it', parsed: null }), null,
-    'an approval still needs the button or a typed decision');
+  assert.deepEqual(
+    await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'yes that looks perfect, send it', parsed: null }),
+    { intent: { decision: 'approve', approvalId: card.approvalId } },
+  );
   reading = { choice: 'changes', confidence: 0.9 };
   assert.deepEqual(
     await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'go ahead but make it shorter', parsed: { decision: 'approve' } }),
@@ -93,8 +98,12 @@ test('qualified replies never gain approval authority from Jev alone', async () 
   reading = { choice: 'approves', confidence: 0.95 };
   assert.deepEqual(
     await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'go ahead, that reads well, thanks', parsed: { decision: 'approve' } }),
-    { intent: null },
+    { intent: { decision: 'approve', approvalId: card.approvalId } },
+    'a sure yes with a typed decision present is the same decision',
   );
+  reading = { choice: 'other', confidence: 0.9 };
+  assert.equal(await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'what time would it go out?', parsed: null }), null,
+    'a question about the card is conversation, not a decision');
 });
 
 test('short typed decisions and ambiguous sessions are left to the existing parser', async () => {
