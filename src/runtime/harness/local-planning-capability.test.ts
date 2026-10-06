@@ -1131,3 +1131,20 @@ test('selected schema drift is advisory at plan admission but exact local author
     local._setConfiguredLocalPlanningToolObserverForTests(null);
   }
 });
+
+test('a published local requirement whose arguments miss its mode is told the field, not "not published"', async () => {
+  // Live 2026-10-05: cap:local:set_timer:local_inbox with delivery omitted or
+  // "configured" was refused as unpublished, and the model searched in circles.
+  const { describeLocalSafeModeMismatch } = await import('./local-planning-capability.js');
+  const definition = { safeMode: { id: 'local_inbox', requiredEquals: { delivery: 'local' } } } as never;
+  assert.equal(describeLocalSafeModeMismatch(definition, { minutes: 3, message: 'Drink water', delivery: 'local' }), null);
+  assert.match(describeLocalSafeModeMismatch(definition, { minutes: 3, message: 'Drink water' }) ?? '', /delivery: "local" \(omitted\)/);
+  assert.match(describeLocalSafeModeMismatch(definition, { minutes: 3, delivery: 'configured' }) ?? '', /delivery: "local" \(you sent "configured"\)/);
+  const alternatives = { safeMode: { id: 'append', requiredEquals: {}, alternatives: [
+    { requiredEquals: { append: true }, allowedValues: { mode: ['create', 'append', null] } },
+    { requiredEquals: { mode: 'append' }, absentOrNull: ['append'] },
+  ] } } as never;
+  assert.equal(describeLocalSafeModeMismatch(alternatives, { mode: 'append' }), null);
+  assert.match(describeLocalSafeModeMismatch(alternatives, { mode: 'overwrite' }) ?? '', /append: true .* — or — mode: "append"/);
+  assert.equal(describeLocalSafeModeMismatch({ safeMode: null } as never, { anything: 1 }), null);
+});

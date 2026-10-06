@@ -126,6 +126,7 @@ import {
   type HostWorkCallPreparationRequest,
   type HostWorkCallPreparationResult,
 } from './work-call-mode.js';
+import { localSafeModeMismatchFor } from '../runtime/harness/local-planning-capability.js';
 export { isHostPlanRequiredWorkCall } from './work-call-mode.js';
 
 const IdSchema = WorkTopologyIdSchema;
@@ -1487,6 +1488,20 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         && getTurnGraphEventForSource(resolved.sessionId, resolved.sourceUserSeq as number) === null
         && normalizedProposal(frame.input.proposal) === null
       ) {
+        // The requirement may already be published and name this very tool;
+        // then the only thing wrong is the arguments' declared mode. Live
+        // 2026-10-05: "remind me in 3 minutes" sent cap:local:set_timer:local_inbox
+        // with delivery omitted or "configured"; the mismatch read as "not yet
+        // published → call tool_search", and the model searched four times
+        // and gave up. Name the field instead — one retry, not a loop.
+        const modeMismatch = localSafeModeMismatchFor({
+          sessionId: resolved.sessionId, sourceUserSeq: resolved.sourceUserSeq as number,
+          requirementId: frame.input.requirement_id, toolName: resolved.targetName, args: resolved.targetArgs,
+        });
+        if (modeMismatch) {
+          frame.refusalKind = 'work_contract_invalid';
+          return refuse(frame.refusalKind, modeMismatch);
+        }
         frame.refusalKind = 'work_contract_required';
         return refuse(
           frame.refusalKind,

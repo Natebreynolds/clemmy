@@ -1122,3 +1122,59 @@ export function localPlanningArgumentsMatch(
     return true;
   });
 }
+
+/** Pure: the field-by-field way these arguments miss a definition's declared
+ * mode, in the words a caller can act on, or null when they fit (or the
+ * definition declares no mode). */
+export function describeLocalSafeModeMismatch(
+  definition: Pick<AuthorizedLocalPlanningDefinitionV1, 'safeMode'>,
+  args: unknown,
+): string | null {
+  if (!definition.safeMode) return null;
+  if (localPlanningArgumentsMatch(definition as AuthorizedLocalPlanningDefinitionV1, args)) return null;
+  const given = isRecord(args) ? args : {};
+  const predicates: readonly LocalPlanningSafeModePredicate[] = definition.safeMode.alternatives?.length
+    ? definition.safeMode.alternatives
+    : [definition.safeMode];
+  const sent = (field: string) => given[field] === undefined ? 'omitted' : `you sent ${JSON.stringify(given[field])}`;
+  const options = predicates.map((predicate) => {
+    const diffs: string[] = [];
+    for (const [field, expected] of Object.entries(predicate.requiredEquals)) {
+      if (given[field] !== expected) diffs.push(`${field}: ${JSON.stringify(expected)} (${sent(field)})`);
+    }
+    for (const field of predicate.absentOrNull ?? []) {
+      if (given[field] !== undefined && given[field] !== null) diffs.push(`${field}: leave it out (${sent(field)})`);
+    }
+    for (const [field, allowed] of Object.entries(predicate.allowedValues ?? {})) {
+      if (!allowed.some((value) => given[field] === value)) diffs.push(`${field}: one of ${JSON.stringify(allowed)} (${sent(field)})`);
+    }
+    return diffs.join(', ');
+  }).filter(Boolean);
+  return options.length === 0 ? null : options.join(' — or — ');
+}
+
+/** A work_call that names a published local requirement for this very tool,
+ * with arguments that do not fit that variant's mode. Live 2026-10-05:
+ * "remind me in 3 minutes" sent cap:local:set_timer:local_inbox with delivery
+ * omitted or "configured"; the mismatch was reported as "not yet published,
+ * call tool_search", and the model searched four times and gave up. The
+ * requirement the model chose already says what the mode needs. */
+export function localSafeModeMismatchFor(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  requirementId: string | undefined;
+  toolName: string;
+  args: unknown;
+}): string | null {
+  const ref = typeof input.requirementId === 'string' ? input.requirementId.trim() : '';
+  const match = /^cap:local:([a-z0-9][a-z0-9._/-]{0,63}):([a-z0-9][a-z0-9._/-]{0,63})$/.exec(ref);
+  if (!match || match[1] !== safeToken(input.toolName)) return null;
+  const loaded = readDurableAuthorizedLocalPlanningDefinition({
+    sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, capabilityRef: ref,
+  });
+  if (!loaded.ok || loaded.definition.name !== input.toolName) return null;
+  const mismatch = describeLocalSafeModeMismatch(loaded.definition, input.args);
+  if (!mismatch) return null;
+  return `${ref} is published for this request, but these arguments do not fit its declared mode — ${mismatch}. `
+    + 'Retry this same work_call with the same requirement_id and those exact values. A different mode is a different requirement, not a search.';
+}
