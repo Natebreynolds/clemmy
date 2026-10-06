@@ -281,3 +281,36 @@ test("a successor keeps the conversation's agent and every agent that answered i
   assert.equal(metadata.agentName, 'Prospect Research');
   assert.deepEqual(metadata.agentIds, ['instagram-manager', 'prospect-research']);
 });
+
+test('a cancelled exchange rides into the successor so "continue" has its referent', async () => {
+  // Live 2026-10-05: a five-file request was cancelled, the next message
+  // "Continue where you left off" was branched, and the branch carried only
+  // completed exchanges — Clem searched memory, history and files for a
+  // "fables" thread and found nothing. The stopped request is conversation.
+  memoryDatabase.resetMemoryDb();
+  const parent = parentSession();
+  completedExchange(parent, 'Write five fables into fable-1.md through fable-5.md, one animal each.',
+    'Stopped — this turn was cancelled. Nothing further will execute; tell me how you’d like to proceed.', 1, 'cancelled');
+  parent.markStatus('cancelled');
+  const selected = claimSessionForAcceptedSource({
+    kind: 'ordinary', entrySessionId: parent.id, durableSourceId: 'continue-after-cancel', continuity,
+    receipt: { requestId: 'continue-request', runId: 'continue-after-cancel', inputHash: '2'.repeat(64) },
+  });
+  assert.equal(selected.selection.disposition, 'branched');
+  const prefix = eventlog.listEvents(selected.selection.sessionId, { types: ['cross_session_prefix'] });
+  assert.equal(prefix.length, 1, 'the successor is seeded');
+  const text = String(prefix[0]!.data.text);
+  assert.ok(text.includes('USER: Write five fables into fable-1.md through fable-5.md, one animal each.'), text);
+  assert.match(text, /Stopped at the person's request before this finished; the request itself still stands/);
+  assert.match(text, /this turn was cancelled/);
+
+  // Failed and blocked exchanges keep their own recovery path and still do not seed.
+  const other = parentSession();
+  completedExchange(other, 'Send the batch.', 'The previous attempt failed before dispatch.', 1, 'failed');
+  prepareFailure(other);
+  const retry = claimSessionForAcceptedSource({
+    kind: 'ordinary', entrySessionId: other.id, durableSourceId: 'retry-after-failure', continuity,
+    receipt: { requestId: 'retry-request', runId: 'retry-after-failure', inputHash: '3'.repeat(64) },
+  });
+  assert.equal(eventlog.listEvents(retry.selection.sessionId, { types: ['cross_session_prefix'] }).length, 0);
+});

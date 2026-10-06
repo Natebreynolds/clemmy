@@ -1447,6 +1447,12 @@ export interface ReviewDepthRequest { effort?: JudgeReviewEffort; timeoutMs?: nu
 
 /** A review of work that wrote to an app or file may take this long to finish. */
 export const WRITE_REVIEW_TIMEOUT_MS = 180_000;
+/** A read-only answer or a plan waits at most this long on its review. Live
+ * 2026-10-05: a workflow list answered in 2 s, its fast review returned in
+ * 17 s, and the confirming full review then hung to the 90 s goal-judge wall
+ * before failing open — 93 s of "still working" for a list. Nothing ran and
+ * nothing was written; the person was only waiting on the reviewer. */
+export const READ_REVIEW_TIMEOUT_MS = 30_000;
 
 /**
  * Review depth follows what the review protects. Work that wrote to an app or
@@ -1479,12 +1485,12 @@ export async function reviewAtStakes(
   if (stakes === 'read' && evidence.readEvidenceComplete === false) {
     return { ...(await review({})), reviewDepth: 'full' };
   }
-  const fast = await review({ effort: 'medium' });
+  const fast = await review({ effort: 'medium', timeoutMs: READ_REVIEW_TIMEOUT_MS });
   if (!fast.verdict || fast.verdict.done) return { ...fast, reviewDepth: 'fast' };
   if (fast.verdict.repairScope === 'claims' || fast.verdict.repairScope === 'reply_format') {
     return { ...fast, reviewDepth: 'fast' };
   }
-  const full = await review({});
+  const full = await review({ timeoutMs: READ_REVIEW_TIMEOUT_MS });
   if (!full.verdict) return { ...fast, reviewDepth: 'fast', reviewConfirmation: 'unavailable' };
   return { ...full, reviewDepth: 'full', reviewConfirmation: full.verdict.done ? 'overruled' : 'upheld' };
 }

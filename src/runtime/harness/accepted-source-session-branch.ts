@@ -201,12 +201,22 @@ function seedSuccessorConversation(
          json_extract(terminal.data_json, '$.presentation.status'),
          json_extract(terminal.data_json, '$.turnOutcome.status'),
          json_extract(terminal.data_json, '$.reason'), 'done'
-       ) NOT IN ('failed', 'cancelled', 'blocked')
+       ) NOT IN ('failed', 'blocked')
      ORDER BY terminal.seq DESC LIMIT 8
   `).all(...lineage) as Array<{
     id: string; seq: number; session_id: string; data_json: string;
     source_id: string; source_seq: number; source_json: string;
   }>;
+  // A cancelled exchange stays in the conversation: the person stopped Clem
+  // and the next thing they say is usually "continue" or "do it differently".
+  // Live 2026-10-05: a cancelled five-file request vanished from its successor,
+  // and "continue where you left off" searched memory, history and files and
+  // found no thread to continue. Failed/blocked turns keep their own recovery.
+  const cancelledTerminal = (terminalData: Record<string, unknown>): boolean => {
+    const presentation = terminalData.presentation as { status?: unknown } | undefined;
+    const outcome = terminalData.turnOutcome as { status?: unknown } | undefined;
+    return (presentation?.status ?? outcome?.status ?? terminalData.reason) === 'cancelled';
+  };
   const header = [
     '[SAME-CONVERSATION CONTEXT]',
     `This turn follows session ${parent.id} with the same conversation and audience.`,
@@ -231,7 +241,9 @@ function seedSuccessorConversation(
       seen.add(row.source_seq);
       // Do not teach a fresh model to print an old tool frame as an action.
       const safeReply = looksLikeToolCallShape(reply) ? '(The prior reply described a tool action.)' : reply;
-      const content = `USER: ${request}\nASSISTANT: ${safeReply}`;
+      const content = cancelledTerminal(terminalData)
+        ? `USER: ${request}\nASSISTANT: (Stopped at the person's request before this finished; the request itself still stands for "continue".) ${safeReply}`
+        : `USER: ${request}\nASSISTANT: ${safeReply}`;
       const reference = `--- Session ${row.session_id}; source ${row.source_seq}; completion ${row.seq} ---\n`;
       const excerpt = `\n[Excerpt; retrieve the full exchange from session_history for ${row.session_id}, source ${row.source_seq}, before copying omitted content.]`;
       const limit = Math.min(SUCCESSOR_EXCHANGE_MAX_CHARS, remaining - reference.length - excerpt.length);
