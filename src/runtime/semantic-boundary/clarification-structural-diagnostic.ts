@@ -5,8 +5,7 @@ import type { ClarificationRevisionInput } from './clarification-revision.js';
 
 export const CLARIFICATION_STRUCTURAL_REJECTION_REASONS = [
   'duplicate_decision_id', 'options_changed', 'question_quote_unbound',
-  'reply_quote_unbound', 'settled_fields_invalid', 'residual_quote_unbound',
-  'unresolved_fields_invalid', 'binding_fields_invalid', 'no_residual_decision',
+  'reply_quote_unbound', 'settled_fields_invalid', 'no_residual_decision',
 ] as const;
 
 export interface ClarificationStructuralRejection {

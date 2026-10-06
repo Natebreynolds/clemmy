@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import {
+  CLARIFICATION_ANSWER_COMPLETE,
+  CLARIFICATION_REVISION_GROUNDED,
   CLARIFICATION_REVISION_SURE,
   checkClarificationAnswerCompleteness,
   proposeClarificationRevision,
@@ -160,16 +162,6 @@ test('structural diagnostics identify one finite local predicate without retaini
       reason: 'options_changed', decisionIndex: null, anchorOrigin: null, optionIndex: null },
     { name: 'answered without reply', raw: { ...p, decisions: [{ ...p.decisions[0], replyQuote: null }, ...p.decisions.slice(1)] },
       reason: 'settled_fields_invalid', decisionIndex: 0, anchorOrigin: 'option', optionIndex: 0 },
-    { name: 'answered with residual', raw: { ...p, decisions: [{ ...p.decisions[0], residualQuote: p.question }, ...p.decisions.slice(1)] },
-      reason: 'settled_fields_invalid', decisionIndex: 0, anchorOrigin: 'option', optionIndex: 0 },
-    { name: 'missing residual quote', raw: { ...p, decisions: [...p.decisions.slice(0, 3), { ...p.decisions[3], residualQuote: null }] },
-      reason: 'residual_quote_unbound', decisionIndex: 3, anchorOrigin: 'question', optionIndex: null },
-    { name: 'invented residual quote', raw: { ...p, decisions: [...p.decisions.slice(0, 3), { ...p.decisions[3], residualQuote: 'PRIVATE_RESIDUAL_QUOTE' }] },
-      reason: 'residual_quote_unbound', decisionIndex: 3, anchorOrigin: 'question', optionIndex: null },
-    { name: 'unresolved with claim', raw: { ...p, decisions: [...p.decisions.slice(0, 3), { ...p.decisions[3], claim: 'Invented definition' }] },
-      reason: 'unresolved_fields_invalid', decisionIndex: 3, anchorOrigin: 'question', optionIndex: null },
-    { name: 'binding without claimed answer', raw: { ...p, decisions: [...p.decisions.slice(0, 3), { ...p.decisions[3], disposition: 'binding_needed' }] },
-      reason: 'binding_fields_invalid', decisionIndex: 3, anchorOrigin: 'question', optionIndex: null },
     { name: 'no residual decision', raw: { ...p, decisions: p.decisions.slice(0, 3) },
       reason: 'no_residual_decision', decisionIndex: null, anchorOrigin: null, optionIndex: null },
   ];
@@ -273,7 +265,7 @@ test('option anchors still require strict fields, residual coverage and independ
   const result = await proposeClarificationRevision(optionInput, ports(p));
   if (result.status !== 'proposed') return assert.fail('expected a reviewed fixture receipt');
   assert.equal(validatedClarificationRevision(optionInput, { ...result.revision, review: undefined }), null);
-  assert.equal(validatedClarificationRevision(optionInput, { ...result.revision, review: { ...result.revision.review, noul: 0.94 } }), null);
+  assert.equal(validatedClarificationRevision(optionInput, { ...result.revision, review: { ...result.revision.review, noul: CLARIFICATION_REVISION_GROUNDED - 0.01 } }), null);
   const changed = { ...p, decisions: [{ ...p.decisions[0], questionQuote: 'PRIVATE_FORGED' }, ...p.decisions.slice(1)] };
   assert.equal(validatedClarificationRevision(optionInput, { ...result.revision, decisions: changed.decisions,
     proposalDigest: sha({ version: 1, inputDigest: result.revision.inputDigest, anchorPolicy: result.revision.anchorPolicy, proposed: changed }) }), null,
@@ -326,7 +318,7 @@ test('source/session/question/options changes and forged or weakened receipts ca
     { ...result.revision, acknowledgment: 'Work started.' },
     { ...result.revision, proposalDigest: 'a'.repeat(64) },
     { ...result.revision, sourceDigest: 'a'.repeat(64) },
-    { ...result.revision, review: { ...result.revision.review, noul: 0.94 } },
+    { ...result.revision, review: { ...result.revision.review, noul: CLARIFICATION_REVISION_GROUNDED - 0.01 } },
     { ...result.revision, review: undefined },
     { ...result.revision, approved: true },
   ]) assert.equal(validatedClarificationRevision(input, changed), null);
@@ -338,8 +330,6 @@ test('invented quotes, duplicate decisions and hidden options are rejected befor
     { ...proposal(), decisions: [{ ...proposal().decisions[0], replyQuote: 'An answer never supplied' }] },
     { ...proposal(), decisions: [...proposal().decisions, proposal().decisions[0]] },
     { ...proposal(), options: ['Approve and execute'] },
-    { ...proposal(), decisions: proposal().decisions.map((decision) => decision.id === 'escalation'
-      ? { ...decision, residualQuote: 'A question not in the revision' } : decision) },
     { ...proposal(), decisions: proposal().decisions.slice(0, 2) },
     { ...proposal(), decisions: Array.from({ length: 9 }, () => proposal().decisions[0]) },
     { ...proposal(), operations: [{ effect: 'send' }] },
@@ -654,7 +644,7 @@ test('completeness replay binds exact input and distinguishes its proof from a q
   // A lower literal retained score cannot replay as complete, even if a
   // caller separately persists a purported complete status beside it.
   assert.equal(validatedClarificationAnswerCompleteness(input, { ...result.receipt,
-    review: { ...result.receipt.review, noul: 0.8 } })?.status, 'incomplete');
+    review: { ...result.receipt.review, noul: CLARIFICATION_ANSWER_COMPLETE - 0.01 } })?.status, 'incomplete');
   const revised = await proposeClarificationRevision(input, ports());
   if (revised.status === 'proposed') assert.equal(validatedClarificationAnswerCompleteness(input, revised.revision), null);
 });
@@ -727,9 +717,11 @@ test('clarification diagnostics retain only source-bound failure facts from the 
           ...(scenario.name === 'provider status' ? { httpStatus: 429 } : {}),
         });
         assert.doesNotMatch(JSON.stringify(result), /PRIVATE_|APIError|stack|message|token|prompt/i);
-        assert.equal(capture.sdk.length, 1, 'one semantic SDK invocation');
-        assert.equal(capture.backend.length, scenario.calls, 'only the pre-existing bounded BYO repair allowance');
-        assert.equal(capture.selectedModels.length, 1, 'no brain substitution or second semantic proposal');
+        // A deadline alone is retried once on the same Quick role; nothing else is.
+        const tries = scenario.name === 'own deadline' ? 2 : 1;
+        assert.equal(capture.sdk.length, tries, 'one semantic SDK invocation per try');
+        assert.equal(capture.backend.length, scenario.calls * tries, 'only the pre-existing bounded BYO repair allowance');
+        assert.deepEqual(capture.selectedModels, Array.from({ length: tries }, () => capture.selectedModels[0]), 'no brain substitution');
         assert.equal(fixture.calls.length, 0, 'failed output cannot reach grounding');
       });
     } finally { _setQuickCheckDeadlineMsForTests(null); }
@@ -843,4 +835,85 @@ test('clarification diagnostic projection rejects arbitrary fields and inconsist
     { ...safe, sdkRunReturned: true }, { ...safe, phase: 'model_selection' },
     { ...safe, kind: 'wire_envelope_invalid' }, { ...safe, kind: 'sdk_output_invalid' },
   ]) assert.equal(validatedClarificationFailureDiagnostic(bad, source), null);
+});
+
+test('the bars sit inside the bands the hosted judge actually produces (measured 2026-10-05)', async () => {
+  // Correct revision 0.73–0.82, wrong revision 0.03–0.04; complete reply
+  // 0.93–0.94, incomplete reply 0.02–0.03. The old 0.95 bar refused all four
+  // correct answers; a bar that only a stub can reach pins nothing.
+  assert.ok(CLARIFICATION_REVISION_GROUNDED <= 0.73 && CLARIFICATION_REVISION_GROUNDED > 0.04);
+  assert.ok(CLARIFICATION_ANSWER_COMPLETE <= 0.93 && CLARIFICATION_ANSWER_COMPLETE > 0.03);
+  const right = await proposeClarificationRevision(input, ports(proposal(), 0.78));
+  assert.equal(right.status, 'proposed');
+  if (right.status === 'proposed') assert.deepEqual(validatedClarificationRevision(input, right.revision), right.revision);
+  assert.deepEqual(await proposeClarificationRevision(input, ports(proposal(), 0.04)), { status: 'no_revision', reason: 'not_grounded' });
+  const completeness = (noul: number) => checkClarificationAnswerCompleteness(input, async () => ({ ok: true,
+    model: 'fixture-jev', answers: { complete_answer: { type: 'noul', noul } }, usage: { input_tokens: 30, output_tokens: 1 } }));
+  assert.equal((await completeness(0.93)).status, 'complete');
+  assert.equal((await completeness(0.03)).status, 'incomplete');
+});
+
+test('shapes the quick model actually writes pass structure and go to the independent check', async () => {
+  // Offline 2026-10-05, DeepSeek proposals that accepted every supplied answer
+  // and asked only for the missing one were refused by field-shape rules: an
+  // unresolved row citing the reply it judged insufficient, and a residual
+  // question in its own words. Structure keeps only the evidence rules.
+  const p = proposal();
+  const escalation = p.decisions.find((decision) => decision.id === 'escalation')!;
+  for (const raw of [
+    { ...p, decisions: p.decisions.map((decision) => decision === escalation
+      ? { ...decision, replyQuote: 'Can I attach the report?' } : decision) },
+    { ...p, decisions: p.decisions.map((decision) => decision === escalation
+      ? { ...decision, residualQuote: null } : decision) },
+    { ...p, question: 'One thing left: what does the escalation label mean, and when should it fire?',
+      decisions: p.decisions.map((decision) => decision === escalation
+        ? { ...decision, residualQuote: 'what does the escalation label mean' } : decision) },
+    { ...p, decisions: p.decisions.map((decision) => decision === escalation
+      ? { ...decision, disposition: 'binding_needed', claim: null, replyQuote: null } : decision) },
+    { ...p, decisions: p.decisions.map((decision) => decision.id === 'source'
+      ? { ...decision, residualQuote: p.question } : decision) },
+  ]) {
+    const fixture = ports(raw);
+    const result = await proposeClarificationRevision(input, fixture);
+    assert.equal(result.status, 'proposed', JSON.stringify(result));
+    assert.deepEqual(fixture.calls.map((call) => call.lane), ['proposal', 'jev']);
+  }
+  // Evidence rules stay: a settled claim without its reply wording is refused locally.
+  const fixture = ports({ ...p, decisions: p.decisions.map((decision) => decision.id === 'source'
+    ? { ...decision, replyQuote: null } : decision) });
+  const result = await proposeClarificationRevision(input, fixture);
+  assert.equal(result.status, 'unavailable');
+  assert.deepEqual(fixture.calls.map((call) => call.lane), ['proposal']);
+});
+
+test('a proposal that merely passed its deadline is tried once more; a second deadline or another failure is not', async () => {
+  const { retainClarificationFailureDiagnostic } = await import('./clarification-failure-diagnostic.js');
+  const failure = (kind: 'deadline' | 'http_error') => {
+    const error = new Error('PRIVATE_FAILURE');
+    retainClarificationFailureDiagnostic(error, { version: 1, sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+      kind, phase: 'sdk_run', deadlineFired: kind === 'deadline', sdkRunStarted: true, sdkRunReturned: false,
+      ...(kind === 'http_error' ? { httpStatus: 429 } : {}) });
+    return error;
+  };
+  const withThrows = (kinds: Array<'deadline' | 'http_error'>) => {
+    const fixture = ports();
+    const inner = fixture.complete;
+    let call = 0;
+    return { ...fixture, complete: async (value: Parameters<typeof inner>[0]) => {
+      const kind = kinds[call++];
+      if (kind) { fixture.calls.push({ lane: 'proposal', input: value }); throw failure(kind); }
+      return inner(value);
+    } };
+  };
+  const recovered = withThrows(['deadline']);
+  assert.equal((await proposeClarificationRevision(input, recovered)).status, 'proposed');
+  assert.deepEqual(recovered.calls.map((call) => call.lane), ['proposal', 'proposal', 'jev']);
+  const twice = withThrows(['deadline', 'deadline']);
+  const stopped = await proposeClarificationRevision(input, twice);
+  assert.equal(stopped.status, 'unavailable');
+  if (stopped.status === 'unavailable') assert.equal(stopped.diagnostic?.kind, 'deadline');
+  assert.deepEqual(twice.calls.map((call) => call.lane), ['proposal', 'proposal']);
+  const other = withThrows(['http_error']);
+  assert.equal((await proposeClarificationRevision(input, other)).status, 'unavailable');
+  assert.deepEqual(other.calls.map((call) => call.lane), ['proposal']);
 });

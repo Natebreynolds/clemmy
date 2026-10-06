@@ -176,6 +176,9 @@ interface OpenQuestionReplyRoute {
   revisionUnavailable?: boolean;
   unavailableReadingEventId?: string;
   answerCompletenessRequired?: boolean;
+  /** The reply settled part of the question and no checked revision could be
+   * made: the brain answers with the step held, instead of a canned hold. */
+  partialAnswer?: boolean;
 }
 
 /** The host's recorded reading of this exact accepted reply, if it made one. */
@@ -233,7 +236,8 @@ function openQuestionReplyRouteFor(sessionId: string, sourceUserSeq: number): Op
   }
   return { route, parentPacketId,
     ...(event?.data.revisionUnavailable === true ? { revisionUnavailable: true, unavailableReadingEventId: event.id } : {}),
-    ...(event?.data.answerCompletenessRequired === true ? { answerCompletenessRequired: true } : {}) };
+    ...(event?.data.answerCompletenessRequired === true ? { answerCompletenessRequired: true } : {}),
+    ...(route === 'respond' && event?.data.partialAnswer === true ? { partialAnswer: true } : {}) };
 }
 
 function clarificationParentInputFromChain(packet: TaskContinuityPacket, consumingSourceUserSeq?: number): string | null {
@@ -451,6 +455,17 @@ export async function classifyUnsettledOpenQuestionReply(input: {
       ...(!revision && proposal.status !== 'proposed' ? { revisionReason: proposal.reason } : {}),
     };
   }
+  // The reply settled part of the question (the independent completeness
+  // check read it) and no checked revision came out of the quick model.
+  // Holding here with "I couldn't verify how it changes the pending question"
+  // was a dead end: live 2026-10-05, every partial answer to a compound
+  // question stopped on that notice, four different ways. Clem answers
+  // instead, with the step held (the brain input below carries the hold).
+  // A completeness check that could not run keeps the honest hold.
+  if (route === 'reask' && !revision && completenessRequired && !skipRevision) {
+    route = 'respond';
+    recordedReading = { ...recordedReading, partialAnswer: true };
+  }
   const retainedReading = appendEvent({
     sessionId: input.sessionId,
     turn: source.turn,
@@ -469,7 +484,8 @@ export async function classifyUnsettledOpenQuestionReply(input: {
   return { route, parentPacketId: current.packet.packetId,
     ...(revision ? { revision } : {}),
     ...(recordedReading.revisionUnavailable === true ? { revisionUnavailable: true, unavailableReadingEventId: retainedReading.id } : {}),
-    ...(recordedReading.answerCompletenessRequired === true ? { answerCompletenessRequired: true } : {}) };
+    ...(recordedReading.answerCompletenessRequired === true ? { answerCompletenessRequired: true } : {}),
+    ...(recordedReading.partialAnswer === true ? { partialAnswer: true } : {}) };
 }
 
 /**
@@ -1674,6 +1690,37 @@ function repliedOpenQuestionContinuationInput(input: {
   return steer;
 }
 
+/** The brain's input for a reply that settled part of an open question when
+ * the host could not produce a checked revision. Clem writes the follow-up
+ * herself: keep what was supplied, change nothing, ask only for the rest. Like
+ * a question back, the stored question is released so the brain can plan; her
+ * own re-ask opens a new one. */
+function partialAnswerContinuationInput(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): string | null {
+  const current = peekTaskContinuityPacket({ sessionId: input.sessionId });
+  if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return null;
+  const recorded = openQuestionReplyRouteFor(input.sessionId, input.sourceUserSeq);
+  if (recorded?.route !== 'respond' || !recorded.partialAnswer || recorded.parentPacketId !== current.packet.packetId) return null;
+  const edge = clarificationRevisionInputFor(current.packet, input.sourceUserSeq);
+  if (!edge) return null;
+  const steer = [
+    '[task-continuation-partial-answer:v1]',
+    '[root-task]',
+    edge.rootTask,
+    '[current-question]',
+    edge.deliveredQuestion,
+    ...(edge.deliveredOptions.length > 0 ? ['[visible-options]', JSON.stringify(edge.deliveredOptions)] : []),
+    '[user-reply]',
+    edge.acceptedReply,
+    '[host-directive]',
+    'The user answered part of your open question and may have changed something you proposed; an independent check found that not every decision is settled yet. Keep every answer and change they gave exactly as they stated it, including ranges. The pending step stays on hold: do not create, change, write, send, publish or delete anything for it, and do not treat a general "approved" as supplying a missing fact. Acknowledge what they supplied, then ask only for what is still missing, in your own words.',
+  ].join('\n');
+  dismissTaskContinuityPacket({ sessionId: input.sessionId, reason: 'no_longer_needed' });
+  return steer;
+}
+
 function accountEvidenceStillFits(row: TaskContinuityCapabilityEvidence): boolean {
   if (row.kind !== 'composio') return true;
   let registry: ReturnType<typeof peekConnectedToolkits> = [];
@@ -2556,6 +2603,15 @@ export async function enrichAcceptedRequestWithTaskContinuity(
     // the host publishes its needs-input successor before building an agent.
     const { semanticTaskInput: _semantic, taskContinuation: _context, ...safe } = request;
     return { ...safe, taskContinuationResolved: true };
+  }
+  if (pendingReplyRoute?.route === 'respond' && pendingReplyRoute.partialAnswer) {
+    // A partial answer never consumes the pending edge into executing work;
+    // the brain gets the exact question and reply with the hold spelled out.
+    const steer = partialAnswerContinuationInput({ sessionId: request.sessionId, sourceUserSeq });
+    const { semanticTaskInput: _semantic, taskContinuation: _context, ...safe } = request;
+    return steer
+      ? { ...safe, semanticTaskInput: steer, taskContinuationResolved: true }
+      : { ...safe, taskContinuationResolved: true };
   }
   if (options.typedClassification && 'keepOpen' in options.typedClassification) {
     const metaInput = verifiedMetaContinuationInput({
