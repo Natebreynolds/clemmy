@@ -250,19 +250,14 @@ for (const kind of ['send', 'delete', 'admin'] as const) {
 // reducer itself: never a card, never a coverage repair, nothing dispatched.
 const PLAN = { version: 1 as const, kind: 'plan' as const };
 
-test('a carrier-bounded call in Plan mode proceeds once as a preparation probe and journals its basis', async () => {
+test('a carrier-bounded call in Plan mode is the typed Plan refusal too: nothing runs during planning', async () => {
+  // Owner 2026-10-06: in Plan mode Clem identifies the tools without committing writes.
   const { result, request } = await exactCall('bounded', { taskMode: PLAN });
   assert.equal(result.status, 'decided', JSON.stringify(result));
   if (result.status !== 'decided') return;
-  assert.deepEqual(result.decision, { kind: 'proceed', basis: 'plan_preparation_probe', authorityDigest: result.call.bindingDigest });
-  assert.deepEqual(result.call.risk, { reversibility: 'ordinary_non_destructive', consequence: 'unknown', destructive: false });
-  assert.equal(result.consentSubject, undefined, 'a probe is never an approval subject');
-  const receipts = eventlog.listEvents(request.attestation.sessionId, { types: ['interactive_consent_decided'] });
-  assert.equal(receipts.length, 1);
-  assert.equal(receipts[0]!.data.basis, 'plan_preparation_probe');
-  assert.equal(receipts[0]!.data.operationId, 'EXAMPLE_REQUEST');
-  assert.equal(receipts[0]!.data.sourceUserSeq, request.attestation.sourceUserSeq);
-  assert.deepEqual(receipts[0]!.data.carrierHints, { destructive: false });
+  assert.deepEqual(result.decision, { kind: 'refuse', reason: 'plan_mode_external_effect' });
+  assert.equal(result.consentSubject, undefined, 'no card in Plan, ever');
+  assert.equal(eventlog.listEvents(request.attestation.sessionId, { types: ['interactive_consent_decided'] }).length, 0);
   // The same shape outside Plan asks once (owner 2026-10-06) and then is ordinary carrier-bounded work.
   const unlearned = await exactCall('bounded');
   assert.equal(unlearned.result.status === 'decided' ? unlearned.result.decision.kind : null, 'needs_user');
@@ -270,7 +265,7 @@ test('a carrier-bounded call in Plan mode proceeds once as a preparation probe a
   assert.equal(act.result.status === 'decided' && act.result.decision.kind === 'proceed' ? act.result.decision.basis : null, 'exact_carrier_bounded_work');
 });
 
-for (const kind of ['draft', 'send', 'delete', 'admin', 'unknown'] as const) {
+for (const kind of ['draft', 'send', 'delete', 'admin', 'unknown', 'bounded'] as const) {
   test(`a ${kind} in Plan mode returns the typed Plan refusal from consent and dispatches nothing`, async () => {
     const { result, request } = await exactCall(kind, { taskMode: PLAN });
     assert.equal(result.status, 'decided', JSON.stringify(result));

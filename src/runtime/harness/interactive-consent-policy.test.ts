@@ -356,17 +356,16 @@ test('a carrier-bounded unnamed consequence with exact coverage is ordinary acce
   assert.equal(local.kind, 'repair');
 });
 
-test('a planning source probes a carrier-bounded call once without coverage and refuses every other external effect without a card', () => {
+test('a planning source refuses every external effect without a card, including a carrier-bounded call it once probed', () => {
   const bounded = call({ effect: 'external_write', accountId: 'selected-account',
     risk: { reversibility: 'ordinary_non_destructive', consequence: 'unknown', destructive: false },
     semanticBasis: { kind: 'current_external_definition', digest: digest('8') } });
-  // Plan holds no expected-work graph: the probe proceeds with no coverage at all.
-  assert.deepEqual(evaluateInteractiveConsentV1(input(bounded, { coverage: null, preparationProbe: true })), {
-    kind: 'proceed', basis: 'plan_preparation_probe', authorityDigest: bounded.bindingDigest,
-  });
-  // The same shape with coverage present still answers as a probe, never as accepted work.
-  assert.equal(evaluateInteractiveConsentV1(input(bounded, { preparationProbe: true })).kind, 'proceed');
-  assert.equal((evaluateInteractiveConsentV1(input(bounded, { preparationProbe: true })) as { basis?: string }).basis, 'plan_preparation_probe');
+  // Owner 2026-10-06: in Plan mode Clem identifies the tools without committing writes.
+  // Plan holds no expected-work graph; with or without coverage the answer is the same typed refusal.
+  assert.deepEqual(evaluateInteractiveConsentV1(input(bounded, { coverage: null, preparationProbe: true })),
+    { kind: 'refuse', reason: 'plan_mode_external_effect' });
+  assert.deepEqual(evaluateInteractiveConsentV1(input(bounded, { preparationProbe: true })),
+    { kind: 'refuse', reason: 'plan_mode_external_effect' });
   // Creates, updates, sends, deletes, admin, carrier-silent and sealed sets are typed refusals: never needs_user, never repair.
   for (const other of [
     call({ ...bounded, risk: { reversibility: 'ordinary_non_destructive', consequence: 'create', destructive: false } }),
@@ -391,7 +390,7 @@ test('a planning source probes a carrier-bounded call once without coverage and 
   assert.deepEqual(evaluateInteractiveConsentV1(input(call({ ...bounded, safety: 'protected' }), { coverage: null, preparationProbe: true })),
     { kind: 'refuse', reason: 'protected_target' });
   assert.equal(evaluateInteractiveConsentV1(input(bounded, { coverage: null, preparationProbe: true, crossing: 'started' })).kind, 'reconcile');
-  // Without the planning flag nothing changed: no coverage repairs, coverage proceeds on the carrier bound.
+  // Without the planning flag nothing changed: no coverage repairs, coverage asks once then proceeds on the carrier bound.
   assert.deepEqual(evaluateInteractiveConsentV1(input(bounded, { coverage: null })), { kind: 'repair', reason: 'coverage_missing' });
   assert.equal((evaluateInteractiveConsentV1(input(bounded, { learnedExternalWrite: true })) as { basis?: string }).basis, 'exact_carrier_bounded_work');
   assert.equal(evaluateInteractiveConsentV1(input(bounded)).kind, 'needs_user');

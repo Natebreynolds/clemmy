@@ -463,31 +463,17 @@ export function evaluateInteractiveConsentV1(
     };
   }
 
-  // A PLANNING TURN VALIDATES WHAT IT WILL CALL.
+  // A PLANNING TURN NAMES WHAT IT WILL CALL AND COMMITS NOTHING.
   //
   // Planning has no expected-work graph, so the coverage gate below could
   // only ever repair; the ceiling that matters here is external consequence.
-  // A carrier-bounded call (the current definition declares it
-  // non-destructive, the arguments carry no send or delete evidence, and it
-  // addresses one occurrence) may run once as preparation, so the published
-  // plan binds arguments that actually worked instead of a guess the
-  // execution turn discovers. Every other external effect is refused as a
-  // typed planning boundary: never a card, never a coverage repair, because a
-  // plan proposes that action and the reviewed revision performs it.
+  // Reads (schemas, catalogs, lookups) already proceeded above as no_effect,
+  // which is how a plan identifies the tools it needs. Every external effect
+  // is refused as a typed planning boundary: never a card, never a coverage
+  // repair, never a one-off "preparation" execution (owner 2026-10-06: in
+  // Plan mode Clem identifies the tools without committing writes). The plan
+  // proposes the action; the reviewed revision performs it.
   if (input.preparationProbe) {
-    if (
-      call.effect === 'external_write'
-      && call.risk.consequence === 'unknown'
-      && call.risk.reversibility === 'ordinary_non_destructive'
-      && !call.risk.destructive
-      && call.cardinality.kind !== 'set'
-    ) {
-      return {
-        kind: 'proceed',
-        basis: 'plan_preparation_probe',
-        authorityDigest: call.bindingDigest,
-      };
-    }
     return { kind: 'refuse', reason: 'plan_mode_external_effect' };
   }
 
