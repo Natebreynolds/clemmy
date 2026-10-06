@@ -1362,15 +1362,18 @@ async function resolveApprovalOrQueueBackgroundContinuation(
   // registry row the way a person surface does; its resolution hook resumes
   // the waiting work.
   const registryRow = approvalRegistry.get(approvalId);
-  if (registryRow && registryRow.status === 'pending') {
-    const resolved = approvalRegistry.resolve(approvalId, approved ? 'approved' : 'rejected', 'api-approvals-route');
+  if (registryRow) {
+    // A second decision on an already-decided card is an answer, not a 500.
+    const resolved = registryRow.status === 'pending'
+      ? approvalRegistry.resolve(approvalId, approved ? 'approved' : 'rejected', 'api-approvals-route')
+      : { ok: false as const };
     return {
       approvalId,
       status: resolved.ok ? (approved ? 'approved' as const : 'rejected' as const) : 'already_resolved' as const,
       sessionId: registryRow.sessionId,
       text: resolved.ok
         ? `${approved ? 'Approved' : 'Rejected'}: ${registryRow.subject}.`
-        : 'That approval was no longer pending.',
+        : `That approval was already ${registryRow.resolution ?? registryRow.status}.`,
     };
   }
   return assistant.getRuntime().resolveApproval(approvalId, approved);
