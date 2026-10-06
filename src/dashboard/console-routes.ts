@@ -3643,7 +3643,11 @@ function tryCommitLiveApprovalControl(input: {
           // armed authority and went silent — no terminal, nothing ran. The
           // card button never takes that path: it resolves the row and the
           // registry listener runs the stored action. Do the same here.
-          if (!input.queuedEligible) return null;
+          // Only a decline is resolved here for now: approving a chat-queued
+          // action runs it through the turn's expected-work graph, which
+          // fails `not_action` on a question turn and strands an attempt
+          // (live 2026-10-06, twice). An approve waits for that executor.
+          if (!input.queuedEligible || intent.decision !== 'reject') return null;
           const preflight = exactPendingActionApprovalPreflight(row, intent.decision);
           if (preflight.kind !== 'ok') return null;
           return {
