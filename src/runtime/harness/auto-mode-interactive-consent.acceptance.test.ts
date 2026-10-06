@@ -135,7 +135,7 @@ function cards(decision: InteractiveConsentDecisionV1): InteractiveConsentDecisi
   return decision.kind === 'needs_user' ? [decision] : [];
 }
 
-test('Auto emits zero cards for conversation, local search, Clem internals, and exact ordinary work', () => {
+test('Auto emits zero cards for conversation, local search, Clem internals and local work; a first-time connected-app change asks once', () => {
   // Conversation has no admitted call, therefore it never enters the consent
   // reducer and has no card surface.
   const conversationCards: InteractiveConsentDecisionV1[] = [];
@@ -176,13 +176,18 @@ test('Auto emits zero cards for conversation, local search, Clem internals, and 
     decide(localFileSearch),
     decide(clemBookkeeping),
     decide(localCreate),
-    decide(externalCreate),
-    decide(externalUpdate),
   ];
-  assert.deepEqual(ordinary.map((decision) => decision.kind), [
-    'proceed', 'proceed', 'proceed', 'proceed', 'proceed',
-  ]);
+  assert.deepEqual(ordinary.map((decision) => decision.kind), ['proceed', 'proceed', 'proceed']);
   assert.equal(ordinary.flatMap(cards).length, 0);
+  // Owner 2026-10-06: a change in a connected app asks the first time, in
+  // Auto as well as Ask, in Clem's words; the approval teaches the kind and
+  // the same kind then runs without a card.
+  for (const external of [externalCreate, externalUpdate]) {
+    const first = decide(external);
+    assert.equal(first.kind, 'needs_user');
+    if (first.kind === 'needs_user') assert.equal(first.teaches, 'external_write_kind');
+    assert.equal(decide(external, { learnedExternalWrite: true }).kind, 'proceed');
+  }
 });
 
 test('host bookkeeping and internal recovery can repair but can never ask the user', () => {
