@@ -39,7 +39,7 @@ import {
   type HostConsentCarrierEvidence,
   type HostConsentSemanticSourceEvidence,
 } from './host-consent-evidence.js';
-import { appendEvent, getEvent, openEventLog } from './eventlog.js';
+import { appendEvent, getEvent, getSession, openEventLog } from './eventlog.js';
 import {
   loadDurableAuthorizedLocalPlanningDefinition,
   localPlanningArgumentsMatch,
@@ -431,7 +431,7 @@ function mintHostConsentGrantAdmission(input: {
       || input.consentSubject.coverageDigest !== digest(input.coverage)
       || input.consentSubject.riskDigest !== digest(input.call.risk)
     ) return null;
-    const consentMode = input.consentMode ?? consentModeForCall(input.call);
+    const consentMode = input.consentMode ?? consentModeForCall(input.call, { sessionId: prepared.sessionId });
     const currentUngrantedDecision = evaluateInteractiveConsentV1({
       call: input.call,
       coverage: input.coverage,
@@ -1170,15 +1170,30 @@ export { ownerRunsInAutoMode };
  * change was approved before. Local work never consults it. The scope value
  * stays as stored: Auto is the widest scope, everything narrower is Ask.
  */
-function consentModeForCall(call: CapabilityRiskAttestationV1): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean } {
+function consentModeForCall(
+  call: CapabilityRiskAttestationV1,
+  identity: { sessionId: string },
+): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean } {
   const mode: 'auto' | 'ask' = ownerRunsInAutoMode() ? 'auto' : 'ask';
   // A connected-app change asks the first time in both modes (owner
   // 2026-10-06), so what was learned is read in Auto too; otherwise every
   // call would ask forever.
   if (call.effect !== 'external_write') return { mode, learnedExternalWrite: false };
+  // A workflow run works under the workflow's own approval: the owner
+  // accepted it when they published it. Live 2026-10-06, an hourly sheet
+  // update sat on a first-time card an hour after the rule went in; owner:
+  // approved workflows need no approval cards. Sends, deletes and the other
+  // high-consequence shapes still ask, as they did before.
+  if (workflowRunSession(identity.sessionId)) return { mode, learnedExternalWrite: true };
   let learned = false;
   try { learned = hasApprovedWriteKind(call.operationId, call.accountId); } catch { learned = false; }
   return { mode, learnedExternalWrite: learned };
+}
+
+/** The step session of a published workflow: kind 'workflow', deterministic `workflow:` id. */
+function workflowRunSession(sessionId: string): boolean {
+  if (sessionId.startsWith('workflow:')) return true;
+  try { return getSession(sessionId)?.kind === 'workflow'; } catch { return false; }
 }
 
 function reduceHostConsentEvidence(input: {
@@ -1191,7 +1206,7 @@ function reduceHostConsentEvidence(input: {
 }) {
   const { call, coverage, crossing, reservationAlreadyClaimed } = input;
   const preparationProbe = planPreparationProbe(input.identity);
-  const consentMode = consentModeForCall(call);
+  const consentMode = consentModeForCall(call, input.identity);
   const ungrantedDecision = evaluateInteractiveConsentV1({
     call, coverage, userGrant: null, readiness: { kind: 'ready' },
     crossing, reservationAlreadyClaimed, preparationProbe, ...consentMode,
@@ -1641,7 +1656,7 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       sessionId: attestation.sessionId,
       sourceUserSeq: attestation.sourceUserSeq,
     }),
-    ...consentModeForCall(call),
+    ...consentModeForCall(call, { sessionId: attestation.sessionId }),
   });
   return { status: 'decided', decision, call, coverage };
 }

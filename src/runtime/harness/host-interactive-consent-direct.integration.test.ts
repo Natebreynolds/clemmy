@@ -50,8 +50,8 @@ async function withLearnedKind<T>(operationId: string, fn: () => Promise<T>): Pr
 }
 
 async function exactCall(kind: 'draft' | 'send' | 'delete' | 'admin' | 'unknown' | 'bounded',
-  options: { taskMode?: { version: 1; kind: 'plan' } } = {}) {
-  const sessionId = `direct-consent-${randomUUID()}`;
+  options: { taskMode?: { version: 1; kind: 'plan' }; sessionId?: string; sessionKind?: 'chat' | 'workflow' } = {}) {
+  const sessionId = options.sessionId ?? `direct-consent-${randomUUID()}`;
   const operationId = { draft: 'EXAMPLE_CREATE_DRAFT', send: 'EXAMPLE_SEND_MESSAGE',
     delete: 'EXAMPLE_DELETE_RECORD', admin: 'EXAMPLE_ROTATE_API_KEY', unknown: 'EXAMPLE_RECORD',
     bounded: 'EXAMPLE_REQUEST' }[kind];
@@ -95,7 +95,7 @@ async function exactCall(kind: 'draft' | 'send' | 'delete' | 'admin' | 'unknown'
   assert.equal(observations.registerIndependentCapabilityObservation({ operationId, accountId,
     definitionFingerprint: fingerprint, providerVersion: manifest.providerVersion,
     operationVersion: '1', observedAt: Date.now(), origin: 'independent' }).ok, true);
-  eventlog.createSession({ id: sessionId, kind: 'chat' });
+  eventlog.createSession({ id: sessionId, kind: options.sessionKind ?? 'chat' });
   const source = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: 'Perform this exact nominated operation on the connected account.',
       ...(options.taskMode ? { taskMode: options.taskMode } : {}) } });
@@ -263,6 +263,17 @@ test('a carrier-bounded call in Plan mode is the typed Plan refusal too: nothing
   assert.equal(unlearned.result.status === 'decided' ? unlearned.result.decision.kind : null, 'needs_user');
   const act = await withLearnedKind('EXAMPLE_REQUEST', () => exactCall('bounded'));
   assert.equal(act.result.status === 'decided' && act.result.decision.kind === 'proceed' ? act.result.decision.basis : null, 'exact_carrier_bounded_work');
+});
+
+test('a published workflow\'s run makes an ordinary connected-app change on the workflow\'s own approval; a send in it still asks', async () => {
+  // Owner 2026-10-06: approved workflows need no approval cards. Live: an
+  // hourly sheet update sat on a first-time card an hour after the card rule.
+  const run = await exactCall('draft', { sessionId: `workflow:trigger-${randomUUID()}:main`, sessionKind: 'workflow' });
+  assert.equal(run.result.status === 'decided' && run.result.decision.kind === 'proceed' ? run.result.decision.basis : JSON.stringify(run.result), 'exact_reversible_work');
+  const byKind = await exactCall('bounded', { sessionId: `step-${randomUUID()}`, sessionKind: 'workflow' });
+  assert.equal(byKind.result.status === 'decided' && byKind.result.decision.kind === 'proceed' ? byKind.result.decision.basis : JSON.stringify(byKind.result), 'exact_carrier_bounded_work');
+  const send = await exactCall('send', { sessionId: `workflow:trigger-${randomUUID()}:main`, sessionKind: 'workflow' });
+  assert.equal(send.result.status === 'decided' ? send.result.decision.kind : null, 'needs_user');
 });
 
 for (const kind of ['draft', 'send', 'delete', 'admin', 'unknown', 'bounded'] as const) {
