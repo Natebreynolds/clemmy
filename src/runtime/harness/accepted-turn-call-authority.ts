@@ -6,6 +6,7 @@
  * bounded read/compute root. Both kinds parent the same logical_tool_calls and
  * therefore reuse the same physical-dispatch and settlement evidence.
  */
+import { hasApprovedWriteKind } from '../../agents/plan-scope.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { savedSourceWorkflowConsentState, persistSavedSourceWorkflowConsent,
   hasRetainedSavedSourceWorkflowConsent, type SavedSourceWorkflowConsentAuthorization } from './saved-source-consent.js';
@@ -2650,7 +2651,8 @@ function workflowV3AutoReceiptMatchesAuthority(
       readiness: { kind: 'ready' },
       crossing: 'not_started',
       reservationAlreadyClaimed: false,
-      workflowApproval: true,
+      // The receipt proceeded once; reproduce it under the same learned kind.
+      learnedExternalWrite: receipt.decision.kind === 'proceed',
     });
     if (
       reproduced.kind !== 'proceed'
@@ -2865,9 +2867,14 @@ export function evaluateWorkflowV3AutoConsent(input: {
       authorityBindingDigest: authority.authorityBindingDigest,
     })}`,
   }) });
-  // A published workflow's action carries the workflow's approval (owner
-  // 2026-10-06): the workflow works end to end without the owner, and its
-  // human-in-the-loop steps are the only pauses.
+  // This path serves a Workspace (Space) click: the owner acting through a
+  // button they built. It follows the chat rule, not the workflow rule: a
+  // first-time change in a connected app asks once and the approval teaches
+  // the kind; a learned kind proceeds; a send or delete asks every time. A
+  // published workflow's own runs carry their approval through their step
+  // sessions (host-interactive-consent), never through here.
+  let learnedExternalWrite = false;
+  try { learnedExternalWrite = hasApprovedWriteKind(call.operationId, call.accountId); } catch { learnedExternalWrite = false; }
   const decision = evaluateInteractiveConsentV1({
     call,
     coverage,
@@ -2875,7 +2882,7 @@ export function evaluateWorkflowV3AutoConsent(input: {
     readiness: { kind: 'ready' },
     crossing: 'not_started',
     reservationAlreadyClaimed: false,
-    workflowApproval: true,
+    learnedExternalWrite,
   });
   journalInteractiveConsentDecision({
     sessionId: authority.sessionId, sourceUserSeq: null, call, decision,

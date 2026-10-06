@@ -218,6 +218,8 @@ function canonicalOrdinaryCreateDecision(input: {
   slug: string;
   actionId: string;
   args: Record<string, unknown>;
+  /** The owner approved this kind of change before (operation on account). */
+  learned?: boolean;
 }): consent.InteractiveConsentDecisionV1 {
   const capability = input.capability;
   const loaded = externalRisk.loadCatalogManifestExternalRiskAttestationV1({
@@ -331,6 +333,7 @@ function canonicalOrdinaryCreateDecision(input: {
     readiness: { kind: 'ready' },
     crossing: 'not_started',
     reservationAlreadyClaimed: false,
+    ...(input.learned ? { learnedExternalWrite: true } : {}),
   });
 }
 
@@ -379,7 +382,7 @@ test.after(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
-test('RED: an exact ordinary Workspace create follows canonical Auto and emits no approval card', async () => {
+test('RED: an exact ordinary Workspace create asks once in Auto, and the learned kind follows canonical Auto with no card', async () => {
   const capability = installCapabilities(['account:workspace:auto-create']);
   const slug = 'auto-create-case';
   const actionId = 'create-case';
@@ -393,14 +396,23 @@ test('RED: an exact ordinary Workspace create follows canonical Auto and emits n
     actions: [{ id: actionId, label: 'Create case', composioSlug: OPERATION, confirm: true }],
   });
 
+  // Owner 2026-10-06: a first-time change in a connected app asks once, in
+  // Auto too; the approval teaches the kind. A Space click follows the chat
+  // rule (a published workflow's own runs are the only standing approval).
+  const first = canonicalOrdinaryCreateDecision({ capability: capability.installed[0]!, slug, actionId, args });
+  assert.equal(first.kind, 'needs_user', JSON.stringify(first));
+  if (first.kind === 'needs_user') assert.equal(first.teaches, 'external_write_kind');
   const decision = canonicalOrdinaryCreateDecision({
     capability: capability.installed[0]!,
     slug,
     actionId,
     args,
+    learned: true,
   });
   assert.equal(decision.kind, 'proceed', JSON.stringify(decision));
   if (decision.kind === 'proceed') assert.equal(decision.basis, 'exact_ordinary_work');
+  const scopes = await import('../agents/plan-scope.js');
+  scopes.recordApprovedWriteKind({ operationId: OPERATION, accountId: capability.installed[0]!.accountId, approvalId: 'apr-space-learned' });
 
   const accepted = acceptedSource(
     'space-auto-create-source',
@@ -567,7 +579,7 @@ async function clickAction(slug: string, actionId: string, args: Record<string, 
   }
 }
 
-test('a click on an ordinary Workspace create runs through the same canonical Auto decision, with no card', async () => {
+test('a click on an ordinary Workspace create asks once, then runs through the same canonical Auto decision with no card', async () => {
   const capability = installCapabilities(['account:workspace:click-create']);
   const slug = 'click-create-case';
   const actionId = 'create-case';
@@ -576,6 +588,15 @@ test('a click on an ordinary Workspace create runs through the same canonical Au
     title: 'Click create case',
     actions: [{ id: actionId, label: 'Create case', composioSlug: OPERATION, confirm: true }],
   });
+  // First time: one card that teaches the kind; nothing crosses.
+  const firstClick = await clickAction(slug, actionId, { case_title: 'From the view', details: 'First click.' });
+  assert.equal(firstClick.status, 202, JSON.stringify(firstClick.body));
+  assert.equal(capability.bodies(), 0, 'nothing crosses before the owner approves the kind');
+  const firstCards = approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' });
+  assert.equal(firstCards.length, 1, 'one card, in Auto, the first time');
+  assert.equal(approvals.resolve(firstCards[0]!.approvalId, 'rejected', 'space-pin').ok, true);
+  const scopes = await import('../agents/plan-scope.js');
+  scopes.recordApprovedWriteKind({ operationId: OPERATION, accountId: capability.installed[0]!.accountId, approvalId: 'apr-space-click-learned' });
   const clicked = await clickAction(slug, actionId, { case_title: 'From the view', details: 'One click.' });
   assert.equal(clicked.status, 200, JSON.stringify(clicked.body));
   assert.equal(clicked.body.ok, true);
