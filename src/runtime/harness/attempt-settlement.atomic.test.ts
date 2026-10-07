@@ -390,6 +390,5 @@ test('a mutation the provider answered with its own refusal settles uncertain, w
   assert.equal(settled.outcome.kind, 'uncertain_write');
   assert.equal(settled.outcome.detail, 'provider_refused_envelope');
   assert.equal(settled.outcome.directive.retrySameCandidate, false, 'provider bytes earn no replay');
-  assert.equal(settled.outcome.directive.requiresReconciliation, false, 'an answered refusal is read back, not a stop');
-  assert.equal(settled.outcome.directive.action, 'settle');
+  assert.equal(settled.outcome.directive.requiresReconciliation, true, 'the ledger still owes reconciliation; turn readers key on the detail');
 });

@@ -1253,7 +1253,7 @@ function reduceStandardConversationTerminal(input: {
           result.lastDecision?.reply,
           pendingCount > 1
             ? `${pendingCount} approvals are waiting, starting with ${approval.subject} (${approval.approvalId}). Approve or reject each and I'll continue.`
-            : cardAsk ?? `Approval required for ${approval.subject}. Review ${approval.approvalId} to continue.`,
+            : cardAsk ?? `Can I go ahead with ${approval.subject}? Say yes, or tell me what to change.`,
         );
         outcome = {
           version: 2,

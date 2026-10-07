@@ -953,7 +953,6 @@ function settledNonSuccessProjectionDisposition(input: {
   // ended "I could not reopen the saved checkpoint" (live 2026-10-07).
   const answeredRefusal = settlement.outcome_kind === 'uncertain_write'
     && settlement.outcome_detail === 'provider_refused_envelope'
-    && settlement.requires_reconciliation === 0
     && settlement.nonreturned_crossing_count === 0;
   const mutatingSafeFailure = answeredRefusal || new Set([
     'invalid_arguments',
@@ -992,8 +991,8 @@ function settledNonSuccessProjectionDisposition(input: {
       && bound.binding.effect === 'local_write'
       && !uncertainEffectStopsTurn(bound.binding.effect);
   }
-  const reconciliationRequired = !returnedLocalWrite && (settlement.requires_reconciliation === 1
-    || (settlement.outcome_kind === 'uncertain_write' && !answeredRefusal)
+  const reconciliationRequired = !returnedLocalWrite && !answeredRefusal && (settlement.requires_reconciliation === 1
+    || settlement.outcome_kind === 'uncertain_write'
     || (
       settlement.mutating === 1
       && (

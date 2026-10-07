@@ -1751,7 +1751,7 @@ for (const variant of ['local_control', 'business_local', 'external', 'admin', '
   });
 }
 
-test('a returned unknown mutation cannot use a projection receipt to bypass reconciliation', async () => {
+test('a returned unknown mutation the provider answered is read back, never a success and never a replay', async () => {
   const task = fixture('Attempt one external mutation whose acknowledgement is negative.');
   const callId = 'call:returned-unknown-write';
   const toolName = 'space_publish';
@@ -1781,7 +1781,13 @@ test('a returned unknown mutation cannot use a projection receipt to bypass reco
   const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, {
     committedResultItems: [resultItem],
   });
-  assert.equal(finalized.status, 'evidence_unavailable');
+  // The provider answered ({ ok: false }): an uncertain write with no replay
+  // and no success handle, projected ready so the model reads the target
+  // and speaks (live 2026-10-07: this very shape parked the owner on
+  // "its effect must be reconciled"). The dark — a dropped acknowledgement —
+  // keeps its reconciliation stop (pinned above).
+  assert.ok(finalized.status === 'committed' || finalized.status === 'existing', JSON.stringify(finalized));
+  assert.equal(finalized.checkpoint.disposition, 'ready');
   leases.revokeDispatchLease(task.parentLease);
 });
 
@@ -1842,7 +1848,7 @@ test('an external write the provider answered with its own refusal checkpoints r
   });
   assert.equal(invoked.settlement.outcome.kind, 'uncertain_write');
   assert.equal(invoked.settlement.outcome.detail, 'provider_refused_envelope');
-  assert.equal(invoked.settlement.outcome.directive.requiresReconciliation, false);
+  assert.equal(invoked.settlement.outcome.directive.requiresReconciliation, true, 'the ledger owes reconciliation; the checkpoint reads the detail');
   const resultItem = projectedTextResult({ callId, toolName, value: payload });
   recordLogicalResult(admitted.admission, resultItem);
   const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, { committedResultItems: [resultItem] });

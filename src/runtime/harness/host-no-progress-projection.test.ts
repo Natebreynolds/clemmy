@@ -1927,10 +1927,10 @@ test('a write the provider answered with its own refusal is a known terminal the
     executionKind: 'provider_execution',
     outcomeKind: 'uncertain_write',
     outcomeDetail: 'provider_refused_envelope',
-    recoveryAction: 'settle',
+    recoveryAction: 'reconcile_then_decide',
     businessCall: 1,
     mutating: 1,
-    requiresReconciliation: 0,
+    requiresReconciliation: 1,
     physicalCrossingCount: 1,
   }], identity);
   const projected = projectHostNoProgressAttempt({

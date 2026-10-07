@@ -98,6 +98,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     const id = presentation.approvalId;
     if (presentation.kind !== 'approval' || !id) return presentation.text;
     const filler = (presentation.text.startsWith('Approval required for ') && presentation.text.endsWith(`. Review ${id} to continue.`))
+      || (presentation.text.startsWith('Can I go ahead with ') && presentation.text.endsWith('? Say yes, or tell me what to change.'))
       || (/^\d+ approvals are waiting, starting with /.test(presentation.text)
         && presentation.text.endsWith(`(${id}). Approve or reject each and I'll continue.`));
     return filler ? approvalAsks.get(id) || presentation.text : presentation.text;

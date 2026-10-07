@@ -285,12 +285,7 @@ function outcome(
     evidence,
     ...(providerStatus !== undefined ? { providerStatus } : {}),
     ...(detail ? { detail: detail.replace(/\s+/g, ' ').trim().slice(0, 160) } : {}),
-    // An answered refusal is an uncertain write the model can read back, so
-    // nothing automatic happens (no replay, no reconciliation stop): the
-    // directive settles and the model verifies the target state in words.
-    directive: detail === 'provider_refused_envelope'
-      ? { ...DIRECTIVES[kind], action: 'settle', requiresReconciliation: false }
-      : DIRECTIVES[kind],
+    directive: DIRECTIVES[kind],
   };
 }
 
@@ -351,27 +346,36 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
   const rejectedAtProviderLayer = signals.providerRejectedBeforeEffect === true;
 
   // A mutation whose fate we cannot observe outranks every other reading: the
-  // one thing worse than failing is doing it twice.
+  // one thing worse than failing is doing it twice. The dark is a dropped
+  // acknowledgement (a thrown call, a timeout) or a server-side failure
+  // or a request-level status, where the request may have landed in part
+  // before the answer (a 400 can name a created id).
   if (
     signals.mutating
     && (signals.acknowledged === false
-      || signals.envelopeSuccessful === false
       || (typeof signals.httpStatus === 'number' && signals.httpStatus >= 400))
     && signals.preDispatch !== true
     && !rejectedAtProviderLayer
   ) {
-    // A provider that ANSWERED with a structured refusal (its own envelope says
-    // "not successful" on a delivered transport) is still an uncertain write:
-    // its bytes prove no commit and earn no replay. But it left nothing in the
-    // dark the way a dropped acknowledgement does — the target's state can be
-    // read — so the host keeps the turn going and the model verifies instead
-    // of parking the owner on a reconciliation block (live 2026-10-07: a Slack
-    // reminder already gone answered `not_found`; the turn ended blocked with
-    // machine text where it used to end in words after a readback).
-    const answeredWithRefusal = signals.envelopeSuccessful === false
-      && signals.acknowledged !== false
-      && (signals.httpStatus === undefined || (signals.httpStatus >= 200 && signals.httpStatus < 300));
-    return outcome('uncertain_write', 'nominal', answeredWithRefusal ? 'provider_refused_envelope' : 'unacknowledged_mutation', signals.httpStatus);
+    return outcome('uncertain_write', 'nominal', 'unacknowledged_mutation', signals.httpStatus);
+  }
+  // A provider that ANSWERED the write with a structured refusal in its own
+  // envelope ("not successful" on a delivered 2xx) is still an uncertain
+  // write — its bytes prove no commit and earn no replay — but it left
+  // nothing in the dark: the target can be read, so the host keeps the turn
+  // going and the model verifies instead of parking the owner on a
+  // reconciliation block (live 2026-10-07: a Slack reminder already gone
+  // answered `not_found`; the turn ended blocked with machine text where it
+  // used to end in words after a readback).
+  if (
+    signals.mutating
+    && signals.envelopeSuccessful === false
+    && signals.acknowledged !== false
+    && signals.preDispatch !== true
+    && !rejectedAtProviderLayer
+    && (signals.httpStatus === undefined || (signals.httpStatus >= 200 && signals.httpStatus < 300))
+  ) {
+    return outcome('uncertain_write', 'nominal', 'provider_refused_envelope', signals.httpStatus);
   }
 
   // A real contradiction is different from an inspection bound. For a write,
@@ -479,9 +483,11 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
   return outcome('unknown', 'text', signals.text ? 'unclassified' : undefined);
 }
 
-/** The provider answered the write with its own refusal envelope: the write
- * stays uncertain (no replay authority), but the turn need not stop for
- * reconciliation — the model can read the target and answer in words. */
+/** The provider answered the write with its own refusal envelope. The write
+ * keeps the uncertain write's own directive in the ledger (no replay, owed
+ * reconciliation), because envelope bytes can arrive through any carrier;
+ * the TURN need not stop for it — the host, checkpoint, projection and
+ * audit read this detail and let the model read the target and answer. */
 export function providerAnsweredWithRefusal(outcome: AttemptOutcome): boolean {
   return outcome.kind === 'uncertain_write' && outcome.detail === 'provider_refused_envelope';
 }

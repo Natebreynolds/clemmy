@@ -45,8 +45,7 @@ test('a mutation the provider answered with its own refusal stays uncertain with
   assert.equal(answered.kind, 'uncertain_write');
   assert.equal(answered.detail, 'provider_refused_envelope');
   assert.equal(answered.directive.retrySameCandidate, false, 'provider bytes never earn a replay');
-  assert.equal(answered.directive.requiresReconciliation, false, 'an answered refusal is read back, never a reconciliation stop');
-  assert.equal(answered.directive.action, 'settle');
+  assert.equal(answered.directive.requiresReconciliation, true, 'the ledger still owes reconciliation; the turn readers key on the detail');
   assert.equal(classifyAttemptOutcome({ mutating: true, acknowledged: false }).directive.requiresReconciliation, true, 'the dark still stops the turn');
   assert.equal(providerAnsweredWithRefusal(answered), true);
   const noStatus = classifyAttemptOutcome({ mutating: true, envelopeSuccessful: false });
@@ -56,6 +55,8 @@ test('a mutation the provider answered with its own refusal stays uncertain with
   assert.equal(providerAnsweredWithRefusal(dropped), false);
   const serverError = classifyAttemptOutcome({ mutating: true, httpStatus: 502, envelopeSuccessful: false });
   assert.equal(serverError.detail, 'unacknowledged_mutation', 'a failed transport is the dark, not an answer');
+  const rejected = classifyAttemptOutcome({ mutating: true, httpStatus: 404, envelopeSuccessful: false });
+  assert.equal(rejected.detail, 'unacknowledged_mutation', 'a request-level status on a mutation can follow a partial commit: the dark');
   const proven = classifyAttemptOutcome({ mutating: true, providerRejectedBeforeEffect: true });
   assert.equal(providerAnsweredWithRefusal(proven), false, 'a trusted pre-effect proof is a different, stronger reading');
 });

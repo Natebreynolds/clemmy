@@ -365,8 +365,26 @@ export function externalWriteTerminalForAttemptOutcome(
     return 'external_write_succeeded';
   }
   if (physicalOutcome === 'not_started') return 'external_write_failed';
-  // Only settled trusted adapter proof can close a dispatched mutation as
-  // failed. HTTP status and generic unsuccessful envelopes remain uncertain.
+  // A provider that answered with a definitive request-level status
+  // (400/401/403/404/405/422/501) refused the exact request at its own layer:
+  // nothing landed, by the provider's own verdict. This is main's 2026-10-06
+  // design, live-proven on a Slack delete already gone; dropping it made
+  // every later turn read "an irreversible write that hasn't been
+  // reconciled" over an answered refusal. The classifier's status is
+  // machine-structured; a durable transport may carry it as a decimal string.
+  const rawStatus = outcome.providerStatus;
+  const status = typeof rawStatus === 'number'
+    ? rawStatus
+    : typeof rawStatus === 'string' && /^\d{3}$/.test(rawStatus.trim())
+      ? Number(rawStatus.trim())
+      : Number.NaN;
+  if (
+    (physicalOutcome === 'returned' || physicalOutcome === 'threw')
+    && outcome.evidence === 'structured'
+    && [400, 401, 403, 404, 405, 422, 501].includes(status)
+  ) return 'external_write_failed';
+  // Otherwise only settled trusted adapter proof can close a dispatched
+  // mutation as failed; a generic unsuccessful envelope stays uncertain.
   if (
     physicalOutcome === 'returned'
     && outcome.kind === 'invalid_arguments'

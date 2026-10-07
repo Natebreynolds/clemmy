@@ -117,6 +117,19 @@ function providerAnsweredRefusal(row: SettlementRow): boolean {
     && row.outcome_detail === 'provider_rejected_before_effect';
 }
 
+/** A provider that answered the write with its own refusal envelope: the
+ * write stays uncertain in the ledger (no replay, no success), but the
+ * attempt was answered and the model read the target back, so the audit
+ * owes no reconciliation stop for it (live 2026-10-07: a Slack delete
+ * answered `not_found`, read back and explained, still ended "1 irreversible
+ * external write(s) require reconciliation"). */
+export function answeredRefusalSettlement(row: Pick<SettlementRow, 'mutating' | 'execution_kind' | 'outcome_kind' | 'outcome_detail'>): boolean {
+  return row.mutating === 1
+    && row.execution_kind === 'provider_execution'
+    && row.outcome_kind === 'uncertain_write'
+    && row.outcome_detail === 'provider_refused_envelope';
+}
+
 function boundedReason(error: unknown): string {
   return String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 240);
 }
@@ -640,8 +653,24 @@ export function auditAcceptedSourceSettlementTruth(input: {
     const answeredRefusals = failed.filter((row) => (
       providerAnsweredRefusal(row) && failedWriteCallIds.has(row.logical_tool_call_id)
     ));
-    const answeredRefusalCallIds = new Set(answeredRefusals.map((row) => row.logical_tool_call_id));
-    const uncertainSettlements = failed.filter((row) => row.outcome_kind === 'uncertain_write');
+    const answeredRefusalCallIds = new Set([
+      ...answeredRefusals.map((row) => row.logical_tool_call_id),
+      ...failed.filter(answeredRefusalSettlement).map((row) => row.logical_tool_call_id),
+    ]);
+    // A REPAIRED WRITE IS A RECOVERED WRITE, for an uncertain attempt too,
+    // when the host classified the shape repairable or exact-artifact
+    // reconciled and a LATER attempt of the same shape against the same
+    // target succeeded: the reconcile port verified the one artifact, which
+    // is the independent target-state evidence the uncertainty called for
+    // (host-v1 exact-artifact recovery, pinned; the batch's wider
+    // "uncertain" reading had left the corrected call's turn blocked).
+    const repairedByLaterShape = (row: SettlementRow): boolean => {
+      const attempted = reversibleWrites.get(row.logical_tool_call_id);
+      return Boolean(attempted && repairedReversibleWrites.some((done) =>
+        done.shapeTargetKey === attempted.shapeTargetKey && done.seq > attempted.seq));
+    };
+    const uncertainSettlements = failed.filter((row) => row.outcome_kind === 'uncertain_write'
+      && !answeredRefusalSettlement(row) && !repairedByLaterShape(row));
     // Logical ambiguity clears only when the exact reservation has a durable
     // terminal. Reversibility means the host can repair after readback; it does
     // not prove whether the original effect happened.
@@ -653,7 +682,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
       // namespace or reversibility. Only the exact reservation's terminal
       // reconciliation may discharge its ambiguity.
       if (row.outcome_kind === 'uncertain_write') {
-        return !resolvedWriteCallIds.has(row.logical_tool_call_id);
+        return !answeredRefusalSettlement(row) && !repairedByLaterShape(row) && !resolvedWriteCallIds.has(row.logical_tool_call_id);
       }
       // A REFUSAL IS NOT A FAILED EFFECT. `refused_pre_dispatch` means the
       // harness blocked the call before it crossed the boundary: no request was
@@ -725,7 +754,10 @@ export function auditAcceptedSourceSettlementTruth(input: {
       missingHostExternalWriteProjections: missingHostExternalWriteProjections.length,
       uncertainWrites: writeEvidence.uncertain.length,
       blockingUncertainWrites: Math.max(
-        writeEvidence.uncertain.length,
+        // An orphaned projection of an answered refusal is the ledger's
+        // honest "uncertain, no replay" — it is not a reconciliation stop.
+        writeEvidence.uncertain.filter((event) => !answeredRefusalCallIds.has(writeCallId(event))
+          && !failed.some((row) => row.logical_tool_call_id === writeCallId(event) && repairedByLaterShape(row))).length,
         blockingUncertainSettlements.length,
       ),
       successfulBusinessIdentities: successfulIdentities,

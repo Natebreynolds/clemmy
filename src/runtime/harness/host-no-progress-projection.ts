@@ -1205,8 +1205,7 @@ function settlementConsequence(input: {
   // Live 2026-10-07: a Slack `not_found` on an approved delete ended the turn
   // "its effect must be reconciled" from this very consequence.
   const answeredRefusal = settlement.outcome_kind === 'uncertain_write'
-    && settlement.outcome_detail === 'provider_refused_envelope'
-    && settlement.requires_reconciliation === 0;
+    && settlement.outcome_detail === 'provider_refused_envelope';
   if (answeredRefusal) {
     return createNoProgressConsequence({
       stage: `execution:provider_refused:${providerRefusedRequestIdentity(call)}`,
