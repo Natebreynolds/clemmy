@@ -763,6 +763,19 @@ function signalsFromResult(result: unknown): AttemptSignals {
   return signals;
 }
 
+/**
+ * A returned provider envelope that refused the exact request at the
+ * provider's own layer: a 2xx transport with the provider's "not successful".
+ * The same reading the classifier makes (`rejectedAtProviderLayer`), exposed
+ * so the host can tell the model what that refusal means for a write.
+ */
+export function providerRefusedExactRequest(result: unknown): boolean {
+  const signals = signalsFromResult(result);
+  return typeof signals.httpStatus === 'number'
+    && signals.httpStatus >= 200 && signals.httpStatus < 300
+    && signals.envelopeSuccessful === false;
+}
+
 /** Pull machine-readable facts out of a thrown value — the path that used to
  *  lose the reason entirely by rendering it to prose. */
 function signalsFromThrown(thrown: unknown): AttemptSignals {

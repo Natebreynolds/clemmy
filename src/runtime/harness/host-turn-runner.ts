@@ -110,6 +110,7 @@ import {
 import {
   InvalidArgumentsPreDispatchResult,
   settleAdmittedLogicalCallPreDispatchDisposition,
+  providerRefusedExactRequest,
 } from './attempt-settlement.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
@@ -7329,8 +7330,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       arguments: parsedArguments,
       routedModelId: harnessRunContextStorage.getStore()?.routedModelId,
     });
+    // A write the provider refused at its own layer (2xx + "not successful")
+    // did nothing; the provider's reason is in the result. Said here so the
+    // model reads "not_found" on a delete as the state it is — already gone —
+    // instead of asking the owner to go and check by hand (live 2026-10-06).
+    const refusedWriteNote = !structuredToolOutputs(output)
+      && admittedEffect === 'external_write'
+      && providerRefusedExactRequest(output)
+      ? 'The provider refused this exact request and said why above; nothing was changed. '
+        + 'If it says the target is missing, not found or already gone, that is the state now: say so plainly and finish — '
+        + 'do not ask the owner to check by hand, and do not offer to recreate anything they did not ask for. '
+        + 'Otherwise correct the request once.'
+      : undefined;
+    const steer = [hostSteer, refusedWriteNote].filter(Boolean).join('\n') || undefined;
     return {
-      historyItem: functionResultItem(call.callId, call.name, modelOutput, hostSteer),
+      historyItem: functionResultItem(call.callId, call.name, modelOutput, steer),
       ...(tool ? { tool } : {}),
       output,
       argumentsJson: call.argumentsJson,
