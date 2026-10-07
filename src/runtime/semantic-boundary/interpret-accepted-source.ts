@@ -708,12 +708,33 @@ async function interpretOnce(input: {
 
   let modelResult: TurnSemanticModelResult;
   try {
-    modelResult = await input.port.interpret({
-      purpose: TURN_SEMANTIC_CALL_PURPOSE,
-      host,
-      acceptedText: input.snapshot.acceptedText,
-      recentTurns: input.snapshot.recentTurns,
-    });
+    try {
+      modelResult = await input.port.interpret({
+        purpose: TURN_SEMANTIC_CALL_PURPOSE,
+        host,
+        acceptedText: input.snapshot.acceptedText,
+        recentTurns: input.snapshot.recentTurns,
+      });
+    } catch (error) {
+      // The model answered in the wrong SHAPE (a stray key, a missing one):
+      // the strict output schema refused it before any reading existed, and
+      // the whole turn used to proceed unread — live 2026-10-07, "continue"
+      // in plan mode: `Unrecognized key: "slotAnswersNote"` → unreadable →
+      // the same question re-asked. One repair call with the shape named is
+      // the same door the validator's own repair round uses.
+      if (!outputShapeFailure(error)) throw error;
+      modelResult = await input.port.interpret({
+        purpose: TURN_SEMANTIC_CALL_PURPOSE,
+        host,
+        acceptedText: input.snapshot.acceptedText,
+        recentTurns: input.snapshot.recentTurns,
+        repairHint: JSON.stringify({
+          reason: 'output_shape_rejected',
+          detail: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+          require: 'return exactly the TurnSemanticProposalV1 keys and no others: no notes, comments or extra fields',
+        }),
+      });
+    }
   } catch (error) {
     const record: SemanticInterpretationRecordV1 = {
       purpose: TURN_SEMANTIC_CALL_PURPOSE,
@@ -1379,6 +1400,13 @@ async function interpretOnce(input: {
     payloadHash: admitted.payloadHash,
     contextHash: admitted.contextHash,
   };
+}
+
+/** The structured-output boundary refused the model's answer for its shape
+ * (unknown or missing keys), as opposed to the model being unreachable. */
+function outputShapeFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /failed schema validation|unrecognized key|invalid output type|invalid_type|required/i.test(message);
 }
 
 export async function interpretAcceptedSource(input: {

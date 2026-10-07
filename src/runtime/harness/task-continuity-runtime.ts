@@ -328,6 +328,26 @@ export function _setOpenQuestionReplyClassifierForTests(
  * conversation goes to the brain on the interpreter's own reading. An
  * unreadable reading keeps the reask: that failure is the host's.
  */
+/** Jev reads the reply against the delivered question. This reading precedes
+ * the foreground usage scope: its checked source owns the call; an enclosing
+ * attempt belongs only to the same tuple. Unavailable reads as failed-open. */
+async function readOpenQuestionReplyWithJev(
+  input: { sessionId: string; sourceUserSeq: number },
+  sourceEdge: { deliveredQuestion: string; acceptedReply: string },
+): Promise<Awaited<ReturnType<typeof classifyOpenQuestionReplyWithJev>>> {
+  const classify = openQuestionReplyClassifierForTests ?? classifyOpenQuestionReplyWithJev;
+  const inherited = modelUsageAttributionStorage.getStore();
+  const sameSource = inherited?.sessionId === input.sessionId && inherited.sourceUserSeq === input.sourceUserSeq;
+  return withModelUsageAttribution({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    attemptId: sameSource ? inherited?.attemptId : undefined,
+  }, () => classify(
+    { question: sourceEdge.deliveredQuestion, reply: sourceEdge.acceptedReply },
+    { sessionId: input.sessionId },
+  )).catch(() => ({ kind: null, failedOpen: true }));
+}
+
 export async function classifyUnsettledOpenQuestionReply(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -411,8 +431,21 @@ export async function classifyUnsettledOpenQuestionReply(input: {
       ...(verified ? { completeness: verified.receipt } : { revisionUnavailable: true }),
     };
   } else if (unreadable) {
+    // The quick reading was lost (schema refusal, model failure). The reply
+    // is still the person's words: before paying the revision proposer for a
+    // re-ask, Jev reads whether it is a go-ahead or a question back — both
+    // are the brain's to answer with the question on hold (owner's user,
+    // 2026-10-07: "continue" in plan mode → "I received your reply:
+    // 'continue.' It does not select one of the listed options…"). An
+    // unreadable reply never becomes a bound answer: a Jev 'answers' reading
+    // keeps the checked re-ask path, and Jev unavailable keeps it too.
     route = 'reask';
     recordedReading = { reading: 'interpretation_unavailable' };
+    const reading = await readOpenQuestionReplyWithJev(input, sourceEdge);
+    if (reading.kind && reading.kind !== 'answers' && (reading.confidence ?? 0) >= OPEN_QUESTION_ANSWER_SURE) {
+      route = 'respond';
+      recordedReading = { reading: 'interpretation_unavailable', replyReading: reading.kind, confidence: reading.confidence, partialAnswer: true };
+    }
   } else if (amending || continuing) {
     // The owner gave an instruction, not an answer: it amends or continues
     // the task past the question. A re-ask — even a revised one that
@@ -424,19 +457,7 @@ export async function classifyUnsettledOpenQuestionReply(input: {
     route = 'respond';
     recordedReading = { reading: relation, partialAnswer: true };
   } else if (!sideConversation) {
-    const classify = openQuestionReplyClassifierForTests ?? classifyOpenQuestionReplyWithJev;
-    const inherited = modelUsageAttributionStorage.getStore();
-    const sameSource = inherited?.sessionId === input.sessionId && inherited.sourceUserSeq === input.sourceUserSeq;
-    // This reading precedes the foreground usage scope. Its checked source
-    // owns the call; an enclosing attempt belongs only to the same tuple.
-    const reading: Awaited<ReturnType<typeof classifyOpenQuestionReplyWithJev>> = await withModelUsageAttribution({
-      sessionId: input.sessionId,
-      sourceUserSeq: input.sourceUserSeq,
-      attemptId: sameSource ? inherited?.attemptId : undefined,
-    }, () => classify(
-      { question: sourceEdge.deliveredQuestion, reply: sourceEdge.acceptedReply },
-      { sessionId: input.sessionId },
-    )).catch(() => ({ kind: null, failedOpen: true }));
+    const reading = await readOpenQuestionReplyWithJev(input, sourceEdge);
     // A verbatim reask needs the exact reoffer to exist; without it, reply.
     if (
       reading.kind === 'answers'

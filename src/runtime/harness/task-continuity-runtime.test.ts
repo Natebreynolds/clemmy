@@ -2215,22 +2215,70 @@ test('an unreadable reply cannot become a choice-classifier answer; the brain re
   const reply = accepted(sessionId, 'which channel?');
   seedSemanticReading(sessionId, reply.seq, 'invalid', AMBIGUOUS_READING);
   let asked = 0;
+  let proposals = 0;
   runtime._setOpenQuestionReplyClassifierForTests(async () => {
     asked += 1;
     return { kind: 'asks', confidence: 0.99, failedOpen: false };
   });
-  runtime._setClarificationRevisionProposerForTests(async () => ({ status: 'unavailable', stage: 'proposal', reason: 'interpretation_unavailable' }));
+  runtime._setClarificationRevisionProposerForTests(async () => { proposals += 1; return { status: 'unavailable', stage: 'proposal', reason: 'interpretation_unavailable' }; });
   try {
     const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
     assert.equal(route?.route, 'respond');
     assert.equal(route?.partialAnswer, true);
-    assert.equal(asked, 0, 'the choice classifier is never consulted for a reading that was not admitted');
+    // Jev reads the unreadable reply (a question back, a go-ahead) so the
+    // brain answers it; it never binds an answer, and the revision proposer
+    // is not paid for a re-ask the brain will not deliver (2026-10-07).
+    assert.equal(asked, 1, 'Jev reads the reply once');
+    assert.equal(proposals, 0, 'no revision proposal for a reply the brain answers');
     const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: 'which channel?' }, reply.seq,
       { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true } });
     assert.ok((enriched.semanticTaskInput ?? '').startsWith('[task-continuation-reply:v1]\n'));
   } finally {
     runtime._setOpenQuestionReplyClassifierForTests(null);
     runtime._setClarificationRevisionProposerForTests(null);
+  }
+});
+
+test('an unreadable go-ahead reaches the brain; an unreadable attempted answer keeps the checked re-ask path', async () => {
+  // Owner's user, 2026-10-07, plan mode: the interpreter's output failed
+  // schema validation on a stray key, "continue" became unreadable, and the
+  // revision proposer re-asked: "I received your reply: 'continue.' It does
+  // not select one of the listed options…".
+  // A go-ahead or a question back goes to the brain without paying the
+  // proposer; an attempted answer (or a reply Jev could not read) keeps the
+  // checked re-ask path, where the proposer is consulted and Jev's reading
+  // never binds an answer.
+  for (const [label, jev, expectRoute, expectProposals] of [
+    ['go-ahead', { kind: 'affirms', confidence: 0.95, failedOpen: false }, 'respond', 0],
+    ['question back', { kind: 'asks', confidence: 0.95, failedOpen: false }, 'respond', 0],
+    ['attempted answer', { kind: 'answers', confidence: 0.95, failedOpen: false }, null, 1],
+    ['jev unavailable', { kind: null, failedOpen: true }, null, 1],
+  ] as const) {
+    const sessionId = `continuity-unreadable-${label.replace(/\s+/g, '-')}`;
+    heldDraft(sessionId);
+    const reply = accepted(sessionId, 'continue');
+    seedSemanticReading(sessionId, reply.seq, 'invalid', AMBIGUOUS_READING);
+    let proposals = 0;
+    runtime._setOpenQuestionReplyClassifierForTests(async () => jev as never);
+    runtime._setClarificationRevisionProposerForTests(async () => {
+      proposals += 1;
+      return { status: 'proposed', revision: { version: 1, anchorPolicy: 'question_only_v1', acknowledgment: 'Noted.', question: HELD_DRAFT_QUESTION, options: [] } } as never;
+    });
+    try {
+      const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+      if (expectRoute) assert.equal(route?.route, expectRoute, label);
+      else assert.notEqual(route?.route, 'settled', `${label}: an unreadable reply never settles the question`);
+      assert.equal(proposals, expectProposals, label);
+      if (expectRoute === 'respond') {
+        assert.equal(route?.partialAnswer, true, label);
+        const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: 'continue' }, reply.seq,
+          { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true } });
+        assert.ok((enriched.semanticTaskInput ?? '').startsWith('[task-continuation-reply:v1]\n'), label);
+      }
+    } finally {
+      runtime._setOpenQuestionReplyClassifierForTests(null);
+      runtime._setClarificationRevisionProposerForTests(null);
+    }
   }
 });
 

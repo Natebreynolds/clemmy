@@ -214,6 +214,53 @@ test('model failure keeps an open question instead of regex fallback', async () 
   assert.equal(result.record.validationOutcome, 'model_failed');
 });
 
+test('a reading the output schema refused for its shape is asked for once more with the shape named, not dropped', async () => {
+  // Live 2026-10-07 (plan mode, "continue"): the model added a stray
+  // `slotAnswersNote` key, the strict output schema refused it, the reply
+  // went unread and the same question was re-asked.
+  resetEventLog();
+  const sessionId = 'sess-semantic-shape-repair';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'continue',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    catalog: constructCatalog(),
+    resumableGoals: [],
+    openQuestions: [],
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const calls: Array<{ purpose: string; repairHint?: string }> = [];
+  const healthy = fakePort([]);
+  const flaky: TurnSemanticModelPort = {
+    ...healthy,
+    async interpret(call) {
+      calls.push({ purpose: call.purpose, ...(call.repairHint ? { repairHint: call.repairHint } : {}) });
+      if (calls.length === 1) throw new Error('Invalid output type: final assistant output failed schema validation at "(root)" (Unrecognized key: "slotAnswersNote").');
+      return healthy.interpret(call);
+    },
+  };
+  const result = await interpretAcceptedSource({ snapshot, authority: authority(host), port: flaky, turn: 1 });
+  assert.notEqual(result.record.validationOutcome, 'model_failed', JSON.stringify(result.record.raw).slice(0, 200));
+  // Call 1 refused for shape, call 2 names the shape; any later call is the
+  // validator's own repair round on the admitted reading, not a second retry.
+  assert.ok(calls.length >= 2, 'one shape-repair call follows the refusal');
+  assert.equal(calls[0]!.repairHint, undefined);
+  assert.match(calls[1]!.repairHint ?? '', /output_shape_rejected/);
+  assert.match(calls[1]!.repairHint ?? '', /slotAnswersNote/);
+  // An unreachable model is still one failure, not a retry.
+  resetEventLog();
+  createSession({ id: `${sessionId}-down`, kind: 'chat' });
+  const down = { ...snapshot, sessionId: `${sessionId}-down` };
+  let downCalls = 0;
+  const unreachable: TurnSemanticModelPort = { ...healthy, async interpret() { downCalls += 1; throw new Error('model down'); } };
+  const failed = await interpretAcceptedSource({ snapshot: down, authority: authority(buildTurnSemanticHostViewV1(down)), port: unreachable, turn: 1 });
+  assert.equal(failed.record.validationOutcome, 'model_failed');
+  assert.equal(downCalls, 1);
+});
+
 test('concurrent interpretation produces one model call', async () => {
   resetEventLog();
   const sessionId = 'sess-semantic-3';

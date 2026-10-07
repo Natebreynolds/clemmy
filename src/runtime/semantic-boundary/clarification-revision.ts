@@ -139,6 +139,7 @@ export const CLARIFICATION_REVISION_SYSTEM = [
   'Use unresolved for a missing required answer, and binding_needed for an understood answer the host still cannot bind safely. Preserve each in the residual question with an exact residualQuote.',
   'Do not call answered or amended decisions unresolved merely to repeat them. A supplied answer that still needs binding may be acknowledged as understood without being called settled.',
   'Acknowledge what was supplied, then ask only for remaining required decisions or a focused binding detail. Never imply that work started, was approved, or will now run.',
+  'Write the acknowledgment and the question as Clem speaking plainly to the person, one short sentence each: never "I received your reply", never a recital of what was not provided, never bureaucratic framing.',
   'Do not invent new required decisions or effects, waive an existing requirement, consume the pending question, or grant execution assent.',
   'Options must be empty for free text, or exactly the unchanged delivered options in their original order. Never invent options or retain options that no longer fit the residual question.',
   'When all answers appear supplied but are unbindable, ask an honest focused binding question, rather than repeat the entire prior question.',
