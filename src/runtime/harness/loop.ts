@@ -14463,6 +14463,30 @@ async function runConversationFromResumeCore(opts: {
     makeRunner: opts.makeRunner,
     runRunner: opts.runRunner,
   });
+  // NO PROGRESS IS A CONVERSATION ON THE RESUME LANE TOO. A card approved in
+  // words resumes the parked call here; when the governor then exhausts the
+  // turn (live 2026-10-06: the resumed delete had a recorded not_found and the
+  // owner got "This call has a recorded outcome… Stopped at:
+  // execution:invalid_arguments"), the owner reads the same host sentence the
+  // fresh lane stopped showing on 2026-09-09. Same one-request, tool-free
+  // check-in, same accepted source, asked at most once.
+  if (activeSourceUserSeq && firstResult.status === 'blocked'
+    && firstResult.blockedReason === 'control_no_progress_exhausted') {
+    const resumedSourceUserSeq = activeSourceUserSeq;
+    firstResult = await modelCheckInForExhaustedTurn(firstResult, {
+      sessionId: opts.sessionId,
+      sourceUserSeq: resumedSourceUserSeq,
+      run: (steer) => runTurn({
+        agent: opts.agent, sessionId: opts.sessionId,
+        input: acceptedRequestText(opts.sessionId, resumedSourceUserSeq) ?? '',
+        sourceUserSeq: resumedSourceUserSeq, runAttemptId: opts.runAttemptId,
+        internalContinuation: true, suppressMemoryCapture: true,
+        continuationSteer: steer, hostOwnedContinuation: true as const,
+        maxTurns: 1, toolCallsPerTurn: 1, hostConversationalCheckIn: true as const,
+        turnEngine: opts.turnEngine, makeRunner: opts.makeRunner, runRunner: opts.runRunner,
+      }),
+    });
+  }
   lastTurn = firstResult.turn;
 
   if (activeSourceUserSeq) {
