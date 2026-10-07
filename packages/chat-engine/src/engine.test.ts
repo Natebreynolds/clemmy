@@ -706,3 +706,52 @@ test('a user row shows what was typed, never the attachment contents folded in f
   const users = messages.filter((m) => m.role === 'user').map((m) => m.text);
   assert.deepEqual(users, ['What does the file say?', 'plain, no attachment']);
 });
+
+test('the card\'s question asked back is drawn on the card, not as a new bubble', async () => {
+  // Owner-approved design, 2026-10-07: a written reply Clem could not read as
+  // a decision comes back as her one line ON the waiting card, with the
+  // owner's words and the same two answers. The placeholder turn that would
+  // have carried the question as a bubble draws nothing.
+  const transport = new FakeTransport();
+  const engine = new ChatEngine({
+    transport,
+    api: {
+      send: async () => ({ sessionId: 's-ask-back', accepted: true }),
+      loadSession: async () => ({ events: [], latestSeq: 0 }),
+    },
+  });
+  await engine.send('Now delete that reminder.');
+  await wait(10);
+  transport.live!.onEvent(ev(2, 'approval_requested', {
+    approvalId: 'apr-askback',
+    subject: 'Delete Slack reminder',
+    preview: { operation: 'Delete Slack reminder', fields: [{ name: 'reminder', value: 'Rm0C7' }], ask: 'Can I delete the Slack reminder?' },
+  }));
+  await engine.send('Yes, delete it, and the other one too.');
+  await wait(10);
+  const emptyTurns = (messages: readonly { role: string; text: string; approval?: unknown }[]) =>
+    messages.filter((m) => m.role === 'assistant' && !m.text.trim() && !m.approval).length;
+  const placeholdersBefore = emptyTurns(engine.snapshot().messages);
+  transport.live!.onEvent(ev(4, 'awaiting_user_input', {
+    reason: 'approval_confirmation_required',
+    approvalId: 'apr-askback',
+    leaning: 'unread',
+    replyText: 'Yes, delete it, and the other one too.',
+    question: 'Just to be sure — should I delete the Slack reminder?',
+    options: ['Yes', 'No'],
+  }));
+  const snap = engine.snapshot();
+  const card = snap.messages.find((m) => m.approval?.approvalId === 'apr-askback');
+  assert.deepEqual(card?.approval?.confirm, {
+    question: 'Just to be sure — should I delete the Slack reminder?',
+    leaning: 'unread',
+    replyText: 'Yes, delete it, and the other one too.',
+  });
+  assert.equal(card?.approval?.resolution, undefined, 'nothing was decided');
+  assert.ok(!snap.messages.some((m) => m.role === 'assistant' && m.status === 'awaiting-reply'),
+    'no separate question bubble');
+  assert.equal(emptyTurns(snap.messages), placeholdersBefore - 1, 'the turn that carried the question draws nothing');
+  assert.equal(snap.messages.at(-1)?.role, 'user', 'the owner\'s words stay the last thing in the thread');
+  assert.equal(snap.busy, false, 'the composer is free: the owner answers on the card or below');
+  engine.dispose();
+});

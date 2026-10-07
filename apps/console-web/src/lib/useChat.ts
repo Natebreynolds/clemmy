@@ -3,7 +3,7 @@ import { reduceActivity as reduceSharedActivity, reduceLifecycle, type HarnessEv
 import type { LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
 import { boundedModelId, modelDisplayName } from '@clem/chat-engine';
 import { applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
-import type { ApprovalPreview, ApprovalResolution } from '@clem/chat-engine';
+import type { ApprovalConfirm, ApprovalPreview, ApprovalResolution } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -151,6 +151,8 @@ export interface ChatMessage {
     preview?: ApprovalPreview;
     /** How the card was answered; 'changed' means a revised card follows. */
     resolution?: ApprovalResolution;
+    /** The card's question asked back, after a reply that could not be read. */
+    confirm?: ApprovalConfirm;
   };
   taskMode?: TaskMode;
   planArtifactRef?: PlanRevisionRef;
@@ -328,6 +330,37 @@ export function appendLiveApprovalCard(
       },
     },
   ];
+}
+
+/** An `awaiting_user_input` that is the card's own question asked back. */
+export function approvalConfirmFromEvent(d: Record<string, unknown>): { approvalId: string; confirm: ApprovalConfirm } | null {
+  if (d.reason !== 'approval_confirmation_required') return null;
+  const approvalId = typeof d.approvalId === 'string' && d.approvalId.trim() ? d.approvalId : '';
+  const question = typeof d.question === 'string' ? d.question.trim() : '';
+  if (!approvalId || !question) return null;
+  const leaning = d.leaning === 'approves' || d.leaning === 'declines' ? d.leaning : 'unread';
+  const replyText = typeof d.replyText === 'string' && d.replyText.trim() ? d.replyText.trim() : undefined;
+  return { approvalId, confirm: { question, leaning, ...(replyText ? { replyText } : {}) } };
+}
+
+/** Draw the asked-back question on its card; the placeholder turn that would
+ * have carried it as a bubble is dropped when it has nothing of its own. */
+export function attachApprovalConfirm(
+  messages: readonly ChatMessage[],
+  approvalId: string,
+  confirm: ApprovalConfirm,
+  placeholderId?: string,
+): ChatMessage[] {
+  const hasCard = messages.some((m) => m.approval?.approvalId === approvalId);
+  if (!hasCard) {
+    // No card on this surface: the question stands on its own, as before.
+    return messages.map((m) => (m.id === placeholderId
+      ? { ...m, text: confirm.question, status: 'awaiting-reply' as const, progress: undefined, answerDraft: undefined }
+      : m));
+  }
+  return messages
+    .filter((m) => !(m.id === placeholderId && !m.text.trim() && !m.approval && !m.planArtifactRef))
+    .map((m) => (m.approval?.approvalId === approvalId ? { ...m, approval: { ...m.approval, confirm } } : m));
 }
 
 let idSeq = 0;
@@ -1622,8 +1655,16 @@ export function useChat(options?: UseChatOptions) {
     } else if (ev.type === 'conversation_limit_exceeded') {
       patch(assistantId, { status: 'stopped', progress: undefined });
     } else if (ev.type === 'awaiting_user_input') {
-      const options = readQuestionOptions(d.options);
-      patch(assistantId, { text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined, answerDraft: undefined, ...(options.length ? { options } : {}) });
+      const confirm = approvalConfirmFromEvent(d);
+      if (confirm) {
+        // The card's own question, asked back: it is drawn ON the waiting
+        // card (the owner's words, Clem's line, the same two answers), and
+        // the turn that would have carried it as a new bubble draws nothing.
+        setMessages((prev) => attachApprovalConfirm(prev, confirm.approvalId, confirm.confirm, assistantId));
+      } else {
+        const options = readQuestionOptions(d.options);
+        patch(assistantId, { text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined, answerDraft: undefined, ...(options.length ? { options } : {}) });
+      }
     } else if (ev.type === 'approval_requested') {
       setMessages((prev) => appendLiveApprovalCard(prev, ev));
     } else if (ev.type === 'conversation_check_in') {
@@ -2169,6 +2210,12 @@ export function inboxAdditionsFromEvents(
     } else if (ev.type === 'awaiting_user_input') {
       const q = typeof d.question === 'string' ? d.question : '';
       if (!q) continue;
+      const confirm = approvalConfirmFromEvent(d);
+      const card = confirm ? additions.find((m) => m.approval?.approvalId === confirm.approvalId) : undefined;
+      if (confirm && card) {
+        card.approval = { ...card.approval!, confirm: confirm.confirm };
+        continue;
+      }
       const taskRef = claimDelivery(ev);
       const options = readQuestionOptions(d.options);
       if (taskRef !== null) additions.push({

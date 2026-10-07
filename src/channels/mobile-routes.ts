@@ -4236,7 +4236,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
                 sourceData: { source: 'mobile_approval_confirm', approvalId: confirm.approvalId, confirm: confirm.leaning },
                 commit: (source) => {
                   appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
-                    data: { sourceUserSeq: source.seq, reason: 'approval_confirmation_required', question: confirm.question, options: ['Yes', 'No'] } });
+                    data: { sourceUserSeq: source.seq, reason: 'approval_confirmation_required', question: confirm.question, options: ['Yes', 'No'],
+                      approvalId: confirm.approvalId, leaning: confirm.leaning, replyText: message } });
                   const identity = mobileApprovalIdentity(source);
                   commitTurnOutcome({
                     version: 2, id: turnOutcomeId(identity), identity,

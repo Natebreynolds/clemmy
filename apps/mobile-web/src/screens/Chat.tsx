@@ -873,6 +873,17 @@ function MessageRow({
           </dl>
         ) : null}
         {message.approval.preview?.items && <ApprovalReview preview={message.approval.preview} />}
+        {message.approval.confirm && !approvalDecided ? (
+          // Clem asked the card's own question back, ON the card: the owner's
+          // words, her one line, then the same answers (owner-approved
+          // design, 2026-10-07). A new bubble for it read as a new turn.
+          <div class="approval-confirm">
+            {message.approval.confirm.replyText ? (
+              <div class="approval-confirm-you"><span class="approval-confirm-mark" aria-hidden="true">You</span><span>You wrote: <q>{message.approval.confirm.replyText}</q></span></div>
+            ) : null}
+            <div class="approval-confirm-clem"><span class="approval-confirm-mark is-clem" aria-hidden="true">C</span><span>{message.approval.confirm.question}</span></div>
+          </div>
+        ) : null}
         {approvalId && !approvalDecided && ask ? (
           <div class="answer-choices" role="group" aria-label="Your answer">
             <button type="button" class="answer-choice" disabled={approvalActing !== null}
@@ -883,7 +894,7 @@ function MessageRow({
               onClick={() => onApprovalAction(approvalId, 'reject')}>
               {APPROVAL_ANSWER_WORDS.reject.replace(/\.$/, '')}
             </button>
-            <div class="approval-check-hint">Or reply below to change it.</div>
+            <div class="approval-check-hint">{message.approval.confirm ? 'Or say it another way below. Nothing runs until you answer.' : 'Or reply below to change it.'}</div>
           </div>
         ) : approvalId && !approvalDecided ? (
           <div class="plan-actions">

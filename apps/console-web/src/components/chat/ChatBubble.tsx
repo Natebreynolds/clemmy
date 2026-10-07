@@ -6,6 +6,7 @@ import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
 import { answerDraftStatus, hiddenCardDecision, renderMarkdown, APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
+import type { ApprovalConfirm, ApprovalResolution } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -53,13 +54,6 @@ function ApprovalCheckNote({ check }: {
         : 'Couldn’t check this against your standing rules.'}
     </p>
   );
-}
-
-function approvalResolutionText(resolution: 'approved' | 'declined' | 'changed' | 'expired'): string {
-  return resolution === 'changed'
-    ? 'You asked for a change — the revised version is below. Nothing was sent from this one.'
-    : resolution === 'declined' ? 'Declined — nothing was sent.'
-      : resolution === 'expired' ? 'Expired without an answer — it did not run.' : 'Approved.';
 }
 
 /** "markdown_text" → "Markdown text": an argument name as a label. */
@@ -179,11 +173,13 @@ function AnswerChoices({ options, onAnswer }: { options: string[]; onAnswer: (te
 /** An approval card's answers, in the question card's style: one tap, the
  *  answer latches, and the owner's bubble reads the same words. Writing a
  *  change below stays open. */
-function ApprovalAnswers({ chosen, disabled, onAnswer, onLater }: {
+function ApprovalAnswers({ chosen, disabled, onAnswer, onLater, confirming }: {
   chosen: 'approve' | 'reject' | null;
   disabled: boolean;
   onAnswer: (decision: 'approve' | 'reject') => void;
   onLater: () => void;
+  /** The card's question was asked back: the answers settle THAT question. */
+  confirming?: boolean;
 }) {
   const answer = (pressed: boolean) => cn(
     'rounded-md border px-3.5 py-2 text-left text-small font-semibold transition-colors duration-fast active:scale-press',
@@ -199,12 +195,58 @@ function ApprovalAnswers({ chosen, disabled, onAnswer, onLater }: {
         <button type="button" className={answer(chosen === 'reject')} aria-pressed={chosen === 'reject'} disabled={disabled} onClick={() => onAnswer('reject')}>
           {APPROVAL_ANSWER_WORDS.reject.replace(/\.$/, '')}
         </button>
-        <button type="button" className={answer(false)} disabled={disabled} onClick={onLater}>
-          Not now
-        </button>
+        {!confirming && (
+          <button type="button" className={answer(false)} disabled={disabled} onClick={onLater}>
+            Not now
+          </button>
+        )}
       </div>
-      <p className="text-caption text-muted">Or reply below to change it.</p>
+      <p className="text-caption text-muted">
+        {confirming ? 'Or say it another way below. Nothing runs until you answer.' : 'Or reply below to change it.'}
+      </p>
     </div>
+  );
+}
+
+/** Clem asked the card's own question back, ON the card: the owner's words,
+ *  her one line, then the same answers (owner-approved design, 2026-10-07).
+ *  A new bubble for it read as a new turn and lost the card. */
+function ApprovalConfirmStrip({ confirm }: { confirm: ApprovalConfirm }) {
+  return (
+    <div className="mt-3 flex flex-col gap-2.5 border-t border-border pt-3">
+      {confirm.replyText && (
+        <div className="flex items-start gap-2.5 text-small text-muted">
+          <span aria-hidden className="mt-0.5 inline-flex h-5 w-5 flex-none items-center justify-center rounded-full bg-hover text-[10px] font-bold text-muted">You</span>
+          <span>You wrote: <span className="text-fg">“{confirm.replyText}”</span></span>
+        </div>
+      )}
+      <div className="flex items-start gap-2.5">
+        <span aria-hidden className="mt-0.5 inline-flex h-5 w-5 flex-none items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-fg">C</span>
+        <p className="text-body font-medium text-fg">{confirm.question}</p>
+      </div>
+    </div>
+  );
+}
+
+/** How a card ended, as one pill and nothing else: the ask above it greys,
+ *  the follow-up turn says what it meant. */
+function ApprovalOutcomePill({ resolution }: { resolution: ApprovalResolution }) {
+  const tone = resolution === 'approved' ? 'bg-success-tint text-success'
+    : resolution === 'changed' ? 'bg-info-tint text-info'
+      : resolution === 'expired' ? 'bg-warning-tint text-warning'
+        : 'bg-subtle text-muted';
+  const label = resolution === 'approved' ? 'Done · you said yes'
+    : resolution === 'declined' ? 'Skipped · nothing ran'
+      : resolution === 'changed' ? 'Changed · the revised version is below'
+        : 'Expired · it did not run';
+  return (
+    <p className="mt-2.5 flex flex-wrap items-center gap-2 text-caption" role="status">
+      <span className={cn('inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 font-semibold', tone)}>
+        {resolution === 'approved' ? <Check className="h-3 w-3" aria-hidden /> : resolution === 'declined' ? <X className="h-3 w-3" aria-hidden /> : null}
+        {label}
+      </span>
+      {resolution === 'changed' && <span className="text-muted">Nothing was sent from this one.</span>}
+    </p>
   );
 }
 
@@ -553,6 +595,9 @@ export function ChatBubble({
             )}
             {!pendingAction && message.approval?.preview?.items && <ApprovalReview preview={message.approval.preview} />}
             {pendingAction && !voicedPendingAction && <PayloadPreview value={pendingAction.payload} />}
+            {message.approval?.confirm && !resolved && !message.approval.resolution && (
+              <ApprovalConfirmStrip confirm={message.approval.confirm} />
+            )}
             {canOfferStandingSendTrust(pendingAction) && !resolved && (
               <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-caption text-muted">
                 <input
@@ -571,9 +616,7 @@ export function ChatBubble({
             ) : message.approval?.resolution && (!pendingAction || message.approval.resolution === 'expired') ? (
               // Answered on the host's record, including by a written reply. An
               // expired card has nothing left to execute, queued action or not.
-              <p className="mt-2.5 text-caption text-muted" role="status">
-                {approvalResolutionText(message.approval.resolution)}
-              </p>
+              <ApprovalOutcomePill resolution={message.approval.resolution} />
             ) : setAside && !resolved ? (
               <p className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-muted" role="status">
                 Left for later — it’s waiting in Needs you.
@@ -587,6 +630,7 @@ export function ChatBubble({
                 disabled={resolved || decisionBusy !== null}
                 onAnswer={(decision) => { void resolvePlainDecision(decision); }}
                 onLater={() => { void setAsideForLater(); }}
+                confirming={Boolean(message.approval?.confirm)}
               />
             ) : (
             <div className="mt-2.5 flex items-center gap-2">

@@ -54,7 +54,7 @@ test('suggested answers stop being buttons once anything follows the question', 
 test('an expired card says so instead of offering its controls, queued action or not', () => {
   // The host marks a card expired when nobody answered in its lifetime; a
   // queued action's Execute button must not come back on it.
-  assert.match(SOURCE, /resolution === 'expired' \? 'Expired without an answer — it did not run\.'/);
+  assert.match(SOURCE, /'Expired · it did not run'/);
   assert.match(SOURCE, /message\.approval\?\.resolution && \(!pendingAction \|\| message\.approval\.resolution === 'expired'\) \?/);
 });
 
@@ -65,4 +65,16 @@ test('a confirmed change in another app shows while the turn is still live', () 
   assert.match(RECEIPT, /<OutsideWorkCards activity=\{activity\}>/, 'the finished receipt keeps the cards in the same place');
   assert.match(RECEIPT, /const outside = outsideWorkCards\(activity\);\s*const workflows = workflowCards\(activity\);\s*if \(outside\.length === 0 && workflows\.length === 0 && !children\) return null;/,
     'only writes the provider confirmed become cards');
+});
+
+test('the card\'s question asked back is drawn on the card with the owner\'s words, and ends as one pill', () => {
+  // Owner-approved design, 2026-10-07.
+  assert.match(SOURCE, /function ApprovalConfirmStrip/);
+  assert.match(SOURCE, /You wrote: /);
+  assert.match(SOURCE, /message\.approval\?\.confirm && !resolved && !message\.approval\.resolution && \(/);
+  assert.match(SOURCE, /Or say it another way below\. Nothing runs until you answer\./);
+  assert.match(SOURCE, /function ApprovalOutcomePill/);
+  assert.match(SOURCE, /Done · you said yes/);
+  assert.match(SOURCE, /Skipped · nothing ran/);
+  assert.doesNotMatch(SOURCE, /function approvalResolutionText/, 'the old resolution sentence is gone');
 });

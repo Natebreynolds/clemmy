@@ -10,6 +10,8 @@ import {
   bindAcceptedChatSource,
   appendLiveApprovalCard,
   applyApprovalResolution,
+  approvalConfirmFromEvent,
+  attachApprovalConfirm,
   applyBridgedWorkflowActivity,
   chatApprovalReply,
   chatDecisionIntent,
@@ -1334,4 +1336,27 @@ test('connection continuation keeps its host identity and setup binding through 
   assert.equal(calls[0]?.[3], 'connection-stable-fixture');
   assert.equal(calls[0]?.[7], 'dep-setup');
   assert.deepEqual(calls[1], calls[0]);
+});
+
+test('the card\'s question asked back lands on its card and drops the empty placeholder turn', () => {
+  const card = appendLiveApprovalCard([], ev('approval_requested', {
+    approvalId: 'apr-askback',
+    subject: 'Delete Slack reminder',
+    preview: { operation: 'Delete Slack reminder', fields: [{ name: 'reminder', value: 'Rm0C7' }], ask: 'Can I delete the Slack reminder?' },
+  }));
+  const placeholder = { id: 'm-placeholder', role: 'assistant' as const, text: '', status: 'thinking' as const };
+  const confirm = approvalConfirmFromEvent({
+    reason: 'approval_confirmation_required', approvalId: 'apr-askback', leaning: 'unread',
+    replyText: 'Yes, delete it, and the other one too.', question: 'Just to be sure — should I delete the Slack reminder?',
+  });
+  assert.ok(confirm);
+  const attached = attachApprovalConfirm([...card, placeholder], confirm!.approvalId, confirm!.confirm, placeholder.id);
+  assert.equal(attached.length, 1, 'the placeholder draws nothing');
+  assert.deepEqual(attached[0].approval?.confirm, confirm!.confirm);
+  // Without a card on this surface the question stands on its own, as before.
+  const alone = attachApprovalConfirm([placeholder], 'apr-elsewhere', confirm!.confirm, placeholder.id);
+  assert.equal(alone[0].text, confirm!.confirm.question);
+  assert.equal(alone[0].status, 'awaiting-reply');
+  assert.equal(approvalConfirmFromEvent({ reason: 'approval_confirmation_required', question: 'x' }), null, 'no card id, no confirm');
+  assert.equal(approvalConfirmFromEvent({ question: 'Which account?', approvalId: 'apr-x' }), null, 'an ordinary question is not a confirm');
 });

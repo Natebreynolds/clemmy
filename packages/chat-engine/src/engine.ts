@@ -12,7 +12,7 @@ import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type
  * injected transports so both the desktop console and the mobile PWA can
  * drive it.
  */
-import type { ChatAttachment,
+import type { ApprovalConfirm, ChatAttachment,
   ChatMessage, ConnectionState, EngineSnapshot, HarnessEvent, MessageStatus,
 } from './types.js';
 import { approvalPreviewFrom, approvalResolutionFrom, cardDecisionOf, type CardDecision } from './types.js';
@@ -790,6 +790,18 @@ export class ChatEngine {
       }
       case 'awaiting_user_input': {
         if (!this.terminalOwnsActiveTurn(event)) return;
+        const confirm = approvalConfirmFromEvent(d);
+        if (confirm && this.messages.some((m) => m.approval?.approvalId === confirm.approvalId)) {
+          // The card's own question, asked back: drawn ON the waiting card
+          // (the owner's words, Clem's line, the same two answers); the
+          // placeholder turn that would have carried it draws nothing.
+          const placeholder = this.activeAssistantId;
+          this.messages = this.messages
+            .filter((m) => !(m.id === placeholder && !m.text.trim() && !m.approval && !m.planArtifactRef))
+            .map((m) => (m.approval?.approvalId === confirm.approvalId ? { ...m, approval: { ...m.approval, confirm: confirm.confirm } } : m));
+          this.busy = false;
+          break;
+        }
         // This event is itself a public terminal for the live stream. The
         // stream closes immediately after delivering it, so waiting for the
         // later conversation_completed projection leaves mobile permanently
@@ -1183,4 +1195,15 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
   }
   return events.reduce((current, event) => event.type === 'conversation_check_in'
     ? appendConversationCheckIn(current, event, sessionId) : current, messages);
+}
+
+/** An `awaiting_user_input` that is the card's own question asked back. */
+export function approvalConfirmFromEvent(d: Record<string, unknown>): { approvalId: string; confirm: ApprovalConfirm } | null {
+  if (d.reason !== 'approval_confirmation_required') return null;
+  const approvalId = typeof d.approvalId === 'string' && d.approvalId.trim() ? d.approvalId : '';
+  const question = typeof d.question === 'string' ? d.question.trim() : '';
+  if (!approvalId || !question) return null;
+  const leaning = d.leaning === 'approves' || d.leaning === 'declines' ? d.leaning : 'unread';
+  const replyText = typeof d.replyText === 'string' && d.replyText.trim() ? d.replyText.trim() : undefined;
+  return { approvalId, confirm: { question, leaning, ...(replyText ? { replyText } : {}) } };
 }

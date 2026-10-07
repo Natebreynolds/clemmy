@@ -53,6 +53,16 @@ export const APPROVAL_ANSWER_WORDS = {
 
 export type ApprovalResolution = 'approved' | 'declined' | 'changed' | 'expired';
 
+/** Clem asked the card's own question back after a written reply she could
+ * not read as a decision (a leaning yes or no, or Jev unavailable). Drawn ON
+ * the card: the owner's words, her one line, the same two answers. */
+export interface ApprovalConfirm {
+  question: string;
+  /** What the owner wrote that raised the question. */
+  replyText?: string;
+  leaning: 'approves' | 'declines' | 'unread';
+}
+
 export interface CardDecision {
   approvalId: string;
   decision: 'approve' | 'reject';
@@ -317,6 +327,8 @@ export interface ChatMessage {
      *  'changed' means the owner asked for a change; a new card follows.
      *  'expired' means nobody answered in time, so it did not run. */
     resolution?: ApprovalResolution;
+    /** The card's question asked back, after a reply that could not be read. */
+    confirm?: ApprovalConfirm;
     /** Host reducer facts, passed through unchanged for display, not authority. */
     consentCall?: {
       effect: string;

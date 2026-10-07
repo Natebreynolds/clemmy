@@ -1475,6 +1475,13 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .approval-check-title { font-weight: 600; color: var(--clem-warning); }
 .approval-check-warn ul { margin: 4px 0 0; padding-left: 18px; }
 .approval-check-hint { margin-top: 4px; color: var(--fg-2); }
+/* The card's question asked back, on the card: the owner's words, then Clem's line. */
+.approval-confirm { margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 10px; }
+.approval-confirm-you { display: flex; align-items: flex-start; gap: 8px; font-size: var(--t-sm); color: var(--fg-2); }
+.approval-confirm-you q { quotes: "“" "”"; color: var(--fg); }
+.approval-confirm-clem { display: flex; align-items: flex-start; gap: 8px; font-size: var(--t-body); font-weight: 500; line-height: 1.4; color: var(--fg); }
+.approval-confirm-mark { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; margin-top: 1px; border-radius: 999px; background: var(--line); color: var(--fg-2); font-size: 9px; font-weight: 700; }
+.approval-confirm-mark.is-clem { background: var(--accent); color: #fff; font-size: 10px; }
 
 /* ── markdown inside a reply ────────────────────────────────────── */
 /* Replies carry markdown; the engine renders it sanitized. Spacing stays

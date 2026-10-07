@@ -3612,8 +3612,12 @@ function tryCommitLiveApprovalControl(input: {
           sourceData: { approvalId: confirm.approvalId, confirm: confirm.leaning },
           commit: (source) => {
             const options = ['Yes', 'No'];
+            // The card the question is about, and the words that raised it, so
+            // a surface can draw the question ON the card instead of as a new
+            // bubble (owner-approved design, 2026-10-07).
             appendHarnessEvent({ sessionId: input.sessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
-              data: { sourceUserSeq: source.seq, reason: 'approval_confirmation_required', question: confirm.question, options } });
+              data: { sourceUserSeq: source.seq, reason: 'approval_confirmation_required', question: confirm.question, options,
+                approvalId: confirm.approvalId, leaning: confirm.leaning, replyText: input.text } });
             commitConsoleTerminal({ identity: { sessionId: input.sessionId, turn: source.turn, sourceUserSeq: source.seq },
               text: confirm.question, status: 'needs_input', legacyReason: 'awaiting_user_input',
               metadata: { steps: 0, liveApprovalControl: source.data.liveApprovalControl } });
