@@ -8,7 +8,12 @@ import { stopWindowsProcessTree } from './windows-process-tree.js';
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-conversion-process-café-'));
 process.env.CLEMENTINE_HOME = home;
 process.env.MARKITDOWN_WARM = 'off';
-test.after(() => rmSync(home, { recursive: true, force: true }));
+test.after(() => {
+  // A fixture process whose cleanup a test proved incomplete may still hold
+  // the home for a moment on Windows (EBUSY, run 37680821835).
+  try { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+  catch (error) { if (process.platform !== 'win32' || (error as NodeJS.ErrnoException).code !== 'EBUSY') throw error; }
+});
 
 let moduleIndex = 0;
 async function freshRunner(): Promise<typeof import('./markitdown.js')> {
