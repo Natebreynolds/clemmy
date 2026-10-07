@@ -347,6 +347,9 @@ function materializeQueuedApproval(
             subject: record.title,
             args,
             rawArgs: JSON.stringify(args),
+            // Clem's words ride the event too: Needs you, the phone and the
+            // reopened transcript title the card from here.
+            preview: args.preview,
             pendingAction: pendingActionApprovalView(linkedRecord),
             approvalId: registered.row.approvalId,
             sourceUserSeq,
