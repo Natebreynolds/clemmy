@@ -241,9 +241,12 @@ test('provider-crossed invalid arguments expose one honest repair-or-alternative
     'the advertised recovery schemas are exactly the failed carrier plus one alternative search',
   );
   const directive = hostNoProgressRecoveryDirective(first.state);
-  assert.match(directive, /Choose exactly one next call/);
+  assert.match(directive, /Choose exactly one next step/);
   assert.match(directive, /call work_call once with corrected arguments/);
   assert.match(directive, /OR call tool_search once for an alternative capability/);
+  // The provider's reason may already be the answer (the item is already
+  // gone): the brain may call nothing and say so, instead of a third call.
+  assert.match(directive, /call nothing and tell the user what the provider said/);
   assert.doesNotMatch(directive, /Do not repeat discovery/);
 
   const repeated = observeNoProgress(first.state, {

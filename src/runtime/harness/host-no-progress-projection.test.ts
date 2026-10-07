@@ -1749,7 +1749,7 @@ test('provider-crossed invalid arguments expose bounded alternative authority, n
     assert.equal(projected.status, 'ok');
     if (projected.status !== 'ok') continue;
     assert.equal(projected.attemptClass, 'provider_repair');
-    assert.equal(projected.consequence?.stage, 'execution:invalid_arguments');
+    assert.match(projected.consequence?.stage ?? '', /^execution:invalid_arguments:request:[a-f0-9]{16}$/);
     assert.equal(projected.consequence?.recovery, 'repair_model');
     assert.equal(projected.consequence?.effectState, 'known_terminal');
     assert.deepEqual(projected.consequence?.recoveryToolNames, ['tool_search', 'work_call']);
@@ -1762,6 +1762,41 @@ test('provider-crossed invalid arguments expose bounded alternative authority, n
       'provider status/detail churn cannot mint another repair stage',
     );
   }
+});
+
+test('a provider refusal is bound to the exact request: a repaired call is a new consequence, the same call is the same one', () => {
+  // Live 2026-10-06: "delete that reminder" → the provider said not_found →
+  // the brain tried the other copy's id → not_found again. That second answer
+  // was read as the first repeating (one key per stage) and the turn stopped
+  // as blocked before Clem could say both were already gone. `repair_model`
+  // asks the model to change the request; when it does, the provider has
+  // answered a different question. Formatting and call-id churn still share
+  // a key, as does the provider's own status/wording churn.
+  const identity = accepted('provider-refusal-request-identity');
+  const row = (callId: string, outcomeDetail: string) => ({
+    callId, executionKind: 'provider_execution', outcomeKind: 'invalid_arguments',
+    recoveryAction: 'repair_arguments', businessCall: 1, physicalCrossingCount: 1, outcomeDetail,
+  });
+  const db = settlementDb([row('first', 'envelope_rejected'), row('second', 'envelope_rejected'),
+    row('same-again', 'http_400'), row('reordered', 'envelope_rejected')], identity);
+  const project = (callId: string, args: unknown) => projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [call(callId, 'work_call', args), result(callId, 'work_call')],
+  }, db);
+  const first = project('first', { tool: 'DELETE_ITEM', arguments: { id: 'item-1' } });
+  const second = project('second', { tool: 'DELETE_ITEM', arguments: { id: 'item-2' } });
+  const sameAgain = project('same-again', '{"tool":"DELETE_ITEM","arguments":{"id":"item-1"}}');
+  const reordered = project('reordered', { arguments: { id: 'item-1' }, tool: 'DELETE_ITEM' });
+  db.close();
+  assert.equal(first.status, 'ok');
+  assert.equal(second.status, 'ok');
+  assert.equal(sameAgain.status, 'ok');
+  assert.equal(reordered.status, 'ok');
+  if (first.status !== 'ok' || second.status !== 'ok' || sameAgain.status !== 'ok' || reordered.status !== 'ok') return;
+  assert.notEqual(first.consequence?.key, second.consequence?.key, 'a repaired request is a new consequence');
+  assert.equal(first.consequence?.key, sameAgain.consequence?.key, 'the same request refused again is the same consequence, whatever the provider detail');
+  assert.equal(first.consequence?.key, reordered.consequence?.key, 'argument formatting cannot mint a stage');
+  assert.deepEqual(first.consequence?.recoveryToolNames, ['tool_search', 'work_call']);
 });
 
 test('a retired capability gets one bounded current-source search, not a repeat carrier call', () => {

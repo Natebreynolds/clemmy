@@ -1692,6 +1692,31 @@ export const NO_PROGRESS_CHECK_IN_STEER = [
 ].join('\n\n');
 
 /**
+ * THE PROVIDER ANSWERED; DELIVER ITS ANSWER. When the stop is a provider
+ * refusing the exact request (the `execution:invalid_arguments` stage: the
+ * call crossed, the provider said no in its own words, nothing changed), the
+ * person is owed that answer, not a check-in that invites workarounds. Live
+ * 2026-10-06: "delete that reminder again and tell me what happened" → Slack
+ * said not_found twice → the generic check-in asked whether to try "another
+ * workspace", the owner said yes, and the next turn chased a second Slack
+ * account that does not exist and ended blocked. Same single tool-free model
+ * request, different ask: say what the provider said and what it means.
+ */
+export const PROVIDER_REFUSAL_ANSWER_STEER = [
+  'The provider processed your request and refused it; its reason is in the tool result you already have, and nothing was changed. Repeating the call, or varying it, will not change that answer.',
+  'Do not call tools now. In your own voice, tell the user what you tried, what the provider said, and what that means for what they asked (for example: the item was already gone, so there was nothing to delete). Do not propose workarounds that depend on tools, accounts or facts you have not verified in this conversation. Ask a question only if a decision from them is genuinely required. Keep it short.',
+].join('\n\n');
+
+/** The steer for a no-progress check-in follows the kind of stop: a provider
+ * refusal is answered; every other exhaustion is explained and, if a real
+ * missing fact blocks it, asked about. */
+export function noProgressCheckInSteerFor(blockedDetail: string | undefined): string {
+  return typeof blockedDetail === 'string' && blockedDetail.startsWith('execution:invalid_arguments')
+    ? PROVIDER_REFUSAL_ANSWER_STEER
+    : NO_PROGRESS_CHECK_IN_STEER;
+}
+
+/**
  * NO PROGRESS IS A CONVERSATION, NOT A PARK.
  *
  * When the no-progress governor exhausts a turn and the host does NOT hold the
@@ -1768,7 +1793,7 @@ export async function modelCheckInForExhaustedTurn(
   });
   let checkIn: RunTurnResult;
   try {
-    checkIn = await input.run(NO_PROGRESS_CHECK_IN_STEER);
+    checkIn = await input.run(noProgressCheckInSteerFor(turnResult.blockedDetail));
     // (the caller bounds this to exactly one model request and one tool call)
   } catch (error) {
     logger.warn({ err: error, sessionId: input.sessionId, sourceUserSeq }, 'no-progress check-in: activation threw — typed stop stands');
@@ -4117,7 +4142,7 @@ async function checkInAfterNoProgressResume(
   const checkIn = await runConversation({
     ...stable,
     input: typeof accepted.data.text === 'string' ? accepted.data.text : options.input,
-    continuationSteer: NO_PROGRESS_CHECK_IN_STEER,
+    continuationSteer: noProgressCheckInSteerFor(result.blockedDetail),
     hostOwnedContinuation: true,
     sourceUserSeq,
     reuseRecordedUserInput: true,

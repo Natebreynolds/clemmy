@@ -875,6 +875,31 @@ function schemaInvalidStage(repairKeys: readonly string[]): string {
  * and canonical JSON digest so formatting/call-id churn cannot mint stages.
  * This identifies only a bounded repair stage, never execution authority or a
  * fresh retry budget; the governor's finite transition cap remains in force. */
+/** The provider refused THIS request, and its answer is bound to the exact
+ * operation and arguments it was asked about. The same call again is the same
+ * refusal (the pinned loop-breaker: it terminalizes), while a call the model
+ * repaired — `recovery: 'repair_model'` is exactly that instruction — is a new
+ * request the provider has not answered yet, and it spends the bounded
+ * budgets like any other distinct consequence. Live 2026-10-06: "delete that
+ * reminder" → not_found → the brain tried the other copy's id → not_found
+ * again, and that second answer was read as the first one repeating, so the
+ * turn stopped as blocked before Clem could say "both are already gone".
+ * Response wording and status churn stay out of the identity, as before. */
+function providerRefusedRequestIdentity(call: HistoryCall): string {
+  const effective = unwrapRuntimeEffectiveToolIdentity(call.name, call.arguments);
+  let args = effective.toolName ? effective.args : call.arguments;
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { /* unreadable bytes keep their exact refusal identity */ }
+  }
+  const digest = stableJsonDigest({
+    domain: 'provider-refused-request',
+    version: 1,
+    operation: effective.toolName ?? call.name,
+    arguments: args,
+  });
+  return `request:${digest.slice(0, 16)}`;
+}
+
 function fallbackSchemaInvalidStage(call: HistoryCall): string {
   const effective = unwrapRuntimeEffectiveToolIdentity(call.name, call.arguments);
   let args = effective.toolName ? effective.args : call.arguments;
@@ -1202,7 +1227,7 @@ function settlementConsequence(input: {
       // across 400/422 wording churn and therefore still stops a real loop.
       if (isProviderCrossedInvalidArguments(settlement)) {
         return createNoProgressConsequence({
-          stage: 'execution:invalid_arguments',
+          stage: `execution:invalid_arguments:${providerRefusedRequestIdentity(call)}`,
           recovery: 'repair_model',
           effectState: 'known_terminal',
           recoveryToolNames: [call.name, 'tool_search'],

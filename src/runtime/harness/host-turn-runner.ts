@@ -1453,7 +1453,7 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
     ].join(' ');
   }
   if (
-    consequence.stage === 'execution:invalid_arguments'
+    consequence.stage.startsWith('execution:invalid_arguments')
     && consequence.recoveryToolNames.length === 2
     && consequence.recoveryToolNames.includes('tool_search')
   ) {
@@ -1465,8 +1465,8 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
       // instruction must agree with the exact recovery surface or it creates
       // a prose gate over an otherwise-admitted unlock.
       return [
-        'BOUNDED AUTO RECOVERY — the last call reached its provider, which rejected the arguments before any consequential effect.',
-        `Choose exactly one next call: call ${carrier} once with corrected arguments for the same accepted requirement, OR call tool_search once for an alternative capability that can fulfill that same requirement.`,
+        'BOUNDED AUTO RECOVERY — the last call reached its provider, which rejected the request before any consequential effect; its reason is in the result.',
+        `Choose exactly one next step: call ${carrier} once with corrected arguments for the same accepted requirement, OR call tool_search once for an alternative capability that can fulfill that same requirement, OR, when the provider's reason means the request cannot succeed as asked (for example the item is already gone), call nothing and tell the user what the provider said and what it means.`,
         'Do not call both, do not call planning, and do not ask the user to continue an internal repair.',
       ].join(' ');
     }
