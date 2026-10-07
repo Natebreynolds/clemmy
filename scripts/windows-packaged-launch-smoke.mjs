@@ -269,6 +269,22 @@ const runChild = createOwnedChildRunner();
 /** Controlled source fixtures avoid requiring dist before the offline gate. */
 export const _testOnly_createOwnedChildRunner = createOwnedChildRunner;
 
+/** Files and bytes under a tree that may still be appearing; never its names. */
+function extractedTreeSize(root) {
+  let files = 0; let bytes = 0;
+  const walk = (directory) => {
+    let names; try { names = readdirSync(directory); } catch { return; }
+    for (const name of names) {
+      const file = path.join(directory, name); let stat;
+      try { stat = lstatSync(file); } catch { continue; }
+      if (stat.isDirectory() && !stat.isSymbolicLink()) walk(file);
+      else if (stat.isFile()) { files += 1; bytes += stat.size; }
+    }
+  };
+  walk(root);
+  return { files, bytes };
+}
+
 async function powershell(script, additionalEnv = {}) {
   const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
   if (!systemRoot || !path.win32.isAbsolute(systemRoot)) refuse('windows_system_root_missing');
@@ -841,9 +857,20 @@ export async function main(args = process.argv.slice(2)) {
     // NSIS consumes its unquoted remainder, including spaces, as the directory.
     await assertNoExistingInstallation();
     phase('nsis_install');
-    await runChild(installer, ['/S', '/currentuser', `/D=${installRoot}`], {
-      env, cwd: fixtureRoot, windowsVerbatimArguments: true, timeoutMs: 180_000,
-    });
+    // A 400 MB LZMA installer extracting on a two-core runner passed 180 s
+    // (run 37667783130) with nothing to tell slow from stuck: the bound is
+    // generous and the extracted tree is measured every 30 s (counts only).
+    const installStarted = Date.now();
+    const progress = setInterval(() => {
+      const extracted = extractedTreeSize(installRoot);
+      process.stdout.write(`[Windows installed smoke] nsis_install progress: ${extracted.files} files, ${Math.round(extracted.bytes / 1_048_576)} MB after ${Math.round((Date.now() - installStarted) / 1000)} s\n`);
+    }, 30_000);
+    try {
+      await runChild(installer, ['/S', '/currentuser', `/D=${installRoot}`], {
+        env, cwd: fixtureRoot, windowsVerbatimArguments: true, timeoutMs: 900_000,
+      });
+    } finally { clearInterval(progress); }
+    receipt.install = { durationMs: Date.now() - installStarted, ...extractedTreeSize(installRoot) };
     if (!existsSync(context.executable) || !isOwnedPath(realpathSync(context.executable), fixtureRoot)) refuse('owned_install_not_created');
     const installed = packageIdentity(installRoot);
     assert.deepEqual(installed, candidate);
