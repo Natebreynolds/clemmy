@@ -594,8 +594,10 @@ test('a question shows the person the question; the retained-work checkpoint sta
   assert.equal(publicCompletionText(asked.data), question, 'the projected terminal still validates as typed');
 
   const blocked = projectHarnessEventForPublic(typed('blocked', 'blocked'));
-  assert.match(String((blocked?.data.presentation as { text: string }).text), /Retained work \(durable checkpoint\)/,
-    'a stopped turn still discloses what was kept and whether anything was written');
+  const blockedText = String((blocked?.data.presentation as { text: string }).text);
+  assert.match(blockedText, /I kept the result from this turn/, 'a stopped turn still discloses what was kept');
+  assert.match(blockedText, /Nothing outside this machine was changed\./, 'and whether anything was written');
+  assert.doesNotMatch(blockedText, /rh_|calendar_view|Retained work/, 'in plain words, with no handles or tool names');
 
   const legacy = projectHarnessEventForPublic(event('conversation_completed', {
     reply: `${question}\n\n${checkpoint}`, reason: 'awaiting_user_input', awaitingUser: true,
@@ -1093,4 +1095,42 @@ test('a fenced JSON payload shown inside a prose reply is content, not a narrate
   assert.equal(looksLikeToolCallShape(bare), true);
   assert.equal(looksLikeToolCallShape('{"tool_slug": "SLACK_CREATE_A_REMINDER", "arguments": {}}'), true);
   assert.equal(looksLikeToolCallShape('Tool call: slack_send_message\n{"channel": "x"}'), true);
+});
+
+// Owner 2026-10-06: ids out of replies. A blocked turn still tells the person
+// what was kept and whether anything outside this machine changed — without
+// record handles or tool names.
+test('a blocked turn discloses retained work in plain words, with no handles or tool names', async () => {
+  const { ownerFacingRetainedWorkCheckpoint } = await import('./retained-work-checkpoint.js');
+  const text = [
+    'I could not finish: the sheet refused the write.',
+    '',
+    'Retained work (durable checkpoint):',
+    '- Source/tool calendar_view: 83 records (complete) retained as rh_463df142f7cee5557b1a54c4c5ca39d6.',
+    '- Source/tool read_file: completed result retained as rh_0123456789abcdef0123456789abcdef.',
+    '- 2 additional retained results.',
+    'External write state (composio_execute_tool): uncertain. Reconcile it before any retry.',
+  ].join('\n');
+  const shown = ownerFacingRetainedWorkCheckpoint(text);
+  assert.equal(shown, [
+    'I could not finish: the sheet refused the write.',
+    '',
+    "I kept 4 results from this turn, so a retry won't fetch them again. I can't yet confirm whether the change outside this machine went through; I'll check before trying again.",
+  ].join('\n'));
+  assert.doesNotMatch(shown, /rh_|calendar_view|read_file|composio|Retained work/);
+  assert.equal(
+    ownerFacingRetainedWorkCheckpoint('Stopped.\n\nRetained work (durable checkpoint):\n- Source/tool list_files: completed result retained as rh_1.\nExternal write state: no settled external-write attempt is recorded.'),
+    "Stopped.\n\nI kept the result from this turn, so a retry won't fetch it again. Nothing outside this machine was changed.",
+  );
+  assert.equal(ownerFacingRetainedWorkCheckpoint('Plain reply with no checkpoint.'), 'Plain reply with no checkpoint.');
+  // The public projection of a blocked terminal uses it; a question still drops the checkpoint entirely.
+  const identity = { sessionId: 'public-projection-test', turn: 1, sourceUserSeq: 11 };
+  const blocked = projectHarnessEventForPublic(event('conversation_completed', {
+    terminalKey: 'turn:11', sourceUserSeq: 11, reply: text, delivered: false,
+    presentation: { version: 1, id: 'turn:11:presentation', outcomeId: 'turn:11', audience: 'user', phase: 'final', identity, status: 'blocked', kind: 'blocked', text, resumable: true },
+    turnOutcome: { version: 2, id: 'turn:11', status: 'blocked', resumable: true },
+  }));
+  assert.ok(blocked);
+  assert.match(String((blocked!.data as { reply?: string }).reply), /I kept 4 results/);
+  assert.doesNotMatch(String((blocked!.data as { reply?: string }).reply), /rh_/);
 });

@@ -35,7 +35,7 @@ import {
   stripLeakedDecisionAssignment,
 } from './presentation-hygiene.js';
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
-import { withoutRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
+import { ownerFacingRetainedWorkCheckpoint, withoutRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 import {
   isSettledReadReplayReturnData,
   settledReadReplayCallId,
@@ -737,11 +737,13 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
     || reason === 'awaiting_continue';
   // While Clem waits on the person, they read the question or approval, not
   // the host's retained-work checkpoint; the durable terminal keeps it for the
-  // model. A failed or blocked terminal still discloses it with its write state.
+  // model. A failed or blocked terminal still discloses what was kept and
+  // whether anything outside this machine changed — in plain words, never
+  // record handles or tool names (owner 2026-10-06: ids out of replies).
   const waitingOnPerson = typedPresentation
     ? typedPresentation.status === 'needs_input'
     : legacyNeedsInput;
-  const readable = (value: string) => (waitingOnPerson ? withoutRetainedWorkCheckpoint(value) : value);
+  const readable = (value: string) => (waitingOnPerson ? withoutRetainedWorkCheckpoint(value) : ownerFacingRetainedWorkCheckpoint(value));
   const reply = readable(publicCompletionText(data));
   const legacyStatus = legacyNeedsInput
     ? 'needs_input'

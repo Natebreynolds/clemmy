@@ -1,4 +1,5 @@
 import { observeHeldStopPublicationOwner, sealHeldStopPublication, drainHeldStopPublication, drainHeldStopPublications, heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_TEXT, HeldStopPublicationSupersededError, type HeldStopPublicationTicket } from './held-stop-publication.js';
+import { approvalCardAsk } from './approval-card-voice.js';
 import { MODEL_REFUSED_BLOCKED_REASON, refusedModelPublicText, refusedRequestedModel } from './model-refusal.js';
 import './memory-scope-binding.js';
 import { retainConnectionExecutionProgress } from './connection-execution-progress.js';
@@ -1244,7 +1245,8 @@ function reduceStandardConversationTerminal(input: {
         const pendingCount = pendingApprovalCountForTurn(result, sourceUserSeq);
         // The line that stands in for the card is the card's own question
         // when Clem wrote one; the old operator wording is only the fallback.
-        const cardAsk = approvalCardAskFromArgs(approval.args);
+        const cardAsk = approvalCardAskFromArgs(approval.args)
+          ?? approvalCardAsk(approval.sessionId, approval.approvalId);
         const approvalText = publicReplyText(
           result.lastDecision?.reply,
           pendingCount > 1
