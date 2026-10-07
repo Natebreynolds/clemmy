@@ -1,5 +1,5 @@
 import { readTaskMode, readPlanRevisionRef } from '../../../lib/task-mode';
-import { approvalPreviewFrom, recordedTurnProject } from '@clem/chat-engine';
+import { approvalPreviewFrom, approvalRevisionFrom, recordedTurnProject } from '@clem/chat-engine';
 import { pendingActionFromEvent, type ChatMessage } from '../../../lib/useChat';
 import type { Turn } from '../types';
 
@@ -72,6 +72,8 @@ function historyMessage(turn: Turn): ChatMessage {
         approvalId: turn.approval.approvalId,
         pendingAction: pendingActionFromEvent(turn.approval.pendingAction),
         ...(approvalPreviewFrom(turn.approval.preview) ? { preview: approvalPreviewFrom(turn.approval.preview) } : {}),
+        // A reopened chat draws the change on the card as the live one did.
+        ...(approvalRevisionFrom(turn.approval.revises) ? { revises: approvalRevisionFrom(turn.approval.revises) } : {}),
         ...(turn.approval.resolution === 'expired' ? { resolution: 'expired' as const } : {}),
       },
     };

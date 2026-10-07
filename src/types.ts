@@ -210,6 +210,9 @@ export interface UnifiedSessionTurn {
     /** What approving would do (operation and argument values), display only. */
     preview?: { operation: string; fields: Array<{ name: string; value: string; label?: string }> };
     pendingAction?: unknown;
+    /** The card this one revises after a change in words: the owner's words
+     *  and the fields as they were, so a reopened chat draws the change. */
+    revises?: { approvalId: string; changeRequest?: string; fields?: Array<{ name: string; value: string; label?: string }> };
     /** Present when nobody answered before the card's lifetime ran out: the
      *  card renders settled, without controls. */
     resolution?: 'expired';

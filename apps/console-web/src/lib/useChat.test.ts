@@ -1374,3 +1374,16 @@ test('a queued card keeps Clem\'s words through hydration, so a reopened chat dr
   assert.equal(view?.why, 'It only prints your settings.');
   assert.equal(pendingActionFromEvent({ id: 'pa-2', toolName: 'x', ask: '   ' })?.ask, undefined, 'blank words are no words');
 });
+
+test('a reopened chat draws the change on the revised card as the live one did', () => {
+  // Live 2026-10-07: the live stream carried `revises`; the reopened
+  // transcript dropped it, so "Was:" and the owner's words vanished on reopen.
+  const revises = { approvalId: 'apr-old', changeRequest: 'Yes, but add -v.', fields: [{ name: 'command', value: 'ssh -G localhost' }] };
+  const messages = historyToMessages([
+    { role: 'user', text: 'Yes, but add -v.', createdAt: 'now' },
+    { role: 'assistant', text: '', createdAt: 'now', approval: { subject: 'Run ssh', approvalId: 'apr-new',
+      preview: { operation: 'run_shell_command', fields: [{ name: 'command', value: 'ssh -G -v localhost' }], ask: 'Run it?' }, revises } },
+  ]);
+  assert.deepEqual(messages[1].approval?.revises, revises);
+  assert.equal(messages[1].approval?.preview?.fields[0].value, 'ssh -G -v localhost');
+});

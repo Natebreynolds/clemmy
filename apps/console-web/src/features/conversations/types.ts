@@ -58,6 +58,8 @@ export interface Turn {
     approvalId: string;
     pendingAction?: unknown;
     preview?: unknown;
+    /** The card this one revises after a change in words (owner's words, fields as they were). */
+    revises?: unknown;
     /** 'expired': nobody answered in time; render the card settled. */
     resolution?: unknown;
   };

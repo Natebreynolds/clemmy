@@ -226,6 +226,28 @@ function branchConversationTitle(row: HarnessSessionRow): string {
   }
 }
 
+/** The bounded revision link a card event carries, or nothing. */
+function approvalRevisionProjection(value: unknown): { revises: NonNullable<UnifiedSessionTurn['approval']>['revises'] } | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.approvalId !== 'string' || !record.approvalId.trim()) return null;
+  const fields = Array.isArray(record.fields)
+    ? (record.fields as unknown[]).flatMap((field) => {
+        if (!field || typeof field !== 'object' || Array.isArray(field)) return [];
+        const f = field as Record<string, unknown>;
+        if (typeof f.name !== 'string' || typeof f.value !== 'string') return [];
+        return [{ name: f.name, value: f.value, ...(typeof f.label === 'string' ? { label: f.label } : {}) }];
+      })
+    : undefined;
+  return {
+    revises: {
+      approvalId: record.approvalId,
+      ...(typeof record.changeRequest === 'string' && record.changeRequest.trim() ? { changeRequest: record.changeRequest.slice(0, 600) } : {}),
+      ...(fields && fields.length > 0 ? { fields } : {}),
+    },
+  };
+}
+
 function summarizeHarness(row: HarnessSessionRow, titleOverride?: string): UnifiedSessionSummary {
   return {
     id: `${HARNESS_PREFIX}${row.id}`,
@@ -655,6 +677,9 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
           pendingAction: pendingActionApprovalViewFromArgs(rowNow.args ?? null),
           // What approving would do, as the live card showed it.
           ...(approvalPreviewProjection(d.preview) ?? {}),
+          // The change in words this card carries (owner's words, fields as
+          // they were), so the reopened chat draws it as the live one did.
+          ...(approvalRevisionProjection(d.revises) ?? {}),
           ...(expiredUnanswered ? { resolution: 'expired' as const } : {}),
         },
       });

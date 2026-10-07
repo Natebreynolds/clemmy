@@ -908,6 +908,25 @@ test('a still-pending card in Clem\'s words takes its paused turn\'s place on re
   assert.deepEqual(after!.turns.filter((t) => t.role === 'assistant').map((t) => t.text), [question]);
 });
 
+test('a reopened chat keeps the change a pending card carries: the owner\'s words and the fields as they were', async () => {
+  // Live 2026-10-07: the live stream drew "Was: ~~ssh -G localhost~~"; the
+  // reopened transcript dropped the link and showed a plain card.
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'revised reopen' });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Yes, but add -v.' } });
+  const row = approvalRegistry.register({ sessionId: origin.id, subject: 'Run ssh -G -v localhost', tool: 'work_call',
+    args: { name: 'run_shell_command', args_json: '{"command":"ssh -G -v localhost","cwd":null,"timeout_ms":null}' }, ttlMs: 60_000 });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'Clem', type: 'approval_requested', data: {
+    tool: 'work_call', subject: 'Run ssh -G -v localhost', approvalId: row.approvalId,
+    preview: { operation: 'run_shell_command', fields: [{ name: 'command', value: 'ssh -G -v localhost' }], ask: 'Run it?' },
+    revises: { approvalId: 'apr-old', changeRequest: 'Yes, but add -v.', fields: [{ name: 'command', value: 'ssh -G localhost' }], stray: 'ignored' },
+  } });
+  const detail = getUnifiedSessionDetail(`harness:${origin.id}`);
+  const card = detail!.turns.find((t) => t.approval?.approvalId === row.approvalId);
+  assert.deepEqual(card?.approval?.revises, { approvalId: 'apr-old', changeRequest: 'Yes, but add -v.', fields: [{ name: 'command', value: 'ssh -G localhost' }] });
+  assert.equal(card?.approval?.preview?.fields[0]?.value, 'ssh -G -v localhost');
+});
+
 // Runs last: the file shares one DB and earlier tests count rows.
 test('a session branched off a conversation lists under that conversation\'s title, never its channel name', () => {
   // Live 2026-10-07: every branched turn listed as "desktop".
