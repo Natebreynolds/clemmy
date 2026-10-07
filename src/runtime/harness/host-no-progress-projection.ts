@@ -1197,6 +1197,24 @@ function settlementConsequence(input: {
   settlement: NoProgressSettlementRow;
 }): NoProgressConsequence | null {
   const { call, settlement } = input;
+  // A provider that ANSWERED a write with its own refusal: the write stays
+  // uncertain in the ledger (no replay), but its effect state is known to
+  // the model — the provider said no — and nothing is owed to
+  // reconciliation (the settlement's directive says so). The model reads the
+  // target and answers; it may repair the request once within its authority.
+  // Live 2026-10-07: a Slack `not_found` on an approved delete ended the turn
+  // "its effect must be reconciled" from this very consequence.
+  const answeredRefusal = settlement.outcome_kind === 'uncertain_write'
+    && settlement.outcome_detail === 'provider_refused_envelope'
+    && settlement.requires_reconciliation === 0;
+  if (answeredRefusal) {
+    return createNoProgressConsequence({
+      stage: `execution:provider_refused:${providerRefusedRequestIdentity(call)}`,
+      recovery: 'repair_model',
+      effectState: 'known_terminal',
+      recoveryToolNames: [call.name, 'tool_search'],
+    });
+  }
   if (
     settlement.requires_reconciliation === 1
     || settlement.outcome_kind === 'uncertain_write'

@@ -1916,6 +1916,40 @@ test('crossed and host-executed policy denials remain factual stops', () => {
   db.close();
 });
 
+test('a write the provider answered with its own refusal is a known terminal the model repairs or reads back, never a reconciliation stop', () => {
+  // Live 2026-10-07 (v3.18.32 candidate, wave 26): Slack answered a reminder
+  // delete with `not_found`; the settlement was uncertain_write with no
+  // reconciliation owed, and this projection still sent the turn to the
+  // governor's reconcile stop.
+  const identity = accepted('answered-refusal');
+  const db = settlementDb([{
+    callId: 'refused-write',
+    executionKind: 'provider_execution',
+    outcomeKind: 'uncertain_write',
+    outcomeDetail: 'provider_refused_envelope',
+    recoveryAction: 'settle',
+    businessCall: 1,
+    mutating: 1,
+    requiresReconciliation: 0,
+    physicalCrossingCount: 1,
+  }], identity);
+  const projected = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('refused-write', 'mcp__fixture__delete'),
+      result('refused-write', 'mcp__fixture__delete'),
+    ],
+  }, db);
+  assert.equal(projected.status, 'ok');
+  if (projected.status === 'ok') {
+    assert.match(projected.consequence?.stage ?? '', /^execution:provider_refused:/);
+    assert.equal(projected.consequence?.recovery, 'repair_model');
+    assert.equal(projected.consequence?.effectState, 'known_terminal');
+    assert.deepEqual(projected.consequence?.recoveryToolNames, ['mcp__fixture__delete', 'tool_search']);
+  }
+  db.close();
+});
+
 test('an unknown external crossing remains reconciliation-owned', () => {
   const identity = accepted('unknown-crossing');
   const db = settlementDb([{
