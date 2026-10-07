@@ -379,6 +379,16 @@ export function externalWriteTerminalForAttemptOutcome(
     && outcome.evidence === 'structured'
     && [400, 401, 403, 404, 405, 422, 501].includes(status)
   ) return 'external_write_failed';
+  // The provider answered 2xx and refused the exact request at its own layer
+  // (the classifier's `envelope_rejected`): nothing landed, by the provider's
+  // own verdict. Leaving it orphaned made every later turn read "an
+  // irreversible write that hasn't been reconciled" over a delete that Slack
+  // had just called not_found (live 2026-10-06).
+  if (
+    physicalOutcome === 'returned'
+    && outcome.evidence === 'structured'
+    && outcome.detail === 'envelope_rejected'
+  ) return 'external_write_failed';
   return 'external_write_orphaned';
 }
 
