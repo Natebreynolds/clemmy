@@ -1366,7 +1366,12 @@ function clarificationSourcesResult(
     const raw = rawSource(db, input.sessionId, packet.originatingSourceUserSeq);
     const accepted = acceptedSourceFromRow(raw);
     const data = parsedEventData(raw);
-    if (isClarificationControlSource(data)) return refuse('control_source');
+    // A decision can never ANSWER a question, but it can root one: the owner
+    // says "Yes, delete it." on a card, Clem runs the turn and asks something
+    // back, the owner replies. Refusing that root left every such reply
+    // unreadable, and the host re-asked the same question word for word on
+    // every reply, including "Yes, go ahead." (live 2026-10-06).
+    if (row.parent_packet_id !== null && isClarificationControlSource(data)) return refuse('control_source');
     if (!accepted || !data || typeof data.text !== 'string' || !data.text.trim()) return refuse('malformed_chain');
     chars += data.text.length;
     if (chars > MAX_CLARIFICATION_SOURCE_CHAIN_CHARS) return refuse('source_chain_limit');

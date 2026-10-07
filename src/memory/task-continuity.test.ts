@@ -979,6 +979,41 @@ test('literal chain refuses formal-control sources and bounded depth/character o
   assert.deepEqual(readChain(chars), { status: 'refused', reason: 'source_chain_limit' });
 });
 
+test('a question rooted at the owner\'s own card decision is answerable; a decision still cannot answer', () => {
+  // Live 2026-10-06: "Yes, delete it." on a card → Clem asked a question in
+  // that turn → every reply, including "Yes, go ahead.", was refused as a
+  // control-source chain and the same question was re-asked word for word.
+  const owner = session('literal-root-decision');
+  const decision = accepted(owner.id, 'Yes, delete it.', false, { source: 'desktop_approval', approvalId: 'apr-fixture', decision: 'approve' });
+  const base = Date.now() + 1_000;
+  const slot = { goalId: `goal:${owner.id}:${decision.seq}`, revision: 0, questionId: `question:${decision.seq}`, slotKey: 'reply' };
+  const question = 'Slack says that reminder is already gone. Want me to set a fresh one?';
+  const packet = continuity.createTaskContinuityPacket({
+    sessionId: owner.id, originatingSourceUserSeq: decision.seq,
+    pause: { kind: 'clarification', question, slot },
+    publicDeliveryBinding: deliveredQuestion(owner.id, decision.seq, question),
+    expiresAt: new Date(base + 100_000).toISOString(),
+  }, { now: new Date(base).toISOString() });
+  const reply = accepted(owner.id, 'Yes, go ahead.');
+  const read = continuity.readTaskContinuityClarificationSources(
+    { sessionId: owner.id, packetId: packet.packetId, nextReplySourceUserSeq: reply.seq },
+    { now: new Date(base + 2_000).toISOString() });
+  assert.equal(read.status, 'verified', JSON.stringify(read));
+  if (read.status === 'verified') assert.equal(read.nextReply?.text, 'Yes, go ahead.');
+  const another = session('literal-root-decision-reply-control');
+  const root = accepted(another.id, 'Prepare the project.');
+  const packet2 = continuity.createTaskContinuityPacket({
+    sessionId: another.id, originatingSourceUserSeq: root.seq,
+    pause: { kind: 'clarification', question, slot: { ...slot, goalId: `goal:${another.id}:${root.seq}` } },
+    publicDeliveryBinding: deliveredQuestion(another.id, root.seq, question),
+    expiresAt: new Date(base + 100_000).toISOString(),
+  }, { now: new Date(base).toISOString() });
+  const click = accepted(another.id, 'Approve.', false, { source: 'mobile_approval', approvalId: 'apr-fixture', decision: 'approve' });
+  assert.deepEqual(continuity.readTaskContinuityClarificationSources(
+    { sessionId: another.id, packetId: packet2.packetId, nextReplySourceUserSeq: click.seq },
+    { now: new Date(base + 2_000).toISOString() }), { status: 'refused', reason: 'control_source' });
+});
+
 test('a consumed ancestor never masquerades as an exact superseded clarification hop', () => {
   const fixture = clarificationChain('literal-consumed-ancestor');
   const child = fixture.replySources[0]!;
