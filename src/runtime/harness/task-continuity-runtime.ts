@@ -406,9 +406,19 @@ export async function classifyUnsettledOpenQuestionReply(input: {
     recordedReading = { reading: 'checked_residual_answer', answerCompletenessRequired: true,
       ...(verified ? { completeness: verified.receipt } : { revisionUnavailable: true }),
     };
-  } else if (unreadable || amending || continuing) {
+  } else if (unreadable) {
     route = 'reask';
-    recordedReading = { reading: unreadable ? 'interpretation_unavailable' : relation };
+    recordedReading = { reading: 'interpretation_unavailable' };
+  } else if (amending || continuing) {
+    // The owner gave an instruction, not an answer: it amends or continues
+    // the task past the question. A re-ask — even a revised one that
+    // acknowledges the instruction — is a hoop (live 2026-10-06: "Delete that
+    // same reminder again" got "Acknowledged: you supplied a direction… the
+    // presence check I requested is still not supplied"). The brain takes
+    // the instruction with the question on hold and decides what, if
+    // anything, still blocks.
+    route = 'respond';
+    recordedReading = { reading: relation, partialAnswer: true };
   } else if (!sideConversation) {
     const classify = openQuestionReplyClassifierForTests ?? classifyOpenQuestionReplyWithJev;
     const inherited = modelUsageAttributionStorage.getStore();

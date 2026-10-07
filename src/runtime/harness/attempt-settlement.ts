@@ -770,7 +770,13 @@ function signalsFromResult(result: unknown): AttemptSignals {
  * so the host can tell the model what that refusal means for a write.
  */
 export function providerRefusedExactRequest(result: unknown): boolean {
-  const signals = signalsFromResult(result);
+  // A carrier hands the provider envelope back as JSON text; read it as the
+  // settlement does, never as prose.
+  let value = result;
+  if (typeof result === 'string') {
+    try { value = JSON.parse(result); } catch { return false; }
+  }
+  const signals = signalsFromResult(value);
   return typeof signals.httpStatus === 'number'
     && signals.httpStatus >= 200 && signals.httpStatus < 300
     && signals.envelopeSuccessful === false;
