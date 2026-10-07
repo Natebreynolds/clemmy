@@ -28,6 +28,7 @@ import { mcpToolEffectApprovalOpen } from '../runtime/mcp-tool-effect-labels.js'
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalogEntriesLexically, toolSchemaSearchText, type RankedCatalogEntry } from '../agents/tool-catalog.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
+import { currentlyServedOperationIdsForToolkit } from '../runtime/harness/current-manifest-operation-semantics.js';
 import { operationNamedInQuery, sameOperationName } from './operation-name-identity.js';
 import { successorSlugsFromProse } from '../integrations/composio/lifecycle-prose.js';
 import { capabilityEffectIsCompatible, rememberedCapabilityEffect, requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
@@ -95,6 +96,30 @@ function isAcquiredLiveReadCandidate(
 const TOP_RESULTS = 8;
 const TOP_SCHEMAS = 3;
 const ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP = 'The account-routing review did not complete; this is not a missing account or a request for user authorization. Retry the identical account_selection once to reopen its cached review. If it is still unavailable, report that exact host blocker; do not broaden discovery or ask the user to repeat the account.';
+/** Same-toolkit operations the host serves today whose names share a word
+ * with the operation that could not be defined, so the door named is one that
+ * actually opens. Exported for tests. */
+export function servedSiblingsFor(operation: string, query: string): string[] {
+  const toolkit = registeredToolkitOfSlug(operation).trim();
+  if (!toolkit) return [];
+  const words = new Set([...operation.toUpperCase().split('_'), ...query.toUpperCase().split(/[^A-Z0-9]+/)]
+    .filter((word) => word.length >= 4 && word !== toolkit.toUpperCase()));
+  return currentlyServedOperationIdsForToolkit(toolkit)
+    .filter((id) => id !== operation.toUpperCase() && id.split('_').some((word) => words.has(word)))
+    .slice(0, 5);
+}
+
+/** The provider lists this operation but will not serve its definition, so
+ * searching for the same name again is the loop that burned six calls live
+ * on 2026-10-06. Exported for tests. */
+export function unavailableDefinitionNextStep(operation: string, servedSiblings: readonly string[]): string {
+  const siblings = servedSiblings.length > 0
+    ? ` Operations of this toolkit the host already serves: ${servedSiblings.join(', ')}; search for one of those by name and use its capabilityRef.`
+    : ' Search once with plain words for what you need, without this name, and use a result that comes with a capabilityRef.';
+  return `${operation} is listed by its provider but its definition could not be fetched right now, so it cannot be called and will not be published by searching for it again.${siblings}`
+    + ' If nothing serves this need, report that exact blocker; no provider call was made.';
+}
+
 const CAPABILITY_PUBLICATION_NEXT_STEP = 'The operation and account have not yet produced an executable capabilityRef. Search once for the exact operation you need, retaining the same account selection. Call it only after that search returns a capabilityRef. If publication remains unavailable, report its exact host blocker; do not invent a ref, broaden discovery, or ask the user to repeat the account.';
 /** One physical broker search retains at most the same window the public
  * surface can request. A smaller first page therefore never makes rank nine
@@ -768,6 +793,9 @@ export interface ToolSearchPlanningBlocker {
     | 'proof_publication_expired' | 'proof_not_registered'
     | 'exact_definition_unavailable'
     | NonNullable<ProofProvisionResult['refusal']>['code'];
+  /** Same-toolkit operations the host currently serves, when the provider
+   * lists this one but will not serve its definition. */
+  servedSiblings?: readonly string[];
 }
 
 export interface ToolSearchPlanningDisclosureOutcome {
@@ -1570,8 +1598,11 @@ export function registerToolSearchTool(
                 sourceKind: source.kind,
               };
             }
-            preparationBlockers[candidate.name] = { code: 'capability_publication_required', choices: [],
-              reason: controller.signal.aborted || Date.now() >= deadlineAt ? 'proof_publication_expired' : 'exact_definition_unavailable' };
+            const blockerReason = controller.signal.aborted || Date.now() >= deadlineAt ? 'proof_publication_expired' : 'exact_definition_unavailable';
+            preparationBlockers[candidate.name] = { code: 'capability_publication_required', choices: [], reason: blockerReason,
+              ...(blockerReason === 'exact_definition_unavailable'
+                ? { servedSiblings: servedSiblingsFor(candidate.name, query) }
+                : {}) };
             // AUTHORITY is withheld; the SHAPE is not. planningAuthority is the
             // safety-bearing field — without it the row fails the plan-citation
             // gate and is routed to the call_tool dispatcher, which the page's
@@ -2068,7 +2099,10 @@ export function registerToolSearchTool(
             ? {
                 planningRefStatus: 'materialization_unavailable' as const,
                 materializationReason: planningBlockers[r.name]!.reason ?? 'proof_not_registered',
-                materializationNextStep: CAPABILITY_PUBLICATION_NEXT_STEP,
+                materializationNextStep: planningBlockers[r.name]!.reason === 'exact_definition_unavailable'
+                  ? unavailableDefinitionNextStep(r.name, planningBlockers[r.name]!.servedSiblings ?? [])
+                  : CAPABILITY_PUBLICATION_NEXT_STEP,
+                ...(planningBlockers[r.name]!.servedSiblings?.length ? { servedSiblings: planningBlockers[r.name]!.servedSiblings } : {}),
               }
             : planningBlockers[r.name]
             ? {

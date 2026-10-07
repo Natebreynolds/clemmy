@@ -1327,7 +1327,8 @@ export function hostProvenOperationRepair(input: {
   if (requestedIsProven && (input.missReason ?? '').startsWith('catalog_entry_or_manifest_missing')) {
     return ` ${requested} was discovered for an earlier request in this conversation, but its executable ref is not current for this request.`
       + ` Call tool_search for ${requested} once now (keep the same account_selection) and copy the capabilityRef and work_call example it publishes for THIS request;`
-      + ' do not reuse the earlier requirement_id. If tool_search does not publish an executable ref, report that exact host blocker; no provider call was made.';
+      + ' do not reuse the earlier requirement_id. If tool_search does not publish an executable ref, report that exact host blocker; no provider call was made.'
+      + ' If tool_search has already said this operation\'s definition is unavailable, do not request it again: use an operation it named as served, or search once with plain words for what you need.';
   }
   if (requested.length > 0 && !requestedIsProven) {
     const context = ranked.length > 0

@@ -48,6 +48,22 @@ function currentOperationEntries(operationId: string | null | undefined) {
   return current.filter((entry) => catalogOperationIdentityKey(entry.manifest.operationId) === key);
 }
 
+/** Operation ids of a toolkit the host currently serves (a current, callable
+ * catalog entry exists), sorted. Used when a provider LISTS an operation but
+ * will not serve its definition: the model is pointed at siblings it can
+ * actually call instead of at the same name again (live 2026-10-06: Slack
+ * listed SLACK_DELETE_A_SLACK_REMINDER, served SLACK_DELETE_REMINDER). */
+export function currentlyServedOperationIdsForToolkit(toolkit: string): string[] {
+  const prefix = `${toolkit.trim().toUpperCase()}_`;
+  if (prefix.length < 2) return [];
+  const ids = new Set<string>();
+  for (const entry of (peekHostCapabilityCatalogFactory()?.snapshot() ?? []).filter(isCurrentCallableCatalogEntry)) {
+    const id = entry.manifest.operationId.trim().toUpperCase();
+    if (id.startsWith(prefix)) ids.add(id);
+  }
+  return [...ids].sort();
+}
+
 /** Reopen positive semantics only from one exact, current, digest-valid
  * materialized manifest. Provider/action names are compared as identities;
  * their tokens never decide the returned semantics. Ambiguous accounts or
