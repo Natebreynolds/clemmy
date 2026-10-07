@@ -1406,6 +1406,34 @@ function validateHostView(host: TurnSemanticHostViewV1): TurnSemanticValidationI
 
 /** The exact payloadHash admitTurnSemantics computes — exported so the host
  *  deterministic-compile recompute reproduces byte-identical digests. */
+/**
+ * A `continue_goal` that also restates the goal is the amend_goal shape, read
+ * under the wrong name. The projection of amend_goal reads the restated goal
+ * and plans the work again; continue_goal may carry neither, so the validator
+ * refuses the whole reading as `illegal_relation_payload` and the reply
+ * counts as unreadable. Live 2026-10-06: "Delete that same reminder again,
+ * with the same id, and tell me what happened", sent while a host question
+ * was open, came back as continue_goal + a full goal ("delete once more and
+ * report"), was refused, and the owner was told "That is a new request; I am
+ * not executing or approving it here". Rename the relation and let the
+ * validator judge the result; nothing else is changed, and a reading that
+ * also settles a slot, names no goal, or targets no active goal is left to
+ * the model repair as before. Pure; zero model calls.
+ */
+export function coerceContinueGoalWithGoalToAmend(
+  raw: unknown,
+  issues: readonly { code: string }[],
+): Record<string, unknown> | null {
+  if (!issues.some((issue) => issue.code === 'illegal_relation_payload')) return null;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const wire = TurnSemanticProposalV1WireSchema.safeParse(raw);
+  if (!wire.success) return null;
+  const proposal = wire.data;
+  if (proposal.relation !== 'continue_goal' || !proposal.goal || !proposal.targetGoal) return null;
+  if ((proposal.slotAnswers ?? []).length > 0) return null;
+  return { ...(raw as Record<string, unknown>), relation: 'amend_goal' };
+}
+
 export function canonicalProposalPayloadHash(proposal: unknown): string {
   return createHash('sha256').update(canonicalJson(proposal), 'utf8').digest('hex');
 }

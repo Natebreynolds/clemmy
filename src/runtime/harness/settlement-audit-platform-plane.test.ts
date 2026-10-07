@@ -157,6 +157,48 @@ test('a mutating platform-management uncertain_write still vetoes delivered busi
     'the ambiguity stays reported and continues to veto a clean terminal');
 });
 
+// Live 2026-10-06: "delete that reminder" → Slack answered not_found in a 2xx
+// envelope (`successful: false`), the ledger projected it as a failed write,
+// and a read-back confirmed nothing remained — yet this audit stayed at
+// unrecovered_failure, the terminal judge was asked twice, and its second
+// RESUME became "check your Slack reminders list by hand". The provider
+// answered; there is nothing to recover. The account of it is the completion
+// review's to judge.
+test('a mutation the provider refused in its envelope, projected as a failed write, is answered — not unrecovered', () => {
+  const refused = () => outcomes.classifyAttemptOutcome({ httpStatus: 200, envelopeSuccessful: false, mutating: true, acknowledged: false });
+  assert.equal(refused().kind, 'invalid_arguments');
+  assert.equal(refused().detail, 'envelope_rejected');
+
+  const accepted = acceptedSource('audit-answered-refusal', 'Delete that reminder.');
+  settleCall(accepted, 'refused-delete', 'SLACK_DELETE_REMINDER', { reminder: 'Rm1' }, refused(), true,
+    { successful: false, error: 'Slack API error: not_found' });
+  // The ledger: the pre-dispatch reservation, then the failed projection of it.
+  eventlog.appendEvent({
+    sessionId: accepted.sessionId, turn: accepted.turn, role: 'system', type: 'external_write',
+    data: { shapeKey: 'SLACK_DELETE_REMINDER', toolName: 'SLACK_DELETE_REMINDER', preDispatch: true, canonicalCallId: 'logical:refused-delete' },
+  });
+  eventlog.appendEvent({
+    sessionId: accepted.sessionId, turn: accepted.turn, role: 'system', type: 'external_write_failed',
+    data: { shapeKey: 'SLACK_DELETE_REMINDER', toolName: 'SLACK_DELETE_REMINDER', canonicalCallId: 'logical:refused-delete', reason: 'envelope_rejected' },
+  });
+  const audit = auditAcceptedSourceSettlementTruth({
+    sessionId: accepted.sessionId, sourceUserSeq: accepted.sourceUserSeq, requiresBusinessEvidence: true,
+  });
+  assert.equal(audit.facts.answeredProviderRefusals, 1, JSON.stringify(audit));
+  assert.equal(audit.facts.unrecoveredBusinessFailures, 0, 'the refusal is the answer; nothing is left to recover');
+  assert.equal(audit.status, 'clean', `an answered refusal is business evidence: ${JSON.stringify(audit)}`);
+
+  // Without the ledger's failed projection the same refusal stays unrecovered.
+  const unprojected = acceptedSource('audit-unprojected-refusal', 'Delete that reminder.');
+  settleCall(unprojected, 'refused-delete-2', 'SLACK_DELETE_REMINDER', { reminder: 'Rm2' }, refused(), true,
+    { successful: false, error: 'Slack API error: not_found' });
+  const audit2 = auditAcceptedSourceSettlementTruth({
+    sessionId: unprojected.sessionId, sourceUserSeq: unprojected.sourceUserSeq, requiresBusinessEvidence: true,
+  });
+  assert.equal(audit2.facts.answeredProviderRefusals ?? 0, 0);
+  assert.equal(audit2.status, 'unrecovered_failure', JSON.stringify(audit2));
+});
+
 test('a composio-prefixed provider business write settling uncertain_write still vetoes delivery', () => {
   const accepted = acceptedSource(
     'workflow:business-write-veto:update_records',

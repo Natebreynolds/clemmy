@@ -14,6 +14,7 @@ import type { Model } from '@openai/agents-core';
 import type { AcceptedSourceSettlementAudit } from './accepted-source-settlement-audit.js';
 import type { BoundaryJudgeRouting } from './debate-model.js';
 import { extractJsonCandidate } from './json-repair.js';
+import { RETAINED_WORK_TERMINAL_HEADER, withoutRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 
 export type TerminalDeliveryJudgeVerb = 'resume' | 'ask' | 'deliver';
 
@@ -190,13 +191,25 @@ export function parseTerminalDeliveryJudgeVerdict(
   if (!reason || (verbValue !== 'resume' && verbValue !== 'ask' && verbValue !== 'deliver')) {
     return null;
   }
+  // The judge is told to preserve useful results from the authored account;
+  // the host's retained-work inventory is not one of them (live 2026-10-06 a
+  // judge question to the owner ended in "Retained work (durable checkpoint):
+  // - Source/tool slack_list_reminders …"). The inventory is stripped from
+  // what the judge reads (see the prompt) and from what it writes.
+  const ownerFacing = (text: string | null): string | null => {
+    if (text === null) return null;
+    const stripped = text.trimStart().startsWith(RETAINED_WORK_TERMINAL_HEADER)
+      ? ''
+      : withoutRetainedWorkCheckpoint(text).trim();
+    return stripped.length > 0 ? stripped : null;
+  };
   if (verbValue === 'resume') {
     const recoveryInstruction = specificRecoveryInstruction(value.recoveryInstruction);
-    const askIfRepeated = boundedText(value.askIfRepeated, PUBLIC_TEXT_MAX_CHARS);
+    const askIfRepeated = ownerFacing(boundedText(value.askIfRepeated, PUBLIC_TEXT_MAX_CHARS));
     if (!recoveryInstruction || !askIfRepeated) return null;
     return { verb: 'resume', reason, recoveryInstruction, askIfRepeated };
   }
-  const publicText = boundedText(value.publicText, PUBLIC_TEXT_MAX_CHARS);
+  const publicText = ownerFacing(boundedText(value.publicText, PUBLIC_TEXT_MAX_CHARS));
   if (!publicText) return null;
   return { verb: verbValue, reason, publicText };
 }
@@ -217,6 +230,7 @@ function auditFactsForPrompt(audit: AcceptedSourceSettlementAudit): string {
     successfulSdkBusinessResults: facts.successfulSdkBusinessResults,
     successfulSdkAuthoringResults: facts.successfulSdkAuthoringResults,
     unrecoveredBusinessFailures: facts.unrecoveredBusinessFailures,
+    answeredProviderRefusals: facts.answeredProviderRefusals ?? 0,
     confirmedWrites: facts.confirmedWrites,
     requiredHostExternalWriteProjections: facts.requiredHostExternalWriteProjections,
     missingHostExternalWriteProjections: facts.missingHostExternalWriteProjections,
@@ -254,7 +268,7 @@ export function buildTerminalDeliveryJudgePrompt(input: TerminalDeliveryJudgeInp
     clip(input.objective, OBJECTIVE_MAX_CHARS) || '(empty)',
     '',
     '=== MODEL-AUTHORED TERMINAL ACCOUNT ===',
-    clip(input.authoredText, AUTHORED_TEXT_MAX_CHARS) || '(empty)',
+    clip(withoutRetainedWorkCheckpoint(input.authoredText), AUTHORED_TEXT_MAX_CHARS) || '(empty)',
     '',
     '=== DELIVERY CONCERN ===',
     clip(input.deliveryConcern.reason, CONCERN_MAX_CHARS) || '(none supplied)',

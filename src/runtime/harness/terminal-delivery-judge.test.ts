@@ -417,3 +417,22 @@ test('no route, no model, self-judge, and same-family routes are unavailable bef
     assert.equal(fixture.runCalls(), 0, `${candidate.name} must be rejected before a judge call`);
   }
 });
+
+test('the host retained-work inventory never rides in a judge question or answer', () => {
+  // Live 2026-10-06: the judge preserved "concrete results" from the authored
+  // account and its question to the owner ended in "Retained work (durable
+  // checkpoint): - Source/tool slack_list_reminders …".
+  const inventory = '\n\nRetained work (durable checkpoint):\n- Source/tool slack_list_reminders (rh_123): 0 records.\n- Nothing outside this machine was changed.';
+  const ask = parseTerminalDeliveryJudgeVerdict(JSON.stringify({
+    verb: 'ask', reason: 'target state unverified', publicText: `Can you check your Slack reminders list?${inventory}`,
+  }));
+  assert.deepEqual(ask, { verb: 'ask', reason: 'target state unverified', publicText: 'Can you check your Slack reminders list?' });
+  const resume = parseTerminalDeliveryJudgeVerdict(JSON.stringify({
+    verb: 'resume', reason: 'one read-only check closes the gap', recoveryInstruction: 'List the reminders again and bind the result to the objective.',
+    askIfRepeated: `Could you confirm the reminder is gone?${inventory}`,
+  }));
+  assert.equal(resume?.verb, 'resume');
+  if (resume?.verb === 'resume') assert.equal(resume.askIfRepeated, 'Could you confirm the reminder is gone?');
+  assert.equal(parseTerminalDeliveryJudgeVerdict(JSON.stringify({ verb: 'deliver', reason: 'done', publicText: inventory })), null,
+    'an answer that is only the inventory is no answer');
+});

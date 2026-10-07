@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  coerceContinueGoalWithGoalToAmend,
   isContextCheckedTurnSemanticProposalV1,
   validateTurnSemanticProposalV1,
   CapabilityGroundingJudgeV1Schema,
@@ -388,6 +389,29 @@ test('new_goal with no work is the act-directly shape and admits', () => {
     goal: { ...goal(), openSlots: [], candidates: [] },
   }), host());
   assert.equal(result.ok, true, issueCodes(result).join(','));
+});
+
+test('a continue_goal that restates the goal is read as amend_goal, and the validator admits the rename', () => {
+  // Live 2026-10-06: "Delete that same reminder again, with the same id, and
+  // tell me what happened" came back as continue_goal + a full goal, was
+  // refused as illegal_relation_payload, and the owner was told "That is a
+  // new request; I am not executing or approving it here".
+  const restated = proposal({ relation: 'continue_goal', targetGoal: activeGoal, goal: goal(), work: work() });
+  const refused = validateTurnSemanticProposalV1(restated, host());
+  assert.equal(refused.ok, false);
+  const coerced = coerceContinueGoalWithGoalToAmend(restated, refused.ok ? [] : refused.issues);
+  assert.ok(coerced, 'the restated goal is the amend_goal shape');
+  assert.equal(coerced?.relation, 'amend_goal');
+  assert.deepEqual({ ...coerced, relation: 'continue_goal' }, restated, 'nothing but the relation changes');
+  const admitted = validateTurnSemanticProposalV1(coerced as never, host());
+  assert.equal(admitted.ok, true, JSON.stringify(admitted));
+
+  // Left to the model repair: no goal, a settled slot, no target, another relation, another complaint.
+  assert.equal(coerceContinueGoalWithGoalToAmend(proposal({ relation: 'continue_goal', targetGoal: activeGoal, goal: null, work: null }), [{ code: 'illegal_relation_payload' }]), null);
+  assert.equal(coerceContinueGoalWithGoalToAmend(proposal({ relation: 'continue_goal', targetGoal: activeGoal, goal: goal(), slotAnswers: [{ questionId: 'question-3', slotKey: 'resource-choice', optionId: 'choice-a', value: null }] as never }), [{ code: 'illegal_relation_payload' }]), null);
+  assert.equal(coerceContinueGoalWithGoalToAmend(proposal({ relation: 'continue_goal', targetGoal: null, goal: goal() }), [{ code: 'illegal_relation_payload' }]), null);
+  assert.equal(coerceContinueGoalWithGoalToAmend(proposal({ relation: 'new_goal', goal: goal() }), [{ code: 'illegal_relation_payload' }]), null);
+  assert.equal(coerceContinueGoalWithGoalToAmend(restated, [{ code: 'unknown_capability_ref' }]), null);
 });
 
 test('relation matrix rejects model payloads that imply another lifecycle', () => {

@@ -22,7 +22,8 @@ import {
   type TurnSemanticModelResult,
 } from './turn-semantic-model-port.js';
 import type { TurnSemanticHostViewV1 } from './turn-semantic-proposal.js';
-import { shownGroundingDescriptors, TurnSemanticProposalV1WireSchema } from './turn-semantic-proposal.js';
+import {
+  coerceContinueGoalWithGoalToAmend, shownGroundingDescriptors, TurnSemanticProposalV1WireSchema } from './turn-semantic-proposal.js';
 import {
   bindPlanGroundingReceipt,
   catalogSnapshotDigestFromDescriptors,
@@ -737,6 +738,26 @@ async function interpretOnce(input: {
   }
 
   let admitted = admitTurnSemantics(modelResult.raw, host, input.authority);
+  // A continue_goal that restates the goal is amend_goal under the wrong name
+  // (see coerceContinueGoalWithGoalToAmend). Rename and re-admit before any
+  // model repair is spent; the validator still judges the renamed reading.
+  if (!admitted.ok) {
+    const coerced = coerceContinueGoalWithGoalToAmend(modelResult.raw, admitted.issues);
+    const readmitted = coerced ? admitTurnSemantics(coerced, host, input.authority) : null;
+    if (coerced && readmitted?.ok) {
+      modelResult = { ...modelResult, raw: coerced };
+      admitted = readmitted;
+      try {
+        appendEvent({
+          sessionId: input.snapshot.sessionId,
+          turn: input.turn,
+          role: 'system',
+          type: 'guardrail_tripped',
+          data: { kind: 'semantic_relation_coerced', sourceUserSeq: input.snapshot.sourceUserSeq, from: 'continue_goal', to: 'amend_goal' },
+        });
+      } catch { /* legibility only */ }
+    }
+  }
   let repairAttempted = false;
   let judgeRecord: SemanticInterpretationJudgeRecordV1 | undefined;
   let groundingReceipt: GroundingReceiptV1 | undefined;

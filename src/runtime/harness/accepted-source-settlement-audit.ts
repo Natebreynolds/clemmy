@@ -78,6 +78,9 @@ export interface AcceptedSourceSettlementAudit {
      * above except calls the host refused before dispatch. */
     dispatchedMutations: number;
     unrecoveredBusinessFailures: number;
+    /** Mutations the provider processed and refused in a structured envelope,
+     * each projected as a failed write: answered, not unrecovered. */
+    answeredProviderRefusals?: number;
     confirmedWrites: number;
     /** Successful direct host provider mutations which require one exact
      * confirmed hostOwnedExternal reservation/terminal projection. */
@@ -99,9 +102,21 @@ interface SettlementRow {
   tool_name: string;
   argument_digest: string;
   outcome_kind: string;
+  outcome_detail: string | null;
   execution_kind: string;
   mutating: number;
   requirement_id: string | null;
+}
+
+/** The provider processed this mutation and refused it in a structured
+ * envelope (a 2xx carrying `successful: false`): nothing changed, and the
+ * refusal in the provider's own words is the answer — a delete of something
+ * already gone, a send to an address the provider rejects. */
+function providerAnsweredRefusal(row: SettlementRow): boolean {
+  return row.mutating === 1
+    && row.execution_kind === 'provider_execution'
+    && row.outcome_kind === 'invalid_arguments'
+    && row.outcome_detail === 'envelope_rejected';
 }
 
 function boundedReason(error: unknown): string {
@@ -462,7 +477,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
     `).get(input.sessionId, input.sourceUserSeq) as { started_dispatches: number };
     const settlements = db.prepare(`
       SELECT s.logical_tool_call_id, l.tool_name, l.argument_digest,
-             s.outcome_kind, s.execution_kind, s.mutating, s.requirement_id
+             s.outcome_kind, s.outcome_detail, s.execution_kind, s.mutating, s.requirement_id
       FROM logical_call_settlements s
       JOIN logical_tool_calls l
         ON l.session_id = s.session_id
@@ -620,6 +635,17 @@ export function auditAcceptedSourceSettlementTruth(input: {
       .map((row) => reversibleWrites.get(row.logical_tool_call_id))
       .filter((entry): entry is ReversibleWriteShape => entry !== undefined);
     const failed = settlements.filter((row) => !succeeded(row));
+    // A refusal the provider answered, projected as a failed write in the
+    // ledger, has nothing to recover: the account of it is the completion
+    // review's to judge. Live 2026-10-06: a not_found delete kept this audit
+    // at unrecovered_failure after a read-back had confirmed the absence, the
+    // judge was asked twice, and its second RESUME became "check your Slack
+    // reminders list by hand".
+    const failedWriteCallIds = new Set(writeEvidence.failed.map(writeCallId).filter(Boolean));
+    const answeredRefusals = failed.filter((row) => (
+      providerAnsweredRefusal(row) && failedWriteCallIds.has(row.logical_tool_call_id)
+    ));
+    const answeredRefusalCallIds = new Set(answeredRefusals.map((row) => row.logical_tool_call_id));
     const uncertainSettlements = failed.filter((row) => row.outcome_kind === 'uncertain_write');
     // Logical ambiguity clears only when the exact reservation has a durable
     // terminal. Reversibility means the host can repair after readback; it does
@@ -645,6 +671,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
       // Work the refusal actually prevented remains visible to the
       // expected-work gates, which judge coverage rather than blame.
       if (row.execution_kind === 'refused_pre_dispatch') return false;
+      if (answeredRefusalCallIds.has(row.logical_tool_call_id)) return false;
       // A FAILED READ THAT WAS WORKED AROUND IS NOT AN UNRECOVERED FAILURE.
       // Recovery identity is the exact call (requirement, or tool+arguments),
       // so trying a query, having it rejected, and getting the same facts from
@@ -697,6 +724,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
       dispatchedMutations: [...settlements.filter((row) => row.mutating === 1), ...localMutations]
         .filter((row) => row.execution_kind !== 'refused_pre_dispatch').length,
       unrecoveredBusinessFailures: unrecovered.length,
+      answeredProviderRefusals: answeredRefusals.length,
       confirmedWrites: writeEvidence.confirmed.length,
       requiredHostExternalWriteProjections: requiredHostExternalWriteProjections.length,
       missingHostExternalWriteProjections: missingHostExternalWriteProjections.length,
@@ -747,6 +775,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
       && facts.successfulSdkAuthoringResults === 0
       && facts.successfulLocalMutations === 0
       && facts.confirmedWrites === 0
+      && (facts.answeredProviderRefusals ?? 0) === 0
     ) {
       return {
         status: 'no_business_evidence',

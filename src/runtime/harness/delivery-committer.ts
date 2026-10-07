@@ -381,7 +381,8 @@ function acceptedSourceHasBusinessEvidence(audit: AcceptedSourceSettlementAudit)
   return audit.facts.successfulBusinessSettlements > 0
     || audit.facts.successfulSdkBusinessResults > 0
     || audit.facts.successfulSdkAuthoringResults > 0
-    || audit.facts.confirmedWrites > 0;
+    || audit.facts.confirmedWrites > 0
+    || (audit.facts.answeredProviderRefusals ?? 0) > 0;
 }
 
 /** The host refused at least one of this source's calls before dispatch (a
@@ -472,6 +473,7 @@ function deliveryMustHoldWhenJudgeUnavailable(audit: AcceptedSourceSettlementAud
       && audit.facts.successfulSdkBusinessResults === 0
       && audit.facts.successfulSdkAuthoringResults === 0
       && audit.facts.confirmedWrites === 0
+      && (audit.facts.answeredProviderRefusals ?? 0) === 0
     );
 }
 
