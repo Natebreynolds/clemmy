@@ -904,9 +904,16 @@ export async function main(args = process.argv.slice(2)) {
     receipt.candidate = candidate;
     receipt.installer = { filename: path.basename(installer), bytes: lstatSync(installer).size, sha256: sha256(readFileSync(installer)) };
     await assertNoExistingInstallation();
-    const runnerTemp = realpathSync(process.env.RUNNER_TEMP);
-    const fixtureRoot = mkdtempSync(path.join(runnerTemp, 'clem-windows-installed-smoke-'));
-    if (!isOwnedPath(fixtureRoot, runnerTemp)) refuse('fixture_ownership_failed');
+    // The fixture stands in for a user's profile, so it lives under the
+    // runner user's own temp folder, which inherits the profile's private
+    // NTFS permissions. Under the shared runner temp drive the installed
+    // app's credential policy refused the home at first boot (run
+    // 37675782327: "Credential storage privacy or integrity could not be
+    // verified" in the app's own log, no window, no listener). The
+    // ephemeral-runner guard above still requires RUNNER_TEMP.
+    const userTemp = realpathSync(os.tmpdir());
+    const fixtureRoot = mkdtempSync(path.join(userTemp, 'clem-windows-installed-smoke-'));
+    if (!isOwnedPath(fixtureRoot, userTemp)) refuse('fixture_ownership_failed');
     const fixtureNonce = randomUUID();
     writeFileSync(path.join(fixtureRoot, '.owned-ci-fixture'), fixtureNonce);
     const profile = path.join(fixtureRoot, 'profile'); const installRoot = path.join(fixtureRoot, 'installed app');
