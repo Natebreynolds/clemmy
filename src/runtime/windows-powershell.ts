@@ -1,6 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
+import { asciiJson } from './ascii-json.js';
 import { windowsSystemRoot } from './windows-process-tree.js';
+
+export { asciiJson };
 
 // The payload arrives as ASCII-only JSON (see asciiJson), so the host's own
 // stdin decoding, whatever code page it started with, reads it exactly; only
@@ -9,14 +12,6 @@ const READ_PAYLOAD = `try { [Console]::OutputEncoding = New-Object System.Text.U
 $ErrorActionPreference = 'Stop'
 $payload = ConvertFrom-Json ([Console]::In.ReadToEnd())
 `;
-
-/** JSON whose bytes are all ASCII: every character outside printable ASCII
- * is a \\uXXXX escape, which every JSON reader decodes back to the exact
- * string. Windows PowerShell 5.1 reads redirected stdin in the console code
- * page it started with, so raw UTF-8 bytes cannot be relied on to arrive. */
-export function asciiJson(value: unknown): string {
-  return JSON.stringify(value).replace(/[\u007f-￿]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
-}
 
 /** Ordinary Windows system variables, never the daemon's own secrets or
  * provider keys: what PowerShell 5.1 and the shell association need to start. */

@@ -23,7 +23,7 @@ export function buildCredentialPolicy(rootDir = defaultRootDir) {
   });
   for (const input of Object.keys(result.metafile.inputs)) {
     const absolute = realpathSync(path.resolve(input));
-    if (![source, path.join(rootDir, 'src/runtime/windows-private-filesystem.ts'), path.join(rootDir, 'src/runtime/sync-directory.ts')].includes(absolute)) {
+    if (![source, path.join(rootDir, 'src/runtime/windows-private-filesystem.ts'), path.join(rootDir, 'src/runtime/sync-directory.ts'), path.join(rootDir, 'src/runtime/ascii-json.ts')].includes(absolute)) {
       throw new Error(`Credential policy bundle unexpectedly imports ${input}; it must remain config independent.`);
     }
   }

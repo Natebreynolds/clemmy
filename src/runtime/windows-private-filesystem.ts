@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { asciiJson } from './windows-powershell.js';
+import { asciiJson } from './ascii-json.js';
 
 /** This program receives data on stdin, never interpolated PowerShell source.
  * The ACL is read/set on an identity-checked handle without delete sharing.
