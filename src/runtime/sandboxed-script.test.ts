@@ -21,7 +21,12 @@ import {
 import { stopWindowsProcessTree, type ProcessTreeStopResult } from './windows-process-tree.js';
 
 const tmp = mkdtempSync(path.join(os.tmpdir(), 'clemmy-sandbox-test-'));
-after(() => rmSync(tmp, { recursive: true, force: true }));
+after(() => {
+  // On Windows a fixture process whose cleanup the test proved incomplete may
+  // still hold its directory for a moment (EBUSY, run 37660389975).
+  try { rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+  catch (error) { if (process.platform !== 'win32' || (error as NodeJS.ErrnoException).code !== 'EBUSY') throw error; }
+});
 
 function writeScript(name: string, body: string, exec = false): string {
   const p = path.join(tmp, name);

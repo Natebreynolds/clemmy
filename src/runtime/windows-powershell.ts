@@ -2,16 +2,30 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import { windowsSystemRoot } from './windows-process-tree.js';
 
-const READ_PAYLOAD = `[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
-[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+// The payload arrives as ASCII-only JSON (see asciiJson), so the host's own
+// stdin decoding, whatever code page it started with, reads it exactly; only
+// the output encoding is set, and only where a console exists to set it on.
+const READ_PAYLOAD = `try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
 $ErrorActionPreference = 'Stop'
 $payload = ConvertFrom-Json ([Console]::In.ReadToEnd())
 `;
 
+/** JSON whose bytes are all ASCII: every character outside printable ASCII
+ * is a \\uXXXX escape, which every JSON reader decodes back to the exact
+ * string. Windows PowerShell 5.1 reads redirected stdin in the console code
+ * page it started with, so raw UTF-8 bytes cannot be relied on to arrive. */
+export function asciiJson(value: unknown): string {
+  return JSON.stringify(value).replace(/[\u007f-￿]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
+/** Ordinary Windows system variables, never the daemon's own secrets or
+ * provider keys: what PowerShell 5.1 and the shell association need to start. */
+const SYSTEM_ENVIRONMENT = /^(?:systemroot|windir|systemdrive|comspec|pathext|path|psmodulepath|userprofile|username|userdomain|homedrive|homepath|appdata|localappdata|programdata|allusersprofile|public|programfiles|programfiles\(x86\)|programw6432|commonprogramfiles|commonprogramfiles\(x86\)|commonprogramw6432|computername|logonserver|sessionname|os|number_of_processors|processor_architecture|processor_identifier|processor_level|processor_revision|temp|tmp)$/i;
+
 /** Fixed host programs receive literal values over stdin, not cmd.exe source.
  * The caller supplies source code, never a model/tool argument. Output stays
- * bounded and failure text deliberately omits private URLs and sign-in data. */
-/** The exact invocation: Windows PowerShell 5.1 from the system root, the
+ * bounded and failure text deliberately omits private URLs and sign-in data.
+ * The exact invocation: Windows PowerShell 5.1 from the system root, the
  * payload reader prepended to the fixed program, a reduced environment. */
 export function windowsPowerShellInvocation(
   program: string,
@@ -20,8 +34,7 @@ export function windowsPowerShellInvocation(
   const systemRoot = windowsSystemRoot(environment);
   const executable = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const encoded = Buffer.from(READ_PAYLOAD + program, 'utf16le').toString('base64');
-  const env = Object.fromEntries(Object.entries(environment).filter(([key, value]) => value !== undefined
-    && /^(?:systemroot|windir|systemdrive|comspec|pathext|path|userprofile|appdata|localappdata|temp|tmp)$/i.test(key)));
+  const env = Object.fromEntries(Object.entries(environment).filter(([key, value]) => value !== undefined && SYSTEM_ENVIRONMENT.test(key)));
   return { executable, args: ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], env };
 }
 
@@ -59,7 +72,7 @@ export function runWindowsPowerShell(
       // Drain errors without persisting or returning potentially private data.
       child.stderr?.on('data', () => {});
       child.once('close', code => finish(code === 0));
-      child.stdin?.end(JSON.stringify(payload));
+      child.stdin?.end(asciiJson(payload));
     } catch { finish(false); }
   });
 }

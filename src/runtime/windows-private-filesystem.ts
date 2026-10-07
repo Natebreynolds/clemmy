@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { asciiJson } from './windows-powershell.js';
 
 /** This program receives data on stdin, never interpolated PowerShell source.
  * The ACL is read/set on an identity-checked handle without delete sharing.
@@ -106,8 +107,8 @@ public static class ClemPrivateAcl {
 const ACL_PROGRAM = String.raw`
 $ErrorActionPreference = 'Stop'
 try {
-[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false, $true)
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false, $true)
+# The request is ASCII-only JSON (asciiJson), readable in any console code page.
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false, $true) } catch { }
 $p = [Console]::In.ReadToEnd() | ConvertFrom-Json
 Add-Type -TypeDefinition @'
 ` + WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE + String.raw`
@@ -205,7 +206,7 @@ export function assertWindowsPrivateFilesystem(
     && /^clem-private-ntfs-test-/.test(path.basename(syntheticHome))
     && !relative.startsWith('..') && !path.isAbsolute(relative);
   const allowInheritedPrivate = !harden && options.allowInheritedPrivate === true;
-  const input = JSON.stringify({ version: 2, path: target, dev: String(identity.dev), ino: String(identity.ino), nlink: String(identity.nlink), directory: kind === 'directory', harden, allowInheritedPrivate, syntheticDiagnostic });
+  const input = asciiJson({ version: 2, path: target, dev: String(identity.dev), ino: String(identity.ino), nlink: String(identity.nlink), directory: kind === 'directory', harden, allowInheritedPrivate, syntheticDiagnostic });
   const native = qualifiedNativeProbe();
   const systemRoot = Object.entries(process.env).find(([key, value]) => key.toLowerCase() === 'systemroot' && value)?.[1] ?? 'C:\\Windows';
   if (!path.isAbsolute(systemRoot)) throw new WindowsPrivateFilesystemError();

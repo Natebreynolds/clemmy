@@ -6,7 +6,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runWindowsPowerShell, windowsPowerShellInvocation } from './windows-powershell.js';
+import { asciiJson, runWindowsPowerShell, windowsPowerShellInvocation } from './windows-powershell.js';
 
 function fixture(outcome: 'ok' | 'fail' | 'error' | 'hang') {
   const calls: unknown[][] = []; let stdin = ''; let kills = 0;
@@ -29,6 +29,7 @@ test('PowerShell receives Unicode URL metacharacters as private stdin data, not 
   assert.equal(await runWindowsPowerShell('Start-Process -FilePath $payload.target -ErrorAction Stop',payload,
     {spawnProcess:f.spawnProcess,env:{SystemRoot:'C:\\Windows',OPENAI_API_KEY:'synthetic-secret'}}),'42');
   assert.deepEqual(JSON.parse(f.input()),payload);
+  assert.match(f.input(),/^[\x20-\x7e]+$/,'the payload bytes over stdin are printable ASCII, whatever code page the host reads');
   assert.equal(f.calls[0][0],'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
   const argv=f.calls[0][1] as string[];
   assert.deepEqual(argv.slice(0,3),['-NoProfile','-NonInteractive','-EncodedCommand']);
@@ -50,23 +51,25 @@ test('actual Windows PowerShell preserves literal Unicode paths and URL query by
   const program='[IO.File]::WriteAllText($payload.file, $payload.value, (New-Object System.Text.UTF8Encoding($false))); [Console]::Out.Write($payload.value)';
   try {
     const output = await runWindowsPowerShell(program, {file,value}).catch(error => {
-      // The launch failed on the real OS (run 37658867292: the 15 s bound with
-      // a warm 5.1). Rerun the same invocation synchronously, then variants
-      // that each drop one difference from the working ACL probe, so the
-      // failure names the cause. The payload here is synthetic, so stderr may show.
+      // The launch failed on the real OS. Run 37660389975 showed every
+      // variant of the invocation (synchronous, minimal environment, no
+      // encoding lines, interactive) waiting with empty output while the
+      // ACL fixtures' plain-ASCII stdin reads completed; the host now sends
+      // ASCII-only JSON and a system-variable environment. Should it still
+      // fail, bisect what remains: the environment, then the payload bytes.
+      // The payload here is synthetic, so stderr may show.
       const { executable, args, env } = windowsPowerShellInvocation(program);
-      const minimalEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !/^(?:path|userprofile|appdata|localappdata)$/i.test(key)));
-      const withoutEncodingLines = windowsPowerShellInvocation(program).args.map((arg, index, all) => index === all.length - 1
-        ? Buffer.from(Buffer.from(arg, 'base64').toString('utf16le').split('\n').filter(line => !/^\[Console\]::(?:Input|Output)Encoding/.test(line)).join('\n'), 'utf16le').toString('base64') : arg);
-      const variants: Array<[string, string, string[], NodeJS.ProcessEnv]> = [
-        ['same invocation, synchronous', executable, args, env],
-        ['minimal env (no PATH/USERPROFILE/APPDATA/LOCALAPPDATA)', executable, args, minimalEnv],
-        ['without the console encoding lines', executable, withoutEncodingLines, env],
-        ['interactive flag dropped', executable, args.filter(arg => arg !== '-NonInteractive'), env],
+      const echo = ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from('$ErrorActionPreference=\'Stop\'; $p=[Console]::In.ReadToEnd(); [Console]::Out.Write($p)', 'utf16le').toString('base64')];
+      const variants: Array<[string, string[], NodeJS.ProcessEnv, string]> = [
+        ['same invocation, synchronous', args, env, asciiJson({file,value})],
+        ['same invocation, the whole process environment', args, process.env, asciiJson({file,value})],
+        ['plain echo program, host environment, ASCII stdin', echo, env, 'ping'],
+        ['plain echo program, whole environment, ASCII stdin', echo, process.env, 'ping'],
+        ['plain echo program, host environment, raw UTF-8 stdin', echo, env, JSON.stringify({file,value})],
       ];
-      const report = variants.map(([label, exe, argv, environment]) => {
+      const report = variants.map(([label, argv, environment, input]) => {
         const started = Date.now();
-        const probe = spawnSync(exe, argv, { input: JSON.stringify({file,value}), env: environment, encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 65_536 });
+        const probe = spawnSync(executable, argv, { input, env: environment, encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 65_536 });
         return `${label}: status=${probe.status} signal=${probe.signal} ${Date.now() - started} ms error=${probe.error?.message ?? ''}\n  stdout=${JSON.stringify(String(probe.stdout ?? '').slice(0, 300))}\n  stderr=${JSON.stringify(String(probe.stderr ?? '').slice(0, 1_500))}`;
       }).join('\n');
       throw new Error(`${String(error)}\n${report}`);
