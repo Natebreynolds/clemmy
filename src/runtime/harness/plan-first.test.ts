@@ -18,6 +18,20 @@ const VAGUE_DEAL_REQUEST =
 
 // ─── priorAnswers never invent provider/resource defaults ───────────────────
 
+test('buildPlannerPrompt: a plain go-ahead with no answers tells the planner to proceed on named defaults, never re-ask', () => {
+  // Owner's user, 2026-10-07: "continue" to an asking plan re-planned the
+  // same request and asked the same questions again.
+  const prompt = buildPlannerPrompt('pull the closed deals into a summary', undefined, undefined, 'continue');
+  assert.match(prompt, /replied "continue" to the prior open questions without answering them/);
+  assert.match(prompt, /Do not ask those questions again/);
+  assert.match(prompt, /name each assumption in the step text/);
+  assert.match(prompt, /Return needsUserInput empty/);
+  // Real answers still win over the go-ahead line.
+  const answered = buildPlannerPrompt('pull the closed deals into a summary', 'last quarter only', undefined, 'continue');
+  assert.match(answered, /The user answered the prior open questions: last quarter only/);
+  assert.doesNotMatch(answered, /without answering them/);
+});
+
 test('buildPlannerPrompt: prior answers never inject a provider-specific destination default', () => {
   const prompt = buildPlannerPrompt('pull the closed deals', 'put them in a sheet');
   assert.doesNotMatch(prompt, /Google Sheet/);

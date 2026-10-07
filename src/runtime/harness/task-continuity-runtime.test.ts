@@ -2667,6 +2667,46 @@ test('a completeness check that cannot run keeps the honest hold instead of gues
   }
 });
 
+test('a continue or amend reading reaches the brain with the question on hold whatever goal reference the quick model bound', async () => {
+  // Owner's user, 2026-10-07: "continue" to Clem's question came back as the
+  // same question. A continue reading with no bound target and an amendment
+  // against a stale revision both fell through the router with the question
+  // still pending and no steer, so the brain re-asked.
+  const shapes: Array<[string, (slot: { goalId: string; revision: number }) => Record<string, unknown>]> = [
+    ['continue, no target', () => ({ version: 1, relation: 'continue_goal', targetGoal: null, goal: null, work: null, slotAnswers: [], rationale: 'go on' })],
+    ['continue, bound target', (slot) => ({ version: 1, relation: 'continue_goal', targetGoal: { goalId: slot.goalId, baseRevision: slot.revision }, goal: null, work: null, slotAnswers: [], rationale: 'go on' })],
+    ['amend, stale revision', (slot) => ({ version: 1, relation: 'amend_goal', targetGoal: { goalId: slot.goalId, baseRevision: slot.revision + 1 }, goal: { summary: 'make it shorter' }, work: null, slotAnswers: [], rationale: 'amend' })],
+  ];
+  let n = 0;
+  for (const [label, reading] of shapes) {
+    const sessionId = `continuity-instruction-past-question-${++n}`;
+    const origin = accepted(sessionId, 'Draft a short note to the team and put it in note.md. Ask me anything you need first.');
+    commitClarification({ sessionId, sourceSeq: origin.seq, question: HELD_DRAFT_QUESTION });
+    const before = continuity.peekTaskContinuityPacket({ sessionId });
+    assert.equal(before.status, 'available', label);
+    if (before.status !== 'available') continue;
+    const reply = accepted(sessionId, 'continue');
+    seedSemanticReading(sessionId, reply.seq, 'admitted', reading(before.packet.pause.slot!));
+    let proposals = 0;
+    runtime._setClarificationRevisionProposerForTests(async () => { proposals++; return { status: 'no_revision', reason: 'no_progress' }; });
+    try {
+      const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+      assert.equal(route?.route, 'respond', label);
+      assert.equal(route?.partialAnswer, true, label);
+      assert.equal(proposals, 0, `${label}: an instruction never asks the quick model for a residual question`);
+      assert.equal(runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: reply.seq }), null, `${label}: no verbatim re-ask`);
+      const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: 'continue' }, reply.seq,
+        { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true } });
+      const steer = enriched.semanticTaskInput ?? '';
+      assert.ok(steer.startsWith('[task-continuation-reply:v1]\n'), `${label}: ${steer.slice(0, 120)}`);
+      assert.ok(steer.includes(`[current-question]\n${HELD_DRAFT_QUESTION}`), `${label}: the brain sees the question exactly as asked`);
+      assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'none', `${label}: released so the brain can act`);
+    } finally {
+      runtime._setClarificationRevisionProposerForTests(null);
+    }
+  }
+});
+
 test('a plain go-ahead to an open question goes to the brain with a settle-and-default directive, never a residual re-ask', async () => {
   // Live 2026-10-06: "Looks right, go." after the facts were supplied was read
   // as answers 0.96 and the turn ended on "same wording as before, or fresh?".

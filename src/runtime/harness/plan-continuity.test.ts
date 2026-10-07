@@ -196,6 +196,46 @@ test('continuity re-entry gate: an EXPLICIT-plan originating request still engag
   );
 });
 
+test('a plain "continue" to an asking plan re-plans on named defaults instead of asking the same questions again', async () => {
+  // Owner's user, 2026-10-07.
+  const sessionId = 'continuity-resume-go-ahead';
+  const channel = 'discord:continuity-resume-go-ahead';
+  createSession({ id: sessionId, kind: 'chat' });
+  const asking = surfaceAskingPlan({
+    plan: aPlan(),
+    originatingRequest: 'Draft me a plan first to create Outlook drafts for the closed deals.',
+    sessionId,
+    channel,
+  });
+  const reply = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'continue' } });
+  const prototype = Runner.prototype as unknown as { run: (...args: unknown[]) => Promise<{ finalOutput: unknown }> };
+  const originalRun = prototype.run;
+  const plannerPrompts: string[] = [];
+  prototype.run = async (...args: unknown[]) => {
+    const prompt = String(args[1] ?? '');
+    if (prompt.includes('Open plan objective:')) return { finalOutput: 'RESUME:' };
+    plannerPrompts.push(prompt);
+    return { finalOutput: {
+      objective: 'Create Outlook drafts for the closed deals.',
+      steps: [{ n: 1, action: 'Create Outlook drafts for last quarter\'s closed-won deals (assumed: last quarter, closed-won only).', rationale: 'Deliver the requested drafts.', verification: 'The drafts exist in Outlook.' }],
+      successCriteria: ['The requested Outlook drafts exist.'], stages: null, risks: [], estimatedComplexity: 'moderate',
+      recommendsTrackedExecution: false, needsUserInput: [], appliedInstructions: [], externalSends: null, voiceMessage: null,
+    } };
+  };
+  try {
+    const result = await routeOpenQuestionPlan({ channel, input: 'continue', sessionId, sourceUserSeq: reply.seq, reuseRecordedUserInput: true });
+    assert.equal(result.kind, 'resume');
+    assert.equal(result.handled, true);
+  } finally {
+    prototype.run = originalRun;
+  }
+  assert.equal(plannerPrompts.length, 1, 'the plan is drafted once more');
+  assert.match(plannerPrompts[0]!, /replied "continue" to the prior open questions without answering them/);
+  assert.match(plannerPrompts[0]!, /Do not ask those questions again/);
+  assert.equal(getPlanProposal(asking.id)?.status, 'superseded', 'the asking plan is replaced, not left open beside the new one');
+  assert.equal(findOpenQuestionPlan(channel), null, 'no open questions remain on the channel');
+});
+
 test('continuity preserves the accepted reply source even when a newer user row exists', async () => {
   const sessionId = 'continuity-exact-source';
   const channel = 'discord:continuity-exact-source';

@@ -43,6 +43,14 @@ export interface PlanFirstRunInput extends PlanFirstInput {
    * rather than re-asking. Flag-gated upstream (CLEMMY_PLAN_CONTINUITY).
    */
   priorAnswers?: string;
+  /**
+   * The user replied to the open questions without answering them — a plain
+   * "continue" / "go ahead" (plan-continuity "resume" with nothing folded in).
+   * The planner then chooses sensible defaults, names each assumption, and
+   * returns a complete plan instead of asking the same questions again
+   * (owner's user, 2026-10-07: "continue" → the same questions back).
+   */
+  proceedWithoutAnswers?: string;
   /** @deprecated Planner drafts are private until validated and persisted.
    * Retained temporarily for caller compatibility. */
   onChunk?: (delta: string) => void | Promise<void>;
@@ -118,7 +126,7 @@ export function shouldUsePlanFirst(input: PlanFirstInput): boolean {
   return false;
 }
 
-export function buildPlannerPrompt(input: string, priorAnswers?: string, memoryContext?: string): string {
+export function buildPlannerPrompt(input: string, priorAnswers?: string, memoryContext?: string, proceedWithoutAnswers?: string): string {
   const lines = [
     'Draft a preflight plan for this fresh Clementine request before any external writes or long-running execution begins.',
     'Do not execute the work. Do not call mutating tools. Produce an inspectable plan the user can approve.',
@@ -129,6 +137,10 @@ export function buildPlannerPrompt(input: string, priorAnswers?: string, memoryC
   if (priorAnswers && priorAnswers.trim().length > 0) {
     lines.push(
       `The user answered the prior open questions: ${priorAnswers.trim()}. Fold those exact answers into the plan. Do not substitute a provider, resource, destination, account, or other default that the accepted request, these answers, or verified memory did not supply. If a material slot is still unresolved, keep only its shortest question in needsUserInput; otherwise return a complete plan with needsUserInput empty.`,
+    );
+  } else if (proceedWithoutAnswers && proceedWithoutAnswers.trim().length > 0) {
+    lines.push(
+      `The user replied "${proceedWithoutAnswers.trim().slice(0, 200)}" to the prior open questions without answering them: they want the plan to go ahead. Do not ask those questions again. Choose a sensible, conservative default for each open question from the request and 'What Clementine already knows', and name each assumption in the step text so the user can correct it. Return needsUserInput empty — keep only one shortest question there if a detail is genuinely unknowable AND the step would send, publish, delete, or otherwise reach outside this machine.`,
     );
   }
   lines.push('', `User request:\n${input}`);
@@ -433,7 +445,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       workflowName: 'clementine-plan-first',
       groupId: input.sessionId,
     });
-    const result = await runner.run(buildPlannerAgent(), buildPlannerPrompt(input.input, input.priorAnswers, memoryContext), {
+    const result = await runner.run(buildPlannerAgent(), buildPlannerPrompt(input.input, input.priorAnswers, memoryContext, input.proceedWithoutAnswers), {
       context: { sessionId: input.sessionId, turn: 0 },
       maxTurns: 8,
       toolExecution: { maxFunctionToolConcurrency: 4 },

@@ -600,12 +600,18 @@ export async function routeOpenQuestionPlan(
   }
 
   if (classification.kind === 'resume') {
+    // A plain "continue" / "go ahead" with nothing folded in: re-planning
+    // the same request with no answers asked the same questions again
+    // (owner's user, 2026-10-07). The planner proceeds on sensible defaults
+    // and names its assumptions; the plan is then reviewable as usual.
+    supersedePlanProposal(openPlan.id);
     const reasked = await runPlanFirstPreflight({
       input: openPlan.originatingRequest,
       sessionId: input.sessionId,
       channel: input.channel,
       freshSession: false,
       autonomy: input.autonomy,
+      proceedWithoutAnswers: input.input,
       reuseRecordedUserInput: input.reuseRecordedUserInput,
       sourceUserSeq: input.sourceUserSeq,
       // No `force`: see the answers branch above. An explicit "resume"

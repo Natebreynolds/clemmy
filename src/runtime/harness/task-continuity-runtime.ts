@@ -347,14 +347,18 @@ export async function classifyUnsettledOpenQuestionReply(input: {
   const relation = taskRelationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
   const typed = typedClassificationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
   const unbound = typed !== undefined && 'keepOpen' in typed && typed.metaAction === undefined;
-  const continuing = relation === 'continue_goal' && unresolvedOpenSlotTargetFromLastInterpretation(input.sessionId, input.sourceUserSeq) !== null;
+  // "Continue" / "go ahead" / "change it to …" while a question waits is an
+  // instruction past the question whatever goal reference the quick model
+  // bound: a continue reading with no bound target, or an amendment against
+  // a stale revision, used to fall through here with the question still
+  // pending and no steer, so the brain re-asked it (owner's user, 2026-10-07,
+  // "continue" → the same question back). The reading's relation is the fact.
+  const continuing = relation === 'continue_goal';
   const raw = interpretation?.raw && typeof interpretation.raw === 'object' && !Array.isArray(interpretation.raw)
     ? interpretation.raw as Record<string, unknown> : null;
   const target = raw?.targetGoal && typeof raw.targetGoal === 'object'
     ? raw.targetGoal as Record<string, unknown> : null;
-  const amending = relation === 'amend_goal' && current.packet.pause.slot !== undefined
-    && target?.goalId === current.packet.pause.slot.goalId
-    && target?.baseRevision === current.packet.pause.slot.revision;
+  const amending = relation === 'amend_goal';
   const boundAnswer = !unreadable && typed !== undefined && 'disposition' in typed
     && (typed.disposition === 'provided' || typed.disposition === 'selected');
   // A single opaque slot can represent several required decisions. The
