@@ -614,7 +614,11 @@ async function startInstalledApp(context, firstLaunch) {
   if (typeof token !== 'string' || token.length < 24) refuse('fixture_local_auth_missing');
   if (existsSync(path.join(context.profile, '.clementine-next'))) refuse('selected_home_ignored');
   // This credential remains in memory; no target/viewer URLs are recorded.
-  const info = await localJSON(`${origin}/api/console/build-info`, token);
+  // A first boot on a cold runner answers slowly; one 5 s read aborting is
+  // "not yet", not a verdict (run 37699594352: a raw TimeoutError here).
+  const info = await waitFor(async () => {
+    try { return await localJSON(`${origin}/api/console/build-info`, token); } catch { return null; }
+  }, 'daemon_build_info_unavailable', 120_000);
   app.served = assertServedIdentity(info, context.expected, path.join(context.installRoot, 'resources', 'daemon', 'dist', 'index.js'));
   app.daemon = exactOwnedProcess(await processes(), app.served.daemonProcessId, context.executable, main.pid);
   if (app.daemon.pid !== daemonCandidate.pid || app.daemon.createdAt !== daemonCandidate.createdAt) refuse('daemon_listener_changed');
@@ -679,7 +683,9 @@ async function quitInstalledApp(app) {
   const current = exactOwnedProcess(await processes(), app.main.pid, app.executable);
   if (current.createdAt !== app.main.createdAt) refuse('desktop_pid_reused');
   await assertListenerOwner(app.port, app.main.pid);
-  const version = await localJSON(`http://127.0.0.1:${app.port}/json/version`);
+  const version = await waitFor(async () => {
+    try { return await localJSON(`http://127.0.0.1:${app.port}/json/version`); } catch { return null; }
+  }, 'desktop_debug_listener_missing', 60_000);
   const browser = new CDP(assertCDPUrl(version.webSocketDebuggerUrl, app.port, 'browser'));
   try {
     await browser.requestQuit();
