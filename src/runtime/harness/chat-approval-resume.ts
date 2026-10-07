@@ -50,7 +50,7 @@ import { BoundaryError } from '../boundary-error.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { publicUserInputText } from './public-presentation.js';
 import { freshExternalWriteEvidenceStatus } from './tool-evidence.js';
-import { PENDING_ACTION_DISPATCH_UNCERTAIN, PENDING_ACTION_PRE_DISPATCH_REFUSAL, executeApprovedPendingActionCall } from '../../execution/pending-action-executor.js';
+import { PENDING_ACTION_DISPATCH_UNCERTAIN, PENDING_ACTION_PRE_DISPATCH_REFUSAL, PENDING_ACTION_TOOL_REFUSAL, executeApprovedPendingActionCall } from '../../execution/pending-action-executor.js';
 import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import { turnOutcomeId, type TurnIdentity } from './turn-outcome.js';
@@ -719,17 +719,39 @@ export function approvedActionFailedText(action: Pick<PendingActionRecord, 'kind
   const shell = action.toolName === 'run_shell_command' || action.kind === 'shell_command';
   const what = shell ? 'the command' : 'it';
   const summary = typeof action.resultSummary === 'string' ? action.resultSummary : '';
-  // Three honest endings, read from the record by the executor's own markers:
-  // refused before anything started (nothing changed), stopped after it may
-  // have begun (uncertain, never retried on its own), or a plain terminal
-  // failure the provider reported (nothing more runs on its own).
+  // Four honest endings, read from the record by the executor's own markers:
+  // refused before anything started (nothing changed); refused by the tool
+  // itself in words after the attempt began (the words reach the owner, the
+  // outcome stays uncertain); stopped after it may have begun (uncertain,
+  // never retried on its own); or a plain terminal failure the provider
+  // reported. Exceptions and provider envelopes never reach the owner as
+  // text; a guard's refusal does, because its reason — a credential that
+  // would leave the machine — is the owner's to hear (live 2026-10-07).
   if (action.status === 'failed' && summary.startsWith(PENDING_ACTION_PRE_DISPATCH_REFUSAL)) {
     return `I couldn't run ${what} — the stored call didn't fit the tool's shape, so it was stopped before it started. Nothing ran and nothing changed.\n\nAsk me again in your own words and I'll build it fresh.`;
+  }
+  if (action.status === 'failed' && summary.startsWith(PENDING_ACTION_TOOL_REFUSAL)) {
+    const words = toolRefusalWords(summary);
+    return `I didn't run ${what} — the tool refused it${words ? `: ${words}` : '.'}\n\nThe refusal came back after the attempt had started, so I can't fully prove nothing changed, and I won't retry it on my own. Say "check" and I'll look at what landed before doing anything else.`;
   }
   if (action.status === 'executing' || summary.startsWith(PENDING_ACTION_DISPATCH_UNCERTAIN)) {
     return `I tried, but I can't tell whether ${what} went through — it stopped partway and the answer never came back, so the outcome is uncertain. I won't retry it on my own.\n\nSay "check" and I'll look at what landed before doing anything else.`;
   }
   return `${shell ? 'The command' : 'It'} didn't go through — the provider reported a terminal failure, and nothing more will run on its own.\n\nAsk me again in your own words if you still want it, and I'll build it fresh.`;
+}
+
+/** A guard's refusal in its own words, without the executor's bookkeeping
+ * or the harness prefix: one line, bounded, ending in a period. */
+export function toolRefusalWords(summary: string): string {
+  const marker = 'no retry is safe:';
+  const at = summary.indexOf(marker);
+  const words = (at >= 0 ? summary.slice(at + marker.length) : '')
+    .replace(/^\s*(?:Tool call refused by harness|Refused|Error)\s*[:\-—]\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!words) return '';
+  const bounded = words.length > 300 ? `${words.slice(0, 297)}…` : words;
+  return /[.!?…]$/.test(bounded) ? bounded : `${bounded}.`;
 }
 
 /** The executor's summary wraps the command's own output in bookkeeping

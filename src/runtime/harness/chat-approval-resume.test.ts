@@ -627,6 +627,15 @@ test('an approved action that did not land ends in Clem\'s words, never the exec
   assert.match(uncertain, /^I tried, but I can't tell whether it went through/);
   assert.match(uncertain, /I won't retry it on my own\./);
   assert.doesNotMatch(uncertain, /socket hang up|composio/);
+  // A guard inside the tool that refused in words: the words reach the
+  // owner (live 2026-10-07: a credential that would leave the machine), the
+  // bookkeeping and the harness prefix do not, and the outcome stays uncertain.
+  const { PENDING_ACTION_TOOL_REFUSAL } = await import('../../execution/pending-action-executor.js');
+  const refusedByTool = approvedActionFailedText({ kind: 'shell_command', toolName: 'run_shell_command', status: 'failed',
+    resultSummary: `${PENDING_ACTION_TOOL_REFUSAL}; provider outcome is uncertain and no retry is safe: Tool call refused by harness: this command would send a credential file off the machine` });
+  assert.match(refusedByTool, /^I didn't run the command — the tool refused it: this command would send a credential file off the machine\./);
+  assert.match(refusedByTool, /can't fully prove nothing changed.*won't retry it on my own/);
+  assert.doesNotMatch(refusedByTool, /harness|Dispatch|execution claim|no retry is safe/);
   const stuck = approvedActionFailedText({ kind: 'external_send', toolName: 'composio_execute_tool', status: 'executing', resultSummary: null });
   assert.match(stuck, /can't tell whether it went through/);
   // A plain terminal failure the provider reported is neither "nothing ran" nor uncertain.

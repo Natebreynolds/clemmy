@@ -67,6 +67,11 @@ export function _setApprovedCallDispatchForTests(dispatch: ApprovedCallDispatch 
   dispatchOverrideForTests = dispatch;
 }
 
+/** The record's own marker for a tool that refused the call in words after
+ * the execution claim began: the words reach the owner, the outcome stays
+ * uncertain because text alone cannot prove no provider commit. */
+export const PENDING_ACTION_TOOL_REFUSAL = 'The tool refused the call after the execution claim began';
+
 /** The record's own marker for a refusal that happened before any provider
  * call: the result summary starts with it. The owner's ending reads it by
  * this constant, never by matching provider prose. */
@@ -279,7 +284,7 @@ export async function executeApprovedPendingActionCall(
       const updated = recordPendingActionResult(
         claimedRecord.id,
         'failed',
-        `Dispatch returned refusal-shaped text after the execution claim began; provider outcome is uncertain and no retry is safe: ${reason}`.slice(0, 4000),
+        `${PENDING_ACTION_TOOL_REFUSAL}; provider outcome is uncertain and no retry is safe: ${reason}`.slice(0, 4000),
         'pending-action-executor',
         claimToken,
       );
