@@ -273,6 +273,14 @@ export interface DeliveryCommitOptions {
    * legacy carrier has not reached the async gate, so the old conservative
    * hold policy remains the fallback. */
   terminalJudgeDisposition?: 'deliver';
+  /** sha256 of the model-authored reply the terminal judge rewrote into the
+   * delivered text. A completion verdict recorded against THAT reply vouches
+   * for the judge's rendering of it: the judge is a reviewer of a different
+   * family that read the same evidence, and its DELIVER text is the public
+   * account of the reply the reviewer passed. Live 2026-10-06: every judge-
+   * delivered turn ended "unverified … recorded against different reply
+   * text" because the digest was compared against the rewrite. */
+  terminalJudgeAuthoredReplyDigest?: string;
 }
 
 export type DeliveryGap = { reason?: string; missing?: readonly string[] };
@@ -1330,8 +1338,20 @@ export function commitTurnOutcome(
       cardRendered: true,
     }),
   );
+  // A JUDGE-DELIVERED REPLY IS THE JUDGE'S RENDERING OF THE REVIEWED REPLY.
+  // The different-family terminal judge rewrites the model's account into the
+  // public text it chose to deliver. The completion review judged the account
+  // the judge read, so its verdict vouches for the rendering exactly when the
+  // digest it recorded names that account; any other wording still has to
+  // match the verdict byte for byte.
+  const replyRendersJudgedAccount = Boolean(
+    options.terminalJudgeDisposition === 'deliver'
+    && options.terminalJudgeAuthoredReplyDigest
+    && publishedVerdict?.replyDigest
+    && publishedVerdict.replyDigest === options.terminalJudgeAuthoredReplyDigest,
+  );
   const replyMatches = publishedVerdict?.replyDigest
-    ? publishedVerdict.replyDigest === replyDigestOf(proposed.text) || replyRendersReviewedPlan
+    ? publishedVerdict.replyDigest === replyDigestOf(proposed.text) || replyRendersReviewedPlan || replyRendersJudgedAccount
     : false;
   // RE-VERIFY the artifacts NOW, against the files as they stand at publication.
   // Trusting the `digestMatches` flags recorded during judging misses every

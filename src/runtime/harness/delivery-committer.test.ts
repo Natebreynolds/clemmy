@@ -856,6 +856,56 @@ for (const variant of ['valid', 'changed-reply', 'foreign-card', 'untrusted-mark
   });
 }
 
+// Live 2026-10-06: the different-family terminal judge chose DELIVER and
+// rewrote the model's account into its own public text; the committer then
+// compared the completion verdict's reply digest against that rewrite, so
+// every judge-delivered turn ended "unverified … recorded against different
+// reply text" (status blocked) with the right words on screen. The verdict
+// judged the account the judge read; it vouches for the judge's rendering
+// exactly when the digest it recorded names that account.
+for (const variant of ['judged-account', 'other-account', 'no-digest'] as const) {
+  test(`a judge-delivered reply is vouched for by the verdict of the account it rendered: ${variant}`, () => {
+    const sessionId = `judge-rendering-${variant}`;
+    createSession({ id: sessionId, kind: 'chat' });
+    const authored = 'The reminder is gone — there was nothing left to delete.';
+    const rendered = 'The reminder is gone. Nothing was left to delete. The delete call returned not_found, so nothing changed.';
+    const original = acceptedAnswer(sessionId, rendered);
+    appendEvent({ sessionId, turn: 1, role: 'system', type: 'completion_policy_captured', data: {
+      version: 1, sourceUserSeq: original.identity.sourceUserSeq, enabled: true,
+    } });
+    appendEvent({ sessionId, turn: 1, role: 'system', type: 'goal_alignment_judged', data: {
+      lane: 'host_v1', kind: 'completion', sourceUserSeq: original.identity.sourceUserSeq, ownerSelectedJudge: true,
+      fulfills: true, failedOpen: false, settledEvidenceAvailable: true,
+      objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+      replyDigest: createHash('sha256').update(authored).digest('hex'),
+    } });
+    const prior = process.env.CLEMMY_COMPLETION_REVIEW;
+    process.env.CLEMMY_COMPLETION_REVIEW = 'on';
+    try {
+      const result = commitTurnOutcome(original, {
+        presentationAlreadyDiscloses: true,
+        terminalJudgeDisposition: 'deliver',
+        ...(variant === 'judged-account'
+          ? { terminalJudgeAuthoredReplyDigest: createHash('sha256').update(authored).digest('hex') }
+          : variant === 'other-account'
+            ? { terminalJudgeAuthoredReplyDigest: createHash('sha256').update('An account the reviewer never saw.').digest('hex') }
+            : {}),
+      });
+      if (variant === 'judged-account') {
+        assert.equal(result.presentation.status, 'done', JSON.stringify(result.event.data).slice(0, 400));
+        assert.equal(result.presentation.text, rendered, 'the judge rendering is delivered as written');
+        assert.equal(result.event.data.verificationDetail, undefined);
+        assert.equal((result.event.data.completionVerdictRef as { verified: boolean }).verified, true);
+      } else {
+        assert.equal(result.presentation.status, 'blocked');
+        assert.equal(result.event.data.verificationDetail, 'completion_review_reply_mismatch');
+      }
+    } finally {
+      if (prior === undefined) delete process.env.CLEMMY_COMPLETION_REVIEW; else process.env.CLEMMY_COMPLETION_REVIEW = prior;
+    }
+  });
+}
+
 // Live 2026-09-28: four approved runs finished done and taught nothing, because
 // learning was keyed to the approval decision's source while the objective,
 // the settled calls and the verdict belong to the request that was approved.

@@ -32,7 +32,7 @@ import {
 import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { HarnessSession } from './session.js';
 import { workflowParentActivation } from './workflow-parent-activation.js';
 import { composeRunProgressLine } from './run-progress.js';
@@ -1686,6 +1686,11 @@ export function hostAccountQuestionForExhaustedTurn(
 }
 
 /** Shared with the ceiling loop's no-progress stop: one voice for "I am stuck". */
+/** The digest the completion review records for a judged reply. */
+function judgedReplyDigest(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
 export const NO_PROGRESS_CHECK_IN_STEER = [
   'You have stopped making progress on this request: your recent tool calls were refused or returned nothing new, and repeating them will not change that.',
   'Do not call tools now. In your own voice, tell the user what you completed and what stopped you. If a specific missing fact or decision from them would let you continue, ask for exactly that in one question. If nothing from them would help, say plainly that you have stopped and what would need to change. Keep it short.',
@@ -2203,6 +2208,8 @@ function finalizeStandardConversation(input: {
   /** A different-family terminal judge explicitly chose truthful delivery.
    * The committer still enforces the deterministic irreversible-effect floor. */
   terminalJudgeDisposition?: 'deliver';
+  /** sha256 of the model-authored reply that judge rewrote (see the committer). */
+  terminalJudgeAuthoredReplyDigest?: string;
   /** The reconciliation branch already resolved its pending-artifact
    * disposition through the terminal judge/repair path. Its legacy typed park
    * is retained only when that repair itself fell back. */
@@ -2290,6 +2297,7 @@ function finalizeStandardConversation(input: {
     ...(input.presentationAlreadyDiscloses ? { presentationAlreadyDiscloses: true } : {}),
     ...(input.deliveryConcern ? { deliveryConcern: input.deliveryConcern } : {}),
     ...(input.terminalJudgeDisposition ? { terminalJudgeDisposition: input.terminalJudgeDisposition } : {}),
+    ...(input.terminalJudgeAuthoredReplyDigest ? { terminalJudgeAuthoredReplyDigest: input.terminalJudgeAuthoredReplyDigest } : {}),
     metadata: dataOut,
   });
   return {
@@ -8050,6 +8058,7 @@ async function runConversationCore(
             presentationAlreadyDiscloses: true,
             deliveryConcern: reconciliationConcern,
             terminalJudgeDisposition: 'deliver',
+            terminalJudgeAuthoredReplyDigest: judgedReplyDigest(authoredText),
             skipPendingArtifactPark: true,
           });
         }
@@ -10074,6 +10083,7 @@ async function runConversationCore(
       // When that judge is unavailable, preserve the earlier safe repair/hold
       // behavior byte-for-byte.
       let terminalJudgeDisposition: 'deliver' | undefined;
+      let terminalJudgeAuthoredReplyDigest: string | undefined;
       let terminalJudgeMetadata: Record<string, unknown> = {};
       if (isCompletedAction && activeSourceUserSeq) {
         const assessment = assessAcceptedSourceDelivery({
@@ -10164,6 +10174,7 @@ async function runConversationCore(
                 publicPresentation,
               };
             }
+            terminalJudgeAuthoredReplyDigest = judgedReplyDigest(userVisibleSummary);
             userVisibleSummary = terminalDecision.publicText;
             terminalRepairAlreadyDiscloses = true;
             terminalJudgeDisposition = 'deliver';
@@ -10322,6 +10333,7 @@ async function runConversationCore(
         ...(terminalRepairAlreadyDiscloses ? { presentationAlreadyDiscloses: true } : {}),
         ...(terminalDeliveryConcern ? { deliveryConcern: terminalDeliveryConcern } : {}),
         ...(terminalJudgeDisposition ? { terminalJudgeDisposition } : {}),
+        ...(terminalJudgeAuthoredReplyDigest ? { terminalJudgeAuthoredReplyDigest } : {}),
       });
       return finalized;
     }
@@ -14827,6 +14839,7 @@ async function runConversationFromResumeCore(opts: {
           }
         : undefined;
       let terminalJudgeDisposition: 'deliver' | undefined;
+      let terminalJudgeAuthoredReplyDigest: string | undefined;
       let terminalJudgeMetadata: Record<string, unknown> = {};
       let terminalPresentationAlreadyDiscloses = false;
       let resumeFromTerminalJudge = false;
@@ -14931,6 +14944,7 @@ async function runConversationFromResumeCore(opts: {
                   publicPresentation,
                 };
               }
+              terminalJudgeAuthoredReplyDigest = judgedReplyDigest(userVisibleSummary ?? '');
               userVisibleSummary = terminalDecision.publicText;
               terminalPresentationAlreadyDiscloses = true;
               terminalJudgeDisposition = 'deliver';
@@ -15009,6 +15023,7 @@ async function runConversationFromResumeCore(opts: {
             : {}),
           ...(resumeDeliveryConcern ? { deliveryConcern: resumeDeliveryConcern } : {}),
           ...(terminalJudgeDisposition ? { terminalJudgeDisposition } : {}),
+          ...(terminalJudgeAuthoredReplyDigest ? { terminalJudgeAuthoredReplyDigest } : {}),
         });
       }
     }
