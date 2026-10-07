@@ -1018,3 +1018,24 @@ test('read-only clarification source lookup never installs missing schema', asyn
     assert.deepEqual(db.prepare('SELECT name FROM sqlite_master WHERE type = ?').all('table'), []);
   } finally { db.close(); }
 });
+
+test('a synthetic input reads as having consumed nothing, never as an invalid consumer', () => {
+  const owner = session('synthetic-reader');
+  const origin = accepted(owner.id, 'Run the export and ask which account if unsure.');
+  const packet = createFullPacket(owner.id, origin.seq, 'export');
+  const hidden = accepted(owner.id, '[approval-resume] The approved action ran; finish the request.', true);
+  assert.deepEqual(
+    continuity.readConsumedTaskContinuityPacket({ sessionId: owner.id, consumingSourceUserSeq: hidden.seq }),
+    { status: 'none' },
+    'a hidden machine source is not the owner\'s answer and consumed nothing',
+  );
+  const reply = accepted(owner.id, 'The second one.');
+  const consumed = continuity.consumeTaskContinuityPacket(consumeInput(owner.id, reply.seq));
+  assert.equal(consumed.status, 'consumed', 'the question is still open for the next real reply');
+  if (consumed.status === 'consumed') assert.equal(consumed.packet.packetId, packet.packetId);
+  assert.equal(
+    continuity.readConsumedTaskContinuityPacket({ sessionId: owner.id, consumingSourceUserSeq: hidden.seq + 1000 }).status,
+    'invalid_source',
+    'a missing source is still invalid',
+  );
+});

@@ -981,6 +981,18 @@ function acceptedSource(db: Database.Database, sessionId: string, sourceUserSeq:
   return acceptedSourceFromRow(rawSource(db, sessionId, sourceUserSeq));
 }
 
+/** A well-formed user input row whose data says `synthetic: true`. */
+function syntheticSource(db: Database.Database, sessionId: string, sourceUserSeq: number): boolean {
+  const row = rawSource(db, sessionId, sourceUserSeq);
+  if (!row || row.type !== 'user_input_received' || row.role !== 'user') return false;
+  try {
+    const data: unknown = JSON.parse(row.data_json);
+    return isPlainObject(data) && data.synthetic === true;
+  } catch {
+    return false;
+  }
+}
+
 /** The next non-synthetic user source. A malformed candidate fails closed. */
 function nextAcceptedSource(db: Database.Database, sessionId: string, afterSeq: number): AcceptedSource | null {
   const rows = db.prepare(`
@@ -1201,7 +1213,19 @@ function consumedLookupResult(
   consumingSourceUserSeq: number,
 ): ConsumedTaskContinuityLookupResult {
   const consumer = acceptedSource(db, sessionId, consumingSourceUserSeq);
-  if (!consumer) return { status: 'invalid_source' };
+  if (!consumer) {
+    // A synthetic (machine) input can never be the owner's answer to a
+    // question, so it consumed nothing: that is "none", not an invalid
+    // consumer. Reading it as invalid refused every host turn driven from a
+    // hidden source before any model (live 2026-10-06, the continuation
+    // after an approved action). A synthetic row that somehow holds a
+    // consumption stays invalid.
+    if (syntheticSource(db, sessionId, consumingSourceUserSeq)
+      && consumedPacketRowsForSource(db, sessionId, consumingSourceUserSeq).length === 0) {
+      return { status: 'none' };
+    }
+    return { status: 'invalid_source' };
+  }
   const rows = consumedPacketRowsForSource(db, sessionId, consumer.seq);
   if (rows.length === 0) return { status: 'none' };
   if (rows.length > 1) return { status: 'ambiguous' };
