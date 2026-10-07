@@ -457,7 +457,8 @@ import { HarnessSession } from '../runtime/harness/session.js';
 import { stopExactHarnessAttempt } from '../runtime/harness/stop-exact-attempt.js';
 import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconcile.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
-import { routeReplyToPendingApproval } from '../runtime/harness/approval-reply-routing.js';
+import { routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
+import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-source-session-branch.js';
 import { getSlackRuntimeStatus } from '../channels/slack.js';
 import { SLACK_APP_MANIFEST_YAML } from '../channels/slack-manifest.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
@@ -17134,13 +17135,20 @@ export function registerConsoleRoutes(
     // tryHandleHarnessApprovalReply pattern — without this, the chat
     // dock had no way to resume a paused session, the SEND button sat
     // in THINKING forever, and the user couldn't continue the workflow.
-    const harnessSession = HarnessSession.load(sessionId);
+    // The waiting card may live in an ancestor of this conversation (see
+    // sessionHoldingWaitingCard): read and commit the decision there.
+    const cardSessionId = sessionHoldingWaitingCard(
+      sessionId,
+      sameConversationAncestorSessionIds({ sessionId, principalId: 'desktop' }),
+      (id) => Boolean(HarnessSession.load(id)?.loadInterruptState()),
+    );
+    const harnessSession = HarnessSession.load(cardSessionId);
     const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();
     // Registry-owned approvals have no RunState interrupt. Most belong to a
     // still-alive Agent SDK query; Workspace buttons are standalone continuations
     // owned by their deterministic runtime.
     const registryApprovalPending = !isPausedOnApproval
-      && approvalRegistry.listPending({ sessionId, status: 'pending' })
+      && approvalRegistry.listPending({ sessionId: cardSessionId, status: 'pending' })
         .some(approvalRegistry.isFormalApprovalSurface);
     // Approvals parked in a background task THIS chat spawned live in the
     // task's OWN run session, so the session-scoped registry check above never
@@ -17165,22 +17173,26 @@ export function registerConsoleRoutes(
     // waiting delete card was never read, started a fresh turn on a successor
     // session and minted a second card for the same action.
     if (!connectionContext && (isPausedOnApproval || registryApprovalPending) && !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0 && input.trim()) {
-      const routed = await routeReplyToPendingApproval({ sessionId, text: input, parsed: parsedIntent })
+      const routed = await routeReplyToPendingApproval({ sessionId: cardSessionId, text: input, parsed: parsedIntent })
         .catch(() => null);
       if (routed) {
         intent = routed.intent;
         approvalChangeRequest = routed.changeRequest;
-        approvalConfirm = routed.confirm;
+        // A reply Jev could not read at all asks the card's question back
+        // only when the card's turn is PAUSED on it — where a fresh turn
+        // would branch away from the card. A live, in-flight owner takes the
+        // words as a steer instead, as it always did.
+        approvalConfirm = routed.confirm?.leaning === 'unread' && !isPausedOnApproval ? undefined : routed.confirm;
       }
     }
 
     try {
-      const control = tryCommitLiveApprovalControl({ sessionId, requestId: requestIdentity.requestId,
+      const control = tryCommitLiveApprovalControl({ sessionId: cardSessionId, requestId: requestIdentity.requestId,
         inputHash: payloadHash, text: input, intent,
         eligible: !explicitTaskMode && !proposedEarlyRoute && !isPausedOnApproval
           && registryApprovalPending && attachmentIds.length === 0,
         queuedEligible: !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0
-          && approvalRegistry.listPending({ sessionId, status: 'pending' })
+          && approvalRegistry.listPending({ sessionId: cardSessionId, status: 'pending' })
             .some((row) => approvalRegistry.isFormalApprovalSurface(row) && pendingActionIdFromArgs(row.args) !== null),
         // A leaning reply asks the card's question back whether the card's
         // turn is parked on a checkpoint or waiting in the registry; it only

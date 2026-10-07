@@ -151,7 +151,9 @@ test('approve-execute on a card the resume owns reports the resume\'s one execut
     // The resume settled its own accepted source with what landed.
     const settled = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
     assert.ok(settled, 'the approval source settled');
-    assert.match(JSON.stringify(settled!.data), /Executed the approved run_shell_command call/);
+    // The ending speaks as Clem (the card-voice patch): what ran and what it
+    // printed, never the host's "Executed the approved … call".
+    assert.match(JSON.stringify(settled!.data), /Done — I ran it/);
   } finally {
     _setApprovedCallDispatchForTests(null);
     _resetChatApprovalResumeForTest();

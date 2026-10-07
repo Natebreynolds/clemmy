@@ -20,7 +20,7 @@ const eventlog = await import('./eventlog.js');
 const registry = await import('./approval-registry.js');
 const pending = await import('./pending-actions.js');
 const jev = await import('../jev/client.js');
-const { routeReplyToPendingApproval, isExactApprovalDecision, describePendingApproval } = await import('./approval-reply-routing.js');
+const { routeReplyToPendingApproval, isExactApprovalDecision, describePendingApproval, sessionHoldingWaitingCard } = await import('./approval-reply-routing.js');
 const { parseApprovalIntent } = await import('./approval-intent.js');
 
 test.after(() => {
@@ -339,4 +339,20 @@ test('Jev reads the question Clem asked on the card, and an unsure yes becomes t
     { intent: null, confirm: { approvalId: card.approvalId, leaning: 'declines', question: 'Just to be sure — should I send this Slack message to the fixture channel?' } },
   );
   assert.ok(asked.at(-1)!.includes('Clem asked: Can I send this Slack message'), 'the ask reached Jev');
+});
+
+test('a typed decision finds the waiting card in an ancestor of the conversation', () => {
+  // Live 2026-10-06, twice: a wavering reply started a fresh turn in a
+  // successor session, the card stayed pending in the parent, and the next
+  // "Yes." reached a session with no card and started a new write.
+  const parent = waitingCard();
+  const child = eventlog.createSession({ id: `approval-reply-child-${++serial}`, kind: 'chat' });
+  assert.equal(sessionHoldingWaitingCard(child.id, [parent.sessionId]), parent.sessionId, 'the parent holds the card');
+  assert.equal(sessionHoldingWaitingCard(parent.sessionId, []), parent.sessionId, 'the session itself comes first');
+  const other = eventlog.createSession({ id: `approval-reply-other-${++serial}`, kind: 'chat' });
+  assert.equal(sessionHoldingWaitingCard(other.id, []), other.id, 'no card anywhere: the session stands');
+  assert.equal(sessionHoldingWaitingCard(other.id, [child.id], (id) => id === child.id), child.id,
+    'a session paused on its card counts even before the registry row is visible');
+  registry.resolve(parent.approvalId, 'approved', 'test');
+  assert.equal(sessionHoldingWaitingCard(child.id, [parent.sessionId]), child.id, 'a decided card holds nothing');
 });

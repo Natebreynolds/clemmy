@@ -78,6 +78,30 @@ function confirmationAlreadyAsked(sessionId: string, question: string): boolean 
   }
 }
 
+/** THE CARD MAY LIVE IN AN ANCESTOR OF THIS CONVERSATION. A reply that was
+ * conversation (a question about the card, a waver) starts a fresh turn in a
+ * successor session while the card stays pending in the parent; the next
+ * "Yes." then reached a session with no card and started a new delete, send
+ * or create (live 2026-10-06, twice). Typed decisions are read against the
+ * nearest session in this conversation's lineage that holds a formal waiting
+ * card (the session itself first), and committed there. */
+export function sessionHoldingWaitingCard(
+  sessionId: string,
+  lineage: readonly string[],
+  pausedOnApproval: (id: string) => boolean = () => false,
+): string {
+  const holds = (id: string): boolean => {
+    try {
+      return approvalRegistry.listPending({ sessionId: id, status: 'pending' }).some(approvalRegistry.isFormalApprovalSurface)
+        || pausedOnApproval(id);
+    } catch {
+      return false;
+    }
+  };
+  if (holds(sessionId)) return sessionId;
+  return lineage.find(holds) ?? sessionId;
+}
+
 export function describePendingApproval(row: approvalRegistry.PendingApprovalRow): string {
   const words = pendingApprovalWords(row.approvalId);
   const framing = [
