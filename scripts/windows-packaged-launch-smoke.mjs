@@ -492,6 +492,63 @@ async function skipSetup(app) {
   } finally { page.close(); }
 }
 
+/** What the installed app did when its debug listener never answered:
+ * structural facts in the receipt, and the tails of the isolated fixture
+ * home's own logs as separate redacted files in the diagnostics upload.
+ * The home is synthetic (no accounts, live models disabled); tokens, keys
+ * and long opaque strings are still cut before anything is written. */
+async function collectLaunchDiagnostics(app, error) {
+  const diagnostics = {
+    failure: error instanceof SmokeError ? error.code : 'qualification_failed',
+    elapsedMs: Date.now() - app.launchStartedAt,
+    childExitCode: app.child.exitCode, childSignal: app.child.signalCode,
+    devToolsActivePort: existsSync(path.join(app.userData, 'DevToolsActivePort')),
+    userDataEntries: safeNames(app.userData), homeStateEntries: safeNames(path.join(app.env.CLEMENTINE_HOME, 'state')),
+    clementineProcesses: null, logs: [],
+  };
+  try { diagnostics.clementineProcesses = (await processes()).length; } catch { /* the launch failure stands */ }
+  const roots = [['user-data', path.join(app.userData, 'logs')], ['home', path.join(app.env.CLEMENTINE_HOME, 'logs')],
+    ['profile', path.join(app.profile, '.clementine-next', 'logs')]];
+  const directory = path.join(app.diagnosticsDir, 'launch-diagnostics');
+  for (const [label, root] of roots) {
+    for (const file of logFiles(root)) {
+      let raw; try { raw = readFileSync(file); } catch { continue; }
+      const tail = raw.subarray(Math.max(0, raw.length - 48_000)).toString('utf8');
+      const name = `${label}-${path.relative(root, file).replace(/[^A-Za-z0-9._-]+/g, '_')}`;
+      try { mkdirSync(directory, { recursive: true }); writeFileSync(path.join(directory, name), redactLogText(tail)); } catch { continue; }
+      diagnostics.logs.push({ file: name, bytes: raw.length });
+    }
+  }
+  return diagnostics;
+}
+
+function safeNames(directory) {
+  try { return readdirSync(directory).filter((name) => /^[A-Za-z0-9._ -]+$/.test(name)).sort().slice(0, 64); } catch { return null; }
+}
+
+function logFiles(root) {
+  const found = [];
+  const walk = (directory, depth) => {
+    let names; try { names = readdirSync(directory); } catch { return; }
+    for (const name of names) {
+      const file = path.join(directory, name); let stat;
+      try { stat = lstatSync(file); } catch { continue; }
+      if (stat.isDirectory() && !stat.isSymbolicLink() && depth < 3) walk(file, depth + 1);
+      else if (stat.isFile() && /\.(?:log|txt|jsonl)(?:\.\d+)?$/.test(name)) found.push(file);
+    }
+  };
+  walk(root, 0);
+  return found.slice(0, 12);
+}
+
+function redactLogText(text) {
+  return text
+    .replace(/(token|key|secret|password|authorization|signature)(["']?\s*[:=]\s*["']?)[^&\s"']+/gi, '$1$2[redacted]')
+    .replace(/Bearer\s+\S+/g, 'Bearer [redacted]')
+    .replace(/[?&][A-Za-z_]*(?:token|key|secret|sig)[A-Za-z_]*=[^&\s]*/gi, (match) => `${match.slice(0, match.indexOf('=') + 1)}[redacted]`)
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, '[redacted-opaque]');
+}
+
 async function startInstalledApp(context, firstLaunch) {
   if ((await processes()).length !== 0) refuse('existing_clementine_process');
   let port = await freePort();
@@ -517,9 +574,18 @@ async function startInstalledApp(context, firstLaunch) {
   }, 'desktop_process_missing', 30_000);
   const app = { ...context, child, main, port, userData };
   context.activeApp = app;
-  await waitFor(async () => {
-    try { await localJSON(`http://127.0.0.1:${port}/json/version`); return true; } catch { return null; }
-  }, 'desktop_debug_listener_missing', 30_000);
+  // The process was alive for the whole 30 s wait in run 37670309581 with
+  // no listener yet: a first start on a cold runner loads a 236 MB
+  // executable while Defender scans 1.4 GB of fresh files. The bound now
+  // matches the other waits, and a miss records what the app itself says.
+  try {
+    await waitFor(async () => {
+      try { await localJSON(`http://127.0.0.1:${port}/json/version`); return true; } catch { return null; }
+    }, 'desktop_debug_listener_missing', 120_000);
+  } catch (error) {
+    context.launchDiagnostics = await collectLaunchDiagnostics(app, error);
+    throw error;
+  }
   await assertListenerOwner(port, main.pid);
   if (firstLaunch) await skipSetup(app);
   // The app's real React landing redirect normally changes /console to
@@ -850,7 +916,7 @@ export async function main(args = process.argv.slice(2)) {
     env.CLEMENTINE_MOBILE_APP_PORT = String(await freePort());
     env.CLEMENTINE_MOBILE_APP_LISTENER = 'on';
     for (const directory of [profile, env.APPDATA, env.LOCALAPPDATA, env.TEMP, env.CLEMENTINE_HOME]) mkdirSync(directory, { recursive: true });
-    context = { profile, installRoot, fixtureRoot, fixtureNonce, env,
+    context = { profile, installRoot, fixtureRoot, fixtureNonce, env, diagnosticsDir: path.dirname(options.receipt),
       executable: path.join(installRoot, 'Clementine.exe'), expected: candidate };
     if (existsSync(path.join(env.CLEMENTINE_HOME, 'state', 'setup-complete.json'))) refuse('fixture_not_fresh');
     // Recheck immediately before installer effect. /D is deliberately final;
@@ -919,6 +985,7 @@ export async function main(args = process.argv.slice(2)) {
     if (error instanceof SmokeError && error.childCleanup) {
       receipt.ownedChildCleanup = { result: error.childCleanup, qualifiesGracefulOrInstallerSuccess: false };
     }
+    if (context?.launchDiagnostics) receipt.launchDiagnostics = context.launchDiagnostics;
     if (context) receipt.failureCleanup = await cleanupFailedCIApp(context);
     receipt.finishedAt = new Date().toISOString(); record();
     throw new SmokeError(receipt.failureCode);
