@@ -71,7 +71,12 @@ export const WRITE_TOOLS: ReadonlySet<string> = innerDispatchSets.write;
 /** Read-only tools available to the nested dispatcher (registry-derived). */
 export const READ_ONLY_TOOLS: ReadonlySet<string> = innerDispatchSets.readOnly;
 
-type InvokableTool = { name: string; invoke?: (ctx: unknown, input: string, details: unknown) => Promise<unknown> };
+type InvokableTool = {
+  name: string;
+  /** The tool's declared input JSON schema (the SDK keeps the strict schema beside the parser). */
+  parameters?: unknown;
+  invoke?: (ctx: unknown, input: string, details: unknown) => Promise<unknown>;
+};
 
 export interface InnerDispatchShellResult {
   ok: boolean;
@@ -223,6 +228,18 @@ async function realToolsByName(): Promise<Map<string, InvokableTool>> {
   }
   toolsByName = m;
   return m;
+}
+
+/** The declared input schema of a tool the nested dispatcher can run, by its
+ * exact name; null when the tool is unknown here or declares none. Read at
+ * queue time so an exact payload is completed and checked against the tool
+ * it names before a card ever shows it (see tool-payload-shape.ts). */
+export async function innerDispatchToolParameters(name: string): Promise<Record<string, unknown> | null> {
+  const tool = (await realToolsByName()).get(name);
+  const parameters = tool?.parameters;
+  return parameters && typeof parameters === 'object' && !Array.isArray(parameters)
+    ? parameters as Record<string, unknown>
+    : null;
 }
 
 /** Test seam: inject the tools-by-name map (fake gated tools) so gate-parity can

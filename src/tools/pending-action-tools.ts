@@ -20,6 +20,7 @@ import {
   type PendingActionStatus,
 } from '../runtime/harness/pending-actions.js';
 import { textResult } from './shared.js';
+import { completePayloadForToolSchema, payloadShapeRefusal } from './tool-payload-shape.js';
 import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js';
 import {
   evaluateRecipientSetIntegrity,
@@ -255,7 +256,21 @@ export function registerPendingActionTools(server: McpServer): void {
       } catch (err) {
         return textResult(`pending_action_queue refused: ${err instanceof Error ? err.message : String(err)}`);
       }
-      const { toolName, payload, executionAuthority } = admitted;
+      const { toolName, executionAuthority } = admitted;
+      let payload = admitted.payload;
+      // A card promises exactly what will run, so the payload must fit the
+      // tool it names before the card exists. Live 2026-10-07: a queued
+      // shell command without its nullable `cwd` was approved, then refused
+      // before dispatch — the owner's yes ran nothing.
+      try {
+        const { innerDispatchToolParameters } = await import('./inner-dispatch.js');
+        const schema = await innerDispatchToolParameters(toolName);
+        if (schema && payload && typeof payload === 'object' && !Array.isArray(payload)) {
+          const shaped = completePayloadForToolSchema(schema, payload as Record<string, unknown>);
+          if (shaped.issues.length > 0) return textResult(payloadShapeRefusal(toolName, shaped.issues));
+          payload = shaped.payload;
+        }
+      } catch { /* an unreadable schema leaves validation to dispatch, as before */ }
       const sessionId = ownedSessionId();
       if (getToolOutputContext() && !sessionId) {
         return textResult('pending_action_queue refused: the active harness context has no authoritative session owner.');

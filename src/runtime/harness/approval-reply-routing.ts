@@ -5,7 +5,7 @@ import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { APPROVAL_REPLY_SURE, classifyApprovalReplyWithJev } from '../jev/control-plane.js';
 import { approvalReplyTargets, parseApprovalIntent } from './approval-intent.js';
 import { selectAddressedApproval } from './approval-addressing.js';
-import { openEventLog } from './eventlog.js';
+import { appendEvent, openEventLog } from './eventlog.js';
 
 export interface ApprovalReplyRoute {
   /** Null suppresses a supplied decision while preserving normal conversation. */
@@ -154,9 +154,10 @@ export async function routeReplyToPendingApproval(input: {
     const row = selected.row;
     // A queued exact payload (a shell command, a send) is approved or
     // declined in words like any other card; the resume compiles the owner's
-    // decision as the control source it is. It cannot be amended in place: a
-    // change is a fresh action and a new card.
-    const queued = pendingActionIdFromArgs(row.args) !== null;
+    // decision as the control source it is. A change is never applied in
+    // place: it rejects this exact card as changed and the owner's words run
+    // as the next turn, whose fresh card names the one it revises
+    // (owner-approved design, 2026-10-07; see resolveQueuedCardAsChanged).
     // Mobile supplies no parsed intent for bare declines. Preserve that
     // control after target selection without spending a semantic model call.
     if (exact?.decision === 'reject') {
@@ -181,7 +182,6 @@ export async function routeReplyToPendingApproval(input: {
       return { intent: null, confirm: { approvalId: row.approvalId, leaning: 'unread', question: confirmQuestionFor(row) } };
     }
     const sure = reading.kind !== null && (reading.confidence ?? 0) >= APPROVAL_REPLY_SURE;
-    if (queued && reading.kind === 'changes') return fallback;
     if (sure && reading.kind === 'changes') {
       return { intent: { decision: 'reject', approvalId: row.approvalId }, changeRequest: text };
     }
@@ -208,4 +208,28 @@ export async function routeReplyToPendingApproval(input: {
     // a registry read or semantic interpretation is unavailable.
     return fallback;
   }
+}
+
+/**
+ * A change in words on a card that links a queued exact payload. The queued
+ * payload cannot be amended in place, so the card is resolved as changed —
+ * one typed resolution carrying the owner's words, written before the
+ * registry settles it so the card copy reads "Changed" and never "Declined" —
+ * and the caller runs those words as an ordinary turn. The fresh card that
+ * turn raises names this one (loop.ts revisedCardLink). Returns false when
+ * the card is not a queued one or is no longer pending; nothing is written.
+ */
+export function resolveQueuedCardAsChanged(input: { sessionId: string; approvalId: string; changeRequest: string }): boolean {
+  const row = approvalRegistry.get(input.approvalId);
+  if (!row || row.status !== 'pending' || pendingActionIdFromArgs(row.args) === null) return false;
+  const change = input.changeRequest.trim().slice(0, 600);
+  if (!change) return false;
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: 0,
+    role: 'system',
+    type: 'approval_resolved',
+    data: { approvalId: row.approvalId, tool: row.tool, decision: 'reject', resolution: 'rejected', sticky: false, edited: false, changeRequested: true, changeRequest: change },
+  });
+  return approvalRegistry.resolve(row.approvalId, 'rejected', 'chat-dock-change-request').ok;
 }

@@ -169,14 +169,17 @@ test('missing, malformed, multiple and queued references never fall back to a pl
   for (const text of [
     'approve apr-miss with changes', 'approve apr-malformed with changes',
     `approve ${card.approvalId} and reject ${queued.approvalId}`,
-    `approve ${queued.approvalId} but shorten it`,
   ]) {
     assert.deepEqual(await routeReplyToPendingApproval({ sessionId: card.sessionId, text, parsed: { decision: 'approve' } }),
       { intent: null }, text);
   }
-  // Only the queued-card amendment reaches Jev now (and still never resolves it).
-  assert.ok(asked.length - before <= 1, 'ambiguous or malformed references never ask Jev to guess a target');
-  assert.equal(pending.getPendingAction(action.id)?.status, 'approval_requested');
+  assert.equal(asked.length, before, 'ambiguous or malformed references never ask Jev to guess a target');
+  // An addressed amendment of the queued card is a change on that exact card
+  // (owner-approved design, 2026-10-07): rejected as changed, words run next.
+  const amend = `approve ${queued.approvalId} but shorten it`;
+  assert.deepEqual(await routeReplyToPendingApproval({ sessionId: card.sessionId, text: amend, parsed: { decision: 'approve' } }),
+    { intent: { decision: 'reject', approvalId: queued.approvalId }, changeRequest: amend });
+  assert.equal(pending.getPendingAction(action.id)?.status, 'approval_requested', 'routing resolves nothing itself');
 });
 
 test('a queued exact payload is approved or declined in words like any other card, never amended in place', async () => {
@@ -194,10 +197,39 @@ test('a queued exact payload is approved or declined in words like any other car
   reading = { choice: 'declines', confidence: 0.95 };
   assert.deepEqual(await routeReplyToPendingApproval({ sessionId: session.id, text: 'No, skip it.', parsed: null }),
     { intent: { decision: 'reject', approvalId: queued.approvalId } });
+  // A change is never applied to the queued payload in place: it rejects
+  // this exact card as changed and the owner's words run as the next turn
+  // (owner-approved design, 2026-10-07; live that day "Yes, but add -v" left
+  // the old card pending forever beside an unrelated new one).
   reading = { choice: 'changes', confidence: 0.95 };
   assert.deepEqual(await routeReplyToPendingApproval({ sessionId: session.id, text: 'run it with -v instead', parsed: null }),
-    null, 'a queued payload is never amended in place');
+    { intent: { decision: 'reject', approvalId: queued.approvalId }, changeRequest: 'run it with -v instead' });
   assert.equal(pending.getPendingAction(action.id)?.status, 'approval_requested', 'routing describes a control; it resolves nothing');
+});
+
+test('a change on a queued card resolves it as changed, in the owner\'s words, before the registry settles it', async () => {
+  const { resolveQueuedCardAsChanged } = await import('./approval-reply-routing.js');
+  const session = eventlog.createSession({ id: `approval-reply-queued-${++serial}`, kind: 'chat' });
+  const action = pending.queuePendingAction({ title: 'Run `ssh -G localhost`', summary: 'Runs once', kind: 'shell_command',
+    toolName: 'run_shell_command', payload: { command: 'ssh -G localhost', cwd: null, timeout_ms: null }, sessionId: session.id });
+  const queued = registry.register({ sessionId: session.id, subject: 'Run `ssh -G localhost`', tool: 'pending_action_execute',
+    args: { pendingActionId: action.id } });
+  eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'approval_requested',
+    data: { approvalId: queued.approvalId, tool: 'request_approval', preview: { operation: 'run_shell_command', fields: [{ name: 'command', value: 'ssh -G localhost' }] } } });
+  assert.equal(resolveQueuedCardAsChanged({ sessionId: session.id, approvalId: queued.approvalId, changeRequest: 'Yes, but add -v so I can see the verbose output too.' }), true);
+  assert.equal(registry.get(queued.approvalId)?.status, 'resolved');
+  assert.equal(registry.get(queued.approvalId)?.resolution, 'rejected');
+  assert.equal(registry.get(queued.approvalId)?.resolver, 'chat-dock-change-request');
+  const resolutions = eventlog.listEvents(session.id, { types: ['approval_resolved'] })
+    .filter((event) => event.data.approvalId === queued.approvalId);
+  assert.equal(resolutions.length, 1, 'one typed resolution: the registry settlement sees it and writes no second, plain "declined" copy');
+  assert.equal(resolutions[0].data.changeRequested, true);
+  assert.equal(resolutions[0].data.changeRequest, 'Yes, but add -v so I can see the verbose output too.');
+  assert.equal(resolutions[0].data.decision, 'reject');
+  // Not a queued card, or no longer pending: nothing is written.
+  const card = waitingCard();
+  assert.equal(resolveQueuedCardAsChanged({ sessionId: card.sessionId, approvalId: card.approvalId, changeRequest: 'shorter' }), false);
+  assert.equal(resolveQueuedCardAsChanged({ sessionId: session.id, approvalId: queued.approvalId, changeRequest: 'again' }), false);
 });
 
 test('unavailable or unsure interpretation never restores a legacy prefix decision', async () => {

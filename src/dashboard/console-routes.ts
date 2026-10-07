@@ -457,7 +457,7 @@ import { HarnessSession } from '../runtime/harness/session.js';
 import { stopExactHarnessAttempt } from '../runtime/harness/stop-exact-attempt.js';
 import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconcile.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
-import { routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
+import { resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
 import { approvalArgsWithFieldEdits } from '../runtime/harness/approval-call-preview.js';
 import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-source-session-branch.js';
 import { getSlackRuntimeStatus } from '../channels/slack.js';
@@ -17202,6 +17202,16 @@ export function registerConsoleRoutes(
         // would branch away from the card. A live, in-flight owner takes the
         // words as a steer instead, as it always did.
         approvalConfirm = routed.confirm?.leaning === 'unread' && !isPausedOnApproval ? undefined : routed.confirm;
+        // A change in words on a queued exact payload: the card is resolved
+        // as changed and the owner's words run as this turn, whose fresh
+        // card names the one it revises. Live 2026-10-07 ("Yes, but add -v"):
+        // the words ran as a turn but the old card stayed pending forever and
+        // the new card stood alone.
+        if (intent?.decision === 'reject' && intent.approvalId && approvalChangeRequest
+          && resolveQueuedCardAsChanged({ sessionId: cardSessionId, approvalId: intent.approvalId, changeRequest: approvalChangeRequest })) {
+          intent = null;
+          approvalChangeRequest = undefined;
+        }
       }
     }
     if ((intent || approvalConfirm) && cardSessionId !== sessionId) {
