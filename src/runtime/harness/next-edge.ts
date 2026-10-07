@@ -82,7 +82,7 @@ const DEFAULT_SAY: Record<NextEdgeChange, string> = {
   publish_partial: 'The work is unresolved — publish the honest partial with its gaps named rather than gathering more.',
   ask_user: 'Ask the user this one exact question; it cannot be discovered.',
   choose_other_capability: 'This exact capability cannot serve this step — select a different one.',
-  queue_for_approval: 'Queue this exact call once with pending_action_queue (same tool, same arguments, approvalIntent request_now), then stop for the owner\'s card. Do not retry the call itself.',
+  queue_for_approval: 'Queue this exact call once with pending_action_queue (same tool, same arguments, approvalIntent request_now, and ask: your own words to the owner — what you need to do and why, ending with the go-ahead question), then end the turn speaking to the owner, never about gates or the harness. Do not retry the call itself.',
 };
 
 /** Build an edge. `say` is derived unless the caller knows something better;

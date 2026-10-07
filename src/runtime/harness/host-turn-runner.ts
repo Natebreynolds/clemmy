@@ -11681,8 +11681,11 @@ export function offMachineCallNeedsCardRepair(carrierName: string, toolName: str
     + exactArgs
     + ` Queue it ONCE: call_tool with name "pending_action_queue" and args_json holding kind "shell_command", toolName "${toolName}", `
     + 'payloadJson set to exactly those same arguments as a JSON string, a short title, a one-sentence summary of what it changes and where, '
-    + 'and approvalIntent "request_now". Then end the turn with one sentence saying the command is waiting for approval. '
-    + 'After approval the harness runs that exact command once and reports the result; do not run it yourself, do not retry it through '
+    + 'approvalIntent "request_now", and ask: your own words to the owner — what you need to do and why their request needs it, ending with the go-ahead question '
+    + '(the exact command is shown under your words automatically). '
+    + 'Then end the turn speaking to the owner as you would in person: what is done, what you need to do next and that you are waiting on their go-ahead. '
+    + 'Never mention gates, refusals, dispatch, cards, ids, hashes or the harness to them. '
+    + 'After their yes the exact command runs once and the result comes back; do not run it yourself, do not retry it through '
     + `${carrierName}, and do not call pending_action_execute.`;
 }
 
