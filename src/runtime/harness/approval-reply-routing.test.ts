@@ -207,11 +207,43 @@ test('unavailable or unsure interpretation never restores a legacy prefix decisi
   assert.deepEqual(await routeReplyToPendingApproval(input), { intent: null });
   jev._setTypesafeKeyForTests(null);
   try {
-    assert.deepEqual(await routeReplyToPendingApproval(input), { intent: null });
+    // Jev unavailable: no decision is restored; the card's own question is
+    // asked back instead of a fresh turn (see the next pin).
+    const routed = await routeReplyToPendingApproval(input);
+    assert.equal(routed?.intent, null);
+    assert.equal(routed?.confirm?.approvalId, card.approvalId);
+    assert.equal(routed?.confirm?.leaning, 'unread');
   } finally {
     jev._setTypesafeKeyForTests('ts_test');
   }
   assert.equal(registry.get(card.approvalId)?.status, 'pending');
+});
+
+test('when Jev cannot read the reply, Clem asks the card\'s question back once, then the reply is conversation', async () => {
+  // Live 2026-10-06: "Yes, delete it." to a waiting delete card passed Jev's
+  // deadline under load; the reply started a fresh turn, which branched into
+  // a successor session with no card, re-derived the delete and minted a
+  // duplicate card. A yes or no to the question asked back is parsed exactly.
+  const card = waitingCard();
+  const question = 'Just to be sure — should I go ahead with "Send Slack message"?';
+  jev._setTypesafeKeyForTests(null);
+  try {
+    assert.deepEqual(
+      await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'Yes, delete it.', parsed: null }),
+      { intent: null, confirm: { approvalId: card.approvalId, leaning: 'unread', question } },
+    );
+    // The host committed that question (what the console does with a confirm).
+    eventlog.appendEvent({ sessionId: card.sessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
+      data: { sourceUserSeq: 1, reason: 'approval_confirmation_required', question, options: ['Yes', 'No'] } });
+    assert.equal(
+      await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'hmm, the second one I think', parsed: null }),
+      null,
+      'a second unreadable reply to the same question is conversation, never a loop',
+    );
+  } finally {
+    jev._setTypesafeKeyForTests('ts_test');
+  }
+  assert.equal(registry.get(card.approvalId)?.status, 'pending', 'nothing was decided on Jev\'s absence');
 });
 
 test('expired and concurrently resolved cards cannot receive a delayed amendment', async () => {

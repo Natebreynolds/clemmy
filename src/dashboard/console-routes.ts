@@ -3591,7 +3591,7 @@ function tryCommitLiveApprovalControl(input: {
   intent: ReturnType<typeof parseApprovalIntent>;
   /** Jev read the reply as leaning yes or no but not surely: Clem asks the
    * card's question back in one line instead of starting a turn. */
-  confirm?: { approvalId: string; leaning: 'approves' | 'declines'; question: string };
+  confirm?: { approvalId: string; leaning: 'approves' | 'declines' | 'unread'; question: string };
   confirmEligible?: boolean;
   /** A decision in words on a card that links a queued exact payload (a shell
    * command, a send). Resolving the row is the human decision; the registry
@@ -17155,7 +17155,7 @@ export function registerConsoleRoutes(
     // call and carries the owner's words into one fresh call and a new card.
     let intent = parsedIntent;
     let approvalChangeRequest: string | undefined;
-    let approvalConfirm: { approvalId: string; leaning: 'approves' | 'declines'; question: string } | undefined;
+    let approvalConfirm: { approvalId: string; leaning: 'approves' | 'declines' | 'unread'; question: string } | undefined;
     // Registry-owned cards (a chat turn waiting on a work_call) get the same
     // reading as an SDK interrupt. Live 2026-10-05: "Yes, delete it." to a
     // waiting delete card was never read, started a fresh turn on a successor

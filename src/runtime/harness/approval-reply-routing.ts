@@ -18,7 +18,7 @@ export interface ApprovalReplyRoute {
    * 2026-10-06: "Yes, delete the draft." to a card reading "Delete Outlook
    * message · message_id: AAMk…" scored approves 0.70, fell through to a
    * fresh turn, and that turn minted an identical card — four times over. */
-  confirm?: { approvalId: string; leaning: 'approves' | 'declines'; question: string };
+  confirm?: { approvalId: string; leaning: 'approves' | 'declines' | 'unread'; question: string };
 }
 
 /** A reading that leans one way is worth a one-line confirmation; below this
@@ -55,6 +55,29 @@ export function isExactApprovalDecision(text: string): boolean {
  * Fields alone can be opaque — "Delete Outlook message · message_id: AAMk…"
  * — and an owner who answers "yes, delete the draft" is answering the
  * question, not the id. */
+/** The card's own question, asked back: "Just to be sure — should I …?" */
+function confirmQuestionFor(row: approvalRegistry.PendingApprovalRow): string {
+  const ask = pendingApprovalWords(row.approvalId).ask;
+  return ask
+    ? `Just to be sure — ${ask.replace(/^can i /i, 'should I ').replace(/\?+$/, '')}?`
+    : `Just to be sure — should I go ahead with "${row.subject}"?`;
+}
+
+/** The host already asked this exact question back once in this session. */
+function confirmationAlreadyAsked(sessionId: string, question: string): boolean {
+  try {
+    return openEventLog().prepare(`
+      SELECT 1 FROM events
+       WHERE session_id = ? AND type = 'awaiting_user_input'
+         AND json_extract(data_json, '$.reason') = 'approval_confirmation_required'
+         AND json_extract(data_json, '$.question') = ?
+       LIMIT 1
+    `).get(sessionId, question) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
 export function describePendingApproval(row: approvalRegistry.PendingApprovalRow): string {
   const words = pendingApprovalWords(row.approvalId);
   const framing = [
@@ -121,6 +144,18 @@ export async function routeReplyToPendingApproval(input: {
     );
     const current = approvalRegistry.get(row.approvalId);
     if (!current || !approvalRegistry.isActionable(current)) return fallback;
+    if (reading.failedOpen) {
+      // Jev could not read the reply at all (unavailable, or past its
+      // deadline under load). Starting a fresh turn here is the dead end:
+      // the card's session is paused, so the turn branches into a successor
+      // session that has no card, re-derives the work and mints a duplicate
+      // card (live 2026-10-06, "Yes, delete it."). Ask the card's own
+      // question back instead, once — a plain yes or no to it is parsed
+      // exactly, with no model at all. A second unreadable reply to the
+      // same question is conversation.
+      if (confirmationAlreadyAsked(input.sessionId, confirmQuestionFor(row))) return fallback;
+      return { intent: null, confirm: { approvalId: row.approvalId, leaning: 'unread', question: confirmQuestionFor(row) } };
+    }
     const sure = reading.kind !== null && (reading.confidence ?? 0) >= APPROVAL_REPLY_SURE;
     if (queued && reading.kind === 'changes') return fallback;
     if (sure && reading.kind === 'changes') {
@@ -141,11 +176,7 @@ export async function routeReplyToPendingApproval(input: {
     // Leaning yes or no, not sure: ask the card's question back in one line.
     // A fresh turn here re-plans the same action and mints a duplicate card.
     if ((reading.kind === 'approves' || reading.kind === 'declines') && (reading.confidence ?? 0) >= APPROVAL_REPLY_LEANING) {
-      const ask = pendingApprovalWords(row.approvalId).ask;
-      const question = ask
-        ? `Just to be sure — ${ask.replace(/^can i /i, 'should I ').replace(/\?+$/, '')}?`
-        : `Just to be sure — should I go ahead with "${row.subject}"?`;
-      return { intent: null, confirm: { approvalId: row.approvalId, leaning: reading.kind, question } };
+      return { intent: null, confirm: { approvalId: row.approvalId, leaning: reading.kind, question: confirmQuestionFor(row) } };
     }
     return fallback;
   } catch {

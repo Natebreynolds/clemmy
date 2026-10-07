@@ -498,7 +498,11 @@ export interface ApprovalReplyReading {
 /** Acting on a reply to a waiting card is a decision about an external write,
  *  so the host takes Jev's reading only when it is sure. */
 export const APPROVAL_REPLY_SURE = 0.85;
-const APPROVAL_REPLY_TIMEOUT_MS = 1_500;
+/** Jev answers in about a second on a quiet machine and took several under
+ * load (2026-10-06). Past this deadline the reply is read as unreadable and
+ * the host asks the card's own question back, so the bound is a worst-case
+ * wait on a typed decision, not a hard failure. */
+const APPROVAL_REPLY_TIMEOUT_MS = 4_000;
 
 /**
  * Clem is waiting on an approval card and the owner wrote back instead of
