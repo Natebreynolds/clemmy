@@ -594,7 +594,15 @@ async function startInstalledApp(context, firstLaunch) {
   }
   // The app's real React landing redirect normally changes /console to
   // /console/chat before the next poll. Both are legitimate dashboard targets.
-  const target = await waitFor(() => findPage(port, isDashboardTarget), 'desktop_dashboard_missing');
+  let target;
+  try {
+    target = await waitFor(() => findPage(port, isDashboardTarget), 'desktop_dashboard_missing');
+  } catch (error) {
+    // Run 37686300729: setup skipped, then no dashboard target in 120 s and
+    // nothing recorded. The app's log says whether its daemon came up.
+    context.launchDiagnostics = await collectLaunchDiagnostics(app, error);
+    throw error;
+  }
   const targetUrl = new URL(target.url);
   const origin = targetUrl.origin;
   const owners = await listeners(Number(targetUrl.port));
