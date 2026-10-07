@@ -402,9 +402,11 @@ test('a parked pending-action card runs its exact stored action on approval, wit
   const resumeSource = listEvents(sess.id, { types: ['user_input_received'] })
     .find((event) => event.data.source === 'approval_resume' && event.data.approvalId === row.approvalId);
   assert.ok(resumeSource, 'the approval minted its own hidden control source');
+  // This fake brain ended nothing, so the result itself became the ending.
   const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
     .find((event) => event.data.sourceUserSeq === resumeSource!.seq);
-  assert.equal(terminal, undefined, 'the continuation turn, not the resume, ends the source');
+  assert.ok(terminal, 'a brain turn that ends nothing still leaves the owner an ending');
+  assert.match(String(terminal!.data.reply), /Executed the approved run_shell_command call/);
 });
 
 test('when the brain cannot continue after the stored action ran, the result itself is the ending', async () => {

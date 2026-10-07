@@ -519,14 +519,25 @@ async function executeApprovedLinkedActionAndSettle(
     // brain cannot be reached does the result itself stand as the ending.
     const result = pendingAction.resultSummary ?? `Executed the exact approved ${pendingAction.toolName} call.`;
     if (!dispatch) return await settleConversationalSource(row, source, { status: 'done', text: result });
+    const startedAt = Date.now();
     try {
       await dispatch(row.sessionId, approvedActionRanDirective(row.subject, result), prepared);
-      return true;
     } catch (err) {
       logger.warn({ approvalId: row.approvalId, err: err instanceof Error ? err.message : String(err) },
         'the brain could not continue after the approved action ran; settling with the result');
       return await settleConversationalSource(row, source, { status: 'done', text: result });
     }
+    // The hand-off returns when the brain's turn is over. A turn that came
+    // back without ending the owner's source (refused before the model, or
+    // replayed as already handled) would leave the approval with no ending at
+    // all; the result is then the ending.
+    const ended = listEvents(row.sessionId, { types: ['conversation_completed'] })
+      .some((event) => event.data.sourceUserSeq === source.seq);
+    logger.info({ approvalId: row.approvalId, elapsedMs: Date.now() - startedAt, ended },
+      'brain continuation after the approved action returned');
+    if (ended) return true;
+    logger.warn({ approvalId: row.approvalId }, 'the brain turn did not end the approval source; settling with the result');
+    return await settleConversationalSource(row, source, { status: 'done', text: result });
   }
   if (pendingAction.status === 'executing') {
     return await settleConversationalSource(row, source, {

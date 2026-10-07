@@ -155,11 +155,11 @@ async function approveCard(sessionId: string, approvalId: string) {
   const continuations: string[] = [];
   const settled = await handleResolvedApprovalForChatResume(resolved.row!, async (_sessionId, directive) => { continuations.push(directive); });
   const endings = eventlog.listEvents(sessionId, { types: ['conversation_completed'] });
-  // A ran action hands the brain its result and the continuation turn ends
-  // the source; an action that could not run ends the source right here.
-  const outcomeText = continuations[0] ?? (endings.length > endingsBefore ? JSON.stringify(endings.at(-1)!.data) : 'no ending');
-  assert.ok(continuations.length + (endings.length - endingsBefore) === 1, `exactly one ending or continuation: ${outcomeText}`);
-  return { settled, continued: continuations.length === 1, outcomeText };
+  // A ran action hands the brain its result to finish the request; when that
+  // turn ends nothing (this fake brain), the result is the ending. An action
+  // that could not run ends the source right here.
+  const outcomeText = endings.length > endingsBefore ? JSON.stringify(endings.at(-1)!.data) : 'no ending';
+  return { settled, continued: continuations.length === 1, continuation: continuations[0] ?? '', outcomeText };
 }
 
 test('a command that leaves the machine is refused into one card, and the approved card runs it once', async () => {
@@ -227,7 +227,7 @@ test('a command that leaves the machine is refused into one card, and the approv
   assert.deepEqual(received, ['POST /hook x=1'], approved.outcomeText);
   assert.equal(pendingActions.getPendingAction(view!.id)?.status, 'executed', approved.outcomeText);
   assert.equal(approved.continued, true, 'the brain finishes the request from the result');
-  assert.match(approved.outcomeText, /ALREADY RUN exactly once/, approved.outcomeText);
+  assert.match(approved.continuation, /ALREADY RUN exactly once/, approved.continuation);
   assert.match(approved.outcomeText, /Executed the approved run_shell_command call/, approved.outcomeText);
 });
 

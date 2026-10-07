@@ -2568,7 +2568,7 @@ export async function startDaemon(
   try {
     const { startChatApprovalResume } = await import('../runtime/harness/chat-approval-resume.js');
     await startChatApprovalResume(async (sessionId, directive, source) => {
-      await respondPreferHarness('background', {
+      const response = await respondPreferHarness('background', {
         sessionId,
         channel: 'daemon',
         message: directive,
@@ -2581,6 +2581,13 @@ export async function startDaemon(
         // MODELS.primary here routed every approval resume to the env primary
         // (a rate-limited Codex on 2026-09-01) over the user's brain switch.
       }, (req) => assistant.respond(req));
+      logger.info({
+        sessionId,
+        sourceUserSeq: source.sourceUserSeq,
+        stoppedReason: response.stoppedReason ?? null,
+        transport: (response.raw as { transport?: string } | undefined)?.transport ?? null,
+        textHead: (response.text ?? '').slice(0, 160),
+      }, 'approval resume turn returned');
     });
   } catch (err) {
     logger.warn(
