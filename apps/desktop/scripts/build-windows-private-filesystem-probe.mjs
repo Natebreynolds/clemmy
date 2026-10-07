@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 export const PROBE_FILENAME = 'windows-private-filesystem-probe.exe';
@@ -125,7 +125,8 @@ export async function buildWindowsAclProbe() {
   if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('Windows ACL native compilation requires an actual Windows x64 host.');
   const { tsImport } = await import('tsx/esm/api');
   const { WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE: classSource } = await tsImport(
-    path.join(rootDir, 'src/runtime/windows-private-filesystem.ts'), import.meta.url);
+    // A module specifier must be a file URL: on Windows an absolute drive path is refused by the ESM loader.
+    pathToFileURL(path.join(rootDir, 'src/runtime/windows-private-filesystem.ts')).href, import.meta.url);
   if (typeof classSource !== 'string' || !classSource.includes('public static class ClemPrivateAcl')) throw new Error('Canonical Windows ACL class source is unavailable.');
   const compiler = resolveWindowsAclCompiler();
   const systemRoot = environmentValue(process.env, 'SystemRoot');

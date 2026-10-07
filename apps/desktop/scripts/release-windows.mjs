@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   assertPeX64,
   RECALL_NATIVE_MANIFEST,
@@ -206,7 +206,7 @@ try {
   const aclExecutable = verifyPackagedPeX64(path.join(aclRoot, PROBE_FILENAME), 'canonical Windows private filesystem probe is missing');
   verifyPackagedFile(path.join(aclRoot, 'manifest.json'), 'canonical Windows private filesystem manifest is missing');
   const { tsImport } = await import('tsx/esm/api');
-  const { WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE } = await tsImport(path.join(rootDir, 'src/runtime/windows-private-filesystem.ts'), import.meta.url);
+  const { WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE } = await tsImport(pathToFileURL(path.join(rootDir, 'src/runtime/windows-private-filesystem.ts')).href, import.meta.url);
   const aclProbe = verifyPackagedWindowsAclProbe({ sourceDirectory: path.join(rootDir, 'output/windows-private-filesystem'),
     resourcesDirectory: resourcesDir, classSource: WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE });
   if (statSync(aclExecutable).size !== aclProbe.probeBytes || createHash('sha256').update(readFileSync(aclExecutable)).digest('hex') !== aclProbe.probeSha256) {
