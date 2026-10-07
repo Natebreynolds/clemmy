@@ -999,7 +999,13 @@ export async function main(args = process.argv.slice(2)) {
     record(); process.stdout.write('[Windows installed smoke] passed (no model/provider acceptance)\n');
     return receipt;
   } catch (error) {
-    // Never serialize native exceptions, subprocess logs, auth URLs or tokens.
+    // Never serialize native exceptions, subprocess logs, auth URLs or tokens
+    // into the receipt. An unexpected exception is the smoke's own defect,
+    // so its stack goes to the step log, bounded and redacted (run
+    // 37697565733: qualification_failed with the stack lost to the re-throw).
+    if (!(error instanceof SmokeError)) {
+      process.stderr.write(`[Windows installed smoke] unexpected: ${redactLogText(String(error?.stack ?? error)).slice(0, 2_000)}\n`);
+    }
     receipt.failureCode = error instanceof SmokeError ? error.code : 'qualification_failed';
     if (error instanceof SmokeError && error.childCleanup) {
       receipt.ownedChildCleanup = { result: error.childCleanup, qualifiesGracefulOrInstallerSuccess: false };
