@@ -396,3 +396,23 @@ test('B4: markPendingActionApprovalResolved refutes an unverifiable card id at m
   const updated = pending.markPendingActionApprovalResolved(queued.id, 'approved', 'no-such-card');
   assert.equal(updated!.approvedBy, 'policy', 'an approved resolution with a dangling card id cannot claim human');
 });
+
+test('an amended payload moves with its hash only while the action still waits', () => {
+  // Edit by hand on the card (owner-approved design, 2026-10-07).
+  const record = pending.queuePendingAction({ title: 'Print SSH settings', summary: 'local', kind: 'shell_command',
+    toolName: 'run_shell_command', payload: { command: 'ssh -G localhost', cwd: null, timeout_ms: null } });
+  const amended = pending.amendPendingActionPayload(record.id, { command: 'ssh -G -v localhost', cwd: null, timeout_ms: null },
+    { actor: 'desktop-command-center', note: 'Edited by hand on the card: command.', preview: 'ssh -G -v localhost' });
+  assert.ok(amended);
+  assert.deepEqual(amended.payload, { command: 'ssh -G -v localhost', cwd: null, timeout_ms: null });
+  assert.equal(amended.payloadHash, pending.pendingActionPayloadHash('run_shell_command', amended.payload, null));
+  assert.notEqual(amended.payloadHash, record.payloadHash);
+  assert.notEqual(amended.idempotencyKey, record.idempotencyKey);
+  assert.equal(amended.preview, 'ssh -G -v localhost');
+  assert.equal(amended.status, 'queued');
+  assert.equal(amended.history.at(-1)?.note, 'Edited by hand on the card: command.');
+  pending.markPendingActionApprovalResolved(record.id, 'approved', null, { by: 'policy', evidence: { kind: 'policy', scope: 'test' } });
+  const decided = pending.amendPendingActionPayload(record.id, { command: 'rm -rf /', cwd: null, timeout_ms: null }, { actor: 'x', note: 'late' });
+  assert.deepEqual(decided?.payload, amended.payload, 'a decided action is never edited');
+  assert.equal(pending.amendPendingActionPayload('pa-missing', {}, { actor: 'x', note: 'n' }), null);
+});

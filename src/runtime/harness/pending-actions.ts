@@ -1233,6 +1233,39 @@ export function claimPendingActionExecution(
   };
 }
 
+/** EDIT BY HAND ON THE CARD (owner-approved design, 2026-10-07). The owner
+ * retyped one of the fields the card showed; what runs is exactly what the
+ * card showed, edited. The record stays the single copy: its payload and
+ * hash move together under the transition lock, only while it still waits
+ * (queued or approval_requested), and its card keeps its id. Returns null
+ * when the record is unknown or the lock is held; an already-decided record
+ * comes back unchanged. */
+export function amendPendingActionPayload(
+  id: string,
+  payload: unknown,
+  opts: { actor: string; note: string; preview?: string },
+): PendingActionRecord | null {
+  const mutate = (): PendingActionRecord | null => {
+    const record = getPendingAction(id);
+    if (!record) return null;
+    if (record.status !== 'queued' && record.status !== 'approval_requested') return record;
+    const now = new Date().toISOString();
+    const payloadHash = pendingActionPayloadHash(record.toolName, payload, record.executionAuthority ?? null);
+    record.payload = payload;
+    record.payloadHash = payloadHash;
+    record.idempotencyKey = shortHash({ kind: record.kind, toolName: record.toolName, payloadHash, targetSummary: record.targetSummary ?? '' });
+    if (opts.preview) record.preview = cleanLine(opts.preview, record.preview, 8000);
+    record.updatedAt = now;
+    record.history = [
+      ...(Array.isArray(record.history) ? record.history : []),
+      { at: now, status: record.status, note: opts.note, actor: opts.actor },
+    ];
+    return writeRecord(record);
+  };
+  const locked = withPendingActionTransitionLock(id, 'amend:payload', mutate);
+  return locked.acquired ? locked.value : null;
+}
+
 export function linkPendingActionApproval(id: string, approvalId: string): PendingActionRecord | null {
   // A policy-approved irreversible send is intentionally inert, but the user
   // must still be able to attach a real approval card and upgrade its consent

@@ -209,7 +209,7 @@ function queuedActionNextStep(
  * paraphrase: for such a tool the command IS the content. Any other tool
  * keeps the preview the model wrote.
  */
-function exactCommandPreview(toolName: string, payload: unknown): string | undefined {
+export function exactCommandPreview(toolName: string, payload: unknown): string | undefined {
   if (!isEffectDecidedPerCall(toolName) || !payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
   const command = (payload as Record<string, unknown>).command;
   return typeof command === 'string' && command.trim() ? command : undefined;

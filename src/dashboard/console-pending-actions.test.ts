@@ -398,6 +398,60 @@ test('Inbox and Tasks generic approval routes reject an unreaped expired card wi
   }
 });
 
+test('edit by hand on a queued card: the edited field lands on the record, the card keeps its id, and the approve is ordinary', async () => {
+  // Owner-approved design, 2026-10-07: "Yes, send this one" sends exactly
+  // what the owner typed, checked the same way first. Live that day the
+  // endpoint refused: the registry row's args are the card's, not the call's.
+  const sessionId = createSession({ kind: 'chat', channel: 'desktop' }).id;
+  const record = queuePendingAction({
+    title: 'Print SSH settings', summary: 'One local read-only command.', kind: 'shell_command',
+    toolName: 'run_shell_command', payload: { command: 'ssh -G localhost', timeout_ms: 30000 }, sessionId,
+  });
+  const card = approvalRegistry.register({
+    sessionId, subject: record.title, tool: 'request_approval',
+    args: { pendingActionId: record.id, pendingAction: pendingActionApprovalView(record) },
+  });
+  const h = await boot();
+  try {
+    const unknown = await fetch(`${h.url}/api/console/harness-approvals/${card.approvalId}/approve_with_edits`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modifiedFields: { recipient: 'x' } }),
+    });
+    assert.equal(unknown.status, 400, 'only a field the card showed can be edited');
+    assert.equal(getPendingAction(record.id)?.payloadHash, record.payloadHash, 'a refused edit changes nothing');
+
+    const res = await fetch(`${h.url}/api/console/harness-approvals/${card.approvalId}/approve_with_edits`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modifiedFields: { command: 'ssh -G -vv localhost' } }),
+    });
+    assert.equal(res.status, 200, JSON.stringify(await res.clone().json()));
+    const body = await res.json() as { ok: boolean; status: string };
+    assert.equal(body.ok, true);
+    assert.equal(body.status, 'resolved-pending-action-approval-only');
+    const durable = getPendingAction(record.id);
+    assert.equal(durable?.status, 'approved');
+    assert.equal(durable?.approvedBy, 'human');
+    assert.equal(durable?.approvalId, card.approvalId, 'the card keeps its id');
+    // What runs is exactly what the card showed, edited — with the field the
+    // tool's own schema lets be omitted completed as null — under a hash that
+    // moves with the payload.
+    assert.deepEqual(durable?.payload, { command: 'ssh -G -vv localhost', timeout_ms: 30000, cwd: null });
+    assert.notEqual(durable?.payloadHash, record.payloadHash);
+    assert.match(durable?.preview ?? '', /ssh -G -vv localhost/);
+    assert.ok(durable?.history.some((item) => /Edited by hand on the card: command/.test(item.note ?? '')));
+    const resolutions = listEvents(sessionId, { types: ['approval_resolved'] }).filter((event) => event.data.approvalId === card.approvalId);
+    assert.equal(resolutions.length, 1, 'one typed resolution, written before the registry settles');
+    assert.equal(resolutions[0].data.edited, true);
+    assert.deepEqual(resolutions[0].data.editedFields, { command: 'ssh -G -vv localhost' });
+    // Decided: a second edit is refused and changes nothing.
+    const again = await fetch(`${h.url}/api/console/harness-approvals/${card.approvalId}/approve_with_edits`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modifiedFields: { command: 'rm -rf /' } }),
+    });
+    assert.equal(again.status, 409);
+    assert.deepEqual(getPendingAction(record.id)?.payload, durable?.payload);
+  } finally {
+    await h.close();
+  }
+});
+
 test('Inbox exact pending-action approval is approval-only and reports execution as unconfirmed', async () => {
   const { record, card } = linkedRunBatch('Inbox approval-only action');
   const h = await boot();

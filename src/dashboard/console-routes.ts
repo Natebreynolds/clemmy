@@ -459,6 +459,8 @@ import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconci
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
 import { resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
 import { approvalArgsWithFieldEdits } from '../runtime/harness/approval-call-preview.js';
+import { completePayloadForToolSchema } from '../tools/tool-payload-shape.js';
+import { exactCommandPreview } from '../tools/pending-action-tools.js';
 import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-source-session-branch.js';
 import { getSlackRuntimeStatus } from '../channels/slack.js';
 import { SLACK_APP_MANIFEST_YAML } from '../channels/slack-manifest.js';
@@ -510,6 +512,7 @@ import {
   pendingActionApprovalViewFromArgs,
   type PendingActionApprovalView, pendingActionIdFromArgs } from '../runtime/harness/pending-action-view.js';
 import {
+  amendPendingActionPayload,
   getPendingAction,
   markPendingActionApprovalResolved,
 } from '../runtime/harness/pending-actions.js';
@@ -14051,18 +14054,67 @@ export function registerConsoleRoutes(
     const modifiedFields = decision === 'approve_with_edits' && !modifiedArgs
       ? (req.body as { modifiedFields?: unknown })?.modifiedFields
       : undefined;
+    // On a card that links a queued exact payload, the edit lands on that
+    // record itself (payload and hash move together, the card keeps its id)
+    // and the decision is then an ordinary approve of the edited record. A
+    // raw args substitution on a queued payload stays refused below.
+    let editedQueuedFields: Record<string, string> | undefined;
     if (modifiedFields && typeof modifiedFields === 'object' && !Array.isArray(modifiedFields)) {
       const edits = Object.fromEntries(Object.entries(modifiedFields as Record<string, unknown>)
         .filter(([, value]) => typeof value === 'string')
         .map(([name, value]) => [name, (value as string).slice(0, 20_000)]));
-      const applied = approvalArgsWithFieldEdits(existing.args ?? null, edits);
-      if (!applied.ok) {
-        res.status(400).json({ error: applied.reason });
-        return;
+      const queuedId = pendingActionIdFromArgs(existing.args ?? null);
+      if (queuedId) {
+        const record = getPendingAction(queuedId);
+        if (!record || record.approvalId !== existing.approvalId) {
+          res.status(409).json({ error: 'approval card is superseded or does not belong to this pending action' });
+          return;
+        }
+        if (record.status !== 'queued' && record.status !== 'approval_requested') {
+          res.status(409).json({ error: `pending action is already ${record.status}` });
+          return;
+        }
+        const applied = approvalArgsWithFieldEdits(
+          record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload) ? record.payload as Record<string, unknown> : null,
+          edits,
+        );
+        if (!applied.ok) {
+          res.status(400).json({ error: applied.reason });
+          return;
+        }
+        let payload: Record<string, unknown> = applied.args;
+        try {
+          const { innerDispatchToolParameters } = await import('../tools/inner-dispatch.js');
+          const schema = await innerDispatchToolParameters(record.toolName);
+          if (schema) {
+            const shaped = completePayloadForToolSchema(schema, payload);
+            if (shaped.issues.length > 0) {
+              res.status(400).json({ error: `the edited call does not fit ${record.toolName}: ${shaped.issues.join('; ')}` });
+              return;
+            }
+            payload = shaped.payload;
+          }
+        } catch { /* the dispatch-time validator still guards the call */ }
+        const amended = amendPendingActionPayload(record.id, payload, {
+          actor: 'desktop-command-center',
+          note: `Edited by hand on the card: ${Object.keys(edits).join(', ')}.`,
+          preview: exactCommandPreview(record.toolName, payload),
+        });
+        if (!amended || amended.status !== record.status) {
+          res.status(409).json({ error: 'the queued action could not be edited right now; nothing was approved' });
+          return;
+        }
+        editedQueuedFields = edits;
+      } else {
+        const applied = approvalArgsWithFieldEdits(existing.args ?? null, edits);
+        if (!applied.ok) {
+          res.status(400).json({ error: applied.reason });
+          return;
+        }
+        modifiedArgs = JSON.stringify(applied.args);
       }
-      modifiedArgs = JSON.stringify(applied.args);
     }
-    if (decision === 'approve_with_edits' && !modifiedArgs) {
+    if (decision === 'approve_with_edits' && !modifiedArgs && !editedQueuedFields) {
       res.status(400).json({ error: 'approve_with_edits requires modifiedArgs (JSON string) or modifiedFields in the body' });
       return;
     }
@@ -14084,7 +14136,7 @@ export function registerConsoleRoutes(
       res.status(409).json({ error: 'approval card has expired', approval: existing });
       return;
     }
-    const pendingActionPreflight = exactPendingActionApprovalPreflight(existing, decision);
+    const pendingActionPreflight = exactPendingActionApprovalPreflight(existing, editedQueuedFields ? 'approve' : decision);
     if (pendingActionPreflight.kind === 'error') {
       res.status(pendingActionPreflight.status).json({ error: pendingActionPreflight.reason });
       return;
@@ -14139,6 +14191,14 @@ export function registerConsoleRoutes(
       && sessionRowForKind?.kind !== 'workflow'
       && !!harnessSession?.loadInterruptState();
     if (!shouldResume) {
+      // The card's copy reads "edited" with the fields the owner retyped,
+      // written before the registry settles it so no plain copy lands first.
+      if (editedQueuedFields) {
+        try {
+          appendHarnessEvent({ sessionId: existing.sessionId, turn: 0, role: 'system', type: 'approval_resolved',
+            data: { approvalId: id, tool: existing.tool, decision: 'approve_with_edits', resolution: 'approved', sticky: false, edited: true, editedFields: editedQueuedFields } });
+        } catch { /* the decision still lands */ }
+      }
       const result = approvalRegistry.resolve(
         id,
         auditResolution,
