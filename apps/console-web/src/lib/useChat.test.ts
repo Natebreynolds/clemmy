@@ -1360,3 +1360,17 @@ test('the card\'s question asked back lands on its card and drops the empty plac
   assert.equal(approvalConfirmFromEvent({ reason: 'approval_confirmation_required', question: 'x' }), null, 'no card id, no confirm');
   assert.equal(approvalConfirmFromEvent({ question: 'Which account?', approvalId: 'apr-x' }), null, 'an ordinary question is not a confirm');
 });
+
+test('a queued card keeps Clem\'s words through hydration, so a reopened chat draws her card, not the tool layout', async () => {
+  // Live 2026-10-07: reopening a chat showed "Ready to execute: … Tool:
+  // run_shell_command … Payload hash" for a card that had spoken as Clem.
+  const { pendingActionFromEvent } = await import('./useChat');
+  const view = pendingActionFromEvent({
+    id: 'pa-1', toolName: 'run_shell_command', title: 'Print SSH settings', summary: 'local', kind: 'shell_command', status: 'approval_requested',
+    ask: 'OK to run it once?', why: 'It only prints your settings.', preview: 'ssh -G localhost', targetSummary: '', risk: '', rollback: '',
+    payload: { command: 'ssh -G localhost' }, payloadHash: 'h', idempotencyKey: 'k', approvalId: 'apr-1', resultSummary: null, createdAt: '', updatedAt: '',
+  });
+  assert.equal(view?.ask, 'OK to run it once?');
+  assert.equal(view?.why, 'It only prints your settings.');
+  assert.equal(pendingActionFromEvent({ id: 'pa-2', toolName: 'x', ask: '   ' })?.ask, undefined, 'blank words are no words');
+});

@@ -1144,6 +1144,11 @@ export function pendingActionFromEvent(value: unknown): PendingActionApprovalVie
     id: record.id,
     title: typeof record.title === 'string' ? record.title : record.id,
     summary: typeof record.summary === 'string' ? record.summary : '',
+    // Clem's words ride the record view; without them a reopened queued card
+    // fell back to the tool-name layout (live 2026-10-07: "Ready to execute:
+    // … Tool: run_shell_command … Payload hash").
+    ...(typeof record.ask === 'string' && record.ask.trim() ? { ask: record.ask } : {}),
+    ...(typeof record.why === 'string' && record.why.trim() ? { why: record.why } : {}),
     kind: typeof record.kind === 'string' ? record.kind : 'other',
     status: typeof record.status === 'string' ? record.status : 'queued',
     toolName: record.toolName,
