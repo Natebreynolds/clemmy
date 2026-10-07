@@ -40,6 +40,9 @@ export interface PendingActionApprovalView {
   id: string;
   title: string;
   summary: string;
+  /** Clem's question to the owner; the card's heading. */
+  ask?: string;
+  why?: string;
   kind: string;
   status: string;
   toolName: string;

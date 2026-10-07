@@ -1083,6 +1083,15 @@ function exactPendingApprovalForTerminal(input: {
   return rows.at(-1) ?? null;
 }
 
+/** Clem's question on a card, from the approval row's own preview. */
+function approvalCardAskFromArgs(args: unknown): string | null {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+  const preview = (args as { preview?: unknown }).preview;
+  if (!preview || typeof preview !== 'object' || Array.isArray(preview)) return null;
+  const ask = (preview as { ask?: unknown }).ask;
+  return typeof ask === 'string' && ask.trim() ? ask.trim().slice(0, 200) : null;
+}
+
 function pendingApprovalCountForTurn(result: RunConversationResult, sourceUserSeq: number): number {
   return pendingApprovalsForAcceptedSource({ sessionId: result.sessionId, sourceUserSeq, turn: result.lastTurn }).length;
 }
@@ -1233,11 +1242,14 @@ function reduceStandardConversationTerminal(input: {
         legacyReason = 'awaiting_user_input';
       } else if (approval) {
         const pendingCount = pendingApprovalCountForTurn(result, sourceUserSeq);
+        // The line that stands in for the card is the card's own question
+        // when Clem wrote one; the old operator wording is only the fallback.
+        const cardAsk = approvalCardAskFromArgs(approval.args);
         const approvalText = publicReplyText(
           result.lastDecision?.reply,
           pendingCount > 1
             ? `${pendingCount} approvals are waiting, starting with ${approval.subject} (${approval.approvalId}). Approve or reject each and I'll continue.`
-            : `Approval required for ${approval.subject}. Review ${approval.approvalId} to continue.`,
+            : cardAsk ?? `Approval required for ${approval.subject}. Review ${approval.approvalId} to continue.`,
         );
         outcome = {
           version: 2,

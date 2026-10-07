@@ -27,6 +27,7 @@ const {
 } = await import('./pending-actions.js');
 const {
   pendingActionApprovalView,
+  pendingActionAsk,
 } = await import('./pending-action-view.js');
 const {
   isQueuedActionApprovalQuestion,
@@ -240,7 +241,8 @@ test('a preexisting exact resumable row is relinked and surfaced after a crash w
     subject: record.title,
     reason: record.summary,
     destructive: false,
-    preview: null,
+    // The card as production writes it: Clem's question over the exact content.
+    preview: { operation: record.toolName.slice(0, 80), fields: [{ name: 'content', value: record.preview }], ask: pendingActionAsk(record) },
     pendingActionId: record.id,
     pendingAction: pendingActionApprovalView(record),
   };
@@ -289,7 +291,8 @@ test('an already-linked row is surfaced after a crash between linkage and card e
     subject: record.title,
     reason: record.summary,
     destructive: false,
-    preview: null,
+    // The card as production writes it: Clem's question over the exact content.
+    preview: { operation: record.toolName.slice(0, 80), fields: [{ name: 'content', value: record.preview }], ask: pendingActionAsk(record) },
     pendingActionId: record.id,
     pendingAction: pendingActionApprovalView(record),
   };

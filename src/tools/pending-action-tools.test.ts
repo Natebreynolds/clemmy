@@ -142,8 +142,8 @@ test('pending_action_queue accepts the exact source-backed recipient set', async
     }));
 
   assert.match(response.content[0].text, /Pending action queued/);
-  assert.match(response.content[0].text, /REQUIRED NEXT EDGE/);
-  assert.match(response.content[0].text, /single formal approval card/);
+  assert.match(response.content[0].text, /^NEXT: end this turn with one plain question/m);
+  assert.match(response.content[0].text, /opens the one card from this record/);
   assert.match(response.content[0].text, /pending_action_execute/);
   assert.equal(listPendingActions({ sessionId: session.id }).length, 1);
 });
@@ -183,7 +183,7 @@ test('pending_action_queue canonicalizes both Composio spellings and promotes on
     payloadJson: JSON.stringify(args),
     approvalIntent: 'queue_only',
   });
-  assert.match(staged.content[0].text, /QUEUE-ONLY EDGE RECORDED/);
+  assert.match(staged.content[0].text, /STAGED ONLY/);
 
   const promoted = await invoke({
     title: 'Canonical email',
@@ -197,7 +197,7 @@ test('pending_action_queue canonicalizes both Composio spellings and promotes on
     approvalIntent: 'request_now',
   });
   assert.match(promoted.content[0].text, /Pending action reused/);
-  assert.match(promoted.content[0].text, /GRAPH EDGE RECORDED/);
+  assert.match(promoted.content[0].text, /CARD OPENED/);
 
   const records = listPendingActions({ sessionId: session.id });
   assert.equal(records.length, 1, 'canonical raw/gateway spellings dedupe');
@@ -222,8 +222,8 @@ test('pending_action_queue canonicalizes both Composio spellings and promotes on
     payloadJson: JSON.stringify(args),
     approvalIntent: 'queue_only',
   });
-  assert.match(refusedDowngrade.content[0].text, /GRAPH EDGE RECORDED/);
-  assert.doesNotMatch(refusedDowngrade.content[0].text, /QUEUE-ONLY EDGE RECORDED/);
+  assert.match(refusedDowngrade.content[0].text, /CARD OPENED/);
+  assert.doesNotMatch(refusedDowngrade.content[0].text, /STAGED ONLY/);
   assert.equal(
     queuedApprovalTransitionsForRequest(session.id, source.seq)[0]?.approvalIntent,
     'request_now',
@@ -458,7 +458,7 @@ test('pending_action_queue refuses a targetless directed send but accepts an acc
       }),
       approvalIntent: 'queue_only',
     }));
-  assert.match(stagedUnbound.content[0].text, /QUEUE-ONLY EDGE RECORDED/);
+  assert.match(stagedUnbound.content[0].text, /STAGED ONLY/);
   assert.equal(listPendingActions({ sessionId: session.id }).length, 1, 'preparatory staging remains available');
 
   const pinnedSession = createSession({ kind: 'chat' });
@@ -478,7 +478,7 @@ test('pending_action_queue refuses a targetless directed send but accepts an acc
       }),
       approvalIntent: 'request_now',
     }));
-  assert.match(pinnedRequestNow.content[0].text, /GRAPH EDGE RECORDED/);
+  assert.match(pinnedRequestNow.content[0].text, /CARD OPENED/);
   const [pinnedRecord] = listPendingActions({ sessionId: pinnedSession.id });
   assert.equal(
     (pinnedRecord.payload as { connected_account_id?: string }).connected_account_id,
@@ -531,7 +531,7 @@ test('CLI-default publish queue snapshots operator authority and refuses account
         image_url: 'https://assets.example/launch.png',
       },
     });
-    assert.match(queued.content[0].text, /GRAPH EDGE RECORDED/);
+    assert.match(queued.content[0].text, /CARD OPENED/);
     const [record] = listPendingActions({ sessionId: session.id });
     assert.deepEqual(record.executionAuthority, authority);
     assert.equal(
@@ -632,7 +632,7 @@ test('pending_action_queue keeps a reversible local action on the lighter conver
       }),
     }));
 
-  assert.match(response.content[0].text, /Next step: ask the user whether to execute/);
+  assert.match(response.content[0].text, /Next: ask the owner whether to go ahead/);
   assert.doesNotMatch(response.content[0].text, /REQUIRED NEXT TOOL/);
 });
 

@@ -1,10 +1,8 @@
 import { addNotification } from '../notifications.js';
 import * as approvalRegistry from './approval-registry.js';
 import { appendEvent, getSession, listEvents } from './eventlog.js';
-import {
-  pendingActionApprovalView,
-  pendingActionIdFromArgs,
-} from './pending-action-view.js';
+import { pendingActionApprovalView, pendingActionIdFromArgs, pendingActionAsk } from './pending-action-view.js';
+import { isEffectDecidedPerCall } from '../../tools/tool-registry.js';
 import {
   cancelPendingActionIfQueuedUnlinked,
   getPendingAction,
@@ -249,7 +247,15 @@ function materializeQueuedApproval(
       subject: record.title,
       reason: record.summary,
       destructive: false,
-      preview: null,
+      // The card in Clem's words on every surface (desktop, phone, Needs
+      // you, the reopened transcript): her question, why, and under it the
+      // exact content that will run — never a tool name as the heading.
+      preview: {
+        operation: record.toolName.slice(0, 80),
+        fields: [{ name: isEffectDecidedPerCall(record.toolName) ? 'command' : 'content', value: record.preview }],
+        ask: pendingActionAsk(record),
+        ...(record.why?.trim() ? { why: record.why.trim() } : {}),
+      },
       pendingActionId: record.id,
       // Immutable authority snapshot stored inside the approval row itself.
       // Execution verifies this independent copy under the same lock as the

@@ -2,6 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { pendingActionAsk } from '../runtime/harness/pending-action-view.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import {
   PENDING_ACTION_KINDS,
@@ -179,25 +180,27 @@ function queuedActionNextStep(
   approvalRequired: boolean,
   approvalIntent?: PendingActionApprovalIntent,
 ): string {
+  const voice = 'Speak to the owner as you would in person: say what you need to do and why, and that you are waiting on their go-ahead. '
+    + 'Never mention ids, hashes, cards, graphs, tools or the harness; the id below is for your tool calls only.';
   if (record.status === 'approval_requested') {
-    return 'This exact request already has its one formal approval card. Do not queue or request another; wait for the user decision.';
+    return `The owner already has the one card for this. Do not queue or request another; wait for their decision. ${voice}`;
   }
   if (record.status === 'approved') {
-    return 'This exact queued action is approved. Call pending_action_execute once with this id; do not reconstruct the underlying call.';
+    return 'The owner approved this exact action. Call pending_action_execute once with this id; do not reconstruct the underlying call.';
   }
   if (record.status === 'executing' || record.status === 'executed') {
-    return `This exact request is already ${record.status}. Do not dispatch or queue it again; report the durable result.`;
+    return `This exact action is already ${record.status}. Do not dispatch or queue it again; report the durable result in your own words.`;
   }
   if (['rejected', 'expired', 'cancelled', 'failed'].includes(record.status)) {
-    return `This exact request is already ${record.status}. Do not retry or create a replacement from this same request; explain the status.`;
+    return `This exact action is already ${record.status}. Do not retry or create a replacement from this same request; tell the owner plainly.`;
   }
   return approvalRequired && approvalIntent === 'request_now'
-    ? 'GRAPH EDGE RECORDED: the harness will open the single formal approval card from this request-owned record now, independent of your closing prose. Do not search for or create another approval tool call. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.'
+    ? `CARD OPENED: the owner now sees one card asking "${pendingActionAsk(record)}" with the exact content under it. Nothing has run. Do not search for or create another approval. ${voice} After their yes, call pending_action_execute with this id so the exact stored payload runs once; do not re-read and reconstruct the underlying tool call.`
     : approvalRequired && approvalIntent === 'queue_only'
-      ? 'QUEUE-ONLY EDGE RECORDED: this action is stored without opening an approval card. Do not ask the user to execute it in this turn. A later explicit request can promote the same exact payload to one formal card.'
+      ? 'STAGED ONLY: stored without a card. Do not ask the owner to run it this turn. A later explicit request can open its one card for the same exact payload.'
       : approvalRequired
-        ? 'REQUIRED NEXT EDGE: end this turn with one concise question naming the external action (for example, "Should I send it?"). The harness will materialize the single formal approval card from this request-owned record; do not search for or create another approval tool call. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.'
-    : 'Next step: ask the user whether to execute this queued action. If it requires a formal approval card, call request_approval with pendingActionId set to this id and include a concise preview. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.';
+        ? `NEXT: end this turn with one plain question to the owner naming what you would do (for example, "Should I send it?"). The harness opens the one card from this record; do not search for or create another approval. ${voice} After their yes, call pending_action_execute with this id so the exact stored payload runs once.`
+    : 'Next: ask the owner whether to go ahead. If it needs a formal card, call request_approval with pendingActionId set to this id and a plain-language preview. After approval, call pending_action_execute with this id so the exact stored payload runs once.';
 }
 
 /**
@@ -222,8 +225,10 @@ export function registerPendingActionTools(server: McpServer): void {
       'After approval, call pending_action_execute with this id; it dispatches the exact queued payload once and records the outcome.',
     ].join(' '),
     {
-      title: z.string().min(3).max(160),
+      title: z.string().min(3).max(160).describe('Short name for lists, e.g. "Run the backup on the server".'),
       summary: z.string().min(8).max(2000).describe('Plain-language summary of what is queued and why.'),
+      ask: z.string().min(12).max(200).optional().describe('Your words to the owner, as you would say them in person: what you need to do and why their request needs it, ending with the go-ahead question. Example: "To finish step 2 I need to run one command on your Mac. It only prints your SSH settings; nothing leaves the machine. OK to run it?" No tool names, ids, hashes or harness terms. The exact command or content is shown under your words automatically.'),
+      why: z.string().max(260).optional().describe('One optional extra line of context for the owner, in plain words (what it touches, what it does not).'),
       kind: kindEnum.describe('Descriptive action class only; the host derives approval from the exact tool and payload. external_write alone does not imply approval.'),
       toolName: z.string().min(1).max(160).describe('The exact tool to call after approval, e.g. composio_execute_tool or run_shell_command.'),
       payloadJson: z.string().min(2).max(100000).describe('Exact JSON payload for the execution tool. Use the tool schema shape, not prose.'),
@@ -319,6 +324,8 @@ export function registerPendingActionTools(server: McpServer): void {
           preview: exactCommandPreview(toolName, payload) ?? input.preview,
           risk: input.risk,
           rollback: input.rollback,
+          ask: input.ask,
+          why: input.why,
           sessionId,
           // The accepted source this action was prepared for. An approval
           // that arrives with no turn of its own (a card button) settles the

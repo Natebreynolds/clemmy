@@ -221,7 +221,8 @@ test('a command that leaves the machine is refused into one card, and the approv
   assert.equal(approved.settled, true, approved.outcomeText);
   assert.deepEqual(received, ['POST /hook x=1'], approved.outcomeText);
   assert.equal(pendingActions.getPendingAction(view!.id)?.status, 'executed', approved.outcomeText);
-  assert.match(approved.outcomeText, /Executed the approved run_shell_command call/, approved.outcomeText);
+  assert.match(approved.outcomeText, /Done — I ran it\. Here's what it printed/, approved.outcomeText);
+  assert.match(approved.outcomeText, /```\\nok\\n```/, 'the command\'s own output, not the executor\'s bookkeeping');
 });
 
 function queueScript(command: string, title: string): Output[][] {

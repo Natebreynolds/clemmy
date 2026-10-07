@@ -403,8 +403,8 @@ test('a parked pending-action card runs its exact stored action on approval, wit
   const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
     .find((event) => event.data.sourceUserSeq === resumeSource!.seq);
   assert.ok(terminal, 'that source settled with what landed');
-  assert.match(String(terminal!.data.reply), /^Done — "Send the reviewed proof" ran\./);
-  assert.match(String(terminal!.data.reply), /Executed the approved run_shell_command call/);
+  assert.match(String(terminal!.data.reply), /^Done — I ran it\. Here's what it printed:/, 'in Clem\'s words, not the executor\'s');
+  assert.doesNotMatch(String(terminal!.data.reply), /run_shell_command|exit_code|pa-/, 'no tool names or ids reach the owner');
   assert.match(String(terminal!.data.reply), /say "continue"/, 'the one next step is named');
 });
 

@@ -102,6 +102,10 @@ export interface PendingActionRecord {
   preview: string;
   risk: string;
   rollback: string;
+  /** Clem's own words to the owner: what she needs to do and why, ending in
+   * the go-ahead question. The card's heading on every surface. */
+  ask?: string;
+  why?: string;
   sessionId: string | null;
   /** Exact accepted source that prepared this immutable action. A replay of
    * that same source reuses the durable record; a genuinely new user source
@@ -144,6 +148,8 @@ export interface QueuePendingActionInput {
   preview?: string | null;
   risk?: string | null;
   rollback?: string | null;
+  ask?: string | null;
+  why?: string | null;
   sessionId?: string | null;
   sourceUserSeq?: number | null;
   createdBy?: string | null;
@@ -635,6 +641,8 @@ export function queuePendingAction(input: QueuePendingActionInput): PendingActio
     preview: cleanLine(input.preview, 'no preview supplied', 8000),
     risk: cleanLine(input.risk, 'normal approval risk', 1000),
     rollback: cleanLine(input.rollback, 'no rollback noted', 1000),
+    ...(cleanLine(input.ask, '', 200) ? { ask: cleanLine(input.ask, '', 200) } : {}),
+    ...(cleanLine(input.why, '', 260) ? { why: cleanLine(input.why, '', 260) } : {}),
     sessionId: input.sessionId?.trim() || null,
     sourceUserSeq: Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
       ? input.sourceUserSeq as number

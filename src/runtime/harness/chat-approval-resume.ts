@@ -519,7 +519,7 @@ async function executeApprovedLinkedActionAndSettle(
     const result = pendingAction.resultSummary ?? `Executed the exact approved ${pendingAction.toolName} call.`;
     return await settleConversationalSource(row, source, {
       status: 'done',
-      text: approvedActionRanText(pendingAction.title, result),
+      text: approvedActionRanText(pendingAction, result),
     });
   }
   if (pendingAction.status === 'executing') {
@@ -699,13 +699,28 @@ async function drainQueuedApprovalResumes(sessionId: string): Promise<void> {
   }
 }
 
-const APPROVED_RESULT_CHARS = 1500;
+const APPROVED_RESULT_LINES = 20;
 
-/** The owner's decision ends with what the approved action did and the one
- * next step if their request had more in it. */
-export function approvedActionRanText(title: string, result: string): string {
-  const shown = result.length > APPROVED_RESULT_CHARS ? `${result.slice(0, APPROVED_RESULT_CHARS)}… (truncated)` : result;
-  return `Done — "${title}" ran.\n\n${shown}\n\nIf there was more to do after it, say "continue" and I'll pick it up from here.`;
+/** The owner's decision ends with what the approved action did, in Clem's
+ * words, and the one next step if their request had more in it. */
+export function approvedActionRanText(action: Pick<PendingActionRecord, 'kind' | 'toolName'>, result: string): string {
+  const shell = action.toolName === 'run_shell_command' || action.kind === 'shell_command';
+  const lines = result.split('\n');
+  const shown = lines.slice(0, APPROVED_RESULT_LINES).join('\n').trim();
+  const more = lines.length > APPROVED_RESULT_LINES ? `\n… (${lines.length - APPROVED_RESULT_LINES} more lines; ask and I'll show the rest)` : '';
+  const body = shell
+    ? `Done — I ran it. Here's what it printed:\n\n\`\`\`\n${shellOutputOnly(shown)}${more}\n\`\`\``
+    : `Done — that went through.${shown && !shown.startsWith('{') && shown.length <= 300 ? `\n\n${shown}` : ''}`;
+  return `${body}\n\nIf there was more to do after it, say "continue" and I'll pick it up from here.`;
+}
+
+/** The executor's summary wraps the command's own output in bookkeeping
+ * ("Executed the approved run_shell_command call. exit_code: 0 stdout: …");
+ * the owner gets the output. */
+function shellOutputOnly(summary: string): string {
+  const m = /stdout:\s*([\s\S]*?)(?:\n\s*stderr:|$)/i.exec(summary);
+  if (!m) return '(no output was captured)';
+  return m[1].trim() || '(nothing printed)';
 }
 
 export function chatApprovalResumeDirective(

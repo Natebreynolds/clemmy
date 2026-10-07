@@ -420,6 +420,12 @@ export function ChatBubble({
   // card: her question, why, the exact content, and answers to tap.
   const voicedApproval = message.status === 'awaiting-approval' && !pendingAction
     && Boolean(message.approval?.preview?.ask) && !message.approval?.preview?.items;
+  // A queued action card speaks the same way: Clem's question and why as the
+  // heading, the exact command or content under it, answers to tap. Tool
+  // names, ids and hashes stay out of the owner's sight.
+  const voicedPendingAction = message.status === 'awaiting-approval' && Boolean(pendingAction?.ask);
+  const pendingActionShowsRisk = Boolean(pendingAction?.risk) && pendingAction!.risk !== 'normal approval risk';
+  const pendingActionShowsRollback = Boolean(pendingAction?.rollback) && pendingAction!.rollback !== 'no rollback noted';
   const stoppedPlaceholder = message.status === 'stopped' && message.text.trim() === STOPPED_PLACEHOLDER;
   // THE PLAN CARD IS THE REPLY.
   //
@@ -480,8 +486,21 @@ export function ChatBubble({
           )}
 
         {((message.status === 'awaiting-approval' && message.approval) || message.status === 'awaiting-plan') && (
-          <div className={cn('rounded-md border p-3', voicedApproval ? 'border-border bg-surface' : 'border-warning/40 bg-warning-tint')}>
-            {voicedApproval ? (
+          <div className={cn('rounded-md border p-3', voicedApproval || voicedPendingAction ? 'border-border bg-surface' : 'border-warning/40 bg-warning-tint')}>
+            {voicedPendingAction ? (
+              <>
+                <p className="text-body text-fg">{pendingAction!.ask}</p>
+                {pendingAction!.why && <p className="mt-1 text-small text-muted">{pendingAction!.why}</p>}
+                {pendingAction!.preview && pendingAction!.preview !== 'no preview supplied' && (
+                  <>
+                    <p className="mt-2.5 text-caption font-semibold uppercase tracking-wide text-faint">Exactly what happens</p>
+                    <pre className="mt-1 whitespace-pre-wrap break-words rounded bg-surface-2 p-2 font-mono text-caption text-fg">{pendingAction!.preview}</pre>
+                  </>
+                )}
+                {pendingActionShowsRisk && <p className="mt-1.5 text-caption text-warning">{pendingAction!.risk}</p>}
+                {pendingActionShowsRollback && <p className="mt-1 text-caption text-muted">{pendingAction!.rollback}</p>}
+              </>
+            ) : voicedApproval ? (
               // Clem asks in her own words, like a question card (the checker
               // wrote them from the exact call); the content below is exact.
               <>
@@ -498,7 +517,7 @@ export function ChatBubble({
                     : `Approve: ${message.approval?.subject ?? 'this action'}`}
             </p>
             )}
-            {pendingAction && (
+            {pendingAction && !voicedPendingAction && (
               <div className="mt-1 space-y-0.5 text-caption text-muted">
                 <div>Tool: <span className="font-mono">{pendingAction.toolName}</span></div>
                 {pendingAction.targetSummary && <div>Target: {pendingAction.targetSummary}</div>}
@@ -508,7 +527,7 @@ export function ChatBubble({
                 {pendingAction.payloadHash && <div>Payload hash: <span className="font-mono">{pendingAction.payloadHash}</span></div>}
               </div>
             )}
-            {message.approval?.reason && !voicedApproval && <p className="mt-0.5 text-caption text-muted">{message.approval.reason}</p>}
+            {message.approval?.reason && !voicedApproval && !voicedPendingAction && <p className="mt-0.5 text-caption text-muted">{message.approval.reason}</p>}
             {!pendingAction && message.approval?.preview?.check && (
               <ApprovalCheckNote check={message.approval.preview.check} />
             )}
@@ -533,7 +552,7 @@ export function ChatBubble({
               </>
             )}
             {!pendingAction && message.approval?.preview?.items && <ApprovalReview preview={message.approval.preview} />}
-            {pendingAction && <PayloadPreview value={pendingAction.payload} />}
+            {pendingAction && !voicedPendingAction && <PayloadPreview value={pendingAction.payload} />}
             {canOfferStandingSendTrust(pendingAction) && !resolved && (
               <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-caption text-muted">
                 <input
@@ -577,9 +596,9 @@ export function ChatBubble({
                 onClick={pendingAction ? runExecute : () => { void resolvePlainDecision('approve'); }}
               >
                 {pendingAction ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
-                {pendingAction ? 'Execute queued action' : message.approval?.preview?.items ? `Approve all ${message.approval.preview.items.length}` : 'Approve'}
+                {pendingAction ? (voicedPendingAction ? 'Yes, go ahead' : 'Execute queued action') : message.approval?.preview?.items ? `Approve all ${message.approval.preview.items.length}` : 'Approve'}
               </Button>
-              <Button size="sm" variant="secondary" disabled={resolved || decisionBusy !== null} onClick={() => { void resolvePlainDecision('reject'); }}><X className="h-4 w-4" aria-hidden /> Decline</Button>
+              <Button size="sm" variant="secondary" disabled={resolved || decisionBusy !== null} onClick={() => { void resolvePlainDecision('reject'); }}><X className="h-4 w-4" aria-hidden /> {voicedPendingAction ? 'No, skip it' : 'Decline'}</Button>
               {!resolved && exec.phase === 'idle' && (
                 <Button size="sm" variant="ghost" disabled={decisionBusy !== null} onClick={() => { void setAsideForLater(); }}>Not now</Button>
               )}
@@ -589,12 +608,12 @@ export function ChatBubble({
                   real result). */}
               {pendingAction ? (
                 <span role="status" aria-live="polite" aria-atomic="true">
-                  {exec.phase === 'running' ? <span className="text-caption text-muted">Executing…</span>
-                    : exec.phase === 'executed' ? <span className="text-caption font-semibold text-success">Executed ✓</span>
-                      : exec.phase === 'failed' ? <span className="text-caption font-semibold text-danger">Failed / needs review</span>
-                        : exec.phase === 'rejected' ? <span className="text-caption font-semibold text-muted">Rejected — not dispatched</span>
-                          : exec.phase === 'expired' ? <span className="text-caption font-semibold text-muted">Expired — not dispatched</span>
-                            : exec.phase === 'cancelled' ? <span className="text-caption font-semibold text-muted">Cancelled — not dispatched</span>
+                  {exec.phase === 'running' ? <span className="text-caption text-muted">Running…</span>
+                    : exec.phase === 'executed' ? <span className="text-caption font-semibold text-success">Done ✓</span>
+                      : exec.phase === 'failed' ? <span className="text-caption font-semibold text-danger">Didn't go through — needs a look</span>
+                        : exec.phase === 'rejected' ? <span className="text-caption font-semibold text-muted">Skipped — nothing ran</span>
+                          : exec.phase === 'expired' ? <span className="text-caption font-semibold text-muted">Expired — nothing ran</span>
+                            : exec.phase === 'cancelled' ? <span className="text-caption font-semibold text-muted">Cancelled — nothing ran</span>
                               : exec.phase === 'uncertain' ? <span className="text-caption font-semibold text-warning">Outcome not confirmed</span>
                                 : null}
                 </span>
