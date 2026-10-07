@@ -860,17 +860,30 @@ function MessageRow({
         {message.approval.preview && !message.approval.preview.items && message.approval.preview.fields.length > 0 ? (
           // What approving would actually send, from the host's frozen call.
           <dl class="approval-preview">
-            {message.approval.preview.fields.map((field) => (
-              <div key={field.name}>
-                <dt>{approvalFieldLabel(field.name)}</dt>
-                <dd>
-                  {field.label
-                    ? <>{field.label} <span class="approval-preview-id">· {field.value}</span></>
-                    : field.value}
-                </dd>
-              </div>
-            ))}
+            {message.approval.preview.fields.map((field) => {
+              // A change in words, shown as a change: the new value washed,
+              // what it was struck under it (owner-approved design, 2026-10-07).
+              const was = message.approval?.revises?.fields?.find((f) => f.name === field.name);
+              const changed = Boolean(was && was.value !== field.value);
+              return (
+                <div key={field.name}>
+                  <dt>{approvalFieldLabel(field.name)}</dt>
+                  <dd class={changed ? 'is-changed' : undefined}>
+                    {field.label
+                      ? <>{field.label} <span class="approval-preview-id">· {field.value}</span></>
+                      : field.value}
+                  </dd>
+                  {changed ? <dd class="approval-was">Was: <s>{was!.value}</s></dd> : null}
+                </div>
+              );
+            })}
           </dl>
+        ) : null}
+        {message.approval.revises?.changeRequest && !approvalDecided ? (
+          // The owner's words that changed the earlier card, on this card.
+          <div class="approval-confirm">
+            <div class="approval-confirm-you"><span class="approval-confirm-mark" aria-hidden="true">You</span><span>You wrote: <q>{message.approval.revises.changeRequest}</q></span></div>
+          </div>
         ) : null}
         {message.approval.preview?.items && <ApprovalReview preview={message.approval.preview} />}
         {message.approval.confirm && !approvalDecided ? (

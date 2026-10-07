@@ -2585,6 +2585,73 @@ test('chat/send returns 503 when no assistant is wired', async () => {
   } finally { await h.close(); }
 });
 
+test('a change in words on a queued card from the phone resolves it as changed and runs the words as the turn', async () => {
+  // Live 2026-10-07: the phone routed a written reply only while the card's
+  // turn was paused, so a change on a queued command started a fresh turn
+  // and the card stayed pending. Parity with the desktop dock.
+  resetEventLog();
+  const jev = await import('../runtime/jev/client.js');
+  const { pendingActionApprovalView } = await import('../runtime/harness/pending-action-view.js');
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  const previousAuthMode = process.env.AUTH_MODE;
+  delete process.env.CLEMMY_HARNESS_WEBHOOK;
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.AUTH_MODE = 'api_key';
+  jev._setTypesafeKeyForTests('ts_test');
+  jev._setSystemOneFetchForTests(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+    reply: { type: 'choice', choice: 'changes', confidence: 0.95, probabilities: { changes: 0.95 } },
+  }, usage: { input_tokens: 50, output_tokens: 3 } }) }) as never);
+  const ran: string[] = [];
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (opts: { sessionId: string }) => {
+      ran.push(opts.sessionId);
+      return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1, reply: 'Amended — here is the new card.' };
+    }) as never,
+  });
+  const h = await startHarness({ assistant: { respond: async () => { throw new Error('the bridge runs the turn'); } } as Parameters<typeof createMobileRouter>[0]['assistant'] });
+  try {
+    const cookie = await loginMobile(h, 'Change phone');
+    const whoami = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    const { deviceId } = await whoami.json() as { deviceId: string };
+    const session = createHarnessSession({ id: 'sess-mobile-queued-change', kind: 'chat', channel: 'mobile', userId: deviceId,
+      metadata: { source: 'mobile', ingressProvider: 'mobile', channelId: 'mobile-queued-change-root', userId: deviceId } });
+    const action = queuePendingAction({ title: 'Print SSH settings', summary: 'local', kind: 'shell_command',
+      toolName: 'run_shell_command', payload: { command: 'ssh -G localhost', cwd: null, timeout_ms: null }, sessionId: session.id });
+    const card = approvalRegistry.register({ sessionId: session.id, subject: 'Print SSH settings', tool: 'request_approval',
+      args: { pendingActionId: action.id, pendingAction: pendingActionApprovalView(action),
+        preview: { operation: 'run_shell_command', fields: [{ name: 'command', value: 'ssh -G localhost' }], ask: 'OK to run it?' } } });
+    const res = await fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie, 'idempotency-key': 'mobile-queued-change-1' },
+      body: JSON.stringify({ message: 'Yes, but add -v so I can see the verbose output too.', sessionId: session.id }),
+    });
+    assert.equal(res.status, 200, await res.text());
+    assert.deepEqual(ran, [session.id], 'the words ran as an ordinary turn in the conversation holding the card');
+    const row = approvalRegistry.get(card.approvalId);
+    assert.equal(row?.status, 'resolved');
+    assert.equal(row?.resolution, 'rejected');
+    assert.equal(row?.resolver, 'chat-dock-change-request');
+    assert.equal(getPendingAction(action.id)?.status, 'rejected', 'the queued payload will not run');
+    const resolutions = listEvents(session.id, { types: ['approval_resolved'] }).filter((event) => event.data.approvalId === card.approvalId);
+    assert.equal(resolutions.length, 1);
+    assert.equal(resolutions[0].data.changeRequested, true);
+    assert.equal(resolutions[0].data.changeRequest, 'Yes, but add -v so I can see the verbose output too.');
+  } finally {
+    _setBridgeImplsForTests({});
+    jev._setTypesafeKeyForTests(undefined);
+    jev._setSystemOneFetchForTests(undefined);
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+    else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
+    if (previousAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = previousAuthMode;
+    await h.close();
+  }
+});
+
 test('default mobile chat/send never exposes a thrown provider error message', async () => {
   const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
   const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;

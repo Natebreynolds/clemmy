@@ -123,6 +123,7 @@ import {
 import {
   claimSessionForAcceptedSource,
   resolveAcceptedSourceIngressLineage,
+  sameConversationAncestorSessionIds,
 } from '../runtime/harness/accepted-source-session-branch.js';
 import {
   projectHarnessEventsForPublic,
@@ -210,7 +211,7 @@ import { attachAnswerStream } from '../runtime/harness/answer-stream.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { runConversationFromResume } from '../runtime/harness/loop.js';
-import { routeReplyToPendingApproval } from '../runtime/harness/approval-reply-routing.js';
+import { resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
 import { loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { forgetApprovedWriteKind, listApprovedWriteKinds } from '../agents/plan-scope.js';
 import { buildContinueInput, isContinueCompletionReason } from '../runtime/harness/continue-directive.js';
@@ -4209,12 +4210,28 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         return;
       }
       // A written reply to the waiting card (parity with the desktop dock):
-      // a sure change or decline, read by Jev, answers the card itself.
-      if (!connectionContext && !typedControl && requestedSessionId && (!taskMode || taskMode.kind === 'normal')
-        && HarnessSession.load(requestedSessionId)?.loadInterruptState()) {
-        const routed = await routeReplyToPendingApproval({ sessionId: requestedSessionId, text: message, parsed: null })
+      // a sure change or decline, read by Jev, answers the card itself. The
+      // card may wait in this conversation or the one it branched from,
+      // paused on a work_call or holding a queued exact payload (a registry
+      // row with no pause). Live 2026-10-07: the phone routed only while
+      // paused, so a change on a queued command started a fresh turn.
+      const cardSessionId = !connectionContext && !typedControl && requestedSessionId && (!taskMode || taskMode.kind === 'normal')
+        ? sessionHoldingWaitingCard(requestedSessionId,
+          sameConversationAncestorSessionIds({ sessionId: requestedSessionId, principalId: ctx.record.deviceId }),
+          (id) => Boolean(HarnessSession.load(id)?.loadInterruptState()))
+        : null;
+      const cardWaiting = cardSessionId !== null && (Boolean(HarnessSession.load(cardSessionId)?.loadInterruptState())
+        || approvalRegistry.listPending({ sessionId: cardSessionId, status: 'pending' })
+          .some((row) => approvalRegistry.isFormalApprovalSurface(row) && approvalRegistry.isActionable(row)));
+      if (cardSessionId && cardWaiting) {
+        const routed = await routeReplyToPendingApproval({ sessionId: cardSessionId, text: message, parsed: null })
           .catch(() => null);
-        if (routed?.intent) {
+        // A change in words on a queued exact payload: the card is resolved
+        // as changed and the words run as this turn, whose fresh card names
+        // the one it revises (owner-approved design, 2026-10-07).
+        const changedQueuedCard = Boolean(routed?.intent?.decision === 'reject' && routed.changeRequest
+          && resolveQueuedCardAsChanged({ sessionId: cardSessionId, approvalId: routed.intent.approvalId, changeRequest: routed.changeRequest }));
+        if (routed?.intent && !changedQueuedCard) {
           await resolveMobileApproval(res, routed.intent.approvalId, routed.intent.decision, {
             request: { requestId, runId, inputHash },
             ...(routed.changeRequest ? { changeRequest: routed.changeRequest } : {}),
@@ -4225,17 +4242,17 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         // own question is asked back in one line, exactly as the desktop does,
         // instead of a fresh turn that would branch away from the waiting card
         // (live 2026-10-06 on the desktop: a duplicate card).
-        if (routed?.confirm) {
+        if (routed?.confirm && !changedQueuedCard) {
           const confirm = routed.confirm;
           const control = commitLiveApprovalControl({
-            requestId, runId, inputHash, sessionId: requestedSessionId, text: message,
+            requestId, runId, inputHash, sessionId: cardSessionId, text: message,
             prepare: () => {
               const row = approvalRegistry.get(confirm.approvalId);
               if (!row || !approvalRegistry.isActionable(row)) return null;
               return {
                 sourceData: { source: 'mobile_approval_confirm', approvalId: confirm.approvalId, confirm: confirm.leaning },
                 commit: (source) => {
-                  appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
+                  appendHarnessEvent({ sessionId: cardSessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
                     data: { sourceUserSeq: source.seq, reason: 'approval_confirmation_required', question: confirm.question, options: ['Yes', 'No'],
                       approvalId: confirm.approvalId, leaning: confirm.leaning, replyText: message } });
                   const identity = mobileApprovalIdentity(source);
