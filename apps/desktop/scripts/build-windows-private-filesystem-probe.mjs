@@ -99,7 +99,9 @@ export function resolveWindowsAclCompiler(env = process.env, run = spawnSync, is
   const vswhere = programRoots.map(root => path.win32.join(root, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe')).find(isFile);
   if (!vswhere) throw new Error('Windows build requires Visual Studio Roslyn compiler discovery.');
   const result = run(vswhere, ['-latest', '-products', '*', '-requires', 'Microsoft.Component.MSBuild', '-find', 'MSBuild\\**\\Bin\\Roslyn\\csc.exe'], {
-    env: windowsCompilerEnvironment(env), encoding: 'utf8', shell: false, windowsHide: true, timeout: 10_000, maxBuffer: 16 * 1024,
+    // A cold runner's first vswhere scan can take well over ten seconds
+    // (run 37655662679 failed at the old 10 s bound); the exact-compiler rule is unchanged.
+    env: windowsCompilerEnvironment(env), encoding: 'utf8', shell: false, windowsHide: true, timeout: 90_000, maxBuffer: 16 * 1024,
   });
   if (result.error || result.status !== 0) throw new Error('Windows C# compiler discovery failed.');
   const candidates = String(result.stdout).trim().split(/\r?\n/).filter(Boolean);
