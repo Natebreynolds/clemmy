@@ -1,4 +1,5 @@
 import { observeHeldStopPublicationOwner, sealHeldStopPublication, drainHeldStopPublication, drainHeldStopPublications, heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_TEXT, HeldStopPublicationSupersededError, type HeldStopPublicationTicket } from './held-stop-publication.js';
+import { priorTerminalDeliveryResumes } from './terminal-delivery-resume-ledger.js';
 import { approvalCardAsk } from './approval-card-voice.js';
 import { MODEL_REFUSED_BLOCKED_REASON, refusedModelPublicText, refusedRequestedModel } from './model-refusal.js';
 import './memory-scope-binding.js';
@@ -7918,7 +7919,7 @@ async function runConversationCore(
           authoredText,
           deliveryConcern: reconciliationConcern,
           settlementAudit: terminalAssessment.settlementAudit,
-          priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+          priorConsecutiveResumes: Math.max(terminalJudgeConsecutiveResumes, priorTerminalDeliveryResumes(options.sessionId, sourceUserSeq)) as 0 | 1,
           recoveryCapability: terminalRecoveryCapability(stepIndex, maxSteps),
         }, {
           ...(options.terminalDeliveryJudgePort
@@ -7951,6 +7952,7 @@ async function runConversationCore(
                 reason: terminalDecision.reason,
                 attempt: terminalDecision.consecutiveResumeCount,
                 path: 'self_reconciliation',
+                sourceUserSeq,
               },
             });
             nextInput = [
@@ -10067,7 +10069,7 @@ async function runConversationCore(
             authoredText: userVisibleSummary,
             deliveryConcern: concern,
             settlementAudit: assessment.settlementAudit,
-            priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+            priorConsecutiveResumes: Math.max(terminalJudgeConsecutiveResumes, priorTerminalDeliveryResumes(options.sessionId, activeSourceUserSeq)) as 0 | 1,
             recoveryCapability: terminalRecoveryCapability(stepIndex, maxSteps),
           }, {
             ...(options.terminalDeliveryJudgePort
@@ -10092,6 +10094,7 @@ async function runConversationCore(
                   kind: 'terminal_delivery_resume',
                   reason: terminalDecision.reason,
                   attempt: terminalDecision.consecutiveResumeCount,
+                  sourceUserSeq: activeSourceUserSeq,
                 },
               });
               nextInput = [
@@ -14822,7 +14825,7 @@ async function runConversationFromResumeCore(opts: {
             authoredText: userVisibleSummary ?? '',
             deliveryConcern: concern,
             settlementAudit: assessment.settlementAudit,
-            priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+            priorConsecutiveResumes: Math.max(terminalJudgeConsecutiveResumes, priorTerminalDeliveryResumes(opts.sessionId, activeSourceUserSeq)) as 0 | 1,
             recoveryCapability: terminalRecoveryCapability(stepIndex, maxSteps),
           }, {
             ...(opts.terminalDeliveryJudgePort
@@ -14848,6 +14851,7 @@ async function runConversationFromResumeCore(opts: {
                   reason: terminalDecision.reason,
                   attempt: terminalDecision.consecutiveResumeCount,
                   path: 'approval_resume',
+                  sourceUserSeq: activeSourceUserSeq,
                 },
               });
               resumeContinuationInput = [
