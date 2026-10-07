@@ -17185,6 +17185,19 @@ export function registerConsoleRoutes(
         approvalConfirm = routed.confirm?.leaning === 'unread' && !isPausedOnApproval ? undefined : routed.confirm;
       }
     }
+    if ((intent || approvalConfirm) && cardSessionId !== sessionId) {
+      // The decision belongs to the card's conversation. From here on the
+      // request IS the reply typed in that session, so every door below —
+      // the live control, the paused resume, the exact-card selection — finds
+      // the card where it waits, and the result lands in that thread. The
+      // response names that session; both sides are the same conversation.
+      const cardSession = getHarnessSession(cardSessionId);
+      if (cardSession) {
+        session = cardSession;
+        sessionId = cardSessionId;
+        streamUrl = `/api/sessions/${sessionId}/events`;
+      }
+    }
 
     try {
       const control = tryCommitLiveApprovalControl({ sessionId: cardSessionId, requestId: requestIdentity.requestId,
