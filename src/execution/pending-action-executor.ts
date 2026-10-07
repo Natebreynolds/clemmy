@@ -67,6 +67,11 @@ export function _setApprovedCallDispatchForTests(dispatch: ApprovedCallDispatch 
   dispatchOverrideForTests = dispatch;
 }
 
+/** The record's own marker for a refusal that happened before any provider
+ * call: the result summary starts with it. The owner's ending reads it by
+ * this constant, never by matching provider prose. */
+export const PENDING_ACTION_PRE_DISPATCH_REFUSAL = 'Dispatch was refused locally before the provider call started';
+
 /** Nominal local refusal for dispatcher implementations that can establish the
  * provider thunk was never invoked. Text returned from a dispatch is never
  * upgraded into this type: providers can echo local-looking marker prose after
@@ -338,7 +343,7 @@ export async function executeApprovedPendingActionCall(
       const updated = recordPendingActionResult(
         claimedRecord.id,
         'failed',
-        `Dispatch was refused locally before the provider call started: ${msg}`.slice(0, 4000),
+        `${PENDING_ACTION_PRE_DISPATCH_REFUSAL}: ${msg}`.slice(0, 4000),
         'pending-action-executor',
         claimToken,
       );

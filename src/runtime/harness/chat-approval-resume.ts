@@ -50,7 +50,7 @@ import { BoundaryError } from '../boundary-error.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { publicUserInputText } from './public-presentation.js';
 import { freshExternalWriteEvidenceStatus } from './tool-evidence.js';
-import { executeApprovedPendingActionCall } from '../../execution/pending-action-executor.js';
+import { PENDING_ACTION_PRE_DISPATCH_REFUSAL, executeApprovedPendingActionCall } from '../../execution/pending-action-executor.js';
 import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import { turnOutcomeId, type TurnIdentity } from './turn-outcome.js';
@@ -522,17 +522,14 @@ async function executeApprovedLinkedActionAndSettle(
       text: approvedActionRanText(pendingAction, result),
     });
   }
-  if (pendingAction.status === 'executing') {
+  if (pendingAction.status === 'executing' || pendingAction.status === 'failed') {
+    // The owner said yes and it did not land: they read what happened and
+    // what to do next in Clem's words. The record keeps the machine text
+    // for the model (live 2026-10-07: "Dispatch was refused locally … Error:
+    // InvalidToolInputError … Call tool_search … then retry" reached the owner).
     return await settleConversationalSource(row, source, {
       status: 'failed',
-      text: pendingAction.resultSummary
-        ?? 'The send crossed into an execution attempt, but its outcome is uncertain. I will not retry it automatically.',
-    });
-  }
-  if (pendingAction.status === 'failed') {
-    return await settleConversationalSource(row, source, {
-      status: 'failed',
-      text: pendingAction.resultSummary ?? 'The exact approved send failed or became uncertain. I will not retry it automatically.',
+      text: approvedActionFailedText(pendingAction),
     });
   }
   return await settleConversationalSource(row, source, {
@@ -712,6 +709,22 @@ export function approvedActionRanText(action: Pick<PendingActionRecord, 'kind' |
     ? `Done — I ran it. Here's what it printed:\n\n\`\`\`\n${shellOutputOnly(shown)}${more}\n\`\`\``
     : `Done — that went through.${shown && !shown.startsWith('{') && shown.length <= 300 ? `\n\n${shown}` : ''}`;
   return `${body}\n\nIf there was more to do after it, say "continue" and I'll pick it up from here.`;
+}
+
+/** The owner's decision ended without the action landing. Two honest cases:
+ * refused before anything started (nothing changed; ask again and Clem
+ * rebuilds it), or stopped after it may have begun (no silent retry; Clem
+ * checks on request). Never the executor's machine text. */
+export function approvedActionFailedText(action: Pick<PendingActionRecord, 'kind' | 'toolName' | 'status' | 'resultSummary'>): string {
+  const shell = action.toolName === 'run_shell_command' || action.kind === 'shell_command';
+  const what = shell ? 'the command' : 'it';
+  const refusedBeforeStart = action.status === 'failed'
+    && typeof action.resultSummary === 'string'
+    && action.resultSummary.startsWith(PENDING_ACTION_PRE_DISPATCH_REFUSAL);
+  if (refusedBeforeStart) {
+    return `I couldn't run ${what} — the stored call didn't fit the tool's shape, so it was stopped before it started. Nothing ran and nothing changed.\n\nAsk me again in your own words and I'll build it fresh.`;
+  }
+  return `I tried, but I can't tell whether ${what} went through — it stopped partway and the answer never came back. I won't retry it on my own.\n\nSay "check" and I'll look at what landed before doing anything else.`;
 }
 
 /** The executor's summary wraps the command's own output in bookkeeping

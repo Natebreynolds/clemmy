@@ -610,3 +610,23 @@ test('the ending after an approved shell action shows only what the command prin
   assert.match(sent, /^Done — that went through\./);
   assert.doesNotMatch(sent, /msg-1/);
 });
+
+test('an approved action that did not land ends in Clem\'s words, never the executor\'s machine text', async () => {
+  // Live 2026-10-07: "Dispatch was refused locally before the provider call
+  // started: … Error: InvalidToolInputError … Call tool_search … then retry"
+  // reached the owner as the ending of their yes.
+  const { approvedActionFailedText } = await import('./chat-approval-resume.js');
+  const { PENDING_ACTION_PRE_DISPATCH_REFUSAL } = await import('../../execution/pending-action-executor.js');
+  const refused = approvedActionFailedText({ kind: 'shell_command', toolName: 'run_shell_command', status: 'failed',
+    resultSummary: `${PENDING_ACTION_PRE_DISPATCH_REFUSAL}: An error occurred while running the tool. Error: InvalidToolInputError: cwd: expected string` });
+  assert.match(refused, /^I couldn't run the command — the stored call didn't fit the tool's shape, so it was stopped before it started\. Nothing ran and nothing changed\./);
+  assert.match(refused, /Ask me again in your own words and I'll build it fresh\./);
+  assert.doesNotMatch(refused, /InvalidToolInputError|tool_search|Dispatch|run_shell_command/);
+  const uncertain = approvedActionFailedText({ kind: 'external_send', toolName: 'composio_execute_tool', status: 'failed',
+    resultSummary: 'Execution attempt failed or became uncertain after dispatch began: socket hang up. Do not retry automatically.' });
+  assert.match(uncertain, /^I tried, but I can't tell whether it went through/);
+  assert.match(uncertain, /I won't retry it on my own\./);
+  assert.doesNotMatch(uncertain, /socket hang up|composio/);
+  const stuck = approvedActionFailedText({ kind: 'external_send', toolName: 'composio_execute_tool', status: 'executing', resultSummary: null });
+  assert.match(stuck, /can't tell whether it went through/);
+});
