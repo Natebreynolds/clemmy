@@ -77,7 +77,7 @@ test('Windows terminal launch carries catalog argv as data and requires a real l
   await openWindowsCatalogTerminal('gh auth login');
   assert.equal(calls.length, 1);
   assert.deepEqual((calls[0].payload as {argv: string[]}).argv, ['C:\\Users\\Fixture Name & Co\\npm\\gh.cmd', 'auth', 'login']);
-  assert.match(calls[0].program, /Start-Process/);
+  assert.match(calls[0].program, /ProcessStartInfo/);
   assert.match(calls[0].program, /EncodedCommand/);
   assert.doesNotMatch(calls[0].program, /gh auth login|ExecutionPolicy|RunAs/);
   _testOnly_setWindowsTerminalExec(async () => '');

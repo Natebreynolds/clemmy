@@ -26,7 +26,7 @@ function fixture(outcome: 'ok' | 'fail' | 'error' | 'hang') {
 
 test('PowerShell receives Unicode URL metacharacters as private stdin data, not command arguments', async () => {
   const f=fixture('ok'); const payload={target:'https://example.invalid/oauth?state=a&scope=b%20c#片段'};
-  assert.equal(await runWindowsPowerShell('Start-Process -FilePath $payload.target -ErrorAction Stop',payload,
+  assert.equal(await runWindowsPowerShell('[void][System.Diagnostics.Process]::Start($payload.target)',payload,
     {spawnProcess:f.spawnProcess,env:{SystemRoot:'C:\\Windows',OPENAI_API_KEY:'synthetic-secret'}}),'42');
   assert.deepEqual(JSON.parse(f.input()),payload);
   assert.match(f.input(),/^[\x20-\x7e]+$/,'the payload bytes over stdin are printable ASCII, whatever code page the host reads');
@@ -34,7 +34,10 @@ test('PowerShell receives Unicode URL metacharacters as private stdin data, not 
   const argv=f.calls[0][1] as string[];
   assert.deepEqual(argv.slice(0,3),['-NoProfile','-NonInteractive','-EncodedCommand']);
   const program=Buffer.from(argv[3],'base64').toString('utf16le');
-  assert.match(program,/ConvertFrom-Json/); assert.doesNotMatch(program,/example\.invalid|片段|ExecutionPolicy|RunAs/);
+  assert.match(program,/JavaScriptSerializer/); assert.doesNotMatch(program,/example\.invalid|片段|ExecutionPolicy|RunAs/);
+  // No Verb-Noun cmdlet: one would make 5.1 analyze every module on the
+  // module path first, which never finished under the reduced environment.
+  assert.doesNotMatch(program,/\b[A-Z][a-z]+-[A-Z][A-Za-z]+\b/);
   assert.deepEqual((f.calls[0][2] as {env:unknown}).env,{SystemRoot:'C:\\Windows'});
 });
 
@@ -48,7 +51,7 @@ for (const outcome of ['fail','error','hang'] as const) test(`PowerShell ${outco
 test('actual Windows PowerShell preserves literal Unicode paths and URL query bytes', {skip:process.platform!=='win32'}, async () => {
   const dir=mkdtempSync(path.join(os.tmpdir(),'clem-PS-片段 & literal-'));
   const file=path.join(dir,'result.txt'); const value='https://example.invalid/?state=a&scope=b%20c#片段';
-  const program='[IO.File]::WriteAllText($payload.file, $payload.value, (New-Object System.Text.UTF8Encoding($false))); [Console]::Out.Write($payload.value)';
+  const program='[IO.File]::WriteAllText($payload.file, $payload.value, ([System.Text.UTF8Encoding]::new($false))); [Console]::Out.Write($payload.value)';
   try {
     const output = await runWindowsPowerShell(program, {file,value}).catch(error => {
       // The launch failed on the real OS. Run 37660389975 showed every

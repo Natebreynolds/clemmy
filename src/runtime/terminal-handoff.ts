@@ -67,14 +67,23 @@ export function escapeAppleScriptString(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
+// Cmdlet-free (see windows-powershell.ts): the outer program only builds the
+// inner command and starts the visible terminal, where the inner one runs.
 const WINDOWS_TERMINAL_PROGRAM = `
-$words = @($payload.argv | ForEach-Object { "'" + ([string]$_).Replace("'", "''") + "'" })
+$words = @()
+foreach ($word in $payload.argv) { $words += "'" + ([string]$word).Replace("'", "''") + "'" }
 $directory = "'" + ([string]$payload.cwd).Replace("'", "''") + "'"
 $inner = 'Set-Location -LiteralPath ' + $directory + '; & ' + ($words -join ' ')
 $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
-$terminal = Start-Process -FilePath $payload.powershell -ArgumentList @('-NoProfile', '-NoExit', '-EncodedCommand', $encoded) -WorkingDirectory $payload.cwd -WindowStyle Normal -PassThru
+$start = [System.Diagnostics.ProcessStartInfo]::new()
+$start.FileName = $payload.powershell
+$start.Arguments = '-NoProfile -NoExit -EncodedCommand ' + $encoded
+$start.WorkingDirectory = $payload.cwd
+$start.UseShellExecute = $true
+$start.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
+$terminal = [System.Diagnostics.Process]::Start($start)
 if (-not $terminal.Id) { throw 'No terminal launch receipt' }
-Write-Output $terminal.Id
+[Console]::Out.Write($terminal.Id)
 `;
 
 /** Only server-owned catalog recipes reach this seam. No secrets or shell

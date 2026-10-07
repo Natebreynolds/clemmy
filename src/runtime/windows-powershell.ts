@@ -5,12 +5,20 @@ import { windowsSystemRoot } from './windows-process-tree.js';
 
 export { asciiJson };
 
-// The payload arrives as ASCII-only JSON (see asciiJson), so the host's own
-// stdin decoding, whatever code page it started with, reads it exactly; only
-// the output encoding is set, and only where a console exists to set it on.
-const READ_PAYLOAD = `try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
+// No cmdlet anywhere in a launch program: a cmdlet makes Windows PowerShell
+// 5.1 discover and analyze every module on the module path before it runs,
+// which under a reduced environment never finished (run 37663745632: the
+// same program answered in 1.3 s with the whole environment, a cmdlet-free
+// program in 0.2 s without it). The payload arrives as ASCII-only JSON
+// (asciiJson), read by the .NET serializer, so the console code page the
+// host started with cannot change a byte; only the output encoding is set,
+// and only where a console exists to set it on.
+const READ_PAYLOAD = `try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
 $ErrorActionPreference = 'Stop'
-$payload = ConvertFrom-Json ([Console]::In.ReadToEnd())
+[void][System.Reflection.Assembly]::Load('System.Web.Extensions, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35')
+$parsed = [System.Web.Script.Serialization.JavaScriptSerializer]::new().DeserializeObject([Console]::In.ReadToEnd())
+$payload = @{}
+foreach ($entry in $parsed.GetEnumerator()) { $payload[$entry.Key] = $entry.Value }
 `;
 
 /** Ordinary Windows system variables, never the daemon's own secrets or
@@ -75,5 +83,8 @@ export function runWindowsPowerShell(
 /** Registry-backed URL/file association. No URL becomes shell syntax. */
 export async function launchWindowsDefaultApp(target: string): Promise<void> {
   if (!target || /[\x00-\x1f]/.test(target)) throw new Error('Invalid application target.');
-  await runWindowsPowerShell('Start-Process -FilePath $payload.target -ErrorAction Stop', { target });
+  await runWindowsPowerShell(`$start = [System.Diagnostics.ProcessStartInfo]::new()
+$start.FileName = $payload.target
+$start.UseShellExecute = $true
+[void][System.Diagnostics.Process]::Start($start)`, { target });
 }

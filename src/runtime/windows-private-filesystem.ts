@@ -212,8 +212,13 @@ export function assertWindowsPrivateFilesystem(
   if (!path.isAbsolute(systemRoot)) throw new WindowsPrivateFilesystemError();
   const command = native ?? path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const args = native ? [] : ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(ACL_PROGRAM, 'utf16le').toString('base64')];
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key, value]) => value !== undefined
-    && /^(?:systemroot|windir|systemdrive|comspec|pathext|temp|tmp)$/i.test(key)));
+  // The native probe needs only system variables. The development backend
+  // runs cmdlets (ConvertFrom-Json, Add-Type), and Windows PowerShell 5.1
+  // analyzes every module on the module path for the first cmdlet, which
+  // under a reduced environment never finished (run 37663745632): it keeps
+  // the developer's own environment. The program is fixed; nothing leaves.
+  const env = native ? Object.fromEntries(Object.entries(process.env).filter(([key, value]) => value !== undefined
+    && /^(?:systemroot|windir|systemdrive|comspec|pathext|temp|tmp)$/i.test(key))) : process.env;
   const result = spawnSync(command, args, { input, env, encoding: 'utf8', windowsHide: true,
     timeout: native ? 2_000 : 10_000, maxBuffer: 4096 });
   if (result.error || result.status !== 0 || result.stdout !== 'private-acl-ok-v2') {
