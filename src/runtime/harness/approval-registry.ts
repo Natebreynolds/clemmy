@@ -38,6 +38,7 @@ import {
   linkPendingActionApproval,
   markPendingActionApprovalResolved,
 } from './pending-actions.js';
+import { pendingActionApprovalView } from './pending-action-view.js';
 import { appendAuditRecord } from '../audit-ledger.js';
 import {
   canonicalExternalWriteActionKey,
@@ -1771,6 +1772,40 @@ export function listPendingAwaitingReminder(
 
 /** Record that the one reminder went out. False when it was already recorded,
  * so two passes (or a pass after a restart) can never both claim it. */
+/** EDIT BY HAND ON THE CARD (owner-approved design, 2026-10-07). The owner
+ * retyped a field the card showed and the linked record's payload moved with
+ * its hash. The card keeps its id; its stored pin (the record view the
+ * executor verifies against) and the fields it shows follow the record. Only
+ * a pending row linked to this exact record is re-pinned; null otherwise. */
+export function repinPendingActionCard(approvalId: string, editedFields: Record<string, string> = {}): PendingApprovalRow | null {
+  const row = get(approvalId);
+  if (!row || row.status !== 'pending') return null;
+  const pendingActionId = pendingActionIdFromArgs(row.args);
+  if (!pendingActionId) return null;
+  const record = getPendingAction(pendingActionId);
+  if (!record || record.approvalId !== approvalId || record.sessionId !== row.sessionId) return null;
+  const args: Record<string, unknown> = { ...(row.args ?? {}) };
+  if (args.pendingAction && typeof args.pendingAction === 'object') args.pendingAction = pendingActionApprovalView(record);
+  const preview = args.preview;
+  if (preview && typeof preview === 'object' && !Array.isArray(preview) && Array.isArray((preview as { fields?: unknown }).fields)) {
+    args.preview = {
+      ...(preview as Record<string, unknown>),
+      fields: ((preview as { fields: unknown[] }).fields).map((field) => {
+        if (!field || typeof field !== 'object' || Array.isArray(field)) return field;
+        const name = (field as { name?: unknown }).name;
+        return typeof name === 'string' && Object.prototype.hasOwnProperty.call(editedFields, name)
+          ? { ...(field as Record<string, unknown>), value: editedFields[name] }
+          : field;
+      }),
+    };
+  }
+  const db = openEventLog();
+  const changed = db.prepare(
+    "UPDATE pending_approvals SET args_json = ? WHERE approval_id = ? AND status = 'pending'",
+  ).run(JSON.stringify(args), approvalId).changes === 1;
+  return changed ? get(approvalId) ?? null : null;
+}
+
 export function markApprovalReminded(approvalId: string, at: Date = new Date()): boolean {
   const db = openEventLog();
   return db.prepare(

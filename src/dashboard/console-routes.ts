@@ -14100,7 +14100,7 @@ export function registerConsoleRoutes(
           note: `Edited by hand on the card: ${Object.keys(edits).join(', ')}.`,
           preview: exactCommandPreview(record.toolName, payload),
         });
-        if (!amended || amended.status !== record.status) {
+        if (!amended || amended.status !== record.status || !approvalRegistry.repinPendingActionCard(id, edits)) {
           res.status(409).json({ error: 'the queued action could not be edited right now; nothing was approved' });
           return;
         }

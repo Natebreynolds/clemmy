@@ -409,8 +409,11 @@ test('edit by hand on a queued card: the edited field lands on the record, the c
   });
   const card = approvalRegistry.register({
     sessionId, subject: record.title, tool: 'request_approval',
-    args: { pendingActionId: record.id, pendingAction: pendingActionApprovalView(record) },
+    args: { pendingActionId: record.id, pendingAction: pendingActionApprovalView(record),
+      preview: { operation: 'run_shell_command', fields: [{ name: 'command', value: 'ssh -G localhost' }], ask: 'OK to run it?' } },
   });
+  const dispatched: Array<{ tool: string; payload: unknown }> = [];
+  _setApprovedCallDispatchForTests(async (tool, payload) => { dispatched.push({ tool, payload }); return 'exit_code: 0\nstdout: host localhost'; });
   const h = await boot();
   try {
     const unknown = await fetch(`${h.url}/api/console/harness-approvals/${card.approvalId}/approve_with_edits`, {
@@ -441,13 +444,27 @@ test('edit by hand on a queued card: the edited field lands on the record, the c
     assert.equal(resolutions.length, 1, 'one typed resolution, written before the registry settles');
     assert.equal(resolutions[0].data.edited, true);
     assert.deepEqual(resolutions[0].data.editedFields, { command: 'ssh -G -vv localhost' });
-    // Decided: a second edit is refused and changes nothing.
+    // The card keeps its id and now pins the edited record: the executor's
+    // verification (card pins id, tool and payload hash) passes and exactly
+    // the edited command runs. Live 2026-10-07: the stale pin refused it.
+    const pinned = approvalRegistry.get(card.approvalId);
+    assert.equal((pinned?.args?.pendingAction as { payloadHash?: string })?.payloadHash, durable?.payloadHash);
+    assert.deepEqual((pinned?.args?.preview as { fields: unknown[] })?.fields, [{ name: 'command', value: 'ssh -G -vv localhost' }]);
+    const executed = await fetch(`${h.url}/api/console/pending-actions/${record.id}/approve-execute`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ approvalId: card.approvalId }),
+    });
+    assert.equal(executed.status, 200, JSON.stringify(await executed.clone().json()));
+    assert.equal(dispatched.length, 1, 'the edited payload ran exactly once');
+    assert.deepEqual(dispatched[0].payload, { command: 'ssh -G -vv localhost', timeout_ms: 30000, cwd: null });
+    assert.equal(getPendingAction(record.id)?.status, 'executed');
+    // Decided: a further edit is refused and changes nothing.
     const again = await fetch(`${h.url}/api/console/harness-approvals/${card.approvalId}/approve_with_edits`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modifiedFields: { command: 'rm -rf /' } }),
     });
     assert.equal(again.status, 409);
     assert.deepEqual(getPendingAction(record.id)?.payload, durable?.payload);
   } finally {
+    _setApprovedCallDispatchForTests(null);
     await h.close();
   }
 });
