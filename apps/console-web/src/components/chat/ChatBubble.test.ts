@@ -78,3 +78,13 @@ test('the card\'s question asked back is drawn on the card with the owner\'s wor
   assert.match(SOURCE, /Skipped · nothing ran/);
   assert.doesNotMatch(SOURCE, /function approvalResolutionText/, 'the old resolution sentence is gone');
 });
+
+test('a change in words and an edit by hand both live on the card', () => {
+  // Owner-approved design, 2026-10-07.
+  assert.match(SOURCE, /function ApprovalRevisionStrip/);
+  assert.match(SOURCE, /Was: <span className="line-through">/);
+  assert.match(SOURCE, /Edit by hand/);
+  assert.match(SOURCE, /Yes, send this one/);
+  assert.match(SOURCE, /onApproveWithEdits!\(\{ \[editableField\.name\]: editedValue \}\)/);
+  assert.match(SOURCE, /Exactly what you typed goes out, checked the same way first\./);
+});

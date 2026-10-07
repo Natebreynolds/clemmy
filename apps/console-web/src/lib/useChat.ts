@@ -2,8 +2,8 @@ import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../
 import { reduceActivity as reduceSharedActivity, reduceLifecycle, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
 import { boundedModelId, modelDisplayName } from '@clem/chat-engine';
-import { applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
-import type { ApprovalConfirm, ApprovalPreview, ApprovalResolution } from '@clem/chat-engine';
+import { applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
+import type { ApprovalConfirm, ApprovalPreview, ApprovalResolution, ApprovalRevision } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -153,6 +153,8 @@ export interface ChatMessage {
     resolution?: ApprovalResolution;
     /** The card's question asked back, after a reply that could not be read. */
     confirm?: ApprovalConfirm;
+    /** This card revises an earlier one the owner changed in words. */
+    revises?: ApprovalRevision;
   };
   taskMode?: TaskMode;
   planArtifactRef?: PlanRevisionRef;
@@ -327,6 +329,7 @@ export function appendLiveApprovalCard(
         ...(pendingActionId ? { pendingActionId } : {}),
         ...(pendingAction ? { pendingAction } : {}),
         ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
+        ...(approvalRevisionFrom(d.revises) ? { revises: approvalRevisionFrom(d.revises) } : {}),
       },
     },
   ];
@@ -2242,6 +2245,7 @@ export function inboxAdditionsFromEvents(
           ...(pendingActionId ? { pendingActionId } : {}),
           ...(pendingAction ? { pendingAction } : {}),
           ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
+          ...(approvalRevisionFrom(d.revises) ? { revises: approvalRevisionFrom(d.revises) } : {}),
         },
       });
     }

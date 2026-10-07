@@ -907,3 +907,20 @@ test('a still-pending card in Clem\'s words takes its paused turn\'s place on re
   const after = getUnifiedSessionDetail(`harness:${origin.id}`);
   assert.deepEqual(after!.turns.filter((t) => t.role === 'assistant').map((t) => t.text), [question]);
 });
+
+// Runs last: the file shares one DB and earlier tests count rows.
+test('a session branched off a conversation lists under that conversation\'s title, never its channel name', () => {
+  // Live 2026-10-07: every branched turn listed as "desktop".
+  const root = createSession({ kind: 'chat', channel: 'desktop', title: 'Set a Slack reminder for tomorrow', metadata: { source: 'desktop' } });
+  const branch = createSession({ kind: 'chat', channel: 'desktop', metadata: { source: 'desktop', channelId: root.id,
+    __accepted_source_branch: { version: 1, rootSessionId: root.id, parentSessionId: root.id } } });
+  appendEvent({ sessionId: branch.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'no wait, hmm, yes?' } });
+  const untitledRoot = createSession({ kind: 'chat', channel: 'desktop', metadata: { source: 'desktop' } });
+  appendEvent({ sessionId: untitledRoot.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Draft the Q3 retreat note' } });
+  const branch2 = createSession({ kind: 'chat', channel: 'desktop', metadata: { source: 'desktop', channelId: untitledRoot.id,
+    __accepted_source_branch: { version: 1, rootSessionId: untitledRoot.id, parentSessionId: untitledRoot.id } } });
+  const titles = new Map(buildUnifiedSessionList().map((s) => [s.id, s.title]));
+  assert.equal(titles.get(`harness:${branch.id}`), 'Set a Slack reminder for tomorrow');
+  assert.equal(titles.get(`harness:${branch2.id}`), 'Draft the Q3 retreat note', 'the root\'s first words title the branch');
+  assert.notEqual(titles.get(`harness:${branch2.id}`), 'desktop');
+});

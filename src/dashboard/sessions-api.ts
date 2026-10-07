@@ -203,13 +203,36 @@ function sessionRunning(sessionId: string): boolean {
   return activeRunRead.ids.has(sessionId);
 }
 
+/** A session branched off a conversation (an accepted-source successor)
+ * carries that conversation's title, never its channel name. Live
+ * 2026-10-07: every branched turn listed as "desktop". The root's stored
+ * title wins; failing that, the root's first words. */
+function branchConversationTitle(row: HarnessSessionRow): string {
+  try {
+    const branch = row.metadata?.__accepted_source_branch as { rootSessionId?: unknown; parentSessionId?: unknown } | undefined;
+    const rootId = typeof branch?.rootSessionId === 'string' ? branch.rootSessionId
+      : typeof branch?.parentSessionId === 'string' ? branch.parentSessionId : '';
+    if (!rootId || rootId === row.id) return '';
+    const root = getHarnessSession(rootId);
+    if (!root) return '';
+    const stored = root.title ? (humanizeReportBackTitle(root.title) ?? root.title) : '';
+    if (stored) return stored;
+    if (root.objective) return root.objective;
+    const first = listHarnessEvents(rootId, { types: ['user_input_received'], limit: 1 })
+      .find((event) => event.role === 'user' && typeof event.data.text === 'string' && event.data.synthetic !== true);
+    return first ? deriveTitle(publicUserInputText(first.data) || String(first.data.text), '') : '';
+  } catch {
+    return '';
+  }
+}
+
 function summarizeHarness(row: HarnessSessionRow, titleOverride?: string): UnifiedSessionSummary {
   return {
     id: `${HARNESS_PREFIX}${row.id}`,
     origin: harnessOrigin(row),
     store: 'harness',
     kind: row.kind,
-    title: titleOverride || row.title || row.objective || harnessLabel(row),
+    title: titleOverride || row.title || row.objective || branchConversationTitle(row) || harnessLabel(row),
     preview: '',
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,

@@ -15,7 +15,7 @@ const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-approval-preview-'));
 process.env.CLEMENTINE_HOME = HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
-const { approvalCallPreview } = await import('./approval-call-preview.js');
+const { approvalCallPreview, approvalArgsWithFieldEdits } = await import('./approval-call-preview.js');
 const { projectHarnessEventForPublic } = await import('./public-presentation.js');
 
 test.after(() => rmSync(HOME, { recursive: true, force: true }));
@@ -114,4 +114,27 @@ test('complete grouped preview retains long nested arguments and later fields', 
   assert.equal(preview.fields.find(field => field.name === 'body')?.value, payload.body.trim());
   assert.equal(preview.fields.find(field => field.name === 'attendees')?.value, JSON.stringify(payload.attendees));
   assert.equal(preview.fields.at(-1)?.name, 'field19');
+});
+
+test('edit by hand applies the retyped field onto the exact stored call, along the preview\'s own unwrapping', () => {
+  // Owner-approved design, 2026-10-07: the card shows the call's fields; the
+  // owner retypes one; what runs is exactly what the card showed, edited.
+  const stored = {
+    requirement_id: 'cap:resolved:slack_send_message', name: 'composio_execute_tool',
+    args_json: JSON.stringify({ tool_slug: 'SLACK_SEND_MESSAGE', arguments: JSON.stringify({ channel: 'D0FIXTURE1', markdown_text: 'Could you run the 4:15 review on your own today?' }) }),
+  };
+  const edited = approvalArgsWithFieldEdits(stored, { markdown_text: 'Could you run the 4:15 review today? Thanks!' });
+  assert.equal(edited.ok, true, JSON.stringify(edited));
+  if (!edited.ok) return;
+  assert.equal(edited.args.requirement_id, stored.requirement_id, 'everything but the field stays exact');
+  const inner = JSON.parse(edited.args.args_json as string) as { tool_slug: string; arguments: string };
+  assert.equal(inner.tool_slug, 'SLACK_SEND_MESSAGE');
+  assert.deepEqual(JSON.parse(inner.arguments), { channel: 'D0FIXTURE1', markdown_text: 'Could you run the 4:15 review today? Thanks!' });
+  // A plain (non-carrier) call edits in place.
+  const plain = approvalArgsWithFieldEdits({ to: 'a@example.test', body: 'hi' }, { body: 'hello' });
+  assert.deepEqual(plain.ok && plain.args, { to: 'a@example.test', body: 'hello' });
+  // Only fields the card showed; never a new or structured one.
+  assert.equal(approvalArgsWithFieldEdits(stored, { recipient: 'x' }).ok, false, 'an unknown field is refused');
+  assert.equal(approvalArgsWithFieldEdits({ items: [1] }, { items: 'x' }).ok, false, 'a structured value is not editable here');
+  assert.equal(approvalArgsWithFieldEdits(stored, {}).ok, false, 'no edits, nothing to apply');
 });

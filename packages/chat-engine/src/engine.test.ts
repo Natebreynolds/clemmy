@@ -755,3 +755,24 @@ test('the card\'s question asked back is drawn on the card, not as a new bubble'
   assert.equal(snap.busy, false, 'the composer is free: the owner answers on the card or below');
   engine.dispose();
 });
+
+test('a card that revises an earlier one carries the owner\'s words and the fields as they were', async () => {
+  const transport = new FakeTransport();
+  const engine = new ChatEngine({
+    transport,
+    api: { send: async () => ({ sessionId: 's-revises', accepted: true }), loadSession: async () => ({ events: [], latestSeq: 0 }) },
+  });
+  await engine.send('Yes, but make it shorter.');
+  await wait(10);
+  transport.live!.onEvent(ev(2, 'approval_requested', {
+    approvalId: 'apr-new', subject: 'Send Slack message',
+    preview: { operation: 'Send Slack message', fields: [{ name: 'markdown_text', value: 'Could you run the review? Thanks!' }], ask: 'Can I send this?' },
+    revises: { approvalId: 'apr-old', changeRequest: 'Yes, but make it shorter.', fields: [{ name: 'markdown_text', value: 'Could you run the 4:15 review on your own today? I am heads-down until 5.' }] },
+  }));
+  const card = engine.snapshot().messages.find((m) => m.approval?.approvalId === 'apr-new');
+  assert.deepEqual(card?.approval?.revises, {
+    approvalId: 'apr-old', changeRequest: 'Yes, but make it shorter.',
+    fields: [{ name: 'markdown_text', value: 'Could you run the 4:15 review on your own today? I am heads-down until 5.' }],
+  });
+  engine.dispose();
+});

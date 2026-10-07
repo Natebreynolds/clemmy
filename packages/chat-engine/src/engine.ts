@@ -15,7 +15,7 @@ import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type
 import type { ApprovalConfirm, ChatAttachment,
   ChatMessage, ConnectionState, EngineSnapshot, HarnessEvent, MessageStatus,
 } from './types.js';
-import { approvalPreviewFrom, approvalResolutionFrom, cardDecisionOf, type CardDecision } from './types.js';
+import { approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, cardDecisionOf, type CardDecision } from './types.js';
 import { reduceFeed } from './reduce-lifecycle.js';
 import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
 import { terminalCompletionPresentation } from './terminal-presentation.js';
@@ -698,6 +698,7 @@ export class ChatEngine {
             approvalId,
             ...(d.consentCall ? { consentCall: d.consentCall as NonNullable<ChatMessage['approval']>['consentCall'] } : {}),
             ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
+            ...(approvalRevisionFrom(d.revises) ? { revises: approvalRevisionFrom(d.revises) } : {}),
           },
         }];
         this.busy = false;

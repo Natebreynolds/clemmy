@@ -56,6 +56,14 @@ export type ApprovalResolution = 'approved' | 'declined' | 'changed' | 'expired'
 /** Clem asked the card's own question back after a written reply she could
  * not read as a decision (a leaning yes or no, or Jev unavailable). Drawn ON
  * the card: the owner's words, her one line, the same two answers. */
+/** The card this one revises after a change in words: the owner's words and
+ * the fields as they were, so the change can be drawn on the card. */
+export interface ApprovalRevision {
+  approvalId: string;
+  changeRequest?: string;
+  fields?: ApprovalPreview['fields'];
+}
+
 export interface ApprovalConfirm {
   question: string;
   /** What the owner wrote that raised the question. */
@@ -88,6 +96,25 @@ export function approvalResolutionFrom(data: Record<string, unknown>): ApprovalR
   // Written by the host when the card's lifetime ran out unanswered.
   if (data.decision === 'expired') return 'expired';
   return undefined;
+}
+
+/** Admit only the exact bounded revision link the host projects. */
+export function approvalRevisionFrom(value: unknown): ApprovalRevision | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.approvalId !== 'string' || !record.approvalId.trim()) return undefined;
+  const fields = Array.isArray(record.fields)
+    ? record.fields.flatMap((entry) => (entry && typeof entry === 'object' && typeof (entry as { name?: unknown }).name === 'string'
+      && typeof (entry as { value?: unknown }).value === 'string'
+      ? [{ name: (entry as { name: string }).name, value: (entry as { value: string }).value,
+        ...(typeof (entry as { label?: unknown }).label === 'string' ? { label: (entry as { label: string }).label } : {}) }]
+      : []))
+    : undefined;
+  return {
+    approvalId: record.approvalId,
+    ...(typeof record.changeRequest === 'string' && record.changeRequest.trim() ? { changeRequest: record.changeRequest.trim() } : {}),
+    ...(fields && fields.length ? { fields } : {}),
+  };
 }
 
 /** Admit only the exact bounded preview shape the host projects. */
@@ -329,6 +356,8 @@ export interface ChatMessage {
     resolution?: ApprovalResolution;
     /** The card's question asked back, after a reply that could not be read. */
     confirm?: ApprovalConfirm;
+    /** This card revises an earlier one the owner changed in words. */
+    revises?: ApprovalRevision;
     /** Host reducer facts, passed through unchanged for display, not authority. */
     consentCall?: {
       effect: string;

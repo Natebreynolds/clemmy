@@ -458,6 +458,7 @@ import { stopExactHarnessAttempt } from '../runtime/harness/stop-exact-attempt.j
 import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconcile.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
 import { routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
+import { approvalArgsWithFieldEdits } from '../runtime/harness/approval-call-preview.js';
 import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-source-session-branch.js';
 import { getSlackRuntimeStatus } from '../channels/slack.js';
 import { SLACK_APP_MANIFEST_YAML } from '../channels/slack-manifest.js';
@@ -14033,18 +14034,36 @@ export function registerConsoleRoutes(
     // (JSON-encoded string in `modifiedArgs`). Used by the dashboard
     // EDIT button and Discord edit modal to substitute the tool's args
     // before the SDK approves.
-    const modifiedArgs = decision === 'approve_with_edits'
+    let modifiedArgs = decision === 'approve_with_edits'
       ? (typeof (req.body as { modifiedArgs?: unknown })?.modifiedArgs === 'string'
           ? (req.body as { modifiedArgs: string }).modifiedArgs
           : undefined)
       : undefined;
-    if (decision === 'approve_with_edits' && !modifiedArgs) {
-      res.status(400).json({ error: 'approve_with_edits requires modifiedArgs in body (JSON string)' });
-      return;
-    }
     const existing = approvalRegistry.get(id);
     if (!existing) {
       res.status(404).json({ error: 'approval not found' });
+      return;
+    }
+    // Edit by hand on the card: the owner retyped one of the fields the card
+    // showed. The edits are applied onto the exact stored call along the same
+    // unwrapping the preview used, so what runs is what the card showed,
+    // edited (owner-approved design, 2026-10-07).
+    const modifiedFields = decision === 'approve_with_edits' && !modifiedArgs
+      ? (req.body as { modifiedFields?: unknown })?.modifiedFields
+      : undefined;
+    if (modifiedFields && typeof modifiedFields === 'object' && !Array.isArray(modifiedFields)) {
+      const edits = Object.fromEntries(Object.entries(modifiedFields as Record<string, unknown>)
+        .filter(([, value]) => typeof value === 'string')
+        .map(([name, value]) => [name, (value as string).slice(0, 20_000)]));
+      const applied = approvalArgsWithFieldEdits(existing.args ?? null, edits);
+      if (!applied.ok) {
+        res.status(400).json({ error: applied.reason });
+        return;
+      }
+      modifiedArgs = JSON.stringify(applied.args);
+    }
+    if (decision === 'approve_with_edits' && !modifiedArgs) {
+      res.status(400).json({ error: 'approve_with_edits requires modifiedArgs (JSON string) or modifiedFields in the body' });
       return;
     }
     if (approvalRegistry.isApprovalGroup(existing) && decision === 'approve_with_edits') {

@@ -228,6 +228,17 @@ function ApprovalConfirmStrip({ confirm }: { confirm: ApprovalConfirm }) {
   );
 }
 
+/** The owner changed the earlier card in words; this card is that change.
+ *  Their words sit on the card, and the fields they changed show "Was: …". */
+function ApprovalRevisionStrip({ changeRequest }: { changeRequest: string }) {
+  return (
+    <div className="mt-2.5 flex items-start gap-2.5 text-small text-muted">
+      <span aria-hidden className="mt-0.5 inline-flex h-5 w-5 flex-none items-center justify-center rounded-full bg-hover text-[10px] font-bold text-muted">You</span>
+      <span>You wrote: <span className="text-fg">“{changeRequest}”</span></span>
+    </div>
+  );
+}
+
 /** How a card ended, as one pill and nothing else: the ask above it greys,
  *  the follow-up turn says what it meant. */
 function ApprovalOutcomePill({ resolution }: { resolution: ApprovalResolution }) {
@@ -269,6 +280,7 @@ export function ChatBubble({
   message,
   onApprove,
   onReject,
+  onApproveWithEdits,
   onBackground,
   traceHref,
   onAnswer,
@@ -298,6 +310,8 @@ export function ChatBubble({
    */
   onApprove?: () => void | Promise<void>;
   onReject?: () => void | Promise<void>;
+  /** Approve with the fields the owner retyped on the card. */
+  onApproveWithEdits?: (fields: Record<string, string>) => void | Promise<void>;
   /** Detach THIS running turn to a durable background task (shown while thinking). */
   onBackground?: () => void;
   /** Deep link to this session's card/trace on the Tasks board. */
@@ -325,6 +339,16 @@ export function ChatBubble({
   // identical send skips the card. trustNote reports the server's truth —
   // "stored" vs "couldn't scope it" — never an optimistic claim.
   const [alwaysAllow, setAlwaysAllow] = useState(false);
+  // EDIT BY HAND: the owner retypes the one field that carries the content
+  // (the longest), then "Yes, send this one" sends exactly that, checked the
+  // same way (owner-approved design, 2026-10-07).
+  const [editing, setEditing] = useState(false);
+  const [editedValue, setEditedValue] = useState('');
+  const editableField = (() => {
+    const fields = message.approval?.preview?.fields ?? [];
+    if (!fields.length || message.approval?.preview?.items) return null;
+    return [...fields].sort((a, b) => b.value.length - a.value.length)[0] ?? null;
+  })();
   const [trustNote, setTrustNote] = useState<string | null>(null);
   const pendingActionId = message.approval?.pendingAction?.id;
   const showDurablePresentation = (presentation: PendingActionExecutionPresentation) => {
@@ -467,6 +491,11 @@ export function ChatBubble({
   // names, ids and hashes stay out of the owner's sight.
   const voicedPendingAction = message.status === 'awaiting-approval' && Boolean(pendingAction?.ask);
   const pendingActionShowsRisk = Boolean(pendingAction?.risk) && pendingAction!.risk !== 'normal approval risk';
+  // A queued action revised in words: the previous command, to show struck.
+  const revisedCommand = (() => {
+    const was = message.approval?.revises?.fields?.find((f) => f.name === 'command' || f.name === 'content')?.value;
+    return was && pendingAction?.preview && was !== pendingAction.preview ? was : null;
+  })();
   const pendingActionShowsRollback = Boolean(pendingAction?.rollback) && pendingAction!.rollback !== 'no rollback noted';
   const stoppedPlaceholder = message.status === 'stopped' && message.text.trim() === STOPPED_PLACEHOLDER;
   // THE PLAN CARD IS THE REPLY.
@@ -541,6 +570,13 @@ export function ChatBubble({
                 )}
                 {pendingActionShowsRisk && <p className="mt-1.5 text-caption text-warning">{pendingAction!.risk}</p>}
                 {pendingActionShowsRollback && <p className="mt-1 text-caption text-muted">{pendingAction!.rollback}</p>}
+                {revisedCommand && (
+                  // The change in words, shown as a change: what it was, struck.
+                  <p className="mt-1 text-caption text-muted">Was: <span className="line-through">{revisedCommand}</span></p>
+                )}
+                {message.approval?.revises?.changeRequest && (
+                  <ApprovalRevisionStrip changeRequest={message.approval.revises.changeRequest} />
+                )}
               </>
             ) : voicedApproval ? (
               // Clem asks in her own words, like a question card (the checker
@@ -578,18 +614,54 @@ export function ChatBubble({
               // receives, from the host's frozen call, so the owner never
               // approves on an operation's name alone.
               <>
-              {voicedApproval && <p className="mt-2.5 text-caption font-semibold uppercase tracking-wide text-faint">Exactly what happens</p>}
-              <dl className="mt-2 space-y-1.5 text-caption">
-                {message.approval.preview.fields.map((field) => (
-                  <div key={field.name}>
-                    <dt className="text-muted">{approvalFieldLabel(field.name)}</dt>
-                    <dd className="whitespace-pre-wrap break-words text-fg">
-                      {field.label
-                        ? <>{field.label} <span className="text-muted">· {field.value}</span></>
-                        : field.value}
-                    </dd>
+              {voicedApproval && message.approval.revises?.changeRequest && (
+                <ApprovalRevisionStrip changeRequest={message.approval.revises.changeRequest} />
+              )}
+              {voicedApproval && (
+                <div className="mt-2.5 flex items-center justify-between">
+                  <p className="text-caption font-semibold uppercase tracking-wide text-faint">Exactly what happens</p>
+                  {editableField && onApproveWithEdits && !resolved && !editing && (
+                    <button type="button" className="text-caption font-semibold text-primary-ink hover:underline"
+                      onClick={() => { setEditedValue(editableField.value); setEditing(true); }}>
+                      Edit by hand
+                    </button>
+                  )}
+                </div>
+              )}
+              {editing && editableField && (
+                <div className="mt-2 flex flex-col gap-1.5">
+                  <label htmlFor={`edit-${message.id}`} className="text-caption text-muted">{approvalFieldLabel(editableField.name)}</label>
+                  <textarea id={`edit-${message.id}`} rows={3} value={editedValue} onChange={(e) => setEditedValue(e.target.value)}
+                    className="w-full rounded-md border border-primary-ink bg-surface px-2.5 py-2 text-small text-fg" />
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button size="sm" disabled={decisionBusy !== null || !editedValue.trim() || editedValue === editableField.value}
+                      onClick={() => { void onApproveWithEdits!({ [editableField.name]: editedValue }); }}>
+                      Yes, send this one
+                    </Button>
+                    <Button size="sm" variant="ghost" disabled={decisionBusy !== null} onClick={() => setEditing(false)}>Keep the original</Button>
                   </div>
-                ))}
+                  <p className="text-caption text-muted">Exactly what you typed goes out, checked the same way first.</p>
+                </div>
+              )}
+              <dl className={cn('mt-2 space-y-1.5 text-caption', editing && 'opacity-60')}>
+                {message.approval.preview.fields.map((field) => {
+                  const was = message.approval?.revises?.fields?.find((f) => f.name === field.name);
+                  const changed = Boolean(was && was.value !== field.value);
+                  return (
+                    <div key={field.name}>
+                      <dt className="text-muted">{approvalFieldLabel(field.name)}</dt>
+                      <dd className={cn('whitespace-pre-wrap break-words text-fg', changed && '-mx-1.5 rounded bg-primary-tint px-1.5 py-0.5')}>
+                        {field.label
+                          ? <>{field.label} <span className="text-muted">· {field.value}</span></>
+                          : field.value}
+                      </dd>
+                      {changed && (
+                        // The change in words, shown as a change: what it was, struck.
+                        <dd className="mt-0.5 text-muted">Was: <span className="line-through">{was!.value}</span></dd>
+                      )}
+                    </div>
+                  );
+                })}
               </dl>
               </>
             )}

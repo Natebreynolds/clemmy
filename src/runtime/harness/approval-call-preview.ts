@@ -165,3 +165,38 @@ export function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
   return `${s.slice(0, n - 1)}…`;
 }
+
+/**
+ * EDIT BY HAND. The card shows the call's fields (`approvalCallPreview`); the
+ * owner may retype one before saying yes. Apply those edits back onto the
+ * exact stored arguments along the same unwrapping the preview used — a
+ * work_call/call_tool carrier's `args_json`, then a Composio `arguments`
+ * JSON string — so what runs is exactly what the card showed, edited. Only
+ * fields the preview showed can be edited; unknown names are refused.
+ */
+export function approvalArgsWithFieldEdits(
+  args: Record<string, unknown> | null | undefined,
+  edits: Record<string, string>,
+): { ok: true; args: Record<string, unknown> } | { ok: false; reason: string } {
+  const names = Object.keys(edits);
+  if (names.length === 0) return { ok: false, reason: 'no fields were edited' };
+  const base = (args ?? {}) as Record<string, unknown>;
+  const carrier = typeof base.name === 'string' && typeof base.args_json === 'string';
+  const target = carrier ? approvalJsonRecord(base.args_json) : { ...base };
+  if (!target) return { ok: false, reason: 'the stored call could not be read' };
+  const slug = typeof target.tool_slug === 'string' ? target.tool_slug.trim() : '';
+  const provider = slug ? approvalJsonRecord(target.arguments) : target;
+  if (!provider) return { ok: false, reason: 'the stored call could not be read' };
+  for (const name of names) {
+    if (!(name in provider)) return { ok: false, reason: `"${name}" is not a field of this call` };
+    if (typeof provider[name] !== 'string' && typeof provider[name] !== 'number' && typeof provider[name] !== 'boolean') {
+      return { ok: false, reason: `"${name}" is not a plain value and cannot be edited here` };
+    }
+    provider[name] = edits[name];
+  }
+  if (slug) {
+    const rebuilt = { ...target, arguments: JSON.stringify(provider) };
+    return { ok: true, args: carrier ? { ...base, args_json: JSON.stringify(rebuilt) } : rebuilt };
+  }
+  return { ok: true, args: carrier ? { ...base, args_json: JSON.stringify(provider) } : provider };
+}

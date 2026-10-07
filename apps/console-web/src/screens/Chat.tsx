@@ -5,7 +5,7 @@ import { Fragment, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowRight, X } from 'lucide-react';
-import { apiGet } from '@/lib/api';
+import { apiGet, apiPost } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
 import { decidePlanProposal, dismissInboxItem } from '@/lib/inbox';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
@@ -141,6 +141,16 @@ export function Chat() {
   );
   const marks = agentThreadMarks(chat.messages);
   const projectMarks = projectThreadMarks(chat.messages);
+  /** Edit by hand on a card: the retyped fields go to the approval endpoint,
+   *  which applies them onto the exact stored call; the thread shows the
+   *  decision the way a tap does. */
+  const approveWithEdits = async (message: ChatMessage, fields: Record<string, string>) => {
+    const approvalId = message.approval?.approvalId;
+    if (!approvalId) return;
+    await apiPost(`/api/console/harness-approvals/${encodeURIComponent(approvalId)}/approve_with_edits`, { modifiedFields: fields });
+    await qc.invalidateQueries({ queryKey: ['command-center'] });
+  };
+
   const resolveDecision = async (message: ChatMessage, decision: 'approve' | 'reject') => {
     const intent = chatDecisionIntent(message, decision);
     if (intent.kind === 'invalid-plan') throw new Error(intent.message);
@@ -256,6 +266,7 @@ export function Chat() {
               onRevisePlan={() => { chat.setComposerMode('plan'); composerRef.current?.focus(); }}
               onApprove={() => resolveDecision(m, 'approve')}
               onReject={() => resolveDecision(m, 'reject')}
+              onApproveWithEdits={(fields) => approveWithEdits(m, fields)}
               onBackground={chat.background}
               // Suggested answers stay tappable only while the question is the
               // newest message; once anything follows it, they are a record.
