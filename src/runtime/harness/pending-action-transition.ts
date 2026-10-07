@@ -1,6 +1,7 @@
 import { addNotification } from '../notifications.js';
 import * as approvalRegistry from './approval-registry.js';
 import { appendEvent, getSession, listEvents } from './eventlog.js';
+import { revisedCardLink } from './revised-card-link.js';
 import { pendingActionApprovalView, pendingActionIdFromArgs, pendingActionAsk } from './pending-action-view.js';
 import { isEffectDecidedPerCall } from '../../tools/tool-registry.js';
 import {
@@ -354,6 +355,9 @@ function materializeQueuedApproval(
             approvalId: registered.row.approvalId,
             sourceUserSeq,
             source: 'pending_action_graph_transition',
+            // The card this one revises, when the owner changed a queued card
+            // in words (live 2026-10-07: the new card stood alone).
+            ...revisedCardLink(sessionId, sourceUserSeq),
             ...(registered.row.presentation ? {
               approvalPresentation: 'conversation',
               question: registered.row.presentation.question,
