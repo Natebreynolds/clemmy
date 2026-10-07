@@ -594,15 +594,16 @@ async function startInstalledApp(context, firstLaunch) {
   }
   // The app's real React landing redirect normally changes /console to
   // /console/chat before the next poll. Both are legitimate dashboard targets.
-  let target;
-  try {
-    target = await waitFor(() => findPage(port, isDashboardTarget), 'desktop_dashboard_missing');
-  } catch (error) {
-    // Run 37686300729: setup skipped, then no dashboard target in 120 s and
-    // nothing recorded. The app's log says whether its daemon came up.
-    context.launchDiagnostics = await collectLaunchDiagnostics(app, error);
-    throw error;
-  }
+  // Every gate from here to the mounted dashboard records the app's own log
+  // on a miss (run 37701723310: the dashboard appeared, then the daemon's
+  // build info never answered in 120 s and nothing was recorded).
+  const withLaunchDiagnostics = async (step) => {
+    try { return await step(); } catch (error) {
+      if (!context.launchDiagnostics) context.launchDiagnostics = await collectLaunchDiagnostics(app, error);
+      throw error;
+    }
+  };
+  const target = await withLaunchDiagnostics(() => waitFor(() => findPage(port, isDashboardTarget), 'desktop_dashboard_missing'));
   const targetUrl = new URL(target.url);
   const origin = targetUrl.origin;
   const owners = await listeners(Number(targetUrl.port));
@@ -616,9 +617,9 @@ async function startInstalledApp(context, firstLaunch) {
   // This credential remains in memory; no target/viewer URLs are recorded.
   // A first boot on a cold runner answers slowly; one 5 s read aborting is
   // "not yet", not a verdict (run 37699594352: a raw TimeoutError here).
-  const info = await waitFor(async () => {
+  const info = await withLaunchDiagnostics(() => waitFor(async () => {
     try { return await localJSON(`${origin}/api/console/build-info`, token); } catch { return null; }
-  }, 'daemon_build_info_unavailable', 120_000);
+  }, 'daemon_build_info_unavailable', 120_000));
   app.served = assertServedIdentity(info, context.expected, path.join(context.installRoot, 'resources', 'daemon', 'dist', 'index.js'));
   app.daemon = exactOwnedProcess(await processes(), app.served.daemonProcessId, context.executable, main.pid);
   if (app.daemon.pid !== daemonCandidate.pid || app.daemon.createdAt !== daemonCandidate.createdAt) refuse('daemon_listener_changed');
@@ -626,7 +627,7 @@ async function startInstalledApp(context, firstLaunch) {
   const page = new CDP(assertCDPUrl(target.webSocketDebuggerUrl, port, 'page'));
   app.page = page;
   await page.send('Page.enable'); await page.send('Runtime.enable');
-  const assets = await waitFor(async () => page.evaluate(`(() => {
+  const assets = await withLaunchDiagnostics(() => waitFor(async () => page.evaluate(`(() => {
     const root = document.getElementById('root'); const main = root?.querySelector('#main');
     if (document.readyState !== 'complete' || !main || root.children.length === 0
       || !main.querySelector('[aria-label="Today overview"]')
@@ -634,7 +635,7 @@ async function startInstalledApp(context, firstLaunch) {
       || (root.innerText || '').length < 50 || (root.innerText || '').includes('Session expired')
       || (root.innerText || '').includes('This view hit a snag')) return null;
     return [...document.scripts].map(script => script.src).filter(Boolean);
-  })()`), 'react_dashboard_not_mounted', 60_000);
+  })()`), 'react_dashboard_not_mounted', 60_000));
   if (!Array.isArray(assets) || assets.length === 0) refuse('console_executed_asset_missing');
   app.assetHashes = [];
   for (const asset of assets) {
