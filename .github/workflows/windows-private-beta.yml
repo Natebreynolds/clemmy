@@ -99,6 +99,11 @@ jobs:
       - name: Offline Windows and package qualification tests
         shell: pwsh
         run: |
+          # pwsh 7 exports its own PSModulePath; Windows PowerShell 5.1, which
+          # the fixtures and the app launch, then cannot load its built-in
+          # modules ("Get-Acl … module could not be loaded", run 37654466246).
+          # Give the test processes the 5.1 defaults a user's machine has.
+          $env:PSModulePath = "$env:ProgramFiles\WindowsPowerShell\Modules;$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules"
           $tests = @(
             'src/runtime/windows-readiness.test.ts',
             'src/runtime/windows-private-filesystem.test.ts',
@@ -188,7 +193,9 @@ jobs:
 
       - name: Qualify actual installed clean launch and restart
         shell: pwsh
-        run: node scripts/windows-packaged-launch-smoke.mjs --release-dir apps/desktop/release --expected-version "$env:CANDIDATE_VERSION" --receipt output/windows-beta/installed-smoke.json
+        run: |
+          $env:PSModulePath = "$env:ProgramFiles\WindowsPowerShell\Modules;$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules"
+          node scripts/windows-packaged-launch-smoke.mjs --release-dir apps/desktop/release --expected-version "$env:CANDIDATE_VERSION" --receipt output/windows-beta/installed-smoke.json
 
       # A failed build retains diagnostics, but its installer is never uploaded
       # as a qualified candidate. This repository and its Actions artifacts are

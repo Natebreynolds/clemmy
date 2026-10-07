@@ -13,7 +13,9 @@ test('actual Windows npm-style batch shim launches from a spaced Unicode path wi
   const program = path.join(directory, 'fixture.cjs');
   const output = path.join(directory, 'args.json');
   writeFileSync(program, `require('node:fs').writeFileSync(${JSON.stringify(output)},JSON.stringify(process.argv.slice(2)));process.exit(7);`);
-  writeFileSync(shim, `@echo off\r\n"${process.execPath}" "${program}" %*\r\n`);
+  // cmd.exe reads a batch file in the OEM code page, so the Unicode directory
+  // must not be spelled inside it; %~dp0 is the shim's own (Unicode) folder.
+  writeFileSync(shim, `@echo off\r\n"${process.execPath}" "%~dp0fixture.cjs" %*\r\n`);
   const child = spawnCliProcess(shim, ['auth', 'login', '--web', '--scope=repo'], { cwd: directory, stdio: 'ignore', windowsHide: true });
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {

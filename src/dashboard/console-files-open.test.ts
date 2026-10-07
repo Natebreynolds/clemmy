@@ -7,6 +7,18 @@ import path from 'node:path';
 import test from 'node:test';
 import express from 'express';
 
+/** Windows keeps SQLite files open until the process exits, so a test home
+ * can refuse removal (EBUSY) after a clean run; the isolated runner discards
+ * the whole temp home afterwards. POSIX removal stays strict. */
+function removeTestDir(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (err) {
+    if (process.platform !== 'win32' || (err as NodeJS.ErrnoException).code !== 'EBUSY') throw err;
+  }
+}
+
+
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-file-open-route-'));
 process.env.CLEMENTINE_HOME = home;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
@@ -17,7 +29,7 @@ const { VAULT_DIR } = await import('../memory/vault.js');
 mkdirSync(VAULT_DIR, { recursive: true });
 const file = path.join(VAULT_DIR, 'report café 日本語 & notes.docx');
 writeFileSync(file, 'synthetic office fixture');
-test.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+test.after(() => removeTestDir(home));
 const headers = { authorization: 'Bearer file-open-fixture' };
 
 async function withRoute(launch: (target: string) => Promise<void>, fn: (url: string) => Promise<void>, platform: NodeJS.Platform = 'win32'): Promise<void> {

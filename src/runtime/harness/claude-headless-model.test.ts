@@ -10,6 +10,18 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+/** Windows keeps SQLite files open until the process exits, so a test home
+ * can refuse removal (EBUSY) after a clean run; the isolated runner discards
+ * the whole temp home afterwards. POSIX removal stays strict. */
+function removeTestDir(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (err) {
+    if (process.platform !== 'win32' || (err as NodeJS.ErrnoException).code !== 'EBUSY') throw err;
+  }
+}
+
+
 const mod = await import('./claude-headless-model.js');
 const {
   ClaudeHeadlessModel,
@@ -61,7 +73,7 @@ test.afterEach(() => {
 
 test.after(() => {
   resetClaudeHeadlessModelCache();
-  rmSync(TMP_HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  removeTestDir(TMP_HOME);
 });
 
 test('claudeCliModelArg passes a FULL model name through (exact model, fidelity), aliases bare words', () => {

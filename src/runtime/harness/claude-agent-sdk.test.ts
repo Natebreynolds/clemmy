@@ -9,6 +9,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Query, SDKAPIRetryMessage, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
+/** Windows keeps SQLite files open until the process exits, so a test home
+ * can refuse removal (EBUSY) after a clean run; the isolated runner discards
+ * the whole temp home afterwards. POSIX removal stays strict. */
+function removeTestDir(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (err) {
+    if (process.platform !== 'win32' || (err as NodeJS.ErrnoException).code !== 'EBUSY') throw err;
+  }
+}
+
+
 const mod = await import('./claude-agent-sdk.js');
 const usageLog = await import('../usage-log.js');
 const operationalTelemetry = await import('../operational-telemetry.js');
@@ -95,7 +107,7 @@ test.beforeEach(() => {
 test.after(() => {
   setClaudeAgentSdkQueryForTest(null);
   setClaudeAgentSdkReflectionForTest(null);
-  rmSync(TMP_HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  removeTestDir(TMP_HOME);
 });
 
 test('defaultClaudeAgentSdkAllowedLocalTools is conservative unless explicitly overridden', () => {

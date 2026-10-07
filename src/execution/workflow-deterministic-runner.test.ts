@@ -15,6 +15,18 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import os from 'node:os';
 import path from 'node:path';
 
+/** Windows keeps SQLite files open until the process exits, so a test home
+ * can refuse removal (EBUSY) after a clean run; the isolated runner discards
+ * the whole temp home afterwards. POSIX removal stays strict. */
+function removeTestDir(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (err) {
+    if (process.platform !== 'win32' || (err as NodeJS.ErrnoException).code !== 'EBUSY') throw err;
+  }
+}
+
+
 const testHome = mkdtempSync(path.join(os.tmpdir(), 'clementine-workflow-deterministic-runner-'));
 process.env.CLEMENTINE_HOME = testHome;
 
@@ -26,7 +38,7 @@ const { readWorkflowEvents } = await import('./workflow-events.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 
 test.after(() => {
-  rmSync(testHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  removeTestDir(testHome);
 });
 
 function definition(slug: string, steps: unknown[]) {

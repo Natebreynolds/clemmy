@@ -6,6 +6,18 @@ import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
+/** Windows keeps SQLite files open until the process exits, so a test home
+ * can refuse removal (EBUSY) after a clean run; the isolated runner discards
+ * the whole temp home afterwards. POSIX removal stays strict. */
+function removeTestDir(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (err) {
+    if (process.platform !== 'win32' || (err as NodeJS.ErrnoException).code !== 'EBUSY') throw err;
+  }
+}
+
+
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-static-update-'));
 process.env.CLEMENTINE_HOME = home;
 const store = await import('./store.js');
@@ -18,7 +30,7 @@ const contract = await import('./workspace-set-data-contract.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 
-test.after(() => { eventlog.closeEventLog(); db.closeWorkspaceDb(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+test.after(() => { eventlog.closeEventLog(); db.closeWorkspaceDb(); removeTestDir(home); });
 let ordinal = 0;
 function fixture() {
   const slug = `static-update-${++ordinal}`;
