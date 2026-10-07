@@ -20,7 +20,10 @@ module.exports = async function afterPack(context) {
     if (context.arch !== Arch.x64) throw new Error('Canonical Windows private filesystem probe requires an x64 package.');
     const root = path.resolve(context.packager.projectDir, '..', '..');
     const { tsImport } = await import('tsx/esm/api');
-    const { WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE } = await tsImport(path.join(root, 'src/runtime/windows-private-filesystem.ts'), require('node:url').pathToFileURL(__filename).href);
+    // A file URL, not a drive path: Node's ESM loader refuses "d:" as a
+    // scheme on Windows (run 37666184033, the same class as the two build scripts).
+    const { pathToFileURL } = require('node:url');
+    const { WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE } = await tsImport(pathToFileURL(path.join(root, 'src/runtime/windows-private-filesystem.ts')).href, pathToFileURL(__filename).href);
     const { bindPackagedWindowsAclProbe } = await import('../scripts/windows-private-filesystem-packaging.mjs');
     bindPackagedWindowsAclProbe({ sourceDirectory: path.join(root, 'output/windows-private-filesystem'),
       resourcesDirectory: packagedResources, classSource: WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE });
