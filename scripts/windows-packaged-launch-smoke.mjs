@@ -1014,6 +1014,12 @@ export async function main(args = process.argv.slice(2)) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`[Windows installed smoke] ${error instanceof SmokeError ? error.code : 'qualification_failed'}\n`);
+    // An unexpected exception is the smoke's own defect; its stack names the
+    // line (bounded, with the same redaction as the log tails). Run
+    // 37695051118 ended qualification_failed with nothing to read.
+    if (!(error instanceof SmokeError)) {
+      process.stderr.write(`[Windows installed smoke] unexpected: ${redactLogText(String(error?.stack ?? error)).slice(0, 2_000)}\n`);
+    }
     process.exitCode = 1;
   });
 }
