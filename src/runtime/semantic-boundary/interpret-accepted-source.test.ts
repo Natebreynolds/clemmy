@@ -96,6 +96,49 @@ function fakePort(calls: unknown[]): TurnSemanticModelPort {
   };
 }
 
+test('the effect judge and the grounding judge run together on an admitted write', async () => {
+  // Live 2026-10-06, under load: 13 s proposal, then 12 s effect judge, then
+  // 30 s grounding judge, in series — 96 s before the turn started. Neither
+  // judge needs the other's verdict; they read the same admitted proposal.
+  resetEventLog();
+  const sessionId = 'sess-semantic-parallel-judges';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const span: Record<'judge' | 'grounding', { start: number; end: number }> = {
+    judge: { start: 0, end: 0 }, grounding: { start: 0, end: 0 },
+  };
+  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const base = fakePort([]);
+  const port: TurnSemanticModelPort = {
+    ...base,
+    async judgeSourceEffect(call) {
+      span.judge.start = Date.now();
+      await wait(80);
+      span.judge.end = Date.now();
+      return base.judgeSourceEffect!(call);
+    },
+    async judgePlanGrounding(call) {
+      span.grounding.start = Date.now();
+      await wait(80);
+      span.grounding.end = Date.now();
+      return base.judgePlanGrounding!(call);
+    },
+  };
+  const result = await interpretAcceptedSource({ snapshot, authority: authority(host), port, turn: 1 });
+  assert.equal(result.status, 'admitted', JSON.stringify(result).slice(0, 300));
+  assert.ok(span.judge.end > 0 && span.grounding.end > 0, 'both judges answered');
+  assert.ok(span.judge.start < span.grounding.end && span.grounding.start < span.judge.end,
+    `the judges overlapped: ${JSON.stringify(span)}`);
+});
+
 test('one semantic call per source and exact replay reuses it', async () => {
   resetEventLog();
   const sessionId = 'sess-semantic-1';
@@ -516,8 +559,12 @@ test('one bounded repair admits after a destination posture mismatch', async () 
   // and the original token totals hold.
   assert.equal(judges, 2);
   assert.equal(result.record.repairAttempted, true);
-  assert.equal(result.record.inputTokens, 222);
-  assert.equal(result.record.outputTokens, 82);
+  // The grounding judge runs beside the effect judge on every round (the two
+  // read the same admitted proposal; running them in series cost 12 s + 30 s
+  // live under load). The conflicted first round therefore also spends the
+  // grounding stub's 1+1 tokens: 222/82 serial → 223/83.
+  assert.equal(result.record.inputTokens, 223);
+  assert.equal(result.record.outputTokens, 83);
 });
 
 test('unresolved mismatch stays blocked after one repair and records tokens', async () => {
@@ -570,8 +617,10 @@ test('unresolved mismatch stays blocked after one repair and records tokens', as
   assert.equal(interprets, 2);
   assert.equal(result.record.repairAttempted, true);
   assert.equal(result.record.validationOutcome, 'invalid');
-  assert.equal(result.record.inputTokens, 124);
-  assert.equal(result.record.outputTokens, 26);
+  // Both conflicted rounds also spend the grounding stub's 1+1 tokens beside
+  // the effect judge (see the admitted repair pin above): 124/26 → 126/28.
+  assert.equal(result.record.inputTokens, 126);
+  assert.equal(result.record.outputTokens, 28);
 });
 
 test('whole-plan grounding is one call and persists an operation-keyed receipt', async () => {

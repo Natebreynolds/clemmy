@@ -874,8 +874,8 @@ async function interpretOnce(input: {
         judgeResult,
         judgeDigest: judgeRecord.digest,
         expectedEffect: requested,
-        expectedDestinationPosture: admitted.clamped.destination?.posture ?? null,
-        expectedProposalDigest: admitted.payloadHash,
+        expectedDestinationPosture: proposedDestinationPosture,
+        expectedProposalDigest: proposalDigest,
       });
       if (judgeIssue) {
         admitted = {
@@ -1016,6 +1016,7 @@ async function interpretOnce(input: {
       catalogSnapshotDigest,
       proposalDigest: admitted.payloadHash,
     };
+    const groundedProposalDigest = admitted.payloadHash;
     const judged = await retryJudge(async () => {
       groundingJudgeCalls += 1;
       return input.port.judgePlanGrounding!(call);
@@ -1041,7 +1042,7 @@ async function interpretOnce(input: {
       descriptors,
       catalogSnapshotDigest,
       shownDescriptorDigest: shown.digest,
-      proposalDigest: admitted.payloadHash,
+      proposalDigest: groundedProposalDigest,
     });
     if (!bound.ok) {
       admitted = { ok: false, issues: [bound.issue] };
@@ -1140,10 +1141,26 @@ async function interpretOnce(input: {
 
   const assess = async (): Promise<void> => {
     absorbEvidence();
-    await judgeAdmittedWrite();
+    // The effect judge and the whole-plan grounding judge read the same
+    // admitted proposal and neither needs the other's verdict, so they run
+    // together: the brain that answers them is the slow part (live
+    // 2026-10-06, under load: 12 s + 30 s in series before a 13 s proposal
+    // was even repaired, 96 s before the turn started). Empty-act binding
+    // happens first because grounding judges the bound operations and the
+    // effect judge never reads them. Each judge reads `admitted` only until
+    // its first await and carries its own copies past it; a failure from
+    // either stands whichever finishes last, and neither success reassigns
+    // the proposal, so the merged outcome is exactly the serial one.
     hostBindEmptyActOperations();
-    if (admitted.ok) await judgePlanGrounding();
-    else if (!validationIssue && admitted.ok === false) validationIssue = admitted.issues[0];
+    if (!admitted.ok) {
+      if (!validationIssue) validationIssue = admitted.issues[0];
+      return;
+    }
+    await Promise.all([judgeAdmittedWrite(), judgePlanGrounding()]);
+    // Read through a call: the judges reassign `admitted` inside closures
+    // the control-flow narrowing above cannot see.
+    const settled = ((): ReturnType<typeof admitTurnSemantics> => admitted)();
+    if (!settled.ok && !validationIssue) validationIssue = settled.issues[0];
   };
 
   await assess();
