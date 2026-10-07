@@ -403,10 +403,20 @@ test('a parked pending-action card runs its exact stored action on approval, wit
   const resumeSource = listEvents(sess.id, { types: ['user_input_received'] })
     .find((event) => event.data.source === 'approval_resume' && event.data.approvalId === row.approvalId);
   assert.ok(resumeSource, 'the approval minted its own hidden control source');
-  // This fake brain ended nothing, so the result itself became the ending.
-  const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
+  const decided = listEvents(sess.id, { types: ['conversation_completed'] })
     .find((event) => event.data.sourceUserSeq === resumeSource!.seq);
-  assert.ok(terminal, 'a brain turn that ends nothing still leaves the owner an ending');
+  assert.ok(decided, 'the owner\'s decision has its own short ending');
+  assert.match(String(decided!.data.reply), /ran\. Picking up the rest now/);
+  // The continuation has its own hidden source (never shown as the owner's
+  // words); this fake brain ended nothing, so the result itself became its ending.
+  const continuation = listEvents(sess.id, { types: ['user_input_received'] })
+    .find((event) => event.data.source === 'approval_continuation' && event.data.approvalId === row.approvalId);
+  assert.ok(continuation, 'one hidden continuation source');
+  assert.equal(continuation!.data.synthetic, true);
+  assert.equal(continuation!.data.decisionSourceUserSeq, resumeSource!.seq);
+  const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
+    .find((event) => event.data.sourceUserSeq === continuation!.seq);
+  assert.ok(terminal, 'a brain turn that ends nothing still leaves the owner the result');
   assert.match(String(terminal!.data.reply), /Executed the approved run_shell_command call/);
 });
 
@@ -438,11 +448,12 @@ test('when the brain cannot continue after the stored action ran, the result its
   );
   assert.equal(dispatched.length, 1);
   assert.equal(getPendingAction(action.id)?.status, 'executed');
-  const resumeSource = listEvents(sess.id, { types: ['user_input_received'] })
-    .find((event) => event.data.source === 'approval_resume' && event.data.approvalId === row.approvalId);
+  const continuation = listEvents(sess.id, { types: ['user_input_received'] })
+    .find((event) => event.data.source === 'approval_continuation' && event.data.approvalId === row.approvalId);
+  assert.ok(continuation, 'the continuation source was minted before the brain was tried');
   const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
-    .find((event) => event.data.sourceUserSeq === resumeSource!.seq);
-  assert.ok(terminal, 'the source still settled with what landed');
+    .find((event) => event.data.sourceUserSeq === continuation!.seq);
+  assert.ok(terminal, 'the continuation still settled with what landed');
   assert.match(String(terminal!.data.reply), /Executed the approved run_shell_command call/);
 });
 

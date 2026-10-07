@@ -514,30 +514,43 @@ async function executeApprovedLinkedActionAndSettle(
     // The stored action ran once with no model in the loop. The owner's
     // request usually did not end at that card ("run X, then put its first
     // line in a file"): the brain now takes the result and finishes what is
-    // left, in its own words. Live 2026-10-06 the raw tool output was the
-    // whole reply and the rest of the request never happened. Only when the
-    // brain cannot be reached does the result itself stand as the ending.
+    // left, in its own words. It cannot do that under the owner's decision
+    // source — that source belongs to the action executor and the host
+    // refuses brain tools under a source another executor owns (live
+    // 2026-10-06, preaccepted_graph_execution_owner) — so the continuation
+    // gets its own hidden source, as a background task's report does. Only
+    // when the brain cannot be reached does the result itself stand as the
+    // ending.
     const result = pendingAction.resultSummary ?? `Executed the exact approved ${pendingAction.toolName} call.`;
     if (!dispatch) return await settleConversationalSource(row, source, { status: 'done', text: result });
+    const continuation = mintApprovalContinuationSource(row, source, pendingAction, result);
+    const decided = await settleConversationalSource(row, source, {
+      status: 'done',
+      text: `Done — "${pendingAction.title}" ran. Picking up the rest now.`,
+    });
+    if (!decided) return false;
     const startedAt = Date.now();
+    let handedOff = false;
     try {
-      await dispatch(row.sessionId, approvedActionRanDirective(row.subject, result), prepared);
+      await dispatch(row.sessionId, continuation.directive, continuation.source);
+      handedOff = true;
     } catch (err) {
       logger.warn({ approvalId: row.approvalId, err: err instanceof Error ? err.message : String(err) },
-        'the brain could not continue after the approved action ran; settling with the result');
-      return await settleConversationalSource(row, source, { status: 'done', text: result });
+        'the brain could not continue after the approved action ran; the result is the ending');
     }
     // The hand-off returns when the brain's turn is over. A turn that came
-    // back without ending the owner's source (refused before the model, or
-    // replayed as already handled) would leave the approval with no ending at
-    // all; the result is then the ending.
+    // back without ending the continuation source (refused before the model,
+    // or replayed as already handled) would leave the result unseen; the
+    // result is then the ending.
     const ended = listEvents(row.sessionId, { types: ['conversation_completed'] })
-      .some((event) => event.data.sourceUserSeq === source.seq);
-    logger.info({ approvalId: row.approvalId, elapsedMs: Date.now() - startedAt, ended },
+      .some((event) => event.data.sourceUserSeq === continuation.source.sourceUserSeq);
+    logger.info({ approvalId: row.approvalId, elapsedMs: Date.now() - startedAt, handedOff, ended },
       'brain continuation after the approved action returned');
     if (ended) return true;
-    logger.warn({ approvalId: row.approvalId }, 'the brain turn did not end the approval source; settling with the result');
-    return await settleConversationalSource(row, source, { status: 'done', text: result });
+    if (handedOff) {
+      logger.warn({ approvalId: row.approvalId }, 'the brain turn did not end the continuation source; settling it with the result');
+    }
+    return await settleConversationalSource(row, continuation.event, { status: 'done', text: result });
   }
   if (pendingAction.status === 'executing') {
     return await settleConversationalSource(row, source, {
@@ -716,8 +729,48 @@ async function drainQueuedApprovalResumes(sessionId: string): Promise<void> {
   }
 }
 
+/** One hidden source for the brain's continuation after an approved action
+ * ran. The desktop never shows a synthetic source; its reply is what the owner
+ * sees. Its own run family keeps the bridge's identity check honest. */
+function mintApprovalContinuationSource(
+  row: approvalRegistry.PendingApprovalRow,
+  decision: EventRow,
+  pendingAction: PendingActionRecord,
+  result: string,
+): { directive: string; source: ChatApprovalResumeSource; event: EventRow } {
+  const directive = approvedActionRanDirective(row.subject, result);
+  const runId = `approval-continuation:${row.approvalId}`;
+  const attempt = beginRunAttempt(row.sessionId, { runId });
+  const event = recordRunAttemptUserInput(attempt, {
+    turn: decision.turn,
+    role: 'user',
+    data: {
+      text: directive,
+      displayText: directive,
+      synthetic: true,
+      source: 'approval_continuation',
+      approvalId: row.approvalId,
+      pendingActionId: pendingAction.id,
+      decisionSourceUserSeq: decision.seq,
+    },
+  }, { armRunInFlight: true });
+  return {
+    directive,
+    event,
+    source: {
+      sourceUserSeq: event.seq,
+      displayMessage: directive,
+      runAttemptId: attempt.attemptId,
+      runId: attempt.runId ?? runId,
+    },
+  };
+}
+
+const CONTINUATION_RESULT_CHARS = 1500;
+
 /** The approved stored action has ALREADY run; the brain finishes the request from its result. */
 export function approvedActionRanDirective(subject: string, result: string): string {
+  if (result.length > CONTINUATION_RESULT_CHARS) result = `${result.slice(0, CONTINUATION_RESULT_CHARS)}… (truncated)`;
   return (
     `[approval-resume] The user just APPROVED the queued action "${subject}" and it has ALREADY RUN exactly once. `
     + `Its result:\n${result}\n`
