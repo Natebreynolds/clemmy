@@ -396,65 +396,16 @@ test('a parked pending-action card runs its exact stored action on approval, wit
   assert.equal(dispatched[0].tool, 'run_shell_command');
   assert.deepEqual(dispatched[0].payload, action.payload);
   assert.equal(getPendingAction(action.id)?.status, 'executed');
-  assert.equal(directives.length, 1, 'one continuation, after the action ran');
-  assert.match(directives[0], /ALREADY RUN exactly once/);
-  assert.match(directives[0], /Do not run it again/);
-  assert.match(directives[0], /Executed the approved run_shell_command call/, 'the result rides in the continuation');
+  assert.equal(directives.length, 0, 'no model turn: a brain cannot run under this source nor from a hidden one');
   const resumeSource = listEvents(sess.id, { types: ['user_input_received'] })
     .find((event) => event.data.source === 'approval_resume' && event.data.approvalId === row.approvalId);
   assert.ok(resumeSource, 'the approval minted its own hidden control source');
-  const decided = listEvents(sess.id, { types: ['conversation_completed'] })
+  const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
     .find((event) => event.data.sourceUserSeq === resumeSource!.seq);
-  assert.ok(decided, 'the owner\'s decision has its own short ending');
-  assert.match(String(decided!.data.reply), /ran\. Picking up the rest now/);
-  // The continuation has its own hidden source (never shown as the owner's
-  // words); this fake brain ended nothing, so the result itself became its ending.
-  const continuation = listEvents(sess.id, { types: ['user_input_received'] })
-    .find((event) => event.data.source === 'approval_continuation' && event.data.approvalId === row.approvalId);
-  assert.ok(continuation, 'one hidden continuation source');
-  assert.equal(continuation!.data.synthetic, true);
-  assert.equal(continuation!.data.decisionSourceUserSeq, resumeSource!.seq);
-  const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
-    .find((event) => event.data.sourceUserSeq === continuation!.seq);
-  assert.ok(terminal, 'a brain turn that ends nothing still leaves the owner the result');
+  assert.ok(terminal, 'that source settled with what landed');
+  assert.match(String(terminal!.data.reply), /^Done — "Send the reviewed proof" ran\./);
   assert.match(String(terminal!.data.reply), /Executed the approved run_shell_command call/);
-});
-
-test('when the brain cannot continue after the stored action ran, the result itself is the ending', async () => {
-  const sess = createSession({ kind: 'chat' });
-  const action = queuePendingAction({
-    title: 'Send the reviewed proof',
-    summary: 'Send one exact reviewed payload.',
-    kind: 'shell_command',
-    toolName: 'run_shell_command',
-    payload: { command: 'git push origin main', cwd: '/tmp' },
-    sessionId: sess.id,
-  });
-  const row = approvalRegistry.register({
-    sessionId: sess.id,
-    subject: 'Send the reviewed proof',
-    tool: 'request_approval',
-    args: { pendingActionId: action.id, pendingAction: pendingActionApprovalView(action) },
-  });
-  appendEvent({
-    sessionId: sess.id, turn: 0, role: 'system', type: 'approval_parked',
-    data: { approvalId: row.approvalId, tool: 'request_approval', pendingActionId: action.id },
-  });
-  const resolvedRow = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
-  const dispatched = recordingDispatch();
-  assert.equal(
-    await handleResolvedApprovalForChatResume(resolvedRow, async () => { throw new Error('brain unavailable'); }),
-    true,
-  );
-  assert.equal(dispatched.length, 1);
-  assert.equal(getPendingAction(action.id)?.status, 'executed');
-  const continuation = listEvents(sess.id, { types: ['user_input_received'] })
-    .find((event) => event.data.source === 'approval_continuation' && event.data.approvalId === row.approvalId);
-  assert.ok(continuation, 'the continuation source was minted before the brain was tried');
-  const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
-    .find((event) => event.data.sourceUserSeq === continuation!.seq);
-  assert.ok(terminal, 'the continuation still settled with what landed');
-  assert.match(String(terminal!.data.reply), /Executed the approved run_shell_command call/);
+  assert.match(String(terminal!.data.reply), /say "continue"/, 'the one next step is named');
 });
 
 test('an exact linked pending-action card resumes even if a crash lost approval_parked', async () => {
@@ -498,8 +449,7 @@ test('an exact linked pending-action card resumes even if a crash lost approval_
   assert.equal(dispatched.length, 1);
   assert.deepEqual(dispatched[0].payload, action.payload);
   assert.equal(getPendingAction(action.id)?.status, 'executed');
-  assert.equal(directives.length, 1, 'the brain finishes the request from the result');
-  assert.match(directives[0], /ALREADY RUN exactly once/);
+  assert.equal(directives.length, 0);
 });
 
 test('an approved run_batch card resumes through its deterministic batch executor', async () => {
