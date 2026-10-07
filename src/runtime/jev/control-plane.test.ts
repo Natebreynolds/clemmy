@@ -688,7 +688,7 @@ test('classifyOpenQuestionReplyWithJev reads a reply to Clem\'s question as one 
   const body = posted[0]!;
   assert.deepEqual(Object.keys(body.questions), ['reply'], 'one question, one request');
   assert.equal(body.questions.reply.type, 'choice');
-  assert.deepEqual(Object.keys(body.questions.reply.criteria).sort(), ['answers', 'asks', 'none', 'other']);
+  assert.deepEqual(Object.keys(body.questions.reply.criteria).sort(), ['affirms', 'answers', 'asks', 'none', 'other']);
   assert.match(JSON.stringify(body.state), /what channel are you going to send to/);
 
   choice = 'answers'; confidence = 0.97;
