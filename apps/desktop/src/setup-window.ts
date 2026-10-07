@@ -175,7 +175,7 @@ function reportSetupCrash(stage: string, details: Record<string, unknown>): void
     details,
   };
   try {
-    const logDir = path.join(os.homedir(), '.clementine-next', 'logs', 'desktop');
+    const logDir = path.join(process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine-next'), 'logs', 'desktop');
     if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
     appendFileSync(path.join(logDir, 'setup-crash.log'), JSON.stringify(payload) + '\n', 'utf-8');
   } catch { /* logging is best-effort */ }

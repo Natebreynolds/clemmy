@@ -19,8 +19,9 @@ import os from 'node:os';
  */
 
 const HOME = os.homedir();
-const STATE_DIR = path.join(HOME, '.clementine-next', 'state');
-const HOME_DIR = path.join(HOME, '.clementine-next');
+// The same home the credentials bridge, setup state and the daemon use.
+const HOME_DIR = process.env.CLEMENTINE_HOME || path.join(HOME, '.clementine-next');
+const STATE_DIR = path.join(HOME_DIR, 'state');
 const HOME_ENV = path.join(HOME_DIR, '.env');
 const PROFILE_FILE = path.join(STATE_DIR, 'user-profile.json');
 

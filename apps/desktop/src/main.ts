@@ -157,7 +157,10 @@ import {
  */
 
 const HOME = os.homedir();
-const LOG_DIR = path.join(HOME, '.clementine-next', 'logs', 'desktop');
+// One home for everything the app writes: a selected CLEMENTINE_HOME, else the
+// profile's (installed Windows smoke, run 37689034862: the desktop log under the
+// profile while the daemon, state and vault lived in the selected home).
+const LOG_DIR = path.join(process.env.CLEMENTINE_HOME || path.join(HOME, '.clementine-next'), 'logs', 'desktop');
 const LOG_FILE = path.join(LOG_DIR, 'supervisor.log');
 
 // Disable Chromium's password manager + macOS Passwords AutoFill so the
