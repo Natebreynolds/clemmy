@@ -152,7 +152,9 @@ sys.modules['websockets.asyncio.client'] = websocket_client
 `;
   const runner: BrowserOperationRunner = async code => {
     const fixed = code.replace("profile = p.pop('chrome_profile')", `profile = ${JSON.stringify(profile)}`);
-    const child = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', prelude + fixed], { encoding: 'utf8', timeout: 10000, maxBuffer: 2 * 1024 * 1024 });
+    // A fixture bound on a real interpreter start, not the product's: a cold
+    // Windows runner once needed more than 10 s (run 37665180200).
+    const child = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', prelude + fixed], { encoding: 'utf8', timeout: process.platform === 'win32' ? 60_000 : 10_000, maxBuffer: 2 * 1024 * 1024 });
     return { code: child.status, stdout: child.stdout, stderr: child.stderr, dispatched: true };
   };
   for (const [operation, args] of [
