@@ -370,3 +370,26 @@ test('a preparation probe with text evidence settles non-mutating and never stop
   assert.equal(claim.outcome.kind, 'unknown');
   assert.equal(eventlog.listEvents(claimTask.sessionId, { types: ['tool_attempt_settled'] })[0]!.data.mutating, true);
 });
+
+test('a mutation the provider answered with its own refusal settles uncertain, without replay and without a reconciliation stop', () => {
+  // Live 2026-10-07 (v3.18.32 candidate, wave 26): a Slack reminder delete
+  // answered `not_found` on a delivered transport; the settlement forced it
+  // to unacknowledged and the turn parked on "its effect must be reconciled".
+  // The provider answered, so the model reads the target and speaks.
+  const task = accept('answered refusal');
+  const governor = new governorModule.DiscoveryGovernor();
+  governor.initializeTask({ ...task, knownCapability: true });
+  const tool = 'slack__delete_reminder_fixture';
+  const args = { reminder: 'Rm0FIXTURE' };
+  const logicalToolCallId = 'logical:answered-refusal';
+  admitReturnedProviderCall({ task, logicalToolCallId, tool, args });
+  const settled = settlement.settleToolAttempt({
+    ...task, lane: 'composio', toolName: tool, callId: logicalToolCallId, args, businessCall: true, mutating: true,
+    result: { successful: false, error: 'Slack API error: not_found', data: { ok: false, error: 'not_found' } },
+  });
+  assert.equal(settled.outcome.kind, 'uncertain_write');
+  assert.equal(settled.outcome.detail, 'provider_refused_envelope');
+  assert.equal(settled.outcome.directive.retrySameCandidate, false, 'provider bytes earn no replay');
+  assert.equal(settled.outcome.directive.requiresReconciliation, false, 'an answered refusal is read back, not a stop');
+  assert.equal(settled.outcome.directive.action, 'settle');
+});

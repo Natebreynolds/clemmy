@@ -1358,16 +1358,17 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
       : input.mutating === true;
   if (binding || preparationProbe) extracted.mutating = settlementMutating;
   if (settlementMutating && extracted.acknowledged === undefined) {
-    // A mutation that threw was never acknowledged — and a mutation whose
-    // envelope merely says "not successful" has not proved that nothing landed
-    // either. Both are uncertain until something observes the target. Treating
-    // a returned failure as a clean miss is exactly how a send gets repeated.
-    // A local tool's own typed non-write is exactly that proof: an in-process
-    // identity the tool mints only when it changed nothing, so the failure
-    // its returned text describes is not a write of unknown fate.
-    const returnedFailure = extracted.envelopeSuccessful === false
-      && !(input.thrown === undefined && localResultTypedNegative(input.result));
-    if ((input.thrown !== undefined && !(input.thrown instanceof LocalNonWriteError)) || returnedFailure) extracted.acknowledged = false;
+    // A mutation that threw was never acknowledged: nothing came back, so it
+    // is the dark, and the turn stops to reconcile. A mutation whose envelope
+    // says "not successful" is a different thing: the provider answered. It
+    // has not proved that nothing landed either (treating it as a clean miss
+    // is exactly how a send gets repeated), so the classifier keeps it an
+    // uncertain write with no replay — as `provider_refused_envelope` — but
+    // leaves the turn running so the model observes the target and answers
+    // (live 2026-10-07: a Slack delete answered `not_found` parked the owner
+    // on "its effect must be reconciled" where a readback was the answer).
+    // Forcing it to unacknowledged here used to erase that distinction.
+    if (input.thrown !== undefined && !(input.thrown instanceof LocalNonWriteError)) extracted.acknowledged = false;
   }
   // THE PROVIDER'S OWN REPLY CONFIRMS A WRITE IT ACKNOWLEDGES. A returned
   // mutation whose structured reply names what it created or changed (the

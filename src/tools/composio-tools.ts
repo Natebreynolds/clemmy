@@ -465,11 +465,13 @@ export function canonicalComposioSettlementResult(
  * machine-readable pre-effect rejection code and verifies the task produced no
  * result. Generic provider prose and ordinary HTTP-looking fields remain
  * commit-ambiguous. */
-export function composioFailureProvesNoCommit(value: unknown, toolSlug?: string): boolean {
-  // Shape alone cannot identify the provider, and one failed member cannot
-  // vouch for a multistage request. The dispatched operation owns this adapter.
-  return Boolean(toolSlug === 'DATAFORSEO_CREATE_SERP_GOOGLE_MAPS_TASK'
-    && detectComposioFailure(value).provesNoCommit === true);
+export function composioFailureProvesNoCommit(value: unknown, _toolSlug?: string): boolean {
+  // The proof is structural and complete in the adapter's reading: one
+  // nested task, the provider's exact invalid-field code, no result and no
+  // result count on a successful transport. No operation name is compiled in
+  // (an allow-list of operations is not evidence); a request with more than
+  // one member never qualifies, by the adapter's own single-task requirement.
+  return detectComposioFailure(value).provesNoCommit === true;
 }
 
 /** Preserve trusted adapter evidence before canonicalization replaces the
