@@ -61,7 +61,7 @@ test.afterEach(() => {
 
 test.after(() => {
   resetClaudeHeadlessModelCache();
-  rmSync(TMP_HOME, { recursive: true, force: true });
+  rmSync(TMP_HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 test('claudeCliModelArg passes a FULL model name through (exact model, fidelity), aliases bare words', () => {
@@ -358,7 +358,7 @@ test('ClaudeHeadlessModel spawns the resolved CLAUDE_CLI_PATH override, not a li
     _setHeadlessFlagSupportForTests(overrideBin, null);
     if (prevOverride === undefined) delete process.env.CLAUDE_CLI_PATH;
     else process.env.CLAUDE_CLI_PATH = prevOverride;
-    rmSync(binDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -384,7 +384,7 @@ test('ClaudeHeadlessModel refuses before spawn when the CLI cannot guarantee too
     _setHeadlessFlagSupportForTests(overrideBin, null);
     if (prevOverride === undefined) delete process.env.CLAUDE_CLI_PATH;
     else process.env.CLAUDE_CLI_PATH = prevOverride;
-    rmSync(binDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -437,7 +437,7 @@ test('resolveClaudeCliPath: finds a `claude` binary on the (augmented) PATH', ()
     process.env.PATH = prevPath;
     if (prevOverride === undefined) delete process.env.CLAUDE_CLI_PATH;
     else process.env.CLAUDE_CLI_PATH = prevOverride;
-    rmSync(binDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -456,7 +456,7 @@ test('resolveClaudeCliPath: an explicit CLAUDE_CLI_PATH override wins when it ex
   } finally {
     if (prevOverride === undefined) delete process.env.CLAUDE_CLI_PATH;
     else process.env.CLAUDE_CLI_PATH = prevOverride;
-    rmSync(binDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 

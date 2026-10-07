@@ -140,7 +140,7 @@ test('missing, tampered, wrong, weak-permissioned, and symlinked spill files fai
   if (process.platform === 'win32') {
     const program = String.raw`$ErrorActionPreference='Stop'; [Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false,$true); $p=[Console]::In.ReadToEnd(); $a=Get-Acl -LiteralPath $p; $s=[System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'); $r=[System.Security.AccessControl.FileSystemAccessRule]::new($s,[System.Security.AccessControl.FileSystemRights]::Read,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $a`;
     const result = spawnSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(program, 'utf16le').toString('base64')], { input: storage.resultPayloadFilePath(weak.digest), encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 4096 });
-    assert.equal(result.status, 0, 'controlled fixture ACL weakening must complete');
+    assert.equal(result.status, 0, `controlled fixture ACL weakening must complete: ${String(result.stderr || result.stdout || result.error?.message || '').slice(0, 400)}`);
   } else chmodSync(storage.resultPayloadFilePath(weak.digest), 0o644);
   assert.equal(storage.readDurableResultPayload(metadata(weak)).status, 'corrupt');
 

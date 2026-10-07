@@ -28,9 +28,9 @@ function weakenFixtureAcl(target: string): void {
   const script = String.raw`$ErrorActionPreference='Stop'; [Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false,$true); $p=[Console]::In.ReadToEnd(); $a=Get-Acl -LiteralPath $p; $sid=[System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'); $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,[System.Security.AccessControl.FileSystemRights]::ReadAndExecute,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $a`;
   const command = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const result = spawnSync(command, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
-    input: target, encoding: 'utf8', timeout: 10_000, maxBuffer: 4096, windowsHide: true,
+    input: target, encoding: 'utf8', timeout: 10_000, maxBuffer: 65536, windowsHide: true,
   });
-  assert.equal(result.status, 0, 'controlled fixture ACL weakening must complete');
+  assert.equal(result.status, 0, `controlled fixture ACL weakening must complete: ${String(result.stderr || result.stdout || result.error?.message || '').slice(0, 400)}`);
 }
 
 test('Windows NTFS private directory and open temp retain exact handle identity and readable bytes', { skip: !WINDOWS }, () => {

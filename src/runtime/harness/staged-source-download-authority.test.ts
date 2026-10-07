@@ -24,7 +24,7 @@ test.after(() => {
   composio.__test__.setConnectedAccountsLoader(null);
   composio.__test__.setComposioApiKeyOverride(null);
   eventlog.closeEventLog();
-  rmSync(TMP_HOME, { recursive: true, force: true });
+  rmSync(TMP_HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 test('remote upload source owns one private GET, atomic checkpoint/blob owner, and exact restart topology', async () => {

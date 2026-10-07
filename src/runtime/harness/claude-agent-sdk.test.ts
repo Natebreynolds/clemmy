@@ -95,7 +95,7 @@ test.beforeEach(() => {
 test.after(() => {
   setClaudeAgentSdkQueryForTest(null);
   setClaudeAgentSdkReflectionForTest(null);
-  rmSync(TMP_HOME, { recursive: true, force: true });
+  rmSync(TMP_HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 test('defaultClaudeAgentSdkAllowedLocalTools is conservative unless explicitly overridden', () => {

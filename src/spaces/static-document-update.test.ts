@@ -18,7 +18,7 @@ const contract = await import('./workspace-set-data-contract.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 
-test.after(() => { eventlog.closeEventLog(); db.closeWorkspaceDb(); rmSync(home, { recursive: true, force: true }); });
+test.after(() => { eventlog.closeEventLog(); db.closeWorkspaceDb(); rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
 let ordinal = 0;
 function fixture() {
   const slug = `static-update-${++ordinal}`;
@@ -121,7 +121,8 @@ for (const phase of ['projection_written', 'before_sqlite_commit', 'after_sqlite
     const profileFile = path.join(home, `profile-${f.slug}.json`);
     writeFileSync(script, `import {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(profileFile)}, JSON.stringify({execPath:process.execPath,version:process.version,home:process.env.CLEMENTINE_HOME,isolated:process.env.CLEMMY_TEST_ISOLATED_HOME,pid:process.pid})); const store = await import(${JSON.stringify(new URL('./store.ts', import.meta.url).href)});\nstore.spaceStore.replaceStaticDocument({...${JSON.stringify(input)}, onPhase(at) { if(at===${JSON.stringify(phase)}) process.kill(process.pid,'SIGKILL'); }});`);
     const child = spawnSync(process.execPath, ['--import', 'tsx', script], { env: { ...process.env, CLEMENTINE_HOME: home }, encoding: 'utf8', timeout: 30_000 });
-    assert.equal(child.signal, 'SIGKILL', child.stderr);
+    if (process.platform === 'win32') assert.notEqual(child.status, 0, child.stderr); // Windows reports a self-kill as a non-zero exit, not a signal
+    else assert.equal(child.signal, 'SIGKILL', child.stderr);
     const profile = JSON.parse(readFileSync(profileFile, 'utf8'));
     assert.equal(profile.execPath, process.execPath);
     assert.equal(profile.version, process.version);

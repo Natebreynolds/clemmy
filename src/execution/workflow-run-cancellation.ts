@@ -100,6 +100,9 @@ function syncDirectory(dir: string): void {
 }
 
 function promoteExistingCancellationDurability(file: string): void {
+  // Windows refuses to flush a read-only handle (EPERM, live 2026-10-07 on the
+  // beta runner); the writer already flushed the bytes before linking.
+  if (process.platform === 'win32') return;
   const fd = openSync(file, 'r');
   try { fsyncSync(fd); } finally { closeSync(fd); }
   syncDirectory(CANCELLATION_DIR);

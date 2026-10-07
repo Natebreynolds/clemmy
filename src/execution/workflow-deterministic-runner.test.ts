@@ -26,7 +26,7 @@ const { readWorkflowEvents } = await import('./workflow-events.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 
 test.after(() => {
-  rmSync(testHome, { recursive: true, force: true });
+  rmSync(testHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 function definition(slug: string, steps: unknown[]) {

@@ -17,7 +17,7 @@ const { VAULT_DIR } = await import('../memory/vault.js');
 mkdirSync(VAULT_DIR, { recursive: true });
 const file = path.join(VAULT_DIR, 'report café 日本語 & notes.docx');
 writeFileSync(file, 'synthetic office fixture');
-test.after(() => rmSync(home, { recursive: true, force: true }));
+test.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 const headers = { authorization: 'Bearer file-open-fixture' };
 
 async function withRoute(launch: (target: string) => Promise<void>, fn: (url: string) => Promise<void>, platform: NodeJS.Platform = 'win32'): Promise<void> {
