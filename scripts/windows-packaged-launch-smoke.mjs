@@ -505,6 +505,7 @@ async function collectLaunchDiagnostics(app, error) {
     childExitCode: app.child.exitCode, childSignal: app.child.signalCode,
     devToolsActivePort: existsSync(path.join(app.userData, 'DevToolsActivePort')),
     userDataEntries: safeNames(app.userData), homeStateEntries: safeNames(path.join(app.env.CLEMENTINE_HOME, 'state')),
+    profileHomeStateEntries: safeNames(path.join(app.profile, '.clementine-next', 'state')),
     clementineProcesses: null, logs: [],
   };
   try { diagnostics.clementineProcesses = (await processes()).length; } catch { /* the launch failure stands */ }
@@ -579,16 +580,18 @@ async function startInstalledApp(context, firstLaunch) {
   // no listener yet: a first start on a cold runner loads a 236 MB
   // executable while Defender scans 1.4 GB of fresh files. The bound now
   // matches the other waits, and a miss records what the app itself says.
+  // Any miss between the listener and the dashboard records what the app
+  // itself did (its log, its state entries), not only a listener miss.
   try {
     await waitFor(async () => {
       try { await localJSON(`http://127.0.0.1:${port}/json/version`); return true; } catch { return null; }
     }, 'desktop_debug_listener_missing', 120_000);
+    await assertListenerOwner(port, main.pid);
+    if (firstLaunch) await skipSetup(app);
   } catch (error) {
     context.launchDiagnostics = await collectLaunchDiagnostics(app, error);
     throw error;
   }
-  await assertListenerOwner(port, main.pid);
-  if (firstLaunch) await skipSetup(app);
   // The app's real React landing redirect normally changes /console to
   // /console/chat before the next poll. Both are legitimate dashboard targets.
   const target = await waitFor(() => findPage(port, isDashboardTarget), 'desktop_dashboard_missing');

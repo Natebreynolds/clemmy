@@ -19,11 +19,16 @@ import os from 'node:os';
  */
 
 const HOME = os.homedir();
-const STATE_DIR = path.join(HOME, '.clementine-next', 'state');
+// The same home the credentials bridge and the daemon use: a selected
+// CLEMENTINE_HOME, else the profile's. Writing the marker under the profile
+// while the bridge read it under the selected home asked a custom-home user
+// to set up again on every launch (installed Windows smoke, run 37681700588).
+const CLEM_BASE_DIR = process.env.CLEMENTINE_HOME || path.join(HOME, '.clementine-next');
+const STATE_DIR = path.join(CLEM_BASE_DIR, 'state');
 const MARKER_FILE = path.join(STATE_DIR, 'setup-complete.json');
 const VAULT_FILE = path.join(STATE_DIR, 'secrets-vault.json');
 const LOCAL_AUTH_FILE = path.join(STATE_DIR, 'auth.json');
-const HOME_ENV = path.join(HOME, '.clementine-next', '.env');
+const HOME_ENV = path.join(CLEM_BASE_DIR, '.env');
 const REPO_ENV_HINTS = [
   path.join(HOME, 'clementine-next', '.env'),
   path.join(process.cwd(), '.env'),
