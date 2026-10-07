@@ -11,17 +11,26 @@ $payload = ConvertFrom-Json ([Console]::In.ReadToEnd())
 /** Fixed host programs receive literal values over stdin, not cmd.exe source.
  * The caller supplies source code, never a model/tool argument. Output stays
  * bounded and failure text deliberately omits private URLs and sign-in data. */
-export function runWindowsPowerShell(
+/** The exact invocation: Windows PowerShell 5.1 from the system root, the
+ * payload reader prepended to the fixed program, a reduced environment. */
+export function windowsPowerShellInvocation(
   program: string,
-  payload: unknown,
-  options: { env?: NodeJS.ProcessEnv; spawnProcess?: typeof spawn; timeoutMs?: number } = {},
-): Promise<string> {
-  const environment = options.env ?? process.env;
+  environment: NodeJS.ProcessEnv = process.env,
+): { executable: string; args: string[]; env: NodeJS.ProcessEnv } {
   const systemRoot = windowsSystemRoot(environment);
   const executable = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const encoded = Buffer.from(READ_PAYLOAD + program, 'utf16le').toString('base64');
   const env = Object.fromEntries(Object.entries(environment).filter(([key, value]) => value !== undefined
     && /^(?:systemroot|windir|systemdrive|comspec|pathext|path|userprofile|appdata|localappdata|temp|tmp)$/i.test(key)));
+  return { executable, args: ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], env };
+}
+
+export function runWindowsPowerShell(
+  program: string,
+  payload: unknown,
+  options: { env?: NodeJS.ProcessEnv; spawnProcess?: typeof spawn; timeoutMs?: number } = {},
+): Promise<string> {
+  const { executable, args, env } = windowsPowerShellInvocation(program, options.env ?? process.env);
   return new Promise((resolve, reject) => {
     let child: ChildProcess | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -38,9 +47,7 @@ export function runWindowsPowerShell(
       } else resolve(output.trim());
     };
     try {
-      child = (options.spawnProcess ?? spawn)(executable,
-        ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-        { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      child = (options.spawnProcess ?? spawn)(executable, args, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
       timer = setTimeout(() => finish(false, 'Windows application launch timed out; check whether a window opened before trying again.'),
         Math.min(15_000, Math.max(1, options.timeoutMs ?? 15_000)));
       child.on('error', () => finish(false));
