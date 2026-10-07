@@ -21,7 +21,7 @@ test('compiler discovery uses exact installed Visual Studio executable, bounded 
   const result = resolveWindowsAclCompiler(env, (...args) => { calls.push(args); return { status: 0, stdout: compiler + '\r\n' }; }, filename => [vswhere, compiler].includes(filename));
   assert.equal(result, compiler); assert.equal(calls[0][0], vswhere);
   assert.deepEqual(calls[0][1], ['-latest', '-products', '*', '-requires', 'Microsoft.Component.MSBuild', '-find', 'MSBuild\\**\\Bin\\Roslyn\\csc.exe']);
-  assert.equal(calls[0][2].timeout, 10_000); assert.equal(calls[0][2].shell, false);
+  assert.equal(calls[0][2].timeout, 90_000); assert.equal(calls[0][2].shell, false);
   assert.equal(calls[0][2].env.OPENAI_API_KEY, undefined); assert.equal(calls[0][2].env.HOME, undefined);
   assert.equal(calls[0][2].env.PATH, undefined);
 });
