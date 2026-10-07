@@ -1818,6 +1818,44 @@ test('a local write whose own failure leaves its effect uncertain keeps the turn
   leases.revokeDispatchLease(task.parentLease);
 });
 
+test('an external write the provider answered with its own refusal checkpoints ready: read back, never replayed, never a reconciliation stop', async () => {
+  // Live 2026-10-07 (v3.18.32 candidate, wave 26): Slack answered a reminder
+  // delete with `not_found`; the settlement no longer stops the turn, but the
+  // checkpoint projected nothing for it and the turn ended "I could not
+  // reopen the saved checkpoint".
+  const task = fixture('Delete the exact Slack reminder once.', 'execute');
+  const callId = 'call:answered-refusal-write';
+  const toolName = 'slack_delete_reminder';
+  const args = { reminder: 'Rm0FIXTURE' };
+  const admitted = checkpoints.admitAcceptedModelBatch({
+    sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq,
+    preHistory: preHistory(task), frameHistory: openFrame({ callId, toolName, args }),
+    providerResponseId: 'response:answered-refusal-write',
+  });
+  assert.equal(admitted.status, 'admitted');
+  if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+  const payload = { successful: false, error: 'Slack API error: not_found', data: { ok: false, error: 'not_found' } };
+  let bodies = 0;
+  const invoked = await runCall({
+    task, callId, toolName, args, effect: 'external_write', boundary: 'host_owned_local',
+    invoke: async () => { bodies += 1; return payload; },
+  });
+  assert.equal(invoked.settlement.outcome.kind, 'uncertain_write');
+  assert.equal(invoked.settlement.outcome.detail, 'provider_refused_envelope');
+  assert.equal(invoked.settlement.outcome.directive.requiresReconciliation, false);
+  const resultItem = projectedTextResult({ callId, toolName, value: payload });
+  recordLogicalResult(admitted.admission, resultItem);
+  const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, { committedResultItems: [resultItem] });
+  assert.ok(finalized.status === 'committed' || finalized.status === 'existing', JSON.stringify(finalized));
+  assert.equal(finalized.checkpoint.disposition, 'ready');
+  const recovered = checkpoints.recoverAcceptedModelBatchForRestart({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq });
+  assert.equal(recovered.status, 'ready');
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM durable_result_handles WHERE session_id = ?').get(task.sessionId) as { n: number }).n, 0,
+    'an answered refusal never gets a success handle');
+  assert.equal(bodies, 1, 'and is never run again');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
 test('an uncertain host-owned mutation with zero provider crossings checkpoints reconciliation', async () => {
   const task = fixture('Attempt one host-owned mutation whose effect is not acknowledged.', 'execute');
   const callId = 'call:host-owned-unknown-write';

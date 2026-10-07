@@ -899,6 +899,7 @@ function settledNonSuccessProjectionDisposition(input: {
 }): 'ready' | 'reconciliation_required' | null {
   const rows = input.db.prepare(`
     SELECT logical.state, settlement.execution_kind, settlement.outcome_kind,
+           settlement.outcome_detail,
            settlement.business_call, settlement.mutating,
            settlement.physical_crossing_count, settlement.host_crossing_count,
            settlement.result_handle_id, settlement.recovery_action,
@@ -925,6 +926,7 @@ function settledNonSuccessProjectionDisposition(input: {
     state: string;
     execution_kind: string;
     outcome_kind: string;
+    outcome_detail: string | null;
     business_call: number;
     mutating: number;
     physical_crossing_count: number;
@@ -944,7 +946,16 @@ function settledNonSuccessProjectionDisposition(input: {
     || settlement.result_handle_id !== null
   ) return null;
 
-  const mutatingSafeFailure = new Set([
+  // A provider that ANSWERED the write with its own refusal: an uncertain
+  // write the model reads back, with no replay and no reconciliation stop
+  // (its settlement says so). The checkpoint projects it like any returned
+  // failure the model saw; without this it projected nothing, and the turn
+  // ended "I could not reopen the saved checkpoint" (live 2026-10-07).
+  const answeredRefusal = settlement.outcome_kind === 'uncertain_write'
+    && settlement.outcome_detail === 'provider_refused_envelope'
+    && settlement.requires_reconciliation === 0
+    && settlement.nonreturned_crossing_count === 0;
+  const mutatingSafeFailure = answeredRefusal || new Set([
     'invalid_arguments',
     'transient',
     'unsupported_capability',
@@ -982,7 +993,7 @@ function settledNonSuccessProjectionDisposition(input: {
       && !uncertainEffectStopsTurn(bound.binding.effect);
   }
   const reconciliationRequired = !returnedLocalWrite && (settlement.requires_reconciliation === 1
-    || settlement.outcome_kind === 'uncertain_write'
+    || (settlement.outcome_kind === 'uncertain_write' && !answeredRefusal)
     || (
       settlement.mutating === 1
       && (
