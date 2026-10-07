@@ -11,6 +11,7 @@ import { spawn } from 'node:child_process';
 import { createHash, randomUUID, X509Certificate } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import tls from 'node:tls';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
