@@ -144,17 +144,22 @@ async function hostTurn(label: string, request: string, script: Output[][]) {
 
 /**
  * What the desktop does when the owner approves the card: the registry
- * resolves and the resume runs the one stored action itself, settling its
- * own accepted source with what landed. No model is called.
+ * resolves and the resume runs the one stored action itself, then hands the
+ * brain the result so it can finish the rest of the request. The model never
+ * decides whether the action runs.
  */
 async function approveCard(sessionId: string, approvalId: string) {
   const resolved = approvalRegistry.resolve(approvalId, 'approved', 'desktop-chat-card');
   assert.equal(resolved.ok, true, JSON.stringify(resolved));
-  let modelResumed = false;
-  const settled = await handleResolvedApprovalForChatResume(resolved.row!, async () => { modelResumed = true; });
-  assert.equal(modelResumed, false, 'no model turn is spent on an approval');
-  const outcome = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
-  return { settled, outcomeText: JSON.stringify(outcome?.data ?? null) };
+  const endingsBefore = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).length;
+  const continuations: string[] = [];
+  const settled = await handleResolvedApprovalForChatResume(resolved.row!, async (_sessionId, directive) => { continuations.push(directive); });
+  const endings = eventlog.listEvents(sessionId, { types: ['conversation_completed'] });
+  // A ran action hands the brain its result and the continuation turn ends
+  // the source; an action that could not run ends the source right here.
+  const outcomeText = continuations[0] ?? (endings.length > endingsBefore ? JSON.stringify(endings.at(-1)!.data) : 'no ending');
+  assert.ok(continuations.length + (endings.length - endingsBefore) === 1, `exactly one ending or continuation: ${outcomeText}`);
+  return { settled, continued: continuations.length === 1, outcomeText };
 }
 
 test('a command that leaves the machine is refused into one card, and the approved card runs it once', async () => {
@@ -221,6 +226,8 @@ test('a command that leaves the machine is refused into one card, and the approv
   assert.equal(approved.settled, true, approved.outcomeText);
   assert.deepEqual(received, ['POST /hook x=1'], approved.outcomeText);
   assert.equal(pendingActions.getPendingAction(view!.id)?.status, 'executed', approved.outcomeText);
+  assert.equal(approved.continued, true, 'the brain finishes the request from the result');
+  assert.match(approved.outcomeText, /ALREADY RUN exactly once/, approved.outcomeText);
   assert.match(approved.outcomeText, /Executed the approved run_shell_command call/, approved.outcomeText);
 });
 
@@ -261,5 +268,6 @@ test('an approved card cannot carry a command the guards inside the tool refuse'
   assert.equal(approved.settled, true, approved.outcomeText);
   assert.deepEqual(received, ['POST /hook x=1'], 'nothing new reached the endpoint');
   assert.notEqual(pendingActions.getPendingAction(view.id)?.status, 'executed', approved.outcomeText);
+  assert.equal(approved.continued, false, 'nothing ran, so there is nothing for the brain to continue from');
   assert.match(approved.outcomeText, /credential/i, approved.outcomeText);
 });

@@ -441,6 +441,9 @@ async function executeApprovedLinkedActionAndSettle(
   source: EventRow,
   pendingActionInput: PendingActionRecord,
   prepared: ChatApprovalResumeSource,
+  /** The chat brain to hand the result to. A channel send-consent decision
+   * has no brain to continue; its result is its ending. */
+  dispatch?: ChatApprovalResumeDispatch,
 ): Promise<boolean> {
   let pendingAction: PendingActionRecord | null = pendingActionInput;
   if (pendingAction.status === 'approved') {
@@ -508,10 +511,22 @@ async function executeApprovedLinkedActionAndSettle(
   }
   if (!pendingAction) return false;
   if (pendingAction.status === 'executed') {
-    return await settleConversationalSource(row, source, {
-      status: 'done',
-      text: pendingAction.resultSummary ?? `Executed the exact approved ${pendingAction.toolName} call.`,
-    });
+    // The stored action ran once with no model in the loop. The owner's
+    // request usually did not end at that card ("run X, then put its first
+    // line in a file"): the brain now takes the result and finishes what is
+    // left, in its own words. Live 2026-10-06 the raw tool output was the
+    // whole reply and the rest of the request never happened. Only when the
+    // brain cannot be reached does the result itself stand as the ending.
+    const result = pendingAction.resultSummary ?? `Executed the exact approved ${pendingAction.toolName} call.`;
+    if (!dispatch) return await settleConversationalSource(row, source, { status: 'done', text: result });
+    try {
+      await dispatch(row.sessionId, approvedActionRanDirective(row.subject, result), prepared);
+      return true;
+    } catch (err) {
+      logger.warn({ approvalId: row.approvalId, err: err instanceof Error ? err.message : String(err) },
+        'the brain could not continue after the approved action ran; settling with the result');
+      return await settleConversationalSource(row, source, { status: 'done', text: result });
+    }
   }
   if (pendingAction.status === 'executing') {
     return await settleConversationalSource(row, source, {
@@ -686,6 +701,16 @@ async function drainQueuedApprovalResumes(sessionId: string): Promise<void> {
   }
 }
 
+/** The approved stored action has ALREADY run; the brain finishes the request from its result. */
+export function approvedActionRanDirective(subject: string, result: string): string {
+  return (
+    `[approval-resume] The user just APPROVED the queued action "${subject}" and it has ALREADY RUN exactly once. `
+    + `Its result:\n${result}\n`
+    + 'Do not run it again, re-queue it, or ask for another approval. '
+    + 'Finish whatever remains of the original request using this result, then tell the user in your own words what happened.'
+  );
+}
+
 export function chatApprovalResumeDirective(
   subject: string,
   tool: string,
@@ -797,7 +822,7 @@ export async function handleResolvedApprovalForChatResume(
         logger.info({ approvalId: row.approvalId, sessionId: row.sessionId, subject: row.subject, pendingActionId },
           'card approved — running the exact stored action');
         try {
-          const settled = await executeApprovedLinkedActionAndSettle(row, sourceEvent, pendingAction, source);
+          const settled = await executeApprovedLinkedActionAndSettle(row, sourceEvent, pendingAction, source, dispatch);
           if (settled) handledApprovalIds.add(row.approvalId);
           return settled;
         } finally {

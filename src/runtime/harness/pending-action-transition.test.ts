@@ -196,7 +196,8 @@ test('queue -> one card -> approve -> resume -> exact payload dispatches once', 
   assert.equal(getPendingAction(record.id)?.status, 'approved');
   assert.equal(getPendingAction(record.id)?.approvedBy, 'human');
 
-  // The approval runs the stored payload itself: no directive, no model.
+  // The approval runs the stored payload itself; the model only continues
+  // the request afterwards, from the result.
   const dispatched: Array<{ tool: string; payload: unknown; sessionId: string }> = [];
   _setApprovedCallDispatchForTests(async (tool, payload, ownerSessionId) => {
     dispatched.push({ tool, payload, sessionId: ownerSessionId });
@@ -214,7 +215,8 @@ test('queue -> one card -> approve -> resume -> exact payload dispatches once', 
   } finally {
     _setApprovedCallDispatchForTests(null);
   }
-  assert.equal(directives.length, 0);
+  assert.equal(directives.length, 1);
+  assert.match(directives[0], /ALREADY RUN exactly once/);
   assert.equal(dispatched.length, 1);
   assert.equal(dispatched[0].tool, record.toolName);
   assert.deepEqual(dispatched[0].payload, record.payload);

@@ -389,19 +389,58 @@ test('a parked pending-action card runs its exact stored action on approval, wit
     true,
   );
   // The owner's decision is the whole instruction: the stored payload ran
-  // once, the model was not asked to re-issue or reconstruct anything.
-  assert.equal(directives.length, 0);
+  // once, the model was not asked to re-issue or reconstruct anything. The
+  // brain is then handed the result to finish the rest of the request.
   assert.equal(dispatched.length, 1, JSON.stringify(getPendingAction(action.id)));
   assert.equal(dispatched[0].tool, 'run_shell_command');
   assert.deepEqual(dispatched[0].payload, action.payload);
   assert.equal(getPendingAction(action.id)?.status, 'executed');
+  assert.equal(directives.length, 1, 'one continuation, after the action ran');
+  assert.match(directives[0], /ALREADY RUN exactly once/);
+  assert.match(directives[0], /Do not run it again/);
+  assert.match(directives[0], /Executed the approved run_shell_command call/, 'the result rides in the continuation');
   const resumeSource = listEvents(sess.id, { types: ['user_input_received'] })
     .find((event) => event.data.source === 'approval_resume' && event.data.approvalId === row.approvalId);
   assert.ok(resumeSource, 'the approval minted its own hidden control source');
   const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
     .find((event) => event.data.sourceUserSeq === resumeSource!.seq);
-  assert.ok(terminal, 'that source settled with what landed');
-  assert.match(JSON.stringify(terminal!.data), /Executed the approved run_shell_command call/);
+  assert.equal(terminal, undefined, 'the continuation turn, not the resume, ends the source');
+});
+
+test('when the brain cannot continue after the stored action ran, the result itself is the ending', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const action = queuePendingAction({
+    title: 'Send the reviewed proof',
+    summary: 'Send one exact reviewed payload.',
+    kind: 'shell_command',
+    toolName: 'run_shell_command',
+    payload: { command: 'git push origin main', cwd: '/tmp' },
+    sessionId: sess.id,
+  });
+  const row = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'Send the reviewed proof',
+    tool: 'request_approval',
+    args: { pendingActionId: action.id, pendingAction: pendingActionApprovalView(action) },
+  });
+  appendEvent({
+    sessionId: sess.id, turn: 0, role: 'system', type: 'approval_parked',
+    data: { approvalId: row.approvalId, tool: 'request_approval', pendingActionId: action.id },
+  });
+  const resolvedRow = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  const dispatched = recordingDispatch();
+  assert.equal(
+    await handleResolvedApprovalForChatResume(resolvedRow, async () => { throw new Error('brain unavailable'); }),
+    true,
+  );
+  assert.equal(dispatched.length, 1);
+  assert.equal(getPendingAction(action.id)?.status, 'executed');
+  const resumeSource = listEvents(sess.id, { types: ['user_input_received'] })
+    .find((event) => event.data.source === 'approval_resume' && event.data.approvalId === row.approvalId);
+  const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
+    .find((event) => event.data.sourceUserSeq === resumeSource!.seq);
+  assert.ok(terminal, 'the source still settled with what landed');
+  assert.match(String(terminal!.data.reply), /Executed the approved run_shell_command call/);
 });
 
 test('an exact linked pending-action card resumes even if a crash lost approval_parked', async () => {
@@ -442,10 +481,11 @@ test('an exact linked pending-action card resumes even if a crash lost approval_
     ),
     true,
   );
-  assert.equal(directives.length, 0);
   assert.equal(dispatched.length, 1);
   assert.deepEqual(dispatched[0].payload, action.payload);
   assert.equal(getPendingAction(action.id)?.status, 'executed');
+  assert.equal(directives.length, 1, 'the brain finishes the request from the result');
+  assert.match(directives[0], /ALREADY RUN exactly once/);
 });
 
 test('an approved run_batch card resumes through its deterministic batch executor', async () => {
