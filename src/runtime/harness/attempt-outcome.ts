@@ -355,7 +355,18 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
     && signals.preDispatch !== true
     && !rejectedAtProviderLayer
   ) {
-    return outcome('uncertain_write', 'nominal', 'unacknowledged_mutation');
+    // A provider that ANSWERED with a structured refusal (its own envelope says
+    // "not successful" on a delivered transport) is still an uncertain write:
+    // its bytes prove no commit and earn no replay. But it left nothing in the
+    // dark the way a dropped acknowledgement does — the target's state can be
+    // read — so the host keeps the turn going and the model verifies instead
+    // of parking the owner on a reconciliation block (live 2026-10-07: a Slack
+    // reminder already gone answered `not_found`; the turn ended blocked with
+    // machine text where it used to end in words after a readback).
+    const answeredWithRefusal = signals.envelopeSuccessful === false
+      && signals.acknowledged !== false
+      && (signals.httpStatus === undefined || (signals.httpStatus >= 200 && signals.httpStatus < 300));
+    return outcome('uncertain_write', 'nominal', answeredWithRefusal ? 'provider_refused_envelope' : 'unacknowledged_mutation', signals.httpStatus);
   }
 
   // A real contradiction is different from an inspection bound. For a write,
@@ -461,4 +472,11 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
     return outcome('transient', 'text', 'unclassified_read_failure');
   }
   return outcome('unknown', 'text', signals.text ? 'unclassified' : undefined);
+}
+
+/** The provider answered the write with its own refusal envelope: the write
+ * stays uncertain (no replay authority), but the turn need not stop for
+ * reconciliation — the model can read the target and answer in words. */
+export function providerAnsweredWithRefusal(outcome: AttemptOutcome): boolean {
+  return outcome.kind === 'uncertain_write' && outcome.detail === 'provider_refused_envelope';
 }

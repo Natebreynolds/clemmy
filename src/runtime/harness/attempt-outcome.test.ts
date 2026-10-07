@@ -36,3 +36,23 @@ test('only trusted exact rejection proof turns a returned mutation failure into 
   // A 2xx that the provider calls successful is still a success.
   assert.equal(classifyAttemptOutcome({ httpStatus: 200, envelopeSuccessful: true, mutating: true }).kind, 'succeeded');
 });
+
+test('a mutation the provider answered with its own refusal stays uncertain without replay, and is told apart from a dropped acknowledgement', async () => {
+  const { classifyAttemptOutcome, providerAnsweredWithRefusal } = await import('./attempt-outcome.js');
+  // Live 2026-10-07: Slack answered a reminder delete with `not_found` on a
+  // delivered 200; the owner must hear words after a readback, not a block.
+  const answered = classifyAttemptOutcome({ mutating: true, httpStatus: 200, envelopeSuccessful: false });
+  assert.equal(answered.kind, 'uncertain_write');
+  assert.equal(answered.detail, 'provider_refused_envelope');
+  assert.equal(answered.directive.retrySameCandidate, false, 'provider bytes never earn a replay');
+  assert.equal(providerAnsweredWithRefusal(answered), true);
+  const noStatus = classifyAttemptOutcome({ mutating: true, envelopeSuccessful: false });
+  assert.equal(providerAnsweredWithRefusal(noStatus), true, 'an envelope without a transport status still answered');
+  const dropped = classifyAttemptOutcome({ mutating: true, acknowledged: false });
+  assert.equal(dropped.detail, 'unacknowledged_mutation');
+  assert.equal(providerAnsweredWithRefusal(dropped), false);
+  const serverError = classifyAttemptOutcome({ mutating: true, httpStatus: 502, envelopeSuccessful: false });
+  assert.equal(serverError.detail, 'unacknowledged_mutation', 'a failed transport is the dark, not an answer');
+  const proven = classifyAttemptOutcome({ mutating: true, providerRejectedBeforeEffect: true });
+  assert.equal(providerAnsweredWithRefusal(proven), false, 'a trusted pre-effect proof is a different, stronger reading');
+});

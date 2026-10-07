@@ -111,6 +111,7 @@ import {
 import {
   InvalidArgumentsPreDispatchResult,
   settleAdmittedLogicalCallPreDispatchDisposition,
+  providerAnsweredWithRefusal,
   providerRefusedExactRequest,
 } from './attempt-settlement.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
@@ -7205,9 +7206,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           // settles and the model gets the ordinary result. Live 2026-09-08:
           // platform-49 blocked on space_refresh, a non-mutating local view
           // rebuild, because the flag tripped for every effect class.
+          // A provider that answered the write with its own refusal envelope
+          // leaves nothing in the dark: the model reads the target state and
+          // answers in words, and the write keeps no replay authority. The
+          // hard block is for a dropped acknowledgement, where nothing can be
+          // read back yet (live 2026-10-07: Slack `not_found` on a delete).
           settlementRequiresReconciliation =
             invoked.settlement.outcome.directive.requiresReconciliation === true
-            && uncertainEffectStopsTurn(effect);
+            && uncertainEffectStopsTurn(effect)
+            && !providerAnsweredWithRefusal(invoked.settlement.outcome);
           providerRejectedBeforeEffect = providerRefusedExactRequest(invoked.settlement.outcome);
           if (
             preserveWorkCallCarrier
