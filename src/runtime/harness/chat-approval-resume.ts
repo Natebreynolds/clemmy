@@ -644,7 +644,11 @@ function prepareApprovalResumeSource(
     sourceUserSeq: source.seq,
     displayMessage: publicUserInputText(source.data) || `Approve ${row.approvalId}`,
     runAttemptId: attempt.attemptId,
-    runId,
+    // A reused attempt (the desktop's own typed decision) keeps its run
+    // family: the bridge correlates a resume by the attempt that owns the
+    // source, and a foreign run id reads as an identity mismatch and refuses
+    // the turn before any model (live 2026-10-06).
+    runId: attempt.runId ?? runId,
   };
 }
 

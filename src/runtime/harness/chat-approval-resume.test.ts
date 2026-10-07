@@ -24,6 +24,7 @@ const {
   listEvents,
   openEventLog,
   beginRunAttempt,
+  recordRunAttemptUserInput,
 } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
 const {
@@ -616,4 +617,20 @@ test('an approved card whose persisted graph can never activate is retired once,
     false,
   );
   assert.equal(dispatched.length, 0);
+});
+
+test('a resume on the desktop attempt that owns the typed decision keeps that attempt\'s run family', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const row = parkApproval(sess.id);
+  const attempt = beginRunAttempt(sess.id, { runId: `desktop:${sess.id}` });
+  const accepted = recordRunAttemptUserInput(attempt, {
+    turn: 7, role: 'user',
+    data: { text: 'Yes, go ahead.', displayText: 'Yes, go ahead.', approvalId: row.approvalId, decision: 'approve', source: 'desktop_approval' },
+  }, { armRunInFlight: true });
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  let source: { sourceUserSeq: number; runId: string; runAttemptId: string } | undefined;
+  assert.equal(await handleResolvedApprovalForChatResume(resolved, async (_sessionId, _directive, exact) => { source = exact; }), true);
+  assert.equal(source?.sourceUserSeq, accepted.seq);
+  assert.equal(source?.runAttemptId, attempt.attemptId, 'the owning attempt is reused');
+  assert.equal(source?.runId, attempt.runId, 'and the hand-off names its run family, not a foreign one');
 });
