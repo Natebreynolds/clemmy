@@ -699,6 +699,7 @@ export class ChatEngine {
             ...(d.consentCall ? { consentCall: d.consentCall as NonNullable<ChatMessage['approval']>['consentCall'] } : {}),
             ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
             ...(approvalRevisionFrom(d.revises) ? { revises: approvalRevisionFrom(d.revises) } : {}),
+            ...(typeof d.pendingActionId === 'string' || (d.pendingAction && typeof d.pendingAction === 'object') ? { queued: true } : {}),
           },
         }];
         this.busy = false;

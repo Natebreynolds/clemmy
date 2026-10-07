@@ -2652,6 +2652,66 @@ test('a change in words on a queued card from the phone resolves it as changed a
   }
 });
 
+test('edit by hand from the phone lands on the queued record, re-pins the card and approves the edited record', async () => {
+  // Owner-approved design, 2026-10-07, parity with the desktop card.
+  resetEventLog();
+  const { pendingActionApprovalView } = await import('../runtime/harness/pending-action-view.js');
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  const previousAuthMode = process.env.AUTH_MODE;
+  delete process.env.CLEMMY_HARNESS_WEBHOOK;
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.AUTH_MODE = 'api_key';
+  const ran: string[] = [];
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (opts: { sessionId: string }) => {
+      ran.push(opts.sessionId);
+      return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1, reply: 'Done — I ran it.' };
+    }) as never,
+  });
+  const h = await startHarness({ assistant: { respond: async () => { throw new Error('the bridge runs the turn'); } } as Parameters<typeof createMobileRouter>[0]['assistant'] });
+  try {
+    const cookie = await loginMobile(h, 'Edit phone');
+    const whoami = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    const { deviceId } = await whoami.json() as { deviceId: string };
+    const session = createHarnessSession({ id: 'sess-mobile-queued-edit', kind: 'chat', channel: 'mobile', userId: deviceId,
+      metadata: { source: 'mobile', ingressProvider: 'mobile', channelId: 'mobile-queued-edit-root', userId: deviceId } });
+    const action = queuePendingAction({ title: 'Print SSH settings', summary: 'local', kind: 'shell_command',
+      toolName: 'run_shell_command', payload: { command: 'ssh -G localhost', timeout_ms: 30000 }, sessionId: session.id });
+    const card = approvalRegistry.register({ sessionId: session.id, subject: 'Print SSH settings', tool: 'request_approval',
+      args: { pendingActionId: action.id, pendingAction: pendingActionApprovalView(action),
+        preview: { operation: 'run_shell_command', fields: [{ name: 'command', value: 'ssh -G localhost' }], ask: 'OK to run it?' } } });
+    const unknown = await fetch(`${h.url}/m/api/approvals/${card.approvalId}/approve`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify({ modifiedFields: { recipient: 'x' } }),
+    });
+    assert.equal(unknown.status, 400, 'only a field the card showed can be edited');
+    assert.equal(getPendingAction(action.id)?.payloadHash, action.payloadHash);
+
+    const res = await fetch(`${h.url}/m/api/approvals/${card.approvalId}/approve`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify({ modifiedFields: { command: 'ssh -G -vv localhost' } }),
+    });
+    assert.equal(res.status, 200, await res.text());
+    const durable = getPendingAction(action.id);
+    assert.deepEqual(durable?.payload, { command: 'ssh -G -vv localhost', timeout_ms: 30000, cwd: null }, 'the edited field, fitted to the tool\'s schema');
+    assert.notEqual(durable?.payloadHash, action.payloadHash);
+    assert.equal((approvalRegistry.get(card.approvalId)?.args?.pendingAction as { payloadHash?: string })?.payloadHash, durable?.payloadHash, 'the card re-pins the edited record');
+    const resolutions = listEvents(session.id, { types: ['approval_resolved'] }).filter((event) => event.data.approvalId === card.approvalId);
+    assert.ok(resolutions.some((event) => event.data.edited === true && (event.data.editedFields as { command?: string })?.command === 'ssh -G -vv localhost'));
+    assert.ok(ran.length >= 1 || approvalRegistry.get(card.approvalId)?.status === 'resolved', 'the approve itself went on as an ordinary decision');
+  } finally {
+    _setBridgeImplsForTests({});
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+    else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
+    if (previousAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = previousAuthMode;
+    await h.close();
+  }
+});
+
 test('default mobile chat/send never exposes a thrown provider error message', async () => {
   const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
   const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;

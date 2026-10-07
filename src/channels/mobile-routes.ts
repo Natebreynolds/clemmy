@@ -212,6 +212,7 @@ import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from 
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { runConversationFromResume } from '../runtime/harness/loop.js';
 import { resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
+import { applyQueuedCardFieldEdits, queuedCardEditsFrom, recordQueuedCardEditDecision } from '../runtime/harness/approval-card-edit.js';
 import { loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { forgetApprovedWriteKind, listApprovedWriteKinds } from '../agents/plan-scope.js';
 import { buildContinueInput, isContinueCompletionReason } from '../runtime/harness/continue-directive.js';
@@ -3500,6 +3501,23 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.post('/api/approvals/:id/approve', requireMobileSession, async (req, res) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    // Edit by hand on the card (owner-approved design, 2026-10-07): the
+    // retyped field lands on the queued record behind the card, the card
+    // keeps its id, and the decision is an ordinary approve of the edited
+    // record. A card with no queued record cannot be edited from the phone.
+    const fieldEdits = queuedCardEditsFrom(req.body?.modifiedFields);
+    if (fieldEdits) {
+      const queuedEdit = await applyQueuedCardFieldEdits({ approvalId: id, edits: fieldEdits, actor: 'mobile-inbox' });
+      if (queuedEdit === null) {
+        res.status(409).json({ error: 'Edit by hand on the phone is for a queued command or send; answer this card in words to change it.' });
+        return;
+      }
+      if (!queuedEdit.ok) {
+        res.status(queuedEdit.status).json({ error: queuedEdit.reason });
+        return;
+      }
+      recordQueuedCardEditDecision({ approvalId: id, editedFields: queuedEdit.editedFields });
+    }
     await resolveMobileApproval(res, id, 'approve');
   });
 

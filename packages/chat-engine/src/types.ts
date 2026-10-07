@@ -358,6 +358,9 @@ export interface ChatMessage {
     confirm?: ApprovalConfirm;
     /** This card revises an earlier one the owner changed in words. */
     revises?: ApprovalRevision;
+    /** The card links a queued exact payload (a command, a send): its fields
+     *  can be edited by hand on the card and the edited record runs. */
+    queued?: boolean;
     /** Host reducer facts, passed through unchanged for display, not authority. */
     consentCall?: {
       effect: string;

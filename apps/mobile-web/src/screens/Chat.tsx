@@ -69,6 +69,7 @@ import {
   sendChatMessageAsync,
   uploadChatAttachment,
   switchChatAgent,
+  approveApprovalWithFields,
   type MobileAgent,
 } from '../lib/api';
 import { listChatDelegatedTasks, listProjects, setChatProject } from '../lib/project-api';
@@ -509,6 +510,21 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
    * No catch — engine.send() does not reject; a failed post marks the user row
    * failed and the existing retry/discard affordance takes over.
    */
+  async function actOnApprovalWithEdits(approvalId: string, fields: Record<string, string>) {
+    if (approvalActing) return;
+    setApprovalActing(approvalId);
+    setError(null);
+    haptic('success');
+    try {
+      // The edited record runs; the card's stream shows the decision and the ending.
+      await approveApprovalWithFields(approvalId, fields);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'That edit could not be sent.');
+    } finally {
+      setApprovalActing(null);
+    }
+  }
+
   async function actOnApproval(approvalId: string, decision: 'approve' | 'reject') {
     const reply = chatApprovalReply(decision, approvalId);
     if (!reply || approvalActing) return;
@@ -670,6 +686,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             approvalActing={approvalActing}
             approvalDecided={Boolean(message.approval?.resolution) || chatApprovalDecided(messages, message.approval?.approvalId)}
             onApprovalAction={actOnApproval}
+            onApproveWithEdits={actOnApprovalWithEdits}
             onRetry={(id) => { void engine.retry(id).catch(error => setError(error instanceof Error ? error.message : 'Could not retry.')); }}
             onDiscard={(id) => engine.discard(id)}
             // Suggested answers stay tappable only while the question is the
@@ -748,7 +765,7 @@ function approvalFieldLabel(name: string): string {
 
 function MessageRow({
   message, speaker, sessionId, busy, onExecutePlan, onRevisePlan, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
-  approvalActing, approvalDecided, onApprovalAction,
+  approvalActing, approvalDecided, onApprovalAction, onApproveWithEdits,
   onDelegatedStateChange, onDelegatedChanged, onAnswer, onConnectionContinue,
 }: {
   message: ChatMessage;
@@ -766,6 +783,8 @@ function MessageRow({
   approvalActing: string | null;
   approvalDecided: boolean;
   onApprovalAction: (approvalId: string, decision: 'approve' | 'reject') => void;
+  /** Edit by hand on a queued card: send exactly the retyped field. */
+  onApproveWithEdits?: (approvalId: string, fields: Record<string, string>) => void;
   onDelegatedStateChange: (
     sourceUserSeq: number,
     state: 'running' | 'cancelling' | 'stopped',
@@ -776,6 +795,8 @@ function MessageRow({
   onAnswer?: (text: string) => void;
   onConnectionContinue?: ConnectionContinuation;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [editedValue, setEditedValue] = useState('');
   if (message.role === 'user') {
     return (
       <div class={`turn turn-user${message.pending ? ` pending pending-${message.pending}` : ''}`}>
@@ -828,6 +849,11 @@ function MessageRow({
     // Clem's own question, when her checker wrote one: the card reads like a
     // question card — her words, why, the exact content, answers to tap.
     const ask = message.approval.preview?.ask && !message.approval.preview.items ? message.approval.preview.ask : null;
+    // Edit by hand: the longest field the card shows, on a queued card only
+    // (the phone's approve endpoint edits the queued record behind the card).
+    const editableField = message.approval.queued && message.approval.preview && !message.approval.preview.items
+      ? [...message.approval.preview.fields].filter((f) => !f.label).sort((a, b) => b.value.length - a.value.length)[0] ?? null
+      : null;
     return (
       <div class={`turn turn-approval${ask ? ' is-voiced' : ''}`}>
         {ask ? (
@@ -855,7 +881,29 @@ function MessageRow({
           </div>
         ) : null}
         {ask && message.approval.preview && message.approval.preview.fields.length > 0 ? (
-          <div class="approval-exact-label">Exactly what happens</div>
+          <div class="approval-exact-row">
+            <div class="approval-exact-label">Exactly what happens</div>
+            {editableField && !approvalDecided && !editing && onApproveWithEdits ? (
+              <button type="button" class="approval-edit-link" onClick={() => { setEditedValue(editableField.value); setEditing(true); }}>Edit by hand</button>
+            ) : null}
+          </div>
+        ) : null}
+        {editing && editableField && !approvalDecided ? (
+          // The field becomes the content; "Yes, send this one" sends exactly
+          // what was typed, checked the same way first (owner-approved design).
+          <div class="approval-edit">
+            <label class="approval-edit-label" for={`edit-${approvalId}`}>{approvalFieldLabel(editableField.name)}</label>
+            <textarea id={`edit-${approvalId}`} class="approval-edit-field" rows={3} value={editedValue}
+              onInput={(e) => setEditedValue((e.currentTarget as HTMLTextAreaElement).value)} />
+            <div class="answer-choices" role="group" aria-label="Your answer">
+              <button type="button" class="answer-choice" disabled={approvalActing !== null || !editedValue.trim() || editedValue === editableField.value}
+                onClick={() => { onApproveWithEdits?.(approvalId!, { [editableField.name]: editedValue }); }}>
+                {approvalActing === approvalId ? '…' : 'Yes, send this one'}
+              </button>
+              <button type="button" class="answer-choice" disabled={approvalActing !== null} onClick={() => setEditing(false)}>Keep the original</button>
+            </div>
+            <div class="approval-check-hint">Exactly what you typed goes out, checked the same way first.</div>
+          </div>
         ) : null}
         {message.approval.preview && !message.approval.preview.items && message.approval.preview.fields.length > 0 ? (
           // What approving would actually send, from the host's frozen call.

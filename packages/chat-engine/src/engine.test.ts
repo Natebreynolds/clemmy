@@ -770,9 +770,26 @@ test('a card that revises an earlier one carries the owner\'s words and the fiel
     revises: { approvalId: 'apr-old', changeRequest: 'Yes, but make it shorter.', fields: [{ name: 'markdown_text', value: 'Could you run the 4:15 review on your own today? I am heads-down until 5.' }] },
   }));
   const card = engine.snapshot().messages.find((m) => m.approval?.approvalId === 'apr-new');
+  assert.equal(card?.approval?.queued, undefined, 'a work_call card is not a queued one');
   assert.deepEqual(card?.approval?.revises, {
     approvalId: 'apr-old', changeRequest: 'Yes, but make it shorter.',
     fields: [{ name: 'markdown_text', value: 'Could you run the 4:15 review on your own today? I am heads-down until 5.' }],
   });
+  engine.dispose();
+});
+
+test('a card that links a queued exact payload says so, so a surface can offer edit by hand', async () => {
+  const transport = new FakeTransport();
+  const engine = new ChatEngine({
+    transport,
+    api: { send: async () => ({ sessionId: 's-queued', accepted: true }), loadSession: async () => ({ events: [], latestSeq: 0 }) },
+  });
+  await engine.send('Run ssh -G localhost');
+  await wait(10);
+  transport.live!.onEvent(ev(2, 'approval_requested', {
+    approvalId: 'apr-q', subject: 'Run ssh -G localhost', pendingActionId: 'pa-1',
+    preview: { operation: 'run_shell_command', fields: [{ name: 'command', value: 'ssh -G localhost' }], ask: 'OK to run it?' },
+  }));
+  assert.equal(engine.snapshot().messages.find((m) => m.approval?.approvalId === 'apr-q')?.approval?.queued, true);
   engine.dispose();
 });

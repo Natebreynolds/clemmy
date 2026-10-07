@@ -418,6 +418,15 @@ export async function approveApproval(id: string, modifiedArgs?: string): Promis
     method: 'POST',
   });
 }
+/** Edit by hand on a queued card: the retyped fields land on the record
+ * behind the card and the edited record runs (owner-approved design, 2026-10-07). */
+export async function approveApprovalWithFields(id: string, modifiedFields: Record<string, string>): Promise<unknown> {
+  return api(`/m/api/approvals/${encodeURIComponent(id)}/approve`, {
+    method: 'POST',
+    body: JSON.stringify({ modifiedFields }),
+    headers: { 'content-type': 'application/json' },
+  });
+}
 export async function rejectApproval(id: string, note?: string): Promise<unknown> {
   return api(`/m/api/approvals/${encodeURIComponent(id)}/reject`, {
     method: 'POST',
