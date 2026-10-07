@@ -168,8 +168,13 @@ setTimeout(()=>{},30000);
   const originalRoot = process.env.SystemRoot;
   let pids: number[] = [];
   try {
+    // The test process spawns synchronously with the real environment; only
+    // the cleanup utility, resolved at the timeout, must be missing. A bogus
+    // SystemRoot in the child's own environment makes Windows fail the child
+    // at start instead (run 37656675446: exited in 313 ms, no timeout).
+    const pending = gitLib.runTestCommand(`"${process.execPath}" "${fixture}"`, project, 3000);
     process.env.SystemRoot = path.join(home, 'missing-system-root');
-    const result = await gitLib.runTestCommand(`"${process.execPath}" "${fixture}"`, project, 3000);
+    const result = await pending;
     assert.equal(result.timedOut, true);
     assert.equal(result.timeoutCleanup, 'incomplete');
     assert.equal(result.exitCode, null);

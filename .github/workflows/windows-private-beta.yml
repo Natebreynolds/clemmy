@@ -104,6 +104,14 @@ jobs:
           # modules ("Get-Acl … module could not be loaded", run 37654466246).
           # Give the test processes the 5.1 defaults a user's machine has.
           $env:PSModulePath = "$env:ProgramFiles\WindowsPowerShell\Modules;$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules"
+          # Every step here runs pwsh 7, so the first Windows PowerShell 5.1
+          # start on a fresh image pays .NET Framework native-image generation
+          # (run 37656675446: the app-launch fixture hit its 15 s bound). One
+          # warm start first, so the fixture measures the launch, not the image.
+          $warm = [Diagnostics.Stopwatch]::StartNew()
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
+          if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell 5.1 warm start failed ($LASTEXITCODE)" }
+          Write-Host "Windows PowerShell 5.1 warm start: $([int]$warm.Elapsed.TotalMilliseconds) ms"
           $tests = @(
             'src/runtime/windows-readiness.test.ts',
             'src/runtime/windows-private-filesystem.test.ts',

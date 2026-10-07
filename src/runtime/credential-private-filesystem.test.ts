@@ -76,7 +76,13 @@ test('symlink, hardlink and directory credential entries cannot enter read or pu
 test('path replacement during current ACL observation refuses stale handle bytes', () => fixture(root => {
   const target = path.join(root, 'vault.json'); writeFileSync(target, '{"grant":"old"}'); let replaced = false;
   const policy = createCredentialFilePolicy({ platform: 'win32', checkAcl: (file, _identity, kind) => {
-    if (kind === 'file' && !replaced) { replaced = true; const other = path.join(root, 'replacement.json'); writeFileSync(other, '{"grant":"new"}'); renameSync(other, file); }
+    if (kind === 'file' && !replaced) {
+      replaced = true; const other = path.join(root, 'replacement.json'); writeFileSync(other, '{"grant":"new"}');
+      // Windows refuses to rename over a name whose file the policy holds open,
+      // but lets the open file itself move aside: the same path swap the policy
+      // must notice, on every platform (run 37656675446 saw EPERM on the one-step rename).
+      renameSync(file, path.join(root, 'moved-aside.json')); renameSync(other, file);
+    }
   } });
   assert.throws(() => policy.readCredentialFileSync(target), CredentialStoragePrivacyError);
   assert.equal(readFileSync(target, 'utf8'), '{"grant":"new"}', 'refusal does not delete a replacement entry');

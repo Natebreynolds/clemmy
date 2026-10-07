@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { stopWindowsProcessTree } from './windows-process-tree.js';
 
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-conversion-process-café-'));
 process.env.CLEMENTINE_HOME = home;
@@ -96,9 +97,13 @@ test('actual Windows converter timeout stops its descendant before returning and
 test('actual Windows missing OS cleanup utility returns bounded failure and blocks a fresh conversion', { skip: process.platform !== 'win32' }, async () => {
   const { runMarkitdownProcess } = await freshRunner();
   const start = performance.now();
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'systemroot'));
-  env.SystemRoot = path.join(home, 'missing-system-root');
-  const result = await runMarkitdownProcess(command('setInterval(()=>{},1000)', 300, env));
+  // Only the cleanup utility is missing; the converter process itself keeps a
+  // real environment (a bogus SystemRoot there makes Windows fail the child at
+  // start, before any timeout: run 37656675446).
+  const utilityEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'systemroot'));
+  utilityEnv.SystemRoot = path.join(home, 'missing-system-root');
+  const result = await runMarkitdownProcess(command('setInterval(()=>{},1000)', 300),
+    { stopProcessTree: child => stopWindowsProcessTree(child, { env: utilityEnv }) });
   assert.equal(result.ok, false);
   assert.equal(result.cleanupIncomplete, true);
   if (!result.ok) assert.match(result.error, /restart Clementine before retrying/);
