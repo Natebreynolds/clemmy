@@ -1899,6 +1899,7 @@ function parseDurableInitialPlanningCard(input: {
       // again at revalidation and at dispatch, never here.
       const durable = peekCapabilityManifestStore()?.get(descriptor.id);
       if (durable && durable.digest === descriptor.manifestDigest && durable.manifest.lifecycle?.state === 'current') continue;
+      if (durableCardRowReattestedAsSameOperation(descriptor.id, descriptor.manifestDigest, descriptor.effect)) continue;
       return {
         ok: false,
         reason: `durable initial planning card capability drifted: ${descriptor.id} (no current row)`,
@@ -1917,6 +1918,7 @@ function parseDurableInitialPlanningCard(input: {
   // never rewrite the model surface that was already admitted.
   for (const entry of exactWithheld) {
     const current = input.currentById.get(entry.id);
+    if (!current && durableCardRowReattestedAsSameOperation(entry.id, null, entry.effect)) continue;
     if (!current || current.effect !== entry.effect) {
       return {
         ok: false,
@@ -1935,6 +1937,50 @@ function parseDurableInitialPlanningCard(input: {
       cardDigest: row.cardDigest,
     }),
   };
+}
+
+/** A card row whose manifest the provider re-versioned under it is still the
+ * capability the card admitted. Providers stamp definitions by date: a
+ * re-fetch between a card's pause and its resume supersedes the row's
+ * manifest under a successor `<id>:definition:<fp>` while the card's digest
+ * still names the predecessor, and dispatch already resolves that explicit
+ * successor chain. Identity here is the operation, its provider kind, the
+ * account it operates in, its effect and its destination contract; schema and
+ * version drift are the successor's to validate at dispatch. Live
+ * 2026-10-06: a typed "Yes, delete it." on a paused card failed in 3 s as
+ * "capability drifted … (no current row)" for a create-reminder row the
+ * resumed delete never used. Zero model calls. */
+function durableCardRowReattestedAsSameOperation(
+  id: string,
+  attestedDigest: string | null,
+  effect: HostCapabilityDescriptorV1['effect'],
+): boolean {
+  const store = peekCapabilityManifestStore();
+  if (!store) return false;
+  const predecessor = store.get(id);
+  if (!predecessor || predecessor.manifest.lifecycle?.state !== 'superseded') return false;
+  if (attestedDigest !== null) {
+    // The card's digest names the manifest as it was CURRENT; the store
+    // re-digests a row when it supersedes it. Prove the card attested exactly
+    // this manifest before trusting its successor.
+    let asCurrent: string;
+    try {
+      asCurrent = capabilityManifestDigest({ ...predecessor.manifest, lifecycle: { state: 'current' } });
+    } catch {
+      return false;
+    }
+    if (asCurrent !== attestedDigest) return false;
+  }
+  const successor = resolveCurrentSuccessorManifest(store, id);
+  if (!successor || successor.manifest.manifestId === id) return false;
+  const before = predecessor.manifest;
+  const after = successor.manifest;
+  return before.operationId === after.operationId
+    && before.providerKind === after.providerKind
+    && before.accountId === after.accountId
+    && before.effect === after.effect
+    && after.effect === effect
+    && JSON.stringify(before.destination ?? null) === JSON.stringify(after.destination ?? null);
 }
 
 const PLANNING_DESCRIPTOR_IDENTITY_FIELDS = [

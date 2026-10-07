@@ -25,6 +25,7 @@ writeFileSync(path.join(TEST_HOME, 'state', 'machine-id'), 'machine-primary-card
 const eventlog = await import('../harness/eventlog.js');
 const catalogs = await import('../harness/host-capability-catalog-factory.js');
 const manifests = await import('../harness/capability-manifest.js');
+const manifestStores = await import('../harness/capability-manifest-store.js');
 const continuityStore = await import('../../memory/task-continuity.js');
 const continuityRuntime = await import('../harness/task-continuity-runtime.js');
 const semantic = await import('./admit-and-compile-accepted-source.js');
@@ -38,16 +39,22 @@ function registerRead(input: {
   slug: string;
   purpose: string;
   fingerprint?: string;
+  manifestId?: string;
+  operationVersion?: string;
+  /** The durable manifest store accepts an external definition only from a
+   * composio / native_mcp provider; the re-version pins install the fixture
+   * manifest into that store, so they register as composio. */
+  providerKind?: 'reviewed_cli' | 'composio';
 }) {
   const fingerprint = input.fingerprint ?? sha256(`definition:${input.slug}`);
   const manifest = manifests.attachSemanticContract({
     version: 1,
-    manifestId: `cap:resolved:${input.slug.toLowerCase()}`,
-    providerKind: 'reviewed_cli',
+    manifestId: input.manifestId ?? `cap:resolved:${input.slug.toLowerCase()}`,
+    providerKind: input.providerKind ?? 'reviewed_cli',
     operationId: input.slug,
     providerIdentity: `/usr/bin/${input.slug.toLowerCase()}`,
     providerVersion: '1',
-    operationVersion: '1',
+    operationVersion: input.operationVersion ?? '1',
     definitionFingerprint: fingerprint,
     externalDefinition: { version: 1, providerInputSchemaDigest: sha256(`input:${input.slug}`),
       providerOutputSchemaObserved: true, providerOutputSchemaDigest: sha256(`output:${input.slug}`),
@@ -87,11 +94,11 @@ function discloseRegisteredRead(source: { sessionId: string; seq: number; turn: 
   eventlog.appendEvent({ sessionId: source.sessionId, turn: source.turn, role: 'system', type: 'capability_discovered',
     data: { sourceUserSeq: source.seq, capabilities: [{ identifier: entry.toolName, capabilityRef: entry.capabilityId,
       providerKind: entry.providerKind, accountIdentity: descriptor.accountScope, manifestDigest: descriptor.manifestDigest,
-      descriptor, effectClass: 'read', providerDefinition: { version: 1,
-        providerInputSchemaDigest: entry.manifest.externalDefinition!.providerInputSchemaDigest,
-        providerOutputSchemaDigest: entry.manifest.externalDefinition!.providerOutputSchemaDigest,
+      descriptor, effectClass: 'read', ...(entry.manifest.externalDefinition ? { providerDefinition: { version: 1,
+        providerInputSchemaDigest: entry.manifest.externalDefinition.providerInputSchemaDigest,
+        providerOutputSchemaDigest: entry.manifest.externalDefinition.providerOutputSchemaDigest,
         definitionFingerprint: entry.manifest.definitionFingerprint, providerOperationVersion: entry.manifest.operationVersion,
-        invokePortId: entry.manifest.invokePortId, verificationContract: null, operationSemantics: entry.manifest.operationSemantics ?? null } }] } });
+        invokePortId: entry.manifest.invokePortId, verificationContract: null, operationSemantics: entry.manifest.operationSemantics ?? null } } : {}) }] } });
 }
 
 function freshSource(label: string, turn = 1) {
@@ -111,6 +118,7 @@ function freshSource(label: string, turn = 1) {
 
 function resetFixture() {
   eventlog.resetEventLog();
+  manifestStores.installCapabilityManifestStore(null);
   const factory = catalogs.createHostCapabilityCatalogFactory();
   catalogs.installHostCapabilityCatalogFactory(factory);
   return factory;
@@ -118,6 +126,7 @@ function resetFixture() {
 
 after(() => {
   catalogs.installHostCapabilityCatalogFactory(null);
+  manifestStores.installCapabilityManifestStore(null);
   eventlog.closeEventLog();
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
@@ -622,6 +631,80 @@ test('same-id advisory drift (purpose wording) reopens the stored card; only ide
   registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'look up the latest news for a topic' });
   const replay = await semantic.primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
   assert.equal(replay.ok, true, replay.ok ? '' : replay.reason);
+});
+
+// ─── A provider re-version between pause and resume is not drift ─────────────
+//
+// Live 2026-10-06: Composio stamps definitions by date. A card paused on an
+// approval named a create-reminder row; the tool_search in the same turn
+// re-attested that operation under a new definition fingerprint, so the
+// durable store superseded the card's manifest under `<id>:definition:<fp>`
+// and the resume ("Yes, delete it.") refused in 3 s as "capability drifted
+// … (no current row)" — for a row the resumed delete never used. Dispatch
+// already resolves the explicit successor chain; the reopen must read the
+// same identity (operation, provider, account, effect, destination) and
+// reopen the frozen card. A successor that is a DIFFERENT operation stays a
+// refusal.
+
+function reversionUnderSuccessor(
+  factory: ReturnType<typeof catalogs.createHostCapabilityCatalogFactory>,
+  store: ReturnType<typeof manifestStores.createCapabilityManifestStore>,
+  prior: ReturnType<typeof registerRead>,
+  successorSlug: string,
+) {
+  const successor = registerRead({
+    factory,
+    slug: successorSlug,
+    purpose: 'recent local LLM news research',
+    manifestId: `${prior.capabilityId}:definition:${sha256(`reversion:${successorSlug}`).slice(0, 24)}`,
+    operationVersion: '20261002_00',
+    fingerprint: sha256(`definition:${successorSlug}:20261002_00`),
+    providerKind: 'composio',
+  });
+  const superseded = store.supersede(prior.capabilityId, successor.manifest);
+  assert.equal(superseded.ok, true, superseded.ok ? '' : superseded.reason);
+  factory.forget(prior.capabilityId);
+  return successor;
+}
+
+test('a card row the provider re-versioned under a successor id reopens the frozen card', async () => {
+  const factory = resetFixture();
+  const store = manifestStores.createCapabilityManifestStore([], { durable: false });
+  manifestStores.installCapabilityManifestStore(store);
+  const prior = registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research', providerKind: 'composio' });
+  const installedPrior = store.install(prior.manifest);
+  assert.equal(installedPrior.ok, true, installedPrior.ok ? "" : installedPrior.reason);
+  const { session, source } = freshSource('reversion');
+  discloseRegisteredRead(source, prior);
+  const first = await semantic.primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.equal(first.ok, true, first.ok ? '' : first.reason);
+  assert.ok(first.ok && first.planning.capabilities.some((entry) => entry.id === prior.capabilityId));
+
+  reversionUnderSuccessor(factory, store, prior, 'NEWS_LOOKUP');
+
+  const replay = await semantic.primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.equal(replay.ok, true, replay.ok ? '' : replay.reason);
+  // The model keeps the card it was shown; dispatch follows the successor chain.
+  assert.ok(replay.ok && replay.planning.capabilities.some((entry) => entry.id === prior.capabilityId));
+});
+
+test('a successor that is a different operation is still card drift', async () => {
+  const factory = resetFixture();
+  const store = manifestStores.createCapabilityManifestStore([], { durable: false });
+  manifestStores.installCapabilityManifestStore(store);
+  const prior = registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research', providerKind: 'composio' });
+  const installedPrior = store.install(prior.manifest);
+  assert.equal(installedPrior.ok, true, installedPrior.ok ? "" : installedPrior.reason);
+  const { session, source } = freshSource('reversion-foreign');
+  discloseRegisteredRead(source, prior);
+  const first = await semantic.primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.equal(first.ok, true, first.ok ? '' : first.reason);
+
+  reversionUnderSuccessor(factory, store, prior, 'NEWS_ARCHIVE_LOOKUP');
+
+  const replay = await semantic.primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.equal(replay.ok, false);
+  if (!replay.ok) assert.match(replay.reason, /capability drifted: cap:resolved:news_lookup \(no current row\)/);
 });
 
 // ─── A continuation answer inherits its parent's disclosures ────────────────
