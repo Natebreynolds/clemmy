@@ -4325,7 +4325,7 @@ test('respondViaHarness: typed async dispatch returns a deterministic ACK withou
   });
   assert.equal(
     response.text,
-    'Started — I’ll post the result here when it’s ready.',
+    'Queued — waiting for the workflow to start. I’ll post the result here when it’s ready.',
   );
   assert.equal(response.stoppedReason, 'success', 'the synchronous provider request delivered its ACK');
   const publicDispatch = listEvents(sessionId, { types: ['async_work_dispatched'] })[0];
