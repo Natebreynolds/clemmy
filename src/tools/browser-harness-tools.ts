@@ -37,14 +37,17 @@ export function registerBrowserHarnessTools(server: McpServer): void {
     [
       'Install, update, or repair Browser Harness so browsing actually works — instead of telling the user to go and click in Settings.',
       'Call this when browser_harness_status reports a problem: not installed, an outdated version, or Chrome remote debugging not enabled.',
-      'action=update upgrades in place using the harness own updater, which also restarts the daemon — this is the fix when output says "update available".',
-      'action=install installs from scratch (it also pulls, but update is the right action for an existing install).',
+      process.platform === 'win32'
+        ? 'Windows uses a reviewed source revision. action=update refuses unreviewed upstream changes and preserves the checkout; explain that an updated revision needs review, and do not retry update. action=install installs that revision or repairs only the same clean checkout; it preserves different revisions and local edits.'
+        : 'action=update upgrades in place using the harness own updater, which also restarts the daemon — this is the fix when output says "update available". action=install installs from scratch (it also pulls, but update is the right action for an existing install).',
       'action=doctor runs the harness self-check and reports what it finds.',
       'action=chrome_debugging opens the page where the user enables Chrome remote debugging — the one step that genuinely needs them.',
-      'Requires approval: install runs a shell command that writes to the user machine.',
+      'Requires approval: install writes to the user machine.',
     ].join(' '),
     {
-      action: z.enum(['install', 'update', 'doctor', 'chrome_debugging']).describe('install = install/update/repair; doctor = self-check; chrome_debugging = open the Chrome setup page.'),
+      action: z.enum(['install', 'update', 'doctor', 'chrome_debugging']).describe(process.platform === 'win32'
+        ? 'install = install or repair the same clean reviewed Windows revision; update = reports the review requirement without changing the checkout; doctor = self-check; chrome_debugging = open the Chrome setup page.'
+        : 'install = install/update/repair; doctor = self-check; chrome_debugging = open the Chrome setup page.'),
       timeout_ms: z.number().min(10000).max(600000).optional().describe('How long to wait for an install. Default 300000 (5 min) — a cold install compiles Python deps.'),
     },
     async ({ action, timeout_ms }) => {

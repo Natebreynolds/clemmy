@@ -45,7 +45,7 @@ test('run_shell_command ships win32 danger/deny patterns, gated so darwin is unt
   const src = read('src/tools/computer-tools.ts');
   assert.match(src, /remove-item\\b/i, 'PowerShell Remove-Item is in the win32 danger set');
   assert.match(src, /vssadmin\\s\+delete\\b/, 'vssadmin delete is hard-denied on win32');
-  assert.match(src, /taskkill', \['\/pid'/, 'timeout kills the whole cmd.exe tree on win32');
+  assert.match(src, /await \(runtime\.stopTree \?\? stopWindowsProcessTree\)\(child\)/, 'timeout awaits the canonical cmd.exe tree cleanup receipt on win32');
   assert.match(src, /%USERPROFILE%/, 'USERPROFILE expands like $HOME');
   // Behavior: on darwin the win32 patterns are inert — the exact shapes that
   // would gate on Windows must not newly gate here.
@@ -61,9 +61,11 @@ test('run_shell_command ships win32 danger/deny patterns, gated so darwin is unt
   }
 });
 
-test('setup capability probe and browser-harness resolve commands via `where` on win32', () => {
+test('setup keeps Windows discovery and browser-harness uses the native filesystem resolver', () => {
   assert.match(read('src/setup/capability-status.ts'), /spawnSync\('where', \[command\]/);
-  assert.match(read('src/integrations/browser-harness.ts'), /spawnSync\('where', \[command\]/);
+  assert.match(read('src/integrations/browser-harness.ts'), /return findWindowsSetupExecutable\(command/,
+    'Windows setup resolves a literal native executable without evaluating a Unix shell');
+  assert.match(read('src/integrations/browser-harness-windows-setup.ts'), /export function findWindowsSetupExecutable/);
 });
 
 test('closing the last window keeps the app (and the daemon it owns) alive on win32', () => {
@@ -78,7 +80,8 @@ test('closing the last window keeps the app (and the daemon it owns) alive on wi
 test('graceful-degradation set: gh.exe resolution, Windows Chrome paths, file URLs, packaged detection', () => {
   assert.match(read('src/integrations/github-cli.ts'), /gh\.exe/);
   const produce = read('src/tools/document-produce-tools.ts');
-  assert.match(produce, /chrome\.exe/);
+  assert.match(read('src/integrations/windows-browser-paths.ts'), /chrome\.exe/);
+  assert.match(produce, /windowsChromiumCandidates/);
   assert.match(produce, /pathToFileURL\(htmlPath\)\.href/, 'no malformed file://C:\\ URLs');
   assert.match(read('src/runtime/build-info.ts'), /win-unpacked/, 'packaged win32 daemon self-identifies as packaged');
   assert.match(read('src/runtime/managed-cli-jobs.ts'), /ComSpec/, 'managed CLI jobs run through cmd.exe on win32');

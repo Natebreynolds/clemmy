@@ -98,6 +98,12 @@ export async function reviewCodingRunReceipt(
     roundsLeft ? { next: 'continue', verdict, reason, followUp } : { next: 'done', verdict, reason, followUp: null }
   );
 
+  if (receipt.test?.timeoutCleanup === 'incomplete') {
+    return {
+      next: 'done', verdict: 'fail', followUp: null,
+      reason: 'The tests timed out, and Windows could not confirm that all test processes stopped. Check and stop the remaining test processes before retrying this coding run.',
+    };
+  }
   if (testsFailed(receipt)) {
     const test = receipt.test!;
     const status = test.timedOut ? 'timed out' : `exited ${test.exitCode}`;

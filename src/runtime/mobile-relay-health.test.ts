@@ -10,7 +10,7 @@ import { probeMobileRelay } from './mobile-relay-health.js';
 const temporary = mkdtempSync(path.join(os.tmpdir(), 'clem-relay-health-'));
 process.env.CLEMENTINE_HOME = temporary;
 const { ensureMobileTlsIdentity } = await import('./mobile-tls.js');
-const identity = ensureMobileTlsIdentity({ stateDir: temporary });
+const identity = await ensureMobileTlsIdentity({ stateDir: temporary });
 test.after(() => rmSync(temporary, { recursive: true, force: true }));
 
 test('health verification pins the Mac before HTTP, sends no credentials and follows no redirects', async () => {

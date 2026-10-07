@@ -22,7 +22,9 @@ export function registerCapabilityTools(server: McpServer): void {
       'Returns availability, version, install path, and an install hint if missing.',
       'If the capability is missing, your draft_plan should either:',
       '  (a) include a `needsUserInput` question asking how to proceed (install? use a different approach? non-standard path?), OR',
-      '  (b) add a setup step that runs the install command if low-friction (e.g. brew install).',
+      process.platform === 'win32'
+        ? '  (b) use the returned reviewed Windows Connect/setup action; if automatic setup is unavailable, explain the official Windows installer step. Do not substitute a POSIX install command.'
+        : '  (b) add a setup step that runs the install command if low-friction (e.g. brew install).',
       'Results are cached for 5 minutes so repeated calls are cheap.',
     ].join(' '),
     {

@@ -41,6 +41,7 @@ export type ShellDispatchState =
 export type ShellEffectState = 'none' | 'possible' | 'committed';
 
 export type ShellExecutionErrorKind =
+  | 'process_cleanup_unconfirmed'
   | 'command_not_found'
   | 'permission_denied'
   | 'package_materialization_failed'
@@ -58,6 +59,8 @@ export interface ShellExecutionOutcome {
   errorKind?: ShellExecutionErrorKind;
   executable?: string;
   providerAdapterId?: string;
+  /** Exact host cleanup receipt after a Windows shell timeout. */
+  timeoutCleanup?: 'complete' | 'incomplete';
 }
 
 export interface ClassifyShellExecutionInput {

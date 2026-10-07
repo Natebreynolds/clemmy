@@ -6,10 +6,16 @@ import { getSecretStore } from '../runtime/secrets/index.js';
 import { invalidateCachedScan as invalidateCliScan, resolveSafeCliProbe } from '../runtime/cli-discovery.js';
 import { augmentPath } from '../runtime/spawn-env.js';
 import { observeBrowserConnection, type BrowserConnectionObservation } from './browser-operation.js';
+import { findBrowserHarnessPython } from './browser-python.js';
+import { windowsEnvValue } from './windows-browser-paths.js';
+import { findWindowsSetupExecutable, installBrowserHarnessOnWindows, openWindowsChromeDebuggingSetup, runWindowsSetupCommand,
+  WINDOWS_BROWSER_HARNESS_SOURCE, windowsBrowserHarnessEnv } from './browser-harness-windows-setup.js';
 
 export const BROWSER_HARNESS_REPO_URL = 'https://github.com/browser-use/browser-harness';
 export const BROWSER_HARNESS_DIR = path.join(os.homedir(), 'Developer', 'browser-harness');
-export const BROWSER_HARNESS_CODEX_SKILL_DIR = path.join(os.homedir(), '.codex', 'skills', 'browser-harness');
+export const BROWSER_HARNESS_CODEX_SKILL_DIR = process.platform === 'win32'
+  ? path.join(windowsEnvValue(process.env, 'CODEX_HOME') ?? path.join(os.homedir(), '.codex'), 'skills', 'browser-harness')
+  : path.join(os.homedir(), '.codex', 'skills', 'browser-harness');
 
 const MAX_OUTPUT_CHARS = 24000;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -65,6 +71,7 @@ function truncate(value: string): string {
 }
 
 function extraPath(): string {
+  if (process.platform === 'win32') return windowsBrowserHarnessEnv(process.env, os.homedir()).PATH ?? '';
   const additions = [
     path.join(os.homedir(), '.local', 'bin'),
     path.join(os.homedir(), '.cargo', 'bin'),
@@ -87,7 +94,7 @@ export const BROWSER_HARNESS_DOMAIN_SKILLS_DIR = path.join(
 
 export function browserHarnessEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
-    ...process.env,
+    ...(process.platform === 'win32' ? windowsBrowserHarnessEnv(process.env, os.homedir()) : process.env),
     PATH: extraPath(),
     // ON by default. The harness ships this off because a stranger's playbook
     // is an unknown instruction source — but Clementine's own domain skills are
@@ -159,15 +166,11 @@ function runShell(command: string, options: {
 }
 
 function commandPath(command: string): string | undefined {
-  const result = process.platform === 'win32'
-    ? spawnSync('where', [command], {
-        encoding: 'utf-8',
-        env: browserHarnessEnv(),
-        timeout: 2_000,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-      })
-    : spawnSync('/bin/sh', ['-lc', `command -v ${command}`], {
+  if (process.platform === 'win32') {
+    if (!['git', 'uv', 'browser-harness', 'python'].includes(command)) return undefined;
+    return findWindowsSetupExecutable(command as 'git' | 'uv' | 'browser-harness' | 'python', browserHarnessEnv(), os.homedir());
+  }
+  const result = spawnSync('/bin/sh', ['-lc', `command -v ${command}`], {
         encoding: 'utf-8',
         env: browserHarnessEnv(),
         timeout: 1_000,
@@ -201,6 +204,10 @@ function prerequisite(name: string, versionArgs: string[] = ['--version']): Brow
 }
 
 export function browserHarnessInstallCommand(): string {
+  if (process.platform === 'win32') {
+    const source = WINDOWS_BROWSER_HARNESS_SOURCE;
+    return `Install the reviewed Browser Harness ${source.version} Windows backend using Git for Windows and uv with Python ${source.python}. Existing different or dirty checkouts are preserved. Chrome permission and connection still require verification.`;
+  }
   return [
     'set -e',
     'GIT_BINARY=""',
@@ -239,7 +246,7 @@ export async function getBrowserHarnessStatus(): Promise<BrowserHarnessStatus> {
     codexSkillLinked = false;
   }
   return {
-    installed: Boolean(command),
+    installed: Boolean(command && (process.platform !== 'win32' || findBrowserHarnessPython({ env: browserHarnessEnv() }))),
     connection: await observeBrowserConnection(),
     commandPath: safeCommand?.path ?? command,
     version: safeCommand && !safeCommand.skipped ? commandVersion(safeCommand.command, ['--version']) : undefined,
@@ -249,7 +256,9 @@ export async function getBrowserHarnessStatus(): Promise<BrowserHarnessStatus> {
     prerequisites: [
       prerequisite('git', ['--version']),
       prerequisite('uv', ['--version']),
-      prerequisite('python3', ['--version']),
+      // uv selects/manages the pinned Python environment on Windows; a separate
+      // python3 PATH entry is neither necessary nor its interpreter authority.
+      ...(process.platform === 'win32' ? [] : [prerequisite('python3', ['--version'])]),
     ],
     browserUseCloudKeyPresent: Boolean(cloudKey.value),
     chromeSetupUrl: 'chrome://inspect/#remote-debugging',
@@ -271,6 +280,26 @@ export function startBrowserHarnessInstall(): InstallJob {
     startedAt: new Date().toISOString(),
   };
   jobs.set(id, job);
+
+  if (process.platform === 'win32') {
+    const env = browserHarnessEnv();
+    const git = findWindowsSetupExecutable('git', env, os.homedir());
+    const uv = findWindowsSetupExecutable('uv', env, os.homedir());
+    if (!git || !uv) {
+      job.status = 'failed'; job.exitCode = 2; job.completedAt = new Date().toISOString();
+      job.output = 'Windows Browser Harness setup requires Git for Windows and uv. Install missing prerequisites from https://git-scm.com/download/win and https://docs.astral.sh/uv/getting-started/installation/, then retry.';
+      return job;
+    }
+    void installBrowserHarnessOnWindows({ git, uv, home: os.homedir(), env,
+      onOutput: value => { job.output = truncate(job.output + value); },
+    }).then(receipt => {
+      job.status = receipt.ok ? 'succeeded' : 'failed'; job.exitCode = receipt.code; job.completedAt = new Date().toISOString();
+      job.output = truncate(receipt.output); if (receipt.ok) invalidateCliScan();
+    }).catch(error => {
+      job.status = 'failed'; job.exitCode = -1; job.completedAt = new Date().toISOString(); job.output = truncate(String(error));
+    });
+    return job;
+  }
 
   const shell = shellCommand(command);
   const child = spawn(shell.command, shell.args, {
@@ -303,10 +332,13 @@ export function getInstallJob(id: string): InstallJob | undefined {
   return jobs.get(id);
 }
 
-export function validateInstallCommand(command: string): { ok: true; normalized: string } | { ok: false; error: string } {
+export function validateInstallCommand(command: string, platform: NodeJS.Platform = process.platform): { ok: true; normalized: string } | { ok: false; error: string } {
   const normalized = command.replace(/\s+/g, ' ').trim();
   if (!normalized) return { ok: false, error: 'command required' };
   const lower = normalized.toLowerCase();
+  if (platform === 'win32' && /^brew\s/i.test(normalized)) {
+    return { ok: false, error: 'Homebrew is not a Windows installer. Use the catalog Windows recipe or the application official Windows installer. For GitHub CLI, use: winget install --id GitHub.cli --exact --source winget --disable-interactivity.' };
+  }
   const denied = [
     /\bsudo\b/,
     /\brm\b/,
@@ -321,6 +353,7 @@ export function validateInstallCommand(command: string): { ok: true; normalized:
     return { ok: false, error: 'Only single, non-destructive install commands are allowed here.' };
   }
   const allowed = [
+    ...(platform === 'win32' ? [/^winget install --id GitHub\.cli --exact --source winget --disable-interactivity$/i] : []),
     /^npm (install|i) (-g|--global) [@a-z0-9._/-]+$/i,
     // brew install [--cask] <formula>  — cask flag is standard for
     // GUI / macOS-bundle packages like google-cloud-sdk.
@@ -430,6 +463,11 @@ export function startApprovedInstallCommand(command: string, title = 'Install ca
 }
 
 export async function runBrowserHarnessDoctor(): Promise<CommandResult> {
+  if (process.platform === 'win32') {
+    const executable = findWindowsSetupExecutable('browser-harness', browserHarnessEnv(), os.homedir());
+    if (!executable) return { ok: false, command: 'browser-harness --doctor', code: 1, stdout: '', stderr: 'The Browser Harness executable is missing. Install the reviewed Windows backend first.', output: 'The Browser Harness executable is missing. Install the reviewed Windows backend first.' };
+    return runWindowsSetupCommand({ executable, args: ['--doctor'], cwd: os.homedir(), timeoutMs: 20_000, env: browserHarnessEnv() });
+  }
   return runShell('browser-harness --doctor', { timeoutMs: 20_000 });
 }
 
@@ -443,6 +481,10 @@ export async function runBrowserHarnessDoctor(): Promise<CommandResult> {
  * detects a new version; running what it asked for is the whole point.
  */
 export async function runBrowserHarnessUpdate(): Promise<CommandResult> {
+  if (process.platform === 'win32') {
+    const output = `Automatic upstream updates are disabled for the reviewed Windows backend (${WINDOWS_BROWSER_HARNESS_SOURCE.tag}, ${WINDOWS_BROWSER_HARNESS_SOURCE.revision}). The existing checkout was preserved. A newer source must be reviewed before updating; action=install can repair only the same clean reviewed checkout.`;
+    return { ok: false, command: 'Reviewed Windows Browser Harness update', code: 1, stdout: '', stderr: output, output };
+  }
   // MACOS WILL BREAK THIS UPDATE UNLESS WE CLEAR ITS OWN LITTER FIRST.
   // The harness refuses to update when the checkout is dirty, and upstream has
   // no .gitignore entry for .DS_Store — which Finder creates the instant anyone
@@ -498,6 +540,7 @@ export async function runBrowserHarnessSmokeTest(): Promise<CommandResult> {
 }
 
 export async function openChromeRemoteDebuggingSetup(): Promise<CommandResult> {
+  if (process.platform === 'win32') return openWindowsChromeDebuggingSetup();
   if (process.platform === 'darwin') {
     return runShell(`osascript -e 'tell application "Google Chrome" to activate' -e 'tell application "Google Chrome" to open location "chrome://inspect/#remote-debugging"'`, { timeoutMs: 5_000 });
   }
@@ -632,7 +675,7 @@ export function browserHarnessNextAction(status: BrowserHarnessStatus): string |
   if (missing.length) {
     return `Missing prerequisite${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}. `
       + 'These must be installed on the machine first — browser_harness_setup cannot install them. '
-      + 'Tell the user exactly which one is missing and how to get it (uv: https://docs.astral.sh/uv/, git: Xcode Command Line Tools).';
+      + `Tell the user exactly which one is missing and how to get it (uv: https://docs.astral.sh/uv/, git: ${process.platform === 'win32' ? 'https://git-scm.com/download/win' : 'Xcode Command Line Tools'}).`;
   }
   if (!status.installed) {
     return 'Browser Harness is not installed. Call browser_harness_setup with action=install.';

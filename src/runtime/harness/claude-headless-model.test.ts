@@ -419,7 +419,7 @@ test('claudeHeadlessCliAvailable: test override forces the value; null restores 
 test('resolveClaudeCliPath: finds a `claude` binary on the (augmented) PATH', () => {
   setClaudeHeadlessCliAvailableForTest(null);
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-claude-bin-'));
-  const claudeBin = path.join(binDir, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+  const claudeBin = path.join(binDir, process.platform === 'win32' ? 'claude.exe' : 'claude');
   writeFileSync(claudeBin, '#!/bin/sh\necho stub', { mode: 0o755 });
   const prevPath = process.env.PATH;
   const prevOverride = process.env.CLAUDE_CLI_PATH;

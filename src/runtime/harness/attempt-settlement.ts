@@ -253,7 +253,17 @@ export function attemptSignalsFromShellExecutionOutcome(
   shell: ShellExecutionOutcome | undefined,
 ): AttemptSignals {
   if (!shell) return {};
+  if (shell.errorKind === 'process_cleanup_unconfirmed' && shell.dispatch === 'not_started' && shell.effect === 'none') {
+    return { preDispatch: true, executionFailed: true, mutating: shell.externalMutation };
+  }
   if (shell.errorKind === 'timeout') {
+    if (shell.timeoutCleanup === 'incomplete') {
+      // A native cleanup failure is not a transient transport failure. Keep
+      // uncertain external effects uncertain; local failures authorize no
+      // automatic retry while the previous process may still be running.
+      return { executionFailed: true, mutating: shell.externalMutation,
+        ...(shell.externalMutation ? { acknowledged: false } : {}) };
+    }
     return {
       errorName: 'TimeoutError',
       mutating: shell.externalMutation,

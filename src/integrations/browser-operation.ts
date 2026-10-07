@@ -3,9 +3,9 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
 import { parseBrowserOperationArguments, type BrowserOperationName } from '../tools/browser-operation-contract.js';
 import { browserBackendOffered, LOCAL_BROWSER_NOT_OFFERED } from '../tools/browser-backend.js';
+import { findBrowserHarnessPython } from './browser-python.js';
 
 export interface BrowserProcessResult { code: number | null; stdout: string; stderr: string; termination?: 'timeout' | 'cancelled'; dispatched?: boolean; }
 export type BrowserOperationRunner = (code: string, sessionName: string, signal?: AbortSignal) => Promise<BrowserProcessResult>;
@@ -31,21 +31,6 @@ function browserProfile(): string {
   return path.join(os.homedir(), '.config/google-chrome');
 }
 
-/** Resolve the installed CLI's exact venv interpreter, without executing its
- * run.py prelude, helpers, learned Python, update check, or self-healing daemon. */
-function browserPython(): string | null {
-  const directories = [path.join(os.homedir(), '.local/bin'), ...(process.env.PATH ?? '').split(path.delimiter)];
-  for (const directory of directories) {
-    const command = path.join(directory, 'browser-harness');
-    try {
-      const firstLine = readFileSync(command, 'utf8').split('\n')[0]!;
-      const interpreter = firstLine.match(/^#!(\/[^\r\n]+\/python(?:[0-9.]+)?)$/)?.[1];
-      if (interpreter && existsSync(interpreter)) return interpreter;
-    } catch { /* Try the next installed CLI path. */ }
-  }
-  return null;
-}
-
 export function browserOperationScript(operation: BrowserOperationName, args: Record<string, unknown>): string {
   const payload = Buffer.from(JSON.stringify({ operation, ...args, chrome_profile: browserProfile() })).toString('base64');
   return `import asyncio, base64, json, os, re, sys, time, hashlib
@@ -53,7 +38,7 @@ from pathlib import Path
 import cdp_use.client as cdp_client
 from cdp_use.client import CDPClient
 from websockets.asyncio.client import connect as WebSocketConnection
-sys.stdout.reconfigure(errors='backslashreplace')
+sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
 p = json.loads(base64.b64decode('${payload}'))
 profile = p.pop('chrome_profile')
 browser_id = None
@@ -98,7 +83,7 @@ async def main():
     try:
       await asyncio.wait_for(client.start(), timeout=15)
     except asyncio.TimeoutError:
-      raise RuntimeError('Chrome did not accept the connection. It may be asking on the Mac to allow remote debugging: allow it in Chrome, then try again.')
+      raise RuntimeError('Chrome did not accept the connection. It may be asking to allow remote debugging: allow it in Chrome, then try again.')
     op = p['operation']
     if op == 'browser_tabs':
         pages = [t for t in (await cdp('Target.getTargets'))['targetInfos'] if t.get('type') == 'page']
@@ -154,7 +139,7 @@ asyncio.run(main())
  * helper loading, Chrome/profile fallback, auto-repair, or mutation replay. */
 export const runBrowserOperationProcess: BrowserOperationRunner = (code, _sessionName, signal) => new Promise((resolve) => {
   if (signal?.aborted) { resolve({ code: null, stdout: '', stderr: 'Cancelled before dispatch', termination: 'cancelled', dispatched: false }); return; }
-  const python = browserPython();
+  const python = findBrowserHarnessPython();
   if (!python) { resolve({ code: -1, stdout: '', stderr: 'Browser Harness venv interpreter is unavailable; install/repair the backend.', dispatched: false }); return; }
   // -I ignores PYTHONPATH/user site and the fixed script imports no browser helpers.
   const env = { ...process.env };
@@ -162,7 +147,7 @@ export const runBrowserOperationProcess: BrowserOperationRunner = (code, _sessio
   // browser traffic to a remote relay.
   for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'WS_PROXY', 'WSS_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'ws_proxy', 'wss_proxy']) delete env[key];
   env.NO_PROXY = '*'; env.no_proxy = '*';
-  const child = spawn(python, ['-I', '-'], { env, stdio: ['pipe','pipe','pipe'], detached: process.platform !== 'win32' });
+  const child = spawn(python, ['-I', '-'], { env, stdio: ['pipe','pipe','pipe'], detached: process.platform !== 'win32', windowsHide: true });
   let stdout = '', stderr = '', termination: BrowserProcessResult['termination'];
   let escalation: ReturnType<typeof setTimeout> | undefined;
   const kill = (reason: 'timeout' | 'cancelled') => {

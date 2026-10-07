@@ -1,4 +1,5 @@
 import { withSessionMemoryScope } from '../memory/memory-scope.js';
+import { renderHostExecutionContext } from '../runtime/host-execution-context.js';
 import { delegatedWorkPointers } from '../projects/delegated-work-pointers.js';
 import { proactiveOfferContextForTurn } from '../runtime/proactive-offers.js';
 /**
@@ -705,7 +706,7 @@ export function harnessInstructions(roleInstructions: string, opts?: {
   }, loaded);
   const ctx = variable.text;
   const agentInstructions = opts?.agentInstructions?.trim() ?? '';
-  const stableRole = [roleInstructions, agentInstructions].filter(Boolean).join('\n\n');
+  const stableRole = [roleInstructions, agentInstructions, renderHostExecutionContext()].filter(Boolean).join('\n\n');
   const stablePrefix = core.text ? `${stableRole}${CACHE_MEMORY_CORE_DELIM}${core.text}` : stableRole;
   const volatileInstructions = opts?.volatileInstructions?.trim() ?? '';
   const volatileMemoryInstructions = opts?.volatileMemoryInstructions?.trim() ?? '';

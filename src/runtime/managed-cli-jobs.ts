@@ -8,6 +8,9 @@ import { getToolOutputContext } from './harness/tool-output-context.js';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { invalidateCachedScan as invalidateCliScan, findSafeCliCommand } from './cli-discovery.js';
+import { stopWindowsProcessTree, type ProcessTreeStopResult } from './windows-process-tree.js';
+import { WINDOWS_GITHUB_INSTALL } from '../integrations/cli-catalog/platform-install.js';
+import { spawnCliProcess } from './cli-spawn.js';
 
 export type ManagedCliKind = 'composio' | 'github';
 export type ManagedCliAction = 'install' | 'auth' | 'repair';
@@ -35,10 +38,15 @@ export interface ManagedCliJob {
 const jobs = new Map<string, ManagedCliJob>();
 const processes = new Map<string, ChildProcess>();
 const privateInputs = new Map<string, string[]>();
+const unconfirmedStops = new Set<string>();
+const stoppingKinds = new Map<string, number>();
 const jobDirectory = path.join(BASE_DIR, 'state', 'cli-jobs');
 const bootId = randomUUID();
-let spawnCli = spawn;
-export function _testOnly_setCliSpawn(value?: typeof spawn): void { spawnCli = value ?? spawn; }
+// cross-spawn escapes Windows batch argv and resolves npm .cmd shims. Native
+// Node spawn cannot execute those files with shell:false. POSIX stays native.
+const defaultCliSpawn = spawnCliProcess;
+let spawnCli = defaultCliSpawn;
+export function _testOnly_setCliSpawn(value?: typeof spawn): void { spawnCli = value ?? defaultCliSpawn; }
 let resolveCli = findSafeCliCommand;
 export function _testOnly_setCliResolver(value?: typeof findSafeCliCommand): void { resolveCli = value ?? findSafeCliCommand; }
 
@@ -73,14 +81,32 @@ function persistUpdate(job: ManagedCliJob): void {
   }
 }
 
-function stopProcess(child: ChildProcess, interactive = false): void {
-  if (!child.pid) return;
+async function stopProcess(child: ChildProcess, interactive = false): Promise<ProcessTreeStopResult> {
+  if (!child.pid) return 'incomplete';
   if (process.platform === 'win32') {
-    spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+    const result = await stopWindowsProcessTree(child);
+    if (result === 'incomplete') { child.stdout?.destroy(); child.stderr?.destroy(); child.unref(); }
+    return result;
   } else {
     // Expect owns a separate child PTY group and handles TERM by stopping it.
-    try { process.kill(-child.pid, interactive ? 'SIGTERM' : 'SIGKILL'); } catch { /* already exited */ }
+    try { process.kill(-child.pid, interactive ? 'SIGTERM' : 'SIGKILL'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return 'incomplete'; }
+    return 'complete';
   }
+}
+
+function stopJobProcess(job: ManagedCliJob, child: ChildProcess): void {
+  stoppingKinds.set(job.kind, (stoppingKinds.get(job.kind) ?? 0) + 1);
+  void stopProcess(child, job.interactive).then(result => {
+    const pending = (stoppingKinds.get(job.kind) ?? 1) - 1;
+    if (pending > 0) stoppingKinds.set(job.kind, pending);
+    else stoppingKinds.delete(job.kind);
+    if (result === 'incomplete') {
+      unconfirmedStops.add(job.kind);
+      job.detail = 'Could not confirm all child processes stopped. Check and stop remaining processes, then restart Clem before another attempt. Any completed effects must be checked first.';
+    }
+    persistUpdate(job);
+  });
 }
 
 /** A fixed Expect adapter owns the PTY without a Node/Electron native ABI.
@@ -136,9 +162,10 @@ function truncate(text: string): string {
   return text.length > 40_000 ? text.slice(text.length - 40_000) : text;
 }
 
-function commandFor(kind: ManagedCliKind, action: ManagedCliAction): { title: string; command: string; args: string[] } {
+function commandFor(kind: ManagedCliKind, action: ManagedCliAction, platform: NodeJS.Platform = process.platform): { title: string; command: string; args: string[] } {
   if (kind === 'composio') {
     if (action === 'install') {
+      if (platform === 'win32') throw new Error('Composio CLI installation on Windows requires WSL and is not automated by Clem. Use the Composio API-key connection in Connect for the native SDK backend; an existing account/backend selection will not be changed automatically.');
       return {
         title: 'Install Composio CLI',
         command: 'curl -fsSL https://composio.dev/install | bash',
@@ -153,6 +180,7 @@ function commandFor(kind: ManagedCliKind, action: ManagedCliAction): { title: st
   }
 
   if (action === 'install') {
+    if (platform === 'win32') return {title:'Install GitHub CLI', command:WINDOWS_GITHUB_INSTALL, args:['-lc',WINDOWS_GITHUB_INSTALL]};
     return {
       title: 'Install GitHub CLI',
       command: 'brew install gh',
@@ -196,6 +224,9 @@ function runJob(spec: RunJobSpec): ManagedCliJob {
     : `cli-${randomUUID()}`;
   const existing = getManagedCliJob(id);
   if (existing) return existing; // a replay observes; it never repeats the process
+  if (stoppingKinds.has(spec.kind) || unconfirmedStops.has(spec.kind)) {
+    throw new Error('The previous CLI process has not been confirmed stopped. Check and stop remaining processes before another attempt; restart Clem after checking.');
+  }
   if (spec.interactive && process.platform !== 'darwin') throw new Error('Interactive CLI sessions are not supported on this host.');
   const job: ManagedCliJob = { id, kind: spec.kind, action: spec.action, title: spec.title,
     command: spec.command, status: 'running', output: '', startedAt: new Date().toISOString(),
@@ -225,7 +256,7 @@ function runJob(spec: RunJobSpec): ManagedCliJob {
     job.status = 'interrupted';
     job.detail = 'The process exceeded its time limit. Check the connection before trying again; effects may already have occurred.';
     persistUpdate(job);
-    stopProcess(child, spec.interactive);
+    stopJobProcess(job, child);
   }, spec.timeoutMs ?? AUTH_JOB_TIMEOUT_MS);
   timer.unref();
   let rawOutput = '';
@@ -364,5 +395,5 @@ export function cancelManagedCliJob(id: string, sessionId: string): boolean {
   const job = jobs.get(id); const child = processes.get(id);
   if (!job || job.sessionId !== sessionId || job.status !== 'running' || !child) return false;
   job.status = 'cancelled'; job.detail = 'Stopped by you. Any effects already performed remain; they will not be retried automatically.';
-  persistUpdate(job); stopProcess(child, job.interactive); return true;
+  persistUpdate(job); stopJobProcess(job, child); return true;
 }

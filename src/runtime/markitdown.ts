@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR, PKG_DIR } from '../config.js';
 import { findSafeCliCommand } from './cli-discovery.js';
+import { stopWindowsProcessTree } from './windows-process-tree.js';
 
 /**
  * markitdown integration — turns binary/Office files (PDF, Word, Excel,
@@ -36,6 +37,8 @@ const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const MAX_CONCURRENT_CONVERSIONS = 2;
 
 let activeConversions = 0;
+let incompleteWindowsCleanup = false;
+const INCOMPLETE_CLEANUP_MESSAGE = 'Windows could not confirm that all conversion processes stopped. Check and stop the remaining conversion processes, then restart Clementine before retrying.';
 const conversionQueue: Array<() => void> = [];
 
 function acquireConversionSlot(): Promise<void> {
@@ -244,11 +247,11 @@ let warmKicked = false;
  * disabled via MARKITDOWN_WARM=off.
  */
 export function warmMarkitdownInBackground(): void {
-  if (warmKicked || !isMarkitdownWarmEnabled()) return;
+  if (warmKicked || incompleteWindowsCleanup || !isMarkitdownWarmEnabled()) return;
   warmKicked = true;
   setImmediate(() => {
     try {
-      if (existsSync(markitdownWarmMarkerPath())) return; // already warmed once
+      if (incompleteWindowsCleanup || existsSync(markitdownWarmMarkerPath())) return; // already warmed, or cleanup remains unknown
       const uv = resolveUv();
       if ('error' in uv) return; // no uv → nothing to warm; convert path reports it
 
@@ -268,6 +271,7 @@ export function warmMarkitdownInBackground(): void {
         child = spawn(uv.command, ['tool', 'run', '--from', markitdownSpec(), 'markitdown', '--version'], {
           cwd: BASE_DIR,
           stdio: 'ignore',
+          windowsHide: true,
           env: {
             ...process.env,
             UV_CACHE_DIR: cacheDir,
@@ -340,6 +344,7 @@ async function runMarkitdown(
   label: string,
   opts: { timeoutMs?: number } = {},
 ): Promise<ConvertResult> {
+  if (incompleteWindowsCleanup) return { ok: false, error: INCOMPLETE_CLEANUP_MESSAGE };
   const uv = resolveUv();
   if ('error' in uv) return { ok: false, error: uv.error };
 
@@ -355,15 +360,41 @@ async function runMarkitdown(
   const timeoutMs = opts.timeoutMs ?? DEFAULT_CONVERT_TIMEOUT_MS;
   const args = ['tool', 'run', '--from', markitdownSpec(), 'markitdown', source];
 
+  const result = await runMarkitdownProcess({ command: uv.command, args, cwd: BASE_DIR,
+    env: { ...process.env, UV_CACHE_DIR: cacheDir, UV_PYTHON_INSTALL_DIR: pythonDir, UV_PYTHON_PREFERENCE: 'managed', NO_COLOR: '1' }, label, timeoutMs });
+  return result.ok ? { ok: true, markdown: result.markdown } : { ok: false, error: result.error };
+}
+
+/** Internal process seam: real execution and bounded cleanup can be qualified
+ * with harmless local processes without downloading Python or calling models. */
+export async function runMarkitdownProcess(input: {
+  command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; label: string; timeoutMs: number;
+}, dependencies: { platform?: NodeJS.Platform; stopProcessTree?: typeof stopWindowsProcessTree } = {}): Promise<ConvertResult & { cleanupIncomplete?: boolean }> {
+  if (incompleteWindowsCleanup) return { ok: false, error: INCOMPLETE_CLEANUP_MESSAGE };
   await acquireConversionSlot();
   try {
-    return await new Promise<ConvertResult>((resolve) => {
+    // A queued conversion must recheck the latch after the previous owner has
+    // settled cleanup. Releasing a slot never means an unconfirmed tree stopped.
+    if (incompleteWindowsCleanup) return { ok: false, error: INCOMPLETE_CLEANUP_MESSAGE };
+    const result = await executeMarkitdownProcess(input, dependencies);
+    if (result.cleanupIncomplete) incompleteWindowsCleanup = true;
+    return result;
+  } finally {
+    releaseConversionSlot();
+  }
+}
+
+function executeMarkitdownProcess(input: {
+  command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; label: string; timeoutMs: number;
+}, dependencies: { platform?: NodeJS.Platform; stopProcessTree?: typeof stopWindowsProcessTree }): Promise<ConvertResult & { cleanupIncomplete?: boolean }> {
+    return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
       let outBytes = 0;
       let truncated = false;
       let settled = false;
-      const done = (result: ConvertResult) => {
+      let timingOut = false;
+      const done = (result: ConvertResult & { cleanupIncomplete?: boolean }) => {
         if (settled) return;
         settled = true;
         resolve(result);
@@ -371,15 +402,10 @@ async function runMarkitdown(
 
       let child: ReturnType<typeof spawn>;
       try {
-        child = spawn(uv.command, args, {
-          cwd: BASE_DIR, // TCC-safe: daemon has access here
-          env: {
-            ...process.env,
-            UV_CACHE_DIR: cacheDir,
-            UV_PYTHON_INSTALL_DIR: pythonDir,
-            UV_PYTHON_PREFERENCE: 'managed',
-            NO_COLOR: '1',
-          },
+        child = spawn(input.command, input.args, {
+          cwd: input.cwd,
+          env: input.env,
+          windowsHide: true,
         });
       } catch (err) {
         // spawn can throw synchronously (e.g. EACCES on the binary).
@@ -387,13 +413,29 @@ async function runMarkitdown(
         return;
       }
 
-      const timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      const timer = setTimeout(async () => {
+        if (settled) return;
+        timingOut = true;
+        let cleanupIncomplete = false;
+        if ((dependencies.platform ?? process.platform) === 'win32') {
+          try {
+            cleanupIncomplete = await (dependencies.stopProcessTree ?? stopWindowsProcessTree)(child, { env: input.env }) !== 'complete';
+          } catch {
+            cleanupIncomplete = true;
+            try { child.kill('SIGKILL'); } catch { /* parent stop is not a tree receipt */ }
+          }
+        }
+        else { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
+        if (cleanupIncomplete) {
+          child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy(); child.unref();
+        }
         done({
           ok: false,
-          error: `markitdown timed out after ${Math.round(timeoutMs / 1000)}s on ${label}. The first conversion downloads Python + markitdown; retry once it has warmed.`,
+          ...(cleanupIncomplete ? { cleanupIncomplete: true } : {}),
+          error: cleanupIncomplete ? INCOMPLETE_CLEANUP_MESSAGE
+            : `markitdown timed out after ${Math.round(input.timeoutMs / 1000)}s on ${input.label}. The first conversion downloads Python + markitdown; retry once it has warmed.`,
         });
-      }, timeoutMs);
+      }, input.timeoutMs);
 
       child.stdout?.on('data', (chunk: Buffer) => {
         if (outBytes >= MAX_OUTPUT_BYTES) { truncated = true; return; }
@@ -407,20 +449,19 @@ async function runMarkitdown(
         if (stderr.length < 4000) stderr += chunk.toString();
       });
       child.on('error', (err) => {
+        if (timingOut) return;
         clearTimeout(timer);
         done({ ok: false, error: `Could not run the uv runtime: ${err.message}` });
       });
       child.on('close', (code) => {
+        if (timingOut) return;
         clearTimeout(timer);
         if (code === 0 && stdout.trim()) {
           done({ ok: true, markdown: truncated ? `${stdout}\n\n…[output truncated — file too large to extract fully]` : stdout });
           return;
         }
         const detail = stderr.trim().slice(0, 500) || stdout.trim().slice(0, 500) || 'no output';
-        done({ ok: false, error: `markitdown failed (exit ${code}) on ${label}: ${detail}` });
+        done({ ok: false, error: `markitdown failed (exit ${code}) on ${input.label}: ${detail}` });
       });
     });
-  } finally {
-    releaseConversionSlot();
-  }
 }

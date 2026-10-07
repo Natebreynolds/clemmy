@@ -20,6 +20,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { getRuntimeEnv } from '../config.js';
+import { windowsChromiumCandidates } from '../integrations/windows-browser-paths.js';
+import { stopWindowsProcessTree } from '../runtime/windows-process-tree.js';
 
 export const SPACE_PREVIEW_DEFAULT_WIDTH = 1440;
 export const SPACE_PREVIEW_DEFAULT_HEIGHT = 1100;
@@ -56,10 +58,7 @@ function browserCandidates(): string[] {
       '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser',
       '/usr/bin/microsoft-edge', '/usr/bin/brave-browser', '/snap/bin/chromium',
     ] : []),
-    ...(process.platform === 'win32' ? [
-      path.join(process.env.PROGRAMFILES ?? 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-      path.join(process.env['PROGRAMFILES(X86)'] ?? 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-    ] : []),
+    ...(process.platform === 'win32' ? windowsChromiumCandidates() : []),
   ];
   return [...new Set(candidates)];
 }
@@ -120,7 +119,29 @@ export interface SpacePreviewDependencies {
   browser?: string | null;
   timeoutMs?: number;
   spawnBrowser?: typeof spawn;
+  /** Controlled platform/lifecycle injection for offline tests, never model inputs. */
+  platform?: NodeJS.Platform;
+  stopWindowsTree?: typeof stopWindowsProcessTree;
+  processGuard?: SpacePreviewProcessGuard;
 }
+
+export interface SpacePreviewProcessGuard {
+  acquire(): string | null;
+  settle(stopped: boolean): void;
+}
+
+export function createSpacePreviewProcessGuard(): SpacePreviewProcessGuard {
+  let active = false, blocked = false;
+  return {
+    acquire() {
+      if (blocked) return 'a previous Windows preview browser could not be confirmed stopped; stop its remaining processes and restart Clementine before another preview';
+      if (active) return 'a Windows preview is still running or stopping; wait for that preview to finish before starting another';
+      active = true; return null;
+    },
+    settle(stopped) { if (!stopped) blocked = true; else active = false; },
+  };
+}
+const windowsPreviewGuard = createSpacePreviewProcessGuard();
 
 function waitForStableFile(file: string, deadlineAt: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -137,14 +158,18 @@ function waitForStableFile(file: string, deadlineAt: number): Promise<boolean> {
   });
 }
 
-function stopProcessTree(child: ReturnType<typeof spawn>): void {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+async function stopProcessTree(child: ReturnType<typeof spawn>, dependencies: SpacePreviewDependencies): Promise<boolean> {
+  const windows = (dependencies.platform ?? process.platform) === 'win32';
+  if (child.exitCode !== null || child.signalCode !== null) return !windows || (child.exitCode === 0 && child.signalCode === null);
+  if (!child.pid) return true; // spawn error before a process existed
+  if (windows) return await (dependencies.stopWindowsTree ?? stopWindowsProcessTree)(child) === 'complete';
   try {
-    if (process.platform !== 'win32' && typeof child.pid === 'number') process.kill(-child.pid, 'SIGKILL');
+    if (typeof child.pid === 'number') process.kill(-child.pid, 'SIGKILL');
     else child.kill('SIGKILL');
   } catch {
     try { child.kill('SIGKILL'); } catch { /* already gone */ }
   }
+  return true;
 }
 
 /** Screenshot the index.html of one prepared directory headlessly. The
@@ -154,7 +179,11 @@ async function captureHostPage(
   dependencies: SpacePreviewDependencies,
 ): Promise<{ ok: true; png: Buffer } | { ok: false; reason: string }> {
   const shot = path.join(input.dir, 'preview.png');
+  const windows = (dependencies.platform ?? process.platform) === 'win32';
+  const guard = dependencies.processGuard ?? windowsPreviewGuard;
+  if (windows) { const reason = guard.acquire(); if (reason) return { ok: false, reason }; }
   let child: ReturnType<typeof spawn> | null = null;
+  let captured: { ok: true; png: Buffer } | { ok: false; reason: string } = { ok: false, reason: 'the preview browser was not started' };
   try {
     const args = [
       '--headless=new',
@@ -170,11 +199,12 @@ async function captureHostPage(
       ...(input.scale && input.scale > 1 ? [`--force-device-scale-factor=${input.scale}`] : []),
       '--virtual-time-budget=6000',
       `--screenshot=${shot}`,
-      `file://${path.join(input.dir, 'index.html')}`,
+      pathToFileURL(path.join(input.dir, 'index.html')).href,
     ];
     child = (dependencies.spawnBrowser ?? spawn)(input.browser, args, {
       stdio: 'ignore',
-      detached: process.platform !== 'win32',
+      detached: !windows,
+      ...(windows ? { windowsHide: true } : {}),
     });
     const spawned = child;
     const exited = new Promise<void>((resolve) => { spawned.once('exit', () => resolve()); spawned.once('error', () => resolve()); });
@@ -183,11 +213,15 @@ async function captureHostPage(
       waitForStableFile(shot, deadlineAt),
       exited.then(() => waitForStableFile(shot, Math.min(deadlineAt, Date.now() + 1_000))),
     ]);
-    if (!settled) return { ok: false, reason: 'the browser did not produce a preview in time' };
-    return { ok: true, png: readFileSync(shot) };
+    captured = settled ? { ok: true, png: readFileSync(shot) } : { ok: false, reason: 'the browser did not produce a preview in time' };
   } finally {
-    if (child) stopProcessTree(child);
+    const neededForcedStop = child !== null && child.exitCode === null && child.signalCode === null && Boolean(child.pid);
+    const stopped = !child || await stopProcessTree(child, dependencies);
+    if (windows) guard.settle(stopped);
+    if (!stopped) return { ok: false, reason: 'the Windows preview browser could not be confirmed stopped; stop its remaining processes and restart Clementine before another preview' };
+    if (windows && neededForcedStop && captured.ok) return { ok: false, reason: 'the Windows browser wrote a preview but did not exit normally; its process tree was stopped, so this preview is not qualified as a completed render' };
   }
+  return captured;
 }
 
 const NO_BROWSER = 'no Chromium-family browser (Chrome, Chromium, Edge, or Brave) is installed on this machine to render the preview';

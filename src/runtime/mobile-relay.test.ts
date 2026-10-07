@@ -74,8 +74,8 @@ test('parseSni extracts the servername from a real Node-generated ClientHello', 
 test('relay E2E: pinned TLS passes through untouched; routes and IP survive; pairing stays LAN-only', async () => {
   const daemonTlsDir = path.join(TMP_ROOT, 'daemon-a');
   const relayTlsDir = path.join(TMP_ROOT, 'relay-identity');
-  const daemonIdentity = ensureMobileTlsIdentity({ stateDir: daemonTlsDir });
-  const relayIdentity = ensureMobileTlsIdentity({ stateDir: relayTlsDir });
+  const daemonIdentity = await ensureMobileTlsIdentity({ stateDir: daemonTlsDir });
+  const relayIdentity = await ensureMobileTlsIdentity({ stateDir: relayTlsDir });
 
   // A minimal daemon app with the real ingress middlewares.
   const app = express();
@@ -214,7 +214,7 @@ test('relay E2E: pinned TLS passes through untouched; routes and IP survive; pai
       'the certificate alone must not claim an address; only the key can',
     );
     // A different Mac's real key proves possession of a DIFFERENT address.
-    const other = ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, 'daemon-impostor') });
+    const other = await ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, 'daemon-impostor') });
     const otherSig = createSign('sha256').update('whatever').sign(other.keyPem).toString('base64url');
     assert.equal(
       await squat({ certPem: other.certPem, signature: otherSig }),
@@ -286,11 +286,11 @@ test('loadRelayConfig: built-in hosted default, overridden by state file and env
   assert.deepEqual(loadRelayConfig(stateDir, {}), DEFAULT_RELAY_CONFIG);
 });
 
-test('relayPairId is DNS-safe lowercase hex derived from the cert', () => {
-  const identity = ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, 'daemon-b') });
+test('relayPairId is DNS-safe lowercase hex derived from the cert', async () => {
+  const identity = await ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, 'daemon-b') });
   const pairId = relayPairId(identity.certPem);
   assert.match(pairId, /^[a-f0-9]{16}$/);
-  assert.notEqual(pairId, relayPairId(ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, 'daemon-c') }).certPem));
+  assert.notEqual(pairId, relayPairId((await ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, 'daemon-c') })).certPem));
   assert.equal(certFingerprint(identity.certPem).length > 0, true);
 });
 
@@ -330,7 +330,7 @@ test('loopback survives, because a same-machine relay reports it honestly', () =
  *  then go silent without closing, as a restarted relay or a proxy that drops
  *  an idle connection does. */
 async function silentRelay(opts: { heartbeats: number }) {
-  const identity = ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, `silent-relay-${opts.heartbeats}`) });
+  const identity = await ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, `silent-relay-${opts.heartbeats}`) });
   let connections = 0;
   const sockets: tls.TLSSocket[] = [];
   const server = tls.createServer({ key: identity.keyPem, cert: identity.certPem }, (socket) => {
@@ -360,8 +360,8 @@ async function silentRelay(opts: { heartbeats: number }) {
   };
 }
 
-function silentClient(relay: { port: number; fingerprint: string }) {
-  const daemon = ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, `silent-daemon-${relay.port}`) });
+async function silentClient(relay: { port: number; fingerprint: string }) {
+  const daemon = await ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, `silent-daemon-${relay.port}`) });
   return startMobileRelayClient({
     config: { url: `127.0.0.1:${relay.port}`, baseDomain: 'r.test.local', relayCertFp: relay.fingerprint },
     pairId: relayPairId(daemon.certPem),
@@ -379,7 +379,7 @@ test('a tunnel whose relay heartbeat stops is dropped and registered again', asy
   // Live 10-02: the relay restarted, the Mac kept a silent socket it thought
   // was registered, and the phone could not reach it until Clem restarted.
   const relay = await silentRelay({ heartbeats: 1 });
-  const client = silentClient(relay);
+  const client = await silentClient(relay);
   try {
     for (let i = 0; i < 100 && !client.connected(); i++) await new Promise((r) => setTimeout(r, 20));
     assert.ok(client.connected(), 'the tunnel registers');
@@ -395,7 +395,7 @@ test('a tunnel whose relay heartbeat stops is dropped and registered again', asy
 
 test('a relay that never sends heartbeats is not treated as dead', async () => {
   const relay = await silentRelay({ heartbeats: 0 });
-  const client = silentClient(relay);
+  const client = await silentClient(relay);
   try {
     for (let i = 0; i < 100 && !client.connected(); i++) await new Promise((r) => setTimeout(r, 20));
     assert.ok(client.connected());
@@ -412,7 +412,7 @@ test('a silent relay registration times out, reports the cause, and stop clears 
   const peers = new Set<net.Socket>();
   const server = net.createServer((socket) => { peers.add(socket); socket.on('close', () => peers.delete(socket)); });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const identity = ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, 'silent-registration') });
+  const identity = await ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, 'silent-registration') });
   const client = startMobileRelayClient({
     config: { url: `127.0.0.1:${(server.address() as net.AddressInfo).port}`, baseDomain: 'r.test.local', relayCertFp: identity.fingerprint },
     pairId: relayPairId(identity.certPem), authToken: 'controlled-fixture-token', localPort: 1,

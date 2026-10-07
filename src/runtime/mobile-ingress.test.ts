@@ -176,7 +176,7 @@ test('a failed main bind rejects and leaves no listeners behind', async () => {
 async function startWithDirectApp() {
   const { ensureMobileTlsIdentity } = await import('./mobile-tls.js');
   const stateDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-direct-tls-'));
-  const identity = ensureMobileTlsIdentity({ stateDir });
+  const identity = await ensureMobileTlsIdentity({ stateDir });
 
   const listeners = await startIngressListeners(buildApp(), {
     host: '127.0.0.1',

@@ -12,6 +12,12 @@ import path from 'node:path';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-codex-oauth-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+if (process.platform === 'win32') {
+  const acl = await import(new URL('../../../src/runtime/windows-private-filesystem.ts', import.meta.url).href);
+  const { lstatSync } = await import('node:fs');
+  const receipt = acl.assertWindowsPrivateFilesystem(TMP_HOME, lstatSync(TMP_HOME, { bigint: true }), 'directory', true);
+  assert.equal(receipt.backend, 'native');
+}
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test } from 'node:test';
@@ -30,9 +36,10 @@ test('partial grant (access token only) does NOT count', () => {
   assert.equal(hasPersistedCodexGrant(), false);
 });
 
-test('corrupt auth.json degrades to no-grant, never throws', () => {
+test('corrupt auth.json retains POSIX no-grant behavior and Windows explicit privacy refusal', () => {
   writeFileSync(AUTH_FILE, '{not json');
-  assert.equal(hasPersistedCodexGrant(), false);
+  if (process.platform === 'win32') assert.throws(() => hasPersistedCodexGrant(), error => error instanceof Error && error.name === 'CredentialStoragePrivacyError');
+  else assert.equal(hasPersistedCodexGrant(), false);
 });
 
 test('complete grant counts', () => {

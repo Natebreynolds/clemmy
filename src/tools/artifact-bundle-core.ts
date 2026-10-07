@@ -16,6 +16,7 @@ import {
 import path from 'node:path';
 
 import { BASE_DIR } from '../config.js';
+import { syncDirectoryMetadata } from '../runtime/sync-directory.js';
 import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
 
 export const ARTIFACT_BUNDLE_LIMITS = Object.freeze({
@@ -228,12 +229,7 @@ function resultFor(bundle: PreparedBundle, directory: string, created: boolean):
 }
 
 function fsyncDirectory(directory: string): void {
-  const fd = openSync(directory, 'r');
-  try {
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
+  syncDirectoryMetadata(directory);
 }
 
 function writeDurableFile(filePath: string, content: string): void {

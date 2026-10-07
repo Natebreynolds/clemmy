@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer, type RequestListener } from 'node:http';
 import { spawn } from 'node:child_process';
+import { launchWindowsDefaultApp } from './windows-powershell.js';
 
 // CODEX_OAUTH_AUTH_BASE_URL overrides the base URL for local testing
 // (smoke scripts stand up a fake OAuth server on localhost). Empty /
@@ -136,15 +137,14 @@ async function listenOnLoopbacks(port: number, listener: RequestListener): Promi
   }
 }
 
-function openBrowser(url: string): void {
+function openBrowser(url: string): void | Promise<void> {
   const platform = process.platform;
   if (platform === 'darwin') {
     spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
     return;
   }
   if (platform === 'win32') {
-    spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' }).unref();
-    return;
+    return launchWindowsDefaultApp(url);
   }
   spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
 }

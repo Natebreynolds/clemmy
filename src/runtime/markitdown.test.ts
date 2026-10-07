@@ -30,7 +30,8 @@ test('isMarkitdownWarmEnabled: default on, kill-switch off', () => {
 });
 
 test('markitdownWarmMarkerPath lives under the runtime dir', () => {
-  assert.match(markitdownWarmMarkerPath(), /runtime\/\.markitdown-warmed$/);
+  assert.equal(path.basename(markitdownWarmMarkerPath()), '.markitdown-warmed');
+  assert.equal(path.basename(path.dirname(markitdownWarmMarkerPath())), 'runtime');
 });
 
 test('warmMarkitdownInBackground never throws and is a no-op when disabled', () => {

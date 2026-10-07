@@ -1,0 +1,221 @@
+name: Unpublished Windows Beta
+
+# Deliberately independent of the production release workflow. This manual job
+# spends nothing on Mac/signing and never creates, updates, or publishes a release.
+on:
+  workflow_call:
+    inputs:
+      candidate_version:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      candidate_version:
+        description: 'Unpublished prerelease newer than package.json (for example, 3.18.29-windows.1)'
+        required: true
+        default: '3.18.29-windows.1'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-private-beta-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  windows-beta:
+    name: Qualify unsigned Windows x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+      SOURCE_COMMIT: ${{ github.sha }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      CSC_LINK: ''
+      CSC_KEY_PASSWORD: ''
+      CLEMMY_TEST_DISABLE_LIVE_MODELS: '1'
+    steps:
+      - name: Checkout exact selected candidate source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Windows x64 Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          architecture: x64
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/desktop/package-lock.json
+            apps/mobile-web/package-lock.json
+            apps/console-web/package-lock.json
+
+      - name: Validate exact source and unpublished candidate version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = git rev-parse HEAD
+          if ($actual -ne $env:SOURCE_COMMIT) { throw 'Checkout differs from selected source commit.' }
+          $current = node -p "require('./package.json').version"
+          node scripts/release-candidate-version.mjs validate "$env:CANDIDATE_VERSION" "$current"
+          if ($LASTEXITCODE -ne 0) { throw 'Unpublished candidate version is invalid or not newer.' }
+          if ([Environment]::Is64BitProcess -ne $true) { throw 'Windows x64 build process required.' }
+
+      - name: Install daemon dependencies including Windows SDK assets
+        run: npm ci --include=optional
+
+      - name: Install desktop dependencies
+        working-directory: apps/desktop
+        run: npm ci --include=optional
+
+      - name: Install mobile-web dependencies
+        working-directory: apps/mobile-web
+        run: npm ci
+
+      - name: Install console-web dependencies
+        working-directory: apps/console-web
+        run: npm ci
+
+      - name: Typecheck runtime and desktop
+        shell: pwsh
+        run: |
+          npm run typecheck
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime typecheck failed.' }
+          npm --prefix apps/desktop run typecheck
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop typecheck failed.' }
+
+      - name: Compile canonical credential policy and Windows ACL native probe
+        shell: pwsh
+        run: |
+          npm --prefix apps/desktop run build:credential-policy
+          if ($LASTEXITCODE -ne 0) { throw 'Canonical credential policy bundle failed.' }
+          npm --prefix apps/desktop run build:windows-private-filesystem
+          if ($LASTEXITCODE -ne 0) { throw 'Canonical Windows ACL probe compilation failed.' }
+
+      - name: Offline Windows and package qualification tests
+        shell: pwsh
+        run: |
+          $tests = @(
+            'src/runtime/windows-readiness.test.ts',
+            'src/runtime/windows-private-filesystem.test.ts',
+            'src/runtime/credential-private-filesystem.test.ts',
+            'src/runtime/windows-credential-privacy.test.ts',
+            'src/runtime/claude-credential-privacy.test.ts',
+            'src/runtime/sync-directory.test.ts',
+            'src/runtime/host-execution-context.test.ts',
+            'src/runtime/windows-process-tree.test.ts',
+            'src/runtime/windows-powershell.test.ts',
+            'src/runtime/terminal-handoff.test.ts',
+            'src/runtime/managed-cli-jobs.test.ts',
+            'src/runtime/cli-spawn.test.ts',
+            'src/runtime/cli-probe-process.test.ts',
+            'src/runtime/cli-probe-windows.test.ts',
+            'src/runtime/codex-native-oauth-loopback.test.ts',
+            'src/runtime/sandboxed-script.test.ts',
+            'src/runtime/mobile-tls.test.ts',
+            'src/runtime/mobile-ingress.test.ts',
+            'src/runtime/mobile-relay.test.ts',
+            'src/runtime/mobile-relay-health.test.ts',
+            'src/channels/transcription-stop-routes.test.ts',
+            'src/runtime/harness/claude-cli-launch.test.ts',
+            'src/runtime/harness/claude-headless-model.test.ts',
+            'src/runtime/harness/claude-agent-sdk.test.ts',
+            'src/execution/coding-agent-claude.test.ts',
+            'src/execution/coding-run-env.test.ts',
+            'src/execution/coding-run-git.test.ts',
+            'src/execution/coding-run-receipt.test.ts',
+            'src/execution/workflow-deterministic-runner.test.ts',
+            'src/integrations/browser-python.test.ts',
+            'src/integrations/browser-operation.test.ts',
+            'src/integrations/browser-harness-windows-setup.test.ts',
+            'src/integrations/windows-browser-paths.test.ts',
+            'src/integrations/browser-harness-install-command.test.ts',
+            'src/integrations/cli-catalog/platform-install.test.ts',
+            'src/integrations/cli-catalog/auth-health.test.ts',
+            'src/integrations/local-meetings/whisper-runtime-windows-process.test.ts',
+            'src/agents/capabilities-windows.test.ts',
+            'src/agents/capabilities.test.ts',
+            'src/runtime/harness/result-payload-storage.test.ts',
+            'src/runtime/harness/authority-encrypted-payload-store.test.ts',
+            'src/runtime/harness/model-request-provenance-blocking.test.ts',
+            'src/runtime/harness/staged-source-download-authority.test.ts',
+            'src/runtime/harness/attempt-settlement.test.ts',
+            'src/tools/artifact-bundle-core.test.ts',
+            'src/tools/computer-tools-windows-process.test.ts',
+            'src/tools/document-docx.test.ts',
+            'src/tools/attachment-tools.test.ts',
+            'src/runtime/markitdown-process.test.ts',
+            'src/runtime/markitdown.test.ts',
+            'src/runtime/attachments.test.ts',
+            'src/dashboard/console-files-open.test.ts',
+            'src/spaces/static-document-update.test.ts',
+            'src/spaces/space-preview-windows.test.ts',
+            'src/integrations/composio/staged-file-blob-store.test.ts',
+            'apps/desktop/src/codex-token-response.test.ts',
+            'apps/desktop/src/auth-grant.test.ts',
+            'apps/desktop/src/credentials-bridge.test.ts',
+            'apps/desktop/scripts/windows-package-runtime.test.mjs',
+            'apps/desktop/scripts/build-windows-private-filesystem-probe.test.mjs',
+            'apps/desktop/scripts/build-credential-policy.test.mjs',
+            'apps/desktop/scripts/windows-private-filesystem-packaging.test.mjs',
+            'scripts/windows-private-beta-workflow.test.mjs',
+            'scripts/windows-packaged-launch-smoke.test.mjs',
+            'scripts/run-tests-isolated.test.mjs',
+            'scripts/release-workflow.test.mjs'
+          )
+          node scripts/run-tests-isolated.mjs @tests
+          if ($LASTEXITCODE -ne 0) { throw 'Offline Windows qualification tests failed.' }
+
+      - name: Apply explicit unpublished version overlay
+        shell: pwsh
+        run: |
+          npm version "$env:CANDIDATE_VERSION" --no-git-tag-version --allow-same-version
+          if ($LASTEXITCODE -ne 0) { throw 'Daemon version overlay failed.' }
+          npm --prefix apps/desktop version "$env:CANDIDATE_VERSION" --no-git-tag-version --allow-same-version
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop version overlay failed.' }
+
+      - name: Build unsigned installer and verify packaged native runtime
+        working-directory: apps/desktop
+        run: npm run package:win
+
+      - name: Verify exact installer assets and updater hashes
+        shell: pwsh
+        run: node scripts/verify-desktop-release-assets.mjs --dir apps/desktop/release --version "$env:CANDIDATE_VERSION" --platform windows
+
+      - name: Qualify actual installed clean launch and restart
+        shell: pwsh
+        run: node scripts/windows-packaged-launch-smoke.mjs --release-dir apps/desktop/release --expected-version "$env:CANDIDATE_VERSION" --receipt output/windows-beta/installed-smoke.json
+
+      # A failed build retains diagnostics, but its installer is never uploaded
+      # as a qualified candidate. This repository and its Actions artifacts are
+      # public: upload only synthetic fixture receipts, never real-home histories,
+      # credentials, viewer capability URLs, or raw provider payloads. No release
+      # feed is published or changed here.
+      - name: Upload qualification diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-beta-diagnostics-${{ github.run_id }}
+          path: |
+            apps/desktop/release/windows-native-core-qualification.json
+            output/windows-beta/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload qualified unpublished Windows installer
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clementine-windows-beta-${{ inputs.candidate_version }}-${{ github.run_id }}
+          path: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.exe.blockmap
+            apps/desktop/release/latest.yml
+            apps/desktop/release/windows-native-core-qualification.json
+            output/windows-beta/installed-smoke.json
+          if-no-files-found: error
+          retention-days: 14

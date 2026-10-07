@@ -53,6 +53,7 @@ import {
 import { BASE_DIR } from '../../config.js';
 import { getWorkspaceDirs } from '../../tools/shared.js';
 import { currentToolAbortSignal } from '../tool-abort-context.js';
+import { assertWindowsPrivateFilesystem } from '../windows-private-filesystem.js';
 import { createPublicHttpsOriginTransport } from './public-https-origin.js';
 import {
   digestSchema,
@@ -3696,9 +3697,15 @@ function verifyExactUploadBlobFile(blob: ExactBlobOwner): BigIntStats {
     if (
       !before.isFile()
       || before.nlink !== 1n
-      || (before.mode & 0o777n) !== 0o600n
+      || (process.platform !== 'win32' && (before.mode & 0o777n) !== 0o600n)
       || before.size !== BigInt(blob.byteCount)
     ) throw new StagedTransferAuthorityError('conflict', 'staged upload blob file is not exact');
+    const verifyPrivateAcl = (identity: BigIntStats): void => {
+      if (process.platform !== 'win32') return;
+      try { assertWindowsPrivateFilesystem(blobPath, identity, 'file'); }
+      catch { throw new StagedTransferAuthorityError('conflict', 'staged upload blob permissions could not be verified'); }
+    };
+    verifyPrivateAcl(before);
     const sha = createHash('sha256');
     const md5 = createHash('md5');
     const buffer = Buffer.allocUnsafe(128 * 1024);
@@ -3715,6 +3722,7 @@ function verifyExactUploadBlobFile(blob: ExactBlobOwner): BigIntStats {
       md5.update(chunk);
     }
     const after = fstatSync(fd, { bigint: true });
+    verifyPrivateAcl(after);
     if (
       !sameUploadBlobStat(before, after)
       || position !== blob.byteCount

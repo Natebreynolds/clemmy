@@ -25,6 +25,8 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
+import { syncDirectoryMetadata } from '../sync-directory.js';
+import { assertWindowsPrivateFilesystem } from '../windows-private-filesystem.js';
 
 export const RESULT_PAYLOAD_INLINE_MAX_BYTES = 8_000_000;
 export const RESULT_PAYLOAD_SPILL_SENTINEL = '';
@@ -87,9 +89,11 @@ function lstatOrMissing(filePath: string): Stats | null {
 
 function requireRealDirectory(directory: string, create: boolean): void {
   let stat = lstatOrMissing(directory);
+  let created = false;
   if (stat === null && create) {
     try {
       mkdirSync(directory, { mode: DIRECTORY_MODE });
+      created = true;
     } catch (error) {
       // Another writer may have won the first-use directory creation race.
       // The lstat/type check below still refuses a symlink or non-directory.
@@ -101,6 +105,17 @@ function requireRealDirectory(directory: string, create: boolean): void {
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new Error('result payload storage directory is not a real directory');
   }
+  if (process.platform === 'win32' && (directory === path.dirname(RESULT_PAYLOAD_SPILL_DIRECTORY) || directory === RESULT_PAYLOAD_SPILL_DIRECTORY)) {
+    assertWindowsPrivateFilesystem(directory, lstatSync(directory, { bigint: true }), 'directory', created);
+  }
+}
+
+function privateFilePermissions(target: string, fd?: number): boolean {
+  if (process.platform !== 'win32') return false;
+  try {
+    assertWindowsPrivateFilesystem(target, fd === undefined ? lstatSync(target, { bigint: true }) : fstatSync(fd, { bigint: true }), 'file');
+    return true;
+  } catch { return false; }
 }
 
 function ensureSpillDirectory(): void {
@@ -116,15 +131,9 @@ function ensureSpillDirectory(): void {
 }
 
 function fsyncDirectory(directory: string): void {
-  const fd = openSync(
-    directory,
-    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-  );
-  try {
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
+  syncDirectoryMetadata(directory, {
+    flags: constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  });
 }
 
 type VerifiedFileRead =
@@ -147,8 +156,8 @@ function readAndVerifySpill(input: {
     if (entry.size !== input.byteCount) {
       return { status: 'corrupt', reason: 'spilled result payload size does not match durable metadata' };
     }
-    if ((entry.mode & 0o777) !== FILE_MODE) {
-      return { status: 'corrupt', reason: 'spilled result payload permissions are not 0600' };
+    if (process.platform === 'win32' ? !privateFilePermissions(target) : (entry.mode & 0o777) !== FILE_MODE) {
+      return { status: 'corrupt', reason: process.platform === 'win32' ? 'spilled result payload requires verified private NTFS permissions; check folder access and PowerShell policy' : 'spilled result payload permissions are not 0600' };
     }
 
     const fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -159,11 +168,14 @@ function readAndVerifySpill(input: {
         !opened.isFile()
         || opened.nlink !== 1
         || opened.size !== input.byteCount
-        || (opened.mode & 0o777) !== FILE_MODE
+        || (process.platform === 'win32' ? !privateFilePermissions(target, fd) : (opened.mode & 0o777) !== FILE_MODE)
       ) {
-        return { status: 'corrupt', reason: 'opened result payload is not one 0600 regular file' };
+        return { status: 'corrupt', reason: process.platform === 'win32' ? 'opened result payload is not one regular file with verified private NTFS permissions' : 'opened result payload is not one 0600 regular file' };
       }
       bytes = readFileSync(fd);
+      if (process.platform === 'win32' && !privateFilePermissions(target, fd)) {
+        return { status: 'corrupt', reason: 'spilled result payload permissions changed while reading' };
+      }
     } finally {
       closeSync(fd);
     }
@@ -235,7 +247,8 @@ export function persistSpilledResultPayload(input: {
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
       FILE_MODE,
     );
-    fchmodSync(fd, FILE_MODE);
+    if (process.platform === 'win32') assertWindowsPrivateFilesystem(temp, fstatSync(fd, { bigint: true }), 'file', true);
+    else fchmodSync(fd, FILE_MODE);
     let offset = 0;
     while (offset < bytes.byteLength) {
       offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);

@@ -21,6 +21,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
 import { refreshClaudeTokens, type ClaudeTokenSet } from './claude-native-oauth.js';
+import { CredentialStoragePrivacyError, isCredentialStoragePrivacyError, readCredentialFileSync, readCredentialSourceFileSync, writeCredentialFileSync } from './credential-private-filesystem.js';
 
 const logger = pino({ name: 'clementine.claude-oauth' });
 
@@ -174,6 +175,14 @@ function clearClaudeVaultDegraded(): void {
 
 /** Persist our own Claude tokens (from the in-app login or a refresh). 0600. */
 export function saveClaudeTokens(tokens: ClaudeTokenSet): void {
+  if (process.platform === 'win32') {
+    // Validate an existing wallet before replacement; failed privacy or schema
+    // must preserve bytes and cannot silently become a different grant source.
+    readVaultClaudeTokens();
+    writeCredentialFileSync(CLAUDE_VAULT_FILE, JSON.stringify(tokens, null, 2));
+    clearClaudeVaultRefreshDead(); clearClaudeVaultDegraded();
+    return;
+  }
   mkdirSync(path.dirname(CLAUDE_VAULT_FILE), { recursive: true });
   writeFileSync(CLAUDE_VAULT_FILE, JSON.stringify(tokens, null, 2), { encoding: 'utf-8', mode: 0o600 });
   // A freshly-written grant supersedes any prior dead/degraded state — clear the
@@ -184,10 +193,13 @@ export function saveClaudeTokens(tokens: ClaudeTokenSet): void {
 }
 
 function readVaultClaudeTokens(): ClaudeOAuthTokens | null {
-  if (!existsSync(CLAUDE_VAULT_FILE)) return null;
+  if (process.platform !== 'win32' && !existsSync(CLAUDE_VAULT_FILE)) return null;
   try {
-    const j = JSON.parse(readFileSync(CLAUDE_VAULT_FILE, 'utf-8')) as Record<string, unknown>;
-    if (!j.accessToken) return null;
+    const raw = process.platform === 'win32' ? readCredentialFileSync(CLAUDE_VAULT_FILE) : readFileSync(CLAUDE_VAULT_FILE, 'utf-8');
+    if (raw === undefined) return null;
+    const j = JSON.parse(raw) as Record<string, unknown>;
+    if (!j.accessToken) { if (process.platform === 'win32') throw new CredentialStoragePrivacyError(); return null; }
+    if (process.platform === 'win32' && (typeof j.accessToken !== 'string' || (j.refreshToken !== undefined && typeof j.refreshToken !== 'string'))) throw new CredentialStoragePrivacyError();
     return {
       accessToken: j.accessToken as string,
       refreshToken: j.refreshToken as string | undefined,
@@ -195,7 +207,10 @@ function readVaultClaudeTokens(): ClaudeOAuthTokens | null {
       scopes: Array.isArray(j.scopes) ? (j.scopes as string[]) : undefined,
       source: 'vault',
     };
-  } catch { return null; }
+  } catch (cause) {
+    if (process.platform === 'win32') throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
+    return null;
+  }
 }
 
 let vaultTokenReader = readVaultClaudeTokens;
@@ -343,8 +358,9 @@ function readRawCredentialJsonFromSystem(): string | null {
   if (process.env.CLEMMY_TEST_ISOLATED_HOME === '1') return null;
   // This sync path never initiates a prompt or waits for the Keychain.
   const credFile = path.join(os.homedir(), '.claude', '.credentials.json');
-  if (existsSync(credFile)) {
-    try { return readFileSync(credFile, 'utf-8'); } catch { /* ignore */ }
+  if (process.platform === 'win32' || existsSync(credFile)) {
+    try { return process.platform === 'win32' ? readCredentialSourceFileSync(credFile) ?? null : readFileSync(credFile, 'utf-8'); }
+    catch (error) { if (isCredentialStoragePrivacyError(error)) throw error; /* ignore ordinary missing/corrupt POSIX credential */ }
   }
   return null;
 }
@@ -376,8 +392,12 @@ export function parseClaudeCredential(raw: string): ClaudeOAuthTokens {
 function getClaudeCodeTokens(): ClaudeOAuthTokens | null {
   const raw = readRawCredentialJson();
   if (!raw) return null;
-  try { return { ...parseClaudeCredential(raw), source: 'claude-code' }; }
-  catch { return null; }
+  try {
+    const parsed = parseClaudeCredential(raw);
+    if (process.platform === 'win32' && (typeof parsed.accessToken !== 'string'
+      || (parsed.refreshToken !== undefined && typeof parsed.refreshToken !== 'string'))) throw new CredentialStoragePrivacyError();
+    return { ...parsed, source: 'claude-code' };
+  } catch (cause) { if (process.platform === 'win32') throw new CredentialStoragePrivacyError(cause); return null; }
 }
 
 /** Read the stored Claude OAuth tokens, preferring Clementine's OWN vault grant
@@ -552,6 +572,7 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
       await ensureClaudeCodeReadiness();
       tokens = getStoredClaudeTokens();
     } catch (error) {
+      if (isCredentialStoragePrivacyError(error)) throw error;
       if (error instanceof ClaudeAuthError && (error.kind === 'missing' || error.kind === 'expired')) {
         await ensureClaudeCodeReadiness();
         tokens = getStoredClaudeTokens();
@@ -592,6 +613,7 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
         await waitAtMost(pending.promise, refreshWaitMs);
         tokens = getStoredClaudeTokens();
       } catch (err) {
+        if (isCredentialStoragePrivacyError(err)) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         const superseded = !claudeRefreshGrantIsCurrent(refreshGrant);
         if (superseded) {

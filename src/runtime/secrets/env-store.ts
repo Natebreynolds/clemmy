@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SecretBackend, SecretName } from './types.js';
 import { getSecretDescriptor } from './registry.js';
+import { isCredentialStoragePrivacyError, readCredentialSourceFileSync } from '../credential-private-filesystem.js';
 
 /**
  * Env backend — read-only. Reads from process.env first, then from the
@@ -18,10 +19,12 @@ import { getSecretDescriptor } from './registry.js';
  */
 
 function readEnvFile(filePath: string): Record<string, string> {
-  if (!existsSync(filePath)) return {};
+  if (process.platform !== 'win32' && !existsSync(filePath)) return {};
   try {
+    const raw = process.platform === 'win32' ? readCredentialSourceFileSync(filePath) : readFileSync(filePath, 'utf-8');
+    if (raw === undefined) return {};
     const out: Record<string, string> = {};
-    for (const line of readFileSync(filePath, 'utf-8').split('\n')) {
+    for (const line of raw.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) continue;
       const eq = trimmed.indexOf('=');
@@ -37,7 +40,8 @@ function readEnvFile(filePath: string): Record<string, string> {
       out[key] = value;
     }
     return out;
-  } catch {
+  } catch (error) {
+    if (isCredentialStoragePrivacyError(error)) throw error;
     return {};
   }
 }

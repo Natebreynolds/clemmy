@@ -2,6 +2,7 @@ import { READ_FILE_PARAMS } from './local-file-read-contract.js';
 import { WRITE_FILE_PARAMS } from './local-file-write-contract.js';
 import { spawn } from 'node:child_process';
 import { CLI_CATALOG } from '../integrations/cli-catalog/catalog.js';
+import { catalogInstallForPlatform } from '../integrations/cli-catalog/platform-install.js';
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -28,6 +29,9 @@ import { LocalFileCreateConflict } from '../runtime/harness/local-file-create-co
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
 import { mergedSpawnEnv } from '../runtime/spawn-env.js';
+import { stopWindowsProcessTree } from '../runtime/windows-process-tree.js';
+import { runCliProbeProcess } from '../runtime/cli-probe-process.js';
+import { shellCwdGuidance } from '../runtime/host-execution-context.js';
 import {
   classifyShellExecutionOutcome,
   isPackageRunnerMaterializationFailure,
@@ -1015,6 +1019,8 @@ export function annotateShellStderr(stderr: string, command: string): string {
       'Do NOT repeat the identical npx/npm-exec command. Call `local_cli_list` to find installed CLIs, then `local_cli_probe({command:"<cli>"})`; invoke the resolved absolute binary path directly. ' +
       'If no installed binary is discoverable, change the package-runner/cache strategy before one bounded retry. This local failure did not exercise the provider operation.',
     );
+  } else if (/EPERM:\s*operation not permitted,?\s*uv_cwd/i.test(stderr) && process.platform === 'win32') {
+    hints.push('CLEMENTINE HINT: Windows refused access to the current working directory. Verify that cwd exists inside an allowed workspace and that this user can access it. Use cwd:null for commands that do not need project files. Check folder access or security policy before repeating the command.');
   } else if (/EPERM:\s*operation not permitted,?\s*uv_cwd/i.test(stderr)) {
     hints.push(
       'CLEMENTINE HINT: macOS TCC blocked this Node-embedding CLI when spawned by the desktop daemon. ' +
@@ -1063,9 +1069,12 @@ export function missingBinaryHint(firstWord: string): string {
 function missingBinaryFixClause(firstWord: string): string {
   const entry = CLI_CATALOG.find((candidate) => candidate.command === firstWord);
   if (entry) {
+    const install = catalogInstallForPlatform(entry);
+    if (!install.supported) return `${install.reason} Official instructions: ${install.docsUrl}`;
     return `Clementine can install it for the user: offer, then on approval call `
-      + `cli_setup {"action":"install","catalogId":"${entry.id}"} (runs \`${entry.installCommand}\` via the approved runner).`;
+      + `cli_setup {"action":"install","catalogId":"${entry.id}"} (runs \`${install.command}\` via the approved runner).`;
   }
+  if (process.platform === 'win32') return 'Install its native Windows version using the official instructions or an applicable WinGet/npm package, then rescan command-line tools in Connect.';
   return `Install it via Homebrew/npm (\`brew install ${firstWord}\` or \`npm install -g ${firstWord}\`), or pick a different tool.`;
 }
 
@@ -1128,11 +1137,26 @@ export function shellOutputLooksInteractive(exitCode: number, stdout: string, st
   return /\(Use arrow keys\)|\u276f|\? +[A-Z][^\n]*[:?] *(\(| |$)|\[y\/N\]|press enter to/i.test(`${stdout}\n${stderr}`);
 }
 
-function runCommand(command: string, cwd: string, timeoutMs: number): Promise<ShellCommandResult> {
+let windowsShellStopping = 0;
+let windowsShellCleanupUnconfirmed = false;
+interface ShellProcessRuntime {
+  platform?: NodeJS.Platform;
+  spawnProcess?: typeof spawn;
+  stopTree?: typeof stopWindowsProcessTree;
+}
+function runCommand(command: string, cwd: string, timeoutMs: number, runtime: ShellProcessRuntime = {}): Promise<ShellCommandResult> {
   assertCommandAllowed(command);
   assertOwnStoresProtected(command, cwd);
   const stubMessage = developerToolStubBlockMessage(command);
   const externalMutation = classifyShellNetworkMutation(command).isNetworkMutation;
+  const windows = (runtime.platform ?? process.platform) === 'win32';
+  if (windows && (windowsShellStopping > 0 || windowsShellCleanupUnconfirmed)) {
+    return Promise.reject(new ShellCommandExecutionError(
+      'No command was started. The previous Windows shell process has not been confirmed stopped. Check and stop remaining processes and verify any completed effects, then restart Clem before another shell command.',
+      { phase: 'resolve', dispatch: 'not_started', effect: 'none', externalMutation,
+        errorKind: 'process_cleanup_unconfirmed' },
+    ));
+  }
   if (stubMessage) {
     return Promise.resolve({
       text: stubMessage,
@@ -1145,12 +1169,12 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
   return new Promise((resolve, reject) => {
     let settled = false;
     const commandStartedAtMs = Date.now();
-    const child = spawn(command, {
+    const child = (runtime.spawnProcess ?? spawn)(command, {
       cwd,
       shell: true,
       // Own one POSIX process group so a deadline stops the command's children
       // as well as its shell wrapper. Windows keeps its taskkill /T owner.
-      detached: process.platform !== 'win32',
+      detached: !windows,
       stdio: ['ignore', 'pipe', 'pipe'],
       // Augmented PATH so CLI-backed skills resolve on a packaged .app
       // launch instead of "command not found". See spawn-env.ts.
@@ -1159,16 +1183,21 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
 
     let stdout = '';
     let stderr = '';
-    const timeout = setTimeout(() => {
+    const timeout = setTimeout(async () => {
       if (settled) return;
       settled = true;
-      if (process.platform === 'win32' && child.pid) {
+      let timeoutCleanup: 'complete' | 'incomplete' | undefined;
+      if (windows) {
         // shell:true wraps the real command in cmd.exe; SIGTERM kills only the
         // wrapper and orphans the grandchild. taskkill /T fells the tree.
-        try {
-          spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
-        } catch { child.kill('SIGTERM'); }
-      } else if (process.platform !== 'win32' && child.pid) {
+        windowsShellStopping += 1;
+        try { timeoutCleanup = await (runtime.stopTree ?? stopWindowsProcessTree)(child); }
+        catch { timeoutCleanup = 'incomplete'; try { child.kill('SIGKILL'); } catch { /* receipt remains unconfirmed */ } }
+        finally {
+          if (timeoutCleanup === 'incomplete') windowsShellCleanupUnconfirmed = true;
+          windowsShellStopping -= 1;
+        }
+      } else if (child.pid) {
         // This is the hard tool deadline, equivalent to taskkill /F above.
         // Killing only the shell orphaned live CLI searches after timeout.
         try { process.kill(-child.pid, 'SIGKILL'); }
@@ -1176,9 +1205,14 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
       } else {
         child.kill('SIGTERM');
       }
+      if (timeoutCleanup === 'incomplete') {
+        child.stdout.destroy(); child.stderr.destroy(); child.unref();
+      }
       reject(new ShellCommandExecutionError(
-        `Command timed out after ${timeoutMs}ms.`,
-        classifyShellExecutionOutcome({ command, externalMutation, stdout, stderr, timedOut: true }),
+        `Command timed out after ${timeoutMs}ms.${timeoutCleanup === 'incomplete'
+          ? ' Windows could not confirm all child processes stopped. Check and stop remaining processes, verify any completed effects, then restart Clem before another shell command.' : ''}`,
+        { ...classifyShellExecutionOutcome({ command, externalMutation, stdout, stderr, timedOut: true }),
+          ...(timeoutCleanup ? { timeoutCleanup } : {}) },
       ));
     }, timeoutMs);
 
@@ -1271,7 +1305,21 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
   });
 }
 
+/** Component seam for owned synthetic process fixtures, never a model tool. */
+export const _testOnly_runShellCommand = runCommand;
+export function _testOnly_resetShellCleanupState(): void {
+  windowsShellStopping = 0;
+  windowsShellCleanupUnconfirmed = false;
+}
+
 function runProcess(command: string, args: string[], cwd: string, timeoutMs: number): Promise<string> {
+  if (process.platform === 'win32') return runCliProbeProcess(command, args, { cwd, timeoutMs, env: mergedSpawnEnv() }).then(result => {
+    if (result.cleanupIncomplete) throw new Error('Windows could not confirm the Git process tree stopped. Check and stop remaining processes, then restart Clem before retrying.');
+    if (result.timedOut) throw new Error(`Command timed out after ${timeoutMs}ms.`);
+    if (result.overflowed) throw new Error('Git status output exceeded its bounded limit. Narrow the workspace check before retrying.');
+    return [`exit_code: ${result.exitCode ?? 'unknown'}`, result.stdout ? `stdout:\n${result.stdout}` : '',
+      result.stderr ? `stderr:\n${annotateShellStderr(result.stderr, command)}` : ''].filter(Boolean).join('\n\n');
+  });
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
@@ -1588,7 +1636,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     description: [
       'Run a shell command in an allowed workspace directory. Ordinary commands, including local changes, run without asking. A destructive command, or one that changes something outside this machine, may first show the owner the exact command for a decision, depending on their Auto/Ask setting; a few dangerous commands are always refused. Has output and time limits.',
       '',
-      'CWD GUIDANCE: leave `cwd` null unless you have a specific reason to be elsewhere. On macOS, paths under ~/Desktop, ~/Documents, ~/Downloads, and iCloud Drive are TCC-protected from sandboxed-app children: child Node CLIs (sf, npm, etc.) spawned there throw EPERM on getcwd. The default cwd (Clementine\'s base directory, which the daemon already has TCC access to) is safe and works for tool invocations that don\'t actually depend on file context (CLI calls, API queries, etc.). Pass an explicit `cwd` only when the command genuinely needs to run in a specific project directory configured in WORKSPACE_DIRS.',
+      shellCwdGuidance(),
     ].join('\n'),
     parameters: z.object(RUN_SHELL_COMMAND_PARAMS),
     needsApproval: needsApprovalForShellSmart(),
@@ -1599,6 +1647,8 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       if (error instanceof ShellPolicyDenialError) {
         return `${SHELL_POLICY_DENIAL_PREFIX} ${error.message}`;
       }
+      if (error instanceof ShellCommandExecutionError && (error.outcome.timeoutCleanup === 'incomplete'
+        || error.outcome.errorKind === 'process_cleanup_unconfirmed')) return error.message;
       const details = error instanceof Error ? error.toString() : String(error);
       const base = `An error occurred while running the tool. Please try again. Error: ${details}`;
       // A malformed argument object never reached execute: keep the exact
@@ -1657,13 +1707,15 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       const git = findSafeCliCommand('git');
       if (!git || git.skipped) {
         const reason = git?.skipped ? git.reason : 'git was not found on PATH.';
-        return `Git is unavailable: ${reason} Install Xcode Command Line Tools or a standalone Git binary to use git_status.`;
+        return `Git is unavailable: ${reason} ${process.platform === 'win32'
+          ? 'Install Git for Windows from its official instructions, then rescan command-line tools in Connect.'
+          : 'Install Xcode Command Line Tools or a standalone Git binary to use git_status.'}`;
       }
       return formatToolOutput(
         'git_status',
         runContext,
         details,
-        await runProcess(git.command, ['status', '--short', '--branch'], resolveAllowedCwd(cwd ?? undefined), 10_000),
+        await runProcess(git.path!, ['status', '--short', '--branch'], resolveAllowedCwd(cwd ?? undefined), 10_000),
       );
     },
   });

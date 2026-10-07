@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { assertWindowsPrivateFilesystem } from '../windows-private-filesystem.js';
 import {
   chmodSync,
   copyFileSync,
@@ -82,14 +84,15 @@ test('spill paths reject traversal and every fixed directory component rejects s
   }
 });
 
-test('oversized canonical JSON is atomically stored 0600 and identical bytes dedupe', () => {
+test('oversized canonical JSON is atomically stored privately and identical bytes dedupe', () => {
   const candidate = payload('dedupe');
   storage.persistSpilledResultPayload(candidate);
   const target = storage.resultPayloadFilePath(candidate.digest);
   const first = lstatSync(target);
   assert.equal(first.isFile(), true);
   assert.equal(first.isSymbolicLink(), false);
-  assert.equal(first.mode & 0o777, 0o600);
+  if (process.platform === 'win32') assertWindowsPrivateFilesystem(target, lstatSync(target, { bigint: true }), 'file');
+  else assert.equal(first.mode & 0o777, 0o600);
   assert.equal(first.size, candidate.byteCount);
   assert.equal(path.basename(target), `${candidate.digest}.json`);
 
@@ -128,12 +131,17 @@ test('missing, tampered, wrong, weak-permissioned, and symlinked spill files fai
     storage.resultPayloadFilePath(other.digest),
     storage.resultPayloadFilePath(wrong.digest),
   );
-  chmodSync(storage.resultPayloadFilePath(wrong.digest), 0o600);
+  if (process.platform === 'win32') assertWindowsPrivateFilesystem(storage.resultPayloadFilePath(wrong.digest), lstatSync(storage.resultPayloadFilePath(wrong.digest), { bigint: true }), 'file', true);
+  else chmodSync(storage.resultPayloadFilePath(wrong.digest), 0o600);
   assert.equal(storage.readDurableResultPayload(metadata(wrong)).status, 'corrupt');
 
   const weak = payload('weak-mode');
   storage.persistSpilledResultPayload(weak);
-  chmodSync(storage.resultPayloadFilePath(weak.digest), 0o644);
+  if (process.platform === 'win32') {
+    const program = String.raw`$ErrorActionPreference='Stop'; [Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false,$true); $p=[Console]::In.ReadToEnd(); $a=Get-Acl -LiteralPath $p; $s=[System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'); $r=[System.Security.AccessControl.FileSystemAccessRule]::new($s,[System.Security.AccessControl.FileSystemRights]::Read,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $a`;
+    const result = spawnSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(program, 'utf16le').toString('base64')], { input: storage.resultPayloadFilePath(weak.digest), encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 4096 });
+    assert.equal(result.status, 0, 'controlled fixture ACL weakening must complete');
+  } else chmodSync(storage.resultPayloadFilePath(weak.digest), 0o644);
   assert.equal(storage.readDurableResultPayload(metadata(weak)).status, 'corrupt');
 
   const linked = payload('symlink-file');

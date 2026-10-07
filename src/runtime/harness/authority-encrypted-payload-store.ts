@@ -26,11 +26,15 @@ import {
   readFileSync,
   unlinkSync,
   writeSync,
+  type BigIntStats,
   type Stats,
 } from 'node:fs';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { BASE_DIR } from '../../config.js';
 import { openCanonicalArguments, sealCanonicalArguments } from './authority-argument-seal.js';
+import { syncDirectoryMetadata } from '../sync-directory.js';
+import { assertWindowsPrivateFilesystem, WindowsPrivateFilesystemError } from '../windows-private-filesystem.js';
 
 export const AUTHORITY_ENCRYPTED_PAYLOAD_VERSION = 1 as const;
 export const AUTHORITY_ENCRYPTED_PAYLOAD_CHUNK_BYTES = 12_000;
@@ -110,13 +114,17 @@ export class AuthorityEncryptedPayloadError extends Error {
       | 'invalid_authority_payload'
       | 'authority_payload_too_large'
       | 'authority_payload_storage_failed',
+    cause?: unknown,
   ) {
     super(
       code === 'authority_payload_too_large'
         ? 'authority payload exceeds the encrypted spill limit'
         : code === 'authority_payload_storage_failed'
-          ? 'authority payload could not be durably encrypted'
+          ? (cause instanceof WindowsPrivateFilesystemError
+            ? `authority payload could not be durably encrypted: ${cause.message}`
+            : 'authority payload could not be durably encrypted')
           : 'authority payload identity is invalid',
+      cause instanceof WindowsPrivateFilesystemError ? { cause } : undefined,
     );
     this.name = 'AuthorityEncryptedPayloadError';
   }
@@ -152,9 +160,11 @@ function lstatOrMissing(filePath: string): Stats | null {
 
 function requireRealDirectory(directory: string, create: boolean): void {
   let stat = lstatOrMissing(directory);
+  let created = false;
   if (stat === null && create) {
     try {
       mkdirSync(directory, { mode: DIRECTORY_MODE });
+      created = true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
@@ -163,6 +173,21 @@ function requireRealDirectory(directory: string, create: boolean): void {
   if (stat === null || stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new AuthorityEncryptedPayloadError('authority_payload_storage_failed');
   }
+  if (process.platform === 'win32' && (directory === path.dirname(AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY) || directory === AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY)) {
+    // Only new dedicated stores are hardened. Retained stores must already
+    // have the private host ACL; broadening is a refusal, not silent repair.
+    assertWindowsPrivateFilesystem(directory, lstatSync(directory, { bigint: true }), 'directory', created);
+  }
+}
+
+function privateFilePermissions(target: string, fd?: number, expected?: BigIntStats): boolean {
+  if (process.platform !== 'win32') return false;
+  try {
+    const actual = fd === undefined ? lstatSync(target, { bigint: true }) : fstatSync(fd, { bigint: true });
+    if (expected && (actual.dev !== expected.dev || actual.ino !== expected.ino || actual.nlink !== expected.nlink)) return false;
+    assertWindowsPrivateFilesystem(target, expected ?? actual, 'file');
+    return true;
+  } catch { return false; }
 }
 
 function ensurePayloadDirectory(): void {
@@ -175,12 +200,9 @@ function ensurePayloadDirectory(): void {
 }
 
 function fsyncDirectory(directory: string): void {
-  const fd = openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-  try {
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
+  syncDirectoryMetadata(directory, {
+    flags: constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  });
 }
 
 export function authorityEncryptedPayloadFilePath(payloadId: string): string {
@@ -209,11 +231,14 @@ function readSealedFile(input: {
       entry.isSymbolicLink()
       || !entry.isFile()
       || entry.nlink !== 1
-      || (entry.mode & 0o777) !== FILE_MODE
+      || (process.platform !== 'win32' && (entry.mode & 0o777) !== FILE_MODE)
       || entry.size > AUTHORITY_ENCRYPTED_PAYLOAD_MAX_FILE_BYTES
       || (input.expectedBytes !== undefined && entry.size !== input.expectedBytes)
     ) {
       return { status: 'corrupt', reason: 'encrypted authority payload metadata is invalid' };
+    }
+    if (process.platform === 'win32' && !privateFilePermissions(target)) {
+      return { status: 'corrupt', reason: 'encrypted authority payload private NTFS permissions are invalid; check folder access and PowerShell policy' };
     }
     const fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW);
     let bytes: Buffer;
@@ -223,11 +248,17 @@ function readSealedFile(input: {
         !opened.isFile()
         || opened.nlink !== 1
         || opened.size !== entry.size
-        || (opened.mode & 0o777) !== FILE_MODE
+        || (process.platform !== 'win32' && (opened.mode & 0o777) !== FILE_MODE)
       ) {
         return { status: 'corrupt', reason: 'encrypted authority payload file changed while opening' };
       }
+      if (process.platform === 'win32' && !privateFilePermissions(target, fd)) {
+        return { status: 'corrupt', reason: 'opened encrypted authority payload private NTFS permissions are invalid; check folder access and PowerShell policy' };
+      }
       bytes = readFileSync(fd);
+      if (process.platform === 'win32' && !privateFilePermissions(target, fd)) {
+        return { status: 'corrupt', reason: 'encrypted authority payload private NTFS permissions changed while reading' };
+      }
     } finally {
       closeSync(fd);
     }
@@ -239,6 +270,7 @@ function readSealedFile(input: {
     }
     return { status: 'ok', bytes };
   } catch (error) {
+    if (error instanceof WindowsPrivateFilesystemError) return { status: 'storage_error', reason: error.message };
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'ENOENT') return { status: 'missing', reason: 'encrypted authority payload is missing' };
     if (code === 'ELOOP') return { status: 'corrupt', reason: 'encrypted authority payload path is unsafe' };
@@ -268,6 +300,7 @@ function readSealedFileForPublication(input: {
   expectedDigest?: string;
 }): ReturnType<typeof readSealedFile> {
   const target = authorityEncryptedPayloadFilePath(input.payloadId);
+  const started = performance.now();
   for (let attempt = 0; attempt <= PUBLICATION_LINK_RETRY_ATTEMPTS; attempt += 1) {
     const read = readSealedFile(input);
     if (read.status !== 'corrupt') return read;
@@ -276,7 +309,10 @@ function readSealedFileForPublication(input: {
     const safeRegularFile = entry !== null
       && !entry.isSymbolicLink()
       && entry.isFile()
-      && (entry.mode & 0o777) === FILE_MODE
+      // Do not acquire a no-delete-sharing ACL handle during the two-link
+      // transition: it would prevent the publisher from removing its alias.
+      // This only permits waiting. The next one-link read must verify the ACL.
+      && (process.platform === 'win32' || (entry.mode & 0o777) === FILE_MODE)
       && entry.size <= AUTHORITY_ENCRYPTED_PAYLOAD_MAX_FILE_BYTES;
     const transitional = safeRegularFile && entry.nlink === 2;
     const settledAfterRead = safeRegularFile
@@ -285,7 +321,13 @@ function readSealedFileForPublication(input: {
         read.reason === 'encrypted authority payload metadata is invalid'
         || read.reason === 'encrypted authority payload file changed while opening'
       );
-    if ((!transitional && !settledAfterRead) || attempt === PUBLICATION_LINK_RETRY_ATTEMPTS) {
+    // Native ACL observations are not cached. Bound Windows retries by the
+    // existing wait allowance too, because repeated PowerShell observations
+    // can themselves consume that allowance. The first strict read can finish
+    // and succeed, but an incomplete transition cannot renew the budget.
+    const windowsBudgetExpired = process.platform === 'win32'
+      && performance.now() - started >= PUBLICATION_LINK_RETRY_ATTEMPTS * PUBLICATION_LINK_RETRY_INTERVAL_MS;
+    if ((!transitional && !settledAfterRead) || attempt === PUBLICATION_LINK_RETRY_ATTEMPTS || windowsBudgetExpired) {
       return read;
     }
     if (transitional) {
@@ -457,12 +499,19 @@ export function persistAuthorityEncryptedPayload(input: {
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
         FILE_MODE,
       );
-      fchmodSync(fd, FILE_MODE);
+      if (process.platform === 'win32') {
+        assertWindowsPrivateFilesystem(temp, fstatSync(fd, { bigint: true }), 'file', true);
+      } else {
+        fchmodSync(fd, FILE_MODE);
+      }
       let offset = 0;
       while (offset < sealedFile.byteLength) {
         offset += writeSync(fd, sealedFile, offset, sealedFile.byteLength - offset);
       }
       fsyncSync(fd);
+      if (process.platform === 'win32') {
+        assertWindowsPrivateFilesystem(temp, fstatSync(fd, { bigint: true }), 'file');
+      }
       closeSync(fd);
       fd = null;
       requireRealDirectory(AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY, false);
@@ -499,7 +548,7 @@ export function persistAuthorityEncryptedPayload(input: {
     }
   } catch (error) {
     if (error instanceof AuthorityEncryptedPayloadError) throw error;
-    throw new AuthorityEncryptedPayloadError('authority_payload_storage_failed');
+    throw new AuthorityEncryptedPayloadError('authority_payload_storage_failed', error);
   }
 }
 
@@ -600,6 +649,7 @@ export function readAuthorityEncryptedPayload(input: {
 interface ReclaimableFile {
   target: string;
   stat: Stats;
+  windowsIdentity?: BigIntStats;
 }
 
 type ReclaimAttempt = 'deleted' | 'referenced' | 'race' | 'unsafe';
@@ -628,14 +678,16 @@ function reclaimableAgedFile(target: string, cutoffMs: number):
       stat.isSymbolicLink()
       || !stat.isFile()
       || stat.nlink !== 1
-      || (stat.mode & 0o777) !== FILE_MODE
+      || (process.platform === 'win32' ? !privateFilePermissions(target) : (stat.mode & 0o777) !== FILE_MODE)
       || stat.size > AUTHORITY_ENCRYPTED_PAYLOAD_MAX_FILE_BYTES
       || !Number.isFinite(stat.mtimeMs)
     ) {
       return { status: 'unsafe' };
     }
     if (stat.mtimeMs >= cutoffMs) return { status: 'fresh' };
-    return { status: 'ok', file: { target, stat } };
+    const windowsIdentity = process.platform === 'win32' ? lstatSync(target, { bigint: true }) : undefined;
+    if (windowsIdentity && !privateFilePermissions(target, undefined, windowsIdentity)) return { status: 'unsafe' };
+    return { status: 'ok', file: { target, stat, ...(windowsIdentity ? { windowsIdentity } : {}) } };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { status: 'missing' };
     return { status: 'unsafe' };
@@ -660,7 +712,7 @@ function openExactReclamationFile(file: ReclaimableFile): number | null {
       current.isSymbolicLink()
       || !current.isFile()
       || current.nlink !== 1
-      || (current.mode & 0o777) !== FILE_MODE
+      || (process.platform === 'win32' ? !privateFilePermissions(file.target, undefined, file.windowsIdentity) : (current.mode & 0o777) !== FILE_MODE)
       || !sameReclamationFile(file.stat, current)
     ) return null;
     fd = openSync(file.target, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -668,7 +720,7 @@ function openExactReclamationFile(file: ReclaimableFile): number | null {
     if (
       !opened.isFile()
       || opened.nlink !== 1
-      || (opened.mode & 0o777) !== FILE_MODE
+      || (process.platform === 'win32' ? !privateFilePermissions(file.target, fd, file.windowsIdentity) : (opened.mode & 0o777) !== FILE_MODE)
       || !sameReclamationFile(current, opened)
     ) {
       closeSync(fd);

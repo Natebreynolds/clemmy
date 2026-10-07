@@ -17,11 +17,16 @@
  * dangerous spawn mechanics live here, once.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { existsSync, statSync, accessSync, constants as fsConstants } from 'node:fs';
+import { existsSync, realpathSync, statSync, accessSync, constants as fsConstants } from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { augmentPath } from './spawn-env.js';
+import { stopWindowsProcessTree, type ProcessTreeStopResult } from './windows-process-tree.js';
+
+export const SANDBOXED_SCRIPT_UNCONFIRMED_STOP_GUIDANCE =
+  'The previous script process tree could not be confirmed stopped. Its effects are uncertain. ' +
+  'Check and stop the remaining processes, then restart Clementine before running another script in this workspace.';
 
 /** Default hard cap on captured stdout so a runaway runner can't OOM the daemon. */
 export const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
@@ -160,6 +165,8 @@ export interface SandboxedSpawnOutcome {
   spawned: boolean;
   /** True when stdout exceeded the cap and the child was killed. */
   overflowed: boolean;
+  /** A Windows stop receipt, including cancellation/output overflow. */
+  timeoutCleanup?: ProcessTreeStopResult;
 }
 
 /**
@@ -168,7 +175,17 @@ export interface SandboxedSpawnOutcome {
  * `launchError` so the caller maps it to its own message. The promise settles
  * exactly once.
  */
-export function spawnSandboxedScript(input: SandboxedSpawnInput): Promise<SandboxedSpawnOutcome> {
+function createSandboxedScriptSpawner(controls: {
+  platform?: NodeJS.Platform;
+  spawnProcess?: typeof spawn;
+  stopWindowsTree?: typeof stopWindowsProcessTree;
+} = {}): (input: SandboxedSpawnInput) => Promise<SandboxedSpawnOutcome> {
+  const platform = controls.platform ?? process.platform;
+  const spawnProcess = controls.spawnProcess ?? spawn;
+  const stopWindowsTree = controls.stopWindowsTree ?? stopWindowsProcessTree;
+  // A successful stop cannot clear another concurrent script's uncertain stop.
+  const stopObligations = new Map<string, { pending: number; incomplete: boolean }>();
+  return (input: SandboxedSpawnInput): Promise<SandboxedSpawnOutcome> => {
   const maxBytes = input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const empty: SandboxedSpawnOutcome = {
     code: null, signal: null, stdout: '', stderr: '', timedOut: false,
@@ -176,16 +193,23 @@ export function spawnSandboxedScript(input: SandboxedSpawnInput): Promise<Sandbo
   };
   // Stop owns admission too: a cancelled caller never briefly launches a child.
   if (input.signal?.aborted) return Promise.resolve({ ...empty, aborted: true });
+  let workspace = path.resolve(input.cwd);
+  try { workspace = realpathSync(workspace); } catch { /* spawn owns missing cwd */ }
+  if (platform === 'win32') workspace = workspace.toLowerCase();
+  if (platform === 'win32' && stopObligations.has(workspace)) {
+    return Promise.resolve({ ...empty, timeoutCleanup: 'incomplete',
+      launchError: new Error(SANDBOXED_SCRIPT_UNCONFIRMED_STOP_GUIDANCE) });
+  }
   return new Promise<SandboxedSpawnOutcome>((resolve) => {
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = spawn(input.command, input.args, {
+      child = spawnProcess(input.command, input.args, {
         cwd: input.cwd,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: input.env,
         // A deadline/Stop owns the process group, including nested CLIs. A
         // script can deliberately escape it; this is not an OS sandbox.
-        detached: process.platform !== 'win32',
+        detached: platform !== 'win32',
         windowsHide: true,
       });
     } catch (error) {
@@ -203,8 +227,11 @@ export function spawnSandboxedScript(input: SandboxedSpawnInput): Promise<Sandbo
     const spawned = child.pid !== undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let escalation: ReturnType<typeof setTimeout> | undefined;
+    let windowsCleanupPending = false;
+    let timeoutCleanup: ProcessTreeStopResult | undefined;
+    let pendingClose: Pick<SandboxedSpawnOutcome, 'code' | 'signal' | 'launchError'> | undefined;
     const signalTree = (signal: NodeJS.Signals): void => {
-      if (process.platform !== 'win32' && child.pid) {
+      if (platform !== 'win32' && child.pid) {
         try { process.kill(-child.pid, signal); }
         catch (error) {
           // ESRCH means the owned group is gone. Do not address a possibly
@@ -213,27 +240,23 @@ export function spawnSandboxedScript(input: SandboxedSpawnInput): Promise<Sandbo
             try { child.kill(signal); } catch { /* outcome remains stopped/uncertain */ }
           }
         }
-      } else if (process.platform === 'win32' && child.pid) {
-        try {
-          const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
-            stdio: 'ignore', windowsHide: true,
-          });
-          killer.once('error', () => { try { child.kill(signal); } catch { /* already exited */ } });
-        } catch { try { child.kill(signal); } catch { /* already exited */ } }
       } else {
         try { child.kill(signal); } catch { /* launch never started */ }
       }
     };
     const finish = (details: Pick<SandboxedSpawnOutcome, 'code' | 'signal' | 'launchError'>): void => {
       if (settled) return;
+      if (windowsCleanupPending) { pendingClose = details; return; }
       settled = true;
       if (timer) clearTimeout(timer);
       if (escalation) clearTimeout(escalation);
       input.signal?.removeEventListener('abort', onAbort);
       // A wrapper can exit on TERM while a child ignores it and has its stdio
       // detached. Its close event is not proof that the owned group stopped.
-      if (stopping && process.platform !== 'win32') signalTree('SIGKILL');
-      resolve({ ...details, stdout, stderr, timedOut, overflowed, aborted, spawned });
+      if (stopping && platform !== 'win32') signalTree('SIGKILL');
+      resolve({ ...details, ...(stopping && platform === 'win32' ? { code: null } : {}),
+        stdout, stderr, timedOut, overflowed, aborted, spawned,
+        ...(timeoutCleanup ? { timeoutCleanup } : {}) });
     };
     const stop = (reason: 'abort' | 'timeout' | 'overflow'): void => {
       if (settled || stopping) return;
@@ -241,6 +264,27 @@ export function spawnSandboxedScript(input: SandboxedSpawnInput): Promise<Sandbo
       aborted = reason === 'abort';
       timedOut = reason === 'timeout';
       overflowed = reason === 'overflow';
+      if (platform === 'win32' && child.pid) {
+        // Hold the process lane before asking the OS to stop the exact tree.
+        // A parent's late close event is not a descendant-cleanup receipt.
+        windowsCleanupPending = true;
+        const obligation = stopObligations.get(workspace) ?? { pending: 0, incomplete: false };
+        obligation.pending += 1;
+        stopObligations.set(workspace, obligation);
+        void Promise.resolve().then(() => stopWindowsTree(child)).catch(() => 'incomplete' as const).then(status => {
+          timeoutCleanup = status;
+          obligation.pending -= 1;
+          obligation.incomplete ||= status === 'incomplete';
+          if (!obligation.pending && !obligation.incomplete) stopObligations.delete(workspace);
+          windowsCleanupPending = false;
+          // Descendants can retain inherited pipes after their wrapper exits.
+          // The bounded OS receipt owns settlement, never the close callback.
+          child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
+          if (status === 'incomplete') child.unref();
+          finish(pendingClose ?? { code: null, signal: null });
+        });
+        return;
+      }
       signalTree('SIGTERM');
       escalation = setTimeout(() => signalTree('SIGKILL'), 2_000);
       escalation.unref?.();
@@ -269,4 +313,13 @@ export function spawnSandboxedScript(input: SandboxedSpawnInput): Promise<Sandbo
     child.stdin.on('error', () => { /* child closed stdin early */ });
     try { child.stdin.end(input.stdinPayload); } catch { /* stdin optional */ }
   });
+  };
 }
+
+const spawnDefaultSandboxedScript = createSandboxedScriptSpawner();
+export function spawnSandboxedScript(input: SandboxedSpawnInput): Promise<SandboxedSpawnOutcome> {
+  return spawnDefaultSandboxedScript(input);
+}
+
+/** Isolated process-control fixture; never changes the production registry. */
+export const _testOnly_createSandboxedScriptSpawner = createSandboxedScriptSpawner;

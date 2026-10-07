@@ -66,6 +66,7 @@ import {
 } from './credentials-bridge.js';
 import { addWorkspaceDir, ensureHomeEnv, saveUserProfile, setHomeEnv, type ProfilePatch } from './setup-bridge.js';
 import { importUsableCodexOAuthTokens, persistCodexOAuthTokens, runCodexOAuthLogin } from './codex-oauth.js';
+import { CredentialStoragePrivacyError, isCredentialStoragePrivacyError, readCredentialFileSync, readCredentialSourceFileSync } from './credential-private-filesystem.js';
 import { hasPersistedCodexGrant } from './auth-grant.js';
 import { redactSensitiveText } from './redaction.js';
 import {
@@ -1643,24 +1644,40 @@ function getWebhookSecret(): string {
   // load matches the daemon's auth.
   // The daemon's home is ~/.clementine-next; .env is the dev path, and
   // the file vault is the fresh desktop setup path.
-  const envFile = path.join(HOME, '.clementine-next', '.env');
-  if (existsSync(envFile)) {
+  const credentialHome = process.env.CLEMENTINE_HOME || path.join(HOME, '.clementine-next');
+  const vaultFile = path.join(credentialHome, 'state', 'secrets-vault.json');
+  // Verify an existing Windows vault before any missing-file fallback. The
+  // selected home matches the wizard/daemon; no alternate profile is consulted.
+  const windowsVaultRaw = process.platform === 'win32' ? readCredentialFileSync(vaultFile) : undefined;
+  let windowsVault: { version?: string; entries?: Record<string, string> } | undefined;
+  if (windowsVaultRaw !== undefined) {
     try {
-      for (const line of readFileSync(envFile, 'utf-8').split('\n')) {
+      windowsVault = JSON.parse(windowsVaultRaw) as typeof windowsVault;
+      if (!windowsVault || windowsVault.version !== 'v1' || !windowsVault.entries || typeof windowsVault.entries !== 'object'
+        || Array.isArray(windowsVault.entries) || Object.values(windowsVault.entries).some(value => typeof value !== 'string')) throw new CredentialStoragePrivacyError();
+    } catch (cause) { throw new CredentialStoragePrivacyError(cause); }
+  }
+  const envFile = path.join(credentialHome, '.env');
+  if (process.platform === 'win32' || existsSync(envFile)) {
+    try {
+      const rawEnv = process.platform === 'win32' ? readCredentialSourceFileSync(envFile) : readFileSync(envFile, 'utf-8');
+      for (const line of (rawEnv ?? '').split('\n')) {
         const m = line.match(/^WEBHOOK_SECRET=(.*)$/);
         if (m) return m[1].trim();
       }
-    } catch {
+    } catch (error) {
+      if (isCredentialStoragePrivacyError(error)) throw error;
       // fall through to the file vault
     }
   }
-  const vaultFile = path.join(HOME, '.clementine-next', 'state', 'secrets-vault.json');
-  if (existsSync(vaultFile)) {
+  if (process.platform === 'win32' || existsSync(vaultFile)) {
     try {
-      const parsed = JSON.parse(readFileSync(vaultFile, 'utf-8')) as { version?: string; entries?: Record<string, string> };
+      if (process.platform === 'win32' && windowsVaultRaw === undefined) return '';
+      const parsed = process.platform === 'win32' ? windowsVault! : JSON.parse(readFileSync(vaultFile, 'utf-8')) as { version?: string; entries?: Record<string, string> };
       const token = parsed.version === 'v1' ? parsed.entries?.webhook_secret : undefined;
       if (token) return token;
-    } catch {
+    } catch (cause) {
+      if (process.platform === 'win32') throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
       // fall through to empty; boot should have generated this already
     }
   }

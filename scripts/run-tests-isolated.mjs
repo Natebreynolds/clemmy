@@ -88,6 +88,18 @@ function fileBudgetMs(argv) {
 
 function killProcessTree(pid, signal = 'SIGKILL') {
   if (!pid) return;
+  if (process.platform === 'win32') {
+    // Windows has no negative-PID process groups. Bound cleanup to this
+    // runner's exact child tree so a timed-out test cannot strand its workers.
+    const taskkill = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
+    const result = spawnSync(taskkill, ['/PID', String(pid), '/T', '/F'], {
+      windowsHide: true, stdio: 'ignore', timeout: 5_000,
+    });
+    if (result.status !== 0) {
+      try { process.kill(pid, signal); } catch { /* already gone */ }
+    }
+    return;
+  }
   try {
     process.kill(-pid, signal);
   } catch {

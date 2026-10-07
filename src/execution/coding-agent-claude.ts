@@ -23,6 +23,7 @@ import type {
   SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import { resolveClaudeCliPath } from '../runtime/harness/claude-headless-model.js';
+import { claudeSdkCliLaunchOptions } from '../runtime/harness/claude-cli-launch.js';
 import { assertLiveModelTransportAllowed } from '../runtime/harness/live-model-guard.js';
 import {
   AsyncQueue,
@@ -207,6 +208,7 @@ export const claudeCodingAgent: CodingAgentBridge = {
       cwd: input.cwd,
       env: input.env,
       ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
+      ...claudeSdkCliLaunchOptions(pathToClaudeCodeExecutable),
       ...(input.model ? { model: input.model } : {}),
       ...(input.resume ? { resume: input.agentSessionId } : { sessionId: input.agentSessionId }),
       persistSession: true,

@@ -177,6 +177,8 @@ export async function commitLeftovers(worktreePath: string, message: string): Pr
 export interface TestRunResult {
   exitCode: number | null;
   timedOut: boolean;
+  /** Windows timeout receipts distinguish stopped trees from failed cleanup. */
+  timeoutCleanup?: 'complete' | 'incomplete';
   tail: string;
   durationMs: number;
 }
@@ -193,26 +195,67 @@ export function runTestCommand(command: string, worktreePath: string, timeoutMs 
   return new Promise((resolve) => {
     let tail = '';
     let timedOut = false;
+    let timeoutCleanup: Promise<'complete' | 'incomplete'> | undefined;
+    let finished = false;
     const append = (chunk: Buffer): void => { tail = (tail + chunk.toString('utf-8')).slice(-8_000); };
-    const child = spawn('/bin/sh', ['-c', command], {
+    const windows = process.platform === 'win32';
+    // A test command is intentionally shell text. Node's Windows shell path
+    // supplies cmd.exe's outer quoting so quoted executables in Program Files
+    // survive /s /c; normal argv escaping is not cmd.exe syntax.
+    const child = spawn(windows ? command : '/bin/sh', windows ? [] : ['-c', command], {
       cwd: worktreePath,
       env: { ...buildCodingAgentEnv(), CI: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
-      detached: true,
+      detached: !windows,
+      windowsHide: true,
+      shell: windows ? (process.env.ComSpec || 'cmd.exe') : false,
     });
     const timer = setTimeout(() => {
       timedOut = true;
-      try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      if (!child.pid) return;
+      if (windows) {
+        // cmd.exe owns the test's descendants. Killing only the shell leaves
+        // watchers running after the host has already reported a timeout.
+        const taskkill = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
+        const killer = spawn(taskkill, ['/pid', String(child.pid), '/T', '/F'], {
+          env: buildCodingAgentEnv(), windowsHide: true, stdio: 'ignore',
+        });
+        timeoutCleanup = new Promise(resolveCleanup => {
+          let settled = false;
+          const settle = (complete: boolean): void => {
+            if (settled) return;
+            settled = true; clearTimeout(cleanupTimer);
+            if (!complete) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
+            resolveCleanup(complete ? 'complete' : 'incomplete');
+          };
+          const cleanupTimer = setTimeout(() => {
+            try { killer.kill('SIGKILL'); } catch { /* already gone */ }
+            settle(false);
+          }, 5_000);
+          killer.on('error', () => settle(false));
+          killer.on('close', (code) => settle(code === 0));
+        });
+        void timeoutCleanup.then(status => { if (status === 'incomplete') void finish(null); });
+      } else {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
     }, timeoutMs);
     child.stdout.on('data', append);
     child.stderr.on('data', append);
-    child.on('error', (error) => {
+    const finish = async (code: number | null, errorMessage?: string): Promise<void> => {
+      if (finished) return;
       clearTimeout(timer);
-      resolve({ exitCode: null, timedOut, tail: `${tail}\n${error.message}`.slice(-8_000), durationMs: Date.now() - startedAt });
-    });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ exitCode: timedOut ? null : code, timedOut, tail, durationMs: Date.now() - startedAt });
-    });
+      const cleanup = await timeoutCleanup;
+      if (finished) return;
+      finished = true;
+      if (errorMessage) tail = `${tail}\n${errorMessage}`.slice(-8_000);
+      if (cleanup === 'incomplete') {
+        tail = `${tail}\nTest timed out; Windows could not confirm descendant cleanup. Check and stop remaining test processes before retrying.`.slice(-8_000);
+        child.stdout.destroy(); child.stderr.destroy(); child.unref();
+      }
+      resolve({ exitCode: timedOut ? null : code, timedOut, ...(cleanup ? { timeoutCleanup: cleanup } : {}), tail, durationMs: Date.now() - startedAt });
+    };
+    child.on('error', error => { void finish(null, error.message); });
+    child.on('close', code => { void finish(code); });
   });
 }

@@ -23,8 +23,9 @@ import { transcribeAudio, hasOpenAiKey } from '../runtime/transcribe.js';
 import { getBuildInfo } from '../runtime/build-info.js';
 import { getStorageInventory } from '../runtime/storage-inventory.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationTaskMode, connectionContinuationAudience, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
-import { transcribeLocalMeetingAudio } from '../integrations/local-meetings/whisper-runtime.js';
+import { LocalWhisperRuntimeError, transcribeLocalMeetingAudio } from '../integrations/local-meetings/whisper-runtime.js';
 import * as childProcess from 'node:child_process';
+import { launchWindowsDefaultApp } from '../runtime/windows-powershell.js';
 import matter from 'gray-matter';
 import { registerConsoleAgentsRoutes } from './console-agents-routes.js';
 import { registerProjectRecordRoutes } from '../projects/project-routes.js';
@@ -615,6 +616,7 @@ import {
   recordConnectedCli,
   statusForSearchResults,
 } from '../integrations/cli-catalog/catalog.js';
+import { catalogInstallForPlatform } from '../integrations/cli-catalog/platform-install.js';
 import { isInternalSessionId } from '../execution/scope.js';
 import {
   buildUnifiedSessionList,
@@ -1625,12 +1627,16 @@ async function workflowCliConnectionCheck(item: WorkflowToolReadinessItem): Prom
   const signedOut = installed && health?.authStatus === 'signed_out';
   const nextActions: WorkflowToolConnectionAction[] = [];
   if (!installed) {
-    nextActions.push({
+    const recipe = catalogInstallForPlatform(entry);
+    nextActions.push(recipe.supported ? {
       kind: 'cli_install',
       label: `Install ${entry.name}`,
-      detail: `Runs \`${entry.installCommand}\` via the approved install runner.`,
+      detail: `Runs \`${recipe.command}\` via the approved install runner.`,
       method: 'POST',
       endpoint: '/api/console/cli-catalog/install',
+    } : {
+      kind: 'cli_install_manual', label: `Install ${entry.name} for Windows`,
+      detail: recipe.reason, href: recipe.docsUrl,
     });
   } else if (signedOut) {
     if (entry.authHeadless && entry.authCommand) {
@@ -3902,7 +3908,14 @@ export function registerConsoleRoutes(
   app: Express,
   isAuthorized: (req: Request) => boolean,
   assistant: ClementineAssistant,
-  opts?: { serveLegacyAtRoot?: boolean },
+  opts?: { serveLegacyAtRoot?: boolean; voiceTranscriptionRuntime?: {
+    transcribeLocal: typeof transcribeLocalMeetingAudio;
+    hasCloudKey: typeof hasOpenAiKey;
+    transcribeCloud: typeof transcribeAudio;
+  }; fileOpenRuntime?: {
+    platform: NodeJS.Platform;
+    launchWindowsDefaultApp: typeof launchWindowsDefaultApp;
+  } },
 ): void {
   // Module load identifies this daemon process. Any unfinished desktop lease
   // owned by a prior process is necessarily orphaned, so make it resumable now
@@ -5422,7 +5435,7 @@ export function registerConsoleRoutes(
   /** Read a file's text content for inline preview. Path MUST resolve
    *  inside VAULT_DIR — anything outside is rejected. Binary-looking
    *  files return a hint instead of content; the dashboard then offers
-   *  "Open in Finder" instead of trying to render bytes as text. */
+   *  "Open in default app" instead of trying to render bytes as text. */
   app.get('/api/console/files/preview', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const raw = typeof req.query.path === 'string' ? req.query.path : '';
@@ -5447,7 +5460,7 @@ export function registerConsoleRoutes(
           ext,
           bytes: st.size,
           previewable: false,
-          reason: `${ext || 'binary'} files preview in the default app — click Open in Finder`,
+          reason: `${ext || 'binary'} files preview in the default app — click Open in default app`,
         });
         return;
       }
@@ -5469,11 +5482,11 @@ export function registerConsoleRoutes(
     }
   });
 
-  /** Open a vault file in the user's default app (macOS `open`). Pure
+  /** Open a vault file in the user's default app. Pure
    *  side effect — no body. Path safety identical to /preview. Used
    *  for HTML reports, PDFs, screenshots, anything that's better
-   *  viewed in Finder/Preview/Safari than rendered inline. */
-  app.post('/api/console/files/open', (req, res) => {
+   *  viewed in its associated application than rendered inline. */
+  app.post('/api/console/files/open', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const raw = typeof req.query.path === 'string' ? req.query.path : '';
     if (!raw) { res.status(400).json({ error: 'path required' }); return; }
@@ -5485,8 +5498,18 @@ export function registerConsoleRoutes(
         return;
       }
       if (!fs.existsSync(resolved)) { res.status(404).json({ error: 'not found' }); return; }
-      if (process.platform !== 'darwin') {
-        res.status(501).json({ error: 'open only implemented on macOS — use Finder/Explorer manually' });
+      const platform = opts?.fileOpenRuntime?.platform ?? process.platform;
+      if (platform === 'win32') {
+        try {
+          await (opts?.fileOpenRuntime?.launchWindowsDefaultApp ?? launchWindowsDefaultApp)(resolved);
+          res.json({ ok: true });
+        } catch {
+          res.status(500).json({ error: 'Windows did not confirm application launch. Check whether a window opened before retrying, or open the file manually in your file manager.' });
+        }
+        return;
+      }
+      if (platform !== 'darwin') {
+        res.status(501).json({ error: 'Opening files is not supported on this platform — open the file manually in your file manager.' });
         return;
       }
       // spawn is detached + unref'd so the spawn child doesn't block
@@ -8555,7 +8578,9 @@ export function registerConsoleRoutes(
     const entry = findCatalogEntry(id);
     if (!entry) { res.status(404).json({ error: 'unknown catalog id: ' + id }); return; }
     try {
-      const job = startApprovedInstallCommand(entry.installCommand, `Install ${entry.name}`, { cliCatalogId: entry.id });
+      const recipe = catalogInstallForPlatform(entry);
+      if (!recipe.supported) { res.status(400).json({ error: recipe.reason, status: 'manual_install_required', docsUrl: recipe.docsUrl }); return; }
+      const job = startApprovedInstallCommand(recipe.command, `Install ${entry.name}`, { cliCatalogId: entry.id });
       res.json({ job, entry });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
@@ -16814,14 +16839,24 @@ export function registerConsoleRoutes(
     try {
       await fs.promises.writeFile(tmp, bytes);
       try {
-        const local = await transcribeLocalMeetingAudio({ audioPath: tmp });
+        const local = await (opts?.voiceTranscriptionRuntime?.transcribeLocal ?? transcribeLocalMeetingAudio)({ audioPath: tmp });
         res.json({ text: (local.text || '').trim(), engine: 'local' });
         return;
       } catch (localErr) {
+        if (localErr instanceof LocalWhisperRuntimeError && (localErr.code === 'TRANSCRIPTION_CLEANUP_PENDING'
+          || localErr.code === 'TRANSCRIPTION_CLEANUP_UNKNOWN' || localErr.code === 'TRANSCRIPTION_CANCELLED')) {
+          const message = localErr.code === 'TRANSCRIPTION_CLEANUP_PENDING'
+            ? 'Local transcription is stopping. Wait for cleanup to finish before recording again. No cloud transcription was started.'
+            : localErr.code === 'TRANSCRIPTION_CLEANUP_UNKNOWN'
+              ? 'Local transcription could not confirm that its processes stopped. Close any remaining local transcription processes and restart Clementine before retrying. No cloud transcription was started.'
+              : 'Local transcription was stopped. No cloud transcription was started. Start a new recording when you are ready.';
+          res.status(409).json({ error: message, code: localErr.code });
+          return;
+        }
         // On-device runtime not ready (model/cli missing) — fall back to OpenAI
         // whisper-1 only if a key exists, else explain how to enable local.
-        if (hasOpenAiKey()) {
-          const result = await transcribeAudio(tmp);
+        if ((opts?.voiceTranscriptionRuntime?.hasCloudKey ?? hasOpenAiKey)()) {
+          const result = await (opts?.voiceTranscriptionRuntime?.transcribeCloud ?? transcribeAudio)(tmp);
           if (result.ok) { res.json({ text: result.text.trim(), engine: 'openai' }); return; }
           res.status(502).json({ error: result.error });
           return;

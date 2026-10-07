@@ -16,15 +16,17 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
+import { assertWindowsPrivateFilesystem } from '../windows-private-filesystem.js';
 
-const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-authority-payload-'));
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-private-ntfs-test-authority-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.CLEMMY_AUTHORITY_SEAL_KEY = 'a'.repeat(64);
+process.env.CLEMMY_TEST_PRIVATE_ACL_DIAGNOSTICS = '1';
 
 const store = await import('./authority-encrypted-payload-store.js');
 const seal = await import('./authority-argument-seal.js');
@@ -48,6 +50,19 @@ test.after(() => {
   RECLAMATION_DB.close();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
+
+function weakenFixturePermissions(target: string): void {
+  if (process.platform !== 'win32') { chmodSync(target, 0o644); return; }
+  const script = String.raw`$ErrorActionPreference='Stop'; [Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false,$true); $p=[Console]::In.ReadToEnd(); $a=Get-Acl -LiteralPath $p; $sid=[System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'); $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,[System.Security.AccessControl.FileSystemRights]::ReadAndExecute,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $a`;
+  const command = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const result = spawnSync(command, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { input: target, encoding: 'utf8', timeout: 10_000, maxBuffer: 4096, windowsHide: true });
+  assert.equal(result.status, 0, 'controlled fixture ACL weakening must complete');
+}
+
+function writePrivateFixture(target: string, value: string): void {
+  writeFileSync(target, value, { mode: 0o600 });
+  if (process.platform === 'win32') assertWindowsPrivateFilesystem(target, lstatSync(target, { bigint: true }), 'file', true);
+}
 
 test('many-file manifest beyond the row-seal ceiling remains ciphertext-only and round-trips exactly', () => {
   const signedNeedle = 'https://object.example/private?X-Amz-Credential=DO_NOT_PERSIST';
@@ -135,7 +150,7 @@ test('tamper and weak permissions fail closed without returning partial plaintex
     bindingDigest: 'f'.repeat(64),
     bytes: Buffer.from('https://signed.example/two?secret=yes'),
   });
-  chmodSync(store.authorityEncryptedPayloadFilePath(second.payloadId), 0o644);
+  weakenFixturePermissions(store.authorityEncryptedPayloadFilePath(second.payloadId));
   assert.equal(
     store.readAuthorityEncryptedPayload({
       reference: second,
@@ -538,8 +553,8 @@ test('unsafe and symlinked canonical-looking entries are ignored', () => {
     store.AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY,
     `${'7'.repeat(64)}.sealed.json`,
   );
-  writeFileSync(weakPath, 'opaque', { mode: 0o600 });
-  chmodSync(weakPath, 0o644);
+  writePrivateFixture(weakPath, 'opaque');
+  weakenFixturePermissions(weakPath);
   makeOld(weakPath);
 
   let symlinkPath: string | null = null;
@@ -568,8 +583,8 @@ test('only horizon-aged safe temp files are cleaned and scanning is bounded', ()
     store.AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY,
     `.${'a'.repeat(64)}.${process.pid}.${randomUUID()}.tmp`,
   );
-  writeFileSync(oldTemp, 'opaque', { mode: 0o600 });
-  writeFileSync(freshTemp, 'opaque', { mode: 0o600 });
+  writePrivateFixture(oldTemp, 'opaque');
+  writePrivateFixture(freshTemp, 'opaque');
   makeOld(oldTemp);
 
   const result = sweep();

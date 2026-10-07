@@ -27,6 +27,7 @@ import {
   mcpToolAllowedByScope,
 } from '../mcp-tool-authority.js';
 import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from './claude-headless-model.js';
+import { claudeSdkCliLaunchOptions } from './claude-cli-launch.js';
 import {
   buildGatedToolPermission,
   surfaceDeferredConversationalApproval,
@@ -2977,6 +2978,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   const sdkOptions: ClaudeAgentOptions = {
     env,
     ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
+    ...claudeSdkCliLaunchOptions(pathToClaudeCodeExecutable),
     model: options.modelId ? claudeCliModelArg(options.modelId) : undefined,
     cwd: PKG_DIR,
     persistSession: false,

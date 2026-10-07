@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AuthMode, Models } from './types.js';
 import { isStrongLocalSecret } from './runtime/security.js';
+import { CredentialStoragePrivacyError, isCredentialStoragePrivacyError, readCredentialFileSync, readCredentialSourceFileSync } from './runtime/credential-private-filesystem.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,11 +48,9 @@ if (
 
 export const BASE_DIR = DEFAULT_BASE_DIR;
 
-function parseEnvFile(envPath: string): Record<string, string> {
-  if (!existsSync(envPath)) return {};
-
+function parseEnvText(text: string): Record<string, string> {
   const result: Record<string, string> = {};
-  for (const rawLine of readFileSync(envPath, 'utf-8').split('\n')) {
+  for (const rawLine of text.split('\n')) {
     // Preserve trailing whitespace on values — some folder names
     // carry significant trailing spaces (e.g. a project folder a
     // user named with a stray space at the end). Strip only leading
@@ -82,10 +81,19 @@ function envSearchPaths(): string[] {
   ];
 }
 
-export const ACTIVE_ENV_FILES = envSearchPaths()
-  .filter((filePath, index, items) => existsSync(filePath) && items.indexOf(filePath) === index);
-
-const env = Object.assign({}, ...ACTIVE_ENV_FILES.map((filePath) => parseEnvFile(filePath)));
+function captureEnvFiles(): { files: string[]; environment: Record<string, string> } {
+  const files: string[] = []; const environment: Record<string, string> = {};
+  for (const filePath of [...new Set(envSearchPaths())]) {
+    const raw = process.platform === 'win32' ? readCredentialSourceFileSync(filePath)
+      : existsSync(filePath) ? readFileSync(filePath, 'utf-8') : undefined;
+    if (raw === undefined) continue;
+    files.push(filePath); Object.assign(environment, parseEnvText(raw));
+  }
+  return { files, environment };
+}
+const initialEnvFiles = captureEnvFiles();
+export const ACTIVE_ENV_FILES = initialEnvFiles.files;
+const env = initialEnvFiles.environment;
 
 function getEnv(key: string, fallback = ''): string {
   return process.env[key] ?? env[key] ?? fallback;
@@ -130,9 +138,7 @@ export function _setRuntimeConfigCaptureObserverForTest(
 }
 
 function captureRuntimeEnvironment(): Readonly<Record<string, string>> {
-  const activeEnvFiles = envSearchPaths()
-    .filter((filePath, index, items) => existsSync(filePath) && items.indexOf(filePath) === index);
-  const currentEnv = Object.assign({}, ...activeEnvFiles.map((filePath) => parseEnvFile(filePath)));
+  const currentEnv = captureEnvFiles().environment;
   runtimeConfigCaptureObserverForTest?.('environment');
   return Object.freeze(currentEnv);
 }
@@ -140,14 +146,21 @@ function captureRuntimeEnvironment(): Readonly<Record<string, string>> {
 function captureSecretVault(): Readonly<Record<string, string>> {
   const vaultPath = path.join(BASE_DIR, 'state', 'secrets-vault.json');
   let entries: Record<string, string> = {};
-  if (existsSync(vaultPath)) {
+  if (process.platform === 'win32' || existsSync(vaultPath)) {
     try {
-      const parsed = JSON.parse(readFileSync(vaultPath, 'utf-8')) as {
+      const raw = process.platform === 'win32' ? readCredentialFileSync(vaultPath) : readFileSync(vaultPath, 'utf-8');
+      if (raw === undefined) { runtimeConfigCaptureObserverForTest?.('secret_vault'); return Object.freeze(entries); }
+      const parsed = JSON.parse(raw) as {
         version?: string;
         entries?: Record<string, string>;
       };
-      if (parsed.version === 'v1' && parsed.entries) entries = { ...parsed.entries };
-    } catch {
+      if (parsed.version === 'v1' && parsed.entries) {
+        if (process.platform === 'win32' && (typeof parsed.entries !== 'object' || Array.isArray(parsed.entries)
+          || Object.values(parsed.entries).some(value => typeof value !== 'string'))) throw new CredentialStoragePrivacyError();
+        entries = { ...parsed.entries };
+      } else if (process.platform === 'win32') throw new CredentialStoragePrivacyError();
+    } catch (cause) {
+      if (process.platform === 'win32') throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
       entries = {};
     }
   }

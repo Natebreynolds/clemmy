@@ -1,7 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { existsSync } from 'node:fs';
 import { Usage } from '@openai/agents-core';
 import type { AgentInputItem, AgentOutputItem, Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
@@ -15,6 +14,7 @@ import { assertConversationProtocolAtProviderBoundary } from './conversation-pro
 import { resolveModelCapability, stripPromptCacheLayerSentinels } from './model-wire-registry.js';
 import type { ReasoningEffort } from './reasoning-effort.js';
 import { redactSensitiveText } from '../security.js';
+import { claudeCliLaunch, resolveClaudeCliOnPath } from './claude-cli-launch.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-headless-model' });
@@ -52,21 +52,8 @@ export function claudeHeadlessCliAvailable(): boolean {
  */
 export function resolveClaudeCliPath(): string | null {
   const override = (process.env.CLAUDE_CLI_PATH || '').trim();
-  if (override && existsSync(override)) return override;
-  const exts = process.platform === 'win32' ? ['.cmd', '.exe', '.bat', ''] : [''];
   const dirs = augmentPath(process.env.PATH).split(path.delimiter);
-  for (const dir of dirs) {
-    if (!dir) continue;
-    for (const ext of exts) {
-      try {
-        const candidate = path.join(dir, `claude${ext}`);
-        if (existsSync(candidate)) return candidate;
-      } catch {
-        /* unreadable PATH entry — keep scanning */
-      }
-    }
-  }
-  return null;
+  return resolveClaudeCliOnPath({ directories: dirs, override });
 }
 
 export type ClaudeSubscriptionTransport = 'headless' | 'raw_messages';
@@ -203,7 +190,11 @@ async function probeSupportedHeadlessFlags(command: string): Promise<Set<string>
   try {
     const { execFile } = await import('node:child_process');
     const help = await new Promise<string>((resolve, reject) => {
-      execFile(command, ['--help'], { timeout: 8000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderrText) => {
+      const launch = claudeCliLaunch(command, ['--help']);
+      execFile(launch.command, launch.args, {
+        timeout: 8000, maxBuffer: 4 * 1024 * 1024,
+        ...(Object.keys(launch.envPatch).length ? { env: { ...process.env, ...launch.envPatch } } : {}),
+      }, (err, stdout, stderrText) => {
         const combined = `${stdout ?? ''}${stderrText ?? ''}`;
         if (combined.trim()) resolve(combined);
         else reject(err ?? new Error('empty --help output'));
@@ -679,8 +670,9 @@ async function* runClaudeHeadlessAttempt(
     emittedText: '',
     rawEvents: 0,
   };
-  const child = spawnImpl(command, args, {
-    env,
+  const launch = claudeCliLaunch(command, args);
+  const child = spawnImpl(launch.command, launch.args, {
+    env: { ...env, ...launch.envPatch },
     cwd: process.cwd(),
     stdio: ['pipe', 'pipe', 'pipe'],
   }) as ChildProcessWithoutNullStreams;

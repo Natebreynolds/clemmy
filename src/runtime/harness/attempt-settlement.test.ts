@@ -6,6 +6,36 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+test('unconfirmed shell cleanup cannot authorize a repeat, and preserves uncertain external effects', async () => {
+  const { attemptSignalsFromShellExecutionOutcome } = await import('./attempt-settlement.js');
+  const { classifyAttemptOutcome } = await import('./attempt-outcome.js');
+  const local = classifyAttemptOutcome(attemptSignalsFromShellExecutionOutcome({
+    phase: 'provider_execution', dispatch: 'not_applicable', effect: 'none',
+    externalMutation: false, errorKind: 'timeout', timeoutCleanup: 'incomplete',
+  }));
+  assert.equal(local.kind, 'unknown');
+  assert.equal(local.directive.retrySameCandidate, false);
+  assert.equal(local.directive.action, 'stop_and_explain');
+  const external = classifyAttemptOutcome(attemptSignalsFromShellExecutionOutcome({
+    phase: 'provider_execution', dispatch: 'unknown', effect: 'possible',
+    externalMutation: true, errorKind: 'timeout', timeoutCleanup: 'incomplete',
+  }));
+  assert.equal(external.kind, 'uncertain_write');
+  assert.equal(external.directive.retrySameCandidate, false);
+  assert.equal(external.directive.requiresReconciliation, true);
+  const blocked = classifyAttemptOutcome(attemptSignalsFromShellExecutionOutcome({
+    phase: 'resolve', dispatch: 'not_started', effect: 'none', externalMutation: true,
+    errorKind: 'process_cleanup_unconfirmed',
+  }));
+  assert.equal(blocked.kind, 'unknown');
+  assert.equal(blocked.directive.retrySameCandidate, false);
+  const stoppedRead = classifyAttemptOutcome(attemptSignalsFromShellExecutionOutcome({
+    phase: 'provider_execution', dispatch: 'not_applicable', effect: 'none',
+    externalMutation: false, errorKind: 'timeout', timeoutCleanup: 'complete',
+  }));
+  assert.equal(stoppedRead.kind, 'transient', 'confirmed read cleanup retains the normal bounded recovery route');
+});
+
 // "A string payload never settles success" is right about PROSE and wrong about
 // a serialized envelope. negativeStringEnvelope already parsed a JSON string to
 // settle successful:false, so an envelope claiming failure was trusted while the

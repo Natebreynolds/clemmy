@@ -843,6 +843,12 @@ export interface MobileRouterDeps {
   stateDir?: string;
   /** Test seam — override secure-cookie behavior. */
   cookieSecure?: boolean;
+  /** Isolated voice-route tests supply provider-free transcription functions. */
+  voiceTranscriptionRuntime?: {
+    transcribeLocal: typeof import('../integrations/local-meetings/whisper-runtime.js').transcribeLocalMeetingAudio;
+    hasCloudKey: typeof import('../runtime/transcribe.js').hasOpenAiKey;
+    transcribeCloud: typeof import('../runtime/transcribe.js').transcribeAudio;
+  };
   /**
    * Optional override for the built PWA assets directory. When unset,
    * the router probes the usual candidate paths (apps/mobile-web/dist
@@ -3750,15 +3756,25 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const tmp = path.join(os.tmpdir(), `clem-phone-voice-${randomBytes(8).toString('hex')}.wav`);
     try {
       await fsp.writeFile(tmp, bytes);
-      const { transcribeLocalMeetingAudio } = await import('../integrations/local-meetings/whisper-runtime.js');
+      const { LocalWhisperRuntimeError, transcribeLocalMeetingAudio } = await import('../integrations/local-meetings/whisper-runtime.js');
       try {
-        const local = await transcribeLocalMeetingAudio({ audioPath: tmp });
+        const local = await (deps.voiceTranscriptionRuntime?.transcribeLocal ?? transcribeLocalMeetingAudio)({ audioPath: tmp });
         res.json({ text: (local.text || '').trim(), engine: 'local' });
         return;
       } catch (localErr) {
+        if (localErr instanceof LocalWhisperRuntimeError && (localErr.code === 'TRANSCRIPTION_CLEANUP_PENDING'
+          || localErr.code === 'TRANSCRIPTION_CLEANUP_UNKNOWN' || localErr.code === 'TRANSCRIPTION_CANCELLED')) {
+          const message = localErr.code === 'TRANSCRIPTION_CLEANUP_PENDING'
+            ? 'Local transcription is stopping. Wait for cleanup to finish before recording again. No cloud transcription was started.'
+            : localErr.code === 'TRANSCRIPTION_CLEANUP_UNKNOWN'
+              ? 'Local transcription could not confirm that its processes stopped. Close any remaining local transcription processes and restart Clementine before retrying. No cloud transcription was started.'
+              : 'Local transcription was stopped. No cloud transcription was started. Start a new recording when you are ready.';
+          res.status(409).json({ error: 'TRANSCRIPTION_STOPPED', message, code: localErr.code });
+          return;
+        }
         const { transcribeAudio, hasOpenAiKey } = await import('../runtime/transcribe.js');
-        if (hasOpenAiKey()) {
-          const result = await transcribeAudio(tmp);
+        if ((deps.voiceTranscriptionRuntime?.hasCloudKey ?? hasOpenAiKey)()) {
+          const result = await (deps.voiceTranscriptionRuntime?.transcribeCloud ?? transcribeAudio)(tmp);
           if (result.ok) { res.json({ text: result.text.trim(), engine: 'openai' }); return; }
           res.status(502).json({ error: 'TRANSCRIBE_FAILED', message: result.error });
           return;

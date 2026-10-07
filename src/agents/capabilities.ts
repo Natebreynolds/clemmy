@@ -1,8 +1,10 @@
-import { spawn } from 'node:child_process';
 import { CLI_CATALOG } from '../integrations/cli-catalog/catalog.js';
+import { catalogInstallForPlatform } from '../integrations/cli-catalog/platform-install.js';
 import path from 'node:path';
 import pino from 'pino';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
+import { runCliProbeProcess } from '../runtime/cli-probe-process.js';
+import { mergedSpawnEnv } from '../runtime/spawn-env.js';
 
 /**
  * Capability pre-flight — does this machine actually have the CLI /
@@ -253,41 +255,39 @@ interface CacheEntry {
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const cache = new Map<string, CacheEntry>();
 
-export function getCapabilityDescriptor(name: string): CapabilityDescriptor | undefined {
+function descriptorForPlatform(descriptor: CapabilityDescriptor, platform: NodeJS.Platform): CapabilityDescriptor {
+  if (platform !== 'win32') return descriptor;
+  const catalog = CLI_CATALOG.find(entry => entry.command === descriptor.name);
+  let installHint: string;
+  if (descriptor.name === 'browser-harness') {
+    installHint = 'Use browser_harness_setup {"action":"install"} for the reviewed pinned Windows setup. Existing modified or different-revision clones are preserved and require a reviewed update; do not run a manual clone/pull/updater as a workaround.';
+  } else if (catalog) {
+    const install = catalogInstallForPlatform(catalog, 'win32');
+    installHint = install.supported
+      ? `Use Connect or cli_setup {"action":"install","catalogId":"${catalog.id}"}. The reviewed Windows install recipe is: ${install.command}`
+      : `Install ${descriptor.friendlyName}'s Windows version using its official instructions at ${install.docsUrl}, then rescan command-line tools in Connect. Automatic installation is not available for this tool on Windows.`;
+  } else if (descriptor.name === 'node' || descriptor.name === 'npm') {
+    installHint = 'Install Node.js for Windows from its official installer at https://nodejs.org; npm is included. Then rescan command-line tools in Connect.';
+  } else {
+    installHint = `Use ${descriptor.friendlyName}'s official Windows installation instructions${descriptor.docsUrl ? ` at ${descriptor.docsUrl}` : ''}, then rescan command-line tools in Connect. Do not use a POSIX installation command on Windows.`;
+  }
+  return { ...descriptor, installHint };
+}
+
+export function getCapabilityDescriptor(name: string, platform: NodeJS.Platform = process.platform): CapabilityDescriptor | undefined {
   const trimmed = name.trim();
-  return CAPABILITY_REGISTRY.find((c) => c.name === trimmed);
+  const descriptor = CAPABILITY_REGISTRY.find((c) => c.name === trimmed);
+  return descriptor ? descriptorForPlatform(descriptor, platform) : undefined;
 }
 
-export function listKnownCapabilities(): CapabilityDescriptor[] {
-  return [...CAPABILITY_REGISTRY];
+export function listKnownCapabilities(platform: NodeJS.Platform = process.platform): CapabilityDescriptor[] {
+  return CAPABILITY_REGISTRY.map(descriptor => descriptorForPlatform(descriptor, platform));
 }
 
-function runProbe(command: string, args: string[]): Promise<{ stdout: string; stderr: string; code: number | null; resolvedPath?: string }> {
-  return new Promise((resolve) => {
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-    const child = spawn(command, args, {
-      env: process.env,
-      // Tight timeout — a probe shouldn't take more than 4s.
-      timeout: 4_000,
-    });
-    child.stdout?.on('data', (d: Buffer) => { stdout += d.toString('utf-8'); });
-    child.stderr?.on('data', (d: Buffer) => { stderr += d.toString('utf-8'); });
-    child.on('error', (err) => {
-      if (settled) return;
-      settled = true;
-      resolve({ stdout, stderr: stderr || err.message, code: -1 });
-    });
-    // `exit` may fire before stdout/stderr finish draining. Resolve on `close`
-    // so a successful probe never becomes "available, version unknown" under
-    // concurrent load merely because its final output chunk arrived late.
-    child.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      resolve({ stdout, stderr, code });
-    });
-  });
+function runProbe(binaryPath: string, args: string[]) {
+  // The resolver's exact absolute executable remains the authority; Windows
+  // npm batch shims require the shared literal-argv launcher and stop receipt.
+  return runCliProbeProcess(binaryPath, args, { cwd: process.cwd(), env: mergedSpawnEnv(), timeoutMs: 4_000 });
 }
 
 function parseVersionLine(text: string): string | undefined {
@@ -330,8 +330,9 @@ export async function checkCapability(name: string, options: { useCache?: boolea
       checkedAt: new Date().toISOString(),
     };
   } else {
-    const probe = await runProbe(safe.command, probeArgs);
-    if (probe.code === 0 || (probe.code !== -1 && (probe.stdout.length > 0 || probe.stderr.length > 0))) {
+    const probe = await runProbe(safe.path, probeArgs);
+    if (!probe.timedOut && !probe.cleanupIncomplete && !probe.overflowed
+      && (probe.exitCode === 0 || probe.output.length > 0)) {
       const versionText = parseVersionLine(probe.stdout) ?? parseVersionLine(probe.stderr);
       result = {
         name: trimmed,
@@ -346,7 +347,11 @@ export async function checkCapability(name: string, options: { useCache?: boolea
         name: trimmed,
         available: false,
         source: safe.path,
-        error: errSnippet || `command '${trimmed}' did not respond to ${probeArgs.join(' ')}`,
+        error: probe.cleanupIncomplete
+          ? probe.stderr
+          : probe.timedOut
+            ? `command '${trimmed}' version check timed out; availability was not confirmed.`
+            : errSnippet || `command '${trimmed}' did not respond to ${probeArgs.join(' ')}`,
         checkedAt: new Date().toISOString(),
       };
     }
@@ -386,7 +391,8 @@ export function _testSeed(name: string, result: CapabilityCheckResult, ttlMs: nu
  * gets this back from check_capability and can reason over the
  * structured fields OR the string.
  */
-export function renderCapabilityResult(result: CapabilityCheckResult, descriptor?: CapabilityDescriptor): string {
+export function renderCapabilityResult(result: CapabilityCheckResult, descriptor?: CapabilityDescriptor, platform: NodeJS.Platform = process.platform): string {
+  if (descriptor) descriptor = descriptorForPlatform(descriptor, platform);
   if (result.available) {
     const lines = [
       `✓ ${descriptor?.friendlyName ?? result.name} is available.`,

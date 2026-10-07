@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -11,6 +11,9 @@ import {
   RECALL_SDK_COMMIT,
   RECALL_SDK_VERSION,
 } from './vendor-recall-native.mjs';
+import { assertBinaryMatchesManifest, assertUvVersion, assertWindowsClaudeSdkAssets, verifyWindowsClaudeNativeLaunch, verifyWindowsNativeCore } from './windows-package-runtime.mjs';
+import { buildWindowsAclProbe, PROBE_FILENAME } from './build-windows-private-filesystem-probe.mjs';
+import { verifyPackagedWindowsAclProbe } from './windows-private-filesystem-packaging.mjs';
 
 const isWindows = process.platform === 'win32';
 const desktopDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -124,6 +127,7 @@ function verifyWhisperPackaged() {
   ) {
     throw new Error(`packaged whisper.cpp provenance is invalid: ${JSON.stringify(manifest)}`);
   }
+  assertBinaryMatchesManifest(executable, manifest);
   const versionOutput = capture(executable, ['--version'], path.dirname(executable));
   if (!versionOutput.includes('whisper.cpp version: 1.9.1')) {
     throw new Error(`packaged whisper.cpp reported an unexpected version: ${versionOutput.trim()}`);
@@ -170,8 +174,9 @@ function verifyRecallPackaged() {
 }
 
 try {
-  if (!isWindows) throw new Error('release-windows.mjs must run on 64-bit Windows.');
+  if (!isWindows || process.arch !== 'x64') throw new Error('release-windows.mjs must run on x64 Windows.');
   rmSync(releaseDir, { recursive: true, force: true });
+  await buildWindowsAclProbe();
   runNpm(['run', 'vendor:recall-native', '--', '--platform', 'win32'], desktopDir);
   runNpm(['run', 'build'], desktopDir);
   runNpm(['run', 'build'], rootDir);
@@ -183,12 +188,34 @@ try {
   run(process.execPath, [path.join(desktopDir, 'scripts', 'rebuild-daemon-natives.mjs'), '--arch', 'x64'], desktopDir);
   run(desktopBin('electron-builder'), ['--win', 'nsis', '--x64', '--publish', 'never'], desktopDir);
 
-  verifyPackagedFile(
+  const uvExecutable = verifyPackagedPeX64(
     path.join('daemon', 'vendor', 'uv', 'x86_64-pc-windows-msvc', 'uv.exe'),
     'vendored Windows uv is missing from the packaged app',
   );
+  const uvVersion = readFileSync(path.join(rootDir, 'src', 'runtime', 'markitdown.ts'), 'utf8').match(/UV_VERSION\s*=\s*'([^']+)'/)?.[1];
+  if (!uvVersion) throw new Error('Pinned uv version is missing from source.');
+  assertUvVersion(capture(uvExecutable, ['--version'], path.dirname(uvExecutable)), uvVersion);
   verifyWhisperPackaged();
   verifyRecallPackaged();
+  const expectedSdk = readJson(path.join(rootDir, 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json'), 'Locked Claude SDK');
+  const claudeSdk = assertWindowsClaudeSdkAssets(path.join(resourcesDir, 'daemon'), expectedSdk.version);
+  assertPeX64(claudeSdk.executable);
+  const claudeNativeLaunch = verifyWindowsClaudeNativeLaunch(claudeSdk.executable);
+  const nativeCore = verifyWindowsNativeCore({ executable: unpackedExecutable, resourcesDir });
+  const aclRoot = path.join('windows-private-filesystem');
+  const aclExecutable = verifyPackagedPeX64(path.join(aclRoot, PROBE_FILENAME), 'canonical Windows private filesystem probe is missing');
+  verifyPackagedFile(path.join(aclRoot, 'manifest.json'), 'canonical Windows private filesystem manifest is missing');
+  const { tsImport } = await import('tsx/esm/api');
+  const { WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE } = await tsImport(path.join(rootDir, 'src/runtime/windows-private-filesystem.ts'), import.meta.url);
+  const aclProbe = verifyPackagedWindowsAclProbe({ sourceDirectory: path.join(rootDir, 'output/windows-private-filesystem'),
+    resourcesDirectory: resourcesDir, classSource: WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE });
+  if (statSync(aclExecutable).size !== aclProbe.probeBytes || createHash('sha256').update(readFileSync(aclExecutable)).digest('hex') !== aclProbe.probeSha256) {
+    throw new Error('Packaged Windows private filesystem probe bytes changed.');
+  }
+  writeFileSync(path.join(releaseDir, 'windows-native-core-qualification.json'), JSON.stringify({
+    at: new Date().toISOString(), executable: unpackedExecutable, resourcesDir,
+    ...nativeCore, claudeSdk, claudeNativeLaunch, uvVersion, aclProbe, installedLaunchQualified: false, liveProviderAccepted: false,
+  }, null, 2) + '\n');
   verifyPackagedFile(
     path.join('daemon', 'apps', 'console-web', 'dist', 'index.html'),
     'console-web dist is missing from the packaged app',

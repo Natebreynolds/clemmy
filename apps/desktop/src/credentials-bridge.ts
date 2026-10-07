@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { randomFillSync } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { CredentialStoragePrivacyError, isCredentialStoragePrivacyError, readCredentialFileSync, readCredentialSourceFileSync, writeCredentialFileSync } from './credential-private-filesystem.js';
 
 const requireFromHere = createRequire(import.meta.url);
 
@@ -37,7 +38,10 @@ const requireFromHere = createRequire(import.meta.url);
  */
 
 const HOME = os.homedir();
-const STATE_DIR = path.join(HOME, '.clementine-next', 'state');
+// The wizard and daemon must share the selected home, including controlled
+// installed fixtures. Keep the ordinary profile default when no override exists.
+const CLEM_BASE_DIR = process.env.CLEMENTINE_HOME || path.join(HOME, '.clementine-next');
+const STATE_DIR = path.join(CLEM_BASE_DIR, 'state');
 const VAULT_FILE = path.join(STATE_DIR, 'secrets-vault.json');
 const META_FILE = path.join(STATE_DIR, 'secrets-meta.json');
 const KEYCHAIN_MIGRATION_MARKER = path.join(STATE_DIR, 'keychain-migrated.json');
@@ -135,15 +139,24 @@ function ensureStateDir(): void {
 }
 
 function readVault(): VaultShape {
-  if (!existsSync(VAULT_FILE)) return { version: 'v1', entries: {} };
+  if (process.platform !== 'win32' && !existsSync(VAULT_FILE)) return { version: 'v1', entries: {} };
   try {
-    const parsed = JSON.parse(readFileSync(VAULT_FILE, 'utf-8'));
-    if (parsed && parsed.version === 'v1' && parsed.entries) return parsed as VaultShape;
-  } catch { /* fall through */ }
+    const raw = process.platform === 'win32' ? readCredentialFileSync(VAULT_FILE) : readFileSync(VAULT_FILE, 'utf-8');
+    if (raw === undefined) return { version: 'v1', entries: {} };
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.version === 'v1' && parsed.entries) {
+      if (process.platform === 'win32' && (typeof parsed.entries !== 'object' || Array.isArray(parsed.entries) || Object.values(parsed.entries).some(value => typeof value !== 'string'))) throw new CredentialStoragePrivacyError();
+      return parsed as VaultShape;
+    }
+    if (process.platform === 'win32') throw new CredentialStoragePrivacyError();
+  } catch (cause) {
+    if (process.platform === 'win32') throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
+  }
   return { version: 'v1', entries: {} };
 }
 
 function writeVault(vault: VaultShape): void {
+  if (process.platform === 'win32') { writeCredentialFileSync(VAULT_FILE, JSON.stringify(vault, null, 2)); return; }
   ensureStateDir();
   const tmp = `${VAULT_FILE}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(vault, null, 2), { encoding: 'utf-8', mode: 0o600 });
@@ -152,15 +165,24 @@ function writeVault(vault: VaultShape): void {
 }
 
 function readMeta(): MetaShape {
-  if (!existsSync(META_FILE)) return { version: 'v1', entries: {} };
+  if (process.platform !== 'win32' && !existsSync(META_FILE)) return { version: 'v1', entries: {} };
   try {
-    const parsed = JSON.parse(readFileSync(META_FILE, 'utf-8'));
-    if (parsed && parsed.version === 'v1' && parsed.entries) return parsed as MetaShape;
-  } catch { /* fall through */ }
+    const raw = process.platform === 'win32' ? readCredentialFileSync(META_FILE) : readFileSync(META_FILE, 'utf-8');
+    if (raw === undefined) return { version: 'v1', entries: {} };
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.version === 'v1' && parsed.entries) {
+      if (process.platform === 'win32' && (typeof parsed.entries !== 'object' || Array.isArray(parsed.entries))) throw new CredentialStoragePrivacyError();
+      return parsed as MetaShape;
+    }
+    if (process.platform === 'win32') throw new CredentialStoragePrivacyError();
+  } catch (cause) {
+    if (process.platform === 'win32') throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
+  }
   return { version: 'v1', entries: {} };
 }
 
 function writeMeta(meta: MetaShape): void {
+  if (process.platform === 'win32') { writeCredentialFileSync(META_FILE, JSON.stringify(meta, null, 2)); return; }
   ensureStateDir();
   const tmp = `${META_FILE}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(meta, null, 2), { encoding: 'utf-8', mode: 0o600 });
@@ -188,15 +210,17 @@ function updateMeta(name: CredentialName, patch: Partial<CredentialMetadata>): C
 
 function readEnvVar(name: string): string | undefined {
   if (process.env[name] && process.env[name]!.length > 0) return process.env[name];
-  const candidates = [
-    path.join(HOME, '.clementine-next', '.env'),
+  const candidates = process.env.CLEMENTINE_HOME ? [path.join(CLEM_BASE_DIR, '.env')] : [
+    path.join(CLEM_BASE_DIR, '.env'),
     path.join(HOME, 'clementine-next', '.env'),
     path.join(process.cwd(), '.env'),
   ];
   for (const file of candidates) {
-    if (!existsSync(file)) continue;
+    if (process.platform !== 'win32' && !existsSync(file)) continue;
     try {
-      for (const line of readFileSync(file, 'utf-8').split('\n')) {
+      const raw = process.platform === 'win32' ? readCredentialSourceFileSync(file) : readFileSync(file, 'utf-8');
+      if (raw === undefined) continue;
+      for (const line of raw.split('\n')) {
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith('#')) continue;
         const eq = trimmed.indexOf('=');
@@ -207,7 +231,7 @@ function readEnvVar(name: string): string | undefined {
         if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
         if (v.length > 0) return v;
       }
-    } catch { /* keep looking */ }
+    } catch (error) { if (isCredentialStoragePrivacyError(error)) throw error; /* keep looking for ordinary POSIX failures */ }
   }
   return undefined;
 }
@@ -302,12 +326,14 @@ export async function setCredential(name: CredentialName, value: string): Promis
 
 /** Delete from keychain + file vault. Never touches .env. */
 export async function deleteCredential(name: CredentialName): Promise<void> {
+  const windowsVault = process.platform === 'win32' ? readVault() : undefined;
+  if (process.platform === 'win32') readMeta();
   const keychain = await loadKeytar();
   if (keychain) {
     try { await keychain.deletePassword(KEYCHAIN_SERVICE, name); } catch { /* ignore */ }
   }
-  if (existsSync(VAULT_FILE)) {
-    const vault = readVault();
+  if (process.platform === 'win32' || existsSync(VAULT_FILE)) {
+    const vault = windowsVault ?? readVault();
     if (name in vault.entries) {
       delete vault.entries[name];
       if (Object.keys(vault.entries).length === 0) {
@@ -326,6 +352,10 @@ export async function deleteCredential(name: CredentialName): Promise<void> {
  *  touches user .env files. Used by the dashboard's Reset flow and
  *  by the wizard's "start over" option. */
 export async function resetAllCredentials(): Promise<{ keychainDeleted: string[]; fileVaultDeleted: boolean; metaDeleted: boolean }> {
+  if (process.platform === 'win32') {
+    readVault();
+    readMeta();
+  }
   const keychainDeleted: string[] = [];
   const keychain = await loadKeytar();
   if (keychain) {
@@ -487,12 +517,14 @@ function writeMigrationMarker(payload: Record<string, unknown>): void {
  * value and store it so the rest of boot can use it.
  */
 export async function ensureWebhookSecret(): Promise<string> {
+  // An unsafe-present Windows vault is not equivalent to a missing entry.
+  const windowsVault = process.platform === 'win32' ? readVault() : undefined;
   // Already in env? Use that.
   const fromEnv = readEnvVar('WEBHOOK_SECRET');
   if (fromEnv) return fromEnv;
 
   // Already in vault? Use that.
-  const vault = readVault();
+  const vault = windowsVault ?? readVault();
   if (vault.entries.webhook_secret) return vault.entries.webhook_secret;
 
   // Generate one.

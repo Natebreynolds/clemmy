@@ -1,7 +1,8 @@
 name: Release Desktop App
 
 # Tag pushes publish production releases. Manual runs build signed/notarized
-# macOS and private Windows candidates and keep both as GitHub Actions artifacts.
+# macOS and unpublished Windows candidates and keep both as GitHub Actions artifacts.
+# The repository and Actions artifacts are public; unpublished does not mean private.
 # Manual Windows candidates may be unsigned; public Windows tag builds may not.
 #
 # Required repository secrets for production:
@@ -23,6 +24,11 @@ on:
         description: 'Prerelease SemVer newer than package.json, without v (for example, 1.4.5-rc.1)'
         required: true
         type: string
+      windows_beta_only:
+        description: 'Qualify only the unsigned unpublished Windows beta; no Mac/signing/release publication'
+        required: false
+        default: false
+        type: boolean
 
 # Production runs are serialized and an in-progress release is never cancelled.
 # Candidate runs have independent groups so they cannot block a tag release.
@@ -34,7 +40,14 @@ permissions:
   contents: read
 
 jobs:
+  windows-private-beta:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_beta_only == true }}
+    uses: ./.github/workflows/windows-private-beta.yml
+    with:
+      candidate_version: ${{ inputs.candidate_version }}
+
   preflight:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_beta_only != true }}
     name: Validate source and release gates
     runs-on: ubuntu-latest
     outputs:
@@ -207,6 +220,7 @@ jobs:
           npm run test:packaged-upgrade
 
   release-mac:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_beta_only != true }}
     name: Build signed and notarized macOS artifacts
     needs: preflight
     runs-on: macos-14
@@ -308,7 +322,7 @@ jobs:
     # on the tagged commit intentionally skips Windows.
     if: >-
       ${{
-        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_dispatch' && inputs.windows_beta_only != true) ||
         (github.event_name == 'push' && needs.preflight.outputs.mac_only != 'true')
       }}
 

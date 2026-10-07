@@ -12,6 +12,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { CredentialStoragePrivacyError, readCredentialFileSync } from './credential-private-filesystem.js';
 
 function localAuthFile(): string {
   const base = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine-next');
@@ -20,18 +21,25 @@ function localAuthFile(): string {
 
 export function hasPersistedCodexGrant(): boolean {
   const filePath = localAuthFile();
-  if (!existsSync(filePath)) return false;
+  if (process.platform !== 'win32' && !existsSync(filePath)) return false;
   try {
-    const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown> | null;
+    const raw = process.platform === 'win32' ? readCredentialFileSync(filePath) : readFileSync(filePath, 'utf-8');
+    if (raw === undefined) return false;
+    const parsed = JSON.parse(raw) as Record<string, unknown> | null;
+    if (process.platform === 'win32' && (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || (parsed.codexOauth !== undefined && (!parsed.codexOauth || typeof parsed.codexOauth !== 'object' || Array.isArray(parsed.codexOauth))))) throw new CredentialStoragePrivacyError();
     const codexOauth = parsed?.codexOauth && typeof parsed.codexOauth === 'object'
       ? parsed.codexOauth as Record<string, unknown>
       : null;
+    if (process.platform === 'win32' && codexOauth && ['accessToken', 'refreshToken', 'idToken', 'accountId', 'lastRefresh'].some(key =>
+      codexOauth[key] !== undefined && typeof codexOauth[key] !== 'string')) throw new CredentialStoragePrivacyError();
     return Boolean(
       codexOauth
       && typeof codexOauth.accessToken === 'string' && codexOauth.accessToken
       && typeof codexOauth.refreshToken === 'string' && codexOauth.refreshToken,
     );
-  } catch {
+  } catch (cause) {
+    if (process.platform === 'win32') throw new CredentialStoragePrivacyError(cause);
     return false;
   }
 }

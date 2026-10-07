@@ -17,8 +17,10 @@ import {
   unlinkSync,
   writeSync,
   type BigIntStats,
+  type Stats,
 } from 'node:fs';
 import path from 'node:path';
+import { assertWindowsPrivateFilesystem, WindowsPrivateFilesystemError } from '../../runtime/windows-private-filesystem.js';
 
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
@@ -101,6 +103,7 @@ export interface StagedFileMaterializationReceipt {
 
 function storageError(message: string, error: unknown): StagedFileBlobError {
   if (error instanceof StagedFileBlobError) return error;
+  if (error instanceof WindowsPrivateFilesystemError) return new StagedFileBlobError('unsafe_store', error.message, error);
   return new StagedFileBlobError('storage_error', message, error);
 }
 
@@ -138,11 +141,31 @@ function fsyncDirectory(directory: string): void {
   }
 }
 
+function privatePermissions(stat: Stats | BigIntStats, mode: number, target: string): boolean {
+  if (process.platform === 'win32') {
+    try {
+      const exact = typeof stat.ino === 'bigint' ? stat : lstatSync(target, { bigint: true });
+      assertWindowsPrivateFilesystem(target, exact, mode === DIRECTORY_MODE ? 'directory' : 'file');
+      return true;
+    } catch { return false; }
+  }
+  return typeof stat.mode === 'bigint' ? (stat.mode & 0o777n) === BigInt(mode) : (stat.mode & 0o777) === mode;
+}
+
+function hardenTemporaryFile(fd: number, target: string): void {
+  if (process.platform === 'win32') assertWindowsPrivateFilesystem(target, fstatSync(fd, { bigint: true }), 'file', true);
+  else fchmodSync(fd, FILE_MODE);
+}
+
+function permissionLstat(target: string): Stats | BigIntStats {
+  return process.platform === 'win32' ? lstatSync(target, { bigint: true }) : lstatSync(target);
+}
+
 function ensureStoreDirectory(configuredDirectory: string): string {
   const requested = validateAbsolutePath(configuredDirectory, 'blob store directory');
   try {
     mkdirSync(requested, { recursive: true, mode: DIRECTORY_MODE });
-    const requestedStat = lstatSync(requested);
+    const requestedStat = permissionLstat(requested);
     if (requestedStat.isSymbolicLink() || !requestedStat.isDirectory()) {
       throw new StagedFileBlobError(
         'unsafe_store',
@@ -151,15 +174,16 @@ function ensureStoreDirectory(configuredDirectory: string): string {
     }
     // This is a dedicated staging directory. Tightening an existing mode is
     // intentional: provider-return bytes must never inherit a permissive umask.
-    if ((requestedStat.mode & 0o777) !== DIRECTORY_MODE) chmodSync(requested, DIRECTORY_MODE);
+    if (process.platform === 'win32') assertWindowsPrivateFilesystem(requested, requestedStat, 'directory', true);
+    else if ((Number(requestedStat.mode) & 0o777) !== DIRECTORY_MODE) chmodSync(requested, DIRECTORY_MODE);
     const canonical = realpathSync(requested);
-    const canonicalStat = lstatSync(canonical);
+    const canonicalStat = permissionLstat(canonical);
     if (
       canonicalStat.isSymbolicLink()
       || !canonicalStat.isDirectory()
-      || (canonicalStat.mode & 0o777) !== DIRECTORY_MODE
+      || !privatePermissions(canonicalStat, DIRECTORY_MODE, canonical)
     ) {
-      throw new StagedFileBlobError('unsafe_store', 'staged-file blob store is not a 0700 directory');
+      throw new StagedFileBlobError('unsafe_store', process.platform === 'win32' ? 'staged-file blob store requires verified private NTFS permissions; check folder access and PowerShell policy' : 'staged-file blob store is not a 0700 directory');
     }
     return canonical;
   } catch (error) {
@@ -170,11 +194,11 @@ function ensureStoreDirectory(configuredDirectory: string): string {
 function exactExistingStoreDirectory(configuredDirectory: string): string {
   const requested = validateAbsolutePath(configuredDirectory, 'managed destination directory');
   try {
-    const requestedStat = lstatSync(requested);
+    const requestedStat = permissionLstat(requested);
     if (
       requestedStat.isSymbolicLink()
       || !requestedStat.isDirectory()
-      || (requestedStat.mode & 0o777) !== DIRECTORY_MODE
+      || !privatePermissions(requestedStat, DIRECTORY_MODE, requested)
     ) {
       throw new StagedFileBlobError(
         'unsafe_store',
@@ -182,11 +206,11 @@ function exactExistingStoreDirectory(configuredDirectory: string): string {
       );
     }
     const canonical = realpathSync(requested);
-    const canonicalStat = lstatSync(canonical);
+    const canonicalStat = permissionLstat(canonical);
     if (
       canonicalStat.isSymbolicLink()
       || !canonicalStat.isDirectory()
-      || (canonicalStat.mode & 0o777) !== DIRECTORY_MODE
+      || !privatePermissions(canonicalStat, DIRECTORY_MODE, canonical)
     ) {
       throw new StagedFileBlobError(
         'unsafe_store',
@@ -281,9 +305,11 @@ function digestOpenFile(input: {
   fd: number;
   maxBytes: number;
   expectedByteCount?: number;
+  privatePath?: string;
 }): { sha256: string; md5: string; byteCount: number; before: BigIntStats; after: BigIntStats } {
   const before = fstatSync(input.fd, { bigint: true });
   assertRegularSingleLink(before, 'invalid_staged_blob');
+  if (process.platform === 'win32' && input.privatePath) assertWindowsPrivateFilesystem(input.privatePath, before, 'file');
   if (before.size > BigInt(input.maxBytes)) {
     throw new StagedFileBlobError('blob_too_large', 'staged-file blob exceeds its byte limit');
   }
@@ -306,6 +332,7 @@ function digestOpenFile(input: {
     md5.update(chunk);
   }
   const after = fstatSync(input.fd, { bigint: true });
+  if (process.platform === 'win32' && input.privatePath) assertWindowsPrivateFilesystem(input.privatePath, after, 'file');
   if (!sameStableFile(before, after) || BigInt(byteCount) !== after.size) {
     throw new StagedFileBlobError('source_changed', 'staged-file bytes changed while they were read');
   }
@@ -367,13 +394,13 @@ function verifyPublishedBlob(input: PublishedStagedFileBlob, maxBytes: number): 
       entry.isSymbolicLink()
       || !entry.isFile()
       || entry.nlink !== 1
-      || (entry.mode & 0o777) !== FILE_MODE
+      || !privatePermissions(entry, FILE_MODE, input.blobPath)
       || entry.size !== input.byteCount
     ) {
       throw new StagedFileBlobError('invalid_staged_blob', 'published blob is not one exact 0600 regular file');
     }
     fd = openSync(input.blobPath, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const digest = digestOpenFile({ fd, maxBytes, expectedByteCount: input.byteCount });
+    const digest = digestOpenFile({ fd, maxBytes, expectedByteCount: input.byteCount, privatePath: input.blobPath });
     if (digest.sha256 !== input.sha256 || digest.md5 !== input.md5) {
       throw new StagedFileBlobError('digest_mismatch', 'published blob bytes do not match their digest');
     }
@@ -401,7 +428,10 @@ function verifyPublishedBlobForPublisher(
       transitional = !entry.isSymbolicLink()
         && entry.isFile()
         && entry.nlink === 2
-        && (entry.mode & 0o777) === FILE_MODE
+        // Waiting is not acceptance: strict ACL verification runs after the
+        // temporary alias disappears. Opening it here without delete sharing
+        // would prevent the winning publisher from removing that alias.
+        && (process.platform === 'win32' || (entry.mode & 0o777) === FILE_MODE)
         && entry.size === input.byteCount;
     } catch {
       // Missing/unreadable winners flow through strict verification below.
@@ -444,7 +474,7 @@ export class StagedFileBlobWriter {
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
         FILE_MODE,
       );
-      fchmodSync(this.fd, FILE_MODE);
+      hardenTemporaryFile(this.fd, this.temporaryPath);
     } catch (error) {
       throw storageError('could not create a staged-file temp file', error);
     }
@@ -485,6 +515,7 @@ export class StagedFileBlobWriter {
       fsyncSync(this.fd);
       const stat = fstatSync(this.fd, { bigint: true });
       assertRegularSingleLink(stat, 'invalid_staged_blob');
+      if (process.platform === 'win32') assertWindowsPrivateFilesystem(this.temporaryPath, stat, 'file');
       if (stat.size !== BigInt(this.byteCount)) {
         throw new StagedFileBlobError('source_changed', 'staged-file temp bytes changed before sealing');
       }
@@ -575,7 +606,7 @@ export function publishStagedFileBlob(input: {
       entry.isSymbolicLink()
       || !entry.isFile()
       || entry.nlink !== 1
-      || (entry.mode & 0o777) !== FILE_MODE
+      || !privatePermissions(entry, FILE_MODE, temporaryPath)
       || entry.size !== input.sealed.byteCount
     ) {
       throw new StagedFileBlobError('invalid_staged_blob', 'sealed temp is not one exact 0600 regular file');
@@ -585,6 +616,7 @@ export function publishStagedFileBlob(input: {
       fd,
       maxBytes,
       expectedByteCount: input.sealed.byteCount,
+      privatePath: temporaryPath,
     });
     if (verifiedTemp.sha256 !== input.sealed.sha256 || verifiedTemp.md5 !== input.sealed.md5) {
       throw new StagedFileBlobError('digest_mismatch', 'sealed temp bytes do not match their checkpoint');
@@ -743,7 +775,7 @@ export function materializeStagedFileBlob(input: {
     const sourceBefore = fstatSync(sourceFd, { bigint: true });
     assertRegularSingleLink(sourceBefore, 'invalid_staged_blob');
     if (
-      (sourceBefore.mode & 0o777n) !== BigInt(FILE_MODE)
+      !privatePermissions(sourceBefore, FILE_MODE, sourcePath)
       || sourceBefore.size !== BigInt(input.blob.byteCount)
     ) {
       throw new StagedFileBlobError('invalid_staged_blob', 'staged blob source changed before materialization');
@@ -753,7 +785,7 @@ export function materializeStagedFileBlob(input: {
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
       FILE_MODE,
     );
-    fchmodSync(temporaryFd, FILE_MODE);
+    hardenTemporaryFile(temporaryFd, temporaryPath);
     const sha256 = createHash('sha256');
     const md5 = createHash('md5');
     const buffer = Buffer.allocUnsafe(READ_BUFFER_BYTES);
@@ -774,6 +806,7 @@ export function materializeStagedFileBlob(input: {
       }
     }
     const sourceAfter = fstatSync(sourceFd, { bigint: true });
+    if (process.platform === 'win32') assertWindowsPrivateFilesystem(sourcePath, sourceAfter, 'file');
     if (!sameStableFile(sourceBefore, sourceAfter) || BigInt(byteCount) !== sourceAfter.size) {
       throw new StagedFileBlobError('source_changed', 'staged blob changed during materialization');
     }
@@ -788,7 +821,7 @@ export function materializeStagedFileBlob(input: {
     const temporaryStat = fstatSync(temporaryFd, { bigint: true });
     assertRegularSingleLink(temporaryStat, 'invalid_staged_blob');
     if (
-      (temporaryStat.mode & 0o777n) !== BigInt(FILE_MODE)
+      !privatePermissions(temporaryStat, FILE_MODE, temporaryPath)
       || temporaryStat.size !== BigInt(byteCount)
     ) {
       throw new StagedFileBlobError('invalid_staged_blob', 'managed materialization temp is not exact');

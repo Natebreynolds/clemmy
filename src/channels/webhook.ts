@@ -3074,14 +3074,14 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   await warmModelDiscovery();
   const app = await buildWebhookApp(assistant);
 
-  // Pinned-TLS door for the iOS app. Identity minting shells out to openssl;
+  // Pinned-TLS door for the iOS app. Identity minting uses bundled Node crypto;
   // if that fails the door stays closed and everything else boots normally.
   let directApp: import('../runtime/mobile-ingress.js').DirectAppListenerOptions | undefined;
   let directAppFingerprint: string | null = null;
   if (MOBILE_APP_LISTENER_ENABLED) {
     try {
       const { ensureMobileTlsIdentity } = await import('../runtime/mobile-tls.js');
-      const identity = ensureMobileTlsIdentity();
+      const identity = await ensureMobileTlsIdentity();
       directApp = { port: MOBILE_APP_PORT, keyPem: identity.keyPem, certPem: identity.certPem };
       directAppFingerprint = identity.fingerprint;
     } catch (err) {

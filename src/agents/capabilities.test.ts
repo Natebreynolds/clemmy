@@ -120,10 +120,11 @@ test('renderCapabilityResult: available branch shows version + path', () => {
   assert.match(out, /\/usr\/local\/bin\/sf/);
 });
 
-test('renderCapabilityResult: missing branch shows install hint', () => {
+test('renderCapabilityResult: retained macOS missing branch shows macOS install hint', () => {
   const out = renderCapabilityResult(
     { name: 'gh', available: false, error: 'command not found', checkedAt: new Date().toISOString() },
-    getCapabilityDescriptor('gh'),
+    getCapabilityDescriptor('gh', 'darwin'),
+    'darwin',
   );
   assert.match(out, /GitHub CLI/);
   assert.match(out, /brew install gh/);

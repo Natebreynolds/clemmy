@@ -8,6 +8,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { BASE_DIR } from '../config.js';
 import { withFileLockSyncStrict } from '../runtime/atomic-json.js';
+import { syncDirectoryMetadata } from '../runtime/sync-directory.js';
 import { workspaceDataContentDigest } from './workspace-set-data-contract.js';
 
 const spaces = path.join(BASE_DIR, 'spaces');
@@ -66,8 +67,7 @@ export function writeWorkspaceSnapshotFile(file: string, content: string): void 
     fsyncSync(fd);
     closeSync(fd); fd = undefined;
     renameSync(temp, file);
-    const directory = openSync(path.dirname(file), 'r');
-    try { fsyncSync(directory); } finally { closeSync(directory); }
+    syncDirectoryMetadata(path.dirname(file));
   } finally {
     if (fd !== undefined) closeSync(fd);
     rmSync(temp, { force: true });
@@ -76,8 +76,7 @@ export function writeWorkspaceSnapshotFile(file: string, content: string): void 
 
 function durableRemove(file: string): void {
   rmSync(file, { force: true });
-  const directory = openSync(path.dirname(file), 'r');
-  try { fsyncSync(directory); } finally { closeSync(directory); }
+  syncDirectoryMetadata(path.dirname(file));
 }
 
 function validateJournal(raw: unknown, slug: string): WorkspaceUpdateJournal {

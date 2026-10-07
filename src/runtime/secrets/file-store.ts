@@ -2,6 +2,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
 import path from 'node:path';
 import { BASE_DIR, invalidateRuntimeConfigSnapshot } from '../../config.js';
 import type { SecretBackend, SecretName } from './types.js';
+import { assertCredentialFileReadable, CredentialStoragePrivacyError, isCredentialStoragePrivacyError, readCredentialFileSync, writeCredentialFileSync } from '../credential-private-filesystem.js';
 
 /**
  * File backend — JSON file at ~/.clementine-next/state/secrets-vault.json
@@ -38,14 +39,19 @@ function ensureStateDir(): void {
 }
 
 function readVault(): VaultShape {
-  if (!existsSync(VAULT_FILE)) return { version: 'v1', entries: {} };
+  if (process.platform !== 'win32' && !existsSync(VAULT_FILE)) return { version: 'v1', entries: {} };
   try {
-    const parsed = JSON.parse(readFileSync(VAULT_FILE, 'utf-8'));
+    const raw = process.platform === 'win32' ? readCredentialFileSync(VAULT_FILE) : readFileSync(VAULT_FILE, 'utf-8');
+    if (raw === undefined) return { version: 'v1', entries: {} };
+    const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === 'object' && parsed.version === 'v1' && parsed.entries && typeof parsed.entries === 'object') {
+      if (process.platform === 'win32' && (Array.isArray(parsed.entries) || Object.values(parsed.entries).some(value => typeof value !== 'string'))) throw new CredentialStoragePrivacyError();
       return parsed as VaultShape;
     }
+    if (process.platform === 'win32') throw new CredentialStoragePrivacyError();
     return { version: 'v1', entries: {} };
-  } catch {
+  } catch (cause) {
+    if (process.platform === 'win32') throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
     // Corrupt — refuse to silently overwrite. Caller's get() will
     // record this as `unreadable` and surface it in the health panel.
     throw new Error('secrets-vault.json is corrupt — use the Reset Credentials flow to recover');
@@ -53,6 +59,11 @@ function readVault(): VaultShape {
 }
 
 function writeVault(vault: VaultShape): void {
+  if (process.platform === 'win32') {
+    writeCredentialFileSync(VAULT_FILE, JSON.stringify(vault, null, 2));
+    invalidateRuntimeConfigSnapshot('secret_vault');
+    return;
+  }
   ensureStateDir();
   const tmp = `${VAULT_FILE}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(vault, null, 2), { encoding: 'utf-8', mode: 0o600 });
@@ -78,10 +89,10 @@ export class FileSecretBackend implements SecretBackend {
   }
 
   async delete(name: SecretName): Promise<void> {
-    if (!existsSync(VAULT_FILE)) return;
+    if (process.platform !== 'win32' && !existsSync(VAULT_FILE)) return;
     let vault: VaultShape;
     try { vault = readVault(); }
-    catch { return; }
+    catch (error) { if (isCredentialStoragePrivacyError(error)) throw error; return; }
     if (!(name in vault.entries)) return;
     delete vault.entries[name];
     if (Object.keys(vault.entries).length === 0) {
@@ -99,6 +110,7 @@ export class FileSecretBackend implements SecretBackend {
   /** Hard reset — drops the entire vault file. Used by the dashboard's
    *  "Reset Credentials" flow. NEVER touches .env or keychain. */
   static reset(): void {
+    if (process.platform === 'win32') assertCredentialFileReadable(VAULT_FILE);
     if (existsSync(VAULT_FILE)) {
       try {
         unlinkSync(VAULT_FILE);

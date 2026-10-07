@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -18,6 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { assertWindowsPrivateFilesystem } from '../../runtime/windows-private-filesystem.js';
 
 import {
   createStagedFileBlobWriter,
@@ -34,6 +35,18 @@ function fixture(): { root: string; allowed: string; store: string } {
   const store = path.join(root, 'store');
   mkdirSync(allowed, { mode: 0o700 });
   return { root, allowed, store };
+}
+
+function assertPrivatePermissions(target: string, mode: number): void {
+  if (process.platform === 'win32') assertWindowsPrivateFilesystem(target, lstatSync(target, { bigint: true }), mode === 0o700 ? 'directory' : 'file');
+  else assert.equal(lstatSync(target).mode & 0o777, mode);
+}
+
+function weakenFixturePermissions(target: string): void {
+  if (process.platform !== 'win32') { chmodSync(target, 0o644); return; }
+  const program = String.raw`$ErrorActionPreference='Stop'; [Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false,$true); $p=[Console]::In.ReadToEnd(); $a=Get-Acl -LiteralPath $p; $s=[System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'); $r=[System.Security.AccessControl.FileSystemAccessRule]::new($s,[System.Security.AccessControl.FileSystemRights]::Read,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $a`;
+  const result = spawnSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(program, 'utf16le').toString('base64')], { input: target, encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 4096 });
+  assert.equal(result.status, 0, 'controlled fixture ACL weakening must complete');
 }
 
 test('local snapshot is allowlisted, content-addressed, exact, and 0600', (t) => {
@@ -55,8 +68,8 @@ test('local snapshot is allowlisted, content-addressed, exact, and 0600', (t) =>
   assert.equal(snapshot.byteCount, bytes.byteLength);
   assert.equal(path.basename(snapshot.blobPath), `sha256-${snapshot.sha256}`);
   assert.deepEqual(readFileSync(snapshot.blobPath), bytes);
-  assert.equal(lstatSync(snapshot.blobPath).mode & 0o777, 0o600);
-  assert.equal(lstatSync(store).mode & 0o777, 0o700);
+  assertPrivatePermissions(snapshot.blobPath, 0o600);
+  assertPrivatePermissions(store, 0o700);
   assert.equal(JSON.stringify(snapshot).includes(source), false, 'checkpoint omits the original local path');
 });
 
@@ -159,8 +172,8 @@ test('managed materialization copies to one private 0600 inode and exact replay 
   assert.equal('materializedPath' in first, false);
   const destination = path.join(destinationDirectory, destinationName);
   assert.deepEqual(readFileSync(destination), bytes);
-  assert.equal(lstatSync(destinationDirectory).mode & 0o777, 0o700);
-  assert.equal(lstatSync(destination).mode & 0o777, 0o600);
+  assertPrivatePermissions(destinationDirectory, 0o700);
+  assertPrivatePermissions(destination, 0o600);
   assert.equal(lstatSync(destination).nlink, 1);
   assert.equal(lstatSync(blob.blobPath).nlink, 1, 'blob store source keeps its single-link invariant');
   assert.notEqual(lstatSync(destination).ino, lstatSync(blob.blobPath).ino, 'destination is a byte copy, not a source hard link');
@@ -404,7 +417,7 @@ test('two processes publish one exact content-addressed blob without replacement
   ]);
   assert.deepEqual(left, right);
   assert.equal(lstatSync(left.blobPath).nlink, 1);
-  assert.equal(lstatSync(left.blobPath).mode & 0o777, 0o600);
+  assertPrivatePermissions(left.blobPath, 0o600);
   assert.equal(readFileSync(left.blobPath).byteLength, left.byteCount);
   assert.equal(createHash('sha256').update(readFileSync(left.blobPath)).digest('hex'), left.sha256);
 });
@@ -414,7 +427,7 @@ test('publication performs no canonical inode metadata mutation after the no-rep
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const published = await runPublicationOrderProbe(store);
   assert.equal(lstatSync(published.blobPath).nlink, 1);
-  assert.equal(lstatSync(published.blobPath).mode & 0o777, 0o600);
+  assertPrivatePermissions(published.blobPath, 0o600);
   assert.equal(createHash('sha256').update(readFileSync(published.blobPath)).digest('hex'), published.sha256);
 });
 
@@ -481,7 +494,7 @@ test('publish refuses tampered, linked, or weak-permission temp checkpoints', (t
   const weakWriter = createStagedFileBlobWriter({ storeDirectory: store });
   weakWriter.write(Buffer.from('weak'));
   const weak = weakWriter.seal();
-  chmodSync(weak.temporaryPath, 0o644);
+  weakenFixturePermissions(weak.temporaryPath);
   assert.throws(
     () => publishStagedFileBlob({ storeDirectory: store, sealed: weak }),
     (error: unknown) => error instanceof StagedFileBlobError && error.code === 'invalid_staged_blob',

@@ -65,9 +65,9 @@ test('authHeadless entries always carry the login command the job will run', () 
   }
 });
 
-test('every catalog install command still passes the install allowlist', () => {
+test('retained macOS catalog install recipes still pass the macOS install allowlist', () => {
   for (const entry of CLI_CATALOG) {
-    const verdict = validateInstallCommand(entry.installCommand);
+    const verdict = validateInstallCommand(entry.installCommand, 'darwin');
     assert.ok(verdict.ok, `${entry.id}: ${entry.installCommand} rejected: ${verdict.ok ? '' : verdict.error}`);
   }
 });

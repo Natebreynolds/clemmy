@@ -101,6 +101,8 @@ test('the actual fixed Python program executes every operation through mock CDP,
   const id = createHash('sha256').update('ws://127.0.0.1:9333/devtools/browser/fixture-browser').digest('hex');
   const trace = path.join(profile, 'trace.json');
   const prelude = `import sys, types, json
+# Reproduce Windows' legacy console encoding before the fixed adapter binds UTF-8.
+sys.stdout.reconfigure(encoding='cp1252', errors='strict')
 calls = []
 class Connector:
   def __init__(self, endpoint, **kwargs):
@@ -150,7 +152,7 @@ sys.modules['websockets.asyncio.client'] = websocket_client
 `;
   const runner: BrowserOperationRunner = async code => {
     const fixed = code.replace("profile = p.pop('chrome_profile')", `profile = ${JSON.stringify(profile)}`);
-    const child = spawnSync('python3', ['-I', '-c', prelude + fixed], { encoding: 'utf8', timeout: 10000, maxBuffer: 2 * 1024 * 1024 });
+    const child = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', prelude + fixed], { encoding: 'utf8', timeout: 10000, maxBuffer: 2 * 1024 * 1024 });
     return { code: child.status, stdout: child.stdout, stderr: child.stderr, dispatched: true };
   };
   for (const [operation, args] of [
@@ -165,6 +167,7 @@ sys.modules['websockets.asyncio.client'] = websocket_client
     assert.equal(calls.some(([method]) => method === 'Target.createTarget'), operation === 'browser_open');
     assert.equal(calls.some(([method]) => method === 'Page.navigate'), operation === 'browser_navigate');
     if (operation === 'browser_read') assert.equal((result.result as Record<string, unknown>).text, '猫'.repeat(16000));
+    if (operation !== 'browser_tabs') assert.ok(String((result.result as Record<string, unknown>).title).startsWith('😀'));
   }
   const changed = await executeBrowserOperation('browser_navigate', { target_id: 'exact-target', browser_id: 'b'.repeat(64), url: 'https://example.com/' }, { runner });
   assert.equal(changed.ok, false);

@@ -4,6 +4,8 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSy
 import path from 'node:path';
 import os from 'node:os';
 import { shell } from 'electron';
+import { CredentialStoragePrivacyError, isCredentialStoragePrivacyError, readCredentialFileSync, readCredentialSourceFileSync, writeCredentialFileSync } from './credential-private-filesystem.js';
+import { parseCodexTokenResponse } from './codex-token-response.js';
 
 /**
  * Codex OAuth flow — desktop-local port of src/runtime/codex-native-oauth.ts
@@ -292,11 +294,34 @@ function normalizeTokenSet(input: {
 }
 
 function readJsonFile(filePath: string): Record<string, unknown> | null {
-  if (!existsSync(filePath)) return null;
+  if (process.platform !== 'win32' && !existsSync(filePath)) return null;
   try {
-    const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as unknown;
+    const raw = process.platform === 'win32' ? (filePath === LOCAL_AUTH_FILE ? readCredentialFileSync(filePath) : readCredentialSourceFileSync(filePath)) : readFileSync(filePath, 'utf-8');
+    if (raw === undefined) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (process.platform === 'win32') {
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new CredentialStoragePrivacyError();
+      const object = parsed as Record<string, unknown>;
+      const sectionKey = filePath === LOCAL_AUTH_FILE ? 'codexOauth' : 'tokens';
+      const section = object[sectionKey];
+      if (section !== undefined) {
+        if (!section || typeof section !== 'object' || Array.isArray(section)) throw new CredentialStoragePrivacyError();
+        const fields = sectionKey === 'codexOauth'
+          ? ['accessToken', 'refreshToken', 'idToken', 'accountId', 'lastRefresh']
+          : ['access_token', 'refresh_token', 'id_token', 'account_id'];
+        if (fields.some(key => (section as Record<string, unknown>)[key] !== undefined
+          && typeof (section as Record<string, unknown>)[key] !== 'string')) throw new CredentialStoragePrivacyError();
+      }
+      if (filePath === LOCAL_AUTH_FILE && object.xaiOauth !== undefined) {
+        const xai = object.xaiOauth;
+        if (!xai || typeof xai !== 'object' || Array.isArray(xai)
+          || ['accessToken', 'refreshToken', 'idToken', 'expiresAt', 'lastRefresh'].some(key =>
+            (xai as Record<string, unknown>)[key] !== undefined && typeof (xai as Record<string, unknown>)[key] !== 'string')) throw new CredentialStoragePrivacyError();
+      }
+    }
     return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
-  } catch {
+  } catch (cause) {
+    if (process.platform === 'win32') throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
     return null;
   }
 }
@@ -313,19 +338,22 @@ function loadExistingCodexOAuthTokens(): CodexOAuthTokens | null {
     accountId: localCodex.accountId,
     lastRefresh: localCodex.lastRefresh,
   }) : null;
+  if (process.platform === 'win32' && localCodex && !localTokens) throw new CredentialStoragePrivacyError();
   if (localTokens) return localTokens;
 
   const cli = readJsonFile(CODEX_AUTH_FILE);
   const cliTokens = cli?.tokens && typeof cli.tokens === 'object'
     ? cli.tokens as Record<string, unknown>
     : null;
-  return cliTokens ? normalizeTokenSet({
+  const normalizedCli = cliTokens ? normalizeTokenSet({
     accessToken: cliTokens.access_token,
     refreshToken: cliTokens.refresh_token,
     idToken: cliTokens.id_token,
     accountId: cliTokens.account_id,
     lastRefresh: cli?.last_refresh,
   }) : null;
+  if (process.platform === 'win32' && cliTokens && !normalizedCli) throw new CredentialStoragePrivacyError();
+  return normalizedCli;
 }
 
 async function exchangeAuthorizationCode(code: string, redirectUri: string, codeVerifier: string): Promise<CodexOAuthTokens> {
@@ -347,15 +375,11 @@ async function exchangeAuthorizationCode(code: string, redirectUri: string, code
     if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
       throw new Error('OAuth token exchange timed out after 30s. Check your network connection and try again.');
     }
-    throw err;
+    throw new Error('OAuth token exchange could not connect. Check your network connection and retry sign-in from Settings.');
   });
 
-  const text = await response.text();
-  if (!response.ok) throw new Error(`OAuth token exchange failed (${response.status}): ${text.slice(0, 300)}`);
-
-  let parsed: Record<string, unknown>;
-  try { parsed = JSON.parse(text) as Record<string, unknown>; }
-  catch { throw new Error(`OAuth token exchange returned invalid JSON: ${text.slice(0, 300)}`); }
+  const text = await response.text().catch(() => { throw new Error('OAuth token exchange response could not be read. Retry sign-in from Settings.'); });
+  const parsed = parseCodexTokenResponse(text, response.status, response.ok, 'exchange');
 
   const accessToken = typeof parsed.access_token === 'string' ? parsed.access_token : '';
   const refreshToken = typeof parsed.refresh_token === 'string' ? parsed.refresh_token : '';
@@ -387,15 +411,11 @@ async function refreshCodexOAuthTokens(tokens: CodexOAuthTokens): Promise<CodexO
     if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
       throw new Error('OAuth refresh timed out after 30s. Check your network connection and try again.');
     }
-    throw err;
+    throw new Error('OAuth refresh could not connect. Check your network connection and retry sign-in from Settings.');
   });
 
-  const text = await response.text();
-  if (!response.ok) throw new Error(`OAuth refresh failed (${response.status}): ${text.slice(0, 300)}`);
-
-  let parsed: Record<string, unknown>;
-  try { parsed = JSON.parse(text) as Record<string, unknown>; }
-  catch { throw new Error(`OAuth refresh returned invalid JSON: ${text.slice(0, 300)}`); }
+  const text = await response.text().catch(() => { throw new Error('OAuth refresh response could not be read. Retry sign-in from Settings.'); });
+  const parsed = parseCodexTokenResponse(text, response.status, response.ok, 'refresh');
 
   const accessToken = typeof parsed.access_token === 'string' ? parsed.access_token : '';
   const refreshToken = typeof parsed.refresh_token === 'string' ? parsed.refresh_token : tokens.refreshToken;
@@ -474,6 +494,7 @@ const CODEX_AUTH_DIR = path.join(HOME, '.codex');
 const CODEX_AUTH_FILE = path.join(CODEX_AUTH_DIR, 'auth.json');
 
 function atomicWriteJson(filePath: string, value: unknown): void {
+  if (process.platform === 'win32') { readJsonFile(filePath); writeCredentialFileSync(filePath, JSON.stringify(value, null, 2)); return; }
   // Tokens here include the OAuth refresh_token. macOS default umask
   // lands new files at 0644 — world-readable. Lock to 0600 so other
   // accounts on the same machine can't read the refresh token from
@@ -490,6 +511,7 @@ function atomicWriteJson(filePath: string, value: unknown): void {
 /** Write the tokens to Clementine's private auth store. */
 export function persistCodexOAuthTokens(tokens: CodexOAuthTokens): void {
   const localState = {
+    ...(process.platform === 'win32' ? readJsonFile(LOCAL_AUTH_FILE) ?? {} : {}),
     importedAt: new Date().toISOString(),
     source: 'native' as const,
     codexOauth: {

@@ -1,4 +1,3 @@
-import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
@@ -6,6 +5,7 @@ import { BASE_DIR } from '../../config.js';
 import { withDaemonRuntimePhase } from '../../daemon/phase.js';
 import { findSafeCliCommand } from '../../runtime/cli-discovery.js';
 import { mergedSpawnEnv } from '../../runtime/spawn-env.js';
+import { runCliProbeProcess } from '../../runtime/cli-probe-process.js';
 import { getSavedClis } from '../../runtime/saved-clis.js';
 import {
   CLI_CATALOG,
@@ -150,22 +150,7 @@ export interface ProbeExecResult {
 type ProbeExec = (binaryPath: string, args: string[], timeoutMs: number) => Promise<ProbeExecResult>;
 
 const realExec: ProbeExec = (binaryPath, args, timeoutMs) =>
-  new Promise((resolve) => {
-    execFile(binaryPath, args, {
-      timeout: timeoutMs,
-      cwd: BASE_DIR,
-      env: mergedSpawnEnv(),
-      maxBuffer: 256 * 1024,
-    }, (err, stdout, stderr) => {
-      const output = [stdout, stderr].filter(Boolean).join('\n');
-      if (err && (err as { killed?: boolean }).killed) {
-        resolve({ exitCode: null, output, stdout, timedOut: true, stderr });
-        return;
-      }
-      const code = err ? ((err as { code?: unknown }).code as number | null ?? 1) : 0;
-      resolve({ exitCode: typeof code === 'number' ? code : 1, output, stdout, timedOut: false, stderr });
-    });
-  });
+  runCliProbeProcess(binaryPath, args, { cwd: BASE_DIR, env: mergedSpawnEnv(), timeoutMs, maxBuffer: 256 * 1024 });
 
 let execImpl: ProbeExec = realExec;
 /** Test seam: probes are live logins away from being side-effectful, so

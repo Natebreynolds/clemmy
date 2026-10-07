@@ -20,18 +20,21 @@ const {
   escapeAppleScriptString,
   _testOnly_setOsaExec,
   _testOnly_stopSignInWatchers,
+  _testOnly_setWindowsTerminalExec,
+  openWindowsCatalogTerminal,
+  _testOnly_setWindowsTerminalResolver,
 } = await import('./terminal-handoff.js');
 const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
 
 afterEach(() => {
   _testOnly_setOsaExec();
+  _testOnly_setWindowsTerminalExec();
+  _testOnly_setWindowsTerminalResolver();
   _testOnly_stopSignInWatchers();
 });
 
-// The hand-off is macOS-only BY DESIGN (terminal-handoff.ts: "the product ships
-// mac-only") — off darwin it returns the "run it yourself" fallback instead of
-// driving Terminal. The tests below assert the macOS path, so they must not run
-// on the Linux release-preflight runner.
+// These existing tests specifically exercise the macOS Terminal.app path.
+// Windows PowerShell dispatch is covered separately below.
 const macOnly = {
   skip: process.platform !== 'darwin' ? 'Terminal hand-off drives Terminal.app; macOS-only by design' : false,
 } as const;
@@ -65,6 +68,37 @@ test('AppleScript escaping neutralizes quotes and backslashes', () => {
     'say \\"hi\\" \\\\ there',
     'backslashes double first, quotes escape second — order matters',
   );
+});
+
+test('Windows terminal launch carries catalog argv as data and requires a real launch receipt', async () => {
+  const calls: Array<{ program: string; payload: unknown }> = [];
+  _testOnly_setWindowsTerminalResolver(command => ({command, skipped:false, path:'C:\\Users\\Fixture Name & Co\\npm\\gh.cmd'}));
+  _testOnly_setWindowsTerminalExec(async (program, payload) => { calls.push({ program, payload }); return '123'; });
+  await openWindowsCatalogTerminal('gh auth login');
+  assert.equal(calls.length, 1);
+  assert.deepEqual((calls[0].payload as {argv: string[]}).argv, ['C:\\Users\\Fixture Name & Co\\npm\\gh.cmd', 'auth', 'login']);
+  assert.match(calls[0].program, /Start-Process/);
+  assert.match(calls[0].program, /EncodedCommand/);
+  assert.doesNotMatch(calls[0].program, /gh auth login|ExecutionPolicy|RunAs/);
+  _testOnly_setWindowsTerminalExec(async () => '');
+  await assert.rejects(openWindowsCatalogTerminal('gh auth login'), /confirm a terminal launch/);
+});
+
+test('a missing Windows catalog executable opens no terminal and gives an install/rescan action', async () => {
+  let calls = 0;
+  _testOnly_setWindowsTerminalResolver(() => null);
+  _testOnly_setWindowsTerminalExec(async () => { calls += 1; return '123'; });
+  await assert.rejects(openWindowsCatalogTerminal('gh auth login'), /no terminal was opened.*Rescan/);
+  assert.equal(calls, 0);
+});
+
+test('Windows terminal refuses secret templates and shell programs before dispatch', async () => {
+  let calls = 0;
+  _testOnly_setWindowsTerminalExec(async () => { calls += 1; return '123'; });
+  for (const command of ['ngrok config add-authtoken <your-token>', 'gh auth login & echo other', 'gh auth login\n; other']) {
+    await assert.rejects(openWindowsCatalogTerminal(command), /dedicated setup flow/);
+  }
+  assert.equal(calls, 0);
 });
 
 test('a TCC automation denial names the System Settings fix instead of a bare error', macOnly, async () => {

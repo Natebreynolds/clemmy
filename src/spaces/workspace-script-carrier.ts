@@ -10,7 +10,7 @@ import { currentDispatchLease, isDispatchLeaseCurrent } from '../runtime/harness
 import { canonicalArgumentDigestOf } from '../runtime/harness/resolved-call-authority.js';
 import { hostPreDispatchRefusal } from '../runtime/harness/host-pre-dispatch-refusal.js';
 import { DEFAULT_MAX_OUTPUT_BYTES, electronNodeEnv, interpreterFor, scrubbedChildEnv,
-  spawnSandboxedScript } from '../runtime/sandboxed-script.js';
+  spawnSandboxedScript, SANDBOXED_SCRIPT_UNCONFIRMED_STOP_GUIDANCE } from '../runtime/sandboxed-script.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import { savedSourceCallConsentIsCurrent } from '../runtime/harness/saved-source-consent.js';
 import { savedSourceOccurrenceCanDispatch } from '../runtime/harness/saved-source-control-state.js';
@@ -148,6 +148,7 @@ export async function executeReviewedWorkspaceScript(input: WorkspaceScriptArgum
     });
     if (!outcome.spawned && outcome.launchError) return refuse(`Saved script could not start: ${outcome.launchError.message}`);
     if (!outcome.spawned && outcome.aborted) return refuse('Saved script was cancelled before launch.');
+    if (outcome.timeoutCleanup === 'incomplete') throw new Error(SANDBOXED_SCRIPT_UNCONFIRMED_STOP_GUIDANCE);
     if (outcome.launchError || outcome.aborted || outcome.timedOut || outcome.overflowed || outcome.code !== 0) {
       // Do not call this zero-body: a started script may already have effects.
       throw new Error(`Saved script execution did not complete (exit=${outcome.code}, signal=${outcome.signal}, cancelled=${outcome.aborted}, timeout=${outcome.timedOut}, outputOverflow=${outcome.overflowed}). Its effects are uncertain; it will not be redispatched.`);

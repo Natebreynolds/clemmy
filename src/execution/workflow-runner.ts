@@ -15,6 +15,7 @@ import { ExternalWritePreDispatchError } from '../runtime/harness/external-write
 import { describeWorkflowStepAction } from '../runtime/approval-summary.js';
 import {
   interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript, DEFAULT_MAX_OUTPUT_BYTES,
+  SANDBOXED_SCRIPT_UNCONFIRMED_STOP_GUIDANCE,
 } from '../runtime/sandboxed-script.js';
 import pino from 'pino';
 import { actionBus } from '../runtime/action-bus.js';
@@ -4333,6 +4334,7 @@ async function runDeterministicWorkflowStep(
   } finally {
     unregisterCancellation();
   }
+  if (outcome.timeoutCleanup === 'incomplete') throw new Error(SANDBOXED_SCRIPT_UNCONFIRMED_STOP_GUIDANCE);
   if (outcome.aborted) throw new WorkflowRunCancelledError();
   // Stop can win between process exit and output publication. Never turn the
   // stopped run green just because its child managed to print valid JSON.

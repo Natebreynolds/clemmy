@@ -9,7 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -88,22 +88,103 @@ test('a refusing commit hook leaves leftovers uncommitted instead of being bypas
 });
 
 test('the host runs the test command itself and reports exit, output and timeouts', async () => {
-  const pass = await gitLib.runTestCommand('echo all good && exit 0', project);
+  // These commands exercise the real host shell on Windows and POSIX alike.
+  const nodeCommand = (script: string): string => `"${process.execPath}" -e "${script}"`;
+  const pass = await gitLib.runTestCommand(nodeCommand("console.log('all good');process.exit(0)"), project);
   assert.equal(pass.exitCode, 0);
   assert.match(pass.tail, /all good/);
-  const fail = await gitLib.runTestCommand('echo "1 failing" >&2; exit 3', project);
+  const fail = await gitLib.runTestCommand(nodeCommand("console.error('1 failing');process.exit(3)"), project);
   assert.equal(fail.exitCode, 3);
   assert.match(fail.tail, /1 failing/);
-  const hung = await gitLib.runTestCommand('sleep 30', project, 300);
+  const hung = await gitLib.runTestCommand(nodeCommand('setTimeout(()=>{},30000)'), project, 300);
   assert.equal(hung.timedOut, true);
   assert.equal(hung.exitCode, null);
   // The clean environment carries no Clem or provider secrets.
   process.env.ANTHROPIC_API_KEY = 'sk-test-should-not-leak';
   try {
-    const env = await gitLib.runTestCommand('env', project);
+    const env = await gitLib.runTestCommand(nodeCommand('console.log(Object.keys(process.env).join(String.fromCharCode(10)))'), project);
     assert.doesNotMatch(env.tail, /ANTHROPIC_API_KEY|CLEMENTINE_HOME/);
   } finally {
     delete process.env.ANTHROPIC_API_KEY;
   }
   assert.ok(readFileSync(path.join(project, 'README.md'), 'utf-8').startsWith('# fixture'));
+});
+
+test('a timed out test also stops its descendant process', async () => {
+  const fixture = path.join(project, 'timeout parent.mjs');
+  const pidFile = path.join(project, 'timeout-child-pid.txt');
+  writeFileSync(fixture, `import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], { stdio: 'ignore' });
+writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+setTimeout(()=>{},30000);
+`);
+  let descendant: number | undefined;
+  try {
+    const result = await gitLib.runTestCommand(`"${process.execPath}" "${fixture}"`, project, 3000);
+    assert.equal(result.timedOut, true);
+    assert.equal(result.exitCode, null);
+    descendant = Number(readFileSync(pidFile, 'utf8'));
+    assert.ok(Number.isInteger(descendant) && descendant > 0);
+    if (process.platform === 'win32') {
+      assert.equal(result.timeoutCleanup, 'complete');
+      assert.throws(() => process.kill(descendant!, 0), 'Windows descendants must be stopped before reporting completed cleanup');
+    }
+    let alive = true;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      try { process.kill(descendant, 0); } catch { alive = false; break; }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(alive, false, 'the test descendant must not survive the host timeout');
+  } finally {
+    if (descendant) { try { process.kill(descendant, 'SIGKILL'); } catch { /* already stopped */ } }
+    rmSync(fixture, { force: true });
+    rmSync(pidFile, { force: true });
+  }
+});
+
+test('Windows host test commands preserve a quoted executable path containing spaces', { skip: process.platform !== 'win32' }, async () => {
+  const directory = path.join(project, 'Program Files fixture');
+  mkdirSync(directory);
+  const executable = path.join(directory, 'node.exe');
+  copyFileSync(process.execPath, executable);
+  try {
+    const result = await gitLib.runTestCommand(`"${executable}" -e "console.log('quoted executable worked')"`, project);
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.timedOut, false);
+    assert.match(result.tail, /quoted executable worked/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('Windows reports failed tree cleanup promptly with an explicit next action', { skip: process.platform !== 'win32' }, async () => {
+  const fixture = path.join(project, 'cleanup-failure.mjs');
+  const pidFile = path.join(project, 'cleanup-failure-pids.json');
+  writeFileSync(fixture, `import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], { stdio: 'ignore' });
+writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([process.pid,child.pid]));
+setTimeout(()=>{},30000);
+`);
+  const originalRoot = process.env.SystemRoot;
+  let pids: number[] = [];
+  try {
+    process.env.SystemRoot = path.join(home, 'missing-system-root');
+    const result = await gitLib.runTestCommand(`"${process.execPath}" "${fixture}"`, project, 3000);
+    assert.equal(result.timedOut, true);
+    assert.equal(result.timeoutCleanup, 'incomplete');
+    assert.equal(result.exitCode, null);
+    assert.match(result.tail, /Check and stop remaining test processes before retrying/);
+    assert.ok(result.durationMs < 10_000, 'a failed cleanup must not wait for the hanging descendants');
+  } finally {
+    if (originalRoot === undefined) delete process.env.SystemRoot;
+    else process.env.SystemRoot = originalRoot;
+    if (existsSync(pidFile)) pids = JSON.parse(readFileSync(pidFile, 'utf8')) as number[];
+    for (const pid of pids) {
+      if (!Number.isInteger(pid) || pid <= 0) continue;
+      try {
+        execFileSync(path.join(originalRoot || 'C:\\Windows', 'System32', 'taskkill.exe'), ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 5000 });
+      } catch { /* test-created process already stopped */ }
+    }
+    rmSync(fixture, { force: true }); rmSync(pidFile, { force: true });
+  }
 });

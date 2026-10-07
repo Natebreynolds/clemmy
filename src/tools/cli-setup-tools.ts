@@ -127,11 +127,14 @@ async function installAction(
     const { findCatalogEntry } = await import('../integrations/cli-catalog/catalog.js');
     const entry = findCatalogEntry(catalogId.trim());
     if (!entry) return textResult(`Unknown catalog CLI "${catalogId}". Use cli_setup status for known ids, or pass a raw install command.`);
-    const job = startApprovedInstallCommand(entry.installCommand, `Install ${entry.name}`, { cliCatalogId: entry.id });
+    const { catalogInstallForPlatform } = await import('../integrations/cli-catalog/platform-install.js');
+    const recipe = catalogInstallForPlatform(entry);
+    if (!recipe.supported) return textResult(`${recipe.reason} Official instructions: ${recipe.docsUrl}`);
+    const job = startApprovedInstallCommand(recipe.command, `Install ${entry.name}`, { cliCatalogId: entry.id });
     return textResult([
-      `Installing ${entry.name} (${entry.installCommand}) — job ${job.id}.`,
+      `Installing ${entry.name} (${recipe.command}) — job ${job.id}.`,
       `Check progress with cli_setup {"action":"job_status","jobId":"${job.id}"}.`,
-      entry.authCommand ? `After install, sign in: ${(entry.authHeadless || process.platform === 'darwin') ? `cli_setup {"action":"auth","catalogId":"${entry.id}"}` : `the user runs \`${entry.authCommand}\` in their terminal`}.` : '',
+      entry.authCommand ? `After install, sign in: ${(entry.authHeadless || process.platform === 'darwin' || process.platform === 'win32') ? `cli_setup {"action":"auth","catalogId":"${entry.id}"}` : `the user runs \`${entry.authCommand}\` in their terminal`}.` : '',
     ].filter(Boolean).join('\n'));
   }
   if (!command?.trim()) return textResult('install needs a catalogId or a raw install command.');

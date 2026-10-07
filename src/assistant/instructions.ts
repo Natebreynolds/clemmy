@@ -16,6 +16,7 @@ import { findCatalogEntry, readConnectedClis } from '../integrations/cli-catalog
 import { readPersistedHealth } from '../integrations/cli-catalog/auth-health.js';
 import type { MessageIntent } from './message-intent.js';
 import { withSessionMemoryScope } from '../memory/memory-scope.js';
+import { renderHostExecutionContext } from '../runtime/host-execution-context.js';
 
 
 /**
@@ -368,6 +369,7 @@ function buildAssistantInstructionsInScope(
   const standingFacts = renderFactsForInstructions(12, 2000, undefined, 'pinned');
 
   const tier1 = [
+    renderHostExecutionContext(),
     identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, agentCreation, capture, handoffs, planner, focus, reportBack, workspaces,
     channelDirective, actionDirective, userPreferences, standingFacts, proposalFeedback,
     // Stable parity blocks (Now/Focus are dynamic → per-turn tail, not here).
@@ -388,6 +390,7 @@ function buildAssistantInstructionsInScope(
   return [
     // Date FIRST so the model reads it before any other context (matches harness).
     nowBlock,
+    renderHostExecutionContext(),
     identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, agentCreation, capture, handoffs, planner, focus, reportBack, workspaces,
     channelDirective, actionDirective,
     autonomyBlock,

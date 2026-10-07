@@ -2,14 +2,14 @@
   "name": "@clemmy/desktop",
   "version": "3.18.30",
   "private": true,
-  "description": "Clementine — native desktop shell. Supervises the daemon, opens the local dashboard, surfaces approvals and check-ins, manages credentials.",
+  "description": "Clementine \u2014 native desktop shell. Supervises the daemon, opens the local dashboard, surfaces approvals and check-ins, manages credentials.",
   "main": "dist/main.js",
   "type": "module",
   "scripts": {
-    "build": "npm run build:notch-helper && tsc -p . && tsc -p tsconfig.preload.json --noEmit && node scripts/build-preload.mjs",
+    "build": "npm run build:credential-policy && npm run build:notch-helper && tsc -p . && tsc -p tsconfig.preload.json --noEmit && node scripts/build-preload.mjs",
     "build:notch-helper": "node scripts/build-notch-click-helper.mjs",
     "typecheck": "tsc -p . --noEmit",
-    "dev": "npm run build:notch-helper && tsx src/main.ts",
+    "dev": "npm run build:credential-policy && npm run build:notch-helper && tsx src/main.ts",
     "start": "electron .",
     "build:daemon": "cd ../.. && npm run build",
     "build:mobile-web": "cd ../mobile-web && npm run build",
@@ -22,7 +22,9 @@
     "package:mac:unsigned": "APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false WHISPER_ALLOW_VALIDATED_CACHE=true ./scripts/release-mac-dual-arch.sh",
     "package:win": "node scripts/release-windows.mjs",
     "package:dist": "npm run build && npm run build:daemon && npm run build:mobile-web && npm run build:console-web && npm run vendor:recall-native && npm run vendor:whisper && npm run rebuild-daemon-natives && electron-builder && npm run restore-node-natives",
-    "release": "./scripts/release-mac-dual-arch.sh"
+    "release": "./scripts/release-mac-dual-arch.sh",
+    "build:credential-policy": "node scripts/build-credential-policy.mjs",
+    "build:windows-private-filesystem": "node scripts/build-windows-private-filesystem-probe.mjs"
   },
   "dependencies": {
     "electron-updater": "^6.8.9",
@@ -226,6 +228,14 @@
           "to": "daemon/vendor/whisper/x86_64-pc-windows-msvc",
           "filter": [
             "**/*"
+          ]
+        },
+        {
+          "from": "../../output/windows-private-filesystem",
+          "to": "windows-private-filesystem",
+          "filter": [
+            "windows-private-filesystem-probe.exe",
+            "manifest.json"
           ]
         }
       ],

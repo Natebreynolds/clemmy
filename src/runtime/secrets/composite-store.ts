@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../../config.js';
+import { CredentialStoragePrivacyError, isCredentialStoragePrivacyError, readCredentialFileSync, writeCredentialFileSync } from '../credential-private-filesystem.js';
 import { EnvSecretBackend } from './env-store.js';
 import { FileSecretBackend } from './file-store.js';
 import { KeychainSecretBackend, probeKeychain } from './keychain-store.js';
@@ -30,19 +31,25 @@ function ensureStateDir(): void {
 }
 
 function readMeta(): MetaShape {
-  if (!existsSync(META_FILE)) return { version: 'v1', entries: {} };
+  if (process.platform !== 'win32' && !existsSync(META_FILE)) return { version: 'v1', entries: {} };
   try {
-    const parsed = JSON.parse(readFileSync(META_FILE, 'utf-8'));
+    const raw = process.platform === 'win32' ? readCredentialFileSync(META_FILE) : readFileSync(META_FILE, 'utf-8');
+    if (raw === undefined) return { version: 'v1', entries: {} };
+    const parsed = JSON.parse(raw);
     if (parsed && parsed.version === 'v1' && parsed.entries && typeof parsed.entries === 'object') {
+      if (process.platform === 'win32' && Array.isArray(parsed.entries)) throw new CredentialStoragePrivacyError();
       return parsed as MetaShape;
     }
+    if (process.platform === 'win32') throw new CredentialStoragePrivacyError();
     return { version: 'v1', entries: {} };
-  } catch {
+  } catch (cause) {
+    if (process.platform === 'win32') throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
     return { version: 'v1', entries: {} };
   }
 }
 
 function writeMeta(meta: MetaShape): void {
+  if (process.platform === 'win32') { writeCredentialFileSync(META_FILE, JSON.stringify(meta, null, 2)); return; }
   ensureStateDir();
   const tmp = `${META_FILE}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(meta, null, 2), { encoding: 'utf-8', mode: 0o600 });
@@ -132,6 +139,11 @@ export class CompositeSecretStore {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (isCredentialStoragePrivacyError(err)) {
+        // Unsafe metadata cannot be rewritten as a side effect of reporting an
+        // unsafe vault. Keep the failure explicit without selecting env/keychain.
+        return { name, source: 'file', status: 'unreadable', metadata: { name, source: 'file', status: 'unreadable', version: 'v1', lastError: message } };
+      }
       const metadata = updateMeta(name, { source: 'file', status: 'unreadable', lastError: message });
       return { name, source: 'file', status: 'unreadable', metadata };
     }
@@ -207,6 +219,7 @@ export class CompositeSecretStore {
   /** Remove from ALL writable backends (keychain + file). Env is
    *  never touched — the user owns their .env. */
   async delete(name: SecretName): Promise<void> {
+    if (process.platform === 'win32') { await this.fileBackend.get(name); readMeta(); }
     await this.init();
     if (this.keychainBackend) await this.keychainBackend.delete(name);
     await this.fileBackend.delete(name);
@@ -272,11 +285,25 @@ export class CompositeSecretStore {
    */
   async health(options: { passive?: boolean } = {}): Promise<SecretHealthRow[]> {
     const rows: SecretHealthRow[] = [];
-    const meta = options.passive ? readMeta() : null;
+    let meta: MetaShape | null = null;
+    let metadataPrivacyError = false;
+    if (options.passive) {
+      try { meta = readMeta(); }
+      catch (error) { if (!isCredentialStoragePrivacyError(error)) throw error; metadataPrivacyError = true; }
+    }
     for (const desc of listSecretDescriptors()) {
       if (options.passive) {
         const metadata = meta?.entries[desc.name];
-        const fileValue = await this.fileBackend.get(desc.name);
+        let fileValue: string | undefined;
+        try {
+          if (metadataPrivacyError) throw new CredentialStoragePrivacyError();
+          fileValue = await this.fileBackend.get(desc.name);
+        } catch (error) {
+          if (!isCredentialStoragePrivacyError(error)) throw error;
+          rows.push({ name: desc.name, description: desc.description, source: 'file', status: 'unreadable', hasValue: false,
+            envFallbackAvailable: false, envVarName: desc.envVarName });
+          continue;
+        }
         const envValue = desc.envVarName ? await this.envBackend.get(desc.name) : undefined;
         const envFallbackAvailable = Boolean(envValue);
         // Drift = both stores populated but values disagree. The
@@ -467,6 +494,7 @@ export class CompositeSecretStore {
     fileVaultDeleted: boolean;
     metaDeleted: boolean;
   }> {
+    if (process.platform === 'win32') { await this.fileBackend.get('webhook_secret'); readMeta(); }
     let keychainDeleted: string[] = [];
     let keychainFailed: string[] = [];
     await this.init();

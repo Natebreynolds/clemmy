@@ -16,6 +16,7 @@ import {
 } from 'node:fs/promises';
 import path from 'node:path';
 import { BASE_DIR, PKG_DIR, getRuntimeEnv } from '../../config.js';
+import { stopWindowsProcessTree, type ProcessTreeStopResult } from '../../runtime/windows-process-tree.js';
 
 /**
  * Keep these pins in sync with scripts/vendor-whispercpp.mjs.
@@ -71,18 +72,22 @@ export type LocalWhisperErrorCode =
   | 'MODEL_CHECKSUM_MISMATCH'
   | 'TRANSCRIPTION_TIMEOUT'
   | 'TRANSCRIPTION_CANCELLED'
+  | 'TRANSCRIPTION_CLEANUP_UNKNOWN'
+  | 'TRANSCRIPTION_CLEANUP_PENDING'
   | 'TRANSCRIPTION_FAILED'
   | 'TRANSCRIPTION_OUTPUT_INVALID';
 
 export class LocalWhisperRuntimeError extends Error {
   readonly code: LocalWhisperErrorCode;
   readonly cause?: unknown;
+  readonly stopReason?: WhisperStopReason;
 
-  constructor(code: LocalWhisperErrorCode, message: string, options?: { cause?: unknown }) {
+  constructor(code: LocalWhisperErrorCode, message: string, options?: { cause?: unknown; stopReason?: WhisperStopReason }) {
     super(message);
     this.name = 'LocalWhisperRuntimeError';
     this.code = code;
     this.cause = options?.cause;
+    this.stopReason = options?.stopReason;
   }
 }
 
@@ -147,6 +152,10 @@ let lastRuntimePruneAt = 0;
 let pendingRuntimePrune: Promise<WhisperRuntimePruneResult> | undefined;
 let whisperLifecycleHandlersInstalled = false;
 let shutdownWhisperRuntimePromise: Promise<void> | undefined;
+// A failed Windows tree-stop receipt is not recoverable by starting another
+// CLI. Only a new host process can admit transcription after manual cleanup.
+let windowsWhisperCleanupUnknown = false;
+let pendingWindowsWhisperStops = 0;
 
 export function resolveWhisperRuntimeTarget(
   platform: NodeJS.Platform = process.platform,
@@ -734,6 +743,24 @@ interface ActiveWhisperProcess {
   closed: Promise<void>;
   requestStop(reason: WhisperStopReason): void;
   forceKill(): void;
+  awaitWindowsStop?: () => Promise<ProcessTreeStopResult>;
+}
+
+interface WhisperProcessControls {
+  platform?: NodeJS.Platform;
+  spawnProcess?: typeof spawn;
+  stopWindowsTree?: typeof stopWindowsProcessTree;
+}
+
+function cleanupUnknownError(stopReason?: WhisperStopReason): LocalWhisperRuntimeError {
+  return new LocalWhisperRuntimeError('TRANSCRIPTION_CLEANUP_UNKNOWN',
+    `Local transcription${stopReason ? ` ${stopReason}` : ' cleanup'} could not confirm that its Windows process tree stopped. Further transcription is blocked. Close the remaining local transcription processes and restart Clementine before retrying.`,
+    { stopReason });
+}
+
+function cleanupPendingError(): LocalWhisperRuntimeError {
+  return new LocalWhisperRuntimeError('TRANSCRIPTION_CLEANUP_PENDING',
+    'Local transcription is waiting for its Windows process-tree cleanup receipt. Wait for that cleanup to finish before retrying; another transcription has not started.');
 }
 
 const WHISPER_PARENT_SIGNALS: readonly NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP'];
@@ -807,17 +834,23 @@ function runWhisperProcess(
   cliPath: string,
   args: string[],
   options: { signal?: AbortSignal; timeoutMs: number },
+  controls: WhisperProcessControls = {},
 ): Promise<ProcessResult> {
   throwIfAborted(options.signal);
+  if (windowsWhisperCleanupUnknown) return Promise.reject(cleanupUnknownError());
+  if (pendingWindowsWhisperStops > 0) return Promise.reject(cleanupPendingError());
   if (shutdownWhisperRuntimePromise) {
     return Promise.reject(new LocalWhisperRuntimeError(
       'TRANSCRIPTION_CANCELLED',
       'Local transcription runtime is shutting down.',
     ));
   }
+  const windows = (controls.platform ?? process.platform) === 'win32';
+  const spawnProcess = controls.spawnProcess ?? spawn;
+  const stopWindowsTree = controls.stopWindowsTree ?? stopWindowsProcessTree;
   return new Promise((resolve, reject) => {
-    const child = spawn(cliPath, args, {
-      detached: process.platform !== 'win32',
+    const child = spawnProcess(cliPath, args, {
+      detached: !windows,
       shell: false,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -828,22 +861,65 @@ function runWhisperProcess(
     let finished = false;
     let stopReason: WhisperStopReason | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    let windowsStopPromise: Promise<ProcessTreeStopResult> | undefined;
     let resolveClosed!: () => void;
     const closed = new Promise<void>((resolveClose) => { resolveClosed = resolveClose; });
 
-    const forceKill = () => { signalWhisperChildTree(child, 'SIGKILL'); };
+    const settleWindowsStop = (receipt: ProcessTreeStopResult): void => {
+      if (finished) return;
+      finished = true;
+      if (receipt !== 'complete') windowsWhisperCleanupUnknown = true;
+      // The bounded receipt, rather than pipe EOF, settles the attempt. An
+      // inherited pipe cannot keep Clem waiting after either stop outcome.
+      child.stdout?.destroy(); child.stderr?.destroy(); child.unref();
+      cleanup();
+      if (receipt !== 'complete') { reject(cleanupUnknownError(stopReason)); return; }
+      if (stopReason === 'timeout') {
+        reject(new LocalWhisperRuntimeError('TRANSCRIPTION_TIMEOUT',
+          `Local transcription timed out after ${Math.round(options.timeoutMs / 1_000)} seconds.`, { stopReason }));
+      } else {
+        reject(new LocalWhisperRuntimeError('TRANSCRIPTION_CANCELLED', 'Local transcription was cancelled.', { stopReason }));
+      }
+    };
+    const stopWindows = (): Promise<ProcessTreeStopResult> => {
+      if (!windowsStopPromise) {
+        // Start tree cleanup while the owned parent still exists. Killing the
+        // parent first can orphan descendants before taskkill /T observes them.
+        let acceptReceipt!: (receipt: ProcessTreeStopResult) => void;
+        windowsStopPromise = new Promise(resolveReceipt => { acceptReceipt = resolveReceipt; });
+        pendingWindowsWhisperStops += 1;
+        let dispatched: Promise<ProcessTreeStopResult>;
+        try { dispatched = stopWindowsTree(child); }
+        catch { dispatched = Promise.resolve('incomplete'); }
+        void Promise.resolve(dispatched)
+          .catch((): ProcessTreeStopResult => 'incomplete')
+          .then(receipt => {
+            const exact: ProcessTreeStopResult = receipt === 'complete' ? 'complete' : 'incomplete';
+            settleWindowsStop(exact);
+            pendingWindowsWhisperStops -= 1;
+            acceptReceipt(exact);
+          });
+      }
+      return windowsStopPromise;
+    };
+    const forceKill = () => {
+      if (windows) { stopReason ??= 'shutdown'; void stopWindows(); }
+      else signalWhisperChildTree(child, 'SIGKILL');
+    };
     const requestStop = (reason: WhisperStopReason) => {
       if (finished) return;
       if (!stopReason) {
         stopReason = reason;
-        signalWhisperChildTree(child, 'SIGTERM');
+        if (!windows) signalWhisperChildTree(child, 'SIGTERM');
       }
+      if (windows) { void stopWindows(); return; }
       if (!forceKillTimer) {
         forceKillTimer = setTimeout(forceKill, PROCESS_KILL_GRACE_MS);
         forceKillTimer.unref();
       }
     };
-    const active: ActiveWhisperProcess = { child, closed, requestStop, forceKill };
+    const active: ActiveWhisperProcess = { child, closed, requestStop, forceKill,
+      ...(windows ? { awaitWindowsStop: stopWindows } : {}) };
     activeWhisperProcesses.add(active);
     installWhisperLifecycleHandlers();
 
@@ -867,12 +943,14 @@ function runWhisperProcess(
 
     child.once('error', (error) => {
       if (finished) return;
+      if (windows && stopReason && child.pid) { void stopWindows(); return; }
       finished = true;
       cleanup();
       reject(new LocalWhisperRuntimeError('TRANSCRIPTION_FAILED', `Could not start whisper.cpp: ${errorMessage(error)}`, { cause: error }));
     });
     child.once('close', (code, processSignal) => {
       if (finished) return;
+      if (windows && stopReason) { void stopWindows(); return; }
       finished = true;
       // If the direct CLI honored SIGTERM before the grace timer, descendants
       // may still be alive in its detached process group. The leader is already
@@ -926,11 +1004,17 @@ export function shutdownLocalTranscriptionRuntime(
   const work = (async () => {
     const initial = [...activeWhisperProcesses];
     for (const active of initial) active.requestStop('shutdown');
+    // Windows helpers own their finite utility deadline. Await the exact
+    // coalesced receipts, even if the direct child closes before the utility.
+    await Promise.all(initial.flatMap(active => active.awaitWindowsStop ? [active.awaitWindowsStop()] : []));
     await waitForWhisperProcesses(initial, graceMs);
 
     const remaining = [...activeWhisperProcesses];
     for (const active of remaining) active.forceKill();
     await waitForWhisperProcesses(remaining, Math.max(1_000, Math.min(PROCESS_KILL_GRACE_MS, graceMs || 1_000)));
+    if (windowsWhisperCleanupUnknown) throw cleanupUnknownError('shutdown');
+    if ([...activeWhisperProcesses].some(active => active.awaitWindowsStop)) throw new LocalWhisperRuntimeError('TRANSCRIPTION_FAILED',
+      'Local transcription shutdown still has active processes. Stop the remaining local transcription processes before restarting Clementine.');
   })();
   tracked = work.finally(() => {
     if (shutdownWhisperRuntimePromise === tracked) shutdownWhisperRuntimePromise = undefined;
@@ -1109,6 +1193,8 @@ export async function getLocalTranscriptionRuntimeStatus(): Promise<LocalTranscr
 export async function transcribeLocalMeetingAudio(
   input: TranscribeLocalMeetingAudioInput,
 ): Promise<LocalWhisperTranscription> {
+  if (windowsWhisperCleanupUnknown) throw cleanupUnknownError();
+  if (pendingWindowsWhisperStops > 0) throw cleanupPendingError();
   const model = input.model ?? DEFAULT_LOCAL_WHISPER_MODEL;
   modelConfig(model);
   throwIfAborted(input.signal);
@@ -1127,6 +1213,7 @@ export async function transcribeLocalMeetingAudio(
   activeJobDirs.add(jobDir);
   const outputPrefix = path.join(jobDir, 'result');
   const outputPath = `${outputPrefix}.json`;
+  let cleanupUnconfirmed = false;
   try {
     await runWhisperProcess(cli.path, [
       '--model', modelPath,
@@ -1138,9 +1225,16 @@ export async function transcribeLocalMeetingAudio(
     ], { signal: input.signal, timeoutMs });
     const parsed = await readWhisperOutput(outputPath);
     return { ...parsed, model, language: parsed.language ?? language };
+  } catch (error) {
+    cleanupUnconfirmed = error instanceof LocalWhisperRuntimeError && error.code === 'TRANSCRIPTION_CLEANUP_UNKNOWN';
+    throw error;
   } finally {
-    activeJobDirs.delete(jobDir);
-    await rm(jobDir, { recursive: true, force: true }).catch(() => undefined);
+    // An unconfirmed writer may still own these temporary files. Preserve its
+    // work directory until the host has been stopped and restarted safely.
+    if (!cleanupUnconfirmed) {
+      activeJobDirs.delete(jobDir);
+      await rm(jobDir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
 
@@ -1151,6 +1245,8 @@ function errorMessage(error: unknown): string {
 /** Narrow test surface for download integrity and process behavior fixtures. */
 export const __testing = {
   activeWhisperProcessCount: (): number => activeWhisperProcesses.size,
+  windowsCleanupUnknown: (): boolean => windowsWhisperCleanupUnknown,
+  pendingWindowsStopCount: (): number => pendingWindowsWhisperStops,
   boundedTimeout,
   detectWaveDurationSeconds,
   downloadVerifiedFile,

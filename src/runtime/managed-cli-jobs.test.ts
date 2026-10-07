@@ -21,15 +21,21 @@ const { _testOnly_commandFor, startCatalogAuthJob } = await import('./managed-cl
 const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
 
 test('legacy gh/composio command specs are pinned byte-for-byte', () => {
-  assert.equal(_testOnly_commandFor('github', 'install').command, 'brew install gh');
+  assert.equal(_testOnly_commandFor('github', 'install', 'darwin').command, 'brew install gh');
   assert.equal(_testOnly_commandFor('github', 'auth').command,
     'gh auth login -h github.com --web -s repo -s read:org -s workflow');
   assert.equal(_testOnly_commandFor('github', 'repair').command,
     'gh auth refresh -h github.com -s repo -s read:org -s workflow');
-  assert.equal(_testOnly_commandFor('composio', 'install').command,
+  assert.equal(_testOnly_commandFor('composio', 'install', 'darwin').command,
     'curl -fsSL https://composio.dev/install | bash');
   assert.equal(_testOnly_commandFor('composio', 'auth').command, 'composio login');
   assert.equal(_testOnly_commandFor('composio', 'repair').command, 'composio login');
+});
+
+test('Windows managed installers use the reviewed GitHub package and refuse the Unix-only Composio recipe', () => {
+  assert.equal(_testOnly_commandFor('github', 'install', 'win32').command,
+    'winget install --id GitHub.cli --exact --source winget --disable-interactivity');
+  assert.throws(() => _testOnly_commandFor('composio', 'install', 'win32'), /requires WSL.*SDK backend/);
 });
 
 test('an unknown catalog id cannot start an auth job', async () => {

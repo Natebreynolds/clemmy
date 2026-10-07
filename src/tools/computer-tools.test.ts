@@ -52,7 +52,10 @@ test('annotateShellStderr: an HTTP 404 is NOT mislabeled "binary not on PATH" (t
 test('annotateShellStderr: a GENUINE command-not-found still gets the install hint (no regression)', () => {
   const out = annotateShellStderr('bash: foo: command not found', 'foo --bar');
   assert.match(out, /not on PATH/i);
-  assert.match(out, /brew install foo|npm install -g foo/);
+  if (process.platform === 'win32') {
+    assert.match(out, /native Windows version/);
+    assert.doesNotMatch(out, /brew/);
+  } else assert.match(out, /brew install foo|npm install -g foo/);
 });
 
 test('annotateShellStderr: a CATALOG binary routes to cli_setup (approved install path), not a raw brew guess', () => {

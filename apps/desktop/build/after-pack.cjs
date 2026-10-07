@@ -16,6 +16,15 @@ module.exports = async function afterPack(context) {
       throw new Error(`Packaged built-in skill differs from source: ${name}`);
     }
   }
+  if (context.electronPlatformName === 'win32') {
+    if (context.arch !== Arch.x64) throw new Error('Canonical Windows private filesystem probe requires an x64 package.');
+    const root = path.resolve(context.packager.projectDir, '..', '..');
+    const { tsImport } = await import('tsx/esm/api');
+    const { WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE } = await tsImport(path.join(root, 'src/runtime/windows-private-filesystem.ts'), require('node:url').pathToFileURL(__filename).href);
+    const { bindPackagedWindowsAclProbe } = await import('../scripts/windows-private-filesystem-packaging.mjs');
+    bindPackagedWindowsAclProbe({ sourceDirectory: path.join(root, 'output/windows-private-filesystem'),
+      resourcesDirectory: packagedResources, classSource: WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE });
+  }
   if (context.electronPlatformName !== 'darwin') return;
   const arch = context.arch === Arch.arm64 ? 'arm64' : context.arch === Arch.x64 ? 'x64' : null;
   if (!arch) throw new Error(`unsupported Clementine macOS package architecture: ${context.arch}`);

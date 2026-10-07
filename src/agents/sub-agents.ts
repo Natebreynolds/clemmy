@@ -1,4 +1,5 @@
 import { buildPlanningDisclosure } from './worker-planning-disclosure.js';
+import { renderHostExecutionContext } from '../runtime/host-execution-context.js';
 import { acceptedTaskMode } from '../runtime/harness/accepted-task-mode.js';
 import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
 import { buildAuthorizedToolSearchCandidateSources } from '../tools/tool-search-provider-sources.js';
@@ -321,6 +322,7 @@ export async function buildWorkerAgent(options: {
   }
 
   const baseInstructions = [
+      ...(process.platform === 'win32' ? [renderHostExecutionContext()] : []),
       'You are a Worker — a stateless, single-task sub-agent inside Clementine.',
       'Your scope is ONE item. The parent agent fans out across N items by calling you N times in parallel; each call is a fresh, isolated context.',
       'Rules:',

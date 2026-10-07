@@ -2,7 +2,7 @@
  * produce_document tool (2026-07-21) — render markdown/HTML into a real
  * PDF / DOCX / HTML file, with {{var}} template merge. The impure half of
  * document-produce-core.ts: PDF via headless Chrome --print-to-pdf, DOCX via
- * macOS textutil — both already installed, zero new dependencies. Output
+ * macOS textutil, with an offline WordprocessingML backend elsewhere. Output
  * lands in the file-pipeline staging dir, so it chains straight into an
  * upload (Drive) or an email attachment param.
  */
@@ -16,16 +16,11 @@ import { pathToFileURL } from 'node:url';
 import { BASE_DIR } from '../config.js';
 import { textResult } from './shared.js';
 import { htmlDocument, mergeTemplate, renderMarkdown } from './document-produce-core.js';
+import { htmlToPortableDocx } from './document-docx.js';
+import { windowsChromiumCandidates } from '../integrations/windows-browser-paths.js';
 
 const CHROME_CANDIDATES = process.platform === 'win32'
-  ? [
-      path.join(process.env['ProgramFiles'] ?? 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-      path.join(process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-      path.join(process.env['LOCALAPPDATA'] ?? '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-      path.join(process.env['ProgramFiles'] ?? 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-      path.join(process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-      path.join(process.env['ProgramFiles'] ?? 'C:\\Program Files', 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
-    ].filter((candidate) => !candidate.startsWith(path.sep))
+  ? windowsChromiumCandidates()
   : [
       '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
       '/Applications/Chromium.app/Contents/MacOS/Chromium',
@@ -63,14 +58,21 @@ function defaultChromePdf(htmlPath: string, pdfPath: string): { ok: boolean; err
   const run = spawnSync(chrome, [
     '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
     `--print-to-pdf=${pdfPath}`, '--no-pdf-header-footer', pathToFileURL(htmlPath).href,
-  ], { timeout: 45_000, encoding: 'utf-8' });
+  ], { timeout: 45_000, encoding: 'utf-8', windowsHide: true });
   if (run.error) return { ok: false, error: run.error.message };
   if (!existsSync(pdfPath)) return { ok: false, error: (run.stderr || 'Chrome produced no PDF').slice(0, 400) };
   return { ok: true };
 }
 
 function defaultTextutilDocx(htmlPath: string, docxPath: string): { ok: boolean; error?: string } {
-  if (process.platform !== 'darwin') return { ok: false, error: 'DOCX conversion uses macOS textutil — produce HTML or PDF on this platform.' };
+  if (process.platform !== 'darwin') {
+    try {
+      writeFileSync(docxPath, htmlToPortableDocx(readFileSync(htmlPath, 'utf-8')));
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   const run = spawnSync('/usr/bin/textutil', ['-convert', 'docx', htmlPath, '-output', docxPath], { timeout: 30_000, encoding: 'utf-8' });
   if (run.error) return { ok: false, error: run.error.message };
   if (!existsSync(docxPath)) return { ok: false, error: (run.stderr || 'textutil produced no DOCX').slice(0, 400) };
@@ -146,6 +148,9 @@ export function registerDocumentProduceTools(server: McpServer, backends: Render
         return textResult(JSON.stringify({
           filePath: outPath,
           format: args.format,
+          ...(args.format === 'docx' && process.platform !== 'darwin' && !backends.textutilDocx
+            ? { rendering_note: 'DOCX uses standard document formatting; custom HTML/CSS page layout is not reproduced.' }
+            : {}),
           note: 'Chain this filePath into an upload (Drive) or an email-attachment param — the file pipeline accepts local paths.',
         }));
       } catch (err) {

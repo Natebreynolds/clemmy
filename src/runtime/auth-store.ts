@@ -7,6 +7,7 @@ import type { AuthStatus } from '../types.js';
 import { loginWithNativeCodexOAuth, refreshNativeCodexTokens, startCodexDeviceAuth, pollCodexDeviceAuth } from './codex-native-oauth.js';
 import type { NativeCodexTokenSet } from './codex-native-oauth.js';
 import { claudeVaultFallbackReady, hasClaudeCodeCredentialFile } from './claude-oauth.js';
+import { CredentialStoragePrivacyError, isCredentialStoragePrivacyError, readCredentialFileSync, readCredentialSourceFileSync, writeCredentialFileSync } from './credential-private-filesystem.js';
 import {
   startXaiDeviceAuth,
   pollXaiDeviceAuth,
@@ -342,10 +343,27 @@ interface CodexBootstrapAvailability {
 }
 
 function loadLocalAuthState(): LocalAuthState {
-  if (!existsSync(AUTH_STATE_FILE)) return {};
+  if (process.platform !== 'win32' && !existsSync(AUTH_STATE_FILE)) return {};
   try {
-    return JSON.parse(readFileSync(AUTH_STATE_FILE, 'utf-8')) as LocalAuthState;
-  } catch {
+    const raw = process.platform === 'win32' ? readCredentialFileSync(AUTH_STATE_FILE) : readFileSync(AUTH_STATE_FILE, 'utf-8');
+    if (raw === undefined) return {};
+    const parsed = JSON.parse(raw) as LocalAuthState;
+    if (process.platform === 'win32') {
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new CredentialStoragePrivacyError();
+      for (const [key, fields] of [
+        ['codexOauth', ['accessToken', 'refreshToken', 'idToken', 'accountId', 'lastRefresh']],
+        ['xaiOauth', ['accessToken', 'refreshToken', 'idToken', 'expiresAt', 'lastRefresh']],
+      ] as const) {
+        const section = parsed[key];
+        if (section === undefined) continue; // An absent unrelated grant is valid.
+        if (!section || typeof section !== 'object' || Array.isArray(section)
+          || fields.some(field => (section as Record<string, unknown>)[field] !== undefined
+            && typeof (section as Record<string, unknown>)[field] !== 'string')) throw new CredentialStoragePrivacyError();
+      }
+    }
+    return parsed;
+  } catch (cause) {
+    if (process.platform === 'win32') throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
     return {};
   }
 }
@@ -354,17 +372,21 @@ function loadLocalAuthState(): LocalAuthState {
  * homes. Its closed schema prevents a refresh/id token from being smuggled into
  * the snapshot, and JWT expiry remains the authority over the metadata field. */
 function loadIsolatedCodexAccessState(options: { allowExpired?: boolean } = {}): IsolatedCodexAccessState | null {
-  if (!existsSync(CODEX_ACCESS_ONLY_FILE)) return null;
+  if (process.platform !== 'win32' && !existsSync(CODEX_ACCESS_ONLY_FILE)) return null;
   try {
-    const parsed = JSON.parse(readFileSync(CODEX_ACCESS_ONLY_FILE, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const raw = process.platform === 'win32' ? readCredentialFileSync(CODEX_ACCESS_ONLY_FILE) : readFileSync(CODEX_ACCESS_ONLY_FILE, 'utf-8');
+    if (raw === undefined) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    const invalid = (): null => { if (process.platform === 'win32') throw new CredentialStoragePrivacyError(); return null; };
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return invalid();
     const record = parsed as Record<string, unknown>;
     const allowed = new Set(['version', 'accessToken', 'expiresAt', 'accountId']);
-    if (Object.keys(record).some((key) => !allowed.has(key))) return null;
-    if (record.version !== 1 || typeof record.accessToken !== 'string' || !record.accessToken.trim()) return null;
-    if (typeof record.expiresAt !== 'number' || !Number.isFinite(record.expiresAt)) return null;
+    if (Object.keys(record).some((key) => !allowed.has(key))) return invalid();
+    if (record.version !== 1 || typeof record.accessToken !== 'string' || !record.accessToken.trim()) return invalid();
+    if (typeof record.expiresAt !== 'number' || !Number.isFinite(record.expiresAt)
+      || (record.accountId !== undefined && typeof record.accountId !== 'string')) return invalid();
     const jwtExpiry = accessTokenExpMs(record.accessToken);
-    if (jwtExpiry === null || jwtExpiry !== record.expiresAt) return null;
+    if (jwtExpiry === null || jwtExpiry !== record.expiresAt) return invalid();
     if (!options.allowExpired && jwtExpiry <= Date.now()) return null;
     const accountId = typeof record.accountId === 'string' && record.accountId.trim()
       ? record.accountId
@@ -375,7 +397,8 @@ function loadIsolatedCodexAccessState(options: { allowExpired?: boolean } = {}):
       expiresAt: jwtExpiry,
       ...(accountId ? { accountId } : {}),
     };
-  } catch {
+  } catch (cause) {
+    if (process.platform === 'win32') throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
     return null;
   }
 }
@@ -412,9 +435,14 @@ function saveLocalAuthState(state: LocalAuthState): void {
   // Refresh tokens live here. Lock to 0600 so other accounts on the
   // same machine can't read them. Pass mode at write time AND chmod
   // after because some filesystems re-apply umask on creation.
-  mkdirSync(path.dirname(AUTH_STATE_FILE), { recursive: true });
-  writeFileSync(AUTH_STATE_FILE, JSON.stringify(state, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  try { chmodSync(AUTH_STATE_FILE, 0o600); } catch { /* best-effort */ }
+  if (process.platform === 'win32') {
+    loadLocalAuthState();
+    writeCredentialFileSync(AUTH_STATE_FILE, JSON.stringify(state, null, 2));
+  } else {
+    mkdirSync(path.dirname(AUTH_STATE_FILE), { recursive: true });
+    writeFileSync(AUTH_STATE_FILE, JSON.stringify(state, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    try { chmodSync(AUTH_STATE_FILE, 0o600); } catch { /* best-effort */ }
+  }
   // A fresh, usable token landed (login / import / successful refresh) → auth is
   // healthy again, so lift any DEAD latch. This is the single recovery signal.
   if (state.codexOauth?.accessToken && state.codexOauth?.refreshToken) {
@@ -423,17 +451,29 @@ function saveLocalAuthState(state: LocalAuthState): void {
 }
 
 function loadCodexCliAuth(sourceFile = getCodexAuthSourceFile()): CodexCliAuthFile | null {
-  if (!existsSync(sourceFile)) return null;
+  if (process.platform !== 'win32' && !existsSync(sourceFile)) return null;
   try {
-    return JSON.parse(readFileSync(sourceFile, 'utf-8')) as CodexCliAuthFile;
-  } catch {
+    const raw = process.platform === 'win32' ? readCredentialSourceFileSync(sourceFile) : readFileSync(sourceFile, 'utf-8');
+    if (raw === undefined) return null;
+    const parsed = JSON.parse(raw) as CodexCliAuthFile;
+    if (process.platform === 'win32') {
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new CredentialStoragePrivacyError();
+      if (parsed.tokens !== undefined && (!parsed.tokens || typeof parsed.tokens !== 'object' || Array.isArray(parsed.tokens)
+        || ['access_token', 'refresh_token', 'id_token', 'account_id'].some(key =>
+          (parsed.tokens as Record<string, unknown>)[key] !== undefined && typeof (parsed.tokens as Record<string, unknown>)[key] !== 'string'))) throw new CredentialStoragePrivacyError();
+    }
+    return parsed;
+  } catch (cause) {
+    if (process.platform === 'win32') throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
     return null;
   }
 }
 
 function getCodexBootstrapState(sourceFile = getCodexAuthSourceFile()): CodexBootstrapState {
   const local = loadLocalAuthState();
-  const codexCli = loadCodexCliAuth(sourceFile);
+  // An external CLI grant is never runtime authority. Windows status/bootstrap
+  // leave that private source uninspected; explicit import still verifies it.
+  const codexCli = process.platform === 'win32' ? null : loadCodexCliAuth(sourceFile);
   return {
     localCodex: local.codexOauth,
     codexCli: codexCli?.tokens,
@@ -848,7 +888,7 @@ export function clearImportedAuth(): void {
 export function getAuthStatus(): AuthStatus {
   const local = loadLocalAuthState();
   const isolatedCodex = loadIsolatedCodexAccessState();
-  const codexCli = loadCodexCliAuth();
+  const codexCli = process.platform === 'win32' ? null : loadCodexCliAuth();
   const codexAuthSourceFile = getCodexAuthSourceFile();
   const localCodex = local.codexOauth;
   const openaiApiKeyPresent = Boolean(getOpenAiApiKey());
@@ -937,7 +977,8 @@ export function getAuthStatus(): AuthStatus {
     source: 'none',
     message: legacyCliFilePresent
       ? 'No Clementine Codex sign-in. A Codex CLI sign-in exists but Clementine no longer uses it (so a `codex logout` can’t sign you out). Run `clementine auth login-device` (or desktop → Re-authenticate) to give Clementine its own independent sign-in.'
-      : 'No Codex OAuth credentials found. Run `clementine auth login-device` (remote/headless), `clementine auth login-native` (local browser), or use the desktop setup flow to sign in with ChatGPT.',
+      : 'No Clementine Codex OAuth credentials found. Run `clementine auth login-device` (remote/headless), `clementine auth login-native` (local browser), or use the desktop setup flow to sign in with ChatGPT.'
+        + (process.platform === 'win32' ? ' External CLI credentials were not inspected; import them only through the explicit import action.' : ''),
     openaiApiKeyPresent,
     codexOauthPresent,
     codexImportPath: codexAuthSourceFile,

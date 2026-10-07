@@ -3,9 +3,9 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { readdir, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { BASE_DIR } from '../config.js';
 import { augmentPath, mergedSpawnEnv } from './spawn-env.js';
+import { runCliProbeProcess } from './cli-probe-process.js';
 
 /**
  * Local CLI discovery. Two operations, both global:
@@ -230,48 +230,15 @@ function cliProbeTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? Math.min(60_000, raw) : 2000;
 }
 
-function runQuick(command: string, args: string[], cwd: string, timeoutMs = cliProbeTimeoutMs()): Promise<string | undefined> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const child = spawn(command, args, {
-      cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      // No shell — direct exec is faster and avoids shell-injection surface.
-      // Use the SAME canonical environment as real shell execution. The caller
-      // passes the already-resolved absolute executable, so discovery cannot
-      // claim a version-manager CLI exists and then fail to launch its bare name.
-      env: mergedSpawnEnv(),
-    });
-    const chunks: Buffer[] = [];
-    const onData = (b: Buffer): void => { chunks.push(b); };
-    child.stdout?.on('data', onData);
-    child.stderr?.on('data', onData);
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try { child.kill('SIGKILL'); } catch (_) { /* noop */ }
-      resolve(undefined);
-    }, timeoutMs);
-    child.on('error', () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(undefined);
-    });
-    child.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code !== 0) {
-        // Some CLIs return non-zero on --help (rare); still consider
-        // it a CLI if we got reasonable output.
-        const text = Buffer.concat(chunks).toString('utf-8').trim();
-        resolve(text.length > 0 ? text : undefined);
-        return;
-      }
-      resolve(Buffer.concat(chunks).toString('utf-8').trim());
-    });
-  });
+async function runQuick(command: string, args: string[], cwd: string, timeoutMs = cliProbeTimeoutMs()): Promise<{ text?: string; cleanupIncomplete?: boolean }> {
+  // The already-resolved path and canonical environment remain the authority.
+  // Windows npm .cmd shims use the locked argv-aware spawn implementation.
+  const result = await runCliProbeProcess(command, args, { cwd, timeoutMs, env: mergedSpawnEnv() });
+  if (result.cleanupIncomplete) return { cleanupIncomplete: true };
+  if (result.timedOut || result.overflowed) return {};
+  const text = result.output.trim();
+  // Some CLIs return non-zero on --help; retain their bounded useful output.
+  return { text: result.exitCode === 0 ? text : text || undefined };
 }
 
 function headLines(text: string, max = 3, perLine = 200): string | undefined {
@@ -622,13 +589,27 @@ export async function probe(command: string, candidatePath?: string): Promise<Cl
 
   let versionOut: string | undefined;
   let helpOut: string | undefined;
+  let cleanupIncomplete = false;
   try {
     chmodSync(scratchCwd, 0o700);
-    versionOut = await runQuick(safe.path, ['--version'], scratchCwd);
-    helpOut = versionOut ? undefined : await runQuick(safe.path, ['--help'], scratchCwd);
+    const first = await runQuick(safe.path, ['--version'], scratchCwd);
+    cleanupIncomplete = Boolean(first.cleanupIncomplete);
+    versionOut = first.text;
+    if (!versionOut && !cleanupIncomplete) {
+      const fallback = await runQuick(safe.path, ['--help'], scratchCwd);
+      helpOut = fallback.text;
+      cleanupIncomplete = Boolean(fallback.cleanupIncomplete);
+    }
   } finally {
-    rmSync(scratchCwd, { recursive: true, force: true });
+    // Preserve the private cwd while an unconfirmed Windows descendant may
+    // still be using it. Retrying this executable remains blocked until restart.
+    if (!cleanupIncomplete) rmSync(scratchCwd, { recursive: true, force: true });
   }
+
+  if (cleanupIncomplete) return {
+    command, path: safe.path, isLikelyCli: false, probedAt: new Date().toISOString(),
+    helpHead: 'The CLI probe process tree could not be confirmed stopped. Stop its remaining processes and restart Clementine before probing this executable again.',
+  };
 
   const version = headLines(versionOut ?? '', 2);
   const helpHead = headLines(helpOut ?? '', 4);

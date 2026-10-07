@@ -22,16 +22,35 @@ const PASSTHROUGH = new Set([
 ]);
 
 const PASSTHROUGH_PREFIXES = ['LC_', 'XDG_'];
+const WINDOWS_ALLOWED_NAMES = new Map<string, string>();
+for (const name of PASSTHROUGH) {
+  if (!WINDOWS_ALLOWED_NAMES.has(name.toLowerCase())) WINDOWS_ALLOWED_NAMES.set(name.toLowerCase(), name);
+}
+
+// Windows process creation, native DLL loading and per-user CLI configuration
+// need these OS values even though provider credentials remain withheld.
+const WINDOWS_PASSTHROUGH = new Map([
+  'SystemRoot', 'windir', 'SystemDrive', 'ComSpec', 'PATHEXT',
+  'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP',
+].map((name) => [name.toLowerCase(), name]));
 
 /** Never forwarded, even when a prefix above would admit them. */
 const WITHHELD = /^(?:ANTHROPIC_|OPENAI_|CLAUDE_CODE_OAUTH|CLEMENTINE_|CLEMMY_|ELECTRON_|NODE_OPTIONS$)/;
 
-export function buildCodingAgentEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+export function buildCodingAgentEnv(source: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(source)) {
-    if (typeof value !== 'string' || WITHHELD.test(key)) continue;
-    if (PASSTHROUGH.has(key) || PASSTHROUGH_PREFIXES.some((prefix) => key.startsWith(prefix))) env[key] = value;
+    const checkedKey = platform === 'win32' ? key.toUpperCase() : key;
+    if (typeof value !== 'string' || WITHHELD.test(checkedKey)) continue;
+    if (platform === 'win32') {
+      const windowsKey = WINDOWS_PASSTHROUGH.get(key.toLowerCase()) ?? WINDOWS_ALLOWED_NAMES.get(key.toLowerCase());
+      if (windowsKey) env[windowsKey] = value;
+      else if (PASSTHROUGH_PREFIXES.some(prefix => checkedKey.startsWith(prefix))) env[checkedKey] = value;
+    } else if (PASSTHROUGH.has(key) || PASSTHROUGH_PREFIXES.some(prefix => key.startsWith(prefix))) env[key] = value;
   }
-  env.PATH = augmentPath(source.PATH);
+  const pathKey = platform === 'win32'
+    ? Object.keys(source).find((key) => key.toLowerCase() === 'path')
+    : 'PATH';
+  env.PATH = augmentPath(pathKey ? source[pathKey] : undefined);
   return env;
 }

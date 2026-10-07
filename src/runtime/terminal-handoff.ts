@@ -1,5 +1,11 @@
 import { execFile } from 'node:child_process';
 import pino from 'pino';
+import path from 'node:path';
+import { BASE_DIR } from '../config.js';
+import { runWindowsPowerShell } from './windows-powershell.js';
+import { windowsSystemRoot } from './windows-process-tree.js';
+import { findSafeCliCommand } from './cli-discovery.js';
+import { mergedSpawnEnv } from './spawn-env.js';
 
 /**
  * Terminal hand-off for INTERACTIVE CLI logins (vercel's method picker,
@@ -13,8 +19,8 @@ import pino from 'pino';
  *
  * Safety shape mirrors the catalog auth jobs: the command is resolved
  * SERVER-SIDE from CLI_CATALOG by id — callers can never inject a
- * command string. macOS-only by design (the product ships mac-only);
- * the AppleScript automation needs the user's one-time TCC approval
+ * command string. Windows opens a real PowerShell window; macOS uses
+ * AppleScript and needs the user's one-time TCC approval
  * ("Clementine wants to control Terminal"), and a denial comes back as
  * a clear error, not a silent no-op.
  */
@@ -43,6 +49,14 @@ const realOsaExec: OsaExec = (args) =>
   });
 
 let osaExec: OsaExec = realOsaExec;
+let windowsTerminalExec = runWindowsPowerShell;
+let resolveWindowsTerminalCli = findSafeCliCommand;
+export function _testOnly_setWindowsTerminalResolver(value?: typeof findSafeCliCommand): void {
+  resolveWindowsTerminalCli = value ?? findSafeCliCommand;
+}
+export function _testOnly_setWindowsTerminalExec(value?: typeof runWindowsPowerShell): void {
+  windowsTerminalExec = value ?? runWindowsPowerShell;
+}
 /** Test seam — tests must never open a real Terminal window. */
 export function _testOnly_setOsaExec(fn?: OsaExec): void {
   osaExec = fn ?? realOsaExec;
@@ -51,6 +65,34 @@ export function _testOnly_setOsaExec(fn?: OsaExec): void {
 /** AppleScript string literal escaping: backslashes first, then quotes. */
 export function escapeAppleScriptString(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+const WINDOWS_TERMINAL_PROGRAM = `
+$words = @($payload.argv | ForEach-Object { "'" + ([string]$_).Replace("'", "''") + "'" })
+$directory = "'" + ([string]$payload.cwd).Replace("'", "''") + "'"
+$inner = 'Set-Location -LiteralPath ' + $directory + '; & ' + ($words -join ' ')
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+$terminal = Start-Process -FilePath $payload.powershell -ArgumentList @('-NoProfile', '-NoExit', '-EncodedCommand', $encoded) -WorkingDirectory $payload.cwd -WindowStyle Normal -PassThru
+if (-not $terminal.Id) { throw 'No terminal launch receipt' }
+Write-Output $terminal.Id
+`;
+
+/** Only server-owned catalog recipes reach this seam. No secrets or shell
+ * placeholders may be substituted into a login's process arguments. */
+export async function openWindowsCatalogTerminal(command: string): Promise<void> {
+  const argv = command.trim().split(/\s+/);
+  if (!argv.length || !argv.every(word => /^[A-Za-z0-9_./:=@+-]+$/.test(word))) {
+    throw new Error('This sign-in needs its dedicated setup flow; no terminal was opened.');
+  }
+  const executable = resolveWindowsTerminalCli(argv[0]!);
+  if (!executable || executable.skipped || !executable.path) {
+    throw new Error('The configured CLI executable is unavailable; no terminal was opened. Rescan command-line tools in Connect after installing it.');
+  }
+  argv[0] = executable.path;
+  const pid = await windowsTerminalExec(WINDOWS_TERMINAL_PROGRAM, { argv, cwd: BASE_DIR,
+    powershell: path.win32.join(windowsSystemRoot(), 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') },
+  { env: mergedSpawnEnv() });
+  if (!/^[1-9][0-9]*$/.test(pid)) throw new Error('Windows did not confirm a terminal launch.');
 }
 
 const activeWatchers = new Map<string, NodeJS.Timeout>();
@@ -102,11 +144,22 @@ export async function openTerminalAuthSession(catalogId: string): Promise<Termin
     return { ok: false, command: '', message: `Unknown catalog CLI: ${catalogId}` };
   }
   const command = entry.authCommand ?? `${entry.command} login`;
+  if (process.platform === 'win32') {
+    try {
+      await openWindowsCatalogTerminal(command);
+      watchForSignIn(entry.id);
+      return { ok: true, command,
+        message: `Opened a PowerShell window running \`${command}\`. Complete the sign-in there; Clementine will verify the connection and resume waiting work once sign-in is confirmed.` };
+    } catch (error) {
+      return { ok: false, command,
+        message: `${error instanceof Error ? error.message : 'Could not open PowerShell.'} Check whether a sign-in window already opened before retrying. If none opened, run \`${command}\` in your own terminal instead.` };
+    }
+  }
   if (process.platform !== 'darwin') {
     return {
       ok: false,
       command,
-      message: `Terminal hand-off is macOS-only. Run \`${command}\` in your own terminal instead.`,
+      message: `Automatic terminal hand-off is unavailable on this host. Run \`${command}\` in your own terminal instead.`,
     };
   }
   const escaped = escapeAppleScriptString(command);

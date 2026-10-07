@@ -10,8 +10,8 @@
  * and a dependency-free renderer keeps the pipeline auditable.
  *
  * The tool wrapper (document-produce-tools.ts) does the impure half: PDF via
- * headless Chrome --print-to-pdf, DOCX via macOS textutil — both already on
- * the machine, zero new dependencies.
+ * headless Chrome --print-to-pdf, DOCX via macOS textutil or offline
+ * WordprocessingML on other platforms, using the existing HTML parser.
  */
 
 export interface TemplateMergeResult {
