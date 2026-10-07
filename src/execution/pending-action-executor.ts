@@ -71,6 +71,9 @@ export function _setApprovedCallDispatchForTests(dispatch: ApprovedCallDispatch 
  * call: the result summary starts with it. The owner's ending reads it by
  * this constant, never by matching provider prose. */
 export const PENDING_ACTION_PRE_DISPATCH_REFUSAL = 'Dispatch was refused locally before the provider call started';
+/** The record's marker for an attempt that may have reached the provider
+ * before it failed: the outcome is uncertain and never retried on its own. */
+export const PENDING_ACTION_DISPATCH_UNCERTAIN = 'Execution attempt failed or became uncertain after dispatch began';
 
 /** Nominal local refusal for dispatcher implementations that can establish the
  * provider thunk was never invoked. Text returned from a dispatch is never
@@ -354,7 +357,7 @@ export async function executeApprovedPendingActionCall(
         record: updated ?? getPendingAction(id),
       };
     }
-    const uncertain = `Execution attempt failed or became uncertain after dispatch began: ${msg}. Do not retry automatically.`;
+    const uncertain = `${PENDING_ACTION_DISPATCH_UNCERTAIN}: ${msg}. Do not retry automatically.`;
     const updated = recordPendingActionResult(
       claimedRecord.id,
       'failed',

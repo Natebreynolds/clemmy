@@ -629,4 +629,9 @@ test('an approved action that did not land ends in Clem\'s words, never the exec
   assert.doesNotMatch(uncertain, /socket hang up|composio/);
   const stuck = approvedActionFailedText({ kind: 'external_send', toolName: 'composio_execute_tool', status: 'executing', resultSummary: null });
   assert.match(stuck, /can't tell whether it went through/);
+  // A plain terminal failure the provider reported is neither "nothing ran" nor uncertain.
+  const terminal = approvedActionFailedText({ kind: 'external_send', toolName: 'composio_execute_tool', status: 'failed',
+    resultSummary: 'Provider returned a terminal failure before the daemon stopped.' });
+  assert.match(terminal, /^It didn't go through — the provider reported a terminal failure/);
+  assert.doesNotMatch(terminal, /can't tell|Nothing ran/);
 });

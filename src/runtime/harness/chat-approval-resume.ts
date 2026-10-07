@@ -50,7 +50,7 @@ import { BoundaryError } from '../boundary-error.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { publicUserInputText } from './public-presentation.js';
 import { freshExternalWriteEvidenceStatus } from './tool-evidence.js';
-import { PENDING_ACTION_PRE_DISPATCH_REFUSAL, executeApprovedPendingActionCall } from '../../execution/pending-action-executor.js';
+import { PENDING_ACTION_DISPATCH_UNCERTAIN, PENDING_ACTION_PRE_DISPATCH_REFUSAL, executeApprovedPendingActionCall } from '../../execution/pending-action-executor.js';
 import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import { turnOutcomeId, type TurnIdentity } from './turn-outcome.js';
@@ -718,13 +718,18 @@ export function approvedActionRanText(action: Pick<PendingActionRecord, 'kind' |
 export function approvedActionFailedText(action: Pick<PendingActionRecord, 'kind' | 'toolName' | 'status' | 'resultSummary'>): string {
   const shell = action.toolName === 'run_shell_command' || action.kind === 'shell_command';
   const what = shell ? 'the command' : 'it';
-  const refusedBeforeStart = action.status === 'failed'
-    && typeof action.resultSummary === 'string'
-    && action.resultSummary.startsWith(PENDING_ACTION_PRE_DISPATCH_REFUSAL);
-  if (refusedBeforeStart) {
+  const summary = typeof action.resultSummary === 'string' ? action.resultSummary : '';
+  // Three honest endings, read from the record by the executor's own markers:
+  // refused before anything started (nothing changed), stopped after it may
+  // have begun (uncertain, never retried on its own), or a plain terminal
+  // failure the provider reported (nothing more runs on its own).
+  if (action.status === 'failed' && summary.startsWith(PENDING_ACTION_PRE_DISPATCH_REFUSAL)) {
     return `I couldn't run ${what} — the stored call didn't fit the tool's shape, so it was stopped before it started. Nothing ran and nothing changed.\n\nAsk me again in your own words and I'll build it fresh.`;
   }
-  return `I tried, but I can't tell whether ${what} went through — it stopped partway and the answer never came back. I won't retry it on my own.\n\nSay "check" and I'll look at what landed before doing anything else.`;
+  if (action.status === 'executing' || summary.startsWith(PENDING_ACTION_DISPATCH_UNCERTAIN)) {
+    return `I tried, but I can't tell whether ${what} went through — it stopped partway and the answer never came back, so the outcome is uncertain. I won't retry it on my own.\n\nSay "check" and I'll look at what landed before doing anything else.`;
+  }
+  return `${shell ? 'The command' : 'It'} didn't go through — the provider reported a terminal failure, and nothing more will run on its own.\n\nAsk me again in your own words if you still want it, and I'll build it fresh.`;
 }
 
 /** The executor's summary wraps the command's own output in bookkeeping

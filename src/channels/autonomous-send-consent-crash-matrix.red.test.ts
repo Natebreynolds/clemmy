@@ -907,7 +907,9 @@ for (const state of ['executing', 'executed', 'failed'] as const) {
       assert.match(presentation?.text ?? '', /Provider returned success/);
     } else {
       assert.equal(presentation?.status, 'failed');
-      assert.match(presentation?.text ?? '', state === 'executing' ? /pending or uncertain|not retry/i : /terminal failure/i);
+      // Clem's words, by the record's own marker: executing = uncertain and
+      // never retried on its own; failed = the provider's terminal failure.
+      assert.match(presentation?.text ?? '', state === 'executing' ? /uncertain|won't retry|not retry/i : /terminal failure/i);
     }
   });
 }
@@ -1373,7 +1375,7 @@ test('boot never steals a dead lock once the PA is executing and never redispatc
     assert.equal(terminals.length, 1);
     const presentation = terminals[0]?.data.presentation as { status?: string; text?: string } | undefined;
     assert.equal(presentation?.status, 'failed');
-    assert.match(presentation?.text ?? '', /uncertain|not retry/i);
+    assert.match(presentation?.text ?? '', /uncertain|won't retry|not retry/i);
   } finally {
     try { unlinkSync(lockPath); } catch { /* test cleanup */ }
   }
