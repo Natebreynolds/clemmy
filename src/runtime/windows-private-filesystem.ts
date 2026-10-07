@@ -146,6 +146,20 @@ export interface WindowsPrivateFilesystemReceipt {
 export function windowsPrivateFilesystemProbeLocation(): { directory: string; packaged: boolean } {
   const filename = typeof __filename === 'string' ? __filename : fileURLToPath(import.meta.url);
   const directory = path.dirname(filename);
+  // The packaged daemon keeps the probe beside its own package directory
+  // (resources/daemon ↔ resources/windows-private-filesystem). This module
+  // is also bundled into emitted implementation artifacts deeper under
+  // dist/, so the daemon package root is found by walking up to it, never
+  // by assuming a depth (installed Windows smoke, run 37692017940: the
+  // daemon's first boot read the vault from an emitted artifact, missed the
+  // probe, fell to the PowerShell development backend and refused).
+  for (let ancestor = directory; ; ancestor = path.dirname(ancestor)) {
+    if (path.basename(ancestor).toLowerCase() === 'daemon'
+      && existsSync(path.join(path.dirname(ancestor), 'windows-private-filesystem'))) {
+      return { directory: path.join(path.dirname(ancestor), 'windows-private-filesystem'), packaged: true };
+    }
+    if (path.dirname(ancestor) === ancestor) break;
+  }
   const packageRoot = path.resolve(directory, '../..');
   if (path.basename(packageRoot).toLowerCase() === 'daemon') {
     return { directory: path.join(path.dirname(packageRoot), 'windows-private-filesystem'), packaged: true };
