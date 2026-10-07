@@ -285,7 +285,12 @@ function outcome(
     evidence,
     ...(providerStatus !== undefined ? { providerStatus } : {}),
     ...(detail ? { detail: detail.replace(/\s+/g, ' ').trim().slice(0, 160) } : {}),
-    directive: DIRECTIVES[kind],
+    // An answered refusal is an uncertain write the model can read back, so
+    // nothing automatic happens (no replay, no reconciliation stop): the
+    // directive settles and the model verifies the target state in words.
+    directive: detail === 'provider_refused_envelope'
+      ? { ...DIRECTIVES[kind], action: 'settle', requiresReconciliation: false }
+      : DIRECTIVES[kind],
   };
 }
 

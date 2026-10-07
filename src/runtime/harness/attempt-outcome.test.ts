@@ -45,6 +45,9 @@ test('a mutation the provider answered with its own refusal stays uncertain with
   assert.equal(answered.kind, 'uncertain_write');
   assert.equal(answered.detail, 'provider_refused_envelope');
   assert.equal(answered.directive.retrySameCandidate, false, 'provider bytes never earn a replay');
+  assert.equal(answered.directive.requiresReconciliation, false, 'an answered refusal is read back, never a reconciliation stop');
+  assert.equal(answered.directive.action, 'settle');
+  assert.equal(classifyAttemptOutcome({ mutating: true, acknowledged: false }).directive.requiresReconciliation, true, 'the dark still stops the turn');
   assert.equal(providerAnsweredWithRefusal(answered), true);
   const noStatus = classifyAttemptOutcome({ mutating: true, envelopeSuccessful: false });
   assert.equal(providerAnsweredWithRefusal(noStatus), true, 'an envelope without a transport status still answered');
