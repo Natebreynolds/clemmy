@@ -1229,7 +1229,16 @@ export function redeemedReadIsExhausted(value: SuccessfulSettlementResultEvidenc
   if (inspectProviderEnvelope(value.rawPayload).verdict !== 'clean') return false;
   if (value.handle.continuationRef !== null || value.handle.continuationRepeated) return false;
   return value.handle.completeness === 'complete'
-    || (value.executionSite === 'host' && value.handle.completeness === 'unknown');
+    || (value.executionSite === 'host' && value.handle.completeness === 'unknown')
+    // An EMPTY collection with no continuation is the whole of it: a provider
+    // that pages hands a cursor with its first page, and there is nothing a
+    // page 2 of zero records could hold. Reading it as "the source never said
+    // it was complete" sent the completion review after the whole of an empty
+    // Slack reminder list and blocked a correct "it is already gone" (live
+    // 2026-10-06).
+    || (value.handle.completeness === 'unknown'
+      && value.handle.recordPath !== null
+      && value.handle.recordCount === 0);
 }
 
 export function redeemRawResult(

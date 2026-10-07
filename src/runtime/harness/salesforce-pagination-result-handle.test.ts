@@ -631,3 +631,29 @@ test('a terminal CLI-shaped Salesforce page redeems and discharges its dependent
   });
   assert.equal(admittedSheet.status, 'bound', JSON.stringify(admittedSheet));
 });
+
+test('an empty collection with no continuation is exhausted even when the provider never said it was complete', () => {
+  // Live 2026-10-06: Slack answered { ok: true, reminders: [] } to a list after
+  // a refused delete; the review ledger read it as "more at source" and the
+  // completion review blocked a correct "it is already gone".
+  const empty = { data: { ok: true, reminders: [] }, successful: true, error: null };
+  const derived = facts.deriveResultHandleFactsFromRaw(empty);
+  assert.notEqual(derived.recordPath, null, JSON.stringify(derived));
+  assert.equal(derived.recordCount, 0);
+  assert.equal(resultHandles.redeemedReadIsExhausted({
+    rawPayload: empty, executionSite: 'provider',
+    handle: { ...derived, continuationRef: null, continuationRepeated: false },
+  } as never), true);
+  // One record and no completeness signal from the provider is still not proof of the whole.
+  const one = { data: { ok: true, reminders: [{ id: 'Rm1' }] }, successful: true, error: null };
+  const derivedOne = facts.deriveResultHandleFactsFromRaw(one);
+  assert.equal(resultHandles.redeemedReadIsExhausted({
+    rawPayload: one, executionSite: 'provider',
+    handle: { ...derivedOne, continuationRef: null, continuationRepeated: false },
+  } as never), derivedOne.completeness === 'complete');
+  // An empty page that hands back a cursor is not the whole of anything.
+  assert.equal(resultHandles.redeemedReadIsExhausted({
+    rawPayload: empty, executionSite: 'provider',
+    handle: { ...derived, continuationRef: 'cursor-1', continuationRepeated: false },
+  } as never), false);
+});
