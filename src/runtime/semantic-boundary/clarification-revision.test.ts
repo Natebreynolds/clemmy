@@ -728,6 +728,31 @@ test('clarification diagnostics retain only source-bound failure facts from the 
   });
 });
 
+test('with retryOnDeadline off, one deadline is the answer: the brain is the next reader', async () => {
+  // Live 2026-10-06: a reply the quick interpretation could not admit waited
+  // through two 20 s proposer deadlines before it reached the brain, which
+  // reads it either way.
+  const { _setQuickCheckDeadlineMsForTests } = await import('./configured-brain-semantic-port.js');
+  const hang = async (_request: Record<string, unknown>, options: unknown): Promise<unknown> => new Promise((_, reject) => {
+    const signal = (options as { signal: AbortSignal }).signal;
+    if (signal.aborted) reject(new Error('PRIVATE_ABORT_DETAIL'));
+    else signal.addEventListener('abort', () => reject(new Error('PRIVATE_ABORT_DETAIL')), { once: true });
+  });
+  _setQuickCheckDeadlineMsForTests(50);
+  try {
+    await withRevisionWireCapture(hang, async (capture) => {
+      const fixture = ports();
+      const result = await withModelUsageAttribution({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, attemptId: 'fixture-single-deadline' }, () =>
+        proposeClarificationRevision(input, { ...fixture, complete: completeViaConfiguredBrain }, { retryOnDeadline: false }));
+      assert.equal(result.status, 'unavailable');
+      assert.equal((result as { reason?: string }).reason, 'interpretation_unavailable');
+      assert.equal(((result as { diagnostic?: { kind?: string } }).diagnostic)?.kind, 'deadline');
+      assert.equal(capture.sdk.length, 1, 'exactly one try');
+      assert.equal(fixture.calls.length, 0);
+    });
+  } finally { _setQuickCheckDeadlineMsForTests(null); }
+});
+
 test('clarification diagnostics distinguish final envelope validation and reject source or attempt reuse', async () => {
   const { Runner } = await import('@openai/agents');
   const original = Runner.prototype.run;

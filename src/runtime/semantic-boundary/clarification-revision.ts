@@ -415,9 +415,19 @@ const CLARIFICATION_REVIEW_TIMEOUT_MS = 12_000;
 /** One proposal (two only when the first merely passed its deadline) and one
  * independent check at most; no repair. Persistence/replay belongs to the
  * caller, which must not execute from this. */
+export interface ClarificationRevisionOptions {
+  /** A first deadline earns one more try (the default). The caller turns this
+   * off when the brain is already the next reader — a reply the quick
+   * interpretation could not admit goes to the brain whether or not a revised
+   * question exists, so a second 20 s wait only delays it (live 2026-10-06:
+   * 40 s of deadlines before "Now delete that reminder" reached the brain). */
+  retryOnDeadline?: boolean;
+}
+
 export async function proposeClarificationRevision(
   input: ClarificationRevisionInput,
   ports: RevisionPorts = defaultPorts,
+  options: ClarificationRevisionOptions = {},
 ): Promise<ClarificationRevisionResult> {
   if (!validInput(input)) return { status: 'unavailable', stage: 'input', reason: 'exact_input_out_of_bounds' };
   // No clipping: omitted source/question text could erase a required decision.
@@ -455,7 +465,7 @@ export async function proposeClarificationRevision(
         // the 20 s quick-check deadline the next (offline, 3 of 5 tries on
         // 2026-10-05). A first deadline earns one more try; a second deadline
         // or any other failure stays unavailable.
-        if (attempt === 1 && diagnostic?.kind === 'deadline') continue;
+        if (attempt === 1 && diagnostic?.kind === 'deadline' && options.retryOnDeadline !== false) continue;
         return { status: 'unavailable', stage: 'proposal', reason: 'interpretation_unavailable',
           ...(diagnostic ? { diagnostic } : {}),
         };

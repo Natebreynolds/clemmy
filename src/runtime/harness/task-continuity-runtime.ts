@@ -458,7 +458,9 @@ export async function classifyUnsettledOpenQuestionReply(input: {
   if (route === 'reask' && !skipRevision) {
     const revisionInput = clarificationRevisionInputFor(current.packet, input.sourceUserSeq);
     const proposal = revisionInput
-      ? await (clarificationRevisionProposerForTests ?? proposeClarificationRevision)(revisionInput)
+      ? await (clarificationRevisionProposerForTests ?? proposeClarificationRevision)(revisionInput, undefined,
+        // The brain reads an unreadable reply either way; one deadline is enough.
+        { retryOnDeadline: !unreadable })
         .catch(() => ({ status: 'unavailable' as const, stage: 'proposal', reason: 'proposal_failed' }))
       : { status: 'unavailable' as const, stage: 'context', reason: 'exact_source_chain_unavailable' };
     if (proposal.status === 'proposed' && revisionInput) {
