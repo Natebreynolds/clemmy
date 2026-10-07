@@ -4221,6 +4221,38 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           });
           return;
         }
+        // Jev leaned one way, or could not read the reply at all: the card's
+        // own question is asked back in one line, exactly as the desktop does,
+        // instead of a fresh turn that would branch away from the waiting card
+        // (live 2026-10-06 on the desktop: a duplicate card).
+        if (routed?.confirm) {
+          const confirm = routed.confirm;
+          const control = commitLiveApprovalControl({
+            requestId, runId, inputHash, sessionId: requestedSessionId, text: message,
+            prepare: () => {
+              const row = approvalRegistry.get(confirm.approvalId);
+              if (!row || !approvalRegistry.isActionable(row)) return null;
+              return {
+                sourceData: { source: 'mobile_approval_confirm', approvalId: confirm.approvalId, confirm: confirm.leaning },
+                commit: (source) => {
+                  appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
+                    data: { sourceUserSeq: source.seq, reason: 'approval_confirmation_required', question: confirm.question, options: ['Yes', 'No'] } });
+                  const identity = mobileApprovalIdentity(source);
+                  commitTurnOutcome({
+                    version: 2, id: turnOutcomeId(identity), identity,
+                    status: 'needs_input', resumable: true, needs: { kind: 'input' },
+                    presentation: { kind: 'question', text: confirm.question },
+                  }, { legacyReason: 'awaiting_user_input', metadata: { steps: 0, liveApprovalControl: source.data.liveApprovalControl } });
+                },
+              };
+            },
+          });
+          if (control) {
+            if (control.replayed) res.setHeader('Idempotent-Replay', '1');
+            res.json({ sessionId: control.receipt.sessionId, runId: control.receipt.runId, reply: control.presentation.text });
+            return;
+          }
+        }
       }
       const priorLineage = requestedSessionId
         ? resolveAcceptedSourceIngressLineage({
