@@ -595,3 +595,18 @@ test('a resume on the desktop attempt that owns the typed decision keeps that at
   assert.equal(source?.runAttemptId, attempt.attemptId, 'the owning attempt is reused');
   assert.equal(source?.runId, attempt.runId, 'and the hand-off names its run family, not a foreign one');
 });
+
+test('the ending after an approved shell action shows only what the command printed', async () => {
+  const { approvedActionRanText } = await import('./chat-approval-resume.js');
+  const text = approvedActionRanText(
+    { kind: 'shell_command', toolName: 'run_shell_command' },
+    'Executed the approved run_shell_command call. exit_code: 0 stdout: host localhost stderr: Pseudo-terminal will not be allocated because stdin is not a terminal.',
+  );
+  assert.match(text, /^Done — I ran it\. Here's what it printed:\n\n```\nhost localhost\n```/);
+  assert.doesNotMatch(text, /stderr|exit_code|run_shell_command/);
+  const quiet = approvedActionRanText({ kind: 'shell_command', toolName: 'run_shell_command' }, 'exit_code: 0 stdout:   stderr: ');
+  assert.match(quiet, /\(nothing printed\)/);
+  const sent = approvedActionRanText({ kind: 'external_send', toolName: 'composio_execute_tool' }, '{"id":"msg-1"}');
+  assert.match(sent, /^Done — that went through\./);
+  assert.doesNotMatch(sent, /msg-1/);
+});

@@ -718,9 +718,14 @@ export function approvedActionRanText(action: Pick<PendingActionRecord, 'kind' |
  * ("Executed the approved run_shell_command call. exit_code: 0 stdout: …");
  * the owner gets the output. */
 function shellOutputOnly(summary: string): string {
-  const m = /stdout:\s*([\s\S]*?)(?:\n\s*stderr:|$)/i.exec(summary);
-  if (!m) return '(no output was captured)';
-  return m[1].trim() || '(nothing printed)';
+  // The executor writes "exit_code: 0 stdout: … stderr: …" on one line; the
+  // owner gets what the command printed, not its stderr chatter or bookkeeping.
+  const start = summary.search(/\bstdout:/i);
+  if (start < 0) return '(no output was captured)';
+  let out = summary.slice(start + 'stdout:'.length);
+  const stderrAt = out.search(/\bstderr:/i);
+  if (stderrAt >= 0) out = out.slice(0, stderrAt);
+  return out.trim() || '(nothing printed)';
 }
 
 export function chatApprovalResumeDirective(
