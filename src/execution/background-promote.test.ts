@@ -252,7 +252,7 @@ test('a promoted chat task runs the configured brain, never a provider tier cons
   // that is the line that sent a Claude-brain home to an unavailable Codex.
   const { readFileSync } = await import('node:fs');
   const source = readFileSync(new URL('./background-promote.ts', import.meta.url), 'utf8');
-  assert.ok(source.includes("model: input.model ?? resolveRoleModel('brain').modelId"),
+  assert.ok(source.includes("model: input.model ?? delegation?.executionModelPin?.modelId ?? resolveRoleModel('brain').modelId"),
     'the promoted task defaults to the configured brain');
   for (const tier of ['deep', 'fast', 'primary']) {
     assert.ok(!source.includes(`model: input.model ?? MODELS.${tier}`),

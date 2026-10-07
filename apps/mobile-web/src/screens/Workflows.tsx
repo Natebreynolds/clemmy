@@ -21,6 +21,8 @@ import { runStateLabel, workflowRunStateLabel } from '../lib/run-rows';
 import { useScreenData } from '../lib/use-screen-data';
 import { buildWorkflowRunDetail } from '../lib/workflow-run-detail';
 import { whenLabel } from '../lib/schedule-label';
+import { usePendingCommit } from '../lib/pending-commit';
+import { workflowRunFailure, workflowRunNotice } from '../lib/workflow-run-receipt';
 
 /** Mirrors src/execution/workflow-run-cancellation.ts — anything else is live. */
 const TERMINAL_RUN_STATUSES = new Set([
@@ -40,7 +42,7 @@ export function Workflows() {
   const workflows = data?.workflows ?? [];
 
   if (selected) {
-    return <WorkflowDetail workflow={selected} onBack={() => { setSelected(null); void refresh(); }} />;
+    return <WorkflowDetail key={selected.name} workflow={selected} onBack={() => { setSelected(null); void refresh(); }} />;
   }
 
   if (loading && workflows.length === 0) {
@@ -93,6 +95,8 @@ interface WorkflowDetailProps {
 function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
   const [triggering, setTriggering] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [runNotice, setRunNotice] = useState<string | null>(null);
+  const commit = usePendingCommit(workflow.name);
   const [selectedRun, setSelectedRun] = useState<WorkflowRunSummary | null>(null);
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const { data, loading: runsLoading, error, offline, refresh } = useScreenData(
@@ -113,25 +117,30 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
   const bindingGaps = workflow.resourceGaps ?? [];
 
   async function trigger() {
-    if (triggering) return;
+    const token = commit.begin();
+    if (!token) return;
     setTriggering(true);
     haptic('medium');
     setActionError(null);
+    setRunNotice(null);
     try {
-      await runWorkflow(workflow.name, inputValues);
+      const receipt = await runWorkflow(workflow.name, inputValues);
+      if (!commit.owns(token)) return;
+      setRunNotice(workflowRunNotice(receipt));
       // Refresh to surface the new queued run.
       void refresh();
     } catch (err) {
+      if (!commit.owns(token)) return;
       const e = err as { status?: number; message?: string };
       if (e.status === 409 && e.message?.includes('REQUIRES_INPUT')) {
         setActionError('This workflow needs input — fill the fields above first.');
       } else if (e.status === 409 && e.message?.includes('DISABLED')) {
         setActionError('This workflow is disabled. Enable it from the desktop app first.');
       } else {
-        setActionError(e.message ?? 'Failed to trigger workflow');
+        setActionError(workflowRunFailure(err));
       }
     } finally {
-      setTriggering(false);
+      if (commit.finish(token)) setTriggering(false);
     }
   }
 
@@ -265,6 +274,7 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
           </button>
         </div>
         {actionError ? <div class="global-error">{actionError}</div> : null}
+        {runNotice ? <p class="muted" role="status">{runNotice}</p> : null}
         <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={runs.length > 0} />
         <div class="memory-section-head">Recent runs</div>
         {runsLoading && runs.length === 0 ? <div class="skeleton-stack" aria-hidden="true"><i /></div> : null}

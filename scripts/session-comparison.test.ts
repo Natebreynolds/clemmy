@@ -643,3 +643,248 @@ test('malformed foreign-looking traces remain visible instead of certifying a ch
     assert.ok(task.usageCertificationIssues.includes('excluded_legacy_window_usage'));
   } finally { rmSync(fixture.home, { recursive: true, force: true }); }
 });
+
+function addTimingStore(db: Database.Database): void {
+  db.exec(`ALTER TABLE events ADD COLUMN id TEXT;
+    UPDATE events SET id = 'fixture-event-' || seq;
+    CREATE TABLE model_request_provenance (
+      source_user_seq INTEGER, request_ordinal INTEGER, protocol_version INTEGER,
+      created_at TEXT, source_event_id TEXT, session_id TEXT
+    )`);
+}
+
+function timingEvents(source: number, attempt: string, start: string, firstSeq: number, overrides: Record<string, unknown> = {}): FixtureEvent[] {
+  const base = Date.parse(start);
+  const identity = { version: 1, sourceUserSeq: source, stepId: `step-${source}`, runAttemptId: attempt,
+    requestOrdinal: 1, retired: false, requestAborted: false, ...overrides };
+  const event = (offset: number, ms: number, data: Record<string, unknown>): FixtureEvent => ({
+    seq: firstSeq + offset, type: 'model_resilience_observed', at: new Date(base + ms).toISOString(),
+    data: { ...identity, ...data },
+  });
+  return [
+    event(0, 100, { phase: 'call_started', callId: `call-${source}`, at: base + 100 }),
+    event(1, 1_100, { phase: 'attempt_finished', callId: `call-${source}`, at: base + 1_100,
+      durationMs: 1_000, outcome: 'failed' }),
+    event(2, 1_300, { phase: 'retry_wait_finished', callId: `call-${source}`, at: base + 1_300,
+      durationMs: 200, outcome: 'completed' }),
+    event(3, 2_500, { phase: 'call_finished', callId: `call-${source}`, at: base + 2_500,
+      durationMs: 2_400, outcome: 'returned', attemptCount: 2, failedAttemptCount: 1,
+      attemptMs: 2_200, failedAttemptMs: 1_000, retryWaitMs: 200 }),
+    event(6, 3_000, { phase: 'host_step_finished', at: base + 3_000, durationMs: 3_000, outcome: 'returned',
+      retired: false, requestAborted: false }),
+  ];
+}
+
+function timingFixture() {
+  const fixture = fixtureHome();
+  const db = new Database(fixture.dbPath);
+  const start = '2026-08-08T08:00:00.000Z';
+  seedSession(db, 'timing', [
+    { seq: 600, type: 'user_input_received', at: start },
+    ...timingEvents(600, 'timing-attempt', start, 601),
+    { seq: 609, type: 'conversation_completed', at: '2026-08-08T08:00:10.000Z', data: typedTerminal('timing', 600, 1) },
+  ]);
+  db.prepare('INSERT INTO run_attempts VALUES (?, ?, ?, ?, ?, ?)')
+    .run('timing-attempt', 'timing', start, '2026-08-08T08:00:10.100Z', 'completed', 600);
+  addTimingStore(db);
+  db.prepare('INSERT INTO model_request_provenance VALUES (?, ?, ?, ?, ?, ?)')
+    .run(600, 1, 1, '2026-08-08T08:00:00.050Z', 'fixture-event-600', 'timing');
+  db.close();
+  writeFileSync(fixture.usageFile, readFileSync(fixture.usageFile, 'utf8') + JSON.stringify({
+    at: '2026-08-08T08:00:02.500Z', source: 'timing', trace: { acceptedSource: 'timing:600', logicalTurnId: 'turn:600', attemptId: 'timing-attempt' },
+    model: 'fixture', kind: 'chat', cacheDialect: 'inclusive', inputTokens: 100, cachedInputTokens: 25,
+    outputTokens: 10, durationMs: 700, providerApiDurationMs: 500,
+  }) + '\n');
+  return fixture;
+}
+
+test('canonical timing retains one failed physical attempt without changing usage or provider durations', () => {
+  const fixture = timingFixture();
+  try {
+    const beforeDb = readFileSync(fixture.dbPath), beforeUsage = readFileSync(fixture.usageFile);
+    const measured = measureAcceptedTurn(fixture.home, 'timing', 600);
+    assert.deepEqual(measured.modelTiming, {
+      scope: 'host_main_steps_only', coverage: 'observed_host_steps', physicalAttemptCoverage: 'observed_calls',
+      provenanceRequests: 1, observedRequests: 1, observedHostSteps: 1, observedResilienceCalls: 1,
+      hostStepMs: 3_000, resilienceCallMs: 2_400, physicalAttemptCount: 2, failedAttemptCount: 1,
+      failedAttemptMs: 1_000, retryWaitMs: 200, retiredResilienceCalls: 0,
+      requestAbortedResilienceCalls: 0, failedAttemptUsage: 'unknown',
+    });
+    assert.deepEqual(measured.modelTimingIssues, []);
+    assert.equal(measured.promptTokens, 100); assert.equal(measured.cachedInputTokens, 25);
+    assert.equal(measured.outputTokens, 10); assert.equal(measured.usageRecords, 1);
+    assert.equal(measured.sdkDurationMs, 700); assert.equal(measured.providerDurationMs, 500);
+    assert.equal(measured.turnWallMs, 10_000);
+    const text = formatAcceptedTurnComparison({ home: fixture.home, baseline: measured, candidate: measured });
+    assert.match(text, /Summed observed failed-attempt time.*1\.000s/);
+    assert.match(text, /not task wall time or billable time/);
+    assert.match(text, /token usage and billing remain unknown/);
+    assert.deepEqual(readFileSync(fixture.dbPath), beforeDb); assert.deepEqual(readFileSync(fixture.usageFile), beforeUsage);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('legacy timing and missing dispatch proof stay null, while generic host-only timing is visibly partial', () => {
+  const fixture = timingFixture();
+  try {
+    const legacy = measureAcceptedTurn(fixture.home, 'multi', 201);
+    assert.equal(legacy.modelTiming?.coverage, 'none'); assert.equal(legacy.modelTiming?.hostStepMs, null);
+    assert.equal(legacy.modelTiming?.failedAttemptMs, null); assert.equal(legacy.modelTiming?.failedAttemptCount, null);
+    const db = new Database(fixture.dbPath);
+    db.exec("DELETE FROM events WHERE session_id = 'timing' AND type = 'model_resilience_observed' AND json_extract(data_json, '$.phase') != 'host_step_finished'");
+    db.close();
+    const generic = measureAcceptedTurn(fixture.home, 'timing', 600);
+    assert.equal(generic.modelTiming?.hostStepMs, 3_000); assert.equal(generic.modelTiming?.coverage, 'partial');
+    assert.equal(generic.modelTiming?.physicalAttemptCoverage, 'none'); assert.equal(generic.modelTiming?.failedAttemptMs, null);
+    const old = new Database(fixture.dbPath); old.exec('DROP TABLE model_request_provenance'); old.close();
+    const missing = measureAcceptedTurn(fixture.home, 'timing', 600);
+    assert.equal(missing.modelTiming?.hostStepMs, null); assert.equal(missing.modelTiming?.provenanceRequests, null);
+    assert.ok(missing.modelTimingIssues?.includes('timing_dispatch_provenance_unavailable'));
+    assert.equal(missing.promptTokens, 100);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('missing attempt timing columns cannot erase existing canonical usage or task lineage', () => {
+  const fixture = timingFixture();
+  try {
+    const before = measureAcceptedTurn(fixture.home, 'timing', 600);
+    const db = new Database(fixture.dbPath); db.exec('ALTER TABLE run_attempts DROP COLUMN started_at'); db.close();
+    const measured = measureAcceptedTurn(fixture.home, 'timing', 600);
+    assert.equal(measured.attemptCount, before.attemptCount); assert.equal(measured.exactUsageRecords, before.exactUsageRecords);
+    assert.equal(measured.promptTokens, before.promptTokens); assert.equal(measured.providerDurationMs, before.providerDurationMs);
+    assert.deepEqual(measured.usageCertificationIssues, before.usageCertificationIssues);
+    assert.equal(measured.modelTiming?.hostStepMs, null); assert.equal(measured.modelTiming?.coverage, 'none');
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  const taskFixture = approvalTaskFixture();
+  try {
+    const before = measureAcceptedTask(taskFixture.home, 'task', 501);
+    const db = new Database(taskFixture.dbPath); db.exec('ALTER TABLE run_attempts DROP COLUMN started_at'); db.close();
+    const task = measureAcceptedTask(taskFixture.home, 'task', 501);
+    assert.deepEqual(task.sourceUserSeqs, before.sourceUserSeqs); assert.equal(task.promptTokens, before.promptTokens);
+    assert.equal(task.attemptCount, before.attemptCount); assert.deepEqual(task.usageCertificationIssues, before.usageCertificationIssues);
+    assert.equal(task.modelTiming?.failedAttemptMs, null);
+  } finally { rmSync(taskFixture.home, { recursive: true, force: true }); }
+});
+
+test('retired physical child time is retained inside a live host step; post-step close is excluded', () => {
+  const fixture = timingFixture();
+  try {
+    const db = new Database(fixture.dbPath);
+    db.exec("UPDATE events SET data_json = json_set(data_json, '$.retired', json('true'), '$.requestAborted', json('true')) WHERE seq = 604");
+    const call = JSON.parse(String((db.prepare('SELECT data_json FROM events WHERE seq = 604').get() as { data_json: string }).data_json));
+    seedSession(db, 'timing', [
+      { seq: 606, type: 'model_resilience_observed', at: '2026-08-08T08:00:02.500Z',
+        data: { ...call, callId: 'overlapping-rescue-call', retired: false, requestAborted: false } },
+      { seq: 610, type: 'model_resilience_observed', at: '2026-08-08T08:00:04.000Z',
+        data: { ...call, callId: 'late-private-call', at: Date.parse('2026-08-08T08:00:04.000Z') } },
+    ]);
+    db.close();
+    const measured = measureAcceptedTurn(fixture.home, 'timing', 600);
+    assert.equal(measured.modelTiming?.failedAttemptMs, 2_000);
+    assert.equal(measured.modelTiming?.retiredResilienceCalls, 1); assert.equal(measured.modelTiming?.requestAbortedResilienceCalls, 1);
+    assert.equal(measured.modelTiming?.observedResilienceCalls, 2); assert.equal(measured.modelTiming?.coverage, 'partial');
+    assert.equal(measured.modelTiming?.resilienceCallMs, 4_800, 'distinct overlapping calls remain a sum, not wall time');
+    assert.equal(measured.modelTiming?.hostStepMs, 3_000, 'host time is neither added to nor replaced by physical-call sums');
+    assert.equal(measured.usageRecords, 1, 'timing never manufactures usage records for physical calls');
+    assert.ok(measured.modelTimingIssues?.includes('retired_resilience_call_timing'));
+    assert.ok(measured.modelTimingIssues?.includes('late_resilience_call_timing'));
+    assert.equal(measured.modelTiming?.failedAttemptUsage, 'unknown');
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('duplicate closes are never added and conflicting or unproved timing stays excluded', () => {
+  const variants = [
+    { sql: "INSERT INTO events SELECT 606, session_id, turn, role, type, data_json, created_at, 'duplicate' FROM events WHERE seq = 604", callMs: 2_400, issue: 'duplicate_resilience_call_close' },
+    { sql: "INSERT INTO events SELECT 606, session_id, turn, role, type, json_set(data_json, '$.durationMs', 2399), created_at, 'conflict' FROM events WHERE seq = 604", callMs: null, issue: 'conflicting_resilience_call_close' },
+    { sql: "UPDATE events SET data_json = json_set(data_json, '$.runAttemptId', 'foreign-attempt') WHERE seq = 607", callMs: null, issue: 'unproved_model_timing_owner' },
+    { sql: "UPDATE model_request_provenance SET source_event_id = 'fixture-event-201'", callMs: null, issue: 'invalid_timing_dispatch_provenance' },
+    { sql: "UPDATE events SET data_json = json_set(data_json, '$.failedAttemptMs', -1) WHERE seq = 604", callMs: null, issue: 'unbounded_resilience_call_timing' },
+    { sql: "UPDATE events SET data_json = json_set(data_json, '$.requestOrdinal', 2) WHERE seq = 604", callMs: null, issue: 'unbounded_resilience_call_timing' },
+    { sql: "UPDATE events SET data_json = json_set(data_json, '$.durationMs', 12000) WHERE seq = 607", callMs: null, issue: 'unbounded_host_step_timing' },
+    { sql: "INSERT INTO model_request_provenance SELECT * FROM model_request_provenance; INSERT INTO model_request_provenance SELECT * FROM model_request_provenance", callMs: null, issue: 'duplicate_timing_dispatch_provenance' },
+    { sql: "INSERT INTO events SELECT 608, session_id, turn, role, type, json_set(data_json, '$.stepId', 'second-step-claim'), created_at, 'duplicate-step' FROM events WHERE seq = 607", callMs: null, issue: 'duplicate_host_request_timing' },
+  ];
+  for (const variant of variants) {
+    const fixture = timingFixture();
+    try {
+      const db = new Database(fixture.dbPath); db.exec(variant.sql); db.close();
+      const measured = measureAcceptedTurn(fixture.home, 'timing', 600);
+      assert.equal(measured.modelTiming?.resilienceCallMs, variant.callMs, variant.sql);
+      assert.ok(measured.modelTimingIssues?.includes(variant.issue), variant.sql);
+      assert.notEqual(measured.modelTiming?.coverage, 'observed_host_steps');
+      assert.equal(measured.promptTokens, 100); assert.equal(measured.providerDurationMs, 500);
+    } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  }
+});
+
+test('an earlier same-source request cannot be reused by a later attempt or a mismatched physical call', () => {
+  const fixture = timingFixture();
+  try {
+    const db = new Database(fixture.dbPath);
+    db.prepare('INSERT INTO run_attempts VALUES (?, ?, ?, ?, ?, ?)').run('timing-later', 'timing',
+      '2026-08-08T08:00:05.000Z', '2026-08-08T08:00:09.000Z', 'completed', 600);
+    seedSession(db, 'timing', timingEvents(600, 'timing-later', '2026-08-08T08:00:05.000Z', 620,
+      { stepId: 'later-step', requestOrdinal: 1, callId: 'later-call' }));
+    // Remove the valid earlier observation, leaving an otherwise valid later
+    // attempt whose ordinal was sealed before that attempt/step began.
+    db.exec('DELETE FROM events WHERE seq BETWEEN 601 AND 607'); db.close();
+    const later = measureAcceptedTurn(fixture.home, 'timing', 600);
+    assert.equal(later.modelTiming?.hostStepMs, null);
+    assert.ok(later.modelTimingIssues?.includes('unbounded_host_step_timing'));
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  const mismatch = timingFixture();
+  try {
+    const db = new Database(mismatch.dbPath);
+    db.prepare('INSERT INTO model_request_provenance VALUES (?, ?, ?, ?, ?, ?)').run(600, 2, 1,
+      '2026-08-08T08:00:00.060Z', 'fixture-event-600', 'timing');
+    db.exec("UPDATE events SET data_json = json_set(data_json, '$.requestOrdinal', 2) WHERE seq BETWEEN 601 AND 604"); db.close();
+    const measured = measureAcceptedTurn(mismatch.home, 'timing', 600);
+    assert.equal(measured.modelTiming?.hostStepMs, 3_000); assert.equal(measured.modelTiming?.resilienceCallMs, null);
+    assert.ok(measured.modelTimingIssues?.includes('unbounded_resilience_call_timing'));
+  } finally { rmSync(mismatch.home, { recursive: true, force: true }); }
+});
+
+test('task timing unions validated sources once, retains ancestor execution ownership, and excludes unrelated followups', () => {
+  const fixture = approvalTaskFixture();
+  try {
+    const db = new Database(fixture.dbPath);
+    addTimingStore(db);
+    const dispatch = db.prepare('INSERT INTO model_request_provenance VALUES (?, ?, ?, ?, ?, ?)');
+    for (const [source, attempt, start, firstSeq] of [
+      [501, 'task-root', '2026-08-08T07:00:00.000Z', 700],
+      [510, 'task-control-one', '2026-08-08T07:00:10.000Z', 710],
+      [520, 'task-control-two', '2026-08-08T07:00:20.000Z', 720],
+      [515, 'task-unrelated', '2026-08-08T07:00:16.000Z', 730],
+    ] as const) {
+      seedSession(db, 'task', timingEvents(source, attempt, start, firstSeq));
+      dispatch.run(source, 1, 1, new Date(Date.parse(start) + 50).toISOString(), `fixture-event-${source}`, 'task');
+    }
+    db.close();
+    const task = measureAcceptedTask(fixture.home, 'task', 501);
+    assert.equal(task.modelTiming?.hostStepMs, 9_000); assert.equal(task.modelTiming?.resilienceCallMs, 7_200);
+    assert.equal(task.modelTiming?.failedAttemptMs, 3_000); assert.equal(task.modelTiming?.observedHostSteps, 3);
+    assert.equal(task.modelTiming?.provenanceRequests, 3); assert.equal(task.modelTiming?.coverage, 'observed_host_steps');
+    assert.equal(task.promptTokens, 670); assert.equal(task.taskWallMs, 25_000);
+    const legacy = new Database(fixture.dbPath);
+    legacy.exec('DELETE FROM events WHERE seq BETWEEN 720 AND 726; DELETE FROM model_request_provenance WHERE source_user_seq = 520');
+    legacy.close();
+    const mixed = measureAcceptedTask(fixture.home, 'task', 501);
+    assert.equal(mixed.modelTiming?.hostStepMs, 6_000); assert.equal(mixed.modelTiming?.coverage, 'partial');
+    assert.ok(mixed.modelTimingIssues?.includes('timing_source_unobserved:520'));
+    const restore = new Database(fixture.dbPath);
+    seedSession(restore, 'task', timingEvents(520, 'task-control-two', '2026-08-08T07:00:20.000Z', 720));
+    restore.prepare('INSERT INTO model_request_provenance VALUES (?, ?, ?, ?, ?, ?)').run(520, 1, 1,
+      '2026-08-08T07:00:20.050Z', 'fixture-event-520', 'task'); restore.close();
+    // Rebind the control step to the durable execution ancestor exactly as a
+    // host approval continuation does; provenance remains exact to that owner.
+    const ancestor = new Database(fixture.dbPath);
+    ancestor.exec("UPDATE events SET data_json = json_set(data_json, '$.sourceUserSeq', 501, '$.requestOrdinal', 2) WHERE seq BETWEEN 710 AND 716; UPDATE model_request_provenance SET source_user_seq = 501, request_ordinal = 2, source_event_id = 'fixture-event-501' WHERE source_user_seq = 510");
+    ancestor.close();
+    const rebound = measureAcceptedTask(fixture.home, 'task', 501);
+    assert.equal(rebound.modelTiming?.hostStepMs, 9_000); assert.equal(rebound.modelTiming?.failedAttemptMs, 3_000);
+    const broken = new Database(fixture.dbPath); broken.exec("UPDATE pending_approvals SET resolution = 'rejected' WHERE approval_id = 'apr-one'"); broken.close();
+    const partial = measureAcceptedTask(fixture.home, 'task', 501);
+    assert.equal(partial.modelTiming?.hostStepMs, 3_000); assert.equal(partial.modelTiming?.observedHostSteps, 1);
+    assert.equal(partial.modelTiming?.coverage, 'partial');
+    assert.ok(partial.modelTimingIssues?.includes('unproved_task_timing_lineage'));
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});

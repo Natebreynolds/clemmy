@@ -175,7 +175,29 @@ export type MessageStatus =
 export interface DelegatedWorkControl {
   sourceUserSeq: number;
   runIds: string[];
+  /** Logical control remains active while the exact child work waits to start. */
   state: 'running' | 'cancelling' | 'stopped';
+  execution?: 'queued' | 'running';
+  /** Bounded by runIds; one child starting cannot imply all children started. */
+  startedRunIds?: string[];
+  dispatchKey?: string;
+  progressSeq?: number;
+}
+
+/** Stop coverage is an acknowledgement, independently of chat completion. */
+export interface WorkflowStopQualification {
+  status: 'complete' | 'partial' | 'unavailable';
+  matchedRunIds: string[];
+  cancelledRunIds: string[];
+  alreadyCancelledRunIds: string[];
+  alreadyTerminalRunIds: string[];
+  failures: Array<{ runId?: string; code: 'source_unbound' | 'ownership_unavailable'
+    | 'shared_child_requires_exact_run_stop' | 'child_stop_failed' | 'membership_open' }>;
+}
+
+export interface ChatStopReceipt {
+  confirmed: boolean;
+  workflowStop?: WorkflowStopQualification;
 }
 
 /** One live step in a turn's activity strip — a tool call, a spawned agent, a
@@ -437,6 +459,9 @@ export interface EngineSnapshot {
    * Stop to work there too falls back to the run attempt's own identity.
    */
   cancelKey: string | null;
+  /** Existing accepted source being observed. A reopened/other-device Stop
+   * must match this source to the host's current attempt before cancelling. */
+  activeSourceUserSeq?: number | null;
   activeTaskMode?: TaskMode;
 }
 

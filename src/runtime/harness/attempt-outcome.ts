@@ -195,6 +195,9 @@ export interface AttemptSignals {
   errorName?: string;
   /** Provider envelope success flag, when the envelope is structured. */
   envelopeSuccessful?: boolean;
+  /** Trusted adapter proof of an exact rejection before the requested effect.
+   * Never inferred from an HTTP status or a provider's generic success flag. */
+  providerRejectedBeforeEffect?: boolean;
   /** Explicit no-op in the provider acknowledgement; success without a new effect. */
   providerNoChange?: boolean;
   /** Provider envelope error code, when the envelope carries one. */
@@ -338,30 +341,18 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
       : outcome('invalid_arguments', 'nominal', 'output_truncated');
   }
 
-  // A request the provider REJECTED never became an effect, so its fate is not
-  // in doubt. Only statuses that prove pre-effect rejection qualify — a 500 is
-  // exactly the case where the write may well have landed.
-  const rejectedBeforeEffect = typeof signals.httpStatus === 'number'
-    && [400, 401, 403, 404, 405, 422, 501].includes(signals.httpStatus);
-  // A provider that answered 2xx and said "not successful" processed the
-  // request and refused it at its own layer (Slack's ok:false, carried by the
-  // adapter as successful:false with the 200 underneath). The refusal is the
-  // provider's verdict on the exact request: nothing landed. Live 2026-10-06 a
-  // delete of an already-gone reminder answered `not_found` this way and
-  // settled as an unacknowledged mutation, so the turn stopped "uncertain"
-  // over a change the provider had just said it did not make. No status, or
-  // a 5xx, stays uncertain: those are the cases where the write may have landed.
-  const rejectedAtProviderLayer = typeof signals.httpStatus === 'number'
-    && signals.httpStatus >= 200 && signals.httpStatus < 300
-    && signals.envelopeSuccessful === false;
+  // Statuses and unsuccessful envelopes can follow partial commits. Only the
+  // trusted adapter's exact pre-effect proof establishes a known rejection.
+  const rejectedAtProviderLayer = signals.providerRejectedBeforeEffect === true;
 
   // A mutation whose fate we cannot observe outranks every other reading: the
   // one thing worse than failing is doing it twice.
   if (
     signals.mutating
-    && signals.acknowledged === false
+    && (signals.acknowledged === false
+      || signals.envelopeSuccessful === false
+      || (typeof signals.httpStatus === 'number' && signals.httpStatus >= 400))
     && signals.preDispatch !== true
-    && !rejectedBeforeEffect
     && !rejectedAtProviderLayer
   ) {
     return outcome('uncertain_write', 'nominal', 'unacknowledged_mutation');
@@ -376,6 +367,9 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
       ? outcome('uncertain_write', 'structured', 'provider_envelope_contradiction')
       : outcome('unknown', 'structured', 'provider_envelope_contradiction');
   }
+  if (rejectedAtProviderLayer) {
+    return outcome('invalid_arguments', 'nominal', 'provider_rejected_before_effect', signals.httpStatus);
+  }
 
   // Structured — the transport or envelope carried a machine-readable verdict.
   if (typeof signals.httpStatus === 'number') {
@@ -388,11 +382,6 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
       return outcome('unsupported_capability', 'structured', `http_${status}`, status);
     }
     if (TRANSIENT_STATUS.has(status)) return outcome('transient', 'structured', `http_${status}`, status);
-    // The provider refused the exact request (see rejectedAtProviderLayer).
-    // WHY is in its own words for the model to read — a wrong or already-gone
-    // target, most often — so the call is repairable, never a dead stop and
-    // never a reason to shop for a sibling capability.
-    if (rejectedAtProviderLayer) return outcome('invalid_arguments', 'structured', 'envelope_rejected', status);
     // A mutation that succeeded with nothing to return (a DELETE's 204, a
     // provider's `{}`) is acknowledged work, not an empty answer to shop
     // around: live 2026-10-06 a successful Outlook draft delete settled as

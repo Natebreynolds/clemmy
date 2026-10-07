@@ -111,10 +111,12 @@ const logger = pino({ name: 'clementine-next.background-tasks' });
 type BackgroundResponseExecutor = (
   assistant: ClementineAssistant,
   request: Parameters<typeof respondPreferHarness>[1],
+  executionModelPin?: BackgroundTaskDelegation['executionModelPin'],
 ) => Promise<AssistantResponse>;
 
-const defaultBackgroundResponseExecutor: BackgroundResponseExecutor = (assistant, request) =>
-  respondPreferHarness('background', request, (nextRequest) => assistant.respond(nextRequest));
+const defaultBackgroundResponseExecutor: BackgroundResponseExecutor = (assistant, request, executionModelPin) =>
+  respondPreferHarness('background', request, (nextRequest) => assistant.respond(nextRequest),
+    executionModelPin ? { delegatedAgentModelPin: executionModelPin.modelId } : {});
 
 let backgroundResponseExecutor: BackgroundResponseExecutor = defaultBackgroundResponseExecutor;
 
@@ -419,6 +421,11 @@ export interface BackgroundTaskDelegation {
   /** When the agent record delegated to was created: an id is a name's slug,
    * and a different agent saved later under it is not this one. */
   agentCreatedAt: string | null;
+  /** Host-resolved saved specialist model, frozen before dispatch. Generic
+   * task model text and later role edits cannot mint or replace this pin. */
+  executionModelPin?: { modelId: string; savedModel: string };
+  /** A settled unavailable choice cannot reopen into another specialist. */
+  modelBindingRefusal?: string;
   projectId: string | null;
   projectName: string | null;
   /** Where the owner asked for the result to be put, in their words. */
@@ -1542,6 +1549,31 @@ function delegatedAgentStillSaved(delegation: BackgroundTaskDelegation): boolean
   } catch {
     return false;
   }
+}
+
+/** No runtime migration: old work must not invent its original saved pin. */
+function delegatedSpecialistMissingPin(task: BackgroundTaskRecord): boolean {
+  const delegation = task.delegation;
+  if (task.foregroundHandoff || !delegation?.agentId || delegation.executionModelPin || !delegation.agentCreatedAt) return false;
+  try {
+    const agent = getAgentRecord(delegation.agentId);
+    if (!agent?.model?.trim() || agent.createdAt !== delegation.agentCreatedAt) return false;
+    const recordedAt = Date.parse(agent.updatedAt ?? agent.createdAt ?? '');
+    const queuedAt = Date.parse(task.createdAt);
+    return Number.isFinite(recordedAt) && Number.isFinite(queuedAt) && recordedAt <= queuedAt;
+  } catch { return false; }
+}
+
+function delegatedSpecialistPinMalformed(task: BackgroundTaskRecord): boolean {
+  if (task.foregroundHandoff || !task.delegation) return false;
+  if (Object.prototype.hasOwnProperty.call(task.delegation, 'modelBindingRefusal')
+    && (typeof task.delegation.modelBindingRefusal !== 'string' || !task.delegation.modelBindingRefusal.trim())) return true;
+  if (!Object.prototype.hasOwnProperty.call(task.delegation, 'executionModelPin')) return false;
+  const pin: unknown = task.delegation.executionModelPin;
+  if (!pin || typeof pin !== 'object' || Array.isArray(pin)) return true;
+  const value = pin as Record<string, unknown>;
+  return typeof value.modelId !== 'string' || !value.modelId.trim()
+    || typeof value.savedModel !== 'string' || !value.savedModel.trim();
 }
 
 function delegatedProjectStillActive(delegation: BackgroundTaskDelegation): boolean {
@@ -5942,26 +5974,69 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
               'Task token budget spent before provider retry; progress preserved.');
             continue;
           }
+          if (delegatedSpecialistPinMalformed(task)) {
+            markBackgroundTaskAwaitingInput(task.id, `model-pin-${task.id}`,
+              'This task has an unreadable saved specialist model pin. Start a new task with that saved agent to confirm its model; this task\'s saved progress is preserved.',
+              { blockerReason: 'saved_agent_model_pin_invalid' });
+            continue;
+          }
+          if (!task.foregroundHandoff && task.delegation?.modelBindingRefusal) {
+            markBackgroundTaskAwaitingInput(task.id, `model-binding-${task.id}`, task.delegation.modelBindingRefusal,
+              { blockerReason: 'saved_agent_model_unavailable' });
+            continue;
+          }
 	      // Work that came from a project with nobody named: ask once which of
 	      // the agents assigned there it belongs to, and keep the answer.
 	      if (task.delegation?.agentChoice === 'open') {
 	        try {
 	          const { settleOpenAgentChoice } = await import('../projects/inherited-delegation.js');
+                  const choiceVersion = task.contractVersion ?? 1;
+                  const choiceIdentity = JSON.stringify(task.delegation);
+                  const choicePrompt = task.prompt;
 	          const settled = await settleOpenAgentChoice(task);
-	          const updated = updateBackgroundTaskWhere(task.id, (current) => current.status === 'running', {
-	            delegation: settled.delegation,
-	            ...(settled.model ? { model: settled.model } : {}),
-	          });
-	          if (updated) {
-	            task = updated;
-	            ensureDelegatedRunSession(task);
-	            if (task.delegation?.agentId) publishDelegatedTaskState(task, 'started');
+                  const updated = updateBackgroundTaskWhere(task.id, (current) => current.status === 'running'
+                    && (current.contractVersion ?? 1) === choiceVersion && current.prompt === choicePrompt
+                    && JSON.stringify(current.delegation) === choiceIdentity, {
+                    delegation: settled.delegation,
+                    ...(settled.model ? { model: settled.model }
+                      : settled.refusal && settled.delegation.executionModelPin ? { model: settled.delegation.executionModelPin.modelId } : {}),
+                  });
+                  if (!updated) {
+                    const latest = getBackgroundTask(task.id);
+                    if (latest?.status === 'cancelling' || latest?.status === 'aborted') {
+                      throw new AgentRuntimeCancelledError(latest.cancellationReason ?? 'Cancelled by user.');
+                    }
+                    const requeued = updateBackgroundTaskWhere(task.id, (current) => current.status === 'running'
+                      && ((current.contractVersion ?? 1) !== choiceVersion || current.prompt !== choicePrompt
+                        || JSON.stringify(current.delegation) !== choiceIdentity), { status: 'pending' });
+                    if (requeued) finishRun(run.id, { status: 'cancelled', message: 'Task authority changed while choosing an agent; re-queued with the current contract.' });
+                    continue;
+                  }
+                  task = updated;
+	          ensureDelegatedRunSession(task);
+	          if (settled.refusal) {
+	            markBackgroundTaskAwaitingInput(task.id, `model-binding-${task.id}`, settled.refusal,
+                  { blockerReason: 'saved_agent_model_unavailable' });
+	            continue;
 	          }
+	          if (task.delegation?.agentId) publishDelegatedTaskState(task, 'started');
 	        } catch (error) {
+                  if (error instanceof AgentRuntimeCancelledError) throw error;
 	          logger.warn({ taskId: task.id, error: error instanceof Error ? error.message : String(error) },
-	            'Could not decide who a task belongs to; it runs in its project without an agent');
+	            'Could not retain the selected task authority; no model was activated');
+                  markBackgroundTaskAwaitingInput(task.id, `model-binding-${task.id}`,
+                    'Clementine could not retain this task\'s selected agent authority. Saved progress is preserved; start a new task to confirm who should run it.',
+                    { blockerReason: 'saved_agent_selection_unverified' });
+                  continue;
 	        }
 	      }
+
+          if (delegatedSpecialistMissingPin(task)) {
+            markBackgroundTaskAwaitingInput(task.id, `model-pin-${task.id}`,
+              `This task was delegated to ${task.delegation!.agentName ?? 'a saved specialist'}, but its original model pin was not retained. Start a new task with that saved agent to confirm its model; this task's saved progress is preserved.`,
+              { blockerReason: 'saved_agent_model_pin_missing' });
+            continue;
+          }
 
 
 	      let toolCount = 0;
@@ -6370,7 +6445,10 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        const remainingWallMs = Math.max(1, wallClockDeadlineMs - Date.now());
 	        activationStartedAt = nowIso();
 	        const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
-	        const requestedModel = task.model ?? resolveRoleModel('brain').modelId;
+	        // A genuine handoff already owns a frozen accepted checkpoint model.
+	        // Fresh delegated work carries its saved specialist pin instead.
+	        const executionModelPin = task.foregroundHandoff ? undefined : task.delegation?.executionModelPin;
+	        const requestedModel = executionModelPin?.modelId ?? task.model ?? resolveRoleModel('brain').modelId;
 	        response = await backgroundResponseExecutor(assistant, {
 	          sessionId: task.runSessionId,
 	          channel: task.channel ?? 'background',
@@ -6431,7 +6509,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	              },
 	            });
 	          },
-	        });
+	        }, executionModelPin);
 	        task = recordBackgroundTaskRoute(task, run.id, response, requestedModel);
 	        const latestContractTask = getBackgroundTask(task.id);
 	        if ((latestContractTask?.contractVersion ?? 1) > acceptedContractVersion) {

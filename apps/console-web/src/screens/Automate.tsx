@@ -12,6 +12,8 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
+import { usePendingCommit } from '@/lib/pending-commit';
+import { workflowRunFailure, workflowRunId, workflowRunNotice, workflowRunTone } from '@/lib/workflow-run-receipt';
 import { statusTone } from '@/lib/inbox';
 import { humanizeCron } from '@/lib/cron';
 import { ActivityCard } from '@/components/chat/ActivityCard';
@@ -95,6 +97,7 @@ export function Automate() {
   const systemQ = usePoll(['agent-system-metrics'], getAgentSystemMetrics, 15000, { enabled: tab !== 'skills' });
 
   const [busyName, setBusyName] = useState<string | null>(null);
+  const runCommit = usePendingCommit('automate-run');
   const [skillUrl, setSkillUrl] = useState('');
   const [installing, setInstalling] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -119,7 +122,7 @@ export function Automate() {
     // Read once on mount: the query string is the deep link, not live state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
+  const [notice, setNotice] = useState<{ tone: 'info' | 'warning' | 'error'; text: string } | null>(null);
 
   const wf = workflows.data?.workflows ?? [];
   // The old Schedules tab duplicated these same cards; a schedule is now a
@@ -135,21 +138,20 @@ export function Automate() {
     .filter((rec) => rec.kind === 'loop' && (rec.severity === 'warn' || rec.severity === 'critical')).length;
 
   const run = async (name: string) => {
+    const token = runCommit.begin();
+    if (!token) return;
     setBusyName(name); setNotice(null);
     try {
-      const queued = await runWorkflow(name) as { id?: string; held?: boolean; message?: string } | undefined;
+      const queued = await runWorkflow(name);
+      if (!runCommit.owns(token)) return;
       void qc.invalidateQueries({ queryKey: ['runs'] });
       void qc.invalidateQueries({ queryKey: ['wf-runs', name] });
-      if (queued?.held) {
-        // Clem is rewriting a legacy step first; the run starts by itself.
-        setNotice({ tone: 'info', text: queued.message ?? `"${name}" is being prepared; it starts by itself.` });
-        return;
-      }
-      setOpenRun({ workflow: name, runId: queued?.id });
-      setNotice({ tone: 'info', text: `Started "${name}".` });
+      const runId = workflowRunId(queued);
+      if (runId) setOpenRun({ workflow: name, runId });
+      setNotice({ tone: workflowRunTone(queued), text: workflowRunNotice(queued) });
     }
-    catch (e) { setNotice({ tone: 'error', text: (e as Error).message }); }
-    finally { setBusyName(null); }
+    catch (e) { if (runCommit.owns(token)) setNotice({ tone: 'warning', text: workflowRunFailure(e) }); }
+    finally { if (runCommit.finish(token)) setBusyName(null); }
   };
   const retryFailed = async (workflow: WorkflowRow) => {
     if (!workflow.lastRunId) return;
@@ -232,7 +234,7 @@ export function Automate() {
 
       {notice && (
         <p className={cn('mb-4 rounded-md border px-3 py-2 text-small',
-          notice.tone === 'error' ? 'border-danger/40 bg-danger-tint text-danger' : 'border-border bg-subtle text-muted')}>
+          notice.tone === 'error' ? 'border-danger/40 bg-danger-tint text-danger' : notice.tone === 'warning' ? 'border-warning/30 bg-warning-tint text-fg' : 'border-border bg-subtle text-muted')}>
           {notice.text}
         </p>
       )}
@@ -339,7 +341,7 @@ export function Automate() {
                           </div>
                           <div className="flex flex-wrap gap-2">
                             {canRun ? (
-                              <Button size="sm" variant="secondary" disabled={busyName === w.name} onClick={() => run(w.name)}>
+                              <Button size="sm" variant="secondary" disabled={busyName !== null} onClick={() => run(w.name)}>
                                 {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run
                               </Button>
                             ) : (

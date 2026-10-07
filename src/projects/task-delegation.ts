@@ -15,7 +15,7 @@
  * The result names who does the work and what they know. It grants nothing.
  */
 import { resolveAgentBinding, agentModelIsRole, listAgentChoicesForRefusal } from '../agents/agent-binding.js';
-import { getAgentRecord } from '../agents/agent-record.js';
+import { getAgentRecord, type AgentRecord } from '../agents/agent-record.js';
 import { sessionAgentState } from '../agents/session-agent-state.js';
 import type { BackgroundTaskDelegation } from '../execution/background-tasks.js';
 import { getSession } from '../runtime/harness/eventlog.js';
@@ -43,6 +43,29 @@ export type TaskDelegationResolution =
 export interface TaskDelegationDependencies {
   selectAgent?: (objective: string, candidates: readonly AgentSelectCandidate[], sessionId: string) =>
     Promise<{ id: string } | null>;
+  roleModel?: typeof resolveRoleModel;
+}
+
+/** A saved specialist choice cannot become a role reader's healthy default. */
+export function resolveDelegatedAgentModel(agent: Pick<AgentRecord, 'name'> & Partial<Pick<AgentRecord, 'model'>>, inherited = false,
+  roleModel: typeof resolveRoleModel = resolveRoleModel):
+  | { kind: 'refuse'; reason: string; executionModelPin?: NonNullable<BackgroundTaskDelegation['executionModelPin']> }
+  | { kind: 'bound'; model?: string; executionModelPin?: NonNullable<BackgroundTaskDelegation['executionModelPin']> } {
+  const savedModel = agent.model?.trim();
+  if (!savedModel) return { kind: 'bound', ...(inherited ? {} : { model: roleModel('worker').modelId }) };
+  let model = savedModel;
+  if (agentModelIsRole(savedModel)) {
+    let resolved: ReturnType<typeof resolveRoleModel>;
+    try { resolved = roleModel(savedModel.toLowerCase() as ModelRole); } catch {
+      return { kind: 'refuse', reason: `The saved agent "${agent.name}" requires the ${savedModel} model, but that saved choice could not be verified. Reconnect it or change the saved role choice before retrying. No substitute was started.` };
+    }
+    if (resolved.inactiveBinding) return { kind: 'refuse',
+      executionModelPin: { modelId: resolved.inactiveBinding.modelId, savedModel },
+      reason: `The saved agent "${agent.name}" requires the ${savedModel} model "${resolved.inactiveBinding.modelId}", but that saved model is unavailable. No substitute was started. Reconnect it or change the saved role choice before retrying.` };
+    model = resolved.modelId;
+    if (!model?.trim()) return { kind: 'refuse', reason: `The saved agent "${agent.name}" has no verifiable model for its ${savedModel} role. Change the saved role choice before retrying. No substitute was started.` };
+  }
+  return { kind: 'bound', model, executionModelPin: { modelId: model, savedModel } };
 }
 
 function projectChoices(limit = 12): string {
@@ -154,22 +177,13 @@ export async function resolveTaskDelegation(
   if (!project && !agentId) return { kind: 'none' };
 
   const agent = agentId ? getAgentRecord(agentId) : null;
-  let model: string | undefined;
-  if (agent) {
-    // One bounded piece of work: the model the agent asks for, otherwise the
-    // owner's helper role. Both go through the owner's own model settings.
-    // A task started from a conversation already in the agent keeps the model
-    // such a task has always run on, unless the agent asks for its own.
-    model = agent.model
-      ? agentModelIsRole(agent.model)
-        ? resolveRoleModel(agent.model.trim().toLowerCase() as ModelRole).modelId
-        : agent.model
-      : inherited ? undefined : resolveRoleModel('worker').modelId;
-  }
+  const selectedModel = agent ? resolveDelegatedAgentModel(agent, inherited, dependencies.roleModel)
+    : { kind: 'bound' as const, model: undefined, executionModelPin: undefined };
+  if (selectedModel.kind === 'refuse') return selectedModel;
   const destination = String(request.artifactDestination ?? '').replace(/\s+/g, ' ').trim().slice(0, 400);
   return {
     kind: 'bound',
-    model,
+    model: selectedModel.model,
     delegation: {
       agentId: agent?.id ?? null,
       agentName: agent?.name ?? null,
@@ -178,6 +192,7 @@ export async function resolveTaskDelegation(
       projectName: project?.name ?? null,
       ...(destination ? { artifactDestination: destination } : {}),
       assignedBy,
+      ...(selectedModel.executionModelPin ? { executionModelPin: selectedModel.executionModelPin } : {}),
       ...(typeof request.sourceUserSeq === 'number' && request.sourceUserSeq > 0
         ? { originSourceUserSeq: request.sourceUserSeq } : {}),
     },

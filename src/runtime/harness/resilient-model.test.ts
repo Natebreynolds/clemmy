@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import { APIConnectionError, APIConnectionTimeoutError, APIUserAbortError } from 'openai';
 import { withResilience, translateSettings, classifyModelError, type ResiliencePolicy } from './resilient-model.js';
+import { withModelResilienceTelemetry, type ResilienceTelemetryEvent } from './resilient-model.js';
 import * as resilient from './resilient-model.js';
 import { resolveModelCapability } from './model-wire-registry.js';
 import { BoundaryError } from '../boundary-error.js';
@@ -677,6 +678,271 @@ test('getResponse: a provider-directed rate-limit wait is not cut short by the n
   const model = withResilience(inner, policy({ now: () => clock.now, sleep: async (ms) => { clock.now += ms; } }));
   await model.getResponse(req());
   assert.equal(calls, 2);
+});
+
+// --- per-call timing observation -------------------------------------------
+
+for (const path of ['getResponse', 'getStreamedResponse'] as const) {
+  test(`${path}: timing includes the failed physical attempt and actual retry wait without inventing usage`, async () => {
+    const clock = { now: 100 };
+    const events: ResilienceTelemetryEvent[] = [];
+    const sleeps: number[] = [];
+    let calls = 0;
+    const attempt = (): void => {
+      calls += 1;
+      clock.now += calls === 1 ? 28_000 : 2_474;
+      if (calls === 1) throw new APIConnectionTimeoutError();
+    };
+    const answer = resp([{ type: 'message', content: 'exact answer' }]);
+    const model = withResilience(makeModel({
+      getResponse: async () => { attempt(); return answer; },
+      getStreamedResponse: async function* () { attempt(); yield { type: 'response_done', response: answer } as never; },
+    }), policy({ now: () => clock.now, sleep: async (ms) => { sleeps.push(ms); clock.now += ms + 5; } }));
+    const request = req({ input: 'private fixture bytes never enter telemetry' });
+    const output = await withModelResilienceTelemetry(event => events.push(event), () => (
+      path === 'getResponse' ? model.getResponse(request) : collect(model.getStreamedResponse(request))
+    ));
+    assert.ok(output);
+    assert.equal(calls, 2);
+    assert.deepEqual(events.map(event => event.type), [
+      'call_started', 'attempt_started', 'attempt_finished', 'retry_scheduled',
+      'retry_wait_finished', 'attempt_started', 'attempt_finished', 'call_finished',
+    ]);
+    const attempts = events.filter(event => event.type === 'attempt_finished');
+    assert.deepEqual(attempts.map(event => [event.attempt, event.durationMs, event.outcome]), [[1, 28_000, 'failed'], [2, 2_474, 'returned']]);
+    assert.equal(attempts[0].failureKind, 'model.transport_timeout');
+    assert.equal(attempts[0].contentCommitted, false);
+    const retry = events.find(event => event.type === 'retry_scheduled');
+    assert.ok(retry && retry.type === 'retry_scheduled');
+    assert.equal(retry.reason, 'transient_failure');
+    assert.equal(retry.plannedBackoffMs, sleeps[0]);
+    assert.equal(retry.maxRetries, 3);
+    const finished = events.at(-1);
+    assert.ok(finished && finished.type === 'call_finished');
+    assert.equal(finished.durationMs, 28_000 + 2_474 + sleeps[0] + 5);
+    assert.equal(finished.failedAttemptMs, 28_000);
+    assert.equal(finished.attemptMs, 30_474);
+    assert.equal(finished.retryWaitMs, sleeps[0] + 5);
+    assert.equal(finished.failedAttemptCount, 1);
+    assert.equal(finished.attemptCount, 2);
+    assert.equal(finished.completionObserved, true);
+    assert.equal(new Set(events.map(event => event.callId)).size, 1);
+    const encoded = JSON.stringify(events);
+    for (const absent of ['private fixture', 'inputTokens', 'outputTokens', 'requestModel', 'providerReportedModel', 'backendId', 'exact answer']) {
+      assert.equal(encoded.includes(absent), false, `observation must not invent or expose ${absent}`);
+    }
+  });
+}
+
+test('timing: concurrent calls on the same cached wrapper retain separate observers and call identities', async () => {
+  const eventsA: ResilienceTelemetryEvent[] = [];
+  const eventsB: ResilienceTelemetryEvent[] = [];
+  const releases = new Map<string, () => void>();
+  const model = withResilience(makeModel({ getResponse: async request => {
+    await new Promise<void>(resolve => releases.set(String(request.input), resolve));
+    return resp([{ type: 'message', content: request.input }]);
+  } }), policy());
+  const a = withModelResilienceTelemetry(event => eventsA.push(event), () => model.getResponse(req({ input: 'A' })));
+  const b = withModelResilienceTelemetry(event => eventsB.push(event), () => model.getResponse(req({ input: 'B' })));
+  assert.deepEqual([...releases.keys()], ['A', 'B'], 'both requests cross the deterministic barrier');
+  releases.get('B')!();
+  await b;
+  assert.equal(eventsA.some(event => event.type === 'call_finished'), false);
+  releases.get('A')!();
+  await a;
+  assert.equal(new Set(eventsA.map(event => event.callId)).size, 1);
+  assert.equal(new Set(eventsB.map(event => event.callId)).size, 1);
+  assert.notEqual(eventsA[0].callId, eventsB[0].callId);
+  const before = eventsA.length + eventsB.length;
+  const unobserved = model.getResponse(req({ input: 'C' }));
+  releases.get('C')!();
+  await unobserved;
+  assert.equal(eventsA.length + eventsB.length, before, 'no observer escapes its async scope');
+});
+
+for (const observer of [() => { throw new Error('journal unavailable'); }, async () => { throw new Error('async journal unavailable'); }]) {
+  test(`timing: ${observer.constructor.name} observer failure cannot alter provider retry or output`, async () => {
+    let calls = 0;
+    const expected = resp([{ type: 'message', content: 'preserved' }]);
+    const model = withResilience(makeModel({ getResponse: async () => {
+      if (++calls === 1) throw { statusCode: 429, message: 'sensitive provider body' };
+      return expected;
+    } }), policy());
+    assert.equal(await withModelResilienceTelemetry(observer, () => model.getResponse(req())), expected);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(calls, 2);
+  });
+}
+
+test('timing: caller cancellation before content emits one cancelled attempt and never schedules a retry', async () => {
+  const events: ResilienceTelemetryEvent[] = [];
+  const caller = new AbortController();
+  let calls = 0;
+  const model = withResilience(makeModel({ getStreamedResponse: async function* () {
+    calls += 1;
+    caller.abort();
+    throw new APIUserAbortError();
+  } }), policy());
+  await assert.rejects(withModelResilienceTelemetry(event => events.push(event), () => collect(model.getStreamedResponse(req({ signal: caller.signal })))), APIUserAbortError);
+  assert.equal(calls, 1);
+  assert.equal(events.some(event => event.type === 'retry_scheduled'), false);
+  assert.equal(events.filter(event => event.type === 'attempt_finished').length, 1);
+  assert.equal(events.at(-1)?.type, 'call_finished');
+  const finished = events.at(-1);
+  assert.ok(finished && finished.type === 'call_finished');
+  assert.equal(finished.outcome, 'cancelled');
+  assert.equal(finished.completionObserved, false);
+});
+
+test('timing: a failure after content remains a single failed attempt, and consumer close is interrupted rather than returned', async () => {
+  for (const close of [false, true]) {
+    const events: ResilienceTelemetryEvent[] = [];
+    let calls = 0;
+    const model = withResilience(makeModel({ getStreamedResponse: async function* () {
+      calls += 1;
+      yield { type: 'output_text_delta', delta: 'partial' } as never;
+      throw new TypeError('terminated');
+    } }), policy());
+    const work = () => close ? (async () => { for await (const _ of model.getStreamedResponse(req())) break; })()
+      : collect(model.getStreamedResponse(req()));
+    if (close) await withModelResilienceTelemetry(event => events.push(event), work);
+    else await assert.rejects(withModelResilienceTelemetry(event => events.push(event), work), /terminated/);
+    assert.equal(calls, 1);
+    const attempt = events.find(event => event.type === 'attempt_finished');
+    assert.ok(attempt && attempt.type === 'attempt_finished');
+    assert.equal(attempt.contentCommitted, true);
+    assert.equal(attempt.completionObserved, false);
+    assert.equal(attempt.outcome, close ? 'interrupted' : 'failed');
+    assert.equal(events.some(event => event.type === 'retry_scheduled'), false);
+    const finished = events.at(-1);
+    assert.ok(finished && finished.type === 'call_finished');
+    assert.equal(finished.outcome, close ? 'interrupted' : 'failed');
+  }
+});
+
+test('timing: auth refresh and effort stripping keep their independent allowance and record distinct reasons', async () => {
+  for (const reason of ['auth_refresh', 'effort_rejected'] as const) {
+    const clock = { now: 0 };
+    const events: ResilienceTelemetryEvent[] = [];
+    let calls = 0;
+    let refreshes = 0;
+    const request = req({ modelSettings: { reasoning: { effort: 'high' } } });
+    const model = withResilience(makeModel({ getResponse: async current => {
+      calls += 1;
+      clock.now += 10;
+      assert.equal(current.input, request.input);
+      assert.equal(current.tools, request.tools);
+      if (calls === 1) throw reason === 'auth_refresh' ? { statusCode: 401 }
+        : { statusCode: 400, message: 'This model does not support the effort parameter.' };
+      if (reason === 'effort_rejected') assert.equal(current.modelSettings.providerData?.providerOptions?.anthropic?.effort, undefined);
+      return resp([{ type: 'message' }]);
+    } }), policy({ maxRetries: 0, now: () => clock.now,
+      refreshAuth: async () => { refreshes += 1; clock.now += 25; } }));
+    await withModelResilienceTelemetry(event => events.push(event), () => model.getResponse(request));
+    assert.equal(calls, 2, 'these existing one-shot repairs are independent of transient count allowance');
+    assert.equal(refreshes, reason === 'auth_refresh' ? 1 : 0);
+    const retries = events.filter(event => event.type === 'retry_scheduled');
+    assert.equal(retries.length, 1);
+    assert.equal(retries[0].reason, reason);
+    assert.equal(retries[0].plannedBackoffMs, 0);
+    const finished = events.at(-1);
+    assert.ok(finished && finished.type === 'call_finished');
+    assert.equal(finished.durationMs, reason === 'auth_refresh' ? 45 : 20);
+    assert.equal(finished.retryWaitMs, reason === 'auth_refresh' ? 25 : 0);
+  }
+});
+
+test('timing: inaccessible error metadata after content cannot replace the original failure', async () => {
+  const events: ResilienceTelemetryEvent[] = [];
+  const original = new Error('the original partial stream failure');
+  Object.defineProperty(original, 'statusCode', { get() { throw new Error('metadata unavailable'); } });
+  const model = withResilience(makeModel({ getStreamedResponse: async function* () {
+    yield { type: 'output_text_delta', delta: 'partial' } as never;
+    throw original;
+  } }), policy());
+  await assert.rejects(withModelResilienceTelemetry(event => events.push(event), () => collect(model.getStreamedResponse(req()))),
+    err => { assert.equal(err, original); return true; });
+  assert.equal(events.some(event => event.type === 'retry_scheduled'), false);
+  const finished = events.at(-1);
+  assert.ok(finished && finished.type === 'call_finished');
+  assert.equal(finished.outcome, 'failed');
+  assert.equal(finished.failureKind, 'runtime.unknown');
+});
+
+test('timing: slow repeated failures retain the no-answer bound and never emit returned success', async () => {
+  const clock = { now: 0 };
+  const events: ResilienceTelemetryEvent[] = [];
+  let calls = 0;
+  const model = withResilience(makeModel({ getResponse: async () => { calls += 1; return connectTimeoutAfter(clock, 25_000); } }),
+    policy({ now: () => clock.now, sleep: async ms => { clock.now += ms; } }));
+  const error = await withModelResilienceTelemetry(event => events.push(event), () => model.getResponse(req())).then(
+    () => assert.fail('a failed provider cannot return success'), (err: unknown) => err);
+  assert.equal(calls, 2);
+  assert.equal(resilient.modelRetriesSpentBeforeContent(error), true);
+  assert.equal(events.filter(event => event.type === 'retry_scheduled').length, 1);
+  const finished = events.at(-1);
+  assert.ok(finished && finished.type === 'call_finished');
+  assert.equal(finished.outcome, 'failed');
+  assert.equal(finished.failedAttemptCount, 2);
+  assert.equal(finished.failedAttemptMs, 50_000);
+});
+
+test('timing: an earlier empty done cannot certify a later partial stream as complete', async () => {
+  const events: ResilienceTelemetryEvent[] = [];
+  let calls = 0;
+  const model = withResilience(makeModel({ getStreamedResponse: async function* () {
+    if (++calls === 1) yield { type: 'response_done', response: { output: [] } } as never;
+    else yield { type: 'output_text_delta', delta: 'partial without done' } as never;
+  } }), policy());
+  await withModelResilienceTelemetry(event => events.push(event), () => collect(model.getStreamedResponse(req())));
+  assert.equal(calls, 2);
+  assert.equal(events.find(event => event.type === 'retry_scheduled')?.reason, 'empty_completion');
+  const finished = events.at(-1);
+  assert.ok(finished && finished.type === 'call_finished');
+  assert.equal(finished.completionObserved, false, 'the wrapper retains its existing return behavior, not a completion proof');
+});
+
+test('timing: a retired child late-empty retry is distinguishable from the same logical step successful rescue', async () => {
+  const { withModelFallback } = await import('./fallback-model.js');
+  const events: ResilienceTelemetryEvent[] = [];
+  const caller = new AbortController();
+  let childCalls = 0;
+  let rescueCalls = 0;
+  const child = withResilience(makeModel({ getStreamedResponse: async function* (request) {
+    childCalls += 1;
+    if (childCalls === 1) {
+      assert.ok(request.signal);
+      // Only FallbackModel's physical retirement opens this barrier. The
+      // owner signal stays live throughout the successful rescue.
+      await new Promise<void>(resolve => request.signal!.addEventListener('abort', () => resolve(), { once: true }));
+      yield { type: 'response_done', response: { output: [] } } as never;
+    } else yield { type: 'response_done', response: resp([{ type: 'message', content: 'ignored old result' }]) } as never;
+  } }), policy({ label: 'retired-child' }));
+  const rescue = withResilience(makeModel({ getStreamedResponse: async function* (request) {
+    rescueCalls += 1;
+    assert.equal(request.signal?.aborted, false);
+    yield { type: 'response_done', response: resp([{ type: 'message', content: 'rescue result' }]) } as never;
+  } }), policy({ label: 'successful-rescue' }));
+  const model = withModelFallback([
+    { label: 'telemetry-fixture-retired-child', getModel: () => child },
+    { label: 'telemetry-fixture-successful-rescue', getModel: () => rescue },
+  ], { firstByteTimeoutMs: 10, responseWallMs: 0 });
+  const output = await withModelResilienceTelemetry(event => events.push(event), () => collect(model.getStreamedResponse(req({ signal: caller.signal }))));
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(caller.signal.aborted, false);
+  assert.equal(childCalls, 2, 'the existing late-empty retry decision is observed, not changed');
+  assert.equal(rescueCalls, 1);
+  assert.match(JSON.stringify(output), /rescue result/);
+  assert.doesNotMatch(JSON.stringify(output), /ignored old result/);
+  const oldRetry = events.find(event => event.type === 'retry_scheduled' && event.label === 'retired-child');
+  assert.ok(oldRetry && oldRetry.type === 'retry_scheduled');
+  assert.equal(oldRetry.reason, 'empty_completion');
+  assert.equal(oldRetry.requestAborted, true, 'host can retire only the obsolete physical-call progress');
+  const rescued = events.find(event => event.type === 'call_finished' && event.label === 'successful-rescue');
+  assert.ok(rescued && rescued.type === 'call_finished');
+  assert.equal(rescued.outcome, 'returned');
+  assert.equal(rescued.requestAborted, false);
+  assert.equal(rescued.completionObserved, true);
 });
 
 // --- helpers ---------------------------------------------------------------

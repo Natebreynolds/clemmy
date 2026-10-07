@@ -140,6 +140,7 @@ import {
   evaluateTerminalDelivery,
   type TerminalDeliveryJudgePort,
 } from './terminal-delivery-judge.js';
+import { priorTerminalDeliveryResumes } from './terminal-delivery-resume-ledger.js';
 import {
   repairActionTerminalBeforeCommit,
   type PrecommitTerminalPresentationResult,
@@ -3770,7 +3771,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         authoredText: result.text.trim(),
         deliveryConcern: concern,
         settlementAudit: assessment.settlementAudit,
-        priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+        priorConsecutiveResumes: Math.max(terminalJudgeConsecutiveResumes, priorTerminalDeliveryResumes(sessionId, userInputEvent.seq)) as 0 | 1,
         recoveryCapability: {
           liveContinuation:
             continuationsUsed < continuationBudget
@@ -3796,7 +3797,6 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         // The judge was shown a live edge, and this branch now consumes it.
         // Count the physical query even when it fails or returns no parseable
         // result so a provider stumble cannot silently mint another attempt.
-        continuationsUsed += 1;
         try {
           appendEvent({
             sessionId,
@@ -3807,9 +3807,17 @@ async function respondViaClaudeAgentSdkBrainAttempt(
               kind: 'terminal_delivery_resume',
               reason: terminalDecision.reason,
               attempt: terminalDecision.consecutiveResumeCount,
+              sourceUserSeq: userInputEvent.seq,
+              path: 'claude_sdk',
             },
           });
-        } catch { /* terminal recovery telemetry is best-effort */ }
+        } catch {
+          // The allowance is durable authority. An unwritten resume must not
+          // buy a continuation that a later activation could repeat.
+          terminalJudgeConcernForCommit = concern;
+          break;
+        }
+        continuationsUsed += 1;
         let resumed: ClaudeAgentSdkRunResult | null = null;
         try {
           resumed = await runContinuation({

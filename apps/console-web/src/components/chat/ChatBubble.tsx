@@ -2,10 +2,10 @@ import { ConnectionSetup, type ConnectionResume } from './ConnectionSetup';
 import { ApprovalReview } from './ApprovalReview';
 import { PlanReview } from './PlanReview';
 import type { PlanRevisionRef } from '@/lib/task-mode';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { answerDraftStatus, hiddenCardDecision, renderMarkdown, APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
+import { answerDraftStatus, hiddenCardDecision, renderMarkdown, APPROVAL_ANSWER_WORDS, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
 import type { ApprovalConfirm, ApprovalResolution } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
@@ -71,6 +71,7 @@ function approvalFieldLabel(name: string): string {
  */
 function ReplyProse({ text, streaming, failed }: { text: string; streaming?: boolean; failed?: boolean }) {
   const navigate = useNavigate();
+  const html = useMemo(() => renderMarkdown(text, { workspaceLinks: false, appPlaceLinks: 'desktop' }), [text]);
   return (
     <div
       className={cn('chat-prose min-w-0', streaming && 'is-streaming', failed && 'text-danger')}
@@ -83,7 +84,7 @@ function ReplyProse({ text, streaming, failed }: { text: string; streaming?: boo
         navigate(href);
       }}
       // eslint-disable-next-line react/no-danger -- renderMarkdown escapes all input first
-      dangerouslySetInnerHTML={{ __html: renderMarkdown(text, { workspaceLinks: false, appPlaceLinks: 'desktop' }) }}
+      dangerouslySetInnerHTML={{ __html: html }}
     />
   );
 }
@@ -326,6 +327,7 @@ export function ChatBubble({
   const [resolvedDecision, setResolvedDecision] = useState<'approve' | 'reject' | null>(null);
   const [decisionBusy, setDecisionBusy] = useState<'approve' | 'reject' | null>(null);
   const [decisionError, setDecisionError] = useState<string | null>(null);
+  const decisionGate = useRef(new ApprovalDecisionGate());
   // "Not now" sets the decision aside — it stays pending in Needs you. It
   // used to decline it for good; declining is its own button now.
   const [setAside, setSetAside] = useState(false);
@@ -344,11 +346,7 @@ export function ChatBubble({
   // same way (owner-approved design, 2026-10-07).
   const [editing, setEditing] = useState(false);
   const [editedValue, setEditedValue] = useState('');
-  const editableField = (() => {
-    const fields = message.approval?.preview?.fields ?? [];
-    if (!fields.length || message.approval?.preview?.items) return null;
-    return [...fields].sort((a, b) => b.value.length - a.value.length)[0] ?? null;
-  })();
+  const editableField = editableApprovalField(message.approval?.preview);
   const [trustNote, setTrustNote] = useState<string | null>(null);
   const pendingActionId = message.approval?.pendingAction?.id;
   const showDurablePresentation = (presentation: PendingActionExecutionPresentation) => {
@@ -369,50 +367,75 @@ export function ChatBubble({
     return true;
   };
   const runExecute = async () => {
-    if (!pendingActionId) return;
-    setResolvedDecision('approve');
-    setExec({ phase: 'running' });
-    try {
-      const result = await approveExecutePendingAction(pendingActionId, message.approval?.approvalId ?? undefined, alwaysAllow);
-      if (alwaysAllow) {
-        setTrustNote(result.trustGranted
-          ? 'Standing trust saved — identical sends to these recipients won’t ask again. Revoke anytime in Settings.'
-          : 'Couldn’t save standing trust for this one (no verifiable recipients) — it will still ask next time.');
+    if (!pendingActionId || resolved || decisionBusy || editing || message.approval?.resolution) return;
+    await decisionGate.current.run(async () => {
+      setDecisionBusy('approve');
+      setResolvedDecision('approve');
+      setExec({ phase: 'running' });
+      try {
+        const result = await approveExecutePendingAction(pendingActionId, message.approval?.approvalId ?? undefined, alwaysAllow);
+        if (alwaysAllow) {
+          setTrustNote(result.trustGranted
+            ? 'Standing trust saved — identical sends to these recipients won’t ask again. Revoke anytime in Settings.'
+            : 'Couldn’t save standing trust for this one (no verifiable recipients) — it will still ask next time.');
+        }
+        const presentation = await resolvePendingActionExecutionPresentation(
+          result,
+          () => getPendingActionStatus(pendingActionId),
+        );
+        if (!showDurablePresentation(presentation)) {
+          // A genuinely queued/non-executable legacy card still belongs to the
+          // conversational approval path. EXECUTING / EXECUTED / FAILED skips
+          // are handled above from durable truth and can never reach this call.
+          setExec({ phase: 'idle' });
+          await onApprove?.();
+        }
+      } catch {
+        // A lost POST response cannot prove the provider did not act. Reconcile
+        // the record; bounded failure becomes explicit do-not-retry uncertainty.
+        const presentation = await reconcilePendingActionExecutionFailure(
+          () => getPendingActionStatus(pendingActionId),
+        );
+        showDurablePresentation(presentation);
+      } finally {
+        setDecisionBusy(null);
       }
-      const presentation = await resolvePendingActionExecutionPresentation(
-        result,
-        () => getPendingActionStatus(pendingActionId),
-      );
-      if (!showDurablePresentation(presentation)) {
-        // A genuinely queued/non-executable legacy card still belongs to the
-        // conversational approval path. EXECUTING / EXECUTED / FAILED skips
-        // are handled above from durable truth and can never reach this call.
-        setExec({ phase: 'idle' });
-        onApprove?.();
-      }
-    } catch {
-      // A lost POST response cannot prove the provider did not act. Reconcile
-      // the record; bounded failure becomes explicit do-not-retry uncertainty.
-      const presentation = await reconcilePendingActionExecutionFailure(
-        () => getPendingActionStatus(pendingActionId),
-      );
-      showDurablePresentation(presentation);
-    }
+    });
   };
   const resolvePlainDecision = async (decision: 'approve' | 'reject') => {
-    if (resolved || decisionBusy) return;
-    setDecisionBusy(decision);
-    setDecisionError(null);
-    try {
-      await Promise.resolve(decision === 'approve' ? onApprove?.() : onReject?.());
-      setResolvedDecision(decision);
-    } catch (error) {
-      setDecisionError(error instanceof Error && error.message.trim()
-        ? error.message.trim()
-        : `Could not ${decision} this ${message.status === 'awaiting-plan' ? 'plan' : 'request'}.`);
-    } finally {
-      setDecisionBusy(null);
-    }
+    if (resolved || decisionBusy || editing || message.approval?.resolution) return;
+    await decisionGate.current.run(async () => {
+      setDecisionBusy(decision);
+      setDecisionError(null);
+      try {
+        await Promise.resolve(decision === 'approve' ? onApprove?.() : onReject?.());
+        setResolvedDecision(decision);
+      } catch (error) {
+        setDecisionError(error instanceof Error && error.message.trim()
+          ? error.message.trim()
+          : `Could not ${decision} this ${message.status === 'awaiting-plan' ? 'plan' : 'request'}.`);
+      } finally {
+        setDecisionBusy(null);
+      }
+    });
+  };
+
+  const submitEditedDecision = async () => {
+    if (resolved || message.approval?.resolution || !editableField || !onApproveWithEdits
+      || !editedValue.trim() || editedValue === editableField.value) return;
+    await decisionGate.current.run(async () => {
+      setDecisionBusy('approve');
+      setDecisionError(null);
+      try {
+        await onApproveWithEdits({ [editableField.name]: editedValue });
+        setResolvedDecision('approve');
+        setEditing(false);
+      } catch (error) {
+        setDecisionError(error instanceof Error && error.message.trim() ? error.message.trim() : 'That edit could not be sent. Your edit is still here.');
+      } finally {
+        setDecisionBusy(null);
+      }
+    });
   };
 
   const snoozeKey = message.status === 'awaiting-plan'
@@ -562,7 +585,7 @@ export function ChatBubble({
               <>
                 <p className="text-body text-fg">{pendingAction!.ask}</p>
                 {pendingAction!.why && <p className="mt-1 text-small text-muted">{pendingAction!.why}</p>}
-                {pendingAction!.preview && pendingAction!.preview !== 'no preview supplied' && (
+                {pendingAction!.preview && pendingAction!.preview !== 'no preview supplied' && !message.approval?.preview?.fields.length && (
                   <>
                     <p className="mt-2.5 text-caption font-semibold uppercase tracking-wide text-faint">Exactly what happens</p>
                     <pre className="mt-1 whitespace-pre-wrap break-words rounded bg-surface-2 p-2 font-mono text-caption text-fg">{pendingAction!.preview}</pre>
@@ -609,7 +632,7 @@ export function ChatBubble({
             {!pendingAction && message.approval?.preview?.check && (
               <ApprovalCheckNote check={message.approval.preview.check} />
             )}
-            {!pendingAction && message.approval?.preview && !message.approval.preview.items && message.approval.preview.fields.length > 0 && (
+            {message.approval?.preview && !message.approval.preview.items && message.approval.preview.fields.length > 0 && (
               // What approving would actually send: each argument the tool
               // receives, from the host's frozen call, so the owner never
               // approves on an operation's name alone.
@@ -617,10 +640,10 @@ export function ChatBubble({
               {voicedApproval && message.approval.revises?.changeRequest && (
                 <ApprovalRevisionStrip changeRequest={message.approval.revises.changeRequest} />
               )}
-              {voicedApproval && (
+              {(voicedApproval || voicedPendingAction) && (
                 <div className="mt-2.5 flex items-center justify-between">
                   <p className="text-caption font-semibold uppercase tracking-wide text-faint">Exactly what happens</p>
-                  {editableField && onApproveWithEdits && !resolved && !editing && (
+                  {editableField && onApproveWithEdits && !resolved && !message.approval.resolution && !editing && (
                     <button type="button" className="text-caption font-semibold text-primary-ink hover:underline"
                       onClick={() => { setEditedValue(editableField.value); setEditing(true); }}>
                       Edit by hand
@@ -628,15 +651,15 @@ export function ChatBubble({
                   )}
                 </div>
               )}
-              {editing && editableField && (
+              {editing && editableField && !resolved && !message.approval.resolution && (
                 <div className="mt-2 flex flex-col gap-1.5">
                   <label htmlFor={`edit-${message.id}`} className="text-caption text-muted">{approvalFieldLabel(editableField.name)}</label>
-                  <textarea id={`edit-${message.id}`} rows={3} value={editedValue} onChange={(e) => setEditedValue(e.target.value)}
+                  <textarea id={`edit-${message.id}`} rows={3} value={editedValue} disabled={decisionBusy !== null} onChange={(e) => setEditedValue(e.target.value)}
                     className="w-full rounded-md border border-primary-ink bg-surface px-2.5 py-2 text-small text-fg" />
                   <div className="flex flex-wrap items-center gap-2">
                     <Button size="sm" disabled={decisionBusy !== null || !editedValue.trim() || editedValue === editableField.value}
-                      onClick={() => { void onApproveWithEdits!({ [editableField.name]: editedValue }); }}>
-                      Yes, send this one
+                      onClick={() => { void submitEditedDecision(); }}>
+                      {decisionBusy ? 'Sending…' : 'Yes, send this one'}
                     </Button>
                     <Button size="sm" variant="ghost" disabled={decisionBusy !== null} onClick={() => setEditing(false)}>Keep the original</Button>
                   </div>
@@ -696,7 +719,7 @@ export function ChatBubble({
                   Decide now
                 </button>
               </p>
-            ) : voicedApproval ? (
+            ) : editing ? null : voicedApproval ? (
               <ApprovalAnswers
                 chosen={resolvedDecision ?? decisionBusy}
                 disabled={resolved || decisionBusy !== null}

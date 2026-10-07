@@ -217,10 +217,13 @@ test('async workflow dispatch projects only validated deterministic receipt data
     runIds: ['run-safe-41'],
     dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}`,
     replyTargetDigest,
-    text: 'Started — I’ll post the result here when it’s ready.',
+    text: 'Queued — waiting for the workflow to start. I’ll post the result here when it’s ready.',
   });
   assert.equal('callId' in projected.data, false);
   assert.equal('replyTarget' in projected.data, false, 'the exact transport target stays private');
+  const batch = projectHarnessEventForPublic({ ...raw, data: { ...raw.data, runIds: ['run-safe-41', 'run-safe-42'] } });
+  assert.equal(batch?.data.text, 'Queued 2 workflows — waiting to start. I’ll post one combined result here when they’re ready.');
+  assert.doesNotMatch(String(batch?.data.text), /started|busy|capacity/i, 'admission proves neither execution nor a reason for waiting');
 });
 
 test('async dispatch projection rejects prose, malformed identity, and mismatched keys', () => {

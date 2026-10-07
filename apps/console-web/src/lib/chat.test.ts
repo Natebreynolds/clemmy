@@ -1,6 +1,41 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isTerminalEvent, runHarnessStream, subscribeDelegatedActivity, unreportedReplay } from './chat';
+import { isTerminalEvent, runHarnessStream, subscribeDelegatedActivity, unreportedReplay, watchForLateCompletion } from './chat';
+import { ApprovalReplyObserver } from '@clem/chat-engine';
+
+test('an edited-card completion watch drains an unrelated terminal and clears its scheduled poll on cancel', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousWindow = globalThis.window;
+  Object.assign(globalThis, { window: { __CLEM_BOOTSTRAP__: { token: 'watch-test', version: '', flags: {} } } });
+  const pages = [
+    { latestSeq: 44, events: [
+      { seq: 41, turn: 2, role: 'system', type: 'approval_resolved', data: { approvalId: 'apr-watch', decision: 'approve_with_edits' } },
+      { seq: 42, turn: 2, role: 'user', type: 'user_input_received', data: { synthetic: true, source: 'approval_resume', approvalId: 'apr-watch', decision: 'approve_with_edits' } },
+      { seq: 43, turn: 3, role: 'user', type: 'user_input_received', data: { text: 'Newer unrelated question' } },
+      { seq: 44, turn: 3, role: 'Clem', type: 'conversation_completed', data: { sourceUserSeq: 43, reply: 'Unrelated answer' } },
+    ] },
+    { latestSeq: 45, events: [{ seq: 45, turn: 2, role: 'Clem', type: 'conversation_completed', data: { sourceUserSeq: 42, reply: 'Exact edited answer' } }] },
+  ];
+  let calls = 0;
+  globalThis.fetch = (async () => ({ ok: true, json: async () => pages[calls++] ?? { events: [] } })) as unknown as typeof fetch;
+  const observer = new ApprovalReplyObserver('watch-session', 'apr-watch');
+  const answers: string[] = [];
+  const watch = watchForLateCompletion('watch-session', 40, event => {
+    if (observer.observe(event) && event.type === 'conversation_completed') answers.push(String(event.data?.reply));
+  }, { intervalMs: 1, maxAttempts: 5, shouldStopOnTerminal: event => observer.ownsSource(event) });
+  try {
+    for (let attempt = 0; attempt < 50 && answers.length === 0; attempt += 1) await new Promise(resolve => setTimeout(resolve, 2));
+    assert.deepEqual(answers, ['Exact edited answer']);
+    assert.equal(calls, 2, 'the unrelated terminal did not stop this watch');
+    const unused = watchForLateCompletion('watch-session', 45, () => {}, { intervalMs: 1 });
+    unused.cancel();
+    await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(calls, 2, 'leaving the card clears its pending timer');
+  } finally {
+    watch.cancel();
+    Object.assign(globalThis, { fetch: previousFetch, window: previousWindow });
+  }
+});
 
 test('chat stream keeps budget-limit telemetry non-terminal', () => {
   assert.equal(isTerminalEvent('conversation_limit_exceeded'), false);

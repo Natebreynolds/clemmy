@@ -83,7 +83,32 @@ export interface SessionComparisonArgs {
 
 export type TurnUsageAttribution = 'exact' | 'mixed' | 'legacy_window' | 'none';
 
+/** Optional diagnostics. These observed sums are neither token accounting nor
+ * provider wall time, and host steps may contain overlapping physical calls. */
+export interface ModelTimingMeasurement {
+  scope: 'host_main_steps_only';
+  coverage: 'none' | 'partial' | 'observed_host_steps';
+  physicalAttemptCoverage: 'none' | 'partial' | 'observed_calls';
+  provenanceRequests: number | null;
+  observedRequests: number;
+  observedHostSteps: number;
+  observedResilienceCalls: number;
+  hostStepMs: number | null;
+  resilienceCallMs: number | null;
+  physicalAttemptCount: number | null;
+  failedAttemptCount: number | null;
+  failedAttemptMs: number | null;
+  retryWaitMs: number | null;
+  retiredResilienceCalls: number;
+  requestAbortedResilienceCalls: number;
+  /** Timing observations cannot prove whether a failed attempt was billed or
+   * establish its token usage, including when no failed attempt was observed. */
+  failedAttemptUsage: 'unknown';
+}
+
 export interface AcceptedTurnMeasurement extends SessionMeasurement {
+  modelTiming?: ModelTimingMeasurement;
+  modelTimingIssues?: string[];
   sourceUserSeq: number;
   acceptedSource: string;
   terminalSeq: number;
@@ -139,6 +164,8 @@ export interface ApprovalContinuationMeasurement {
 }
 
 export interface AcceptedTaskMeasurement extends SessionMeasurement {
+  modelTiming?: ModelTimingMeasurement;
+  modelTimingIssues?: string[];
   scope: 'task';
   rootSourceUserSeq: number;
   acceptedSource: string;
@@ -363,6 +390,7 @@ interface AttemptRead {
   ids: Set<string>;
   closeoutAt: string | null;
   unfinished: number;
+  bounds: Map<string, { start: number | null; end: number | null }>;
 }
 
 function readAttemptsForSource(
@@ -373,13 +401,28 @@ function readAttemptsForSource(
   const db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 5_000 });
   try {
     db.pragma('query_only = ON');
-    const rows = db.prepare(
-      `SELECT attempt_id, finished_at
+    const identityQuery = `SELECT attempt_id, finished_at
          FROM run_attempts
         WHERE session_id = ?
-          AND source_user_seq = ?
-        ORDER BY started_at ASC`,
-    ).all(sessionId, sourceUserSeq) as Array<{ attempt_id: string; finished_at: string | null }>;
+          AND source_user_seq = ?`;
+    let rows: Array<{ attempt_id: string; finished_at: string | null }>;
+    try {
+      rows = db.prepare(`${identityQuery} ORDER BY started_at ASC`).all(sessionId, sourceUserSeq) as typeof rows;
+    } catch {
+      // Timing columns cannot erase the durable identity/usage join in a
+      // minimal historical store. No timestamp is invented for those rows.
+      rows = db.prepare(`${identityQuery} ORDER BY attempt_id ASC`).all(sessionId, sourceUserSeq) as typeof rows;
+    }
+    const bounds: AttemptRead['bounds'] = new Map(rows.map(row => [row.attempt_id, { start: null, end: null }]));
+    try {
+      const timing = db.prepare(`SELECT attempt_id, started_at, finished_at FROM run_attempts
+        WHERE session_id = ? AND source_user_seq = ?`).all(sessionId, sourceUserSeq) as Array<{
+          attempt_id: string; started_at: string; finished_at: string | null;
+        }>;
+      for (const row of timing) bounds.set(row.attempt_id, {
+        start: timestampValue(row.started_at), end: timestampValue(row.finished_at ?? ''),
+      });
+    } catch { /* Missing timing bounds never change attempt identity or usage. */ }
     const finished = rows
       .map((row) => row.finished_at)
       .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
@@ -388,14 +431,232 @@ function readAttemptsForSource(
       ids: new Set(rows.map((row) => row.attempt_id)),
       closeoutAt: finished.at(-1) ?? null,
       unfinished: rows.filter((row) => !row.finished_at).length,
+      bounds,
     };
   } catch {
     // Pre-attempt fixtures and old read-only homes still measure through the
     // owned terminal; measurement must never migrate them just to add a bound.
-    return { ids: new Set(), closeoutAt: null, unfinished: 0 };
+    return { ids: new Set(), closeoutAt: null, unfinished: 0, bounds: new Map() };
   } finally {
     db.close();
   }
+}
+
+interface TimingSource {
+  source: SessionEvent;
+  attempts: AttemptRead;
+  terminal?: SessionEvent;
+}
+
+function timingNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
+}
+
+/** Read only content-free dispatch identity. This does not open encrypted
+ * requests or claim that timing certifies provider/model/account or billing. */
+function measureModelTiming(
+  dbPath: string,
+  sessionId: string,
+  events: readonly SessionEvent[],
+  sources: ReadonlyMap<number, TimingSource>,
+  isAncestor: (ancestor: number, descendant: number) => boolean = (a, b) => a === b,
+): { modelTiming: ModelTimingMeasurement; modelTimingIssues: string[] } {
+  const issues = new Set<string>();
+  const requests = new Map<string, number>();
+  const requestKeys = new Set<string>();
+  let provenanceAvailable = true;
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 5_000 });
+  try {
+    db.pragma('query_only = ON');
+    const rows = db.prepare(`SELECT p.source_user_seq, p.request_ordinal, p.protocol_version,
+      p.created_at, source.seq AS bound_source_seq
+      FROM model_request_provenance p LEFT JOIN events source
+        ON source.id = p.source_event_id AND source.session_id = p.session_id
+      WHERE p.session_id = ? ORDER BY p.source_user_seq, p.request_ordinal`).all(sessionId) as Array<{
+        source_user_seq: number; request_ordinal: number; protocol_version: number;
+        created_at: string; bound_source_seq: number | null;
+      }>;
+    for (const row of rows) {
+      if (!sources.has(row.source_user_seq)) continue;
+      const key = `${row.source_user_seq}:${row.request_ordinal}`;
+      if (requestKeys.has(key)) {
+        requests.delete(key);
+        issues.add('duplicate_timing_dispatch_provenance');
+        continue;
+      }
+      requestKeys.add(key);
+      const at = timestampValue(row.created_at);
+      if (row.protocol_version !== 1 || row.bound_source_seq !== row.source_user_seq
+        || positiveEventSeq(row.request_ordinal) === null || at === null
+        || at < (timestampMs(sources.get(row.source_user_seq)!.source) ?? Infinity)) {
+        issues.add('invalid_timing_dispatch_provenance');
+        continue;
+      }
+      requests.set(key, at);
+    }
+  } catch {
+    provenanceAvailable = false;
+    issues.add('timing_dispatch_provenance_unavailable');
+  } finally { db.close(); }
+
+  const attemptOwners = new Map<string, number>();
+  for (const [seq, source] of sources) {
+    for (const id of source.attempts.ids) attemptOwners.set(id, seq);
+    if (source.attempts.unfinished > 0) issues.add(`unfinished_timing_source_attempt:${seq}`);
+  }
+  const rows = events.filter(event => event.type === 'model_resilience_observed'
+    && sources.has(Number(event.data.sourceUserSeq)));
+  const byStep = new Map<string, SessionEvent[]>();
+  for (const event of rows) {
+    const data = event.data;
+    const source = positiveEventSeq(data.sourceUserSeq);
+    const attemptOwner = typeof data.runAttemptId === 'string' ? attemptOwners.get(data.runAttemptId) : undefined;
+    if (event.role !== 'system' || data.version !== 1 || source === null
+      || typeof data.stepId !== 'string' || !data.stepId.trim()
+      || typeof data.retired !== 'boolean' || attemptOwner === undefined || !isAncestor(source, attemptOwner)
+      || event.seq <= sources.get(source)!.source.seq) {
+      issues.add('unproved_model_timing_owner');
+      continue;
+    }
+    const group = byStep.get(data.stepId) ?? [];
+    group.push(event);
+    byStep.set(data.stepId, group);
+  }
+  const observedRequests = new Set<string>();
+  const observedAttemptSources = new Set<number>();
+  const hostRequestSteps = new Map<string, Set<string>>();
+  const callSteps = new Map<string, Set<string>>();
+  for (const [stepId, stepRows] of byStep) for (const row of stepRows) {
+    if (row.data.phase === 'host_step_finished') {
+      const key = `${row.data.sourceUserSeq}:${row.data.requestOrdinal}`;
+      const ids = hostRequestSteps.get(key) ?? new Set<string>();
+      ids.add(stepId); hostRequestSteps.set(key, ids);
+    }
+    if (typeof row.data.callId === 'string') {
+      const ids = callSteps.get(row.data.callId) ?? new Set<string>();
+      ids.add(stepId); callSteps.set(row.data.callId, ids);
+    }
+  }
+  let hostSteps = 0, hostMs = 0, calls = 0, callMs = 0, attempts = 0, failed = 0, failedMs = 0, waitMs = 0;
+  let retiredCalls = 0, abortedCalls = 0, stepsWithCalls = 0;
+  // Only terminal totals are summed. attempt_finished/retry_wait_finished rows
+  // describe the same intervals and must never be added to call_finished.
+  const closeFingerprint = (event: SessionEvent): string => JSON.stringify([
+    'version', 'sourceUserSeq', 'stepId', 'runAttemptId', 'requestOrdinal', 'phase', 'callId',
+    'at', 'durationMs', 'outcome', 'retired', 'requestAborted', 'attemptCount',
+    'failedAttemptCount', 'attemptMs', 'failedAttemptMs', 'retryWaitMs',
+  ].map(key => event.data[key]));
+  const oneClose = (closing: SessionEvent[], kind: string): SessionEvent | null => {
+    if (closing.length === 0) { issues.add(`missing_${kind}_close`); return null; }
+    if (closing.length > 1) {
+      issues.add(`duplicate_${kind}_close`);
+      if (closing.some(event => closeFingerprint(event) !== closeFingerprint(closing[0]!))) {
+        issues.add(`conflicting_${kind}_close`);
+        return null;
+      }
+    }
+    return closing[0]!;
+  };
+  for (const stepRows of byStep.values()) {
+    const host = oneClose(stepRows.filter(event => event.data.phase === 'host_step_finished'), 'host_step');
+    if (!host) continue;
+    const data = host.data;
+    const seq = Number(data.sourceUserSeq);
+    const requestKey = `${seq}:${data.requestOrdinal}`;
+    const dispatchAt = requests.get(requestKey);
+    const owner = attemptOwners.get(String(data.runAttemptId))!;
+    const ownerSource = sources.get(owner)!;
+    const bound = ownerSource.attempts.bounds.get(String(data.runAttemptId))!;
+    const endBound = bound.end ?? timestampMs(ownerSource.terminal);
+    if (hostRequestSteps.get(requestKey)!.size > 1) {
+      issues.add('duplicate_host_request_timing'); continue;
+    }
+    if (!timingNumber(data.at) || !timingNumber(data.durationMs)
+      || !['returned', 'failed', 'cancelled'].includes(String(data.outcome))
+      || dispatchAt === undefined || positiveEventSeq(data.requestOrdinal) === null
+      || bound.start === null || endBound === null || data.at > endBound
+      || data.at - data.durationMs < bound.start || dispatchAt > data.at
+      || dispatchAt < data.at - data.durationMs
+      || timestampMs(host) === null || timestampMs(host)! > endBound
+      || stepRows.some(row => row.data.sourceUserSeq !== seq || row.data.runAttemptId !== data.runAttemptId)) {
+      issues.add('unbounded_host_step_timing');
+      continue;
+    }
+    hostSteps += 1;
+    hostMs += data.durationMs;
+    observedAttemptSources.add(owner);
+    observedRequests.add(requestKey);
+    if (data.retired) issues.add('retired_host_step_timing');
+    const byCall = new Map<string, SessionEvent[]>();
+    for (const row of stepRows) {
+      if (row.data.phase === 'host_step_finished') continue;
+      if (typeof row.data.callId !== 'string' || !row.data.callId.trim()) {
+        issues.add('invalid_resilience_call_identity'); continue;
+      }
+      const group = byCall.get(row.data.callId) ?? [];
+      group.push(row);
+      byCall.set(row.data.callId, group);
+    }
+    let stepCalls = 0;
+    for (const [callId, callRows] of byCall) {
+      const call = oneClose(callRows.filter(event => event.data.phase === 'call_finished'), 'resilience_call');
+      if (!call) continue;
+      const total = call.data;
+      const callRequestKey = `${seq}:${total.requestOrdinal}`;
+      const callDispatchAt = requests.get(callRequestKey);
+      if (call.seq > host.seq || !timingNumber(total.at) || total.at > data.at) {
+        issues.add('late_resilience_call_timing'); continue;
+      }
+      if (callSteps.get(callId)!.size > 1) { issues.add('duplicate_resilience_call_identity'); continue; }
+      if (callDispatchAt === undefined || positiveEventSeq(total.requestOrdinal) === null
+        || total.requestOrdinal !== data.requestOrdinal
+        || !timingNumber(total.durationMs) || total.at - total.durationMs < data.at - data.durationMs
+        || total.at < callDispatchAt || !['returned', 'failed', 'cancelled', 'interrupted'].includes(String(total.outcome))
+        || !Number.isSafeInteger(total.attemptCount) || Number(total.attemptCount) < 0
+        || !Number.isSafeInteger(total.failedAttemptCount) || Number(total.failedAttemptCount) < 0
+        || Number(total.failedAttemptCount) > Number(total.attemptCount)
+        || !timingNumber(total.attemptMs) || !timingNumber(total.failedAttemptMs) || !timingNumber(total.retryWaitMs)
+        || total.failedAttemptMs > total.attemptMs || total.attemptMs + total.retryWaitMs > total.durationMs
+        || (total.requestAborted !== undefined && typeof total.requestAborted !== 'boolean')
+        || callRows.some(row => row.data.requestOrdinal !== undefined && row.data.requestOrdinal !== total.requestOrdinal)) {
+        issues.add('unbounded_resilience_call_timing'); continue;
+      }
+      calls += 1; stepCalls += 1;
+      callMs += total.durationMs;
+      attempts += Number(total.attemptCount); failed += Number(total.failedAttemptCount);
+      failedMs += total.failedAttemptMs; waitMs += total.retryWaitMs;
+      observedRequests.add(callRequestKey);
+      if (total.retired) { retiredCalls += 1; issues.add('retired_resilience_call_timing'); }
+      if (total.requestAborted === true) abortedCalls += 1;
+    }
+    if (stepCalls > 0) stepsWithCalls += 1;
+    else issues.add('physical_attempt_timing_unavailable_for_host_step');
+  }
+  if (hostSteps === 0) issues.add('model_timing_unavailable');
+  for (const source of sources.keys()) {
+    if (!observedAttemptSources.has(source)) issues.add(`timing_source_unobserved:${source}`);
+  }
+  if (provenanceAvailable && observedRequests.size < requests.size) issues.add('partial_host_request_timing');
+  if ([hostMs, callMs, attempts, failed, failedMs, waitMs].some(value => !timingNumber(value))) {
+    issues.add('model_timing_sum_overflow');
+    return { modelTiming: { scope: 'host_main_steps_only', coverage: 'partial', physicalAttemptCoverage: 'partial',
+      provenanceRequests: provenanceAvailable ? requests.size : null, observedRequests: observedRequests.size,
+      observedHostSteps: hostSteps, observedResilienceCalls: calls, hostStepMs: null, resilienceCallMs: null,
+      physicalAttemptCount: null, failedAttemptCount: null, failedAttemptMs: null, retryWaitMs: null,
+      retiredResilienceCalls: retiredCalls, requestAbortedResilienceCalls: abortedCalls, failedAttemptUsage: 'unknown' },
+      modelTimingIssues: [...issues] };
+  }
+  return { modelTiming: {
+    scope: 'host_main_steps_only',
+    coverage: hostSteps === 0 ? 'none' : issues.size > 0 ? 'partial' : 'observed_host_steps',
+    physicalAttemptCoverage: calls === 0 ? 'none' : issues.size > 0 || stepsWithCalls < hostSteps ? 'partial' : 'observed_calls',
+    provenanceRequests: provenanceAvailable ? requests.size : null,
+    observedRequests: observedRequests.size, observedHostSteps: hostSteps, observedResilienceCalls: calls,
+    hostStepMs: hostSteps > 0 ? hostMs : null, resilienceCallMs: calls > 0 ? callMs : null,
+    physicalAttemptCount: calls > 0 ? attempts : null, failedAttemptCount: calls > 0 ? failed : null,
+    failedAttemptMs: calls > 0 ? failedMs : null, retryWaitMs: calls > 0 ? waitMs : null,
+    retiredResilienceCalls: retiredCalls, requestAbortedResilienceCalls: abortedCalls, failedAttemptUsage: 'unknown',
+  }, modelTimingIssues: [...issues] };
 }
 
 function readDiscoveryForSource(
@@ -805,8 +1066,11 @@ export function measureAcceptedTurn(
     malformedEventPayloads: sessionRead.malformedEventPayloads,
     malformedUsageLines: usageRead.malformedUsageLines,
   });
+  const timing = measureModelTiming(dbPath, sessionId, sessionRead.events,
+    new Map([[sourceUserSeq, { source, attempts, terminal }]]));
   return {
     ...measured,
+    ...timing,
     sourceUserSeq,
     acceptedSource,
     terminalSeq: terminal.seq,
@@ -1056,8 +1320,19 @@ export function measureAcceptedTask(
       waits.push([requested, resolved]);
     }
   }
+  const timing = measureModelTiming(dbPath, sessionId, sessionRead.events, new Map(
+    [...members].map(([seq, source]) => [seq, {
+      source, attempts: attemptsBySource.get(seq)!, terminal: terminals.get(seq),
+    }]),
+  ), isAncestor);
+  if (lineageIssues.size > 0) {
+    timing.modelTimingIssues.push('unproved_task_timing_lineage');
+    if (timing.modelTiming.coverage !== 'none') timing.modelTiming.coverage = 'partial';
+    if (timing.modelTiming.physicalAttemptCoverage !== 'none') timing.modelTiming.physicalAttemptCoverage = 'partial';
+  }
   return {
     ...measured,
+    ...timing,
     // SessionMeasurement's wall helper means one turn; never relabel its last
     // segment as the whole task. Explicit task/segment timings follow below.
     turnWallMs: null,
@@ -1236,6 +1511,25 @@ function keyedRows(
     .map((key) => row(`  ${key}`, baseline[key] ?? 0, candidate[key] ?? 0));
 }
 
+function modelTimingRows(b?: ModelTimingMeasurement, c?: ModelTimingMeasurement): string[] {
+  if (!b && !c) return [];
+  return ['', 'Observed host-main timing diagnostics',
+    `Host-step coverage: ${b?.coverage ?? 'none'} → ${c?.coverage ?? 'none'}; physical-call coverage: ${b?.physicalAttemptCoverage ?? 'none'} → ${c?.physicalAttemptCoverage ?? 'none'}`,
+    row('Dispatch provenance requests', b?.provenanceRequests ?? null, c?.provenanceRequests ?? null),
+    row('Observed host-main steps', b?.observedHostSteps ?? null, c?.observedHostSteps ?? null),
+    row('Summed observed host-main step time', b?.hostStepMs ?? null, c?.hostStepMs ?? null, duration),
+    row('Observed resilience calls', b?.observedResilienceCalls ?? null, c?.observedResilienceCalls ?? null),
+    row('Summed observed resilience call time', b?.resilienceCallMs ?? null, c?.resilienceCallMs ?? null, duration),
+    row('Observed physical attempts', b?.physicalAttemptCount ?? null, c?.physicalAttemptCount ?? null),
+    row('Observed failed physical attempts', b?.failedAttemptCount ?? null, c?.failedAttemptCount ?? null),
+    row('Summed observed failed-attempt time', b?.failedAttemptMs ?? null, c?.failedAttemptMs ?? null, duration),
+    row('Summed observed retry-wait time', b?.retryWaitMs ?? null, c?.retryWaitMs ?? null, duration),
+    row('Observed retired resilience calls', b?.retiredResilienceCalls ?? null, c?.retiredResilienceCalls ?? null),
+    row('Observed request-aborted resilience calls', b?.requestAbortedResilienceCalls ?? null, c?.requestAbortedResilienceCalls ?? null),
+    'These sums may overlap. They exclude unobserved roles and are not task wall time or billable time.',
+    'Failed-attempt token usage and billing remain unknown; timing adds no token totals.'];
+}
+
 export function formatSessionComparison(comparison: SessionComparison): string {
   const { baseline: b, candidate: c } = comparison;
   const lines = [
@@ -1338,9 +1632,13 @@ export function formatAcceptedTurnComparison(comparison: AcceptedTurnComparison)
     '',
     'Discovery governor claims by outcome',
     ...keyedRows(b.discoveryClaimsByOutcome, c.discoveryClaimsByOutcome),
+    ...modelTimingRows(b.modelTiming, c.modelTiming),
   ];
   const warnings: string[] = [];
   for (const measurement of [b, c]) {
+    if (measurement.modelTimingIssues?.length) {
+      warnings.push(`${measurement.acceptedSource}: model timing is observational/incomplete: ${measurement.modelTimingIssues.join(', ')}.`);
+    }
     if (!measurement.usageAttributionCertified) {
       warnings.push(`${measurement.acceptedSource}: usage is ${measurement.usageAttribution}; certification issues: ${measurement.usageCertificationIssues.join(', ') || 'unknown'}.`);
     }
@@ -1403,9 +1701,13 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
     row('Summed SDK latency', b.sdkDurationMs, c.sdkDurationMs, duration),
     row('Summed provider latency', b.providerDurationMs, c.providerDurationMs, duration),
     '', 'Usage records by model', ...keyedRows(b.usageRecordsByModel, c.usageRecordsByModel),
+    ...modelTimingRows(b.modelTiming, c.modelTiming),
   ];
   const warnings: string[] = [];
   for (const measurement of [b, c]) {
+    if (measurement.modelTimingIssues?.length) {
+      warnings.push(`${measurement.acceptedSource}: model timing is observational/incomplete: ${measurement.modelTimingIssues.join(', ')}.`);
+    }
     if (!measurement.usageAttributionCertified) {
       warnings.push(`${measurement.acceptedSource}: incomplete attribution; proven totals are a lower bound, not comparable whole-task cost. ${measurement.usageCertificationIssues.join(', ')}.`);
     }

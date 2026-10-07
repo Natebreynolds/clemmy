@@ -98,12 +98,12 @@ test('explicit successful no-op is retained without interpreting records or pros
   assert.notEqual(classifyAttemptOutcome({ envelopeSuccessful: false, providerNoChange: true }).kind, 'succeeded');
 });
 
-test('a refused provider envelope is recognised as the carrier returns it, as JSON text or as an object', async () => {
+test('host no-effect steering reads the settled trusted proof, never a generic unsuccessful envelope', async () => {
   const { providerRefusedExactRequest } = await import('./attempt-settlement.js');
-  const envelope = { data: { message: 'Slack API error: not_found', status_code: 200 }, error: 'Slack API error: not_found', successful: false };
-  assert.equal(providerRefusedExactRequest(envelope), true);
-  assert.equal(providerRefusedExactRequest(JSON.stringify(envelope)), true);
-  assert.equal(providerRefusedExactRequest({ data: { ok: true }, successful: true }), false);
-  assert.equal(providerRefusedExactRequest({ error: 'timeout', successful: false }), false, 'no transport status stays uncertain');
-  assert.equal(providerRefusedExactRequest('not json'), false);
+  const { classifyAttemptOutcome } = await import('./attempt-outcome.js');
+  assert.equal(providerRefusedExactRequest(classifyAttemptOutcome({ providerRejectedBeforeEffect: true, mutating: true })), true);
+  for (const status of [200, 400, 404, 500]) {
+    assert.equal(providerRefusedExactRequest(classifyAttemptOutcome({ httpStatus: status, envelopeSuccessful: false, mutating: true })), false);
+  }
+  assert.equal(providerRefusedExactRequest(classifyAttemptOutcome({ providerRejectedBeforeEffect: true, providerEnvelopeContradicted: true, mutating: true })), false);
 });

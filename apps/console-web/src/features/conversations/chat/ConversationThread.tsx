@@ -173,6 +173,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
               onRevisePlan={() => { chat.setComposerMode('plan'); composerRef.current?.focus(); }}
               onApprove={() => resolveDecision(m, 'approve')}
               onReject={() => resolveDecision(m, 'reject')}
+              onApproveWithEdits={(fields) => chat.approveWithEdits(m, fields)}
               onPreparePlan={chat.preparePlan}
               // Suggested answers stay tappable only while the question is the
               // newest message; once anything follows it, they are a record.

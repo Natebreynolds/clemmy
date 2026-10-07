@@ -165,9 +165,9 @@ test('a mutating platform-management uncertain_write still vetoes delivered busi
 // answered; there is nothing to recover. The account of it is the completion
 // review's to judge.
 test('a mutation the provider refused in its envelope, projected as a failed write, is answered — not unrecovered', () => {
-  const refused = () => outcomes.classifyAttemptOutcome({ httpStatus: 200, envelopeSuccessful: false, mutating: true, acknowledged: false });
+  const refused = () => outcomes.classifyAttemptOutcome({ httpStatus: 200, envelopeSuccessful: false, mutating: true, acknowledged: false, providerRejectedBeforeEffect: true });
   assert.equal(refused().kind, 'invalid_arguments');
-  assert.equal(refused().detail, 'envelope_rejected');
+  assert.equal(refused().detail, 'provider_rejected_before_effect');
 
   const accepted = acceptedSource('audit-answered-refusal', 'Delete that reminder.');
   settleCall(accepted, 'refused-delete', 'SLACK_DELETE_REMINDER', { reminder: 'Rm1' }, refused(), true,

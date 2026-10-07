@@ -365,29 +365,13 @@ export function externalWriteTerminalForAttemptOutcome(
     return 'external_write_succeeded';
   }
   if (physicalOutcome === 'not_started') return 'external_write_failed';
-  // The classifier's providerStatus is machine-structured, but durable
-  // transports may preserve an HTTP status as a decimal string. Accept that
-  // exact representation without ever guessing from prose/error messages.
-  const rawStatus = outcome.providerStatus;
-  const status = typeof rawStatus === 'number'
-    ? rawStatus
-    : typeof rawStatus === 'string' && /^\d{3}$/.test(rawStatus.trim())
-      ? Number(rawStatus.trim())
-      : Number.NaN;
-  if (
-    (physicalOutcome === 'returned' || physicalOutcome === 'threw')
-    && outcome.evidence === 'structured'
-    && [400, 401, 403, 404, 405, 422, 501].includes(status)
-  ) return 'external_write_failed';
-  // The provider answered 2xx and refused the exact request at its own layer
-  // (the classifier's `envelope_rejected`): nothing landed, by the provider's
-  // own verdict. Leaving it orphaned made every later turn read "an
-  // irreversible write that hasn't been reconciled" over a delete that Slack
-  // had just called not_found (live 2026-10-06).
+  // Only settled trusted adapter proof can close a dispatched mutation as
+  // failed. HTTP status and generic unsuccessful envelopes remain uncertain.
   if (
     physicalOutcome === 'returned'
-    && outcome.evidence === 'structured'
-    && outcome.detail === 'envelope_rejected'
+    && outcome.kind === 'invalid_arguments'
+    && outcome.evidence === 'nominal'
+    && outcome.detail === 'provider_rejected_before_effect'
   ) return 'external_write_failed';
   return 'external_write_orphaned';
 }

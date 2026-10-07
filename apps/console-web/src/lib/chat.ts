@@ -1,5 +1,5 @@
 import { acceptReplayEvent, copyReplayCursor, createReplayCursor, pollRecentReplayPages, type ReplayCursor } from './replay-cursor';
-import { readLiveApprovalControl } from '@clem/chat-engine';
+import { readChatStopReceipt, readLiveApprovalControl, type ChatStopReceipt } from '@clem/chat-engine';
 import type { TaskMode } from './task-mode';
 /**
  * Chat plumbing — ports the legacy console's chat-dock streaming
@@ -8,7 +8,7 @@ import type { TaskMode } from './task-mode';
  * and a /events/recent JSON fallback so a finished run is never lost to a
  * dropped socket. All same-origin; auth via the session cookie.
  */
-import { apiPost } from './api';
+import { apiGet, apiPost } from './api';
 import { getAuthToken } from './bootstrap';
 import type { HarnessEvent, ChatPostResult, AttachResult } from './types';
 
@@ -158,17 +158,35 @@ export function chatCancelEndpoint(
   return `/api/console/harness-sessions/${encodeURIComponent(accepted.sessionId)}/cancel?${query.toString()}`;
 }
 
+/** Reopen control authority must name the source being displayed. A newer
+ * attempt in the same reusable conversation is not permission to stop it. */
+export function reattachedRunControl(value: unknown, sessionId: string, sourceUserSeq: number): ChatPostResult | null {
+  const row = value as Record<string, unknown> | null;
+  if (!row || row.sessionId !== sessionId || row.sourceUserSeq !== sourceUserSeq
+    || typeof row.attemptId !== 'string' || !row.attemptId.trim()
+    || typeof row.runScopeId !== 'string' || !row.runScopeId.trim()
+    || typeof row.cancelEndpoint !== 'string' || !row.cancelEndpoint.startsWith('/api/')
+    || typeof row.backgroundEndpoint !== 'string' || !row.backgroundEndpoint.startsWith('/api/')) return null;
+  return { sessionId, streamUrl: `/api/sessions/${encodeURIComponent(sessionId)}/events`, status: 'started', mode: 'reattached',
+    attemptId: row.attemptId, runScopeId: row.runScopeId, cancelEndpoint: row.cancelEndpoint, backgroundEndpoint: row.backgroundEndpoint };
+}
+
+export async function getReattachedRunControl(sessionId: string, sourceUserSeq: number): Promise<ChatPostResult | null> {
+  const result = await apiGet<{ activeRun?: unknown }>(`/api/sessions/${encodeURIComponent(sessionId)}/control?sourceUserSeq=${sourceUserSeq}`);
+  return reattachedRunControl(result.activeRun, sessionId, sourceUserSeq);
+}
+
 interface IdempotentControlOptions {
   transport?: (path: string, body: unknown) => Promise<unknown>;
   retryDelaysMs?: number[];
   wait?: (ms: number) => Promise<void>;
 }
 
-async function postIdempotentControl(
+async function postIdempotentControlReceipt(
   endpoint: string,
   body: unknown,
   options: IdempotentControlOptions,
-): Promise<boolean> {
+): Promise<ChatStopReceipt> {
   const transport = options.transport ?? ((path: string, payload: unknown) => apiPost(path, payload));
   const retryDelaysMs = options.retryDelaysMs ?? [250, 750, 1_500];
   const wait = options.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -176,24 +194,34 @@ async function postIdempotentControl(
   while (true) {
     try {
       const result = await transport(endpoint, body);
-      return !result || typeof result !== 'object' || (result as { ok?: unknown }).ok !== false;
+      return readChatStopReceipt(result);
     } catch (error) {
       const status = Number((error as { status?: unknown } | null)?.status);
       const retryable = status === 0 || status >= 500 || (!Number.isFinite(status) && error instanceof TypeError);
-      if (!retryable || attempt >= retryDelaysMs.length) return false;
+      if (!retryable || attempt >= retryDelaysMs.length) return { confirmed: false };
       await wait(retryDelaysMs[attempt]);
       attempt += 1;
     }
   }
 }
 
+async function postIdempotentControl(endpoint: string, body: unknown, options: IdempotentControlOptions): Promise<boolean> {
+  return (await postIdempotentControlReceipt(endpoint, body, options)).confirmed;
+}
+
+export async function cancelSessionDetailed(
+  accepted: Pick<ChatPostResult, 'sessionId' | 'attemptId' | 'runScopeId' | 'cancelEndpoint'>,
+  options: IdempotentControlOptions = {},
+): Promise<ChatStopReceipt> {
+  const endpoint = chatCancelEndpoint(accepted);
+  return endpoint ? postIdempotentControlReceipt(endpoint, undefined, options) : { confirmed: false };
+}
+
 export async function cancelSession(
   accepted: Pick<ChatPostResult, 'sessionId' | 'attemptId' | 'runScopeId' | 'cancelEndpoint'>,
   options: IdempotentControlOptions = {},
 ): Promise<boolean> {
-  const endpoint = chatCancelEndpoint(accepted);
-  if (!endpoint) return false;
-  return postIdempotentControl(endpoint, undefined, options);
+  return (await cancelSessionDetailed(accepted, options)).confirmed;
 }
 
 /** Stop authority for the window before POST /api/harness/chat returns an
@@ -411,11 +439,12 @@ export function watchForLateCompletion(
   sessionId: string,
   sinceSeq: number,
   onEvent: (ev: HarnessEvent) => void,
-  opts: { intervalMs?: number; maxAttempts?: number; replayCursor?: ReplayCursor } = {},
+  opts: { intervalMs?: number; maxAttempts?: number; replayCursor?: ReplayCursor; shouldStopOnTerminal?(event: HarnessEvent): boolean } = {},
 ): { cancel: () => void } {
   const intervalMs = opts.intervalMs ?? 15_000;
   const maxAttempts = opts.maxAttempts ?? 40; // ~10 minutes
   let cancelled = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
   const replayCursor = opts.replayCursor ? copyReplayCursor(opts.replayCursor) : createReplayCursor(sinceSeq);
   let attempt = 0;
   const tick = async () => {
@@ -431,15 +460,16 @@ export function watchForLateCompletion(
         },
         onEvent: (event) => {
           onEvent(event);
-          if (isTerminalEvent(event.type) && !readLiveApprovalControl(event)) cancelled = true;
+          if (isTerminalEvent(event.type) && !readLiveApprovalControl(event)
+            && (opts.shouldStopOnTerminal?.(event) ?? true)) cancelled = true;
           return !cancelled;
         },
       });
     } catch { /* daemon still down — keep this continuation for the next poll */ }
-    if (!cancelled && attempt < maxAttempts) setTimeout(() => { void tick(); }, intervalMs);
+    if (!cancelled && attempt < maxAttempts) timer = setTimeout(() => { timer = null; void tick(); }, intervalMs);
   };
-  setTimeout(() => { void tick(); }, intervalMs);
-  return { cancel: () => { cancelled = true; } };
+  timer = setTimeout(() => { timer = null; void tick(); }, intervalMs);
+  return { cancel: () => { cancelled = true; if (timer) clearTimeout(timer); timer = null; } };
 }
 
 /**
@@ -476,19 +506,23 @@ export function subscribeDelegatedActivity(
    *  conversation's own stream, so it is the one own-session frame an idle
    *  chat still has to hear. */
   onTaskState?: (ev: HarnessEvent) => void,
+  onOwnEvent?: (ev: HarnessEvent, observeReply: boolean) => void,
 ): () => void {
   let closed = false;
   let es: EventSource | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let ownCursor: number | null = null;
 
   const connect = () => {
     if (closed) return;
     es = new EventSource(withToken(`/api/sessions/${encodeURIComponent(sessionId)}/events`));
-    const handleForeign = (ev: HarnessEvent) => {
+    const handleForeign = (ev: HarnessEvent, observeReply = true) => {
       if (!ev || typeof ev.type !== 'string') return;
       if (!ev.sessionId || ev.sessionId === sessionId) {
         // Own-turn frames belong to the turn stream.
         if (ev.type === 'delegated_task_state') onTaskState?.(ev);
+        onOwnEvent?.(ev, observeReply);
+        if (ev.seq > 0) ownCursor = Math.max(ownCursor ?? 0, ev.seq);
         return;
       }
       onEvent(ev);
@@ -496,7 +530,12 @@ export function subscribeDelegatedActivity(
     es.addEventListener('replay', (e) => {
       try {
         const payload = JSON.parse((e as MessageEvent).data) as { events?: HarnessEvent[] };
-        for (const ev of unreportedReplay(sessionId, payload.events ?? [])) handleForeign(ev);
+        const priorCursor = ownCursor;
+        for (const ev of unreportedReplay(sessionId, payload.events ?? [])) {
+          // Initial history already has its reply bubbles. Card state is safe
+          // to reconcile; reconnects additionally catch replies missed offline.
+          handleForeign(ev, priorCursor !== null && ev.seq > priorCursor);
+        }
       } catch { /* malformed frame — skip */ }
     });
     es.addEventListener('event', (e) => {

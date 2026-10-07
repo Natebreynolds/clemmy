@@ -44,6 +44,8 @@ import {
   type TimelineBounds,
   turnModelOffer,
   turnReview,
+  readChatStopReceipt,
+  workflowStopNotice,
   type ActivityItem,
   type ModelRuleOffer,
   type ChatMessage,
@@ -55,15 +57,18 @@ import {
   type WorkflowCardData,
   APPROVAL_ANSWER_WORDS,
   hiddenCardDecision,
+  editableApprovalField,
+  ApprovalDecisionGate,
 } from '@clem/chat-engine';
 import {
   answerModelRuleOffer,
   approvePlanProposal,
-  cancelActiveChat,
   cancelChatRequest,
+  cancelChatTurn,
   createChatStreamTransport,
   freshIdempotencyKey,
   getChatSession,
+  getChatRunControl,
   listAgents,
   rejectPlanProposal,
   sendChatMessageAsync,
@@ -79,6 +84,7 @@ import { replySpeakers } from '../lib/chat-speakers';
 import { refusalWords } from '../lib/project-words';
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
+import { stopObservedChatTurn, stopQualificationOwnsChat } from '../lib/chat-control';
 import { getNextAnsweringModel, getModelSettings, type NextAnsweringModel, type BrainOptionRow } from '../lib/api';
 import { useKeyboardInset } from '../lib/use-keyboard-inset';
 import { BrainSheet } from '../components/BrainSheet';
@@ -169,7 +175,9 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const [composerMode, setComposerMode] = useState<ComposerMode>('normal');
   const [planActing, setPlanActing] = useState<string | null>(null);
   const [approvalActing, setApprovalActing] = useState<string | null>(null);
+  const approvalGate = useRef(new ApprovalDecisionGate());
   const [stopping, setStopping] = useState(false);
+  const stopOwnerRef = useRef<{ sessionId: string; key: string | null; sourceUserSeq: number | null } | null>(null);
   const [planOutcome, setPlanOutcome] = useState<Record<string, 'approved' | 'rejected' | undefined>>({});
   const [error, setError] = useState<string | null>(null);
   // §6a: a compact brain chip in the chat header — the same live catalog
@@ -186,6 +194,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     transport: createChatStreamTransport(),
     sessionId: initialSessionId ?? null,
     agentId: boundAgentId,
+    observeWhileIdle: true,
     pendingStore: createPendingMessageStore(localStorage, `clem.pending.mobile:${initialSessionId ?? 'new'}`),
     api: {
       send: async ({ message, sessionId, idempotencyKey, connectionRequestId, steerOnly, taskMode, agentId, attachments }) => {
@@ -269,10 +278,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const planning = busy ? snapshot?.activeTaskMode?.kind === 'plan' : composerMode === 'plan';
   const executing = busy && snapshot?.activeTaskMode?.kind === 'execute';
   const connection = snapshot?.connection ?? 'idle';
-  // Present only while this client owns the in-flight turn. A turn adopted
-  // from another surface has no key here, so the button stays a plain busy
-  // indicator rather than a control that would silently do nothing.
+  // Local sends cancel by request key, including before acceptance. A
+  // reopened/other-device source first recovers its exact attempt identity.
   const cancelKey = snapshot?.cancelKey ?? null;
+  const activeSourceUserSeq = snapshot?.activeSourceUserSeq ?? null;
   const canStop = busy && Boolean(snapshot?.sessionId);
   // A Space dock takes no agent; everything else can switch at any time.
   const takesAgent = !(snapshot?.sessionId ?? initialSessionId ?? '').startsWith('space-');
@@ -399,18 +408,56 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   }
   const followingTail = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
-  useEffect(() => { if (!busy) setStopping(false); }, [busy]);
+  useEffect(() => {
+    const owner = stopOwnerRef.current;
+    if (!busy || (owner && (owner.sessionId !== snapshot?.sessionId
+      || (owner.key ? owner.key !== cancelKey : owner.sourceUserSeq !== activeSourceUserSeq)))) {
+      stopOwnerRef.current = null;
+      setStopping(false);
+    }
+  }, [busy, cancelKey, activeSourceUserSeq, snapshot?.sessionId]);
 
   function stopTurn() {
     const key = cancelKey;
     const session = snapshot?.sessionId;
-    if (!session || stopping) return;
+    if (!session || stopping || stopOwnerRef.current) return;
+    const owner = { sessionId: session, key, sourceUserSeq: activeSourceUserSeq,
+      acceptedSeqAtStop: engine.snapshot().messages.reduce((seq, message) => message.acceptedSource?.sessionId === session
+        ? Math.max(seq, message.acceptedSource.sourceUserSeq) : seq, 0) };
+    const stillCurrent = () => {
+      const current = engine.snapshot();
+      return current.busy && current.sessionId === session && (key
+        ? current.cancelKey === key
+        : current.cancelKey === null && current.activeSourceUserSeq === owner.sourceUserSeq);
+    };
+    stopOwnerRef.current = owner;
     setStopping(true);
     haptic('light');
+    let stopReceipt: ReturnType<typeof readChatStopReceipt> | undefined;
     const stop = key
-      ? cancelChatRequest(session, key)
-      : cancelActiveChat(session);
-    void stop.catch((err) => {
+      ? cancelChatRequest(session, key).then(result => {
+        if (!result.ok) throw new Error('Stop was not confirmed for this request. Try again after refreshing the conversation.');
+        stopReceipt = readChatStopReceipt(result);
+        return true;
+      })
+      : stopObservedChatTurn({ sessionId: session, sourceUserSeq: owner.sourceUserSeq, stillCurrent,
+        readControl: getChatRunControl, cancelExact: async (sid, attemptId) => {
+          const result = await cancelChatTurn(sid, attemptId);
+          stopReceipt = readChatStopReceipt(result);
+          return result;
+        } });
+    void stop.then(() => {
+      const current = engine.snapshot();
+      if (stopReceipt && stopQualificationOwnsChat(owner, current)) {
+        const pending = current.messages.find(message => message.delegatedWork?.sourceUserSeq === owner.sourceUserSeq)?.delegatedWork?.runIds;
+        const notice = workflowStopNotice(stopReceipt, pending);
+        if (notice) setError(notice);
+      }
+      if (stopOwnerRef.current === owner) stopOwnerRef.current = null;
+    }).catch((err) => {
+      if (stopOwnerRef.current !== owner) return;
+      stopOwnerRef.current = null;
+      if (!stillCurrent()) return;
       // Leaving `stopping` latched would strand the only control the user
       // has; the turn is still running, so hand the button back.
       setStopping(false);
@@ -502,41 +549,45 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   /**
    * Decide a tool approval from inside the transcript.
    *
-   * Sent as ordinary chat text, not through the approval endpoint:
-   * `approval_requested` is TERMINAL for the stream, and only engine.send()
-   * re-attaches it. Resolving via the endpoint would leave the transcript
-   * frozen, so the tap would look like it did nothing.
+   * Ordinary answers go through chat; exact edits use the approval endpoint.
+   * The mounted observer follows both paths through the host's resolution
+   * and eventual reply, including a decision made on the other device.
    *
    * No catch — engine.send() does not reject; a failed post marks the user row
    * failed and the existing retry/discard affordance takes over.
    */
   async function actOnApprovalWithEdits(approvalId: string, fields: Record<string, string>) {
-    if (approvalActing) return;
-    setApprovalActing(approvalId);
-    setError(null);
-    haptic('success');
-    try {
-      // The edited record runs; the card's stream shows the decision and the ending.
-      await approveApprovalWithFields(approvalId, fields);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'That edit could not be sent.');
-    } finally {
-      setApprovalActing(null);
-    }
+    await approvalGate.current.run(async () => {
+      setApprovalActing(approvalId);
+      setError(null);
+      try {
+        // Poll the live cursor before the mutation, and again afterwards. The
+        // mounted engine keeps observing the card through its eventual result.
+        engine.resume();
+        await approveApprovalWithFields(approvalId, fields);
+        engine.resume();
+        haptic('success');
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'That edit could not be sent. Your edit is still here.');
+      } finally {
+        setApprovalActing(null);
+      }
+    });
   }
 
   async function actOnApproval(approvalId: string, decision: 'approve' | 'reject') {
     const reply = chatApprovalReply(decision, approvalId);
-    if (!reply || approvalActing) return;
-    setApprovalActing(approvalId);
-    setError(null);
-    haptic(decision === 'approve' ? 'success' : 'warning');
-    try {
-      // The card shows the decision; the exchange itself stays out of sight.
-      await engine.send(reply, undefined, { cardDecision: { approvalId, decision } });
-    } finally {
-      setApprovalActing(null);
-    }
+    if (!reply) return;
+    await approvalGate.current.run(async () => {
+      setApprovalActing(approvalId);
+      setError(null);
+      haptic(decision === 'approve' ? 'success' : 'warning');
+      try {
+        await engine.send(reply, undefined, { cardDecision: { approvalId, decision } });
+      } finally {
+        setApprovalActing(null);
+      }
+    });
   }
 
   return (
@@ -852,7 +903,7 @@ function MessageRow({
     // Edit by hand: the longest field the card shows, on a queued card only
     // (the phone's approve endpoint edits the queued record behind the card).
     const editableField = message.approval.queued && message.approval.preview && !message.approval.preview.items
-      ? [...message.approval.preview.fields].filter((f) => !f.label).sort((a, b) => b.value.length - a.value.length)[0] ?? null
+      ? editableApprovalField(message.approval.preview)
       : null;
     return (
       <div class={`turn turn-approval${ask ? ' is-voiced' : ''}`}>
@@ -893,7 +944,7 @@ function MessageRow({
           // what was typed, checked the same way first (owner-approved design).
           <div class="approval-edit">
             <label class="approval-edit-label" for={`edit-${approvalId}`}>{approvalFieldLabel(editableField.name)}</label>
-            <textarea id={`edit-${approvalId}`} class="approval-edit-field" rows={3} value={editedValue}
+            <textarea id={`edit-${approvalId}`} class="approval-edit-field" rows={3} value={editedValue} disabled={approvalActing !== null}
               onInput={(e) => setEditedValue((e.currentTarget as HTMLTextAreaElement).value)} />
             <div class="answer-choices" role="group" aria-label="Your answer">
               <button type="button" class="answer-choice" disabled={approvalActing !== null || !editedValue.trim() || editedValue === editableField.value}
@@ -945,7 +996,7 @@ function MessageRow({
             <div class="approval-confirm-clem"><span class="approval-confirm-mark is-clem" aria-hidden="true">C</span><span>{message.approval.confirm.question}</span></div>
           </div>
         ) : null}
-        {approvalId && !approvalDecided && ask ? (
+        {editing && !approvalDecided ? null : approvalId && !approvalDecided && ask ? (
           <div class="answer-choices" role="group" aria-label="Your answer">
             <button type="button" class="answer-choice" disabled={approvalActing !== null}
               onClick={() => onApprovalAction(approvalId, 'approve')}>

@@ -1478,7 +1478,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .approval-edit-link { margin-top: var(--sp-3); min-height: 32px; padding: 4px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--accent); font-size: var(--t-sm); font-weight: 600; }
 .approval-edit { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 .approval-edit-label { font-size: var(--t-xs); color: var(--fg-2); }
-.approval-edit-field { width: 100%; box-sizing: border-box; padding: 8px 10px; border: 1px solid var(--accent); border-radius: 8px; background: var(--bg, #fff); color: var(--fg); font-size: var(--t-sm); line-height: 1.5; resize: vertical; }
+.approval-edit-field { width: 100%; box-sizing: border-box; padding: 8px 10px; border: 1px solid var(--accent); border-radius: 8px; background: var(--bg, #fff); color: var(--fg); font-size: 16px; line-height: 1.5; resize: vertical; }
 .approval-check { margin: 8px 0 0; font-size: var(--t-sm); color: var(--fg-2); }
 .approval-check-warn { color: var(--fg); padding: 8px 10px; border-radius: 8px; border: 1px solid var(--clem-warning); background: var(--warn-soft); }
 .approval-check-title { font-weight: 600; color: var(--clem-warning); }

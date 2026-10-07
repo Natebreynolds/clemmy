@@ -1,6 +1,6 @@
 import { boundedModelId, modelDisplayName } from './model-name.js';
 import { readLiveApprovalControl } from './live-approval-control.js';
-import type { ActivityItem, HarnessEvent, WorkflowCardStep } from './types.js';
+import type { ActivityItem, ChatStopReceipt, DelegatedWorkControl, HarnessEvent, WorkflowCardStep, WorkflowStopQualification } from './types.js';
 import { humanToolLabel, salientArgDetail } from './tool-labels.js';
 import { applyWriteEvent, writeRowKey, writeRowLabel, writeRowStatus, writeRowTone } from './write-ledger.js';
 import { workPlanActivityItem } from './work-plan-presentation.js';
@@ -53,6 +53,165 @@ export const REUSED_RESULT_LABEL = 'Reused earlier result';
  * "thinking" rows while still letting each new route/heartbeat move the live
  * headline forward. The presenter hides this row once the turn settles. */
 export const MODEL_PHASE_ACTIVITY_ID = 'model-phase-live';
+
+const MODEL_RETRY_LABELS = {
+  connection: 'The model connection was interrupted. Retrying…',
+  busy: 'The model is temporarily unavailable. Retrying…',
+  auth: 'Refreshing the model sign-in. Retrying…',
+  empty: 'The model returned no usable reply. Retrying…',
+  request: 'Adjusting the model request. Retrying…',
+} as const;
+const MODEL_RETRY_LABEL_SET: ReadonlySet<string> = new Set(Object.values(MODEL_RETRY_LABELS));
+const MODEL_PROGRESS_EVENTS: ReadonlySet<string> = new Set([
+  'turn_started', 'turn_model_routed', 'step_started', 'tool_called', 'tool_returned',
+  'worker_started', 'worker_result', 'batch_started', 'batch_progress', 'batch_completed',
+  'coding_run_activity', 'coding_run_settled',
+]);
+
+/** These durable beats prove progress beyond an older scheduled model retry. */
+export function isModelRetryProgressBoundary(ev: HarnessEvent): boolean {
+  return MODEL_PROGRESS_EVENTS.has(ev.type);
+}
+
+/** Accept only the bounded public retry contract, never journal diagnostics. */
+export function readModelRetryProgress(ev: HarnessEvent): { sourceUserSeq: number; label: string } | null {
+  if (ev.type !== 'model_resilience_observed') return null;
+  const d = ev.data ?? {};
+  if (d.phase !== 'retry' || !Number.isSafeInteger(d.sourceUserSeq) || Number(d.sourceUserSeq) <= 0
+    || !Number.isSafeInteger(ev.seq) || ev.seq <= Number(d.sourceUserSeq)
+    || typeof d.reasonCode !== 'string' || !Object.hasOwn(MODEL_RETRY_LABELS, d.reasonCode)) return null;
+  return { sourceUserSeq: Number(d.sourceUserSeq), label: MODEL_RETRY_LABELS[d.reasonCode as keyof typeof MODEL_RETRY_LABELS] };
+}
+
+/** Real work clears a retry message without manufacturing another phase row. */
+export function clearModelRetryProgress(prev: ActivityItem[], now: () => number = Date.now): ActivityItem[] {
+  return prev.some((row) => row.id === MODEL_PHASE_ACTIVITY_ID && MODEL_RETRY_LABEL_SET.has(row.label))
+    ? upsertModelPhase(prev, 'Working on it…', now)
+    : prev;
+}
+
+/** A queue admission has the exact public identity; it is not execution proof. */
+export function readWorkflowQueueDispatch(ev: HarnessEvent): DelegatedWorkControl | null {
+  if (ev.type !== 'async_work_dispatched') return null;
+  const d = ev.data ?? {};
+  const runIds = d.runIds;
+  if (d.version !== 2 || d.kind !== 'workflow_run_group' || d.status !== 'dispatched'
+    || !Number.isSafeInteger(d.sourceUserSeq) || Number(d.sourceUserSeq) <= 0
+    || !Number.isSafeInteger(ev.seq) || ev.seq <= Number(d.sourceUserSeq)
+    || typeof d.sourceGroupId !== 'string' || !/^workflow-origin-group-v1:[a-f0-9]{64}$/.test(d.sourceGroupId)
+    || typeof d.sourceGroupDigest !== 'string' || !/^[a-f0-9]{64}$/.test(d.sourceGroupDigest)
+    || typeof d.replyTargetDigest !== 'string' || !/^[a-f0-9]{64}$/.test(d.replyTargetDigest)
+    || d.dispatchKey !== `workflow_source_group:${d.sourceGroupId}:${d.sourceGroupDigest}`
+    || !Array.isArray(runIds) || !runIds.length
+    || runIds.some(id => typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/.test(id))
+    || new Set(runIds).size !== runIds.length) return null;
+  return { sourceUserSeq: Number(d.sourceUserSeq), runIds: [...runIds], state: 'running',
+    execution: 'queued', startedRunIds: [], dispatchKey: String(d.dispatchKey), progressSeq: Number(d.sourceUserSeq) };
+}
+
+export function workflowDispatchText(work: DelegatedWorkControl): string {
+  const started = work.startedRunIds?.length ?? 0;
+  if (!started) return work.runIds.length === 1
+    ? 'Queued — waiting for the workflow to start. I’ll post the result here when it’s ready.'
+    : `Queued ${work.runIds.length} workflows — waiting to start. I’ll post one combined result here when they’re ready.`;
+  return work.runIds.length === 1
+    ? 'The workflow has started. I’ll post the result here when it’s ready.'
+    : `${started} of ${work.runIds.length} workflows have started. I’ll post one combined result here when they’re ready.`;
+}
+
+export function workflowDispatchLabel(work: DelegatedWorkControl): string {
+  const started = work.startedRunIds?.length ?? 0;
+  return !started
+    ? work.runIds.length === 1 ? 'Workflow queued — waiting to start' : `${work.runIds.length} workflows queued — waiting to start`
+    : work.runIds.length === 1 ? 'Workflow started in the background' : `${started} of ${work.runIds.length} workflows started`;
+}
+
+/** Heartbeats, draft text and native parent completion prove no child start. */
+export function isWorkflowChildActivity(ev: HarnessEvent): boolean {
+  return isModelRetryProgressBoundary(ev) || ev.type === 'deliverable_saved'
+    || ev.type === 'external_write' || ev.type === 'external_write_succeeded'
+    || ev.type === 'external_write_failed' || ev.type === 'external_write_orphaned'
+    || ev.type === 'codemode_program_summary';
+}
+
+export function advanceWorkflowChildActivity(work: DelegatedWorkControl, ev: HarnessEvent): DelegatedWorkControl | null {
+  if (work.state !== 'running' || !work.execution || !isWorkflowChildActivity(ev)
+    || !Number.isSafeInteger(ev.seq) || ev.seq <= (work.progressSeq ?? work.sourceUserSeq)) return null;
+  const runId = work.runIds.find(id => ev.sessionId === `workflow:${id}` || ev.sessionId?.startsWith(`workflow:${id}:`));
+  if (!runId) return null;
+  const startedRunIds = work.startedRunIds?.includes(runId) ? work.startedRunIds : [...(work.startedRunIds ?? []), runId];
+  return { ...work, execution: 'running', startedRunIds, progressSeq: ev.seq };
+}
+
+export function updateWorkflowDispatchActivity(prev: ActivityItem[], work: DelegatedWorkControl): ActivityItem[] {
+  const label = workflowDispatchLabel(work);
+  let changed = false;
+  const next = prev.map(row => {
+    if (row.id !== `dispatch-${work.dispatchKey}` || row.label === label) return row;
+    changed = true;
+    return { ...row, label, detail: 'I’ll post the result here when it’s ready.', tone: 'live' as const };
+  });
+  return changed ? next : prev;
+}
+
+const WORKFLOW_STOP_CODES = new Set(['source_unbound', 'ownership_unavailable',
+  'shared_child_requires_exact_run_stop', 'child_stop_failed', 'membership_open']);
+const unavailableWorkflowStop = (): WorkflowStopQualification => ({ status: 'unavailable', matchedRunIds: [],
+  cancelledRunIds: [], alreadyCancelledRunIds: [], alreadyTerminalRunIds: [], failures: [{ code: 'ownership_unavailable' }] });
+
+/** A malformed present qualification stays unknown; no raw server prose. */
+export function readWorkflowStopQualification(value: unknown): WorkflowStopQualification {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return unavailableWorkflowStop();
+  const row = value as Record<string, unknown>;
+  const keys = ['matchedRunIds', 'cancelledRunIds', 'alreadyCancelledRunIds', 'alreadyTerminalRunIds'] as const;
+  if (!['complete', 'partial', 'unavailable'].includes(String(row.status)) || !Array.isArray(row.failures)) return unavailableWorkflowStop();
+  for (const key of keys) {
+    const ids = row[key];
+    if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/.test(id))
+      || new Set(ids).size !== ids.length) return unavailableWorkflowStop();
+  }
+  const matched = row.matchedRunIds as string[];
+  const accounted = keys.slice(1).flatMap(key => row[key] as string[]);
+  if (accounted.some(id => !matched.includes(id)) || new Set(accounted).size !== accounted.length) return unavailableWorkflowStop();
+  const failures: WorkflowStopQualification['failures'] = [];
+  for (const failure of row.failures) {
+    if (!failure || typeof failure !== 'object' || Array.isArray(failure)) return unavailableWorkflowStop();
+    const data = failure as Record<string, unknown>;
+    if (typeof data.code !== 'string' || !WORKFLOW_STOP_CODES.has(data.code)
+      || (data.runId !== undefined && (typeof data.runId !== 'string' || !matched.includes(data.runId)))) return unavailableWorkflowStop();
+    failures.push({ code: data.code as WorkflowStopQualification['failures'][number]['code'],
+      ...(typeof data.runId === 'string' ? { runId: data.runId } : {}) });
+  }
+  if (row.status === 'complete' && (failures.length || matched.some(id => !accounted.includes(id)))) return unavailableWorkflowStop();
+  return { status: row.status as WorkflowStopQualification['status'], matchedRunIds: [...matched],
+    cancelledRunIds: [...row.cancelledRunIds as string[]], alreadyCancelledRunIds: [...row.alreadyCancelledRunIds as string[]],
+    alreadyTerminalRunIds: [...row.alreadyTerminalRunIds as string[]], failures };
+}
+
+export function readChatStopReceipt(value: unknown): ChatStopReceipt {
+  const row = value && typeof value === 'object' ? value as Record<string, unknown> : null;
+  return { confirmed: !row || row.ok !== false,
+    ...(row && Object.hasOwn(row, 'workflowStop') ? { workflowStop: readWorkflowStopQualification(row.workflowStop) } : {}) };
+}
+
+/** Fixed qualification text; a Stop receipt never proves completion/reversal. */
+export function workflowStopNotice(receipt: ChatStopReceipt, pendingRunIds: readonly string[] = []): string | null {
+  const stop = receipt.workflowStop;
+  if (!stop && !pendingRunIds.length) return null;
+  if (!stop || stop.status === 'unavailable' || (stop.status === 'complete'
+    && pendingRunIds.some(id => !stop.matchedRunIds.includes(id)))) {
+    return 'Stop was requested, but linked workflow work was not confirmed stopped. Open Tasks to check it before trying again.';
+  }
+  if (stop.failures.some(failure => failure.code === 'shared_child_requires_exact_run_stop')) {
+    return 'This workflow is shared with another request, so stopping this chat did not stop it. Open Tasks to review the exact run.';
+  }
+  if (stop.failures.some(failure => failure.code === 'membership_open')) {
+    return 'Stop was requested, but the workflow handoff is still open. Open Tasks to check its final status before trying again.';
+  }
+  return stop.status === 'partial'
+    ? 'Stop was requested, but some workflow work could not be confirmed stopped. Open Tasks to check it before trying again.'
+    : null;
+}
 
 function boundedPhaseIdentity(value: unknown): string {
   const raw = typeof value === 'string' ? value.trim() : '';
@@ -157,6 +316,11 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
       const projectName = typeof d.projectName === 'string' ? d.projectName.trim().slice(0, 80) : '';
       return upsertModelPhase(prev, label, now, identity || undefined, routedModelName(d) || undefined, agentName || undefined, projectName || undefined);
     }
+    case 'model_resilience_observed': {
+      const retry = readModelRetryProgress(ev);
+      if (!retry || prev.some((row) => row.status === 'running' && row.id !== MODEL_PHASE_ACTIVITY_ID)) return prev;
+      return upsertModelPhase(prev, retry.label, now);
+    }
     // The compiled graph is internal topology. Pinning "Planned: plan · N
     // steps" is generic noise, not work.
     case 'turn_graph_compiled':
@@ -179,27 +343,20 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
       return index >= 0 ? prev.map((it, i) => (i === index ? { ...it, ...row } : it)) : [...prev, row];
     }
     case 'async_work_dispatched': {
-      const runIds = Array.isArray(d.runIds)
-        ? d.runIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
-        : [];
-      if (runIds.length === 0) return prev;
-      const key = typeof d.dispatchKey === 'string' && d.dispatchKey.trim()
-        ? d.dispatchKey.trim()
-        : runIds.join(',');
-      const label = runIds.length > 1
-        ? `Started ${runIds.length} workflows in the background`
-        : 'Started the workflow in the background';
+      const work = readWorkflowQueueDispatch(ev);
+      if (!work) return prev;
+      const key = work.dispatchKey;
+      if (prev.some(row => row.id === `dispatch-${key}`)) return prev;
       const row: ActivityItem = {
         id: `dispatch-${key}`,
         kind: 'event',
         variant: 'lifecycle',
-        tone: 'live',
-        label,
+        tone: 'muted',
+        label: workflowDispatchLabel(work),
         detail: 'I’ll post the result here when it’s ready.',
         status: 'running',
       };
-      const index = prev.findIndex((it) => it.id === row.id);
-      return index >= 0 ? prev.map((it, i) => (i === index ? row : it)) : [...prev, row];
+      return [...prev, row];
     }
     case 'expected_work_progress': {
       // Host plan: show the work that is happening. A later write waiting on
@@ -364,7 +521,9 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
       return prev;
     }
     case 'tool_called': {
-      if (!tool || tool === 'run_worker' || /run_worker/.test(tool)) return prev; // agents render as agents, not a tool row
+      if (!tool) return prev;
+      prev = clearModelRetryProgress(prev, now);
+      if (tool === 'run_worker' || /run_worker/.test(tool)) return prev; // agents render as agents, not a tool row
       if (d.batchMode === true) return prev; // batch items render as ONE live meter row, not N tool rows
       const reused = d.reused === true;
       const detail = reused ? toolLabel : salientArgDetail(d.args);
@@ -581,6 +740,9 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
         // concrete tool, worker, or batch that is provably still running.
         if (prev.some((row) => row.status === 'running' && row.id !== MODEL_PHASE_ACTIVITY_ID)) return prev;
         const prior = prev.find((row) => row.id === MODEL_PHASE_ACTIVITY_ID);
+        // A scheduled retry remains the honest phase until concrete work or a
+        // new route arrives; a clock beat cannot claim thinking resumed.
+        if (prior && MODEL_RETRY_LABEL_SET.has(prior.label)) return prev;
         const identity = prior?.detail?.trim() ?? '';
         const hostMessage = d.kind === 'progress_check_in' && typeof d.message === 'string'
           ? d.message.trim().replace(/\s+/g, ' ').slice(0, 120)

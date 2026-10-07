@@ -3463,7 +3463,10 @@ export async function startDaemon(
           );
         }
         try {
-          const converged = await reconcileAutomationPilotProductionConvergence();
+          const converged = await withDaemonRuntimePhase(
+            'daemon.timer.workflow_runs.production_convergence', {},
+            () => reconcileAutomationPilotProductionConvergence(),
+          );
           if (
             converged.chooserCreated > 0
             || converged.chooserBlocked > 0
@@ -3479,7 +3482,10 @@ export async function startDaemon(
             'Automation pilot production convergence tick failed',
           );
         }
-        await processWorkflowRuns(assistant);
+        await withDaemonRuntimePhase(
+          'daemon.timer.workflow_runs.execution', {},
+          () => processWorkflowRuns(assistant),
+        );
         reconcileAutomationPartitionsOnDaemon('after workflow drain');
       }).catch((err) => {
         logger.warn(

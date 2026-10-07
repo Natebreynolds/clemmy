@@ -391,7 +391,7 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
   // Work started in a project, or in a conversation with an agent, stays
   // there when it moves to the background, whichever path moved it.
   const delegation = input.delegation
-    ?? inheritedTaskDelegation(input.sessionId, input.foregroundHandoff?.sourceUserSeq)
+    ?? inheritedTaskDelegation(input.sessionId, input.foregroundHandoff?.sourceUserSeq, Boolean(input.foregroundHandoff))
     ?? undefined;
   const task = createBackgroundTask({
     title,
@@ -414,7 +414,7 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
     // A task delegated to a saved agent is one bounded piece of work: it
     // runs on the model its caller resolved for it (the agent's own, or the
     // helper role), never silently on the brain the owner is talking to.
-    model: input.model ?? resolveRoleModel('brain').modelId,
+    model: input.model ?? delegation?.executionModelPin?.modelId ?? resolveRoleModel('brain').modelId,
     ...(delegation ? { delegation } : {}),
     maxMinutes: input.maxMinutes ?? loadProactivityPolicy().defaultLongTaskMinutes,
     source: input.source ?? 'gateway',

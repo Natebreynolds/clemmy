@@ -70,6 +70,51 @@ test('active-turn heartbeat remains a kind-only public liveness signal', () => {
   assert.deepEqual(projected?.data, { kind: 'active_turn_check_in' });
 });
 
+function retryEvent(data: Record<string, unknown>): EventRow {
+  return { ...routeEvent(data), type: 'model_resilience_observed' };
+}
+
+const scheduledRetry = {
+  version: 1, sourceUserSeq: 42, phase: 'retry_scheduled', retired: false,
+  reason: 'transient_failure', failureKind: 'model.transport_timeout', nextAttempt: 2,
+};
+
+test('public scheduled retry exposes only an exact source and closed human reason', () => {
+  for (const [reason, failureKind, reasonCode] of [
+    ['transient_failure', 'model.transport_timeout', 'connection'],
+    ['transient_failure', 'model.rate_limited', 'busy'],
+    ['transient_failure', 'model.overloaded', 'busy'],
+    ['transient_failure', 'model.http_5xx', 'busy'],
+    ['auth_refresh', 'model.auth_expired', 'auth'],
+    ['empty_completion', 'model.empty_completion', 'empty'],
+    ['effort_rejected', 'runtime.unknown', 'request'],
+    ['incomplete_stream', 'model.transport_timeout', 'connection'],
+  ]) {
+    const projected = projectHarnessEventForPublic(retryEvent({
+      ...scheduledRetry, reason, failureKind,
+      callId: 'private-call', label: 'private-label', path: 'private-path',
+      at: 123, elapsedMs: 456, plannedBackoffMs: 789, maxRetries: 2,
+      model: 'private-model', account: 'private-account', error: 'private-secret',
+    }));
+    assert.deepEqual(projected?.data, { sourceUserSeq: 42, phase: 'retry', reasonCode });
+    assert.equal(projected?.parentEventId, null);
+    assert.doesNotMatch(JSON.stringify(projected), /private|Backoff|elapsed|Retries|nextAttempt|failureKind/);
+  }
+});
+
+test('unknown retry causes, retired calls and invalid source/attempt never reach public chat', () => {
+  for (const invalid of [
+    { version: 2 }, { phase: 'attempt_started' }, { retired: true }, { retired: undefined },
+    { sourceUserSeq: 0 }, { sourceUserSeq: -1 }, { sourceUserSeq: 1.5 }, { sourceUserSeq: '42' },
+    { sourceUserSeq: Number.MAX_SAFE_INTEGER + 1 }, { nextAttempt: 1 }, { nextAttempt: 2.5 },
+    { nextAttempt: '2' }, { reason: 'future_reason' }, { failureKind: 'model.future_failure' },
+    { reason: 'auth_refresh', failureKind: 'model.transport_timeout' },
+    { reason: 'incomplete_stream', failureKind: 'model.empty_completion' },
+  ]) {
+    assert.equal(projectHarnessEventForPublic(retryEvent({ ...scheduledRetry, ...invalid })), null);
+  }
+});
+
 test('an active-turn beat speaks on change, not on the clock', async () => {
   const { activeTurnBeatSpeaks } = await import('./loop.js');
   const quietEvery = 6;

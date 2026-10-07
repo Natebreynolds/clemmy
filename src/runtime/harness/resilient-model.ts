@@ -33,6 +33,8 @@
  * surfaced, not retried (it can't be replayed without duplicating Runner state).
  */
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
 import type { StreamEvent } from '@openai/agents-core/types';
 import type { ModelCapability } from './model-wire-registry.js';
 import { BoundaryError, type BoundaryErrorKind } from '../boundary-error.js';
@@ -56,6 +58,151 @@ const MAX_BACKOFF_MS = 30_000;
  * really down ends the call in about two of its timeouts, not minutes. */
 const NO_ANSWER_RETRY_WALL_MS = 20_000;
 const NO_ANSWER_KINDS: ReadonlySet<BoundaryErrorKind> = new Set(['model.transport_timeout', 'model.http_5xx']);
+
+type ResiliencePath = 'getResponse' | 'getStreamedResponse';
+type ResilienceOutcome = 'returned' | 'failed' | 'cancelled' | 'interrupted';
+type ResilienceRetryReason = 'transient_failure' | 'auth_refresh' | 'effort_rejected' | 'empty_completion' | 'incomplete_stream';
+type ResilienceFailureKind = BoundaryErrorKind;
+
+interface ResilienceTelemetryBase {
+  /** One wrapper invocation, distinct even when cached models serve concurrent calls. */
+  callId: string;
+  label: string;
+  path: ResiliencePath;
+  at: number;
+  elapsedMs: number;
+  maxRetries: number;
+  /** This physical provider request was retired, even if its containing
+   * logical step is still running on a fresh fallback request. Observation
+   * only; it does not grant or withdraw retry authority. */
+  requestAborted: boolean;
+}
+
+/** Timing observations only. These events contain no request/result bytes,
+ * credentials, inferred tokens, or proof of a served model/account. The host
+ * binds its observer to the exact accepted source and independently certified
+ * route. A returned wrapper call is not a completion/effect verdict. */
+type ResilienceTelemetryDetail =
+  | { type: 'call_started' }
+  | { type: 'attempt_started'; attempt: number }
+  | { type: 'attempt_finished'; attempt: number; durationMs: number; outcome: ResilienceOutcome;
+      contentCommitted: boolean; completionObserved: boolean; failureKind?: ResilienceFailureKind; status?: number }
+  | { type: 'retry_scheduled'; afterAttempt: number; nextAttempt: number; reason: ResilienceRetryReason;
+      failureKind: ResilienceFailureKind; plannedBackoffMs: number }
+  | { type: 'retry_wait_finished'; afterAttempt: number; nextAttempt: number; reason: ResilienceRetryReason;
+      plannedBackoffMs: number; durationMs: number; outcome: 'completed' | 'failed' }
+  | { type: 'call_finished'; outcome: ResilienceOutcome; durationMs: number; attemptCount: number;
+      failedAttemptCount: number; attemptMs: number; failedAttemptMs: number; retryWaitMs: number;
+      completionObserved: boolean; failureKind?: ResilienceFailureKind }
+;
+export type ResilienceTelemetryEvent = ResilienceTelemetryBase & ResilienceTelemetryDetail;
+
+export type ResilienceTelemetryObserver = (event: Readonly<ResilienceTelemetryEvent>) => void;
+const resilienceTelemetry = new AsyncLocalStorage<ResilienceTelemetryObserver>();
+
+/** Bind observations to this asynchronous request, never a mutable process-wide
+ * callback. The wrapper captures this binding once before its first attempt. */
+export function withModelResilienceTelemetry<T>(observer: ResilienceTelemetryObserver, work: () => T): T {
+  return resilienceTelemetry.run(observer, work);
+}
+
+class ResilienceCallTelemetry {
+  private readonly observer = resilienceTelemetry.getStore();
+  private readonly callId = randomUUID();
+  private activeAttempt?: { ordinal: number; startedAt: number; contentCommitted: boolean; completionObserved: boolean };
+  private attemptCount = 0;
+  private failedAttemptCount = 0;
+  private attemptMs = 0;
+  private failedAttemptMs = 0;
+  private retryWaitMs = 0;
+  private completionObserved = false;
+
+  constructor(private readonly label: string, private readonly path: ResiliencePath,
+    private readonly maxRetries: number, private readonly startedAt: number, private readonly now: () => number,
+    private readonly signal?: AbortSignal) {
+    this.emit({ type: 'call_started' });
+  }
+
+  private emit(event: ResilienceTelemetryDetail): void {
+    if (!this.observer) return;
+    const at = this.now();
+    try {
+      const returned: unknown = this.observer(Object.freeze({ ...event, callId: this.callId, label: this.label,
+        path: this.path, at, elapsedMs: Math.max(0, at - this.startedAt), maxRetries: this.maxRetries,
+        requestAborted: this.signal?.aborted ?? false }) as ResilienceTelemetryEvent);
+      // A mistakenly async observer must not turn a journal failure into an
+      // unhandled rejection, or delay/change provider retry authority.
+      if (returned && typeof (returned as PromiseLike<unknown>).then === 'function') {
+        void Promise.resolve(returned).catch(() => {});
+      }
+    } catch { /* observation cannot alter the model call */ }
+  }
+
+  startAttempt(ordinal: number): void {
+    this.attemptCount += 1;
+    this.activeAttempt = { ordinal, startedAt: this.now(), contentCommitted: false, completionObserved: false };
+    this.emit({ type: 'attempt_started', attempt: ordinal });
+  }
+
+  streamState(contentCommitted: boolean, completionObserved: boolean): void {
+    if (this.activeAttempt) Object.assign(this.activeAttempt, { contentCommitted, completionObserved });
+  }
+
+  finishAttempt(outcome: ResilienceOutcome, contentCommitted: boolean, completionObserved: boolean,
+    failureKind?: ResilienceFailureKind, status?: number): void {
+    if (!this.activeAttempt) return;
+    const { ordinal, startedAt } = this.activeAttempt;
+    this.activeAttempt = undefined;
+    const durationMs = Math.max(0, this.now() - startedAt);
+    this.attemptMs += durationMs;
+    if (outcome === 'failed' || outcome === 'cancelled') {
+      this.failedAttemptCount += 1;
+      this.failedAttemptMs += durationMs;
+    }
+    // Only the final physical attempt can describe the returned call. A prior
+    // empty response_done must not certify a later partial stream as complete.
+    this.completionObserved = completionObserved;
+    this.emit({ type: 'attempt_finished', attempt: ordinal, durationMs, outcome, contentCommitted,
+      completionObserved, ...(failureKind ? { failureKind } : {}), ...(status !== undefined ? { status } : {}) });
+  }
+
+  retryNow(afterAttempt: number, reason: ResilienceRetryReason, failureKind: ResilienceFailureKind): void {
+    this.emit({ type: 'retry_scheduled', afterAttempt, nextAttempt: afterAttempt + 1, reason, failureKind, plannedBackoffMs: 0 });
+  }
+
+  async wait<T>(afterAttempt: number, reason: ResilienceRetryReason, failureKind: ResilienceFailureKind,
+    plannedBackoffMs: number, work: () => Promise<T>): Promise<T> {
+    this.emit({ type: 'retry_scheduled', afterAttempt, nextAttempt: afterAttempt + 1, reason, failureKind, plannedBackoffMs });
+    const startedAt = this.now();
+    let outcome: 'completed' | 'failed' = 'failed';
+    try { const result = await work(); outcome = 'completed'; return result; }
+    finally {
+      const durationMs = Math.max(0, this.now() - startedAt);
+      this.retryWaitMs += durationMs;
+      this.emit({ type: 'retry_wait_finished', afterAttempt, nextAttempt: afterAttempt + 1, reason,
+        plannedBackoffMs, durationMs, outcome });
+    }
+  }
+
+  finish(outcome: ResilienceOutcome, failureKind?: ResilienceFailureKind): void {
+    this.finishAttempt(outcome, this.activeAttempt?.contentCommitted ?? false,
+      this.activeAttempt?.completionObserved ?? false, failureKind);
+    this.emit({ type: 'call_finished', outcome, durationMs: Math.max(0, this.now() - this.startedAt),
+      attemptCount: this.attemptCount, failedAttemptCount: this.failedAttemptCount, attemptMs: this.attemptMs,
+      failedAttemptMs: this.failedAttemptMs, retryWaitMs: this.retryWaitMs, completionObserved: this.completionObserved,
+      ...(failureKind ? { failureKind } : {}) });
+  }
+}
+
+function telemetryFailureKind(err: unknown): ResilienceFailureKind {
+  try { return err instanceof BoundaryError ? err.kind : classifyModelError(err).kind; }
+  catch { return 'runtime.unknown'; }
+}
+
+function telemetryFailureStatus(err: unknown): number | undefined {
+  try { return classifyModelError(err).status; }
+  catch { return undefined; }
+}
 
 export interface ResiliencePolicy {
   /** Short label for logs (e.g. 'claude', 'byo'). */
@@ -375,6 +522,7 @@ export class ResilientModel implements Model {
     authRefreshed: { value: boolean },
     path: 'getResponse' | 'getStreamedResponse',
     call: NoAnswerCall,
+    telemetry: ResilienceCallTelemetry,
   ): Promise<boolean> {
     // The caller withdrew the request (the owner stopped, or an outer
     // deadline retired it). Another attempt could only fail the same way.
@@ -388,7 +536,7 @@ export class ResilientModel implements Model {
       if (!this.policy.refreshAuth || authRefreshed.value) return false;
       authRefreshed.value = true;
       try {
-        await this.policy.refreshAuth();
+        await telemetry.wait(attempt + 1, 'auth_refresh', cls.kind, 0, () => this.policy.refreshAuth!());
       } catch {
         return false;
       }
@@ -425,7 +573,7 @@ export class ResilientModel implements Model {
       'model call failed before content — retrying transparently',
     );
     if (noAnswer) call.noAnswerRetries += 1;
-    await this.sleep(wait);
+    await telemetry.wait(attempt + 1, 'transient_failure', cls.kind, wait, () => this.sleep(wait));
     return true;
   }
 
@@ -433,19 +581,27 @@ export class ResilientModel implements Model {
     let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
     const call: NoAnswerCall = { startedAt: this.now(), signal: request.signal, noAnswerRetries: 0 };
+    const telemetry = new ResilienceCallTelemetry(this.policy.label, 'getResponse', this.maxRetries, call.startedAt, () => this.now(), request.signal);
+    let outcome: ResilienceOutcome = 'failed';
+    let failureKind: ResilienceFailureKind | undefined;
     let effortStripped = false;
+    try {
     for (let attempt = 0; ; attempt++) {
+      telemetry.startAttempt(attempt + 1);
       try {
         const res = await this.inner.getResponse(req);
         if (isEmptyResponse(res) && isProviderRefusalFinish(res.providerData?.finishReason)) {
           throw providerRefusalError(this.policy.label);
         }
         if (isEmptyResponse(res) && attempt < this.maxRetries) {
+          telemetry.finishAttempt('failed', false, true, 'model.empty_completion');
           logger.warn({ label: this.policy.label, attempt: attempt + 1 }, 'model returned empty completion — retrying (always-an-output invariant)');
-          await this.sleep(backoffMs(attempt, { retryable: true, kind: 'model.empty_completion', isAuth: false }));
+          const wait = backoffMs(attempt, { retryable: true, kind: 'model.empty_completion', isAuth: false });
+          await telemetry.wait(attempt + 1, 'empty_completion', 'model.empty_completion', wait, () => this.sleep(wait));
           continue;
         }
         if (isEmptyResponse(res)) {
+          telemetry.finishAttempt('failed', false, true, 'model.empty_completion');
           throw new BoundaryError({
             kind: 'model.empty_completion',
             retryable: true,
@@ -454,28 +610,43 @@ export class ResilientModel implements Model {
             context: { label: this.policy.label, attempts: attempt + 1 },
           });
         }
+        telemetry.finishAttempt('returned', true, true);
+        outcome = 'returned';
         return res;
       } catch (err) {
+        telemetry.finishAttempt(request.signal?.aborted ? 'cancelled' : 'failed', false, false,
+          telemetryFailureKind(err), telemetryFailureStatus(err));
         if (err instanceof BoundaryError) throw err;
         if (!effortStripped && isEffortRejection(err)) {
           effortStripped = true;
           req = stripEffortFromRequest(req);
           logger.warn({ label: this.policy.label, path: 'getResponse' }, 'model rejected the effort parameter — stripping effort and retrying');
+          telemetry.retryNow(attempt + 1, 'effort_rejected', telemetryFailureKind(err));
           continue;
         }
-        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getResponse', call)) continue;
+        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getResponse', call, telemetry)) continue;
         throw err;
       }
     }
+    } catch (err) {
+      outcome = request.signal?.aborted ? 'cancelled' : 'failed';
+      failureKind = telemetryFailureKind(err);
+      throw err;
+    } finally { telemetry.finish(outcome, failureKind); }
   }
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
     let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
     const call: NoAnswerCall = { startedAt: this.now(), signal: request.signal, noAnswerRetries: 0 };
+    const telemetry = new ResilienceCallTelemetry(this.policy.label, 'getStreamedResponse', this.maxRetries, call.startedAt, () => this.now(), request.signal);
+    let outcome: ResilienceOutcome = 'interrupted';
+    let failureKind: ResilienceFailureKind | undefined;
     let effortStripped = false;
 
+    try {
     for (let attempt = 0; ; attempt++) {
+      telemetry.startAttempt(attempt + 1);
       // Stream events to the Runner AS THEY ARRIVE so the loop's stream-stall
       // watchdog — and the user — sees the model working. Reasoning + tool-call
       // frames on a long operational turn can span well past the stall window,
@@ -511,6 +682,7 @@ export class ResilientModel implements Model {
             // the post-loop handler retries OR throws (never a clean empty turn).
             if (doneEmpty) break;
             if (!committed) { yield* drain(pending); committed = true; }
+            telemetry.streamState(committed, sawDone);
             yield ev;
             continue;
           }
@@ -519,18 +691,22 @@ export class ResilientModel implements Model {
           // retry would duplicate it). Flush the buffered metadata in order, then
           // stream this and every later event straight through.
           if (!committed) { yield* drain(pending); committed = true; }
+          telemetry.streamState(committed, sawDone);
           yield ev;
         }
       } catch (err) {
+        telemetry.finishAttempt(request.signal?.aborted ? 'cancelled' : 'failed', committed, sawDone,
+          telemetryFailureKind(err), telemetryFailureStatus(err));
         if (committed) throw err; // real content already escaped — cannot safely retry
         if (err instanceof BoundaryError) throw err;
         if (!effortStripped && isEffortRejection(err)) {
           effortStripped = true;
           req = stripEffortFromRequest(req);
           logger.warn({ label: this.policy.label, path: 'getStreamedResponse' }, 'model rejected the effort parameter — stripping effort and retrying');
+          telemetry.retryNow(attempt + 1, 'effort_rejected', telemetryFailureKind(err));
           continue;
         }
-        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getStreamedResponse', call)) continue;
+        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getStreamedResponse', call, telemetry)) continue;
         throw err;
       }
 
@@ -538,9 +714,11 @@ export class ResilientModel implements Model {
       // remains; otherwise throw the retryable boundary error — NEVER yield a
       // clean empty response_done (mirrors getResponse + the Codex adapter).
       if (doneEmpty && !committed) {
+        telemetry.finishAttempt('failed', false, true, 'model.empty_completion');
         if (attempt < this.maxRetries) {
           logger.warn({ label: this.policy.label, attempt: attempt + 1 }, 'streamed empty completion — retrying (always-an-output invariant)');
-          await this.sleep(backoffMs(attempt, { retryable: true, kind: 'model.empty_completion', isAuth: false }));
+          const wait = backoffMs(attempt, { retryable: true, kind: 'model.empty_completion', isAuth: false });
+          await telemetry.wait(attempt + 1, 'empty_completion', 'model.empty_completion', wait, () => this.sleep(wait));
           continue;
         }
         throw new BoundaryError({
@@ -554,10 +732,12 @@ export class ResilientModel implements Model {
       // If the stream ended with no done event and nothing committed, surface a
       // retryable boundary error (don't fabricate a clean end).
       if (!sawDone && !committed) {
+        telemetry.finishAttempt('failed', false, false, 'model.transport_timeout');
         if (attempt < this.maxRetries) {
           logger.warn({ label: this.policy.label, attempt: attempt + 1 }, 'stream ended with no response_done before content — retrying');
           call.noAnswerRetries += 1;
-          await this.sleep(backoffMs(attempt, { retryable: true, kind: 'model.transport_timeout', isAuth: false }));
+          const wait = backoffMs(attempt, { retryable: true, kind: 'model.transport_timeout', isAuth: false });
+          await telemetry.wait(attempt + 1, 'incomplete_stream', 'model.transport_timeout', wait, () => this.sleep(wait));
           continue;
         }
         const ended = new BoundaryError({
@@ -570,7 +750,16 @@ export class ResilientModel implements Model {
         if (call.noAnswerRetries >= 1) markRetriesSpent(ended);
         throw ended;
       }
+      telemetry.finishAttempt('returned', committed, sawDone);
+      outcome = 'returned';
       return; // committed + drained, or done emitted
+    }
+    } catch (err) {
+      outcome = request.signal?.aborted ? 'cancelled' : 'failed';
+      failureKind = telemetryFailureKind(err);
+      throw err;
+    } finally {
+      telemetry.finish(request.signal?.aborted && outcome === 'interrupted' ? 'cancelled' : outcome, failureKind);
     }
   }
 }

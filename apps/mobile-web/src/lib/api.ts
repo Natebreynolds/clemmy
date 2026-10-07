@@ -1,4 +1,4 @@
-import { readCompletionReviewResponse, type CheckerFacts, type DelegatedTask, type MemoryModelProblem, type MemoryScope, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
+import { readChatStopReceipt, readCompletionReviewResponse, type CheckerFacts, type DelegatedTask, type MemoryModelProblem, type MemoryScope, type TaskMode, type ReplayPayload, type UsageStatusLike, type WorkflowStopQualification } from '@clem/chat-engine';
 import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.js';
 /**
  * Minimal fetch wrapper. All requests go same-origin (the PWA is
@@ -17,6 +17,7 @@ import { signProof, deviceKeySupported, exportPublicJwk } from './device-key.js'
 import { connectionDoor, reportConnectionLost, setConnectionDoor } from './native-bridge.js';
 import { LAST_GOOD_HEADER, clearLastGood, noteLastGood } from './last-good.js';
 import { readBrainSelectionResponse, type BrainSelectionResponse } from '@clem/chat-engine';
+import type { WorkflowRunReceipt } from './workflow-run-receipt';
 
 /**
  * The current session's fingerprint, which every proof is signed over.
@@ -1472,8 +1473,8 @@ export async function listWorkflowRuns(name: string, limit = 20): Promise<{ runs
   return api<{ runs: WorkflowRunSummary[] }>(`/m/api/workflows/${encodeURIComponent(name)}/runs?limit=${limit}`);
 }
 
-export async function runWorkflow(name: string, inputs?: Record<string, string>): Promise<{ ok: true; runId: string; status: string }> {
-  return api<{ ok: true; runId: string; status: string }>(`/m/api/workflows/${encodeURIComponent(name)}/run`, {
+export async function runWorkflow(name: string, inputs?: Record<string, string>): Promise<WorkflowRunReceipt> {
+  return api<WorkflowRunReceipt>(`/m/api/workflows/${encodeURIComponent(name)}/run`, {
     method: 'POST',
     body: JSON.stringify(inputs && Object.keys(inputs).length > 0 ? { inputs } : {}),
   });
@@ -1639,12 +1640,13 @@ export async function cancelRun(runId: string): Promise<{ ok: boolean; message: 
 /** Stop the LIVE chat turn for a session — the exact-attempt primitive the
  *  desktop uses. attemptId is required and stale-checked server-side, so a
  *  stale tap can never widen into a session-wide kill. */
-export async function cancelChatTurn(sessionId: string, attemptId: string): Promise<{ ok: boolean }> {
-  return api<{ ok: boolean }>(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}/cancel`, {
+export async function cancelChatTurn(sessionId: string, attemptId: string): Promise<{ ok: boolean; workflowStop?: WorkflowStopQualification }> {
+  const result = await api<{ ok: boolean }>(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}/cancel`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ attemptId }),
   });
+  return { ...result, ...readChatStopReceipt(result) };
 }
 
 /** Stop the live chat turn by the REQUEST identity the phone already minted
@@ -1654,8 +1656,8 @@ export async function cancelChatTurn(sessionId: string, attemptId: string): Prom
 export async function cancelChatRequest(
   sessionId: string,
   clientRequestId: string,
-): Promise<{ ok: boolean; pendingAcceptance: boolean }> {
-  return api<{ ok: boolean; pendingAcceptance: boolean }>(
+): Promise<{ ok: boolean; pendingAcceptance: boolean; workflowStop?: WorkflowStopQualification }> {
+  const result = await api<{ ok: boolean; pendingAcceptance: boolean }>(
     `/m/api/chat/sessions/${encodeURIComponent(sessionId)}/cancel`,
     {
       method: 'POST',
@@ -1663,19 +1665,12 @@ export async function cancelChatRequest(
       body: JSON.stringify({ clientRequestId }),
     },
   );
+  return { ...result, ...readChatStopReceipt(result) };
 }
 
-/** Stop the live attempt on this conversation when this client never minted
- *  a cancel key (refresh, another surface, lost in-flight key). */
-export async function cancelActiveChat(sessionId: string): Promise<{ ok: boolean }> {
-  return api<{ ok: boolean }>(
-    `/m/api/chat/sessions/${encodeURIComponent(sessionId)}/cancel`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    },
-  );
+/** Read the existing active attempt only when it owns the observed source. */
+export async function getChatRunControl(sessionId: string, sourceUserSeq: number): Promise<{ activeRun?: unknown }> {
+  return api<{ activeRun?: unknown }>(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}/control?sourceUserSeq=${sourceUserSeq}`);
 }
 
 export async function controlTask(taskId: string, action: 'cancel' | 'resume'): Promise<{ ok: true; status: string }> {

@@ -24,6 +24,8 @@ import { humanizeCron } from '@/lib/cron';
 import { certificationTone, sentenceCaseLabel } from '@/lib/workflowCertification';
 import { workflowBuildFromMessages, type WorkflowBuildState, type WorkflowDraft } from '@/lib/workflow-build';
 import { cn } from '@/lib/cn';
+import { usePendingCommit } from '@/lib/pending-commit';
+import { workflowRunFailure, workflowRunNotice, workflowRunTone } from '@/lib/workflow-run-receipt';
 
 const STARTERS = [
   'Every Friday at 7, summarize my open pipeline by stage and email it to me.',
@@ -100,6 +102,7 @@ export function AutomateCreate() {
   const threadEndRef = useRef<HTMLDivElement>(null);
   const seededRef = useRef(false);
   const [runNotice, setRunNotice] = useState<string | null>(null);
+  const [runNoticeTone, setRunNoticeTone] = useState<'info' | 'warning'>('info');
   useEffect(() => { threadEndRef.current?.scrollIntoView({ block: 'end' }); }, [chat.messages]);
 
   // A deep link can hand in the objective; it fires once.
@@ -117,10 +120,28 @@ export function AutomateCreate() {
     refetchInterval: build.state === 'testing' ? 3000 : false,
   });
   const wf = stored.data;
+  const runCommit = usePendingCommit(wf?.name ?? '');
+  const [runPending, setRunPending] = useState(false);
+  useEffect(() => { setRunPending(false); setRunNotice(null); }, [wf?.name]);
   const cert = wf?.certification;
   const live = build.state === 'drafting' || build.state === 'writing' || build.state === 'testing';
 
   const start = (text: string) => { void chat.send({ text: `Create a workflow: ${text}` }); };
+  const queueRun = async () => {
+    if (!wf) return;
+    const token = runCommit.begin();
+    if (!token) return;
+    setRunPending(true);
+    setRunNotice(null);
+    try {
+      const receipt = await runWorkflow(wf.name);
+      if (runCommit.owns(token)) { setRunNotice(workflowRunNotice(receipt)); setRunNoticeTone(workflowRunTone(receipt)); }
+    } catch (e) {
+      if (runCommit.owns(token)) { setRunNotice(workflowRunFailure(e)); setRunNoticeTone('warning'); }
+    } finally {
+      if (runCommit.finish(token)) setRunPending(false);
+    }
+  };
 
   return (
     <div className="flex h-full">
@@ -175,10 +196,8 @@ export function AutomateCreate() {
           <div className="ml-auto flex items-center gap-1.5">
             {wf && (
               <>
-                <Button variant="secondary" size="sm" disabled={cert ? !cert.canRun : false} title={cert?.summary} onClick={async () => {
-                  try { await runWorkflow(wf.name); setRunNotice('Started a run — watch it in Automate.'); } catch (e) { setRunNotice((e as Error).message); }
-                }}>
-                  <Play className="h-4 w-4" aria-hidden /> Run once now
+                <Button variant="secondary" size="sm" disabled={runPending || (cert ? !cert.canRun : false)} title={cert?.summary} onClick={() => void queueRun()}>
+                  <Play className="h-4 w-4" aria-hidden /> {runPending ? 'Queuing…' : 'Run once now'}
                 </Button>
                 <Button variant="secondary" size="sm" onClick={() => navigate(`/automate?workflow=${encodeURIComponent(wf.name)}`)}>
                   <ExternalLink className="h-4 w-4" aria-hidden /> Open in Automate
@@ -187,7 +206,7 @@ export function AutomateCreate() {
             )}
           </div>
         </div>
-        {runNotice && <p className="border-b border-border bg-subtle px-4 py-2 text-small text-muted" role="status">{runNotice}</p>}
+        {runNotice && <p className={cn('border-b px-4 py-2 text-small', runNoticeTone === 'warning' ? 'border-warning/30 bg-warning-tint text-fg' : 'border-border bg-subtle text-muted')} role="status">{runNotice}</p>}
         <div className="relative min-h-0 flex-1 overflow-y-auto bg-canvas p-6">
           {wf ? (
             <div className="mx-auto flex w-full max-w-[760px] flex-col gap-5">

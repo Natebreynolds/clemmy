@@ -951,7 +951,20 @@ test('DataForSEO nested task failure overrides Composio outer success before set
     providerStatus: 400,
     provesNoCommit: true,
   });
-  assert.equal(composioFailureProvesNoCommit(rejected), true);
+  assert.equal(composioFailureProvesNoCommit(rejected, 'DATAFORSEO_CREATE_SERP_GOOGLE_MAPS_TASK'), true);
+  assert.equal(composioFailureProvesNoCommit(rejected), false, 'unbound provider-shaped bytes cannot prove no effect');
+  assert.equal(composioFailureProvesNoCommit(rejected, 'SLACK_DELETE_REMINDER'), false, 'another provider cannot borrow the task-code adapter');
+  assert.equal(composioFailureProvesNoCommit(rejected, 'DATAFORSEO_GET_GOOGLE_HIST_BULK_TRAFFIC_EST_LIVE'), false, 'another operation cannot borrow the exact task-creation rejection proof');
+  const mixed = { ...rejected, data: { ...rejected.data, tasks: [...rejected.data.tasks,
+    { status_code: 20000, result: [{ id: 'already-created' }], result_count: 1 }] } };
+  assert.equal(composioFailureProvesNoCommit(mixed, 'DATAFORSEO_CREATE_SERP_GOOGLE_MAPS_TASK'), false, 'one rejected task does not prove the whole request changed nothing');
+  for (const dataPatch of [{ tasks_count: 2 }, { tasks_error: 0 }, { status_code: 50_000 }]) {
+    assert.equal(composioFailureProvesNoCommit({ ...rejected, data: { ...rejected.data, ...dataPatch } }, 'DATAFORSEO_CREATE_SERP_GOOGLE_MAPS_TASK'), false, 'contradictory whole-request fields retain uncertainty');
+  }
+  assert.equal(composioFailureProvesNoCommit({ ...rejected, error: 'downstream response lost' }, 'DATAFORSEO_CREATE_SERP_GOOGLE_MAPS_TASK'), false);
+  for (const taskPatch of [{ result: undefined }, { result_count: undefined }, { result: [{ id: 'partial' }] }, { result_count: 1 }]) {
+    assert.equal(composioFailureProvesNoCommit({ ...rejected, data: { ...rejected.data, tasks: [{ ...rejected.data.tasks[0], ...taskPatch }] } }, 'DATAFORSEO_CREATE_SERP_GOOGLE_MAPS_TASK'), false, 'missing or positive effect evidence cannot prove a rejection before effect');
+  }
 
   const canonical = canonicalComposioSettlementResult(rejected) as Record<string, unknown>;
   assert.equal(canonical.successful, false, 'the settlement reducer must not see outer successful:true');

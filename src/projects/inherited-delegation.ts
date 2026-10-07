@@ -10,18 +10,20 @@
  * started inside a project ran outside it: as Clem, with no project context,
  * and what it learned was kept for everywhere.
  */
-import { agentModelIsRole } from '../agents/agent-binding.js';
 import { getAgentRecord } from '../agents/agent-record.js';
 import { sessionAgentState } from '../agents/session-agent-state.js';
 import type { BackgroundTaskDelegation, BackgroundTaskRecord } from '../execution/background-tasks.js';
 import { getSession } from '../runtime/harness/eventlog.js';
-import { resolveRoleModel, type ModelRole } from '../runtime/harness/model-roles.js';
+import { resolveDelegatedAgentModel } from './task-delegation.js';
 import { getAssignment, getProject, listAssignments } from './project-record.js';
 import { sessionProjectState } from './session-project-state.js';
+
+export class InheritedAgentModelUnavailableError extends Error {}
 
 export function inheritedTaskDelegation(
   sessionId: string | null | undefined,
   sourceUserSeq?: number,
+  preserveAcceptedModel = false,
 ): BackgroundTaskDelegation | null {
   if (!sessionId) return null;
   try {
@@ -35,6 +37,10 @@ export function inheritedTaskDelegation(
     const saved = current.agentId ? getAgentRecord(current.agentId) : null;
     const agent = saved && (!project || getAssignment(project.id, saved.id)) ? saved : null;
     if (!project && !agent) return null;
+    // A genuine foreground handoff already carries accepted checkpoint
+    // authority. Fresh inherited work freezes the saved specialist here.
+    const selected = agent && !preserveAcceptedModel ? resolveDelegatedAgentModel(agent, true) : null;
+    if (selected?.kind === 'refuse') throw new InheritedAgentModelUnavailableError(selected.reason);
     // The conversation is in an agent of its own that cannot take work in
     // this project: that was a choice, and nobody is suggested in its place.
     const choiceIsOpen = Boolean(project) && !saved && assignedAgents(project!.id).length > 0;
@@ -45,11 +51,13 @@ export function inheritedTaskDelegation(
       projectId: project?.id ?? null,
       projectName: project?.name ?? null,
       assignedBy: agent && metadata.agentSetBy !== 'clem' ? 'owner' : 'clem',
+      ...(selected?.kind === 'bound' && selected.executionModelPin ? { executionModelPin: selected.executionModelPin } : {}),
       ...(typeof sourceUserSeq === 'number' && Number.isSafeInteger(sourceUserSeq) && sourceUserSeq > 0
         ? { originSourceUserSeq: sourceUserSeq } : {}),
       ...(choiceIsOpen ? { agentChoice: 'open' as const } : {}),
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof InheritedAgentModelUnavailableError) throw error;
     return null;
   }
 }
@@ -80,8 +88,8 @@ export function _setOpenAgentChooserForTests(chooser: AgentChooser | null): void
  * Either way the choice is closed, so a resumed task is never asked again.
  */
 export async function settleOpenAgentChoice(
-  task: Pick<BackgroundTaskRecord, 'delegation' | 'prompt' | 'originSessionId'>,
-): Promise<{ delegation: BackgroundTaskDelegation; model?: string }> {
+  task: Pick<BackgroundTaskRecord, 'delegation' | 'prompt' | 'originSessionId' | 'foregroundHandoff' | 'model'>,
+): Promise<{ delegation: BackgroundTaskDelegation; model?: string; refusal?: string }> {
   const { agentChoice: _closed, ...decided } = task.delegation!;
   void _closed;
   if (decided.agentId || !decided.projectId) return { delegation: decided };
@@ -100,15 +108,18 @@ export async function settleOpenAgentChoice(
   }
   const agent = chosen ? candidates.find((candidate) => candidate.id === chosen!.id) ?? null : null;
   if (!agent) return { delegation: decided };
-  // One bounded piece of work: the model the agent asks for, otherwise the
-  // owner's helper role, as for work delegated to it by name.
-  const model = agent.model
-    ? agentModelIsRole(agent.model)
-      ? resolveRoleModel(agent.model.trim().toLowerCase() as ModelRole).modelId
-      : agent.model
-    : resolveRoleModel('worker').modelId;
+  const delegation = { ...decided, agentId: agent.id, agentName: agent.name, agentCreatedAt: agent.createdAt, assignedBy: 'router' as const };
+  // An accepted foreground handoff retains its already-authorized model. A
+  // fresh router choice must use the same saved-pin decision as named work.
+  if (task.foregroundHandoff && task.model) return { delegation };
+  const selected = resolveDelegatedAgentModel(agent);
+  if (selected.kind === 'refuse') {
+    const refusal = `The chosen agent "${agent.name}" requires its saved ${agent.model} model${selected.executionModelPin ? ` "${selected.executionModelPin.modelId}"` : ''}, which is unavailable or could not be verified. This task keeps that choice and its saved progress. Reconnect the model or change the saved agent choice, then start a new task to confirm its model authority.`;
+    return { delegation: { ...delegation,
+      ...(selected.executionModelPin ? { executionModelPin: selected.executionModelPin } : {}), modelBindingRefusal: refusal }, refusal };
+  }
   return {
-    delegation: { ...decided, agentId: agent.id, agentName: agent.name, agentCreatedAt: agent.createdAt, assignedBy: 'router' },
-    model,
+    delegation: { ...delegation, ...(selected.executionModelPin ? { executionModelPin: selected.executionModelPin } : {}) },
+    model: selected.model,
   };
 }

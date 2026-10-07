@@ -15,6 +15,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { Switch } from '@/components/ui/Switch';
 import { getAgentCatalog, listAgents, type AgentRecord, type CatalogEntry } from '@/lib/agents';
 import { usePoll } from '@/lib/poll';
+import { usePendingCommit } from '@/lib/pending-commit';
 import {
   refusalText, removeAssignment, saveAssignment,
   type AssignmentInput, type ProjectAssignmentView, type ProjectOverview,
@@ -66,10 +67,12 @@ function AssignmentFields({
       className="mt-3 border-t border-border pt-3"
       onSubmit={(event) => {
         event.preventDefault();
+        if (saving) return;
         onSubmit({ responsibility: responsibility.trim(), context: context.trim(), skills: Array.from(skills), shareMethods });
       }}
       onKeyDown={(event) => { if (event.key === 'Escape' && !saving) { event.stopPropagation(); onCancel(); } }}
     >
+      <fieldset disabled={saving} aria-busy={saving} className="m-0 min-w-0 border-0 p-0">
       <Field label={`What ${agentName} answers for here`} hint="One or two sentences. Clem uses this to decide who a task in this project goes to.">
         {(id) => (
           <Textarea
@@ -121,6 +124,7 @@ function AssignmentFields({
           <p className="text-caption text-muted">{shareMethods ? SHARE_HINT_ON : SHARE_HINT_OFF}</p>
         </div>
       </div>
+      </fieldset>
       {error && <p role="alert" className="mb-3 text-small text-danger">{error}</p>}
       <div className="flex justify-end gap-2">
         <Button type="button" variant="secondary" size="sm" disabled={saving} onClick={onCancel}>Cancel</Button>
@@ -140,17 +144,22 @@ function AssignmentRow({ projectId, assignment, skillOptions, readOnly, onSaved 
   const [mode, setMode] = useState<'view' | 'edit' | 'remove'>('view');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const commit = usePendingCommit(`${projectId}:${assignment.agentId}`);
 
   const run = async (call: () => Promise<ProjectOverview>, fallback: string) => {
+    const token = commit.begin();
+    if (!token) return;
     setBusy(true);
     setError('');
     try {
-      onSaved(await call());
+      const saved = await call();
+      if (!commit.owns(token)) return;
+      onSaved(saved);
       setMode('view');
     } catch (failure) {
-      setError(refusalText(failure, fallback));
+      if (commit.owns(token)) setError(refusalText(failure, fallback));
     } finally {
-      setBusy(false);
+      if (commit.finish(token)) setBusy(false);
     }
   };
 
@@ -210,7 +219,7 @@ function AssignmentRow({ projectId, assignment, skillOptions, readOnly, onSaved 
           saving={busy}
           error={error}
           submitLabel="Save"
-          onCancel={() => setMode('view')}
+          onCancel={() => { if (!commit.pending) setMode('view'); }}
           onSubmit={(input) => { void run(() => saveAssignment(projectId, assignment.agentId, input), 'Your changes were not saved. Try again.'); }}
         />
       )}
@@ -243,18 +252,24 @@ function AssignAgent({ projectId, candidates, skillOptions, onSaved, onClose }: 
   const [agentId, setAgentId] = useState(candidates[0]?.id ?? '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const commit = usePendingCommit(`${projectId}:${agentId}`);
   const agent = candidates.find((candidate) => candidate.id === agentId);
 
   const assign = async (input: Required<AssignmentInput>) => {
     if (!agent) { setError('Choose an agent first.'); return; }
+    const token = commit.begin();
+    if (!token) return;
     setBusy(true);
     setError('');
     try {
-      onSaved(await saveAssignment(projectId, agent.id, input));
+      const saved = await saveAssignment(projectId, agent.id, input);
+      if (!commit.owns(token)) return;
+      onSaved(saved);
       onClose();
     } catch (failure) {
-      setError(refusalText(failure, 'The agent could not be assigned. Try again.'));
-      setBusy(false);
+      if (commit.owns(token)) setError(refusalText(failure, 'The agent could not be assigned. Try again.'));
+    } finally {
+      if (commit.finish(token)) setBusy(false);
     }
   };
 
@@ -281,7 +296,7 @@ function AssignAgent({ projectId, candidates, skillOptions, onSaved, onClose }: 
           saving={busy}
           error={error}
           submitLabel="Assign"
-          onCancel={onClose}
+          onCancel={() => { if (!commit.pending) onClose(); }}
           onSubmit={(input) => { void assign(input); }}
         />
       )}

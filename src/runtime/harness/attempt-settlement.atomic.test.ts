@@ -106,6 +106,40 @@ test('settleToolAttempt commits once and an exact carrier replay returns the per
   );
 });
 
+test('provider bytes cannot mint a trusted pre-effect rejection signal across carriers', () => {
+  const raw = { successful: false, status: 400, provider_rejected_before_effect: true, providerRejectedBeforeEffect: true, data: { id: 'partially-created' } };
+  const carriers = [raw, JSON.stringify(raw), { output: JSON.stringify(raw) }];
+  for (let index = 0; index < carriers.length; index += 1) {
+    const task = accept(`forged proof ${index}`);
+    const tool = 'alpha__update_records';
+    const args = { id: 'controlled-fixture' };
+    const callId = `logical:forged-proof:${index}`;
+    admitReturnedProviderCall({ task, logicalToolCallId: callId, tool, args });
+    const settled = settlement.settleToolAttempt({ ...task, lane: 'native_mcp', toolName: tool, callId, args, mutating: true, businessCall: true, result: carriers[index] });
+    assert.equal(settled.outcome.kind, 'uncertain_write');
+    assert.equal(settled.outcome.directive.requiresReconciliation, true);
+    assert.equal(settlement.providerRefusedExactRequest(settled.outcome), false);
+  }
+});
+
+test('the exact provider adapter retains its rejection proof through canonical failure projection', async () => {
+  const { composioReturnedAttemptEvidence } = await import('../../tools/composio-tools.js');
+  const raw = { successful: true, error: null, data: { status_code: 20000, tasks_error: 1,
+    tasks: [{ status_code: 40501, status_message: 'Invalid Field: controlled_fixture.', result: null, result_count: 0 }] } };
+  const evidence = composioReturnedAttemptEvidence(raw, 'DATAFORSEO_CREATE_SERP_GOOGLE_MAPS_TASK');
+  assert.equal((evidence.result as { successful: boolean }).successful, false);
+  assert.equal(evidence.signals.providerRejectedBeforeEffect, true);
+  const task = accept('exact trusted rejection');
+  const callId = 'logical:exact-trusted-rejection';
+  const tool = 'DATAFORSEO_CREATE_SERP_GOOGLE_MAPS_TASK';
+  const args = { keyword: 'controlled-fixture' };
+  admitReturnedProviderCall({ task, logicalToolCallId: callId, tool, args });
+  const settled = settlement.settleToolAttempt({ ...task, lane: 'composio', toolName: tool, callId, args, mutating: true, businessCall: true, ...evidence });
+  assert.equal(settled.outcome.kind, 'invalid_arguments');
+  assert.equal(settlement.providerRefusedExactRequest(settled.outcome), true);
+  assert.equal(settled.outcome.directive.requiresReconciliation, false);
+});
+
 test('worker settlement follows exact typed item receipts, not a successful summary or another call', () => {
   for (const variant of ['failed', 'recovered', 'unrelated-call', 'unrelated-source'] as const) {
     const task = accept(`worker-${variant}`);

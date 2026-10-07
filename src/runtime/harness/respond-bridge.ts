@@ -181,6 +181,9 @@ export interface RespondHarnessLimits {
   connectionExecutionLeaseOwner?: string;
   /** Trusted daemon dispatcher only. Never supplied by a browser/model. */
   connectionRecoveryLeaseOwner?: string;
+  /** Trusted background dispatcher, from the task's frozen saved specialist
+   * binding. A request.model string alone never grants exact pin authority. */
+  delegatedAgentModelPin?: string;
 }
 
 const MATERIAL_SOURCE_AUTHORITY_BLOCKED_TEXT =
@@ -1510,6 +1513,7 @@ export async function respondViaHarness(
     maxSteps?: number;
     /** The server-side owner that acquired this connection execution lease. */
     connectionExecutionLeaseOwner?: string;
+    delegatedAgentModelPin?: string;
   } = {},
 ): Promise<AssistantResponse> {
   // Request-local offsets expose pre-routing work without another model call
@@ -1570,6 +1574,11 @@ export async function respondViaHarness(
       savedAgentPin = choice;
       opts = { ...opts, modelOverride: choice.modelId };
     }
+  }
+  const delegatedAgentModelPin = surface === 'background' && !connection
+    ? opts.delegatedAgentModelPin : undefined;
+  if (delegatedAgentModelPin) {
+    opts = { ...opts, modelOverride: delegatedAgentModelPin };
   }
 
   if (!getSession(sessionId)) {
@@ -2034,7 +2043,8 @@ export async function respondViaHarness(
     } catch { /* Diagnostics never change dispatch or completion behavior. */ }
     // The exact saved choice (or a resumed execution's frozen checkpoint
     // model) spans lazy construction and every awaited foreground response.
-    const exactForegroundModel = savedAgentPin?.modelId ?? connection?.checkpoint.agent?.modelId;
+    const exactForegroundModel = savedAgentPin?.modelId ?? connection?.checkpoint.agent?.modelId
+      ?? delegatedAgentModelPin;
     const result = await withPinnedWorkerModel(exactForegroundModel, () => runConversationImpl({
       buildAgent,
       sessionId,

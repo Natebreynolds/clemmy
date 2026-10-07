@@ -367,8 +367,14 @@ function nestedDataForSeoFailure(value: Record<string, unknown>): Omit<ComposioF
     : `provider task status ${providerCode}`;
   const notFound = providerCode === 40_401;
   const invalidFieldRejection = providerCode === 40_501
-    && failedTask.result == null
-    && (failedTask.result_count === undefined || failedTask.result_count === 0);
+    && tasks.length === 1
+    && (data?.tasks_count === undefined || data.tasks_count === 1)
+    && data?.tasks_error === 1
+    && data.status_code === 20_000
+    && value.successful === true
+    && value.error == null
+    && failedTask.result === null
+    && failedTask.result_count === 0;
   return {
     summary: statusMessage,
     notFound,
@@ -459,8 +465,24 @@ export function canonicalComposioSettlementResult(
  * machine-readable pre-effect rejection code and verifies the task produced no
  * result. Generic provider prose and ordinary HTTP-looking fields remain
  * commit-ambiguous. */
-export function composioFailureProvesNoCommit(value: unknown): boolean {
-  return detectComposioFailure(value).provesNoCommit === true;
+export function composioFailureProvesNoCommit(value: unknown, toolSlug?: string): boolean {
+  // Shape alone cannot identify the provider, and one failed member cannot
+  // vouch for a multistage request. The dispatched operation owns this adapter.
+  return Boolean(toolSlug === 'DATAFORSEO_CREATE_SERP_GOOGLE_MAPS_TASK'
+    && detectComposioFailure(value).provesNoCommit === true);
+}
+
+/** Preserve trusted adapter evidence before canonicalization replaces the
+ * transport-success wrapper with the nested provider's failure verdict. */
+export function composioReturnedAttemptEvidence(
+  value: unknown,
+  toolSlug: string,
+  verdict: ComposioFailureVerdict = detectComposioFailure(value),
+): { result: unknown; signals: AttemptSignals } {
+  return {
+    result: canonicalComposioSettlementResult(value, verdict),
+    signals: composioFailureProvesNoCommit(value, toolSlug) ? { providerRejectedBeforeEffect: true } : {},
+  };
 }
 
 /** Narrow nominal thrown-error proof owned by trusted host/client code.
@@ -714,7 +736,7 @@ export function formatComposioExecuteOutput(
     const label = options.toolName || 'composio_execute_tool';
     const where = ` (slug=${options.toolSlug})`;
     const toolkit = registeredToolkitOfSlug(options.toolSlug).toUpperCase();
-    if (failure.provesNoCommit === true) {
+    if (composioFailureProvesNoCommit(value, options.toolSlug)) {
       return [
         '[provider-dispatch:rejected]',
         `⚠️ ${label} FAILED${where}: ${summary}. The provider rejected this request before creating the requested external effect.`,
@@ -3871,10 +3893,13 @@ export async function dispatchComposioTool(
         }, providerDispatch)
         : await providerDispatch();
       const failure = detectComposioFailure(result);
+      const evidence = composioReturnedAttemptEvidence(result, toolSlug, failure);
       settleComposioReturned(
         toolSlug,
         resolved.args,
-        canonicalComposioSettlementResult(result, failure),
+        evidence.result,
+        false,
+        evidence.signals,
       );
       providerOutcomeSettled = true;
       if (failure.failed) {
@@ -4354,7 +4379,8 @@ async function runComposioExecuteInner(
       // this, and only after failure detection and async resolution have had
       // their say — a wire result is not a settlement.
       let settledForLearning: unknown = failure.failed ? null : result;
-      const canonicalSettlementResult = canonicalComposioSettlementResult(result, failure);
+      const canonicalSettlementEvidence = composioReturnedAttemptEvidence(result, toolSlug, failure);
+      const canonicalSettlementResult = canonicalSettlementEvidence.result;
       if (failure.failed) {
         output += suppressComposioConnectionAfterHardFailure(effectiveConnectionId, result);
         // F2: a not-connected RESULT (returned, not thrown) also trips the breaker.
@@ -4440,7 +4466,7 @@ async function runComposioExecuteInner(
       // the authority path.
       const finalSettlementResult = settledForLearning ?? canonicalSettlementResult;
       let settlementResult = finalSettlementResult;
-      let settlementSignals: AttemptSignals = {};
+      let settlementSignals: AttemptSignals = canonicalSettlementEvidence.signals;
       if (documentedCreateProjection.status === 'ready' && !failure.failed) {
         const projected = projectDocumentedCreateResult(
           documentedCreateProjection.admission,

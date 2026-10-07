@@ -32,7 +32,7 @@ const {
   getPendingAction,
 } = await import('../runtime/harness/pending-actions.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
-const { createSession, listEvents, openEventLog } = await import('../runtime/harness/eventlog.js');
+const { createSession, listEvents, openEventLog, claimRunAttemptLease, recordRunAttemptUserInput, finishRunAttempt } = await import('../runtime/harness/eventlog.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { listSendTrustGrants } = await import('../agents/plan-scope.js');
 const { startChatApprovalResume, _resetChatApprovalResumeForTest } = await import('../runtime/harness/chat-approval-resume.js');
@@ -57,6 +57,35 @@ async function boot(authorized = { v: true }) {
 function trustGrantIds(): string[] {
   return listSendTrustGrants().map((grant) => grant.id).sort();
 }
+
+test('reattach control projects only the active attempt bound to the exact accepted source', async () => {
+  const session = createSession({ kind: 'chat', channel: 'desktop' });
+  const lease = claimRunAttemptLease({ sessionId: session.id, runId: 'control-fixture', ownerId: 'fixture-owner', leaseMs: 60_000 });
+  assert.equal(lease.claimed, true);
+  assert.ok(lease.attempt);
+  const source = recordRunAttemptUserInput(lease.attempt, { turn: 1, role: 'user', data: { text: 'Controlled read.', runId: 'control-fixture' } });
+  const authorized = { v: true };
+  const h = await boot(authorized);
+  try {
+    const endpoint = `${h.url}/api/sessions/${session.id}/control`;
+    const exact = await fetch(`${endpoint}?sourceUserSeq=${source.seq}`);
+    assert.equal(exact.status, 200);
+    const { activeRun } = await exact.json() as { activeRun: { sessionId: string; sourceUserSeq: number; attemptId: string; runScopeId: string; cancelEndpoint: string; backgroundEndpoint: string } };
+    assert.equal(activeRun.sessionId, session.id);
+    assert.equal(activeRun.sourceUserSeq, source.seq);
+    assert.equal(activeRun.attemptId, lease.attempt.attemptId);
+    assert.ok(activeRun.runScopeId.includes('control-fixture'));
+    assert.equal(new URL(activeRun.cancelEndpoint, h.url).searchParams.get('attemptId'), lease.attempt.attemptId);
+    assert.equal(new URL(activeRun.backgroundEndpoint, h.url).searchParams.get('attemptId'), lease.attempt.attemptId);
+    assert.deepEqual(await (await fetch(`${endpoint}?sourceUserSeq=${source.seq + 1}`)).json(), { activeRun: null });
+    assert.equal((await fetch(`${endpoint}?sourceUserSeq=0`)).status, 400);
+    authorized.v = false;
+    assert.equal((await fetch(`${endpoint}?sourceUserSeq=${source.seq}`)).status, 401);
+    authorized.v = true;
+    finishRunAttempt(lease.attempt);
+    assert.deepEqual(await (await fetch(`${endpoint}?sourceUserSeq=${source.seq}`)).json(), { activeRun: null });
+  } finally { await h.close(); }
+});
 
 function matchingApprovalInterrupt(tool: string, args: Record<string, unknown>): string {
   const agent = new Agent({ name: 'PendingActionOwnershipTest', instructions: 'test' });
@@ -421,6 +450,15 @@ test('edit by hand on a queued card: the edited field lands on the record, the c
     });
     assert.equal(unknown.status, 400, 'only a field the card showed can be edited');
     assert.equal(getPendingAction(record.id)?.payloadHash, record.payloadHash, 'a refused edit changes nothing');
+
+    for (const modifiedFields of [{ command: 'x'.repeat(20_001) }, { command: 'printf valid', timeout_ms: 3 }]) {
+      const invalid = await fetch(`${h.url}/api/console/harness-approvals/${card.approvalId}/approve_with_edits`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modifiedFields }),
+      });
+      assert.equal(invalid.status, 400);
+      assert.equal(getPendingAction(record.id)?.payloadHash, record.payloadHash);
+      assert.equal(approvalRegistry.get(card.approvalId)?.status, 'pending');
+    }
 
     const res = await fetch(`${h.url}/api/console/harness-approvals/${card.approvalId}/approve_with_edits`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modifiedFields: { command: 'ssh -G -vv localhost' } }),

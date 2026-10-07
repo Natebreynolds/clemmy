@@ -85,6 +85,6 @@ test('a change in words and an edit by hand both live on the card', () => {
   assert.match(SOURCE, /Was: <span className="line-through">/);
   assert.match(SOURCE, /Edit by hand/);
   assert.match(SOURCE, /Yes, send this one/);
-  assert.match(SOURCE, /onApproveWithEdits!\(\{ \[editableField\.name\]: editedValue \}\)/);
+  assert.match(SOURCE, /onApproveWithEdits\(\{ \[editableField\.name\]: editedValue \}\)/);
   assert.match(SOURCE, /Exactly what you typed goes out, checked the same way first\./);
 });

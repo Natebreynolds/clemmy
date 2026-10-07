@@ -56,6 +56,117 @@ const ev = (seq: number, type: string, data: Record<string, unknown> = {}): Harn
 
 const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+test('a mounted phone observes card edits and foreign-device completion after approval settlement', async () => {
+  const transport = new FakeTransport();
+  const engine = new ChatEngine({ sessionId: 'cross-device-card', transport, observeWhileIdle: true, streamTimings: { approvalSettleMs: 1 }, api: {
+    send: async () => ({ sessionId: 'cross-device-card', accepted: true }),
+    loadSession: async () => ({ events: [{ ...ev(1, 'user_input_received', { text: 'Fixture' }), role: 'user', turn: 1 }], latestSeq: 1 }),
+  } });
+  try {
+    await engine.open();
+    await wait(5);
+    transport.live!.onEvent(ev(2, 'approval_requested', { approvalId: 'apr-cross', subject: 'Fixture' }));
+    await wait(10);
+    assert.ok(transport.live, 'the card can still receive its resolution after the approval settle timer');
+    transport.live!.onEvent(ev(3, 'approval_resolved', { approvalId: 'apr-cross', decision: 'approve_with_edits' }));
+    assert.equal(engine.snapshot().messages.find(message => message.approval)?.approval?.resolution, 'approved');
+    transport.live!.onEvent({ ...ev(4, 'user_input_received', { text: 'Continue fixture' }), role: 'user', turn: 2 });
+    assert.equal(engine.snapshot().busy, true);
+    assert.equal(engine.snapshot().cancelKey, null, 'an adopted turn cannot borrow an old local Stop key');
+    assert.equal(engine.snapshot().activeSourceUserSeq, 4, 'Stop can recover authority only for this observed source');
+    transport.live!.onEvent(ev(0, 'stream_token', { delta: 'Visible draft', sourceUserSeq: 4 }));
+    transport.live!.onEvent(ev(5, 'conversation_completed', { sourceUserSeq: 4, reply: 'Exact edited result.' }));
+    assert.equal(engine.snapshot().busy, false);
+    assert.equal(engine.snapshot().messages.at(-1)?.text, 'Exact edited result.');
+    assert.ok(transport.live, 'the next device decision still has an observer');
+    engine.resume();
+    await wait(5);
+    assert.ok(transport.fetchRecentCalls > 0, 'wake/reconciliation polls the live cursor');
+  } finally { engine.dispose(); }
+  assert.equal(transport.live, null, 'leaving the conversation closes its listener');
+});
+
+test('a phone attaches a direct card resume to its new source and hides the internal approval command', async () => {
+  const transport = new FakeTransport();
+  const source: HarnessEvent = { ...ev(4, 'user_input_received', { synthetic: true, source: 'approval_resume',
+    approvalId: 'apr-cross', decision: 'approve_with_edits', text: 'Approve apr-cross.' }), role: 'user', turn: 2 };
+  const history: HarnessEvent[] = [
+    { ...ev(1, 'user_input_received', { text: 'Fixture' }), role: 'user', turn: 1 },
+    ev(2, 'approval_requested', { approvalId: 'apr-cross', subject: 'Fixture' }),
+    ev(3, 'approval_resolved', { approvalId: 'apr-cross', decision: 'approve_with_edits' }),
+  ];
+  const engine = new ChatEngine({ sessionId: 'direct-card', transport, observeWhileIdle: true, api: {
+    send: async () => ({ sessionId: 'direct-card', accepted: true }),
+    loadSession: async () => ({ events: history, latestSeq: 3 }),
+  } });
+  try {
+    await engine.open();
+    await wait(5);
+    transport.live!.onEvent(source);
+    assert.equal(engine.snapshot().busy, true);
+    assert.equal(engine.snapshot().cancelKey, null);
+    assert.deepEqual(engine.snapshot().messages.filter(message => message.role === 'user').map(message => message.text), ['Fixture']);
+    assert.equal(engine.snapshot().messages.at(-1)?.acceptedSource?.sourceUserSeq, 4);
+    transport.live!.onEvent(ev(0, 'stream_token', { delta: 'Exact draft', sourceUserSeq: 4 }));
+    assert.equal(engine.snapshot().messages.at(-1)?.text, 'Exact draft');
+    const terminal = ev(5, 'conversation_completed', { sourceUserSeq: 4, reply: 'Edited fixture result.' });
+    transport.live!.onEvent(terminal);
+    assert.equal(engine.snapshot().messages.at(-1)?.text, 'Edited fixture result.');
+    assert.equal(engine.snapshot().busy, false);
+    const replayed = foldTranscript([...history, source, terminal], 'direct-card');
+    assert.deepEqual(replayed.filter(message => message.role === 'user').map(message => message.text), ['Fixture']);
+    assert.equal(replayed.at(-1)?.text, 'Edited fixture result.');
+  } finally { engine.dispose(); }
+});
+
+test('a reopened phone retains the queued editing affordance and the previous card wording', () => {
+  const preview = { operation: 'Fixture send', ask: 'Send this exact fixture?', fields: [{ name: 'body', value: 'Revised fixture' }] };
+  const revises = { approvalId: 'apr-original', changeRequest: 'Use the revised fixture', fields: [{ name: 'body', value: 'Original fixture' }] };
+  const [card] = foldTranscript([ev(2, 'approval_requested', { approvalId: 'apr-reopened', subject: 'Fixture',
+    pendingActionId: 'pa-fixture', preview, revises })], 'reopened-card');
+  assert.equal(card?.approval?.queued, true);
+  assert.deepEqual(card?.approval?.preview, preview);
+  assert.deepEqual(card?.approval?.revises, revises);
+});
+
+test('a reopened phone exposes its exact accepted source without inventing a local cancel key', async () => {
+  const engine = new ChatEngine({ sessionId: 'reopened-source', transport: new FakeTransport(), api: {
+    send: async () => ({ sessionId: 'reopened-source', accepted: true }),
+    loadSession: async () => ({ latestSeq: 20, events: [{ ...ev(20, 'user_input_received', { text: 'Fixture waiting' }), role: 'user', turn: 1 }] }),
+  } });
+  try {
+    await engine.open();
+    assert.equal(engine.snapshot().busy, true);
+    assert.equal(engine.snapshot().cancelKey, null);
+    assert.equal(engine.snapshot().activeSourceUserSeq, 20);
+  } finally { engine.dispose(); }
+});
+
+test('phone live and replayed edited resolutions retain exact approved fields and the previous text', async () => {
+  const transport = new FakeTransport();
+  const card = ev(2, 'approval_requested', { approvalId: 'apr-edited', subject: 'Fixture', pendingActionId: 'pa-fixture',
+    preview: { operation: 'Fixture send', fields: [{ name: 'body', value: 'Before' }] } });
+  const edited = ev(3, 'approval_resolved', { approvalId: 'apr-edited', decision: 'approve_with_edits', edited: true, editedFields: { body: 'Exact edit' } });
+  const plain = ev(4, 'approval_resolved', { approvalId: 'apr-edited', decision: 'approve' });
+  const engine = new ChatEngine({ sessionId: 'edited-fields', transport, observeWhileIdle: true, api: {
+    send: async () => ({ sessionId: 'edited-fields', accepted: true }),
+    loadSession: async () => ({ latestSeq: 2, events: [card] }),
+  } });
+  try {
+    await engine.open();
+    await wait(5);
+    transport.live!.onEvent(edited);
+    transport.live!.onEvent(plain);
+    const liveApproval = engine.snapshot().messages.find(message => message.approval)?.approval;
+    const replayApproval = foldTranscript([card, edited, plain], 'edited-fields')[0]?.approval;
+    for (const approval of [liveApproval, replayApproval]) {
+      assert.equal(approval?.preview?.fields[0]?.value, 'Exact edit');
+      assert.equal(approval?.revises?.fields?.[0]?.value, 'Before');
+      assert.equal(approval?.resolution, 'approved');
+    }
+  } finally { engine.dispose(); }
+});
+
 test('approval consent facts survive both live delivery and transcript replay verbatim', async () => {
   const transport = new FakeTransport();
   const engine = new ChatEngine({ transport, api: {

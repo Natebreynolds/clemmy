@@ -7,17 +7,22 @@
  * (live 2026-10-06: 223 s, nine judge rounds, every one "fulfilled", ended
  * blocked). The journal is the only memory that survives an activation.
  */
-import { listEvents } from './eventlog.js';
+import { openEventLog } from './eventlog.js';
 
 export const TERMINAL_DELIVERY_RESUME_HEARTBEAT = 'terminal_delivery_resume' as const;
 
 /** Whether this accepted source has already been resumed by the delivery judge. */
 export function priorTerminalDeliveryResumes(sessionId: string, sourceUserSeq: number | undefined): 0 | 1 {
-  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return 0;
+  // An unbound legacy activation cannot establish an unused allowance.
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return 1;
   try {
-    const resumed = listEvents(sessionId, { types: ['heartbeat'], desc: true, limit: 200 })
-      .some((event) => event.data.kind === TERMINAL_DELIVERY_RESUME_HEARTBEAT
-        && event.data.sourceUserSeq === sourceUserSeq);
+    const resumed = openEventLog().prepare(`
+      SELECT 1 FROM events
+      WHERE session_id = ? AND type = 'heartbeat'
+        AND json_extract(data_json, '$.kind') = ?
+        AND json_extract(data_json, '$.sourceUserSeq') = ?
+      LIMIT 1
+    `).get(sessionId, TERMINAL_DELIVERY_RESUME_HEARTBEAT, sourceUserSeq);
     return resumed ? 1 : 0;
   } catch {
     // An unreadable journal must not buy the judge another resume.

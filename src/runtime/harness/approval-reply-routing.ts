@@ -63,18 +63,19 @@ function confirmQuestionFor(row: approvalRegistry.PendingApprovalRow): string {
     : `Just to be sure — should I go ahead with "${row.subject}"?`;
 }
 
-/** The host already asked this exact question back once in this session. */
-function confirmationAlreadyAsked(sessionId: string, question: string): boolean {
+/** The host already asked this exact card back once. Call inside the endpoint's
+ * control transaction as well as semantic preparation, to fence concurrent replies. */
+export function approvalConfirmationAlreadyAsked(sessionId: string, approvalId: string): boolean {
   try {
     return openEventLog().prepare(`
       SELECT 1 FROM events
        WHERE session_id = ? AND type = 'awaiting_user_input'
          AND json_extract(data_json, '$.reason') = 'approval_confirmation_required'
-         AND json_extract(data_json, '$.question') = ?
+         AND json_extract(data_json, '$.approvalId') = ?
        LIMIT 1
-    `).get(sessionId, question) !== undefined;
+    `).get(sessionId, approvalId) !== undefined;
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -178,7 +179,7 @@ export async function routeReplyToPendingApproval(input: {
       // question back instead, once — a plain yes or no to it is parsed
       // exactly, with no model at all. A second unreadable reply to the
       // same question is conversation.
-      if (confirmationAlreadyAsked(input.sessionId, confirmQuestionFor(row))) return fallback;
+      if (approvalConfirmationAlreadyAsked(input.sessionId, row.approvalId)) return fallback;
       return { intent: null, confirm: { approvalId: row.approvalId, leaning: 'unread', question: confirmQuestionFor(row) } };
     }
     const sure = reading.kind !== null && (reading.confidence ?? 0) >= APPROVAL_REPLY_SURE;
@@ -200,6 +201,7 @@ export async function routeReplyToPendingApproval(input: {
     // Leaning yes or no, not sure: ask the card's question back in one line.
     // A fresh turn here re-plans the same action and mints a duplicate card.
     if ((reading.kind === 'approves' || reading.kind === 'declines') && (reading.confidence ?? 0) >= APPROVAL_REPLY_LEANING) {
+      if (approvalConfirmationAlreadyAsked(input.sessionId, row.approvalId)) return fallback;
       return { intent: null, confirm: { approvalId: row.approvalId, leaning: reading.kind, question: confirmQuestionFor(row) } };
     }
     return fallback;

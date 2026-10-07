@@ -17,11 +17,13 @@ import type { ApprovalConfirm, ChatAttachment,
 } from './types.js';
 import { approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, cardDecisionOf, type CardDecision } from './types.js';
 import { reduceFeed } from './reduce-lifecycle.js';
+import { advanceWorkflowChildActivity, clearModelRetryProgress, isModelRetryProgressBoundary, isWorkflowChildActivity, readModelRetryProgress, readWorkflowQueueDispatch, updateWorkflowDispatchActivity, workflowDispatchText } from './reduce-activity.js';
 import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
 import { terminalCompletionPresentation } from './terminal-presentation.js';
 import { settleTerminalActivity, activityTerminalOutcomeForMessageStatus } from './activity-presentation.js';
 import { runChatStream, type ChatStreamHandle, type StreamTransport } from './stream.js';
 import { acceptedConversationSource, appendConversationCheckIn } from './conversation-check-in.js';
+import { acceptedApprovalResumeSource, approvalWithCanonicalEdits } from './approval-edit.js';
 
 export interface SendResult {
   sessionId: string;
@@ -70,6 +72,9 @@ export interface ChatEngineOptions {
   now?: () => number;
   /** Stream timing overrides ride through to runChatStream (tests). */
   streamTimings?: Partial<Parameters<typeof runChatStream>[0]>;
+  /** A mounted UI also observes decisions and turns from other devices while
+   * idle. One-shot consumers retain their terminal-close behavior. */
+  observeWhileIdle?: boolean;
 }
 
 let engineIdSeq = 0;
@@ -113,16 +118,6 @@ function delegatedSourceUserSeq(message: ChatMessage): number | null {
     : delegatedSourceSeqFromMessageId(message.id);
 }
 
-function exactRunIds(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return [...new Set(value.filter((id): id is string => (
-    typeof id === 'string'
-    && id.trim().length > 0
-    && id.length <= 200
-    && /^[A-Za-z0-9_.:-]+$/.test(id)
-  )))];
-}
-
 export class ChatEngine {
   private readonly transport: StreamTransport;
   private readonly api: ChatApi;
@@ -130,6 +125,7 @@ export class ChatEngine {
   private readonly newKey: () => string;
   private readonly now: () => number;
   private readonly streamTimings: Partial<Parameters<typeof runChatStream>[0]>;
+  private readonly observeWhileIdle: boolean;
 
   private sessionId: string | null;
   private readonly agentId: string | null;
@@ -151,6 +147,8 @@ export class ChatEngine {
   /** Cursor immediately before the current ordinary send. A terminal naming a
    * source at/below this fence is a trailing terminal for earlier work. */
   private activeSourceFloorSeq = 0;
+  private modelRetryProgressSource: number | null = null;
+  private modelRetryProgressSeq = 0;
 
   constructor(options: ChatEngineOptions) {
     this.transport = options.transport;
@@ -160,6 +158,7 @@ export class ChatEngine {
     this.newKey = options.newIdempotencyKey ?? defaultIdempotencyKey;
     this.now = options.now ?? Date.now;
     this.streamTimings = options.streamTimings ?? {};
+    this.observeWhileIdle = options.observeWhileIdle === true;
     this.sessionId = options.sessionId ?? null;
     this.agentId = options.agentId ?? null;
   }
@@ -184,6 +183,7 @@ export class ChatEngine {
       // Derived rather than cleared at each of the several places busy drops,
       // so a stale key can never outlive the turn it belonged to.
       cancelKey: this.busy ? this.inFlightKey : null,
+      activeSourceUserSeq: this.busy ? this.activeSourceUserSeq : null,
       activeTaskMode: this.busy ? this.messages.find(message => message.id === this.activeAssistantId)?.taskMode : undefined,
     };
   }
@@ -485,6 +485,7 @@ export class ChatEngine {
         this.connection = 'idle';
         this.emit();
       },
+      keepOpenAfterTerminal: this.observeWhileIdle,
       now: this.now,
       ...this.streamTimings,
     } as Parameters<typeof runChatStream>[0]);
@@ -508,6 +509,8 @@ export class ChatEngine {
   private terminalOwnsActiveTurn(event: HarnessEvent): boolean {
     const sourceUserSeq = sourceUserSeqOf(event);
     if (sourceUserSeq !== null) {
+      if (event.sessionId && event.sessionId !== this.sessionId
+        && this.messages.some(message => delegatedSourceUserSeq(message) === sourceUserSeq)) return false;
       const delegatedTarget = this.messages.find((message) => (
         message.role === 'assistant'
         && message.delegatedWork !== undefined
@@ -597,6 +600,10 @@ export class ChatEngine {
   private applyEvent(event: HarnessEvent): void {
     if (this.disposed) return;
     const d = (event.data ?? {}) as Record<string, unknown>;
+    if ((event.type === 'conversation_completed' || event.type === 'run_failed')
+      && event.sessionId && event.sessionId !== this.sessionId
+      && sourceUserSeqOf(event) !== null
+      && this.messages.some(message => delegatedSourceUserSeq(message) === sourceUserSeqOf(event))) return;
     if (event.seq > this.cursor && (!event.sessionId || event.sessionId === this.sessionId)) {
       this.cursor = event.seq;
     }
@@ -612,13 +619,63 @@ export class ChatEngine {
       // Keep the current work bubble, mode, busy state and Stop request intact.
       return;
     }
+    if (event.sessionId?.startsWith('workflow:') && (isWorkflowChildActivity(event)
+      || event.type === 'heartbeat' || event.type === 'stream_token' || event.type === 'run_completed')) {
+      let changed = false;
+      this.messages = this.messages.map(message => {
+        if (message.status !== 'thinking' || !message.delegatedWork) return message;
+        const work = advanceWorkflowChildActivity(message.delegatedWork, event);
+        if (!work) return message;
+        changed = true;
+        return { ...message, text: workflowDispatchText(work), delegatedWork: work,
+          activity: updateWorkflowDispatchActivity(reduceFeed(message.activity ?? [], event, this.now), work) };
+      });
+      if (changed) this.emit();
+      return;
+    }
+    if (this.modelRetryProgressSource !== this.activeSourceUserSeq) {
+      this.modelRetryProgressSource = this.activeSourceUserSeq;
+      this.modelRetryProgressSeq = 0;
+    }
+    const eventSource = sourceUserSeqOf(event);
+    if (isModelRetryProgressBoundary(event) && this.activeSourceUserSeq !== null
+      && Number.isSafeInteger(event.seq) && event.seq > this.activeSourceUserSeq
+      && (eventSource === null || eventSource === this.activeSourceUserSeq)
+      && (!event.sessionId || event.sessionId === this.sessionId)) {
+      this.modelRetryProgressSeq = Math.max(this.modelRetryProgressSeq, event.seq);
+    }
     switch (event.type) {
+      case 'model_resilience_observed': {
+        const retry = readModelRetryProgress(event);
+        if (!retry || !this.busy || !this.activeAssistantId
+          || retry.sourceUserSeq !== this.activeSourceUserSeq
+          || event.seq <= this.modelRetryProgressSeq
+          || (event.sessionId && event.sessionId !== this.sessionId)) return;
+        this.modelRetryProgressSeq = event.seq;
+        this.updateActive((message) => {
+          const activity = reduceFeed(message.activity ?? [], event, this.now);
+          return activity === message.activity ? message : { ...message, activity };
+        });
+        break;
+      }
       case 'stream_token': {
         if (!this.busy) return;
         // A draft belongs to one accepted source; never paint it into another.
         const source = typeof d.sourceUserSeq === 'number' ? d.sourceUserSeq : null;
         if (source !== null && this.activeSourceUserSeq !== null && source !== this.activeSourceUserSeq) return;
-        this.updateActive((m) => applyStreamToken(m, d));
+        this.updateActive((m) => {
+          const next = applyStreamToken(m, d);
+          if (next === m || d.reset === true || typeof d.delta !== 'string' || !d.delta.trim()
+            || source === null || source !== this.activeSourceUserSeq
+            || (event.sessionId && event.sessionId !== this.sessionId)) return next;
+          // Modern draft frames use seq0. Their useful text proves progress
+          // beyond the durable cursor already observed, without dropping old
+          // history or inventing a persisted sequence for a live draft.
+          this.modelRetryProgressSeq = Math.max(this.modelRetryProgressSeq, this.cursor,
+            Number.isSafeInteger(event.seq) && event.seq >= 0 ? event.seq : 0);
+          const activity = next.activity ? clearModelRetryProgress(next.activity, this.now) : next.activity;
+          return activity === next.activity ? next : { ...next, activity };
+        });
         break;
       }
       case 'conversation_preamble': {
@@ -640,13 +697,29 @@ export class ChatEngine {
         if (event.sessionId && event.sessionId !== this.sessionId) return;
         // What the person typed is the bubble; `text` may carry folded
         // attachment contents meant for the model, never for the screen.
-        const text = userVisibleText(d);
+        const approvalId = typeof d.approvalId === 'string' ? d.approvalId : undefined;
+        const resumeSource = acceptedApprovalResumeSource(event, this.sessionId,
+          this.messages.find(message => message.approval?.approvalId === approvalId)?.approval?.approvalId);
+        const text = resumeSource ? '' : userVisibleText(d);
         const cardDecision = cardDecisionOf(d);
         if (cardDecision) {
           this.cardDecisionsBySource.set(event.seq, cardDecision);
         }
-        if (!text) return;
-        const acceptedSource = acceptedConversationSource(event, this.sessionId);
+        if (!text && !resumeSource) return;
+        const acceptedSource = resumeSource ?? acceptedConversationSource(event, this.sessionId);
+        let adoptedSource = false;
+        if (!this.busy && acceptedSource && event.seq > this.activeSourceFloorSeq
+          && !this.messages.some(message => message.acceptedSource?.sessionId === acceptedSource.sessionId
+            && message.acceptedSource.sourceUserSeq === acceptedSource.sourceUserSeq)) {
+          // A real turn accepted on the other device owns its own reply. It
+          // cannot borrow this device's older cancellation request key.
+          this.activeSourceFloorSeq = event.seq - 1;
+          this.activeSourceUserSeq = event.seq;
+          this.activeAssistantId = null;
+          this.inFlightKey = null;
+          this.busy = true;
+          adoptedSource = true;
+        }
         if (
           this.busy
           && this.activeAssistantId
@@ -667,13 +740,19 @@ export class ChatEngine {
           : this.messages.findIndex((m) => m.role === 'user' && !m.steer
             && (m.pending === 'sending' || (acceptedSource && !m.acceptedSource && m.idempotencyKey === this.inFlightKey))
             && m.text === text && sameTaskMode(m.taskMode, readTaskMode(d.taskMode)));
-        if (pendingIndex >= 0) {
+        if (resumeSource) {
+          // Assistant-only source: the exact edited fields stay on the card.
+        } else if (pendingIndex >= 0) {
           this.messages = this.messages.map((m, i) => (i === pendingIndex ? { ...m, pending: undefined, acceptedSource } : m));
         } else if (!this.messages.some((m) => m.role === 'user' && (acceptedSource
           ? m.acceptedSource?.sourceUserSeq === event.seq && m.acceptedSource.sessionId === acceptedSource.sessionId
           : m.text === text && sameTaskMode(m.taskMode, readTaskMode(d.taskMode)) && m.pending === undefined))) {
           this.messages = [...this.messages, { id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode), acceptedSource,
             ...(cardDecision ? { cardDecision } : {}) }];
+        }
+        if (adoptedSource) {
+          this.ensureActiveAssistant();
+          this.updateActive(message => ({ ...message, acceptedSource, taskMode: readTaskMode(d.taskMode) }));
         }
         break;
       }
@@ -710,7 +789,7 @@ export class ChatEngine {
         const resolution = approvalResolutionFrom(d);
         if (!approvalId || !resolution) break;
         this.messages = this.messages.map((m) => (
-          m.approval?.approvalId === approvalId ? { ...m, approval: { ...m.approval, resolution } } : m
+          m.approval?.approvalId === approvalId ? { ...m, approval: { ...approvalWithCanonicalEdits(m.approval, d), resolution } } : m
         ));
         break;
       }
@@ -831,14 +910,11 @@ export class ChatEngine {
         break;
       }
       case 'async_work_dispatched': {
-        const sourceUserSeq = sourceUserSeqOf(event);
-        const runIds = exactRunIds(d.runIds);
-        if (
-          sourceUserSeq !== null
-          && runIds.length > 0
-          && this.activeAssistantId
-          && (this.activeSourceUserSeq === null || this.activeSourceUserSeq === sourceUserSeq)
-        ) {
+        const work = readWorkflowQueueDispatch(event);
+        if (!work || (event.sessionId && event.sessionId !== this.sessionId)) return;
+        const sourceUserSeq = work.sourceUserSeq;
+        if (this.messages.some(message => delegatedSourceUserSeq(message) === sourceUserSeq)) return;
+        if (this.busy && this.activeAssistantId && this.activeSourceUserSeq === sourceUserSeq) {
           const currentId = this.activeAssistantId;
           const delegatedId = delegatedAssistantMessageId(sourceUserSeq, event.seq);
           this.messages = this.messages.map((current) => {
@@ -847,13 +923,9 @@ export class ChatEngine {
             return {
               ...message,
               id: delegatedId,
-              text: message.text.trim()
-                ? message.text
-                : runIds.length === 1
-                  ? 'The workflow is running. I’ll report back here when it finishes.'
-                  : `${runIds.length} workflows are running. I’ll report back here when they finish.`,
+              text: workflowDispatchText(work),
               status: 'thinking',
-              delegatedWork: { sourceUserSeq, runIds, state: 'running' },
+              delegatedWork: work,
               activity: reduceFeed(message.activity ?? [], event, this.now),
             };
           });
@@ -864,16 +936,12 @@ export class ChatEngine {
           this.busy = false;
           break;
         }
-        if (!this.busy && !this.activeAssistantId) return;
-        this.updateActive((message) => {
-          const activity = reduceFeed(message.activity ?? [], event, this.now);
-          return activity === message.activity ? message : { ...message, activity };
-        });
         break;
       }
       default: {
         if (!this.busy && !this.activeAssistantId) return;
         this.updateActive((m) => {
+          if (m.delegatedWork && ['heartbeat', 'turn_started', 'turn_model_routed', 'step_started'].includes(event.type)) return m;
           const activity = reduceFeed(m.activity ?? [], event, this.now);
           return activity === m.activity ? m : { ...m, activity };
         });
@@ -954,21 +1022,93 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
   let pendingAwaitingMessageIndex: number | null = null;
   const awaitingMessageIndexBySource = new Map<number, number>();
   const delegatedMessageIndexBySource = new Map<number, number>();
+  const acceptedWorkflowSources = new Set<number>();
+  const closedWorkflowSources = new Set<number>();
   let currentSourceUserSeq: number | null = null;
+  // This new progress signal alone requires a still-open exact source. Keep
+  // older event folding rules unchanged, including legacy unbound terminals.
+  let modelRetrySourceClosed = true;
+  let modelRetryProgressSeq = 0;
+  let modelRetryObservedSeq = 0;
+  let modelRetryDraft: { text: string; answerDraft?: ChatMessage['answerDraft'] } = { text: '' };
   const taskModesBySource = new Map<number, TaskMode>();
   const planRefsBySource = new Map<number, NonNullable<ChatMessage['planArtifactRef']>>();
   const cardDecisionsBySource = new Map<number, CardDecision>();
   for (const event of events) {
     const d = (event.data ?? {}) as Record<string, unknown>;
+    if ((event.type === 'conversation_completed' || event.type === 'run_failed') && sessionId
+      && event.sessionId && event.sessionId !== sessionId && sourceUserSeqOf(event) !== null
+      && delegatedMessageIndexBySource.has(sourceUserSeqOf(event)!)) continue;
+    if (event.sessionId?.startsWith('workflow:') && (isWorkflowChildActivity(event)
+      || event.type === 'heartbeat' || event.type === 'stream_token' || event.type === 'run_completed')) {
+      for (const index of delegatedMessageIndexBySource.values()) {
+        const message = messages[index]!;
+        const work = message.delegatedWork && advanceWorkflowChildActivity(message.delegatedWork, event);
+        if (!work || message.status !== 'thinking') continue;
+        messages[index] = { ...message, text: workflowDispatchText(work), delegatedWork: work,
+          activity: updateWorkflowDispatchActivity(reduceFeed(message.activity ?? [], event), work) };
+      }
+      continue;
+    }
+    if (Number.isSafeInteger(event.seq) && event.seq > 0
+      && (!sessionId || !event.sessionId || event.sessionId === sessionId)) {
+      modelRetryObservedSeq = Math.max(modelRetryObservedSeq, event.seq);
+    }
     if (readLiveApprovalControl(event)) {
       if (event.type === 'conversation_completed' && !messages.some(message => message.id === `control-ack-${event.seq}`)) messages.push({
         id: `control-ack-${event.seq}`, role: 'assistant', ...terminalCompletionPresentation(d, ''),
       });
       continue;
     }
+    if (event.type === 'conversation_completed' || event.type === 'run_failed'
+      || event.type === 'awaiting_user_input' || event.type === 'approval_requested'
+      || event.type === 'async_work_dispatched') {
+      const source = sourceUserSeqOf(event);
+      if (source === null || source === currentSourceUserSeq) modelRetrySourceClosed = true;
+    }
+    const eventSource = sourceUserSeqOf(event);
+    if (isModelRetryProgressBoundary(event) && currentSourceUserSeq !== null
+      && Number.isSafeInteger(event.seq) && event.seq > currentSourceUserSeq
+      && (eventSource === null || eventSource === currentSourceUserSeq)
+      && (!sessionId || !event.sessionId || event.sessionId === sessionId)) {
+      modelRetryProgressSeq = Math.max(modelRetryProgressSeq, event.seq);
+    }
     switch (event.type) {
+      case 'stream_token': {
+        if (modelRetrySourceClosed || currentSourceUserSeq === null
+          || d.sourceUserSeq !== currentSourceUserSeq
+          || (sessionId && event.sessionId && event.sessionId !== sessionId)) break;
+        // Draft frames are normally absent from durable history. If supplied
+        // in a replay, validate placement for retry progress only; provisional
+        // words still cannot become the transcript's delivered answer.
+        const next = applyStreamToken(modelRetryDraft, d);
+        const usefulText = next !== modelRetryDraft && d.reset !== true
+          && typeof d.delta === 'string' && Boolean(d.delta.trim());
+        modelRetryDraft = next;
+        if (usefulText) {
+          modelRetryProgressSeq = Math.max(modelRetryProgressSeq, modelRetryObservedSeq,
+            Number.isSafeInteger(event.seq) && event.seq >= 0 ? event.seq : 0);
+          activity = clearModelRetryProgress(activity ?? []);
+        }
+        break;
+      }
+      case 'model_resilience_observed': {
+        const retry = readModelRetryProgress(event);
+        if (!retry || modelRetrySourceClosed || retry.sourceUserSeq !== currentSourceUserSeq
+          || event.seq <= modelRetryProgressSeq
+          || (sessionId && event.sessionId && event.sessionId !== sessionId)) break;
+        modelRetryProgressSeq = event.seq;
+        activity = reduceFeed(activity ?? [], event);
+        break;
+      }
       case 'user_input_received': {
-        const text = userVisibleText(d);
+        const approvalId = typeof d.approvalId === 'string' ? d.approvalId : undefined;
+        const resumeSource = acceptedApprovalResumeSource(event, sessionId,
+          messages.find(message => message.approval?.approvalId === approvalId)?.approval?.approvalId);
+        const text = resumeSource ? '' : userVisibleText(d);
+        if (Number.isSafeInteger(event.seq) && event.seq > 0 && (d.synthetic !== true || resumeSource)
+          && (event.role === undefined || event.role === 'user')
+          && (!sessionId || !event.sessionId || event.sessionId === sessionId)) acceptedWorkflowSources.add(event.seq);
         const cardDecision = cardDecisionOf(d);
         if (cardDecision) {
           cardDecisionsBySource.set(event.seq, cardDecision);
@@ -976,6 +1116,9 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         if (text) messages.push({ id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode),
           acceptedSource: acceptedConversationSource(event, sessionId), ...(cardDecision ? { cardDecision } : {}) });
         currentSourceUserSeq = event.seq;
+        modelRetrySourceClosed = false;
+        modelRetryProgressSeq = 0;
+        modelRetryDraft = { text: '' };
         const mode = readTaskMode(d.taskMode);
         if (mode) taskModesBySource.set(event.seq, mode);
         activity = [];
@@ -1002,6 +1145,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         const planProposalId = typeof d.planProposalId === 'string' ? d.planProposalId : undefined;
         const statusRaw = typeof d.planProposalStatus === 'string' ? d.planProposalStatus : 'pending';
         const sourceUserSeq = sourceUserSeqOf(event);
+        if (sourceUserSeq !== null && (!sessionId || !event.sessionId || event.sessionId === sessionId)) closedWorkflowSources.add(sourceUserSeq);
         const delegatedIndex = sourceUserSeq === null
           ? undefined
           : delegatedMessageIndexBySource.get(sourceUserSeq);
@@ -1059,6 +1203,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
       case 'run_failed': {
         const error = typeof d.error === 'string' && d.error ? d.error : 'The run failed.';
         const sourceUserSeq = sourceUserSeqOf(event);
+        if (sourceUserSeq !== null && (!sessionId || !event.sessionId || event.sessionId === sessionId)) closedWorkflowSources.add(sourceUserSeq);
         const delegatedIndex = sourceUserSeq === null
           ? undefined
           : delegatedMessageIndexBySource.get(sourceUserSeq);
@@ -1147,6 +1292,8 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
             approvalId,
             ...(d.consentCall ? { consentCall: d.consentCall as NonNullable<ChatMessage['approval']>['consentCall'] } : {}),
             ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
+            ...(approvalRevisionFrom(d.revises) ? { revises: approvalRevisionFrom(d.revises) } : {}),
+            ...(typeof d.pendingActionId === 'string' || (d.pendingAction && typeof d.pendingAction === 'object') ? { queued: true } : {}),
           },
         });
         break;
@@ -1158,35 +1305,32 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         for (let index = 0; index < messages.length; index += 1) {
           const message = messages[index]!;
           if (message.approval?.approvalId === approvalId) {
-            messages[index] = { ...message, approval: { ...message.approval, resolution } };
+            messages[index] = { ...message, approval: { ...approvalWithCanonicalEdits(message.approval, d), resolution } };
           }
         }
         break;
       }
       case 'async_work_dispatched': {
-        activity = reduceFeed(activity ?? [], event);
-        const runIds = exactRunIds(d.runIds);
-        const sourceUserSeq = sourceUserSeqOf(event);
-        if (runIds.length > 0 && sourceUserSeq !== null) {
-          const priorIndex = delegatedMessageIndexBySource.get(sourceUserSeq);
+        const work = readWorkflowQueueDispatch(event);
+        if (!work || !acceptedWorkflowSources.has(work.sourceUserSeq) || closedWorkflowSources.has(work.sourceUserSeq)
+          || (sessionId && event.sessionId && event.sessionId !== sessionId)) break;
+        const sourceUserSeq = work.sourceUserSeq;
+        if (!delegatedMessageIndexBySource.has(sourceUserSeq)) {
+          const delegatedActivity = reduceFeed(sourceUserSeq === currentSourceUserSeq ? activity ?? [] : [], event);
           const delegatedMessage: ChatMessage = {
             id: delegatedAssistantMessageId(sourceUserSeq, event.seq),
             role: 'assistant',
-            text: runIds.length === 1
-              ? 'The workflow is running. I’ll report back here when it finishes.'
-              : `${runIds.length} workflows are running. I’ll report back here when they finish.`,
+            text: workflowDispatchText(work),
             status: 'thinking',
-            delegatedWork: { sourceUserSeq, runIds, state: 'running' },
-            activity,
+            delegatedWork: work,
+            activity: delegatedActivity,
           };
-          if (priorIndex === undefined) {
-            messages.push(delegatedMessage);
-            delegatedMessageIndexBySource.set(sourceUserSeq, messages.length - 1);
-          } else {
-            messages[priorIndex] = delegatedMessage;
+          messages.push(delegatedMessage);
+          delegatedMessageIndexBySource.set(sourceUserSeq, messages.length - 1);
+          if (sourceUserSeq === currentSourceUserSeq) {
+            activity = [];
+            opening = '';
           }
-          activity = [];
-          opening = '';
         }
         break;
       }

@@ -111,7 +111,7 @@ export const AWAITING_PROJECTION: Readonly<Record<string, Row>> = {
  * test can prove every projected type is accounted for exactly once.
  */
 export const ACTIVITY_FOLD_EVENTS: ReadonlySet<string> = new Set([
-  'turn_started', 'turn_model_routed', 'turn_graph_compiled', 'heartbeat',
+  'turn_started', 'turn_model_routed', 'model_resilience_observed', 'turn_graph_compiled', 'heartbeat',
   'step_started', 'conversation_completed',
   'tool_called', 'tool_returned', 'capability_resolution',
   'worker_started', 'worker_result', 'worker_capped',

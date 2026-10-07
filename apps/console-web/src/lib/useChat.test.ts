@@ -6,6 +6,7 @@ import {
   activeTurnTaskMode,
   inFlightTurnSince,
   readReattachTurn,
+  reconcileIdleChatEvent,
   appendCheckIn,
   bindAcceptedChatSource,
   appendLiveApprovalCard,
@@ -13,9 +14,11 @@ import {
   approvalConfirmFromEvent,
   attachApprovalConfirm,
   applyBridgedWorkflowActivity,
+  applyChatWorkflowDispatch,
   chatApprovalReply,
   chatDecisionIntent,
   createInboxOutcomeCursor,
+  pollInboxOutcomeEvents,
   createInboxOutcomeDeliveryState,
   inboxOutcomeCursorForSession,
   mergePendingActionHydration,
@@ -36,10 +39,135 @@ import {
   chatBackgroundEndpoint,
   chatCancelEndpoint,
   moveSessionToBackground,
+  reattachedRunControl,
 } from './chat';
 import type { HarnessEvent } from './types';
 
 let seq = 0;
+
+test('reopened live run restores source-bound exact Stop and Background authority', async () => {
+  const sessionId = 'reopened-control';
+  const row = { sessionId, sourceUserSeq: 41, attemptId: 'attempt:reopened', runScopeId: 'scope:reopened',
+    cancelEndpoint: '/api/sessions/reopened-control/cancel?attemptId=attempt%3Areopened',
+    backgroundEndpoint: '/api/sessions/reopened-control/background?attemptId=attempt%3Areopened' };
+  const active = await readReattachTurn(sessionId, {
+    active: () => true,
+    fetchPage: async () => ({ events: [{ seq: 41, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Wait on this fixture' } }], latestSeq: 41 }),
+    fetchControl: async (sid, source) => reattachedRunControl(row, sid, source),
+  });
+  assert.ok(active?.runControl);
+  const stopped: string[] = [];
+  assert.equal(await cancelSession(active!.runControl!, { transport: async path => { stopped.push(path); return { ok: true }; } }), true);
+  assert.deepEqual(stopped, [row.cancelEndpoint]);
+  assert.equal(chatBackgroundEndpoint(active!.runControl!), row.backgroundEndpoint);
+  for (const wrong of [{ ...row, sourceUserSeq: 42 }, { ...row, sessionId: 'another-chat' }, { ...row, attemptId: '' }]) {
+    assert.equal(reattachedRunControl(wrong, sessionId, 41), null);
+  }
+});
+
+test('unavailable reopened control preserves observation without inventing attempt authority', async () => {
+  const active = await readReattachTurn('unavailable-control', {
+    active: () => true,
+    fetchPage: async () => ({ events: [{ seq: 9, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Fixture' } }], latestSeq: 9 }),
+    fetchControl: async () => { throw new Error('temporarily unavailable'); },
+  });
+  assert.equal(active?.sourceUserSeq, 9);
+  assert.equal(active?.runControl, undefined);
+});
+
+test('reopen follows only a typed approval resume backed by its exact existing card', async () => {
+  const source: HarnessEvent = { seq: 20, turn: 2, role: 'user', type: 'user_input_received', data: {
+    synthetic: true, source: 'approval_resume', approvalId: 'apr-reopened', decision: 'approve_with_edits', text: 'Approve apr-reopened.',
+  } };
+  const events: HarnessEvent[] = [
+    { seq: 10, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Fixture' } },
+    { seq: 12, turn: 1, role: 'Clem', type: 'approval_requested', data: { approvalId: 'apr-reopened' } },
+    source,
+    { seq: 21, turn: 1, role: 'Clem', type: 'conversation_completed', data: { sourceUserSeq: 10, reply: 'Older pause' } },
+  ];
+  const active = await readReattachTurn('reopened-resume', { active: () => true,
+    fetchPage: async () => ({ events, latestSeq: 21 }),
+  });
+  assert.equal(active?.sourceUserSeq, 20);
+  assert.deepEqual(active?.acceptedSource, { sessionId: 'reopened-resume', sourceUserSeq: 20, turn: 2 });
+  for (const invalid of [
+    { ...source, data: { ...source.data, source: 'outcome' } },
+    { ...source, data: { ...source.data, approvalId: 'apr-unknown' } },
+  ]) {
+    assert.equal(await readReattachTurn('reopened-resume', { active: () => true,
+      fetchPage: async () => ({ events: events.map(event => event.seq === 20 ? invalid : event), latestSeq: 21 }),
+    }), null);
+  }
+});
+
+test('idle card resolution and confirmation reconcile the existing card across devices', () => {
+  const card: ChatMessage = { id: 'card', role: 'assistant', text: '', status: 'awaiting-approval', approval: { approvalId: 'apr-idle', subject: 'Fixture' } };
+  let messages = reconcileIdleChatEvent([card], { seq: 12, turn: 1, role: 'Clem', type: 'awaiting_user_input', sessionId: 'idle-chat',
+    data: { reason: 'approval_confirmation_required', approvalId: 'apr-idle', question: 'This exact fixture?', leaning: 'unread' } }, 'idle-chat', false);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0]?.approval?.confirm?.question, 'This exact fixture?');
+  const resolved: HarnessEvent = { seq: 13, turn: 1, role: 'Clem', type: 'approval_resolved', sessionId: 'idle-chat', data: { approvalId: 'apr-idle', decision: 'approve_with_edits' } };
+  messages = reconcileIdleChatEvent(messages, resolved, 'idle-chat', false);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0]?.approval?.resolution, 'approved');
+  assert.equal(reconcileIdleChatEvent(messages, resolved, 'idle-chat'), messages);
+  assert.equal(reconcileIdleChatEvent(messages, { ...resolved, sessionId: 'other-chat' }, 'idle-chat'), messages);
+});
+
+test('a desktop canonical edited resolution shows the approved exact text across devices and survives a plain later decision', () => {
+  const card: ChatMessage = { id: 'card', role: 'assistant', text: '', status: 'awaiting-approval', approval: { approvalId: 'apr-edit', subject: 'Fixture',
+    preview: { operation: 'Fixture send', fields: [{ name: 'body', value: 'Before' }] } } };
+  const other: ChatMessage = { ...card, id: 'other-card', approval: { ...card.approval!, approvalId: 'apr-other' } };
+  const event: HarnessEvent = { seq: 13, turn: 1, role: 'system', type: 'approval_resolved', sessionId: 'idle-chat', data: {
+    approvalId: 'apr-edit', decision: 'approve_with_edits', edited: true, editedFields: { body: 'Exact canonical edit' },
+  } };
+  const messages = reconcileIdleChatEvent([card, other], event, 'idle-chat', false);
+  assert.equal(messages[0]?.approval?.preview?.fields[0]?.value, 'Exact canonical edit');
+  assert.equal(messages[0]?.approval?.revises?.fields?.[0]?.value, 'Before');
+  assert.equal(messages[1], other);
+  assert.equal(reconcileIdleChatEvent(messages, event, 'idle-chat'), messages);
+  const later = reconcileIdleChatEvent(messages, { ...event, seq: 14, data: { approvalId: 'apr-edit', decision: 'approve' } }, 'idle-chat');
+  assert.equal(later, messages);
+});
+
+test('an unowned direct result cannot borrow a later foreign-device reply', () => {
+  const finish: HarnessEvent = { seq: 14, turn: 1, role: 'Clem', type: 'conversation_completed', sessionId: 'idle-chat', data: { sourceUserSeq: 10, reply: 'Edited fixture completed.' } };
+  let messages = reconcileIdleChatEvent([], finish, 'idle-chat');
+  assert.equal(messages.length, 0, 'an unbound queued owner result is not a new reply source');
+  const source: HarnessEvent = { seq: 20, turn: 2, role: 'user', type: 'user_input_received', sessionId: 'idle-chat', data: { text: 'Next fixture' } };
+  messages = reconcileIdleChatEvent(messages, source, 'idle-chat');
+  messages = reconcileIdleChatEvent(messages, { ...finish, seq: 22, turn: 2, data: { sourceUserSeq: 20, reply: 'Second fixture result.' } }, 'idle-chat');
+  assert.deepEqual(messages.filter(message => message.role === 'assistant').map(message => message.text), ['Second fixture result.']);
+});
+
+test('the first idle watermark does not reappend historical sources when own event observation is enabled', async () => {
+  const cursor = createInboxOutcomeCursor('idle-chat');
+  let observed = 0;
+  await pollInboxOutcomeEvents(cursor, { active: () => true, onEvents: () => { observed += 1; }, fetchPage: async () => ({ latestSeq: 10, events: [
+    { seq: 1, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Already in history' } },
+    { seq: 10, turn: 1, role: 'Clem', type: 'conversation_completed', data: { sourceUserSeq: 1, reply: 'Already visible' } },
+  ] }) });
+  assert.equal(observed, 0);
+  assert.equal(cursor.seq, 10);
+});
+
+test('a direct edit resumed on another device owns its exact reply without showing host commands', () => {
+  const card: ChatMessage = { id: 'card', role: 'assistant', text: '', status: 'awaiting-approval', approval: { approvalId: 'apr-resume', subject: 'Fixture' } };
+  const source: HarnessEvent = { seq: 20, turn: 2, role: 'user', type: 'user_input_received', sessionId: 'idle-chat',
+    data: { synthetic: true, source: 'approval_resume', approvalId: 'apr-resume', decision: 'approve_with_edits', text: 'Approve apr-resume.' } };
+  let messages = reconcileIdleChatEvent([card], source, 'idle-chat');
+  assert.equal(messages.length, 2);
+  assert.equal(messages[1]?.status, 'thinking');
+  assert.equal(messages[1]?.acceptedSource?.sourceUserSeq, 20);
+  assert.equal(messages.some(message => message.role === 'user'), false);
+  assert.equal(reconcileIdleChatEvent(messages, source, 'idle-chat'), messages);
+  messages = reconcileIdleChatEvent(messages, { seq: 22, turn: 2, role: 'Clem', type: 'conversation_completed', sessionId: 'idle-chat',
+    data: { sourceUserSeq: 20, reply: 'Exact edited result.' } }, 'idle-chat');
+  assert.deepEqual(messages.map(message => message.text), ['', 'Exact edited result.']);
+  assert.equal(reconcileIdleChatEvent([card], { ...source, data: { ...source.data, source: 'outcome' } }, 'idle-chat').length, 1);
+  assert.equal(reconcileIdleChatEvent([], source, 'idle-chat').length, 0, 'an unknown card cannot open a reply source');
+});
+
 function ev(type: string, data: Record<string, unknown>): HarnessEvent {
   seq += 1;
   return { seq, turn: 0, role: 'Clem', type, data };
@@ -584,31 +712,31 @@ test('reduceActivity upserts the host work-plan as the work happening, not a blo
   assert.equal(activity[1]?.label, 'Writing');
 });
 
-test('reduceActivity paints a host-dispatched workflow as live background work', () => {
-  const next = reduceActivity([], ev('async_work_dispatched', {
-    dispatchKey: 'workflow_source_group:abc:def',
-    runIds: ['1786721689090-4af5e4'],
-    text: 'Started — I’ll post the result here when it’s ready.',
-  }));
+const workflowDispatch = (runIds: string[] = ['1786721689090-4af5e4']): HarnessEvent => ({
+  seq: 8, turn: 0, role: 'system', sessionId: 'queue-test', type: 'async_work_dispatched', data: {
+    version: 2, kind: 'workflow_run_group', status: 'dispatched', sourceUserSeq: 4, runIds,
+    sourceGroupId: `workflow-origin-group-v1:${'b'.repeat(64)}`, sourceGroupDigest: 'c'.repeat(64),
+    replyTargetDigest: 'a'.repeat(64),
+    dispatchKey: `workflow_source_group:workflow-origin-group-v1:${'b'.repeat(64)}:${'c'.repeat(64)}`,
+  },
+});
+
+test('reduceActivity paints a host-dispatched workflow as live queued work', () => {
+  const next = reduceActivity([], workflowDispatch());
   assert.equal(next.length, 1);
   assert.equal(next[0]?.kind, 'event');
   assert.equal(next[0]?.status, 'running');
-  assert.match(next[0]?.label ?? '', /started the workflow/i);
+  assert.match(next[0]?.label ?? '', /queued.*waiting to start/i);
 });
 
 test('applyBridgedWorkflowActivity paints step tools onto the dispatched ACK bubble', () => {
   assert.equal(workflowStepLabelFromSession('workflow:1786726670475-33ef31:find_official_page'), 'find official page');
-  const seeded = reduceActivity([], ev('async_work_dispatched', {
-    dispatchKey: 'workflow_source_group:abc:def',
-    runIds: ['1786726670475-33ef31'],
-  }));
-  const messages: ChatMessage[] = [{
+  const dispatch = workflowDispatch(['1786726670475-33ef31']);
+  const messages: ChatMessage[] = [applyChatWorkflowDispatch({
     id: 'ack-1',
     role: 'assistant',
-    text: 'Started — I’ll post the result here when it’s ready.',
-    status: 'complete',
-    activity: seeded,
-  }];
+    text: '', status: 'thinking', acceptedSource: { sessionId: 'queue-test', sourceUserSeq: 4, turn: 1 },
+  }, dispatch, { sessionId: 'queue-test', activeAssistantId: 'ack-1', busy: true })];
   const next = applyBridgedWorkflowActivity(messages, {
     seq: 10,
     turn: 1,
@@ -670,11 +798,8 @@ test('progressLabel names the live work, not the compiled topology', () => {
     'Getting started…',
   );
   assert.equal(
-    progressLabel(ev('async_work_dispatched', {
-      text: 'Started — I’ll post the result here when it’s ready.',
-      runIds: ['1786721689090-4af5e4'],
-    })),
-    'Started the workflow — I’ll post the result here.',
+    progressLabel(workflowDispatch()),
+    'Workflow queued — waiting to start',
   );
   assert.equal(
     progressLabel(ev('expected_work_progress', {

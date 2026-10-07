@@ -82,7 +82,8 @@ import { isToolMediaContent, toolMediaText } from './tool-media-content.js';
 import { admitModelStep, codexOneStep } from './codex-one-step.js';
 import { BoundaryError } from '../boundary-error.js';
 import { workflowParentActivation } from './workflow-parent-activation.js';
-import { classifyModelError, modelRetriesSpentBeforeContent } from './resilient-model.js';
+import { classifyModelError, modelRetriesSpentBeforeContent, withModelResilienceTelemetry } from './resilient-model.js';
+import { createModelResilienceObservation } from './model-resilience-observation.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
 import { serializeAdvertisedTools, toolsOnAdvertisedWire, usesSessionWireOrder } from './advertised-tool-wire.js';
 import type { PromptReadingPublisher } from './prompt-composition.js';
@@ -147,6 +148,7 @@ import { nextTurnSteer, recordTurnSteer, appendSteerToResultText } from './turn-
 import * as approvalRegistry from './approval-registry.js';
 import { classifyMessageIntent, selfContainedConversation, intentRequestsNoToolWork } from '../../assistant/message-intent.js';
 import {
+  HOST_COMPLETION_EVIDENCE_GUIDANCE,
   completionJudgeContextAdmission,
   honestFailureReportSettles,
   resolveJudgeResponder,
@@ -4579,6 +4581,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const delegatedJobs = delegatedJobsStartedBy(identity);
       verdict = await hostObjectiveJudge(objective, judgedReply, {
         sessionId: identity.sessionId,
+        completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE,
         ...(memoryRequirementRequired ? { memoryRequirementContext: (() => {
           try {
             const source = readMemoryRequirementSource(identity, objective);
@@ -4646,18 +4649,6 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           // beforehand"); without it that claim reads as unverified.
           planCandidate ? undefined : earlierTurnsEvidence(identity),
           preparation?.summary,
-          'Judge only the effective accepted objective. A successful empty result may complete a bounded lookup; '
-            + 'a cancelled or replaced request does not owe its abandoned effects. Do not demand writes or '
-            + 'artifacts the objective never requested. Unavailable optional or irrelevant reads do not create '
-            + 'new requirements. Each result above is shown whole or as an explicitly bounded reviewer preview, '
-            + 'as its own line says. A claim that rests on content outside what is shown, including a claim that '
-            + 'data is missing, empty, unavailable or complete, is unverified unless another read shown here covers '
-            + 'it, such as a filtered query, a true count or a recalled page, or you open it with the evidence tools. '
-            + 'EARLIER TURNS evidence counts for what the reply says an earlier turn checked or found at that time; '
-            + 'it cannot show this turn\'s own effects. '
-            + 'A selected/derived projection is not the full source result, and an omitted projection field does '
-            + 'not establish absence. Distinguish absent values from zero, empty and uninspected values. '
-            + 'When the objective is not met and the evidence shows another attempt cannot change that, the verdict is BLOCKED.',
         ].filter(Boolean).join('\n'),
       });
       if (workflowEvidence !== workflowParentActivation(identity.sessionId, identity.sourceUserSeq)?.completionEvidence?.()) {
@@ -5301,71 +5292,91 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     });
     const modelActivity = ambient?.hostModelActivity;
     if (modelActivity) modelActivity.pendingRequests += 1;
+    let observedRequestOrdinal: number | undefined;
+    let modelObservation: ReturnType<typeof createModelResilienceObservation> | undefined;
     try {
-      return await Promise.race([
-        codexOneStep({
-          input: modelInput,
-          tools: modelSchemas as never,
-          ...(formatWorkerModelId ? { modelId: formatWorkerModelId } : modelId !== undefined ? { modelId } : {}),
-          ...(exactModel ? { resolveModel: () => exactModel } : !formatWorkerModelId && resolveModel ? { resolveModel } : {}),
-          ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
-          modelSettings: settingsForStep,
-          signal: controller.signal,
-          stream: true,
-          ...(hostProduction
-            ? {
-                beforeModelDispatch: (request: ModelRequest) => {
-                  assertRecoveryActivationOwned();
-                  if (outerBudget) assertSourceBudgetBeforeModel(outerBudget.policy,
-                    (carriedProgress?.activation.elapsedMs ?? 0) + Math.max(0, Date.now() - connectionActivationStartedAt));
-                  const identity = exactHostIdentity();
-                  const provenance = recordModelRequestDispatchProvenance({
-                    sessionId: identity.sessionId,
-                    sourceUserSeq: identity.sourceUserSeq,
-                    request,
-                    hostProjection,
-                  });
-                  if (provenance.removedOptionalLayer) {
-                    console.warn(
-                      '[clem] model_request_optional_layer_removed:',
-                      provenance.removedOptionalLayer,
-                    );
-                  }
-                  // A clarification supplement changes the filter's request.
-                  // Publish the actual admitted bytes, after provenance has
-                  // removed any unproven optional primer, using existing math.
-                  if (finalRequestReading && !publishedFinalReading) {
-                    publishedFinalReading = true;
-                    // The supplemented host path supplies an item array.
-                    // For the SDK's wider string union, use its exact
-                    // toAgentInputList string representation for observation;
-                    // leave the dispatched request untouched.
-                    finalRequestReading({ input: typeof request.input === 'string'
-                      ? [{ type: 'message', role: 'user', content: request.input }] : request.input,
-                      ...(request.systemInstructions !== undefined ? { instructions: request.systemInstructions } : {}),
-                      advertisedTools: request.tools,
-                      requestOrdinal: provenance.record.requestOrdinal,
-                      ...(typeof modelId === 'string' ? { model: modelId } : {}) });
-                  }
-                },
+      if (hostProduction) modelObservation = createModelResilienceObservation({
+        owner: { ...exactHostIdentity(), ...(ambient?.runAttemptId ? { runAttemptId: ambient.runAttemptId } : {}) },
+        requestOrdinal: () => observedRequestOrdinal,
+        // A watchdog can retire one provider while a valid fallback is still
+        // rescuing this step. Only the owner cancellation retires its progress.
+        retired: () => cancelAuthority.signal.aborted,
+      });
+    } catch { /* Observation cannot move or replace the dispatch authority fence. */ }
+    let observedOutcome: 'returned' | 'failed' = 'failed';
+    const dispatchModelStep = () => codexOneStep({
+      input: modelInput,
+      tools: modelSchemas as never,
+      ...(formatWorkerModelId ? { modelId: formatWorkerModelId } : modelId !== undefined ? { modelId } : {}),
+      ...(exactModel ? { resolveModel: () => exactModel } : !formatWorkerModelId && resolveModel ? { resolveModel } : {}),
+      ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
+      modelSettings: settingsForStep,
+      signal: controller.signal,
+      stream: true,
+      ...(hostProduction
+        ? {
+            beforeModelDispatch: (request: ModelRequest) => {
+              assertRecoveryActivationOwned();
+              if (outerBudget) assertSourceBudgetBeforeModel(outerBudget.policy,
+                (carriedProgress?.activation.elapsedMs ?? 0) + Math.max(0, Date.now() - connectionActivationStartedAt));
+              const identity = exactHostIdentity();
+              const provenance = recordModelRequestDispatchProvenance({
+                sessionId: identity.sessionId,
+                sourceUserSeq: identity.sourceUserSeq,
+                request,
+                hostProjection,
+              });
+              observedRequestOrdinal = provenance.record.requestOrdinal;
+              if (provenance.removedOptionalLayer) {
+                console.warn(
+                  '[clem] model_request_optional_layer_removed:',
+                  provenance.removedOptionalLayer,
+                );
               }
-            : {}),
-          onActivity: (activity) => {
-            lastSemanticActivityAt = Date.now();
-            if (activity === 'actionable') sawActionableActivity = true;
-          },
-          ...(answerDraft
-            ? {
-                onOutputText: (delta: string) => answerDraft.text(delta),
-                onToolCallStart: () => answerDraft.toolCall(),
+              // A clarification supplement changes the filter's request.
+              // Publish the actual admitted bytes, after provenance has
+              // removed any unproven optional primer, using existing math.
+              if (finalRequestReading && !publishedFinalReading) {
+                publishedFinalReading = true;
+                // The supplemented host path supplies an item array.
+                // For the SDK's wider string union, use its exact
+                // toAgentInputList string representation for observation;
+                // leave the dispatched request untouched.
+                finalRequestReading({ input: typeof request.input === 'string'
+                  ? [{ type: 'message', role: 'user', content: request.input }] : request.input,
+                  ...(request.systemInstructions !== undefined ? { instructions: request.systemInstructions } : {}),
+                  advertisedTools: request.tools,
+                  requestOrdinal: provenance.record.requestOrdinal,
+                  ...(typeof modelId === 'string' ? { model: modelId } : {}) });
               }
-            : {}),
-        }),
+            },
+          }
+        : {}),
+      onActivity: (activity) => {
+        lastSemanticActivityAt = Date.now();
+        if (activity === 'actionable') sawActionableActivity = true;
+      },
+      ...(answerDraft
+        ? {
+            onOutputText: (delta: string) => answerDraft.text(delta),
+            onToolCallStart: () => answerDraft.toolCall(),
+          }
+        : {}),
+    });
+    try {
+      const result = await Promise.race([
+        modelObservation
+          ? withModelResilienceTelemetry(modelObservation.observer, dispatchModelStep)
+          : dispatchModelStep(),
         stall,
         killed,
         aborted,
       ]);
+      observedOutcome = 'returned';
+      return result;
     } finally {
+      modelObservation?.close(observedOutcome === 'returned' ? 'returned'
+        : cancelAuthority.signal.aborted ? 'cancelled' : 'failed');
       if (modelActivity) modelActivity.pendingRequests = Math.max(0, modelActivity.pendingRequests - 1);
       if (stallTimer) clearInterval(stallTimer);
       if (killTimer) clearInterval(killTimer);
@@ -6877,6 +6888,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     let hostRefusal: string | undefined;
     let returnedPreDispatchRefusal = false;
     let settlementRequiresReconciliation = false;
+    let providerRejectedBeforeEffect = false;
     let committedVerificationHolds: CommittedMutationVerificationHold[] = [];
     if (canaryRefusal) {
       output = canaryRefusal;
@@ -7196,6 +7208,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           settlementRequiresReconciliation =
             invoked.settlement.outcome.directive.requiresReconciliation === true
             && uncertainEffectStopsTurn(effect);
+          providerRejectedBeforeEffect = providerRefusedExactRequest(invoked.settlement.outcome);
           if (
             preserveWorkCallCarrier
             && (effect === 'local_write' || effect === 'external_write' || effect === 'admin')
@@ -7331,17 +7344,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       arguments: parsedArguments,
       routedModelId: harnessRunContextStorage.getStore()?.routedModelId,
     });
-    // A write the provider refused at its own layer (2xx + "not successful")
-    // did nothing; the provider's reason is in the result. Said here so the
-    // model reads "not_found" on a delete as the state it is — already gone —
-    // instead of asking the owner to go and check by hand (live 2026-10-06).
+    // Exact adapter proof establishes no effect from this call; it does not
+    // establish the requested target state. Generic failures stay uncertain.
     const refusedWriteNote = !structuredToolOutputs(output)
       && admittedEffect === 'external_write'
-      && providerRefusedExactRequest(output)
-      ? 'The provider refused this exact request and said why above; nothing was changed. '
-        + 'If it says the target is missing, not found or already gone, that is the state now: say so plainly and finish — '
-        + 'do not ask the owner to check by hand, and do not offer to recreate anything they did not ask for. '
-        + 'Otherwise correct the request once.'
+      && providerRejectedBeforeEffect
+      ? 'The provider\'s exact rejection proof establishes that this call created no effect. '
+        + 'Use the stated reason to correct the request once within the original authority. '
+        + 'Independent exact target-state evidence is still required to claim the requested end state.'
       : undefined;
     const steer = [hostSteer, refusedWriteNote].filter(Boolean).join('\n') || undefined;
     return {

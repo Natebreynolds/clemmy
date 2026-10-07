@@ -30,13 +30,16 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { afterEventPublicationCommit, listEvents, openEventLog, withEventPublicationTransaction } from './eventlog.js';
+import { afterEventPublicationCommit, appendEvent, listEvents, openEventLog, withEventPublicationTransaction } from './eventlog.js';
 import { markNotificationsReadByApprovalId } from '../notifications.js';
 import { updateToolChoiceOutcomeForIdentifier } from '../../memory/tool-choice-store.js';
 import {
   getPendingAction,
   linkPendingActionApproval,
   markPendingActionApprovalResolved,
+  amendPendingActionPayload,
+  pendingActionPayloadHash,
+  pendingActionWithEditedPayload,
 } from './pending-actions.js';
 import { pendingActionApprovalView } from './pending-action-view.js';
 import { appendAuditRecord } from '../audit-ledger.js';
@@ -1561,6 +1564,33 @@ export function reconcileLinkedPendingActionResolution(row: PendingApprovalRow):
     return false;
   }
   const resolution = row.resolution;
+  // The SQLite decision owns a hand edit. A crash after that commit but before
+  // the file update is recovered from this exact snapshot, never redispatched.
+  if (resolution === 'approved' && row.args?.__queuedCardEdit) {
+    const edit = row.args.__queuedCardEdit as { previousPayloadHash?: unknown; payloadHash?: unknown; editedFields?: Record<string, string> };
+    const pin = row.args.pendingAction as Record<string, unknown> | undefined;
+    if (typeof edit.previousPayloadHash !== 'string' || typeof edit.payloadHash !== 'string' || !pin) return false;
+    const proof = openEventLog().prepare(`
+      SELECT 1 FROM events WHERE session_id = ? AND type = 'approval_resolved'
+        AND json_extract(data_json, '$.approvalId') = ?
+        AND json_extract(data_json, '$.decision') = 'approve_with_edits'
+        AND json_extract(data_json, '$.previousPayloadHash') = ?
+        AND json_extract(data_json, '$.payloadHash') = ? LIMIT 1
+    `).get(row.sessionId, row.approvalId, edit.previousPayloadHash, edit.payloadHash);
+    if (!proof
+      || pin.id !== pendingAction.id || pin.toolName !== pendingAction.toolName
+      || pin.payloadHash !== edit.payloadHash
+      || JSON.stringify(pin.executionAuthority ?? null) !== JSON.stringify(pendingAction.executionAuthority ?? null)
+      || pendingActionPayloadHash(pendingAction.toolName, pin.payload, pendingAction.executionAuthority ?? null) !== pin.payloadHash) return false;
+    if (pendingAction.payloadHash !== pin.payloadHash) {
+      const amended = amendPendingActionPayload(pendingAction.id, pin.payload, {
+        actor: row.resolver ?? 'approval-registry', note: `Edited by hand on the card: ${Object.keys(edit.editedFields ?? {}).join(', ')}.`,
+        expectedPayloadHash: edit.previousPayloadHash, approvalId: row.approvalId,
+        ...(typeof pin.preview === 'string' ? { preview: pin.preview } : {}),
+      });
+      if (!amended || amended.payloadHash !== pin.payloadHash) return false;
+    }
+  }
   try {
     markPendingActionApprovalResolved(
       pendingActionId,
@@ -1679,6 +1709,64 @@ export function resolve(
   resolver: string,
 ): ResolveResult {
   return withApprovalControlCommit(resolveDecision => resolveDecision(approvalId, resolution, resolver));
+}
+
+/** One exact hand-edit decision. Preparation is inert; the snapshot, event and
+ * approval commit together before any file update or executor is released. */
+export function approvePendingActionCardEdit(input: {
+  approvalId: string;
+  expectedArgs: Record<string, unknown> | null;
+  expectedPayloadHash: string;
+  payload: Record<string, unknown>;
+  editedFields: Record<string, string>;
+  preview?: string;
+  actor: string;
+}): ResolveResult {
+  return withApprovalControlCommit<ResolveResult>(resolveDecision => {
+    const row = get(input.approvalId);
+    if (!row || !isActionable(row) || !isFormalApprovalSurface(row) || isApprovalGroup(row)
+      || JSON.stringify(row.args) !== JSON.stringify(input.expectedArgs)) {
+      return { ok: false, reason: row ? 'already_resolved' : 'not_found', ...(row ? { row } : {}) };
+    }
+    const id = pendingActionIdFromArgs(row.args);
+    const record = id ? getPendingAction(id) : null;
+    if (!record || record.sessionId !== row.sessionId || record.approvalId !== row.approvalId
+      || record.payloadHash !== input.expectedPayloadHash
+      || !['queued', 'approval_requested'].includes(record.status)) return { ok: false, reason: 'already_resolved', row };
+    const pinned = row.args?.pendingAction as Record<string, unknown> | undefined;
+    if (!pinned || pinned.id !== record.id || pinned.toolName !== record.toolName || pinned.payloadHash !== record.payloadHash
+      || JSON.stringify(pinned.executionAuthority ?? null) !== JSON.stringify(record.executionAuthority ?? null)
+      || pendingActionPayloadHash(record.toolName, pinned.payload, record.executionAuthority ?? null) !== record.payloadHash
+      || pendingActionPayloadHash(record.toolName, record.payload, record.executionAuthority ?? null) !== record.payloadHash) {
+      return { ok: false, reason: 'already_resolved', row };
+    }
+    const snapshot = pendingActionWithEditedPayload(record, input.payload, {
+      actor: input.actor, note: 'Edited by hand on the card.', preview: input.preview,
+    });
+    const args: Record<string, unknown> = { ...(row.args ?? {}), pendingAction: pendingActionApprovalView(snapshot),
+      __queuedCardEdit: { previousPayloadHash: record.payloadHash, payloadHash: snapshot.payloadHash, editedFields: input.editedFields } };
+    const preview = args.preview;
+    if (preview && typeof preview === 'object' && !Array.isArray(preview) && Array.isArray((preview as { fields?: unknown }).fields)) {
+      args.preview = { ...(preview as Record<string, unknown>), fields: ((preview as { fields: unknown[] }).fields).map(field => {
+        if (!field || typeof field !== 'object' || Array.isArray(field)) return field;
+        const name = (field as { name?: unknown }).name;
+        return typeof name === 'string' && Object.hasOwn(input.editedFields, name)
+          ? { ...(field as Record<string, unknown>), value: input.editedFields[name] } : field;
+      }) };
+    }
+    const changed = openEventLog().prepare(`UPDATE pending_approvals SET args_json = ?
+      WHERE approval_id = ? AND status = 'pending' AND args_json IS ?`)
+      .run(JSON.stringify(args), row.approvalId, row.args ? JSON.stringify(row.args) : null).changes;
+    if (changed !== 1) return { ok: false, reason: 'already_resolved', row };
+    appendEvent({ sessionId: row.sessionId, turn: 0, role: 'system', type: 'approval_resolved', data: {
+      approvalId: row.approvalId, tool: row.tool, decision: 'approve_with_edits', resolution: 'approved',
+      sticky: false, edited: true, editedFields: input.editedFields,
+      previousPayloadHash: record.payloadHash, payloadHash: snapshot.payloadHash,
+    } });
+    const result = resolveDecision(row.approvalId, 'approved', input.actor);
+    if (!result.ok) throw new Error(`The edited card decision could not commit: ${result.reason}`);
+    return result;
+  });
 }
 
 /** Commit an approval control and its acknowledgement before waking an executor.

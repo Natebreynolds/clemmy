@@ -108,15 +108,13 @@ interface SettlementRow {
   requirement_id: string | null;
 }
 
-/** The provider processed this mutation and refused it in a structured
- * envelope (a 2xx carrying `successful: false`): nothing changed, and the
- * refusal in the provider's own words is the answer — a delete of something
- * already gone, a send to an address the provider rejects. */
+/** An exact adapter-proven rejection is an answered attempt with no effect.
+ * It does not by itself prove the user's requested end state was achieved. */
 function providerAnsweredRefusal(row: SettlementRow): boolean {
   return row.mutating === 1
     && row.execution_kind === 'provider_execution'
     && row.outcome_kind === 'invalid_arguments'
-    && row.outcome_detail === 'envelope_rejected';
+    && row.outcome_detail === 'provider_rejected_before_effect';
 }
 
 function boundedReason(error: unknown): string {
@@ -635,12 +633,9 @@ export function auditAcceptedSourceSettlementTruth(input: {
       .map((row) => reversibleWrites.get(row.logical_tool_call_id))
       .filter((entry): entry is ReversibleWriteShape => entry !== undefined);
     const failed = settlements.filter((row) => !succeeded(row));
-    // A refusal the provider answered, projected as a failed write in the
-    // ledger, has nothing to recover: the account of it is the completion
-    // review's to judge. Live 2026-10-06: a not_found delete kept this audit
-    // at unrecovered_failure after a read-back had confirmed the absence, the
-    // judge was asked twice, and its second RESUME became "check your Slack
-    // reminders list by hand".
+    // An exact adapter-proven no-effect rejection, paired with its failed
+    // write projection, is an answered attempt. Completion still needs the
+    // requested end-state evidence; generic refusals cannot enter this set.
     const failedWriteCallIds = new Set(writeEvidence.failed.map(writeCallId).filter(Boolean));
     const answeredRefusals = failed.filter((row) => (
       providerAnsweredRefusal(row) && failedWriteCallIds.has(row.logical_tool_call_id)

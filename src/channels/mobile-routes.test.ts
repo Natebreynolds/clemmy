@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
@@ -2689,6 +2689,15 @@ test('edit by hand from the phone lands on the queued record, re-pins the card a
     assert.equal(unknown.status, 400, 'only a field the card showed can be edited');
     assert.equal(getPendingAction(action.id)?.payloadHash, action.payloadHash);
 
+    for (const modifiedFields of [{ command: 'x'.repeat(20_001) }, { command: 'printf valid', timeout_ms: 3 }]) {
+      const invalid = await fetch(`${h.url}/m/api/approvals/${card.approvalId}/approve`, {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify({ modifiedFields }),
+      });
+      assert.equal(invalid.status, 400);
+      assert.equal(getPendingAction(action.id)?.payloadHash, action.payloadHash);
+      assert.equal(approvalRegistry.get(card.approvalId)?.status, 'pending');
+    }
+
     const res = await fetch(`${h.url}/m/api/approvals/${card.approvalId}/approve`, {
       method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify({ modifiedFields: { command: 'ssh -G -vv localhost' } }),
     });
@@ -4529,6 +4538,33 @@ test('a retired token WITHOUT a device proof still revokes the whole chain', asy
 // semantics when an attempt id is supplied. A refreshed phone may omit that id
 // and stop only the session's currently-active attempt; it never widens into a
 // historical session-wide kill.
+test('mobile reattach control binds the exact source and cannot cancel a newer attempt', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Exact control phone');
+    const session = createHarnessSession({ id: 'sess-mobile-source-control', kind: 'chat' });
+    const first = beginRunAttempt(session.id, { runId: 'controlled-first' });
+    const firstSource = recordRunAttemptUserInput(first, { turn: 1, role: 'user', data: { text: 'Controlled first request.' } }, { armRunInFlight: true });
+    const endpoint = `${h.url}/m/api/chat/sessions/${session.id}/control`;
+    assert.equal((await fetch(`${endpoint}?sourceUserSeq=${firstSource.seq}`)).status, 401);
+    assert.equal((await fetch(`${endpoint}?sourceUserSeq=0`, { headers: { cookie } })).status, 400);
+    assert.equal((await fetch(`${h.url}/m/api/chat/sessions/fixture-missing/control?sourceUserSeq=1`, { headers: { cookie } })).status, 404);
+    const exact = await fetch(`${endpoint}?sourceUserSeq=${firstSource.seq}`, { headers: { cookie } });
+    assert.equal(exact.status, 200);
+    assert.deepEqual(await exact.json(), { activeRun: { sessionId: session.id, sourceUserSeq: firstSource.seq, attemptId: first.attemptId } });
+    const newer = beginRunAttempt(session.id, { runId: 'controlled-newer' });
+    const newerSource = recordRunAttemptUserInput(newer, { turn: 2, role: 'user', data: { text: 'Controlled newer request.' } }, { armRunInFlight: true });
+    assert.deepEqual(await (await fetch(`${endpoint}?sourceUserSeq=${firstSource.seq}`, { headers: { cookie } })).json(), { activeRun: null });
+    const stale = await fetch(`${h.url}/m/api/chat/sessions/${session.id}/cancel`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify({ attemptId: first.attemptId }),
+    });
+    assert.equal(stale.status, 409);
+    assert.equal(getActiveRunAttempt(session.id)?.attemptId, newer.attemptId);
+    assert.equal(isKillRequested(session.id, newer), false);
+    assert.deepEqual(await (await fetch(`${endpoint}?sourceUserSeq=${newerSource.seq}`, { headers: { cookie } })).json(), { activeRun: { sessionId: session.id, sourceUserSeq: newerSource.seq, attemptId: newer.attemptId } });
+  } finally { await h.close(); }
+});
+
 test('mobile chat cancel rejects a stale exact id and stops the exact live attempt', async () => {
   const h = await startHarness();
   try {
@@ -5313,6 +5349,76 @@ test('mobile chat cancel resolves the receipt the send path actually wrote', asy
 // is still unbound means the workflow cannot run, and the phone must say so
 // instead of offering a Run now that 409s. Pure over the definition, so it is
 // cheap enough for the list (certification stays on the detail route).
+test('mobile ordinary workflow Run reports readiness refusal without a queued run identity', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Workflow readiness receipt fixture');
+    const slug = 'mobile-run-readiness-refusal';
+    writeWorkflow(slug, {
+      name: slug, description: 'Controlled unavailable-resource fixture', enabled: true,
+      trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read controlled fixture only.', sideEffect: 'read',
+        deterministic: { runner: 'missing-fixture.py' } }],
+    } as never);
+    const before = existsSync(WORKFLOW_RUNS_DIR) ? readdirSync(WORKFLOW_RUNS_DIR).filter(name => name.endsWith('.json')) : [];
+    const response = await fetch(`${h.url}/m/api/workflows/${slug}/run`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(response.status, 409);
+    const body = await response.json() as { ok: boolean; queued: boolean; status: string; id?: string; runId?: string; message: string; readiness?: unknown };
+    assert.equal(body.ok, false);
+    assert.equal(body.queued, false);
+    assert.equal(body.status, 'blocked_readiness');
+    assert.equal(body.id, undefined);
+    assert.equal(body.runId, undefined);
+    assert.match(body.message, /missing-fixture.py/);
+    assert.ok(body.readiness);
+    const after = existsSync(WORKFLOW_RUNS_DIR) ? readdirSync(WORKFLOW_RUNS_DIR).filter(name => name.endsWith('.json')) : [];
+    assert.deepEqual(after, before, 'refusal installs no executable run');
+  } finally { await h.close(); }
+});
+
+test('mobile ordinary workflow Run rejoins same-input active and uncertain-write runs', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Workflow duplicate receipt fixture');
+    const slug = 'mobile-run-duplicate-fixture';
+    writeWorkflow(slug, {
+      name: slug, description: 'Controlled queue-only fixture', enabled: true,
+      trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read controlled fixture only.', sideEffect: 'read' }],
+    });
+    const post = () => fetch(`${h.url}/m/api/workflows/${slug}/run`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}',
+    });
+    const responses = await Promise.all([post(), post()]);
+    assert.ok(responses.every(response => response.status === 200));
+    const bodies = await Promise.all(responses.map(response => response.json())) as Array<{
+      ok: boolean; queued: boolean; duplicate: boolean; status: string; id: string; runId: string; message: string;
+    }>;
+    assert.deepEqual(bodies.map(body => body.status).sort(), ['duplicate', 'queued']);
+    assert.equal(bodies[0].id, bodies[1].id, 'lost-response retry joins the same existing run');
+    for (const body of bodies) {
+      assert.equal(body.ok, true);
+      assert.equal(body.runId, body.id, 'old and new identity fields agree');
+      assert.equal(body.queued, body.status === 'queued');
+      assert.equal(body.duplicate, body.status === 'duplicate');
+    }
+    const file = path.join(WORKFLOW_RUNS_DIR, `${bodies[0].id}.json`);
+    const record = JSON.parse(readFileSync(file, 'utf8'));
+    writeFileSync(file, JSON.stringify({ ...record, status: 'blocked_mutation' }), 'utf8');
+    const uncertain = await post();
+    const body = await uncertain.json() as typeof bodies[number];
+    assert.equal(uncertain.status, 200);
+    assert.equal(body.status, 'duplicate');
+    assert.equal(body.queued, false);
+    assert.equal(body.id, bodies[0].id);
+    assert.match(body.message, /unresolved external mutation.*No duplicate was queued/);
+    const matching = readdirSync(WORKFLOW_RUNS_DIR).filter(name => name.endsWith('.json'))
+      .map(name => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, name), 'utf8')))
+      .filter(run => run.workflow === slug);
+    assert.equal(matching.length, 1, 'same-input replay never installs a sibling write attempt');
+  } finally { await h.close(); }
+});
+
 test('GET /m/api/workflows lists each workflow\'s unbound required resources so the phone can show the stop', async () => {
   const h = await startHarness();
   try {

@@ -16,6 +16,7 @@
  */
 import { withDiscoveryDeadline, type DiscoveryDeadline } from './discovery-deadline.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
+import { prepareSelectedToolSearchSources } from './tool-search-source-preparation.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
@@ -1564,23 +1565,12 @@ export function registerToolSearchTool(
       const selectedNames = new Set(selectedRows.map((row) => row.name));
       const preparationBlockers: Record<string, ToolSearchPlanningBlocker> = {};
       if (!selectedExactly && opts.discloseForPlanning) {
-        for (const source of opts.candidateSources ?? []) {
-          if (!source.prepareCandidates) continue;
-          const selected = sourceCandidates.filter((candidate) => candidate.sourceKind === source.kind && selectedNames.has(candidate.name));
-          if (selected.length === 0) continue;
-          const controller = new AbortController();
-          const deadlineAt = Math.min(brokerDeadlineAt, Date.now() + PLANNING_DISCLOSURE_DEADLINE_MS);
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          let prepared: ToolSearchBrokerCandidate[] = [];
-          try {
-            prepared = await Promise.race([
-              source.prepareCandidates({ candidates: selected, query, reuseSearchPreparation: !deferredPage, signal: controller.signal, deadlineAt }).catch(() => []),
-              new Promise<ToolSearchBrokerCandidate[]>((resolve) => {
-                timer = setTimeout(() => { controller.abort(); resolve([]); }, Math.max(0, deadlineAt - Date.now()));
-              }),
-            ]);
-            if (controller.signal.aborted || Date.now() >= deadlineAt) prepared = [];
-          } finally { if (timer) clearTimeout(timer); }
+        const selections = (opts.candidateSources ?? []).flatMap(source => {
+          if (!source.prepareCandidates) return [];
+          const candidates = sourceCandidates.filter(candidate => candidate.sourceKind === source.kind && selectedNames.has(candidate.name));
+          return candidates.length > 0 ? [{ source, candidates }] : [];
+        });
+        const mergePreparation = (source: ToolSearchCandidateSource, prepared: ToolSearchBrokerCandidate[], expired: boolean): void => {
           const preparedByName = new Map(prepared.filter((candidate) => selectedNames.has(candidate.name)).map((candidate) => [candidate.name, candidate]));
           sourceCandidates = sourceCandidates.map((candidate) => {
             if (candidate.sourceKind !== source.kind || !selectedNames.has(candidate.name)) return candidate;
@@ -1598,7 +1588,7 @@ export function registerToolSearchTool(
                 sourceKind: source.kind,
               };
             }
-            const blockerReason = controller.signal.aborted || Date.now() >= deadlineAt ? 'proof_publication_expired' : 'exact_definition_unavailable';
+            const blockerReason = expired ? 'proof_publication_expired' : 'exact_definition_unavailable';
             preparationBlockers[candidate.name] = { code: 'capability_publication_required', choices: [], reason: blockerReason,
               ...(blockerReason === 'exact_definition_unavailable'
                 ? { servedSiblings: servedSiblingsFor(candidate.name, query) }
@@ -1616,6 +1606,27 @@ export function registerToolSearchTool(
             const current = sourceCandidates.find((candidate) => candidate.name === row.name && candidate.sourceKind === source.kind);
             return current && selectedNames.has(row.name) ? { ...row, ...current } : row;
           });
+        };
+        const prepareSelections = (selected: typeof selections) => prepareSelectedToolSearchSources({
+          selections: selected, query, reuseSearchPreparation: !deferredPage,
+          brokerDeadlineAt, preparationBudgetMs: PLANNING_DISCLOSURE_DEADLINE_MS,
+          signal: currentToolAbortSignal(),
+        });
+        if (new Set(selections.map(({ source }) => source.kind)).size !== selections.length) {
+          // Custom adapters sharing a namespace may depend on a predecessor's
+          // exact prepared candidate. Preserve their original prepare/merge
+          // boundary, including the candidate input seen by the next adapter.
+          for (const { source } of selections) {
+            const candidates = sourceCandidates.filter(candidate => candidate.sourceKind === source.kind && selectedNames.has(candidate.name));
+            const [preparation] = await prepareSelections([{ source, candidates }]);
+            mergePreparation(source, preparation!.prepared, preparation!.expired);
+          }
+        } else {
+          // Source-disjoint reads can settle together; merge in configured
+          // source order. The later catalog-disclosure owner stays sequential.
+          for (const { source, prepared, expired } of await prepareSelections(selections)) {
+            mergePreparation(source, prepared, expired);
+          }
         }
       }
       const planningOutcomes: (ToolSearchPlanningDisclosureCandidate | { name: string; refused: LocalPlanningRefusalReason } | null)[] = opts.discloseForPlanning

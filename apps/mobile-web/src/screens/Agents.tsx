@@ -13,6 +13,7 @@ import { ScreenNotice } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
 import { useScreenData } from '../lib/use-screen-data';
 import { AgentDetail } from './AgentDetail';
+import { usePendingCommit } from '../lib/pending-commit';
 
 /**
  * Named agents — a person's own standing helpers.
@@ -66,6 +67,7 @@ export function Agents({ onMessage, initialAgentId, onAgentChange, onOpenProject
   if (editing) {
     return (
       <AgentEditor
+        key={editing === 'new' ? 'new' : editing.id}
         agent={editing === 'new' ? null : editing}
         available={available}
         onClose={() => { setEditing(null); void refresh(); }}
@@ -161,6 +163,8 @@ function AgentEditor({ agent, available, onClose }: {
   const [workflows, setWorkflows] = useState<string[]>(agent?.workflows ?? []);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+  const commit = usePendingCommit(agent?.id ?? 'new');
+  const close = () => { if (!commit.pending) onClose(); };
 
   const toggle = (list: string[], set: (next: string[]) => void, value: string) => {
     haptic('light');
@@ -168,7 +172,9 @@ function AgentEditor({ agent, available, onClose }: {
   };
 
   const save = async () => {
-    if (!name.trim() || busy) return;
+    if (!name.trim()) return;
+    const token = commit.begin();
+    if (!token) return;
     setBusy(true);
     setFailure(null);
     try {
@@ -177,33 +183,37 @@ function AgentEditor({ agent, available, onClose }: {
       } else {
         await createAgent({ name, handles, instructions, skills, workflows });
       }
-      haptic('light');
-      onClose();
+      if (commit.owns(token)) { haptic('light'); onClose(); }
     } catch (err) {
+      if (!commit.owns(token)) return;
       // Say what actually happened. A duplicate name is a normal thing to hit.
       const message = String((err as Error)?.message ?? err);
       setFailure(/409|name_taken/.test(message)
         ? 'You already have an agent with that name.'
         : message);
-      setBusy(false);
+    } finally {
+      if (commit.finish(token)) setBusy(false);
     }
   };
 
   const remove = async () => {
-    if (!agent || busy) return;
+    if (!agent) return;
+    const token = commit.begin();
+    if (!token) return;
     setBusy(true);
     try {
       await deleteAgent(agent.id);
-      haptic('light');
-      onClose();
+      if (commit.owns(token)) { haptic('light'); onClose(); }
     } catch (err) {
-      setFailure(String((err as Error)?.message ?? err));
-      setBusy(false);
+      if (commit.owns(token)) setFailure(String((err as Error)?.message ?? err));
+    } finally {
+      if (commit.finish(token)) setBusy(false);
     }
   };
 
   return (
     <div class="screen-pad agent-editor">
+      <fieldset disabled={busy} aria-busy={busy} style={{ margin: 0, padding: 0, border: 0, minWidth: 0, display: 'grid', gap: 'var(--sp-3)' }}>
       <label class="agent-field">
         <span>Name</span>
         <input
@@ -251,6 +261,7 @@ function AgentEditor({ agent, available, onClose }: {
         selected={workflows}
         onToggle={(value) => toggle(workflows, setWorkflows, value)}
       />
+      </fieldset>
 
       {failure ? <p class="agent-failure">{failure}</p> : null}
 
@@ -258,7 +269,7 @@ function AgentEditor({ agent, available, onClose }: {
         <button class="agent-save" type="button" disabled={!name.trim() || busy} onClick={() => void save()}>
           {busy ? 'Saving…' : agent ? 'Save' : 'Create agent'}
         </button>
-        <button class="agent-cancel" type="button" onClick={onClose}>Cancel</button>
+        <button class="agent-cancel" type="button" disabled={busy} onClick={close}>Cancel</button>
         {agent ? (
           <button class="agent-delete" type="button" disabled={busy} onClick={() => void remove()}>
             Delete

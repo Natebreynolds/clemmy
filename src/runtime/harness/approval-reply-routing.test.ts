@@ -20,7 +20,7 @@ const eventlog = await import('./eventlog.js');
 const registry = await import('./approval-registry.js');
 const pending = await import('./pending-actions.js');
 const jev = await import('../jev/client.js');
-const { routeReplyToPendingApproval, isExactApprovalDecision, describePendingApproval, sessionHoldingWaitingCard } = await import('./approval-reply-routing.js');
+const { approvalConfirmationAlreadyAsked, routeReplyToPendingApproval, isExactApprovalDecision, describePendingApproval, sessionHoldingWaitingCard } = await import('./approval-reply-routing.js');
 const { parseApprovalIntent } = await import('./approval-intent.js');
 
 test.after(() => {
@@ -266,7 +266,7 @@ test('when Jev cannot read the reply, Clem asks the card\'s question back once, 
     );
     // The host committed that question (what the console does with a confirm).
     eventlog.appendEvent({ sessionId: card.sessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
-      data: { sourceUserSeq: 1, reason: 'approval_confirmation_required', question, options: ['Yes', 'No'] } });
+      data: { sourceUserSeq: 1, approvalId: card.approvalId, reason: 'approval_confirmation_required', question, options: ['Yes', 'No'] } });
     assert.equal(
       await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'hmm, the second one I think', parsed: null }),
       null,
@@ -276,6 +276,39 @@ test('when Jev cannot read the reply, Clem asks the card\'s question back once, 
     jev._setTypesafeKeyForTests('ts_test');
   }
   assert.equal(registry.get(card.approvalId)?.status, 'pending', 'nothing was decided on Jev\'s absence');
+});
+
+test('distinct cards with identical questions each keep one confirmation opportunity', async () => {
+  const card = waitingCard();
+  const question = 'Just to be sure — should I go ahead with "Send Slack message"?';
+  eventlog.appendEvent({ sessionId: card.sessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
+    data: { approvalId: 'apr-earlier-card', reason: 'approval_confirmation_required', question } });
+  jev._setTypesafeKeyForTests(null);
+  try {
+    assert.equal((await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'Yes, send it.', parsed: null }))?.confirm?.approvalId, card.approvalId);
+    eventlog.appendEvent({ sessionId: card.sessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
+      data: { approvalId: card.approvalId, reason: 'approval_confirmation_required', question } });
+    assert.equal(await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'hmm, send that one', parsed: null }), null);
+  } finally { jev._setTypesafeKeyForTests('ts_test'); }
+  reading = { choice: 'approves', confidence: 0.7 };
+  assert.equal(await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'Yes, send that one.', parsed: null }), null,
+    'a second unsure interpretation does not repeat the same card question');
+});
+
+test('two prepared surface replies share one transactional confirmation allowance for the exact card', async () => {
+  const card = waitingCard();
+  reading = { choice: 'approves', confidence: 0.7 };
+  const prepared = await Promise.all(['desktop fixture', 'phone fixture'].map(text => routeReplyToPendingApproval({ sessionId: card.sessionId, text, parsed: null })));
+  assert.equal(prepared.filter(route => route?.confirm).length, 2, 'both semantic preparations finish before either endpoint commits');
+  const committed = prepared.map(route => registry.withApprovalControlCommit(() => {
+    const confirm = route!.confirm!;
+    if (approvalConfirmationAlreadyAsked(card.sessionId, confirm.approvalId)) return false;
+    eventlog.appendEvent({ sessionId: card.sessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
+      data: { reason: 'approval_confirmation_required', approvalId: confirm.approvalId, question: confirm.question } });
+    return true;
+  }));
+  assert.deepEqual(committed, [true, false]);
+  assert.equal(eventlog.listEvents(card.sessionId, { types: ['awaiting_user_input'] }).length, 1);
 });
 
 test('expired and concurrently resolved cards cannot receive a delayed amendment', async () => {

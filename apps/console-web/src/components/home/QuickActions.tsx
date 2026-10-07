@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Loader2, Plus, Sparkles, Zap } from 'lucide-react';
@@ -6,6 +6,8 @@ import { runWorkflow } from '@/lib/automate';
 import type { QuickAction } from '@/lib/home-prefs';
 import { cn } from '@/lib/cn';
 import { HomeNotice, type HomeNoticeState } from './HomeSection';
+import { usePendingCommit } from '@/lib/pending-commit';
+import { workflowRunFailure, workflowRunId, workflowRunNotice, workflowRunTone } from '@/lib/workflow-run-receipt';
 
 /** The window event the Customize panel listens for. Dispatched from every
  *  "Add" affordance so there is one door into shaping the home. */
@@ -38,40 +40,42 @@ export function QuickActions({
   const qc = useQueryClient();
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notice, setNotice] = useState<HomeNoticeState | null>(null);
-  const mountedRef = useRef(true);
-  useEffect(() => () => { mountedRef.current = false; }, []);
+  const [noticeWarning, setNoticeWarning] = useState(false);
+  const scope = JSON.stringify(actions.filter((action) => action.kind === 'workflow').map((action) => [action.id, action.value]));
+  const commit = usePendingCommit(scope);
+  useEffect(() => { setBusyId(null); setNotice(null); }, [scope]);
 
   const startWorkflow = async (action: QuickAction) => {
+    const token = commit.begin();
+    if (!token) return;
     setBusyId(action.id);
     setNotice(null);
     try {
-      const queued = await runWorkflow(action.value) as { id?: string; held?: boolean; message?: string } | undefined;
+      const queued = await runWorkflow(action.value);
+      if (!commit.owns(token)) return;
       void qc.invalidateQueries({ queryKey: ['runs'] });
       void qc.invalidateQueries({ queryKey: ['working-now-badge'] });
       void qc.invalidateQueries({ queryKey: ['command-center'] });
-      if (!mountedRef.current) return;
-      if (queued?.held) {
-        setNotice({ tone: 'info', text: queued.message ?? `“${action.label}” is being prepared; it starts by itself.` });
-        return;
-      }
-      const href = queued?.id ? `/tasks?select=${encodeURIComponent(queued.id)}` : '/automate';
+      const id = workflowRunId(queued);
+      setNoticeWarning(workflowRunTone(queued) === 'warning');
       setNotice({
-        tone: 'success',
-        text: `Started “${action.label}”.`,
-        action: (
-          <Link to={href} className="shrink-0 rounded-sm px-1 font-semibold text-primary hover:underline">
+        tone: 'info',
+        text: workflowRunNotice(queued),
+        action: id ? (
+          <Link to={`/tasks?select=${encodeURIComponent(id)}`} className="shrink-0 rounded-sm px-1 font-semibold text-primary hover:underline">
             Open
           </Link>
-        ),
+        ) : undefined,
       });
     } catch (error) {
-      if (!mountedRef.current) return;
+      if (!commit.owns(token)) return;
+      setNoticeWarning(true);
       setNotice({
-        tone: 'error',
-        text: error instanceof Error && error.message.trim() ? error.message : `Couldn’t start “${action.label}”.`,
+        tone: 'info',
+        text: workflowRunFailure(error),
       });
     } finally {
-      if (mountedRef.current) setBusyId(null);
+      if (commit.finish(token)) setBusyId(null);
     }
   };
 
@@ -110,7 +114,7 @@ export function QuickActions({
           {actions.length === 0 ? 'Add a prompt or workflow' : 'Add'}
         </button>
       </div>
-      {notice && <HomeNotice notice={notice} onDismiss={() => setNotice(null)} />}
+      {notice && <HomeNotice notice={notice} onDismiss={() => setNotice(null)} className={noticeWarning ? 'border-warning/30 bg-warning-tint [&>svg]:text-warning' : undefined} />}
     </div>
   );
 }

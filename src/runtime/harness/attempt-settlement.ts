@@ -774,22 +774,13 @@ function signalsFromResult(result: unknown): AttemptSignals {
 }
 
 /**
- * A returned provider envelope that refused the exact request at the
- * provider's own layer: a 2xx transport with the provider's "not successful".
- * The same reading the classifier makes (`rejectedAtProviderLayer`), exposed
- * so the host can tell the model what that refusal means for a write.
+ * The settled adapter proof, never a second reading of provider bytes.
+ * A generic unsuccessful envelope cannot prove that nothing committed.
  */
-export function providerRefusedExactRequest(result: unknown): boolean {
-  // A carrier hands the provider envelope back as JSON text; read it as the
-  // settlement does, never as prose.
-  let value = result;
-  if (typeof result === 'string') {
-    try { value = JSON.parse(result); } catch { return false; }
-  }
-  const signals = signalsFromResult(value);
-  return typeof signals.httpStatus === 'number'
-    && signals.httpStatus >= 200 && signals.httpStatus < 300
-    && signals.envelopeSuccessful === false;
+export function providerRefusedExactRequest(outcome: AttemptOutcome): boolean {
+  return outcome.kind === 'invalid_arguments'
+    && outcome.evidence === 'nominal'
+    && outcome.detail === 'provider_rejected_before_effect';
 }
 
 /** Pull machine-readable facts out of a thrown value — the path that used to

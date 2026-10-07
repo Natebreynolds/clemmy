@@ -8,6 +8,7 @@ import { X } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Field, Input, Select, Textarea } from '@/components/ui/Field';
 import { createAgent, updateAgent, type AgentInput, type AgentRecord, type AgentCatalog } from '@/lib/agents';
+import { usePendingCommit } from '@/lib/pending-commit';
 
 /** The select value that means "no model of its own — follow the brain". */
 const FOLLOW_BRAIN = '__follow__';
@@ -34,6 +35,8 @@ export function AgentForm({
   const [tools, setTools] = useState<Set<string>>(new Set(agent?.tools ?? []));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const commit = usePendingCommit(`${mode}:${agent?.id ?? 'new'}`);
+  const close = () => { if (!commit.pending) onClose(); };
 
   const toggleIn = (setter: typeof setSkills) => (value: string) =>
     setter((prev) => {
@@ -49,6 +52,8 @@ export function AgentForm({
 
   const submit = async () => {
     if (!name.trim()) { setError('Give the agent a name.'); return; }
+    const token = commit.begin();
+    if (!token) return;
     setSaving(true); setError(null);
     const input: AgentInput = {
       name: name.trim(),
@@ -62,26 +67,27 @@ export function AgentForm({
     };
     try {
       const saved = mode === 'create' ? await createAgent(input) : await updateAgent(agent!.id, input);
-      onSaved(saved);
+      if (commit.owns(token)) onSaved(saved);
     } catch (e) {
       // The server answers with one plain sentence; show it as is.
-      setError(e instanceof Error ? e.message : String(e));
-      setSaving(false);
+      if (commit.owns(token)) setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (commit.finish(token)) setSaving(false);
     }
   };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label={`${mode === 'create' ? 'New' : 'Edit'} agent`}>
-      <div className="absolute inset-0 bg-black/30 animate-fade-in" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/30 animate-fade-in" onClick={close} />
       <div className="relative flex max-h-[90vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-modal animate-fade-in">
         <header className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
           <h3 className="text-h3 text-fg">{mode === 'create' ? 'New agent' : `Edit ${agent?.name}`}</h3>
-          <button onClick={onClose} className="rounded-sm p-1.5 text-muted hover:bg-hover hover:text-fg" aria-label="Close">
+          <button onClick={close} disabled={saving} className="rounded-sm p-1.5 text-muted hover:bg-hover hover:text-fg disabled:opacity-50" aria-label="Close">
             <X className="h-4 w-4" />
           </button>
         </header>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+        <fieldset disabled={saving} aria-busy={saving} className="m-0 min-h-0 min-w-0 flex-1 overflow-y-auto border-0 px-5 py-4">
           <Field label="Name">
             {(id) => <Input id={id} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Sales" autoFocus />}
           </Field>
@@ -139,10 +145,10 @@ export function AgentForm({
           )}
 
           {error && <p className="text-body text-danger" role="alert">{error}</p>}
-        </div>
+        </fieldset>
 
         <footer className="flex items-center justify-end gap-2 border-t border-border px-5 py-3">
-          <Button variant="secondary" size="sm" onClick={onClose} disabled={saving}>Cancel</Button>
+          <Button variant="secondary" size="sm" onClick={close} disabled={saving}>Cancel</Button>
           <Button size="sm" onClick={submit} disabled={saving}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : 'Save changes'}</Button>
         </footer>
       </div>

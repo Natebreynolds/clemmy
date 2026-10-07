@@ -1243,27 +1243,36 @@ export function claimPendingActionExecution(
 export function amendPendingActionPayload(
   id: string,
   payload: unknown,
-  opts: { actor: string; note: string; preview?: string },
+  opts: { actor: string; note: string; preview?: string; expectedPayloadHash?: string; approvalId?: string },
 ): PendingActionRecord | null {
   const mutate = (): PendingActionRecord | null => {
     const record = getPendingAction(id);
     if (!record) return null;
+    if (opts.expectedPayloadHash !== undefined && record.payloadHash !== opts.expectedPayloadHash) return null;
+    if (opts.approvalId !== undefined && record.approvalId !== opts.approvalId) return null;
     if (record.status !== 'queued' && record.status !== 'approval_requested') return record;
-    const now = new Date().toISOString();
-    const payloadHash = pendingActionPayloadHash(record.toolName, payload, record.executionAuthority ?? null);
-    record.payload = payload;
-    record.payloadHash = payloadHash;
-    record.idempotencyKey = shortHash({ kind: record.kind, toolName: record.toolName, payloadHash, targetSummary: record.targetSummary ?? '' });
-    if (opts.preview) record.preview = cleanLine(opts.preview, record.preview, 8000);
-    record.updatedAt = now;
-    record.history = [
-      ...(Array.isArray(record.history) ? record.history : []),
-      { at: now, status: record.status, note: opts.note, actor: opts.actor },
-    ];
-    return writeRecord(record);
+    return writeRecord(pendingActionWithEditedPayload(record, payload, opts));
   };
   const locked = withPendingActionTransitionLock(id, 'amend:payload', mutate);
   return locked.acquired ? locked.value : null;
+}
+
+/** Prepare the exact snapshot without changing the file. The approval journal
+ * commits that snapshot first; reconciliation can finish the file after a crash. */
+export function pendingActionWithEditedPayload(
+  record: PendingActionRecord,
+  payload: unknown,
+  opts: { actor: string; note: string; preview?: string },
+): PendingActionRecord {
+  const now = new Date().toISOString();
+  const payloadHash = pendingActionPayloadHash(record.toolName, payload, record.executionAuthority ?? null);
+  return {
+    ...record, payload, payloadHash,
+    idempotencyKey: shortHash({ kind: record.kind, toolName: record.toolName, payloadHash, targetSummary: record.targetSummary ?? '' }),
+    preview: opts.preview ? cleanLine(opts.preview, record.preview, 8000) : record.preview,
+    updatedAt: now,
+    history: [...record.history, { at: now, status: record.status, note: opts.note, actor: opts.actor }],
+  };
 }
 
 export function linkPendingActionApproval(id: string, approvalId: string): PendingActionRecord | null {

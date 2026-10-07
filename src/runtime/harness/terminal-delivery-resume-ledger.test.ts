@@ -22,6 +22,9 @@ test('a delivery-judge resume is remembered across activations, per accepted sou
   eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'heartbeat',
     data: { kind: 'terminal_delivery_resume', reason: 'verify the state', attempt: 1, sourceUserSeq: first.seq } });
   assert.equal(ledger.priorTerminalDeliveryResumes(session.id, first.seq), 1, 'the second activation sees the first resume');
+  for (let n = 0; n < 220; n += 1) eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'heartbeat', data: { kind: 'working', n } });
+  eventlog.closeEventLog();
+  assert.equal(ledger.priorTerminalDeliveryResumes(session.id, first.seq), 1, 'the durable cap survives 220 later heartbeats and reopen');
   assert.equal(ledger.priorTerminalDeliveryResumes(session.id, second.seq), 0, 'another source is not charged for it');
-  assert.equal(ledger.priorTerminalDeliveryResumes(session.id, undefined), 0);
+  assert.equal(ledger.priorTerminalDeliveryResumes(session.id, undefined), 1, 'an unknown legacy source cannot buy another automatic resume');
 });

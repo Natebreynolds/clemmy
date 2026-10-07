@@ -43,7 +43,12 @@ const event = (
   seq: number,
   type: string,
   data: Record<string, unknown> = {},
-): HarnessEvent => ({ seq, type, data });
+): HarnessEvent => ({ seq, type, data: type === 'async_work_dispatched' ? {
+  ...data, version: 2, kind: 'workflow_run_group', status: 'dispatched',
+  sourceGroupId: `workflow-origin-group-v1:${'b'.repeat(64)}`, sourceGroupDigest: 'c'.repeat(64),
+  replyTargetDigest: 'a'.repeat(64),
+  dispatchKey: `workflow_source_group:workflow-origin-group-v1:${'b'.repeat(64)}:${'c'.repeat(64)}`,
+} : data });
 
 const nextTurn = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -62,7 +67,9 @@ test('delegated workflow dispatch stays live until the origin report-back termin
   const firstConnection = transport.live;
   assert.ok(firstConnection, 'the accepted mobile turn must attach its origin stream');
 
+  firstConnection.onEvent(event(9, 'user_input_received', { text: 'Run my workflow' }));
   firstConnection.onEvent(event(10, 'async_work_dispatched', {
+    sourceUserSeq: 9,
     runIds: ['workflow-run-1'],
     dispatchKey: 'workflow-origin-1',
   }));
@@ -70,7 +77,7 @@ test('delegated workflow dispatch stays live until the origin report-back termin
   const dispatched = engine.snapshot();
   const activeReply = dispatched.messages.find((message) => message.role === 'assistant');
   assert.equal(
-    activeReply?.activity?.some((item) => item.label === 'Started the workflow in the background'),
+    activeReply?.activity?.some((item) => item.label === 'Workflow queued — waiting to start'),
     true,
     'dispatch remains visible progress in the active mobile transcript',
   );
@@ -122,19 +129,19 @@ test('reopening a delegated workflow keeps its running message until report-back
   assert.equal(snapshot.busy, false, 'delegated work leaves the composer available');
   assert.deepEqual(snapshot.messages.map((message) => [message.role, message.text]), [
     ['user', 'Can you run my platform 49 flow please'],
-    ['assistant', 'The workflow is running. I’ll report back here when it finishes.'],
+    ['assistant', 'Queued — waiting for the workflow to start. I’ll post the result here when it’s ready.'],
   ]);
   assert.equal(
     snapshot.messages[1]?.activity?.some(
-      (item) => item.label === 'Started the workflow in the background' && item.status === 'running',
+      (item) => item.label === 'Workflow queued — waiting to start' && item.status === 'running',
     ),
     true,
     'the durable dispatch reconstructs the running activity after navigation',
   );
-  assert.deepEqual(snapshot.messages[1]?.delegatedWork, {
-    sourceUserSeq,
-    runIds: ['1788201716184-f6311f'],
-    state: 'running',
+  assert.deepEqual({ sourceUserSeq: snapshot.messages[1]?.delegatedWork?.sourceUserSeq,
+    runIds: snapshot.messages[1]?.delegatedWork?.runIds, state: snapshot.messages[1]?.delegatedWork?.state,
+    execution: snapshot.messages[1]?.delegatedWork?.execution }, {
+    sourceUserSeq, runIds: ['1788201716184-f6311f'], state: 'running', execution: 'queued',
   }, 'replay preserves the exact dispatch identity needed by the card control');
   assert.equal(engine.setDelegatedWorkState(sourceUserSeq + 1, 'stopped'), false,
     'a stale source cannot mutate this card');
@@ -287,7 +294,7 @@ test('reopen settles an older delegated bubble even when a newer turn already co
   await nextTurn();
   assert.deepEqual(engine.snapshot().messages.map((message) => [message.role, message.text]), [
     ['user', 'Run Platform 49'],
-    ['assistant', 'The workflow is running. I’ll report back here when it finishes.'],
+    ['assistant', 'Queued — waiting for the workflow to start. I’ll post the result here when it’s ready.'],
     ['user', 'What else is new?'],
     ['assistant', 'Nothing else needs attention.'],
   ]);

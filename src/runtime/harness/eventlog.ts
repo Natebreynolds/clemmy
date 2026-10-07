@@ -260,6 +260,9 @@ export const EVENT_TYPES = [
   // Source-bound adapter metadata only; never completion evidence or a public
   // lifecycle event. No prompt, output prose, tool arguments or credentials.
   'model_stream_diagnostic',
+  // Content-free, exact-source attempt/retry timing. This is observational;
+  // it must never replenish a budget or establish task/effect completion.
+  'model_resilience_observed',
   // Exact model/tool-loop owner selected at the RunRunnerFn boundary. This is
   // distinct from turn_model_routed: a provider can be routed through the
   // shared harness while the legacy SDK or Clem's host engine owns stepping.

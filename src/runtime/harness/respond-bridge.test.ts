@@ -1859,6 +1859,66 @@ test('respondPreferHarness: a conversation switched to an agent pinned to a mode
   assert.equal(isPinnedWorkerModel('claude-sonnet-4-6'), false, 'the caller does not inherit foreground pin authority');
 });
 
+test('delegated specialist pin spans lazy background dispatch and a conflicting generic override cannot replace it', async (t) => {
+  const { isPinnedWorkerModel } = await import('./pinned-worker-model.js');
+  const { _setFalloverChainForTest } = await import('./respond-bridge.js');
+  _setFalloverChainForTest(['gpt-5.5']);
+  t.after(() => _setFalloverChainForTest(null));
+  const built: Array<string | undefined> = [];
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: (async (input: { model?: string }) => {
+      assert.equal(isPinnedWorkerModel('claude-sonnet-4-6'), true);
+      assert.equal(isPinnedWorkerModel('gpt-5.5'), false);
+      built.push(input.model); return FAKE_AGENT;
+    }) as never,
+    runConversation: (async (opts: { sessionId: string; buildAgent?: (identity: unknown) => Promise<unknown>;
+      falloverModelIds?: string[]; rebuildAgentForBrain?: unknown }) => {
+      assert.equal(opts.falloverModelIds, undefined);
+      assert.equal(opts.rebuildAgentForBrain, undefined);
+      await opts.buildAgent?.(stubBuildIdentity(opts as never));
+      await Promise.resolve();
+      assert.equal(isPinnedWorkerModel('claude-sonnet-4-6'), true, 'awaited work retains exact provider retry guard');
+      return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+        lastDecision: { reply: 'controlled specialist result', done: true, nextAction: 'completed' } };
+    }) as never,
+  });
+  for (const [index, override] of [undefined, 'gpt-5.5'].entries()) {
+    const response = await respondViaHarness('background', { message: 'Controlled fixture', sessionId: `delegated-pin-${index}`, model: 'gpt-5.5' },
+      { delegatedAgentModelPin: 'claude-sonnet-4-6', ...(override ? { modelOverride: override } : {}) });
+    assert.equal(response.route?.effectiveModel, 'claude-sonnet-4-6');
+  }
+  assert.deepEqual(built, ['claude-sonnet-4-6', 'claude-sonnet-4-6']);
+  assert.equal(isPinnedWorkerModel('claude-sonnet-4-6'), false, 'pin authority does not escape the background response');
+});
+
+test('delegated specialist parse recovery does not rerun on a substitute and generic request model creates no exact pin', async () => {
+  const { isPinnedWorkerModel } = await import('./pinned-worker-model.js');
+  let calls = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: (async () => FAKE_AGENT) as never,
+    runConversation: (async (opts: { sessionId: string }) => {
+      calls++;
+      assert.equal(isPinnedWorkerModel('claude-sonnet-4-6'), true);
+      return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1, completedReason: 'no_structured_output' };
+    }) as never,
+  });
+  await respondViaHarness('background', { message: 'Controlled parse fixture', sessionId: 'delegated-pin-parse' },
+    { delegatedAgentModelPin: 'claude-sonnet-4-6' });
+  assert.equal(calls, 1, 'unstructured output cannot activate the default model for a pinned specialist');
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: (async () => FAKE_AGENT) as never,
+    runConversation: (async (opts: { sessionId: string }) => {
+      assert.equal(isPinnedWorkerModel('claude-sonnet-4-6'), false);
+      return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+        lastDecision: { reply: 'generic result', done: true, nextAction: 'completed' } };
+    }) as never,
+  });
+  await respondViaHarness('background', { message: 'Controlled generic fixture', sessionId: 'generic-no-pin', model: 'claude-sonnet-4-6' });
+});
+
 test('saved agent model unavailable commits its exact-source block before any model or tool dispatch and replays it', async (t) => {
   const { createAgentRecord } = await import('../../agents/agent-record.js');
   const { setSessionAgent } = await import('../../agents/session-agent.js');

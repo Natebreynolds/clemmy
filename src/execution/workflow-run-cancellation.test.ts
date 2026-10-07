@@ -1,6 +1,6 @@
 import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -52,6 +52,41 @@ test('a corrupt cancellation receipt still fails closed', () => {
 
   assert.equal(workflowRunCancellationRequested('run-corrupt'), true);
   assert.match(readWorkflowRunCancellation('run-corrupt')?.reason ?? '', /unreadable/);
+});
+
+test('exact ownership precondition is read under the canonical lock and refusal writes no cancellation authority', () => {
+  const file = writeRun('precondition-refused', { status: 'queued' });
+  const before = readFileSync(file, 'utf8');
+  let observedLock = false;
+  const refused = cancelWorkflowRunAtBoundary({ runId: 'precondition-refused', reason: 'Stop.', source: 'test',
+    precondition: (run) => {
+      observedLock = existsSync(`${file}.record-lock`);
+      assert.equal(run.status, 'queued');
+      return 'shared_child_requires_exact_run_stop';
+    } });
+  assert.equal(observedLock, true);
+  assert.equal(refused.status, 'refused');
+  assert.equal(refused.status === 'refused' && refused.reason, 'shared_child_requires_exact_run_stop');
+  assert.equal(readFileSync(file, 'utf8'), before);
+  assert.equal(workflowRunCancellationRequested('precondition-refused'), false);
+  assert.equal(existsSync(`${file}.record-lock`), false);
+});
+
+test('an unavailable ownership precondition fails closed; a completed winner bypasses it without cancellation', () => {
+  const file = writeRun('precondition-unavailable', { status: 'queued' });
+  const before = readFileSync(file, 'utf8');
+  const result = cancelWorkflowRunAtBoundary({ runId: 'precondition-unavailable', reason: 'Stop.', source: 'test',
+    precondition: () => { throw new Error('private ownership failure'); } });
+  assert.equal(result.status === 'refused' && result.reason, 'ownership_unproved');
+  assert.equal(readFileSync(file, 'utf8'), before);
+  assert.equal(workflowRunCancellationRequested('precondition-unavailable'), false);
+  const terminal = writeRun('precondition-completed', { status: 'completed', finishedAt: new Date().toISOString(), effectReceipts: ['kept'] });
+  const terminalBefore = readFileSync(terminal, 'utf8');
+  const completed = cancelWorkflowRunAtBoundary({ runId: 'precondition-completed', reason: 'Stop.', source: 'test',
+    precondition: () => { assert.fail('completed work is not subject to a new cancellation precondition'); } });
+  assert.equal(completed.status, 'already_terminal');
+  assert.equal(readFileSync(terminal, 'utf8'), terminalBefore);
+  assert.equal(workflowRunCancellationRequested('precondition-completed'), false);
 });
 
 test('completion landing after the dashboard snapshot wins the cancellation boundary', () => {

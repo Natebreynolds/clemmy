@@ -65,6 +65,9 @@ export interface ChatStreamOptions {
   onConnectionState?(state: ConnectionState): void;
   /** The stream saw a terminal event and closed itself. */
   onTerminal?(): void;
+  /** A mounted conversation keeps observing card decisions and replies from
+   * another device after its foreground turn parks or finishes. */
+  keepOpenAfterTerminal?: boolean;
   /** Timings — injectable for tests. */
   reconnectWindowMs?: number;
   reconnectBaseDelayMs?: number;
@@ -140,7 +143,8 @@ export function runChatStream(options: ChatStreamOptions): ChatStreamHandle {
   };
 
   const finishTerminal = (): void => {
-    stop();
+    if (!options.keepOpenAfterTerminal) stop();
+    else if (approvalTimer) { clearTimeout(approvalTimer); approvalTimer = null; }
     options.onTerminal?.();
   };
 
@@ -192,10 +196,10 @@ export function runChatStream(options: ChatStreamOptions): ChatStreamHandle {
           finishTerminal();
         };
         approvalTimer = setTimeout(() => { void settleApproval(); }, t.approvalSettleMs);
-        return true;
+        return !options.keepOpenAfterTerminal;
       }
       finishTerminal();
-      return true;
+      return !options.keepOpenAfterTerminal;
     }
     return false;
   };

@@ -360,6 +360,44 @@ test('repeated RESUME verdicts still cannot reopen the SDK — one evaluation, o
   );
 });
 
+test('SDK reactivation charges the exact durable source after 220 heartbeats and reopen, retaining confirmed effects', async () => {
+  const sessionId = 'claude-terminal-judge-durable-source-cap';
+  eventlog.createSession({ id: sessionId, kind: 'chat', channel: 'desktop' });
+  const source = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Report the controlled effect once.' } });
+  recordConfirmedWrite({ sessionId, sourceUserSeq: source.seq, turn: 1 });
+  eventlog.appendEvent({ sessionId, turn: 1, role: 'system', type: 'heartbeat', data: { kind: 'terminal_delivery_resume', sourceUserSeq: source.seq, attempt: 1 } });
+  for (let n = 0; n < 220; n += 1) eventlog.appendEvent({ sessionId, turn: 1, role: 'system', type: 'heartbeat', data: { kind: 'working', n } });
+  eventlog.closeEventLog();
+  const askIfRepeated = 'The effect is recorded; which remaining check should I continue with?';
+  const judge = judgeFixture([{
+    verb: 'resume', reason: 'the exact remaining account can be checked',
+    recoveryInstruction: 'Inspect the retained receipt and report the exact remaining gap without repeating the effect.', askIfRepeated,
+  }]);
+  let sdkCalls = 0;
+  setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(judge.port);
+  setClaudeAgentSdkBrainRunForTest(async () => { sdkCalls += 1; return concernOnlySdkResult(sessionId); });
+  const response = await respondViaClaudeAgentSdkBrain('home', { message: 'Report the controlled effect once.', sessionId, channel: 'desktop', sourceUserSeq: source.seq });
+  assert.equal(sdkCalls, 1, 'reactivation cannot mint another automatic SDK query');
+  assert.equal(judge.runCalls(), 1);
+  assert.match(judge.requests()[0]?.prompt ?? '', /Consecutive RESUME verdicts already honored: 1/);
+  assert.equal(response.text, askIfRepeated);
+  assert.equal(response.stoppedReason, 'awaiting-input');
+  assert.equal(eventlog.listEvents(sessionId, { types: ['external_write_succeeded'] }).length, 1, 'the confirmed receipt is retained');
+  assert.equal(eventlog.listEvents(sessionId, { types: ['heartbeat'] }).filter(row => row.data.kind === 'terminal_delivery_resume').length, 1);
+});
+
+test('SDK delivery allowance is not charged by another accepted source in the same session', async () => {
+  const sessionId = 'claude-terminal-judge-other-source-cap';
+  eventlog.createSession({ id: sessionId, kind: 'chat' });
+  const older = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Previous controlled source.' } });
+  eventlog.appendEvent({ sessionId, turn: 1, role: 'system', type: 'heartbeat', data: { kind: 'terminal_delivery_resume', sourceUserSeq: older.seq, attempt: 1 } });
+  const judge = judgeFixture([{ verb: 'deliver', reason: 'the remaining gap is disclosed', publicText: 'The controlled reply needs a later check.' }]);
+  setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(judge.port);
+  setClaudeAgentSdkBrainRunForTest(async () => concernOnlySdkResult(sessionId));
+  await respondViaClaudeAgentSdkBrain('home', { message: 'A different controlled request.', sessionId });
+  assert.match(judge.requests()[0]?.prompt ?? '', /Consecutive RESUME verdicts already honored: 0/);
+});
+
 test('ASK publishes exactly the judge-authored question and does not resume the SDK', async () => {
   const sessionId = 'claude-terminal-judge-asks';
   const publicText = 'Which account should I use before I inspect the remaining record?';

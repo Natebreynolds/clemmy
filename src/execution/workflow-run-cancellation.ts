@@ -55,7 +55,8 @@ export type CancelWorkflowRunResult =
   | { status: 'already_cancelled'; request?: WorkflowRunCancellationRequest; run: WorkflowRunProjection }
   | { status: 'already_terminal'; terminalStatus: Exclude<WorkflowRunTerminalStatus, 'cancelled'>; run: WorkflowRunProjection }
   | { status: 'not_found' }
-  | { status: 'workflow_mismatch'; run: WorkflowRunProjection };
+  | { status: 'workflow_mismatch'; run: WorkflowRunProjection }
+  | { status: 'refused'; reason: 'ownership_unproved' | 'shared_child_requires_exact_run_stop'; run: WorkflowRunProjection };
 
 const CANCELLATION_DIR = path.join(WORKFLOW_RUNS_DIR, '.cancellations');
 const TERMINAL_STATUSES = new Set<WorkflowRunTerminalStatus>([
@@ -225,6 +226,9 @@ export function cancelWorkflowRunAtBoundary(input: {
   reason: string;
   source: string;
   expectedWorkflow?: string;
+  /** Trusted control-plane reads only. It shares the terminal lock so exact
+   * ownership cannot change between the proof and cancellation authority. */
+  precondition?: (run: Readonly<WorkflowRunProjection>) => 'allow' | 'ownership_unproved' | 'shared_child_requires_exact_run_stop';
 }): CancelWorkflowRunResult {
   const file = runFile(input.runId);
   // Preserve the exact old race window in a deterministic seam: a completion
@@ -243,6 +247,15 @@ export function cancelWorkflowRunAtBoundary(input: {
     const currentStatus = terminalStatus(current);
     if (currentStatus && currentStatus !== 'cancelled') {
       return { status: 'already_terminal', terminalStatus: currentStatus, run: current };
+    }
+
+    if (input.precondition && currentStatus !== 'cancelled') {
+      let proof: ReturnType<NonNullable<typeof input.precondition>>;
+      try { proof = input.precondition(current); } catch { proof = 'ownership_unproved'; }
+      if (proof !== 'allow') {
+        return { status: 'refused', reason: proof === 'shared_child_requires_exact_run_stop'
+          ? proof : 'ownership_unproved', run: current };
+      }
     }
 
     const wasCancelled = currentStatus === 'cancelled';

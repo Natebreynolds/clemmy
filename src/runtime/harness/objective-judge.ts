@@ -50,6 +50,10 @@ export const OWNER_STANDING_INSTRUCTIONS_HEADING = "THE OWNER'S STANDING INSTRUC
 export const OWNER_STANDING_INSTRUCTIONS_RUBRIC =
   `- OWNER STANDING INSTRUCTIONS: evidence headed ${OWNER_STANDING_INSTRUCTIONS_HEADING} is the owner's own, exactly as the work had it in context. One that applies to this work carries the owner's authority: where it addresses this case more specifically than the objective or the saved instructions (an exception, an exclusion, a way to do it), following it fulfils the objective as the owner wants it and is not a gap, an omission or an invented preference, and a clear departure from it is a gap. Name the instruction when it decides a finding. It reaches only what it says: it never adds a deliverable, never authorizes work outside its own scope, and never relaxes a USER CONSTRAINT. A preference the work applied that appears in none of the objective, the saved instructions or these instructions is still unsupported.`;
 
+/** Exact host completion guidance. Only its existing caller opts in; the
+ * source's changing objective, receipt bytes and lookup refs stay in the prompt. */
+export const HOST_COMPLETION_EVIDENCE_GUIDANCE = `Judge only the effective accepted objective. A successful empty result may complete a bounded lookup; a cancelled or replaced request does not owe its abandoned effects. Do not demand writes or artifacts the objective never requested. Unavailable optional or irrelevant reads do not create new requirements. Each result above is shown whole or as an explicitly bounded reviewer preview, as its own line says. A claim that rests on content outside what is shown, including a claim that data is missing, empty, unavailable or complete, is unverified unless another read shown here covers it, such as a filtered query, a true count or a recalled page, or you open it with the evidence tools. EARLIER TURNS evidence counts for what the reply says an earlier turn checked or found at that time; it cannot show this turn's own effects. A selected/derived projection is not the full source result, and an omitted projection field does not establish absence. Distinguish absent values from zero, empty and uninspected values. When the objective is not met and the evidence shows another attempt cannot change that, the verdict is BLOCKED.`;
+
 export const JUDGE_SYSTEM_PROMPT = [
   'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',
   '',
@@ -573,6 +577,9 @@ export interface SkillExecutionContext {
    * model's request admission. Never independently clip the reply or skills
    * while claiming this is a complete evidence review. */
   fullSourceEvidence?: boolean;
+  /** The host's existing static completion paragraph, supplied explicitly.
+   * Arbitrary guidance cannot enter the shared cached instruction prefix. */
+  completionEvidenceGuidance?: typeof HOST_COMPLETION_EVIDENCE_GUIDANCE;
   /** Only the accepted source may supply this; omitted retains legacy routing. */
   boundaryJudgeSelection?: CapturedBoundaryJudgeSelection;
   /** Retained results the reviewer may open with read-only evidence tools. */
@@ -588,6 +595,22 @@ export interface SkillExecutionContext {
   /** What the review protects: work that wrote to an app or file, a plan
    *  that runs only after the owner approves it, or a read-only answer. */
   reviewStakes?: ReviewStakes;
+}
+
+/** Assemble the same review rules, with opted-in host guidance before the
+ * existing cache boundary. Absence preserves the legacy instructions exactly. */
+export function buildCompletionJudgeInstructions(
+  context?: Pick<SkillExecutionContext, 'completionEvidenceGuidance' | 'memoryRequirementContext'>,
+): string {
+  if (context?.completionEvidenceGuidance !== undefined
+    && context.completionEvidenceGuidance !== HOST_COMPLETION_EVIDENCE_GUIDANCE) {
+    throw new Error('Completion evidence guidance must match the retained host rules exactly.');
+  }
+  return [
+    JUDGE_SYSTEM_PROMPT,
+    ...(context?.completionEvidenceGuidance ? [HOST_COMPLETION_EVIDENCE_GUIDANCE] : []),
+    ...(context?.memoryRequirementContext ? [MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS] : []),
+  ].join('\n\n');
 }
 
 export interface CompletionEvidenceRow {
@@ -1360,6 +1383,7 @@ async function runCompletionJudge(
   skillContext?: SkillExecutionContext,
   judge: { lane?: JudgeMetricLane; timeoutMs?: number } = {},
 ): Promise<CompletionJudgeRun> {
+  const instructions = buildCompletionJudgeInstructions(skillContext);
   const basePrompt = buildObjectiveJudgePrompt(objective, assistantResponse, skillContext);
   const prompt = skillContext?.memoryRequirementContext
     ? `${basePrompt}\n\n${skillContext.memoryRequirementContext}\n\n${MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS}` : basePrompt;
@@ -1378,7 +1402,7 @@ async function runCompletionJudge(
   const hedged = (reviewPrompt: string, depth: ReviewDepthRequest) => {
     const timeoutMs = judge.timeoutMs ?? depth.timeoutMs;
     return runHedgedJudge(
-      skillContext?.memoryRequirementContext ? `${JUDGE_SYSTEM_PROMPT}\n\n${MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS}` : JUDGE_SYSTEM_PROMPT,
+      instructions,
       reviewPrompt,
       parse,
       (v) => v.done,

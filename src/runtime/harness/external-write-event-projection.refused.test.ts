@@ -12,13 +12,17 @@ import { classifyAttemptOutcome } from './attempt-outcome.js';
 import { externalWriteTerminalForAttemptOutcome } from './external-write-event-projection.js';
 
 test('a provider-refused mutation projects as a failed write, not an orphaned one', () => {
-  const refused = classifyAttemptOutcome({ httpStatus: 200, envelopeSuccessful: false, mutating: true, acknowledged: false });
-  assert.equal(refused.detail, 'envelope_rejected');
+  const refused = classifyAttemptOutcome({ httpStatus: 200, envelopeSuccessful: false, mutating: true, acknowledged: false, providerRejectedBeforeEffect: true });
+  assert.equal(refused.detail, 'provider_rejected_before_effect');
   assert.equal(externalWriteTerminalForAttemptOutcome(refused, 'returned', { hasDurableResultHandle: false }), 'external_write_failed');
   // Without a transport status the fate is unknown and stays orphaned.
   const unknown = classifyAttemptOutcome({ envelopeSuccessful: false, mutating: true, acknowledged: false });
   assert.equal(externalWriteTerminalForAttemptOutcome(unknown, 'returned', { hasDurableResultHandle: false }), 'external_write_orphaned');
-  // A 404 still proves rejection before effect, as before.
+  // A generic 404 does not prove a multistage provider changed nothing.
   const notFound = classifyAttemptOutcome({ httpStatus: 404, mutating: true, acknowledged: false });
-  assert.equal(externalWriteTerminalForAttemptOutcome(notFound, 'returned', { hasDurableResultHandle: false }), 'external_write_failed');
+  assert.equal(externalWriteTerminalForAttemptOutcome(notFound, 'returned', { hasDurableResultHandle: false }), 'external_write_orphaned');
+  for (const status of [200, 400, 403, 422]) {
+    const partial = classifyAttemptOutcome({ httpStatus: status, envelopeSuccessful: false, mutating: true });
+    assert.equal(externalWriteTerminalForAttemptOutcome(partial, 'returned', { hasDurableResultHandle: true }), 'external_write_orphaned');
+  }
 });

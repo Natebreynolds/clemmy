@@ -101,6 +101,7 @@ import { atomicJsonMutate } from '../runtime/atomic-json.js';
 import {
   activeRunSessionIds,
   getActiveRunAttempt,
+  getRunAttemptSourceUserEvent,
   getLatestRunAttempt as getLatestHarnessRunAttempt,
   claimHarnessChatRequest,
   claimRunAttemptLease,
@@ -211,8 +212,8 @@ import { attachAnswerStream } from '../runtime/harness/answer-stream.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { runConversationFromResume } from '../runtime/harness/loop.js';
-import { resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
-import { applyQueuedCardFieldEdits, queuedCardEditsFrom, recordQueuedCardEditDecision } from '../runtime/harness/approval-card-edit.js';
+import { approvalConfirmationAlreadyAsked, resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
+import { applyQueuedCardFieldEdits, queuedCardEditsFrom } from '../runtime/harness/approval-card-edit.js';
 import { loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { forgetApprovedWriteKind, listApprovedWriteKinds } from '../agents/plan-scope.js';
 import { buildContinueInput, isContinueCompletionReason } from '../runtime/harness/continue-directive.js';
@@ -3511,7 +3512,12 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     // retyped field lands on the queued record behind the card, the card
     // keeps its id, and the decision is an ordinary approve of the edited
     // record. A card with no queued record cannot be edited from the phone.
-    const fieldEdits = queuedCardEditsFrom(req.body?.modifiedFields);
+    let fieldEdits: Record<string, string> | null;
+    try { fieldEdits = queuedCardEditsFrom(req.body?.modifiedFields); }
+    catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : 'invalid edited fields' });
+      return;
+    }
     if (fieldEdits) {
       const queuedEdit = await applyQueuedCardFieldEdits({ approvalId: id, edits: fieldEdits, actor: 'mobile-inbox' });
       if (queuedEdit === null) {
@@ -3522,7 +3528,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         res.status(queuedEdit.status).json({ error: queuedEdit.reason });
         return;
       }
-      recordQueuedCardEditDecision({ approvalId: id, editedFields: queuedEdit.editedFields });
+      res.json({ ok: true, approvalId: id, sessionId: queuedEdit.approval.sessionId,
+        approval: serializeApprovalForMobile(queuedEdit.approval), status: 'resolved-pending-action-approval-only',
+        message: 'Approved with your edits; execution remains with its runtime owner.' });
+      return;
     }
     await resolveMobileApproval(res, id, 'approve');
   });
@@ -3904,6 +3913,20 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  // Read-only identity for a reopened phone turn. A newer source never lends
+  // its active attempt to an older turn's Stop button.
+  router.get('/api/chat/sessions/:sessionId/control', requireMobileSession, (req, res) => {
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    const sourceUserSeq = typeof req.query.sourceUserSeq === 'string' ? Number(req.query.sourceUserSeq) : NaN;
+    if (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) {
+      res.status(400).json({ error: 'sourceUserSeq must be a positive integer' }); return;
+    }
+    if (!harnessGetSession(sessionId)) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+    const attempt = getActiveRunAttempt(sessionId);
+    const boundSource = attempt ? getRunAttemptSourceUserEvent(attempt) : null;
+    res.json({ activeRun: attempt && boundSource?.seq === sourceUserSeq ? { sessionId, sourceUserSeq, attemptId: attempt.attemptId } : null });
+  });
+
   router.get('/api/chat/sessions/:sessionId', requireMobileSession, (req, res) => {
     const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
     const session = harnessGetSession(sessionId);
@@ -4282,7 +4305,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             requestId, runId, inputHash, sessionId: cardSessionId, text: message,
             prepare: () => {
               const row = approvalRegistry.get(confirm.approvalId);
-              if (!row || !approvalRegistry.isActionable(row)) return null;
+              if (!row || !approvalRegistry.isActionable(row) || approvalConfirmationAlreadyAsked(cardSessionId, confirm.approvalId)) return null;
               return {
                 sourceData: { source: 'mobile_approval_confirm', approvalId: confirm.approvalId, confirm: confirm.leaning },
                 commit: (source) => {
@@ -5212,8 +5235,22 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       return;
     }
     try {
-      const queued = queueWorkflowRun(entry.data.name, inputs, { source: 'mobile', dedupe: false });
-      res.json({ ok: true, runId: queued.id, status: 'queued' });
+      // Ordinary Run rejoins the same active/uncertain occurrence, just as
+      // desktop Run does. Explicit TRY/recovery paths own fresh-run authority.
+      const queued = queueWorkflowRun(entry.data.name, inputs, { source: 'mobile' });
+      if (queued.status === 'blocked_readiness') {
+        res.status(409).json({ ok: false, queued: false, status: queued.status,
+          error: queued.message, message: queued.message, readiness: queued.readiness });
+        return;
+      }
+      const identity = queued.id ? { id: queued.id, runId: queued.id } : {};
+      if (queued.status === 'held') {
+        res.status(202).json({ ok: true, queued: false, held: true, status: queued.status,
+          message: queued.message, ...identity });
+        return;
+      }
+      res.json({ ok: true, queued: queued.status === 'queued', duplicate: queued.status === 'duplicate',
+        ...identity, status: queued.status, message: queued.message });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -5798,13 +5835,15 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         // stops nothing, and every later retry of that same message then 409s.
         const cancellation = requestHarnessChatCancellation(requestId, 'cancelled from the phone');
         let cancelledApprovals = 0;
+        let stopped: ReturnType<typeof stopExactHarnessAttempt> | undefined;
         if (attempt && !attempt.finishedAt && attempt.status === 'active') {
-          cancelledApprovals = stopExactHarnessAttempt(
+          stopped = stopExactHarnessAttempt(
             sessionId,
             attempt,
             'cancelled from the phone',
             'mobile',
-          ).cancelledApprovals;
+          );
+          cancelledApprovals = stopped.cancelledApprovals;
         }
         res.json({
           ok: true,
@@ -5818,6 +5857,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           pendingAcceptance: !receipt || !attempt,
           attemptId: attempt?.attemptId ?? null,
           cancelledApprovals,
+          ...(stopped?.workflowStop ? { workflowStop: stopped.workflowStop } : {}),
         });
       } catch (err) {
         res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -5856,6 +5896,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           attemptId: activeAttempt.attemptId,
           cancelledApprovals: stopped.cancelledApprovals,
           cancelledTasks: stopped.cancelledTasks,
+          ...(stopped.workflowStop ? { workflowStop: stopped.workflowStop } : {}),
           stoppedActive: true,
         });
       } catch (err) {
@@ -5895,6 +5936,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         attemptId: activeAttempt.attemptId,
         cancelledApprovals: stopped.cancelledApprovals,
         cancelledTasks: stopped.cancelledTasks,
+        ...(stopped.workflowStop ? { workflowStop: stopped.workflowStop } : {}),
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

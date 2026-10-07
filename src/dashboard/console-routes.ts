@@ -458,9 +458,9 @@ import { HarnessSession } from '../runtime/harness/session.js';
 import { stopExactHarnessAttempt } from '../runtime/harness/stop-exact-attempt.js';
 import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconcile.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
-import { resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
+import { approvalConfirmationAlreadyAsked, resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
 import { approvalArgsWithFieldEdits } from '../runtime/harness/approval-call-preview.js';
-import { applyQueuedCardFieldEdits, queuedCardEditsFrom, recordQueuedCardEditDecision } from '../runtime/harness/approval-card-edit.js';
+import { applyQueuedCardFieldEdits, queuedCardEditsFrom } from '../runtime/harness/approval-card-edit.js';
 import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-source-session-branch.js';
 import { getSlackRuntimeStatus } from '../channels/slack.js';
 import { SLACK_APP_MANIFEST_YAML } from '../channels/slack-manifest.js';
@@ -3616,7 +3616,7 @@ function tryCommitLiveApprovalControl(input: {
       if (input.confirm && input.confirmEligible) {
         const confirm = input.confirm;
         const row = approvalRegistry.get(confirm.approvalId);
-        if (!row || !approvalRegistry.isActionable(row)) return null;
+        if (!row || !approvalRegistry.isActionable(row) || approvalConfirmationAlreadyAsked(input.sessionId, confirm.approvalId)) return null;
         return {
           sourceData: { approvalId: confirm.approvalId, confirm: confirm.leaning },
           commit: (source) => {
@@ -14081,8 +14081,12 @@ export function registerConsoleRoutes(
     // record itself (payload and hash move together, the card keeps its id)
     // and the decision is then an ordinary approve of the edited record. A
     // raw args substitution on a queued payload stays refused below.
-    let editedQueuedFields: Record<string, string> | undefined;
-    const fieldEdits = queuedCardEditsFrom(modifiedFields);
+    let fieldEdits: Record<string, string> | null;
+    try { fieldEdits = queuedCardEditsFrom(modifiedFields); }
+    catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : 'invalid edited fields' });
+      return;
+    }
     if (fieldEdits) {
       const queuedEdit = await applyQueuedCardFieldEdits({ approvalId: id, edits: fieldEdits, actor: 'desktop-command-center' });
       if (queuedEdit && !queuedEdit.ok) {
@@ -14090,7 +14094,10 @@ export function registerConsoleRoutes(
         return;
       }
       if (queuedEdit) {
-        editedQueuedFields = queuedEdit.editedFields;
+        res.json({ ok: true, approval: queuedEdit.approval,
+          status: 'resolved-pending-action-approval-only',
+          message: `Approved ${id} with your edits; execution remains with its runtime owner.` });
+        return;
       } else {
         const applied = approvalArgsWithFieldEdits(existing.args ?? null, fieldEdits);
         if (!applied.ok) {
@@ -14100,7 +14107,7 @@ export function registerConsoleRoutes(
         modifiedArgs = JSON.stringify(applied.args);
       }
     }
-    if (decision === 'approve_with_edits' && !modifiedArgs && !editedQueuedFields) {
+    if (decision === 'approve_with_edits' && !modifiedArgs) {
       res.status(400).json({ error: 'approve_with_edits requires modifiedArgs (JSON string) or modifiedFields in the body' });
       return;
     }
@@ -14122,7 +14129,7 @@ export function registerConsoleRoutes(
       res.status(409).json({ error: 'approval card has expired', approval: existing });
       return;
     }
-    const pendingActionPreflight = exactPendingActionApprovalPreflight(existing, editedQueuedFields ? 'approve' : decision);
+    const pendingActionPreflight = exactPendingActionApprovalPreflight(existing, decision);
     if (pendingActionPreflight.kind === 'error') {
       res.status(pendingActionPreflight.status).json({ error: pendingActionPreflight.reason });
       return;
@@ -14179,7 +14186,6 @@ export function registerConsoleRoutes(
     if (!shouldResume) {
       // The card's copy reads "edited" with the fields the owner retyped,
       // written before the registry settles it so no plain copy lands first.
-      if (editedQueuedFields) recordQueuedCardEditDecision({ approvalId: id, editedFields: editedQueuedFields });
       const result = approvalRegistry.resolve(
         id,
         auditResolution,
@@ -15864,6 +15870,26 @@ export function registerConsoleRoutes(
     return out;
   };
 
+  // Read-only control identity for an exact accepted source; never mint an attempt.
+  app.get('/api/sessions/:sessionId/control', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const sessionId = req.params.sessionId;
+    const sourceUserSeq = typeof req.query.sourceUserSeq === 'string' ? Number(req.query.sourceUserSeq) : NaN;
+    if (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) {
+      res.status(400).json({ error: 'sourceUserSeq must be a positive integer' }); return;
+    }
+    if (!getHarnessSession(sessionId)) { res.status(404).json({ error: 'session not found' }); return; }
+    const attempt = getActiveHarnessRunAttempt(sessionId);
+    const boundSource = attempt ? getRunAttemptSourceUserEvent(attempt) : null;
+    const activeRun = attempt && boundSource?.seq === sourceUserSeq ? {
+      sessionId, sourceUserSeq, attemptId: attempt.attemptId,
+      runScopeId: harnessAttemptRunScopeId(sessionId, attempt),
+      cancelEndpoint: harnessAttemptCancelEndpoint(sessionId, attempt),
+      backgroundEndpoint: harnessAttemptBackgroundEndpoint(sessionId, attempt),
+    } : null;
+    res.json({ activeRun });
+  });
+
   /**
    * Per-session harness event stream.
    *
@@ -16138,6 +16164,7 @@ export function registerConsoleRoutes(
         runScopeId: activeRunScopeId,
         cancelledApprovals: stopped.cancelledApprovals,
         cancelledTasks: stopped.cancelledTasks,
+        ...(stopped.workflowStop ? { workflowStop: stopped.workflowStop } : {}),
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -16908,13 +16935,15 @@ export function registerConsoleRoutes(
         ? getLatestHarnessRunAttemptByRunId(receipt.sessionId, receipt.runId)
         : null;
       let cancelledApprovals = 0;
+      let stopped: ReturnType<typeof stopExactHarnessAttempt> | undefined;
       if (attempt && !attempt.finishedAt && attempt.status === 'active') {
-        cancelledApprovals = stopExactHarnessAttempt(
+        stopped = stopExactHarnessAttempt(
           receipt!.sessionId,
           attempt,
           'cancelled from chat before acknowledgement',
           'chat-request-cancellation',
-        ).cancelledApprovals;
+        );
+        cancelledApprovals = stopped.cancelledApprovals;
       }
       res.json({
         ok: true,
@@ -16930,6 +16959,7 @@ export function registerConsoleRoutes(
             }
           : {}),
         cancelledApprovals,
+        ...(stopped?.workflowStop ? { workflowStop: stopped.workflowStop } : {}),
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

@@ -1,8 +1,8 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
-import { reduceActivity as reduceSharedActivity, reduceLifecycle, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
-import type { LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
+import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
+import type { ChatStopReceipt, DelegatedWorkControl, LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
 import { boundedModelId, modelDisplayName } from '@clem/chat-engine';
-import { applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
+import { acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
 import type { ApprovalConfirm, ApprovalPreview, ApprovalResolution, ApprovalRevision } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
@@ -13,6 +13,8 @@ import {
   runHarnessStream,
   watchForLateCompletion,
   cancelSession,
+  cancelSessionDetailed,
+  getReattachedRunControl,
   cancelPendingChatRequest,
   moveSessionToBackground,
   humanHarnessText,
@@ -167,12 +169,25 @@ export interface ChatMessage {
   /** Host-dispatched workflow is still running after the ACK settled the
    *  foreground turn. Keeps the activity strip live on this same bubble. */
   workflowLive?: boolean;
+  /** Exact admission and observed child execution, independently of the ACK. */
+  workflowWork?: DelegatedWorkControl;
+  /** Replay/terminal tombstone for this exact admitted ACK. */
+  workflowDispatchSeq?: number;
+  workflowTerminalSeq?: number;
   /** Clem's own mid-task check-in, not a turn reply. It lands while the work is
    *  still running so someone who walks away can reopen the session and read
    *  what happened. Rendered as an aside, never as the answer. */
   checkIn?: boolean;
   /** Durable ownership; never inferred from the currently streaming reply. */
   acceptedSource?: AcceptedChatSource;
+  /** Bounded client ordering for retry progress; never a delivered reply. */
+  modelRetryProgress?: {
+    sourceUserSeq: number;
+    observedSeq: number;
+    progressSeq: number;
+    retryLabel?: string;
+    closed?: boolean;
+  };
   checkInSeq?: number;
   /** A question's suggested answers, offered as one-tap replies. */
   options?: string[];
@@ -295,9 +310,11 @@ export function applyApprovalResolution(
   if (!approvalId || !resolution) return messages as ChatMessage[];
   let changed = false;
   const next = messages.map((message) => {
-    if (message.approval?.approvalId !== approvalId || message.approval.resolution === resolution) return message;
+    if (message.approval?.approvalId !== approvalId) return message;
+    const approval = approvalWithCanonicalEdits(message.approval, data);
+    if (approval === message.approval && approval.resolution === resolution) return message;
     changed = true;
-    return { ...message, approval: { ...message.approval, resolution } };
+    return { ...message, approval: { ...approval, resolution } };
   });
   return changed ? next : messages as ChatMessage[];
 }
@@ -364,6 +381,47 @@ export function attachApprovalConfirm(
   return messages
     .filter((m) => !(m.id === placeholderId && !m.text.trim() && !m.approval && !m.planArtifactRef))
     .map((m) => (m.approval?.approvalId === approvalId ? { ...m, approval: { ...m.approval, confirm } } : m));
+}
+
+/** Own-session card updates can arrive while the foreground stream is closed
+ * (an edit on this device, or a decision on the other one). Reconcile the
+ * existing card and exact reply source instead of appending another card. */
+export function reconcileIdleChatEvent(messages: readonly ChatMessage[], event: HarnessEvent, sessionId: string,
+  observeReply = true): ChatMessage[] {
+  if (event.sessionId && event.sessionId !== sessionId) return messages as ChatMessage[];
+  const d = event.data ?? {};
+  if (event.type === 'approval_resolved') return applyApprovalResolution(messages, d);
+  const confirm = event.type === 'awaiting_user_input' ? approvalConfirmFromEvent(d) : null;
+  if (confirm) return attachApprovalConfirm(messages, confirm.approvalId, confirm.confirm);
+  if (!observeReply || readLiveApprovalControl(event)) return messages as ChatMessage[];
+  if (event.type === 'user_input_received') {
+    const approvalId = typeof d.approvalId === 'string' ? d.approvalId : undefined;
+    const resumeSource = acceptedApprovalResumeSource(event, sessionId,
+      messages.find(message => message.approval?.approvalId === approvalId)?.approval?.approvalId);
+    const source = resumeSource ?? acceptedChatSource(event, sessionId);
+    if (!source || messages.some(message => message.acceptedSource?.sourceUserSeq === source.sourceUserSeq
+      && message.acceptedSource.sessionId === sessionId)) return messages as ChatMessage[];
+    const text = resumeSource ? '' : humanHarnessText(d.displayText ?? d.text, '');
+    return [...messages, ...(text ? [{ id: `observed-user-${event.seq}`, role: 'user' as const, text, acceptedSource: source }] : []),
+      { id: `observed-reply-${event.seq}`, role: 'assistant', text: '', status: 'thinking', acceptedSource: source }];
+  }
+  if (event.type === 'async_work_dispatched') return messages.map(message => applyChatWorkflowDispatch(message, event, { sessionId }));
+  if (event.type !== 'conversation_completed' && event.type !== 'run_failed') return messages as ChatMessage[];
+  const sourceUserSeq = typeof d.sourceUserSeq === 'number' ? d.sourceUserSeq : null;
+  const index = sourceUserSeq === null ? -1 : messages.findIndex(message => message.role === 'assistant'
+    && !message.approval && !message.checkIn && message.acceptedSource?.sessionId === sessionId
+    && message.acceptedSource.sourceUserSeq === sourceUserSeq);
+  if (index < 0) return messages as ChatMessage[];
+  const target = messages[index]!;
+  if (target.workflowDispatchSeq && (!Number.isSafeInteger(event.seq)
+    || event.seq <= Math.max(target.workflowDispatchSeq, target.workflowTerminalSeq ?? 0))) return messages as ChatMessage[];
+  const presentation = event.type === 'run_failed'
+    ? { text: humanHarnessText(d.error, GENERIC_TURN_ERROR), status: 'failed' as const }
+    : terminalCompletionPresentation(d, messages[index]!.text);
+  return messages.map((message, i) => i === index ? { ...withoutAnswerDraft(message), ...presentation, progress: undefined,
+    workflowLive: undefined, workflowWork: undefined,
+    ...(message.workflowDispatchSeq ? { workflowTerminalSeq: event.seq,
+      activity: settleTerminalActivity(message.activity ?? EMPTY_ACTIVITY, activityTerminalOutcomeForMessageStatus(presentation.status)) } : {}) } : message);
 }
 
 let idSeq = 0;
@@ -621,6 +679,89 @@ function sharedEvent(ev: HarnessEvent): SharedHarnessEvent {
   return { ...ev, createdAt: typeof ev.createdAt === 'number' ? ev.createdAt : undefined };
 }
 
+/** Retry progress has stricter ownership/order than legacy transcript events.
+ * Keep its cursor on the message so repeated React updates are deterministic. */
+export function applyChatModelProgress(
+  message: ChatMessage, ev: HarnessEvent,
+  owner: { sessionId: string | null; activeAssistantId: string | null; busy: boolean; now: number },
+): ChatMessage {
+  const d = ev.data ?? {};
+  if (message.workflowDispatchSeq && ev.type === 'stream_token') return message;
+  // Preserve the established answer-draft behavior, including older frames.
+  const next = ev.type === 'stream_token' ? applyStreamToken(message, d) : message;
+  const source = message.acceptedSource;
+  if (!owner.busy || owner.activeAssistantId !== message.id || message.role !== 'assistant'
+    || message.status !== 'thinking' || message.checkIn || message.approval || message.delegated
+    || !source || !Number.isSafeInteger(source.sourceUserSeq) || source.sourceUserSeq <= 0
+    || source.sessionId !== owner.sessionId || (ev.sessionId && ev.sessionId !== source.sessionId)
+    || (d.sourceUserSeq !== undefined && d.sourceUserSeq !== source.sourceUserSeq)) return next;
+
+  const prior = message.modelRetryProgress?.sourceUserSeq === source.sourceUserSeq
+    ? message.modelRetryProgress
+    : { sourceUserSeq: source.sourceUserSeq, observedSeq: source.sourceUserSeq, progressSeq: source.sourceUserSeq };
+  if (prior.closed) return next;
+  const retry = ev.type === 'model_resilience_observed' ? readModelRetryProgress(sharedEvent(ev)) : null;
+  if (ev.type === 'model_resilience_observed' && (!retry || retry.sourceUserSeq !== source.sourceUserSeq
+    || ev.seq <= prior.progressSeq)) return next;
+
+  const durableSeq = Number.isSafeInteger(ev.seq) && ev.seq > source.sourceUserSeq ? ev.seq : 0;
+  const observedSeq = Math.max(prior.observedSeq, durableSeq);
+  let progressSeq = prior.progressSeq;
+  let retryLabel = prior.retryLabel;
+  let activity = next.activity;
+  let progress = next.progress;
+  const usefulText = ev.type === 'stream_token' && next !== message && d.reset !== true
+    && typeof d.delta === 'string' && !!d.delta.trim() && d.sourceUserSeq === source.sourceUserSeq;
+  const newerWork = isModelRetryProgressBoundary(sharedEvent(ev)) && durableSeq > progressSeq;
+  if (usefulText || newerWork) {
+    progressSeq = Math.max(progressSeq, durableSeq, usefulText ? observedSeq : 0);
+    const cleared = activity ? clearModelRetryProgress(activity, () => owner.now) : activity;
+    if (retryLabel && progress === retryLabel) progress = undefined;
+    retryLabel = undefined;
+    activity = cleared;
+  }
+  if (retry) {
+    progressSeq = ev.seq;
+    const before = activity ?? EMPTY_ACTIVITY;
+    activity = reduceSharedActivity(before, sharedEvent(ev), () => owner.now);
+    if (activity !== before) {
+      retryLabel = retry.label;
+      progress = retry.label;
+    }
+  }
+  const closed = ev.type === 'conversation_completed' || ev.type === 'run_failed'
+    || ev.type === 'conversation_limit_exceeded' || ev.type === 'awaiting_user_input'
+    || ev.type === 'approval_requested' || ev.type === 'async_work_dispatched' || undefined;
+  const same = message.modelRetryProgress === prior && observedSeq === prior.observedSeq
+    && progressSeq === prior.progressSeq && retryLabel === prior.retryLabel && closed === prior.closed;
+  if (same && activity === next.activity && progress === next.progress) return next;
+  return {
+    ...next,
+    modelRetryProgress: same ? prior : { sourceUserSeq: source.sourceUserSeq, observedSeq, progressSeq, retryLabel, closed },
+    ...(activity !== next.activity ? { activity } : {}),
+    ...(progress !== next.progress ? { progress } : {}),
+  };
+}
+
+/** The active reply's ordinary activity and retry progress share one update. */
+export function applyChatProgressEvent(
+  message: ChatMessage, ev: HarnessEvent, owner: Parameters<typeof applyChatModelProgress>[2],
+): ChatMessage {
+  if (message.workflowWork && ['heartbeat', 'turn_started', 'turn_model_routed', 'step_started'].includes(ev.type)) return message;
+  const next = applyChatModelProgress(message, ev, owner);
+  if (ev.type === 'model_resilience_observed' || ev.type === 'stream_token') return next;
+  const label = progressLabel(ev);
+  const cur = next.activity ?? EMPTY_ACTIVITY;
+  const activity = reduceActivity(cur, ev);
+  const changed = activity !== cur;
+  const keepProgress = (label === 'Finding the right tool…' && activity.some(isWorkPlanRow))
+    || (ev.type === 'heartbeat' && ev.data?.kind !== 'watcher_steer'
+      && owner.busy && owner.activeAssistantId === next.id && next.status === 'thinking'
+      && !next.modelRetryProgress?.closed && !!next.modelRetryProgress?.retryLabel);
+  if (!changed && (!label || keepProgress)) return next;
+  return { ...next, ...(changed ? { activity } : {}), ...(label && !keepProgress ? { progress: label } : {}) };
+}
+
 export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
   if (readLiveApprovalControl(ev)) return prev;
   // Event types this surface delegates wholesale to the shared fold rather than
@@ -633,6 +774,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     || ev.type === 'delegated_task_state'
     || ev.type === 'worker_model_offer' || ev.type === 'worker_model_offer_resolved'
     || ev.type === 'workflow_saved'
+    || ev.type === 'async_work_dispatched'
     // The saved-file row carries the file's name for the card that opens it.
     // This surface's own copy of the fold never set it, so the card never
     // drew on the desktop (found live 2026-09-29).
@@ -671,29 +813,6 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       };
       const index = prev.findIndex((item) => item.id === row.id);
       return index >= 0 ? prev.map((item, i) => (i === index ? { ...item, ...row } : item)) : [...prev, row];
-    }
-    case 'async_work_dispatched': {
-      const runIds = Array.isArray(d.runIds)
-        ? d.runIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
-        : [];
-      if (runIds.length === 0) return prev;
-      const key = typeof d.dispatchKey === 'string' && d.dispatchKey.trim()
-        ? d.dispatchKey.trim()
-        : runIds.join(',');
-      const label = runIds.length > 1
-        ? `Started ${runIds.length} workflows in the background`
-        : 'Started the workflow in the background';
-      const row: ActivityItem = {
-        id: `dispatch-${key}`,
-        kind: 'event',
-        variant: 'lifecycle',
-        tone: 'live',
-        label,
-        detail: 'I’ll post the result here when it’s ready.',
-        status: 'running',
-      };
-      const index = prev.findIndex((item) => item.id === row.id);
-      return index >= 0 ? prev.map((item, i) => (i === index ? row : item)) : [...prev, row];
     }
     case 'expected_work_progress': {
       // Host plan: show the work that is happening. A later write waiting on
@@ -987,8 +1106,53 @@ export function workflowStepLabelFromSession(sessionId?: string): string | null 
   return label || null;
 }
 
-/** Fold a host-dispatched workflow's bridged activity onto the ACK bubble
- *  that started it. Returns the same array when nothing changed. */
+/** The settled ACK stays visibly waiting until its captured child starts. */
+export function applyChatWorkflowDispatch(message: ChatMessage, ev: HarnessEvent, owner: {
+  sessionId: string | null; activeAssistantId?: string | null; busy?: boolean;
+}): ChatMessage {
+  const work = readWorkflowQueueDispatch(sharedEvent(ev));
+  const source = message.acceptedSource;
+  if (!work || !source || source.sessionId !== owner.sessionId
+    || (ev.sessionId && ev.sessionId !== source.sessionId) || work.sourceUserSeq !== source.sourceUserSeq
+    || message.role !== 'assistant' || message.checkIn || message.approval || message.delegated
+    || message.workflowWork || message.workflowDispatchSeq || message.status !== 'thinking'
+    || (owner.activeAssistantId !== undefined && (owner.activeAssistantId !== message.id || !owner.busy))) return message;
+  const next = withoutAnswerDraft(message);
+  return { ...next, text: workflowDispatchText(work), status: 'complete', workflowLive: true, workflowWork: work,
+    workflowDispatchSeq: ev.seq, progress: workflowDispatchLabel(work), activity: reduceActivity(next.activity ?? EMPTY_ACTIVITY, ev) };
+}
+
+/** Dispatch receipts/replays cannot end an exact workflow report watch. */
+export function workflowReportEndsWatch(ev: HarnessEvent, source: AcceptedChatSource): boolean {
+  return (ev.type === 'conversation_completed' || ev.type === 'run_failed')
+    && (!ev.sessionId || ev.sessionId === source.sessionId) && ev.data?.sourceUserSeq === source.sourceUserSeq
+    && Number.isSafeInteger(ev.seq) && ev.seq > source.sourceUserSeq;
+}
+
+/** A parent Stop acknowledgement never settles linked child work. */
+export function applyChatStopReceipt(message: ChatMessage, receipt: ChatStopReceipt, owner: {
+  assistantId: string; sessionId: string; sourceUserSeq?: number;
+}): ChatMessage {
+  if (message.id !== owner.assistantId || (message.acceptedSource && (message.acceptedSource.sessionId !== owner.sessionId
+    || (owner.sourceUserSeq !== undefined && message.acceptedSource.sourceUserSeq !== owner.sourceUserSeq)))) return message;
+  const notice = workflowStopNotice(receipt, message.workflowWork?.runIds);
+  if (message.workflowDispatchSeq) {
+    const text = notice && !message.text.includes(notice) ? `${message.text}\n\n${notice}` : message.text;
+    // Preserve a canonical result that won the race; otherwise keep waiting
+    // for its typed terminal instead of treating this receipt as completion.
+    return { ...message, text, ...(message.workflowWork ? {
+      progress: notice ?? 'Stop was requested — waiting for the workflow’s final status.', workflowLive: true,
+    } : {}) };
+  }
+  if (notice) return { ...message, status: 'stopped', progress: undefined,
+    text: message.text.includes(notice) ? message.text : `${message.text.trim() ? `${message.text}\n\n` : ''}${notice}` };
+  return receipt.confirmed
+    ? { ...message, status: 'stopped', progress: undefined, text: message.text.trim() ? message.text : 'Stopped.' }
+    : { ...message, status: 'failed', progress: undefined,
+      text: 'Stop closed this view, but the server did not confirm that the exact run attempt was cancelled. Open Run Environment to check it before retrying.' };
+}
+
+/** Only activity from a captured child promotes its own waiting ACK. */
 export function applyBridgedWorkflowActivity(
   messages: ChatMessage[],
   ev: HarnessEvent,
@@ -996,14 +1160,16 @@ export function applyBridgedWorkflowActivity(
   let dispatchIdx = -1;
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const m = messages[i];
-    if (m.role === 'assistant'
-      && (m.activity ?? []).some((row) => row.id.startsWith('dispatch-') && row.status === 'running')) {
+    if (m.role === 'assistant' && m.workflowLive && m.workflowWork
+      && m.acceptedSource?.sourceUserSeq === m.workflowWork.sourceUserSeq
+      && advanceWorkflowChildActivity(m.workflowWork, sharedEvent(ev))) {
       dispatchIdx = i;
       break;
     }
   }
   if (dispatchIdx < 0) return messages;
   const cur = messages[dispatchIdx];
+  const work = advanceWorkflowChildActivity(cur.workflowWork!, sharedEvent(ev))!;
   let before = cur.activity ?? EMPTY_ACTIVITY;
   const stepLabel = workflowStepLabelFromSession(ev.sessionId);
   if (stepLabel && !before.some((row) => row.id.startsWith('wf-step-'))) {
@@ -1016,13 +1182,15 @@ export function applyBridgedWorkflowActivity(
       status: 'running',
     }];
   }
-  const activity = reduceActivity(before, ev);
+  const activity = updateWorkflowDispatchActivity(reduceActivity(before, ev), work);
   const label = progressLabel(ev)
     ?? (stepLabel ? `Working on ${stepLabel}…` : null);
   if (activity === before && !label && cur.workflowLive) return messages;
   const next = messages.slice();
   next[dispatchIdx] = {
     ...cur,
+    text: workflowDispatchText(work),
+    workflowWork: work,
     workflowLive: true,
     ...(activity !== (cur.activity ?? EMPTY_ACTIVITY) ? { activity } : {}),
     ...(label ? { progress: label } : {}),
@@ -1068,10 +1236,8 @@ export function progressLabel(ev: HarnessEvent): string | null {
       return null;
     }
     case 'async_work_dispatched': {
-      const runIds = Array.isArray(d.runIds) ? d.runIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0) : [];
-      return runIds.length > 1
-        ? `Started ${runIds.length} workflows — I’ll post the result here.`
-        : 'Started the workflow — I’ll post the result here.';
+      const work = readWorkflowQueueDispatch(sharedEvent(ev));
+      return work ? workflowDispatchLabel(work) : null;
     }
     case 'expected_work_progress': {
       const rawLines = Array.isArray(d.lines) ? d.lines : [];
@@ -1263,32 +1429,67 @@ export function activeTurnTaskMode(
 export async function readReattachTurn(sessionId: string, input: {
   fetchPage(url: string): Promise<RecentEventsPage>;
   active(): boolean;
-}): Promise<{ sourceUserSeq: number; taskMode?: TaskMode; acceptedSource?: AcceptedChatSource } | null> {
+  fetchControl?(sessionId: string, sourceUserSeq: number): Promise<ChatPostResult | null>;
+}): Promise<{ sourceUserSeq: number; taskMode?: TaskMode; acceptedSource?: AcceptedChatSource; runControl?: ChatPostResult;
+  workflowDispatch?: HarnessEvent; workflowWork?: DelegatedWorkControl } | null> {
   const cursor: { scanSeq: number; snapshotSeq?: number } = { scanSeq: 0 };
   // Retain only the newest source and its terminal, never the whole tool
   // trajectory. A page boundary is not evidence that a turn is still live.
   let boundary: HarnessEvent[] = [];
+  let workflowDispatch: HarnessEvent | undefined;
+  let workflowWork: DelegatedWorkControl | undefined;
+  let workflowSourceClosed = false;
+  const knownApprovalIds = new Set<string>();
   while (input.active()) {
     const page = await input.fetchPage(recentEventsUrl(sessionId, cursor, 200));
     if (!input.active()) return null;
     const continuation = advanceRunEventPage(cursor, page, 200);
     for (const event of [...(page.events ?? [])].sort((a, b) => a.seq - b.seq)) {
+      if (workflowWork && event.sessionId?.startsWith('workflow:')) {
+        workflowWork = advanceWorkflowChildActivity(workflowWork, sharedEvent(event)) ?? workflowWork;
+        continue;
+      }
       if ((event.sessionId && event.sessionId !== sessionId) || readLiveApprovalControl(event)) continue;
-      if (event.type === 'user_input_received' && event.data?.synthetic !== true) {
+      const approvalId = typeof event.data?.approvalId === 'string' ? event.data.approvalId : undefined;
+      if (event.type === 'approval_requested' && approvalId) knownApprovalIds.add(approvalId);
+      const resumeSource = acceptedApprovalResumeSource(event, sessionId,
+        approvalId && knownApprovalIds.has(approvalId) ? approvalId : undefined);
+      if (event.type === 'user_input_received' && (event.data?.synthetic !== true || resumeSource)) {
         boundary = [event];
+        workflowDispatch = undefined;
+        workflowWork = undefined;
+        workflowSourceClosed = false;
       } else if (boundary.length && isTerminalEvent(event.type)) {
         const source = event.data?.sourceUserSeq;
         if (typeof source === 'number' && source !== boundary[0].seq) continue;
+        if (event.type === 'async_work_dispatched') {
+          const work = readWorkflowQueueDispatch(sharedEvent(event));
+          if (!work || work.sourceUserSeq !== boundary[0]!.seq || workflowDispatch || workflowSourceClosed) continue;
+          workflowDispatch = event;
+          workflowWork = work;
+        } else {
+          workflowDispatch = undefined;
+          workflowWork = undefined;
+          workflowSourceClosed = true;
+        }
         boundary = [boundary[0], event];
       }
     }
     // Finish the fixed snapshot even if newer events arrived during the scan.
     // An active turn's stream resumes from its source and catches those events.
     if (page.page ? !page.page.hasMore : continuation.complete) {
-      const sourceUserSeq = inFlightTurnSince(boundary);
-      const source = boundary[0] ? acceptedChatSource(boundary[0], sessionId) : null;
-      return sourceUserSeq === null ? null : { sourceUserSeq, taskMode: activeTurnTaskMode(boundary, sourceUserSeq),
-        ...(source ? { acceptedSource: source } : {}) };
+      const sourceUserSeq = (boundary.length === 1 || workflowWork) && Number.isSafeInteger(boundary[0]?.seq) && boundary[0]!.seq > 0 ? boundary[0]!.seq : null;
+      const sourceEvent = boundary[0];
+      const approvalId = typeof sourceEvent?.data?.approvalId === 'string' ? sourceEvent.data.approvalId : undefined;
+      const source = sourceEvent ? acceptedChatSource(sourceEvent, sessionId)
+        ?? acceptedApprovalResumeSource(sourceEvent, sessionId, approvalId && knownApprovalIds.has(approvalId) ? approvalId : undefined) : null;
+      if (sourceUserSeq === null) return null;
+      let runControl: ChatPostResult | null = null;
+      try { runControl = await input.fetchControl?.(sessionId, sourceUserSeq) ?? null; } catch { /* read-only observation remains available */ }
+      if (!input.active()) return null;
+      return { sourceUserSeq, taskMode: activeTurnTaskMode(boundary, sourceUserSeq),
+        ...(source ? { acceptedSource: source } : {}), ...(runControl ? { runControl } : {}),
+        ...(source && workflowDispatch && workflowWork ? { workflowDispatch, workflowWork } : {}) };
     }
     if (!continuation.more) throw new Error('The conversation history could not be fully checked.');
   }
@@ -1297,7 +1498,12 @@ export async function readReattachTurn(sessionId: string, input: {
 
 export function useChat(options?: UseChatOptions) {
   const [messages, setMessages] = useState<ChatMessage[]>(options?.initialMessages ?? []);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusyState] = useState(false);
+  const busyRef = useRef(false);
+  const setBusy = useCallback((value: boolean) => {
+    busyRef.current = value;
+    setBusyState(value);
+  }, []);
   const [composerMode, setComposerMode] = useState<ComposerMode>('normal');
   const sessionIdRef = useRef<string | null>(options?.initialSessionId ?? null);
   const streamRef = useRef<StreamHandle | null>(null);
@@ -1318,8 +1524,10 @@ export function useChat(options?: UseChatOptions) {
   const pendingBackgroundRef = useRef<{ assistantId: string } | null>(null);
   const backgroundInFlightRef = useRef(false);
   const pendingActionHydrationsRef = useRef(new Set<string>());
+  const approvalWatchesRef = useRef(new Map<string, { cancel(): void }>());
   /** Host dispatch ends the foreground stream; keep watching for the later origin terminal. */
-  const awaitingWorkflowReportRef = useRef(false);
+  const awaitingWorkflowReportRef = useRef<{ assistantId: string; source: AcceptedChatSource } | null>(null);
+  const acceptedStreamSourceRef = useRef<{ assistantId: string; source: AcceptedChatSource } | null>(null);
 
   // Rises each time a task this conversation delegated changed state. The
   // event is a nudge: whoever shows the task re-reads its record.
@@ -1396,6 +1604,7 @@ export function useChat(options?: UseChatOptions) {
         const additions = await pollInboxOutcomeEvents(cursor, {
           active: () => !stopped && inboxOutcomeCursorRef.current === cursor,
           fetchPage: (url) => apiGet<RecentEventsPage>(url),
+          onEvents: (events) => setMessages(previous => events.reduce((current, event) => reconcileIdleChatEvent(current, event, sid), previous)),
         });
         if (additions.length) {
           setMessages((prev) => {
@@ -1432,6 +1641,8 @@ export function useChat(options?: UseChatOptions) {
       streamRef.current = null;
       lateWatchRef.current?.cancel();
       lateWatchRef.current = null;
+      for (const watch of approvalWatchesRef.current.values()) watch.cancel();
+      approvalWatchesRef.current.clear();
     };
     // Mount/unmount lifecycle only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1456,13 +1667,38 @@ export function useChat(options?: UseChatOptions) {
         const active = await readReattachTurn(sid, {
           fetchPage: (url) => apiGet<RecentEventsPage>(url),
           active: stillOpening,
+          fetchControl: getReattachedRunControl,
         });
         if (!active || !stillOpening()) return;
         const lastUserSeq = active.sourceUserSeq;
         const assistantId = `reattach-${Date.now().toString(36)}`;
         reattachedAssistantId = assistantId;
+        if (active.acceptedSource) acceptedStreamSourceRef.current = { assistantId, source: active.acceptedSource };
+        if (active.workflowDispatch && active.workflowWork && active.acceptedSource) {
+          const dispatch = active.workflowDispatch;
+          const work = active.workflowWork;
+          setMessages(previous => {
+            // The scan proved the newest source still owns this deterministic
+            // receipt. Reuse that exact receipt if history already drew it.
+            const last = previous.at(-1);
+            const replace = last?.role === 'assistant' && !last.approval && !last.checkIn
+              && !last.acceptedSource && last.text === String(dispatch.data?.text ?? '');
+            const base: ChatMessage = { id: assistantId, role: 'assistant', text: '', status: 'thinking',
+              acceptedSource: active.acceptedSource, taskMode: active.taskMode };
+            const queued = applyChatWorkflowDispatch(base, dispatch, { sessionId: sid });
+            const restored = { ...queued, text: workflowDispatchText(work), workflowWork: work,
+              progress: workflowDispatchLabel(work), activity: updateWorkflowDispatchActivity(queued.activity ?? EMPTY_ACTIVITY, work) };
+            return [...(replace ? previous.slice(0, -1) : previous), restored];
+          });
+          awaitingWorkflowReportRef.current = { assistantId, source: active.acceptedSource };
+          const source = active.acceptedSource;
+          lateWatchRef.current = watchForLateCompletion(sid, Math.max(dispatch.seq, work.progressSeq ?? 0), ev => applyEvent(assistantId, ev),
+            { intervalMs: 8_000, maxAttempts: 180, shouldStopOnTerminal: ev => workflowReportEndsWatch(ev, source) });
+          return;
+        }
         setBusy(true);
         activeAssistantId.current = assistantId;
+        activeRunRef.current = active.runControl ?? null;
         setMessages((prev) => [...prev, {
           id: assistantId,
           role: 'assistant' as const,
@@ -1526,8 +1762,7 @@ export function useChat(options?: UseChatOptions) {
         : undefined;
       setMessages((prev) => {
         if (ev.sessionId?.startsWith('workflow:')) {
-          const onBubble = applyBridgedWorkflowActivity(prev, ev);
-          if (onBubble !== prev) return onBubble;
+          return applyBridgedWorkflowActivity(prev, ev);
         }
         const idx = prev.findIndex((m) => m.id === DELEGATED_STRIP_ID);
         if (idx === -1) {
@@ -1575,13 +1810,20 @@ export function useChat(options?: UseChatOptions) {
         };
         return next;
       });
-    }, noteDelegatedTask);
+    }, noteDelegatedTask, (event, observeReply) => {
+      setMessages(previous => reconcileIdleChatEvent(previous, event, sid, observeReply));
+    });
   }, [busy, noteDelegatedTask]);
 
   const applyEvent = useCallback((assistantId: string, ev: HarnessEvent, sourceBoundary?: { sessionId: string; afterSeq: number }) => {
     if (ev.type === 'delegated_task_state') noteDelegatedTask();
     const d = (ev.data ?? {}) as Record<string, unknown>;
     if (ev.type === 'user_input_received' && sourceBoundary) {
+      const source = acceptedChatSource(ev, sourceBoundary.sessionId);
+      if (source && source.sourceUserSeq > sourceBoundary.afterSeq && sessionIdRef.current === source.sessionId
+        && activeAssistantId.current === assistantId && acceptedStreamSourceRef.current?.assistantId !== assistantId) {
+        acceptedStreamSourceRef.current = { assistantId, source };
+      }
       setMessages(previous => bindAcceptedChatSource(previous, ev, assistantId, sourceBoundary));
     }
     if (readLiveApprovalControl(ev)) {
@@ -1594,56 +1836,81 @@ export function useChat(options?: UseChatOptions) {
       });
       return;
     }
-    if (ev.type === 'approval_resolved') {
-      setMessages((prev) => applyApprovalResolution(prev, ev.data as Record<string, unknown>));
+    const owner = { sessionId: sessionIdRef.current, activeAssistantId: activeAssistantId.current,
+      busy: busyRef.current, now: Date.now() };
+    if (ev.sessionId?.startsWith('workflow:')) {
+      setMessages(previous => applyBridgedWorkflowActivity(previous, ev));
+      return;
     }
-    if (ev.type === 'stream_token') {
-      // The live answer draft: provisional text the terminal reply replaces.
-      setMessages((prev) => prev.map((m) => (m.id === assistantId ? applyStreamToken(m, d) : m)));
+    const updateMessages = (update: (messages: ChatMessage[]) => ChatMessage[]) => setMessages(previous => {
+      let changed = false;
+      const progressed = previous.map(message => {
+        if (message.id !== assistantId) return message;
+        const next = applyChatModelProgress(message, ev, owner);
+        changed ||= next !== message;
+        return next;
+      });
+      return update(changed ? progressed : previous);
+    });
+    const patchAssistant = (fields: Partial<ChatMessage>) => updateMessages(previous =>
+      previous.map(message => message.id === assistantId ? { ...message, ...fields } : message));
+    if (ev.type === 'approval_resolved') {
+      updateMessages((prev) => applyApprovalResolution(prev, ev.data as Record<string, unknown>));
+    }
+    if (ev.type === 'stream_token' || ev.type === 'model_resilience_observed') {
+      // New retry rows require the accepted active source; legacy draft text
+      // still follows its established answer-stream contract.
+      setMessages(previous => previous.map(message => message.id === assistantId
+        ? applyChatProgressEvent(message, ev, owner) : message));
     } else if (ev.type === 'async_work_dispatched') {
-      awaitingWorkflowReportRef.current = true;
-      const ack = typeof d.text === 'string' && d.text.trim()
-        ? d.text.trim()
-        : 'Started — I’ll post the result here when it’s ready.';
-      setMessages((prev) => prev.map((current) => {
-        if (current.id !== assistantId) return current;
-        const m = withoutAnswerDraft(current);
-        const activity = reduceActivity(m.activity ?? EMPTY_ACTIVITY, ev);
-        return {
-          ...m,
-          text: m.text.trim() ? m.text : ack,
-          status: 'complete' as const,
-          progress: undefined,
-          ...(activity !== (m.activity ?? EMPTY_ACTIVITY) ? { activity } : {}),
-        };
-      }));
+      const work = readWorkflowQueueDispatch(sharedEvent(ev));
+      const accepted = acceptedStreamSourceRef.current;
+      if (work && (!ev.sessionId || ev.sessionId === owner.sessionId)
+        && owner.activeAssistantId === assistantId && owner.busy && accepted?.assistantId === assistantId
+        && accepted.source.sessionId === owner.sessionId && accepted.source.sourceUserSeq === work.sourceUserSeq) {
+        awaitingWorkflowReportRef.current = accepted;
+      }
+      updateMessages(prev => prev.map(current => current.id === assistantId ? applyChatWorkflowDispatch(current, ev, owner) : current));
     } else if (ev.type === 'plan_revision_published') {
       const ref = readPlanRevisionRef(d.planArtifactRef ?? d.artifact);
-      if (ref) patch(assistantId, { planArtifactRef: ref });
+      if (ref) patchAssistant({ planArtifactRef: ref });
     } else if (ev.type === 'conversation_completed') {
-      awaitingWorkflowReportRef.current = false;
+      // A late workflow report belongs to its captured source, including
+      // when a newer foreground turn owns this callback.
+      const exactWorkflowSource = typeof d.sourceUserSeq === 'number' ? d.sourceUserSeq : null;
+      if (awaitingWorkflowReportRef.current?.source.sessionId === owner.sessionId
+        && awaitingWorkflowReportRef.current.source.sourceUserSeq === exactWorkflowSource) awaitingWorkflowReportRef.current = null;
       const text = humanHarnessText((d.reply ?? d.summary), '');
       const reason = typeof d.reason === 'string' ? d.reason : '';
       const planProposalId = typeof d.planProposalId === 'string' ? d.planProposalId : '';
       if (reason === 'plan_first' && planProposalId) {
-        patch(assistantId, { text: text || 'I drafted a plan — approve it to go ahead.', status: 'awaiting-plan', planProposalId, progress: undefined, answerDraft: undefined });
+        patchAssistant({ text: text || 'I drafted a plan — approve it to go ahead.', status: 'awaiting-plan', planProposalId, progress: undefined, answerDraft: undefined });
       } else {
         // Keep already-streamed human output when the terminal envelope omits
         // its duplicate reply. With neither source present, fail closed: an
         // empty/reasoning-only terminal event is not a successful answer. A
         // live answer draft is never that output: the terminal replaces it.
-        setMessages((prev) => prev.map((current) => {
+        updateMessages((prev) => {
+          if (prev.some(message => message.workflowDispatchSeq && message.acceptedSource?.sessionId === owner.sessionId
+            && message.acceptedSource.sourceUserSeq === exactWorkflowSource)) {
+            return reconcileIdleChatEvent(prev, ev, owner.sessionId ?? '', true);
+          }
+          return prev.map((current) => {
           if (current.id !== assistantId) return current;
           const m = withoutAnswerDraft(current);
+          if (m.workflowWork && (exactWorkflowSource !== m.workflowWork.sourceUserSeq
+            || (ev.sessionId && ev.sessionId !== m.acceptedSource?.sessionId))) return current;
           const activity = reduceActivity(m.activity ?? EMPTY_ACTIVITY, ev);
           return {
             ...m,
             ...terminalCompletionPresentation(d, m.text, m.status),
             ...(readPlanRevisionRef(d.planArtifactRef ?? d.artifact) ? { planArtifactRef: readPlanRevisionRef(d.planArtifactRef ?? d.artifact) } : {}),
             workflowLive: undefined,
+            workflowWork: undefined,
             ...(activity !== (m.activity ?? EMPTY_ACTIVITY) ? { activity } : {}),
           };
-        }));
+          });
+        });
       }
     } else if (ev.type === 'stall_retry_attempted') {
       // The streamed draft was a DETECTED-BAD reply (e.g. the model claiming it
@@ -1653,55 +1920,48 @@ export function useChat(options?: UseChatOptions) {
       // while the retry was already succeeding underneath).
       // A transport retry (the model backend never answered) is named as such;
       // the malformed-reply wording stays for the structured-decision repair.
-      patch(assistantId, { text: '', answerDraft: undefined, progress: d.kind === 'model_transport_retry'
+      patchAssistant({ text: '', answerDraft: undefined, progress: d.kind === 'model_transport_retry'
         ? 'The model backend didn’t respond — retrying…'
         : 'First attempt came back malformed — retrying now…' });
     } else if (ev.type === 'run_failed') {
       const errStr = String(d.error ?? '').trim();
       const text = !errStr || looksRawError(errStr) ? GENERIC_TURN_ERROR : `Something went wrong: ${errStr}`;
-      patch(assistantId, { text, status: 'failed', progress: undefined, answerDraft: undefined });
+      if (awaitingWorkflowReportRef.current?.source.sessionId === owner.sessionId
+        && awaitingWorkflowReportRef.current.source.sourceUserSeq === d.sourceUserSeq) awaitingWorkflowReportRef.current = null;
+      updateMessages(previous => previous.some(message => message.workflowDispatchSeq
+        && message.acceptedSource?.sessionId === owner.sessionId && message.acceptedSource.sourceUserSeq === d.sourceUserSeq)
+        ? reconcileIdleChatEvent(previous, ev, owner.sessionId ?? '', true)
+        : previous.map(message => message.id === assistantId && !message.workflowDispatchSeq
+          ? { ...message, text, status: 'failed', progress: undefined, answerDraft: undefined } : message));
     } else if (ev.type === 'conversation_limit_exceeded') {
-      patch(assistantId, { status: 'stopped', progress: undefined });
+      patchAssistant({ status: 'stopped', progress: undefined });
     } else if (ev.type === 'awaiting_user_input') {
       const confirm = approvalConfirmFromEvent(d);
       if (confirm) {
         // The card's own question, asked back: it is drawn ON the waiting
         // card (the owner's words, Clem's line, the same two answers), and
         // the turn that would have carried it as a new bubble draws nothing.
-        setMessages((prev) => attachApprovalConfirm(prev, confirm.approvalId, confirm.confirm, assistantId));
+        updateMessages((prev) => attachApprovalConfirm(prev, confirm.approvalId, confirm.confirm, assistantId));
       } else {
         const options = readQuestionOptions(d.options);
-        patch(assistantId, { text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined, answerDraft: undefined, ...(options.length ? { options } : {}) });
+        patchAssistant({ text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined, answerDraft: undefined, ...(options.length ? { options } : {}) });
       }
     } else if (ev.type === 'approval_requested') {
-      setMessages((prev) => appendLiveApprovalCard(prev, ev));
+      updateMessages((prev) => appendLiveApprovalCard(prev, ev));
     } else if (ev.type === 'conversation_check_in') {
-      setMessages((prev) => appendCheckIn(prev, ev));
+      updateMessages((prev) => appendCheckIn(prev, ev));
     } else if (ev.type === 'conversation_preamble') {
       const text = typeof d.text === 'string' ? d.text.trim() : '';
       if (text) {
-        setMessages((prev) => prev.map((m) => (
+        updateMessages((prev) => prev.map((m) => (
           m.id === assistantId && !m.text.trim() ? { ...m, text } : m
         )));
       }
     } else {
-      const label = progressLabel(ev);
-      setMessages((prev) => prev.map((m) => {
-        if (m.id !== assistantId) return m;
-        const cur = m.activity ?? EMPTY_ACTIVITY;
-        const activity = reduceActivity(cur, ev);
-        const changed = activity !== cur;
-        const keepProgress = label === 'Finding the right tool…'
-          && activity.some((row) => isWorkPlanRow(row));
-        if (!changed && (!label || keepProgress)) return m;
-        return {
-          ...m,
-          ...(changed ? { activity } : {}),
-          ...(label && !keepProgress ? { progress: label } : {}),
-        };
-      }));
+      setMessages(previous => previous.map(message => message.id === assistantId
+        ? applyChatProgressEvent(message, ev, owner) : message));
     }
-  }, [patch, noteDelegatedTask]);
+  }, [noteDelegatedTask]);
 
   const handoffAcceptedRun = useCallback(async (
     accepted: ChatPostResult,
@@ -1784,7 +2044,8 @@ export function useChat(options?: UseChatOptions) {
     // from a previous stopped turn would misattribute this turn's events.
     lateWatchRef.current?.cancel();
     lateWatchRef.current = null;
-    awaitingWorkflowReportRef.current = false;
+    awaitingWorkflowReportRef.current = null;
+    acceptedStreamSourceRef.current = null;
     // Do not carry a reusable session's prior attempt into this turn. If Stop
     // wins before the new 202 arrives, onLateAccepted will cancel the exact
     // attempt from that acknowledgement instead of guessing by session id.
@@ -1851,6 +2112,8 @@ export function useChat(options?: UseChatOptions) {
       streamRef.current = handle;
       const result = await handle.promise;
       streamRef.current = null;
+      // Stream callbacks can update this ref while the promise is pending.
+      const waitingWorkflowReport = awaitingWorkflowReportRef.current as { assistantId: string; source: AcceptedChatSource } | null;
       if (!result.ok) {
         setMessages((prev) => prev.map((m) => {
           if (m.id !== assistantId) return m;
@@ -1863,12 +2126,14 @@ export function useChat(options?: UseChatOptions) {
         // result over the "stopped" note instead of stranding a completed run.
         // (Any prior watch was cancelled at the top of this send.)
         lateWatchRef.current = watchForLateCompletion(body.sessionId, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev, sourceBoundary), { replayCursor: handle.getReplayCursor() });
-      } else if (awaitingWorkflowReportRef.current) {
+      } else if (waitingWorkflowReport?.assistantId === assistantId
+        && waitingWorkflowReport.source.sessionId === body.sessionId) {
+        const source = waitingWorkflowReport.source;
         lateWatchRef.current = watchForLateCompletion(
           body.sessionId,
           handle.getLastSeq(),
           (ev) => applyEvent(assistantId, ev, sourceBoundary),
-          { intervalMs: 8_000, maxAttempts: 180 },
+          { intervalMs: 8_000, maxAttempts: 180, shouldStopOnTerminal: ev => workflowReportEndsWatch(ev, source) },
         );
       }
     } catch (err) {
@@ -1904,26 +2169,22 @@ export function useChat(options?: UseChatOptions) {
   const stop = useCallback(() => {
     const aid = activeAssistantId.current;
     const accepted = activeRunRef.current;
+    const source = acceptedStreamSourceRef.current?.assistantId === aid ? acceptedStreamSourceRef.current.source : undefined;
     const pending = pendingPostRef.current;
     pendingBackgroundRef.current = null;
     postAbortRef.current?.abort();
     streamRef.current?.stop();
     streamRef.current = null;
-    // Stopping before any text streamed in otherwise leaves an empty bubble.
+    // Closing the stream is not confirmation that the server stopped work.
     if (aid) setMessages((prev) => prev.map((m) => (m.id === aid
-      ? { ...m, status: 'stopped', progress: undefined, text: m.text.trim() ? m.text : 'Stopped.' }
+      ? { ...m, status: 'thinking', progress: 'Stopping…' }
       : m)));
     if (accepted) {
-      void cancelSession(accepted).then((confirmed) => {
-        if (confirmed || !aid) return;
-        setMessages((prev) => prev.map((m) => (m.id === aid
-          ? {
-              ...m,
-              status: 'failed',
-              progress: undefined,
-              text: 'Stop closed this view, but the server did not confirm that the exact run attempt was cancelled. Open Run Environment to check it before retrying.',
-            }
-          : m)));
+      void cancelSessionDetailed(accepted).then((receipt) => {
+        if (!aid) return;
+        setMessages(prev => prev.map(message => applyChatStopReceipt(message, receipt, {
+          assistantId: aid, sessionId: accepted.sessionId, sourceUserSeq: source?.sourceUserSeq,
+        })));
       });
     } else if (pending) {
       // Stop may win before the 202 carries an attempt id. Persist a negative
@@ -1931,9 +2192,9 @@ export function useChat(options?: UseChatOptions) {
       // the server confirms it can never execute later.
       void cancelPendingChatRequest(pending.clientRequestId).then((confirmed) => {
         if (confirmed && pendingPostRef.current === pending) retainPending(null);
-        if (confirmed || !aid) return;
+        if (!aid) return;
         setMessages((prev) => prev.map((m) => (m.id === aid
-          ? {
+          ? confirmed ? { ...m, status: 'stopped', progress: undefined, text: m.text.trim() ? m.text : 'Stopped.' } : {
               ...m,
               status: 'failed',
               progress: undefined,
@@ -1941,9 +2202,12 @@ export function useChat(options?: UseChatOptions) {
             }
           : m)));
       });
+    } else if (aid) {
+      patch(aid, { status: 'failed', progress: undefined,
+        text: 'This view closed, but this run’s cancellation could not be confirmed. Open Run Environment to check the exact run before retrying.' });
     }
     setBusy(false);
-  }, []);
+  }, [patch, retainPending]);
 
   /** User-initiated "continue in background" (the ctrl+b model): detach the
    *  running turn to a durable background task that picks up where the
@@ -1962,6 +2226,8 @@ export function useChat(options?: UseChatOptions) {
     if (postAbortRef.current) {
       pendingBackgroundRef.current = { assistantId: aid };
       patch(aid, { progress: 'Waiting for this run’s identity, then moving it to the background…' });
+    } else {
+      patch(aid, { progress: 'This run’s controls could not be recovered. Open Run Environment to move the exact run to the background.' });
     }
   }, [handoffAcceptedRun, patch]);
 
@@ -1974,6 +2240,10 @@ export function useChat(options?: UseChatOptions) {
     sessionIdRef.current = null;
     pendingBackgroundRef.current = null;
     activeRunRef.current = null;
+    lateWatchRef.current?.cancel();
+    lateWatchRef.current = null;
+    for (const watch of approvalWatchesRef.current.values()) watch.cancel();
+    approvalWatchesRef.current.clear();
     inboxOutcomeCursorRef.current = createInboxOutcomeCursor(null);
     setMessages([]);
     setBusy(false);
@@ -1990,6 +2260,23 @@ export function useChat(options?: UseChatOptions) {
     if (await cancelPendingChatRequest(pending.clientRequestId)) {
       if (pendingPostRef.current === pending) retainPending(null);
     } else throw new Error('Cancellation was not confirmed. The exact request remains available to retry.');
+  };
+  const approveWithEdits = async (message: ChatMessage, fields: Record<string, string>) => {
+    const approvalId = message.approval?.approvalId;
+    const sid = sessionIdRef.current;
+    if (!approvalId || !sid || message.approval?.resolution) throw new Error('This card is no longer available to edit.');
+    // Fence before the mutation, so a quick server reply cannot land in the
+    // gap between the POST and the observer attaching.
+    const before = await apiGet<RecentEventsPage>(recentEventsUrl(sid, { scanSeq: 0 }, 1));
+    const sinceSeq = before.latestSeq;
+    if (!Number.isSafeInteger(sinceSeq) || Number(sinceSeq) < 0) throw new Error('Could not check this card’s live state. Your edit is still here.');
+    await apiPost(`/api/console/harness-approvals/${encodeURIComponent(approvalId)}/approve_with_edits`, { modifiedFields: fields });
+    if (sessionIdRef.current !== sid) return;
+    approvalWatchesRef.current.get(approvalId)?.cancel();
+    const observer = new ApprovalReplyObserver(sid, approvalId);
+    approvalWatchesRef.current.set(approvalId, watchForLateCompletion(sid, Number(sinceSeq), (event) => {
+      if (sessionIdRef.current === sid && observer.observe(event)) setMessages(previous => reconcileIdleChatEvent(previous, event, sid));
+    }, { intervalMs: 1000, maxAttempts: 120, shouldStopOnTerminal: event => observer.ownsSource(event) }));
   };
   const activeTaskMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
   const executePlan = (ref: PlanRevisionRef) => send({ text: `Execute the reviewed plan, revision ${ref.revision}.`, taskMode: { version: 1, kind: 'execute', executeRef: ref } });
@@ -2009,7 +2296,7 @@ export function useChat(options?: UseChatOptions) {
       + 'revision. Only ask me about something that genuinely needs my answer.',
     taskMode: { version: 1, kind: 'plan' },
   });
-  return { messages, busy, send, stop, background, reset, sessionId: sessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, preparePlan, pendingPost, retryPending, cancelPending, delegatedTaskTick };
+  return { messages, busy, send, stop, background, reset, approveWithEdits, sessionId: sessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, preparePlan, pendingPost, retryPending, cancelPending, delegatedTaskTick };
 }
 
 
@@ -2054,18 +2341,21 @@ export async function pollInboxOutcomeEvents(cursor: InboxOutcomeCursor, input: 
   fetchPage(url: string): Promise<RecentEventsPage>;
   active(): boolean;
   maxPages?: number;
+  onEvents?(events: HarnessEvent[]): void;
 }): Promise<ChatMessage[]> {
   if (!cursor.sessionId) return [];
   // A reset/busy transition during a later fetch cannot consume earlier pages
   // without presenting their messages. Commit this bounded turn together.
   const draft = { ...cursor, deliveries: cursor.deliveries.map(delivery => ({ ...delivery })) };
   const additions: ChatMessage[] = [];
+  const observedEvents: HarnessEvent[] = [];
   const maxPages = Number.isSafeInteger(input.maxPages) && Number(input.maxPages) > 0 ? Math.min(4, Number(input.maxPages)) : 4;
   const finish = (): ChatMessage[] => {
     if (!input.active()) return [];
     cursor.seq = draft.seq;
     cursor.snapshotSeq = draft.snapshotSeq;
     cursor.deliveries = draft.deliveries;
+    if (observedEvents.length) input.onEvents?.(observedEvents);
     return additions;
   };
   try {
@@ -2084,6 +2374,7 @@ export async function pollInboxOutcomeEvents(cursor: InboxOutcomeCursor, input: 
       const next = { ...scan };
       const continuation = advanceRunEventPage(next, out, 200);
       const events = (out.events ?? []).filter(event => !event.sessionId || event.sessionId === cursor.sessionId);
+      observedEvents.push(...events);
       additions.push(...inboxAdditionsFromEvents(events.map(event => ({ ...event, data: event.data ?? {} })), draft.deliveries));
       draft.seq = next.scanSeq;
       draft.snapshotSeq = next.snapshotSeq;

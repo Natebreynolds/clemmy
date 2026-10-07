@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Plus, Sparkles, AlertCircle, Plug } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { cn } from '@/lib/cn';
+import { usePendingCommit } from '@/lib/pending-commit';
 import { createSpace, listStarterRecipes, type StarterRecipe } from '@/lib/spaces';
 import {
   resolveWorkspaceCreation,
@@ -46,9 +47,11 @@ export function CreateWorkspaceModal({
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [starters, setStarters] = useState<StarterRecipe[]>([]);
+  const commit = usePendingCommit(open ? 'open' : 'closed');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const close = () => { if (!commit.pending) onCloseRef.current(); };
 
   useEffect(() => {
     if (!open) return;
@@ -62,16 +65,17 @@ export function CreateWorkspaceModal({
     setError(null);
     setCreating(false);
     listStarterRecipes().then(setStarters).catch(() => setStarters([]));
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCloseRef.current(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !commit.pending) onCloseRef.current(); };
     window.addEventListener('keydown', onKey);
     requestAnimationFrame(() => textareaRef.current?.focus());
     return () => window.removeEventListener('keydown', onKey);
-  }, [open]);
+  }, [open, commit]);
 
   if (!open) return null;
 
   const submit = async (mode: WorkspaceCreationMode = 'build') => {
-    if (creating) return;
+    const token = commit.begin();
+    if (!token) return;
     setCreating(true);
     setError(null);
     try {
@@ -83,17 +87,18 @@ export function CreateWorkspaceModal({
       // seeds the dock. Blank mode resolves to no objective/build, even when a
       // recipe populated the visible fields.
       const space = await createSpace(intent.title, intent.objective);
-      onCreated(space.id, intent.build);
+      if (commit.owns(token)) onCreated(space.id, intent.build);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not create a workspace.');
-      setCreating(false);
+      if (commit.owns(token)) setError(err instanceof Error ? err.message : 'Could not create a workspace.');
+    } finally {
+      if (commit.finish(token)) setCreating(false);
     }
   };
 
   return (
     <div
       className="fixed inset-0 z-[100] flex items-start justify-center bg-black/30 p-4 pt-[12vh] animate-fade-in"
-      onMouseDown={onClose}
+      onMouseDown={close}
       role="dialog"
       aria-modal="true"
       aria-label="New Space"
@@ -107,7 +112,7 @@ export function CreateWorkspaceModal({
           <p className="mt-0.5 text-small text-muted">Tell Clem what you want and she’ll build it — a live surface that refreshes itself and can act on one click.</p>
         </div>
 
-        <div className="flex flex-col gap-4 p-5">
+        <fieldset disabled={creating} className="m-0 flex min-w-0 flex-col gap-4 border-0 p-5" aria-busy={creating}>
           <label className="flex flex-col gap-1.5">
             <span className="text-small font-medium text-fg">What do you want to build?</span>
             <textarea
@@ -185,7 +190,7 @@ export function CreateWorkspaceModal({
               <AlertCircle className="h-4 w-4" aria-hidden /> {error}
             </p>
           )}
-        </div>
+        </fieldset>
 
         <div className="flex items-center justify-between gap-2 border-t border-border px-5 py-3">
           <button
@@ -197,7 +202,7 @@ export function CreateWorkspaceModal({
             Start blank instead
           </button>
           <div className="flex items-center gap-2">
-            <Button variant="ghost" onClick={onClose} disabled={creating}>Cancel</Button>
+            <Button variant="ghost" onClick={close} disabled={creating}>Cancel</Button>
             <Button onClick={() => { void submit(); }} disabled={creating}>
               <Plus className="h-4 w-4" aria-hidden /> {creating ? 'Creating…' : description.trim() ? 'Build it' : 'Create'}
             </Button>

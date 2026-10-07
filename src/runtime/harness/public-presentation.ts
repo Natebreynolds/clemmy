@@ -597,8 +597,8 @@ export function publicAsyncWorkDispatchedData(
     dispatchKey,
     replyTargetDigest,
     text: runIds.length === 1
-      ? 'Started — I’ll post the result here when it’s ready.'
-      : `Started ${runIds.length} workflows — I’ll post one combined result here when they’re ready.`,
+      ? 'Queued — waiting for the workflow to start. I’ll post the result here when it’s ready.'
+      : `Queued ${runIds.length} workflows — waiting to start. I’ll post one combined result here when they’re ready.`,
   };
 }
 
@@ -1084,6 +1084,24 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         fallover: data.fallover === true,
         preselected: data.preselected === true,
       };
+    }
+    case 'model_resilience_observed': {
+      // Only a scheduled retry is public. The transport journal's timings,
+      // attempt identity, diagnostics and account/model fields stay private.
+      if (data.version !== 1 || data.phase !== 'retry_scheduled' || data.retired !== false
+        || !Number.isSafeInteger(data.sourceUserSeq) || Number(data.sourceUserSeq) <= 0
+        || !Number.isSafeInteger(data.nextAttempt) || Number(data.nextAttempt) < 2) return null;
+      let reasonCode: 'connection' | 'busy' | 'auth' | 'empty' | 'request';
+      if (data.reason === 'transient_failure' && data.failureKind === 'model.transport_timeout') reasonCode = 'connection';
+      else if (data.reason === 'transient_failure'
+        && (data.failureKind === 'model.rate_limited' || data.failureKind === 'model.overloaded'
+          || data.failureKind === 'model.http_5xx')) reasonCode = 'busy';
+      else if (data.reason === 'auth_refresh' && data.failureKind === 'model.auth_expired') reasonCode = 'auth';
+      else if (data.reason === 'empty_completion' && data.failureKind === 'model.empty_completion') reasonCode = 'empty';
+      else if (data.reason === 'effort_rejected' && data.failureKind === 'runtime.unknown') reasonCode = 'request';
+      else if (data.reason === 'incomplete_stream' && data.failureKind === 'model.transport_timeout') reasonCode = 'connection';
+      else return null;
+      return { sourceUserSeq: data.sourceUserSeq, phase: 'retry', reasonCode };
     }
     // The compiled turn plan, as a SHAPE summary only: route + fast-path +
     // node count. The chat header uses route/fast-path to name the kind of

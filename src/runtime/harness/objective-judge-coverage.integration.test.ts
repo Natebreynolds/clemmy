@@ -14,7 +14,7 @@ mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
 const { Usage } = await import('@openai/agents');
 const { ClaudeModelProvider } = await import('./claude-model.js');
 const { CodexModelProvider } = await import('./codex-model.js');
-const { judgeObjectiveComplete } = await import('./objective-judge.js');
+const { judgeObjectiveComplete, HOST_COMPLETION_EVIDENCE_GUIDANCE } = await import('./objective-judge.js');
 const { resetJudgeMetricsForTests } = await import('./judge-family.js');
 const { _setDiscoveredModelsForTest } = await import('./model-discovery.js');
 const { closeEventLog } = await import('./eventlog.js');
@@ -130,6 +130,41 @@ test('the reviewer is told before it rules which results it holds only in part',
   assert.deepEqual(verdict.evidenceCoverage?.open.map((row) => row.ref), ['call_list'],
     'the uninspected result stays on the record even though the verdict does not rest on it');
   assert.equal(verdict.evidenceCoverage?.followUp, undefined);
+});
+
+test('relocated host guidance preserves a sufficient verdict through the actual completion request', async () => {
+  script = ['DONE: the event was created, confirmed by its write receipt.\nNEEDS ALL OF: call_write'];
+  const verdict = await review({ completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE });
+  assert.equal(verdict.done, true);
+  assert.equal(verdict.failedOpen, undefined);
+  assert.equal(requests.length, 1);
+  assert.equal(verdict.evidenceCoverage?.status, 'sufficient');
+  assert.deepEqual(verdict.evidenceCoverage?.needsAllOf, ['call_write']);
+  const system = String(requests[0]!.systemInstructions);
+  assert.equal(system.split(HOST_COMPLETION_EVIDENCE_GUIDANCE).length - 1, 1);
+  assert.doesNotMatch(system, /call_list|call_write|rh_list|rh_write|Autumn Picture Day/);
+  assert.doesNotMatch(promptOf(requests[0]!), /Judge only the effective accepted objective/);
+  assert.match(promptOf(requests[0]!), /Retained READ results for THIS accepted source/);
+  assert.match(promptOf(requests[0]!), /call_list/);
+});
+
+test('relocated host guidance cannot qualify an acceptance resting on unopened evidence', async () => {
+  script = [
+    'DONE: created; none of the records pre-existed.\nNEEDS ALL OF: call_list',
+    'DONE: created; the successful count confirms absence.\nNEEDS ALL OF: call_list',
+  ];
+  const verdict = await review({ completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE });
+  assert.equal(requests.length, 2, 'the existing one-follow-up coverage bound is retained');
+  assert.equal(verdict.done, false);
+  assert.equal(verdict.failedOpen, undefined);
+  assert.equal(verdict.repairScope, 'claims');
+  assert.equal(verdict.evidenceCoverage?.status, 'insufficient');
+  assert.equal(verdict.evidenceCoverage?.returnedForCorrection, true);
+  assert.deepEqual(verdict.evidenceCoverage?.lookups, []);
+  for (const request of requests) {
+    assert.equal(String(request.systemInstructions).split(HOST_COMPLETION_EVIDENCE_GUIDANCE).length - 1, 1);
+    assert.doesNotMatch(promptOf(request), /Judge only the effective accepted objective/);
+  }
 });
 
 test('an acceptance resting on an unopened result is asked once to inspect it, and the lookup is recorded', async () => {

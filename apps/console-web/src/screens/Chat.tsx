@@ -5,7 +5,7 @@ import { Fragment, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowRight, X } from 'lucide-react';
-import { apiGet, apiPost } from '@/lib/api';
+import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
 import { decidePlanProposal, dismissInboxItem } from '@/lib/inbox';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
@@ -145,9 +145,7 @@ export function Chat() {
    *  which applies them onto the exact stored call; the thread shows the
    *  decision the way a tap does. */
   const approveWithEdits = async (message: ChatMessage, fields: Record<string, string>) => {
-    const approvalId = message.approval?.approvalId;
-    if (!approvalId) return;
-    await apiPost(`/api/console/harness-approvals/${encodeURIComponent(approvalId)}/approve_with_edits`, { modifiedFields: fields });
+    await chat.approveWithEdits(message, fields);
     await qc.invalidateQueries({ queryKey: ['command-center'] });
   };
 

@@ -51,6 +51,8 @@ import { WorkflowEnginePanel } from '@/components/automate/WorkflowDrawer';
 import { WorkflowCanvasNode, type WorkflowCanvasFlowNode, type WorkflowCanvasNodeRun } from '@/components/automate/WorkflowCanvasNode';
 import { useWorkflowChanges } from '@/lib/workflow-changes';
 import { usePoll } from '@/lib/poll';
+import { usePendingCommit, type PendingCommit } from '@/lib/pending-commit';
+import { workflowRunFailure, workflowRunNotice, workflowRunTone } from '@/lib/workflow-run-receipt';
 import { getSettings, type ModelRolesSnapshot } from '@/lib/settings';
 import { detectedTimezone, humanizeCron } from '@/lib/cron';
 import { cn } from '@/lib/cn';
@@ -124,6 +126,8 @@ function WorkflowView({ name }: { name: string }) {
   const queryClient = useQueryClient();
   const isDark = useIsDarkTheme();
   const [searchParams] = useSearchParams();
+  const graphCommit = usePendingCommit(name);
+  const runCommit = usePendingCommit(name);
   useWorkflowChanges();
 
   const detailQuery = useQuery({
@@ -220,10 +224,14 @@ function WorkflowView({ name }: { name: string }) {
   const dragEnded = useRef(false);
   const handleNodesChange = useCallback(
     (changes: NodeChange<WorkflowCanvasFlowNode>[]) => {
+      if (graphCommit.pending) {
+        onNodesChange(changes.filter((change) => change.type === 'select' || change.type === 'dimensions'));
+        return;
+      }
       if (changes.some((c) => c.type === 'position' && c.dragging === false)) dragEnded.current = true;
       onNodesChange(changes);
     },
-    [onNodesChange],
+    [graphCommit, onNodesChange],
   );
   useEffect(() => {
     if (!dragEnded.current) return;
@@ -233,13 +241,15 @@ function WorkflowView({ name }: { name: string }) {
 
   const onConnect = useCallback(
     (connection: Connection) => {
+      if (graphCommit.pending) return;
       if (connection.source === connection.target) return;
       setEdges((current) => addEdge({ ...connection, id: `${connection.source}->${connection.target}` }, current));
     },
-    [setEdges],
+    [graphCommit, setEdges],
   );
 
   const addStep = useCallback(() => {
+    if (graphCommit.pending) return;
     const id = newStepId(nodes.map((n) => n.id));
     const positions: Record<string, CanvasPosition> = {};
     for (const n of nodes) positions[n.id] = { x: n.position.x, y: n.position.y };
@@ -249,32 +259,50 @@ function WorkflowView({ name }: { name: string }) {
       { id, type: 'workflowStep' as const, position: nextFreePosition(positions), data: { node, isNew: true } },
     ]);
     setCreatedIds((ids) => (ids.includes(id) ? ids : [...ids, id]));
-  }, [nodes, setNodes]);
+  }, [graphCommit, nodes, setNodes]);
 
   const removeSelected = useCallback(() => {
+    if (graphCommit.pending) return;
     if (!selectedId) return;
     setNodes((current) => current.filter((n) => n.id !== selectedId));
     setEdges((current) => current.filter((e) => e.source !== selectedId && e.target !== selectedId));
     setCreatedIds((ids) => ids.filter((id) => id !== selectedId));
     setSelectedId(null);
-  }, [selectedId, setEdges, setNodes]);
+  }, [graphCommit, selectedId, setEdges, setNodes]);
 
   const revert = useCallback(() => {
+    if (graphCommit.pending) return;
     applyGraph(baseline.current, detail?.layout?.positions);
     setSelectedId(null);
     setSaveError(null);
-  }, [applyGraph, detail]);
+  }, [applyGraph, detail, graphCommit]);
 
-  const reloadFromDaemon = useCallback(async () => {
-    const fresh = await queryClient.fetchQuery({ queryKey: ['workflow', name], queryFn: () => getWorkflow(name) });
-    drawnFrom.current = fresh;
-    applyGraph(fresh.graph ?? EMPTY_GRAPH, fresh.layout?.positions);
-    void queryClient.invalidateQueries({ queryKey: ['workflows'] });
-    return fresh;
-  }, [applyGraph, name, queryClient]);
+  const reloadFromDaemon = useCallback(async (token?: symbol) => {
+    const owned = token ?? graphCommit.begin();
+    if (!owned || !graphCommit.owns(owned)) return null;
+    if (!token) setSaving(true);
+    try {
+      const fresh = await queryClient.fetchQuery({ queryKey: ['workflow', name], queryFn: () => getWorkflow(name) });
+      if (!graphCommit.owns(owned)) return null;
+      setSaveError(null);
+      drawnFrom.current = fresh;
+      applyGraph(fresh.graph ?? EMPTY_GRAPH, fresh.layout?.positions);
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] });
+      return fresh;
+    } catch (err) {
+      if (graphCommit.owns(owned)) {
+        setSaveError(`Could not reload this workflow. Your draft is still here. Try Reload again.${err instanceof Error ? ` ${err.message}` : ''}`);
+      }
+      return null;
+    } finally {
+      if (!token && graphCommit.finish(owned)) setSaving(false);
+    }
+  }, [applyGraph, graphCommit, name, queryClient]);
 
   const saveGraph = useCallback(async () => {
     if (cycle || !dirty || patch.length === 0) return;
+    const token = graphCommit.begin();
+    if (!token) return;
     setSaving(true);
     setSaveError(null);
     try {
@@ -282,26 +310,28 @@ function WorkflowView({ name }: { name: string }) {
         stepEdits: patch,
         ...(removedIds.length > 0 ? { removeStepIds: removedIds } : {}),
       });
-      await reloadFromDaemon();
-      setNotice(saveOutcome(result));
+      await reloadFromDaemon(token);
+      if (graphCommit.owns(token)) setNotice(saveOutcome(result));
     } catch (err: unknown) {
+      if (!graphCommit.owns(token)) return;
       const written = writtenButTurnedOff(err);
       if (written) {
-        await reloadFromDaemon().catch(() => undefined);
-        setNotice(written);
+        await reloadFromDaemon(token).catch(() => undefined);
+        if (graphCommit.owns(token)) setNotice(written);
       } else {
         setSaveError(err instanceof Error ? err.message : 'Could not save the graph.');
       }
     } finally {
-      setSaving(false);
+      if (graphCommit.finish(token)) setSaving(false);
     }
-  }, [cycle, dirty, name, patch, reloadFromDaemon, removedIds]);
+  }, [cycle, dirty, graphCommit, name, patch, reloadFromDaemon, removedIds]);
 
   /* ---------- workflow-level controls ---------- */
   const [busy, setBusy] = useState<'run' | 'enable' | 'delete' | null>(null);
   const [testing, setTesting] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
   const [runNotice, setRunNotice] = useState<string | null>(null);
+  const [runNoticeTone, setRunNoticeTone] = useState<'info' | 'warning'>('info');
   const invalidateAll = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ['workflow', name] });
     void queryClient.invalidateQueries({ queryKey: ['workflows'] });
@@ -309,14 +339,18 @@ function WorkflowView({ name }: { name: string }) {
   }, [name, queryClient]);
 
   const run = async () => {
+    const token = runCommit.begin();
+    if (!token) return;
     setBusy('run'); setControlError(null); setRunNotice(null);
     try {
-      await runWorkflow(name);
-      setRunNotice('Started. Watch it under Automate → last run.');
+      const receipt = await runWorkflow(name);
+      if (!runCommit.owns(token)) return;
+      setRunNotice(workflowRunNotice(receipt));
+      setRunNoticeTone(workflowRunTone(receipt));
       void queryClient.invalidateQueries({ queryKey: ['runs'] });
       invalidateAll();
-    } catch (e) { setControlError((e as Error).message); }
-    finally { setBusy(null); }
+    } catch (e) { if (runCommit.owns(token)) setControlError(workflowRunFailure(e)); }
+    finally { if (runCommit.finish(token)) setBusy(null); }
   };
 
   // A queued creation test is followed to its settled result (passed → on,
@@ -351,9 +385,9 @@ function WorkflowView({ name }: { name: string }) {
 
   // After a step save: the graph is redrawn from the daemon unless it holds
   // unsaved rewiring, in which case only the detail (and so the panel) refreshes.
-  const afterStepChange = useCallback(async () => {
+  const afterStepChange = useCallback(async (token?: symbol) => {
     if (dirtyRef.current) invalidateAll();
-    else await reloadFromDaemon();
+    else await reloadFromDaemon(token);
   }, [invalidateAll, reloadFromDaemon]);
 
   const remove = async () => {
@@ -507,7 +541,7 @@ function WorkflowView({ name }: { name: string }) {
         </Banner>
       ) : null}
       {controlError ? <Banner tone="danger">{controlError}</Banner> : null}
-      {runNotice ? <Banner tone="success">{runNotice}</Banner> : null}
+      {runNotice ? <Banner tone={runNoticeTone}>{runNotice}</Banner> : null}
       {changedElsewhere ? (
         <Banner tone="warning">
           This workflow changed while you had unsaved edits here.{' '}
@@ -558,11 +592,11 @@ function WorkflowView({ name }: { name: string }) {
             </div>
             {view === 'steps' ? (
               <>
-                <Button variant="ghost" size="sm" onClick={addStep}>
+                <Button variant="ghost" size="sm" onClick={addStep} disabled={saving}>
                   <Plus size={16} aria-hidden />
                   Add step
                 </Button>
-                <Button variant="ghost" size="sm" onClick={removeSelected} disabled={!selectedId}>
+                <Button variant="ghost" size="sm" onClick={removeSelected} disabled={!selectedId || saving}>
                   <Trash2 size={16} aria-hidden />
                   Remove
                 </Button>
@@ -602,7 +636,7 @@ function WorkflowView({ name }: { name: string }) {
               title="No steps to draw"
               description="This workflow has no steps yet. Add one here, or build it out with Clementine."
               action={
-                <Button variant="secondary" onClick={addStep}>
+                <Button variant="secondary" onClick={addStep} disabled={saving}>
                   <Plus size={16} aria-hidden />
                   Add step
                 </Button>
@@ -615,11 +649,12 @@ function WorkflowView({ name }: { name: string }) {
                 edges={edges}
                 nodeTypes={nodeTypes}
                 onNodesChange={handleNodesChange}
-                onEdgesChange={onEdgesChange}
+                onEdgesChange={(changes) => onEdgesChange(graphCommit.pending ? changes.filter((change) => change.type === 'select') : changes)}
                 onConnect={onConnect}
                 onSelectionChange={({ nodes: sel }) => setSelectedId(sel[0]?.id ?? null)}
-                nodesConnectable={view === 'steps'}
-                deleteKeyCode={view === 'steps' ? ['Backspace', 'Delete'] : null}
+                nodesConnectable={view === 'steps' && !saving}
+                nodesDraggable={!saving}
+                deleteKeyCode={view === 'steps' && !saving ? ['Backspace', 'Delete'] : null}
                 colorMode={isDark ? 'dark' : 'light'}
                 fitView
               >
@@ -659,6 +694,9 @@ function WorkflowView({ name }: { name: string }) {
               graph={canvasGraph}
               isNew={createdIds.includes(selectedNode.id)}
               workflowOn={enabled}
+              graphCommit={graphCommit}
+              graphSaving={saving}
+              onGraphPending={setSaving}
               onChanged={afterStepChange}
               onTestQueued={followCreationTest}
             />
@@ -745,7 +783,7 @@ const RUN_ICON: Record<ReturnType<typeof describeStepRun>['kind'], LucideIcon> =
   model: Bot, skill: Puzzle, script: ScrollText, call: Zap,
 };
 
-function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, onChanged, onTestQueued }: {
+function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, graphCommit, graphSaving, onGraphPending, onChanged, onTestQueued }: {
   workflowName: string;
   node: CanvasGraphNode;
   step?: WorkflowStep;
@@ -754,12 +792,29 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
   isNew: boolean;
   /** The workflow is on, so a change to what runs pauses it for a test. */
   workflowOn: boolean;
+  graphCommit: PendingCommit;
+  graphSaving: boolean;
+  onGraphPending: (pending: boolean) => void;
   /** The step was saved or undone; the page refreshes what it shows. */
-  onChanged: () => Promise<void>;
+  onChanged: (token?: symbol) => Promise<void>;
   /** A save turned the workflow off and queued its test; the page follows it. */
   onTestQueued: () => Promise<void>;
 }) {
   const queryClient = useQueryClient();
+  const stepCommit = usePendingCommit(`${workflowName}:${node.id}`);
+  const beginMutation = () => {
+    const graphToken = graphCommit.begin();
+    if (!graphToken) return null;
+    const stepToken = stepCommit.begin();
+    if (!stepToken) { graphCommit.finish(graphToken); return null; }
+    onGraphPending(true);
+    return { graph: graphToken, step: stepToken };
+  };
+  const ownsMutation = (token: { graph: symbol; step: symbol }) => graphCommit.owns(token.graph) && stepCommit.owns(token.step);
+  const finishMutation = (token: { graph: symbol; step: symbol }) => {
+    if (graphCommit.finish(token.graph)) onGraphPending(false);
+    return stepCommit.finish(token.step);
+  };
   const runAs = describeStepRun(node, step);
   const RunIcon = RUN_ICON[runAs.kind];
   const waitsFor = Array.isArray(node.dependsOn) ? node.dependsOn : [];
@@ -790,11 +845,15 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
   const save = async () => {
     const patch = stepPatchFromDraft(base, draft);
     if (Object.keys(patch).length === 0) return;
+    const token = beginMutation();
+    if (!token) return;
     setSaving(true); setSaveError(null); setSaveNote(null);
     try {
       const result = await editWorkflowStep(workflowName, node.id, patch);
+      if (!graphCommit.owns(token.graph)) return;
       void queryClient.invalidateQueries({ queryKey: ['workflow-step-edits', workflowName] });
-      await onChanged();
+      await onChanged(token.graph);
+      if (!ownsMutation(token)) return;
       if (result.verification.turnedOff) {
         if (result.verification.runId) {
           setSaveNote('Saved. The workflow is paused while its quick test runs; it turns back on when the test passes.');
@@ -806,10 +865,11 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
         setSaveNote('Saved.');
       }
     } catch (e) {
+      if (!ownsMutation(token)) return;
       const body = (e as { body?: { error?: string; errors?: string[] } }).body;
       setSaveError(body?.error ? [body.error, ...(body.errors ?? [])].join(' ') : (e as Error).message);
     } finally {
-      setSaving(false);
+      if (finishMutation(token)) setSaving(false);
     }
   };
   useEffect(() => {
@@ -828,14 +888,17 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
   const [undoing, setUndoing] = useState(false);
   const undo = async () => {
     if (!lastEdit) return;
+    const token = beginMutation();
+    if (!token) return;
     setUndoing(true); setSaveError(null);
     try {
       const result = await revertWorkflowStepEdit(workflowName, lastEdit.id);
+      if (!graphCommit.owns(token.graph)) return;
       void queryClient.invalidateQueries({ queryKey: ['workflow-step-edits', workflowName] });
-      await onChanged();
-      setSaveNote(result.message);
-    } catch (e) { setSaveError((e as Error).message); }
-    finally { setUndoing(false); }
+      await onChanged(token.graph);
+      if (ownsMutation(token)) setSaveNote(result.message);
+    } catch (e) { if (ownsMutation(token)) setSaveError((e as Error).message); }
+    finally { if (finishMutation(token)) setUndoing(false); }
   };
 
   /* ---- test this step: one run of just this step, followed here ---- */
@@ -854,16 +917,20 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
   const testRun = testRunId ? runsQuery.data?.runs.find((r) => r.id === testRunId) ?? null : null;
   const testTone = statusTone(testRun?.status ?? (testRunId ? 'queued' : undefined));
   const testThisStep = async () => {
+    const token = beginMutation();
+    if (!token) return;
     setStarting(true); setTestNote(null); setTestRunId(null);
     try {
       const result = await runWorkflowStep(workflowName, node.id);
+      if (!ownsMutation(token)) return;
       if (result.id) setTestRunId(result.id);
       else setTestNote(result.message ?? 'The test could not start.');
     } catch (e) {
+      if (!ownsMutation(token)) return;
       const body = (e as { body?: { error?: string; message?: string } }).body;
       setTestNote(body?.message ?? body?.error ?? (e as Error).message);
     } finally {
-      setStarting(false);
+      if (finishMutation(token)) setStarting(false);
     }
   };
   const openRunHref = testRunId ? `/automate?workflow=${encodeURIComponent(workflowName)}&run=${encodeURIComponent(testRunId)}` : null;
@@ -891,7 +958,7 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
         {isNew ? (
           <p className="text-small text-muted">A new step has no instructions yet. Save the graph first, then write what this step should do here.</p>
         ) : (
-          <>
+          <fieldset disabled={graphSaving} aria-busy={graphSaving} className="m-0 min-w-0 space-y-4 border-0 p-0">
             <section>
               <label className="mb-1 block text-label text-fg" htmlFor={`step-prompt-${node.id}`}>What this step does</label>
               <Textarea
@@ -947,13 +1014,13 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
             {saveNote ? <p className="text-small text-success">{saveNote}</p> : null}
 
             <div className="flex flex-wrap items-center gap-2">
-              <Button size="sm" onClick={() => void save()} disabled={!changed || saving || undoing}>
+              <Button size="sm" onClick={() => void save()} disabled={!changed || saving || undoing || graphSaving}>
                 {saving ? <Loader2 size={16} className="animate-spin" aria-hidden /> : <Save size={16} aria-hidden />}
                 Save step
               </Button>
-              <Button size="sm" variant="ghost" onClick={() => setDraft(base)} disabled={!changed || saving}>Discard</Button>
+              <Button size="sm" variant="ghost" onClick={() => { if (!graphCommit.pending) setDraft(base); }} disabled={!changed || saving || graphSaving}>Discard</Button>
               {lastEdit ? (
-                <Button size="sm" variant="ghost" onClick={() => void undo()} disabled={undoing || saving} title={`${lastEdit.description} · ${new Date(lastEdit.createdAt).toLocaleString()}`}>
+                <Button size="sm" variant="ghost" onClick={() => void undo()} disabled={undoing || saving || graphSaving} title={`${lastEdit.description} · ${new Date(lastEdit.createdAt).toLocaleString()}`}>
                   {undoing ? <Loader2 size={16} className="animate-spin" aria-hidden /> : <Undo2 size={16} aria-hidden />}
                   Undo last change
                 </Button>
@@ -963,7 +1030,7 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
             <section className="rounded-md border border-border bg-subtle px-3 py-2">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="text-small font-medium text-fg">Try just this step</div>
-                <Button size="sm" variant="secondary" onClick={() => void testThisStep()} disabled={starting || changed} title={changed ? 'Save the step first' : 'Runs this step alone, with no upstream chain'}>
+                <Button size="sm" variant="secondary" onClick={() => void testThisStep()} disabled={starting || changed || graphSaving} title={changed ? 'Save the step first' : 'Runs this step alone, with no upstream chain'}>
                   {starting ? <Loader2 size={16} className="animate-spin" aria-hidden /> : <FlaskConical size={16} aria-hidden />}
                   Test this step
                 </Button>
@@ -982,7 +1049,7 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
               {testNote ? <p className="mt-2 text-small text-muted">{testNote}</p> : null}
               <p className="mt-1 text-caption text-faint">Runs the saved step by itself, using the real tools. Nothing upstream runs.</p>
             </section>
-          </>
+          </fieldset>
         )}
 
         <section>

@@ -1,5 +1,6 @@
 import { apiGet, apiPost, api } from './api';
 import type { CanvasGraph } from './workflow-canvas';
+import type { WorkflowRunReceipt } from './workflow-run-receipt';
 
 export type WorkflowCertificationState =
   | 'blocked'
@@ -449,7 +450,7 @@ export const deleteSkill = (name: string) => api(`/api/console/skills/${encodeUR
 export const updateSkill = (name: string) => apiPost(`/api/console/skills/${encodeURIComponent(name)}/update`, {});
 
 export const listWorkflows = () => apiGet<{ workflows: WorkflowRow[] }>('/api/console/workflows');
-export const runWorkflow = (name: string) => apiPost(`/api/console/workflows/${encodeURIComponent(name)}/run`, {});
+export const runWorkflow = (name: string) => apiPost<WorkflowRunReceipt>(`/api/console/workflows/${encodeURIComponent(name)}/run`, {});
 
 // ── Runs & the run workspace (the "file system" of workflow work) ──────────
 export interface WorkflowRunRecord {
