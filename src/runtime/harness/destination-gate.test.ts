@@ -434,6 +434,29 @@ test('heredoc BODIES are document content, never commands (2026-08-04 markdown-p
 });
 
 test('classifyShellNetworkMutation: commands that run on another machine are sends', () => {
+  // Live 2026-10-06 (later the same day): the model found the Composio CLI
+  // and called Slack's API through the shell — `execute` of a delete slug,
+  // then `proxy` POSTs to reminders.delete and reminders.add — all as
+  // compute: no card, no ledger, no learned kind. The binary was a shell
+  // variable or a full path; the request itself is the evidence.
+  for (const cmd of [
+    '/Users/me/.composio/composio execute SLACK_DELETE_A_SLACK_REMINDER -d \'{"reminder":"Rm0C74M0QWSX"}\' 2>&1 | tail -20',
+    'C=/Users/me/.composio/composio; echo \'=== list ===\'; $C proxy https://slack.com/api/reminders.list --toolkit slack -X POST 2>&1 | head -20; echo \'=== delete ===\'; $C proxy https://slack.com/api/reminders.delete --toolkit slack -X POST -d \'{"reminder":"Rm0C74M0QWSX"}\'',
+    'composio proxy https://slack.com/api/reminders.add --toolkit slack -X POST -d \'{"text":"x","time":"1791388800"}\'',
+    'composio trigger SLACK_SEND_MESSAGE',
+    '$HTTP https://api.example.com/items --json \'{"name":"x"}\'',
+    'MYCURL=/opt/bin/curl; $MYCURL -X DELETE https://api.example.com/items/1',
+  ]) assert.equal(classifyShellNetworkMutation(cmd).isNetworkMutation, true, `should flag: ${cmd}`);
+  for (const cmd of [
+    '/Users/me/.composio/composio --help 2>&1 | head -60',
+    "composio search 'delete a slack reminder' --toolkits slack --limit 10 --human",
+    'composio proxy https://slack.com/api/auth.test --toolkit slack',
+    '$C proxy https://slack.com/api/reminders.list --toolkit slack',
+    'echo "$C proxy https://slack.com/api/reminders.delete -X POST -d x"',
+    'grep -n "curl -X POST https://api.example.com" notes.md',
+    '$C proxy http://localhost:8520/api/console/build-info -X POST -d x',
+  ]) assert.equal(classifyShellNetworkMutation(cmd).isNetworkMutation, false, `should NOT flag: ${cmd}`);
+
   // Live 2026-10-06: `railway link` + `railway ssh … node scripts/backup.js`
   // reached a production service through the shell with no card.
   for (const cmd of [

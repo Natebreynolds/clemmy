@@ -692,18 +692,38 @@ export interface ShellNetworkMutation {
  * constitute a clear network mutation? Binary-anchored so a send-CLI name inside
  * a FILENAME or quoted string (`cat notes-about-sendmail.txt`) never trips it.
  */
+/** curl-style request flags that make an HTTP call a mutation. curl short
+ * flags are CASE-SENSITIVE: `-d` sends data, while `-D` merely dumps response
+ * headers; `-F` uploads a form, while `-f` is read-only fail-on-HTTP-error.
+ * Keeping them under `/i` mislabeled a cache-busted GET verification as an
+ * irreversible external write. */
+function httpRequestCarriesMutation(rest: string): boolean {
+  return /\s-X\s*(post|put|patch|delete)\b/i.test(rest)
+    || /\s(?:--request|--method[ =])\s*(post|put|patch|delete)\b/i.test(rest)
+    || /\s(?:-d|-F|-T)(?:$|[^-])/.test(rest)
+    || /\s--(?:data|data-raw|data-binary|data-urlencode|json|form|upload-file|body)(?:\s|=|$)/i.test(rest);
+}
+
+/** An http(s) URL whose host is not this machine. */
+const REMOTE_HTTP_URL_RE = /https?:\/\/(?!(?:localhost|127\.|0\.0\.0\.0|\[::1\]|10\.|192\.168\.)(?:[:/?#]|$))[A-Za-z0-9.-]+/i;
+
 function binaryIsNetworkMutation(binary: string, rest: string): boolean {
   switch (binary) {
     case 'curl':
     case 'xh':
-      // curl short flags are CASE-SENSITIVE: `-d` sends data, while `-D`
-      // merely dumps response headers; `-F` uploads a form, while `-f` is
-      // read-only fail-on-HTTP-error. Keeping them under `/i` mislabeled a
-      // cache-busted GET verification as an irreversible external write.
-      return /\s-X\s*(post|put|patch|delete)\b/i.test(rest)
-        || /\s(?:--request|--method[ =])\s*(post|put|patch|delete)\b/i.test(rest)
-        || /\s(?:-d|-F|-T)(?:$|[^-])/.test(rest)
-        || /\s--(?:data|data-raw|data-binary|data-urlencode|json|form|upload-file)(?:\s|=|$)/i.test(rest);
+      return httpRequestCarriesMutation(rest);
+    // A connected-app call made through the provider's own CLI from the
+    // shell. Live 2026-10-06: the model found ~/.composio/composio and ran
+    // `composio execute SLACK_DELETE_A_SLACK_REMINDER -d …` and
+    // `composio proxy https://slack.com/api/reminders.delete -X POST -d …`
+    // (then reminders.add) as "compute": two deletes and a create in a
+    // connected app with no card, no write ledger and no learned kind.
+    // `execute`/`trigger` run a provider operation of unknown effect; `proxy`
+    // is a raw request under the connected account's auth, a mutation
+    // whenever it carries a method or a body.
+    case 'composio':
+      return /^\s*(execute|exec|run|trigger|triggers?\s+(create|delete|enable|disable))\b/i.test(rest)
+        || (/^\s*proxy\b/i.test(rest) && httpRequestCarriesMutation(rest));
     case 'wget':
       return /\s(--post-data|--post-file|--body-data|--body-file|--method[ =](post|put|patch|delete))\b/i.test(rest);
     case 'http': // httpie
@@ -800,9 +820,29 @@ function classifyOneShellNetworkMutation(command: string): ShellNetworkMutation 
     if (binaryIsNetworkMutation(binary, rest)) {
       return { isNetworkMutation: true, shapeKey: `shell:${binary}` };
     }
+    // The binary's name proves nothing when it is a shell variable or a
+    // binary this table does not know (`C=…/composio; $C proxy …`, an
+    // aliased curl): the REQUEST does. A segment that names a remote http(s)
+    // URL and carries a mutating method or body is a network mutation
+    // whatever ran it. Quoted strings were stripped above, so an `echo` of
+    // such a command keeps no flags and never trips this.
+    if (
+      (binary.startsWith('$') || !KNOWN_LOCAL_TEXT_BINARIES.has(binary))
+      && REMOTE_HTTP_URL_RE.test(segment)
+      && httpRequestCarriesMutation(rest)
+    ) {
+      return { isNetworkMutation: true, shapeKey: 'shell:http' };
+    }
   }
   return { isNetworkMutation: false };
 }
+
+/** Binaries that only print or transform text: a URL and request flags in
+ * their arguments are data, never a request. */
+const KNOWN_LOCAL_TEXT_BINARIES: ReadonlySet<string> = new Set([
+  'echo', 'printf', 'cat', 'grep', 'rg', 'sed', 'awk', 'head', 'tail', 'less', 'more', 'tee', 'sort', 'uniq',
+  'wc', 'cut', 'tr', 'jq', 'yq', 'diff', 'test', '[', 'true', 'false', 'read', 'export', 'set', 'unset',
+]);
 
 export function classifyShellNetworkMutation(command: string): ShellNetworkMutation {
   if (!command || typeof command !== 'string') return { isNetworkMutation: false };
