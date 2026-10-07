@@ -132,7 +132,11 @@ async function ownedWindowsFixture(kind: 'abort' | 'timeout' | 'shutdown' | 'mis
     assert.ok(performance.now() - started < 15_000, 'deadline/abort/shutdown cannot await pipe EOF indefinitely');
     if (kind === 'missing-utility') {
       assert.equal(error.code, 'TRANSCRIPTION_CLEANUP_UNKNOWN'); assert.equal(runtime.__testing.windowsCleanupUnknown(), true);
-      assert.equal(alive(descendantPid), true, 'failed tree utility must not claim the surviving descendant stopped');
+      // The claim under test is the runtime's: a failed tree utility reports
+      // uncertainty. Whether the descendant outlives its killed parent is the
+      // OS's: Windows' job object usually leaves it (nine runs), once took it
+      // with the parent (run 37673016670). Either way the runtime never claims it stopped.
+      if (!alive(descendantPid)) process.stdout.write('# windows job object took the descendant with its parent\n');
       await assert.rejects(() => runtime.shutdownLocalTranscriptionRuntime({ graceMs: 0 }), { code: 'TRANSCRIPTION_CLEANUP_UNKNOWN' });
       await assert.rejects(() => runtime.__testing.runWhisperProcess(process.execPath, [], { timeoutMs: 50 }), { code: 'TRANSCRIPTION_CLEANUP_UNKNOWN' });
     } else {
