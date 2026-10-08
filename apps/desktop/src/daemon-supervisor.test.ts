@@ -13,6 +13,7 @@ import {
   settleTerminalReadinessFailure,
   shouldDeferHungRestartForIpcHeartbeat,
   shouldDeferHungRestartForLivenessBeacon,
+  shouldExtendReadinessForLivenessBeacon,
 } from './daemon-supervisor.js';
 
 test('isDaemonIpcHeartbeatMessage accepts only the daemon heartbeat envelope', () => {
@@ -149,6 +150,19 @@ test('a young running phase defers the kill even next to an old in-flight entry'
     ageMs: 2_000,
   };
   assert.equal(shouldDeferHungRestartForLivenessBeacon(read, 0), true);
+});
+
+test('a boot still making progress gets more time; a stale, foreign or stuck boot does not', () => {
+  // Owner's Mac 10-08 under swap: boots took 75–95 s and each was killed at 90 s.
+  const booting = { beacon: { at: new Date().toISOString(), pid: 4242, phase: { name: 'daemon.boot.start', activeMs: 40_000 } }, ageMs: 3_000 };
+  assert.equal(shouldExtendReadinessForLivenessBeacon(booting, 4242, 90_000), true);
+  assert.equal(shouldExtendReadinessForLivenessBeacon(booting, 9999, 90_000), false, "a previous daemon's beacon never extends this boot");
+  assert.equal(shouldExtendReadinessForLivenessBeacon({ ...booting, ageMs: 25_000 }, 4242, 90_000), false, 'a stale beacon means the boot is not progressing');
+  assert.equal(shouldExtendReadinessForLivenessBeacon(booting, 4242, 5 * 60_000), false, 'the whole wait stays bounded');
+  assert.equal(shouldExtendReadinessForLivenessBeacon({ ...booting, beacon: { ...booting.beacon, phase: { name: 'daemon.boot.start', activeMs: 11 * 60_000 } } }, 4242, 90_000), false,
+    'one phase past the stuck ceiling is a freeze');
+  assert.equal(shouldExtendReadinessForLivenessBeacon(null, 4242, 90_000), false);
+  assert.equal(shouldExtendReadinessForLivenessBeacon(booting, undefined, 90_000), false);
 });
 
 test('the HUNG line names the beacon running phase, its stamp ages and the in-flight set', () => {

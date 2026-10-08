@@ -55,6 +55,12 @@ export type SupervisorEvent =
   | { type: 'hung-restart'; misses: number; unresponsiveMs: number; ipcHeartbeatAgeMs: number | null; heartbeat: DaemonIpcHeartbeatSnapshot | null; recentLogs: SupervisorLogTailEntry[] };
 
 const READINESS_TIMEOUT_MS = 90_000;
+// A boot still making progress (fresh beacon from ITS OWN worker, no single
+// phase past the stuck ceiling) is given more time instead of being killed.
+// Owner's Mac 2026-10-08 under heavy swap: boots took 75–95 s, each was
+// SIGKILLed at 90 s and paid a fresh boot reconciliation, a 17-minute loop.
+const READINESS_EXTENSION_MS = 60_000;
+const READINESS_MAX_MS = 5 * 60_000;
 const READINESS_POLL_MS = 250;
 const SHUTDOWN_GRACE_MS = 5_000;
 const RESTART_BASE_MS = 1_000;
@@ -301,6 +307,24 @@ export function shouldDeferHungRestartForLivenessBeacon(
   const activeMs = read.beacon.phase?.activeMs;
   if (typeof activeMs === 'number' && activeMs > phaseCeilingMs) return false; // stuck in ONE phase too long → real freeze
   return true;
+}
+
+/** Should a boot that has not answered /api/status by its deadline be given
+ *  more time? Only when the beacon is fresh, comes from THIS child (a previous
+ *  daemon's file can linger), no single phase has run past the stuck ceiling,
+ *  and the whole wait stays under its own bound. */
+export function shouldExtendReadinessForLivenessBeacon(
+  read: { beacon: DaemonLivenessBeacon; ageMs: number } | null,
+  childPid: number | undefined,
+  waitedMs: number,
+  maxMs = READINESS_MAX_MS,
+  phaseCeilingMs = LIVENESS_STUCK_PHASE_CEILING_MS,
+  beaconFreshMs = LIVENESS_BEACON_FRESH_MS,
+): boolean {
+  if (!read || childPid === undefined || read.beacon.pid !== childPid) return false;
+  if (read.ageMs > beaconFreshMs || waitedMs >= maxMs) return false;
+  const activeMs = read.beacon.phase?.activeMs;
+  return !(typeof activeMs === 'number' && activeMs > phaseCeilingMs);
 }
 
 export function shouldDeferHungRestartForIpcHeartbeat(
@@ -992,12 +1016,19 @@ export class DaemonSupervisor {
     // `/api/status` is intentionally minimal and is the correct boot
     // readiness signal.
     const url = `http://${WEBHOOK_HOST}:${port}/api/status`;
-    const deadline = Date.now() + READINESS_TIMEOUT_MS;
+    const startedAt = Date.now();
+    let deadline = startedAt + READINESS_TIMEOUT_MS;
     const assertCurrent = () => {
       if (this.shuttingDown || generation !== this.generation) throw new Error('Daemon startup stopped or superseded');
       if (this.child !== child) throw new Error('Daemon exited before ready');
     };
-    while (Date.now() < deadline) {
+    while (true) {
+      if (Date.now() >= deadline) {
+        const read = readLivenessBeacon(this.livenessBeaconFile());
+        if (!shouldExtendReadinessForLivenessBeacon(read, child.pid, Date.now() - startedAt)) break;
+        deadline = Date.now() + READINESS_EXTENSION_MS;
+        this.emit({ type: 'log', stream: 'stderr', line: `[supervisor] readiness extended: pid=${child.pid} is still booting (phase=${read?.beacon.phase?.name ?? 'unknown'}, beacon ${Math.round((read?.ageMs ?? 0) / 1000)}s old, waited ${Math.round((Date.now() - startedAt) / 1000)}s)` });
+      }
       assertCurrent();
       let response: Response | undefined;
       try {
@@ -1009,7 +1040,7 @@ export class DaemonSupervisor {
       if (response?.status === 200) return { port, url: `http://${WEBHOOK_HOST}:${port}` };
       await sleep(READINESS_POLL_MS);
     }
-    throw new Error(`Daemon did not become ready within ${READINESS_TIMEOUT_MS}ms`);
+    throw new Error(`Daemon did not become ready within ${Date.now() - startedAt}ms`);
   }
 
   private scheduleRestart(): void {
