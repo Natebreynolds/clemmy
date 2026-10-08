@@ -40,3 +40,10 @@ test('no lazy screen is rendered without a Suspense boundary', () => {
     `These lazy screens render outside Suspense and will throw on visit:\n  ${bare.join('\n  ')}\n`
     + 'Wrap each route element in deferred(...), or give it its own Suspense boundary.');
 });
+
+test('every deferred screen except the design mock is fetched in the background after start', () => {
+  // A busy daemon made tabs look dead: navigation waits for a screen's code.
+  assert.match(app, /SCREEN_LOADERS\.push\(loader\)/);
+  assert.match(app, /lazyNamed\(\(\) => import\('\.\/screens\/HomeMock'\), 'HomeMock', \{ prefetch: false \}\)/);
+  assert.match(app, /useEffect\(\(\) => \(window\.location\.pathname\.includes\('\/notch'\) \? undefined : prefetchScreens\(\)\), \[\]\)/);
+});
