@@ -1,4 +1,5 @@
 import { READ_FILE_PARAMS } from './local-file-read-contract.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { WRITE_FILE_PARAMS } from './local-file-write-contract.js';
 import { spawn } from 'node:child_process';
 import { CLI_CATALOG } from '../integrations/cli-catalog/catalog.js';
@@ -1143,6 +1144,8 @@ interface ShellProcessRuntime {
   platform?: NodeJS.Platform;
   spawnProcess?: typeof spawn;
   stopTree?: typeof stopWindowsProcessTree;
+  /** Test seam: the owner's stop authority; production reads the run context. */
+  cancelSignal?: AbortSignal;
 }
 function runCommand(command: string, cwd: string, timeoutMs: number, runtime: ShellProcessRuntime = {}): Promise<ShellCommandResult> {
   assertCommandAllowed(command);
@@ -1216,6 +1219,35 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
       ));
     }, timeoutMs);
 
+    // The owner's Stop reaches the running command: the host's cancel
+    // authority for this step ends the process group and the call returns
+    // as stopped, so the next turn reads "the owner stopped it", never an
+    // unknown effect to reconcile (live 2026-10-08: a stopped 90 s count was
+    // still alive afterwards and the brain re-ran it to "find out").
+    const cancelSignal = runtime.cancelSignal ?? harnessRunContextStorage.getStore()?.callerCancelSignal;
+    const onOwnerStop = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (windows) {
+        void (runtime.stopTree ?? stopWindowsProcessTree)(child).catch(() => { try { child.kill('SIGKILL'); } catch { /* already exited */ } });
+      } else if (child.pid) {
+        try { process.kill(-child.pid, 'SIGKILL'); }
+        catch { try { child.kill('SIGKILL'); } catch { /* already exited */ } }
+      } else {
+        child.kill('SIGTERM');
+      }
+      child.stdout.destroy(); child.stderr.destroy(); child.unref();
+      reject(new ShellCommandExecutionError(
+        'Stopped at the owner\'s request while this command was running; the host ended the command and its child processes. It did not finish, and nothing is owed unless the owner asks for it again.'
+          + (externalMutation ? ' It may have reached an outside service before it was ended; check that state before repeating it.' : ''),
+        { ...classifyShellExecutionOutcome({ command, externalMutation, stdout, stderr, timedOut: true }), errorKind: 'owner_stopped' },
+      ));
+    };
+    if (cancelSignal?.aborted) onOwnerStop();
+    else cancelSignal?.addEventListener('abort', onOwnerStop, { once: true });
+    const releaseOwnerStop = (): void => { cancelSignal?.removeEventListener('abort', onOwnerStop); };
+
     child.stdout.on('data', (chunk) => {
       stdout = appendCapturedOutput(stdout, String(chunk));
     });
@@ -1223,6 +1255,7 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
       stderr = appendCapturedOutput(stderr, String(chunk));
     });
     child.on('error', (error) => {
+      releaseOwnerStop();
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
@@ -1241,6 +1274,7 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
       ));
     });
     child.on('close', (code) => {
+      releaseOwnerStop();
       if (settled) return;
       settled = true;
       clearTimeout(timeout);

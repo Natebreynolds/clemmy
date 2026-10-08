@@ -2775,8 +2775,39 @@ test('a plain go-ahead to an open question goes to the brain with a settle-and-d
     const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: 'Looks right, go.' }, reply.seq,
       { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true } });
     const steer = enriched.semanticTaskInput ?? '';
-    assert.ok(steer.startsWith('[task-continuation-reply:v1]\n'), steer.slice(0, 120));
-    assert.match(steer, /choose a sensible default and say what you assumed/);
+    assert.ok(steer.startsWith('[task-continuation-go-ahead:v1]\n'), steer.slice(0, 120));
+    assert.match(steer, /choose a sensible default yourself/);
+    assert.match(steer, /do not ask it again and do not argue for it/);
+    assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'none', 'released so the brain can act');
+  } finally {
+    runtime._setOpenQuestionReplyClassifierForTests(null);
+    runtime._setClarificationRevisionProposerForTests(null);
+  }
+});
+
+test('a go-ahead the quick model is unsure of still goes to the brain with the go-ahead directive, never a bare reply the brain can argue with', async () => {
+  // Live 2026-10-06: "Looks right, go." after the facts were supplied was read
+  // as answers 0.96 and the turn ended on "same wording as before, or fresh?".
+  const sessionId = 'continuity-affirms-unsure';
+  const origin = accepted(sessionId, 'Draft a short note to the team and put it in note.md. Ask me anything you need first.');
+  commitClarification({ sessionId, sourceSeq: origin.seq, question: HELD_DRAFT_QUESTION });
+  const reply = accepted(sessionId, 'Looks right, go.');
+  seedSemanticReading(sessionId, reply.seq, 'admitted', AMBIGUOUS_READING);
+  let proposals = 0;
+  runtime._setOpenQuestionReplyClassifierForTests(async () => ({ kind: 'affirms', confidence: 0.4, failedOpen: false }));
+  runtime._setClarificationRevisionProposerForTests(async () => { proposals++; return { status: 'no_revision', reason: 'no_progress' }; });
+  try {
+    const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    assert.equal(route?.route, 'respond');
+    assert.equal(route?.partialAnswer, true);
+    assert.equal(route?.replyReading, 'affirms');
+    assert.equal(proposals, 0, 'a go-ahead never asks the quick model for a residual question');
+    const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: 'Looks right, go.' }, reply.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true } });
+    const steer = enriched.semanticTaskInput ?? '';
+    assert.ok(steer.startsWith('[task-continuation-go-ahead:v1]\n'), steer.slice(0, 120));
+    assert.match(steer, /choose a sensible default yourself/);
+    assert.match(steer, /do not ask it again and do not argue for it/);
     assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'none', 'released so the brain can act');
   } finally {
     runtime._setOpenQuestionReplyClassifierForTests(null);

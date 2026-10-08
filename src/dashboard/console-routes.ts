@@ -3660,7 +3660,10 @@ function tryCommitLiveApprovalControl(input: {
           // action runs it through the turn's expected-work graph, which
           // fails `not_action` on a question turn and strands an attempt
           // (live 2026-10-06, twice). An approve waits for that executor.
-          if (!input.queuedEligible || intent.decision !== 'reject') return null;
+          // A decline is never answered here: the registry branch closes the
+          // row and the brain answers the owner (owner 2026-10-08).
+          if (intent.decision === 'reject') return null;
+          if (!input.queuedEligible) return null;
           const preflight = exactPendingActionApprovalPreflight(row, intent.decision);
           if (preflight.kind !== 'ok') return null;
           return {
@@ -18265,6 +18268,12 @@ export function registerConsoleRoutes(
         // the original still-alive query() picks it up via its poll and continues,
         // delivering its own final reply. Do NOT runConversationFromResume here —
         // there is no RunState to rehydrate (that would fail + clear state).
+        // A decline in words is the harness's to enforce (the row closes, nothing
+        // runs) and Clem's to answer: the turn falls through to the brain with the
+        // fact, never a sentence the route wrote (owner 2026-10-08: "the harness
+        // should never ever speak for Clem"; live: "No, don't run that." got
+        // "Rejected apr-827o — continuing.").
+        let declinedCardFacts: string | undefined;
         if (intent && registryApprovalPending) {
           const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
           const row = addressedApprovalId ? approvalRegistry.get(addressedApprovalId) : null;
@@ -18311,6 +18320,13 @@ export function registerConsoleRoutes(
             });
             return;
           }
+          if (resolved && resolution === 'rejected' && row) {
+            declinedCardFacts = [
+              '[turn-facts:v1]',
+              `The owner just declined the card "${row.subject}" in their own words. The harness closed that card; the action did not run and will not run unless they ask again.`,
+              'Answer as yourself: say plainly what was not done, and offer the natural next step if there is one. Do not run the declined action.',
+            ].join('\n');
+          } else {
           const reply = resolved
             ? `${resolution === 'approved' ? 'Approved' : 'Rejected'} ${addressedApprovalId}${parkedSdkApproval && resolution === 'approved' ? ' — resuming the parked turn.' : ' — continuing.'}`
             : 'That approval was no longer pending. Nothing was approved or rejected.';
@@ -18346,8 +18362,9 @@ export function registerConsoleRoutes(
             });
           }
           return;
+          }
         }
-        if (intent && harnessSession) {
+        if (intent && harnessSession && !declinedCardFacts) {
           await runConversationFromResume({
             buildAgent: (identity) => buildOrchestratorAgentForApprovalResume({
               userInput: effectiveInput,
@@ -18390,6 +18407,7 @@ export function registerConsoleRoutes(
           {
             message: effectiveInput,
             ...taskModeFields(taskMode),
+            ...(declinedCardFacts ? { turnFacts: declinedCardFacts } : {}),
             displayMessage: input,
             sourceUserSeq: requestSourceUserSeq,
             sessionId,

@@ -46,6 +46,8 @@ export type ShellExecutionErrorKind =
   | 'permission_denied'
   | 'package_materialization_failed'
   | 'timeout'
+  /** The owner stopped the turn while the command ran; the host ended it. */
+  | 'owner_stopped'
   | 'nonzero_exit'
   | 'provider_precondition_rejected'
   | 'spawn_failed';

@@ -256,6 +256,17 @@ export function attemptSignalsFromShellExecutionOutcome(
   if (shell.errorKind === 'process_cleanup_unconfirmed' && shell.dispatch === 'not_started' && shell.effect === 'none') {
     return { preDispatch: true, executionFailed: true, mutating: shell.externalMutation };
   }
+  if (shell.errorKind === 'owner_stopped') {
+    // The owner stopped the turn and the host ended the command. A local
+    // command is simply over; an external write that may have begun stays
+    // unacknowledged, never replayed on its own.
+    return {
+      errorName: 'OwnerStoppedError',
+      executionFailed: true,
+      mutating: shell.externalMutation,
+      ...(shell.externalMutation ? { acknowledged: false } : {}),
+    };
+  }
   if (shell.errorKind === 'timeout') {
     if (shell.timeoutCleanup === 'incomplete') {
       // A native cleanup failure is not a transient transport failure. Keep

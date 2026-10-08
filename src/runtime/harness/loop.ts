@@ -14666,11 +14666,15 @@ async function runConversationFromResumeCore(opts: {
   let decision = toOrchestratorDecision(firstResult.finalOutput);
   lastDecision = decision ?? lastDecision;
 
-  // If reject was the decision, treat it as "done — we cancelled
-  // the action" regardless of what the orchestrator says next.
+  // A reject ends the turn cancelled whatever the orchestrator decides next:
+  // the declined action never runs. The sentence the owner reads is the
+  // brain's own answer to their decline (what was not done, what comes next);
+  // the harness's fixed line stands in only when the brain said nothing
+  // (owner 2026-10-08: "the harness was dictating before given to Clem").
   if (opts.decision === 'reject') {
     const artifactState = standardArtifactTerminalState(opts.sessionId, activeSourceUserSeq);
-    const rejectionReply = 'Okay — I rejected that action. Nothing else was approved.';
+    const spokenRejection = (decision?.reply ?? decision?.summary ?? '').trim();
+    const rejectionReply = spokenRejection || 'Okay — I rejected that action. Nothing else was approved.';
     const publicPresentation = commitStandardCancelledTerminal({
       sessionId: opts.sessionId,
       sourceUserSeq: activeSourceUserSeq,

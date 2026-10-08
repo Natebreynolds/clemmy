@@ -310,6 +310,10 @@ export interface TaskContinuationContext {
 }
 
 export interface AssistantRequest {
+  /** Facts the harness knows about this turn that the model should read
+   * (a card the owner just declined, nothing pending). Transient system
+   * context: never the owner's words, never a reply the harness authored. */
+  turnFacts?: string;
   /** Explicit accepted request mode; never inferred from prose. */
   taskMode?: TaskMode;
   /** Advisory capability candidates resolved ONCE for this accepted turn by

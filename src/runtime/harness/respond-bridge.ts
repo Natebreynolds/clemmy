@@ -108,6 +108,7 @@ import {
   type EventRow,
 } from './eventlog.js';
 import { sessionAgentFields, sessionProjectFields } from './session-composition.js';
+import { turnFactsFor } from './turn-facts.js';
 import { projectPendingApprovalUserDependency } from './approval-registry.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkUnparseableToolCall } from './claude-agent-brain.js';
 import { buildContinueInput } from './continue-directive.js';
@@ -1728,6 +1729,12 @@ export async function respondViaHarness(
     )
     ? request.semanticTaskInput
     : undefined;
+  // What the harness knows about this turn rides as transient system context
+  // for the brain: a card the owner just declined, or that nothing at all is
+  // waiting on them. Facts only, never a sentence for the owner (owner
+  // 2026-10-08: "Clem is driving the harness; the harness is the vehicle").
+  const turnFacts = request.turnFacts ?? turnFactsFor(sessionId);
+  const turnSteer = [verifiedMetaContinuationSteer, turnFacts].filter(Boolean).join('\n\n') || undefined;
   if (hostOwnsTurn && !resumesExecutionCheckpoint) {
     const materialSource = inspectDurableMaterialSourceContinuation({
       sessionId,
@@ -2050,9 +2057,7 @@ export async function respondViaHarness(
       sessionId,
       input: request.message,
       ...(request.semanticTaskInput ? { semanticTaskInput: request.semanticTaskInput } : {}),
-      ...(verifiedMetaContinuationSteer
-        ? { continuationSteer: verifiedMetaContinuationSteer }
-        : {}),
+      ...(turnSteer ? { continuationSteer: turnSteer } : {}),
       ...(request.taskContinuation ? { taskContinuation: request.taskContinuation } : {}),
       ...(request.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
       sourceUserSeq: sourceUserEvent.seq,

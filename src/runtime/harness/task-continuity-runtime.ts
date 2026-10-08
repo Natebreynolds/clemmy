@@ -474,9 +474,14 @@ export async function classifyUnsettledOpenQuestionReply(input: {
     // on a residual question. Jev tells a go-ahead from a partial answer; the
     // brain takes the go-ahead: carry on, choose sensible defaults for what is
     // left, say what was assumed, and ask only if something truly blocks.
-    if (reading.kind === 'affirms' && (reading.confidence ?? 0) >= OPEN_QUESTION_ANSWER_SURE) {
+    // Any go-ahead reading, sure or not, is the brain's to take: the quick
+    // model's doubt is recorded, never a reason to hold (live 2026-10-08:
+    // "Why do you need a title from me? Just pick something sensible and go"
+    // read as a go-ahead below the sure line, went to the brain with no
+    // directive, and the brain argued for the question instead of choosing).
+    if (reading.kind === 'affirms') {
       route = 'respond';
-      recordedReading = { ...recordedReading, partialAnswer: true };
+      recordedReading = { ...recordedReading, partialAnswer: true, replyReading: 'affirms' };
     }
   }
   let revision: ProposedClarificationRevision | undefined;
@@ -1771,9 +1776,10 @@ function partialAnswerContinuationInput(input: {
   if (recorded?.route !== 'respond' || !recorded.partialAnswer || recorded.parentPacketId !== current.packet.packetId) return null;
   const edge = clarificationRevisionInputFor(current.packet, input.sourceUserSeq);
   if (!edge) return null;
-  const partial = recorded.replyReading === undefined || recorded.replyReading === 'checked_residual_answer';
+  const affirmed = recorded.replyReading === 'affirms';
+  const partial = !affirmed && (recorded.replyReading === undefined || recorded.replyReading === 'checked_residual_answer');
   const steer = [
-    partial ? '[task-continuation-partial-answer:v1]' : '[task-continuation-reply:v1]',
+    affirmed ? '[task-continuation-go-ahead:v1]' : partial ? '[task-continuation-partial-answer:v1]' : '[task-continuation-reply:v1]',
     '[root-task]',
     edge.rootTask,
     '[current-question]',
@@ -1782,7 +1788,9 @@ function partialAnswerContinuationInput(input: {
     '[user-reply]',
     edge.acceptedReply,
     '[host-directive]',
-    partial
+    affirmed
+      ? 'The user told you to go ahead, or left the choice you asked about to you. That settles the question: do not ask it again and do not argue for it. Carry the work on from the root task under whatever hold the root task itself set (a task that says to plan and not do it yet stays a plan); for anything the reply did not pick, choose a sensible default yourself, do the work, and say in one line what you assumed. Ask again only if something truly blocks the work.'
+      : partial
       ? 'The user answered part of your open question and may have changed something you proposed; an independent check found that not every decision is settled yet. Keep every answer and change they gave exactly as they stated it, including ranges. The pending step stays on hold: do not create, change, write, send, publish or delete anything for it, and do not treat a general "approved" as supplying a missing fact. Acknowledge what they supplied, then ask only for what is still missing, in your own words.'
       : 'The user replied to your open question. No checked reading of how the reply changes the question is available, so read it yourself from the exact text above. If it answers or approves, the question is settled: carry the work on from the root task plus that answer, under whatever hold the root task itself set (a task that says to plan and not do it yet stays a plan); for anything your question left open that the reply did not pick, choose a sensible default and say what you assumed rather than asking again. If it changes what you proposed, apply the change exactly as stated and show the result in the form you were asked for. If it truly does not answer, ask again in your own words. Never say the reply was recorded but could not be verified.',
   ].join('\n');
