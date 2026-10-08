@@ -27,7 +27,7 @@ import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { cn } from '@/lib/cn';
 import { listFocusSnapshot } from '@/lib/focus';
 import { usePoll } from '@/lib/poll';
-import { useSession } from '../hooks/useSession';
+import { isMissingConversation, useSession } from '../hooks/useSession';
 import { sessionHistoryReady } from '../hooks/session-history-readiness';
 import { useSessionMutations } from '../hooks/useSessionMutations';
 import { sessionKeys } from '../hooks/keys';
@@ -237,6 +237,22 @@ export function ConversationThread() {
     );
   }
   if (detail.isError || !detail.data) {
+    if (detail.isError && !isMissingConversation(detail.error)) {
+      // Unreachable or restarting is not missing (a Windows tester, 10-08:
+      // every chat read "could not be found" while the daemon restarted).
+      return (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center text-muted">
+          <p>Can’t reach Clementine right now, so this conversation didn’t load.</p>
+          <button
+            type="button"
+            className="rounded-md border border-border px-3 py-1.5 text-fg hover:bg-bg-subtle"
+            onClick={() => { void detail.refetch(); }}
+          >
+            Try again
+          </button>
+        </div>
+      );
+    }
     // A dead pointer must not keep bouncing the chat index back here.
     if (sessionId && lastChatSession() === sessionId) rememberLastChatSession(null);
     return (
