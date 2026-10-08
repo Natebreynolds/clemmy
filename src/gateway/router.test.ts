@@ -627,7 +627,7 @@ for (const message of ['Continue.', 'keep going!']) {
   });
 }
 
-test('gateway keeps an INFERRED pipeline in the conversation, and backgrounds a named one', async () => {
+test('gateway keeps an inferred pipeline AND a background ask in words in the conversation; only /background routes', async () => {
   const session = createSession({ kind: 'chat', channel: 'mobile', title: 'CRM enrichment' });
   let hostCalled = false;
   const { gateway, legacyCalls } = hostGatewayForTest(async (options) => {
@@ -652,7 +652,7 @@ test('gateway keeps an INFERRED pipeline in the conversation, and backgrounds a 
   // Naming the lane is an instruction, and it is still honoured immediately.
   hostCalled = false;
   const named = await gateway.handleMessage({
-    message: 'Run this in the background: Pull full data from Salesforce via the CLI, then scrape all of it with Apify MCP, then add the results to my Airtable CRM via MCP.',
+    message: '/background Pull full data from Salesforce via the CLI, then scrape all of it with Apify MCP, then add the results to my Airtable CRM via MCP.',
     sessionId: session.id,
     channel: 'mobile',
     source: 'mobile',
@@ -691,7 +691,7 @@ test('gateway keeps simple replies with negated background instructions in foreg
   assert.equal(response.text, 'HOTPATCH_SMOKE_OK');
 });
 
-test('gateway explicit "move this to the background" with task skips foreground execution', async () => {
+test('gateway explicit /background command with task skips foreground execution', async () => {
   const sessionId = 'gateway-explicit-background-origin';
   assert.equal(getSession(sessionId), null, 'precondition: origin session is not already registered');
   let respondCalled = false;
@@ -703,7 +703,7 @@ test('gateway explicit "move this to the background" with task skips foreground 
   } as never);
 
   const response = await gateway.handleMessage({
-    message: 'Live validation only: move this to the background. Read the top-level files and summarize them.',
+    message: '/background Read the top-level files and summarize them.',
     sessionId,
     channel: 'webhook',
     source: 'webhook',
@@ -717,13 +717,13 @@ test('gateway explicit "move this to the background" with task skips foreground 
   assert.equal(task!.originSessionId, sessionId);
   assert.equal(task!.source, 'webhook');
   assert.match(task!.prompt, /^Read the top-level files and summarize them\./);
-  assert.doesNotMatch(task!.prompt, /move this to the background/i);
+  assert.doesNotMatch(task!.prompt, /\/background/i);
 
   const origin = getSession(sessionId);
   assert.equal(origin?.kind, 'chat', 'queued-only background origin is registered as a harness chat session');
   const [originTurn] = listEvents(sessionId, { types: ['user_input_received'], limit: 5, desc: true });
   assert.ok(originTurn);
-  assert.match(String((originTurn?.data as { text?: string } | undefined)?.text ?? ''), /move this to the background/i);
+  assert.match(String((originTurn?.data as { text?: string } | undefined)?.text ?? ''), /\/background/i);
   const terminal = listEvents(sessionId, { types: ['conversation_completed'] })
     .find((event) => event.data.sourceUserSeq === originTurn.seq);
   assert.equal(terminal?.data.reason, 'queued_background');

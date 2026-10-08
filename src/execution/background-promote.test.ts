@@ -54,6 +54,12 @@ test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
+/* Owner 2026-10-08: only an explicit `/background` command routes straight to
+ * the background lane. A request in words ("run this in the background",
+ * "keep working until…") reaches Clem, who starts background work herself
+ * with dispatch_background_task. The durableExecutionDecision reading below is
+ * kept as a reading, never a route. */
+
 test('hasDurableExecutionIntent fires on explicit durable intent — vocabulary alone never routes (E6.1)', () => {
   // Explicit intent → promote.
   assert.equal(hasDurableExecutionIntent('/background build the site'), true);
@@ -83,9 +89,9 @@ test('hasDurableExecutionIntent fires on explicit durable intent — vocabulary 
 test('shouldPromoteToDurable requires intent AND a non-empty instruction', () => {
   // Real durable asks promote.
   assert.equal(shouldPromoteToDurable('/background build the site'), true);
-  assert.equal(shouldPromoteToDurable('move this to the background. Read the workspace files.'), true);
-  assert.equal(shouldPromoteToDurable('Live validation only: move this to the background. Read the top-level files.'), true);
-  assert.equal(shouldPromoteToDurable('keep working until the audit is done'), true);
+  assert.equal(shouldPromoteToDurable('move this to the background. Read the workspace files.'), false);
+  assert.equal(shouldPromoteToDurable('Live validation only: move this to the background. Read the top-level files.'), false);
+  assert.equal(shouldPromoteToDurable('keep working until the audit is done'), false);
   // An INFERRED pipeline no longer auto-dispatches. Shape is Clementine's
   // guess; choosing to run unattended is the user's call. Naming the lane
   // still promotes it immediately (asserted above and below).
@@ -95,7 +101,7 @@ test('shouldPromoteToDurable requires intent AND a non-empty instruction', () =>
   );
   assert.equal(
     shouldPromoteToDurable('Run this in the background: pull all Salesforce leads, enrich them through Apify, then sync into Airtable.'),
-    true,
+    false,
   );
   // A bare command with no task must NOT queue a content-free worker.
   assert.equal(shouldPromoteToDurable('/background'), false);
@@ -146,9 +152,9 @@ test('space sessions promote only on an explicit background directive', () => {
   );
   // The user naming the lane still wins — they own the designation.
   assert.equal(shouldPromoteToDurable('/background rebuild the coaching tab', spaceOpts), true);
-  assert.equal(shouldPromoteToDurable('run this in the background: refresh all the feeds', spaceOpts), true);
+  assert.equal(shouldPromoteToDurable('run this in the background: refresh all the feeds', spaceOpts), false);
   // Non-space sessions are unchanged.
-  assert.equal(shouldPromoteToDurable('keep working until the audit is done', { sessionId: 'sess-abc123' }), true);
+  assert.equal(shouldPromoteToDurable('keep working until the audit is done', { sessionId: 'sess-abc123' }), false);
 });
 
 test('isContinuationDirective spots directives that continue existing work', () => {
@@ -497,7 +503,8 @@ test('an under-specified request asks first at the TYPED seam; a named lane stil
   ]) {
     const decision = durableExecutionDecision(named);
     assert.equal(decision.lane, 'background', `a named lane was not honoured: ${named.slice(0, 40)}`);
-    assert.equal(shouldPromoteToDurable(named), true);
+    // Only the owner's explicit command routes directly; words reach Clem.
+    assert.equal(shouldPromoteToDurable(named), named.startsWith('/background'));
   }
 });
 
@@ -536,25 +543,24 @@ test('an information question never mints a background task (live 2026-08-04 des
 
   // A question mark on an explicitly named lane is still the user naming the
   // lane — a REQUEST, not an information question.
-  assert.equal(shouldPromoteToDurable('can you run this in the background?'), true);
-  assert.equal(shouldPromoteToDurable('could you queue the audit as a job overnight?'), true);
+  assert.equal(shouldPromoteToDurable('can you run this in the background?'), false);
+  assert.equal(shouldPromoteToDurable('could you queue the audit as a job overnight?'), false);
 });
 
 test('"finish this" alone is not durable intent — the guard verb must be a build verb', () => {
   assert.equal(shouldPromoteToDurable('finish this task'), false,
     '"finish" satisfied its own build-verb guard');
   // With a genuine build verb the soft directive still promotes.
-  assert.equal(shouldPromoteToDurable('finish this migration and deploy it end to end'), true);
+  assert.equal(shouldPromoteToDurable('finish this migration and deploy it end to end'), false);
 });
 
 test('a continuation directive steers the ACTIVE run instead of minting a sibling task', () => {
   const sess = createSession({ kind: 'chat' });
   const reminder = 'Okay keep working and get this done, reminder, do not do any accounts that are customer you must remember this.';
 
-  // No active task for the session → the soft "keep working" directive still
-  // promotes exactly as before (the user chose to let it run long).
-  assert.equal(shouldPromoteToDurable(reminder, { sessionId: sess.id }), true,
-    'the pre-existing soft-directive behavior regressed');
+  // Words never route to the background lane, with or without an active run.
+  assert.equal(shouldPromoteToDurable(reminder, { sessionId: sess.id }), false,
+    'words never route to the background lane; Clem reads them');
 
   // Spawn the run the user is talking about; the same reminder must now stay
   // conversational so the ordinary turn can steer the EXISTING task.
@@ -564,6 +570,7 @@ test('a continuation directive steers the ACTIVE run instead of minting a siblin
     'a policy reminder for the active run minted a second background task');
   assert.equal(decision.reason, 'continuation_of_active_run');
 
-  // Explicit lane naming still wins even mid-run.
-  assert.equal(shouldPromoteToDurable('also run the report rebuild in the background', { sessionId: sess.id }), true);
+  // Mid-run, words still reach Clem; only the explicit command routes.
+  assert.equal(shouldPromoteToDurable('also run the report rebuild in the background', { sessionId: sess.id }), false);
+  assert.equal(shouldPromoteToDurable('/background also run the report rebuild', { sessionId: sess.id }), true);
 });

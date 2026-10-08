@@ -298,8 +298,23 @@ export function durableExecutionDecision(
  * Callers treat `true` as "enqueue without asking", so an inferred pipeline
  * must not return true here — that is exactly the fire-and-forget this fixes.
  */
-export function shouldPromoteToDurable(message: string, opts?: { sessionId?: string }): boolean {
-  return durableExecutionDecision(message, opts).lane === 'background';
+/**
+ * Only the owner's explicit `/background` (or `/bg`) command routes a request
+ * straight to the background lane, the way `/new` starts a session: a command
+ * is the owner operating the app. Everything said in words reaches Clem, who
+ * decides and starts background work herself with dispatch_background_task,
+ * which can also hand it to the right specialist (owner 2026-10-08: "Clem is
+ * driving the harness and the harness is just the vehicle"). The word
+ * patterns below no longer route; live, all eight route promotions in the two
+ * weeks before were explicit asks that named a specialist the generic
+ * background chat task could not reach.
+ */
+export function shouldPromoteToDurable(message: string, _opts?: { sessionId?: string }): boolean {
+  return isExplicitBackgroundCommand(message);
+}
+
+export function isExplicitBackgroundCommand(message: string): boolean {
+  return /^\s*\/(?:background|bg)\s+\S/i.test(message);
 }
 
 /** The directive half of `hasDurableExecutionIntent`, without the shape guess. */
