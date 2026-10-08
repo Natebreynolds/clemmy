@@ -709,6 +709,10 @@ async function startInstalledApp(context, firstLaunch) {
     return true;
   }, 'mobile_tls_listener_missing', 180_000));
   mark('mobileListener');
+  if (firstLaunch) {
+    app.consoleScreens = await withLaunchDiagnostics(() => probeConsoleScreens(app));
+    mark('consoleScreens');
+  }
   console.log(`${firstLaunch ? 'first launch' : 'restart'} gate timings (ms from launch): ${JSON.stringify(app.timings)}`);
   const freshDaemon = exactOwnedProcess(await processes(), app.daemon.pid, context.executable, main.pid);
   if (freshDaemon.createdAt !== app.daemon.createdAt) refuse('mobile_tls_daemon_identity_changed');
@@ -728,6 +732,75 @@ async function startInstalledApp(context, firstLaunch) {
     catch { return false; }
   })) refuse('setup_repeated_after_restart');
   return app;
+}
+
+// Every screen past Today is its own lazy chunk plus its own first reads.
+// A tester's installed beta mounted Today and then no other tab would open
+// (2026-10-08); the smoke had never left Today. Each sidebar destination is
+// opened the way a click does it, and what the window shows is recorded:
+// rendered, still a placeholder, a failed chunk, or an error boundary,
+// with every request that failed or never finished, and script errors.
+const CONSOLE_SCREENS = ['/inbox', '/projects', '/workspaces', '/automate', '/heartbeats', '/connect',
+  '/memory', '/meetings', '/goals', '/agents', '/made', '/tasks', '/settings', '/help'];
+
+async function probeConsoleScreens(app) {
+  const page = app.page;
+  const requests = new Map(); const errors = [];
+  const pathOf = (url) => { try { return new URL(url).pathname; } catch { return '(unparsed)'; } };
+  page.on('Network.requestWillBeSent', (p) => requests.set(p.requestId, { path: pathOf(p.request?.url ?? ''), method: p.request?.method, type: p.type, at: Date.now() }));
+  page.on('Network.responseReceived', (p) => { const r = requests.get(p.requestId); if (r) r.status = p.response?.status; });
+  page.on('Network.loadingFinished', (p) => { const r = requests.get(p.requestId); if (r) r.doneAt = Date.now(); });
+  page.on('Network.loadingFailed', (p) => { const r = requests.get(p.requestId); if (r) { r.doneAt = Date.now(); r.failed = String(p.errorText ?? 'failed').slice(0, 120); r.canceled = Boolean(p.canceled); } });
+  page.on('Runtime.exceptionThrown', (p) => { if (errors.length < 30) errors.push(redactLogText(String(p.exceptionDetails?.exception?.description ?? p.exceptionDetails?.text ?? 'exception')).slice(0, 400)); });
+  page.on('Runtime.consoleAPICalled', (p) => {
+    if (p.type === 'error' && errors.length < 30) errors.push(redactLogText((p.args ?? []).map((a) => a.value ?? a.description ?? '').join(' ')).slice(0, 400));
+  });
+  await page.send('Network.enable');
+  const screens = [];
+  for (const route of CONSOLE_SCREENS) {
+    const target = `/console${route}`;
+    // Navigation keeps the previous screen up until the next one's code has
+    // arrived, so a tab counts as open only once #main shows something else.
+    const previous = await page.evaluate(`(document.getElementById('main')?.innerText || '').trim().slice(0, 400)`);
+    const started = Date.now(); const firstRequest = requests.size;
+    await page.evaluate(`(() => {
+      const link = document.querySelector('a[href=${JSON.stringify(target)}]');
+      if (link) { link.click(); return 'click'; }
+      history.pushState({}, '', ${JSON.stringify(target)}); dispatchEvent(new PopStateEvent('popstate')); return 'history';
+    })()`);
+    const probe = `(() => {
+      const main = document.getElementById('main'); const text = (main?.innerText || '').trim();
+      if (location.pathname !== ${JSON.stringify(target)}) return { state: 'not_navigated', at: location.pathname };
+      if (!main) return { state: 'no_main' };
+      if (/This screen failed to load/.test(text)) return { state: 'chunk_failed', text: text.slice(0, 200) };
+      if (/This view hit a snag/.test(text)) return { state: 'error_boundary', text: text.slice(0, 300) };
+      const skeleton = main.querySelector('[role="status"]');
+      if (skeleton && /^Loading$/.test((skeleton.textContent || '').trim()) && text.length < 40) return { state: 'placeholder' };
+      if (text.slice(0, 400) === ${JSON.stringify(previous)}) return { state: 'previous_screen_still_shown' };
+      if (text.length < 40) return { state: 'empty', text: text.slice(0, 120) };
+      return { state: 'rendered', chars: text.length, text: text.slice(0, 160) };
+    })()`;
+    let outcome = { state: 'unknown' }; let renderedMs = null;
+    while (Date.now() - started < 45_000) {
+      outcome = await page.evaluate(probe);
+      if (outcome.state === 'rendered') { renderedMs = Date.now() - started; break; }
+      await pause(500);
+    }
+    // Let the screen's first reads finish, then record any that did not.
+    const settleUntil = Date.now() + 6_000;
+    while (Date.now() < settleUntil) {
+      if (![...requests.values()].slice(firstRequest).some((r) => !r.doneAt)) break;
+      await pause(500);
+    }
+    const mine = [...requests.values()].slice(firstRequest);
+    screens.push({ route, renderedMs, ...outcome, requests: mine.length,
+      pending: mine.filter((r) => !r.doneAt).map((r) => ({ path: r.path, method: r.method, type: r.type, ageMs: Date.now() - r.at })),
+      failed: mine.filter((r) => r.failed && !r.canceled).map((r) => ({ path: r.path, type: r.type, error: r.failed })),
+      httpErrors: mine.filter((r) => (r.status ?? 0) >= 400).map((r) => ({ path: r.path, status: r.status })),
+      slow: mine.filter((r) => r.doneAt && r.doneAt - r.at > 3_000).map((r) => ({ path: r.path, ms: r.doneAt - r.at })) });
+    console.log(`screen ${route}: ${outcome.state}${renderedMs === null ? '' : ` in ${renderedMs} ms`}; requests ${mine.length}, pending ${screens.at(-1).pending.length}, failed ${screens.at(-1).failed.length}, http errors ${screens.at(-1).httpErrors.length}`);
+  }
+  return { screens, scriptErrors: errors };
 }
 
 async function quitInstalledApp(app) {
@@ -1020,7 +1093,15 @@ export async function main(args = process.argv.slice(2)) {
     receipt.installed = installed;
     phase('first_launch_real_setup');
     const first = await startInstalledApp(context, true);
-    receipt.firstLaunch = { served: first.served, setupSkippedByUI: true, reactMounted: true, assets: first.assetHashes, mobileTls: first.mobileTls, timingsMs: first.timings };
+    receipt.firstLaunch = { served: first.served, setupSkippedByUI: true, reactMounted: true, assets: first.assetHashes, mobileTls: first.mobileTls, timingsMs: first.timings,
+      consoleScreens: first.consoleScreens };
+    // A tab that never opens fails; reads still pending after the screen
+    // opened are recorded, not judged (Spaces previews legitimately take longer).
+    const unopened = first.consoleScreens.screens.filter((screen) => screen.state !== 'rendered');
+    if (unopened.length > 0) {
+      receipt.launchDiagnostics = await collectLaunchDiagnostics(first, new SmokeError('console_screens_not_rendered'));
+      refuse('console_screens_not_rendered');
+    }
     phase('first_graceful_quit'); await quitInstalledApp(first);
     const fixture = { sessionId: `windows-installed-smoke-${randomUUID()}`, bundleId: `windows-smoke-${randomUUID()}`,
       marker: `Controlled CI-only Windows restart fixture ${randomUUID()}`, mobileFingerprint: first.mobileTls.fingerprint };
