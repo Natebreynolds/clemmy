@@ -252,14 +252,21 @@ function createOwnedChildRunner(controls = {}) {
       };
       // Never forward child logs: they may contain local credential URLs.
       child.stdout.on('data', chunk => { bytes += chunk.length; if (bytes < 8_000_000) output.push(chunk); });
-      child.stderr.on('data', () => {});
+      // Only a bounded tail of stderr is kept, for the diagnostics upload
+      // after redaction (run 37710195197: the installed storage probe
+      // exited non-zero in 3 s with nothing to read).
+      let errorTail = Buffer.alloc(0);
+      child.stderr.on('data', chunk => { errorTail = Buffer.concat([errorTail, chunk]); if (errorTail.length > 16_000) errorTail = errorTail.subarray(errorTail.length - 16_000); });
       child.once('exit', () => { exited = true; });
       child.on('error', () => stop('owned_child_start_failed'));
       child.once('close', code => {
         if (settled || stopping) return;
         settled = true; clearTimeout(timer);
-        if (code !== 0 || bytes >= 8_000_000) reject(new SmokeError('owned_child_failed'));
-        else resolve(Buffer.concat(output).toString('utf8'));
+        if (code !== 0 || bytes >= 8_000_000) {
+          const error = new SmokeError('owned_child_failed');
+          error.ownedChild = { exitCode: code, stderrTail: errorTail.toString('utf8') };
+          reject(error);
+        } else resolve(Buffer.concat(output).toString('utf8'));
       });
       timer = setTimeout(() => stop('owned_child_timeout'), timeoutMs);
     });
@@ -1036,6 +1043,15 @@ export async function main(args = process.argv.slice(2)) {
       receipt.ownedChildCleanup = { result: error.childCleanup, qualifiesGracefulOrInstallerSuccess: false };
     }
     if (context?.launchDiagnostics) receipt.launchDiagnostics = context.launchDiagnostics;
+    if (error instanceof SmokeError && error.ownedChild && context) {
+      // The probe's own words, redacted and bounded, beside the receipt.
+      receipt.ownedChild = { exitCode: error.ownedChild.exitCode, stderrBytes: error.ownedChild.stderrTail.length };
+      try {
+        const directory = path.join(context.diagnosticsDir, 'owned-child');
+        mkdirSync(directory, { recursive: true });
+        writeFileSync(path.join(directory, 'stderr-tail.txt'), redactLogText(error.ownedChild.stderrTail));
+      } catch { /* the failure stands without its tail */ }
+    }
     if (context) receipt.failureCleanup = await cleanupFailedCIApp(context);
     receipt.finishedAt = new Date().toISOString(); record();
     throw new SmokeError(receipt.failureCode);
