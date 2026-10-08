@@ -15,6 +15,11 @@ on:
         required: true
         default: '3.18.29-windows.1'
         type: string
+      release_tag:
+        description: "Optional: qualify a published release's own Windows build. Dispatch with --ref <tag>; candidate_version must then be the tag's version, equal to package.json."
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -30,6 +35,7 @@ jobs:
     timeout-minutes: 45
     env:
       CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
       SOURCE_COMMIT: ${{ github.sha }}
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       CSC_LINK: ''
@@ -61,8 +67,16 @@ jobs:
           $actual = git rev-parse HEAD
           if ($actual -ne $env:SOURCE_COMMIT) { throw 'Checkout differs from selected source commit.' }
           $current = node -p "require('./package.json').version"
-          node scripts/release-candidate-version.mjs validate "$env:CANDIDATE_VERSION" "$current"
-          if ($LASTEXITCODE -ne 0) { throw 'Unpublished candidate version is invalid or not newer.' }
+          if ($env:RELEASE_TAG) {
+            # A published release's own Windows build (unsigned until a signing
+            # certificate exists): only the exact tag commit, at the tag's version.
+            # Nothing here publishes; the qualified files are attached afterwards.
+            if ($env:GITHUB_REF -ne "refs/tags/$env:RELEASE_TAG") { throw 'A release build must be dispatched on its tag.' }
+            if ("v$env:CANDIDATE_VERSION" -ne $env:RELEASE_TAG -or $env:CANDIDATE_VERSION -ne $current) { throw 'A release build uses the tag version, which must equal package.json.' }
+          } else {
+            node scripts/release-candidate-version.mjs validate "$env:CANDIDATE_VERSION" "$current"
+            if ($LASTEXITCODE -ne 0) { throw 'Unpublished candidate version is invalid or not newer.' }
+          }
           if ([Environment]::Is64BitProcess -ne $true) { throw 'Windows x64 build process required.' }
 
       - name: Install daemon dependencies including Windows SDK assets

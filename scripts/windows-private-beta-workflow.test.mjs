@@ -88,6 +88,12 @@ test('candidate artifact is withheld until the actual Windows installer/native/c
   assert.equal(steps.find(step => step.name === 'Upload qualification diagnostics').if, 'always()');
   assert.match(steps.find(step => step.name === 'Validate exact source and unpublished candidate version').run,
     /release-candidate-version\.mjs validate/);
+  // A release tag build is the same qualification at the tag's exact version,
+  // dispatched on the tag; it still publishes nothing itself.
+  const validate = steps.find(step => step.name === 'Validate exact source and unpublished candidate version').run;
+  assert.match(validate, /GITHUB_REF -ne "refs\/tags\/\$env:RELEASE_TAG"/);
+  assert.match(validate, /CANDIDATE_VERSION -ne \$current/);
+  assert.equal(job.env.RELEASE_TAG, '${{ inputs.release_tag }}');
   assert.match(steps.find(step => step.name === 'Offline Windows and package qualification tests').run,
     /run-tests-isolated\.mjs/);
 });
