@@ -17445,14 +17445,14 @@ export function registerConsoleRoutes(
       ? (intent.approvalId
           // An explicit id is the user naming the exact card — honor it even
           // when the task was spawned elsewhere (Discord already does).
-          ? (() => {
-              const byOrigin = originTaskApprovals.find((task) => task.pendingApprovalId === intent.approvalId);
+          ? ((namedApprovalId: string) => {
+              const byOrigin = originTaskApprovals.find((task) => task.pendingApprovalId === namedApprovalId);
               if (byOrigin) return byOrigin;
-              const anywhere = getBackgroundTaskByApprovalId(intent.approvalId);
-              return anywhere?.status === 'awaiting_approval' && anywhere.pendingApprovalId === intent.approvalId
+              const anywhere = getBackgroundTaskByApprovalId(namedApprovalId);
+              return anywhere?.status === 'awaiting_approval' && anywhere.pendingApprovalId === namedApprovalId
                 ? anywhere
                 : null;
-            })()
+            })(intent.approvalId)
           : (!isPausedOnApproval && !registryApprovalPending && originTaskApprovals.length === 1
               ? originTaskApprovals[0]
               : null))
@@ -17997,29 +17997,31 @@ export function registerConsoleRoutes(
         // the session-scoped selection below (whose registry cannot see a task
         // session's card and would answer "no longer pending"). Live
         // 2026-08-04 (desktop): six approvals typed, zero applied.
+        // A decision the harness enforces (the row resolves, the task resumes or
+        // skips) is Clem's to answer: the turn reaches the brain with the fact,
+        // never a sentence the route wrote (owner 2026-10-08: "the harness
+        // should never ever speak for Clem"; live: "No, don't run that." got
+        // "Rejected apr-827o — continuing.").
+        let routeTurnFacts: string | undefined;
         if (addressedTaskApproval?.pendingApprovalId && intent) {
           const approved = intent.decision === 'approve';
           const queued = queueBackgroundTaskApprovalResolution(addressedTaskApproval.pendingApprovalId, approved);
-          // Lead with what the user recognizes — the task by name. The card id
-          // is plumbing; people who never learned it must not need it.
-          const text = queued
-            ? (approved
-                ? `Approved — "${queued.title}" is back underway and will report back here when it's done.`
-                : `Got it — "${queued.title}" will skip that action and report back with where things stand.`)
-            : `That one was already resolved — nothing further was needed.`;
-          commitConsoleTerminal({
-            identity: requestTurnIdentity,
-            text,
-            status: 'done',
-            legacyReason: 'task_approval_settled',
-            metadata: { steps: 0, approvalId: addressedTaskApproval.pendingApprovalId, taskId: addressedTaskApproval.id },
-          });
-          return;
+          routeTurnFacts = [
+            '[turn-facts:v1]',
+            queued
+              ? (approved
+                  ? `The owner just approved the paused background task "${queued.title}". The harness resumed it; it will report back in this chat when it is done.`
+                  : `The owner just declined the action the background task "${queued.title}" was waiting on. The harness told it to skip that action; it will report back with where things stand.`)
+              : 'The owner answered a background task\'s card that was already resolved; nothing further was needed and nothing changed.',
+            'Answer as yourself in a line or two. Do not start that work here; it runs on its own.',
+          ].join('\n');
+          intent = null;
         }
         if (bareTaskApprovalAmbiguous && intent) {
+          const decision = intent.decision;
           const choices = originTaskApprovals
             .slice(0, 12)
-            .map((task) => `${intent.decision} ${task.pendingApprovalId} — ${task.title}`);
+            .map((task) => `${decision} ${task.pendingApprovalId} — ${task.title}`);
           commitConsoleTerminal({
             identity: requestTurnIdentity,
             text: [
@@ -18042,14 +18044,12 @@ export function registerConsoleRoutes(
           && !isPausedOnApproval
           && !registryApprovalPending
         ) {
-          commitConsoleTerminal({
-            identity: requestTurnIdentity,
-            text: `I couldn't find anything still waiting on ${intent.approvalId} — it may already be resolved or expired. Nothing was approved or rejected. If work seems stuck, ask "status" and I'll check.`,
-            status: 'needs_input',
-            legacyReason: 'task_approval_not_found',
-            metadata: { steps: 0 },
-          });
-          return;
+          routeTurnFacts = [
+            '[turn-facts:v1]',
+            'The owner answered a card that is no longer waiting (already resolved or expired). Nothing was approved or rejected.',
+            'Answer as yourself: say that plainly, and offer to show what is still running if that helps. Do not name card ids.',
+          ].join('\n');
+          intent = null;
         }
         let addressedApprovalId = intent?.approvalId;
         if (intent) {
@@ -18057,9 +18057,10 @@ export function registerConsoleRoutes(
             .filter((row) => approvalRegistry.isActionable(row))
             .filter(approvalRegistry.isFormalApprovalSurface);
           const selection = selectAddressedApproval(actionable, intent.approvalId);
+          const decision = intent.decision;
           const choiceLines = actionable
             .slice(0, 12)
-            .map((row) => `${intent.decision} ${row.approvalId} — ${row.subject}`);
+            .map((row) => `${decision} ${row.approvalId} — ${row.subject}`);
           if (selection.kind === 'ambiguous') {
             const question = [
               `You have ${selection.rows.length} pending approvals. Choose the exact card; I did not approve or reject any of them.`,
@@ -18107,16 +18108,14 @@ export function registerConsoleRoutes(
                 legacyReason: 'awaiting_user_input',
                 metadata: { steps: 0 },
               });
-            } else {
-              commitConsoleTerminal({
-                identity: requestTurnIdentity,
-                text: reply,
-                status: 'done',
-                legacyReason: 'approval_not_pending',
-                metadata: { steps: 0 },
-              });
+              return;
             }
-            return;
+            routeTurnFacts = [
+              '[turn-facts:v1]',
+              'The owner answered a card that is no longer waiting. Nothing was approved or rejected, and nothing else is waiting on them.',
+              'Answer as yourself: say that plainly in a line. Do not name card ids.',
+            ].join('\n');
+            intent = null;
           }
           if (selection.kind === 'selected') {
             if (!acceptedApprovalId || selection.row.approvalId !== acceptedApprovalId) {
@@ -18268,12 +18267,6 @@ export function registerConsoleRoutes(
         // the original still-alive query() picks it up via its poll and continues,
         // delivering its own final reply. Do NOT runConversationFromResume here —
         // there is no RunState to rehydrate (that would fail + clear state).
-        // A decline in words is the harness's to enforce (the row closes, nothing
-        // runs) and Clem's to answer: the turn falls through to the brain with the
-        // fact, never a sentence the route wrote (owner 2026-10-08: "the harness
-        // should never ever speak for Clem"; live: "No, don't run that." got
-        // "Rejected apr-827o — continuing.").
-        let declinedCardFacts: string | undefined;
         if (intent && registryApprovalPending) {
           const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
           const row = addressedApprovalId ? approvalRegistry.get(addressedApprovalId) : null;
@@ -18321,7 +18314,7 @@ export function registerConsoleRoutes(
             return;
           }
           if (resolved && resolution === 'rejected' && row) {
-            declinedCardFacts = [
+            routeTurnFacts = [
               '[turn-facts:v1]',
               `The owner just declined the card "${row.subject}" in their own words. The harness closed that card; the action did not run and will not run unless they ask again.`,
               'Answer as yourself: say plainly what was not done, and offer the natural next step if there is one. Do not run the declined action.',
@@ -18364,7 +18357,7 @@ export function registerConsoleRoutes(
           return;
           }
         }
-        if (intent && harnessSession && !declinedCardFacts) {
+        if (intent && harnessSession && !routeTurnFacts) {
           await runConversationFromResume({
             buildAgent: (identity) => buildOrchestratorAgentForApprovalResume({
               userInput: effectiveInput,
@@ -18407,7 +18400,7 @@ export function registerConsoleRoutes(
           {
             message: effectiveInput,
             ...taskModeFields(taskMode),
-            ...(declinedCardFacts ? { turnFacts: declinedCardFacts } : {}),
+            ...(routeTurnFacts ? { turnFacts: routeTurnFacts } : {}),
             displayMessage: input,
             sourceUserSeq: requestSourceUserSeq,
             sessionId,
