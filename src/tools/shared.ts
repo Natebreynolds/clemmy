@@ -559,9 +559,39 @@ const DEFAULT_WORKSPACE_CANDIDATES = [
   'Dev',
   'github',
   'GitHub',
+  // GitHub Desktop's default clone folder (macOS and Windows) and Visual
+  // Studio's default on Windows.
+  path.join('Documents', 'GitHub'),
+  path.join('source', 'repos'),
 ];
 
-const PROJECT_MARKERS = ['.git', 'package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod', 'Makefile', 'CMakeLists.txt'];
+/** Windows moves Desktop and Documents into OneDrive when folder backup is
+ *  on; the profile's own Desktop and Documents are then near-empty shells. */
+function oneDriveRoots(): string[] {
+  if (process.platform !== 'win32') return [];
+  const roots = ['OneDrive', 'OneDriveConsumer', 'OneDriveCommercial']
+    .map((key) => process.env[key]?.trim())
+    .filter((value): value is string => Boolean(value && path.isAbsolute(value)));
+  return [...new Set(roots.map((root) => path.resolve(root)))];
+}
+
+/** The folders a home with no chosen workspace list works in by default. */
+function defaultWorkspaceLocations(): string[] {
+  const home = os.homedir();
+  return [
+    ...DEFAULT_WORKSPACE_CANDIDATES.map((candidate) => path.join(home, candidate)),
+    ...oneDriveRoots().flatMap((root) => ['Desktop', 'Documents', path.join('Documents', 'GitHub')].map((candidate) => path.join(root, candidate))),
+  ];
+}
+
+function isWithin(target: string, root: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+// A folder someone works in with an agent says so in its instructions file
+// even when it holds no code manifest (a proposal or research folder).
+const PROJECT_MARKERS = ['.git', 'package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod', 'Makefile', 'CMakeLists.txt', 'AGENTS.md', 'CLAUDE.md'];
 
 export function readBaseEnv(): Record<string, string> {
   const envPath = path.join(BASE_DIR, '.env');
@@ -679,11 +709,25 @@ export function getWorkspaceDirs(): string[] {
     return dirs;
   }
 
-  for (const candidate of DEFAULT_WORKSPACE_CANDIDATES) {
-    add(path.join(os.homedir(), candidate));
-  }
+  for (const location of defaultWorkspaceLocations()) add(location);
 
   return dirs;
+}
+
+/**
+ * Adds one folder to the folders Clementine may work in. With no list chosen
+ * yet, the folders in use are the defaults: they are kept, never replaced by
+ * the one folder added (adding a folder used to drop Desktop and Documents).
+ */
+export function addWorkspaceDir(dir: string): string[] {
+  const absolute = path.resolve(dir);
+  if (absolute.includes(',')) throw new Error('A folder whose path contains a comma cannot be added to the workspace list.');
+  const configured = (readBaseEnv().WORKSPACE_DIRS ?? '').split(',').filter((entry) => entry.length > 0);
+  const base = configured.length > 0 ? configured : getWorkspaceDirs();
+  if (base.some((entry) => path.resolve(entry.trim() || entry) === absolute)) return base;
+  const next = [...base, absolute];
+  updateEnvKey('WORKSPACE_DIRS', next.join(','));
+  return next;
 }
 
 function detectProjectType(entries: string[]): string {
@@ -706,6 +750,9 @@ function detectProjectType(entries: string[]): string {
  * not just literal CloudStorage paths.
  */
 function isCloudStoragePath(dirPath: string): boolean {
+  // Windows OneDrive files can be cloud-only placeholders: reading one
+  // downloads it synchronously. Listing a folder does not.
+  if (oneDriveRoots().some((root) => isWithin(dirPath, root))) return true;
   const literal = /\/Library\/CloudStorage\//.test(dirPath) || /\/Library\/Mobile Documents\//.test(dirPath);
   if (literal) return true;
   try {
@@ -806,8 +853,30 @@ function extractDescription(dirPath: string, entries: string[]): string {
 const PROJECT_LIST_CACHE_TTL_MS = 60_000;
 let projectListCache: { at: number; projects: WorkspaceProject[] } | null = null;
 
+let discoverableCache: { at: number; projects: WorkspaceProject[] } | null = null;
+
 export function clearWorkspaceProjectCache(): void {
   projectListCache = null;
+  discoverableCache = null;
+}
+
+/** The project a folder is, when it carries a project marker; null otherwise. */
+function projectAt(candidate: string): WorkspaceProject | null {
+  try {
+    if (!statSync(candidate).isDirectory()) return null;
+    const subEntries = readdirSync(candidate);
+    if (!PROJECT_MARKERS.some((marker) => subEntries.includes(marker))) return null;
+    return {
+      name: path.basename(candidate),
+      path: path.resolve(candidate),
+      type: detectProjectType(subEntries),
+      description: extractDescription(candidate, subEntries),
+      hasClaude: existsSync(path.join(candidate, '.claude', 'CLAUDE.md')),
+      capabilities: detectCapabilities(candidate, subEntries),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function listWorkspaceProjects(filter?: string): WorkspaceProject[] {
@@ -830,29 +899,12 @@ export function listWorkspaceProjects(filter?: string): WorkspaceProject[] {
 
     const candidates = [workspaceDir, ...entries.map((entry) => path.join(workspaceDir, entry))];
     for (const candidate of candidates) {
-      try {
-        if (!statSync(candidate).isDirectory()) continue;
-        const resolved = path.resolve(candidate);
-        if (seen.has(resolved)) continue;
-
-        const subEntries = readdirSync(candidate);
-        const isProject = PROJECT_MARKERS.some((marker) => subEntries.includes(marker));
-        if (!isProject) continue;
-
-        const name = path.basename(candidate);
-
-        seen.add(resolved);
-        projects.push({
-          name,
-          path: resolved,
-          type: detectProjectType(subEntries),
-          description: extractDescription(candidate, subEntries),
-          hasClaude: existsSync(path.join(candidate, '.claude', 'CLAUDE.md')),
-          capabilities: detectCapabilities(candidate, subEntries),
-        });
-      } catch {
-        continue;
-      }
+      const resolved = path.resolve(candidate);
+      if (seen.has(resolved)) continue;
+      const project = projectAt(candidate);
+      if (!project) continue;
+      seen.add(resolved);
+      projects.push(project);
     }
   }
 
@@ -867,6 +919,49 @@ export function listWorkspaceProjects(filter?: string): WorkspaceProject[] {
 /** Force the projects cache to refresh on next call. */
 export function invalidateWorkspaceProjectsCache(): void {
   projectListCache = null;
+  discoverableCache = null;
+}
+
+// Folders in a home that never hold a project someone keeps there: system,
+// media and per-app folders (Windows profile junctions included).
+const NOT_PROJECT_HOME_FOLDERS = new Set([
+  'appdata', 'application data', 'applications', 'library', 'pictures', 'music', 'movies', 'videos', 'public',
+  'saved games', 'searches', 'links', 'contacts', 'favorites', '3d objects', 'cookies', 'local settings',
+  'my documents', 'nethood', 'printhood', 'recent', 'sendto', 'start menu', 'templates', 'node_modules',
+]);
+const MOST_DISCOVERY_ENTRIES = 500;
+const MOST_DISCOVERED_PROJECTS = 100;
+
+/**
+ * Project folders kept where people usually keep them (directly in the home
+ * folder, and in the usual places like Documents\GitHub, source\repos and
+ * OneDrive) that are NOT yet among the folders Clementine may work in. They
+ * are offered for linking; linking one adds that one folder. One level deep,
+ * marker-checked, cloud-only files never read, cached like the roster.
+ */
+export function listDiscoverableProjects(): WorkspaceProject[] {
+  if (discoverableCache && Date.now() - discoverableCache.at < PROJECT_LIST_CACHE_TTL_MS) return discoverableCache.projects;
+  const granted = getWorkspaceDirs();
+  const containers = [os.homedir(), ...defaultWorkspaceLocations()];
+  const projects: WorkspaceProject[] = [];
+  const seen = new Set<string>();
+  for (const container of containers) {
+    let entries: string[];
+    try { entries = readdirSync(container); } catch { continue; }
+    for (const entry of entries.slice(0, MOST_DISCOVERY_ENTRIES)) {
+      if (projects.length >= MOST_DISCOVERED_PROJECTS) break;
+      if (entry.startsWith('.') || entry.startsWith('$') || NOT_PROJECT_HOME_FOLDERS.has(entry.toLowerCase())
+        || /^onedrive\b/i.test(entry) || entry.includes(',')) continue;
+      const candidate = path.resolve(container, entry);
+      if (seen.has(candidate) || granted.some((dir) => isWithin(candidate, dir))) continue;
+      seen.add(candidate);
+      const project = projectAt(candidate);
+      if (project) projects.push(project);
+    }
+  }
+  const sorted = projects.sort((left, right) => left.name.localeCompare(right.name));
+  discoverableCache = { at: Date.now(), projects: sorted };
+  return sorted;
 }
 
 export interface TeamAgentRecord {

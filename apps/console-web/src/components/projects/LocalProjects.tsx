@@ -180,7 +180,7 @@ export function LinkLocalProject({ projectId, resources, onSaved, onClose }: {
     return (
       <div>
         <div role="status" className="mb-4 space-y-2">
-          <p className="text-small text-muted">Looking through the code folders on this Mac. The first time can take a few seconds.</p>
+          <p className="text-small text-muted">Looking for project folders on this computer. The first time can take a few seconds.</p>
           <Skeleton className="h-12 w-full" />
           <Skeleton className="h-12 w-full" />
         </div>
@@ -192,7 +192,7 @@ export function LinkLocalProject({ projectId, resources, onSaved, onClose }: {
     return (
       <div>
         <p role="alert" className="mb-4 text-small text-danger">
-          The code folders on this Mac could not be read.{' '}
+          The code folders on this computer could not be read.{' '}
           <button type="button" className="font-semibold text-primary hover:underline cursor-pointer" onClick={() => { void roster.refetch(); }}>Try again</button>
         </p>
         {footer(false)}
@@ -203,7 +203,7 @@ export function LinkLocalProject({ projectId, resources, onSaved, onClose }: {
     return (
       <div>
         <p className="mb-4 text-small text-muted">
-          No code folders are set up on this Mac yet.{' '}
+          No project folders were found on this computer yet.{' '}
           <Link to="/connect" className="font-semibold text-primary hover:underline">Add one in Connect</Link>, then link it here.
         </p>
         {footer(false)}
@@ -216,7 +216,7 @@ export function LinkLocalProject({ projectId, resources, onSaved, onClose }: {
       <fieldset className="mb-4" disabled={busy}>
         <legend className="mb-1 text-label text-fg">Link a local project</legend>
         <p className="mb-2 text-caption text-muted">
-          The code folders on this Mac. Linking one says where this project’s work happens; it changes nothing in the folder.
+          Project folders on this computer. Linking one says where this project’s work happens; it changes nothing in the folder.
         </p>
         <div className="max-h-72 space-y-1 overflow-y-auto pr-1">
           {choices.map(({ localProject, linked }) => (
@@ -245,6 +245,7 @@ export function LinkLocalProject({ projectId, resources, onSaved, onClose }: {
                   {localProject.type && <span className="text-caption text-faint">{localProject.type}</span>}
                   {linked && <span className="text-caption font-semibold text-success">Already linked</span>}
                   {!linked && !localProject.git && <span className="text-caption text-faint">not a git repository</span>}
+                  {!linked && localProject.found && <span className="text-caption text-faint">found on this computer · linking adds it to your code folders</span>}
                 </span>
                 <span className="block truncate font-mono text-caption text-faint" title={localProject.path}>
                   {middleTruncatePath(localProject.path, 60)}
@@ -255,7 +256,7 @@ export function LinkLocalProject({ projectId, resources, onSaved, onClose }: {
         </div>
         {open.length === 0 && (
           <p className="mt-2 text-small text-muted">
-            Every code folder on this Mac is already linked. <Link to="/connect" className="font-semibold text-primary hover:underline">Add another in Connect</Link>.
+            Every project folder on this computer is already linked. <Link to="/connect" className="font-semibold text-primary hover:underline">Add another in Connect</Link>.
           </p>
         )}
       </fieldset>

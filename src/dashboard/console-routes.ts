@@ -104,7 +104,7 @@ import {
   type ActivityEntry,
 } from './activity-projection.js';
 import { settleFocusActionsForTerminals } from './activity-settlement.js';
-import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, removeEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { addWorkspaceDir, CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, removeEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import {
   listWorkflows,
   readWorkflow,
@@ -7976,8 +7976,11 @@ export function registerConsoleRoutes(
       res.json({ ok: true, alreadyLinked: true, workspaceDirs: existing });
       return;
     }
-    const next = [...existing, absolute];
-    writeWorkspaceDirs(next);
+    // With no list chosen yet the defaults are in use; adding one folder
+    // keeps them instead of replacing them with that folder alone.
+    let next: string[];
+    try { next = addWorkspaceDir(absolute); }
+    catch (err) { res.status(400).json({ error: err instanceof Error ? err.message : String(err) }); return; }
     res.json({ ok: true, workspaceDirs: next });
   });
 

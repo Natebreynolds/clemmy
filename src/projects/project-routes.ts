@@ -27,7 +27,7 @@ import {
   agentWork, delegatedTaskById, delegatedTasksForSession, projectLabelsForSessions, projectOverview, projectSummaries,
 } from './project-views.js';
 import { setSessionProject } from './session-project.js';
-import { chooseLocalProject, localProjects } from './local-projects.js';
+import { admitLocalProject, chooseLocalProject, foundLocalProjects, localProjects } from './local-projects.js';
 import { localPageContentPolicy, pageImageIsBlank, pageMadeBySession, pageOfProject, pagesMadeInProject, readPageDocument } from './local-pages.js';
 import { readSessionFile, sessionFileImageType } from './session-files.js';
 import { moveFact } from './memory-scope-views.js';
@@ -155,9 +155,11 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
     res.json({ apps: await connectedApps() });
   });
 
-  // The local projects on this machine, for linking one to a project.
+  // The local projects on this machine, for linking one to a project, and
+  // the project folders found where people keep them that are not work
+  // folders yet (linking one of those adds it).
   add('get', `${mount.projects}-local-projects`, (_req, res) => {
-    res.json({ localProjects: localProjects() });
+    res.json({ localProjects: localProjects(), foundProjects: foundLocalProjects() });
   });
 
   // The pages work in the project wrote into its linked local projects.
@@ -330,10 +332,13 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
         });
         return;
       }
+      let project;
+      try { project = admitLocalProject(choice.project); }
+      catch (error) { refuse(res, 'local_project_not_added', { detail: error instanceof Error ? error.message : String(error) }); return; }
       const saved = saveResource(projectId, {
-        kind: 'folder', ref: choice.project.path, label: choice.project.name,
+        kind: 'folder', ref: project.path, label: project.name,
         verifiedAt: new Date().toISOString(),
-        verification: { against: 'local_projects', type: choice.project.type, git: choice.project.git },
+        verification: { against: 'local_projects', type: project.type, git: project.git },
       });
       if (!saved.ok) { refuse(res, saved.reason); return; }
       res.json({ overview: projectOverview(projectId) });

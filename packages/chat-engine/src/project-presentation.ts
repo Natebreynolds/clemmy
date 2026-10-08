@@ -64,6 +64,8 @@ export interface ProjectLocalProject {
   description: string;
   /** Whether it is a repository, which coding work needs. */
   git: boolean;
+  /** Found on this computer, not yet among the code folders; linking adds it. */
+  found?: boolean;
 }
 
 /** A local project as a project's resource shows it: what the folder is now. */
@@ -574,8 +576,8 @@ export function projectLocalProjectRefusal(code: string | null | undefined, name
   }
   if (code === 'LOCAL_PROJECT_NOT_FOUND') {
     return name
-      ? `“${name}” is not among the code folders on this Mac. Choose one of these, or add the folder in Connect first.`
-      : 'That folder is not among the code folders on this Mac. Choose one of these, or add the folder in Connect first.';
+      ? `“${name}” is not among the code folders on this computer. Choose one of these, or add the folder in Connect first.`
+      : 'That folder is not among the code folders on this computer. Choose one of these, or add the folder in Connect first.';
   }
   return null;
 }

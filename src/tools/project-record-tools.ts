@@ -14,7 +14,7 @@ import { createAgentRecord, findAgentRecord, getAgentRecord } from '../agents/ag
 import { listBackgroundTasks } from '../execution/background-tasks.js';
 import { loadSkill } from '../memory/skill-store.js';
 import { chooseConnectedAccount } from '../projects/connected-accounts.js';
-import { chooseLocalProject } from '../projects/local-projects.js';
+import { admitLocalProject, chooseLocalProject } from '../projects/local-projects.js';
 import {
   createProject, findProject, listAssignments, listAssignmentsForAgent, listProjects, listResources,
   removeAssignment, saveAssignment, saveResource, updateProject,
@@ -152,7 +152,7 @@ export function registerProjectRecordTools(server: McpServer): void {
       })).nullable().optional(),
       resources: z.array(z.object({
         kind: z.enum(['space', 'workflow', 'folder', 'link']),
-        ref: z.string().min(1).describe('The Space\'s id, the workflow\'s name or the address. For kind "folder": the name or absolute path of a local project on this machine, as workspace_list names it; it is linked only when it is exactly one of those.'),
+        ref: z.string().min(1).describe('The Space\'s id, the workflow\'s name or the address. For kind "folder": the name or absolute path of a local project on this computer: one workspace_list names, or a project folder found where people keep them (directly in the home folder, Documents\\GitHub, source\\repos and the like). It is linked only when it is exactly one of those; a found folder the owner named becomes one of the folders Clementine can work in.'),
         label: z.string().nullable().optional(),
       })).nullable().optional(),
       attach_conversation: z.boolean().nullable().optional().describe('Whether this conversation should work in the project from its next turn. Defaults to true when the project is created here.'),
@@ -273,15 +273,21 @@ export function registerProjectRecordTools(server: McpServer): void {
           if (choice.kind !== 'found') {
             questions.push({ about: 'which_local_project', named: entry.ref,
               problem: choice.kind === 'choose' ? 'more than one local project has that name' : 'no local project has that name or path',
-              choices: choice.choices.slice(0, 20).map((row) => ({ name: row.name, path: row.path })) });
+              choices: choice.choices.slice(0, 20).map((row) => ({ name: row.name, path: row.path, ...(row.found ? { foundOnThisComputer: true } : {}) })) });
             continue;
           }
-          const linked = saveResource(record.id, { kind: 'folder', ref: choice.project.path, label: choice.project.name,
-            verifiedAt: new Date().toISOString(), verification: { against: 'local_projects', type: choice.project.type, git: choice.project.git } });
+          // A folder found on this computer (not yet a work folder) that the
+          // owner named is added as one work folder, then linked.
+          let project;
+          try { project = admitLocalProject(choice.project); }
+          catch (error) { notes.push(`The local project ${choice.project.name} was not linked: ${error instanceof Error ? error.message : String(error)}`); continue; }
+          const linked = saveResource(record.id, { kind: 'folder', ref: project.path, label: project.name,
+            verifiedAt: new Date().toISOString(), verification: { against: 'local_projects', type: project.type, git: project.git } });
           notes.push(linked.ok
-            ? `The local project ${choice.project.name} (${choice.project.path}) is ${linked.created ? 'linked' : 'already linked'}.`
-              + (choice.project.git ? '' : ' It is not a git repository, so coding work cannot run in it yet.')
-            : `The local project ${choice.project.name} was not linked: ${linked.reason}.`);
+            ? `The local project ${project.name} (${project.path}) is ${linked.created ? 'linked' : 'already linked'}.`
+              + (choice.project.found ? ' It was found on this computer and is now one of the folders Clementine can work in.' : '')
+              + (project.git ? '' : ' It is not a git repository, so coding work cannot run in it yet.')
+            : `The local project ${project.name} was not linked: ${linked.reason}.`);
           continue;
         }
         const saved = saveResource(record.id, { kind: entry.kind, ref: entry.ref, label: entry.label ?? undefined });

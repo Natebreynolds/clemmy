@@ -221,19 +221,23 @@ function rosterRows(value: unknown): ProjectLocalProject[] {
     const entry = row as Partial<ProjectLocalProject> | null;
     return entry && typeof entry.path === 'string' && entry.path
       ? [{
-        name: typeof entry.name === 'string' && entry.name.trim() ? entry.name : entry.path.split('/').filter(Boolean).pop() ?? entry.path,
+        name: typeof entry.name === 'string' && entry.name.trim() ? entry.name : entry.path.split(/[\\/]/).filter(Boolean).pop() ?? entry.path,
         path: entry.path,
         type: typeof entry.type === 'string' ? entry.type : '',
         description: typeof entry.description === 'string' ? entry.description : '',
         git: entry.git === true,
+        ...(entry.found === true ? { found: true } : {}),
       }]
       : [];
   });
 }
 
-/** The code folders on this machine. The first read can take a few seconds. */
+/** The code folders on this computer, then the project folders found where
+ *  people keep them (linking one of those adds it). The first read can take
+ *  a few seconds. */
 export const getLocalProjects = () =>
-  apiGet<{ localProjects?: unknown }>(`${BASE}-local-projects`).then((r) => rosterRows(r.localProjects));
+  apiGet<{ localProjects?: unknown; foundProjects?: unknown }>(`${BASE}-local-projects`)
+    .then((r) => [...rosterRows(r.localProjects), ...rosterRows(r.foundProjects).map((row) => ({ ...row, found: true }))]);
 
 /**
  * What linking a local project came to. A refusal that names the folders to

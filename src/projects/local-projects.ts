@@ -12,7 +12,7 @@
  */
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { listWorkspaceProjects } from '../tools/shared.js';
+import { addWorkspaceDir, listDiscoverableProjects, listWorkspaceProjects, type WorkspaceProject } from '../tools/shared.js';
 
 export interface LocalProject {
   name: string;
@@ -22,6 +22,9 @@ export interface LocalProject {
   description: string;
   /** Whether it is a git repository, which coding work needs. */
   git: boolean;
+  /** Found on this computer but not yet among the workspace folders.
+   *  Linking it adds that one folder. */
+  found?: true;
 }
 
 export type LocalProjectChoice =
@@ -31,38 +34,67 @@ export type LocalProjectChoice =
 
 type Roster = () => LocalProject[];
 let rosterForTests: Roster | null = null;
+let foundForTests: Roster | null = null;
 
-/** Test seam. Null restores the machine's own roster. */
-export function _setLocalProjectsForTests(roster: Roster | null): void {
+/** Test seam. Null restores the machine's own roster and discovery. */
+export function _setLocalProjectsForTests(roster: Roster | null, found: Roster | null = null): void {
   rosterForTests = roster;
+  foundForTests = found;
 }
+
+const asLocalProject = (row: WorkspaceProject, found: boolean): LocalProject => ({
+  name: row.name,
+  path: row.path,
+  type: row.type,
+  description: row.description ?? '',
+  git: existsSync(path.join(row.path, '.git')),
+  ...(found ? { found: true as const } : {}),
+});
 
 export function localProjects(): LocalProject[] {
   if (rosterForTests) return rosterForTests();
-  return (listWorkspaceProjects() ?? []).map((row) => ({
-    name: row.name,
-    path: row.path,
-    type: row.type,
-    description: row.description ?? '',
-    git: existsSync(path.join(row.path, '.git')),
-  }));
+  return (listWorkspaceProjects() ?? []).map((row) => asLocalProject(row, false));
 }
 
-/** The one local project a name or a path means, or the question to ask. */
+/** Project folders found where people keep them, not yet among the work folders. */
+export function foundLocalProjects(): LocalProject[] {
+  if (rosterForTests) return foundForTests ? foundForTests() : [];
+  return listDiscoverableProjects().map((row) => asLocalProject(row, true));
+}
+
+/** The one local project a name or a path means, or the question to ask.
+ *  The roster answers first; a folder found on this computer answers only
+ *  when the roster has nothing by that name or path. */
 export function chooseLocalProject(named: string | null | undefined): LocalProjectChoice {
   const wanted = String(named ?? '').trim();
   const roster = localProjects();
   if (!wanted) return { kind: roster.length === 1 ? 'found' : 'choose', ...(roster.length === 1 ? { project: roster[0]! } : { named: '', choices: roster }) } as LocalProjectChoice;
-  if (path.isAbsolute(wanted)) {
-    const resolved = path.resolve(wanted);
-    const byPath = roster.find((row) => path.resolve(row.path) === resolved);
-    return byPath ? { kind: 'found', project: byPath } : { kind: 'not_found', named: wanted, choices: roster };
-  }
-  const lower = wanted.toLowerCase();
-  const byName = roster.filter((row) => row.name.toLowerCase() === lower);
-  if (byName.length === 1) return { kind: 'found', project: byName[0]! };
-  if (byName.length > 1) return { kind: 'choose', named: wanted, choices: byName };
-  return { kind: 'not_found', named: wanted, choices: roster };
+  const pick = (rows: LocalProject[]): LocalProjectChoice | null => {
+    if (path.isAbsolute(wanted)) {
+      const resolved = path.resolve(wanted);
+      const byPath = rows.find((row) => path.resolve(row.path) === resolved);
+      return byPath ? { kind: 'found', project: byPath } : null;
+    }
+    const lower = wanted.toLowerCase();
+    const byName = rows.filter((row) => row.name.toLowerCase() === lower);
+    if (byName.length === 1) return { kind: 'found', project: byName[0]! };
+    if (byName.length > 1) return { kind: 'choose', named: wanted, choices: byName };
+    return null;
+  };
+  const fromRoster = pick(roster);
+  if (fromRoster) return fromRoster;
+  const found = foundLocalProjects();
+  return pick(found) ?? { kind: 'not_found', named: wanted, choices: [...roster, ...found] };
+}
+
+/** Makes a found project a work folder before it is linked. The owner's link
+ *  (a click, or asking Clem for it by name or path) is what adds that one
+ *  folder; nothing else in the home is added. */
+export function admitLocalProject(project: LocalProject): LocalProject {
+  if (!project.found) return project;
+  addWorkspaceDir(project.path);
+  const { found: _found, ...admitted } = project;
+  return admitted;
 }
 
 /** What a linked folder is now: still there, still a repository. */
