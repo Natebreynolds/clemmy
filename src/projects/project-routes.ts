@@ -31,6 +31,7 @@ import { admitLocalProject, chooseLocalProject, foundLocalProjects, localProject
 import { localPageContentPolicy, pageImageIsBlank, pageMadeBySession, pageOfProject, pagesMadeInProject, readPageDocument } from './local-pages.js';
 import { readSessionFile, sessionFileImageType } from './session-files.js';
 import { moveFact } from './memory-scope-views.js';
+import { launchWindowsDefaultApp } from '../runtime/windows-powershell.js';
 
 type Handler = (req: Request, res: Response) => void | Promise<void>;
 
@@ -105,6 +106,12 @@ function renderPage(input: Parameters<PageRenderer>[0]): ReturnType<PageRenderer
 
 function openPage(file: string): ReturnType<PageOpener> {
   if (pageOpenerForTests) return pageOpenerForTests(file);
+  if (process.platform === 'win32') {
+    // The default app for the page (its browser), like `open` on macOS; the
+    // hand-off is not awaited, the same as the detached `open` below.
+    void launchWindowsDefaultApp(file).catch(() => undefined);
+    return { ok: true };
+  }
   if (process.platform !== 'darwin') return { ok: false, reason: 'not_supported_here' };
   // Detached, so a slow hand-off to the browser never holds the answer.
   const child = spawn('open', [file], { detached: true, stdio: 'ignore' });

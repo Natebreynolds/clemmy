@@ -8219,7 +8219,7 @@ export function registerConsoleRoutes(
 
   /** Open a project file in the OS default app / editor (macOS `open`).
    *  Workspace-scoped via the same traversal-safe guard. */
-  app.post('/api/console/projects/open', (req, res) => {
+  app.post('/api/console/projects/open', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const body = req.body ?? {};
     const guard = resolveWithinProject(
@@ -8227,6 +8227,16 @@ export function registerConsoleRoutes(
       typeof body.path === 'string' ? body.path : '',
     );
     if (!guard.ok) { res.status(guard.status).json({ error: guard.error }); return; }
+    if (process.platform === 'win32') {
+      // The file's default app, as `open` does on macOS and /files/open does here.
+      try {
+        await launchWindowsDefaultApp(guard.target);
+        res.json({ ok: true, opened: guard.target });
+      } catch {
+        res.status(500).json({ error: 'Windows did not confirm the app opened. Check whether a window opened before retrying, or open the file from File Explorer.' });
+      }
+      return;
+    }
     if (process.platform !== 'darwin') {
       res.status(501).json({ error: 'Opening files in an editor is not supported on this computer yet.' });
       return;
