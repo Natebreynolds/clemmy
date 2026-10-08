@@ -337,7 +337,9 @@ async function assertListenerOwner(port, expectedPid) {
   if ((await listeners(port)).some((row) => row.pid !== expectedPid)) refuse('listener_ownership_unqualified');
 }
 
+let activeGate = null;
 async function waitFor(operation, code, timeoutMs = 120_000) {
+  activeGate = code;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const result = await operation();
@@ -646,14 +648,18 @@ async function startInstalledApp(context, firstLaunch) {
     // The daemon's loop stalls on a cold first boot (run 37705987629: a
     // 10 s abort here ended the smoke after the dashboard had mounted);
     // each asset is read through such stalls, bounded, inside the collector.
-    const response = await withLaunchDiagnostics(() => waitFor(async () => {
+    // The body read is governed by the same abort signal as the headers
+    // (run 37708030984: headers answered, the bundle's bytes stalled past
+    // the signal, and the raw timeout surfaced outside this wait), so the
+    // whole download, headers and bytes, is one bounded attempt.
+    const { response, bytes } = await withLaunchDiagnostics(() => waitFor(async () => {
       try {
-        return await fetch(asset, { headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(30_000) });
+        const response = await fetch(asset, { headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(60_000) });
+        return { response, bytes: Buffer.from(await response.arrayBuffer()) };
       } catch { return null; }
-    }, 'console_asset_unreadable', 180_000));
+    }, 'console_asset_unreadable', 240_000));
     const contentType = response.headers.get('content-type') ?? '';
     if (!response.ok || !/javascript/.test(contentType)) refuse('console_asset_response_invalid');
-    const bytes = Buffer.from(await response.arrayBuffer());
     const installed = path.join(context.installRoot, 'resources', 'daemon', 'apps', 'console-web', 'dist', relative);
     if (sha256(bytes) !== sha256(readFileSync(installed))) refuse('console_served_asset_mismatch');
     app.assetHashes.push({ relative, bytes: bytes.length, sha256: sha256(bytes) });
@@ -1021,7 +1027,9 @@ export async function main(args = process.argv.slice(2)) {
     // so its stack goes to the step log, bounded and redacted (run
     // 37697565733: qualification_failed with the stack lost to the re-throw).
     if (!(error instanceof SmokeError)) {
-      process.stderr.write(`[Windows installed smoke] unexpected: ${redactLogText(String(error?.stack ?? error)).slice(0, 2_000)}\n`);
+      // An abort timeout carries no user frames; the gate that was open
+      // when it surfaced locates it.
+      process.stderr.write(`[Windows installed smoke] unexpected (last gate: ${activeGate ?? 'none'}): ${redactLogText(String(error?.stack ?? error)).slice(0, 2_000)}\n`);
     }
     receipt.failureCode = error instanceof SmokeError ? error.code : 'qualification_failed';
     if (error instanceof SmokeError && error.childCleanup) {
