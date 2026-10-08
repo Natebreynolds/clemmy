@@ -34,7 +34,7 @@ export function BrowserbaseConnection() {
       {status && (!status.configured || editing) ? <form onSubmit={save} className="mt-4 space-y-3">
         <label className="block text-small text-fg">Project ID<Input value={projectId} onChange={(event) => setProjectId(event.target.value)} autoComplete="off" required className="mt-1" /></label>
         <label className="block text-small text-fg">API key<Input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="new-password" required className="mt-1" /></label>
-        <p className="text-small text-muted">The key is saved securely on your Mac, not saved in this browser. Browser sessions use your Browserbase account; recording starts off.</p>
+        <p className="text-small text-muted">The key is saved securely on your computer, not saved in this browser. Browser sessions use your Browserbase account; recording starts off.</p>
         <Button type="submit" size="sm" disabled={busy || !apiKey.trim() || !projectId.trim()}>{busy ? 'Saving…' : 'Save connection'}</Button>
       </form> : null}
       {status?.idleSeconds && status?.sessionTimeoutSeconds ? <p className="mt-3 text-small text-muted">Idle release after {Math.ceil(status.idleSeconds / 60)} minutes · maximum session {Math.ceil(status.sessionTimeoutSeconds / 60)} minutes.</p> : null}

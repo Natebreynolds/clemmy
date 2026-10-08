@@ -94,7 +94,7 @@ export function mobileAccessTarget(
       qrBlockedReason = posture.gaps.find((gap) => gap.blocking)?.message
         ?? 'Mobile access is not safe to expose yet.';
     } else if (!lanIp) {
-      qrBlockedReason = 'This Mac has no network address a phone could reach. Join a Wi-Fi network and try again.';
+      qrBlockedReason = 'This computer has no network address a phone could reach. Join a Wi-Fi network and try again.';
     }
     return {
       url: `https://${lanIp ?? '127.0.0.1'}:${directApp.port}/m/`,
@@ -109,7 +109,7 @@ export function mobileAccessTarget(
     url: `http://127.0.0.1:${WEBHOOK_PORT}/m/`,
     mode: 'local-preview',
     qrReady: false,
-    qrBlockedReason: 'Your phone cannot reach this Mac right now because the direct connection is closed. Quit and reopen Clementine to reopen it.',
+    qrBlockedReason: 'Your phone cannot reach this computer right now because the direct connection is closed. Quit and reopen Clementine to reopen it.',
   };
 }
 

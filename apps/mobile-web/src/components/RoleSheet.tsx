@@ -175,7 +175,7 @@ export function RoleSheet({ role, settings, review, reviewBusy, reviewError, onT
         </div>
 
         {groups.length === 0 ? (
-          <p class="brain-note muted">No connected model can do this yet. Connect one on your Mac.</p>
+          <p class="brain-note muted">No connected model can do this yet. Connect one on your computer.</p>
         ) : null}
         {saved ? <p class="brain-note switched">{copy.saved ?? 'Saved. Applies to your next message.'}</p> : null}
         {error ? <p class="error brain-note">{error}</p> : null}

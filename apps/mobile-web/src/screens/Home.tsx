@@ -446,7 +446,7 @@ function QuickActions({ actions, onAsk }: {
         text: e.status === 409 && e.message?.includes('REQUIRES_INPUT')
           ? `${action.label} needs input first — run it from Flows.`
           : e.status === 409 && e.message?.includes('DISABLED')
-            ? `${action.label} is disabled. Enable it on your Mac first.`
+            ? `${action.label} is disabled. Enable it on your computer first.`
             : e.message || `Could not start ${action.label}.`,
       });
     }

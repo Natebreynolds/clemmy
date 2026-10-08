@@ -45,7 +45,7 @@ test('a refusal is said in words; its code never reaches the screen', () => {
   assert.equal(refusalWords(refused('TASK_NOT_OPEN')), 'This task has already ended, so it cannot take a correction.');
   assert.equal(refusalWords(refused('STOPPING')), 'This task is stopping. Correct it once it has stopped.');
   assert.equal(refusalWords(refused('ALREADY_KEPT_THERE')), 'It is already kept there.');
-  assert.equal(refusalWords({ offline: true, status: 0, message: 'x' }), "Can't reach your Mac right now. Try again when you're back on.");
+  assert.equal(refusalWords({ offline: true, status: 0, message: 'x' }), "Can't reach your computer right now. Try again when you're back on.");
   assert.equal(refusalWords(refused('SOMETHING_NEW_FROM_THE_MAC')), 'That did not go through. Try again.');
   assert.equal(refusalWords(new Error('HTTP 500'), 'Could not save.'), 'Could not save.');
   assert.equal(refusalWords(null), 'That did not go through. Try again.');
@@ -89,7 +89,7 @@ test('a refused account binding asks the owner the right next thing', () => {
 
 test('a failure handed to a screen keeps what it was and loses its code', () => {
   const gone = inWords(refused('PROJECT_NOT_FOUND'), 'Could not load this project.') as Error & { status?: number; offline?: boolean };
-  assert.equal(gone.message, 'That project is no longer on your Mac.');
+  assert.equal(gone.message, 'That project is no longer on your computer.');
   assert.equal(gone.status, 409);
   const away = inWords({ offline: true, status: 0 }, 'Could not load this project.') as Error & { offline?: boolean };
   assert.equal(away.offline, true, 'a screen still says the Mac is out of reach');

@@ -94,7 +94,7 @@ export function connectionsSummary(rows: readonly ConnectionRowLike[] | undefine
   const attention = rows.filter((r) => r.state !== 'ok').length;
   const parts = [
     apps.length ? `${apps.length} app${apps.length === 1 ? '' : 's'}` : '',
-    tools.length ? `${tools.length} tool${tools.length === 1 ? '' : 's'} on your Mac` : '',
+    tools.length ? `${tools.length} tool${tools.length === 1 ? '' : 's'} on your computer` : '',
   ].filter(Boolean);
   const head = parts.join(' · ');
   return attention ? `${head} · ${attention} need${attention === 1 ? 's' : ''} a look` : head;
@@ -131,7 +131,7 @@ export function joinWords(words: readonly string[]): string {
 /** Why push would not reach a phone today, in the owner's terms; empty when it would. */
 export function phonePushCaveat(readiness: PhoneHeartbeat['phonePush'] | undefined, native: boolean): string {
   if (!readiness || readiness.ready) return '';
-  if (readiness.reason === 'apns_key_missing') return 'This Mac has no Apple push key yet, so these stay in the app for now.';
+  if (readiness.reason === 'apns_key_missing') return 'This computer has no Apple push key yet, so these stay in the app for now.';
   return native
     ? 'Allow notifications for Clem in iOS Settings, then reopen the app; until then these stay in the app.'
     : 'Open the Clem app on your phone and allow notifications; until then these stay in the app.';

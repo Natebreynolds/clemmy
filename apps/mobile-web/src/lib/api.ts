@@ -122,7 +122,7 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
     // and the UI show one honest "can't reach your Mac" state.
     setConnectionDoor('offline');
     reportConnectionLost();
-    const err = makeError(0, null, "Can't reach your Mac right now");
+    const err = makeError(0, null, "Can't reach your computer right now");
     err.offline = true;
     throw err;
   }

@@ -363,7 +363,7 @@ export function AccountBinderSheet({ open, projectId, onClose, onSaved }: Binder
         apps === null ? (
           <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
         ) : apps.length === 0 ? (
-          failure ? null : <p class="project-sheet-note">No apps are connected yet. Connect one on your Mac, then add its account here.</p>
+          failure ? null : <p class="project-sheet-note">No apps are connected yet. Connect one on your computer, then add its account here.</p>
         ) : (
           <>
             <p class="project-sheet-note">Which app does this project use?</p>
@@ -401,7 +401,7 @@ export function AccountBinderSheet({ open, projectId, onClose, onSaved }: Binder
       ) : step.at === 'not_connected' ? (
         <>
           <p class="project-sheet-note">
-            No {step.app} account is connected right now. Connect it on your Mac, then add it here.
+            No {step.app} account is connected right now. Connect it on your computer, then add it here.
           </p>
           <button type="button" class="link-btn" onClick={() => { setStep({ at: 'apps' }); setFailure(null); }}>Choose another app</button>
         </>
@@ -464,7 +464,7 @@ export function LocalProjectSheet({ open, projectId, resources, onClose, onSaved
       .catch((err) => {
         if (cancelled) return;
         setRoster([]);
-        setFailure(refusalWords(err, 'Could not read the local projects on your Mac. Try again.'));
+        setFailure(refusalWords(err, 'Could not read the local projects on your computer. Try again.'));
       });
     return () => { cancelled = true; };
   }, [open]);
@@ -502,7 +502,7 @@ export function LocalProjectSheet({ open, projectId, resources, onClose, onSaved
     <Sheet open={open} onClose={onClose} title="Link a local project">
       {roster === null ? (
         <div role="status" aria-live="polite">
-          <p class="project-sheet-note">Looking through the code folders on your Mac. This can take a few seconds the first time.</p>
+          <p class="project-sheet-note">Looking through the code folders on your computer. This can take a few seconds the first time.</p>
           <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
         </div>
       ) : (
@@ -511,7 +511,7 @@ export function LocalProjectSheet({ open, projectId, resources, onClose, onSaved
           {failure ? <p class="agent-failure" role="alert">{failure}</p> : null}
           {choices.length === 0 && !failure ? (
             <p class="project-sheet-note">
-              No local projects are on your Mac's list yet. Add a code folder in Connect on your Mac, then link it here.
+              No local projects are on your computer's list yet. Add a code folder in Connect on your computer, then link it here.
             </p>
           ) : (
             <ul class="agent-pick-list">

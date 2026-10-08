@@ -37,7 +37,7 @@ export type RunControlTarget =
 /** Why a control did not go through, in words. A delegated task's refusal has
  *  a name the owner should never read; everything else says what it said. */
 function controlFailure(target: RunControlTarget, err: unknown): string {
-  if (isOfflineError(err)) return "Can't reach your Mac — try again when you're back on";
+  if (isOfflineError(err)) return "Can't reach your computer — try again when you're back on";
   if (target.kind === 'delegated-task') return refusalWords(err, 'That did not go through. Try again.');
   return (err as Error).message;
 }

@@ -1,4 +1,5 @@
 import { clemmy } from './clemmy';
+import { isMac } from './platform';
 
 const OUTPUT_SAMPLE_RATE = 16_000;
 const PROCESSOR_BUFFER_SIZE = 4096;
@@ -87,7 +88,9 @@ export function float32ToPcm16(samples: Float32Array): ArrayBuffer {
 function captureErrorMessage(error: unknown): string {
   const name = error instanceof DOMException ? error.name : '';
   if (name === 'NotAllowedError' || name === 'SecurityError') {
-    return 'Microphone access was denied. Allow Clementine in System Settings → Privacy & Security → Microphone, then try again.';
+    return isMac()
+      ? 'Microphone access was denied. Allow Clementine in System Settings → Privacy & Security → Microphone, then try again.'
+      : 'Microphone access was denied. Allow Clementine in Settings → Privacy & security → Microphone, then try again.';
   }
   if (name === 'NotFoundError') return 'No microphone was found. Connect one and try again.';
   return error instanceof Error ? error.message : String(error);

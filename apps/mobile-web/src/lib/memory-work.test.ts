@@ -131,7 +131,7 @@ test('only a fresh, successful read of a running job may pulse', () => {
 test('a failed first read says so before any empty state; loading says nothing yet', () => {
   assert.equal(memoryWorkStatus(readOf(null), namer), null, 'still loading: the skeleton shows');
   assert.equal(memoryWorkStatus(readOf(null, { error: 'HTTP 500' }), namer)?.text, 'Couldn’t read memory work just now');
-  assert.equal(memoryWorkStatus(readOf(null, { offline: true }), namer)?.text, 'Can’t reach your Mac right now');
+  assert.equal(memoryWorkStatus(readOf(null, { offline: true }), namer)?.text, 'Can’t reach your computer right now');
   assert.equal(recentEmptyText(null), null);
   assert.equal(recentEmptyText(view('unknown')), null, 'an unread day is not "nothing happened"');
   assert.match(recentEmptyText(view('resting', { recent: [] })) ?? '', /^Nothing in the last 7 days\./);
@@ -366,7 +366,7 @@ test('undo appears only while it would change something, and forgetting asks fir
   // An undo that gets no answer (offline included) says the Mac's sentence.
   const parts = read('../components/MemoryWorkParts.tsx');
   assert.match(parts, /catch \{[\s\S]{0,200}?setOutcome\(undoOutcomeText\(null, undo\.kind\)\);/);
-  assert.doesNotMatch(parts, /Can’t reach your Mac/, 'no phone-only undo sentence');
+  assert.doesNotMatch(parts, /Can’t reach your computer/, 'no phone-only undo sentence');
 });
 
 test('a run lists at most what the daemon sent and says how many more it changed', () => {
@@ -429,7 +429,7 @@ test('jobs list in the shared order, learning first, import only once it has run
   assert.equal(reconcile?.today, '5 model calls today · 2.2k tokens');
   const byId = new Map(groups.flatMap((g) => g.jobs).map((j) => [j.id, j]));
   assert.equal(byId.get('standing')?.model, 'Named checker-model · Checks the work');
-  assert.equal(byId.get('index')?.model, 'local-embedder · Runs on this Mac', 'the local model is a file, not a catalog name');
+  assert.equal(byId.get('index')?.model, 'local-embedder · Runs on this computer', 'the local model is a file, not a catalog name');
   assert.equal(byId.get('tidy')?.model, 'No model');
   assert.equal(byId.get('identity')?.last, 'No run recorded yet', 'no record is not "not in 7 days": a restart forgets quiet runs');
   assert.equal(byId.get('identity')?.today, null);

@@ -143,7 +143,7 @@ export function FromClem({ data, onChanged, onOpenThread }: {
       <div key={row.key} class="home-row home-row-needs" aria-busy={busy === row.key}>
         <div class="home-row-title">{row.say || row.text}</div>
         {!row.say && row.detail ? <div class="home-row-note">{row.detail}</div> : null}
-        {!href ? <div class="home-row-note">{setup.placeName} is on your Mac.</div> : null}
+        {!href ? <div class="home-row-note">{setup.placeName} is on your computer.</div> : null}
         {notice(row)}
         {!done ? (
           <div class="home-row-actions">

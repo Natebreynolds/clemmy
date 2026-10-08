@@ -203,7 +203,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
         <div class="empty">
           <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
           <p class="empty-title">No conversations yet</p>
-          <p class="empty-body">Ask below — she picks up all the context from your Mac.</p>
+          <p class="empty-body">Ask below — she picks up all the context from your computer.</p>
         </div>
       ) : null}
 

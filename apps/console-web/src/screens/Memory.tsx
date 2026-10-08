@@ -47,6 +47,7 @@ import { ScopeChip } from '@/components/memory/ScopeChip';
 import { canMoveToEverywhere, factScopeChoices, factScopeFromKey, factScopeKey, scopedFacts } from '@/lib/memory-scope';
 import { apiErrorCode, listProjects, projectKeys, refusalText } from '@/lib/projects';
 import { listAgents } from '@/lib/agents';
+import { isMac } from '@/lib/platform';
 
 type Tab = 'overview' | 'facts' | 'tools' | 'episodes' | 'entities' | 'sources';
 const TABS: readonly Tab[] = ['overview', 'facts', 'tools', 'episodes', 'entities', 'sources'];
@@ -131,7 +132,7 @@ export function Memory() {
             <Search className="h-4 w-4 text-faint" aria-hidden />
             <input ref={searchInputRef} value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search everything she knows" aria-label="Search memory"
               className="h-12 flex-1 bg-transparent text-body-lg text-fg outline-none placeholder:text-faint" />
-            {!q && <kbd className="rounded bg-subtle px-1.5 py-0.5 font-mono text-caption text-faint">⌘K</kbd>}
+            {!q && <kbd className="rounded bg-subtle px-1.5 py-0.5 font-mono text-caption text-faint">{isMac() ? '⌘K' : 'Ctrl K'}</kbd>}
             {q && <button type="button" onClick={() => { setQ(''); setSelected(null); }} aria-label="Clear search" className="cursor-pointer text-faint hover:text-fg"><X className="h-4 w-4" aria-hidden /></button>}
           </div>
           {/* Filters belong to the search, not to the page. Two rows of chips sat
@@ -1937,7 +1938,7 @@ function ImportTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
 
       {!scan && (discovered.data?.sources.length ?? 0) > 0 && (
         <Card>
-          <div className="mb-2 text-body-lg font-semibold text-fg">Found on this Mac</div>
+          <div className="mb-2 text-body-lg font-semibold text-fg">Found on this computer</div>
           <p className="mb-3 text-body text-muted">Agent-memory locations Clementine can see. Nothing is imported until you scan and confirm.</p>
           <ul className="space-y-2">
             {discovered.data!.sources.map((s) => (

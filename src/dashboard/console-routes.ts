@@ -8228,7 +8228,7 @@ export function registerConsoleRoutes(
     );
     if (!guard.ok) { res.status(guard.status).json({ error: guard.error }); return; }
     if (process.platform !== 'darwin') {
-      res.status(501).json({ error: 'open-in-editor is only supported on macOS' });
+      res.status(501).json({ error: 'Opening files in an editor is not supported on this computer yet.' });
       return;
     }
     try {

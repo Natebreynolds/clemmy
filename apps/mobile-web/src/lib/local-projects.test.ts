@@ -56,7 +56,7 @@ test('a folder that is gone says so, and one that cannot take coding work says t
   assert.equal(projectLocalProjectMissingLine(here), null);
   assert.equal(projectLocalProjectGitLine(here), null);
   const gone = projectLinkedLocalProject(resource({ name: 'fixture-site', path: '/a/fixture-site', present: false, git: false }))!;
-  assert.match(projectLocalProjectMissingLine(gone) ?? '', /no longer on this Mac/);
+  assert.match(projectLocalProjectMissingLine(gone) ?? '', /no longer on this computer/);
   assert.equal(projectLocalProjectGitLine(gone), null, 'a folder that is gone says only that');
   const plain = projectLinkedLocalProject(resource({ name: 'notes', path: '/a/notes', present: true, git: false }))!;
   assert.match(projectLocalProjectGitLine(plain) ?? '', /Coding work cannot run here yet/);

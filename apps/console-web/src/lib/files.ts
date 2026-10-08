@@ -29,7 +29,7 @@ export function localPathFromUri(uri: string): string | null {
  *  happened". */
 export async function openFile(uri: string): Promise<OpenFileResult> {
   const filePath = localPathFromUri(uri);
-  if (!filePath) return { ok: false, reason: 'That result does not point at a file on this Mac.' };
+  if (!filePath) return { ok: false, reason: 'That result does not point at a file on this computer.' };
   try {
     await apiPost(`/api/console/files/open?path=${encodeURIComponent(filePath)}`);
     return { ok: true };

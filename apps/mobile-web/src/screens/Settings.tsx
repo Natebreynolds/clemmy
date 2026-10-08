@@ -215,7 +215,7 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
         <IndexRow
           icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>}
           title="Home"
-          note="What Today shows, what opens on launch, quick actions. Same as your Mac."
+          note="What Today shows, what opens on launch, quick actions. Same as your computer."
           onOpen={() => { haptic('light'); onCustomize(); }}
         />
       </IndexGroup>
@@ -266,7 +266,7 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
         />
       </IndexGroup>
 
-      <p class="settings-foot">Sign-ins, keys and clean-up live on your Mac, in Settings.</p>
+      <p class="settings-foot">Sign-ins, keys and clean-up live on your computer, in Settings.</p>
     </div>
   );
 }
@@ -326,7 +326,7 @@ function ModePage({ loaded, error, onChanged, onRetry }: {
             ? 'Anything that is not disruptive just runs: local files, the shell, reads, ordinary changes in your connected apps.'
             : 'Clem also checks with you before an ordinary change in a connected app, once. Approving it teaches her that kind of change.'}
         </p>
-        <p class="card-note">In both modes a send, a delete or anything irreversible always asks, on one card. Same setting as your Mac.</p>
+        <p class="card-note">In both modes a send, a delete or anything irreversible always asks, on one card. Same setting as your computer.</p>
         {failed ? <p class="error card-note" role="alert">{failed}</p> : null}
       </section>
       <section class="card settings-card">
@@ -500,7 +500,7 @@ function NotificationsPage({ device, devicesLoading, heartbeats, heartbeatsError
               <span class="settings-row-label">{device ? deviceDisplayName(device) : 'This phone'}</span>
               <span class="settings-row-note">
                 {registered
-                  ? 'Receives notifications from your Mac.'
+                  ? 'Receives notifications from your computer.'
                   : 'Not receiving notifications yet. Allow notifications for Clem in iOS Settings, then reopen the app.'}
               </span>
             </span>
@@ -555,7 +555,7 @@ function NotificationsPage({ device, devicesLoading, heartbeats, heartbeatsError
               <span class="settings-row-main">
                 <span class="settings-row-label">{h.title}</span>
                 <span class="settings-row-note">
-                  {!h.enabled ? 'Off on your Mac.' : h.notify === 'push' ? 'Findings reach this phone.' : 'Findings wait in the app.'}
+                  {!h.enabled ? 'Off on your computer.' : h.notify === 'push' ? 'Findings reach this phone.' : 'Findings wait in the app.'}
                 </span>
               </span>
               <span class={`settings-switch${h.notify === 'push' ? ' on' : ''}`} aria-hidden="true"><i /></span>
@@ -896,7 +896,7 @@ export function ConnectionsPage({ rows, loading, error, offline, stale, refreshi
       />
       {refreshing && <p class="card-note" role="status">Checking connections…</p>}
       {unavailable && Boolean(rows?.length) && <p class="card-note">Showing last known connections. Their current status has not been verified.</p>}
-      {!unavailable && rows?.length === 0 && <section class="card settings-card"><p class="card-note">Nothing connected yet. Connect apps on your Mac and they show up here.</p></section>}
+      {!unavailable && rows?.length === 0 && <section class="card settings-card"><p class="card-note">Nothing connected yet. Connect apps on your computer and they show up here.</p></section>}
       {apps.length ? (
         <section class="settings-group" aria-label="Apps">
           <h2 class="settings-group-label">Apps</h2>
@@ -904,12 +904,12 @@ export function ConnectionsPage({ rows, loading, error, offline, stale, refreshi
         </section>
       ) : null}
       {tools.length ? (
-        <section class="settings-group" aria-label="Tools on your Mac">
-          <h2 class="settings-group-label">Tools on your Mac</h2>
+        <section class="settings-group" aria-label="Tools on your computer">
+          <h2 class="settings-group-label">Tools on your computer</h2>
           <div class="card settings-card">{list(tools)}</div>
         </section>
       ) : null}
-      {Boolean(rows?.length) && <p class="settings-foot">Other connections are managed on your Mac, in Connect.</p>}
+      {Boolean(rows?.length) && <p class="settings-foot">Other connections are managed on your computer, in Connect.</p>}
     </Fragment>
   );
 }
@@ -1019,7 +1019,7 @@ function DevicesPage({ rows, loading, onRevoked, onSignOut }: {
           <h2 class="settings-group-label">Not seen in weeks</h2>
           <div class="card settings-card">
             <ul class="settings-list">{stale.map(deviceRow)}</ul>
-            <p class="card-note">Revoking signs that device out of Clem. It can pair again from your Mac.</p>
+            <p class="card-note">Revoking signs that device out of Clem. It can pair again from your computer.</p>
           </div>
         </section>
       ) : null}

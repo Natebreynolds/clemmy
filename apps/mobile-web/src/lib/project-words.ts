@@ -63,8 +63,8 @@ export function projectDraftChanges(
 const REFUSALS: Record<string, string> = {
   NAME_REQUIRED: 'Give the project a name.',
   NAME_TAKEN: 'You already have a project with that name.',
-  NOT_FOUND: 'That project is no longer on your Mac.',
-  PROJECT_NOT_FOUND: 'That project is no longer on your Mac.',
+  NOT_FOUND: 'That project is no longer on your computer.',
+  PROJECT_NOT_FOUND: 'That project is no longer on your computer.',
   ARCHIVED: 'That project is archived. Restore it to change it.',
   PROJECT_ARCHIVED: 'That project is archived. Restore it to use it.',
   AGENT_NOT_FOUND: 'That agent is no longer available.',
@@ -72,11 +72,11 @@ const REFUSALS: Record<string, string> = {
   RESOURCE_INCOMPLETE: 'That needs a little more detail before it can be added.',
   TOO_MANY_RESOURCES: 'This project already lists as much as it can hold. Remove something first.',
   TOOLKIT_REQUIRED: 'Say which app the account is for.',
-  ACCOUNT_NOT_CONNECTED: 'No account for that app is connected on your Mac yet.',
-  SESSION_NOT_FOUND: 'That conversation is no longer on your Mac.',
+  ACCOUNT_NOT_CONNECTED: 'No account for that app is connected on your computer yet.',
+  SESSION_NOT_FOUND: 'That conversation is no longer on your computer.',
   NOT_A_CONVERSATION: 'Only a conversation can work in a project.',
   INVALID_PROJECT: 'That project could not be used.',
-  TASK_NOT_FOUND: 'That task is no longer on your Mac.',
+  TASK_NOT_FOUND: 'That task is no longer on your computer.',
   INSTRUCTION_REQUIRED: 'Say a little more about what should change.',
   TASK_NOT_OPEN: 'This task has already ended, so it cannot take a correction.',
   STOPPING: 'This task is stopping. Correct it once it has stopped.',
@@ -98,7 +98,7 @@ const REFUSALS: Record<string, string> = {
  */
 export function refusalWords(error: unknown, fallback = 'That did not go through. Try again.'): string {
   const candidate = error as { offline?: boolean; body?: unknown; message?: unknown } | null | undefined;
-  if (candidate?.offline) return "Can't reach your Mac right now. Try again when you're back on.";
+  if (candidate?.offline) return "Can't reach your computer right now. Try again when you're back on.";
   const body = candidate?.body as { error?: unknown } | null | undefined;
   const code = body && typeof body === 'object' && typeof body.error === 'string' ? body.error : '';
   if (code && REFUSALS[code]) return REFUSALS[code];

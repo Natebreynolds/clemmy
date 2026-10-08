@@ -66,7 +66,7 @@ export function Workspaces({
       <div class="empty">
         <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
         <p class="empty-title">No workspaces yet</p>
-        <p class="empty-body">Ask Clem to build one on your Mac and it shows up here.</p>
+        <p class="empty-body">Ask Clem to build one on your computer and it shows up here.</p>
       </div>
     );
   }
@@ -346,7 +346,7 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
           </div>
           {projection.total > projection.shown ? (
             <p class="ws-more">
-              Showing {projection.shown} of {projection.total}. The full workspace lives on your Mac.
+              Showing {projection.shown} of {projection.total}. The full workspace lives on your computer.
             </p>
           ) : null}
         </section>
@@ -355,7 +355,7 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
           <p class="empty-title">Nothing to list</p>
           <p class="empty-body">
             This workspace's data doesn't look like a set of records, so there's nothing to scan here.
-            Open it on your Mac for the full view.
+            Open it on your computer for the full view.
           </p>
         </div>
       )}

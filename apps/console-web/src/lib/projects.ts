@@ -71,7 +71,7 @@ const REFUSALS: Record<string, string> = {
   RESOURCE_INCOMPLETE: 'That is missing what it points at.',
   TOO_MANY_RESOURCES: 'This project already lists as many resources as it can hold. Remove one first.',
   LOCAL_PROJECT_CHOICE_REQUIRED: 'Choose which local project to link.',
-  LOCAL_PROJECT_NOT_FOUND: 'That folder is not among the code folders on this Mac. Add it in Connect first.',
+  LOCAL_PROJECT_NOT_FOUND: 'That folder is not among the code folders on this computer. Add it in Connect first.',
   ACCOUNT_NOT_CONNECTED: 'No account is connected for that app. Connect one first.',
   ACCOUNT_CHOICE_REQUIRED: 'Choose which account this project uses.',
   CONFLICTING_ACCOUNT: 'This project already uses another account for that app.',

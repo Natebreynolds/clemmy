@@ -66,7 +66,7 @@ test('a place Clem links opens inside the app on the surface that asks for it', 
 
 test('a Mac-only place reads as text on the phone, and unknown or unasked places are plain labels', () => {
   assert.match(renderMarkdown('[Open Meetings](app:meetings)', { appPlaceLinks: 'phone' }),
-    /<span class="app-place-elsewhere">Open Meetings \(on your Mac\)<\/span>/);
+    /<span class="app-place-elsewhere">Open Meetings \(on your computer\)<\/span>/);
   const unknown = renderMarkdown('[Open Vault](app:vault)', { appPlaceLinks: 'desktop' });
   assert.doesNotMatch(unknown, /<a /);
   assert.match(unknown, /Open Vault/);

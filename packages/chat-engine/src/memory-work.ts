@@ -300,7 +300,7 @@ export const MEMORY_JOB_WORDS: Record<MemoryJobId, MemoryJobWords> = {
   index: {
     title: 'Keeping memory searchable',
     doing: 'Indexing new memories',
-    blurb: 'Indexes new memories so Clem can find them, using a model that runs on this Mac.',
+    blurb: 'Indexes new memories so Clem can find them, using a model that runs on this computer.',
   },
   backup: { title: 'Protecting your memories', doing: 'Saving a recovery copy', blurb: 'Keeps a local recovery copy while Clem continues answering you.' },
   connect: { title: 'Connecting your memories', doing: 'Organizing memory connections', blurb: 'Checks links between facts, people and resources, in small background steps.' },
@@ -343,7 +343,7 @@ export function memoryJobModelOwnerText(owner: MemoryJobModelOwner): string {
   switch (owner) {
     case 'memory': return MEMORY_ROLE_WORDS.title;
     case 'checker': return 'Checks the work';
-    case 'local': return 'Runs on this Mac';
+    case 'local': return 'Runs on this computer';
     default: return 'No model';
   }
 }

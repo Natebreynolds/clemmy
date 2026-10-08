@@ -47,7 +47,7 @@ export function mobileAuthPosture(opts?: { stateDir?: string }): MobileAuthPostu
       message:
         'Device binding is turned off (CLEMENTINE_MOBILE_REQUIRE_DEVICE_KEY=false), so a '
         + 'copied session cookie would be enough to sign in. Re-enable it before exposing '
-        + 'this Mac to the internet.',
+        + 'this computer to the internet.',
       blocking: true,
     });
   }

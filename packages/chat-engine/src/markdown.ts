@@ -55,7 +55,7 @@ function renderInline(escaped: string, options: RenderMarkdownOptions): string {
     const surface = options.appPlaceLinks;
     if (!surface || !appPlace(id)) return hold(label);
     const href = appPlaceHref(id, surface);
-    if (!href) return hold(`<span class="app-place-elsewhere">${label} (on your Mac)</span>`);
+    if (!href) return hold(`<span class="app-place-elsewhere">${label} (on your computer)</span>`);
     return hold(`<a href="${escapeHtml(href)}" class="app-place-link" data-app-place="${id}">${label}</a>`);
   });
   out = out.replace(

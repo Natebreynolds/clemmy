@@ -100,7 +100,7 @@ export function ageLabel(stampIso: string, nowMs: number): string {
  */
 export function lastGoodNotice(stampIso: string | null, nowMs: number): string | null {
   if (!stampIso) return null;
-  return `Can't reach your Mac. This is what I last saw, ${ageLabel(stampIso, nowMs)}.`;
+  return `Can't reach your computer. This is what I last saw, ${ageLabel(stampIso, nowMs)}.`;
 }
 
 /**

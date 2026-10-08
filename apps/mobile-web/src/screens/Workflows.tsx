@@ -268,7 +268,7 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
           >
             {triggering ? 'Queuing…'
               : !workflow.enabled ? 'Disabled'
-                : bindingGaps.length > 0 ? 'Needs a binding (set it on your Mac)'
+                : bindingGaps.length > 0 ? 'Needs a binding (set it on your computer)'
                 : requiredMissing.length > 0 ? `Needs: ${requiredMissing.join(', ')}`
                   : 'Run now'}
           </button>

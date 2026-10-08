@@ -15,6 +15,7 @@ import { usePoll } from '@/lib/poll';
 import { sentence } from '@/lib/sentence-case';
 import { statusTone, relativeTime } from '@/lib/inbox';
 import { clemmy, isDesktop } from '@/lib/clemmy';
+import { isMac } from '@/lib/platform';
 import {
   getRecallStatus,
   patchRecallSettings,
@@ -201,7 +202,9 @@ export function Meetings() {
     setBusy(true); setNotice(null);
     try {
       await clemmy()?.recallRequestPermissions?.();
-      setNotice({ tone: 'info', text: 'Permission requests sent — approve the macOS dialogs. If you just enabled Screen Recording, quit and reopen Clementine for it to take effect.' });
+      setNotice({ tone: 'info', text: isMac()
+        ? 'Permission requests sent — approve the macOS dialogs. If you just enabled Screen Recording, quit and reopen Clementine for it to take effect.'
+        : 'Permission requests sent. Allow the permission prompts Windows shows, then try again.' });
     } catch (e) { setNotice({ tone: 'error', text: (e as Error).message }); }
     finally { setBusy(false); refresh(); }
   };
@@ -466,7 +469,7 @@ export function Meetings() {
         ) : recallUnsupported ? (
           <div className="mt-4 rounded-md border border-warning/30 bg-warning-tint px-3 py-3">
             <p className="text-body text-warning">{recallUnsupportedMessage}</p>
-            <p className="mt-1 text-small text-muted">Use In-person meeting above to record the microphone and transcribe locally with whisper.cpp. Local recording remains available on Intel Macs.</p>
+            <p className="mt-1 text-small text-muted">Use In-person meeting above to record the microphone and transcribe locally with whisper.cpp.{isMac() ? ' Local recording remains available on Intel Macs.' : ''}</p>
           </div>
         ) : !credConnected ? (
           <p className="mt-4 text-body text-muted">Add your Recall.ai key in <span className="font-medium text-fg">Connect → Keys & accounts</span> to enable meeting capture.</p>

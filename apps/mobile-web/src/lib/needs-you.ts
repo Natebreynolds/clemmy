@@ -67,7 +67,7 @@ export function needsYouChrome(input: {
     drawerBadgeText: cap(count, 9),
     stale,
     age,
-    pillAriaLabel: `${count} ${noun} you${provenance}.${stale ? " Can't reach your Mac." : ''} Open Needs you`,
+    pillAriaLabel: `${count} ${noun} you${provenance}.${stale ? " Can't reach your computer." : ''} Open Needs you`,
     badgeAriaLabel: `${count} ${noun} you${provenance}`,
   };
 }

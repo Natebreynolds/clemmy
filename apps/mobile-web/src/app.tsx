@@ -1027,9 +1027,9 @@ class ScreenBoundary extends Component<{ tab: string; children: ComponentChildre
  * claiming "Direct" from a hotel wifi would be a lie the user could catch.
  */
 const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
-  direct: { label: 'Direct', hint: 'Connected straight to your Mac on this network — end-to-end encrypted' },
-  relay: { label: 'Remote', hint: 'Reaching your Mac from away — still end-to-end encrypted, the relay only passes bytes' },
-  offline: { label: 'Offline', hint: "Can't reach your Mac right now" },
+  direct: { label: 'Direct', hint: 'Connected straight to your computer on this network — end-to-end encrypted' },
+  relay: { label: 'Remote', hint: 'Reaching your computer from away — still end-to-end encrypted, the relay only passes bytes' },
+  offline: { label: 'Offline', hint: "Can't reach your computer right now" },
 };
 
 /** The places (owner 09-26, Projects added 09-29): everything else is reached from inside them or from the quiet rows. */

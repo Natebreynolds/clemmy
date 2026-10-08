@@ -78,7 +78,7 @@ test('stale data says how old it is and never claims to be live', () => {
 
   assert.equal(
     lastGoodNotice('2026-09-06T09:00:00.000Z', now),
-    "Can't reach your Mac. This is what I last saw, 3h ago.",
+    "Can't reach your computer. This is what I last saw, 3h ago.",
   );
   assert.equal(lastGoodNotice(null, now), null, 'live data gets no banner at all');
 });

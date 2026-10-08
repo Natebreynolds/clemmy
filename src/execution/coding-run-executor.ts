@@ -90,7 +90,7 @@ async function defaultPreflight(agent: CodingAgentId): Promise<CodingRunPrefligh
   const { resolveGuestHarnessBinary } = await import('./guest-harness.js');
   const label = agent === 'claude' ? 'Claude Code' : 'Codex';
   if (!resolveGuestHarnessBinary(agent)) {
-    return { ok: false, reason: `${label} is not installed on this Mac. Install it from Connect → CLI tools, then run this again.` };
+    return { ok: false, reason: `${label} is not installed on this computer. Install it from Connect → CLI tools, then run this again.` };
   }
   try {
     const { getCliHealth } = await import('../integrations/cli-catalog/auth-health.js');

@@ -188,7 +188,7 @@ export function fireDueTimers(now: number = Date.now()): number {
           claimProspectiveIntention(intentionId, cueKey, 'timer-daemon', new Date(now));
         } catch { /* the timer file remains the execution authority */ }
         const lateNote = lateMs > LATE_ANNOTATION_MS
-          ? ` (delayed ${Math.round(lateMs / 60_000)} min — the app was closed or your Mac was asleep when it was due)`
+          ? ` (delayed ${Math.round(lateMs / 60_000)} min — the app was closed or your computer was asleep when it was due)`
           : '';
         try {
           addNotification({

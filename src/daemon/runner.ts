@@ -1310,7 +1310,7 @@ async function executeCronScheduleOccurrence(
         id: `cron-catchup-${job.name}-${occurrence.atMs}`,
         kind: 'cron',
         title: `Catching up: ${job.name}`,
-        body: `"${job.name}" missed ${missed} scheduled ${missed === 1 ? 'run' : 'runs'} while the app was closed or your Mac was asleep. Running it once now to catch up.`,
+        body: `"${job.name}" missed ${missed} scheduled ${missed === 1 ? 'run' : 'runs'} while the app was closed or your computer was asleep. Running it once now to catch up.`,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: {

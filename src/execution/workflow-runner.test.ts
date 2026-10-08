@@ -5540,8 +5540,16 @@ test.after(() => {
 
 test('explainDeterministicSpawnError: EPERM names the packaged-app TCC sandbox cause', () => {
   const err = Object.assign(new Error('spawn EPERM'), { code: 'EPERM' });
-  const out = explainDeterministicSpawnError(err, 'scripts/fetch.py');
+  const out = explainDeterministicSpawnError(err, 'scripts/fetch.py', 'darwin');
   assert.match(out.message, /sandbox|TCC|entitlement/i);
+  assert.match(out.message, /scripts\/fetch\.py/);
+});
+
+test('explainDeterministicSpawnError: EPERM off macOS stays a plain permission message', () => {
+  const err = Object.assign(new Error('spawn EPERM'), { code: 'EPERM' });
+  const out = explainDeterministicSpawnError(err, 'scripts/fetch.py', 'win32');
+  assert.doesNotMatch(out.message, /macOS|TCC|entitlement/i);
+  assert.match(out.message, /permission/i);
   assert.match(out.message, /scripts\/fetch\.py/);
 });
 

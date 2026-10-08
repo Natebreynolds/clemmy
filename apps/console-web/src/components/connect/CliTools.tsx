@@ -13,6 +13,7 @@ import {
   type ManagedCliStatus, type ManagedCliKind, type ManagedCliAction,
   type CatalogEntry, type ConnectedCli, type CliHealth,
 } from '@/lib/connect';
+import { isMac } from '@/lib/platform';
 
 const BARE = /^[A-Za-z0-9._+-]{1,60}$/;
 // gh + composio are shown as rich managed cards; don't duplicate them in the catalog list.
@@ -431,7 +432,7 @@ function CustomInstall({ onJob }: { onJob: (jobId: string) => void }) {
       <div className="mb-2 text-small font-medium text-fg">Paste an install command</div>
       <div className="mb-2 flex items-center gap-2">
         <input value={command} onChange={(e) => { setCommand(e.target.value); setError(''); }}
-          placeholder="npm install -g some-cli   ·   brew install some-tool" aria-label="Install command"
+          placeholder={isMac() ? 'npm install -g some-cli   ·   brew install some-tool' : 'npm install -g some-cli'} aria-label="Install command"
           className="min-w-0 flex-1 rounded border border-border bg-canvas px-2.5 py-1.5 font-mono text-caption text-fg outline-none focus-visible:ring-2 focus-visible:ring-primary" />
         <Button size="sm" disabled={!command.trim() || submitting} onClick={() => void submit()}>
           {submitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Download className="h-3.5 w-3.5" aria-hidden />} Install
@@ -447,7 +448,7 @@ function CustomInstall({ onJob }: { onJob: (jobId: string) => void }) {
             className="w-32 rounded border border-border bg-canvas px-2 py-0.5 font-mono text-caption text-fg outline-none focus-visible:ring-2 focus-visible:ring-primary" />
         )}
       </label>
-      <p className="mt-1.5 text-caption text-faint">Allowed forms: npm install -g · brew install · uv tool install · pipx install · pip install --user · git clone https. Anything else is refused.</p>
+      <p className="mt-1.5 text-caption text-faint">Allowed forms: npm install -g · {isMac() ? 'brew install · ' : ''}uv tool install · pipx install · pip install --user · git clone https. Anything else is refused.</p>
       {error && <p className="mt-1.5 text-caption text-danger">{error}</p>}
     </Card>
   );

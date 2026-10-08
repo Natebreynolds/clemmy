@@ -378,7 +378,7 @@ export const PROJECT_PAGES_EMPTY = 'No page has been made in this project yet.';
 /** What the desktop's frame allows a page: its scripts, and nothing of the app. */
 export const PROJECT_PAGE_FRAME_SANDBOX = 'allow-scripts';
 export const PROJECT_PAGE_FRAME_NOTE = 'Shown in a sandbox: the page cannot reach Clem, your accounts or your files.';
-export const PROJECT_PAGE_RENDERED_NOTE = 'Rendered on your Mac at this width. Nothing on the page runs here.';
+export const PROJECT_PAGE_RENDERED_NOTE = 'Rendered on your computer at this width. Nothing on the page runs here.';
 /** How tall one rendered part is, and how many parts a reader asks for at most. */
 export const PROJECT_PAGE_PART_HEIGHT = 1600;
 export const PROJECT_PAGE_MOST_PARTS = 12;
@@ -435,10 +435,10 @@ export function projectPageNextOffset(parts: ReadonlyArray<Pick<ProjectPageImage
 export function projectPageRefusal(code: string | null | undefined): string {
   switch ((code ?? '').toUpperCase()) {
     case 'PAGE_NOT_FOUND': return 'That page is no longer where it was written, or its folder is no longer linked to this project.';
-    case 'PAGE_TOO_LARGE': return 'That page is too large to show here. Open it in your browser on your Mac.';
-    case 'PAGE_NOT_RENDERED': return 'Your Mac could not render the page. It needs Chrome, Edge, Brave or Chromium installed.';
-    case 'THIS_MACHINE_ONLY': return 'That can only be done on your Mac.';
-    case 'NOT_SUPPORTED_HERE': return 'Opening a page in the browser works on a Mac only.';
+    case 'PAGE_TOO_LARGE': return 'That page is too large to show here. Open it in your browser on your computer.';
+    case 'PAGE_NOT_RENDERED': return 'Your computer could not render the page. It needs Chrome, Edge, Brave or Chromium installed.';
+    case 'THIS_MACHINE_ONLY': return 'That can only be done on your computer.';
+    case 'NOT_SUPPORTED_HERE': return 'Opening a page in the browser is not supported on this computer yet.';
     default: return 'The page could not be shown. Try again.';
   }
 }
@@ -502,7 +502,7 @@ function pathLeaf(path: string | null | undefined): string {
 
 /** Said when the folder is gone; null while it is there. */
 export function projectLocalProjectMissingLine(localProject: Pick<ProjectLinkedLocalProject, 'present'>): string | null {
-  return localProject.present ? null : 'This folder is no longer on this Mac. Remove it, or link the local project where it lives now.';
+  return localProject.present ? null : 'This folder is no longer on this computer. Remove it, or link the local project where it lives now.';
 }
 
 export const PROJECT_LOCAL_COMMANDS_LABEL = 'Commands it offers';

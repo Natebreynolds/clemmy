@@ -19,6 +19,7 @@ import { NotchSettingsCard } from './settings/NotchSettingsCard';
 import { CleanupCard } from './settings/CleanupCard';
 import { StorageCard } from './settings/StorageCard';
 import { cn } from '@/lib/cn';
+import { isMac } from '@/lib/platform';
 
 const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
   { key: 'light', label: 'Light', icon: Sun },
@@ -57,6 +58,8 @@ const NAV_GROUPS: { group: string; items: { id: string; label: string }[] }[] = 
 
 export function Settings() {
   const { choice, setChoice } = useTheme();
+  // The notch is a macOS menu-bar feature; elsewhere it is not offered at all.
+  const showNotch = isMac();
   // Links from elsewhere (Connect, a top-bar chip) land on a section by hash;
   // the router does not scroll to it on its own.
   const { hash } = useLocation();
@@ -70,7 +73,7 @@ export function Settings() {
         {NAV_GROUPS.map((g, i) => (
           <div key={g.group} className={cn('flex flex-col', i > 0 && 'mt-3 border-t border-border pt-3')}>
             <p className="px-2.5 pb-1 text-caption font-semibold uppercase tracking-widest text-faint">{g.group}</p>
-            {g.items.map((s) => (
+            {g.items.filter((s) => showNotch || s.id !== 'notch').map((s) => (
               <a key={s.id} href={`#${s.id}`} className="rounded-md px-2.5 py-1.5 text-small font-medium text-muted transition-colors hover:bg-surface hover:text-fg">{s.label}</a>
             ))}
           </div>
@@ -115,7 +118,7 @@ export function Settings() {
               <Button variant="secondary" size="sm" onClick={openCustomizeHome}>Customize</Button>
             </div>
           </section>
-          <section id="notch" className="scroll-mt-16"><NotchSettingsCard /></section>
+          {showNotch && <section id="notch" className="scroll-mt-16"><NotchSettingsCard /></section>}
           <p className="-mb-4 text-caption font-semibold uppercase tracking-widest text-faint">Upkeep</p>
           <section id="storage" className="scroll-mt-16">
             <h2 className="mb-3 text-h2 text-fg">Storage</h2>

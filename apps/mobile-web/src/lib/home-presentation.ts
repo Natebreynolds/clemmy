@@ -89,7 +89,7 @@ export interface CountProvenance {
 export function homeCountAsOf(input: CountProvenance): string {
   if (input.countLive) return '';
   return input.countAge
-    ? `Counted ${input.countAge} — I can't reach your Mac.`
+    ? `Counted ${input.countAge} — I can't reach your computer.`
     : 'Not confirmed just now.';
 }
 

@@ -31,9 +31,9 @@ export function Login({ pairError }: Props) {
   return (
     <div class="login-shell">
       <img class="login-mark" src="/m/clemmy.png" alt="" width="88" height="88" />
-      <h1>Pair with your Mac</h1>
+      <h1>Pair with your computer</h1>
       <p>
-        Open Clementine on your Mac, go to <strong>Mobile</strong>, and scan the QR code
+        Open Clementine on your computer, go to <strong>Mobile</strong>, and scan the QR code
         from inside this app.
       </p>
       {pairError ? <div class="global-error">{pairError}</div> : null}

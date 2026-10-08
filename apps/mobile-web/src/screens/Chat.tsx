@@ -864,7 +864,7 @@ function MessageRow({
         {message.pending === 'sending' ? <div class="pending-status">sending…</div> : null}
         {message.pending === 'failed' ? (
           <div class="pending-status pending-failed">
-            <span>failed — {message.pendingError ?? 'couldn’t reach your Mac'}</span>
+            <span>failed — {message.pendingError ?? 'couldn’t reach your computer'}</span>
             <button class="pending-action" onClick={() => onRetry(message.id)}>retry</button>
             <button class="pending-action" onClick={() => onDiscard(message.id)}>discard</button>
           </div>

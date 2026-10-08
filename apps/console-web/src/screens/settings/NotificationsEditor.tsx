@@ -24,12 +24,12 @@ const TYPE_LABEL: Record<DestinationType, string> = {
   slack_user: 'Slack DM',
   web_push: 'Browser push',
   apns: 'Clem app',
-  desktop: 'This Mac',
+  desktop: 'This computer',
 };
 
 const PHONE_TYPES = new Set<DestinationType>(['web_push', 'apns']);
 const isPhone = (d: NotificationDestination) => PHONE_TYPES.has(d.type);
-const phoneCaption = (d: NotificationDestination) => (d.type === 'apns' ? 'Clem app · notifications from your Mac' : 'Browser push · notifications from your Mac');
+const phoneCaption = (d: NotificationDestination) => (d.type === 'apns' ? 'Clem app · notifications from your computer' : 'Browser push · notifications from your computer');
 
 export function NotificationsEditor() {
   const qc = useQueryClient();
@@ -102,7 +102,7 @@ export function NotificationsEditor() {
       <ul className="mb-4 space-y-2">
         <li className="flex items-center gap-3 rounded-md border border-border px-3 py-2.5">
           <div className="min-w-0 flex-1">
-            <div className="truncate text-body font-medium text-fg">This Mac</div>
+            <div className="truncate text-body font-medium text-fg">This computer</div>
             <div className="truncate text-caption text-faint">A toast when she needs you, or finished something while you were away</div>
           </div>
           <StatusPill tone="success">Always on</StatusPill>

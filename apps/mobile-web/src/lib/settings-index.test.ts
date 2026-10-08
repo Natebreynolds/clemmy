@@ -44,7 +44,7 @@ test('connections are counted as apps and Mac tools, with what needs a look', ()
     { id: 'b', name: 'Monday', kind: 'composio', state: 'ok' as const, cause: null },
     { id: 'c', name: 'sf', kind: 'cli', state: 'warn' as const, cause: 'Not checked yet' },
   ];
-  assert.equal(connectionsSummary(rows), '2 apps · 1 tool on your Mac · 1 needs a look');
+  assert.equal(connectionsSummary(rows), '2 apps · 1 tool on your computer · 1 needs a look');
   assert.equal(connectionsSummary([]), 'Nothing connected yet');
 });
 

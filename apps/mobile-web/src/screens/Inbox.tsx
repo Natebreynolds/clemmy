@@ -958,7 +958,7 @@ function EndRunButton({ runId, workflow, onResolved }: {
           'error',
         );
       } else if (status === 404) {
-        onResolved('That run is no longer on your Mac, so there was nothing to stop.', 'error');
+        onResolved('That run is no longer on your computer, so there was nothing to stop.', 'error');
       } else {
         haptic('error');
         onResolved(err instanceof Error ? err.message : 'I could not stop that run.', 'error');
@@ -1053,7 +1053,7 @@ function WorkflowCapabilityCard({ row, gate, onResolved, onOpenSettings, onOpenW
         <div class="inbox-card-actions">
           <button type="button" class="btn-reply" disabled={busy} onClick={onOpenSettings}>View connection status</button>
           <button type="button" class="btn-approve" disabled={busy} onClick={() => void resolve()}>
-            {busy ? 'Resuming…' : 'I connected it on my Mac — resume'}
+            {busy ? 'Resuming…' : 'I connected it on my computer — resume'}
           </button>
         </div>
       ) : resolution.kind === 'retry_exact_metadata' ? (

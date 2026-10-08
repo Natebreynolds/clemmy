@@ -55,7 +55,7 @@ test('failed first connection read is unavailable with a working Retry, never em
 test('a failed refresh of a previously empty inventory makes no current empty claim', () => {
   const rendered = view({ rows: [], error: 'Request failed', stale: true });
   assert.match(rendered.text, /Connection status is unavailable/);
-  assert.doesNotMatch(rendered.text, /Nothing connected|Connect apps on your Mac/);
+  assert.doesNotMatch(rendered.text, /Nothing connected|Connect apps on your computer/);
 });
 
 test('a failed refresh preserves known rows while withdrawing current health indicators', () => {
@@ -72,7 +72,7 @@ test('offline failures retain historical warnings and offer Retry', () => {
     rows: [{ ...connected, state: 'warn', cause: 'Sign-in expired' }],
     error: 'Offline', offline: true, stale: true,
   });
-  assert.match(rendered.text, /Can't reach your Mac right now/);
+  assert.match(rendered.text, /Can't reach your computer right now/);
   assert.match(rendered.text, /Last checked: Sign-in expired/);
   assert.match(rendered.text, /Retry/);
   assert.doesNotMatch(rendered.text, /Nothing connected/);

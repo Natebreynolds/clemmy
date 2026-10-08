@@ -3790,7 +3790,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         }
         res.status(502).json({
           error: 'TRANSCRIBER_NOT_READY',
-          message: localErr instanceof Error ? `On-device transcription isn't ready: ${localErr.message}` : 'On-device transcription is not ready yet. Open Meetings on your Mac once to install the local model.',
+          message: localErr instanceof Error ? `On-device transcription isn't ready: ${localErr.message}` : 'On-device transcription is not ready yet. Open Meetings on your computer once to install the local model.',
         });
       }
     } catch (err) {
@@ -6365,7 +6365,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       if (!option.available) {
         res.status(409).json({
           error: 'MODEL_UNAVAILABLE',
-          message: `${option.label} is not connected. Connect it on your Mac first.`,
+          message: `${option.label} is not connected. Connect it on your computer first.`,
         });
         return;
       }
@@ -6382,7 +6382,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         if (!getByoBackendConfig().configured) {
           res.status(409).json({
             error: 'BYO_NOT_CONFIGURED',
-            message: 'No BYO model is configured. Add one on your Mac first.',
+            message: 'No BYO model is configured. Add one on your computer first.',
           });
           return;
         }
@@ -6521,7 +6521,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
               ? null
               : broken?.suppressionReason
                 ?? (needsReconnect
-                  ? 'Stopped working — fix on your Mac'
+                  ? 'Stopped working — fix on your computer'
                   : `Status: ${broken?.providerStatus ?? 'unknown'}`),
           });
         }
@@ -6548,11 +6548,11 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             : !row
               ? 'Not checked yet'
               : !row.installed
-                ? 'Not installed — fix on your Mac'
+                ? 'Not installed — fix on your computer'
                 : row.authStatus === 'signed_out'
-                  ? 'Signed out — fix on your Mac'
+                  ? 'Signed out — fix on your computer'
                   : row.authStatus === 'error'
-                    ? 'Health check failed — fix on your Mac'
+                    ? 'Health check failed — fix on your computer'
                     : 'Not checked yet',
         });
       }

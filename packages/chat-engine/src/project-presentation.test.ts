@@ -156,7 +156,7 @@ test('a linked local project says when its folder is gone, and when coding work 
   assert.equal(projectLocalProjectGitLine(here!), null);
 
   const gone = { name: 'old', path: '/srv/o/code/old', present: false, git: false };
-  assert.match(projectLocalProjectMissingLine(gone)!, /no longer on this Mac/);
+  assert.match(projectLocalProjectMissingLine(gone)!, /no longer on this computer/);
   assert.equal(projectLocalProjectGitLine(gone), null, 'a folder that is gone gets one line, not two');
 
   const plain = { name: 'notes', path: '/srv/o/notes', present: true, git: false };
@@ -248,7 +248,7 @@ test('the picker marks what is already linked and lists each folder once', () =>
 test('a refused link is said in plain words', () => {
   assert.equal(projectLocalProjectRefusal('LOCAL_PROJECT_CHOICE_REQUIRED', 'app'), 'More than one local project is called “app”. Choose the one you mean.');
   assert.equal(projectLocalProjectRefusal('LOCAL_PROJECT_CHOICE_REQUIRED', ''), 'Choose which local project to link.');
-  assert.match(projectLocalProjectRefusal('LOCAL_PROJECT_NOT_FOUND', '/tmp/x')!, /^“\/tmp\/x” is not among the code folders on this Mac/);
+  assert.match(projectLocalProjectRefusal('LOCAL_PROJECT_NOT_FOUND', '/tmp/x')!, /^“\/tmp\/x” is not among the code folders on this computer/);
   assert.equal(projectLocalProjectRefusal('NAME_TAKEN'), null);
 });
 

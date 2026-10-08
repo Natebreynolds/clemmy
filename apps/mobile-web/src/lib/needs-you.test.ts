@@ -49,7 +49,7 @@ test('a remembered count says how old it is, in every surface', () => {
     '3 items need you, as of 6h ago',
     'a bare numeral cannot disclose its own age — the label does',
   );
-  assert.match(chrome.pillAriaLabel, /Can't reach your Mac/);
+  assert.match(chrome.pillAriaLabel, /Can't reach your computer/);
 });
 
 test('a failed poll stops the chrome claiming to be current, even with no stamp', () => {
@@ -73,7 +73,7 @@ test('a freshly-missed poll is not yet worth a number', () => {
   assert.equal(chrome.stale, true, 'still marked, so the chrome is not solid');
   assert.equal(chrome.age, null);
   assert.equal(chrome.pillText, 'Needs you · 1');
-  assert.equal(chrome.pillAriaLabel, "1 item needs you, not confirmed just now. Can't reach your Mac. Open Needs you");
+  assert.equal(chrome.pillAriaLabel, "1 item needs you, not confirmed just now. Can't reach your computer. Open Needs you");
 });
 
 test('an unknown count and a real zero both show nothing', () => {

@@ -35,7 +35,7 @@ interface Props {
 
 function presentable(error: string): string {
   if (error.length > 120 || /at\s+\w+\s+\(|stack|ECONN|ETIMEDOUT|\{"/.test(error)) {
-    return 'Something went wrong talking to your Mac.';
+    return 'Something went wrong talking to your computer.';
   }
   return error;
 }
@@ -63,7 +63,7 @@ export function ScreenNotice({ error, offline, onRetry, hasData, note, lastGood 
     );
   }
   const text = offline
-    ? "Can't reach your Mac right now."
+    ? "Can't reach your computer right now."
     : presentable(error ?? '');
   return (
     <div class={`screen-notice${hasData ? ' screen-notice-banner' : ''}${offline ? ' screen-notice-offline' : ''}`} role="status">

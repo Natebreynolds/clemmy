@@ -23,10 +23,10 @@ export const PAGE_WIDTH_USUAL = 390;
 const PAGE_IMAGE_TYPE = 'image/png';
 const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 
-export const PAGE_RENDERING_WORDS = 'Rendering the next part on your Mac…';
+export const PAGE_RENDERING_WORDS = 'Rendering the next part on your computer…';
 export const PAGE_MORE_WORDS = 'Show more of the page';
 export const PAGE_ENDED_WORDS = 'End of the page.';
-export const PAGE_LIMIT_WORDS = 'This is as much as is shown here. Open the page on your Mac to see the rest.';
+export const PAGE_LIMIT_WORDS = 'This is as much as is shown here. Open the page on your computer to see the rest.';
 
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 

@@ -158,7 +158,7 @@ test('a count off the service-worker shelf is disclosed, never gated', () => {
     countAge: '6h ago',
   }));
   assert.equal(lead.headline, '86 things are waiting in Needs you', 'the answer is still given');
-  assert.equal(lead.asOf, "Counted 6h ago — I can't reach your Mac.");
+  assert.equal(lead.asOf, "Counted 6h ago — I can't reach your computer.");
   assert.deepEqual(lead.action, { label: 'Open Needs you', target: 'inbox' },
     'and the door to act on it stays open');
 });
@@ -175,7 +175,7 @@ test('every lead that rests on the count carries its provenance, including the q
     {},
   ] as Array<Partial<HomeLeadFacts>>) {
     const lead = homeLead(facts({ ...over, ...stale }));
-    assert.equal(lead.asOf, "Counted 6h ago — I can't reach your Mac.", JSON.stringify(over));
+    assert.equal(lead.asOf, "Counted 6h ago — I can't reach your computer.", JSON.stringify(over));
   }
   // "All clear" is the most confident thing this screen says, so it is the one
   // that most needs the disclosure.

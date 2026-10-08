@@ -140,7 +140,7 @@ export function mobileSetupView(payload: MobileAccessStatusPayload): MobileSetup
       failure: {
         code: 'DOOR_CLOSED',
         message: payload.target.qrBlockedReason
-          ?? 'The direct-app door did not open, so a phone cannot reach this Mac.',
+          ?? 'The direct-app door did not open, so a phone cannot reach this computer.',
         remedy: { label: 'Try again', action: 'retry' },
       },
     };
@@ -152,7 +152,7 @@ export function mobileSetupView(payload: MobileAccessStatusPayload): MobileSetup
     phase: 'not-set-up',
     headline: 'Use Clementine on your phone',
     detail: payload.target.qrBlockedReason
-      ?? 'Scan a code from the Clem app to pair this Mac.',
+      ?? 'Scan a code from the Clem app to pair this computer.',
     qrReady: false,
     devices,
   };

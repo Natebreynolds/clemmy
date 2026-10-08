@@ -4287,10 +4287,21 @@ export async function runDeterministicWorkflowStepForTest(
  * failure that looks like a bug. Name it so the user knows the fix is
  * entitlements, not the workflow. Pure + exported for tests.
  */
-export function explainDeterministicSpawnError(err: unknown, target: string): Error {
+export function explainDeterministicSpawnError(
+  err: unknown,
+  target: string,
+  platform: NodeJS.Platform = process.platform,
+): Error {
   const msg = err instanceof Error ? err.message : String(err);
   const code = (err as { code?: string } | null)?.code;
   if (code === 'EPERM' || code === 'EACCES' || /\bEPERM\b|uv_cwd|operation not permitted/i.test(msg)) {
+    if (platform !== 'darwin') {
+      return new Error(
+        `deterministic runner could not launch (${code ?? 'permission denied'}): ${target}. ` +
+        'This computer refused permission to start it. Check that your account can read and run the script ' +
+        `and its folder, then retry. (original: ${msg})`,
+      );
+    }
     return new Error(
       `deterministic runner could not launch (${code ?? 'permission denied'}): ${target}. ` +
       'On the packaged macOS app, child scripts are blocked by the app sandbox (TCC) until Clementine has ' +

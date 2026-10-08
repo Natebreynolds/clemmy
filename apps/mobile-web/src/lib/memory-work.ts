@@ -240,13 +240,13 @@ export interface MemoryWorkStatus {
 export function memoryWorkStatus(read: MemoryWorkRead, modelName: ModelNamer): MemoryWorkStatus | null {
   const { snapshot } = read;
   if (!snapshot) {
-    if (read.offline) return { tone: 'unknown', pulse: false, text: 'Can’t reach your Mac right now', stale: null };
+    if (read.offline) return { tone: 'unknown', pulse: false, text: 'Can’t reach your computer right now', stale: null };
     if (read.error) return { tone: 'unknown', pulse: false, text: 'Couldn’t read memory work just now', stale: null };
     return null;
   }
   const now = serverNow(snapshot.generatedAt, read.receivedAt, read.now);
   const headline = memoryWorkHeadline(snapshot, memoryTimeFormat(now), modelName);
-  const failed = read.offline ? 'Can’t reach your Mac' : read.error ? 'Couldn’t refresh' : null;
+  const failed = read.offline ? 'Can’t reach your computer' : read.error ? 'Couldn’t refresh' : null;
   const stale = failed
     ? (read.receivedAt === null ? failed : `${failed} · as of ${agoFromMs(Math.max(0, read.now - read.receivedAt))}`)
     : null;

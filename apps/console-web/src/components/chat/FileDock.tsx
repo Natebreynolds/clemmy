@@ -128,7 +128,7 @@ function FileBody({ fileRef, onClose }: { fileRef: SessionFileRef; onClose: () =
     setOpening('working');
     void openSessionFile(fileRef)
       .then(() => setOpening('opened'))
-      .catch(() => { setOpening('idle'); setProblem('The Mac could not open it in its app.'); });
+      .catch(() => { setOpening('idle'); setProblem('The computer could not open it in its app.'); });
   };
   const place = file ? `${file.place} · ${fileSizeWords(file.bytes)}` : fileRef.folder;
   return (

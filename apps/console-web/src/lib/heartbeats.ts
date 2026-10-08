@@ -71,7 +71,7 @@ export function cadenceChoices(range: { min: number; max: number }, current: num
 /** Why push would not reach a phone today, in the owner's terms; empty when it would. */
 export function phonePushCaveat(readiness: HeartbeatStatus['phonePush'] | undefined): string {
   if (!readiness || readiness.ready) return '';
-  if (readiness.reason === 'apns_key_missing') return 'Your phone is paired, but this Mac has no Apple push key yet, so these items stay in the app for now.';
+  if (readiness.reason === 'apns_key_missing') return 'Your phone is paired, but this computer has no Apple push key yet, so these items stay in the app for now.';
   return 'No phone is set up for notifications yet. Open Clem on your phone and allow notifications; until then these items stay in the app.';
 }
 

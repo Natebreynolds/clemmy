@@ -84,7 +84,7 @@ test('workflow capability cards expose exact choices and truthful recovery actio
   assert.match(source, /account \{candidate\.accountId\}/);
   assert.match(source, /capability \{candidate\.capabilityId\}/);
   assert.match(source, /if \(actionLock\.current \|\| gate\.resolution\.kind === 'review_run'\) return/);
-  assert.match(source, /I connected it on my Mac — resume/);
+  assert.match(source, /I connected it on my computer — resume/);
   assert.match(source, /Retry exact metadata now/);
   assert.match(source, /Review preserved run/);
   assert.match(api, /choiceSetDigest: gate\.resolution\.choiceSetDigest/);

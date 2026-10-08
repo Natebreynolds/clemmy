@@ -102,7 +102,7 @@ test('linking a local project: a refusal hands back the folders to choose from',
     { kind: 'not_found', named: '/tmp/gone', localProjects: [] },
   );
   assert.equal(localProjectLinkFromRefusal(refused(409, { error: 'PROJECT_ARCHIVED' })), null, 'any other refusal is a failure');
-  assert.equal(refusalText(refused(409, { error: 'LOCAL_PROJECT_NOT_FOUND' })), 'That folder is not among the code folders on this Mac. Add it in Connect first.');
+  assert.equal(refusalText(refused(409, { error: 'LOCAL_PROJECT_NOT_FOUND' })), 'That folder is not among the code folders on this computer. Add it in Connect first.');
   assert.notEqual(projectKeys.localProjects[0], 'projects', 'Connect\'s code folders own that key');
 });
 

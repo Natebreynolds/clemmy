@@ -179,7 +179,7 @@ export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent
                     <span class="brain-row-note">
                       {busyValue === option.value ? 'Switching…'
                         : isCurrent ? 'Current'
-                          : option.available ? '' : 'Connect on your Mac'}
+                          : option.available ? '' : 'Connect on your computer'}
                     </span>
                   </button>
                 );

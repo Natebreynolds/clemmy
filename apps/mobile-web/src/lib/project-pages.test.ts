@@ -174,7 +174,7 @@ test('a part that did not arrive is said in words, and a page that is gone is no
 
   const offline = pageFailure({ offline: true, status: 0, body: null });
   assert.equal(offline.retry, true);
-  assert.match(offline.text, /reach your Mac/);
+  assert.match(offline.text, /reach your computer/);
 
   const unnamed = [pageFailure(new Error('HTTP 500')), pageFailure(null), pageFailure({ body: { error: 42 } }), pageFailure(refused('SOMETHING_NEW'))];
   for (const failure of unnamed) {
