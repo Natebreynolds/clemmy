@@ -14,18 +14,30 @@ function readSmallFile(file: string): string | null {
   } catch { return null; }
 }
 
-/** Recognize npm's local Claude Code target, without evaluating batch syntax. */
+/** Recognize npm's local Claude Code target, without evaluating batch syntax.
+ *  npm's cmd-shim ends the launcher with `"%_prog%" <args> "%dp0%\<target>" %*`
+ *  for a script node runs (with no args that is TWO spaces after "%_prog%"),
+ *  or `"%dp0%\<target>" <args> %*` for a native target. A tester's real npm
+ *  install (2026-10-08) failed the old one-space pattern, fell through to the
+ *  extensionless sh launcher and every Claude call crashed with spawn ENOENT.
+ *  The target must be the package's own declared `claude` bin, inside it. */
 function npmClaudeEntry(shim: string): string | null {
   const text = readSmallFile(shim);
-  if (!text || !/^\s*(?:endLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & )?"%_prog%" "%dp0%\\node_modules\\@anthropic-ai\\claude-code\\cli\.js" %\*\s*$/im.test(text)) return null;
+  const launch = text ? /^\s*(?:endLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & )?(?:"%_prog%"\s+)?"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\([^"%\r\n]+)"\s+%\*\s*$/im.exec(text) : null;
+  if (!launch) return null;
   const packageRoot = path.join(path.dirname(shim), 'node_modules', '@anthropic-ai', 'claude-code');
   const metadata = readSmallFile(path.join(packageRoot, 'package.json'));
   if (!metadata) return null;
   try {
     const pkg = JSON.parse(metadata) as { name?: unknown; bin?: unknown };
-    if (pkg.name !== '@anthropic-ai/claude-code' || !pkg.bin || typeof pkg.bin !== 'object'
-      || (pkg.bin as Record<string, unknown>).claude !== 'cli.js') return null;
-    const entry = path.join(packageRoot, 'cli.js');
+    const declared = typeof pkg.bin === 'string' ? pkg.bin
+      : pkg.bin && typeof pkg.bin === 'object' ? (pkg.bin as Record<string, unknown>).claude : undefined;
+    if (pkg.name !== '@anthropic-ai/claude-code' || typeof declared !== 'string') return null;
+    const target = path.posix.normalize(launch[1]!.split('\\').join('/'));
+    if (path.posix.normalize(declared.split('\\').join('/')) !== target) return null;
+    const entry = path.join(packageRoot, ...target.split('/'));
+    const relative = path.relative(packageRoot, entry);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
     return statSync(entry).isFile() ? entry : null;
   } catch { return null; }
 }
@@ -46,7 +58,9 @@ export function resolveClaudeCliOnPath(input: {
     if (resolved) return resolved;
     throw new Error('CLAUDE_CLI_PATH is an unsupported Windows batch launcher. Use the native claude.exe or a standard npm Claude Code installation.');
   }
-  const extensions = platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
+  // Windows cannot start an extensionless file: npm's bare `claude` beside
+  // claude.cmd is a sh script for Git Bash, and spawning it is ENOENT.
+  const extensions = platform === 'win32' ? ['.exe', '.cmd', '.bat'] : [''];
   let unsupportedLauncher = false;
   for (const directory of input.directories) {
     if (!directory) continue;

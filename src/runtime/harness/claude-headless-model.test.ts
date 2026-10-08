@@ -318,6 +318,40 @@ test('ClaudeHeadlessModel streams deltas and emits a conformant done event', asy
   assert.equal(done.response.usage.outputTokens, 2);
 });
 
+test('a Claude CLI that fails to start fails only this call, never the daemon', async () => {
+  // Installed Windows beta, 2026-10-08: spawn ENOENT rejected the exit wait
+  // before anything observed it; the daemon's fatal unhandled-rejection
+  // handler then ended the process on every Claude call.
+  writeClaudeToken();
+  setClaudeHeadlessSpawnForTest(((_cmd: string, _args: string[]) => {
+    const child = new EventEmitter() as any;
+    child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+    child.kill = () => true;
+    process.nextTick(() => {
+      const error = Object.assign(new Error('spawn C:\\fixture\\npm\\claude ENOENT'), { code: 'ENOENT', errno: -4058, syscall: 'spawn' });
+      child.stdin.destroy(Object.assign(new Error('write EOF'), { code: 'EOF' }));
+      child.emit('error', error);
+      child.stdout.end(); child.stderr.end();
+      child.emit('close', -4058, null);
+    });
+    return child;
+  }) as any);
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const model = new ClaudeHeadlessModel('claude-sonnet-4-6');
+    await assert.rejects(model.getResponse({ input: 'Answer once.', modelSettings: {}, tools: [], outputType: 'text', handoffs: [], tracing: false } as any),
+      /ENOENT/);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(unhandled, [], 'the failed launch is this call\'s error, not a process-level rejection');
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    setClaudeHeadlessSpawnForTest(null);
+  }
+});
+
 test('ClaudeHeadlessModel.getResponse returns assistant output and usage', async () => {
   const captured: { args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv } = {};
   installSpawnMock([

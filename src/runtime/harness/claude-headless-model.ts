@@ -39,7 +39,9 @@ export function setClaudeHeadlessCliAvailableForTest(value: boolean | null): voi
  *  fallover error, so nothing auto-recovers from it. */
 export function claudeHeadlessCliAvailable(): boolean {
   if (cliAvailableOverride !== null) return cliAvailableOverride;
-  return resolveClaudeCliPath() !== null;
+  // A launcher this transport cannot start is an absent CLI here: the caller
+  // falls back to the raw Messages adapter instead of failing every turn.
+  try { return resolveClaudeCliPath() !== null; } catch { return false; }
 }
 
 /**
@@ -678,6 +680,14 @@ async function* runClaudeHeadlessAttempt(
   }) as ChildProcessWithoutNullStreams;
   const stderr = collectStderr(child);
   const exit = waitForExit(child);
+  // A launch that fails (spawn ENOENT) rejects `exit` before stdout is read.
+  // Unobserved until then, it was an unhandled rejection, and the daemon's
+  // fatal handler took the whole process down with it (installed Windows
+  // beta, ten restarts in seven minutes). The rejection is still thrown at
+  // the `await exit` below as this call's own failure; a write to a child
+  // that never started is that same failure, not a stream crash.
+  exit.catch(() => undefined);
+  child.stdin.on('error', () => undefined);
   const abort = () => {
     try { child.kill('SIGTERM'); } catch { /* ignore */ }
   };
