@@ -489,12 +489,22 @@ async function skipSetup(app) {
         dialogFailure = new SmokeError('setup_confirmation_failed');
       });
     });
-    await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', clickCount: 1, ...bounds });
-    await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', clickCount: 1, ...bounds });
+    // The skip can complete and the app close the setup window before the
+    // click's own reply arrives (run 37735935514: cdp_closed with the app's
+    // setup-complete marker already written). After the click is dispatched,
+    // a closed window is not a verdict: the app's marker is the evidence.
+    let setupWindowClosed = false;
+    try {
+      await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', clickCount: 1, ...bounds });
+      await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', clickCount: 1, ...bounds });
+    } catch (error) {
+      if (!(error instanceof SmokeError && error.code === 'cdp_closed')) throw error;
+      setupWindowClosed = true;
+    }
     await waitFor(async () => {
-      if (dialogFailure) throw dialogFailure;
+      if (dialogFailure && !setupWindowClosed) throw dialogFailure;
       const marker = path.join(app.env.CLEMENTINE_HOME, 'state', 'setup-complete.json');
-      if (!dialogAccepted || !existsSync(marker)) return null;
+      if (!(dialogAccepted || setupWindowClosed) || !existsSync(marker)) return null;
       const record = jsonFile(marker);
       if (record.version !== 'v1' || record.configured?.auth !== 'skipped') refuse('setup_marker_not_app_skip');
       return true;
