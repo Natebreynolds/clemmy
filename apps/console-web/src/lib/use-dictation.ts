@@ -1,95 +1,83 @@
 /**
  * Dictation for the desktop composer.
  *
- * The phone has had this since it shipped (apps/mobile-web/src/lib/use-dictation.ts)
- * while the desktop's only microphone lived in the notch meeting surface — so
- * the owner could talk to Clem from the couch but not from the machine the work
- * actually happens on. This is that hook for React.
+ * The microphone is recorded and transcribed ON THIS COMPUTER: the notch's
+ * recorder captures 16 kHz mono audio and /api/console/voice/transcribe runs
+ * the same local whisper model Meetings uses (an OpenAI key is only its
+ * fallback). The words land in the draft; nothing is sent until the owner
+ * sends it.
  *
- * It is a deliberate copy rather than a shared module: @clem/chat-engine is
- * framework-agnostic with no DOM types, and the Web Speech API is nothing but
- * DOM. The two copies differ only in which `useState` they import and in the
- * phone's haptic tap.
+ * It used the browser's Web Speech API. Electron exposes
+ * webkitSpeechRecognition, but it cannot work there (the speech service is
+ * keyed into Google Chrome builds only), so the Mac and Windows apps showed a
+ * microphone that did nothing (owner, 2026-10-08). The phone keeps its own
+ * copy, where the system speech recognizer does work.
+ *
+ * The final transcription only, no live interim: each interim pass re-runs
+ * whisper over the whole clip, which costs a loaded machine more than the
+ * words appearing a second earlier is worth.
  */
 import { useEffect, useRef, useState } from 'react';
+import { NotchVoice } from './notch-voice';
+import { dictatedDraft } from './dictation-text';
 
-/** The minimal slice of the Web Speech API this hook uses. */
-interface SpeechRecognitionLike {
-  lang: string;
-  interimResults: boolean;
-  continuous: boolean;
-  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>>; resultIndex: number }) => void) | null;
-  onend: (() => void) | null;
-  onerror: (() => void) | null;
-  start(): void;
-  stop(): void;
-  abort(): void;
+function microphoneRecordingAvailable(): boolean {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;
+  const audio = typeof AudioContext !== 'undefined' || 'webkitAudioContext' in window;
+  return Boolean(navigator.mediaDevices?.getUserMedia) && audio;
 }
 
-function speechRecognitionCtor(): (new () => SpeechRecognitionLike) | null {
-  const w = window as unknown as {
-    SpeechRecognition?: new () => SpeechRecognitionLike;
-    webkitSpeechRecognition?: new () => SpeechRecognitionLike;
-  };
-  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
-}
-
-/**
- * Dictation is offered only where the platform actually provides it.
- * A microphone that does nothing is a lie.
- */
 export function useDictation(draft: string, setDraft: (next: string) => void, onEnd?: () => void) {
   const [listening, setListening] = useState(false);
-  const recognition = useRef<SpeechRecognitionLike | null>(null);
-  const [available] = useState(() => speechRecognitionCtor() !== null);
+  const [transcribing, setTranscribing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [available] = useState(microphoneRecordingAvailable);
+  const voice = useRef<NotchVoice | null>(null);
+  const base = useRef('');
+  const setDraftRef = useRef(setDraft);
+  setDraftRef.current = setDraft;
   const onEndRef = useRef(onEnd);
   onEndRef.current = onEnd;
 
-  useEffect(() => () => { recognition.current?.abort(); }, []);
+  useEffect(() => () => { voice.current?.cancel(); voice.current = null; }, []);
 
   const stop = () => {
-    recognition.current?.stop();
+    const active = voice.current;
+    if (!active || !listening) return;
+    setListening(false);
+    setTranscribing(true);
+    void active.stopAndTranscribe()
+      .then((heard) => {
+        if (voice.current !== active) return;
+        if (heard.trim()) setDraftRef.current(dictatedDraft(base.current, heard));
+        else setError("I didn't catch that. Try again a little closer to the microphone.");
+      })
+      .catch((failure: unknown) => {
+        if (voice.current === active) setError(failure instanceof Error && failure.message ? failure.message : 'Dictation could not be transcribed.');
+      })
+      .finally(() => {
+        if (voice.current !== active) return;
+        voice.current = null;
+        setTranscribing(false);
+        onEndRef.current?.();
+      });
   };
 
   const toggle = () => {
-    if (listening) {
-      stop();
-      return;
-    }
-    const Ctor = speechRecognitionCtor();
-    if (!Ctor) return;
-    const rec = new Ctor();
-    rec.lang = navigator.language || 'en-US';
-    rec.interimResults = true;
-    rec.continuous = false;
-    // Captured once, so interim results replace each other instead of
-    // stacking onto a draft that is already growing.
-    const base = draft;
-    rec.onresult = (event) => {
-      let heard = '';
-      for (let i = event.resultIndex; i < event.results.length; i += 1) {
-        heard += event.results[i][0]?.transcript ?? '';
-      }
-      setDraft(`${base}${base && !base.endsWith(' ') ? ' ' : ''}${heard}`);
-    };
-    rec.onend = () => {
-      setListening(false);
-      recognition.current = null;
-      onEndRef.current?.();
-    };
-    rec.onerror = () => {
-      setListening(false);
-      recognition.current = null;
-    };
-    recognition.current = rec;
+    if (listening) { stop(); return; }
+    if (transcribing) return;
+    setError(null);
+    base.current = draft;
+    const active = new NotchVoice({ onStatus: () => undefined }, { autoSend: false, interim: false });
+    voice.current = active;
     setListening(true);
-    try {
-      rec.start();
-    } catch {
+    void active.startRecording().catch((failure: unknown) => {
+      if (voice.current !== active) return;
+      voice.current = null;
       setListening(false);
-      recognition.current = null;
-    }
+      setError(failure instanceof Error && failure.message ? failure.message : 'The microphone could not be opened.');
+    });
   };
 
-  return { available, listening, toggle, stop };
+  return { available, listening, transcribing, error, toggle, stop };
 }

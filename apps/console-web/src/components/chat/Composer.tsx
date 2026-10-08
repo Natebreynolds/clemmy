@@ -70,7 +70,7 @@ export function Composer({
   const mode = controlledMode ?? localMode;
   const planning = busy ? activeTaskMode?.kind === 'plan' : mode === 'plan';
   const changeMode = (next: ComposerMode) => { setLocalMode(next); onModeChange?.(next); };
-  const { available: dictation, listening, toggle: toggleDictation, stop: stopDictation } = useDictation(
+  const { available: dictation, listening, transcribing, error: dictationError, toggle: toggleDictation, stop: stopDictation } = useDictation(
     value,
     (next) => { setValue(next); autoGrow(); },
   );
@@ -277,21 +277,26 @@ export function Composer({
           <ModelPicker sessionId={sessionId} agentId={agentId} applyAgent={applyAgent} />
         </div>
 
-        {/* Offered only where the browser actually provides speech recognition —
-            a microphone button that does nothing is a lie. The phone has had
-            this since it shipped; the desktop's only mic lived in the notch. */}
+        {/* Offered only where this computer can record the microphone; the
+            words are transcribed on this computer (use-dictation.ts). */}
         {dictation && (
           <Button
             variant="ghost"
             size="icon"
             onClick={toggleDictation}
-            aria-label={listening ? 'Stop dictation' : 'Dictate'}
+            disabled={transcribing}
+            aria-label={transcribing ? 'Transcribing dictation' : listening ? 'Stop dictation' : dictationError ?? 'Dictate'}
             aria-pressed={listening}
-            title={listening ? 'Stop dictation' : 'Dictate'}
+            title={transcribing ? 'Transcribing…' : listening ? 'Stop dictation' : dictationError ?? 'Dictate'}
             className="h-8 w-8 rounded-full"
           >
-            <Mic className={cn('h-[18px] w-[18px]', listening && 'animate-breathe text-primary')} aria-hidden />
+            {transcribing
+              ? <Loader2 className="h-[18px] w-[18px] animate-spin" aria-hidden />
+              : <Mic className={cn('h-[18px] w-[18px]', listening && 'animate-breathe text-primary', dictationError && 'text-danger')} aria-hidden />}
           </Button>
+        )}
+        {dictationError && !listening && !transcribing && (
+          <span role="status" className="max-w-56 truncate text-caption text-danger" title={dictationError}>{dictationError}</span>
         )}
 
         {busy ? (

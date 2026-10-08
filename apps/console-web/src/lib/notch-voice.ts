@@ -185,6 +185,34 @@ export class NotchVoice {
     }
   }
 
+  /** Stop recording and transcribe on-device; the words are returned and
+   *  sent nowhere (the composer's dictation puts them in the draft). Use with
+   *  autoSend: false so silence never sends a chat message instead. */
+  stopAndTranscribe(): Promise<string> {
+    if (this.stopped || this.captureFinished) return Promise.resolve('');
+    this.captureFinished = true;
+    const revision = this.lifecycleRevision;
+    return Promise.resolve().then(async () => {
+      if (!this.isActive(revision)) return '';
+      const wav = this.finishRecording();
+      if (!this.isActive(revision) || !wav || wav.size <= 44) return '';
+      const controller = new AbortController();
+      this.requestController = controller;
+      try {
+        this.emitStatus(revision, 'transcribing', 'Transcribing…');
+        const text = (await this.transcribe(wav, controller.signal)).trim();
+        if (!this.isActive(revision)) return '';
+        this.emitStatus(revision, 'done');
+        return text;
+      } catch (error) {
+        if (!this.isActive(revision) || controller.signal.aborted) return '';
+        throw error;
+      } finally {
+        if (this.requestController === controller) this.requestController = null;
+      }
+    });
+  }
+
   /** Stop recording, transcribe on-device, send to Clementine, surface the reply. */
   stopAndSend(): Promise<void> {
     if (this.sendPromise) return this.sendPromise;
