@@ -10,15 +10,15 @@ function fixture(run: (dir: string) => void): void {
   try { run(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-const WHO = { userHome: 'C:\\Users\\kenvi', hostname: 'Kevin-PC' };
+const WHO = { userHome: 'C:\\Users\\tester', hostname: 'TESTER-PC' };
 const SOURCE = { appVersion: '3.18.34-windows.9', platform: 'win32' as const, arch: 'x64', osRelease: '10.0.26100',
   versions: { electron: '43.0.0', node: '24.17.0' }, ...WHO, now: new Date('2026-10-08T17:20:44.000Z') };
 
 test('the support file carries the crash the tester could only paste by hand, with the build identity', () => fixture((logDir) => {
   writeFileSync(path.join(logDir, 'supervisor.log'), [
     '=== Daemon started 2026-10-08T17:20:44.310Z on port 8520 ===',
-    '{"level":30,"hostname":"Kevin-PC","msg":"Clementine daemon build: v3.18.34-windows.5"}',
-    'Unhandled rejection Error: spawn C:\\Users\\kenvi\\AppData\\Roaming\\npm\\claude ENOENT',
+    '{"level":30,"hostname":"TESTER-PC","msg":"Clementine daemon build: v3.18.34-windows.5"}',
+    'Unhandled rejection Error: spawn C:\\Users\\tester\\AppData\\Roaming\\npm\\claude ENOENT',
     '[daemon] FATAL unhandledRejection — exiting',
   ].join('\n'));
   writeFileSync(path.join(logDir, 'daemon-stalls.jsonl'), '{"event":"end","durationMs":17226,"phase":{"name":"daemon.http"}}\n');
@@ -29,8 +29,8 @@ test('the support file carries the crash the tester could only paste by hand, wi
   assert.match(text, /spawn ~\\AppData\\Roaming\\npm\\claude ENOENT/, 'the path stays readable with the user folder replaced');
   assert.match(text, /=== daemon-stalls\.jsonl/);
   assert.match(text, /=== supervisor-hang-snapshots\.jsonl: not present ===/);
-  assert.equal(text.includes('kenvi'), false);
-  assert.equal(text.includes('Kevin-PC'), false);
+  assert.equal(text.includes('tester'), false);
+  assert.equal(text.includes('TESTER-PC'), false);
 }));
 
 test('secrets, tokens, emails, the user folder in every form and the computer name never leave', () => {
@@ -39,11 +39,11 @@ test('secrets, tokens, emails, the user folder in every form and the computer na
     'WEBHOOK_SECRET=0123456789abcdef0123456789abcdef',
     '{"accessToken":"sk-ant-oat01-ABCDEFGHIJKLMNOP","refresh_token":"xyz\\"quoted","user":"nate@example.com"}',
     'jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U',
-    '"entry":"C:\\\\Users\\\\kenvi\\\\AppData\\\\Local\\\\Programs\\\\@clemmydesktop" file:///C:/Users/kenvi/x.js host Kevin-PC',
+    '"entry":"C:\\\\Users\\\\tester\\\\AppData\\\\Local\\\\Programs\\\\@clemmydesktop" file:///C:/Users/tester/x.js host TESTER-PC',
   ].join('\n');
   const out = redactDiagnostics(raw, WHO);
   for (const secret of ['abcdefghijklmnopqrstuvwx', '0123456789abcdef0123456789abcdef', 'sk-ant-oat01-ABCDEFGHIJKLMNOP', 'xyz', 'nate@example.com',
-    'dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U', 'kenvi', 'Kevin-PC']) {
+    'dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U', 'tester', 'TESTER-PC']) {
     assert.equal(out.includes(secret), false, `${secret} is replaced`);
   }
   assert.match(out, /"entry":"~\\\\AppData/);
