@@ -120,3 +120,31 @@ Every failing file so far failed identically on the 3.18.29 batch:
 - zsh never word-splits `$VAR`; a space-joined file list reaches the test
   runner as one argument and nothing runs.
 - Never `git add -A` in a shared worktree.
+
+## Shipped: v3.18.32 (10-08 00:09Z) on `f38c41e45`
+
+The batch is on main and tagged, with these changes on top of it, each
+found by a live run of the Slack reminder scenario on the installed app and
+each pinned:
+
+- A provider that answers a write with its own refusal envelope is read
+  back, not parked: classification (`provider_refused_envelope`), the
+  settlement no longer forcing `acknowledged = false` on returned failures,
+  the checkpoint projection, the no-progress projection and the settlement
+  audit all key on that detail; the ledger keeps the uncertain write's own
+  directive (reconciliation owed, no replay).
+- The batch's pin that an `{ ok: false }` envelope must block
+  reconciliation was updated: that shape is the live dead end.
+- The audit's repaired-write rule now applies to uncertain attempts, which
+  restored the host-v1 exact-artifact recovery pin that had failed on every
+  candidate commit since the batch.
+- A definitive 4xx-class status closes the write as failed in the
+  projection again (main's 2026-10-06 design); a 4xx on a mutation stays
+  classified uncertain as the batch intended.
+- `composioFailureProvesNoCommit` no longer compiles in an operation name.
+- A card whose question the model left out asks in Clem's words.
+
+Known limits recorded in docs/releases/v3.18.32.md. Two framework defects
+for the next wave: an auto-resumed chat run can wedge the daemon's HTTP
+server into a liveness kill loop, and each kill re-orphans it; the hard
+reconciliation stop, when right, still speaks machine text.
