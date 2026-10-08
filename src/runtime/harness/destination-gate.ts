@@ -714,7 +714,7 @@ function binaryIsNetworkMutation(binary: string, rest: string): boolean {
       return httpRequestCarriesMutation(rest);
     // A connected-app call made through the provider's own CLI from the
     // shell. Live 2026-10-06: the model found ~/.composio/composio and ran
-    // `composio execute SLACK_DELETE_A_SLACK_REMINDER -d …` and
+    // `composio execute <a delete-reminder operation> -d …` and
     // `composio proxy https://slack.com/api/reminders.delete -X POST -d …`
     // (then reminders.add) as "compute": two deletes and a create in a
     // connected app with no card, no write ledger and no learned kind.

@@ -51,8 +51,9 @@ function currentOperationEntries(operationId: string | null | undefined) {
 /** Operation ids of a toolkit the host currently serves (a current, callable
  * catalog entry exists), sorted. Used when a provider LISTS an operation but
  * will not serve its definition: the model is pointed at siblings it can
- * actually call instead of at the same name again (live 2026-10-06: Slack
- * listed SLACK_DELETE_A_SLACK_REMINDER, served SLACK_DELETE_REMINDER). */
+ * actually call instead of at the same name again (live 2026-10-06: a chat
+ * provider listed a delete-reminder operation under one name and served
+ * its definition under a shorter sibling name). */
 export function currentlyServedOperationIdsForToolkit(toolkit: string): string[] {
   const prefix = `${toolkit.trim().toUpperCase()}_`;
   if (prefix.length < 2) return [];
