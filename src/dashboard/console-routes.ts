@@ -269,7 +269,9 @@ import {
   getStoredXaiOAuthTokens,
   xaiAccessTokenExpiresSoon,
   disconnectXaiOAuth,
+  getStoredCodexOAuthTokens,
 } from '../runtime/auth-store.js';
+import { claudeBrainAdoptionAfterSignIn } from '../runtime/harness/claude-brain-adoption.js';
 import { beginClaudeLogin, completeClaudeLogin } from '../runtime/claude-native-oauth.js';
 import { saveClaudeTokens, getClaudeAuthSnapshot, loadFreshClaudeAccessToken, ClaudeAuthError } from '../runtime/claude-oauth.js';
 import { resetClaudeModelCache } from '../runtime/harness/claude-model.js';
@@ -16497,10 +16499,22 @@ export function registerConsoleRoutes(
       const tokens = await completeClaudeLogin(code, flow.verifier, flow.state);
       saveClaudeTokens(tokens);
       claudeLoginFlows.delete(flowId);
+      // A home whose brain cannot run takes Claude as its brain now
+      // (claude-brain-adoption.ts); a working brain is never moved.
+      let codexSignedIn = false;
+      try { codexSignedIn = Boolean(getStoredCodexOAuthTokens()?.accessToken); } catch { codexSignedIn = true; /* unreadable: never move */ }
+      let openAiKey = false;
+      try { openAiKey = Boolean(getOpenAiApiKey()); } catch { openAiKey = true; }
+      const adoption = claudeBrainAdoptionAfterSignIn({ authMode: getActiveAuthMode(), routingMode: getModelRoutingMode(),
+        codexSignedIn, openAiKey, claudeModel: getRuntimeEnv('CLAUDE_MODEL', '') || '' });
+      if (adoption) {
+        if (adoption.claudeModel) { updateEnvKey('CLAUDE_MODEL', adoption.claudeModel); process.env.CLAUDE_MODEL = adoption.claudeModel; }
+        updateEnvKey('AUTH_MODE', 'claude_oauth'); process.env.AUTH_MODE = 'claude_oauth';
+      }
       resetHarnessRuntimeConfig(); // re-register the Claude provider on the next run
       resetClaudeModelCache(); // drop the cached (pre-login) token so the new grant takes effect immediately
       void refreshModelDiscoveryNow('anthropic'); // the picker lists what this subscription can run, now
-      res.json({ ok: true, snapshot: getClaudeAuthSnapshot() });
+      res.json({ ok: true, snapshot: getClaudeAuthSnapshot(), brainAdopted: Boolean(adoption) });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
     }
