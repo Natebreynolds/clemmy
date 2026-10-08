@@ -671,7 +671,11 @@ async function startInstalledApp(context, firstLaunch) {
     if (sha256(bytes) !== sha256(readFileSync(installed))) refuse('console_served_asset_mismatch');
     app.assetHashes.push({ relative, bytes: bytes.length, sha256: sha256(bytes) });
   }
-  app.readAPI = (pathname) => localJSON(`${origin}${pathname}`, token);
+  // A restarted daemon's loop stalls like a first boot's; each read waits
+  // through a stall, bounded, instead of a single 5 s attempt.
+  app.readAPI = (pathname) => waitFor(async () => {
+    try { return await localJSON(`${origin}${pathname}`, token, 30_000); } catch { return null; }
+  }, 'restarted_api_unavailable', 180_000);
   // A dashboard can boot while optional mobile TLS catches an initialization
   // failure. Require the actual owned daemon listener and its boot-generated pin.
   const mobilePort = Number(context.env.CLEMENTINE_MOBILE_APP_PORT);
@@ -826,7 +830,7 @@ export const INSTALLED_STORAGE_PROBE = `
       assert.equal(eventlog.getSession(settings.sessionId), null);
       eventlog.createSession({ id: settings.sessionId, kind: 'chat', channel: 'cli',
         title: 'Controlled Windows installed smoke', metadata: { source: 'controlled_ci_windows_smoke' } });
-      eventlog.appendEvent({ sessionId: settings.sessionId, turn: 1, role: 'user', type: 'user_input',
+      eventlog.appendEvent({ sessionId: settings.sessionId, turn: 1, role: 'user', type: 'user_input_received',
         data: { text: settings.marker, source: 'controlled_ci_windows_smoke' } });
       const saved = artifacts.saveArtifactBundle(artifactInput);
       assert.equal(saved.created, true);
@@ -872,7 +876,7 @@ export const INSTALLED_STORAGE_PROBE = `
     const events = eventlog.listEvents(settings.sessionId);
     assert.equal(session?.metadata.source, 'controlled_ci_windows_smoke');
     assert.equal(events.length, 1);
-    assert.equal(events[0].type, 'user_input');
+    assert.equal(events[0].type, 'user_input_received');
     assert.equal(events[0].data.text, settings.marker);
     const inspected = artifacts.inspectArtifactBundle(artifactInput);
     assert.equal(inspected.status, 'present_exact');
