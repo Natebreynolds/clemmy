@@ -148,3 +148,29 @@ Known limits recorded in docs/releases/v3.18.32.md. Two framework defects
 for the next wave: an auto-resumed chat run can wedge the daemon's HTTP
 server into a liveness kill loop, and each kill re-orphans it; the hard
 reconciliation stop, when right, still speaks machine text.
+
+## Windows x64 beta installer: qualified (10-08 01:40Z)
+
+`windows-private-beta.yml` run 37712746814 on main `43b6d8821` passed every
+gate on the real Windows runner: unsigned NSIS install (166 s, 16,330 files),
+the real setup window driven through CDP, the authenticated daemon, the
+mounted React dashboard with the served asset hashed against the installed
+file, the mobile TLS loopback pin, a graceful quit, the installed storage
+probe (event log, artifact bundle, encrypted payload store, staged blobs,
+mobile identity retained), a restart on the same home that lists the
+seeded session and exposes its text, a second graceful quit and the
+retention read-back. Artifact
+`clementine-windows-beta-3.18.33-windows.32-37712746814` (the `.exe`, its
+blockmap, `latest.yml`, both receipts), 14-day retention. Unsigned: testers
+click through SmartScreen. Not claimed by the smoke: models, OAuth, BYO,
+Browserbase, a physical tester, phone pairing, LAN firewall.
+
+Runs 20–32 on the runner, each one defect: PowerShell 5.1 cmdlet analysis
+under a reduced environment (launch programs carry no cmdlet), ASCII JSON
+over stdin, file URLs for `tsImport`, the setup marker under the selected
+home, the probe resolver walking to the daemon root, every read through the
+daemon on a cold first boot as a bounded retried wait inside the diagnostics
+collector (headers and body both), and the storage probe's event type.
+Method that ended the loop: run a probe that imports the daemon's dist on
+the Mac with Electron as node against an isolated home before spending a
+25-minute Windows run (`scratchpad/probe-fixture` in the session notes).
