@@ -122,6 +122,7 @@ test('Windows CI runs the exact frozen feature and privacy suites before packagi
     'src/runtime/harness/claude-headless-model.test.ts',
     'src/projects/local-project-discovery.test.ts',
     'src/projects/project-routes.test.ts',
+    'apps/desktop/src/diagnostics-bundle.test.ts',
     'src/runtime/harness/claude-agent-sdk.test.ts',
     'src/execution/coding-agent-claude.test.ts',
     'src/execution/coding-run-env.test.ts',

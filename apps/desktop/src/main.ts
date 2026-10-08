@@ -69,6 +69,7 @@ import { importUsableCodexOAuthTokens, persistCodexOAuthTokens, runCodexOAuthLog
 import { CredentialStoragePrivacyError, isCredentialStoragePrivacyError, readCredentialFileSync, readCredentialSourceFileSync } from './credential-private-filesystem.js';
 import { hasPersistedCodexGrant } from './auth-grant.js';
 import { redactSensitiveText } from './redaction.js';
+import { saveDiagnosticsFile } from './diagnostics-bundle.js';
 import {
   computeClementineLiveGeometry,
   DEFAULT_CLEMENTINE_LIVE_DORMANT_SIZE,
@@ -1939,6 +1940,7 @@ function rebuildTrayMenu(): void {
     },
     { label: 'Open Console in Browser', click: () => dashboardUrl && shell.openExternal(dashboardUrl) },
     { label: 'Open Log File', click: () => shell.openPath(LOG_FILE) },
+    { label: 'Save Diagnostics for Support…', click: () => { saveDiagnosticsForSupport(); } },
     { type: 'separator' },
     { label: 'Restart Daemon', click: () => supervisor?.restart() },
     { label: 'Stop Daemon', click: () => supervisor?.stop() },
@@ -2295,6 +2297,24 @@ async function boot(): Promise<void> {
  * may want to copy the error before closing. Tray + auto-updater still
  * arm so they can install a fix once one ships.
  */
+/** Writes the redacted support file (diagnostics-bundle.ts) into Downloads and
+ *  shows it. Works with the daemon down: everything it reads is a local log. */
+function saveDiagnosticsForSupport(): string | null {
+  const source = {
+    logDir: LOG_DIR, appVersion: app.getVersion(), platform: process.platform, arch: process.arch,
+    osRelease: os.release(), versions: { electron: process.versions.electron, node: process.versions.node },
+    userHome: os.homedir(), hostname: os.hostname(),
+  };
+  let file: string | null = null;
+  try { file = saveDiagnosticsFile(source, app.getPath('downloads')); }
+  catch {
+    try { file = saveDiagnosticsFile(source, LOG_DIR); } catch { file = null; }
+  }
+  if (file) shell.showItemInFolder(file);
+  else dialog.showErrorBox('Clementine could not save diagnostics', `Open the log folder instead:\n${LOG_DIR}`);
+  return file;
+}
+
 function reportBootFailure(stage: string, err: unknown): void {
   const message = err instanceof Error ? err.stack ?? err.message : String(err);
   // Log to the daemon supervisor log file so a later "Open Log File"
@@ -2305,11 +2325,17 @@ function reportBootFailure(stage: string, err: unknown): void {
   } catch {
     // If we can't even append to the log, fall through to the dialog.
   }
+  const advice = 'Try quitting Clementine and relaunching. If this keeps happening, choose Save diagnostics and send that file to support.';
   try {
-    dialog.showErrorBox(
-      `Clementine couldn't ${stage}`,
-      `${message}\n\nLog file: ${LOG_FILE}\n\nTry quitting Clementine and relaunching. If this keeps happening, open the log and share it from Advanced → Diagnostics.`,
-    );
+    if (app.isReady()) {
+      void dialog.showMessageBox({
+        type: 'error', title: 'Clementine', message: `Clementine couldn't ${stage}`,
+        detail: `${message}\n\nLog file: ${LOG_FILE}\n\n${advice}`,
+        buttons: ['Save diagnostics', 'OK'], defaultId: 1, cancelId: 1, noLink: true,
+      }).then(({ response }) => { if (response === 0) saveDiagnosticsForSupport(); }).catch(() => undefined);
+    } else {
+      dialog.showErrorBox(`Clementine couldn't ${stage}`, `${message}\n\nLog file: ${LOG_FILE}\n\n${advice}`);
+    }
   } catch {
     // dialog may not be ready (e.g. app.on('ready') hasn't fired yet);
     // the log line is the durable record.
@@ -3292,6 +3318,12 @@ ipcMain.handle('clemmy:open-logs', async (evt: IpcMainInvokeEvent) => {
   assertIpcSender(evt, ['dashboard']);
   await shell.openPath(LOG_FILE);
   return { opened: true };
+});
+
+ipcMain.handle('clemmy:save-diagnostics', (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
+  const file = saveDiagnosticsForSupport();
+  return { saved: Boolean(file), fileName: file ? path.basename(file) : null };
 });
 
 ipcMain.handle('clemmy:workspace-open-external', async (

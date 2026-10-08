@@ -29,6 +29,8 @@ const api = {
   tailLog: (maxLines?: number) => ipcRenderer.invoke('clemmy:tail-log', maxLines) as Promise<{ lines: string[] }>,
   /** Open the log file in the OS default viewer. */
   openLogs: () => ipcRenderer.invoke('clemmy:open-logs') as Promise<{ opened: boolean }>,
+  /** Saves a redacted support file into Downloads and shows it. */
+  saveDiagnostics: () => ipcRenderer.invoke('clemmy:save-diagnostics') as Promise<{ saved: boolean; fileName: string | null }>,
   /** Open a link captured from a real click in a sandboxed Workspace. The
    * dashboard parent validates the request before it reaches this bridge. */
   workspaceOpenExternal: (url: string) =>

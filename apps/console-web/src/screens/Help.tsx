@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MessageCircle, Keyboard, RefreshCw } from 'lucide-react';
+import { MessageCircle, Keyboard, RefreshCw, LifeBuoy } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -48,6 +48,25 @@ export function Help() {
     }
   };
 
+  const [savingDiagnostics, setSavingDiagnostics] = useState(false);
+  const [diagnosticsNote, setDiagnosticsNote] = useState<string | null>(null);
+  const saveDiagnostics = async () => {
+    const bridge = clemmy();
+    if (!bridge?.saveDiagnostics) return;
+    setSavingDiagnostics(true);
+    setDiagnosticsNote(null);
+    try {
+      const result = await bridge.saveDiagnostics();
+      setDiagnosticsNote(result.saved && result.fileName
+        ? `Saved ${result.fileName} to your Downloads folder. Send that file to support.`
+        : "Couldn't save the diagnostics file. Use the tray menu's Open Log File instead.");
+    } catch {
+      setDiagnosticsNote("Couldn't save the diagnostics file. Use the tray menu's Open Log File instead.");
+    } finally {
+      setSavingDiagnostics(false);
+    }
+  };
+
   return (
     <Page title="Help" subtitle="Guides, shortcuts, and version" width="reading">
       <div className="space-y-4">
@@ -84,6 +103,21 @@ export function Help() {
             </Button>
           )}
         </Card>
+
+        {clemmy()?.saveDiagnostics && (
+          <Card className="flex flex-wrap items-center gap-3 p-5">
+            <div className="flex-1">
+              <h3 className="text-h3 text-fg">Something not working?</h3>
+              <p className="text-small text-muted">
+                Save a diagnostics file and send it to support. Secrets, email addresses, your user folder and this computer’s name are removed first.
+              </p>
+              {diagnosticsNote && <p className="mt-1 text-small text-primary" role="status" aria-live="polite">{diagnosticsNote}</p>}
+            </div>
+            <Button variant="secondary" size="sm" onClick={saveDiagnostics} disabled={savingDiagnostics}>
+              <LifeBuoy className="h-4 w-4" aria-hidden /> Save diagnostics
+            </Button>
+          </Card>
+        )}
       </div>
     </Page>
   );
