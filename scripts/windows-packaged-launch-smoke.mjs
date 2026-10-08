@@ -347,9 +347,9 @@ async function waitFor(operation, code, timeoutMs = 120_000) {
   refuse(code);
 }
 
-async function localJSON(url, token) {
+async function localJSON(url, token, timeoutMs = 5_000) {
   const response = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {},
-    signal: AbortSignal.timeout(5_000), redirect: 'error' });
+    signal: AbortSignal.timeout(timeoutMs), redirect: 'error' });
   if (!response.ok) refuse('local_read_failed');
   return response.json();
 }
@@ -617,9 +617,12 @@ async function startInstalledApp(context, firstLaunch) {
   // This credential remains in memory; no target/viewer URLs are recorded.
   // A first boot on a cold runner answers slowly; one 5 s read aborting is
   // "not yet", not a verdict (run 37699594352: a raw TimeoutError here).
+  // A cold first boot stalls the daemon's loop for 10–60 s at a time (run
+  // 37703868292: a font request in flight for 114 s while heartbeats ran);
+  // each read waits through one such stall, and the gate waits five minutes.
   const info = await withLaunchDiagnostics(() => waitFor(async () => {
-    try { return await localJSON(`${origin}/api/console/build-info`, token); } catch { return null; }
-  }, 'daemon_build_info_unavailable', 120_000));
+    try { return await localJSON(`${origin}/api/console/build-info`, token, 30_000); } catch { return null; }
+  }, 'daemon_build_info_unavailable', 300_000));
   app.served = assertServedIdentity(info, context.expected, path.join(context.installRoot, 'resources', 'daemon', 'dist', 'index.js'));
   app.daemon = exactOwnedProcess(await processes(), app.served.daemonProcessId, context.executable, main.pid);
   if (app.daemon.pid !== daemonCandidate.pid || app.daemon.createdAt !== daemonCandidate.createdAt) refuse('daemon_listener_changed');
