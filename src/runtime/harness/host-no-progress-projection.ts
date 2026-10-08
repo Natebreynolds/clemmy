@@ -1366,8 +1366,25 @@ function settlementConsequence(input: {
             : [],
         });
       }
-      // A MUTATION whose fate we cannot observe keeps the factual stop. The one
-      // thing worse than failing is doing it twice.
+      // A LOCAL change that failed is observable. A command the host ran on
+      // this Mac with nothing leaving the machine (zero physical crossings)
+      // left its state right here for Clem to read: she looks, then finishes
+      // or repairs it, and the governor still bounds a loop. Live 2026-10-08:
+      // `printf … > greeting.txt && cat -A` wrote the file, then exited 1 on a
+      // flag macOS lacks; the turn was stopped as an unknown mutation although
+      // Clem had read the output and knew the file was written. Local work is
+      // ordinary work (owner 2026-09-29).
+      if (settlement.execution_kind === 'local_execution' && settlement.physical_crossing_count === 0) {
+        return createNoProgressConsequence({
+          stage: 'execution:unknown_local',
+          recovery: 'repair_model',
+          effectState,
+          recoveryToolNames: [call.name],
+        });
+      }
+      // A MUTATION that may have reached outside this machine, whose fate we
+      // cannot observe, keeps the factual stop. The one thing worse than
+      // failing is doing it twice.
       return createNoProgressConsequence({
         stage: `execution:${settlement.outcome_kind}`,
         recovery: 'stop_factual',

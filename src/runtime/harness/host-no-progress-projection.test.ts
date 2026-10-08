@@ -2532,6 +2532,40 @@ test('an unknown READ is repairable; an unknown WRITE still stops', () => {
     'an unobservable mutation is never safe to simply retry');
 });
 
+test('a failed LOCAL write on this Mac goes back to Clem to look and finish; an outside write still stops', () => {
+  // Live 2026-10-08: `printf … > greeting.txt && cat -A greeting.txt` wrote
+  // the file, then exited 1 on a flag macOS lacks. It settled unknown,
+  // mutating, local_execution, zero physical crossings, and the turn stopped
+  // as if an outside write's fate were unknown.
+  const identity = accepted('unknown-local-write-repairable');
+  const db = settlementDb([
+    { callId: 'local-write-exit-1', outcomeKind: 'unknown', recoveryAction: 'stop_and_explain',
+      executionKind: 'local_execution', businessCall: 1, mutating: 1, physicalCrossingCount: 0 },
+    { callId: 'outside-write-uncertain', outcomeKind: 'unknown', recoveryAction: 'stop_and_explain',
+      executionKind: 'provider_execution', businessCall: 1, mutating: 1, physicalCrossingCount: 1 },
+  ], identity);
+  const local = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('local-write-exit-1', 'run_shell_command'),
+      result('local-write-exit-1', 'run_shell_command', 'exit_code: 1'),
+    ],
+  }, db);
+  const localConsequence = local.status === 'ok' ? local.consequence : null;
+  assert.equal(localConsequence?.recovery, 'repair_model', 'Clem reads the local state and finishes');
+  assert.equal(localConsequence?.stage, 'execution:unknown_local');
+  assert.ok((localConsequence?.recoveryToolNames ?? []).includes('run_shell_command'));
+  const outside = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('outside-write-uncertain', 'googlesheets_values_update'),
+      result('outside-write-uncertain', 'googlesheets_values_update', 'no acknowledgement'),
+    ],
+  }, db);
+  const outsideConsequence = outside.status === 'ok' ? outside.consequence : null;
+  assert.notEqual(outsideConsequence?.recovery, 'repair_model', 'an outside write whose fate is unknown is never simply retried');
+});
+
 test('a CONTROL call returning unknown still mints no recovery surface', () => {
   // The malformed-plan-refusal contract: a locally forged result must never
   // name tools. Only genuine business reads earn a repair surface.
