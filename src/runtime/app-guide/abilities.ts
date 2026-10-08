@@ -112,7 +112,7 @@ export function appAbilitiesFromFacts(facts: AppAbilityFacts): AppAbility[] {
   else out.push({ id: 'phone-alerts', name: 'Phone notifications', unlocks: pushUnlocks,
     state: facts.phonePush.ready ? 'ready' : facts.phonePush.reason === 'apns_key_missing' ? 'needs_attention' : 'not_set_up',
     detail: facts.phonePush.ready ? 'On.'
-      : facts.phonePush.reason === 'apns_key_missing' ? 'A phone is registered but this Mac cannot send it notifications yet.'
+      : facts.phonePush.reason === 'apns_key_missing' ? 'A phone is registered but this computer cannot send it notifications yet.'
         : 'No phone is registered for notifications.',
     place: 'notifications' });
 
@@ -227,7 +227,7 @@ export function appGuideText(abilities: readonly AppAbility[], options: { places
   }
   if (options.places !== false) {
     lines.push('', 'Places (id: name, what it is for):');
-    for (const place of APP_PLACES) lines.push(`- ${place.id}: ${place.name}, ${place.purpose}${place.phone ? '' : ' (Mac only)'}`);
+    for (const place of APP_PLACES) lines.push(`- ${place.id}: ${place.name}, ${place.purpose}${place.phone ? '' : ' (on the computer, not the phone)'}`);
   }
   lines.push('', 'To send the owner to a place, link it in your reply as [Open <name>](app:<id>); they tap it to go there. Say what to do once they are there.');
   return lines.join('\n');

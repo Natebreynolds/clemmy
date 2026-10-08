@@ -108,6 +108,11 @@ function reminderOriginMetadata(): TimerEntry['metadata'] | undefined {
 }
 
 function desktopBundleCandidates(): string[] {
+  if (process.platform === 'win32') {
+    // The per-user NSIS install: %LOCALAPPDATA%\Programs\@clemmydesktop.
+    const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    return [path.join(local, 'Programs', '@clemmydesktop')];
+  }
   return [
     '/Applications/Clementine.app',
     path.join(os.homedir(), 'Applications', 'Clementine.app'),
@@ -128,14 +133,17 @@ export function registerAdminTools(server: McpServer): void {
       );
 
       const foundBundle = desktopBundleCandidates().find((candidate) => existsSync(candidate));
-      const plistPath = foundBundle ? path.join(foundBundle, 'Contents', 'Info.plist') : null;
-      const bundleVersion = plistPath ? readPlistValue(plistPath, 'CFBundleShortVersionString') : null;
+      const windows = process.platform === 'win32';
+      const plistPath = foundBundle && !windows ? path.join(foundBundle, 'Contents', 'Info.plist') : null;
+      const bundleVersion = windows
+        ? (foundBundle ? readJsonFile<{ version?: string }>(path.join(foundBundle, 'resources', 'daemon', 'package.json'))?.version ?? null : null)
+        : plistPath ? readPlistValue(plistPath, 'CFBundleShortVersionString') : null;
       const bundleBuild = plistPath ? readPlistValue(plistPath, 'CFBundleVersion') : null;
 
       return textResult(
         [
           'Clementine desktop status',
-          foundBundle ? `Installed app: ${foundBundle}` : 'Installed app: not found in /Applications or ~/Applications',
+          foundBundle ? `Installed app: ${foundBundle}` : `Installed app: not found in ${desktopBundleCandidates().join(' or ')}`,
           bundleVersion ? `Installed version: ${bundleVersion}` : 'Installed version: unknown',
           bundleBuild && bundleBuild !== bundleVersion ? `Installed build: ${bundleBuild}` : '',
           desktopPackage?.version ? `Packaged desktop version: ${desktopPackage.version}` : '',
@@ -182,7 +190,7 @@ export function registerAdminTools(server: McpServer): void {
         `Reminder set for ${resolved.confirmationTarget}: "${message}" — `
         + (delivery === 'local'
           ? 'it will appear only in the app inbox, with no external delivery (after reopening if the app is closed).'
-          : 'it will fire as a notification (late-but-never-lost if the app is closed or the Mac sleeps).'),
+          : 'it will fire as a notification (late-but-never-lost if the app is closed or the computer sleeps).'),
       );
     },
   );

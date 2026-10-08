@@ -31,7 +31,7 @@ export const APP_PLACES: readonly AppPlace[] = [
   { id: 'running', name: 'Running', purpose: 'Everything Clem is working on right now', desktop: '/tasks', phone: '?tab=activity' },
   { id: 'heartbeats', name: 'Heartbeats', purpose: 'What Clem checks on her own, and how often', desktop: '/heartbeats', phone: null },
   { id: 'connect', name: 'Connect', purpose: 'Apps, keys, command-line tools, MCP servers and your phone', desktop: '/connect', phone: '?tab=settings&section=connections' },
-  { id: 'phone', name: 'Your phone', purpose: 'Pair a phone with this Mac', desktop: '/connect', phone: '?tab=settings&section=devices' },
+  { id: 'phone', name: 'Your phone', purpose: 'Pair a phone with this computer', desktop: '/connect', phone: '?tab=settings&section=devices' },
   { id: 'memory', name: 'Memory', purpose: 'What Clem knows about you', desktop: '/memory', phone: '?tab=memory' },
   { id: 'meetings', name: 'Meetings', purpose: 'Recorded meetings and their summaries', desktop: '/meetings', phone: null },
   { id: 'goals', name: 'Goals', purpose: 'Long-running outcomes', desktop: '/goals', phone: null },

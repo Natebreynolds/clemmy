@@ -228,7 +228,7 @@ export function registerPendingActionTools(server: McpServer): void {
     {
       title: z.string().min(3).max(160).describe('Short name for lists, e.g. "Run the backup on the server".'),
       summary: z.string().min(8).max(2000).describe('Plain-language summary of what is queued and why.'),
-      ask: z.string().min(12).max(200).optional().describe('Your words to the owner, as you would say them in person: what you need to do and why their request needs it, ending with the go-ahead question. Example: "To finish step 2 I need to run one command on your Mac. It only prints your SSH settings; nothing leaves the machine. OK to run it?" No tool names, ids, hashes or harness terms. The exact command or content is shown under your words automatically.'),
+      ask: z.string().min(12).max(200).optional().describe('Your words to the owner, as you would say them in person: what you need to do and why their request needs it, ending with the go-ahead question. Example: "To finish step 2 I need to run one command on your computer. It only prints your SSH settings; nothing leaves the machine. OK to run it?" No tool names, ids, hashes or harness terms. The exact command or content is shown under your words automatically.'),
       why: z.string().max(260).optional().describe('One optional extra line of context for the owner, in plain words (what it touches, what it does not).'),
       kind: kindEnum.describe('Descriptive action class only; the host derives approval from the exact tool and payload. external_write alone does not imply approval.'),
       toolName: z.string().min(1).max(160).describe('The exact tool to call after approval, e.g. composio_execute_tool or run_shell_command.'),
