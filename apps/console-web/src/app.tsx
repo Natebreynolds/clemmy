@@ -18,14 +18,40 @@ import { NotchSurface } from './features/notch/NotchSurface';
 function lazyNamed<T extends Record<K, ComponentType>, K extends keyof T>(
   loader: () => Promise<T>,
   exportName: K,
+  options: { prefetch?: boolean } = {},
 ) {
+  if (options.prefetch !== false) SCREEN_LOADERS.push(loader);
   return lazy(async () => ({ default: (await loader())[exportName] }));
+}
+
+/** Every screen's code is fetched in the background once the app is up, so
+ * opening a tab never waits on a busy daemon for its code. Navigation keeps
+ * the current screen until the next one's code arrives, so a starved daemon
+ * read as "the tab won't open" (a Windows tester, 2026-10-08). The chunks are
+ * hashed and served immutable: each is fetched once per version. */
+const SCREEN_LOADERS: Array<() => Promise<unknown>> = [];
+const PREFETCH_START_MS = 3_000;
+const PREFETCH_GAP_MS = 150;
+
+function prefetchScreens(): () => void {
+  let cancelled = false;
+  const run = async () => {
+    for (const load of SCREEN_LOADERS) {
+      if (cancelled) return;
+      // A failed import is remembered by the browser until reload; stop at the
+      // first one rather than poisoning every screen while the daemon restarts.
+      try { await load(); } catch { return; }
+      await new Promise((resolve) => window.setTimeout(resolve, PREFETCH_GAP_MS));
+    }
+  };
+  const timer = window.setTimeout(() => { void run(); }, PREFETCH_START_MS);
+  return () => { cancelled = true; window.clearTimeout(timer); };
 }
 
 // The approved design mock is 1,380 lines of fixture that almost nobody loads.
 // It was statically imported here AND in Home.tsx, so it rode the main chunk on
 // every cold start.
-const HomeMock = lazyNamed(() => import('./screens/HomeMock'), 'HomeMock');
+const HomeMock = lazyNamed(() => import('./screens/HomeMock'), 'HomeMock', { prefetch: false });
 const Chat = lazyNamed(() => import('./screens/Chat'), 'Chat');
 const Inbox = lazyNamed(() => import('./screens/Inbox'), 'Inbox');
 const BackgroundTasks = lazyNamed(() => import('./screens/BackgroundTasks'), 'BackgroundTasks');
@@ -196,6 +222,8 @@ function ChatIndex() {
 }
 
 export function App() {
+  // The notch is its own small window and never opens these screens.
+  useEffect(() => (window.location.pathname.includes('/notch') ? undefined : prefetchScreens()), []);
   return (
     <QueryClientProvider client={queryClient}>
       <BrowserRouter basename="/console">
