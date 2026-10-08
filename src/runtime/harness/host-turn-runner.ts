@@ -2,6 +2,7 @@ import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedM
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
+import { RETAINED_WORK_TERMINAL_HEADER } from './retained-work-checkpoint.js';
 import { retainConnectionExecutionProgress } from './connection-execution-progress.js';
 import { assertHostConnectionProgress, bindHostConnectionProgress, clearHostConnectionProgress, type HostConnectionProgress } from './host-connection-progress.js';
 import { declaresWorkflowDispatchReceipt } from './workflow-dispatch-commit.js';
@@ -294,6 +295,15 @@ let hostWriterResolver: HostWriterResolver = productionHostWriter;
 /** Test seam: supply the chosen writer and its model. */
 export function _setHostWriterForTests(resolver: HostWriterResolver | null): void {
   hostWriterResolver = resolver ?? productionHostWriter;
+}
+
+/** Clem narrates a host stop with one extra tool-less model call. Tests that
+ * count model calls exactly run without it unless they opt in; the test
+ * runner marks its child processes with NODE_TEST_CONTEXT (as config.ts and
+ * memory/db.ts already read). */
+let hostStopNarrationEnabled = !process.env.NODE_TEST_CONTEXT;
+export function _setHostStopNarrationForTests(enabled: boolean): void {
+  hostStopNarrationEnabled = enabled;
 }
 
 interface PendingHostWriter {
@@ -2948,7 +2958,35 @@ function priorZeroCrossingRefusalCounts(
  * exact physical-attempt lease before entering this body and revokes it at
  * every exit (success, approval pause, typed stop, cancellation, or error).
  */
+/** Set by the runner body once its model step exists: narrates a host stop
+ * in Clem's words. Absent when the body never reached a live model. */
+interface HostStopNarration {
+  narrate?: (outcome: RunOutcome) => Promise<RunOutcome>;
+}
+
+/**
+ * The host decides THAT a turn stops and WHY; Clem says it. A blocked
+ * terminal's fixed sentence is the host's fact, handed to one tool-less model
+ * step that answers the owner in Clem's own words (owner 2026-10-08: "the
+ * harness should never ever speak for Clem … Clem is driving the harness and
+ * the harness is just the vehicle"). The fixed sentence stays only where the
+ * model itself is the thing that failed, the owner pressed Stop, or the
+ * narration step cannot answer.
+ */
 const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
+  const narration: HostStopNarration = {};
+  const outcome = await runHostTurnBody(runner, agent, itemsOrState, opts, narration);
+  if (!narration.narrate || !isNarratableHostStop(outcome)) return outcome;
+  return narration.narrate(outcome);
+};
+
+const runHostTurnBody = async (
+  runner: Parameters<RunRunnerFn>[0],
+  agent: Parameters<RunRunnerFn>[1],
+  itemsOrState: Parameters<RunRunnerFn>[2],
+  opts: Parameters<RunRunnerFn>[3],
+  narration: HostStopNarration,
+): Promise<HostRunOutcome> => {
   clearHostConnectionProgress(agent);
   const configuredActivationStartedAt = opts.hostActivationStartedAt;
   const connectionActivationStartedAt = typeof configuredActivationStartedAt === 'number'
@@ -5130,6 +5168,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
   }
 
+  /** A stop before any model step was a host decision the model never saw;
+   * narrating it would contact the model the stop was meant to keep out. */
+  let reachedModel = false;
   const runOneModelStep = async (
     modelInput: AgentInputItem[],
     instructions: string | undefined,
@@ -5139,6 +5180,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     answerDraft?: AnswerDraftStep,
     finalRequestReading?: PromptReadingPublisher,
   ): Promise<Awaited<ReturnType<typeof codexOneStep>>> => {
+    reachedModel = true;
     let publishedFinalReading = false;
     const ambient = harnessRunContextStorage.getStore();
     const killTarget = ambient?.runAttemptId
@@ -5384,6 +5426,78 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       signal?.removeEventListener('abort', callerAbort);
       signal?.removeEventListener('abort', cancelAuthorityFromCaller);
       if (rejectCallerAbort) signal?.removeEventListener('abort', rejectCallerAbort);
+    }
+  };
+
+  if (hostProduction) narration.narrate = async (outcome: RunOutcome): Promise<RunOutcome> => {
+    if (!hostStopNarrationEnabled || !reachedModel) return outcome;
+    try {
+      const identity = exactHostIdentity();
+      const ambient = harnessRunContextStorage.getStore();
+      const killTarget = ambient?.runAttemptId
+        ? { attemptId: ambient.runAttemptId, sourceUserSeq: identity.sourceUserSeq }
+        : { sourceUserSeq: identity.sourceUserSeq };
+      // A Stop is the owner's own decision: the committer says it.
+      if (isKillRequested(identity.sessionId, killTarget)) return outcome;
+      const full = typeof outcome.finalOutput === 'string' ? outcome.finalOutput : '';
+      const headerAt = full.indexOf(RETAINED_WORK_TERMINAL_HEADER);
+      let fact = (headerAt >= 0 ? full.slice(0, headerAt) : full).trim();
+      const retained = headerAt >= 0 ? full.slice(headerAt).trim() : '';
+      if (!fact) return outcome;
+      if (fact.startsWith(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT)) {
+        // The ledger, not the runner's generic copy, says whether anything
+        // outside this machine could have run (delivery-committer reads the
+        // same truth for the fixed copy).
+        const committer = await import('./delivery-committer.js');
+        const { completionEvidenceSource } = await import('./recovery-activation.js');
+        if (committer.acceptedSourceHasZeroExternalEffectSurface(completionEvidenceSource(identity))) {
+          fact = committer.HOST_LOCAL_FAILURE_BLOCKED_TEXT;
+        }
+      }
+      let narrationInput = structuredClone(history);
+      let narrationInstructions = await resolveInstructions();
+      if (inputFilter) {
+        const filtered = await inputFilter({
+          modelData: {
+            input: structuredClone(history),
+            ...(narrationInstructions !== undefined ? { instructions: narrationInstructions } : {}),
+          },
+          agent,
+          context: contextValue,
+          advertisedTools: [],
+          holdReading: () => { /* the narration step publishes no prompt reading */ },
+        });
+        if (!filtered || !Array.isArray(filtered.input)) return outcome;
+        narrationInput = structuredClone(filtered.input);
+        if (typeof filtered.instructions !== 'undefined') narrationInstructions = filtered.instructions;
+      }
+      narrationInput.push({
+        role: 'system',
+        content: hostStopNarrationDirective(fact, (outcome as HostRunOutcome).blockedDetail),
+      } as AgentInputItem);
+      // A plain one-shot on the turn's own model, with no tools: the stop is
+      // already settled, so this request is outside the turn's checkpoint
+      // chain, provenance and recovery (it can only add words, never work).
+      const step = await codexOneStep({
+        input: narrationInput,
+        tools: [],
+        ...(modelId !== undefined ? { modelId } : {}),
+        ...(resolveModel ? { resolveModel } : {}),
+        ...(narrationInstructions !== undefined ? { systemInstructions: narrationInstructions } : {}),
+        modelSettings: stepModelSettings(),
+        signal: AbortSignal.timeout(HOST_STOP_NARRATION_BUDGET_MS),
+        stream: false,
+      });
+      const spoken = step.toolCalls.length === 0 ? step.text.trim() : '';
+      if (!spoken) return outcome;
+      try {
+        appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+          data: { kind: 'host_stop_narrated', sourceUserSeq: identity.sourceUserSeq,
+            reason: outcome.terminal && 'reason' in outcome.terminal ? outcome.terminal.reason ?? null : null } });
+      } catch { /* diagnostics never change a terminal */ }
+      return { ...outcome, finalOutput: retained ? `${spoken}\n\n${retained}` : spoken };
+    } catch {
+      return outcome;
     }
   };
 
@@ -11741,6 +11855,41 @@ interface HostFaultTerminal {
  * identity pins stay byte-stable; the conversation reducer persists it as
  * `blockedDetail` metadata, never as user-facing prose. */
 export type HostRunOutcome = RunOutcome & { blockedDetail?: string };
+
+/** One tool-less model step: bounded so a slow provider never holds a stop. */
+const HOST_STOP_NARRATION_BUDGET_MS = 45_000;
+
+/** Stops whose fixed sentence is about the model itself (it stalled, was
+ * filtered, gave nothing, ran out of its bound) or about bytes that must not
+ * reach a model: those keep the host's sentence. Every other blocked
+ * terminal is narrated by Clem from the host's fact. */
+const HOST_STOP_TEXTS_NOT_NARRATED = (): readonly string[] => [
+  HOST_MODEL_STALL_BLOCKED_TEXT,
+  HOST_MODEL_FILTERED_BLOCKED_TEXT,
+  HOST_MODEL_INCOMPLETE_BLOCKED_TEXT,
+  HOST_MODEL_LIMIT_BLOCKED_TEXT,
+  HOST_UNSUPPORTED_CAPABILITY_BLOCKED_TEXT,
+  HOST_RESULT_CHECKPOINT_BLOCKED_TEXT,
+];
+
+export function isNarratableHostStop(outcome: RunOutcome): boolean {
+  if (!outcome.terminal || outcome.terminal.status !== 'blocked') return false;
+  const text = typeof outcome.finalOutput === 'string' ? outcome.finalOutput.trim() : '';
+  if (!text) return false;
+  return !HOST_STOP_TEXTS_NOT_NARRATED().some((fixed) => text.startsWith(fixed));
+}
+
+/** The host's fact, for Clem to say. Facts only; the words are hers. */
+export function hostStopNarrationDirective(fact: string, detail?: string): string {
+  return [
+    '[turn-facts:v1]',
+    'This turn has to stop here. What the harness knows, in its own terms:',
+    fact,
+    ...(detail ? [`Machine detail: ${detail}`] : []),
+    'Write your reply to the owner now, as yourself, from the conversation above and this fact: what you did, what did not happen or is not certain, what is kept, and the one next step (what you need from them, or what you will do when they say go).',
+    'Do not call tools. Claim nothing the conversation does not show. Do not mention the harness, checkpoints, reconciliation, tool names, ids or handles.',
+  ].join('\n');
+}
 
 export function hostBlockedTerminalDetail(outcome: RunOutcome): string | undefined {
   const detail = (outcome as { blockedDetail?: unknown }).blockedDetail;

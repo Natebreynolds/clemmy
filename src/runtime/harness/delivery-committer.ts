@@ -909,7 +909,7 @@ export const HOST_LOCAL_FAILURE_BLOCKED_TEXT =
  * ledger keeps the conservative uncertainty copy: honesty may only ever be
  * upgraded on proof, never on a query failure.
  */
-function acceptedSourceHasZeroExternalEffectSurface(
+export function acceptedSourceHasZeroExternalEffectSurface(
   identity: Pick<TurnIdentity, 'sessionId' | 'sourceUserSeq'>,
 ): boolean {
   try {
@@ -1164,6 +1164,10 @@ export function commitTurnOutcome(
     effectiveOutcome.status === 'blocked'
     // The runner may already have appended retained-work context. Its typed
     // reason survives that rendering; presentation bytes are not identity.
+    // Only the host's own fixed copy is replaced here. A stop Clem already
+    // narrated was told the ledger's truth before she spoke (host-turn-runner
+    // narration) and keeps her words; a stopped one was never narrated.
+    && effectiveOutcome.presentation.text.startsWith(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT)
     && (effectiveOptions.metadata?.blockedReason === 'tool_effect_uncertain'
       || effectiveOutcome.presentation.text === HOST_TOOL_UNCERTAIN_BLOCKED_TEXT)
     && acceptedSourceHasZeroExternalEffectSurface(completionEvidenceSource(effectiveOutcome.identity))
