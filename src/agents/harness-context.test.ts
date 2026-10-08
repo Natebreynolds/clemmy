@@ -195,14 +195,19 @@ test('harness context prefers per-session working-memory checkpoints over global
   assert.match(context, /Recovered 12 prospects/);
 });
 
-test('Autonomy section: YOLO auto-runs reversible work but preserves one irreversible-action gate', () => {
+test('Autonomy section: Auto describes local work and the actual connected-write and exact-command boundaries', () => {
   saveProactivityPolicy({ autoApproveScope: 'yolo' });
   try {
     const context = renderHarnessMemoryContext();
     assert.match(context, /## Autonomy/);
-    assert.match(context, /STANDING APPROVAL for reversible work/);
-    assert.match(context, /do NOT use ask_user_question to seek sign-off/i);
-    assert.match(context, /Irreversible external sends\/posts\/calls and destructive actions remain exceptions/);
+    assert.match(context, /accepted reversible local work[^.]*runs without asking/);
+    assert.match(context, /do NOT add your own approval steps or use ask_user_question to seek sign-off/i);
+    assert.match(context, /connected app waits for the owner the first time, in Auto as well as Ask/);
+    assert.match(context, /operation on that account/);
+    assert.match(context, /Destructive, irreversible and administrative actions require exact approval unless an approved workflow covers them/);
+    assert.match(context, /shell call classified as changing something outside this machine uses one card for its exact command/);
+    assert.match(context, /reviewer advice and a request to modify a queued payload never substitute for exact execution consent/);
+    assert.doesNotMatch(context, /STANDING APPROVAL for[^.]*recoverable API writes/);
     assert.match(context, /one approval card own the pause/);
   } finally {
     saveProactivityPolicy({ autoApproveScope: 'balanced' });

@@ -50,7 +50,8 @@ import { appendEvent, getEvent, getSession, getTurnGraphEventForSource, listEven
 import { readConsumedTaskContinuityPacket } from '../../memory/task-continuity.js';
 import { computeResultHasSubstance } from './expected-work-matcher.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
-import { currentHostCallAttestation } from './accepted-turn-call-authority.js';
+import { acceptedTurnCallAuthorityFor, currentHostCallAttestation } from './accepted-turn-call-authority.js';
+import { harnessRunContextStorage } from './brackets.js';
 import { hostCallCapabilityBindingMatchesAttestation, loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { REPAIR_ARGUMENTS_NEEDS_INPUT_TEXT } from './recovery-presentation-truth.js';
@@ -76,6 +77,7 @@ import {
 import {
   getPendingAction,
   verifyConversationalPendingActionAuthority,
+  verifyPendingActionResumeExecutionCapability,
 } from './pending-actions.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import {
@@ -627,6 +629,22 @@ export function approvedMandateAdmitsCall(
   args: unknown,
 ): boolean {
   try {
+    // A formal card names request_approval while its PendingAction freezes the
+    // actual call. Its executing claim admits only those bytes under this
+    // exact graph; it cannot replace host_v1 capability attestation.
+    const context = harnessRunContextStorage.getStore();
+    const capability = context?.pendingActionExecution;
+    if (context?.sessionId === sessionId && context.sourceUserSeq === sourceUserSeq
+      && capability?.sourceUserSeq === sourceUserSeq && sourceUserSeq > 0) {
+      const root = acceptedTurnCallAuthorityFor(sessionId, sourceUserSeq);
+      const expected = expectedTaskFor(sessionId, sourceUserSeq);
+      const effect = classifyRuntimeToolEffect(tool, args).effect;
+      if (root.status === 'ok' && root.authority.authorityKind === 'turn_graph'
+        && expected.status === 'ok' && expected.graph.compiler.graphHash === root.authority.graphHash
+        && expected.graph.classification.route === 'act' && effect !== 'unknown'
+        && (expected.graph.effectCeiling === 'unknown' || expected.graph.effectCeiling === effect)
+        && verifyPendingActionResumeExecutionCapability({ capability, sessionId, toolName: tool, payload: args })) return true;
+    }
     const rows = db.prepare(`
       SELECT approval_id, tool, args_json, presentation_json FROM pending_approvals
        WHERE session_id = ? AND status = 'resolved' AND resolution = 'approved'

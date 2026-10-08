@@ -197,7 +197,8 @@ test('pending_action_queue canonicalizes both Composio spellings and promotes on
     approvalIntent: 'request_now',
   });
   assert.match(promoted.content[0].text, /Pending action reused/);
-  assert.match(promoted.content[0].text, /CARD OPENED/);
+  assert.match(promoted.content[0].text, /QUEUED FOR APPROVAL/);
+  assert.doesNotMatch(promoted.content[0].text, /CARD OPENED/);
 
   const records = listPendingActions({ sessionId: session.id });
   assert.equal(records.length, 1, 'canonical raw/gateway spellings dedupe');
@@ -222,7 +223,7 @@ test('pending_action_queue canonicalizes both Composio spellings and promotes on
     payloadJson: JSON.stringify(args),
     approvalIntent: 'queue_only',
   });
-  assert.match(refusedDowngrade.content[0].text, /CARD OPENED/);
+  assert.match(refusedDowngrade.content[0].text, /QUEUED FOR APPROVAL/);
   assert.doesNotMatch(refusedDowngrade.content[0].text, /STAGED ONLY/);
   assert.equal(
     queuedApprovalTransitionsForRequest(session.id, source.seq)[0]?.approvalIntent,
@@ -478,7 +479,8 @@ test('pending_action_queue refuses a targetless directed send but accepts an acc
       }),
       approvalIntent: 'request_now',
     }));
-  assert.match(pinnedRequestNow.content[0].text, /CARD OPENED/);
+  assert.match(pinnedRequestNow.content[0].text, /QUEUED FOR APPROVAL/);
+  assert.doesNotMatch(pinnedRequestNow.content[0].text, /CARD OPENED/);
   const [pinnedRecord] = listPendingActions({ sessionId: pinnedSession.id });
   assert.equal(
     (pinnedRecord.payload as { connected_account_id?: string }).connected_account_id,
@@ -531,7 +533,9 @@ test('CLI-default publish queue snapshots operator authority and refuses account
         image_url: 'https://assets.example/launch.png',
       },
     });
-    assert.match(queued.content[0].text, /CARD OPENED/);
+    assert.match(queued.content[0].text, /QUEUED FOR APPROVAL/);
+    assert.match(queued.content[0].text, /card is not open yet/);
+    assert.doesNotMatch(queued.content[0].text, /CARD OPENED|call request_approval/);
     const [record] = listPendingActions({ sessionId: session.id });
     assert.deepEqual(record.executionAuthority, authority);
     assert.equal(

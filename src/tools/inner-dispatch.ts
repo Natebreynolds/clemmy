@@ -31,7 +31,9 @@ import { deriveInnerDispatchSets } from './tool-registry.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope, stripMcpToolCarrier } from '../runtime/mcp-tool-authority.js';
 import { toolOutputLooksSuccessful } from '../runtime/harness/tool-evidence.js';
-import type { PendingActionExecutionCapability } from '../runtime/harness/pending-actions.js';
+import { pendingActionResumeLogicalCallId, verifyPendingActionResumeExecutionCapability, type PendingActionExecutionCapability } from '../runtime/harness/pending-actions.js';
+import { currentLogicalCall } from '../runtime/harness/attempt-identity.js';
+import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import {
   invokeAcceptedExactMcpCarrier,
 } from '../runtime/harness/accepted-mcp-carrier.js';
@@ -293,6 +295,10 @@ export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmiss
   | 'dispatchLease'
   | 'runAttemptId'
   | 'hostOwnsToolAccounting'
+  | 'hostOwnsToolDeadlineAndSettlement'
+  | 'hostOwnedToolEffect'
+  | 'callerCancelSignal'
+  | 'pendingActionExecution'
   | 'routedModelId'
 >> {
   const parent = harnessRunContextStorage.getStore();
@@ -308,6 +314,15 @@ export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmiss
     ...(parent.mcpToolScope !== undefined ? { mcpToolScope: parent.mcpToolScope } : {}),
     ...(parent.dispatchLease ? { dispatchLease: parent.dispatchLease } : {}),
     ...(parent.runAttemptId ? { runAttemptId: parent.runAttemptId } : {}),
+    // A mirror of the exact host-owned action retains its one deadline and
+    // terminal owner. Unrelated batch children cannot inherit that exemption.
+    ...(mirroredCallId && currentLogicalCall()?.logicalToolCallId === mirroredCallId
+      && parent.pendingActionExecution !== undefined
+      && pendingActionResumeLogicalCallId(parent.pendingActionExecution) === mirroredCallId
+      && parent.hostOwnsToolDeadlineAndSettlement === true
+      ? { hostOwnsToolDeadlineAndSettlement: true, hostOwnedToolEffect: parent.hostOwnedToolEffect,
+          callerCancelSignal: parent.callerCancelSignal, pendingActionExecution: parent.pendingActionExecution }
+      : {}),
     // An exact consent admission or same-logical-call mirror retains the host
     // charge. Ordinary nested/batch calls remain separately accounted: an
     // ambient parent flag cannot exempt arbitrary child work.
@@ -408,7 +423,8 @@ async function dispatchInnerLocalTool(method: string, args: unknown, sessionId: 
   // without it a local tool's attempt could not settle and the approved
   // command never ran.
   const inheritedContext = {
-    ...inheritedNestedHarnessContext(sessionId, exactHostAdmission, batchItem === false ? callId : undefined),
+    ...inheritedNestedHarnessContext(sessionId, exactHostAdmission,
+      batchItem === false || pendingActionExecution ? callId : undefined),
     ...(pendingActionExecution?.sourceUserSeq
       ? { sourceUserSeq: pendingActionExecution.sourceUserSeq }
       : {}),
@@ -420,7 +436,9 @@ async function dispatchInnerLocalTool(method: string, args: unknown, sessionId: 
   const runContext = { context: { sessionId,
     ...(inheritedContext.sourceUserSeq ? { sourceUserSeq: inheritedContext.sourceUserSeq } : {}),
   } };
-  const details = { toolCall: { callId } };
+  const details = { toolCall: { callId },
+    ...(inheritedContext.hostOwnsToolDeadlineAndSettlement ? { signal: currentToolAbortSignal() } : {}),
+  };
   // `certifiedBatch` is threaded into the run context ONLY on the batch runner's
   // approved execute path (dispatchBatchItemTool passes it); other nested calls
   // leave it undefined, so ad-hoc writes keep full per-item judging.
@@ -498,7 +516,8 @@ async function dispatchInnerMcpTool(
   const activeCounter = counter ?? new ToolCallsCounter(1000);
   return withHarnessRunContext(
     {
-      ...inheritedNestedHarnessContext(sessionId, false, batchItem === false ? callId : undefined),
+      ...inheritedNestedHarnessContext(sessionId, false,
+        batchItem === false || pendingActionExecution ? callId : undefined),
       sessionId,
       counter: activeCounter,
       nestedDispatch: true,
@@ -565,7 +584,18 @@ export async function dispatchBatchItemTool(
   // `call_tool` is a transport mirror of the model's existing invocation, so
   // its inner bracket must carry the same logical id.  A real batch item has no
   // canonical parent id and therefore receives a fresh child call as before.
-  const callId = telemetry?.accounting === 'transport_mirror'
+  const parent = harnessRunContextStorage.getStore();
+  const logical = currentLogicalCall();
+  const exactApprovedOwner = parent?.sessionId === sessionId
+    && parent.sourceUserSeq === pendingActionExecution?.sourceUserSeq
+    && parent.hostOwnsToolDeadlineAndSettlement === true
+    && logical
+    && pendingActionExecution
+    && logical.logicalToolCallId === pendingActionResumeLogicalCallId(pendingActionExecution)
+    && verifyPendingActionResumeExecutionCapability({ capability: pendingActionExecution, sessionId, toolName: method, payload: args });
+  const callId = exactApprovedOwner
+    ? logical.logicalToolCallId
+    : telemetry?.accounting === 'transport_mirror'
     && typeof telemetry.canonicalCallId === 'string'
     && telemetry.canonicalCallId.trim().length > 0
     ? telemetry.canonicalCallId

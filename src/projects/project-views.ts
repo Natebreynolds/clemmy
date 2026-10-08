@@ -336,6 +336,51 @@ export function conversationsForProject(projectId: string, limit = 20): ProjectC
   }
 }
 
+/** A listing reads large conversation metadata once, then matches projects
+ * against the small membership projection. The legacy view's JSON.parse can
+ * disagree with SQLite on non-strict JSON or duplicate keys; retain its exact
+ * per-project query/catch behavior for those records. */
+function conversationsForProjects(projectIds: string[], limit: number): Map<string, ProjectConversationView[]> {
+  const result = new Map(projectIds.map((id) => [id, [] as ProjectConversationView[]]));
+  if (!projectIds.length) return result;
+  try {
+    const rows = openEventLog().prepare(`
+      WITH requested_projects AS (SELECT value AS projectId FROM json_each(?)),
+      chat_projection AS MATERIALIZED (
+        SELECT id, title, updated_at AS updatedAt,
+               json_extract(metadata_json, '$.projectId', '$.projectIds', '$.agentId', '$.agentName') AS metadata,
+               CASE WHEN json_valid(metadata_json) THEN NOT EXISTS (
+                 SELECT 1 FROM json_each(metadata_json)
+                  WHERE key IN ('projectId', 'projectIds', 'agentId', 'agentName')
+                  GROUP BY key HAVING COUNT(*) > 1
+               ) ELSE 0 END AS strictUnique
+          FROM sessions WHERE kind = 'chat'
+      ),
+      project_matches AS (
+        SELECT requested_projects.projectId, chat_projection.*,
+               row_number() OVER (PARTITION BY requested_projects.projectId ORDER BY updatedAt DESC) AS position
+          FROM requested_projects CROSS JOIN chat_projection
+         WHERE json_extract(metadata, '$[0]') = requested_projects.projectId
+            OR EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(metadata, '$[1]'), '[]'))
+                        WHERE value = requested_projects.projectId)
+      )
+      SELECT * FROM project_matches WHERE position <= ? ORDER BY projectId, position
+    `).all(JSON.stringify(projectIds), Math.max(1, Math.min(100, limit))) as Array<{
+      projectId: string; id: string; title: string | null; updatedAt: string; metadata: string; strictUnique: number;
+    }>;
+    if (rows.some((row) => !row.strictUnique)) throw new Error('Legacy conversation metadata projection required');
+    for (const row of rows) {
+      const [currentProjectId, , agentId, agentName] = JSON.parse(row.metadata) as unknown[];
+      result.get(row.projectId)!.push({ sessionId: row.id, title: row.title, updatedAt: row.updatedAt,
+        agentName: typeof agentName === 'string' && agentId ? agentName : null,
+        current: currentProjectId === row.projectId });
+    }
+    return result;
+  } catch {
+    return new Map(projectIds.map((id) => [id, conversationsForProject(id, limit)]));
+  }
+}
+
 /** The id of an approval that is decided on a card, and of no other. */
 function cardApprovalId(approvalId: string | undefined): string | null {
   if (!approvalId) return null;
@@ -370,6 +415,15 @@ export interface ProjectDecisionView {
 export function decisionsForProject(projectId: string, limit = 12): ProjectDecisionView[] {
   const tasks = listBackgroundTasks({ includeArchived: false })
     .filter((task) => task.delegation?.projectId === projectId && !task.internal);
+  return decisionsFromRecords(tasks, conversationsForProject(projectId, 50), () => approvalRegistry.listPending({ status: 'pending' }), limit);
+}
+
+function decisionsFromRecords(
+  tasks: readonly BackgroundTaskRecord[],
+  conversations: readonly ProjectConversationView[],
+  pendingApprovals: () => readonly approvalRegistry.PendingApprovalRow[],
+  limit: number,
+): ProjectDecisionView[] {
   const decisions: ProjectDecisionView[] = [];
   const sessions = new Map<string, { taskId: string | null; owner: string; title: string; conversation: string | null }>();
   for (const task of tasks) {
@@ -382,13 +436,13 @@ export function decisionsForProject(projectId: string, limit = 12): ProjectDecis
         detail: task.pendingQuestion.slice(0, 600), owner, askedAt: task.updatedAt });
     }
   }
-  for (const conversation of conversationsForProject(projectId, 50)) {
+  for (const conversation of conversations) {
     if (!conversation.current) continue;
     sessions.set(conversation.sessionId, { taskId: null, owner: conversation.agentName ?? 'Clem', title: conversation.title ?? 'Conversation',
       conversation: conversation.sessionId });
   }
   try {
-    for (const approval of approvalRegistry.listPending({ status: 'pending' })) {
+    for (const approval of pendingApprovals()) {
       const from = sessions.get(approval.sessionId);
       if (!from || approvalRegistry.isExpired(approval)) continue;
       // The registry says what a pending row may show: a card's id, or, for
@@ -419,6 +473,16 @@ export interface ProjectSummaryView {
 export function projectSummary(project: ProjectRecord): ProjectSummaryView {
   const tasks = listBackgroundTasks({ includeArchived: false })
     .filter((task) => task.delegation?.projectId === project.id && !task.internal);
+  return summaryFromRecords(project, tasks, project.status === 'active' ? conversationsForProject(project.id, 50) : [],
+    () => approvalRegistry.listPending({ status: 'pending' }));
+}
+
+function summaryFromRecords(
+  project: ProjectRecord,
+  tasks: readonly BackgroundTaskRecord[],
+  conversations: readonly ProjectConversationView[],
+  pendingApprovals: () => readonly approvalRegistry.PendingApprovalRow[],
+): ProjectSummaryView {
   return {
     id: project.id,
     name: project.name,
@@ -428,12 +492,32 @@ export function projectSummary(project: ProjectRecord): ProjectSummaryView {
     agents: listAssignments(project.id).map(assignmentView).filter((row) => row.available)
       .map((row) => ({ agentId: row.agentId, agentName: row.agentName })),
     activeTasks: tasks.filter((task) => !TERMINAL.has(task.status)).length,
-    needsYou: project.status === 'active' ? decisionsForProject(project.id, 50).length : 0,
+    needsYou: project.status === 'active' ? decisionsFromRecords(tasks, conversations, pendingApprovals, 50).length : 0,
   };
 }
 
 export function projectSummaries(options: { includeArchived?: boolean } = {}): ProjectSummaryView[] {
-  return listProjects(options).map(projectSummary);
+  const projects = listProjects(options);
+  if (!projects.length) return [];
+  const tasksByProject = new Map<string, BackgroundTaskRecord[]>();
+  for (const task of listBackgroundTasks({ includeArchived: false })) {
+    const projectId = task.delegation?.projectId;
+    if (!projectId || task.internal) continue;
+    const tasks = tasksByProject.get(projectId) ?? [];
+    tasks.push(task);
+    tasksByProject.set(projectId, tasks);
+  }
+  const conversations = conversationsForProjects(projects.filter((project) => project.status === 'active').map((project) => project.id), 50);
+  let approvals: approvalRegistry.PendingApprovalRow[] | undefined;
+  const pendingApprovals = () => {
+    if (approvals === undefined) {
+      try { approvals = approvalRegistry.listPending({ status: 'pending' }); }
+      catch { approvals = []; }
+    }
+    return approvals;
+  };
+  return projects.map((project) => summaryFromRecords(project, tasksByProject.get(project.id) ?? [],
+    conversations.get(project.id) ?? [], pendingApprovals));
 }
 
 export type ProjectResourceView = ProjectResource & {

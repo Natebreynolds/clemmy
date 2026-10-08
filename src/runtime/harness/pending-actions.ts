@@ -257,6 +257,38 @@ export function verifyPendingActionExecutionCapability(input: {
   );
 }
 
+/** The invocation identity of one atomic claim. Retaining the same opaque
+ * token can never mint another logical invocation for its stored effect. */
+export function pendingActionResumeLogicalCallId(capability: PendingActionExecutionCapability): string {
+  return `approved-action:${capability.pendingActionId}:${capability.sourceUserSeq}:${executionTokenHash(capability.claimToken)}`;
+}
+
+/** Stronger source proof used only by the no-model resume invocation kernel.
+ * Legacy execution capability consumers keep their original source policy. */
+export function verifyPendingActionResumeExecutionCapability(input: {
+  capability: PendingActionExecutionCapability | null | undefined;
+  sessionId: string | null | undefined;
+  toolName: string;
+  payload: unknown;
+}): boolean {
+  if (!verifyPendingActionExecutionCapability(input)) return false;
+  const capability = input.capability!;
+  if (!Number.isSafeInteger(capability.sourceUserSeq) || capability.sourceUserSeq <= 0) return false;
+  const record = getPendingAction(capability.pendingActionId);
+  if (!record?.approvalId || !record.sessionId) return false;
+  const row = approvalRegistryForVerify.get(record.approvalId);
+  if (!row || row.sessionId !== input.sessionId || row.status !== 'resolved' || row.resolution !== 'approved') return false;
+  const sources = listEvents(record.sessionId, { types: ['user_input_received'] });
+  if (record.approvalEvidence?.kind === 'conversation') {
+    // The underlying verifier already checked the responder and addressed
+    // conversation. The registry must still name this same accepted reply.
+    return row.presentation?.responseSourceUserSeq === capability.sourceUserSeq;
+  }
+  const tagged = sources.filter(source => source.role === 'user'
+    && source.data.approvalId === record.approvalId && source.data.decision === 'approve');
+  return tagged.length === 1 && tagged[0].seq === capability.sourceUserSeq;
+}
+
 function cleanLine(value: string | null | undefined, fallback: string, max = 1000): string {
   const cleaned = (value ?? '').replace(/\s+/g, ' ').trim();
   return (cleaned || fallback).slice(0, max);

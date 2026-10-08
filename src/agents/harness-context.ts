@@ -89,9 +89,9 @@ export function renderAutonomy(): string {
     const scope = loadProactivityPolicy().autoApproveScope;
     if (scope === 'yolo') {
       return [
-        'AUTO MODE — the user has granted STANDING APPROVAL for reversible work such as drafts, local files, workspace updates, and recoverable API writes. Irreversible external sends/posts/calls and destructive actions remain exceptions: they require one concrete human or certified grant at the execution gate.',
-        'Do NOT stop to ask permission for reversible work, do NOT add redundant approval steps, and do NOT use ask_user_question to seek sign-off on work already requested — just do it, then report what landed and any assumption you made. For an irreversible action, queue the exact payload and let the one approval card own the pause; never ask once in prose and again at the tool gate.',
-        'You MAY still ask a genuine clarifying question when a fact cannot be inferred — set ask_user_question purpose:"clarification" for those. An approval-shaped ask auto-resolves only so the execution gate can apply the real policy; it is not permission to bypass an irreversible-action card.',
+        'AUTO MODE — accepted reversible local work such as drafts, local files and workspace updates runs without asking. A change in a connected app waits for the owner the first time, in Auto as well as Ask; approving once teaches that operation on that account. Destructive, irreversible and administrative actions require exact approval unless an approved workflow covers them. Explicit human checkpoints still pause.',
+        'Do NOT add your own approval steps or use ask_user_question to seek sign-off on work already requested: make the exact call and let its execution boundary apply the real policy. A shell call classified as changing something outside this machine uses one card for its exact command. Let the one approval card own the pause; never ask once in prose and again at the tool gate.',
+        'You MAY still ask a genuine clarifying question when a fact cannot be inferred — set ask_user_question purpose:"clarification" for those. An approval-shaped ask auto-resolves only so the execution boundary can apply the real policy. AUTO MODE, reviewer advice and a request to modify a queued payload never substitute for exact execution consent.',
       ].join(' ');
     }
     if (scope === 'strict') {

@@ -46,6 +46,8 @@ mkdirSync(WORK, { recursive: true });
 
 const eventlog = await import('./eventlog.js');
 const { runConversation } = await import('./loop.js');
+const host = await import('./host-turn-runner.js');
+const { sourceSettledReadEvidence } = await import('./host-completion-work.js');
 const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
 const semanticPorts = await import('../semantic-boundary/turn-semantic-port-registry.js');
 const approvalRegistry = await import('./approval-registry.js');
@@ -119,11 +121,12 @@ function scriptedBrain(script: Output[][]) {
   };
 }
 
-async function runHostTurn(input: { sessionId: string; sourceUserSeq: number; runAttemptId: string; request: string; script: Output[][] }) {
+async function runHostTurn(input: { sessionId: string; sourceUserSeq: number; runAttemptId: string; request: string; script: Output[][]; judgeCompletion?: boolean }) {
   const brain = scriptedBrain(input.script);
+  if (input.judgeCompletion) host.captureEffectiveCompletionPolicyOnce({ ...input, enabled: true });
   const result = await runConversation({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, input: input.request,
     reuseRecordedUserInput: true, runAttemptId: input.runAttemptId, turnEngine: 'host_v1', maxSteps: 1, maxTurns: 6,
-    toolCallsPerTurn: 8, judgeCompletion: false,
+    toolCallsPerTurn: 8, judgeCompletion: input.judgeCompletion ?? false,
     buildAgent: async (context) => buildOrchestratorAgent({ sessionId: context.sessionId,
       sourceUserSeq: context.sourceUserSeq, hostFreshPlanning: context.hostFreshPlanning, userInput: input.request,
       allowToolJit: true, model: brain as never }),
@@ -132,13 +135,13 @@ async function runHostTurn(input: { sessionId: string; sourceUserSeq: number; ru
   return { result, frames: brain.frames, trace: eventlog.listEvents(input.sessionId) };
 }
 
-async function hostTurn(label: string, request: string, script: Output[][]) {
+async function hostTurn(label: string, request: string, script: Output[][], judgeCompletion = false) {
   const session = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: label });
   const attempt = eventlog.beginRunAttempt(session.id, { runId: `off-machine-${label}:${session.id}` });
   const accepted = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
     text: request, taskMode: { version: 1, kind: 'normal' },
   } }, { armRunInFlight: true });
-  const run = await runHostTurn({ sessionId: session.id, sourceUserSeq: accepted.seq, runAttemptId: attempt.attemptId, request, script });
+  const run = await runHostTurn({ sessionId: session.id, sourceUserSeq: accepted.seq, runAttemptId: attempt.attemptId, request, script, judgeCompletion });
   return { session, sourceUserSeq: accepted.seq, ...run };
 }
 
@@ -219,7 +222,7 @@ test('a command that leaves the machine is refused into one card, and the approv
   // the endpoint receives exactly that request; the owner is told what landed.
   const approved = await approveCard(run.session.id, approvalId);
   assert.equal(approved.settled, true, approved.outcomeText);
-  assert.deepEqual(received, ['POST /hook x=1'], approved.outcomeText);
+  assert.deepEqual(received, ['POST /hook x=1'], `${approved.outcomeText}\n${pendingActions.getPendingAction(view!.id)?.resultSummary ?? ''}`);
   assert.equal(pendingActions.getPendingAction(view!.id)?.status, 'executed', approved.outcomeText);
   assert.match(approved.outcomeText, /Done — I ran it\. Here's what it printed/, approved.outcomeText);
   assert.match(approved.outcomeText, /```\\nok\\n```/, 'the command\'s own output, not the executor\'s bookkeeping');
@@ -244,6 +247,88 @@ function queueScript(command: string, title: string): Output[][] {
     [text('The command is waiting for your approval.')],
   ];
 }
+
+test('a request_now card parks before completion review while retaining the mixed task read and authored question', async () => {
+  const receivedBefore = [...received];
+  const file = path.join(WORK, 'approval-context.txt');
+  const content = 'The controlled endpoint expects x=1. No request has been sent.';
+  writeFileSync(file, content);
+  const reply = 'The endpoint expects x=1. Can I send that exact request now?';
+  let judged = 0;
+  host._setHostObjectiveJudgeForTests(async () => {
+    judged += 1;
+    return { done: false, reason: 'Execution requires its pending card.' };
+  });
+  try {
+    const run = await hostTurn('mixed-card-review', 'Read the endpoint instructions and prepare the exact request for my approval.', [
+      [call('call-read', 'call_tool', { name: 'read_file', args_json: JSON.stringify({ path: file, max_chars: null }) })],
+      [call('call-queue-mixed', 'call_tool', { name: 'pending_action_queue', args_json: JSON.stringify({
+        title: 'Send the controlled request', summary: 'Sends x=1 to the controlled endpoint.',
+        kind: 'shell_command', toolName: 'run_shell_command', payloadJson: JSON.stringify(SHELL_ARGS),
+        approvalIntent: 'request_now', ask: reply,
+      }) })],
+      [text(reply)],
+    ], true);
+    const debug = JSON.stringify({ result: run.result, frames: run.frames }).slice(0, 5_000);
+    assert.equal(judged, 0, 'a real pending card is a dependency, not missing completed execution');
+    assert.equal(run.frames.length, 3, debug);
+    assert.equal(run.result.status, 'awaiting_approval', debug);
+    assert.equal(run.result.lastDecision?.reply, reply, debug);
+    assert.equal(run.result.lastDecision?.nextAction, 'awaiting_approval', debug);
+    assert.equal(run.result.lastDecision?.done, false, debug);
+    assert.match(run.frames[2]?.toolResults.join('\n') ?? '', /card is not open yet/, debug);
+    assert.doesNotMatch(run.frames[2]?.toolResults.join('\n') ?? '', /CARD OPENED|call request_approval/, debug);
+    assert.ok(sourceSettledReadEvidence({ sessionId: run.session.id, sourceUserSeq: run.sourceUserSeq }).summary.includes(content),
+      'the completed read remains available as exact-source evidence');
+    const approval = run.trace.find(event => event.type === 'approval_requested')!;
+    assert.equal(approval.data.sourceUserSeq, run.sourceUserSeq);
+    const card = approvalRegistry.get(String(approval.data.approvalId))!;
+    assert.equal(card.status, 'pending');
+    const view = pendingActionApprovalViewFromArgs(card.args)!;
+    assert.deepEqual(view.payload, SHELL_ARGS, 'the card pins the original command arguments');
+    assert.equal(pendingActions.getPendingAction(view.id)?.status, 'approval_requested');
+    const completed = run.trace.find(event => event.type === 'conversation_completed')!;
+    assert.equal(completed.data.reason, 'awaiting_approval');
+    assert.equal(completed.data.pendingApprovalId, card.approvalId);
+    assert.ok(String(completed.data.reply).startsWith(reply), 'the ordinary delivery committer keeps the authored question and retained-work appendix');
+    assert.equal((completed.data.presentation as Record<string, unknown>).kind, 'approval');
+    assert.equal(run.trace.filter(event => event.type === 'goal_alignment_judged').length, 0);
+    assert.deepEqual(received, receivedBefore, 'queueing a new card executes nothing');
+  } finally {
+    host._setHostObjectiveJudgeForTests(null);
+  }
+});
+
+test('queue_only stays inert and retains the required completion review', async () => {
+  const receivedBefore = [...received];
+  let judged = 0;
+  host._setHostObjectiveJudgeForTests(async () => {
+    judged += 1;
+    return { done: true, reason: 'The exact request was stored without opening a card or executing it.' };
+  });
+  try {
+    const run = await hostTurn('queue-only-review', 'Store the exact endpoint request for later, without requesting approval.', [
+      [call('call-queue-only', 'call_tool', { name: 'pending_action_queue', args_json: JSON.stringify({
+        title: 'Stored controlled request', summary: 'Sends x=1 to the controlled endpoint when later approved.',
+        kind: 'shell_command', toolName: 'run_shell_command', payloadJson: JSON.stringify(SHELL_ARGS),
+        approvalIntent: 'queue_only',
+      }) })],
+      [text('The exact request is stored for later. No approval was requested and nothing ran.')],
+    ], true);
+    const debug = JSON.stringify({ result: run.result, frames: run.frames }).slice(0, 5_000);
+    assert.equal(judged, 1, 'a queued payload without an open card does not skip review');
+    assert.equal(run.result.status, 'completed', debug);
+    assert.equal(run.trace.filter(event => event.type === 'approval_requested').length, 0, debug);
+    assert.equal(run.trace.filter(event => event.type === 'approval_parked').length, 0, debug);
+    const queued = run.trace.find(event => event.type === 'autonomy_note' && event.data.kind === 'pending_action_queued')!;
+    const record = pendingActions.getPendingAction(String(queued.data.pendingActionId))!;
+    assert.equal(record.status, 'queued', debug);
+    assert.equal(record.approvalId, null);
+    assert.deepEqual(received, receivedBefore, 'queue_only executes nothing');
+  } finally {
+    host._setHostObjectiveJudgeForTests(null);
+  }
+});
 
 test('an approved card cannot carry a command the guards inside the tool refuse', async () => {
   // The same door, for a command that reads credential material on its way

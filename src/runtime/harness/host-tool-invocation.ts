@@ -45,14 +45,16 @@ import {
   withHarnessRunContext,
   type HarnessRunContext,
 } from './brackets.js';
-import type { RuntimeToolEffect, TrustedRuntimeEffectCarrier } from './tool-effect.js';
-import { getToolOutput, listEvents, openEventLog, writeToolOutput } from './eventlog.js';
+import { classifyRuntimeToolEffect, type RuntimeToolEffect, type TrustedRuntimeEffectCarrier } from './tool-effect.js';
+import { getRunAttemptBySourceUserSeq, getToolOutput, isKillRequested, listEvents, openEventLog, writeToolOutput } from './eventlog.js';
 import type {
   CapabilityRiskAttestationV1,
   InteractiveConsentProceedBasis,
 } from './interactive-consent-policy.js';
 import { openCanonicalArguments } from './authority-argument-seal.js';
-import { currentHostCallAttestation } from './accepted-turn-call-authority.js';
+import { acceptedTurnCallAuthorityFor, currentHostCallAttestation } from './accepted-turn-call-authority.js';
+import { pendingActionResumeLogicalCallId, verifyPendingActionResumeExecutionCapability, type PendingActionExecutionCapability } from './pending-actions.js';
+import { expectedTaskFor } from './resolution-ledger.js';
 import { learnedReadRequest } from './execution-gate.js';
 import {
   persistHostCallCapabilityBinding,
@@ -159,6 +161,9 @@ export interface InvokeHostToolCallInput<T> {
   /** Opaque provenance for an exact provider operation whose transport
    * envelope was peeled by the trusted host before this shared kernel. */
   trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
+  /** Exact claimed action under an accepted graph. This is not a host_v1
+   * capability attestation and cannot replace one on a host-owned root. */
+  pendingActionExecution?: PendingActionExecutionCapability;
   /** Optional synchronous policy edge owned by the host adapter. It runs
    * inside the exact child-lease context, immediately before this kernel owns
    * a physical reservation. Throwing is a proven zero-crossing refusal and
@@ -1200,6 +1205,7 @@ export async function invokeHostToolCall<T>(
   ) throw new HostToolInvocationAuthorityError('invocation identity, parent lease, or deadline is invalid');
   if (input.callerSignal?.aborted) throw new HostToolInvocationCancelledError('caller');
   if (input.isKillRequested?.()) throw new HostToolInvocationCancelledError('kill');
+  let invocationKillRequested = input.isKillRequested;
 
   const acceptedTaskId = acceptedTaskIdFor(
     input.identity.sessionId,
@@ -1211,6 +1217,43 @@ export async function invokeHostToolCall<T>(
     input.identity.args,
   );
   if (!recoveryMaterial) throw new HostToolInvocationAuthorityError('tool call contract is unsafe');
+  if (input.pendingActionExecution) {
+    const root = acceptedTurnCallAuthorityFor(input.identity.sessionId, input.identity.sourceUserSeq);
+    const expected = expectedTaskFor(input.identity.sessionId, input.identity.sourceUserSeq);
+    const attempt = getRunAttemptBySourceUserSeq(input.identity.sessionId, input.identity.sourceUserSeq);
+    if (
+      root.status !== 'ok'
+      || root.authority.authorityKind !== 'turn_graph'
+      || input.pendingActionExecution.sourceUserSeq !== input.identity.sourceUserSeq
+      || !attempt || attempt.status !== 'active' || attempt.finishedAt !== null
+      || input.parentLease.runAttemptId !== attempt.attemptId
+      || modelCallId !== pendingActionResumeLogicalCallId(input.pendingActionExecution)
+      || !verifyPendingActionResumeExecutionCapability({
+        capability: input.pendingActionExecution,
+        sessionId: input.identity.sessionId,
+        toolName: input.identity.toolName,
+        payload: input.identity.args,
+      })
+      || expected.status !== 'ok'
+      || expected.graph.compiler.graphHash !== root.authority.graphHash
+      || expected.graph.classification.route !== 'act'
+      // Approval control graphs intentionally leave the effect unknown. The
+      // verified claim freezes the concrete call; refine only this invocation
+      // through the canonical classifier, without upgrading the graph root.
+      || (expected.graph.effectCeiling !== 'unknown' && expected.graph.effectCeiling !== input.effect)
+      || input.effect === 'unknown'
+      || classifyRuntimeToolEffect(input.identity.toolName, input.identity.args).effect !== input.effect
+    ) throw new HostToolInvocationAuthorityError('approved action does not own this exact graph call and effect');
+    invocationKillRequested = () => isKillRequested(input.identity.sessionId, { attemptId: attempt.attemptId })
+      || input.isKillRequested?.() === true;
+    if (invocationKillRequested()) throw new HostToolInvocationCancelledError('kill');
+    // The executor's CAS normally makes this unreachable. Refuse a repeated
+    // direct kernel entry without touching the first invocation's live rows.
+    if (openEventLog().prepare(`SELECT 1 FROM logical_tool_calls
+      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`).get(
+        input.identity.sessionId, input.identity.sourceUserSeq, modelCallId,
+      )) throw new HostToolInvocationAuthorityError('approved action logical call was already admitted');
+  }
   const contract = {
     toolName: recoveryMaterial.toolName,
     argumentDigest: recoveryMaterial.argumentDigest,
@@ -1256,6 +1299,11 @@ export async function invokeHostToolCall<T>(
     logicalToolCallId: modelCallId,
   });
   if (prior.status !== 'missing') {
+    // Only the pending-action CAS may adopt a completed action. Its executing
+    // token cannot authorize a second kernel call or retained result replay.
+    if (input.pendingActionExecution) {
+      throw new HostToolInvocationAuthorityError('approved action logical call already has a terminal');
+    }
     if (prior.status !== 'ok') {
       throw new HostToolInvocationAuthorityError(
         `settled logical call is ${prior.status}: ${prior.reason}`,
@@ -1506,7 +1554,9 @@ export async function invokeHostToolCall<T>(
         reason,
       });
     };
-    const capabilityBinding = persistHostCallCapabilityBinding({
+    const capabilityBinding = input.pendingActionExecution
+      ? { status: 'not_applicable' as const }
+      : persistHostCallCapabilityBinding({
       db: openEventLog(),
       attestation: currentHostCallAttestation(),
       sessionId: input.identity.sessionId,
@@ -2212,10 +2262,10 @@ export async function invokeHostToolCall<T>(
           };
           input.callerSignal?.addEventListener('abort', callerAbort, { once: true });
           deadlineTimer = setTimeout(() => stop('deadline'), input.deadlineMs);
-          if (input.isKillRequested) {
+          if (invocationKillRequested) {
             killTimer = setInterval(() => {
               try {
-                if (input.isKillRequested?.()) stop('kill');
+                if (invocationKillRequested?.()) stop('kill');
               } catch (error) {
                 stopForUnreadableKillAuthority(error);
               }

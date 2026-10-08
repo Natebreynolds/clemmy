@@ -522,7 +522,7 @@ import {
   type PendingActionApprovalPreflight,
 } from '../runtime/harness/pending-action-approval.js';
 import { executeApprovedPendingActionCall } from '../execution/pending-action-executor.js';
-import { approvalResumeInFlight } from '../runtime/harness/chat-approval-resume.js';
+import { approvalResumeInFlight, approvalResumeOwnsAttempt } from '../runtime/harness/chat-approval-resume.js';
 import {
   listOperationalEvents,
   isOperationalEventType,
@@ -18569,8 +18569,17 @@ export function registerConsoleRoutes(
           heldByArmedRecoveryOwner = true;
           heldOwnerEvidence = 'unreadable';
         }
-        if (workflowOwnsAttempt) {
-          // Exact final report-back owns the terminal and attempt settlement.
+        let approvalOwnsAttempt = false;
+        try {
+          approvalOwnsAttempt = Boolean(acceptedApprovalId
+            && approvalResumeOwnsAttempt(acceptedApprovalId, requestAttempt));
+        } catch {
+          heldByArmedRecoveryOwner = true;
+          heldOwnerEvidence = 'unreadable';
+        }
+        if (workflowOwnsAttempt || approvalOwnsAttempt) {
+          // The exact workflow report-back or approved action terminal owns
+          // attempt settlement after its physical invocation has stopped.
         } else if (heldByArmedRecoveryOwner && requestAttemptStatus === 'completed') {
           try {
             appendHarnessEvent({

@@ -819,6 +819,8 @@ test('large file and all Space components reach the actual completion request wi
 });
 
 async function runHost(options: { captured: boolean; incoming: boolean; text?: string; work?: boolean; reply?: string; firstReply?: string; secondReply?: string; abortAtJudge?: boolean; policyData?: Record<string, unknown>; readResult?: unknown; afterCapture?: () => void;
+  beforeResponse?: (identity: ReturnType<typeof accepted>) => void;
+  queuedApprovalHook?: import('./loop.js').HostQueuedApprovalBeforeCompletion;
   firstVerdict?: { done: boolean; reason: string; blocked?: boolean };
   /** An earlier turn in the same session that settled one read. */
   earlierTurn?: { text: string; tool: string; payload: unknown; args?: Record<string, unknown> } }) {
@@ -848,6 +850,7 @@ async function runHost(options: { captured: boolean; incoming: boolean; text?: s
   const model = {
     async getResponse() {
       calls += 1;
+      if (calls === 1) options.beforeResponse?.(identity);
       if (calls === 1 && options.readResult !== undefined) {
         retainedRead(identity, 'read_file', options.readResult, false, true);
       }
@@ -870,13 +873,50 @@ async function runHost(options: { captured: boolean; incoming: boolean; text?: s
     envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
     envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
     const runner = Object.assign(new EventEmitter(), { run() { throw new Error('Legacy runner must not execute'); } });
-    const outcome = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(20) }, () => host.hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: options.text ?? request }] as never, { maxTurns: 4, hostTurnEngine: 'host_v1', hostJudgeCompletion: options.incoming, context: identity, signal: signal.signal } as never));
+    const outcome = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(20) }, () => host.hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: options.text ?? request }] as never, { maxTurns: 4, hostTurnEngine: 'host_v1', hostJudgeCompletion: options.incoming, hostQueuedApprovalBeforeCompletion: options.queuedApprovalHook, context: identity, signal: signal.signal } as never));
     return { identity, outcome, calls, judged };
   } finally {
     host._setHostObjectiveJudgeForTests(null);
     catalogs.installHostCapabilityCatalogFactory(prior);
   }
 }
+
+test('failed queue registration retains ordinary required completion review and its truthful source evidence', async () => {
+  const result = await runHost({ captured: true, incoming: true,
+    text: 'Prepare the exact external action for my approval.',
+    reply: 'The exact action is queued; its approval could not be opened and nothing ran.',
+    firstVerdict: { done: true, reason: 'The registration blocker is accurately reported.' },
+    queuedApprovalHook: () => ({ approvalIds: [], unregisteredActionIds: ['inert-exact-action'] }) });
+  assert.equal(result.judged.length, 1, 'a failed registration cannot masquerade as an awaiting card');
+  assert.equal(result.outcome.terminal, undefined);
+  assert.match(result.judged[0]?.evidence ?? '', /registration could not be verified/);
+  assert.match(result.judged[0]?.evidence ?? '', /No action ran and no open card was established/);
+});
+
+test('a hook cannot park a foreign or resolved approval instead of required completion review', async () => {
+  const registry = await import('./approval-registry.js');
+  const foreign = events.createSession({ kind: 'chat' });
+  const card = registry.register({ sessionId: foreign.id, subject: 'Different request', tool: 'request_approval', args: {} });
+  const foreignResult = await runHost({ captured: true, incoming: true,
+    text: 'Prepare the exact external action for my approval.',
+    reply: 'The requested action could not be prepared.', firstVerdict: { done: true, reason: 'The blocker is accurately reported.' },
+    queuedApprovalHook: () => ({ approvalIds: [card.approvalId], unregisteredActionIds: [] }) });
+  assert.equal(foreignResult.judged.length, 1);
+  assert.equal(foreignResult.outcome.terminal, undefined);
+  registry.resolve(card.approvalId, 'rejected', 'test-owner');
+  let optionsResolvedId = '';
+  const resolvedResult = await runHost({ captured: true, incoming: true,
+    text: 'Prepare the exact external action for my approval.',
+    reply: 'The requested action could not be prepared.', firstVerdict: { done: true, reason: 'The blocker is accurately reported.' },
+    beforeResponse(identity) {
+      const resolved = registry.register({ sessionId: identity.sessionId, subject: 'Resolved request', tool: 'request_approval', args: {} });
+      registry.resolve(resolved.approvalId, 'rejected', 'test-owner');
+      optionsResolvedId = resolved.approvalId;
+    },
+    queuedApprovalHook: () => ({ approvalIds: [optionsResolvedId], unregisteredActionIds: [] }) });
+  assert.equal(resolvedResult.judged.length, 1);
+  assert.equal(resolvedResult.outcome.terminal, undefined);
+});
 
 test('host reviews the exact refresh objective and curly-apostrophe promise, then continues on the named gap', async () => {
   const result = await runHost({ captured: true, incoming: true });
@@ -1526,7 +1566,7 @@ test('the reviewer sees what an earlier turn checked when the reply rests on it'
   assert.match(evidence, /before I say yes, will saving it overwrite anything/);
   assert.match(evidence, /- list_files \(read\) \{"path":"\/fixture\/output"\}: /);
   assert.match(evidence, /"entries":\[\]/);
-  assert.match(evidence, /EARLIER TURNS evidence counts for what the reply says an earlier turn checked/);
+  assert.match(evidence, /can support a reply that cites an earlier check, never this turn's own effects/);
 });
 
 test('earlier-turn evidence is bounded: this turn, synthetic inputs and old turns stay out', () => {

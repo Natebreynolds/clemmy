@@ -10,12 +10,20 @@ import {
   claimPendingActionExecution,
   getPendingAction,
   recordPendingActionResult,
+  pendingActionResumeLogicalCallId,
+  verifyPendingActionResumeExecutionCapability,
   type PendingActionExecutionClaim,
   type PendingActionExecutionCapability,
   type PendingActionRecord,
 } from '../runtime/harness/pending-actions.js';
-import { dispatchBatchItemTool } from '../tools/inner-dispatch.js';
-import { ToolCallsCounter } from '../runtime/harness/brackets.js';
+import { dispatchBatchItemTool, isMcpNamespacedTool } from '../tools/inner-dispatch.js';
+import { ToolCallsCounter, harnessRunContextStorage, timeoutForTool, withHarnessRunContext } from '../runtime/harness/brackets.js';
+import { acceptedTurnCallAuthorityFor } from '../runtime/harness/accepted-turn-call-authority.js';
+import { ensureAcceptedTaskResolutionOpenInTransaction, expectedTaskFor } from '../runtime/harness/resolution-ledger.js';
+import { activateDispatchLease, revokeDispatchLeaseBeforeRecovery } from '../runtime/harness/dispatch-lease.js';
+import { getActiveRunAttempt, getRunAttemptSourceUserEvent, isKillRequested, openEventLog } from '../runtime/harness/eventlog.js';
+import { invokeHostToolCall } from '../runtime/harness/host-tool-invocation.js';
+import { classifyRuntimeToolEffect } from '../runtime/harness/tool-effect.js';
 import { detectStructuredToolFailure } from '../runtime/harness/tool-error-corrective.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
@@ -59,6 +67,85 @@ const defaultDispatch: ApprovedCallDispatch = (toolName, payload, sessionId, cer
     undefined,
     executionCapability,
   );
+
+/** The no-model approval resume uses the same exact invocation owner as an
+ * ordinary host call. Legacy tool/card consumers retain their existing owner;
+ * an explicitly accepted resume may never fall back to an unowned dispatch. */
+async function dispatchApprovedCall(
+  dispatch: ApprovedCallDispatch,
+  record: PendingActionRecord,
+  sessionId: string,
+  capability: PendingActionExecutionCapability,
+  acceptedResume: boolean,
+): Promise<unknown> {
+  if (!acceptedResume) {
+    return dispatch(record.toolName, record.payload, sessionId,
+      { batchId: record.id, payloadHash: record.payloadHash }, capability);
+  }
+  const expected = expectedTaskFor(sessionId, capability.sourceUserSeq);
+  const effect = classifyRuntimeToolEffect(record.toolName, record.payload).effect;
+  const parent = harnessRunContextStorage.getStore();
+  const attempt = getActiveRunAttempt(sessionId);
+  if (
+    expected.status !== 'ok'
+    || expected.graph.classification.route !== 'act'
+    || effect === 'unknown'
+    || expected.graph.effectCeiling === 'none'
+    || (expected.graph.effectCeiling !== 'unknown' && expected.graph.effectCeiling !== effect)
+    || !attempt
+    || getRunAttemptSourceUserEvent(attempt)?.seq !== capability.sourceUserSeq
+    || (parent && (parent.sessionId !== sessionId
+      || parent.sourceUserSeq !== capability.sourceUserSeq
+      || parent.runAttemptId !== attempt.attemptId))
+    || !verifyPendingActionResumeExecutionCapability({ capability, sessionId,
+      toolName: record.toolName, payload: record.payload })
+  ) throw new PendingActionPreDispatchError('The approved action has no exact live graph and attempt owner.');
+  let root = acceptedTurnCallAuthorityFor(sessionId, capability.sourceUserSeq);
+  // Graph call roots are normally armed by first logical admission. Only
+  // after proving this exact executing claim and live attempt may this lane
+  // use the same existing resolution transaction to arm its graph root.
+  if (root.status === 'missing') {
+    const db = openEventLog();
+    db.transaction(() => ensureAcceptedTaskResolutionOpenInTransaction(db, expected.expectation)).immediate();
+    root = acceptedTurnCallAuthorityFor(sessionId, capability.sourceUserSeq);
+  }
+  if (root.status !== 'ok' || root.authority.authorityKind !== 'turn_graph') {
+    throw new PendingActionPreDispatchError('The approved action does not own an accepted graph call root.');
+  }
+  const logicalToolCallId = pendingActionResumeLogicalCallId(capability);
+  const ownLease = !parent?.dispatchLease;
+  const lease = parent?.dispatchLease ?? activateDispatchLease({
+    sessionId,
+    scopeId: `${attempt.attemptId}::${logicalToolCallId}`,
+    runAttemptId: attempt.attemptId,
+  });
+  try {
+    const invoked = await withHarnessRunContext({
+      ...parent,
+      sessionId,
+      sourceUserSeq: capability.sourceUserSeq,
+      runAttemptId: attempt.attemptId,
+      dispatchLease: lease,
+      counter: parent?.counter ?? new ToolCallsCounter(1),
+      pendingActionExecution: capability,
+    }, () => invokeHostToolCall({
+      identity: { sessionId, sourceUserSeq: capability.sourceUserSeq, modelCallId: logicalToolCallId,
+        toolName: record.toolName, args: record.payload, ...(parent?.turn ? { turn: parent.turn } : {}) },
+      parentLease: lease,
+      effect,
+      boundary: isMcpNamespacedTool(record.toolName) ? 'nested_owned' : 'host_owned_local',
+      deadlineMs: timeoutForTool(record.toolName),
+      callerSignal: parent?.callerCancelSignal,
+      isKillRequested: () => isKillRequested(sessionId, { attemptId: attempt.attemptId }),
+      pendingActionExecution: capability,
+      invoke: () => dispatch(record.toolName, record.payload, sessionId,
+        { batchId: record.id, payloadHash: record.payloadHash }, capability),
+    }));
+    return invoked.value;
+  } finally {
+    if (ownLease) await revokeDispatchLeaseBeforeRecovery(lease);
+  }
+}
 
 /** A test's stand-in for the provider dispatch on paths that own their own
  * executor call (an approval resume). Inert in every non-test process. */
@@ -261,17 +348,14 @@ export async function executeApprovedPendingActionCall(
         'Stored call_tool carriers cannot be replayed outside their original turn scope. Queue the validated inner tool and exact payload in a new pending action.',
       );
     }
-    const out = await dispatch(claimedRecord.toolName, claimedRecord.payload, sessionId, {
-      batchId: claimedRecord.id,
-      payloadHash: claimedRecord.payloadHash,
-    }, {
+    const out = await dispatchApprovedCall(dispatch, claimedRecord, sessionId, {
       pendingActionId: claimedRecord.id,
       payloadHash: claimedRecord.payloadHash,
       claimToken,
       // A conversational approval names the reply that carried it; a card
       // approved outside any turn settles under the source that queued it.
       sourceUserSeq: opts.sourceUserSeq ?? claimedRecord.sourceUserSeq ?? 0,
-    });
+    }, opts.sourceUserSeq !== undefined);
     const outText = typeof out === 'string' ? out : JSON.stringify(out ?? '');
     const structuredFailure = detectStructuredToolFailure(outText);
     // A gate/guard refusal commonly comes back as a returned string. It is not

@@ -3449,7 +3449,8 @@ export interface RunOutcome {
    * re-derive "was this blocked?" from the text it produced.
    */
   terminal?: { status: 'blocked'; reason: string; resumable?: false }
-    | { status: 'awaiting_user_input'; reason: string };
+    | { status: 'awaiting_user_input'; reason: string }
+    | { status: 'awaiting_approval'; reason: 'queued_action_approval'; approvalId: string };
   /** Internal nonterminal recovery ownership. No public terminal is authored. */
   hold?: {
     owner: 'host';
@@ -3457,6 +3458,16 @@ export interface RunOutcome {
     reason: 'recovery_pending';
   };
 }
+
+/** Host-owned queue finalization, never a model's approval interpretation. */
+export type HostQueuedApprovalBeforeCompletion = (identity: {
+  sessionId: string;
+  sourceUserSeq: number;
+}) => {
+  approvalIds: readonly string[];
+  /** A registration miss is a host fact for ordinary review, never consent. */
+  unregisteredActionIds: readonly string[];
+};
 
 export type RunRunnerFn = (
   runner: Runner,
@@ -4318,8 +4329,28 @@ function materializeHostQueuedApprovals(
     queuedApprovalTransitionShouldMaterialize(transition, approvalQuestion)
   ));
   if (eligible.length === 0) return null;
-  const materialized = materializeQueuedApprovals(sessionId, turn, sourceUserSeq, eligible);
+  const materialized = materializeHostQueuedApprovalCards(sessionId, turn, sourceUserSeq, eligible);
   if (materialized.length === 0) return null;
+  const lastDecision = result.lastDecision
+    ? { ...result.lastDecision, done: false, nextAction: 'awaiting_approval' as const }
+    : undefined;
+  return {
+    approvalId: materialized[0]!.approval.approvalId,
+    result: {
+      ...result,
+      status: 'awaiting_approval',
+      ...(lastDecision ? { lastDecision } : {}),
+    },
+  };
+}
+
+function materializeHostQueuedApprovalCards(
+  sessionId: string,
+  turn: number,
+  sourceUserSeq: number,
+  transitions: Parameters<typeof materializeQueuedApprovals>[3],
+): ReturnType<typeof materializeQueuedApprovals> {
+  const materialized = materializeQueuedApprovals(sessionId, turn, sourceUserSeq, transitions);
   for (const item of materialized) {
     safeAppend({
       sessionId,
@@ -4337,16 +4368,34 @@ function materializeHostQueuedApprovals(
       },
     });
   }
-  const lastDecision = result.lastDecision
-    ? { ...result.lastDecision, done: false, nextAction: 'awaiting_approval' as const }
-    : undefined;
-  return {
-    approvalId: materialized[0]!.approval.approvalId,
-    result: {
-      ...result,
-      status: 'awaiting_approval',
-      ...(lastDecision ? { lastDecision } : {}),
-    },
+  return materialized;
+}
+
+/** Resolve only the current source's typed request_now edge before review.
+ * queue_only and the legacy prose bridge keep their existing outer path. */
+function hostQueuedApprovalBeforeCompletion(
+  sessionId: string,
+  turn: number,
+  sourceUserSeq: number | undefined,
+): HostQueuedApprovalBeforeCompletion {
+  return (identity) => {
+    if (identity.sessionId !== sessionId || identity.sourceUserSeq !== sourceUserSeq) {
+      return { approvalIds: [], unregisteredActionIds: [] };
+    }
+    const transitions = queuedApprovalTransitionsForRequest(sessionId, sourceUserSeq)
+      .filter(transition => transition.approvalIntent === 'request_now');
+    materializeHostQueuedApprovalCards(sessionId, turn, identity.sourceUserSeq, transitions);
+    const open = queuedApprovalTransitionsForRequest(sessionId, sourceUserSeq)
+      .filter(transition => transition.approvalIntent === 'request_now')
+      .flatMap(({ record }) => {
+        if (!record.approvalId) return [];
+        const current = approvalRegistry.get(record.approvalId);
+        return current?.sessionId === sessionId && current.status === 'pending'
+          && approvalRegistry.isActionable(current) ? [{ id: record.id, approvalId: current.approvalId }] : [];
+      });
+    const opened = new Set(open.map(item => item.id));
+    return { approvalIds: open.map(item => item.approvalId),
+      unregisteredActionIds: transitions.filter(transition => !opened.has(transition.record.id)).map(transition => transition.record.id) };
   };
 }
 
@@ -12722,6 +12771,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
       // (2026-09-01: it only ever ran in the legacy core, which host_v1 never
       // enters — every live reply shipped unjudged).
       opts.hostJudgeCompletion = options.judgeCompletion === true;
+      opts.hostQueuedApprovalBeforeCompletion = hostQueuedApprovalBeforeCompletion(options.sessionId, turn, sourceUserSeq);
       opts.hostActivationStartedAt = options.hostActivationStartedAt;
       opts.hostPreviousResponseId = session.previousResponseId();
       if (options.hostConversationalCheckIn === true) {
@@ -12913,6 +12963,13 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
     }
 
     if (session.loadRecoveryState()) session.clearRecoveryState();
+
+    if (outcome.terminal?.status === 'awaiting_approval') {
+      session.recordTurnResult({ history: outcome.history, lastResponseId: outcome.lastResponseId, turn });
+      bumpTurnNumber(options.sessionId, turn);
+      return { sessionId: options.sessionId, turn, status: 'awaiting_approval',
+        finalOutput: outcome.finalOutput, toolCalls: toolCounter.currentCount };
+    }
 
     if (outcome.terminal?.status === 'awaiting_user_input') {
       const question = publicReplyText(outcome.finalOutput, 'Awaiting your input.');
@@ -13661,6 +13718,7 @@ export async function resumePendingApproval(
       opts.hostTurnEngine = selectedTurnEngine;
       if (selectedTurnEngine === 'host_v1_read_only') opts.hostReadOnlyCanary = true;
       opts.hostJudgeCompletion = options.judgeCompletion === true;
+      opts.hostQueuedApprovalBeforeCompletion = hostQueuedApprovalBeforeCompletion(options.sessionId, turn, resumeSourceUserSeq);
       safeAppend({
         sessionId: options.sessionId,
         turn,
@@ -13819,6 +13877,13 @@ export async function resumePendingApproval(
     }
 
     if (session.loadRecoveryState()) session.clearRecoveryState();
+
+    if (outcome.terminal?.status === 'awaiting_approval') {
+      session.recordTurnResult({ history: outcome.history, lastResponseId: outcome.lastResponseId, turn });
+      bumpTurnNumber(options.sessionId, turn);
+      return { sessionId: options.sessionId, turn, status: 'awaiting_approval',
+        finalOutput: outcome.finalOutput, toolCalls: toolCounter.currentCount };
+    }
 
     if (outcome.terminal?.status === 'awaiting_user_input') {
       const question = publicReplyText(outcome.finalOutput, 'Awaiting your input.');

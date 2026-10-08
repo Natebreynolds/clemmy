@@ -196,7 +196,7 @@ function queuedActionNextStep(
     return `This exact action is already ${record.status}. Do not retry or create a replacement from this same request; tell the owner plainly.`;
   }
   return approvalRequired && approvalIntent === 'request_now'
-    ? `CARD OPENED: the owner now sees one card asking "${pendingActionAsk(record)}" with the exact content under it. Nothing has run. Do not search for or create another approval. ${voice} After their yes, call pending_action_execute with this id so the exact stored payload runs once; do not re-read and reconstruct the underlying tool call.`
+    ? `QUEUED FOR APPROVAL: the exact payload is stored with the question "${pendingActionAsk(record)}". The card is not open yet and nothing has run. Return your proposed-action reply; the host turn boundary handles registration of this exact payload's card. Do not search for or create another approval. ${voice} After their yes, the exact stored payload runs once; do not re-read and reconstruct the underlying tool call.`
     : approvalRequired && approvalIntent === 'queue_only'
       ? 'STAGED ONLY: stored without a card. Do not ask the owner to run it this turn. A later explicit request can open its one card for the same exact payload.'
       : approvalRequired

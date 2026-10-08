@@ -39,6 +39,8 @@ import {
   finishRunAttempt,
   getActiveRunAttempt,
   getRunAttemptSourceUserEvent,
+  getRunAttemptBySourceUserSeq,
+  isKillRequested,
   listEvents,
   recordRunAttemptUserInput,
   type EventRow,
@@ -324,7 +326,7 @@ function approvalSourceIsSafeToDispatch(row: approvalRegistry.PendingApprovalRow
 async function settleConversationalSource(
   row: approvalRegistry.PendingApprovalRow,
   source: EventRow,
-  input: { text: string; status: 'done' | 'failed' | 'needs_input' },
+  input: { text: string; status: 'done' | 'failed' | 'needs_input' | 'cancelled' },
 ): Promise<boolean> {
   const identity: TurnIdentity = {
     sessionId: source.sessionId,
@@ -353,6 +355,9 @@ async function settleConversationalSource(
             needs: { kind: 'input' as const },
             presentation: { kind: 'question' as const, text: input.text },
           }
+        : input.status === 'cancelled'
+          ? { ...common, status: 'cancelled' as const, resumable: false as const,
+              presentation: { kind: 'stopped' as const, text: input.text } }
         : {
             ...common,
             status: 'failed' as const,
@@ -365,9 +370,11 @@ async function settleConversationalSource(
     });
     const attempt = getActiveRunAttempt(row.sessionId);
     if (attempt && getRunAttemptSourceUserEvent(attempt)?.seq === source.seq) {
-      try { finishRunAttempt(attempt, input.status === 'failed' ? 'failed' : 'completed'); } catch { /* terminal wins */ }
+      try { finishRunAttempt(attempt, input.status === 'cancelled' ? 'cancelled'
+        : input.status === 'failed' ? 'failed' : 'completed'); } catch { /* terminal wins */ }
     }
-    HarnessSession.load(row.sessionId)?.clearRunInFlight();
+    // commitTurnOutcome clears only its exact source/attempt-owned marker.
+    // A successor accepted while this action was finishing must keep its own.
     return true;
   } catch (err) {
     logger.warn({ approvalId: row.approvalId, err: err instanceof Error ? err.message : String(err) },
@@ -507,6 +514,14 @@ async function executeApprovedLinkedActionAndSettle(
     pendingAction = getPendingAction(approvedPendingAction.id);
   }
   if (!pendingAction) return false;
+  const actionAttempt = getRunAttemptBySourceUserSeq(source.sessionId, source.seq);
+  if (actionAttempt?.status === 'cancelled'
+    || isKillRequested(source.sessionId, { sourceUserSeq: source.seq })) {
+    return await settleConversationalSource(row, source, {
+      status: 'cancelled',
+      text: 'Stopped as requested. Completed results are kept; this action will not run again on its own.',
+    });
+  }
   if (pendingAction.status === 'executed') {
     // The stored action ran once with no model in the loop; the owner's
     // decision ends with what it did, in plain words. The rest of a longer
@@ -940,6 +955,17 @@ function trackResumeFlight(approvalId: string, flight: Promise<boolean>): Promis
  * null when none is in flight. */
 export function approvalResumeInFlight(approvalId: string): Promise<boolean> | null {
   return resumeFlights.get(approvalId) ?? null;
+}
+
+/** The resolver may return while its exact stored action is still running.
+ * Keep the adopted attempt available to Stop; the resume's terminal owns its
+ * finish. A different card/source must never retain an unrelated attempt. */
+export function approvalResumeOwnsAttempt(approvalId: string, attempt: RunAttemptRef): boolean {
+  if (!resumeFlights.has(approvalId) && !conversationalDecisionFlights.has(approvalId)) return false;
+  const row = approvalRegistry.get(approvalId);
+  if (!row || row.sessionId !== attempt.sessionId || row.resolution !== 'approved') return false;
+  const source = taggedApprovalResponse(row);
+  return Boolean(source && getRunAttemptSourceUserEvent(attempt)?.seq === source.seq);
 }
 
 const dispatchResolvedApproval = (row: approvalRegistry.PendingApprovalRow): void => {
