@@ -3676,12 +3676,16 @@ function tryCommitLiveApprovalControl(input: {
           // An exact approval releases only the saved action after its card
           // binding is verified. A decline retains the existing registry and
           // conversational path so the owner receives the appropriate reply.
+          // The decision needs the card's live executor: once that turn has
+          // finished, the reply goes to Clem, who runs the card and reports
+          // what it printed. Borrowing the finished turn's identity here left
+          // the owner with only "Approved — running it now." and no output
+          // (live 2026-10-08, w24-approve-in-words on 85b41943f).
           if (intent.decision === 'reject') return null;
           if (!input.queuedEligible) return null;
           const preflight = exactPendingActionApprovalPreflight(row, intent.decision);
           if (preflight.kind !== 'ok') return null;
           return {
-            pausedCardId: row.approvalId,
             sourceData: { approvalId: row.approvalId, decision: intent.decision, queued: preflight.pendingActionId },
             commit: (source, resolveDecision) => {
               const result = resolveDecision(row.approvalId,
