@@ -643,7 +643,14 @@ async function startInstalledApp(context, firstLaunch) {
   app.assetHashes = [];
   for (const asset of assets) {
     const relative = consoleAssetRelative(asset, origin);
-    const response = await fetch(asset, { headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(10_000) });
+    // The daemon's loop stalls on a cold first boot (run 37705987629: a
+    // 10 s abort here ended the smoke after the dashboard had mounted);
+    // each asset is read through such stalls, bounded, inside the collector.
+    const response = await withLaunchDiagnostics(() => waitFor(async () => {
+      try {
+        return await fetch(asset, { headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(30_000) });
+      } catch { return null; }
+    }, 'console_asset_unreadable', 180_000));
     const contentType = response.headers.get('content-type') ?? '';
     if (!response.ok || !/javascript/.test(contentType)) refuse('console_asset_response_invalid');
     const bytes = Buffer.from(await response.arrayBuffer());
