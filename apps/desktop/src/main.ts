@@ -173,6 +173,13 @@ app.commandLine.appendSwitch(
   'PasswordManagerEnabledForApp,AutofillEnableAccountWalletStorage,AutofillServerCommunication',
 );
 
+// Windows delivers a toast only for the app identity its Start-menu shortcut
+// was registered under; the NSIS installer registers build.appId. Without it
+// every notification failed ("Settings prevent the notification type from
+// being delivered", installed Windows beta, 2026-10-08).
+const WINDOWS_APP_USER_MODEL_ID = 'com.clemmy.desktop';
+if (process.platform === 'win32') app.setAppUserModelId(WINDOWS_APP_USER_MODEL_ID);
+
 let supervisor: DaemonSupervisor | null = null;
 let mainWindow: BrowserWindow | null = null;
 let splashWindow: BrowserWindow | null = null;
