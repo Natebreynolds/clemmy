@@ -3114,8 +3114,12 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     // Advertise the door on the LAN so the app can follow this Mac across
     // DHCP address changes without re-pairing. Best-effort: without it the
     // QR-baked address still works until the IP rotates.
-    const { startBonjourAdvertisement } = await import('../runtime/mobile-bonjour.js');
-    startBonjourAdvertisement({ port: listeners.directAppPort, fingerprint: directAppFingerprint });
+    // It uses macOS's dns-sd; Windows has none, and trying logged a spawn
+    // ENOENT stack on every boot. Windows keeps the QR address and the relay.
+    if (process.platform !== 'win32') {
+      const { startBonjourAdvertisement } = await import('../runtime/mobile-bonjour.js');
+      startBonjourAdvertisement({ port: listeners.directAppPort, fingerprint: directAppFingerprint });
+    }
 
     // Off-LAN reach: when a relay is configured, dial out and keep a tunnel
     // registered. Best-effort like Bonjour — no relay means LAN-only, never
