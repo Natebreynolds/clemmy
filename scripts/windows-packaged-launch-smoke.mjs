@@ -679,13 +679,17 @@ async function startInstalledApp(context, firstLaunch) {
   // A dashboard can boot while optional mobile TLS catches an initialization
   // failure. Require the actual owned daemon listener and its boot-generated pin.
   const mobilePort = Number(context.env.CLEMENTINE_MOBILE_APP_PORT);
-  await waitFor(async () => {
+  // The mobile listener binds after the daemon's first answer, on the same
+  // stalling cold-boot loop as every read above (run 37733208007: missing at
+  // 30 s, 4.5 min into first launch). Bounded like the others, and a miss
+  // records the app's own log.
+  await withLaunchDiagnostics(() => waitFor(async () => {
     let rows;
     try { rows = await listeners(mobilePort, 'mobile'); }
     catch (error) { if (error instanceof SmokeError && error.code === 'owned_child_failed') return null; throw error; }
     if (rows.some(row => row.pid !== app.daemon.pid)) refuse('mobile_tls_listener_ownership_unqualified');
     return true;
-  }, 'mobile_tls_listener_missing', 30_000);
+  }, 'mobile_tls_listener_missing', 180_000));
   const freshDaemon = exactOwnedProcess(await processes(), app.daemon.pid, context.executable, main.pid);
   if (freshDaemon.createdAt !== app.daemon.createdAt) refuse('mobile_tls_daemon_identity_changed');
   if ((await listeners(mobilePort, 'mobile')).some(row => row.pid !== app.daemon.pid)) refuse('mobile_tls_listener_ownership_unqualified');
