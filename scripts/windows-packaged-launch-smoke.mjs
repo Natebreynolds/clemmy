@@ -593,8 +593,11 @@ async function startInstalledApp(context, firstLaunch) {
     if (!rows.some((row) => row.pid === child.pid)) return null;
     return exactOwnedProcess(rows, child.pid, context.executable);
   }, 'desktop_process_missing', 30_000);
-  const app = { ...context, child, main, port, userData };
+  const app = { ...context, child, main, port, userData, timings: {} };
   context.activeApp = app;
+  // Milliseconds from launch to each gate: how long the daemon's boot held
+  // the dashboard, measured on every run instead of inferred from a miss.
+  const mark = (gate) => { app.timings[gate] = Date.now() - context.launchStartedAt; };
   // The process was alive for the whole 30 s wait in run 37670309581 with
   // no listener yet: a first start on a cold runner loads a 236 MB
   // executable while Defender scans 1.4 GB of fresh files. The bound now
@@ -605,8 +608,9 @@ async function startInstalledApp(context, firstLaunch) {
     await waitFor(async () => {
       try { await localJSON(`http://127.0.0.1:${port}/json/version`); return true; } catch { return null; }
     }, 'desktop_debug_listener_missing', 120_000);
+    mark('debugListener');
     await assertListenerOwner(port, main.pid);
-    if (firstLaunch) await skipSetup(app);
+    if (firstLaunch) { await skipSetup(app); mark('setupSkipped'); }
   } catch (error) {
     context.launchDiagnostics = await collectLaunchDiagnostics(app, error);
     throw error;
@@ -623,6 +627,7 @@ async function startInstalledApp(context, firstLaunch) {
     }
   };
   const target = await withLaunchDiagnostics(() => waitFor(() => findPage(port, isDashboardTarget), 'desktop_dashboard_missing'));
+  mark('dashboardTarget');
   const targetUrl = new URL(target.url);
   const origin = targetUrl.origin;
   const owners = await listeners(Number(targetUrl.port));
@@ -642,6 +647,7 @@ async function startInstalledApp(context, firstLaunch) {
   const info = await withLaunchDiagnostics(() => waitFor(async () => {
     try { return await localJSON(`${origin}/api/console/build-info`, token, 30_000); } catch { return null; }
   }, 'daemon_build_info_unavailable', 300_000));
+  mark('daemonAnswered');
   app.served = assertServedIdentity(info, context.expected, path.join(context.installRoot, 'resources', 'daemon', 'dist', 'index.js'));
   app.daemon = exactOwnedProcess(await processes(), app.served.daemonProcessId, context.executable, main.pid);
   if (app.daemon.pid !== daemonCandidate.pid || app.daemon.createdAt !== daemonCandidate.createdAt) refuse('daemon_listener_changed');
@@ -658,6 +664,7 @@ async function startInstalledApp(context, firstLaunch) {
       || (root.innerText || '').includes('This view hit a snag')) return null;
     return [...document.scripts].map(script => script.src).filter(Boolean);
   })()`), 'react_dashboard_not_mounted', 60_000));
+  mark('reactMounted');
   if (!Array.isArray(assets) || assets.length === 0) refuse('console_executed_asset_missing');
   app.assetHashes = [];
   for (const asset of assets) {
@@ -681,6 +688,7 @@ async function startInstalledApp(context, firstLaunch) {
     if (sha256(bytes) !== sha256(readFileSync(installed))) refuse('console_served_asset_mismatch');
     app.assetHashes.push({ relative, bytes: bytes.length, sha256: sha256(bytes) });
   }
+  mark('assetsServed');
   // A restarted daemon's loop stalls like a first boot's; each read waits
   // through a stall, bounded, instead of a single 5 s attempt.
   app.readAPI = (pathname) => waitFor(async () => {
@@ -700,6 +708,8 @@ async function startInstalledApp(context, firstLaunch) {
     if (rows.some(row => row.pid !== app.daemon.pid)) refuse('mobile_tls_listener_ownership_unqualified');
     return true;
   }, 'mobile_tls_listener_missing', 180_000));
+  mark('mobileListener');
+  console.log(`${firstLaunch ? 'first launch' : 'restart'} gate timings (ms from launch): ${JSON.stringify(app.timings)}`);
   const freshDaemon = exactOwnedProcess(await processes(), app.daemon.pid, context.executable, main.pid);
   if (freshDaemon.createdAt !== app.daemon.createdAt) refuse('mobile_tls_daemon_identity_changed');
   if ((await listeners(mobilePort, 'mobile')).some(row => row.pid !== app.daemon.pid)) refuse('mobile_tls_listener_ownership_unqualified');
@@ -1010,7 +1020,7 @@ export async function main(args = process.argv.slice(2)) {
     receipt.installed = installed;
     phase('first_launch_real_setup');
     const first = await startInstalledApp(context, true);
-    receipt.firstLaunch = { served: first.served, setupSkippedByUI: true, reactMounted: true, assets: first.assetHashes, mobileTls: first.mobileTls };
+    receipt.firstLaunch = { served: first.served, setupSkippedByUI: true, reactMounted: true, assets: first.assetHashes, mobileTls: first.mobileTls, timingsMs: first.timings };
     phase('first_graceful_quit'); await quitInstalledApp(first);
     const fixture = { sessionId: `windows-installed-smoke-${randomUUID()}`, bundleId: `windows-smoke-${randomUUID()}`,
       marker: `Controlled CI-only Windows restart fixture ${randomUUID()}`, mobileFingerprint: first.mobileTls.fingerprint };
@@ -1028,7 +1038,7 @@ export async function main(args = process.argv.slice(2)) {
     if (!JSON.stringify(detail).includes(fixture.marker)) refuse('restarted_history_bytes_not_exposed');
     await screenshot(second, path.join(path.dirname(options.receipt), 'installed-dashboard.png'));
     receipt.restart = { served: second.served, reactMounted: true, assets: second.assetHashes,
-      retainedHistoryAPI: true, setupRepeated: false, screenshot: 'installed-dashboard.png', mobileTls: second.mobileTls };
+      retainedHistoryAPI: true, setupRepeated: false, screenshot: 'installed-dashboard.png', mobileTls: second.mobileTls, timingsMs: second.timings };
     phase('second_graceful_quit'); await quitInstalledApp(second);
     phase('retention_readback');
     const retained = await storageFixture(context, fixture, 'read', seeded);
