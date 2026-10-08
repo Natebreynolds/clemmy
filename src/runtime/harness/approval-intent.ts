@@ -14,16 +14,30 @@ const LOOSE_APPROVE_WITH_ID = /^(?:yes|y|ok|okay|sure|sounds good|do this)$/;
 const LOOSE_REJECT_WITH_ID = /^(?:no|n|stop)$/;
 
 export function parseApprovalIntent(prompt: string): ParsedApprovalIntent | null {
+  return parseCompleteDecision(prompt, false);
+}
+
+/** A complete yes/no answers a waiting card's question. This grammar does
+ * not select or resolve a card; callers must prove the exact pending target
+ * or ask which card when several remain. Ordinary chat keeps the stricter
+ * grammar above. */
+export function parseWaitingApprovalReplyIntent(prompt: string): ParsedApprovalIntent | null {
+  return parseCompleteDecision(prompt, true);
+}
+
+function parseCompleteDecision(prompt: string, waitingCard: boolean): ParsedApprovalIntent | null {
   // Only sentence-ending assertion punctuation is ignorable. A question,
   // quote, condition, second decision or other suffix must remain visible.
   const text = prompt.trim().toLowerCase().replace(/\s+/gu, ' ').replace(/[.!]+$/u, '').trim();
   const id = /\s+(apr-[a-z0-9]{4})$/.exec(text);
   const approvalId = id?.[1];
   const decisionText = id ? text.slice(0, id.index).trim() : text;
-  if (STRONG_APPROVE.test(decisionText) || (approvalId && LOOSE_APPROVE_WITH_ID.test(decisionText))) {
+  if (STRONG_APPROVE.test(decisionText) || (approvalId && LOOSE_APPROVE_WITH_ID.test(decisionText))
+    || (waitingCard && /^(?:yes|y)$/.test(decisionText))) {
     return approvalId ? { decision: 'approve', approvalId } : { decision: 'approve' };
   }
-  if (STRONG_REJECT.test(decisionText) || (approvalId && LOOSE_REJECT_WITH_ID.test(decisionText))) {
+  if (STRONG_REJECT.test(decisionText) || (approvalId && LOOSE_REJECT_WITH_ID.test(decisionText))
+    || (waitingCard && /^(?:no|n)$/.test(decisionText))) {
     return approvalId ? { decision: 'reject', approvalId } : { decision: 'reject' };
   }
   return null;

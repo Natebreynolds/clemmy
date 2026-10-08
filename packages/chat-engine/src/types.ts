@@ -69,6 +69,9 @@ export interface ApprovalConfirm {
   /** What the owner wrote that raised the question. */
   replyText?: string;
   leaning: 'approves' | 'declines' | 'unread';
+  /** Presentation identity of the exact asked-back question, so its typed
+   * terminal/replay cannot draw it again or replace a newer question. */
+  source?: { sessionId: string; sourceUserSeq: number; awaitingSeq: number };
 }
 
 export interface CardDecision {

@@ -11,7 +11,7 @@ import { presentApprovalForHumans, type ApprovalPresentation } from '../dashboar
 import { patchUnifiedSession } from '../dashboard/sessions-api.js';
 import { needsYouKey, needsYouReferents, notificationActionItemId, notificationNeedsYou, summarizeNeedsYou, type NeedsYouReferents } from '../dashboard/needs-you.js';
 import { extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
-import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
+import { ApprovalControlBindingUnavailable, commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { createMobileChatAdmission, prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
 import { registerMobileMemoryWorkRoutes } from './mobile-memory-work-routes.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
@@ -212,7 +212,7 @@ import { attachAnswerStream } from '../runtime/harness/answer-stream.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { runConversationFromResume } from '../runtime/harness/loop.js';
-import { approvalConfirmationAlreadyAsked, resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
+import { approvalConfirmationAlreadyAsked, approvalInquiryQuestion, resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
 import { applyQueuedCardFieldEdits, queuedCardEditsFrom } from '../runtime/harness/approval-card-edit.js';
 import { loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { forgetApprovedWriteKind, listApprovedWriteKinds } from '../agents/plan-scope.js';
@@ -4245,6 +4245,21 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // The receipt has a session FK, so create the deterministic session first
       // only on a genuinely new key. Replays recover its original durable id.
       const priorReceipt = getHarnessChatRequestReceipt(requestId);
+      if (priorReceipt) {
+        if (priorReceipt.inputHash !== inputHash || priorReceipt.runId !== runId) {
+          res.status(409).json({ error: 'IDEMPOTENCY_KEY_CONFLICT' }); return;
+        }
+        // A control has no competing execution attempt. Its exact accepted
+        // source and terminal remain the replay owner even after the card's
+        // once-only confirmation allowance was consumed.
+        const replay = commitLiveApprovalControl({ sessionId: priorReceipt.sessionId,
+          requestId, runId, inputHash, text: message, prepare: () => null });
+        if (replay) {
+          res.setHeader('Idempotent-Replay', '1');
+          res.json({ sessionId: replay.receipt.sessionId, runId: replay.receipt.runId, reply: replay.presentation.text });
+          return;
+        }
+      }
       if (connectionContext) taskMode = connectionContinuationTaskMode(connectionContext);
       const connectionNeedsAdmission = connectionContext && (!priorReceipt
         || !getLatestRunAttemptByRunId(priorReceipt.sessionId, priorReceipt.runId)?.sourceUserSeq);
@@ -4283,6 +4298,37 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       if (cardSessionId && cardWaiting) {
         const routed = await routeReplyToPendingApproval({ sessionId: cardSessionId, text: message, parsed: null })
           .catch(() => null);
+        if (routed?.inquiry) {
+          const inquiry = routed.inquiry;
+          const ids = inquiry.approvalIds;
+          try {
+            const control = commitLiveApprovalControl({ requestId, runId, inputHash, sessionId: cardSessionId, text: message,
+              prepare: () => {
+                const rows = ids.map(id => approvalRegistry.get(id));
+                if (rows.some(row => !row || row.sessionId !== cardSessionId || !approvalRegistry.isActionable(row))) {
+                  throw new ApprovalControlBindingUnavailable();
+                }
+                const { question, options } = approvalInquiryQuestion(rows as approvalRegistry.PendingApprovalRow[], inquiry.decision);
+                return { inquiryCardIds: ids, sourceData: { source: 'mobile_approval_inquiry', approvalInquiry: inquiry }, commit: (source) => {
+                  appendHarnessEvent({ sessionId: cardSessionId, turn: source.turn, role: 'Clem', type: 'awaiting_user_input',
+                    data: { sourceUserSeq: source.seq, reason: 'approval_choice_required', question, options, approvalIds: ids } });
+                  const identity = mobileApprovalIdentity(source);
+                  commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity,
+                    status: 'needs_input', resumable: true, needs: { kind: 'input' }, presentation: { kind: 'question', text: question } },
+                  { legacyReason: 'awaiting_user_input', metadata: { steps: 0 } });
+                } };
+              } });
+            if (!control) throw new ApprovalControlBindingUnavailable();
+            if (control.replayed) res.setHeader('Idempotent-Replay', '1');
+            res.json({ sessionId: control.receipt.sessionId, runId: control.receipt.runId, reply: control.presentation.text });
+            return;
+          } catch (error) {
+            if (error instanceof ApprovalControlBindingUnavailable) {
+              res.status(409).json({ error: error.message, code: 'APPROVAL_CONTROL_BINDING_UNAVAILABLE' }); return;
+            }
+            throw error;
+          }
+        }
         // A change in words on a queued exact payload: the card is resolved
         // as changed and the words run as this turn, whose fresh card names
         // the one it revises (owner-approved design, 2026-10-07).
@@ -4307,6 +4353,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
               const row = approvalRegistry.get(confirm.approvalId);
               if (!row || !approvalRegistry.isActionable(row) || approvalConfirmationAlreadyAsked(cardSessionId, confirm.approvalId)) return null;
               return {
+                pausedCardId: confirm.approvalId,
                 sourceData: { source: 'mobile_approval_confirm', approvalId: confirm.approvalId, confirm: confirm.leaning },
                 commit: (source) => {
                   appendHarnessEvent({ sessionId: cardSessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',

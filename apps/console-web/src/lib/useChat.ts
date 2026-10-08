@@ -1129,12 +1129,38 @@ export function workflowReportEndsWatch(ev: HarnessEvent, source: AcceptedChatSo
     && Number.isSafeInteger(ev.seq) && ev.seq > source.sourceUserSeq;
 }
 
-/** A parent Stop acknowledgement never settles linked child work. */
-export function applyChatStopReceipt(message: ChatMessage, receipt: ChatStopReceipt, owner: {
-  assistantId: string; sessionId: string; sourceUserSeq?: number;
-}): ChatMessage {
-  if (message.id !== owner.assistantId || (message.acceptedSource && (message.acceptedSource.sessionId !== owner.sessionId
-    || (owner.sourceUserSeq !== undefined && message.acceptedSource.sourceUserSeq !== owner.sourceUserSeq)))) return message;
+interface ChatStopTarget {
+  assistantId: string;
+  /** A first POST may not yet have an accepted session or source. */
+  sessionId: string | null;
+  sourceUserSeq?: number;
+}
+
+function chatStopOwnsMessage(message: ChatMessage, owner: ChatStopTarget): boolean {
+  return message.id === owner.assistantId && (!message.acceptedSource
+    || ((!owner.sessionId || message.acceptedSource.sessionId === owner.sessionId)
+      && (owner.sourceUserSeq === undefined || message.acceptedSource.sourceUserSeq === owner.sourceUserSeq)));
+}
+
+function chatStopTerminalWon(message: ChatMessage): boolean {
+  // A queued workflow's ACK is complete, while its child work remains live.
+  // Ordinary typed terminals and settled legacy replies are final evidence;
+  // a local lost-connection "stopped" note is still eligible for a receipt.
+  return Boolean(message.terminal || message.workflowTerminalSeq) || (!message.workflowWork
+    && (message.status === 'complete' || message.status === 'failed'
+    || message.status === 'awaiting-reply' || message.status === 'awaiting-plan'
+    || message.status === 'awaiting-approval'));
+}
+
+export function applyChatStopping(message: ChatMessage, owner: ChatStopTarget): ChatMessage {
+  if (!chatStopOwnsMessage(message, owner) || chatStopTerminalWon(message)) return message;
+  return { ...message, status: message.workflowWork ? message.status : 'thinking', progress: 'Stopping…' };
+}
+
+/** A parent Stop acknowledgement never settles linked child work or replaces
+ * a canonical result that arrived while its response was in flight. */
+export function applyChatStopReceipt(message: ChatMessage, receipt: ChatStopReceipt, owner: ChatStopTarget): ChatMessage {
+  if (!chatStopOwnsMessage(message, owner) || chatStopTerminalWon(message)) return message;
   const notice = workflowStopNotice(receipt, message.workflowWork?.runIds);
   if (message.workflowDispatchSeq) {
     const text = notice && !message.text.includes(notice) ? `${message.text}\n\n${notice}` : message.text;
@@ -1150,6 +1176,14 @@ export function applyChatStopReceipt(message: ChatMessage, receipt: ChatStopRece
     ? { ...message, status: 'stopped', progress: undefined, text: message.text.trim() ? message.text : 'Stopped.' }
     : { ...message, status: 'failed', progress: undefined,
       text: 'Stop closed this view, but the server did not confirm that the exact run attempt was cancelled. Open Run Environment to check it before retrying.' };
+}
+
+/** The request-key receipt has the same terminal precedence before admission. */
+export function applyPendingChatStopReceipt(message: ChatMessage, confirmed: boolean, owner: ChatStopTarget): ChatMessage {
+  const next = applyChatStopReceipt(message, { confirmed }, owner);
+  return next !== message && !confirmed ? { ...next,
+    text: 'Stop closed this view, but Clementine could not record the server-side cancellation. Open Run Environment to check it before retrying.',
+  } : next;
 }
 
 /** Only activity from a captured child promotes its own waiting ACK. */
@@ -2171,20 +2205,18 @@ export function useChat(options?: UseChatOptions) {
     const accepted = activeRunRef.current;
     const source = acceptedStreamSourceRef.current?.assistantId === aid ? acceptedStreamSourceRef.current.source : undefined;
     const pending = pendingPostRef.current;
+    const stopTarget = aid ? { assistantId: aid, sessionId: accepted?.sessionId ?? pending?.sessionId ?? sessionIdRef.current,
+      sourceUserSeq: source?.sourceUserSeq } : null;
     pendingBackgroundRef.current = null;
     postAbortRef.current?.abort();
     streamRef.current?.stop();
     streamRef.current = null;
     // Closing the stream is not confirmation that the server stopped work.
-    if (aid) setMessages((prev) => prev.map((m) => (m.id === aid
-      ? { ...m, status: 'thinking', progress: 'Stopping…' }
-      : m)));
+    if (stopTarget) setMessages(previous => previous.map(message => applyChatStopping(message, stopTarget)));
     if (accepted) {
       void cancelSessionDetailed(accepted).then((receipt) => {
-        if (!aid) return;
-        setMessages(prev => prev.map(message => applyChatStopReceipt(message, receipt, {
-          assistantId: aid, sessionId: accepted.sessionId, sourceUserSeq: source?.sourceUserSeq,
-        })));
+        if (!stopTarget) return;
+        setMessages(prev => prev.map(message => applyChatStopReceipt(message, receipt, stopTarget)));
       });
     } else if (pending) {
       // Stop may win before the 202 carries an attempt id. Persist a negative
@@ -2192,22 +2224,19 @@ export function useChat(options?: UseChatOptions) {
       // the server confirms it can never execute later.
       void cancelPendingChatRequest(pending.clientRequestId).then((confirmed) => {
         if (confirmed && pendingPostRef.current === pending) retainPending(null);
-        if (!aid) return;
-        setMessages((prev) => prev.map((m) => (m.id === aid
-          ? confirmed ? { ...m, status: 'stopped', progress: undefined, text: m.text.trim() ? m.text : 'Stopped.' } : {
-              ...m,
-              status: 'failed',
-              progress: undefined,
-              text: 'Stop closed this view, but Clementine could not record the server-side cancellation. Open Run Environment to check it before retrying.',
-            }
-          : m)));
+        if (!stopTarget) return;
+        setMessages(previous => previous.map(message => applyPendingChatStopReceipt(message, confirmed, stopTarget)));
       });
-    } else if (aid) {
-      patch(aid, { status: 'failed', progress: undefined,
-        text: 'This view closed, but this run’s cancellation could not be confirmed. Open Run Environment to check the exact run before retrying.' });
+    } else if (stopTarget) {
+      setMessages(previous => previous.map(message => {
+        const next = applyChatStopReceipt(message, { confirmed: false }, stopTarget);
+        return next !== message ? { ...next,
+          text: 'This view closed, but this run’s cancellation could not be confirmed. Open Run Environment to check the exact run before retrying.',
+        } : next;
+      }));
     }
     setBusy(false);
-  }, [patch, retainPending]);
+  }, [retainPending]);
 
   /** User-initiated "continue in background" (the ctrl+b model): detach the
    *  running turn to a durable background task that picks up where the

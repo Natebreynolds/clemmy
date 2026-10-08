@@ -1,5 +1,6 @@
 import { READ_FILE_PARAMS } from './local-file-read-contract.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import { isKillRequested } from '../runtime/harness/eventlog.js';
 import { WRITE_FILE_PARAMS } from './local-file-write-contract.js';
 import { spawn } from 'node:child_process';
@@ -1155,6 +1156,14 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
   assertOwnStoresProtected(command, cwd);
   const stubMessage = developerToolStubBlockMessage(command);
   const externalMutation = classifyShellNetworkMutation(command).isNetworkMutation;
+  const cancelSignal = runtime.cancelSignal ?? currentToolAbortSignal()
+    ?? harnessRunContextStorage.getStore()?.callerCancelSignal;
+  if (cancelSignal?.aborted) {
+    return Promise.reject(new ShellCommandExecutionError(
+      'No command was started. Its tool invocation was already cancelled.',
+      { phase: 'resolve', dispatch: 'not_started', effect: 'none', externalMutation, errorKind: 'cancelled' },
+    ));
+  }
   const windows = (runtime.platform ?? process.platform) === 'win32';
   if (windows && (windowsShellStopping > 0 || windowsShellCleanupUnconfirmed)) {
     return Promise.reject(new ShellCommandExecutionError(
@@ -1189,10 +1198,12 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
 
     let stdout = '';
     let stderr = '';
-    const timeout = setTimeout(async () => {
+    const onDeadline = async (deadlineMs?: number): Promise<void> => {
       if (settled) return;
       settled = true;
+      clearTimeout(timeout);
       if (stopPoll) clearInterval(stopPoll);
+      cancelSignal?.removeEventListener('abort', onSignalAbort);
       let timeoutCleanup: 'complete' | 'incomplete' | undefined;
       if (windows) {
         // shell:true wraps the real command in cmd.exe; SIGTERM kills only the
@@ -1216,38 +1227,46 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
         child.stdout.destroy(); child.stderr.destroy(); child.unref();
       }
       reject(new ShellCommandExecutionError(
-        `Command timed out after ${timeoutMs}ms.${timeoutCleanup === 'incomplete'
+        `${deadlineMs === undefined ? 'Command stopped when its tool deadline expired.' : `Command timed out after ${deadlineMs}ms.`}${timeoutCleanup === 'incomplete'
           ? ' Windows could not confirm all child processes stopped. Check and stop remaining processes, verify any completed effects, then restart Clem before another shell command.' : ''}`,
         { ...classifyShellExecutionOutcome({ command, externalMutation, stdout, stderr, timedOut: true }),
           ...(timeoutCleanup ? { timeoutCleanup } : {}) },
       ));
-    }, timeoutMs);
+    };
+    const timeout = setTimeout(() => { void onDeadline(timeoutMs); }, timeoutMs);
 
     // The owner's Stop reaches the running command: the host's cancel
     // authority for this step ends the process group and the call returns
-    // as stopped, so the next turn reads "the owner stopped it", never an
-    // unknown effect to reconcile (live 2026-10-08: a stopped 90 s count was
-    // still alive afterwards and the brain re-ran it to "find out").
-    // Two ways the Stop arrives: the step's cancel signal while a model step
-    // is live, and the durable kill latch the Stop button writes, which is the
-    // only one still standing once the step that called this tool returned
-    // (live 2026-10-08: a stopped 90 s loop was alive 20 s later, its parent
-    // the daemon). The latch is polled exactly like the host's model step.
-    const cancelSignal = runtime.cancelSignal ?? harnessRunContextStorage.getStore()?.callerCancelSignal;
+    // as stopped. Effects before cancellation still need their own evidence
+    // (live 2026-10-08: a stopped 90 s count was still alive afterwards).
+    // The host invocation's signal survives the model step and the finisher's
+    // removal of its Stop latch. Use that existing exact owner first; the old
+    // model-step signal and durable polling remain compatibility fallbacks.
     const ambient = harnessRunContextStorage.getStore();
     const stopRequested = runtime.isStopRequested ?? (ambient?.sessionId
       ? () => isKillRequested(ambient.sessionId, ambient.runAttemptId
-        ? { attemptId: ambient.runAttemptId, sourceUserSeq: ambient.sourceUserSeq }
+        ? { attemptId: ambient.runAttemptId }
         : ambient.sourceUserSeq ? { sourceUserSeq: ambient.sourceUserSeq } : undefined)
       : undefined);
     let stopPoll: ReturnType<typeof setInterval> | undefined;
-    const onOwnerStop = (): void => {
+    const onOwnerStop = async (ownerRequested = true): Promise<void> => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       if (stopPoll) clearInterval(stopPoll);
+      cancelSignal?.removeEventListener('abort', onSignalAbort);
+      let stopCleanup: 'complete' | 'incomplete' | undefined;
       if (windows) {
-        void (runtime.stopTree ?? stopWindowsProcessTree)(child).catch(() => { try { child.kill('SIGKILL'); } catch { /* already exited */ } });
+        // Stop needs the same tree receipt as a deadline. Do not allow a new
+        // command while taskkill is pending or claim all descendants ended
+        // when Windows could not confirm that outcome.
+        windowsShellStopping += 1;
+        try { stopCleanup = await (runtime.stopTree ?? stopWindowsProcessTree)(child); }
+        catch { stopCleanup = 'incomplete'; try { child.kill('SIGKILL'); } catch { /* receipt remains unconfirmed */ } }
+        finally {
+          if (stopCleanup === 'incomplete') windowsShellCleanupUnconfirmed = true;
+          windowsShellStopping -= 1;
+        }
       } else if (child.pid) {
         try { process.kill(-child.pid, 'SIGKILL'); }
         catch { try { child.kill('SIGKILL'); } catch { /* already exited */ } }
@@ -1256,21 +1275,36 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
       }
       child.stdout.destroy(); child.stderr.destroy(); child.unref();
       reject(new ShellCommandExecutionError(
-        'Stopped at the owner\'s request while this command was running; the host ended the command and its child processes. It did not finish, and nothing is owed unless the owner asks for it again.'
+        (ownerRequested ? 'Stopped at the owner\'s request while this command was running.' : 'This command was cancelled by its tool invocation.')
+          + (stopCleanup === 'incomplete'
+            ? ' Windows could not confirm all child processes stopped. Check and stop remaining processes, verify any completed effects, then restart Clem before another shell command.'
+            : ' The host ended the command and its child processes. It did not finish; earlier steps may already have changed local files.')
           + (externalMutation ? ' It may have reached an outside service before it was ended; check that state before repeating it.' : ''),
-        { ...classifyShellExecutionOutcome({ command, externalMutation, stdout, stderr, timedOut: true }), errorKind: 'owner_stopped' },
+        { ...classifyShellExecutionOutcome({ command, externalMutation, stdout, stderr, timedOut: true }),
+          errorKind: ownerRequested ? 'owner_stopped' : 'cancelled',
+          ...(stopCleanup ? { timeoutCleanup: stopCleanup } : {}) },
       ));
     };
-    if (cancelSignal?.aborted) onOwnerStop();
-    else cancelSignal?.addEventListener('abort', onOwnerStop, { once: true });
+    const onSignalAbort = (): void => {
+      const reason = cancelSignal?.reason as { name?: string; reason?: string; deadlineMs?: number } | undefined;
+      if (reason?.name === 'HostToolInvocationDeadlineError' || reason?.name === 'TimeoutError') {
+        void onDeadline(Number.isFinite(reason.deadlineMs) && Number(reason.deadlineMs) > 0 ? reason.deadlineMs : undefined);
+      } else {
+        // An authority failure or generic caller cancellation is not proof
+        // the owner pressed Stop. The kernel retains settlement ownership.
+        void onOwnerStop(Boolean(runtime.cancelSignal) || reason?.reason === 'kill');
+      }
+    };
+    if (cancelSignal?.aborted) onSignalAbort();
+    else cancelSignal?.addEventListener('abort', onSignalAbort, { once: true });
     if (stopRequested && !settled) {
       stopPoll = setInterval(() => {
-        try { if (stopRequested()) onOwnerStop(); } catch { /* the deadline still bounds the command */ }
+        try { if (stopRequested()) void onOwnerStop(); } catch { /* the deadline still bounds the command */ }
       }, 250);
       stopPoll.unref?.();
     }
     const releaseOwnerStop = (): void => {
-      cancelSignal?.removeEventListener('abort', onOwnerStop);
+      cancelSignal?.removeEventListener('abort', onSignalAbort);
       if (stopPoll) clearInterval(stopPoll);
     };
 

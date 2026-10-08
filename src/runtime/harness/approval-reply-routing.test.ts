@@ -127,6 +127,25 @@ test('short typed decisions and ambiguous sessions are left to the existing pars
   assert.equal(isExactApprovalDecision('go ahead but make it a lot shorter'), false);
 });
 
+test('mobile exact bare decisions bind the sole actionable card without semantic approval or guessing', async () => {
+  assert.equal(parseApprovalIntent('Yes.'), null, 'waiting-card words do not broaden ordinary approval parsing');
+  assert.equal(parseApprovalIntent('No.'), null);
+  const card = waitingCard();
+  const before = asked.length;
+  for (const text of ['Yes.', 'approve', 'go ahead']) {
+    assert.deepEqual(await routeReplyToPendingApproval({ sessionId: card.sessionId, text, parsed: null }),
+      { intent: { decision: 'approve', approvalId: card.approvalId } });
+  }
+  assert.deepEqual(await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'No.', parsed: null }),
+    { intent: { decision: 'reject', approvalId: card.approvalId } });
+  const two = waitingCard(1);
+  const inquiry = await routeReplyToPendingApproval({ sessionId: two.sessionId, text: 'Yes.', parsed: null });
+  assert.equal(inquiry?.intent, null);
+  assert.equal(inquiry?.inquiry?.approvalIds.length, 2);
+  assert.equal(asked.length, before, 'exact owner words do not ask Jev to approve or select a card');
+  assert.equal(registry.get(card.approvalId)?.status, 'pending', 'routing itself releases no payload');
+});
+
 test('short amendments use the exact original words without approving the old card', async () => {
   const card = waitingCard();
   reading = { choice: 'changes', confidence: 0.99 };
@@ -346,9 +365,11 @@ test('mobile-shaped exact declines select the supported card without a Jev call'
       { intent: { decision: 'reject', approvalId: card.approvalId } });
   }
   const ambiguous = waitingCard(1);
-  assert.equal(await routeReplyToPendingApproval({ sessionId: ambiguous.sessionId, text: 'reject', parsed: null }), null);
-  assert.equal(await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'approve', parsed: null }), null,
-    'do not expand mobile bare-approval authority');
+  const inquiry = await routeReplyToPendingApproval({ sessionId: ambiguous.sessionId, text: 'reject', parsed: null });
+  assert.equal(inquiry?.intent, null);
+  assert.equal(inquiry?.inquiry?.approvalIds.length, 2);
+  assert.deepEqual(await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'approve', parsed: null }),
+    { intent: { decision: 'approve', approvalId: card.approvalId } }, 'a complete exact reply binds the sole actionable card');
   assert.equal(asked.length, before);
 });
 

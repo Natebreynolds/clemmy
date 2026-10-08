@@ -84,6 +84,147 @@ async function boot(): Promise<{ url: string; close: () => Promise<void> }> {
   };
 }
 
+test('desktop paused-card confirmation stays with the exact card after its original attempt finished', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  let brainCalls = 0;
+  _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+    claudeAgentBrain: (async () => { brainCalls++; throw new Error('a card confirmation must not execute'); }) as never });
+  const registry = await import('../runtime/harness/approval-registry.js');
+  const { appendEvent } = await import('../runtime/harness/eventlog.js');
+  const jev = await import('../runtime/jev/client.js');
+  jev._setTypesafeKeyForTests('fixture-key');
+  jev._setSystemOneFetchForTests(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({
+    model: 'jev-1.13.0', answers: { reply: { type: 'choice', choice: 'approves', confidence: 0.7,
+      probabilities: { approves: 0.7 } } }, usage: { input_tokens: 1, output_tokens: 1 },
+  }) }));
+  const harness = await boot();
+  try {
+    const session = createSession({ id: 'sess-desktop-paused-confirm', kind: 'chat', channel: 'desktop',
+      metadata: { source: 'desktop', __interrupt_state: '{}' } });
+    const original = beginRunAttempt(session.id, { runId: 'desktop:paused-confirm-original' });
+    const originalSource = recordRunAttemptUserInput(original, { turn: 1, role: 'user', data: { text: 'Prepare a controlled local change.' } });
+    const args = { name: 'fixture_write', args_json: '{"value":"pinned","account":"fixture-account"}' };
+    const card = registry.register({ sessionId: session.id, subject: 'Controlled local change', tool: 'work_call', args });
+    appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'approval_requested',
+      data: { approvalId: card.approvalId, tool: card.tool, args, sourceUserSeq: originalSource.seq } });
+    finishRunAttempt(original, 'interrupted');
+    const post = () => fetch(`${harness.url}/api/harness/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: 'Yes, please do that.', sessionId: session.id, clientRequestId: 'desktop-paused-confirm-once' }) });
+    const first = await post();
+    assert.equal(first.status, 202);
+    const accepted = await first.json() as { sessionId: string; sourceUserSeq: number; mode: string };
+    assert.equal(accepted.sessionId, session.id);
+    assert.equal(accepted.mode, 'approval-control');
+    const source = listEvents(session.id, { types: ['user_input_received'] }).find(event => event.seq === accepted.sourceUserSeq)!;
+    assert.equal(source.parentEventId, originalSource.id);
+    assert.equal((source.data.liveApprovalControl as { mode: string }).mode, 'paused_card');
+    assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).filter(event => event.data.sourceUserSeq === source.seq).length, 1);
+    assert.equal(listEvents(session.id, { types: ['awaiting_user_input'] }).filter(event => event.data.approvalId === card.approvalId).length, 1);
+    const { projectHarnessEventForPublic } = await import('../runtime/harness/public-presentation.js');
+    const publicQuestion = projectHarnessEventForPublic(listEvents(session.id, { types: ['awaiting_user_input'] })[0]!)!;
+    assert.equal(publicQuestion.data.reason, 'approval_confirmation_required');
+    assert.equal(publicQuestion.data.sourceUserSeq, source.seq);
+    assert.equal(publicQuestion.data.leaning, 'approves');
+    assert.equal(publicQuestion.data.replyText, 'Yes, please do that.');
+    assert.equal(publicQuestion.data.ownerAttemptId, undefined);
+    assert.equal(registry.get(card.approvalId)?.status, 'pending');
+    assert.deepEqual(registry.get(card.approvalId)?.args, args);
+    assert.equal(getActiveRunAttempt(session.id), null);
+    const replay = await post();
+    assert.equal(replay.status, 202);
+    assert.equal((await replay.json() as { sourceUserSeq: number }).sourceUserSeq, source.seq);
+    assert.equal(listEvents(session.id, { types: ['user_input_received'] }).filter(event => event.data.clientRequestId === 'desktop-paused-confirm-once').length, 1);
+    assert.equal(brainCalls, 0);
+  } finally {
+    jev._setTypesafeKeyForTests(undefined); jev._setSystemOneFetchForTests(undefined);
+    _setBridgeImplsForTests({}); await harness.close();
+  }
+});
+
+test('desktop exact multi-card replies commit one nonexecuting inquiry for independent sources and explicit choices remain exact', async () => {
+  resetEventLog(); resetHarnessRuntimeConfig();
+  let brainCalls = 0;
+  _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+    claudeAgentBrain: (async () => { brainCalls++; throw new Error('a card inquiry must not execute'); }) as never });
+  const registry = await import('../runtime/harness/approval-registry.js');
+  const { appendEvent } = await import('../runtime/harness/eventlog.js');
+  const { parseApprovalIntent } = await import('../runtime/harness/approval-intent.js');
+  const harness = await boot();
+  try {
+    for (const reply of ['Yes.', 'No.']) {
+      const suffix = reply.startsWith('Yes') ? 'yes' : 'no';
+      const session = createSession({ id: `sess-desktop-multi-inquiry-${suffix}`, kind: 'chat', channel: 'desktop', metadata: { source: 'desktop' } });
+      const cards = [1, 2].map(index => {
+        const original = beginRunAttempt(session.id, { runId: `desktop:inquiry-${suffix}-${index}` });
+        const originalSource = recordRunAttemptUserInput(original, { turn: index, role: 'user', data: { text: `Prepare controlled local change ${index}.` } });
+        const args = { name: 'fixture_write', args_json: JSON.stringify({ value: index, account: `fixture-${index}` }) };
+        const row = registry.register({ sessionId: session.id, subject: 'Identical controlled change', tool: 'work_call', args });
+        appendEvent({ sessionId: session.id, turn: index, role: 'Clem', type: 'approval_requested',
+          data: { approvalId: row.approvalId, tool: row.tool, args, sourceUserSeq: originalSource.seq } });
+        finishRunAttempt(original, 'interrupted');
+        return row;
+      });
+      const post = () => fetch(`${harness.url}/api/harness/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: reply, sessionId: session.id, clientRequestId: `desktop-inquiry-${suffix}` }) });
+      const responses = await Promise.all([post(), post()]);
+      const bodies = await Promise.all(responses.map(response => { assert.equal(response.status, 202); return response.json(); })) as Array<{ sessionId: string; sourceUserSeq: number }>;
+      assert.equal(bodies[0]!.sessionId, session.id);
+      assert.equal(bodies[0]!.sourceUserSeq, bodies[1]!.sourceUserSeq);
+      const source = listEvents(session.id, { types: ['user_input_received'] }).find(event => event.seq === bodies[0]!.sourceUserSeq)!;
+      assert.equal((source.data.liveApprovalControl as { mode: string }).mode, 'card_inquiry');
+      assert.equal(source.parentEventId, null);
+      const questions = listEvents(session.id, { types: ['awaiting_user_input'] }).filter(event => event.data.sourceUserSeq === source.seq);
+      assert.equal(questions.length, 1);
+      const decision = suffix === 'yes' ? 'approve' : 'reject';
+      const options = questions[0]!.data.options as string[];
+      assert.deepEqual(new Set(options.map(option => parseApprovalIntent(option)?.approvalId)), new Set(cards.map(card => card.approvalId)));
+      assert.ok(options.every(option => parseApprovalIntent(option)?.decision === decision));
+      const terminals = listEvents(session.id, { types: ['conversation_completed'] }).filter(event => event.data.sourceUserSeq === source.seq);
+      assert.equal(terminals.length, 1);
+      assert.equal((terminals[0]!.data.presentation as { status: string }).status, 'needs_input');
+      assert.ok(cards.every(card => registry.get(card.approvalId)?.status === 'pending'));
+      assert.ok(cards.every(card => JSON.stringify(registry.get(card.approvalId)?.args) === JSON.stringify(card.args)));
+      assert.equal(getActiveRunAttempt(session.id), null);
+      const selected = await fetch(`${harness.url}/api/harness/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: `approve ${cards[0]!.approvalId}`, sessionId: session.id, clientRequestId: `desktop-explicit-${suffix}` }) });
+      assert.equal(selected.status, 202);
+      await waitUntil(() => registry.get(cards[0]!.approvalId)?.resolution === 'approved', 'explicit card did not resolve');
+      assert.equal(registry.get(cards[1]!.approvalId)?.status, 'pending');
+    }
+    assert.equal(brainCalls, 0);
+  } finally { _setBridgeImplsForTests({}); await harness.close(); }
+});
+
+test('desktop incomplete multi-card binding refuses before acceptance instead of dispatching a model turn', async () => {
+  resetEventLog(); resetHarnessRuntimeConfig();
+  let brainCalls = 0;
+  _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+    claudeAgentBrain: (async () => { brainCalls++; throw new Error('unverified inquiry cannot execute'); }) as never });
+  const registry = await import('../runtime/harness/approval-registry.js');
+  const { appendEvent } = await import('../runtime/harness/eventlog.js');
+  const harness = await boot();
+  try {
+    const session = createSession({ id: 'sess-desktop-incomplete-inquiry', kind: 'chat', channel: 'desktop', metadata: { source: 'desktop' } });
+    const original = beginRunAttempt(session.id, { runId: 'desktop:incomplete-inquiry' });
+    const originalSource = recordRunAttemptUserInput(original, { turn: 1, role: 'user', data: { text: 'Prepare two controlled changes.' } });
+    const cards = [1, 2].map(index => registry.register({ sessionId: session.id, subject: `Controlled change ${index}`,
+      tool: 'work_call', args: { name: 'fixture_write', args_json: JSON.stringify({ value: index }) } }));
+    appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'approval_requested',
+      data: { approvalId: cards[0]!.approvalId, tool: cards[0]!.tool, args: cards[0]!.args, sourceUserSeq: originalSource.seq } });
+    finishRunAttempt(original, 'interrupted');
+    const response = await fetch(`${harness.url}/api/harness/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: 'Yes.', sessionId: session.id, clientRequestId: 'desktop-incomplete-inquiry' }) });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json() as { code: string }).code, 'APPROVAL_CONTROL_BINDING_UNAVAILABLE');
+    assert.equal(getHarnessChatRequestReceipt('desktop-incomplete-inquiry'), null);
+    assert.equal(listEvents(session.id, { types: ['user_input_received'] }).length, 1);
+    assert.equal(listEvents(session.id, { types: ['conversation_completed', 'approval_resolved', 'tool_called'] }).length, 0);
+    assert.ok(cards.every(card => registry.get(card.approvalId)?.status === 'pending'));
+    assert.equal(brainCalls, 0);
+  } finally { _setBridgeImplsForTests({}); await harness.close(); }
+});
+
 async function waitUntil(
   predicate: () => boolean,
   message: string,
@@ -1281,6 +1422,11 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
       role: 'user',
       data: { text: 'Run the live SDK task.', displayText: 'Run the live SDK task.' },
     }, { armRunInFlight: true });
+    const { appendEvent } = await import('../runtime/harness/eventlog.js');
+    for (const card of [first, second]) appendEvent({
+      sessionId: session.id, turn: originalSource.turn, role: 'Clem', type: 'approval_requested',
+      data: { approvalId: card.approvalId, tool: card.tool, args: card.args, sourceUserSeq: originalSource.seq },
+    });
     const postDecision = async (input: string, clientRequestId: string) => {
       const response = await fetch(`${harness.url}/api/harness/chat`, {
         method: 'POST',

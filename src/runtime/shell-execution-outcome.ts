@@ -48,6 +48,8 @@ export type ShellExecutionErrorKind =
   | 'timeout'
   /** The owner stopped the turn while the command ran; the host ended it. */
   | 'owner_stopped'
+  /** Exact invocation cancellation without evidence of an owner Stop. */
+  | 'cancelled'
   | 'nonzero_exit'
   | 'provider_precondition_rejected'
   | 'spawn_failed';
@@ -61,7 +63,7 @@ export interface ShellExecutionOutcome {
   errorKind?: ShellExecutionErrorKind;
   executable?: string;
   providerAdapterId?: string;
-  /** Exact host cleanup receipt after a Windows shell timeout. */
+  /** Exact host cleanup receipt after a Windows shell timeout or Stop. */
   timeoutCleanup?: 'complete' | 'incomplete';
 }
 

@@ -19,7 +19,7 @@ import { approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, card
 import { reduceFeed } from './reduce-lifecycle.js';
 import { advanceWorkflowChildActivity, clearModelRetryProgress, isModelRetryProgressBoundary, isWorkflowChildActivity, readModelRetryProgress, readWorkflowQueueDispatch, updateWorkflowDispatchActivity, workflowDispatchText } from './reduce-activity.js';
 import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
-import { terminalCompletionPresentation } from './terminal-presentation.js';
+import { terminalCompletionPresentation, terminalFactsFrom } from './terminal-presentation.js';
 import { settleTerminalActivity, activityTerminalOutcomeForMessageStatus } from './activity-presentation.js';
 import { runChatStream, type ChatStreamHandle, type StreamTransport } from './stream.js';
 import { acceptedConversationSource, appendConversationCheckIn } from './conversation-check-in.js';
@@ -84,6 +84,13 @@ const defaultIdempotencyKey = (): string =>
   (globalThis.crypto as { randomUUID?: () => string } | undefined)?.randomUUID?.()
     ?? `key-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
+/** A durable authority/payload conflict refused this request. Repeating its
+ * identity cannot repair it; the owner must choose the current card/request. */
+function isPermanentChatSendConflict(error: unknown): boolean {
+  return error !== null && typeof error === 'object'
+    && (error as { status?: unknown }).status === 409;
+}
+
 const DELEGATED_ASSISTANT_ID_PREFIX = 'a-delegated-';
 
 function delegatedAssistantMessageId(sourceUserSeq: number, dispatchSeq: number): string {
@@ -109,6 +116,48 @@ function sourceUserSeqOf(event: HarnessEvent): number | null {
   return typeof nested === 'number' && Number.isSafeInteger(nested) && nested > 0
     ? nested
     : null;
+}
+
+function approvalConfirmationOf(event: HarnessEvent, sessionId?: string | null) {
+  const confirm = approvalConfirmFromEvent(event.data ?? {});
+  if (!confirm) return null;
+  const sourceUserSeq = sourceUserSeqOf(event);
+  // Preserve the incumbent legacy asked-back card when no binding was
+  // published. Only an exact modern binding may suppress its typed terminal.
+  if (event.data?.sourceUserSeq === undefined) return confirm;
+  const boundSession = event.sessionId ?? sessionId;
+  if (!boundSession || (sessionId && boundSession !== sessionId) || event.role !== 'Clem'
+    || sourceUserSeq === null || !Number.isSafeInteger(event.seq) || event.seq <= sourceUserSeq) return null;
+  return { ...confirm, confirm: { ...confirm.confirm,
+    source: { sessionId: boundSession, sourceUserSeq, awaitingSeq: event.seq } } };
+}
+
+function withApprovalConfirmation(message: ChatMessage, confirm: ApprovalConfirm): ChatMessage {
+  const previous = message.approval?.confirm;
+  if (previous?.source && (!confirm.source
+    || previous.source.sessionId !== confirm.source.sessionId
+    || previous.source.awaitingSeq >= confirm.source.awaitingSeq)) return message;
+  return { ...message, approval: { ...message.approval!, confirm } };
+}
+
+/** Only the typed question for this exact card/source is already rendered.
+ * Ordinary questions, failures and later results keep their own bubbles. */
+function isApprovalConfirmationTerminal(messages: readonly ChatMessage[], event: HarnessEvent, sessionId?: string | null): boolean {
+  if (event.type !== 'conversation_completed' || (sessionId && event.sessionId && event.sessionId !== sessionId)) return false;
+  const sourceUserSeq = sourceUserSeqOf(event);
+  const d = event.data ?? {};
+  const identity = (d.presentation as { identity?: { sessionId?: unknown; sourceUserSeq?: unknown } } | undefined)?.identity;
+  const facts = terminalFactsFrom(d);
+  if (sourceUserSeq === null || identity?.sourceUserSeq !== sourceUserSeq
+    || identity.sessionId !== (event.sessionId ?? sessionId)
+    || facts?.status !== 'needs_input' || facts.kind !== 'question') return false;
+  const text = terminalCompletionPresentation(d, '').text.trim();
+  return messages.some(message => {
+    const confirm = message.approval?.confirm;
+    if (!confirm?.source) return false;
+    return confirm.source.sessionId === identity.sessionId && confirm.source.sourceUserSeq === sourceUserSeq
+      && Number.isSafeInteger(event.seq) && event.seq > confirm.source.awaitingSeq && confirm.question.trim() === text;
+  });
 }
 
 function delegatedSourceUserSeq(message: ChatMessage): number | null {
@@ -402,6 +451,7 @@ export class ChatEngine {
     // Same identity on every attempt: a lost 202 replays the server's durable
     // receipt instead of starting a second run.
     const delays = [500, 1500, 3500];
+    const assistantId = this.activeAssistantId;
     for (let attempt = 0; ; attempt += 1) {
       try {
         const result = await this.api.send({ message, sessionId: userMessage.requestSessionId !== undefined ? userMessage.requestSessionId : this.sessionId, idempotencyKey,
@@ -430,21 +480,28 @@ export class ChatEngine {
         return;
       } catch (err) {
         if (this.disposed) return;
-        if (attempt < delays.length) {
+        if (!isPermanentChatSendConflict(err) && attempt < delays.length) {
           await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
           continue;
         }
-        this.messages = this.messages.map((m) => (m.id === userMessage.id
+        const pending = this.messages.find(m => m.id === userMessage.id && m.pending === 'sending');
+        // A streamed acceptance/result can beat a late POST refusal. It is
+        // already authoritative and must not become a failed local echo.
+        if (!pending) return;
+        this.messages = this.messages.map((m) => (m.id === userMessage.id && m.pending === 'sending'
           ? { ...m, pending: 'failed', pendingError: err instanceof Error ? err.message : 'Failed to send' }
           : m));
         // The assistant placeholder for a send that never left the phone is
         // noise — drop it.
-        if (this.activeAssistantId) {
-          const active = this.activeAssistantId;
-          this.messages = this.messages.filter((m) => !(m.id === active && m.role === 'assistant' && !m.text && (m.activity?.length ?? 0) === 0));
-          this.activeAssistantId = null;
+        if (assistantId) {
+          this.messages = this.messages.filter((m) => !(m.id === assistantId && m.role === 'assistant'
+            && m.status === 'thinking' && !m.acceptedSource && !m.text && (m.activity?.length ?? 0) === 0));
         }
-        this.busy = false;
+        if (this.inFlightKey === idempotencyKey && this.activeAssistantId === assistantId
+          && this.activeSourceUserSeq === null) {
+          this.activeAssistantId = null;
+          this.busy = false;
+        }
         this.emit();
         // Connection setup awaits this callback before declaring its task
         // continued. Keep the retryable echo, but do not report acceptance
@@ -610,6 +667,7 @@ export class ChatEngine {
     if (readLiveApprovalControl(event)) {
       if (event.sessionId && event.sessionId !== this.sessionId) return;
       if (event.type === 'conversation_completed') {
+        if (isApprovalConfirmationTerminal(this.messages, event, this.sessionId)) return;
         const id = `control-ack-${event.seq}`;
         if (!this.messages.some(message => message.id === id)) this.messages = [...this.messages, {
           id, role: 'assistant', ...terminalCompletionPresentation(d, ''),
@@ -813,6 +871,13 @@ export class ChatEngine {
           this.emit();
           return;
         }
+        if (isApprovalConfirmationTerminal(this.messages, event, this.sessionId)) {
+          if (sourceUserSeqOf(event) === this.activeSourceUserSeq) {
+            this.busy = false;
+            this.activeAssistantId = null;
+          }
+          break;
+        }
         if (!this.terminalOwnsActiveTurn(event)) {
           return;
         }
@@ -871,7 +936,7 @@ export class ChatEngine {
       }
       case 'awaiting_user_input': {
         if (!this.terminalOwnsActiveTurn(event)) return;
-        const confirm = approvalConfirmFromEvent(d);
+        const confirm = approvalConfirmationOf(event, this.sessionId);
         if (confirm && this.messages.some((m) => m.approval?.approvalId === confirm.approvalId)) {
           // The card's own question, asked back: drawn ON the waiting card
           // (the owner's words, Clem's line, the same two answers); the
@@ -879,8 +944,9 @@ export class ChatEngine {
           const placeholder = this.activeAssistantId;
           this.messages = this.messages
             .filter((m) => !(m.id === placeholder && !m.text.trim() && !m.approval && !m.planArtifactRef))
-            .map((m) => (m.approval?.approvalId === confirm.approvalId ? { ...m, approval: { ...m.approval, confirm: confirm.confirm } } : m));
+            .map((m) => (m.approval?.approvalId === confirm.approvalId ? withApprovalConfirmation(m, confirm.confirm) : m));
           this.busy = false;
+          if (confirm.confirm.source) this.activeAssistantId = null;
           break;
         }
         // This event is itself a public terminal for the live stream. The
@@ -1055,7 +1121,8 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
       modelRetryObservedSeq = Math.max(modelRetryObservedSeq, event.seq);
     }
     if (readLiveApprovalControl(event)) {
-      if (event.type === 'conversation_completed' && !messages.some(message => message.id === `control-ack-${event.seq}`)) messages.push({
+      if (event.type === 'conversation_completed' && !isApprovalConfirmationTerminal(messages, event, sessionId)
+        && !messages.some(message => message.id === `control-ack-${event.seq}`)) messages.push({
         id: `control-ack-${event.seq}`, role: 'assistant', ...terminalCompletionPresentation(d, ''),
       });
       continue;
@@ -1141,6 +1208,14 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         break;
       }
       case 'conversation_completed': {
+        if (isApprovalConfirmationTerminal(messages, event, sessionId)) {
+          if (sourceUserSeqOf(event) === currentSourceUserSeq) {
+            activity = [];
+            opening = '';
+            pendingAwaitingMessageIndex = null;
+          }
+          break;
+        }
         const presentation = terminalCompletionPresentation(d, opening, undefined);
         const planProposalId = typeof d.planProposalId === 'string' ? d.planProposalId : undefined;
         const statusRaw = typeof d.planProposalStatus === 'string' ? d.planProposalStatus : 'pending';
@@ -1247,6 +1322,17 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         break;
       }
       case 'awaiting_user_input': {
+        const confirm = approvalConfirmationOf(event, sessionId);
+        const cardIndex = confirm ? messages.findIndex(message => message.approval?.approvalId === confirm.approvalId) : -1;
+        if (confirm && cardIndex >= 0) {
+          messages[cardIndex] = withApprovalConfirmation(messages[cardIndex]!, confirm.confirm);
+          if (sourceUserSeqOf(event) === currentSourceUserSeq) {
+            activity = [];
+            opening = '';
+            pendingAwaitingMessageIndex = null;
+          }
+          break;
+        }
         const question = typeof d.question === 'string' && d.question.trim()
           ? d.question.trim()
           : 'I have a question for you.';

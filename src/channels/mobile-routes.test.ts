@@ -1103,6 +1103,150 @@ test('mobile approval B is accepted before mutation and owns B terminal, never a
   } finally { await h.close(); }
 });
 
+test('mobile paused-card confirmation stays with its exact finished source without starting a fresh turn', async () => {
+  resetEventLog();
+  _clearMobileChatInFlightForTests();
+  let modelCalls = 0;
+  const jev = await import('../runtime/jev/client.js');
+  const { finishRunAttempt } = await import('../runtime/harness/eventlog.js');
+  jev._setTypesafeKeyForTests('fixture-key');
+  jev._setSystemOneFetchForTests(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({
+    model: 'jev-1.13.0', answers: { reply: { type: 'choice', choice: 'approves', confidence: 0.7,
+      probabilities: { approves: 0.7 } } }, usage: { input_tokens: 1, output_tokens: 1 },
+  }) }));
+  const assistant = { respond: async () => { modelCalls++; throw new Error('a card confirmation must not execute'); } } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const h = await startHarness({ assistant });
+  try {
+    const cookie = await loginMobile(h, 'Paused card phone fixture');
+    const { deviceId } = await (await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } })).json() as { deviceId: string };
+    const session = createHarnessSession({ id: 'sess-mobile-paused-confirm', kind: 'chat', channel: 'mobile', userId: deviceId,
+      metadata: { source: 'mobile', ingressProvider: 'mobile', channelId: 'mobile-paused-confirm-root', userId: deviceId } });
+    const original = beginRunAttempt(session.id, { runId: 'mobile:paused-confirm-original' });
+    const originalSource = recordRunAttemptUserInput(original, { turn: 1, role: 'user', data: { text: 'Prepare a controlled local change.' } });
+    const args = { name: 'fixture_write', args_json: '{"value":"pinned","account":"fixture-account"}' };
+    const card = approvalRegistry.register({ sessionId: session.id, subject: 'Controlled local change', tool: 'work_call', args });
+    appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'approval_requested',
+      data: { approvalId: card.approvalId, tool: card.tool, args, sourceUserSeq: originalSource.seq } });
+    finishRunAttempt(original, 'interrupted');
+    const post = () => fetch(`${h.url}/m/api/chat/send`, { method: 'POST',
+      headers: { cookie, 'content-type': 'application/json', 'idempotency-key': 'mobile-paused-confirm-once' },
+      body: JSON.stringify({ message: 'Yes, please do that.', sessionId: session.id, async: true }) });
+    const first = await post();
+    assert.equal(first.status, 200);
+    assert.equal((await first.json() as { sessionId: string }).sessionId, session.id);
+    const source = listEvents(session.id, { types: ['user_input_received'] }).find(event => event.data.confirm === 'approves')!;
+    assert.ok(source);
+    assert.equal(source.parentEventId, originalSource.id);
+    assert.equal((source.data.liveApprovalControl as { mode: string }).mode, 'paused_card');
+    assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).filter(event => event.data.sourceUserSeq === source.seq).length, 1);
+    assert.equal(listEvents(session.id, { types: ['awaiting_user_input'] }).filter(event => event.data.approvalId === card.approvalId).length, 1);
+    const { projectHarnessEventForPublic } = await import('../runtime/harness/public-presentation.js');
+    const publicQuestion = projectHarnessEventForPublic(listEvents(session.id, { types: ['awaiting_user_input'] })[0]!)!;
+    assert.equal(publicQuestion.data.reason, 'approval_confirmation_required');
+    assert.equal(publicQuestion.data.sourceUserSeq, source.seq);
+    assert.equal(publicQuestion.data.leaning, 'approves');
+    assert.equal(publicQuestion.data.replyText, 'Yes, please do that.');
+    assert.equal(publicQuestion.data.ownerAttemptId, undefined);
+    assert.equal(approvalRegistry.get(card.approvalId)?.status, 'pending');
+    assert.deepEqual(approvalRegistry.get(card.approvalId)?.args, args);
+    assert.equal(getActiveRunAttempt(session.id), null);
+    const replay = await post();
+    assert.equal(replay.status, 200);
+    assert.equal(listEvents(session.id, { types: ['user_input_received'] }).filter(event => event.data.confirm === 'approves').length, 1);
+    assert.equal(modelCalls, 0);
+  } finally {
+    jev._setTypesafeKeyForTests(undefined); jev._setSystemOneFetchForTests(undefined); await h.close();
+  }
+});
+
+test('mobile exact multi-card replies terminalize one inquiry and later exact card or sole-card answers remain bound', async () => {
+  resetEventLog(); _clearMobileChatInFlightForTests();
+  let modelCalls = 0;
+  const { finishRunAttempt } = await import('../runtime/harness/eventlog.js');
+  const { parseApprovalIntent } = await import('../runtime/harness/approval-intent.js');
+  const assistant = { respond: async () => { modelCalls++; throw new Error('an inquiry cannot execute'); } } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const h = await startHarness({ assistant });
+  try {
+    const cookie = await loginMobile(h, 'Multi-card phone fixture');
+    const { deviceId } = await (await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } })).json() as { deviceId: string };
+    for (const reply of ['Yes.', 'No.']) {
+      const suffix = reply.startsWith('Yes') ? 'yes' : 'no';
+      const session = createHarnessSession({ id: `sess-mobile-multi-inquiry-${suffix}`, kind: 'chat', channel: 'mobile', userId: deviceId,
+        metadata: { source: 'mobile', ingressProvider: 'mobile', channelId: `mobile-inquiry-${suffix}`, userId: deviceId } });
+      const cards = [1, 2].map(index => {
+        const original = beginRunAttempt(session.id, { runId: `mobile:inquiry-${suffix}-${index}` });
+        const originalSource = recordRunAttemptUserInput(original, { turn: index, role: 'user', data: { text: `Prepare controlled local change ${index}.` } });
+        const args = { name: 'fixture_write', args_json: JSON.stringify({ value: index, account: `fixture-${index}` }) };
+        const row = approvalRegistry.register({ sessionId: session.id, subject: 'Identical controlled change', tool: 'work_call', args });
+        appendEvent({ sessionId: session.id, turn: index, role: 'Clem', type: 'approval_requested',
+          data: { approvalId: row.approvalId, tool: row.tool, args, sourceUserSeq: originalSource.seq } });
+        finishRunAttempt(original, 'interrupted'); return row;
+      });
+      const post = (message = reply, key = `mobile-inquiry-${suffix}`) => fetch(`${h.url}/m/api/chat/send`, {
+        method: 'POST', headers: { cookie, 'content-type': 'application/json', 'idempotency-key': key },
+        body: JSON.stringify({ message, sessionId: session.id, async: true }) });
+      const responses = await Promise.all([post(), post()]);
+      for (const response of responses) { assert.equal(response.status, 200); assert.equal((await response.json() as { sessionId: string }).sessionId, session.id); }
+      const controls = listEvents(session.id, { types: ['user_input_received'] }).filter(event => event.data.approvalInquiry);
+      assert.equal(controls.length, 1);
+      const source = controls[0]!;
+      assert.equal((source.data.liveApprovalControl as { mode: string }).mode, 'card_inquiry');
+      assert.equal(source.parentEventId, null);
+      const questions = listEvents(session.id, { types: ['awaiting_user_input'] }).filter(event => event.data.sourceUserSeq === source.seq);
+      assert.equal(questions.length, 1);
+      const decision = suffix === 'yes' ? 'approve' : 'reject';
+      const options = questions[0]!.data.options as string[];
+      assert.deepEqual(new Set(options.map(option => parseApprovalIntent(option)?.approvalId)), new Set(cards.map(card => card.approvalId)));
+      assert.ok(options.every(option => parseApprovalIntent(option)?.decision === decision));
+      const terminals = listEvents(session.id, { types: ['conversation_completed'] }).filter(event => event.data.sourceUserSeq === source.seq);
+      assert.equal(terminals.length, 1);
+      assert.equal((terminals[0]!.data.presentation as { status: string }).status, 'needs_input');
+      assert.ok(cards.every(card => approvalRegistry.get(card.approvalId)?.status === 'pending'));
+      assert.ok(cards.every(card => JSON.stringify(approvalRegistry.get(card.approvalId)?.args) === JSON.stringify(card.args)));
+      assert.equal(getActiveRunAttempt(session.id), null);
+      assert.equal(listEvents(session.id, { types: ['tool_called', 'approval_resolved'] }).length, 0);
+      const exact = await post(`reject ${cards[0]!.approvalId}`, `mobile-explicit-${suffix}`);
+      assert.equal(exact.status, 200);
+      assert.equal(approvalRegistry.get(cards[0]!.approvalId)?.resolution, 'rejected');
+      assert.equal(approvalRegistry.get(cards[1]!.approvalId)?.status, 'pending');
+      const sole = await post('Yes.', `mobile-sole-yes-${suffix}`);
+      assert.equal(sole.status, 200);
+      assert.equal(approvalRegistry.get(cards[1]!.approvalId)?.resolution, 'approved');
+    }
+    assert.equal(modelCalls, 0);
+  } finally { await h.close(); }
+});
+
+test('mobile incomplete multi-card binding refuses before acceptance instead of dispatching a model turn', async () => {
+  resetEventLog(); _clearMobileChatInFlightForTests();
+  let modelCalls = 0;
+  const { finishRunAttempt } = await import('../runtime/harness/eventlog.js');
+  const assistant = { respond: async () => { modelCalls++; throw new Error('unverified inquiry cannot execute'); } } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const h = await startHarness({ assistant });
+  try {
+    const cookie = await loginMobile(h, 'Incomplete card phone fixture');
+    const { deviceId } = await (await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } })).json() as { deviceId: string };
+    const session = createHarnessSession({ id: 'sess-mobile-incomplete-inquiry', kind: 'chat', channel: 'mobile', userId: deviceId,
+      metadata: { source: 'mobile', ingressProvider: 'mobile', channelId: 'mobile-incomplete-inquiry', userId: deviceId } });
+    const original = beginRunAttempt(session.id, { runId: 'mobile:incomplete-inquiry' });
+    const originalSource = recordRunAttemptUserInput(original, { turn: 1, role: 'user', data: { text: 'Prepare two controlled changes.' } });
+    const cards = [1, 2].map(index => approvalRegistry.register({ sessionId: session.id, subject: `Controlled change ${index}`,
+      tool: 'work_call', args: { name: 'fixture_write', args_json: JSON.stringify({ value: index }) } }));
+    appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'approval_requested',
+      data: { approvalId: cards[0]!.approvalId, tool: cards[0]!.tool, args: cards[0]!.args, sourceUserSeq: originalSource.seq } });
+    finishRunAttempt(original, 'interrupted');
+    const response = await fetch(`${h.url}/m/api/chat/send`, { method: 'POST',
+      headers: { cookie, 'content-type': 'application/json', 'idempotency-key': 'mobile-incomplete-inquiry' },
+      body: JSON.stringify({ message: 'Yes.', sessionId: session.id, async: true }) });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json() as { code: string }).code, 'APPROVAL_CONTROL_BINDING_UNAVAILABLE');
+    assert.equal(listEvents(session.id, { types: ['user_input_received'] }).length, 1);
+    assert.equal(listEvents(session.id, { types: ['conversation_completed', 'approval_resolved', 'tool_called'] }).length, 0);
+    assert.ok(cards.every(card => approvalRegistry.get(card.approvalId)?.status === 'pending'));
+    assert.equal(modelCalls, 0);
+  } finally { await h.close(); }
+});
+
 test('live mobile exact approvals preserve the executor through approve, reject, replay and later steering', async () => {
   resetEventLog();
   let modelCalls = 0;

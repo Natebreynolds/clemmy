@@ -1138,6 +1138,68 @@ test('a cooperative hanging read sees one exact signal and settles timed_out bef
   leases.revokeDispatchLease(task.parentLease);
 });
 
+for (const stopReason of ['kill', 'deadline'] as const) {
+  test(`a host-owned shell abort stops its real process after ${stopReason} settlement clears the latch`, {
+    skip: process.platform === 'win32' ? 'POSIX process groups; Windows cleanup is pinned separately' : false,
+  }, async () => {
+    const { spawn } = await import('node:child_process');
+    const computer = await import('../../tools/computer-tools.js');
+    const task = fixture('Run one controlled, read-only shell command.');
+    const attempt = eventlog.beginRunAttempt(task.sessionId);
+    eventlog.bindRunAttemptSourceUserEvent(attempt, task.sourceUserSeq);
+    task.context.runAttemptId = attempt.attemptId;
+    // The model step has already returned. Its signal remains un-aborted;
+    // cleanup must belong to the exact host tool invocation instead.
+    task.context.callerCancelSignal = new AbortController().signal;
+    let child: ReturnType<typeof spawn> | undefined;
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const command = 'while true; do echo shell-fixture; sleep 1; done';
+    const callId = `model:shell-${stopReason}`;
+    const running = runCall(task, {
+      callId, toolName: 'run_shell_command', args: { command },
+      deadlineMs: stopReason === 'deadline' ? 150 : 10_000,
+      isKillRequested: () => eventlog.isKillRequested(task.sessionId, { attemptId: attempt.attemptId }),
+      invoke: () => computer._testOnly_runShellCommand(command, TMP_HOME, 30_000, {
+        spawnProcess: ((...args: Parameters<typeof spawn>) => {
+          child = spawn(...args);
+          child.once('spawn', entered);
+          return child;
+        }) as typeof spawn,
+      }),
+    });
+    const rejection = assert.rejects(running, error => stopReason === 'kill'
+      ? error instanceof invocation.HostToolInvocationCancelledError
+      : error instanceof invocation.HostToolInvocationDeadlineError);
+    try {
+      await started;
+      if (stopReason === 'kill') eventlog.requestKill(task.sessionId, 'owner fixture Stop', { attemptId: attempt.attemptId });
+      await rejection;
+      // The production attempt finisher erases its exact Stop latch. This
+      // happens before the shell's 250ms polling interval can observe it.
+      eventlog.finishRunAttempt(attempt, stopReason === 'kill' ? 'cancelled' : 'completed');
+      assert.equal(eventlog.isKillRequested(task.sessionId, { attemptId: attempt.attemptId }), false);
+      for (let wait = 0; wait < 10 && child?.exitCode === null && child?.signalCode === null; wait++) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      assert.ok(child && (child.exitCode !== null || child.signalCode !== null),
+        'the original command must stop even after its model step and durable latch are gone');
+      assert.deepEqual(rows(task, callId).map(row => row.state), [stopReason === 'kill' ? 'cancelled' : 'timed_out']);
+      const successor = fixture('Run a different harmless command after the stop.');
+      const result = await runCall(successor, {
+        callId: 'model:shell-successor', toolName: 'run_shell_command', args: { command: 'echo successor-ok' },
+        deadlineMs: 2_000,
+        invoke: () => computer._testOnly_runShellCommand('echo successor-ok', TMP_HOME, 1_000),
+      });
+      assert.match(result.value.text, /successor-ok/);
+      leases.revokeDispatchLease(successor.parentLease);
+    } finally {
+      try { if (child?.pid) process.kill(-child.pid, 'SIGKILL'); } catch { /* fixture already stopped */ }
+      leases.revokeDispatchLease(task.parentLease);
+    }
+  });
+}
+
 // Live 2026-08-26, sess-desktop-970d457a6554134620236989 source 85009: a
 // discovery-classified call (tool_search) admitted a governor claim, then hit
 // this exact host-owned deadline path. The attempt above settled `transient`
@@ -1569,7 +1631,7 @@ test('accepted-source audit accepts one exact parented v76 success projection', 
   leases.revokeDispatchLease(task.parentLease);
 });
 
-test('host-owned external semantic outcomes project only proven no-effect failure; ambiguity stays orphaned', async () => {
+test('raw external rejection responses and thrown statuses preserve uncertainty without trusted no-effect evidence', async () => {
   const rejected = fixture('Update the current alpha record.');
   const rejectedResult = await runCall(rejected, {
     callId: 'model:projected-write-rejected',
@@ -1580,16 +1642,18 @@ test('host-owned external semantic outcomes project only proven no-effect failur
     deadlineMs: 200,
     invoke: async () => ({ successful: false, status: 400, error: { code: 'INVALID_INPUT' } }),
   });
-  assert.equal(rejectedResult.settlement.outcome.kind, 'invalid_arguments');
+  // A raw provider failure may follow a partial commit. An HTTP status and
+  // error label alone do not prove that this external write had no effect.
+  assert.equal(rejectedResult.settlement.outcome.kind, 'uncertain_write');
   const rejectedEvents = eventlog.listEvents(rejected.sessionId, {
     types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
   });
   assert.deepEqual(
     rejectedEvents.map((event) => event.type),
-    ['external_write', 'external_write_failed'],
+    ['external_write', 'external_write_orphaned'],
     JSON.stringify(rejectedResult.settlement.outcome),
   );
-  assert.equal(workReport.resolveWriteEvidence(rejectedEvents).failed.length, 1);
+  assert.equal(workReport.resolveWriteEvidence(rejectedEvents).uncertain.length, 1);
   leases.revokeDispatchLease(rejected.parentLease);
 
   const thrownRejected = fixture('Update the current alpha record.');
@@ -1611,7 +1675,7 @@ test('host-owned external semantic outcomes project only proven no-effect failur
   });
   assert.deepEqual(thrownRejectedEvents.map((event) => event.type), [
     'external_write',
-    'external_write_failed',
+    'external_write_orphaned',
   ]);
   leases.revokeDispatchLease(thrownRejected.parentLease);
 

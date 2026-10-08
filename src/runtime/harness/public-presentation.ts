@@ -1001,6 +1001,9 @@ function publicLiveApprovalControl(event: EventRow): PublicLiveApprovalControl |
       source = accepted;
     }
     if (!isLiveApprovalAcknowledgement(source)) return null;
+    // Historical card owners and card-set inquiries are not live executors.
+    // Its exact-source question/terminal uses the ordinary presentation.
+    if ((source.data.liveApprovalControl as Record<string, unknown>).mode !== undefined) return null;
     const control = source.data.liveApprovalControl as PublicLiveApprovalControl;
     const ownerSource = getRunAttemptSourceUserEvent({ sessionId: source.sessionId, attemptId: control.ownerAttemptId });
     if (!ownerSource || ownerSource.seq !== control.ownerSourceUserSeq || ownerSource.id !== source.parentEventId) return null;
@@ -1008,6 +1011,39 @@ function publicLiveApprovalControl(event: EventRow): PublicLiveApprovalControl |
     if (claimed && (claimed.version !== control.version || claimed.ownerAttemptId !== control.ownerAttemptId
       || claimed.ownerSourceUserSeq !== control.ownerSourceUserSeq)) return null;
     return { version: 1, ownerAttemptId: control.ownerAttemptId, ownerSourceUserSeq: control.ownerSourceUserSeq };
+  } catch { return null; }
+}
+
+/** A confirmation identifies a displayed card, never its payload or executor.
+ * Reopen the accepted control and earlier card carrier so copied metadata
+ * cannot attach a question to another source/card. A later card resolution
+ * does not erase this historical presentation relationship. */
+function publicApprovalConfirmation(event: EventRow): Record<string, unknown> | null {
+  const data = event.data;
+  const seq = data.sourceUserSeq;
+  const approvalId = data.approvalId;
+  const leaning = data.leaning;
+  if (event.role !== 'Clem' || data.reason !== 'approval_confirmation_required'
+    || !Number.isSafeInteger(seq) || Number(seq) <= 0 || Number(seq) >= event.seq
+    || typeof approvalId !== 'string' || !approvalId.trim()
+    || (leaning !== 'approves' && leaning !== 'declines' && leaning !== 'unread')
+    || typeof data.question !== 'string' || !data.question.trim()) return null;
+  try {
+    const source = listEvents(event.sessionId, { types: ['user_input_received'], sinceSeq: Number(seq) - 1, limit: 1 })[0];
+    if (!source || source.seq !== seq || source.turn !== event.turn || !isLiveApprovalAcknowledgement(source)
+      || source.data.approvalId !== approvalId || source.data.confirm !== leaning) return null;
+    const control = source.data.liveApprovalControl as Record<string, unknown>;
+    if (control.mode !== undefined && (control.mode !== 'paused_card' || control.approvalId !== approvalId)) return null;
+    const ownerSource = getRunAttemptSourceUserEvent({ sessionId: source.sessionId, attemptId: String(control.ownerAttemptId) });
+    if (!ownerSource || ownerSource.seq !== control.ownerSourceUserSeq || ownerSource.id !== source.parentEventId) return null;
+    const carriers = listEvents(event.sessionId, { types: ['approval_requested'] })
+      .filter(row => row.seq < source.seq && row.data.approvalId === approvalId);
+    if (!carriers.length || carriers.some(row => row.role !== 'Clem'
+      || row.data.sourceUserSeq !== ownerSource.seq || row.seq <= ownerSource.seq)) return null;
+    if (data.replyText !== undefined && (typeof data.replyText !== 'string' || data.replyText !== source.data.text)) return null;
+    const replyText = data.replyText === undefined ? '' : publicUserInputText({ text: data.replyText });
+    return { reason: 'approval_confirmation_required', approvalId, sourceUserSeq: seq, leaning,
+      ...(replyText ? { replyText } : {}) };
   } catch { return null; }
 }
 
@@ -1030,6 +1066,16 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       if (liveApprovalControl) {
         const input = publicUserInputText(data);
         return { text: input, ...answerWords(input), synthetic: true, liveApprovalControl };
+      }
+      // These are the owner's accepted words with a question of their own,
+      // not a claim that any historical card executor is running. Keep the
+      // private control/payload bindings out of the public replay plane.
+      if (isLiveApprovalAcknowledgement(event)) {
+        const mode = (data.liveApprovalControl as Record<string, unknown>).mode;
+        if (mode === 'paused_card' || mode === 'card_inquiry') {
+          const input = publicUserInputText(data);
+          return input ? { text: input, ...answerWords(input) } : null;
+        }
       }
       if (data.synthetic === true) {
         if (data.source !== 'outcome') return null;
@@ -1139,10 +1185,12 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       return publicAsyncWorkDispatchedData(data);
     case 'awaiting_user_input': {
       const question = publicReplyText(data.question, 'I need your input before I can continue.');
+      const confirmation = publicApprovalConfirmation(event);
       return {
         question,
         options: stringList(data.options, 8),
         ...selected(data, ['source', 'approvalId', 'pendingQuestionId', 'sourceId']),
+        ...(confirmation ?? {}),
       };
     }
     case 'approval_requested': {

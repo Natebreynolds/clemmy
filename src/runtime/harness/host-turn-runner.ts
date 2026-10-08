@@ -3,6 +3,7 @@ import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
 import { RETAINED_WORK_TERMINAL_HEADER } from './retained-work-checkpoint.js';
+import { runOwnedHostStopNarration } from './host-stop-narration-lifecycle.js';
 import { retainConnectionExecutionProgress } from './connection-execution-progress.js';
 import { assertHostConnectionProgress, bindHostConnectionProgress, clearHostConnectionProgress, type HostConnectionProgress } from './host-connection-progress.js';
 import { declaresWorkflowDispatchReceipt } from './workflow-dispatch-commit.js';
@@ -134,6 +135,7 @@ import {
 } from './brackets.js';
 import {
   activateDispatchLease,
+  assertDispatchLeaseCurrent,
   revokeDispatchLeaseBeforeRecovery,
   type DispatchLeaseRef,
 } from './dispatch-lease.js';
@@ -5434,68 +5436,108 @@ const runHostTurnBody = async (
     try {
       const identity = exactHostIdentity();
       const ambient = harnessRunContextStorage.getStore();
+      if (!ambient) return outcome;
       const killTarget = ambient?.runAttemptId
-        ? { attemptId: ambient.runAttemptId, sourceUserSeq: identity.sourceUserSeq }
+        ? { attemptId: ambient.runAttemptId }
         : { sourceUserSeq: identity.sourceUserSeq };
       // A Stop is the owner's own decision: the committer says it.
-      if (isKillRequested(identity.sessionId, killTarget)) return outcome;
-      const full = typeof outcome.finalOutput === 'string' ? outcome.finalOutput : '';
-      const headerAt = full.indexOf(RETAINED_WORK_TERMINAL_HEADER);
-      let fact = (headerAt >= 0 ? full.slice(0, headerAt) : full).trim();
-      const retained = headerAt >= 0 ? full.slice(headerAt).trim() : '';
-      if (!fact) return outcome;
-      if (fact.startsWith(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT)) {
-        // The ledger, not the runner's generic copy, says whether anything
-        // outside this machine could have run (delivery-committer reads the
-        // same truth for the fixed copy).
-        const committer = await import('./delivery-committer.js');
-        const { completionEvidenceSource } = await import('./recovery-activation.js');
-        if (committer.acceptedSourceHasZeroExternalEffectSurface(completionEvidenceSource(identity))) {
-          fact = committer.HOST_LOCAL_FAILURE_BLOCKED_TEXT;
-        }
-      }
-      let narrationInput = structuredClone(history);
-      let narrationInstructions = await resolveInstructions();
-      if (inputFilter) {
-        const filtered = await inputFilter({
-          modelData: {
-            input: structuredClone(history),
-            ...(narrationInstructions !== undefined ? { instructions: narrationInstructions } : {}),
-          },
-          agent,
-          context: contextValue,
-          advertisedTools: [],
-          holdReading: () => { /* the narration step publishes no prompt reading */ },
-        });
-        if (!filtered || !Array.isArray(filtered.input)) return outcome;
-        narrationInput = structuredClone(filtered.input);
-        if (typeof filtered.instructions !== 'undefined') narrationInstructions = filtered.instructions;
-      }
-      narrationInput.push({
-        role: 'system',
-        content: hostStopNarrationDirective(fact, (outcome as HostRunOutcome).blockedDetail),
-      } as AgentInputItem);
-      // A plain one-shot on the turn's own model, with no tools: the stop is
-      // already settled, so this request is outside the turn's checkpoint
-      // chain, provenance and recovery (it can only add words, never work).
-      const step = await codexOneStep({
-        input: narrationInput,
-        tools: [],
-        ...(modelId !== undefined ? { modelId } : {}),
-        ...(resolveModel ? { resolveModel } : {}),
-        ...(narrationInstructions !== undefined ? { systemInstructions: narrationInstructions } : {}),
-        modelSettings: stepModelSettings(),
-        signal: AbortSignal.timeout(HOST_STOP_NARRATION_BUDGET_MS),
-        stream: false,
-      });
-      const spoken = step.toolCalls.length === 0 ? step.text.trim() : '';
-      if (!spoken) return outcome;
-      try {
-        appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
-          data: { kind: 'host_stop_narrated', sourceUserSeq: identity.sourceUserSeq,
-            reason: outcome.terminal && 'reason' in outcome.terminal ? outcome.terminal.reason ?? null : null } });
-      } catch { /* diagnostics never change a terminal */ }
-      return { ...outcome, finalOutput: retained ? `${spoken}\n\n${retained}` : spoken };
+      if (signal?.aborted || isKillRequested(identity.sessionId, killTarget)) return outcome;
+      return await runOwnedHostStopNarration({
+        signal,
+        deadlineMs: HOST_STOP_NARRATION_BUDGET_MS,
+        assertOwned: () => {
+          const current = exactHostIdentity();
+          if (current.sessionId !== identity.sessionId || current.sourceUserSeq !== identity.sourceUserSeq
+            || harnessRunContextStorage.getStore()?.runAttemptId !== ambient?.runAttemptId) {
+            throw new HostCallAuthorityBoundaryError('accepted_source_context_mismatch');
+          }
+          assertRecoveryActivationOwned();
+          assertDispatchLeaseCurrent(ambient?.dispatchLease);
+        },
+        isStopped: () => isKillRequested(identity.sessionId, killTarget),
+        work: async (narrator) => withHarnessRunContext({ ...ambient, callerCancelSignal: narrator.signal }, async () => {
+          const full = typeof outcome.finalOutput === 'string' ? outcome.finalOutput : '';
+          const headerAt = full.indexOf(RETAINED_WORK_TERMINAL_HEADER);
+          let fact = (headerAt >= 0 ? full.slice(0, headerAt) : full).trim();
+          const retained = headerAt >= 0 ? full.slice(headerAt).trim() : '';
+          if (!fact) return outcome;
+          if (fact.startsWith(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT)) {
+            // The ledger, not the runner's generic copy, says whether anything
+            // outside this machine could have run (delivery-committer reads the
+            // same truth for the fixed copy).
+            const committer = await import('./delivery-committer.js');
+            const { completionEvidenceSource } = await import('./recovery-activation.js');
+            if (committer.acceptedSourceHasZeroExternalEffectSurface(completionEvidenceSource(identity))) {
+              fact = committer.HOST_LOCAL_FAILURE_BLOCKED_TEXT;
+            }
+          }
+          let narrationInput = structuredClone(history);
+          let narrationInstructions = await resolveInstructions();
+          if (inputFilter) {
+            const filtered = await inputFilter({
+              modelData: {
+                input: structuredClone(history),
+                ...(narrationInstructions !== undefined ? { instructions: narrationInstructions } : {}),
+              },
+              agent,
+              context: contextValue,
+              advertisedTools: [],
+              holdReading: () => { /* the narration step publishes no prompt reading */ },
+            });
+            if (!filtered || !Array.isArray(filtered.input)) return outcome;
+            narrationInput = structuredClone(filtered.input);
+            if (typeof filtered.instructions !== 'undefined') narrationInstructions = filtered.instructions;
+          }
+          narrationInput.push({
+            role: 'system',
+            content: hostStopNarrationDirective(fact, (outcome as HostRunOutcome).blockedDetail),
+          } as AgentInputItem);
+          const narrationSettings = stepModelSettings();
+          const hostProjection = canonicalPromptCacheRequest({
+            ...(narrationInstructions !== undefined ? { systemInstructions: narrationInstructions } : {}),
+            input: narrationInput, modelSettings: narrationSettings,
+            tools: [], toolsExplicitlyProvided: true, outputType: 'text', handoffs: [], tracing: false,
+          });
+          let requestOrdinal: number | undefined;
+          // One tool-less request on the same selected model/account, outside
+          // checkpoint recovery. The adapter remains the sole usage recorder.
+          const step = await withModelUsageAttribution({
+            sessionId: identity.sessionId,
+            sourceUserSeq: identity.sourceUserSeq,
+            ...(ambient?.runAttemptId ? { attemptId: ambient.runAttemptId } : {}),
+            role: 'brain', channel: 'narrator:stop', ownRequest: true,
+          }, () => codexOneStep({
+            input: narrationInput,
+            tools: [],
+            ...(modelId !== undefined ? { modelId } : {}),
+            ...(resolveModel ? { resolveModel } : {}),
+            ...(narrationInstructions !== undefined ? { systemInstructions: narrationInstructions } : {}),
+            modelSettings: narrationSettings,
+            signal: narrator.signal,
+            stream: false,
+            beforeModelDispatch: (request) => {
+              narrator.assertCurrent();
+              if (outerBudget) assertSourceBudgetBeforeModel(outerBudget.policy,
+                (carriedProgress?.activation.elapsedMs ?? 0) + Math.max(0, Date.now() - connectionActivationStartedAt));
+              requestOrdinal = recordModelRequestDispatchProvenance({
+                sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, request, hostProjection,
+              }).record.requestOrdinal;
+              narrator.assertCurrent();
+            },
+          }));
+          narrator.assertCurrent();
+          const spoken = step.toolCalls.length === 0 ? step.text.trim() : '';
+          if (!spoken) return outcome;
+          try {
+            appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+              data: { kind: 'host_stop_narrated', sourceUserSeq: identity.sourceUserSeq,
+                ...(ambient?.runAttemptId ? { runAttemptId: ambient.runAttemptId } : {}),
+                requestOrdinal,
+                reason: outcome.terminal && 'reason' in outcome.terminal ? outcome.terminal.reason ?? null : null } });
+          } catch { /* diagnostics never change a terminal */ }
+          return { ...outcome, finalOutput: retained ? `${spoken}\n\n${retained}` : spoken };
+        }),
+      }) ?? outcome;
     } catch {
       return outcome;
     }

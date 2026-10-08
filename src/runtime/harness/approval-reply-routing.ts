@@ -3,7 +3,7 @@ import { approvalCallPreview } from './approval-call-preview.js';
 import { approvalPreviewProjection } from './public-presentation.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { APPROVAL_REPLY_SURE, classifyApprovalReplyWithJev } from '../jev/control-plane.js';
-import { approvalReplyTargets, parseApprovalIntent } from './approval-intent.js';
+import { approvalReplyTargets, parseApprovalIntent, parseWaitingApprovalReplyIntent } from './approval-intent.js';
 import { selectAddressedApproval } from './approval-addressing.js';
 import { appendEvent, openEventLog } from './eventlog.js';
 
@@ -19,11 +19,23 @@ export interface ApprovalReplyRoute {
    * message · message_id: AAMk…" scored approves 0.70, fell through to a
    * fresh turn, and that turn minted an identical card — four times over. */
   confirm?: { approvalId: string; leaning: 'approves' | 'declines' | 'unread'; question: string };
+  /** A complete unaddressed decision with several cards asks for a target;
+   * it carries no decision authority for any member. */
+  inquiry?: { approvalIds: string[]; decision: 'approve' | 'reject' };
 }
 
 /** A reading that leans one way is worth a one-line confirmation; below this
  * the reply is conversation. */
 export const APPROVAL_REPLY_LEANING = 0.5;
+
+/** A target question carries no decision. Identical titles remain separate
+ * cards; only a later explicit card choice can authorize their payload. */
+export function approvalInquiryQuestion(rows: readonly Pick<approvalRegistry.PendingApprovalRow, 'approvalId' | 'subject'>[], decision: 'approve' | 'reject'): { question: string; options: string[] } {
+  const options = rows.map(row => `${decision} ${row.approvalId}`);
+  const choices = rows.map((row, index) => `${options[index]} — ${row.subject}`);
+  return { question: `Several cards are waiting. Which exact card do you want to ${decision === 'approve' ? 'approve' : 'decline'}? I haven't approved or rejected any of them.\n${choices.join('\n')}`,
+    options };
+}
 
 /** The card's own words — the question Clem asked and why — as recorded when
  * the card was shown. The registry row keeps the call; the chat event keeps
@@ -136,12 +148,11 @@ export async function routeReplyToPendingApproval(input: {
   // Defend against callers retaining an old prefix-based parser. Returning
   // null from those callers would restore the unsafe supplied decision.
   const fallback: ApprovalReplyRoute | null = input.parsed ? { intent: null } : null;
-  const exact = parseApprovalIntent(text);
-  if (exact && input.parsed) {
+  const exact = parseWaitingApprovalReplyIntent(text);
+  if (exact?.approvalId && input.parsed) {
     return exact.decision === input.parsed.decision && exact.approvalId === input.parsed.approvalId
       ? null : fallback;
   }
-  if (exact?.decision === 'approve') return null;
   if (!text) return fallback;
   try {
     const targets = approvalReplyTargets(text);
@@ -151,8 +162,15 @@ export async function routeReplyToPendingApproval(input: {
     // Select before inspecting executor support: a queued card is still a
     // competing target, and an explicit missing ID must never select another.
     const selected = selectAddressedApproval(waiting, targets[0]);
+    if (exact && !exact.approvalId && targets.length === 0 && selected.kind === 'ambiguous') {
+      return { intent: null, inquiry: { approvalIds: selected.rows.map(row => row.approvalId).sort(), decision: exact.decision } };
+    }
     if (selected.kind !== 'selected') return fallback;
     const row = selected.row;
+    if (exact && input.parsed) {
+      return exact.decision === input.parsed.decision && exact.approvalId === input.parsed.approvalId
+        ? null : fallback;
+    }
     // A queued exact payload (a shell command, a send) is approved or
     // declined in words like any other card; the resume compiles the owner's
     // decision as the control source it is. A change is never applied in
@@ -161,8 +179,8 @@ export async function routeReplyToPendingApproval(input: {
     // (owner-approved design, 2026-10-07; see resolveQueuedCardAsChanged).
     // Mobile supplies no parsed intent for bare declines. Preserve that
     // control after target selection without spending a semantic model call.
-    if (exact?.decision === 'reject') {
-      return { intent: { decision: 'reject', approvalId: row.approvalId } };
+    if (exact) {
+      return { intent: { decision: exact.decision, approvalId: row.approvalId } };
     }
     const reading = await classifyApprovalReplyWithJev(
       { pending: describePendingApproval(row), reply: text },

@@ -5,7 +5,7 @@ import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
 import { captureFreshSourceSessionContext } from '../runtime/harness/source-session-context.js';
 import { activateConnectionExecution } from '../runtime/harness/connection-execution-activation.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
-import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
+import { ApprovalControlBindingUnavailable, commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { claimPlanExecutionIngress, inspectPlanExecutionIngress, preflightPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, withReviewedPlanExecuteAdmission, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
@@ -458,7 +458,7 @@ import { HarnessSession } from '../runtime/harness/session.js';
 import { stopExactHarnessAttempt } from '../runtime/harness/stop-exact-attempt.js';
 import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconcile.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
-import { approvalConfirmationAlreadyAsked, resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
+import { approvalConfirmationAlreadyAsked, approvalInquiryQuestion, resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
 import { approvalArgsWithFieldEdits } from '../runtime/harness/approval-call-preview.js';
 import { applyQueuedCardFieldEdits, queuedCardEditsFrom } from '../runtime/harness/approval-card-edit.js';
 import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-source-session-branch.js';
@@ -3607,17 +3607,34 @@ function tryCommitLiveApprovalControl(input: {
    * listener runs the stored action under its own source, exactly as the
    * card button does. The parked re-drive is never entered for it. */
   queuedEligible?: boolean;
+  inquiry?: { approvalIds: string[]; decision: 'approve' | 'reject' };
+  inquiryEligible?: boolean;
 }): Record<string, unknown> | null {
   const result = commitLiveApprovalControl({
     sessionId: input.sessionId, requestId: input.requestId,
     runId: `desktop:${harnessChatStableDigest(input.requestId).slice(0, 40)}`,
     inputHash: input.inputHash, text: input.text,
     prepare: () => {
+      if (input.inquiry && input.inquiryEligible) {
+        const ids = input.inquiry.approvalIds;
+        const rows = ids.map(id => approvalRegistry.get(id));
+        if (rows.some(row => !row || row.sessionId !== input.sessionId || !approvalRegistry.isActionable(row))) {
+          throw new ApprovalControlBindingUnavailable();
+        }
+        const { question, options } = approvalInquiryQuestion(rows as approvalRegistry.PendingApprovalRow[], input.inquiry.decision);
+        return { inquiryCardIds: ids, sourceData: { approvalInquiry: input.inquiry }, commit: (source) => {
+          appendHarnessEvent({ sessionId: input.sessionId, turn: source.turn, role: 'Clem', type: 'awaiting_user_input',
+            data: { sourceUserSeq: source.seq, reason: 'approval_choice_required', question, options, approvalIds: ids } });
+          commitConsoleTerminal({ identity: { sessionId: input.sessionId, turn: source.turn, sourceUserSeq: source.seq },
+            text: question, status: 'needs_input', legacyReason: 'awaiting_user_input', metadata: { steps: 0 } });
+        } };
+      }
       if (input.confirm && input.confirmEligible) {
         const confirm = input.confirm;
         const row = approvalRegistry.get(confirm.approvalId);
         if (!row || !approvalRegistry.isActionable(row) || approvalConfirmationAlreadyAsked(input.sessionId, confirm.approvalId)) return null;
         return {
+          pausedCardId: confirm.approvalId,
           sourceData: { approvalId: confirm.approvalId, confirm: confirm.leaning },
           commit: (source) => {
             const options = ['Yes', 'No'];
@@ -3633,7 +3650,7 @@ function tryCommitLiveApprovalControl(input: {
           },
         };
       }
-      if (!input.eligible || !input.intent) return null;
+      if (!input.intent || (!input.eligible && !input.queuedEligible)) return null;
       const intent = input.intent;
       if (intent.approvalId && getBackgroundTaskByApprovalId(intent.approvalId)?.status === 'awaiting_approval') {
         return null;
@@ -3656,17 +3673,15 @@ function tryCommitLiveApprovalControl(input: {
           // armed authority and went silent — no terminal, nothing ran. The
           // card button never takes that path: it resolves the row and the
           // registry listener runs the stored action. Do the same here.
-          // Only a decline is resolved here for now: approving a chat-queued
-          // action runs it through the turn's expected-work graph, which
-          // fails `not_action` on a question turn and strands an attempt
-          // (live 2026-10-06, twice). An approve waits for that executor.
-          // A decline is never answered here: the registry branch closes the
-          // row and the brain answers the owner (owner 2026-10-08).
+          // An exact approval releases only the saved action after its card
+          // binding is verified. A decline retains the existing registry and
+          // conversational path so the owner receives the appropriate reply.
           if (intent.decision === 'reject') return null;
           if (!input.queuedEligible) return null;
           const preflight = exactPendingActionApprovalPreflight(row, intent.decision);
           if (preflight.kind !== 'ok') return null;
           return {
+            pausedCardId: row.approvalId,
             sourceData: { approvalId: row.approvalId, decision: intent.decision, queued: preflight.pendingActionId },
             commit: (source, resolveDecision) => {
               const result = resolveDecision(row.approvalId,
@@ -3686,6 +3701,7 @@ function tryCommitLiveApprovalControl(input: {
         // wait only needs a registry decision; it must not acquire another lease.
         if (parked) return null;
       }
+      if (!input.eligible) return null;
       return {
         sourceData: row ? { approvalId: row.approvalId, decision: intent.decision } : {},
         commit: (source, resolveDecision) => {
@@ -17043,6 +17059,14 @@ export function registerConsoleRoutes(
       res.status(409).json({ error: 'client request id is already bound to different input' });
       return;
     }
+    if (priorReceipt) {
+      // A committed card control owns its own terminal, not an execution
+      // attempt. Rejoin it before reclassifying a reply or ordinary admission.
+      const replay = tryCommitLiveApprovalControl({ sessionId: priorReceipt.sessionId,
+        requestId: requestIdentity.requestId, inputHash: payloadHash, text: input,
+        eligible: false, intent: null });
+      if (replay) { res.status(202).json(replay); return; }
+    }
 
     if (connectionContext) {
       try {
@@ -17271,6 +17295,7 @@ export function registerConsoleRoutes(
     let intent = parsedIntent;
     let approvalChangeRequest: string | undefined;
     let approvalConfirm: { approvalId: string; leaning: 'approves' | 'declines' | 'unread'; question: string } | undefined;
+    let approvalInquiry: { approvalIds: string[]; decision: 'approve' | 'reject' } | undefined;
     // Registry-owned cards (a chat turn waiting on a work_call) get the same
     // reading as an SDK interrupt. Live 2026-10-05: "Yes, delete it." to a
     // waiting delete card was never read, started a fresh turn on a successor
@@ -17281,11 +17306,13 @@ export function registerConsoleRoutes(
       if (routed) {
         intent = routed.intent;
         approvalChangeRequest = routed.changeRequest;
+        approvalInquiry = routed.inquiry;
         // A reply Jev could not read at all asks the card's question back
         // only when the card's turn is PAUSED on it — where a fresh turn
         // would branch away from the card. A live, in-flight owner takes the
         // words as a steer instead, as it always did.
-        approvalConfirm = routed.confirm?.leaning === 'unread' && !isPausedOnApproval ? undefined : routed.confirm;
+        approvalConfirm = routed.confirm?.leaning === 'unread' && !isPausedOnApproval
+          && getActiveHarnessRunAttempt(cardSessionId) !== null ? undefined : routed.confirm;
         // A change in words on a queued exact payload: the card is resolved
         // as changed and the owner's words run as this turn, whose fresh
         // card names the one it revises. Live 2026-10-07 ("Yes, but add -v"):
@@ -17298,7 +17325,7 @@ export function registerConsoleRoutes(
         }
       }
     }
-    if ((intent || approvalConfirm) && cardSessionId !== sessionId) {
+    if ((intent || approvalConfirm || approvalInquiry) && cardSessionId !== sessionId) {
       // The decision belongs to the card's conversation. From here on the
       // request IS the reply typed in that session, so every door below —
       // the live control, the paused resume, the exact-card selection — finds
@@ -17323,9 +17350,13 @@ export function registerConsoleRoutes(
         // A leaning reply asks the card's question back whether the card's
         // turn is parked on a checkpoint or waiting in the registry; it only
         // writes the question, never a decision or a new turn.
-        ...(approvalConfirm ? { confirm: approvalConfirm, confirmEligible: !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0 } : {}) });
+        ...(approvalConfirm ? { confirm: approvalConfirm, confirmEligible: !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0 } : {}),
+        ...(approvalInquiry ? { inquiry: approvalInquiry, inquiryEligible: !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0 } : {}) });
       if (control) { res.status(202).json(control); return; }
     } catch (error) {
+      if (error instanceof ApprovalControlBindingUnavailable) {
+        res.status(409).json({ error: error.message, code: 'APPROVAL_CONTROL_BINDING_UNAVAILABLE' }); return;
+      }
       console.error('live approval control could not commit:', error);
       res.status(500).json({ error: PUBLIC_RUN_FAILURE_TEXT });
       return;

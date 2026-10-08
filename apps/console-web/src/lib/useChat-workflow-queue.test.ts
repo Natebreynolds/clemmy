@@ -120,4 +120,7 @@ test('desktop parent Stop receipt keeps waiting child truth and cannot replace a
   assert.equal(lateAck.text, finished.text);
   assert.equal(lateAck.status, finished.status);
   assert.equal(lateAck.workflowLive, undefined);
+  assert.equal(applyChatStopReceipt(finished, partial, target), finished,
+    'a late partial Stop receipt cannot attach stale child warnings to a canonical terminal');
+  assert.equal(applyChatStopReceipt(finished, readChatStopReceipt({ ok: false }), target), finished);
 });
