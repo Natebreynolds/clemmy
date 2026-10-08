@@ -1,16 +1,16 @@
 import assert from 'node:assert/strict';
-import { linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { createCredentialFilePolicy, CredentialStoragePrivacyError } from './credential-private-filesystem.js';
+import { createCredentialFilePolicy, CREDENTIAL_ACL_REUSE_MS, CredentialStoragePrivacyError } from './credential-private-filesystem.js';
 
 function fixture(run: (root: string) => void): void {
   const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'clem-credential-policy-')));
   try { run(root); } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
-test('retained credential bytes and identity survive repeated current-permission reads', () => fixture(root => {
+test('retained credential bytes and identity survive repeated reads that reuse one unchanged observation', () => fixture(root => {
   const target = path.join(root, "retained & ' café 日本語.json"); const bytes = '{"grant":"synthetic retained"}\n';
   writeFileSync(target, bytes); const before = lstatSync(target, { bigint: true }); let observations = 0;
   const policy = createCredentialFilePolicy({ platform: 'win32', checkAcl: (file, identity, kind, harden, options) => {
@@ -20,9 +20,71 @@ test('retained credential bytes and identity survive repeated current-permission
   } });
   assert.equal(policy.readCredentialFileSync(target), bytes);
   assert.equal(policy.readCredentialFileSync(target), bytes);
-  assert.equal(observations, 4, 'each retained read observes current file permissions before and after bytes');
+  assert.equal(observations, 1, 'an unchanged file is observed once, not before and after every read');
   const after = lstatSync(target, { bigint: true });
   assert.equal(after.ino, before.ino); assert.equal(after.mtimeNs, before.mtimeNs); assert.equal(after.ctimeNs, before.ctimeNs);
+}));
+
+function countingPolicy(clock: { now: number }, refuse: (file: string) => boolean = () => false) {
+  const observed: string[] = []; const hardened: string[] = [];
+  const policy = createCredentialFilePolicy({ platform: 'win32', now: () => clock.now, checkAcl: (file, _identity, kind, harden) => {
+    (harden ? hardened : observed).push(`${kind}:${path.basename(file)}`);
+    if (refuse(file)) throw new Error('synthetic weak ACL');
+  } });
+  return { policy, observed, hardened };
+}
+
+test('an unchanged credential reuses its observation inside the window and is observed again after it', () => fixture(root => {
+  const target = path.join(root, 'vault.json'); writeFileSync(target, '{"grant":"synthetic"}');
+  const clock = { now: 1_000 }; const { policy, observed } = countingPolicy(clock);
+  for (let read = 0; read < 50; read += 1) assert.equal(policy.readCredentialFileSync(target), '{"grant":"synthetic"}');
+  assert.deepEqual(observed, [`directory:${path.basename(root)}`, 'file:vault.json'], 'fifty reads of an unchanged file launch two observations');
+  clock.now += CREDENTIAL_ACL_REUSE_MS - 1; policy.readCredentialFileSync(target);
+  assert.equal(observed.length, 2, 'still inside the window');
+  clock.now += 1; policy.readCredentialFileSync(target);
+  assert.deepEqual(observed.slice(2), [`directory:${path.basename(root)}`, 'file:vault.json'], 'the window bounds how long a broadened directory or file can go unobserved');
+}));
+
+test('a changed file, a changed change time and a replaced directory are observed again at once', () => fixture(root => {
+  const state = path.join(root, 'state'); mkdirSync(state); const target = path.join(state, 'vault.json');
+  writeFileSync(target, '{"grant":"one"}');
+  const clock = { now: 1_000 }; const { policy, observed } = countingPolicy(clock);
+  policy.readCredentialFileSync(target); observed.length = 0;
+  writeFileSync(target, '{"grant":"two, longer"}');
+  assert.equal(policy.readCredentialFileSync(target), '{"grant":"two, longer"}');
+  assert.deepEqual(observed, ['file:vault.json'], 'new bytes are observed again; the unchanged directory is reused');
+  if (process.platform !== 'win32') {
+    // A permission change moves only the change time. NTFS does the same for
+    // an ACL edit; the real-ACL qualification pins that on Windows.
+    observed.length = 0; chmodSync(target, 0o640);
+    policy.readCredentialFileSync(target);
+    assert.deepEqual(observed, ['file:vault.json'], 'a metadata-only change is observed again');
+  }
+  observed.length = 0;
+  renameSync(state, path.join(root, 'state-aside')); mkdirSync(state); writeFileSync(target, '{"grant":"replacement"}');
+  assert.equal(policy.readCredentialFileSync(target), '{"grant":"replacement"}');
+  assert.deepEqual(observed, ['directory:state', 'file:vault.json'], 'a different directory object is never covered by the old observation');
+}));
+
+test('a refused observation is never reused, and hardening is never skipped', () => fixture(root => {
+  const target = path.join(root, 'vault.json'); writeFileSync(target, '{"grant":"synthetic"}');
+  let weak = true; const clock = { now: 1_000 };
+  const { policy, observed, hardened } = countingPolicy(clock, file => weak && file === target);
+  assert.throws(() => policy.readCredentialFileSync(target), CredentialStoragePrivacyError);
+  assert.throws(() => policy.readCredentialFileSync(target), CredentialStoragePrivacyError, 'a refusal is observed again, never remembered as safe');
+  assert.equal(observed.filter(entry => entry === 'file:vault.json').length, 2);
+  weak = false;
+  assert.equal(policy.readCredentialFileSync(target), '{"grant":"synthetic"}');
+  const owned = path.join(root, 'owned', 'meta.json');
+  policy.writeCredentialFileSync(owned, '{"one":1}'); const firstHardening = hardened.length;
+  policy.writeCredentialFileSync(owned, '{"two":2}');
+  assert.ok(firstHardening > 0 && hardened.length > firstHardening, 'every write hardens its own temporary file');
+}));
+
+test('a missing credential reuses the observation of its unchanged parent', () => fixture(root => {
+  const clock = { now: 1_000 }; const { policy, observed } = countingPolicy(clock);
+  for (let read = 0; read < 20; read += 1) assert.equal(policy.readCredentialFileSync(path.join(root, 'auth.json')), undefined);
+  assert.deepEqual(observed, [`directory:${path.basename(root)}`]);
 }));
 
 test('new dedicated directories and empty exclusive temp are hardened before credential bytes', () => fixture(root => {

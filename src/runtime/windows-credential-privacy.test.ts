@@ -137,9 +137,14 @@ test('Windows unsafe or malformed present credentials cannot select environment/
 test('Windows later ACL broadening refuses retained bytes without repairing or selecting a source', { skip: !WINDOWS }, t => fixture(root => {
   const target = path.join(root, 'private.json'); const policy = createCredentialFilePolicy(); policy.writeCredentialFileSync(target, '{"synthetic":"private"}');
   const original = readFileSync(target);
+  // A verified observation now exists inside the reuse window; the broadening
+  // below must still be seen at once, through the file's change time.
+  assert.equal(policy.readCredentialFileSync(target), '{"synthetic":"private"}');
+  const verifiedCtime = lstatSync(target, { bigint: true }).ctimeNs;
   const script = String.raw`$ErrorActionPreference='Stop'; [Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false,$true); $p=[Console]::In.ReadToEnd(); $a=Get-Acl -LiteralPath $p; $r=[System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[System.Security.AccessControl.FileSystemRights]::ReadAndExecute,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $a`;
   const result = spawnSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { input: target, encoding: 'utf8', timeout: 10_000, maxBuffer: 4096, windowsHide: true });
   assert.equal(result.status, 0, 'synthetic broadening utility must finish');
+  assert.notEqual(lstatSync(target, { bigint: true }).ctimeNs, verifiedCtime, 'NTFS records an ACL edit in the change time the reuse window compares');
   const started = performance.now(); assert.throws(() => policy.readCredentialFileSync(target), CredentialStoragePrivacyError);
   assert.throws(() => policy.writeCredentialFileSync(target, '{}'), CredentialStoragePrivacyError);
   assert.deepEqual(readFileSync(target), original); t.diagnostic(`compiled native broadened-ACL refusal ${Math.ceil(performance.now() - started)} ms`);

@@ -203,7 +203,8 @@ function qualifiedNativeProbe(): string | null {
   } catch (cause) { throw new WindowsPrivateFilesystemError(cause); }
 }
 
-/** No permission caching: every retained read is checked against the current ACL. */
+/** Observes the current ACL on every call, never cached here. The credential
+ * policy decides when an unchanged path may reuse a verified observation. */
 export function assertWindowsPrivateFilesystem(
   target: string,
   identity: PrivateFilesystemIdentity,
@@ -233,8 +234,12 @@ export function assertWindowsPrivateFilesystem(
   // the developer's own environment. The program is fixed; nothing leaves.
   const env = native ? Object.fromEntries(Object.entries(process.env).filter(([key, value]) => value !== undefined
     && /^(?:systemroot|windir|systemdrive|comspec|pathext|temp|tmp)$/i.test(key))) : process.env;
+  // The first launch of the unsigned native probe can wait on antivirus
+  // inspection well past 2 s (installed beta 3.18.34-windows.3 refused its
+  // first boot at the first vault read; the next launch passed). A timeout
+  // is a refusal, so the bound covers that first launch.
   const result = spawnSync(command, args, { input, env, encoding: 'utf8', windowsHide: true,
-    timeout: native ? 2_000 : 10_000, maxBuffer: 4096 });
+    timeout: native ? 15_000 : 10_000, maxBuffer: 4096 });
   if (result.error || result.status !== 0 || result.stdout !== 'private-acl-ok-v2') {
     throw new WindowsPrivateFilesystemError(syntheticDiagnostic ? String(result.stderr || result.error?.message || 'no ACL receipt').slice(0, 4096) : undefined);
   }

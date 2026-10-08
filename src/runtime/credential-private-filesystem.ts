@@ -25,12 +25,43 @@ const regular = (stat: BigIntStats): boolean => stat.isFile() && !stat.isSymboli
 const same = (left: BigIntStats, right: BigIntStats): boolean => left.dev === right.dev && left.ino === right.ino
   && left.nlink === right.nlink && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 
+/** How long an unchanged path may reuse its last verified permissions. */
+export const CREDENTIAL_ACL_REUSE_MS = 30_000;
+
 /** One canonical policy for the daemon and desktop. Dependency injection only
  * qualifies host filesystem guards offline; Windows acceptance uses native ACL.
- * No credential or permission state is cached. No file is read on import. */
-export function createCredentialFilePolicy(dependencies: { platform?: NodeJS.Platform; checkAcl?: AclCheck } = {}) {
+ * No credential bytes are cached and no file is read on import.
+ *
+ * Every Windows ACL observation launches the native probe synchronously, and
+ * the daemon reads the same few credential files many times a second (.env,
+ * vault and sign-in lookups). Observing all of them on every read held the
+ * event loop through the first boot: installed beta 3.18.34-windows.3 never
+ * answered its readiness probe within 90 s and was stopped. A verified
+ * observation is therefore reused while the path is provably the same object,
+ * for at most CREDENTIAL_ACL_REUSE_MS. A file must keep its exact identity,
+ * size, write and change times; NTFS records a permission change in the
+ * change time, so a broadened file is observed again at once. A directory
+ * must keep its identity; its times move with every sibling write, so a
+ * broadened directory is observed again within the reuse window. Hardening,
+ * a refused observation and a changed identity are never reused. */
+export function createCredentialFilePolicy(dependencies: { platform?: NodeJS.Platform; checkAcl?: AclCheck; now?: () => number } = {}) {
   const windows = (dependencies.platform ?? process.platform) === 'win32';
-  const checkAcl = dependencies.checkAcl ?? assertWindowsPrivateFilesystem;
+  const observeAcl = dependencies.checkAcl ?? assertWindowsPrivateFilesystem;
+  const now = dependencies.now ?? (() => performance.now());
+  const verified = new Map<string, { at: number; stat: BigIntStats }>();
+  const checkAcl = (target: string, stat: BigIntStats, kind: 'file' | 'directory', harden = false,
+    options?: { allowInheritedPrivate?: boolean }): void => {
+    const key = `${kind}\0${options?.allowInheritedPrivate === true}\0${target}`;
+    const prior = verified.get(key);
+    verified.delete(key);
+    if (!harden && prior && now() - prior.at < CREDENTIAL_ACL_REUSE_MS && prior.stat.dev === stat.dev
+      && prior.stat.ino === stat.ino && (kind === 'directory' || same(prior.stat, stat))) {
+      verified.set(key, prior);
+      return;
+    }
+    observeAcl(target, stat, kind, harden, options);
+    if (!harden) verified.set(key, { at: now(), stat });
+  };
   const assertMissingPathParents = (directory: string, verifyNearestPrivate = true): void => {
     let current = directory;
     let nearestObserved = false;
