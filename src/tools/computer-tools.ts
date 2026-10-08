@@ -1,5 +1,6 @@
 import { READ_FILE_PARAMS } from './local-file-read-contract.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { isKillRequested } from '../runtime/harness/eventlog.js';
 import { WRITE_FILE_PARAMS } from './local-file-write-contract.js';
 import { spawn } from 'node:child_process';
 import { CLI_CATALOG } from '../integrations/cli-catalog/catalog.js';
@@ -1146,6 +1147,8 @@ interface ShellProcessRuntime {
   stopTree?: typeof stopWindowsProcessTree;
   /** Test seam: the owner's stop authority; production reads the run context. */
   cancelSignal?: AbortSignal;
+  /** Test seam: the durable Stop latch; production polls the run's kill request. */
+  isStopRequested?: () => boolean;
 }
 function runCommand(command: string, cwd: string, timeoutMs: number, runtime: ShellProcessRuntime = {}): Promise<ShellCommandResult> {
   assertCommandAllowed(command);
@@ -1189,6 +1192,7 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
     const timeout = setTimeout(async () => {
       if (settled) return;
       settled = true;
+      if (stopPoll) clearInterval(stopPoll);
       let timeoutCleanup: 'complete' | 'incomplete' | undefined;
       if (windows) {
         // shell:true wraps the real command in cmd.exe; SIGTERM kills only the
@@ -1224,11 +1228,24 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
     // as stopped, so the next turn reads "the owner stopped it", never an
     // unknown effect to reconcile (live 2026-10-08: a stopped 90 s count was
     // still alive afterwards and the brain re-ran it to "find out").
+    // Two ways the Stop arrives: the step's cancel signal while a model step
+    // is live, and the durable kill latch the Stop button writes, which is the
+    // only one still standing once the step that called this tool returned
+    // (live 2026-10-08: a stopped 90 s loop was alive 20 s later, its parent
+    // the daemon). The latch is polled exactly like the host's model step.
     const cancelSignal = runtime.cancelSignal ?? harnessRunContextStorage.getStore()?.callerCancelSignal;
+    const ambient = harnessRunContextStorage.getStore();
+    const stopRequested = runtime.isStopRequested ?? (ambient?.sessionId
+      ? () => isKillRequested(ambient.sessionId, ambient.runAttemptId
+        ? { attemptId: ambient.runAttemptId, sourceUserSeq: ambient.sourceUserSeq }
+        : ambient.sourceUserSeq ? { sourceUserSeq: ambient.sourceUserSeq } : undefined)
+      : undefined);
+    let stopPoll: ReturnType<typeof setInterval> | undefined;
     const onOwnerStop = (): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      if (stopPoll) clearInterval(stopPoll);
       if (windows) {
         void (runtime.stopTree ?? stopWindowsProcessTree)(child).catch(() => { try { child.kill('SIGKILL'); } catch { /* already exited */ } });
       } else if (child.pid) {
@@ -1246,7 +1263,16 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
     };
     if (cancelSignal?.aborted) onOwnerStop();
     else cancelSignal?.addEventListener('abort', onOwnerStop, { once: true });
-    const releaseOwnerStop = (): void => { cancelSignal?.removeEventListener('abort', onOwnerStop); };
+    if (stopRequested && !settled) {
+      stopPoll = setInterval(() => {
+        try { if (stopRequested()) onOwnerStop(); } catch { /* the deadline still bounds the command */ }
+      }, 250);
+      stopPoll.unref?.();
+    }
+    const releaseOwnerStop = (): void => {
+      cancelSignal?.removeEventListener('abort', onOwnerStop);
+      if (stopPoll) clearInterval(stopPoll);
+    };
 
     child.stdout.on('data', (chunk) => {
       stdout = appendCapturedOutput(stdout, String(chunk));

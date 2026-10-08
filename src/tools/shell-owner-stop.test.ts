@@ -52,3 +52,28 @@ test('a command that finishes releases the stop listener and resolves normally',
     rmSync(fixture, { recursive: true, force: true });
   }
 });
+
+test('the durable Stop latch ends a running command after the model step that called it is gone', { skip: process.platform === 'win32' }, async () => {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), 'clem-shell-owner-stop-'));
+  let latched = false;
+  let child: ChildProcess | undefined;
+  const runtime = {
+    isStopRequested: () => latched,
+    spawnProcess: ((command: string, options: never) => { child = spawn(command, options); return child; }) as typeof spawn,
+  };
+  try {
+    const running = tools._testOnly_runShellCommand('for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do echo $i; sleep 1; done', fixture, 60_000, runtime);
+    await pause(400);
+    assert.ok(child?.pid, 'the command started');
+    latched = true;
+    await assert.rejects(running, (error: unknown) => {
+      assert.equal((error as { outcome?: { errorKind?: string } }).outcome?.errorKind, 'owner_stopped');
+      return true;
+    });
+    await pause(300);
+    assert.ok(child!.exitCode !== null || child!.signalCode !== null, 'the latch ended the process group');
+  } finally {
+    try { if (child?.pid) process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
