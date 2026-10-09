@@ -701,7 +701,11 @@ export class DaemonSupervisor {
     // vouch for the process replacing it.
     try { rmSync(this.livenessBeaconFile(), { force: true }); } catch { /* best effort */ }
     rotateSupervisorLogIfNeeded(this.opts.logFile, supervisorLogMaxBytes());
-    this.logStream = createWriteStream(this.opts.logFile, { flags: 'a' });
+    const logStream = createWriteStream(this.opts.logFile, { flags: 'a' });
+    // The log is best-effort: a missing folder, a full disk or a permission
+    // change must never become an uncaught error in the app's main process.
+    logStream.on('error', () => { if (this.logStream === logStream) this.logStream = null; });
+    this.logStream = logStream;
     this.logStream.write(`\n=== Daemon started ${new Date().toISOString()} on port ${this.chosenPort} ===\n`);
 
     // emit() is the SINGLE writer of log events to supervisor.log — writing

@@ -37,7 +37,7 @@ async function flush() {
   for (let i = 0; i < 5; i++) await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
-function fixture(t: TestContext) {
+function fixture(t: TestContext, opts: { logInMissingFolder?: boolean } = {}) {
   const root = mkdtempSync(path.join(os.tmpdir(), 'clem-supervisor-lifecycle-'));
   mkdirSync(path.join(root, 'dist'));
   writeFileSync(path.join(root, 'dist/index.js'), '// process boundary is mocked\n');
@@ -57,7 +57,7 @@ function fixture(t: TestContext) {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_000_000 });
   const supervisor = new DaemonSupervisor({
     daemonProjectRoot: root, preferredPort: 0,
-    logFile: path.join(root, 'supervisor.log'), onEvent: (event) => events.push(event),
+    logFile: path.join(opts.logInMissingFolder ? path.join(root, 'no-such-folder') : root, 'supervisor.log'), onEvent: (event) => events.push(event),
   });
   t.after(async () => {
     for (const child of children) child.holdTermination = false;
@@ -218,4 +218,17 @@ test('stable uptime decays the budget once and cannot be reused by failed replac
   assert.equal(f.events.filter((e) => e.type === 'restart-counter-reset').length, 1);
   assert.deepEqual(f.events.filter((e) => e.type === 'restart-scheduled').at(-1),
     { type: 'restart-scheduled', delayMs: 2000, attempt: 2 });
+});
+
+test('a supervisor log it cannot open is dropped, never an uncaught error in the app', async (t) => {
+  const f = fixture(t, { logInMissingFolder: true });
+  await f.supervisor.start();
+  // Let the log file's failed open reach its stream inside this test.
+  const { access } = await import('node:fs');
+  for (let i = 0; i < 5; i++) await new Promise<void>((resolve) => access(f.root, () => resolve()));
+  await flush();
+  assert.equal(f.events.filter((e) => e.type === 'ready').length, 1, 'the daemon still starts');
+  // A write stream with no error listener throws its failure into the process.
+  const stream = (f.supervisor as unknown as { logStream: import('node:fs').WriteStream | null }).logStream;
+  assert.ok(stream === null || stream.listenerCount('error') > 0, 'the log stream handles its own failures');
 });
