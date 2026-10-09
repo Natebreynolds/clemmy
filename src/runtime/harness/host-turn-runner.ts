@@ -1276,6 +1276,20 @@ export function hostCarrierInnerJsonRepair(name: string, problem: string): strin
     + ' If the arguments carry HTML or quoted text, escape it correctly or shorten the body; do not switch operations or report a provider error.';
 }
 
+/** A work_call missing its own `name` while its requirement_id selects one
+ * local operation: name that operation, so a single retry repairs the call
+ * instead of a discovery detour. Naming it grants nothing; every gate still
+ * runs on the next call. */
+export function carrierMissingNameRepair(name: string, args: unknown): string | null {
+  if (name !== 'work_call') return null;
+  const record = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : null;
+  if (!record || (typeof record.name === 'string' && record.name.trim())) return null;
+  const requirement = typeof record.requirement_id === 'string' ? record.requirement_id.trim() : '';
+  const local = /^cap:local:([a-z][a-z0-9_]*):[a-z0-9_-]+$/i.exec(requirement);
+  if (!local) return null;
+  return `Tool 'work_call' was refused before dispatch: its own \`name\` is missing. Set name to "${local[1]}", the operation requirement_id ${requirement} selects, and keep args_json to that operation's own arguments. No local or external mutation was attempted.`;
+}
+
 export function hostProvenOperationRepair(input: {
   requestedOperation: string;
   provenOperations: readonly string[];
@@ -6785,6 +6799,8 @@ const runHostTurnBody = async (
         const problem = carrierInnerJsonProblem(args ?? parsedArgs(argumentsJson));
         if (problem) return hostCarrierInnerJsonRepair(name, problem);
       }
+      const missingName = carrierMissingNameRepair(name, args ?? parsedArgs(argumentsJson));
+      if (missingName) return missingName;
       if (lastExactProductionMiss === OFF_MACHINE_CALL_NEEDS_CARD) {
         const effective = unwrapRuntimeEffectiveToolIdentity(name, args ?? parsedArgs(argumentsJson));
         return offMachineCallNeedsCardRepair(name, effective.toolName?.trim() ?? '', effective.args);
