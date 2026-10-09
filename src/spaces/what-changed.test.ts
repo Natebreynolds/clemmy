@@ -40,6 +40,16 @@ test('row identity is found by shape: any casing of the usual names, or a field 
   assert.deepEqual(rowCounts(persisting), { added: 1, changed: 1, removed: 0, other: 0, more: false });
 });
 
+test('a secret-like field is never a row identity, so its values never enter change paths', () => {
+  const diff = diffWorkspaceObservationDocuments(
+    { sessions: [{ accessToken: 'tok-aaa-111', apiKey: 'k-1', label: 'One' }, { accessToken: 'tok-bbb-222', apiKey: 'k-2', label: 'Two' }] },
+    { sessions: [{ accessToken: 'tok-aaa-111', apiKey: 'k-1', label: 'One!' }, { accessToken: 'tok-bbb-222', apiKey: 'k-2', label: 'Two' }] },
+  );
+  const rendered = JSON.stringify(diff);
+  assert.doesNotMatch(rendered, /tok-aaa-111|tok-bbb-222|k-1|k-2/);
+  assert.ok(diff.changes.every((change) => !change.entityKey || !/token|apikey/i.test(change.entityKey)));
+});
+
 test('a Space reports each collection\'s last real change, not its last refresh', async () => {
   const slug = 'post-queue';
   store.spaceStore.save({ id: slug, title: 'Post queue', viewContent: '<p>queue</p>' });

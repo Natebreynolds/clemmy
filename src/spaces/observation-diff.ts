@@ -75,7 +75,10 @@ function uniqueFieldValues(rows: unknown[], field: string): string[] | null {
 function inferredStableKey(before: unknown[], after: unknown[]): string | null {
   const rows = [...before, ...after];
   if (rows.length === 0 || !rows.every(isRecord)) return null;
-  const fields = [...new Set(rows.flatMap((row) => Object.keys(row as Record<string, unknown>)))];
+  // A row's identity is written into change paths and entity keys, so a
+  // secret-like field is never chosen, however well it would identify a row.
+  const fields = [...new Set(rows.flatMap((row) => Object.keys(row as Record<string, unknown>)))]
+    .filter((field) => !isSecretLikeKey(field));
   const qualifies = (field: string): Set<string> | null => {
     const beforeValues = uniqueFieldValues(before, field);
     const afterValues = uniqueFieldValues(after, field);
