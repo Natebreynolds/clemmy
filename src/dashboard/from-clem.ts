@@ -13,6 +13,12 @@
  */
 import { createHash } from 'node:crypto';
 import type { NotificationRecord } from '../runtime/notifications.js';
+import { isWorkflowReport } from '../runtime/notification-intent.js';
+
+/** notify_user's own limit on what a report says. */
+export const REPORT_MAX_CHARS = 2_000;
+/** A report older than this stays in the inbox: news, not a backlog. */
+export const REPORT_FRESH_MS = 3 * 24 * 60 * 60 * 1000;
 
 export interface FromClemRow {
   /** Stable across polls: the underlying record's own id. */
@@ -37,6 +43,10 @@ export interface FromClemRow {
   done?: { notificationId: string };
   /** A part of Clementine Clem offers to help set up, and where it lives. */
   setup?: { ability: string; place: string; placeName: string };
+  /** The workflow run whose report this is. */
+  run?: { runId: string; workflow?: string };
+  /** Words Clem already wrote for the owner (a report); said as they are. */
+  authored?: boolean;
 }
 
 export interface FromClemPulse {
@@ -66,6 +76,8 @@ export interface FromClemInput {
   /** Rows the owner moved to later: hidden until then, still covered, so they
    *  do not reappear in Home's other lists meanwhile. */
   later?: (key: string) => boolean;
+  /** Now, for what still counts as news. */
+  now?: number;
   /** The one part Clem offers to help set up next, if any. */
   setup?: {
     ability: string; name: string; unlocks: string; detail: string;
@@ -129,6 +141,23 @@ export function buildFromClem(input: FromClemInput): FromClem {
 
   for (const notification of input.notifications) {
     if (notification.read) continue;
+    // A report a workflow run sent the owner with no chat of its own to report
+    // into (a silent one went to its chat): her words, posted as written.
+    if (isWorkflowReport(notification.metadata)) {
+      if (notification.silent || !notification.body.trim()
+        || !(Date.parse(notification.createdAt) >= (input.now ?? Date.now()) - REPORT_FRESH_MS)) continue;
+      const meta = notification.metadata ?? {};
+      const workflow = str(meta.workflow).trim();
+      rows.push({
+        key: `notif:${notification.id}`, heartbeat: 'workflow', heartbeatTitle: workflow || 'Workflow',
+        at: notification.createdAt, asks: false, text: notification.title,
+        say: notification.body.trim().slice(0, REPORT_MAX_CHARS), authored: true,
+        done: { notificationId: notification.id },
+        run: { runId: str(meta.workflowRunId), ...(workflow ? { workflow } : {}) },
+      });
+      covers.notificationIds.push(notification.id);
+      continue;
+    }
     const heartbeat = heartbeatOf(notification);
     if (!heartbeat) continue;
     rows.push({
@@ -170,7 +199,7 @@ export function buildFromClem(input: FromClemInput): FromClem {
     const voiceDigest = fromClemVoiceDigest(row);
     const said = input.voiced?.(row.key, voiceDigest);
     return { ...row, voiceDigest,
-      ...(said ? { say: said.message } : {}),
+      ...(said && !row.authored ? { say: said.message } : {}),
       ...(said?.choices?.length && row.asks ? { choices: said.choices } : {}) };
   });
   // A check that failed says when it looked, never what went wrong: the

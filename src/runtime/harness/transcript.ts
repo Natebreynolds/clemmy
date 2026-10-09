@@ -23,6 +23,10 @@ import {
   publicTaskMode,
 } from './public-presentation.js';
 
+/** The longest message of her own her thread shows: a workflow report (its
+ *  2,000-character body and title); her other messages stay far shorter. */
+export const CLEM_MESSAGE_MAX_CHARS = 2_200;
+
 /**
  * Coerce a harness event payload into the human-facing reply text.
  * `conversation_completed` data can be a string, a JSON-string, or an
@@ -320,7 +324,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     const raw = typeof event.data.text === 'string' ? event.data.text.trim() : '';
     let text = '';
     try { text = raw ? assertPublicPresentationText(raw) : ''; } catch { text = ''; }
-    if (!text || text.length > 600) continue;
+    if (!text || text.length > CLEM_MESSAGE_MAX_CHARS) continue;
     fromClem.push({ order: event.seq, turns: [{ role: 'assistant', text, createdAt: event.createdAt, fromClem: true }] });
   }
 

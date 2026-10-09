@@ -37,6 +37,7 @@ export function FromClem({ data, onChanged, onOpenThread }: {
   const [busy, setBusy] = useState<string | null>(null);
   const [notices, setNotices] = useState<Record<string, { text: string; error?: boolean }>>({});
   const [replying, setReplying] = useState<string | null>(null);
+  const [reading, setReading] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const rows = data?.rows ?? [];
   if (rows.length === 0) return null;
@@ -116,13 +117,21 @@ export function FromClem({ data, onChanged, onOpenThread }: {
   const updateRow = (row: FromClemRow) => {
     const done = Boolean(notices[row.key] && !notices[row.key]!.error);
     const notificationId = row.done?.notificationId;
+    // A report leads with its title; its text opens in place, as she wrote it.
+    const report = row.authored === true && Boolean(row.say);
+    const open = reading === row.key;
     return (
       <div key={row.key} class="home-row home-row-needs" aria-busy={busy === row.key}>
         {meta(row)}
-        <div class="home-row-title">{row.say || row.text}</div>
+        <div class="home-row-title">{report ? row.text : row.say || row.text}</div>
+        {report ? <div class={open ? 'from-clem-report' : 'from-clem-report from-clem-report-clamped'}>{row.say}</div> : null}
         {notice(row)}
         {!done ? (
           <div class="home-row-actions">
+            {report ? (
+              <button type="button" class="home-btn" aria-expanded={open}
+                onClick={() => setReading(open ? null : row.key)}>{open ? 'Show less' : 'Read'}</button>
+            ) : null}
             {notificationId ? (
               <button type="button" class="home-btn" disabled={busy !== null}
                 onClick={() => void run(row, async () => { await markInboxNotificationRead(notificationId); return 'Cleared.'; })}>Done</button>

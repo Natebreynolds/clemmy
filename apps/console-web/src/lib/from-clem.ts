@@ -20,6 +20,17 @@ export interface FromClemRow {
   done?: { notificationId: string };
   /** A part of Clementine Clem offers to help set up, and where it lives. */
   setup?: { ability: string; place: string; placeName: string };
+  /** The workflow run whose report this is. */
+  run?: { runId: string; workflow?: string };
+  /** A report she already wrote: `say` is the report itself. */
+  authored?: boolean;
+}
+
+/** Where a report's run opens, when its workflow is known. */
+export function fromClemRunHref(row: Pick<FromClemRow, 'run'>): string | null {
+  const run = row.run;
+  if (!run?.runId || !run.workflow) return null;
+  return `/automate?workflow=${encodeURIComponent(run.workflow)}&run=${encodeURIComponent(run.runId)}`;
 }
 
 export interface FromClemPulse {

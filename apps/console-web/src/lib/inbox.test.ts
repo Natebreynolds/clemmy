@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import {
   approvalDecisionSuccessText,
   collapseAttentionRows,
+  notificationRunHref,
   summarizeApprovalDecisionBatch,
   trustProposalScopeExpectation,
   type NotificationRow,
@@ -156,4 +157,10 @@ test('desktop trust decision binds the exact rendered scope revision and digest'
     scopeRevision: proposal.scopeRevision,
     scopeDigest: proposal.scopeDigest,
   });
+});
+
+test('a notification about a workflow run opens that run when it names both', () => {
+  assert.equal(notificationRunHref({ metadata: { workflowRunId: 'trigger-9', workflow: 'end-of-day' } }), '/automate?workflow=end-of-day&run=trigger-9');
+  assert.equal(notificationRunHref({ metadata: { workflowRunId: 'trigger-9' } }), null);
+  assert.equal(notificationRunHref({}), null);
 });

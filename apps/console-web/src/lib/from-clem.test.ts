@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { recentPulses, withoutFromClem } from './from-clem';
+import { fromClemRunHref, recentPulses, withoutFromClem } from './from-clem';
 
 test('Home lists leave out exactly what From Clem shows', () => {
   const items = [
@@ -23,4 +23,10 @@ test('pulses are the enabled heartbeats that have looked, newest first', () => {
     { heartbeat: 'd', title: 'D', enabled: true },
   ]);
   assert.deepEqual(pulses.map((pulse) => pulse.heartbeat), ['b', 'a']);
+});
+
+test('a report opens its own run, and only when its workflow is known', () => {
+  assert.equal(fromClemRunHref({ run: { runId: 'trigger-1', workflow: 'morning trends' } }), '/automate?workflow=morning%20trends&run=trigger-1');
+  assert.equal(fromClemRunHref({ run: { runId: 'trigger-1' } }), null);
+  assert.equal(fromClemRunHref({}), null);
 });

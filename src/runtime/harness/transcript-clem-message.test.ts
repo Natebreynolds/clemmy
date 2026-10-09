@@ -29,3 +29,12 @@ test('her own messages show in order, attributed to her; anything else wearing t
   ]);
   assert.equal(harnessPreview('clem'), 'The standup email is still waiting on you.');
 });
+
+test('a workflow report she posts reads in full; anything past a report\'s length does not', () => {
+  createSession({ id: 'clem-long', kind: 'chat', channel: 'desktop', title: 'Clem' });
+  const report = `Morning trends\n\n${'- a finding worth reading\n'.repeat(70)}`.trim();
+  assert.ok(report.length > 600 && report.length <= 2_200);
+  appendEvent({ sessionId: 'clem-long', turn: 0, role: 'Clem', type: 'clem_message', data: { version: 1, key: 'r', heartbeat: 'workflow', text: report } });
+  appendEvent({ sessionId: 'clem-long', turn: 0, role: 'Clem', type: 'clem_message', data: { version: 1, key: 'x', heartbeat: 'workflow', text: 'x'.repeat(2_201) } });
+  assert.deepEqual(reconstructHarnessTranscript('clem-long').map((turn) => turn.text), [report]);
+});

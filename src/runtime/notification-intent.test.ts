@@ -230,3 +230,11 @@ test('a row that names no proposal is never unverifiable, whatever the caller kn
   // An empty string is not a referent.
   assert.equal(hasUnverifiableProposalReferent({ metadata: { approvalId: '   ' } }), false);
 });
+
+test('a report a workflow run sent the owner is finished work, worth telling them, from the moment it is written', () => {
+  const report = { kind: 'workflow', title: 'Morning trends', metadata: { source: 'notify_user_tool', workflowRunId: 'run-1', workflowStepId: 'notify' } };
+  assert.equal(classifyNotification(report), 'finished');
+  assert.equal(isWorthNotifying(report), true);
+  // Outside a workflow run, notify_user is not by itself a finished-work report.
+  assert.equal(classifyNotification({ kind: 'system', title: 'FYI', metadata: { source: 'notify_user_tool' } }), 'neither');
+});

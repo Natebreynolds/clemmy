@@ -168,6 +168,7 @@ export async function readFromClem(): Promise<FromClem> {
 export const CLEM_THREAD_ID = 'clem';
 const RAISED_PRIMER = '[clem-raised]';
 const MAX_RAISED_IN_PRIMER = 8;
+const MAX_RAISED_SAY_CHARS = 600;
 
 export interface ClemThreadDeps {
   ensure: () => void;
@@ -215,7 +216,8 @@ function raisedPrimer(rows: ReadonlyArray<FromClemRow & { say: string }>): strin
   if (rows.length === 0) return `${RAISED_PRIMER} Nothing I (Clem) raised with the owner on my own is open right now.`;
   return [
     `${RAISED_PRIMER} What I (Clem) raised with the owner on my own recently, newest first. A reply here may be about one of these; if it is unclear which, ask.`,
-    ...rows.slice(0, MAX_RAISED_IN_PRIMER).map((row) => `- ${row.at} · ${row.heartbeatTitle}: ${row.say} (the record: ${[row.text, row.detail].filter(Boolean).join(' — ').slice(0, 400)})`),
+    // A report's full text is in the thread itself; the primer names it.
+    ...rows.slice(0, MAX_RAISED_IN_PRIMER).map((row) => `- ${row.at} · ${row.heartbeatTitle}: ${row.say.slice(0, MAX_RAISED_SAY_CHARS)} (the record: ${[row.text, row.detail].filter(Boolean).join(' — ').slice(0, 400)})`),
   ].join('\n');
 }
 
@@ -246,11 +248,22 @@ export async function voiceFromClemRows(
     if (!live.has(key)) { delete failures[key]; changed = true; }
   }
   const nowMs = deps.now?.() ?? Date.now();
+  // What she already wrote for the owner (a workflow's report) is her message
+  // as it stands, titled: no model call to say it again.
+  for (const row of rows) {
+    if (!row.authored || !row.say || file.entries[row.key]?.digest === row.voiceDigest) continue;
+    const prior = file.entries[row.key];
+    file.entries[row.key] = {
+      digest: row.voiceDigest, message: `${row.text}\n\n${row.say}`, model: 'authored', at: new Date(nowMs).toISOString(),
+      ...(prior?.posted ? { posted: prior.posted } : {}),
+    };
+    changed = true;
+  }
   const port = deps.port();
   let written = 0;
   if (port?.voiceProactiveItem) {
     const pending = rows
-      .filter((row) => file.entries[row.key]?.digest !== row.voiceDigest && !waitingAfterFailure(failures[row.key], row.voiceDigest, nowMs))
+      .filter((row) => !row.authored && file.entries[row.key]?.digest !== row.voiceDigest && !waitingAfterFailure(failures[row.key], row.voiceDigest, nowMs))
       .slice(0, deps.max ?? MAX_VOICES_PER_PASS);
     for (const row of pending) {
       const unsaid = (reason: string): void => {

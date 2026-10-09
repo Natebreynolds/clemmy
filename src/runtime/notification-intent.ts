@@ -143,6 +143,12 @@ function isOpenHeartbeatItem(meta: Record<string, unknown> | undefined): boolean
     && meta?.needsAttention === true;
 }
 
+/** What a workflow run's own step sent the owner through notify_user. */
+export function isWorkflowReport(meta: Record<string, unknown> | undefined): boolean {
+  return meta?.source === 'notify_user_tool'
+    && typeof meta.workflowRunId === 'string' && meta.workflowRunId.trim() !== '';
+}
+
 /** A proposal is a decision only while it is actually pending. */
 function hasPendingProposal(
   meta: Record<string, unknown> | undefined,
@@ -204,6 +210,11 @@ export function classifyNotification(
   if (typeof meta?.completedAt === 'string' || typeof meta?.settledAt === 'string') {
     return 'finished';
   }
+
+  // A workflow run telling the owner its result (notify_user from one of its
+  // steps) is that run delivering finished work. The record is written before
+  // the run settles, so the run's later outcome cannot be what decides it.
+  if (isWorkflowReport(meta)) return 'finished';
 
   return 'neither';
 }

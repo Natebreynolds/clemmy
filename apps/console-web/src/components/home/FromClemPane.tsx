@@ -4,7 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { appPlaceHref } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
 import { decidePlanProposal, markNotificationRead } from '@/lib/inbox';
-import { recentPulses, replyFromClem, replyOutcomeText, type FromClem, type FromClemRow } from '@/lib/from-clem';
+import { fromClemRunHref, recentPulses, replyFromClem, replyOutcomeText, type FromClem, type FromClemRow } from '@/lib/from-clem';
 import { cn } from '@/lib/cn';
 import { unifiedChatSessionId } from '@/lib/last-session';
 import { agoLabel } from './home-model';
@@ -168,16 +168,25 @@ export function FromClemPane({
     const state = states[row.key] ?? {};
     const open = openKey === row.key;
     const done = row.done;
+    // A report leads with its title; opened, it reads as she wrote it.
+    const report = row.authored === true;
+    const runHref = fromClemRunHref(row);
     return (
       <PaneRow key={row.key} className="flex-col items-stretch gap-1.5 py-3.5">
         <button type="button" aria-expanded={open} onClick={() => setOpenKey(open ? null : row.key)}
           className="flex flex-col items-stretch gap-1 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
           {meta(row)}
-          <span className={cn('text-body text-fg', !open && 'line-clamp-2')}>{row.say || row.text}</span>
+          {report && <span className="text-body font-semibold text-fg">{row.text}</span>}
+          <span className={cn('text-body text-fg', open ? report && 'whitespace-pre-line' : 'line-clamp-2')}>{row.say || row.text}</span>
         </button>
-        {open && source(row) && <p className="whitespace-pre-line text-small text-muted">{source(row)}</p>}
+        {open && !report && source(row) && <p className="whitespace-pre-line text-small text-muted">{source(row)}</p>}
         {state.notice ? notice(state) : (
           <div className="flex flex-wrap items-center gap-2">
+            {runHref && (
+              <Link to={runHref} className="inline-flex h-8 items-center rounded-md px-1 text-small font-medium text-primary hover:underline">
+                Open run
+              </Link>
+            )}
             {done && (
               <Button size="sm" variant="secondary" className="h-8 px-3 text-small" disabled={Boolean(state.busy)}
                 onClick={() => act(row, 'done', () => markNotificationRead(done.notificationId), 'Cleared.')}>

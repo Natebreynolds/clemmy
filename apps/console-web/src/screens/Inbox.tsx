@@ -29,7 +29,7 @@ import {
   listInboxQuestions, answerInboxQuestion,
   resolveWorkflowCapability,
   relativeTime,
-  approvalDecisionSuccessText, collapseAttentionRows, getNeedsYouSummary, notifTone, notifFailed,
+  approvalDecisionSuccessText, collapseAttentionRows, getNeedsYouSummary, notifTone, notifFailed, notificationRunHref,
   summarizeApprovalDecisionBatch,
   type ApprovalRow, type NotificationRow, type TrustProposalRow, type PlanProposalRow, type InboxQuestionRow,
   type WorkspaceDestinationChooser, type WorkflowCapabilityAccountChoice, type WorkflowCapabilityInboxGate,
@@ -120,7 +120,9 @@ export function Inbox() {
   // Server sorts urgent-first; aged cards (48h+ unanswered, nothing parked on
   // them) render below a divider and stop counting toward "needs you".
   const urgentApprovalRows = approvalRows.filter((a) => !a.stale);
-  const notifRows = notifications.data?.notifications ?? [];
+  // Silent records are history (lifecycle steps, reports delivered into their
+  // own chat); the Notifications tab is what was meant for the owner.
+  const notifRows = (notifications.data?.notifications ?? []).filter((n) => !n.silent);
   const trustRows = trustProposals.data?.proposals ?? [];
   const planRows = planProposals.data?.proposals ?? [];
   const questionRows = questions.data?.questions ?? [];
@@ -1138,7 +1140,8 @@ function NotifDetail({ row, view, destination, onRead, onRetry, onBack }: Notifi
     }
   };
   const frameView = view ?? { state: notifTone(row), at: row.createdAt };
-  const actions = enableGate || !row.read || failed || destination ? (
+  const runHref = notificationRunHref(row);
+  const actions = enableGate || !row.read || failed || destination || runHref ? (
     <>
       {destination && !enableGate && (
         <Link to={destination.href} className="inline-flex h-11 items-center rounded-md bg-primary px-4 text-body font-medium text-primary-fg hover:bg-primary-hover active:bg-primary-press">
@@ -1151,6 +1154,11 @@ function NotifDetail({ row, view, destination, onRead, onRetry, onBack }: Notifi
         </Button>
       )}
       {failed && <Button variant={enableGate || destination ? 'secondary' : 'primary'} onClick={onRetry}><RefreshCw className="h-4 w-4" aria-hidden /> Retry delivery</Button>}
+      {runHref && !destination && (
+        <Link to={runHref} className="inline-flex h-11 items-center rounded-md px-3 text-body font-medium text-primary hover:underline">
+          Open run
+        </Link>
+      )}
       {!row.read && <Button variant="secondary" onClick={onRead}>Mark as read</Button>}
     </>
   ) : undefined;

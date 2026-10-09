@@ -375,3 +375,33 @@ test('an item moved to later is hidden until the next morning and stays covered 
   assert.deepEqual(later.covers.notificationIds, ['cal']);
   assert.equal(typeof readFromClem, 'function');
 });
+
+test('a workflow report lands in her thread as she wrote it, titled, with no model asked to say it again', async () => {
+  const fs = await import('node:fs');
+  fs.rmSync(path.join(TMP, 'state', 'from-clem-voice.json'), { force: true });
+  const posts: Array<{ key: string; text: string }> = [];
+  const primers: string[] = [];
+  const thread = {
+    ensure: () => {},
+    postedKeys: () => new Set<string>(),
+    post: (m: { key: string; text: string }) => { posts.push(m); },
+    primer: (t: string) => { primers.push(t); return true; },
+  };
+  const body = `Five things moved.\n${'- a detail worth reading\n'.repeat(40)}`.trim();
+  const rows = buildFromClem({
+    heartbeats: [], noticingProposals: [], planProposals: [], asksOwner: () => false,
+    now: Date.parse('2026-10-09T15:00:00.000Z'),
+    notifications: [{ id: 'rep', kind: 'workflow', title: 'Morning trends', body, createdAt: '2026-10-09T14:31:00.000Z', read: false,
+      metadata: { source: 'notify_user_tool', workflowRunId: 'run-rep', workflow: 'morning-trends' } }],
+  }).rows;
+  let asked = 0;
+  const port = () => ({ async voiceProactiveItem() { asked += 1; return { message: 'reworded', evidenceDigest: 'x', modelIdentity: 'm' }; } });
+  assert.equal(await voiceFromClemRows(rows, { port: port as never, thread }), 0, 'nothing for a model to write');
+  assert.equal(asked, 0);
+  assert.deepEqual(posts.map((post) => post.text), [`Morning trends\n\n${body}`]);
+  // The thread's context names it without carrying the whole report again.
+  assert.match(primers.at(-1)!, /morning-trends: Morning trends/);
+  assert.ok(primers.at(-1)!.length < body.length + 600);
+  await voiceFromClemRows(rows, { port: port as never, thread });
+  assert.equal(posts.length, 1, 'posted once');
+});

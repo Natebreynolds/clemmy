@@ -2100,6 +2100,10 @@ export interface FromClemRow {
   done?: { notificationId: string };
   /** A part of Clementine Clem offers to help set up, and where it lives. */
   setup?: { ability: string; place: string; placeName: string };
+  /** The workflow run whose report this is. */
+  run?: { runId: string; workflow?: string };
+  /** A report she already wrote: `say` is the report itself. */
+  authored?: boolean;
 }
 
 export interface FromClem {

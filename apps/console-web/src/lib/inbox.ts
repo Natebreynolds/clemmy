@@ -82,6 +82,17 @@ export interface NotificationRow {
   workflowCapability?: WorkflowCapabilityInboxGate | null;
   /** A workflow the system switched off that only a person can switch back on. */
   workflowEnableGate?: WorkflowEnableInboxGate | null;
+  /** Recorded for history only; never shown as news. */
+  silent?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+/** Where the workflow run a notification reports on opens, when it names one. */
+export function notificationRunHref(row: Pick<NotificationRow, 'metadata'>): string | null {
+  const runId = row.metadata?.workflowRunId;
+  const workflow = row.metadata?.workflow;
+  if (typeof runId !== 'string' || !runId.trim() || typeof workflow !== 'string' || !workflow.trim()) return null;
+  return `/automate?workflow=${encodeURIComponent(workflow)}&run=${encodeURIComponent(runId)}`;
 }
 
 export interface WorkflowEnableInboxGate {

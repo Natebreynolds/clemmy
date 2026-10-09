@@ -3755,6 +3755,8 @@ a.home-btn { text-decoration: none; }
 .from-clem-group { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
 .from-clem-group-head { margin: 0; color: var(--fg-3); font-size: var(--t-xs); font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
 .from-clem-reply { display: flex; gap: 8px; width: 100%; }
+.from-clem-report { font-size: var(--t-sm); color: var(--fg-2); white-space: pre-line; overflow-wrap: anywhere; }
+.from-clem-report-clamped { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 .from-clem-reply .cz-input { flex: 1 1 auto; min-width: 0; }
 .home-btn-primary:active:not(:disabled) { background: var(--accent-deep); }
 .home-row-receipt { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; color: var(--accent-2); font-size: var(--t-sm); font-weight: 700; }

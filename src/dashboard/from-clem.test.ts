@@ -93,3 +93,32 @@ test('a check that failed says when it looked, never what went wrong', () => {
   assert.equal(out.pulses.find((pulse) => pulse.heartbeat === 'noticing')?.summary, 'Quiet: considered 7 things');
   assert.ok(!JSON.stringify(out).includes('Read failed'), 'no failure text anywhere in the stream');
 });
+
+test('a report a workflow run sent the owner is hers to say as written, with its run, while it is news', () => {
+  const now = Date.parse('2026-10-09T15:00:00.000Z');
+  const report = (id: string, extra: Partial<NotificationRecord> = {}, meta: Record<string, unknown> = {}) => notification(id,
+    { source: 'notify_user_tool', workflowRunId: `run-${id}`, workflow: 'morning-trends', ...meta },
+    { kind: 'workflow', title: `Trends ${id}`, body: `Five things moved.\n- one\n- two`, createdAt: '2026-10-09T14:31:00.000Z', ...extra });
+  const stream = buildFromClem(input({
+    now,
+    notifications: [
+      report('fresh'),
+      report('to-its-chat', { silent: true }),
+      report('seen', { read: true }),
+      report('stale', { createdAt: '2026-10-05T14:31:00.000Z' }),
+    ],
+    voiced: () => ({ message: 'reworded by a model' }),
+  }));
+  const rows = stream.rows.filter((row) => row.heartbeat === 'workflow');
+  assert.deepEqual(rows.map((row) => row.key), ['notif:fresh']);
+  const [row] = rows;
+  assert.equal(row!.heartbeatTitle, 'morning-trends');
+  assert.equal(row!.text, 'Trends fresh');
+  assert.equal(row!.say, 'Five things moved.\n- one\n- two', 'her report as written, never reworded');
+  assert.equal(row!.authored, true);
+  assert.equal(row!.asks, false);
+  assert.deepEqual(row!.run, { runId: 'run-fresh', workflow: 'morning-trends' });
+  assert.deepEqual(row!.done, { notificationId: 'fresh' });
+  assert.ok(stream.covers.notificationIds.includes('fresh'));
+  assert.ok(!stream.covers.notificationIds.includes('stale'), 'an old report stays in the inbox');
+});
