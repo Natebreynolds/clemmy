@@ -8729,17 +8729,12 @@ export function registerConsoleRoutes(
       const files = CONTEXT_FILES.map(readContextFile);
       const facts = listActiveFacts({ limit: 18 });
       const goals = readContextGoals().slice(0, 12);
-      const voiceInstructions = buildRealtimeVoiceInstructions('console:home');
       res.json({
         profile,
         files,
         facts,
         goals,
         memory: readMemoryIndexStatus(),
-        voiceContext: {
-          chars: voiceInstructions.length,
-          sections: Array.from(voiceInstructions.matchAll(/^## (.+)$/gm)).map((match) => match[1]),
-        },
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
