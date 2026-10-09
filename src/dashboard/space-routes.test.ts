@@ -8,7 +8,7 @@
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Server } from 'node:http';
@@ -665,6 +665,26 @@ test('notes append + list', async () => {
   assert.equal(list.body.notes[0].kind, 'call');
 });
 
+test('a page reporting its own error is recorded once per view version, stamped with that version', async () => {
+  const slug = 'view-error-rt';
+  store.spaceStore.save({ id: slug, title: 'View error RT', viewContent: '<p>v1</p>' });
+  const version = store.spaceStore.get(slug)!.version;
+  const report = () => fetch(`${base}/api/console/spaces/${slug}/notes`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text: 'rows is not defined (line 3)', kind: 'view_error', meta: { version: 999 } }),
+  });
+  assert.equal((await report()).status, 201);
+  assert.equal((await report()).status, 200, 'the same error on the same version is not recorded again');
+  let errors = (await j(await fetch(`${base}/api/console/spaces/${slug}/notes`))).body.notes.filter((n: { kind?: string }) => n.kind === 'view_error');
+  assert.equal(errors.length, 1);
+  assert.deepEqual(errors[0].meta, { version }, 'the server stamps the version, not the page');
+
+  store.spaceStore.commitViewRevision(slug, '<p>v2</p>');
+  assert.equal((await report()).status, 201, 'a new version that still fails is recorded again');
+  errors = (await j(await fetch(`${base}/api/console/spaces/${slug}/notes`))).body.notes.filter((n: { kind?: string }) => n.kind === 'view_error');
+  assert.equal(errors.length, 2);
+});
+
 test('iframe-authored correction kinds remain Workspace-local and cannot poison memory', async () => {
   const slug = 'note-memory-boundary';
   store.spaceStore.save({ id: slug, title: 'Note Memory Boundary' });
@@ -767,6 +787,33 @@ test('paused workspace rejects data writes (423) but still serves the view', asy
   assert.equal(put.status, 423);
   const view = await fetch(`${base}/console/spaces/${slug}/view`);
   assert.equal(view.status, 200); // read-only cached view still serves
+  assert.equal(store.spaceStore.get(slug)!.pausedBy, 'owner', 'a console pause is the owner\'s');
+  await fetch(`${base}/api/console/spaces/${slug}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'active' }),
+  });
+  assert.equal(store.spaceStore.get(slug)!.pausedBy, undefined);
+});
+
+test('restoring a version restores exactly that version and keeps the page it replaced', async () => {
+  const slug = 'restore-rt';
+  store.spaceStore.save({ id: slug, title: 'Restore RT', viewContent: '<h1>one</h1>' });
+  const v1 = store.spaceStore.get(slug)!.version;
+  store.spaceStore.commitViewRevision(slug, '<h1>two</h1>');
+  store.spaceStore.commitViewRevision(slug, '<h1>three</h1>');
+
+  const missing = await fetch(`${base}/api/console/spaces/${slug}/rollback`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ version: 999 }),
+  });
+  assert.equal(missing.status, 404, 'a missing version is never swapped for another one');
+  assert.equal(readFileSync(store.resolveInSpace(slug, 'view/index.html'), 'utf-8'), '<h1>three</h1>');
+
+  const res = await fetch(`${base}/api/console/spaces/${slug}/rollback`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ version: v1 }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal(readFileSync(store.resolveInSpace(slug, 'view/index.html'), 'utf-8'), '<h1>one</h1>');
+  const after = store.spaceStore.get(slug)!;
+  assert.equal(store.spaceStore.viewRevisionContent(slug, after.version - 1), '<h1>three</h1>', 'the restore can be undone');
 });
 
 test('action route refuses a read-looking Composio action without a current read manifest: no card for work nothing could execute', async () => {

@@ -272,7 +272,7 @@ process.stdout.write(JSON.stringify({rows:[1,2]}));`);
   const outagePath = store.resolveInSpace(slug, 'data/outage.txt');
   writeFileSync(outagePath, 'on', 'utf8');
   await approveInstalledRunnerFixture(slug, source);
-  store.spaceStore.update(slug, { status: 'paused' });
+  store.spaceStore.update(slug, { status: 'paused', pausedBy: 'build_check' });
 
   // Too fresh (< 5 min since pause) → not touched.
   const now0 = new Date(Date.parse(store.spaceStore.get(slug)!.updatedAt) + 60_000);
@@ -306,6 +306,27 @@ process.stdout.write(JSON.stringify({rows:[1,2]}));`);
   store.spaceStore.archive(slug);
 });
 
+test('a Space the owner paused is never retried or reactivated by the scheduler', async () => {
+  const slug = 'owner-paused';
+  store.spaceStore.save({
+    id: slug, title: 'Owner paused',
+    dataSources: [{ id: 'pull', runner: 'pull.mjs' }],
+  });
+  writeRunner(slug, 'pull.mjs', 'process.stdout.write(JSON.stringify({rows:[1]}));');
+  store.spaceStore.update(slug, { status: 'paused', pausedBy: 'owner' });
+
+  const base = Date.parse(store.spaceStore.get(slug)!.updatedAt) + 10 * 60_000;
+  const first = await sched.retryPausedSpaces(new Date(base));
+  const later = await sched.retryPausedSpaces(new Date(base + 60 * 60_000));
+  assert.equal(first.examined + later.examined, 0, 'the owner\'s pause is not a build failure to retry');
+  assert.equal(store.spaceStore.get(slug)!.status, 'paused');
+  assert.equal(store.spaceStore.get(slug)!.pausedBy, 'owner');
+
+  store.spaceStore.update(slug, { status: 'active' });
+  assert.equal(store.spaceStore.get(slug)!.pausedBy, undefined, 'resuming clears who paused it');
+  store.spaceStore.archive(slug);
+});
+
 test('paused-build auto-retry: a genuinely-broken source exhausts 2 attempts and stays paused (human decision)', async () => {
   const slug = 'retry-exhaust';
   store.spaceStore.save({
@@ -313,7 +334,7 @@ test('paused-build auto-retry: a genuinely-broken source exhausts 2 attempts and
     dataSources: [{ id: 'pull', runner: 'broken.mjs' }],
   });
   writeRunner(slug, 'broken.mjs', 'console.error("always fails"); process.exit(1);');
-  store.spaceStore.update(slug, { status: 'paused' });
+  store.spaceStore.update(slug, { status: 'paused', pausedBy: 'build_check' });
 
   const base = Date.parse(store.spaceStore.get(slug)!.updatedAt) + 10 * 60_000;
   const a1 = await sched.retryPausedSpaces(new Date(base));

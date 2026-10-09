@@ -62,6 +62,33 @@ test('a browser that writes its screenshot and lingers still yields the image, a
   assert.deepEqual(temporaryPreviewDirs().filter((name) => !before.has(name)), [], 'its temporary files were removed');
 });
 
+test('the page\'s uncaught errors and refused loads come back with the preview; its ordinary logging and the host page do not', async () => {
+  const log = [
+    '[1:2:1008/233008.933442:INFO:CONSOLE:1] "Uncaught ReferenceError: rowz is not defined", source: file:///tmp/x/view.html (12)',
+    '[1:2:1008/233008.933442:INFO:CONSOLE:1] "Uncaught ReferenceError: rowz is not defined", source: file:///tmp/x/view.html (12)',
+    '[1:2:1008/233008.933516:INFO:CONSOLE:1] "rendered 3 rows", source: file:///tmp/x/view.html (14)',
+    '[1:2:1008/233008.933516:INFO:CONSOLE(3)] "Refused to load the image \'https://x.example/a.png\' because it violates the following Content Security Policy directive", source: file:///tmp/x/view.html (0)',
+    '[1:2:1008/233008.933516:INFO:CONSOLE:1] "Uncaught TypeError: host", source: file:///tmp/x/index.html (1)',
+    'some unrelated browser line',
+  ].join('\n');
+  assert.deepEqual(preview.pageProblemsFromBrowserLog(log), [
+    'Uncaught ReferenceError: rowz is not defined (line 12)',
+    'Refused to load the image \'https://x.example/a.png\' because it violates the following Content Security Policy directive (line 0)',
+  ]);
+
+  const reporting = fakeBrowser('reporting-browser.js', `
+const fs = require('node:fs');
+process.stderr.write('[1:2:1008/1.0:INFO:CONSOLE:1] "Uncaught SyntaxError: Unexpected token \\')\\'", source: file:///tmp/p/view.html (4)\\n');
+const arg = process.argv.find((value) => value.startsWith('--screenshot='));
+fs.writeFileSync(arg.slice('--screenshot='.length), Buffer.from('${PNG.toString('hex')}', 'hex'));
+`);
+  const result = await preview.renderWorkspacePreview({
+    slug: 'broken-board', servedViewHtml: '<html><body></body></html>', dataset: {},
+  }, { browser: reporting, timeoutMs: 10_000 });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (result.ok) assert.deepEqual(result.problems, ["Uncaught SyntaxError: Unexpected token ')' (line 4)"]);
+});
+
 test('a browser that never writes a screenshot times out with a reason; no browser at all says so', async () => {
   const slow = await preview.renderWorkspacePreview({
     slug: 'my-board', servedViewHtml: '<html></html>', dataset: {},
@@ -165,6 +192,20 @@ test('a real installed browser renders a Workspace document', { skip: process.en
   }, { browser });
   assert.equal(result.ok, true, JSON.stringify(result));
   if (result.ok) assert.ok(result.png.subarray(0, 8).equals(PNG.subarray(0, 8)), 'a PNG came back');
+});
+
+test('a real installed browser reports a Workspace page that throws', { skip: process.env.CLEMMY_TEST_REAL_BROWSER !== '1' }, async () => {
+  const browser = preview.findPreviewBrowser();
+  assert.ok(browser, 'CLEMMY_TEST_REAL_BROWSER=1 needs an installed Chromium-family browser');
+  const result = await preview.renderWorkspacePreview({
+    slug: 'real-throw',
+    servedViewHtml: '<!doctype html><html><body><h1>Board</h1><script>document.querySelector("h1").textContent = rows.length;</script></body></html>',
+    dataset: {},
+    width: 800,
+    height: 600,
+  }, { browser });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (result.ok) assert.match(result.problems.join('\n'), /Uncaught ReferenceError: rows is not defined/);
 });
 
 /** RGB of the first pixel of a PNG (the first pixel of any scanline filter is

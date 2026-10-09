@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom';
-import { AlertTriangle, Wrench, Play, Inbox as InboxIcon } from 'lucide-react';
+import { AlertTriangle, Wrench, Play, Pause, Inbox as InboxIcon } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import type { GapQuestion, SpaceAudit } from '@/lib/spaces';
 
@@ -12,6 +12,8 @@ import type { GapQuestion, SpaceAudit } from '@/lib/spaces';
  */
 export function BuildStatusBanner({
   paused,
+  pausedByOwner = false,
+  pageErrors = [],
   gaps,
   openApprovals,
   failures,
@@ -20,6 +22,10 @@ export function BuildStatusBanner({
   onAskClem,
 }: {
   paused: boolean;
+  /** The owner paused it: nothing is broken, so there is nothing to fix. */
+  pausedByOwner?: boolean;
+  /** Errors the page reported while open, for the version on screen. */
+  pageErrors?: string[];
   gaps: GapQuestion[];
   openApprovals: number;
   failures: SpaceAudit[];
@@ -28,12 +34,15 @@ export function BuildStatusBanner({
   onAskClem: () => void;
 }) {
   const navigate = useNavigate();
-  if (!paused && gaps.length === 0 && openApprovals === 0 && failures.length === 0) return null;
-  const askLabel = paused || failures.length > 0
+  if (!paused && gaps.length === 0 && openApprovals === 0 && failures.length === 0 && pageErrors.length === 0) return null;
+  const brokenPause = paused && !pausedByOwner;
+  const askLabel = brokenPause || failures.length > 0 || pageErrors.length > 0
     ? 'Ask Clem to fix'
     : gaps.length > 0
       ? 'Ask Clem to resolve'
-      : 'Ask Clem to review';
+      : openApprovals > 0
+        ? 'Ask Clem to review'
+        : null;
 
   return (
     <div className="border-b border-border bg-subtle px-4 py-3">
@@ -41,9 +50,26 @@ export function BuildStatusBanner({
         <div className="flex min-w-0 flex-1 flex-col gap-2">
           {paused && (
             <p className="inline-flex items-center gap-2 text-small text-fg">
-              <AlertTriangle className="h-4 w-4 text-muted" aria-hidden />
-              This workspace is <strong>paused</strong> — a data source didn’t return data when it was built. Fix it, then resume.
+              {pausedByOwner ? (
+                <><Pause className="h-4 w-4 text-muted" aria-hidden /> You paused this Space. It won’t refresh until you resume it.</>
+              ) : (
+                <><AlertTriangle className="h-4 w-4 text-muted" aria-hidden /> This Space is <strong>paused</strong> — a data source didn’t return data when it was built. Fix it, then resume.</>
+              )}
             </p>
+          )}
+          {pageErrors.length > 0 && (
+            <div className="min-w-0 text-small text-fg">
+              <span className="inline-flex items-center gap-1.5">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-warning" aria-hidden />
+                <span>This page hit an error when it opened, so parts of it may be missing.</span>
+              </span>
+              <details className="mt-0.5 pl-5 text-caption text-muted">
+                <summary className="cursor-pointer select-none hover:text-fg">Details</summary>
+                <ul className="mt-1 flex flex-col gap-0.5 font-mono [overflow-wrap:anywhere]">
+                  {pageErrors.map((error) => <li key={error}>{error}</li>)}
+                </ul>
+              </details>
+            </div>
           )}
           {failures.length > 0 && (
             <ul className="flex flex-col gap-1.5">
@@ -94,9 +120,11 @@ export function BuildStatusBanner({
               <Play className="h-4 w-4" aria-hidden /> Resume
             </Button>
           )}
-          <Button size="sm" onClick={onAskClem}>
-            <Wrench className="h-4 w-4" aria-hidden /> {askLabel}
-          </Button>
+          {askLabel && (
+            <Button size="sm" onClick={onAskClem}>
+              <Wrench className="h-4 w-4" aria-hidden /> {askLabel}
+            </Button>
+          )}
         </div>
       </div>
     </div>

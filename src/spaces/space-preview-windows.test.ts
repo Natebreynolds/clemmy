@@ -39,7 +39,7 @@ test('Windows preview accepts a stable exact screenshot after natural exit0 and 
   assert.equal(stopCalls, 0, 'natural exit is not mislabeled as taskkill evidence');
   const invocation = fixture.invocations[0]!; const profile = invocation.args.find(arg => arg.startsWith('--user-data-dir='))!.slice('--user-data-dir='.length);
   assert.equal(invocation.args.at(-1), pathToFileURL(path.join(path.dirname(profile), 'index.html')).href);
-  assert.deepEqual(invocation.options, { stdio: 'ignore', detached: false, windowsHide: true });
+  assert.deepEqual(invocation.options, { stdio: ['ignore', 'ignore', 'pipe'], detached: false, windowsHide: true }, 'stderr carries the page\'s console');
   assert.ok(profile.includes('clem-space-preview-'), 'the browser keeps its unique isolated preview profile');
 });
 

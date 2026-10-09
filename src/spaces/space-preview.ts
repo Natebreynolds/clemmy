@@ -34,8 +34,33 @@ const SCREENSHOT_SETTLE_MS = 400;
 export type SpacePreviewTheme = 'light' | 'dark';
 
 export type SpacePreviewResult =
-  | { ok: true; png: Buffer; width: number; height: number; theme: SpacePreviewTheme }
+  | { ok: true; png: Buffer; width: number; height: number; theme: SpacePreviewTheme; problems: string[] }
   | { ok: false; reason: string };
+
+const MAX_PAGE_PROBLEMS = 5;
+const MAX_BROWSER_LOG_BYTES = 256 * 1024;
+
+/**
+ * The page's own failures, read from the browser's console log: uncaught
+ * exceptions and loads the page's security policy refused. These are what make
+ * a page render blank or half-built while its screenshot looks merely empty.
+ * The preview's host page is ours and is left out.
+ */
+export function pageProblemsFromBrowserLog(log: string): string[] {
+  const problems: string[] = [];
+  const line = /:CONSOLE[^\]]*\] "(.*)", source: (.*?) \((\d+)\)\s*$/;
+  for (const raw of log.split(/\r?\n/)) {
+    const match = line.exec(raw);
+    if (!match) continue;
+    const [, message, source, at] = match;
+    if (/(^|\/)index\.html$/.test(source)) continue;
+    if (!/^(Uncaught|Refused to)/.test(message)) continue;
+    const entry = `${message.slice(0, 300)} (line ${at})`;
+    if (!problems.includes(entry)) problems.push(entry);
+    if (problems.length >= MAX_PAGE_PROBLEMS) break;
+  }
+  return problems;
+}
 
 /** Installed Chromium-family browsers that can screenshot headlessly, in the
  *  order they are tried. An explicit override wins. */
@@ -177,13 +202,14 @@ async function stopProcessTree(child: ReturnType<typeof spawn>, dependencies: Sp
 async function captureHostPage(
   input: { dir: string; browser: string; width: number; height: number; scale?: number },
   dependencies: SpacePreviewDependencies,
-): Promise<{ ok: true; png: Buffer } | { ok: false; reason: string }> {
+): Promise<{ ok: true; png: Buffer; log: string } | { ok: false; reason: string }> {
   const shot = path.join(input.dir, 'preview.png');
   const windows = (dependencies.platform ?? process.platform) === 'win32';
   const guard = dependencies.processGuard ?? windowsPreviewGuard;
   if (windows) { const reason = guard.acquire(); if (reason) return { ok: false, reason }; }
   let child: ReturnType<typeof spawn> | null = null;
-  let captured: { ok: true; png: Buffer } | { ok: false; reason: string } = { ok: false, reason: 'the preview browser was not started' };
+  let captured: { ok: true; png: Buffer; log: string } | { ok: false; reason: string } = { ok: false, reason: 'the preview browser was not started' };
+  let log = '';
   try {
     const args = [
       '--headless=new',
@@ -198,14 +224,23 @@ async function captureHostPage(
       // Device pixels per CSS pixel: the layout is the same, the picture is finer.
       ...(input.scale && input.scale > 1 ? [`--force-device-scale-factor=${input.scale}`] : []),
       '--virtual-time-budget=6000',
+      // The page's console (uncaught errors, refused loads) on stderr.
+      '--enable-logging=stderr',
+      '--v=0',
       `--screenshot=${shot}`,
       pathToFileURL(path.join(input.dir, 'index.html')).href,
     ];
     child = (dependencies.spawnBrowser ?? spawn)(input.browser, args, {
-      stdio: 'ignore',
+      stdio: ['ignore', 'ignore', 'pipe'],
       detached: !windows,
       ...(windows ? { windowsHide: true } : {}),
     });
+    // Always drained so the browser never blocks on a full pipe; only the
+    // first part is kept.
+    child.stderr?.on('data', (chunk: Buffer) => {
+      if (log.length < MAX_BROWSER_LOG_BYTES) log += chunk.toString('utf8');
+    });
+    child.stderr?.on('error', () => { /* the log is best-effort */ });
     const spawned = child;
     const exited = new Promise<void>((resolve) => { spawned.once('exit', () => resolve()); spawned.once('error', () => resolve()); });
     const deadlineAt = Date.now() + (dependencies.timeoutMs ?? PREVIEW_TIMEOUT_MS);
@@ -213,7 +248,7 @@ async function captureHostPage(
       waitForStableFile(shot, deadlineAt),
       exited.then(() => waitForStableFile(shot, Math.min(deadlineAt, Date.now() + 1_000))),
     ]);
-    captured = settled ? { ok: true, png: readFileSync(shot) } : { ok: false, reason: 'the browser did not produce a preview in time' };
+    captured = settled ? { ok: true, png: readFileSync(shot), log } : { ok: false, reason: 'the browser did not produce a preview in time' };
   } finally {
     const neededForcedStop = child !== null && child.exitCode === null && child.signalCode === null && Boolean(child.pid);
     const stopped = !child || await stopProcessTree(child, dependencies);
@@ -258,7 +293,7 @@ export async function renderWorkspacePreview(
     }), 'utf8');
     const captured = await captureHostPage({ dir, browser, width, height }, dependencies);
     if (!captured.ok) return captured;
-    return { ok: true, png: captured.png, width, height, theme };
+    return { ok: true, png: captured.png, width, height, theme, problems: pageProblemsFromBrowserLog(captured.log) };
   } catch (error) {
     return { ok: false, reason: `the preview could not be rendered: ${error instanceof Error ? error.message : String(error)}` };
   } finally {

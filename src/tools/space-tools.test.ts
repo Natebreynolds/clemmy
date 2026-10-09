@@ -855,7 +855,7 @@ test('space_edit_view reports when no find string matches (no write)', async () 
   writeFileSync(draft, '<html>hello</html>', 'utf-8');
   await tools.space_save({ slug: 'nomatch', title: 'NoMatch', view_path: draft });
   const res = await tools.space_edit_view({ slug: 'nomatch', edits: [{ find: 'NOT THERE', replace: 'x' }] });
-  assert.match(text(res), /No edits applied/);
+  assert.match(text(res), /Nothing was saved/);
   // The miss-message points at space_get_view (which returns the view HTML), NOT
   // space_get — the old instruction was impossible and forced a shell read_file/grep.
   assert.match(text(res), /space_get_view\('nomatch'/);
@@ -931,7 +931,7 @@ test('space_edit_view surfaces a whitespace mismatch hint instead of a blind mis
     slug: 'mismatch',
     edits: [{ find: '  <button id="go">Go</button>', replace: '  <button id="go">Done</button>' }],
   }));
-  assert.match(res, /No edits applied/);
+  assert.match(res, /Nothing was saved/);
   assert.match(res, /matched the first \d+ char\(s\)/); // pinpoints where it diverged
   assert.match(res, /space_get_view/); // points the model at the real fix
   assert.match(res, /watch tabs vs spaces/);
@@ -939,13 +939,84 @@ test('space_edit_view surfaces a whitespace mismatch hint instead of a blind mis
   assert.match(readFileSync(store.resolveInSpace('mismatch', 'view/index.html'), 'utf-8'), /Go<\/button>/);
 });
 
-test('space_edit_view notes when a find hit multiple occurrences', async () => {
+test('space_edit_view refuses an ambiguous find unless all is set', async () => {
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-edit-multi.html');
   writeFileSync(draft, '<span>x</span><span>x</span>', 'utf-8');
   await tools.space_save({ slug: 'multi', title: 'Multi', view_path: draft });
-  const res = text(await tools.space_edit_view({ slug: 'multi', edits: [{ find: '<span>x</span>', replace: '<span>y</span>' }] }));
+  const ambiguous = text(await tools.space_edit_view({ slug: 'multi', edits: [{ find: '<span>x</span>', replace: '<span>y</span>' }] }));
+  assert.match(ambiguous, /Nothing was saved/);
+  assert.match(ambiguous, /matches 2 places/);
+  assert.equal(readFileSync(store.resolveInSpace('multi', 'view/index.html'), 'utf-8'), '<span>x</span><span>x</span>');
+  const res = text(await tools.space_edit_view({ slug: 'multi', edits: [{ find: '<span>x</span>', replace: '<span>y</span>', all: true }] }));
   assert.match(res, /Applied 1 edit/);
-  assert.match(res, /ALL 2 occurrences/);
+  assert.match(res, /applied to all 2 occurrences/);
+  assert.equal(readFileSync(store.resolveInSpace('multi', 'view/index.html'), 'utf-8'), '<span>y</span><span>y</span>');
+});
+
+test('space_edit_view saves a set of edits together or not at all', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-edit-set.html');
+  writeFileSync(draft, '<h1>Title</h1><p>Body</p>', 'utf-8');
+  await tools.space_save({ slug: 'edit-set', title: 'Edit set', view_path: draft });
+  const version = store.spaceStore.get('edit-set')!.version;
+  const res = text(await tools.space_edit_view({
+    slug: 'edit-set',
+    edits: [{ find: '<h1>Title</h1>', replace: '<h1>New title</h1>' }, { find: '<p>Missing</p>', replace: '<p>x</p>' }],
+  }));
+  assert.match(res, /Nothing was saved — 1 of 2 edits could not be applied/);
+  assert.match(res, /edit 2: not applied/);
+  assert.equal(readFileSync(store.resolveInSpace('edit-set', 'view/index.html'), 'utf-8'), '<h1>Title</h1><p>Body</p>', 'the first edit did not land alone');
+  assert.equal(store.spaceStore.get('edit-set')!.version, version);
+});
+
+test('space_edit_view refuses an edit that breaks the page script, but not one on a page already broken', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-edit-syntax.html');
+  writeFileSync(draft, '<div id="n"></div><script>document.getElementById("n").textContent = "ok";</script>', 'utf-8');
+  await tools.space_save({ slug: 'edit-syntax', title: 'Edit syntax', view_path: draft });
+  const version = store.spaceStore.get('edit-syntax')!.version;
+  const broken = text(await tools.space_edit_view({
+    slug: 'edit-syntax',
+    edits: [{ find: '.textContent = "ok";', replace: '.textContent = ("ok";' }],
+  }));
+  assert.match(broken, /Nothing was saved — these edits would break/);
+  assert.match(broken, /syntax error/i);
+  assert.equal(store.spaceStore.get('edit-syntax')!.version, version, 'a broken script never goes live');
+
+  // A page that is already broken can still be worked on: the check refuses
+  // only what this change introduces.
+  writeFileSync(store.resolveInSpace('edit-syntax', 'view/index.html'), '<h1>Old</h1><script>var a = (;</script>', 'utf-8');
+  const unrelated = text(await tools.space_edit_view({ slug: 'edit-syntax', edits: [{ find: '<h1>Old</h1>', replace: '<h1>New</h1>' }] }));
+  assert.match(unrelated, /Applied 1 edit/);
+});
+
+test('space_edit_view reverts to an earlier version as a new, undoable version', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-edit-revert.html');
+  writeFileSync(draft, '<h1>First</h1>', 'utf-8');
+  await tools.space_save({ slug: 'edit-revert', title: 'Edit revert', view_path: draft });
+  const first = store.spaceStore.get('edit-revert')!.version;
+  await tools.space_edit_view({ slug: 'edit-revert', edits: [{ find: 'First', replace: 'Second' }] });
+  assert.match(text(await tools.space_get({ slug: 'edit-revert', metadata_only: true })), new RegExp(`Earlier view versions: v${first} `));
+
+  const res = text(await tools.space_edit_view({ slug: 'edit-revert', revert_to_version: first }));
+  assert.match(res, new RegExp(`Restored the "edit-revert" view to v${first}`));
+  assert.equal(readFileSync(store.resolveInSpace('edit-revert', 'view/index.html'), 'utf-8'), '<h1>First</h1>');
+  const after = store.spaceStore.get('edit-revert')!;
+  assert.equal(after.version, first + 2);
+  assert.equal(store.spaceStore.viewRevisionContent('edit-revert', first + 1), '<h1>Second</h1>', 'the replaced view is kept');
+
+  assert.match(text(await tools.space_edit_view({ slug: 'edit-revert', revert_to_version: 99 })), /not in its history.*Nothing was changed/);
+  assert.match(text(await tools.space_edit_view({ slug: 'edit-revert' })), /Pass either edits or revert_to_version/);
+});
+
+test('a view edit committed against a view that changed underneath it writes nothing', () => {
+  const slug = 'edit-race';
+  store.spaceStore.save({ id: slug, title: 'Edit race', viewContent: '<p>one</p>' });
+  const version = store.spaceStore.get(slug)!.version;
+  assert.throws(
+    () => store.spaceStore.commitViewRevision(slug, '<p>three</p>', { expectedCurrentView: '<p>stale</p>' }),
+    store.SpaceViewChangedError,
+  );
+  assert.equal(readFileSync(store.resolveInSpace(slug, 'view/index.html'), 'utf-8'), '<p>one</p>');
+  assert.equal(store.spaceStore.get(slug)!.version, version);
 });
 
 // --- space_try_runner: static-only safety inspection (never spawns code) ---

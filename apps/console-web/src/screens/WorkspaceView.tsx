@@ -19,7 +19,7 @@ import {
 } from '@/lib/workspace-history-state';
 import {
   getSpace, refreshSpace, patchSpace, rollbackSpace, publishSpace,
-  getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions,
+  getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions, pageErrors,
   latestRefreshFailures, buildWorkspaceFixPrompt, type SpaceStatus, type SpaceDiffResponse,
   type SpaceObservationSummary, WorkspaceRefreshError,
 } from '@/lib/spaces';
@@ -242,6 +242,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
   const health = detail.data?.health ?? space.health;
   const openApprovals = openApprovalCount(notes);
   const gaps = gapQuestions(notes);
+  const viewErrors = pageErrors(notes, space.version);
   const refreshFailures = latestRefreshFailures(detail.data?.audit ?? []);
 
   // "Ask Clem to fix" hands Clem the actual failure, not an empty composer —
@@ -250,7 +251,8 @@ function WorkspaceViewForId({ id }: { id: string }) {
     setDockOpen(true);
     void chat.send({
       text: buildWorkspaceFixPrompt({
-        paused: space.status === 'paused',
+        paused: space.status === 'paused' && space.pausedBy !== 'owner',
+        pageErrors: viewErrors,
         failures: refreshFailures,
         gaps,
         openApprovals,
@@ -439,6 +441,8 @@ function WorkspaceViewForId({ id }: { id: string }) {
 
       <BuildStatusBanner
         paused={space.status === 'paused'}
+        pausedByOwner={space.pausedBy === 'owner'}
+        pageErrors={viewErrors}
         gaps={gaps}
         openApprovals={openApprovals}
         failures={refreshFailures}

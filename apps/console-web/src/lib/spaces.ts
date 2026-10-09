@@ -79,6 +79,8 @@ export interface SpaceHealthSnapshot {
 }
 export interface SpaceRecord {
   id: string;
+  /** Present while paused: the owner's pause holds until they resume it. */
+  pausedBy?: 'owner' | 'build_check';
   title: string;
   status: SpaceStatus;
   contract?: SpaceContract;
@@ -340,6 +342,17 @@ export function gapQuestions(notes: SpaceNote[]): GapQuestion[] {
     .map((g) => ({ question: g.question, why: typeof g.why === 'string' ? g.why : undefined }));
 }
 
+/** Errors the page itself reported while open, for the version on screen now
+ *  (an edit that fixes them leaves them behind with the old version). */
+export function pageErrors(notes: SpaceNote[], version: number): string[] {
+  const errors: string[] = [];
+  for (const note of notes) {
+    if (note.kind !== 'view_error' || note.meta?.version !== version) continue;
+    if (!errors.includes(note.text)) errors.push(note.text);
+  }
+  return errors.slice(-3);
+}
+
 /** The data feeds whose LATEST refresh failed. The audit trail is append-only
  *  and edit loops execute every intermediate save, so historical error entries
  *  are normal — a feed that errored mid-edit and refreshed clean afterward is
@@ -360,8 +373,12 @@ export function buildWorkspaceFixPrompt(input: {
   failures: SpaceAudit[];
   gaps: GapQuestion[];
   openApprovals: number;
+  pageErrors?: string[];
 }): string {
   const sections: string[] = [];
+  if (input.pageErrors && input.pageErrors.length > 0) {
+    sections.push(`This page hit errors when it opened, so parts of it may not show:\n${input.pageErrors.map((error) => `- ${error}`).join('\n')}\nFind the cause in the view, fix it, and check the result with a preview.`);
+  }
   if (input.failures.length > 0) {
     const lines = input.failures.map((failure) => (
       `- ${failure.path.replace('/refresh/', '')}: ${(failure.note ?? 'failed to refresh').slice(0, 600)}`

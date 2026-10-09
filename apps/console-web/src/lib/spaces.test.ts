@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildWorkspaceFixPrompt, latestRefreshFailures, type SpaceAudit } from './spaces';
+import { buildWorkspaceFixPrompt, latestRefreshFailures, pageErrors, type SpaceAudit, type SpaceNote } from './spaces';
 
 const entry = (ts: string, path: string, outcome: string, note?: string): SpaceAudit =>
   ({ ts, method: 'REFRESH', path, outcome, ...(note ? { note } : {}) });
@@ -56,4 +56,21 @@ test('workspace fix prompt is actionable for gaps-only and approval-only banners
   });
   assert.match(approvalPrompt, /2 actions waiting/i);
   assert.match(approvalPrompt, /do not approve or execute/i);
+});
+
+test('pageErrors shows only what the page on screen reported, once each', () => {
+  const note = (text: string, version: number, kind = 'view_error'): SpaceNote =>
+    ({ id: `${text}-${version}`, text, kind, meta: { version }, createdAt: 't' });
+  const notes = [
+    note('old failure (line 1)', 3),
+    note('rows is not defined (line 9)', 4),
+    note('rows is not defined (line 9)', 4),
+    note('Gap test: clean.', 4, 'gap'),
+  ];
+  assert.deepEqual(pageErrors(notes, 4), ['rows is not defined (line 9)']);
+  assert.deepEqual(pageErrors(notes, 5), [], 'a fixed version leaves its old errors behind');
+  assert.match(
+    buildWorkspaceFixPrompt({ paused: false, failures: [], gaps: [], openApprovals: 0, pageErrors: pageErrors(notes, 4) }),
+    /This page hit errors when it opened[\s\S]*rows is not defined/,
+  );
 });

@@ -21,8 +21,10 @@ import path from 'node:path';
 import {
   spaceStore, resolveInSpace, resolveSpaceDir, isValidSpaceSlug, buildSpaceHealthSnapshot,
   mergeSpaceContract,
+  SpaceViewChangedError,
   type SpaceRecord,
 } from '../spaces/store.js';
+import { recordViewGapNote } from '../spaces/view-revision-checks.js';
 import {
   readData, MAX_DATA_BYTES, appendNote, listNotes, appendAudit, listAudit, readViewData } from '../spaces/data-store.js';
 import {
@@ -354,6 +356,9 @@ lock('fetch',legacyFetch);
 try{Object.defineProperty(navigator,'sendBeacon',{value:function(){return false;},writable:false,configurable:false});}catch(_){}
 function anchor(e){var path=PATH(e),i,a;for(i=0;i<path.length;i++){try{a=CLOSEST(path[i],'a');if(a)return a;}catch(_){}}return null;}
 ADD(document,'click',function(e){var a,raw,parsed,url,protocol;if(GET_TRUSTED(e)!==true||GET_TARGET(e)===null||(a=anchor(e))===null)return;if(HAS_ATTR(a,'download')){PREVENT(e);STOP(e);gesture('download',{filename:GET_ATTR(a,'download')||'download',dataUrl:GET_ATTR(a,'href')||''});return;}raw=GET_ATTR(a,'href');if(typeof raw!=='string'||!raw)return;try{parsed=new URL_CTOR(raw,BASE_URL);url=GET_URL_HREF(parsed);protocol=GET_URL_PROTOCOL(parsed);}catch(_){return;}if(ARRAY_INDEX(['https:','http:','mailto:','tel:','callto:','sms:','facetime:','facetime-audio:','maps:','webcal:','zoommtg:','msteams:'],protocol)<0)return;PREVENT(e);STOP(e);gesture('open_external',{url:url});},true);
+var REPORTED=[];function report(message,line){var text;if(REPORTED.length>=3||parent===window)return;text=String(message||'').slice(0,300);if(!text||ARRAY_INDEX(REPORTED,text)>=0)return;ARRAY_PUSH(REPORTED,text);rpc('note',{text:text+(line?' (line '+line+')':''),kind:'view_error'}).catch(function(){});}
+ADD(window,'error',function(e){if(e&&typeof e.message==='string'&&e.message)report(e.message,e.lineno);},true);
+ADD(window,'unhandledrejection',function(e){var r=e&&e.reason;report('Unhandled rejection: '+(r&&r.message?r.message:String(r)));},true);
 var K=window.__clemKit||{};try{delete window.__clemKit;}catch(_){}
 window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,pick:K.pick,rows:K.rows,mail:K.mail,slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});}});
 })();</script>`;
@@ -613,6 +618,8 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     if (typeof req.body?.title === 'string') patch.title = req.body.title.trim().slice(0, 200);
     if (req.body?.status === 'active' || req.body?.status === 'paused' || req.body?.status === 'archived') {
       patch.status = req.body.status;
+      // The console is the owner's hand: their pause holds until they resume.
+      if (req.body.status === 'paused') patch.pausedBy = 'owner';
     }
     if (
       Object.prototype.hasOwnProperty.call(req.body ?? {}, 'objective')
@@ -915,6 +922,16 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     const storedKind = explicitKind === 'correction' || explicitKind === 'user_correction'
       ? 'correction_candidate'
       : explicitKind;
+    if (storedKind === 'view_error') {
+      // The page reporting its own uncaught error. Stamped with the view
+      // version it happened on, and recorded once per version, so a page that
+      // fails on every open does not fill its notes.
+      const text = textVal.trim().slice(0, 400);
+      const known = listNotes(slug, 50).find((n) => n.kind === 'view_error' && n.text === text && n.meta?.version === rec.version);
+      if (known) { res.status(200).json({ note: known }); return; }
+      res.status(201).json({ note: appendNote(slug, { text, kind: 'view_error', meta: { version: rec.version } }) });
+      return;
+    }
     const note = appendNote(slug, { text: textVal, kind: storedKind, meta: req.body?.meta });
     appendAudit(slug, { method: 'POST', path: '/notes', outcome: 'ok' });
     // Authored Workspace code can call clem.note() programmatically, so a
@@ -937,22 +954,41 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     }
   });
 
-  app.post('/api/console/spaces/:id/rollback', (req, res) => {
+  app.post('/api/console/spaces/:id/rollback', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const slug = req.params.id;
-    const rec = spaceStore.get(slug);
-    if (!isValidSpaceSlug(slug) || !rec) { res.status(404).json({ error: 'not found' }); return; }
-    const wanted = Number(req.body?.version);
-    const revision = rec.revisions.find((r) => r.version === wanted) ?? rec.revisions[rec.revisions.length - 1];
-    if (!revision) { res.status(400).json({ error: 'no prior version to restore' }); return; }
-    let snapshot: string;
-    try { snapshot = readFileSync(resolveInSpace(slug, revision.file), 'utf-8'); } catch { res.status(404).json({ error: 'snapshot missing' }); return; }
-    spaceStore.recordRevision(slug); // snapshot current before overwriting
-    const canonical = resolveInSpace(slug, rec.viewEntry);
-    mkdirSync(path.dirname(canonical), { recursive: true });
-    writeFileSync(canonical, snapshot, 'utf-8');
-    appendAudit(slug, { method: 'POST', path: `/rollback/${revision.version}`, outcome: 'ok' });
-    res.json({ space: spaceStore.get(slug), restoredFrom: revision.version });
+    const rec = isValidSpaceSlug(slug) ? spaceStore.get(slug) : undefined;
+    if (!rec) { res.status(404).json({ error: 'not found' }); return; }
+    // Restore exactly the version asked for; only a request naming no version
+    // means "the one before this".
+    const asked = req.body?.version;
+    const revision = asked === undefined || asked === null
+      ? rec.revisions[rec.revisions.length - 1]
+      : rec.revisions.find((r) => r.version === Number(asked));
+    if (!revision) {
+      res.status(asked === undefined || asked === null ? 400 : 404).json({
+        error: asked === undefined || asked === null ? 'There is no earlier version to restore.' : `Version ${String(asked)} is not in this Space's history.`,
+      });
+      return;
+    }
+    const snapshot = spaceStore.viewRevisionContent(slug, revision.version);
+    if (snapshot === undefined) { res.status(404).json({ error: `The saved copy of version ${revision.version} is missing.` }); return; }
+    let current: string;
+    try { current = readFileSync(resolveInSpace(slug, rec.viewEntry), 'utf-8'); } catch { res.status(409).json({ error: 'This Space has no view to replace.' }); return; }
+    try {
+      // The same locked revision commit an edit uses: the replaced view is
+      // kept as a version, so a restore can itself be undone.
+      const after = spaceStore.commitViewRevision(slug, snapshot, { expectedCurrentView: current });
+      await recordViewGapNote(after, snapshot);
+      appendAudit(slug, { method: 'POST', path: `/rollback/${revision.version}`, outcome: 'ok' });
+      res.json({ space: spaceStore.get(slug), restoredFrom: revision.version });
+    } catch (err) {
+      if (err instanceof SpaceViewChangedError) {
+        res.status(409).json({ error: 'The page changed while restoring. Look at the latest version and try again.' });
+        return;
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   // ---- Publish: export a static share-ready snapshot ----------------------

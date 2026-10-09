@@ -27,6 +27,7 @@ import {
   spaceStore, resolveInSpace, isValidSpaceSlug, runnerFilenameError, mergeSpaceContract,
   SPACE_INITIAL_DATA_MAX_BYTES,
   WorkspaceStaticUpdateError,
+  SpaceViewChangedError,
   type SpaceDataSource, type SpaceAction, type SpaceRecord,
 } from '../spaces/store.js';
 import { prepareSpaceForWrite } from '../spaces/space-enforce.js';
@@ -38,6 +39,12 @@ import { readWorkspaceCanonicalEntityProjectionPage } from '../dashboard/workspa
 import { getCanonicalRecord, listCanonicalRecordIds } from '../execution/canonical-entity-store.js';
 import { countWorkspaceRecords, renderWorkspaceDataDigest, renderWorkspaceSourceRecords } from '../spaces/workspace-data-digest.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
+import {
+  SPACE_SAVE_MAX_READ_PREPARATIONS,
+  newBreakingGaps,
+  recordViewGapNote,
+  workspaceActionInputContract,
+} from '../spaces/view-revision-checks.js';
 import { runSpaceCreationSmoke } from '../spaces/space-smoke.js';
 import { refreshSpaceData } from '../spaces/runner.js';
 import { readData, listNotes, listAudit, appendNote } from '../spaces/data-store.js';
@@ -347,42 +354,6 @@ export const SPACE_INLINE_VIEW_MAX_BYTES = 24_000;
 const SPACE_GET_COMPLETE_DATASET_MAX_BYTES = 12_000;
 
 /** Distinct Composio reads one save will prepare before judging; a Workspace declares a handful. */
-const SPACE_SAVE_MAX_READ_PREPARATIONS = 12;
-
-/**
- * Action id → the inputs its operation REQUIRES (declared required, no schema
- * default), read from the operation's input schema without calling it. The gap
- * test compares these against the args template and the view's literal
- * clem.action call, so a button that could never succeed is caught at save
- * instead of by clicking it against real data. An unreadable schema is simply
- * not checked.
- */
-async function workspaceActionInputContract(
-  actions: readonly SpaceAction[],
-): Promise<{ actionInputRequirements: Record<string, string[]>; actionInputNames: Record<string, string[]> }> {
-  const requirements: Record<string, string[]> = {};
-  const names: Record<string, string[]> = {};
-  for (const action of actions.slice(0, SPACE_SAVE_MAX_READ_PREPARATIONS)) {
-    const operationId = action.composioSlug?.trim().toUpperCase();
-    if (!operationId) continue;
-    let schema: Record<string, unknown> | null = null;
-    try { schema = await ensureToolSchema(operationId); } catch { schema = null; }
-    const required = Array.isArray(schema?.required)
-      ? (schema!.required as unknown[]).filter((name): name is string => typeof name === 'string' && name.length > 0)
-      : [];
-    const properties = schema?.properties && typeof schema.properties === 'object'
-      ? schema.properties as Record<string, unknown>
-      : {};
-    const withoutDefault = required.filter((name) => {
-      const property = properties[name];
-      return !(property && typeof property === 'object' && Object.prototype.hasOwnProperty.call(property, 'default'));
-    });
-    if (withoutDefault.length > 0) requirements[action.id] = withoutDefault;
-    if (schema) names[action.id] = Object.keys(properties);
-  }
-  return { actionInputRequirements: requirements, actionInputNames: names };
-}
-
 /**
  * Render a view's HTML for space_get_view: cat -n style line numbers so the model
  * can craft a VERBATIM space_edit_view find string. With `grep`, returns only the
@@ -897,8 +868,11 @@ export function registerSpaceTools(server: McpServer): void {
         id: slug,
         title,
         // A fresh validated save is a candidate to be live — start 'active'
-        // (unless archived), then the creation smoke decides if it stays active.
-        status: existing?.status === 'archived' ? 'archived' : 'active',
+        // (unless archived, or paused by the owner, which only the owner
+        // lifts), then the creation smoke decides if it stays active.
+        status: existing?.status === 'archived' ? 'archived'
+          : existing?.status === 'paused' && existing.pausedBy === 'owner' ? 'paused'
+          : 'active',
         ...(contract ? { contract } : {}),
         viewEntry: 'view/index.html',
         ...(authoredView?.ok ? { viewContent: authoredView.content } : {}),
@@ -937,7 +911,10 @@ export function registerSpaceTools(server: McpServer): void {
       if (shouldSmoke) {
         smoke = await runSpaceCreationSmoke(slug);
         if (smoke.failed.length > 0) {
-          record = spaceStore.update(slug, { status: 'paused' }) ?? record;
+          record = spaceStore.update(slug, {
+            status: 'paused',
+            pausedBy: record.pausedBy === 'owner' ? 'owner' : 'build_check',
+          }) ?? record;
         }
       }
 
@@ -1022,10 +999,13 @@ export function registerSpaceTools(server: McpServer): void {
         return textResult(spaceStore.commitSaveResult({
           // A smoke failure may pause this save; it cannot adopt unrelated
           // authoring changes that happened while the source read awaited.
-          expectedRecord: {
-            ...savedAuthoringRecord,
-            status: smoke && smoke.failed.length > 0 ? 'paused' : savedAuthoringRecord.status,
-          },
+          expectedRecord: smoke && smoke.failed.length > 0
+            ? {
+              ...savedAuthoringRecord,
+              status: 'paused',
+              pausedBy: savedAuthoringRecord.pausedBy === 'owner' ? 'owner' : 'build_check',
+            }
+            : savedAuthoringRecord,
           ...(authoredView?.ok ? { expectedView: authoredView.content } : {}),
           result,
         }));
@@ -1188,7 +1168,8 @@ export function registerSpaceTools(server: McpServer): void {
     'space_edit_view',
     [
       'Edit only an existing Workspace HTML view, such as its layout, styling, buttons or client-side logic. Stored data and phone content stay unchanged. For a static board record edit, use space_save with replacement_data_json, expected_revision and updated view_html so the stored document and rendered values change together.',
-      'Provide one or more {find, replace} pairs; each `find` must appear VERBATIM in the current view — call space_get_view first (optionally grep for the spot) to read the exact current text. It snapshots the prior version and bumps the version. The open Workspace auto-refreshes after this view-only edit.',
+      'Provide one or more {find, replace} pairs; each `find` must appear VERBATIM in the current view, exactly once unless you set `all` — call space_get_view first (optionally grep for the spot) to read the exact current text. The edits are saved together or not at all, and a set that would break the page (a script that no longer parses, a source or action the view stops using) is not saved. It snapshots the prior version and bumps the version. The open Workspace auto-refreshes after this view-only edit.',
+      'To undo, pass revert_to_version instead of edits: that earlier version (space_get lists them) becomes the current view as a new version, so a revert can itself be undone.',
       'Preserve everything outside the requested change. Put explanations or suggestions in chat; do not insert unrequested notes or improvements into the saved view.',
       'Use space_save with inline view_html instead for an ordinary full rewrite, or when changing data sources / actions; view_path remains oversized-file compatibility.',
     ].join('\n'),
@@ -1197,10 +1178,15 @@ export function registerSpaceTools(server: McpServer): void {
       edits: z.array(z.object({
         find: z.string().min(1).max(8000).describe('Exact substring currently in the view to replace.'),
         replace: z.string().max(8000).describe('Replacement text (may be empty to delete).'),
-      })).min(1).max(20).describe('Targeted find/replace edits, applied in order.'),
+        all: z.boolean().optional().describe('Replace every occurrence of find. Default: find must match exactly once.'),
+      })).min(1).max(20).optional().describe('Targeted find/replace edits, applied in order and saved together.'),
+      revert_to_version: z.number().int().min(1).optional().describe('Restore this earlier view version instead of editing.'),
     },
-    async ({ slug, edits }) => {
+    async ({ slug, edits, revert_to_version }) => {
       if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      if ((edits === undefined) === (revert_to_version === undefined)) {
+        return invalidArgumentsTextResult('Pass either edits or revert_to_version (one of them, not both).');
+      }
       const rec = spaceStore.get(slug);
       if (!rec) return textResult(`No workspace named "${slug}". Create it with space_save first.`);
       if (rec.manifestErrors && rec.manifestErrors.length > 0) {
@@ -1211,52 +1197,77 @@ export function registerSpaceTools(server: McpServer): void {
       }
       const viewFile = resolveInSpace(slug, rec.viewEntry);
       if (!existsSync(viewFile)) return textResult(`Workspace "${slug}" has no view yet — use space_save with view_html (or legacy view_path).`);
-      let html = readFileSync(viewFile, 'utf-8');
-      const detailLines: string[] = [];
-      let applied = 0;
-      // Apply in order — a later find operates on the already-edited html (same as
-      // before). Per-edit: report occurrences + a precise mismatch hint on a miss
-      // so the model sees the whitespace divergence instead of re-reading blind.
-      edits.forEach((e, i) => {
-        const occurrences = e.find ? html.split(e.find).length - 1 : 0;
-        if (occurrences === 0) {
-          const hint = mismatchHint(html, e.find);
-          detailLines.push(
-            hint && hint.matchedChars > 0
-              ? `edit ${i + 1}: NOT applied — matched the first ${hint.matchedChars} char(s), then your find had ${hint.findHad} but the view has ${hint.haystackHad}. Re-read with space_get_view and copy the exact characters (watch tabs vs spaces), then retry just this edit.`
-              : `edit ${i + 1}: NOT applied — that find string isn't in the view; re-read with space_get_view and copy an exact snippet.`,
+      const current = readFileSync(viewFile, 'utf-8');
+      let html = current;
+      let detail = '';
+      if (revert_to_version !== undefined) {
+        const restored = spaceStore.viewRevisionContent(slug, revert_to_version);
+        if (restored === undefined) {
+          const versions = rec.revisions.map((r) => `v${r.version}`);
+          return textResult(
+            `Version ${revert_to_version} of the "${slug}" view is not in its history `
+            + `(${versions.length > 0 ? `saved: ${versions.slice(-12).join(', ')}; ` : ''}current: v${rec.version}). Nothing was changed.`,
           );
-          return;
         }
-        html = html.split(e.find).join(e.replace);
-        applied += 1;
-        if (occurrences > 1) detailLines.push(`edit ${i + 1}: applied to ALL ${occurrences} occurrences.`);
-      });
-      const detail = detailLines.length ? `\n${detailLines.join('\n')}` : '';
-      if (applied === 0) {
-        return textResult(`No edits applied — none of the find strings were in the view. Call space_get_view('${slug}', '<nearby text>') to read the exact current view lines, then match a find string EXACTLY (whitespace included).${detail}`);
+        if (restored === current) return textResult(`The "${slug}" view already matches v${revert_to_version}. Nothing was changed.`);
+        html = restored;
+      } else {
+        const detailLines: string[] = [];
+        let unapplied = 0;
+        // Applied in order, so a later find reads the already-edited text. A
+        // miss or an ambiguous find stops the whole set from being saved: a
+        // half-applied set leaves a view nobody asked for.
+        edits!.forEach((e, i) => {
+          const occurrences = html.split(e.find).length - 1;
+          if (occurrences === 0) {
+            unapplied += 1;
+            const hint = mismatchHint(html, e.find);
+            detailLines.push(
+              hint && hint.matchedChars > 0
+                ? `edit ${i + 1}: not applied — matched the first ${hint.matchedChars} char(s), then your find had ${hint.findHad} but the view has ${hint.haystackHad}. Copy the exact characters (watch tabs vs spaces).`
+                : `edit ${i + 1}: not applied — that find string isn't in the view; copy an exact snippet.`,
+            );
+            return;
+          }
+          if (occurrences > 1 && !e.all) {
+            unapplied += 1;
+            detailLines.push(`edit ${i + 1}: not applied — the find matches ${occurrences} places. Include more surrounding text so it matches one, or set all: true to change every one.`);
+            return;
+          }
+          html = html.split(e.find).join(e.replace);
+          if (occurrences > 1) detailLines.push(`edit ${i + 1}: applied to all ${occurrences} occurrences.`);
+        });
+        if (unapplied > 0) {
+          return textResult(
+            `Nothing was saved — ${unapplied} of ${edits!.length} edit${edits!.length === 1 ? '' : 's'} could not be applied, and a set is saved together or not at all. `
+            + `Call space_get_view('${slug}', '<nearby text>') to read the exact current lines, fix those edits, and send the whole set again.\n${detailLines.join('\n')}`,
+          );
+        }
+        if (html === current) return textResult(`Those edits leave the "${slug}" view exactly as it is. Nothing was saved.`);
+        const breaking = newBreakingGaps(rec, current, html, await workspaceActionInputContract(rec.actions));
+        if (breaking.length > 0) {
+          return invalidArgumentsTextResult(
+            `Nothing was saved — these edits would break the "${slug}" view.${renderSpaceGapQuestions(breaking)}`,
+          );
+        }
+        detail = detailLines.length ? `\n${detailLines.join('\n')}` : '';
       }
       // One locked store operation snapshots V1, commits V2 + its manifest,
-      // and only then indexes V2. recordRevision()+writeFileSync() previously
-      // indexed the V1 digest under the incremented version before V2 existed.
-      const after = spaceStore.commitViewRevision(slug, html);
-      // Re-run the gap test on EVERY edit and record the fresh verdict — the
-      // gap note is what the desktop banner renders, and before this it was
-      // only ever re-evaluated by space_save. A model that fixed the view with
-      // this tool (the recommended one!) left a STALE note as the newest — the
-      // banner could never clear and models re-"fixed" working views for hours
-      // (2026-07-16 james-english-pipeline incident). Advisory only; a note
-      // failure never fails the edit.
-      let gapNote = '';
+      // and only then indexes V2 — and only if V1 is still the view this
+      // change was made from.
+      let after: SpaceRecord;
       try {
-        const gaps = analyzeSpaceGaps(after, html, [], await workspaceActionInputContract(after.actions));
-        appendNote(slug, {
-          text: gaps.length > 0 ? `Gap test flagged ${gaps.length} item${gaps.length === 1 ? '' : 's'} to confirm.` : 'Gap test: clean.',
-          kind: 'gap',
-          meta: { gaps: gaps.map((g) => ({ question: g.question, why: g.why })) },
-        });
-        gapNote = gaps.length > 0 ? renderSpaceGapQuestions(gaps) : '\n\nGap test: clean — the confirm banner clears on next load.';
-      } catch { /* the verdict is best-effort; the edit already landed */ }
+        after = spaceStore.commitViewRevision(slug, html, { expectedCurrentView: current });
+      } catch (error) {
+        if (error instanceof SpaceViewChangedError) {
+          return textResult(`${error.message} Read it again with space_get_view and redo the change on the current text.`);
+        }
+        throw error;
+      }
+      // Re-run the gap test on every change and record the fresh verdict: the
+      // gap note is what the desktop banner renders, so a stale one would keep
+      // asking for a fix that already landed.
+      const gapNote = await recordViewGapNote(after, html);
       // Include the note appended above in the same final file index. This
       // strict pass happens after V2 is durable and never associates V1 bytes
       // with the new version.
@@ -1270,11 +1281,10 @@ export function registerSpaceTools(server: McpServer): void {
       // history), so its receipt is the Workspace bundle, exactly as a save's
       // is. A view-only receipt under-reported the write, and an earlier save
       // bundle in the same request then read as drift against the edit.
-      return textResult(spaceStore.commitSaveResult({
-        expectedRecord: after,
-        expectedView: html,
-        result: `Applied ${applied} edit${applied === 1 ? '' : 's'} to the "${slug}" HTML view (now v${after.version}). Stored data and phone content were not changed by this operation. The open Workspace auto-refreshes.${detail}${gapNote}`,
-      }));
+      const result = revert_to_version !== undefined
+        ? `Restored the "${slug}" view to v${revert_to_version}; it is now v${after.version}, and the view it replaced is kept as v${after.version - 1}, so this can be undone. Stored data and phone content were not changed. The open Workspace auto-refreshes.${gapNote}`
+        : `Applied ${edits!.length} edit${edits!.length === 1 ? '' : 's'} to the "${slug}" HTML view (now v${after.version}). Stored data and phone content were not changed by this operation. The open Workspace auto-refreshes.${detail}${gapNote}`;
+      return textResult(spaceStore.commitSaveResult({ expectedRecord: after, expectedView: html, result }));
     },
   );
 
@@ -1406,8 +1416,22 @@ export function registerSpaceTools(server: McpServer): void {
           canonicalLine = 'Canonical records: a reviewed workflow binding exists, but no run has projected records yet.';
         }
       } catch { canonicalLine = ''; }
+      const pausedLine = rec.status !== 'paused' ? ''
+        : rec.pausedBy === 'owner'
+          ? ' The owner paused it: it stays paused until they resume it.'
+          : rec.pausedBy === 'build_check' ? ' Paused because a source failed its first check; it is retried automatically.' : '';
+      const earlierVersions = rec.revisions.slice(-8).map((r) => `v${r.version} (${r.ts.slice(0, 10)})`);
+      const viewErrors = [...new Set(listNotes(slug, 50)
+        .filter((n) => n.kind === 'view_error' && n.meta?.version === rec.version)
+        .map((n) => n.text))].slice(-3);
       const parts = [
-        `Workspace "${rec.title}" (${slug}) — ${rec.status}, v${rec.version}.`,
+        `Workspace "${rec.title}" (${slug}) — ${rec.status}, v${rec.version}.${pausedLine}`,
+        ...(earlierVersions.length > 0
+          ? [`Earlier view versions: ${earlierVersions.join(', ')} — space_edit_view with revert_to_version restores one.`]
+          : []),
+        ...(viewErrors.length > 0
+          ? [`The page (v${rec.version}) reported errors when it was open, so parts of it may not show:\n${viewErrors.map((e) => `  - ${e}`).join('\n')}`]
+          : []),
         rec.contract
           ? [
             `Objective: ${rec.contract.objective}`,
@@ -1580,7 +1604,11 @@ export function registerSpaceTools(server: McpServer): void {
       return {
         content: [
           { type: 'image' as const, data: rendered.png.toString('base64'), mimeType: 'image/png' },
-          { type: 'text' as const, text: `Preview of "${rec.title}" (${slug}) v${rec.version}, ${rendered.theme} theme, ${rendered.width}×${rendered.height}${offset_y ? `, starting ${offset_y}px down the page` : ''}, rendered with its current data. This is what the user sees in the desktop app.` },
+          { type: 'text' as const, text: `Preview of "${rec.title}" (${slug}) v${rec.version}, ${rendered.theme} theme, ${rendered.width}×${rendered.height}${offset_y ? `, starting ${offset_y}px down the page` : ''}, rendered with its current data. This is what the user sees in the desktop app.${
+            rendered.problems.length > 0
+              ? `\n\nThe page reported errors while rendering, so parts of it may not have run — fix these before calling it done:\n- ${rendered.problems.join('\n- ')}`
+              : ''
+          }` },
         ],
       };
     },

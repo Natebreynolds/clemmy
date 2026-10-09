@@ -321,6 +321,9 @@ export interface SpaceContract {
 }
 
 export type SpaceStatus = 'active' | 'paused' | 'archived';
+/** Who paused a Space. The owner's pause holds until the owner resumes it;
+ *  a pause from a failed build check is retried automatically. */
+export type SpacePausedBy = 'owner' | 'build_check';
 export type SpaceContentMode = 'static_snapshot';
 
 /**
@@ -335,6 +338,8 @@ export interface SpaceRecord {
   id: string;
   title: string;
   status: SpaceStatus;
+  /** Present only while paused. */
+  pausedBy?: SpacePausedBy;
   /** Living objective/spec for this long-lived collaboration surface. */
   contract?: SpaceContract;
   /** Relative to the Space dir; the served entry point. */
@@ -642,6 +647,7 @@ function normalizeManifest(raw: unknown, slug: string, fallbackTime: string): Sp
     id: slug,
     title: asStr(m.title) ?? slug,
     status,
+    pausedBy: status === 'paused' && (m.pausedBy === 'owner' || m.pausedBy === 'build_check') ? m.pausedBy : undefined,
     contract: normalizeContract(m),
     viewEntry: asStr(m.viewEntry) ?? 'view/index.html',
     dataSources: Array.isArray(m.dataSources) ? m.dataSources.map((src, index) => normDataSource(src, manifestErrors, index)) : [],
@@ -888,6 +894,7 @@ export interface SaveSpaceInput {
   id: string;
   title: string;
   status?: SpaceStatus;
+  pausedBy?: SpacePausedBy;
   contract?: SpaceContract;
   viewEntry?: string;
   /** Optional complete view bytes committed in the same Workspace lock as
@@ -1224,6 +1231,7 @@ function saveSpaceUnlocked(input: SaveSpaceInput): SpaceRecord {
     id: input.id,
     title: input.title.trim().slice(0, 200) || input.id,
     status: input.status ?? existing?.status ?? 'active',
+    pausedBy: (input.status ?? existing?.status) === 'paused' ? input.pausedBy ?? existing?.pausedBy : undefined,
     contract: input.contract ?? existing?.contract,
     viewEntry,
     dataSources,
@@ -1304,7 +1312,16 @@ function saveSpaceUnlocked(input: SaveSpaceInput): SpaceRecord {
  * manifest or index commit fails, restore the exact V1 view/manifest before
  * returning the failure.
  */
-function commitSpaceViewRevisionUnlocked(slug: string, nextView: string): SpaceRecord {
+/** The view changed between the caller reading it and committing an edit of
+ *  it (another edit or a revert landed first). Nothing was written. */
+export class SpaceViewChangedError extends Error {
+  constructor(slug: string) {
+    super(`The "${slug}" view changed while this edit was being made; nothing was written.`);
+    this.name = 'SpaceViewChangedError';
+  }
+}
+
+function commitSpaceViewRevisionUnlocked(slug: string, nextView: string, expectedCurrentView?: string): SpaceRecord {
   const existing = readManifest(slug);
   if (!existing) throw new Error(`No workspace named "${slug}".`);
   if (existing.manifestErrors && existing.manifestErrors.length > 0) {
@@ -1313,6 +1330,9 @@ function commitSpaceViewRevisionUnlocked(slug: string, nextView: string): SpaceR
   const viewFile = resolveInSpace(slug, existing.viewEntry);
   if (!existsSync(viewFile)) throw new Error(`Workspace "${slug}" has no view.`);
   const previousView = readFileSync(viewFile, 'utf-8');
+  if (expectedCurrentView !== undefined && previousView !== expectedCurrentView) {
+    throw new SpaceViewChangedError(slug);
+  }
   const previousManifest = readFileSync(manifestPath(slug), 'utf-8');
   const now = new Date();
   const timestamp = now.toISOString();
@@ -1465,14 +1485,25 @@ export class SpaceStore {
     );
   }
 
-  /** Snapshot V1 and atomically publish/index one complete V2 view revision. */
-  commitViewRevision(slug: string, nextView: string): SpaceRecord {
+  /** Snapshot V1 and atomically publish/index one complete V2 view revision.
+   *  With `expectedCurrentView`, V1 must still be exactly the view the caller
+   *  edited, or SpaceViewChangedError is thrown and nothing is written. */
+  commitViewRevision(slug: string, nextView: string, opts: { expectedCurrentView?: string } = {}): SpaceRecord {
     if (!isValidSpaceSlug(slug)) throw new Error(`invalid workspace slug: ${slug}`);
     ensureDir(SPACES_DIR);
     return withWorkspaceSnapshotMutation(
       slug,
-      () => commitSpaceViewRevisionUnlocked(slug, nextView),
+      () => commitSpaceViewRevisionUnlocked(slug, nextView, opts.expectedCurrentView),
     );
+  }
+
+  /** The exact bytes of one saved earlier view version, or undefined when that
+   *  version is not in this Space's history. */
+  viewRevisionContent(slug: string, version: number): string | undefined {
+    const rec = this.get(slug);
+    const revision = rec?.revisions.find((r) => r.version === version);
+    if (!rec || !revision) return undefined;
+    try { return readFileSync(resolveInSpace(slug, revision.file), 'utf-8'); } catch { return undefined; }
   }
 
   /** Create one exact Space without ever overwriting an existing directory or
@@ -1524,6 +1555,7 @@ export class SpaceStore {
         ? undefined
         : patch.contentMode ?? existing.contentMode,
     };
+    if (record.status !== 'paused') delete record.pausedBy;
     delete record.manifestErrors;
     atomicWrite(manifestPath(slug), JSON.stringify(persistableRecord(record), null, 2));
     indexWorkspaceRecord(record, {

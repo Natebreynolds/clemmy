@@ -400,7 +400,8 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
 // times with spacing: all sources pull clean → reactivate + re-engage Clem so
 // she tells the user; still failing → stays paused (a human decision, as
 // designed). Budget is durable in the schedule state, and cleared when a save
-// reactivates the space through the normal path.
+// reactivates the space through the normal path. Only a build-check pause is
+// retried: a Space the owner paused stays paused until the owner resumes it.
 
 const MAX_PAUSE_RETRIES = 2;
 const PAUSE_RETRY_MIN_AGE_MS = 5 * 60 * 1000;      // don't race the authoring turn
@@ -419,7 +420,7 @@ async function retryPausedSpacesOwned(now: Date): Promise<PausedRetryResult> {
   const nowMs = now.getTime();
 
   for (const space of spaceStore.list()) {
-    if (space.status !== 'paused' || space.dataSources.length === 0) {
+    if (space.status !== 'paused' || space.pausedBy !== 'build_check' || space.dataSources.length === 0) {
       if (space.status === 'active' && retries[space.id]) delete retries[space.id]; // fixed via re-save → reset budget
       continue;
     }
