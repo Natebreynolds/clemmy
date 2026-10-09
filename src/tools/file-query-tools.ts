@@ -7,6 +7,7 @@
 
 import { retainedResultWayThrough } from '../runtime/harness/retained-result-routes.js';
 import { readFileSync, statSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -14,6 +15,7 @@ import { resolveToolOutputForQuery } from '../runtime/harness/eventlog.js';
 import { resolveRetainedOutputRead } from '../runtime/harness/retained-output-read.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { convertToMarkdown, isConvertibleExtension } from '../runtime/markitdown.js';
+import { isSensitivePath, redactSensitiveText } from '../runtime/security.js';
 import { invalidArgumentsTextResult, textResult } from './shared.js';
 import { chunkText, scoreChunks } from './file-query-core.js';
 
@@ -54,7 +56,14 @@ export function registerFileQueryTools(server: McpServer): void {
         let text: string;
         let label: string;
         if (fileSource !== null) {
-          const filePath = path.resolve(fileSource);
+          const filePath = path.resolve(fileSource === '~' || /^~[\\/]/.test(fileSource)
+            ? path.join(os.homedir(), fileSource.slice(2))
+            : fileSource);
+          // The same rule read_file applies: credential material is refused,
+          // never read, whichever tool is asked to open it.
+          if (isSensitivePath(filePath)) {
+            return invalidArgumentsTextResult('Refused: that file holds credential material, and Clementine never needs raw secrets to do work. Nothing was read.');
+          }
           const stat = statSync(filePath);
           if (stat.size > MAX_TEXT_BYTES) return invalidArgumentsTextResult(`ERROR: file is ${Math.round(stat.size / 1024 / 1024)}MB (cap 50MB).`);
           if (isConvertibleExtension(filePath)) {
@@ -121,7 +130,7 @@ export function registerFileQueryTools(server: McpServer): void {
             of: chunks.length,
             heading: h.heading,
             score: Number(h.score.toFixed(2)),
-            text: h.text.slice(0, 2000),
+            text: redactSensitiveText(h.text.slice(0, 2000)),
           })),
         }, null, 1));
       } catch (err) {
