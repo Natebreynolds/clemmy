@@ -25,7 +25,7 @@ import {
   type SpaceRecord,
 } from '../spaces/store.js';
 import { recordViewGapNote } from '../spaces/view-revision-checks.js';
-import { reconcileWorkflowFeeds, spaceFeedSummaries } from '../spaces/workflow-feeds.js';
+import { spaceFeedSummaries } from '../spaces/workflow-feeds.js';
 import {
   readData, MAX_DATA_BYTES, appendNote, listNotes, appendAudit, listAudit, readViewData } from '../spaces/data-store.js';
 import {
@@ -499,8 +499,6 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       id: slug, title, viewEntry: 'view/index.html',
       ...(contract ? { contract } : {}),
     });
-    // A workflow saved before this Space existed can feed it now.
-    void reconcileWorkflowFeeds().catch(() => undefined);
     res.status(201).json({ space: rec });
   });
 

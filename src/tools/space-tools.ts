@@ -883,12 +883,6 @@ export function registerSpaceTools(server: McpServer): void {
         originSessionId: desiredOriginSession,
       });
       const savedAuthoringRecord = record;
-      if (!existing) {
-        // A workflow saved before this Space existed can feed it now.
-        void import('../spaces/workflow-feeds.js')
-          .then(({ reconcileWorkflowFeeds }) => reconcileWorkflowFeeds())
-          .catch(() => undefined);
-      }
       if (initialData) {
         // The file document is already durable/visible. Seed temporal history
         // now when possible; daemon startup repeats this idempotently if a
@@ -1434,9 +1428,12 @@ export function registerSpaceTools(server: McpServer): void {
           const last = feed.lastRun
             ? `last run ${feed.lastRun.state} ${feed.lastRun.at}${feed.lastRun.problem ? ` (${feed.lastRun.problem})` : ''}`
             : 'no recent run';
-          const next = feed.nextRunAt ? `next run ${feed.nextRunAt}` : feed.enabled ? 'runs when started' : 'disabled';
-          const fills = feed.collections.length > 0 ? `fills ${feed.collections.join(', ')}` : 'fills a collection chosen at run time';
-          return `Fed by workflow "${feed.workflow}" (${feed.role}): ${fills}; ${last}; ${next}.`;
+          const next = !feed.enabled ? 'disabled'
+            : feed.nextRunAt ? `next run ${feed.nextRunAt}`
+            : feed.scheduled ? `on schedule "${feed.schedule}"${feed.timezone ? ` (${feed.timezone})` : ''}, next run more than a week out`
+            : 'runs when started';
+          const fills = feed.collections.length > 0 ? `fills ${feed.collections.join(', ')}` : 'what it fills is set by its formal binding';
+          return `Fed by workflow "${feed.workflow}" (${feed.role}${feed.link === 'reviewed' ? ', formal binding' : ''}): ${fills}; ${last}; ${next}.`;
         });
       } catch { feedLines = []; }
       const viewErrors = [...new Set(listNotes(slug, 50)

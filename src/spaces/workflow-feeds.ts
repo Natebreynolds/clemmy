@@ -2,41 +2,33 @@
  * Which workflows feed which Spaces, read from what the workflows do.
  *
  * A workflow feeds a Space when one of its `call` steps runs a reviewed local
- * write into a Space dataset with a literal Space and collection in its
- * arguments. That is recognised by the tool's registered local execution
- * contract, never by a tool name list, and prose that merely mentions a Space
- * never counts. Each such pair is kept as a WorkflowSurfaceBindingV1 row whose
- * id starts with `feed:`; this module writes only those rows and never touches
- * a binding another writer owns. The first feeder of a Space is its primary
- * feed and later ones support it.
+ * write into a Space dataset whose Space and collection are literal and
+ * exactly admissible by that write's own identity rules. It is recognised by
+ * the tool's registered local execution contract, never by a tool name list,
+ * and prose that merely mentions a Space never counts.
  *
- * The summaries tell the Space what feeds it: the workflow, what it fills,
- * when it last ran and how that went, and when it runs next.
+ * These links are derived, not authority. They live in an in-memory index
+ * rebuilt from the saved workflows (at start and after any workflow change)
+ * and are never written into the reviewed workflow-to-Workspace binding
+ * store, whose rows carry formal approval and projection identity. A Space
+ * shows both: its derived feeds and any formal bindings, as a lookup only.
  */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { BASE_DIR } from '../config.js';
 import { cronMatches } from '../execution/workflow-scheduler.js';
 import { subscribeWorkflowChanges } from '../memory/workflow-change-bus.js';
 import { listWorkflows, readWorkflow, type WorkflowDefinition } from '../memory/workflow-store.js';
-import { BASE_DIR } from '../config.js';
-import { isValidSpaceSlug, spaceStore } from './store.js';
-import type { WorkflowSurfaceBindingV1 } from './workflow-surface-binding.js';
-import {
-  listWorkflowSurfaceBindingsForWorkspace,
-  listWorkflowSurfaceBindingsWithIdPrefix,
-  putWorkflowSurfaceBinding,
-} from './workflow-surface-binding-store.js';
-
-export const FEED_BINDING_PREFIX = 'feed:';
+import { workspaceSetDataIdentityProblem } from './workspace-set-data-contract.js';
+import { listWorkflowSurfaceBindingsForWorkspace } from './workflow-surface-binding-store.js';
 
 /** How many of the newest run records are read to find a feed's last run. */
 const RECENT_RUN_RECORDS = 120;
-/** How far ahead a next run is looked for. */
-const NEXT_RUN_HORIZON_MINUTES = 8 * 24 * 60;
+/** How far ahead an exact next run is looked for, in hours. */
+const NEXT_RUN_HORIZON_HOURS = 8 * 24;
 
 export interface WorkflowSpaceWrite {
   workspaceId: string;
-  /** The collection (source id) the step fills; empty when chosen at run time. */
   collection: string;
   stepId: string;
 }
@@ -51,123 +43,98 @@ export async function spaceDatasetWriteTest(): Promise<SpaceWriteTest> {
   return (tool) => observeReviewedLocalTool(tool)?.execution.adapter === 'workspace_dataset_v1';
 }
 
-function literal(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() && !value.includes('{{') ? value.trim() : null;
-}
-
-/** The Spaces a workflow writes into, and the steps whose Space is only known
- *  when the workflow runs. */
+/** The Spaces a workflow writes into, and the steps whose target is not a
+ *  fixed, admissible Space and collection (chosen at run time, or invalid). */
 export function workflowSpaceWrites(
   def: Pick<WorkflowDefinition, 'steps'>,
   isSpaceWrite: SpaceWriteTest,
-): { writes: WorkflowSpaceWrite[]; chosenAtRun: string[] } {
+): { writes: WorkflowSpaceWrite[]; notFixed: string[] } {
   const writes: WorkflowSpaceWrite[] = [];
-  const chosenAtRun: string[] = [];
+  const notFixed: string[] = [];
   for (const step of def.steps ?? []) {
-    const tool = step.call?.tool?.trim();
-    if (!tool || !isSpaceWrite(tool)) continue;
-    const slug = literal(step.call?.args?.slug);
-    if (slug && isValidSpaceSlug(slug)) {
-      writes.push({ workspaceId: slug, collection: literal(step.call?.args?.source_id) ?? '', stepId: step.id });
+    const tool = step.call?.tool;
+    if (typeof tool !== 'string' || !isSpaceWrite(tool)) continue;
+    const slug = step.call?.args?.slug;
+    const source = step.call?.args?.source_id;
+    if (
+      typeof slug === 'string' && typeof source === 'string'
+      && !slug.includes('{{') && !source.includes('{{')
+      && workspaceSetDataIdentityProblem(slug, source) === null
+    ) {
+      writes.push({ workspaceId: slug, collection: source, stepId: step.id });
     } else {
-      chosenAtRun.push(step.id);
+      notFixed.push(step.id);
     }
   }
-  return { writes, chosenAtRun };
+  return { writes, notFixed };
 }
 
-type StoredBinding = WorkflowSurfaceBindingV1 & { digest: string };
-
-function revise(existing: StoredBinding, patch: Partial<Pick<WorkflowSurfaceBindingV1, 'state' | 'role'>>, now: string): boolean {
-  const { digest, ...binding } = existing;
-  const result = putWorkflowSurfaceBinding({
-    binding: { ...binding, ...patch, revision: binding.revision + 1, updatedAt: now },
-    expectedDigest: digest,
-  });
-  return result.ok;
+export interface FeedLink {
+  workflow: string;
+  collections: string[];
+  enabled: boolean;
+  /** When the workflow was first saved; the earliest feed leads. */
+  since: number;
 }
 
-export interface FeedReconcileResult {
-  bound: string[];
-  changed: string[];
-  retired: string[];
-  /** Bindings that could not be written yet (their Space does not exist). */
-  waiting: string[];
+let index: Map<string, FeedLink[]> | null = null;
+
+function workflowSince(filePath: string): number {
+  try {
+    const stat = statSync(filePath);
+    return stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+/** Rebuild the derived feed index from every saved workflow. */
+export async function rebuildFeedIndex(options: { isSpaceWrite?: SpaceWriteTest } = {}): Promise<Map<string, FeedLink[]>> {
+  const isSpaceWrite = options.isSpaceWrite ?? await spaceDatasetWriteTest();
+  const next = new Map<string, FeedLink[]>();
+  for (const entry of listWorkflows()) {
+    const bySpace = new Map<string, Set<string>>();
+    for (const write of workflowSpaceWrites(entry.data, isSpaceWrite).writes) {
+      const collections = bySpace.get(write.workspaceId) ?? new Set<string>();
+      collections.add(write.collection);
+      bySpace.set(write.workspaceId, collections);
+    }
+    for (const [workspaceId, collections] of bySpace) {
+      const links = next.get(workspaceId) ?? [];
+      links.push({
+        workflow: entry.name,
+        collections: [...collections],
+        enabled: entry.data.enabled !== false,
+        since: workflowSince(entry.filePath),
+      });
+      next.set(workspaceId, links);
+    }
+  }
+  for (const links of next.values()) links.sort((a, b) => a.since - b.since || a.workflow.localeCompare(b.workflow));
+  index = next;
+  return next;
+}
+
+/** The derived feeds of one Space, earliest first. */
+export async function feedLinksForSpace(workspaceId: string): Promise<FeedLink[]> {
+  return ((index ?? await rebuildFeedIndex()).get(workspaceId) ?? []).slice();
 }
 
 /**
- * Bring the `feed:` bindings in line with what every saved workflow writes.
- * Idempotent; safe to call after any workflow or Space change.
+ * Keep the derived index current: built now, and rebuilt shortly after any
+ * workflow is created, changed or deleted. Returns the unsubscribe.
  */
-export async function reconcileWorkflowFeeds(
-  options: { isSpaceWrite?: SpaceWriteTest; now?: Date } = {},
-): Promise<FeedReconcileResult> {
-  const isSpaceWrite = options.isSpaceWrite ?? await spaceDatasetWriteTest();
-  const now = (options.now ?? new Date()).toISOString();
-  const out: FeedReconcileResult = { bound: [], changed: [], retired: [], waiting: [] };
-
-  const desired = new Map<string, { workflowId: string; workspaceId: string; state: 'active' | 'paused' }>();
-  for (const entry of listWorkflows()) {
-    for (const write of workflowSpaceWrites(entry.data, isSpaceWrite).writes) {
-      desired.set(`${FEED_BINDING_PREFIX}${entry.name}:${write.workspaceId}`, {
-        workflowId: entry.name,
-        workspaceId: write.workspaceId,
-        state: entry.data.enabled === false ? 'paused' : 'active',
-      });
-    }
-  }
-
-  const existing = new Map(listWorkflowSurfaceBindingsWithIdPrefix(FEED_BINDING_PREFIX).map((b) => [b.bindingId, b]));
-  const touched = new Set<string>();
-
-  for (const [id, binding] of existing) {
-    if (desired.has(id) || binding.state === 'retired') continue;
-    if (revise(binding, { state: 'retired' }, now)) { out.retired.push(id); touched.add(binding.workspaceId); }
-  }
-
-  for (const [id, want] of desired) {
-    const have = existing.get(id);
-    if (have) {
-      if (have.state !== want.state && revise(have, { state: want.state }, now)) {
-        out.changed.push(id);
-        touched.add(want.workspaceId);
-      }
-      continue;
-    }
-    if (!spaceStore.get(want.workspaceId)) { out.waiting.push(id); continue; }
-    const others = listWorkflowSurfaceBindingsForWorkspace(want.workspaceId).filter((b) => b.state !== 'retired');
-    const result = putWorkflowSurfaceBinding({
-      binding: {
-        version: 1,
-        bindingId: id,
-        workflowId: want.workflowId,
-        workspaceId: want.workspaceId,
-        revision: 1,
-        role: others.some((b) => b.role === 'primary') ? 'supporting' : 'primary',
-        projectionVersion: 1,
-        scheduleAuthority: 'workflow',
-        state: want.state,
-        createdAt: now,
-        updatedAt: now,
-      },
-    });
-    if (result.ok) { out.bound.push(id); touched.add(want.workspaceId); } else out.waiting.push(id);
-  }
-
-  // Exactly one primary per Space among the bindings still in use: the
-  // earliest one, and a binding another writer owns is never re-roled.
-  for (const workspaceId of touched) {
-    const live = listWorkflowSurfaceBindingsForWorkspace(workspaceId)
-      .filter((b) => b.state !== 'retired')
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.bindingId.localeCompare(b.bindingId));
-    const primary = live.find((b) => b.role === 'primary') ?? live[0];
-    for (const binding of live) {
-      if (!binding.bindingId.startsWith(FEED_BINDING_PREFIX)) continue;
-      const role = binding === primary ? 'primary' : 'supporting';
-      if (binding.role !== role && revise(binding, { role }, now)) out.changed.push(binding.bindingId);
-    }
-  }
-  return out;
+export function installWorkflowFeedIndex(onError: (error: unknown) => void = () => undefined): () => void {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const run = () => { void rebuildFeedIndex().catch(onError); };
+  run();
+  const unsubscribe = subscribeWorkflowChanges(() => {
+    index = null;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => { timer = null; run(); }, 1_000);
+    timer.unref?.();
+  });
+  return () => { if (timer) clearTimeout(timer); unsubscribe(); };
 }
 
 export type FeedRunState = 'running' | 'done' | 'failed' | 'waiting';
@@ -177,7 +144,11 @@ export interface SpaceFeedSummary {
   title: string;
   description?: string;
   role: 'primary' | 'supporting';
+  /** derived: read from the workflow's steps; reviewed: a formal binding. */
+  link: 'derived' | 'reviewed';
   enabled: boolean;
+  /** Has a schedule. nextRunAt is set only when the next run is near enough to name. */
+  scheduled: boolean;
   schedule?: string;
   timezone?: string;
   nextRunAt?: string;
@@ -192,8 +163,8 @@ function runState(status: string): FeedRunState {
   return 'waiting';
 }
 
-/** The newest run of one workflow among the most recent run records. */
-export function latestFeedRun(names: string[], runsDir = path.join(BASE_DIR, 'workflows', 'runs')): SpaceFeedSummary['lastRun'] {
+/** The newest run records, read once and shared by every feed of a request. */
+export function recentRunRecords(runsDir = path.join(BASE_DIR, 'workflows', 'runs')): Array<Record<string, unknown>> {
   let files: Array<{ file: string; mtime: number }>;
   try {
     files = readdirSync(runsDir)
@@ -204,84 +175,94 @@ export function latestFeedRun(names: string[], runsDir = path.join(BASE_DIR, 'wo
       .sort((a, b) => b.mtime - a.mtime)
       .slice(0, RECENT_RUN_RECORDS);
   } catch {
-    return undefined;
+    return [];
   }
+  const records: Array<Record<string, unknown>> = [];
   for (const { file } of files) {
     try {
       const raw = JSON.parse(readFileSync(path.join(runsDir, file), 'utf-8')) as Record<string, unknown>;
-      if (typeof raw.workflow !== 'string' || !names.includes(raw.workflow)) continue;
-      const at = String(raw.startedAt ?? raw.createdAt ?? '');
-      const problem = typeof raw.error === 'string' && raw.error.trim() ? raw.error.trim().slice(0, 300) : undefined;
-      return {
-        id: String(raw.id ?? file.replace(/\.json$/, '')),
-        state: runState(String(raw.status ?? '')),
-        at,
-        ...(typeof raw.finishedAt === 'string' ? { finishedAt: raw.finishedAt } : {}),
-        ...(problem ? { problem } : {}),
-      };
+      records.push({ ...raw, id: raw.id ?? file.replace(/\.json$/, '') });
     } catch { /* an unreadable record is skipped */ }
   }
-  return undefined;
+  return records;
 }
 
-/** The next minute a cron schedule fires, within the next eight days. */
+/** The newest run of one workflow among already-read recent records. */
+export function latestFeedRun(names: string[], records: Array<Record<string, unknown>>): SpaceFeedSummary['lastRun'] {
+  const raw = records.find((record) => typeof record.workflow === 'string' && names.includes(record.workflow));
+  if (!raw) return undefined;
+  const problem = typeof raw.error === 'string' && raw.error.trim() ? raw.error.trim().slice(0, 300) : undefined;
+  return {
+    id: String(raw.id),
+    state: runState(String(raw.status ?? '')),
+    at: String(raw.startedAt ?? raw.createdAt ?? ''),
+    ...(typeof raw.finishedAt === 'string' ? { finishedAt: raw.finishedAt } : {}),
+    ...(problem ? { problem } : {}),
+  };
+}
+
+/**
+ * The next minute a cron schedule fires within the next eight days, found an
+ * hour at a time with the scheduler's own matcher (minute field widened), then
+ * a minute at a time inside the first matching hour. Undefined past the
+ * horizon: a schedule may still exist, it is just not named.
+ */
 export function nextScheduledRun(schedule: string, timezone: string | undefined, now = new Date()): string | undefined {
-  const start = Math.floor(now.getTime() / 60_000) * 60_000 + 60_000;
-  for (let i = 0; i < NEXT_RUN_HORIZON_MINUTES; i += 1) {
-    const at = new Date(start + i * 60_000);
-    if (cronMatches(schedule, at, timezone)) return at.toISOString();
+  const fields = schedule.trim().split(/\s+/);
+  if (fields.length !== 5) return undefined;
+  const anyMinute = ['*', ...fields.slice(1)].join(' ');
+  const startMinute = Math.floor(now.getTime() / 60_000) * 60_000 + 60_000;
+  const firstHour = Math.floor(startMinute / 3_600_000) * 3_600_000;
+  for (let h = 0; h <= NEXT_RUN_HORIZON_HOURS; h += 1) {
+    const hour = firstHour + h * 3_600_000;
+    // Half-hour zones shift where a local hour starts, so test both halves.
+    if (!cronMatches(anyMinute, new Date(hour), timezone) && !cronMatches(anyMinute, new Date(hour + 1_800_000), timezone)) continue;
+    for (let m = 0; m < 60; m += 1) {
+      const at = hour + m * 60_000;
+      if (at < startMinute) continue;
+      if (cronMatches(schedule, new Date(at), timezone)) return new Date(at).toISOString();
+    }
   }
   return undefined;
 }
 
-/** What feeds one Space, primary first. */
+/** What feeds one Space, primary first: derived feeds, then formal bindings. */
 export async function spaceFeedSummaries(
   workspaceId: string,
-  options: { isSpaceWrite?: SpaceWriteTest; runsDir?: string; now?: Date } = {},
+  options: { runsDir?: string; now?: Date; links?: FeedLink[] } = {},
 ): Promise<SpaceFeedSummary[]> {
-  const isSpaceWrite = options.isSpaceWrite ?? await spaceDatasetWriteTest();
+  const derived = options.links ?? await feedLinksForSpace(workspaceId);
+  const reviewed = listWorkflowSurfaceBindingsForWorkspace(workspaceId)
+    .filter((binding) => binding.state !== 'retired' && !derived.some((link) => link.workflow === binding.workflowId));
+  if (derived.length === 0 && reviewed.length === 0) return [];
+  const records = recentRunRecords(options.runsDir);
   const summaries: SpaceFeedSummary[] = [];
-  for (const binding of listWorkflowSurfaceBindingsForWorkspace(workspaceId)) {
-    if (binding.state === 'retired') continue;
-    const entry = readWorkflow(binding.workflowId);
-    if (!entry) continue;
+  const describe = (name: string, link: SpaceFeedSummary['link'], role: SpaceFeedSummary['role'], collections: string[]) => {
+    const entry = readWorkflow(name);
+    if (!entry) return;
     const def = entry.data;
     const schedule = def.trigger?.schedule?.trim() || undefined;
     const timezone = (def.trigger as { timezone?: string } | undefined)?.timezone;
     const enabled = def.enabled !== false;
-    const collections = [...new Set(workflowSpaceWrites(def, isSpaceWrite).writes
-      .filter((w) => w.workspaceId === workspaceId && w.collection)
-      .map((w) => w.collection))];
-    const lastRun = latestFeedRun([entry.name, def.name], options.runsDir);
     const nextRunAt = enabled && schedule ? nextScheduledRun(schedule, timezone, options.now) : undefined;
+    const lastRun = latestFeedRun([entry.name, def.name], records);
     summaries.push({
       workflow: entry.name,
       title: def.name || entry.name,
       ...(def.description ? { description: def.description.slice(0, 300) } : {}),
-      role: binding.role,
+      role,
+      link,
       enabled,
+      scheduled: Boolean(schedule),
       ...(schedule ? { schedule } : {}),
       ...(timezone ? { timezone } : {}),
       ...(nextRunAt ? { nextRunAt } : {}),
       collections,
       ...(lastRun ? { lastRun } : {}),
     });
-  }
-  return summaries;
-}
-
-/**
- * Keep the feed bindings current: once now, and again shortly after any
- * workflow is created, changed or deleted. Returns the unsubscribe.
- */
-export function installWorkflowFeedReconciler(onError: (error: unknown) => void = () => undefined): () => void {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const run = () => { void reconcileWorkflowFeeds().catch(onError); };
-  run();
-  const unsubscribe = subscribeWorkflowChanges(() => {
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => { timer = null; run(); }, 1_000);
-    timer.unref?.();
-  });
-  return () => { if (timer) clearTimeout(timer); unsubscribe(); };
+  };
+  const reviewedPrimary = reviewed.some((binding) => binding.role === 'primary');
+  derived.forEach((link, i) => describe(link.workflow, 'derived', i === 0 && !reviewedPrimary ? 'primary' : 'supporting', link.collections));
+  for (const binding of reviewed) describe(binding.workflowId, 'reviewed', binding.role, []);
+  return summaries.sort((a, b) => (a.role === b.role ? 0 : a.role === 'primary' ? -1 : 1));
 }

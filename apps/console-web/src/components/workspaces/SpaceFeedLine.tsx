@@ -42,7 +42,9 @@ export function SpaceFeedLine({
     ? 'turned off'
     : feed.nextRunAt
       ? `next ${feedTime(feed.nextRunAt)}`
-      : 'runs when started';
+      : feed.scheduled
+        ? 'on a schedule'
+        : 'runs when started';
 
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-border bg-surface px-4 py-2 text-small">

@@ -102,7 +102,7 @@ import {
   scheduleCatchupWindow,
 } from '../execution/workflow-scheduler.js';
 import { recoverPendingWorkflowTriggerEvents, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
-import { installWorkflowFeedReconciler } from '../spaces/workflow-feeds.js';
+import { installWorkflowFeedIndex } from '../spaces/workflow-feeds.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js';
 import { processSpaceSchedules, retryPausedSpaces } from '../spaces/scheduler.js';
@@ -2920,13 +2920,13 @@ export async function startDaemon(
   }
 
   // Which workflows feed which Spaces is read from the workflows themselves:
-  // bind them now and again after every workflow change.
+  // index them now and again after every workflow change.
   try {
-    installWorkflowFeedReconciler((err) => {
-      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Workflow feed reconcile failed (continuing)');
+    installWorkflowFeedIndex((err) => {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Workflow feed index rebuild failed (continuing)');
     });
   } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Workflow feed reconciler did not start (continuing)');
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Workflow feed index did not start (continuing)');
   }
 
   // The automation proposal remains inert until this exact projection sees its

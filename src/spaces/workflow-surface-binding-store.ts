@@ -97,23 +97,6 @@ export function listWorkflowSurfaceBindingsForWorkspace(
   });
 }
 
-/** Every binding whose id starts with `prefix`: the rows one writer owns. */
-export function listWorkflowSurfaceBindingsWithIdPrefix(
-  prefix: string,
-  db: Database.Database = openWorkspaceDb(),
-): Array<WorkflowSurfaceBindingV1 & { digest: string }> {
-  const rows = db.prepare(`
-    SELECT *
-    FROM workspace_workflow_bindings
-    WHERE substr(binding_id, 1, ?) = ?
-    ORDER BY binding_id
-  `).all(prefix.length, prefix) as WorkflowSurfaceBindingRow[];
-  return rows.flatMap((row) => {
-    const binding = trustedBindingFromRow(row);
-    return binding ? [binding] : [];
-  });
-}
-
 /**
  * Read every explicit visual surface for one exact workflow identity. This is
  * a lookup only: ordering, role, or display text never selects a binding and

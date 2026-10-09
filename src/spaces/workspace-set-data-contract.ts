@@ -159,32 +159,34 @@ function exactArguments(value: unknown): WorkspaceSetDataArguments {
   return parsed.data;
 }
 
-/** Validate and close all identity-bearing bytes before any storage lookup. */
-export function prepareWorkspaceSetData(
-  value: unknown,
-): PreparedWorkspaceSetData {
-  const args = exactArguments(value);
-  if (!WORKSPACE_SLUG_RE.test(args.slug)) {
-    throw new WorkspaceSetDataContractError('invalid_slug', `invalid workspace slug "${args.slug}"`);
-  }
-  const sourceId = args.source_id;
+/** Why a Space/source pair could not be the target of a dataset commit, or
+ *  null when it is exactly admissible as written. One rule set for the commit
+ *  itself and for anything that reads a saved call's target. */
+export function workspaceSetDataIdentityProblem(
+  slug: string,
+  sourceId: string,
+): { code: 'invalid_slug' | 'invalid_source' | 'reserved_source'; message: string } | null {
+  if (!WORKSPACE_SLUG_RE.test(slug)) return { code: 'invalid_slug', message: `invalid workspace slug "${slug}"` };
   if (
     sourceId !== sourceId.trim()
     || sourceId.length === 0
     || sourceId.length > WORKSPACE_SET_DATA_MAX_SOURCE_CHARS
     || SOURCE_CONTROL_RE.test(sourceId)
   ) {
-    throw new WorkspaceSetDataContractError(
-      'invalid_source',
-      'source_id must already be canonical, bounded, and free of control characters',
-    );
+    return { code: 'invalid_source', message: 'source_id must already be canonical, bounded, and free of control characters' };
   }
-  if (sourceId === '_meta') {
-    throw new WorkspaceSetDataContractError(
-      'reserved_source',
-      '"_meta" is a reserved Workspace source key',
-    );
-  }
+  if (sourceId === '_meta') return { code: 'reserved_source', message: '"_meta" is a reserved Workspace source key' };
+  return null;
+}
+
+/** Validate and close all identity-bearing bytes before any storage lookup. */
+export function prepareWorkspaceSetData(
+  value: unknown,
+): PreparedWorkspaceSetData {
+  const args = exactArguments(value);
+  const sourceId = args.source_id;
+  const problem = workspaceSetDataIdentityProblem(args.slug, sourceId);
+  if (problem) throw new WorkspaceSetDataContractError(problem.code, problem.message);
   if (utf8(args.data_json) > WORKSPACE_SET_DATA_MAX_BYTES) {
     throw new WorkspaceSetDataContractError(
       'json_limit_exceeded',

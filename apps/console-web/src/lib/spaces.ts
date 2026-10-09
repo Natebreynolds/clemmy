@@ -183,7 +183,10 @@ export interface SpaceFeed {
   title: string;
   description?: string;
   role: 'primary' | 'supporting';
+  link: 'derived' | 'reviewed';
   enabled: boolean;
+  /** Has a schedule; nextRunAt is only set when the next run is near enough to name. */
+  scheduled: boolean;
   schedule?: string;
   timezone?: string;
   nextRunAt?: string;
