@@ -57,6 +57,7 @@ import {
 } from './shipped-implementation-identity.js';
 import { isolatedTestContractActive } from './isolated-test-contract.js';
 import { ProviderAnsweredError } from './attempt-outcome.js';
+import { mcpArgumentsWithFileContent } from '../mcp-file-inputs.js';
 import {
   capabilityManifestDigest,
   validateCapabilityManifestV1,
@@ -806,9 +807,15 @@ async function executeWithRuntime(
   }
   prepared.used = true;
   void runtime;
+  // A field the tool's own schema declares as file content, filled with the
+  // path of a file on this computer, carries that file's bytes; checked the
+  // way every lane checks a file before it leaves (nothing is sent on refusal).
+  const definition = prepared.snapshot.definitions
+    .find((entry) => entry.definition.operationId === call.operationId)?.definition;
+  const args = mcpArgumentsWithFileContent(definition?.inputSchema, call.args);
   const result = runtime.invokePreparedOperation
-    ? await runtime.invokePreparedOperation(prepared.snapshot.server, call.operationId, call.args)
-    : await prepared.snapshot.server.callTool(call.operationId, call.args);
+    ? await runtime.invokePreparedOperation(prepared.snapshot.server, call.operationId, args)
+    : await prepared.snapshot.server.callTool(call.operationId, args);
   return normalizeProductionMcpResult(result);
 }
 
