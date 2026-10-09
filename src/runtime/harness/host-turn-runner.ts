@@ -1166,6 +1166,20 @@ export function hostRecoveryCallMatchesOperation(
   return canonical !== null && provenReads.some(name => canonicalLogicalToolName(name) === canonical);
 }
 
+/**
+ * Whether a consequence puts the turn on the narrow recovery surface. A call
+ * that changed nothing (a read or any other non-mutating call that failed)
+ * does not: there is no effect to reconcile, so narrowing protects nothing.
+ * It only refused the next useful step, a different tool, which then counted
+ * as another failure. The failed call's own result says what went wrong, and
+ * the governor's retry budget still bounds a loop.
+ */
+export function noProgressConsequenceNarrowsSurface(
+  consequence: NoProgressGovernorState['lastConsequence'] | undefined,
+): boolean {
+  return consequence !== undefined && consequence !== null && consequence.stage !== 'execution:unknown_read';
+}
+
 export function hostNoProgressRecoveryToolNames(
   consequence: NoProgressGovernorState['lastConsequence'],
   toolNames: readonly string[],
@@ -9933,7 +9947,7 @@ const runHostTurnBody = async (
               // forced the model into an unrelated plan_task.  Discovery and
               // every typed repair/ask consequence remain recovery-only; the
               // governor still terminalizes the next no-gain attempt.
-              noProgressRecoveryOnly = attempt.consequence !== undefined;
+              noProgressRecoveryOnly = noProgressConsequenceNarrowsSurface(attempt.consequence);
               if (!noProgressRecoveryOnly) {
                 noProgressRecoveryDirectiveWritten = false;
               }
