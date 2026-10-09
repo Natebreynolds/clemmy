@@ -38,6 +38,7 @@ import {
   composioToolSchemaObservedAt,
   getExactComposioToolsBySlugs,
   listUsableConnectedToolkits,
+  peekConnectedToolkits,
   selectToolkitConnection,
 } from '../integrations/composio/client.js';
 import {
@@ -1368,6 +1369,9 @@ const INDEX_NOMINATION_DEADLINE_MS = 4_000;
 /** Return just before the broker-owned abort so completed partial progress is
  * observed by the caller rather than discarded at the same timer boundary. */
 const PROVIDER_SOURCE_RETURN_MARGIN_MS = 100;
+/** How long before the search deadline the provider source answers from
+ * current contract leases instead of waiting on a slow live search. */
+const COMPOSIO_LEASED_FALLBACK_MARGIN_MS = 1_500;
 
 function exactDiscoveryDeadline(sourceDeadlineAt?: number): number {
   const ownDeadline = Date.now() + INDEX_NOMINATION_DEADLINE_MS;
@@ -2391,9 +2395,59 @@ export function buildAuthorizedToolSearchCandidateSources(
     preparedSearchCandidates.set(candidate.name, candidate);
     return candidate;
   };
+  // When the live provider search cannot answer inside the search deadline,
+  // the operations this home already holds a current contract for, on an app
+  // that is connected, still answer the query. Live 2026-10-09: the provider
+  // search took 11 s, missed the deadline, and a just-connected Slides
+  // batch update whose contract was cached never reached the model, which
+  // then reached for a shell command instead. Contract leases are the same
+  // proof the exact path above accepts; nothing here mints new authority.
+  const leasedIndexedComposioCandidates = (query: string): ToolSearchBrokerCandidate[] => {
+    let connected: Set<string>;
+    try {
+      connected = new Set(peekConnectedToolkits()
+        .filter((connection) => /active|enabled|initiat/i.test(connection.status ?? ''))
+        .map((connection) => connection.slug.trim().toLowerCase()));
+    } catch { return []; }
+    if (connected.size === 0) return [];
+    return searchCapabilityOperations(query, { limit: 20, carrierKind: 'composio' })
+      .flatMap((hit) => {
+        const slug = hit.identifier.trim().toUpperCase();
+        const toolkit = registeredToolkitOfSlug(slug).trim().toLowerCase();
+        if (!connected.has(toolkit)) return [];
+        const lease = rememberedExactComposioLease(slug);
+        if (!lease) return [];
+        return [rememberPreparedSearchCandidate({
+          ...exactComposioSearchCandidate(slug, lease.schema, hit.description || hit.displayName),
+          score: composioDiscoveryScore(hit.score, toolkit, slug),
+        })];
+      })
+      .slice(0, 8);
+  };
   const composio: ToolSearchCandidateSource = {
     kind: 'authorized_composio',
-    async search({ query, signal, deadlineAt, accountSelection, deferPreparation }) {
+    async search(input) {
+      const { query, deadlineAt } = input;
+      if (deadlineAt === undefined || exactComposioOperationsFromQuery(query).length > 0) return searchLive(input);
+      const budgetMs = deadlineAt - Date.now() - COMPOSIO_LEASED_FALLBACK_MARGIN_MS;
+      if (budgetMs <= 0) return leasedIndexedComposioCandidates(query);
+      const live = searchLive(input);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<'late'>((resolve) => { timer = setTimeout(() => resolve('late'), budgetMs); });
+      try {
+        const raced = await Promise.race([live, late]);
+        if (raced !== 'late') return raced;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      // The live search keeps going and teaches what it learns; this answer
+      // uses what is already proven current.
+      live.catch(() => undefined);
+      return leasedIndexedComposioCandidates(query);
+    },
+    prepareCandidates: (input) => prepareCandidatesLive(input),
+  };
+  async function searchLive({ query, signal, deadlineAt, accountSelection, deferPreparation }: Parameters<ToolSearchCandidateSource['search']>[0]): Promise<ToolSearchBrokerCandidate[]> {
       preparedSearchCandidates.clear();
       if (signal?.aborted) return [];
       const exactOperations = exactComposioOperationsFromQuery(query);
@@ -2666,8 +2720,8 @@ export function buildAuthorizedToolSearchCandidateSources(
         // page size/cursors; truncating here made provider rank nine impossible
         // to recover without another physical discovery epoch.
         .slice(0, 20);
-    },
-    async prepareCandidates({ candidates, signal, deadlineAt, reuseSearchPreparation }) {
+  }
+  async function prepareCandidatesLive({ candidates, signal, deadlineAt, reuseSearchPreparation }: Parameters<NonNullable<ToolSearchCandidateSource['prepareCandidates']>>[0]): Promise<ToolSearchBrokerCandidate[]> {
       const requested = new Map(candidates.map((candidate) => [candidate.name.trim().toUpperCase(), candidate]));
       const alreadyPrepared = [...requested.keys()].flatMap((slug) => {
         const candidate = reuseSearchPreparation ? preparedSearchCandidates.get(slug) : undefined;
@@ -2700,8 +2754,7 @@ export function buildAuthorizedToolSearchCandidateSources(
           invocation: { name: 'composio_execute_tool', fixedArgs: { tool_slug: candidate.slug }, payloadField: 'arguments' },
         }] : [];
       })];
-    },
-  };
+  }
 
   // These sources are disjoint: native MCP metadata is enumerated once; the
   // read registry here contains reviewed CLI descriptors only. Presenting a
