@@ -89,23 +89,24 @@ function ReplyProse({ text, streaming, failed }: { text: string; streaming?: boo
   );
 }
 
-/** A draft stays on the page while it is checked or corrected: a withdrawn
- *  one dims until the next draft or the delivered reply replaces it in
- *  place, and a line underneath says where it stands. */
-function DraftFrame({ draft, children }: { draft: ChatMessage['answerDraft']; children: React.ReactNode }) {
-  const status = answerDraftStatus(draft);
-  const withdrawn = draft?.phase === 'withdrawn';
+/** The longest line that reads as what she is doing rather than an answer. */
+const LIVE_WORDS_MAX = 280;
+
+/** A draft stays on the page while it is checked or corrected, at full
+ *  strength: only a draft the reviewer sent back dims, since those words will
+ *  not stand. A quiet line underneath says where it stands, and only while the
+ *  turn is live (a stopped turn keeps no "checking" line). */
+function DraftFrame({ draft, live, children }: { draft: ChatMessage['answerDraft']; live: boolean; children: React.ReactNode }) {
+  const status = live ? answerDraftStatus(draft) : null;
+  const sentBack = draft?.phase === 'withdrawn' && draft.withdrawn === 'review';
   return (
     <>
-      <div className={cn('transition-opacity duration-base', withdrawn && 'opacity-60')} aria-busy={status ? true : undefined}>
+      <div className={cn('transition-opacity duration-base', live && sentBack && 'opacity-60')} aria-busy={status ? true : undefined}>
         {children}
       </div>
       {status && (
-        <p className={cn('flex items-center gap-2 text-small', withdrawn && draft?.withdrawn === 'review' ? 'text-warning' : 'text-muted')} role="status">
-          <span className="relative flex h-2 w-2" aria-hidden>
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-current opacity-40 motion-reduce:animate-none" />
-            <span className="relative inline-flex h-2 w-2 rounded-full bg-current" />
-          </span>
+        <p className={cn('flex items-center gap-2 text-caption', sentBack ? 'text-warning' : 'text-faint')} role="status">
+          <span className="inline-flex h-1.5 w-1.5 rounded-full bg-current" aria-hidden />
           {status}
         </p>
       )}
@@ -533,7 +534,17 @@ export function ChatBubble({
   // The harness is right to send both; a surface that renders one must not
   // render the other.
   const planCardCarriesTheReply = Boolean(message.planArtifactRef);
+  // While she works, the sentence she wrote before a tool ran (a draft set
+  // aside for the tool call) and her first words are what she is DOING, so
+  // they lead the work line instead of sitting in the answer's place.
+  // A plain stream without a draft identity is an answer, not a sentence:
+  // only a short line counts as her words about the work.
+  const liveWords = thinking && message.text.trim().length <= LIVE_WORDS_MAX && (
+    (message.answerDraft?.phase === 'withdrawn' && message.answerDraft.withdrawn === 'tool_call')
+    || (!message.answerDraft && !message.approval)
+  ) ? message.text.trim() : '';
   const hasReplyText = Boolean(message.text.trim())
+    && !liveWords
     && !stoppedPlaceholder
     && !planCardCarriesTheReply;
   // A turn with no words, no plan and no decision draws no reply at all: the
@@ -555,8 +566,7 @@ export function ChatBubble({
           items={message.activity ?? []}
           live={live}
           progress={message.progress}
-          draft={message.answerDraft}
-          hasText={hasReplyText}
+          words={liveWords || undefined}
           terminalOutcome={live ? undefined : activityTerminalOutcomeForMessageStatus(message.status)}
           traceHref={traceHref}
           onBackground={live ? onBackground : undefined}
@@ -570,7 +580,7 @@ export function ChatBubble({
           {message.taskMode?.kind === 'plan' && <div className="text-caption font-semibold text-primary">{thinking ? 'Planning · read-only investigation' : 'Plan investigation'}</div>}
           {message.planArtifactRef && <PlanReview planRef={message.planArtifactRef} sessionId={sessionId} busy={executionBusy} onPrepare={onPreparePlan} onExecute={onExecutePlan} onRevise={onRevisePlan} />}
           {hasReplyText && (
-            <DraftFrame draft={message.answerDraft}>
+            <DraftFrame draft={message.answerDraft} live={thinking}>
               <ReplyProse
                 text={message.text}
                 streaming={thinking && message.answerDraft?.phase !== 'withdrawn' && message.answerDraft?.phase !== 'checking'}

@@ -175,6 +175,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
               onReject={() => resolveDecision(m, 'reject')}
               onApproveWithEdits={(fields) => chat.approveWithEdits(m, fields)}
               onPreparePlan={chat.preparePlan}
+              onBackground={chat.background}
               // Suggested answers stay tappable only while the question is the
               // newest message; once anything follows it, they are a record.
               onAnswer={index === chat.messages.length - 1 ? (text, connectionResume) => connectionResume ? chat.send({ text, connectionResume }) : send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}

@@ -23,7 +23,7 @@ const bubble = read('../../components/chat/ChatBubble.tsx');
 
 test('a reopened conversation keeps every control the new-chat surface has', () => {
   for (const [prop, what] of [
-    ['onBackground', 'Continue in background'],
+    ['onBackground', 'Run in background'],
     ['onPreparePlan', 'plan Prepare'],
     ['onStop', 'Stop'],
     ['onRetryPending', 'retry an unconfirmed send'],

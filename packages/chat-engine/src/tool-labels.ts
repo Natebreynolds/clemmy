@@ -184,3 +184,54 @@ export function providerLabel(provider: string | undefined): string {
     default: return 'Agent';
   }
 }
+
+/** A step in people's words: the app it happened in, what is being done, and
+ *  what was done. */
+export interface FriendlyStep {
+  app?: string;
+  action: string;
+  done: string;
+}
+
+/** Verbs by meaning, present then past. Read from the label's own words, never
+ *  from a list of operations, so any connected tool reads naturally. */
+const STEP_VERBS: ReadonlyArray<readonly [RegExp, string, string]> = [
+  [/^(get|list|fetch|read|view|retrieve|load|show|check|count|describe)$/, 'Reading', 'Read'],
+  [/^(search|find|query|lookup|look)$/, 'Searching', 'Searched'],
+  [/^(create|add|insert|new|make)$/, 'Creating', 'Created'],
+  [/^(update|patch|edit|modify|set|change|rename|move)$/, 'Updating', 'Updated'],
+  [/^(send|post|reply|forward|publish|share|invite)$/, 'Sending', 'Sent'],
+  [/^(delete|remove|archive|trash|cancel)$/, 'Removing', 'Removed'],
+  [/^draft$/, 'Drafting', 'Drafted'],
+  [/^(write|save|upload|append|replace)$/, 'Saving', 'Saved'],
+  [/^(run|execute|exec|call|invoke)$/, 'Running', 'Ran'],
+  [/^(download|export)$/, 'Downloading', 'Downloaded'],
+];
+
+function stepVerb(word: string | undefined): readonly [string, string] | null {
+  if (!word) return null;
+  const hit = STEP_VERBS.find(([pattern]) => pattern.test(word));
+  return hit ? [hit[1], hit[2]] : null;
+}
+
+/** "outlook get calendar view" → Outlook · "Reading calendar view" / "Read
+ *  calendar view"; "read file" → "Reading file". A label that already reads
+ *  as words (anything not a lower-case slug) is kept as it is. */
+export function friendlyStep(label: string): FriendlyStep {
+  const text = (label ?? '').trim();
+  if (!text || /[A-Z…]/.test(text) || !/^[a-z0-9 ·_-]+$/.test(text)) return { action: text, done: text };
+  const words = text.replace(/[·_-]+/g, ' ').split(/\s+/).filter(Boolean);
+  const first = stepVerb(words[0]);
+  if (first) {
+    const rest = words.slice(1).join(' ');
+    return { action: rest ? `${first[0]} ${rest}` : first[0], done: rest ? `${first[1]} ${rest}` : first[1] };
+  }
+  const second = stepVerb(words[1]);
+  if (second && words.length >= 2) {
+    const app = words[0].charAt(0).toUpperCase() + words[0].slice(1);
+    const rest = words.slice(2).join(' ');
+    return { app, action: rest ? `${second[0]} ${rest}` : second[0], done: rest ? `${second[1]} ${rest}` : second[1] };
+  }
+  const sentence = text.charAt(0).toUpperCase() + text.slice(1).replace(/[_·]+/g, ' ');
+  return { action: sentence, done: sentence };
+}

@@ -362,8 +362,8 @@ export function Composer({
                 variant="ghost"
                 size="icon"
                 onClick={onBackground}
-                aria-label="Continue in background"
-                title="Continue in background — keeps working, reports back here, frees the chat"
+                aria-label="Run in background"
+                title="Run in background — keeps working, reports back here, frees the chat"
                 className="h-8 w-8 rounded-full"
               >
                 <SendToBack className="h-4 w-4" aria-hidden />

@@ -12,8 +12,8 @@ const CHAT = readFileSync(new URL('../../screens/Chat.tsx', import.meta.url), 'u
 const THREAD = readFileSync(new URL('./chat/ConversationThread.tsx', import.meta.url), 'utf8');
 const SHELL = readFileSync(new URL('../../components/AppShell.tsx', import.meta.url), 'utf8');
 
-test('the live chat thread packs against the composer on a reading column', () => {
-  assert.match(CHAT_THREAD, /max-w-3xl/);
+test('the live chat thread packs against the composer on a column that fills the window', () => {
+  assert.match(CHAT_THREAD, /max-w-\[60rem\]/);
   assert.match(CHAT_THREAD, /justify-end/);
   assert.match(CHAT_THREAD, /gap-7/);
   assert.doesNotMatch(CHAT_THREAD, /space-y-/);

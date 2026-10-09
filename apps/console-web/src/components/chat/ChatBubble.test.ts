@@ -28,7 +28,7 @@ test('the answer is typeset by the shared escaping renderer, never boxed', () =>
 
 test('a running turn can always be moved to the background from its work line', () => {
   assert.match(SOURCE, /onBackground=\{live \? onBackground : undefined\}/);
-  assert.match(WORK_LINE, /Move to background/);
+  assert.match(WORK_LINE, /Run in background/);
 });
 
 test('suggested answers are buttons only where an answer can land', () => {
