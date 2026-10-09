@@ -14,11 +14,11 @@ test('a job id round-trips through its ledger channel', () => {
   assert.equal(isMemoryJobId('toString'), false);
 });
 
-test('independent checks stay on the checker; the search index stays local', () => {
-  assert.equal(MEMORY_JOBS.standing.modelOwner, 'checker');
+test('the standing check follows the memory model; verify stays on the checker; the search index stays local', () => {
+  assert.equal(MEMORY_JOBS.standing.modelOwner, 'memory');
   assert.equal(MEMORY_JOBS.verify.modelOwner, 'checker');
   assert.equal(MEMORY_JOBS.index.modelOwner, 'local');
-  assert.deepEqual(MEMORY_JOB_IDS.filter(memoryJobUsesMemoryModel), ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import']);
+  assert.deepEqual(MEMORY_JOB_IDS.filter(memoryJobUsesMemoryModel), ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import', 'standing']);
 });
 
 test('the nightly jobs keep their clock; jobs started by an event have none', async () => {
