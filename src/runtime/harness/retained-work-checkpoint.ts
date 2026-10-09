@@ -31,7 +31,7 @@ export function ownerFacingRetainedWorkCheckpoint(text: string): string {
   const head = text.slice(0, index).trimEnd();
   const lines = text.slice(index + RETAINED_WORK_TERMINAL_HEADER.length).split('\n').map((line) => line.trim()).filter(Boolean);
   let kept = 0;
-  type WriteState = 'succeeded' | 'failed' | 'mixed' | 'uncertain' | 'not_recorded';
+  type WriteState = 'succeeded' | 'failed' | 'mixed' | 'uncertain' | 'refused' | 'not_recorded';
   let writeState: WriteState | null = null;
   for (const line of lines) {
     if (line.startsWith('- ')) {
@@ -39,7 +39,7 @@ export function ownerFacingRetainedWorkCheckpoint(text: string): string {
       kept += more ? Number(more[1]) : 1;
       continue;
     }
-    const state = /^External write state(?: \([^)]*\))?: (succeeded|failed|mixed|uncertain|no settled)/.exec(line);
+    const state = /^External write state(?: \([^)]*\))?: (succeeded|failed|mixed|uncertain|refused|no settled)/.exec(line);
     if (state) writeState = (state[1] === 'no settled' ? 'not_recorded' : state[1]) as WriteState;
   }
   const sentences: string[] = [];
@@ -49,6 +49,7 @@ export function ownerFacingRetainedWorkCheckpoint(text: string): string {
     case 'failed': sentences.push('The change outside this machine did not go through.'); break;
     case 'mixed': sentences.push('Some changes outside this machine went through and at least one did not; I won\'t repeat the ones that did.'); break;
     case 'uncertain': sentences.push('I can\'t yet confirm whether the change outside this machine went through; I\'ll check before trying again.'); break;
+    case 'refused': sentences.push('The app turned the change down; I won\'t try it again without asking you.'); break;
     case 'not_recorded': sentences.push('Nothing outside this machine was changed.'); break;
     default: break;
   }

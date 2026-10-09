@@ -18,7 +18,9 @@ export type RetainedExternalWriteState =
   | 'succeeded'
   | 'failed'
   | 'mixed'
-  | 'uncertain';
+  | 'uncertain'
+  /** The app refused the write in its own reply; nothing reruns on its own. */
+  | 'refused';
 
 export interface RetainedWorkItem {
   toolName: string;
@@ -39,6 +41,7 @@ interface SettlementInventoryRow {
   logical_tool_call_id: string;
   tool_name: string;
   outcome_kind: string;
+  outcome_detail: string | null;
   business_call: number;
   mutating: number;
   physical_crossing_count: number;
@@ -59,8 +62,16 @@ function externalWriteState(rows: readonly SettlementInventoryRow[]): {
   if (writes.length === 0) return { state: 'not_recorded', tools: [] };
   const tools = [...new Set(writes.map((row) => boundedIdentity(row.tool_name, 96)).filter(Boolean))]
     .slice(0, 4);
-  if (writes.some((row) => row.requires_reconciliation === 1 || row.outcome_kind === 'uncertain_write')) {
+  const answeredRefusal = (row: SettlementInventoryRow) => row.outcome_kind === 'uncertain_write'
+    && row.outcome_detail === 'provider_refused_envelope';
+  if (writes.some((row) => (row.requires_reconciliation === 1 || row.outcome_kind === 'uncertain_write') && !answeredRefusal(row))) {
     return { state: 'uncertain', tools };
+  }
+  // Every unsettled write was refused by the app in its own reply, and none
+  // landed: say so, rather than "uncertain, reconcile before any retry".
+  if (writes.some(answeredRefusal)
+    && !writes.some((row) => row.outcome_kind === 'succeeded' || row.outcome_kind === 'empty_result')) {
+    return { state: 'refused', tools };
   }
   const knownSuccess = writes.some((row) => (
     row.outcome_kind === 'succeeded' || row.outcome_kind === 'empty_result'
@@ -86,7 +97,7 @@ export function retainedWorkInventoryForAcceptedSource(input: {
   try {
     const rows = openEventLog().prepare(`
       SELECT l.accepted_task_id, l.logical_tool_call_id, l.tool_name,
-             s.outcome_kind, s.business_call, s.mutating,
+             s.outcome_kind, s.outcome_detail, s.business_call, s.mutating,
              s.physical_crossing_count, s.requires_reconciliation,
              s.result_handle_id, s.settled_at
         FROM logical_call_settlements s
@@ -164,6 +175,8 @@ function downstreamWriteLine(inventory: RetainedWorkInventory): string {
       return `External write state${tools}: mixed known results, including at least one success and at least one failure. Do not repeat successful writes; isolate the failed operation before reusing retained source work.`;
     case 'uncertain':
       return `External write state${tools}: uncertain. Reconcile it before any retry.`;
+    case 'refused':
+      return `External write state${tools}: refused by the app in its reply. Nothing reruns on its own; a changed attempt goes to the owner first.`;
     case 'not_recorded':
       return 'External write state: no settled external-write attempt is recorded.';
   }

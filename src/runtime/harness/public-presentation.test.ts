@@ -1125,6 +1125,12 @@ test('a blocked turn discloses retained work in plain words, with no handles or 
     ownerFacingRetainedWorkCheckpoint('Stopped.\n\nRetained work (durable checkpoint):\n- Source/tool list_files: completed result retained as rh_1.\nExternal write state: no settled external-write attempt is recorded.'),
     "Stopped.\n\nI kept the result from this turn, so a retry won't fetch it again. Nothing outside this machine was changed.",
   );
+  // Owner 2026-10-09: an app that turned the write down said so; the owner
+  // hears that, not "can't confirm whether it went through".
+  assert.equal(
+    ownerFacingRetainedWorkCheckpoint('I could not attach it.\n\nRetained work (durable checkpoint):\n- Source/tool list_files: completed result retained as rh_1.\nExternal write state (outlook_create_draft): refused by the app in its reply. Nothing reruns on its own; a changed attempt goes to the owner first.'),
+    "I could not attach it.\n\nI kept the result from this turn, so a retry won't fetch it again. The app turned the change down; I won't try it again without asking you.",
+  );
   assert.equal(ownerFacingRetainedWorkCheckpoint('Plain reply with no checkpoint.'), 'Plain reply with no checkpoint.');
   // The public projection of a blocked terminal uses it; a question still drops the checkpoint entirely.
   const identity = { sessionId: 'public-projection-test', turn: 1, sourceUserSeq: 11 };
