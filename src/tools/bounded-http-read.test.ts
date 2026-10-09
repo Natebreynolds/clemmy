@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { boundedHttpRead, HTTP_READ_MAX_BYTES } from './bounded-http-read.js';
+import { boundedHttpRead, HTTP_READ_IMAGE_MAX_BYTES, HTTP_READ_MAX_BYTES } from './bounded-http-read.js';
 
 test('HTTP read follows bounded redirects and preserves exact response evidence', async () => {
   const urls: string[] = [];
@@ -54,4 +54,32 @@ test('HTTP read retains HTTP failure status, bounds redirect loops and oversized
     cancel() { cancelled = true; },
   }))), /1 MiB/);
   assert.equal(cancelled, true);
+});
+
+const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32, 7)]);
+
+test('an image URL comes back as the image itself, when the bytes agree with the declared type', async () => {
+  const shown = await boundedHttpRead('https://example.com/thumb', async () => new Response(PNG, { headers: { 'content-type': 'image/png' } }));
+  assert.deepEqual(shown.image, { data: PNG.toString('base64'), mimeType: 'image/png' });
+  assert.equal(shown.body, undefined, 'the pixels are not also sent as text');
+  assert.equal(shown.sha256, createHash('sha256').update(PNG).digest('hex'));
+  // The bytes decide the type, not the header.
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+  assert.equal((await boundedHttpRead('https://example.com/a', async () => new Response(jpeg, { headers: { 'content-type': 'image/png' } }))).image?.mimeType, 'image/jpeg');
+  // A page that only claims to be an image is text.
+  const claimed = await boundedHttpRead('https://example.com/b', async () => new Response('<html>no</html>', { headers: { 'content-type': 'image/png' } }));
+  assert.equal(claimed.image, undefined);
+  assert.equal(claimed.body, '<html>no</html>');
+  // An unsupported image type and a failed request stay text evidence.
+  assert.equal((await boundedHttpRead('https://example.com/c', async () => new Response('<svg/>', { headers: { 'content-type': 'image/svg+xml' } }))).body, '<svg/>');
+  const missing = await boundedHttpRead('https://example.com/d', async () => new Response(PNG, { status: 404, headers: { 'content-type': 'image/png' } }));
+  assert.equal(missing.image, undefined);
+  assert.equal(missing.ok, false);
+});
+
+test('an image may be larger than text, up to the viewing limit', async () => {
+  const big = Buffer.concat([PNG, Buffer.alloc(HTTP_READ_MAX_BYTES + 10)]);
+  assert.equal((await boundedHttpRead('https://example.com/big', async () => new Response(big, { headers: { 'content-type': 'image/png' } }))).image?.mimeType, 'image/png');
+  const tooBig = Buffer.concat([PNG, Buffer.alloc(HTTP_READ_IMAGE_MAX_BYTES)]);
+  await assert.rejects(boundedHttpRead('https://example.com/huge', async () => new Response(tooBig, { headers: { 'content-type': 'image/png' } })), /viewing limit/);
 });

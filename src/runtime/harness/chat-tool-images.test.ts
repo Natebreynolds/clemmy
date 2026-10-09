@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
 import { withTrace } from '@openai/agents-core';
-import { projectChatToolImages, withChatToolImages } from './chat-tool-images.js';
+import { CHAT_TOOL_IMAGES_PER_REQUEST, projectChatToolImages, UNSEEN_IMAGE_NOTE, withChatToolImages } from './chat-tool-images.js';
 import { withTracelessStep } from './traceless-step-model.js';
 import { wrapCompletionsCreate } from './byo-model.js';
 
@@ -53,3 +53,92 @@ for (const mode of ['response', 'stream'] as const) {
     assert.equal(JSON.stringify(body).split(image).length - 1, 1, 'pixels appear exactly once, not as base64 text');
   });
 }
+
+function imageTurn(count: number): any[] {
+  const rows: any[] = [{ role: 'user', content: 'Check the slides.' }];
+  for (let index = 1; index <= count; index += 1) {
+    rows.push({ type: 'function_call', callId: `shot${index}`, name: 'http_read', arguments: '{}' });
+    rows.push({ type: 'function_call_result', callId: `shot${index}`, name: 'http_read', status: 'completed', output: [
+      { type: 'input_text', text: `slide ${index}` }, { type: 'input_image', image: `data:image/png;base64,${index}` },
+    ] });
+  }
+  return rows;
+}
+
+function attachedImages(projected: any): string[] {
+  return (projected as any[]).filter((row) => row.role === 'user' && Array.isArray(row.content))
+    .flatMap((row) => row.content.filter((part: any) => part.type === 'input_image').map((part: any) => part.image));
+}
+
+test('only the latest tool images ride along; earlier ones leave a note naming how to see them again', () => {
+  const turn = imageTurn(CHAT_TOOL_IMAGES_PER_REQUEST + 2);
+  const projected = projectChatToolImages(turn) as any[];
+  assert.deepEqual(attachedImages(projected), [3, 4, 5, 6].map((index) => `data:image/png;base64,${index}`));
+  const first = projected.find((row) => row.type === 'function_call_result' && row.callId === 'shot1');
+  assert.match(JSON.stringify(first.output), /no longer attached\. Call the tool again/);
+  assert.equal(JSON.stringify(turn).includes('no longer attached'), false, 'canonical history is untouched');
+});
+
+test('without images, every image becomes a note that it was not seen', () => {
+  const projected = projectChatToolImages(imageTurn(2), { withoutImages: true }) as any[];
+  assert.deepEqual(attachedImages(projected), []);
+  assert.equal(projected.filter((row) => row.role === 'user').length, 1, 'no image message is sent');
+  for (const callId of ['shot1', 'shot2']) {
+    const row = projected.find((item) => item.type === 'function_call_result' && item.callId === callId);
+    assert.ok(row.output.some((part: any) => part.text === UNSEEN_IMAGE_NOTE), callId);
+  }
+});
+
+function refusingModel(status: number) {
+  const seen: any[] = [];
+  const carries = (request: any) => attachedImages(request.input).length > 0;
+  const fail = () => Object.assign(new Error(`${status} image_url is not supported`), { status });
+  const answer = { output: [], usage: {}, responseId: 'ok' } as any;
+  return {
+    seen,
+    model: {
+      async getResponse(request: any) { seen.push(request); if (carries(request)) throw fail(); return answer; },
+      async *getStreamedResponse(request: any) {
+        seen.push(request);
+        if (carries(request)) throw fail();
+        yield { type: 'response_done', response: answer } as any;
+      },
+    },
+  };
+}
+
+for (const mode of ['response', 'stream'] as const) {
+  test(`a model that refuses images is asked once more with notes in their place, and that is remembered (${mode})`, async () => {
+    let clock = 1_000;
+    const { seen, model: inner } = refusingModel(400);
+    const model = withChatToolImages(inner as never, () => clock);
+    const run = async (request: any) => {
+      if (mode === 'response') return model.getResponse(request);
+      for await (const _ of model.getStreamedResponse(request)) { /* drain */ }
+    };
+    const request: any = { input: imageTurn(1), modelSettings: {}, tools: [], handoffs: [], outputType: 'text', tracing: false };
+    await run(request);
+    assert.equal(seen.length, 2);
+    assert.equal(attachedImages(seen[0].input).length, 1);
+    assert.equal(attachedImages(seen[1].input).length, 0);
+    assert.match(JSON.stringify(seen[1].input), /was not seen/);
+    await run(request);
+    assert.equal(seen.length, 3, 'the next request goes without images straight away');
+    clock += 16 * 60_000;
+    await run(request);
+    assert.equal(seen.length, 5, 'after a while the model is offered images again');
+  });
+}
+
+test('a refusal that is about the moment, the account or the quota is not answered by dropping images', async () => {
+  for (const status of [429, 401, 500]) {
+    const { seen, model: inner } = refusingModel(status);
+    const model = withChatToolImages(inner as never);
+    await assert.rejects(model.getResponse({ input: imageTurn(1) } as any));
+    assert.equal(seen.length, 1, String(status));
+  }
+  const { seen, model: inner } = refusingModel(400);
+  const model = withChatToolImages(inner as never);
+  await model.getResponse({ input: [{ role: 'user', content: 'no images here' }] } as any);
+  assert.equal(seen.length, 1);
+});
