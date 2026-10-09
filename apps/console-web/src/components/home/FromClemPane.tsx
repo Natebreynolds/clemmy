@@ -177,7 +177,7 @@ export function FromClemPane({
           className="flex flex-col items-stretch gap-1 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
           {meta(row)}
           {report && <span className="text-body font-semibold text-fg">{row.text}</span>}
-          <span className={cn('text-body text-fg', open ? report && 'whitespace-pre-line' : 'line-clamp-2')}>{row.say || row.text}</span>
+          <span className={cn('text-body text-fg', open ? report && 'whitespace-pre-line [overflow-wrap:anywhere]' : 'line-clamp-2')}>{row.say || row.text}</span>
         </button>
         {open && !report && source(row) && <p className="whitespace-pre-line text-small text-muted">{source(row)}</p>}
         {state.notice ? notice(state) : (
