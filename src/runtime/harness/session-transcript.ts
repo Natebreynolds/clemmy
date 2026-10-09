@@ -740,11 +740,13 @@ function conservativePriorWorkCompatibility(
   return { eligible: true, tokenScore: tokenScore.containment };
 }
 
+/** The deadline holds the process until it fires or the work wins (it is
+ *  always cleared), so a caller awaiting it is never stranded by an otherwise
+ *  idle event loop. */
 async function withPriorWorkDeadline<T>(work: Promise<T>, ms: number): Promise<T | null> {
   let timer: NodeJS.Timeout | undefined;
   const expiry = new Promise<null>((resolve) => {
     timer = setTimeout(() => resolve(null), ms);
-    timer.unref?.();
   });
   try {
     return await Promise.race([work, expiry]);

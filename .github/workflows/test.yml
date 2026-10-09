@@ -291,7 +291,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $env:CLEMENTINE_HOME = Join-Path $env:RUNNER_TEMP 'clem-win-smoke'
+          # A real home lives in the user's own profile, which only that user
+          # (and the system) can read; credential storage refuses anything
+          # broader. The runner's shared temp folder is broader.
+          $env:CLEMENTINE_HOME = Join-Path $env:USERPROFILE '.clem-win-smoke'
           New-Item -ItemType Directory -Force -Path (Join-Path $env:CLEMENTINE_HOME 'state') | Out-Null
           $env:MCP_AUTO_IMPORT_ENABLED = 'false'
           $log = Join-Path $env:RUNNER_TEMP 'daemon-smoke.log'
