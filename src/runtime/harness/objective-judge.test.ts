@@ -598,6 +598,17 @@ test('review depth follows what the review protects', async () => {
     assert.deepEqual(pass.asked, [{ effort: 'medium', timeoutMs: READ_REVIEW_TIMEOUT_MS }], `${stakes}: a passing fast review is final and time-boxed`);
     assert.equal(p.reviewDepth, 'fast');
     assert.equal(p.verdict?.done, true);
+  }
+
+  // A read never buys a full review: its fast finding is the verdict.
+  const readSendBack = script({ done: false, reason: 'fast: figure missing' }, { done: true, reason: 'full: never asked' });
+  const r = await reviewAtStakes('read', readSendBack.review);
+  assert.deepEqual(readSendBack.asked, [{ effort: 'medium', timeoutMs: READ_REVIEW_TIMEOUT_MS }], 'read: one fast review, even when it sends the work back');
+  assert.equal(r.verdict?.reason, 'fast: figure missing');
+  assert.equal(r.reviewDepth, 'fast');
+  assert.equal(r.reviewConfirmation, undefined);
+
+  for (const stakes of ['plan'] as const) {
 
     const overruled = script({ done: false, reason: 'fast: looks unsupported' }, { done: true, reason: 'full: the evidence supports it' });
     const o = await reviewAtStakes(stakes, overruled.review);
@@ -620,7 +631,7 @@ test('review depth follows what the review protects', async () => {
 
   const other = { modelId: 'judge-model', judgeFamily: 'codex', model: null, brainFamily: 'byo', selfJudge: false } as never;
   const asked: unknown[] = [];
-  const once = await reviewAtStakes('read', async (depth) => {
+  const once = await reviewAtStakes('plan', async (depth) => {
     asked.push(depth);
     return { verdict: { done: false, reason: 'not done' }, failure: null, routing: other };
   });
@@ -629,7 +640,7 @@ test('review depth follows what the review protects', async () => {
   assert.equal(once.reviewConfirmation, 'upheld');
 });
 
-test('incomplete read evidence gets one default-depth review instead of a fast positive shortcut', async () => {
+test('incomplete read evidence gets one light review with the reviewer\'s own deadline, never a full one', async () => {
   const { READ_REVIEW_TIMEOUT_MS, reviewAtStakes } = await import('./objective-judge.js');
   for (const verdict of [{ done: true, reason: 'Supported after inspection.' },
     { done: false, reason: 'A coverage claim contradicts retained records.', repairScope: 'claims' as const }, null]) {
@@ -638,8 +649,8 @@ test('incomplete read evidence gets one default-depth review instead of a fast p
       asked.push(depth);
       return { verdict, failure: verdict ? null : 'timeout' as const };
     }, { readEvidenceComplete: false });
-    assert.deepEqual(asked, [{}], 'do not reduce effort or add a second judge call when receipt coverage is incomplete');
-    assert.equal(result.reviewDepth, 'full');
+    assert.deepEqual(asked, [{ effort: 'medium' }], 'one light review, with time to inspect retained data');
+    assert.equal(result.reviewDepth, 'fast');
     assert.deepEqual(result.verdict, verdict, 'preserve correction and unavailable-review semantics');
   }
   const asked: unknown[] = [];

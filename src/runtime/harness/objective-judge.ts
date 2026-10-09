@@ -1520,11 +1520,10 @@ export const READ_REVIEW_TIMEOUT_MS = 30_000;
 /**
  * Review depth follows what the review protects. Work that wrote to an app or
  * file gets the reviewer's full depth, with time to finish: that review is the
- * guarantee that what was written is right before the turn says done. A plan
- * (nothing runs until the owner approves it) and a read-only answer with
- * complete inspectable evidence get a fast review first; a fast
- * review that finds missing work is checked by a full review, whose
- * verdict decides. A scoped reply correction already verifies that the work
+ * guarantee that what was written is right before the turn says done. A
+ * read-only answer gets the fast review only. A plan (nothing runs until the
+ * owner approves it) gets a fast review first; a fast review that finds
+ * missing work is checked by a full review, whose verdict decides. A scoped reply correction already verifies that the work
  * is present: send it to the existing repair owner, which must have the revised
  * reply reviewed before completion. Reviewing the unchanged draft again only
  * delays that repair and cannot verify the eventual corrected reply. When
@@ -1543,15 +1542,16 @@ export async function reviewAtStakes(
     evidence.signal?.throwIfAborted();
     return { ...full, reviewDepth: 'full' };
   }
-  // Read-only is an effect classification, not proof that a factual answer is
-  // cheap to verify. Incomplete receipts may require inspecting retained data
-  // before accepting coverage/absence claims. Keep the selected model's default
-  // depth in that case; never downgrade it merely because no write occurred.
-  // This buys no extra call, grants no authority and changes no deadline.
-  if (stakes === 'read' && evidence.readEvidenceComplete === false) {
-    const full = await review({});
+  // The owner's rule: a full second-model review is for work that wrote or
+  // created something, never for a read. A read gets the light review, whose
+  // verdict stands; it reads the same evidence with the same lookups. With
+  // incomplete receipts it keeps the reviewer's own deadline, since inspecting
+  // retained data before accepting a coverage or absence claim takes longer.
+  if (stakes === 'read') {
+    const light = await review({ effort: 'medium',
+      ...(evidence.readEvidenceComplete === false ? {} : { timeoutMs: READ_REVIEW_TIMEOUT_MS }) });
     evidence.signal?.throwIfAborted();
-    return { ...full, reviewDepth: 'full' };
+    return { ...light, reviewDepth: 'fast' };
   }
   const fast = await review({ effort: 'medium', timeoutMs: READ_REVIEW_TIMEOUT_MS });
   evidence.signal?.throwIfAborted();
