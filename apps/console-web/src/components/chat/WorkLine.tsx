@@ -55,6 +55,18 @@ export function workLineSummary(
   return parts.join(' · ');
 }
 
+/** The turn's own span: from when she started thinking (the hidden model
+ *  row's start) to the last thing that settled, so the clock and "Worked"
+ *  count the whole turn, not just its tool steps. */
+function turnSpan(items: readonly ActivityItem[], fallback: { startedAt?: number; totalMs?: number }): { startedAt?: number; totalMs?: number } {
+  const finite = (value: number | undefined): value is number => typeof value === 'number' && Number.isFinite(value);
+  const starts = [items.find((item) => item.id === MODEL_PHASE_ACTIVITY_ID)?.startedAt, fallback.startedAt].filter(finite);
+  const startedAt = starts.length > 0 ? Math.min(...starts) : undefined;
+  const ends = items.map((item) => item.finishedAt).filter(finite);
+  const totalMs = startedAt !== undefined && ends.length > 0 ? Math.max(0, Math.max(...ends) - startedAt) : fallback.totalMs;
+  return { startedAt, totalMs };
+}
+
 /** The app a step happens in, by its real logo where the connection catalog
  *  has one, else its initial; a built-in step shows Clem's own mark. */
 function AppMark({ app }: { app?: string }) {
@@ -119,6 +131,7 @@ export function WorkLine({
   const view = work.length > 0 ? settleTerminalActivity(narrateActivity(work, { live }), live ? undefined : outcome) : [];
   if (!live && view.length === 0) return null;
   const head = activityCardHead(view, live, now);
+  const span = turnSpan(items, head);
   const { top, children } = groupActivityByParent(view);
   const anyRunning = live && view.some((row) => row.status === 'running');
   const current = anyRunning ? head.title : (progress ?? head.title);
@@ -156,7 +169,7 @@ export function WorkLine({
       || (inHand && running && step ? step.action : '')
       || (anyRunning ? current : progress)
       || (tools.length > 0 ? 'Working on it' : 'Getting started');
-    const clock = head.startedAt !== undefined ? clockLabel(head.startedAt, now) : '';
+    const clock = span.startedAt !== undefined ? clockLabel(span.startedAt, now) : '';
     const stepCount = top.filter((row) => row.kind !== 'check').length;
     return (
       <section aria-label="What Clem is doing" className="min-w-0">
@@ -232,7 +245,7 @@ export function WorkLine({
         className="-ml-1.5 inline-flex max-w-full items-center gap-2 rounded-sm px-1.5 py-1 text-small text-muted transition-colors duration-fast hover:bg-subtle hover:text-fg active:scale-press"
       >
         <OutcomeMark outcome={outcome} />
-        <span className="min-w-0 truncate">{workLineSummary(outcome, head.totalMs, stepCount, head.helpers, highlights)}</span>
+        <span className="min-w-0 truncate">{workLineSummary(outcome, span.totalMs, stepCount, head.helpers, highlights)}</span>
         <ChevronRight className={cn('h-3.5 w-3.5 shrink-0 text-faint transition-transform duration-base', open && 'rotate-90')} aria-hidden />
       </button>
       {open && (
