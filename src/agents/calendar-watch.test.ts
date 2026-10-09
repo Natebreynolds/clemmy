@@ -423,3 +423,53 @@ test('the watch runtime never dispatches through the raw provider client; reads 
   assert.match(source, /compileLiveCatalogWorkflowCallPlan/);
   assert.match(source, /refreshIndependentCapabilityObservation/);
 });
+
+// ── an answered invite reset by the organizer ────────────────────────────────
+
+test('an invite the owner answered that the organizer moved is ONE re-ask that says the reply was cleared', async () => {
+  // Live 2026-10-09: accepted at 1 PM, then moved to 2 PM; Outlook reset the
+  // response. Home showed "moved, nothing needed from you" beside "still
+  // needs your reply", and never said the owner had accepted.
+  const { buildCalendarWatchNotification } = await import('./calendar-watch.js');
+  const accepted = ev({ id: 'inv', subject: 'Q4 prep', myResponse: 'accepted', attendeeCount: 7, organizer: 'Organizer', startMs: NOW + 2 * H, endMs: NOW + 3 * H });
+  const reset = { ...accepted, myResponse: 'notResponded', showAs: 'tentative', startMs: NOW + 3 * H, endMs: NOW + 4 * H };
+  const changes = detect([accepted], [reset]);
+  assert.deepEqual(changes.map((c) => c.kind), ['invite_unanswered'], 'no separate moved note');
+  assert.equal(changes[0]!.priorResponse, 'accepted');
+  assert.deepEqual(changes[0]!.previous, { startMs: accepted.startMs, endMs: accepted.endMs });
+  const note = buildCalendarWatchNotification(changes[0]!, NOW, 'UTC', 'tick-x');
+  assert.match(note.title, /^Reply needed again: Q4 prep/);
+  assert.match(note.body, /\(was /);
+  assert.match(note.body, /Your earlier acceptance was cleared when the organizer moved it\./);
+  assert.equal(note.metadata?.priorResponse, 'accepted');
+  // Changed but not moved (the organizer edited it): still one re-ask.
+  const edited = detect([accepted], [{ ...accepted, myResponse: 'notResponded' }]);
+  assert.deepEqual(edited.map((c) => c.kind), ['invite_unanswered']);
+  assert.match(buildCalendarWatchNotification(edited[0]!, NOW, 'UTC', 'tick-y').body, /cleared when the organizer changed it/);
+  // An invite never answered keeps the ordinary first ask.
+  const fresh = detect([{ ...accepted, myResponse: 'notResponded' }], [reset]);
+  assert.equal(fresh.filter((c) => c.kind === 'invite_unanswered').length, 0, 'still unanswered is not a new ask');
+});
+
+test('the re-ask retires what was still open about the event and keeps the history of the earlier answer', async () => {
+  let events = [ev({ id: 'inv', subject: 'Q4 prep', myResponse: 'notResponded', attendeeCount: 7, startMs: NOW + 2 * H, endMs: NOW + 3 * H })];
+  const h = harness({ events: () => events, verdict: async () => ({ surface: true, confidence: 0.9, model: 'jev-test', durationMs: 50 }) });
+  await processCalendarWatchTick(h.deps); // baseline: the first ask
+  assert.equal(h.notified.length, 1);
+  assert.match(h.notified[0]!.title, /^Reply needed: Q4 prep/);
+  events = [{ ...events[0]!, myResponse: 'accepted' }];
+  await processCalendarWatchTick({ ...h.deps, tickId: 'tick-2' }); // the owner (or Clem) accepted
+  const answered = Object.values(h.state().items).find((item) => item.retiredReason === 'invite_answered');
+  assert.ok(answered, 'the first ask retired as answered');
+  events = [{ ...events[0]!, startMs: NOW + 2.5 * H, endMs: NOW + 3.5 * H }];
+  await processCalendarWatchTick({ ...h.deps, tickId: 'tick-3' }); // moved while still accepted
+  const moved = Object.values(h.state().items).find((item) => item.kind === 'moved' && !item.retiredAt);
+  assert.ok(moved, 'a moved note while the acceptance stands');
+  events = [{ ...events[0]!, myResponse: 'notResponded', startMs: NOW + 4 * H, endMs: NOW + 5 * H }];
+  const tick = await processCalendarWatchTick({ ...h.deps, tickId: 'tick-4' });
+  assert.equal(tick.produced, 1, 'one item for the re-ask');
+  assert.match(h.notified.at(-1)!.title, /^Reply needed again: Q4 prep/);
+  assert.equal(h.state().items[moved!.key]!.retiredReason, 'superseded');
+  assert.ok(h.read.has(moved!.notificationId!), 'the superseded note leaves Home');
+  assert.ok(Object.values(h.state().items).some((item) => item.retiredReason === 'invite_answered'), 'the earlier answer is still on record');
+});

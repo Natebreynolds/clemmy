@@ -493,7 +493,14 @@ async function replyOnce(
         && Array.isArray(row.choices) && row.choices[choiceIndex] === reply;
       const sessionId = deps.startTurn({
         title: row.text.slice(0, 120),
-        message: [`You told me: ${said}`, `What it was about: ${factsOf(row)}`, `My reply: ${reply}`].join('\n\n'),
+        message: [
+          `You told me: ${said}`,
+          `What it was about: ${factsOf(row)}`,
+          // The record's own identifiers, so the work goes straight to the
+          // item instead of looking it up again.
+          ...(row.ref ? [`Identifiers: ${Object.entries(row.ref).map(([name, value]) => `${name}=${value}`).join(', ')}`] : []),
+          `My reply: ${reply}`,
+        ].join('\n\n'),
         displayMessage: reply,
         ...(tapped ? { ownerChoiceToken: mintOwnerChoiceToken({
           rowKey: row.key, voiceDigest: row.voiceDigest, said, facts: factsOf(row), choice: reply,

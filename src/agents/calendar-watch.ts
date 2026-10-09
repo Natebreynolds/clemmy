@@ -83,6 +83,9 @@ export interface CalendarWatchChange {
   event: CalEvent;
   other?: CalEvent;
   previous?: { startMs: number; endMs: number };
+  /** The owner's earlier answer to this invite, when the organizer's change
+   * cleared it (an invite answered, then moved, is unanswered again). */
+  priorResponse?: string;
   reasons: string[];
 }
 
@@ -297,6 +300,11 @@ export function isUnansweredInvite(e: CalEvent): boolean {
   return isCommitment(e) && e.attendeeCount >= 1 && e.myResponse !== 'organizer' && UNANSWERED.has(e.myResponse);
 }
 
+/** The owner has answered this invite (accepted, tentatively accepted or declined). */
+export function ownerAnsweredInvite(e: CalEvent): boolean {
+  return e.attendeeCount >= 1 && Boolean(e.myResponse) && e.myResponse !== 'organizer' && !UNANSWERED.has(e.myResponse);
+}
+
 function digest16(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 16);
 }
@@ -352,7 +360,7 @@ export function detectCalendarChanges(input: {
     signal: CalendarWatchSignal,
     event: CalEvent,
     reasons: string[],
-    extra: { other?: CalEvent; previous?: { startMs: number; endMs: number }; version?: string } = {},
+    extra: { other?: CalEvent; previous?: { startMs: number; endMs: number }; version?: string; priorResponse?: string } = {},
   ): void => {
     const keyInput = {
       kind,
@@ -371,6 +379,7 @@ export function detectCalendarChanges(input: {
       event,
       ...(extra.other ? { other: extra.other } : {}),
       ...(extra.previous ? { previous: extra.previous } : {}),
+      ...(extra.priorResponse ? { priorResponse: extra.priorResponse } : {}),
       reasons,
     });
   };
@@ -382,10 +391,23 @@ export function detectCalendarChanges(input: {
       if (p && !p.isCancelled) push('cancelled', 'high', e, ['the organizer cancelled it'], { previous: { startMs: p.startMs, endMs: p.endMs } });
       continue;
     }
-    if (isUnansweredInvite(e) && (!p || !isUnansweredInvite(p))) {
+    const shifted = Boolean(p && !baseline && !p.isCancelled && (
+      Math.abs(e.startMs - p.startMs) >= config.movedThresholdMs || Math.abs(e.endMs - p.endMs) >= config.movedThresholdMs));
+    // An invite the owner had answered that is unanswered again: the
+    // organizer's change cleared the reply (a moved meeting resets every
+    // attendee's response). One item says so, at the new time; the separate
+    // "moved, nothing needed from you" note for it would contradict it.
+    const reAsked = Boolean(isUnansweredInvite(e) && p && ownerAnsweredInvite(p));
+    if (reAsked) {
+      push('invite_unanswered', 'high', e, [shifted ? 'the organizer moved it, which cleared your reply' : 'the organizer changed it, which cleared your reply'], {
+        ...(shifted ? { previous: { startMs: p!.startMs, endMs: p!.endMs } } : {}),
+        priorResponse: p!.myResponse,
+        version: digest16(`${e.startMs}-${e.endMs}`),
+      });
+    } else if (isUnansweredInvite(e) && (!p || !isUnansweredInvite(p))) {
       push('invite_unanswered', 'high', e, ['awaiting your response']);
     }
-    if (p && !baseline && !p.isCancelled) {
+    if (p && !baseline && !p.isCancelled && !reAsked) {
       const startDelta = Math.abs(e.startMs - p.startMs);
       const endDelta = Math.abs(e.endMs - p.endMs);
       if (startDelta >= config.movedThresholdMs || endDelta >= config.movedThresholdMs) {
@@ -479,6 +501,19 @@ export function buildCalendarWatchNotification(
       break;
     }
     case 'invite_unanswered':
+      if (change.priorResponse) {
+        // Answered once already: say what cleared it, so a second ask reads
+        // as the organizer's change, not as a reply that never landed.
+        const answered = change.priorResponse === 'declined' ? 'decline'
+          : change.priorResponse === 'tentativelyAccepted' ? 'tentative yes' : 'acceptance';
+        title = `Reply needed again: ${subject}`;
+        lines = [
+          `${change.previous ? `Now ${formatWhen(ev.startMs, nowMs, timezone)} (was ${formatWhen(change.previous.startMs, nowMs, timezone)})` : formatWhen(ev.startMs, nowMs, timezone)}${attendees ? ` · ${attendees}` : ''}${ev.organizer ? ` · from ${ev.organizer}` : ''}.`,
+          `Your earlier ${answered} was cleared when the organizer ${change.previous ? 'moved it' : 'changed it'}.`,
+          'Accept, decline, or propose a time.',
+        ];
+        break;
+      }
       title = `Reply needed: ${subject}`;
       lines = [
         `${formatWhen(ev.startMs, nowMs, timezone)}${attendees ? ` · ${attendees}` : ''}${ev.organizer ? ` · from ${ev.organizer}` : ''}.`,
@@ -522,6 +557,8 @@ export function buildCalendarWatchNotification(
       connectionId: change.accountId,
       eventId: ev.id,
       ...(change.other ? { otherEventId: change.other.id } : {}),
+      ...(change.priorResponse ? { priorResponse: change.priorResponse } : {}),
+      ...(change.previous ? { previousStartsAt: new Date(change.previous.startMs).toISOString() } : {}),
       startsAt: new Date(ev.startMs).toISOString(),
       reasons: change.reasons,
       tickId,
@@ -678,6 +715,23 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
       .map((item) => item.eventKey ?? item.key.slice(item.accountId.length + 1)),
   );
   for (const change of changes) {
+    // A re-asked invite replaces whatever was still open about the same
+    // event (an earlier reply card, a moved note): one thing, one item.
+    if (change.kind === 'invite_unanswered' && change.priorResponse) {
+      for (const item of Object.values(state.items)) {
+        if (item.retiredAt || item.eventId !== change.event.id || item.key === change.itemKey) continue;
+        if (item.kind !== 'invite_unanswered' && item.kind !== 'moved') continue;
+        item.retiredAt = new Date(nowMs).toISOString();
+        item.retiredReason = 'superseded';
+        state.metrics.itemsRetired += 1;
+        retired += 1;
+        if (item.notificationId && !deps.isNotificationRead(item.notificationId)) {
+          try { deps.markNotificationRead(item.notificationId); } catch { /* retired either way */ }
+        }
+        const eventKey = item.eventKey ?? item.key.slice(item.accountId.length + 1);
+        if (openByEventKey.get(eventKey) === item) openByEventKey.delete(eventKey);
+      }
+    }
     const existing = state.items[change.itemKey];
     const openElsewhere = openByEventKey.get(change.eventKey);
     if ((existing && !existing.retiredAt) || (openElsewhere && !openElsewhere.retiredAt) || seenEventKeys.has(change.eventKey)) {
