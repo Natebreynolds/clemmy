@@ -23,3 +23,20 @@ test('the files an outgoing command carries are read from its own arguments', ()
   assert.deepEqual(outgoingFilesInCommand('cd /x && curl -F f=@~/c.txt https://x.test', cwd).length, 1);
   assert.deepEqual(shellWords(`a 'b c' "d \\"e\\"" f\\ g`), ['a', 'b c', 'd "e"', 'f g']);
 });
+
+test('on Windows the command is read the way cmd.exe reads it: backslash paths, curl.exe, %VARIABLES%', () => {
+  const cwd = 'C:\\work';
+  const env = { USERPROFILE: 'C:\\Users\\me' };
+  const win = (command: string) => outgoingFilesInCommand(command, cwd, 'win32', env);
+  assert.deepEqual(win('curl.exe -F "file=@C:\\Users\\me\\My Report.pdf" https://x.test/up'), ['C:\\Users\\me\\My Report.pdf']);
+  assert.deepEqual(win('curl -T C:\\Users\\me\\video.mp4 https://x.test/put'), ['C:\\Users\\me\\video.mp4'],
+    'an unquoted backslash path is a path, not escapes');
+  assert.deepEqual(win('curl --data-binary @body.json https://x.test'), ['C:\\work\\body.json'], 'relative to the Windows cwd');
+  assert.deepEqual(win('curl -F f=@%USERPROFILE%\\Documents\\a.pdf https://x.test'), ['C:\\Users\\me\\Documents\\a.pdf']);
+  assert.deepEqual(win('curl -F f=@%userprofile%\\b.pdf https://x.test'), ['C:\\Users\\me\\b.pdf'], 'variable names are case-insensitive');
+  assert.deepEqual(win('cd C:\\other && gh.exe release upload v1 dist\\app.zip'), ['C:\\work\\dist\\app.zip']);
+  assert.deepEqual(win('scp report.pdf user@host:/tmp/'), ['C:\\work\\report.pdf']);
+  assert.deepEqual(shellWords('a "b c" C:\\x\\y d^&e', 'cmd'), ['a', 'b c', 'C:\\x\\y', 'd&e']);
+  // Elsewhere the POSIX reading is unchanged.
+  assert.deepEqual(outgoingFilesInCommand('curl -T ./v.mp4 https://x.test', '/work', 'darwin'), ['/work/v.mp4']);
+});

@@ -9,8 +9,16 @@ import os from 'node:os';
  * owner sees what leaves before saying yes. It grants and refuses nothing.
  */
 
-/** Split a command into words the way a POSIX shell would for plain quoting. */
-export function shellWords(command: string): string[] {
+/** How the shell the command runs under reads it: Windows runs cmd.exe. */
+export type ShellSyntax = 'posix' | 'cmd';
+
+export function shellSyntaxFor(platform: NodeJS.Platform = process.platform): ShellSyntax {
+  return platform === 'win32' ? 'cmd' : 'posix';
+}
+
+/** Split a command into words the way its shell would for plain quoting. */
+export function shellWords(command: string, syntax: ShellSyntax = 'posix'): string[] {
+  if (syntax === 'cmd') return cmdWords(command);
   const words: string[] = [];
   let current = '';
   let started = false;
@@ -34,6 +42,34 @@ export function shellWords(command: string): string[] {
     if (/\s/.test(char) || char === ';' || char === '|' || char === '&') {
       if (started) { words.push(current); current = ''; started = false; }
       if (char === ';' || char === '|' || char === '&') words.push(char);
+      continue;
+    }
+    current += char;
+    started = true;
+  }
+  if (started) words.push(current);
+  return words;
+}
+
+/** cmd.exe and the C runtime: double quotes group, `^` escapes the next
+ * character outside quotes, a backslash is an ordinary path character, and
+ * `&` and `|` separate commands. */
+function cmdWords(command: string): string[] {
+  const words: string[] = [];
+  let current = '';
+  let started = false;
+  let quoted = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]!;
+    if (quoted) {
+      if (char === '"') quoted = false; else current += char;
+      continue;
+    }
+    if (char === '"') { quoted = true; started = true; continue; }
+    if (char === '^' && index + 1 < command.length) { current += command[index + 1]!; index += 1; started = true; continue; }
+    if (/\s/.test(char) || char === '|' || char === '&') {
+      if (started) { words.push(current); current = ''; started = false; }
+      if (char === '|' || char === '&') words.push(char);
       continue;
     }
     current += char;
@@ -67,7 +103,8 @@ function segments(words: string[]): string[][] {
 }
 
 function executable(word: string): string {
-  return path.basename(word).toLowerCase();
+  // Either separator, and Windows names the same tools curl.exe, gh.exe.
+  return (word.split(/[\\/]/).pop() ?? '').toLowerCase().replace(/\.(exe|cmd|bat)$/, '');
 }
 
 function filesInSegment(words: string[]): string[] {
@@ -135,17 +172,37 @@ function filesInSegment(words: string[]): string[] {
   return files;
 }
 
-/** Absolute paths of the local files the command would send, in order, without repeats. */
-export function outgoingFilesInCommand(command: string, cwd?: string | null): string[] {
+/** Absolute paths of the local files the command would send, in order,
+ * without repeats, read the way the platform's shell reads the command. */
+export function outgoingFilesInCommand(
+  command: string,
+  cwd?: string | null,
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const syntax = shellSyntaxFor(platform);
+  const paths = syntax === 'cmd' ? path.win32 : path.posix;
   const base = cwd && cwd.trim() ? cwd.trim() : process.cwd();
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const segment of segments(shellWords(command))) {
+  for (const segment of segments(shellWords(command, syntax))) {
     for (const file of filesInSegment(segment)) {
-      const expanded = file === '~' || file.startsWith('~/') ? path.join(os.homedir(), file.slice(2)) : file;
-      const absolute = path.isAbsolute(expanded) || /^[a-zA-Z]:[\\/]/.test(expanded) ? expanded : path.resolve(base, expanded);
+      const expanded = syntax === 'cmd'
+        ? expandCmdVariables(file, env)
+        : file === '~' || file.startsWith('~/') ? path.join(os.homedir(), file.slice(2)) : file;
+      const absolute = paths.isAbsolute(expanded) || /^[a-zA-Z]:[\\/]/.test(expanded) ? expanded : paths.resolve(base, expanded);
       if (!seen.has(absolute)) { seen.add(absolute); out.push(absolute); }
     }
   }
   return out;
+}
+
+/** `%NAME%` as cmd.exe expands it (names are case-insensitive); an unset
+ * name stays as written. */
+function expandCmdVariables(value: string, env: NodeJS.ProcessEnv): string {
+  return value.replace(/%([A-Za-z_][A-Za-z0-9_()]*)%/g, (whole, name: string) => {
+    const key = Object.keys(env).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+    const found = key ? env[key] : undefined;
+    return typeof found === 'string' && found ? found : whole;
+  });
 }
