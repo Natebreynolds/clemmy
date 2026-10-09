@@ -69,7 +69,7 @@ function turnSpan(items: readonly ActivityItem[], fallback: { startedAt?: number
 
 /** The app a step happens in, by its real logo where the connection catalog
  *  has one, else its initial; a built-in step shows Clem's own mark. */
-function AppMark({ app }: { app?: string }) {
+function AppMark({ app, small = false }: { app?: string; small?: boolean }) {
   const key = app?.toLowerCase().replace(/[^a-z0-9]/g, '') ?? '';
   const catalog = useQuery({
     queryKey: ['composio-toolkits'],
@@ -81,9 +81,10 @@ function AppMark({ app }: { app?: string }) {
     ? catalog.data?.toolkits?.find((toolkit) => toolkit.slug.toLowerCase().replace(/[^a-z0-9]/g, '') === key)?.logoUrl
     : undefined;
   return (
-    <span aria-hidden className="grid h-9 w-9 shrink-0 place-items-center overflow-hidden rounded-[10px] border border-border bg-subtle text-small font-semibold text-muted">
+    <span aria-hidden className={cn('grid shrink-0 place-items-center overflow-hidden border border-border bg-subtle font-semibold text-muted',
+      small ? 'h-5 w-5 rounded-[6px] text-[10px]' : 'h-9 w-9 rounded-[10px] text-small')}>
       {logo
-        ? <img src={logo} alt="" className="h-5 w-5 object-contain" />
+        ? <img src={logo} alt="" className={small ? 'h-3.5 w-3.5 object-contain' : 'h-5 w-5 object-contain'} />
         : key ? app!.charAt(0).toUpperCase() : <span className="h-2 w-2 rounded-full bg-primary" />}
     </span>
   );
@@ -253,6 +254,11 @@ export function WorkLine({
   const highlights = [...new Set(top.filter((row) => row.kind !== 'check')
     .map((row) => friendlyStep(row.label).done)
     .map((done) => done.charAt(0).toLowerCase() + done.slice(1)))];
+  // The apps the turn worked in stay on the receipt once the answer lands
+  // (owner 2026-10-09: the app's mark went away when the work folded).
+  const apps = [...new Set(top.filter((row) => row.kind !== 'check')
+    .map((row) => friendlyStep(row.label).app)
+    .filter((app): app is string => Boolean(app)))].slice(0, 3);
   return (
     <section aria-label="What Clem did" className="min-w-0">
       <button
@@ -262,6 +268,11 @@ export function WorkLine({
         className="-ml-1.5 inline-flex max-w-full items-center gap-2 rounded-sm px-1.5 py-1 text-small text-muted transition-colors duration-fast hover:bg-subtle hover:text-fg active:scale-press"
       >
         <OutcomeMark outcome={outcome} />
+        {apps.length > 0 && (
+          <span className="flex shrink-0 items-center gap-1">
+            {apps.map((app) => <AppMark key={app} app={app} small />)}
+          </span>
+        )}
         <span className="min-w-0 truncate">{workLineSummary(outcome, span.totalMs, stepCount, head.helpers, highlights)}</span>
         <ChevronRight className={cn('h-3.5 w-3.5 shrink-0 text-faint transition-transform duration-base', open && 'rotate-90')} aria-hidden />
       </button>
