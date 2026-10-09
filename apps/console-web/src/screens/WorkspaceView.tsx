@@ -89,6 +89,9 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
   const viewMtime = detail.data?.viewMtimeMs ?? null;
   const dataMtime = detail.data?.dataMtimeMs ?? null;
   const frameControl = useRef<WorkspaceFrameControl | null>(null);
+  // Each data fetch is numbered; only the newest may reach the page, so a
+  // slow earlier fetch can never overwrite newer data.
+  const dataFetchRef = useRef(0);
   useEffect(() => {
     if (viewMtime == null && dataMtime == null) return;
     const stamp = `${viewMtime ?? 0}:${dataMtime ?? 0}`;
@@ -104,11 +107,15 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
     };
     // Only the data changed: a page that asked for live data gets it in place,
     // keeping its scroll, filters and drafts. Anything else reloads.
+    const fetchNumber = ++dataFetchRef.current;
     const viewChanged = previous.split(':')[0] !== String(viewMtime ?? 0);
     if (viewChanged) { reload(); return; }
     void getSpaceData(id)
-      .then((data) => { if (!frameControl.current?.pushData(data)) reload(); })
-      .catch(reload);
+      .then((data) => {
+        if (fetchNumber !== dataFetchRef.current) return;
+        if (!frameControl.current?.pushData(data)) reload();
+      })
+      .catch(() => { if (fetchNumber === dataFetchRef.current) reload(); });
   }, [viewMtime, dataMtime, id]);
   useEffect(() => {
     const flush = () => {
