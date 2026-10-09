@@ -193,6 +193,40 @@ function pickAvailableBrainFallback(skip: BrainMode): BrainMode | null {
   return null;
 }
 
+/**
+ * The brain a home runs on when Codex was only the default — AUTH_MODE is not
+ * an explicit codex_oauth choice — and Codex is not connected: Claude when the
+ * owner signed in to it, else their own BYO model. Nothing else is guessed: an
+ * OpenAI API key never runs the brain (voice and embeddings only), and an
+ * explicit Codex choice is never moved here.
+ */
+export function connectedBrainInPlaceOfDefaultCodex(state: {
+  authMode: 'api_key' | 'codex_oauth' | 'claude_oauth';
+  codexSignedIn: boolean;
+  claudeReady: boolean;
+  byoConfigured: boolean;
+}): 'claude_oauth' | 'all_in' | null {
+  if (state.authMode !== 'api_key' || state.codexSignedIn) return null;
+  if (state.claudeReady) return 'claude_oauth';
+  if (state.byoConfigured) return 'all_in';
+  return null;
+}
+
+/** Make the connected model the brain, the way a Claude sign-in already does
+ *  (persisted, so Settings and every later run agree), on the Claude model
+ *  already chosen, else the standard tier. */
+async function adoptConnectedBrain(to: 'claude_oauth' | 'all_in'): Promise<void> {
+  const { updateEnvKey } = await import('../../tools/shared.js');
+  if (to === 'claude_oauth') {
+    const { CLAUDE_ADOPTED_BRAIN_MODEL } = await import('./claude-brain-adoption.js');
+    if (!(getRuntimeEnv('CLAUDE_MODEL', '') || '').trim()) updateEnvKey('CLAUDE_MODEL', CLAUDE_ADOPTED_BRAIN_MODEL);
+    updateEnvKey('AUTH_MODE', 'claude_oauth');
+  } else {
+    updateEnvKey('MODEL_ROUTING_MODE', 'all_in');
+  }
+  logger.info({ to }, 'brain set to the connected model: Codex was only the default and is not connected');
+}
+
 /** Apply a brain fallback for THIS SESSION ONLY (process.env override, NOT .env),
  *  so a restart retries the user's real choice once they reconnect. Registers the
  *  router, logs loudly, and notifies the user. */
@@ -294,14 +328,30 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
 
   const tokens = getStoredCodexOAuthTokens();
   if (!tokens?.accessToken) {
-    // Codex is the default brain but isn't logged in — fall back to any other
-    // connected model (Claude / BYO) before surfacing a hard error.
+    // Codex was only the default, not the owner's choice: run on the model
+    // they did connect instead of blocking every turn on a login they never had.
+    const authMode = getActiveAuthMode();
+    const connected = connectedBrainInPlaceOfDefaultCodex({
+      authMode,
+      codexSignedIn: false,
+      claudeReady: (() => { try { return claudeVaultFallbackReady(); } catch { return false; } })(),
+      byoConfigured: (() => { try { return getByoBackendConfig().configured; } catch { return false; } })(),
+    });
+    if (connected) {
+      try { await adoptConnectedBrain(connected); } catch (error) {
+        logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'could not set the connected model as the brain');
+      }
+      // Only once the setting took: the next pass then takes its own branch.
+      if (getActiveAuthMode() === 'claude_oauth' || getModelRoutingMode() === 'all_in') return configureHarnessRuntime();
+    }
+    // The owner chose Codex and it isn't logged in — fall back to any other
+    // connected model (Claude / BYO) only when they allowed that.
     const fb = automaticBrainFallbackEnabled() ? pickAvailableBrainFallback('codex_oauth') : null;
     if (fb) return applyBrainFallback('Codex', fb);
     return {
       ok: false,
       reason:
-        (automaticBrainFallbackEnabled()
+        (automaticBrainFallbackEnabled() || authMode !== 'codex_oauth'
           ? 'No AI model is signed in yet. Open Settings → Models & routing and sign in with ChatGPT or Claude (or add an API-key model).'
           : 'The selected Codex login is unavailable and automatic provider switching is off. Reconnect Codex in Settings → Models or explicitly enable brain fallover.'),
     };

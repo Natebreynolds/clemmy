@@ -41,7 +41,6 @@ import {
   LOCAL_MCP_ENABLED,
   MODEL_ENV_KEYS,
   getModelSettingsSnapshot,
-  getOpenAiApiKey,
   getRuntimeEnv,
   normalizeModelId,
   getByoBackendConfig,
@@ -16490,10 +16489,8 @@ export function registerConsoleRoutes(
       // (claude-brain-adoption.ts); a working brain is never moved.
       let codexSignedIn = false;
       try { codexSignedIn = Boolean(getStoredCodexOAuthTokens()?.accessToken); } catch { codexSignedIn = true; /* unreadable: never move */ }
-      let openAiKey = false;
-      try { openAiKey = Boolean(getOpenAiApiKey()); } catch { openAiKey = true; }
       const adoption = claudeBrainAdoptionAfterSignIn({ authMode: getActiveAuthMode(), routingMode: getModelRoutingMode(),
-        codexSignedIn, openAiKey, claudeModel: getRuntimeEnv('CLAUDE_MODEL', '') || '' });
+        codexSignedIn, claudeModel: getRuntimeEnv('CLAUDE_MODEL', '') || '' });
       if (adoption) {
         if (adoption.claudeModel) { updateEnvKey('CLAUDE_MODEL', adoption.claudeModel); process.env.CLAUDE_MODEL = adoption.claudeModel; }
         updateEnvKey('AUTH_MODE', 'claude_oauth'); process.env.AUTH_MODE = 'claude_oauth';

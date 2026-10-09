@@ -78,12 +78,98 @@ test('configureHarnessRuntime returns ok:false when NO provider is connected', a
     resetHarnessRuntimeConfig();
     const result = await configureHarnessRuntime();
     assert.equal(result.ok, false);
-    assert.match(result.reason ?? '', /selected Codex login is unavailable/i);
+    // Codex was only the default: the owner is told no model is signed in,
+    // never that a Codex login they never chose is unavailable.
+    assert.match(result.reason ?? '', /No AI model is signed in yet/);
     assert.match(result.reason ?? '', /Settings → Models/);
   } finally {
     clearClaudeVault();
     resetHarnessRuntimeConfig();
   }
+});
+
+test('an explicit Codex choice that is not signed in fails closed and names Codex, even with Claude connected', async () => {
+  const prevMode = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = 'codex_oauth';
+  writeClaudeVault({ accessToken: 'sk-ant-oat01-faketoken', refreshToken: 'r', expiresAt: Date.now() + 3_600_000 });
+  try {
+    resetHarnessRuntimeConfig();
+    const result = await configureHarnessRuntime();
+    assert.equal(result.ok, false);
+    assert.match(result.reason ?? '', /selected Codex login is unavailable/i);
+    assert.equal(process.env.AUTH_MODE, 'codex_oauth', 'the owner\'s own choice is never moved at boot');
+  } finally {
+    clearClaudeVault();
+    if (prevMode === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = prevMode;
+    resetHarnessRuntimeConfig();
+  }
+});
+
+test('with Codex only the default and not connected, the brain runs on the Claude login the owner connected, and stays there', async () => {
+  const prev = { mode: process.env.AUTH_MODE, model: process.env.CLAUDE_MODEL, debate: process.env.CLEMMY_DEBATE_MODE };
+  delete process.env.AUTH_MODE;
+  delete process.env.CLAUDE_MODEL;
+  process.env.CLEMMY_DEBATE_MODE = 'off';
+  writeClaudeVault({ accessToken: 'sk-ant-oat01-faketoken', refreshToken: 'r', expiresAt: Date.now() + 3_600_000 });
+  try {
+    resetHarnessRuntimeConfig();
+    const result = await configureHarnessRuntime();
+    assert.equal(result.ok, true, result.reason);
+    assert.equal(result.fallback, undefined, 'not a substitution of a choice, so no "switched" notice');
+    assert.equal(process.env.AUTH_MODE, 'claude_oauth');
+    const { readFileSync } = await import('node:fs');
+    const env = readFileSync(path.join(TMP_HOME, '.env'), 'utf8');
+    assert.match(env, /^AUTH_MODE=claude_oauth$/m, 'persisted, so Settings and the next start agree');
+    assert.match(env, /^CLAUDE_MODEL=\S+$/m);
+  } finally {
+    clearClaudeVault();
+    for (const [k, envk] of [['mode', 'AUTH_MODE'], ['model', 'CLAUDE_MODEL'], ['debate', 'CLEMMY_DEBATE_MODE']] as const) {
+      const v = (prev as Record<string, string | undefined>)[k];
+      if (v === undefined) delete process.env[envk]; else process.env[envk] = v;
+    }
+    rmSync(path.join(TMP_HOME, '.env'), { force: true });
+    resetHarnessRuntimeConfig();
+  }
+});
+
+test('with Codex only the default and only a BYO model connected, the BYO model becomes the brain', async () => {
+  const prev = {
+    mode: process.env.AUTH_MODE, routing: process.env.MODEL_ROUTING_MODE,
+    base: process.env.BYO_MODEL_BASE_URL, id: process.env.BYO_MODEL_ID,
+    key: process.env.BYO_MODEL_API_KEY, debate: process.env.CLEMMY_DEBATE_MODE,
+  };
+  delete process.env.AUTH_MODE;
+  process.env.MODEL_ROUTING_MODE = 'worker';
+  process.env.BYO_MODEL_BASE_URL = 'https://api.deepseek.com/v1';
+  process.env.BYO_MODEL_ID = 'deepseek-chat';
+  process.env.BYO_MODEL_API_KEY = 'fake-byo-key';
+  process.env.CLEMMY_DEBATE_MODE = 'off';
+  writeClaudeVault({ accessToken: 'sk-ant-api03-not-a-subscription' }); // no usable Claude
+  try {
+    resetHarnessRuntimeConfig();
+    const result = await configureHarnessRuntime();
+    assert.equal(result.ok, true, result.reason);
+    assert.equal(process.env.MODEL_ROUTING_MODE, 'all_in');
+  } finally {
+    clearClaudeVault();
+    for (const [k, envk] of [['mode', 'AUTH_MODE'], ['routing', 'MODEL_ROUTING_MODE'], ['base', 'BYO_MODEL_BASE_URL'], ['id', 'BYO_MODEL_ID'], ['key', 'BYO_MODEL_API_KEY'], ['debate', 'CLEMMY_DEBATE_MODE']] as const) {
+      const v = (prev as Record<string, string | undefined>)[k];
+      if (v === undefined) delete process.env[envk]; else process.env[envk] = v;
+    }
+    rmSync(path.join(TMP_HOME, '.env'), { force: true });
+    resetHarnessRuntimeConfig();
+  }
+});
+
+test('the connected-brain rule: only a default Codex with no Codex login moves, to Claude first, then BYO', async () => {
+  const { connectedBrainInPlaceOfDefaultCodex: pick } = await import('./codex-client.js');
+  const none = { authMode: 'api_key' as const, codexSignedIn: false, claudeReady: false, byoConfigured: false };
+  assert.equal(pick({ ...none, claudeReady: true, byoConfigured: true }), 'claude_oauth');
+  assert.equal(pick({ ...none, byoConfigured: true }), 'all_in');
+  assert.equal(pick(none), null, 'nothing connected: nothing is guessed');
+  assert.equal(pick({ ...none, claudeReady: true, codexSignedIn: true }), null, 'a working Codex brain stays');
+  assert.equal(pick({ ...none, claudeReady: true, authMode: 'codex_oauth' }), null, 'an explicit Codex choice is never moved here');
+  assert.equal(pick({ ...none, claudeReady: true, authMode: 'claude_oauth' }), null);
 });
 
 test('configureHarnessRuntime returns ok:true once tokens exist', async () => {
