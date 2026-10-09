@@ -48,3 +48,21 @@ test('no plan and no pending_action_id → undefined (unchanged contract)', () =
   assert.equal(pendingActionApprovalViewFromArgs(null), undefined);
   assert.equal(pendingActionApprovalViewFromArgs({ plan: { items: [] } }), undefined);
 });
+
+test('a queued command names the local files it would send, and why one cannot be sent', async () => {
+  const { mkdirSync, writeFileSync } = await import('node:fs');
+  const { pendingActionOutgoingFiles } = await import('./pending-action-view.js');
+  const folder = path.join(TMP_HOME, 'outputs');
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(path.join(folder, 'deck.pdf'), 'x'.repeat(3000));
+  const files = pendingActionOutgoingFiles({
+    toolName: 'run_shell_command', kind: 'shell_command',
+    payload: { command: `curl -F file=@deck.pdf -F notes=@missing.txt https://upload.example.test`, cwd: folder },
+  } as never);
+  assert.deepEqual(files, [
+    'deck.pdf · 3 KB · in outputs',
+    `missing.txt: cannot be sent (There is no file at ${path.join(folder, 'missing.txt')}.)`,
+  ]);
+  assert.deepEqual(pendingActionOutgoingFiles({ toolName: 'run_shell_command', kind: 'shell_command', payload: { command: 'curl -d ping=1 https://x.test' } } as never), []);
+  assert.deepEqual(pendingActionOutgoingFiles({ toolName: 'outlook_send_email', kind: 'external_send', payload: { body: 'x' } } as never), []);
+});

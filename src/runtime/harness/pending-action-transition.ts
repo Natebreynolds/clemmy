@@ -2,7 +2,7 @@ import { addNotification } from '../notifications.js';
 import * as approvalRegistry from './approval-registry.js';
 import { appendEvent, getSession, listEvents } from './eventlog.js';
 import { revisedCardLink } from './revised-card-link.js';
-import { pendingActionApprovalView, pendingActionIdFromArgs, pendingActionAsk } from './pending-action-view.js';
+import { pendingActionApprovalView, pendingActionIdFromArgs, pendingActionAsk, pendingActionOutgoingFiles } from './pending-action-view.js';
 import { isEffectDecidedPerCall } from '../../tools/tool-registry.js';
 import {
   cancelPendingActionIfQueuedUnlinked,
@@ -253,7 +253,15 @@ function materializeQueuedApproval(
       // exact content that will run — never a tool name as the heading.
       preview: {
         operation: record.toolName.slice(0, 80),
-        fields: [{ name: isEffectDecidedPerCall(record.toolName) ? 'command' : 'content', value: record.preview }],
+        fields: [
+          { name: isEffectDecidedPerCall(record.toolName) ? 'command' : 'content', value: record.preview },
+          // The local files the command itself would send, named so the
+          // owner sees exactly what leaves (desktop and phone alike).
+          ...(() => {
+            const files = pendingActionOutgoingFiles(record);
+            return files.length > 0 ? [{ name: 'files_leaving_this_computer', value: files.join('\n') }] : [];
+          })(),
+        ],
         ask: pendingActionAsk(record),
         ...(record.why?.trim() ? { why: record.why.trim() } : {}),
       },
