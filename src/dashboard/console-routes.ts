@@ -16534,6 +16534,17 @@ export function registerConsoleRoutes(
         Object.fromEntries(CODEX_BRAIN_SLOTS.map((key) => [key, (getRuntimeEnv(key, '') || '').trim()])) as Record<CodexBrainSlot, string>,
         resolveProvider, DEFAULT_CODEX_MODEL) : [];
 
+      // Only a connected model can be the brain: Codex needs its sign-in, checked
+      // before any routing state moves, as Claude's is below.
+      if (brain === 'codex_oauth') {
+        let codexSignedIn = false;
+        try { codexSignedIn = Boolean(getStoredCodexOAuthTokens()?.accessToken); } catch { codexSignedIn = false; }
+        if (!codexSignedIn) {
+          res.status(409).json({ error: 'Codex is not signed in. Sign in with ChatGPT under Settings → Models first.', needsLogin: true });
+          return;
+        }
+      }
+
       // A BYO brain runs all-in (every role on the BYO backend unless a role is
       // bound elsewhere); a Codex/Claude brain cannot coexist with all-in, so step
       // it down to 'off' (BYO providers stay connected and routable via role pins).

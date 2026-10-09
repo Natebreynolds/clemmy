@@ -11,7 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { type AddressInfo } from 'node:net';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
@@ -30,6 +30,13 @@ process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
   { role: 'worker', modelId: 'gpt-5.6-luna', scope: 'durable', source: 'settings' },
 ]);
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+// The home is signed in to Codex: only a connected model can be the brain.
+const CODEX_AUTH_FILE = path.join(TMP_HOME, 'state', 'auth.json');
+const signInToCodex = (): void => writeFileSync(CODEX_AUTH_FILE, JSON.stringify({
+  source: 'native',
+  codexOauth: { accessToken: 'fake-codex-access', refreshToken: 'fake-codex-refresh', lastRefresh: new Date().toISOString() },
+}), 'utf-8');
+signInToCodex();
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { getActiveAuthMode } = await import('../config.js');
@@ -486,5 +493,24 @@ test('a newer Codex generation selection persists the exact requested model', as
     assert.equal(persistedEnvValue('OPENAI_MODEL_PRIMARY'), 'gpt-6-sol');
   } finally {
     await harness.close();
+  }
+});
+
+test('a Codex switch fails closed before changing the live or persisted brain when Codex is not signed in', async () => {
+  const before = { mode: process.env.AUTH_MODE, routing: process.env.MODEL_ROUTING_MODE };
+  process.env.AUTH_MODE = 'claude_oauth';
+  rmSync(CODEX_AUTH_FILE, { force: true });
+  const server = await boot();
+  try {
+    const { response, body } = await patchActiveBrain(server.url, { brain: 'codex_oauth' });
+    assert.equal(response.status, 409);
+    assert.match(String(body.error), /Codex is not signed in/);
+    assert.equal((body as { needsLogin?: unknown }).needsLogin, true);
+    assert.equal(process.env.AUTH_MODE, 'claude_oauth', 'the live brain did not move');
+    assert.equal(process.env.MODEL_ROUTING_MODE, before.routing, 'no routing state moved');
+  } finally {
+    await server.close();
+    signInToCodex();
+    if (before.mode === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = before.mode;
   }
 });
