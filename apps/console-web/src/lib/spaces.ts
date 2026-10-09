@@ -197,6 +197,13 @@ export interface SpaceFeed {
 export const getSpaceFeeds = (id: string) =>
   apiGet<{ feeds: SpaceFeed[] }>(`/api/console/spaces/${encodeURIComponent(id)}/feeds`);
 
+/** When a page version was made. A revision is stamped when it was replaced,
+ *  so a version was made when the one before it was replaced; the first was
+ *  made with the Space. */
+export function versionMadeAt(space: Pick<SpaceRecord, 'createdAt' | 'revisions'>, version: number): string {
+  return space.revisions.find((r) => r.version === version - 1)?.ts ?? space.createdAt;
+}
+
 /** "7:00 AM", "tomorrow 7:00 AM", "Fri 7:00 AM" or "Oct 2, 7:00 AM". */
 export function feedTime(iso: string, now = new Date()): string {
   const at = new Date(iso);

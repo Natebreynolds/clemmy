@@ -395,12 +395,11 @@ function slugify(title: string): string {
   return candidate;
 }
 
+/** A new Space's first page, drawn entirely by the shared design layer so it
+ *  follows the light or dark theme like any page Clem builds. */
 const PLACEHOLDER_VIEW = (title: string) => `<!doctype html><html><head><meta charset="utf-8">
-<title>${title.replace(/[<>&]/g, '')}</title>
-<style>body{font:16px/1.5 system-ui,sans-serif;margin:0;padding:48px;color:#1f1b16;background:#faf7f2}
-.card{max-width:640px;margin:0 auto;background:#fff;border:1px solid #e7e1d6;border-radius:16px;padding:32px}</style></head>
-<body><div class="card"><h1>${title.replace(/[<>&]/g, '')}</h1>
-<p>This workspace is empty. Ask Clem to build it — she'll write the view and wire up its data.</p></div></body></html>`;
+<title>${title.replace(/[<>&]/g, '')}</title></head>
+<body><main class="clem-app"><p class="clem-empty">This Space is empty.<span class="clem-empty-hint">Tell Clem what it should show and she'll build it.</span></p></main></body></html>`;
 
 export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): void {
   registerWorkspaceSourceControlRoutes(app, '/api/console/spaces', (req, res, next) => {

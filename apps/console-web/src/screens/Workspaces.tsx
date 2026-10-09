@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Plus, Clock } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
@@ -7,7 +7,7 @@ import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { usePoll } from '@/lib/poll';
-import { listSpaces, type SpaceRecord } from '@/lib/spaces';
+import { feedTime, listSpaces, type SpaceRecord } from '@/lib/spaces';
 import { humanizeCron } from '@/lib/cron';
 import { CreateWorkspaceModal } from '@/components/workspaces/CreateWorkspaceModal';
 import { SpacesIntro } from '@/components/workspaces/SpacesIntro';
@@ -42,14 +42,19 @@ function WorkspaceCard({ space, onOpen, building }: { space: SpaceRecord; onOpen
   const healthStatus = healthLabel(space);
   return (
     <article className="group relative flex flex-col overflow-hidden rounded-2xl border border-border-raised bg-raised text-left transition-colors duration-base hover:border-border-strong hover:bg-hover">
-      <button
-        type="button"
-        onClick={onOpen}
-        aria-label={`Open ${space.title} workspace`}
+      {/* A real link: it opens in place, and can be opened elsewhere or copied. */}
+      <Link
+        to={`/workspaces/${encodeURIComponent(space.id)}`}
+        onClick={(event) => {
+          if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return;
+          event.preventDefault();
+          onOpen();
+        }}
+        aria-label={`Open the ${space.title} Space`}
         className="absolute inset-0 z-20 rounded-2xl cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset"
       >
-        <span className="sr-only">Open {space.title} workspace</span>
-      </button>
+        <span className="sr-only">Open the {space.title} Space</span>
+      </Link>
       {/* Live preview — a scaled, non-interactive snapshot of the actual view. */}
       <div className="relative h-40 w-full overflow-hidden border-b border-border bg-subtle">
         <WorkspaceFrame
@@ -69,7 +74,7 @@ function WorkspaceCard({ space, onOpen, building }: { space: SpaceRecord; onOpen
       </div>
       <div className="flex flex-1 flex-col gap-1 p-4">
         <div className="flex items-center justify-between gap-2">
-          <h3 className="truncate text-h3 text-fg">{space.title}</h3>
+          <h3 className="line-clamp-2 min-w-0 text-h3 text-fg" title={space.title}>{space.title}</h3>
           {building
             ? <StatusPill tone="live" className="shrink-0 whitespace-nowrap">Clementine is building</StatusPill>
             : (
@@ -82,7 +87,7 @@ function WorkspaceCard({ space, onOpen, building }: { space: SpaceRecord; onOpen
               </StatusPill>
             )}
         </div>
-        <p className="text-caption text-faint">Updated {new Date(space.updatedAt).toLocaleDateString()}</p>
+        <p className="text-caption text-faint">Updated {feedTime(space.updatedAt)}</p>
         {health && (health.counts.dataSources > 0 || health.counts.actions > 0) && (
           <p className="mt-1 text-small text-muted">
             {[

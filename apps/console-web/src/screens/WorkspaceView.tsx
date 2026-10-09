@@ -23,7 +23,7 @@ import {
 } from '@/lib/workspace-history-state';
 import {
   getSpace, refreshSpace, patchSpace, rollbackSpace, publishSpace,
-  getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions, pageErrors, getSpaceFeeds,
+  getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions, pageErrors, getSpaceFeeds, feedTime, versionMadeAt,
   latestRefreshFailures, buildWorkspaceFixPrompt, type SpaceStatus, type SpaceDiffResponse,
   type SpaceObservationSummary, WorkspaceRefreshError,
 } from '@/lib/spaces';
@@ -509,7 +509,7 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
         />
 
         {firstVersionPending && (
-          <div className="pointer-events-none absolute inset-0 grid place-items-center text-center" aria-live="polite">
+          <div className="pointer-events-none absolute inset-0 grid place-items-center bg-canvas text-center" aria-live="polite">
             <div>
               <p className="text-h3 text-muted">Nothing here yet</p>
               <p className="mt-1 text-body text-faint">Clementine is reading your data. The first version lands in a moment.</p>
@@ -628,16 +628,24 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
                 space.revisions.length === 0
                   ? <p className="text-small text-muted">No prior versions yet.</p>
                   : (
-                    <ul className="flex flex-col gap-2">
-                      {[...space.revisions].reverse().map((r) => (
-                        <li key={r.version} className="flex items-center justify-between gap-2 rounded-md border border-border bg-surface px-3 py-2">
-                          <span className="text-small text-fg">v{r.version} · {new Date(r.ts).toLocaleString()}</span>
-                          <Button variant="ghost" size="sm" disabled={busy} onClick={() => act(() => rollbackSpace(id, r.version), true)}>
-                            <RotateCcw className="h-3.5 w-3.5" aria-hidden /> Revert
-                          </Button>
+                    <div className="flex flex-col gap-2">
+                      <p className="text-caption text-muted">Restoring an earlier page keeps the current one as a version, so it can be undone.</p>
+                      <ul className="flex flex-col gap-2">
+                        <li className="flex items-center justify-between gap-2 rounded-md border border-border bg-subtle px-3 py-2">
+                          <span className="text-small text-fg">v{space.version} · on screen now</span>
                         </li>
-                      ))}
-                    </ul>
+                        {[...space.revisions].reverse().map((r) => (
+                          <li key={r.version} className="flex items-center justify-between gap-2 rounded-md border border-border bg-surface px-3 py-2">
+                            <span className="text-small text-fg">
+                              v{r.version} · made {feedTime(versionMadeAt(space, r.version))}
+                            </span>
+                            <Button variant="ghost" size="sm" disabled={busy} onClick={() => act(() => rollbackSpace(id, r.version), true)}>
+                              <RotateCcw className="h-3.5 w-3.5" aria-hidden /> Restore
+                            </Button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
                   )
               )}
               {tab === 'audit' && (

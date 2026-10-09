@@ -115,7 +115,9 @@ export function BuildStatusBanner({
           )}
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
-          {paused && (
+          {/* The toolbar already offers Resume; the banner repeats it only
+              beside a fix, for a pause something went wrong to cause. */}
+          {paused && !pausedByOwner && (
             <Button variant="secondary" size="sm" disabled={busy} onClick={onResume}>
               <Play className="h-4 w-4" aria-hidden /> Resume
             </Button>
