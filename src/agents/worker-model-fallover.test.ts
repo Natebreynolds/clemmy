@@ -56,3 +56,17 @@ test('REAL Moonshot 429 text classifies rate-limited RAW, even though normalizat
   // …so the branch must classify on the RAW text, which stays detectable.
   assert.equal(workerFailureLooksRateLimited(real), true);
 });
+
+// Only models the owner connected: the last fallover candidate is the brain's
+// own fast tier (always the connected brain's family), never a fixed Codex id
+// that a home without Codex would dispatch to and fail.
+test('worker fallover chains end on the brain\'s own fast tier, never a hardcoded provider model', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./orchestrator.ts', import.meta.url), 'utf8');
+  const chains = [...source.matchAll(/pickWorkerModelWithFallover\(\[([\s\S]*?)\]\)/g)].map((match) => match[1]!);
+  assert.equal(chains.length, 2);
+  for (const chain of chains) {
+    assert.match(chain, /resolveRoleModel\('quick'\)\.modelId/);
+    assert.doesNotMatch(chain, /DEFAULT_CODEX_FAST_MODEL|gpt-|claude-/);
+  }
+});

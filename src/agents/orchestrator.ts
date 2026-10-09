@@ -7,7 +7,7 @@ import { buildPublishPlanTool } from '../tools/publish-plan.js';
 import { Agent, tool } from '@openai/agents';
 import type { Handoff } from '@openai/agents';
 import { z } from 'zod';
-import { DEFAULT_CODEX_FAST_MODEL, getRuntimeEnv } from '../config.js';
+import { getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { routeWorkerModel, type WorkerRouteTrace } from '../runtime/harness/worker-model-route.js';
 import { resolveWorkerAgentRequest } from './agent-binding.js';
@@ -2888,7 +2888,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         if (!workerRoute.exactModel && uniform && (workerFailureLooksRateLimited(uniform) || failedItems.some((f) => workerFailureLooksRateLimited(f.text)))) {
           const benched = resolveRoleModel('worker', call.intent || undefined).modelId;
           markWorkerModelCoolingDown(benched);
-          const next = pickWorkerModelWithFallover([benched, resolveRoleModel('worker').modelId, DEFAULT_CODEX_FAST_MODEL]);
+          const next = pickWorkerModelWithFallover([benched, resolveRoleModel('worker').modelId, resolveRoleModel('quick').modelId]);
           if (next.falloverFrom) {
             return `Batch failed: ALL ${rendered.length} workers hit a rate limit on worker model "${benched}". It is benched for a cooldown and fan-out has AUTO-SWITCHED to "${next.model}" — call run_worker again NOW with the same items; they will dispatch on the healthy model.`;
           }
@@ -3021,11 +3021,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // window — route this item to the next healthy candidate instead of
       // burning a slot on a known-429 model. Chain stays inside the models this
       // session already legitimately uses (routed → default worker binding →
-      // session primary), so provider-isolation promises hold.
+      // the brain's own fast tier), so provider-isolation promises hold: never
+      // a provider the owner did not connect.
       const workerPick = route.exactModel ? { model: workerModel, falloverFrom: undefined } : pickWorkerModelWithFallover([
         workerModel,
         resolveRoleModel('worker').modelId,
-        DEFAULT_CODEX_FAST_MODEL,
+        resolveRoleModel('quick').modelId,
       ]);
       if (workerPick.falloverFrom) {
         workerModel = workerPick.model;
