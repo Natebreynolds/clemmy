@@ -23,17 +23,18 @@ import {
 } from '@/lib/workspace-history-state';
 import {
   getSpace, refreshSpace, patchSpace, rollbackSpace, publishSpace,
-  getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions, pageErrors,
+  getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions, pageErrors, getSpaceFeeds,
   latestRefreshFailures, buildWorkspaceFixPrompt, type SpaceStatus, type SpaceDiffResponse,
   type SpaceObservationSummary, WorkspaceRefreshError,
 } from '@/lib/spaces';
 import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
+import { SpaceFeedLine } from '@/components/workspaces/SpaceFeedLine';
 import { CanonicalEntityCoveragePanel } from '@/components/workspaces/CanonicalEntityCoveragePanel';
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
 import { SourceControlsPanel } from '@/components/workspaces/SourceControlsPanel';
 import { WorkspaceFrame } from '@/components/workspaces/WorkspaceFrame';
 import { describeSpaceShape, spaceBuildState } from '@/lib/space-build';
-import { getWorkflowsHome } from '@/lib/automate';
+import { getWorkflowsHome, runWorkflow } from '@/lib/automate';
 
 function statusTone(status: SpaceStatus): Tone {
   if (status === 'active') return 'success';
@@ -192,7 +193,13 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
   const buildState = spaceBuildState(chat.messages);
   // A linked workflow that is running right now says so on its chip — the
   // Space is where its output lands, so its progress belongs here too.
-  const workflowsHome = usePoll(['workflows-home'], getWorkflowsHome, 6000, { enabled: (detail.data?.linkedWorkflows ?? []).length > 0 });
+  // The workflows that fill this Space, read from what they do.
+  const feeds = usePoll(['space-feeds', id], () => getSpaceFeeds(id), 60_000, { enabled: !!id });
+  const feedList = feeds.data?.feeds ?? [];
+  const feedNames = new Set(feedList.flatMap((feed) => [feed.workflow, feed.title]));
+  const workflowsHome = usePoll(['workflows-home'], getWorkflowsHome, 6000, {
+    enabled: (detail.data?.linkedWorkflows ?? []).length > 0 || feedList.length > 0,
+  });
   const runningWorkflows = new Map((workflowsHome.data?.activeRuns ?? []).map((run) => [run.workflowName, run]));
   const threadEndRef = useRef<HTMLDivElement>(null);
   useEffect(() => { threadEndRef.current?.scrollIntoView({ block: 'end' }); }, [chat.messages]);
@@ -389,7 +396,7 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
           </span>
         )}
         {/* The automation feeding this workspace — one click to its workflow. */}
-        {(detail.data?.linkedWorkflows ?? []).map((wf) => (
+        {(detail.data?.linkedWorkflows ?? []).filter((wf) => !feedNames.has(wf.name)).map((wf) => (
           <button
             key={wf.name}
             type="button"
@@ -451,6 +458,23 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
           </Button>
         </div>
       </div>
+
+      <SpaceFeedLine
+        feeds={feedList}
+        running={feedList.some((feed) => feed.role === 'primary' && (runningWorkflows.has(feed.title) || runningWorkflows.has(feed.workflow)))}
+        busy={busy}
+        onRunNow={(feed) => act(async () => {
+          await runWorkflow(feed.workflow);
+          await Promise.all([feeds.refetch(), workflowsHome.refetch()]);
+        })}
+        onAskClemToFix={(feed) => {
+          setDockOpen(true);
+          void chat.send({
+            text: `The workflow that fills this Space ("${feed.title}") failed on its last run`
+              + `${feed.lastRun?.problem ? `: ${feed.lastRun.problem}` : '.'} Find out why, fix it, and run it again.`,
+          });
+        }}
+      />
 
       {error && (
         <p className="flex items-center gap-2 border-b border-danger/30 bg-danger/5 px-4 py-2 text-small text-danger">

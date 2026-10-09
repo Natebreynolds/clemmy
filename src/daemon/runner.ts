@@ -102,6 +102,7 @@ import {
   scheduleCatchupWindow,
 } from '../execution/workflow-scheduler.js';
 import { recoverPendingWorkflowTriggerEvents, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
+import { installWorkflowFeedReconciler } from '../spaces/workflow-feeds.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js';
 import { processSpaceSchedules, retryPausedSpaces } from '../spaces/scheduler.js';
@@ -2916,6 +2917,16 @@ export async function startDaemon(
     }
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Workflow legacy migration failed (continuing)');
+  }
+
+  // Which workflows feed which Spaces is read from the workflows themselves:
+  // bind them now and again after every workflow change.
+  try {
+    installWorkflowFeedReconciler((err) => {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Workflow feed reconcile failed (continuing)');
+    });
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Workflow feed reconciler did not start (continuing)');
   }
 
   // The automation proposal remains inert until this exact projection sees its

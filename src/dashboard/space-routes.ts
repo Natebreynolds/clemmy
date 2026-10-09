@@ -25,6 +25,7 @@ import {
   type SpaceRecord,
 } from '../spaces/store.js';
 import { recordViewGapNote } from '../spaces/view-revision-checks.js';
+import { reconcileWorkflowFeeds, spaceFeedSummaries } from '../spaces/workflow-feeds.js';
 import {
   readData, MAX_DATA_BYTES, appendNote, listNotes, appendAudit, listAudit, readViewData } from '../spaces/data-store.js';
 import {
@@ -498,7 +499,22 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       id: slug, title, viewEntry: 'view/index.html',
       ...(contract ? { contract } : {}),
     });
+    // A workflow saved before this Space existed can feed it now.
+    void reconcileWorkflowFeeds().catch(() => undefined);
     res.status(201).json({ space: rec });
+  });
+
+  // What feeds this Space: each bound workflow, what it fills, its last run
+  // and its next one. Read on open and after a run, not on the 5 s poll.
+  app.get('/api/console/spaces/:id/feeds', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const slug = req.params.id;
+    if (!isValidSpaceSlug(slug) || !spaceStore.get(slug)) { res.status(404).json({ error: 'not found' }); return; }
+    try {
+      res.json({ feeds: await spaceFeedSummaries(slug) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   // ---- Starter recipes: the "start from a recipe" activation list ---------

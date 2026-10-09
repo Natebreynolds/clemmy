@@ -177,6 +177,37 @@ export const listSpaces = () =>
 export const getSpace = (id: string) =>
   apiGet<SpaceDetail>(`/api/console/spaces/${encodeURIComponent(id)}`);
 
+/** A workflow that fills this Space, as the daemon reads it from the workflow. */
+export interface SpaceFeed {
+  workflow: string;
+  title: string;
+  description?: string;
+  role: 'primary' | 'supporting';
+  enabled: boolean;
+  schedule?: string;
+  timezone?: string;
+  nextRunAt?: string;
+  collections: string[];
+  lastRun?: { id: string; state: 'running' | 'done' | 'failed' | 'waiting'; at: string; finishedAt?: string; problem?: string };
+}
+
+export const getSpaceFeeds = (id: string) =>
+  apiGet<{ feeds: SpaceFeed[] }>(`/api/console/spaces/${encodeURIComponent(id)}/feeds`);
+
+/** "7:00 AM", "tomorrow 7:00 AM", "Fri 7:00 AM" or "Oct 2, 7:00 AM". */
+export function feedTime(iso: string, now = new Date()): string {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return '';
+  const time = at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const day = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((day(at) - day(now)) / 86_400_000);
+  if (days === 0) return time;
+  if (days === 1) return `tomorrow ${time}`;
+  if (days === -1) return `yesterday ${time}`;
+  if (days > 1 && days < 7) return `${at.toLocaleDateString([], { weekday: 'short' })} ${time}`;
+  return `${at.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${time}`;
+}
+
 export const createSpace = (title: string, objective?: string) =>
   apiPost<{ space: SpaceRecord }>('/api/console/spaces', {
     title,

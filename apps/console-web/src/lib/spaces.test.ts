@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildWorkspaceFixPrompt, latestRefreshFailures, pageErrors, type SpaceAudit, type SpaceNote } from './spaces';
+import { buildWorkspaceFixPrompt, feedTime, latestRefreshFailures, pageErrors, type SpaceAudit, type SpaceNote } from './spaces';
 
 const entry = (ts: string, path: string, outcome: string, note?: string): SpaceAudit =>
   ({ ts, method: 'REFRESH', path, outcome, ...(note ? { note } : {}) });
@@ -73,4 +73,15 @@ test('pageErrors shows only what the page on screen reported, once each', () => 
     buildWorkspaceFixPrompt({ paused: false, failures: [], gaps: [], openApprovals: 0, pageErrors: pageErrors(notes, 4) }),
     /This page hit errors when it opened[\s\S]*rows is not defined/,
   );
+});
+
+test('feedTime says when in plain words relative to now', () => {
+  const now = new Date(2026, 9, 9, 9, 30);
+  const at = (d: number, h: number) => new Date(2026, 9, d, h, 0).toISOString();
+  const time = new Date(2026, 9, 9, 7, 0).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  assert.equal(feedTime(at(9, 7), now), time);
+  assert.equal(feedTime(at(10, 7), now), `tomorrow ${time}`);
+  assert.equal(feedTime(at(8, 7), now), `yesterday ${time}`);
+  assert.match(feedTime(at(13, 7), now), new RegExp(`^\\w{3} ${time}$`));
+  assert.equal(feedTime('not a date', now), '');
 });

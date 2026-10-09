@@ -883,6 +883,12 @@ export function registerSpaceTools(server: McpServer): void {
         originSessionId: desiredOriginSession,
       });
       const savedAuthoringRecord = record;
+      if (!existing) {
+        // A workflow saved before this Space existed can feed it now.
+        void import('../spaces/workflow-feeds.js')
+          .then(({ reconcileWorkflowFeeds }) => reconcileWorkflowFeeds())
+          .catch(() => undefined);
+      }
       if (initialData) {
         // The file document is already durable/visible. Seed temporal history
         // now when possible; daemon startup repeats this idempotently if a
@@ -1421,6 +1427,18 @@ export function registerSpaceTools(server: McpServer): void {
           ? ' The owner paused it: it stays paused until they resume it.'
           : rec.pausedBy === 'build_check' ? ' Paused because a source failed its first check; it is retried automatically.' : '';
       const earlierVersions = rec.revisions.slice(-8).map((r) => `v${r.version} (${r.ts.slice(0, 10)})`);
+      let feedLines: string[] = [];
+      try {
+        const { spaceFeedSummaries } = await import('../spaces/workflow-feeds.js');
+        feedLines = (await spaceFeedSummaries(slug)).map((feed) => {
+          const last = feed.lastRun
+            ? `last run ${feed.lastRun.state} ${feed.lastRun.at}${feed.lastRun.problem ? ` (${feed.lastRun.problem})` : ''}`
+            : 'no recent run';
+          const next = feed.nextRunAt ? `next run ${feed.nextRunAt}` : feed.enabled ? 'runs when started' : 'disabled';
+          const fills = feed.collections.length > 0 ? `fills ${feed.collections.join(', ')}` : 'fills a collection chosen at run time';
+          return `Fed by workflow "${feed.workflow}" (${feed.role}): ${fills}; ${last}; ${next}.`;
+        });
+      } catch { feedLines = []; }
       const viewErrors = [...new Set(listNotes(slug, 50)
         .filter((n) => n.kind === 'view_error' && n.meta?.version === rec.version)
         .map((n) => n.text))].slice(-3);
@@ -1432,6 +1450,7 @@ export function registerSpaceTools(server: McpServer): void {
         ...(viewErrors.length > 0
           ? [`The page (v${rec.version}) reported errors when it was open, so parts of it may not show:\n${viewErrors.map((e) => `  - ${e}`).join('\n')}`]
           : []),
+        ...feedLines,
         rec.contract
           ? [
             `Objective: ${rec.contract.objective}`,
