@@ -56,17 +56,45 @@ function scalarKey(value: unknown): string | null {
   return null;
 }
 
+/** The values of one field across rows, or null when any row lacks a scalar
+ *  value for it or two rows share one (it cannot identify a row). */
+function uniqueFieldValues(rows: unknown[], field: string): string[] | null {
+  const values = rows.map((row) => scalarKey((row as Record<string, unknown>)[field]));
+  if (values.some((value) => value === null)) return null;
+  return new Set(values).size === values.length ? values as string[] : null;
+}
+
+/**
+ * The field that identifies a row in both versions of an array. The usual
+ * identity names win in their own spelling or any casing (`id`, `Id`, `ID`).
+ * Otherwise a field qualifies when every row in both versions has a unique
+ * scalar value for it, and the one whose values carry over between the
+ * versions most is chosen (a row's identity persists; a timestamp that changes
+ * with each edit does not). No field means rows are compared by position.
+ */
 function inferredStableKey(before: unknown[], after: unknown[]): string | null {
   const rows = [...before, ...after];
   if (rows.length === 0 || !rows.every(isRecord)) return null;
+  const fields = [...new Set(rows.flatMap((row) => Object.keys(row as Record<string, unknown>)))];
+  const qualifies = (field: string): Set<string> | null => {
+    const beforeValues = uniqueFieldValues(before, field);
+    const afterValues = uniqueFieldValues(after, field);
+    if (!beforeValues || !afterValues) return null;
+    const shared = new Set(beforeValues);
+    return new Set(afterValues.filter((value) => shared.has(value)));
+  };
   for (const candidate of STABLE_ROW_KEYS) {
-    const beforeKeys = before.map((row) => scalarKey((row as Record<string, unknown>)[candidate]));
-    const afterKeys = after.map((row) => scalarKey((row as Record<string, unknown>)[candidate]));
-    if (beforeKeys.some((key) => key === null) || afterKeys.some((key) => key === null)) continue;
-    if (new Set(beforeKeys).size !== beforeKeys.length || new Set(afterKeys).size !== afterKeys.length) continue;
-    return candidate;
+    for (const field of fields.filter((name) => name.toLowerCase() === candidate)) {
+      if (qualifies(field)) return field;
+    }
   }
-  return null;
+  if (before.length === 0 || after.length === 0) return null;
+  let best: { field: string; overlap: number } | null = null;
+  for (const field of fields.slice(0, 64)) {
+    const overlap = qualifies(field)?.size ?? 0;
+    if (overlap > 0 && (!best || overlap > best.overlap)) best = { field, overlap };
+  }
+  return best?.field ?? null;
 }
 
 function redactedPreviewValue(value: unknown, depth = 0): unknown {

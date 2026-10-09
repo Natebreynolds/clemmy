@@ -1436,6 +1436,16 @@ export function registerSpaceTools(server: McpServer): void {
           return `Fed by workflow "${feed.workflow}" (${feed.role}${feed.link === 'reviewed' ? ', formal binding' : ''}): ${fills}; ${last}; ${next}.`;
         });
       } catch { feedLines = []; }
+      let changeLine = '';
+      try {
+        const { whatChangedInSpace } = await import('../spaces/what-changed.js');
+        const changed = whatChangedInSpace(slug).filter((c) => c.state === 'changed').slice(0, 8);
+        if (changed.length > 0) {
+          changeLine = `Last change per collection: ${changed.map((c) => (
+            `${c.collection} at ${c.changedAt} (+${c.added} new, ${c.changed} changed, ${c.removed} gone, ${c.other} other${c.more ? ', at least' : ''})`
+          )).join('; ')}. space_diff shows the details.`;
+        }
+      } catch { changeLine = ''; }
       const viewErrors = [...new Set(listNotes(slug, 50)
         .filter((n) => n.kind === 'view_error' && n.meta?.version === rec.version)
         .map((n) => n.text))].slice(-3);
@@ -1448,6 +1458,7 @@ export function registerSpaceTools(server: McpServer): void {
           ? [`The page (v${rec.version}) reported errors when it was open, so parts of it may not show:\n${viewErrors.map((e) => `  - ${e}`).join('\n')}`]
           : []),
         ...feedLines,
+        ...(changeLine ? [changeLine] : []),
         rec.contract
           ? [
             `Objective: ${rec.contract.objective}`,

@@ -23,12 +23,13 @@ import {
 } from '@/lib/workspace-history-state';
 import {
   getSpace, refreshSpace, patchSpace, rollbackSpace, publishSpace,
-  getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions, pageErrors, getSpaceFeeds, feedTime, versionMadeAt, getSpaceData,
+  getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions, pageErrors, getSpaceFeeds, feedTime, versionMadeAt, getSpaceData, getSpaceChanges,
   latestRefreshFailures, buildWorkspaceFixPrompt, type SpaceStatus, type SpaceDiffResponse,
   type SpaceObservationSummary, WorkspaceRefreshError,
 } from '@/lib/spaces';
 import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
 import { SpaceFeedLine } from '@/components/workspaces/SpaceFeedLine';
+import { WhatChangedStrip } from '@/components/workspaces/WhatChangedStrip';
 import { CanonicalEntityCoveragePanel } from '@/components/workspaces/CanonicalEntityCoveragePanel';
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
 import { SourceControlsPanel } from '@/components/workspaces/SourceControlsPanel';
@@ -205,6 +206,8 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
   // Space is where its output lands, so its progress belongs here too.
   // The workflows that fill this Space, read from what they do.
   const feeds = usePoll(['space-feeds', id], () => getSpaceFeeds(id), 60_000, { enabled: !!id });
+  // What changed, per collection; refetched whenever the data changes.
+  const changes = usePoll(['space-changes', id, detail.data?.dataMtimeMs ?? 0], () => getSpaceChanges(id), 300_000, { enabled: !!id });
   const feedList = feeds.data?.feeds ?? [];
   const feedNames = new Set(feedList.flatMap((feed) => [feed.workflow, feed.title]));
   const workflowsHome = usePoll(['workflows-home'], getWorkflowsHome, 6000, {
@@ -484,6 +487,11 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
               + `${feed.lastRun?.problem ? `: ${feed.lastRun.problem}` : '.'} Find out why, fix it, and run it again.`,
           });
         }}
+      />
+
+      <WhatChangedStrip
+        changes={changes.data?.changes ?? []}
+        onOpenHistory={() => { setTab('dataHistory'); setDetailsOpen(true); }}
       />
 
       {error && (

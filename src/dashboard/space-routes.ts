@@ -26,6 +26,7 @@ import {
 } from '../spaces/store.js';
 import { recordViewGapNote } from '../spaces/view-revision-checks.js';
 import { spaceFeedSummaries } from '../spaces/workflow-feeds.js';
+import { whatChangedInSpace } from '../spaces/what-changed.js';
 import {
   readData, MAX_DATA_BYTES, appendNote, listNotes, appendAudit, listAudit, readViewData } from '../spaces/data-store.js';
 import {
@@ -914,6 +915,23 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
         to: safeObservation(to),
         diff,
       });
+    } catch {
+      res.status(503).json({ error: 'workspace history is temporarily unavailable' });
+    }
+  });
+
+  // What changed in each collection since its content last differed, counted
+  // by row. Drawn by the app above every Space's page.
+  app.get('/api/console/spaces/:id/changes', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    const slug = String(req.params.id ?? '');
+    const rec = spaceStore.get(slug);
+    if (!isValidSpaceSlug(slug) || !rec) { res.status(404).json({ error: 'not found' }); return; }
+    try {
+      ensureWorkspaceIndexed(rec);
+      bootstrapLegacyWorkspaceHistoryIfNeeded(slug);
+      res.json({ changes: whatChangedInSpace(slug) });
     } catch {
       res.status(503).json({ error: 'workspace history is temporarily unavailable' });
     }

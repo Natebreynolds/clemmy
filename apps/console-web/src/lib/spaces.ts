@@ -194,6 +194,34 @@ export interface SpaceFeed {
   lastRun?: { id: string; state: 'running' | 'done' | 'failed' | 'waiting'; at: string; finishedAt?: string; problem?: string };
 }
 
+/** What changed in one collection since its content last differed. */
+export interface SpaceCollectionChange {
+  collection: string;
+  checkedAt: string;
+  state: 'first' | 'changed' | 'unavailable';
+  changedAt?: string;
+  comparedWith?: string;
+  added: number;
+  changed: number;
+  removed: number;
+  other: number;
+  more: boolean;
+}
+
+export const getSpaceChanges = (id: string) =>
+  apiGet<{ changes: SpaceCollectionChange[] }>(`/api/console/spaces/${encodeURIComponent(id)}/changes`);
+
+/** "3 new · 2 changed · 1 gone", or "updated" when only non-row data moved. */
+export function changeText(change: Pick<SpaceCollectionChange, 'added' | 'changed' | 'removed' | 'more'>): string {
+  const plus = change.more ? '+' : '';
+  const parts = [
+    change.added > 0 ? `${change.added}${plus} new` : '',
+    change.changed > 0 ? `${change.changed}${plus} changed` : '',
+    change.removed > 0 ? `${change.removed}${plus} gone` : '',
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(' · ') : 'updated';
+}
+
 export const getSpaceFeeds = (id: string) =>
   apiGet<{ feeds: SpaceFeed[] }>(`/api/console/spaces/${encodeURIComponent(id)}/feeds`);
 

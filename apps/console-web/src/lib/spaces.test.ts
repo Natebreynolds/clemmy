@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildWorkspaceFixPrompt, feedTime, latestRefreshFailures, pageErrors, type SpaceAudit, type SpaceNote } from './spaces';
+import { buildWorkspaceFixPrompt, changeText, feedTime, latestRefreshFailures, pageErrors, versionMadeAt, type SpaceAudit, type SpaceNote } from './spaces';
 
 const entry = (ts: string, path: string, outcome: string, note?: string): SpaceAudit =>
   ({ ts, method: 'REFRESH', path, outcome, ...(note ? { note } : {}) });
@@ -84,4 +84,17 @@ test('feedTime says when in plain words relative to now', () => {
   assert.equal(feedTime(at(8, 7), now), `yesterday ${time}`);
   assert.match(feedTime(at(13, 7), now), new RegExp(`^\\w{3} ${time}$`));
   assert.equal(feedTime('not a date', now), '');
+});
+
+test('changeText counts rows plainly, marks a floor, and says updated for non-row changes', () => {
+  assert.equal(changeText({ added: 3, changed: 2, removed: 1, more: false }), '3 new · 2 changed · 1 gone');
+  assert.equal(changeText({ added: 0, changed: 40, removed: 0, more: true }), '40+ changed');
+  assert.equal(changeText({ added: 0, changed: 0, removed: 0, more: false }), 'updated');
+});
+
+test('versionMadeAt: a version was made when the one before it was replaced', () => {
+  const space = { createdAt: 'c0', revisions: [{ version: 1, ts: 't1', bytes: 1, file: 'a' }, { version: 2, ts: 't2', bytes: 1, file: 'b' }] };
+  assert.equal(versionMadeAt(space, 1), 'c0');
+  assert.equal(versionMadeAt(space, 2), 't1');
+  assert.equal(versionMadeAt(space, 3), 't2');
 });
