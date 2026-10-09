@@ -1995,6 +1995,7 @@ export async function invokeHostToolCall<T>(
           };
           const adoptedNestedSettlement = (
             returned?: { value: unknown },
+            thrown?: { error: unknown },
           ): SettledToolAttempt => {
             const redeemed = redeemDurableLogicalCallSettlementForHost({
               sessionId: input.identity.sessionId,
@@ -2019,7 +2020,7 @@ export async function invokeHostToolCall<T>(
               // Durable rows, not the in-memory marker: an inner dispatcher
               // may record its crossing through its own identities without
               // ever reserving through this wrapper.
-              const durableCrossings = redeemed.status === 'missing' && returned !== undefined
+              const durableCrossings = redeemed.status === 'missing' && (returned !== undefined || thrown !== undefined)
                 ? (openEventLog().prepare(`
                     SELECT COUNT(*) AS n FROM physical_dispatches
                      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
@@ -2046,6 +2047,32 @@ export async function invokeHostToolCall<T>(
                   reason: redeemed.reason,
                 }, 'nested-owned local control returned without its own durable settlement; host settled the non-mutating result');
                 return logicalSettlement({ result: returned.value, resultPresent: true });
+              }
+              // The same call that THREW before anything crossed: a carrier
+              // that refused a malformed call, a target that rejected its own
+              // arguments. Nothing started, so the failure is the attempt's
+              // own outcome and the model corrects it; failing closed here
+              // poisoned the whole turn's authority and every later checkpoint
+              // (live 2026-10-09: a download whose carrier fields were nested
+              // in args_json ended "I could not reopen the saved checkpoint").
+              // Any crossing, mutation or business upgrade still fails closed.
+              if (
+                redeemed.status === 'missing'
+                && thrown !== undefined
+                && topCrossing === undefined
+                && durableCrossings === 0
+                && !isMutating
+                && observedNow?.mutating !== true
+                && !(observedNow?.businessCall === true && !frozenBusinessCall)
+              ) {
+                hostToolInvocationLogger.warn({
+                  sessionId: input.identity.sessionId,
+                  sourceUserSeq: input.identity.sourceUserSeq,
+                  callId: modelCallId,
+                  tool: input.identity.toolName,
+                  reason: redeemed.reason,
+                }, 'nested-owned call threw before any crossing; host settled the failed attempt');
+                return logicalSettlement({ thrown: thrown.error, thrownPresent: true });
               }
               // An approved action's inner dispatch hands exactly this logical
               // call to the host (inner-dispatch propagates host ownership only
@@ -2378,7 +2405,7 @@ export async function invokeHostToolCall<T>(
                     return;
                   }
                   closeTop('threw');
-                  if (input.boundary === 'nested_owned') adoptedNestedSettlement();
+                  if (input.boundary === 'nested_owned') adoptedNestedSettlement(undefined, { error });
                   else {
                     const settlement = logicalSettlement({ thrown: error, thrownPresent: true });
                     if (externalWriteDescriptor) {

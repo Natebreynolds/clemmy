@@ -2490,6 +2490,35 @@ test('a nested-owned LOCAL control that returns without its own settlement and w
   leases.revokeDispatchLease(task.parentLease);
 });
 
+test('a nested-owned call that threw before any crossing settles as its own failed attempt; a mutating one still fails closed', async () => {
+  // Live 2026-10-09: a carrier refused a malformed call by throwing before
+  // anything crossed; with no inner settlement the host failed closed, poisoned
+  // the turn's authority, and every later checkpoint reopen failed.
+  const task = fixture();
+  await assert.rejects(runCall(task, {
+    callId: 'model:nested-threw-local',
+    boundary: 'nested_owned',
+    deadlineMs: 200,
+    invoke: async () => { throw new Error('carrier refused the malformed call before dispatch'); },
+  }), (error: unknown) => !(error instanceof invocation.HostToolInvocationAuthorityError)
+    && /carrier refused the malformed call/.test(String((error as Error).message)), 'the call\'s own error reaches the caller, not an authority failure');
+  const settled = eventlog.openEventLog().prepare(`
+    SELECT outcome_kind FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, 'model:nested-threw-local') as { outcome_kind: string } | undefined;
+  assert.ok(settled, 'the host settled the failed attempt durably');
+  assert.notEqual(settled!.outcome_kind, 'succeeded');
+
+  await assert.rejects(runCall(task, {
+    callId: 'model:nested-threw-write',
+    boundary: 'nested_owned',
+    effect: 'external_write',
+    deadlineMs: 200,
+    invoke: async () => { throw new Error('write carrier threw'); },
+  }), /nested-owned logical settlement is missing/);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
 test('a marked nested provider adapter owns the one threw crossing without a host duplicate', async () => {
   const task = fixture();
   const callId = 'model:nested-provider-threw';

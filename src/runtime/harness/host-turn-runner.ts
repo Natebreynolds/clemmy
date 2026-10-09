@@ -1,4 +1,5 @@
 import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion } from './memory-completion-obligation.js';
+import { liftNestedCarrierFields } from './carrier-field-lift.js';
 import { composioFileInputRefusal, composioOperationInputSchema } from '../../integrations/composio/file-inputs.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
@@ -7635,18 +7636,27 @@ const runHostTurnBody = async (
     acceptedFrameRecovery = false,
   ): { argumentsJson: string; completion: CarrierCompletion | null; boundTargets?: string[] } => {
     const tool = toolByName.get(call.name);
-    const argumentsJson = materializedArgumentsJson(call.name, call.argumentsJson);
+    const materialized = materializedArgumentsJson(call.name, call.argumentsJson);
     const directGateway = isRegisteredCarrierGateway(call.name);
+    const wrappedCarrier = isPlainOrClementineLocalTool(call.name, 'work_call')
+      || isPlainOrClementineLocalTool(call.name, 'call_tool');
+    // The carrier's own fields nested inside args_json move back out before
+    // anything binds the call, so the bound identity and the arguments the
+    // target runs with are one and the same.
+    const lifted = hostProduction && wrappedCarrier ? liftNestedCarrierFields(materialized) : null;
+    const argumentsJson = lifted?.argumentsJson ?? materialized;
     // Finalize recovery intentionally runs before refreshTools. Its caller
     // has reopened the exact raw admission, so known carrier serialization
     // may be reconstructed without acquiring a current execution surface.
-    const completion = hostProduction && (tool || acceptedFrameRecovery)
-      && (isPlainOrClementineLocalTool(call.name, 'work_call')
-        || isPlainOrClementineLocalTool(call.name, 'call_tool') || directGateway)
+    const providerCompletion = hostProduction && (tool || acceptedFrameRecovery)
+      && (wrappedCarrier || directGateway)
       ? directGateway
         ? completeDirectCarrierArguments(call.name, argumentsJson, provenEntries)
         : completeCarrierArguments(argumentsJson, provenEntries)
       : null;
+    const completion = providerCompletion
+      ? (lifted ? { ...providerCompletion, changes: [...lifted.changes, ...providerCompletion.changes] } : providerCompletion)
+      : lifted ? { argumentsJson: lifted.argumentsJson, toolSlug: lifted.target, changes: lifted.changes } : null;
     const canonical = completion?.argumentsJson ?? argumentsJson;
     const bound = hostProduction ? materializeReviewedPlanCallArguments({ ...exactHostIdentity(),
       toolName: call.name, argumentsJson: canonical }) : undefined;
