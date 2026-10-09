@@ -487,3 +487,85 @@ test('selected-definition refresh bypasses a recent discovery schema exactly onc
     schemaCache.resetToolSchemaCache();
   }
 });
+
+/**
+ * A slow provider search never hides an operation this home already holds a
+ * current contract for on a connected app. When the query names that app, the
+ * contracts answer after a short wait instead of the whole search budget; the
+ * live search keeps going either way.
+ */
+test('a slow provider search answers from current contracts, and briefly when the query names the app', async () => {
+  schemaCache.resetToolSchemaCache();
+  capabilityIndex._resetCapabilityIndexForTest();
+  composio.resetComposioClient();
+  composio.__test__.setComposioApiKeyOverride('leased-answer-key');
+  composio.__test__.setConnectedAccountsLoader(async () => [{
+    id: 'connection-quillboard',
+    status: 'ACTIVE',
+    user_id: 'leased-answer-user',
+    toolkit: { slug: 'quillboard' },
+  }]);
+  const slug = 'QUILLBOARD_PAGES_BATCH_UPDATE';
+  const row = {
+    slug,
+    name: 'Batch update pages',
+    description: 'Apply a batch of updates to the pages of a deck.',
+    toolkit: { slug: 'quillboard' },
+    inputParameters: DESTINATION_SCHEMA,
+  };
+  const liveOnly = { ...row, slug: 'QUILLBOARD_PAGES_BATCH_UPDATE_LIVE', name: 'Batch update pages (live)' };
+  let fuzzyDelayMs = 0;
+  let fuzzyRows: unknown[] = [row];
+  composio.__test__.setComposioClient({
+    tools: {
+      async getRawComposioTools(input: Record<string, unknown>) {
+        if (Array.isArray(input.tools)) {
+          return [row, liveOnly].filter((candidate) => (input.tools as string[]).includes(candidate.slug));
+        }
+        await new Promise((resolve) => setTimeout(resolve, fuzzyDelayMs));
+        return fuzzyRows;
+      },
+    },
+  });
+  const source = () => providerSources.buildAuthorizedToolSearchCandidateSources({
+    reason: 'leased answer proof',
+    authority: 'catalog',
+    allowedServerSlugs: [],
+    toolPatterns: [],
+    maxTools: 0,
+  } as never, { sessionId: 'leased-answer-proof', sourceUserSeq: 1 }).find((candidate) => candidate.kind === 'authorized_composio')!;
+
+  const learned = await source().search({ query: 'batch update pages', limit: 8, deadlineAt: Date.now() + 10_000 });
+  assert.ok(learned.some((candidate) => candidate.name === slug), 'the warm search learns the operation');
+  schemaCache.rememberToolSchema(slug, DESTINATION_SCHEMA, Date.now());
+  capabilityIndex.recordCapabilityOperations([{
+    identifier: slug,
+    carrierKind: 'composio',
+    carrier: 'quillboard',
+    displayName: row.name,
+    description: row.description,
+    effectClass: 'write',
+    effectProvenance: 'inferred',
+  }]);
+
+  // The provider's search is now slow, and would answer with another row.
+  fuzzyRows = [liveOnly];
+  fuzzyDelayMs = 4_000;
+  let started = Date.now();
+  const named = await source().search({ query: 'quillboard batch update pages', limit: 8, deadlineAt: Date.now() + 10_000 });
+  const namedMs = Date.now() - started;
+  assert.ok(named.some((candidate) => candidate.name === slug), 'the current contract answers');
+  assert.ok(namedMs < 3_800, `a query naming the connected app waited ${namedMs} ms, not the search budget`);
+
+  started = Date.now();
+  const unnamed = await source().search({ query: 'batch update pages', limit: 8, deadlineAt: Date.now() + 10_000 });
+  assert.ok(Date.now() - started >= 3_500, 'without the app named, the live search gets its budget');
+  assert.ok(unnamed.some((candidate) => candidate.name === liveOnly.slug), 'and its answer is the one used');
+
+  // A provider search that cannot answer inside the deadline at all.
+  started = Date.now();
+  const late = await source().search({ query: 'batch update pages', limit: 8, deadlineAt: Date.now() + 3_000 });
+  assert.ok(late.some((candidate) => candidate.name === slug), 'the current contract still answers');
+  assert.ok(Date.now() - started < 2_500, 'before the search deadline');
+  await new Promise((resolve) => setTimeout(resolve, fuzzyDelayMs));
+});

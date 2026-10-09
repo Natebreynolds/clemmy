@@ -1375,6 +1375,9 @@ let lastExternalMcpListedAt = 0;
 /** How long before the search deadline the provider source answers from
  * current contract leases instead of waiting on a slow live search. */
 const COMPOSIO_LEASED_FALLBACK_MARGIN_MS = 1_500;
+/** How long the live search gets when the query names a connected app this
+ * home already holds current contracts on. */
+const COMPOSIO_NAMED_APP_LEASE_WAIT_MS = 2_500;
 
 function exactDiscoveryDeadline(sourceDeadlineAt?: number): number {
   const ownDeadline = Date.now() + INDEX_NOMINATION_DEADLINE_MS;
@@ -2296,15 +2299,12 @@ export function buildAuthorizedToolSearchCandidateSources(
       const server = getOrCreateExternalMcpServers(mcpToolDiscoveryScope(scope));
       // Search is the recovery path after an exact invocation detects drift
       // (an exact name that no longer resolves): refresh this namespace view
-      // then, and otherwise at most once a minute. Re-listing every server on
-      // every search cost 2-4.5 s per search (live 2026-10-09, a remote MCP
-      // proxy among them) for a catalog that had not changed.
-      const nowMs = Date.now();
-      if (exactOperation || nowMs - lastExternalMcpListedAt > EXTERNAL_MCP_LIST_FRESH_MS) {
-        await server.invalidateToolsCache();
-      }
+      // then, and otherwise at most once a minute; a remote server's listing
+      // costs seconds and rarely changes between searches.
+      const relist = Boolean(exactOperation) || Date.now() - lastExternalMcpListedAt > EXTERNAL_MCP_LIST_FRESH_MS;
+      if (relist) await server.invalidateToolsCache();
       const tools = await server.listTools();
-      lastExternalMcpListedAt = Date.now();
+      if (relist) lastExternalMcpListedAt = Date.now();
       if (signal?.aborted) return [];
       const ranked = rankCatalogEntriesLexically(query, tools.map(tool => ({
         name: tool.name, namespace: stripMcpToolCarrier(tool.name).split('__')[0],
@@ -2312,8 +2312,7 @@ export function buildAuthorizedToolSearchCandidateSources(
         tool,
       })))
         // Only tools the query actually matches: the top N of an unrelated
-        // server is noise in every result (10-12 site-builder tools answered
-        // "insert an image into a Google slide").
+        // server is noise in every result.
         .filter((entry) => entry.score > 0);
       return ranked.slice(0, limit).map(({ tool }, index): ToolSearchBrokerCandidate => ({
         name: stripMcpToolCarrier(tool.name),
@@ -2410,12 +2409,11 @@ export function buildAuthorizedToolSearchCandidateSources(
   };
   // When the live provider search cannot answer inside the search deadline,
   // the operations this home already holds a current contract for, on an app
-  // that is connected, still answer the query. Live 2026-10-09: the provider
-  // search took 11 s, missed the deadline, and a just-connected Slides
-  // batch update whose contract was cached never reached the model, which
-  // then reached for a shell command instead. Contract leases are the same
-  // proof the exact path above accepts; nothing here mints new authority.
-  const leasedIndexedComposioCandidates = (query: string): ToolSearchBrokerCandidate[] => {
+  // that is connected, still answer the query, so a slow provider search never
+  // hides a capability that is cached and current. Contract leases are the
+  // same proof the exact path above accepts; nothing here mints new authority.
+  // `namedAppsOnly` keeps only apps the query itself names.
+  const leasedIndexedComposioCandidates = (query: string, namedAppsOnly = false): ToolSearchBrokerCandidate[] => {
     let connected: Set<string>;
     try {
       connected = new Set(peekConnectedToolkits()
@@ -2423,11 +2421,18 @@ export function buildAuthorizedToolSearchCandidateSources(
         .map((connection) => connection.slug.trim().toLowerCase()));
     } catch { return []; }
     if (connected.size === 0) return [];
+    const compact = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const compactQuery = compact(query);
+    const namedInQuery = (toolkit: string) => {
+      const name = compact(toolkit);
+      return name.length >= 3 && compactQuery.includes(name);
+    };
     return searchCapabilityOperations(query, { limit: 20, carrierKind: 'composio' })
       .flatMap((hit) => {
         const slug = hit.identifier.trim().toUpperCase();
         const toolkit = registeredToolkitOfSlug(slug).trim().toLowerCase();
         if (!connected.has(toolkit)) return [];
+        if (namedAppsOnly && !namedInQuery(toolkit)) return [];
         const lease = rememberedExactComposioLease(slug);
         if (!lease) return [];
         return [rememberPreparedSearchCandidate({
@@ -2442,9 +2447,14 @@ export function buildAuthorizedToolSearchCandidateSources(
     async search(input) {
       const { query, deadlineAt } = input;
       if (deadlineAt === undefined || exactComposioOperationsFromQuery(query).length > 0) return searchLive(input);
-      const budgetMs = deadlineAt - Date.now() - COMPOSIO_LEASED_FALLBACK_MARGIN_MS;
-      if (budgetMs <= 0) return leasedIndexedComposioCandidates(query);
+      const fallbackMs = deadlineAt - Date.now() - COMPOSIO_LEASED_FALLBACK_MARGIN_MS;
+      if (fallbackMs <= 0) return leasedIndexedComposioCandidates(query);
       const live = searchLive(input);
+      // A query that names a connected app with current contracts that match
+      // it is answered from them after a short wait, not the whole budget.
+      const budgetMs = leasedIndexedComposioCandidates(query, true).length > 0
+        ? Math.min(fallbackMs, COMPOSIO_NAMED_APP_LEASE_WAIT_MS)
+        : fallbackMs;
       let timer: ReturnType<typeof setTimeout> | undefined;
       const late = new Promise<'late'>((resolve) => { timer = setTimeout(() => resolve('late'), budgetMs); });
       try {
