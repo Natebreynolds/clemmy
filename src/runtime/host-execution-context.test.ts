@@ -17,6 +17,12 @@ test('Windows host facts identify the real shell, cross-drive cwd and computer c
   assert.equal(renderHostExecutionContext('linux'), '');
 });
 
+test('the macOS shell guidance names its BSD tools, so commands are written for this machine', () => {
+  assert.match(shellCwdGuidance('darwin'), /^SHELL — this computer runs macOS: .*BSD command-line tools/);
+  assert.doesNotMatch(shellCwdGuidance('win32'), /BSD/);
+  assert.doesNotMatch(shellCwdGuidance('linux'), /^SHELL/);
+});
+
 test('the live tool definition carries current-host guidance and Windows permission errors get Windows remedies', async () => {
   const { getComputerTools, annotateShellStderr } = await import('../tools/computer-tools.js');
   const tool = getComputerTools().find(entry => entry.name === 'run_shell_command')!;
