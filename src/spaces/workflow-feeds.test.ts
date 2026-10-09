@@ -97,6 +97,26 @@ test('a formal binding stays exactly as it was and is shown beside derived feeds
   assert.equal(after.digest, stored.ok ? stored.digest : '', 'the formal binding is byte-for-byte unchanged');
 });
 
+test('a workflow with both a derived link and a formal binding keeps the formal identity', async () => {
+  store.spaceStore.save({ id: 'mixed-board', title: 'Mixed board', viewContent: '<p>mixed</p>' });
+  saveWorkflow('mixed-older', [fetchStep, writeStep('mixed-board', 'older')]);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  saveWorkflow('mixed-formal', [fetchStep, writeStep('mixed-board', 'formal')]);
+  const now = new Date().toISOString();
+  assert.equal(bindings.putWorkflowSurfaceBinding({
+    binding: {
+      version: 1, bindingId: 'mixed-formal-binding', workflowId: 'mixed-formal', workspaceId: 'mixed-board', revision: 1,
+      role: 'primary', projectionVersion: 1, scheduleAuthority: 'workflow', state: 'active', createdAt: now, updatedAt: now,
+    },
+  }).ok, true);
+  const index = await feeds.rebuildFeedIndex({ isSpaceWrite });
+  const summaries = await feeds.spaceFeedSummaries('mixed-board', { links: index.get('mixed-board') });
+  assert.deepEqual(
+    summaries.map((s) => [s.workflow, s.link, s.role, s.collections]),
+    [['mixed-formal', 'reviewed', 'primary', ['formal']], ['mixed-older', 'derived', 'supporting', ['older']]],
+  );
+});
+
 test('a Space learns what feeds it: what it fills, its last run and its next one', async () => {
   saveWorkflow('calendar-feed', [fetchStep, writeStep('content-calendar', 'posts')]);
   store.spaceStore.save({ id: 'content-calendar', title: 'Content calendar', viewContent: '<p>cal</p>' });

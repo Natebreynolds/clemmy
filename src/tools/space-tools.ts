@@ -1430,7 +1430,7 @@ export function registerSpaceTools(server: McpServer): void {
             : 'no recent run';
           const next = !feed.enabled ? 'disabled'
             : feed.nextRunAt ? `next run ${feed.nextRunAt}`
-            : feed.scheduled ? `on schedule "${feed.schedule}"${feed.timezone ? ` (${feed.timezone})` : ''}, next run more than a week out`
+            : feed.scheduled ? `on schedule "${feed.schedule}"${feed.timezone ? ` (${feed.timezone})` : ''}, no run found in the next 8 days`
             : 'runs when started';
           const fills = feed.collections.length > 0 ? `fills ${feed.collections.join(', ')}` : 'what it fills is set by its formal binding';
           return `Fed by workflow "${feed.workflow}" (${feed.role}${feed.link === 'reviewed' ? ', formal binding' : ''}): ${fills}; ${last}; ${next}.`;

@@ -232,9 +232,8 @@ export async function spaceFeedSummaries(
   options: { runsDir?: string; now?: Date; links?: FeedLink[] } = {},
 ): Promise<SpaceFeedSummary[]> {
   const derived = options.links ?? await feedLinksForSpace(workspaceId);
-  const reviewed = listWorkflowSurfaceBindingsForWorkspace(workspaceId)
-    .filter((binding) => binding.state !== 'retired' && !derived.some((link) => link.workflow === binding.workflowId));
-  if (derived.length === 0 && reviewed.length === 0) return [];
+  const formal = listWorkflowSurfaceBindingsForWorkspace(workspaceId).filter((binding) => binding.state !== 'retired');
+  if (derived.length === 0 && formal.length === 0) return [];
   const records = recentRunRecords(options.runsDir);
   const summaries: SpaceFeedSummary[] = [];
   const describe = (name: string, link: SpaceFeedSummary['link'], role: SpaceFeedSummary['role'], collections: string[]) => {
@@ -261,8 +260,22 @@ export async function spaceFeedSummaries(
       ...(lastRun ? { lastRun } : {}),
     });
   };
-  const reviewedPrimary = reviewed.some((binding) => binding.role === 'primary');
-  derived.forEach((link, i) => describe(link.workflow, 'derived', i === 0 && !reviewedPrimary ? 'primary' : 'supporting', link.collections));
-  for (const binding of reviewed) describe(binding.workflowId, 'reviewed', binding.role, []);
+  // A formal binding's identity wins for its workflow (its role and label);
+  // the derived link only adds what the workflow fills. Among workflows with
+  // no formal binding, the earliest leads unless a formal primary exists.
+  const formalByWorkflow = new Map(formal.map((binding) => [binding.workflowId, binding]));
+  let leadAvailable = !formal.some((binding) => binding.role === 'primary');
+  for (const link of derived) {
+    const binding = formalByWorkflow.get(link.workflow);
+    if (binding) {
+      describe(link.workflow, 'reviewed', binding.role, link.collections);
+      continue;
+    }
+    describe(link.workflow, 'derived', leadAvailable ? 'primary' : 'supporting', link.collections);
+    leadAvailable = false;
+  }
+  for (const binding of formal) {
+    if (!derived.some((link) => link.workflow === binding.workflowId)) describe(binding.workflowId, 'reviewed', binding.role, []);
+  }
   return summaries.sort((a, b) => (a.role === b.role ? 0 : a.role === 'primary' ? -1 : 1));
 }
