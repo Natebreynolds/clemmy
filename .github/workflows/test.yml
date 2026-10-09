@@ -269,6 +269,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Test homes are made in the temp folder. On a real Windows install that
+      # is inside the user's own profile, which credential storage accepts as
+      # private; the runner's default temp folder is shared, so it is refused.
+      - name: Private temp folder, as on a real install
+        shell: pwsh
+        run: |
+          $tmp = Join-Path $env:USERPROFILE 'clem-ci-tmp'
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          "TEMP=$tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TMP=$tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
