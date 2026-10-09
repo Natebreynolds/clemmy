@@ -10,6 +10,10 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TEST_HOME, 'state', 'machine-id'), 'machine-composio-terminal-identity\n');
+const REAL_ATTACHMENT = path.join(TEST_HOME, 'outputs', 'report.pdf');
+const REAL_ATTACHMENT_BYTES = 17;
+mkdirSync(path.dirname(REAL_ATTACHMENT), { recursive: true });
+writeFileSync(REAL_ATTACHMENT, '%PDF-1.4 fixture\n');
 
 const client = await import('../integrations/composio/client.js');
 const schemas = await import('./composio-schema-cache.js');
@@ -203,6 +207,8 @@ async function prepareFixture(input: {
   let legacyBodies = 0;
   const noRetryOptions: unknown[] = [];
   const rawSignals: Array<AbortSignal | undefined> = [];
+  const sentBodies: Array<Record<string, unknown>> = [];
+  const presigns: Array<Record<string, unknown>> = [];
   client.__test__.setComposioClient({
     getClient: () => ({
       withOptions: (options: unknown) => {
@@ -211,12 +217,19 @@ async function prepareFixture(input: {
           tools: {
             execute: async (
               _slug: string,
-              _body: Record<string, unknown>,
+              body: Record<string, unknown>,
               options?: { signal?: AbortSignal },
             ) => {
               rawBodies += 1;
               rawSignals.push(options?.signal);
+              sentBodies.push(body);
               return { successful: true, error: null, data: { items: [] } };
+            },
+          },
+          files: {
+            createPresignedURL: async (body: Record<string, unknown>) => {
+              presigns.push(body);
+              return { key: `fixture-key-${presigns.length}`, new_presigned_url: `https://storage.example.test/put/${presigns.length}` };
             },
           },
         };
@@ -237,6 +250,8 @@ async function prepareFixture(input: {
     legacyBodies: () => legacyBodies,
     noRetryOptions,
     rawSignals,
+    sentBodies,
+    presigns,
   };
 }
 
@@ -639,7 +654,7 @@ test('invoke-port drift between the host attestation and registered manifest is 
   assert.equal(fixture.accountLoads(), 1);
 });
 
-for (const variant of ['absent', 'null', 'empty_array', 'file', 'files', 'missing_required', 'missing_required_file'] as const) {
+for (const variant of ['absent', 'null', 'empty_array', 'file', 'files', 'missing_required', 'missing_required_file', 'real_file', 'real_files'] as const) {
   test(`prepared call stages only a runtime-present upload (${variant})`, async () => {
     // Same optional scalar/array annotation shape retained from the P3 draft
     // canary. This is provider-neutral preparation, not a draft-name bypass.
@@ -662,15 +677,44 @@ for (const variant of ['absent', 'null', 'empty_array', 'file', 'files', 'missin
       ...(variant === 'null' ? { attachment: null }
         : variant === 'empty_array' ? { attachment: [] }
         : variant === 'file' ? { attachment: '/allowed/report.pdf' }
-        : variant === 'files' ? { attachment: ['/allowed/report.pdf'] } : {}),
+        : variant === 'files' ? { attachment: ['/allowed/report.pdf'] }
+        : variant === 'real_file' ? { attachment: REAL_ATTACHMENT }
+        : variant === 'real_files' ? { attachment: [REAL_ATTACHMENT] } : {}),
     };
+    const puts: Array<{ url: string; type: string | null; bytes: number }> = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      puts.push({ url: String(url), type: new Headers(init?.headers).get('content-type'), bytes: (init?.body as Uint8Array | undefined)?.byteLength ?? 0 });
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
     const result = await authority.withHostCallAttestation(hostAttestation(fixture.manifest), () => tools.resolveComposioDispatch(
       fixture.manifest.operationId, args, fixture.manifest.accountId, { preparedExecution: true },
     ));
+    try {
     if (variant === 'file' || variant === 'files') {
+      // A file that is not there is refused before anything is reserved or sent.
       assert.equal(result.ok, false);
       if (result.ok) return;
-      assert.match(result.message, /separately admitted\/staged upload plan/);
+      assert.match(result.message, /There is no file at \/allowed\/report\.pdf/);
+      assert.match(result.message, /No provider dispatch was started/);
+    } else if (variant === 'real_file' || variant === 'real_files') {
+      // A real file in the owner's folders is uploaded after approval, right
+      // before the one business request, and the provider gets its handle.
+      assert.equal(result.ok, true, result.ok ? '' : result.message);
+      if (!result.ok) return;
+      assert.deepEqual(result.args, args, 'the approved arguments keep the path');
+      await tools.executePreparedComposioGatewayTool(result.preparedDispatch!);
+      assert.equal(fixture.presigns.length, 1);
+      assert.equal(fixture.presigns[0]!.filename, 'report.pdf');
+      assert.equal(fixture.presigns[0]!.mimetype, 'application/pdf');
+      assert.equal(fixture.presigns[0]!.tool_slug, 'ACME_CREATE_DOCUMENT');
+      assert.equal(fixture.presigns[0]!.toolkit_slug, 'acme');
+      assert.match(String(fixture.presigns[0]!.md5), /^[a-f0-9]{32}$/);
+      assert.deepEqual(puts, [{ url: 'https://storage.example.test/put/1', type: 'application/pdf', bytes: REAL_ATTACHMENT_BYTES }]);
+      const handle = { name: 'report.pdf', mimetype: 'application/pdf', s3key: 'fixture-key-1' };
+      const sent = fixture.sentBodies[0]!.arguments as Record<string, unknown>;
+      assert.deepEqual(sent.attachment, variant === 'real_file' ? handle : [handle]);
+      assert.equal(sent.subject, 'Prepared document');
     } else if (variant === 'missing_required' || variant === 'missing_required_file') {
       assert.equal(result.ok, false);
       if (result.ok) return;
@@ -685,7 +729,10 @@ for (const variant of ['absent', 'null', 'empty_array', 'file', 'files', 'missin
       assert.ok(result.preparedDispatch, 'the exact normal one-shot is prepared');
       await tools.executePreparedComposioGatewayTool(result.preparedDispatch!);
     }
-    assert.equal(fixture.rawBodies(), ['absent', 'null', 'empty_array'].includes(variant) ? 1 : 0);
+    assert.equal(fixture.rawBodies(), ['absent', 'null', 'empty_array', 'real_file', 'real_files'].includes(variant) ? 1 : 0);
     assert.equal(fixture.legacyBodies(), 0);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 }

@@ -1,4 +1,5 @@
 import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion } from './memory-completion-obligation.js';
+import { composioFileInputRefusal, composioOperationInputSchema } from '../../integrations/composio/file-inputs.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
@@ -6317,7 +6318,21 @@ const runHostTurnBody = async (
           : {}),
       });
       const sourcePurpose = classifyMaterialSourceManifestPurpose(manifest.purpose);
+      // A file this call would send is checked before the owner is asked and
+      // before anything is reserved: one that does not exist, sits outside
+      // the owner's folders, holds credentials or is too large is the
+      // model's to correct (or the owner's to answer), never a dispatch.
+      const checksFileInputs = manifest.providerKind === 'composio'
+        && (dispatchEffect === 'external_write' || dispatchEffect === 'admin');
       const validateForegroundPayload = (): InvalidArgumentsPreDispatchResult | null => {
+        if (checksFileInputs) {
+          const unsendable = composioFileInputRefusal(composioOperationInputSchema(manifest.operationId), effectiveArgs);
+          if (unsendable) {
+            return new InvalidArgumentsPreDispatchResult(
+              `${manifest.operationId} was not started: ${unsendable.refusal.message} Give the full path of the file to send, or ask the owner which file they mean. Nothing was sent.`,
+            );
+          }
+        }
         const validation = catalogEntry.validateForegroundPayload?.(effectiveArgs);
         if (!validation || validation.ok) return null;
         // The proof validator's host-authored, value-free repair key rides
@@ -6396,11 +6411,11 @@ const runHostTurnBody = async (
         ...(sourceCapability ? { sourceCapability } : {}),
         sourcePurpose,
         trustedEffectCarrier: trustedRuntimeEffectCarrier(name, args),
-        ...(catalogEntry.validateForegroundPayload
+        ...(catalogEntry.validateForegroundPayload || checksFileInputs
           ? { validateBeforeConsent: validateForegroundPayload }
           : {}),
         ...(!preserveExternalCarrier
-          && (portOwnsPreparation || shippedTransportPreparation || catalogEntry.validateForegroundPayload)
+          && (portOwnsPreparation || shippedTransportPreparation || catalogEntry.validateForegroundPayload || checksFileInputs)
           ? {
               prepareBeforePhysical: async () => {
                 const validation = validateForegroundPayload();

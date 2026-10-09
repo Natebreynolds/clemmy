@@ -47,7 +47,7 @@ export const BUILTIN_STAGED_FILE_DENY_SEGMENTS = Object.freeze([
   'keychains',
 ]);
 
-const SECRET_BASENAME_RE = /^(?:\.env(?:\..*)?|\.netrc|\.pgpass|\.git-credentials|\.npmrc|\.pypirc|credentials(?:\.json)?|id_(?:rsa|ed25519|ecdsa|dsa|ecdsa_sk)(?:\.old)?)$/i;
+export const SECRET_BASENAME_RE = /^(?:\.env(?:\..*)?|\.netrc|\.pgpass|\.git-credentials|\.npmrc|\.pypirc|credentials(?:\.json)?|id_(?:rsa|ed25519|ecdsa|dsa|ecdsa_sk)(?:\.old)?)$/i;
 
 export type StagedFileBlobErrorCode =
   | 'invalid_configuration'

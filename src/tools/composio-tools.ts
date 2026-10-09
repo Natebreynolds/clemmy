@@ -56,6 +56,7 @@ import {
 } from '../integrations/composio/client.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { planStagedFileUploads, StagedFileTransferPlanError } from '../integrations/composio/staged-file-transfer-plan.js';
+import { composioFileInputRefusal } from '../integrations/composio/file-inputs.js';
 import {
   irreversibleSendRequiresExplicitTarget,
   validateIrreversibleSendPayload,
@@ -1183,7 +1184,11 @@ function renderCallableContract(toolSlug: string, schema: unknown): string {
   if (!properties) return '';
   const required = new Set(Array.isArray(shape?.required) ? shape.required as string[] : []);
   const lines = Object.entries(properties).slice(0, 24).map(([name, spec]) => {
-    const type = typeof spec?.type === 'string' ? spec.type : 'any';
+    let fileInput = false;
+    try { fileInput = JSON.stringify(spec ?? {}).includes('"file_uploadable":true'); } catch { fileInput = false; }
+    const type = fileInput
+      ? 'full path of a file on this computer, or a list of them (uploaded when the call runs)'
+      : typeof spec?.type === 'string' ? spec.type : 'any';
     return `  ${name}${required.has(name) ? '*' : ''}: ${type}`;
   });
   if (lines.length === 0) return '';
@@ -2507,6 +2512,7 @@ function prepareComposioGatewayOneShot(input: {
     args: input.args,
     connectedAccountId: input.connectedAccountId,
     providerOperationVersion: input.providerOperationVersion,
+    schema: input.schema,
   });
   const prepared = Object.freeze(Object.create(null)) as PreparedComposioGatewayOneShotDispatch;
   preparedComposioGatewayOneShots.set(prepared as object, {
@@ -3674,9 +3680,9 @@ export async function resolveComposioDispatch(
     // The schema advertises possibilities; only values in this exact call
     // require a transfer. Reuse the same bounded schema/argument projection
     // as staged execution, after ordinary required-field/argument repair.
-    let hasUpload: boolean;
+    let uploadNodes: readonly { pointer: string }[];
     try {
-      hasUpload = planStagedFileUploads(dispatchSchema, args).length > 0;
+      uploadNodes = planStagedFileUploads(dispatchSchema, args);
     } catch (error) {
       if (!(error instanceof StagedFileTransferPlanError)) throw error;
       const message = `⚠️ ${toolSlug} arguments could not be prepared (${error.code}): ${error.message}. `
@@ -3686,13 +3692,16 @@ export async function resolveComposioDispatch(
       });
       return { ok: false, reason: 'invalid-args', message, toolkit };
     }
-    if (hasUpload) {
-      const message =
-        `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started because this call supplies a file upload, `
-        + 'and no separately admitted/staged upload plan is attached. Prepare the exact file transfer first, '
-        + 'then retry the business action. No provider dispatch was started.';
+    // A file this call sends is checked here, before anything is reserved:
+    // the dispatch uploads it after approval, right before the one business
+    // request. A path that cannot be sent is the model's to correct (or the
+    // owner's to answer), never a dispatch.
+    const unsendable = uploadNodes.length > 0 ? composioFileInputRefusal(dispatchSchema, args) : null;
+    if (unsendable) {
+      const message = `⚠️ ${toolSlug} was not started: ${unsendable.refusal.message} Give the full path of the file to send, `
+        + 'or ask the owner which file they mean. No provider dispatch was started.';
       emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
-        guard: 'prepared-file-upload-plan-required',
+        guard: 'file-input-not-sendable', field: unsendable.pointer, validationReason: unsendable.refusal.code,
       });
       return { ok: false, reason: 'invalid-args', message, toolkit };
     }
@@ -5617,7 +5626,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
 
   const composio_execute_tool = attestTerminalPhysicalDispatchOwner(attestToolLocalInputInvalidity(tool({
     name: 'composio_execute_tool',
-    description: 'Execute any Composio action by exact slug (Outlook list-mail, Gmail search, Drive search, Salesforce query, etc.). Use an exact slug already supplied by the runtime or a proven capability directly. Never invent a slug: when this requirement is unresolved, use the single discovery broker once, then pass its exact result here. If the slug is known but its arguments fail validation, inspect that exact action once and repair the call instead of broad-searching again. Arguments must be a JSON object string. Uses the connected OAuth account and approval policy. FILES: actions that return files (attachment/export downloads) save them locally and include the local `filePath` in the result — pass that exact path onward; file-input params (uploads, attachments) accept a local file path string, so download→upload flows (e.g. Outlook attachment → Drive) chain the returned filePath directly.',
+    description: 'Execute any Composio action by exact slug (Outlook list-mail, Gmail search, Drive search, Salesforce query, etc.). Use an exact slug already supplied by the runtime or a proven capability directly. Never invent a slug: when this requirement is unresolved, use the single discovery broker once, then pass its exact result here. If the slug is known but its arguments fail validation, inspect that exact action once and repair the call instead of broad-searching again. Arguments must be a JSON object string. Uses the connected OAuth account and approval policy. FILES: a parameter the schema marks as a file upload (attachments, uploads) takes the full path of a file on this computer, or a list of paths; the file is checked and uploaded when the call runs, and the owner\'s card names it. When more than one file could be the one meant, ask which before calling. A file an action returns comes back as a local `filePath` or a download link; pass a local filePath onward as is.',
     parameters: COMPOSIO_EXECUTE_TOOL_INPUT_SCHEMA,
     // Taxonomy reads `tool_slug` from args to decide read-vs-send, so
     // GOOGLESHEETS_BATCH_GET autos through while GMAIL_SEND_EMAIL pauses

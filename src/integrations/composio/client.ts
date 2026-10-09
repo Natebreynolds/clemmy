@@ -30,6 +30,8 @@ import { successorSlugsFromProse } from './lifecycle-prose.js';
 import { aliasLabelFor } from '../../memory/account-alias-store.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { redactSensitiveText } from '../../runtime/security.js';
+import { composioFileInputs, composioOperationInputSchema, writeArgumentPointer } from './file-inputs.js';
+import { readLocalFileToSend, resolveLocalFileToSend, type LocalFileToSend } from '../../runtime/local-file-sending.js';
 import pino from 'pino';
 import {
   composioErrorDetail,
@@ -3218,6 +3220,9 @@ interface PreparedComposioOneShotState {
   lane: 'sdk';
   toolSlug: string;
   args: Record<string, unknown>;
+  /** The exact input schema the caller validated, when it has one; its
+   * file annotations say which arguments are files to upload. */
+  inputSchema?: unknown;
   connectedAccountId?: string;
   userId: string;
   providerOperationVersion?: string;
@@ -3227,6 +3232,12 @@ interface PreparedComposioOneShotState {
         slug: string,
         body: Record<string, unknown>,
         options?: { signal?: AbortSignal },
+      ) => Promise<unknown>;
+    };
+    files?: {
+      createPresignedURL?: (
+        body: Record<string, unknown>,
+        options?: { signal?: AbortSignal; timeout?: number },
       ) => Promise<unknown>;
     };
   };
@@ -3339,6 +3350,7 @@ export function prepareComposioOneShotDispatch(input: {
   args: Record<string, unknown>;
   connectedAccountId?: string;
   providerOperationVersion?: string;
+  schema?: unknown;
 }): PreparedComposioOneShotDispatch {
   const toolSlug = input.toolSlug.trim();
   if (!toolSlug) {
@@ -3413,6 +3425,7 @@ export function prepareComposioOneShotDispatch(input: {
     lane: 'sdk',
     toolSlug,
     args,
+    ...(input.schema !== undefined ? { inputSchema: input.schema } : {}),
     connectedAccountId,
     userId,
     providerOperationVersion,
@@ -3554,6 +3567,82 @@ function preparedComposioRequestOptions(): { signal?: AbortSignal; timeout?: num
   return { ...(signal ? { signal } : {}), timeout: remainingMs };
 }
 
+/** A refusal before the business request: the file could not be checked or
+ * uploaded, so the app received nothing. The name is the nominal pre-dispatch
+ * marker the settlement reads across module boundaries. */
+class ComposioFileInputRefusal extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = 'ProviderPreDispatchRefusalError';
+  }
+}
+
+/**
+ * The arguments the provider receives: a local path in a parameter the tool's
+ * own schema marks as a file upload is checked, uploaded to the provider's
+ * file storage, and replaced by the handle the provider expects. The owner
+ * approved the call with the path (the card names the file); the upload
+ * happens here, after that approval and before the one business request.
+ * Anything already a handle or a URL is sent as given.
+ */
+async function composioArgumentsWithUploadedFiles(
+  state: PreparedComposioOneShotState,
+): Promise<Record<string, unknown>> {
+  const uploads = composioFileInputs(state.inputSchema ?? composioOperationInputSchema(state.toolSlug), state.args);
+  if (uploads.length === 0) return state.args;
+  const presign = state.rawClient?.files?.createPresignedURL;
+  if (typeof presign !== 'function') {
+    throw new ComposioFileInputRefusal(`${state.toolSlug} needs a file uploaded, and Composio's file storage is not reachable from this connection. Nothing was sent.`);
+  }
+  const toolkitSlug = state.toolSlug.split('_')[0]?.toLowerCase() ?? '';
+  const args = structuredClone(state.args);
+  for (const upload of uploads) {
+    let file: LocalFileToSend;
+    let bytes: Buffer;
+    try {
+      file = resolveLocalFileToSend(upload.path);
+      bytes = readLocalFileToSend(file);
+    } catch (error) {
+      throw new ComposioFileInputRefusal(
+        `${error instanceof Error ? error.message : String(error)} ${state.toolSlug} was not sent.`,
+        error,
+      );
+    }
+    let key: string;
+    try {
+      const options = preparedComposioRequestOptions();
+      const presigned = await presign.call(state.rawClient!.files, {
+        filename: file.name,
+        mimetype: file.mimetype,
+        md5: createHash('md5').update(bytes).digest('hex'),
+        tool_slug: state.toolSlug,
+        toolkit_slug: toolkitSlug,
+      }, options) as { key?: unknown; new_presigned_url?: unknown };
+      if (typeof presigned?.key !== 'string' || typeof presigned.new_presigned_url !== 'string'
+        || !/^https:\/\//.test(presigned.new_presigned_url)) {
+        throw new Error('the file storage did not return an upload address');
+      }
+      const put = await fetch(presigned.new_presigned_url, {
+        method: 'PUT',
+        body: new Uint8Array(bytes),
+        headers: { 'Content-Type': file.mimetype },
+        redirect: 'error',
+        ...(options?.signal ? { signal: options.signal } : {}),
+      });
+      if (!put.ok) throw new Error(`the file storage answered ${put.status}`);
+      key = presigned.key;
+    } catch (error) {
+      if (error instanceof DOMException && (error.name === 'AbortError' || error.name === 'TimeoutError')) throw error;
+      throw new ComposioFileInputRefusal(
+        `${file.name} could not be uploaded (${error instanceof Error ? error.message : String(error)}). ${state.toolSlug} was not sent.`,
+        error,
+      );
+    }
+    writeArgumentPointer(args, upload.pointer, { name: file.name, mimetype: file.mimetype, s3key: key });
+  }
+  return args;
+}
+
 /** The terminal body: one no-retry v3.1 POST.
  * It performs no schema lookup, account listing, reconnect, version fetch,
  * fallback, upload/download modifier, or retry. */
@@ -3574,8 +3663,9 @@ export async function executePreparedComposioTool(
   if (!execute || !state.providerOperationVersion) {
     throw new ComposioPreDispatchError('preparation-required', 'Prepared Composio SDK transport was lost.');
   }
+  const requestArgs = await composioArgumentsWithUploadedFiles(state);
   const body: Record<string, unknown> = {
-    arguments: state.args,
+    arguments: requestArgs,
     user_id: state.userId,
     version: state.providerOperationVersion,
     ...(state.connectedAccountId
