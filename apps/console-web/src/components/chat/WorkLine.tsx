@@ -139,6 +139,13 @@ export function WorkLine({
   // while live, → the last settle once done.
   const bounds = timelineBounds(view, live, now);
   const timeline: StepTimeline | undefined = bounds ? { bounds, now, live } : undefined;
+  // Steps read in people's words: what she is doing while it runs, what she
+  // did once it settled.
+  const plain = (row: ActivityItem): ActivityItem => {
+    const phrased = friendlyStep(row.label);
+    const label = row.status === 'running' ? phrased.action : phrased.done;
+    return { ...row, label: phrased.app ? `${label} · ${phrased.app}` : label };
+  };
   const steps = (
     <LiveStepList live={live}>
       <ol className="ml-[7px] mt-1 list-none border-l border-border py-0.5 pl-4">
@@ -147,10 +154,10 @@ export function WorkLine({
             ? <BatchRow key={a.id} a={a} now={now} live={live} />
             : (
               <li key={a.id} className="list-none">
-                <ol className="list-none p-0"><StepRow a={a} now={now} live={live} timeline={timeline} /></ol>
+                <ol className="list-none p-0"><StepRow a={plain(a)} now={now} live={live} timeline={live ? undefined : timeline} /></ol>
                 {children.get(a.id) && (
                   <ol className="list-none p-0">
-                    {children.get(a.id)!.map((c) => <StepRow key={c.id} a={c} now={now} live={live} timeline={timeline} nested />)}
+                    {children.get(a.id)!.map((c) => <StepRow key={c.id} a={plain(c)} now={now} live={live} timeline={live ? undefined : timeline} nested />)}
                   </ol>
                 )}
               </li>
@@ -162,13 +169,23 @@ export function WorkLine({
 
   if (live) {
     const tools = view.filter((row) => row.kind !== 'check');
-    const inHand = [...tools].reverse().find((row) => row.status === 'running') ?? tools[tools.length - 1];
+    // The card holds the work that matters to the owner: a step in one of
+    // their apps or one that changes something, while it runs or as the last
+    // one done. Looking up memory or finding a tool is how she gets there,
+    // not what she is doing, so it takes the card only when nothing else has.
+    const matters = (row: ActivityItem) => Boolean(friendlyStep(row.label).app)
+      || row.effect === 'local_write' || row.effect === 'external_write' || row.kind === 'agent';
+    const latest = [...tools].reverse();
+    const inHand = latest.find((row) => row.status === 'running' && matters(row))
+      ?? latest.find(matters)
+      ?? latest.find((row) => row.status === 'running')
+      ?? latest[0];
     const step = inHand ? friendlyStep(inHand.label) : null;
     const running = inHand?.status === 'running';
+    // Her own sentence leads; otherwise the card already names the step, so
+    // the line does not say it twice.
     const said = words?.trim()
-      || (inHand && running && step ? step.action : '')
-      || (anyRunning ? current : progress)
-      || (tools.length > 0 ? 'Working on it' : 'Getting started');
+      || (inHand ? 'Working on it' : anyRunning && current ? friendlyStep(current).action : 'Getting started');
     const clock = span.startedAt !== undefined ? clockLabel(span.startedAt, now) : '';
     const stepCount = top.filter((row) => row.kind !== 'check').length;
     return (
@@ -262,15 +279,14 @@ export function WorkLine({
   );
 }
 
-const LIVE_STEPS_OPEN_KEY = 'clem.workline.liveStepsOpen';
-/** Open the first time (the steps are the show while a turn runs); after
- *  that, whatever the reader chose. Storage may be unavailable: default open. */
+const LIVE_STEPS_OPEN_KEY = 'clem.workline.liveStepsOpen.v2';
+/** Closed the first time (the card is the show while a turn runs); after
+ *  that, whatever the reader chose. Storage may be unavailable: default closed. */
 function readLiveStepsOpen(): boolean {
   try {
-    const raw = window.localStorage.getItem(LIVE_STEPS_OPEN_KEY);
-    return raw === null ? true : raw === '1';
+    return window.localStorage.getItem(LIVE_STEPS_OPEN_KEY) === '1';
   } catch {
-    return true;
+    return false;
   }
 }
 function writeLiveStepsOpen(open: boolean): void {
