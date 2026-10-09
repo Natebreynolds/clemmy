@@ -198,7 +198,7 @@ test('a chosen memory model is used exactly by every governed job, with no deadl
 test('each governed job\'s model is named from one description, building no model', () => {
   // The Memory tab polls every few seconds; naming six jobs must not build
   // six provider models (each build reads the account state).
-  const governed = ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import'] as const;
+  const governed = ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import', 'standing'] as const;
   const builds = () => [ClaudeModelProvider.prototype.getModel, CodexModelProvider.prototype.getModel]
     .reduce((n, fn) => n + (fn as unknown as { mock: { callCount(): number } }).mock.callCount(), 0);
   const counted = builds();
@@ -209,7 +209,7 @@ test('each governed job\'s model is named from one description, building no mode
   const before = builds();
   assert.deepEqual(governed.map((job) => memoryJobModelId(job, described)), expected, 'the same ids the routes ask for');
   assert.equal(builds(), before, 'no model was built to name them');
-  for (const job of ['standing', 'verify', 'index', 'tidy'] as const) assert.equal(memoryJobModelId(job, described), null, job);
+  for (const job of ['verify', 'index', 'tidy'] as const) assert.equal(memoryJobModelId(job, described), null, job);
 
   useByo();
   chooseMemory('byo-memory-model');
@@ -257,7 +257,7 @@ test('an extractor pause makes learning wait until the provider said, with the p
 });
 
 test('jobs the memory model does not govern have no memory route and never wait on it', () => {
-  for (const job of ['standing', 'verify', 'index', 'tidy'] as const) {
+  for (const job of ['verify', 'index', 'tidy'] as const) {
     assert.equal(resolveMemoryModelRoute(job), null, job);
     assert.deepEqual(memoryModelAvailability(job), { ok: true }, job);
   }
@@ -410,7 +410,7 @@ test('a checker out of plan quota makes automatic learning wait until the plan s
 test('with no model signed in, the automatic route resolves nothing: every governed job waits as not connected', () => {
   // The checker's selection still builds a model for a signed-out family
   // (a review fails open); memory work must not spend tries on it.
-  const governed = ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import'] as const;
+  const governed = ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import', 'standing'] as const;
   for (const crossFamily of ['on', 'off']) {
     process.env.CLEMMY_JUDGE_CROSS_FAMILY = crossFamily;
     writeAuth({ claude: false, codex: false });

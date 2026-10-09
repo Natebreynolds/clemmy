@@ -56,7 +56,9 @@ export const MEMORY_JOBS: Readonly<Record<MemoryJobId, MemoryJobSpec>> = Object.
   skills: { id: 'skills', modelOwner: 'memory', trigger: 'after_success' },
   identity: { id: 'identity', modelOwner: 'memory', trigger: 'daily' },
   import: { id: 'import', modelOwner: 'memory', trigger: 'on_request' },
-  standing: { id: 'standing', modelOwner: 'checker', trigger: 'after_message' },
+  // The owner's memory model reads each message for a standing preference;
+  // with none chosen it follows the checker, as before (memory-model-route).
+  standing: { id: 'standing', modelOwner: 'memory', trigger: 'after_message' },
   verify: { id: 'verify', modelOwner: 'checker', trigger: 'nightly' },
   index: { id: 'index', modelOwner: 'local', trigger: 'every_few_minutes' },
   backup: { id: 'backup', modelOwner: 'none', trigger: 'nightly' },

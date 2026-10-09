@@ -1,7 +1,6 @@
 import { Agent, Runner } from '@openai/agents';
-import { resolveBoundaryJudge } from '../runtime/harness/debate-model.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
-import { inMemoryJobTurn, memoryWorkSourceFromTurn, runMemoryModelJob } from './memory-job-context.js';
+import { memoryJobRoute, memoryWorkSourceFromTurn, runMemoryModelJob } from './memory-job-context.js';
 import { createAutomaticMemoryEnvelope, withAutomaticMemoryDecision,
   type AutomaticMemoryDecision, type AutomaticMemoryOrigin } from './memory-destination.js';
 
@@ -178,8 +177,10 @@ async function reviewStandingMemoryNow(
   mode: 'inferred' | 'explicit' | 'volunteered' | 'destination',
   origin?: AutomaticMemoryOrigin,
 ): Promise<StandingMemoryReview> {
-  const route = inMemoryJobTurn(() => resolveBoundaryJudge());
-  if (!route.model) throw new Error('Standing-memory review model is unavailable');
+  // The owner's memory model, else the checker as before; a chosen model that
+  // cannot serve right now makes the check wait, never borrow another provider.
+  const route = memoryJobRoute('standing');
+  if (!route?.model) throw new Error('Standing-memory review model is unavailable');
   const request = buildStandingMemoryReviewRequest(source, candidate, mode, origin);
   const agent = new Agent({ name: 'StandingMemoryReview', model: route.model,
     instructions: request.instructions, tools: [] });

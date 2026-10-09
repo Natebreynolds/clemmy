@@ -110,7 +110,7 @@ test('model calls inside a job carry its channel and the memory role, even insid
     runMemoryJob('learn', {}, async () => { call('memory-model'); }, () => ({ outcome: 'nothing_new' })));
   // A checker job's judge route opens a narrower scope that keeps the
   // inherited channel and names its own role (routeAttributionContext).
-  await runMemoryJob('standing', {}, async () => withModelUsageAttribution(
+  await runMemoryJob('verify', {}, async () => withModelUsageAttribution(
     { ...modelUsageAttributionStorage.getStore()!, role: 'reviewer' },
     async () => { call('checker-model'); },
   ), () => ({ outcome: 'nothing_new' }));
@@ -120,7 +120,7 @@ test('model calls inside a job carry its channel and the memory role, even insid
   assert.equal((learn?.payload as { channel?: string }).channel, 'memory:learn');
   assert.equal((learn?.payload as { role?: string }).role, 'memory');
   assert.notEqual(learn?.sessionId, 'sess-chat', 'memory tokens are never charged to the conversation');
-  assert.equal((standing?.payload as { channel?: string }).channel, 'memory:standing');
+  assert.equal((standing?.payload as { channel?: string }).channel, 'memory:verify');
   assert.equal((standing?.payload as { role?: string }).role, 'reviewer', 'the checker jobs keep their own role');
 });
 
@@ -131,7 +131,8 @@ test('a job\'s scope names whose thinking it is, so a route recorded as the brai
   const scopeRole = (job: 'verify' | 'standing' | 'reconcile' | 'index' | 'tidy') => runMemoryJob(job, {},
     async () => modelUsageAttributionStorage.getStore()?.role, () => ({ outcome: 'nothing_new' }));
   assert.equal(await scopeRole('verify'), 'reviewer');
-  assert.equal(await scopeRole('standing'), 'reviewer');
+  // The standing-preference check runs on the owner's memory model.
+  assert.equal(await scopeRole('standing'), 'memory');
   assert.equal(await scopeRole('reconcile'), 'memory');
   assert.equal(await scopeRole('index'), undefined, 'the local index names no model role');
   assert.equal(await scopeRole('tidy'), undefined);
@@ -443,7 +444,7 @@ test('the journal remembers when it began, so earlier days are absent rather tha
 test('memory child calls keep exact causal ownership without restoring turn execution scope', async () => {
   const parent = { sessionId: 'sess-memory-causal', sourceUserSeq: 37, attemptId: 'attempt:memory-causal' };
   await withModelUsageAttribution(parent, () => runMemoryJob('learn', {}, async () => {
-    await runMemoryJob('standing', {}, async () => {
+    await runMemoryJob('verify', {}, async () => {
       const scope = modelUsageAttributionStorage.getStore()!;
       assert.equal(scope.sessionId, '');
       assert.equal(scope.sourceUserSeq, 0, 'accounting does not reactivate a turn pin or execution authority');
@@ -455,9 +456,9 @@ test('memory child calls keep exact causal ownership without restoring turn exec
   const rows = readUsageEventsForDate().filter(e => e.model === 'causal-memory-check');
   assert.equal(rows.length, 1, 'a nested call is persisted once');
   const row = rows[0]!;
-  const event = memoryEvents().find(e => e.actor === 'standing')!;
-  assert.equal(row.source, `memory:standing:${(event.payload as {runId: string}).runId}`);
-  assert.equal(row.channel, 'memory:standing');
+  const event = memoryEvents().find(e => e.actor === 'verify')!;
+  assert.equal(row.source, `memory:verify:${(event.payload as {runId: string}).runId}`);
+  assert.equal(row.channel, 'memory:verify');
   assert.equal(row.role, 'reviewer');
   assert.equal(row.trace?.acceptedSource, 'sess-memory-causal:37');
   assert.equal(row.trace?.logicalTurnId, 'turn:37');

@@ -105,7 +105,7 @@ export type MemoryModelAvailability =
   | { ok: false; reason: 'model_paused' | 'model_unavailable'; problem?: MemoryModelProblem; until?: string };
 
 /** Jobs whose automatic model is the boundary checker's selection. */
-const BOUNDARY_JOBS: ReadonlySet<MemoryJobId> = new Set(['learn', 'reconcile', 'patterns']);
+const BOUNDARY_JOBS: ReadonlySet<MemoryJobId> = new Set(['learn', 'reconcile', 'patterns', 'standing']);
 
 /** The job that stands for "memory's model" on Settings and the Memory tab:
  *  the learning extractor, which makes most memory calls. */

@@ -432,7 +432,7 @@ test('an import records the memories it added by id; its saves are not recorded 
 
 // ───────────────────────────── checker jobs ─────────────────────────────
 
-test('a standing-instruction check is recorded on the checker with its own lane', async () => {
+test('a standing-instruction check runs on the memory route (the checker\'s model until a memory model is chosen), in its own lane', async () => {
   const clause = 'Every Monday, send the digest to my review list.';
   const checker = (await import('../runtime/harness/debate-model.js')).resolveBoundaryJudge();
   replies[checker.modelId] = JSON.stringify({ scope: 'standing', text: clause, reason: 'recurring request' });
@@ -445,7 +445,7 @@ test('a standing-instruction check is recorded on the checker with its own lane'
   assert.equal(event.payload.model?.modelId, checker.modelId);
   const [call] = callEvents(checker.modelId);
   assert.equal(call.channel, 'memory:standing');
-  assert.equal(call.role, 'reviewer', 'the checker keeps its own role');
+  assert.equal(call.role, 'memory', 'booked to the memory model the owner chooses for it');
 });
 
 test('a repair check asks the independent checker and is recorded on its own lane', async () => {

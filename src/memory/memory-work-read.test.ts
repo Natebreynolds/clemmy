@@ -431,7 +431,7 @@ test('today, the jobs and the memory model come from the recorded runs', async (
   await runMemoryJob('learn', { source: { kind: 'conversation', sessionId: 'sess-1' } }, async () => { call('memory-model', 100, 10); call('memory-model', 50, 5); }, () => ({
     outcome: 'ok', produced: { claims: 4, learned: 1, updated: 1, leftOut: 1, setAside: 1 },
   }));
-  await runMemoryJob('standing', {}, async () => { call('checker-model', 20, 2); }, () => ({ outcome: 'nothing_new' }));
+  await runMemoryJob('verify', {}, async () => { call('checker-model', 20, 2); }, () => ({ outcome: 'nothing_new' }));
   const snap = readMemoryWork();
   assert.equal(snap.today.runs, 2);
   assert.equal(snap.today.modelCalls, 3);
@@ -451,8 +451,8 @@ test('today, the jobs and the memory model come from the recorded runs', async (
   assert.equal(byId.get('learn')?.today.modelCalls, 2);
   assert.equal(byId.get('learn')?.lastRun?.outcome, 'ok');
   assert.equal(typeof byId.get('learn')?.lastRun?.durationMs, 'number');
-  assert.equal(byId.get('standing')?.modelId, null, 'nothing signed in can serve the checker');
-  assert.equal(snap.recent.find((e) => e.job === 'standing')?.model?.modelId, 'checker-model');
+  assert.equal(byId.get('verify')?.modelId, null, 'nothing signed in can serve the checker');
+  assert.equal(snap.recent.find((e) => e.job === 'verify')?.model?.modelId, 'checker-model');
   // The memory model's "last served" is a governed job's model, never the checker's.
   assert.equal(snap.model.lastServed?.modelId, 'memory-model');
   assert.equal(snap.model.lastServed?.standIn, false);

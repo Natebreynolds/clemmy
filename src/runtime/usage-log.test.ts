@@ -424,8 +424,8 @@ test('a memory job channel names the role of the model the job registry gives it
     assert.equal(usageRoleFromChannel(`memory:${job}`), 'memory', `${job} runs on the memory model`);
   }
   assert.equal(usageRoleFromChannel('Memory:Reconcile'), 'memory', 'case does not change the job');
-  // Checking stays with "Checks the work" on purpose; its calls are review.
-  assert.equal(usageRoleFromChannel('memory:standing'), 'reviewer');
+  // The standing-preference check runs on the memory model; repairs stay review.
+  assert.equal(usageRoleFromChannel('memory:standing'), 'memory');
   assert.equal(usageRoleFromChannel('memory:verify'), 'reviewer');
   // The local index and model-free upkeep are not memory model work.
   assert.equal(usageRoleFromChannel('memory:index'), undefined);
@@ -438,7 +438,7 @@ test('a memory job channel names the role of the model the job registry gives it
 test('a checker memory job books an unrouted call as review, never as the memory model', () => {
   const read = (sessionId: string) => listOperationalEvents({ source: 'model', type: 'model_call_completed', sessionId, limit: 5 })[0]?.payload;
   // The journal's scope shape: a governed job adds role memory, a checker job only its channel.
-  for (const [job, role] of [['verify', 'reviewer'], ['standing', 'reviewer'], ['index', undefined], ['learn', 'memory']] as const) {
+  for (const [job, role] of [['verify', 'reviewer'], ['standing', 'memory'], ['index', undefined], ['learn', 'memory']] as const) {
     const sessionId = `usage-memory-owner-${job}`;
     withModelUsageAttribution({ sessionId: 'memory', sourceUserSeq: 0, channel: `memory:${job}`,
       ...(job === 'learn' ? { role: 'memory' as const } : {}) }, () =>
