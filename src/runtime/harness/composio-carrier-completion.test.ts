@@ -182,3 +182,32 @@ test('an extra {args:{...}} envelope inside arguments is unwrapped once (GLM 5.3
   const ri = JSON.parse((JSON.parse(real!.argumentsJson) as { args_json: string }).args_json) as { arguments: string };
   assert.deepEqual(JSON.parse(ri.arguments), { channel: 'C1', limit: 5 });
 });
+
+test('a carrier with no tool_slug is bound to the proven read its own requirement_id names, among several proven reads', () => {
+  const proven = [
+    { kind: 'composio', identifier: 'DECKS_PRESENTATIONS_GET', effectClass: 'read' },
+    { kind: 'composio', identifier: 'DECKS_PRESENTATIONS_PAGES_GET', effectClass: 'read' },
+    { kind: 'composio', identifier: 'DECKS_PRESENTATIONS_BATCH_UPDATE', effectClass: 'write' },
+  ];
+  const carrier = (requirementId: string) => JSON.stringify({
+    args_json: JSON.stringify({ presentationId: 'deck-1', pageObjectId: 'p4' }),
+    name: 'composio_execute_tool',
+    requirement_id: requirementId,
+  });
+  const completed = completeComposioCarrierArguments(carrier('cap:resolved:decks_presentations_pages_get'), proven);
+  assert.ok(completed);
+  assert.equal(completed!.toolSlug, 'DECKS_PRESENTATIONS_PAGES_GET');
+  const outer = JSON.parse(completed!.argumentsJson) as Record<string, unknown>;
+  assert.equal(outer.requirement_id, 'cap:resolved:decks_presentations_pages_get', 'the requirement is untouched');
+  const inner = JSON.parse(String(outer.args_json)) as Record<string, unknown>;
+  assert.equal(inner.tool_slug, 'DECKS_PRESENTATIONS_PAGES_GET');
+  assert.deepEqual(JSON.parse(String(inner.arguments)), { presentationId: 'deck-1', pageObjectId: 'p4' });
+  assert.match(completed!.changes.join('; '), /requirement_id names/);
+  // A re-versioned definition id names the same operation.
+  assert.equal(completeComposioCarrierArguments(carrier('cap:resolved:decks_presentations_get:definition:ab12cd'), proven)?.toolSlug,
+    'DECKS_PRESENTATIONS_GET');
+  // Never a write, never an operation not proven this turn, never a free-form requirement.
+  assert.equal(completeComposioCarrierArguments(carrier('cap:resolved:decks_presentations_batch_update'), proven), null);
+  assert.equal(completeComposioCarrierArguments(carrier('cap:resolved:decks_slides_delete'), proven), null);
+  assert.equal(completeComposioCarrierArguments(carrier('read slide four'), proven), null);
+});

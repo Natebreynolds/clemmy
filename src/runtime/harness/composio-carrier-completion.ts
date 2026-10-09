@@ -9,6 +9,7 @@
  *
  * Three completions, all deterministic and all logged:
  *  1. no tool_slug and EXACTLY ONE composio READ proven this turn → bind it;
+ *     or the carrier's requirement_id names a read proven this turn → bind that;
  *  2. action arguments given at the top level → wrapped into `arguments`;
  *  3. `arguments` given as an object → serialized once (the gateway schema
  *     takes a JSON string); the model never has to double-encode.
@@ -92,6 +93,16 @@ function normalizeBareCompositeOperationName(
   return provenIdentifiers.has(upper) ? upper : null;
 }
 
+/** The operation a host-issued capability id names (`cap:resolved:<slug>`,
+ * or `cap:resolved:<slug>:definition:<fingerprint>` after a provider
+ * re-version), as an uppercase slug; null for any other requirement id. */
+function resolvedOperationOfRequirement(requirementId: unknown): string | null {
+  if (typeof requirementId !== 'string') return null;
+  const match = /^cap:resolved:([a-z0-9_]+)(?::definition:[a-z0-9]+)?$/i.exec(requirementId.trim());
+  const slug = match?.[1]?.toUpperCase() ?? '';
+  return COMPOSIO_SLUG_RE.test(slug) ? slug : null;
+}
+
 export function completeComposioCarrierArguments(
   outerArgumentsJson: string,
   provenEntries: readonly ProvenCompletionEntry[],
@@ -162,9 +173,18 @@ export function completeComposioCarrierArguments(
         .map((entry) => entry.identifier.trim().toUpperCase())
         .filter(Boolean),
     )];
-    if (provenReads.length !== 1) return null;
-    toolSlug = provenReads[0]!;
-    changes.push(`tool_slug bound to ${toolSlug}, the only operation proven this turn`);
+    // The carrier's own requirement_id may name the operation exactly (a
+    // host-issued capability id); when that is a read proven this turn it is
+    // the answer, however many other reads were proven.
+    const named = resolvedOperationOfRequirement(outer.requirement_id);
+    if (named && provenReads.includes(named)) {
+      toolSlug = named;
+      changes.push(`tool_slug bound to ${toolSlug}, the proven read the call's requirement_id names`);
+    } else {
+      if (provenReads.length !== 1) return null;
+      toolSlug = provenReads[0]!;
+      changes.push(`tool_slug bound to ${toolSlug}, the only operation proven this turn`);
+    }
   } else if (!provenIdentifiers.has(toolSlug.toUpperCase())) {
     // A doubled toolkit prefix (OUTLOOK_OUTLOOK_SEND_EMAIL for the proven
     // OUTLOOK_SEND_EMAIL) names the proven operation with one stutter; the
