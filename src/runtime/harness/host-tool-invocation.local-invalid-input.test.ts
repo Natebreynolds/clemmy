@@ -322,7 +322,10 @@ test('production shape: the real task_list tool, wrapped for the harness, refuse
   assert.equal(typeof output, 'string', 'the model receives repair guidance, not the internal carrier');
   assert.match(String(output), /^An error occurred while running the tool/);
   assert.match(String(output), /priority: Invalid option/);
-  assert.match(String(output), /tool_search/);
+  // The tool's own current schema comes back inline, so the retry needs no
+  // schema search.
+  assert.match(String(output), /Input schema \(complete\):\n\{/);
+  assert.doesNotMatch(String(output), /tool_search/);
   assert.equal(counter.calls, 1, 'the refused attempt still consumes one tool-call unit');
 
   assert.deepEqual(settlementRow(accepted), {
