@@ -33,8 +33,8 @@ export interface RecallUseResult {
   duplicates: RecallCandidateRef[];
   rejected: string[];
   utilityFactIds: number[];
-  /** Archived (active=0) facts that earned their way back: a demonstrable use
-   *  through this sink reactivates them (earn-your-way-back resurrection). */
+  /** Facts already archived before this recall run was recorded that earned
+   *  their way back through demonstrable use. Later deactivations stay down. */
   resurrectedFactIds: number[];
   reason?: 'not_found' | 'expired';
 }
@@ -315,10 +315,10 @@ export function recordRecallUse(input: {
   const db = openMemoryDb();
   const now = input.nowIso ?? new Date().toISOString();
   const run = db.prepare(`
-    SELECT candidate_refs_json, expires_at
+    SELECT candidate_refs_json, created_at, expires_at
     FROM memory_recall_runs
     WHERE id = ?
-  `).get(input.recallId) as { candidate_refs_json: string; expires_at: string } | undefined;
+  `).get(input.recallId) as { candidate_refs_json: string; created_at: string; expires_at: string } | undefined;
   if (!run) return { ok: false, recorded: [], duplicates: [], rejected: input.refs, utilityFactIds: [], resurrectedFactIds: [], reason: 'not_found' };
   if (Date.parse(run.expires_at) < Date.parse(now)) {
     return { ok: false, recorded: [], duplicates: [], rejected: input.refs, utilityFactIds: [], resurrectedFactIds: [], reason: 'expired' };
@@ -425,15 +425,23 @@ export function recordRecallUse(input: {
         // Earn-your-way-back resurrection (2026-07-31): the credit UPDATE is
         // guarded on active=1, so an ARCHIVED fact surfaced by the cold-tier
         // fallback used to earn nothing here — preserved yet unrewardable.
-        // Demonstrable use is the strongest possible evidence a retirement was
-        // premature, so restore through the canonical reactivateFact path
+        // Only a row archived before this recall run was recorded can earn back.
+        // A later deactivation supersedes that offer, even if the final answer
+        // cites its ref. Equal millisecond stamps cannot prove this ordering.
+        // Restore through the canonical reactivateFact path
         // (which also refreshes last_used_at against immediate re-decay), then
         // credit. Superseded rows stay down: they were replaced, not stale.
         try {
           const archived = db.prepare(
-            'SELECT 1 FROM consolidated_facts WHERE id = ? AND active = 0 AND superseded_by_fact_id IS NULL',
-          ).get(factId);
-          if (archived && reactivateFact(factId) && creditFact.run(now, now, factId).changes > 0) {
+            'SELECT updated_at FROM consolidated_facts WHERE id = ? AND active = 0 AND superseded_by_fact_id IS NULL',
+          ).get(factId) as { updated_at: string } | undefined;
+          const archivedMs = archived ? Date.parse(archived.updated_at) : NaN;
+          const admittedMs = Date.parse(run.created_at);
+          const archivedBeforeRecall = Number.isFinite(archivedMs) && Number.isFinite(admittedMs)
+            && new Date(archivedMs).toISOString() === archived?.updated_at
+            && new Date(admittedMs).toISOString() === run.created_at
+            && archivedMs < admittedMs;
+          if (archivedBeforeRecall && reactivateFact(factId) && creditFact.run(now, now, factId).changes > 0) {
             utilityFactIds.add(factId);
             resurrectedFactIds.add(factId);
           }

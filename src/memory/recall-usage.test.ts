@@ -266,18 +266,19 @@ test('M2: the exclusion window closes — an old correction falls back to demoti
   assert.equal(correctionExcludesFromRecall(signal), false, 'a spurious correction self-heals after the window');
 });
 
-test('earn-your-way-back: crediting a retired fact resurrects it through the canonical restore path (2026-07-31)', async () => {
+test('earn-your-way-back: a fact archived before recall can resurrect through the canonical restore path', async (t) => {
   const { forgetFact } = await import('./facts.js');
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-09T12:00:00.000Z') });
   const fact = rememberFact({ kind: 'project', content: 'The Northwind renewal contact is the regional ops lead.' });
+  forgetFact(fact.id);
+  assert.equal(getFact(fact.id)?.active, false, 'precondition: the fact is archived before recall');
+  t.mock.timers.tick(1);
   const run = recordRecallRun({
     objective: 'who handles the Northwind renewal?',
     surface: 'memory_search_facts',
     answerability: 'partial',
     candidateRefs: [{ type: 'fact', id: String(fact.id), snippet: fact.content }],
   });
-  forgetFact(fact.id);
-  assert.equal(getFact(fact.id)?.active, false, 'precondition: the fact is archived');
-
   const result = recordRecallUse({ recallId: run.id, refs: [`fact:${fact.id}`], detail: 'auto:content' });
   assert.equal(result.ok, true);
   assert.deepEqual(result.resurrectedFactIds, [fact.id], 'demonstrable use resurrects the archived fact');
