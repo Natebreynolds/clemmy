@@ -17,9 +17,9 @@ function readSmallFile(file: string): string | null {
 /** Recognize npm's local Claude Code target, without evaluating batch syntax.
  *  npm's cmd-shim ends the launcher with `"%_prog%" <args> "%dp0%\<target>" %*`
  *  for a script node runs (with no args that is TWO spaces after "%_prog%"),
- *  or `"%dp0%\<target>" <args> %*` for a native target. A tester's real npm
- *  install (2026-10-08) failed the old one-space pattern, fell through to the
- *  extensionless sh launcher and every Claude call crashed with spawn ENOENT.
+ *  or `"%dp0%\<target>" <args> %*` for a native target. Matching only one
+ *  space falls through to the extensionless sh launcher, which Windows cannot
+ *  spawn (ENOENT).
  *  The target must be the package's own declared `claude` bin, inside it. */
 function npmClaudeEntry(shim: string): string | null {
   const text = readSmallFile(shim);

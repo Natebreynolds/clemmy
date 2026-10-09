@@ -9,8 +9,8 @@
  *
  * It used the browser's Web Speech API. Electron exposes
  * webkitSpeechRecognition, but it cannot work there (the speech service is
- * keyed into Google Chrome builds only), so the Mac and Windows apps showed a
- * microphone that did nothing (owner, 2026-10-08). The phone keeps its own
+ * keyed into Google Chrome builds only), so the desktop apps showed a
+ * microphone that did nothing. The phone keeps its own
  * copy, where the system speech recognizer does work.
  *
  * The final transcription only, no live interim: each interim pass re-runs

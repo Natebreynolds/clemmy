@@ -27,7 +27,7 @@ function lazyNamed<T extends Record<K, ComponentType>, K extends keyof T>(
 /** Every screen's code is fetched in the background once the app is up, so
  * opening a tab never waits on a busy daemon for its code. Navigation keeps
  * the current screen until the next one's code arrives, so a starved daemon
- * read as "the tab won't open" (a Windows tester, 2026-10-08). The chunks are
+ * would otherwise read as "the tab won't open". The chunks are
  * hashed and served immutable: each is fetched once per version. */
 const SCREEN_LOADERS: Array<() => Promise<unknown>> = [];
 const PREFETCH_START_MS = 3_000;

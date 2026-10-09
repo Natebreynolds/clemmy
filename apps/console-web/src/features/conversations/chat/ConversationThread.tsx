@@ -238,8 +238,8 @@ export function ConversationThread() {
   }
   if (detail.isError || !detail.data) {
     if (detail.isError && !isMissingConversation(detail.error)) {
-      // Unreachable or restarting is not missing (a Windows tester, 10-08:
-      // every chat read "could not be found" while the daemon restarted).
+      // Unreachable or restarting is not missing: a daemon restart must not
+      // read as "could not be found".
       return (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center text-muted">
           <p>Can’t reach Clementine right now, so this conversation didn’t load.</p>

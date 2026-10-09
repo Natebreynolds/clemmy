@@ -56,9 +56,9 @@ export type SupervisorEvent =
 
 const READINESS_TIMEOUT_MS = 90_000;
 // A boot still making progress (fresh beacon from ITS OWN worker, no single
-// phase past the stuck ceiling) is given more time instead of being killed.
-// Owner's Mac 2026-10-08 under heavy swap: boots took 75–95 s, each was
-// SIGKILLed at 90 s and paid a fresh boot reconciliation, a 17-minute loop.
+// phase past the stuck ceiling) is given more time instead of being killed:
+// under memory pressure a boot can outlast the base timeout, and killing it
+// only restarts the same slow boot.
 const READINESS_EXTENSION_MS = 60_000;
 const READINESS_MAX_MS = 5 * 60_000;
 const READINESS_POLL_MS = 250;

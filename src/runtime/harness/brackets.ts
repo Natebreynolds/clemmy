@@ -2748,8 +2748,8 @@ function settlementCallIsMutating(toolName: string, args: unknown): boolean {
   // An approved pending action carries no host capability binding (its claim
   // is the authority), so no attestation reaches here. Its invocation froze
   // the action's runtime effect; report that same effect, or the host refuses
-  // the result of a command that already ran (live 2026-10-08: every approved
-  // off-machine shell command ended "can't tell whether it went through").
+  // the result of a command that already ran and the owner hears an uncertain
+  // outcome for a command that succeeded.
   const approved = context?.pendingActionExecution;
   if (approved && verifyPendingActionResumeExecutionCapability({
     capability: approved, sessionId: context?.sessionId, toolName, payload: args,

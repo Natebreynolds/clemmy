@@ -2054,8 +2054,8 @@ export async function invokeHostToolCall<T>(
               // observation instead of settling. The host settles the returned
               // result under the frozen contract; its claim already consumed
               // the approval, and an observation that contradicts the contract
-              // or a throw still fails closed. Live 2026-10-08: an approved
-              // send went out and the owner was told the outcome was uncertain.
+              // or a throw still fails closed. Without this, an approved send
+              // that went out is reported to the owner as uncertain.
               if (
                 redeemed.status === 'missing'
                 && returned !== undefined

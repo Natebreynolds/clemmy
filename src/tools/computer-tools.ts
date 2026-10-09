@@ -1237,8 +1237,7 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
 
     // The owner's Stop reaches the running command: the host's cancel
     // authority for this step ends the process group and the call returns
-    // as stopped. Effects before cancellation still need their own evidence
-    // (live 2026-10-08: a stopped 90 s count was still alive afterwards).
+    // as stopped. Effects before cancellation still need their own evidence.
     // The host invocation's signal survives the model step and the finisher's
     // removal of its Stop latch. Use that existing exact owner first; the old
     // model-step signal and durable polling remain compatibility fallbacks.

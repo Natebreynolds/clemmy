@@ -1,10 +1,10 @@
 /**
- * One redacted text file a tester can send when Clementine misbehaves.
+ * One redacted text file a user can send when Clementine misbehaves.
  *
  * The desktop shell builds it, not the daemon: it has to work while the
- * daemon is crash-looping or never started. A Windows tester's crash loop
- * (2026-10-08) was only diagnosed once the supervisor log was pasted by hand;
- * screenshots of "Clem needs to reconnect" could not say why. The file holds
+ * daemon is crash-looping or never started, when the supervisor log is the
+ * only record of why and a screenshot of "Clem needs to reconnect" cannot
+ * say. The file holds
  * the build identity and the last part of the supervisor log and of the
  * daemon's stall, hang and liveness records. Secrets and tokens, email
  * addresses, the user's own folder and the computer's name are replaced

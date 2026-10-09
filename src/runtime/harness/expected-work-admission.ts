@@ -642,8 +642,8 @@ export function approvedMandateAdmitsCall(
       // The ledger names the call by its canonical (case-folded) identity; the
       // action froze the provider's spelling and hashed its payload under it.
       // The same canonical tool verifies under the frozen spelling, never a
-      // different tool (live 2026-10-08: outlook__outlook_send_email vs the
-      // stored outlook__OUTLOOK_SEND_EMAIL refused every approved MCP send).
+      // different tool; otherwise a provider slug's case alone refuses an
+      // approved send.
       const frozenTool = getPendingAction(capability.pendingActionId)?.toolName;
       const canonical = canonicalLogicalToolName(tool);
       const toolName = frozenTool && canonical !== null && canonicalLogicalToolName(frozenTool) === canonical

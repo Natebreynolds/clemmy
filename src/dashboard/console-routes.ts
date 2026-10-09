@@ -3680,9 +3680,8 @@ function tryCommitLiveApprovalControl(input: {
           // conversational path so the owner receives the appropriate reply.
           // The decision needs the card's live executor: once that turn has
           // finished, the reply goes to Clem, who runs the card and reports
-          // what it printed. Borrowing the finished turn's identity here left
-          // the owner with only "Approved — running it now." and no output
-          // (live 2026-10-08, w24-approve-in-words on 85b41943f).
+          // what it printed. Borrowing the finished turn's identity here would
+          // leave the owner with a fixed host line and no output.
           if (intent.decision === 'reject') return null;
           if (!input.queuedEligible) return null;
           const preflight = exactPendingActionApprovalPreflight(row, intent.decision);

@@ -145,7 +145,7 @@ async function dispatchApprovedCall(
       // (its effective operation differs from its name) or an MCP tool books
       // its own crossing under the exact operation: a host-owned crossing
       // there names the carrier and conflicts with that row, or books a
-      // second crossing beside the adapter's (live 2026-10-08).
+      // second crossing beside the adapter's.
       boundary: isMcpNamespacedTool(record.toolName) || carriedCall(record) ? 'nested_owned' : 'host_owned_local',
       deadlineMs: timeoutForTool(record.toolName),
       callerSignal: parent?.callerCancelSignal,

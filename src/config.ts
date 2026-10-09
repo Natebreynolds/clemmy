@@ -373,6 +373,9 @@ export type ModelTier = keyof Models;
 export const DEFAULT_CODEX_FAST_MODEL = 'gpt-5.6-luna';
 /** Small Claude worker rescue; independent of the foreground brain selection. */
 export const DEFAULT_CLAUDE_FAST_MODEL = 'claude-haiku-4-5';
+/** Claude brain a Claude sign-in adopts when no Claude model was chosen: the
+ * standard tier, never a premium one unbidden. */
+export const DEFAULT_CLAUDE_ADOPTED_BRAIN_MODEL = 'claude-sonnet-5';
 /** Codex brain default and BYO-slot rescue. gpt-5.4 is no longer served on ChatGPT Codex OAuth. */
 export const DEFAULT_CODEX_MODEL = 'gpt-5.6-terra';
 export const DEFAULT_CODEX_DEEP_MODEL = 'gpt-5.6-sol';
