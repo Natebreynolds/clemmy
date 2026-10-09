@@ -288,6 +288,8 @@ function workspaceViewCsp(req: Request, slug: string): string | null {
  *    await clem.compose(instructions, ctx)   → a grounded draft (throws on error)
  *    await clem.action(actionId, args)       → fire a declared action
  *    await clem.note(text, kind?, meta?)     → record a note
+ *    clem.onData(callback)                   → new data arrives in place, no reload
+ *                                              (returns an unsubscribe)
  *  clem.action() RESOLVES the E1 approval contract: a send/write returns
  *  {pending:true, approvalId} (the user approves in the inbox; it fires then),
  *  a read returns {ok:true, result}. */
@@ -333,7 +335,7 @@ var TARGET_DESC=OWN_DESC(Event.prototype,'target'),TRUSTED_DESC=OWN_DESC(Event.p
 var GET_PORTS=PORTS_DESC&&PORTS_DESC.get?U(PORTS_DESC.get):null,GET_DATA=DATA_DESC&&DATA_DESC.get?U(DATA_DESC.get):null,GET_SOURCE=SOURCE_DESC&&SOURCE_DESC.get?U(SOURCE_DESC.get):null;
 var GET_TARGET=TARGET_DESC&&TARGET_DESC.get?U(TARGET_DESC.get):null,GET_TRUSTED=TRUSTED_DESC&&TRUSTED_DESC.get?U(TRUSTED_DESC.get):function(e){return e.isTrusted;};
 var CLOSEST=U(Element.prototype.closest),HAS_ATTR=U(Element.prototype.hasAttribute),GET_ATTR=U(Element.prototype.getAttribute);
-var ARRAY_PUSH=U(Array.prototype.push),ARRAY_INDEX=U(Array.prototype.indexOf);
+var ARRAY_PUSH=U(Array.prototype.push),ARRAY_INDEX=U(Array.prototype.indexOf),ARRAY_SPLICE=U(Array.prototype.splice),DL=[];
 var URL_PROTOCOL_DESC=OWN_DESC(URL.prototype,'protocol'),URL_HREF_DESC=OWN_DESC(URL.prototype,'href');
 var GET_URL_PROTOCOL=URL_PROTOCOL_DESC&&URL_PROTOCOL_DESC.get?U(URL_PROTOCOL_DESC.get):null,GET_URL_HREF=URL_HREF_DESC&&URL_HREF_DESC.get?U(URL_HREF_DESC.get):null;
 var JSON_PARSE=JSON.parse,JSON_STRINGIFY=JSON.stringify,URL_CTOR=URL,RESPONSE_CTOR=Response,BASE_URL=location.href;
@@ -342,10 +344,11 @@ var D='doc_'+id(),nav=window.navigation,SAFE_NAV=!!(nav&&typeof nav.addEventList
 function lock(name,value){try{Object.defineProperty(window,name,{value:value,writable:false,configurable:false});}catch(_){}}
 if(SAFE_NAV){ADD(nav,'navigate',function(e){if(e.hashChange)return;if(e.cancelable)PREVENT(e);},true);}
 function finish(m){var p;if(!m||m.channel!==C||m.version!==1||m.kind!=='response'||m.workspaceId!==S||typeof m.id!=='string')return;p=P.get(m.id);if(!p)return;P.delete(m.id);clearTimeout(p.timer);if(m.ok)p.resolve(m.result);else p.reject(new Error(typeof m.error==='string'?m.error:'Workspace request failed'));}
+function onPort(m){var i,l;if(m&&m.channel===C&&m.version===1&&m.kind==='push'&&m.workspaceId===S&&m.op==='data'){try{window.__SPACE_DATA__=m.data;}catch(_){}l=DL.slice();for(i=0;i<l.length;i++){try{l[i](m.data);}catch(_){}}return;}finish(m);}
 function send(m){if(PORT)PORT_POST(PORT,m);else ARRAY_PUSH(Q,m);}
 function gesture(op,payload){var m;if(!SAFE_NAV)return;m={channel:GC,version:1,kind:'gesture',workspaceId:S,documentId:D,id:id(),op:op,payload:payload||{}};if(GPORT)PORT_POST(GPORT,m);else if(GQ.length<8)ARRAY_PUSH(GQ,m);}
 function rpc(op,payload){return new Promise(function(resolve,reject){if(!SAFE_NAV){reject(new Error('This browser cannot safely isolate Workspace navigation'));return;}if(parent===window){reject(new Error('Workspace bridge requires the Clementine shell'));return;}if(P.size>=64){reject(new Error('Too many Workspace requests'));return;}var rid=id(),timer=setTimeout(function(){P.delete(rid);reject(new Error('Workspace request timed out'));},30000);P.set(rid,{resolve:resolve,reject:reject,timer:timer});send({channel:C,version:1,kind:'request',workspaceId:S,id:rid,op:op,payload:payload||{}});});}
-function onAck(e){var m,p,g,i,ports;if(GET_TRUSTED(e)!==true||GET_SOURCE(e)!==parent)return;m=GET_DATA(e);ports=GET_PORTS(e);if(!m||m.channel!==C||m.version!==1||m.kind!=='bootstrap_ack'||m.workspaceId!==S||m.documentId!==D||!ports||!ports[0]||!ports[1])return;STOP(e);PORT=ports[0];GPORT=ports[1];ADD(PORT,'message',function(pe){finish(GET_DATA(pe));});PORT_START(PORT);for(i=0;i<Q.length;i++){p=Q[i];PORT_POST(PORT,p);}Q.length=0;for(i=0;i<GQ.length;i++){g=GQ[i];PORT_POST(GPORT,g);}GQ.length=0;if(BOOT)clearInterval(BOOT);REMOVE(window,'message',onAck,true);}
+function onAck(e){var m,p,g,i,ports;if(GET_TRUSTED(e)!==true||GET_SOURCE(e)!==parent)return;m=GET_DATA(e);ports=GET_PORTS(e);if(!m||m.channel!==C||m.version!==1||m.kind!=='bootstrap_ack'||m.workspaceId!==S||m.documentId!==D||!ports||!ports[0]||!ports[1])return;STOP(e);PORT=ports[0];GPORT=ports[1];ADD(PORT,'message',function(pe){onPort(GET_DATA(pe));});PORT_START(PORT);for(i=0;i<Q.length;i++){p=Q[i];PORT_POST(PORT,p);}Q.length=0;for(i=0;i<GQ.length;i++){g=GQ[i];PORT_POST(GPORT,g);}GQ.length=0;if(BOOT)clearInterval(BOOT);REMOVE(window,'message',onAck,true);}
 ADD(window,'message',onAck,true);
 function bootstrap(){parent.postMessage({channel:C,version:1,kind:'bootstrap',workspaceId:S,documentId:D},'*');}
 var BOOT=null;if(parent!==window){bootstrap();BOOT=setInterval(bootstrap,250);setTimeout(function(){if(BOOT){clearInterval(BOOT);BOOT=null;}},5000);}
@@ -361,7 +364,7 @@ var REPORTED=[];function report(message,line){var text;if(REPORTED.length>=3||pa
 ADD(window,'error',function(e){if(e&&typeof e.message==='string'&&e.message)report(e.message,e.lineno);},true);
 ADD(window,'unhandledrejection',function(e){var r=e&&e.reason;report('Unhandled rejection: '+(r&&r.message?r.message:String(r)));},true);
 var K=window.__clemKit||{};try{delete window.__clemKit;}catch(_){}
-window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,pick:K.pick,rows:K.rows,mail:K.mail,slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});}});
+window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,pick:K.pick,rows:K.rows,mail:K.mail,slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});},onData:function(cb){if(typeof cb!=='function')return function(){};ARRAY_PUSH(DL,cb);if(DL.length===1)rpc('subscribe',{}).catch(function(){});return function(){var i=ARRAY_INDEX(DL,cb);if(i>=0)ARRAY_SPLICE(DL,i,1);};}});
 })();</script>`;
 };
 

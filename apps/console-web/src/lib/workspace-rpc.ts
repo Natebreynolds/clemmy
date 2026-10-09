@@ -13,6 +13,8 @@ export const WORKSPACE_IFRAME_SANDBOX = 'allow-scripts';
 
 export type WorkspaceRpcOp =
   | 'data'
+  /** The view wants new data delivered in place instead of being reloaded. */
+  | 'subscribe'
   | 'history'
   | 'diff'
   | 'refresh'
@@ -101,6 +103,7 @@ export type WorkspaceGestureParseResult =
 
 const OPS = new Set<WorkspaceRpcOp>([
   'data',
+  'subscribe',
   'history',
   'diff',
   'refresh',
@@ -182,7 +185,7 @@ function optionalIsoTimestamp(value: unknown): boolean {
 
 function payloadMatchesOperation(op: WorkspaceRpcOp, payload: Record<string, unknown>): boolean {
   if (!payloadIsBounded(payload)) return false;
-  if (op === 'data') return Object.keys(payload).length === 0;
+  if (op === 'data' || op === 'subscribe') return Object.keys(payload).length === 0;
   if (op === 'history') {
     return hasOnlyKeys(payload, ['sourceKey', 'limit', 'cursor', 'before'])
       && optionalSourceKey(payload.sourceKey)
@@ -434,7 +437,22 @@ export function parseWorkspaceRpcEvent(
 }
 
 export function workspaceRpcOpAllowed(op: WorkspaceRpcOp, readOnly: boolean): boolean {
-  return !readOnly || op === 'data' || op === 'history' || op === 'diff';
+  return !readOnly || op === 'data' || op === 'subscribe' || op === 'history' || op === 'diff';
+}
+
+/** The host's unsolicited message on the private RPC port: the view's new
+ *  dataset, sent only after the view subscribed. */
+export interface WorkspaceRpcPush {
+  channel: typeof WORKSPACE_RPC_CHANNEL;
+  version: 1;
+  kind: 'push';
+  workspaceId: string;
+  op: 'data';
+  data: unknown;
+}
+
+export function workspaceDataPush(workspaceId: string, data: unknown): WorkspaceRpcPush {
+  return { channel: WORKSPACE_RPC_CHANNEL, version: 1, kind: 'push', workspaceId, op: 'data', data };
 }
 
 export function workspaceGestureAllowed(readOnly: boolean): boolean {

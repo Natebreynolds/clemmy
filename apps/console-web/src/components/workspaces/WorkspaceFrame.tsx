@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type MutableRefObject } from 'react';
 import { clemmy } from '@/lib/clemmy';
 import {
   addSpaceNote,
@@ -19,6 +19,7 @@ import {
   workspaceRpcFailure,
   workspaceRpcOpAllowed,
   workspaceRpcSuccess,
+  workspaceDataPush,
   WORKSPACE_IFRAME_SANDBOX,
   WORKSPACE_RPC_CHANNEL,
   type WorkspaceGestureRequest,
@@ -26,7 +27,16 @@ import {
   type WorkspaceRpcRequest,
 } from '@/lib/workspace-rpc';
 
+/** What the host can do with a live frame. */
+export interface WorkspaceFrameControl {
+  /** Deliver a new dataset in place. False when the page did not ask for
+   *  live data (or its channel is gone), so the caller reloads it instead. */
+  pushData: (data: unknown) => boolean;
+}
+
 interface WorkspaceFrameProps {
+  /** Filled while a page's private channel is open. */
+  controlRef?: MutableRefObject<WorkspaceFrameControl | null>;
   id: string;
   title: string;
   className?: string;
@@ -79,6 +89,9 @@ async function runWorkspaceOperation(id: string, request: WorkspaceRpcRequest): 
   switch (request.op) {
     case 'data':
       return getSpaceData(id);
+    case 'subscribe':
+      // Answered by the frame itself; it never reaches the daemon.
+      return { subscribed: true };
     case 'history':
       return getSpaceHistory(id, {
         ...(typeof payload.sourceKey === 'string' ? { sourceKey: payload.sourceKey } : {}),
@@ -138,6 +151,7 @@ function readShellTheme(): 'light' | 'dark' {
 }
 
 export function WorkspaceFrame({
+  controlRef,
   id,
   title,
   className,
@@ -179,6 +193,16 @@ export function WorkspaceFrame({
     let gestureInFlight = false;
     let loadCount = 0;
     let revoked = false;
+    let subscribed = false;
+    if (controlRef) {
+      controlRef.current = {
+        pushData: (data) => {
+          if (revoked || !port || !subscribed) return false;
+          port.postMessage(workspaceDataPush(id, data));
+          return true;
+        },
+      };
+    }
 
     const remember = (requestId: string): boolean => {
       if (seen.has(requestId)) return false;
@@ -231,6 +255,11 @@ export function WorkspaceFrame({
       }
       if (!workspaceRpcOpAllowed(request.op, readOnly)) {
         reply(workspaceRpcFailure(request, 'Workspace preview is read-only'));
+        return;
+      }
+      if (request.op === 'subscribe') {
+        subscribed = true;
+        reply(workspaceRpcSuccess(request, { subscribed: true }));
         return;
       }
       if (inFlight >= MAX_IN_FLIGHT) {
@@ -324,6 +353,7 @@ export function WorkspaceFrame({
     window.addEventListener('message', receiveBootstrap);
     return () => {
       revoked = true;
+      if (controlRef) controlRef.current = null;
       frame.removeEventListener('load', onLoad);
       window.removeEventListener('message', receiveBootstrap);
       if (port) {

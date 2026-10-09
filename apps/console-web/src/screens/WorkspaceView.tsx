@@ -23,7 +23,7 @@ import {
 } from '@/lib/workspace-history-state';
 import {
   getSpace, refreshSpace, patchSpace, rollbackSpace, publishSpace,
-  getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions, pageErrors, getSpaceFeeds, feedTime, versionMadeAt,
+  getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions, pageErrors, getSpaceFeeds, feedTime, versionMadeAt, getSpaceData,
   latestRefreshFailures, buildWorkspaceFixPrompt, type SpaceStatus, type SpaceDiffResponse,
   type SpaceObservationSummary, WorkspaceRefreshError,
 } from '@/lib/spaces';
@@ -32,7 +32,7 @@ import { SpaceFeedLine } from '@/components/workspaces/SpaceFeedLine';
 import { CanonicalEntityCoveragePanel } from '@/components/workspaces/CanonicalEntityCoveragePanel';
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
 import { SourceControlsPanel } from '@/components/workspaces/SourceControlsPanel';
-import { WorkspaceFrame } from '@/components/workspaces/WorkspaceFrame';
+import { WorkspaceFrame, type WorkspaceFrameControl } from '@/components/workspaces/WorkspaceFrame';
 import { describeSpaceShape, spaceBuildState } from '@/lib/space-build';
 import { getWorkflowsHome, runWorkflow } from '@/lib/automate';
 
@@ -87,18 +87,28 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
   // Polled via `detail` (5s), so a fresh pull shows without hitting Refresh.
   const viewMtime = detail.data?.viewMtimeMs ?? null;
   const dataMtime = detail.data?.dataMtimeMs ?? null;
+  const frameControl = useRef<WorkspaceFrameControl | null>(null);
   useEffect(() => {
     if (viewMtime == null && dataMtime == null) return;
     const stamp = `${viewMtime ?? 0}:${dataMtime ?? 0}`;
-    if (lastMtimeRef.current != null && stamp !== lastMtimeRef.current) {
-      // Remounting the frame discards whatever the viewer was typing inside the
-      // board (a draft reply in a textarea). Hold the repaint while the frame
-      // has focus and flush it the moment focus leaves.
+    const previous = lastMtimeRef.current;
+    lastMtimeRef.current = stamp;
+    if (previous == null || stamp === previous) return;
+    // Remounting the frame discards whatever the viewer was typing inside the
+    // board (a draft reply in a textarea). Hold the repaint while the frame
+    // has focus and flush it the moment focus leaves.
+    const reload = () => {
       if (document.activeElement?.tagName === 'IFRAME') pendingReloadRef.current = true;
       else setIframeKey((k) => k + 1);
-    }
-    lastMtimeRef.current = stamp;
-  }, [viewMtime, dataMtime]);
+    };
+    // Only the data changed: a page that asked for live data gets it in place,
+    // keeping its scroll, filters and drafts. Anything else reloads.
+    const viewChanged = previous.split(':')[0] !== String(viewMtime ?? 0);
+    if (viewChanged) { reload(); return; }
+    void getSpaceData(id)
+      .then((data) => { if (!frameControl.current?.pushData(data)) reload(); })
+      .catch(reload);
+  }, [viewMtime, dataMtime, id]);
   useEffect(() => {
     const flush = () => {
       if (!pendingReloadRef.current) return;
@@ -498,6 +508,7 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
       <div className="relative min-h-0 flex-1 bg-canvas">
         <WorkspaceFrame
           key={iframeKey}
+          controlRef={frameControl}
           id={id}
           title={space.title}
           className="absolute inset-0 h-full w-full border-0"

@@ -41,7 +41,7 @@ Every save runs each changed source once and reports what came back. A source th
 
 ## 3. Read data in the view
 
-- The current dataset is planted as `window.__SPACE_DATA__` before your script runs, and `await clem.data()` returns the same object. The desktop reloads the view whenever the data changes, so render straight from it.
+- The current dataset is planted as `window.__SPACE_DATA__` before your script runs, and `await clem.data()` returns the same object. Render from it, and register `clem.onData(render)`: new data then arrives in place and the owner keeps their scroll, filters and half-typed text. A view that does not register is reloaded whenever the data changes.
 - Each source lives under its id: `data["emails"]`. Provenance lives under `data._meta`.
 - `clem.rows(data.emails)` returns the record list inside any stored shape. Connected-app sources are stored as `{ complete, result: { data: … } }`; command-line reads store the command's parsed JSON, such as `{ status, result: { records } }`.
 - `clem.pick(value, "result.data.value.0.subject")` reads a path safely and returns `undefined` when any step is missing.
