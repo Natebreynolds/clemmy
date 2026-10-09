@@ -104,6 +104,15 @@ export async function observeForNoticing(now = Date.now()): Promise<NoticingObse
       const text = typeof last?.data.displayText === 'string' ? last.data.displayText : typeof last?.data.text === 'string' ? last.data.text : undefined;
       return { title: clip(s.title ?? '(untitled)', 120), updatedAt: s.updatedAt, ...(text ? { lastRequest: clip(text) } : {}) };
     });
+  // What Home already asks the owner about, from every other part of Clem.
+  let alreadyAskingOwner: NonNullable<NoticingObservation['alreadyAskingOwner']> = [];
+  try {
+    const { readFromClem } = await import('../dashboard/from-clem-runtime.js');
+    alreadyAskingOwner = (await readFromClem()).rows
+      .filter((row) => row.asks && row.heartbeat !== 'noticing')
+      .slice(0, 12)
+      .map((row) => ({ from: clip(row.heartbeatTitle, 60), about: clip([row.text, row.detail ?? ''].filter(Boolean).join(' — '), 240) }));
+  } catch { alreadyAskingOwner = []; }
   let memories: NoticingObservation['memories'] = [];
   try {
     memories = listActiveFacts({ limit: 16, ranking: 'stanford' })
@@ -121,6 +130,7 @@ export async function observeForNoticing(now = Date.now()): Promise<NoticingObse
     calendar,
     conversations,
     memories,
+    ...(alreadyAskingOwner.length > 0 ? { alreadyAskingOwner } : {}),
   };
 }
 

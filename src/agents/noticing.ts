@@ -49,6 +49,10 @@ export interface NoticingObservation {
   calendar: Array<{ kind: string; subject: string; createdAt: string }>;
   conversations: Array<{ title: string; updatedAt: string; lastRequest?: string }>;
   memories: Array<{ text: string; ageDays: number }>;
+  /** What another part of Clem has already put to the owner as a question on
+   * Home (a reply-needed invite, a double booking, a stuck wait): one open
+   * thing is one card, so it is never proposed again from here. */
+  alreadyAskingOwner?: Array<{ from: string; about: string }>;
 }
 
 // ── what the model answers ────────────────────────────────────────────────────

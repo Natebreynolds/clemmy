@@ -180,3 +180,11 @@ test('a proposal whose question was closed without an answer is settled on the n
   assert.match(record.retiredReason ?? '', /closed without an answer/);
   assert.equal(next.retired, 1);
 });
+
+test('Noticing is told what Home already asks the owner, and never to raise it again', async () => {
+  // Live 2026-10-09: the calendar watch already asked about an invite; Noticing
+  // proposed drafting a reply to the same invite, a second card for one thing.
+  const { NOTICING_PROPOSAL_SYSTEM } = await import('../runtime/semantic-boundary/configured-brain-semantic-port.js');
+  assert.match(NOTICING_PROPOSAL_SYSTEM, /alreadyAskingOwner/);
+  assert.match(NOTICING_PROPOSAL_SYSTEM, /one open thing is one card, so never propose any of it, or a step toward answering it/);
+});
