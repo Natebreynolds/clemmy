@@ -49,7 +49,7 @@ import {
 import { appendEvent, getEvent, getSession, getTurnGraphEventForSource, listEvents, openEventLog } from './eventlog.js';
 import { readConsumedTaskContinuityPacket } from '../../memory/task-continuity.js';
 import { computeResultHasSubstance } from './expected-work-matcher.js';
-import { durableLogicalCallContract } from './logical-call-contract.js';
+import { canonicalLogicalToolName, durableLogicalCallContract } from './logical-call-contract.js';
 import { acceptedTurnCallAuthorityFor, currentHostCallAttestation } from './accepted-turn-call-authority.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { hostCallCapabilityBindingMatchesAttestation, loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
@@ -639,11 +639,21 @@ export function approvedMandateAdmitsCall(
       const root = acceptedTurnCallAuthorityFor(sessionId, sourceUserSeq);
       const expected = expectedTaskFor(sessionId, sourceUserSeq);
       const effect = classifyRuntimeToolEffect(tool, args).effect;
+      // The ledger names the call by its canonical (case-folded) identity; the
+      // action froze the provider's spelling and hashed its payload under it.
+      // The same canonical tool verifies under the frozen spelling, never a
+      // different tool (live 2026-10-08: outlook__outlook_send_email vs the
+      // stored outlook__OUTLOOK_SEND_EMAIL refused every approved MCP send).
+      const frozenTool = getPendingAction(capability.pendingActionId)?.toolName;
+      const canonical = canonicalLogicalToolName(tool);
+      const toolName = frozenTool && canonical !== null && canonicalLogicalToolName(frozenTool) === canonical
+        ? frozenTool
+        : tool;
       if (root.status === 'ok' && root.authority.authorityKind === 'turn_graph'
         && expected.status === 'ok' && expected.graph.compiler.graphHash === root.authority.graphHash
         && expected.graph.classification.route === 'act' && effect !== 'unknown'
         && (expected.graph.effectCeiling === 'unknown' || expected.graph.effectCeiling === effect)
-        && verifyPendingActionResumeExecutionCapability({ capability, sessionId, toolName: tool, payload: args })) return true;
+        && verifyPendingActionResumeExecutionCapability({ capability, sessionId, toolName, payload: args })) return true;
     }
     const rows = db.prepare(`
       SELECT approval_id, tool, args_json, presentation_json FROM pending_approvals

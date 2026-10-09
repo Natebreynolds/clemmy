@@ -2047,6 +2047,23 @@ export async function invokeHostToolCall<T>(
                 }, 'nested-owned local control returned without its own durable settlement; host settled the non-mutating result');
                 return logicalSettlement({ result: returned.value, resultPresent: true });
               }
+              // An approved action's inner dispatch hands exactly this logical
+              // call to the host (inner-dispatch propagates host ownership only
+              // to its pendingActionResumeLogicalCallId), so its wrapper or MCP
+              // adapter books its own physical crossing and reports its
+              // observation instead of settling. The host settles the returned
+              // result under the frozen contract; its claim already consumed
+              // the approval, and an observation that contradicts the contract
+              // or a throw still fails closed. Live 2026-10-08: an approved
+              // send went out and the owner was told the outcome was uncertain.
+              if (
+                redeemed.status === 'missing'
+                && returned !== undefined
+                && input.pendingActionExecution
+              ) {
+                assertFrozenObservation();
+                return logicalSettlement({ result: returned.value, resultPresent: true });
+              }
               throw new HostToolInvocationAuthorityError(
                 `nested-owned logical settlement is ${redeemed.status}: ${redeemed.reason}`,
               );

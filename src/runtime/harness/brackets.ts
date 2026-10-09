@@ -90,6 +90,7 @@ import {
   queuePendingAction,
   findOpenPendingActionByPayload,
   getPendingAction,
+  verifyPendingActionResumeExecutionCapability,
 } from './pending-actions.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import {
@@ -2743,6 +2744,18 @@ function settlementCallIsMutating(toolName: string, args: unknown): boolean {
       && loaded.binding.effectiveArgumentDigest === contract.argumentDigest) {
       return loaded.binding.effect === 'local_write';
     }
+  }
+  // An approved pending action carries no host capability binding (its claim
+  // is the authority), so no attestation reaches here. Its invocation froze
+  // the action's runtime effect; report that same effect, or the host refuses
+  // the result of a command that already ran (live 2026-10-08: every approved
+  // off-machine shell command ended "can't tell whether it went through").
+  const approved = context?.pendingActionExecution;
+  if (approved && verifyPendingActionResumeExecutionCapability({
+    capability: approved, sessionId: context?.sessionId, toolName, payload: args,
+  })) {
+    const { effect } = classifyRuntimeToolEffect(toolName, args);
+    return effect === 'local_write' || effect === 'external_write' || effect === 'admin';
   }
   return classifyExternalWrite(toolName, args).mutating;
 }

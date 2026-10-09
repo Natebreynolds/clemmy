@@ -23,7 +23,8 @@ import { ensureAcceptedTaskResolutionOpenInTransaction, expectedTaskFor } from '
 import { activateDispatchLease, revokeDispatchLeaseBeforeRecovery } from '../runtime/harness/dispatch-lease.js';
 import { getActiveRunAttempt, getRunAttemptSourceUserEvent, isKillRequested, openEventLog } from '../runtime/harness/eventlog.js';
 import { invokeHostToolCall } from '../runtime/harness/host-tool-invocation.js';
-import { classifyRuntimeToolEffect } from '../runtime/harness/tool-effect.js';
+import { classifyRuntimeToolEffect, unwrapRuntimeEffectiveToolIdentity } from '../runtime/harness/tool-effect.js';
+import { canonicalLogicalToolName } from '../runtime/harness/logical-call-contract.js';
 import { detectStructuredToolFailure } from '../runtime/harness/tool-error-corrective.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
@@ -67,6 +68,13 @@ const defaultDispatch: ApprovedCallDispatch = (toolName, payload, sessionId, cer
     undefined,
     executionCapability,
   );
+
+/** A carrier (call_tool, work_call, the Composio gateway) names one tool and
+ * runs another; the effective operation is what its own wrapper books. */
+function carriedCall(record: PendingActionRecord): boolean {
+  const effective = unwrapRuntimeEffectiveToolIdentity(record.toolName, record.payload).toolName;
+  return effective === null || canonicalLogicalToolName(effective) !== canonicalLogicalToolName(record.toolName);
+}
 
 /** The no-model approval resume uses the same exact invocation owner as an
  * ordinary host call. Legacy tool/card consumers retain their existing owner;
@@ -133,7 +141,12 @@ async function dispatchApprovedCall(
         toolName: record.toolName, args: record.payload, ...(parent?.turn ? { turn: parent.turn } : {}) },
       parentLease: lease,
       effect,
-      boundary: isMcpNamespacedTool(record.toolName) ? 'nested_owned' : 'host_owned_local',
+      // A plain local tool's crossing is the host's to book. A carried call
+      // (its effective operation differs from its name) or an MCP tool books
+      // its own crossing under the exact operation: a host-owned crossing
+      // there names the carrier and conflicts with that row, or books a
+      // second crossing beside the adapter's (live 2026-10-08).
+      boundary: isMcpNamespacedTool(record.toolName) || carriedCall(record) ? 'nested_owned' : 'host_owned_local',
       deadlineMs: timeoutForTool(record.toolName),
       callerSignal: parent?.callerCancelSignal,
       isKillRequested: () => isKillRequested(sessionId, { attemptId: attempt.attemptId }),
