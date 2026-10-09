@@ -23,6 +23,8 @@ import { openEventLog } from './eventlog.js';
 import { acceptedTaskIdFor, settlementIdentityFor } from './attempt-identity.js';
 import {
   classifyAttemptOutcome,
+  isAnsweredRefusalStatus,
+  ProviderAnsweredError,
   recoveryDirectiveFor,
   type AttemptOutcome,
   type AttemptSignals,
@@ -296,10 +298,17 @@ export function attemptSignalsFromShellExecutionOutcome(
     };
   }
   if (shell.errorKind !== undefined || (shell.exitCode !== undefined && shell.exitCode !== 0)) {
+    // A command that ran to completion and exited with its own failure
+    // answered: its output says why, so the model reads it and decides what
+    // has to change. It still proves no commit and earns no replay. A killed
+    // process (no exit code), a timeout or a Stop stays in the dark.
+    const answered = shell.externalMutation
+      && typeof shell.exitCode === 'number' && shell.exitCode !== 0
+      && (shell.errorKind === 'nonzero_exit' || shell.errorKind === 'provider_precondition_rejected');
     return {
       executionFailed: true,
       mutating: shell.externalMutation,
-      ...(shell.externalMutation ? { acknowledged: false } : {}),
+      ...(answered ? { providerAnsweredFailure: true } : shell.externalMutation ? { acknowledged: false } : {}),
     };
   }
   if (shell.exitCode === 0) {
@@ -829,6 +838,7 @@ function signalsFromThrown(thrown: unknown): AttemptSignals {
   if (thrown instanceof CurrentCapabilityDefinitionUnavailableError) {
     signals.capabilityDefinitionUnavailable = true;
   }
+  if (thrown instanceof ProviderAnsweredError) signals.providerAnsweredFailure = true;
   const status = numericStatus(
     asRecord?.status ?? asRecord?.statusCode ?? asRecord?.status_code ?? asRecord?.httpStatus,
   );
@@ -1379,7 +1389,15 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     // (live 2026-10-07: a Slack delete answered `not_found` parked the owner
     // on "its effect must be reconciled" where a readback was the answer).
     // Forcing it to unacknowledged here used to erase that distinction.
-    if (input.thrown !== undefined && !(input.thrown instanceof LocalNonWriteError)) extracted.acknowledged = false;
+    // A throw that carries the provider's own refusal status (a client that
+    // raises on a 400 or 404 response) was answered too: the reply exists
+    // and says why. Server failures, transient statuses and throws with no
+    // status stay unacknowledged.
+    const thrownRefusal = isAnsweredRefusalStatus(extracted.httpStatus);
+    if (input.thrown !== undefined && !(input.thrown instanceof LocalNonWriteError)) {
+      if (thrownRefusal || extracted.providerAnsweredFailure === true) extracted.providerAnsweredFailure = true;
+      else extracted.acknowledged = false;
+    }
   }
   // THE PROVIDER'S OWN REPLY CONFIRMS A WRITE IT ACKNOWLEDGES. A returned
   // mutation whose structured reply names what it created or changed (the

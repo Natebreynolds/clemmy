@@ -117,15 +117,17 @@ function providerAnsweredRefusal(row: SettlementRow): boolean {
     && row.outcome_detail === 'provider_rejected_before_effect';
 }
 
-/** A provider that answered the write with its own refusal envelope: the
+/** A provider (or command) that answered the write with its own refusal: the
  * write stays uncertain in the ledger (no replay, no success), but the
  * attempt was answered and the model read the target back, so the audit
  * owes no reconciliation stop for it (live 2026-10-07: a Slack delete
  * answered `not_found`, read back and explained, still ended "1 irreversible
  * external write(s) require reconciliation"). */
 export function answeredRefusalSettlement(row: Pick<SettlementRow, 'mutating' | 'execution_kind' | 'outcome_kind' | 'outcome_detail'>): boolean {
+  // A command that leaves the machine runs on the host's own crossing, so
+  // its answered refusal settles as local execution; it is the same answer.
   return row.mutating === 1
-    && row.execution_kind === 'provider_execution'
+    && (row.execution_kind === 'provider_execution' || row.execution_kind === 'local_execution')
     && row.outcome_kind === 'uncertain_write'
     && row.outcome_detail === 'provider_refused_envelope';
 }

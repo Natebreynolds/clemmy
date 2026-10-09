@@ -210,6 +210,10 @@ export interface AttemptSignals {
   emptyResult?: boolean;
   /** A required parameter was accepted and then absent from the effect. */
   droppedRequiredParameter?: boolean;
+  /** The lane's call ran to completion and returned the provider's or the
+   * command's own failure in its reply (an exit code, an error flag, a
+   * refusal status). Answered, not dark: the reply can be read. */
+  providerAnsweredFailure?: boolean;
   /** The lane already knows the connection is missing/expired (nominal). */
   connectionMissing?: boolean;
   /** A local policy/approval layer refused (nominal). */
@@ -273,6 +277,22 @@ export interface AttemptSignals {
 }
 
 const TRANSIENT_STATUS = new Set([408, 425, 429, 500, 502, 503, 504, 529]);
+
+/** A provider answered the call with its own typed error flag (MCP's
+ * `isError`): a reply that says why, not a lost one. Carriers that surface
+ * the flag as a throw use this class so the settlement keeps the difference. */
+export class ProviderAnsweredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderAnsweredError';
+  }
+}
+
+/** A provider's refusal status: the request was answered and refused (a 4xx),
+ * unlike a server failure or a transient status, which stay in the dark. */
+export function isAnsweredRefusalStatus(status: number | undefined): boolean {
+  return status !== undefined && status >= 400 && status < 500 && !TRANSIENT_STATUS.has(status);
+}
 
 function outcome(
   kind: AttemptOutcomeKind,
@@ -345,37 +365,43 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
   // trusted adapter's exact pre-effect proof establishes a known rejection.
   const rejectedAtProviderLayer = signals.providerRejectedBeforeEffect === true;
 
-  // A mutation whose fate we cannot observe outranks every other reading: the
-  // one thing worse than failing is doing it twice. The dark is a dropped
-  // acknowledgement (a thrown call, a timeout) or a server-side failure
-  // or a request-level status, where the request may have landed in part
-  // before the answer (a 400 can name a created id).
+  // A provider (or a command) that ANSWERED the write with its own refusal —
+  // "not successful" in its envelope, an error flag, a refusal status such as
+  // a 400 or 404, a completed command's non-zero exit — is still an uncertain
+  // write: its bytes prove no commit and earn no replay. But it left nothing
+  // in the dark: the reply says why, and the target can be read. The host
+  // keeps the turn going so the model reads the refusal, decides what has to
+  // change, and puts that change to the owner, whatever lane carried the
+  // call (live 2026-10-07: a Slack reminder already gone answered
+  // `not_found`; live 2026-10-09: a draft whose attachment the provider
+  // rejected with a 400 ended three times on a reconciliation block).
+  const status = typeof signals.httpStatus === 'number' ? signals.httpStatus : undefined;
+  const statusInTheDark = status !== undefined && (status >= 500 || TRANSIENT_STATUS.has(status));
+  const statusRefused = isAnsweredRefusalStatus(status);
   if (
     signals.mutating
-    && (signals.acknowledged === false
-      || (typeof signals.httpStatus === 'number' && signals.httpStatus >= 400))
+    && signals.acknowledged !== false
+    && signals.preDispatch !== true
+    && !rejectedAtProviderLayer
+    && !statusInTheDark
+    && (signals.envelopeSuccessful === false
+      || signals.providerReportedError === true
+      || signals.providerAnsweredFailure === true
+      || statusRefused)
+  ) {
+    return outcome('uncertain_write', 'nominal', 'provider_refused_envelope', status);
+  }
+  // A mutation whose fate we cannot observe outranks every other reading: the
+  // one thing worse than failing is doing it twice. The dark is a dropped
+  // acknowledgement (a thrown call, a timeout) or a server-side failure,
+  // where the request may have landed in part before the answer.
+  if (
+    signals.mutating
+    && (signals.acknowledged === false || statusInTheDark)
     && signals.preDispatch !== true
     && !rejectedAtProviderLayer
   ) {
     return outcome('uncertain_write', 'nominal', 'unacknowledged_mutation', signals.httpStatus);
-  }
-  // A provider that ANSWERED the write with a structured refusal in its own
-  // envelope ("not successful" on a delivered 2xx) is still an uncertain
-  // write — its bytes prove no commit and earn no replay — but it left
-  // nothing in the dark: the target can be read, so the host keeps the turn
-  // going and the model verifies instead of parking the owner on a
-  // reconciliation block (live 2026-10-07: a Slack reminder already gone
-  // answered `not_found`; the turn ended blocked with machine text where it
-  // used to end in words after a readback).
-  if (
-    signals.mutating
-    && signals.envelopeSuccessful === false
-    && signals.acknowledged !== false
-    && signals.preDispatch !== true
-    && !rejectedAtProviderLayer
-    && (signals.httpStatus === undefined || (signals.httpStatus >= 200 && signals.httpStatus < 300))
-  ) {
-    return outcome('uncertain_write', 'nominal', 'provider_refused_envelope', signals.httpStatus);
   }
 
   // A real contradiction is different from an inspection bound. For a write,

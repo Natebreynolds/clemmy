@@ -55,8 +55,26 @@ test('a mutation the provider answered with its own refusal stays uncertain with
   assert.equal(providerAnsweredWithRefusal(dropped), false);
   const serverError = classifyAttemptOutcome({ mutating: true, httpStatus: 502, envelopeSuccessful: false });
   assert.equal(serverError.detail, 'unacknowledged_mutation', 'a failed transport is the dark, not an answer');
-  const rejected = classifyAttemptOutcome({ mutating: true, httpStatus: 404, envelopeSuccessful: false });
-  assert.equal(rejected.detail, 'unacknowledged_mutation', 'a request-level status on a mutation can follow a partial commit: the dark');
+  // Live 2026-10-09: a draft whose attachment the provider rejected came
+  // back as a returned envelope carrying status 400; it was read as the dark
+  // and the turn ended on a reconciliation block three times. A refusal
+  // status is an answer: still uncertain, still no replay, but read.
+  for (const status of [400, 404, 409, 422]) {
+    const rejected = classifyAttemptOutcome({ mutating: true, httpStatus: status, envelopeSuccessful: false });
+    assert.equal(rejected.kind, 'uncertain_write', `${status}`);
+    assert.equal(rejected.detail, 'provider_refused_envelope', `a returned ${status} refusal is an answer`);
+    assert.equal(rejected.directive.retrySameCandidate, false, `${status} earns no replay`);
+  }
+  assert.equal(classifyAttemptOutcome({ mutating: true, httpStatus: 400 }).detail, 'provider_refused_envelope', 'a refusal status with no success flag still answered');
+  for (const status of [408, 429, 500, 503]) {
+    assert.equal(classifyAttemptOutcome({ mutating: true, httpStatus: status, envelopeSuccessful: false }).detail, 'unacknowledged_mutation', `${status} is a failure or a transient, the dark`);
+  }
+  assert.equal(classifyAttemptOutcome({ mutating: true, httpStatus: 400, acknowledged: false }).detail, 'unacknowledged_mutation', 'a dropped acknowledgement outranks any status');
+  // Every lane's own answered-failure facts read the same way: an MCP error
+  // flag on a returned result, a completed command's non-zero exit.
+  assert.equal(classifyAttemptOutcome({ mutating: true, providerReportedError: true }).detail, 'provider_refused_envelope', 'MCP isError on a write');
+  assert.equal(classifyAttemptOutcome({ mutating: true, providerAnsweredFailure: true, executionFailed: true }).detail, 'provider_refused_envelope', 'a completed command that exited non-zero');
+  assert.equal(classifyAttemptOutcome({ mutating: false, providerReportedError: true }).kind, 'unknown', 'a read keeps its own reading');
   const proven = classifyAttemptOutcome({ mutating: true, providerRejectedBeforeEffect: true });
   assert.equal(providerAnsweredWithRefusal(proven), false, 'a trusted pre-effect proof is a different, stronger reading');
 });

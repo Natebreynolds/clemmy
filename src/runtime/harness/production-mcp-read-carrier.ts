@@ -56,6 +56,7 @@ import {
   shippedTransportDigest,
 } from './shipped-implementation-identity.js';
 import { isolatedTestContractActive } from './isolated-test-contract.js';
+import { ProviderAnsweredError } from './attempt-outcome.js';
 import {
   capabilityManifestDigest,
   validateCapabilityManifestV1,
@@ -827,7 +828,7 @@ export function normalizeProductionMcpResult(result: unknown): unknown {
     ).join('\n').trim() : '';
     const detail = text || (metadata.structuredContent !== undefined
       ? JSON.stringify(metadata.structuredContent) : '');
-    throw new Error(detail ? `native MCP operation failed: ${detail}` : 'native MCP operation returned isError');
+    throw new ProviderAnsweredError(detail ? `native MCP operation failed: ${detail}` : 'native MCP operation returned isError');
   }
   if (metadata?.isError !== undefined && typeof metadata.isError !== 'boolean') {
     throw new Error('native MCP operation returned a malformed isError flag');

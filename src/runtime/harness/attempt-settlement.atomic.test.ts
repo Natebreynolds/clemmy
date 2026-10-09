@@ -392,3 +392,46 @@ test('a mutation the provider answered with its own refusal settles uncertain, w
   assert.equal(settled.outcome.directive.retrySameCandidate, false, 'provider bytes earn no replay');
   assert.equal(settled.outcome.directive.requiresReconciliation, true, 'the ledger still owes reconciliation; turn readers key on the detail');
 });
+
+test('a write refused in the reply of any lane is an answered refusal the turn can see; a lost or failed reply stays in the dark', async () => {
+  // Owner 2026-10-09: a draft whose attachment the app rejected came back as
+  // `{successful:false, data:{status_code:400}}`, was read as the dark, and
+  // the turn ended three times on a reconciliation block. The fix is the
+  // framework's, not one provider's: an app's own refusal is an answer.
+  const { ProviderAnsweredError } = await import('./attempt-outcome.js');
+  const { answeredRefusalsInTurn } = await import('./turn-answered-refusals.js');
+  const cases: Array<{ label: string; lane: 'composio' | 'native_mcp'; result?: unknown; thrown?: unknown; detail: string }> = [
+    { label: 'returned 400 envelope', lane: 'composio', detail: 'provider_refused_envelope',
+      result: { successful: false, error: 'Invalid request data provided', data: { message: 'Invalid request data provided', status_code: 400 } } },
+    { label: 'MCP error flag', lane: 'native_mcp', detail: 'provider_refused_envelope',
+      thrown: new ProviderAnsweredError('native MCP operation failed: attachment must be uploaded first') },
+    { label: 'thrown 422', lane: 'composio', detail: 'provider_refused_envelope',
+      thrown: Object.assign(new Error('Unprocessable'), { status: 422 }) },
+    { label: 'thrown 503', lane: 'composio', detail: 'unacknowledged_mutation',
+      thrown: Object.assign(new Error('Service unavailable'), { status: 503 }) },
+    { label: 'thrown with no reply', lane: 'composio', detail: 'unacknowledged_mutation',
+      thrown: new Error('socket hang up') },
+    { label: 'returned 500 envelope', lane: 'composio', detail: 'unacknowledged_mutation',
+      result: { successful: false, error: 'internal', data: { status_code: 500 } } },
+  ];
+  for (const [index, entry] of cases.entries()) {
+    const task = accept(`any-lane refusal ${index}`);
+    const tool = 'fixture_create_draft';
+    const args = { to: 'fixture@example.invalid', attachment: `/tmp/fixture-${index}.pdf` };
+    const logicalToolCallId = `logical:any-lane-refusal-${index}`;
+    admitReturnedProviderCall({ task, logicalToolCallId, tool, args });
+    const settled = settlement.settleToolAttempt({
+      ...task, lane: entry.lane, toolName: tool, callId: logicalToolCallId, args, businessCall: true, mutating: true,
+      ...(entry.thrown !== undefined ? { thrown: entry.thrown } : { result: entry.result }),
+    });
+    assert.equal(settled.outcome.kind, 'uncertain_write', entry.label);
+    assert.equal(settled.outcome.detail, entry.detail, entry.label);
+    assert.equal(settled.outcome.directive.retrySameCandidate, false, `${entry.label}: never a replay`);
+    const seen = answeredRefusalsInTurn({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq });
+    assert.equal(seen.length, entry.detail === 'provider_refused_envelope' ? 1 : 0, `${entry.label}: what the consent gate reads for this turn`);
+    if (seen.length) {
+      assert.equal(seen[0]!.logicalToolCallId, logicalToolCallId);
+      assert.equal(answeredRefusalsInTurn({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, exceptLogicalToolCallId: logicalToolCallId }).length, 0);
+    }
+  }
+});

@@ -36,6 +36,32 @@ test('unconfirmed shell cleanup cannot authorize a repeat, and preserves uncerta
   assert.equal(stoppedRead.kind, 'transient', 'confirmed read cleanup retains the normal bounded recovery route');
 });
 
+test('a command that leaves the machine and exits with its own failure answered; a killed, timed-out or stopped one stays in the dark', async () => {
+  const { attemptSignalsFromShellExecutionOutcome } = await import('./attempt-settlement.js');
+  const { classifyAttemptOutcome } = await import('./attempt-outcome.js');
+  for (const errorKind of ['nonzero_exit', 'provider_precondition_rejected'] as const) {
+    const answered = classifyAttemptOutcome(attemptSignalsFromShellExecutionOutcome({
+      phase: 'provider_execution', dispatch: 'unknown', effect: 'possible', externalMutation: true, exitCode: 1, errorKind,
+    }));
+    assert.equal(answered.kind, 'uncertain_write', errorKind);
+    assert.equal(answered.detail, 'provider_refused_envelope', `${errorKind}: the command answered`);
+    assert.equal(answered.directive.retrySameCandidate, false);
+  }
+  const killed = classifyAttemptOutcome(attemptSignalsFromShellExecutionOutcome({
+    phase: 'provider_execution', dispatch: 'unknown', effect: 'possible', externalMutation: true, exitCode: null, errorKind: 'nonzero_exit',
+  }));
+  assert.equal(killed.detail, 'unacknowledged_mutation', 'no exit code: nothing answered');
+  const timedOut = classifyAttemptOutcome(attemptSignalsFromShellExecutionOutcome({
+    phase: 'provider_execution', dispatch: 'unknown', effect: 'possible', externalMutation: true, errorKind: 'timeout',
+  }));
+  assert.equal(timedOut.kind, 'uncertain_write');
+  assert.notEqual(timedOut.detail, 'provider_refused_envelope');
+  const local = classifyAttemptOutcome(attemptSignalsFromShellExecutionOutcome({
+    phase: 'complete', dispatch: 'not_applicable', effect: 'none', externalMutation: false, exitCode: 1, errorKind: 'nonzero_exit',
+  }));
+  assert.notEqual(local.kind, 'uncertain_write', 'a local command that failed is not a write');
+});
+
 // "A string payload never settles success" is right about PROSE and wrong about
 // a serialized envelope. negativeStringEnvelope already parsed a JSON string to
 // settle successful:false, so an envelope claiming failure was trusted while the
