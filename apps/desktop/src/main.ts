@@ -70,6 +70,7 @@ import { CredentialStoragePrivacyError, isCredentialStoragePrivacyError, readCre
 import { hasPersistedCodexGrant } from './auth-grant.js';
 import { redactSensitiveText } from './redaction.js';
 import { saveDiagnosticsFile } from './diagnostics-bundle.js';
+import { trayIconLayout, trayIconPng } from './tray-icon.js';
 import {
   computeClementineLiveGeometry,
   DEFAULT_CLEMENTINE_LIVE_DORMANT_SIZE,
@@ -1857,23 +1858,16 @@ function activeMeetingCaptureLabels(): string[] {
 }
 
 /**
- * Generate a 22×22 tray icon at runtime — no shipped image asset
- * required. Renders a filled circle (orange = daemon active, red = recording)
- * on a transparent background. Uses an inline SVG → nativeImage.createFromDataURL.
+ * The tray icon for the daemon's state (orange = running, red = recording),
+ * drawn as PNG at each pixel density this platform uses (see tray-icon.ts).
  */
 function buildTrayIcon(active: boolean, recording = false): NativeImage {
-  const color = recording ? '#ff3b30' : active ? '#ff5a35' : '#666c7a';
-  const dot = recording ? '#ffffff' : active ? '#b9ff36' : '#3a3f4a';
-  // 22x22 is the Electron-recommended template size for menubar icons
-  // on macOS retina. We use a colored variant (not template mode)
-  // because the operational aesthetic wants the accent colors visible.
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
-    <circle cx="11" cy="11" r="9" fill="${color}" opacity="0.18" />
-    <circle cx="11" cy="11" r="6" fill="none" stroke="${color}" stroke-width="1.4" />
-    <circle cx="11" cy="11" r="2.6" fill="${dot}" />
-  </svg>`;
-  const dataUrl = 'data:image/svg+xml;base64,' + Buffer.from(svg, 'utf-8').toString('base64');
-  const image = nativeImage.createFromDataURL(dataUrl);
+  const state = recording ? 'recording' : active ? 'active' : 'idle';
+  const { size, scales } = trayIconLayout(process.platform);
+  const image = nativeImage.createEmpty();
+  for (const scaleFactor of scales) {
+    image.addRepresentation({ scaleFactor, buffer: trayIconPng(state, Math.round(size * scaleFactor)) });
+  }
   // Don't mark template — we want the color to appear (some platforms
   // render template mode as monochrome-by-system-theme).
   image.setTemplateImage(false);
