@@ -18,16 +18,28 @@ test('Clem\'s first words while she works, then her answer, are each heard once'
   assert.deepEqual(say([owner('u1', 'move my 3pm'), clem('a1', 'Moved it to 4.', 'complete')]), []);
 });
 
-test('what was on screen before voice mode, live drafts, check-ins and stops are not read', () => {
+test('what was on screen before voice mode, drafts still being written or sent back, and stops are not read', () => {
   const heard = new Map<string, string>();
   const baseline = new Set(['old']);
   const messages = [
     clem('old', 'An earlier answer.', 'complete'),
-    clem('draft', 'Half a sent', 'thinking', { answerDraft: { id: 's1' } }),
-    clem('ci', 'Still working on it.', 'thinking', { checkIn: true }),
+    clem('draft', 'Half a sent', 'thinking', { answerDraft: { id: 's1', phase: 'writing' } }),
+    clem('reviewed', 'A draft review sent back.', 'thinking', { answerDraft: { id: 's2', phase: 'withdrawn', withdrawn: 'review' } }),
     clem('stopped', 'Stopped as requested.', 'stopped'),
   ];
   assert.deepEqual(voiceUtterances(messages, heard, baseline), []);
+});
+
+test('what she says before her tools run and her progress notes are read while she works, once', () => {
+  const heard = new Map<string, string>();
+  const say = (messages: VoiceChatMessage[]) => voiceUtterances(messages, heard, new Set()).map((u) => { heard.set(u.key, u.text); return u.text; });
+  const beforeTools = clem('a1', 'Let me check your calendar.', 'thinking', { answerDraft: { id: 's1', phase: 'withdrawn', withdrawn: 'tool_call' } });
+  assert.deepEqual(say([owner('u1', 'what is on tomorrow'), beforeTools]), ['Let me check your calendar.']);
+  assert.deepEqual(say([owner('u1', 'what is on tomorrow'), beforeTools]), []);
+  const progress = clem('p1', 'Found three meetings, checking the fourth.', 'complete', { checkIn: true });
+  assert.deepEqual(say([owner('u1', 'what is on tomorrow'), beforeTools, progress]), ['Found three meetings, checking the fourth.']);
+  const answered = clem('a1', 'Four things tomorrow, starting at nine.', 'complete');
+  assert.deepEqual(say([owner('u1', 'what is on tomorrow'), progress, answered]), ['Four things tomorrow, starting at nine.']);
 });
 
 test('an answer identical to her first words is not repeated; a card is read by its question', () => {

@@ -10,7 +10,9 @@
  * voice mode. Without a key the caller falls back to the computer's own voice.
  */
 
+import pino from 'pino';
 import { getOpenAiApiKey, getRuntimeEnv } from '../config.js';
+import { redactSensitiveText } from '../runtime/security.js';
 import { toSpokenSentences } from './spoken-text.js';
 
 /** The most a single spoken reply says aloud; the rest stays on screen. */
@@ -19,6 +21,7 @@ export const SPOKEN_REPLY_MAX_CHARS = 900;
 /** How the speech model should sound: delivery only, never content. */
 export const SPEECH_DELIVERY = 'Speak naturally and warmly, like a capable assistant talking with the person she works for. Brisk and conversational, never an announcer.';
 
+const logger = pino({ name: 'clementine.voice' });
 const DEFAULT_SPEECH_MODEL = 'gpt-4o-mini-tts';
 const DEFAULT_SPEECH_VOICE = 'marin';
 
@@ -63,13 +66,18 @@ export async function requestSpeech(text: string, signal?: AbortSignal): Promise
     });
   } catch (error) {
     if (signal?.aborted) return { ok: false, status: 499, error: 'Speech was stopped.' };
-    return { ok: false, status: 502, error: `The speech service could not be reached (${error instanceof Error ? error.message : String(error)}).`, fallback: 'system' };
+    const reason = error instanceof Error ? error.message : String(error);
+    logger.warn({ reason: redactSensitiveText(reason).slice(0, 300), chars: text.length }, 'voice speech could not reach the speech service');
+    return { ok: false, status: 502, error: `The speech service could not be reached (${reason}).` };
   }
   if (response.status === 401 || response.status === 403) {
+    logger.warn({ status: response.status }, 'voice speech key refused; the computer voice speaks instead');
     return { ok: false, status: 409, error: 'The saved OpenAI key was refused for speech; using this computer’s voice.', fallback: 'system' };
   }
   if (!response.ok || !response.body) {
-    return { ok: false, status: 502, error: `The speech service answered HTTP ${response.status}.`, fallback: 'system' };
+    const detail = await response.text().catch(() => '');
+    logger.warn({ status: response.status, detail: redactSensitiveText(detail).slice(0, 300), chars: text.length }, 'voice speech failed');
+    return { ok: false, status: 502, error: `The speech service answered HTTP ${response.status}.` };
   }
   return { ok: true, response, contentType: response.headers.get('content-type') || 'audio/mpeg' };
 }

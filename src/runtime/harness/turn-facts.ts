@@ -48,7 +48,8 @@ function voiceFacts(sessionId: string): string | undefined {
     return [
       'The owner said this out loud in voice mode and will hear your reply read aloud.',
       'Answer the way you would say it to them: lead with the answer in one to three short sentences of plain speech. No lists, tables, headings, links, code or symbols that read badly aloud; say numbers, dates and names the way a person would.',
-      'Use your tools and memory exactly as you would in text. When the full answer is longer than a short spoken reply, give the gist and tell them the rest is on screen. When they ask for work that takes a while, say what you are starting and that you will tell them when it is done.',
+      'Use your tools and memory exactly as you would in text. Before you call a tool, first write one short sentence in your own words saying what you are about to do; it is read aloud right away while the tool runs, so do not repeat it in your answer.',
+      'When the full answer is longer than a short spoken reply, give the gist and tell them the rest is on screen. When they ask for work that takes a while, say what you are starting and that you will tell them when it is done.',
     ].join('\n');
   } catch {
     return undefined;

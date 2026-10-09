@@ -10,32 +10,49 @@ export interface VoiceChatMessage {
   role: 'user' | 'assistant';
   text: string;
   status?: string;
-  answerDraft?: unknown;
+  answerDraft?: { id: string; phase?: string; withdrawn?: string };
   checkIn?: unknown;
   approval?: { preview?: { ask?: string } };
 }
 
 export const FINISHED_STATUSES = new Set(['complete', 'awaiting-reply', 'awaiting-approval', 'awaiting-plan', 'failed']);
 
-/** What Clem said that has not been read aloud yet, in order. A message the
- *  owner saw before voice mode started is never read; a live draft is not
- *  read until it is the answer; a stop the owner pressed is not read back. */
+/** What Clem said that has not been read aloud yet, in order: what she says
+ *  she is about to do before her tools run (a draft set aside for a tool
+ *  call), her progress notes, her first words while she works, and her
+ *  answer, a question or a card's ask. A message the owner saw before voice
+ *  mode started is never read; a draft still being written or sent back by
+ *  review is not read; a stop the owner pressed is not read back; the same
+ *  words are never said twice in a row. */
 export function voiceUtterances(
   messages: readonly VoiceChatMessage[],
   heard: Map<string, string>,
   baseline: ReadonlySet<string>,
 ): Array<{ key: string; text: string }> {
   const out: Array<{ key: string; text: string }> = [];
+  const said = new Set(heard.values());
+  const say = (key: string, text: string): void => {
+    if (heard.has(key) || said.has(text)) return;
+    said.add(text);
+    out.push({ key, text });
+  };
   for (const message of messages) {
-    if (message.role !== 'assistant' || baseline.has(message.id) || message.checkIn || message.answerDraft) continue;
+    if (message.role !== 'assistant' || baseline.has(message.id)) continue;
+    const draft = message.answerDraft;
+    if (draft) {
+      if (draft.phase === 'withdrawn' && draft.withdrawn === 'tool_call' && message.text.trim()) {
+        say(`${message.id}:before-tools:${draft.id}`, message.text.trim());
+      }
+      continue;
+    }
     const text = (message.text?.trim() || message.approval?.preview?.ask?.trim() || '');
     if (!text) continue;
-    if (message.status === 'thinking') {
-      const key = `${message.id}:first`;
-      if (!heard.has(key)) out.push({ key, text });
+    if (message.checkIn) {
+      say(`${message.id}:progress`, text);
+    } else if (message.status === 'thinking') {
+      say(`${message.id}:first`, text);
     } else if (message.status && FINISHED_STATUSES.has(message.status)) {
-      const key = `${message.id}:answer`;
-      if (!heard.has(key) && heard.get(`${message.id}:first`) !== text) out.push({ key, text });
+      say(`${message.id}:answer`, text);
     }
   }
   return out;

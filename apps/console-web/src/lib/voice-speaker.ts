@@ -73,7 +73,10 @@ export class VoiceSpeaker {
     this.handlers.onIdle?.();
   }
 
-  private async speakOne(text: string, generation: number): Promise<void> {
+  /** One voice for the whole conversation: a failed request is tried once
+   *  more in the same voice; the computer's own voice speaks only when there
+   *  is no usable key at all. */
+  private async speakOne(text: string, generation: number, attempt = 0): Promise<void> {
     const controller = new AbortController();
     this.controller = controller;
     const token = getAuthToken();
@@ -88,8 +91,13 @@ export class VoiceSpeaker {
     if (!res.ok) {
       const payload = await res.json().catch(() => ({})) as { error?: string; fallback?: string; text?: string };
       if (res.status === 400) return;
-      if (payload.fallback === 'system' && payload.text) {
+      if (res.status === 409 && payload.fallback === 'system' && payload.text) {
         await this.sayWithSystemVoice(payload.text, generation);
+        return;
+      }
+      if (attempt === 0 && generation === this.generation) {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        if (generation === this.generation) await this.speakOne(text, generation, 1);
         return;
       }
       throw new Error(payload.error || 'Could not speak the reply.');
