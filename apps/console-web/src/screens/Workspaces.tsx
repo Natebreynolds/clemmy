@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Plus, Clock } from 'lucide-react';
 import { Page } from '@/components/Page';
@@ -36,7 +36,23 @@ function healthLabel(space: SpaceRecord): { tone: Tone; text: string } {
   return { tone: 'warning', text: 'Out of date' };
 }
 
+/** True once the element has come within a screen of the viewport; stays true. */
+function useNearViewport(): [RefObject<HTMLDivElement | null>, boolean] {
+  const ref = useRef<HTMLDivElement>(null);
+  const [near, setNear] = useState(() => typeof IntersectionObserver === 'undefined');
+  useEffect(() => {
+    if (near || !ref.current) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) { setNear(true); observer.disconnect(); }
+    }, { rootMargin: '100% 0px' });
+    observer.observe(ref.current);
+    return () => observer.disconnect();
+  }, [near]);
+  return [ref, near];
+}
+
 function WorkspaceCard({ space, onOpen, building }: { space: SpaceRecord; onOpen: () => void; building?: boolean }) {
+  const [previewRef, previewVisible] = useNearViewport();
   const sched = scheduleHint(space);
   const health = space.health;
   const healthStatus = healthLabel(space);
@@ -55,17 +71,20 @@ function WorkspaceCard({ space, onOpen, building }: { space: SpaceRecord; onOpen
       >
         <span className="sr-only">Open the {space.title} Space</span>
       </Link>
-      {/* Live preview — a scaled, non-interactive snapshot of the actual view. */}
-      <div className="relative h-40 w-full overflow-hidden border-b border-border bg-subtle">
-        <WorkspaceFrame
-          id={space.id}
-          title={`${space.title} preview`}
-          tabIndex={-1}
-          ariaHidden
-          readOnly
-          className="pointer-events-none absolute left-0 top-0 origin-top-left"
-          style={{ width: '250%', height: '250%', transform: 'scale(0.4)', border: 0 }}
-        />
+      {/* Live preview — a scaled, non-interactive snapshot of the actual view,
+          started only once the card is near the screen. */}
+      <div ref={previewRef} className="relative h-40 w-full overflow-hidden border-b border-border bg-subtle">
+        {previewVisible && (
+          <WorkspaceFrame
+            id={space.id}
+            title={`${space.title} preview`}
+            tabIndex={-1}
+            ariaHidden
+            readOnly
+            className="pointer-events-none absolute left-0 top-0 origin-top-left"
+            style={{ width: '250%', height: '250%', transform: 'scale(0.4)', border: 0 }}
+          />
+        )}
         {space.status !== 'active' && (
           <div className="absolute inset-0 flex items-center justify-center bg-canvas/55">
             <StatusPill tone={statusTone(space.status)}>{space.status}</StatusPill>
