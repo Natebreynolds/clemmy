@@ -800,3 +800,14 @@ test('an approved action that did not land ends in Clem\'s words, never the exec
   assert.match(terminal, /^It didn't go through — the provider reported a terminal failure/);
   assert.doesNotMatch(terminal, /can't tell|Nothing ran/);
 });
+
+test('the facts Clem is given about an approved action that did not land come from the executor\'s markers', async () => {
+  const { approvedActionEndingFacts } = await import('./chat-approval-resume.js');
+  const { PENDING_ACTION_PRE_DISPATCH_REFUSAL, PENDING_ACTION_TOOL_REFUSAL, PENDING_ACTION_DISPATCH_UNCERTAIN } = await import('../../execution/pending-action-executor.js');
+  assert.deepEqual(approvedActionEndingFacts({ status: 'failed', resultSummary: `${PENDING_ACTION_PRE_DISPATCH_REFUSAL}: The command did not run: cwd does not exist: /x.` }),
+    { verdict: 'never_started', reply: 'The command did not run: cwd does not exist: /x.' });
+  assert.equal(approvedActionEndingFacts({ status: 'failed', resultSummary: `${PENDING_ACTION_TOOL_REFUSAL}; provider outcome is uncertain and no retry is safe: Invalid request data provided` }).verdict, 'refused');
+  assert.match(approvedActionEndingFacts({ status: 'failed', resultSummary: `${PENDING_ACTION_TOOL_REFUSAL}; provider outcome is uncertain and no retry is safe: Tool call refused by harness: shell_policy_denial: reads a credential` }).verdict, /^guard_refused$/);
+  assert.equal(approvedActionEndingFacts({ status: 'failed', resultSummary: `${PENDING_ACTION_DISPATCH_UNCERTAIN}: socket hang up. Do not retry automatically.` }).verdict, 'uncertain');
+  assert.equal(approvedActionEndingFacts({ status: 'executing', resultSummary: null }).verdict, 'uncertain');
+});

@@ -28,6 +28,7 @@ import { canonicalLogicalToolName } from '../runtime/harness/logical-call-contra
 import { detectStructuredToolFailure } from '../runtime/harness/tool-error-corrective.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
+import { providerAnsweredWithRefusal, type AttemptOutcome } from '../runtime/harness/attempt-outcome.js';
 import { verifyPendingComposioExecutionAuthority } from '../tools/pending-action-admission.js';
 
 export interface ExecuteApprovedResult {
@@ -85,10 +86,10 @@ async function dispatchApprovedCall(
   sessionId: string,
   capability: PendingActionExecutionCapability,
   acceptedResume: boolean,
-): Promise<unknown> {
+): Promise<{ value: unknown; outcome?: AttemptOutcome }> {
   if (!acceptedResume) {
-    return dispatch(record.toolName, record.payload, sessionId,
-      { batchId: record.id, payloadHash: record.payloadHash }, capability);
+    return { value: await dispatch(record.toolName, record.payload, sessionId,
+      { batchId: record.id, payloadHash: record.payloadHash }, capability) };
   }
   const expected = expectedTaskFor(sessionId, capability.sourceUserSeq);
   const effect = classifyRuntimeToolEffect(record.toolName, record.payload).effect;
@@ -154,10 +155,32 @@ async function dispatchApprovedCall(
       invoke: () => dispatch(record.toolName, record.payload, sessionId,
         { batchId: record.id, payloadHash: record.payloadHash }, capability),
     }));
-    return invoked.value;
+    return { value: invoked.value, outcome: invoked.settlement.outcome };
   } finally {
     if (ownLease) await revokeDispatchLeaseBeforeRecovery(lease);
   }
+}
+
+/** What the settled outcome of the approved call says happened. The ledger is
+ * the authority here, not the returned text: a tool error the agent runtime
+ * turned into a sentence still settled as the failure it was. */
+export function approvedCallVerdict(outcome: AttemptOutcome): 'succeeded' | 'not_started' | 'refused' | 'uncertain' | 'guard' {
+  if (outcome.kind === 'succeeded' || outcome.kind === 'empty_result') return 'succeeded';
+  // A guard inside the tool refused it (a credential leaving the machine):
+  // its own words are the owner's to hear, read from the guard's marker.
+  if (outcome.kind === 'policy_denial') return 'guard';
+  if (outcome.kind === 'invalid_arguments'
+    && (outcome.detail?.startsWith('validation') || outcome.detail === 'provider_rejected_before_effect')) return 'not_started';
+  if (providerAnsweredWithRefusal(outcome)) return 'refused';
+  return 'uncertain';
+}
+
+/** The words a returned value carries: a typed carrier's `output`, a string, or its JSON. */
+function approvedCallWords(value: unknown): string {
+  if (typeof value === 'string') return value;
+  const output = value && typeof value === 'object' ? (value as { output?: unknown }).output : undefined;
+  if (typeof output === 'string') return output;
+  try { return JSON.stringify(value ?? ''); } catch { return String(value); }
 }
 
 /** A test's stand-in for the provider dispatch on paths that own their own
@@ -361,7 +384,7 @@ export async function executeApprovedPendingActionCall(
         'Stored call_tool carriers cannot be replayed outside their original turn scope. Queue the validated inner tool and exact payload in a new pending action.',
       );
     }
-    const out = await dispatchApprovedCall(dispatch, claimedRecord, sessionId, {
+    const dispatched = await dispatchApprovedCall(dispatch, claimedRecord, sessionId, {
       pendingActionId: claimedRecord.id,
       payloadHash: claimedRecord.payloadHash,
       claimToken,
@@ -369,7 +392,39 @@ export async function executeApprovedPendingActionCall(
       // approved outside any turn settles under the source that queued it.
       sourceUserSeq: opts.sourceUserSeq ?? claimedRecord.sourceUserSeq ?? 0,
     }, opts.sourceUserSeq !== undefined);
+    const out = dispatched.value;
     const outText = typeof out === 'string' ? out : JSON.stringify(out ?? '');
+    // The settled outcome decides how the record ends, before any reading of
+    // the text: a command refused before it started, an app that refused it
+    // in its reply, and a failure that may have landed are three different
+    // endings (live 2026-10-09: a command whose folder did not exist never
+    // ran, came back as an error sentence, and was recorded as executed).
+    const verdict = dispatched.outcome ? approvedCallVerdict(dispatched.outcome) : 'succeeded';
+    if (verdict !== 'succeeded' && verdict !== 'guard') {
+      const words = approvedCallWords(out).replace(/\s+/g, ' ').trim().slice(0, 600);
+      const summary = verdict === 'not_started'
+        ? `${PENDING_ACTION_PRE_DISPATCH_REFUSAL}: ${words}`
+        : verdict === 'refused'
+          ? `${PENDING_ACTION_TOOL_REFUSAL}; provider outcome is uncertain and no retry is safe: ${words}`
+          : `${PENDING_ACTION_DISPATCH_UNCERTAIN}: ${words}. Do not retry automatically.`;
+      const updated = recordPendingActionResult(
+        claimedRecord.id,
+        'failed',
+        summary.slice(0, 4000),
+        'pending-action-executor',
+        claimToken,
+      );
+      return {
+        ok: false,
+        status: 'failed',
+        resultSummary: verdict === 'not_started'
+          ? `${claimedRecord.toolName} was refused before it started: ${words}. Nothing ran.`
+          : verdict === 'refused'
+            ? `${claimedRecord.toolName} was refused in the reply: ${words}. No automatic retry is safe.`
+            : `${claimedRecord.toolName} failed or its outcome is uncertain: ${words}. No automatic retry is safe.`,
+        record: updated ?? getPendingAction(id),
+      };
+    }
     const structuredFailure = detectStructuredToolFailure(outText);
     // A gate/guard refusal commonly comes back as a returned string. It is not
     // safe to call that pre-dispatch solely from its text: the provider may

@@ -55,6 +55,9 @@ import { publicUserInputText } from './public-presentation.js';
 import { freshExternalWriteEvidenceStatus } from './tool-evidence.js';
 import { PENDING_ACTION_DISPATCH_UNCERTAIN, PENDING_ACTION_PRE_DISPATCH_REFUSAL, PENDING_ACTION_TOOL_REFUSAL, executeApprovedPendingActionCall } from '../../execution/pending-action-executor.js';
 import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
+import { peekTurnSemanticModelPort } from '../semantic-boundary/turn-semantic-port-registry.js';
+import { CLEM_VOICE_PURPOSE } from '../semantic-boundary/turn-semantic-model-port.js';
+import { withOwnModelRequestAttribution } from '../usage-log.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import { turnOutcomeId, type TurnIdentity } from './turn-outcome.js';
 import { reprojectUndeliveredConversationalApproval } from './claude-agent-approval.js';
@@ -546,9 +549,13 @@ async function executeApprovedLinkedActionAndSettle(
     // what to do next in Clem's words. The record keeps the machine text
     // for the model (live 2026-10-07: "Dispatch was refused locally … Error:
     // InvalidToolInputError … Call tool_search … then retry" reached the owner).
+    // Clem says it herself, from the record: what happened, what she would
+    // change, and whether to go ahead (owner 2026-10-09). The plain ending
+    // stands when no brain answers in time.
+    const said = await approvedActionEndingInClemsWords(row, pendingAction, source.seq);
     return await settleConversationalSource(row, source, {
       status: 'failed',
-      text: approvedActionFailedText(pendingAction),
+      text: said ?? approvedActionFailedText(pendingAction),
     });
   }
   return await settleConversationalSource(row, source, {
@@ -764,6 +771,78 @@ export function approvedActionRanText(action: Pick<PendingActionRecord, 'kind' |
   return retainedWorkNeedsVerification
     ? `${body}\n\nYour earlier request still has retained work to verify. Say "continue" to check the saved results and finish what remains.`
     : body;
+}
+
+const APPROVED_ACTION_ENDING_DEADLINE_MS = 20_000;
+const APPROVED_ACTION_ENDING_FIELD_CHARS = 600;
+
+function boundedEndingField(value: string, max = APPROVED_ACTION_ENDING_FIELD_CHARS): string {
+  const text = value.replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/** What the record says happened to an approved action that did not land,
+ * read from the executor's own markers, never from provider prose. */
+export function approvedActionEndingFacts(action: Pick<PendingActionRecord, 'status' | 'resultSummary'>): {
+  verdict: 'never_started' | 'refused' | 'guard_refused' | 'uncertain';
+  reply: string;
+} {
+  const summary = typeof action.resultSummary === 'string' ? action.resultSummary : '';
+  const after = (marker: string) => summary.slice(summary.indexOf(marker) + marker.length).replace(/^[\s:;.-]+/, '');
+  if (action.status === 'failed' && summary.startsWith(PENDING_ACTION_PRE_DISPATCH_REFUSAL)) {
+    return { verdict: 'never_started', reply: boundedEndingField(after(PENDING_ACTION_PRE_DISPATCH_REFUSAL)) };
+  }
+  if (action.status === 'failed' && summary.startsWith(PENDING_ACTION_TOOL_REFUSAL)) {
+    const guard = /refused by harness|shell_policy_denial/i.test(summary);
+    return { verdict: guard ? 'guard_refused' : 'refused', reply: boundedEndingField(toolRefusalWords(summary)) };
+  }
+  if (action.status === 'executing' || summary.startsWith(PENDING_ACTION_DISPATCH_UNCERTAIN)) {
+    return { verdict: 'uncertain', reply: boundedEndingField(summary.startsWith(PENDING_ACTION_DISPATCH_UNCERTAIN) ? after(PENDING_ACTION_DISPATCH_UNCERTAIN) : '') };
+  }
+  return { verdict: 'refused', reply: boundedEndingField(summary) };
+}
+
+/** Clem's own reply when an approved action did not go through: what
+ * happened, what she would change, and whether to go ahead. Null when no
+ * brain is reachable in time; the caller then keeps the plain ending. */
+async function approvedActionEndingInClemsWords(
+  row: approvalRegistry.PendingApprovalRow,
+  action: PendingActionRecord,
+  decisionSeq: number,
+): Promise<string | null> {
+  const port = peekTurnSemanticModelPort();
+  if (!port?.voiceApprovedActionEnding) return null;
+  try {
+    const shell = action.toolName === 'run_shell_command' || action.kind === 'shell_command';
+    const payload = action.payload && typeof action.payload === 'object' ? action.payload as Record<string, unknown> : {};
+    const command = shell && typeof payload.command === 'string' ? payload.command : '';
+    let asked = '';
+    if (typeof action.sourceUserSeq === 'number') {
+      const accepted = getUserInputEventAtSequence(row.sessionId, action.sourceUserSeq);
+      if (accepted && accepted.data.synthetic !== true) asked = publicUserInputText(accepted.data);
+    }
+    const happened = approvedActionEndingFacts(action);
+    const work = withOwnModelRequestAttribution({ sessionId: row.sessionId, sourceUserSeq: decisionSeq }, () => port.voiceApprovedActionEnding!({
+      purpose: CLEM_VOICE_PURPOSE,
+      asked: boundedEndingField(asked),
+      action: {
+        title: boundedEndingField(action.title ?? '', 200),
+        kind: shell ? 'command_on_this_computer' : 'connected_app_change',
+        detail: boundedEndingField(command || action.title || '', 400),
+      },
+      happened,
+      evidenceDigest: createHash('sha256').update(`${action.id}\0${action.resultSummary ?? ''}`).digest('hex'),
+    }));
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), APPROVED_ACTION_ENDING_DEADLINE_MS); });
+    const result = await Promise.race([work, deadline]).finally(() => { if (timer) clearTimeout(timer); });
+    const message = result?.message?.trim();
+    return message ? message : null;
+  } catch (err) {
+    logger.warn({ pendingActionId: action.id, err: err instanceof Error ? err.message : String(err) },
+      'approved action ending: Clem could not be reached; the plain ending stands');
+    return null;
+  }
 }
 
 /** The owner's decision ended without the action landing. Two honest cases:

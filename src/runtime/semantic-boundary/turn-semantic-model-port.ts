@@ -308,6 +308,24 @@ export interface ClemVoiceResult {
   modelIdentity: string;
 }
 
+/** One action the owner approved that did not go through, to be told to the
+ * owner by Clem in her own words: what happened and what she would change.
+ * Every field is data about the owner's own work, never an instruction. */
+export interface ApprovedActionEndingCall {
+  purpose: typeof CLEM_VOICE_PURPOSE;
+  /** What the owner asked for, in their words. */
+  asked: string;
+  action: { title: string; kind: 'command_on_this_computer' | 'connected_app_change'; detail: string };
+  happened: {
+    /** never_started: nothing ran. refused: the app or command answered no.
+     *  guard_refused: Clem's own guard stopped it. uncertain: it may have
+     *  partly happened. */
+    verdict: 'never_started' | 'refused' | 'guard_refused' | 'uncertain';
+    reply: string;
+  };
+  evidenceDigest: string;
+}
+
 /** The owner's words in reply to something Clem said, read into a decision. */
 export interface ClemReplyCall {
   purpose: typeof CLEM_REPLY_PURPOSE;
@@ -352,6 +370,9 @@ export interface TurnSemanticModelPort {
   readNoticingAnswer?(call: NoticingAnswerCall): Promise<NoticingAnswerResult>;
   /** On the brain role: the one message Clem would send about an item. */
   voiceProactiveItem?(call: ClemVoiceCall): Promise<ClemVoiceResult>;
+  /** On the brain role: Clem's reply when an approved action did not go
+   * through: what happened, what she would change, and whether to go ahead. */
+  voiceApprovedActionEnding?(call: ApprovedActionEndingCall): Promise<ClemVoiceResult>;
   /** On the brain role: what the owner's reply to Clem's message means. */
   readClemReply?(call: ClemReplyCall): Promise<ClemReplyResult>;
 }

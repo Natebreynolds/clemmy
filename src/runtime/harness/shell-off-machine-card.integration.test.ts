@@ -349,3 +349,58 @@ test('an approved card cannot carry a command the guards inside the tool refuse'
   assert.notEqual(pendingActions.getPendingAction(view.id)?.status, 'executed', approved.outcomeText);
   assert.match(approved.outcomeText, /credential/i, approved.outcomeText);
 });
+
+test('an approved command that was refused before it started ends in Clem\'s words, never as run', async () => {
+  // Live 2026-10-09: the approved command named a folder that does not exist.
+  // Nothing ran, yet the record said executed and the owner read "Done — I
+  // ran it". Now the ledger decides how the record ends, and Clem says what
+  // happened and what she would change.
+  const missing = path.join(HOME, 'no-such-folder');
+  const args = { command: COMMAND, cwd: missing, timeout_ms: 20_000 };
+  const run = await hostTurn('missing-folder', 'Post x=1 to the hook endpoint from the project folder.', [
+    [call('call-work', 'work_call', {
+      requirement_id: 'cap:local:run_shell_command:ordinary', source_call_ids: null, source_record_ids: null,
+      universe_item_id: null, universe_selector: null, seal_amendment: null,
+      name: 'run_shell_command', args_json: JSON.stringify(args),
+    })],
+    [call('call-queue', 'call_tool', {
+      name: 'pending_action_queue',
+      args_json: JSON.stringify({
+        title: 'Post to the hook endpoint', summary: 'Sends x=1 to the hook endpoint.',
+        kind: 'shell_command', toolName: 'run_shell_command', payloadJson: JSON.stringify(args),
+        approvalIntent: 'request_now',
+      }),
+    })],
+    [text('The command is waiting for your approval.')],
+  ]);
+  const debug = JSON.stringify({ status: run.result.status, frames: run.frames }).slice(0, 4_000);
+  assert.equal(run.result.status, 'awaiting_approval', debug);
+  const approval = run.trace.find((event) => event.type === 'approval_requested')!;
+  const view = pendingActionApprovalViewFromArgs(approval.data.args)!;
+  const before = received.length;
+  const asked: Array<Record<string, unknown>> = [];
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('not used by an approval'); },
+    async voiceApprovedActionEnding(call) {
+      asked.push(call as unknown as Record<string, unknown>);
+      return { message: 'That never ran: the folder I picked does not exist. Want me to run it from your home folder instead?', evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture' };
+    },
+  } as never);
+  let approved: Awaited<ReturnType<typeof approveCard>>;
+  try {
+    approved = await approveCard(run.session.id, String(approval.data.approvalId));
+  } finally {
+    semanticPorts.installTurnSemanticModelPort(null);
+  }
+  assert.equal(approved.settled, true, approved.outcomeText);
+  assert.equal(received.length, before, 'nothing reached the endpoint');
+  const record = pendingActions.getPendingAction(view.id);
+  assert.equal(record?.status, 'failed', record?.resultSummary ?? '');
+  assert.match(record?.resultSummary ?? '', /refused locally before the provider call started/);
+  assert.equal(asked.length, 1);
+  assert.equal((asked[0]!.happened as { verdict: string }).verdict, 'never_started');
+  assert.match((asked[0]!.happened as { reply: string }).reply, /does not exist/);
+  assert.match(String(asked[0]!.asked), /hook endpoint/);
+  assert.match(approved.outcomeText, /That never ran: the folder I picked does not exist/, approved.outcomeText);
+  assert.doesNotMatch(approved.outcomeText, /I ran it/);
+});

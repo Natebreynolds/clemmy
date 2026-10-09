@@ -1125,6 +1125,13 @@ interface ShellCommandResult {
   outcome: ShellExecutionOutcome;
 }
 
+/** The command's working folder was refused before any process started (it
+ * does not exist, or lies outside the allowed roots). Nothing ran, so this is
+ * a repairable argument, never a possible effect. */
+class ShellWorkingDirectoryError extends Error {
+  override readonly name = 'ShellWorkingDirectoryError';
+}
+
 class ShellCommandExecutionError extends Error {
   constructor(message: string, public readonly outcome: ShellExecutionOutcome) {
     super(message);
@@ -1846,6 +1853,11 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       if (error instanceof ShellPolicyDenialError) {
         return `${SHELL_POLICY_DENIAL_PREFIX} ${error.message}`;
       }
+      // A refused working folder is a repairable argument: the command never
+      // started, so it is no possible effect for the ledger or the owner.
+      if (error instanceof ShellWorkingDirectoryError) {
+        return new InvalidArgumentsPreDispatchResult(`The command did not run: ${error.message}`) as unknown as string;
+      }
       if (error instanceof ShellCommandExecutionError && (error.outcome.timeoutCleanup === 'incomplete'
         || error.outcome.errorKind === 'process_cleanup_unconfirmed')) return error.message;
       const details = error instanceof Error ? error.toString() : String(error);
@@ -1869,7 +1881,12 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
           + 'Read-only inspection of the DB is fine; mutation must go through the tools.',
         );
       }
-      const cwd = resolveAllowedCwd(input.cwd ?? undefined);
+      let cwd: string;
+      try {
+        cwd = resolveAllowedCwd(input.cwd ?? undefined);
+      } catch (error) {
+        throw new ShellWorkingDirectoryError(error instanceof Error ? error.message : String(error));
+      }
       if (shellWritesInstalledSkillSource(input.command, cwd)) {
         throw new ShellPolicyDenialError(
           'This shell command appears to write into an installed skill source tree under ~/.clementine-next/skills. '

@@ -584,3 +584,17 @@ test('a refused create is a typed not-started refusal, never a settled mutation'
   const replaced = await executeLocalFileWrite({ path: file, content: 'x', mode: 'replace', append: null, find: 'absent passage' });
   assert.ok(replaced instanceof InvalidArgumentsPreDispatchResult);
 });
+
+test('a shell command whose working folder does not exist is refused before it starts, as a repairable argument', async () => {
+  // Live 2026-10-09: an approved command named a folder that does not exist;
+  // nothing ran, yet it settled as a possible external write and the owner
+  // was told it had run. The folder check is a typed no-dispatch refusal.
+  const { InvalidArgumentsPreDispatchResult, attemptSignalsFromTypedResult } = await import('../runtime/harness/attempt-settlement.js');
+  const missing = path.join(tmpHome, 'no-such-folder');
+  const result = await invokeShell({ command: 'echo should-not-run', cwd: missing }) as unknown;
+  assert.ok(result instanceof InvalidArgumentsPreDispatchResult, `got ${typeof result}: ${String((result as { output?: string })?.output ?? result).slice(0, 200)}`);
+  assert.match((result as { output: string }).output, /The command did not run: cwd does not exist/);
+  const signals = attemptSignalsFromTypedResult(result);
+  assert.equal(signals.preDispatch, true);
+  assert.equal(signals.argumentValidationFailed, true);
+});
