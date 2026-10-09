@@ -17,31 +17,76 @@ export interface VoiceChatMessage {
 
 export const FINISHED_STATUSES = new Set(['complete', 'awaiting-reply', 'awaiting-approval', 'awaiting-plan', 'failed']);
 
-/** What Clem said that has not been read aloud yet, in order: what she says
- *  she is about to do before her tools run (a draft set aside for a tool
- *  call), her progress notes, her first words while she works, and her
- *  answer, a question or a card's ask. A message the owner saw before voice
- *  mode started is never read; a draft still being written or sent back by
- *  review is not read; a stop the owner pressed is not read back; the same
- *  words are never said twice in a row. */
+/** The most of one message read aloud; the rest stays on screen. */
+export const SPOKEN_PER_MESSAGE_MAX = 900;
+
+const SENTENCE_END = /[.!?…]["'”’)\]]*\s+|\n{2,}/g;
+
+/** The words after `said`: up to the last complete sentence while the draft
+ *  is still being written, or all of them once it is finished. */
+export function nextSpokenPart(text: string, said: string, finished: boolean): string {
+  if (!text.startsWith(said)) return '';
+  const rest = text.slice(said.length);
+  if (finished) return rest;
+  let end = -1;
+  for (const match of rest.matchAll(SENTENCE_END)) end = (match.index ?? 0) + match[0].length;
+  return end > 0 ? rest.slice(0, end) : '';
+}
+
+/** What of one message's drafts has already been read, and from which draft. */
+function draftSaid(heard: Map<string, string>, messageId: string): { draftId: string | null; said: string } {
+  const prefix = `${messageId}:draft:`;
+  let draftId: string | null = null;
+  const parts = new Map<string, string>();
+  for (const [key, text] of heard) {
+    if (!key.startsWith(prefix)) continue;
+    const id = key.slice(prefix.length).split(':part:')[0];
+    draftId = id;
+    parts.set(id, (parts.get(id) ?? '') + text);
+  }
+  return { draftId, said: draftId ? parts.get(draftId) ?? '' : '' };
+}
+
+function partCount(heard: Map<string, string>, messageId: string, draftId: string): number {
+  let count = 0;
+  for (const key of heard.keys()) if (key.startsWith(`${messageId}:draft:${draftId}:part:`)) count += 1;
+  return count;
+}
+
+/** What Clem said that has not been read aloud yet, in order: her answer as
+ *  she writes it (each complete sentence as it lands, so the reading starts
+ *  with her first sentence), what she says before her tools run, her
+ *  progress notes, her first words while she works, a question or a card's
+ *  ask, and whatever her finished answer adds to what was already read. A
+ *  message the owner saw before voice mode started is never read; a draft
+ *  sent back by review stops being read; a stop the owner pressed is not read
+ *  back; the same words are never said twice in a row. */
 export function voiceUtterances(
   messages: readonly VoiceChatMessage[],
   heard: Map<string, string>,
   baseline: ReadonlySet<string>,
 ): Array<{ key: string; text: string }> {
   const out: Array<{ key: string; text: string }> = [];
-  const said = new Set(heard.values());
+  const said = new Set([...heard.values()].map((value) => value.trim()));
   const say = (key: string, text: string): void => {
-    if (heard.has(key) || said.has(text)) return;
-    said.add(text);
+    const words = text.trim();
+    if (!words || heard.has(key) || said.has(words)) return;
+    said.add(words);
     out.push({ key, text });
   };
   for (const message of messages) {
     if (message.role !== 'assistant' || baseline.has(message.id)) continue;
     const draft = message.answerDraft;
     if (draft) {
-      if (draft.phase === 'withdrawn' && draft.withdrawn === 'tool_call' && message.text.trim()) {
-        say(`${message.id}:before-tools:${draft.id}`, message.text.trim());
+      const forTool = draft.phase === 'withdrawn' && draft.withdrawn === 'tool_call';
+      if (draft.phase === 'withdrawn' && !forTool) continue;
+      const before = draftSaid(heard, message.id);
+      const sofar = before.draftId === draft.id ? before.said : '';
+      if (sofar.length >= SPOKEN_PER_MESSAGE_MAX) continue;
+      const part = nextSpokenPart(message.text, sofar, forTool || draft.phase === 'checking');
+      if (part.trim()) {
+        out.push({ key: `${message.id}:draft:${draft.id}:part:${partCount(heard, message.id, draft.id)}`, text: part });
+        said.add(part.trim());
       }
       continue;
     }
@@ -52,7 +97,11 @@ export function voiceUtterances(
     } else if (message.status === 'thinking') {
       say(`${message.id}:first`, text);
     } else if (message.status && FINISHED_STATUSES.has(message.status)) {
-      say(`${message.id}:answer`, text);
+      // The answer was read while she wrote it: add only what it adds. A
+      // reviewed answer that changed is read as itself.
+      const { said: read } = draftSaid(heard, message.id);
+      const rest = read && message.text.startsWith(read) ? message.text.slice(read.length) : text;
+      if (read.length < SPOKEN_PER_MESSAGE_MAX) say(`${message.id}:answer`, rest);
     }
   }
   return out;

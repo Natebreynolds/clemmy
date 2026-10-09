@@ -17,6 +17,7 @@
 import { useSyncExternalStore } from 'react';
 import { NotchVoice } from './notch-voice';
 import { VoiceSpeaker } from './voice-speaker';
+import { heardCue, workingTick } from './voice-cues';
 import { spokenWords, voiceBaseline, voiceTurnEnded, voiceTurnRunning, voiceUtterances, type VoiceChatMessage } from './voice-turns';
 
 export type VoicePhase = 'off' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
@@ -35,6 +36,8 @@ export interface VoiceModeState {
 export type { VoiceChatMessage } from './voice-turns';
 
 const SILENCE_MS = 900;
+/** How often a quiet tick says she is still working while she is silent. */
+const WORKING_TICK_MS = 4_000;
 
 type Send = (text: string) => Promise<void> | void;
 
@@ -49,6 +52,7 @@ class VoiceModeController {
   private messages: readonly VoiceChatMessage[] = [];
   private awaitingTurn = false;
   private turnFrom = 0;
+  private tick: ReturnType<typeof setInterval> | null = null;
   private readonly speaker = new VoiceSpeaker({
     onSpeaking: () => { this.closeMic(); this.update({ phase: 'speaking' }); },
     onIdle: () => this.afterSpeaking(),
@@ -186,6 +190,7 @@ class VoiceModeController {
       : -1;
     this.turnFrom = running >= 0 ? running : this.messages.length;
     this.awaitingTurn = true;
+    heardCue();
     this.update({ phase: 'thinking', heard: words, error: '' });
     try {
       await this.send(words);
@@ -203,8 +208,23 @@ class VoiceModeController {
   }
 
   private update(patch: Partial<VoiceModeState>): void {
+    const before = this.state.phase;
     this.state = { ...this.state, ...patch };
+    if (this.state.phase !== before) this.phaseChanged();
     for (const listener of this.listeners) listener();
+  }
+
+  /** While she works in silence a quiet tick keeps the line alive; it stops
+   *  the moment she speaks, listens or voice mode ends. */
+  private phaseChanged(): void {
+    if (this.state.phase === 'thinking') {
+      this.tick ??= setInterval(() => {
+        if (this.state.phase === 'thinking' && !this.speaker.speaking) workingTick();
+      }, WORKING_TICK_MS);
+    } else if (this.tick) {
+      clearInterval(this.tick);
+      this.tick = null;
+    }
   }
 }
 

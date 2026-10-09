@@ -1,11 +1,13 @@
 /**
- * Voice mode's speaker: plays Clem's replies one after another.
+ * Voice mode's speaker: plays Clem's words one after another, without gaps.
  *
- * Each reply goes to /api/console/voice/speak, which streams the speech
- * service's audio; playback starts on the first bytes. Without a usable key
- * the daemon hands back the words and this computer's own voice says them.
- * The audio plays through the page, so the microphone's echo cancellation
- * hears it as Clem, not as the owner.
+ * Each piece goes to /api/console/voice/speak, which streams the speech
+ * service's audio; playback starts on the first bytes. The next piece is
+ * already being fetched while the current one plays, so a reply read in
+ * sentences sounds like one reply. Without a usable key the daemon hands back
+ * the words and this computer's own voice says them. The audio plays through
+ * the page, so the microphone's echo cancellation hears it as Clem, not as
+ * the owner.
  */
 import { getAuthToken } from './bootstrap';
 
@@ -14,17 +16,30 @@ export interface VoiceSpeakerHandlers {
   onSpeaking?: () => void;
   /** Nothing left to say (finished, stopped, or failed). */
   onIdle?: () => void;
-  /** A reply could not be spoken; the words are still on screen. */
+  /** A piece could not be spoken; the words are still on screen. */
   onError?: (message: string) => void;
 }
 
 const MP3 = 'audio/mpeg';
+/** How many pieces are fetched ahead of the one playing. */
+const LOOKAHEAD = 2;
+
+type Spoken =
+  | { kind: 'audio'; response: Response }
+  | { kind: 'system'; text: string }
+  | { kind: 'skip' }
+  | { kind: 'error'; message: string };
+
+interface Piece {
+  text: string;
+  spoken: Promise<Spoken> | null;
+}
 
 export class VoiceSpeaker {
-  private queue: string[] = [];
+  private pieces: Piece[] = [];
   private active = false;
   private generation = 0;
-  private controller: AbortController | null = null;
+  private controllers = new Set<AbortController>();
   private audio: HTMLAudioElement | null = null;
   private objectUrl: string | null = null;
   private settleCurrent: (() => void) | null = null;
@@ -37,16 +52,23 @@ export class VoiceSpeaker {
   say(text: string): void {
     const words = text.trim();
     if (!words) return;
-    this.queue.push(words);
+    this.pieces.push({ text: words, spoken: null });
+    this.lookAhead(this.generation);
     if (!this.active) void this.drain(this.generation);
   }
 
   /** Stop now and forget what was queued. */
   stop(): void {
     this.generation += 1;
-    this.queue = [];
-    this.controller?.abort();
-    this.controller = null;
+    // Audio fetched ahead is let go, so the daemon ends its upstream request.
+    for (const piece of this.pieces) {
+      void piece.spoken?.then((spoken) => {
+        if (spoken.kind === 'audio') void spoken.response.body?.cancel().catch(() => undefined);
+      });
+    }
+    this.pieces = [];
+    for (const controller of this.controllers) controller.abort();
+    this.controllers.clear();
     this.releaseAudio();
     try { window.speechSynthesis?.cancel(); } catch { /* not available */ }
     if (this.active) {
@@ -55,14 +77,31 @@ export class VoiceSpeaker {
     }
   }
 
+  private lookAhead(generation: number): void {
+    for (const piece of this.pieces.slice(0, LOOKAHEAD)) {
+      piece.spoken ??= this.request(piece.text, generation);
+    }
+  }
+
   private async drain(generation: number): Promise<void> {
     this.active = true;
     this.handlers.onSpeaking?.();
     while (generation === this.generation) {
-      const next = this.queue.shift();
-      if (next === undefined) break;
+      const piece = this.pieces.shift();
+      if (!piece) break;
+      this.lookAhead(generation);
+      const spoken = await (piece.spoken ?? this.request(piece.text, generation));
+      if (generation !== this.generation) return;
       try {
-        await this.speakOne(next, generation);
+        if (spoken.kind === 'audio') {
+          const body = spoken.response.body;
+          if (body && typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(MP3)) await this.playStream(body, generation);
+          else await this.playUrl(URL.createObjectURL(await spoken.response.blob()), generation);
+        } else if (spoken.kind === 'system') {
+          await this.sayWithSystemVoice(spoken.text, generation);
+        } else if (spoken.kind === 'error') {
+          this.handlers.onError?.(spoken.message);
+        }
       } catch (error) {
         if (generation !== this.generation) return;
         this.handlers.onError?.(error instanceof Error ? error.message : 'Could not speak the reply.');
@@ -76,36 +115,33 @@ export class VoiceSpeaker {
   /** One voice for the whole conversation: a failed request is tried once
    *  more in the same voice; the computer's own voice speaks only when there
    *  is no usable key at all. */
-  private async speakOne(text: string, generation: number, attempt = 0): Promise<void> {
+  private async request(text: string, generation: number, attempt = 0): Promise<Spoken> {
     const controller = new AbortController();
-    this.controller = controller;
-    const token = getAuthToken();
-    const res = await fetch(`/api/console/voice/speak${token ? `?token=${encodeURIComponent(token)}` : ''}`, {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text }),
-      signal: controller.signal,
-    });
-    if (generation !== this.generation) return;
-    if (!res.ok) {
+    this.controllers.add(controller);
+    try {
+      const token = getAuthToken();
+      const res = await fetch(`/api/console/voice/speak${token ? `?token=${encodeURIComponent(token)}` : ''}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text }),
+        signal: controller.signal,
+      });
+      if (res.ok) return { kind: 'audio', response: res };
       const payload = await res.json().catch(() => ({})) as { error?: string; fallback?: string; text?: string };
-      if (res.status === 400) return;
-      if (res.status === 409 && payload.fallback === 'system' && payload.text) {
-        await this.sayWithSystemVoice(payload.text, generation);
-        return;
-      }
+      if (res.status === 400) return { kind: 'skip' };
+      if (res.status === 409 && payload.fallback === 'system' && payload.text) return { kind: 'system', text: payload.text };
       if (attempt === 0 && generation === this.generation) {
         await new Promise((resolve) => setTimeout(resolve, 400));
-        if (generation === this.generation) await this.speakOne(text, generation, 1);
-        return;
+        if (generation === this.generation) return this.request(text, generation, 1);
       }
-      throw new Error(payload.error || 'Could not speak the reply.');
-    }
-    if (res.body && typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(MP3)) {
-      await this.playStream(res.body, generation);
-    } else {
-      await this.playUrl(URL.createObjectURL(await res.blob()), generation);
+      return { kind: 'error', message: payload.error || 'Could not speak the reply.' };
+    } catch (error) {
+      if (controller.signal.aborted || generation !== this.generation) return { kind: 'skip' };
+      if (attempt === 0) return this.request(text, generation, 1);
+      return { kind: 'error', message: error instanceof Error ? error.message : 'Could not speak the reply.' };
+    } finally {
+      this.controllers.delete(controller);
     }
   }
 
