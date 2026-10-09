@@ -272,6 +272,9 @@ export async function judgeWorkflowTarget(
   try {
     const verdict = await withJudgeTimeout('workflow_objective', () => judge(objectivePrompt, deliverable, (evidence || opts.reviewPolicy) ? {
       skills: [], fullSourceEvidence: Boolean(evidence), toolCallSummary: evidence?.summary ?? '',
+      // Unknown effects never acquire the read shortcut. The run-evidence
+      // reader derives this from exact settlements and current host artifacts.
+      reviewStakes: evidence?.reviewStakes ?? 'write',
       ...(evidence?.results ? { verifiedReadResults: evidence.results } : {}),
       ...(evidence?.evidence ? { evidence: evidence.evidence } : {}),
       ...(opts.reviewPolicy?.status === 'captured' ? { boundaryJudgeSelection: opts.reviewPolicy.judgeSelection } : {}),
@@ -280,7 +283,9 @@ export async function judgeWorkflowTarget(
       return { reached: true, judged: false, unavailable: true, gap: verdict?.reason ?? 'target judge timed out — accepting completion' };
     }
     const currentEvidence = opts.executionEvidence?.();
-    if (evidence?.summary !== currentEvidence?.summary) {
+    if (evidence?.summary !== currentEvidence?.summary
+      || evidence?.reviewStakes !== currentEvidence?.reviewStakes
+      || evidence?.reviewStakesDigest !== currentEvidence?.reviewStakesDigest) {
       return { reached: true, judged: false, unavailable: true, gap: 'workflow evidence changed during review — the verdict does not describe the current result' };
     }
     if (verdict.done && (evidence?.available === false || currentEvidence?.available === false)) {
