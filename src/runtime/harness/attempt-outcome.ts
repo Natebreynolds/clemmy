@@ -385,7 +385,9 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
     && !rejectedAtProviderLayer
     && !statusInTheDark
     && (signals.envelopeSuccessful === false
-      || signals.providerReportedError === true
+      // MCP's error flag on a remote server's reply; a tool Clem ran
+      // in-process keeps its own typed reading.
+      || (signals.providerReportedError === true && signals.hostExecuted !== true)
       || signals.providerAnsweredFailure === true
       || statusRefused)
   ) {

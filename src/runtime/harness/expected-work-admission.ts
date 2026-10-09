@@ -1,4 +1,5 @@
 import { reviewedFileCorrectionForCall, retainReviewedFileCorrection, staleReviewedReadCalls } from './reviewed-file-correction.js';
+import { isAnsweredRefusalStatus } from './attempt-outcome.js';
 /**
  * Fused action-topology admission.
  *
@@ -2018,7 +2019,7 @@ function priorRequirementAllowsAdmission(
   const rows = db.prepare(`
     SELECT b.tool_name, b.argument_digest, b.universe_item_id,
            b.logical_tool_call_id, l.state,
-           s.execution_kind, s.outcome_kind, s.outcome_detail, s.recovery_action, s.retry_same_candidate,
+           s.execution_kind, s.outcome_kind, s.outcome_detail, s.provider_status, s.recovery_action, s.retry_same_candidate,
            s.eliminates_candidate, s.requires_reconciliation,
            s.physical_crossing_count
       FROM expected_work_call_bindings b
@@ -2047,6 +2048,7 @@ function priorRequirementAllowsAdmission(
     execution_kind: string | null;
     outcome_kind: string | null;
     outcome_detail: string | null;
+    provider_status: string | null;
     recovery_action: string | null;
     retry_same_candidate: number | null;
     eliminates_candidate: number | null;
@@ -2188,11 +2190,14 @@ function priorRequirementAllowsAdmission(
     };
   }
   if (latest.outcome_kind === 'uncertain_write' || latest.requires_reconciliation === 1) {
-    // A provider (or command) that answered with its own refusal said why.
-    // One changed attempt may follow, never the same bytes, and the consent
-    // gate puts that change to the owner before it runs.
+    // An app that refused the request itself (a 4xx in its reply) said why
+    // and did not take it. One changed attempt may follow, never the same
+    // bytes, and the consent gate puts that change to the owner before it
+    // runs. A server failure or an unexplained "not successful" may have
+    // landed, so a second mutator still waits for reconciliation.
     const answeredRefusal = latest.outcome_kind === 'uncertain_write'
-      && latest.outcome_detail === 'provider_refused_envelope';
+      && latest.outcome_detail === 'provider_refused_envelope'
+      && isAnsweredRefusalStatus(latest.provider_status !== null ? Number(latest.provider_status) : undefined);
     if (answeredRefusal && !(latest.tool_name === currentTool && latest.argument_digest === currentArgumentDigest)) {
       return { ok: true };
     }
