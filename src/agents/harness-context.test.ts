@@ -107,7 +107,9 @@ test('stable rubric, turn authority, and externally-rendered Tool Memory occupy 
   assert.ok(at > 0);
   // The stable side is the rubric, then the memory core behind its own marker.
   const stable = splitStableMemoryCore(rendered.slice(0, at).trim());
-  assert.equal(stable.role, 'STABLE RUBRIC');
+  // This host's own facts (shell, platform) sit in the stable layer too.
+  const { renderHostExecutionContext } = await import('../runtime/host-execution-context.js');
+  assert.equal(stable.role, ['STABLE RUBRIC', renderHostExecutionContext()].filter(Boolean).join('\n\n'));
   assert.match(stable.memoryCore, /^# Persistent Context/);
   assert.equal(stable.memoryCore, renderMemoryCore().text, 'the stable side carries exactly the content-addressed core');
   const dynamic = rendered.slice(at + CACHE_BREAK_SENTINEL.length).trim();

@@ -13,14 +13,14 @@ test('Windows host facts identify the real shell, cross-drive cwd and computer c
   assert.match(text, /PowerShell syntax requires explicitly invoking PowerShell/);
   assert.match(text, /tool's cwd.*another drive/);
   assert.match(text, /does not imply arbitrary desktop mouse\/keyboard/);
-  assert.equal(renderHostExecutionContext('darwin'), '');
   assert.equal(renderHostExecutionContext('linux'), '');
 });
 
-test('the macOS shell guidance names its BSD tools, so commands are written for this machine', () => {
-  assert.match(shellCwdGuidance('darwin'), /^SHELL — this computer runs macOS: .*BSD command-line tools/);
+test('macOS host facts name the BSD tools, for every model and in the shell tool, so commands are written for this machine', () => {
+  assert.match(renderHostExecutionContext('darwin'), /^HOST EXECUTION — this connected computer runs macOS\. run_shell_command runs \/bin\/sh with the BSD command-line tools/);
+  assert.ok(shellCwdGuidance('darwin').startsWith(renderHostExecutionContext('darwin')));
   assert.doesNotMatch(shellCwdGuidance('win32'), /BSD/);
-  assert.doesNotMatch(shellCwdGuidance('linux'), /^SHELL/);
+  assert.doesNotMatch(shellCwdGuidance('linux'), /^HOST EXECUTION/);
 });
 
 test('the live tool definition carries current-host guidance and Windows permission errors get Windows remedies', async () => {
