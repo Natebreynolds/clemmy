@@ -1429,7 +1429,11 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
         "img-src 'self' data: https:",
         "script-src 'self' 'unsafe-inline'",
         "style-src 'self' 'unsafe-inline'",
-        "connect-src 'self' https://api.openai.com wss://api.openai.com",
+        // Voice mode plays Clem's spoken reply from a same-origin stream
+        // through a blob: URL (MediaSource); without this the audio is
+        // refused by default-src and nothing is heard.
+        "media-src 'self' blob:",
+        "connect-src 'self'",
       ].join('; '),
     );
     next();

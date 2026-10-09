@@ -16903,7 +16903,7 @@ export function registerConsoleRoutes(
     try {
       await fs.promises.writeFile(tmp, bytes);
       try {
-        const local = await (opts?.voiceTranscriptionRuntime?.transcribeLocal ?? transcribeLocalMeetingAudio)({ audioPath: tmp });
+        const local = await (opts?.voiceTranscriptionRuntime?.transcribeLocal ?? transcribeLocalMeetingAudio)({ audioPath: tmp, suppressNonSpeech: true });
         res.json({ text: (local.text || '').trim(), engine: 'local' });
         return;
       } catch (localErr) {

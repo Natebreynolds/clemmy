@@ -17,7 +17,7 @@
 import { useSyncExternalStore } from 'react';
 import { NotchVoice } from './notch-voice';
 import { VoiceSpeaker } from './voice-speaker';
-import { voiceBaseline, voiceTurnEnded, voiceTurnRunning, voiceUtterances, type VoiceChatMessage } from './voice-turns';
+import { spokenWords, voiceBaseline, voiceTurnEnded, voiceTurnRunning, voiceUtterances, type VoiceChatMessage } from './voice-turns';
 
 export type VoicePhase = 'off' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
 
@@ -177,7 +177,7 @@ class VoiceModeController {
 
   private async heardUtterance(text: string): Promise<void> {
     this.closeMic();
-    const words = text.trim();
+    const words = spokenWords(text);
     if (!words || !this.send) { void this.listen(); return; }
     // Spoken while a turn still runs, the words steer that turn: its answer
     // ends this one. Otherwise the answer comes after what is on screen.

@@ -113,6 +113,8 @@ export interface TranscribeLocalMeetingAudioInput {
   durationSeconds?: number;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** Words only: no non-speech tokens ([MUSIC], [SOUND]) for spoken input. */
+  suppressNonSpeech?: boolean;
 }
 
 export interface LocalTranscriptionRuntimeStatus {
@@ -1222,6 +1224,7 @@ export async function transcribeLocalMeetingAudio(
       '--output-json',
       '--output-file', outputPrefix,
       '--no-prints',
+      ...(input.suppressNonSpeech ? ['--suppress-nst'] : []),
     ], { signal: input.signal, timeoutMs });
     const parsed = await readWhisperOutput(outputPath);
     return { ...parsed, model, language: parsed.language ?? language };

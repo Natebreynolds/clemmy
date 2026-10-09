@@ -3767,7 +3767,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       await fsp.writeFile(tmp, bytes);
       const { LocalWhisperRuntimeError, transcribeLocalMeetingAudio } = await import('../integrations/local-meetings/whisper-runtime.js');
       try {
-        const local = await (deps.voiceTranscriptionRuntime?.transcribeLocal ?? transcribeLocalMeetingAudio)({ audioPath: tmp });
+        const local = await (deps.voiceTranscriptionRuntime?.transcribeLocal ?? transcribeLocalMeetingAudio)({ audioPath: tmp, suppressNonSpeech: true });
         res.json({ text: (local.text || '').trim(), engine: 'local' });
         return;
       } catch (localErr) {

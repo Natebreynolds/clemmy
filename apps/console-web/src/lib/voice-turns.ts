@@ -63,3 +63,16 @@ export function voiceBaseline(messages: readonly VoiceChatMessage[], awaitingTur
   const lastOwner = messages.map((message) => message.role === 'user').lastIndexOf(true);
   return { seen: new Set(messages.slice(0, lastOwner + 1).map((message) => message.id)), turnFrom: lastOwner + 1 };
 }
+
+/** What the owner said, without the transcriber's own markup for sounds that
+ *  are not words: "[SOUND]", "(upbeat music)", "*chuckles*". Empty when that
+ *  markup is all there was, so background noise never becomes a message. */
+export function spokenWords(transcript: string): string {
+  const words = (transcript ?? '')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\*[^*]*\*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return /[\p{L}\p{N}]/u.test(words) ? words : '';
+}
