@@ -2018,7 +2018,7 @@ function priorRequirementAllowsAdmission(
   const rows = db.prepare(`
     SELECT b.tool_name, b.argument_digest, b.universe_item_id,
            b.logical_tool_call_id, l.state,
-           s.execution_kind, s.outcome_kind, s.recovery_action, s.retry_same_candidate,
+           s.execution_kind, s.outcome_kind, s.outcome_detail, s.recovery_action, s.retry_same_candidate,
            s.eliminates_candidate, s.requires_reconciliation,
            s.physical_crossing_count
       FROM expected_work_call_bindings b
@@ -2046,6 +2046,7 @@ function priorRequirementAllowsAdmission(
     state: string;
     execution_kind: string | null;
     outcome_kind: string | null;
+    outcome_detail: string | null;
     recovery_action: string | null;
     retry_same_candidate: number | null;
     eliminates_candidate: number | null;
@@ -2187,7 +2188,21 @@ function priorRequirementAllowsAdmission(
     };
   }
   if (latest.outcome_kind === 'uncertain_write' || latest.requires_reconciliation === 1) {
-    return { ok: false, refusalKind: 'work_effect_already_executed', reason: 'an uncertain mutation must be reconciled before any retry' };
+    // A provider (or command) that answered with its own refusal said why.
+    // One changed attempt may follow, never the same bytes, and the consent
+    // gate puts that change to the owner before it runs.
+    const answeredRefusal = latest.outcome_kind === 'uncertain_write'
+      && latest.outcome_detail === 'provider_refused_envelope';
+    if (answeredRefusal && !(latest.tool_name === currentTool && latest.argument_digest === currentArgumentDigest)) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      refusalKind: 'work_effect_already_executed',
+      reason: answeredRefusal
+        ? 'the provider refused this exact request; change what it refused before trying again'
+        : 'an uncertain mutation must be reconciled before any retry',
+    };
   }
   // An unknown read is not an ambiguous write or a completed requirement.
   // Let the model recover the same read; ordinary progress accounting still

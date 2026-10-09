@@ -723,3 +723,68 @@ for (const fixture of [
     `send must wait on the unverified doc, not die as already-executed: ${JSON.stringify(send).slice(0, 250)}`,
   );
 });
+
+test('a write the app refused in its reply admits one changed attempt, never the same bytes; the dark admits none', () => {
+  // Owner 2026-10-09: on a refusal Clem decides what has to change; the
+  // changed write is admitted here and put to the owner at the consent gate.
+  for (const answered of [true, false]) {
+    const task = accept(LIVE_PROMPT);
+    hostFreezeLiveChain(task);
+    for (const id of ['n5:retrieve', 'n6:retrieve']) {
+      settleUnboundRead({
+        task,
+        id: `comp:${serial}:${answered ? 'a' : 'd'}:${id.replace(/[^a-z0-9]/gi, '')}`,
+        tool: 'FIRECRAWL_SEARCH',
+        payload: { successful: true, data: { web: [{ title: 'Firm A', url: 'https://example.com/a' }] } },
+        requirementId: id,
+      });
+    }
+    const tool = 'GOOGLESHEETS_SHEET_FROM_JSON';
+    const firstInner = { title: 'PI Lawyer Prospects', sheet_name: 'Prospects', sheet_json: [{ name: 'Firm A' }] };
+    const carrier = (inner: Record<string, unknown>) => ({ tool_slug: tool, arguments: JSON.stringify(inner) });
+    const admit = (label: string, inner: Record<string, unknown>) => {
+      const callId = `logical:write:${serial}:${answered ? 'answered' : 'dark'}:${label}`;
+      assert.ok(['inserted', 'existing'].includes(dispatch.admitLogicalCall({
+        identity: { ...task, logicalToolCallId: callId }, tool: 'composio_execute_tool', args: carrier(inner),
+      }).status));
+      return {
+        callId,
+        result: admission.admitExpectedWorkInvocation({
+          sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq,
+          logicalToolCallId: callId, proposal: null, requirementId: 'n7:execute',
+          universeItemId: null, universeSelector: null,
+          tool: 'composio_execute_tool', args: carrier(inner),
+        }),
+      };
+    };
+    const first = admit('first', firstInner);
+    assert.equal(first.result.status, 'bound', JSON.stringify(first.result).slice(0, 240));
+    const begun = dispatch.beginPhysicalDispatch({
+      identity: { ...task, logicalToolCallId: first.callId, physicalDispatchId: `dispatch:refused:${serial}:${answered}`, ordinal: 0 },
+      tool, args: firstInner,
+    });
+    assert.equal(begun.status, 'inserted');
+    assert.equal(dispatch.settlePhysicalDispatch({
+      identity: begun.status === 'inserted' ? begun.identity : (null as never), tool, outcome: 'returned',
+    }).status, 'inserted');
+    const settled = settlements.commitLogicalCallSettlement({
+      identity: { ...task, logicalToolCallId: first.callId },
+      contract: { toolName: tool, args: firstInner },
+      execution: { kind: 'provider_execution' },
+      result: { payload: { successful: false, error: 'Invalid request data provided', data: { status_code: 400 } } },
+      outcome: outcomes.classifyAttemptOutcome(answered
+        ? { mutating: true, envelopeSuccessful: false, httpStatus: 400 }
+        : { mutating: true, acknowledged: false }),
+      recovery: { businessCall: true, mutating: true },
+      observer: { lane: 'composio', turn: task.turn },
+    });
+    assert.equal(settled.status, 'committed', JSON.stringify(settled).slice(0, 200));
+    const refusedKind = (result: unknown) => (result as { status?: string; kind?: string }).status === 'refused'
+      ? (result as { kind?: string }).kind : (result as { status?: string }).status;
+    const same = admit('same', firstInner);
+    assert.equal(refusedKind(same.result), 'work_effect_already_executed', `${answered}: the refused bytes never run again`);
+    const changed = admit('changed', { ...firstInner, sheet_json: [{ name: 'Firm A', email: 'a@x.com' }] });
+    assert.equal(answered ? changed.result.status : refusedKind(changed.result), answered ? 'bound' : 'work_effect_already_executed',
+      `${answered ? 'an answered refusal admits a changed attempt' : 'the dark admits nothing until reconciled'}: ${JSON.stringify(changed.result).slice(0, 240)}`);
+  }
+});

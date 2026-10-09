@@ -1945,7 +1945,7 @@ test('a write the provider answered with its own refusal is a known terminal the
     assert.match(projected.consequence?.stage ?? '', /^execution:provider_refused:/);
     assert.equal(projected.consequence?.recovery, 'repair_model');
     assert.equal(projected.consequence?.effectState, 'known_terminal');
-    assert.deepEqual(projected.consequence?.recoveryToolNames, ['mcp__fixture__delete', 'tool_search']);
+    assert.deepEqual(projected.consequence?.recoveryToolNames, ['ask_user_question', 'mcp__fixture__delete', 'tool_search']);
   }
   db.close();
 });

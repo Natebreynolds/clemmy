@@ -129,3 +129,10 @@ test('the check judges against what the owner wants now: a later message replace
   assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /A later message changes or replaces what an earlier one asked/);
   assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /not a conflict with the earlier request/);
 });
+
+test('after a refusal in the same turn the checker is told to say what was refused and what changed', () => {
+  // Owner 2026-10-09: a change of plan after an app said no is put to the
+  // owner; the card's why carries the refusal and the change.
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /"refusedEarlier"/);
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /what the app refused and what this attempt changes/);
+});

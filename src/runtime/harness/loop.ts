@@ -1713,13 +1713,26 @@ export const PROVIDER_REFUSAL_ANSWER_STEER = [
   'Do not call tools now. In your own voice, tell the user what you tried, what the provider said, and what that means for what they asked (for example: the item was already gone, so there was nothing to delete). Do not propose workarounds that depend on tools, accounts or facts you have not verified in this conversation. Ask a question only if a decision from them is genuinely required. Keep it short.',
 ].join('\n\n');
 
+/**
+ * THE APP SAID NO TO A WRITE; PROPOSE THE CHANGE. A write the app refused in
+ * its own reply (the `execution:provider_refused` stage) is not proven to
+ * have changed nothing, and the way forward is a change of plan, which is
+ * the owner's call (owner 2026-10-09: a draft's attachment was refused three
+ * times and the turn ended on a reconciliation block, never asking).
+ */
+export const PROVIDER_REFUSAL_REPLAN_STEER = [
+  'The app you were writing to refused the request; its reply is in the tool result you already have. The refused request is not resent on its own.',
+  'Do not call tools now. In your own voice, tell the user what you tried, what the app said, and what you would change to get it done: a corrected request, a different way, or the one detail only they can give (for example which file or which recipient). Ask whether to go ahead with that change. Do not propose changes that depend on tools, accounts or facts you have not verified in this conversation. Keep it short.',
+].join('\n\n');
+
 /** The steer for a no-progress check-in follows the kind of stop: a provider
- * refusal is answered; every other exhaustion is explained and, if a real
- * missing fact blocks it, asked about. */
+ * refusal is answered; a refused write proposes its change; every other
+ * exhaustion is explained and, if a real missing fact blocks it, asked about. */
 export function noProgressCheckInSteerFor(blockedDetail: string | undefined): string {
-  return typeof blockedDetail === 'string' && blockedDetail.startsWith('execution:invalid_arguments')
-    ? PROVIDER_REFUSAL_ANSWER_STEER
-    : NO_PROGRESS_CHECK_IN_STEER;
+  if (typeof blockedDetail !== 'string') return NO_PROGRESS_CHECK_IN_STEER;
+  if (blockedDetail.startsWith('execution:invalid_arguments')) return PROVIDER_REFUSAL_ANSWER_STEER;
+  if (blockedDetail.startsWith('execution:provider_refused')) return PROVIDER_REFUSAL_REPLAN_STEER;
+  return NO_PROGRESS_CHECK_IN_STEER;
 }
 
 /**

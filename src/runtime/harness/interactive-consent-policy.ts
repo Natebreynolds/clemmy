@@ -288,6 +288,9 @@ export interface EvaluateInteractiveConsentInputV1 {
   learnedExternalWrite?: boolean;
   /** The call runs inside a published workflow's step session. */
   workflowApproval?: boolean;
+  /** A provider (or command) refused a write earlier in this same turn, so
+   * this call is a change of plan. */
+  afterAnsweredRefusal?: boolean;
 }
 
 function sameDestination(
@@ -518,6 +521,19 @@ export function evaluateInteractiveConsentV1(
       basis: 'workflow_approval',
       authorityDigest: input.coverage.requirementDigest,
       reservationKey: input.coverage.reservationKey,
+    };
+  }
+
+  // A change of plan after a refusal is the owner's call. The provider said
+  // no and why; Clem decides what has to change and the changed write waits
+  // for the owner, in Auto as in Ask and whatever kind was learned before
+  // (owner 2026-10-09). It teaches nothing: the approval covers this change.
+  if (input.afterAnsweredRefusal && (call.effect === 'external_write' || call.effect === 'admin')) {
+    return {
+      kind: 'needs_user',
+      need: 'approval',
+      subjectDigest: call.bindingDigest,
+      reason: 'An earlier write in this turn was refused by the app it went to; this changed attempt waits for the owner.',
     };
   }
 

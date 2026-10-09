@@ -24,6 +24,17 @@ test('a provider-refusal stop is steered to deliver the provider answer', () => 
   assert.equal(loop.noProgressCheckInSteerFor('execution:invalid_arguments'), loop.PROVIDER_REFUSAL_ANSWER_STEER);
 });
 
+test('a write the app refused is steered to propose the change and ask before doing it', () => {
+  // Owner 2026-10-09: on a refusal Clem decides what has to change and asks.
+  const steer = loop.noProgressCheckInSteerFor('execution:provider_refused:request:0123456789abcdef');
+  assert.equal(steer, loop.PROVIDER_REFUSAL_REPLAN_STEER);
+  assert.match(steer, /Do not call tools now/);
+  assert.match(steer, /what the app said/);
+  assert.match(steer, /what you would change/);
+  assert.match(steer, /Ask whether to go ahead/);
+  assert.doesNotMatch(steer, /nothing was changed/i, 'a refused write is not proven to have changed nothing');
+});
+
 test('every other exhaustion keeps the explain-and-ask check-in', () => {
   for (const detail of [undefined, '', 'repeated_refused_frame', 'schema_invalid:call:0123456789abcdef', 'execution:transient']) {
     assert.equal(loop.noProgressCheckInSteerFor(detail), loop.NO_PROGRESS_CHECK_IN_STEER, String(detail));

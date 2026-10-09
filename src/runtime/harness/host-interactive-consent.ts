@@ -74,6 +74,7 @@ import {
 import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
 import { hasApprovedWriteKind, recordApprovedWriteKind, approvedWriteKindsForTestsMode } from '../../agents/plan-scope.js';
 import { ownerRunsInAutoMode } from './worker-lead-authority.js';
+import { answeredRefusalsInTurn } from './turn-answered-refusals.js';
 import {
   loadHostCallCapabilityBinding,
   hostCallCapabilityBindingMatchesAttestation,
@@ -385,7 +386,7 @@ function mintHostConsentGrantAdmission(input: {
   consentSubject: HostInteractiveConsentSubjectV1;
   durableApproval: NonNullable<Parameters<typeof evaluatePreparedHostWorkCallConsent>[0]['durableApproval']>;
   userGrant: ExactUserGrantV1;
-  consentMode?: { mode: 'auto' | 'ask'; learnedExternalWrite: boolean; workflowApproval?: boolean };
+  consentMode?: { mode: 'auto' | 'ask'; learnedExternalWrite: boolean; workflowApproval?: boolean; afterAnsweredRefusal?: boolean };
 }): HostConsentGrantAdmissionV1 | null {
   try {
     if (
@@ -432,7 +433,11 @@ function mintHostConsentGrantAdmission(input: {
       || input.consentSubject.coverageDigest !== digest(input.coverage)
       || input.consentSubject.riskDigest !== digest(input.call.risk)
     ) return null;
-    const consentMode = input.consentMode ?? consentModeForCall(input.call, { sessionId: prepared.sessionId });
+    const consentMode = input.consentMode ?? consentModeForCall(input.call, {
+      sessionId: prepared.sessionId,
+      sourceUserSeq: prepared.sourceUserSeq,
+      logicalToolCallId: prepared.logicalToolCallId,
+    });
     const currentUngrantedDecision = evaluateInteractiveConsentV1({
       call: input.call,
       coverage: input.coverage,
@@ -1173,9 +1178,9 @@ export { ownerRunsInAutoMode };
  */
 function consentModeForCall(
   call: CapabilityRiskAttestationV1,
-  identity: { sessionId: string },
+  identity: { sessionId: string; sourceUserSeq?: number; logicalToolCallId?: string },
   learnedApplies?: boolean,
-): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean; workflowApproval?: boolean } {
+): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean; workflowApproval?: boolean; afterAnsweredRefusal?: boolean } {
   const mode: 'auto' | 'ask' = ownerRunsInAutoMode() ? 'auto' : 'ask';
   // A connected-app change asks the first time in both modes (owner
   // 2026-10-06), so what was learned is read in Auto too; otherwise every
@@ -1194,7 +1199,16 @@ function consentModeForCall(
   // this change; a sure "not requested" keeps the card. Unavailable or unsure
   // keeps the learned kind, so a Jev outage never adds cards.
   if (learned && learnedApplies === false) learned = false;
-  return { mode, learnedExternalWrite: learned };
+  // A provider refused a write earlier in this turn: whatever comes next is a
+  // change of plan, and that is the owner's call, in Auto as in Ask (owner
+  // 2026-10-09: on a refusal Clem decides what has to change, then asks).
+  const afterAnsweredRefusal = typeof identity.sourceUserSeq === 'number'
+    && answeredRefusalsInTurn({
+      sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq,
+      ...(identity.logicalToolCallId ? { exceptLogicalToolCallId: identity.logicalToolCallId } : {}),
+    }).length > 0;
+  return { mode, learnedExternalWrite: learned, ...(afterAnsweredRefusal ? { afterAnsweredRefusal: true } : {}) };
 }
 
 /** Was this exact change part of what the owner asked for? Only consulted
@@ -1717,7 +1731,11 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       sessionId: attestation.sessionId,
       sourceUserSeq: attestation.sourceUserSeq,
     }),
-    ...consentModeForCall(call, { sessionId: attestation.sessionId }, await learnedKindAppliesToRequest({
+    ...consentModeForCall(call, {
+      sessionId: attestation.sessionId,
+      sourceUserSeq: attestation.sourceUserSeq,
+      logicalToolCallId: attestation.logicalToolCallId,
+    }, await learnedKindAppliesToRequest({
       sessionId: attestation.sessionId, sourceUserSeq: attestation.sourceUserSeq, call, args: input.args,
     })),
   });

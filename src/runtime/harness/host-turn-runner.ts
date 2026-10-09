@@ -1501,6 +1501,18 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
       ].join(' ');
     }
   }
+  if (consequence.stage.startsWith('execution:provider_refused')) {
+    const carrier = consequence.recoveryToolNames.find((name) => name !== 'tool_search' && name !== 'ask_user_question');
+    // The app answered and said no. Nothing reruns on its own; Clem reads
+    // the reply, decides what has to change, and the changed write waits for
+    // the owner at the consent gate, whatever carried the call.
+    return [
+      'The last write reached the app it was meant for and the app refused it; its reply is in the result. Nothing reruns on its own.',
+      `If the refused request could have landed in part, first check the target through ${carrier ?? 'the same carrier'}.`,
+      'Then decide what has to change: corrected arguments for the same call, a different capability (tool_search once), or a question only the owner can answer (ask_user_question, for example which file or which recipient was meant).',
+      'A changed write is shown to the owner for approval before it runs, with what the app refused and what you changed; never resend the refused request unchanged. If the request cannot succeed as asked, call nothing and tell the owner what the app said and what it means.',
+    ].join(' ');
+  }
   return [
     `BOUNDED AUTO RECOVERY — the host validated consequence stage ${consequence.stage}.`,
     'Use retained results and the available recovery tools to correct the call or resolve another unfinished requirement.',

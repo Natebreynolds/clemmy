@@ -1203,7 +1203,10 @@ function settlementConsequence(input: {
   // reconciliation (the settlement's directive says so). The model reads the
   // target and answers; it may repair the request once within its authority.
   // Live 2026-10-07: a Slack `not_found` on an approved delete ended the turn
-  // "its effect must be reconciled" from this very consequence.
+  // "its effect must be reconciled" from this very consequence. A change of
+  // plan may need something only the owner knows (which file, which
+  // recipient), so the question is on the surface too; the changed write
+  // itself waits for the owner at the consent gate.
   const answeredRefusal = settlement.outcome_kind === 'uncertain_write'
     && settlement.outcome_detail === 'provider_refused_envelope';
   if (answeredRefusal) {
@@ -1211,7 +1214,7 @@ function settlementConsequence(input: {
       stage: `execution:provider_refused:${providerRefusedRequestIdentity(call)}`,
       recovery: 'repair_model',
       effectState: 'known_terminal',
-      recoveryToolNames: [call.name, 'tool_search'],
+      recoveryToolNames: [call.name, 'tool_search', 'ask_user_question'],
     });
   }
   if (

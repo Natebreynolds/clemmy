@@ -414,6 +414,29 @@ test('a published workflow\'s run proceeds on the workflow\'s approval for any e
   assert.equal(evaluateInteractiveConsentV1(input(send)).kind, 'needs_user');
 });
 
+test('a write that follows a refused write in the same turn asks the owner, in Auto and on a learned kind, and teaches nothing', () => {
+  // Owner 2026-10-09: when an app refuses a write mid-turn, Clem decides what
+  // has to change and the changed write is put to the owner, whatever lane.
+  const draft = call({ effect: 'external_write', accountId: 'selected-account',
+    risk: { reversibility: 'ordinary_non_destructive', consequence: 'create', destructive: false },
+    semanticBasis: { kind: 'current_external_definition', digest: digest('8') } });
+  for (const mode of ['auto', 'ask'] as const) {
+    assert.equal(evaluateInteractiveConsentV1(input(draft, { mode, learnedExternalWrite: true })).kind, 'proceed', `${mode}: a learned kind runs`);
+    const decision = evaluateInteractiveConsentV1(input(draft, { mode, learnedExternalWrite: true, afterAnsweredRefusal: true }));
+    assert.equal(decision.kind, 'needs_user', `${mode}: after a refusal it asks`);
+    assert.equal((decision as { need?: string }).need, 'approval');
+    assert.equal((decision as { teaches?: string }).teaches, undefined, 'approving a change of plan teaches no kind');
+  }
+  // The owner's yes to that exact change proceeds as their grant.
+  assert.equal((evaluateInteractiveConsentV1(input(draft, { learnedExternalWrite: true, afterAnsweredRefusal: true, userGrant: grant(draft) })) as { basis?: string }).basis, 'exact_user_grant');
+  // Local work and reads never ask on account of an app's refusal.
+  const local = call({ effect: 'local_write', accountId: null, risk: { reversibility: 'reversible', consequence: 'update', destructive: false },
+    semanticBasis: { kind: 'local_registry', digest: digest('e') } });
+  assert.notEqual(evaluateInteractiveConsentV1(input(local, { afterAnsweredRefusal: true })).kind, 'needs_user');
+  // A published workflow keeps running on its own approval.
+  assert.equal((evaluateInteractiveConsentV1(input(draft, { workflowApproval: true, afterAnsweredRefusal: true })) as { basis?: string }).basis, 'workflow_approval');
+});
+
 test('an exact destructive, irreversible local change always asks the owner, in Auto and Ask, and never runs as a planning probe', () => {
   // Live 10-02: a workflow delete the owner asked for now reaches consent;
   // what consent does with it is this: one exact approval, nothing silent.
