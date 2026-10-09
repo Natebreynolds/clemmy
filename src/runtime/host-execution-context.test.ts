@@ -25,6 +25,9 @@ test('macOS host facts name the BSD tools, for every model and in the shell tool
   assert.match(renderHostExecutionContext('darwin'), /mdfind -name/);
   assert.match(shellCwdGuidance('darwin'), /mdfind -name/);
   assert.doesNotMatch(renderHostExecutionContext('win32'), /mdfind/);
+  // Windows has no instant index command; a search stays inside one folder.
+  assert.match(renderHostExecutionContext('win32'), /dir \/s \/b "%USERPROFILE%\\Downloads\\\*name\*"/);
+  assert.match(shellCwdGuidance('win32'), /search one folder rather than the whole drive/);
 });
 
 test('the live tool definition carries current-host guidance and Windows permission errors get Windows remedies', async () => {
