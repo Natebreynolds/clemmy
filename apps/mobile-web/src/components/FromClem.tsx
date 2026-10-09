@@ -60,8 +60,8 @@ export function FromClem({ data, onChanged, onOpenThread }: {
       setBusy(null);
     }
   };
-  const reply = (row: FromClemRow, text: string, decision?: Decision) =>
-    run(row, async () => outcomeText(await replyFromClem(row.key, text, row.voiceDigest, decision)));
+  const reply = (row: FromClemRow, text: string, decision?: Decision, choiceIndex?: number) =>
+    run(row, async () => outcomeText(await replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex)));
 
   const meta = (row: FromClemRow) => (
     <div class="home-row-note">{row.heartbeatTitle} · {relativeTime(row.at)}</div>
@@ -98,7 +98,7 @@ export function FromClem({ data, onChanged, onOpenThread }: {
           <div class="home-row-actions">
             {(row.choices ?? []).map((choice, index) => (
               <button key={choice} type="button" class={index === 0 ? 'home-btn home-btn-primary' : 'home-btn'} disabled={busy !== null}
-                onClick={() => void reply(row, choice)}>{choice}</button>
+                onClick={() => void reply(row, choice, undefined, index)}>{choice}</button>
             ))}
             {!row.choices?.length && row.answer?.kind === 'yes_no' ? (
               <>

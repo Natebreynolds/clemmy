@@ -2125,11 +2125,12 @@ export async function getFromClem(): Promise<FromClem> {
 /** One reply, one id: a retried send is the same answer. A button whose
  *  meaning is fixed carries its decision. */
 export async function replyFromClem(
-  key: string, text: string, voiceDigest?: string, decision?: 'do_it' | 'done' | 'not_now' | 'never',
+  key: string, text: string, voiceDigest?: string, decision?: 'do_it' | 'done' | 'not_now' | 'never', choiceIndex?: number,
 ): Promise<FromClemReplyOutcome> {
   const random = globalThis.crypto?.randomUUID?.();
   const requestId = random ? random.replace(/-/g, '') : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
   return api('/m/api/home/from-clem/reply', { method: 'POST', body: JSON.stringify({
     key, text, requestId, ...(voiceDigest ? { voiceDigest } : {}), ...(decision ? { decision } : {}),
+    ...(typeof choiceIndex === 'number' ? { choiceIndex } : {}),
   }) });
 }

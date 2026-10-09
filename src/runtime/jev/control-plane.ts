@@ -607,6 +607,60 @@ export async function classifyRequestedExternalWriteWithJev(
   return { kind, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
 }
 
+export type OwnerChoiceCallKind = 'exact' | 'adds_content' | 'different';
+
+export interface OwnerChoiceCallReading {
+  kind: OwnerChoiceCallKind | null;
+  confidence?: number;
+  failedOpen: boolean;
+}
+
+const OWNER_CHOICE_TIMEOUT_MS = 3_000;
+
+/**
+ * The owner tapped one of the choices Clem offered on a Home card. Is the
+ * change Clem is about to make exactly that choice, on that item, with
+ * nothing the card did not show? A sure "exact" lets the tap stand as the
+ * owner's approval (owner 2026-10-09); anything else asks as before.
+ */
+export async function classifyOwnerChoiceCallWithJev(
+  input: { offered: string; item: string; tapped: string; change: string },
+  opts: { timeoutMs?: number; sessionId?: string } = {},
+): Promise<OwnerChoiceCallReading> {
+  const result = await evaluateSystemOne({
+    state: {
+      clemOffered: clipMiddle(input.offered.trim(), 1_200).text,
+      itemFacts: clipMiddle(input.item.trim(), 1_500).text,
+      ownerTapped: clipMiddle(input.tapped.trim(), 200).text,
+      clemIsAboutTo: clipMiddle(input.change.trim(), 1_500).text,
+    },
+    questions: {
+      covers: {
+        type: 'choice',
+        instructions: 'Clem offered the owner choices about one item and the owner tapped one. Is the change Clem is about to make exactly what the tapped choice says, on that same item?',
+        criteria: {
+          exact: 'Yes — exactly the tapped choice, on this item and account, with nothing the card did not show.',
+          adds_content: 'It also sends or writes something the card never showed the owner: a message, a comment, a body, new times or recipients.',
+          different: 'It is a different action, or a different item or account.',
+          none: 'Not sure.',
+        },
+      },
+    },
+    timeoutMs: Math.min(OWNER_CHOICE_TIMEOUT_MS, opts.timeoutMs ?? OWNER_CHOICE_TIMEOUT_MS),
+    sessionId: opts.sessionId,
+    channel: 'jev-owner-choice',
+  });
+  if (!result.ok) return { kind: null, failedOpen: true };
+  const answer = result.answers.covers as ChoiceAnswer | undefined;
+  const kind = answer && ['exact', 'adds_content', 'different'].includes(answer.choice)
+    ? answer.choice as OwnerChoiceCallKind
+    : null;
+  noteJevDecisionOutcome(result.decisionId, kind ?? 'none', {
+    ...(answer ? { choice: answer.choice, confidence: answer.confidence } : {}),
+  });
+  return { kind, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
+}
+
 /** A card that names the wrong person is worse than one that shows the id,
  *  so the host shows a name only when Jev is sure of it. */
 export const APPROVAL_LABEL_SURE = 0.8;

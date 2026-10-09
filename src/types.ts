@@ -310,6 +310,10 @@ export interface TaskContinuationContext {
 }
 
 export interface AssistantRequest {
+  /** A one-time token for a choice the owner tapped on Home, minted by the
+   * From Clem reply path and redeemed once by the bridge into the accepted
+   * source's own event. Any other value is nothing. */
+  ownerChoiceToken?: string;
   /** Facts the harness knows about this turn that the model should read
    * (a card the owner just declined, nothing pending). Transient system
    * context: never the owner's words, never a reply the harness authored. */

@@ -47,6 +47,20 @@ export interface FromClemRow {
   run?: { runId: string; workflow?: string };
   /** Words Clem already wrote for the owner (a report); said as they are. */
   authored?: boolean;
+  /** Identifiers the item is about (a calendar event, an account), from the
+   * record's own metadata: what a tapped choice acts on. */
+  ref?: Record<string, string>;
+}
+
+/** The identifiers a notification is about, from the metadata its heartbeat wrote. */
+function refOf(metadata: Record<string, unknown> | undefined): Record<string, string> | undefined {
+  if (!metadata) return undefined;
+  const ref: Record<string, string> = {};
+  for (const key of ['eventId', 'connectionId', 'accountId', 'provider', 'itemKey']) {
+    const value = metadata[key];
+    if (typeof value === 'string' && value.trim()) ref[key] = value.trim().slice(0, 400);
+  }
+  return Object.keys(ref).length > 0 ? ref : undefined;
 }
 
 export interface FromClemPulse {
@@ -160,11 +174,13 @@ export function buildFromClem(input: FromClemInput): FromClem {
     }
     const heartbeat = heartbeatOf(notification);
     if (!heartbeat) continue;
+    const ref = refOf(notification.metadata as Record<string, unknown> | undefined);
     rows.push({
       key: `notif:${notification.id}`, heartbeat, heartbeatTitle: title(heartbeat),
       at: notification.createdAt, asks: input.asksOwner(notification), text: notification.title,
       ...(notification.body.trim() ? { detail: notification.body.trim() } : {}),
       done: { notificationId: notification.id },
+      ...(ref ? { ref } : {}),
     });
     covers.notificationIds.push(notification.id);
   }

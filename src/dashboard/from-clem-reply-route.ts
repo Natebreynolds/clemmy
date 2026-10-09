@@ -24,6 +24,8 @@ export async function handleFromClemReply(
   const requestId = typeof input.requestId === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(input.requestId) ? input.requestId : undefined;
   const seenDigest = typeof input.voiceDigest === 'string' ? input.voiceDigest.slice(0, 64) : undefined;
   const decision = (['do_it', 'done', 'not_now', 'never'] as const).find((value) => value === input.decision);
+  const choiceIndex = Number.isInteger(input.choiceIndex) && (input.choiceIndex as number) >= 0 && (input.choiceIndex as number) < 8
+    ? input.choiceIndex as number : undefined;
   const [
     { readFromClem, replyToFromClem, startFromClemTurn, moveFromClemRowToLater },
     { addRule, HEARTBEAT_IDS },
@@ -68,6 +70,7 @@ export async function handleFromClemReply(
     snoozePlan: (planProposalId) => { void snoozeHomeItem(`plan:${planProposalId}`, DEFAULT_SNOOZE_HOURS); },
     later: (rowKey, forever) => moveFromClemRowToLater(rowKey, Date.now(), forever),
     startTurn: (turn) => startFromClemTurn(turn),
-  }, { ...(requestId ? { requestId } : {}), ...(seenDigest ? { seenDigest } : {}), ...(decision ? { decision } : {}) });
+  }, { ...(requestId ? { requestId } : {}), ...(seenDigest ? { seenDigest } : {}), ...(decision ? { decision } : {}),
+    ...(choiceIndex !== undefined ? { choiceIndex } : {}) });
   return { status: 200, json: result };
 }

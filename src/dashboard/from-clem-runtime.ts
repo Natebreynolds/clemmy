@@ -20,6 +20,7 @@ import { needsYouReferents, notificationNeedsYou } from './needs-you.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import { appendEvent, getSession, listEvents, updateSession } from '../runtime/harness/eventlog.js';
+import { mintOwnerChoiceToken } from '../runtime/harness/owner-choice.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { withOwnModelRequestAttribution } from '../runtime/usage-log.js';
 
@@ -372,7 +373,7 @@ export function startFromClemVoice(): { stop: () => void } {
 
 // ── the owner's reply ─────────────────────────────────────────────────────────
 export interface FromClemRespond {
-  (request: { sessionId: string; channel: string; message: string; displayMessage?: string }): Promise<unknown>;
+  (request: { sessionId: string; channel: string; message: string; displayMessage?: string; ownerChoiceToken?: string }): Promise<unknown>;
 }
 let respondImpl: FromClemRespond | null = null;
 export function bindFromClemRespond(respond: FromClemRespond | null): void { respondImpl = respond; }
@@ -398,7 +399,7 @@ export interface FromClemReplyDeps {
   /** Hide the row until the next morning, or for good; the item itself is
    *  untouched. */
   later: (key: string, forever?: boolean) => void;
-  startTurn: (input: { title: string; message: string; displayMessage: string }) => string;
+  startTurn: (input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string }) => string;
 }
 
 /** The facts behind a row, as Clem would cite them. */
@@ -422,6 +423,9 @@ export interface FromClemReplyRequest {
   /** A button whose meaning is fixed ("Not now", "Don't suggest this")
    *  carries its decision, so there is nothing to read. */
   decision?: 'do_it' | 'done' | 'not_now' | 'never';
+  /** Which of the row's offered choices the owner tapped. A tap is the
+   *  owner's approval of exactly that action (owner 2026-10-09). */
+  choiceIndex?: number;
 }
 
 const replyQueues = new Map<string, Promise<unknown>>();
@@ -435,7 +439,7 @@ export function replyToFromClem(key: string, text: string, deps: FromClemReplyDe
   // Replies to one item are taken one at a time, so a second reply (another
   // device, a second tap) is read against what the first one already did.
   const prior = replyQueues.get(key) ?? Promise.resolve();
-  const run = prior.catch(() => undefined).then(() => replyOnce(key, text, deps, requestId, request.seenDigest, request.decision));
+  const run = prior.catch(() => undefined).then(() => replyOnce(key, text, deps, requestId, request.seenDigest, request.decision, request.choiceIndex));
   replyQueues.set(key, run);
   run.finally(() => { if (replyQueues.get(key) === run) replyQueues.delete(key); }).catch(() => undefined);
   if (requestId) {
@@ -449,7 +453,7 @@ export function replyToFromClem(key: string, text: string, deps: FromClemReplyDe
 
 async function replyOnce(
   key: string, text: string, deps: FromClemReplyDeps, requestId: string | undefined, seenDigest: string | undefined,
-  decided?: FromClemReplyRequest['decision'],
+  decided?: FromClemReplyRequest['decision'], choiceIndex?: number,
 ): Promise<FromClemReplyOutcome> {
   const reply = text.trim();
   const row = (await deps.read()).rows.find((candidate) => candidate.key === key);
@@ -482,10 +486,19 @@ async function replyOnce(
       if (planId && !read.instruction) {
         return deps.approvePlan(planId) ? { outcome: 'approved', decision: read.decision } : { outcome: 'gone' };
       }
+      // A tap on one of the choices this row offered (checked against the
+      // choices the host showed, for the version the owner saw) approves
+      // exactly that action; typed words are an ordinary reply.
+      const tapped = typeof choiceIndex === 'number' && row.asks
+        && Array.isArray(row.choices) && row.choices[choiceIndex] === reply;
       const sessionId = deps.startTurn({
         title: row.text.slice(0, 120),
         message: [`You told me: ${said}`, `What it was about: ${factsOf(row)}`, `My reply: ${reply}`].join('\n\n'),
         displayMessage: reply,
+        ...(tapped ? { ownerChoiceToken: mintOwnerChoiceToken({
+          rowKey: row.key, voiceDigest: row.voiceDigest, said, facts: factsOf(row), choice: reply,
+          ...(row.ref ? { ref: row.ref } : {}),
+        }) } : {}),
       });
       if (notificationId) deps.markRead(notificationId);
       if (planId) deps.rejectPlan(planId, `Taken up in conversation: ${reply}`);
@@ -515,12 +528,15 @@ async function replyOnce(
 }
 
 /** Runs the owner's "do it" in her thread, without waiting for it. */
-export function startFromClemTurn(input: { title: string; message: string; displayMessage: string }, thread: Pick<ClemThreadDeps, 'ensure'> = productionClemThread): string {
+export function startFromClemTurn(input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string }, thread: Pick<ClemThreadDeps, 'ensure'> = productionClemThread): string {
   if (!respondImpl) throw new Error('no turn runner is bound');
   thread.ensure();
   const sessionId = CLEM_THREAD_ID;
   const respond = respondImpl;
-  void respond({ sessionId, channel: 'desktop', message: input.message, displayMessage: input.displayMessage }).catch((error: unknown) => {
+  void respond({
+    sessionId, channel: 'desktop', message: input.message, displayMessage: input.displayMessage,
+    ...(input.ownerChoiceToken ? { ownerChoiceToken: input.ownerChoiceToken } : {}),
+  }).catch((error: unknown) => {
     logger.warn({ sessionId, err: error instanceof Error ? error.message : String(error) }, 'from clem: the reply turn failed');
   });
   return sessionId;

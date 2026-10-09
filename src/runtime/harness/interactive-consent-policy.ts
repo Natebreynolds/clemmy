@@ -224,6 +224,9 @@ export type InteractiveConsentDecisionV1 =
          * 2026-10-06). Human-in-the-loop steps pause as explicit checkpoints
          * above; nothing else in the run asks. */
         | 'workflow_approval'
+        /** The owner tapped exactly this action on a choice Clem offered
+         * on Home (owner 2026-10-09: the tap is the approval). One call. */
+        | 'owner_choice'
         | 'settled_replay';
       authorityDigest: string;
       reservationKey?: string;
@@ -291,6 +294,9 @@ export interface EvaluateInteractiveConsentInputV1 {
   /** A provider (or command) refused a write earlier in this same turn, so
    * this call is a change of plan. */
   afterAnsweredRefusal?: boolean;
+  /** The owner tapped exactly this change on a choice Clem offered on Home;
+   * the host read it from the accepted source and a judge confirmed it. */
+  ownerChoice?: { authorityDigest: string };
 }
 
 function sameDestination(
@@ -534,6 +540,29 @@ export function evaluateInteractiveConsentV1(
       need: 'approval',
       subjectDigest: call.bindingDigest,
       reason: 'An earlier write in this turn was refused by the app it went to; this changed attempt waits for the owner.',
+    };
+  }
+
+  // The owner already said yes by tapping exactly this change on a choice
+  // Clem offered (owner 2026-10-09: "Tap is the approval"). It covers one
+  // ordinary, non-destructive change in a connected app, never an admin or
+  // destructive change, a sealed bulk set, or a change of plan after a
+  // refusal; it teaches no kind. Composed content the card never showed was
+  // already ruled out by the judge that granted it.
+  if (
+    input.ownerChoice
+    && call.effect === 'external_write'
+    && !call.risk.destructive
+    && call.risk.consequence !== 'delete'
+    && call.risk.consequence !== 'admin'
+    && call.cardinality.kind !== 'set'
+    && !input.afterAnsweredRefusal
+  ) {
+    return {
+      kind: 'proceed',
+      basis: 'owner_choice',
+      authorityDigest: input.ownerChoice.authorityDigest,
+      reservationKey: input.coverage.reservationKey,
     };
   }
 

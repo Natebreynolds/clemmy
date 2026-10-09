@@ -76,7 +76,7 @@ export function FromClemPane({
     );
   };
 
-  const reply = (row: FromClemRow, text: string, decision?: 'do_it' | 'done' | 'not_now' | 'never') => act(row, 'answer', () => replyFromClem(row.key, text, row.voiceDigest, decision), (result) => {
+  const reply = (row: FromClemRow, text: string, decision?: 'do_it' | 'done' | 'not_now' | 'never', choiceIndex?: number) => act(row, 'answer', () => replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex), (result) => {
     const outcome = result as Awaited<ReturnType<typeof replyFromClem>>;
     return { text: replyOutcomeText(outcome, row.heartbeatTitle), ...(outcome.outcome === 'started' ? { sessionId: outcome.sessionId } : {}) };
   });
@@ -88,7 +88,7 @@ export function FromClemPane({
     if (row.choices?.length) {
       return row.choices.map((choice, index) => (
         <Button key={choice} size="sm" variant={index === 0 ? 'primary' : 'secondary'} className="h-8 px-3 text-small"
-          disabled={busy} onClick={() => reply(row, choice)}>
+          disabled={busy} onClick={() => reply(row, choice, undefined, index)}>
           {choice}
         </Button>
       ));

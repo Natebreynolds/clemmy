@@ -405,3 +405,28 @@ test('a workflow report lands in her thread as she wrote it, titled, with no mod
   await voiceFromClemRows(rows, { port: port as never, thread });
   assert.equal(posts.length, 1, 'posted once');
 });
+
+test('a tapped choice carries the owner\'s approval of exactly that action; typed words and a mismatched tap do not', async () => {
+  // Owner 2026-10-09: "Tap is the approval."
+  const { redeemOwnerChoiceToken } = await import('../runtime/harness/owner-choice.js');
+  const tokens: Array<string | undefined> = [];
+  const run = deps({
+    read: async () => stream((key) => (key === 'notif:wr' ? { message: 'Standup is still waiting on you. Accept it?', choices: ['Accept', 'Decline'] } : undefined)),
+    startTurn: (input) => { tokens.push(input.ownerChoiceToken); return 'sess-1'; },
+  }, { decision: 'do_it' });
+  const row = (await run.all.read()).rows.find((candidate) => candidate.key === 'notif:wr')!;
+  assert.deepEqual(row.ref, { itemKey: 'k2' }, 'the row carries what it is about');
+
+  assert.equal((await replyToFromClem('notif:wr', 'Accept', run.all, { choiceIndex: 0, requestId: 'tap-accept-0001' })).outcome, 'started');
+  const choice = redeemOwnerChoiceToken(tokens.at(-1));
+  assert.equal(choice?.choice, 'Accept');
+  assert.equal(choice?.rowKey, 'notif:wr');
+  assert.equal(choice?.said, 'Standup is still waiting on you. Accept it?');
+  assert.match(choice?.facts ?? '', /Still waiting on you: standup/);
+  assert.deepEqual(choice?.ref, { itemKey: 'k2' });
+
+  await replyToFromClem('notif:wr', 'Accept', run.all, { requestId: 'typed-accept-0001' });
+  assert.equal(tokens.at(-1), undefined, 'the same words typed are an ordinary reply');
+  await replyToFromClem('notif:wr', 'Accept', run.all, { choiceIndex: 1, requestId: 'tap-mismatch-0001' });
+  assert.equal(tokens.at(-1), undefined, 'an index that is not the shown choice is nothing');
+});

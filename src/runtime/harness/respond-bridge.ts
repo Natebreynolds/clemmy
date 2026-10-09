@@ -1,4 +1,5 @@
 import { heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_PENDING_TEXT } from './held-stop-publication.js';
+import { redeemOwnerChoiceToken } from './owner-choice.js';
 import './memory-scope-binding.js';
 import { providerCapacityErrorText } from '../../shared/provider-capacity.js';
 import { redactSensitiveText } from '../security.js';
@@ -1635,11 +1636,15 @@ export async function respondViaHarness(
   const requestAttempt = connection?.attempt ?? reviewedAdmission?.attempt ?? beginRunAttempt(sessionId, { runId: request.runId });
   const newlyAcceptedSource = reviewedAdmission?.newlyAccepted
     ?? (acceptedSourceUserSeq === undefined && getRunAttemptSourceUserEvent(requestAttempt) === null);
+  // A choice the owner tapped on Home rides on the accepted source's own
+  // event, from a token only the From Clem reply path can mint.
+  const ownerChoice = redeemOwnerChoiceToken(request.ownerChoiceToken);
   const sourceUserEvent = connection?.source ?? reviewedAdmission?.source ?? recordRunAttemptUserInput(requestAttempt, {
     turn: 1,
     role: 'user',
     data: {
       text: displayMessage,
+      ...(ownerChoice ? { ownerChoice } : {}),
       ...taskModeFields(request.taskMode),
       ...(displayMessage !== request.message ? { modelDirectiveApplied: true } : {}),
       ...(request.runId ? { runId: request.runId } : {}),

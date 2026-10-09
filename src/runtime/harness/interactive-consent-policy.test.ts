@@ -437,6 +437,34 @@ test('a write that follows a refused write in the same turn asks the owner, in A
   assert.equal((evaluateInteractiveConsentV1(input(draft, { workflowApproval: true, afterAnsweredRefusal: true })) as { basis?: string }).basis, 'workflow_approval');
 });
 
+test('a tap on the choice Clem offered approves exactly that change, once, and never a destructive, admin or bulk change', () => {
+  // Owner 2026-10-09: "Tap is the approval." Tapping Accept on an invite
+  // card raised a second, first-time card in Clem's thread that sat unseen.
+  const accept = call({ effect: 'external_write', accountId: 'selected-account',
+    risk: { reversibility: 'ordinary_non_destructive', consequence: 'update', destructive: false },
+    semanticBasis: { kind: 'current_external_definition', digest: digest('8') } });
+  const tap = { authorityDigest: digest('7') };
+  for (const mode of ['auto', 'ask'] as const) {
+    assert.equal(evaluateInteractiveConsentV1(input(accept, { mode })).kind, 'needs_user', `${mode}: without the tap, the first-time card`);
+    const decision = evaluateInteractiveConsentV1(input(accept, { mode, ownerChoice: tap }));
+    assert.equal(decision.kind, 'proceed', mode);
+    assert.equal((decision as { basis?: string }).basis, 'owner_choice');
+    assert.equal((decision as { authorityDigest?: string }).authorityDigest, tap.authorityDigest);
+  }
+  for (const [label, other] of [
+    ['destructive', call({ ...accept, risk: { ...accept.risk, destructive: true } })],
+    ['delete', call({ ...accept, risk: { reversibility: 'unknown', consequence: 'delete', destructive: false } })],
+    ['admin', call({ ...accept, effect: 'admin', risk: { reversibility: 'unknown', consequence: 'admin', destructive: false } })],
+    ['bulk set', call({ ...accept, cardinality: { kind: 'set', universeDigest: digest('9') } })],
+  ] as const) {
+    assert.equal(evaluateInteractiveConsentV1(input(other, { ownerChoice: tap })).kind, 'needs_user', `${label} still asks`);
+  }
+  assert.equal(evaluateInteractiveConsentV1(input(accept, { ownerChoice: tap, afterAnsweredRefusal: true })).kind, 'needs_user',
+    'a change of plan after a refusal still asks');
+  assert.equal(evaluateInteractiveConsentV1(input(accept, { ownerChoice: tap, coverage: null })).kind, 'repair',
+    'a tap never covers a write outside accepted work');
+});
+
 test('an exact destructive, irreversible local change always asks the owner, in Auto and Ask, and never runs as a planning probe', () => {
   // Live 10-02: a workflow delete the owner asked for now reaches consent;
   // what consent does with it is this: one exact approval, nothing silent.

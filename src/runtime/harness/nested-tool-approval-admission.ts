@@ -86,7 +86,8 @@ interface GenericNestedCallAdmissionToken {
     | 'exact_ordinary_work'
     | 'exact_carrier_bounded_work'
     | 'exact_user_grant'
-    | 'workflow_approval';
+    | 'workflow_approval'
+    | 'owner_choice';
   exactGrant?: {
     approvalId: string;
     consentSubjectDigest: string;

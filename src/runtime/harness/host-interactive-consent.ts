@@ -40,7 +40,8 @@ import {
   type HostConsentSemanticSourceEvidence,
 } from './host-consent-evidence.js';
 import { appendEvent, getEvent, getSession, listEvents, openEventLog } from './eventlog.js';
-import { REQUESTED_WRITE_SURE, classifyRequestedExternalWriteWithJev } from '../jev/control-plane.js';
+import { REQUESTED_WRITE_SURE, classifyOwnerChoiceCallWithJev, classifyRequestedExternalWriteWithJev } from '../jev/control-plane.js';
+import { ownerChoiceForSource } from './owner-choice.js';
 import {
   loadDurableAuthorizedLocalPlanningDefinition,
   localPlanningArgumentsMatch,
@@ -386,7 +387,7 @@ function mintHostConsentGrantAdmission(input: {
   consentSubject: HostInteractiveConsentSubjectV1;
   durableApproval: NonNullable<Parameters<typeof evaluatePreparedHostWorkCallConsent>[0]['durableApproval']>;
   userGrant: ExactUserGrantV1;
-  consentMode?: { mode: 'auto' | 'ask'; learnedExternalWrite: boolean; workflowApproval?: boolean; afterAnsweredRefusal?: boolean };
+  consentMode?: { mode: 'auto' | 'ask'; learnedExternalWrite: boolean; workflowApproval?: boolean; afterAnsweredRefusal?: boolean; ownerChoice?: { authorityDigest: string } };
 }): HostConsentGrantAdmissionV1 | null {
   try {
     if (
@@ -1180,7 +1181,8 @@ function consentModeForCall(
   call: CapabilityRiskAttestationV1,
   identity: { sessionId: string; sourceUserSeq?: number; logicalToolCallId?: string },
   learnedApplies?: boolean,
-): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean; workflowApproval?: boolean; afterAnsweredRefusal?: boolean } {
+  ownerChoice?: { authorityDigest: string },
+): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean; workflowApproval?: boolean; afterAnsweredRefusal?: boolean; ownerChoice?: { authorityDigest: string } } {
   const mode: 'auto' | 'ask' = ownerRunsInAutoMode() ? 'auto' : 'ask';
   // A connected-app change asks the first time in both modes (owner
   // 2026-10-06), so what was learned is read in Auto too; otherwise every
@@ -1208,7 +1210,11 @@ function consentModeForCall(
       sourceUserSeq: identity.sourceUserSeq,
       ...(identity.logicalToolCallId ? { exceptLogicalToolCallId: identity.logicalToolCallId } : {}),
     }).length > 0;
-  return { mode, learnedExternalWrite: learned, ...(afterAnsweredRefusal ? { afterAnsweredRefusal: true } : {}) };
+  return {
+    mode, learnedExternalWrite: learned,
+    ...(afterAnsweredRefusal ? { afterAnsweredRefusal: true } : {}),
+    ...(ownerChoice ? { ownerChoice } : {}),
+  };
 }
 
 /** Was this exact change part of what the owner asked for? Only consulted
@@ -1258,6 +1264,63 @@ async function learnedKindAppliesToRequest(input: {
   return undefined;
 }
 
+/**
+ * Did the owner already approve this exact change by tapping a choice Clem
+ * offered on Home (owner 2026-10-09: "Tap is the approval")? The tap rides
+ * on the accepted source's own event; Jev reads whether this call is exactly
+ * that choice on that item, with nothing the card did not show. One tap
+ * covers one call. Undefined = no tap, or not sure: the ordinary gate asks.
+ */
+async function ownerChoiceCoversCall(input: {
+  sessionId: string;
+  sourceUserSeq: number | null | undefined;
+  logicalToolCallId: string;
+  call: CapabilityRiskAttestationV1;
+  args: unknown;
+}): Promise<{ authorityDigest: string } | undefined> {
+  if (input.call.effect !== 'external_write') return undefined;
+  if (typeof input.sourceUserSeq !== 'number') return undefined;
+  if (workflowRunSession(input.sessionId)) return undefined;
+  const choice = ownerChoiceForSource(input.sessionId, input.sourceUserSeq);
+  if (!choice) return undefined;
+  let readings: Array<{ data: Record<string, unknown> }> = [];
+  try {
+    readings = listEvents(input.sessionId, { types: ['guardrail_tripped'], sinceSeq: input.sourceUserSeq })
+      .filter((event) => event.data.kind === 'owner_choice_reading' && event.data.sourceUserSeq === input.sourceUserSeq);
+  } catch { readings = []; }
+  const covered = readings.filter((event) => event.data.covers === true);
+  const same = covered.find((event) => event.data.logicalToolCallId === input.logicalToolCallId);
+  if (same && typeof same.data.authorityDigest === 'string') return { authorityDigest: same.data.authorityDigest };
+  // One tap approves one change; a second write in the turn asks as usual.
+  if (covered.length > 0) return undefined;
+  let argsText = '';
+  try { argsText = JSON.stringify(input.args ?? {}); } catch { argsText = ''; }
+  const change = `${input.call.operationId}\n${argsText.slice(0, 1_500)}`;
+  const item = [choice.facts, choice.ref ? `Identifiers: ${JSON.stringify(choice.ref)}` : ''].filter(Boolean).join('\n');
+  let reading: Awaited<ReturnType<typeof classifyOwnerChoiceCallWithJev>>;
+  try {
+    reading = await classifyOwnerChoiceCallWithJev({ offered: choice.said, item, tapped: choice.choice, change }, { sessionId: input.sessionId });
+  } catch {
+    return undefined;
+  }
+  const covers = reading.kind === 'exact' && (reading.confidence ?? 0) >= REQUESTED_WRITE_SURE;
+  const authorityDigest = covers ? digest({
+    version: 1, kind: 'owner_choice', sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+    logicalToolCallId: input.logicalToolCallId, rowKey: choice.rowKey, voiceDigest: choice.voiceDigest,
+    choice: choice.choice, operationId: input.call.operationId, bindingDigest: input.call.bindingDigest,
+  }) : undefined;
+  try {
+    appendEvent({ sessionId: input.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: {
+      kind: 'owner_choice_reading', sourceUserSeq: input.sourceUserSeq, logicalToolCallId: input.logicalToolCallId,
+      operationId: input.call.operationId, choice: choice.choice, rowKey: choice.rowKey,
+      reading: reading.kind ?? (reading.failedOpen ? 'unavailable' : 'unsure'),
+      ...(typeof reading.confidence === 'number' ? { confidence: reading.confidence } : {}),
+      covers, ...(authorityDigest ? { authorityDigest } : {}),
+    } });
+  } catch { /* a reading that cannot be journaled grants nothing */ return undefined; }
+  return authorityDigest ? { authorityDigest } : undefined;
+}
+
 /** The step session of a published workflow: kind 'workflow', deterministic `workflow:` id. */
 function workflowRunSession(sessionId: string): boolean {
   if (sessionId.startsWith('workflow:')) return true;
@@ -1272,10 +1335,11 @@ function reduceHostConsentEvidence(input: {
   reservationAlreadyClaimed: boolean;
   durableApproval?: DurableHostConsentApproval;
   learnedApplies?: boolean;
+  ownerChoice?: { authorityDigest: string };
 }) {
   const { call, coverage, crossing, reservationAlreadyClaimed } = input;
   const preparationProbe = planPreparationProbe(input.identity);
-  const consentMode = consentModeForCall(call, input.identity, input.learnedApplies);
+  const consentMode = consentModeForCall(call, input.identity, input.learnedApplies, input.ownerChoice);
   const ungrantedDecision = evaluateInteractiveConsentV1({
     call, coverage, userGrant: null, readiness: { kind: 'ready' },
     crossing, reservationAlreadyClaimed, preparationProbe, ...consentMode,
@@ -1417,9 +1481,13 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
   const learnedApplies = await learnedKindAppliesToRequest({
     sessionId: prepared.sessionId, sourceUserSeq: prepared.sourceUserSeq, call, args: prepared.targetArgs,
   });
+  const ownerChoice = input.durableApproval ? undefined : await ownerChoiceCoversCall({
+    sessionId: prepared.sessionId, sourceUserSeq: prepared.sourceUserSeq,
+    logicalToolCallId: prepared.logicalToolCallId, call, args: prepared.targetArgs,
+  });
   const { decision, consentSubject, userGrant, consentMode } = reduceHostConsentEvidence({
     identity: prepared, call, coverage, crossing, reservationAlreadyClaimed,
-    durableApproval: input.durableApproval, learnedApplies,
+    durableApproval: input.durableApproval, learnedApplies, ...(ownerChoice ? { ownerChoice } : {}),
   });
   journalInteractiveConsentDecision({
     sessionId: prepared.sessionId, sourceUserSeq: prepared.sourceUserSeq,
@@ -1586,9 +1654,13 @@ export async function evaluateUncoveredHostMutationConsent(input: {
     const learnedApplies = await learnedKindAppliesToRequest({
       sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq, call, args: input.args,
     });
+    const ownerChoice = input.durableApproval ? undefined : await ownerChoiceCoversCall({
+      sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq,
+      logicalToolCallId: binding.logicalToolCallId, call, args: input.args,
+    });
     const { decision, consentSubject } = reduceHostConsentEvidence({
       identity: binding, call, coverage, crossing, reservationAlreadyClaimed: false,
-      durableApproval: input.durableApproval, learnedApplies,
+      durableApproval: input.durableApproval, learnedApplies, ...(ownerChoice ? { ownerChoice } : {}),
     });
     journalInteractiveConsentDecision({
       sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq,
@@ -1737,6 +1809,9 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       logicalToolCallId: attestation.logicalToolCallId,
     }, await learnedKindAppliesToRequest({
       sessionId: attestation.sessionId, sourceUserSeq: attestation.sourceUserSeq, call, args: input.args,
+    }), input.durableApproval ? undefined : await ownerChoiceCoversCall({
+      sessionId: attestation.sessionId, sourceUserSeq: attestation.sourceUserSeq,
+      logicalToolCallId: attestation.logicalToolCallId, call, args: input.args,
     })),
   });
   return { status: 'decided', decision, call, coverage };
