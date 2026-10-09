@@ -1369,6 +1369,9 @@ const INDEX_NOMINATION_DEADLINE_MS = 4_000;
 /** Return just before the broker-owned abort so completed partial progress is
  * observed by the caller rather than discarded at the same timer boundary. */
 const PROVIDER_SOURCE_RETURN_MARGIN_MS = 100;
+/** How long a listing of connected MCP servers' tools stays fresh for search. */
+const EXTERNAL_MCP_LIST_FRESH_MS = 60_000;
+let lastExternalMcpListedAt = 0;
 /** How long before the search deadline the provider source answers from
  * current contract leases instead of waiting on a slow live search. */
 const COMPOSIO_LEASED_FALLBACK_MARGIN_MS = 1_500;
@@ -2291,17 +2294,27 @@ export function buildAuthorizedToolSearchCandidateSources(
         }
       }
       const server = getOrCreateExternalMcpServers(mcpToolDiscoveryScope(scope));
-      // Search is the recovery path after an exact invocation detects drift.
-      // Its namespace view can differ from the invocation's per-server view;
-      // refresh this view too, otherwise it keeps advertising the retired name.
-      await server.invalidateToolsCache();
+      // Search is the recovery path after an exact invocation detects drift
+      // (an exact name that no longer resolves): refresh this namespace view
+      // then, and otherwise at most once a minute. Re-listing every server on
+      // every search cost 2-4.5 s per search (live 2026-10-09, a remote MCP
+      // proxy among them) for a catalog that had not changed.
+      const nowMs = Date.now();
+      if (exactOperation || nowMs - lastExternalMcpListedAt > EXTERNAL_MCP_LIST_FRESH_MS) {
+        await server.invalidateToolsCache();
+      }
       const tools = await server.listTools();
+      lastExternalMcpListedAt = Date.now();
       if (signal?.aborted) return [];
       const ranked = rankCatalogEntriesLexically(query, tools.map(tool => ({
         name: tool.name, namespace: stripMcpToolCarrier(tool.name).split('__')[0],
         oneLiner: [typeof tool.description === 'string' ? tool.description : '', toolSchemaSearchText(tool.inputSchema)].filter(Boolean).join('\n'),
         tool,
-      })));
+      })))
+        // Only tools the query actually matches: the top N of an unrelated
+        // server is noise in every result (10-12 site-builder tools answered
+        // "insert an image into a Google slide").
+        .filter((entry) => entry.score > 0);
       return ranked.slice(0, limit).map(({ tool }, index): ToolSearchBrokerCandidate => ({
         name: stripMcpToolCarrier(tool.name),
         summary: typeof tool.description === 'string'
@@ -2309,7 +2322,7 @@ export function buildAuthorizedToolSearchCandidateSources(
           : `Connected external capability ${stripMcpToolCarrier(tool.name)}`,
         ...(tool.inputSchema !== undefined ? { schema: tool.inputSchema } : {}),
         carrier: 'work_call',
-        score: boundedRank(index, Math.min(limit, tools.length)),
+        score: boundedRank(index, Math.min(limit, ranked.length)),
       }));
     },
   };
