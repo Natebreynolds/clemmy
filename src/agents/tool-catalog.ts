@@ -340,14 +340,61 @@ export function resolveHotSet(
  * A name appears in every part that earned it; `resolveHotSet` is their
  * union in this order, so its membership and order are unchanged.
  */
+type HotSetParts = { kernel: string[]; request: string[]; session: string[] };
+
+/**
+ * THE HOT SET A TURN STARTED WITH.
+ *
+ * A tool reached for during a turn is promoted from the owner's next message.
+ * A rebuild of the same turn (the resume after an approval, a recovery
+ * restart) sees the set its first build saw, re-checked against the current
+ * policy: a schema joining mid-turn re-sends the whole conversation uncached
+ * on a provider that caches the prompt prefix.
+ */
+const turnStartHotSets = new Map<string, { sourceUserSeq: number; parts: HotSetParts }>();
+const TURN_START_HOT_SESSIONS = 200;
+
 export function resolveHotSetParts(
   sessionId: string | undefined | null,
   userInput: string | undefined | null,
-  opts: { allowedNames?: ReadonlySet<string> } = {},
-): { kernel: string[]; request: string[]; session: string[] } {
+  opts: { allowedNames?: ReadonlySet<string>; sourceUserSeq?: number | null } = {},
+): HotSetParts {
   const universe = allRegistryNames();
   const allowed = opts.allowedNames;
   const keep = (name: string) => universe.has(name) && passesPolicy(name, allowed);
+  const sid = (sessionId ?? '').trim();
+  const source = Number.isSafeInteger(opts.sourceUserSeq) && (opts.sourceUserSeq as number) > 0
+    ? opts.sourceUserSeq as number
+    : null;
+  const started = sid && source !== null ? turnStartHotSets.get(sid) : undefined;
+  if (started && started.sourceUserSeq === source) {
+    return {
+      kernel: started.parts.kernel.filter(keep),
+      request: started.parts.request.filter(keep),
+      session: started.parts.session.filter(keep),
+    };
+  }
+  const parts = currentHotSetParts(sessionId, userInput, keep);
+  if (sid && source !== null) {
+    turnStartHotSets.delete(sid);
+    turnStartHotSets.set(sid, { sourceUserSeq: source, parts });
+    if (turnStartHotSets.size > TURN_START_HOT_SESSIONS) {
+      const oldest = turnStartHotSets.keys().next().value;
+      if (oldest !== undefined) turnStartHotSets.delete(oldest);
+    }
+  }
+  return parts;
+}
+
+/** Test seam: forget every turn's starting hot set. */
+export function _resetTurnStartHotSetsForTests(): void { turnStartHotSets.clear(); }
+
+function currentHotSetParts(
+  sessionId: string | undefined | null,
+  userInput: string | undefined | null,
+  keep: (name: string) => boolean,
+): HotSetParts {
+  const universe = allRegistryNames();
 
   const query = userInput ?? '';
   const named = (name: string) => queryExplicitlyNamesTool(query, name);

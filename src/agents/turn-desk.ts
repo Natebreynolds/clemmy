@@ -241,6 +241,11 @@ export interface TurnDeskInput {
    *  tool-bearing surface, not Plan, Execute, act, a frozen contract or the
    *  local-memory scope. */
   ordinaryHostChat: boolean;
+  /** A rebuild that is not ordinary host chat but is neither Plan, Execute
+   *  nor the local-memory scope (an approval or recovery resume): it keeps the
+   *  desk this same source already recorded. The desk only defers schemas of
+   *  desk-declared tools, so it never narrows what the resume may call. */
+  resumeMayKeepDesk?: boolean;
   /** Names on the policy-resolved surface, in order. */
   surfaceNames: readonly string[];
   requestText: string;
@@ -252,13 +257,20 @@ export function resolveTurnDesk(input: TurnDeskInput): TurnDeskDecision {
   const sourceUserSeq = Number.isSafeInteger(input.sourceUserSeq) ? input.sourceUserSeq as number : 0;
   try {
     const sessionId = (input.sessionId ?? '').trim();
-    if (!input.ordinaryHostChat || !sessionId || sourceUserSeq <= 0 || isUnattendedSession(sessionId)) {
+    if (!sessionId || sourceUserSeq <= 0 || isUnattendedSession(sessionId)) {
       return fullTurnDesk('out_of_scope', sourceUserSeq);
     }
     const surface = new Set(input.surfaceNames);
-    if (!surface.has('tool_search') || !surface.has('call_tool')) {
-      return fullTurnDesk('doors_absent', sourceUserSeq);
+    const doors = surface.has('tool_search') && surface.has('call_tool');
+    // A resume of a turn that already recorded its desk (after the owner
+    // approves an action, after a recovery restart) is the same turn and keeps
+    // that desk: a schema joining mid-turn re-sends the whole conversation
+    // uncached on a provider that caches the prompt prefix.
+    if (!input.ordinaryHostChat) {
+      const recorded = input.resumeMayKeepDesk && doors ? recordedTurnDesk(sessionId, sourceUserSeq) : null;
+      return recorded ? reuseTurnDesk(recorded, input.surfaceNames) : fullTurnDesk('out_of_scope', sourceUserSeq);
     }
+    if (!doors) return fullTurnDesk('doors_absent', sourceUserSeq);
     const recorded = recordedTurnDesk(sessionId, sourceUserSeq);
     if (recorded) return reuseTurnDesk(recorded, input.surfaceNames);
     return decideTurnDesk(input.surfaceNames, gatherTurnDeskFacts({

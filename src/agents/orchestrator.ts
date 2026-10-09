@@ -81,7 +81,7 @@ import {
 } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
 import { resolveToolSearchDecision, resolveHotSetParts, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS, applyProvenSkipToHotSet, steadySessionPromotions } from './tool-catalog.js';
-import { renderDeskNamesLine, resolveTurnDesk, type TurnDeskDecision } from './turn-desk.js';
+import { recordedTurnDesk, renderDeskNamesLine, resolveTurnDesk, type TurnDeskDecision } from './turn-desk.js';
 import { bindSessionWireOrder } from '../runtime/harness/advertised-tool-wire.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
 import {
@@ -3758,7 +3758,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const searchQuery = [scopeUserInput, ...priorUserInputs.slice(0, 3)]
         .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
         .join('\n');
-      const hotParts = resolveHotSetParts(options.sessionId, searchQuery, { allowedNames: policyAllowed });
+      const hotParts = resolveHotSetParts(options.sessionId, searchQuery, {
+        allowedNames: policyAllowed,
+        sourceUserSeq: options.sourceUserSeq,
+      });
       const hot = new Set([...hotParts.kernel, ...hotParts.request, ...hotParts.session]);
       if (hotParts.request.length > 0) deskIdentifiedTarget = true;
       pinCompositionHotTools(hot, sessionMount, policyAllowed);
@@ -4154,6 +4157,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   }
 
   const reviewedComputeResults = taskMode?.kind === 'execute' && !reviewedReadOnlyExecution ? [buildPlanStepResultTool(options.sessionId && options.sourceUserSeq ? { sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq } : undefined)] : [];
+  // An act build that resumes a turn which began as ordinary chat (the restart
+  // after the owner approves an action) keeps that turn's tools block, so the
+  // conversation stays a cached prefix (turn-desk.ts resumeMayKeepDesk).
+  const resumeMayKeepDesk = !planMode && taskMode?.kind !== 'execute' && !localMemoryScope;
+  const resumesChatTurn = options.acceptedRoute === 'act' && resumeMayKeepDesk
+    && Boolean(options.sessionId && options.sourceUserSeq
+      && recordedTurnDesk(options.sessionId, options.sourceUserSeq as number));
   const structuralTools = factorySkip
     ? []
     : planMode
@@ -4185,7 +4195,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // control on cold and warm turns. Explicit act work advertises it;
           // toolsOnAdvertisedWire also exposes it when acquisition doors are
           // absent. Enablement and exact plan admission are unchanged.
-          deferLoading: options.acceptedRoute !== 'act',
+          deferLoading: options.acceptedRoute !== 'act' || resumesChatTurn,
         }), buildAskUserQuestionTool(), runWorkerTool]
       : [buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool]
     : localMemoryScope
@@ -4355,6 +4365,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           && !actionWork
           && !frozenContract
           && !localMemoryScope,
+        // An approval or recovery resume of a turn that began as ordinary chat
+        // keeps that turn's recorded desk; Plan and Execute keep their own.
+        resumeMayKeepDesk,
         surfaceNames: toolPolicy.tools.map((toolRef) => toolRef.name),
         requestText: scopeUserInput,
         identifiedTarget: deskIdentifiedTarget

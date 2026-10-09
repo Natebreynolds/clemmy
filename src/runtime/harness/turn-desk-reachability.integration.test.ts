@@ -265,14 +265,14 @@ test('plan, execute, act and unattended builds keep today\'s surface and record 
   }
 });
 
-test('a plan, execute or act re-entry on a source that recorded a lean desk keeps today\'s surface', async () => {
+test('a plan or execute re-entry on a source that recorded a lean desk keeps today\'s surface', async () => {
   // A real in-scope lean record to reuse.
   const leanSession = 'turn-desk-reentry-lean';
   const leanSource = acceptSource(leanSession, TARGETED);
   await buildFor(leanSession, leanSource.seq, TARGETED, idleModel);
   const lean = deskRecord(leanSession, leanSource.seq);
   assert.equal(lean?.rung, 'lean', 'the ordinary build recorded a lean desk');
-  for (const entry of OUT_OF_SCOPE.filter((candidate) => candidate.label !== 'unattended')) {
+  for (const entry of OUT_OF_SCOPE.filter((candidate) => candidate.label === 'plan' || candidate.label === 'execute')) {
     const sessionId = `turn-desk-reentry-${entry.label}`;
     const controlId = `turn-desk-reentry-control-${entry.label}`;
     const source = entry.source(sessionId);
@@ -295,6 +295,42 @@ test('a plan, execute or act re-entry on a source that recorded a lean desk keep
     assert.equal(toolsBytes(scoped), toolsBytes(fresh),
       `${entry.label}: the re-entry's tools are byte-identical to the same build on a source with no desk record`);
   }
+});
+
+test('an act resume of a turn that recorded its desk (the restart after an approval) keeps that turn\'s exact tools block', async () => {
+  const sessionId = 'turn-desk-resume-act';
+  const source = acceptSource(sessionId, TARGETED);
+  const chat = await buildFor(sessionId, source.seq, TARGETED, idleModel);
+  assert.equal(deskRecord(sessionId, source.seq)?.rung, 'lean', 'the turn began as ordinary chat on the lean rung');
+  const resumed = await buildFor(sessionId, source.seq, TARGETED, idleModel, { acceptedRoute: 'act' });
+  assert.deepEqual(deferredOn(resumed), deferredOn(chat), 'the resume defers what the turn deferred');
+  const before = toolsBytes(chat);
+  const after = toolsBytes(resumed);
+  assert.equal(after, before, `the resume re-sends the turn's tools block byte for byte: ${JSON.stringify(firstDifference(before, after))}`);
+  assert.equal(deskRecord(sessionId, source.seq)?.fallbackReason, null, 'the resume recorded the reused in-scope desk');
+  // A source that never recorded a desk still gets today's surface on act.
+  const freshId = 'turn-desk-resume-act-fresh';
+  const fresh = acceptSource(freshId, TARGETED);
+  const act = await buildFor(freshId, fresh.seq, TARGETED, idleModel, { acceptedRoute: 'act' });
+  assert.deepEqual(deferredOn(act), []);
+  assert.equal(deskRecord(freshId, fresh.seq)?.fallbackReason, 'out_of_scope');
+});
+
+test('a tool reached for during a turn joins the tools block at the owner\'s next message, never on a rebuild of the same turn', async () => {
+  const hotset = await import('../../agents/tool-hotset.js');
+  const sessionId = 'turn-desk-hot-next-turn';
+  const first = acceptSource(sessionId, TARGETED);
+  const opening = await buildFor(sessionId, first.seq, TARGETED, idleModel);
+  const names = (agent: unknown) => agentTools(agent).map((entry) => entry.name);
+  assert.equal(names(opening).includes('view_image'), false, 'the fixture tool is not on the opening surface');
+  // The turn reaches for it (through the dispatcher), then restarts.
+  hotset.recordToolHit(sessionId, 'view_image');
+  const restarted = await buildFor(sessionId, first.seq, TARGETED, idleModel);
+  assert.equal(toolsBytes(restarted), toolsBytes(opening), 'the same turn re-sends its exact tools block');
+  // The owner's next message promotes it.
+  const next = acceptSource(sessionId, TARGETED);
+  const nextTurn = await buildFor(sessionId, next.seq, TARGETED, idleModel);
+  assert.equal(names(nextTurn).includes('view_image'), true, 'the next turn carries the tool it reached for');
 });
 
 test('Jev off and Jev on without a key decide the same desk and send the same tools block', async () => {
