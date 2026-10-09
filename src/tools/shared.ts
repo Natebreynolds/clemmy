@@ -77,6 +77,10 @@ export function truncateToolText(text: string, maxChars: number = DEFAULT_TOOL_R
 
 export { DEFAULT_TOOL_RESULT_MAX_CHARS };
 
+/** Keep a complete corrective schema small enough for the prompt's inline
+ * tool-result presentation. Oversized schemas use discovery, never a slice. */
+export const INVALID_INPUT_SCHEMA_GUIDANCE_MAX_CHARS = 4_000;
+
 export interface TextToolResult {
   [key: string]: unknown;
   content: Array<{ type: 'text'; text: string }>;
@@ -245,7 +249,14 @@ export function describeInvalidToolInput(
   /** How many violated paths to name (default 5). A packet-shaped tool whose
    * every required field can be absent at once passes its full field count so
    * one refusal names the whole repair instead of five fields per round. */
-  options?: { maxIssues?: number },
+  options?: {
+    maxIssues?: number;
+    /** The trusted caller's current parser schema, never invocation values or
+     * capability authority. Omitted keeps the existing discovery fallback. */
+    inputSchema?: unknown;
+    /** Budget for the complete guidance, after the caller's error prefix. */
+    maxChars?: number;
+  },
 ): string | null {
   if (!error || typeof error !== 'object') return null;
   if ((error as { name?: unknown }).name !== 'InvalidToolInputError') return null;
@@ -281,8 +292,21 @@ export function describeInvalidToolInput(
           : `${path} takes the object as one JSON-encoded string, encoded once, not the object itself`];
       })
     : [];
-  return `The arguments for ${toolName} did not match its schema${cause}. `
-    + (repairs.length > 0 ? `${repairs.join('. ')}. ` : '')
+  const diagnostic = `The arguments for ${toolName} did not match its schema${cause}. `
+    + (repairs.length > 0 ? `${repairs.join('. ')}. ` : '');
+  const budget = Math.min(INVALID_INPUT_SCHEMA_GUIDANCE_MAX_CHARS,
+    Number.isSafeInteger(options?.maxChars) && (options?.maxChars ?? -1) >= 0
+      ? options!.maxChars as number : DEFAULT_TOOL_RESULT_MAX_CHARS);
+  try {
+    if (options?.inputSchema && typeof options.inputSchema === 'object' && !Array.isArray(options.inputSchema)) {
+      const schema = JSON.stringify(options.inputSchema);
+      const complete = `${diagnostic}Use this current input schema and retry once with corrected arguments. No schema search is needed.\nInput schema (complete):\n${schema}`;
+      // A cut JSON schema can invent an allowed field or hide a required one.
+      // Include the entire schema or keep the familiar discovery fallback.
+      if (complete.length <= budget) return complete;
+    }
+  } catch { /* Unserializable metadata keeps the ordinary discovery fallback. */ }
+  return diagnostic
     + `Call tool_search with the exact query "${toolName}" to get the full input schema, then retry once with corrected arguments.`;
 }
 

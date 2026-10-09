@@ -47,6 +47,7 @@ import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 import { bindHostLocalCallPreparation } from '../runtime/harness/host-local-call-preparation.js';
 import { createHash } from 'node:crypto';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
+import { inlineResultBudgetForModel } from '../runtime/harness/tool-output-format.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
 import { appendAgentCapabilityBinding, bindAgentCapabilityEnvelope, bindAgentCapabilityRevision, sealAgentCapabilityUniverse, turnStateToolsLast, type SealableToolLike } from './capability-envelope.js';
 import { composioStandingPolicyCapabilityHints } from '../integrations/composio/standing-policy-adapter.js';
@@ -91,13 +92,14 @@ import {
 } from '../runtime/harness/session-composition.js';
 import { actionControlAdmittedForTaskState, actionControlContextFor, actionTopologyRoleFor, deriveOrchestratorDiscoveryNames, isRegistryDeclaredRead, deriveGuardrailMutating, isRegisteredDelegationPrimitive } from '../tools/tool-registry.js';
 import { buildCallTool, type BuildCallToolOptions, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
-import { buildWorkCall, type BuildWorkCallOptions } from '../tools/work-call.js';
+import { buildWorkCall, disclosedWorkCallReadyOperations, type BuildWorkCallOptions } from '../tools/work-call.js';
 import { buildPlanTaskTool } from '../tools/plan-tools.js';
 import { isHostOnlyActionControl } from '../tools/tool-registry.js';
 import {
   disclosePrimaryModelPlanningCapabilities,
   inspectPrimaryModelPlanningReadCapability,
   snapshotPrimaryModelPlanningContext,
+  snapshotPrimaryModelSelectedStagedPlanningDescriptors,
   type HostFreshPlanningContextV1,
 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
 import type { HostCapabilityDescriptorV1 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
@@ -122,6 +124,7 @@ import {
   isRegistryDeclaredNativePlanningRead,
   isWorkCallConfiguredLocalPlanningCapability,
   issueAuthorizedLocalPlanningDisclosureCandidate,
+  type AuthorizedLocalPlanningDisclosureCandidate,
 } from '../runtime/harness/local-planning-capability.js';
 import {
   accountSelectionBlockersFromSearchResult,
@@ -189,7 +192,7 @@ import { describeInvalidToolInput, isSdkToolInputValidationError } from '../tool
 import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { falloverWorkerModelIds } from '../runtime/harness/model-role-options.js';
-import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
+import { resolveEffectiveToolNames, resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import {
   bareTerminalToolName,
@@ -1963,6 +1966,56 @@ function mergeWorkCallDisclosures(
     merged.push(entry);
   }
   return merged;
+}
+
+/** Presentation only. Callers supply the sealed publisher's owned snapshot;
+ * neither these rows nor the returned READY list grant execution authority. */
+export function projectNativeHintPresentation(input: {
+  instructions: string;
+  candidates: readonly AuthorizedLocalPlanningDisclosureCandidate[];
+  owned: readonly HostCapabilityDescriptorV1[];
+  disclosedOperations: readonly HostCapabilityDescriptorV1[];
+  budget: number;
+  planMode: boolean;
+}): { contracts: string | null; disclosedOperations: readonly HostCapabilityDescriptorV1[] } {
+  const ownedRefs = new Set(input.owned.map(descriptor => descriptor.id));
+  const readyByRef = new Map(disclosedWorkCallReadyOperations(input.owned)
+    .map(row => [row.capability_selector, row]));
+  const rows = input.candidates.flatMap(candidate => {
+    const variants = candidate.capabilityVariants.filter(variant => ownedRefs.has(variant.capabilityRef));
+    return variants.length > 0 ? [{ name: candidate.name, carrier: 'work_call',
+      capabilityVariants: variants, argumentSchema: candidate.schema }] : [];
+  });
+  const presentedRefs = new Set<string>();
+  if (!input.planMode) {
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]!;
+      const represented: string[] = [];
+      const variants = row.capabilityVariants.map(variant => {
+        const ready = readyByRef.get(variant.capabilityRef);
+        if (!ready || ready.name !== row.name) return variant;
+        // Keep the same effect/purpose/deliverable/destination facts visible
+        // once with the exact variant and full schema, rather than lose them
+        // when omitting their duplicate carrier presentation.
+        const { name: _name, capability_selector: _ref, ...semantics } = ready;
+        represented.push(variant.capabilityRef);
+        return { ...variant, ...semantics };
+      });
+      const enhanced = { ...row, capabilityVariants: variants };
+      const next = [...rows];
+      next[i] = enhanced;
+      // Complete schemas were selected before publication. Semantic metadata
+      // uses remaining presentation room; if it cannot fit, retain the READY
+      // row carrying those facts. Never truncate or hide the schema.
+      if (input.instructions.length + JSON.stringify(next).length > input.budget) continue;
+      rows[i] = enhanced;
+      for (const ref of represented) presentedRefs.add(ref);
+    }
+  }
+  return {
+    contracts: rows.length > 0 ? input.instructions + JSON.stringify(rows) : null,
+    disclosedOperations: input.disclosedOperations.filter(descriptor => !presentedRefs.has(descriptor.id)),
+  };
 }
 
 export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOptions = {}): Promise<
@@ -4173,6 +4226,88 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     const name = (toolRef as { name?: string }).name ?? '';
     return !name || !structuralToolNames.has(name);
   });
+  // A learned native BUSINESS operation stays behind work_call, so hot-set
+  // promotion cannot put its schema/ref on the first-class surface. Reopen
+  // only those exact hints through the carrier's already-resolved policy set
+  // before constructing work_call. Publication is the same sealed, current-
+  // source disclosure tool_search performs; it grants no consent or dispatch.
+  // Keep the full callable contract visible too: a planning ref alone still
+  // sends the model to discovery to learn the inner argument names.
+  let nativeHintContracts: string | null = null;
+  const nativeHintPolicy = workCallOptions?.reachableBuiltinNames
+    ? resolveEffectiveToolNames({
+        surface: 'orchestrator', lane: 'execution',
+        toolNames: ['work_call', ...workCallOptions.reachableBuiltinNames],
+        allowedToolNames: effectiveAllowedToolNames,
+        excludeToolNames: [...(options.excludeToolNames ?? []), ...(workCallOptions.deniedNames ?? [])],
+      }) : null;
+  if (hostFreshPlanning && !factorySkip && !frozenContract
+    && workCallOptions?.reachableBuiltinNames
+    && nativeHintPolicy?.names.includes('work_call')) {
+    // Use the final policy's own normalization, intersected with the actual
+    // dispatcher surface. A padded exclusion must not advertise a carrier or
+    // inner operation that the final model policy removes.
+    const configuredNames = new Set(nativeHintPolicy.names
+      .filter(name => workCallOptions!.reachableBuiltinNames!.has(name)));
+    const candidates = (await Promise.all([...new Set(provenDisclosure.nativeTools ?? [])]
+      .filter(name => configuredNames.has(name)
+        && actionTopologyRoleFor(name) === 'business'
+        && isRegistryDeclaredLocalPlanningCapability(name))
+      // The existing sealed publisher accepts at most twenty candidates per
+      // disclosure. Keep eager schema presentation to that same one-page bound;
+      // any additional hint retains the ordinary exact discovery path.
+      .slice(0, 20)
+      .map(name => issueAuthorizedLocalPlanningDisclosureCandidate({
+        name, carrier: 'work_call', configuredNames,
+      })))).flatMap(candidate => candidate && !('refused' in candidate) ? [candidate] : []);
+    const nativeHintInstructions = '[current-native-contracts] These exact native operations were revalidated and disclosed for this request. '
+      + (planMode
+        ? 'Use these capabilityRef values and argument schemas to prepare publish_plan. Do not execute these business operations during Plan; disclosure is preparation evidence only, and the existing Plan effect boundary remains closed. '
+        : 'Invoke the selected operation through work_call with its exact name and arguments encoded as one args_json string. For a direct call without a frozen requirement, use the matching capabilityRef as requirement_id. After plan_task activates a plan, use that plan\'s exact requirement id for required steps; capabilityRef remains the schema/definition reference. Supplemental contextual reads may use their capabilityRef without claiming completion of a required step. ')
+      + 'No schema search is needed for these supplied contracts. This is discovery evidence, not approval: actual effects, consent, scope, frozen requirements and once-only dispatch retain their existing gates. Admin, destructive, unknown-effect or dependent work still needs its proper plan/consent boundary.\n';
+    const nativeContractRow = (candidate: typeof candidates[number]) => ({
+      name: candidate.name, carrier: 'work_call',
+      capabilityVariants: candidate.capabilityVariants, argumentSchema: candidate.schema,
+    });
+    // Reuse the whole-inline presentation ceiling, including the guidance and
+    // aggregate JSON envelope. Never clip an executable schema. Select before
+    // publishing so an omitted contract stays on ordinary exact discovery,
+    // rather than being advertised as READY without its complete arguments.
+    // An opaque SDK model stays the selected adapter. Its context window is
+    // unknown here; do not resolve an unrelated saved brain as its window.
+    const budgetModelId = typeof options.model === 'string' ? options.model
+      : options.model == null ? resolveRoleModel('brain').modelId : undefined;
+    const eagerBudget = inlineResultBudgetForModel(budgetModelId);
+    const eagerCandidates: typeof candidates = [];
+    const eagerRows: ReturnType<typeof nativeContractRow>[] = [];
+    for (const candidate of candidates) {
+      const row = nativeContractRow(candidate);
+      if (nativeHintInstructions.length + JSON.stringify([...eagerRows, row]).length > eagerBudget) continue;
+      eagerCandidates.push(candidate);
+      eagerRows.push(row);
+    }
+    const published: Record<string, string> = {};
+    for (let i = 0; i < eagerCandidates.length; i += 20) {
+      Object.assign(published, await disclosePrimaryModelPlanningCapabilities({
+        authority: hostFreshPlanning.authority, candidates: eagerCandidates.slice(i, i + 20),
+      }));
+    }
+    const readyCandidates = eagerCandidates.filter(candidate => Boolean(published[candidate.name]));
+    if (readyCandidates.length > 0) {
+      const owned = snapshotPrimaryModelSelectedStagedPlanningDescriptors({
+        authority: hostFreshPlanning.authority, identity: hostFreshPlanning.identity,
+        selectedRefs: new Set(readyCandidates.flatMap(candidate =>
+          candidate.capabilityVariants.map(variant => variant.capabilityRef))),
+      });
+      const presentation = projectNativeHintPresentation({
+        instructions: nativeHintInstructions, candidates: readyCandidates, owned,
+        disclosedOperations: mergeWorkCallDisclosures(undefined, [...disclosedOperations, ...owned]),
+        budget: eagerBudget, planMode,
+      });
+      nativeHintContracts = presentation.contracts;
+      if (!planMode) workCallOptions.disclosedOperations = presentation.disclosedOperations;
+    }
+  }
   const narrowSurface = provenDisclosure.narrowSurface === true;
   const assembledTools = turnStateToolsLast([
     ...structuralTools.filter((toolRef) => (
@@ -4323,6 +4458,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           : '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly and deferred controls through their control-only `call_tool` carrier; `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
       : null,
     catalogBlock,
+    nativeHintContracts,
     turnDesk ? renderDeskNamesLine(turnDesk.deferred) : null,
     renderCapabilityCandidateCard(options.turnCandidates),
   ].filter(Boolean).join('\n\n');

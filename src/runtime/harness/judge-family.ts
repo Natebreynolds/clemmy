@@ -248,8 +248,9 @@ export interface HedgedJudgeResult<T> {
 export async function withJudgeHedge<T>(
   primary: (signal?: AbortSignal) => Promise<T>,
   hedge: ((signal?: AbortSignal) => Promise<T>) | null,
-  opts: { lane: JudgeMetricLane; hedgeDelayMs?: number; timeoutMs?: number },
+  opts: { lane: JudgeMetricLane; hedgeDelayMs?: number; timeoutMs?: number; signal?: AbortSignal },
 ): Promise<HedgedJudgeResult<T>> {
+  opts.signal?.throwIfAborted();
   const timeoutMs = opts.timeoutMs ?? boundaryJudgeTimeoutMs();
   const primaryController = new AbortController();
   const hedgeController = new AbortController();
@@ -257,7 +258,7 @@ export async function withJudgeHedge<T>(
     ? () => asJudgeRequest(opts.lane, () => hedge(hedgeController.signal))
     : null;
   const hedgeDelayMs = Math.min(opts.hedgeDelayMs ?? judgeHedgeDelayMs(), timeoutMs);
-  return await new Promise((resolve) => {
+  return await new Promise((resolve, reject) => {
     let settled = false;
     let hedgeFired = false;
     let primaryFailed = false;
@@ -266,11 +267,25 @@ export async function withJudgeHedge<T>(
     let hedgeTimer: ReturnType<typeof setTimeout> | undefined;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 
+    const clearWaits = () => {
+      if (hedgeTimer) clearTimeout(hedgeTimer);
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      opts.signal?.removeEventListener('abort', cancel);
+    };
+    const cancel = () => {
+      if (settled) return;
+      settled = true;
+      clearWaits();
+      primaryController.abort(opts.signal?.reason);
+      hedgeController.abort(opts.signal?.reason);
+      // Cancellation is neither a deadline miss nor a completed verdict. The
+      // caller owns it; returning null could turn Stop into failed-open success.
+      reject(opts.signal?.reason ?? new DOMException('Judge cancelled', 'AbortError'));
+    };
     const finish = (value: T | null, winner: 'primary' | 'hedge' | null) => {
       if (settled) return;
       settled = true;
-      if (hedgeTimer) clearTimeout(hedgeTimer);
-      if (deadlineTimer) clearTimeout(deadlineTimer);
+      clearWaits();
       // Freeze failure evidence before cancellation triggers transport rejection.
       // A late response cannot repair a verdict or spend further lookup turns.
       const receipt = { value, winner, hedgeFired, errors: [...errors] };
@@ -293,6 +308,8 @@ export async function withJudgeHedge<T>(
       );
     };
 
+    opts.signal?.addEventListener('abort', cancel, { once: true });
+    if (opts.signal?.aborted) { cancel(); return; }
     deadlineTimer = setTimeout(() => finish(null, null), timeoutMs);
     if (hedgeThunk) hedgeTimer = setTimeout(startHedge, hedgeDelayMs);
     asJudgeRequest(opts.lane, () => primary(primaryController.signal)).then(

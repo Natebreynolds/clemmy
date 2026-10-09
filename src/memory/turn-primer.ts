@@ -1,7 +1,7 @@
 import { withSessionMemoryScope } from './memory-scope.js';
 import { getRuntimeEnv } from '../config.js';
 import { getFact, recordFactImpression, type ConsolidatedFact } from './facts.js';
-import { appendFactRecallTrace } from './recall-trace.js';
+import { appendFactRecallTrace, recallSelectionDiagnostic, recallSelectionRef, RECALL_SELECTION_TRACE_CAP, type RecallSelectionStage } from './recall-trace.js';
 import {
   formatUnifiedPrimer,
   projectedRecallAnswerability,
@@ -55,7 +55,9 @@ export const RANKED_TAIL_TITLE = '## Relevant To This Request';
 export const RANKED_TAIL_USE_RULE = 'Ranked by a memory search for this request: candidates, not proof. Use complete, applicable facts with their dates; a dated record does not establish another date. Reopen a ref when a value is missing or its scope is uncertain.';
 
 /** Apply the tail's selection to the ranker's hits, in the ranker's order. */
-export function selectRankedTailHits(hits: readonly UnifiedHit[], selection: RankedTailSelection): UnifiedHit[] {
+export function selectRankedTailHits(hits: readonly UnifiedHit[], selection: RankedTailSelection,
+  observeSelection?: (stage: RecallSelectionStage) => void,
+): UnifiedHit[] {
   const excluded = selection.excludeRefKeys ?? new Set<string>();
   const shownElsewhere = (hit: UnifiedHit): boolean => {
     const ref = unifiedHitRecallRef(hit);
@@ -64,7 +66,16 @@ export function selectRankedTailHits(hits: readonly UnifiedHit[], selection: Ran
       || ((hit.type === 'policy' || hit.type === 'fact') && (excluded.has(`policy:${hit.ref}`) || excluded.has(`fact:${hit.ref}`)));
   };
   const candidates = hits.filter((hit) => !shownElsewhere(hit));
-  if (candidates.length === 0) return [];
+  if (candidates.length === 0) {
+    try { observeSelection?.({ stage: 'tail_selection', candidates: hits.length, selected: 0,
+      rowsOmitted: Math.max(0, hits.length - RECALL_SELECTION_TRACE_CAP), relativeFloor: selection.relativeFloor,
+      reservedPolicySlots: selection.reservedPolicySlots,
+      rows: hits.slice(0, RECALL_SELECTION_TRACE_CAP).map((hit, index) => ({
+        ref: recallSelectionRef(unifiedHitRecallRef(hit).type, hit.ref), rank: index + 1,
+        score: hit.score, reason: 'core_already_visible',
+      })) }); } catch { /* diagnostic only */ }
+    return [];
+  }
   const policies = candidates.filter((hit) => hit.type === 'policy').slice(0, Math.max(0, selection.reservedPolicySlots));
   const reserved = new Set(policies);
   const fraction = Math.max(0, Math.min(1, selection.relativeFloor));
@@ -81,7 +92,17 @@ export function selectRankedTailHits(hits: readonly UnifiedHit[], selection: Ran
   // The block is filled in this order and a line that does not fit is left
   // out. A record of earlier work is several times the length of a fact, so
   // what is known takes its place first and earlier work takes what remains.
-  return [...policies, ...kept.filter((hit) => hit.type !== 'episode'), ...kept.filter((hit) => hit.type === 'episode')];
+  const selected = [...policies, ...kept.filter((hit) => hit.type !== 'episode'), ...kept.filter((hit) => hit.type === 'episode')];
+  try { observeSelection?.({ stage: 'tail_selection', candidates: hits.length, selected: selected.length,
+    rowsOmitted: Math.max(0, hits.length - RECALL_SELECTION_TRACE_CAP), relativeFloor: fraction,
+    reservedPolicySlots: selection.reservedPolicySlots,
+    rows: hits.slice(0, RECALL_SELECTION_TRACE_CAP).map((hit, index) => ({
+      ref: recallSelectionRef(unifiedHitRecallRef(hit).type, hit.ref), rank: index + 1, score: hit.score,
+      reason: shownElsewhere(hit) ? 'core_already_visible' : reserved.has(hit) ? 'reserved_policy'
+        : clears(hit) ? 'selected' : 'relative_floor',
+      ...(selected.includes(hit) ? { rankOut: selected.indexOf(hit) + 1 } : {}),
+    })) }); } catch { /* diagnostic failure cannot affect selection */ }
+  return selected;
 }
 
 type RecallEverythingFn = typeof recallEverything;
@@ -148,6 +169,8 @@ function recordPrimerExposure(
     includedCount: counts.included,
     omittedCount: Math.max(0, counts.retrieved - counts.included),
     candidateCount: result.diagnostics?.candidates ?? counts.retrieved,
+    selection: recallSelectionDiagnostic(result),
+    recallId: result.recallId,
   });
 }
 
@@ -237,7 +260,13 @@ async function buildUnifiedTurnPrimerInScope(
   });
 
   const retrievedBeforeFilter = result.hits.length;
-  if (input.selection) result.hits = selectRankedTailHits(result.hits, input.selection);
+  const selectionDiagnostic = recallSelectionDiagnostic(result);
+  const observeSelection = selectionDiagnostic
+    ? (stage: RecallSelectionStage) => {
+      selectionDiagnostic.stages = [...selectionDiagnostic.stages.filter(previous => previous.stage !== stage.stage), stage].slice(0, 3);
+    }
+    : undefined;
+  if (input.selection) result.hits = selectRankedTailHits(result.hits, input.selection, observeSelection);
   const tailFormat = input.format === 'tail';
 
   const recallId = createRecallRunId();
@@ -264,7 +293,7 @@ async function buildUnifiedTurnPrimerInScope(
     ? Math.max(0, maxChars - MEMORY_PRIMER_MARKER.length - RANKED_TAIL_TITLE.length - RANKED_TAIL_USE_RULE.length - 4)
     : Math.max(0, maxChars - preamble.length - RULE_RESERVE - 2);
   const retrievedHitCount = retrievedBeforeFilter;
-  result.hits = visibleUnifiedPrimerHits(result, recallBudget, { header: !tailFormat });
+  result.hits = visibleUnifiedPrimerHits(result, recallBudget, { header: !tailFormat, observeSelection });
   result.answerability = projectedRecallAnswerability(result, result.hits);
   const useRule = result.purpose === 'ambient'
     ? AMBIENT_USE_RULE

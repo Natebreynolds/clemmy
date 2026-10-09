@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { BASE_DIR } from '../config.js';
 import type { ConsolidatedFact } from './facts.js';
 
@@ -13,6 +14,90 @@ import type { ConsolidatedFact } from './facts.js';
  */
 const TRACE_FILE = path.join(BASE_DIR, 'state', 'memory-recall-trace.jsonl');
 const MAX_LINES = 3000;
+
+export const RECALL_SELECTION_TRACE_CAP = 128;
+export interface RecallSelectionRef { type: string; id?: string; digest?: string }
+export interface RecallSelectionRow {
+  ref: RecallSelectionRef;
+  rank: number;
+  reason: string;
+  score?: number;
+  scoreBeforeDistinctiveness?: number;
+  scoreAfterDistinctiveness?: number;
+  distinctiveCueApplied?: boolean;
+  lineChars?: number;
+  rankOut?: number;
+}
+export interface RecallSelectionStage {
+  stage: 'topK' | 'tail_selection' | 'primer_bytes';
+  candidates: number;
+  selected: number;
+  rowsOmitted: number;
+  rows: RecallSelectionRow[];
+  limit?: number;
+  relativeFloor?: number;
+  reservedPolicySlots?: number;
+  maxChars?: number;
+  initialChars?: number;
+}
+export interface RecallSelectionDiagnostic {
+  version: 1;
+  asOf: string;
+  admitted: number;
+  stages: RecallSelectionStage[];
+}
+
+const selectionSidecars = new WeakMap<object, RecallSelectionDiagnostic>();
+export function recallSelectionDiagnostic(result: object): RecallSelectionDiagnostic | undefined {
+  return selectionSidecars.get(result);
+}
+export function retainRecallSelectionDiagnostic(result: object, diagnostic: RecallSelectionDiagnostic): void {
+  selectionSidecars.set(result, diagnostic);
+}
+
+/** Exact numeric identities; opaque digests for path/URI-bearing refs. */
+export function recallSelectionRef(type: string, id: string | number): RecallSelectionRef {
+  const value = String(id);
+  const safeType = /^(fact|policy|entity|resource|episode|note|vault|procedure|tool-recall|deliverable)$/.test(type) ? type : 'other';
+  return /^(fact|policy|entity|resource)$/.test(safeType) && /^\d{1,20}$/.test(value)
+    ? { type: safeType, id: value }
+    : { type: safeType, digest: createHash('sha256').update(value).digest('hex') };
+}
+
+/** Keep actual selected rows even when duplicate-heavy ranking passes the cap. */
+export function retainRecallSelectionRow(rows: RecallSelectionRow[], row: RecallSelectionRow): void {
+  if (rows.length < RECALL_SELECTION_TRACE_CAP) { rows.push(row); return; }
+  if (row.reason !== 'selected') return;
+  let replace = rows.length - 1;
+  while (replace >= 0 && rows[replace].reason === 'selected') replace -= 1;
+  if (replace >= 0) rows[replace] = row;
+}
+
+function privateSelectionDiagnostic(diagnostic: RecallSelectionDiagnostic): RecallSelectionDiagnostic {
+  const finite = (value: number | undefined): number | undefined => Number.isFinite(value) ? value : undefined;
+  const count = (value: number): number => Math.max(0, Math.floor(finite(value) ?? 0));
+  // Copy a whitelist only. A diagnostic caller must not accidentally persist
+  // source text, excerpts, queries, paths or arbitrary fields here.
+  return {
+    version: 1, asOf: /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(diagnostic.asOf) ? diagnostic.asOf : '',
+    admitted: count(diagnostic.admitted),
+    stages: diagnostic.stages.filter(stage => /^(topK|tail_selection|primer_bytes)$/.test(stage.stage)).slice(0, 3).map(stage => ({
+      stage: stage.stage, candidates: count(stage.candidates), selected: count(stage.selected),
+      rowsOmitted: Math.max(count(stage.rowsOmitted), stage.rows.length - RECALL_SELECTION_TRACE_CAP),
+      limit: finite(stage.limit), relativeFloor: finite(stage.relativeFloor),
+      reservedPolicySlots: finite(stage.reservedPolicySlots), maxChars: finite(stage.maxChars), initialChars: finite(stage.initialChars),
+      rows: stage.rows.slice(0, RECALL_SELECTION_TRACE_CAP).map(row => ({
+        ref: row.ref.id !== undefined ? recallSelectionRef(row.ref.type, row.ref.id)
+          : { type: recallSelectionRef(row.ref.type, '').type, digest: /^[a-f0-9]{64}$/.test(row.ref.digest ?? '') ? row.ref.digest : undefined },
+        rank: count(row.rank), rankOut: finite(row.rankOut),
+        reason: /^(selected|similarity_duplicate|topK|core_already_visible|reserved_policy|relative_floor|byte_budget|forced_first_oversize)$/.test(row.reason) ? row.reason : 'other',
+        score: finite(row.score), scoreBeforeDistinctiveness: finite(row.scoreBeforeDistinctiveness),
+        scoreAfterDistinctiveness: finite(row.scoreAfterDistinctiveness),
+        distinctiveCueApplied: row.distinctiveCueApplied === true, lineChars: finite(row.lineChars),
+      })),
+    })),
+  };
+}
 
 export type FactRecallSurface =
   | 'facts_for_instructions'
@@ -43,6 +128,8 @@ export interface FactRecallTraceEntry {
   omittedCount?: number;
   candidateCount?: number;
   enforcementBackedCount?: number;
+  /** Private bounded selection metadata. Exact source joins via recallId. */
+  selection?: RecallSelectionDiagnostic & { recallId?: string; sessionId?: string };
 }
 
 function truncate(s: string | undefined, max = 500): string | undefined {
@@ -63,6 +150,8 @@ export function appendFactRecallTrace(input: {
   omittedCount?: number;
   candidateCount?: number;
   enforcementBackedCount?: number;
+  selection?: RecallSelectionDiagnostic;
+  recallId?: string;
 }): void {
   try {
     const facts = input.facts
@@ -95,6 +184,11 @@ export function appendFactRecallTrace(input: {
     if (objective) entry.objective = objective;
     if (input.mode) entry.mode = input.mode;
     if (input.sessionId) entry.sessionId = input.sessionId;
+    if (input.selection) entry.selection = {
+      ...privateSelectionDiagnostic(input.selection),
+      ...(input.recallId && /^mr-[a-f0-9-]{36}$/.test(input.recallId) ? { recallId: input.recallId } : {}),
+      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    };
 
     mkdirSync(path.dirname(TRACE_FILE), { recursive: true });
     appendFileSync(TRACE_FILE, `${JSON.stringify(entry)}\n`);

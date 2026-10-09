@@ -1,7 +1,7 @@
 import { READ_FILE_PARAMS } from './local-file-read-contract.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
-import { isKillRequested } from '../runtime/harness/eventlog.js';
+import { appendEvent, isKillRequested, type AppendEventInput } from '../runtime/harness/eventlog.js';
 import { WRITE_FILE_PARAMS } from './local-file-write-contract.js';
 import { spawn } from 'node:child_process';
 import { CLI_CATALOG } from '../integrations/cli-catalog/catalog.js';
@@ -9,6 +9,7 @@ import { catalogInstallForPlatform } from '../integrations/cli-catalog/platform-
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
@@ -46,7 +47,7 @@ import {
 import { isConvertibleExtension } from '../runtime/markitdown.js';
 import { ingestAttachment } from '../runtime/attachments.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
-import { callIdFromToolDetails, getToolOutputContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
+import { callIdFromToolDetails, getToolOutputContext, sessionIdFromRunContext, sourceUserSeqFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { classifyShellNetworkMutation, expandLiteralShellCommands } from '../runtime/harness/destination-gate.js';
 import { isSensitivePath, redactSensitiveText, shellCommandTouchesSensitiveData } from '../runtime/security.js';
 import { SPACES_DIR, isValidSpaceSlug, spaceStore } from '../spaces/store.js';
@@ -1547,68 +1548,173 @@ export async function executeLocalFileWrite(input: z.infer<z.ZodObject<typeof WR
     result: [text, revision.previousPath ? `Previous bytes retained at ${revision.previousPath}.` : null, notice].filter(Boolean).join('\n\n') });
 }
 
+type LocalReadTimingStage = 'path_checks' | 'file_read' | 'ingest' | 'redaction' | 'format_retain';
+type LocalReadTimingKind = 'unresolved' | 'text' | 'html' | 'converted';
+type LocalReadTimingOutcome = 'returned' | 'sensitive_refusal' | 'missing' | 'not_file' | 'ingest_error' | 'threw';
+interface LocalReadTimingDependencies {
+  now: () => number;
+  emit: (event: AppendEventInput) => void;
+  ingest: typeof ingestAttachment;
+}
+
+/** Private timing only: the existing invocation owns attribution, never a path
+ * or a nearest journal row. A broken clock/diagnostic cannot change a read. */
+function beginLocalReadTiming(dependencies: LocalReadTimingDependencies, runContext: unknown, details: unknown) {
+  let context: ReturnType<typeof getToolOutputContext>;
+  let valid = false;
+  try {
+    const active = getToolOutputContext();
+    // Snapshot scalar identity so a changed async context cannot relabel the
+    // diagnostic after conversion finishes.
+    context = active ? { sessionId: active.sessionId, sourceUserSeq: active.sourceUserSeq,
+      callId: active.callId, toolName: active.toolName, settlementNonce: active.settlementNonce } : undefined;
+    const suppliedSession = sessionIdFromRunContext(runContext);
+    const suppliedCall = callIdFromToolDetails(details);
+    const suppliedSource = sourceUserSeqFromRunContext(runContext);
+    valid = Boolean(context?.sessionId?.trim() && context.callId?.trim()
+      && context.toolName === 'read_file' && context.settlementNonce?.trim()
+      && Number.isSafeInteger(context.sourceUserSeq) && (context.sourceUserSeq ?? 0) > 0
+      && (!suppliedSession || suppliedSession === context.sessionId)
+      && (!suppliedSource || suppliedSource === context.sourceUserSeq)
+      && (!suppliedCall || suppliedCall === context.callId));
+  } catch { /* attribution failures disable only the diagnostic */ }
+  const durations: Partial<Record<LocalReadTimingStage, number>> = {};
+  let previous = -Infinity;
+  const now = (): number | undefined => {
+    if (!valid) return undefined;
+    try {
+      const value = dependencies.now();
+      if (!Number.isFinite(value) || value < previous) { valid = false; return undefined; }
+      previous = value;
+      return value;
+    } catch { valid = false; return undefined; }
+  };
+  const started = now();
+  const settle = (stage: LocalReadTimingStage, began: number | undefined) => {
+    const ended = now();
+    if (began !== undefined && ended !== undefined) durations[stage] = (durations[stage] ?? 0) + ended - began;
+  };
+  return {
+    sync<T>(stage: LocalReadTimingStage, work: () => T): T {
+      const began = now();
+      try { return work(); } finally { settle(stage, began); }
+    },
+    async async<T>(stage: LocalReadTimingStage, work: () => Promise<T>): Promise<T> {
+      const began = now();
+      try { return await work(); } finally { settle(stage, began); }
+    },
+    finish(readKind: LocalReadTimingKind, outcome: LocalReadTimingOutcome) {
+      const ended = now();
+      try {
+        const current = getToolOutputContext();
+        if (!valid || started === undefined || ended === undefined || !context || !current
+          || current.sessionId !== context.sessionId || current.sourceUserSeq !== context.sourceUserSeq
+          || current.callId !== context.callId || current.toolName !== 'read_file'
+          || current.settlementNonce !== context.settlementNonce) return;
+        dependencies.emit({ sessionId: context.sessionId!, turn: 0, role: 'system', type: 'turn_phase_timings', data: {
+          version: 1, lane: 'local_file_read', clock: 'monotonic', sourceUserSeq: context.sourceUserSeq,
+          callId: context.callId, tool: 'read_file', readKind, outcome, durationsMs: durations, totalMs: ended - started,
+        } });
+      } catch { /* diagnostic only; returned bytes and thrown errors stay intact */ }
+    },
+  };
+}
+
+async function executeLocalFileReadWithDependencies(
+  input: z.infer<z.ZodObject<typeof READ_FILE_PARAMS>>,
+  runContext?: unknown, details?: unknown,
+  options?: { failOnReadError?: boolean; completeOutput?: boolean },
+  dependencies: LocalReadTimingDependencies = {
+    now: () => performance.now(), emit: (event) => { appendEvent(event); }, ingest: ingestAttachment,
+  },
+) {
+  const timing = beginLocalReadTiming(dependencies, runContext, details);
+  let readKind: LocalReadTimingKind = 'unresolved';
+  let outcome: LocalReadTimingOutcome = 'threw';
+  try {
+    const formatToolOutput = (toolName: string, runContext: unknown, details: unknown, output: string, maxChars?: number): string => {
+      const redacted = timing.sync('redaction', () => redactSensitiveText(output));
+      // A structured workflow consumes data, not a model-facing preview. Its
+      // invocation kernel retains these complete bytes before downstream use.
+      if (options?.completeOutput) return redacted;
+      return timing.sync('format_retain', () => formatRecallableToolText(redacted, {
+        toolName, sessionId: sessionIdFromRunContext(runContext),
+        callId: callIdFromToolDetails(details), maxChars,
+      }));
+    };
+    const filePath = timing.sync('path_checks', () => resolveAllowedPath(input.path));
+    // Credential material is refused, never asked about (owner rule
+    // 2026-08-07). The secret stays out of the model's context and the
+    // autonomous run is not interrupted for a question with one answer.
+    if (timing.sync('path_checks', () => isSensitivePath(filePath))) {
+      outcome = 'sensitive_refusal';
+      if (options?.failOnReadError) return new InvalidArgumentsPreDispatchResult('Credential files cannot be read.');
+      return 'Refused: that file holds credential material, and Clementine never needs raw secrets to do work. '
+        + 'Nothing was read and no approval is needed — the provider connections are already authenticated, so use '
+        + 'the connection/toolkit directly (composio_status for configuration state).';
+    }
+    if (!timing.sync('path_checks', () => existsSync(filePath))) {
+      outcome = 'missing';
+      return new InvalidArgumentsPreDispatchResult(`File does not exist: ${filePath}`);
+    }
+    if (!timing.sync('path_checks', () => statSync(filePath).isFile())) {
+      outcome = 'not_file';
+      return new InvalidArgumentsPreDispatchResult(`Not a file: ${filePath}`);
+    }
+    // HTML/HTM are TEXT — read the raw source. A Workspace view is edited AS
+    // HTML, so routing it through markitdown strips the tags (and was erroring
+    // on workspace views: "An error occurred while running the tool"). Only
+    // non-text formats (PDF/Word/Excel/audio/images) take the ingest path.
+    const readExt = timing.sync('path_checks', () => path.extname(filePath).toLowerCase());
+    const isHtmlSource = readExt === '.html' || readExt === '.htm';
+    if (timing.sync('path_checks', () => isConvertibleExtension(filePath)) && !isHtmlSource) {
+      readKind = 'converted';
+      // Route through the unified ingestion pipeline so audio→Whisper,
+      // image→vision OCR, and docs→markitdown all behave identically here.
+      const ingested = await timing.async('ingest', () => dependencies.ingest({ name: path.basename(filePath), sourcePath: filePath }));
+      if (ingested.error) {
+        outcome = 'ingest_error';
+        const detail = `Could not read ${path.basename(filePath)}: ${ingested.error}`;
+        return options?.failOnReadError ? new InvalidArgumentsPreDispatchResult(detail) : detail;
+      }
+      const output = formatToolOutput(
+        'read_file',
+        runContext,
+        details,
+        ingested.markdown ?? '',
+        input.max_chars ?? undefined,
+      );
+      outcome = 'returned';
+      return output;
+    }
+    readKind = isHtmlSource ? 'html' : 'text';
+    const text = timing.sync('file_read', () => readFileSync(filePath, 'utf-8'));
+    const output = formatToolOutput(
+      'read_file',
+      runContext,
+      details,
+      // A page read here is its source. Asked to look at a rendered page, a turn
+      // read the source and answered from it (live 2026-09-29); the result says
+      // where the picture is, only when a page was read, and never to a workflow
+      // that consumes the bytes as data.
+      isHtmlSource && !options?.completeOutput ? `${PAGE_SOURCE_NOTE}\n\n${text}` : text,
+      input.max_chars ?? undefined,
+    );
+    outcome = 'returned';
+    return output;
+  } finally { timing.finish(readKind, outcome); }
+}
+
 export async function executeLocalFileRead(
   input: z.infer<z.ZodObject<typeof READ_FILE_PARAMS>>,
   runContext?: unknown, details?: unknown,
   options?: { failOnReadError?: boolean; completeOutput?: boolean },
 ) {
-  const formatToolOutput = (toolName: string, runContext: unknown, details: unknown, output: string, maxChars?: number): string => {
-    const redacted = redactSensitiveText(output);
-    // A structured workflow consumes data, not a model-facing preview. Its
-    // invocation kernel retains these complete bytes before downstream use.
-    if (options?.completeOutput) return redacted;
-    return formatRecallableToolText(redacted, {
-      toolName, sessionId: sessionIdFromRunContext(runContext),
-      callId: callIdFromToolDetails(details), maxChars,
-    });
-  };
-  const filePath = resolveAllowedPath(input.path);
-  // Credential material is refused, never asked about (owner rule
-  // 2026-08-07). The secret stays out of the model's context and the
-  // autonomous run is not interrupted for a question with one answer.
-  if (isSensitivePath(filePath)) {
-    if (options?.failOnReadError) return new InvalidArgumentsPreDispatchResult('Credential files cannot be read.');
-    return 'Refused: that file holds credential material, and Clementine never needs raw secrets to do work. '
-      + 'Nothing was read and no approval is needed — the provider connections are already authenticated, so use '
-      + 'the connection/toolkit directly (composio_status for configuration state).';
-  }
-  if (!existsSync(filePath)) return new InvalidArgumentsPreDispatchResult(`File does not exist: ${filePath}`);
-  if (!statSync(filePath).isFile()) return new InvalidArgumentsPreDispatchResult(`Not a file: ${filePath}`);
-  // HTML/HTM are TEXT — read the raw source. A Workspace view is edited AS
-  // HTML, so routing it through markitdown strips the tags (and was erroring
-  // on workspace views: "An error occurred while running the tool"). Only
-  // non-text formats (PDF/Word/Excel/audio/images) take the ingest path.
-  const readExt = path.extname(filePath).toLowerCase();
-  const isHtmlSource = readExt === '.html' || readExt === '.htm';
-  if (isConvertibleExtension(filePath) && !isHtmlSource) {
-    // Route through the unified ingestion pipeline so audio→Whisper,
-    // image→vision OCR, and docs→markitdown all behave identically here.
-    const ingested = await ingestAttachment({ name: path.basename(filePath), sourcePath: filePath });
-    if (ingested.error) {
-      const detail = `Could not read ${path.basename(filePath)}: ${ingested.error}`;
-      return options?.failOnReadError ? new InvalidArgumentsPreDispatchResult(detail) : detail;
-    }
-    return formatToolOutput(
-      'read_file',
-      runContext,
-      details,
-      ingested.markdown ?? '',
-      input.max_chars ?? undefined,
-    );
-  }
-  const text = readFileSync(filePath, 'utf-8');
-  return formatToolOutput(
-    'read_file',
-    runContext,
-    details,
-    // A page read here is its source. Asked to look at a rendered page, a turn
-    // read the source and answered from it (live 2026-09-29); the result says
-    // where the picture is, only when a page was read, and never to a workflow
-    // that consumes the bytes as data.
-    isHtmlSource && !options?.completeOutput ? `${PAGE_SOURCE_NOTE}\n\n${text}` : text,
-    input.max_chars ?? undefined,
-  );
+  return executeLocalFileReadWithDependencies(input, runContext, details, options);
 }
+
+/** Deterministic diagnostics/conversion seam for isolated tests, never a tool. */
+export const _testOnly_executeLocalFileReadWithDependencies = executeLocalFileReadWithDependencies;
 
 /** Said at the top of an .html file's source. */
 export const PAGE_SOURCE_NOTE = '[This is the page\'s source. To see how it LOOKS, as a browser shows it, use page_preview.]';

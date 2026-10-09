@@ -14,7 +14,14 @@ export interface AgentSystemGuidance {
   text: string;
 }
 
+export interface AgentSystemGuidanceOptions {
+  /** The caller knows whether the deterministic fan-out governor needs policy.
+   * Omitted retains the standalone renderer's existing policy projection. */
+  needsCoordinationPolicy?: boolean;
+}
+
 const CACHE_MS = 30_000;
+let metricsCollector = collectAgentSystemMetrics;
 let cachedAt = 0;
 let cachedRecommendations: AgentSystemRecommendation[] = [];
 let cachedPolicy: CoordinationPolicySnapshot | null = null;
@@ -25,6 +32,13 @@ export function __resetAgentSystemGuidanceCacheForTests(): void {
   cachedRecommendations = [];
   cachedPolicy = null;
   cachedSummary = '';
+}
+
+export function __setAgentSystemGuidanceCollectorForTests(
+  collector: typeof collectAgentSystemMetrics | null,
+): void {
+  metricsCollector = collector ?? collectAgentSystemMetrics;
+  __resetAgentSystemGuidanceCacheForTests();
 }
 
 function guidanceAllowedForSession(kind?: string): boolean {
@@ -49,7 +63,7 @@ function positiveCoordinationSignalText(input: string): string {
     .replace(/\bno\s+(?:retry|rerun|replan|workflow|automation|loop|fan[- ]?out|delegation)\b[^.!?\n;]*/gi, ' ');
 }
 
-function recommendationRelevantToInput(rec: AgentSystemRecommendation, input: string): boolean {
+function recommendationRelevantToInput(rec: Pick<AgentSystemRecommendation, 'kind'>, input: string): boolean {
   const text = positiveCoordinationSignalText(input).toLowerCase();
   if (rec.kind === 'swarm') {
     return /\b(agent|agents|swarm|delegate|delegation|review|debate|parallel|worker|fan[- ]?out|specialist)\b/.test(text)
@@ -61,6 +75,19 @@ function recommendationRelevantToInput(rec: AgentSystemRecommendation, input: st
   // repairing, retrying, or asking about workflow-system health.
   return /\b(?:retry|replan|rerun|repair|fix|debug|failed|failure|error|issue|loop|health|effectiveness|observability|optimi[sz]|improv|failed items?)\b/.test(text)
     && /\b(?:workflow|automation|automate|run|task|job|schedule|loop|system)\b/.test(text);
+}
+
+// Exhaustive over recommendation families: deciding whether collection can be
+// skipped must use the same predicate as filtering the collected snapshot.
+// A new family requires this list to be updated before compilation succeeds.
+const RECOMMENDATION_KINDS: Record<AgentSystemRecommendation['kind'], true> = {
+  swarm: true,
+  loop: true,
+};
+
+function anyRecommendationRelevantToInput(input: string): boolean {
+  return (Object.keys(RECOMMENDATION_KINDS) as AgentSystemRecommendation['kind'][])
+    .some((kind) => recommendationRelevantToInput({ kind }, input));
 }
 
 /** Repair/learning modes summarize failures in existing workflow loops. They
@@ -105,7 +132,7 @@ function loadGuidanceSnapshot(): {
     return { recommendations: cachedRecommendations, policy: cachedPolicy, summary: cachedSummary };
   }
   try {
-    const metrics = collectAgentSystemMetrics();
+    const metrics = metricsCollector();
     cachedRecommendations = metrics.recommendations ?? [];
     cachedPolicy = metrics.coordination ?? null;
     cachedSummary = renderMetricsSummary(metrics);
@@ -124,8 +151,19 @@ function clip(text: string, max: number): string {
   return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max)}...`;
 }
 
-export function renderAgentSystemGuidance(input: string, sessionKind?: string): AgentSystemGuidance {
+export function renderAgentSystemGuidance(
+  input: string,
+  sessionKind?: string,
+  opts?: AgentSystemGuidanceOptions,
+): AgentSystemGuidance {
   if (!guidanceAllowedForSession(sessionKind)) {
+    return { injected: false, recommendationCount: 0, recommendations: [], policy: null, summary: '', text: '' };
+  }
+
+  // Only an explicit caller decision can omit the governor's policy. Ordinary
+  // single-item requests need neither it nor irrelevant global diagnostics,
+  // so avoid collecting the full metrics snapshot in that case.
+  if (opts?.needsCoordinationPolicy === false && !anyRecommendationRelevantToInput(input)) {
     return { injected: false, recommendationCount: 0, recommendations: [], policy: null, summary: '', text: '' };
   }
 

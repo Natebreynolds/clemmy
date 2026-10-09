@@ -508,10 +508,27 @@ export class ResilientModel implements Model {
     return this.policy.now ? this.policy.now() : Date.now();
   }
 
-  private sleep(ms: number): Promise<void> {
-    if (this.policy.sleep) return this.policy.sleep(ms);
-    if (ms <= 0) return Promise.resolve();
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  private async sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const wait = this.policy.sleep ? this.policy.sleep(ms)
+      : ms <= 0 ? Promise.resolve()
+        : new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); });
+    if (!signal) return wait;
+    let onAbort: (() => void) | undefined;
+    try {
+      // Observe both promises immediately. An injected sleep may settle after
+      // cancellation; it must not strand this call or reject unobserved.
+      await Promise.race([wait, new Promise<never>((_, reject) => {
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      })]);
+      signal.throwIfAborted();
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+    }
   }
 
   /** Shared pre-attempt failure handling: decide retry, refresh auth once, back
@@ -536,10 +553,14 @@ export class ResilientModel implements Model {
       if (!this.policy.refreshAuth || authRefreshed.value) return false;
       authRefreshed.value = true;
       try {
-        await telemetry.wait(attempt + 1, 'auth_refresh', cls.kind, 0, () => this.policy.refreshAuth!());
+        await telemetry.wait(attempt + 1, 'auth_refresh', cls.kind, 0, () => {
+          call.signal?.throwIfAborted();
+          return this.policy.refreshAuth!();
+        });
       } catch {
         return false;
       }
+      if (call.signal?.aborted) return false;
       logger.warn({ label: this.policy.label, path, attempt: attempt + 1, kind: cls.kind }, 'model auth expired — refreshed token, retrying');
       return true;
     }
@@ -573,7 +594,8 @@ export class ResilientModel implements Model {
       'model call failed before content — retrying transparently',
     );
     if (noAnswer) call.noAnswerRetries += 1;
-    await telemetry.wait(attempt + 1, 'transient_failure', cls.kind, wait, () => this.sleep(wait));
+    await telemetry.wait(attempt + 1, 'transient_failure', cls.kind, wait, () => this.sleep(wait, call.signal));
+    call.signal?.throwIfAborted();
     return true;
   }
 
@@ -587,17 +609,24 @@ export class ResilientModel implements Model {
     let effortStripped = false;
     try {
     for (let attempt = 0; ; attempt++) {
+      call.signal?.throwIfAborted();
       telemetry.startAttempt(attempt + 1);
       try {
+        call.signal?.throwIfAborted();
         const res = await this.inner.getResponse(req);
+        if (isEmptyResponse(res) && call.signal?.aborted) {
+          telemetry.finishAttempt('cancelled', false, true, 'model.empty_completion');
+          call.signal.throwIfAborted();
+        }
         if (isEmptyResponse(res) && isProviderRefusalFinish(res.providerData?.finishReason)) {
           throw providerRefusalError(this.policy.label);
         }
         if (isEmptyResponse(res) && attempt < this.maxRetries) {
           telemetry.finishAttempt('failed', false, true, 'model.empty_completion');
+          call.signal?.throwIfAborted();
           logger.warn({ label: this.policy.label, attempt: attempt + 1 }, 'model returned empty completion — retrying (always-an-output invariant)');
           const wait = backoffMs(attempt, { retryable: true, kind: 'model.empty_completion', isAuth: false });
-          await telemetry.wait(attempt + 1, 'empty_completion', 'model.empty_completion', wait, () => this.sleep(wait));
+          await telemetry.wait(attempt + 1, 'empty_completion', 'model.empty_completion', wait, () => this.sleep(wait, call.signal));
           continue;
         }
         if (isEmptyResponse(res)) {
@@ -610,12 +639,16 @@ export class ResilientModel implements Model {
             context: { label: this.policy.label, attempts: attempt + 1 },
           });
         }
-        telemetry.finishAttempt('returned', true, true);
-        outcome = 'returned';
+        // Preserve a completed response (including its observed usage) for the
+        // surrounding recorder. Cancellation still withdraws caller authority;
+        // it never grants this wrapper another physical request.
+        outcome = call.signal?.aborted ? 'cancelled' : 'returned';
+        telemetry.finishAttempt(outcome, true, true);
         return res;
       } catch (err) {
         telemetry.finishAttempt(request.signal?.aborted ? 'cancelled' : 'failed', false, false,
           telemetryFailureKind(err), telemetryFailureStatus(err));
+        if (call.signal?.aborted) throw err;
         if (err instanceof BoundaryError) throw err;
         if (!effortStripped && isEffortRejection(err)) {
           effortStripped = true;
@@ -646,6 +679,7 @@ export class ResilientModel implements Model {
 
     try {
     for (let attempt = 0; ; attempt++) {
+      call.signal?.throwIfAborted();
       telemetry.startAttempt(attempt + 1);
       // Stream events to the Runner AS THEY ARRIVE so the loop's stream-stall
       // watchdog — and the user — sees the model working. Reasoning + tool-call
@@ -668,6 +702,7 @@ export class ResilientModel implements Model {
       let doneEmpty = false;
 
       try {
+        call.signal?.throwIfAborted();
         for await (const ev of this.inner.getStreamedResponse(req)) {
           const e = ev as { type?: string; event?: { type?: string; finishReason?: unknown }; response?: { output?: unknown[]; providerData?: { finishReason?: unknown } } };
           if (!committed && ((e.type === 'model' && e.event?.type === 'finish' && isProviderRefusalFinish(e.event.finishReason))
@@ -697,6 +732,7 @@ export class ResilientModel implements Model {
       } catch (err) {
         telemetry.finishAttempt(request.signal?.aborted ? 'cancelled' : 'failed', committed, sawDone,
           telemetryFailureKind(err), telemetryFailureStatus(err));
+        if (call.signal?.aborted) throw err;
         if (committed) throw err; // real content already escaped — cannot safely retry
         if (err instanceof BoundaryError) throw err;
         if (!effortStripped && isEffortRejection(err)) {
@@ -714,11 +750,16 @@ export class ResilientModel implements Model {
       // remains; otherwise throw the retryable boundary error — NEVER yield a
       // clean empty response_done (mirrors getResponse + the Codex adapter).
       if (doneEmpty && !committed) {
+        if (call.signal?.aborted) {
+          telemetry.finishAttempt('cancelled', false, true, 'model.empty_completion');
+          call.signal.throwIfAborted();
+        }
         telemetry.finishAttempt('failed', false, true, 'model.empty_completion');
+        call.signal?.throwIfAborted();
         if (attempt < this.maxRetries) {
           logger.warn({ label: this.policy.label, attempt: attempt + 1 }, 'streamed empty completion — retrying (always-an-output invariant)');
           const wait = backoffMs(attempt, { retryable: true, kind: 'model.empty_completion', isAuth: false });
-          await telemetry.wait(attempt + 1, 'empty_completion', 'model.empty_completion', wait, () => this.sleep(wait));
+          await telemetry.wait(attempt + 1, 'empty_completion', 'model.empty_completion', wait, () => this.sleep(wait, call.signal));
           continue;
         }
         throw new BoundaryError({
@@ -732,12 +773,17 @@ export class ResilientModel implements Model {
       // If the stream ended with no done event and nothing committed, surface a
       // retryable boundary error (don't fabricate a clean end).
       if (!sawDone && !committed) {
+        if (call.signal?.aborted) {
+          telemetry.finishAttempt('cancelled', false, false, 'model.transport_timeout');
+          call.signal.throwIfAborted();
+        }
         telemetry.finishAttempt('failed', false, false, 'model.transport_timeout');
+        call.signal?.throwIfAborted();
         if (attempt < this.maxRetries) {
           logger.warn({ label: this.policy.label, attempt: attempt + 1 }, 'stream ended with no response_done before content — retrying');
           call.noAnswerRetries += 1;
           const wait = backoffMs(attempt, { retryable: true, kind: 'model.transport_timeout', isAuth: false });
-          await telemetry.wait(attempt + 1, 'incomplete_stream', 'model.transport_timeout', wait, () => this.sleep(wait));
+          await telemetry.wait(attempt + 1, 'incomplete_stream', 'model.transport_timeout', wait, () => this.sleep(wait, call.signal));
           continue;
         }
         const ended = new BoundaryError({
@@ -750,8 +796,9 @@ export class ResilientModel implements Model {
         if (call.noAnswerRetries >= 1) markRetriesSpent(ended);
         throw ended;
       }
-      telemetry.finishAttempt('returned', committed, sawDone);
-      outcome = 'returned';
+      if (!sawDone) call.signal?.throwIfAborted();
+      outcome = call.signal?.aborted ? 'cancelled' : 'returned';
+      telemetry.finishAttempt(outcome, committed, sawDone);
       return; // committed + drained, or done emitted
     }
     } catch (err) {

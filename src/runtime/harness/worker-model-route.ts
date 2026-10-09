@@ -260,7 +260,11 @@ export async function routeWorkerModel(input: WorkerModelRouteInput): Promise<Wo
     const needWhich = Boolean(requested && !resolved);
     let overridesPin = Boolean(pinnedId && resolved?.id !== pinnedId);
     const needAsked = Boolean(requested && (needWhich || overridesPin || (resolved && !ownerChosen.has(resolved.id))));
-    const ruleCandidates = !exactRule && rules.length > 0 ? rules.slice(0, WORKER_RULE_WINDOW) : [];
+    // This exact owner choice returns through the packet branch before saved
+    // rule selection. Ask about rules only when their answers can be consumed.
+    const packetRouteSettled = Boolean(requested && resolved && ownerChosen.has(resolved.id)
+      && !overridesPin && !needWhich && !needAsked);
+    const ruleCandidates = !packetRouteSettled && !exactRule && rules.length > 0 ? rules.slice(0, WORKER_RULE_WINDOW) : [];
     const shownCatalog = catalog.slice(0, WORKER_CATALOG_WINDOW);
 
     const questions: SystemOneQuestions = {};

@@ -1,6 +1,9 @@
 import { activeFactEmbeddingCoverage } from './embeddings.js';
 import { deliverableRecallScore } from './deliverable-recall-score.js';
 import { explicitlyNamesRecallEntity, prioritizeNamedEntityFacts } from './named-entity-recall-priority.js';
+import { distinctiveRecallFactKey, prioritizeDistinctiveRecallFacts } from './recall-distinctive-priority.js';
+import { retainAutomaticPrimerOrigin } from './automatic-primer-origin.js';
+import { RECALL_SELECTION_TRACE_CAP, recallSelectionRef, retainRecallSelectionDiagnostic, retainRecallSelectionRow, type RecallSelectionRow } from './recall-trace.js';
 import { openMemoryDb, type MemoryEpisodeStatus } from './db.js';
 import { renderDeliverableHit, searchDeliverables } from './deliverable-index.js';
 import {
@@ -264,7 +267,7 @@ export function resolveTemporalQueryWindow(
 }
 
 function factHit(fact: ConsolidatedFact, score: number, why: string[]): MemoryEvidenceHit {
-  return {
+  const hit: MemoryEvidenceHit = {
     ref: { type: 'fact', id: String(fact.id) },
     title: `${fact.kind} fact`,
     text: fact.content,
@@ -283,6 +286,7 @@ function factHit(fact: ConsolidatedFact, score: number, why: string[]): MemoryEv
       })),
     whyRecalled: why,
   };
+  return retainAutomaticPrimerOrigin(hit, hit.ref, fact.source.path);
 }
 
 function mergeHit(target: Map<string, MemoryEvidenceHit>, hit: MemoryEvidenceHit): void {
@@ -491,7 +495,7 @@ function applyUtilityRerank(
   hits: MemoryEvidenceHit[],
   nowMs: number,
   objective?: string,
-): { hits: MemoryEvidenceHit[]; adjusted: number } {
+): { hits: MemoryEvidenceHit[]; adjusted: number; nonBoostableRefs: Set<string> } {
   const signals = readRecallRefUtilitySignals(hits.map((hit) => ({
     type: hit.ref.type,
     id: String(hit.ref.id),
@@ -502,6 +506,7 @@ function applyUtilityRerank(
   const activeAnchors = objective ? extractAnchors({ content: objective }) : null;
   const accountScoped = Boolean(activeAnchors && accountScopedRecallEnabled() && activeContextHasAccountScope(activeAnchors));
   let adjusted = 0;
+  const nonBoostableRefs = new Set<string>();
   const allowed = scopeGate();
   const survivors = hits.filter((hit) => {
     // What is kept for another project or another agent never reaches this
@@ -520,6 +525,8 @@ function applyUtilityRerank(
   });
   const reranked = survivors.map((hit) => {
     const signal = signals.get(serializeRecallRef({ type: hit.ref.type, id: String(hit.ref.id) }));
+    const factKey = distinctiveRecallFactKey(hit);
+    if (factKey && signal && signal.notUseful > signal.used) nonBoostableRefs.add(factKey);
     const bonus = recallUtilityBonus(signal, nowMs);
     if (bonus === 0 || !signal) return hit;
     adjusted += 1;
@@ -537,7 +544,7 @@ function applyUtilityRerank(
       whyRecalled: Array.from(new Set([...hit.whyRecalled, ...why])),
     };
   });
-  return { hits: reranked, adjusted };
+  return { hits: reranked, adjusted, nonBoostableRefs };
 }
 
 function normalizedMeetingSourceUri(sourceUri?: string | null): string | null {
@@ -639,9 +646,13 @@ function isValidAt(fact: ConsolidatedFact, asOfMs: number): boolean {
   return (!Number.isFinite(from) || from <= asOfMs) && (!Number.isFinite(to) || asOfMs < to);
 }
 
-function diversify(hits: MemoryEvidenceHit[], limit: number): MemoryEvidenceHit[] {
+function diversify(hits: MemoryEvidenceHit[], limit: number,
+  observe?: (hit: MemoryEvidenceHit, rank: number, reason: 'selected' | 'similarity_duplicate' | 'topK') => void,
+): MemoryEvidenceHit[] {
   const selected: MemoryEvidenceHit[] = [];
-  for (const hit of hits.sort((a, b) => b.score - a.score)) {
+  const ranked = hits.sort((a, b) => b.score - a.score);
+  let examined = 0;
+  for (const hit of ranked) {
     // Entity hit bodies intentionally share a compact type/count string; their
     // identity lives in `title`. Comparing text alone collapsed an eight-person
     // roster to one visible person. Diversify what the model actually sees.
@@ -658,7 +669,14 @@ function diversify(hits: MemoryEvidenceHit[], limit: number): MemoryEvidenceHit[
       return union > 0 && intersection / union >= 0.85;
     });
     if (!duplicate) selected.push(hit);
+    examined += 1;
+    try { observe?.(hit, examined, duplicate ? 'similarity_duplicate' : 'selected'); } catch { /* diagnostics cannot affect recall */ }
     if (selected.length >= limit) break;
+  }
+  // These candidates were never examined for duplication after the existing
+  // topK stop. Do not retrospectively label them duplicates.
+  if (observe) for (let index = examined; index < Math.min(ranked.length, RECALL_SELECTION_TRACE_CAP); index += 1) {
+    try { observe(ranked[index], index + 1, 'topK'); } catch { /* diagnostic only */ }
   }
   return selected;
 }
@@ -1194,7 +1212,12 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   // roster. Preserve relevance ranking here; targeted recall still prefers
   // complete source-backed sets when the user asks for them.
   const completeSetRerank = ambient ? scopedFacts : preferDurableCompleteSetHits(scopedFacts, objective);
-  const logicalCandidates = collapseMeetingRepresentations(completeSetRerank, logicalMeetingKeys)
+  // Rarity is a ranking cue, never new support eligibility. Keep the exact
+  // pre-existing support floor and all earlier named/complete-set behavior:
+  // weak candidates remain available, but only existing eligible facts can
+  // receive this new bonus. Negative utility targets likewise stay demoted.
+  const distinctiveFacts = prioritizeDistinctiveRecallFacts(completeSetRerank, objective, utilityRerank.nonBoostableRefs);
+  const logicalCandidates = collapseMeetingRepresentations(distinctiveFacts, logicalMeetingKeys)
     .map((hit) => temporalMeetingTopicQuery && hit.whyRecalled.includes('exact temporal match')
       && !meetingContentSupportsTopicAnswer(hit.text)
       ? {
@@ -1206,13 +1229,24 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   const intentCandidates = temporalMeetingDate
     ? logicalCandidates.filter((hit) => hit.whyRecalled.includes('exact temporal match'))
     : logicalCandidates;
-  const hits = diversify(intentCandidates, limit);
+  const selectionRows: RecallSelectionRow[] = [];
+  const hits = diversify(intentCandidates, limit, (hit, rank, reason) => {
+    if (rank > RECALL_SELECTION_TRACE_CAP && reason !== 'selected') return;
+    const before = completeSetRerank.find(candidate => memoryRefKey(candidate.ref) === memoryRefKey(hit.ref));
+    const after = distinctiveFacts.find(candidate => memoryRefKey(candidate.ref) === memoryRefKey(hit.ref));
+    retainRecallSelectionRow(selectionRows, {
+      ref: recallSelectionRef(hit.ref.type, hit.ref.id), rank, reason, score: hit.score,
+      ...(before ? { scoreBeforeDistinctiveness: before.score } : {}),
+      ...(after ? { scoreAfterDistinctiveness: after.score } : {}),
+      distinctiveCueApplied: Boolean(before && after && after.score > before.score),
+    });
+  });
   const supported = temporalMeetingDate
     ? hits.some((hit) => hit.evidence.length > 0
       && hit.score >= 0.45
       && (!temporalMeetingTopicQuery || meetingContentSupportsTopicAnswer(hit.text)))
     : hits.some((hit) => hit.evidence.length > 0 && hit.score >= 0.45);
-  return {
+  const result: MemoryRecallResult = {
     hits,
     // Contextual relevance is not proof that memory answers the whole task.
     answerability: supported && !ambient ? 'supported' : hits.length > 0 ? 'partial' : 'insufficient',
@@ -1224,4 +1258,11 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
       utilityAdjusted: utilityRerank.adjusted,
     },
   };
+  retainRecallSelectionDiagnostic(result, {
+    version: 1, asOf: new Date(asOfMs).toISOString(), admitted: utilityRerank.hits.length,
+    stages: [{ stage: 'topK', candidates: intentCandidates.length, selected: hits.length,
+      rowsOmitted: Math.max(0, intentCandidates.length - selectionRows.length), limit,
+      rows: selectionRows.sort((a, b) => a.rank - b.rank) }],
+  });
+  return result;
 }

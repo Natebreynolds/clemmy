@@ -902,7 +902,7 @@ test('timing: an earlier empty done cannot certify a later partial stream as com
   assert.equal(finished.completionObserved, false, 'the wrapper retains its existing return behavior, not a completion proof');
 });
 
-test('timing: a retired child late-empty retry is distinguishable from the same logical step successful rescue', async () => {
+test('timing: a retired child late-empty cancellation is distinguishable from the same logical step successful rescue', async () => {
   const { withModelFallback } = await import('./fallback-model.js');
   const events: ResilienceTelemetryEvent[] = [];
   const caller = new AbortController();
@@ -930,14 +930,22 @@ test('timing: a retired child late-empty retry is distinguishable from the same 
   const output = await withModelResilienceTelemetry(event => events.push(event), () => collect(model.getStreamedResponse(req({ signal: caller.signal }))));
   await new Promise<void>(resolve => setImmediate(resolve));
   assert.equal(caller.signal.aborted, false);
-  assert.equal(childCalls, 2, 'the existing late-empty retry decision is observed, not changed');
+  assert.equal(childCalls, 1, 'a retired physical request must not start its empty-completion retry');
   assert.equal(rescueCalls, 1);
   assert.match(JSON.stringify(output), /rescue result/);
   assert.doesNotMatch(JSON.stringify(output), /ignored old result/);
   const oldRetry = events.find(event => event.type === 'retry_scheduled' && event.label === 'retired-child');
-  assert.ok(oldRetry && oldRetry.type === 'retry_scheduled');
-  assert.equal(oldRetry.reason, 'empty_completion');
-  assert.equal(oldRetry.requestAborted, true, 'host can retire only the obsolete physical-call progress');
+  assert.equal(oldRetry, undefined);
+  const retired = events.find(event => event.type === 'attempt_finished' && event.label === 'retired-child');
+  assert.ok(retired && retired.type === 'attempt_finished');
+  assert.equal(retired.outcome, 'cancelled');
+  assert.equal(retired.failureKind, 'model.empty_completion');
+  assert.equal(retired.completionObserved, true, 'retain the actual late empty completion observation');
+  assert.equal(retired.requestAborted, true, 'host can retire only the obsolete physical-call progress');
+  const retiredCall = events.find(event => event.type === 'call_finished' && event.label === 'retired-child');
+  assert.ok(retiredCall && retiredCall.type === 'call_finished');
+  assert.equal(retiredCall.outcome, 'cancelled');
+  assert.equal(retiredCall.attemptCount, 1);
   const rescued = events.find(event => event.type === 'call_finished' && event.label === 'successful-rescue');
   assert.ok(rescued && rescued.type === 'call_finished');
   assert.equal(rescued.outcome, 'returned');

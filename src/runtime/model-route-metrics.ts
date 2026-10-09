@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { estimateTokens } from './harness/budget.js';
 import { providerReportedModel } from './harness/traceless-step-model.js';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
@@ -634,6 +634,21 @@ function routeAttributionContext(role: ModelRouteRole, request: ModelRequest): M
   return { ...inherited, role: routeRole, promptComponents: undefined };
 }
 
+const MAX_PROVIDER_RESPONSE_ID_BYTES = 1_024;
+
+/** Bridge only an adapter's completed response identity to its usage record.
+ * The SDK returns responseId for getResponse and id inside response_done.
+ * Never infer it from prompt/output/providerData or normalize its bytes. */
+function completedProviderResponseIdDigest(response: unknown, field: 'responseId' | 'id'): string | undefined {
+  try {
+    if (!response || typeof response !== 'object') return undefined;
+    const id = (response as Record<string, unknown>)[field];
+    if (typeof id !== 'string' || !id.trim() || Buffer.byteLength(id, 'utf8') > MAX_PROVIDER_RESPONSE_ID_BYTES) return undefined;
+    if (Buffer.from(id, 'utf8').toString('utf8') !== id) return undefined;
+    return createHash('sha256').update(id, 'utf8').digest('hex');
+  } catch { return undefined; /* missing identity never changes model behavior */ }
+}
+
 class ModelRouteMetricsModel implements Model {
   constructor(
     private readonly inner: Model,
@@ -654,7 +669,9 @@ class ModelRouteMetricsModel implements Model {
       const response = await this.inRouteRole(usageContext, () => this.inner.getResponse(request));
       const usage = modelRouteUsageFromResponse(response);
       const resolution = fallbackRouteResolution(response);
-      const outcome = successfulRouteOutcome(resolution, { path: 'getResponse', responseCompleted: true });
+      const providerResponseIdDigest = completedProviderResponseIdDigest(response, 'responseId');
+      const outcome = successfulRouteOutcome(resolution, { path: 'getResponse', responseCompleted: true,
+        ...(providerResponseIdDigest ? { providerResponseIdDigest } : {}) });
       const servedModel = providerReportedModel(response);
       if (servedModel) Object.assign(outcome.metadata, { actualModel: servedModel, providerReportedModel: servedModel });
       this.finishCall(
@@ -683,6 +700,7 @@ class ModelRouteMetricsModel implements Model {
     let usage: ModelRouteCallUsage = {};
     let completed = false;
     let responseCompleted = false;
+    let providerResponseIdDigest: string | undefined;
     let servedModel: string | undefined;
     let failed = false;
     let resolution: FallbackRouteResolution | undefined;
@@ -701,12 +719,18 @@ class ModelRouteMetricsModel implements Model {
       for await (const event of scoped) {
         servedModel = providerReportedModel(event) ?? servedModel;
         const doneUsage = usageFromStreamEvent(event);
-        if (doneUsage) { usage = doneUsage; responseCompleted = true; }
+        if (doneUsage) {
+          usage = doneUsage;
+          responseCompleted = true;
+          providerResponseIdDigest = event.type === 'response_done'
+            ? completedProviderResponseIdDigest(event.response, 'id') : undefined;
+        }
         resolution = fallbackRouteResolution(event) ?? resolution;
         yield event;
       }
       completed = true;
-      const outcome = successfulRouteOutcome(resolution, { path: 'getStreamedResponse', responseCompleted });
+      const outcome = successfulRouteOutcome(resolution, { path: 'getStreamedResponse', responseCompleted,
+        ...(providerResponseIdDigest ? { providerResponseIdDigest } : {}) });
       if (responseCompleted && servedModel) Object.assign(outcome.metadata, { actualModel: servedModel, providerReportedModel: servedModel });
       this.finishCall(
         decisionId,
@@ -721,11 +745,13 @@ class ModelRouteMetricsModel implements Model {
       failed = true;
       this.finishCall(decisionId, 'failed', startedAt, usage, {
         path: 'getStreamedResponse',
+        ...(providerResponseIdDigest ? { providerResponseIdDigest } : {}),
       }, errorClass(err));
       throw err;
     } finally {
       if (!completed && !failed) {
-        this.finishCall(decisionId, 'cancelled', startedAt, usage, { path: 'getStreamedResponse' });
+        this.finishCall(decisionId, 'cancelled', startedAt, usage, { path: 'getStreamedResponse',
+          ...(providerResponseIdDigest ? { providerResponseIdDigest } : {}) });
       }
     }
   }
@@ -815,6 +841,7 @@ class ModelRouteMetricsModel implements Model {
       try {
         appendEvent({ sessionId: active.sessionId, turn: active.turn ?? 0, role: 'system', type: 'worker_model_response_completed', data: {
           sourceUserSeq: active.sourceUserSeq, runAttemptId: active.runAttemptId, modelCallId: decisionId,
+          ...(typeof metadata.providerResponseIdDigest === 'string' ? { providerResponseIdDigest: metadata.providerResponseIdDigest } : {}),
           model: typeof metadata.actualModel === 'string' ? metadata.actualModel : this.context.resolvedModel,
           requestedModel: this.context.resolvedModel,
           ...(typeof metadata.providerReportedModel === 'string' ? { providerReportedModel: metadata.providerReportedModel } : {}),

@@ -184,10 +184,12 @@ const GOLDEN = {
   // standing rule the first time the user names a model for one phase. The
   // phase runs on that model through run_worker's packet model, and the host
   // offers to keep it; set_model_role is for a rule the user asks for.
-  instructions: { len: 31898, sha16: '4c366210ce5868a0' },
-  native: { len: 31005, sha16: '6eca30da1942d4f1' },
-  claudeBrain: { len: 9384, sha16: 'ee7846000e14c638' },
-  lean: { len: 11389, sha16: 'b6b16fcac7b2ddd1' },
+  // 2026-10-09: share queued-versus-saved memory status with fresh actions,
+  // preserve claim-scoped privacy, and avoid unconditional retrieval promises.
+  instructions: { len: 32464, sha16: 'cb0e3b515e6eb3d5' },
+  native: { len: 31571, sha16: '3f09d9ce21ac3189' },
+  claudeBrain: { len: 9945, sha16: 'b425913632303081' },
+  lean: { len: 11950, sha16: '808c1c78bf67646c' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -236,9 +238,9 @@ test('characterization: ORCHESTRATOR_INSTRUCTIONS_LEAN is byte-stable (reviewabl
 });
 
 test('fresh accepted actions keep model judgment while omitting unreachable policy', () => {
-  // 23 bytes over the earlier 5,500 carry the owner's rule that content trying
-  // to steer Clem is reported to them, not just ignored.
-  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, 'utf8') <= 5_525,
+  // The original 5,525 allowance plus the 550-byte memory-status rule and its
+  // separator; preserve the same two bytes of assembly headroom.
+  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, 'utf8') <= 6_077,
     'fresh-action stable policy must leave room for the exact turn snapshot and tool schemas');
   for (const required of [
     'CONVERSE FIRST',
@@ -530,8 +532,9 @@ test('two-lane invariant: the decision-JSON contract NEVER leaks into the native
 // Catches accidental bloat. 2026-08-22 provider-neutral baseline: ≈ 7,594 tok. A drift
 // of >5% in either direction is a prompt-size regression worth a look.
 test('budget guard: rubric token estimate stays within 5% of the Phase-0 baseline', () => {
-  // Raised by the six tokens of the rule that steering content is reported to the owner.
-  const BASELINE_TOK = 7600;
+  // The shared memory-status correction adds 566 legacy characters (142
+  // estimated tokens); retain the original 5% drift allowance around that delta.
+  const BASELINE_TOK = 7742;
   const actual = TOK(ORCHESTRATOR_INSTRUCTIONS.length);
   const drift = Math.abs(actual - BASELINE_TOK) / BASELINE_TOK;
   assert.ok(

@@ -1,3 +1,4 @@
+import { FACT_QUERY_STOPWORDS } from './fact-query-stopwords.js';
 import { retainFactEntityLinks } from './retained-fact-entities.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
@@ -1015,17 +1016,6 @@ export async function findSimilarFacts(
  * "remember my X is TOKEN" is recallable in the very next turn, closing the
  * fresh-fact recall gap. Token-occurrence ranked, recency as tiebreaker.
  */
-/** Common words that match too many facts to be useful as a lexical key. */
-const FACT_QUERY_STOPWORDS = new Set<string>([
-  'the', 'and', 'but', 'not', 'are', 'was', 'were', 'for', 'with', 'from', 'this',
-  'that', 'these', 'those', 'what', 'when', 'where', 'who', 'whom', 'which', 'why',
-  'how', 'your', 'you', 'mine', 'our', 'their', 'just', 'please', 'can', 'will',
-  'would', 'should', 'could', 'have', 'has', 'had', 'did', 'does', 'about', 'into',
-  'only', 'also', 'exactly', 'confirm', 'tell', 'give', 'show', 'list', 'find',
-  'get', 'got', 'need', 'want', 'here', 'there', 'now', 'then', 'any', 'all',
-  'some', 'more', 'most', 'than', 'them', 'they', 'its', 'his', 'her', 'out',
-]);
-
 export function searchFactsByText(query: string, limit = 5): ConsolidatedFact[] {
   const normalized = normalizeContent(query);
   if (!normalized) return [];

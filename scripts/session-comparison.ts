@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -171,6 +172,11 @@ export interface AcceptedTaskMeasurement extends SessionMeasurement {
   acceptedSource: string;
   sourceUserSeqs: number[];
   approvalContinuations: ApprovalContinuationMeasurement[];
+  /** Exact helper sources proved independently of public delivery segments. */
+  workerUsageParticipants: WorkerUsageParticipant[];
+  workerLineageIssues: string[];
+  workerAttemptCount: number;
+  unfinishedWorkerAttempts: number;
   lineageIssues: string[];
   exactUsageRecords: number;
   /** Exact-looking rows whose attempt/lineage cannot be proved. Kept visible,
@@ -195,6 +201,17 @@ export interface AcceptedTaskMeasurement extends SessionMeasurement {
    * task wall. Includes delivery/decision time, not a claim of human CPU time. */
   recordedApprovalWaitMs: number | null;
   approvalWaitIssues: string[];
+}
+
+export interface WorkerUsageParticipant {
+  sessionId: string;
+  sourceUserSeq: number;
+  parentSessionId: string;
+  parentSourceUserSeq: number;
+  parentLogicalCallId: string;
+  packetKey: string;
+  packetDigest: string;
+  attemptIds: string[];
 }
 
 export interface AcceptedTaskComparison {
@@ -1110,11 +1127,260 @@ function intervalUnionMs(intervals: readonly [number, number][]): number {
   return total;
 }
 
+interface WorkerUsageScope {
+  participant: WorkerUsageParticipant;
+  source: SessionEvent;
+  events: SessionEvent[];
+  attempts: AttemptRead;
+  parentKey: string;
+}
+
+interface WorkerUsageGraph {
+  scopes: Map<string, WorkerUsageScope>;
+  claimedSources: Set<string>;
+  claimedAttempts: Set<string>;
+  issues: Set<string>;
+}
+
+const usageSourceKey = (sessionId: string, sourceUserSeq: number): string => `${sessionId}:${sourceUserSeq}`;
+
+function exactIdentity(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.trim() === value && !/[\u0000-\u001f]/.test(value);
+}
+
+function objectPayload(raw: unknown): Record<string, unknown> | null {
+  if (typeof raw !== 'string') return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown> : null;
+  } catch { return null; }
+}
+
+function workerAttemptOwnsParentCall(
+  db: Database.Database,
+  childSessionId: string,
+  attemptId: string,
+  parent: { sessionId: string; seq: number; callId: string; argumentDigest: string },
+  deliverySessionId: string,
+  deliverySources: ReadonlyMap<number, SessionEvent>,
+): boolean {
+  try {
+    const rows = db.prepare(`SELECT parent_scope_id, parent_lease_id FROM run_dispatch_leases
+      WHERE session_id = ? AND run_attempt_id = ?`).all(childSessionId, attemptId) as Array<{
+        parent_scope_id: string | null; parent_lease_id: string | null;
+      }>;
+    for (const child of rows) {
+      let scope = child.parent_scope_id;
+      let lease = child.parent_lease_id;
+      const seen = new Set<string>();
+      while (scope && lease) {
+        const key = JSON.stringify([scope, lease]);
+        if (seen.has(key)) break;
+        seen.add(key);
+        const row = db.prepare(`SELECT source_user_seq, accepted_task_id, logical_tool_call_id, run_attempt_id,
+          recovery_tool_name, recovery_argument_digest, parent_scope_id, parent_lease_id
+          FROM run_dispatch_leases WHERE session_id = ? AND scope_id = ? AND lease_id = ?`)
+          .get(parent.sessionId, scope, lease) as { source_user_seq: number | null; accepted_task_id: string | null;
+            logical_tool_call_id: string | null; run_attempt_id: string | null;
+            recovery_tool_name: string | null; recovery_argument_digest: string | null;
+            parent_scope_id: string | null; parent_lease_id: string | null } | undefined;
+        if (!row) break;
+        if (row.source_user_seq === parent.seq && row.accepted_task_id === `task:${parent.sessionId}#${parent.seq}`
+          && row.logical_tool_call_id === parent.callId && row.recovery_tool_name === 'run_worker'
+          && row.recovery_argument_digest === parent.argumentDigest) {
+          const owner = db.prepare('SELECT session_id, source_user_seq FROM run_attempts WHERE attempt_id = ?')
+            .get(row.run_attempt_id) as { session_id: string; source_user_seq: number } | undefined;
+          if (owner?.session_id !== parent.sessionId) break;
+          let source: number | null = positiveEventSeq(owner.source_user_seq);
+          const controls = new Set<number>();
+          while (source !== null && source !== parent.seq && parent.sessionId === deliverySessionId
+            && deliverySources.has(source) && !controls.has(source)) {
+            controls.add(source);
+            source = readApprovalExecutionSource(db, { sessionId: parent.sessionId, sourceUserSeq: source });
+          }
+          if (source === parent.seq) return true;
+          break;
+        }
+        scope = row.parent_scope_id;
+        lease = row.parent_lease_id;
+      }
+    }
+  } catch { /* Missing/corrupt historical authority is not invented. */ }
+  return false;
+}
+
+/** Read-only reciprocal worker provenance, never a session-name/time guess.
+ * Claimed sources are traversed separately so a broken ancestor cannot make
+ * its descendant costs disappear. Public delivery still belongs to the root
+ * and its approval controls; helpers finish attempts, not chat terminals. */
+function readWorkerUsageGraph(
+  dbPath: string,
+  rootSessionId: string,
+  roots: ReadonlyMap<number, SessionEvent>,
+  claimedRoots: ReadonlyMap<number, SessionEvent> = roots,
+): WorkerUsageGraph {
+  const graph: WorkerUsageGraph = { scopes: new Map(), claimedSources: new Set(), claimedAttempts: new Set(), issues: new Set() };
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 5_000 });
+  const rootKeys = new Set([...roots.keys()].map(seq => usageSourceKey(rootSessionId, seq)));
+  const queue = [...claimedRoots].map(([seq, source]) => ({ sessionId: rootSessionId, seq, source }));
+  const seen = new Set<string>();
+  const conflicting = new Set<string>();
+  const ownerByChild = new Map<string, string>();
+  try {
+    db.pragma('query_only = ON');
+    for (let index = 0; index < queue.length; index += 1) {
+      const parent = queue[index]!;
+      const parentKey = usageSourceKey(parent.sessionId, parent.seq);
+      if (seen.has(parentKey)) continue;
+      seen.add(parentKey);
+      const sessionRead = readSessionEvents(dbPath, parent.sessionId);
+      const markers = sessionRead.events.filter(event => event.type === 'worker_started'
+        && (event.data.parentSourceUserSeq === parent.seq || event.data.sourceUserSeq === parent.seq));
+      let parentId: string | undefined;
+      let orphans: Array<{ seq: number; session_id: string; data_json: string }> = [];
+      try {
+        parentId = (db.prepare('SELECT id FROM events WHERE session_id = ? AND seq = ? AND role = ? AND type = ?')
+          .get(parent.sessionId, parent.seq, 'user', 'user_input_received') as { id: string } | undefined)?.id;
+        if (parentId) orphans = db.prepare(`SELECT seq, session_id, data_json FROM events
+          WHERE parent_event_id = ? AND type = 'user_input_received' AND role = 'user' ORDER BY seq`)
+          .all(parentId) as typeof orphans;
+      } catch {
+        if (markers.length > 0) graph.issues.add(`worker_lineage_store_unavailable:${parentKey}`);
+      }
+      // Also find a corrupted/missing parent marker via the reciprocal child
+      // pointer. It supplies only a possible cost owner, never proof.
+      const childKeys = new Set(orphans.filter(row => objectPayload(row.data_json)?.delegatedWorker)
+        .map(row => usageSourceKey(row.session_id, row.seq)));
+      const candidates = sessionRead.events.filter(event => event.type === 'worker_started'
+        && (markers.includes(event) || (exactIdentity(event.data.childSessionId)
+          && positiveEventSeq(event.data.childSourceUserSeq) !== null
+          && childKeys.has(usageSourceKey(event.data.childSessionId, event.data.childSourceUserSeq as number)))));
+      for (const row of orphans) {
+        if (!objectPayload(row.data_json)?.delegatedWorker) continue;
+        const childKey = usageSourceKey(row.session_id, row.seq);
+        if (!candidates.some(event => event.data.childSessionId === row.session_id && event.data.childSourceUserSeq === row.seq)) {
+          graph.claimedSources.add(childKey);
+          for (const id of readAttemptsForSource(dbPath, row.session_id, row.seq).ids) graph.claimedAttempts.add(id);
+          graph.issues.add(`missing_worker_link:${childKey}`);
+          const childRead = readSessionEvents(dbPath, row.session_id);
+          const source = childRead.events.find(event => event.seq === row.seq)!;
+          queue.push({ sessionId: row.session_id, seq: row.seq, source });
+        }
+      }
+      for (const marker of candidates) {
+        const data = marker.data;
+        if (exactIdentity(data.childAttemptId)) graph.claimedAttempts.add(data.childAttemptId);
+        const childSeq = positiveEventSeq(data.childSourceUserSeq);
+        if (!exactIdentity(data.childSessionId) || childSeq === null) {
+          graph.issues.add(`unproved_worker_link:${marker.seq}`);
+          continue;
+        }
+        const childSessionId = data.childSessionId;
+        const childKey = usageSourceKey(childSessionId, childSeq);
+        graph.claimedSources.add(childKey);
+        const attempts = readAttemptsForSource(dbPath, childSessionId, childSeq);
+        for (const id of attempts.ids) graph.claimedAttempts.add(id);
+        let childRead: ReturnType<typeof readSessionEvents>;
+        try { childRead = readSessionEvents(dbPath, childSessionId); }
+        catch { graph.issues.add(`unproved_worker_link:${marker.seq}`); continue; }
+        if (childRead.malformedEventPayloads > 0) graph.issues.add(`malformed_worker_session_events:${childKey}`);
+        const source = childRead.events.find(event => event.seq === childSeq);
+        if (source) queue.push({ sessionId: childSessionId, seq: childSeq, source });
+        const owner = JSON.stringify([data.parentSessionId, data.parentSourceUserSeq, data.parentAcceptedTaskId,
+          data.parentLogicalCallId, data.packetKey, data.packetDigest, data.item]);
+        const previousOwner = ownerByChild.get(childKey);
+        if ((previousOwner !== undefined && previousOwner !== owner) || rootKeys.has(childKey) || childSeq <= parent.seq) {
+          conflicting.add(childKey);
+          graph.issues.add(`conflicting_worker_parent:${childKey}`);
+        }
+        ownerByChild.set(childKey, owner);
+        let valid = false;
+        try {
+          const childRow = db.prepare(`SELECT id, parent_event_id FROM events WHERE session_id = ? AND seq = ?
+            AND role = 'user' AND type = 'user_input_received'`).get(childSessionId, childSeq) as { id: string; parent_event_id: string } | undefined;
+          const metadata = objectPayload((db.prepare('SELECT metadata_json FROM sessions WHERE id = ? AND kind = ?')
+            .get(childSessionId, 'agent') as { metadata_json: string } | undefined)?.metadata_json);
+          const binding = source?.data.delegatedWorker as Record<string, unknown> | undefined;
+          const packet = binding?.packet;
+          const keys = ['parentSessionId', 'parentSourceUserSeq', 'parentAcceptedTaskId', 'parentLogicalCallId', 'packetKey', 'packetDigest', 'item'];
+          const call = db.prepare(`SELECT tool_name, argument_digest, state FROM logical_tool_calls WHERE session_id = ?
+            AND source_user_seq = ? AND accepted_task_id = ? AND logical_tool_call_id = ?`)
+            .get(parent.sessionId, parent.seq, `task:${parent.sessionId}#${parent.seq}`, data.parentLogicalCallId) as {
+              tool_name: string; argument_digest: string; state: string;
+            } | undefined;
+          const ownedAttempts = new Set<string>();
+          if (call?.tool_name === 'run_worker' && /^[a-f0-9]{64}$/.test(call.argument_digest) && ['open', 'settled'].includes(call.state)
+            && exactIdentity(data.parentLogicalCallId)) {
+            for (const id of attempts.ids) {
+              if (workerAttemptOwnsParentCall(db, childSessionId, id, { sessionId: parent.sessionId, seq: parent.seq,
+                callId: data.parentLogicalCallId, argumentDigest: call.argument_digest }, rootSessionId, roots)) ownedAttempts.add(id);
+              else graph.issues.add(`unproved_worker_attempt:${childKey}:${id}`);
+            }
+          }
+          for (const id of attempts.ids) if (!ownedAttempts.has(id)) {
+            attempts.ids.delete(id);
+            attempts.bounds.delete(id);
+          }
+          attempts.unfinished = [...attempts.ids].filter(id => !(db.prepare(`SELECT finished_at FROM run_attempts
+            WHERE attempt_id = ? AND session_id = ? AND source_user_seq = ?`).get(id, childSessionId, childSeq) as {
+              finished_at: string | null;
+            } | undefined)?.finished_at).length;
+          valid = marker.role === 'system' && data.parentSessionId === parent.sessionId
+            && data.parentSourceUserSeq === parent.seq
+            && (data.sourceUserSeq === undefined || data.sourceUserSeq === parent.seq)
+            && data.parentAcceptedTaskId === `task:${parent.sessionId}#${parent.seq}`
+            && exactIdentity(data.parentLogicalCallId) && call?.tool_name === 'run_worker' && ['open', 'settled'].includes(call.state)
+            && exactIdentity(data.packetKey) && exactIdentity(data.item)
+            && typeof data.packetDigest === 'string' && /^[a-f0-9]{64}$/.test(data.packetDigest)
+            && exactIdentity(data.childAttemptId) && attempts.ids.has(data.childAttemptId)
+            && childSeq > parent.seq && marker.seq > childSeq
+            && source?.role === 'user' && source.type === 'user_input_received'
+            && !!parentId && childRow?.parent_event_id === parentId
+            && metadata?.source === 'delegated_worker' && metadata.workerScope === true
+            && !!binding && binding.composeOnly === true
+            && packet !== null && typeof packet === 'object' && !Array.isArray(packet)
+            && (packet as Record<string, unknown>).item === data.item
+            && createHash('sha256').update(JSON.stringify(packet)).digest('hex') === data.packetDigest
+            && keys.every(key => binding[key] === data[key] && metadata[key] === data[key]);
+        } catch { /* Historical/malformed stores remain unproved, never migrated. */ }
+        if (!valid || !source) {
+          graph.issues.add(`unproved_worker_link:${marker.seq}`);
+          conflicting.add(childKey);
+          continue;
+        }
+        const existing = graph.scopes.get(childKey);
+        graph.scopes.set(childKey, existing ?? {
+          participant: { sessionId: childSessionId, sourceUserSeq: childSeq,
+            parentSessionId: parent.sessionId, parentSourceUserSeq: parent.seq,
+            parentLogicalCallId: data.parentLogicalCallId as string, packetKey: data.packetKey as string,
+            packetDigest: data.packetDigest as string, attemptIds: [...attempts.ids] },
+          source, events: childRead.events, attempts, parentKey,
+        });
+      }
+    }
+    // An invalid or conflicting ancestor invalidates all descendants, even
+    // when it was discovered after a valid-looking child marker.
+    let removed = true;
+    while (removed) {
+      removed = false;
+      for (const [key, scope] of graph.scopes) {
+        if (conflicting.has(key) || (!rootKeys.has(scope.parentKey) && !graph.scopes.has(scope.parentKey))) {
+          graph.scopes.delete(key);
+          graph.issues.add(`unproved_worker_ancestry:${key}`);
+          removed = true;
+        }
+      }
+    }
+  } finally { db.close(); }
+  return graph;
+}
+
 /**
- * Explicit whole-task scope. Only host-validated, durable approval execution
- * edges extend the root; adjacent turns, matching text, and timestamps never
- * establish parentage. Each NDJSON row is selected once across the entire
- * lineage. This deliberately does not sum overlapping accepted-turn totals.
+ * Explicit whole-task scope. Host-validated approval execution edges extend
+ * public delivery; reciprocally verified worker edges extend usage ownership.
+ * Adjacent turns, matching text and timestamps never establish parentage.
+ * Each NDJSON row is selected once; overlapping turn totals are never summed.
  * Unproved candidate cost is reported separately, not discarded as free work.
  */
 export function measureAcceptedTask(
@@ -1227,9 +1493,31 @@ export function measureAcceptedTask(
   }
   const events = sessionRead.events.filter((event) => eventSeqs.has(event.seq));
   const acceptedSource = `${sessionId}:${root.seq}`;
-  const sourceByAccepted = new Map([...members.keys()].map((seq) => [`${sessionId}:${seq}`, seq]));
+  const workers = readWorkerUsageGraph(dbPath, sessionId, members, claimedMembers);
+  for (const issue of workers.issues) issues.add(issue);
+  const sourceByAccepted = new Map([...members.keys()].map((seq) => [usageSourceKey(sessionId, seq), seq]));
+  const usageSourceByAttempt = new Map([...sourceByAttempt].map(([id, seq]) => [id, usageSourceKey(sessionId, seq)]));
+  const usageParentBySource = new Map([...parentBySource].map(([child, parent]) => [usageSourceKey(sessionId, child), usageSourceKey(sessionId, parent)]));
+  let workerAttemptCount = 0;
+  let unfinishedWorkerAttempts = 0;
+  for (const [key, worker] of workers.scopes) {
+    sourceByAccepted.set(key, worker.source.seq);
+    usageParentBySource.set(key, worker.parentKey);
+    workerAttemptCount += worker.attempts.ids.size;
+    unfinishedWorkerAttempts += worker.attempts.unfinished;
+    if (worker.attempts.unfinished > 0) issues.add(`unfinished_worker_attempt:${key}`);
+    for (const id of worker.attempts.ids) {
+      const prior = usageSourceByAttempt.get(id);
+      if (prior !== undefined && prior !== key) {
+        usageSourceByAttempt.delete(id);
+        issues.add(`conflicting_worker_attempt:${id}`);
+      } else usageSourceByAttempt.set(id, key);
+    }
+  }
   const claimedAccepted = new Set([...claimedMembers.keys()].map((seq) => `${sessionId}:${seq}`));
+  for (const key of workers.claimedSources) claimedAccepted.add(key);
   const claimedAttemptIds = new Set(sourceByAttempt.keys());
+  for (const id of workers.claimedAttempts) claimedAttemptIds.add(id);
   for (const source of claimedMembers.keys()) {
     if (!members.has(source)) {
       for (const id of readAttemptsForSource(dbPath, sessionId, source).ids) claimedAttemptIds.add(id);
@@ -1243,6 +1531,16 @@ export function measureAcceptedTask(
     }
     return false;
   };
+  const isUsageAncestor = (ancestor: string, descendant: string): boolean => {
+    let current: string | undefined = descendant;
+    const visited = new Set<string>();
+    while (current !== undefined && !visited.has(current)) {
+      if (current === ancestor) return true;
+      visited.add(current);
+      current = usageParentBySource.get(current);
+    }
+    return false;
+  };
   const usageRead = readUsageEvents(path.join(home, 'state', 'token-usage'));
   const exactUsage: UsageEvent[] = [];
   const unprovenUsage: UsageEvent[] = [];
@@ -1252,12 +1550,15 @@ export function measureAcceptedTask(
   for (const event of usageRead.events) {
     const traceSource = sourceByAccepted.get(event.trace?.acceptedSource ?? '');
     const attemptId = event.trace?.attemptId;
-    const attemptSource = typeof attemptId === 'string' ? sourceByAttempt.get(attemptId) : undefined;
+    const attemptSource = typeof attemptId === 'string' ? usageSourceByAttempt.get(attemptId) : undefined;
     if (traceSource !== undefined || attemptSource !== undefined
       || claimedAccepted.has(event.trace?.acceptedSource ?? '')
       || (typeof attemptId === 'string' && claimedAttemptIds.has(attemptId))) {
       if (traceSource !== undefined && attemptSource !== undefined
-        && event.trace?.logicalTurnId === `turn:${traceSource}` && isAncestor(traceSource, attemptSource)) {
+        && event.trace?.logicalTurnId === `turn:${traceSource}`
+        && (workers.scopes.has(attemptSource)
+          ? event.trace.acceptedSource === attemptSource
+          : isUsageAncestor(event.trace.acceptedSource!, attemptSource))) {
         exactUsage.push(event);
         usageAttemptIds.add(attemptId!);
       } else {
@@ -1280,6 +1581,74 @@ export function measureAcceptedTask(
   if (legacyWindowUsageRecords > 0) issues.add('excluded_legacy_window_usage');
   if (unscopedWindowUsageRecords > 0) issues.add('unscoped_window_usage');
   if (sessionRead.malformedEventPayloads > 0) issues.add('malformed_session_events');
+  for (const [key, worker] of workers.scopes) {
+    const usage = exactUsage.filter(row => typeof row.trace?.attemptId === 'string' && worker.attempts.ids.has(row.trace.attemptId));
+    const responses = worker.events.filter(event => event.type === 'worker_model_response_completed'
+      && event.role === 'system'
+      && event.data.sourceUserSeq === worker.source.seq
+      && typeof event.data.runAttemptId === 'string' && worker.attempts.ids.has(event.data.runAttemptId));
+    for (const response of worker.events.filter(event => event.type === 'worker_model_response_completed'
+      && (event.data.sourceUserSeq === worker.source.seq
+        || (typeof event.data.runAttemptId === 'string' && worker.attempts.ids.has(event.data.runAttemptId))))) {
+      if (!responses.includes(response)) issues.add(`invalid_worker_response_ownership:${key}:${response.seq}`);
+    }
+    if (usage.length > 0 && responses.length === 0) issues.add(`worker_host_response_coverage_unknown:${key}`);
+    const requests = worker.events.filter(event => ['turn_model_routed', 'model_resilience_observed'].includes(event.type)
+      && event.data.sourceUserSeq === worker.source.seq
+      && (event.type === 'turn_model_routed' || event.data.phase === 'call_started'));
+    if ((responses.length > 0 || requests.length > 0) && usage.length === 0) issues.add(`worker_model_without_exact_usage:${key}`);
+    // A provider stream proves that response's usage, but does not prove
+    // coverage of a different host decision UUID. Check every completed host
+    // request independently. Historical rows without a recorded exact ID
+    // bridge remain a lower bound even when some provider usage is present.
+    const hostByResponseDigest = new Map<string, string>();
+    const digestByHost = new Map<string, string>();
+    for (const response of responses) {
+      const hostId = response.data.modelCallId;
+      const digest = response.data.providerResponseIdDigest;
+      const hasDigest = typeof digest === 'string' && /^[a-f0-9]{64}$/.test(digest);
+      if (hasDigest && exactIdentity(hostId)) {
+        const hostAttempt = JSON.stringify([response.data.runAttemptId, hostId]);
+        const attemptDigest = JSON.stringify([response.data.runAttemptId, digest]);
+        const priorHost = hostByResponseDigest.get(digest);
+        const priorDigest = digestByHost.get(hostId);
+        if ((priorHost !== undefined && priorHost !== hostAttempt) || (priorDigest !== undefined && priorDigest !== attemptDigest)) {
+          issues.add(`conflicting_worker_response_bridge:${key}:${response.seq}`);
+        }
+        hostByResponseDigest.set(digest, hostAttempt);
+        digestByHost.set(hostId, attemptDigest);
+      }
+      if (!exactIdentity(hostId) || !usage.some(row => row.trace?.attemptId === response.data.runAttemptId
+        && (hasDigest
+          ? [row.trace?.modelCallId, row.responseId].some(id => exactIdentity(id)
+            && createHash('sha256').update(id).digest('hex') === digest)
+          : digest === undefined && row.trace?.modelCallId === hostId))) {
+        issues.add(`worker_host_response_usage_unknown:${key}:${response.seq}`);
+      }
+    }
+    // Host UUIDs and provider IDs are different namespaces. A usage row may
+    // explicitly retain both identities; timestamps/counts/models never join
+    // them. Provider diagnostics still independently detect missing usage.
+    for (const response of worker.events.filter(event => event.type === 'model_stream_diagnostic'
+      && event.role === 'system'
+      && event.data.sourceUserSeq === worker.source.seq && event.data.settlement === 'completed'
+      && event.data.sawResponseDone === true && exactIdentity(event.data.responseId)
+      && typeof event.data.attemptId === 'string' && worker.attempts.ids.has(event.data.attemptId))) {
+      if (!usage.some(row => row.trace?.attemptId === response.data.attemptId
+        && (row.trace?.modelCallId === response.data.responseId || row.responseId === response.data.responseId))) {
+        issues.add(`worker_response_without_exact_usage:${key}:${response.seq}`);
+      }
+    }
+    if (worker.events.some(event => event.type === 'model_resilience_observed'
+      && event.data.sourceUserSeq === worker.source.seq
+      && typeof event.data.runAttemptId === 'string' && worker.attempts.ids.has(event.data.runAttemptId)
+      && typeof event.data.failedAttemptCount === 'number' && event.data.failedAttemptCount > 0)) {
+      // An aggregate failure count cannot identify every billed physical
+      // attempt. Retain all exact failed rows, without certifying that one
+      // such row covers all failures or that an absent row means zero cost.
+      issues.add(`worker_failed_attempt_usage_unknown:${key}`);
+    }
+  }
   const routes = sessionRead.events.filter((event) => {
     if (event.type !== 'turn_model_routed') return false;
     const attemptId = typeof event.data.attemptId === 'string' ? event.data.attemptId : '';
@@ -1338,6 +1707,8 @@ export function measureAcceptedTask(
     turnWallMs: null,
     scope: 'task', rootSourceUserSeq, acceptedSource,
     sourceUserSeqs: [...members.keys()], approvalContinuations, lineageIssues: [...lineageIssues],
+    workerUsageParticipants: [...workers.scopes.values()].map(scope => scope.participant),
+    workerLineageIssues: [...workers.issues], workerAttemptCount, unfinishedWorkerAttempts,
     exactUsageRecords: exactUsage.length,
     unprovenUsage: { usageRecords: unproven.usageRecords, promptTokens: unproven.promptTokens,
       cachedInputTokens: unproven.cachedInputTokens, uncachedInputTokens: unproven.uncachedInputTokens, outputTokens: unproven.outputTokens },
@@ -1672,7 +2043,7 @@ export function formatAcceptedTurnComparison(comparison: AcceptedTurnComparison)
 export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison): string {
   const { baseline: b, candidate: c } = comparison;
   const lines = [
-    'Clementine approval-linked task comparison (read-only; explicit task scope)',
+    'Clementine approval/helper-linked task comparison (read-only; explicit task scope)',
     `home:      ${comparison.home}`,
     `baseline:  ${b.acceptedSource}; sources ${b.sourceUserSeqs.join(', ')}`,
     `candidate: ${c.acceptedSource}; sources ${c.sourceUserSeqs.join(', ')}`,
@@ -1680,6 +2051,9 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
     '',
     'Metric                                                               Baseline      Candidate                  Delta',
     row('Proved approval continuations', b.approvalContinuations.length, c.approvalContinuations.length),
+    row('Proved exact helper sources', b.workerUsageParticipants?.length ?? 0, c.workerUsageParticipants?.length ?? 0),
+    row('Helper attempts', b.workerAttemptCount ?? 0, c.workerAttemptCount ?? 0),
+    row('Unfinished helper attempts', b.unfinishedWorkerAttempts ?? 0, c.unfinishedWorkerAttempts ?? 0),
     row('Durable attempts', b.attemptCount, c.attemptCount),
     row('Unfinished attempts', b.unfinishedAttempts, c.unfinishedAttempts),
     row('Model routes', b.modelRouteEvents, c.modelRouteEvents),
@@ -1711,6 +2085,9 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
     if (!measurement.usageAttributionCertified) {
       warnings.push(`${measurement.acceptedSource}: incomplete attribution; proven totals are a lower bound, not comparable whole-task cost. ${measurement.usageCertificationIssues.join(', ')}.`);
     }
+    if (measurement.usageCertificationIssues.some(issue => /^(worker_(host_response|response_without|model_without|failed_attempt)|conflicting_worker_response_bridge|invalid_worker_response_ownership)/.test(issue))) {
+      warnings.push(`${measurement.acceptedSource}: helper request usage coverage is unknown/incomplete; absent or conflicting response evidence does not establish zero cost.`);
+    }
     if (measurement.uncertifiedUsageCalls > 0 || measurement.invalidUsageCalls > 0) {
       warnings.push(`${measurement.acceptedSource}: ${measurement.uncertifiedUsageCalls} uncertified and ${measurement.invalidUsageCalls} invalid cache-accounting sample(s).`);
     }
@@ -1720,7 +2097,7 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
     }
   }
   if (warnings.length > 0) lines.push('', 'Warnings', ...warnings.map((warning) => `  - ${warning}`));
-  lines.push('', 'Task scope follows proved approval continuations only; unrelated follow-up turns are excluded.',
+  lines.push('', 'Public delivery follows proved approval continuations; reciprocally proved helpers extend usage only. Unrelated follow-up turns are excluded.',
     'Wall spans and approval waits may overlap; do not add them. Unrecorded waits remain unknown.');
   return `${lines.join('\n')}\n`;
 }

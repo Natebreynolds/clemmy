@@ -40,6 +40,7 @@ import {
   getActiveRunAttempt,
   getRunAttemptSourceUserEvent,
   getRunAttemptBySourceUserSeq,
+  getUserInputEventAtSequence,
   isKillRequested,
   listEvents,
   recordRunAttemptUserInput,
@@ -60,6 +61,8 @@ import { reprojectUndeliveredConversationalApproval } from './claude-agent-appro
 import { requireAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { requireActionExpectedWorkActivation } from './action-expected-work-boundary.js';
 import { ToolCallsCounter, withHarnessRunContext } from './brackets.js';
+import { loadExpectedWorkContract } from './expected-work-contract.js';
+import { expectedWorkPlanLines } from './expected-work-admission.js';
 
 const logger = pino({ name: 'clementine.chat-approval-resume' });
 
@@ -534,7 +537,8 @@ async function executeApprovedLinkedActionAndSettle(
     const result = pendingAction.resultSummary ?? `Executed the exact approved ${pendingAction.toolName} call.`;
     return await settleConversationalSource(row, source, {
       status: 'done',
-      text: approvedActionRanText(pendingAction, result),
+      text: approvedActionRanText(pendingAction, result,
+        approvedActionRetainedWorkNeedsVerification(row, pendingAction, source)),
     });
   }
   if (pendingAction.status === 'executing' || pendingAction.status === 'failed') {
@@ -713,9 +717,43 @@ async function drainQueuedApprovalResumes(sessionId: string): Promise<void> {
 
 const APPROVED_RESULT_LINES = 20;
 
+/** Reporting only: the exact original request still has requirements the
+ * admission oracle has not discharged. Approval source B completing one
+ * action neither proves source A complete nor authorizes another effect.
+ * Unknown/legacy evidence must not invent a Continue turn. */
+export function approvedActionRetainedWorkNeedsVerification(
+  row: { sessionId: string; presentation: Pick<approvalRegistry.ConversationalApprovalPresentation, 'sourceUserSeq'> | null },
+  action: Pick<PendingActionRecord, 'sessionId' | 'sourceUserSeq'>,
+  decisionSource: Pick<EventRow, 'sessionId' | 'seq'>,
+): boolean {
+  try {
+    const sourceUserSeq = action.sourceUserSeq;
+    if (action.sessionId !== row.sessionId || decisionSource.sessionId !== row.sessionId
+      || sourceUserSeq === null || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq < 1
+      || !Number.isSafeInteger(decisionSource.seq) || sourceUserSeq >= decisionSource.seq
+      || (row.presentation && row.presentation.sourceUserSeq !== sourceUserSeq)) return false;
+    const accepted = getUserInputEventAtSequence(row.sessionId, sourceUserSeq);
+    if (!accepted || accepted.role !== 'user' || accepted.data.synthetic === true
+      || !publicUserInputText(accepted.data).trim()) return false;
+    const loaded = loadExpectedWorkContract(row.sessionId, sourceUserSeq);
+    if (loaded.status !== 'ok' || loaded.contract.operations.length === 0) return false;
+    const lines = expectedWorkPlanLines({ sessionId: row.sessionId, sourceUserSeq });
+    const requirementIds = new Set(loaded.contract.operations.map((operation) => operation.id));
+    if (lines.length !== requirementIds.size
+      || new Set(lines.map((line) => line.requirementId)).size !== requirementIds.size
+      || lines.some((line) => !requirementIds.has(line.requirementId))) return false;
+    return lines.some((line) => line.state === 'open'
+      || line.state === 'blocked_on_dependency' || line.state === 'data_in');
+  } catch {
+    // This optional projection may not obstruct exact action settlement or
+    // reinterpret missing/unreadable evidence as whole-task completion.
+    return false;
+  }
+}
+
 /** The owner's decision ends with what the approved action did, in Clem's
- * words, and the one next step if their request had more in it. */
-export function approvedActionRanText(action: Pick<PendingActionRecord, 'kind' | 'toolName'>, result: string): string {
+ * words. Name a next step only from exact retained requirement evidence. */
+export function approvedActionRanText(action: Pick<PendingActionRecord, 'kind' | 'toolName'>, result: string, retainedWorkNeedsVerification = false): string {
   const shell = action.toolName === 'run_shell_command' || action.kind === 'shell_command';
   const lines = result.split('\n');
   const shown = lines.slice(0, APPROVED_RESULT_LINES).join('\n').trim();
@@ -723,7 +761,9 @@ export function approvedActionRanText(action: Pick<PendingActionRecord, 'kind' |
   const body = shell
     ? `Done — I ran it. Here's what it printed:\n\n\`\`\`\n${shellOutputOnly(shown)}${more}\n\`\`\``
     : `Done — that went through.${shown && !shown.startsWith('{') && shown.length <= 300 ? `\n\n${shown}` : ''}`;
-  return `${body}\n\nIf there was more to do after it, say "continue" and I'll pick it up from here.`;
+  return retainedWorkNeedsVerification
+    ? `${body}\n\nYour earlier request still has retained work to verify. Say "continue" to check the saved results and finish what remains.`
+    : body;
 }
 
 /** The owner's decision ended without the action landing. Two honest cases:

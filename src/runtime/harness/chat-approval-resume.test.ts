@@ -36,7 +36,15 @@ const { _setApprovedCallDispatchForTests } = await import('../../execution/pendi
 const { pendingActionApprovalView } = await import('./pending-action-view.js');
 const { HarnessSession } = await import('./session.js');
 const { recordTurnGraphShadow, turnGraphFromShadowEvent } = await import('../graph/turn-graph-shadow.js');
+const workContracts = await import('./expected-work-contract.js');
+const workAdmission = await import('./expected-work-admission.js');
+const dispatchLedger = await import('./dispatch-ledger.js');
+const settlementStore = await import('./logical-call-settlement-store.js');
+const { classifyAttemptOutcome } = await import('./attempt-outcome.js');
+const { acceptedTaskIdFor } = await import('./attempt-identity.js');
+const currentCapabilities = await import('./current-capability-manifest.fixture.js');
 const {
+  approvedActionRetainedWorkNeedsVerification,
   handleResolvedApprovalForChatResume,
   startChatApprovalResume,
   chatApprovalResumeDirective,
@@ -391,7 +399,7 @@ test('a parked pending-action card runs its exact stored action on approval, wit
   );
   // The owner's decision is the whole instruction: the stored payload ran
   // once, the model was not asked to re-issue or reconstruct anything. The
-  // brain is then handed the result to finish the rest of the request.
+  // outcome reports that action, without inventing a follow-up model turn.
   assert.equal(dispatched.length, 1, JSON.stringify(getPendingAction(action.id)));
   assert.equal(dispatched[0].tool, 'run_shell_command');
   assert.deepEqual(dispatched[0].payload, action.payload);
@@ -405,7 +413,154 @@ test('a parked pending-action card runs its exact stored action on approval, wit
   assert.ok(terminal, 'that source settled with what landed');
   assert.match(String(terminal!.data.reply), /^Done — I ran it\. Here's what it printed:/, 'in Clem\'s words, not the executor\'s');
   assert.doesNotMatch(String(terminal!.data.reply), /run_shell_command|exit_code|pa-/, 'no tool names or ids reach the owner');
-  assert.match(String(terminal!.data.reply), /say "continue"/, 'the one next step is named');
+  assert.doesNotMatch(String(terminal!.data.reply), /continue|more to do|request.*complete/i,
+    'a legacy action without exact original work evidence reports only its own result');
+});
+
+function retainedOriginalWork(sessionId: string, ids = ['first_job', 'second_job']) {
+  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Update the approved remote records.' } });
+  const identity = { sessionId, sourceUserSeq: source.seq, turn: source.turn };
+  assert.ok(recordTurnGraphShadow({ identity }), 'the original request has its exact accepted graph');
+  const activation = workAdmission.activateActionExpectedWork(identity);
+  assert.ok(activation.status === 'activated' || activation.status === 'replayed', JSON.stringify(activation));
+  const frozen = workContracts.freezeActionExpectedWorkContract({ ...identity, proposal: {
+    version: 1,
+    operations: ids.map((id, index) => ({ id, effect: 'external_write',
+      dependsOn: index ? [ids[index - 1]!] : [], dataFrom: [], cardinality: { kind: 'once' } })),
+    universes: [],
+  } });
+  assert.ok(frozen.status === 'fixed' || frozen.status === 'replayed', JSON.stringify(frozen));
+  return { source, identity, acceptedTaskId: acceptedTaskIdFor(sessionId, source.seq) };
+}
+
+async function approveStoredActionForOriginal(sessionId: string, sourceUserSeq: number | null) {
+  const action = queuePendingAction({ title: 'Run the reviewed command', summary: 'One exact approved command.',
+    kind: 'shell_command', toolName: 'run_shell_command', payload: { command: 'echo approved', cwd: '/tmp' },
+    sessionId, sourceUserSeq });
+  const row = approvalRegistry.register({ sessionId, subject: action.title, tool: 'request_approval',
+    args: { pendingActionId: action.id, pendingAction: pendingActionApprovalView(action) } });
+  appendEvent({ sessionId, turn: 1, role: 'system', type: 'approval_parked',
+    data: { approvalId: row.approvalId, tool: 'request_approval', pendingActionId: action.id } });
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  const calls = recordingDispatch();
+  let modelCalls = 0;
+  assert.equal(await handleResolvedApprovalForChatResume(resolved, async () => { modelCalls += 1; }), true);
+  assert.equal(modelCalls, 0);
+  assert.deepEqual(calls, [{ tool: action.toolName, payload: action.payload, sessionId }]);
+  assert.equal(getPendingAction(action.id)?.status, 'executed');
+  const decision = listEvents(sessionId, { types: ['user_input_received'] })
+    .find((event) => event.data.source === 'approval_resume' && event.data.approvalId === row.approvalId)!;
+  assert.ok(decision);
+  const terminal = listEvents(sessionId, { types: ['conversation_completed'] })
+    .find((event) => event.data.sourceUserSeq === decision.seq)!;
+  assert.ok(terminal);
+  assert.equal(terminal.data.turnOutcome?.status, 'done');
+  assert.equal(terminal.data.turnOutcome?.resumable, false, 'reporting remaining A work does not reopen executor source B');
+  _resetChatApprovalResumeForTest();
+  assert.equal(await handleResolvedApprovalForChatResume(approvalRegistry.get(row.approvalId)!,
+    async () => { throw new Error('must not dispatch a model'); }), false);
+  assert.equal(calls.length, 1, 'replaying the card never repeats the approved effect');
+  return { action, row, decision, terminal };
+}
+
+test('approved action B names verification only from the original A retained requirements', async () => {
+  const session = createSession({ kind: 'chat' });
+  const original = retainedOriginalWork(session.id);
+  assert.deepEqual(workAdmission.expectedWorkPlanLines(original.identity).map((line) => line.state),
+    ['open', 'blocked_on_dependency']);
+  const result = await approveStoredActionForOriginal(session.id, original.source.seq);
+  assert.match(String(result.terminal.data.reply), /earlier request still has retained work to verify/);
+  assert.match(String(result.terminal.data.reply), /Say "continue" to check the saved results and finish what remains/);
+  assert.doesNotMatch(String(result.terminal.data.reply), /more to do after it|I'll pick it up from here|entire request.*complete/i);
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] })
+    .filter((event) => event.data.sourceUserSeq === original.source.seq).length, 0,
+  'executing B does not claim or settle A complete');
+  assert.deepEqual(workAdmission.expectedWorkPlanLines(original.identity).map((line) => line.settledInstances), [0, 0],
+    'B success cannot discharge A requirements');
+});
+
+test('unknown or corrupt original work never invents a Continue invitation despite sibling work', async () => {
+  for (const variant of ['missing', 'corrupt'] as const) {
+    const session = createSession({ kind: 'chat' });
+    const original = variant === 'corrupt' ? retainedOriginalWork(session.id).source
+      : appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+        data: { text: 'Run this approved command.' } });
+    retainedOriginalWork(session.id);
+    if (variant === 'corrupt') {
+      const db = openEventLog();
+      const trigger = db.prepare(`SELECT sql FROM sqlite_master
+        WHERE type = 'trigger' AND name = 'trg_accepted_task_work_contracts_update_immutable'`)
+        .get() as { sql: string };
+      assert.ok(trigger?.sql);
+      // Simulate unreadable historical/storage bytes only inside the isolated
+      // fixture; restore the immutable boundary before executing approval B.
+      db.exec('DROP TRIGGER trg_accepted_task_work_contracts_update_immutable');
+      try {
+        db.prepare(`UPDATE accepted_task_work_contracts
+          SET contract_json = '{}' WHERE session_id = ? AND source_user_seq = ?`).run(session.id, original.seq);
+      } finally { db.exec(trigger.sql); }
+    }
+    assert.equal(workContracts.loadExpectedWorkContract(session.id, original.seq).status, variant);
+    const result = await approveStoredActionForOriginal(session.id, original.seq);
+    assert.doesNotMatch(String(result.terminal.data.reply), /continue|retained work|request.*complete/i, variant);
+  }
+});
+
+test('remaining-work presentation refuses wrong-session, wrong-source, synthetic and decision-owned evidence', () => {
+  const session = createSession({ kind: 'chat' });
+  const original = retainedOriginalWork(session.id);
+  const sibling = retainedOriginalWork(session.id);
+  const decision = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Yes, run that action.', decision: 'approve' } });
+  const row = { sessionId: session.id, presentation: null };
+  const action = { sessionId: session.id, sourceUserSeq: original.source.seq };
+  assert.equal(approvedActionRetainedWorkNeedsVerification(row, action, decision), true);
+  assert.equal(approvedActionRetainedWorkNeedsVerification({ ...row,
+    presentation: { sourceUserSeq: original.source.seq } }, action, decision), true);
+  assert.equal(approvedActionRetainedWorkNeedsVerification({ ...row,
+    presentation: { sourceUserSeq: sibling.source.seq } }, action, decision), false);
+  assert.equal(approvedActionRetainedWorkNeedsVerification(row, { ...action, sessionId: 'another-session' }, decision), false);
+  assert.equal(approvedActionRetainedWorkNeedsVerification(row, action, { ...decision, sessionId: 'another-session' }), false);
+  assert.equal(approvedActionRetainedWorkNeedsVerification(row, { ...action, sourceUserSeq: null }, decision), false);
+  assert.equal(approvedActionRetainedWorkNeedsVerification(row, { ...action, sourceUserSeq: decision.seq }, decision), false);
+  assert.equal(approvedActionRetainedWorkNeedsVerification(row, { ...action, sourceUserSeq: 1.5 }, decision), false);
+  openEventLog().prepare(`UPDATE events SET data_json = json_set(data_json, '$.synthetic', json('true')) WHERE seq = ?`)
+    .run(original.source.seq);
+  assert.equal(approvedActionRetainedWorkNeedsVerification(row, action, decision), false,
+    'a synthetic original source cannot justify asking the owner for a new turn');
+});
+
+test('discharged original work reports only the approved action, using the canonical settlement oracle', async (t) => {
+  const tool = 'FIXTURE_APPROVAL_REMOTE_JOB';
+  const prior = currentCapabilities.installCurrentCapabilityManifestFixtures([{ operationId: tool,
+    providerKind: 'native_mcp', effect: 'external_write', operationSemantics: { version: 1, reversibility: 'reversible' } }]);
+  t.after(() => currentCapabilities.restoreCurrentCapabilityManifestFixtures(prior));
+  const session = createSession({ kind: 'chat' });
+  const original = retainedOriginalWork(session.id, ['first_job']);
+  const identity = { ...original.identity, acceptedTaskId: original.acceptedTaskId,
+    logicalToolCallId: 'logical:retained-first-job' };
+  const args = { record_id: 'fixture-record-1', value: 'ready' };
+  assert.equal(dispatchLedger.admitLogicalCall({ identity, tool, args }).status, 'inserted');
+  const binding = workAdmission.admitExpectedWorkInvocation({ ...identity, requirementId: 'first_job', tool, args });
+  assert.equal(binding.status, 'bound', JSON.stringify(binding));
+  const crossing = dispatchLedger.beginPhysicalDispatch({ identity: { ...identity,
+    physicalDispatchId: 'dispatch:retained-first-job', ordinal: 1 }, tool, args });
+  assert.equal(crossing.status, 'inserted', JSON.stringify(crossing));
+  if (crossing.status !== 'inserted') throw new Error('fixture crossing not admitted');
+  assert.equal(dispatchLedger.settlePhysicalDispatch({ identity: crossing.identity, tool, outcome: 'returned' }).status, 'inserted');
+  const settled = settlementStore.commitLogicalCallSettlement({ identity, contract: { toolName: tool, args },
+    execution: { kind: 'provider_execution' }, result: { payload: { successful: true, id: 'fixture-record-1' } },
+    outcome: classifyAttemptOutcome({ envelopeSuccessful: true, acknowledged: true, mutating: true }),
+    recovery: { businessCall: true, mutating: true, requirementId: 'first_job' },
+    observer: { lane: 'native_mcp', turn: original.identity.turn } });
+  assert.equal(settled.status, 'committed', JSON.stringify(settled));
+  assert.deepEqual(workAdmission.expectedWorkPlanLines(original.identity).map((line) => ({ state: line.state,
+    settled: line.settledInstances })), [{ state: 'satisfied', settled: 1 }]);
+  retainedOriginalWork(session.id);
+  const result = await approveStoredActionForOriginal(session.id, original.source.seq);
+  assert.doesNotMatch(String(result.terminal.data.reply), /continue|retained work|request.*complete/i,
+    'neither another open source nor B success changes the original satisfied evidence');
 });
 
 test('an exact linked pending-action card resumes even if a crash lost approval_parked', async () => {
@@ -604,6 +759,7 @@ test('the ending after an approved shell action shows only what the command prin
   );
   assert.match(text, /^Done — I ran it\. Here's what it printed:\n\n```\nhost localhost\n```/);
   assert.doesNotMatch(text, /stderr|exit_code|run_shell_command/);
+  assert.doesNotMatch(text, /continue|more to do/i, 'action-only is the default');
   const quiet = approvedActionRanText({ kind: 'shell_command', toolName: 'run_shell_command' }, 'exit_code: 0 stdout:   stderr: ');
   assert.match(quiet, /\(nothing printed\)/);
   const sent = approvedActionRanText({ kind: 'external_send', toolName: 'composio_execute_tool' }, '{"id":"msg-1"}');

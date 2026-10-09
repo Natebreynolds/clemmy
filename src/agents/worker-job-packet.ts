@@ -89,19 +89,19 @@ export const WorkerToolInputSchema = z.object({
     .string()
     .min(1)
     .nullable()
-    .describe('Worker category in the user\'s word ("design", "research"); null for ordinary workers.'),
+    .describe('Worker category in the user\'s word ("design", "research"); null supplies no category. With model:null, saved-rule routing may still apply.'),
   model: z
     .string()
     .min(1)
     .nullable()
     .optional()
-    .describe('Model the user named; null uses routing.'),
+    .describe('Exact model the user named, or the host-shown role-wide Worker model id when the user asks for that role. null keeps routing, including a named agent\'s model pin.'),
   agent: z
     .string()
     .min(1)
     .nullable()
     .optional()
-    .describe('Saved agent to run as (its name); null for none.'),
+    .describe('Named saved agent to run as; its model pin applies even with model:null. null leaves named-agent binding off; the Worker model role is not an agent name.'),
   workManifest: WorkerManifestDescriptorSchema
     .nullable()
     .optional()

@@ -35,7 +35,7 @@ test('OpenAI local-runtime context preserves the exact accepted source turn', ()
   assert.equal(context.callId, 'call-source-authority');
 });
 
-test('invalid tool input returns the violated paths and a tool_search pointer, never a blind retry prompt', async () => {
+test('invalid tool input returns violated paths and current schema or discovery fallback', async () => {
   const { z } = await import('zod');
   const schema = z.strictObject({
     slug: z.string(),
@@ -79,7 +79,8 @@ test('invalid tool input returns the violated paths and a tool_search pointer, n
   });
   assert.match(String(message), /^An error occurred while running the tool/);
   assert.match(String(message), /did not match its schema/);
-  assert.match(String(message), /tool_search/);
+  assert.match(String(message), /Input schema \(complete\)/);
+  assert.doesNotMatch(String(message), /Call tool_search with/);
 
   // Spelling is not identity: a forged error merely NAMED InvalidToolInputError
   // still gets the guidance text but never the nominal carrier.
@@ -89,6 +90,8 @@ test('invalid tool input returns the violated paths and a tool_search pointer, n
   );
   assert.equal(typeof forged, 'string');
   assert.match(forged as string, /did not match its schema/);
+  assert.match(forged as string, /Call tool_search with/);
+  assert.doesNotMatch(forged as string, /Input schema \(complete\)/);
 
   // A plain execution error keeps the exact SDK default shape — no guidance.
   const executionMessage = await errorFunction(undefined, new Error('disk full'));
@@ -212,11 +215,12 @@ test('task_list literal "null" enum value returns the nominal invalid-arguments 
     'the laundered-prefix detectors (inner-dispatch, batch-runner) keep matching the bytes');
   assert.match(String(output), /InvalidToolInputError/);
   assert.match(String(output), /priority: Invalid option/);
-  assert.match(String(output), /tool_search/);
+  assert.match(String(output), /Input schema \(complete\)/);
+  assert.doesNotMatch(String(output), /Call tool_search with/);
 
   // The deferred call_tool/work_call carrier validates with its own canonical
-  // schema (the envelope admits any object): same input, same carrier, same
-  // bytes — lane parity at the producer.
+  // schema (the envelope admits any object): same input and no-dispatch
+  // carrier, while each lane reports its own current parser schema.
   const deferred = getLocalDeferredDispatchTools()
     .find((candidate) => (candidate as { name?: string }).name === 'task_list');
   assert.ok(deferred && deferred.type === 'function');

@@ -71,6 +71,8 @@ import { registerTeamTools } from './team-tools.js';
 import { registerVaultTools } from './vault-tools.js';
 import {
   describeInvalidToolInput,
+  DEFAULT_TOOL_RESULT_MAX_CHARS,
+  INVALID_INPUT_SCHEMA_GUIDANCE_MAX_CHARS,
   ensureToolDirectories,
   isInvalidArgumentsTextResult,
   isSdkToolInputValidationError,
@@ -400,8 +402,39 @@ function completeExactNativeArguments(
   return repairNativeArguments(parameters, filled, { sideEffect })?.args ?? null;
 }
 
+function parserInputSchema(parameters: z.ZodTypeAny): unknown {
+  try {
+    // Input mode retains optional/default input semantics. The deferred JSON
+    // parser must not inherit the first-class Responses projection.
+    return z.toJSONSchema(parameters, {
+      io: 'input',
+      override: ({ zodSchema }) => {
+        const definition = zodSchema._zod.def as {
+          type?: string;
+          coerce?: boolean;
+          checks?: Array<{ _zod?: { def?: { check?: string } } }>;
+        };
+        // Zod omits executable refinements from JSON Schema without throwing.
+        // A pipe's output parser can also reject input admitted by its input
+        // projection; coercion/catch can admit values its schema cannot name.
+        // Do not present those incomplete projections as complete.
+        if (definition.type === 'pipe' || definition.type === 'catch'
+          || definition.coerce === true || definition.checks?.some(check =>
+          check._zod?.def?.check === 'custom' || check._zod?.def?.check === 'overwrite')) {
+          throw new Error('Parser constraints are not completely representable in JSON Schema');
+        }
+      },
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 export function buildLocalToolErrorFunction(
   localTool: CapturedLocalTool,
+  /** The SDK parser used by this exact registration. The default preserves
+   * the first-class constructor used by existing callers and fixtures. */
+  sdkInputSchema?: () => unknown,
 ): (runContext: unknown, error: unknown) => Promise<LocalToolErrorFunctionResult> {
   return async (runContext: unknown, error: unknown): Promise<LocalToolErrorFunctionResult> => {
     if (localTool.name === 'memory_remember') {
@@ -460,18 +493,29 @@ export function buildLocalToolErrorFunction(
     }
     const details = error instanceof Error ? error.toString() : String(error);
     const base = `An error occurred while running the tool. Please try again. Error: ${details}`;
-    const guidance = describeInvalidToolInput(error, localTool.name);
+    let inputSchema: unknown;
+    if (isSdkToolInputValidationError(error)) {
+      try {
+        inputSchema = sdkInputSchema ? sdkInputSchema() : parserInputSchema(z.strictObject(normalizedShape));
+      } catch { /* Schema presentation cannot obstruct the nominal refusal. */ }
+    }
+    const guidance = describeInvalidToolInput(error, localTool.name, {
+      inputSchema,
+      maxChars: Math.max(0, Math.min(DEFAULT_TOOL_RESULT_MAX_CHARS,
+        INVALID_INPUT_SCHEMA_GUIDANCE_MAX_CHARS) - base.length - 1),
+    });
     return invalidLocalToolInputResult(error, guidance ? `${base}\n${guidance}` : base);
   };
 }
 
 function localToolToRuntimeTool(localTool: CapturedLocalTool): Tool<RuntimeContextValue> {
+  const parameters = z.strictObject(normalizeShapeForResponses(localTool.parameters));
   return tool({
     name: localTool.name,
     description: localTool.description,
     // Match the advertised closed schema and the deferred carrier. Silently
     // stripping an unknown filter/query changes the requested operation.
-    parameters: z.strictObject(normalizeShapeForResponses(localTool.parameters)),
+    parameters,
     // Unified taxonomy. The captured tool's `approvalRequired` flag is
     // honored via a destructive-hint so dynamic tools that the runtime
     // marks as "always ask" still pause regardless of policy scope.
@@ -483,10 +527,11 @@ function localToolToRuntimeTool(localTool: CapturedLocalTool): Tool<RuntimeConte
       toolOutputContextFromSdk(localTool.name, runContext, details),
       async () => resultToText(await localTool.handler(input as Record<string, unknown>)),
     ),
-    // Input-validation failures return the violated paths + a tool_search
-    // pointer (see buildLocalToolErrorFunction); execution errors keep the
+    // Input-validation failures return the violated paths + this exact schema
+    // (or the existing discovery fallback); execution errors keep the
     // SDK's default text; memory_remember keeps only exact omitted-nullable recovery.
-    errorFunction: buildLocalToolErrorFunction(localTool) as unknown as SdkStringErrorFunction,
+    errorFunction: buildLocalToolErrorFunction(localTool,
+      () => parserInputSchema(parameters)) as unknown as SdkStringErrorFunction,
   });
 }
 
@@ -503,6 +548,12 @@ function canonicalDeferredLocalToolSchema(localTool: CapturedLocalTool): z.ZodTy
 
 function localToolToDeferredDispatchTool(localTool: CapturedLocalTool): Tool<RuntimeContextValue> {
   const canonicalParameters = canonicalDeferredLocalToolSchema(localTool);
+  const envelopeParameters = {
+    type: 'object' as const,
+    properties: {},
+    required: [] as never[],
+    additionalProperties: true as const,
+  };
   return tool({
     name: localTool.name,
     description: localTool.description,
@@ -510,12 +561,7 @@ function localToolToDeferredDispatchTool(localTool: CapturedLocalTool): Tool<Run
     // model. The SDK parses the envelope, then execute applies the canonical
     // lossless deferred schema. Provider-strict conversion cannot represent
     // open JSON records and must not narrow their values to strings.
-    parameters: {
-      type: 'object',
-      properties: {},
-      required: [],
-      additionalProperties: true,
-    },
+    parameters: envelopeParameters,
     strict: false,
     needsApproval: needsApprovalFromTaxonomy(localTool.name, {
       isDestructive: () => Boolean(localTool.approvalRequired),
@@ -526,16 +572,19 @@ function localToolToDeferredDispatchTool(localTool: CapturedLocalTool): Tool<Run
         // The envelope schema above admits any object, so the canonical
         // deferred schema is this lane's real validation boundary. A thrown
         // ZodError would reach errorFunction without the SDK's nominal class
-        // and be laundered into an execution-error string; refuse here with
-        // the same carrier and the same bytes the first-class lane returns.
+        // and be laundered into an execution-error string; preserve the same
+        // no-dispatch carrier and failure prefix, with this lane's schema.
+        const base = 'An error occurred while running the tool. Please try again. '
+          + 'Error: InvalidToolInputError: Invalid JSON input for tool';
         const guidance = describeInvalidToolInput(
           { name: 'InvalidToolInputError', originalError: parsed.error },
           localTool.name,
+          { inputSchema: parserInputSchema(canonicalParameters),
+            maxChars: Math.max(0, Math.min(DEFAULT_TOOL_RESULT_MAX_CHARS,
+              INVALID_INPUT_SCHEMA_GUIDANCE_MAX_CHARS) - base.length - 1) },
         );
         return new InvalidArgumentsPreDispatchResult(
-          'An error occurred while running the tool. Please try again. '
-          + 'Error: InvalidToolInputError: Invalid JSON input for tool'
-          + (guidance ? `\n${guidance}` : ''),
+          base + (guidance ? `\n${guidance}` : ''),
         );
       }
       const canonical = parsed.data as Record<string, unknown>;
@@ -544,7 +593,8 @@ function localToolToDeferredDispatchTool(localTool: CapturedLocalTool): Tool<Run
         async () => resultToText(await localTool.handler(canonical)),
       );
     },
-    errorFunction: buildLocalToolErrorFunction(localTool) as unknown as SdkStringErrorFunction,
+    errorFunction: buildLocalToolErrorFunction(localTool,
+      () => envelopeParameters) as unknown as SdkStringErrorFunction,
   });
 }
 

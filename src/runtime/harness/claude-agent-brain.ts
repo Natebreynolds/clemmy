@@ -298,6 +298,11 @@ export function setClaudeAgentSdkBrainSearchFactsHybridForTest(fn: typeof search
   searchFactsHybridImpl = fn ?? searchFactsHybrid;
 }
 
+let fallbackBreadcrumbsImpl: typeof crossStoreBreadcrumbs = crossStoreBreadcrumbs;
+export function setClaudeAgentSdkBrainFallbackBreadcrumbsForTest(fn: typeof crossStoreBreadcrumbs | null): void {
+  fallbackBreadcrumbsImpl = fn ?? crossStoreBreadcrumbs;
+}
+
 export function setClaudeAgentSdkBrainUnifiedPrimerForTest(
   fn: Parameters<typeof _setUnifiedTurnPrimerRecallForTest>[0],
 ): void {
@@ -1204,6 +1209,9 @@ async function buildClaudeAgentBrainTurnContext(
       })
     : '';
   let recall = '';
+  let breadcrumbWork: Promise<string> | undefined;
+  const startFallbackBreadcrumbs = (): Promise<string> => breadcrumbWork ??= Promise.resolve()
+    .then(() => fallbackBreadcrumbsImpl(q)).catch(() => '');
   let unifiedPrimerStatus: 'ok' | 'empty' | 'timeout' | 'error' | 'disabled' | null = null;
   const recallOn = queryRecallEnabled();
   const recallOptedOut = explicitlyOptsOutOfAutomaticMemoryRecall(q);
@@ -1257,7 +1265,10 @@ async function buildClaudeAgentBrainTurnContext(
         rememberTurnMemoryForJudges(request.sessionId, recall);
       } else if (unified.status !== 'empty') {
         // Degraded fallback only: preserve the prior bounded fact/meeting path
-        // when the unified ranker is killed, times out, or fails.
+        // when the unified ranker is killed, times out, or fails. Breadcrumbs
+        // are independent and retain their own budget and evidence; overlap
+        // their graph recall with these reads, without starting on success.
+        startFallbackBreadcrumbs();
         const [hits, meetingRecall] = await Promise.all([
           withTimeout(searchFactsHybridImpl(q, 6), timeoutMs, []),
           isTemporalMeetingQuery(q)
@@ -1338,7 +1349,7 @@ async function buildClaudeAgentBrainTurnContext(
     && unifiedPrimerStatus !== 'ok'
     && unifiedPrimerStatus !== 'empty'
   ) {
-    try { breadcrumbs = await crossStoreBreadcrumbs(q); } catch { breadcrumbs = ''; }
+    breadcrumbs = await startFallbackBreadcrumbs();
   }
   let sessionActions = '';
   if (sessionHistoryEnabled()) {

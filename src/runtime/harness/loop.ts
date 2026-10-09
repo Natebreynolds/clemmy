@@ -5768,14 +5768,32 @@ function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVau
   };
 }
 
+let fallbackBreadcrumbsImpl = crossStoreBreadcrumbs;
+let fallbackVaultImpl = searchVault;
+let fallbackHybridVaultImpl = searchVaultAsync;
+
+export function _setFallbackMemoryLookupsForTest(ports: {
+  breadcrumbs?: typeof crossStoreBreadcrumbs;
+  vault?: typeof searchVault;
+  hybridVault?: typeof searchVaultAsync;
+} | null): void {
+  fallbackBreadcrumbsImpl = ports?.breadcrumbs ?? crossStoreBreadcrumbs;
+  fallbackVaultImpl = ports?.vault ?? searchVault;
+  fallbackHybridVaultImpl = ports?.hybridVault ?? searchVaultAsync;
+}
+
 async function searchVaultAsyncWithTimeout(query: string): Promise<ReturnType<typeof searchVault> | null> {
-  const timeout = new Promise<null>((resolve) => {
-    setTimeout(() => resolve(null), TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS);
-  });
-  return await Promise.race([
-    searchVaultAsync(query, TURN_MEMORY_PRIMER_TOP_K),
-    timeout,
-  ]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      fallbackHybridVaultImpl(query, TURN_MEMORY_PRIMER_TOP_K),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** The primer the host builds when the shared ranker gave no signal (off,
@@ -5787,18 +5805,28 @@ async function plainFallbackPrimer(
   hybridEnabled: boolean,
 ): Promise<TurnMemoryPrimer> {
   const unified = { status: unifiedStatus };
-  // Wave 2 Move A: APPEND sync cross-store breadcrumbs (people/places/tools) to
-  // the existing facts+vault+episodic primer — never replacing it. Self-gating +
-  // computed once (sync stores → no latency), passed into every format path below.
-  const breadcrumbs = await crossStoreBreadcrumbs(query);
-  const ftsHits = searchVault(query, TURN_MEMORY_PRIMER_TOP_K);
+  // Both fallback reads belong to this request and are independent. Start
+  // them together only after the shared ranker gave no signal; breadcrumbs
+  // may await semantic graph bridges, so they must not serialize the vault
+  // pass. Settle failures immediately while retaining the other leg's evidence.
+  const ftsHits = fallbackVaultImpl(query, TURN_MEMORY_PRIMER_TOP_K);
+  const breadcrumbWork = Promise.resolve().then(() => fallbackBreadcrumbsImpl(query)).catch(() => '');
+  const hybridWork = hybridEnabled
+    ? searchVaultAsyncWithTimeout(query).then(
+        (value) => ({ kind: 'result' as const, value }),
+        (error: unknown) => ({ kind: 'error' as const, error }),
+      )
+    : null;
+  const breadcrumbs = await breadcrumbWork;
   if (!hybridEnabled) {
     const legacy = formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
     return unified.status === 'disabled' ? legacy : { ...legacy, skippedReason: `unified_${unified.status}_fallback` };
   }
 
   try {
-    const hybridHits = await searchVaultAsyncWithTimeout(query);
+    const hybrid = await hybridWork!;
+    if (hybrid.kind === 'error') throw hybrid.error;
+    const hybridHits = hybrid.value;
     if (hybridHits && hybridHits.length > 0) {
       const legacy = formatTurnMemoryPrimer(query, hybridHits, 'hybrid', sessionId, breadcrumbs);
       return unified.status === 'disabled' ? legacy : { ...legacy, skippedReason: `unified_${unified.status}_fallback` };
@@ -5818,6 +5846,8 @@ async function plainFallbackPrimer(
 
   return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
 }
+
+export const _testOnly_plainFallbackPrimer = plainFallbackPrimer;
 
 /**
  * The primer of a turn whose shared ranker did not run: switched off, out of
@@ -12022,6 +12052,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
     const objective = goalObjectiveString(activeGoalForTurn);
     if (objective) classifierInput = objective;
   }
+  markTurnClock(options.sessionId, 'canonical_context_started');
   const canonicalContext = buildCanonicalContextPack({
     input: classifierInput,
     // A harness-generated retry is not a new authority source. Reuse the exact
@@ -12061,12 +12092,14 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
       skippedReason: turnMemoryPrimer.skippedReason ?? null,
     },
   });
+  markTurnClock(options.sessionId, 'canonical_context_built');
   // The checks (Jev completion, grounding) see what the brain was told from
   // memory this turn; a stated preference is then support, not an unsupported
   // specific.
   rememberTurnMemoryForJudges(options.sessionId, turnMemoryPrimer.text);
   const contextPacket = canonicalContext.turn;
   if (contextPacket.skills.length > 1) {
+    markTurnClock(options.sessionId, 'skill_rerank_started');
     try {
       const { rerankNamedCandidatesWithJev } = await import('../jev/control-plane.js');
       contextPacket.skills = await rerankNamedCandidatesWithJev(
@@ -12075,6 +12108,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
         { label: (skill) => skill.description, sessionId: options.sessionId },
       );
     } catch { /* fail-open: keep lexical skill ranking */ }
+    markTurnClock(options.sessionId, 'skill_rerank_settled');
   }
   let preparedPreflight: {
     identity: TurnIdentity;

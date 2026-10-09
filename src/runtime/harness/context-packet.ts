@@ -26,6 +26,7 @@ import {
 } from './focus-projection.js';
 import { classifyTurnIntent } from './turn-intent.js';
 import { acceptedTaskMode } from './accepted-task-mode.js';
+import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import {
   classifyTurnPreflight,
   confirmBeatDirective,
@@ -45,6 +46,7 @@ import {
 import { openLoopsForSession, renderOpenLoops } from './open-loops.js';
 import { renderSessionConstraints, sessionConstraintsForSession } from './session-constraints.js';
 import { standingRuleCaptureDirective } from '../../memory/rule-capture.js';
+import { resolveRoleModel } from './model-roles.js';
 import {
   BATCH_RE,
   READ_RE,
@@ -702,6 +704,23 @@ function providerAccessLine(): string {
   }
 }
 
+/** Role configuration is distinct from a named agent and from execution
+ * evidence. Read the canonical role afresh; never advertise a stale saved
+ * binding's fallback as the owner's unavailable choice. */
+function workerRoleConfigurationLine(): string {
+  const distinction = 'A named saved agent is a separate choice: its own model pin applies even with model:null. model:null keeps ordinary routing, including matching saved intent rules. Configuration is not execution proof: report the actual model/provider from worker receipts; exact account claims need account evidence.';
+  try {
+    const worker = resolveRoleModel('worker');
+    if (worker.inactiveBinding) {
+      const saved = worker.inactiveBinding;
+      return `Worker model role (role-wide configuration, no intent): saved model=${JSON.stringify(saved.modelId)}, provider=${saved.provider}, source=${saved.source} is unavailable; current fallback model=${JSON.stringify(worker.modelId)}, provider=${worker.provider}, source=${worker.source}. The fallback is not that saved choice; do not claim it honored an exact request for the unavailable binding. ${distinction}`;
+    }
+    return `Worker model role (role-wide configuration, no intent): model=${JSON.stringify(worker.modelId)}, provider=${worker.provider}, source=${worker.source}. When the user asks for this role-wide Worker model, call run_worker with agent:null, model:${JSON.stringify(worker.modelId)}, intent:null; use this host-shown model id, not a saved agent called "Worker". ${distinction}`;
+  } catch {
+    return `Worker model role configuration could not be read. Do not guess its model or account from a saved agent's name. ${distinction}`;
+  }
+}
+
 export function buildAgentContextPacket(
   input: string,
   memory: MemoryPrimerSummary,
@@ -734,6 +753,17 @@ export function buildAgentContextPacket(
   // summaries are not evidence about this run: words such as "failed" in a
   // reviewed plan previously imported another workflow's repair directive.
   const reviewedExecution = acceptedTaskMode(opts?.sessionId, opts?.sourceUserSeq)?.kind === 'execute';
+  // The orchestrator still exposes run_worker on an exact, ready read-only
+  // Execute revision. Its role facts remain useful without importing global
+  // health or changing the reviewed topology. Unclaimed/invalid revisions
+  // cannot establish that surface; execution admission owns their refusal.
+  let reviewedReadOnlyExecution = false;
+  if (reviewedExecution && opts?.sessionId && opts?.sourceUserSeq) {
+    try {
+      reviewedReadOnlyExecution = acceptedPlanExecution(opts.sessionId, opts.sourceUserSeq)
+        ?.artifact.structuredPlan?.executionDraft === null;
+    } catch { /* advisory projection only; do not invent a worker surface */ }
+  }
   const suppressSemanticEnrichment = opts?.suppressSemanticEnrichment === true;
   const plainConversationSurface = opts?.plainConversationSurface === true;
   const suppressActionSemanticEnrichment = suppressSemanticEnrichment || plainConversationSurface;
@@ -855,7 +885,9 @@ export function buildAgentContextPacket(
     : detectMultiItemIntent(authorityInput);
   const agentSystem = plainConversationSurface || reviewedExecution
     ? { injected: false, recommendationCount: 0, recommendations: [], policy: null, summary: '', text: '' }
-    : renderAgentSystemGuidance(authorityInput, opts?.sessionKind);
+    : renderAgentSystemGuidance(authorityInput, opts?.sessionKind, {
+        needsCoordinationPolicy: multiItem.isMultiItem,
+      });
   const fanoutPosture = agentSystem.policy?.fanoutPosture ?? 'unknown';
   const recommendedWorkerWaveSize = agentSystem.policy?.recommendedWorkerWaveSize ?? 8;
   // The count-aware fan-out directive belongs to EVERY non-workflow lane.
@@ -989,6 +1021,7 @@ export function buildAgentContextPacket(
     ...(suppressActionSemanticEnrichment
       ? []
       : renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. Shared names or keywords do not establish that a workflow fits the current task. If the user asks to run a saved workflow, call workflow_run with their exact phrasing; inspect its definition when needed to supply its inputs. Otherwise use workflow_get only when the workflow\'s purpose is relevant and its steps could help with the requested work. A candidate does not prove that its capabilities, accounts or arguments apply here. Continue directly when they do not fit. Do NOT auto-run a workflow the user did not ask to run.')),
+    suppressActionSemanticEnrichment || constrainedWorkflowNode || (reviewedExecution && !reviewedReadOnlyExecution) ? '' : workerRoleConfigurationLine(),
     ...renderCandidates('Saved agents', savedAgents, 'The owner\'s saved agents. To hand one of them a piece of work you wait on here, call run_worker with agent set to its name. To hand one longer, multi-step work that runs on its own and reports back here, call dispatch_background_task with agent set to its name, and project set to the project it works in when it has one. Either way the work runs as that agent, with its instructions and on its model. Credit a result to an agent only when the work ran as it, and say which model ran it when that matters.'),
     savedAgents.length === 0 && agentRoster
       ? `${agentRoster} This is the current list, so a question about the agents is answered from it. To hand one work, call run_worker (or dispatch_background_task for longer work) with agent set to its name.`

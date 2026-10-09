@@ -1,6 +1,8 @@
 import { getRuntimeEnv } from '../config.js';
 import { asksForCompleteRecallSet, recallMemory, type MemoryEvidenceHit } from './recall-memory.js';
 import type { RecallCandidateRef } from './recall-usage.js';
+import { recallSelectionDiagnostic, recallSelectionRef, retainRecallSelectionDiagnostic, RECALL_SELECTION_TRACE_CAP, type RecallSelectionStage } from './recall-trace.js';
+import { canCompactAutomaticPrimerSource, transferAutomaticPrimerOrigin } from './automatic-primer-origin.js';
 
 /** Backwards-compatible facade over the evidence-backed recall pipeline. */
 export type UnifiedHitType = 'fact' | 'vault' | 'entity' | 'resource' | 'episode' | 'policy' | 'tool-recall' | 'deliverable';
@@ -142,7 +144,7 @@ export async function recallEverything(objective: string, opts: UnifiedRecallOpt
     const projected = type === 'vault'
       ? { snippet: hit.text, truncated: false }
       : projectSnippet(hit.text, fullValueHit ? 1_200 : 240);
-    return {
+    const projectedHit: UnifiedHit = {
       type,
       ref: String(hit.ref.id),
       title: hit.title ?? type,
@@ -155,12 +157,16 @@ export async function recallEverything(objective: string, opts: UnifiedRecallOpt
       evidence: hit.evidence,
       whyRecalled: hit.whyRecalled,
     };
+    return transferAutomaticPrimerOrigin(hit, projectedHit, { type: recallStore(type), id: projectedHit.ref });
   });
   // `recallMemory` judges the full stored hit. A complete-set request can only
   // be called supported when at least one evidence-backed supporting hit is also
   // complete in the projection the model actually receives.
   const answerability = projectedRecallAnswerability({ objective: obj, answerability: result.answerability, purpose: opts.purpose }, hits);
-  return { objective: obj, hits, perStore, answerability, diagnostics: result.diagnostics, ...(opts.purpose ? { purpose: opts.purpose } : {}) };
+  const unified: UnifiedRecallResult = { objective: obj, hits, perStore, answerability, diagnostics: result.diagnostics, ...(opts.purpose ? { purpose: opts.purpose } : {}) };
+  const selection = recallSelectionDiagnostic(result);
+  if (selection) retainRecallSelectionDiagnostic(unified, selection);
+  return unified;
 }
 
 export function formatUnifiedRecall(result: UnifiedRecallResult, maxChars = 2400): string {
@@ -241,7 +247,10 @@ function unifiedPrimerLine(hit: UnifiedHit): string {
     .map((item) => item.sourceUri?.trim())
     .filter((uri): uri is string => Boolean(uri)))]
     .find((uri) => uri !== hit.ref && uri.length <= 240);
-  return `- [${label[hit.type]}] [ref ${ref.type}:${ref.id}] ${title}${snippet ? `: ${snippet}` : ''}${hit.truncated || snippet !== hit.snippet.replace(/\s+/g, ' ').trim() ? ' [excerpt; reopen ref for full value]' : ''}${source ? ` [source: ${source}]` : ''}${unifiedTimeEvidence(hit)}`;
+  const sourceHint = source && canCompactAutomaticPrimerSource(hit, ref, source)
+    ? ' [source via ref]'
+    : source ? ` [source: ${source}]` : '';
+  return `- [${label[hit.type]}] [ref ${ref.type}:${ref.id}] ${title}${snippet ? `: ${snippet}` : ''}${hit.truncated || snippet !== hit.snippet.replace(/\s+/g, ' ').trim() ? ' [excerpt; reopen ref for full value]' : ''}${sourceHint}${unifiedTimeEvidence(hit)}`;
 }
 
 /** Exact visible candidate set for a bounded recall block. Attribution must
@@ -263,11 +272,18 @@ export function visibleUnifiedRecallHits(result: UnifiedRecallResult, maxChars =
 
 /** Exact visible candidate set for the compact automatic primer. Attribution
  * must use this formatter's real boundary, not the larger tool-output format. */
-export function visibleUnifiedPrimerHits(result: UnifiedRecallResult, maxChars = 1800, options: { header?: boolean } = {}): UnifiedHit[] {
+export function visibleUnifiedPrimerHits(result: UnifiedRecallResult, maxChars = 1800, options: {
+  header?: boolean;
+  /** Host-only diagnostic observer; never added to model-facing values. */
+  observeSelection?: (stage: RecallSelectionStage) => void;
+} = {}): UnifiedHit[] {
   const visible: UnifiedHit[] = [];
   let used = options.header === false ? 0 : unifiedRecallHeader(result).length;
+  const initialChars = used;
+  const lineLengths: number[] | undefined = options.observeSelection ? [] : undefined;
   for (const hit of result.hits) {
     const line = unifiedPrimerLine(hit);
+    if (lineLengths && lineLengths.length < RECALL_SELECTION_TRACE_CAP) lineLengths.push(line.length);
     // Skip-and-continue, not break — one large hit must not discard the rest.
     if (used + line.length + 1 > maxChars) continue;
     visible.push(hit);
@@ -277,7 +293,19 @@ export function visibleUnifiedPrimerHits(result: UnifiedRecallResult, maxChars =
   // top-ranked one even if it alone exceeds the compact budget. The complete-set
   // boost ranks a durable roster first, so this guarantees the roster reaches
   // the model instead of being silently dropped (the 2026-07-19 incident).
-  if (visible.length === 0 && result.hits.length > 0) visible.push(result.hits[0]);
+  const forcedFirst = visible.length === 0 && result.hits.length > 0;
+  if (forcedFirst) visible.push(result.hits[0]);
+  if (options.observeSelection) try {
+    options.observeSelection({ stage: 'primer_bytes', candidates: result.hits.length, selected: visible.length,
+      rowsOmitted: Math.max(0, result.hits.length - RECALL_SELECTION_TRACE_CAP), maxChars, initialChars,
+      rows: result.hits.slice(0, RECALL_SELECTION_TRACE_CAP).map((hit, index) => ({
+        ref: recallSelectionRef(recallStore(hit.type), hit.ref), rank: index + 1, score: hit.score,
+        lineChars: lineLengths?.[index],
+        reason: forcedFirst && index === 0 ? 'forced_first_oversize' : visible.includes(hit) ? 'selected' : 'byte_budget',
+        ...(visible.includes(hit) ? { rankOut: visible.indexOf(hit) + 1 } : {}),
+      })),
+    });
+  } catch { /* diagnostic failure never changes projection */ }
   return visible;
 }
 

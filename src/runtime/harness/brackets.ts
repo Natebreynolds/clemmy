@@ -188,6 +188,7 @@ import {
 import {
   attemptSignalsFromShellExecutionOutcome,
   attemptSignalsFromTypedResult,
+  HostLocalReadSuccessResult,
   providerResultReportsNoChange,
   settleToolAttempt,
   ToolAttemptSettlementAuthorityError,
@@ -4685,7 +4686,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           sessionId: ctx?.sessionId,
           callId: invokeCallId,
           toolName: tool.name,
-          compactResult: result,
+          compactResult: result instanceof HostLocalReadSuccessResult ? result.output : result,
           settlementNonce,
         });
         const hostSignals = {
@@ -5256,7 +5257,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       sessionId: ctx?.sessionId,
       callId: executeCallId,
       toolName: tool.name,
-      compactResult: result,
+      compactResult: result instanceof HostLocalReadSuccessResult ? result.output : result,
       settlementNonce,
     });
     if (wrapperMustSettleLogicalCall(ctx)) {
