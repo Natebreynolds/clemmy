@@ -270,14 +270,27 @@ export const archiveSpace = (id: string) =>
 export const deleteSpace = (id: string) =>
   apiDelete<{ removed: boolean }>(`/api/console/spaces/${encodeURIComponent(id)}?hard=1`);
 
+/** A feed Refresh started (or could not start) instead of the Space's own read. */
+export interface SpaceFeedRunStart { workflow: string; status: string; id?: string; message?: string }
+
 export const refreshSpace = async (id: string, sourceId?: string) => {
-  const response = await apiPost<{ results: RefreshResult[]; data: unknown }>(
+  const response = await apiPost<{ results: RefreshResult[]; data: unknown; feedRuns?: SpaceFeedRunStart[] }>(
     `/api/console/spaces/${encodeURIComponent(id)}/refresh`, sourceId ? { sourceId } : {},
   );
   const failure = refreshFailureForResults(response.results);
   if (failure) throw failure;
+  const unstarted = feedRunsNotStarted(response.feedRuns ?? []);
+  if (unstarted) throw new Error(unstarted);
   return response;
 };
+
+/** A feed that could not start, said plainly; null when every feed started
+ *  (or was already running). */
+export function feedRunsNotStarted(runs: readonly SpaceFeedRunStart[]): string | null {
+  const stuck = runs.filter((run) => run.status !== 'queued' && run.status !== 'duplicate' && run.status !== 'held');
+  if (stuck.length === 0) return null;
+  return stuck.map((run) => `${run.workflow} did not start: ${run.message ?? run.status}`).join(' ');
+}
 
 /** Narrow operations used by the parent-owned Workspace iframe RPC bridge.
  *  Auth stays here in the trusted console; authored view code never receives a

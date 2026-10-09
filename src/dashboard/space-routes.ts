@@ -25,7 +25,7 @@ import {
   type SpaceRecord,
 } from '../spaces/store.js';
 import { recordViewGapNote } from '../spaces/view-revision-checks.js';
-import { spaceFeedSummaries } from '../spaces/workflow-feeds.js';
+import { spaceFeedSummaries, spaceRefreshPlan } from '../spaces/workflow-feeds.js';
 import { whatChangedInSpace } from '../spaces/what-changed.js';
 import {
   readData, MAX_DATA_BYTES, appendNote, listNotes, appendAudit, listAudit, readViewData } from '../spaces/data-store.js';
@@ -981,8 +981,29 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     const slug = req.params.id;
     if (!isValidSpaceSlug(slug) || !spaceStore.get(slug)) { res.status(404).json({ error: 'not found' }); return; }
     try {
-      const results = await refreshSpaceData(slug, typeof req.body?.sourceId === 'string' ? req.body.sourceId : undefined);
-      res.json({ results, data: readData(slug) });
+      const only = typeof req.body?.sourceId === 'string' ? req.body.sourceId : undefined;
+      // One schedule: what a workflow feeds is refreshed by running that
+      // workflow; the Space's own sources refresh the rest, as before.
+      let plan: ReturnType<typeof spaceRefreshPlan> | null = null;
+      try {
+        const record = spaceStore.get(slug);
+        plan = spaceRefreshPlan({ sourceIds: (record?.dataSources ?? []).map((source) => source.id),
+          feeds: await spaceFeedSummaries(slug), ...(only !== undefined ? { only } : {}) });
+      } catch { plan = null; }
+      if (!plan || plan.runFeeds.length === 0) {
+        const results = await refreshSpaceData(slug, only);
+        res.json({ results, data: readData(slug) });
+        return;
+      }
+      const { resumeWorkflowRun } = await import('../tools/workflow-run-queue.js');
+      const feedRuns = plan.runFeeds.map((feed) => {
+        const queued = resumeWorkflowRun(feed.title, {}, { source: 'console' });
+        return { workflow: feed.workflow, status: queued.status, ...(queued.id ? { id: queued.id } : {}),
+          ...(queued.status === 'queued' ? {} : { message: queued.message }) };
+      });
+      const results: Awaited<ReturnType<typeof refreshSpaceData>> = [];
+      for (const sourceId of plan.refreshSources) results.push(...await refreshSpaceData(slug, sourceId));
+      res.json({ results, data: readData(slug), feedRuns });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

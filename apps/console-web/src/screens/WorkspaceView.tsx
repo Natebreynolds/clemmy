@@ -432,19 +432,22 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
           </button>
         ))}
         <div className="ml-auto flex items-center gap-1.5">
-          {space.dataSources.length > 0 && (
+          {(space.dataSources.length > 0 || feedList.some((feed) => feed.enabled)) && (
             <Button
               variant="secondary"
               size="sm"
               disabled={busy}
               onClick={() => act(async () => {
                 try {
+                  // A fed collection refreshes by running its feed.
                   await refreshSpace(id);
                 } catch (err) {
                   if (err instanceof WorkspaceRefreshError && err.pendingApprovalIds.length > 0) {
                     setDockOpen(true);
                   }
                   throw err;
+                } finally {
+                  void feeds.refetch();
                 }
                 await history.refetch();
               }, true)}

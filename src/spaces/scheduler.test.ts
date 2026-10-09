@@ -344,3 +344,31 @@ test('paused-build auto-retry: a genuinely-broken source exhausts 2 attempts and
   assert.equal(store.spaceStore.get(slug)!.status, 'paused', 'a real bug stays a human decision');
   store.spaceStore.archive(slug);
 });
+
+test('one schedule: a source whose collection a scheduled workflow feeds is not refreshed by the Space timer', async () => {
+  const workflowStore = await import('../memory/workflow-store.js');
+  const feeds = await import('./workflow-feeds.js');
+  const slug = 'sched-fed';
+  store.spaceStore.save({
+    id: slug, title: 'Fed',
+    dataSources: [{ id: 'leads', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '* * * * *' }],
+  });
+  workflowStore.writeWorkflow('sched-fed-feed', {
+    name: 'sched-fed-feed',
+    description: 'Feeds the fed Space.',
+    enabled: true,
+    trigger: { manual: true, schedule: '0 7 * * *', timezone: 'UTC' },
+    steps: [
+      { id: 'fetch', prompt: '', call: { tool: 'EXAMPLE_LIST_ITEMS', args: {} }, sideEffect: 'read' },
+      { id: 'publish', prompt: '', dependsOn: ['fetch'], call: { tool: 'space_set_data', args: { slug, source_id: 'leads', data_json: '{{steps.fetch.output}}' } }, sideEffect: 'write' },
+    ],
+  } as Parameters<typeof workflowStore.writeWorkflow>[1]);
+  await feeds.rebuildFeedIndex({ isSpaceWrite: (tool) => tool === 'space_set_data' });
+  try {
+    const res = await sched.processSpaceSchedules(new Date('2026-06-08T11:00:00.000Z'));
+    assert.equal(res.fedByWorkflow, 1, 'the feed\'s schedule is the schedule');
+    assert.deepEqual(data.readData(slug), {}, 'the Space timer did not refresh it');
+  } finally {
+    store.spaceStore.archive(slug);
+  }
+});

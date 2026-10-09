@@ -182,6 +182,8 @@ export interface SpaceFireResult {
   heldBack: number;
   /** Failing-source notices written this tick. */
   told: number;
+  /** Scheduled sources whose collection a scheduled workflow feeds instead. */
+  fedByWorkflow?: number;
 }
 
 /** The source's current successful observation, or null when it has none. */
@@ -229,6 +231,7 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
   let awaitingApproval = 0;
   let heldBack = 0;
   let told = 0;
+  let fedByWorkflow = 0;
   const newlyToldBySpace = new Map<string, SourceStreakNoticeInput[]>();
 
   const recordFailure = (
@@ -250,10 +253,19 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
     newlyToldBySpace.set(space.id, group);
   };
 
+  // One schedule: a collection a scheduled workflow feeds is refreshed by that
+  // workflow's own trigger, never a second time by this timer.
+  let fedOnSchedule = new Map<string, Set<string>>();
+  try {
+    const { scheduledFeedCollectionsBySpace } = await import('./workflow-feeds.js');
+    fedOnSchedule = await scheduledFeedCollectionsBySpace();
+  } catch { /* the feed index is unreadable: every source keeps its own timer */ }
+
   for (const space of spaceStore.list()) {
     if (space.status !== 'active') continue;
     for (const ds of space.dataSources) {
       if (!ds.schedule) continue;
+      if (fedOnSchedule.get(space.id)?.has(ds.id)) { fedByWorkflow += 1; continue; }
       evaluated += 1;
       const key = `${space.id}:${ds.id}`;
       scheduledKeys.add(key);
@@ -388,7 +400,7 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
     } catch { /* Keep the durable outbox entry; never equate failure with delivery. */ }
   }
   if (told > 0) saveState(state);
-  return { evaluated, fired, errors, awaitingApproval, heldBack, told };
+  return { evaluated, fired, errors, awaitingApproval, heldBack, told, ...(fedByWorkflow ? { fedByWorkflow } : {}) };
 }
 
 // ── Paused-build auto-retry ───────────────────────────────────────────────────

@@ -163,3 +163,32 @@ test('the registered test recognises the Space dataset write by its execution co
   assert.equal(registered('space_save'), false);
   assert.equal(registered('GMAIL_SEND_EMAIL'), false);
 });
+
+test('one schedule: only collections an enabled, scheduled feed writes leave the Space timer', async () => {
+  saveWorkflow('sched-feed', [fetchStep, writeStep('one-schedule', 'scheduled')]);
+  saveWorkflow('manual-feed', [fetchStep, writeStep('one-schedule', 'manual')], { trigger: { manual: true } });
+  saveWorkflow('off-feed', [fetchStep, writeStep('one-schedule', 'off')], { enabled: false });
+  await feeds.rebuildFeedIndex({ isSpaceWrite });
+  const fed = await feeds.scheduledFeedCollectionsBySpace();
+  assert.deepEqual([...(fed.get('one-schedule') ?? [])], ['scheduled'],
+    'a manual or disabled feed is not a schedule, so its collection keeps the Space timer');
+});
+
+test('Refresh runs each enabled feed once and refreshes only the sources no feed writes', () => {
+  const feedsFor = [
+    { workflow: 'a', title: 'Feed A', enabled: true, collections: ['leads', 'stats'] },
+    { workflow: 'b', title: 'Feed B', enabled: true, collections: ['stats'] },
+    { workflow: 'c', title: 'Feed C', enabled: false, collections: ['notes'] },
+  ];
+  assert.deepEqual(feeds.spaceRefreshPlan({ sourceIds: ['leads', 'notes', 'calendar'], feeds: feedsFor }), {
+    runFeeds: [{ workflow: 'a', title: 'Feed A' }, { workflow: 'b', title: 'Feed B' }],
+    refreshSources: ['notes', 'calendar'],
+  });
+  assert.deepEqual(feeds.spaceRefreshPlan({ sourceIds: ['leads'], feeds: feedsFor, only: 'stats' }), {
+    runFeeds: [{ workflow: 'a', title: 'Feed A' }, { workflow: 'b', title: 'Feed B' }], refreshSources: [],
+  }, 'one fed source: the feeds that write it');
+  assert.deepEqual(feeds.spaceRefreshPlan({ sourceIds: ['leads'], feeds: feedsFor, only: 'notes' }), {
+    runFeeds: [], refreshSources: ['notes'],
+  }, 'a disabled feed refreshes nothing; the source refreshes itself');
+  assert.deepEqual(feeds.spaceRefreshPlan({ sourceIds: ['x'], feeds: [] }), { runFeeds: [], refreshSources: ['x'] });
+});

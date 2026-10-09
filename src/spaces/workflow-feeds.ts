@@ -279,3 +279,52 @@ export async function spaceFeedSummaries(
   }
   return summaries.sort((a, b) => (a.role === b.role ? 0 : a.role === 'primary' ? -1 : 1));
 }
+
+/**
+ * One schedule: the collections of each Space that an enabled workflow with its
+ * own schedule writes. The Space's own timer stands down for exactly these; a
+ * collection fed only by a manual workflow, and every unfed collection, keeps
+ * its timer, so nothing goes stale.
+ */
+export async function scheduledFeedCollectionsBySpace(): Promise<Map<string, Set<string>>> {
+  const all = index ?? await rebuildFeedIndex();
+  const scheduled = new Map<string, boolean>();
+  const out = new Map<string, Set<string>>();
+  for (const [workspaceId, links] of all) {
+    for (const link of links) {
+      if (!link.enabled) continue;
+      let hasSchedule = scheduled.get(link.workflow);
+      if (hasSchedule === undefined) {
+        const def = readWorkflow(link.workflow)?.data;
+        hasSchedule = Boolean(def && def.enabled !== false && def.trigger?.schedule?.trim());
+        scheduled.set(link.workflow, hasSchedule);
+      }
+      if (!hasSchedule) continue;
+      const collections = out.get(workspaceId) ?? new Set<string>();
+      for (const collection of link.collections) collections.add(collection);
+      out.set(workspaceId, collections);
+    }
+  }
+  return out;
+}
+
+/**
+ * What Refresh does on a Space: run each enabled feed once (for one source,
+ * only the feeds that write it), and refresh the Space's own sources that no
+ * enabled feed writes.
+ */
+export function spaceRefreshPlan(input: {
+  sourceIds: readonly string[];
+  feeds: ReadonlyArray<Pick<SpaceFeedSummary, 'workflow' | 'title' | 'enabled' | 'collections'>>;
+  only?: string;
+}): { runFeeds: Array<{ workflow: string; title: string }>; refreshSources: string[] } {
+  const enabled = input.feeds.filter((feed) => feed.enabled);
+  const fed = new Set(enabled.flatMap((feed) => feed.collections));
+  const run = (feeds: typeof enabled) => feeds.map((feed) => ({ workflow: feed.workflow, title: feed.title }));
+  if (input.only !== undefined) {
+    return fed.has(input.only)
+      ? { runFeeds: run(enabled.filter((feed) => feed.collections.includes(input.only!))), refreshSources: [] }
+      : { runFeeds: [], refreshSources: [input.only] };
+  }
+  return { runFeeds: run(enabled), refreshSources: input.sourceIds.filter((id) => !fed.has(id)) };
+}

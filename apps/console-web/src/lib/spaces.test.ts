@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildWorkspaceFixPrompt, changeText, feedTime, latestRefreshFailures, pageErrors, versionMadeAt, type SpaceAudit, type SpaceNote } from './spaces';
+import { buildWorkspaceFixPrompt, changeText, feedRunsNotStarted, feedTime, latestRefreshFailures, pageErrors, versionMadeAt, type SpaceAudit, type SpaceNote } from './spaces';
 
 const entry = (ts: string, path: string, outcome: string, note?: string): SpaceAudit =>
   ({ ts, method: 'REFRESH', path, outcome, ...(note ? { note } : {}) });
@@ -97,4 +97,10 @@ test('versionMadeAt: a version was made when the one before it was replaced', ()
   assert.equal(versionMadeAt(space, 1), 'c0');
   assert.equal(versionMadeAt(space, 2), 't1');
   assert.equal(versionMadeAt(space, 3), 't2');
+});
+
+test('Refresh says plainly when a feed could not start; a started or already-running feed is fine', () => {
+  assert.equal(feedRunsNotStarted([{ workflow: 'daily-leads', status: 'queued', id: 'r1' }, { workflow: 'stats', status: 'duplicate' }]), null);
+  assert.equal(feedRunsNotStarted([{ workflow: 'daily-leads', status: 'disabled', message: 'It is switched off.' }]),
+    'daily-leads did not start: It is switched off.');
 });
