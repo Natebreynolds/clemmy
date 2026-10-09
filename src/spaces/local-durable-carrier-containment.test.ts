@@ -123,7 +123,7 @@ test('paused-space retry keeps an approved local runner zero-process', async () 
   store.spaceStore.save({ id: slug, title: 'Retry runner', dataSources: [source] });
   writeMarkerRunner(slug, source.runner, marker);
   await approveSourceTrust(slug, source);
-  store.spaceStore.update(slug, { status: 'paused' });
+  store.spaceStore.update(slug, { status: 'paused', pausedBy: 'build_check' });
 
   const pausedAt = Date.parse(store.spaceStore.get(slug)!.updatedAt);
   const result = await scheduler.retryPausedSpaces(new Date(pausedAt + 10 * 60_000));
