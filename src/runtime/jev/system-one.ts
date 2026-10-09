@@ -5,6 +5,7 @@
  * POST /v1/systemone contract. Vault, kill-switch, and usage recording stay
  * in client.ts so parse/fail-open tests never need a home or a network.
  */
+import { performance } from 'node:perf_hooks';
 
 export const TYPESAFE_SYSTEMONE_URL = 'https://api.typesafe.ai/v1/systemone';
 /** A pinned version, not the moving `jev-latest` alias: the vendor can move
@@ -190,40 +191,62 @@ export async function postSystemOne(opts: {
   const key = opts.apiKey.trim();
   if (!key) return { ok: false, reason: 'missing_key' };
   const timeoutMs = Math.max(250, Math.min(30_000, opts.timeoutMs ?? 4_000));
+  const deadline = performance.now() + timeoutMs;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const fetchImpl = opts.fetchImpl ?? (globalThis.fetch as unknown as SystemOneFetch);
-    const res = await fetchImpl(TYPESAFE_SYSTEMONE_URL, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${key}`,
-        'content-type': 'application/json',
-        accept: 'application/json',
-      },
-      body: JSON.stringify(opts.request),
-      signal: controller.signal,
-    });
-    const text = await res.text();
-    if (res.status === 401 || res.status === 403) {
-      return { ok: false, reason: 'unauthorized', status: res.status, body: text };
+  const expired = (): boolean => performance.now() >= deadline;
+  const timeout = (): SystemOneFailure => {
+    controller.abort();
+    return { ok: false, reason: 'timeout' };
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadlineResult = new Promise<SystemOneFailure>((resolve) => {
+    timer = setTimeout(() => resolve(timeout()), timeoutMs);
+  });
+  // Aborting a transport is cooperative: either headers or its body may take
+  // longer to settle. The independent deadline releases the caller regardless,
+  // and the race observes both outcomes even after a losing request settles.
+  const transport = (async (): Promise<SystemOneResult> => {
+    try {
+      const fetchImpl = opts.fetchImpl ?? (globalThis.fetch as unknown as SystemOneFetch);
+      const body = JSON.stringify(opts.request);
+      if (expired()) return timeout();
+      const res = await fetchImpl(TYPESAFE_SYSTEMONE_URL, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${key}`,
+          'content-type': 'application/json',
+          accept: 'application/json',
+        },
+        body,
+        signal: controller.signal,
+      });
+      if (expired()) return timeout();
+      const text = await res.text();
+      if (expired()) return timeout();
+      if (res.status === 401 || res.status === 403) {
+        return { ok: false, reason: 'unauthorized', status: res.status, body: text };
+      }
+      if (!res.ok) {
+        return { ok: false, reason: 'http_error', status: res.status, body: text };
+      }
+      let parsed: unknown;
+      try { parsed = JSON.parse(text); }
+      catch { return { ok: false, reason: 'malformed', status: res.status, body: text, message: 'response is not JSON' }; }
+      const answers = parseSystemOneResponse(parsed, opts.request.questions);
+      // A delayed timer cannot make a late response admissible after synchronous
+      // serialization/parsing held the event loop beyond the absolute deadline.
+      if (expired()) return timeout();
+      if (!answers.ok) return { ...answers, status: res.status, body: text };
+      return { ...answers, status: res.status };
+    } catch (err) {
+      if (expired()) return timeout();
+      const name = err instanceof Error ? err.name : '';
+      if (name === 'AbortError' || name === 'TimeoutError') return { ok: false, reason: 'timeout' };
+      return { ok: false, reason: 'http_error', message: err instanceof Error ? err.message : String(err) };
     }
-    if (!res.ok) {
-      return { ok: false, reason: 'http_error', status: res.status, body: text };
-    }
-    let parsed: unknown;
-    try { parsed = JSON.parse(text); }
-    catch { return { ok: false, reason: 'malformed', status: res.status, body: text, message: 'response is not JSON' }; }
-    const answers = parseSystemOneResponse(parsed, opts.request.questions);
-    if (!answers.ok) return { ...answers, status: res.status, body: text };
-    return { ...answers, status: res.status };
-  } catch (err) {
-    const name = err instanceof Error ? err.name : '';
-    if (name === 'AbortError' || name === 'TimeoutError') return { ok: false, reason: 'timeout' };
-    return { ok: false, reason: 'http_error', message: err instanceof Error ? err.message : String(err) };
-  } finally {
-    clearTimeout(timer);
-  }
+  })();
+  try { return await Promise.race([transport, deadlineResult]); }
+  finally { if (timer) clearTimeout(timer); }
 }
 
 export async function probeTypesafeApiKey(
