@@ -24,6 +24,8 @@ import {
   type EvidenceCoverageRow, type ReviewCoverageStatus,
 } from './review-evidence-coverage.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
+import { historicalReadPacketIsCurrent, historicalReadClosureIsCurrent,
+  type HistoricalReadPacket, type HistoricalReadClosure } from './historical-completion-evidence.js';
 
 /**
  * Judge system prompt — modeled on OpenAI Codex's continuation.md auditor
@@ -38,6 +40,10 @@ import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 /** How long Jev may take before the configured reviewer is started alongside
  * it. Below Jev's measured miss latency on this machine, above its hit median. */
 export const JEV_HEDGE_DELAY_MS = 1_000;
+/** A complete read can wait for Jev's existing 2.5 s completion transport
+ * window before starting the speculative reviewer. A declined/unavailable
+ * screen still falls through immediately; the review itself is unchanged. */
+export const JEV_READ_HEDGE_DELAY_MS = 2_500;
 
 /** A verdict names every finding at once, numbered; this bounds that list. */
 const VERDICT_REASON_MAX_CHARS = 1_600;
@@ -173,6 +179,8 @@ export interface ObjectiveJudgeVerdict {
   verdictRestatedFrom?: string;
   /** Typed Jev (or similar) prefilter produced this verdict. */
   fast?: boolean;
+  /** Qualified past observations, separately bound from current receipts. */
+  historicalEvidence?: HistoricalReadClosure;
   /** Jev ran even when the Settings judge remained authoritative. */
   jevAttempt?: {
     choice?: string;
@@ -183,6 +191,7 @@ export interface ObjectiveJudgeVerdict {
     coverageComplete: boolean;
       /** Whether the configured reviewer was started (false = the hedge saved it). */
     reviewerStarted?: boolean;
+    historicalOnly?: boolean;
 };
 }
 
@@ -573,6 +582,7 @@ export interface SkillExecutionContext {
   verifiedReads?: string;
   /** Structured read settlements for coverage checks (not a character heuristic). */
   verifiedReadResults?: CompletionEvidenceRow[];
+  historicalEvidence?: HistoricalReadPacket;
   /** Source-authenticated host evidence is kept whole until the selected
    * model's request admission. Never independently clip the reply or skills
    * while claiming this is a complete evidence review. */
@@ -1044,6 +1054,7 @@ export async function runRoutedJudgeAttempt<T>(
   onResponder?: (modelId: string) => void,
   observe?: JudgeAttemptObservers,
 ): Promise<T> {
+  signal?.throwIfAborted();
   // Keep per-review handles out of tool schemas and stable instructions.
   // Supply them once with the evidence whose handles they identify.
   const reviewInstructions = evidence ? instructions + judgeEvidenceGuidance(evidence) : instructions;
@@ -1073,6 +1084,7 @@ export async function runRoutedJudgeAttempt<T>(
       routing.judgeFamily === 'claude' ? `${reviewInstructions}${INSTRUCTION_CACHE_DELIM}` : reviewInstructions,
       judgeEvidenceTools(evidence, JUDGE_EVIDENCE_LOOKUP_BUDGET, observe?.lookup), reviewEffort)
     : buildJudgeAgent(routing, instructions, [], reviewEffort);
+  signal?.throwIfAborted();
   const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1, signal });
   signal?.throwIfAborted();
   const observeResponder = (responses: typeof result.rawResponses): void => {
@@ -1101,6 +1113,7 @@ export async function runRoutedJudgeAttempt<T>(
     if (prior) {
       try { observe?.restated?.(head.slice(0, 240)); } catch { /* observation only */ }
       try {
+        signal?.throwIfAborted();
         // The review is already written. Live 2026-09-28 (source 325147): a
         // restatement run at the review's own depth took 56.7 s and 4,123
         // output tokens to produce one line.
@@ -1119,6 +1132,7 @@ export async function runRoutedJudgeAttempt<T>(
         // completion authority. Preserve the whole review or decline repair.
         const repairAdmission = completionJudgeContextAdmission(routing.modelId, instructions, repairPrompt);
         if (!repairAdmission.fits) throw new JudgeContextUnavailableError('Complete verdict repair exceeds the reviewer context window.');
+        signal?.throwIfAborted();
         const repaired = await new Runner({ workflowName: 'clementine-objective-judge-verdict' }).run(
           repairAgent, repairPrompt, { maxTurns: 1, signal },
         );
@@ -1126,6 +1140,7 @@ export async function runRoutedJudgeAttempt<T>(
         observeResponder(repaired.rawResponses);
         value = parse(repaired.finalOutput);
       } catch (error) {
+        signal?.throwIfAborted();
         logDebugSafe(error);
       }
     }
@@ -1135,6 +1150,7 @@ export async function runRoutedJudgeAttempt<T>(
       );
     }
   }
+  signal?.throwIfAborted();
   return value;
 }
 
@@ -1180,6 +1196,8 @@ export async function runHedgedJudge<T>(
      *  (resolveCompletionCheckerRoute). Other lanes keep the boundary route. */
     quotaAwareRoute?: boolean;
     effort?: JudgeReviewEffort;
+    /** Cancellation belongs to the caller, never to review/fallback policy. */
+    signal?: AbortSignal;
   } = {},
 ): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string; invalidDetail?: string;
   /** Evidence lookups made by the attempt whose verdict was returned. */
@@ -1189,8 +1207,14 @@ export async function runHedgedJudge<T>(
   restatedFrom?: string }> {
   const startedAt = Date.now();
   let routing: BoundaryJudgeRouting | undefined;
+  let callerSignal = opts.signal;
   try {
+    const requestSignal = (await import('./brackets.js')).harnessRunContextStorage.getStore()?.callerCancelSignal;
+    const callerSignals = [opts.signal, requestSignal].filter((value): value is AbortSignal => Boolean(value));
+    callerSignal = callerSignals.length ? AbortSignal.any(callerSignals) : undefined;
+    callerSignal?.throwIfAborted();
     const debate = await import('./debate-model.js');
+    callerSignal?.throwIfAborted();
     // Accepted turns already carry this snapshot. Direct callers with an
     // explicit fallback capture it once too, before the primary starts.
     const selection = opts.boundaryJudgeSelection
@@ -1208,7 +1232,6 @@ export async function runHedgedJudge<T>(
     // The hedge seam runs every attempt as the lane's own reviewer request, so
     // the usage log can rank judge spend per lane while the turn's own
     // session/source attribution is preserved.
-    const callerSignal = (await import('./brackets.js')).harnessRunContextStorage.getStore()?.callerCancelSignal;
     const observedRoutes = new Map<BoundaryJudgeRouting, BoundaryJudgeRouting>();
     // Lookups belong to the attempt that made them: a hedge that lost the race
     // inspected nothing on behalf of the verdict that won.
@@ -1261,19 +1284,18 @@ export async function runHedgedJudge<T>(
       : attempt(chosen);
     let raced: HedgedJudgeResult<T>;
     if (fallbackMode === 'model') {
-      const callerCancelSignal = (await import('./brackets.js')).harnessRunContextStorage.getStore()?.callerCancelSignal;
       // Each lane gets its existing bounded attempt. Cancel the first request
       // before advancing on a deadline; a late response cannot win or launch a
       // verdict repair after the selected fallback has begun.
       const boundedAttempt = async (route: BoundaryJudgeRouting) => {
-        callerCancelSignal?.throwIfAborted();
+        callerSignal?.throwIfAborted();
         const controller = new AbortController();
-        const signal = callerCancelSignal ? AbortSignal.any([controller.signal, callerCancelSignal]) : controller.signal;
+        const signal = callerSignal ? AbortSignal.any([controller.signal, callerSignal]) : controller.signal;
         const result = await withJudgeHedge(attempt(route, signal), null,
-          { lane, timeoutMs: opts.timeoutMs ?? route.timeoutMs });
+          { lane, timeoutMs: opts.timeoutMs ?? route.timeoutMs, signal: callerSignal });
         const settled = { ...result, errors: [...result.errors] };
         if (result.value === null) controller.abort();
-        callerCancelSignal?.throwIfAborted();
+        callerSignal?.throwIfAborted();
         return settled;
       };
       raced = await boundedAttempt(chosen);
@@ -1291,6 +1313,7 @@ export async function runHedgedJudge<T>(
           refusal !== undefined ? 'exact_pin_quota_exhausted' : 'chain_fallback_after_exact_pin');
           raced = await boundedAttempt(answering);
         } catch (error) {
+          callerSignal?.throwIfAborted();
           raced = { ...raced, errors: [...raced.errors, error] };
         }
       }
@@ -1298,9 +1321,10 @@ export async function runHedgedJudge<T>(
       raced = await withJudgeHedge(
         primaryAttempt,
         hedgeRouting ? attempt(hedgeRouting) : null,
-        { lane, ...(effectiveTimeoutMs ? { timeoutMs: effectiveTimeoutMs } : {}) },
+        { lane, signal: callerSignal, ...(effectiveTimeoutMs ? { timeoutMs: effectiveTimeoutMs } : {}) },
       );
     }
+    callerSignal?.throwIfAborted();
     const winningRoute = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : answering;
     const winner = observedRoutes.get(winningRoute) ?? winningRoute;
     if (raced.value !== null) {
@@ -1331,6 +1355,10 @@ export async function runHedgedJudge<T>(
         : undefined;
     return { value: null, failure, routing: failedRoute, ...(unavailableReason ? { unavailableReason } : {}), ...(invalidDetail ? { invalidDetail } : {}) };
   } catch (err) {
+    // The new owning caller must observe cancellation, rather than turn it
+    // into unavailable/failed-open completion. Ambient-only legacy consumers
+    // retain their existing null/error contract and never start a fallback.
+    opts.signal?.throwIfAborted();
     recordCompletionJudgeMetric('error', startedAt, routing, lane);
     logDebugSafe(err);
     return { value: null, failure: 'error', routing,
@@ -1342,6 +1370,7 @@ type CompletionJudgeImpl = (
   objective: string,
   assistantResponse: string,
   skillContext?: SkillExecutionContext,
+  judge?: { lane?: JudgeMetricLane; timeoutMs?: number; signal?: AbortSignal },
 ) => Promise<CompletionJudgeRun>;
 
 let completionJudgeForTests: CompletionJudgeImpl | null = null;
@@ -1350,13 +1379,16 @@ export function _setCompletionJudgeForTests(fn: CompletionJudgeImpl | null): voi
   completionJudgeForTests = fn;
 }
 
-function startCompletionJudge(
+async function startCompletionJudge(
   objective: string,
   assistantResponse: string,
   skillContext?: SkillExecutionContext,
+  signal?: AbortSignal,
 ): Promise<CompletionJudgeRun> {
+  signal?.throwIfAborted();
   const run = completionJudgeForTests ?? runCompletionJudge;
-  return run(objective, assistantResponse, skillContext).catch((err): CompletionJudgeRun => {
+  return run(objective, assistantResponse, skillContext, { signal }).catch((err): CompletionJudgeRun => {
+    signal?.throwIfAborted();
     logDebugSafe(err);
     return { verdict: null, failure: 'error' };
   });
@@ -1381,8 +1413,9 @@ async function runCompletionJudge(
   objective: string,
   assistantResponse: string,
   skillContext?: SkillExecutionContext,
-  judge: { lane?: JudgeMetricLane; timeoutMs?: number } = {},
+  judge: { lane?: JudgeMetricLane; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<CompletionJudgeRun> {
+  judge.signal?.throwIfAborted();
   const instructions = buildCompletionJudgeInstructions(skillContext);
   const basePrompt = buildObjectiveJudgePrompt(objective, assistantResponse, skillContext);
   const prompt = skillContext?.memoryRequirementContext
@@ -1400,6 +1433,7 @@ async function runCompletionJudge(
       ...(memoryRequirement ? { memoryRequirement } : {}) };
   };
   const hedged = (reviewPrompt: string, depth: ReviewDepthRequest) => {
+    judge.signal?.throwIfAborted();
     const timeoutMs = judge.timeoutMs ?? depth.timeoutMs;
     return runHedgedJudge(
       instructions,
@@ -1407,7 +1441,7 @@ async function runCompletionJudge(
       parse,
       (v) => v.done,
       judge.lane ?? 'completion',
-      { ...(timeoutMs ? { timeoutMs } : {}),
+      { signal: judge.signal, ...(timeoutMs ? { timeoutMs } : {}),
         ...(skillContext?.fullSourceEvidence ? { requireCompletePrompt: true } : {}),
         ...(skillContext?.boundaryJudgeSelection ? { boundaryJudgeSelection: skillContext.boundaryJudgeSelection } : {}),
         ...(skillContext?.evidence ? { evidence: skillContext.evidence } : {}),
@@ -1418,7 +1452,9 @@ async function runCompletionJudge(
   };
   const plain = ({ needsAllOf: _needsAllOf, ...verdict }: Parsed): NonNullable<CompletionJudgeRun['verdict']> => verdict;
   const review = async (depth: ReviewDepthRequest): Promise<CompletionJudgeRun> => {
+    judge.signal?.throwIfAborted();
     const first = await hedged(prompt, depth);
+    judge.signal?.throwIfAborted();
     const run: CompletionJudgeRun = { verdict: first.value ? plain(first.value) : null, failure: first.failure, routing: first.routing,
       ...(first.restatedFrom ? { verdictRestatedFrom: first.restatedFrom } : {}),
       ...(first.unavailableReason ? { unavailableReason: first.unavailableReason } : {}),
@@ -1438,6 +1474,7 @@ async function runCompletionJudge(
       const second = await hedged([
         prompt, '', `Your verdict on the above: DONE: ${first.value.reason}`, '', reviewCoverageFollowUp(assessment),
       ].join('\n'), depth);
+      judge.signal?.throwIfAborted();
       followUp = second.value ? 'answered' : 'unanswered';
       if (second.value) {
         lookups.push(...(second.lookups ?? []));
@@ -1461,6 +1498,7 @@ async function runCompletionJudge(
     return { ...run, evidenceCoverage: coverageRecord(assessment, lookups, followUp) };
   };
   return skillContext?.reviewStakes ? reviewAtStakes(skillContext.reviewStakes, review, {
+    signal: judge.signal,
     readEvidenceComplete: assessCompletionEvidenceCoverage({
       objective, results: skillContext.verifiedReadResults,
     }).complete,
@@ -1497,10 +1535,13 @@ export const READ_REVIEW_TIMEOUT_MS = 30_000;
 export async function reviewAtStakes(
   stakes: ReviewStakes,
   review: (depth: ReviewDepthRequest) => Promise<CompletionJudgeRun>,
-  evidence: { readEvidenceComplete?: boolean } = {},
+  evidence: { readEvidenceComplete?: boolean; signal?: AbortSignal } = {},
 ): Promise<CompletionJudgeRun> {
+  evidence.signal?.throwIfAborted();
   if (stakes === 'write') {
-    return { ...(await review({ timeoutMs: WRITE_REVIEW_TIMEOUT_MS })), reviewDepth: 'full' };
+    const full = await review({ timeoutMs: WRITE_REVIEW_TIMEOUT_MS });
+    evidence.signal?.throwIfAborted();
+    return { ...full, reviewDepth: 'full' };
   }
   // Read-only is an effect classification, not proof that a factual answer is
   // cheap to verify. Incomplete receipts may require inspecting retained data
@@ -1508,14 +1549,18 @@ export async function reviewAtStakes(
   // depth in that case; never downgrade it merely because no write occurred.
   // This buys no extra call, grants no authority and changes no deadline.
   if (stakes === 'read' && evidence.readEvidenceComplete === false) {
-    return { ...(await review({})), reviewDepth: 'full' };
+    const full = await review({});
+    evidence.signal?.throwIfAborted();
+    return { ...full, reviewDepth: 'full' };
   }
   const fast = await review({ effort: 'medium', timeoutMs: READ_REVIEW_TIMEOUT_MS });
+  evidence.signal?.throwIfAborted();
   if (!fast.verdict || fast.verdict.done) return { ...fast, reviewDepth: 'fast' };
   if (fast.verdict.repairScope === 'claims' || fast.verdict.repairScope === 'reply_format') {
     return { ...fast, reviewDepth: 'fast' };
   }
   const full = await review({ timeoutMs: READ_REVIEW_TIMEOUT_MS });
+  evidence.signal?.throwIfAborted();
   if (!full.verdict) return { ...fast, reviewDepth: 'fast', reviewConfirmation: 'unavailable' };
   return { ...full, reviewDepth: 'full', reviewConfirmation: full.verdict.done ? 'overruled' : 'upheld' };
 }
@@ -1699,15 +1744,22 @@ export async function judgeObjectiveComplete(
   // shape) started grok on every turn and let it run to completion after Jev
   // had already been accepted — a whole reviewer call and its tokens spent
   // for a verdict nobody read (live 2026-09-22: Jev accepted at 988 ms while
-  // grok-4.3 ran on for seconds). The reviewer cannot be aborted mid-flight,
-  // so the only cost that can be avoided is the one not started. Measured
-  // Jev latency on this machine: 270–988 ms on hits, so a 1 s delay lets most
-  // hits settle without a reviewer and costs a miss at most 1 s of wall time.
+  // grok-4.3 ran on for seconds). A started losing reviewer is cancelled only
+  // after Jev passes the same acceptance checks below. Observed usage stays
+  // recorded; cancellation does not prove zero provider usage. Measured
+  // Jev latency on this machine: 270–988 ms on early hits. An ordinary read
+  // later settled at 1,892 ms, after its 1 s hedge had started a losing reviewer.
+  // Only a complete answer at explicit read stakes gives the screen its existing
+  // 2.5 s transport window. Other stakes/questions keep the 1 s hedge; rejected
+  // or unavailable screens start the reviewer immediately on either path.
   const coverage = assessCompletionEvidenceCoverage({
     objective,
     results: skillContext?.verifiedReadResults,
   });
   const directionQuestion = isDirectionSeekingQuestion(assistantResponse);
+  const historicalEligible = (skillContext?.verifiedReadResults?.length ?? 0) === 0
+    && historicalReadPacketIsCurrent(skillContext?.historicalEvidence,
+      { sessionId: skillContext?.sessionId, objective, reply: assistantResponse });
   // screening: the ask ahead of the reviewer, which Jev's record may skip.
   // The late ask, when the reviewer could not run, is never skipped.
   const askJev = async (screening = false): Promise<Awaited<ReturnType<typeof import('../jev/control-plane.js').tryJevCompletionVerdict>>> => {
@@ -1729,14 +1781,24 @@ export async function judgeObjectiveComplete(
             contentComplete: row.contentComplete,
           })),
         },
+        ...(historicalEligible ? { historicalEvidence: skillContext?.historicalEvidence } : {}),
       });
     } catch {
       return null;
     }
   };
+  const callerSignal = (await import('./brackets.js')).harnessRunContextStorage.getStore()?.callerCancelSignal;
+  callerSignal?.throwIfAborted();
+  const reviewerController = new AbortController();
+  const reviewerSignal = callerSignal ? AbortSignal.any([reviewerController.signal, callerSignal]) : reviewerController.signal;
   let judgePromise: Promise<CompletionJudgeRun> | null = null;
   const startJudge = (): Promise<CompletionJudgeRun> => {
-    judgePromise ??= startCompletionJudge(objective, assistantResponse, skillContext);
+    if (!judgePromise) {
+      judgePromise = startCompletionJudge(objective, assistantResponse, skillContext, reviewerSignal);
+      // The timer may start this request while Jev is still pending. Attach a
+      // handler immediately: a cancelled loser is intentionally never awaited.
+      void judgePromise.catch(() => {});
+    }
     return judgePromise;
   };
   let jevAttempt: ObjectiveJudgeVerdict['jevAttempt'];
@@ -1755,6 +1817,7 @@ export async function judgeObjectiveComplete(
       coverageComplete: coverage.complete,
       // Whether the hedge saved the reviewer call, so the saving is countable.
       reviewerStarted: judgePromise !== null,
+      ...(fast.historicalEvidence ? { historicalOnly: true } : {}),
       ...(fast.choice ? { choice: fast.choice } : {}),
       ...(fast.requirementCoverage ? { requirementCoverage: fast.requirementCoverage } : {}),
       ...(typeof fast.confidence === 'number' ? { confidence: fast.confidence } : {}),
@@ -1771,26 +1834,38 @@ export async function judgeObjectiveComplete(
   // reviewer: that review is the check that what was written is right.
   const reviewsWrite = skillContext?.reviewStakes === 'write';
   const reviewsMemory = Boolean(skillContext?.memoryRequirementContext);
-  if (!reviewsPlan && !reviewsWrite && !reviewsMemory && (coverage.complete || directionQuestion)) {
+  if (!reviewsPlan && !reviewsWrite && !reviewsMemory && (coverage.complete || directionQuestion || historicalEligible)) {
     const jevPromise = askJev(true);
-    const hedge = setTimeout(startJudge, JEV_HEDGE_DELAY_MS);
+    const hedgeDelayMs = skillContext?.reviewStakes === 'read' && coverage.complete && !directionQuestion
+      ? JEV_READ_HEDGE_DELAY_MS : JEV_HEDGE_DELAY_MS;
+    const hedge = setTimeout(startJudge, hedgeDelayMs);
     hedge.unref?.();
-    const fast = await jevPromise;
-    clearTimeout(hedge);
+    const cancelHedge = () => clearTimeout(hedge);
+    callerSignal?.addEventListener('abort', cancelHedge, { once: true });
+    let fast: Awaited<typeof jevPromise>;
+    try { fast = await jevPromise; } finally {
+      clearTimeout(hedge);
+      callerSignal?.removeEventListener('abort', cancelHedge);
+    }
+    callerSignal?.throwIfAborted();
     // DONE stands only on complete receipts (and, inside the helper, every
     // named requirement satisfied); AWAITING only when the reply really closes
     // on a question. Nothing else Jev says is final.
     const acceptJev = Boolean(fast) && (
-      (fast!.done && !fast!.awaitingUser && !fast!.blocked && coverage.complete)
+      (fast!.done && !fast!.awaitingUser && !fast!.blocked && (coverage.complete
+        || (historicalEligible && historicalReadClosureIsCurrent(fast!.historicalEvidence, skillContext?.historicalEvidence,
+          { sessionId: skillContext?.sessionId, objective, reply: assistantResponse }))))
       || (fast!.awaitingUser === true && directionQuestion)
     );
     if (fast) noteJev(fast, acceptJev);
     if (fast && acceptJev) {
+      if (judgePromise) reviewerController.abort();
       return {
         done: fast.done,
         reason: fast.reason,
         judgeModelId: fast.judgeModelId,
         fast: true,
+        ...(fast.historicalEvidence ? { historicalEvidence: fast.historicalEvidence } : {}),
         ...(jevAttempt ? { jevAttempt } : {}),
         ...(fast.awaitingUser ? { awaitingUser: true } : {}),
         ...(fast.blocked ? { blocked: true } : {}),
@@ -1799,6 +1874,7 @@ export async function judgeObjectiveComplete(
     }
   }
   const run = await startJudge();
+  callerSignal?.throwIfAborted();
   if (!run.verdict) {
     // NO REVIEWER IS NOT A REASON TO ACCEPT A PROMISE.
     //
@@ -1818,6 +1894,7 @@ export async function judgeObjectiveComplete(
     // failedOpen stays set, so nothing downstream claims a completed review.
     if (!jevSaid && !reviewsPlan && !reviewsMemory) {
       const late = await askJev();
+      callerSignal?.throwIfAborted();
       if (late) noteJev(late, false);
     }
     const finding = jevSaid as { done: boolean; reason?: string; awaitingUser?: boolean; blocked?: boolean } | null;

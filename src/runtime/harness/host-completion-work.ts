@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { openEventLog } from './eventlog.js';
+import { getRunAttemptSourceUserEvent, openEventLog } from './eventlog.js';
 import { isToolMediaImageBlock } from './tool-media-content.js';
 import { acceptedTaskIdFor } from './attempt-identity.js';
 import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
@@ -13,6 +13,11 @@ import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output
 import type { JudgeEvidenceSource } from './judge-evidence-tools.js';
 import { loadPersistedCallAuthority, loadPhysicalRequestEvidence } from './dispatch-ledger.js';
 import { normalizeCallableArguments } from './callable-contract.js';
+import { acceptedTaskMode } from './accepted-task-mode.js';
+import { loadExpectedWorkContract } from './expected-work-contract.js';
+import { hasPending } from './approval-registry.js';
+import { admitHistoricalReadPacket, historicalEvidenceDigest, historicalReadClosureHasShape, HISTORICAL_COMPLETION_MAX_CHARS,
+  type HistoricalReadPacket, type HistoricalReadGroup, type HistoricalReadClosure } from './historical-completion-evidence.js';
 
 /** Whether this accepted source attempted work that a completion claim should
  * be checked against. This is eligibility, never a success/failure verdict.
@@ -811,6 +816,205 @@ function settledRequestArgs(sessionId: string, sourceUserSeq: number, callId: st
   const sealed = loadPersistedCallAuthority({ sessionId, sourceUserSeq, physicalDispatchId });
   if (sealed.ok && sealed.authority.logicalCallId === callId) return sealed.authority.canonicalArgs;
   return loadPhysicalRequestEvidence({ sessionId, sourceUserSeq, logicalToolCallId: callId, physicalDispatchId })?.args;
+}
+
+function historicalSettlementRows(sessionId: string, sourceUserSeq: number) {
+  return openEventLog().prepare(`SELECT s.rowid AS ordinal, s.logical_tool_call_id AS callId, l.tool_name AS toolName,
+    l.argument_digest AS argumentDigest, s.outcome_kind AS outcome, s.business_call AS business, s.mutating AS mutating,
+    s.settled_at AS recordedAt FROM logical_call_settlements s JOIN logical_tool_calls l
+    ON l.session_id = s.session_id AND l.source_user_seq = s.source_user_seq AND l.logical_tool_call_id = s.logical_tool_call_id
+    WHERE s.session_id = ? AND s.source_user_seq = ? ORDER BY s.rowid`)
+    .all(sessionId, sourceUserSeq) as Array<{ ordinal: number; callId: string; toolName: string; argumentDigest: string;
+      outcome: string; business: number; mutating: number; recordedAt: string }>;
+}
+
+/** No model classification or execution is performed here. This admission
+ * window only offers exact old observations to the existing completion call;
+ * Jev must separately find the accepted ask and every claim historical-only. */
+export function historicalReadCompletionEvidence(input: {
+  sessionId: string; sourceUserSeq: number; objective: string; reply: string;
+  excluded: boolean;
+}): HistoricalReadPacket | undefined {
+  const ambient = harnessRunContextStorage.getStore();
+  const attemptId = ambient?.runAttemptId;
+  if (input.excluded !== false || !attemptId || ambient?.interactiveForeground !== true
+    || ambient.sessionId !== input.sessionId || ambient.sourceUserSeq !== input.sourceUserSeq
+    || ambient.taskContinuation || ambient.executionId || ambient.callerCancelSignal?.aborted) return undefined;
+  try {
+    const db = openEventLog();
+    const consumerSource = getRunAttemptSourceUserEvent({ sessionId: input.sessionId, attemptId });
+    const text = consumerSource && typeof consumerSource.data.displayText === 'string' && consumerSource.data.displayText.trim()
+      ? consumerSource.data.displayText : consumerSource?.data.text;
+    const root = acceptedTurnCallAuthorityFor(input.sessionId, input.sourceUserSeq);
+    if (!consumerSource || consumerSource.seq !== input.sourceUserSeq || consumerSource.role !== 'user'
+      || consumerSource.data.synthetic === true || typeof text !== 'string' || !text.trim()
+      || text !== input.objective || root.status !== 'ok' || root.authority.state !== 'open'
+      || root.authority.sourceEventId !== consumerSource.id
+      || !['host_v1', 'host_v1_read_only'].includes(root.authority.authorityKind)) return undefined;
+    const sourceEventDigest = root.authority.sourceEventDigest;
+    const currentIsEmpty = (): boolean => {
+      const active = harnessRunContextStorage.getStore();
+      if (active?.runAttemptId !== attemptId || active.sessionId !== input.sessionId
+        || active.sourceUserSeq !== input.sourceUserSeq || active.callerCancelSignal?.aborted) return false;
+      const source = getRunAttemptSourceUserEvent({ sessionId: input.sessionId, attemptId });
+      const authority = acceptedTurnCallAuthorityFor(input.sessionId, input.sourceUserSeq);
+      const mode = acceptedTaskMode(input.sessionId, input.sourceUserSeq);
+      if (!source || source.id !== consumerSource.id || source.seq !== input.sourceUserSeq
+        || authority.status !== 'ok' || authority.authority.state !== 'open'
+        || authority.authority.sourceEventDigest !== sourceEventDigest
+        || (mode && mode.kind !== 'normal')
+        || loadExpectedWorkContract(input.sessionId, input.sourceUserSeq).status !== 'missing'
+        || acceptedPlanExecution(input.sessionId, input.sourceUserSeq) || hasPending(input.sessionId)) return false;
+      const attempt = db.prepare(`SELECT 1 AS active FROM run_attempts
+        WHERE session_id = ? AND attempt_id = ? AND source_user_seq = ? AND finished_at IS NULL AND status = 'active'`)
+        .get(input.sessionId, attemptId, input.sourceUserSeq);
+      // All logical attempts, including discovery/control/read, exclude this
+      // deliberately narrow path. Settled writes alone miss pending attempts.
+      const calls = db.prepare(`SELECT 1 AS attempted FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ?
+        UNION ALL SELECT 1 FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?
+        UNION ALL SELECT 1 FROM accepted_model_batch_admissions WHERE session_id = ? AND source_user_seq = ? AND call_count > 0
+        UNION ALL SELECT 1 FROM events WHERE session_id = ? AND type = 'tool_called'
+          AND json_extract(data_json, '$.sourceUserSeq') = ? LIMIT 1`)
+        .get(input.sessionId, input.sourceUserSeq, input.sessionId, input.sourceUserSeq,
+          input.sessionId, input.sourceUserSeq, input.sessionId, input.sourceUserSeq);
+      return Boolean(attempt && !calls && sourceAttemptedWrites(input) === 0);
+    };
+    if (!currentIsEmpty()) return undefined;
+    const sources = (db.prepare(`SELECT seq FROM events WHERE session_id = ? AND type = 'user_input_received'
+      AND role = 'user' AND seq < ? AND created_at >= ? ORDER BY seq DESC LIMIT 6`)
+      .all(input.sessionId, input.sourceUserSeq, new Date(Date.now() - 30 * 60_000).toISOString()) as Array<{ seq: number }>)
+      .filter(row => {
+        const event = db.prepare('SELECT data_json FROM events WHERE session_id = ? AND seq = ?')
+          .get(input.sessionId, row.seq) as { data_json: string };
+        return JSON.parse(event.data_json).synthetic !== true;
+      }).slice(0, 2).reverse();
+    const groups: HistoricalReadGroup[] = [];
+    for (const source of sources) {
+      const oldRoot = acceptedTurnCallAuthorityFor(input.sessionId, source.seq);
+      if (oldRoot.status !== 'ok') continue;
+      const event = db.prepare('SELECT id, created_at, data_json FROM events WHERE session_id = ? AND seq = ?')
+        .get(input.sessionId, source.seq) as { id: string; created_at: string; data_json: string };
+      const data = JSON.parse(event.data_json) as Record<string, unknown>;
+      const oldText = typeof data.displayText === 'string' && data.displayText.trim() ? data.displayText : data.text;
+      if (event.id !== oldRoot.authority.sourceEventId || typeof oldText !== 'string' || !oldText.trim()) continue;
+      const rows = historicalSettlementRows(input.sessionId, source.seq);
+      const original = sourceSettledReadEvidence({ sessionId: input.sessionId, sourceUserSeq: source.seq });
+      if (!original.evidenceAvailable) continue;
+      const group: HistoricalReadGroup = { ref: `historical_source_${source.seq}`,
+        source: { sessionId: input.sessionId, sourceUserSeq: source.seq, eventId: event.id,
+          eventDigest: oldRoot.authority.sourceEventDigest, settlementDigest: historicalEvidenceDigest(JSON.stringify(rows)),
+          recordedAt: event.created_at, request: oldText },
+        observations: [], warnings: rows.filter(row => row.mutating || !['succeeded', 'empty_result'].includes(row.outcome))
+          .map(row => ({ logicalToolCallId: row.callId, toolName: row.toolName, outcome: row.outcome, mutating: Boolean(row.mutating) })) };
+      let unavailable = false;
+      for (const row of rows.filter(row => row.business && !row.mutating && row.toolName !== 'tool_search')) {
+        const seen = original.results.find(result => result.logicalToolCallId === row.callId);
+        if (!seen || seen.status !== 'verified' || seen.contentComplete !== true || seen.precedesWrite
+          || !['succeeded', 'empty_result'].includes(row.outcome)) { unavailable = true; break; }
+        const redeemed = redeemSuccessfulSettlementResultForHost({ sessionId: input.sessionId, sourceUserSeq: source.seq,
+          acceptedTaskId: evidenceAcceptedTaskId(input.sessionId, source.seq), logicalToolCallId: row.callId });
+        if (redeemed.status !== 'ok' || !redeemedReadIsExhausted(redeemed.value)) { unavailable = true; break; }
+        const value = redeemed.value;
+        const request = settledRequestArgs(input.sessionId, source.seq, row.callId, value.physicalDispatchId);
+        const shown = completionReadPresentation(value.rawPayloadJson);
+        if (request === undefined || shown.format === 'media_described') { unavailable = true; break; }
+        group.observations.push({ ref: `historical:${source.seq}:${historicalEvidenceDigest(`${row.callId}\n${value.resultHandleId}\n${value.rawPayloadSha256}`)}`,
+          acceptedTaskId: evidenceAcceptedTaskId(input.sessionId, source.seq), logicalToolCallId: row.callId,
+          physicalDispatchId: value.physicalDispatchId, resultHandleId: value.resultHandleId, toolName: row.toolName,
+          argumentDigest: row.argumentDigest, contentDigest: value.rawPayloadSha256, rawByteCount: value.rawByteCount,
+          recordedAt: row.recordedAt, contentComplete: true, sourceExhausted: true, request, content: shown.text });
+      }
+      if (!unavailable && group.observations.length > 0 && JSON.stringify(group).length < HISTORICAL_COMPLETION_MAX_CHARS) groups.push(group);
+    }
+    const packet: HistoricalReadPacket = { version: 1, kind: 'historical_observations',
+      consumer: { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, runAttemptId: attemptId,
+        sourceEventId: consumerSource.id, sourceEventDigest,
+        objectiveDigest: historicalEvidenceDigest(input.objective), replyDigest: historicalEvidenceDigest(input.reply) }, groups };
+    return admitHistoricalReadPacket(packet, () => {
+      if (!currentIsEmpty()) return false;
+      return groups.every(group => {
+        const origin = acceptedTurnCallAuthorityFor(group.source.sessionId, group.source.sourceUserSeq);
+        return origin.status === 'ok' && origin.authority.sourceEventId === group.source.eventId
+          && origin.authority.sourceEventDigest === group.source.eventDigest
+          && historicalEvidenceDigest(JSON.stringify(historicalSettlementRows(group.source.sessionId, group.source.sourceUserSeq))) === group.source.settlementDigest
+          && group.observations.every(observation => {
+            const result = redeemSuccessfulSettlementResultForHost({ sessionId: group.source.sessionId,
+              sourceUserSeq: group.source.sourceUserSeq, acceptedTaskId: observation.acceptedTaskId,
+              logicalToolCallId: observation.logicalToolCallId });
+            return result.status === 'ok' && result.value.rawPayloadSha256 === observation.contentDigest
+              && result.value.resultHandleId === observation.resultHandleId && result.value.physicalDispatchId === observation.physicalDispatchId;
+          });
+      });
+    });
+  } catch { return undefined; } // Optional evidence never widens authority or blocks full review.
+}
+
+/** Reopen only the exact recorded historical selection. This does not load
+ * whichever earlier result happens to be newest, mint an effect, or turn the
+ * original unknown mutation into a successful settlement. */
+export function historicalReadClosureIsAuthentic(input: {
+  sessionId: string; sourceUserSeq: number; objectiveDigest: unknown; replyDigest: unknown;
+}, value: unknown): value is HistoricalReadClosure {
+  try {
+    if (!historicalReadClosureHasShape(value)) return false;
+    const closure = value;
+    if (closure.version !== 1 || closure.evidenceMode !== 'historical_only'
+      || JSON.stringify(closure).length > HISTORICAL_COMPLETION_MAX_CHARS
+      || !/^[a-f0-9]{64}$/.test(closure.packetDigest)
+      || closure.consumer.sessionId !== input.sessionId || closure.consumer.sourceUserSeq !== input.sourceUserSeq
+      || closure.consumer.objectiveDigest !== input.objectiveDigest || closure.consumer.replyDigest !== input.replyDigest
+      || closure.source.sessionId !== input.sessionId || closure.source.sourceUserSeq >= input.sourceUserSeq
+      || closure.groupRef !== `historical_source_${closure.source.sourceUserSeq}`
+      || !Array.isArray(closure.observations) || closure.observations.length === 0 || !Array.isArray(closure.warnings)) return false;
+    const db = openEventLog();
+    const consumer = acceptedTurnCallAuthorityFor(input.sessionId, input.sourceUserSeq);
+    const attemptSource = getRunAttemptSourceUserEvent({ sessionId: input.sessionId, attemptId: closure.consumer.runAttemptId });
+    const acceptedText = attemptSource && typeof attemptSource.data.displayText === 'string' && attemptSource.data.displayText.trim()
+      ? attemptSource.data.displayText : attemptSource?.data.text;
+    const attempt = db.prepare(`SELECT 1 AS valid FROM run_attempts WHERE session_id = ? AND attempt_id = ?
+      AND source_user_seq = ? AND status IN ('active', 'completed')`)
+      .get(input.sessionId, closure.consumer.runAttemptId, input.sourceUserSeq);
+    const currentCalls = db.prepare(`SELECT 1 AS attempted FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ?
+      UNION ALL SELECT 1 FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?
+      UNION ALL SELECT 1 FROM accepted_model_batch_admissions WHERE session_id = ? AND source_user_seq = ? AND call_count > 0
+      UNION ALL SELECT 1 FROM events WHERE session_id = ? AND type = 'tool_called'
+        AND json_extract(data_json, '$.sourceUserSeq') = ? LIMIT 1`)
+      .get(input.sessionId, input.sourceUserSeq, input.sessionId, input.sourceUserSeq,
+        input.sessionId, input.sourceUserSeq, input.sessionId, input.sourceUserSeq);
+    if (consumer.status !== 'ok' || consumer.authority.sourceEventId !== closure.consumer.sourceEventId
+      || consumer.authority.sourceEventDigest !== closure.consumer.sourceEventDigest
+      || !['host_v1', 'host_v1_read_only'].includes(consumer.authority.authorityKind)
+      || !attempt || attemptSource?.seq !== input.sourceUserSeq || attemptSource.id !== closure.consumer.sourceEventId
+      || attemptSource.role !== 'user' || attemptSource.data.synthetic === true
+      || typeof acceptedText !== 'string' || historicalEvidenceDigest(acceptedText) !== closure.consumer.objectiveDigest
+      || currentCalls || sourceAttemptedWrites(input) !== 0) return false;
+    const origin = acceptedTurnCallAuthorityFor(closure.source.sessionId, closure.source.sourceUserSeq);
+    const rows = historicalSettlementRows(closure.source.sessionId, closure.source.sourceUserSeq);
+    if (origin.status !== 'ok' || origin.authority.sourceEventId !== closure.source.eventId
+      || origin.authority.sourceEventDigest !== closure.source.eventDigest
+      || historicalEvidenceDigest(JSON.stringify(rows)) !== closure.source.settlementDigest) return false;
+    const reads = rows.filter(row => row.business && !row.mutating && row.toolName !== 'tool_search');
+    const warnings = rows.filter(row => row.mutating || !['succeeded', 'empty_result'].includes(row.outcome))
+      .map(row => ({ logicalToolCallId: row.callId, toolName: row.toolName, outcome: row.outcome, mutating: Boolean(row.mutating) }));
+    if (reads.length !== closure.observations.length
+      || new Set(closure.observations.map(row => row.logicalToolCallId)).size !== reads.length
+      || JSON.stringify(warnings) !== JSON.stringify(closure.warnings)) return false;
+    const original = sourceSettledReadEvidence({ sessionId: closure.source.sessionId, sourceUserSeq: closure.source.sourceUserSeq });
+    return original.evidenceAvailable && closure.observations.every(observation => {
+      const row = reads.find(candidate => candidate.callId === observation.logicalToolCallId);
+      const seen = original.results.find(candidate => candidate.logicalToolCallId === observation.logicalToolCallId);
+      if (!row || seen?.status !== 'verified' || seen.contentComplete !== true || seen.precedesWrite
+        || row.argumentDigest !== observation.argumentDigest || row.toolName !== observation.toolName
+        || row.recordedAt !== observation.recordedAt || observation.contentComplete !== true || observation.sourceExhausted !== true) return false;
+      const redeemed = redeemSuccessfulSettlementResultForHost({ sessionId: closure.source.sessionId,
+        sourceUserSeq: closure.source.sourceUserSeq, acceptedTaskId: observation.acceptedTaskId,
+        logicalToolCallId: observation.logicalToolCallId });
+      return redeemed.status === 'ok' && redeemedReadIsExhausted(redeemed.value)
+        && redeemed.value.resultHandleId === observation.resultHandleId && redeemed.value.physicalDispatchId === observation.physicalDispatchId
+        && redeemed.value.rawPayloadSha256 === observation.contentDigest && redeemed.value.rawByteCount === observation.rawByteCount
+        && observation.ref === `historical:${closure.source.sourceUserSeq}:${historicalEvidenceDigest(`${observation.logicalToolCallId}\n${observation.resultHandleId}\n${observation.contentDigest}`)}`;
+    });
+  } catch { return false; }
 }
 
 /**

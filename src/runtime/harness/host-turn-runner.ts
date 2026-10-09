@@ -185,6 +185,7 @@ import { objectiveMayRequireMultipleResults } from './tool-evidence.js';
 import { conversationalReviewSkipRecord } from './completion-review-skip.js';
 import {
   acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceEvidenceLookup, sourceWritesAtStake,
+  historicalReadCompletionEvidence, historicalReadClosureIsAuthentic,
   sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence, sourceSucceededResultCount,
   earlierTurnsEvidence,
 } from './host-completion-work.js';
@@ -4614,6 +4615,7 @@ const runHostTurnBody = async (
     let verdict: ObjectiveJudgeVerdict;
     const judgeStartedAt = Date.now();
     let preparation: ReturnType<typeof acceptedPlanPreparationReadEvidence>;
+    let historicalEvidence: ReturnType<typeof historicalReadCompletionEvidence>;
     // The viewer sees that the finished draft is being checked, not a pause.
     markAnswerDraftChecking(identity.sessionId, identity.sourceUserSeq);
     try {
@@ -4621,6 +4623,10 @@ const runHostTurnBody = async (
       const workflowEvidence = workflowParentActivation(identity.sessionId, identity.sourceUserSeq)?.completionEvidence?.();
       const agentInstructions = sessionAgentReviewContext(identity.sessionId);
       const delegatedJobs = delegatedJobsStartedBy(identity);
+      historicalEvidence = historicalReadCompletionEvidence({ ...identity, objective, reply: judgedReply,
+        excluded: Boolean(planCandidate || preparation || workflowParentActivation(identity.sessionId, identity.sourceUserSeq)
+          || openApprovalCard || explicitMemoryRequired || memoryRequirementRequired || delegatedJobs.length > 0
+          || settled.count > 0 || !settled.evidenceAvailable || !readEvidence.evidenceAvailable || readEvidence.results.length > 0) });
       verdict = await hostObjectiveJudge(objective, judgedReply, {
         sessionId: identity.sessionId,
         completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE,
@@ -4649,6 +4655,7 @@ const runHostTurnBody = async (
         }),
         verifiedReads: readEvidence.summary,
         verifiedReadResults: readEvidence.results,
+        ...(historicalEvidence ? { historicalEvidence } : {}),
         fullSourceEvidence: true,
         ...(policy.status === 'captured' ? { boundaryJudgeSelection: policy.policy.judgeSelection } : {}),
         ...(hostWrittenReply && hostWrittenReply.digest === createHash('sha256').update(judgedReply, 'utf8').digest('hex')
@@ -4797,6 +4804,7 @@ const runHostTurnBody = async (
           settledEffectCount: settled.count,
           settledEvidenceAvailable: settled.evidenceAvailable && readEvidence.evidenceAvailable,
           judgedReadResults: readEvidence.results,
+          ...(verdict.historicalEvidence ? { judgedHistoricalReadResults: verdict.historicalEvidence } : {}),
           ...(memoryConsolidation ? { judgedMemoryResults: memoryConsolidation } : {}),
           ...(memoryRequirementRequired ? { judgedMemoryRequirement: currentMemoryReviewCheck ?? memoryRequirementCompletion() } : {}),
           ...(preparation ? { judgedPreparationReadResults: {
@@ -12269,6 +12277,8 @@ export function completionVerdictForAcceptedSource(input: {
       if (!data) continue;
       if (data.lane !== 'host_v1' || data.kind !== 'completion') continue;
       if (data.sourceUserSeq !== input.sourceUserSeq) continue;
+      if (data.judgedHistoricalReadResults !== undefined && !historicalReadClosureIsAuthentic({ ...input,
+        objectiveDigest: data.objectiveDigest, replyDigest: data.replyDigest }, data.judgedHistoricalReadResults)) return null;
       const judged = Array.isArray(data.judgedArtifacts) ? data.judgedArtifacts : [];
       latest = {
         eventId: String(event.id),
