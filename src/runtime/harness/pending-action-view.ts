@@ -1,4 +1,8 @@
 import { getPendingAction, type PendingActionRecord } from './pending-actions.js';
+import path from 'node:path';
+import { BASE_DIR } from '../../config.js';
+import { outgoingFilesInCommand } from '../shell-outgoing-files.js';
+import { LocalFileSendRefusal, describeLocalFileToSend, resolveLocalFileToSend } from '../local-file-sending.js';
 
 export interface PendingActionApprovalView {
   id: string;
@@ -22,6 +26,9 @@ export interface PendingActionApprovalView {
   resultSummary: string | null;
   createdAt: string;
   updatedAt: string;
+  /** The local files a command would send off this computer, each named
+   * by name, size and folder (or why it cannot be sent). Display only. */
+  files?: string[];
 }
 
 export function pendingActionIdFromArgs(args: unknown): string | null {
@@ -62,7 +69,31 @@ export function pendingActionApprovalView(record: PendingActionRecord): PendingA
     resultSummary: record.resultSummary,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
+    ...(() => {
+      const files = pendingActionOutgoingFiles(record);
+      return files.length > 0 ? { files } : {};
+    })(),
   };
+}
+
+/** The files a queued command would send from this computer, as the card names them. */
+export function pendingActionOutgoingFiles(record: Pick<PendingActionRecord, 'toolName' | 'kind' | 'payload'>): string[] {
+  const shell = record.toolName === 'run_shell_command' || record.kind === 'shell_command';
+  const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
+    ? record.payload as Record<string, unknown> : null;
+  if (!shell || !payload || typeof payload.command !== 'string') return [];
+  try {
+    const cwd = typeof payload.cwd === 'string' && payload.cwd.trim() ? payload.cwd : BASE_DIR;
+    return outgoingFilesInCommand(payload.command, cwd).slice(0, 8).map((file) => {
+      try {
+        return describeLocalFileToSend(resolveLocalFileToSend(file));
+      } catch (error) {
+        return `${path.basename(file)}: cannot be sent (${error instanceof LocalFileSendRefusal ? error.message : 'it cannot be read'})`;
+      }
+    });
+  } catch {
+    return [];
+  }
 }
 
 export function pendingActionApprovalViewFromArgs(args: unknown): PendingActionApprovalView | undefined {

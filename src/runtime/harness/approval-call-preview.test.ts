@@ -138,3 +138,30 @@ test('edit by hand applies the retyped field onto the exact stored call, along t
   assert.equal(approvalArgsWithFieldEdits({ items: [1] }, { items: 'x' }).ok, false, 'a structured value is not editable here');
   assert.equal(approvalArgsWithFieldEdits(stored, {}).ok, false, 'no edits, nothing to apply');
 });
+
+test('a file argument is named on the card by name, size and folder, and one that cannot be sent says why', async () => {
+  // Owner 2026-10-09: "the PDF we just produced" with two PDFs around; the
+  // card names the exact file that will leave before the owner says yes.
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { approvalCallPreview } = await import('./approval-call-preview.js');
+  // Clem's own folder is one the owner's files may be sent from (outside her stores).
+  const dir = mkdtempSync(path.join(process.env.CLEMENTINE_HOME!, 'card-file-'));
+  try {
+    mkdirSync(path.join(dir, 'Reports'), { recursive: true });
+    const report = path.join(dir, 'Reports', 'staging report.pdf');
+    writeFileSync(report, 'x'.repeat(2048));
+    const preview = approvalCallPreview({
+      toolName: 'composio_execute_tool',
+      args: { tool_slug: 'ACME_CREATE_DRAFT', arguments: JSON.stringify({ subject: 'Hi', attachment: [report], other: path.join(dir, 'missing.pdf') }) },
+    } as never);
+    const attachment = preview!.fields.find((field) => field.name === 'attachment')!;
+    assert.equal(attachment.label, 'staging report.pdf · 2 KB · in Reports');
+    const other = preview!.fields.find((field) => field.name === 'other')!;
+    assert.match(other.label ?? '', /^cannot be sent: There is no file at /);
+    assert.equal(preview!.fields.find((field) => field.name === 'subject')!.label, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

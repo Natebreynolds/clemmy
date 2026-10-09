@@ -601,6 +601,16 @@ export function ChatBubble({
                     <pre className="mt-1 whitespace-pre-wrap break-words rounded bg-surface-2 p-2 font-mono text-caption text-fg">{pendingAction!.preview}</pre>
                   </>
                 )}
+                {pendingAction!.files && pendingAction!.files.length > 0 && (
+                  <>
+                    <p className="mt-2.5 text-caption font-semibold uppercase tracking-wide text-faint">Files leaving this computer</p>
+                    <ul className="mt-1 space-y-0.5">
+                      {pendingAction!.files.map((file) => (
+                        <li key={file} className={cn('break-words text-caption', file.includes('cannot be sent') ? 'text-warning' : 'text-fg')}>{file}</li>
+                      ))}
+                    </ul>
+                  </>
+                )}
                 {pendingActionShowsRisk && <p className="mt-1.5 text-caption text-warning">{pendingAction!.risk}</p>}
                 {pendingActionShowsRollback && <p className="mt-1 text-caption text-muted">{pendingAction!.rollback}</p>}
                 {revisedCommand && (

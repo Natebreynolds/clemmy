@@ -57,6 +57,8 @@ export interface PendingActionApprovalView {
   resultSummary: string | null;
   createdAt: string;
   updatedAt: string;
+  /** Files on this computer the action sends, named by name, size and folder. */
+  files?: string[];
 }
 
 /** A "Needs you" / "Working now" / "Recent" row from the command center. */

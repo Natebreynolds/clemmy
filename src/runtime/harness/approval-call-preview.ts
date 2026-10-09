@@ -1,6 +1,7 @@
 import { scanSecrets } from './guardrails.js';
 import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
 import type { InterruptionInfo } from './loop.js';
+import { LocalFileSendRefusal, describeLocalFileToSend, looksLikeLocalFilePath, resolveLocalFileToSend } from '../local-file-sending.js';
 
 /**
  * What an approval shows a person: the operation and the exact arguments it
@@ -28,6 +29,25 @@ export function approvalJsonRecord(value: unknown): Record<string, unknown> | nu
   }
 }
 
+
+/** How a card names the file(s) an argument would send from this computer;
+ * undefined when the argument names no local file. A file that cannot be
+ * sent says why. */
+export function approvalFileLabel(raw: unknown): string | undefined {
+  const paths = typeof raw === 'string' ? [raw]
+    : Array.isArray(raw) && raw.length > 0 && raw.every((item) => typeof item === 'string') ? raw as string[]
+      : [];
+  const local = paths.filter((item) => looksLikeLocalFilePath(item));
+  if (local.length === 0 || local.length !== paths.length) return undefined;
+  return local.map((item) => {
+    try {
+      return describeLocalFileToSend(resolveLocalFileToSend(item));
+    } catch (error) {
+      const reason = error instanceof LocalFileSendRefusal ? error.message : 'it cannot be read';
+      return `cannot be sent: ${reason}`;
+    }
+  }).join('; ');
+}
 
 export interface ApprovalCallPreview {
   operation: string;
@@ -97,11 +117,13 @@ export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = tru
     const value = approvalPreviewValue(raw, complete);
     if (value === null) continue;
     const secret = scanSecrets(value).length > 0;
-    const label = secret ? undefined : info.previewLabels?.[value];
+    // A file on this computer is named exactly (name, size, folder), so the
+    // owner sees which file leaves before saying yes.
+    const label = secret ? undefined : approvalFileLabel(raw) ?? info.previewLabels?.[value];
     fields.push({
       name: truncate(name, 80),
       value: secret ? '[withheld: looks like a secret]' : value,
-      ...(label ? { label: truncate(label, 120) } : {}),
+      ...(label ? { label: truncate(label, 300) } : {}),
     });
   }
   return {
