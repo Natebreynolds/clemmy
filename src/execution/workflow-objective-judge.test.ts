@@ -420,3 +420,13 @@ test('legacy file updates retain their instructions without inventing path or it
     assert.equal(verdict.reached, valid, 'removing invented keys does not bypass semantic preservation review');
   }
 });
+
+test('the review reads setup notes in a description as configuration, not as work the run owes', async () => {
+  let objectiveSeen = '';
+  await judgeWorkflowTarget({
+    workflow: wf({ description: 'Daily briefing. Starts disabled; enable it, then switch off the old schedule to prevent double-fire.' }), inputs: {},
+    finalOutput: 'Briefing delivered.', deliveredBody: 'Briefing delivered.',
+    judgeFn: async (objective) => { objectiveSeen = objective; return { done: true, reason: 'Delivered.' }; },
+  });
+  assert.match(objectiveSeen, /notes to the owner about setting the workflow up .* describe its configuration, not work a run must do/);
+});
