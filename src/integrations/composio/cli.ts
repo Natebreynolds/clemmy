@@ -118,9 +118,11 @@ export function findComposioCli(options: ComposioCliDiscoveryOptions = {}): stri
       && extension
       && !WINDOWS_SPAWN_SUPPORTED_EXTENSIONS.has(extension.toUpperCase())
     ) return;
+    // Windows cannot launch an extensionless file (npm installs a POSIX shell
+    // shim beside composio.cmd); only its PATHEXT variants are candidates.
     const variants =
       platform === 'win32' && !extension
-        ? [base, ...executableExtensions.map((extension) => `${base}${extension}`)]
+        ? executableExtensions.map((extension) => `${base}${extension}`)
         : [base];
     for (const candidate of variants) {
       const key = platform === 'win32' ? candidate.toLowerCase() : candidate;

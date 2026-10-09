@@ -122,6 +122,19 @@ test('findComposioCli probes safe Windows PATHEXT candidates, including cmd shim
   );
 });
 
+test('findComposioCli on Windows takes npm\'s composio.cmd over its extensionless shell shim', () => {
+  const present = new Set(['C:\\Users\\Clem\\AppData\\Roaming\\npm\\composio', 'C:\\Users\\Clem\\AppData\\Roaming\\npm\\composio.CMD']);
+  const checked: string[] = [];
+  const selected = findComposioCli({
+    platform: 'win32',
+    homeDir: 'C:\\Users\\Clem',
+    env: { PATH: 'C:\\Users\\Clem\\AppData\\Roaming\\npm', PATHEXT: '.EXE;.CMD' },
+    isExecutable: (candidate: string) => { checked.push(candidate); return present.has(candidate); },
+  });
+  assert.equal(selected, 'C:\\Users\\Clem\\AppData\\Roaming\\npm\\composio.CMD');
+  assert.ok(checked.every((candidate) => /\.(exe|cmd)$/i.test(candidate)), 'an extensionless file is never a Windows candidate');
+});
+
 test('findComposioCli rejects unsupported explicit Windows script extensions before probing', () => {
   for (const extension of ['ps1', 'vbs']) {
     const checked: string[] = [];

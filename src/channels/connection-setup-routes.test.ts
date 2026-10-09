@@ -302,6 +302,23 @@ test('provider failures cannot echo submitted credentials or mark the task ready
   } finally { await harness.close(); }
 });
 
+test('a connect that cannot reach Composio says why in plain words, never with provider text', async () => {
+  const context = parkedTask('mobile-setup-unreachable');
+  const unreachable = async (): Promise<never> => {
+    throw new TypeError(`fetch failed ${secret}`, { cause: Object.assign(new Error('self-signed'), { code: 'SELF_SIGNED_CERT_IN_CHAIN' }) });
+  };
+  const harness = await startHarness(routeDeps({ prepareConnection: unreachable }));
+  try {
+    const failed = await harness.request('POST', `/m/api/composio/toolkits/${toolkit}/authorize`, { ...context, details: { token: secret } });
+    assert.equal(failed.status, 503);
+    const body = await failed.text();
+    assert.match(body, /Couldn’t reach Composio from this computer: this network’s security certificate isn’t trusted/);
+    assert.equal(body.includes(secret), false);
+    assert.ok(dependencies.currentConnectionDependency(context.sessionId), 'the task stays parked on the connection');
+    assertNoCredentialEvents(context.sessionId);
+  } finally { await harness.close(); }
+});
+
 test('a newer source during metadata loading prevents a contextual credential mutation', async () => {
   const context = parkedTask('mobile-setup-metadata-race');
   let markStarted!: () => void;

@@ -368,6 +368,16 @@ function formatIpcHeartbeatAge(ageMs: number | null): string {
 // (30MB+ observed). Roll it at log-open when it exceeds this size, keeping one
 // previous generation (.1). Override via CLEMENTINE_SUPERVISOR_LOG_MAX_BYTES.
 const DEFAULT_SUPERVISOR_LOG_MAX_BYTES = 20 * 1024 * 1024; // 20MB
+/** The daemon's Node trusts the certificates this computer trusts (the
+ * Windows certificate store, the macOS system roots), as the app window
+ * already does. A network whose proxy or antivirus re-signs web traffic
+ * otherwise fails every provider call in the daemon while the window
+ * works. Node only adds those roots to its own; an explicit setting wins. */
+export function daemonSystemTrustEnv(env: NodeJS.ProcessEnv): { NODE_USE_SYSTEM_CA: string } {
+  const explicit = env.NODE_USE_SYSTEM_CA;
+  return { NODE_USE_SYSTEM_CA: typeof explicit === 'string' && explicit.trim() !== '' ? explicit : '1' };
+}
+
 function supervisorLogMaxBytes(): number {
   const raw = Number.parseInt(process.env.CLEMENTINE_SUPERVISOR_LOG_MAX_BYTES ?? '', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SUPERVISOR_LOG_MAX_BYTES;
@@ -635,6 +645,7 @@ export class DaemonSupervisor {
       ...dotenvBaseline,
       ...process.env,
       ...this.opts.envOverrides,
+      ...daemonSystemTrustEnv({ ...dotenvBaseline, ...process.env, ...this.opts.envOverrides }),
       WEBHOOK_ENABLED: 'true',
       WEBHOOK_PORT: String(this.chosenPort),
       WEBHOOK_HOST,

@@ -76,6 +76,8 @@ export function Connect() {
   const connected = connectedToolkits(snap);
   const results = searchToolkits(snap, appQuery);
   const appsUnavailable = composio.isError || toolkits.isError;
+  // A read that could not reach Composio says why; it is never "no apps".
+  const composioProblem = snap?.connectionsError ?? snap?.catalogError ?? null;
   const cliOnlyComposio = composio.data?.executionBackend === 'cli'
     || (composio.data?.executionBackend === 'auto' && !composio.data?.apiKeyPresent);
   const cliAuthenticated = composio.data?.cli?.authenticated === true;
@@ -205,6 +207,20 @@ export function Connect() {
             className="mb-4 py-10"
           />
         )}
+        {!appsUnavailable && composioProblem && (
+          <div role="status" className="mb-3 flex items-start gap-3 rounded-md border border-danger/40 bg-danger-tint px-3 py-2 text-small text-danger">
+            <p className="flex-1">
+              Clementine couldn’t reach Composio from this computer: {composioProblem}.{' '}
+              {snap?.connectionsError
+                ? 'Your connected apps may be missing from this list until it can.'
+                : 'Search shows the common apps until it can.'}
+            </p>
+            <button type="button" onClick={() => { void refreshApps(); }} disabled={refreshing}
+              className="shrink-0 cursor-pointer font-medium underline-offset-2 hover:underline disabled:cursor-default disabled:opacity-60">
+              {refreshing ? 'Trying…' : 'Try again'}
+            </button>
+          </div>
+        )}
         {!appsUnavailable && appNotice && (
           <p className={cn('mb-3 rounded-md border px-3 py-2 text-small',
             appNotice.tone === 'error' ? 'border-danger/40 bg-danger-tint text-danger' : 'border-border bg-subtle text-muted')}>
@@ -255,7 +271,7 @@ export function Connect() {
             : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 {results.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onReconnect={() => reconnectApp(t)} onDisconnectConnection={disconnectConnection} onSaveLabel={saveLabel} />)}
               </div>
-        ) : !appsUnavailable && connected.length === 0 ? (
+        ) : !appsUnavailable && connected.length === 0 && !snap?.connectionsError ? (
           <Card className="p-5 text-body text-muted">No apps connected yet — search above to connect Gmail, Slack, your CRM, and more.</Card>
         ) : !appsUnavailable ? (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">

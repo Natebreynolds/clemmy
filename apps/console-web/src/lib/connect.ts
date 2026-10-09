@@ -82,7 +82,10 @@ export interface ComposioSnapshot {
   connected?: Array<{ slug: string; status?: string }>;
   toolkits?: ComposioToolkit[];
   featured?: string[];
+  /** Why the app catalog is missing (plain words), or null. */
   catalogError?: string | null;
+  /** Why the connected-account list is missing (plain words), or null. */
+  connectionsError?: string | null;
 }
 export interface ComposioSetupField {
   name: string;

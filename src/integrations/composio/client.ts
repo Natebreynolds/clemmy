@@ -30,6 +30,12 @@ import { successorSlugsFromProse } from './lifecycle-prose.js';
 import { aliasLabelFor } from '../../memory/account-alias-store.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { redactSensitiveText } from '../../runtime/security.js';
+import pino from 'pino';
+import {
+  composioErrorDetail,
+  composioReadProblem,
+  withComposioDeadline,
+} from './reachability.js';
 
 const ENV_FILE = path.join(BASE_DIR, '.env');
 const CACHE_DIR = path.join(BASE_DIR, 'state');
@@ -70,6 +76,7 @@ const CONNECTIONS_TTL_MS = 60_000;
  * immediately regardless of this window. */
 const EXECUTION_OBSERVATION_TTL_MS = 900_000;
 const CONNECTED_ACCOUNTS_LIST_TIMEOUT_MS = 15_000;
+const logger = pino({ name: 'clementine.composio' });
 const CATALOG_TTL_MS = 60 * 60_000;
 const BACKEND_VALUES = ['auto', 'sdk', 'cli'] as const;
 export const COMPOSIO_AUTH_CONFIGS_URL = 'https://dashboard.composio.dev/~/project/auth-configs';
@@ -359,6 +366,8 @@ export interface ComposioDashboardSnapshot {
   featured: string[];
   totalCount: number;
   catalogError?: string | null;
+  /** Why the connected-account list is missing (plain words), or null. */
+  connectionsError?: string | null;
 }
 
 interface AccountIdentity {
@@ -383,6 +392,26 @@ let connectionsInflight: { generation: number; promise: Promise<ConnectedToolkit
 // throttled the snapshot fetch and every worker hard-failed auth). Cleared only on a
 // real client reset (API-key change), where the prior account's connections no longer apply.
 let lastGoodConnections: ConnectedToolkit[] | null = null;
+/** The last connected-account refresh failure, cleared by the next success.
+ * The Connect screen reads it so a failed listing never shows as "no apps". */
+let connectionsFailure: { at: number; reason: string } | null = null;
+let connectionsFailureLoggedAt = 0;
+const CONNECTIONS_FAILURE_LOG_INTERVAL_MS = 5 * 60_000;
+
+function noteConnectionsFailure(reason: string): void {
+  const at = Date.now();
+  connectionsFailure = { at, reason };
+  if (at - connectionsFailureLoggedAt < CONNECTIONS_FAILURE_LOG_INTERVAL_MS) return;
+  connectionsFailureLoggedAt = at;
+  logger.warn({ reason: redactSensitiveText(reason).slice(0, 400), problem: composioReadProblem(reason) },
+    'composio connected-account listing failed; the Connect screen shows why');
+}
+
+/** Plain words for why the connected-account list is missing, or null when
+ * the last refresh succeeded. */
+export function composioConnectionsProblem(): string | null {
+  return connectionsFailure ? composioReadProblem(connectionsFailure.reason) : null;
+}
 // A refresh superseded by a newer generation (concurrent invalidation) throws
 // this specific message so a stale in-flight result is never served. It is NOT a
 // transient fetch failure — the caller should get the newer refresh, so this
@@ -1110,7 +1139,7 @@ async function loadConnectedAccountItemsWithinPhase(
     }
   } catch (err) {
     if (signal.aborted) return connectedAccountLoadFailure('connected-account listing deadline exceeded');
-    rawFailure = err instanceof Error ? err.message : String(err);
+    rawFailure = composioErrorDetail(err);
   }
 
   if (signal.aborted) return connectedAccountLoadFailure('connected-account listing deadline exceeded');
@@ -1130,7 +1159,7 @@ async function loadConnectedAccountItemsWithinPhase(
             : null;
         })();
   } catch (err) {
-    return connectedAccountLoadFailure(err instanceof Error ? err.message : String(err));
+    return connectedAccountLoadFailure(composioErrorDetail(err));
   }
   if (!sdkRequest) return connectedAccountLoadFailure(rawFailure);
   try {
@@ -1141,7 +1170,7 @@ async function loadConnectedAccountItemsWithinPhase(
       : connectedAccountLoadFailure('SDK connected-account listing returned an invalid payload');
   } catch (err) {
     if (signal.aborted) return connectedAccountLoadFailure('connected-account listing deadline exceeded');
-    return connectedAccountLoadFailure(err instanceof Error ? err.message : String(err));
+    return connectedAccountLoadFailure(`${composioErrorDetail(err)}; raw listing: ${rawFailure}`);
   }
 }
 
@@ -1150,7 +1179,7 @@ async function loadConnectedAccountItems(): Promise<ConnectedAccountItemsLoadOut
     try {
       return { kind: 'authoritative', items: await connectedAccountsLoaderForTest() };
     } catch (err) {
-      return connectedAccountLoadFailure(err instanceof Error ? err.message : String(err));
+      return connectedAccountLoadFailure(composioErrorDetail(err));
     }
   }
   const apiKey = readComposioEnv('COMPOSIO_API_KEY');
@@ -1235,6 +1264,7 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
       throw new Error(SNAPSHOT_SUPERSEDED_MESSAGE);
     }
     if (loaded.kind === 'transient') {
+      noteConnectionsFailure(loaded.reason);
       throw new Error(`Composio connected-account refresh was transient: ${loaded.reason}`);
     }
     const decoded = loaded.items.map((item) => {
@@ -1286,6 +1316,7 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
       data,
     };
     lastGoodConnections = data;
+    connectionsFailure = null;
     // Connection publication stays metadata-only. Starting an unawaited
     // 200-definition enumeration here still competes with the foreground
     // role search (and can outlive its turn); the bounded live search owns
@@ -4027,27 +4058,37 @@ async function buildComposioDashboardSnapshotLive(): Promise<ComposioDashboardSn
       featured: toolkits.map((toolkit) => toolkit.slug),
       totalCount: toolkits.length,
       catalogError: null,
+      connectionsError: null,
     };
   }
 
-  let catalog: CatalogToolkit[] = [];
+  // The three reads run together, each bounded: an unreachable Composio
+  // answers the screen with what is known and why the rest is missing,
+  // instead of holding it on the SDK's own retries.
   let catalogError: string | null = null;
-  try {
-    catalog = await listAllToolkits();
-  } catch (error) {
-    catalogError = error instanceof Error ? error.message : String(error);
-    catalog = CURATED_TOOLKITS.map((toolkit) => ({
-      slug: toolkit.slug,
-      name: toolkit.displayName,
-      authMode: toolkit.authMode,
-      categories: [],
-    }));
-  }
-
-  const [connected, configured] = await Promise.all([
-    listConnectedToolkits(),
-    listToolkitSlugsWithAuthConfig(),
+  let connectionsError: string | null = null;
+  const [catalog, connected, configured] = await Promise.all([
+    withComposioDeadline(listAllToolkits()).catch((error: unknown): CatalogToolkit[] => {
+      catalogError = composioReadProblem(error);
+      logger.warn({ reason: redactSensitiveText(composioErrorDetail(error)).slice(0, 400), problem: catalogError },
+        'composio catalog read failed; the Connect screen shows why');
+      const stale = readCatalogCache();
+      return stale.length > 0 ? stale : CURATED_TOOLKITS.map((toolkit) => ({
+        slug: toolkit.slug,
+        name: toolkit.displayName,
+        authMode: toolkit.authMode,
+        categories: [],
+      }));
+    }),
+    withComposioDeadline(listConnectedToolkits()).catch((error: unknown): ConnectedToolkit[] => {
+      if (!(error instanceof Error && error.message === SNAPSHOT_SUPERSEDED_MESSAGE)) {
+        noteConnectionsFailure(composioErrorDetail(error));
+      }
+      return lastGoodConnections ?? [];
+    }),
+    withComposioDeadline(listToolkitSlugsWithAuthConfig()).catch(() => new Set<string>()),
   ]);
+  connectionsError = composioConnectionsProblem();
 
   const suppressionState = readComposioConnectionSuppressionState();
   const dashboardConnections = connected.map((connection) =>
@@ -4109,6 +4150,7 @@ async function buildComposioDashboardSnapshotLive(): Promise<ComposioDashboardSn
     featured,
     totalCount: toolkits.length,
     catalogError,
+    connectionsError,
   };
 }
 

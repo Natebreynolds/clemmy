@@ -7,6 +7,7 @@ import { strict as assert } from 'node:assert';
 
 import {
   appendSupervisorLogTail,
+  daemonSystemTrustEnv,
   formatHungRestartDiagnostic,
   isDaemonIpcHeartbeatMessage,
   normalizeDaemonIpcHeartbeatMessage,
@@ -209,4 +210,23 @@ test('the hang snapshot and the HUNG line carry the beacon read used for the dec
   const source = readFileSync(new URL('./daemon-supervisor.ts', import.meta.url), 'utf8');
   assert.match(source, /formatHungRestartDiagnostic\(\{[^}]*beacon: beaconRead \}\)/);
   assert.match(source, /writeHungRestartSnapshot\(\{[^}]*beacon: beaconRead\?\.beacon/);
+});
+
+test('the daemon trusts the computer\'s own certificates unless told otherwise', () => {
+  assert.deepEqual(daemonSystemTrustEnv({}), { NODE_USE_SYSTEM_CA: '1' });
+  assert.deepEqual(daemonSystemTrustEnv({ NODE_USE_SYSTEM_CA: '' }), { NODE_USE_SYSTEM_CA: '1' });
+  assert.deepEqual(daemonSystemTrustEnv({ NODE_USE_SYSTEM_CA: '0' }), { NODE_USE_SYSTEM_CA: '0' }, 'an explicit setting wins');
+});
+
+test('a Node started with the daemon\'s trust env trusts every system root', async (t) => {
+  const tls = await import('node:tls') as { getCACertificates?: (type: string) => string[] };
+  if (typeof tls.getCACertificates !== 'function' || tls.getCACertificates('system').length === 0) {
+    t.skip('this Node or machine exposes no system certificate store');
+    return;
+  }
+  const { execFileSync } = await import('node:child_process');
+  const probe = 'const t=require("tls");const d=new Set(t.getCACertificates("default"));'
+    + 'process.stdout.write(String(t.getCACertificates("system").every((c)=>d.has(c))))';
+  const env = { ...process.env, NODE_OPTIONS: '', ...daemonSystemTrustEnv({}) };
+  assert.equal(execFileSync(process.execPath, ['-e', probe], { env, encoding: 'utf8' }), 'true');
 });

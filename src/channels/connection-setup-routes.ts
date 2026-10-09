@@ -1,4 +1,5 @@
 import type { Request, RequestHandler, Response, Router } from 'express';
+import pino from 'pino';
 import {
   bustComposioDashboardCaches,
   credentialModeFor,
@@ -11,6 +12,7 @@ import {
   setupCustomOAuthToolkit,
   setupMetaForMode,
 } from '../integrations/composio/client.js';
+import { composioErrorCodes, composioReachabilityProblem } from '../integrations/composio/reachability.js';
 import {
   readConnectionSetup,
   recordConnectionSetupResult,
@@ -18,6 +20,8 @@ import {
   verifyConnectionSetup,
   type ConnectionSetupContext,
 } from '../runtime/harness/connection-setup.js';
+
+const logger = pino({ name: 'clementine.connection-setup' });
 
 export interface ConnectionSetupRouteDependencies {
   prepareConnection: typeof prepareInAppToolkitConnection;
@@ -83,8 +87,16 @@ export function registerConnectionSetupRoutes(
       return null;
     }
   };
-  const failed = (res: Response, slug: string) => {
-    // Even a provider error that echoes a submitted secret must stay private.
+  const failed = (res: Response, slug: string, err: unknown) => {
+    // Even a provider error that echoes a submitted secret must stay private:
+    // the log and the reply carry the error's codes and plain words only.
+    const problem = composioReachabilityProblem(err);
+    logger.warn({ toolkit: slug, codes: composioErrorCodes(err), ...(problem ? { problem } : {}) },
+      'composio connection setup failed');
+    if (problem) {
+      res.status(503).json({ error: `Couldn’t reach Composio from this computer: ${problem}. Check the network, then try again.`, toolkit: slug });
+      return;
+    }
     res.status(500).json({ error: 'Couldn’t connect this app. Check the details and try again.', toolkit: slug });
   };
   const slugFor = (req: Request): string => String(req.params.slug ?? '');
@@ -120,7 +132,7 @@ export function registerConnectionSetupRoutes(
       recordConnectionSetupResult(bound.context, authorized);
       deps.invalidate();
       res.json(authorized);
-    } catch { failed(res, slug); }
+    } catch (err) { failed(res, slug, err); }
   });
 
   router.post(`${prefix}/composio/toolkits/:slug/oauth-app`, guard, noStore, async (req, res) => {
@@ -159,7 +171,7 @@ export function registerConnectionSetupRoutes(
       recordConnectionSetupResult(bound.context, authorized);
       deps.invalidate();
       res.json(authorized);
-    } catch { failed(res, slug); }
+    } catch (err) { failed(res, slug, err); }
   });
 
   const setupCredentials: RequestHandler = async (req, res) => {
@@ -192,7 +204,7 @@ export function registerConnectionSetupRoutes(
       recordConnectionSetupResult(bound.context, result);
       deps.invalidate();
       res.json(result);
-    } catch { failed(res, slug); }
+    } catch (err) { failed(res, slug, err); }
   };
   router.post(`${prefix}/composio/toolkits/:slug/setup-credentials`, guard, noStore, setupCredentials);
   if (options.includeLegacyCredentialAlias) {
