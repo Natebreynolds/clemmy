@@ -11,6 +11,10 @@ import { ChatBubble } from '@/components/chat/ChatBubble';
 import { Composer } from '@/components/chat/Composer';
 import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { chatApprovalReply, useChat } from '@/lib/useChat';
+import { unifiedChatSessionId } from '@/lib/last-session';
+import { useSession } from '@/features/conversations/hooks/useSession';
+import { historyToMessages } from '@/features/conversations/chat/conversation-history';
+import type { Turn } from '@/features/conversations/types';
 import { usePoll } from '@/lib/poll';
 import { sentence } from '@/lib/sentence-case';
 import {
@@ -46,11 +50,26 @@ export function WorkspaceView() {
   return <WorkspaceViewForId key={id} id={id} />;
 }
 
+/** The Space's conversation is loaded before its chat mounts, so a reopened
+ *  Space shows what was said in it and reattaches a turn still running. */
 function WorkspaceViewForId({ id }: { id: string }) {
+  const conversation = useSession(id ? unifiedChatSessionId(spaceSessionId(id)) : undefined);
+  if (conversation.isLoading) {
+    return <div className="flex h-full items-center justify-center text-muted">Opening this Space…</div>;
+  }
+  // A Space nobody has talked in yet has no conversation (404): it starts empty.
+  return <WorkspaceViewLoaded id={id} conversationTurns={conversation.data?.turns ?? []} />;
+}
+
+function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversationTurns: Turn[] }) {
   const navigate = useNavigate();
   const location = useLocation();
   const detail = usePoll(['space', id], () => getSpace(id), 5000, { enabled: !!id });
-  const chat = useChat({ initialSessionId: spaceSessionId(id) });
+  const chat = useChat({
+    initialSessionId: spaceSessionId(id),
+    initialMessages: historyToMessages(conversationTurns),
+    reattachActiveRun: true,
+  });
 
   const [iframeKey, setIframeKey] = useState(0);
   const lastMtimeRef = useRef<string | null>(null);
