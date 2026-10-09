@@ -27,7 +27,7 @@ import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-i
 import { MODELS, getActiveAuthMode, getByoBackendConfig, getModelRoutingMode, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { warmCapabilityRetrieval } from '../runtime/read-path/capability-candidates.js';
-import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
+import { configureHarnessRuntime, connectedBrainInPlaceOfDefaultCodex } from '../runtime/harness/codex-client.js';
 import { startModelDiscoveryHeartbeat, warmModelDiscovery } from '../runtime/harness/model-discovery.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
@@ -126,7 +126,7 @@ import { reconcileDormantTerminalWorkSessions } from '../runtime/harness/session
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
-import { getClaudeAuthSnapshot } from '../runtime/claude-oauth.js';
+import { claudeVaultFallbackReady, getClaudeAuthSnapshot } from '../runtime/claude-oauth.js';
 import { tickAuthKeepalive } from '../runtime/auth-keepalive.js';
 import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } from '../config.js';
 import { getOrRefreshScan as warmCliScan } from '../runtime/cli-discovery.js';
@@ -1400,11 +1400,13 @@ function reportBootSetupIssues(): void {
 
   try {
     const auth = getAuthStatus();
-    if (!bootAuthSetupSatisfied(auth.configured)) {
+    if (!bootAuthSetupSatisfied(brainAuthConfigured(auth))) {
+      // The default mode's own message asks for an OpenAI key, which never runs the brain.
+      const message = auth.mode === 'api_key' ? 'No AI model is signed in yet.' : auth.message;
       issues.push({
         slug: 'auth',
         title: 'Set up a model so Clem can work',
-        body: `${auth.message}\n\nOpen the desktop app → Settings → Models to sign in, or run \`clementine auth login\`. Until a model is set up, chat, workflows and background tasks cannot run; scheduled jobs wait instead of failing.`,
+        body: `${message}\n\nOpen the desktop app → Settings → Models to sign in, or run \`clementine auth login\`. Until a model is set up, chat, workflows and background tasks cannot run; scheduled jobs wait instead of failing.`,
       });
     }
   } catch (err) {
@@ -1454,10 +1456,27 @@ export function _testOnly_setScheduledRunHasAModel(check: (() => boolean) | null
 export function scheduledRunHasAModel(): boolean {
   if (scheduledRunModelCheckForTests) return scheduledRunModelCheckForTests();
   try {
-    return bootAuthSetupSatisfied(getAuthStatus().configured);
+    return bootAuthSetupSatisfied(brainAuthConfigured(getAuthStatus()));
   } catch {
     return true;
   }
+}
+
+/**
+ * Whether the auth status gives the brain a model. An OpenAI API key never runs
+ * agent calls (voice and embeddings only), so under the default mode the brain
+ * needs a Codex sign-in, or the model the home connected in its place (Claude,
+ * or a BYO model), which the runtime takes as the brain on its next run.
+ */
+export function brainAuthConfigured(status: { mode: string; configured: boolean; codexOauthPresent?: boolean }): boolean {
+  if (status.mode !== 'api_key') return status.configured;
+  if (status.codexOauthPresent) return true;
+  return connectedBrainInPlaceOfDefaultCodex({
+    authMode: 'api_key',
+    codexSignedIn: false,
+    claudeReady: (() => { try { return claudeVaultFallbackReady(); } catch { return false; } })(),
+    byoConfigured: (() => { try { return getByoBackendConfig().configured; } catch { return false; } })(),
+  }) !== null;
 }
 
 export function bootAuthSetupSatisfied(authConfigured: boolean): boolean {

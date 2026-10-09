@@ -20,6 +20,7 @@ process.env.WEBHOOK_ENABLED = 'false';
 const {
   ambientComposioMonitorDisabledVerdict,
   bootAuthSetupSatisfied,
+  brainAuthConfigured,
   bootModelWarmupEnabled,
   cliDiscoveryWarmupEnabled,
   daemonRecursiveReflectionEnabled,
@@ -417,4 +418,26 @@ test('combined daemon and service listeners open only inside onReady', () => {
 
   assert.ok(guardedBranches.some((condition) => condition.includes("sub==='--foreground'")));
   assert.ok(guardedBranches.some((condition) => condition === "command==='service'"));
+});
+
+test('an OpenAI API key alone is not a model for the brain; a Codex sign-in or a connected BYO model is', () => {
+  const prior = { base: process.env.BYO_MODEL_BASE_URL, id: process.env.BYO_MODEL_ID, key: process.env.BYO_MODEL_API_KEY };
+  delete process.env.BYO_MODEL_BASE_URL; delete process.env.BYO_MODEL_ID; delete process.env.BYO_MODEL_API_KEY;
+  try {
+    // The default mode reads "configured" when an OpenAI key exists, but the
+    // harness never runs agent calls on it, so scheduled jobs would start and fail.
+    assert.equal(brainAuthConfigured({ mode: 'api_key', configured: true, codexOauthPresent: false }), false);
+    assert.equal(brainAuthConfigured({ mode: 'api_key', configured: false, codexOauthPresent: true }), true);
+    process.env.BYO_MODEL_BASE_URL = 'https://api.deepseek.com/v1';
+    process.env.BYO_MODEL_ID = 'deepseek-chat';
+    process.env.BYO_MODEL_API_KEY = 'test-only-key';
+    assert.equal(brainAuthConfigured({ mode: 'api_key', configured: false, codexOauthPresent: false }), true,
+      'a connected BYO model becomes the brain on the next run');
+    assert.equal(brainAuthConfigured({ mode: 'claude_oauth', configured: true }), true, 'other modes keep their own answer');
+  } finally {
+    for (const [k, envk] of [['base', 'BYO_MODEL_BASE_URL'], ['id', 'BYO_MODEL_ID'], ['key', 'BYO_MODEL_API_KEY']] as const) {
+      const v = (prior as Record<string, string | undefined>)[k];
+      if (v === undefined) delete process.env[envk]; else process.env[envk] = v;
+    }
+  }
 });
