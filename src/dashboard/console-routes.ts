@@ -1,4 +1,6 @@
 import { registerCloudBrowserRoutes } from '../channels/cloud-browser-routes.js';
+import { Readable } from 'node:stream';
+import { requestSpeech, spokenReplyText } from './voice-speech.js';
 import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { SAVED_SOURCE_SCRIPT_CONSENT_TOOL } from '../runtime/harness/saved-source-consent.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
@@ -195,13 +197,11 @@ import {
   workflowTerminalOutcomeNeedsAttention,
 } from '../execution/workflow-terminal-outcome.js';
 import { promoteWorkflowFromSession } from '../tools/orchestration-tools.js';
-import { resolveRealtimeVad, buildRealtimeSessionConfig, VOICE_DELIVERY_INSTRUCTIONS } from './realtime-session-config.js';
 import { ExecutionStore } from '../execution/store.js';
 import { isReservedProjectWorkflowRunRecord } from '../execution/compiled-project-run-contract.js';
 import { closeCheckIn } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import type { AssistantRequest, ExecutionRecord, PendingApproval } from '../types.js';
-import { buildRealtimeVoiceInstructions } from '../assistant/voice-context.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import {
@@ -2201,13 +2201,6 @@ function buildGoalsPayload(filter: string | undefined): Record<string, unknown> 
   };
 }
 
-function realtimeNumberEnv(name: string, fallback: number, min: number, max: number): number {
-  const raw = getRuntimeEnv(name, String(fallback));
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(min, Math.min(max, parsed));
-}
-
 
 /**
  * Tools the Workflow Architect chat is forbidden from calling. The
@@ -3936,7 +3929,7 @@ export function registerConsoleRoutes(
     transcribeLocal: typeof transcribeLocalMeetingAudio;
     hasCloudKey: typeof hasOpenAiKey;
     transcribeCloud: typeof transcribeAudio;
-  }; fileOpenRuntime?: {
+  }; voiceSpeechRuntime?: { requestSpeech: typeof requestSpeech }; fileOpenRuntime?: {
     platform: NodeJS.Platform;
     launchWindowsDefaultApp: typeof launchWindowsDefaultApp;
   } },
@@ -16951,6 +16944,33 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Voice mode reads Clem's reply aloud: the heard part of the reply (no
+  // markdown, no code, bounded) streams back as audio from the speech service.
+  // Without a usable key the reply says so and the client speaks with this
+  // computer's own voice. Hanging up stops the upstream request.
+  app.post('/api/console/voice/speak', express.json({ limit: '64kb' }), async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const raw = typeof req.body?.text === 'string' ? req.body.text : '';
+    const heard = spokenReplyText(raw);
+    if (!heard) { res.status(400).json({ error: 'nothing to say' }); return; }
+    const controller = new AbortController();
+    res.on('close', () => { if (!res.writableFinished) controller.abort(); });
+    const speech = await (opts?.voiceSpeechRuntime?.requestSpeech ?? requestSpeech)(heard, controller.signal);
+    if (!speech.ok) {
+      if (!res.headersSent && !controller.signal.aborted) {
+        res.status(speech.status).json({ error: speech.error, ...(speech.fallback ? { fallback: speech.fallback } : {}), text: heard });
+      }
+      return;
+    }
+    res.status(200);
+    res.setHeader('Content-Type', speech.contentType);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Clem-Spoken-Chars', String(heard.length));
+    const body = Readable.fromWeb(speech.response.body as unknown as import('node:stream/web').ReadableStream<Uint8Array>);
+    body.on('error', () => { if (!res.writableEnded) res.end(); });
+    body.pipe(res);
+  });
+
   /**
    * Persist Stop before a chat POST has returned its exact attempt identity.
    * The client-owned request id is the only safe authority in that window.
@@ -17787,6 +17807,8 @@ export function registerConsoleRoutes(
             runId: requestRunId,
             attemptId: requestAttempt.attemptId,
             ...(proposedEarlyRoute ? { consoleEarlyRoute: proposedEarlyRoute } : {}),
+            // Spoken in voice mode: the reply will be heard, so the turn knows it.
+            ...((body as Record<string, unknown>).voice === true ? { voice: true } : {}),
             ...(acceptedApprovalId
               ? {
                   approvalId: acceptedApprovalId,
@@ -19319,105 +19341,6 @@ export function registerConsoleRoutes(
       const result = deleteUnifiedSession(req.params.id, hard);
       if (!result) { res.status(404).json({ error: 'session not found' }); return; }
       res.json(result);
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  /**
-   * Mint a short-lived Realtime client secret for the Electron/browser
-   * home voice panel. The renderer never receives the long-lived
-   * OpenAI API key; it only receives the ephemeral secret returned by
-   * OpenAI's Realtime API.
-   */
-  app.post('/api/console/realtime/session', async (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-
-    const apiKey = getOpenAiApiKey();
-    if (!apiKey) {
-      res.status(400).json({
-        error: 'Live voice needs the optional OpenAI API key. Codex OAuth can still run the agent; add the key in Settings → Runtime Auth & Capability Keys to enable voice.',
-      });
-      return;
-    }
-
-    const body = req.body ?? {};
-    const requestedVoice = typeof body.voice === 'string' ? body.voice : '';
-    const requestedModel = typeof body.model === 'string' ? body.model : '';
-    const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim()
-      ? body.sessionId.trim().slice(0, 120)
-      : 'console:home';
-    const voice = requestedVoice || getRuntimeEnv('OPENAI_REALTIME_VOICE', 'marin');
-    const model = requestedModel || getRuntimeEnv('OPENAI_REALTIME_MODEL', 'gpt-realtime');
-    const transcriptionModel = getRuntimeEnv('OPENAI_REALTIME_TRANSCRIBE_MODEL', 'gpt-4o-mini-transcribe');
-
-    // Turn-taking (VAD) parameters: env vars are the default, but the voice
-    // settings UI may override them per-session via the request body. The
-    // shared resolver clamps every value to the same safe range as the env
-    // path so UI input can never push out-of-range numbers into the session.
-    const { vadThreshold, prefixPaddingMs, silenceMs } = resolveRealtimeVad(body, {
-      vadThreshold: realtimeNumberEnv('OPENAI_REALTIME_VAD_THRESHOLD', 0.55, 0.1, 0.95),
-      prefixPaddingMs: realtimeNumberEnv('OPENAI_REALTIME_PREFIX_PADDING_MS', 350, 0, 1500),
-      silenceMs: realtimeNumberEnv('OPENAI_REALTIME_SILENCE_MS', 430, 150, 2000),
-    });
-
-    // Client-honored feature flags (kill-switches). The renderer drives the
-    // spoken-progress and one-loop behavior, so the server is the single source
-    // of truth and hands the resolved flags back in the session payload.
-    // Reconnect/swap is always on.
-    const voiceProgress = (getRuntimeEnv('CLEMMY_VOICE_PROGRESS', 'off') || 'off').toLowerCase() === 'on';
-    // One-loop: the realtime model becomes ears+mouth only and the REAL agent
-    // (the chat loop) does the thinking + talking. Off → the legacy persona.
-    const voiceOneLoop = (getRuntimeEnv('CLEMMY_VOICE_ONE_LOOP', 'off') || 'off').toLowerCase() === 'on';
-
-    // In one-loop mode the model decides nothing, so it gets a thin voice-
-    // delivery instruction instead of the heavy memory/goals context (the
-    // brain owns that). The persona path keeps the full injected context.
-    const instructions = voiceOneLoop ? VOICE_DELIVERY_INSTRUCTIONS : buildRealtimeVoiceInstructions(sessionId);
-
-    const session = buildRealtimeSessionConfig({
-      model,
-      voice,
-      transcriptionModel,
-      instructions,
-      vad: { vadThreshold, prefixPaddingMs, silenceMs },
-      idleTimeoutMs: realtimeNumberEnv('OPENAI_REALTIME_IDLE_TIMEOUT_MS', 6500, 1000, 30000),
-      oneLoop: voiceOneLoop,
-    });
-
-    try {
-      const response = await fetch('https://api.openai.com/v1/realtime/client_secrets', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(session),
-      });
-
-      const text = await response.text();
-      let payload: unknown;
-      try {
-        payload = JSON.parse(text);
-      } catch {
-        payload = { raw: text };
-      }
-
-      if (!response.ok) {
-        res.status(response.status).json({
-          error: 'Failed to create Realtime client secret.',
-          details: payload,
-        });
-        return;
-      }
-
-      res.json({
-        ...(payload && typeof payload === 'object' ? payload as Record<string, unknown> : { value: payload }),
-        model,
-        voice,
-        vad: { threshold: vadThreshold, silenceMs, prefixPaddingMs },
-        features: { progressUpdates: voiceProgress, reconnect: true, oneLoop: voiceOneLoop },
-      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

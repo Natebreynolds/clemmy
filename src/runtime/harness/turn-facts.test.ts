@@ -42,3 +42,26 @@ test('a turn that asked a question leaves the question in charge: no fact is wri
   const id = sessionWithTerminal('turn-facts-question', { status: 'needs_input', kind: 'question', text: 'Which title?' });
   assert.equal(turnFactsFor(id), undefined);
 });
+
+test('a turn spoken in voice mode tells the brain its reply will be heard, beside any other fact', () => {
+  const id = 'turn-facts-voice';
+  createSession({ id, kind: 'chat' });
+  appendEvent({ sessionId: id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'what is on my calendar today', voice: true } });
+  const facts = turnFactsFor(id);
+  assert.ok(facts?.startsWith('[turn-facts:v1]\n'), facts);
+  assert.match(facts!, /will hear your reply read aloud/);
+  assert.match(facts!, /Use your tools and memory exactly as you would in text/);
+
+  const later = sessionWithTerminal('turn-facts-voice-after-done', { status: 'done', kind: 'answer', text: 'Done.' });
+  appendEvent({ sessionId: later, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'and tomorrow?', voice: true } });
+  const both = turnFactsFor(later)!;
+  assert.equal(both.split('[turn-facts:v1]').length, 2, 'one header for every fact');
+  assert.match(both, /Nothing is waiting on the owner/);
+  assert.match(both, /read aloud/);
+});
+
+test('a typed turn carries no voice fact', () => {
+  const id = sessionWithTerminal('turn-facts-typed', { status: 'needs_input', kind: 'question', text: 'Which title?' });
+  appendEvent({ sessionId: id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'the first one' } });
+  assert.equal(turnFactsFor(id), undefined);
+});

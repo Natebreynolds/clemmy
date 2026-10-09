@@ -1512,3 +1512,18 @@ test('a reopened chat draws the change on the revised card as the live one did',
   assert.deepEqual(messages[1].approval?.revises, revises);
   assert.equal(messages[1].approval?.preview?.fields[0].value, 'ssh -G -v localhost');
 });
+
+test('a spoken message reaches the chat route marked voice; a typed one keeps its exact call', async () => {
+  const calls: unknown[][] = [];
+  const transport = async (...args: unknown[]) => {
+    calls.push(args);
+    return { sessionId: 'sess-voice', streamUrl: '/api/sessions/sess-voice/events', status: 'started', mode: 'fresh', clientRequestId: String(args[3]) } as never;
+  };
+  const spoken = retainPendingChatPost(null, { input: 'what is on today', sessionId: 'sess-voice', attachments: [], voice: true }, () => 'voice-request');
+  const typed = retainPendingChatPost(null, { input: 'what is on today', sessionId: 'sess-voice', attachments: [] }, () => 'typed-request');
+  assert.equal(spoken.fingerprint, typed.fingerprint, 'speaking is not part of the request identity');
+  await postPendingChatWithRetry(spoken, { transport: transport as never });
+  await postPendingChatWithRetry(typed, { transport: transport as never });
+  assert.equal(calls[0].at(-1), true, 'the spoken post carries voice');
+  assert.equal(calls[1].length, 5, 'the typed post makes the call it always made');
+});

@@ -142,7 +142,7 @@ function LiveHome() {
   const agentChoice = useConversationAgent(null);
   // Which project it opens in, chosen the same way.
   const projectChoice = useConversationProject(null);
-  const sendAndOpen = useCallback((input: { text: string; attachmentIds: string[]; attachmentNames: string[] }) => {
+  const sendAndOpen = useCallback((input: { text: string; attachmentIds: string[]; attachmentNames: string[]; voice?: boolean }) => {
     if (chat.busy || opening) return;
     setNotice(null);
     setOpening(true);
@@ -376,6 +376,7 @@ function LiveHome() {
           onModeChange={chat.setComposerMode}
           onSend={sendAndOpen}
           onStop={chat.stop}
+          voiceMessages={chat.messages}
           agentSlot={<><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} /><AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} /></>}
           placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : undefined}
           agentId={agentChoice.chosen?.id ?? null}

@@ -38,6 +38,11 @@ export interface NotchVoiceOptions {
   silenceMs?: number;
   /** Stream a live interim transcript as you speak. Default true. */
   interim?: boolean;
+  /** Hands-free without sending: when the speaker goes quiet the clip is
+   *  transcribed on this computer and the words go here (voice mode sends
+   *  them into the open conversation). Empty when nothing was heard. Takes
+   *  precedence over autoSend. */
+  onUtterance?: (text: string) => void;
 }
 
 export interface NotchVoiceHandlers {
@@ -151,8 +156,9 @@ export class NotchVoice {
           // the resampler it just caused teardownAudio() to release.
           if (!this.isCaptureActive(revision) || this.resampler !== resampler) return;
         }
-        // Hands-free VAD: once you've spoken, sustained silence auto-sends.
-        if (this.options.autoSend !== false) {
+        // Hands-free VAD: once you've spoken, sustained silence ends the
+        // utterance (sent, or handed to onUtterance).
+        if (this.options.autoSend !== false || this.options.onUtterance) {
           const chunkMs = (input.length / (this.context?.sampleRate || OUTPUT_SAMPLE_RATE)) * 1000;
           if (rms > SPEECH_RMS_THRESHOLD) {
             this.speechDetected = true;
@@ -160,7 +166,14 @@ export class NotchVoice {
           } else if (this.speechDetected) {
             this.silentMs += chunkMs;
             if (this.silentMs >= (this.options.silenceMs ?? DEFAULT_SILENCE_MS) && !this.captureFinished) {
-              void this.stopAndSend().catch(() => undefined);
+              const onUtterance = this.options.onUtterance;
+              if (onUtterance) {
+                void this.stopAndTranscribe()
+                  .then((text) => onUtterance(text))
+                  .catch((error: unknown) => this.emitStatus(revision, 'error', error instanceof Error ? error.message : 'Could not transcribe.'));
+              } else {
+                void this.stopAndSend().catch(() => undefined);
+              }
             }
           }
         }

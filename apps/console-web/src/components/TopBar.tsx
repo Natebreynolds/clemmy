@@ -1,4 +1,4 @@
-import { Activity, PanelLeftClose, PanelLeft, Search, Mic } from 'lucide-react';
+import { Activity, PanelLeftClose, PanelLeft, Search } from 'lucide-react';
 import type { PresentedLiveWork } from '@/lib/activity-presentation';
 import type { HomeLiveStatus } from '@/lib/home-prefs';
 import { LiveStatus } from './home/LiveStatus';
@@ -39,7 +39,6 @@ export function TopBar({
   liveUnavailable?: boolean;
 }) {
   const openPalette = () => window.dispatchEvent(new Event('clem:command-palette'));
-  const openVoice = () => window.dispatchEvent(new Event('clem:open-voice'));
   const showLive = liveMode !== 'off' && !liveUnavailable;
 
   return (
@@ -117,21 +116,6 @@ export function TopBar({
         <HealthIndicator />
         <ThemeToggle />
 
-        {/* Peer weight, deliberately. As a FILLED primary button this was the
-            loudest control in the whole shell, which made the console's
-            standing call to action "start a conversation" rather than "show me
-            the work". The voice overlay is unchanged — only its volume is. */}
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={openVoice}
-          aria-label="Talk to Clementine"
-          title="Talk to Clementine"
-          className="gap-2"
-        >
-          <Mic className="h-4 w-4" aria-hidden />
-          <span className="hidden md:inline">Talk</span>
-        </Button>
       </div>
     </header>
   );

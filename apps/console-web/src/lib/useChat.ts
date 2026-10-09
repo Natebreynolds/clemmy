@@ -494,6 +494,9 @@ export interface PendingChatPost {
    *  identity the same way. */
   projectId?: string;
   connectionRequestId?: string;
+  /** Spoken in voice mode: the reply will be read aloud. Not part of the
+   *  request identity. */
+  voice?: true;
 }
 
 export class ChatPostCancelledError extends Error {
@@ -518,7 +521,7 @@ function throwIfChatPostCancelled(signal?: AbortSignal): void {
  * second model/tool run. */
 export function retainPendingChatPost(
   previous: PendingChatPost | null,
-  payload: { input: string; sessionId: string | null; attachments: string[]; taskMode?: TaskMode; agentId?: string; projectId?: string; connectionRequestId?: string },
+  payload: { input: string; sessionId: string | null; attachments: string[]; taskMode?: TaskMode; agentId?: string; projectId?: string; connectionRequestId?: string; voice?: boolean },
   createId: () => string = createChatClientRequestId,
 ): PendingChatPost {
   const taskMode = snapshotTaskMode(payload.taskMode);
@@ -544,6 +547,7 @@ export function retainPendingChatPost(
     ...(agentId ? { agentId } : {}),
     ...(projectId ? { projectId } : {}),
     ...(payload.connectionRequestId ? { connectionRequestId: payload.connectionRequestId } : {}),
+    ...(payload.voice ? { voice: true as const } : {}),
   };
 }
 
@@ -615,7 +619,12 @@ export async function postPendingChatWithRetry(
   while (true) {
     throwIfChatPostCancelled(options.signal);
     try {
-      const result = await transport(
+      // A spoken request names every argument through `voice`; every other
+      // request keeps the exact transport call it always made.
+      const result = pending.voice ? await transport(
+        pending.input, pending.sessionId, pending.attachments, pending.clientRequestId, pending.taskMode,
+        pending.agentId, pending.projectId, pending.connectionRequestId, true,
+      ) : await transport(
         pending.input,
         pending.sessionId,
         pending.attachments,
@@ -2028,7 +2037,7 @@ export function useChat(options?: UseChatOptions) {
     }
   }, [patch]);
 
-  const send = useCallback(async (input: { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string } }, retryRequest?: PendingChatPost) => {
+  const send = useCallback(async (input: { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string }; voice?: boolean }, retryRequest?: PendingChatPost) => {
     if (busy && input.connectionResume) throw new Error('Another turn is running. Your connection is saved; check again when it finishes.');
     const taskMode = snapshotTaskMode(input.connectionResume ? undefined : input.taskMode);
     const activeMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
@@ -2109,6 +2118,7 @@ export function useChat(options?: UseChatOptions) {
         ...(agentId ? { agentId } : {}),
         ...(projectId ? { projectId } : {}),
         ...(input.connectionResume ? { connectionRequestId: input.connectionResume.connectionRequestId } : {}),
+        ...(input.voice ? { voice: true } : {}),
       }, input.connectionResume ? () => input.connectionResume!.clientRequestId : undefined);
       retainPending(pending);
       const body = await postPendingChatWithRetry(pending, {

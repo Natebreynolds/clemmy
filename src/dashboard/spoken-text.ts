@@ -1,19 +1,10 @@
 /**
- * Convert a brain reply (markdown) into TTS-friendly spoken text.
+ * Convert a brain reply (markdown) into speakable text.
  *
- * Used by the one-loop voice surface: the realtime model is asked to speak the
- * brain's reply verbatim, so we must strip markdown first (otherwise it reads
- * "asterisk asterisk", bullet characters, raw URLs, etc.) and split into
- * sentences so the first sentence can be spoken the moment it streams.
- *
- * NOTE: the harness already runs scrubInternalNarration() on the reply
- * server-side (loop.ts), so this layer only handles markdown + sentence
- * splitting. Kept pure + side-effect-free for unit testing.
- *
- * IMPORTANT: the renderer (console.ts CONSOLE_JS template) inlines a byte-for-
- * byte mirror of stripMarkdownForSpeech/toSpokenSentences because that code
- * runs in the browser and cannot import. Keep the two in sync; this module is
- * the tested spec.
+ * Voice mode reads Clem's reply aloud (voice-speech.ts), so markdown must not
+ * be read as punctuation ("asterisk asterisk", bullets, raw URLs) and code is
+ * never read. The harness already scrubs internal narration from the reply
+ * server-side; this layer only handles markdown and sentence splitting. Pure.
  */
 
 import { splitSentences } from '../runtime/harness/scrub-internal-narration.js';

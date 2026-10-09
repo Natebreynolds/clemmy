@@ -120,7 +120,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
     bottomRef.current?.scrollIntoView({ behavior: chat.busy ? 'auto' : 'smooth', block: 'end' });
   }, [chat.messages, chat.busy]);
 
-  const send = async (input: { text: string; attachmentIds: string[]; attachmentNames: string[]; taskMode?: TaskMode }) => {
+  const send = async (input: { text: string; attachmentIds: string[]; attachmentNames: string[]; taskMode?: TaskMode; voice?: boolean }) => {
     const [addressed, placed] = takesAgent
       ? await Promise.all([
           agentChoice.prepare(chat.sessionId.current, chat.busy),
@@ -187,7 +187,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
         </div>
       </div>
       <div className={CHAT_COMPOSER_WRAP}>
-        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} agentSlot={takesAgent ? <><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} started /><AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} started /></> : undefined} agentId={takesAgent ? agentChoice.chosen?.id ?? null : undefined} applyAgent={takesAgent ? () => agentChoice.prepare(chat.sessionId.current, chat.busy) : undefined} placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : undefined} />
+        <Composer inputRef={composerRef} voiceMessages={chat.messages} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} agentSlot={takesAgent ? <><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} started /><AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} started /></> : undefined} agentId={takesAgent ? agentChoice.chosen?.id ?? null : undefined} applyAgent={takesAgent ? () => agentChoice.prepare(chat.sessionId.current, chat.busy) : undefined} placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : undefined} />
       </div>
     </div>
     </FileDockWorkspace>

@@ -1,13 +1,23 @@
 import type { ComposerMode, TaskMode } from '@/lib/task-mode';
 import { ModelPicker } from '@/components/chat/ModelPicker';
-import { useRef, useState, useCallback, type KeyboardEvent, type ChangeEvent, type ReactNode, type RefObject } from 'react';
-import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack, Mic } from 'lucide-react';
+import { useEffect, useId, useRef, useState, useCallback, type KeyboardEvent, type ChangeEvent, type ReactNode, type RefObject } from 'react';
+import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack, Mic, AudioLines } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { uploadAttachment } from '@/lib/chat';
 import { useDictation } from '@/lib/use-dictation';
+import { useVoiceMode, voiceMode, type VoiceChatMessage, type VoicePhase } from '@/lib/voice-mode';
 import { cn } from '@/lib/cn';
 
 const MAX_BYTES = 30 * 1024 * 1024;
+
+/** What voice mode is doing, in a few words under the composer. */
+const VOICE_PHASE_WORDS: Record<VoicePhase, string> = {
+  off: '',
+  listening: 'Listening… talk, then pause.',
+  transcribing: 'Got it…',
+  thinking: 'Clem is on it…',
+  speaking: 'Clem is talking.',
+};
 
 interface Attachment {
   localId: string;
@@ -36,6 +46,7 @@ export function Composer({
   agentSlot,
   agentId,
   applyAgent,
+  voiceMessages,
 }: {
   busy: boolean;
   mode?: ComposerMode;
@@ -46,7 +57,7 @@ export function Composer({
   pendingPost?: { input: string; taskMode?: TaskMode } | null;
   onRetryPending?: () => Promise<void>;
   onCancelPending?: () => Promise<void>;
-  onSend: (input: { text: string; attachmentIds: string[]; attachmentNames: string[]; taskMode?: TaskMode }) => Promise<void> | void;
+  onSend: (input: { text: string; attachmentIds: string[]; attachmentNames: string[]; taskMode?: TaskMode; voice?: boolean }) => Promise<void> | void;
   onStop: () => void;
   /** Detach the running turn to a durable background task (keeps the chat free). */
   onBackground?: () => void;
@@ -62,6 +73,9 @@ export function Composer({
   /** Apply the agent chip's choice now, so a model picked in this
    *  conversation is the one that answers it. */
   applyAgent?: () => Promise<unknown>;
+  /** This composer's conversation, for voice mode: when given, the owner can
+   *  talk to Clem here and hear what she says back in it. */
+  voiceMessages?: readonly VoiceChatMessage[];
 }) {
   const [value, setValue] = useState('');
   const [deliveryError, setDeliveryError] = useState('');
@@ -74,6 +88,44 @@ export function Composer({
     value,
     (next) => { setValue(next); autoGrow(); },
   );
+  const voiceOwner = useId();
+  const voice = useVoiceMode();
+  // On is the owner's switch; this composer shows the controls while it is
+  // the conversation voice mode is working in.
+  const voiceOn = voice.enabled;
+  const voiceHere = voiceOn && voice.surface === voiceOwner;
+  const voiceSend = useCallback((text: string) => onSend({
+    text,
+    attachmentIds: [],
+    attachmentNames: [],
+    taskMode: busy ? activeTaskMode : { version: 1, kind: mode },
+    voice: true,
+  }), [onSend, busy, activeTaskMode, mode]);
+  const voiceSendRef = useRef(voiceSend);
+  voiceSendRef.current = voiceSend;
+  const voiceSupported = Boolean(voiceMessages);
+  useEffect(() => {
+    if (!voiceSupported) return undefined;
+    voiceMode.attach(voiceOwner, (text) => voiceSendRef.current(text), []);
+    return () => voiceMode.detach(voiceOwner);
+  }, [voiceOwner, voiceSupported]);
+  useEffect(() => { if (voiceMessages) voiceMode.observe(voiceOwner, voiceMessages); }, [voiceOwner, voiceMessages]);
+  useEffect(() => {
+    if (!voiceHere) return;
+    // Esc stops Clem mid-sentence; pressed again (or while she listens) it
+    // ends voice mode.
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (voiceMode.getSnapshot().phase === 'speaking') voiceMode.interrupt(); else voiceMode.disable();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [voiceHere]);
+  const toggleVoice = () => {
+    if (voiceOn) { voiceMode.disable(); return; }
+    stopDictation();
+    voiceMode.enable(voiceOwner, (text) => voiceSendRef.current(text), voiceMessages ?? []);
+  };
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -121,6 +173,10 @@ export function Composer({
     setAttachments((p) => p.filter((a) => a.localId !== localId));
 
   const uploading = attachments.some((a) => a.status === 'uploading');
+  const hasDraft = value.trim().length > 0 || attachments.length > 0;
+  // Like the send button's other face: offered on an empty composer, gone
+  // once the owner types or dictates.
+  const voiceAvailable = Boolean(dictation && voiceMessages) && !listening && !transcribing;
   const readyIds = attachments.filter((a) => a.status === 'ready' && a.id).map((a) => a.id!);
   // Mid-run steering: TEXT can be sent while Clem is working — it reaches her
   // at the next step without stopping the run. Attachments still wait for the
@@ -279,7 +335,7 @@ export function Composer({
 
         {/* Offered only where this computer can record the microphone; the
             words are transcribed on this computer (use-dictation.ts). */}
-        {dictation && (
+        {dictation && !voiceHere && (
           <Button
             variant="ghost"
             size="icon"
@@ -334,6 +390,20 @@ export function Composer({
               <Square className="h-3 w-3 fill-current" aria-hidden />
             </button>
           </>
+        ) : voiceAvailable && !hasDraft ? (
+          // The main button is voice mode while there is nothing to send:
+          // talk to Clem here and hear her answer (voice-mode.ts).
+          <button
+            type="button"
+            onClick={toggleVoice}
+            aria-label={voiceOn ? 'End voice mode' : 'Talk with Clem'}
+            aria-pressed={voiceOn}
+            title={voiceOn ? 'End voice mode' : 'Talk with Clem — she answers out loud'}
+            className={cn('grid h-9 w-9 place-items-center rounded-full bg-primary text-primary-fg transition-[transform,background-color,box-shadow] duration-fast hover:bg-primary-hover active:scale-press',
+              voiceOn && 'ring-4 ring-primary/20')}
+          >
+            <AudioLines className={cn('h-[18px] w-[18px]', voiceOn && (voice.phase === 'listening' || voice.phase === 'speaking') && 'animate-breathe')} strokeWidth={2.25} aria-hidden />
+          </button>
         ) : (
           <button
             type="button"
@@ -348,7 +418,17 @@ export function Composer({
         )}
       </div>
     </div>
-    <p className="mt-2 text-center text-caption text-faint" role="status">{hint}</p>
+    {voiceHere ? (
+      <p className="mt-2 flex items-center justify-center gap-2 text-center text-caption text-muted" role="status">
+        <span>{voice.error || VOICE_PHASE_WORDS[voice.phase]}</span>
+        {voice.phase === 'speaking' && (
+          <button type="button" onClick={() => voiceMode.interrupt()} className="cursor-pointer font-medium text-primary underline-offset-2 hover:underline">Interrupt</button>
+        )}
+        <button type="button" onClick={() => voiceMode.disable()} className="cursor-pointer text-faint underline-offset-2 hover:text-fg hover:underline">End voice</button>
+      </p>
+    ) : (
+      <p className="mt-2 text-center text-caption text-faint" role="status">{voice.error && !voice.enabled ? voice.error : hint}</p>
+    )}
     </div>
   );
 }

@@ -5,7 +5,6 @@ import { Sidebar, readSidebarCollapsed, writeSidebarCollapsed } from './Sidebar'
 import { TopBar } from './TopBar';
 import { CommandPalette } from './CommandPalette';
 import { CustomizePanel } from './home/CustomizePanel';
-import { VoiceOverlay } from './VoiceOverlay';
 import { UpdaterBanner } from './UpdaterBanner';
 import { ErrorBoundary } from './ErrorBoundary';
 import { LocalRecordingBanner } from './LocalRecordingBanner';
@@ -168,7 +167,6 @@ export function AppShell() {
 
       <CommandPalette />
       <CustomizePanel />
-      <VoiceOverlay />
       <UpdaterBanner />
     </div>
   );
