@@ -21,6 +21,10 @@ test('macOS host facts name the BSD tools, for every model and in the shell tool
   assert.ok(shellCwdGuidance('darwin').startsWith(renderHostExecutionContext('darwin')));
   assert.doesNotMatch(shellCwdGuidance('win32'), /BSD/);
   assert.doesNotMatch(shellCwdGuidance('linux'), /^HOST EXECUTION/);
+  // Finding a file by name goes to the Spotlight index, not a home-folder walk.
+  assert.match(renderHostExecutionContext('darwin'), /mdfind -name/);
+  assert.match(shellCwdGuidance('darwin'), /mdfind -name/);
+  assert.doesNotMatch(renderHostExecutionContext('win32'), /mdfind/);
 });
 
 test('the live tool definition carries current-host guidance and Windows permission errors get Windows remedies', async () => {
