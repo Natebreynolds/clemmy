@@ -470,3 +470,23 @@ export const patchWatch = (id: string, p: { enabled?: boolean; cadenceMinutes?: 
   patch<{ watch: WatchStatus }>(`/api/console/watches/${encodeURIComponent(id)}`, p);
 export const tickWatch = (id: string) =>
   apiPost<{ tick: WatchFinding & { judged: number; duplicatesSuppressed: number }; watch: WatchStatus }>(`/api/console/watches/${encodeURIComponent(id)}/tick`, {});
+
+// Computer access: the owner's one-time choice of what Clem may reach on this
+// computer, and the operating system's own gates for it.
+export type ComputerAccessChoice = 'full' | 'standard';
+export interface ComputerAccessStatus {
+  choice: ComputerAccessChoice;
+  chosen: boolean;
+  platform: 'mac' | 'windows' | 'other';
+  mac?: { fullDiskAccess: 'granted' | 'not_granted' | 'unknown' };
+  windows?: { controlledFolderAccess: 'off' | 'on' | 'audit' | 'unknown'; appAllowed: boolean | null };
+}
+export interface FolderAccessResult { label: string; folder: string; state: 'allowed' | 'denied' | 'missing' | 'unknown' }
+export const getComputerAccess = () =>
+  apiGet<{ access: ComputerAccessStatus }>('/api/console/settings/computer-access');
+export const setComputerAccess = (choice: ComputerAccessChoice) =>
+  patch<{ access: ComputerAccessStatus }>('/api/console/settings/computer-access', { choice });
+export const openComputerAccessPage = (page: 'full_disk_access' | 'controlled_folders') =>
+  apiPost<{ opened: boolean }>('/api/console/settings/computer-access/open', { page });
+export const requestFolderAccess = () =>
+  apiPost<{ folders: FolderAccessResult[] }>('/api/console/settings/computer-access/folders', {});

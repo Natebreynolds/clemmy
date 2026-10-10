@@ -15,6 +15,7 @@ import { ProfileForm } from './settings/ProfileForm';
 import { NotificationsEditor } from './settings/NotificationsEditor';
 import { ModelsSection } from './settings/ModelsRoutingSection';
 import { DeveloperModeCard } from './settings/DeveloperModeCard';
+import { ComputerAccessCard } from './settings/ComputerAccessCard';
 import { NotchSettingsCard } from './settings/NotchSettingsCard';
 import { CleanupCard } from './settings/CleanupCard';
 import { StorageCard } from './settings/StorageCard';
@@ -39,6 +40,7 @@ const NAV_GROUPS: { group: string; items: { id: string; label: string }[] }[] = 
   { group: 'Clementine', items: [
     { id: 'accounts', label: 'Model accounts' },
     { id: 'who-does-what', label: 'Who does what' },
+    { id: 'computer-access', label: 'Computer access' },
   ] },
   { group: 'You', items: [
     { id: 'profile', label: 'Profile' },
@@ -88,6 +90,10 @@ export function Settings() {
         <div className="mx-auto flex w-full max-w-[760px] flex-col gap-8">
           <p className="-mb-4 text-caption font-semibold uppercase tracking-widest text-faint">Clementine</p>
           <ModelsSection />
+          <section id="computer-access" className="scroll-mt-16">
+            <h2 className="mb-3 text-h2 text-fg">Computer access</h2>
+            <ComputerAccessCard />
+          </section>
           <p className="-mb-4 text-caption font-semibold uppercase tracking-widest text-faint">You</p>
           <section id="profile" className="scroll-mt-16"><h2 className="mb-3 text-h2 text-fg">Profile</h2><ProfileForm /></section>
           <section id="notifications" className="scroll-mt-16"><NotificationsEditor /></section>
