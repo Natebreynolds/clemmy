@@ -1,12 +1,14 @@
 import type { ComposerMode, TaskMode } from '@/lib/task-mode';
 import { ModelPicker } from '@/components/chat/ModelPicker';
-import { useEffect, useId, useRef, useState, useCallback, type KeyboardEvent, type ChangeEvent, type ReactNode, type RefObject } from 'react';
+import { useEffect, useId, useRef, useState, useCallback, useSyncExternalStore, type KeyboardEvent, type ChangeEvent, type ReactNode, type RefObject } from 'react';
 import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack, Mic, AudioLines } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { uploadAttachment } from '@/lib/chat';
 import { useDictation } from '@/lib/use-dictation';
 import { useVoiceMode, voiceMode, type VoiceChatMessage, type VoicePhase } from '@/lib/voice-mode';
 import { cn } from '@/lib/cn';
+import { useLocation } from 'react-router-dom';
+import { readComposerDraft, writeComposerDraft, handoffComposerDraft, newComposerDraftKey, subscribeComposerDraft, type DraftAttachment as Attachment } from '@/lib/composer-drafts';
 
 const MAX_BYTES = 30 * 1024 * 1024;
 
@@ -18,14 +20,6 @@ const VOICE_PHASE_WORDS: Record<VoicePhase, string> = {
   thinking: 'Clem is on it…',
   speaking: 'Clem is talking.',
 };
-
-interface Attachment {
-  localId: string;
-  name: string;
-  status: 'uploading' | 'ready' | 'error';
-  id?: string;
-  error?: string;
-}
 
 let localSeq = 0;
 
@@ -77,7 +71,23 @@ export function Composer({
    *  talk to Clem here and hear what she says back in it. */
   voiceMessages?: readonly VoiceChatMessage[];
 }) {
-  const [value, setValue] = useState('');
+  const location = useLocation();
+  const newChat = (location.state as { newChat?: number } | null)?.newChat;
+  const routeDraftKey = newComposerDraftKey(location.pathname, location.key, newChat);
+  const draftKey = sessionId ? `session:${sessionId}` : routeDraftKey;
+  const draftOwner = useRef({ draftKey: routeDraftKey, sessionId });
+  useEffect(() => {
+    const next = { draftKey: routeDraftKey, sessionId };
+    handoffComposerDraft(draftOwner.current, next);
+    draftOwner.current = next;
+  }, [routeDraftKey, sessionId]);
+  const draft = useSyncExternalStore(subscribeComposerDraft, () => readComposerDraft(draftKey));
+  const value = draft.text;
+  const setValue = (text: string) => writeComposerDraft(draftKey, current => ({ ...current, text }));
+  const attachments = draft.attachments;
+  const setAttachments = useCallback((update: Attachment[] | ((previous: Attachment[]) => Attachment[])) => {
+    writeComposerDraft(draftKey, current => ({ ...current, attachments: typeof update === 'function' ? update(current.attachments) : update }));
+  }, [draftKey]);
   const [deliveryError, setDeliveryError] = useState('');
   const recover = (action?: () => Promise<void>) => { setDeliveryError(''); void action?.().catch(error => setDeliveryError(error instanceof Error ? error.message : 'Request could not be confirmed.')); };
   const [localMode, setLocalMode] = useState<ComposerMode>('normal');
@@ -126,7 +136,6 @@ export function Composer({
     stopDictation();
     voiceMode.enable(voiceOwner, (text) => voiceSendRef.current(text), voiceMessages ?? []);
   };
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const localTextarea = useRef<HTMLTextAreaElement>(null);
@@ -162,7 +171,7 @@ export function Composer({
             : a));
         });
     }
-  }, []);
+  }, [setAttachments]);
 
   const onFilePick = (e: ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) addFiles(e.target.files);

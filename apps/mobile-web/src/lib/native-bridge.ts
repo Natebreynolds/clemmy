@@ -23,6 +23,8 @@ export type ConnectionDoor = 'direct' | 'relay' | 'offline';
 
 declare global {
   interface Window {
+    /** Native navigation/download support for completed-file previews. */
+    clemArtifactFiles?: boolean;
     clemNative?: {
       registerApnsToken(deviceToken: string, environment?: string): void;
       /** Called by the shell's pull-to-refresh. */

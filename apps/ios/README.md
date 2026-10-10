@@ -97,6 +97,17 @@ BadDeviceToken and nothing arrives).
 
 ## Current scope / known gaps
 
+- Completed HTML/PDF previews and file saving require a native build containing
+  `clemArtifactFiles`. Older shells keep text/image previews and explain the
+  update requirement instead of opening a blocked frame. The daemon/mobile-web
+  hotpatch alone cannot update the iPhone's navigation policy.
+- Artifact frames accept only local blobs made by the paired `/m` page, or its
+  sandboxed `about:srcdoc` document. Top-frame, popup and bridge origin policies
+  are unchanged. Downloads use already authenticated blob bytes, are bounded
+  to 25 MiB, and open the system Save/Share sheet; no new network/auth path or
+  device permission is introduced. Verify HTML, multipage PDF, Save to Files,
+  returning to the same chat/draft, and rejection of untrusted frames on a
+  physical iPhone before distributing the native build.
 - On Wi-Fi, Clem tries the paired Mac directly before its relay. On cellular
   or another off-LAN path, it probes the paired relay first. The relay is only
   a byte tunnel: the native shell still pins the Mac's TLS identity, and the

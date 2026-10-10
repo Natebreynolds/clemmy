@@ -103,7 +103,7 @@ export function requestHeaders(init?: RequestInit): Record<string, string> {
   };
 }
 
-export async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+async function request(path: string, init: RequestInit | undefined, format: 'json' | 'blob'): Promise<unknown> {
   const opts: RequestInit = {
     credentials: 'same-origin',
     ...init,
@@ -116,7 +116,9 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
   let res: Response;
   try {
     res = await fetch(path, opts);
-  } catch {
+  } catch (error) {
+    // Closing a preview cancels its read; that does not mean the Mac went offline.
+    if (init?.signal?.aborted) throw error;
     // A transport failure is a fact about the network, not about the request.
     // Reaching the daemon again is the recovery, so say so and let the shell
     // and the UI show one honest "can't reach your Mac" state.
@@ -153,9 +155,12 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
   // this is the second lock on the same door.)
   const rotatedFp = lastGoodStamp ? null : res.headers.get('x-clem-session-fp');
   if (rotatedFp) sessionFingerprint = rotatedFp;
-  const text = await res.text();
   let body: unknown = null;
-  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  if (res.ok && format === 'blob') body = await res.blob();
+  else {
+    const text = await res.text();
+    try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  }
   if (res.status === 401) {
     // ONE 401 IS NOT A SIGN-OUT (live 2026-08-26: a single rotation-race 401
     // among six healthy same-second requests bounced a paired phone to the
@@ -195,7 +200,19 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
         : `HTTP ${res.status}`;
     throw makeError(res.status, body, message);
   }
-  return body as T;
+  return body;
+}
+
+export async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+  return await request(path, init, 'json') as T;
+}
+
+/** File reads keep the same device proof, rotation and recovery as JSON reads.
+ * A bare iframe URL cannot carry the phone's proof, so previews use local URLs. */
+export async function apiBlob(path: string, init?: RequestInit): Promise<Blob> {
+  const headers = new Headers(requestHeaders(init));
+  headers.set('accept', '*/*');
+  return await request(path, { ...init, headers }, 'blob') as Blob;
 }
 
 export interface AuthStatus {

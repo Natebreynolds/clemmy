@@ -20,6 +20,7 @@
     "cytoscape-fcose": "^2.2.0",
     "framer-motion": "^11.11.17",
     "lucide-react": "^0.468.0",
+    "pdfjs-dist": "6.4.299",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-force-graph-3d": "^1.29.1",

@@ -22,7 +22,7 @@ import { test } from 'node:test';
 /** Minimal history double, installed before the module is imported. */
 let pushed: unknown[] = [];
 let backCalls = 0;
-let popListener: (() => void) | null = null;
+let popListener: ((event?: { state: unknown }) => void) | null = null;
 
 (globalThis as Record<string, unknown>).window = {
   history: {
@@ -30,10 +30,11 @@ let popListener: (() => void) | null = null;
     back: () => {
       backCalls += 1;
       // A real back() over a same-document entry fires popstate.
-      popListener?.();
+      pushed.pop();
+      popListener?.({ state: pushed.at(-1) ?? null });
     },
   },
-  addEventListener: (type: string, fn: () => void) => {
+  addEventListener: (type: string, fn: (event?: { state: unknown }) => void) => {
     if (type === 'popstate') popListener = fn;
   },
 };
@@ -111,6 +112,44 @@ test('nested depth unwinds one level per gesture', async () => {
   assert.deepEqual(closed, ['detail'], 'the innermost view closes first');
   assert.equal(_backGestureDepthForTest(), 1, 'the outer view is still open');
   await settle();
+});
+
+test('tapping Done in a nested sheet retains its chat and the next swipe closes only that chat', async () => {
+  reset();
+  const closed: string[] = [];
+  openBackEntry(() => closed.push('chat'));
+  const sheet = openBackEntry(() => closed.push('files'));
+  closeBackEntry(sheet);
+  assert.deepEqual(closed, [], 'Files was closed by its button; neither view closes again on popstate');
+  assert.equal(_backGestureDepthForTest(), 1, 'the chat and its draft remain mounted');
+  assert.equal(backCalls, 1);
+  await settle();
+  pushed.pop();
+  popListener!({ state: null });
+  assert.deepEqual(closed, ['chat']);
+  assert.equal(_backGestureDepthForTest(), 0);
+  assert.equal(backCalls, 1, 'the real swipe does not request a second history traversal');
+  await settle();
+});
+
+test('a delayed programmatic pop does not consume the surviving parent registration', async () => {
+  reset();
+  const history = (globalThis as Record<string, any>).window.history;
+  const originalBack = history.back;
+  let chatClosed = false;
+  const chat = openBackEntry(() => { chatClosed = true; });
+  const sheet = openBackEntry(() => {});
+  try {
+    history.back = () => { backCalls += 1; };
+    closeBackEntry(sheet);
+    assert.equal(_backGestureDepthForTest(), 1);
+    await settle();
+    popListener!({ state: { clemBackId: chat } });
+    assert.equal(chatClosed, false);
+    assert.equal(_backGestureDepthForTest(), 1);
+  } finally {
+    history.back = originalBack;
+  }
 });
 
 test('a swipe with nothing open is inert', () => {

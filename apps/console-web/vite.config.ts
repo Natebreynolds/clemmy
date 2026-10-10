@@ -1,6 +1,35 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'node:path';
+import { readFileSync, readdirSync } from 'node:fs';
+
+/** Keep PDF decoding assets local, versioned and available in dev and builds. */
+function pdfAssets(): Plugin {
+  const root = path.resolve(__dirname, 'node_modules/pdfjs-dist');
+  const pdfjsPackage = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')) as { version: string };
+  const files = new Map<string, Buffer>();
+  files.set(`assets/pdfjs-${pdfjsPackage.version}/LICENSE`, readFileSync(path.join(root, 'LICENSE')));
+  for (const directory of ['cmaps', 'standard_fonts', 'wasm', 'iccs']) {
+    for (const name of readdirSync(path.join(root, directory))) {
+      if (name.startsWith('LICENSE') || /\.(?:bcmap|pfb|ttf|wasm|js|icc)$/.test(name)) {
+        files.set(`assets/pdfjs-${pdfjsPackage.version}/${directory}/${name}`, readFileSync(path.join(root, directory, name)));
+      }
+    }
+  }
+  return {
+    name: 'clem-pdf-assets',
+    generateBundle() { for (const [fileName, source] of files) this.emitFile({ type: 'asset', fileName, source }); },
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const requested = (req.url ?? '').split('?')[0].replace(/^\/console\//, '');
+        const bytes = files.get(requested);
+        if (!bytes) { next(); return; }
+        res.setHeader('Content-Type', requested.endsWith('.js') ? 'text/javascript' : requested.endsWith('.wasm') ? 'application/wasm' : 'application/octet-stream');
+        res.end(bytes);
+      });
+    },
+  };
+}
 
 // Served by the Clementine daemon at /console — see
 // src/dashboard/console-spa.ts. Base path is kept as /console/ so the
@@ -8,7 +37,7 @@ import path from 'node:path';
 // keep resolving exactly as the legacy console did.
 export default defineConfig({
   base: '/console/',
-  plugins: [react()],
+  plugins: [react(), pdfAssets()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, 'src'),

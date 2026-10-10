@@ -85,6 +85,7 @@ export interface ActivityItem {
   };
   /** kind 'event' deliverable rows: the latest file folded in, by basename. */
   deliverable?: { name: string; dir: string };
+  deliverables?: Array<{ name: string; dir: string }>;
   /** kind 'check' verdict rows: the review's decision as a fact. */
   verdict?: 'passed' | 'rejected' | 'unreviewed';
   /** The model-phase row only: the routed model's display name. */

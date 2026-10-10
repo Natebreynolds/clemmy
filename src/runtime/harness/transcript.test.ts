@@ -438,3 +438,57 @@ test('the owner\'s card answers read the same on the daemon and in the shared ch
   const engine = await import('../../../packages/chat-engine/src/types.js');
   assert.deepEqual(daemon.APPROVAL_ANSWER_WORDS, engine.APPROVAL_ANSWER_WORDS);
 });
+
+test('recorded files reopen on their exact reply, retain distinct folders, and coexist with workflow cards', () => {
+  const session = createSession({ kind: 'chat', title: 'saved file cards' });
+  const first = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Make the drafts.' } });
+  const save = (sourceUserSeq: number, name: string, dir: string) => appendEvent({
+    sessionId: session.id, turn: 0, role: 'system', type: 'deliverable_saved', data: { sourceUserSeq, name, dir },
+  });
+  save(first.seq, 'email.html', 'out');
+  save(first.seq, 'brief.pdf', 'out');
+  save(first.seq, 'email.html', 'other');
+  save(first.seq, 'email.html', 'out');
+  appendEvent({ sessionId: session.id, turn: 0, role: 'system', type: 'workflow_saved', data: {
+    sourceUserSeq: first.seq, slug: 'draft-reports', name: 'Draft reports', op: 'created', enabled: false,
+    steps: [], changedStepIds: [], addedStepIds: [], removedStepIds: [],
+  } });
+  appendTypedTerminal(session.id, first.seq, 'The draft files are ready.');
+  const second = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Explain the plan.' } });
+  save(first.seq, 'late.txt', 'out'); // The asynchronous write tee still belongs to the first source.
+  save(999999, 'unbound.txt', 'out');
+  save(second.seq, '../private.txt', 'out');
+  save(second.seq, 'private.txt', '/private');
+  appendEvent({ sessionId: session.id, turn: 0, role: 'user', type: 'deliverable_saved', data: { sourceUserSeq: second.seq, name: 'invented.txt', dir: 'out' } });
+  appendTypedTerminal(session.id, second.seq, 'I mentioned plan.md, but did not save it.');
+  const turns = reconstructHarnessTranscript(session.id);
+  assert.deepEqual(turns[1]?.files, [
+    { name: 'brief.pdf', dir: 'out' }, { name: 'email.html', dir: 'other' },
+    { name: 'email.html', dir: 'out' }, { name: 'late.txt', dir: 'out' },
+  ]);
+  assert.equal(turns[1]?.workflows?.[0]?.slug, 'draft-reports');
+  assert.equal(turns[0]?.files, undefined);
+  assert.equal(turns[2]?.files, undefined);
+  assert.equal(turns[3]?.files, undefined, 'prose, unsafe paths, unbound and user-authored facts do not create receipts');
+});
+
+test('legacy file facts attach only inside one completed sequence window, never overlapping or unbound turns', () => {
+  const session = createSession({ kind: 'chat', title: 'legacy saved files' });
+  const ask = (text: string) => appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
+  const save = (name: string, data = {}) => appendEvent({ sessionId: session.id, turn: 0, role: 'system', type: 'deliverable_saved', data: { name, dir: 'out', ...data } });
+  save('before-source.pdf');
+  const first = ask('First output');
+  save('first.pdf');
+  appendTypedTerminal(session.id, first.seq, 'First is ready.');
+  save('between-turns.pdf');
+  const second = ask('Second output');
+  const third = ask('Overlapping output');
+  save('ambiguous.pdf');
+  save('invalid-source.pdf', { sourceUserSeq: -1 });
+  appendTypedTerminal(session.id, second.seq, 'Second is ready.');
+  appendTypedTerminal(session.id, third.seq, 'Third is ready.');
+  ask('Still running');
+  save('unfinished.pdf');
+  const turns = reconstructHarnessTranscript(session.id);
+  assert.deepEqual(turns.filter(turn => turn.files?.length).map(turn => turn.files), [[{ name: 'first.pdf', dir: 'out' }]]);
+});

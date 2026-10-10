@@ -1,3 +1,4 @@
+import { handoffComposerDraft, newComposerDraftKey } from '@/lib/composer-drafts';
 import { CliSessions } from '@/components/chat/CliSessions';
 import { CloudBrowserWorkspace } from '@/components/chat/CloudBrowserDock';
 import { FileDockWorkspace } from '@/components/chat/FileDock';
@@ -107,6 +108,16 @@ export function Chat() {
   });
   const agent = agentChoice.chosen;
   const location = useLocation();
+  // This owner outlives the empty/thread composer swap and the file workspace.
+  // Transfer text typed while the first send is assigning its server session.
+  const unsentDraftKey = newComposerDraftKey(location.pathname, location.key, (location.state as { newChat?: number } | null)?.newChat);
+  const assignedSessionId = chat.sessionId.current;
+  const draftOwner = useRef({ draftKey: unsentDraftKey, sessionId: assignedSessionId });
+  useEffect(() => {
+    const next = { draftKey: unsentDraftKey, sessionId: assignedSessionId };
+    handoffComposerDraft(draftOwner.current, next);
+    draftOwner.current = next;
+  }, [assignedSessionId, unsentDraftKey]);
   // "New conversation in this project" arrives with the project already
   // chosen; the first message opens the conversation inside it.
   const projectChoice = useConversationProject(openedInProject(location.state), {

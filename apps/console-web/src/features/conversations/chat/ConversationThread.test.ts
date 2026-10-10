@@ -42,3 +42,25 @@ test('a reopened conversation keeps who answered each exchange and draws the swi
   assert.deepEqual(marks.map((m) => m.switchedTo?.name), [undefined, undefined, 'Instagram Manager', undefined, undefined]);
   assert.equal(marks[3].speaker, 'Instagram Manager');
 });
+
+test('reopened file receipts retain every recorded artifact alongside workflow receipts', () => {
+  const files = [{ name: 'email.html', dir: 'drafts' }, { name: 'brief.pdf', dir: 'reports' }, { name: 'brief.pdf', dir: 'other' }];
+  const messages = historyToMessages([
+    { role: 'user', text: 'Make the documents', createdAt: '2026-10-09T10:00:00.000Z', files },
+    { role: 'assistant', text: 'Saved the documents', createdAt: '2026-10-09T10:01:00.000Z', files, workflows: [{
+      slug: 'report-drafts', name: 'Report drafts', op: 'created', enabled: false,
+      steps: [], changedStepIds: [], addedStepIds: [], removedStepIds: [],
+    }] },
+    { role: 'assistant', text: 'The prose mentions another.pdf', createdAt: '2026-10-09T10:02:00.000Z' },
+  ]);
+  assert.equal(messages[0]?.activity, undefined, 'file receipts belong to assistant replies');
+  assert.equal(messages[2]?.activity, undefined, 'prose does not invent a file receipt');
+  const activity = messages[1]?.activity;
+  assert.equal(activity?.length, 2);
+  assert.equal(activity?.[0]?.workflow?.slug, 'report-drafts');
+  const saved = activity?.find(row => row.id === 'deliverables');
+  assert.deepEqual(saved?.deliverables, files);
+  assert.deepEqual(saved?.deliverable, { name: 'brief.pdf', dir: 'other' });
+  assert.equal(saved?.count, 3);
+  assert.equal(saved?.status, 'done');
+});

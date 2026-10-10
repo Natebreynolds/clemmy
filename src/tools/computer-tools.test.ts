@@ -194,6 +194,28 @@ test('write_file create refuses to clobber an existing file', async () => {
   assert.equal(readFileSync(file, 'utf-8'), 'first\n');
 });
 
+test('a saved-file fact keeps the accepted source of the write after asynchronous recording', async () => {
+  const { createSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const { executeLocalFileWrite } = await import('./computer-tools.js');
+  const session = createSession({ kind: 'chat', title: 'file receipt source' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Write a draft.' } });
+  const file = path.join(tmpHome, 'receipt-source.html');
+  await withToolOutputContext({ sessionId: session.id, sourceUserSeq: source.seq }, () => executeLocalFileWrite({
+    path: file, content: '<h1>Draft</h1>', mode: 'create', append: null, find: null,
+  }));
+  let saved = listEvents(session.id, { types: ['deliverable_saved'] });
+  for (let attempt = 0; saved.length === 0 && attempt < 100; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+    saved = listEvents(session.id, { types: ['deliverable_saved'] });
+  }
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0]?.data.sourceUserSeq, source.seq);
+  assert.equal(saved[0]?.data.name, 'receipt-source.html');
+  assert.equal(saved[0]?.data.dir, path.basename(tmpHome));
+  assert.equal(saved[0]?.role, 'system');
+});
+
 test('write_file append preserves existing content', async () => {
   const file = path.join(tmpHome, 'append.md');
   assert.equal(await invokeWrite({ path: file, content: 'alpha', mode: null }), `Wrote ${file} (5 chars).`);

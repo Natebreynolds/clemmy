@@ -312,6 +312,7 @@ function teeFileDeliverable(filePath: string): void {
             role: 'system',
             type: 'deliverable_saved',
             data: {
+              ...(Number.isSafeInteger(ctx.sourceUserSeq) && Number(ctx.sourceUserSeq) > 0 ? { sourceUserSeq: ctx.sourceUserSeq } : {}),
               name: path.basename(filePath),
               dir: path.basename(path.dirname(filePath)),
               bytes,

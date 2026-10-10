@@ -7,31 +7,21 @@ import { chatRailLayout } from './lib/chatRailLayout';
 export { chatRailLayout } from './lib/chatRailLayout';
 
 /**
- * Layout for the Chat experience: the conversation rail beside the active
- * conversation. The rail is COLLAPSIBLE (persisted) — a long history reads as
- * clutter next to the composer, so the user can tuck it away to a slim rail
- * that keeps just "expand" + "new chat". The index route renders the new-chat
- * hero (the existing <Chat/> screen); /chat/:sessionId renders a reopened
- * conversation. Both flow through the <Outlet/>.
+ * Desktop history lives in the global navigator, alongside the user's work.
+ * A narrow window keeps a temporary history overlay so the thread gets the
+ * available width. Both conversation routes share the same Outlet.
  */
-const RAIL_PREF_KEY = 'clem.chat.rail';
 const NARROW_RAIL_QUERY = '(max-width: 767px)';
 
 export function ChatScreen() {
   const navigate = useNavigate();
   const location = useLocation();
-  const [collapsed, setCollapsed] = useState<boolean>(() => {
-    try { return localStorage.getItem(RAIL_PREF_KEY) === 'collapsed'; } catch { return false; }
-  });
   const [narrow, setNarrow] = useState(() => (
     typeof window !== 'undefined' && window.matchMedia(NARROW_RAIL_QUERY).matches
   ));
   const [mobileOpen, setMobileOpen] = useState(false);
   const mobileHistoryButtonRef = useRef<HTMLButtonElement>(null);
-  const setRail = (next: boolean) => {
-    setCollapsed(next);
-    try { localStorage.setItem(RAIL_PREF_KEY, next ? 'collapsed' : 'open'); } catch { /* preference only */ }
-  };
+  const mobileHistoryRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const media = window.matchMedia(NARROW_RAIL_QUERY);
@@ -60,7 +50,7 @@ export function ChatScreen() {
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [closeMobileHistory, mobileOpen]);
 
-  const layout = chatRailLayout(narrow, collapsed, mobileOpen);
+  const layout = chatRailLayout(narrow, mobileOpen);
   const startNewChat = () => {
     setMobileOpen(false);
     navigate('/chat', { state: { newChat: Date.now() } });
@@ -68,30 +58,7 @@ export function ChatScreen() {
 
   return (
     <div className="relative flex h-full min-h-0 overflow-hidden animate-fade-in">
-      {layout === 'desktop-collapsed' ? (
-        <div className="flex h-full w-12 shrink-0 flex-col items-center gap-1.5 border-r border-border bg-surface py-3">
-          <button
-            type="button"
-            title="Show chat history"
-            aria-label="Show chat history"
-            onClick={() => setRail(false)}
-            className="rounded-md p-2 text-muted transition-colors hover:bg-subtle hover:text-fg cursor-pointer"
-          >
-            <PanelLeftOpen className="h-4 w-4" aria-hidden />
-          </button>
-          <button
-            type="button"
-            title="New chat"
-            aria-label="New chat"
-            onClick={startNewChat}
-            className="rounded-md p-2 text-muted transition-colors hover:bg-subtle hover:text-fg cursor-pointer"
-          >
-            <Plus className="h-4 w-4" aria-hidden />
-          </button>
-        </div>
-      ) : layout === 'desktop-open' ? (
-        <ConversationSidebar onCollapse={() => setRail(true)} />
-      ) : (
+      {layout !== 'desktop' && (
         <>
           <div className="absolute left-2 top-2 z-30 flex items-center gap-1 rounded-lg border border-border bg-surface/95 p-1 shadow-md backdrop-blur">
             <button
@@ -116,10 +83,19 @@ export function ChatScreen() {
           </div>
           {layout === 'mobile-overlay' && (
             <div
+              ref={mobileHistoryRef}
               role="dialog"
               aria-modal="true"
               aria-label="Conversation history"
               className="absolute inset-0 z-40 flex"
+              onKeyDown={event => {
+                if (event.key !== 'Tab') return;
+                const elements = [...(mobileHistoryRef.current?.querySelectorAll<HTMLElement>('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])') ?? [])]
+                  .filter(element => element.tabIndex >= 0 && element.getClientRects().length > 0);
+                const first = elements[0]; const last = elements.at(-1);
+                if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+                else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+              }}
             >
               <ConversationSidebar
                 onCollapse={closeMobileHistory}

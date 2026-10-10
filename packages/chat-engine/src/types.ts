@@ -259,6 +259,8 @@ export interface ActivityItem {
    *  that wants to OPEN the file has to resolve it — and must be able to tell
    *  an exact match from an ambiguous one. */
   deliverable?: { name: string; dir: string };
+  /** Every distinct saved file in this turn; the rolling activity row stays compact. */
+  deliverables?: Array<{ name: string; dir: string }>;
   /** kind 'check' verdict rows: what the review decided, as a fact rather
    *  than a label. `unreviewed` means no reviewer ran — never a pass. */
   verdict?: 'passed' | 'rejected' | 'unreviewed';

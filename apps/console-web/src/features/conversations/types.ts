@@ -37,6 +37,8 @@ export interface Session {
 export interface Turn {
   /** Workflows this reply created or changed, as saved; drawn as cards under it. */
   workflows?: WorkflowCardData[];
+  /** Recorded file saves belonging to this reply, resolved by the chat on open. */
+  files?: Array<{ name: string; dir: string }>;
   taskMode?: TaskMode;
   planArtifactRef?: PlanRevisionRef;
   role: 'user' | 'assistant';

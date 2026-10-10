@@ -45,6 +45,57 @@ enum PinnedWebNavigationPolicy {
         return .openExternally
     }
 
+    /// Local previews never widen the normal navigation or bridge policy.
+    /// Only a paired mobile page may create one, and only in a child frame.
+    static func allowsArtifactPreview(
+        for url: URL,
+        pairing: Pairing,
+        mainDocumentURL: URL?,
+        sourceOrigin: URL?,
+        targetIsMainFrame: Bool?
+    ) -> Bool {
+        guard targetIsMainFrame == false,
+              let mainDocumentURL, let sourceOrigin,
+              isTrustedArtifactSource(mainDocumentURL, sourceOrigin, pairing: pairing) else {
+            return false
+        }
+        if url.absoluteString == "about:srcdoc" { return true }
+        return isArtifactBlob(url, createdBy: mainDocumentURL)
+    }
+
+    /// The download attribute converts a local blob into a WKDownload. It
+    /// must never load that blob into the top frame or trust a child frame.
+    static func allowsArtifactDownload(
+        for url: URL,
+        pairing: Pairing,
+        mainDocumentURL: URL?,
+        sourceOrigin: URL?,
+        sourceIsMainFrame: Bool,
+        hasDownloadAttribute: Bool
+    ) -> Bool {
+        guard sourceIsMainFrame, hasDownloadAttribute,
+              let mainDocumentURL, let sourceOrigin,
+              isTrustedArtifactSource(mainDocumentURL, sourceOrigin, pairing: pairing) else {
+            return false
+        }
+        return isArtifactBlob(url, createdBy: mainDocumentURL)
+    }
+
+    private static func isTrustedArtifactSource(_ page: URL, _ source: URL, pairing: Pairing) -> Bool {
+        disposition(for: page, pairing: pairing, userInitiated: false) == .allowInWebView
+            && source.user == nil && source.password == nil
+            && normalizedOrigin(url: page) == normalizedOrigin(url: source)
+    }
+
+    private static func isArtifactBlob(_ url: URL, createdBy page: URL) -> Bool {
+        guard url.scheme == "blob",
+              let embedded = URL(string: String(url.absoluteString.dropFirst(5))),
+              embedded.user == nil, embedded.password == nil,
+              embedded.query == nil, embedded.fragment == nil,
+              UUID(uuidString: String(embedded.path.dropFirst())) != nil else { return false }
+        return normalizedOrigin(url: embedded) == normalizedOrigin(url: page)
+    }
+
     private static func isAllowedMobilePath(_ url: URL) -> Bool {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             return false
@@ -168,6 +219,7 @@ final class WebViewModel: NSObject, ObservableObject {
     private let impactMedium = UIImpactFeedbackGenerator(style: .medium)
     private let notify = UINotificationFeedbackGenerator()
     private let refreshControl = UIRefreshControl()
+    private var artifactDownloads: [ObjectIdentifier: URL] = [:]
 
     init(
         pairing: Pairing,
@@ -178,6 +230,11 @@ final class WebViewModel: NSObject, ObservableObject {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
+        config.userContentController.addUserScript(WKUserScript(
+            source: "window.clemArtifactFiles = true;",
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        ))
         // WKWebView copies its configuration during initialization. Install
         // every JS bridge first, then attach this model after Swift finishes
         // initializing self; otherwise a copied empty controller can silently
@@ -749,6 +806,38 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
             decisionHandler(.cancel)
             return
         }
+        let source = navigationAction.sourceFrame.securityOrigin
+        var sourceURL: URL?
+        // A new/opaque frame can have an empty protocol. URLComponents traps
+        // on that value; it is an untrusted source, not a URL to reconstruct.
+        if source.protocol == "https", !source.host.isEmpty {
+            var sourceComponents = URLComponents()
+            sourceComponents.scheme = "https"
+            sourceComponents.host = source.host
+            sourceComponents.port = source.port > 0 ? source.port : nil
+            sourceURL = sourceComponents.url
+        }
+        if PinnedWebNavigationPolicy.allowsArtifactDownload(
+            for: url,
+            pairing: pairing,
+            mainDocumentURL: webView.url,
+            sourceOrigin: sourceURL,
+            sourceIsMainFrame: navigationAction.sourceFrame.isMainFrame,
+            hasDownloadAttribute: navigationAction.shouldPerformDownload
+        ) {
+            decisionHandler(.download)
+            return
+        }
+        if PinnedWebNavigationPolicy.allowsArtifactPreview(
+            for: url,
+            pairing: pairing,
+            mainDocumentURL: webView.url,
+            sourceOrigin: sourceURL,
+            targetIsMainFrame: navigationAction.targetFrame?.isMainFrame
+        ) {
+            decisionHandler(.allow)
+            return
+        }
         switch PinnedWebNavigationPolicy.disposition(
             for: url,
             pairing: pairing,
@@ -762,6 +851,10 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
         case .cancel:
             decisionHandler(.cancel)
         }
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        download.delegate = self
     }
 
     /// The microphone, for the paired origin only.
@@ -833,6 +926,106 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
             break
         }
         return nil
+    }
+}
+
+enum ArtifactDownloadPolicy {
+    static let maximumBytes: Int64 = 25 * 1024 * 1024
+
+    static func filename(_ suggested: String) -> String {
+        let basename = (suggested.replacingOccurrences(of: "\\", with: "/") as NSString).lastPathComponent
+        let clean = String(basename.unicodeScalars.filter {
+            !CharacterSet.controlCharacters.contains($0) && $0 != ":"
+        }).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, clean != ".", clean != "..", clean.utf8.count <= 240 else { return "File" }
+        return clean
+    }
+}
+
+extension WebViewModel: WKDownloadDelegate {
+    func download(
+        _ download: WKDownload,
+        decideDestinationUsing response: URLResponse,
+        suggestedFilename: String,
+        completionHandler: @escaping (URL?) -> Void
+    ) {
+        // Bytes already came through the page's proof-authenticated request.
+        // WebKit synthesizes this response from its local blob; never initiate
+        // another HTTP request or extend certificate/authentication handling.
+        guard response.url?.scheme == "blob",
+              response.expectedContentLength >= 0,
+              response.expectedContentLength <= ArtifactDownloadPolicy.maximumBytes else {
+            completionHandler(nil)
+            showArtifactDownloadError()
+            return
+        }
+        do {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("Clem-file-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            let destination = directory.appendingPathComponent(ArtifactDownloadPolicy.filename(suggestedFilename))
+            artifactDownloads[ObjectIdentifier(download)] = destination
+            completionHandler(destination)
+        } catch {
+            completionHandler(nil)
+            showArtifactDownloadError()
+        }
+    }
+
+    func download(
+        _ download: WKDownload,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        decisionHandler: @escaping (WKDownload.RedirectPolicy) -> Void
+    ) {
+        decisionHandler(.cancel)
+    }
+
+    func download(
+        _ download: WKDownload,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        completionHandler(.cancelAuthenticationChallenge, nil)
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+        guard let file = artifactDownloads.removeValue(forKey: ObjectIdentifier(download)) else { return }
+        let directory = file.deletingLastPathComponent()
+        guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              Int64(size) <= ArtifactDownloadPolicy.maximumBytes,
+              let presenter = artifactPresenter() else {
+            try? FileManager.default.removeItem(at: directory)
+            showArtifactDownloadError()
+            return
+        }
+        let share = UIActivityViewController(activityItems: [file], applicationActivities: nil)
+        share.completionWithItemsHandler = { _, _, _, _ in
+            try? FileManager.default.removeItem(at: directory)
+        }
+        share.popoverPresentationController?.sourceView = webView
+        share.popoverPresentationController?.sourceRect = CGRect(x: webView.bounds.midX, y: webView.bounds.maxY, width: 1, height: 1)
+        presenter.present(share, animated: true)
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        if let file = artifactDownloads.removeValue(forKey: ObjectIdentifier(download)) {
+            try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+        }
+        showArtifactDownloadError()
+    }
+
+    private func artifactPresenter() -> UIViewController? {
+        guard var controller = webView.window?.rootViewController else { return nil }
+        while let presented = controller.presentedViewController { controller = presented }
+        return controller
+    }
+
+    private func showArtifactDownloadError() {
+        guard let presenter = artifactPresenter(), !(presenter is UIAlertController) else { return }
+        let alert = UIAlertController(title: "Couldn't save this file", message: "Try again, or open the file on your computer.", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        presenter.present(alert, animated: true)
     }
 }
 

@@ -26,19 +26,26 @@ export function ConversationSidebar({
   onCollapse,
   className,
   autoFocusSearch = false,
+  embedded = false,
 }: {
   onCollapse?: () => void;
   className?: string;
   autoFocusSearch?: boolean;
+  /** The global navigator owns New chat; filters here must not edit another screen's URL. */
+  embedded?: boolean;
 } = {}) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const mutations = useSessionMutations();
 
   // Debounced search text mirrored into ?q=.
-  const [search, setSearch] = useState(searchParams.get('q') ?? '');
+  const [search, setSearch] = useState(embedded ? '' : searchParams.get('q') ?? '');
+  const [localQuery, setLocalQuery] = useState('');
+  const [localTag, setLocalTag] = useState('');
+  const [localArchived, setLocalArchived] = useState(false);
   useEffect(() => {
     const t = setTimeout(() => {
+      if (embedded) { setLocalQuery(search.trim()); return; }
       // Nothing to mirror: leave the location alone. Replacing it here on
       // every mount dropped the state a link into Chat arrived with (a new
       // chat opened from another screen fell back to Today).
@@ -51,7 +58,7 @@ export function ConversationSidebar({
       }, { replace: true });
     }, 250);
     return () => clearTimeout(t);
-  }, [search, setSearchParams]);
+  }, [embedded, search, setSearchParams]);
 
   // Which kinds the rail is showing. A view preference, not a query — it
   // persists per-machine the way the rail's own collapsed state does.
@@ -68,16 +75,16 @@ export function ConversationSidebar({
     try { localStorage.setItem(KIND_PREF_KEY, next); } catch { /* preference only */ }
   };
 
-  const tag = searchParams.get('tag') ?? '';
-  const includeArchived = searchParams.get('archived') === '1';
+  const tag = embedded ? localTag : searchParams.get('tag') ?? '';
+  const includeArchived = embedded ? localArchived : searchParams.get('archived') === '1';
   const filters: SessionFilters = useMemo(
     () => ({
-      q: searchParams.get('q') ?? undefined,
+      q: (embedded ? localQuery : searchParams.get('q')) || undefined,
       tag: tag || undefined,
       includeArchived,
       limit: SESSION_PAGE_SIZE,
     }),
-    [searchParams, tag, includeArchived],
+    [embedded, localQuery, searchParams, tag, includeArchived],
   );
 
   const { data, isLoading } = useSessions(filters, kind);
@@ -105,6 +112,11 @@ export function ConversationSidebar({
   const tags = useMemo(() => collectTags(sessions), [sessions]);
 
   const setParam = (key: string, value: string | null) => {
+    if (embedded) {
+      if (key === 'tag') setLocalTag(value ?? '');
+      if (key === 'archived') setLocalArchived(value === '1');
+      return;
+    }
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
       if (value) next.set(key, value);
@@ -127,7 +139,7 @@ export function ConversationSidebar({
       className={cn('flex h-full w-[300px] shrink-0 flex-col border-r border-border bg-surface', className)}
     >
       <div className="space-y-2 border-b border-border p-3">
-        <div className="flex items-center gap-1.5">
+        {!embedded && <div className="flex items-center gap-1.5">
           <Button className="min-w-0 flex-1 rounded-full bg-fg text-canvas hover:bg-fg hover:opacity-90 active:bg-fg" onClick={() => navigate('/chat', { state: { newChat: Date.now() } })}>
             <Plus className="h-4 w-4" /> New chat
           </Button>
@@ -142,7 +154,7 @@ export function ConversationSidebar({
               <PanelLeftClose className="h-4 w-4" aria-hidden />
             </button>
           )}
-        </div>
+        </div>}
         <div className="flex items-center gap-2 rounded-md border border-border bg-canvas px-2.5">
           <Search className="h-4 w-4 shrink-0 text-faint" aria-hidden />
           <input
@@ -150,7 +162,8 @@ export function ConversationSidebar({
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search chats and runs"
-            className="h-9 flex-1 bg-transparent text-small text-fg outline-none placeholder:text-faint"
+            aria-label="Search chats and runs"
+            className="h-9 min-w-0 flex-1 bg-transparent text-small text-fg outline-none placeholder:text-faint"
           />
           {search && (
             <button type="button" aria-label="Clear search" onClick={() => setSearch('')} className="text-faint hover:text-fg">

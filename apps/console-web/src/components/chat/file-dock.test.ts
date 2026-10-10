@@ -25,7 +25,7 @@ test('the card asks for the file by name and folder, never by a path', () => {
 
 test('the panel docks beside the conversation, never over it', () => {
   assert.match(DOCK, /className="file-dock-conversation">\{children\}<\/div>/);
-  assert.match(DOCK, /<aside\s+className="file-dock-panel"/);
+  assert.match(DOCK, /<aside[^>]*className="file-dock-panel"/);
   assert.doesNotMatch(DOCK, /aria-modal|role="dialog"|fixed inset-0/, 'a modal would take the conversation away');
   for (const screen of [CHAT, THREAD]) assert.match(screen, /<FileDockWorkspace conversationId=/);
 });
@@ -39,4 +39,12 @@ test('in a conversation the whole card opens the file or page in the dock', () =
 test('markdown is typeset by the shared escaping renderer; other text stays text', () => {
   assert.match(DOCK, /renderMarkdown\(file\.text, \{ workspaceLinks: false \}\)/);
   assert.match(DOCK, /<pre className="whitespace-pre-wrap/);
+});
+
+
+test('opaque artifact IDs disambiguate equal filenames without trusting paths', () => {
+  const ref = { sessionId: 'fixture', name: 'draft.html', folder: 'out', fileId: 'file-one' };
+  assert.equal(sessionFilePath(ref, 'content'), '/api/console/sessions/fixture/file/content?name=draft.html&folder=out&fileId=file-one');
+  assert.equal(sameSessionFile(ref, { ...ref, fileId: 'file-two' }), false);
+  assert.match(DOCK, /sandbox=""/);
 });

@@ -201,9 +201,12 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     list.set(slug, event.data as unknown as WorkflowSavedEventData);
     workflowsBySource.set(key, list);
   }
-  const withWorkflows = (key: string, turn: UnifiedSessionTurn): UnifiedSessionTurn => {
+  const filesBySource = new Map<string, Map<string, { name: string; dir: string }>>();
+  const withSavedWork = (key: string, turn: UnifiedSessionTurn): UnifiedSessionTurn => {
     const saved = workflowsBySource.get(key);
-    return saved && saved.size > 0 ? { ...turn, workflows: [...saved.values()] } : turn;
+    const files = filesBySource.get(key);
+    return { ...turn, ...(saved?.size ? { workflows: [...saved.values()] } : {}),
+      ...(files?.size ? { files: [...files.values()] } : {}) };
   };
 
   // Who answered each accepted source: its first route marker names the saved
@@ -316,6 +319,41 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     }
   }
 
+  // File-save facts, never filenames inferred from the reply. A separate read
+  // keeps a large set of outputs from shortening the visible turn window.
+  // New records bind to their exact accepted source, including late async tees.
+  // Legacy records have only sequence order: admit them inside exactly one
+  // completed source-to-reply window; overlaps and unbound writes stay in Files.
+  for (const event of listEvents(sessionId, { types: ['deliverable_saved'], limit })) {
+    if (event.role !== 'system') continue;
+    const name = typeof event.data.name === 'string' ? event.data.name : '';
+    const dir = typeof event.data.dir === 'string' ? event.data.dir : '';
+    if (!name.trim() || name === '.' || name === '..' || dir === '.' || dir === '..'
+      || /[\\/\u0000-\u001f\u007f]/.test(name + dir)) continue;
+    let key: string | undefined;
+    if (Object.prototype.hasOwnProperty.call(event.data, 'sourceUserSeq')) {
+      const seq = positiveSeq(event.data.sourceUserSeq);
+      if (!seq) continue;
+      const candidate = sourceKey(event.sessionId, seq);
+      const source = sources.get(candidate);
+      if (!source || source.event.seq >= event.seq) continue;
+      key = candidate;
+    } else {
+      const candidates = [...sources.values()].filter(source => {
+        const reply = assistantBySource.get(source.key);
+        return source.event.sessionId === event.sessionId && source.event.seq < event.seq
+          && reply && event.seq < reply.seq;
+      });
+      if (candidates.length !== 1) continue;
+      key = candidates[0]!.key;
+    }
+    const saved = filesBySource.get(key) ?? new Map<string, { name: string; dir: string }>();
+    const identity = JSON.stringify([name, dir]);
+    saved.delete(identity);
+    saved.set(identity, { name, dir });
+    filesBySource.set(key, saved);
+  }
+
   // Her own messages stand on their own, in the order she sent them. The text
   // is held to the same public floor as her check-ins.
   const fromClem: Unit[] = [];
@@ -350,7 +388,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
         turns: attributed(source.key, [
           ...userTurns,
           ...(checkInsBySource.get(source.key) ?? []),
-          withWorkflows(source.key, {
+          withSavedWork(source.key, {
             role: 'assistant',
             text: assistant.text,
             createdAt: assistant.createdAt,

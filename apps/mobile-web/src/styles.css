@@ -3608,6 +3608,43 @@ textarea:focus-visible,
   padding: 0 16px 8px;
 }
 .sheet-foot { display: flex; align-items: center; gap: var(--sp-3); padding: 10px 16px 0; border-top: 1px solid var(--line); }
+
+/* Saved outputs stay one tap from the conversation; opening one keeps the
+   transcript and composer mounted in place behind this familiar sheet. */
+.chat-files-bar { flex: 0 0 auto; display: flex; align-items: center; margin: -4px 0 4px; }
+.chat-files-trigger { display: inline-flex; align-items: center; gap: 7px; min-height: 44px; padding: 8px 10px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--fg-2); font: inherit; font-size: var(--t-sm); font-weight: 600; }
+.chat-files-trigger:hover, .chat-files-trigger:active { background: var(--bg-3); color: var(--fg); }
+.chat-files-count { min-width: 20px; color: var(--fg-2); font-variant-numeric: tabular-nums; }
+.chat-files-sheet .sheet-body { padding: 0 16px 12px; }
+.chat-files-sheet .sheet-title { font-size: 20px; }
+.chat-files-intro { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 8px; color: var(--fg-2); font-size: var(--t-sm); }
+.chat-files-intro p { margin: 0; }
+.chat-file-action { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 44px; padding: 8px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--accent); font: inherit; font-size: var(--t-sm); font-weight: 650; white-space: nowrap; }
+.chat-file-action:hover, .chat-file-action:active { background: var(--accent-soft); }
+.chat-file-action:disabled { color: var(--fg-2); opacity: .65; }
+.chat-file-list { margin: 0; padding: 0; list-style: none; }
+.chat-file-list li + li { border-top: 1px solid var(--line); }
+.chat-file-row { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 76px; padding: 14px 4px; border: 0; background: transparent; color: var(--fg); text-align: left; }
+.chat-file-row:hover, .chat-file-row:active { background: var(--bg-2); }
+.chat-file-row > svg { flex: 0 0 20px; color: var(--fg-2); }
+.chat-file-row-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 5px; }
+.chat-file-row-copy strong { font-size: var(--t-body); font-weight: 600; overflow-wrap: anywhere; }
+.chat-file-row-copy > span { color: var(--fg-2); font-size: var(--t-xs); overflow-wrap: anywhere; }
+.chat-file-open { flex: 0 0 auto; color: var(--accent); font-size: var(--t-sm); font-weight: 600; }
+.chat-file-empty { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; padding: 32px 8px; color: var(--fg-2); }
+.chat-file-empty p { margin: 0; color: var(--fg); font-size: var(--t-body); font-weight: 600; }
+.chat-file-empty > span { max-width: 36ch; font-size: var(--t-sm); line-height: 1.6; }
+.chat-file-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.chat-file-toolbar .chat-file-action:first-child { margin-left: -8px; }
+.chat-file-heading { margin: 6px 0 16px; }
+.chat-file-heading h3 { margin: 0; font-size: 18px; line-height: 1.4; font-weight: 650; overflow-wrap: anywhere; }
+.chat-file-heading p { margin: 5px 0 0; color: var(--fg-2); font-size: var(--t-xs); }
+.chat-file-frame { display: block; width: 100%; height: min(58dvh, 640px); min-height: 280px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: white; }
+.chat-file-image { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+.chat-file-text { margin: 0; padding: 16px; border-radius: var(--r-sm); background: var(--bg-2); color: var(--fg); font: 13px/1.65 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
+.chat-file-document { overflow-wrap: anywhere; }
+.chat-file-help, .chat-file-notice { margin: 14px 0; color: var(--fg-2); font-size: var(--t-sm); line-height: 1.6; overflow-wrap: anywhere; }
+.chat-file-notice p { margin: 0; }
 @media (min-width: 700px) {
   .sheet { margin-bottom: 18px; border-bottom: 1px solid var(--line); border-radius: 28px; }
 }

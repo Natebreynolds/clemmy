@@ -511,6 +511,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
         // The latest file's identity rides along so a surface can offer to open
         // it. Basenames only — that is all the harness publishes.
         deliverable: { name, dir },
+        deliverables: [...(existing?.deliverables ?? (existing?.deliverable ? [existing.deliverable] : [])).filter(file => file.name !== name || file.dir !== dir), { name, dir }],
       };
       return existing
         ? prev.map((a) => (a.id === 'deliverables' ? row : a))

@@ -97,6 +97,7 @@ import { PlanReview } from '../components/PlanReview';
 import { RunControl, delegatedRunControlForExpandedWork } from '../components/RunControl';
 import { ProgressRail } from '../components/ProgressRail';
 import { DelegatedTaskCard } from '../components/DelegatedTaskCard';
+import { CompletedFiles } from '../components/CompletedFiles';
 
 interface Props {
   sessionId?: string;
@@ -696,6 +697,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           <div class="conn-pill conn-detached">catching up in the background</div>
         ) : null}
       </div>
+      <CompletedFiles conversationId={snapshot?.sessionId ?? initialSessionId} />
       <CloudBrowserDock conversationId={snapshot?.sessionId ?? initialSessionId} />
       <div
         class="chat-transcript"

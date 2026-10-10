@@ -630,6 +630,9 @@ test('reduceActivity: batch meter, deliverables roll-up, external write phrasing
   activity = reduceActivity(activity, ev(3, 'deliverable_saved', { name: 'brief.md' }));
   activity = reduceActivity(activity, ev(4, 'deliverable_saved', { name: 'notes.md' }));
   assert.ok(activity.some((a) => a.label === 'Saved 2 files · latest notes.md'));
+  assert.deepEqual(activity.find(a => a.id === 'deliverables')?.deliverables, [{ name: 'brief.md', dir: '' }, { name: 'notes.md', dir: '' }]);
+  activity = reduceActivity(activity, ev(5, 'deliverable_saved', { name: 'brief.md' }));
+  assert.equal(activity.find(a => a.id === 'deliverables')?.deliverables?.length, 2, 'rewriting one file must not hide the other finished file or add duplicate Open cards');
   activity = reduceActivity(activity, ev(5, 'external_write', { callId: 'mail-write', shapeKey: 'GMAIL_SEND_EMAIL', targets: ['a@b.co'], irreversible: true }));
   assert.ok(activity.some((a) => a.label === 'Sending a message to a@b.co' && a.status === 'running'));
   activity = reduceActivity(activity, ev(6, 'external_write_succeeded', { callId: 'mail-write', targets: ['a@b.co'] }));

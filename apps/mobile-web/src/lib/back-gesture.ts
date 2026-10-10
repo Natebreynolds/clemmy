@@ -74,7 +74,12 @@ let servicingPop = false;
 function install(): void {
   if (installed || typeof window === 'undefined') return;
   installed = true;
-  window.addEventListener('popstate', () => {
+  window.addEventListener('popstate', (event) => {
+    // A tap-close already removed its registration before history.back()
+    // completed. If history landed on the surviving parent, that parent is
+    // still open: consuming it here would close the chat beneath a sheet.
+    const destinationId = event?.state?.clemBackId;
+    if (typeof destinationId === 'number' && stack.at(-1)?.id === destinationId) return;
     const top = stack.pop();
     if (!top) return;
     servicingPop = true;

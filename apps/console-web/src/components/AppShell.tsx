@@ -116,6 +116,7 @@ export function AppShell() {
 
       <Sidebar
         collapsed={collapsed}
+        onExpand={() => { if (collapsed) toggleSidebar(); }}
         needsYouCount={needsYouCount}
         runningCount={workingView.running}
       />
@@ -153,6 +154,7 @@ export function AppShell() {
         )}
         <main
           id="main"
+          tabIndex={-1}
           // Chat and an agent's workspace own their scrollers (a full-height
           // thread over a composer); every other screen scrolls as a page.
           className={`min-h-0 flex-1 ${location.pathname.startsWith('/agents/') || location.pathname === '/chat' || location.pathname.startsWith('/chat/') ? 'overflow-hidden' : 'overflow-y-auto'}`}

@@ -9,24 +9,30 @@ let seedSeq = 0;
  * the chat UI. Durable plan and approval identities survive navigation; plain
  * assistant history remains terminal text. */
 export function historyToMessages(turns: Turn[]): ChatMessage[] {
-  return turns.map((turn) => ({ ...historyMessage(turn), ...writtenAt(turn), ...answeredBy(turn), ...workedIn(turn), ...savedWorkflows(turn) }));
+  return turns.map((turn) => ({ ...historyMessage(turn), ...writtenAt(turn), ...answeredBy(turn), ...workedIn(turn), ...savedWork(turn) }));
 }
 
-/** The workflows the reply saved, as the receipt-only rows the live card is
+/** The workflows and files the reply saved, as the receipt-only rows the live card is
  *  drawn from, so reopening shows the same card the live reply did. */
-function savedWorkflows(turn: Turn): Pick<ChatMessage, 'activity'> {
-  if (turn.role !== 'assistant' || !turn.workflows?.length) return {};
-  return {
-    activity: turn.workflows.map((workflow) => ({
-      id: `workflow-${workflow.slug}`,
-      kind: 'event' as const,
-      variant: 'write' as const,
-      tone: 'success' as const,
-      status: 'done' as const,
-      label: workflow.op === 'created' ? `Created workflow “${workflow.name}”` : `Changed workflow “${workflow.name}”`,
-      workflow,
-    })),
-  };
+function savedWork(turn: Turn): Pick<ChatMessage, 'activity'> {
+  if (turn.role !== 'assistant') return {};
+  const activity: NonNullable<ChatMessage['activity']> = (turn.workflows ?? []).map((workflow) => ({
+    id: `workflow-${workflow.slug}`,
+    kind: 'event' as const,
+    variant: 'write' as const,
+    tone: 'success' as const,
+    status: 'done' as const,
+    label: workflow.op === 'created' ? `Created workflow “${workflow.name}”` : `Changed workflow “${workflow.name}”`,
+    workflow,
+  }));
+  const files = turn.files ?? [];
+  const latest = files.at(-1);
+  if (latest) activity.push({
+    id: 'deliverables', kind: 'event', variant: 'write', tone: 'success', status: 'done',
+    label: files.length === 1 ? `Saved ${latest.name}${latest.dir ? ` in ${latest.dir}` : ''}` : `Saved ${files.length} files · latest ${latest.name}`,
+    count: files.length, deliverable: latest, deliverables: files,
+  });
+  return activity.length ? { activity } : {};
 }
 
 /** Who answered the exchange, when the server recorded it. */

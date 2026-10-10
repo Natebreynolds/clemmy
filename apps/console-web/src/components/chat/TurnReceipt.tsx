@@ -45,10 +45,10 @@ function DeliverableCard({ row, sessionId }: { row: ActivityItem; sessionId?: st
   useEffect(() => {
     let current = true;
     setPage(null);
-    if (!sessionId || !isPageName(name)) return undefined;
+    if (dock || !sessionId || !isPageName(name)) return undefined;
     void findSessionPage(sessionId, name, folder).then((found) => { if (current) setPage(found); });
     return () => { current = false; };
-  }, [sessionId, name, folder]);
+  }, [Boolean(dock), sessionId, name, folder]);
   if (!file) return null;
   const count = row.count ?? 1;
   const fileRef = sessionId ? { sessionId, name, folder } : null;
@@ -80,7 +80,7 @@ function DeliverableCard({ row, sessionId }: { row: ActivityItem; sessionId?: st
           </span>
         </span>
         <span className="shrink-0 rounded-sm border border-border-strong px-3 py-1 text-caption font-semibold text-fg">
-          {showing ? 'Close' : page ? 'View' : 'Open'}
+          {showing ? 'Close' : 'Open'}
         </span>
       </button>
     );
@@ -350,7 +350,7 @@ export function TurnReceipt({
   const offer = turnModelOffer(activity);
   return (
     <>
-      <OutsideWorkCards activity={activity}>{saved ? <DeliverableCard row={saved} sessionId={sessionId} /> : null}</OutsideWorkCards>
+      <OutsideWorkCards activity={activity}>{saved ? (saved.deliverables ?? [saved.deliverable!]).map(file => <DeliverableCard key={`${file.dir}/${file.name}`} row={{ ...saved, count: 1, deliverable: file }} sessionId={sessionId} />) : null}</OutsideWorkCards>
       {offer && sessionId && <ModelRuleOfferCard key={offer.offerId} offer={offer} sessionId={sessionId} />}
       <div className="flex min-h-7 flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
         {review === 'checked' && (

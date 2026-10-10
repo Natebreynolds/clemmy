@@ -197,6 +197,9 @@ export interface UnifiedSessionTurn {
   /** Workflows this reply created or changed, as saved, so a reopened
    *  conversation shows the same card the live reply did. */
   workflows?: import('./execution/workflow-saved-event.js').WorkflowSavedEventData[];
+  /** File-save facts attached to this reply; names only, resolved through the
+   *  conversation's recorded deliverables when opened. */
+  files?: Array<{ name: string; dir: string }>;
   /** The approval a reply paused on, when it did: a still-pending card for
    *  the same id takes this turn's place on reopen instead of repeating it. */
   pausedOnApprovalId?: string;
