@@ -58,8 +58,10 @@ async function runScenario(options: { id: string; replaceInvoke?: boolean; workC
             { type: 'function_call', callId: 'healthy-sibling', name: 'call_tool', arguments: JSON.stringify({ name: 'task_list', args_json: JSON.stringify({ status: null, priority: null, project: null, since: null, limit: 10 }) }) },
           ]
           : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The task list is empty.' }] }]
+        // A null args_json is refused by the carrier's parser. An object is
+        // not malformed: the host encodes it once before dispatch.
         : calls === 1
-        ? [{ type: 'function_call', callId: 'malformed-search', name: 'call_tool', arguments: JSON.stringify({ name: 'composio_search_tools', args_json: { query: 'Find the search tool' } }) }]
+        ? [{ type: 'function_call', callId: 'malformed-search', name: 'call_tool', arguments: JSON.stringify({ name: 'composio_search_tools', args_json: null }) }]
         : calls === 2
           ? [{ type: 'function_call', callId: 'recovered-task-list', name: 'call_tool', arguments: JSON.stringify({ name: 'task_list', args_json: JSON.stringify({ status: null, priority: null, project: null, since: null, limit: 10 }) }) }]
           : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The task list is empty.' }] }];

@@ -36,3 +36,23 @@ test('a well-formed carrier, a target with its own name parameter, and a conflic
   assert.deepEqual(JSON.parse(lifted.args_json), { q: 1 });
   assert.equal(liftNestedCarrierFields('not json'), null);
 });
+
+test('args_json sent as the object itself is encoded once instead of refused', () => {
+  // Live 2026-10-09 shape: a read through call_tool with its arguments as an object.
+  const target = { call_id: 'call_1', path: '/data/pageElements', fields: ['objectId', 'image'], limit: 50,
+    where: [{ field: 'objectId', op: 'contains', value: 'SLIDES_API' }] };
+  const lifted = liftNestedCarrierFields(JSON.stringify({ name: 'tool_output_query', args_json: target }))!;
+  const outer = JSON.parse(lifted.argumentsJson);
+  assert.equal(typeof outer.args_json, 'string');
+  assert.deepEqual(JSON.parse(outer.args_json), target, 'the document is unchanged, only encoded');
+  assert.equal(outer.name, 'tool_output_query');
+  assert.equal(lifted.target, 'tool_output_query');
+  assert.match(lifted.changes[0]!, /encoded args_json once/);
+  const ownName = liftNestedCarrierFields(JSON.stringify({ name: 'create_folder', args_json: { name: 'Reports' } }))!;
+  assert.deepEqual(JSON.parse(JSON.parse(ownName.argumentsJson).args_json), { name: 'Reports' }, 'a target\'s own `name` survives');
+  const both = JSON.parse(liftNestedCarrierFields(JSON.stringify({ name: 't', args_json: { requirement_id: 'r', q: 1 } }))!.argumentsJson);
+  assert.equal(both.requirement_id, 'r');
+  assert.deepEqual(JSON.parse(both.args_json), { q: 1 });
+  assert.equal(liftNestedCarrierFields(JSON.stringify({ args_json: { q: 1 } })), null, 'no target named: the schema refusal stays');
+  assert.equal(liftNestedCarrierFields(JSON.stringify({ name: 't', args_json: [1] })), null, 'an array is not an argument object');
+});

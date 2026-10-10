@@ -11,6 +11,10 @@
  * This moves them back out: a field the carrier left empty takes the nested
  * value, and the target's arguments keep only their own. It recognises the
  * shape by the carrier's own field names, never by which tool is called.
+ *
+ * `args_json` sent as the object itself, rather than as its JSON text, is the
+ * same document: it is encoded once here instead of refused, so the call runs
+ * in the round it was made.
  */
 
 const CARRIER_FIELDS = [
@@ -32,24 +36,34 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-/** The carrier call with its own fields moved out of `args_json`; null when there is nothing to move. */
+/** The carrier call with its own fields moved out of `args_json` and the
+ *  target's arguments as one JSON string; null when there is nothing to change. */
 export function liftNestedCarrierFields(argumentsJson: string): LiftedCarrierFields | null {
   let outer: Record<string, unknown> | null;
   try { outer = record(JSON.parse(argumentsJson)); } catch { return null; }
-  if (!outer || typeof outer.args_json !== 'string') return null;
-  let inner: Record<string, unknown> | null;
-  try { inner = record(JSON.parse(outer.args_json)); } catch { return null; }
+  if (!outer) return null;
+  const sentAsObject = record(outer.args_json);
+  let inner: Record<string, unknown> | null = sentAsObject;
+  if (!inner) {
+    if (typeof outer.args_json !== 'string') return null;
+    try { inner = record(JSON.parse(outer.args_json)); } catch { return null; }
+  }
   if (!inner) return null;
   const nested = CARRIER_FIELDS.filter((field) => field in inner!);
   // Only the carrier's own fields mark the shape; a target that merely has a
   // `name` parameter is left alone.
-  if (nested.length === 0) return null;
+  if (nested.length === 0 && !sentAsObject) return null;
   const outerName = typeof outer.name === 'string' ? outer.name.trim() : '';
-  const innerName = typeof inner.name === 'string' ? inner.name.trim() : '';
+  const innerName = nested.length > 0 && typeof inner.name === 'string' ? inner.name.trim() : '';
   if (outerName && innerName && innerName !== outerName) return null;
   const target = outerName || innerName;
   if (!target) return null;
-  const changes: string[] = [];
+  const changes: string[] = sentAsObject
+    ? ['encoded args_json once; it takes the target\'s arguments as one JSON string, not the object itself']
+    : [];
+  if (nested.length === 0) {
+    return { argumentsJson: JSON.stringify({ ...outer, args_json: JSON.stringify(inner) }), target, changes };
+  }
   const nextOuter: Record<string, unknown> = { ...outer };
   const nextInner: Record<string, unknown> = { ...inner };
   for (const field of nested) {
