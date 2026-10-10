@@ -84,3 +84,33 @@ export function answeredRefusalsInTurn(input: {
     return [];
   }
 }
+
+/**
+ * The writes in this turn that went through, oldest first, by operation. A
+ * card raised partway through a request reads them, so its question can say
+ * what is already done before it asks for the next thing. Display only.
+ */
+export function writesDoneInTurn(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  db?: Database.Database;
+}): string[] {
+  try {
+    const db = input.db ?? openEventLog();
+    const rows = db.prepare(`
+      SELECT l.tool_name AS toolName
+        FROM logical_call_settlements s
+        JOIN logical_tool_calls l
+          ON l.session_id = s.session_id
+         AND l.source_user_seq = s.source_user_seq
+         AND l.logical_tool_call_id = s.logical_tool_call_id
+       WHERE s.session_id = ? AND s.source_user_seq = ?
+         AND s.mutating = 1
+         AND s.outcome_kind = 'succeeded'
+       ORDER BY s.settled_at, s.logical_tool_call_id
+    `).all(input.sessionId, input.sourceUserSeq) as Array<{ toolName: string }>;
+    return rows.map((row) => row.toolName).filter((name) => typeof name === 'string' && name.trim().length > 0).slice(-6);
+  } catch {
+    return [];
+  }
+}

@@ -108,7 +108,7 @@ test('the card\'s words are bounded and optional', async () => {
   const where = conversation();
   _setApprovalPrecheckRunForTests(async () => ({ ask: `Can I ${'really '.repeat(60)}do it?`, conflicts: [] }));
   const result = await approvalPrecheck({ ...where, preview: email });
-  assert.ok((result?.ask ?? '').length <= 160);
+  assert.ok((result?.ask ?? '').length <= 200);
   assert.equal(result?.why, undefined);
   _setApprovalPrecheckRunForTests(async () => '{"conflicts": []}');
   assert.deepEqual(await approvalPrecheck({ ...where, preview: email }), { status: 'clear' }, 'an older reply shape still works');
@@ -135,4 +135,17 @@ test('after a refusal in the same turn the checker is told to say what was refus
   // owner; the card's why carries the refusal and the change.
   assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /"refusedEarlier"/);
   assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /what the app refused and what this attempt changes/);
+});
+
+test('a card partway through a request opens with what is already done', async () => {
+  // Phone test 2026-10-09: after the owner approved the HTML body, the next
+  // card only asked to delete an attachment, and the owner read the request
+  // as not done. The checker now gets the writes already through.
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /"doneThisTurn"/);
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /Open "ask" with a short clause on what is already done/);
+  const where = conversation();
+  let seen: Record<string, unknown> | undefined;
+  _setApprovalPrecheckRunForTests(async (input) => { seen = input as Record<string, unknown>; return { ask: 'Can I?', conflicts: [] }; });
+  await approvalPrecheck({ ...where, preview: email });
+  assert.equal(seen && 'doneThisTurn' in seen, false, 'nothing done yet: the field is absent');
 });
