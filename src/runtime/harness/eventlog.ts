@@ -6800,28 +6800,44 @@ export function earlierInScopeDeskRungs(sessionId: string, sourceUserSeq: number
   return rows.map((row) => row.rung).filter((rung): rung is string => typeof rung === 'string');
 }
 
-/** The session's newest host model request: its prompt size and when it was
- * composed, and the rung of the newest round-one desk any build recorded (an
- * out-of-scope build records the full rung). Together they say whether a
- * large prompt prefix was sent recently under a given tools block. */
-export function latestHostPromptPrefix(sessionId: string): { totalTokens: number; at: string; rung: string } | null {
+/** The session's newest host model request, bound to what produced its
+ * prompt prefix: its size and time, the rung of the desk its own accepted
+ * source recorded before that request, and the model it was composed for,
+ * which must be the model this source is routed to. Null when any binding is
+ * missing or differs, so an unbound pair never holds a desk climb. */
+export function latestHostPromptPrefix(
+  sessionId: string,
+  sourceUserSeq: number,
+): { totalTokens: number; at: string; rung: string } | null {
   const id = sessionId.trim();
-  if (!id) return null;
+  if (!id || !Number.isSafeInteger(sourceUserSeq)) return null;
   const db = openEventLog();
   const reading = prepareCached(db,
-    `SELECT json_extract(data_json, '$.totalTokens') AS totalTokens, created_at AS at FROM events
+    `SELECT seq, created_at AS at,
+            json_extract(data_json, '$.totalTokens') AS totalTokens,
+            json_extract(data_json, '$.sourceUserSeq') AS source,
+            json_extract(data_json, '$.model') AS model FROM events
       WHERE session_id = ? AND type = 'prompt_composition'
         AND json_extract(data_json, '$.lane') = 'host'
       ORDER BY seq DESC LIMIT 1`,
-  ).get(id) as { totalTokens: unknown; at: unknown } | undefined;
-  if (!reading || typeof reading.totalTokens !== 'number' || typeof reading.at !== 'string') return null;
+  ).get(id) as { seq: number; at: unknown; totalTokens: unknown; source: unknown; model: unknown } | undefined;
+  if (!reading || typeof reading.totalTokens !== 'number' || typeof reading.at !== 'string'
+    || typeof reading.source !== 'number' || typeof reading.model !== 'string' || !reading.model) return null;
   const desk = prepareCached(db,
     `SELECT json_extract(data_json, '$.desk.rung') AS rung FROM events
-      WHERE session_id = ? AND type = 'tool_search_scope'
+      WHERE session_id = ? AND type = 'tool_search_scope' AND seq < ?
+        AND json_extract(data_json, '$.desk.sourceUserSeq') = ?
         AND json_extract(data_json, '$.desk.rung') IS NOT NULL
       ORDER BY seq DESC LIMIT 1`,
-  ).get(id) as { rung: unknown } | undefined;
+  ).get(id, reading.seq, reading.source) as { rung: unknown } | undefined;
   if (!desk || typeof desk.rung !== 'string') return null;
+  const routed = prepareCached(db,
+    `SELECT json_extract(data_json, '$.model') AS model FROM events
+      WHERE session_id = ? AND type = 'turn_model_routed'
+        AND json_extract(data_json, '$.sourceUserSeq') = ?
+      ORDER BY seq DESC LIMIT 1`,
+  ).get(id, sourceUserSeq) as { model: unknown } | undefined;
+  if (!routed || routed.model !== reading.model) return null;
   return { totalTokens: reading.totalTokens, at: reading.at, rung: desk.rung };
 }
 

@@ -215,22 +215,41 @@ test('after a heavy turn the climb is held so the cached conversation stays warm
   const sessionId = 'turn-desk-warm-hold';
   const turn1 = await hostTurn(sessionId, TARGETED, [() => ({ name: 'recall_tool_result', args: { call_id: 'no-such-call' } })]);
   assert.equal(deskRecord(sessionId, turn1.source.seq)?.rung, 'lean');
-  // The turn's last request carried a large conversation.
-  eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'prompt_composition',
-    data: { lane: 'host', totalTokens: 64_000, stableTokens: 7_000, variableTokens: 57_000, stableShare: 0.11, toolCount: 10 } });
-  const turn2 = await hostTurn(sessionId, TARGETED, []);
-  const desk2 = deskRecord(sessionId, turn2.source.seq) as (DeskRecord & { held?: { rung: string; climbedBy: string[] } }) | undefined;
+  // The turn's last request carried a large conversation, composed for the model this session is routed to.
+  const reading = (source: number, totalTokens: number) => eventlog.appendEvent({ sessionId, turn: 0, role: 'system',
+    type: 'prompt_composition', data: { lane: 'host', totalTokens, stableTokens: 7_000, variableTokens: totalTokens - 7_000,
+      stableShare: 0.1, toolCount: 10, sourceUserSeq: source, requestOrdinal: 3, model: 'fixture-model' } });
+  const routedSource = (model: string) => {
+    const source = acceptSource(sessionId, TARGETED);
+    eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'turn_model_routed',
+      data: { model, sourceUserSeq: source.seq } });
+    return source;
+  };
+  reading(turn1.source.seq, 64_000);
+  const source2 = routedSource('fixture-model');
+  const agent2 = await buildFor(sessionId, source2.seq, TARGETED, idleModel);
+  const desk2 = deskRecord(sessionId, source2.seq) as (DeskRecord & { held?: { rung: string; climbedBy: string[] } }) | undefined;
   assert.equal(desk2?.rung, 'lean', `the miss's climb is held: ${JSON.stringify(desk2)}`);
   assert.equal(desk2?.held?.rung, 'readers');
   assert.ok(desk2?.held?.climbedBy.includes('miss'));
-  assert.equal(turn2.requests[0]!.toolsJson, turn1.requests[0]!.toolsJson, 'the tools block is byte-identical, so the cached prefix holds');
-  const reached = await hostTurn(sessionId, TARGETED, [() => ({ name: 'recall_tool_result', args: { call_id: 'no-such-call' } })]);
-  assert.ok(reached.outputs.get(reached.callId(0)), 'a held tool is still callable by exact name');
-  // A later request is small again (the conversation was compacted): the next turn climbs.
-  eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'prompt_composition',
-    data: { lane: 'host', totalTokens: 9_000, stableTokens: 7_000, variableTokens: 2_000, stableShare: 0.78, toolCount: 10 } });
-  const turn4 = await hostTurn(sessionId, TARGETED, []);
-  assert.equal(deskRecord(sessionId, turn4.source.seq)?.rung, 'readers', 'the held climb lands once the prefix is small');
+  assert.equal(toolsBytes(agent2), toolsBytes(turn1.agent), 'the tools block is byte-identical, so the cached prefix holds');
+  // A prefix composed for a different model than this source is routed to
+  // is not this request's cache: the climb lands.
+  reading(source2.seq, 64_000);
+  const source3 = routedSource('another-model');
+  await buildFor(sessionId, source3.seq, TARGETED, idleModel);
+  assert.equal(deskRecord(sessionId, source3.seq)?.rung, 'readers', 'a changed model does not hold the climb');
+});
+
+test('a small last prefix climbs as before', async () => {
+  const sessionId = 'turn-desk-warm-small';
+  const turn1 = await hostTurn(sessionId, TARGETED, [() => ({ name: 'recall_tool_result', args: { call_id: 'no-such-call' } })]);
+  eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'prompt_composition', data: { lane: 'host', totalTokens: 9_000,
+    stableTokens: 7_000, variableTokens: 2_000, stableShare: 0.78, toolCount: 10, sourceUserSeq: turn1.source.seq, model: 'fixture-model' } });
+  const source = acceptSource(sessionId, TARGETED);
+  eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'turn_model_routed', data: { model: 'fixture-model', sourceUserSeq: source.seq } });
+  await buildFor(sessionId, source.seq, TARGETED, idleModel);
+  assert.equal(deskRecord(sessionId, source.seq)?.rung, 'readers');
 });
 
 test('a turn without the call door records doors_absent and defers nothing', async () => {
