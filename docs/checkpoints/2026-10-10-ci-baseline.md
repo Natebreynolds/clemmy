@@ -59,6 +59,47 @@ owner before any pin moves.
 | `src/execution/coding-run-git.test.ts` · "a timed out test also stops its descendant process" | failed once in the detached full run under full CPU load | intermittent: the 10-06 Windows checkpoint records "one joined POSIX cancellation check failed without retaining its descendant PID; its cause remains unknown". Rerun alone before classifying; if it fails alone it is a real process-group cleanup race. |
 | `src/agents/orchestrator.test.ts` · the fan-out case | passes at `v3.18.26` (`4c3a9e42`, 10-02), fails at `v3.18.30` (`1a17e070`, 10-07) and at `v3.18.34` | a change in the 10-02 → 10-07 waves (301 commits) stopped the batch-shape mandate (`src/tools/batch-shape-directive.ts:43`, injected at `orchestrator.ts:2453` unless `hostFreshPlanning`) from reaching the affirmed follow-up's instructions. Bisect result below. |
 
+## 2b. The orchestrator fan-out case, bisected
+
+`git bisect` between `v3.18.26` (good) and `v3.18.30` (bad), running the single
+case through the real runner at each step, names **`d222b5f3`** (2026-10-05,
+"Clarification revision work exactly as installed on 10-05 (from the Codex
+tree)", 68 files) as the first bad commit. Inside it, the relevant change is
+`src/runtime/harness/multi-item-intent.ts` (+48/-?): count-only prose now needs
+an operation **in its own clause** (`countedClause`), ranges and bounds ("10–12
+cases", "up to 20") are masked so they do not become exact item sets, and
+`sameShapeWork` requires a read or deep-work verb in that clause, an enumerated
+list with a write, or an anaphoric operation ("research them"). Its own new test
+(`multi-item-intent.test.ts`, +63) pins that precision.
+
+The orchestrator fixture is a near-action request whose ~18 items were
+established on an earlier turn and affirmed on this one; the batch-shape
+mandate (`orchestrator.ts:2453`) is built from `multiItem.isMultiItem` and
+`carriedFromPrior`. Under the stricter parser the carried scope no longer reads
+as multi-item, so the mandate is dropped and the follow-up turn loses its
+fan-out hint. Two rules collide, both reasonable:
+
+- the 10-05 rule: a quantity in prose is not per-item work unless the operation
+  sits beside it (prevents "10–12 cases" from spawning twelve jobs);
+- the older rule the test states: an affirmative follow-up keeps the semantic
+  scope and fan-out the prior turn established, without the host's plain proof.
+
+Recommended reading: the collision is in **re-deriving** a carried scope from
+text. A scope the prior turn already established (`carriedFromPrior`) should be
+carried as a fact, not re-parsed under the new precision; a fresh count still
+gets the strict parse. That keeps both pins. It is the owner's call whether
+fan-out on an affirmed follow-up is wanted; if it is, the fix is in how
+`multi-item-intent` treats `carriedFromPrior`, not in either test.
+
+## 2c. The detached full run so far
+
+At 9,412 of 21,284 tests the detached run has 7 failures: the orchestrator
+fan-out case (§2b), the two Discord queued-wording pins (PR-15), the
+cutover-hold closure (§2a), the descendant-process case (§2a, intermittent), the
+memory fast-tier attribution (PR-14), and one not yet classified:
+`src/runtime/graph/turn-graph-semantics.test.ts` · "a participated failed admission stays graphless and commits a
+blocked zero-tool terminal". Run it alone before classifying.
+
 ## 3. What the classes mean
 
 - **stale pin**: the sentence or shape changed on purpose, in a commit whose
