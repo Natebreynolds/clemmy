@@ -9276,6 +9276,56 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Computer access: the owner's one-time choice of what Clem may reach on
+  // this computer, and the operating system's own gates (macOS Full Disk
+  // Access and protected folders, Windows Controlled Folder Access), so a task
+  // never stops mid-way on a system prompt. The routes report and open system
+  // pages; they never change a system setting themselves.
+  app.get('/api/console/settings/computer-access', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { computerAccessStatus } = await import('../runtime/computer-access.js');
+      res.json({ access: await computerAccessStatus() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/settings/computer-access', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const choice = (req.body as { choice?: unknown } | undefined)?.choice;
+      if (choice !== 'full' && choice !== 'standard') { res.status(400).json({ error: 'choice must be full or standard' }); return; }
+      const { computerAccessStatus, setComputerAccessChoice } = await import('../runtime/computer-access.js');
+      setComputerAccessChoice(choice);
+      res.json({ access: await computerAccessStatus() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/settings/computer-access/open', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const page = (req.body as { page?: unknown } | undefined)?.page;
+      if (page !== 'full_disk_access' && page !== 'controlled_folders') { res.status(400).json({ error: 'unknown page' }); return; }
+      const { openSystemAccessPage } = await import('../runtime/computer-access.js');
+      res.json({ opened: await openSystemAccessPage(page) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/settings/computer-access/folders', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { requestMacFolderAccess } = await import('../runtime/computer-access.js');
+      res.json({ folders: await requestMacFolderAccess() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // Watches: what each background watch is for, its last finding, its open
   // items and its controls. The calendar watch is the first one on the
   // heartbeat contract (calendar-watch.ts). "Check now" runs one tick.

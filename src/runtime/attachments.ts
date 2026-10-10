@@ -4,6 +4,8 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { convertToMarkdown, convertUrlToMarkdown, isConvertibleExtension } from './markitdown.js';
 import { describeImage, hasOpenAiKey, isAudioExtension, isImageExtension, transcribeAudio } from './transcribe.js';
+import { LocalFileSendRefusal, readLocalFileToSend, resolveLocalFileToSend } from './local-file-sending.js';
+import { computerAccessChoice } from './computer-access.js';
 
 /**
  * Unified attachment ingestion — the ONE pipeline every transport (desktop
@@ -307,17 +309,25 @@ export type ViewableImage =
   | { ok: false; error: string };
 
 /**
- * Load a stored attachment image for native viewing. Fail-closed guards:
- * the path must resolve INSIDE state/attachments-files (no traversal, no
- * arbitrary filesystem reads through a model-supplied path), must be a
- * supported image type, and must fit the provider's image cap.
+ * Load an image for native viewing. Fail-closed guards: a stored attachment
+ * must resolve INSIDE state/attachments-files (no traversal). An image
+ * elsewhere is viewable only when the owner chose Full computer access, and
+ * then only through the same check every lane runs before a file leaves this
+ * computer (no credentials, none of Clem's own stores, nothing outside the
+ * owner's folders). Every image must be a supported type within the cap.
  */
-export function readImageForViewing(requestedPath: string): ViewableImage {
+export function readImageForViewing(
+  requestedPath: string,
+  ownerGrantedFullAccess: () => boolean = () => computerAccessChoice() === 'full',
+): ViewableImage {
   try {
     const store = path.join(BASE_DIR, 'state', 'attachments-files');
     const resolved = path.resolve(String(requestedPath ?? ''));
     if (resolved !== store && !resolved.startsWith(store + path.sep)) {
-      return { ok: false, error: 'view_image only reads stored attachment images (state/attachments-files).' };
+      if (!ownerGrantedFullAccess()) {
+        return { ok: false, error: 'view_image reads chat attachments. Images elsewhere on this computer open once the owner turns on Full access in Settings → Computer access.' };
+      }
+      return readOwnerImageForViewing(String(requestedPath ?? ''));
     }
     if (!existsSync(resolved) || !statSync(resolved).isFile()) {
       return { ok: false, error: 'No stored image at that path — it may have been pruned. Ask the user to re-attach it.' };
@@ -335,4 +345,21 @@ export function readImageForViewing(requestedPath: string): ViewableImage {
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+function readOwnerImageForViewing(requestedPath: string): ViewableImage {
+  let file;
+  try {
+    file = resolveLocalFileToSend(requestedPath, { maxBytes: MAX_VIEWABLE_IMAGE_BYTES });
+  } catch (error) {
+    if (!(error instanceof LocalFileSendRefusal)) throw error;
+    if (error.code === 'too_large') {
+      return { ok: false, error: `That image is over the ${(MAX_VIEWABLE_IMAGE_BYTES / 1_000_000).toFixed(1)}MB viewing cap; view a smaller copy.` };
+    }
+    return { ok: false, error: error.message.replace(/so it is not sent\.$|so it is never sent anywhere\.$/, 'so it cannot be viewed.') };
+  }
+  const mimeType = VIEWABLE_IMAGE_MIME[path.extname(file.name).toLowerCase()];
+  if (!mimeType) return { ok: false, error: 'Not a viewable image type (png/jpg/gif/webp).' };
+  const bytes = readLocalFileToSend(file);
+  return { ok: true, base64: bytes.toString('base64'), mimeType, bytes: bytes.length, name: file.name };
 }
