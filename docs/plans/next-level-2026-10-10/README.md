@@ -155,9 +155,10 @@ owner's recorded decisions. A PR that breaks one is not done, whatever its tests
 | [PR-13](PR-13-later.md) | Later, each behind its own measurement: plan continuation cap, watcher budget, effort routing, model tryouts, quota-aware scheduling, phone parity, console on ChatEngine | — | — | — |
 | [PR-14](PR-14-all-in-byo-identity.md) | All-in BYO identity: options, inactive bindings and memory attribution agree with the router (four baseline failures) | S | low | PR-00 |
 | [PR-15](PR-15-last-fixed-sentences.md) | The last fixed host sentences and three stale pins (six baseline failures) | S | low | PR-00 |
+| [PR-16](PR-16-route-outcomes-on-the-host-lane.md) | Route outcomes on the host lane carry the verdict and tool success (today both columns are null everywhere) | S | additive | PR-00 |
 
-PR-00, PR-07, PR-08, PR-12, PR-14 and PR-15 have no dependencies beyond PR-00 and can start today; PR-14 should land before PR-03 reads the catalog snapshot. PR-01 and
-PR-02 are the foundation; PR-03 and PR-04 are the owner-visible payoff and should
+PR-00, PR-07, PR-08, PR-12, PR-14 and PR-15 have no dependencies beyond PR-00 and can start today; PR-14 should land before PR-03 reads the catalog snapshot. PR-01, PR-16 and
+PR-02 are the foundation (PR-16 is what makes the scorecard's objective columns real); PR-03 and PR-04 are the owner-visible payoff and should
 ship as one release. PR-05 is the first automatic behaviour and stays opt-in.
 
 ## 5. What "set apart" looks like when this lands
