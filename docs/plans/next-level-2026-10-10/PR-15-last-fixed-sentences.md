@@ -15,7 +15,7 @@ found by running the files one at a time on `b0612dd` (2026-10-10).
 |---|---|---|
 | `respond-bridge-one-gate-wiring.test.ts` · "completed-work recovery candidate … a genuine no-work candidate stays blocked" | An ownerless stalled terminal (a workflow-owned session with no completed work) never tells the user to "ask me / continue / retry / resume" | `respond-bridge.ts:766-768` ends with "The run stopped before it produced a safe final answer, so this request is still unfinished. **Ask me to check what completed and what remains before continuing.**" |
 | same file · "ownerless narration give-up closes factually without asking for a continuation" | Same, on the SDK-brain narration give-up path | `respond-bridge.ts:2717` same sentence; `:2204` names the brain ("The first brain stopped …") |
-| `src/runtime/graph/turn-graph-semantics.test.ts` · "a participated failed admission stays graphless and commits a blocked zero-tool terminal" | A blocked zero-tool terminal carries no instruction to the owner | `:` ends with "…Ask me to check the capability details and any completed work for this exact request before continuing." |
+| `src/runtime/graph/turn-graph-semantics.test.ts` · "a participated failed admission stays graphless and commits a blocked zero-tool terminal" | A blocked zero-tool terminal carries no instruction to the owner | `src/runtime/harness/public-presentation.ts:298` ends with "…Ask me to check the capability details and any completed work for this exact request before continuing." |
 | `claude-agent-brain.test.ts` · "SDK brain keeps a still-pending automatic memory capture non-done" (two wordings) | A reply that claims "Saved — your smoke marker is …" while the automatic memory capture has no host receipt yet ends `unverified` / `blocked`, never `success` | ends `success` with the claim intact |
 
 The first two are the same defect the v3.18.32 notes record as a known limit
@@ -36,7 +36,7 @@ sessions persisted on it".
 
 1. **Ownerless and blocked terminals state facts only.** In `respond-bridge.ts`, the two
    `commitBridgeBlockedTerminal` texts (`:766-768`, `:2717`), the brain-naming
-   sentence at `:2204`, and the blocked zero-tool terminal in `:` become one shared factual close with no instruction, for
+   sentence at `:2204`, and the blocked zero-tool terminal in `src/runtime/harness/public-presentation.ts:298` become one shared factual close with no instruction, for
    example "The run stopped before it produced a safe final answer; this request
    is unfinished." When the session has an owner conversation and a model is
    reachable, hand the fact to one tool-less call on the turn's own model (the
@@ -60,7 +60,7 @@ sessions persisted on it".
 
 ## Files
 
-- `src/runtime/harness/respond-bridge.ts`, `turn-decision.ts`, ``
+- `src/runtime/harness/respond-bridge.ts`, `turn-decision.ts`, `src/runtime/harness/public-presentation.ts`
 - `src/runtime/harness/respond-bridge-one-gate-wiring.test.ts`,
   `loop-structured-output-guard.test.ts`, `claude-agent-brain.test.ts`,
   `src/channels/discord-harness-terminal.test.ts`, `src/channels/discord-harness.test.ts`

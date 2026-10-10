@@ -101,7 +101,7 @@ memory fast-tier attribution (PR-14), and
 blocked zero-tool terminal", which fails alone too: the blocked zero-tool terminal
 reads "The next step is blocked, so this request is still unfinished. Ask me to
 check the capability details and any completed work for this exact request
-before continuing." (`:`), the same fixed-sentence-with-an-instruction
+before continuing." (`src/runtime/harness/public-presentation.ts:298`), the same fixed-sentence-with-an-instruction
 family as the respond-bridge cases. Real; PR-15.
 
 ## 3. What the classes mean
