@@ -268,6 +268,18 @@ function discoveryStillActive(input: {
 
 /** Explicit registered actions are independent exact lookups, not fuzzy intent.
  * Returning several schemas does not select execution authority for any of them. */
+/** The query's own words for a fuzzy search: each operation name already
+ * found removed, and every other snake_case name spelled out as words, so the
+ * search answers the request rather than one guessed spelling. */
+export function wordsForUnresolvedOperations(query: string, found: ReadonlySet<string>): string {
+  return query
+    .replace(/(^|[^A-Za-z0-9_])([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)(?=$|[^A-Za-z0-9_])/g, (_whole, lead: string, token: string) => (
+      found.has(token.toUpperCase()) ? lead : `${lead}${token.toLowerCase().split('_').filter(Boolean).join(' ')}`
+    ))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export function exactComposioOperationsFromQuery(query: string): string[] {
   const operations = new Set<string>();
   const pattern = /(?:^|[^A-Za-z0-9_])([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)(?=$|[^A-Za-z0-9_])/g;
@@ -2546,6 +2558,19 @@ export function buildAuthorizedToolSearchCandidateSources(
             },
             guidance: `For publish_plan, staticArgumentsJson contains only the direct ${candidate.slug} input fields from this exact schema. For work_call execution, use inner name composio_execute_tool, tool_slug ${candidate.slug}, and serialize those direct action fields into the carrier arguments field.`,
           })).map(rememberPreparedSearchCandidate));
+        }
+        // A guessed operation name the provider does not serve is still a
+        // request in words. Search those words in this same pass instead of
+        // answering nothing and spending another model round on a new search.
+        const found = new Set(exactCandidates.map((candidate) => candidate.name.trim().toUpperCase()));
+        const words = exactOperations.some((operation) => !found.has(operation))
+          ? wordsForUnresolvedOperations(query, found)
+          : '';
+        if (words && !signal?.aborted && (deadlineAt === undefined || Date.now() < deadlineAt - PROVIDER_SOURCE_RETURN_MARGIN_MS)) {
+          const kept = [...exactCandidates];
+          const fuzzy = await searchLive({ query: words, limit: 20, signal, deadlineAt, accountSelection, deferPreparation });
+          kept.forEach(rememberPreparedSearchCandidate);
+          return [...kept, ...fuzzy.filter((candidate) => !found.has(candidate.name.trim().toUpperCase()))];
         }
         return exactCandidates;
       }

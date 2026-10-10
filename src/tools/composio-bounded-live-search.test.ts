@@ -569,3 +569,53 @@ test('a slow provider search answers from current contracts, and briefly when th
   assert.ok(Date.now() - started < 2_500, 'before the search deadline');
   await new Promise((resolve) => setTimeout(resolve, fuzzyDelayMs));
 });
+
+/**
+ * Phone test 2026-10-09: "OUTLOOK_UPDATE_MESSAGE and OUTLOOK_DELETE_ message
+ * attachment …" named an operation the provider does not serve; the search
+ * looked up only that spelling, answered nothing, and the model spent four
+ * more searches finding OUTLOOK_BATCH_UPDATE_MESSAGES.
+ */
+test('a guessed operation name the provider does not serve is searched as words in the same pass', async () => {
+  schemaCache.resetToolSchemaCache();
+  capabilityIndex._resetCapabilityIndexForTest();
+  composio.resetComposioClient();
+  composio.__test__.setComposioApiKeyOverride('guessed-name-key');
+  composio.__test__.setConnectedAccountsLoader(async () => [{
+    id: 'connection-outlook', status: 'ACTIVE', user_id: 'guessed-name-user', toolkit: { slug: 'outlook' },
+  }]);
+  const served = {
+    slug: 'OUTLOOK_BATCH_UPDATE_MESSAGES', name: 'Batch update messages',
+    description: 'Update the body, subject or flags of one or more messages, including drafts.',
+    toolkit: { slug: 'outlook' }, inputParameters: DESTINATION_SCHEMA,
+  };
+  const exactAsked: string[] = [];
+  const fuzzyAsked: string[] = [];
+  composio.__test__.setComposioClient({
+    tools: {
+      async getRawComposioTools(input: Record<string, unknown>) {
+        if (Array.isArray(input.tools)) {
+          exactAsked.push(...(input.tools as string[]));
+          return (input.tools as string[]).includes(served.slug) ? [served] : [];
+        }
+        fuzzyAsked.push(String(input.search));
+        return [served];
+      },
+    },
+  });
+  const source = providerSources.buildAuthorizedToolSearchCandidateSources({
+    reason: 'guessed name proof', authority: 'catalog', allowedServerSlugs: [], toolPatterns: [], maxTools: 0,
+  } as never, { sessionId: 'guessed-name-proof', sourceUserSeq: 1 }).find((candidate) => candidate.kind === 'authorized_composio')!;
+
+  const found = await source.search({ query: 'OUTLOOK_UPDATE_MESSAGE patch the draft body to html', limit: 8 });
+  assert.ok(exactAsked.includes('OUTLOOK_UPDATE_MESSAGE'), 'the guessed name is still tried exactly first');
+  assert.equal(fuzzyAsked.length, 1, 'then the request is searched once, in words');
+  assert.match(fuzzyAsked[0]!, /outlook update message patch the draft body to html/);
+  assert.ok(found.some((candidate) => candidate.name === served.slug), JSON.stringify(found.map((candidate) => candidate.name)));
+
+  // A name the provider serves needs no word search.
+  fuzzyAsked.length = 0;
+  const exact = await source.search({ query: 'OUTLOOK_BATCH_UPDATE_MESSAGES', limit: 8 });
+  assert.deepEqual(exact.map((candidate) => candidate.name), [served.slug]);
+  assert.equal(fuzzyAsked.length, 0);
+});
