@@ -67,3 +67,14 @@ test('with Full access, an image in the owner\'s folders is viewed, and the send
   assert.equal(big.ok, false);
   if (!big.ok) assert.match(big.error, /viewing cap/);
 });
+
+test('a web address is answered with the reader that fetches it, whatever the access choice', () => {
+  for (const full of [false, true]) {
+    const refused = readImageForViewing('https://images.example.test/slide7.png?sz=1600', () => full);
+    assert.equal(refused.ok, false);
+    if (!refused.ok) {
+      assert.match(refused.error, /http_read/);
+      assert.doesNotMatch(refused.error, /Computer access|Full access/, 'access settings do not apply to a web address');
+    }
+  }
+});

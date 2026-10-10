@@ -321,6 +321,11 @@ export function readImageForViewing(
   ownerGrantedFullAccess: () => boolean = () => computerAccessChoice() === 'full',
 ): ViewableImage {
   try {
+    // A web address is not a file; the bounded web reader returns an image
+    // URL as the image itself.
+    if (/^https?:\/\//i.test(String(requestedPath ?? '').trim())) {
+      return { ok: false, error: 'That is a web address, not a file. http_read with this url returns a web image as the image itself.' };
+    }
     const store = path.join(BASE_DIR, 'state', 'attachments-files');
     const resolved = path.resolve(String(requestedPath ?? ''));
     if (resolved !== store && !resolved.startsWith(store + path.sep)) {
