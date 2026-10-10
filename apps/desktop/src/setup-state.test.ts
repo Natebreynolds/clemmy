@@ -75,6 +75,7 @@ const nothingConfigured: ExistingConfiguration = {
   profile: { preferredName: '', role: '', timezone: '', communicationTone: 'balanced' },
   discord: false,
   composio: false,
+  computerAccess: null,
 };
 
 // ── detection ───────────────────────────────────────────────────────────────
@@ -162,8 +163,16 @@ test('process env is a credential source of last resort', () => {
 
 // ── planning ────────────────────────────────────────────────────────────────
 
-test('a brand-new machine answers four questions, not seven', () => {
-  assert.deepEqual(planSetupSteps(nothingConfigured), ['welcome', 'auth', 'profile', 'workspace', 'launch']);
+test('a brand-new machine answers five questions, not eight', () => {
+  assert.deepEqual(planSetupSteps(nothingConfigured), ['welcome', 'auth', 'profile', 'workspace', 'access', 'launch']);
+});
+
+test('computer access is asked once: a stored choice is not asked again', () => {
+  assert.ok(!planSetupSteps({ ...nothingConfigured, computerAccess: 'full' }).includes('access'));
+  assert.ok(!planSetupSteps({ ...nothingConfigured, computerAccess: 'standard' }).includes('access'));
+  const home = fakeHome();
+  writeFileSync(path.join(home.dir, '.clementine-next', 'state', 'computer-access.json'), JSON.stringify({ choice: 'full' }), 'utf-8');
+  assert.equal(detect(home).computerAccess, 'full');
 });
 
 test('no plan ever contains a channel step', () => {
@@ -183,11 +192,11 @@ test('no plan ever contains a channel step', () => {
 test('an answered question is not asked again', () => {
   assert.deepEqual(
     planSetupSteps({ ...nothingConfigured, auth: 'codex' }),
-    ['welcome', 'profile', 'workspace', 'launch'],
+    ['welcome', 'profile', 'workspace', 'access', 'launch'],
   );
   assert.deepEqual(
     planSetupSteps({ ...nothingConfigured, workspaces: ['/Users/a/Projects'] }),
-    ['welcome', 'auth', 'profile', 'launch'],
+    ['welcome', 'auth', 'profile', 'access', 'launch'],
   );
 });
 
@@ -204,6 +213,7 @@ test('the deleted-marker replay is two screens, neither of them a question', () 
     profile: { preferredName: 'Alex', role: 'VP of sales', timezone: 'America/Denver', communicationTone: 'terse' },
     discord: true,
     composio: true,
+    computerAccess: 'full',
   };
   assert.deepEqual(planSetupSteps(fullyConfigured), ['welcome', 'launch']);
 });

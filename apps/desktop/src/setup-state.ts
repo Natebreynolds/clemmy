@@ -155,7 +155,7 @@ export function clearSetupComplete(): void {
    needs a new IPC channel to know what to skip.
    ──────────────────────────────────────────────────────────────────────────── */
 
-export type SetupStepId = 'welcome' | 'auth' | 'profile' | 'workspace' | 'launch';
+export type SetupStepId = 'welcome' | 'auth' | 'profile' | 'workspace' | 'access' | 'launch';
 
 export interface ExistingConfiguration {
   /** Which model credential we can already see. 'none' means we must ask. */
@@ -171,6 +171,8 @@ export interface ExistingConfiguration {
   };
   discord: boolean;
   composio: boolean;
+  /** What the owner chose Clem may reach on this computer; null when not yet asked. */
+  computerAccess: 'full' | 'standard' | null;
 }
 
 interface SetupPaths {
@@ -179,6 +181,7 @@ interface SetupPaths {
   homeEnv: string;
   codexAuth: string;
   profileFile: string;
+  computerAccessFile: string;
 }
 
 function setupPathsFor(homeDir: string): SetupPaths {
@@ -189,6 +192,7 @@ function setupPathsFor(homeDir: string): SetupPaths {
     homeEnv: path.join(homeDir, '.clementine-next', '.env'),
     codexAuth: path.join(homeDir, '.codex', 'auth.json'),
     profileFile: path.join(stateDir, 'user-profile.json'),
+    computerAccessFile: path.join(stateDir, 'computer-access.json'),
   };
 }
 
@@ -269,6 +273,10 @@ export function detectExistingConfiguration(opts: { homeDir?: string; env?: Node
     },
     discord: vaultHas(vault, 'discord_bot_token') || Boolean(homeEnv.DISCORD_BOT_TOKEN),
     composio: vaultHas(vault, 'composio_api_key') || Boolean(homeEnv.COMPOSIO_API_KEY),
+    computerAccess: (() => {
+      const choice = readJson(paths.computerAccessFile)?.choice;
+      return choice === 'full' || choice === 'standard' ? choice : null;
+    })(),
   };
 }
 
@@ -290,6 +298,9 @@ export function planSetupSteps(existing: ExistingConfiguration): SetupStepId[] {
   // nice-to-have, so having those two is enough to not ask again.
   if (!(existing.profile.preferredName && existing.profile.timezone)) steps.push('profile');
   if (existing.workspaces.length === 0) steps.push('workspace');
+  // What Clem may reach on this computer is settled here, once, so a task
+  // never stops halfway on a system prompt.
+  if (existing.computerAccess === null) steps.push('access');
   steps.push('launch');
   return steps;
 }

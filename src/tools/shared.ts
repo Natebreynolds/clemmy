@@ -566,7 +566,7 @@ export interface WorkspaceProject {
   capabilities: WorkspaceProjectCapabilities;
 }
 
-const DEFAULT_WORKSPACE_CANDIDATES = [
+export const DEFAULT_WORKSPACE_CANDIDATES = [
   'Desktop',
   'Documents',
   'Developer',

@@ -342,6 +342,7 @@ function safeDetect(): ExistingConfiguration {
       profile: { preferredName: '', role: '', timezone: '', communicationTone: 'balanced' },
       discord: false,
       composio: false,
+      computerAccess: null,
     };
   }
 }
@@ -632,7 +633,7 @@ const SETUP_JS = `
   }
 
   var boot = window.__CLEM_SETUP__ || {};
-  var STEPS = (boot.plan && boot.plan.length) ? boot.plan : ['welcome', 'auth', 'profile', 'workspace', 'launch'];
+  var STEPS = (boot.plan && boot.plan.length) ? boot.plan : ['welcome', 'auth', 'profile', 'workspace', 'access', 'launch'];
   var already = boot.existing || {
     auth: 'none', embeddingKey: false, workspaces: [],
     profile: { preferredName: '', role: '', timezone: '', communicationTone: 'balanced' },
@@ -687,6 +688,13 @@ const SETUP_JS = `
     discordVerifyStatus: '',
     discordVerifyMessage: '',
     composioKey: '',
+    // Computer access: the owner's choice, what the OS currently allows, and
+    // the result of asking macOS for the protected folders.
+    access: 'full',
+    accessStatus: null,
+    accessOpened: false,
+    accessFolders: null,
+    accessAsking: false,
     // Folders already in WORKSPACE_DIRS are shown and kept; re-saving one is a
     // no-op in setup-bridge, so the list stays the user's whole picture.
     workspaces: (already.workspaces || []).slice(),
@@ -743,6 +751,7 @@ const SETUP_JS = `
     else if (step === 'auth') html = renderAuth();
     else if (step === 'profile') html = renderProfile();
     else if (step === 'workspace') html = renderWorkspace();
+    else if (step === 'access') html = renderAccess();
     else html = renderLaunch();
     mainEl.innerHTML = html;
     bind();
@@ -869,7 +878,7 @@ const SETUP_JS = `
       '<div class="step">' +
       '  <div class="eyebrow">' + ico('folder') + '<span>Your folders</span></div>' +
       '  <h1>Where do you work?</h1>' +
-      '  <p class="lede">Folders I am allowed to read and write in. Skip this if you only want chat and memory — I will ask again the first time you point me at a file.</p>' +
+      '  <p class="lede">Where your projects live, so I know where to look first. Desktop and Documents are already on my list; add any others.</p>' +
       '  <ul class="ws-list">' + items + '</ul>' +
       '  <div class="ws-add">' +
       '    <input type="text" data-ws-input placeholder="/Users/you/Projects/example" aria-label="Folder path" />' +
@@ -877,6 +886,71 @@ const SETUP_JS = `
       '    <button class="btn btn-secondary btn-sm" type="button" data-ws-pick>' + ico('plus') + '<span>Add</span></button>' +
       '  </div>' +
       '</div>';
+  }
+
+  function renderAccess() {
+    function choice(value, title, meta) {
+      return '' +
+        '<label class="choice">' +
+        '  <input type="radio" name="clem-access" value="' + value + '"' + (state.access === value ? ' checked' : '') + ' />' +
+        '  <span><span class="choice-title">' + esc(title) + '</span><span class="choice-meta">' + meta + '</span></span>' +
+        '</label>';
+    }
+    var s = state.accessStatus;
+    var gates = '';
+    if (s && s.platform === 'mac') {
+      if (s.fullDiskAccess === 'granted') {
+        gates = note('note-ok', 'check-circle', 'Full Disk Access is on, so Desktop, Documents, Downloads and the rest open without macOS stopping to ask.');
+      } else {
+        var folderNotes = (state.accessFolders || []).filter(function (f) { return f.state !== 'missing'; }).map(function (f) {
+          return f.state === 'allowed'
+            ? note('note-ok', 'check-circle', esc(f.label) + ' is allowed.')
+            : note('note-warn', 'triangle-alert', esc(f.label) + ' is not allowed yet. Turn it on in System Settings → Privacy &amp; Security → Files and Folders.');
+        }).join('');
+        gates = '' +
+          '<div class="field">' +
+          '  <button class="btn btn-secondary" type="button" data-access-open="full_disk_access">' + ico('arrow-up-right') + '<span>Open System Settings</span></button>' +
+          (state.accessOpened ? ' <button class="btn btn-secondary btn-sm" type="button" data-access-check><span>Check again</span></button>' : '') +
+          '  <span class="hint">' + (state.accessOpened
+            ? 'Turn on Clementine in the Full Disk Access list, then press Check again.'
+            : 'Full Disk Access lets me open Desktop, Documents, Downloads and the rest without macOS stopping to ask in the middle of a task.') + '</span>' +
+          '</div>' +
+          '<div class="field">' +
+          '  <button class="btn btn-secondary btn-sm" type="button" data-access-folders' + (state.accessAsking ? ' disabled' : '') + '>' + ico('folder') +
+               '<span>' + (state.accessAsking ? 'Waiting for macOS…' : 'Just allow Desktop, Documents and Downloads') + '</span></button>' +
+          '  <span class="hint">Rather not turn on Full Disk Access? macOS asks for these three now instead of halfway through a task.</span>' +
+          '</div>' + folderNotes;
+      }
+    } else if (s && s.platform === 'windows') {
+      if (s.controlledFolderAccess === 'on' && s.appAllowed !== true) {
+        gates = note('note-warn', 'triangle-alert', 'Windows Security is blocking apps from changing files in your protected folders. In Ransomware protection, choose Allow an app through Controlled folder access and add Clementine.') +
+          '<div class="field"><button class="btn btn-secondary" type="button" data-access-open="controlled_folders">' + ico('arrow-up-right') + '<span>Open Windows Security</span></button>' +
+          (state.accessOpened ? ' <button class="btn btn-secondary btn-sm" type="button" data-access-check><span>Check again</span></button>' : '') + '</div>';
+      } else if (s.controlledFolderAccess === 'unknown') {
+        gates = note('', 'info', 'I could not read Windows Security. If I cannot save into Documents or Desktop later, allow Clementine under Ransomware protection.');
+      } else {
+        gates = note('note-ok', 'check-circle', 'Windows Security is not blocking me from your folders.');
+      }
+    }
+    return '' +
+      '<div class="step">' +
+      '  <div class="eyebrow">' + ico('lock') + '<span>Computer access</span></div>' +
+      '  <h1>What can I reach on this computer?</h1>' +
+      '  <p class="lede">Decide once, so I never stop halfway through a task to ask for a folder.</p>' +
+      '  <div class="choices">' +
+           choice('full', 'Full access (recommended)', 'Open, read and edit any of your files, look at pictures anywhere in your folders, and run commands in any folder.') +
+           choice('standard', 'Standard', 'Work in your files the same way, but look at pictures only when you attach them.') +
+      '  </div>' + gates +
+      '  <p class="hint">Either way, passwords and keys stay off-limits, and anything that leaves your computer still asks you first. You can change this any time in Settings → Computer access.</p>' +
+      '</div>';
+  }
+
+  function refreshAccessStatus() {
+    if (!window.clemmy.setupAccessStatus) return;
+    window.clemmy.setupAccessStatus().then(function (status) {
+      state.accessStatus = status;
+      if (currentStep() === 'access') render();
+    }).catch(function () { /* the step still works without the OS row */ });
   }
 
   function renderLaunch() {
@@ -966,6 +1040,43 @@ const SETUP_JS = `
         render();
       });
     });
+
+    mainEl.querySelectorAll('input[name="clem-access"]').forEach(function (el) {
+      el.addEventListener('change', function () {
+        if (!el.checked) return;
+        state.access = el.value === 'standard' ? 'standard' : 'full';
+        render();
+      });
+    });
+    if (currentStep() === 'access' && state.accessStatus === null) refreshAccessStatus();
+    mainEl.querySelectorAll('[data-access-open]').forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        if (!window.clemmy.setupAccessOpen) return;
+        try {
+          var result = await window.clemmy.setupAccessOpen(btn.getAttribute('data-access-open'));
+          state.accessOpened = Boolean(result && result.opened);
+        } catch (err) { /* the hint still says where the setting lives */ }
+        render();
+      });
+    });
+    var accessCheck = mainEl.querySelector('[data-access-check]');
+    if (accessCheck) accessCheck.addEventListener('click', function () { refreshAccessStatus(); });
+    var accessFolders = mainEl.querySelector('[data-access-folders]');
+    if (accessFolders) {
+      accessFolders.addEventListener('click', async function () {
+        if (!window.clemmy.setupAccessFolders) return;
+        state.accessAsking = true;
+        render();
+        try {
+          var result = await window.clemmy.setupAccessFolders();
+          state.accessFolders = (result && result.folders) || [];
+        } catch (err) {
+          state.accessFolders = [];
+        }
+        state.accessAsking = false;
+        render();
+      });
+    }
 
     mainEl.querySelectorAll('[data-state]').forEach(function (el) {
       var evt = el.tagName === 'SELECT' ? 'change' : 'input';
@@ -1140,7 +1251,11 @@ const SETUP_JS = `
       if (p.preferredName || p.role || p.timezone || p.communicationTone) {
         await window.clemmy.setupSaveProfile(p);
       }
-      // 7. Mark complete.
+      // 7. Computer access, when this run asked it.
+      if (STEPS.indexOf('access') !== -1 && window.clemmy.setupSaveAccess) {
+        await window.clemmy.setupSaveAccess(state.access === 'standard' ? 'standard' : 'full');
+      }
+      // 8. Mark complete.
       await window.clemmy.setupComplete({
         configured: {
           auth: state.authChoice === 'skipped' && already.auth !== 'none' ? already.auth : state.authChoice,
@@ -1163,4 +1278,4 @@ const SETUP_JS = `
 
 /** Exported for the test: the wizard never shows more than these, in this
  *  order, and never shows a channel step. */
-export const MAX_SETUP_STEPS: SetupStepId[] = ['welcome', 'auth', 'profile', 'workspace', 'launch'];
+export const MAX_SETUP_STEPS: SetupStepId[] = ['welcome', 'auth', 'profile', 'workspace', 'access', 'launch'];

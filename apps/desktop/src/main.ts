@@ -64,7 +64,8 @@ import {
   setCredential,
   type CredentialName,
 } from './credentials-bridge.js';
-import { addWorkspaceDir, ensureHomeEnv, saveUserProfile, setHomeEnv, type ProfilePatch } from './setup-bridge.js';
+import { addWorkspaceDir, ensureHomeEnv, saveUserProfile, setHomeEnv, type ProfilePatch, saveComputerAccess } from './setup-bridge.js';
+import { requestSetupFolders, setupAccessPageUrl, setupAccessStatus, type SetupAccessPage } from './computer-access-setup.js';
 import { importUsableCodexOAuthTokens, persistCodexOAuthTokens, runCodexOAuthLogin } from './codex-oauth.js';
 import { CredentialStoragePrivacyError, isCredentialStoragePrivacyError, readCredentialFileSync, readCredentialSourceFileSync } from './credential-private-filesystem.js';
 import { hasPersistedCodexGrant } from './auth-grant.js';
@@ -3615,6 +3616,34 @@ ipcMain.handle('clemmy:setup-pick-workspace-folder', async (evt: IpcMainInvokeEv
     : await dialog.showOpenDialog(opts);
   if (result.canceled || result.filePaths.length === 0) return { path: '' };
   return { path: result.filePaths[0] };
+});
+
+// Computer access, settled once at first run: the owner's choice, and the
+// operating system's own gates, so a task never stops on a system prompt.
+ipcMain.handle('clemmy:setup-access-status', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['setup']);
+  return setupAccessStatus();
+});
+
+ipcMain.handle('clemmy:setup-access-open', async (evt: IpcMainInvokeEvent, payload: { page?: string }) => {
+  assertIpcSender(evt, ['setup']);
+  const page = payload?.page;
+  if (page !== 'full_disk_access' && page !== 'controlled_folders') throw new Error('unknown system page');
+  if ((page === 'full_disk_access') !== (process.platform === 'darwin')) return { opened: false };
+  await shell.openExternal(setupAccessPageUrl(page as SetupAccessPage));
+  return { opened: true };
+});
+
+ipcMain.handle('clemmy:setup-access-folders', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['setup']);
+  if (process.platform !== 'darwin') return { folders: [] };
+  return { folders: await requestSetupFolders() };
+});
+
+ipcMain.handle('clemmy:setup-save-access', async (evt: IpcMainInvokeEvent, payload: { choice?: string }) => {
+  assertIpcSender(evt, ['setup']);
+  saveComputerAccess(payload?.choice === 'full' ? 'full' : 'standard');
+  return { ok: true };
 });
 
 ipcMain.handle('clemmy:setup-codex-login', async (evt: IpcMainInvokeEvent) => {

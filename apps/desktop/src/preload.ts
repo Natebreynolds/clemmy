@@ -110,6 +110,12 @@ const api = {
   credentialsSet: (name: string, value: string) => ipcRenderer.invoke('clemmy:credentials-set', { name, value }) as Promise<Record<string, unknown>>,
   /** Persist a workspace path to ~/.clementine-next/.env's WORKSPACE_DIRS. */
   setupSaveWorkspace: (absPath: string) => ipcRenderer.invoke('clemmy:setup-save-workspace', { path: absPath }) as Promise<{ ok: boolean }>,
+  /** Computer access step: the OS gates, open the page that grants them,
+   *  ask macOS for the protected folders now, and save the owner's choice. */
+  setupAccessStatus: () => ipcRenderer.invoke('clemmy:setup-access-status') as Promise<{ platform: 'mac' | 'windows' | 'other'; fullDiskAccess?: string; controlledFolderAccess?: string; appAllowed?: boolean | null }>,
+  setupAccessOpen: (page: 'full_disk_access' | 'controlled_folders') => ipcRenderer.invoke('clemmy:setup-access-open', { page }) as Promise<{ opened: boolean }>,
+  setupAccessFolders: () => ipcRenderer.invoke('clemmy:setup-access-folders') as Promise<{ folders: Array<{ label: string; state: string }> }>,
+  setupSaveAccess: (choice: 'full' | 'standard') => ipcRenderer.invoke('clemmy:setup-save-access', { choice }) as Promise<{ ok: boolean }>,
   /** Native folder picker for the setup wizard's workspace step. */
   setupPickWorkspaceFolder: () => ipcRenderer.invoke('clemmy:setup-pick-workspace-folder') as Promise<{ path: string }>,
   /** Run the Codex OAuth flow from the main process — opens the user's
