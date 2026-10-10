@@ -43,6 +43,7 @@ import {
   resolveEffectiveProviderForModel,
   resolveByoProviderForModel,
   isByoModelNotServed,
+  captureByoRoutingSnapshot,
 } from './byo-providers.js';
 import { slugifyIntent } from '../../memory/tool-choice-store.js';
 import { modelUsageAttributionStorage } from '../usage-log.js';
@@ -623,6 +624,12 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
  * inactive snapshot while the collision reason explains why no route was used;
  * valid/default/policy routes always use the strict effective resolver above. */
 function providerForInactiveBinding(modelId: string): ModelProviderClass {
+  // A model a named BYO provider declares is that provider's, connected or
+  // not: the binding is inactive because THAT provider is unavailable, never
+  // because the id is shaped like a subscription model.
+  try {
+    if (captureByoRoutingSnapshot().ownersForModel(modelId).some(({ provider }) => provider.id !== 'default')) return 'byo';
+  } catch { /* the wire-shape answer below */ }
   try {
     return resolveEffectiveProviderForModel(modelId);
   } catch {

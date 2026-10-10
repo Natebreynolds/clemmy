@@ -433,11 +433,12 @@ test('the fast-tier jobs name the model the router actually serves them, and the
   const fast = ['skills', 'identity', 'import'] as const;
   const memoryAccounts = () => [...rolesByAccount()].filter(([, roles]) => roles.includes('memory')).map(([account]) => account).sort();
 
-  // BYO all-in with Codex also signed in: the router sends the fast-tier
-  // string to the BYO primary, so Codex does no memory work.
+  // BYO all-in with no subscription signed in: the router sends the
+  // fast-tier string to the BYO primary, so the job names it and no
+  // subscription account carries memory work.
   Object.assign(process.env, { AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_JUDGE_ID: 'byo-judge-model' });
   useByo();
-  writeAuth({ claude: false });
+  writeAuth({ claude: false, codex: false });
   let described = describeMemoryModel();
   for (const job of fast) {
     assert.equal(memoryJobModelId(job, described), 'byo-memory-model', `${job} names the BYO primary`);
@@ -445,7 +446,18 @@ test('the fast-tier jobs name the model the router actually serves them, and the
     assert.equal(resolveMemoryModelRoute(job)?.model, job === 'import' ? (MODELS.fast || MODELS.primary || DEFAULT_CODEX_FAST_MODEL) : MODELS.fast,
       `${job} still hands the agent today's string`);
   }
-  assert.ok(!memoryAccounts().includes('codex'), 'the connected Codex account keeps no memory here');
+  assert.ok(!memoryAccounts().includes('codex'), 'no Codex account, no Codex memory');
+
+  // The same all-in home with Codex signed in: a connected subscription keeps
+  // its own lane (byo-providers, 10-05), so the fast-tier string is served by
+  // Codex. The job names what actually serves it, and the meter credits Codex.
+  writeAuth({ claude: false });
+  described = describeMemoryModel();
+  for (const job of fast) {
+    const served = memoryJobModelId(job, described);
+    assert.ok(served && served !== 'byo-memory-model', `${job} names the subscription model that serves it, not the BYO primary`);
+  }
+  assert.ok(memoryAccounts().includes('codex'), 'the account that serves memory work carries it');
 
   // Claude signed in without Codex: the router sends a Codex-shaped string
   // to the Claude brain.

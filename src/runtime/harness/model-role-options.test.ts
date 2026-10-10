@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -86,6 +86,13 @@ function writeAuthFiles(): void {
     refreshToken: 'claude-refresh',
     expiresAt: Date.now() + 60 * 60 * 1000,
   }), 'utf-8');
+}
+
+/** No subscription signed in: a test that means "Codex is not connected" says so,
+ * instead of inheriting whatever an earlier test in this file wrote. */
+function removeSubscriptionAuth(): void {
+  rmSync(path.join(home, 'state', 'auth.json'), { force: true });
+  blockClaudeKeychainFallback();
 }
 
 function blockClaudeKeychainFallback(): void {
@@ -248,9 +255,15 @@ test('an explicitly selected fallback keeps connected subscription and API route
     BYO_PROVIDER_REVIEW_API_KEY: 'review-key',
   }, () => {
     const ordinary = connectedModelGroupsForRole('judge');
-    assert.equal(ordinary.some((group) => group.provider === 'codex'), false,
-      'the existing all-in primary judge catalog remains unchanged');
-    assert.equal(validateRoleModelBinding('judge', 'gpt-5.4-nano').ok, false);
+    // A connected subscription keeps its own lane in all-in (byo-providers,
+    // 10-05): the ordinary judge list may offer it, and it offers exactly what
+    // validation accepts.
+    const offeredOrdinary = ordinary.flatMap((group) => group.models.map((model) => model.id));
+    for (const id of offeredOrdinary) {
+      assert.equal(validateRoleModelBinding('judge', id).ok, true, `${id} is offered, so it is accepted`);
+    }
+    assert.equal(validateRoleModelBinding('judge', 'gpt-5.4-nano').ok, offeredOrdinary.includes('gpt-5.4-nano'),
+      'the ordinary list and validation agree');
 
     const fallback = connectedJudgeFallbackModelGroups();
     assert.equal(fallback.find((group) => group.provider === 'codex')?.models.some((model) => model.id === 'gpt-5.4-nano'), true);
@@ -521,6 +534,7 @@ test('brainOptions includes a BYO brain when configured; effectiveBrain reflects
 });
 
 test('all_in is provider-isolated and gpt-shaped BYO ids remain BYO in role/UI reporting', () => {
+  removeSubscriptionAuth();
   withEnv({
     BYO_MODEL_BASE_URL: 'https://api.together.test/v1',
     BYO_MODEL_ID: 'gpt-4o',

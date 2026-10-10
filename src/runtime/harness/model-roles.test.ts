@@ -213,7 +213,9 @@ test('all_in declared gpt-shaped BYO binding and inactive reporting stay on the 
     assert.equal(resolved.provider, 'byo');
     assert.equal(resolved.inactiveBinding?.modelId, 'gpt-4o');
     assert.equal(resolved.inactiveBinding?.provider, 'byo');
-    assert.match(resolved.inactiveBinding?.reason ?? '', /Codex-family ids stay on the BYO backend in all-in/);
+    // The declaring provider is named: a better reason than the older
+    // family-rule sentence this pin carried.
+    assert.match(resolved.inactiveBinding?.reason ?? '', /declared by BYO provider Together, but that provider is not connected/);
   });
 });
 
