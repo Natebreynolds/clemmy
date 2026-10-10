@@ -92,7 +92,7 @@ import {
 } from '../runtime/harness/session-composition.js';
 import { actionControlAdmittedForTaskState, actionControlContextFor, actionTopologyRoleFor, deriveOrchestratorDiscoveryNames, isRegistryDeclaredRead, deriveGuardrailMutating, isRegisteredDelegationPrimitive } from '../tools/tool-registry.js';
 import { buildCallTool, type BuildCallToolOptions, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
-import { buildWorkCall, disclosedWorkCallReadyOperations, renderWorkCallReadyBlock, type BuildWorkCallOptions } from '../tools/work-call.js';
+import { buildWorkCall, disclosedWorkCallReadyOperations, type BuildWorkCallOptions } from '../tools/work-call.js';
 import { buildPlanTaskTool } from '../tools/plan-tools.js';
 import { isHostOnlyActionControl } from '../tools/tool-registry.js';
 import {
@@ -4356,17 +4356,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (!planMode) workCallOptions.disclosedOperations = presentation.disclosedOperations;
     }
   }
-  // The ready operations change from turn to turn, and tool definitions sit
-  // before the conversation in the cached prompt prefix: listed in
-  // work_call's definition, a new turn's list re-sent the whole conversation
-  // uncached. They ride the turn's context instead, frozen for the turn.
-  let workCallReadyBlock: string | null = null;
   if (carrierWork && workCallOptions) {
     const disclosed = workCallDisclosuresAtTurnStart(
       options.sessionId, options.sourceUserSeq, taskMode?.kind ?? 'chat', workCallOptions.disclosedOperations ?? [],
     );
-    workCallReadyBlock = disclosed.length > 0 ? renderWorkCallReadyBlock(disclosed) : null;
-    delete workCallOptions.disclosedOperations;
+    if (disclosed.length > 0) workCallOptions.disclosedOperations = disclosed;
+    else delete workCallOptions.disclosedOperations;
   }
   const narrowSurface = provenDisclosure.narrowSurface === true;
   const assembledTools = turnStateToolsLast([
@@ -4522,7 +4517,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       : null,
     catalogBlock,
     nativeHintContracts,
-    workCallReadyBlock,
     turnDesk ? renderDeskNamesLine(turnDesk.deferred) : null,
     renderCapabilityCandidateCard(options.turnCandidates),
   ].filter(Boolean).join('\n\n');

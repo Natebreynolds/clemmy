@@ -16,7 +16,6 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
-import { RunContext } from '@openai/agents';
 
 const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-turn-desk-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
@@ -375,7 +374,7 @@ test('a tool reached for during a turn joins the tools block at the owner\'s nex
   assert.equal(names(nextTurn).includes('view_image'), true, 'the next turn carries the tool it reached for');
 });
 
-test('work_call\'s definition never changes between turns; its ready list rides the turn context, frozen for the turn', async () => {
+test('a rebuild of the same turn keeps work_call\'s ready list; an operation found during the turn joins at the next message', async () => {
   const sessionId = 'work-call-disclosure-turn';
   const descriptor = {
     id: 'cap:resolved:quillboard_pages_batch_update', effect: 'external_write', purpose: 'Update the pages of a deck',
@@ -389,26 +388,20 @@ test('work_call\'s definition never changes between turns; its ready list rides 
   });
   const workCallBytes = (agent: unknown) => JSON.stringify(agentTools(agent)
     .filter((entry) => entry.name === 'work_call').map((entry) => [entry.description, entry.parameters]));
-  const readyLine = async (agent: unknown) => String(await (agent as { getSystemPrompt: (context: unknown) => Promise<unknown> })
-    .getSystemPrompt(new RunContext({}))).split('\n').find((line) => line.startsWith('[work_call ready]')) ?? '';
   const source = acceptSource(sessionId, TARGETED);
   const opening = await buildFor(sessionId, source.seq, TARGETED, idleModel);
   const before = workCallBytes(opening);
   assert.notEqual(before, '[]', 'the turn carries work_call');
-  assert.doesNotMatch(await readyLine(opening), /QUILLBOARD_PAGES_BATCH_UPDATE/);
+  assert.doesNotMatch(before, /QUILLBOARD_PAGES_BATCH_UPDATE/);
   // The turn finds an operation, then restarts after the owner approves.
   proven(source.seq);
   const resumed = await buildFor(sessionId, source.seq, TARGETED, idleModel, { acceptedRoute: 'act' });
   assert.equal(workCallBytes(resumed), before, 'the restarted turn re-sends work_call byte for byte');
-  assert.equal(await readyLine(resumed), await readyLine(opening), 'the ready list is frozen for the turn');
-  // The owner's next message lists it, in the turn context: the definition,
-  // which sits before the cached conversation, does not change.
+  // The owner's next message lists it.
   const next = acceptSource(sessionId, TARGETED);
   proven(next.seq);
   const nextTurn = await buildFor(sessionId, next.seq, TARGETED, idleModel);
-  assert.match(await readyLine(nextTurn), /QUILLBOARD_PAGES_BATCH_UPDATE/, 'the next turn lists the operation as ready');
-  assert.equal(workCallBytes(nextTurn), before, 'work_call is byte-identical across turns');
-  assert.doesNotMatch(workCallBytes(nextTurn), /QUILLBOARD_PAGES_BATCH_UPDATE/);
+  assert.match(workCallBytes(nextTurn), /QUILLBOARD_PAGES_BATCH_UPDATE/, 'the next turn lists the operation as ready');
 });
 
 test('Jev off and Jev on without a key decide the same desk and send the same tools block', async () => {

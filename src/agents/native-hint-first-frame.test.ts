@@ -99,9 +99,6 @@ const contracts = async (agent: Awaited<ReturnType<typeof buildOrchestratorAgent
   }>;
 };
 
-/** The turn context's ready list for work_call. */
-const readyLine = (system: string) => system.split('\n').find(row => row.startsWith('[work_call ready]')) ?? '';
-
 test('a native first frame preserves an opaque selected model adapter without borrowing the saved brain window', async () => {
   const model = {
     async getResponse() { throw new Error('Preparation must not invoke the model'); },
@@ -174,7 +171,6 @@ test('hinted native business contract is complete and source-owned before the fi
   assert.match(line, /Supplemental contextual reads may use their capabilityRef without claiming completion of a required step/);
   assert.doesNotMatch(f.agent.tools.find(tool => tool.name === 'work_call')!.description, new RegExp(ref),
     'the exact eager ref is not repeated in carrier READY prose');
-  assert.doesNotMatch(readyLine(instructions), new RegExp(ref), 'nor in the turn\'s ready list');
   assert.equal(rows[0]!.capabilityVariants[0]!.effect, 'local_write');
   assert.equal(rows[0]!.capabilityVariants[0]!.purpose, 'run_local_command');
   assert.equal(rows[0]!.capabilityVariants[0]!.deliverableKind, 'local_command');
@@ -199,7 +195,6 @@ test('hinted native business contract is complete and source-owned before the fi
     'publication state does not alter the immutable callable universe');
   assert.doesNotMatch(rebuilt.tools.find(tool => tool.name === 'work_call')!.description, new RegExp(ref),
     'same-source rebuild also filters the original staged disclosure');
-  assert.doesNotMatch(readyLine(String(await rebuilt.getSystemPrompt(new RunContext({})))), new RegExp(ref));
   assert.equal((await contracts(rebuilt))[0]!.capabilityVariants[0]!.purpose, 'run_local_command');
 });
 
@@ -236,7 +231,6 @@ test('explicit Plan retains the schema and ref for publish_plan without an execu
   assert.doesNotMatch(line, /Invoke the selected operation|as requirement_id/);
   assert.doesNotMatch(f.agent.tools.find(tool => tool.name === 'work_call')?.description ?? '',
     /cap:local:run_shell_command:ordinary/, 'new Plan disclosure is not described as ordinary ready execution');
-  assert.doesNotMatch(readyLine(String(instructions)), /cap:local:run_shell_command:ordinary/);
   assert.equal(rows[0]!.capabilityVariants[0]!.effect, undefined,
     'Plan keeps its preparation-only presentation unchanged');
   assert.ok(f.agent.tools.some(tool => tool.name === 'publish_plan'));
@@ -250,13 +244,11 @@ test('unhinted same-source READY refs remain while a complete eager ref is prese
     allow: ['write_file', 'run_shell_command', 'tool_search'] });
   const rows = await contracts(f.agent);
   assert.deepEqual(rows.map(row => row.name), ['run_shell_command']);
-  const ready = readyLine(String(await f.agent.getSystemPrompt(new RunContext({}))));
-  assert.doesNotMatch(ready, /cap:local:run_shell_command:ordinary/);
+  const description = f.agent.tools.find(tool => tool.name === 'work_call')!.description;
+  assert.doesNotMatch(description, /cap:local:run_shell_command:ordinary/);
   for (const variant of ['create', 'append', 'overwrite', 'replace']) {
-    assert.match(ready, new RegExp(`cap:local:write_file:${variant}`));
+    assert.match(description, new RegExp(`cap:local:write_file:${variant}`));
   }
-  assert.doesNotMatch(f.agent.tools.find(tool => tool.name === 'work_call')!.description, /cap:local:/,
-    'the ready list rides the turn context, never work_call\'s definition');
 });
 
 test('an oversized already-disclosed hint retains its exact carrier presentation', async () => {
@@ -265,7 +257,7 @@ test('an oversized already-disclosed hint retains its exact carrier presentation
   local._setConfiguredLocalPlanningToolObserverForTests(schemaObserver({ run_shell_command: schema }));
   const f = await fixture({ model, preDisclosed: ['run_shell_command'] });
   assert.deepEqual(await contracts(f.agent), []);
-  assert.match(readyLine(String(await f.agent.getSystemPrompt(new RunContext({})))),
+  assert.match(f.agent.tools.find(tool => tool.name === 'work_call')!.description,
     /cap:local:run_shell_command:ordinary/, 'only a fully emitted contract can replace an existing READY row');
 });
 
