@@ -19,8 +19,11 @@ const SRC = readFileSync(new URL('./host-turn-runner.ts', import.meta.url), 'utf
 test('settlementRequiresReconciliation is gated on the irreversible boundary', async () => {
   assert.match(
     SRC,
-    /settlementRequiresReconciliation =\s*\n\s*invoked\.settlement\.outcome\.directive\.requiresReconciliation === true\s*\n\s*&& uncertainEffectStopsTurn\(effect\);/,
-    'a local write or read that may have started must not hard-block; only external_write/admin reconcile',
+    // v3.18.32 added the third clause on purpose: a provider that ANSWERED with
+    // a refusal is read back, not reconciled; only a dropped acknowledgement
+    // hard-stops.
+    /settlementRequiresReconciliation =\s*\n\s*invoked\.settlement\.outcome\.directive\.requiresReconciliation === true\s*\n\s*&& uncertainEffectStopsTurn\(effect\)\s*\n\s*&& !providerAnsweredWithRefusal\(invoked\.settlement\.outcome\);/,
+    'a local write or read that may have started must not hard-block; only external_write/admin reconcile, and an answered refusal never does',
   );
   // One rule, shared with the checkpoint that must accept what the runner showed.
   const { uncertainEffectStopsTurn } = await import('./reconciliation-stop.js');

@@ -124,11 +124,19 @@ test('held parent and migration child have exact minimal runtime import closures
       'src/daemon/liveness-beacon.ts',
       'src/daemon/phase.ts',
       'src/daemon/process.ts',
+      // The held parent reads its home through the credential policy
+      // (config.ts → credential-private-filesystem): the private-directory
+      // check, its Windows ACL leaf, the fsync helper and the ASCII JSON leaf
+      // the Windows probe speaks. Node built-ins only; no package added.
+      'src/runtime/ascii-json.ts',
       'src/runtime/build-info.ts',
+      'src/runtime/credential-private-filesystem.ts',
       'src/runtime/cutover-hold.ts',
       'src/runtime/harness/schema-version.ts',
       'src/runtime/security.ts',
       'src/runtime/source-fingerprint.ts',
+      'src/runtime/sync-directory.ts',
+      'src/runtime/windows-private-filesystem.ts',
     ],
     packages: ['better-sqlite3', 'pino'],
   });
@@ -137,7 +145,10 @@ test('held parent and migration child have exact minimal runtime import closures
       'src/config.ts',
       'src/daemon/cutover-hold-migrate.ts',
       'src/daemon/process.ts',
+      // Same credential-policy read of the home as the held parent (config.ts).
+      'src/runtime/ascii-json.ts',
       'src/runtime/build-info.ts',
+      'src/runtime/credential-private-filesystem.ts',
       'src/runtime/cutover-hold.ts',
       // Exact-history schema/decoder leaf for v89/v90: Node crypto/zlib only,
       // with a type-only SQLite import; no SDK, eventlog, credential or task runtime.
@@ -155,6 +166,8 @@ test('held parent and migration child have exact minimal runtime import closures
       'src/runtime/harness/session-history-search-schema.ts',
       'src/runtime/security.ts',
       'src/runtime/source-fingerprint.ts',
+      'src/runtime/sync-directory.ts',
+      'src/runtime/windows-private-filesystem.ts',
       'src/shared/closed-canonical-json.ts',
     ],
     packages: ['better-sqlite3'],
