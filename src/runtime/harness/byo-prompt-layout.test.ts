@@ -149,6 +149,28 @@ test('the anchor layout is adopted only when it reused clearly more in every rou
   assert.deepEqual(decidePromptLayout([round(2_176, 7_168)]), { layout: 'system', reason: 'probe_failed' });
 });
 
+test('a round where either layout reused nothing is a cache miss, not a verdict', () => {
+  // Live 2026-10-10: one clear anchor win, then two rounds the provider served no cache to.
+  assert.deepEqual(decidePromptLayout([round(2_432, 7_936), round(2_432, 0), round(0, 0)]),
+    { layout: 'system', reason: 'probe_failed' }, 'one served round is inconclusive');
+  assert.deepEqual(decidePromptLayout([round(2_176, 7_168), round(2_176, 0), round(2_176, 7_040)]),
+    { layout: 'turn_anchor', reason: 'anchor_reused_more' }, 'two served wins decide; the miss does not');
+  assert.deepEqual(decidePromptLayout([round(4_800, 2_624), round(0, 7_000), round(4_864, 2_688)]),
+    { layout: 'system', reason: 'anchor_not_better' }, 'served losses still decide');
+});
+
+test('a verdict its own rounds no longer support is measured again', () => {
+  _resetPromptLayoutForTest();
+  const base = 'https://provider.example/v1/';
+  const now = Date.parse('2026-10-10T08:03:31.228Z');
+  recordPromptLayoutVerdict(base, 'noisy-model', { layout: 'system', reason: 'anchor_not_better', measuredAt: new Date(now).toISOString(),
+    rounds: [round(2_432, 7_936), round(2_432, 0), round(0, 0)] });
+  assert.equal(promptLayoutProbeDue(base, 'noisy-model', now + 60_000), true, 'decided under an older rule: due now');
+  recordPromptLayoutVerdict(base, 'steady-model', { layout: 'turn_anchor', reason: 'anchor_reused_more', measuredAt: new Date(now).toISOString(),
+    rounds: [round(2_176, 7_168), round(2_176, 7_168), round(2_176, 7_040)] });
+  assert.equal(promptLayoutProbeDue(base, 'steady-model', now + 60_000), false, 'a verdict its rounds support stays');
+});
+
 test('a verdict applies only while fresh; a failed probe is retried after a day', () => {
   _resetPromptLayoutForTest();
   const base = 'https://provider.example/v1/';
@@ -353,4 +375,23 @@ test('adapter: without a measured win the request is byte-identical to the syste
   const plain = wrapCompletionsCreate(async (params) => { sent.push(params); return completion(); });
   await harnessRunContextStorage.run(runContext(digest('what changed this week?')), () => plain(brainBody({ model: 'provider/model-f' })));
   assert.deepEqual(sent[1], sent[0], 'a client without a layout endpoint behaves as before');
+});
+
+test('an inconclusive or failed re-measurement keeps the layout in use and retries after a day', async () => {
+  _resetPromptLayoutForTest();
+  const input = { baseURL: 'https://kept.example/v1', model: 'provider/model-k', sleep: async () => {},
+    create: async () => { throw Object.assign(new Error('unavailable'), { status: 503 }); } };
+  const long = Date.now() - PROMPT_LAYOUT_VERDICT_TTL_MS - 60_000;
+  recordPromptLayoutVerdict(input.baseURL, input.model, { layout: 'turn_anchor', reason: 'anchor_reused_more',
+    measuredAt: new Date(long).toISOString(), rounds: [round(2_176, 7_168), round(2_176, 7_168), round(2_176, 7_040)] });
+  assert.equal(promptLayoutProbeDue(input.baseURL, input.model), true, 'the old verdict expired');
+  schedulePromptLayoutProbe(input);
+  for (let i = 0; i < 50 && readPromptLayoutVerdict(input.baseURL, input.model)?.reason !== 'probe_failed'; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const kept = readPromptLayoutVerdict(input.baseURL, input.model)!;
+  assert.equal(kept.reason, 'probe_failed');
+  assert.equal(kept.layout, 'turn_anchor', 'a failed measurement is no evidence against the layout in use');
+  assert.equal(promptLayoutFor(input.baseURL, input.model), 'turn_anchor');
+  assert.equal(promptLayoutProbeDue(input.baseURL, input.model, Date.now() + PROMPT_LAYOUT_FAILED_RETRY_MS), true);
 });

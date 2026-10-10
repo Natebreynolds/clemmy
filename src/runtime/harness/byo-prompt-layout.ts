@@ -120,20 +120,37 @@ export function promptLayoutProbeDue(baseURL: string, model: string, now = Date.
   if (!verdict) return true;
   const at = Date.parse(verdict.measuredAt);
   if (!Number.isFinite(at)) return true;
+  if (!decidedUnderCurrentRule(verdict)) return true;
   const wait = verdict.reason === 'probe_failed' ? PROMPT_LAYOUT_FAILED_RETRY_MS : PROMPT_LAYOUT_VERDICT_TTL_MS;
   return now - at >= wait;
 }
 
-/** Adopt the anchor layout only when it reused clearly more in every round. */
+/**
+ * Adopt the anchor layout only when it reused clearly more in every round
+ * that measured anything. Both layouts send the same stable system text
+ * first, so a provider that served its cache serves at least that to both; a
+ * round where either side reused nothing is a cache miss, not a verdict on
+ * the layout. Fewer than two rounds with both sides served is inconclusive.
+ */
 export function decidePromptLayout(rounds: readonly PromptLayoutRound[]): Pick<PromptLayoutVerdict, 'layout' | 'reason'> {
   if (rounds.length < PROMPT_LAYOUT_PROBE_ROUNDS) return { layout: 'system', reason: 'probe_failed' };
   if (rounds.every((round) => round.systemReuse <= 0 && round.anchorReuse <= 0)) {
     return { layout: 'system', reason: 'no_prefix_cache' };
   }
-  const anchorWins = rounds.every((round) => round.anchorReuse > round.systemReuse * 1.15 + 256);
+  const served = rounds.filter((round) => round.systemReuse > 0 && round.anchorReuse > 0);
+  if (served.length < 2) return { layout: 'system', reason: 'probe_failed' };
+  const anchorWins = served.every((round) => round.anchorReuse > round.systemReuse * 1.15 + 256);
   return anchorWins
     ? { layout: 'turn_anchor', reason: 'anchor_reused_more' }
     : { layout: 'system', reason: 'anchor_not_better' };
+}
+
+/** A stored verdict the current rule would decide differently from its own
+ *  rounds is measured again. */
+function decidedUnderCurrentRule(verdict: PromptLayoutVerdict): boolean {
+  if (verdict.rounds.length < PROMPT_LAYOUT_PROBE_ROUNDS || verdict.reason === 'probe_failed') return true;
+  const again = decidePromptLayout(verdict.rounds);
+  return again.layout === verdict.layout && again.reason === verdict.reason;
 }
 
 // --- turn anchor --------------------------------------------------------
@@ -370,7 +387,13 @@ export function schedulePromptLayoutProbe(input: PromptLayoutProbeInput): void {
     () => {
       void (async () => {
         try {
-          const verdict = await measurePromptLayout(input);
+          const measured = await measurePromptLayout(input);
+          // An inconclusive or failed measurement is no evidence against the
+          // layout in use: keep it, and measure again after the retry delay.
+          const previous = readPromptLayoutVerdict(input.baseURL, input.model);
+          const verdict = measured.reason === 'probe_failed' && previous?.layout === 'turn_anchor'
+            ? { ...measured, layout: 'turn_anchor' as const }
+            : measured;
           recordPromptLayoutVerdict(input.baseURL, input.model, verdict);
           logger.info({ baseURL: input.baseURL, model: input.model, ...verdict }, 'measured prompt layout');
         } catch { /* measurement is additive; the system layout stays in use */ } finally {
