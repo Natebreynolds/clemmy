@@ -20,7 +20,7 @@ const { _setDiscoveredModelsForTest } = await import('./model-discovery.js');
 const { closeEventLog } = await import('./eventlog.js');
 
 /** One scripted reviewer turn: a verdict, or a lookup the runner executes. */
-type Step = string | { tool: 'open_evidence' | 'query_evidence'; args: Record<string, unknown> };
+type Step = string | Error | { tool: 'open_evidence' | 'query_evidence'; args: Record<string, unknown> };
 let script: Step[] = [];
 const requests: ModelRequest[] = [];
 
@@ -29,6 +29,7 @@ const reviewer: Model = {
     requests.push(request);
     const step = script.shift();
     if (step === undefined) throw new Error('the reviewer was asked more often than this review allows');
+    if (step instanceof Error) throw step;
     if (typeof step === 'string') {
       return { output: [{ type: 'message', role: 'assistant', status: 'completed',
         content: [{ type: 'output_text', text: step, providerData: {} }] }],
@@ -232,22 +233,67 @@ test('one page of two is not the list: the second page completes the inspection'
   assert.deepEqual(verdict.evidenceCoverage?.lookups.map((lookup) => [lookup.offset, lookup.recordsReturned]), [[0, 50], [50, 44]]);
 });
 
-test('a verdict that never says what it needs the whole of is asked once, then stands as unattested', async () => {
+test('a verdict that never attests its coverage is not reported as a passing review', async () => {
   script = ['DONE: the event was created.', 'DONE: the event was created, confirmed by its receipt.'];
   const verdict = await review();
   assert.equal(requests.length, 2);
   assert.match(promptOf(requests[1]!), /did not say which results it needs the whole of/);
-  assert.equal(verdict.done, true, 'nothing shows the verdict needs the unopened result, so the work is not sent back');
+  assert.equal(verdict.done, true, 'the existing failed-open policy preserves landed work');
+  assert.equal(verdict.failedOpen, true);
+  assert.equal(verdict.reviewFailure, 'invalid');
+  assert.equal(verdict.repairScope, undefined, 'missing review qualification is not invented incomplete work');
+  assert.match(verdict.reason, /no review was completed.*Required evidence coverage/);
   assert.equal(verdict.evidenceCoverage?.status, 'unattested');
   assert.equal(verdict.evidenceCoverage?.needsAllOf, null);
 });
 
-test('a follow-up that gets no answer leaves the first verdict and its record standing', async () => {
+test('an unreadable coverage follow-up preserves its record but cannot qualify the earlier acceptance', async () => {
   script = ['DONE: the event was created.', 'The receipt looks right to me.', 'Still no verdict line here.'];
   const verdict = await review();
   assert.equal(verdict.done, true);
+  assert.equal(requests.length, 3, 'one follow-up and its existing one format-repair attempt, no further review');
+  assert.equal(verdict.failedOpen, true);
+  assert.equal(verdict.reviewFailure, 'invalid');
+  assert.equal(verdict.repairScope, undefined);
   assert.equal(verdict.evidenceCoverage?.status, 'unattested');
   assert.equal(verdict.evidenceCoverage?.followUp, 'unanswered');
+});
+
+test('an unavailable coverage follow-up is reported as unavailable rather than successful or missing work', async () => {
+  script = ['DONE: the event was created.', new Error('controlled non-transient reviewer failure')];
+  const verdict = await review();
+  assert.equal(requests.length, 2, 'the qualification check adds no retry after the existing follow-up fails');
+  assert.equal(verdict.done, true);
+  assert.equal(verdict.failedOpen, true);
+  assert.equal(verdict.reviewFailure, 'unavailable');
+  assert.equal(verdict.repairScope, undefined);
+  assert.match(verdict.reason, /no review was completed/);
+  assert.equal(verdict.evidenceCoverage?.status, 'unattested');
+  assert.equal(verdict.evidenceCoverage?.followUp, 'unanswered');
+});
+
+test('a format-repaired completion attests its coverage in the same output without another coverage call', async () => {
+  script = ['The created event is supported by the exact write receipt; the verdict rests on that receipt.',
+    'DONE: the event was created.\nNEEDS ALL OF: call_write'];
+  const verdict = await review();
+  assert.equal(requests.length, 2, 'the initial review plus one existing format repair, no extra coverage review');
+  assert.equal(verdict.done, true);
+  assert.equal(verdict.failedOpen, undefined);
+  assert.equal(verdict.evidenceCoverage?.status, 'sufficient');
+  assert.deepEqual(verdict.evidenceCoverage?.needsAllOf, ['call_write']);
+  assert.equal(verdict.evidenceCoverage?.followUp, undefined);
+  assert.match(String(requests[1]!.systemInstructions), /required NEEDS ALL OF line/);
+});
+
+test('a genuine second negative verdict stays authoritative without an acceptance attestation', async () => {
+  script = ['DONE: the event was created.', 'CORRECT: (1) "none of these existed" is not established by the shown records.'];
+  const verdict = await review();
+  assert.equal(requests.length, 2);
+  assert.equal(verdict.done, false);
+  assert.equal(verdict.failedOpen, undefined);
+  assert.equal(verdict.repairScope, 'claims');
+  assert.match(verdict.reason, /not established/);
+  assert.equal(verdict.evidenceCoverage?.followUp, 'answered');
 });
 
 test('a source that reported more than it returned cannot support absence, however much was read', async () => {

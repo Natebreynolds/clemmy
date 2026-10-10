@@ -74,7 +74,7 @@ export type ReviewCoverageStatus =
   | 'sufficient'
   /** The verdict did not say what it needs the whole of, and results were shown in part. */
   | 'unattested'
-  /** The verdict needs the whole of a result that was not inspected in full. */
+  /** The verdict needs an unknown result, or one not inspected in full. */
   | 'insufficient';
 
 export interface ReviewCoverageAssessment {
@@ -194,18 +194,23 @@ export function reviewEvidenceCoverage(
   return rows;
 }
 
-const NEEDS_ALL_OF_LINE = /^\s*NEEDS ALL OF\s*[:\-]\s*(.*)$/im;
+const NEEDS_ALL_OF_LINE = /^[\t ]*NEEDS ALL OF[\t ]*[:\-][\t ]*(.*)$/i;
 
 /** The results a verdict says it needs the whole of: where something must be
  * absent from the result or true of every record in it. A verdict
- * resting only on what it was shown names none. Null when the verdict did
- * not say; an empty list when it said none. Refs are matched exactly. */
+ * resting only on what it was shown names none. Null when the verdict
+ * did not give one unambiguous line; an empty list only for a lone none.
+ * Refs are matched exactly. */
 export function parseNeedsAllOf(finalOutput: unknown): string[] | null {
-  const match = NEEDS_ALL_OF_LINE.exec(String(finalOutput ?? ''));
-  if (!match) return null;
-  const listed = (match[1] ?? '').trim();
-  if (!listed || /^none\b/i.test(listed)) return [];
-  return [...new Set(listed.split(/[\s,;]+/).map((ref) => ref.replace(/^[`"'[(]+|[`"'\]).]+$/g, '')).filter(Boolean))];
+  const lines = String(finalOutput ?? '').split(/\r?\n/)
+    .map(line => NEEDS_ALL_OF_LINE.exec(line)).filter(match => match !== null);
+  if (lines.length !== 1) return null;
+  const listed = (lines[0]![1] ?? '').trim();
+  if (!listed) return null;
+  if (/^none[.!;]?$/i.test(listed)) return [];
+  if (/^none\b/i.test(listed)) return null;
+  const refs = [...new Set(listed.split(/[\s,;]+/).map((ref) => ref.replace(/^[`"'[(]+|[`"'\]).]+$/g, '')).filter(Boolean))];
+  return refs.length > 0 ? refs : null;
 }
 
 /** Compare what a verdict rests on with what the review inspected. */
@@ -248,7 +253,7 @@ export function assessReviewCoverage(input: {
       unknownRefs.push(ref);
     }
   }
-  return { status: unsupported.length > 0 ? 'insufficient' : 'sufficient', rows, open, unsupported, unknownRefs, needsAllOf };
+  return { status: unsupported.length > 0 || unknownRefs.length > 0 ? 'insufficient' : 'sufficient', rows, open, unsupported, unknownRefs, needsAllOf };
 }
 
 function describeRow(row: EvidenceCoverageRow): string {
@@ -302,7 +307,7 @@ export function reviewCoverageFollowUp(assessment: ReviewCoverageAssessment): st
  * result it never inspected in full, even after being asked to. Written for
  * the assistant that will correct the reply. */
 export function reviewCoverageFinding(assessment: ReviewCoverageAssessment): string {
-  return assessment.unsupported.map((row, index) => {
+  const findings = assessment.unsupported.map((row, index) => {
     const limit = row.moreAtSource
       ? 'the source reported more results than the call returned, or did not say it was complete'
       : typeof row.recordCount === 'number' && row.recordCount > 0
@@ -311,5 +316,8 @@ export function reviewCoverageFinding(assessment: ReviewCoverageAssessment): str
     return `(${index + 1}) The review needs the whole of ${row.toolName} [${row.ref}], but ${limit}. `
       + 'Check every record for what the response states (query the retained result, or fetch the remaining pages), '
       + 'or say plainly what was checked and what was not.';
-  }).join(' ');
+  });
+  return [...findings, ...assessment.unknownRefs.map((ref, index) =>
+    `(${findings.length + index + 1}) The review needs evidence [${ref}], but that ref matches no retained result under review. `
+      + 'Bind the claim to an exact inspected result or correct the unsupported claim; do not infer evidence from the ref name.')].join(' ');
 }

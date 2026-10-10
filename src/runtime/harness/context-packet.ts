@@ -145,6 +145,18 @@ export interface AgentContextPacket {
 const MAX_CANDIDATES = 3;
 const LOW_DISK_WARNING_BYTES = 10 * 1024 * 1024 * 1024;
 const CRITICAL_DISK_WARNING_BYTES = 2 * 1024 * 1024 * 1024;
+const SKILL_CANDIDATES_INSTRUCTION = 'Candidates only, not a checklist: call skill_read only when the skill\'s declared purpose fits this request; otherwise continue directly.';
+
+interface CapturedSkillRendering {
+  before: readonly string[];
+  after: readonly string[];
+  candidates: ReadonlyMap<RankedContextCandidate, Readonly<RankedContextCandidate>>;
+  text: string;
+}
+
+// Rendering state belongs to this exact captured packet. It never enlarges
+// serialized diagnostics or the model-facing packet, and expires with it.
+const capturedSkillRendering = new WeakMap<AgentContextPacket, CapturedSkillRendering>();
 
 const STOPWORDS = new Set([
   'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'can', 'could', 'do', 'for', 'from',
@@ -649,6 +661,40 @@ function renderCandidates(title: string, candidates: RankedContextCandidate[], i
   ];
 }
 
+/** Apply only a permutation of this packet's admitted skill objects. Rebuild
+ * their display from captured surrounding lines, without reading context or
+ * learned pitfalls again after the asynchronous rank decision. */
+export function applyAgentContextPacketSkillRanking(
+  packet: AgentContextPacket,
+  rankedSkills: readonly RankedContextCandidate[],
+): boolean {
+  const captured = capturedSkillRendering.get(packet);
+  if (!captured || packet.text !== captured.text) return false;
+  const isCapturedPermutation = (skills: readonly RankedContextCandidate[]): boolean => {
+    if (!Array.isArray(skills) || skills.length !== captured.candidates.size) return false;
+    const seen = new Set<RankedContextCandidate>();
+    for (const skill of skills) {
+      const admitted = captured.candidates.get(skill);
+      if (!admitted || seen.has(skill)
+        || skill.name !== admitted.name || skill.description !== admitted.description
+        || skill.score !== admitted.score || skill.reason !== admitted.reason) return false;
+      seen.add(skill);
+    }
+    return true;
+  };
+  if (!isCapturedPermutation(packet.skills) || !isCapturedPermutation(rankedSkills)) return false;
+  const skills = [...rankedSkills];
+  const text = [
+    ...captured.before,
+    ...renderCandidates('Likely skills', skills, SKILL_CANDIDATES_INSTRUCTION),
+    ...captured.after,
+  ].join('\n');
+  packet.skills = skills;
+  packet.text = text;
+  captured.text = text;
+  return true;
+}
+
 function summarizeToolScope(input: string): AgentContextPacket['toolScope'] {
   try {
     return resolveMcpToolScope({
@@ -986,7 +1032,7 @@ export function buildAgentContextPacket(
   const memoryStatusLine = memory.skippedReason || !memory.enabled
     ? memoryLine
     : '';
-  const lines = [
+  const beforeSkills = [
     '[AGENT CONTEXT PACKET]',
     suppressSemanticEnrichment
       ? 'Typed continuation result: the user declined the prior proposal. Keep the conversation natural, but do not revive, retrieve for, or prepare tools for the declined work.'
@@ -1004,13 +1050,11 @@ export function buildAgentContextPacket(
     ruleCapture,
     mcpScopeLine,
     suppressActionSemanticEnrichment ? '' : providerAccessLine(),
-    ...(suppressActionSemanticEnrichment
-      ? []
-      : renderCandidates(
-          'Likely skills',
-          skills,
-          'Candidates only, not a checklist: call skill_read only when the skill\'s declared purpose fits this request; otherwise continue directly.',
-        )),
+  ].filter((line): line is string => Boolean(line));
+  const skillLines = suppressActionSemanticEnrichment
+    ? []
+    : renderCandidates('Likely skills', skills, SKILL_CANDIDATES_INSTRUCTION);
+  const afterSkills = [
     // Pre-flight error library: the freshest distilled lessons for the skills
     // this turn will likely use — surfaced BEFORE acting so a known mistake
     // isn't repeated (they used to be reachable only via skill_read).
@@ -1035,7 +1079,7 @@ export function buildAgentContextPacket(
     capabilityBlock,
   ].filter((line): line is string => Boolean(line));
 
-  return {
+  const packet: AgentContextPacket = {
     inputPreview: clip(suppressSemanticEnrichment ? authorityInput : input, 200),
     semanticEnrichmentSkippedReason,
     complexity,
@@ -1084,6 +1128,15 @@ export function buildAgentContextPacket(
       ? Boolean(preflightDecision.destinationInstanceUnstated)
       : false,
     capabilityResolution,
-    text: lines.join('\n'),
+    text: [...beforeSkills, ...skillLines, ...afterSkills].join('\n'),
   };
+  capturedSkillRendering.set(packet, {
+    before: beforeSkills,
+    after: afterSkills,
+    candidates: new Map<RankedContextCandidate, Readonly<RankedContextCandidate>>(
+      skills.map((skill) => [skill, { ...skill }]),
+    ),
+    text: packet.text,
+  });
+  return packet;
 }

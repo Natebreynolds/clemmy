@@ -1,8 +1,10 @@
 import { renderHarnessMemoryContext } from '../../agents/harness-context.js';
 import {
+  applyAgentContextPacketSkillRanking,
   buildAgentContextPacket,
   type AgentContextPacket,
   type MemoryPrimerSummary,
+  type RankedContextCandidate,
 } from './context-packet.js';
 import type { TurnSourceStrategyBindingV1 } from './turn-control.js';
 
@@ -122,4 +124,15 @@ export function buildCanonicalContextPack(opts: BuildCanonicalContextPackOptions
       turnContextBytes: Buffer.byteLength(turn.text, 'utf-8'),
     },
   };
+}
+
+/** Keep the canonical byte reading bound to the text the same captured packet
+ * will send, after its existing advisory skill ranking has settled. */
+export function applyCanonicalContextSkillRanking(
+  pack: CanonicalContextPack,
+  rankedSkills: readonly RankedContextCandidate[],
+): boolean {
+  if (!applyAgentContextPacketSkillRanking(pack.turn, rankedSkills)) return false;
+  pack.diagnostics.turnContextBytes = Buffer.byteLength(pack.turn.text, 'utf-8');
+  return true;
 }

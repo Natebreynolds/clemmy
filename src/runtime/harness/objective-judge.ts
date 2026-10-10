@@ -27,6 +27,8 @@ import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 import { projectionMayCompleteSource } from './retained-projection-scope.js';
 import { historicalReadPacketIsCurrent, historicalReadClosureIsCurrent,
   type HistoricalReadPacket, type HistoricalReadClosure } from './historical-completion-evidence.js';
+import { judgeVerdictRepairInstructions, judgeVerdictRepairPrompt,
+  type CompletionVerdictRepairContract } from './judge-verdict-repair-contract.js';
 
 /**
  * Judge system prompt — modeled on OpenAI Codex's continuation.md auditor
@@ -1059,6 +1061,7 @@ export async function runRoutedJudgeAttempt<T>(
   effort?: JudgeReviewEffort,
   onResponder?: (modelId: string) => void,
   observe?: JudgeAttemptObservers,
+  verdictRepairContract?: CompletionVerdictRepairContract,
 ): Promise<T> {
   signal?.throwIfAborted();
   // Keep per-review handles out of tool schemas and stable instructions.
@@ -1123,20 +1126,18 @@ export async function runRoutedJudgeAttempt<T>(
         // The review is already written. Live 2026-09-28 (source 325147): a
         // restatement run at the review's own depth took 56.7 s and 4,123
         // output tokens to produce one line.
-        const repairAgent = buildJudgeAgent(routing, instructions, [], VERDICT_RESTATEMENT_EFFORT);
-        const repairPrompt = [
-            'You already reviewed a response and wrote the review below, but it did not contain the required verdict line.',
-            'Do not review again. From your own review, state the verdict now.',
-            '',
-            '[YOUR REVIEW]',
-            prior,
-            '[/YOUR REVIEW]',
-            '',
-            'Reply with EXACTLY ONE LINE and nothing else, in the verdict format your instructions require.',
-          ].join('\n');
+        // Host completion normally already supplies these static rules. Keep
+        // the exact schema available to an explicitly opted-in restatement,
+        // without copying changing source context or granting fresh lookups.
+        const repairBaseInstructions = verdictRepairContract?.memoryRequirement
+          && !instructions.includes(MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS)
+          ? `${instructions}\n\n${MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS}` : instructions;
+        const repairInstructions = judgeVerdictRepairInstructions(repairBaseInstructions, verdictRepairContract);
+        const repairAgent = buildJudgeAgent(routing, repairInstructions, [], VERDICT_RESTATEMENT_EFFORT);
+        const repairPrompt = judgeVerdictRepairPrompt(prior, verdictRepairContract);
         // A missing verdict must not turn an incomplete review excerpt into
         // completion authority. Preserve the whole review or decline repair.
-        const repairAdmission = completionJudgeContextAdmission(routing.modelId, instructions, repairPrompt);
+        const repairAdmission = completionJudgeContextAdmission(routing.modelId, repairInstructions, repairPrompt);
         if (!repairAdmission.fits) throw new JudgeContextUnavailableError('Complete verdict repair exceeds the reviewer context window.');
         signal?.throwIfAborted();
         const repaired = await new Runner({ workflowName: 'clementine-objective-judge-verdict' }).run(
@@ -1202,6 +1203,8 @@ export async function runHedgedJudge<T>(
      *  (resolveCompletionCheckerRoute). Other lanes keep the boundary route. */
     quotaAwareRoute?: boolean;
     effort?: JudgeReviewEffort;
+    /** Only completion supplies additional same-answer output obligations. */
+    verdictRepairContract?: CompletionVerdictRepairContract;
     /** Cancellation belongs to the caller, never to review/fallback policy. */
     signal?: AbortSignal;
   } = {},
@@ -1255,7 +1258,8 @@ export async function runHedgedJudge<T>(
             substituteForExactPin: true,
             substituteReason: r.substituteReason ?? 'provider_reported_model',
           });
-        }, { lookup: (lookup) => { lookups.push(lookup); }, restated: (head) => { attemptRestated.set(r, head); } });
+        }, { lookup: (lookup) => { lookups.push(lookup); }, restated: (head) => { attemptRestated.set(r, head); } },
+        opts.verdictRepairContract);
     };
     // An explicit caller deadline still wins; otherwise use the deadline the
     // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
@@ -1428,6 +1432,10 @@ async function runCompletionJudge(
     ? `${basePrompt}\n\n${skillContext.memoryRequirementContext}\n\n${MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS}` : basePrompt;
   const checksCoverage = coverageReviewed(skillContext);
   const results = skillContext?.verifiedReadResults ?? [];
+  const verdictRepairContract: CompletionVerdictRepairContract = {
+    evidenceCoverage: checksCoverage && reviewCoverageLedger(results) !== undefined,
+    memoryRequirement: Boolean(skillContext?.memoryRequirementContext),
+  };
   // What the verdict rests on is read from the same output the verdict line
   // is, so the two can never come from different answers.
   type Parsed = NonNullable<ReturnType<typeof parseCompletionVerdict>> & { needsAllOf?: string[] | null; memoryRequirement?: MemoryRequirementAssessmentV1 };
@@ -1453,7 +1461,7 @@ async function runCompletionJudge(
         ...(skillContext?.evidence ? { evidence: skillContext.evidence } : {}),
         ...(skillContext?.reviewedAuthor ? { reviewedAuthor: skillContext.reviewedAuthor } : {}),
         ...(depth.effort ? { effort: depth.effort } : {}),
-        quotaAwareRoute: true },
+        quotaAwareRoute: true, verdictRepairContract },
     );
   };
   const plain = ({ needsAllOf: _needsAllOf, ...verdict }: Parsed): NonNullable<CompletionJudgeRun['verdict']> => verdict;
@@ -1472,6 +1480,7 @@ async function runCompletionJudge(
     const lookups = [...(first.lookups ?? [])];
     let assessment = assessReviewCoverage({ results, lookups, needsAllOf: first.value.needsAllOf ?? null });
     let followUp: ReviewEvidenceCoverageRecord['followUp'];
+    let followUpFailure: Pick<CompletionJudgeRun, 'failure' | 'unavailableReason' | 'invalidDetail'> | undefined;
     if (assessment.status !== 'sufficient') {
       // ONE follow-up, in the reviewer's own lane: it names the exact results
       // and what was read of them, and the reviewer inspects or corrects. The
@@ -1482,6 +1491,9 @@ async function runCompletionJudge(
       ].join('\n'), depth);
       judge.signal?.throwIfAborted();
       followUp = second.value ? 'answered' : 'unanswered';
+      if (!second.value) followUpFailure = { failure: second.failure,
+        ...(second.unavailableReason ? { unavailableReason: second.unavailableReason } : {}),
+        ...(second.invalidDetail ? { invalidDetail: second.invalidDetail } : {}) };
       if (second.value) {
         lookups.push(...(second.lookups ?? []));
         run.verdict = plain(second.value);
@@ -1500,6 +1512,17 @@ async function runCompletionJudge(
       run.verdict = { done: false, repairScope: 'claims', reason: reviewCoverageFinding(assessment).slice(0, VERDICT_REASON_MAX_CHARS),
         ...(run.verdict?.memoryRequirement ? { memoryRequirement: run.verdict.memoryRequirement } : {}) };
       return { ...run, evidenceCoverage: { ...coverageRecord(assessment, lookups, followUp), returnedForCorrection: true } };
+    }
+    // An unqualified acceptance is not a finding that the landed work is
+    // wrong. Report the unavailable review through the existing failed-open
+    // policy, rather than turning missing attestation into reviewed success
+    // or inventing another work/review loop.
+    if (assessment.status === 'unattested') {
+      return { ...run, verdict: null, failure: followUpFailure?.failure ?? 'invalid',
+        ...(followUpFailure?.unavailableReason ? { unavailableReason: followUpFailure.unavailableReason } : {}),
+        invalidDetail: 'Required evidence coverage was not provided after one follow-up.'
+          + (followUpFailure?.invalidDetail ? ` ${followUpFailure.invalidDetail}` : ''),
+        evidenceCoverage: coverageRecord(assessment, lookups, followUp) };
     }
     return { ...run, evidenceCoverage: coverageRecord(assessment, lookups, followUp) };
   };
@@ -1906,6 +1929,7 @@ export async function judgeObjectiveComplete(
     const finding = jevSaid as { done: boolean; reason?: string; awaitingUser?: boolean; blocked?: boolean } | null;
     const reviewFailure: NonNullable<ObjectiveJudgeVerdict['reviewFailure']> =
       run.failure === 'timeout' ? 'timeout' : run.failure === 'invalid' ? 'invalid' : 'unavailable';
+    const unqualifiedCoverage = run.evidenceCoverage ? { evidenceCoverage: run.evidenceCoverage } : {};
     if (finding && !finding.done && !finding.awaitingUser) {
       return {
         done: false,
@@ -1916,17 +1940,18 @@ export async function judgeObjectiveComplete(
           : 'The configured completion reviewer could not be reached; the fast check found the objective unmet.',
         ...(finding.blocked ? { blocked: true } : {}),
         ...(jevAttempt ? { jevAttempt } : {}),
+        ...unqualifiedCoverage,
       };
     }
     if (run.unavailableReason) return { done: true, failedOpen: true, reviewFailure,
-      reason: run.unavailableReason, ...(jevAttempt ? { jevAttempt } : {}) };
+      reason: run.unavailableReason, ...(jevAttempt ? { jevAttempt } : {}), ...unqualifiedCoverage };
     const why =
       run.failure === 'timeout'
         ? 'The completion reviewer timed out; no review was completed.'
         : run.failure === 'invalid'
           ? `The completion reviewer returned an unreadable verdict; no review was completed.${run.invalidDetail ? ` (${run.invalidDetail})` : ''}`
           : 'The completion reviewer was unavailable; no review was completed.';
-    return { done: true, reason: why, failedOpen: true, reviewFailure, ...(jevAttempt ? { jevAttempt } : {}) };
+    return { done: true, reason: why, failedOpen: true, reviewFailure, ...(jevAttempt ? { jevAttempt } : {}), ...unqualifiedCoverage };
   }
   return {
     done: run.verdict.done,

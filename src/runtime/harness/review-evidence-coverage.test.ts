@@ -144,8 +144,9 @@ test('discovery, repeated bytes and failed calls carry no claim and are never op
     { logicalToolCallId: 'call_failed', toolName: 'provider_list_records', outcome: 'unknown', status: 'not_succeeded' },
   ];
   assert.deepEqual(reviewEvidenceCoverage(rows), []);
+  assert.equal(assessReviewCoverage({ results: rows, needsAllOf: ['call_search'] }).status, 'sufficient');
   const assessed = assessReviewCoverage({ results: rows, needsAllOf: ['call_search', 'call_invented'] });
-  assert.equal(assessed.status, 'sufficient');
+  assert.equal(assessed.status, 'insufficient');
   assert.deepEqual(assessed.unknownRefs, ['call_invented'], 'a ref matching no judged result is reported, not trusted');
 });
 

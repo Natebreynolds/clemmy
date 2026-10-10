@@ -13,6 +13,8 @@ process.env.OPENAI_AGENTS_DISABLE_TRACING = '1';
 mkdirSync(path.join(testHome, 'state'), { recursive: true });
 const { Usage } = await import('@openai/agents');
 const { runRoutedJudgeAttempt, parseCompletionVerdict } = await import('./objective-judge.js');
+const { assessReviewCoverage, parseNeedsAllOf } = await import('./review-evidence-coverage.js');
+const { MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS, parseMemoryRequirementPacket } = await import('./memory-completion-obligation.js');
 const { closeEventLog } = await import('./eventlog.js');
 
 after(() => {
@@ -46,6 +48,7 @@ function scripted(texts: string[]): { model: Model; requests: ModelRequest[] } {
 
 const route = (model: Model) => ({
   model, modelId: 'fixture-flagship-judge', judgeFamily: 'claude' as const, brainFamily: 'byo' as const,
+  transport: 'claude_subscription' as const,
   selfJudge: false, ownerSelectedJudge: true,
 });
 
@@ -111,4 +114,57 @@ test('a restated verdict is asked for at low depth and the first output is repor
   assert.equal(requests[1]!.modelSettings.reasoning?.effort, 'low', 'restating a verdict already reached decides nothing new');
   assert.equal(restated.length, 1);
   assert.match(restated[0]!, /^Reviewing the three drafts/);
+});
+
+test('completion repair returns coverage and exact memory bindings together without authorizing an uninspected source', async () => {
+  const packet = { version: 1, kind: 'correct', corrections: [{ readCallId: 'call_memory_read',
+    expectedDigest: 'a'.repeat(64), edits: [{ before: 'old synthetic convention', after: 'new synthetic convention' }] }],
+    reason: 'The owner requested this exact retained correction.' };
+  const prior = 'The requested correction names this retained observation. The records needed for the absence claim remain partly shown.\n'
+    + `MEMORY_REQUIREMENT: ${JSON.stringify(packet)}`;
+  const { model, requests } = scripted([prior,
+    `DONE: Requested work reviewed.\nNEEDS ALL OF: call_records\nMEMORY_REQUIREMENT: ${JSON.stringify(packet)}`]);
+  const parse = (output: unknown) => {
+    const verdict = parseCompletionVerdict(output);
+    return verdict ? { ...verdict, needsAllOf: parseNeedsAllOf(output), memoryRequirement: parseMemoryRequirementPacket(output) } : null;
+  };
+  const result = await runRoutedJudgeAttempt(route(model), `Audit. Reply with EXACTLY ONE LINE.\n${MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS}`,
+    'Objective: controlled synthetic correction and records check. EVIDENCE PACKET: original evidence.', parse,
+    true, undefined, undefined, undefined, undefined, undefined, { evidenceCoverage: true, memoryRequirement: true });
+  assert.equal(requests.length, 2, 'one format repair returns the entire completion packet');
+  assert.deepEqual(result.memoryRequirement, packet, 'the exact correction bindings come from the same repaired output');
+  assert.deepEqual(result.needsAllOf, ['call_records']);
+  const repair = requests[1]!;
+  assert.match(String(repair.systemInstructions), /The earlier one-line rule applies to the verdict line/);
+  assert.equal(String(repair.systemInstructions).split(MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS).length - 1, 1,
+    'the exact existing static memory contract is present once');
+  assert.match(JSON.stringify(repair.input), /NEEDS ALL OF.*MEMORY_REQUIREMENT/);
+  assert.doesNotMatch(JSON.stringify(repair.input), /EVIDENCE PACKET/);
+  assert.equal(repair.tools?.length ?? 0, 0, 'restatement gets no new lookup or effect authority');
+  assert.equal(assessReviewCoverage({ results: [{ logicalToolCallId: 'call_records', toolName: 'provider_list',
+    outcome: 'succeeded', status: 'verified', evidenceKind: 'source_result', contentComplete: false,
+    sourceExhausted: true }], needsAllOf: result.needsAllOf }).status, 'insufficient',
+  'a contract line does not invent the missing inspection receipt');
+  assert.equal(assessReviewCoverage({ results: [{ logicalToolCallId: 'call_records', toolName: 'provider_list',
+    outcome: 'succeeded', status: 'verified', evidenceKind: 'source_result', contentComplete: true }],
+    needsAllOf: ['invented_ref'] }).status, 'insufficient', 'an unknown ref cannot authorize an acceptance');
+});
+
+test('a repaired verdict missing contract lines cannot borrow packets from the earlier review', async () => {
+  const priorPacket = { version: 1, kind: 'unresolved', corrections: [], reason: 'The exact correction target was not inspected.' };
+  const { model, requests } = scripted([`Review of an incomplete records check.\nNEEDS ALL OF: call_records\nMEMORY_REQUIREMENT: ${JSON.stringify(priorPacket)}`,
+    'DONE: reviewed.']);
+  const parse = (output: unknown) => {
+    const verdict = parseCompletionVerdict(output);
+    return verdict ? { ...verdict, needsAllOf: parseNeedsAllOf(output), memoryRequirement: parseMemoryRequirementPacket(output) } : null;
+  };
+  const result = await runRoutedJudgeAttempt(route(model), 'Audit.', 'Objective: synthetic memory correction.', parse,
+    false, undefined, undefined, undefined, undefined, undefined, { evidenceCoverage: true, memoryRequirement: true });
+  assert.equal(result.needsAllOf, null);
+  assert.equal(result.memoryRequirement, null, 'no detached earlier assessment can authorize the repaired verdict');
+  assert.ok(String(requests[1]!.systemInstructions).includes(MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS),
+    'explicit memory restatement retains the exact static schema even through the direct attempt seam');
+  assert.equal(assessReviewCoverage({ results: [{ logicalToolCallId: 'call_records', toolName: 'provider_list',
+    outcome: 'succeeded', status: 'verified', evidenceKind: 'source_result', contentComplete: false }],
+    needsAllOf: result.needsAllOf }).status, 'unattested', 'the ordinary coverage follow-up remains necessary');
 });

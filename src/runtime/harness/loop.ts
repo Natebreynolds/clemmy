@@ -127,7 +127,7 @@ import {
   reasoningEffortSignalsForTurn,
   selectReasoningEffort,
 } from './reasoning-effort.js';
-import { buildCanonicalContextPack } from './canonical-context.js';
+import { applyCanonicalContextSkillRanking, buildCanonicalContextPack } from './canonical-context.js';
 import { renderCapabilityResolutionForContext } from './capability-resolution.js';
 import { discoveryGovernor } from './discovery-governor.js';
 import {
@@ -12115,11 +12115,12 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
     markTurnClock(options.sessionId, 'skill_rerank_started');
     try {
       const { rerankNamedCandidatesWithJev } = await import('../jev/control-plane.js');
-      contextPacket.skills = await rerankNamedCandidatesWithJev(
+      const rankedSkills = await rerankNamedCandidatesWithJev(
         classifierInput,
         contextPacket.skills,
         { label: (skill) => skill.description, sessionId: options.sessionId },
       );
+      applyCanonicalContextSkillRanking(canonicalContext, rankedSkills);
     } catch { /* fail-open: keep lexical skill ranking */ }
     markTurnClock(options.sessionId, 'skill_rerank_settled');
   }
