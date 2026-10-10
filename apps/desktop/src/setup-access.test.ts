@@ -27,7 +27,7 @@ test('the wizard saves the choice into the daemon\'s own file, and never writes 
   assert.equal(JSON.parse(readFileSync(file, 'utf-8')).choice, 'full');
   assert.equal(existsSync(path.join(HOME, '.clementine-next', 'state', 'proactivity-policy.json')), false,
     'a policy file holding only this field would read as Ask mode');
-  const daemon = await import('../../../src/runtime/computer-access.js');
+  const daemon = await import(new URL('../../../src/runtime/computer-access.ts', import.meta.url).href);
   assert.deepEqual(daemon.storedComputerAccess(), { choice: 'full', chosen: true }, 'the daemon reads what the wizard wrote');
 });
 
@@ -41,7 +41,7 @@ test('adding a folder on a fresh install keeps the default folders instead of re
 });
 
 test('the wizard\'s default folders are the daemon\'s default folders', async () => {
-  const shared = await import('../../../src/tools/shared.js');
+  const shared = await import(new URL('../../../src/tools/shared.ts', import.meta.url).href);
   assert.deepEqual([...bridge.DEFAULT_WORKSPACE_CANDIDATES], [...shared.DEFAULT_WORKSPACE_CANDIDATES]);
 });
 
