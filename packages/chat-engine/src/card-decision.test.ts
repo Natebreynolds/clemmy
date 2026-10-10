@@ -33,7 +33,7 @@ test('a card tap and its reply stay out of the transcript, and the card reads as
 
 test('a tap whose decision failed to land stays visible', () => {
   const rows = foldTranscript([card, tap('approve'), reply('failed')], 'chat');
-  const failed = rows.find((row) => row.role === 'assistant' && row.cardDecision);
+  const failed = rows.find((row) => row.role === 'assistant' && /Could not record that decision/.test(row.text ?? ''));
   assert.ok(failed);
   assert.equal(hiddenCardDecision(failed!), false);
   assert.equal(rows.find((row) => row.approval)?.approval?.resolution, undefined, 'the failed decision leaves the card actionable');
@@ -75,5 +75,41 @@ test('an offline tap and discarding its failed echo retain the actionable card',
     assert.equal(new Set(calls).size, 1, 'every attempt keeps its exact request identity');
     engine.discard(failed!.id);
     assert.equal(engine.snapshot().messages.find((row) => row.approval)?.approval?.resolution, undefined);
+  } finally { engine.dispose(); }
+});
+
+test('Clem\'s own answer to a card tap stays in the conversation; only the tap and an echo leave', () => {
+  // Phone test 2026-10-09: the resumed work's answer, delivered against the
+  // tap ("Yes — done. Slide 7's screenshot is now attached…"), was hidden
+  // with the tap, and the owner had to check the draft folder.
+  const answer = event(7, 'conversation_completed', {
+    sourceUserSeq: 6, reply: 'Yes — done. The screenshot is attached to the same draft.',
+    presentation: { identity: { sessionId: 'chat', sourceUserSeq: 6 }, status: 'done', kind: 'answer',
+      text: 'Yes — done. The screenshot is attached to the same draft.', resumable: false },
+    turnOutcome: { status: 'done' },
+  });
+  const rows = foldTranscript([card, tap('approve'), answer,
+    event(8, 'approval_resolved', { approvalId: 'apr-card', decision: 'approve' })], 'chat');
+  const shown = rows.filter((row) => !hiddenCardDecision(row));
+  assert.ok(shown.some((row) => row.role === 'assistant' && /screenshot is attached/.test(row.text ?? '')), JSON.stringify(shown.map((row) => [row.role, row.text])));
+  assert.equal(shown.some((row) => row.role === 'user'), false, 'the tap itself stays out of sight');
+});
+
+test('after a card tap, the work it resumes shows as working until Clem answers', async () => {
+  const engine = new ChatEngine({
+    sessionId: 'chat',
+    api: {
+      loadSession: async () => ({ events: [card], latestSeq: 5 }),
+      send: async () => ({ sessionId: 'chat', accepted: true }),
+    },
+    transport: { connect: async () => ({ close() {} }), fetchRecent: async () => ({ events: [] }) },
+  });
+  try {
+    await engine.open();
+    await engine.send('Approve apr-card', undefined, { cardDecision: { approvalId: 'apr-card', decision: 'approve' } });
+    const visible = engine.snapshot().messages.filter((row) => !hiddenCardDecision(row));
+    assert.ok(visible.some((row) => row.role === 'assistant' && row.status === 'thinking'),
+      `a working state is on screen: ${JSON.stringify(visible.map((row) => [row.role, row.status]))}`);
+    assert.equal(visible.some((row) => row.role === 'user'), false, 'the tap itself is not');
   } finally { engine.dispose(); }
 });

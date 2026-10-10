@@ -15,7 +15,7 @@ import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type
 import type { ApprovalConfirm, ChatAttachment,
   ChatMessage, ConnectionState, EngineSnapshot, HarnessEvent, MessageStatus,
 } from './types.js';
-import { approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, cardDecisionOf, type CardDecision } from './types.js';
+import { approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, cardDecisionEcho, cardDecisionOf, type CardDecision } from './types.js';
 import { reduceFeed } from './reduce-lifecycle.js';
 import { advanceWorkflowChildActivity, clearModelRetryProgress, isModelRetryProgressBoundary, isWorkflowChildActivity, readModelRetryProgress, readWorkflowQueueDispatch, updateWorkflowDispatchActivity, workflowDispatchText } from './reduce-activity.js';
 import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
@@ -393,12 +393,14 @@ export class ChatEngine {
       ...(options.connectionResume ? { connectionRequestId: options.connectionResume.connectionRequestId } : {}),
       ...(options.cardDecision ? { cardDecision: options.cardDecision } : {}),
     };
+    // A card tap's own bubble stays out of sight, but the work it resumes is
+    // shown working like any other turn and becomes Clem's answer; only an
+    // echo of the tap is folded into the card when it lands.
     const assistant: ChatMessage = {
       id: nextLocalId(),
       role: 'assistant',
       text: '',
       status: 'thinking',
-      ...(options.cardDecision ? { cardDecision: options.cardDecision } : {}),
       ...(taskMode ? { taskMode, ...(taskMode.kind === 'plan' ? { progress: 'Investigating with read-only tools…' } : {}) } : {}),
       activity: [],
     };
@@ -1017,7 +1019,8 @@ export class ChatEngine {
     this.emit();
   }
 
-  /** The host's reply to a card tap from another surface is the tap's too. */
+  /** The host's echo of a card tap from another surface is the tap's too.
+   *  Clem's own answer to the tap is not: it stays in the conversation. */
   private tagCardDecisionReply(event: HarnessEvent): void {
     const source = sourceUserSeqOf(event);
     const cardDecision = source === null ? undefined : this.cardDecisionsBySource.get(source);
@@ -1025,6 +1028,7 @@ export class ChatEngine {
     this.messages = this.messages.map((message) => (
       message.role === 'assistant' && !message.cardDecision
         && (message.acceptedSource?.sourceUserSeq === source || message.id === `a-${event.seq}`)
+        && cardDecisionEcho(message.text, cardDecision)
         ? { ...message, cardDecision }
         : message
     ));
@@ -1233,7 +1237,8 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         const awaitingMessage = awaitingIndex === undefined
           ? undefined
           : messages[awaitingIndex];
-        const cardDecision = sourceUserSeq === null ? undefined : cardDecisionsBySource.get(sourceUserSeq);
+        const tappedDecision = sourceUserSeq === null ? undefined : cardDecisionsBySource.get(sourceUserSeq);
+        const cardDecision = tappedDecision && cardDecisionEcho(presentation.text, tappedDecision) ? tappedDecision : undefined;
         const terminalMessage: ChatMessage = {
           id: delegatedMessage?.id ?? awaitingMessage?.id ?? `a-${event.seq}`,
           role: 'assistant',

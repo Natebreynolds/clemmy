@@ -88,6 +88,17 @@ export function cardDecisionOf(data: Record<string, unknown>): CardDecision | nu
   return { approvalId: data.approvalId, decision: data.decision };
 }
 
+/**
+ * Whether the host's reply to a card tap is only the tap's echo: empty, or
+ * quoting the card's own approval id ("Approved apr-…"). Clem's own answer to
+ * the tap (the resumed work's result, or the next question) never quotes an
+ * id, and is a reply the owner must see.
+ */
+export function cardDecisionEcho(text: string | undefined, decision: CardDecision): boolean {
+  const trimmed = (text ?? '').trim();
+  return !trimmed || trimmed.includes(decision.approvalId);
+}
+
 /** Whether a message is a card decision that should stay out of sight. */
 export function hiddenCardDecision(message: { cardDecision?: CardDecision; pending?: string; status?: string }): boolean {
   return Boolean(message.cardDecision) && message.pending !== 'failed' && message.status !== 'failed';
