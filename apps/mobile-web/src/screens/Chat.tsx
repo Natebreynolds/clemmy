@@ -29,7 +29,7 @@ import {
   type TaskMode,
   answerDraftStatus,
   evidenceChips,
-  friendlyStep,
+  stepWords,
   liveTurnText,
   looksLikeMachineText,
   stepInHand,
@@ -1191,14 +1191,14 @@ function WorkLine({
   // The model's own phase row ran the whole turn as a second spinner and a
   // second clock; the clock at the top already says how long she has been at it.
   const view = activity.filter((item) => item.id !== MODEL_PHASE_ACTIVITY_ID);
-  const failed = view.some((item) => item.status === 'failed');
-  // A turn with no failed ROW can still not have succeeded: stopped, waiting
-  // on a reply, waiting on approval, blocked. The typed terminal is what knows.
-  // Clem asking for a reply or an approval is her turn ending on purpose: it
-  // waits on you, which is neither done nor "Didn't finish".
+  // The receipt says how the TURN ended, as on desktop: a step that failed and
+  // was worked around keeps its own ✗ in the list, but a turn that went on to
+  // answer did not "run into trouble". The typed terminal knows the rest:
+  // stopped or blocked did not finish; a question or an approval waits on you.
+  const failed = !live && message.status === 'failed';
   const waiting = !live && !failed && message.terminal?.status === 'needs_input';
   const unfinished = !live && !failed && !waiting
-    && Boolean(message.terminal) && message.terminal?.status !== 'done';
+    && (message.status === 'stopped' || (Boolean(message.terminal) && message.terminal?.status !== 'done'));
   const [open, setOpen] = useState(failed);
   const [stepsOpen, setStepsOpen] = useState<boolean>(() => readLiveStepsOpen());
   const now = useNowTick(live);
@@ -1208,7 +1208,7 @@ function WorkLine({
   // Steps read in people's words: what she is doing while it runs, what she
   // did once it settled.
   const plain = (item: ActivityItem): ActivityItem => {
-    const phrased = friendlyStep(item.label);
+    const phrased = stepWords(item);
     const label = item.status === 'running' ? phrased.action : phrased.done;
     return { ...item, label: phrased.app ? `${label} · ${phrased.app}` : label };
   };
@@ -1226,7 +1226,7 @@ function WorkLine({
 
   if (live) {
     const inHand = stepInHand(view);
-    const step = inHand ? friendlyStep(inHand.label) : null;
+    const step = inHand ? stepWords(inHand) : null;
     const running = inHand?.status === 'running';
     const progress = message.progress?.trim() && !looksLikeMachineText(message.progress) ? message.progress.trim() : '';
     // Her own sentence leads; otherwise the card already names the step, so

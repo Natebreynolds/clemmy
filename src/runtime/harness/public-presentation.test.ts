@@ -964,6 +964,17 @@ test('call_tool progress rows show the REAL inner action, never an anonymous wra
   // The model-supplied arguments (the absolute path) never leak.
   assert.doesNotMatch(JSON.stringify(wrote), /\/Users\/x\/secret/);
 
+  // work_call is the same kind of carrier: a shell command it carries is
+  // named, never "work call" (live 2026-10-10: a phone receipt read "Ran · Work").
+  const carried = projectHarnessEventForPublic({
+    sessionId: 's', seq: 12, turn: 0, role: 'Clem', type: 'tool_called',
+    data: { tool: 'work_call', callId: 'c4', effect: 'compute', effectiveTool: 'run_shell_command',
+      arguments: JSON.stringify({ name: 'run_shell_command', args_json: '{"command":"sf data query --query secret"}' }) },
+  } as never);
+  const cd = (carried as { data: Record<string, unknown> }).data;
+  assert.equal(cd.innerTool, 'run_shell_command');
+  assert.doesNotMatch(JSON.stringify(carried), /sf data query/);
+
   // A bare provider call (no wrapper) is unchanged — no phantom innerTool.
   const plain = projectHarnessEventForPublic({
     sessionId: 's', seq: 10, turn: 0, role: 'Clem', type: 'tool_called',

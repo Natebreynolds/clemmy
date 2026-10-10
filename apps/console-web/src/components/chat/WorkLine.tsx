@@ -19,7 +19,7 @@ import { Link } from 'react-router-dom';
 import { AlertCircle, ArrowUpRight, CheckCircle2, ChevronRight, PauseCircle, XCircle } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
-import { MODEL_PHASE_ACTIVITY_ID, friendlyStep, timelineBounds } from '@clem/chat-engine';
+import { MODEL_PHASE_ACTIVITY_ID, friendlyStep, stepWords, timelineBounds } from '@clem/chat-engine';
 import { getComposioToolkits } from '@/lib/connect';
 import { BatchRow, useNowTick } from '@/components/chat/ActivityFeed';
 import { LiveStepList, StepRow, type StepTimeline } from '@/components/chat/ActivityCard';
@@ -143,7 +143,7 @@ export function WorkLine({
   // Steps read in people's words: what she is doing while it runs, what she
   // did once it settled.
   const plain = (row: ActivityItem): ActivityItem => {
-    const phrased = friendlyStep(row.label);
+    const phrased = stepWords(row);
     const label = row.status === 'running' ? phrased.action : phrased.done;
     return { ...row, label: phrased.app ? `${label} · ${phrased.app}` : label };
   };
@@ -174,14 +174,14 @@ export function WorkLine({
     // their apps or one that changes something, while it runs or as the last
     // one done. Looking up memory or finding a tool is how she gets there,
     // not what she is doing, so it takes the card only when nothing else has.
-    const matters = (row: ActivityItem) => Boolean(friendlyStep(row.label).app)
+    const matters = (row: ActivityItem) => row.fromApp === true
       || row.effect === 'local_write' || row.effect === 'external_write' || row.kind === 'agent';
     const latest = [...tools].reverse();
     const inHand = latest.find((row) => row.status === 'running' && matters(row))
       ?? latest.find(matters)
       ?? latest.find((row) => row.status === 'running')
       ?? latest[0];
-    const step = inHand ? friendlyStep(inHand.label) : null;
+    const step = inHand ? stepWords(inHand) : null;
     const running = inHand?.status === 'running';
     // Her own sentence leads; otherwise the card already names the step, so
     // the line does not say it twice.
@@ -252,12 +252,12 @@ export function WorkLine({
 
   const stepCount = top.filter((row) => row.kind !== 'check').length;
   const highlights = [...new Set(top.filter((row) => row.kind !== 'check')
-    .map((row) => friendlyStep(row.label).done)
+    .map((row) => stepWords(row).done)
     .map((done) => done.charAt(0).toLowerCase() + done.slice(1)))];
   // The apps the turn worked in stay on the receipt once the answer lands
   // (owner 2026-10-09: the app's mark went away when the work folded).
   const apps = [...new Set(top.filter((row) => row.kind !== 'check')
-    .map((row) => friendlyStep(row.label).app)
+    .map((row) => stepWords(row).app)
     .filter((app): app is string => Boolean(app)))].slice(0, 3);
   return (
     <section aria-label="What Clem did" className="min-w-0">

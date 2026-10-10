@@ -955,7 +955,7 @@ function publicDispatchSlug(data: Record<string, unknown>): string {
 const PUBLIC_INNER_TOOL_RE = /^[a-z][a-z0-9_]{1,48}$/;
 function publicInnerTool(data: Record<string, unknown>): string {
   const wrapper = firstString(data.tool, data.toolName, data.name);
-  if (wrapper !== 'call_tool') return '';
+  if (wrapper !== 'call_tool' && wrapper !== 'work_call') return '';
   const inner = firstString(data.effectiveTool);
   return inner && PUBLIC_INNER_TOOL_RE.test(inner) ? inner : '';
 }

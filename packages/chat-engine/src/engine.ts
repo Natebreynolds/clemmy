@@ -1081,6 +1081,14 @@ export function inFlightTurnSince(events: readonly HarnessEvent[]): number | nul
 
 /** Rebuild a message list from a session's persisted, public-projected
  *  events — the transcript a reopened chat renders instantly. */
+/** A replayed event's own time, so a reopened turn keeps its real durations
+ *  (every step stamped at the moment of replay read "worked 1s"). An event
+ *  without one reads at the moment it is folded. */
+function eventClock(event: HarnessEvent): () => number {
+  const at = typeof event.createdAt === 'number' && Number.isFinite(event.createdAt) ? event.createdAt : undefined;
+  return at === undefined ? Date.now : () => at;
+}
+
 export function foldTranscript(events: readonly HarnessEvent[], sessionId?: string | null): ChatMessage[] {
   const messages: ChatMessage[] = [];
   let activity: ChatMessage['activity'] = [];
@@ -1116,7 +1124,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         const work = message.delegatedWork && advanceWorkflowChildActivity(message.delegatedWork, event);
         if (!work || message.status !== 'thinking') continue;
         messages[index] = { ...message, text: workflowDispatchText(work), delegatedWork: work,
-          activity: updateWorkflowDispatchActivity(reduceFeed(message.activity ?? [], event), work) };
+          activity: updateWorkflowDispatchActivity(reduceFeed(message.activity ?? [], event, eventClock(event)), work) };
       }
       continue;
     }
@@ -1169,7 +1177,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
           || event.seq <= modelRetryProgressSeq
           || (sessionId && event.sessionId && event.sessionId !== sessionId)) break;
         modelRetryProgressSeq = event.seq;
-        activity = reduceFeed(activity ?? [], event);
+        activity = reduceFeed(activity ?? [], event, eventClock(event));
         break;
       }
       case 'user_input_received': {
@@ -1407,7 +1415,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
           || (sessionId && event.sessionId && event.sessionId !== sessionId)) break;
         const sourceUserSeq = work.sourceUserSeq;
         if (!delegatedMessageIndexBySource.has(sourceUserSeq)) {
-          const delegatedActivity = reduceFeed(sourceUserSeq === currentSourceUserSeq ? activity ?? [] : [], event);
+          const delegatedActivity = reduceFeed(sourceUserSeq === currentSourceUserSeq ? activity ?? [] : [], event, eventClock(event));
           const delegatedMessage: ChatMessage = {
             id: delegatedAssistantMessageId(sourceUserSeq, event.seq),
             role: 'assistant',
@@ -1426,7 +1434,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         break;
       }
       default: {
-        activity = reduceFeed(activity ?? [], event);
+        activity = reduceFeed(activity ?? [], event, eventClock(event));
       }
     }
   }

@@ -1,6 +1,6 @@
 import type { ActivityItem, ChatMessage } from './types.js';
 import { MODEL_PHASE_ACTIVITY_ID } from './reduce-activity.js';
-import { friendlyStep } from './tool-labels.js';
+import { stepWords } from './tool-labels.js';
 
 /**
  * How a working turn reads, shared by desktop and phone so the two surfaces
@@ -61,7 +61,7 @@ export function liveTurnText(message: Pick<ChatMessage, 'text' | 'answerDraft' |
  *  the card only when nothing else has. */
 export function stepInHand(rows: readonly ActivityItem[]): ActivityItem | undefined {
   const tools = rows.filter((row) => row.kind !== 'check' && row.id !== MODEL_PHASE_ACTIVITY_ID);
-  const matters = (row: ActivityItem) => Boolean(friendlyStep(row.label).app)
+  const matters = (row: ActivityItem) => row.fromApp === true
     || row.effect === 'local_write' || row.effect === 'external_write' || row.kind === 'agent';
   const latest = [...tools].reverse();
   return latest.find((row) => row.status === 'running' && matters(row))
@@ -107,7 +107,7 @@ export function workReceiptLine(
   steps: readonly ActivityItem[],
 ): string {
   const worked = workedFor(totalMs);
-  const highlights = [...new Set(steps.map((row) => friendlyStep(row.label).done)
+  const highlights = [...new Set(steps.map((row) => stepWords(row).done)
     .map((done) => done.charAt(0).toLowerCase() + done.slice(1)))];
   const named = highlights.length > 0 && highlights.length <= 2 && highlights.length === steps.length;
   return [
@@ -119,6 +119,6 @@ export function workReceiptLine(
 
 /** The apps a turn worked in, for the receipt's marks. */
 export function workApps(steps: readonly ActivityItem[], limit = 3): string[] {
-  return [...new Set(steps.map((row) => friendlyStep(row.label).app)
+  return [...new Set(steps.map((row) => stepWords(row).app)
     .filter((app): app is string => Boolean(app)))].slice(0, limit);
 }

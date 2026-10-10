@@ -216,8 +216,11 @@ function stepVerb(word: string | undefined): readonly [string, string] | null {
 
 /** "outlook get calendar view" → Outlook · "Reading calendar view" / "Read
  *  calendar view"; "read file" → "Reading file". A label that already reads
- *  as words (anything not a lower-case slug) is kept as it is. */
-export function friendlyStep(label: string): FriendlyStep {
+ *  as words (anything not a lower-case slug) is kept as it is. With
+ *  `appNamed` false the label is a built-in tool's name, so a noun-first name
+ *  ("file query") reads as the action on that noun ("Searched file"), never
+ *  as an app called File. */
+export function friendlyStep(label: string, appNamed = true): FriendlyStep {
   const text = (label ?? '').trim();
   if (!text || /[A-Z…]/.test(text) || !/^[a-z0-9 ·_-]+$/.test(text)) return { action: text, done: text };
   const words = text.replace(/[·_-]+/g, ' ').split(/\s+/).filter(Boolean);
@@ -227,6 +230,10 @@ export function friendlyStep(label: string): FriendlyStep {
     return { action: rest ? `${first[0]} ${rest}` : first[0], done: rest ? `${first[1]} ${rest}` : first[1] };
   }
   const second = stepVerb(words[1]);
+  if (second && words.length >= 2 && !appNamed) {
+    const object = [words[0], ...words.slice(2)].join(' ');
+    return { action: `${second[0]} ${object}`, done: `${second[1]} ${object}` };
+  }
   if (second && words.length >= 2) {
     const app = words[0].charAt(0).toUpperCase() + words[0].slice(1);
     const rest = words.slice(2).join(' ');
@@ -234,4 +241,18 @@ export function friendlyStep(label: string): FriendlyStep {
   }
   const sentence = text.charAt(0).toUpperCase() + text.slice(1).replace(/[_·]+/g, ' ');
   return { action: sentence, done: sentence };
+}
+
+/** Whether a tool step ran in one of the owner's connected apps: a provider
+ *  operation (its public slug, or the provider gateway) or an MCP server's tool
+ *  (`server__tool`). Built-in tools are not apps, whatever their names say. */
+export function toolRunsInApp(tool: string, publicSlug?: unknown): boolean {
+  if (typeof publicSlug === 'string' && publicSlug) return true;
+  if (tool === 'composio_execute_tool') return true;
+  return tool.replace(/^mcp__/, '').includes('__');
+}
+
+/** A step row in people's words: its app only when it ran in one. */
+export function stepWords(row: { label: string; fromApp?: boolean }): FriendlyStep {
+  return friendlyStep(row.label, row.fromApp === true);
 }

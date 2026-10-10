@@ -1,7 +1,7 @@
 import { boundedModelId, modelDisplayName } from './model-name.js';
 import { readLiveApprovalControl } from './live-approval-control.js';
 import type { ActivityItem, ChatStopReceipt, DelegatedWorkControl, HarnessEvent, WorkflowCardStep, WorkflowStopQualification } from './types.js';
-import { humanToolLabel, salientArgDetail } from './tool-labels.js';
+import { humanToolLabel, salientArgDetail, toolRunsInApp } from './tool-labels.js';
 import { applyWriteEvent, writeRowKey, writeRowLabel, writeRowStatus, writeRowTone } from './write-ledger.js';
 import { workPlanActivityItem } from './work-plan-presentation.js';
 
@@ -532,6 +532,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
         id: callId ? `t-${callId}` : `t${prev.length}-${tool}`,
         kind: 'tool',
         label: reused ? REUSED_RESULT_LABEL : toolLabel,
+        ...(toolRunsInApp(tool, d.publicSlug) ? { fromApp: true } : {}),
         ...(detail ? { detail } : {}),
         startedAt: now(),
         status: 'running',

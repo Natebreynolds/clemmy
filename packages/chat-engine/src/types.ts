@@ -242,6 +242,9 @@ export interface ActivityItem {
   excerpt?: string;
   /** Actual event effect; presentation only, never execution authority. */
   effect?: 'read' | 'compute' | 'local_write' | 'external_write' | 'admin';
+  /** kind 'tool' only: the step ran in a connected app, so its label leads
+   *  with the app's name. Built-in tools leave it unset. */
+  fromApp?: boolean;
   /** A reservation becomes confirmed only through its own write terminal. */
   write?: WriteLedgerRow;
   /** kind 'batch' rows fed by a declared work manifest. The harness enumerates

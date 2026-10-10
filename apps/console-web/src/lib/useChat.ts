@@ -1,5 +1,5 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
-import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
+import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { ChatStopReceipt, DelegatedWorkControl, LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
 import { boundedModelId, modelDisplayName } from '@clem/chat-engine';
 import { acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
@@ -45,6 +45,9 @@ export interface ActivityItem {
   label: string;
   detail?: string;
   provider?: 'claude' | 'codex' | 'byo' | 'glm' | 'unknown';
+  /** kind 'tool' only: the step ran in a connected app, so its label leads
+   *  with the app's name. Built-in tools leave it unset. */
+  fromApp?: boolean;
   status: 'running' | 'done' | 'failed' | 'interrupted';
   /** Client-clock start, for the live per-row elapsed timer while running. */
   startedAt?: number;
@@ -683,6 +686,14 @@ function helperOf(ev: unknown): { sessionId: string; item: string } | null {
   return { sessionId: w.sessionId, item: w.item };
 }
 
+/** When an event happened, in client-clock milliseconds: its own time when it
+ *  carries one, else the moment it is folded. */
+function eventTime(ev: HarnessEvent): number {
+  const raw = (ev as { createdAt?: unknown }).createdAt;
+  const at = typeof raw === 'number' ? raw : typeof raw === 'string' ? Date.parse(raw) : Number.NaN;
+  return Number.isFinite(at) ? at : Date.now();
+}
+
 /** This surface's HarnessEvent still allows a string `createdAt` from older
  *  transports; the shared engine's does not. Normalize once, at the boundary. */
 function sharedEvent(ev: HarnessEvent): SharedHarnessEvent {
@@ -773,6 +784,9 @@ export function applyChatProgressEvent(
 }
 
 export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
+  // Steps are stamped with their event's own time, so a reopened turn keeps
+  // its real durations instead of reading "Worked 1s".
+  const at = eventTime(ev);
   if (readLiveApprovalControl(ev)) return prev;
   // Event types this surface delegates wholesale to the shared fold rather than
   // keeping a second implementation of. The work-contract pair is here because
@@ -790,7 +804,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     // drew on the desktop (found live 2026-09-29).
     || ev.type === 'deliverable_saved'
     || (ev.type === 'heartbeat' && ev.data?.kind !== 'watcher_steer')) {
-    return reduceSharedActivity(prev, sharedEvent(ev));
+    return reduceSharedActivity(prev, sharedEvent(ev), () => at);
   }
   const d = (ev.data ?? {}) as Record<string, unknown>;
   const tool = typeof d.tool === 'string' ? d.tool : typeof d.toolName === 'string' ? d.toolName : '';
@@ -858,7 +872,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       const slugRaw = typeof d.slug === 'string' && d.slug ? d.slug : typeof d.tool === 'string' ? d.tool : 'items';
       const verb = d.sideEffect === 'send' ? 'Sending' : d.sideEffect === 'write' ? 'Writing' : 'Fetching';
       const label = `${verb} ${total} × ${slugRaw.replace(/^mcp__.+?__/, '').replace(/_/g, ' ').toLowerCase()}`;
-      return [...prev, { id: `b-${batchId}`, kind: 'batch', label, status: 'running', startedAt: Date.now(), batch: { done: 0, total, failed: 0 } }];
+      return [...prev, { id: `b-${batchId}`, kind: 'batch', label, status: 'running', startedAt: at, batch: { done: 0, total, failed: 0 } }];
     }
     case 'batch_progress': {
       const id = `b-${typeof d.batchId === 'string' ? d.batchId : ''}`;
@@ -883,7 +897,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
         ? {
             ...a,
             status: failed > 0 || halted ? 'failed' : 'done',
-            finishedAt: Date.now(),
+            finishedAt: at,
             detail: undefined,
             batch: a.batch ? { ...a.batch, done: typeof d.succeeded === 'number' ? (d.succeeded as number) + failed : a.batch.done, failed } : a.batch,
           }
@@ -912,8 +926,9 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
         ...(draft ? { draft } : {}),
         kind: 'tool',
         label: reused ? REUSED_RESULT_LABEL : toolLabel,
+        ...(toolRunsInApp(tool, d.publicSlug) ? { fromApp: true } : {}),
         ...(detail ? { detail } : {}),
-        startedAt: Date.now(),
+        startedAt: at,
         status: 'running',
       }];
     }
@@ -940,7 +955,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
         return {
           ...a,
           status,
-          finishedAt: Date.now(),
+          finishedAt: at,
           ...(reused ? { label: REUSED_RESULT_LABEL } : {}),
           ...(glimpseDetail
             ? { detail: glimpseDetail }
@@ -971,7 +986,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       // a second row under the same id.
       return [...prev.filter((a) => !(a.kind === 'agent' && a.id === `a-${item}`)), {
         id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined,
-        provider: providerFor(d, model), status: 'running', startedAt: Date.now(),
+        provider: providerFor(d, model), status: 'running', startedAt: at,
         ...(stepOf(ev) ? { step: stepOf(ev) } : {}),
         ...(modelName ? { modelName } : {}),
         ...(role.trim() ? { helperFor: role.trim().slice(0, 80) } : {}),
@@ -992,7 +1007,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
           ? {
               ...a,
               status,
-              finishedAt: Date.now(),
+              finishedAt: at,
               // Keep the worker_started label (it carries the role); on failure
               // append the short reason so "<item> ✗ <reason>" reads by default.
               ...(status === 'failed' && reason ? { label: `${a.label} — ${reason.slice(0, 80)}` } : {}),
@@ -1006,13 +1021,13 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       const label = status === 'failed' && reason ? `${base} — ${reason.slice(0, 80)}` : base;
       const modelName = helperModelName(model);
       return [...prev, {
-        id, kind: 'agent', label, detail: model || undefined, provider: providerFor(d, model), status, finishedAt: Date.now(),
+        id, kind: 'agent', label, detail: model || undefined, provider: providerFor(d, model), status, finishedAt: at,
         ...(modelName ? { modelName } : {}),
         ...(role.trim() ? { helperFor: role.trim().slice(0, 80) } : {}),
       }];
     }
     case 'worker_capped':
-      return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed', finishedAt: Date.now() } : a));
+      return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed', finishedAt: at } : a));
     // Trust cockpit: judge verdicts + watcher steers appear as 'check' rows so
     // the strip shows not only what the agent DID but what verified it.
     case 'verdict_recorded': {
