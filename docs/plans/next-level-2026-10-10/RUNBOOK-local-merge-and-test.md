@@ -49,6 +49,9 @@ The known failing families on `b0612dd`, verified one file at a time on
 `docs/checkpoints/2026-10-10-ci-baseline.md` with their classification (stale
 pin, real defect, test-order artifact). Compare every later run against that
 file; a new failing file is a regression, a vanished one is a fix to record.
+On a machine without the local retrieval model cached (a fresh Linux box, a
+container with no egress to Hugging Face) nine more cases fail for the
+environment, listed in the checkpoint's §2; on the owner's Mac they pass.
 
 Fast per-file loop while implementing:
 

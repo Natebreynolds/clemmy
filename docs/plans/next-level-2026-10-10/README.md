@@ -43,7 +43,7 @@ What the repo's own records say is still open (not my inference):
 - An auto-resumed chat run can wedge the HTTP server into a liveness kill loop; the hard reconciliation stop still speaks machine text (v3.18.32 known limits).
 - With several cards open, a bare "yes" in words moves to a fresh conversation (v3.18.33 known limits).
 - Plan candidates bypass the completion-review continuation cap (`host-turn-runner.ts:4788`); 7.92M uncached tokens were once spent after a final rejection (09-21).
-- **Main's CI is red at its first step.** `npm run check:public-hygiene` rejects `packages/chat-engine/src/live-work.test.ts:18` (a Salesforce-shaped contact id in a fixture string, commit `b0612dd`), so no unit test has run on main since v3.18.34's "22 known failures" baseline. PR-00 fixes it.
+- **Main's CI is red at its first step.** `npm run check:public-hygiene` rejects `packages/chat-engine/src/live-work.test.ts:18` (a Salesforce-shaped contact id in a fixture string, commit `b0612dd`), so no unit test has run on main since v3.18.34's "22 known failures" baseline. PR-00 fixes it. The full suite was run on `b0612dd` in a clean container: 21,465 tests, 31 failures, of which 22 match CI's count exactly and 9 are this container's (no local retrieval model, one process-cleanup race under load). All 22 are classified in `docs/checkpoints/2026-10-10-ci-baseline.md`; they are not stale pins but four product gaps (PR-14, PR-15, PR-17, PR-18), two pins to move (PR-00) and one owner decision.
 
 ## 2. The gap this plan closes
 
@@ -156,6 +156,8 @@ owner's recorded decisions. A PR that breaks one is not done, whatever its tests
 | [PR-14](PR-14-all-in-byo-identity.md) | All-in BYO identity: options, inactive bindings and memory attribution agree with the router (four baseline failures) | S | low | PR-00 |
 | [PR-15](PR-15-last-fixed-sentences.md) | The last fixed host sentences and three stale pins (six baseline failures) | S | low | PR-00 |
 | [PR-16](PR-16-route-outcomes-on-the-host-lane.md) | Route outcomes on the host lane carry the verdict and tool success (today both columns are null everywhere) | S | additive | PR-00 |
+| [PR-17](PR-17-browser-no-change-settlement.md) | A browser open that proved nothing changed settles repairable, not uncertain (two baseline failures) | S | low | PR-00 |
+| [PR-18](PR-18-kernel-names-no-provider.md) | The shared kernel names no provider (one baseline failure, an owner rule) | S | low | PR-00 |
 
 PR-00, PR-07, PR-08, PR-12, PR-14 and PR-15 have no dependencies beyond PR-00 and can start today; PR-14 should land before PR-03 reads the catalog snapshot. PR-01, PR-16 and
 PR-02 are the foundation (PR-16 is what makes the scorecard's objective columns real); PR-03 and PR-04 are the owner-visible payoff and should
