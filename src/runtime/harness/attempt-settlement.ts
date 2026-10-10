@@ -1514,7 +1514,12 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // classification would tell the model to try the same mutation again with no
   // proof the first one did nothing.
   const preservesUncertainty = outcome.kind === 'uncertain_write';
-  if (typedNegative && !preservesUncertainty) {
+  // The exception is the tool's own typed proof that it never dispatched at
+  // all (`*_not_dispatched`, set by the tool, never by provider or model
+  // text): that is the exact pre-effect proof uncertainty waits for, so the
+  // step is repairable instead of held for reconciliation.
+  const provesNeverDispatched = typedNegative?.status?.endsWith('_not_dispatched') === true;
+  if (typedNegative && (!preservesUncertainty || provesNeverDispatched)) {
     const classified = classifyAttemptOutcome({
       ...extracted,
       hostExecuted: true,
