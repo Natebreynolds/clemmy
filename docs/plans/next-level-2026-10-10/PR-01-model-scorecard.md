@@ -57,6 +57,9 @@ export interface ModelScoreRowV1 {
   `certified:false`.
 - Route-metric rows come from the existing summary query in
   `model-route-metrics.ts` (`ModelRouteSummary`); join on (role, model).
+  **Until PR-16 lands, `objectiveRate` and `toolSuccessRate` are null on every
+  row**: no production path writes those two columns today (verified 2026-10-10,
+  see PR-16). The presenter omits null fields, so the card is honest either way.
 - Health rows come from `buildModelStatus` plus the dead-login, bench, quota-latch
   and credit stores. Each row: provider, account label, state
   (`ok | rate_limited | auth_dead | out_of_credit | benched`), since, until,

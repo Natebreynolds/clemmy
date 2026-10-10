@@ -1,6 +1,6 @@
 # PR-05 — Governed auto-routing for helpers: the route policy gets a door and a log
 
-Size S · risk opt-in (default off, byte-identical) · depends on PR-01, PR-03
+Size S · risk opt-in (default off, byte-identical) · depends on PR-01, PR-03, **PR-16** (without the verdict join the policy would drift toward the fastest answer, not the one that passes review)
 
 ## Why
 
