@@ -25,6 +25,9 @@ const prior = fixtures.installCurrentCapabilityManifestFixtures([
   { operationId: 'SLACK_DELETE_REMINDER', providerKind: 'composio', effect: 'external_write' },
   { operationId: 'SLACK_CREATE_A_REMINDER', providerKind: 'composio', effect: 'external_write' },
   { operationId: 'SLACK_SEND_MESSAGE', providerKind: 'composio', effect: 'external_write' },
+  ...['ARCHIVE', 'BOOKMARK', 'COPY', 'FETCH', 'MARK', 'POST'].map((verb) => (
+    { operationId: `SLACK_${verb}_MESSAGE`, providerKind: 'composio' as const, effect: 'external_write' as const }
+  )),
 ]);
 test.after(() => {
   fixtures.restoreCurrentCapabilityManifestFixtures(prior);
@@ -33,7 +36,7 @@ test.after(() => {
 
 test('an unmaterializable listed operation points at served siblings of the same toolkit, never at itself', () => {
   const siblings = toolSearch.servedSiblingsFor('SLACK_DELETE_A_SLACK_REMINDER', 'delete a slack reminder');
-  assert.deepEqual(siblings, ['SLACK_CREATE_A_REMINDER', 'SLACK_DELETE_REMINDER']);
+  assert.deepEqual(siblings, ['SLACK_DELETE_REMINDER', 'SLACK_CREATE_A_REMINDER'], 'the closest served sibling comes first');
   const step = toolSearch.unavailableDefinitionNextStep('SLACK_DELETE_A_SLACK_REMINDER', siblings);
   assert.match(step, /listed by its provider but its definition could not be fetched/);
   assert.match(step, /SLACK_DELETE_REMINDER/);
@@ -41,4 +44,14 @@ test('an unmaterializable listed operation points at served siblings of the same
   // No served sibling: plain-word search, still never the same name.
   const alone = toolSearch.unavailableDefinitionNextStep('SLACK_DELETE_A_SLACK_REMINDER', []);
   assert.match(alone, /plain words for what you need, without this name/);
+});
+
+test('siblings sharing one common word do not crowd out the one that shares the whole action', () => {
+  // Five served operations share only MESSAGE with the request; the one that
+  // shares the action itself comes after them in the catalog. Live 2026-10-10:
+  // a send operation the provider listed but would not serve named five
+  // message siblings and left out the served send, and the turn made a draft.
+  const siblings = toolSearch.servedSiblingsFor('SLACK_SLACK_POST_MESSAGE', 'post a slack message to the team');
+  assert.equal(siblings[0], 'SLACK_POST_MESSAGE');
+  assert.equal(siblings.length, 5);
 });

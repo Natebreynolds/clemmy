@@ -100,15 +100,25 @@ const ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP = 'The account-routing review did not
 const ACCOUNT_CHECK_PENDING_NOTE = 'its connected account is still being confirmed, and that check finishes before it runs. When you need it, call it with the work_call example on its result; do not search for it again to get a capabilityRef. It has none to cite in plan_task until a later search returns one.';
 /** Same-toolkit operations the host serves today whose names share a word
  * with the operation that could not be defined, so the door named is one that
- * actually opens. Exported for tests. */
+ * actually opens. The closest come first: a word of the operation's own name
+ * counts twice a word only the query used, so five siblings sharing one
+ * common word cannot crowd out the one that shares the whole action.
+ * Exported for tests. */
 export function servedSiblingsFor(operation: string, query: string): string[] {
   const toolkit = registeredToolkitOfSlug(operation).trim();
   if (!toolkit) return [];
-  const words = new Set([...operation.toUpperCase().split('_'), ...query.toUpperCase().split(/[^A-Z0-9]+/)]
-    .filter((word) => word.length >= 4 && word !== toolkit.toUpperCase()));
+  const meaningful = (word: string) => word.length >= 4 && word !== toolkit.toUpperCase();
+  const own = new Set(operation.toUpperCase().split('_').filter(meaningful));
+  const asked = new Set(query.toUpperCase().split(/[^A-Z0-9]+/).filter(meaningful));
+  const closeness = (id: string) => [...new Set(id.split('_'))]
+    .reduce((score, word) => score + (own.has(word) ? 2 : asked.has(word) ? 1 : 0), 0);
   return currentlyServedOperationIdsForToolkit(toolkit)
-    .filter((id) => id !== operation.toUpperCase() && id.split('_').some((word) => words.has(word)))
-    .slice(0, 5);
+    .filter((id) => id !== operation.toUpperCase())
+    .map((id, order) => ({ id, order, score: closeness(id) }))
+    .filter((row) => row.score > 0)
+    .sort((a, b) => b.score - a.score || a.order - b.order)
+    .slice(0, 5)
+    .map((row) => row.id);
 }
 
 /** The provider lists this operation but will not serve its definition, so
