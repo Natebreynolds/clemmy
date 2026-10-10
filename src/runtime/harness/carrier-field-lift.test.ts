@@ -56,3 +56,24 @@ test('args_json sent as the object itself is encoded once instead of refused', (
   assert.equal(liftNestedCarrierFields(JSON.stringify({ args_json: { q: 1 } })), null, 'no target named: the schema refusal stays');
   assert.equal(liftNestedCarrierFields(JSON.stringify({ name: 't', args_json: [1] })), null, 'an array is not an argument object');
 });
+
+test('a field the carrier does not have, sent empty, is dropped; one with a value is left for the schema', () => {
+  // Live 2026-10-10 shape: a shell write whose carrier carried `record_ids: null`.
+  const live = { name: 'run_shell_command', record_ids: null, requirement_id: 'cap:local:run_shell_command:ordinary',
+    seal_amendment: null, source_call_ids: null, source_record_ids: null, universe_item_id: null, universe_selector: null,
+    args_json: JSON.stringify({ command: 'ls', cwd: null, timeout_ms: null }) };
+  const lifted = liftNestedCarrierFields(JSON.stringify(live))!;
+  const outer = JSON.parse(lifted.argumentsJson);
+  assert.equal('record_ids' in outer, false);
+  assert.deepEqual({ ...outer, record_ids: null }, live, 'nothing else changes');
+  assert.equal(lifted.target, 'run_shell_command');
+  assert.match(lifted.changes[0]!, /dropped record_ids/);
+  for (const empty of [[], '']) {
+    assert.equal('extra' in JSON.parse(liftNestedCarrierFields(JSON.stringify({ ...live, record_ids: undefined, extra: empty }))!.argumentsJson), false);
+  }
+  assert.equal(liftNestedCarrierFields(JSON.stringify({ ...live, record_ids: ['r1'] })), null, 'a stray field with a value is not guessed at');
+  const clean = { ...live } as Record<string, unknown>;
+  delete clean.record_ids;
+  assert.equal(liftNestedCarrierFields(JSON.stringify(clean)), null, 'a well-formed carrier is untouched');
+  assert.equal(liftNestedCarrierFields(JSON.stringify({ ...clean, proposal: null })), null, 'proposal is the carrier\'s own field');
+});

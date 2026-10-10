@@ -15,6 +15,13 @@
  * `args_json` sent as the object itself, rather than as its JSON text, is the
  * same document: it is encoded once here instead of refused, so the call runs
  * in the round it was made.
+ *
+ * A field the carrier does not have, sent empty (null, [] or ""), carries no
+ * information and is dropped. The carrier's schema is strict, and for a local
+ * write the host has already opened the inner call when the schema refuses
+ * it, so an empty stray field ended the whole turn (live 2026-10-10:
+ * `record_ids: null` beside a shell write). A stray field with a value is
+ * left for the schema to refuse.
  */
 
 const CARRIER_FIELDS = [
@@ -25,6 +32,12 @@ const CARRIER_FIELDS = [
   'universe_item_id',
   'universe_selector',
 ] as const;
+
+/** Every top-level field a work carrier may carry. */
+const CARRIER_OWN_FIELDS = new Set<string>([...CARRIER_FIELDS, 'name', 'args_json', 'proposal']);
+
+const emptyValue = (value: unknown): boolean => value === null || value === undefined || value === ''
+  || (Array.isArray(value) && value.length === 0);
 
 export interface LiftedCarrierFields {
   argumentsJson: string;
@@ -39,28 +52,38 @@ function record(value: unknown): Record<string, unknown> | null {
 /** The carrier call with its own fields moved out of `args_json` and the
  *  target's arguments as one JSON string; null when there is nothing to change. */
 export function liftNestedCarrierFields(argumentsJson: string): LiftedCarrierFields | null {
-  let outer: Record<string, unknown> | null;
-  try { outer = record(JSON.parse(argumentsJson)); } catch { return null; }
-  if (!outer) return null;
+  let parsedOuter: Record<string, unknown> | null;
+  try { parsedOuter = record(JSON.parse(argumentsJson)); } catch { return null; }
+  if (!parsedOuter) return null;
+  const strayEmpty = Object.keys(parsedOuter).filter((field) => !CARRIER_OWN_FIELDS.has(field) && emptyValue(parsedOuter![field]));
+  const outer: Record<string, unknown> = Object.fromEntries(Object.entries(parsedOuter)
+    .filter(([field]) => !strayEmpty.includes(field)));
+  const strayChange = strayEmpty.length > 0
+    ? [`dropped ${strayEmpty.join(', ')}: not a field of this carrier, and sent empty`] : [];
   const sentAsObject = record(outer.args_json);
+  const strayOnly = (): LiftedCarrierFields | null => {
+    const target = typeof outer.name === 'string' ? outer.name.trim() : '';
+    return strayChange.length > 0 && target
+      ? { argumentsJson: JSON.stringify(outer), target, changes: strayChange } : null;
+  };
   let inner: Record<string, unknown> | null = sentAsObject;
   if (!inner) {
-    if (typeof outer.args_json !== 'string') return null;
-    try { inner = record(JSON.parse(outer.args_json)); } catch { return null; }
+    if (typeof outer.args_json !== 'string') return strayOnly();
+    try { inner = record(JSON.parse(outer.args_json)); } catch { return strayOnly(); }
   }
-  if (!inner) return null;
+  if (!inner) return strayOnly();
   const nested = CARRIER_FIELDS.filter((field) => field in inner!);
   // Only the carrier's own fields mark the shape; a target that merely has a
   // `name` parameter is left alone.
-  if (nested.length === 0 && !sentAsObject) return null;
+  if (nested.length === 0 && !sentAsObject) return strayOnly();
   const outerName = typeof outer.name === 'string' ? outer.name.trim() : '';
   const innerName = nested.length > 0 && typeof inner.name === 'string' ? inner.name.trim() : '';
-  if (outerName && innerName && innerName !== outerName) return null;
+  if (outerName && innerName && innerName !== outerName) return strayOnly();
   const target = outerName || innerName;
   if (!target) return null;
-  const changes: string[] = sentAsObject
+  const changes: string[] = [...strayChange, ...(sentAsObject
     ? ['encoded args_json once; it takes the target\'s arguments as one JSON string, not the object itself']
-    : [];
+    : [])];
   if (nested.length === 0) {
     return { argumentsJson: JSON.stringify({ ...outer, args_json: JSON.stringify(inner) }), target, changes };
   }
