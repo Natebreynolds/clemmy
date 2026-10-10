@@ -7,7 +7,7 @@
 | Layer | What it is | Count / gate |
 |---|---|---|
 | Unit and component (`node:test` via tsx) | Pure functions, reducers, stores, routes with fixtures; each file runs in its own process with a private `CLEMENTINE_HOME` minted by `scripts/test-isolation-preload.mjs`, live models disabled (`CLEMMY_TEST_DISABLE_LIVE_MODELS=1`), local embeddings off | 2,250 `*.test.*` files; `npm test` = `scripts/run-tests-isolated.mjs` over the `DEFAULT_TEST_TARGETS` globs (`src/**`, `apps/**`, `packages/**`) |
-| Journeys (`src/journeys`) | End-to-end turns through the bridge with **scripted** models and recorded providers | separate serialized gate `npm run journeys`; excluded from the broad suite by design (latency contracts) |
+| Journeys (`src/journeys`, 38 files) | End-to-end turns through the bridge with **scripted** models and recorded providers, including the competitive-acceptance journeys (prompt cache, long task, run_worker ×100, ordinary conversation, provider-neutral matrix, restart kernel parity) | separate serialized gate `npm run journeys` (`--test-concurrency=1 --test-timeout=1200000`); not in `test.yml`; excluded from the broad suite by design (latency contracts); last recorded 200/201 with one inherited failure (09-30) |
 | Release gates | `test:release-assets`, `test:release-closure` (named presenter and UI suites that both apps render from), `check:public-hygiene`, `check:operation-identity`, `no-hardcoded-provider-pins` ratchet, `project-plan-ir` manifest growth | `.github/workflows/test.yml` and `release-desktop.yml` |
 | Proof and evals | `npm run proof` (real daemon × claude/codex/glm × 37 scenarios), `eval:passk`, `eval:memory`, `measure:judge-calibration` (κ on a 10-case seed), `bench:gates` | manual, token-spending, not CI |
 | Live acceptance | Named fixtures on the installed app, wave runner, receipts under `output/` | manual, the owner's requirement for every change |
@@ -40,10 +40,13 @@ it also means CI can only prove shape, not judgement.
   recommendation, review verdict and routing decision is only shape-tested.
   PR-03's engine is deliberately pure so that this is enough for it; PR-10's
   review change is the opposite and needs the replay in its brief.
-- **Both surfaces.** The console runs its own `lib/useChat.ts`; the phone runs
-  `ChatEngine`. A card wired in one and not the other passes every unit test.
-  The only parity suite is `apps/console-web/src/features/conversations/thread-parity.test.ts`
-  in the release-closure gate. Every UI brief in the plan adds a parity test.
+- **Both surfaces, and no rendering at all.** Neither app has a DOM test harness;
+  UI tests are source-text pins and pure model tests. The console runs its own
+  `lib/useChat.ts`; the phone runs `ChatEngine`. A card wired in one and not the
+  other passes every unit test. The only "parity" suite,
+  `thread-parity.test.ts`, is a regex over two source files. Every UI brief in
+  the plan therefore tests the shared presenter, a reducer parity fixture, and a
+  source-contract pin per app (see IMPLEMENTATION-NOTES.md).
 - **Real tokens.** Journeys carry no usage; `measure:turns` on the installed app
   is the only cost truth. Nine of the plan's briefs say "measure:turns unchanged"
   for that reason.

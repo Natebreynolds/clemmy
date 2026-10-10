@@ -72,21 +72,28 @@ extend, so nothing in the plan grows a parallel primitive.
 - Both already route a typed "continue" through the reply router
   (`task-continuity-runtime.ts`); nothing new server-side.
 
-## Parity tests (every UI brief)
+## UI tests and parity (every UI brief)
 
-- The only existing "parity" suite,
-  `apps/console-web/src/features/conversations/thread-parity.test.ts`, is a
-  **source-text** test (it reads the two React files and asserts on regexes,
-  `:20-39`). It proves nothing about rendering. The pattern the plan asks for is
-  different: feed one fixture event stream to the shared reducers
-  (`packages/chat-engine/src/reduce-lifecycle.ts` `reduceFeed`, `reduce-activity.ts`
-  `reduceActivity`) and to `ChatEngine`, and compare the derived card models
-  (not DOM). Put it in `packages/chat-engine/src/*.parity.test.ts` so it runs in
-  the release-closure gate (`package.json` `test:release-closure` lists chat-engine
-  files explicitly; add the new file there).
-- Because the console's `useChat.ts` does not use `ChatEngine`, a parity test on
-  the reducers covers the data; the console component still needs its own
-  render test (`Home.test.ts` style) for the new card.
+- There is **no DOM render harness** in either app: `apps/console-web` and
+  `apps/mobile-web` declare only `typecheck` and `build` scripts, no jsdom or
+  testing-library. Console screen tests (`screens/Home.test.ts`,
+  `thread-parity.test.ts`) read the component source with `readFileSync` and
+  assert on regexes ("visual contract" pins); model tests
+  (`components/home/home-model.test.ts`, `needs-you-answer.test.ts`) exercise
+  pure helpers. The phone has 54 test files of the same two kinds.
+- So a new card is tested in three places, none of them a render:
+  1. its presenter in `packages/chat-engine/src/*-presentation.ts` (pure, one
+     fixture in, words and actions out), which is where desktop and phone
+     parity actually lives, because both import it;
+  2. a reducer parity test: one fixture event stream through `reduceFeed` /
+     `reduceActivity` and through `ChatEngine`, comparing the derived card
+     models, placed in `packages/chat-engine/src/*.parity.test.ts` and listed in
+     `package.json` `test:release-closure`;
+  3. a source-contract pin per app in the existing style (the component imports
+     the presenter, wires every action the presenter names, and renders nothing
+     the presenter did not say).
+- A jsdom render harness would be a real improvement; it is listed under
+  PR-13 and is not a prerequisite for any brief.
 
 ## Route metrics (PR-16, PR-01, PR-05)
 
