@@ -22,12 +22,12 @@ import { selectRetainedJson } from './retained-json-selection.js';
 import {
   aggregateRows,
   applyWhere,
+  fieldPathCrossesList,
   fieldValue,
   sortRows,
   type AggregateFigure,
   type RecordAggregateOp,
-  type RecordCondition,
-} from './record-query.js';
+  type RecordCondition } from './record-query.js';
 
 /**
  * recall_tool_result — retrieve the verbatim output of a prior tool
@@ -811,8 +811,11 @@ export function registerRecallTools(server: McpServer): void {
         // exact reuse when both the selection and projection are identical.
         const refBase = unwrappedPath ? `${unwrappedPath}[*]` : '[*]';
         const refPath = fields && fields.length === 1 ? `${refBase}.${fields[0]}` : refBase;
+        // The reference follows plain dot paths: a field read through a list
+        // would bind other values than the ones shown here.
         const completeSourceSelection = rows === parsed && offset === 0 && page.length === rows.length
-          && (!fields || fields.length === 1);
+          && (!fields || fields.length === 1)
+          && !(fields?.length === 1 && rows.some((row) => fieldPathCrossesList(row, fields[0]!)));
         const refHint = explicitPath !== undefined || resolved.receipt || decodedMcpPayload || recoveredClippedArrayPrefix || !completeSourceSelection ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
         // A page that does not fit the reply is cut on a record boundary, and
         // the header counts only the records shown and names the exact query

@@ -16,6 +16,7 @@ const { RecallBudget, ToolCallsCounter, withHarnessRunContext } =
   await import('../runtime/harness/brackets.js');
 const { inlineResultBudgetForModel, retainedReaderMaxChars } =
   await import('../runtime/harness/tool-output-format.js');
+const { extractByPath } = await import('../runtime/harness/tool-output-reference.js');
 
 type QueryHandler = (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>;
 let query: QueryHandler | undefined;
@@ -263,4 +264,25 @@ test('a projected field reads text inside nested lists of each record', async ()
     { objectId: 'p7_i3', 'shape.text.textElements.textRun.content': ['Q4 results\n', 'Revenue up 12%'] },
     { objectId: 'p7_i4' },
   ]);
+});
+
+test('a reuse reference is offered only when it binds exactly the values shown', async () => {
+  const records = [
+    { objectId: 'a', m: { rank: 6 }, items: [{ value: 'A' }, { value: 'B' }] },
+    { objectId: 'b', m: { rank: 9 }, items: [{ value: 'C' }] },
+  ];
+  const fixture = park(records);
+  const reference = (text: string) => /"\$fromToolOutput":\{"callId":"[^"]+","path":"([^"]+)"\}/.exec(text)?.[1];
+  for (const field of ['objectId', 'm.rank']) {
+    const text = await read(fixture.sessionId, { call_id: fixture.callId, fields: [field] });
+    const path = reference(text);
+    assert.ok(path, `a plain path offers a reference: ${text.slice(0, 300)}`);
+    assert.deepEqual(extractByPath(records, path), shownRows(text).map((row) => row[field]),
+      'the reference binds exactly the values shown');
+  }
+  for (const field of ['items.value', 'items[*].value', 'items[0].value']) {
+    const text = await read(fixture.sessionId, { call_id: fixture.callId, fields: [field] });
+    assert.deepEqual(shownRows(text)[0]![field], field === 'items[0].value' ? 'A' : ['A', 'B'], 'the list path is still read');
+    assert.equal(reference(text), undefined, `a path through a list offers no reference: ${field}`);
+  }
 });

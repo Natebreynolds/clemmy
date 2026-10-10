@@ -52,6 +52,20 @@ export function fieldValue(record: unknown, field: string): unknown {
   return valueAtSteps(record, fieldSteps(field));
 }
 
+/** True when reading this field from this record steps through a list or
+ *  uses a bracket step: a path a plain dot-path reference does not follow the
+ *  same way. A list at the end of the path is read the same by both. */
+export function fieldPathCrossesList(record: unknown, field: string): boolean {
+  if (/[[\]]/.test(field)) return true;
+  let current: unknown = record;
+  for (const step of field.split('.')) {
+    if (Array.isArray(current)) return true;
+    if (!current || typeof current !== 'object') return false;
+    current = (current as Record<string, unknown>)[step];
+  }
+  return false;
+}
+
 function valueAtSteps(current: unknown, steps: readonly string[]): unknown {
   if (steps.length === 0) return current;
   const [step, ...rest] = steps as [string, ...string[]];
