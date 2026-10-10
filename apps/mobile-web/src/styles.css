@@ -4311,6 +4311,46 @@ textarea.cz-input { resize: vertical; }
 .work-chevron { flex: 0 0 auto; color: var(--fg-3); transition: transform 0.18s var(--clem-ease); }
 .work-chevron.open { transform: rotate(90deg); }
 
+/* ── a working turn, as on desktop ──────────────────────────────────
+   Her sentence and one clock on top; under it one card for the step in
+   hand. One mark breathes; nothing else moves.                         */
+.work-now { margin-bottom: var(--sp-3); }
+.work-said-row { display: flex; align-items: flex-start; gap: 10px; flex: 1 1 200px; min-width: 0; padding: 6px 0; }
+.work-said-row .work-orb { margin-top: 0.55em; }
+.work-said { flex: 1 1 auto; min-width: 0; margin: 0; color: var(--fg); font-size: var(--t-body); line-height: 1.45; }
+.work-clock { flex: 0 0 auto; padding-top: 0.15em; color: var(--fg-3); font-family: var(--font-mono); font-size: var(--t-xs); font-variant-numeric: tabular-nums; }
+.work-card { margin: 6px 0 0 18px; overflow: hidden; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg-0); animation: work-card-in 0.22s var(--clem-ease) both; }
+@keyframes work-card-in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+.work-card-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; }
+.work-card-text { flex: 1 1 auto; min-width: 0; }
+.work-card-title, .work-card-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.work-card-title { color: var(--fg); font-size: var(--t-sm); font-weight: 650; }
+.work-card-app { color: var(--fg-2); font-weight: 400; }
+.work-card-detail { margin-top: 1px; color: var(--fg-2); font-size: var(--t-xs); }
+.work-card-state { flex: 0 0 auto; color: var(--accent); font-size: var(--t-xs); font-weight: 600; }
+.work-card-excerpt {
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+  padding: 8px 12px; border-top: 1px solid var(--line); background: var(--bg-2);
+  color: var(--fg-2); font-family: var(--font-mono); font-size: var(--t-xs); line-height: 1.5; white-space: pre-wrap;
+}
+.work-card-foot { display: flex; align-items: center; padding: 2px 8px; border-top: 1px solid var(--line); }
+.work-card-steps { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 0 4px; border: none; background: none; color: var(--fg-3); font-size: var(--t-xs); }
+.work-card-steps:active { opacity: 0.6; }
+.work-now .work-detail { margin-left: 18px; }
+.work .work-detail .activity-row { font-size: var(--t-sm); }
+.app-mark {
+  display: inline-grid; place-items: center; flex: 0 0 auto; width: 34px; height: 34px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg-2);
+  color: var(--fg-2); font-size: var(--t-sm); font-weight: 650;
+}
+.app-mark-small { width: 18px; height: 18px; border-radius: 6px; font-size: 10px; }
+.app-mark-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--clem-primary); }
+.work-apps { display: inline-flex; flex: 0 0 auto; gap: 3px; }
+.reply-draft-dot { flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+@media (prefers-reduced-motion: reduce) {
+  .work-card { animation: none; }
+}
+
 /* The progress rail under the live line: one segment per phase. Done is
    filled, current sweeps (or fills to a declared count), pending waits,
    skipped is a dashed gap. Labels below; only the current phase captions. */

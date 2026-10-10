@@ -5,7 +5,7 @@ import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { answerDraftStatus, hiddenCardDecision, renderMarkdown, APPROVAL_ANSWER_WORDS, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
+import { answerDraftStatus, hiddenCardDecision, liveTurnText, renderMarkdown, APPROVAL_ANSWER_WORDS, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
 import type { ApprovalConfirm, ApprovalResolution } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
@@ -88,9 +88,6 @@ function ReplyProse({ text, streaming, failed }: { text: string; streaming?: boo
     />
   );
 }
-
-/** The longest line that reads as what she is doing rather than an answer. */
-const LIVE_WORDS_MAX = 280;
 
 /** A draft stays on the page while it is checked or corrected, at full
  *  strength: only a draft the reviewer sent back dims, since those words will
@@ -534,17 +531,13 @@ export function ChatBubble({
   // The harness is right to send both; a surface that renders one must not
   // render the other.
   const planCardCarriesTheReply = Boolean(message.planArtifactRef);
-  // While she works, the sentence she wrote before a tool ran (a draft set
-  // aside for the tool call) and her first words are what she is DOING, so
-  // they lead the work line instead of sitting in the answer's place.
-  // A plain stream without a draft identity is an answer, not a sentence:
-  // only a short line counts as her words about the work.
-  const liveWords = thinking && message.text.trim().length <= LIVE_WORDS_MAX && (
-    (message.answerDraft?.phase === 'withdrawn' && message.answerDraft.withdrawn === 'tool_call')
-    || (!message.answerDraft && !message.approval)
-  ) ? message.text.trim() : '';
-  const hasReplyText = Boolean(message.text.trim())
-    && !liveWords
+  // While she works, the sentence she wrote before a tool ran and her first
+  // words lead the work line instead of sitting in the answer's place; a draft
+  // set aside for a tool call, or text that is the call itself, is never shown
+  // as an answer. One rule for desktop and phone (chat-engine liveTurnText).
+  const turnText = liveTurnText(message, thinking);
+  const liveWords = turnText.words;
+  const hasReplyText = turnText.showReply
     && !stoppedPlaceholder
     && !planCardCarriesTheReply;
   // A turn with no words, no plan and no decision draws no reply at all: the

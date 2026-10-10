@@ -29,6 +29,7 @@ export * from './turn-project.js';
 export * from './delegated-task.js';
 export * from './project-presentation.js';
 export * from './turn-progress.js';
+export * from './live-work.js';
 export * from './workflow-name.js';
 export * from './memory-work.js';
 

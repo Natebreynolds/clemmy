@@ -29,7 +29,16 @@ import {
   type TaskMode,
   answerDraftStatus,
   evidenceChips,
-  liveActivityHeadline,
+  friendlyStep,
+  liveTurnText,
+  looksLikeMachineText,
+  stepInHand,
+  turnSpan,
+  workApps,
+  workClock,
+  workReceiptLine,
+  type WorkOutcome,
+  MODEL_PHASE_ACTIVITY_ID,
   narrateActivity,
   observedEvidenceChips,
   delegatedTaskFollowsLine,
@@ -40,7 +49,6 @@ import {
   timelineBounds,
   timelineSpan,
   turnByline,
-  turnProgress,
   type TimelineBounds,
   turnModelOffer,
   turnReview,
@@ -95,7 +103,6 @@ import { ChatBackButton } from '../components/ChatBackButton';
 import { Sheet } from '../components/Sheet';
 import { PlanReview } from '../components/PlanReview';
 import { RunControl, delegatedRunControlForExpandedWork } from '../components/RunControl';
-import { ProgressRail } from '../components/ProgressRail';
 import { DelegatedTaskCard } from '../components/DelegatedTaskCard';
 import { CompletedFiles } from '../components/CompletedFiles';
 
@@ -885,7 +892,10 @@ function MessageRow({
   }
 
   const thinking = message.status === 'thinking';
-  const draftStatus = thinking ? answerDraftStatus(message.answerDraft) : null;
+  // Her sentence before a tool runs leads the work line; a draft set aside for
+  // the tool call, or text that is the call itself, never sits in the answer's place.
+  const turnText = liveTurnText(message, thinking);
+  const draftStatus = thinking && turnText.showReply ? answerDraftStatus(message.answerDraft) : null;
   const activity = narrateActivity(message.activity ?? [], { live: thinking });
   const planStatus = message.planProposalId
     ? (planOutcome[message.planProposalId] ?? message.planProposalStatus ?? 'pending')
@@ -1064,40 +1074,33 @@ function MessageRow({
       {/* The work Clem did is ONE quiet line, not a stack of tool rows: while
           she is working it narrates the current step, and once settled it
           becomes a summary you can open. The reply is what the screen is for. */}
-      {activity.length > 0 ? (
+      {thinking || activity.length > 0 ? (
         <WorkLine
           activity={activity}
           live={thinking}
+          words={turnText.words}
           message={message}
           onDelegatedStateChange={onDelegatedStateChange}
           onDelegatedChanged={onDelegatedChanged}
         />
       ) : null}
-      {message.text ? (
+      {turnText.showReply ? (
         <>
           {/* Safe by construction: renderMarkdown escapes ALL input before
               adding markup, refuses raw HTML, and only links http(s). A draft
-              that is being checked or corrected stays on screen (dimmed once
-              withdrawn) until the next draft or the reply replaces it. */}
+              that is being checked stays at full strength; only one the
+              reviewer sent back dims, since those words will not stand. */}
           <div
-            class={`reply bubble-md${thinking && !draftStatus ? ' reply-writing' : ''}${message.answerDraft?.phase === 'withdrawn' ? ' reply-withdrawn' : ''}`}
+            class={`reply bubble-md${thinking && !draftStatus ? ' reply-writing' : ''}${thinking && message.answerDraft?.phase === 'withdrawn' && message.answerDraft.withdrawn === 'review' ? ' reply-withdrawn' : ''}`}
             dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text, { appPlaceLinks: 'phone' }) }}
           />
           {draftStatus ? (
             <p class={`reply-draft-status${message.answerDraft?.withdrawn === 'review' ? ' is-correcting' : ''}`} role="status">
-              <span class="work-orb" aria-hidden="true" />
+              <span class="reply-draft-dot" aria-hidden="true" />
               {draftStatus}
             </p>
           ) : null}
         </>
-      ) : thinking && activity.length === 0 ? (
-        <div class="work">
-          <div class="work-line work-live" role="status">
-            <span class="work-orb" aria-hidden="true" />
-            <span class="work-summary work-shimmer">{message.progress ?? 'Thinking…'}</span>
-          </div>
-          <ProgressRail progress={turnProgress({ activity, live: true, draft: message.answerDraft, hasText: Boolean(message.text) })} />
-        </div>
       ) : null}
       {/* Mirror the backend's TYPED terminal (desktop shows the same pills).
           Without this the phone showed a blocked or paused turn as plain prose,
@@ -1156,23 +1159,28 @@ function MessageRow({
 }
 
 /**
- * One line for everything Clem did this turn.
+ * How a turn shows Clem's work, as on desktop.
  *
- * Live, it says what is happening right now — a person watching wants the
- * current beat, not a growing list. Settled, it collapses to how long the work
- * took and how many steps it was, and opens on tap for anyone who wants the
- * receipts. Failures are never hidden: if any step failed the line says so and
- * starts open, because that is the one case where the detail IS the answer.
+ * While she works: her own sentence about what she is doing (the line she
+ * wrote before a tool ran, her first words, or the step in plain words), one
+ * clock, and a card for the step in hand — the app it happens in, what is
+ * being done, and the steps behind it on demand. One mark breathes; nothing
+ * else moves. When the answer lands it folds to one receipt line ("Worked 18s
+ * · read calendar view · created draft") that opens to the same steps.
+ * Failures are never hidden: a turn with a failed step starts open.
  */
 function WorkLine({
   activity,
   live,
+  words,
   message,
   onDelegatedStateChange,
   onDelegatedChanged,
 }: {
   activity: ActivityItem[];
   live: boolean;
+  /** Her own words about the work right now, when she wrote some. */
+  words: string;
   message: ChatMessage;
   onDelegatedStateChange: (
     sourceUserSeq: number,
@@ -1180,60 +1188,142 @@ function WorkLine({
   ) => void;
   onDelegatedChanged: () => void;
 }) {
-  const failed = activity.some((item) => item.status === 'failed');
+  // The model's own phase row ran the whole turn as a second spinner and a
+  // second clock; the clock at the top already says how long she has been at it.
+  const view = activity.filter((item) => item.id !== MODEL_PHASE_ACTIVITY_ID);
+  const failed = view.some((item) => item.status === 'failed');
   // A turn with no failed ROW can still not have succeeded: stopped, waiting
   // on a reply, waiting on approval, blocked. The typed terminal is what knows.
-  // Without this the card read "Worked 40s · 6 steps" for all of them, which is
-  // the same class of lie as Home's old "done while you were away".
   // Clem asking for a reply or an approval is her turn ending on purpose: it
   // waits on you, which is neither done nor "Didn't finish".
   const waiting = !live && !failed && message.terminal?.status === 'needs_input';
   const unfinished = !live && !failed && !waiting
     && Boolean(message.terminal) && message.terminal?.status !== 'done';
   const [open, setOpen] = useState(failed);
+  const [stepsOpen, setStepsOpen] = useState<boolean>(() => readLiveStepsOpen());
   const now = useNowTick(live);
-  const elapsed = turnElapsed(activity, live, now);
+  const span = turnSpan(message.activity ?? []);
   const delegatedControl = delegatedRunControlForExpandedWork(message, open);
-  // The four-phase rail while live; the step bars share one time window.
-  const progress = live ? turnProgress({ activity, live, draft: message.answerDraft, hasText: Boolean(message.text) }) : null;
-  const bounds = timelineBounds(activity, live, now);
+  const steps = view.filter((item) => item.kind !== 'check');
+  // Steps read in people's words: what she is doing while it runs, what she
+  // did once it settled.
+  const plain = (item: ActivityItem): ActivityItem => {
+    const phrased = friendlyStep(item.label);
+    const label = item.status === 'running' ? phrased.action : phrased.done;
+    return { ...item, label: phrased.app ? `${label} · ${phrased.app}` : label };
+  };
+  const control = delegatedControl?.target ? (
+    <RunControl
+      compact
+      state={delegatedControl.state}
+      target={delegatedControl.target}
+      onStateChange={(state) => onDelegatedStateChange(delegatedControl.sourceUserSeq, state)}
+      onChanged={onDelegatedChanged}
+    />
+  ) : delegatedControl?.state === 'stopped' ? (
+    <div class="delegated-work-state" role="status">Stopped</div>
+  ) : null;
 
-  // While live, a running step names itself; between steps the engine's own
-  // rolling line ("Reading your calendar…") says what she is doing.
-  const running = activity.some((item) => item.status === 'running');
-  const summary = live
-    ? (!running && message.progress ? message.progress : liveActivityHeadline(activity))
-    : `${failed ? 'Ran into trouble · ' : unfinished ? 'Didn’t finish · ' : waiting ? 'Waiting for you · ' : ''}${elapsed ? `Worked ${elapsed} · ` : ''}${activity.length} ${activity.length === 1 ? 'step' : 'steps'}`;
+  if (live) {
+    const inHand = stepInHand(view);
+    const step = inHand ? friendlyStep(inHand.label) : null;
+    const running = inHand?.status === 'running';
+    const progress = message.progress?.trim() && !looksLikeMachineText(message.progress) ? message.progress.trim() : '';
+    // Her own sentence leads; otherwise the card already names the step, so
+    // the line does not say it twice.
+    const said = words.trim() || (inHand ? 'Working on it' : progress || 'Getting started');
+    const clock = workClock(span.startedAt, now);
+    const toggleSteps = () => setStepsOpen((value) => { writeLiveStepsOpen(!value); return !value; });
+    return (
+      <div class="work work-now">
+        <div class="work-head">
+          <div class="work-said-row">
+            <span class="work-orb" aria-hidden="true" />
+            <p class="work-said" role="status" aria-live="polite">{said}</p>
+            {clock ? <span class="work-clock">{clock}</span> : null}
+          </div>
+          {control}
+        </div>
+        {inHand && step ? (
+          <div class="work-card">
+            <div class="work-card-head">
+              <AppMark app={step.app} />
+              <div class="work-card-text">
+                <div class="work-card-title">
+                  {running ? step.action : step.done}
+                  {step.app ? <span class="work-card-app"> · {step.app}</span> : null}
+                </div>
+                {inHand.detail ? <div class="work-card-detail">{inHand.detail}</div> : null}
+              </div>
+              {running
+                ? <span class="work-card-state">In progress</span>
+                : <span class={`act-mark ${inHand.status === 'failed' ? 'act-fail' : 'act-ok'}`} role="img" aria-label={inHand.status === 'failed' ? 'Failed' : 'Done'}>{inHand.status === 'failed' ? '✗' : '✓'}</span>}
+            </div>
+            {inHand.excerpt ? <div class="work-card-excerpt">{inHand.excerpt}</div> : null}
+            <div class="work-card-foot">
+              <button type="button" class="work-card-steps" onClick={toggleSteps} aria-expanded={stepsOpen}>
+                <span class={`work-chevron${stepsOpen ? ' open' : ''}`} aria-hidden="true">›</span>
+                {steps.length} {steps.length === 1 ? 'step' : 'steps'}
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {inHand && stepsOpen ? (
+          <div class="work-detail">
+            {view.map((item) => <ActivityRow key={item.id} item={plain(item)} bounds={null} now={now} live={live} />)}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
 
+  if (view.length === 0) return null;
+  const outcome: WorkOutcome = failed ? 'failed' : unfinished ? 'interrupted' : waiting ? 'waiting' : 'completed';
+  const apps = workApps(steps);
+  const bounds = timelineBounds(view, false, now);
   return (
     <div class={`work${open ? ' work-open' : ''}${failed ? ' work-failed' : ''}${unfinished ? ' work-unfinished' : ''}${waiting ? ' work-waiting' : ''}`}>
       <div class="work-head">
-        <button class={`work-line${live ? ' work-live' : ''}`} onClick={() => setOpen(!open)} aria-expanded={open}>
-          {live ? <span class="work-orb" aria-hidden="true" /> : <OutcomeMark failed={failed} unfinished={unfinished} waiting={waiting} />}
-          <span class={`work-summary${live ? ' work-shimmer' : ''}`}>{summary}</span>
-          {live && elapsed ? <span class="work-elapsed">{elapsed}</span> : null}
-          {live ? null : <span class={`work-chevron${open ? ' open' : ''}`} aria-hidden="true">›</span>}
+        <button class="work-line" onClick={() => setOpen(!open)} aria-expanded={open}>
+          <OutcomeMark failed={failed} unfinished={unfinished} waiting={waiting} />
+          {apps.length > 0 ? (
+            <span class="work-apps">{apps.map((app) => <AppMark key={app} app={app} small />)}</span>
+          ) : null}
+          <span class="work-summary">{workReceiptLine(outcome, span.totalMs, steps)}</span>
+          <span class={`work-chevron${open ? ' open' : ''}`} aria-hidden="true">›</span>
         </button>
-        {delegatedControl?.target ? (
-          <RunControl
-            compact
-            state={delegatedControl.state}
-            target={delegatedControl.target}
-            onStateChange={(state) => onDelegatedStateChange(delegatedControl.sourceUserSeq, state)}
-            onChanged={onDelegatedChanged}
-          />
-        ) : delegatedControl?.state === 'stopped' ? (
-          <div class="delegated-work-state" role="status">Stopped</div>
-        ) : null}
+        {control}
       </div>
-      {progress ? <ProgressRail progress={progress} /> : null}
       {open ? (
         <div class="work-detail">
-          {activity.map((item) => <ActivityRow key={item.id} item={item} bounds={bounds} now={now} live={live} />)}
+          {view.map((item) => <ActivityRow key={item.id} item={plain(item)} bounds={bounds} now={now} live={false} />)}
         </div>
       ) : null}
     </div>
   );
+}
+
+/** The app a step happens in, by its initial; a built-in step shows Clem's own mark. */
+function AppMark({ app, small = false }: { app?: string; small?: boolean }) {
+  return (
+    <span class={`app-mark${small ? ' app-mark-small' : ''}`} aria-hidden="true">
+      {app ? app.charAt(0).toUpperCase() : <span class="app-mark-dot" />}
+    </span>
+  );
+}
+
+const LIVE_STEPS_OPEN_KEY = 'clem.workline.liveStepsOpen.v2';
+/** Closed the first time (the card is the show while a turn runs); after
+ *  that, whatever the reader chose. Storage may be unavailable: default closed. */
+function readLiveStepsOpen(): boolean {
+  try {
+    return window.localStorage.getItem(LIVE_STEPS_OPEN_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+function writeLiveStepsOpen(open: boolean): void {
+  try { window.localStorage.setItem(LIVE_STEPS_OPEN_KEY, open ? '1' : '0'); } catch { /* per-viewer convenience only */ }
 }
 
 /** Tick once a second while live, so the clock and the step bars move together. */
@@ -1246,19 +1336,6 @@ function useNowTick(live: boolean): number {
     return () => clearInterval(timer);
   }, [live]);
   return now;
-}
-
-/** Human elapsed for the turn, from the earliest step that carried a start. */
-function turnElapsed(activity: ActivityItem[], live: boolean, now: number): string {
-  const startedAt = activity.reduce<number | undefined>((earliest, item) => (
-    item.startedAt && (earliest === undefined || item.startedAt < earliest) ? item.startedAt : earliest
-  ), undefined);
-  if (startedAt === undefined) return '';
-  const seconds = Math.max(0, Math.round(((live ? now : Math.max(now, startedAt)) - startedAt) / 1000));
-  if (!live && seconds < 1) return '';
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${seconds % 60}s`;
 }
 
 /** One step, with where it sat in the turn drawn as a hairline under it. */
