@@ -1270,6 +1270,56 @@ export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'around
   disclosedOperations?: readonly HostCapabilityDescriptorV1[];
 }
 
+/** The ready operations, their invocation shape and when they need no plan:
+ *  in work_call's own definition (`here`), or in the turn's context, which
+ *  changes per turn without changing the tool definitions before it. */
+function workCallReadyLines(
+  operations: readonly HostCapabilityDescriptorV1[],
+  where: 'here' | 'through work_call',
+): string[] {
+  const ready = disclosedWorkCallReadyOperations(operations);
+  if (ready.length === 0) return [];
+  const hasLocal = ready.some((row) => row.capability_selector.startsWith('cap:local:'));
+  const hasResolved = ready.some((row) => row.capability_selector.startsWith('cap:resolved:'));
+  const shapes: unknown[] = [];
+  if (hasLocal) {
+    shapes.push({
+      requirement_id: 'cap:local:<name>:<variant>',
+      name: '<name>',
+      args_json: '{"<arg>":"<value>"}',
+      universe_item_id: null,
+      universe_selector: null,
+      seal_amendment: null,
+      source_call_ids: null,
+      source_record_ids: null,
+    });
+  }
+  if (hasResolved) {
+    shapes.push({
+      requirement_id: 'cap:resolved:<operation>',
+      name: 'composio_execute_tool',
+      args_json: '{"tool_slug":"<OPERATION>","arguments":{"<argument>":"<value>"}}',
+      universe_item_id: null,
+      universe_selector: null,
+      seal_amendment: null,
+      source_call_ids: null,
+      source_record_ids: null,
+    });
+  }
+  return [
+    `Operations already disclosed for this request and callable ${where} now: ${JSON.stringify(ready)}. \`name\` is the exact callable name. For a direct call without a frozen requirement, use \`capability_selector\` as requirement_id. Once a plan is active, use that plan's exact requirement id instead. Neither identifier substitutes for the callable name.`,
+    `Invocation shape for a direct call: ${JSON.stringify(shapes.length === 1 ? shapes[0] : shapes)}. args_json is a JSON STRING, not an object. There is no proposal field on this call.`,
+    'Use the exact argument schema already provided. If it is missing, call tool_search with the exact operation name before invoking. Do not guess argument names and learn them from a refusal.',
+    'Ordinary native work, including contextual reads, one authorized reversible write and its readback, may proceed directly through these operations without plan_task. Planning stays required for coordinated business dependencies, each/set, admin, destructive or unknown-effect work, and the explicit desktop/mobile Plan review path is unchanged.',
+  ];
+}
+
+/** The ready operations as one block for the turn's context. */
+export function renderWorkCallReadyBlock(operations: readonly HostCapabilityDescriptorV1[]): string | null {
+  const lines = workCallReadyLines(operations, 'through work_call');
+  return lines.length > 0 ? `[work_call ready] ${lines.join(' ')}` : null;
+}
+
 /** Present disclosed local and resolved-provider operations as callable work_call rows. */
 export function disclosedWorkCallReadyOperations(
   descriptors: readonly HostCapabilityDescriptorV1[],
@@ -2023,43 +2073,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       // artifact, edit one existing artifact, read it back — needs no plan;
       // explicit desktop/mobile Plan and exact Execute are unchanged.
       ...(disclosedOperations && disclosedOperations.length > 0
-        ? (() => {
-            const ready = disclosedWorkCallReadyOperations(disclosedOperations);
-            if (ready.length === 0) return [];
-            const hasLocal = ready.some((row) => row.capability_selector.startsWith('cap:local:'));
-            const hasResolved = ready.some((row) => row.capability_selector.startsWith('cap:resolved:'));
-            const shapes: unknown[] = [];
-            if (hasLocal) {
-              shapes.push({
-                requirement_id: 'cap:local:<name>:<variant>',
-                name: '<name>',
-                args_json: '{"<arg>":"<value>"}',
-                universe_item_id: null,
-                universe_selector: null,
-                seal_amendment: null,
-                source_call_ids: null,
-                source_record_ids: null,
-              });
-            }
-            if (hasResolved) {
-              shapes.push({
-                requirement_id: 'cap:resolved:<operation>',
-                name: 'composio_execute_tool',
-                args_json: '{"tool_slug":"<OPERATION>","arguments":{"<argument>":"<value>"}}',
-                universe_item_id: null,
-                universe_selector: null,
-                seal_amendment: null,
-                source_call_ids: null,
-                source_record_ids: null,
-              });
-            }
-            return [
-              `Operations already disclosed for this request and callable here now: ${JSON.stringify(ready)}. \`name\` is the exact callable name. For a direct call without a frozen requirement, use \`capability_selector\` as requirement_id. Once a plan is active, use that plan's exact requirement id instead. Neither identifier substitutes for the callable name.`,
-              `Invocation shape for a direct call: ${JSON.stringify(shapes.length === 1 ? shapes[0] : shapes)}. args_json is a JSON STRING, not an object. There is no proposal field on this call.`,
-              'Use the exact argument schema already provided. If it is missing, call tool_search with the exact operation name before invoking. Do not guess argument names and learn them from a refusal.',
-              'Ordinary native work, including contextual reads, one authorized reversible write and its readback, may proceed directly through these operations without plan_task. Planning stays required for coordinated business dependencies, each/set, admin, destructive or unknown-effect work, and the explicit desktop/mobile Plan review path is unchanged.',
-            ];
-          })()
+        ? workCallReadyLines(disclosedOperations, 'here')
         : []),
       requireHostPlan
         ? 'Compose content you write yourself in the consuming call\'s args. After a reviewed compute step is recorded with plan_step_result, call its consumer with the plan requirement id and omit the bound argument fields: the host fills them from the recorded output.'
