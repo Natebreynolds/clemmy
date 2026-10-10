@@ -51,6 +51,14 @@ staying active) was lost or only its wording. If the behaviour was lost it is a
 regression of the semantic-scope retention the test protects and goes to the
 owner before any pin moves.
 
+## 2a. Gates and intermittent cases seen in the container
+
+| Gate or file | Result here | Reading |
+|---|---|---|
+| `npm run test:release-closure` (151 tests) | 149 pass, 2 fail: `scripts/dev-down-active-acceptance.test.mjs` both cases, exit code `null` where 0 was expected | environment: the dev-down script does not run to completion in a Linux container; this gate runs on macOS in `release-desktop.yml`, where v3.18.35 shipped. Verify on the Mac before counting it. |
+| `src/execution/coding-run-git.test.ts` · "a timed out test also stops its descendant process" | failed once in the detached full run under full CPU load | intermittent: the 10-06 Windows checkpoint records "one joined POSIX cancellation check failed without retaining its descendant PID; its cause remains unknown". Rerun alone before classifying; if it fails alone it is a real process-group cleanup race. |
+| `src/agents/orchestrator.test.ts` · the fan-out case | passes at `v3.18.26` (`4c3a9e42`, 10-02), fails at `v3.18.30` (`1a17e070`, 10-07) and at `v3.18.34` | a change in the 10-02 → 10-07 waves (301 commits) stopped the batch-shape mandate (`src/tools/batch-shape-directive.ts:43`, injected at `orchestrator.ts:2453` unless `hostFreshPlanning`) from reaching the affirmed follow-up's instructions. Bisect result below. |
+
 ## 3. What the classes mean
 
 - **stale pin**: the sentence or shape changed on purpose, in a commit whose
@@ -71,6 +79,11 @@ is recorded here with the commit that fixed it.
   container that wrote this document; its failing lines will be appended here
   with their files when it ends. Until then, treat any failing file not in §1 as
   "unclassified", not as new.
-- Whether the four Windows modules in the cutover-hold closure are needed by the
-  held parent (they are if the credential policy gates the hold's home reads) or
-  leaked in through an import of `credential-private-filesystem.ts`.
+- The four Windows modules enter the cutover-hold closure through one import:
+  `src/config.ts:8` now reads credential files through
+  `runtime/credential-private-filesystem.ts` (the Windows credential policy),
+  which pulls `windows-private-filesystem.ts`, `sync-directory.ts` and
+  `ascii-json.ts`. `config.ts` was already in the closure, so the growth is the
+  credential policy itself, not a stray import. Recommended: accept, move the
+  pin, and note in the pin's comment that the hold reads its home through the
+  credential policy since the Windows beta.
