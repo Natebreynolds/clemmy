@@ -15,7 +15,7 @@ test('the sentence she wrote before a tool ran leads the work line, never the an
 test('a draft that is the tool call itself is never shown, as words or as an answer', () => {
   for (const text of [
     '{"requirement_id":"cap:local:run_shell_command:ordinary","name":"run_shell_command","args_json":"{\\"command\\":\\"sf data query\\"}"}',
-    '[{"Id":"003Rj000002c0XLIAY","Name":"Mike"}]',
+    '[{"Id":"contact-fixture-1","Name":"Mike"}]',
     '"tool_slug": "OUTLOOK_SEARCH_MESSAGES", "arguments": {"query": "slide 7"}',
     'Calling it now: {"tool_slug":"OUTLOOK_SEARCH_MESSAGES","arguments":{"query":"slide 7"}}',
   ]) {
