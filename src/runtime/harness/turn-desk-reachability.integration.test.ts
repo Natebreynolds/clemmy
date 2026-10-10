@@ -333,6 +333,36 @@ test('a tool reached for during a turn joins the tools block at the owner\'s nex
   assert.equal(names(nextTurn).includes('view_image'), true, 'the next turn carries the tool it reached for');
 });
 
+test('a rebuild of the same turn keeps work_call\'s ready list; an operation found during the turn joins at the next message', async () => {
+  const sessionId = 'work-call-disclosure-turn';
+  const descriptor = {
+    id: 'cap:resolved:quillboard_pages_batch_update', effect: 'external_write', purpose: 'Update the pages of a deck',
+    acceptedInputKinds: [], producedOutputKinds: [], applicableDeliverableKinds: [], inputShape: 'object', outputShape: 'object',
+    outputKind: 'record', deliverableKind: 'none', destinationPosture: null, evidenceKinds: [], handleRequired: false,
+    readbackRequired: false, accountScope: 'account', manifestDigest: 'a'.repeat(64),
+  };
+  const proven = (sourceUserSeq: number) => eventlog.appendEvent({
+    sessionId, turn: 0, role: 'system', type: 'proven_operation_selected',
+    data: { sourceUserSeq, skipDiscoverySearch: false, tools: ['QUILLBOARD_PAGES_BATCH_UPDATE'], descriptors: [descriptor], boundAccounts: [] },
+  });
+  const workCallBytes = (agent: unknown) => JSON.stringify(agentTools(agent)
+    .filter((entry) => entry.name === 'work_call').map((entry) => [entry.description, entry.parameters]));
+  const source = acceptSource(sessionId, TARGETED);
+  const opening = await buildFor(sessionId, source.seq, TARGETED, idleModel);
+  const before = workCallBytes(opening);
+  assert.notEqual(before, '[]', 'the turn carries work_call');
+  assert.doesNotMatch(before, /QUILLBOARD_PAGES_BATCH_UPDATE/);
+  // The turn finds an operation, then restarts after the owner approves.
+  proven(source.seq);
+  const resumed = await buildFor(sessionId, source.seq, TARGETED, idleModel, { acceptedRoute: 'act' });
+  assert.equal(workCallBytes(resumed), before, 'the restarted turn re-sends work_call byte for byte');
+  // The owner's next message lists it.
+  const next = acceptSource(sessionId, TARGETED);
+  proven(next.seq);
+  const nextTurn = await buildFor(sessionId, next.seq, TARGETED, idleModel);
+  assert.match(workCallBytes(nextTurn), /QUILLBOARD_PAGES_BATCH_UPDATE/, 'the next turn lists the operation as ready');
+});
+
 test('Jev off and Jev on without a key decide the same desk and send the same tools block', async () => {
   const offRun = await hostTurn('turn-desk-jev-off', TARGETED, []);
   process.env.CLEMMY_JEV = 'on';

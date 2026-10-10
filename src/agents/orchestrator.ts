@@ -1954,6 +1954,43 @@ export function renderProvenDiscoveryCompleteLine(disclosure: ProvenTurnDisclosu
   return `[discovery-complete] Discovery already ran for this turn's proven operations (${tools}): their exact work_call requirement_id is disclosed in the PROVEN OPERATION note.${accounts} Calling tool_search for them again only spends a model round; call them now, and use tool_search only for something they cannot do.`;
 }
 
+/**
+ * THE WORK_CALL DISCLOSURE A TURN STARTED WITH.
+ *
+ * The operations work_call lists as ready are part of its schema, and the
+ * schema is part of the prompt prefix a provider caches. A rebuild of the
+ * same turn (the restart after the owner approves an action) used to list
+ * the operations found during the turn, change the schema and re-send the
+ * whole conversation uncached. Those operations are already in the turn's own
+ * history; they join the list from the owner's next message. A rebuild in
+ * another mode (a plan turning into its execution) takes its own list.
+ */
+const turnStartWorkCallDisclosures = new Map<string, {
+  sourceUserSeq: number;
+  mode: string;
+  disclosed: readonly HostCapabilityDescriptorV1[];
+}>();
+const TURN_START_DISCLOSURE_SESSIONS = 200;
+
+export function workCallDisclosuresAtTurnStart(
+  sessionId: string | null | undefined,
+  sourceUserSeq: number | null | undefined,
+  mode: string,
+  current: readonly HostCapabilityDescriptorV1[],
+): readonly HostCapabilityDescriptorV1[] {
+  const sid = (sessionId ?? '').trim();
+  if (!sid || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq as number) <= 0) return current;
+  const started = turnStartWorkCallDisclosures.get(sid);
+  if (started && started.sourceUserSeq === sourceUserSeq && started.mode === mode) return started.disclosed;
+  turnStartWorkCallDisclosures.delete(sid);
+  turnStartWorkCallDisclosures.set(sid, { sourceUserSeq: sourceUserSeq as number, mode, disclosed: current });
+  if (turnStartWorkCallDisclosures.size > TURN_START_DISCLOSURE_SESSIONS) {
+    const oldest = turnStartWorkCallDisclosures.keys().next().value;
+    if (oldest !== undefined) turnStartWorkCallDisclosures.delete(oldest);
+  }
+  return current;
+}
+
 function mergeWorkCallDisclosures(
   planning: HostFreshPlanningContextV1 | undefined,
   proven: readonly HostCapabilityDescriptorV1[],
@@ -4318,6 +4355,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       nativeHintContracts = presentation.contracts;
       if (!planMode) workCallOptions.disclosedOperations = presentation.disclosedOperations;
     }
+  }
+  if (carrierWork && workCallOptions) {
+    const disclosed = workCallDisclosuresAtTurnStart(
+      options.sessionId, options.sourceUserSeq, taskMode?.kind ?? 'chat', workCallOptions.disclosedOperations ?? [],
+    );
+    if (disclosed.length > 0) workCallOptions.disclosedOperations = disclosed;
+    else delete workCallOptions.disclosedOperations;
   }
   const narrowSurface = provenDisclosure.narrowSurface === true;
   const assembledTools = turnStateToolsLast([
