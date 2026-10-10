@@ -196,3 +196,45 @@ ship as one release. PR-05 is the first automatic behaviour and stays opt-in.
 - For anything that changes a review: `measure:judge-calibration` unchanged or
   better, plus the nine-run read fixture from the 10-09 data.
 - Installed-app acceptance with a named fixture, receipts kept under `output/`.
+
+## 8. Review decisions, 2026-10-10 (merged onto main with this plan)
+
+Reviewed against the owner's standing decisions before merging. Where a brief and a
+standing decision disagree, the decision wins and the brief is read as amended here.
+
+**Status of PR-00.** Step 1 was already on main (`5f3816e6f` replaced the fixture id
+before this branch's own fix; that commit was not taken). Main's unit job runs again.
+Step 3: #91 (test concurrency cap) is taken. #90 is closed with a reason: main removed
+the eager local-model warmup that was the recursion's entry (09-21, the boot-path load
+that crash-looped the daemon), so the fix's `embeddings.ts` hunk would put it back, and
+its worker-guard test does not load in a worker thread on today's main. Steps 4 and 5
+are done (`e7386a94c`): the baseline is 20 failures. What remains of PR-00 is the CI
+confirmation against the baseline list.
+
+**Order from here.** PR-15 → PR-14 → PR-17 → PR-18 (main green except the orchestrator
+case), then PR-16 → PR-01 → PR-02 → PR-03 with PR-04 as one release. PR-08 can go any time.
+
+**Amendments.**
+- **PR-07, step 2 is dropped.** The four-segment rail was removed on purpose by the
+  owner-approved live-turn redesign (desktop 10-09; phone 10-10, `b0612ddab`): while
+  Clem works the chat shows her words, one clock and a card for the step in hand. Keep
+  step 1 (Continue as a tap) and step 3 (project the work manifest), and render the
+  manifest inside the live step card ("5 items · 2 settled"), not as a separate line.
+- **PR-03, and every suggestion card: the words are Clem's.** The v3.18.33 rule is that
+  the harness hands Clem facts and she speaks; a template sentence is the harness
+  speaking for her. The card's text comes from one tool-less call on her own model,
+  given the scorecard row; the numbers on the card come from the row, never from that
+  call. The template is the fallback only when no model is reachable.
+- **PR-02/03/04/12: suggestions never push a notification.** The owner's notification
+  rule admits only "needs an answer" and "finished work". Suggestions wait where the
+  owner looks (Settings → Models, From Clem), at most one per role per day as written.
+- **PR-15, step 2: the SDK lane is frozen** (owner, 10-04: no fixes to the Claude SDK
+  brain, worker or workflow-step paths; remove later, revertibly). Take the brief's
+  "retire" branch for the three real SDK-lane cases: move them to `.legacy` with a note.
+  Still move the two stale SDK wording pins.
+- **PR-10 belongs to the read-review path's owner** (the review agent). The owner's
+  10-08 rule stands: reads get the light check; the full other-family review is for
+  writes and creations.
+- **The orchestrator fan-out case (baseline §2b): recommended, owner to confirm.** A
+  scope the prior turn established is carried as a fact, not re-parsed under the 10-05
+  precision; a fresh count keeps the strict parse. It is its own small PR after PR-15.
