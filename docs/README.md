@@ -36,6 +36,7 @@ Design documents describe the repository at the time they were written. They are
 - [Next-wave north-star improvements](NEXT-WAVE-NORTHSTAR-IMPROVEMENTS.md) — implementing-agent brief: what to take from Qwen 3.8 and Block Buzz without relaxing write law
 - [iOS app roadmap](roadmap-ios-app.md)
 - [Composio reliability slice](plans/composio-reliability-slice.md)
+- [Next level: Clem knows her models](plans/next-level-2026-10-10/README.md) — 2026-10-10 plan and PR briefs: model scorecard, suggestions, routing recommendations, self-setup, governed auto-routing, turn receipts
 
 ## Documentation standard
 
