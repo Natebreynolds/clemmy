@@ -248,3 +248,19 @@ test('a scoped retained-reader lineage resolves the producer before selecting it
   assert.ok(selected.includes(`call_id=${JSON.stringify(fixture.callId)}`));
   assert.doesNotMatch(selected, /\$fromToolOutput/);
 });
+
+test('a projected field reads text inside nested lists of each record', async () => {
+  const fixture = park({ data: { pageElements: [
+    { objectId: 'p7_i3', size: { width: 1 }, shape: { text: { textElements: [
+      { paragraphMarker: {} }, { textRun: { content: 'Q4 results\n' } }, { textRun: { content: 'Revenue up 12%' } },
+    ] } } },
+    { objectId: 'p7_i4', image: { contentUrl: 'https://x.test/a.png' } },
+  ] } });
+  const text = await read(fixture.sessionId, {
+    call_id: fixture.callId, path: '/data/pageElements', fields: ['objectId', 'shape.text.textElements.textRun.content'],
+  });
+  assert.deepEqual(shownRows(text), [
+    { objectId: 'p7_i3', 'shape.text.textElements.textRun.content': ['Q4 results\n', 'Revenue up 12%'] },
+    { objectId: 'p7_i4' },
+  ]);
+});

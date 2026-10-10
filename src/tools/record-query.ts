@@ -38,14 +38,35 @@ const DATE_TIME = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+
 const PLAIN_NUMBER = /^[+-]?\d+(?:\.\d+)?$/;
 const GROUPED_NUMBER = /^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?$/;
 
-/** The value at a field, following a dotted path into nested objects. */
+/** A field's steps. Dots separate keys; `[*]`, `[]` and `[n]` after a key are
+ *  the same steps as `.*` and `.n`. */
+function fieldSteps(field: string): string[] {
+  return field.replace(/\[(\*|\d*)\]/g, (_whole, inner: string) => `.${inner || '*'}`).replace(/^\./, '').split('.');
+}
+
+/** The value at a field, following a dotted path into nested objects. A step
+ *  that meets a list reads it from every item (`*`, or any key) or from one
+ *  item (its index), so text inside nested lists is reachable; what several
+ *  items hold comes back as one flat list. */
 export function fieldValue(record: unknown, field: string): unknown {
-  let current: unknown = record;
-  for (const key of field.split('.')) {
-    if (!current || typeof current !== 'object' || Array.isArray(current)) return undefined;
-    current = (current as Record<string, unknown>)[key];
+  return valueAtSteps(record, fieldSteps(field));
+}
+
+function valueAtSteps(current: unknown, steps: readonly string[]): unknown {
+  if (steps.length === 0) return current;
+  const [step, ...rest] = steps as [string, ...string[]];
+  if (Array.isArray(current)) {
+    if (/^\d+$/.test(step)) return valueAtSteps(current[Number(step)], rest);
+    const each = step === '*' ? rest : steps;
+    const found = current.flatMap((item) => {
+      const value = valueAtSteps(item, each);
+      return value === undefined ? [] : Array.isArray(value) ? value : [value];
+    });
+    return found.length > 0 ? found : undefined;
   }
-  return current;
+  // `*` steps through a list only; it never widens to every key of a record.
+  if (!current || typeof current !== 'object' || step === '*') return undefined;
+  return valueAtSteps((current as Record<string, unknown>)[step], rest);
 }
 
 function comparable(value: unknown): Comparable | null {
@@ -75,7 +96,22 @@ function compare(a: Comparable, b: Comparable): number | null {
 }
 
 function matches(record: unknown, condition: RecordCondition): boolean | null {
-  const left = comparable(fieldValue(record, condition.field));
+  const raw = fieldValue(record, condition.field);
+  // A list of values meets a condition when any item does; `ne` when none
+  // equals the value.
+  if (Array.isArray(raw) && raw.length > 0 && raw.every((item) => item === null || typeof item !== 'object')) {
+    if (condition.op === 'ne') {
+      const equal = raw.map((item) => valueMatches(item, { ...condition, op: 'eq' }));
+      return equal.some((verdict) => verdict === true) ? false : true;
+    }
+    const verdicts = raw.map((item) => valueMatches(item, condition));
+    return verdicts.some((verdict) => verdict === true) ? true : verdicts.some((verdict) => verdict === false) ? false : null;
+  }
+  return valueMatches(raw, condition);
+}
+
+function valueMatches(raw: unknown, condition: RecordCondition): boolean | null {
+  const left = comparable(raw);
   const right = comparable(condition.value);
   if (condition.op === 'ne') {
     if (!left || !right) return left !== right;
@@ -84,7 +120,6 @@ function matches(record: unknown, condition: RecordCondition): boolean | null {
   }
   if (!left || !right) return null;
   if (condition.op === 'contains') {
-    const raw = fieldValue(record, condition.field);
     return String(raw).toLowerCase().includes(String(condition.value).trim().toLowerCase());
   }
   const order = compare(left, right);

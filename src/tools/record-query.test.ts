@@ -129,6 +129,30 @@ test('aggregates retain very small and high-precision Number results without fix
     0.30000000000000004, 'ordinary Number arithmetic is retained, not represented as exact decimal arithmetic');
 });
 
+test('a field path steps through lists: text inside nested lists is reachable', () => {
+  // The shape of a slide's text box, as a presentation provider returns it.
+  const box = { objectId: 'p7_i3', shape: { text: { textElements: [
+    { endIndex: 1, paragraphMarker: { style: {} } },
+    { endIndex: 12, textRun: { content: 'Q4 results\n' } },
+    { endIndex: 30, textRun: { content: 'Revenue up 12%\n' } },
+  ] } } };
+  const expected = ['Q4 results\n', 'Revenue up 12%\n'];
+  assert.deepEqual(fieldValue(box, 'shape.text.textElements.textRun.content'), expected);
+  assert.deepEqual(fieldValue(box, 'shape.text.textElements[*].textRun.content'), expected);
+  assert.deepEqual(fieldValue(box, 'shape.text.textElements[].textRun.content'), expected);
+  assert.equal(fieldValue(box, 'shape.text.textElements[1].textRun.content'), 'Q4 results\n');
+  assert.equal(fieldValue(box, 'shape.text.textElements.2.textRun.content'), 'Revenue up 12%\n');
+  assert.equal(fieldValue(box, 'shape.text.textElements.missing'), undefined, 'nothing found is undefined, not []');
+  assert.deepEqual(fieldValue({ tags: ['a', 'b'] }, 'tags'), ['a', 'b'], 'a list at the end is returned as it is');
+  assert.equal(fieldValue({ a: 1, secret: 2 }, '[]'), undefined, 'a wildcard never widens to every key of a record');
+  assert.equal(fieldValue({ a: { b: 1 } }, 'a.*'), undefined);
+  const boxes = [box, { objectId: 'p7_i4', shape: { text: { textElements: [{ textRun: { content: 'Costs flat' } }] } } }];
+  const field = 'shape.text.textElements.textRun.content';
+  assert.deepEqual(applyWhere(boxes, [{ field, op: 'contains', value: 'revenue' }]).rows, [box], 'any item may match');
+  assert.equal(applyWhere(boxes, [{ field, op: 'ne', value: 'Costs flat' }]).rows.length, 1, 'ne holds when no item equals');
+  assert.equal(applyWhere([{ tags: ['x', 'y'] }], [{ field: 'tags', op: 'eq', value: 'y' }]).rows.length, 1);
+});
+
 test('dotted fields reach nested values', () => {
   assert.equal(fieldValue({ metrics: { rank: { organic: 6 } } }, 'metrics.rank.organic'), 6);
   assert.equal(fieldValue({ metrics: null }, 'metrics.rank'), undefined);

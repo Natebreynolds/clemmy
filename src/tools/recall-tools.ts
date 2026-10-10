@@ -677,7 +677,7 @@ export function registerRecallTools(server: McpServer): void {
       const decodedMcpPayload = view?.kind === 'provider_payload'
         && (view.owner === 'mcp_structured_content' || view.owner === 'mcp_text_json');
       if (decodedMcpPayload) parsed = view.payload;
-      // A dotted field reaches into nested objects, as `where` and `sort_by`
+      // A dotted field reaches into nested objects and lists, as `where` and `sort_by`
       // already do; the projected key is the path as written. A projection
       // that ignored the path would empty every record and tell the model a
       // field it can sort by does not exist.
