@@ -6945,6 +6945,15 @@ const runHostTurnBody = async (
     if (!carriedOperation || jitReadProvisionAttempted.has(carriedOperation)) return false;
     jitReadProvisionAttempted.add(carriedOperation);
     const jitIdentity = exactHostIdentity();
+    // A write whose search answered before its account review finished is
+    // published by that review. Wait for it instead of provisioning the
+    // operation a second time beside it; the re-run check then binds what it
+    // published, or refuses exactly as before when the review did not entail.
+    if (await settleDeferredProviderWrite({
+      sessionId: jitIdentity.sessionId,
+      sourceUserSeq: jitIdentity.sourceUserSeq,
+      operation: carriedOperation,
+    })) return true;
     if (isReviewedLiveReadIdentity(carriedOperation)) {
       // Supply only: the exact production check re-runs after acquisition and
       // still proves candidate, account and effect; writes never enter here.
@@ -11909,6 +11918,16 @@ const productionHostJitReadProvisioner: HostJitReadProvisioner = async (input) =
 let hostJitReadProvisioner: HostJitReadProvisioner = productionHostJitReadProvisioner;
 export function _setHostJitReadProvisionerForTests(provisioner: HostJitReadProvisioner | null): void {
   hostJitReadProvisioner = provisioner ?? productionHostJitReadProvisioner;
+}
+/** True after waiting for a write whose search answered before its account
+ * review finished, and whose publication that review then owned. */
+async function settleDeferredProviderWrite(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  operation: string;
+}): Promise<boolean> {
+  const { settleDeferredWritePublication } = await import('../../tools/tool-search-provider-sources.js');
+  return settleDeferredWritePublication({ ...input, waitMs: HOST_JIT_READ_PROVISION_BUDGET_MS });
 }
 
 /** A reviewed-CLI or live-read identity (`salesforce_sf_soql_query`) is

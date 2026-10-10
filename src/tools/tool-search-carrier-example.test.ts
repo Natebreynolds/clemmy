@@ -99,3 +99,63 @@ test('call_tool and undisclosed work_call examples never invent a requirement bi
   assert.equal(callTool.args.requirement_id, undefined);
   assert.equal(undisclosed.args.requirement_id, undefined);
 });
+
+test('a write whose account review is still running is callable by its operation, with no ref to copy', async () => {
+  const { registerToolSearchTool } = await import('./tool-search-tool.js');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'carrier-example-pending-row', version: '1.0.0' });
+  registerToolSearchTool(server as never, {
+    candidateSources: [{
+      kind: 'authorized_composio',
+      search: async () => [{
+        name: 'CRM_UPDATE_RECORD',
+        summary: 'Update one existing record.',
+        schema: {
+          type: 'object',
+          properties: { record_id: { type: 'string' } },
+          required: ['record_id'],
+        },
+        carrier: 'work_call',
+        invocation: {
+          name: 'composio_execute_tool',
+          fixedArgs: { tool_slug: 'CRM_UPDATE_RECORD' },
+          payloadField: 'arguments',
+        },
+      }],
+    }],
+    // An earlier definition on the card must not stand in for this request's
+    // account review.
+    discloseForPlanning: async () => ({
+      version: 1 as const,
+      refs: { CRM_UPDATE_RECORD: 'cap:resolved:crm_update_record:definition-earlier' },
+      blockers: {},
+      pending: { CRM_UPDATE_RECORD: true as const },
+    }),
+  });
+  const handler = (server as never as {
+    _registeredTools: Record<string, {
+      handler(input: Record<string, unknown>): Promise<{ content: Array<{ text: string }> }>;
+    }>;
+  })._registeredTools.tool_search.handler;
+  const result = await handler({ query: 'CRM_UPDATE_RECORD', role_key: null, limit: 3, cursor: null });
+  const text = result.content[0]!.text;
+  const body = JSON.parse(text) as {
+    results: Array<{
+      capabilityRef?: string;
+      planningRefStatus?: string;
+      accountCheck?: string;
+      example?: { tool: string; args: Record<string, unknown> };
+    }>;
+  };
+  const row = body.results[0];
+  assert.equal(row?.capabilityRef, undefined, 'no ref until its own review publishes one');
+  assert.equal(row?.planningRefStatus, 'account_check_pending');
+  assert.match(row?.accountCheck ?? '', /can be called now/);
+  assert.equal(row?.example?.tool, 'work_call');
+  assert.equal(row?.example?.args.requirement_id, 'cap:resolved:crm_update_record');
+  assert.deepEqual(JSON.parse(String(row?.example?.args.args_json)), {
+    tool_slug: 'CRM_UPDATE_RECORD',
+    arguments: { '<argument>': '<value>' },
+  });
+  assert.match(text, /CRM_UPDATE_RECORD can be called now/, 'the page says to call it rather than search again');
+});

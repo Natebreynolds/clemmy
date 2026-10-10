@@ -2352,13 +2352,17 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           get deadlineAt() { return control?.deadlineAt; },
           awaitModelReview: control?.awaitModelReview,
           accountSelection: control?.accountSelection,
+          // The chat search answers before a write's account review finishes;
+          // the write's own call is checked by that same review.
+          deferSlowWriteReviews: true,
         });
         if (control && (control.signal.aborted || Date.now() >= control.deadlineAt)) {
           return { version: 1 as const, refs: Object.freeze({}), blockers: Object.freeze({}) };
         }
+        const pending = staged.pending ?? {};
         const refs = await disclosePrimaryModelPlanningCapabilities({
           authority: hostFreshPlanning.authority,
-          candidates,
+          candidates: candidates.filter((candidate) => !pending[candidate.name.trim()]),
           signal: control?.signal,
           deadlineAt: control?.deadlineAt,
         });
@@ -2369,6 +2373,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           version: 1 as const,
           refs,
           blockers: staged.blockers,
+          pending,
         };
       }
     : workflowDiscoveryIdentity

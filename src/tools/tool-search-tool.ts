@@ -97,6 +97,7 @@ function isAcquiredLiveReadCandidate(
 const TOP_RESULTS = 8;
 const TOP_SCHEMAS = 3;
 const ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP = 'The account-routing review did not complete; this is not a missing account or a request for user authorization. Retry the identical account_selection once to reopen its cached review. If it is still unavailable, report that exact host blocker; do not broaden discovery or ask the user to repeat the account.';
+const ACCOUNT_CHECK_PENDING_NOTE = 'its connected account is still being confirmed, and that check finishes before it runs. When you need it, call it with the work_call example on its result; do not search for it again to get a capabilityRef. It has none to cite in plan_task until a later search returns one.';
 /** Same-toolkit operations the host serves today whose names share a word
  * with the operation that could not be defined, so the door named is one that
  * actually opens. Exported for tests. */
@@ -803,6 +804,9 @@ export interface ToolSearchPlanningDisclosureOutcome {
   version: 1;
   refs: Readonly<Record<string, string>>;
   blockers: Readonly<Record<string, ToolSearchPlanningBlocker>>;
+  /** Writes whose account review was still running when the search answered.
+   * Not yet published; the write's own call is checked by the same review. */
+  pending?: Readonly<Record<string, true>>;
 }
 
 export interface ToolSearchPlanningDisclosureControl {
@@ -1751,7 +1755,7 @@ export function registerToolSearchTool(
       // stage walking a candidate list with no budget. Discovery is a READ:
       // it answers with what materialized inside the budget, and the
       // existing no-materialized-ref copy stays honest about the rest.
-      const planningDisclosure = opts.discloseForPlanning
+      const planningDisclosure: ToolSearchPlanningDisclosureOutcome = opts.discloseForPlanning
         ? await (async (): Promise<ToolSearchPlanningDisclosureOutcome> => {
             // Materialize already-independent MCP/reviewed-local rows first,
             // then Composio's account-bound rows. The catalog mutation owner is
@@ -1801,11 +1805,13 @@ export function registerToolSearchTool(
             }
             const refs: Record<string, string> = {};
             const blockers: Record<string, ToolSearchPlanningBlocker> = {};
+            const pending: Record<string, true> = {};
             for (const outcome of outcomes) {
               if (outcome === null) continue;
               if (isPlanningDisclosureOutcome(outcome)) {
                 Object.assign(refs, outcome.refs);
                 Object.assign(blockers, outcome.blockers);
+                Object.assign(pending, outcome.pending ?? {});
               } else {
                 Object.assign(refs, outcome);
               }
@@ -1814,16 +1820,25 @@ export function registerToolSearchTool(
               version: 1,
               refs: Object.freeze({ ...refs }),
               blockers: Object.freeze({ ...blockers }),
+              pending: Object.freeze({ ...pending }),
             });
           })()
         : Object.freeze({ version: 1, refs: Object.freeze({}), blockers: Object.freeze({}) });
       let planningBlockers: Record<string, ToolSearchPlanningBlocker> = { ...planningDisclosure.blockers, ...preparationBlockers };
+      // A write whose account review is still running has no ref for this
+      // request yet, whatever an earlier definition on the card says.
+      const planningPending: Record<string, true> = Object.fromEntries(
+        Object.keys(planningDisclosure.pending ?? {})
+          .filter((name) => !planningBlockers[name])
+          .map((name) => [name, true as const]),
+      );
       // A previous catalog definition cannot override this page's current
       // account or publication refusal. Never disclose both a blocker and an
       // executable-looking ref for the same selected operation.
       let planningRefs: Record<string, string> = Object.fromEntries(
         Object.entries(planningDisclosure.refs).filter((entry): entry is [string, string] => (
-          !planningBlockers[entry[0]] && typeof entry[1] === 'string' && entry[1].trim().length > 0
+          !planningBlockers[entry[0]] && !planningPending[entry[0]]
+          && typeof entry[1] === 'string' && entry[1].trim().length > 0
         )),
       );
 
@@ -1836,6 +1851,7 @@ export function registerToolSearchTool(
         opts.discloseForPlanning
         && !skippedBroadDiscovery
         && Object.keys(planningRefs).length === 0
+        && Object.keys(planningPending).length === 0
         && remainingBrokerMs() > 500
       ) {
         const composio = (opts.candidateSources ?? []).find((source) => source.kind === 'authorized_composio');
@@ -1881,8 +1897,11 @@ export function registerToolSearchTool(
             })).catch(() => null);
             if (extraOutcome) {
               if (isPlanningDisclosureOutcome(extraOutcome)) {
+                for (const name of Object.keys(extraOutcome.pending ?? {})) {
+                  if (!planningBlockers[name] && !extraOutcome.blockers[name]) planningPending[name] = true;
+                }
                 for (const [name, ref] of Object.entries(extraOutcome.refs)) {
-                  if (typeof ref === 'string' && ref.trim() && !planningBlockers[name]) {
+                  if (typeof ref === 'string' && ref.trim() && !planningBlockers[name] && !planningPending[name]) {
                     planningRefs[name] = ref;
                   }
                 }
@@ -1991,9 +2010,11 @@ export function registerToolSearchTool(
           ? [[row.name, planningBlockers[row.name]!] as const]
           : []);
         const visibleRefs = rows.filter((row) => Boolean(planningRefs[row.name]));
+        const visiblePending = rows.filter((row) => planningPending[row.name]).map((row) => row.name);
         if (visibleBlockers.length > 0) {
           const available = rows.some((row) => !planningBlockers[row.name] && (
             Boolean(planningRefs[row.name])
+            || Boolean(planningPending[row.name])
             || localPlanningRowStatus(row.name).planningRefStatus === 'dispatch_now'
           ));
           if (available) {
@@ -2015,6 +2036,9 @@ export function registerToolSearchTool(
           const publication = visibleBlockers
             .map(([name, blocker]) => `${name}: ${blocker.reason ?? 'proof_not_registered'}`).join(', ');
           return `Capability publication unavailable (${publication}). ${CAPABILITY_PUBLICATION_NEXT_STEP} Other results with a capabilityRef remain executable.`;
+        }
+        if (opts.discloseForPlanning && visibleRefs.length === 0 && visiblePending.length > 0) {
+          return `${visiblePending.join(', ')} can be called now: ${ACCOUNT_CHECK_PENDING_NOTE}`;
         }
         if (opts.discloseForPlanning && visibleRefs.length === 0) {
           // "No plan ref" is not "no door". The names below fail the plan-citation
@@ -2129,6 +2153,11 @@ export function registerToolSearchTool(
                   ? 'The quoted user wording did not name this account, so it was not bound. Do not retry the same selection. Ask the user which one of accountChoices to use, then repeat tool_search with account_selection quoting their answer verbatim.'
                   : 'If the user\'s request names the operating account, repeat tool_search ONCE with account_selection={toolkit, identity: one exact accountChoices value, source_quote: verbatim user wording from this conversation}; accountChoiceLabels names each choice. Reads route on that nomination directly; writes are reviewed. If it comes back blocked again, stop discovery — the host will ask the user which account.',
               }
+            : planningPending[r.name]
+            ? {
+                planningRefStatus: 'account_check_pending' as const,
+                accountCheck: `This write can be called now: ${ACCOUNT_CHECK_PENDING_NOTE}`,
+              }
             : opts.discloseForPlanning && !planningRefs[r.name]
               ? localPlanningRowStatus(r.name)
               : {}),
@@ -2150,6 +2179,9 @@ export function registerToolSearchTool(
                 planningRefs[r.name]
                   && (planningCandidateByName.get(r.name)?.capabilityVariants?.length ?? 0) <= 1
                   ? planningRefs[r.name]
+                  // A pending write is selected by its operation; its call
+                  // binds whatever the account review publishes.
+                  : planningPending[r.name] ? `cap:resolved:${r.name.trim().toLowerCase()}`
                   : undefined,
                 carriedPerCall ? r.name : undefined,
               ) }

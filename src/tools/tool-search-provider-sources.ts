@@ -1,5 +1,5 @@
 import { withDiscoveryDeadline, type DiscoveryDeadline } from './discovery-deadline.js';
-import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
+import { currentToolAbortSignal, runWithToolAbortSignal } from '../runtime/tool-abort-context.js';
 import { createProductionMcpReadCarrier, type ProductionMcpRuntime } from '../runtime/harness/production-mcp-read-carrier.js';
 import { learnComposioOperationEffects } from '../integrations/composio/learned-operation-effect.js';
 import { scheduleOperationDeliveryLearning } from '../runtime/harness/learned-operation-delivery.js';
@@ -1108,6 +1108,86 @@ export function planningConnectionForOperation(
   return connection ? { kind: 'resolved', connection } : { kind: 'unavailable' };
 }
 
+/** How long a search waits on a write's account review before it answers
+ * without that write's ref. Reviews the host decides from recorded choices
+ * finish well inside it; a model review takes seconds. */
+const WRITE_ACCOUNT_REVIEW_GRACE_MS = 250;
+/** The background publication's own metadata budget once the search has
+ * answered; the account review itself does not spend it. */
+const DEFERRED_WRITE_PUBLICATION_MS = 30_000;
+/** A review that has not answered by then publishes nothing. */
+const DEFERRED_WRITE_REVIEW_LIMIT_MS = 180_000;
+const DEFERRED_WRITE_KEY_LIMIT = 512;
+
+/** Account reviews a search stopped waiting on, by accepted source and
+ * toolkit. A later search of the same source waits for the review instead of
+ * answering without the write again. */
+const deferredWriteReviews = new Set<string>();
+/** Background publications of writes whose account review outlived their
+ * search, by accepted source and operation. */
+const deferredWritePublications = new Map<string, Promise<void>>();
+/** The same keys once their publication has finished, so a call that missed
+ * the catalog just before it finished does not provision the write again. */
+const finishedDeferredWrites = new Set<string>();
+
+function deferredWriteOperationKey(sessionId: string, sourceUserSeq: number, operation: string): string {
+  return `${sessionId}:${sourceUserSeq}:${operation.trim().toUpperCase()}`;
+}
+
+function finishDeferredWrite(key: string, publication: Promise<void>): void {
+  if (deferredWritePublications.get(key) !== publication) return;
+  deferredWritePublications.delete(key);
+  finishedDeferredWrites.add(key);
+  if (finishedDeferredWrites.size > DEFERRED_WRITE_KEY_LIMIT) {
+    finishedDeferredWrites.delete(finishedDeferredWrites.values().next().value!);
+  }
+}
+
+/**
+ * The write's own call reaches here before it provisions the operation again:
+ * when its search answered while the account review was still running, wait
+ * for that review's publication. The review is the same one either way; this
+ * only keeps the call from publishing the operation a second time alongside
+ * it. Waits at most `waitMs`; a review still running after that leaves the
+ * call unbound, as a search still waiting on it would. Returns false when no
+ * publication was deferred for this write.
+ */
+export async function settleDeferredWritePublication(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  operation: string;
+  waitMs?: number;
+}): Promise<boolean> {
+  const key = deferredWriteOperationKey(input.sessionId, input.sourceUserSeq, input.operation);
+  const pending = deferredWritePublications.get(key);
+  if (!pending) return finishedDeferredWrites.has(key);
+  if (input.waitMs === undefined) {
+    await pending;
+    return true;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    pending,
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, input.waitMs); }),
+  ]);
+  clearTimeout(timer);
+  return true;
+}
+
+/** Test seam: stand in for a search that answered before its review. The
+ * publication starts when a call first waits on it, so a test controls that
+ * the call arrives while it is still running. */
+export function _deferWritePublicationForTests(
+  input: { sessionId: string; sourceUserSeq: number; operation: string },
+  publish: () => Promise<void>,
+): void {
+  const key = deferredWriteOperationKey(input.sessionId, input.sourceUserSeq, input.operation);
+  let started: Promise<void> | undefined;
+  const start = () => (started ??= publish().finally(() => finishDeferredWrite(key, lazy)));
+  const lazy = { then: (resolve: () => void, reject: (error: unknown) => void) => start().then(resolve, reject) } as unknown as Promise<void>;
+  deferredWritePublications.set(key, lazy);
+}
+
 /**
  * Deposit identity/schema facts for only the provider candidates the visible
  * tool_search result actually returned, and materialize a current callable
@@ -1121,6 +1201,12 @@ export function planningConnectionForOperation(
  * moves — the effect gate still runs at the write boundary, every crossing
  * still reopens the same live definition against the current manifest,
  * account, schema and port, and an irreversible send still asks.
+ *
+ * With `deferSlowWriteReviews`, a write whose account review is still running
+ * after a short grace is answered as `pending` instead of holding the search:
+ * the review keeps running, and the write is published here when it entails,
+ * exactly as if the search had waited. Until then the write has no catalog
+ * entry, so its own call provisions it through the same review before consent.
  */
 export async function stageDisclosedPlanningProviderCandidates(input: {
   sessionId: string;
@@ -1134,7 +1220,12 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   deadlineAt?: number;
   accountSelection?: SourceAccountNomination | null;
   awaitModelReview?: DiscoveryDeadline['awaitModelReview'];
-}): Promise<{ refs: Readonly<Record<string, string>>; blockers: Readonly<Record<string, ToolSearchPlanningBlocker>> }> {
+  deferSlowWriteReviews?: boolean;
+}): Promise<{
+  refs: Readonly<Record<string, string>>;
+  blockers: Readonly<Record<string, ToolSearchPlanningBlocker>>;
+  pending?: Readonly<Record<string, true>>;
+}> {
   const empty = () => ({ refs: Object.freeze({}), blockers: Object.freeze({}) });
   // Non-broker callers use the same ownership rule. Metadata keeps its budget;
   // account judging remains attached to the current cancellable invocation.
@@ -1198,6 +1289,9 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
     firstForKey.add(row.routingKey);
     reviewsByToolkit.set(row.toolkit, [...(reviewsByToolkit.get(row.toolkit) ?? []), row]);
   }
+  // Write reviews still running after the grace: their writes are answered as
+  // pending and published by the background continuation below.
+  const deferredKeys = new Set<string>();
   await Promise.all([...reviewsByToolkit.values()].map(async (rows) => {
     for (const { slug, toolkit, routingEffect, routingKey } of rows) {
       if (!discoveryStillActive(guard)) return;
@@ -1211,7 +1305,32 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
         }),
         signal: input.signal,
       });
-      const outcome = input.awaitModelReview ? await input.awaitModelReview(review) : await review();
+      // A search that names this toolkit's account is answering an account
+      // question, so its outcome is the next step: it waits. So does a later
+      // search of the same source, once, for the review it stopped waiting on.
+      const sourceReviewKey = `${input.sessionId}:${input.sourceUserSeq}:${routingKey}`;
+      const reviewing = input.deferSlowWriteReviews && routingEffect === 'write'
+        && input.accountSelection?.toolkit.trim().toLowerCase() !== toolkit
+        && !deferredWriteReviews.has(sourceReviewKey)
+        ? review()
+        : null;
+      if (reviewing) {
+        const settledInGrace = await Promise.race([
+          reviewing.then(() => true, () => true),
+          new Promise<false>((resolve) => { setTimeout(() => resolve(false), WRITE_ACCOUNT_REVIEW_GRACE_MS); }),
+        ]);
+        if (!settledInGrace) {
+          deferredWriteReviews.add(sourceReviewKey);
+          if (deferredWriteReviews.size > DEFERRED_WRITE_KEY_LIMIT) {
+            deferredWriteReviews.delete(deferredWriteReviews.values().next().value!);
+          }
+          deferredKeys.add(routingKey);
+          continue;
+        }
+      }
+      const outcome = reviewing
+        ? await reviewing
+        : input.awaitModelReview ? await input.awaitModelReview(review) : await review();
       routingByToolkit.set(routingKey, outcome.kind === 'settled' ? outcome.value : {
         kind: 'account_selection_required', reason: 'review_unavailable',
         labels: accountChoiceLabels(connections.filter(connection => connection.slug.trim().toLowerCase() === toolkit)),
@@ -1221,8 +1340,15 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
     }
   }));
   if (!discoveryStillActive(guard)) return empty();
+  const pending: Record<string, true> = {};
+  const deferredCandidates: ToolSearchPlanningDisclosureCandidate[] = [];
   for (const { candidate, slug, routingKey } of reviewWindow) {
     if (!discoveryStillActive(guard)) return empty();
+    if (deferredKeys.has(routingKey)) {
+      pending[slug] = true;
+      deferredCandidates.push(candidate);
+      continue;
+    }
     const routing = routingByToolkit.get(routingKey);
     if (!routing) return empty();
     // Checked nominations and established routes precede legacy prose hints;
@@ -1282,8 +1408,10 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   // searches may have published another role while this search was waiting.
   // This synchronous read/append preserves both; candidates this search checked
   // keep their own outcome, including removal after a failed account check.
-  const checkedKeys = new Set(composioCandidates.slice(0, 20)
-    .map(candidate => `composio:${candidate.name.trim().toLowerCase()}`));
+  // A write whose review is still running was not checked here.
+  const checkedKeys = new Set(reviewWindow
+    .filter(row => !deferredKeys.has(row.routingKey))
+    .map(row => `composio:${row.slug.toLowerCase()}`));
   for (const event of listEvents(input.sessionId, { types: ['capability_resolution'] })) {
     if (event.data.sourceUserSeq !== input.sourceUserSeq || event.data.authoritativeForTask === false) continue;
     const prior = Array.isArray(event.data.entries) ? event.data.entries as CapabilityResolutionEntry[] : [];
@@ -1366,7 +1494,49 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
     }));
   }
   if (!discoveryStillActive(guard)) return empty();
-  return { refs: Object.freeze({ ...refs }), blockers: Object.freeze({ ...blockers }) };
+  // A write this source already published under an earlier review is current;
+  // only the rest wait on the review this search stopped waiting for.
+  const stillPending = deferredCandidates.filter((candidate) => !refs[candidate.name.trim()]);
+  for (const slug of Object.keys(pending)) if (refs[slug]) delete pending[slug];
+  if (stillPending.length > 0) publishDeferredWrites(input, stillPending);
+  return {
+    refs: Object.freeze({ ...refs }),
+    blockers: Object.freeze({ ...blockers }),
+    pending: Object.freeze({ ...pending }),
+  };
+}
+
+/** Finish the staging a search answered without: wait for the same account
+ * review, then publish exactly as the search would have. Runs under its own
+ * cancellation scope because the search that started it has returned. */
+function publishDeferredWrites(
+  input: Parameters<typeof stageDisclosedPlanningProviderCandidates>[0],
+  candidates: readonly ToolSearchPlanningDisclosureCandidate[],
+): void {
+  const controller = new AbortController();
+  const limit = setTimeout(() => controller.abort(), DEFERRED_WRITE_REVIEW_LIMIT_MS);
+  limit.unref?.();
+  const publication = runWithToolAbortSignal(controller.signal, async () => {
+    try {
+      await stageDisclosedPlanningProviderCandidates({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        candidates,
+        ...(input.query ? { query: input.query } : {}),
+        accountSelection: input.accountSelection ?? null,
+        signal: controller.signal,
+        deadlineAt: Date.now() + DEFERRED_WRITE_PUBLICATION_MS,
+      });
+    } catch { /* the write's own call provisions it through the same review */ }
+    finally { clearTimeout(limit); }
+  });
+  const keys = candidates.map((candidate) => (
+    deferredWriteOperationKey(input.sessionId, input.sourceUserSeq, candidate.name)
+  ));
+  for (const key of keys) deferredWritePublications.set(key, publication);
+  void publication.finally(() => {
+    for (const key of keys) finishDeferredWrite(key, publication);
+  });
 }
 /**
  * Bind provider adapters to the already-resolved turn scope. The returned

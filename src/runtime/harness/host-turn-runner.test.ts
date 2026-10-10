@@ -9625,6 +9625,134 @@ test('a carried provider READ is provisioned and dispatched; a newly resolved WR
   }
 });
 
+// A chat search can answer before a write's account review finishes; that
+// review then publishes the write. The write's call waits for that
+// publication instead of provisioning the operation again beside it, and the
+// re-run exact check binds what it published — consent rules unchanged.
+test('a carried call waits for the publication its search left running, and binds it without provisioning again', async (t) => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const { _deferWritePublicationForTests } = await import('../../tools/tool-search-provider-sources.js');
+
+  const runVariant = async (input: { label: string; effect: 'read' | 'external_write'; shouldExecute: boolean }) => {
+    const fixture = acceptHostCanarySource(`deferred-publication-${input.label}`);
+    const operationId = `market_${input.label}__deferred_sheet_info`;
+    const manifest = capabilityManifests.attachSemanticContract({
+      version: 1,
+      manifestId: `cap:${input.label}:deferred-sheet-info`,
+      providerKind: 'native_mcp',
+      operationId,
+      providerIdentity: `configured-market-directory:${input.label}`,
+      providerVersion: '2026-10-10',
+      operationVersion: '1',
+      definitionFingerprint: 'd'.repeat(64),
+      effect: input.effect,
+      accountId: `account:${input.label}:primary`,
+      idempotency: { required: false, policy: 'none' },
+      reconciliation: { supported: false, policy: 'none' },
+      outputContract: { kind: input.effect === 'read' ? 'sheet_records' : 'created_resource' },
+      evidenceContract: { kinds: ['receipt'], readbackRequired: false },
+      provenance: { issuer: 'host-turn-runner:test', issuedAt: '2026-10-10T00:00:00.000Z', trusted: true },
+      lifecycle: { state: 'current' },
+      advisoryRoles: ['lookup'],
+    });
+    let portBodies = 0;
+    const portInvoke = async () => {
+      portBodies += 1;
+      return { kind: 'clementine.external-read.result', version: 1, records: [{ sheetId: 7 }] };
+    };
+    const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
+    capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+    productionPorts.clearProductionCapabilityPorts();
+    assert.deepEqual(productionPorts.registerFixtureCapabilityPort(
+      productionPorts.productionPortIdentityFromManifest(manifest),
+      { invoke: portInvoke as never },
+    ), { ok: true });
+    const provisionCalls: string[][] = [];
+    _setHostJitReadProvisionerForTests(async (request) => {
+      provisionCalls.push([...request.operationIds]);
+      return { ok: false, code: 'provisioned_twice', identifier: request.operationIds[0] ?? '' } as const;
+    });
+    // The search's review is still running when the call arrives; it
+    // publishes the exact capability a moment later.
+    _deferWritePublicationForTests(
+      { sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq, operation: operationId },
+      () => new Promise<void>((resolve) => setTimeout(() => {
+        factory.register({
+          capabilityId: manifest.manifestId,
+          toolName: manifest.operationId,
+          schemaVersion: manifest.operationVersion,
+          schemaDigest: manifest.definitionFingerprint,
+          effect: manifest.effect,
+          account: manifest.accountId,
+          manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+          providerKind: manifest.providerKind,
+          liveFingerprint: manifest.definitionFingerprint,
+          manifest,
+          invoke: portInvoke as never,
+        });
+        resolve();
+      }, 50)),
+    );
+    try {
+      const carrier = brackets.wrapToolForHarness({
+        type: 'function',
+        name: 'call_tool',
+        description: 'Invoke one exact schema acquired from the frozen capability catalog.',
+        parameters: {
+          type: 'object',
+          properties: { name: { type: 'string' }, args_json: { type: 'string' } },
+          required: ['name', 'args_json'],
+        },
+        needsApproval: async () => false,
+        invoke: async () => { throw new Error('the generic carrier body must not replace the exact production port'); },
+      });
+      const model = stubModel([
+        [toolCall(`${input.label}-deferred-call`, 'call_tool', { name: operationId, args_json: JSON.stringify({ spreadsheet: 'sheet-1' }) })],
+        [textMsg(`${input.label} settled`)],
+      ]);
+      const agent = { model, tools: [carrier] };
+      bindHostCanarySurface(fixture, agent, [carrier]);
+      const outcome = await runProductionHost(fixture, agent);
+      const db = eventlog.openEventLog();
+      const physical = (db.prepare(`
+        SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?
+      `).get(fixture.session.id, fixture.source.seq) as { n: number }).n;
+      assert.deepEqual(provisionCalls, [], 'the call waited for the running publication instead of provisioning again');
+      if (input.shouldExecute) {
+        assert.equal(portBodies >= 1, true, JSON.stringify({ terminal: outcome.terminal, history: outcome.history }).slice(0, 2000));
+        assert.equal(physical >= 1, true);
+        assert.doesNotMatch(JSON.stringify(outcome.history), /catalog_entry_or_manifest_missing/);
+      } else {
+        assert.equal(portBodies, 0, 'a write published by its review still meets consent');
+        assert.equal(physical, 0);
+        assert.match(JSON.stringify(outcome.history), /bound_catalog_call_does_not_match_exact_schema_and_arguments/);
+      }
+    } finally {
+      _setHostJitReadProvisionerForTests(null);
+    }
+  };
+
+  try {
+    await t.test('read: bound from the publication and dispatched', () => runVariant({
+      label: 'read', effect: 'read', shouldExecute: true,
+    }));
+    await t.test('write: bound from the publication, still behind consent', () => runVariant({
+      label: 'write', effect: 'external_write', shouldExecute: false,
+    }));
+  } finally {
+    productionPorts.clearProductionCapabilityPorts();
+    for (const prior of priorPorts) {
+      productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+    }
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
 // --- a bare CONTINUE: marker keeps the same host turn open (live 2026-09-01) ---
 function runProductionHostSteps(
   fixture: ReturnType<typeof acceptHostCanarySource>,
