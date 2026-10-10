@@ -153,8 +153,10 @@ owner's recorded decisions. A PR that breaks one is not done, whatever its tests
 | [PR-11](PR-11-capability-learning.md) | Capability learning: what a model proved it can and cannot do | M | additive | PR-03 |
 | [PR-12](PR-12-settings-clarity-and-palette.md) | Settings that explain themselves, and a command palette that acts | S | low | PR-02 |
 | [PR-13](PR-13-later.md) | Later, each behind its own measurement: plan continuation cap, watcher budget, effort routing, model tryouts, quota-aware scheduling, phone parity, console on ChatEngine | — | — | — |
+| [PR-14](PR-14-all-in-byo-identity.md) | All-in BYO identity: options, inactive bindings and memory attribution agree with the router (four baseline failures) | S | low | PR-00 |
+| [PR-15](PR-15-last-fixed-sentences.md) | The last fixed host sentences and three stale pins (six baseline failures) | S | low | PR-00 |
 
-PR-00, PR-07, PR-08 and PR-12 have no dependencies and can start today. PR-01 and
+PR-00, PR-07, PR-08, PR-12, PR-14 and PR-15 have no dependencies beyond PR-00 and can start today; PR-14 should land before PR-03 reads the catalog snapshot. PR-01 and
 PR-02 are the foundation; PR-03 and PR-04 are the owner-visible payoff and should
 ship as one release. PR-05 is the first automatic behaviour and stays opt-in.
 
@@ -175,7 +177,13 @@ ship as one release. PR-05 is the first automatic behaviour and stays opt-in.
   surface, and every accepted suggestion can be undone and is followed up with
   "did it help?".
 
-## 6. Measurement that every PR reports
+## 6. Companion documents
+
+- [RUNBOOK-local-merge-and-test.md](RUNBOOK-local-merge-and-test.md): merging this branch, the baseline, the hotpatch traps, per-PR fixtures, the handoff prompt.
+- [TEST-LANDSCAPE.md](TEST-LANDSCAPE.md): what the suite proves and does not, the baseline classification, rules for touching a failing case.
+- `docs/checkpoints/2026-10-10-ci-baseline.md`: the failing-file list on `b0612dd`, case by case.
+
+## 7. Measurement that every PR reports
 
 - `npm run typecheck`, the touched test files one at a time via
   `scripts/run-tests-isolated.mjs`, the release-closure gate where UI is touched.
