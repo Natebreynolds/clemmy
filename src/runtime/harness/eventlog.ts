@@ -6800,6 +6800,31 @@ export function earlierInScopeDeskRungs(sessionId: string, sourceUserSeq: number
   return rows.map((row) => row.rung).filter((rung): rung is string => typeof rung === 'string');
 }
 
+/** The session's newest host model request: its prompt size and when it was
+ * composed, and the rung of the newest round-one desk any build recorded (an
+ * out-of-scope build records the full rung). Together they say whether a
+ * large prompt prefix was sent recently under a given tools block. */
+export function latestHostPromptPrefix(sessionId: string): { totalTokens: number; at: string; rung: string } | null {
+  const id = sessionId.trim();
+  if (!id) return null;
+  const db = openEventLog();
+  const reading = prepareCached(db,
+    `SELECT json_extract(data_json, '$.totalTokens') AS totalTokens, created_at AS at FROM events
+      WHERE session_id = ? AND type = 'prompt_composition'
+        AND json_extract(data_json, '$.lane') = 'host'
+      ORDER BY seq DESC LIMIT 1`,
+  ).get(id) as { totalTokens: unknown; at: unknown } | undefined;
+  if (!reading || typeof reading.totalTokens !== 'number' || typeof reading.at !== 'string') return null;
+  const desk = prepareCached(db,
+    `SELECT json_extract(data_json, '$.desk.rung') AS rung FROM events
+      WHERE session_id = ? AND type = 'tool_search_scope'
+        AND json_extract(data_json, '$.desk.rung') IS NOT NULL
+      ORDER BY seq DESC LIMIT 1`,
+  ).get(id) as { rung: unknown } | undefined;
+  if (!desk || typeof desk.rung !== 'string') return null;
+  return { totalTokens: reading.totalTokens, at: reading.at, rung: desk.rung };
+}
+
 /** Which of these exact tools this session dispatched after `afterSeq`,
  * directly or carried by a dispatcher (the call's recorded effective tool). */
 export function sessionDispatchedToolsSince(

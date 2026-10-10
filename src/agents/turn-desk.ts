@@ -30,7 +30,14 @@
  *      any earlier in-scope source recorded, however many out-of-scope
  *      sources or rebuilds of older sources came after it. An out-of-scope or
  *      facts_unavailable source records no in-scope desk, so it neither
- *      raises nor lowers that floor.
+ *      raises nor lowers that floor;
+ *   5. hold — a climb rewrites the tools block, and the tools block sits
+ *      before the conversation in the cached prompt prefix, so the next
+ *      request re-sends the whole conversation uncached. When the session's
+ *      last request was large and recent, its cache is worth more than the
+ *      schemas: the turn keeps that request's rung and records the climb it
+ *      held. The held tools stay callable by exact name, and the climb lands
+ *      on a turn whose prefix is small or already cold.
  * Any fact that cannot be read gives today's surface (`facts_unavailable`).
  * All facts are durable records, so a restart decides the same rung.
  */
@@ -43,6 +50,7 @@ import {
 } from '../tools/tool-registry.js';
 import {
   earlierInScopeDeskRungs,
+  latestHostPromptPrefix,
   latestInScopeDeskEvent,
   sessionDispatchedToolsSince,
   sessionHasRetainedToolOutputLongerThan,
@@ -66,9 +74,14 @@ export const DESK_RUNGS: readonly DeskRung[] = ['lean', 'readers', 'full'];
  */
 export const NO_TARGET_STARTS_LEAN = true;
 
+/** A climb is held while the session's last request carried at least this
+ *  many prompt tokens and was composed within the warm window. */
+export const DESK_HOLD_MIN_PROMPT_TOKENS = 20_000;
+export const DESK_HOLD_WARM_MS = 30 * 60_000;
+
 export type TurnDeskFallbackReason = 'out_of_scope' | 'doors_absent' | 'facts_unavailable';
 /** Why an in-scope desk sits above the lean rung. */
-export type TurnDeskClimb = DeskEvidenceKind | 'miss' | 'session_floor' | 'no_identified_target';
+export type TurnDeskClimb = DeskEvidenceKind | 'miss' | 'session_floor' | 'no_identified_target' | 'warm_prefix';
 
 export interface TurnDeskDecision {
   version: 1;
@@ -82,6 +95,9 @@ export interface TurnDeskDecision {
   /** Tools callable this turn whose schemas are not sent. */
   deferred: string[];
   sourceUserSeq: number;
+  /** A climb this turn did not take to keep a large, recent prompt prefix
+   *  cached: the rung it would have reached, why, and the prefix's size. */
+  held?: { rung: DeskRung; climbedBy: TurnDeskClimb[]; promptTokens: number };
 }
 
 export interface TurnDeskFacts {
@@ -91,6 +107,9 @@ export interface TurnDeskFacts {
   missed: readonly string[];
   /** The rung the session's previous in-scope source recorded. */
   sessionFloor: DeskRung | null;
+  /** The session's last request, when it was composed within the warm
+   *  window: the rung its tools block carried and its prompt size. */
+  warmPrefix?: { rung: DeskRung; promptTokens: number } | null;
 }
 
 const rungIndex = (rung: DeskRung): number => DESK_RUNGS.indexOf(rung);
@@ -138,6 +157,21 @@ export function decideTurnDesk(
   const missed = [...new Set(facts.missed)].filter((name) => deskDeclarationFor(name) !== null).sort();
   for (const name of missed) climb(deskDeclarationFor(name)!.rung, 'miss');
   if (facts.sessionFloor) climb(facts.sessionFloor, 'session_floor');
+  const warm = facts.warmPrefix;
+  if (warm && warm.promptTokens >= DESK_HOLD_MIN_PROMPT_TOKENS
+    && rungIndex(warm.rung) < rungIndex(rung)
+    && rungIndex(warm.rung) >= rungIndex(facts.sessionFloor ?? 'lean')) {
+    return {
+      version: 1,
+      rung: warm.rung,
+      fallbackReason: null,
+      climbedBy: warm.rung === 'lean' ? [] : ['warm_prefix'],
+      missed,
+      deferred: deferredOnRung(surfaceNames, warm.rung),
+      sourceUserSeq,
+      held: { rung, climbedBy: [...new Set(climbedBy)], promptTokens: warm.promptTokens },
+    };
+  }
   return {
     version: 1,
     rung,
@@ -182,6 +216,8 @@ export interface TurnDeskFactInput {
   /** The accepted request text, ranked the way the context packet ranks skills. */
   requestText: string;
   identifiedTarget: boolean;
+  /** The decision time; defaults to now. */
+  now?: number;
 }
 
 /** Read the host facts the desk decides on. Throws when a read fails. */
@@ -211,7 +247,18 @@ export function gatherTurnDeskFacts(input: TurnDeskFactInput): TurnDeskFacts {
     // made before any rebuild of that source still counts.
     missed: sessionDispatchedToolsSince(input.sessionId, previous?.sourceUserSeq ?? 0, deskDeclaredToolNames()),
     sessionFloor: sessionFloorRung(input.sessionId, input.sourceUserSeq),
+    warmPrefix: warmPromptPrefix(input.sessionId, input.now ?? Date.now()),
   };
+}
+
+/** The session's last request when it is recent enough that its cached
+ *  prefix is likely still warm. */
+function warmPromptPrefix(sessionId: string, now: number): TurnDeskFacts['warmPrefix'] {
+  const last = latestHostPromptPrefix(sessionId);
+  if (!last || !(DESK_RUNGS as readonly string[]).includes(last.rung)) return null;
+  const at = Date.parse(last.at);
+  if (!Number.isFinite(at) || now - at > DESK_HOLD_WARM_MS) return null;
+  return { rung: last.rung as DeskRung, promptTokens: last.totalTokens };
 }
 
 /** The highest rung any earlier in-scope source of this session recorded. */

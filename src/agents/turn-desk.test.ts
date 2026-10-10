@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  DESK_HOLD_MIN_PROMPT_TOKENS,
   DESK_RUNGS,
   NO_TARGET_STARTS_LEAN,
   decideTurnDesk,
@@ -119,4 +120,34 @@ test('the names line names each deferred tool with its purpose and the two doors
   assert.match(line, /tool_search/);
   assert.match(line, /call_tool/);
   assert.equal(renderDeskNamesLine([]), null);
+});
+
+test('a climb is held while the last request\'s prompt is large and recent; the held tools stay deferred and named', () => {
+  const warm = { rung: 'lean' as const, promptTokens: 64_000 };
+  const held = decideTurnDesk(SURFACE, facts({ evidence: { ...NONE, retained_output: true }, warmPrefix: warm }), 9);
+  assert.equal(held.rung, 'lean', 'the turn keeps the rung its last request carried');
+  assert.deepEqual(held.held, { rung: 'readers', climbedBy: ['retained_output'], promptTokens: 64_000 });
+  assert.deepEqual([...held.deferred].sort(), DESK_TOOLS, 'every desk tool stays callable with its schema off the request');
+  const fromReaders = decideTurnDesk(SURFACE, facts({ evidence: { ...NONE, listed_skill: true }, sessionFloor: 'readers',
+    warmPrefix: { rung: 'readers', promptTokens: 64_000 } }), 10);
+  assert.equal(fromReaders.rung, 'readers');
+  assert.deepEqual(fromReaders.climbedBy, ['warm_prefix']);
+  assert.equal(fromReaders.held?.rung, 'full');
+});
+
+test('a small or cold prefix climbs as before, and a hold never goes below the session floor', () => {
+  const evidence = { ...NONE, retained_output: true };
+  const small = decideTurnDesk(SURFACE, facts({ evidence, warmPrefix: { rung: 'lean', promptTokens: DESK_HOLD_MIN_PROMPT_TOKENS - 1 } }), 11);
+  assert.equal(small.rung, 'readers');
+  assert.equal(small.held, undefined);
+  const cold = decideTurnDesk(SURFACE, facts({ evidence, warmPrefix: null }), 12);
+  assert.equal(cold.rung, 'readers');
+  assert.equal(cold.held, undefined);
+  const belowFloor = decideTurnDesk(SURFACE, facts({ evidence: { ...NONE, listed_skill: true }, sessionFloor: 'readers',
+    warmPrefix: { rung: 'lean', promptTokens: 64_000 } }), 13);
+  assert.equal(belowFloor.rung, 'full', 'a prefix below the floor is not held');
+  assert.equal(belowFloor.held, undefined);
+  const noClimb = decideTurnDesk(SURFACE, facts({ warmPrefix: { rung: 'full', promptTokens: 64_000 } }), 14);
+  assert.equal(noClimb.rung, 'lean', 'only a climb is held');
+  assert.equal(noClimb.held, undefined);
 });

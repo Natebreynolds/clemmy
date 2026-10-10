@@ -211,6 +211,28 @@ test('a session climbs the ladder only on a miss: unchanged turns reuse the exac
   assert.equal(turn8.requests[0]!.toolsJson, turn7.requests[0]!.toolsJson, 'a later full turn reuses the exact tools block');
 });
 
+test('after a heavy turn the climb is held so the cached conversation stays warm, and lands once the prefix is small', async () => {
+  const sessionId = 'turn-desk-warm-hold';
+  const turn1 = await hostTurn(sessionId, TARGETED, [() => ({ name: 'recall_tool_result', args: { call_id: 'no-such-call' } })]);
+  assert.equal(deskRecord(sessionId, turn1.source.seq)?.rung, 'lean');
+  // The turn's last request carried a large conversation.
+  eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'prompt_composition',
+    data: { lane: 'host', totalTokens: 64_000, stableTokens: 7_000, variableTokens: 57_000, stableShare: 0.11, toolCount: 10 } });
+  const turn2 = await hostTurn(sessionId, TARGETED, []);
+  const desk2 = deskRecord(sessionId, turn2.source.seq) as (DeskRecord & { held?: { rung: string; climbedBy: string[] } }) | undefined;
+  assert.equal(desk2?.rung, 'lean', `the miss's climb is held: ${JSON.stringify(desk2)}`);
+  assert.equal(desk2?.held?.rung, 'readers');
+  assert.ok(desk2?.held?.climbedBy.includes('miss'));
+  assert.equal(turn2.requests[0]!.toolsJson, turn1.requests[0]!.toolsJson, 'the tools block is byte-identical, so the cached prefix holds');
+  const reached = await hostTurn(sessionId, TARGETED, [() => ({ name: 'recall_tool_result', args: { call_id: 'no-such-call' } })]);
+  assert.ok(reached.outputs.get(reached.callId(0)), 'a held tool is still callable by exact name');
+  // A later request is small again (the conversation was compacted): the next turn climbs.
+  eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'prompt_composition',
+    data: { lane: 'host', totalTokens: 9_000, stableTokens: 7_000, variableTokens: 2_000, stableShare: 0.78, toolCount: 10 } });
+  const turn4 = await hostTurn(sessionId, TARGETED, []);
+  assert.equal(deskRecord(sessionId, turn4.source.seq)?.rung, 'readers', 'the held climb lands once the prefix is small');
+});
+
 test('a turn without the call door records doors_absent and defers nothing', async () => {
   const sessionId = 'turn-desk-no-call-door';
   const source = acceptSource(sessionId, TARGETED);
