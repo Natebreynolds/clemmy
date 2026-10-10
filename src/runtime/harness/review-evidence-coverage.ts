@@ -13,6 +13,7 @@
  * host's record; this module only compares the two. */
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 import type { JudgeEvidenceLookup } from './judge-evidence-tools.js';
+import { projectionMayCompleteSource } from './retained-projection-scope.js';
 
 /** The fields of a judged result row that coverage depends on. */
 export interface ReviewedEvidenceRow {
@@ -36,6 +37,8 @@ export interface ReviewedEvidenceRow {
   precedesWrite?: boolean;
   sourceLogicalToolCallId?: string;
   sourceResultHandleId?: string;
+  /** False for a focused subtree even when its reply was shown whole. */
+  sourceSelectionComplete?: boolean;
 }
 
 export type EvidenceInspection =
@@ -177,7 +180,8 @@ export function reviewEvidenceCoverage(
   // A complete retained projection of a source result is its inspection: the
   // answerer read the rest, and the review was shown that read whole.
   for (const row of results) {
-    if (row.evidenceKind !== 'retained_projection' || row.contentComplete !== true || !succeeded(row)) continue;
+    if (row.evidenceKind !== 'retained_projection' || row.contentComplete !== true || !succeeded(row)
+      || !projectionMayCompleteSource(row)) continue;
     const sources = new Set([row.sourceLogicalToolCallId, row.sourceResultHandleId].filter(Boolean));
     if (sources.size === 0) continue;
     for (const covered of rows) {

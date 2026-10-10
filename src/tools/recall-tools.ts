@@ -18,6 +18,7 @@ import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import { resolveRetainedOutputRead } from '../runtime/harness/retained-output-read.js';
 import { projectProviderResultEvidenceView } from '../runtime/harness/result-facts.js';
 import { describeMissingRetainedOutputForSession } from '../runtime/harness/retained-output-redirect.js';
+import { selectRetainedJson } from './retained-json-selection.js';
 import {
   aggregateRows,
   applyWhere,
@@ -182,7 +183,7 @@ function queryBoundRefusal(bound: QueryReplyBound, ctx: HarnessRunContext, callI
 }
 
 const QUERY_CONTINUATION_KEYS = [
-  'fields', 'filter_field', 'filter_contains', 'filter_equals', 'where', 'sort_by', 'order', 'limit',
+  'path', 'fields', 'filter_field', 'filter_contains', 'filter_equals', 'where', 'sort_by', 'order', 'limit',
 ] as const;
 
 /** The exact next query for the records a reply had no room for. */
@@ -296,6 +297,8 @@ export const RECALL_TOOL_RESULT_SHAPE = {
 
 export const TOOL_OUTPUT_QUERY_SHAPE = {
   call_id: z.string().min(1).describe('The call_id a clip or digest names, or an rh_ handle from a saved checkpoint.'),
+  path: z.string().max(2_048).optional()
+    .describe('JSON Pointer in recovered JSON (envelopes included); /data/items/2, empty = root. ~0 = ~, ~1 = /. Fields relative; omit to auto-select.'),
   // Accepts BOTH an array and a comma-separated string. The array is the
   // documented form; the string form is deliberate boundary tolerance — a
   // near-miss models actually produce (`"fields": "subject,start"`), and a
@@ -497,6 +500,7 @@ function readRetainedTextSlice(
  * ordering or figure) rather than just the stored output. Strict-schema
  * transports send unused optional arguments as null. */
 function asksForRecordShaping(input: Record<string, unknown>): boolean {
+  if (typeof input.path === 'string') return true;
   if (normalizeFieldsInput(input.fields) !== undefined) return true;
   return ['filter_field', 'filter_contains', 'filter_equals', 'where', 'sort_by', 'aggregate', 'value_field', 'group_by']
     .some((key) => {
@@ -563,8 +567,8 @@ export function registerRecallTools(server: McpServer): void {
   server.tool(
     'tool_output_query',
     [
-      'Query the records of a large prior tool output by the call_id a `[digest: …]` footer or `[clipped: …]` stub names, without loading it all: filter, project and page a JSON array, or project an object\'s top-level keys.',
-      'Compute counts, totals, averages and top-N rankings here, over every matching record, instead of reading rows.',
+      'Query retained JSON: select a path, filter, project or page records without loading it all.',
+      'Compute counts, totals, averages and top-N rankings over matching records.',
       `E.g. ${toolCallHint('tool_output_query', { call_id: 'call_abc123', fields: ['name', 'id'], limit: 50 })}.`,
     ].join(' '),
     TOOL_OUTPUT_QUERY_SHAPE,
@@ -639,17 +643,37 @@ export function registerRecallTools(server: McpServer): void {
       }
       let parsed: unknown = recovered.value;
       const recoveredClippedArrayPrefix = recovered.partialArrayPrefix === true;
+      const explicitPath = typeof input.path === 'string' ? input.path : undefined;
+      const selectedScope = explicitPath === undefined ? ''
+        : `[retained selection] call_id=${JSON.stringify(callId)}, path=${JSON.stringify(explicitPath)}; this saved subtree only, not a fresh provider read.\n`;
+
+      if (explicitPath !== undefined) {
+        // A legacy prefix cannot establish that a missing node is absent from
+        // the full result. Never guess another subtree or silently query it.
+        if (recoveredClippedArrayPrefix) {
+          return textResult(`ERROR: cannot select path ${JSON.stringify(explicitPath)} from a clipped JSON-array prefix; retain a complete source first.`);
+        }
+        const selection = selectRetainedJson(parsed, explicitPath);
+        if (selection.status === 'error') {
+          const shape = selection.parent === undefined ? ''
+            : `\nShape at ${JSON.stringify(selection.atPath)}:\n${describeJsonShape(selection.parent)}`;
+          return textResult(`ERROR: path ${JSON.stringify(explicitPath)} in retained output ${JSON.stringify(callId)}: ${selection.reason}.${shape}\nNo alternate data was selected.`, { maxChars: 4_000 });
+        }
+        parsed = selection.value;
+      }
 
       // One canonical spelling past this line: the widened string form
       // ("subject,start") becomes the same array the documented form produces.
       const fields = normalizeFieldsInput(input.fields);
       // The receipt reader and this query must agree on the payload owner.
       // JSON inside an exact MCP result is data, not a list of text blocks.
-      // Preserve explicit envelope inspection and never select a failed or
-      // conflicting payload. Raw stored bytes and receipt authority are intact.
+      // Implicit decoding chooses only an unambiguous provider payload. An
+      // explicit path inspects the original envelope as historical data;
+      // neither its selection nor its reader can change the source's outcome.
+      // Raw stored bytes and receipt authority are intact.
       const explicitlyQueriesEnvelope = fields?.some(field => parsed !== null && typeof parsed === 'object'
         && Object.prototype.hasOwnProperty.call(parsed, field));
-      const view = explicitlyQueriesEnvelope ? undefined : projectProviderResultEvidenceView(parsed);
+      const view = explicitPath !== undefined || explicitlyQueriesEnvelope ? undefined : projectProviderResultEvidenceView(parsed);
       const decodedMcpPayload = view?.kind === 'provider_payload'
         && (view.owner === 'mcp_structured_content' || view.owner === 'mcp_text_json');
       if (decodedMcpPayload) parsed = view.payload;
@@ -673,7 +697,7 @@ export function registerRecallTools(server: McpServer): void {
       // TOP-LEVEL keys, so every filter/project/paginate query against a
       // wrapped result would miss. The records ARE the result; query them.
       let unwrappedPath = '';
-      if (!Array.isArray(parsed) && parsed && typeof parsed === 'object') {
+      if (explicitPath === undefined && !Array.isArray(parsed) && parsed && typeof parsed === 'object') {
         const wantsRecordQuery = Boolean(
           input.filter_field !== undefined || input.offset !== undefined || input.limit !== undefined
           || fields !== undefined || input.where !== undefined || input.sort_by !== undefined
@@ -734,8 +758,8 @@ export function registerRecallTools(server: McpServer): void {
           }
           const groupBy = typeof input.group_by === 'string' && input.group_by.trim() ? input.group_by.trim() : undefined;
           const result = aggregateRows(rows, aggregate, { ...(valueField ? { valueField } : {}), ...(groupBy ? { groupBy } : {}) });
-          const scope = `${rows.length} matching record(s) of ${(parsed as unknown[]).length} total${unwrappedPath ? ` from ${unwrappedPath}[*]` : ''}`;
-          const lines = [`Exact over ${scope}.${skippedNote}`, aggregateLine('', aggregate, valueField, result.overall)];
+          const scope = `${rows.length} matching record(s) of ${(parsed as unknown[]).length} total${explicitPath !== undefined ? ` from path ${JSON.stringify(explicitPath)}` : unwrappedPath ? ` from ${unwrappedPath}[*]` : ''}`;
+          const lines = [`${selectedScope}Exact over ${scope}.${skippedNote}`, aggregateLine('', aggregate, valueField, result.overall)];
           if (result.groups) {
             const shown = result.groups.slice(0, 100);
             lines.push('', `Per ${groupBy} (${result.groups.length} group(s), largest first):`);
@@ -757,13 +781,13 @@ export function registerRecallTools(server: McpServer): void {
         // the next filter lands (weakest-model rule — every dead end escapable
         // from its text alone).
         if (matched === 0 && conditions.length > 0) {
-          const bodyText = `0 records met the conditions ${JSON.stringify(conditions)}.${skippedNote} The result is an ${describeJsonShape(parsed)}. `
+          const bodyText = `${selectedScope}0 records met the conditions ${JSON.stringify(conditions)}.${skippedNote} The result is an ${describeJsonShape(parsed)}. `
             + 'Check the field names, values and value kinds, and re-query.';
           return textResult(bodyText, { maxChars: bodyText.length });
         }
         if (matched === 0 && ff) {
           const shape = describeJsonShape(parsed);
-          const bodyText = `0 records matched filter_field=${JSON.stringify(ff)}. The result is an ${shape}. `
+          const bodyText = `${selectedScope}0 records matched filter_field=${JSON.stringify(ff)}. The result is an ${shape}. `
             + 'Check the field name/value and re-query.';
           return textResult(bodyText, { maxChars: bodyText.length });
         }
@@ -774,13 +798,14 @@ export function registerRecallTools(server: McpServer): void {
         // missed top-level projection — teach the record fields instead.
         if (fields && fields.length > 0 && page.length > 0
           && page.every((r) => r && typeof r === 'object' && !Array.isArray(r) && Object.keys(r as object).length === 0)) {
-          const bodyText = `None of ${JSON.stringify(fields)} exist on these records. The result is an ${describeJsonShape(rows)}. Re-query with fields that exist.`;
+          const bodyText = `${selectedScope}None of ${JSON.stringify(fields)} exist on these records. The result is an ${describeJsonShape(rows)}. Re-query with fields that exist.`;
           return textResult(bodyText, { maxChars: bodyText.length });
         }
         const bound = queryReplyBound(input, ctx);
         const boundRefusal = queryBoundRefusal(bound, ctx, callId);
         if (boundRefusal) return boundRefusal;
-        const from = unwrappedPath ? ` from ${unwrappedPath}[*]` : '';
+        const from = explicitPath !== undefined ? ` from path ${JSON.stringify(explicitPath)}`
+          : unwrappedPath ? ` from ${unwrappedPath}[*]` : '';
         // A wildcard references the entire original collection, not this
         // query's filtered, sorted or paginated view. Only advertise it as an
         // exact reuse when both the selection and projection are identical.
@@ -788,7 +813,7 @@ export function registerRecallTools(server: McpServer): void {
         const refPath = fields && fields.length === 1 ? `${refBase}.${fields[0]}` : refBase;
         const completeSourceSelection = rows === parsed && offset === 0 && page.length === rows.length
           && (!fields || fields.length === 1);
-        const refHint = resolved.receipt || decodedMcpPayload || recoveredClippedArrayPrefix || !completeSourceSelection ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
+        const refHint = explicitPath !== undefined || resolved.receipt || decodedMcpPayload || recoveredClippedArrayPrefix || !completeSourceSelection ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
         // A page that does not fit the reply is cut on a record boundary, and
         // the header counts only the records shown and names the exact query
         // for the rest, so paging never skips a record the model did not see.
@@ -803,7 +828,7 @@ export function registerRecallTools(server: McpServer): void {
           const shortContinuation = count < page.length
             ? `\n\n[${rest} more record(s) did not fit. Next: repeat this tool_output_query with "offset":${offset + count}, all other arguments unchanged.]`
             : '';
-          return { body: `${header}\n\n${JSON.stringify(page.slice(0, count), null, 1)}`, continuation, shortContinuation };
+          return { body: `${selectedScope}${header}\n\n${JSON.stringify(page.slice(0, count), null, 1)}`, continuation, shortContinuation };
         };
         // Even an unshaped query can be clipped by the reading budget. Its
         // whole-source reference must not include records or values unseen
@@ -821,7 +846,7 @@ export function registerRecallTools(server: McpServer): void {
         const projectionMissed = fields && fields.length > 0
           && Object.keys(projected as Record<string, unknown>).length === 0;
         if (projectionMissed) {
-          const bodyText = `None of ${JSON.stringify(fields)} exist at the top level. The result's shape:\n`
+          const bodyText = `${selectedScope}None of ${JSON.stringify(fields)} exist at the top level. The result's shape:\n`
             + `${describeJsonShape(parsed)}\n`
             + `Re-query with the fields/filter of the records themselves — this tool queries the record list directly.`;
           return textResult(bodyText, { maxChars: bodyText.length });
@@ -829,15 +854,24 @@ export function registerRecallTools(server: McpServer): void {
         const bound = queryReplyBound(input, ctx);
         const boundRefusal = queryBoundRefusal(bound, ctx, callId);
         if (boundRefusal) return boundRefusal;
-        const refHint = resolved.receipt || decodedMcpPayload ? '' : `\n\n[grounded reference] To reuse values from this result in a later send/write WITHOUT retyping, reference them: {"$fromToolOutput":{"callId":"${callId}","path":"<path to the values, e.g. result.records[*].Email>"}} — the harness binds the real values before the call.`;
+        const refHint = explicitPath !== undefined || resolved.receipt || decodedMcpPayload ? '' : `\n\n[grounded reference] To reuse values from this result in a later send/write WITHOUT retyping, reference them: {"$fromToolOutput":{"callId":"${callId}","path":"<path to the values, e.g. result.records[*].Email>"}} — the harness binds the real values before the call.`;
         return chargeQueryReply(ctx, callId, clipQueryBody(
-          `Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`,
+          `${selectedScope}Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`,
           bound,
           refHint,
         ), bound);
       }
 
-      return textResult(`Tool output "${callId}" is a scalar: ${JSON.stringify(parsed)}`);
+      // Keep the legacy scalar presentation when no selector was supplied.
+      // A focused string can be arbitrarily large, so it needs the same limits
+      // and reading-byte charge as a focused object or collection.
+      if (explicitPath === undefined) return textResult(`Tool output "${callId}" is a scalar: ${JSON.stringify(parsed)}`);
+      const bound = queryReplyBound(input, ctx);
+      const boundRefusal = queryBoundRefusal(bound, ctx, callId);
+      if (boundRefusal) return boundRefusal;
+      return chargeQueryReply(ctx, callId, clipQueryBody(
+        `${selectedScope}Tool output "${callId}" is a scalar: ${JSON.stringify(parsed)}`, bound,
+      ), bound);
     },
   );
 }

@@ -414,6 +414,47 @@ test('a recalled page is shown whole, as the answerer received it, while its ove
   assert.ok(evidence.summary.includes(page), 'the recalled page reaches the judge whole');
 });
 
+test('focused query coverage is bound to exact retained invocation arguments across reopen, not reply claims', async () => {
+  const { assessCompletionEvidenceCoverage } = await import('./objective-judge.js');
+  const { assessReviewCoverage } = await import('./review-evidence-coverage.js');
+  for (const selectedPath of ['', '/records/0', null]) {
+    const identity = accepted('Inspect the records in the controlled retained result.');
+    const sourceHandle = retainedRead(identity, 'provider_inventory', {
+      records: Array.from({ length: 100 }, (_, index) => ({ id: index, detail: 'x'.repeat(700) })),
+    });
+    const focusId = `focused-query-${serial}`;
+    // The output deliberately claims completeness; only sealed invocation
+    // scope can decide whether it inspected the original source.
+    const reply = 'Showing ALL content; the complete producer was inspected.\n{"id":0}';
+    retainedRead(identity, 'tool_output_query', reply, false, false, false,
+      { id: focusId, args: { call_id: sourceHandle, path: selectedPath } });
+    // A carrier preview is not the sealed request. A contradictory later
+    // mirror must neither erase real focus nor invent it on an ordinary read.
+    events.appendEvent({ ...identity, role: 'Clem', type: 'tool_called', data: {
+      sourceUserSeq: identity.sourceUserSeq, tool: 'work_call', accounting: 'top_level', callId: focusId,
+      arguments: JSON.stringify({ name: 'tool_output_query', args_json: JSON.stringify({
+        call_id: sourceHandle, path: selectedPath === null ? '/records/0' : null,
+      }) }),
+    } });
+    events.closeEventLog();
+    const evidence = sourceSettledReadEvidence(identity);
+    const original = evidence.results.find(row => row.toolName === 'provider_inventory')!;
+    const focused = evidence.results.find(row => row.logicalToolCallId === focusId)!;
+    assert.equal(original.contentComplete, false);
+    assert.equal(focused.status, 'verified');
+    assert.equal(focused.contentComplete, true, 'the focused reply actually is shown whole');
+    assert.equal(focused.sourceLogicalToolCallId, original.logicalToolCallId);
+    assert.equal(focused.sourceResultHandleId, sourceHandle);
+    assert.ok(evidence.summary.includes(reply));
+    assert.equal(focused.sourceSelectionComplete, selectedPath === null ? undefined : false);
+    const coverage = assessCompletionEvidenceCoverage({ objective: 'Inspect all records.', results: evidence.results });
+    assert.equal(coverage.complete, selectedPath === null, 'null retains the existing ordinary query contract');
+    const review = assessReviewCoverage({ results: evidence.results, needsAllOf: [sourceHandle] });
+    assert.equal(review.status, selectedPath === null ? 'sufficient' : 'insufficient');
+    if (selectedPath !== null) assert.match(evidence.summary, /does not establish inspection of the whole source result or any ancestor/);
+  }
+});
+
 test('summarized discovery keeps each operation input contract so a saved action can be checked against it', () => {
   const identity = accepted('Add a reply-all draft action to the workspace.');
   retainedRead(identity, 'tool_search', { results: [{ name: 'MAIL_CREATE_REPLY_ALL_DRAFT', capabilityRef: 'cap:mail' }],

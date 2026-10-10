@@ -24,6 +24,7 @@ import {
   type EvidenceCoverageRow, type ReviewCoverageStatus,
 } from './review-evidence-coverage.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
+import { projectionMayCompleteSource } from './retained-projection-scope.js';
 import { historicalReadPacketIsCurrent, historicalReadClosureIsCurrent,
   type HistoricalReadPacket, type HistoricalReadClosure } from './historical-completion-evidence.js';
 
@@ -645,6 +646,8 @@ export interface CompletionEvidenceRow {
   sourceLogicalToolCallId?: string;
   sourceResultHandleId?: string;
   sourcePhysicalDispatchId?: string;
+  /** False for a selected subtree; contentComplete remains reply completeness. */
+  sourceSelectionComplete?: boolean;
   /** What the review was shown of the retained result, and what it holds. */
   rawByteCount?: number;
   shownByteCount?: number;
@@ -718,11 +721,14 @@ function projectionCompletesSource(
   projection: CompletionEvidenceRow,
   all: readonly CompletionEvidenceRow[],
 ): boolean {
-  if (!isCompleteRetainedProjection(projection)) return false;
+  if (!isCompleteRetainedProjection(projection) || !projectionMayCompleteSource(projection)) return false;
   const seen = new Set<CompletionEvidenceRow>();
   const visit = (row: CompletionEvidenceRow): boolean => {
     if (seen.has(row)) return false;
     seen.add(row);
+    // A later whole read of a focused reply may inspect that reply, but the
+    // lineage cannot cross its selected scope and certify an ancestor whole.
+    if (!projectionMayCompleteSource(row)) return false;
     if (sharesEvidenceLineage(source, row)) return true;
     for (const next of all) {
       if (next === row || next === source || seen.has(next)) continue;

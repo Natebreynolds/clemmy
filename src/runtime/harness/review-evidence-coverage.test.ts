@@ -110,6 +110,33 @@ test('a complete retained read of a bounded result is its inspection; an incompl
   assert.equal(bounded.status, 'insufficient');
 });
 
+test('a wholly shown focused query supports its selection without certifying the whole producer', () => {
+  const focused: Row = { logicalToolCallId: 'call_focus', toolName: 'tool_output_query',
+    outcome: 'succeeded', status: 'verified', evidenceKind: 'retained_projection', resultHandleId: 'rh_focus',
+    contentComplete: true, sourceSelectionComplete: false,
+    sourceLogicalToolCallId: 'call_list', sourceResultHandleId: 'rh_list' };
+  const wholeSource = assessReviewCoverage({ results: [boundedList(), focused], needsAllOf: ['call_list'] });
+  assert.equal(wholeSource.status, 'insufficient');
+  assert.equal(wholeSource.rows.find(row => row.ref === 'call_list')?.inspection, 'unopened');
+  const selection = assessReviewCoverage({ results: [boundedList(), focused], needsAllOf: ['rh_focus'] });
+  assert.equal(selection.status, 'sufficient', 'the exact selected reply is useful, fully shown evidence');
+  assert.equal(selection.rows.find(row => row.ref === 'call_focus')?.exhaustive, true);
+  assert.deepEqual(selection.open.map(row => row.ref), ['call_list']);
+});
+
+test('reading a focused reply whole cannot promote its ancestor through coverage lineage', () => {
+  const focused: Row = { logicalToolCallId: 'call_focus', toolName: 'tool_output_query',
+    outcome: 'succeeded', status: 'verified', evidenceKind: 'retained_projection', resultHandleId: 'rh_focus',
+    contentComplete: false, sourceSelectionComplete: false, sourceLogicalToolCallId: 'call_list' };
+  const reopened: Row = { logicalToolCallId: 'call_reopen', toolName: 'recall_tool_result',
+    outcome: 'succeeded', status: 'verified', evidenceKind: 'retained_projection', resultHandleId: 'rh_reopen',
+    contentComplete: true, sourceLogicalToolCallId: 'call_focus', sourceResultHandleId: 'rh_focus' };
+  const assessed = assessReviewCoverage({ results: [boundedList(), focused, reopened], needsAllOf: ['call_list'] });
+  assert.equal(assessed.status, 'insufficient');
+  assert.equal(assessed.rows.find(row => row.ref === 'call_focus')?.inspection, 'queried');
+  assert.equal(assessed.rows.find(row => row.ref === 'call_list')?.inspection, 'unopened');
+});
+
 test('discovery, repeated bytes and failed calls carry no claim and are never open coverage', () => {
   const rows: Row[] = [
     boundedList({ logicalToolCallId: 'call_search', toolName: 'tool_search', resultHandleId: 'rh_search', contentDisposition: 'discovery_navigation' }),

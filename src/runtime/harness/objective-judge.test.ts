@@ -458,6 +458,33 @@ test('evidence coverage uses registry role and completeness, not vendor names', 
   assert.equal(twoDeliverablesOneFailed.failedAttempts.length, 1);
 });
 
+test('focused retained selections stay useful without completing their whole producer, directly or transitively', () => {
+  type Row = NonNullable<Parameters<typeof assessCompletionEvidenceCoverage>[0]['results']>[number];
+  const original: Row = { toolName: 'provider_inventory', outcome: 'succeeded', status: 'verified',
+    evidenceKind: 'source_result', logicalToolCallId: 'original', resultHandleId: 'rh_original', contentComplete: false };
+  const focused: Row = { toolName: 'tool_output_query', outcome: 'succeeded', status: 'verified',
+    evidenceKind: 'retained_projection', logicalToolCallId: 'focus', resultHandleId: 'rh_focus',
+    sourceLogicalToolCallId: 'original', sourceResultHandleId: 'rh_original',
+    contentComplete: true, sourceSelectionComplete: false };
+  const direct = assessCompletionEvidenceCoverage({ objective: 'Inspect all inventory.', results: [original, focused] });
+  assert.equal(direct.complete, false);
+  assert.deepEqual(direct.incompleteReceipts, [original]);
+  assert.deepEqual(direct.outcomeEvidence, [focused], 'the focused reply is still inspectable outcome evidence');
+
+  const reopened: Row = { toolName: 'recall_tool_result', outcome: 'succeeded', status: 'verified',
+    evidenceKind: 'retained_projection', logicalToolCallId: 'reopen',
+    sourceLogicalToolCallId: 'focus', sourceResultHandleId: 'rh_focus', contentComplete: true };
+  for (const intermediaryComplete of [false, true]) {
+    const intermediary = { ...focused, contentComplete: intermediaryComplete };
+    const transitive = assessCompletionEvidenceCoverage({ objective: 'Inspect all inventory.',
+      results: [original, intermediary, reopened] });
+    assert.equal(transitive.complete, false);
+    assert.deepEqual(transitive.incompleteReceipts, [original], 'reopen may complete the selected reply, never its ancestor');
+  }
+  const onlySelection = assessCompletionEvidenceCoverage({ objective: 'Inspect the selected item.', results: [focused] });
+  assert.equal(onlySelection.complete, true, 'do not discard useful selected evidence or force another provider read');
+});
+
 test('Jev DONE after discovery-only execution is not accepted as completion', async () => {
   _setTypesafeKeyForTests('ts_test');
   _setSystemOneFetchForTests(async () => ({
