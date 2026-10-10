@@ -37,14 +37,11 @@ regress anything.
    to confirm after `npm ci`). This change is already applied on branch
    `claude/next-level-plan-2026-10-10`; cherry-pick it or re-apply.
 
-2. **Record the baseline.** With CI green at the hygiene step, let the unit job run
-   once and write the list of failing test files into
-   `docs/checkpoints/2026-10-10-ci-baseline.md` (the "22 known" set of v3.18.34 is
-   named only by count in `docs/releases/v3.18.35.md:73`; the 10-07 checkpoint names
-   seven of them: `autonomous-send-consent-crash-matrix.red`, `memory-model-route`,
-   `claude-agent-brain`, `loop-structured-output-guard`, `model-role-options`,
-   `model-roles`, `respond-bridge-one-gate-wiring`). Every later PR compares
-   against that list, never against "the same count".
+2. **Confirm the baseline.** `docs/checkpoints/2026-10-10-ci-baseline.md` already
+   names all 22 CI failures case by case, reconstructed in a clean container and
+   matched to CI's count. With CI green at the hygiene step, let the unit job run
+   once and diff its failing files against that list; record any difference
+   there. Every later PR compares against the list, never against a count.
 
 3. **Take the two community fixes**, each re-validated on today's main (they are
    from 2026-09-14 and have not been rebased):
@@ -59,6 +56,22 @@ regress anything.
      (`origin/fix/test-runner-concurrency-cap`): caps default test concurrency at
      `min(4, availableParallelism() - 1)` in `scripts/run-tests-isolated-args.mjs`,
      with `--test-concurrency` to widen. CI itself is unchanged. Rebase and keep.
+
+4. **The cutover-hold closure pin.** `src/daemon/cutover-hold-structure.test.ts`
+   fails because `src/config.ts:8` now reads credentials through
+   `runtime/credential-private-filesystem.ts` (the Windows credential policy),
+   which brings `windows-private-filesystem.ts`, `sync-directory.ts` and
+   `ascii-json.ts` into the held parent's closure. Accept it: move the pin and
+   say in its comment that the hold reads its home through the credential policy.
+5. **The reconciliation regex pin.** `src/runtime/harness/reconcile-only-irreversible-effects.test.ts`
+   expects two clauses in `settlementRequiresReconciliation`
+   (`host-turn-runner.ts:7447-7450`); v3.18.32 added the third,
+   `&& !providerAnsweredWithRefusal(...)`, on purpose. Widen the regex to admit
+   it; the second assertion (only `external_write` and `admin` reconcile) stays.
+6. **What this PR does not fix, by design.** The other eighteen cases are
+   owned by PR-14 (all-in BYO identity), PR-15 (fixed host sentences and stale
+   pins), PR-17 (browser no-change settlement), PR-18 (kernel names no provider),
+   and the orchestrator fan-out case (owner decision, see the checkpoint §2b).
 
 ## Files
 

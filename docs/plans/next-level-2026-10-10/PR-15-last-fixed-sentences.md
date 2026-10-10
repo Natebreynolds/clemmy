@@ -1,6 +1,6 @@
 # PR-15 — The last fixed host sentences, and the stale pins behind them
 
-Size S · risk low · depends on PR-00 (baseline) · the owner's 3.18.33 rule, finished · clears nine baseline failures
+Size S · risk low · depends on PR-00 (baseline) · the owner's 3.18.33 rule, finished · clears ten baseline failures
 
 ## Why
 
@@ -16,7 +16,7 @@ found by running the files one at a time on `b0612dd` (2026-10-10).
 | `respond-bridge-one-gate-wiring.test.ts` · "completed-work recovery candidate … a genuine no-work candidate stays blocked" | An ownerless stalled terminal (a workflow-owned session with no completed work) never tells the user to "ask me / continue / retry / resume" | `respond-bridge.ts:766-768` ends with "The run stopped before it produced a safe final answer, so this request is still unfinished. **Ask me to check what completed and what remains before continuing.**" |
 | same file · "ownerless narration give-up closes factually without asking for a continuation" | Same, on the SDK-brain narration give-up path | `respond-bridge.ts:2717` same sentence; `:2204` names the brain ("The first brain stopped …") |
 | `src/runtime/graph/turn-graph-semantics.test.ts` · "a participated failed admission stays graphless and commits a blocked zero-tool terminal" | A blocked zero-tool terminal carries no instruction to the owner | `src/runtime/harness/public-presentation.ts:298` ends with "…Ask me to check the capability details and any completed work for this exact request before continuing." |
-| `claude-agent-brain.test.ts` · "SDK brain keeps a still-pending automatic memory capture non-done" (two wordings) | A reply that claims "Saved — your smoke marker is …" while the automatic memory capture has no host receipt yet ends `unverified` / `blocked`, never `success` | ends `success` with the claim intact |
+| `claude-agent-brain.test.ts` · "SDK brain keeps a still-pending automatic memory capture non-done" (two wordings) and "SDK brain durably captures an exact pre-recorded source once and isolates compound-decline memory authority" (ends in "accepted-task authority admission conflict") | A reply that claims "Saved — your smoke marker is …" while the automatic memory capture has no host receipt yet ends `unverified` / `blocked`, never `success` | ends `success` with the claim intact |
 
 The first two are the same defect the v3.18.32 notes record as a known limit
 ("the hard reconciliation block, when it is right, still speaks machine text").
@@ -69,7 +69,7 @@ sessions persisted on it".
 
 ## Tests
 
-- The nine baseline cases above go green; the two ownerless cases assert on the
+- The ten baseline cases above go green; the two ownerless cases assert on the
   regex they already carry (`/ask me|continue|retry|resume/i`).
 - New: a stalled terminal **with** an owner conversation and a reachable model
   yields Clem's words (fixture model returns a sentence) and the factual sentence
@@ -79,7 +79,7 @@ sessions persisted on it".
 
 ## Done when
 
-The nine cases leave `docs/checkpoints/2026-10-10-ci-baseline.md`; a workflow-owned
+The ten cases leave `docs/checkpoints/2026-10-10-ci-baseline.md`; a workflow-owned
 fixture session that stalls ends with a factual sentence and no instruction;
 and no production path outside `turn-decision.ts` carries a fixed sentence that
 addresses the owner.
