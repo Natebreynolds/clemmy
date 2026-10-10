@@ -72,7 +72,9 @@ test('the public approval event carries a well-formed preview and drops a malfor
   assert.equal((malformed?.data as Record<string, unknown> | undefined)?.preview, undefined);
   const named = { operation: 'Open Slack dm', fields: [{ name: 'users', value: 'U0FIXTURE1', label: 'Sam Rivera' }] };
   assert.deepEqual((projectHarnessEventForPublic(event({ preview: named }) as never)?.data as Record<string, unknown>)?.preview, named);
-  const badName = { operation: 'Open Slack dm', fields: [{ name: 'users', value: 'U0FIXTURE1', label: 'x'.repeat(121) }] };
+  // The card names a file by up to 300 characters (approvalCallPreview); one
+  // past that is malformed.
+  const badName = { operation: 'Open Slack dm', fields: [{ name: 'users', value: 'U0FIXTURE1', label: 'x'.repeat(301) }] };
   assert.equal((projectHarnessEventForPublic(event({ preview: badName }) as never)?.data as Record<string, unknown>)?.preview, undefined);
   const checked = { ...preview, check: { status: 'conflicts', conflicts: ['It names the research tool; you asked never to.'] } };
   assert.deepEqual((projectHarnessEventForPublic(event({ preview: checked }) as never)?.data as Record<string, unknown>)?.preview, checked);
@@ -164,4 +166,72 @@ test('a file argument is named on the card by name, size and folder, and one tha
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// The phone test of 2026-10-09: an Outlook draft edited three times. Each card
+// listed the provider call's plumbing (user_id, two ~170-character Graph ids,
+// an OData type tag, response_detail, the HTML update as JSON) as what the
+// owner was approving.
+const MESSAGE_ID = `AAMkADExOGRmNmY1LWQ1MmEtNGUwMi05MTk0LTA4MmY5NTg2NTgxYQBGAAAAAAD-yrYzWhDuRp3B0nXllfXnBwCM9mY4rqw1TrpigdngpBZ0AAAAAAEPAACM9mY4rqw1TrpigdngpBZ0AAJN54yLAAA=`;
+const ATTACHMENT_ID = `${MESSAGE_ID.slice(0, -4)}ABEgAQAOJsWtE0jXFHv0564sc55yo=`;
+const outlookCall = (slug: string, args: Record<string, unknown>) => ({
+  toolName: 'work_call',
+  args: { name: 'composio_execute_tool', args_json: JSON.stringify({ tool_slug: slug, arguments: JSON.stringify(args) }) },
+});
+
+test('opaque ids, flags and type tags are folded as details; what the owner approves stays in view', () => {
+  const preview = approvalCallPreview(outlookCall('OUTLOOK_ADD_MAIL_ATTACHMENT', {
+    message_id: MESSAGE_ID, user_id: 'me', attachment: '/Users/owner/Downloads/team-legal-q4-slide7.png',
+    name: 'slide7.png', odata_type: '#microsoft.graph.fileAttachment', contentType: 'image/png', isInline: false,
+  }) as never)!;
+  const detail = Object.fromEntries(preview.fields.map((field) => [field.name, field.detail === true]));
+  assert.deepEqual(detail, {
+    message_id: true, user_id: false, attachment: false, name: false,
+    odata_type: true, contentType: false, isInline: true,
+  });
+  assert.equal(preview.fields.find((field) => field.name === 'message_id')!.value, MESSAGE_ID, 'a detail is folded, never dropped');
+});
+
+test('an id with a name from the conversation reads as that name, not as a detail', () => {
+  const preview = approvalCallPreview({
+    ...outlookCall('OUTLOOK_DELETE_ME_MESSAGES_ATTACHMENTS', { user_id: 'me', message_id: MESSAGE_ID, attachment_id: ATTACHMENT_ID }),
+    previewLabels: { [ATTACHMENT_ID]: 'team-legal-q4-slide7.png' },
+  } as never)!;
+  const attachment = preview.fields.find((field) => field.name === 'attachment_id')!;
+  assert.equal(attachment.label, 'team-legal-q4-slide7.png');
+  assert.equal(attachment.detail, undefined);
+  assert.equal(preview.fields.find((field) => field.name === 'message_id')!.detail, true);
+});
+
+test('an HTML body inside a JSON update reads as its words, with the image named', () => {
+  const preview = approvalCallPreview(outlookCall('OUTLOOK_BATCH_UPDATE_MESSAGES', {
+    user_id: 'me', response_detail: 'full',
+    updates: [{ message_id: MESSAGE_ID, patch: { body: { contentType: 'html',
+      content: '<html><body><p>Here is slide 7 from the kickoff deck.</p><img src="cid:slide7" /><ul><li>New technology and bundles on Oct 19</li></ul></body></html>' } } }],
+  }) as never)!;
+  const updates = preview.fields.find((field) => field.name === 'updates')!;
+  assert.match(updates.display ?? '', /Here is slide 7 from the kickoff deck\./);
+  assert.match(updates.display ?? '', /\[image\]/);
+  assert.match(updates.display ?? '', /New technology and bundles on Oct 19/);
+  assert.doesNotMatch(updates.display ?? '', /<|message_id|AAMk/);
+  assert.ok(updates.value.startsWith('['), 'the exact JSON is kept for Details and edits');
+});
+
+test('the public card carries the folds and a file name up to the card\'s own label bound', () => {
+  const longLabel = `${'quarterly-board-pack-'.repeat(8)}final.pdf · 2.1 MB · in Board`;
+  const projected = projectHarnessEventForPublic({
+    type: 'approval_requested', data: { approvalId: 'apr-fold', preview: {
+      operation: 'Add Outlook mail attachment',
+      fields: [
+        { name: 'message_id', value: MESSAGE_ID, detail: true },
+        { name: 'attachment', value: '/Users/owner/Board/x.pdf', label: longLabel },
+        { name: 'updates', value: '[{"a":1}]', display: 'Here is the pack.' },
+      ],
+    } },
+  } as never) as { data?: { preview?: { fields?: Array<Record<string, unknown>> } } } | null;
+  const fields = projected?.data?.preview?.fields ?? [];
+  assert.equal(fields.length, 3, JSON.stringify(projected).slice(0, 400));
+  assert.equal(fields[0]!.detail, true);
+  assert.equal(fields[1]!.label, longLabel);
+  assert.equal(fields[2]!.display, 'Here is the pack.');
 });

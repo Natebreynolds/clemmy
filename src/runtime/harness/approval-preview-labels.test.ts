@@ -96,3 +96,13 @@ test('several identifiers in one token are one argument that no record carries, 
   assert.equal(source, 'P123,P999');
   assert.deepEqual(labelCandidatesFor([person.result, group.result], source!), [], 'a group is never given one person\'s name');
 });
+
+test('a provider id over a hundred characters is still an id the card can name', async () => {
+  const { identifierValue } = await import('./approval-preview-labels.js');
+  const graphAttachmentId = `AAMkADExOGRmNmY1LWQ1MmEtNGUwMi05MTk0LTA4MmY5NTg2NTgxYQBGAAAAAAD-yrYzWhDuRp3B0nXllfXnBwCM9mY4rqw1TrpigdngpBZ0AAAAAAEPAACM9mY4rqw1TrpigdngpBZ0AAJN54yLAAABEgAQAOJsWtE0jXFHv0564sc55yo=`;
+  assert.ok(graphAttachmentId.length > 170);
+  assert.equal(identifierValue(graphAttachmentId), true);
+  const listing = { value: [{ id: graphAttachmentId, name: 'team-legal-q4-slide7.png', contentType: 'image/png', size: 176893 }] };
+  assert.ok(labelCandidatesFor([listing], graphAttachmentId).includes('team-legal-q4-slide7.png'));
+  assert.equal(identifierValue('two words'), false, 'prose is never an id');
+});

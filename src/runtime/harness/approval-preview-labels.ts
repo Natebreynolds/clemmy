@@ -28,8 +28,10 @@ const MAX_CANDIDATE_CHARS = 80;
 const MAX_PAYLOAD_CHARS = 4_000_000;
 
 /** An argument value worth naming is one token, as ids are, never prose. */
-function identifierValue(value: string): boolean {
-  return value.length >= 3 && value.length <= 120 && !/\s/.test(value);
+/** A provider's own identifier: one token, no spaces. Some providers' ids
+ *  run past a hundred characters (a mail attachment's is about 180). */
+export function identifierValue(value: string): boolean {
+  return value.length >= 3 && value.length <= 512 && !/\s/.test(value);
 }
 
 /**

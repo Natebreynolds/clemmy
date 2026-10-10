@@ -11711,31 +11711,31 @@ const runHostTurnBody = async (
           rawArgs: pending.rawItem.arguments,
         };
         const preview = approvalCallPreview(info);
-        const [previewLabels, previewCheck] = await Promise.all([
-          approvalPreviewLabels({
-            sessionId: approvalIdentity.sessionId,
-            sourceUserSeq: approvalIdentity.sourceUserSeq,
-            preview,
-            accountId: pending.consentCall?.accountId,
-            operationId: unwrapRuntimeEffectiveToolIdentity(info.toolName, info.args).toolName ?? undefined,
-            memo: labelMemo,
-          }).catch(() => undefined),
-          // The owner's checker reads the exact content against their standing
-          // rules before the card; the card shows what it found.
-          approvalPrecheck({
-            sessionId: approvalIdentity.sessionId,
-            sourceUserSeq: approvalIdentity.sourceUserSeq,
-            preview,
-            ...(pending.consentCall ? {
-              consent: {
-                effect: pending.consentCall.effect,
-                consequence: pending.consentCall.risk?.consequence,
-                reversibility: pending.consentCall.risk?.reversibility,
-                destructive: pending.consentCall.risk?.destructive,
-              },
-            } : {}),
-          }).catch(() => undefined),
-        ]);
+        const previewLabels = await approvalPreviewLabels({
+          sessionId: approvalIdentity.sessionId,
+          sourceUserSeq: approvalIdentity.sourceUserSeq,
+          preview,
+          accountId: pending.consentCall?.accountId,
+          operationId: unwrapRuntimeEffectiveToolIdentity(info.toolName, info.args).toolName ?? undefined,
+          memo: labelMemo,
+        }).catch(() => undefined);
+        // The owner's checker reads the exact content against their standing
+        // rules before the card; the card shows what it found. It reads the
+        // ids by the names just found for them, so its question can say
+        // which attachment or event, not an id.
+        const previewCheck = await approvalPrecheck({
+          sessionId: approvalIdentity.sessionId,
+          sourceUserSeq: approvalIdentity.sourceUserSeq,
+          preview: previewLabels ? approvalCallPreview({ ...info, previewLabels }) : preview,
+          ...(pending.consentCall ? {
+            consent: {
+              effect: pending.consentCall.effect,
+              consequence: pending.consentCall.risk?.consequence,
+              reversibility: pending.consentCall.risk?.reversibility,
+              destructive: pending.consentCall.risk?.destructive,
+            },
+          } : {}),
+        }).catch(() => undefined);
         return {
           ...info,
           ...(pending.consentCall ? { consentCall: pending.consentCall } : {}),

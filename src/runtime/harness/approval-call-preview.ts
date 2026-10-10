@@ -49,9 +49,21 @@ export function approvalFileLabel(raw: unknown): string | undefined {
   }).join('; ');
 }
 
+export interface ApprovalCallPreviewField {
+  name: string;
+  value: string;
+  label?: string;
+  /** Plumbing, not content: an opaque id with no name, a flag or a type tag.
+   *  Shown folded under Details, never dropped. Display only. */
+  detail?: true;
+  /** The readable text inside a structured value (an HTML body inside a
+   *  JSON update), shown in place of the raw JSON. Display only. */
+  display?: string;
+}
+
 export interface ApprovalCallPreview {
   operation: string;
-  fields: Array<{ name: string; value: string; label?: string }>;
+  fields: ApprovalCallPreviewField[];
   /** Exact prepared members; display only, never approval authority. */
   items?: ApprovalCallPreview[];
   /** The pre-send check against the owner's standing rules, when one ran. */
@@ -88,6 +100,62 @@ function approvalPreviewValue(value: unknown, complete = false): string | null {
 }
 
 /**
+ * Plumbing rather than content: a value the owner cannot read anything into.
+ * A boolean, a type tag (`#…`), or one long opaque token (an id) with no
+ * address, path or file name in it. The card folds these under Details; it
+ * never drops them. Decided by the value's shape, never by a field's name.
+ */
+export function approvalPlumbingValue(raw: unknown): boolean {
+  if (typeof raw === 'boolean') return true;
+  if (typeof raw !== 'string') return false;
+  const value = raw.trim();
+  if (!value || /\s/.test(value)) return false;
+  if (value.startsWith('#')) return true;
+  if (/[@/\\]/.test(value) || /\.[A-Za-z0-9]{1,6}$/.test(value)) return false;
+  return value.length >= 20 && /^[A-Za-z0-9+=_\-.:]+$/.test(value);
+}
+
+const APPROVAL_READABLE_TEXT_MAX_CHARS = 600;
+
+/**
+ * The words inside a structured value: every string in it that reads as text
+ * (has a space), HTML tags removed, in order. An update that carries an email
+ * body as HTML inside JSON shows that body as words instead of the JSON.
+ * Undefined for a plain value or a structure with no words in it.
+ */
+export function approvalReadableText(raw: unknown): string | undefined {
+  let value = raw;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!(text.startsWith('{') || text.startsWith('['))) return undefined;
+    try { value = JSON.parse(text); } catch { return undefined; }
+  }
+  if (!value || typeof value !== 'object') return undefined;
+  const words: string[] = [];
+  const visit = (node: unknown, depth: number) => {
+    if (depth > 12 || words.join(' ').length > APPROVAL_READABLE_TEXT_MAX_CHARS) return;
+    if (typeof node === 'string') {
+      const text = node
+        .replace(/<(?:br|\/p|\/div|\/li|\/h[1-6])\s*\/?>/gi, '\n')
+        .replace(/<img\b[^>]*>/gi, '[image]')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;|&rsquo;/g, "'")
+        .replace(/[ \t]+/g, ' ').replace(/\n\s*/g, '\n').trim();
+      if (/\s/.test(text)) words.push(text);
+      return;
+    }
+    if (Array.isArray(node)) { for (const item of node) visit(item, depth + 1); return; }
+    if (node && typeof node === 'object') for (const item of Object.values(node)) visit(item, depth + 1);
+  };
+  visit(value, 0);
+  const joined = words.join('\n').trim();
+  if (!joined) return undefined;
+  return joined.length > APPROVAL_READABLE_TEXT_MAX_CHARS
+    ? `${joined.slice(0, APPROVAL_READABLE_TEXT_MAX_CHARS)}…`
+    : joined;
+}
+
+/**
  * What an approval would actually do, from the exact frozen arguments the
  * registry holds: the operation and each argument the provider receives, so
  * the owner approves the content itself, never an operation's name alone.
@@ -120,10 +188,13 @@ export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = tru
     // A file on this computer is named exactly (name, size, folder), so the
     // owner sees which file leaves before saying yes.
     const label = secret ? undefined : approvalFileLabel(raw) ?? info.previewLabels?.[value];
+    const display = secret ? undefined : approvalReadableText(raw);
     fields.push({
       name: truncate(name, 80),
       value: secret ? '[withheld: looks like a secret]' : value,
       ...(label ? { label: truncate(label, 300) } : {}),
+      ...(display ? { display } : {}),
+      ...(!secret && !label && !display && approvalPlumbingValue(raw) ? { detail: true as const } : {}),
     });
   }
   return {

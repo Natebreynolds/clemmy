@@ -53,7 +53,7 @@ import {
 
 /** The host-built approval preview (operation + argument values the owner is
  * approving), admitted only in its exact bounded shape. */
-type ApprovalPreviewField = { name: string; value: string; label?: string };
+type ApprovalPreviewField = { name: string; value: string; label?: string; detail?: true; display?: string };
 type ApprovalPreview = { operation: string; fields: ApprovalPreviewField[]; check?: ApprovalPreviewCheck; items?: ApprovalPreview[]; ask?: string; why?: string };
 type ApprovalPreviewCheck = { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
 
@@ -77,14 +77,22 @@ export function approvalPreviewProjection(value: unknown): { preview: ApprovalPr
   let totalCharacters = 0;
   for (const field of record.fields) {
     if (!field || typeof field !== 'object' || Array.isArray(field)) return null;
-    const { name, value: shown, label } = field as Record<string, unknown>;
+    const { name, value: shown, label, detail, display } = field as Record<string, unknown>;
     if (typeof name !== 'string' || typeof shown !== 'string' || !name || name.length > 80) return null;
     // A grouped review contains all prepared actions. Keep the total bounded
     // without silently dropping its preview at the former per-field limit.
     totalCharacters += shown.length;
     if (totalCharacters > 256_000) return null;
-    if (label !== undefined && (typeof label !== 'string' || !label.trim() || label.length > 120)) return null;
-    fields.push({ name, value: shown, ...(typeof label === 'string' ? { label } : {}) });
+    // A file named on the card ("q3 report.pdf · 120 KB · in Reports") can run
+    // to the card's own 300-character label bound.
+    if (label !== undefined && (typeof label !== 'string' || !label.trim() || label.length > 300)) return null;
+    if (display !== undefined && (typeof display !== 'string' || !display.trim() || display.length > 700)) return null;
+    fields.push({
+      name, value: shown,
+      ...(typeof label === 'string' ? { label } : {}),
+      ...(typeof display === 'string' ? { display } : {}),
+      ...(detail === true ? { detail: true as const } : {}),
+    });
   }
   const check = approvalPreviewCheck(record.check);
   if (check === null) return null;

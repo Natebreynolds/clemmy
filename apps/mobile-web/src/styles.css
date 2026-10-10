@@ -1470,6 +1470,13 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .approval-preview dt { color: var(--fg-2); }
 .approval-preview dd { margin: 0; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
 .approval-preview-id { color: var(--fg-2); }
+.approval-details { margin-top: 8px; font-size: var(--t-sm); color: var(--fg-2); }
+.approval-details > summary { cursor: pointer; list-style: none; -webkit-tap-highlight-color: transparent; }
+.approval-details > summary::-webkit-details-marker { display: none; }
+.approval-details > summary::after { content: ' ›'; }
+.approval-details[open] > summary::after { content: ' ⌄'; }
+.approval-preview-details { margin-top: 4px; }
+.approval-preview-details dd { color: var(--fg-2); overflow-wrap: anywhere; word-break: break-all; }
 .approval-preview dd.is-changed { margin: 0 -6px; padding: 2px 6px; border-radius: 6px; background: var(--accent-soft); }
 .approval-was { margin-top: 2px; font-size: var(--t-xs); color: var(--fg-2); }
 .approval-was s { text-decoration: line-through; }

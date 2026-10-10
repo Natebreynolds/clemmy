@@ -677,16 +677,15 @@ export function ChatBubble({
                 </div>
               )}
               <dl className={cn('mt-2 space-y-1.5 text-caption', editing && 'opacity-60')}>
-                {message.approval.preview.fields.map((field) => {
+                {message.approval.preview.fields.filter((field) => !field.detail).map((field) => {
                   const was = message.approval?.revises?.fields?.find((f) => f.name === field.name);
                   const changed = Boolean(was && was.value !== field.value);
                   return (
                     <div key={field.name}>
                       <dt className="text-muted">{approvalFieldLabel(field.name)}</dt>
                       <dd className={cn('whitespace-pre-wrap break-words text-fg', changed && '-mx-1.5 rounded bg-primary-tint px-1.5 py-0.5')}>
-                        {field.label
-                          ? <>{field.label} <span className="text-muted">· {field.value}</span></>
-                          : field.value}
+                        {/* A named id reads as its name; the id itself is under Details. */}
+                        {field.label ?? field.display ?? field.value}
                       </dd>
                       {changed && (
                         // The change in words, shown as a change: what it was, struck.
@@ -696,6 +695,23 @@ export function ChatBubble({
                   );
                 })}
               </dl>
+              {message.approval.preview.fields.some((field) => field.detail || field.label || field.display) && (
+                // The plumbing (ids, flags, the raw JSON) stays one tap away,
+                // never in the way of what the owner is approving.
+                <details className="mt-2 text-caption text-muted">
+                  <summary className="cursor-pointer select-none">Details</summary>
+                  <dl className="mt-1.5 space-y-1">
+                    {message.approval.preview.fields
+                      .filter((field) => field.detail || field.label || field.display)
+                      .map((field) => (
+                        <div key={field.name}>
+                          <dt>{approvalFieldLabel(field.name)}</dt>
+                          <dd className="whitespace-pre-wrap break-all">{field.value}</dd>
+                        </div>
+                      ))}
+                  </dl>
+                </details>
+              )}
               </>
             )}
             {!pendingAction && message.approval?.preview?.items && <ApprovalReview preview={message.approval.preview} />}

@@ -34,7 +34,9 @@ export interface ApprovalPreview {
   items?: ApprovalPreview[];
   operation: string;
   /** `label` is the name the host found for an id-like value, display only. */
-  fields: Array<{ name: string; value: string; label?: string }>;
+  /** `detail`: plumbing (an opaque id, a flag, a type tag) folded under
+   *  Details. `display`: the readable words inside a structured value. */
+  fields: Array<{ name: string; value: string; label?: string; detail?: true; display?: string }>;
   /** The pre-send check of this content against the owner's standing rules. */
   check?: { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
   /** The card in Clem's words: her question to the owner and why a yes is

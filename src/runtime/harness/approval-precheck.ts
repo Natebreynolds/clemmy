@@ -175,7 +175,7 @@ export async function approvalPrecheck(input: {
   if (!input.preview) return undefined;
   const content = [
     input.preview.operation,
-    ...input.preview.fields.map((field) => `${field.name}: ${field.label ? `${field.label} (${field.value})` : field.value}`),
+    ...input.preview.fields.map((field) => `${field.name}: ${field.label ? `${field.label} (${field.value})` : field.display ?? field.value}`),
   ].join('\n');
   let ownerRules = '';
   try {

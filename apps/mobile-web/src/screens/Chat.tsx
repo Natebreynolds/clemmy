@@ -958,8 +958,9 @@ function MessageRow({
         ) : null}
         {message.approval.preview && !message.approval.preview.items && message.approval.preview.fields.length > 0 ? (
           // What approving would actually send, from the host's frozen call.
+          <>
           <dl class="approval-preview">
-            {message.approval.preview.fields.map((field) => {
+            {message.approval.preview.fields.filter((field) => !field.detail).map((field) => {
               // A change in words, shown as a change: the new value washed,
               // what it was struck under it (owner-approved design, 2026-10-07).
               const was = message.approval?.revises?.fields?.find((f) => f.name === field.name);
@@ -968,15 +969,32 @@ function MessageRow({
                 <div key={field.name}>
                   <dt>{approvalFieldLabel(field.name)}</dt>
                   <dd class={changed ? 'is-changed' : undefined}>
-                    {field.label
-                      ? <>{field.label} <span class="approval-preview-id">· {field.value}</span></>
-                      : field.value}
+                    {/* A named id reads as its name; the id itself is under Details. */}
+                    {field.label ?? field.display ?? field.value}
                   </dd>
                   {changed ? <dd class="approval-was">Was: <s>{was!.value}</s></dd> : null}
                 </div>
               );
             })}
           </dl>
+          {message.approval.preview.fields.some((field) => field.detail || field.label || field.display) ? (
+            // The plumbing (ids, flags, the raw JSON) one tap away, never in
+            // the way of what the owner is approving.
+            <details class="approval-details">
+              <summary>Details</summary>
+              <dl class="approval-preview approval-preview-details">
+                {message.approval.preview.fields
+                  .filter((field) => field.detail || field.label || field.display)
+                  .map((field) => (
+                    <div key={field.name}>
+                      <dt>{approvalFieldLabel(field.name)}</dt>
+                      <dd class="approval-preview-id">{field.value}</dd>
+                    </div>
+                  ))}
+              </dl>
+            </details>
+          ) : null}
+          </>
         ) : null}
         {message.approval.revises?.changeRequest && !approvalDecided ? (
           // The owner's words that changed the earlier card, on this card.
