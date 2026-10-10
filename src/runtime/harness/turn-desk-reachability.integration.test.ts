@@ -374,6 +374,40 @@ test('a tool reached for during a turn joins the tools block at the owner\'s nex
   assert.equal(names(nextTurn).includes('view_image'), true, 'the next turn carries the tool it reached for');
 });
 
+test('a tool reached for joins later when the cached conversation is large and warm; the held tool stays reachable', async () => {
+  const hotset = await import('../../agents/tool-hotset.js');
+  const sessionId = 'turn-desk-hot-held';
+  const names = (agent: unknown) => agentTools(agent).map((entry) => entry.name);
+  // As the live host records it: only the schemas the request sent.
+  const sent = (agent: unknown) => agentTools(agent).filter((entry) => entry.deferLoading !== true).map((entry) => entry.name!);
+  const reading = (source: number, totalTokens: number, tools: string[]) => eventlog.appendEvent({ sessionId, turn: 0,
+    role: 'system', type: 'prompt_composition', data: { lane: 'host', totalTokens, stableTokens: 7_000,
+      variableTokens: totalTokens - 7_000, stableShare: 0.1, toolCount: tools.length, sourceUserSeq: source, model: 'fixture-model',
+      toolSchemaCosts: tools.map((name) => ({ name, deferred: false, tokens: 100 })) } });
+  const routed = () => {
+    const source = acceptSource(sessionId, TARGETED);
+    eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'turn_model_routed', data: { model: 'fixture-model', sourceUserSeq: source.seq } });
+    return source;
+  };
+  const first = routed();
+  const opening = await buildFor(sessionId, first.seq, TARGETED, idleModel);
+  assert.equal(names(opening).includes('view_image'), false);
+  hotset.recordToolHit(sessionId, 'view_image');
+  reading(first.seq, 64_000, sent(opening));
+  const second = routed();
+  const held = await buildFor(sessionId, second.seq, TARGETED, idleModel);
+  assert.equal(names(held).includes('view_image'), false, 'the promotion waits while the cached conversation is large');
+  assert.equal(toolsBytes(held), toolsBytes(opening), 'the tools block, deferred tools included, is byte-identical');
+  const scope = eventlog.listEvents(sessionId, { sinceSeq: second.seq, types: ['tool_search_scope'] }).at(-1);
+  assert.deepEqual((scope?.data as { heldPromotions?: string[] }).heldPromotions, ['view_image']);
+  assert.ok(names(held).includes('call_tool'), 'the held tool stays reachable through call_tool');
+  // A later request is small (the conversation was compacted): it joins.
+  reading(second.seq, 9_000, sent(held));
+  const third = routed();
+  const joined = await buildFor(sessionId, third.seq, TARGETED, idleModel);
+  assert.equal(names(joined).includes('view_image'), true, 'the held promotion lands once the prefix is small');
+});
+
 test('a rebuild of the same turn keeps work_call\'s ready list; an operation found during the turn joins at the next message', async () => {
   const sessionId = 'work-call-disclosure-turn';
   const descriptor = {

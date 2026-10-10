@@ -262,11 +262,29 @@ export function gatherTurnDeskFacts(input: TurnDeskFactInput): TurnDeskFacts {
  *  prefix is likely still warm, and bound to the desk and model that
  *  produced it (this source is routed to the same model). */
 function warmPromptPrefix(sessionId: string, sourceUserSeq: number, now: number): TurnDeskFacts['warmPrefix'] {
+  const warm = warmPromptPrefixFor(sessionId, sourceUserSeq, now);
+  return warm ? { rung: warm.rung, promptTokens: warm.promptTokens } : null;
+}
+
+export interface WarmPromptPrefix {
+  rung: DeskRung;
+  promptTokens: number;
+  /** The names the build of that request promoted; null when not recorded. */
+  promotedNames: readonly string[] | null;
+}
+
+/** The warm, bound prefix of the session's last request, or null. */
+export function warmPromptPrefixFor(sessionId: string, sourceUserSeq: number, now = Date.now()): WarmPromptPrefix | null {
   const last = latestHostPromptPrefix(sessionId, sourceUserSeq);
   if (!last || !(DESK_RUNGS as readonly string[]).includes(last.rung)) return null;
   const at = Date.parse(last.at);
   if (!Number.isFinite(at) || now - at > DESK_HOLD_WARM_MS) return null;
-  return { rung: last.rung as DeskRung, promptTokens: last.totalTokens };
+  return { rung: last.rung as DeskRung, promptTokens: last.totalTokens, promotedNames: last.promotedNames };
+}
+
+/** A prefix worth more than a change to the tools block before it. */
+export function holdsWarmPrefix(prefix: WarmPromptPrefix | null): prefix is WarmPromptPrefix {
+  return Boolean(prefix && prefix.promptTokens >= DESK_HOLD_MIN_PROMPT_TOKENS);
 }
 
 /** The highest rung any earlier in-scope source of this session recorded. */

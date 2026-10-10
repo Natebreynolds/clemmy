@@ -256,6 +256,27 @@ export function steadySessionPromotions(
   return result;
 }
 
+/**
+ * While the conversation's cached prefix is large and warm, a tool that the
+ * previous request's build did not promote does not join the tools block: the block
+ * sits before the conversation, so adding a schema re-sends the whole
+ * conversation uncached. The held tool stays callable by exact name and
+ * through call_tool, and stays promoted, so it joins on a turn whose prefix
+ * is small or cold. Comparing with the previous request keeps a turn's
+ * rebuilds on the same block.
+ */
+export function holdNewPromotions(
+  promoted: ReadonlySet<string>,
+  promotedBefore: readonly string[] | null,
+): { promoted: Set<string>; held: string[] } {
+  if (!promotedBefore) return { promoted: new Set(promoted), held: [] };
+  const before = new Set(promotedBefore);
+  const kept = new Set<string>();
+  const held: string[] = [];
+  for (const name of promoted) (before.has(name) ? kept.add(name) : held.push(name));
+  return { promoted: kept, held };
+}
+
 /** Test seam: forget every conversation's steady promotions. */
 export function _resetSteadySessionPromotionsForTests(): void { stickyBySession.clear(); }
 

@@ -6808,7 +6808,7 @@ export function earlierInScopeDeskRungs(sessionId: string, sourceUserSeq: number
 export function latestHostPromptPrefix(
   sessionId: string,
   sourceUserSeq: number,
-): { totalTokens: number; at: string; rung: string } | null {
+): { totalTokens: number; at: string; rung: string; promotedNames: string[] | null } | null {
   const id = sessionId.trim();
   if (!id || !Number.isSafeInteger(sourceUserSeq)) return null;
   const db = openEventLog();
@@ -6824,12 +6824,13 @@ export function latestHostPromptPrefix(
   if (!reading || typeof reading.totalTokens !== 'number' || typeof reading.at !== 'string'
     || typeof reading.source !== 'number' || typeof reading.model !== 'string' || !reading.model) return null;
   const desk = prepareCached(db,
-    `SELECT json_extract(data_json, '$.desk.rung') AS rung FROM events
+    `SELECT json_extract(data_json, '$.desk.rung') AS rung,
+            json_extract(data_json, '$.promotedNames') AS promoted FROM events
       WHERE session_id = ? AND type = 'tool_search_scope' AND seq < ?
         AND json_extract(data_json, '$.desk.sourceUserSeq') = ?
         AND json_extract(data_json, '$.desk.rung') IS NOT NULL
       ORDER BY seq DESC LIMIT 1`,
-  ).get(id, reading.seq, reading.source) as { rung: unknown } | undefined;
+  ).get(id, reading.seq, reading.source) as { rung: unknown; promoted: unknown } | undefined;
   if (!desk || typeof desk.rung !== 'string') return null;
   const routed = prepareCached(db,
     `SELECT json_extract(data_json, '$.model') AS model FROM events
@@ -6838,7 +6839,13 @@ export function latestHostPromptPrefix(
       ORDER BY seq DESC LIMIT 1`,
   ).get(id, sourceUserSeq) as { model: unknown } | undefined;
   if (!routed || routed.model !== reading.model) return null;
-  return { totalTokens: reading.totalTokens, at: reading.at, rung: desk.rung };
+  // The names that build promoted onto its surface (sent or deferred).
+  let promotedNames: string[] | null = null;
+  try {
+    const parsed = typeof desk.promoted === 'string' ? JSON.parse(desk.promoted) as unknown : null;
+    if (Array.isArray(parsed)) promotedNames = parsed.filter((name): name is string => typeof name === 'string');
+  } catch { /* not recorded: a promotion is not held */ }
+  return { totalTokens: reading.totalTokens, at: reading.at, rung: desk.rung, promotedNames };
 }
 
 /** Which of these exact tools this session dispatched after `afterSeq`,

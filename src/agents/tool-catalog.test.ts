@@ -534,3 +534,11 @@ test('multi-provider queries preserve repeated words in each namespace', () => {
   const control = rankCatalogEntriesLexically('Atlas Calendar and Docs', entries);
   assert.equal(control.find(entry => entry.name === 'ATLAS_DOCS_READ')?.namespaceMatch, false, 'do not join non-adjacent provider words');
 });
+
+test('holdNewPromotions keeps what the previous build promoted and holds only additions', async () => {
+  const { holdNewPromotions } = await import('./tool-catalog.js');
+  const decided = holdNewPromotions(new Set(['read_file', 'view_image', 'list_files']), ['read_file', 'list_files', 'call_tool']);
+  assert.deepEqual([...decided.promoted].sort(), ['list_files', 'read_file']);
+  assert.deepEqual(decided.held, ['view_image']);
+  assert.deepEqual([...holdNewPromotions(new Set(['view_image']), null).promoted], ['view_image'], 'no recorded list holds nothing');
+});

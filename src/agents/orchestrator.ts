@@ -80,8 +80,8 @@ import {
   ORCHESTRATOR_BEHAVIOR_NATIVE,
 } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
-import { resolveToolSearchDecision, resolveHotSetParts, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS, applyProvenSkipToHotSet, steadySessionPromotions } from './tool-catalog.js';
-import { recordedTurnDesk, renderDeskNamesLine, resolveTurnDesk, type TurnDeskDecision } from './turn-desk.js';
+import { resolveToolSearchDecision, resolveHotSetParts, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS, applyProvenSkipToHotSet, steadySessionPromotions, holdNewPromotions } from './tool-catalog.js';
+import { holdsWarmPrefix, recordedTurnDesk, renderDeskNamesLine, resolveTurnDesk, warmPromptPrefixFor, type TurnDeskDecision, type WarmPromptPrefix } from './turn-desk.js';
 import { bindSessionWireOrder } from '../runtime/harness/advertised-tool-wire.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
 import {
@@ -3763,6 +3763,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // round-one desk (turn-desk.ts) reads it under its no-signal rule.
   let deskIdentifiedTarget = false;
   let workCallOptions: BuildWorkCallOptions | null = null;
+  // Tools whose promotion waited for the cached conversation (see holdNewPromotions),
+  // and the names this build promoted, which the next turn's hold compares with.
+  let heldPromotions: string[] = [];
+  let finalPromotions: string[] | null = null;
   // Assigned after the capability universe seals (the agent does not exist yet
   // when the dispatcher is built). Until then it fails closed: a production
   // dispatcher can never interpret missing authority as unlimited authority.
@@ -3836,7 +3840,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         excludeNames: excludes,
         // Steady within the conversation, so the cached prompt prefix holds
         // from turn to turn (tool-catalog.ts steadySessionPromotions).
-        promotedNames: steadySessionPromotions(options.sessionId, hot, (name) => policyAllowed.has(name)),
+        promotedNames: (() => {
+          const steady = steadySessionPromotions(options.sessionId, hot, (name) => policyAllowed.has(name));
+          let warm: WarmPromptPrefix | null = null;
+          try {
+            warm = options.sessionId && options.sourceUserSeq
+              ? warmPromptPrefixFor(options.sessionId, options.sourceUserSeq) : null;
+          } catch { warm = null; }
+          const decided = holdsWarmPrefix(warm) ? holdNewPromotions(steady, warm.promotedNames) : { promoted: steady, held: [] };
+          heldPromotions = decided.held;
+          finalPromotions = [...decided.promoted];
+          return decided.promoted;
+        })(),
         // The explicit local-memory scope intentionally suppresses call_tool,
         // so every policy-allowed memory tool must stay directly reachable.
         // General turns have the dispatcher and can safely defer.
@@ -4455,6 +4470,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // The round-one desk for this accepted source; a re-entry on the
           // same source reads it back instead of deciding again.
           ...(turnDesk ? { desk: turnDesk } : {}),
+          ...(heldPromotions.length > 0 ? { heldPromotions } : {}),
+          ...(finalPromotions ? { promotedNames: finalPromotions } : {}),
         },
       });
     } catch {
