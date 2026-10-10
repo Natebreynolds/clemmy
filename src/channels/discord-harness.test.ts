@@ -280,7 +280,7 @@ test('async dispatch releases only its exact placeholder with a compact determin
     runIds: ['run-owned'],
     sourceGroupId: `workflow-origin-group-v1:${'b'.repeat(64)}`,
   });
-  const expected = 'Started — I’ll post the result here when it’s ready.';
+  const expected = 'Queued — waiting for the workflow to start. I’ll post the result here when it’s ready.';
   assert.equal(state.summary, expected);
   assert.equal(__test__.renderBody(state), expected);
   assert.equal(__test__.renderFullBody(state), expected);

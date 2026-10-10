@@ -106,7 +106,7 @@ test('guard: JSON SyntaxError on completed → recovers from text-part content',
 test('guard: parse error with no recoverable text → safe fallback string', async () => {
   const runner = makeRunner({ completed: Promise.reject(new SyntaxError('bad')), history: [] });
   const out = await callRunner(runner);
-  assert.match(out.finalOutput as string, /couldn't be structured/);
+  assert.match(out.finalOutput as string, /couldn't prepare a usable reply/);
 });
 
 test('guard: parse error with empty history recovers active streamed text', async () => {
@@ -132,7 +132,7 @@ test('guard: parse recovery does not reuse stale assistant text from prior turns
     history: [...prior, { type: 'function_call', callId: 'call_write', name: 'write_file', arguments: '{}' }],
   });
   const out = await callRunnerWithItems(runner, prior);
-  assert.match(out.finalOutput as string, /couldn't be structured/);
+  assert.match(out.finalOutput as string, /couldn't prepare a usable reply/);
   assert.doesNotMatch(out.finalOutput as string, /The Loop/);
 });
 

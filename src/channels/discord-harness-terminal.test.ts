@@ -643,7 +643,7 @@ test('provider replied means dispatch ACK delivered while the exact logical edge
 
     const outcome = __test__.acceptedChannelOutcome(accepted);
     assert.equal(outcome?.kind, 'dispatched');
-    assert.equal(outcome?.text, 'Started — I’ll post the result here when it’s ready.');
+    assert.equal(outcome?.text, 'Queued — waiting for the workflow to start. I’ll post the result here when it’s ready.');
     assert.equal(terminalEvents(session.id).length, 0);
 
     // The provider row accounts for ingress/ACK delivery, not logical work

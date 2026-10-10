@@ -7,7 +7,7 @@ import { isHostAuthorityIdentity, HOST_BIND_IDENTITY, hostCompileDigest } from '
 import { hostDeterministicCompile, HOST_COMPILER_VERSION } from './host-deterministic-compile.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendEvent, getEvent, listEvents, openEventLog, type EventRow } from '../harness/eventlog.js';
-import { heldExecutionTextForInternalReason } from '../harness/public-presentation.js';
+import { isHostAuthorityHeldReason } from '../harness/public-presentation.js';
 import {
   admitTurnSemantics,
   type HostSemanticAuthorityV1,
@@ -1764,9 +1764,11 @@ export function blockedPresentationForSemanticRecord(
   record: SemanticInterpretationRecordV1 | null,
 ): string {
   const issue = record?.validationIssue?.code ?? '';
-  if (/capability|grounding|catalog|schema|account|provider|identity/i.test(issue)) {
-    const held = heldExecutionTextForInternalReason(issue, 'blocked');
-    if (held !== issue) return held;
+  // Stopped at admission: no tool ran, so these facts are known here, and the
+  // terminal states them instead of telling the owner what to ask for.
+  if (/capability|grounding|catalog|schema|account|provider|identity/i.test(issue)
+    && isHostAuthorityHeldReason(issue)) {
+    return 'I stopped before using any tools because the host could not authorize the next step. No provider call was made. No external change was made.';
   }
   if (!record || record.validationOutcome === 'model_failed') {
     return 'I could not finish planning that, so I stopped before using any tools. You can restate it.';

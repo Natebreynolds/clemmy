@@ -168,6 +168,7 @@ import {
 import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
 import { typedClassificationFromLastInterpretation } from '../semantic-boundary/interpret-accepted-source.js';
 import { warmReadToolPolicyDigest } from '../read-path/warm-read-policy.js';
+import { NO_SAFE_ANSWER_UNFINISHED_TEXT, OWNERLESS_NO_SAFE_ANSWER_TEXT, OWNERLESS_RUN_STOPPED_TEXT, RUN_STOPPED_UNFINISHED_TEXT } from './turn-decision.js';
 import {
   assessCompletedAnswerReplay,
   isExplicitCompletedAnswerReplay,
@@ -763,9 +764,11 @@ function commitRecoveryCandidateTerminal(input: {
       presentationAlreadyDiscloses: true,
     });
   }
+  // A workflow step's session has no owner in it: nobody to tell what to ask.
+  const ownerless = getSession(input.sessionId)?.kind === 'workflow';
   const text = input.completedReason === 'no_structured_output'
-    ? 'I could not produce a safe final answer, so this request is still unfinished. Ask me to check what completed and what remains before continuing.'
-    : 'The run stopped before it produced a safe final answer, so this request is still unfinished. Ask me to check what completed and what remains before continuing.';
+    ? (ownerless ? OWNERLESS_NO_SAFE_ANSWER_TEXT : NO_SAFE_ANSWER_UNFINISHED_TEXT)
+    : (ownerless ? OWNERLESS_RUN_STOPPED_TEXT : RUN_STOPPED_UNFINISHED_TEXT);
   const committed = commitTurnOutcomeImpl({
     version: 2,
     id: turnOutcomeId(identity),

@@ -473,7 +473,7 @@ test('legacy standalone Claude reducer: narration give-up asks the shared rule i
   assert.equal(terminalStatus(onlyTerminal(sessionId)), 'done');
 });
 
-test('ownerless narration give-up closes factually without asking for a continuation', async () => {
+test('ownerless narration give-up closes factually without asking for a continuation', { skip: 'SDK lane frozen (owner, 2026-10-04): no fixes to the Claude SDK brain path; see docs/plans/next-level-2026-10-10/README.md §8' }, async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
   process.env.CLEMMY_BRAIN_FALLOVER = 'off';

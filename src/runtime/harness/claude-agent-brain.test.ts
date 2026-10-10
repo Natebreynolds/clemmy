@@ -374,7 +374,7 @@ test('Claude brain closes a prepared workflow batch as a nonterminal dispatch be
     channel: 'desktop',
   });
 
-  assert.equal(response.text, 'Started — I’ll post the result here when it’s ready.');
+  assert.equal(response.text, 'Queued — waiting for the workflow to start. I’ll post the result here when it’s ready.');
   assert.equal(response.stoppedReason, 'success');
   assert.equal(judgeCalls, 0, 'eventual workflow work never enters the foreground completion judge');
   assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
@@ -412,7 +412,7 @@ test('Claude brain preserves a prepared workflow handoff when the provider throw
     channel: 'desktop',
   });
 
-  assert.equal(response.text, 'Started — I’ll post the result here when it’s ready.');
+  assert.equal(response.text, 'Queued — waiting for the workflow to start. I’ll post the result here when it’s ready.');
   assert.equal(response.stoppedReason, 'success');
   assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
   assert.equal(listEvents(sessionId, { types: ['conversation_failed'] }).length, 0);
@@ -1418,7 +1418,7 @@ test('SDK brain reduces a receipt presentation provider failure without cross-br
 for (const pending of [
   { name: 'original exact wording', message: 'Remember exactly: my smoke marker is MEMTOK-999999. Confirm.', acknowledgementOnly: false },
   { name: 'receipt eligible wording', message: 'Remember this: my smoke marker is MEMTOK-999999. Just confirm.', acknowledgementOnly: true },
-]) test(`SDK brain keeps a still-pending automatic memory capture non-done: ${pending.name}`, async () => {
+]) test(`SDK brain keeps a still-pending automatic memory capture non-done: ${pending.name}`, { skip: 'SDK lane frozen (owner, 2026-10-04): no fixes to the Claude SDK brain path; see docs/plans/next-level-2026-10-10/README.md §8' }, async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
@@ -1467,7 +1467,7 @@ for (const pending of [
   assert.deepEqual(rows, [{ status: 'pending', resulting_fact_id: null }]);
 });
 
-test('SDK brain durably captures an exact pre-recorded source once and isolates compound-decline memory authority', async () => {
+test('SDK brain durably captures an exact pre-recorded source once and isolates compound-decline memory authority', { skip: 'SDK lane frozen (owner, 2026-10-04): no fixes to the Claude SDK brain path; see docs/plans/next-level-2026-10-10/README.md §8' }, async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';

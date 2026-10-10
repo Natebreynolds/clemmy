@@ -29,6 +29,19 @@ import type { OrchestratorDecisionShape } from './loop.js';
 export const MISSING_REPLY_USER_FALLBACK =
   "I couldn't provide a visible reply, so I can't confirm this request is complete. Ask me to check what completed and what remains before continuing.";
 
+/** The model failed to produce a safe final answer (no structured output, or
+ *  a stalled sub-agent) and the ledger shows no completed work. In the owner's
+ *  conversation the close says where to pick up; an ownerless run (a workflow
+ *  step) has nobody to address, so its close states the facts only. */
+export const NO_SAFE_ANSWER_UNFINISHED_TEXT =
+  'I could not produce a safe final answer, so this request is still unfinished. Ask me to check what completed and what remains before continuing.';
+export const RUN_STOPPED_UNFINISHED_TEXT =
+  'The run stopped before it produced a safe final answer, so this request is still unfinished. Ask me to check what completed and what remains before continuing.';
+export const OWNERLESS_NO_SAFE_ANSWER_TEXT =
+  'I could not produce a safe final answer, so this request is still unfinished.';
+export const OWNERLESS_RUN_STOPPED_TEXT =
+  'The run stopped before it produced a safe final answer, so this request is still unfinished.';
+
 export const STRUCTURED_OUTPUT_RECOVERY_FALLBACK =
   "Clementine couldn't prepare a usable reply. Ask me to check what completed and what remains before continuing.";
 
