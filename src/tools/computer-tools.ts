@@ -952,7 +952,19 @@ const pathLikeArgument = (value: string): boolean => Boolean(value)
  * never saw). Pure: the caller's existence and fresh-mtime check is what turns
  * a lead into a deliverable, so a file the command only read is never one.
  */
+export interface ShellWriteLead {
+  /** Candidate absolute paths, in resolution-priority order. */
+  candidates: string[];
+  /** A redirect target is an output by its syntax; a named path is only a
+   *  path the command mentions, so it must be seen to change. */
+  role: 'redirect' | 'named';
+}
+
 export function shellWriteLeadPaths(command: string, cwd: string): string[][] {
+  return shellWriteLeads(command, cwd).map((lead) => lead.candidates);
+}
+
+export function shellWriteLeads(command: string, cwd: string): ShellWriteLead[] {
   const body = withoutHeredocBodies(command);
   const cdBases = [...body.matchAll(/(?:^|&&|;|\|)\s*cd\s+(['"]?)(\/[^'"\s;&|]+)\1/g)]
     .map((m) => m[2])
@@ -966,7 +978,8 @@ export function shellWriteLeadPaths(command: string, cwd: string): string[][] {
     .map((token) => (/^-[^=]*=/.test(token) ? token.slice(token.indexOf('=') + 1) : token))
     .filter(pathLikeArgument);
   const assigned = [...variables.values()].filter(pathLikeArgument);
-  const tokens = [...new Set([...outputRedirectionTargets(body).slice(0, 10), ...named, ...assigned].map(expand))]
+  const redirects = new Set(outputRedirectionTargets(body).slice(0, 10).map(expand));
+  const tokens = [...new Set([...redirects, ...[...named, ...assigned].map(expand)])]
     .filter((token) => !errorLogs.has(token))
     .slice(0, 24);
   return tokens.flatMap((token) => {
@@ -975,8 +988,58 @@ export function shellWriteLeadPaths(command: string, cwd: string): string[][] {
       const resolved = resolveShellPathToken(token, base);
       if (resolved && !candidates.includes(resolved)) candidates.push(resolved);
     }
-    return candidates.length > 0 ? [candidates] : [];
+    return candidates.length > 0 ? [{ candidates, role: redirects.has(token) ? 'redirect' as const : 'named' as const }] : [];
   });
+}
+
+/** A file's identity before a command runs; null when it did not exist. */
+type FileMark = { mtimeMs: number; size: number; ino: number } | null;
+
+function fileMark(file: string): FileMark {
+  try {
+    const stat = statSync(file);
+    return stat.isFile() ? { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Before a command runs: the state of every path it names but does not
+ *  redirect to, so afterwards a mention is told apart from a write. */
+export function markShellNamedLeads(leads: readonly ShellWriteLead[]): Map<string, FileMark> {
+  const marks = new Map<string, FileMark>();
+  for (const lead of leads) {
+    if (lead.role !== 'named') continue;
+    for (const candidate of lead.candidates) if (!marks.has(candidate)) marks.set(candidate, fileMark(candidate));
+  }
+  return marks;
+}
+
+/** The files a completed command saved: a redirect target written since the
+ *  command started, or a named path that appeared or changed while it ran. A
+ *  path the command only read, or assigned and never wrote, is unchanged. */
+export function savedShellLeadFiles(
+  leads: readonly ShellWriteLead[],
+  marks: ReadonlyMap<string, FileMark>,
+  commandStartedAtMs: number,
+): string[] {
+  const saved: string[] = [];
+  for (const lead of leads) {
+    for (const candidate of lead.candidates) {
+      if (saved.includes(candidate)) break;
+      const now = fileMark(candidate);
+      if (!now) continue;
+      const before = marks.get(candidate) ?? null;
+      const written = lead.role === 'redirect'
+        ? now.mtimeMs >= commandStartedAtMs - 2_000
+        : before === null || before.mtimeMs !== now.mtimeMs || before.size !== now.size || before.ino !== now.ino;
+      if (written) {
+        saved.push(candidate);
+        break;
+      }
+    }
+  }
+  return saved;
 }
 
 function shellWriteApiTargets(command: string, cwd: string): boolean {
@@ -1236,6 +1299,12 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
   }
   return new Promise((resolve, reject) => {
     let settled = false;
+    let deliverableLeads: ShellWriteLead[] = [];
+    let namedLeadMarks = new Map<string, FileMark>();
+    try {
+      deliverableLeads = shellWriteLeads(command, cwd);
+      namedLeadMarks = markShellNamedLeads(deliverableLeads);
+    } catch { /* visibility must never affect the command */ }
     const commandStartedAtMs = Date.now();
     const child = (runtime.spawnProcess ?? spawn)(command, {
       cwd,
@@ -1392,24 +1461,14 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
       clearTimeout(timeout);
       // Deliverable visibility for shell-written files (live 2026-08-05: the
       // model drafted three markdown files via a heredoc and the feed showed
-      // nothing — only write_file had the tee). Redirect targets parsed from
-      // the command are LEADS, not truth; a lead becomes a deliverable only
-      // when the file provably exists with an mtime at/after command start.
+      // nothing — only write_file had the tee). Paths parsed from the command
+      // are LEADS, not truth: a redirect target counts when it exists with an
+      // mtime at/after command start, and a path the command only names counts
+      // only when it appeared or changed while the command ran.
       if ((code ?? 0) === 0) {
         try {
-          const seen = new Set<string>();
-          for (const candidates of shellWriteLeadPaths(command, cwd)) {
-            for (const resolved of candidates) {
-              if (seen.has(resolved)) continue;
-              try {
-                const stat = statSync(resolved);
-                if (stat.isFile() && stat.mtimeMs >= commandStartedAtMs - 2_000) {
-                  seen.add(resolved);
-                  teeFileDeliverable(resolved);
-                  break;
-                }
-              } catch { /* a lead that never landed is not a deliverable */ }
-            }
+          for (const saved of savedShellLeadFiles(deliverableLeads, namedLeadMarks, commandStartedAtMs)) {
+            teeFileDeliverable(saved);
           }
         } catch { /* visibility must never affect the command result */ }
       }

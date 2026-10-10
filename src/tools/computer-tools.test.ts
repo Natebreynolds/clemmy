@@ -3,7 +3,7 @@
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -572,6 +572,33 @@ test('a file a shell command writes through a variable is recorded as saved; its
   }
   assert.deepEqual(saved.map((event) => event.data.name), ['slide.txt'], 'the written file, not its stderr log');
   assert.equal(saved[0]?.data.sourceUserSeq, source.seq);
+});
+
+test('a path the command only reads or assigns is not saved, even when it was written a moment before', async () => {
+  const { createSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const session = createSession({ kind: 'chat', title: 'shell reads' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Check it.' } });
+  const dir = path.join(tmpHome, 'reads');
+  mkdirSync(dir, { recursive: true });
+  const input = path.join(dir, 'recent-input.pdf');
+  writeFileSync(input, '%PDF-1.4 just written');
+  const unused = path.join(dir, 'never-written.pdf');
+  const written = path.join(dir, 'written.txt');
+  const ran = await withToolOutputContext({ sessionId: session.id, sourceUserSeq: source.seq }, () => invokeShell({
+    command: `IN="${input}"; NOPE="${unused}"; OUT="${written}"; cat "$IN" | wc -c; ls -la "$IN"; cp "$IN" "$OUT"`,
+    cwd: tmpHome,
+  }));
+  assert.match(String(ran), /exit_code: 0/, String(ran));
+  let saved = listEvents(session.id, { types: ['deliverable_saved'] });
+  for (let attempt = 0; saved.length === 0 && attempt < 100; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+    saved = listEvents(session.id, { types: ['deliverable_saved'] });
+  }
+  await new Promise(resolve => setTimeout(resolve, 50));
+  saved = listEvents(session.id, { types: ['deliverable_saved'] });
+  assert.deepEqual(saved.map((event) => event.data.name), ['written.txt'],
+    'only the file the command wrote; the input it read and the path it never wrote are not saved');
 });
 
 // ── Credential reads are refused, never carded (owner rule 2026-08-07) ──
