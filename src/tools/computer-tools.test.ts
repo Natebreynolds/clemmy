@@ -524,12 +524,54 @@ test('shellWriteLeadPaths: a relative redirect after an in-command cd resolves a
     "mkdir -p /tmp/deliver-test && cd /tmp/deliver-test && cat > profile.md <<'EOF'\ncontent\nEOF",
     '/spawn/cwd',
   );
-  assert.equal(leads.length, 1, 'one redirect target');
   assert.deepEqual(leads[0], ['/spawn/cwd/profile.md', '/tmp/deliver-test/profile.md'],
-    'both bases are candidates, spawn cwd first, cd target second');
+    'the redirect target comes first; both bases are candidates, spawn cwd first, cd target second');
+  assert.ok(!leads.some((lead) => lead.some((candidate) => candidate.includes('content'))), 'heredoc text is not an argument');
   // Absolute targets need no base juggling.
   const absolute = shellWriteLeadPaths('echo hi > /tmp/out.md', '/spawn/cwd');
   assert.deepEqual(absolute[0], ['/tmp/out.md']);
+});
+
+test('shellWriteLeadPaths: a file written through a variable or an output flag is a lead; a stderr log is not', async () => {
+  const { shellWriteLeadPaths } = await import('./computer-tools.js');
+  const home = os.homedir();
+  // The live 2026-10-09 shape: a PDF printed to a path held in a variable.
+  const leads = shellWriteLeadPaths(
+    'OUT="$HOME/Downloads/slide-7.pdf"; rm -f "$OUT"; "/Applications/Some Browser.app/Contents/MacOS/Some Browser" '
+      + '--headless=new --print-to-pdf="$OUT" file:///tmp/slide7.html 2>/tmp/browser.err; ls -la "$OUT"',
+    '/spawn/cwd',
+  ).flat();
+  assert.ok(leads.includes(path.join(home, 'Downloads', 'slide-7.pdf')), JSON.stringify(leads));
+  assert.ok(!leads.includes('/tmp/browser.err'), 'a stderr log is not a deliverable');
+  assert.ok(!leads.some((lead) => lead.includes('file:')), 'a URL is not a path');
+  const forms = shellWriteLeadPaths(
+    "export DIR='/tmp/out dir'; NAME=report; cp notes.md \"${DIR}/$NAME.md\" && tool -o result.json",
+    '/spawn/cwd',
+  ).flat();
+  assert.ok(forms.includes('/tmp/out dir/report.md'), JSON.stringify(forms));
+  assert.ok(forms.includes('/spawn/cwd/result.json'));
+  assert.deepEqual(shellWriteLeadPaths('make build 2>&1', '/spawn/cwd'), []);
+});
+
+test('a file a shell command writes through a variable is recorded as saved; its stderr log is not', async () => {
+  const { createSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const session = createSession({ kind: 'chat', title: 'shell deliverable' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Save it as a file.' } });
+  const out = path.join(tmpHome, 'deliver', 'slide.txt');
+  const log = path.join(tmpHome, 'deliver', 'tool.err');
+  const ran = await withToolOutputContext({ sessionId: session.id, sourceUserSeq: source.seq }, () => invokeShell({
+    command: `mkdir -p "${path.dirname(out)}" && OUT="${out}"; printf 'slide text' | tee "$OUT" >/dev/null 2>"${log}"`,
+    cwd: tmpHome,
+  }));
+  assert.match(String(ran), /exit_code: 0/, String(ran));
+  let saved = listEvents(session.id, { types: ['deliverable_saved'] });
+  for (let attempt = 0; saved.length === 0 && attempt < 100; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+    saved = listEvents(session.id, { types: ['deliverable_saved'] });
+  }
+  assert.deepEqual(saved.map((event) => event.data.name), ['slide.txt'], 'the written file, not its stderr log');
+  assert.equal(saved[0]?.data.sourceUserSeq, source.seq);
 });
 
 // ── Credential reads are refused, never carded (owner rule 2026-08-07) ──

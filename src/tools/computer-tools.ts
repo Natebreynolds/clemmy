@@ -911,27 +911,71 @@ function tokenResolvesToSkillArtifact(token: string, cwd: string): boolean {
   return Boolean(resolved && isInstalledSkillArtifactPath(resolved));
 }
 
+/** The command without heredoc bodies: their text is data, not arguments. */
+function withoutHeredocBodies(command: string): string {
+  return command.replace(/<<-?[^\S\n]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1([^\n]*)\n[\s\S]*?\n[^\S\n]*\2[^\S\n]*(?=\n|$)/g,
+    (_whole, _quote: string, tag: string, rest: string) => `<<${tag}${rest}`);
+}
+
+function expandSameCommandVariables(token: string, variables: ReadonlyMap<string, string>): string {
+  return token.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (whole, braced?: string, bare?: string) => variables.get((braced ?? bare)!) ?? whole);
+}
+
+/** `NAME=value` assignments the command makes, in order; each value is
+ *  expanded with the assignments before it. */
+function sameCommandVariables(command: string): Map<string, string> {
+  const variables = new Map<string, string>();
+  for (const match of command.matchAll(/(?:^|[;&|\n(][^\S\n]*|\bexport[^\S\n]+)([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s;&|)]*))/g)) {
+    const value = match[3] !== undefined ? match[3] : expandSameCommandVariables(match[2] ?? match[4] ?? '', variables);
+    variables.set(match[1]!, value);
+  }
+  return variables;
+}
+
+const pathLikeArgument = (value: string): boolean => Boolean(value)
+  && !value.startsWith('-')
+  && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(value)
+  && !value.includes('://')
+  && value.length <= 1024
+  && (/[\\/]/.test(value) || /\.[A-Za-z0-9]{1,8}$/.test(value));
+
 /**
- * Deliverable LEADS for a completed shell command: per redirect target, the
- * candidate absolute paths it may have written, in resolution-priority order.
- * A relative redirect after an in-command `cd` resolves against the cd'ed
- * directory, not the spawn cwd (live 2026-08-05: `cd DIR && cat > profile.md`
- * wrote seven files the feed never saw). Pure — the caller's existence +
- * fresh-mtime check is what turns a lead into a deliverable, so a wrong base
- * simply finds nothing.
+ * Deliverable LEADS for a completed shell command: per path the command names,
+ * the candidate absolute paths it may have written, in resolution-priority
+ * order. Redirect targets come first, then paths named as arguments (an output
+ * flag's value, a copy's destination, a variable set earlier in the same
+ * command), so a file written through `OUT=…; tool --out="$OUT"` is found. A
+ * stderr redirect (`2>`) is a log, not a deliverable. A relative path after an
+ * in-command `cd` resolves against the cd'ed directory, not the spawn cwd
+ * (live 2026-08-05: `cd DIR && cat > profile.md` wrote seven files the feed
+ * never saw). Pure: the caller's existence and fresh-mtime check is what turns
+ * a lead into a deliverable, so a file the command only read is never one.
  */
 export function shellWriteLeadPaths(command: string, cwd: string): string[][] {
-  const cdBases = [...command.matchAll(/(?:^|&&|;|\|)\s*cd\s+(['"]?)(\/[^'"\s;&|]+)\1/g)]
+  const body = withoutHeredocBodies(command);
+  const cdBases = [...body.matchAll(/(?:^|&&|;|\|)\s*cd\s+(['"]?)(\/[^'"\s;&|]+)\1/g)]
     .map((m) => m[2])
     .slice(0, 4);
   const bases = [cwd, ...cdBases];
-  return outputRedirectionTargets(command).slice(0, 10).map((token) => {
+  const variables = sameCommandVariables(body);
+  const expand = (token: string) => expandSameCommandVariables(token, variables);
+  const errorLogs = new Set([...body.matchAll(/(?:^|[\s;&|])2>>?[^\S\n]*(['"]?)([^'"\s;&|]+)\1/g)]
+    .map((m) => expand(m[2]!)));
+  const named = tokenizeShell(body)
+    .map((token) => (/^-[^=]*=/.test(token) ? token.slice(token.indexOf('=') + 1) : token))
+    .filter(pathLikeArgument);
+  const assigned = [...variables.values()].filter(pathLikeArgument);
+  const tokens = [...new Set([...outputRedirectionTargets(body).slice(0, 10), ...named, ...assigned].map(expand))]
+    .filter((token) => !errorLogs.has(token))
+    .slice(0, 24);
+  return tokens.flatMap((token) => {
     const candidates: string[] = [];
     for (const base of bases) {
       const resolved = resolveShellPathToken(token, base);
       if (resolved && !candidates.includes(resolved)) candidates.push(resolved);
     }
-    return candidates;
+    return candidates.length > 0 ? [candidates] : [];
   });
 }
 
