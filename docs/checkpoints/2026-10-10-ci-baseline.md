@@ -96,9 +96,13 @@ fan-out on an affirmed follow-up is wanted; if it is, the fix is in how
 At 9,412 of 21,284 tests the detached run has 7 failures: the orchestrator
 fan-out case (§2b), the two Discord queued-wording pins (PR-15), the
 cutover-hold closure (§2a), the descendant-process case (§2a, intermittent), the
-memory fast-tier attribution (PR-14), and one not yet classified:
+memory fast-tier attribution (PR-14), and
 `src/runtime/graph/turn-graph-semantics.test.ts` · "a participated failed admission stays graphless and commits a
-blocked zero-tool terminal". Run it alone before classifying.
+blocked zero-tool terminal", which fails alone too: the blocked zero-tool terminal
+reads "The next step is blocked, so this request is still unfinished. Ask me to
+check the capability details and any completed work for this exact request
+before continuing." (`:`), the same fixed-sentence-with-an-instruction
+family as the respond-bridge cases. Real; PR-15.
 
 ## 3. What the classes mean
 
