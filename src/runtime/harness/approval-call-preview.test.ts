@@ -181,7 +181,7 @@ const outlookCall = (slug: string, args: Record<string, unknown>) => ({
 
 test('opaque ids, flags and type tags are folded as details; what the owner approves stays in view', () => {
   const preview = approvalCallPreview(outlookCall('OUTLOOK_ADD_MAIL_ATTACHMENT', {
-    message_id: MESSAGE_ID, user_id: 'me', attachment: '/Users/owner/Downloads/team-legal-q4-slide7.png',
+    message_id: MESSAGE_ID, user_id: 'me', attachment: '/Users/example/Downloads/team-legal-q4-slide7.png',
     name: 'slide7.png', odata_type: '#microsoft.graph.fileAttachment', contentType: 'image/png', isInline: false,
   }) as never)!;
   const detail = Object.fromEntries(preview.fields.map((field) => [field.name, field.detail === true]));
@@ -224,7 +224,7 @@ test('the public card carries the folds and a file name up to the card\'s own la
       operation: 'Add Outlook mail attachment',
       fields: [
         { name: 'message_id', value: MESSAGE_ID, detail: true },
-        { name: 'attachment', value: '/Users/owner/Board/x.pdf', label: longLabel },
+        { name: 'attachment', value: '/Users/example/Board/x.pdf', label: longLabel },
         { name: 'updates', value: '[{"a":1}]', display: 'Here is the pack.' },
       ],
     } },

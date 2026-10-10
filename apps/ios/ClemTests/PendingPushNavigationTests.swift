@@ -323,7 +323,7 @@ final class PinnedWebNavigationPolicyTests: XCTestCase {
             // The general policy remains closed to top navigation and popups.
             XCTAssertEqual(disposition(raw, userInitiated: true), .cancel)
         }
-        for raw in ["about:blank", "about:srcdoc#other", "blob:null/8533143e-ef28-4997-b96f-759e9f6e3260", "blob:https://evil.example/8533143e-ef28-4997-b96f-759e9f6e3260", "blob:https://relay.example.test:53028/8533143e-ef28-4997-b96f-759e9f6e3260", "blob:https://192.168.1.11:43117/not-a-blob", "blob:https://user:password@192.168.1.11:43117/8533143e-ef28-4997-b96f-759e9f6e3260", "data:text/html,hello"] {
+        for raw in ["about:blank", "about:srcdoc#other", "blob:null/8533143e-ef28-4997-b96f-759e9f6e3260", "blob:https://evil.example/8533143e-ef28-4997-b96f-759e9f6e3260", "blob:https://relay.example.test:53028/8533143e-ef28-4997-b96f-759e9f6e3260", "blob:https://192.168.1.11:43117/not-a-blob", "blob:https://user:placeholder@192.168.1.11:43117/8533143e-ef28-4997-b96f-759e9f6e3260", "data:text/html,hello"] {
             XCTAssertFalse(PinnedWebNavigationPolicy.allowsArtifactPreview(for: try XCTUnwrap(URL(string: raw)), pairing: pairing, mainDocumentURL: page, sourceOrigin: origin, targetIsMainFrame: false), raw)
         }
         var unpinned = pairing

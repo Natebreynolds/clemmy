@@ -26,7 +26,7 @@ function probes(overrides: Partial<import('./computer-access.js').ComputerAccess
     calls,
     probes: {
       platform: 'darwin' as NodeJS.Platform,
-      homedir: '/Users/owner',
+      homedir: '/Users/example',
       openForRead: () => undefined,
       listFolder: async () => [],
       run: async (command: string, args: readonly string[]) => { calls.push({ command, args }); return ''; },
@@ -41,7 +41,7 @@ test('macOS Full Disk Access is read from the privacy database without any promp
   const granted = probes({ openForRead: (file) => { opened = file; } });
   assert.deepEqual(await access.computerAccessStatus(granted.probes, { choice: 'full', chosen: true }),
     { choice: 'full', chosen: true, platform: 'mac', mac: { fullDiskAccess: 'granted' } });
-  assert.equal(opened, '/Users/owner/Library/Application Support/com.apple.TCC/TCC.db');
+  assert.equal(opened, '/Users/example/Library/Application Support/com.apple.TCC/TCC.db');
   const refused = probes({ openForRead: () => { throw fault('EPERM'); } });
   assert.equal((await access.computerAccessStatus(refused.probes, { choice: 'standard', chosen: false })).mac?.fullDiskAccess, 'not_granted');
   const odd = probes({ openForRead: () => { throw fault('ENOENT'); } });
@@ -59,9 +59,9 @@ test('asking for the protected folders lists each once and reports what macOS an
     },
   });
   assert.deepEqual(await access.requestMacFolderAccess(mac.probes), [
-    { label: 'Desktop', folder: '/Users/owner/Desktop', state: 'allowed' },
-    { label: 'Documents', folder: '/Users/owner/Documents', state: 'denied' },
-    { label: 'Downloads', folder: '/Users/owner/Downloads', state: 'missing' },
+    { label: 'Desktop', folder: '/Users/example/Desktop', state: 'allowed' },
+    { label: 'Documents', folder: '/Users/example/Documents', state: 'denied' },
+    { label: 'Downloads', folder: '/Users/example/Downloads', state: 'missing' },
   ]);
   assert.equal(listed.length, 3);
   assert.deepEqual(await access.requestMacFolderAccess(probes({ platform: 'win32' }).probes), [], 'nothing to ask on Windows');

@@ -30,7 +30,7 @@ async function fileQuery(file: string, query: string): Promise<string> {
 test('file_query refuses a credential file and never returns its contents', async () => {
   const envFile = path.join(HOME, 'project', '.env');
   mkdirSync(path.dirname(envFile), { recursive: true });
-  writeFileSync(envFile, 'STRIPE_SECRET_KEY=sk_live_abcdefghijklmnop1234\nDATABASE_URL=postgres://user:pass@db/app\n');
+  writeFileSync(envFile, 'STRIPE_SECRET_KEY=sk_live_abcdefghijklmnop1234\nDATABASE_URL=postgres://user:pass@db.example/app\n');
   const out = await fileQuery(envFile, 'stripe secret key');
   assert.match(out, /credential material/);
   assert.doesNotMatch(out, /sk_live_abcdefghijklmnop1234|postgres:\/\/user:pass/);
