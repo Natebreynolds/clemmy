@@ -1,6 +1,6 @@
-# PR-15 — The last fixed host sentences, and three stale pins
+# PR-15 — The last fixed host sentences, and the stale pins behind them
 
-Size S · risk low · depends on PR-00 (baseline) · the owner's 3.18.33 rule, finished
+Size S · risk low · depends on PR-00 (baseline) · the owner's 3.18.33 rule, finished · clears eight baseline failures
 
 ## Why
 
@@ -29,7 +29,7 @@ sessions persisted on it".
 | File · case | Pinned | Current, intended |
 |---|---|---|
 | `loop-structured-output-guard.test.ts` · "parse error with no recoverable text → safe fallback string" and "parse recovery does not reuse stale assistant text" | `/couldn't be structured/` (the sentence `turn-decision.ts` now keeps only as `LEGACY_STRUCTURED_OUTPUT_RECOVERY_FALLBACK` for historical rows) | `STRUCTURED_OUTPUT_RECOVERY_FALLBACK` = "Clementine couldn't prepare a usable reply. Ask me to check what completed and what remains before continuing." |
-| `claude-agent-brain.test.ts` · the two "prepared workflow batch / handoff" cases | "Started — I'll post the result here when it's ready." | "Queued — waiting for the workflow to start. I'll post the result here when it's ready." (`public-presentation.ts:608`; the 10-07 checkpoint records this wording change and that one pin was updated, not this one) |
+| `claude-agent-brain.test.ts` · the two "prepared workflow batch / handoff" cases; `discord-harness-terminal.test.ts` · "provider replied means dispatch ACK delivered…"; `discord-harness.test.ts` · "async dispatch releases only its exact placeholder…" | "Started — I'll post the result here when it's ready." | "Queued — waiting for the workflow to start. I'll post the result here when it's ready." (`public-presentation.ts:608`; the 10-07 checkpoint records this wording change and that one pin was updated, not these four) |
 
 ## Change
 
@@ -48,8 +48,8 @@ sessions persisted on it".
    saved claim (the test's exact assertions). If the owner would rather retire
    the SDK lane than fix it, the lane's tests move to `.legacy` and the lane is
    documented as frozen; either way the baseline stops carrying the failure.
-3. **Move the three stale pins** to the intended sentences. Do not change the
-   sentences.
+3. **Move the six stale pins** (two structured-output, four queued-workflow
+   wording) to the intended sentences. Do not change the sentences.
 4. **One place for the fixed sentences that remain.** `turn-decision.ts` already
    holds `MISSING_REPLY_USER_FALLBACK`, `STRUCTURED_OUTPUT_RECOVERY_FALLBACK` and
    `STALLED_WORK_USER_FALLBACK`; the respond-bridge sentences join them so a
@@ -61,13 +61,14 @@ sessions persisted on it".
 
 - `src/runtime/harness/respond-bridge.ts`, `turn-decision.ts`
 - `src/runtime/harness/respond-bridge-one-gate-wiring.test.ts`,
-  `loop-structured-output-guard.test.ts`, `claude-agent-brain.test.ts`
+  `loop-structured-output-guard.test.ts`, `claude-agent-brain.test.ts`,
+  `src/channels/discord-harness-terminal.test.ts`, `src/channels/discord-harness.test.ts`
 - the SDK-brain terminal path for pending capture (`claude-agent-brain.ts`
   around the `memory_signals_captured` → terminal verdict)
 
 ## Tests
 
-- The six baseline cases above go green; the two ownerless cases assert on the
+- The eight baseline cases above go green; the two ownerless cases assert on the
   regex they already carry (`/ask me|continue|retry|resume/i`).
 - New: a stalled terminal **with** an owner conversation and a reachable model
   yields Clem's words (fixture model returns a sentence) and the factual sentence
@@ -77,7 +78,7 @@ sessions persisted on it".
 
 ## Done when
 
-The six cases leave `docs/checkpoints/2026-10-10-ci-baseline.md`; a workflow-owned
+The eight cases leave `docs/checkpoints/2026-10-10-ci-baseline.md`; a workflow-owned
 fixture session that stalls ends with a factual sentence and no instruction;
 and no production path outside `turn-decision.ts` carries a fixed sentence that
 addresses the owner.
