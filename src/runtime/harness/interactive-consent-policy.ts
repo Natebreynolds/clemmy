@@ -287,7 +287,7 @@ export interface EvaluateInteractiveConsentInputV1 {
    * of change was approved before. Local work is never gated by the mode.
    */
   mode?: 'auto' | 'ask';
-  /** Ask mode only: the owner already approved this operation once. */
+  /** The owner already approved this kind of change once (read in both modes since 2026-10-06). */
   learnedExternalWrite?: boolean;
   /** The call runs inside a published workflow's step session. */
   workflowApproval?: boolean;

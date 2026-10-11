@@ -206,6 +206,8 @@ type Evaluation =
 function evaluateGeneratedCreate(input: {
   manifest: CapabilityManifestV1;
   cohort: readonly CapabilityManifestV1[];
+  /** The owner already approved this kind of change once. */
+  learnedExternalWrite?: boolean;
 }): Evaluation {
   const manifest = input.manifest;
   const destination = {
@@ -276,11 +278,12 @@ function evaluateGeneratedCreate(input: {
       readiness: { kind: 'ready' },
       crossing: 'not_started',
       reservationAlreadyClaimed: false,
+      ...(input.learnedExternalWrite ? { learnedExternalWrite: true } : {}),
     }),
   };
 }
 
-test('generated exact reversible creates stay card-free under catalog-order permutations', () => {
+test('generated exact reversible creates ask once per kind, then stay card-free, under catalog-order permutations', () => {
   const manifests = Array.from({ length: 6 }, (_, index) => generatedManifest(index + 1));
   for (let rotation = 0; rotation < manifests.length; rotation += 1) {
     const ordered = [
@@ -288,7 +291,18 @@ test('generated exact reversible creates stay card-free under catalog-order perm
       ...manifests.slice(0, rotation),
     ];
     for (const manifest of manifests) {
-      assert.deepEqual(evaluateGeneratedCreate({ manifest, cohort: ordered }), {
+      // A connected-app change asks the first time in either mode, and the
+      // owner's approval teaches the kind (owner 2026-10-06).
+      const first = evaluateGeneratedCreate({ manifest, cohort: ordered });
+      assert.equal(first.status, 'consent_decision');
+      if (first.status === 'consent_decision') {
+        assert.equal(first.decision.kind, 'needs_user');
+        if (first.decision.kind === 'needs_user') {
+          assert.equal(first.decision.need, 'approval');
+          assert.equal(first.decision.teaches, 'external_write_kind');
+        }
+      }
+      assert.deepEqual(evaluateGeneratedCreate({ manifest, cohort: ordered, learnedExternalWrite: true }), {
         status: 'consent_decision',
         decision: {
           kind: 'proceed',
@@ -333,15 +347,16 @@ test('incomplete, irreversible, and destructive creates retain stops; exact sele
     destination: { family: 'artifact:generated', posture: 'named_existing' },
   });
 
+  // A learned kind never lifts these stops.
   for (const manifest of [missing, namedExisting, irreversible, destructive]) {
-    const evaluated = evaluateGeneratedCreate({ manifest, cohort: [manifest] });
+    const evaluated = evaluateGeneratedCreate({ manifest, cohort: [manifest], learnedExternalWrite: true });
     assert.equal(evaluated.status, 'consent_decision');
     if (evaluated.status !== 'consent_decision') continue;
     assert.equal(evaluated.decision.kind, 'needs_user');
     if (evaluated.decision.kind !== 'needs_user') continue;
     assert.equal(evaluated.decision.need, 'approval');
   }
-  const bounded = evaluateGeneratedCreate({ manifest: carrierBounded, cohort: [carrierBounded] });
+  const bounded = evaluateGeneratedCreate({ manifest: carrierBounded, cohort: [carrierBounded], learnedExternalWrite: true });
   assert.equal(bounded.status, 'consent_decision');
   if (bounded.status === 'consent_decision') {
     assert.equal(bounded.decision.kind, 'proceed');
@@ -363,8 +378,8 @@ test('incomplete, irreversible, and destructive creates retain stops; exact sele
     },
   });
   assert.deepEqual(
-    evaluateGeneratedCreate({ manifest: ambiguous, cohort: [sibling, ambiguous] }),
-    evaluateGeneratedCreate({ manifest: ambiguous, cohort: [ambiguous] }),
+    evaluateGeneratedCreate({ manifest: ambiguous, cohort: [sibling, ambiguous], learnedExternalWrite: true }),
+    evaluateGeneratedCreate({ manifest: ambiguous, cohort: [ambiguous], learnedExternalWrite: true }),
   );
   // Removing the selected manifest cannot silently substitute its sibling.
   assert.equal(

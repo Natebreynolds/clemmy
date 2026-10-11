@@ -79,6 +79,7 @@ const innerDispatch = await import('../tools/inner-dispatch.js');
 const composioSchemas = await import('../tools/composio-schema-cache.js');
 const composioClient = await import('../integrations/composio/client.js');
 const composioTools = await import('../tools/composio-tools.js');
+const planScope = await import('../agents/plan-scope.js');
 const composioProviderIdentity = await import('../integrations/composio/provider-definition-identity.js');
 const operationEffects = await import('../integrations/composio/learned-operation-effect.js');
 
@@ -902,6 +903,18 @@ test('balanced ordinary-channel corpus has only real typed user stops', { timeou
       prompt: `Create one resource with unavailable ${generatedToken(990).toLowerCase()} credentials.`,
     },
   ];
+  // A connected-app change asks the first time in either mode and the owner's
+  // approval teaches its kind (owner 2026-10-06). The ordinary create and the
+  // uncertain create stand for kinds the owner already approved; the
+  // irreversible publish keeps its own stop whatever was learned.
+  for (const corpusCase of cases) {
+    if (corpusCase.kind !== 'create' && corpusCase.kind !== 'uncertain') continue;
+    planScope.recordApprovedWriteKind({
+      operationId: corpusCase.fixture!.manifest.operationId,
+      accountId: corpusCase.fixture!.manifest.accountId,
+      approvalId: `fixture-approval-${corpusCase.kind}`,
+    });
+  }
   const questionCounts: number[] = [];
   const observations: Array<{ rotation: number; kind: CaseKind; observation: NormalizedObservation }> = [];
 
