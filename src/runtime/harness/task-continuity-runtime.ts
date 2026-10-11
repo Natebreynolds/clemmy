@@ -1687,6 +1687,22 @@ function consumeContinuationContext(input: {
   });
 }
 
+/**
+ * The accepted source is a checked strategic meta choice ("explain" or
+ * "customize") on the open question: an admitted typed meta action, a visible
+ * option whose intent matches it, and this source the next real one after
+ * the question. Such a choice keeps the question open on purpose until Clem's
+ * follow-up supersedes it, so the planning prime must let its turn run
+ * rather than refuse it as an unresolved continuation (refused since 08-31,
+ * so every live customize or explain choice ended "could not load the
+ * capability catalog"). Arbitrary prose never qualifies.
+ */
+export function acceptedSourceIsVerifiedMetaChoice(input: { sessionId: string; sourceUserSeq: number }): boolean {
+  const typed = typedClassificationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
+  if (!typed || !('keepOpen' in typed) || !typed.metaAction) return false;
+  return verifiedMetaContinuationInput({ ...input, typed }) !== null;
+}
+
 function verifiedMetaContinuationInput(input: {
   sessionId: string;
   sourceUserSeq: number;

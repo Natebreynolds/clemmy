@@ -509,22 +509,57 @@ test('literal B opens one bundled customization slot; details resume the origina
   assert.match(stillOpen.semanticTaskInput ?? '', /\[meta-action\]\ncustomize/);
   assertNoBusinessIo(session.id);
 
-  const customizationPacket = await askThroughHost({
+  // "B" runs through the production entry (runConversation), not runTurn
+  // directly: its planning prime refused every checked meta choice as an
+  // unresolved continuation from 08-31 until 10-10, and only this entry
+  // reaches it. The meta choice keeps the question open on purpose; Clem's
+  // follow-up question supersedes it with the customization slot.
+  const { runConversation } = await import('../runtime/harness/loop.js');
+  let customizeCalls = 0;
+  let sawMetaSteer = false;
+  const customizeModel = {
+    async getResponse(request: unknown) {
+      customizeCalls += 1;
+      sawMetaSteer = /\[task-continuation-meta:v1\]/.test(JSON.stringify(request));
+      return {
+        responseId: `northstar-customize-bundle-${customizeCalls}`,
+        output: [functionCall(`northstar-customize-bundle-${customizeCalls}`, 'ask_user_question', {
+          question: CUSTOM_QUESTION, options: [], purpose: 'clarification',
+        })],
+      };
+    },
+    getStreamedResponse: modelStream,
+  };
+  const noExternalWork = { authority: 'none' as const, reason: 'strategy question performs no external work',
+    allowedServerSlugs: [], toolPatterns: [], maxTools: 0 };
+  const outcomeB = await runConversation({
     sessionId: session.id,
-    source: b,
-    userInput: 'B',
-    semanticSteer: stillOpen.semanticTaskInput,
-    question: CUSTOM_QUESTION,
-    options: [],
-    history: [
-      { type: 'message', role: 'user', content: PROMPT },
-      { type: 'message', role: 'assistant', content: QUESTION },
-      { type: 'message', role: 'user', content: 'B' },
-    ],
-    callId: 'northstar-customize-bundle',
-    expectedMetaAction: 'customize',
-  });
-  assert.ok(customizationPacket);
+    input: 'B',
+    sourceUserSeq: b.seq,
+    reuseRecordedUserInput: true,
+    turnEngine: 'host_v1',
+    maxSteps: 1, maxTurns: 2, toolCallsPerTurn: 2,
+    judgeCompletion: false,
+    suppressMemoryCapture: true,
+    semanticTaskInput: stillOpen.semanticTaskInput,
+    continuationSteer: stillOpen.semanticTaskInput,
+    mcpToolScope: noExternalWork as never,
+    buildAgent: async ({ sourceUserSeq, hostFreshPlanning }: { sourceUserSeq: number; hostFreshPlanning?: unknown }) => buildOrchestratorAgent({
+      userInput: 'B', sessionId: session.id, sourceUserSeq, hostFreshPlanning: hostFreshPlanning as never,
+      allowedToolNames: ['ask_user_question'], allowToolJit: true, mcpToolScope: noExternalWork as never,
+      model: customizeModel as never,
+    }),
+  } as never) as { status?: string; error?: unknown };
+  assert.notEqual(outcomeB.status, 'blocked', JSON.stringify(outcomeB));
+  assert.equal(customizeCalls, 1, 'the meta choice runs one model step');
+  assert.equal(sawMetaSteer, true, 'the model is told this is a customize choice on the open question');
+  assert.deepEqual(eventlog.listEvents(session.id, { types: ['primary_model_planning_prime_refused'] }), [],
+    'a checked meta choice is not refused as an unresolved continuation');
+  const afterB = taskContinuity.peekTaskContinuityPacket({ sessionId: session.id });
+  const customizationPacket = afterB.status === 'available' && afterB.packet.originatingSourceUserSeq === b.seq ? afterB.packet : null;
+  assert.ok(customizationPacket, JSON.stringify(afterB));
+  assert.equal(customizationPacket.pause.slot?.slotKey, taskContinuity.CUSTOMIZATION_SLOT_KEY);
+  assert.equal(customizationPacket.pause.slot?.questionId, taskContinuity.customizationQuestionId(b.seq));
   const linked = customizationPacket as typeof customizationPacket & {
     rootSourceUserSeq?: number;
     parentPacketId?: string;

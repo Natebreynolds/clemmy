@@ -72,6 +72,7 @@ import {
   turnGraphFromShadowEvent,
 } from '../graph/turn-graph-shadow.js';
 import {
+  acceptedSourceIsVerifiedMetaChoice,
   continuationInheritsParentCapabilities,
   rehydrateConsumedClarificationContext,
   verifyDurableClarificationContext,
@@ -2155,7 +2156,9 @@ export async function primePrimaryModelPlanningCatalog(input: {
     }
     if (!durableContinuation) {
       const pending = peekTaskContinuityPacket({ sessionId: input.sessionId });
-      if (pending.status !== 'none') {
+      // A checked meta choice keeps the question open until Clem's follow-up
+      // supersedes it; that is the one unresolved continuation whose turn runs.
+      if (pending.status !== 'none' && !acceptedSourceIsVerifiedMetaChoice(input)) {
         return refuse('accepted_source_continuation', 'durable accepted-source continuation is unresolved');
       }
     }
