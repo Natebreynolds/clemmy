@@ -12,6 +12,7 @@ import {
   type McpToolScope,
 } from '../runtime/mcp-tool-scope.js';
 import {
+  externalMcpDefinitionDriftAt,
   getOrCreateExternalMcpServers,
   resolveAuthorizedExternalMcpToolDefinition,
 } from '../runtime/mcp-servers.js';
@@ -2479,11 +2480,14 @@ export function buildAuthorizedToolSearchCandidateSources(
         }
       }
       const server = getOrCreateExternalMcpServers(mcpToolDiscoveryScope(scope));
-      // Search is the recovery path after an exact invocation detects drift
-      // (an exact name that no longer resolves): refresh this namespace view
-      // then, and otherwise at most once a minute; a remote server's listing
-      // costs seconds and rarely changes between searches.
-      const relist = Boolean(exactOperation) || Date.now() - lastExternalMcpListedAt > EXTERNAL_MCP_LIST_FRESH_MS;
+      // Search is the recovery path after an exact invocation detects drift:
+      // refresh this namespace view for an exact name, after any drift proven
+      // since the last listing (the recovery search is usually plain words,
+      // not the retired name), and otherwise at most once a minute; a remote
+      // server's listing costs seconds and rarely changes between searches.
+      const relist = Boolean(exactOperation)
+        || externalMcpDefinitionDriftAt() >= lastExternalMcpListedAt
+        || Date.now() - lastExternalMcpListedAt > EXTERNAL_MCP_LIST_FRESH_MS;
       if (relist) await server.invalidateToolsCache();
       const tools = await server.listTools();
       if (relist) lastExternalMcpListedAt = Date.now();

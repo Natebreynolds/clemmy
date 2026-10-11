@@ -8,6 +8,7 @@
  * fails closed and retires authority previously selected for the requirement.
  */
 import type { CapabilityCarrierKind, CapabilityOperationRow } from '../../memory/capability-index.js';
+import { noteExternalMcpDefinitionDrift } from '../mcp-servers.js';
 import { listCapabilityOperationsForCarrier } from '../../memory/capability-index.js';
 import type { ManagedMcpServer } from '../../types.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
@@ -819,6 +820,9 @@ export function createProductionLiveReadAcquisitionRegistry(
       if (current && store.revoke(id)) retired.add(id);
       else if (!current) retired.add(id);
     }
+    // A fresh observation proved these reads gone: the next search relists
+    // instead of reusing a listing that still advertises them (10-10).
+    if (retired.size > 0) noteExternalMcpDefinitionDrift();
     return [...retired].sort();
   };
 

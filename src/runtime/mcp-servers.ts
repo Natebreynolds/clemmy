@@ -800,6 +800,22 @@ function withoutDeniedServers(scope: McpToolScope): McpToolScope {
   };
 }
 
+let lastExternalMcpDefinitionDrift = 0;
+
+/** A connected MCP definition was proven gone or changed (an exact operation
+ *  no longer listed, or listed differently). The next search refreshes its
+ *  namespace listing instead of reusing a fresh-looking one: search is the
+ *  recovery path after drift, and a reused listing kept advertising the
+ *  retired tool for up to a minute (journey 2026-10-10, after fa2ff0a9f). */
+export function noteExternalMcpDefinitionDrift(now = Date.now()): void {
+  lastExternalMcpDefinitionDrift = Math.max(lastExternalMcpDefinitionDrift, now);
+}
+
+/** When the latest MCP definition drift was proven (0 when none). */
+export function externalMcpDefinitionDriftAt(): number {
+  return lastExternalMcpDefinitionDrift;
+}
+
 export function getOrCreateExternalMcpServers(rawScope?: McpToolScope): MCPServer {
   // The ceiling applies to EVERY caller shape, including the ones that pass
   // nothing or ask for everything — those are exactly the ones that used to
