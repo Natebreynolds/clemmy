@@ -20,7 +20,6 @@ export interface ModelScoreRowLike {
   toolTurnsLanded: number;
   fellOver: number;
   stoodIn: number;
-  billedUsd: number | null;
 }
 
 export interface ModelScorecardLike {
@@ -75,7 +74,6 @@ export function modelScoreLine(card: ModelScorecardLike | null | undefined, role
     row.cacheHitRate !== null && row.cacheHitRate >= 0.01 ? `${Math.round(row.cacheHitRate * 100)}% cached` : '',
     row.fellOver > 0 ? `fell back ${plural(row.fellOver, 'time', 'times')}` : '',
     row.stoodIn > 0 ? `stood in ${plural(row.stoodIn, 'time', 'times')}` : '',
-    row.billedUsd !== null && row.billedUsd > 0 ? `$${row.billedUsd.toFixed(2)} billed` : '',
   ].filter(Boolean);
   return `${when}${on}: ${parts.join(' · ')}`;
 }

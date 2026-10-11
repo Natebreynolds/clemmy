@@ -42,7 +42,7 @@ test('usage tallies per role and model: failures by reason, certified tokens onl
   assert.deepEqual(brain.durations.sort((a, b) => a - b), [1_000, 2_000, 4_000], 'a failed call\'s wait is not its model\'s speed');
 });
 
-test('rows join usage with route evidence, with percentiles, cache rate and billed cost only when reported', () => {
+test('rows join usage with route evidence, with percentiles and cache rate; a route row with nothing done is dropped', () => {
   const usageTallies = scorecard.mergeTallies([
     scorecard.tallyUsage([call({ durationMs: 1_000 }), call({ durationMs: 2_000 })]),
     scorecard.tallyUsage([call({ durationMs: 3_000 }), call({ durationMs: 10_000 })]),
@@ -50,8 +50,9 @@ test('rows join usage with route evidence, with percentiles, cache rate and bill
   const card = scorecard.scorecardFromTallies({
     usage: usageTallies,
     routes: [
-      { role: 'brain', modelId: 'model-a', reviewed: 4, passed: 3, toolTurns: 2, toolTurnsLanded: 2, fellOver: 1, stoodIn: 0, billedUsd: null },
-      { role: 'judge', modelId: 'model-j', reviewed: 0, passed: 0, toolTurns: 0, toolTurnsLanded: 0, fellOver: 0, stoodIn: 0, billedUsd: 0.42 },
+      { role: 'brain', modelId: 'model-a', reviewed: 4, passed: 3, toolTurns: 2, toolTurnsLanded: 2, fellOver: 1, stoodIn: 0, reportedCostUsd: null },
+      { role: 'judge', modelId: 'model-j', reviewed: 0, passed: 0, toolTurns: 0, toolTurnsLanded: 0, fellOver: 0, stoodIn: 1, reportedCostUsd: 0.42 },
+      { role: 'worker', modelId: 'model-idle', reviewed: 0, passed: 0, toolTurns: 0, toolTurnsLanded: 0, fellOver: 0, stoodIn: 0, reportedCostUsd: 0.1 },
     ],
     days: 7,
     now: new Date('2026-10-10T12:00:00.000Z'),
@@ -63,13 +64,14 @@ test('rows join usage with route evidence, with percentiles, cache rate and bill
   assert.equal(brain.cacheHitRate, 0.8);
   assert.equal(brain.reviewed, 4);
   assert.equal(brain.passed, 3);
-  assert.equal(brain.billedUsd, null);
+  assert.equal(brain.reportedCostUsd, null);
   assert.equal(brain.certified, true);
   const judge = card.rows.find((row) => row.role === 'judge')!;
   assert.equal(judge.calls, 0, 'route evidence without usage still shows, with no invented calls');
   assert.equal(judge.latencyMs, null);
   assert.equal(judge.cacheHitRate, null);
-  assert.equal(judge.billedUsd, 0.42);
+  assert.equal(judge.reportedCostUsd, 0.42);
+  assert.equal(card.rows.some((row) => row.modelId === 'model-idle'), false);
 });
 
 test('an empty home has no rows; a live read joins the ledger files and the route metrics', async () => {

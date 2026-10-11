@@ -4,7 +4,7 @@ import { modelScoreLine, modelScoreRow, type ModelScoreRowLike } from './model-s
 
 const row = (role: string, modelId: string, extra: Partial<ModelScoreRowLike> = {}): ModelScoreRowLike => ({
   role, modelId, calls: 0, failedCalls: 0, cacheHitRate: null, latencyMs: null, reviewed: 0, passed: 0,
-  toolTurns: 0, toolTurnsLanded: 0, fellOver: 0, stoodIn: 0, billedUsd: null, ...extra,
+  toolTurns: 0, toolTurnsLanded: 0, fellOver: 0, stoodIn: 0, ...extra,
 });
 
 test('one line per role, in the order a person reads it, with only what was measured', () => {
@@ -19,10 +19,10 @@ test('one line per role, in the order a person reads it, with only what was meas
   assert.equal(modelScoreLine(card, 'quick', 'model-q'), 'This week: not used.');
 });
 
-test('a share under twenty reads as a count, and a cost shows only when billed', () => {
-  const card = { window: { days: 30 }, rows: [row('worker', 'model-w', { calls: 25, reviewed: 25, passed: 24, toolTurns: 4, toolTurnsLanded: 3, billedUsd: 1.234, stoodIn: 1 })] };
+test('a share under twenty reads as a count, and a provider\'s cost figure is never shown as a charge', () => {
+  const card = { window: { days: 30 }, rows: [row('worker', 'model-w', { calls: 25, reviewed: 25, passed: 24, toolTurns: 4, toolTurnsLanded: 3, stoodIn: 1 })] };
   assert.equal(modelScoreLine(card, 'worker', 'model-w'),
-    'Last 30 days: 25 calls · 96% passed review · tools worked 3 of 4 times · stood in 1 time · $1.23 billed');
+    'Last 30 days: 25 calls · 96% passed review · tools worked 3 of 4 times · stood in 1 time');
 });
 
 test('a new home says nothing; a role that moved models names the one that ran', () => {

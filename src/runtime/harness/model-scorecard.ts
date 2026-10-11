@@ -4,12 +4,12 @@
  * Two ledgers already measure every model call: the usage ledger (calls,
  * failures, tokens, cache reads, duration, per request role) and the route
  * metrics (whether the turn's answer passed review, whether its tool calls
- * landed, fallovers, explicitly billed cost). Neither reached the owner as a
+ * landed, fallovers, provider-reported cost). Neither reached the owner as a
  * judgement about a model. This joins them per (role, model) for Settings.
  *
  * Read-only. Past days' ledger files never change, so each is read once and
  * kept by its size and mtime; today's file is re-read when it grows. No model
- * call, no estimate: cost is only what an adapter reported as billed.
+ * call, no estimate: cost is only the figure a provider reported.
  */
 import { readFile, stat } from 'node:fs/promises';
 import {
@@ -47,8 +47,10 @@ export interface ModelScoreRowV1 {
   /** Calls that fell over to another model, and calls this model took over. */
   fellOver: number;
   stoodIn: number;
-  /** Explicitly billed by the adapter; null when no call reported a cost. */
-  billedUsd: number | null;
+  /** The provider's own cost figure, summed; null when none reported one.
+   *  Not a charge: a subscription sign-in reports what the call would cost
+   *  at API prices while billing nothing per call. Never shown as billed. */
+  reportedCostUsd: number | null;
   /** False when any call's token accounting could not be certified. */
   certified: boolean;
 }
@@ -153,7 +155,7 @@ export interface RouteTally {
   toolTurnsLanded: number;
   fellOver: number;
   stoodIn: number;
-  billedUsd: number | null;
+  reportedCostUsd: number | null;
 }
 
 /** Nearest-rank percentile of a list (sorted here). */
@@ -183,6 +185,9 @@ export function scorecardFromTallies(input: {
     const role = (usage?.role ?? route?.role)!;
     const modelId = (usage?.modelId ?? route?.modelId)!;
     const durations = usage?.durations ?? [];
+    // A route row with no answered call and nothing judged is not something
+    // the model did; it never becomes "0 calls".
+    if (!usage?.calls && !route?.reviewed && !route?.toolTurns && !route?.fellOver && !route?.stoodIn) continue;
     rows.push({
       role,
       modelId,
@@ -200,7 +205,7 @@ export function scorecardFromTallies(input: {
       toolTurnsLanded: route?.toolTurnsLanded ?? 0,
       fellOver: route?.fellOver ?? 0,
       stoodIn: route?.stoodIn ?? 0,
-      billedUsd: route?.billedUsd ?? null,
+      reportedCostUsd: route?.reportedCostUsd ?? null,
       certified: (usage?.uncertifiedCalls ?? 0) === 0,
     });
   }
@@ -220,8 +225,8 @@ export function readRouteTallies(since: string): RouteTally[] {
              SUM(o.tool_success = 1) AS toolTurnsLanded,
              SUM(o.status = 'fallback') AS fellOver,
              SUM(d.source = 'fallback' AND o.status IN ('success', 'fallback')) AS stoodIn,
-             SUM(o.cost_usd) AS billed,
-             COUNT(o.cost_usd) AS billedRows
+             SUM(o.cost_usd) AS reportedCost,
+             COUNT(o.cost_usd) AS reportedCostRows
         FROM model_route_decisions d
         JOIN model_route_outcomes o ON o.decision_id = d.id
        WHERE d.created_at >= ?
@@ -236,7 +241,7 @@ export function readRouteTallies(since: string): RouteTally[] {
         reviewed: Number(row.reviewed ?? 0), passed: Number(row.passed ?? 0),
         toolTurns: Number(row.toolTurns ?? 0), toolTurnsLanded: Number(row.toolTurnsLanded ?? 0),
         fellOver: Number(row.fellOver ?? 0), stoodIn: Number(row.stoodIn ?? 0),
-        billedUsd: Number(row.billedRows ?? 0) > 0 ? Number(row.billed ?? 0) : null,
+        reportedCostUsd: Number(row.reportedCostRows ?? 0) > 0 ? Number(row.reportedCost ?? 0) : null,
       });
     }
     return tallies;

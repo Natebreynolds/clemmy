@@ -254,3 +254,11 @@ case), then PR-16 → PR-01 → PR-02 → PR-03 with PR-04 as one release. PR-08
   phone under the row's summary. The endpoints take `days=7|30`; the UI shows the week.
   Past days' ledger files are tallied once and kept by size and mtime, so a month's
   read never re-parses the whole ledger.
+- **Rule 5's premise does not hold for subscription sign-ins (found live, 10-10).** The
+  Claude adapter records the result frame's `total_cost_usd` as the call's cost, and
+  Claude reports it on an OAuth subscription too: an API-price figure, not a charge.
+  This week's route metrics carry $24 of it across the checker and brain on a home that
+  was billed nothing per call, while the BYO rows carry none. So the scorecard calls the
+  column `reportedCostUsd` and the Settings line never shows it, and before PR-03 or
+  PR-05 compare cost, the cost guard in `route-policy.ts` needs to know which accounts
+  bill per call (it currently reads Claude as costly and every BYO model as free).
