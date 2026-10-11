@@ -251,6 +251,7 @@ test('workflow_create accepts an inputs SCHEMA as a JSON string and persists it'
     inputs: JSON.stringify({ url: { type: 'string', description: 'Site to audit' } }),
   });
   assert.match(resultText(result), /Created workflow "audit-wf"/);
+  assert.match(resultText(result), /validated but NOT run/, 'a save with no creation test never reads as tested');
 
   const entry = readWorkflow('audit-wf');
   assert.ok(entry, 'workflow persisted');

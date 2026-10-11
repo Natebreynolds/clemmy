@@ -1317,9 +1317,12 @@ export function registerOrchestrationTools(server: McpServer): void {
           { before: null },
         ));
       }
+      // No read-only step means no creation test: the save is validated, never
+      // run. Say so, or a readback of the saved steps reads as "verified"
+      // (live 2026-10-10, a shell step that could never run).
       return textResult(withWorkflowCommit(
         dirName,
-        `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+        `Created workflow "${name}" — validated but NOT run: it has no read-only step to trial, so its first real run is the first check that it works. Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
         + `${appendDataSources(created.savedDef)}`
         + `${appendVisualContract(created.executionPlan)}`
         + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}`
