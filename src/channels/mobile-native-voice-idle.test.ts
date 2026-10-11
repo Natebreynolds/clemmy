@@ -20,6 +20,8 @@ const eventlog = await import('../runtime/harness/eventlog.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
 const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+const selector = await import('../runtime/harness/accepted-source-session-branch.js');
+const approvals = await import('../runtime/harness/approval-registry.js');
 
 let providerCalls = 0;
 const stateDir = path.join(fixtureHome, 'mobile');
@@ -80,7 +82,7 @@ async function finishCommand(key: string, sessionId?: string, cookie = firstDevi
   }
   assert.equal(observed.status, 200, JSON.stringify(observed.body));
   assert.equal(observed.body.state, 'answered', JSON.stringify(observed.body));
-  return { sessionId: String(response.body.sessionId), observed };
+  return { sessionId: String(response.body.sessionId), runId: String(response.body.runId), observed };
 }
 
 for (const recovering of [false, true]) {
@@ -129,6 +131,81 @@ test('native typed controls refuse before mutating the target conversation', asy
   assert.equal(eventlog.listEvents(sessionId).length, before);
 });
 
+test('native idle admission follows a stopped root to its reserved and active successor', async () => {
+  const auth = await fetch(`${base}/m/auth/status`, { headers: { cookie: firstDevice } });
+  const { deviceId } = await auth.json() as { deviceId: string };
+  const root = eventlog.createSession({ kind: 'chat', channel: 'mobile', userId: deviceId,
+    metadata: { source: 'mobile', ingressProvider: 'mobile', channelId: 'native-stopped-root', userId: deviceId } });
+  const original = eventlog.beginRunAttempt(root.id, { runId: `native-stopped-${randomUUID()}` });
+  const stoppedSource = eventlog.recordRunAttemptUserInput(original, { turn: 1, role: 'user', data: { text: 'Controlled original', runId: original.runId, attemptId: original.attemptId } });
+  const identity = { sessionId: root.id, turn: 1, sourceUserSeq: stoppedSource.seq };
+  commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'cancelled', resumable: false,
+    presentation: { kind: 'stopped', text: 'Stopped.' } });
+  eventlog.finishRunAttempt(original, 'cancelled'); HarnessSession.load(root.id)!.markStatus('cancelled');
+  const reservedRun = `native-reserved-${randomUUID()}`;
+  const reserved = selector.claimSessionForAcceptedSource({ kind: 'ordinary', requireIdle: true,
+    entrySessionId: root.id, durableSourceId: reservedRun,
+    continuity: { provider: 'mobile', scopeId: null, conversationId: 'native-stopped-root', audienceId: deviceId },
+    receipt: { requestId: reservedRun, runId: reservedRun, inputHash: 'controlled-reservation' } });
+  assert.notEqual(reserved.receipt.sessionId, root.id);
+  const counts = () => eventlog.openEventLog().prepare(`SELECT
+    (SELECT COUNT(*) FROM events) AS events, (SELECT COUNT(*) FROM sessions) AS sessions,
+    (SELECT COUNT(*) FROM harness_chat_requests) AS receipts,
+    (SELECT COUNT(*) FROM accepted_source_session_bindings) AS bindings`).get();
+  const key = randomUUID(), beforeReservation = counts();
+  const rejectedReservation = await send(key, { message: 'tasks', sessionId: root.id, async: true, voice: true, requireIdle: true });
+  assert.equal(rejectedReservation.status, 409); assert.equal(rejectedReservation.body.error, 'VOICE_REQUIRES_IDLE_CHAT');
+  assert.deepEqual(counts(), beforeReservation); assert.equal((await status(key)).status, 404);
+  const attempt = eventlog.beginRunAttempt(reserved.receipt.sessionId, { runId: reservedRun });
+  const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Controlled continuation', runId: reservedRun, attemptId: attempt.attemptId } });
+  const beforeActive = counts();
+  const rejectedActive = await send(key, { message: 'tasks', sessionId: root.id, async: true, voice: true, requireIdle: true });
+  assert.equal(rejectedActive.status, 409); assert.equal(rejectedActive.body.error, 'VOICE_REQUIRES_IDLE_CHAT');
+  assert.deepEqual(counts(), beforeActive); assert.equal(eventlog.getRunAttemptSourceUserEvent(attempt)?.seq, source.seq);
+  const doneIdentity = { sessionId: reserved.receipt.sessionId, turn: 1, sourceUserSeq: source.seq };
+  commitTurnOutcome({ version: 2, id: turnOutcomeId(doneIdentity), identity: doneIdentity, status: 'done', resumable: false,
+    presentation: { kind: 'answer', text: 'Controlled continuation finished.' } });
+  eventlog.finishRunAttempt(attempt, 'completed'); HarnessSession.load(reserved.receipt.sessionId)!.markStatus('completed');
+  await finishCommand(key, root.id);
+});
+
+test('native idle requests cannot route a waiting approval or alternate control mode before admission', async () => {
+  const { sessionId } = await finishCommand(randomUUID());
+  const approval = approvals.register({ sessionId, channel: 'mobile', subject: 'Controlled native approval',
+    tool: 'workflow_approval_gate', args: { controlled: true } });
+  const before = eventlog.listEvents(sessionId).length;
+  for (const extra of [{}, { steerOnly: true }, { taskMode: { version: 1, kind: 'plan' } }, { connectionRequestId: 'controlled-connection' }]) {
+    const key = randomUUID();
+    const refused = await send(key, { message: 'yes please', sessionId, async: true, voice: true, requireIdle: true, ...extra });
+    assert.equal(refused.status, 409, JSON.stringify(refused.body)); assert.equal(refused.body.error, 'VOICE_CONTROL_REQUIRES_CHAT');
+    assert.equal((await status(key)).status, 404);
+  }
+  assert.equal(eventlog.listEvents(sessionId).length, before);
+  assert.equal(approvals.get(approval.approvalId)?.status, 'pending');
+  assert.equal(providerCalls, 0);
+});
+
+test('an admitted native ordinary key recovers before a later approval or checkpoint while new keys are refused', async () => {
+  const key = randomUUID(), first = await finishCommand(key);
+  const approval = approvals.register({ sessionId: first.sessionId, channel: 'mobile', subject: 'Controlled replay approval',
+    tool: 'workflow_approval_gate', args: { controlled: true } });
+  eventlog.openEventLog().prepare('UPDATE sessions SET metadata_json=json_set(metadata_json, ?, json(?)) WHERE id=?')
+    .run('$.__source_approval_checkpoints', JSON.stringify({ 1: { revision: 'controlled-held', checkpoint: { serialized: 'controlled' } } }), first.sessionId);
+  const snapshot = () => ['events', 'sessions', 'run_attempts', 'harness_chat_requests', 'accepted_source_session_bindings', 'pending_approvals']
+    .map(table => eventlog.openEventLog().prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
+  const before = snapshot();
+  const replay = await send(key, { message: 'tasks', async: true, voice: true, requireIdle: true });
+  assert.equal(replay.status, 202, JSON.stringify(replay.body));
+  assert.equal(replay.body.sessionId, first.sessionId); assert.equal(replay.body.replayed, true);
+  assert.equal(replay.body.runId, first.runId);
+  assert.deepEqual(snapshot(), before, 'ordinary replay mutates neither card/checkpoint nor source/receipt/attempt state');
+  const newKey = randomUUID();
+  const refused = await send(newKey, { message: 'tasks', sessionId: first.sessionId, async: true, voice: true, requireIdle: true });
+  assert.equal(refused.status, 409); assert.equal(refused.body.error, 'VOICE_CONTROL_REQUIRES_CHAT');
+  assert.equal((await status(newKey)).status, 404); assert.equal(approvals.get(approval.approvalId)?.status, 'pending');
+  assert.deepEqual(snapshot(), before); assert.equal(providerCalls, 0);
+});
+
 test('native request status authenticates and binds missing or committed receipts to the exact device', async () => {
   const key = randomUUID();
   assert.equal((await status(key, '')).status, 401);
@@ -175,7 +252,7 @@ test('authenticated status resumes an ordinary canonical question but never an a
     eventlog.claimHarnessChatRequest({ requestId, runId, sessionId: session.id, inputHash: 'controlled-question', sinceSeq: 0 });
     const attempt = eventlog.beginRunAttempt(session.id, { runId });
     const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
-      text: 'Controlled native clarification fixture', source: 'gateway:mobile', runId,
+      text: 'Controlled native clarification fixture', source: 'gateway:mobile', runId, attemptId: attempt.attemptId,
       ...(boundary === 'source-control' ? { liveApprovalControl: { version: 1 } } : {}),
     } });
     if (boundary === 'awaiting-approval') {

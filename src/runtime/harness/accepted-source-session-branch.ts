@@ -44,7 +44,7 @@ export type AcceptedSourceSessionSelectionInput = {
    * from arbitrary parent metadata during a split. */
   validatedMount?: AcceptedSourceValidatedMount;
 } & (
-  | { kind: 'ordinary' }
+  | { kind: 'ordinary'; /** Refuse competing work instead of branching away from it. */ requireIdle?: boolean }
   | { kind: 'bound_control'; targetSessionId: string }
 );
 
@@ -118,6 +118,13 @@ interface TransactionSelection {
   selection: AcceptedSourceSessionSelection;
   createdEvent: EventRow | null;
   continuityEvent?: EventRow;
+}
+
+export class AcceptedSourceSessionIdleError extends Error {
+  constructor(readonly reason: 'busy' | 'held') {
+    super(`Accepted conversation head is ${reason}.`);
+    this.name = 'AcceptedSourceSessionIdleError';
+  }
 }
 
 const SUCCESSOR_CONTEXT_MAX_CHARS = 32_000;
@@ -749,6 +756,33 @@ function canReuseProtocolHistory(db: Database.Database, sessionId: string): bool
   }
 }
 
+/** This is an admission precondition, not a read followed by a later claim.
+ * The same IMMEDIATE transaction owns the current pointer, reservations,
+ * attempts, and approval holds until the new binding/receipt is inserted. */
+function assertOrdinaryHeadIdle(db: Database.Database, head: RawSession): void {
+  if (db.prepare(`SELECT 1 FROM run_attempts WHERE session_id = ? AND finished_at IS NULL LIMIT 1`)
+    .get(head.id) || headHasUnsettledSelection(db, head.id)) {
+    throw new AcceptedSourceSessionIdleError('busy');
+  }
+  const metadata = parseMetadata(head.metadata_json);
+  const checkpoints = metadata.__source_approval_checkpoints;
+  if (checkpoints != null && (typeof checkpoints !== 'object' || Array.isArray(checkpoints))) {
+    throw new Error('Malformed source approval checkpoint index');
+  }
+  const sourceHeld = Object.values(checkpoints ?? {}).some((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Malformed source approval checkpoint');
+    const row = value as Record<string, unknown>;
+    if (typeof row.revision !== 'string' || !row.revision || !Object.prototype.hasOwnProperty.call(row, 'checkpoint')) {
+      throw new Error('Malformed source approval checkpoint');
+    }
+    return row.checkpoint !== null;
+  });
+  if (metadata.__interrupt_state != null || sourceHeld
+    || db.prepare(`SELECT 1 FROM pending_approvals WHERE session_id = ? AND status = 'pending' LIMIT 1`).get(head.id)) {
+    throw new AcceptedSourceSessionIdleError('held');
+  }
+}
+
 function selectInTransaction(
   db: Database.Database,
   input: AcceptedSourceSessionSelectionInput,
@@ -863,6 +897,7 @@ function selectInTransaction(
     };
   }
 
+  if (input.requireIdle === true) assertOrdinaryHeadIdle(db, head);
   pointer ??= ensurePointer(db, rootSessionId, continuityKey, head.id, now);
   const reusable = head.status === 'active'
     && !headHasUnsettledSelection(db, head.id)

@@ -126,6 +126,7 @@ import {
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
 import {
+  AcceptedSourceSessionIdleError,
   claimSessionForAcceptedSource,
   resolveAcceptedSourceIngressLineage,
   sameConversationAncestorSessionIds,
@@ -4189,6 +4190,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
     let taskMode: TaskMode | undefined;
     try { taskMode = parseTaskMode(req.body?.taskMode); } catch { res.status(400).json({ error: 'INVALID_TASK_MODE' }); return; }
+    if (req.body?.requireIdle === true && (req.body?.steerOnly === true || req.body?.connectionRequestId !== undefined
+      || (taskMode && taskMode.kind !== 'normal'))) {
+      res.status(409).json({ error: 'VOICE_CONTROL_REQUIRES_CHAT' }); return;
+    }
     if (taskMode && req.body?.steerOnly === true) { res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' }); return; }
     const ctx = req.mobileSession!;
     const typedMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
@@ -4324,6 +4329,18 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           res.json({ sessionId: replay.receipt.sessionId, runId: replay.receipt.runId, reply: replay.presentation.text });
           return;
         }
+        // Recovery of an admitted ordinary native request is not a new reply
+        // to whatever approval or continuation now waits in this conversation.
+        // Return its exact durable owner before any semantic card routing or
+        // preparation/dispatch; the status endpoint reports that owner's state.
+        if (req.body?.requireIdle === true && !connectionContext
+          && (!taskMode || taskMode.kind === 'normal') && !classifyMobileTypedChatControl(message)) {
+          const attempt = getLatestRunAttemptByRunId(priorReceipt.sessionId, priorReceipt.runId);
+          res.setHeader('Idempotent-Replay', '1');
+          res.status(202).json({ accepted: true, sessionId: priorReceipt.sessionId, runId: priorReceipt.runId,
+            sinceSeq: priorReceipt.sinceSeq, ...(attempt?.sourceUserSeq ? { sourceUserSeq: attempt.sourceUserSeq } : {}), replayed: true });
+          return;
+        }
       }
       if (connectionContext) taskMode = connectionContinuationTaskMode(connectionContext);
       const connectionNeedsAdmission = connectionContext && (!priorReceipt
@@ -4363,6 +4380,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const cardWaiting = cardSessionId !== null && (Boolean(HarnessSession.load(cardSessionId)?.loadInterruptState())
         || approvalRegistry.listPending({ sessionId: cardSessionId, status: 'pending' })
           .some((row) => approvalRegistry.isFormalApprovalSurface(row) && approvalRegistry.isActionable(row)));
+      if (cardWaiting && req.body?.requireIdle === true) {
+        res.status(409).json({ error: 'VOICE_CONTROL_REQUIRES_CHAT' }); return;
+      }
       if (cardSessionId && cardWaiting) {
         const routed = await routeReplyToPendingApproval({ sessionId: cardSessionId, text: message, parsed: null })
           .catch(() => null);
@@ -4603,6 +4623,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           } else {
             const selectedClaim = claimSessionForAcceptedSource({
               kind: 'ordinary',
+              ...(req.body?.requireIdle === true ? { requireIdle: true } : {}),
               entrySessionId: proposedSessionId,
               durableSourceId: runId,
               continuity: {
@@ -4626,6 +4647,14 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           : claimOrdinaryRequest();
         if (executeIngress && rejoinPlanExecution(requestClaim.receipt)) return;
       } catch (err) {
+        if (req.body?.requireIdle === true) {
+          res.status(err instanceof AcceptedSourceSessionIdleError ? 409 : 503).json({
+            error: err instanceof AcceptedSourceSessionIdleError
+              ? err.reason === 'held' ? 'VOICE_CONTROL_REQUIRES_CHAT' : 'VOICE_REQUIRES_IDLE_CHAT'
+              : 'VOICE_IDLE_CHECK_UNAVAILABLE',
+          });
+          return;
+        }
         console.warn('mobile idempotency key conflict:', err);
         res.status(409).json({ error: 'IDEMPOTENCY_KEY_CONFLICT' });
         return;
