@@ -14,9 +14,12 @@
  *   automatic — nothing bound. Each job keeps the model it ran on before the
  *               role existed: learn / reconcile / patterns take exactly the
  *               model resolveBoundaryJudge() selects (explicit checker pins
- *               included); skills / identity / import keep today's fast-tier
- *               model string. When nothing signed in can serve that model
- *               the route is null too, and learning waits: memory work never
+ *               included); skills / identity / import take exactly the
+ *               model the owner chose to do the work. A model the owner never
+ *               chose never serves memory because it happens to be signed in
+ *               (owner, 2026-10-10: "Background memory should run on what the
+ *               user has selected"). When that model cannot be served the
+ *               route is null too, and learning waits: memory work never
  *               spends a part's tries on a model that cannot answer.
  *
  * Either way the route records its calls under route role `memory` with the
@@ -33,7 +36,7 @@
  * role registry many times, and an unscoped read parses the env file anew.
  */
 import type { Model } from '@openai/agents-core';
-import { DEFAULT_CODEX_FAST_MODEL, MODELS, getByoBackendConfig, withRuntimeConfigSnapshot } from '../config.js';
+import { withRuntimeConfigSnapshot } from '../config.js';
 import { memoryJobUsesMemoryModel, type MemoryJobId } from './memory-jobs.js';
 import {
   modelProviderLive,
@@ -51,11 +54,9 @@ import {
 } from '../runtime/harness/debate-model.js';
 import {
   checkerQuotaExhaustion,
-  debateBrainsAvailable,
   judgeCrossFamilyEnabled,
 } from '../runtime/harness/judge-family.js';
 import { resolveByoProviderForModel } from '../runtime/harness/byo-providers.js';
-import { routedPrimaryModel, type RoutedPrimaryModel } from '../runtime/harness/router-model.js';
 import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
 import { creditRefusal } from '../runtime/provider-credit.js';
 import { getRateLimitSnapshot } from '../runtime/harness/rate-limit-store.js';
@@ -140,51 +141,13 @@ function followsFor(modelId: string): 'checker' | 'brain' | null {
   return null;
 }
 
-/** Today's fast-tier string for the jobs that never had a bound model. */
-function automaticFastModelId(job: MemoryJobId): string {
-  return job === 'import' ? (MODELS.fast || MODELS.primary || DEFAULT_CODEX_FAST_MODEL) : MODELS.fast;
-}
-
-/** Where the process-global router sends a bare model string first: the
- *  router's own rule (routedPrimaryModel), so a job row and the token meter
- *  name the model and account that actually serve it (the BYO primary under
- *  all-in, the Claude brain for a Codex-shaped id when only Claude is signed
- *  in). Null when the router would refuse the string outright. */
-function routedModelString(modelId: string): RoutedPrimaryModel | null {
-  try {
-    return routedPrimaryModel(modelId);
-  } catch {
-    return null;
-  }
-}
-
-/** Whether a bare model string can be served: the router serves it on the
- *  provider it routes to, or falls over to another connected one. Generous
- *  on purpose: this only holds work back when nothing can run it. A string
- *  the router refuses outright (a BYO id with no backend) never serves. */
-function modelStringServes(modelId: string): boolean {
-  const routed = routedModelString(modelId);
-  if (!routed) return false;
-  try {
-    if (modelProviderLive(routed.modelId, routed.provider)) return true;
-  } catch { /* an unreadable provider state still reaches whichever one is connected */ }
-  try {
-    const brains = debateBrainsAvailable();
-    return brains.claude || brains.codex || getByoBackendConfig().configured;
-  } catch {
-    return false;
-  }
-}
-
-/** Why a bare model string cannot be served. */
-function modelStringProblem(modelId: string): MemoryModelUnavailable {
-  const routed = routedModelString(modelId);
-  if (!routed) return { problem: 'not_connected' };
-  try {
-    return problemForModel(routed.provider, routed.modelId);
-  } catch {
-    return { problem: 'not_connected' };
-  }
+/** The model the owner chose to do the work, as it answers now, when its
+ *  account can serve it; otherwise why not. Builds nothing. */
+function selectedBrain(): { brain: ResolvedRoleModel; why?: undefined } | { brain: null; why: MemoryModelUnavailable } {
+  const brain = resolveRoleModel('brain');
+  if (!brain.modelId) return { brain: null, why: { problem: 'not_connected' } };
+  if (!modelProviderLive(brain.modelId, brain.provider)) return { brain: null, why: problemForModel(brain.provider, brain.modelId) };
+  return { brain };
 }
 
 /** Whether the extractor's cross-family hedge could take a call the route's
@@ -204,13 +167,13 @@ type AutomaticResolution =
 
 function resolveAutomatic(job: MemoryJobId): AutomaticResolution {
   if (!BOUNDARY_JOBS.has(job)) {
-    const requested = automaticFastModelId(job);
-    if (!requested) return { route: null, why: { problem: 'not_connected' } };
-    if (!modelStringServes(requested)) return { route: null, why: modelStringProblem(requested) };
-    // The agent still gets today's string; the router serves it. What will
-    // be asked for is what the router sends it to.
-    const modelId = routedModelString(requested)?.modelId ?? requested;
-    return { route: { job, model: requested, modelId, source: 'automatic', follows: null } };
+    // Exactly the model the owner chose to do the work: no fast-tier string
+    // for the router to send wherever a subscription happens to be signed in.
+    const { brain, why } = selectedBrain();
+    if (!brain) return { route: null, why };
+    const model = buildExactRoleModel(brain, 'memory', { job });
+    if (!model) return { route: null, why: problemForModel(brain.provider, brain.modelId) };
+    return { route: { job, model, modelId: brain.modelId, source: 'automatic', follows: 'brain', provider: brain.provider } };
   }
   let routing: BoundaryJudgeRouting;
   try {
@@ -404,7 +367,7 @@ export interface MemoryJobServing {
  * building a model (the Memory tab and the token meter poll it): the owner's
  * pick for every job when chosen; for automatic, the described checker
  * selection for learn / reconcile / patterns (they share it), and for the
- * others where the router sends today's fast-tier string. Null for a job the
+ * others the model the owner chose to do the work. Null for a job the
  * memory model does not govern, or when nothing can be named. Never throws.
  */
 export function memoryJobServing(job: MemoryJobId, described?: MemoryModelDescription): MemoryJobServing | null {
@@ -417,13 +380,14 @@ function memoryJobServingNow(job: MemoryJobId, described: MemoryModelDescription
     if (described.source === 'chosen' || BOUNDARY_JOBS.has(job)) {
       return described.modelId ? { modelId: described.modelId, provider: described.provider ?? null } : null;
     }
-    // A model string nothing connected can serve is not the job's model.
-    const requested = automaticFastModelId(job);
-    if (!requested || !modelStringServes(requested)) return null;
-    const routed = routedModelString(requested);
-    if (!routed) return null;
-    const byoProviderId = routed.provider === 'byo' ? routed.backend?.providerId : undefined;
-    return { modelId: routed.modelId, provider: routed.provider, ...(byoProviderId ? { byoProviderId } : {}) };
+    // A model its account cannot serve is not the job's model.
+    const { brain } = selectedBrain();
+    if (!brain) return null;
+    let byoProviderId: string | undefined;
+    if (brain.provider === 'byo') {
+      try { byoProviderId = resolveByoProviderForModel(brain.modelId)?.providerId || undefined; } catch { byoProviderId = undefined; }
+    }
+    return { modelId: brain.modelId, provider: brain.provider, ...(byoProviderId ? { byoProviderId } : {}) };
   } catch {
     return null;
   }

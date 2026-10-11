@@ -262,3 +262,10 @@ case), then PR-16 → PR-01 → PR-02 → PR-03 with PR-04 as one release. PR-08
   column `reportedCostUsd` and the Settings line never shows it, and before PR-03 or
   PR-05 compare cost, the cost guard in `route-policy.ts` needs to know which accounts
   bill per call (it currently reads Claude as costly and every BYO model as free).
+- **Owner decision, 10-10: "Background memory should run on what the user has
+  selected."** A chosen memory model already served every governed job exactly (and the
+  per-message standing check moved onto it on 10-09). With Automatic, skills, identity
+  and import used a fast-tier model string that the router sent to Codex whenever Codex
+  was signed in, even on a home that never chose it (what PR-14's memory test pinned).
+  They now take exactly the model the owner chose to do the work, and wait when its
+  account cannot serve; learning keeps following the checker the owner chose.
