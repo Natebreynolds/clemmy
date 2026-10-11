@@ -2271,6 +2271,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
         ? {
             slug: 'release-outbound-fixture',
             edits: [{ find: 'Draft', replace: 'Updated Draft', all: null }],
+            revert_to_version: null,
           }
         : null;
       const sourceCallId = `planned-external-source-${index}`;
