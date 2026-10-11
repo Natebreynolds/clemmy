@@ -557,6 +557,7 @@ for (const post of data.posts) {
 }
 </script></body></html>`;
 
+const clarificationRevision = await import('../runtime/semantic-boundary/clarification-revision.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const brackets = await import('../runtime/harness/brackets.js');
 const continuity = await import('../runtime/harness/task-continuity-runtime.js');
@@ -1009,6 +1010,25 @@ function configureResearchProvider(
       .filter((tool) => tool.name === 'skill_read' || tool.name === 'skill_list')
       .map((tool) => [tool.name, tool as never] as const),
   ]));
+}
+
+
+/**
+ * Since d222b5f3d (10-05) a typed answer resumes the paused task only after the
+ * reply route settles: code must not equate a typed value with every decision
+ * being supplied. Production classifies the reply between admission and
+ * enrichment (respond-bridge); the journey does the same, with the fixture
+ * completeness model answering that the reply is complete.
+ */
+async function settleTypedAnswer(sessionId: string, sourceUserSeq: number): Promise<void> {
+  continuity._setClarificationAnswerCompletenessForTests((input) => clarificationRevision.checkClarificationAnswerCompleteness(input,
+    async () => ({ ok: true, model: 'fixture-jev', answers: { complete_answer: { type: 'noul', noul: 0.99 } },
+      usage: { input_tokens: 1, output_tokens: 1 }, decisionId: 'fixture-completeness' }) as never));
+  try {
+    assert.equal((await continuity.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq }))?.route, 'settled');
+  } finally {
+    continuity._setClarificationAnswerCompletenessForTests(null);
+  }
 }
 
 test('the shipped marketing skill and exact Firecrawl S→R→W definitions reach the production model surface', async () => {
@@ -2056,6 +2076,7 @@ test('the exact local-LLM ask plans with the user, executes once, survives re-en
     answerSource.seq,
   );
   assert.deepEqual(typedAnswer, { disposition: 'selected', selectedOption: 'opt-1' });
+  await settleTypedAnswer(session.id, answerSource.seq);
   semanticPorts.installTurnSemanticModelPort(null);
   const enriched = await continuity.enrichAcceptedRequestWithTaskContinuity({
     sessionId: session.id,
@@ -3020,6 +3041,7 @@ test('missing Firecrawl authority becomes one visible resumable connection gate 
     answerSource.seq,
   );
   assert.deepEqual(typedContinue, { disposition: 'selected', selectedOption: 'opt-1' });
+  await settleTypedAnswer(session.id, answerSource.seq);
   const resumed = await continuity.enrichAcceptedRequestWithTaskContinuity({
     sessionId: session.id,
     sourceUserSeq: answerSource.seq,
