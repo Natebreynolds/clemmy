@@ -460,6 +460,10 @@ export const EVENT_TYPES = [
   // proves the judge fired BEFORE a YOLO silent-proceed (the 2026-06-22
   // CLEMMY_GOAL_ALIGNMENT_GATE fix). Pure telemetry; never alters behavior.
   'goal_alignment_judged',
+  // A finished turn's review verdict and tool success, joined onto the routed
+  // request that wrote its reply (route-outcome-join.ts). Telemetry for the
+  // route policy; never projected and never alters a turn.
+  'route_outcome_judged',
   // Per tool_search call: what each candidate source returned, how long it
   // took, and the real error when one failed. Live 2026-09-15: the Composio
   // source threw, the message was discarded, the model saw local tools ranked
