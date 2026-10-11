@@ -6,8 +6,8 @@
   "cases": {
     "a_saved_work_lookup/jev_off": {
       "rounds": 3,
-      "round1Bytes": 27386,
-      "totalRequestBytes": 95339,
+      "round1Bytes": 28626,
+      "totalRequestBytes": 99059,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -25,13 +25,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "a_saved_work_lookup/jev_hang": {
       "rounds": 3,
-      "round1Bytes": 27386,
-      "totalRequestBytes": 95345,
+      "round1Bytes": 28626,
+      "totalRequestBytes": 99065,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -49,13 +50,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "a_saved_work_lookup/jev_http_500": {
       "rounds": 3,
-      "round1Bytes": 27386,
-      "totalRequestBytes": 95369,
+      "round1Bytes": 28626,
+      "totalRequestBytes": 99089,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -73,13 +75,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "a_saved_work_lookup/jev_scripted": {
       "rounds": 3,
-      "round1Bytes": 27386,
-      "totalRequestBytes": 95369,
+      "round1Bytes": 28626,
+      "totalRequestBytes": 99089,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -97,13 +100,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "b_heartbeat_edit/jev_off": {
       "rounds": 3,
-      "round1Bytes": 29586,
-      "totalRequestBytes": 99811,
+      "round1Bytes": 30255,
+      "totalRequestBytes": 101818,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -121,13 +125,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "b_heartbeat_edit/jev_hang": {
       "rounds": 3,
-      "round1Bytes": 29586,
-      "totalRequestBytes": 99817,
+      "round1Bytes": 30255,
+      "totalRequestBytes": 101824,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -145,13 +150,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "b_heartbeat_edit/jev_http_500": {
       "rounds": 3,
-      "round1Bytes": 29586,
-      "totalRequestBytes": 99841,
+      "round1Bytes": 30255,
+      "totalRequestBytes": 101848,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -169,13 +175,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "b_heartbeat_edit/jev_scripted": {
       "rounds": 3,
-      "round1Bytes": 29586,
-      "totalRequestBytes": 99841,
+      "round1Bytes": 30255,
+      "totalRequestBytes": 101848,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -193,13 +200,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "c_provider_carrier_read/jev_off": {
       "rounds": 4,
-      "round1Bytes": 27338,
-      "totalRequestBytes": 163842,
+      "round1Bytes": 28578,
+      "totalRequestBytes": 168874,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -217,13 +225,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "c_provider_carrier_read/jev_hang": {
       "rounds": 4,
-      "round1Bytes": 27338,
-      "totalRequestBytes": 163859,
+      "round1Bytes": 28578,
+      "totalRequestBytes": 168891,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -241,13 +250,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "c_provider_carrier_read/jev_http_500": {
       "rounds": 4,
-      "round1Bytes": 27338,
-      "totalRequestBytes": 163799,
+      "round1Bytes": 28578,
+      "totalRequestBytes": 168831,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -265,13 +275,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "c_provider_carrier_read/jev_scripted": {
       "rounds": 4,
-      "round1Bytes": 27338,
-      "totalRequestBytes": 163799,
+      "round1Bytes": 28578,
+      "totalRequestBytes": 168831,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -289,13 +300,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "d_calendar_read/jev_off": {
       "rounds": 3,
-      "round1Bytes": 27295,
-      "totalRequestBytes": 105996,
+      "round1Bytes": 28535,
+      "totalRequestBytes": 109854,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -313,13 +325,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "d_calendar_read/jev_hang": {
       "rounds": 3,
-      "round1Bytes": 27295,
-      "totalRequestBytes": 106004,
+      "round1Bytes": 28535,
+      "totalRequestBytes": 109862,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -337,13 +350,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "d_calendar_read/jev_http_500": {
       "rounds": 3,
-      "round1Bytes": 27295,
-      "totalRequestBytes": 106036,
+      "round1Bytes": 28535,
+      "totalRequestBytes": 109894,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -361,13 +375,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "d_calendar_read/jev_scripted": {
       "rounds": 3,
-      "round1Bytes": 27295,
-      "totalRequestBytes": 106036,
+      "round1Bytes": 28535,
+      "totalRequestBytes": 109894,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -385,13 +400,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "e_no_signal_control/jev_off": {
       "rounds": 1,
-      "round1Bytes": 27386,
-      "totalRequestBytes": 27386,
+      "round1Bytes": 28626,
+      "totalRequestBytes": 28626,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -409,13 +425,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "e_no_signal_control/jev_hang": {
       "rounds": 1,
-      "round1Bytes": 27386,
-      "totalRequestBytes": 27386,
+      "round1Bytes": 28626,
+      "totalRequestBytes": 28626,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -433,13 +450,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "e_no_signal_control/jev_http_500": {
       "rounds": 1,
-      "round1Bytes": 27386,
-      "totalRequestBytes": 27386,
+      "round1Bytes": 28626,
+      "totalRequestBytes": 28626,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -457,13 +475,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "e_no_signal_control/jev_scripted": {
       "rounds": 1,
-      "round1Bytes": 27386,
-      "totalRequestBytes": 27386,
+      "round1Bytes": 28626,
+      "totalRequestBytes": 28626,
       "round1WireTools": [
         "ask_user_question",
         "run_worker",
@@ -481,13 +500,14 @@
         "recall_tool_result",
         "skill_read",
         "tool_output_query",
+        "app_guide",
         "file_query"
       ]
     },
     "f_calendar_read_warm/jev_off": {
       "rounds": 2,
-      "round1Bytes": 25060,
-      "totalRequestBytes": 52329,
+      "round1Bytes": 26141,
+      "totalRequestBytes": 54491,
       "round1WireTools": [
         "ask_user_question",
         "call_tool",
@@ -501,8 +521,8 @@
     },
     "f_calendar_read_warm/jev_hang": {
       "rounds": 2,
-      "round1Bytes": 25060,
-      "totalRequestBytes": 52333,
+      "round1Bytes": 26141,
+      "totalRequestBytes": 54495,
       "round1WireTools": [
         "ask_user_question",
         "call_tool",
@@ -516,8 +536,8 @@
     },
     "f_calendar_read_warm/jev_http_500": {
       "rounds": 2,
-      "round1Bytes": 25060,
-      "totalRequestBytes": 52349,
+      "round1Bytes": 26141,
+      "totalRequestBytes": 54511,
       "round1WireTools": [
         "ask_user_question",
         "call_tool",
@@ -531,8 +551,8 @@
     },
     "f_calendar_read_warm/jev_scripted": {
       "rounds": 2,
-      "round1Bytes": 25060,
-      "totalRequestBytes": 52349,
+      "round1Bytes": 26141,
+      "totalRequestBytes": 54511,
       "round1WireTools": [
         "ask_user_question",
         "call_tool",
