@@ -9898,6 +9898,17 @@ export function registerConsoleRoutes(
     }
   });
 
+  // What each role's model did over the last 7 or 30 days (Settings › Models).
+  app.get('/api/console/models/scorecard', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { readModelScorecard } = await import('../runtime/harness/model-scorecard.js');
+      res.json(await readModelScorecard(req.query.days === '30' ? 30 : 7));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/settings/model-providers', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {

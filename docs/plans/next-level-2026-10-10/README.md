@@ -238,3 +238,19 @@ case), then PR-16 → PR-01 → PR-02 → PR-03 with PR-04 as one release. PR-08
 - **The orchestrator fan-out case (baseline §2b): recommended, owner to confirm.** A
   scope the prior turn established is carried as a fact, not re-parsed under the 10-05
   precision; a fresh count keeps the strict parse. It is its own small PR after PR-15.
+- **PR-16, as built (`bb1609465`).** A turn's verdict lands on the one brain request
+  that wrote its reply, not on every request of the turn, so a turn counts once however
+  many rounds it took. The scorer's objective and tool rates are over the samples that
+  carry the signal (an unreviewed request is not a failed review). A light check on a
+  read counts as a verdict; a failed-open, self-judged, plan-only or owner-waiting
+  verdict does not. A helper's usable result is its own route's tool signal. No kill
+  switch (owner rule: no rollout flags); a turn with no review and no calls writes
+  nothing. Live on hotpatch 128: source 448728's last brain request recorded passed
+  review, tools 6 of 7 landed (`tool_success` false), and a `route_outcome_judged` row.
+- **PR-01, as built.** No separate card and no health rows: the Accounts card already
+  shows each account's state, resets and credit. Instead each role row in Settings →
+  Models carries one line from the scorecard ("This week: 430 calls · 9 of 10 passed
+  review · 2.1 s typical · 81% cached"), on desktop under the role's hint and on the
+  phone under the row's summary. The endpoints take `days=7|30`; the UI shows the week.
+  Past days' ledger files are tallied once and kept by size and mtime, so a month's
+  read never re-parses the whole ledger.

@@ -6,10 +6,11 @@
  * re-pins THAT conversation; worker and judge are global today (the daemon has
  * no per-session scope for them), and the UI says so rather than pretending.
  */
-import { MEMORY_ROLE_WORDS, QUICK_ROLE_WORDS, modelDisplayName } from '@clem/chat-engine';
+import { MEMORY_ROLE_WORDS, QUICK_ROLE_WORDS, modelDisplayName, type ModelScorecardLike } from '@clem/chat-engine';
 import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePoll } from './poll';
+import { apiGet } from './api';
 import {
   getSettings,
   patchModelRole,
@@ -21,6 +22,9 @@ import {
   type JudgeFallbackSetting,
   type JudgeFallbackSelection,
 } from './settings';
+
+/** What each role's model did over the last week (the daemon's scorecard). */
+export const getModelScorecard = () => apiGet<ModelScorecardLike>('/api/console/models/scorecard');
 
 export interface ModelChoice { id: string; label: string; provider: string }
 export interface BrainChoice { value: string; label: string; available: boolean; provider: string; note?: string }

@@ -4,8 +4,8 @@ import { useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { AlertTriangle, Check, ChevronRight, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/cn';
-import { judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, ROLE_WORDS, useModelRoles } from '@/lib/model-roles';
-import { CHECKER_ROLE_WORDS, QUICK_ROLE_WORDS, checkerAutomaticText, checkerBackupAutomaticLabel, checkerSameFamilyWarning, jevFirstChecksText, memoryModelUnavailableText, memoryRoleAutomaticText, modelDisplayName } from '@clem/chat-engine';
+import { getModelScorecard, judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, ROLE_WORDS, useModelRoles } from '@/lib/model-roles';
+import { CHECKER_ROLE_WORDS, QUICK_ROLE_WORDS, modelScoreLine, checkerAutomaticText, checkerBackupAutomaticLabel, checkerSameFamilyWarning, jevFirstChecksText, memoryModelUnavailableText, memoryRoleAutomaticText, modelDisplayName } from '@clem/chat-engine';
 import { memoryTimeFormat } from '@/lib/memory-work';
 import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -81,6 +81,13 @@ function JudgeMetrics({ metrics }: { metrics?: JudgeMetricsSnapshot }) {
 export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const r = useModelRoles({ sessionId });
   const mr = r.mr;
+  // What each role's model did this week, under its row: the owner sees what
+  // the current choice has done before changing it.
+  const scorecard = usePoll(['model-scorecard'], getModelScorecard, 60_000);
+  const score = (role: string, modelId?: string | null) => {
+    const line = modelScoreLine(scorecard.data, role, modelId);
+    return line ? <div className="mt-1 text-caption text-muted">{line}</div> : null;
+  };
   const [newIntent, setNewIntent] = useState('');
   const [newIntentModel, setNewIntentModel] = useState('');
   // The Memory tab's "Change" lands on the memory row. The row exists only once
@@ -198,20 +205,20 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
         {row(ROLE_WORDS.brain.title, ROLE_WORDS.brain.hint,
           <Select disabled={busy === 'brain'} value={r.brainValue} onChange={(e) => void r.onBrain(e.target.value)} aria-label="Model that does the work">
             {r.brains.map((o) => <option key={o.value} value={o.value} disabled={!o.available}>{o.label}{o.note ? ` (${o.note})` : ''}</option>)}
-          </Select>, inactive('brain'))}
+          </Select>, <>{score('brain', mr.roles.brain.modelId)}{inactive('brain')}</>)}
         {row(ROLE_WORDS.worker.title, ROLE_WORDS.worker.hint,
           <Select disabled={busy === 'worker'} value={mr.roles.worker.source === 'default' ? '__default__' : mr.roles.worker.modelId} onChange={(e) => void r.onRole('worker', e.target.value)} aria-label="Model that helps in parallel">
             <option value="__default__">Same model that does the work</option>
             {workerFlat.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
-          </Select>, inactive('worker'))}
+          </Select>, <>{score('worker', mr.roles.worker.modelId)}{inactive('worker')}</>)}
         {writer && row(ROLE_WORDS.writer.title, ROLE_WORDS.writer.hint,
           <Select disabled={busy === 'writer'} value={writer.source === 'default' ? '__default__' : writer.modelId} onChange={(e) => void r.onRole('writer', e.target.value)} aria-label="Model that writes the final answer">
             <option value="__default__">Same model that does the work</option>
             {writerFlat.map((m) => <option key={`wr-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
           </Select>,
           <>
+            {score('writer', writer.modelId)}
             {inactive('writer')}
-
           </>)}
         {row(ROLE_WORDS.judge.title, ROLE_WORDS.judge.hint,
           <Select disabled={busy === 'judge'} value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId} onChange={(e) => void r.onRole('judge', e.target.value)} aria-label="Model that checks the work">
@@ -219,6 +226,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
             {judgeFlat.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
           </Select>,
           <>
+            {score('judge', judge.modelId)}
             {judgeAutomaticNote && <div className="mt-1 text-caption text-muted">{judgeAutomaticNote}</div>}
             {judgeFamilyWarning && (
               <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden /><span className="min-w-0">{judgeFamilyWarning}</span></div>
@@ -260,6 +268,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
             <div className="min-w-0">
               <div className="text-body font-semibold text-fg">{ROLE_WORDS.memory.title}</div>
               <div className="text-small text-muted">{ROLE_WORDS.memory.hint}</div>
+              {score('memory', memory.modelId)}
               {memory.source === 'default' && (
                 <div className="mt-1 text-caption text-muted">{memoryRoleAutomaticText(memory.follows ?? null, memory.modelId || null)}</div>
               )}
@@ -294,6 +303,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
             {r.quicks.map((m) => <option key={`q-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
           </Select>,
           <>
+            {score('quick', quick.modelId)}
             {quick.source === 'default' && <div className="mt-1 text-caption text-muted">{QUICK_ROLE_WORDS.automatic}</div>}
             {inactive('quick')}
           </>)}

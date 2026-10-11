@@ -41,3 +41,4 @@ export * from './brain-selection.js';
 export * from './cloud-browser.js';
 export * from './browser-view-lifecycle.js';
 export * from './model-role-words.js';
+export * from './model-scorecard-presentation.js';

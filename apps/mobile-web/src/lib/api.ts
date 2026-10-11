@@ -16,7 +16,7 @@ import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.j
 import { signProof, deviceKeySupported, exportPublicJwk } from './device-key.js';
 import { connectionDoor, reportConnectionLost, setConnectionDoor } from './native-bridge.js';
 import { LAST_GOOD_HEADER, clearLastGood, noteLastGood } from './last-good.js';
-import { readBrainSelectionResponse, type BrainSelectionResponse } from '@clem/chat-engine';
+import { readBrainSelectionResponse, type BrainSelectionResponse, type ModelScorecardLike } from '@clem/chat-engine';
 import type { WorkflowRunReceipt } from './workflow-run-receipt';
 
 /**
@@ -1917,6 +1917,11 @@ export async function forgetLearnedWriteKind(kind: { operationId: string; accoun
 
 export async function getModelSettings(): Promise<ModelSettings> {
   return api<ModelSettings>('/m/api/settings/models');
+}
+
+/** What each role's model did this week: the desktop's scorecard, read-only. */
+export async function getModelScorecard(): Promise<ModelScorecardLike> {
+  return api<ModelScorecardLike>('/m/api/models/scorecard');
 }
 
 export interface JudgeFallbackSetting {

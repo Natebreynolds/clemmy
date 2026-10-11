@@ -6228,6 +6228,16 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  // The desktop's scorecard, read-only: what each role's model did lately.
+  router.get('/api/models/scorecard', requireMobileSession, async (req, res) => {
+    try {
+      const { readModelScorecard } = await import('../runtime/harness/model-scorecard.js');
+      res.json(await readModelScorecard(req.query.days === '30' ? 30 : 7));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   router.patch('/api/settings/models/judge-fallback', requireMobileSession, async (req, res) => {
     const { persistJudgeFallbackSetting, JudgeFallbackSettingError } = await import('../runtime/harness/judge-fallback-settings.js');
     try {

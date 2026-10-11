@@ -869,6 +869,23 @@ export function recordUsage(event: UsageEvent): void {
   }
 }
 
+/** The ledger file one UTC day's events are appended to. */
+export function usageFileForDate(date: Date): string {
+  return todaysFile(date);
+}
+
+/** The ledger's one line parser: one event per line, unreadable lines skipped. */
+export function parseUsageLedger(text: string): UsageEvent[] {
+  return text
+    .split('\n')
+    .filter((line) => line.trim().length > 0)
+    .map((line) => {
+      try { return JSON.parse(line) as UsageEvent; }
+      catch { return null; }
+    })
+    .filter((e): e is UsageEvent => e !== null);
+}
+
 /**
  * Read all usage events for a date (default today). Returns oldest-first.
  */
@@ -876,14 +893,7 @@ export function readUsageEventsForDate(date: Date = new Date()): UsageEvent[] {
   try {
     const file = todaysFile(date);
     if (!existsSync(file)) return [];
-    return readFileSync(file, 'utf-8')
-      .split('\n')
-      .filter((line) => line.trim().length > 0)
-      .map((line) => {
-        try { return JSON.parse(line) as UsageEvent; }
-        catch { return null; }
-      })
-      .filter((e): e is UsageEvent => e !== null);
+    return parseUsageLedger(readFileSync(file, 'utf-8'));
   } catch {
     return [];
   }
