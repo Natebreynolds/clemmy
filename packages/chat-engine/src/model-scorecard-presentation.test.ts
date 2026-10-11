@@ -33,3 +33,12 @@ test('a new home says nothing; a role that moved models names the one that ran',
   assert.match(modelScoreLine(card, 'brain', 'model-new') ?? '', /^This week on .+: 12 calls$/);
   assert.equal(modelScoreLine(card, 'brain', 'model-b'), 'This week: 3 calls');
 });
+
+test('a partial cache figure names its coverage, and unconfirmed writes are said plainly', () => {
+  const card = { window: { days: 7 }, rows: [row('brain', 'model-a', { calls: 40, cacheHitRate: 0.81, answeredCalls: 40, cacheMeasuredCalls: 11,
+    uncertainWriteTurns: 2 })] };
+  assert.equal(modelScoreLine(card, 'brain', 'model-a'),
+    'This week: 40 calls · 81% cached on the 11 of 40 calls measured · 2 turns with a write not confirmed');
+  const whole = { window: { days: 7 }, rows: [row('brain', 'model-a', { calls: 5, cacheHitRate: 0.5, answeredCalls: 5, cacheMeasuredCalls: 5 })] };
+  assert.equal(modelScoreLine(whole, 'brain', 'model-a'), 'This week: 5 calls · 50% cached');
+});

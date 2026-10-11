@@ -285,6 +285,7 @@ export async function runPacketWorkerWithHost(input: {
     finishRunAttempt(attempt, completed ? 'completed' : 'failed');
     // The helper's own result is its route's signal for the route policy.
     const usable = completed;
-    scheduleRouteOutcomeJoin(() => joinWorkerRouteOutcome({ sessionId: session.id, sourceUserSeq: childSource.seq, usable }));
+    const runAttemptId = attempt.attemptId;
+    scheduleRouteOutcomeJoin(() => joinWorkerRouteOutcome({ sessionId: session.id, sourceUserSeq: childSource.seq, runAttemptId, usable }));
   }
 }

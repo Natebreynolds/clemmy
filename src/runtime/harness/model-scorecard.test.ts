@@ -50,9 +50,9 @@ test('rows join usage with route evidence, with percentiles and cache rate; a ro
   const card = scorecard.scorecardFromTallies({
     usage: usageTallies,
     routes: [
-      { role: 'brain', modelId: 'model-a', reviewed: 4, passed: 3, toolTurns: 2, toolTurnsLanded: 2, fellOver: 1, stoodIn: 0, reportedCostUsd: null },
-      { role: 'judge', modelId: 'model-j', reviewed: 0, passed: 0, toolTurns: 0, toolTurnsLanded: 0, fellOver: 0, stoodIn: 1, reportedCostUsd: 0.42 },
-      { role: 'worker', modelId: 'model-idle', reviewed: 0, passed: 0, toolTurns: 0, toolTurnsLanded: 0, fellOver: 0, stoodIn: 0, reportedCostUsd: 0.1 },
+      { role: 'brain', modelId: 'model-a', reviewed: 4, passed: 3, toolTurns: 2, toolTurnsLanded: 2, fellOver: 1, stoodIn: 0, uncertainWriteTurns: 0, reportedCostUsd: null },
+      { role: 'judge', modelId: 'model-j', reviewed: 0, passed: 0, toolTurns: 0, toolTurnsLanded: 0, fellOver: 0, stoodIn: 1, uncertainWriteTurns: 0, reportedCostUsd: 0.42 },
+      { role: 'worker', modelId: 'model-idle', reviewed: 0, passed: 0, toolTurns: 0, toolTurnsLanded: 0, fellOver: 0, stoodIn: 0, uncertainWriteTurns: 0, reportedCostUsd: 0.1 },
     ],
     days: 7,
     now: new Date('2026-10-10T12:00:00.000Z'),
@@ -96,4 +96,25 @@ test('an empty home has no rows; a live read joins the ledger files and the rout
   const month = await scorecard.readModelScorecard(30, now);
   assert.equal(month.rows.find((row) => row.role === 'brain')!.calls, 3);
   assert.equal(await scorecard.readModelScorecard(7, now), await scorecard.readModelScorecard(7, now), 'computed once a minute');
+});
+
+test('a cache figure says how many calls it was measured on, and unconfirmed writes are counted, never landed', async () => {
+  const tallies = scorecard.tallyUsage([
+    call({}), call({}),
+    call({ cacheDialect: undefined }),
+    call({ ok: false, failReason: 'timeout', inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 }),
+  ]);
+  const brain = [...tallies.values()][0]!;
+  assert.equal(brain.answeredCalls, 3, 'a failed call answered nothing');
+  assert.equal(brain.cacheMeasuredCalls, 2, 'an undeclared cache dialect is not a measurement');
+
+  scorecard._resetModelScorecardForTests();
+  const now = new Date();
+  const decision = metrics.recordModelRouteDecision({ role: 'brain', resolvedModel: 'model-u', provider: 'claude', source: 'default', now });
+  metrics.recordModelRouteOutcome({ decisionId: decision, status: 'success', now });
+  metrics.updateModelRouteOutcomeVerdict(decision, { toolCalls: 1, basis: { uncertainWrites: 1 } });
+  const card = await scorecard.readModelScorecard(7, now);
+  const row = card.rows.find((entry) => entry.modelId === 'model-u')!;
+  assert.equal(row.uncertainWriteTurns, 1);
+  assert.equal(row.toolTurns, 0, 'an unconfirmed write is not a tool turn that landed or failed');
 });

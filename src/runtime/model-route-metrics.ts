@@ -492,12 +492,14 @@ export function updateModelRouteOutcomeVerdict(
 }
 
 /**
- * The last answered request of one role for one accepted source: for the
- * brain, the request whose answer the turn shipped. `since` bounds the scan to
- * the source's own lifetime.
+ * The request of one role, in one exact run attempt, whose answer the verdict
+ * judged: the last one answered at or before `until` (the verdict's time; the
+ * attempt's end when there was none). Bound to the attempt, never to the
+ * source alone, so a retried or resumed source cannot hand one attempt's
+ * verdict to another attempt's model. `since` bounds the scan.
  */
-export function latestSourceRouteDecision(
-  input: { sessionId: string; sourceUserSeq: number; role: ModelRouteRole; since?: string },
+export function attemptRouteDecision(
+  input: { sessionId: string; runAttemptId: string; role: ModelRouteRole; since?: string; until?: string },
   db?: Database.Database,
 ): { id: string; requests: number } | null {
   try {
@@ -508,11 +510,12 @@ export function latestSourceRouteDecision(
        WHERE d.created_at >= @since
          AND d.session_id = @sessionId
          AND d.role = @role
-         AND json_extract(d.reason_json, '$.sourceUserSeq') = @sourceUserSeq
+         AND json_extract(d.reason_json, '$.runAttemptId') = @runAttemptId
          AND o.status IN ('success', 'fallback')
+         AND (@until = '' OR o.completed_at <= @until)
        ORDER BY o.completed_at DESC, d.created_at DESC
-    `).all({ since: input.since ?? '', sessionId: input.sessionId, role: input.role,
-      sourceUserSeq: input.sourceUserSeq }) as Array<{ id: string }>;
+    `).all({ since: input.since ?? '', until: input.until ?? '', sessionId: input.sessionId, role: input.role,
+      runAttemptId: input.runAttemptId }) as Array<{ id: string }>;
     return rows.length > 0 ? { id: rows[0]!.id, requests: rows.length } : null;
   } catch {
     return null;
@@ -830,6 +833,7 @@ class ModelRouteMetricsModel implements Model {
   ): string {
     const activeContext = harnessMetricsContext(this.context);
     const sourceUserSeq = activeSourceUserSeq(activeContext.sessionId);
+    const runAttemptId = activeRunAttemptId(activeContext.sessionId);
     const decisionId = recordModelRouteDecision({
       ...activeContext,
       id: this.context.modelCallIdPrefix ? `${this.context.modelCallIdPrefix}:${randomUUID()}` : undefined,
@@ -840,6 +844,7 @@ class ModelRouteMetricsModel implements Model {
         // The accepted request this call worked on, so the finished turn's
         // review verdict can be joined back onto it (route-outcome-join.ts).
         ...(sourceUserSeq !== undefined ? { sourceUserSeq } : {}),
+        ...(runAttemptId ? { runAttemptId } : {}),
       },
     }, this.db);
     if (!this.db) recordOperationalEvent({
@@ -1144,6 +1149,13 @@ function harnessMetricsContext(context: ModelRouteMetricsContext): ModelRouteMet
 
 /** The accepted source of the run this call belongs to, only when the run is
  *  the same session the decision is recorded under. */
+/** The durable run attempt this call belongs to, under the same rule. */
+function activeRunAttemptId(sessionId: string | undefined): string | undefined {
+  const active = harnessRunContextStorage.getStore();
+  const id = active?.runAttemptId;
+  return sessionId && active?.sessionId === sessionId && typeof id === 'string' && id ? id : undefined;
+}
+
 function activeSourceUserSeq(sessionId: string | undefined): number | undefined {
   const active = harnessRunContextStorage.getStore();
   const seq = active?.sourceUserSeq;

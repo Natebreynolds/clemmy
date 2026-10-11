@@ -35,8 +35,12 @@ export interface ModelScoreRowV1 {
   uncachedInputTokens: number;
   cachedReadTokens: number;
   outputTokens: number;
-  /** Cached reads over the prompt, certified calls only; null when none were. */
+  /** Cached reads over the prompt, over the calls whose cache accounting was
+   *  certified; null when none were. `cacheMeasuredCalls` of `answeredCalls`
+   *  says how much of the work the figure covers. */
   cacheHitRate: number | null;
+  answeredCalls: number;
+  cacheMeasuredCalls: number;
   latencyMs: { p50: number; p95: number } | null;
   /** Turns whose answer this model wrote that a reviewer judged, and passed. */
   reviewed: number;
@@ -44,6 +48,8 @@ export interface ModelScoreRowV1 {
   /** Turns with tool calls, and those where every dispatched call landed. */
   toolTurns: number;
   toolTurnsLanded: number;
+  /** Turns with a write whose outcome is not known: never counted as landed. */
+  uncertainWriteTurns: number;
   /** Calls that fell over to another model, and calls this model took over. */
   fellOver: number;
   stoodIn: number;
@@ -81,6 +87,8 @@ export interface UsageTally {
   cachedReadTokens: number;
   outputTokens: number;
   uncertifiedCalls: number;
+  answeredCalls: number;
+  cacheMeasuredCalls: number;
   durations: number[];
 }
 
@@ -97,7 +105,7 @@ export function tallyUsage(events: readonly UsageEvent[]): Map<string, UsageTall
     let tally = tallies.get(key(role, modelId));
     if (!tally) {
       tally = { role, modelId, calls: 0, failedCalls: 0, failureReasons: {}, promptTokens: 0, uncachedInputTokens: 0,
-        cachedReadTokens: 0, outputTokens: 0, uncertifiedCalls: 0, durations: [] };
+        cachedReadTokens: 0, outputTokens: 0, uncertifiedCalls: 0, answeredCalls: 0, cacheMeasuredCalls: 0, durations: [] };
       tallies.set(key(role, modelId), tally);
     }
     tally.calls += 1;
@@ -107,6 +115,8 @@ export function tallyUsage(events: readonly UsageEvent[]): Map<string, UsageTall
       tally.failureReasons[reason] = (tally.failureReasons[reason] ?? 0) + 1;
     }
     const canonical = event.canonical ?? canonicalCacheAccounting(event);
+    if (event.ok !== false) tally.answeredCalls += 1;
+    if (canonical.certified && event.ok !== false) tally.cacheMeasuredCalls += 1;
     if (canonical.certified) {
       tally.promptTokens += canonical.promptTokens;
       tally.uncachedInputTokens += canonical.uncachedInputTokens;
@@ -139,6 +149,8 @@ export function mergeTallies(parts: Iterable<Map<string, UsageTally>>): Map<stri
       into.cachedReadTokens += tally.cachedReadTokens;
       into.outputTokens += tally.outputTokens;
       into.uncertifiedCalls += tally.uncertifiedCalls;
+      into.answeredCalls += tally.answeredCalls;
+      into.cacheMeasuredCalls += tally.cacheMeasuredCalls;
       for (const ms of tally.durations) into.durations.push(ms);
     }
   }
@@ -153,6 +165,7 @@ export interface RouteTally {
   passed: number;
   toolTurns: number;
   toolTurnsLanded: number;
+  uncertainWriteTurns: number;
   fellOver: number;
   stoodIn: number;
   reportedCostUsd: number | null;
@@ -187,7 +200,7 @@ export function scorecardFromTallies(input: {
     const durations = usage?.durations ?? [];
     // A route row with no answered call and nothing judged is not something
     // the model did; it never becomes "0 calls".
-    if (!usage?.calls && !route?.reviewed && !route?.toolTurns && !route?.fellOver && !route?.stoodIn) continue;
+    if (!usage?.calls && !route?.reviewed && !route?.toolTurns && !route?.uncertainWriteTurns && !route?.fellOver && !route?.stoodIn) continue;
     rows.push({
       role,
       modelId,
@@ -198,11 +211,14 @@ export function scorecardFromTallies(input: {
       cachedReadTokens: usage?.cachedReadTokens ?? 0,
       outputTokens: usage?.outputTokens ?? 0,
       cacheHitRate: usage && usage.promptTokens > 0 ? usage.cachedReadTokens / usage.promptTokens : null,
+      answeredCalls: usage?.answeredCalls ?? 0,
+      cacheMeasuredCalls: usage?.cacheMeasuredCalls ?? 0,
       latencyMs: durations.length > 0 ? { p50: percentile(durations, 50), p95: percentile(durations, 95) } : null,
       reviewed: route?.reviewed ?? 0,
       passed: route?.passed ?? 0,
       toolTurns: route?.toolTurns ?? 0,
       toolTurnsLanded: route?.toolTurnsLanded ?? 0,
+      uncertainWriteTurns: route?.uncertainWriteTurns ?? 0,
       fellOver: route?.fellOver ?? 0,
       stoodIn: route?.stoodIn ?? 0,
       reportedCostUsd: route?.reportedCostUsd ?? null,
@@ -223,6 +239,7 @@ export function readRouteTallies(since: string): RouteTally[] {
              SUM(o.objective_met = 1) AS passed,
              SUM(o.tool_success IS NOT NULL) AS toolTurns,
              SUM(o.tool_success = 1) AS toolTurnsLanded,
+             SUM(COALESCE(json_extract(o.metadata_json, '$.verdict.uncertainWrites'), 0) > 0) AS uncertainWriteTurns,
              SUM(o.status = 'fallback') AS fellOver,
              SUM(d.source = 'fallback' AND o.status IN ('success', 'fallback')) AS stoodIn,
              SUM(o.cost_usd) AS reportedCost,
@@ -240,6 +257,7 @@ export function readRouteTallies(since: string): RouteTally[] {
         role, modelId: String(row.modelId),
         reviewed: Number(row.reviewed ?? 0), passed: Number(row.passed ?? 0),
         toolTurns: Number(row.toolTurns ?? 0), toolTurnsLanded: Number(row.toolTurnsLanded ?? 0),
+        uncertainWriteTurns: Number(row.uncertainWriteTurns ?? 0),
         fellOver: Number(row.fellOver ?? 0), stoodIn: Number(row.stoodIn ?? 0),
         reportedCostUsd: Number(row.reportedCostRows ?? 0) > 0 ? Number(row.reportedCost ?? 0) : null,
       });

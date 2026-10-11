@@ -13,11 +13,15 @@ export interface ModelScoreRowLike {
   calls: number;
   failedCalls: number;
   cacheHitRate: number | null;
+  /** Older daemons omit these; the cache figure then reads as before. */
+  answeredCalls?: number;
+  cacheMeasuredCalls?: number;
   latencyMs: { p50: number; p95: number } | null;
   reviewed: number;
   passed: number;
   toolTurns: number;
   toolTurnsLanded: number;
+  uncertainWriteTurns?: number;
   fellOver: number;
   stoodIn: number;
 }
@@ -52,6 +56,18 @@ function seconds(ms: number): string {
   return s < 10 ? `${s.toFixed(1)} s` : s < 60 ? `${Math.round(s)} s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
 }
 
+/** "81% cached", or, when only some calls reported certified cache figures,
+ *  "81% cached on the 11 of 40 calls measured": a partial figure never reads
+ *  as the whole week's. */
+function cacheWords(row: ModelScoreRowLike): string {
+  if (row.cacheHitRate === null || row.cacheHitRate < 0.01) return '';
+  const rate = `${Math.round(row.cacheHitRate * 100)}% cached`;
+  const measured = row.cacheMeasuredCalls;
+  const answered = row.answeredCalls;
+  if (measured === undefined || answered === undefined || measured >= answered) return rate;
+  return `${rate} on the ${measured.toLocaleString('en-US')} of ${answered.toLocaleString('en-US')} calls measured`;
+}
+
 /**
  * "This week: 430 calls · 9 of 10 passed review · 2.1 s typical · 81% cached".
  * Null when nothing at all has been measured (a new home says nothing rather
@@ -71,7 +87,8 @@ export function modelScoreLine(card: ModelScorecardLike | null | undefined, role
       ? `tools worked ${row.toolTurnsLanded} of ${row.toolTurns} times`
       : `tools worked ${Math.round((row.toolTurnsLanded / row.toolTurns) * 100)}% of the time`) : '',
     row.latencyMs ? `${seconds(row.latencyMs.p50)} typical` : '',
-    row.cacheHitRate !== null && row.cacheHitRate >= 0.01 ? `${Math.round(row.cacheHitRate * 100)}% cached` : '',
+    cacheWords(row),
+    (row.uncertainWriteTurns ?? 0) > 0 ? `${plural(row.uncertainWriteTurns!, 'turn', 'turns')} with a write not confirmed` : '',
     row.fellOver > 0 ? `fell back ${plural(row.fellOver, 'time', 'times')}` : '',
     row.stoodIn > 0 ? `stood in ${plural(row.stoodIn, 'time', 'times')}` : '',
   ].filter(Boolean);

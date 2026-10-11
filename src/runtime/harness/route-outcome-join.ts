@@ -3,18 +3,27 @@
  *
  * Route metrics record each model request as the provider answered it:
  * status, latency, tokens. Whether the work was right is known only when the
- * turn finishes: the completion review's verdict and the settlement ledger's
- * account of the tool calls. This joins those two facts onto the brain request
- * whose answer the turn shipped, so the route policy can prefer the model
- * whose answers pass review over the one that answers fastest.
+ * turn finishes: the completion verdict the terminal was published under and
+ * the settlement ledger's account of the tool calls. This joins those two
+ * facts onto the one brain request that wrote the reviewed reply, in the same
+ * run attempt, so the route policy can prefer the model whose answers pass
+ * review over the one that answers fastest.
+ *
+ * Only what is proven is written. The verdict is the terminal's own
+ * completionVerdictRef (the review it was published under, whether the
+ * delivered reply is the judged one, whether it still stands); a reply nobody
+ * judged, a failed-open or self-judged review and an answer waiting on the
+ * owner stay unknown. A write whose outcome is uncertain keeps the turn's tool
+ * result unknown and is counted, so confirmed siblings cannot make it look
+ * landed.
  *
  * Telemetry only. It runs after the terminal is published, off the response
  * path; any failure leaves the row as it was and never reaches the owner.
  */
 import type Database from 'better-sqlite3';
-import { appendEvent, listEvents, openEventLog, type EventRow } from './eventlog.js';
+import { appendEvent, getEvent, listEvents, openEventLog, type EventRow } from './eventlog.js';
 import {
-  latestSourceRouteDecision,
+  attemptRouteDecision,
   updateModelRouteOutcomeVerdict,
   type ModelRouteRole,
 } from '../model-route-metrics.js';
@@ -25,62 +34,77 @@ export interface SourceIdentity {
 }
 
 export interface SourceRouteVerdict {
-  /** The review passed the shipped reply; undefined when nothing reviewed it. */
+  /** The review passed the shipped reply; undefined when that is not proven. */
   objectiveMet?: boolean;
-  /** The judged row the objective was read from. */
+  /** The verdict event the terminal was published under. */
   verdictEventId?: string;
-  /** Every dispatched call landed; undefined when none ran. */
+  /** Every dispatched call landed; undefined when none ran or any is uncertain. */
   toolSuccess?: boolean;
-  /** Dispatched calls the tool verdict counted. */
+  /** Dispatched calls with a known outcome. */
   toolCalls: number;
+  /** Dispatched writes whose outcome is not known; never folded into success. */
+  uncertainWrites: number;
+}
+
+/** The terminal's record of the review it was published under. */
+export interface PublishedVerdictRef {
+  sourceUserSeq?: number;
+  eventId?: string;
+  fulfills?: boolean;
+  verified?: boolean;
+  replyMatches?: boolean;
+  failedOpen?: boolean;
+  selfJudge?: boolean;
 }
 
 /**
- * The reviewer's last word on the reply the source shipped. Passed is true;
- * not passed (blocked, or a rejection carried onto an honest stop) is false.
- * Anything that is not a reviewer judging this model's finished reply leaves
- * it unknown, never false: a review that failed open, a model judging its own
- * work, a verdict waiting on the owner, a plan review, and a verdict the turn
- * went on past (its continuation shipped a reply nobody reviewed). The host
- * deleting claims a reviewer flagged is an edit, not a verdict: the reviewer's
- * rejection before it stands.
+ * The model's verdict, from the review the terminal was published under.
+ * Passed is true only when the reviewer passed the reply that shipped and the
+ * review still stands against it. The reviewer rejecting that reply is false,
+ * including a reply the host edited by deleting the claims a reviewer flagged
+ * (the model's own answer failed). Everything else is unknown, never false:
+ * no review, a review that failed open, a model judging its own work, a
+ * delivered reply that is not the judged one, a verdict waiting on the owner,
+ * a plan review, or a verdict the turn went on past.
  */
-export function objectiveFromVerdictRows(
-  rows: ReadonlyArray<Pick<EventRow, 'id' | 'data'>>,
-  sourceUserSeq: number,
+export function objectiveFromPublishedVerdict(
+  ref: PublishedVerdictRef | undefined,
+  verdictRow: Pick<EventRow, 'id' | 'data'> | null,
 ): Pick<SourceRouteVerdict, 'objectiveMet' | 'verdictEventId'> {
-  for (let index = rows.length - 1; index >= 0; index -= 1) {
-    const row = rows[index]!;
-    const data = row.data as Record<string, unknown> | undefined;
-    if (!data || data.lane !== 'host_v1' || data.kind !== 'completion' || data.sourceUserSeq !== sourceUserSeq) continue;
-    if (data.claimRemoval !== undefined) continue;
-    const verdictEventId = String(row.id);
-    if (data.failedOpen === true || data.selfJudge === true || data.awaitingUser === true
-      || data.planDigest !== undefined || data.continuation === true) return { verdictEventId };
-    return { objectiveMet: data.fulfills === true, verdictEventId };
+  if (!ref?.eventId || !verdictRow || String(verdictRow.id) !== ref.eventId) return {};
+  const verdictEventId = ref.eventId;
+  const data = verdictRow.data as Record<string, unknown>;
+  if (ref.failedOpen === true || ref.selfJudge === true || ref.replyMatches !== true) return { verdictEventId };
+  if (data.kind !== 'completion' || data.awaitingUser === true || data.planDigest !== undefined
+    || data.continuation === true || data.failedOpen === true || data.selfJudge === true) return { verdictEventId };
+  if (data.claimRemoval !== undefined) return { objectiveMet: false, verdictEventId };
+  if (ref.fulfills === true && data.fulfills === true) {
+    return ref.verified === true ? { objectiveMet: true, verdictEventId } : { verdictEventId };
   }
-  return {};
+  if (ref.fulfills === false && data.fulfills === false) return { objectiveMet: false, verdictEventId };
+  return { verdictEventId };
 }
 
-/** Outcomes that are neither a landed call nor a failed one: the call waits
- *  on the owner, or the ledger cannot yet say whether a write took. */
-const NO_TOOL_VERDICT = new Set(['input_required', 'uncertain_write']);
+/** Outcomes that are neither landed nor failed: the call waits on the owner. */
+const WAITING = new Set(['input_required']);
 
 /**
- * Whether the turn's tool calls landed: true when every dispatched call
- * succeeded or honestly came back empty, false when any failed after it was
- * dispatched. A call the host refused before dispatch never reached a tool,
- * so it is not counted either way.
+ * Whether the turn's tool calls landed. A failure after dispatch is false and
+ * outranks everything. A write whose outcome is uncertain makes the result
+ * unknown, whatever its siblings did, and is counted. Otherwise true when
+ * every dispatched call succeeded or honestly came back empty. A call the host
+ * refused before dispatch never reached a tool and is not counted.
  */
 export function toolSuccessFromSettlements(
   rows: ReadonlyArray<{ execution_kind: string; outcome_kind: string }>,
-): Pick<SourceRouteVerdict, 'toolSuccess' | 'toolCalls'> {
-  const counted = rows.filter((row) => row.execution_kind !== 'refused_pre_dispatch' && !NO_TOOL_VERDICT.has(row.outcome_kind));
-  if (counted.length === 0) return { toolCalls: 0 };
-  return {
-    toolSuccess: counted.every((row) => row.outcome_kind === 'succeeded' || row.outcome_kind === 'empty_result'),
-    toolCalls: counted.length,
-  };
+): Pick<SourceRouteVerdict, 'toolSuccess' | 'toolCalls' | 'uncertainWrites'> {
+  const dispatched = rows.filter((row) => row.execution_kind !== 'refused_pre_dispatch' && !WAITING.has(row.outcome_kind));
+  const uncertainWrites = dispatched.filter((row) => row.outcome_kind === 'uncertain_write').length;
+  const known = dispatched.filter((row) => row.outcome_kind !== 'uncertain_write');
+  const failed = known.some((row) => row.outcome_kind !== 'succeeded' && row.outcome_kind !== 'empty_result');
+  if (failed) return { toolSuccess: false, toolCalls: known.length, uncertainWrites };
+  if (uncertainWrites > 0 || known.length === 0) return { toolCalls: known.length, uncertainWrites };
+  return { toolSuccess: true, toolCalls: known.length, uncertainWrites };
 }
 
 function sourceSettlements(identity: SourceIdentity, db: Database.Database): Array<{ execution_kind: string; outcome_kind: string }> {
@@ -90,20 +114,15 @@ function sourceSettlements(identity: SourceIdentity, db: Database.Database): Arr
   `).all(identity.sessionId, identity.sourceUserSeq) as Array<{ execution_kind: string; outcome_kind: string }>;
 }
 
-export function readSourceRouteVerdict(
-  identity: SourceIdentity,
-  deps: { settlementsDb?: Database.Database } = {},
-): SourceRouteVerdict {
-  const objective = objectiveFromVerdictRows(listEvents(identity.sessionId, { types: ['goal_alignment_judged'] }),
-    identity.sourceUserSeq);
-  const tools = toolSuccessFromSettlements(sourceSettlements(identity, deps.settlementsDb ?? openEventLog()));
-  return { ...objective, ...tools };
-}
-
 /** When the source was accepted, to bound the decision scan to its lifetime. */
 function sourceAcceptedAt(identity: SourceIdentity): string | undefined {
   const [row] = listEvents(identity.sessionId, { sinceSeq: identity.sourceUserSeq - 1, limit: 1 });
   return row?.seq === identity.sourceUserSeq ? row.createdAt : undefined;
+}
+
+function readPublishedVerdictRef(terminal: Pick<EventRow, 'data'>): PublishedVerdictRef | undefined {
+  const ref = (terminal.data as Record<string, unknown>).completionVerdictRef;
+  return ref && typeof ref === 'object' ? ref as PublishedVerdictRef : undefined;
 }
 
 export interface RouteOutcomeJoin {
@@ -113,17 +132,35 @@ export interface RouteOutcomeJoin {
 }
 
 /**
- * Join one finished source's verdict onto its brain request. A source with no
- * review and no calls changes nothing. Writing the same verdict twice is a
- * no-op, so a replayed terminal records once.
+ * Join one published terminal's verdict and tool result onto the brain
+ * request that wrote the reviewed reply, in the terminal's own run attempt.
+ * A terminal with no attempt, or nothing proven, changes nothing. Writing the
+ * same verdict twice is a no-op, so a replayed terminal records once.
  */
 export function joinRouteOutcomeVerdict(
-  identity: SourceIdentity,
+  input: SourceIdentity & { terminal: Pick<EventRow, 'id' | 'data' | 'createdAt'> },
   deps: { metricsDb?: Database.Database; settlementsDb?: Database.Database } = {},
 ): RouteOutcomeJoin {
-  const verdict = readSourceRouteVerdict(identity, deps);
-  if (verdict.objectiveMet === undefined && verdict.toolSuccess === undefined) return { verdict, updated: false };
-  const decision = latestSourceRouteDecision({ ...identity, role: 'brain', since: sourceAcceptedAt(identity) }, deps.metricsDb);
+  const identity = { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq };
+  const terminalData = input.terminal.data as Record<string, unknown>;
+  const runAttemptId = typeof terminalData.attemptId === 'string' && terminalData.attemptId ? terminalData.attemptId : null;
+  const ref = readPublishedVerdictRef(input.terminal);
+  const verdictRow = ref?.eventId ? getEvent(ref.eventId) : null;
+  // The work's own source: a terminal published under an approval answers for
+  // the request that was approved, and that request's calls are its tools.
+  const workSource = { sessionId: identity.sessionId,
+    sourceUserSeq: Number.isSafeInteger(ref?.sourceUserSeq) && (ref?.sourceUserSeq ?? 0) > 0 ? ref!.sourceUserSeq! : identity.sourceUserSeq };
+  const verdict: SourceRouteVerdict = {
+    ...objectiveFromPublishedVerdict(ref, verdictRow),
+    ...toolSuccessFromSettlements(sourceSettlements(workSource, deps.settlementsDb ?? openEventLog())),
+  };
+  const nothingProven = verdict.objectiveMet === undefined && verdict.toolSuccess === undefined && verdict.uncertainWrites === 0;
+  if (!runAttemptId || nothingProven) return { verdict, updated: false };
+  const decision = attemptRouteDecision({
+    sessionId: identity.sessionId, runAttemptId, role: 'brain',
+    since: sourceAcceptedAt(workSource) ?? sourceAcceptedAt(identity),
+    until: verdictRow?.createdAt ?? input.terminal.createdAt,
+  }, deps.metricsDb);
   if (!decision) return { verdict, updated: false };
   const updated = updateModelRouteOutcomeVerdict(decision.id, {
     objectiveMet: verdict.objectiveMet,
@@ -131,8 +168,12 @@ export function joinRouteOutcomeVerdict(
     toolCalls: verdict.toolCalls,
     basis: {
       sourceUserSeq: identity.sourceUserSeq,
-      turnRequests: decision.requests,
+      ...(workSource.sourceUserSeq !== identity.sourceUserSeq ? { workSourceUserSeq: workSource.sourceUserSeq } : {}),
+      runAttemptId,
+      terminalEventId: String(input.terminal.id),
+      attemptRequests: decision.requests,
       ...(verdict.verdictEventId ? { verdictEventId: verdict.verdictEventId } : {}),
+      ...(verdict.uncertainWrites > 0 ? { uncertainWrites: verdict.uncertainWrites } : {}),
     },
   }, deps.metricsDb);
   if (updated) recordJudged(identity, decision.id, 'brain', verdict);
@@ -141,18 +182,21 @@ export function joinRouteOutcomeVerdict(
 
 /**
  * A helper's own result is its signal: the request that wrote the helper's
- * answer records whether the helper came back with a usable result.
+ * answer, in the helper's own run attempt, records whether it came back with
+ * a usable result.
  */
 export function joinWorkerRouteOutcome(
-  identity: SourceIdentity & { usable: boolean },
+  identity: SourceIdentity & { runAttemptId: string; usable: boolean },
   deps: { metricsDb?: Database.Database } = {},
 ): RouteOutcomeJoin {
-  const verdict: SourceRouteVerdict = { toolSuccess: identity.usable, toolCalls: 0 };
-  const decision = latestSourceRouteDecision({ ...identity, role: 'worker', since: sourceAcceptedAt(identity) }, deps.metricsDb);
+  const verdict: SourceRouteVerdict = { toolSuccess: identity.usable, toolCalls: 0, uncertainWrites: 0 };
+  const decision = attemptRouteDecision({ sessionId: identity.sessionId, runAttemptId: identity.runAttemptId,
+    role: 'worker', since: sourceAcceptedAt(identity) }, deps.metricsDb);
   if (!decision) return { verdict, updated: false };
   const updated = updateModelRouteOutcomeVerdict(decision.id, {
     toolSuccess: identity.usable,
-    basis: { sourceUserSeq: identity.sourceUserSeq, workerResult: identity.usable ? 'usable' : 'unusable' },
+    basis: { sourceUserSeq: identity.sourceUserSeq, runAttemptId: identity.runAttemptId,
+      workerResult: identity.usable ? 'usable' : 'unusable' },
   }, deps.metricsDb);
   if (updated) recordJudged(identity, decision.id, 'worker', verdict);
   return { decisionId: decision.id, verdict, updated };
@@ -171,6 +215,7 @@ function recordJudged(identity: SourceIdentity, decisionId: string, role: ModelR
       ...(verdict.objectiveMet !== undefined ? { objectiveMet: verdict.objectiveMet } : {}),
       ...(verdict.toolSuccess !== undefined ? { toolSuccess: verdict.toolSuccess } : {}),
       toolCalls: verdict.toolCalls,
+      ...(verdict.uncertainWrites > 0 ? { uncertainWrites: verdict.uncertainWrites } : {}),
       ...(verdict.verdictEventId ? { verdictEventId: verdict.verdictEventId } : {}),
     },
   });

@@ -1903,7 +1903,8 @@ export function commitTurnOutcome(
   // route metrics for the route policy, whatever the terminal's status.
   if (terminal.inserted) {
     const identity = { sessionId: persisted.identity.sessionId, sourceUserSeq: persisted.identity.sourceUserSeq };
-    scheduleRouteOutcomeJoin(() => joinRouteOutcomeVerdict(identity));
+    const published = terminal.event;
+    scheduleRouteOutcomeJoin(() => joinRouteOutcomeVerdict({ ...identity, terminal: published }));
   }
   // NOTE: the run attempt is closed by the terminal publication itself, in the
   // same transaction (eventlog `terminalOwner` branch). A best-effort finish
