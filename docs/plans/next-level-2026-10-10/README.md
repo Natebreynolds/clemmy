@@ -185,6 +185,7 @@ ship as one release. PR-05 is the first automatic behaviour and stays opt-in.
 - [RUNBOOK-local-merge-and-test.md](RUNBOOK-local-merge-and-test.md): merging this branch, the baseline, the hotpatch traps, per-PR fixtures, the handoff prompt.
 - [TEST-LANDSCAPE.md](TEST-LANDSCAPE.md): what the suite proves and does not, the baseline classification, rules for touching a failing case.
 - `docs/checkpoints/2026-10-10-ci-baseline.md`: the failing-file list on `b0612dd`, case by case.
+- [WORKFLOWS-refinements.md](WORKFLOWS-refinements.md): why a legacy workflow draws as one block, and nine refinements to the canvas, creation, editing and running.
 
 ## 7. Measurement that every PR reports
 
