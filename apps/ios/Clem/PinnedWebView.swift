@@ -224,6 +224,8 @@ final class WebViewModel: NSObject, ObservableObject {
     private let notify = UINotificationFeedbackGenerator()
     private let refreshControl = UIRefreshControl()
     private var artifactDownloads: [ObjectIdentifier: URL] = [:]
+    private var nativeVoiceBridgeReady = false
+    private var pendingNativeVoiceConversation: String?
 
     init(
         pairing: Pairing,
@@ -262,6 +264,9 @@ final class WebViewModel: NSObject, ObservableObject {
             "clemWidgetNavigationHandled",
             "clemWidgetNavigationReady",
             "clemWidgetSpace",
+            "clemNativeVoiceReady",
+            "clemNativeVoiceSession",
+            "clemNativeVoiceClear",
         ] {
             config.userContentController.add(scriptProxy, name: name)
         }
@@ -306,6 +311,7 @@ final class WebViewModel: NSObject, ObservableObject {
     }
 
     func load(_ url: URL, pendingPushNotificationID: String? = nil, pendingWidgetID: UUID? = nil) {
+        nativeVoiceBridgeReady = false
         connectionLost = false
         lastRequestedURL = url
         let navigation = webView.load(URLRequest(url: url))
@@ -558,6 +564,7 @@ final class WebViewModel: NSObject, ObservableObject {
         pendingPushNavigationAllowed = allowed
         if allowed {
             resumePendingPushNavigation()
+            prepareNativeVoice()
         } else {
             // A delivery with no page receipt is retryable after the next
             // unlock/foreground, even if its original WKNavigation completed
@@ -566,6 +573,53 @@ final class WebViewModel: NSObject, ObservableObject {
             inFlightPushNavigation = nil
             inFlightWidgetID = nil
             inFlightWidgetNavigation = nil
+        }
+    }
+
+    /// Native keeps its own device-bound key. Only the authenticated paired
+    /// main frame may provision it, after the same owner/foreground gate.
+    func prepareNativeVoice(force: Bool = false) {
+        guard #available(iOS 18.0, *), pendingPushNavigationAllowed,
+              nativeVoiceBridgeReady, hasLoadedOnce else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                if force { await WidgetVoiceSession.shared.reconnect() }
+                guard await WidgetVoiceSession.shared.needsProvisioning() else { self.deliverNativeVoiceConversation(); return }
+                let request = try await WidgetVoiceSession.shared.prepareProvisioning()
+                guard self.pendingPushNavigationAllowed, self.nativeVoiceBridgeReady,
+                      PairingStore.load()?.fingerprint == self.pairing.fingerprint,
+                      let json = String(data: try JSONEncoder().encode(request), encoding: .utf8) else { return }
+                _ = try await self.webView.evaluateJavaScript("window.clemNative?.prepareVoice?.(\(json)); true")
+                self.deliverNativeVoiceConversation()
+            } catch { /* The native setup surface exposes connection recovery. */ }
+        }
+    }
+
+    fileprivate func nativeVoiceReady() {
+        nativeVoiceBridgeReady = true
+        prepareNativeVoice()
+        deliverNativeVoiceConversation()
+    }
+
+    fileprivate func acceptNativeVoiceSession(_ body: [String: Any]) {
+        guard #available(iOS 18.0, *), pendingPushNavigationAllowed, nativeVoiceBridgeReady else { return }
+        Task { @MainActor in await WidgetVoiceSession.shared.acceptProvisioning(body) }
+    }
+
+    func openNativeVoiceConversation(_ sessionId: String) {
+        guard sessionId.range(of: "^[a-zA-Z0-9:_-]{1,200}$", options: .regularExpression) != nil else { return }
+        pendingNativeVoiceConversation = sessionId
+        deliverNativeVoiceConversation()
+    }
+
+    private func deliverNativeVoiceConversation() {
+        guard pendingPushNavigationAllowed, nativeVoiceBridgeReady, hasLoadedOnce,
+              let sessionId = pendingNativeVoiceConversation,
+              let data = try? JSONSerialization.data(withJSONObject: ["sessionId": sessionId]),
+              let json = String(data: data, encoding: .utf8) else { return }
+        webView.evaluateJavaScript("!window.dispatchEvent(new CustomEvent('clem:native-voice-conversation',{cancelable:true,detail:\(json)}))") { [weak self] handled, _ in
+            if handled as? Bool == true, self?.pendingNativeVoiceConversation == sessionId { self?.pendingNativeVoiceConversation = nil }
         }
     }
 
@@ -809,6 +863,7 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
         finishPendingPushNavigation(navigation)
         finishConnectionRouteNavigation(navigation)
         hasLoadedOnce = true
+        prepareNativeVoice()
         connectionLost = false
         certificatePinFailed = false
         // The page loaded, so a remote origin has now earned persistence.
@@ -1157,6 +1212,17 @@ private final class ScriptProxy: NSObject, WKScriptMessageHandler {
             model?.acceptsBridgeMessage(message) == true
         }
         guard accepted else { return }
+
+        if message.name == "clemNativeVoiceReady", message.body as? Bool == true {
+            MainActor.assumeIsolated { model?.nativeVoiceReady() }; return
+        }
+        if message.name == "clemNativeVoiceSession", let body = message.body as? [String: Any] {
+            MainActor.assumeIsolated { model?.acceptNativeVoiceSession(body) }; return
+        }
+        if message.name == "clemNativeVoiceClear", message.body as? Bool == true {
+            if #available(iOS 18.0, *) { MainActor.assumeIsolated { WidgetVoiceSession.shared.beginClear() } }
+            return
+        }
 
         if message.name == "clemWidgetNavigationReady", message.body as? Bool == true {
             MainActor.assumeIsolated { model?.resumePendingPushNavigation() }

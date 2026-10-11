@@ -49,6 +49,10 @@
 	<string>Clem uses the camera only to scan the pairing QR code shown on your Mac.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Clem uses the microphone when you tap Dictate or Talk to Clem to talk instead of typing. Speech is transcribed on your Mac or by your configured transcription service.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>UIBackgroundModes</key>
+	<array><string>audio</string></array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Clem finds your paired Mac on the local network; away from Wi-Fi, it can use a pinned encrypted relay to that same Mac.</string>
 	<key>NSBonjourServices</key>

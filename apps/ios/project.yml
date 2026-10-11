@@ -56,7 +56,7 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: false
         ENABLE_PREVIEWS: true
-        CURRENT_PROJECT_VERSION: 14
+        CURRENT_PROJECT_VERSION: 15
         MARKETING_VERSION: 0.1.0
       configs:
         # Debug runs from Xcode against the sandbox, which is the daemon's
@@ -92,8 +92,9 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: false
         APPLICATION_EXTENSION_API_ONLY: true
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) CLEM_WIDGET_EXTENSION
         SKIP_INSTALL: true
-        CURRENT_PROJECT_VERSION: 14
+        CURRENT_PROJECT_VERSION: 15
         MARKETING_VERSION: 0.1.0
   ClemTests:
     type: bundle.unit-test

@@ -11,6 +11,7 @@ struct RootView: View {
     @State private var launchURL: URL?
     @State private var confirmUnpair = false
     @State private var searching = false
+    @State private var widgetVoiceOpen = false
     @StateObject private var gate = BiometricGate()
     @Environment(\.scenePhase) private var scenePhase
 
@@ -71,8 +72,23 @@ struct RootView: View {
             }
         }
         .preferredColorScheme(.light)
-        .onAppear { synchronizePendingNavigationDelivery() }
+        .onAppear {
+            synchronizePendingNavigationDelivery()
+            connectWidgetVoice()
+        }
+        .sheet(isPresented: $widgetVoiceOpen) {
+            if #available(iOS 18.0, *), gate.unlocked {
+                WidgetVoiceSheet(onReconnect: { model?.prepareNativeVoice(force: true) })
+            }
+        }
         .onOpenURL { url in
+            if url.scheme == "clem", ["voice-setup", "recording"].contains(url.host ?? ""),
+               url.user == nil, url.password == nil, url.port == nil, url.query == nil,
+               url.fragment == nil, url.path.isEmpty {
+                if gate.unlocked { widgetVoiceOpen = true }
+                else if #available(iOS 18.0, *) { WidgetVoiceSession.shared.setupRequested = true }
+                return
+            }
             // A widget chooses a bounded in-app destination only. Pairing and
             // Face ID remain the authorities for delivery, including cold start.
             guard let fingerprint = model?.pairing.fingerprint,
@@ -82,6 +98,7 @@ struct RootView: View {
         }
         .onChange(of: gate.unlocked) { _, _ in
             synchronizePendingNavigationDelivery()
+            connectWidgetVoice()
         }
         .onReceive(
             NotificationCenter.default.publisher(for: AppDelegate.pendingNavigationChanged)
@@ -104,18 +121,28 @@ struct RootView: View {
             case .active:
                 gate.noteForegrounded()
                 synchronizePendingNavigationDelivery()
+                connectWidgetVoice()
             @unknown default: break
             }
         }
     }
 
     private func unpair() {
+        if #available(iOS 18.0, *) { WidgetVoiceSession.shared.beginClear() }
         OriginHandoffStore.clear()
         PendingPushNavigationStore.clear()
         clearWidgetState()
         PairingStore.clear()
         launchURL = nil
         model = nil
+    }
+
+    private func connectWidgetVoice() {
+        guard #available(iOS 18.0, *), gate.unlocked, scenePhase == .active else { return }
+        let voice = WidgetVoiceSession.shared
+        voice.refreshPairing()
+        voice.onOpenConversation = { sessionId in model?.openNativeVoiceConversation(sessionId) }
+        if voice.setupRequested { widgetVoiceOpen = true }
     }
 
     private func synchronizePendingNavigationDelivery() {
