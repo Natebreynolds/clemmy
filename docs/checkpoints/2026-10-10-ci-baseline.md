@@ -110,3 +110,22 @@ Rule for every later run: compare the failing-file **list** against §1. A file
 not listed is a regression. A listed case that goes green is recorded here with
 the commit that fixed it. The §2 cases are expected on any machine without the
 local retrieval model and under full load; they are not a pass or a fail of a PR.
+
+## 4. Resolved since (2026-10-10, on main)
+
+Every row of §1 has a commit. Expected CI unit failing list after these: empty
+(the frozen-lane cases are skipped with the freeze named in the skip reason).
+
+| Rows | How | Commit |
+|---|---|---|
+| 20, 21 | pins moved to what main does on purpose (credential-policy closure leaves; the v3.18.32 third reconciliation clause) | `e7386a94c` |
+| 5, 7–11, 15, 16 | ownerless stalls and zero-tool admission stops state facts only; six stale wording pins moved | `f63dd96c5` |
+| 6, 12, 13, 14 | skipped: the Claude SDK brain lane is frozen (owner, 10-04) | `f63dd96c5` |
+| 1–4 | inactive BYO-declared bindings report `byo`; option tests state the 10-05 subscription-lane routing; memory route pins both all-in cases | `1235e7beb` |
+| 17, 18 | a tool's own `*_not_dispatched` proof settles repairable | `e35dd3bbd` |
+| 19 | the kernel asks the provider port about outgoing files; names no provider | `72114f9ce` |
+| 22 | a bare yes to a counted proposal carries that batch (§2b's recommendation) | `c81704744` |
+
+Not in CI's unit targets and still failing locally on main and before it: the
+`src/journeys/*` acceptance and competitive files (their own `npm run journeys`
+gate). They are the next list to classify.
