@@ -226,7 +226,13 @@ function inlineNumberedMembers(text: string): Array<{ index: number; body: strin
   return members.every(member => member.body.length > 0) ? members : [];
 }
 
-export function detectMultiItemIntent(input: string): MultiItemIntent {
+export function detectMultiItemIntent(
+  input: string,
+  /** The owner just said yes to exactly this proposal. Its counted write is
+   *  the batch they agreed to, so a write needs no enumerated list; every
+   *  other gate (ranges, single artifacts, aggregates) still decides. */
+  options: { affirmedProposal?: boolean } = {},
+): MultiItemIntent {
   try {
     const rawText = (typeof input === 'string' ? input : '').trim();
     const text = canonicalMultiItemObjective(rawText);
@@ -475,6 +481,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
     const sameShapeWork = READ_RE.test(operationText)
       || DEEP_WORK_RE.test(operationText)
       || (enumerated && WRITE_RE.test(operationText))
+      || (options.affirmedProposal === true && WRITE_RE.test(operationText))
       || anaphoricOperation
       || explicitParallelRequest
       || explicitPerTarget
@@ -547,7 +554,9 @@ export function detectMultiItemIntentFromConversation(
     // one synthesis artifact. Detect only the proposal clause, never the stale
     // completion prefix.
     const proposal = prior.slice(proposalCue.index);
-    const carried = detectMultiItemIntent(proposal);
+    // A bare yes affirms the proposal itself: the scope it states is the
+    // owner's agreed fact, not prose for the stricter fresh-count parse.
+    const carried = detectMultiItemIntent(proposal, { affirmedProposal: SHORT_CONTINUATION_RE.test(text) });
     if (carried.isMultiItem) return { ...carried, carriedFromPrior: true };
     if (ANAPHORIC_CONTINUATION_RE.test(proposal)) {
       if (ANAPHORIC_SINGLE_OUTPUT_PROPOSAL_RE.test(proposal)) return direct;

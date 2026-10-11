@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { detectMultiItemIntent } from './multi-item-intent.js';
+import { detectMultiItemIntent, detectMultiItemIntentFromConversation } from './multi-item-intent.js';
 
 test('report quantities and unrelated work verbs do not declare independent jobs', () => {
   for (const input of [
@@ -60,4 +60,16 @@ test('direct counted authoring still declares the exact independent outputs', ()
     assert.equal(intent.isMultiItem, true, input);
     assert.equal(intent.itemCount, count, input);
   }
+});
+
+test('a bare yes to a counted write proposal carries that batch; a fresh counted write still does not', () => {
+  const proposal = ['Should I send Outlook emails to all 18 contacts?'];
+  const affirmed = detectMultiItemIntentFromConversation('Yes.', proposal);
+  assert.equal(affirmed.isMultiItem, true);
+  assert.equal(affirmed.itemCount, 18);
+  assert.equal(affirmed.carriedFromPrior, true);
+  // The same counted write asked fresh keeps the 10-05 precision.
+  assert.equal(detectMultiItemIntent('send Outlook emails to the 18 contacts').isMultiItem, false);
+  // A range in the proposal is still not an exact set, even when affirmed.
+  assert.equal(detectMultiItemIntentFromConversation('Yes.', ['Should I email 10–12 of the contacts?']).isMultiItem, false);
 });
