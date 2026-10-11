@@ -165,6 +165,8 @@ const capabilityCandidates = await import('../runtime/read-path/capability-candi
 const proactivity = await import('../agents/proactivity-policy.js');
 const documentedCreates = await import('../runtime/harness/documented-create-result-evidence.js');
 const terminalLearning = await import('../memory/semantic-learning-worker.js');
+const learningWorker = await import('../memory/learning-worker.js');
+const aliasIndex = await import('../memory/capability-alias-index.js');
 const learningIntake = await import('../memory/learning-intake.js');
 const sourceMap = await import('../memory/source-map.js');
 const reflection = await import('../memory/reflection.js');
@@ -1295,6 +1297,14 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   assert.equal(delivery.followups.length, 0);
   assert.equal(delivery.edits.at(-1), SUCCESS);
   assert.match(delivery.edits.at(-1) ?? '', new RegExp(SHEET_URL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+  // The verified read is learned by a background drain the settlement only
+  // schedules; run it here so the warm turn never races that timer, and a
+  // declined learning fails with its own reason rather than downstream.
+  const readLearning = await learningWorker.drainPendingLearning();
+  assert.equal(readLearning.failed, 0, JSON.stringify({ readLearning, pending: aliasIndex.listPendingLearning() }));
+  assert.equal(eventlog.listEvents(session.id, { types: ['read_receipt'] }).length, 1,
+    JSON.stringify(aliasIndex.listPendingLearning()));
 
   const learned = await terminalLearning.drainTerminalSemanticLearning({
     requireIdle: false,
