@@ -45,10 +45,19 @@ jobs:
 
   ios-tests:
     name: iOS unit tests
-    runs-on: macos-14
+    # The widget voice intent uses the iOS 18 SDK (AudioRecordingIntent);
+    # macos-14's default Xcode 15.4 ships only the iOS 17.5 SDK.
+    runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v5
+
+      - name: Require an iOS 18+ simulator SDK
+        run: |
+          xcodebuild -version
+          sdk="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+          echo "iphonesimulator SDK $sdk"
+          test "${sdk%%.*}" -ge 18 || { echo "::error::iOS simulator SDK $sdk is older than 18; the app uses iOS 18 APIs"; exit 1; }
 
       - name: Install XcodeGen
         run: brew install xcodegen
