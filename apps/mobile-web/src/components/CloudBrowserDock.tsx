@@ -1,19 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { flushSync } from 'preact/compat';
-import { browserClosesText, browserElapsed, browserFocusPage, browserBoundInputAllowed, browserViewTarget, browserCloseResultMessage, startBrowserViewLifecycle, browserResourceKey, browserStopMessage, browsersChipLabel, canApplyBrowserResponse, canApplyBrowserControlResponse, createBrowserViewerLeases, canStartBrowserInTask, isBrowserDisconnected, type CloudBrowserOpenBrowser, type CloudBrowserOverview, type CloudBrowserResource, type CloudBrowserStatus, type CloudBrowserUnlinkedSession, type BrowserViewLifecycle, type CloudBrowserView } from '@clem/chat-engine';
+import { browserClosesText, browserElapsed, browserFocusPage, browserBoundInputAllowed, browserViewTarget, browserCloseResultMessage, startBrowserViewLifecycle, browserResourceKey, browserStopMessage, canApplyBrowserResponse, canApplyBrowserControlResponse, createBrowserViewerLeases, canStartBrowserInTask, isBrowserDisconnected, type CloudBrowserOpenBrowser, type CloudBrowserOverview, type CloudBrowserResource, type CloudBrowserStatus, type CloudBrowserUnlinkedSession, type BrowserViewLifecycle, type CloudBrowserView } from '@clem/chat-engine';
 import { cloudBrowser } from '../lib/cloud-browser';
+import { conversationBrowsersInUse } from '../lib/chat-browser-visibility';
 const Globe = () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z" /></svg>;
-export function CloudBrowserDock({ conversationId }: { conversationId?: string }) {
+export function CloudBrowserDock({ conversationId, openRequest = 0, onReturn }: { conversationId?: string; openRequest?: number; onReturn?: () => void }) {
   if (!conversationId) return null;
-  return <TaskBrowser key={conversationId} conversationId={conversationId} />;
+  return <TaskBrowser key={conversationId} conversationId={conversationId} openRequest={openRequest} onReturn={onReturn} />;
 }
-function TaskBrowser({ conversationId }: { conversationId: string }) {
+function TaskBrowser({ conversationId, openRequest, onReturn }: { conversationId: string; openRequest: number; onReturn?: () => void }) {
   const [status, setStatus] = useState<CloudBrowserStatus | null>(null);
   const [statusFailed, setStatusFailed] = useState(false);
   const [visible, setVisible] = useState(!document.hidden);
   const [resources, setResources] = useState<CloudBrowserResource[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [open, setOpen] = useState(false); const [busy, setBusy] = useState<string | null>(null);
+  const lastOpenRequest = useRef(0);
+  useEffect(() => {
+    if (!openRequest || openRequest === lastOpenRequest.current) return;
+    lastOpenRequest.current = openRequest;
+    setOpen(true);
+  }, [openRequest]);
   const [notice, setNotice] = useState(''); const [recording, setRecording] = useState(false);
   const [recoveryId, setRecoveryId] = useState('');
   const [view, setView] = useState<(CloudBrowserView & { key: string }) | null>(null);
@@ -173,14 +180,19 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
     catch { if (mounted.current) { setNotice('Recovery was not confirmed. Check the session ID in your Browserbase project, then refresh.'); await refresh(); } }
     finally { if (mounted.current) setBusy(null); }
   };
-  const close = () => { void lifecycle.current?.stop(); setOpen(false); trigger.current?.focus(); };
+  const close = () => {
+    void lifecycle.current?.stop(); setOpen(false);
+    window.requestAnimationFrame(() => { if (trigger.current?.isConnected) trigger.current.focus(); else onReturn?.(); });
+  };
   const others = (overview?.browsers ?? []).filter((item) => item.conversationId !== conversationId);
   const lost = overview?.unlinked ?? [];
-  const openCount = (overview?.browsers.length ?? 0) + lost.length;
+  const inUse = conversationBrowsersInUse(resources);
+  const shortcut = inUse[0];
   const thisEntry = resource ? overview?.browsers.find((item) => item.id === resource.id) : undefined;
   const now = Date.now();
+  if (!open && !shortcut) return null;
   return <div class="m-browser-dock">
-    <button ref={trigger} type="button" class="m-browser-trigger" aria-expanded={open} onClick={() => setOpen(true)}><Globe /><span>{browsersChipLabel(openCount)}</span><span>{resource ? `${resource.returnPending ? 'Waiting for open views' : active ? resource.controller === 'human' ? 'Your control' : 'Clem is browsing' : resource.state} · ${browserElapsed(resource.elapsedSeconds)}` : 'For this conversation'}</span></button>
+    {shortcut ? <button ref={trigger} type="button" class="m-browser-trigger" aria-expanded={open} onClick={() => { setSelectedId(shortcut.id); setOpen(true); }}><Globe /><span>Browser</span><span>{inUse.length > 1 ? `${inUse.length} open` : shortcut.returnPending ? 'Returning control' : shortcut.state === 'active' ? shortcut.controller === 'human' ? 'Your control' : 'Working' : shortcut.state === 'uncertain' ? 'Check status' : shortcut.state === 'starting' ? 'Starting' : 'Stopping'}</span></button> : null}
     {open ? <section class="m-browser-layer" aria-label="Conversation browser" onKeyDown={(event) => { if (event.key === 'Escape') close(); }}>
       <header><button ref={returnButton} type="button" onClick={close}>Return to chat</button><span>{resource ? browserElapsed(resource.elapsedSeconds) : 'Browser'}{resource?.recording ? ' · Recording on' : ''}{thisEntry ? ` · ${browserClosesText(thisEntry, now)}` : ''}</span></header>
       {resources.length > 1 ? <label class="m-browser-select">Browser session<select value={resource?.id ?? ''} onChange={(event) => setSelectedId(event.currentTarget.value)}>{resources.map((item) => <option key={item.id} value={item.id}>{browserFocusPage(item)?.title || 'Browser'} · {item.state}</option>)}</select></label> : null}

@@ -1,4 +1,4 @@
-import type { ChatAttachment } from '@clem/chat-engine';
+import type { ChatAttachment, ComposerMode } from '@clem/chat-engine';
 import { api, type ApiError } from './api';
 import type { SessionFile, SessionFileRef } from './session-files';
 
@@ -16,6 +16,22 @@ export interface MobileDraft {
   context: SelectedFileContext | null;
   prepared?: { key: string; attachment: ChatAttachment };
   failed?: FailedFileRequest;
+  stagedAttachments?: MobileStagedAttachment[];
+  agentChoice?: MobileDraftChoice;
+  projectChoice?: MobileDraftChoice;
+  composerMode?: ComposerMode;
+}
+export interface MobileStagedAttachment extends ChatAttachment { uploading?: boolean; error?: string }
+export type MobileChatChoice = { id: string; name: string } | null;
+export interface MobileDraftChoice { value: MobileChatChoice; pending: boolean }
+
+/** Unsent choices (including Clem / no project) take precedence on reopening. */
+export function reconcileDraftChoice(saved: MobileDraftChoice | undefined, server: MobileChatChoice): MobileDraftChoice {
+  return saved?.pending && (saved.value?.id ?? null) !== (server?.id ?? null) ? saved : { value: server, pending: false };
+}
+/** A slow switch cannot erase a newer choice made while it was being applied. */
+export function settleDraftChoice(saved: MobileDraftChoice | undefined, requestedId: string | null, server: MobileChatChoice): MobileDraftChoice {
+  return saved?.pending && (saved.value?.id ?? null) !== requestedId ? saved : { value: server, pending: false };
 }
 
 export function fileContextKey(context: SelectedFileContext): string {
@@ -30,7 +46,26 @@ export function selectedFileContext(sessionId: string, file: SessionFile): Selec
 /** Memory belongs to this window. It is not persisted or shared with another device. */
 export class MobileDraftStore {
   private drafts = new Map<string, MobileDraft>();
+  private aliases = new Map<string, string>();
+  private listeners = new Set<() => void>();
+  private epoch = 0;
+  constructor(private readonly releasePreview = (url: string) => URL.revokeObjectURL(url)) {}
+  get generation(): number { return this.epoch; }
+  /** Async owners keep this token across navigation, but never across sign-out. */
+  patchInGeneration(scope: string, generation: number, patch: Partial<MobileDraft>): MobileDraft | null {
+    return generation === this.epoch ? this.patch(scope, patch) : null;
+  }
+  private resolve(scope: string): string { return this.aliases.get(scope) ?? scope; }
+  private changed(): void { for (const listener of this.listeners) listener(); }
+  subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
+  private releaseRemoved(previous: MobileDraft | undefined, next?: MobileDraft): void {
+    const kept = new Set(next?.stagedAttachments?.map(file => file.previewUrl));
+    for (const url of new Set(previous?.stagedAttachments?.map(file => file.previewUrl))) {
+      if (url && !kept.has(url)) this.releasePreview(url);
+    }
+  }
   read(scope: string, initialText = ''): MobileDraft {
+    scope = this.resolve(scope);
     const saved = this.drafts.get(scope);
     if (saved) {
       if (!saved.text && initialText && !saved.failed) { const next = { ...saved, text: initialText }; this.drafts.set(scope, next); return next; }
@@ -41,8 +76,11 @@ export class MobileDraftStore {
     return draft;
   }
   patch(scope: string, patch: Partial<MobileDraft>): MobileDraft {
-    const next = { ...this.read(scope), ...patch };
-    this.drafts.set(scope, next);
+    const previous = this.read(scope);
+    const next = { ...previous, ...patch };
+    this.releaseRemoved(previous, next);
+    this.drafts.set(this.resolve(scope), next);
+    this.changed();
     return next;
   }
   select(scope: string, context: SelectedFileContext): MobileDraft {
@@ -50,12 +88,17 @@ export class MobileDraftStore {
     return this.patch(scope, { context, ...(current.context && fileContextKey(current.context) === fileContextKey(context) ? {} : { prepared: undefined }) });
   }
   move(from: string, to: string): void {
-    if (from === to) return;
+    if (from === to || this.aliases.has(from)) return;
     const draft = this.drafts.get(from);
-    if (draft) this.drafts.set(to, draft);
+    if (draft) { this.releaseRemoved(this.drafts.get(to), draft); this.drafts.set(to, draft); }
     this.drafts.delete(from);
+    this.aliases.set(from, to);
+    this.changed();
   }
-  clear(): void { this.drafts.clear(); }
+  clear(): void {
+    for (const draft of this.drafts.values()) this.releaseRemoved(draft);
+    this.drafts.clear(); this.aliases.clear(); this.epoch += 1; this.changed();
+  }
 }
 export const mobileDrafts = new MobileDraftStore();
 let draftSequence = 0;
@@ -90,6 +133,10 @@ export function fileSendWasNotAdmitted(error: unknown): boolean {
 export function settledFileRequest(current: MobileDraft, request: FailedFileRequest): Partial<MobileDraft> {
   if (current.failed?.messageId !== request.messageId) return {};
   const patch: Partial<MobileDraft> = { failed: undefined };
+  if (current.stagedAttachments) {
+    const sent = new Set(request.attachmentIds);
+    patch.stagedAttachments = current.stagedAttachments.filter(file => !sent.has(file.id));
+  }
   const sameContext = Boolean(current.context && request.context && fileContextKey(current.context) === fileContextKey(request.context)
     && current.prepared?.attachment.id === request.contextAttachment?.id);
   if (sameContext) {
@@ -118,6 +165,8 @@ export async function submitFileDraft(input: {
   attachments: ChatAttachment[];
   busy: () => boolean;
   current: () => boolean;
+  /** The same window/account owner, even when its screen has unmounted. */
+  latest?: () => MobileDraft | null;
   prepare: (context: SelectedFileContext) => Promise<ChatAttachment>;
   remember: (patch: Partial<MobileDraft>) => void;
   send: (text: string, attachments: ChatAttachment[]) => Promise<DraftSendResult>;
@@ -166,6 +215,14 @@ export async function submitFileDraft(input: {
       context: draft.context, contextAttachment } });
     throw new Error('Your message was not confirmed. Send again to retry the same request; your draft and file context are still here.');
   }
-  if (input.current()) input.remember({ context: null, prepared: undefined, failed: undefined });
+  if (input.latest) {
+    const latest = input.latest();
+    // A deliberate reselect of the same file creates another context object.
+    // Do not clear it just because its recorded file/revision key is equal.
+    if (latest && latest.context === draft.context && (!draft.context || latest.prepared?.attachment.id === contextAttachment?.id)) {
+      input.remember({ context: null, prepared: undefined,
+        ...(latest.failed?.messageId === draft.failed?.messageId ? { failed: undefined } : {}) });
+    }
+  } else if (input.current()) input.remember({ context: null, prepared: undefined, failed: undefined });
   return true;
 }

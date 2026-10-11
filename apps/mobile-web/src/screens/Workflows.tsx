@@ -14,6 +14,8 @@ import {
   type WorkflowRunSummary,
 } from '../lib/api';
 import { ChatBackButton } from '../components/ChatBackButton';
+import { NavigationMenuButton } from '../components/NavigationMenuButton';
+import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
@@ -98,6 +100,7 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
   const [runNotice, setRunNotice] = useState<string | null>(null);
   const commit = usePendingCommit(workflow.name);
   const [selectedRun, setSelectedRun] = useState<WorkflowRunSummary | null>(null);
+  useMobileDetailHeader(selectedRun === null);
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const { data, loading: runsLoading, error, offline, refresh } = useScreenData(
     () => listWorkflowRuns(workflow.name, 20),
@@ -158,7 +161,8 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
     <div class="workflow-detail">
       <div class="chat-header">
         <ChatBackButton onClick={onBack} />
-        <div class="chat-title">{workflowDisplayName(workflow.name, workflow.description)}</div>
+        <h2 class="chat-title">{workflowDisplayName(workflow.name, workflow.description)}</h2>
+        <NavigationMenuButton />
       </div>
       <div class="workflow-detail-body">
         {workflowCaption(workflow.name, workflow.description) ? <div class="workflow-row-slug">{workflow.name}</div> : null}
@@ -317,6 +321,7 @@ interface WorkflowRunEventsProps {
 }
 
 function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps) {
+  useMobileDetailHeader();
   const { data, loading, error, offline, refresh } = useScreenData(
     () => getWorkflowRunEventsFull(workflowName, run.id, 500),
     { intervalMs: 5_000 },
@@ -330,7 +335,8 @@ function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps
     <div class="workflow-detail">
       <div class="chat-header">
         <ChatBackButton onClick={onBack} />
-        <div class="chat-title">{run.id}</div>
+        <h2 class="chat-title">{run.id}</h2>
+        <NavigationMenuButton />
       </div>
       <div class="workflow-detail-body">
         <div class="memory-section-head">

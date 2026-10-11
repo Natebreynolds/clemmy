@@ -100,12 +100,14 @@ import { CloudBrowserDock } from '../components/CloudBrowserDock';
 import { Composer } from '../components/Composer';
 import { attachmentLabel, attachmentsSummary } from '../lib/attachments';
 import { ChatBackButton } from '../components/ChatBackButton';
+import { NavigationMenuButton } from '../components/NavigationMenuButton';
+import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { Sheet } from '../components/Sheet';
 import { PlanReview } from '../components/PlanReview';
 import { RunControl, delegatedRunControlForExpandedWork } from '../components/RunControl';
 import { DelegatedTaskCard } from '../components/DelegatedTaskCard';
 import { CompletedFiles } from '../components/CompletedFiles';
-import { assertDraftCurrent, currentDraftStep, fileContextKey, fileContextProblem, fileSendWasNotAdmitted, mobileDrafts, newMobileDraftScope, prepareSelectedFile, settledFileRequest, submitFileDraft, type MobileDraft, type SelectedFileContext, type DraftSendResult } from '../lib/file-context';
+import { assertDraftCurrent, currentDraftStep, fileContextKey, fileContextProblem, fileSendWasNotAdmitted, mobileDrafts, newMobileDraftScope, prepareSelectedFile, reconcileDraftChoice, settleDraftChoice, settledFileRequest, submitFileDraft, type MobileDraft, type SelectedFileContext, type DraftSendResult } from '../lib/file-context';
 
 interface Props {
   sessionId?: string;
@@ -130,24 +132,43 @@ interface Props {
   onOpenRun?: (runSessionId: string) => void;
   /** Where an approval a task waits on is decided. */
   onOpenNeedsYou?: () => void;
+  /** Keeps the list's new-chat selection bound to its assigned conversation. */
+  onSessionCreated?: (sessionId: string) => void;
   onBack: () => void;
 }
 
-export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialFileContext, draftScope, initialAttachments, initialAutoSend, agentId: initialAgentId, agentName: initialAgentName, projectId: initialProjectId, projectName: initialProjectName, onOpenRun, onOpenNeedsYou, onBack }: Props) {
+export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialFileContext, draftScope, initialAttachments, initialAutoSend, agentId: initialAgentId, agentName: initialAgentName, projectId: initialProjectId, projectName: initialProjectName, onOpenRun, onOpenNeedsYou, onSessionCreated, onBack }: Props) {
+  useMobileDetailHeader();
+  const draftOwner = useRef(initialSessionId ? `chat:${initialSessionId}` : draftScope ?? newMobileDraftScope());
+  const draftGeneration = useRef(mobileDrafts.generation);
+  const ownsDraftGeneration = () => draftGeneration.current === mobileDrafts.generation;
+  const [savedChoices] = useState(() => mobileDrafts.read(draftOwner.current));
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
+  const sessionCreated = useRef(onSessionCreated);
+  sessionCreated.current = onSessionCreated;
+  const reportedSession = useRef(initialSessionId);
+  // One settings surface at a time: a choice replaces the options sheet,
+  // instead of leaving two modal focus traps mounted over the conversation.
+  const [conversationPanel, setConversationPanel] = useState<'options' | 'agent' | 'project' | 'model' | null>(null);
+  const optionsTrigger = useRef<HTMLButtonElement | null>(null);
+  const [browserOpenRequest, setBrowserOpenRequest] = useState(0);
+  const closeConversationPanel = () => {
+    setConversationPanel(null);
+    window.requestAnimationFrame(() => optionsTrigger.current?.focus());
+  };
   // Who answers the next message — changeable at any time, like the brain.
   // A new conversation opens inside it; after that a change is applied just
   // before the next message (see sendMessage).
   const [agent, setAgent] = useState<{ id: string; name: string } | null>(
-    initialAgentId ? { id: initialAgentId, name: initialAgentName ?? '' } : null,
+    savedChoices.agentChoice ? savedChoices.agentChoice.value : initialAgentId ? { id: initialAgentId, name: initialAgentName ?? '' } : null,
   );
   /** The agent the daemon has for this conversation, so a send only reports a real change. */
   const sessionAgentId = useRef<string | null>(initialAgentId ?? null);
   // The agent a NEW conversation is created in. Frozen once a session exists:
   // the engine is rebuilt when it changes, which must never drop a thread.
-  const [openingAgentId, setOpeningAgentId] = useState<string | null>(initialSessionId ? null : initialAgentId ?? null);
+  const [openingAgentId, setOpeningAgentId] = useState<string | null>(initialSessionId ? null : agent?.id ?? null);
   const boundAgentId = initialSessionId ? null : openingAgentId;
-  const [agentPickOpen, setAgentPickOpen] = useState(false);
+  const agentPickOpen = conversationPanel === 'agent';
   const [agentChoices, setAgentChoices] = useState<MobileAgent[] | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -160,7 +181,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   // who answers. A new conversation opens inside it; after that a change is
   // applied just before the next message (see sendMessage).
   const [project, setProject] = useState<{ id: string; name: string } | null>(
-    initialProjectId ? { id: initialProjectId, name: initialProjectName ?? '' } : null,
+    savedChoices.projectChoice ? savedChoices.projectChoice.value : initialProjectId ? { id: initialProjectId, name: initialProjectName ?? '' } : null,
   );
   /** The project the daemon has for this conversation, so a send only reports a real change. */
   const sessionProjectId = useRef<string | null>(initialSessionId ? initialProjectId ?? null : null);
@@ -169,7 +190,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   projectRef.current = project;
   /** A retried send carries the project its first attempt carried. */
   const openedInProject = useRef(new Map<string, string | null>());
-  const [projectPickOpen, setProjectPickOpen] = useState(false);
+  const projectPickOpen = conversationPanel === 'project';
   const [projectChoices, setProjectChoices] = useState<ProjectSummary[] | null>(null);
   useEffect(() => {
     // A Space dock works in its Space, never in a project: it asks for none.
@@ -182,7 +203,6 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     return () => { cancelled = true; };
   }, [projectPickOpen]);
   const [title, setTitle] = useState(initialTitle ?? '');
-  const draftOwner = useRef(initialSessionId ? `chat:${initialSessionId}` : draftScope ?? newMobileDraftScope());
   const [draft, setDraftState] = useState(() => mobileDrafts.read(draftOwner.current, initialDraft).text);
   const [fileContext, setFileContext] = useState<SelectedFileContext | null>(() => initialFileContext
     ? mobileDrafts.select(draftOwner.current, initialFileContext).context : mobileDrafts.read(draftOwner.current).context);
@@ -195,15 +215,18 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const acceptedRequests = useRef(new Set<string>());
   const notAdmittedRequests = useRef(new Set<string>());
   const setDraft = (value: string | ((previous: string) => string)) => {
+    if (!ownsDraftGeneration()) return;
     const next = typeof value === 'function' ? value(mobileDrafts.read(draftOwner.current).text) : value;
-    mobileDrafts.patch(draftOwner.current, { text: next });
-    setDraftState(next);
+    mobileDrafts.patchInGeneration(draftOwner.current, draftGeneration.current, { text: next });
+    if (activeDraftOwner.current) setDraftState(next);
   };
   const rememberDraft = (patch: Partial<MobileDraft>) => {
-    mobileDrafts.patch(draftOwner.current, patch);
+    if (!ownsDraftGeneration()) return;
+    mobileDrafts.patchInGeneration(draftOwner.current, draftGeneration.current, patch);
     if ('context' in patch && activeDraftOwner.current) { contextRef.current = patch.context ?? null; setFileContext(patch.context ?? null); }
   };
   const discussFile = (context: SelectedFileContext) => {
+    if (!ownsDraftGeneration()) return;
     mobileDrafts.select(draftOwner.current, context);
     contextRef.current = context;
     setFileContext(context);
@@ -214,7 +237,12 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     if (initialFileContext && initialFileContext !== appliedContext.current) discussFile(initialFileContext);
     appliedContext.current = initialFileContext;
   }, [initialFileContext]);
-  const [composerMode, setComposerMode] = useState<ComposerMode>('normal');
+  const [composerMode, setComposerModeState] = useState<ComposerMode>(savedChoices.composerMode ?? 'normal');
+  const setComposerMode = (mode: ComposerMode) => {
+    if (!ownsDraftGeneration()) return;
+    rememberDraft({ composerMode: mode });
+    setComposerModeState(mode);
+  };
   const [planActing, setPlanActing] = useState<string | null>(null);
   const [approvalActing, setApprovalActing] = useState<string | null>(null);
   const approvalGate = useRef(new ApprovalDecisionGate());
@@ -224,7 +252,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const [error, setError] = useState<string | null>(null);
   // §6a: a compact brain chip in the chat header — the same live catalog
   // sheet as Settings > Brain, mounted where the switch is most often wanted.
-  const [brainOpen, setBrainOpen] = useState(false);
+  const brainOpen = conversationPanel === 'model';
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const dockRef = useRef<HTMLDivElement | null>(null);
@@ -267,10 +295,15 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       loadSession: async (sessionId) => {
         try {
           const result = await getChatSession(sessionId);
+          if (!ownsDraftGeneration() || !activeDraftOwner.current) return { events: result.events, latestSeq: result.latestSeq };
+          const saved = mobileDrafts.read(draftOwner.current);
+          const agentChoice = reconcileDraftChoice(saved.agentChoice, result.session.agentId ? { id: result.session.agentId, name: result.session.agentName ?? '' } : null);
+          const projectChoice = reconcileDraftChoice(saved.projectChoice, result.session.projectId ? { id: result.session.projectId, name: result.session.projectName ?? '' } : null);
+          rememberDraft({ agentChoice, projectChoice });
           setTitle(result.session.title);
-          setAgent(result.session.agentId ? { id: result.session.agentId, name: result.session.agentName ?? '' } : null);
+          setAgent(agentChoice.value);
           sessionAgentId.current = result.session.agentId ?? null;
-          setProject(result.session.projectId ? { id: result.session.projectId, name: result.session.projectName ?? '' } : null);
+          setProject(projectChoice.value);
           sessionProjectId.current = result.session.projectId ?? null;
           return { events: result.events, latestSeq: result.latestSeq };
         } catch (err) {
@@ -329,10 +362,14 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const messages = snapshot?.messages ?? [];
   const busy = snapshot?.busy ?? false;
   useEffect(() => {
-    if (!snapshot?.sessionId) return;
+    if (!snapshot?.sessionId || !ownsDraftGeneration()) return;
     const next = `chat:${snapshot.sessionId}`;
     mobileDrafts.move(draftOwner.current, next);
     draftOwner.current = next;
+    if (reportedSession.current !== snapshot.sessionId) {
+      reportedSession.current = snapshot.sessionId;
+      sessionCreated.current?.(snapshot.sessionId);
+    }
   }, [snapshot?.sessionId]);
   const planning = busy ? snapshot?.activeTaskMode?.kind === 'plan' : composerMode === 'plan';
   const executing = busy && snapshot?.activeTaskMode?.kind === 'execute';
@@ -344,7 +381,6 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const canStop = busy && Boolean(snapshot?.sessionId);
   // A Space dock takes no agent; everything else can switch at any time.
   const takesAgent = !(snapshot?.sessionId ?? initialSessionId ?? '').startsWith('space-');
-  const showAgentChip = takesAgent && (Boolean(agent) || (agentChoices?.length ?? 0) > 0);
   const agentLabel = agent?.name || (agent ? 'Agent' : 'Clem');
   // An agent pinned to a model answers on it: the model chip
   // names it, read again whenever the agent, the conversation or the brain changes.
@@ -374,7 +410,6 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const agentMarks = agentThreadMarks(messages, agent?.name ?? null);
   const speakers = replySpeakers(messages, agentMarks);
   // A Space dock works in its Space, never in a project.
-  const showProjectChip = takesAgent && (Boolean(project) || (projectChoices?.length ?? 0) > 0);
   const projectMarks = projectThreadMarks(messages, project?.name || null);
 
   // Tasks this conversation delegated. What a task IS comes from the Mac.
@@ -414,35 +449,39 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 
   function pickProject(next: { id: string; name: string } | null) {
     haptic('light');
+    rememberDraft({ projectChoice: { value: next, pending: true } });
     setProject(next);
-    setProjectPickOpen(false);
+    closeConversationPanel();
   }
 
   function pickAgent(next: { id: string; name: string } | null) {
     haptic('light');
+    rememberDraft({ agentChoice: { value: next, pending: true } });
     setAgent(next);
     if (!snapshot?.sessionId && messages.length === 0) setOpeningAgentId(next?.id ?? null);
-    setAgentPickOpen(false);
+    closeConversationPanel();
   }
 
   /** Tell the daemon about the agent chip. Only when the chip changed: a
    *  plain follow-up must never wait on, or fail on, a switch to what the
    *  conversation already has: a failed switch must not drop the follow-up. */
-  async function applyAgentChoice(sessionId: string | null | undefined, current: () => boolean = () => activeDraftOwner.current && engineOwner.current === engine) {
+  async function applyAgentChoice(sessionId: string | null | undefined, current: () => boolean = () => ownsDraftGeneration() && activeDraftOwner.current && engineOwner.current === engine) {
     const wanted = agent?.id ?? null;
     if (!sessionId || busy || !takesAgent || wanted === sessionAgentId.current) return;
     const result = await currentDraftStep(current, () => switchChatAgent(sessionId, wanted));
     sessionAgentId.current = result.agentId ?? null;
-    // Who actually replies (a deleted agent falls back to Clem).
-    if ((result.agentId ?? null) !== wanted) {
-      setAgent(result.agentId ? { id: result.agentId, name: result.agentName ?? '' } : null);
-    }
+    // Who actually replies (a deleted agent falls back to Clem), unless the
+    // owner has already made a different choice for the following message.
+    const agentChoice = settleDraftChoice(mobileDrafts.read(draftOwner.current).agentChoice, wanted,
+      result.agentId ? { id: result.agentId, name: result.agentName ?? '' } : null);
+    rememberDraft({ agentChoice });
+    setAgent(agentChoice.value);
   }
 
   /** Send a new message to whoever the chip names. A message sent while a
    *  reply runs steers that reply; the choice waits for the next one. */
   async function sendMessage(text: string, mode: TaskMode | undefined, attachments: ChatAttachment[] = [], stillCurrent: () => boolean = () => true) {
-    const current = () => activeDraftOwner.current && engineOwner.current === engine && stillCurrent();
+    const current = () => ownsDraftGeneration() && activeDraftOwner.current && engineOwner.current === engine && stillCurrent();
     assertDraftCurrent(current);
     if (attachments.length && engine.snapshot().busy) throw new Error('Files can be sent after Clem finishes this turn.');
     const sessionId = engine.snapshot().sessionId;
@@ -454,16 +493,20 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       try {
         const result = await currentDraftStep(current, () => setChatProject(sessionId, wantedProject));
         sessionProjectId.current = result.projectId ?? null;
-        if ((result.projectId ?? null) !== wantedProject) {
-          setProject(result.projectId ? { id: result.projectId, name: result.projectName ?? '' } : null);
-        }
+        const projectChoice = settleDraftChoice(mobileDrafts.read(draftOwner.current).projectChoice, wantedProject,
+          result.projectId ? { id: result.projectId, name: result.projectName ?? '' } : null);
+        rememberDraft({ projectChoice });
+        setProject(projectChoice.value);
       } catch (err) {
         if (!current()) throw err;
         // The message was written for a project it cannot work in. It is not
         // sent somewhere else instead: the words go back to the composer and
         // the chip goes back to what the conversation really has.
         const known = projectChoices?.find((row) => row.id === sessionProjectId.current);
-        setProject(sessionProjectId.current ? { id: sessionProjectId.current, name: known?.name ?? '' } : null);
+        const projectChoice = settleDraftChoice(mobileDrafts.read(draftOwner.current).projectChoice, wantedProject,
+          sessionProjectId.current ? { id: sessionProjectId.current, name: known?.name ?? '' } : null);
+        rememberDraft({ projectChoice });
+        setProject(projectChoice.value);
         setDraft((current) => current || text);
         throw new Error(refusalWords(err, 'That project could not be used, so your message was not sent.'));
       }
@@ -601,7 +644,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     if (executing || preparingContext) return false;
     const selected = contextRef.current;
     const owner = draftOwner.current;
-    const current = () => activeDraftOwner.current && engineOwner.current === engine && (contextRef.current === selected
+    const current = () => ownsDraftGeneration() && activeDraftOwner.current && engineOwner.current === engine && (contextRef.current === selected
       || Boolean(contextRef.current && selected && fileContextKey(contextRef.current) === fileContextKey(selected)));
     setPreparingContext(true);
     setError(null);
@@ -610,6 +653,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         draft: mobileDrafts.read(owner), text, attachments,
         busy: () => engine.snapshot().busy,
         current: () => Boolean(current()),
+        latest: () => ownsDraftGeneration() ? mobileDrafts.read(owner) : null,
         prepare: prepareSelectedFile,
         remember: rememberDraft,
         send: async (words, files) => {
@@ -630,6 +674,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   async function retryDraftMessage(id: string) {
     const request = mobileDrafts.read(draftOwner.current).failed;
     await engine.retry(id);
+    if (!ownsDraftGeneration()) return;
     const result = requestOutcome(new Set(), id);
     if (result.notAdmitted) {
       engine.discard(id);
@@ -710,42 +755,36 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       class="chat-shell"
       style={{ '--kb-inset': `${keyboardInset}px`, '--chat-dock-h': `${dockH}px` }}
     >
-      {/* Two named choices take a row of their own. With no project chosen the
-          choice is a single quiet icon, so a conversation outside any project
-          keeps the header it always had. */}
-      <div class={`chat-header${showAgentChip && showProjectChip && project ? ' chat-header-two' : ''}`}>
+      <div class="chat-header chat-header-compact">
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{title || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</h2>
-        {showAgentChip ? (
-          <button
-            type="button"
-            class="brain-chip agent-chip"
-            disabled={executing}
-            title="Who answers your next message"
-            onClick={() => { haptic('light'); setAgentPickOpen(true); }}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="12" cy="8" r="4" /><path d="M4 21a8 8 0 0 1 16 0" />
-            </svg>
-            <span class="truncate">{agentLabel}</span>
-          </button>
-        ) : null}
-        {showProjectChip ? (
-          <button
-            type="button"
-            class={`brain-chip project-chip${project ? ' is-set' : ' is-unset'}`}
-            disabled={executing}
-            title="Which project your next message works in"
-            aria-label={project ? `Project: ${project.name || 'this project'}` : 'No project'}
-            onClick={() => { haptic('light'); setProjectPickOpen(true); }}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-            </svg>
-            {project ? <span class="truncate">{project.name || 'Project'}</span> : null}
-          </button>
-        ) : null}
-        <Sheet open={projectPickOpen} onClose={() => setProjectPickOpen(false)} title="Project" class="sheet-compact">
+        <button ref={optionsTrigger} type="button" class="chat-options-trigger" aria-label="Conversation options" aria-haspopup="dialog" aria-expanded={conversationPanel !== null} onClick={() => { haptic('light'); setConversationPanel('options'); }}>
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="19" cy="12" r="2" /></svg>
+        </button>
+        <NavigationMenuButton />
+      </div>
+      {connection === 'recovering' || connection === 'connecting' ? (
+        <p class="chat-connection-status" role="status">Reconnecting…</p>
+      ) : connection === 'detached' ? (
+        <p class="chat-connection-status" role="status">Catching up in the background.</p>
+      ) : null}
+      <Sheet open={conversationPanel === 'options'} onClose={closeConversationPanel} title="Conversation options" class="sheet-compact" aside={<button type="button" class="btn-quiet" onClick={closeConversationPanel}>Done</button>}>
+        <div class="chat-options-list">
+          {takesAgent ? <>
+            <button type="button" class="chat-option" disabled={executing} onClick={() => setConversationPanel('agent')}><span>Who answers</span><strong>{agentLabel}</strong></button>
+            <button type="button" class="chat-option" disabled={executing} onClick={() => setConversationPanel('project')}><span>Project</span><strong>{project?.name || (project ? 'Project' : 'No project')}</strong></button>
+          </> : null}
+          <button type="button" class="chat-option" onClick={() => setConversationPanel('model')}><span>Model</span><strong>{modelDisplayName(brainLabel)}</strong></button>
+          <button type="button" class="chat-option" disabled={busy} aria-pressed={planning} onClick={() => { haptic('light'); setComposerMode(planning ? 'normal' : 'plan'); }}><span>Plan before acting</span><strong>{executing ? 'Executing approved plan' : planning ? 'On' : 'Off'}</strong></button>
+          <p class="chat-options-note">Plan investigates first and asks before execution. Changing the agent or project applies to your next message.</p>
+          {snapshot?.sessionId || initialSessionId ? <button type="button" class="chat-option" onClick={() => {
+            setConversationPanel(null);
+            // Let the options sheet release focus before opening the browser.
+            window.requestAnimationFrame(() => setBrowserOpenRequest(value => value + 1));
+          }}><span>Browser</span><strong>Open browser tools</strong></button> : <p class="chat-options-note">Browser tools are available after your first message.</p>}
+        </div>
+      </Sheet>
+        <Sheet open={projectPickOpen} onClose={closeConversationPanel} title="Project" class="sheet-compact" aside={<button type="button" class="btn-quiet" onClick={closeConversationPanel}>Done</button>}>
           {projectChoices === null ? (
             <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
           ) : (
@@ -769,7 +808,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           )}
           {busy ? <p class="project-sheet-note">The reply being written keeps its project. This applies to your next message.</p> : null}
         </Sheet>
-        <Sheet open={agentPickOpen} onClose={() => setAgentPickOpen(false)} title="Who answers" class="sheet-compact">
+        <Sheet open={agentPickOpen} onClose={closeConversationPanel} title="Who answers" class="sheet-compact" aside={<button type="button" class="btn-quiet" onClick={closeConversationPanel}>Done</button>}>
           {agentChoices === null ? (
             <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
           ) : (
@@ -797,7 +836,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             next message (Settings mounts the same sheet with no session). */}
         <BrainSheet
           open={brainOpen}
-          onClose={() => setBrainOpen(false)}
+          onClose={closeConversationPanel}
           onChanged={() => { setBrainTick((n) => n + 1); }}
           sessionId={snapshot?.sessionId ?? initialSessionId ?? undefined}
           answeringAgent={agentModel}
@@ -805,14 +844,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           modelReadFailed={currentModelRead?.failed ?? false}
           beforeChange={() => applyAgentChoice(snapshot?.sessionId ?? initialSessionId ?? undefined)}
         />
-        {connection === 'recovering' || connection === 'connecting' ? (
-          <div class="conn-pill conn-recovering">reconnecting…</div>
-        ) : connection === 'detached' ? (
-          <div class="conn-pill conn-detached">catching up in the background</div>
-        ) : null}
-      </div>
-      <CompletedFiles conversationId={snapshot?.sessionId ?? initialSessionId} onDiscuss={discussFile} />
-      <CloudBrowserDock conversationId={snapshot?.sessionId ?? initialSessionId} />
+      {snapshot?.sessionId || initialSessionId ? <div class="chat-tools" aria-label="Conversation tools">
+        <CompletedFiles conversationId={snapshot?.sessionId ?? initialSessionId} onDiscuss={discussFile} />
+        <CloudBrowserDock conversationId={snapshot?.sessionId ?? initialSessionId} openRequest={browserOpenRequest} onReturn={() => optionsTrigger.current?.focus()} />
+      </div> : null}
       <div
         class="chat-transcript"
         ref={scrollRef}
@@ -880,6 +915,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       ) : null}
       <div class="chat-dock-fade" aria-hidden="true" />
       <div ref={dockRef} class="chat-dock">
+        {planning || executing ? <p class="chat-mode-status" role="status">{executing ? 'Executing your approved plan' : 'Plan mode · Review before execution'}</p> : null}
         <Composer
           value={draft}
           onChange={setDraft}
@@ -895,6 +931,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           reservedAttachments={fileContext ? 1 : 0}
           contextKey={fileContext ? fileContextKey(fileContext) : undefined}
           settledAttachmentIds={settledAttachmentIds}
+          attachmentScope={draftOwner.current}
           sendBlocked={fileContext && busy ? 'This selected file will go with your next message after Clem finishes.' : undefined}
           context={fileContext ? <div class="composer-file-context" aria-label="Selected file context">
             <span><strong>{fileContext.ref.name}</strong><span>Selected version · Attached to your next message</span></span>
@@ -902,32 +939,6 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
             </button>
           </div> : null}
-          chips={(
-            <>
-              {/* Act | Plan as one chip: tap flips it. Disabled mid-run, when
-                  the mode belongs to the turn already going. */}
-              <button
-                type="button"
-                class={`composer-chip mode-chip${planning ? ' is-plan' : ''}`}
-                disabled={busy}
-                aria-pressed={planning}
-                title={planning ? 'Plan: shows you the steps first' : 'Act: does it now'}
-                onClick={() => { haptic('light'); setComposerMode(planning ? 'normal' : 'plan'); }}
-              >
-                {executing ? 'Executing plan' : planning ? 'Plan' : 'Act'}
-              </button>
-              {brainLabel || agentModel ? (
-                <button
-                  type="button"
-                  class="composer-chip brain-chip"
-                  title={agentModel ? `${agentModel.agentName} answers on its own model` : 'Does the work: the model that answers your next message'}
-                  onClick={() => { haptic('light'); setBrainOpen(true); }}
-                >
-                  <span class="truncate">{modelDisplayName(brainLabel)}</span>
-                </button>
-              ) : null}
-            </>
-          )}
         />
       </div>
     </div>

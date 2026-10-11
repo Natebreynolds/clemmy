@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { useBackGesture } from '../lib/back-gesture';
 import { listChatSessions, patchChatSession, type ChatSession } from '../lib/api';
 import { arrangeChatList, cleanChatTitle } from '../lib/chat-list';
@@ -13,6 +13,7 @@ import { relativeTime } from '../components/Approvals';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
 import { newMobileDraftScope, type SelectedFileContext } from '../lib/file-context';
+import { mobileChatLocation } from '../lib/chat-location';
 
 export interface ChatHandoff {
   draft?: string;
@@ -48,9 +49,10 @@ interface Props {
 }
 
 export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenRun, onOpenNeedsYou }: Props) {
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const resume = useRef(handoff ? null : mobileChatLocation.resume());
+  const [selectedId, setSelectedId] = useState<string | null>(resume.current?.kind === 'chat' ? resume.current.sessionId : null);
   const [selectedDraft, setSelectedDraft] = useState<string | undefined>();
-  const [selectedTitle, setSelectedTitle] = useState<string | undefined>();
+  const [selectedTitle, setSelectedTitle] = useState<string | undefined>(resume.current?.kind === 'chat' ? resume.current.title : undefined);
   const [selectedContext, setSelectedContext] = useState<SelectedFileContext | undefined>();
   // The thread the owner just left: marked read once the list shows how it
   // stands, unless work is still running in it (its reply is then news).
@@ -63,7 +65,11 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
     setSelectedContext(undefined);
   };
   useBackGesture(selectedId !== null, closeSelected);
-  const [composing, setComposing] = useState<{ scope: string; draft?: string; fileContext?: SelectedFileContext; attachments?: ChatAttachment[]; autoSend?: boolean; agentId?: string; agentName?: string; projectId?: string; projectName?: string } | null>(null);
+  const [composing, setComposing] = useState<{ scope: string; draft?: string; fileContext?: SelectedFileContext; attachments?: ChatAttachment[]; autoSend?: boolean; agentId?: string; agentName?: string; projectId?: string; projectName?: string } | null>(resume.current?.kind === 'new' ? resume.current : null);
+  useLayoutEffect(() => {
+    mobileChatLocation.save(composing ? { kind: 'new', ...composing }
+      : selectedId ? { kind: 'chat', sessionId: selectedId, title: selectedTitle } : null);
+  }, [composing, selectedId, selectedTitle]);
   const [pendingLatest, setPendingLatest] = useState(false);
   const [query, setQuery] = useState('');
   const [showArchived, setShowArchived] = useState(false);
@@ -154,7 +160,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
       setSelectedDraft(handoff.draft);
       setSelectedContext(handoff.fileContext);
     }
-    else if (handoff.openLatest) setPendingLatest(true);
+    else if (handoff.openLatest) { setComposing(null); setSelectedId(null); setPendingLatest(true); }
     else { setSelectedId(null); setSelectedContext(undefined); setComposing({ scope: newMobileDraftScope(), draft: handoff.draft, fileContext: handoff.fileContext, attachments: handoff.attachments, autoSend: handoff.fileContext ? false : handoff.autoSend, agentId: handoff.agentId, agentName: handoff.agentName, projectId: handoff.projectId, projectName: handoff.projectName }); }
     onHandoffConsumed?.();
   }, [handoff, onHandoffConsumed]);
@@ -168,6 +174,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
         initialDraft={composing.draft}
         initialAttachments={composing.attachments}
         initialAutoSend={composing.autoSend}
+        onSessionCreated={(sessionId) => mobileChatLocation.promote(composing.scope, sessionId)}
         agentId={composing.agentId}
         agentName={composing.agentName}
         projectId={composing.projectId}

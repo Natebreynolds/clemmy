@@ -29,8 +29,10 @@ function outcomeText(outcome: FromClemReplyOutcome): string {
  * away; then updates, each cleared with Done; then the one part she offers to
  * help set up. A place that lives only on the Mac says so instead of linking.
  */
-export function FromClem({ data, onChanged, onOpenThread }: {
+export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
   data: FromClemData | null;
+  /** Home places current decisions in its configurable Needs you pane. */
+  mode?: 'all' | 'decisions' | 'updates';
   onChanged: () => void;
   onOpenThread: () => void;
 }) {
@@ -39,11 +41,15 @@ export function FromClem({ data, onChanged, onOpenThread }: {
   const [replying, setReplying] = useState<string | null>(null);
   const [reading, setReading] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
-  const rows = data?.rows ?? [];
+  const rows = (data?.rows ?? []).filter(row => mode === 'all' || (mode === 'decisions' ? row.asks && !row.setup : !row.asks || Boolean(row.setup)));
+  const sectionId = `home-from-clem-${mode}`;
   if (rows.length === 0) return null;
   const waiting = rows.filter((row) => row.asks && !row.setup);
   const updates = rows.filter((row) => !row.asks && !row.setup);
   const offers = rows.filter((row) => row.setup);
+  const heading = mode === 'decisions' ? 'Waiting on you'
+    : mode === 'updates' ? (updates.length > 0 ? 'Updates from Clem' : 'Set up next') : 'From Clem';
+  const showGroupHeading = mode === 'all' || [waiting, updates, offers].filter(group => group.length > 0).length > 1;
 
   const run = async (row: FromClemRow, work: () => Promise<string>) => {
     haptic('light');
@@ -171,16 +177,16 @@ export function FromClem({ data, onChanged, onOpenThread }: {
 
   const group = (id: string, label: string, list: FromClemRow[], render: (row: FromClemRow) => JSX.Element) => (list.length > 0 ? (
     <div class="from-clem-group">
-      <h3 id={id} class="from-clem-group-head">{label}{list.length > 1 ? ` · ${list.length}` : ''}</h3>
-      <div class="home-card" aria-labelledby={id}>{list.map(render)}</div>
+      {showGroupHeading ? <h3 id={`${sectionId}-${id}`} class="from-clem-group-head">{label}{list.length > 1 ? ` · ${list.length}` : ''}</h3> : null}
+      <div class="home-card" aria-labelledby={showGroupHeading ? `${sectionId}-${id}` : sectionId}>{list.map(render)}</div>
     </div>
   ) : null);
 
   return (
-    <section class="home-section" aria-labelledby="home-from-clem">
+    <section class="home-section" aria-labelledby={sectionId}>
       <div class="from-clem-head">
-        <h2 id="home-from-clem" class="section-head pane-head">From Clem</h2>
-        <button type="button" class="from-clem-thread" onClick={() => { haptic('light'); onOpenThread(); }}>Her thread</button>
+        <h2 id={sectionId} class="section-head pane-head">{heading}</h2>
+        {mode !== 'decisions' ? <button type="button" class="from-clem-thread" onClick={() => { haptic('light'); onOpenThread(); }}>Her thread</button> : null}
       </div>
       {group('from-clem-waiting', 'Waiting on you', waiting, waitingRow)}
       {group('from-clem-updates', 'Updates', updates, updateRow)}

@@ -2,7 +2,7 @@
  * Home — what Clem wants you to know, the moment you open your phone.
  *
  * It opens with an ANSWER, not with a stack of lists at one visual weight.
- * The greeting is an eyebrow; the largest type on the screen is the single
+ * The largest type on the screen is the single
  * most important state, and every word of it comes from home-presentation.ts,
  * where the rules are pure and tested against the owner's own measured
  * numbers. Two of those rules bind this file:
@@ -169,7 +169,9 @@ export function Home({
   const loaded = data ?? lastGood.current;
   // What Clem's heartbeats brought, in her words. Home's other lists leave out
   // what she already shows, so nothing appears twice.
-  const fromClem = useScreenData(() => getFromClem(), { intervalMs: 20_000, resourceKey: 'home-from-clem' });
+  const fromClem = useScreenData(() => getFromClem(), { intervalMs: 20_000, resourceKey: 'home-from-clem', disabled: !paneSet.has('needs_you') && !paneSet.has('while_away') });
+  const clemDecisions = (fromClem.data?.rows ?? []).filter(row => row.asks && !row.setup);
+  const clemUpdates = (fromClem.data?.rows ?? []).filter(row => !row.asks || row.setup);
   const covers = fromClem.data?.covers;
   const covered = (ids: string[] | undefined) => new Set(ids ?? []);
   const coveredQuestions = covered(covers?.questionIds);
@@ -257,7 +259,7 @@ export function Home({
   const greeting = timeGreeting(new Date().getHours(), greetingName(name));
   const lead = homeLead({
     loading,
-    answerableShown: needsShown.length,
+    answerableShown: needsShown.length + (paneSet.has('needs_you') ? clemDecisions.length : 0),
     needsYouCount,
     needsYouCountKnown,
     countLive: needsYouCountLive,
@@ -280,28 +282,32 @@ export function Home({
     quick_actions: () => (prefs.quickActions.length > 0 ? (
       <QuickActions actions={prefs.quickActions} onAsk={onAsk} />
     ) : null),
-    needs_you: () => (needsPane.show ? (
-      <NeedsYou
-        pane={needsPane}
-        items={needsShown}
-        onOpenInbox={onOpenInbox}
-        onChanged={refresh}
-      />
-    ) : null),
+    needs_you: () => (needsPane.show || clemDecisions.length > 0) ? <>
+      <FromClem data={fromClem.data ?? null} mode="decisions" onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={() => onOpenThread('clem', 'Clem')} />
+      {needsPane.show ? (
+        <NeedsYou
+          pane={needsPane}
+          items={needsShown}
+          onOpenInbox={onOpenInbox}
+          onChanged={refresh}
+        />
+      ) : null}</> : null,
     // Current work lives in Activity; the headline and the header chip lead there.
     running: () => null,
     // Delivered work is a row in Today now; this pane is folded in.
     made: () => null,
-    while_away: () => (dayRows.length > 0 ? (
-      <section class="home-section" aria-labelledby="home-today">
-        <h2 id="home-today" class="section-head pane-head">Today</h2>
-        <div class="home-card">
-          {dayRows.map((row) => (
-            <TodayLine key={row.key} row={row} onDone={async () => { if (row.notificationId) { await markInboxNotificationRead(row.notificationId); void refresh(); } }} />
-          ))}
-        </div>
-      </section>
-    ) : null),
+    while_away: () => (dayRows.length > 0 || clemUpdates.length > 0) ? <>
+      <FromClem data={fromClem.data ?? null} mode="updates" onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={() => onOpenThread('clem', 'Clem')} />
+      {dayRows.length > 0 ? (
+        <section class="home-section" aria-labelledby="home-today">
+          <h2 id="home-today" class="section-head pane-head">Today</h2>
+          <div class="home-card">
+            {dayRows.map((row) => (
+              <TodayLine key={row.key} row={row} onDone={async () => { if (row.notificationId) { await markInboxNotificationRead(row.notificationId); void refresh(); } }} />
+            ))}
+          </div>
+        </section>
+      ) : null}</> : null,
     projects: () => (recent.length > 0 ? (
       <section class="home-section" aria-labelledby="home-recent">
         <h2 id="home-recent" class="section-head pane-head">Recent</h2>
@@ -326,14 +332,8 @@ export function Home({
 
   return (
     <div class="home">
-      {/* THE LEAD. The greeting is an eyebrow — it was the largest type on the
-          screen and it never told anyone anything. What the phone says first
-          is now the answer, and it is the only thing at this weight. */}
+      {/* Current state leads; the greeting stays a quiet personal detail. */}
       <header class={`home-lead home-lead-${lead.tone} rise`} style={{ '--i': 0 }}>
-        {lead.tone === 'clear' ? (
-          <img class="home-lead-mark" src="/m/clemmy.png" alt="" width="52" height="52" />
-        ) : null}
-        <p class="home-lead-eyebrow">{greeting}</p>
         {/* The answer rewrites itself as polls land — from "Catching up…" to
             whatever is true — so it is announced. One live region for the
             whole sentence, its qualifier and its provenance, or a screen
@@ -346,6 +346,7 @@ export function Home({
               given — with how old it is. */}
           {lead.asOf ? <p class="home-lead-asof">{lead.asOf}</p> : null}
         </div>
+        <p class="home-greeting">{greeting}</p>
         {digest ? (
           <p class="today-digest" role="status">
             <span>{digest}</span>
@@ -377,15 +378,12 @@ export function Home({
         hasData={needsYouCount + workingView.total + dayRows.length + recent.length > 0}
       />
 
-      <FromClem data={fromClem.data ?? null} onChanged={() => { void fromClem.refresh(); void refresh(); }}
-        onOpenThread={() => onOpenThread('clem', 'Clem')} />
-
-      <HomeTiles onOpenWorkspace={onOpenWorkspace} onAsk={onAsk} />
-
       {panes.map((id) => {
         const rendered = sections[id]();
         return rendered ? <div key={id} class="home-pane rise" style={{ '--i': 1 }}>{rendered}</div> : null;
       })}
+
+      <HomeTiles onOpenWorkspace={onOpenWorkspace} onAsk={onAsk} />
 
       {loading ? <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div> : null}
 

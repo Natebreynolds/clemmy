@@ -15,6 +15,7 @@ import { haptic } from '../lib/native-bridge';
 import { useDictation } from '../lib/use-dictation';
 import { HoldToTalk, holdToTalkAvailable } from '../lib/hold-to-talk';
 import { attachmentKind, attachmentLabel, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS } from '../lib/attachments';
+import { mobileDrafts, type MobileStagedAttachment } from '../lib/file-context';
 
 export interface UploadResult { id: string; name: string; ok: boolean; error: string | null }
 
@@ -29,11 +30,13 @@ export interface ComposerProps {
   reservedAttachments?: number;
   /** A retry in the transcript settled attachments still shown in this composer. */
   settledAttachmentIds?: readonly string[];
+  /** Saved with the conversation, including uploads that finish after leaving. */
+  attachmentScope?: string;
   placeholder: string;
   ariaLabel: string;
   /** Uploads one picked file and returns the daemon's id. Omit to hide "+". */
   upload?: (file: File) => Promise<UploadResult>;
-  /** Chips between "+" and the mic: who answers, in what mode. */
+  /** Optional secondary choices get their own wrapping row above the controls. */
   chips?: ComponentChildren;
   disabled?: boolean;
   /** A turn is running: the arrow sends into it and a stop square appears. */
@@ -45,16 +48,49 @@ export interface ComposerProps {
   textareaRef?: { current: HTMLTextAreaElement | null };
 }
 
-interface Staged extends ChatAttachment {
-  uploading?: boolean;
-  error?: string;
-}
+type Staged = MobileStagedAttachment;
+const NO_ATTACHMENTS: Staged[] = [];
 
 export function Composer(props: ComposerProps) {
   const { value, onChange, onSend, placeholder, ariaLabel, upload, chips, disabled, canStop, stopping, onStop, compact } = props;
   const localRef = useRef<HTMLTextAreaElement | null>(null);
   const textareaRef = props.textareaRef ?? localRef;
-  const [staged, setStaged] = useState<Staged[]>([]);
+  const attachmentScope = props.attachmentScope;
+  const draftGeneration = useRef(mobileDrafts.generation);
+  const mounted = useRef(true);
+  const [staged, setStagedState] = useState<Staged[]>(() => attachmentScope ? mobileDrafts.read(attachmentScope).stagedAttachments ?? NO_ATTACHMENTS : []);
+  const stagedRef = useRef(staged);
+  stagedRef.current = staged;
+  const setStaged = (update: (previous: Staged[]) => Staged[]) => {
+    // An upload completing after sign-out cannot revive the previous account's draft.
+    if (attachmentScope && draftGeneration.current !== mobileDrafts.generation) return;
+    const previous = attachmentScope ? mobileDrafts.read(attachmentScope).stagedAttachments ?? NO_ATTACHMENTS : stagedRef.current;
+    const next = update(previous);
+    if (attachmentScope) mobileDrafts.patchInGeneration(attachmentScope, draftGeneration.current, { stagedAttachments: next });
+    else {
+      const kept = new Set(next.map(file => file.previewUrl));
+      for (const file of previous) if (file.previewUrl && !kept.has(file.previewUrl)) URL.revokeObjectURL(file.previewUrl);
+    }
+    stagedRef.current = next;
+    if (mounted.current) setStagedState(next);
+  };
+  useEffect(() => {
+    if (!attachmentScope) return;
+    const sync = () => {
+      const next = draftGeneration.current === mobileDrafts.generation
+        ? mobileDrafts.read(attachmentScope).stagedAttachments ?? NO_ATTACHMENTS : NO_ATTACHMENTS;
+      stagedRef.current = next; setStagedState(next);
+    };
+    sync();
+    return mobileDrafts.subscribe(sync);
+  }, [attachmentScope]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (!attachmentScope) for (const file of stagedRef.current) if (file.previewUrl) URL.revokeObjectURL(file.previewUrl);
+    };
+  }, [attachmentScope]);
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false);
   const valueRef = useRef(value);
@@ -126,7 +162,18 @@ export function Composer(props: ComposerProps) {
     el.style.height = `${Math.min(el.scrollHeight, compact ? 100 : 172)}px`;
   };
   useEffect(() => { autoresize(textareaRef.current); }, [value]);
-  useEffect(() => () => { for (const s of staged) if (s.previewUrl) URL.revokeObjectURL(s.previewUrl); }, []);
+  useEffect(() => {
+    const field = textareaRef.current;
+    if (!field) return;
+    let width = field.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (field.clientWidth === width) return;
+      width = field.clientWidth;
+      autoresize(field);
+    });
+    observer.observe(field);
+    return () => observer.disconnect();
+  }, [compact]);
 
   // Resting, empty and untouched, the card is one slim line: "+", the words,
   // the mic and send. Touching it opens the full card with its chips. Leaving
@@ -165,7 +212,10 @@ export function Composer(props: ComposerProps) {
     try {
       const accepted = await onSend(text, sending);
       if (accepted === false) return;
-      if (valueRef.current === original) onChange('');
+      if (draftGeneration.current === mobileDrafts.generation) {
+        const currentText = attachmentScope ? mobileDrafts.read(attachmentScope).text : valueRef.current;
+        if (currentText === original) onChange('');
+      }
       const sent = new Set(sending.map(file => file.id));
       setStaged(current => current.filter(file => !sent.has(file.id)));
     } catch (error) {
@@ -181,6 +231,7 @@ export function Composer(props: ComposerProps) {
     if (!files || !upload) return;
     const chosen = Array.from(files).slice(0, Math.max(0, attachmentLimit - staged.length));
     for (const file of chosen) {
+      if (draftGeneration.current !== mobileDrafts.generation || (!attachmentScope && !mounted.current)) break;
       const kind = attachmentKind(file.name, file.type);
       const localId = `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
       const previewUrl = kind === 'image' ? URL.createObjectURL(file) : undefined;
@@ -204,8 +255,6 @@ export function Composer(props: ComposerProps) {
 
   const remove = (id: string) => {
     setStaged((prev) => {
-      const gone = prev.find((s) => s.id === id);
-      if (gone?.previewUrl) URL.revokeObjectURL(gone.previewUrl);
       return prev.filter((s) => s.id !== id);
     });
   };
@@ -251,13 +300,13 @@ export function Composer(props: ComposerProps) {
           if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit(); }
         }}
       />
+      {chips ? <div class="composer-chips">{chips}</div> : null}
       <div class="composer-row">
         {upload ? (
           <button type="button" class="composer-icon composer-attach" aria-label="Attach a photo or file" aria-haspopup="dialog" aria-expanded={attachOpen} disabled={disabled || submitting || staged.length >= attachmentLimit} onClick={() => { haptic('light'); setAttachOpen(true); }}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
           </button>
         ) : null}
-        {chips ? <div class="composer-chips">{chips}</div> : null}
         <span class="composer-spacer" aria-hidden="true" />
         {holdable ? (
           <button
