@@ -62,3 +62,23 @@ announced merged-file hashes, exact candidate CSS bytes, and a successful
 reverse-patch check. Evidence: `integration-verification.json` in the same output
 directory. This verifies source integration only: installed fingerprint remains
 batch6 `57a4df00`; the next build/hotpatch and physical phone acceptance are pending.
+
+## Installed and served verification passed — 20:21 UTC
+
+Supersedes the pending-install status above. Mac owner installed/reopened batch7,
+fingerprint `e5ca57396d4c9613f7df4f895bffc396760dd1ca28fe2ffff63b473d6b36d527`,
+schema93. This lane independently verified receipt SHA-256
+`c3c191f4bbf07fd7dd2a3d60335bc9429a16bf87b6ae26ed6af196ce84830953`, installed
+build stamp, full mobile tree against built tree/receipt, and HTTP 200 served
+index/CSS/JS bytes against the actual installed bundle at port8520.
+
+Served assets are `main-Cll_Bgp1.js` (newer installer Chat preserved) and
+`main-BFapUaiR.css` (byte-identical to the visually reviewed candidate). A separate
+read-only reviewer confirmed all intended composer styles and voice/dictate copy
+conditions in those installed bundles. Full hashes and limits are recorded in
+`output/mobile-composer-2026-10-11/installed-served-verification.json`.
+
+The web change is available for the iPhone's next page load. Physical iPhone
+corners, safe area and keyboard verification remain pending, as does native widget
+voice/dictation capture acceptance. This check performed no app lifecycle action,
+live-home write, microphone capture or provider request.
