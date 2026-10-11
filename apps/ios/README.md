@@ -58,6 +58,35 @@ Desktop → Mobile panel → QR. Scan it in the app (or paste the pairing link i
 the field under the scanner — handy in the Simulator). Done: the PWA session
 machinery takes over inside the pinned web view.
 
+## Home Screen widgets
+
+The native build includes **Talk to Clem** (small or medium) and **Your Space**
+(small or medium). The small Talk widget opens voice; the medium size also offers
+Dictate and the chosen Space. Add them from the iPhone Home Screen widget gallery.
+Recording always requires another explicit tap inside the foreground app.
+
+To choose the Space, open its Details in the paired app and choose **Use in iPhone
+widget**. This copies only its bounded routing slug, name, summary, update date and local save date into the
+shared App Group. The widget labels the result as a saved snapshot; it neither
+contacts the Mac nor refreshes personal data in the background. Signout clears
+the snapshot. Unpairing also clears pending widget navigation. iOS controls when
+the cleared or updated widget timeline is displayed.
+
+Both app and extension require the `group.ai.breakthroughcoaching.clem` App Group
+capability in their signing profiles. `project.yml` declares the capability and
+embeds the extension; it does not configure the Apple developer account. Generate
+the project with XcodeGen, then build the Clem scheme using the existing signing
+setup. A daemon/mobile-web update alone cannot add widgets to an older native app.
+
+The only custom URL destinations are `clem://voice`, `clem://dictate`, and
+`clem://space` with an optional validated `id` slug. The app binds pending taps to
+the current pairing, waits for foreground unlock and connection selection, and
+consumes an intent only after the addressed screen acknowledges its exact ID.
+Warm delivery routes within the existing web document to preserve unsent drafts.
+Before native distribution, verify gallery placement, both sizes, a cold/locked
+launch, microphone permission, warm draft preservation, and the Space snapshot
+on a physical iPhone. Hosted simulator tests do not establish those device results.
+
 ## Rendezvous: surviving IP changes
 
 The daemon advertises `_clemmy._tcp` over Bonjour with the cert fingerprint

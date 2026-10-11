@@ -1446,6 +1446,8 @@ export function mergePendingActionHydration(
 export interface UseChatOptions {
   /** Resume an existing harness session (its turns post back to this id). */
   initialSessionId?: string | null;
+  /** Stable visible chat root; execution successors never replace this id. */
+  conversationSessionId?: string | null;
   /** Seed the thread with already-loaded history (e.g. a reopened session). */
   initialMessages?: ChatMessage[];
   /** Record this conversation as the user's active chat (survives navigation;
@@ -1455,6 +1457,16 @@ export interface UseChatOptions {
   /** On mount with an in-flight turn server-side, reattach to its live stream
    *  instead of showing a dead transcript with an enabled composer. */
   reattachActiveRun?: boolean;
+}
+
+/** Keep navigation identity separate from exact attempt/session controls.
+ * An acknowledgement from a superseded POST must change neither identity. */
+export function acceptedChatSessionIdentity(conversationSessionId: string | null, acceptedSessionId: string, ownsRequest: boolean): {
+  conversationSessionId: string;
+  executionSessionId: string;
+} | null {
+  return ownsRequest ? { conversationSessionId: conversationSessionId ?? acceptedSessionId,
+    executionSessionId: acceptedSessionId } : null;
 }
 
 /**
@@ -1565,10 +1577,11 @@ export function useChat(options?: UseChatOptions) {
   }, []);
   const [composerMode, setComposerMode] = useState<ComposerMode>('normal');
   const sessionIdRef = useRef<string | null>(options?.initialSessionId ?? null);
+  const conversationSessionIdRef = useRef<string | null>(options?.conversationSessionId ?? options?.initialSessionId ?? null);
   const streamRef = useRef<StreamHandle | null>(null);
   const activeAssistantId = useRef<string | null>(null);
   const lateWatchRef = useRef<{ cancel: () => void } | null>(null);
-  const pendingStorageKey = `clem.pending.console:${options?.initialSessionId ?? 'new'}`;
+  const pendingStorageKey = `clem.pending.console:${options?.conversationSessionId ?? options?.initialSessionId ?? 'new'}`;
   const [pendingPost, setPendingPost] = useState<PendingChatPost | null>(() => {
     try { return loadPendingChatPost(localStorage, pendingStorageKey); } catch { return null; }
   });
@@ -1692,8 +1705,8 @@ export function useChat(options?: UseChatOptions) {
   // writing into a dead tree for up to the reconnect window. Server-side, the
   // run is untouched by this teardown.
   useEffect(() => {
-    if (options?.rememberAsLastSession && options?.initialSessionId) {
-      rememberLastChatSession(unifiedChatSessionId(options.initialSessionId));
+    if (options?.rememberAsLastSession && conversationSessionIdRef.current) {
+      rememberLastChatSession(unifiedChatSessionId(conversationSessionIdRef.current));
     }
     return () => {
       streamRef.current?.stop();
@@ -2053,7 +2066,7 @@ export function useChat(options?: UseChatOptions) {
     }
   }, [patch]);
 
-  const send = useCallback(async (input: { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string }; voice?: boolean }, retryRequest?: PendingChatPost) => {
+  const send = useCallback(async (input: { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string }; voice?: boolean; onAccepted?: () => void }, retryRequest?: PendingChatPost) => {
     if (busy && input.connectionResume) throw new Error('Another turn is running. Your connection is saved; check again when it finishes.');
     const taskMode = snapshotTaskMode(input.connectionResume ? undefined : input.taskMode);
     const activeMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
@@ -2079,7 +2092,7 @@ export function useChat(options?: UseChatOptions) {
       // supersede and kill the active run). steerOnly makes the server
       // steer-or-409, never silently accept a competing turn. Attachments
       // wait for the turn to finish.
-      if (attachmentIds.length > 0) return;
+      if (attachmentIds.length > 0) throw new Error('Wait for this turn to finish before sending files. Your message is still here.');
       const steerId = nextId();
       setMessages((prev) => [...prev, { id: steerId, role: 'user', text, steer: 'pending', taskMode }]);
       try {
@@ -2091,8 +2104,11 @@ export function useChat(options?: UseChatOptions) {
           steerOnly: true,
         });
         patch(steerId, { steer: res?.steered ? 'delivered' : 'failed' } as Partial<ChatMessage>);
-      } catch {
+        if (res?.steered) input.onAccepted?.();
+        else throw new Error('That addition was not accepted. Your message is still here.');
+      } catch (error) {
         patch(steerId, { steer: 'failed' } as Partial<ChatMessage>);
+        if (input.onAccepted) throw error;
       }
       return;
     }
@@ -2143,7 +2159,12 @@ export function useChat(options?: UseChatOptions) {
           // Stop won locally while the POST was crossing the daemon boundary.
           // Use the late acknowledgement to kill that exact durable session,
           // but never attach its stream or revive the stopped chat bubble.
-          if (postAbortRef.current === postAbort) sessionIdRef.current = accepted.sessionId;
+          const identity = acceptedChatSessionIdentity(conversationSessionIdRef.current, accepted.sessionId, postAbortRef.current === postAbort);
+          if (identity) {
+            sessionIdRef.current = identity.executionSessionId;
+            conversationSessionIdRef.current = identity.conversationSessionId;
+            if (options?.rememberAsLastSession) rememberLastChatSession(unifiedChatSessionId(identity.conversationSessionId));
+          }
           const confirmed = await cancelSession(accepted);
           if (confirmed && pendingPostRef.current === pending) retainPending(null);
         },
@@ -2151,8 +2172,18 @@ export function useChat(options?: UseChatOptions) {
       // Only observing the server's 202 proves this turn identity is safely
       // bound. Until then it remains reusable for an explicit resend.
       if (pendingPostRef.current === pending) retainPending(null);
-      sessionIdRef.current = body.sessionId;
-      if (options?.rememberAsLastSession) rememberLastChatSession(unifiedChatSessionId(body.sessionId));
+      const identity = acceptedChatSessionIdentity(conversationSessionIdRef.current, body.sessionId,
+        postAbortRef.current === postAbort && !postAbort.signal.aborted && activeAssistantId.current === assistantId);
+      if (!identity) {
+        // Stop/reset or a newer request won the race. The old acknowledgement
+        // is useful only for cancelling its exact accepted attempt.
+        await cancelSession(body);
+        return;
+      }
+      sessionIdRef.current = identity.executionSessionId;
+      conversationSessionIdRef.current = identity.conversationSessionId;
+      if (options?.rememberAsLastSession) rememberLastChatSession(unifiedChatSessionId(identity.conversationSessionId));
+      input.onAccepted?.();
       activeRunRef.current = body;
       // The background button is available immediately for responsiveness,
       // but authority arrives only in the 202. Queue an early click and apply
@@ -2202,8 +2233,9 @@ export function useChat(options?: UseChatOptions) {
       // Validation/conflict errors prove the server did not accept this exact
       // request. Transport/restart failures retain it for a safe replay.
       if (!isRetryableChatPostError(e) && postAbortRef.current === postAbort) retainPending(null);
-      if (e.status === 404) {
+      if (e.status === 404 && postAbortRef.current === postAbort) {
         sessionIdRef.current = null;
+        conversationSessionIdRef.current = null;
         // The session is gone server-side — a stale pointer would bounce the
         // chat index into a dead thread forever.
         if (options?.rememberAsLastSession) rememberLastChatSession(null);
@@ -2211,7 +2243,7 @@ export function useChat(options?: UseChatOptions) {
       const msg = (e.message || '').trim();
       const text = !msg || looksRawError(msg) ? GENERIC_TURN_ERROR : `Couldn't send: ${msg}`;
       patch(assistantId, { text, status: 'failed', progress: undefined });
-      if (input.connectionResume || retryRequest?.connectionRequestId) throw err;
+      if (input.onAccepted || input.connectionResume || retryRequest?.connectionRequestId) throw err;
     } finally {
       // A stopped POST can finish after the user has already started another
       // turn. Never let the stale promise clear the newer turn's controller,
@@ -2293,6 +2325,7 @@ export function useChat(options?: UseChatOptions) {
     streamRef.current = null;
     activeAssistantId.current = null;
     sessionIdRef.current = null;
+    conversationSessionIdRef.current = null;
     pendingBackgroundRef.current = null;
     activeRunRef.current = null;
     lateWatchRef.current?.cancel();
@@ -2304,10 +2337,10 @@ export function useChat(options?: UseChatOptions) {
     setBusy(false);
   }, []);
 
-  const retryPending = () => {
+  const retryPending = (onAccepted?: () => void) => {
     const pending = pendingPostRef.current;
     if (!pending || busy) return Promise.resolve();
-    return send({ text: pending.input, attachmentIds: pending.attachments, taskMode: pending.taskMode }, pending);
+    return send({ text: pending.input, attachmentIds: pending.attachments, taskMode: pending.taskMode, onAccepted }, pending);
   };
   const cancelPending = async () => {
     const pending = pendingPostRef.current;
@@ -2351,7 +2384,7 @@ export function useChat(options?: UseChatOptions) {
       + 'revision. Only ask me about something that genuinely needs my answer.',
     taskMode: { version: 1, kind: 'plan' },
   });
-  return { messages, busy, send, stop, background, reset, approveWithEdits, sessionId: sessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, preparePlan, pendingPost, retryPending, cancelPending, delegatedTaskTick };
+  return { messages, busy, send, stop, background, reset, approveWithEdits, sessionId: sessionIdRef, conversationSessionId: conversationSessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, preparePlan, pendingPost, retryPending, cancelPending, delegatedTaskTick };
 }
 
 

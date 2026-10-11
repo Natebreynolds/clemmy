@@ -3,11 +3,10 @@
  * pinned WKWebView).
  *
  * The native side owns the APNs registration ceremony (permission prompt,
- * device token), but it deliberately does NOT own an authenticated transport
- * — the device-bound session key lives in this page's IndexedDB and is
- * non-extractable by design. So the shell hands the token to the page and the
- * page registers it through the normal proof-signed api() path. One auth
- * path, no second credential.
+ * device token). Push registration uses the page's device-bound session key
+ * in IndexedDB, which is non-extractable by design. The shell hands the token
+ * to the page for the normal proof-signed api() path. Widget voice has a
+ * separate native key; its enrollment lives in native-voice-bridge.ts.
  *
  * Resilience: a token can arrive before the session exists (first launch
  * races pairing) or while the daemon is briefly unreachable. Failed
@@ -15,6 +14,7 @@
  * boot — registration is idempotent per device on the daemon side.
  */
 import { registerApnsToken } from './api';
+import { openWidgetRoute, widgetSpaceStored } from './widget-bridge';
 
 const PENDING_KEY = 'clem.apns.pending';
 
@@ -33,6 +33,8 @@ declare global {
       setConnection?(door: ConnectionDoor): void;
       /** Native durably parked this exact relay lease in Keychain. */
       originHandoffStored?(value: { handoffId: string; generation: number }): void;
+      widgetSpaceStored?(value: { requestId: string; ok: boolean; slug?: string }): void;
+      openWidgetRoute?(value: { path: string; navigationId: string }): boolean;
     };
     webkit?: {
       messageHandlers?: Record<string, { postMessage(body: unknown): void } | undefined>;
@@ -55,6 +57,21 @@ export function haptic(kind: HapticKind = 'light'): void {
 /** True when the pinned native shell is hosting this page. */
 export function inNativeShell(): boolean {
   return Boolean(window.webkit?.messageHandlers?.clemHaptic);
+}
+
+/** The native capture setup is available only in supported iPhone builds. */
+export function nativeVoiceSetupAvailable(): boolean {
+  return Boolean(window.webkit?.messageHandlers?.clemNativeVoiceSetup);
+}
+
+/** Presents setup; only a later explicit native action may start recording. */
+export function requestNativeVoiceSetup(): boolean {
+  try {
+    const handler = window.webkit?.messageHandlers?.clemNativeVoiceSetup;
+    if (!handler) return false;
+    handler.postMessage(true);
+    return true;
+  } catch { return false; }
 }
 
 /**
@@ -212,6 +229,8 @@ async function tryRegister(deviceToken: string, environment?: string): Promise<b
 /** Installed once at app bootstrap; also drains a parked token from a prior failed attempt. */
 export function installNativeBridge(): void {
   window.clemNative = {
+    widgetSpaceStored,
+    openWidgetRoute,
     registerApnsToken(deviceToken: string, environment?: string): void {
       void tryRegister(deviceToken, environment);
     },

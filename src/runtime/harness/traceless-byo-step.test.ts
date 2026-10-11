@@ -28,6 +28,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import OpenAI from 'openai';
 import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
+import { withTracelessStep, providerReportedModel } from './traceless-step-model.js';
 
 const { _withTracelessStepForTest } = await import('./byo-model.js');
 const { codexOneStep } = await import('./codex-one-step.js');
@@ -39,6 +40,54 @@ after(() => {
 function sseBody(chunks: unknown[]): string {
   return `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}`).join('\n\n')}\n\ndata: [DONE]\n\n`;
 }
+
+test('the buffered Claude reviewer retains actual response-metadata model without using request selection', async () => {
+  const { aisdk } = await import('@openai/agents-extensions/ai-sdk');
+  const { createAnthropic } = await import('@ai-sdk/anthropic');
+  const { withRawClaudeUsageRecording } = await import('./claude-model.js');
+  let requests = 0;
+  const parts = [
+    { type: 'message_start', message: { id: 'msg_reported_reviewer', type: 'message', role: 'assistant',
+      model: 'claude-sonnet-5-wire', content: [], stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: 42, output_tokens: 1 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'controlled verdict' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 7 } },
+    { type: 'message_stop' },
+  ];
+  const provider = createAnthropic({ apiKey: 'fixture-only', fetch: async () => {
+    requests++;
+    return new Response(parts.map(part => `event: ${part.type}\ndata: ${JSON.stringify(part)}\n\n`).join(''),
+      { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const recorded: Array<Record<string, any>> = [];
+  const model = withRawClaudeUsageRecording(withTracelessStep(aisdk(provider('claude-request-selection'))),
+    'claude-request-selection', row => recorded.push(row), () => {}, () => {});
+  const result = await model.getResponse({ input: 'fixture', tools: [], handoffs: [], modelSettings: {}, outputType: 'text', tracing: false } as never);
+  assert.equal(requests, 1);
+  assert.equal(result.responseId, 'msg_reported_reviewer');
+  assert.equal(providerReportedModel(result), 'claude-sonnet-5-wire');
+  assert.equal(result.usage.inputTokens, 42); assert.equal(result.usage.outputTokens, 7);
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0]?.requestModel, 'claude-request-selection');
+  assert.equal(recorded[0]?.providerReportedModel, 'claude-sonnet-5-wire');
+  assert.equal(recorded[0]?.account, undefined); assert.equal(recorded[0]?.backendId, undefined);
+});
+
+test('missing or conflicting reviewer wire model is unqualified and never replaced by request selection', async () => {
+  for (const variant of ['missing', 'conflicting', 'content-shaped']) {
+    const model = withTracelessStep({ async getResponse() { throw new Error('unused'); }, async *getStreamedResponse() {
+      if (variant !== 'missing') yield { type: 'model', event: { type: 'response-metadata',
+        modelId: variant === 'content-shaped' ? 'https://private.invalid' : 'claude-observed-a' } } as never;
+      yield { type: 'response_done', response: { id: 'msg_fixture', output: [], usage: { inputTokens: 1, outputTokens: 0 },
+        ...(variant === 'conflicting' ? { providerData: { model: 'claude-observed-b' } } : {}) } } as never;
+    } });
+    const result = await model.getResponse({ model: 'claude-selected' } as never);
+    assert.equal(providerReportedModel(result), undefined, variant);
+    if (variant !== 'missing') assert.equal(result.providerData?.providerReportedModelUnqualified, true, variant);
+  }
+});
 
 /** A grok-shaped chat-completions backend: one text delta + a tool call. */
 function fakeFetch(recorder: { requests: number }, shape: 'tool_step' | 'text_only' = 'tool_step'): typeof fetch {

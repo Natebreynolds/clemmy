@@ -14,20 +14,36 @@ import { Sheet } from './Sheet';
 import { haptic } from '../lib/native-bridge';
 import { useDictation } from '../lib/use-dictation';
 import { HoldToTalk, holdToTalkAvailable } from '../lib/hold-to-talk';
+import type { DictationPhase } from '../lib/browser-dictation';
+import { appendDictationText, bindDictationForegroundCancellation, microphoneProblem, microphoneUnavailableReason } from '../lib/dictation-support';
 import { attachmentKind, attachmentLabel, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS } from '../lib/attachments';
+import { mobileDrafts, type MobileStagedAttachment } from '../lib/file-context';
 
 export interface UploadResult { id: string; name: string; ok: boolean; error: string | null }
 
 export interface ComposerProps {
   value: string;
   onChange: (next: string) => void;
-  onSend: (text: string, attachments: ChatAttachment[]) => void;
+  onSend: (text: string, attachments: ChatAttachment[]) => void | boolean | Promise<void | boolean>;
+  /** Context is rendered above the words and never folded out of sight. */
+  context?: ComponentChildren;
+  contextKey?: string;
+  sendBlocked?: string;
+  reservedAttachments?: number;
+  /** A retry in the transcript settled attachments still shown in this composer. */
+  settledAttachmentIds?: readonly string[];
+  /** Saved with the conversation, including uploads that finish after leaving. */
+  attachmentScope?: string;
   placeholder: string;
   ariaLabel: string;
   /** Uploads one picked file and returns the daemon's id. Omit to hide "+". */
   upload?: (file: File) => Promise<UploadResult>;
-  /** Chips between "+" and the mic: who answers, in what mode. */
+  /** Optional secondary choices get their own wrapping row above the controls. */
   chips?: ComponentChildren;
+  /** Spoken conversation and dictation must never own the microphone together. */
+  voiceActive?: boolean;
+  onDictationActiveChange?: (active: boolean) => void;
+  onDictationStart?: () => void;
   disabled?: boolean;
   /** A turn is running: the arrow sends into it and a stop square appears. */
   canStop?: boolean;
@@ -38,68 +54,165 @@ export interface ComposerProps {
   textareaRef?: { current: HTMLTextAreaElement | null };
 }
 
-interface Staged extends ChatAttachment {
-  uploading?: boolean;
-  error?: string;
-}
+type Staged = MobileStagedAttachment;
+const NO_ATTACHMENTS: Staged[] = [];
 
 export function Composer(props: ComposerProps) {
   const { value, onChange, onSend, placeholder, ariaLabel, upload, chips, disabled, canStop, stopping, onStop, compact } = props;
   const localRef = useRef<HTMLTextAreaElement | null>(null);
   const textareaRef = props.textareaRef ?? localRef;
-  const [staged, setStaged] = useState<Staged[]>([]);
+  const attachmentScope = props.attachmentScope;
+  const draftGeneration = useRef(mobileDrafts.generation);
+  const mounted = useRef(true);
+  const [staged, setStagedState] = useState<Staged[]>(() => attachmentScope ? mobileDrafts.read(attachmentScope).stagedAttachments ?? NO_ATTACHMENTS : []);
+  const stagedRef = useRef(staged);
+  stagedRef.current = staged;
+  const setStaged = (update: (previous: Staged[]) => Staged[]) => {
+    // An upload completing after sign-out cannot revive the previous account's draft.
+    if (attachmentScope && draftGeneration.current !== mobileDrafts.generation) return;
+    const previous = attachmentScope ? mobileDrafts.read(attachmentScope).stagedAttachments ?? NO_ATTACHMENTS : stagedRef.current;
+    const next = update(previous);
+    if (attachmentScope) mobileDrafts.patchInGeneration(attachmentScope, draftGeneration.current, { stagedAttachments: next });
+    else {
+      const kept = new Set(next.map(file => file.previewUrl));
+      for (const file of previous) if (file.previewUrl && !kept.has(file.previewUrl)) URL.revokeObjectURL(file.previewUrl);
+    }
+    stagedRef.current = next;
+    if (mounted.current) setStagedState(next);
+  };
+  useEffect(() => {
+    if (!attachmentScope) return;
+    const sync = () => {
+      const next = draftGeneration.current === mobileDrafts.generation
+        ? mobileDrafts.read(attachmentScope).stagedAttachments ?? NO_ATTACHMENTS : NO_ATTACHMENTS;
+      stagedRef.current = next; setStagedState(next);
+    };
+    sync();
+    return mobileDrafts.subscribe(sync);
+  }, [attachmentScope]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (!attachmentScope) for (const file of stagedRef.current) if (file.previewUrl) URL.revokeObjectURL(file.previewUrl);
+    };
+  }, [attachmentScope]);
+  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const [sendProblem, setSendProblem] = useState('');
+  useEffect(() => { setSendProblem(''); }, [props.contextKey]);
+  useEffect(() => {
+    if (!props.settledAttachmentIds?.length) return;
+    const settled = new Set(props.settledAttachmentIds);
+    setStaged(current => current.filter(file => !settled.has(file.id)));
+    setSendProblem('');
+  }, [props.settledAttachmentIds]);
   const [attachOpen, setAttachOpen] = useState(false);
   const cameraRef = useRef<HTMLInputElement | null>(null);
   const photosRef = useRef<HTMLInputElement | null>(null);
   const filesRef = useRef<HTMLInputElement | null>(null);
-  const { available: dictation, listening: dictating, toggle: toggleDictation, stop: stopDictation } = useDictation(
+  const draftScopeRef = useRef(attachmentScope);
+  draftScopeRef.current = attachmentScope;
+  const changeRef = useRef(onChange);
+  changeRef.current = onChange;
+  const voiceActiveRef = useRef(props.voiceActive);
+  voiceActiveRef.current = props.voiceActive;
+  const ownsDictationDraft = () => mounted.current && document.visibilityState !== 'hidden' && draftGeneration.current === mobileDrafts.generation && draftScopeRef.current === attachmentScope && !voiceActiveRef.current;
+  const { available: dictation, listening: dictating, starting: speechStarting, transcribing: speechTranscribing, error: speechError, toggle: toggleDictation, cancel: cancelSpeech } = useDictation(
     value,
     onChange,
     () => textareaRef.current?.focus(),
+    ownsDictationDraft,
   );
-  // Hold to talk: the words are transcribed on the Mac. Web Speech remains
-  // the fallback where no microphone stream is available to the page.
+  // The Mac capture path remains preferred. A capture failure never changes
+  // the provider; platform speech keeps only its existing unsupported path.
   const holdable = holdToTalkAvailable();
   const talker = useRef<HoldToTalk | null>(null);
-  const [holding, setHolding] = useState(false);
-  const [transcribing, setTranscribing] = useState(false);
+  const [capturePhase, setCapturePhaseState] = useState<DictationPhase>('idle');
+  const capturePhaseRef = useRef<DictationPhase>('idle');
+  const setCapturePhase = (phase: DictationPhase) => { capturePhaseRef.current = phase; if (mounted.current) setCapturePhaseState(phase); };
   const [voiceNote, setVoiceNote] = useState<string | null>(null);
-  const listening = holding || dictating;
-  const beginHold = async (event: Event) => {
-    event.preventDefault();
-    if (disabled || holding || transcribing) return;
+  const starting = capturePhase === 'starting' || speechStarting;
+  const listening = capturePhase === 'recording' || dictating;
+  const transcribing = capturePhase === 'transcribing' || speechTranscribing;
+  const dictationActive = starting || listening || transcribing;
+  const activeChangeRef = useRef(props.onDictationActiveChange);
+  activeChangeRef.current = props.onDictationActiveChange;
+  useEffect(() => { activeChangeRef.current?.(dictationActive); }, [dictationActive]);
+
+  const cancelCapture = () => {
+    talker.current?.cancel();
+    talker.current = null;
+    setCapturePhase('idle');
+  };
+  const cancelDictation = () => { cancelCapture(); cancelSpeech(); };
+  useEffect(() => bindDictationForegroundCancellation(document, window, () => {
+    cancelDictation();
+    if (mounted.current) setVoiceNote(null);
+  }), []);
+  const beginCapture = async () => {
+    if (disabled || submittingRef.current || talker.current || !ownsDictationDraft()) return;
     setVoiceNote(null);
     const t = new HoldToTalk();
+    const scope = attachmentScope;
+    const owns = () => ownsDictationDraft() && talker.current === t && draftScopeRef.current === scope;
     talker.current = t;
-    setHolding(true);
+    setCapturePhase('starting');
     haptic('light');
-    try { await t.start(); } catch (err) {
-      setHolding(false);
+    try {
+      const ready = await t.start();
+      if (owns() && ready) setCapturePhase('recording');
+      else t.cancel();
+    } catch (err) {
+      if (!owns()) return;
+      t.cancel();
       talker.current = null;
-      setVoiceNote(err instanceof Error ? err.message : 'The microphone is not available.');
+      setCapturePhase('idle');
+      setVoiceNote(microphoneProblem(err));
     }
   };
-  const endHold = async () => {
+  const finishCapture = async () => {
     const t = talker.current;
     if (!t) return;
-    talker.current = null;
-    setHolding(false);
-    setTranscribing(true);
+    const scope = attachmentScope;
+    const owns = () => ownsDictationDraft() && talker.current === t && draftScopeRef.current === scope;
+    setCapturePhase('transcribing');
     try {
       const words = await t.stop();
-      if (words) {
+      if (owns() && words) {
         haptic('medium');
-        const joined = value.trim() ? `${value.replace(/\s+$/, '')} ${words}` : words;
-        onChange(joined);
+        const current = scope ? mobileDrafts.read(scope).text : valueRef.current;
+        changeRef.current(appendDictationText(current, words));
         textareaRef.current?.focus();
       }
     } catch (err) {
-      setVoiceNote(err instanceof Error ? err.message : 'Could not transcribe that.');
+      if (owns()) setVoiceNote(microphoneProblem(err));
     } finally {
-      setTranscribing(false);
+      if (owns()) { talker.current = null; setCapturePhase('idle'); }
     }
   };
-  useEffect(() => () => { talker.current?.cancel(); }, []);
+  const toggleMicrophone = () => {
+    if (props.voiceActive || disabled || submittingRef.current) return;
+    if (!dictationActive) props.onDictationStart?.();
+    if (holdable) {
+      if (capturePhaseRef.current === 'recording') void finishCapture();
+      else if (capturePhaseRef.current !== 'idle') cancelCapture();
+      else void beginCapture();
+    } else if (dictation) {
+      setVoiceNote(null);
+      if (speechStarting || speechTranscribing) cancelSpeech();
+      else toggleDictation();
+    } else setVoiceNote(microphoneUnavailableReason());
+  };
+  useEffect(() => { if (props.voiceActive || disabled) { cancelDictation(); setVoiceNote(null); } }, [props.voiceActive, disabled]);
+  useEffect(() => () => { cancelDictation(); }, [attachmentScope]);
+  useEffect(() => {
+    const checkOwner = () => { if (draftGeneration.current !== mobileDrafts.generation) cancelDictation(); };
+    return mobileDrafts.subscribe(checkOwner);
+  }, []);
+  useEffect(() => () => { talker.current?.cancel(); talker.current = null; cancelSpeech(); activeChangeRef.current?.(false); }, []);
 
   const autoresize = (el: HTMLTextAreaElement | null) => {
     if (!el) return;
@@ -107,7 +220,18 @@ export function Composer(props: ComposerProps) {
     el.style.height = `${Math.min(el.scrollHeight, compact ? 100 : 172)}px`;
   };
   useEffect(() => { autoresize(textareaRef.current); }, [value]);
-  useEffect(() => () => { for (const s of staged) if (s.previewUrl) URL.revokeObjectURL(s.previewUrl); }, []);
+  useEffect(() => {
+    const field = textareaRef.current;
+    if (!field) return;
+    let width = field.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (field.clientWidth === width) return;
+      width = field.clientWidth;
+      autoresize(field);
+    });
+    observer.observe(field);
+    return () => observer.disconnect();
+  }, [compact]);
 
   // Resting, empty and untouched, the card is one slim line: "+", the words,
   // the mic and send. Touching it opens the full card with its chips. Leaving
@@ -123,30 +247,49 @@ export function Composer(props: ComposerProps) {
     foldTimer.current = window.setTimeout(() => { foldTimer.current = null; setFocused(false); }, 240);
   };
   useEffect(() => () => { if (foldTimer.current !== null) window.clearTimeout(foldTimer.current); }, []);
-  const slim = !focused && !value.trim() && staged.length === 0 && !listening && !transcribing && !voiceNote;
+  const slim = !focused && !value.trim() && staged.length === 0 && !props.context && !dictationActive && !voiceNote && (!speechError || props.voiceActive);
 
   const ready = staged.filter((s) => !s.uploading && !s.error);
+  const attachmentLimit = Math.max(0, MAX_ATTACHMENTS - (props.reservedAttachments ?? 0));
   const uploading = staged.some((s) => s.uploading);
-  const canSend = !disabled && !uploading && (value.trim().length > 0 || ready.length > 0);
+  const fileSteeringBlocked = Boolean(canStop && staged.length);
+  const sendBlocked = props.sendBlocked || (staged.length > attachmentLimit ? 'Remove one attachment to include the selected file. A message can include up to 10 files.' : fileSteeringBlocked ? 'Files can be sent after Clem finishes this turn.' : '');
+  const canSend = !disabled && !props.voiceActive && !dictationActive && !submitting && !sendBlocked && !uploading && (value.trim().length > 0 || ready.length > 0);
 
-  const submit = (event?: Event) => {
+  const submit = async (event?: Event) => {
     event?.preventDefault();
-    if (!canSend) return;
+    if (!canSend || submittingRef.current || talker.current || props.voiceActive) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    setSendProblem('');
     haptic('medium');
-    stopDictation();
+    cancelDictation();
     const text = value.trim();
     const sending: ChatAttachment[] = ready.map(({ uploading: _u, error: _e, ...rest }) => rest);
-    onChange('');
-    setStaged([]);
-    if (textareaRef.current) { textareaRef.current.value = ''; autoresize(textareaRef.current); }
-    onSend(text, sending);
+    const original = value;
+    try {
+      const accepted = await onSend(text, sending);
+      if (accepted === false) return;
+      if (draftGeneration.current === mobileDrafts.generation) {
+        const currentText = attachmentScope ? mobileDrafts.read(attachmentScope).text : valueRef.current;
+        if (currentText === original) onChange('');
+      }
+      const sent = new Set(sending.map(file => file.id));
+      setStaged(current => current.filter(file => !sent.has(file.id)));
+    } catch (error) {
+      setSendProblem(error instanceof Error ? error.message : 'Your message could not be sent. Try again.');
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
   };
 
   const pick = async (files: FileList | null) => {
     setAttachOpen(false);
     if (!files || !upload) return;
-    const chosen = Array.from(files).slice(0, Math.max(0, MAX_ATTACHMENTS - staged.length));
+    const chosen = Array.from(files).slice(0, Math.max(0, attachmentLimit - staged.length));
     for (const file of chosen) {
+      if (draftGeneration.current !== mobileDrafts.generation || (!attachmentScope && !mounted.current)) break;
       const kind = attachmentKind(file.name, file.type);
       const localId = `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
       const previewUrl = kind === 'image' ? URL.createObjectURL(file) : undefined;
@@ -170,8 +313,6 @@ export function Composer(props: ComposerProps) {
 
   const remove = (id: string) => {
     setStaged((prev) => {
-      const gone = prev.find((s) => s.id === id);
-      if (gone?.previewUrl) URL.revokeObjectURL(gone.previewUrl);
       return prev.filter((s) => s.id !== id);
     });
   };
@@ -179,7 +320,8 @@ export function Composer(props: ComposerProps) {
   const onFiles = (event: Event) => { void pick((event.currentTarget as HTMLInputElement).files); (event.currentTarget as HTMLInputElement).value = ''; };
 
   return (
-    <form class={`composer${compact ? ' composer-compact' : ''}${slim ? ' composer-slim' : ''}${listening ? ' listening' : ''}`} onSubmit={submit}>
+    <form class={`composer${compact ? ' composer-compact' : ''}${slim ? ' composer-slim' : ''}${listening ? ' listening' : ''}`} onSubmit={event => { void submit(event); }}>
+      {props.context}
       {staged.length > 0 ? (
         <div class="composer-attachments" aria-label="Attachments">
           {staged.map((s) => (
@@ -193,7 +335,7 @@ export function Composer(props: ComposerProps) {
               )}
               <span class="composer-attachment-name">{s.error ? s.error : attachmentLabel(s)}</span>
               {s.uploading ? <span class="composer-attachment-spin" role="status" aria-label="Uploading" /> : null}
-              <button type="button" class="composer-attachment-remove" aria-label={`Remove ${attachmentLabel(s)}`} onClick={() => remove(s.id)}>×</button>
+              <button type="button" class="composer-attachment-remove" disabled={submitting} aria-label={`Remove ${attachmentLabel(s)}`} onClick={() => remove(s.id)}>×</button>
             </div>
           ))}
         </div>
@@ -204,50 +346,38 @@ export function Composer(props: ComposerProps) {
         rows={1}
         value={value}
         aria-label={ariaLabel}
-        placeholder={holding ? 'Listening… let go to finish' : transcribing ? 'Writing down what you said…' : dictating ? 'Listening…' : placeholder}
+        placeholder={starting ? 'Starting microphone…' : transcribing ? 'Writing down what you said…' : listening ? 'Listening… tap the mic to finish' : placeholder}
         enterkeyhint="send"
         autocomplete="off"
-        disabled={disabled}
+        disabled={disabled || props.voiceActive}
         onFocus={onFieldFocus}
         onBlur={onFieldBlur}
         onInput={(event) => onChange((event.currentTarget as HTMLTextAreaElement).value)}
         onKeyDown={(event) => {
           if (event.isComposing) return;
-          if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit(); }
+          if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit(); }
         }}
       />
+      {chips ? <div class="composer-chips">{chips}</div> : null}
       <div class="composer-row">
         {upload ? (
-          <button type="button" class="composer-icon composer-attach" aria-label="Attach a photo or file" aria-haspopup="dialog" aria-expanded={attachOpen} disabled={disabled || staged.length >= MAX_ATTACHMENTS} onClick={() => { haptic('light'); setAttachOpen(true); }}>
+          <button type="button" class="composer-icon composer-attach" aria-label="Attach a photo or file" aria-haspopup="dialog" aria-expanded={attachOpen} disabled={disabled || props.voiceActive || submitting || staged.length >= attachmentLimit} onClick={() => { haptic('light'); setAttachOpen(true); }}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
           </button>
         ) : null}
-        {chips ? <div class="composer-chips">{chips}</div> : null}
         <span class="composer-spacer" aria-hidden="true" />
-        {holdable ? (
           <button
             type="button"
-            class={`composer-icon chat-mic${holding ? ' holding' : ''}${transcribing ? ' transcribing' : ''}`}
-            aria-label={holding ? 'Let go to finish' : 'Hold to talk'}
-            aria-pressed={holding}
-            disabled={disabled || transcribing}
-            onPointerDown={(e) => { void beginHold(e); }}
-            onPointerUp={() => { void endHold(); }}
-            onPointerCancel={() => { void endHold(); }}
-            onPointerLeave={() => { if (holding) void endHold(); }}
-            onContextMenu={(e) => e.preventDefault()}
+            class={`composer-icon chat-mic${listening ? ' holding' : ''}${transcribing || starting ? ' transcribing' : ''}`}
+            aria-label={starting ? 'Cancel dictation' : transcribing ? 'Cancel transcription' : listening ? 'Finish dictation' : 'Dictate'}
+            aria-pressed={dictationActive}
+            disabled={disabled || props.voiceActive || submitting}
+            onClick={toggleMicrophone}
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3" />
             </svg>
           </button>
-        ) : dictation ? (
-          <button type="button" class="composer-icon chat-mic" aria-label={dictating ? 'Stop dictation' : 'Dictate'} aria-pressed={dictating} disabled={disabled} onClick={toggleDictation}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3" />
-            </svg>
-          </button>
-        ) : null}
         {canStop ? (
           <button class="chat-stop" type="button" onClick={onStop} disabled={stopping} aria-label="Stop">
             {stopping ? <span class="chat-stop-busy" aria-hidden="true" /> : (
@@ -261,7 +391,11 @@ export function Composer(props: ComposerProps) {
           </svg>
         </button>
       </div>
-      {voiceNote ? <p class="composer-note" role="alert">{voiceNote}</p> : null}
+      {submitting ? <p class="composer-note" role="status">Preparing and sending…</p> : null}
+      {sendBlocked ? <p class="composer-note" role="status">{sendBlocked}</p> : null}
+      {sendProblem ? <p class="composer-note" role="alert">{sendProblem}</p> : null}
+      {dictationActive ? <p class="composer-note" role="status">{starting ? 'Starting microphone… Allow access if asked. Tap the mic again to cancel.' : transcribing ? 'Transcribing… Tap the mic again to cancel.' : 'Listening. Tap the mic again to finish.'}</p> : null}
+      {voiceNote || (!holdable && speechError) ? <p class="composer-note" role="alert">{voiceNote || speechError}</p> : null}
       {upload ? (
         <>
           <input ref={cameraRef} type="file" accept="image/*" capture="environment" hidden onChange={onFiles} />

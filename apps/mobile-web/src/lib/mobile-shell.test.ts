@@ -59,7 +59,9 @@ test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the cu
   // ONE menu (owner 2026-08-25, 2026-09-26): the Clemmy mark opens the drawer
   // with a real touch target, a rightward swipe across the header opens it too,
   // and the title is words. The title-tap sheet is gone.
-  assert.match(app, /class="menu-mark"[\s\S]*?aria-haspopup="dialog"[\s\S]*?aria-expanded=\{drawerOpen\}/);
+  assert.match(app, /<NavigationMenuButton brand\s*\/>/);
+  const menuButton = read('../components/NavigationMenuButton.tsx');
+  assert.match(menuButton, /aria-label="Open navigation"[\s\S]*?aria-haspopup="dialog"[\s\S]*?aria-expanded=\{navigation.navigationOpen\}/);
   assert.match(app, /clientX - sw\.x > 48 && !drawerOpen\) openDrawer\(\)/);
   assert.match(app, /<span class="title-text">\{TAB_TITLES\[tab\]\}<\/span>/);
   assert.doesNotMatch(app, /TitleSwitcher|switcherOpen|title-switch/);
@@ -73,18 +75,18 @@ test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the cu
   const closeStart = app.indexOf('const closeDrawer =');
   const closeEnd = app.indexOf('\n  };', closeStart);
   const closeSource = app.slice(closeStart, closeEnd);
-  assert.ok(closeSource.indexOf('titleBtnRef.current?.focus()') < closeSource.indexOf('window.setTimeout'),
+  const restoreFocusAt = closeSource.indexOf('drawerOpenerRef.current.focus()');
+  assert.ok(restoreFocusAt >= 0 && restoreFocusAt < closeSource.indexOf('window.setTimeout'),
     'focus returns before the exit animation rather than staying inside aria-hidden content');
   // The active section carries the page marker, accent-highlighted in CSS.
   assert.match(app, /aria-current=\{tab === t\.id \? 'page' : undefined\}/);
   const css = read('../styles.css');
   assert.match(css, /\.menu-mark \{[\s\S]*?min-width: 44px;[\s\S]*?min-height: 44px/);
-  // Seven places (Projects joined them 2026-09-29), two quiet doors, Settings
-  // at the foot.
-  assert.match(app, /const PRIMARY_TABS: ReadonlyArray<Tab> = \['home', 'inbox', 'projects', 'spaces', 'workflows', 'agents', 'memory'\];/);
+  // Chats has a direct section door as well as its recent-thread shortcuts.
+  assert.match(app, /const PRIMARY_TABS: ReadonlyArray<Tab> = \['home', 'chats', 'inbox', 'projects', 'spaces', 'workflows', 'agents', 'memory'\];/);
   assert.match(app, /const QUIET_TABS: ReadonlyArray<Tab> = \['activity'\];/);
   assert.match(app, /class="drawer-quiet"/);
-  assert.match(css, /\.drawer \{[\s\S]*?width: min\(82vw, 320px\)/);
+  assert.match(css, /\.drawer \{[\s\S]*?width: min\(calc\(100vw - 40px\), 340px\)/);
   assert.match(css, /\.drawer \{[\s\S]*?env\(safe-area-inset-left\)/);
   assert.match(css, /\.drawer-item \{[\s\S]*?min-height: 48px/);
   assert.match(css, /\.drawer-item\[aria-current='page'\] \{[\s\S]*?var\(--accent\)/);
@@ -214,11 +216,10 @@ test('the one drawer and the ask capsule replace the hamburger, the title sheet 
   assert.match(home, /useWorkingNow\(\)/, 'Running renders from the ONE shared snapshot');
   const css = read('../styles.css');
   assert.match(css, /\.ask-capsule \{[\s\S]*?position: fixed;[\s\S]*?env\(safe-area-inset-bottom\)/);
-  // One composer card for the capsule and the thread; its controls are 40px
-  // circles inside a card that itself clears 44px.
+  // The capsule and thread share 44px controls that remain reachable on phones.
   const capsule = read('../components/AskCapsule.tsx');
   assert.match(capsule, /<Composer[\s\S]*?compact/);
-  assert.match(css, /\.composer-icon \{[\s\S]*?width: 40px;[\s\S]*?height: 40px/);
+  assert.match(css, /\.composer-icon \{[^}]*width: 44px;[^}]*height: 44px/);
   assert.doesNotMatch(css, /\.ask-capsule-send \{|\.ask-capsule-mic \{|\.chat-composer \{|\.chat-mode-seg \{/, 'the old capsule and thread composer styles are deleted, not hidden');
   assert.doesNotMatch(css, /\.menu-btn \{|\.inbox-intro \{/, 'dead chrome styles are deleted, not hidden');
 });

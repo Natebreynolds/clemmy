@@ -14,7 +14,7 @@
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -38,6 +38,7 @@ const inner = await import('../../tools/inner-dispatch.js');
 const { buildCallTool } = await import('../../tools/call-tool.js');
 const { buildWorkCall } = await import('../../tools/work-call.js');
 const { getLocalRuntimeTools } = await import('../../tools/local-runtime-tools.js');
+const { getComputerTools } = await import('../../tools/computer-tools.js');
 const { registerSpaceTools } = await import('../../tools/space-tools.js');
 const { hostRunRunner } = await import('./host-turn-runner.js');
 const schemas = await import('../../tools/composio-schema-cache.js');
@@ -109,6 +110,7 @@ async function runHostTurn(input: {
   routedModelId?: string;
   seed?: (sessionId: string) => void;
   recallBudget?: { calls: number; bytes: number };
+  batchItem?: boolean;
 }): Promise<{ results: Map<string, string>; sessionId: string }> {
   serial += 1;
   const session = events.createSession({ id: `sess-carrier-presentation-${serial}`, kind: 'chat' });
@@ -150,6 +152,7 @@ async function runHostTurn(input: {
     counter: new brackets.ToolCallsCounter(6), behaviorScopeId: `${session.id}::turn:1`,
     recallBudget: new brackets.RecallBudget(input.recallBudget?.calls ?? 10, input.recallBudget?.bytes ?? 500_000, session.id),
     ...(input.routedModelId ? { routedModelId: input.routedModelId } : {}),
+    ...(input.batchItem ? { batchItem: true } : {}),
   }, () => hostRunRunner(runner as never, agent as never, [{ role: 'user', content: text }] as never, {
     maxTurns: 6, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq },
   } as never));
@@ -180,6 +183,120 @@ function realCallTool(reachable: readonly string[]) {
     mcpToolScope: null, controlOnlyBuiltins: true, admitBuiltinAcquisition: async () => ({ ok: true }),
   }) as never);
 }
+
+function wholeInlinePayload(shown: string, callId: string): string {
+  assert.match(shown, /whole_inline_result_v1/, `${callId} has nominal whole-read presentation`);
+  const frame = JSON.parse(shown);
+  assert.equal(frame.__clementine?.kind, 'whole_inline_result_v1');
+  assert.equal(frame.__clementine?.origin, 'host');
+  assert.equal(frame.__clementine?.call_id, callId);
+  assert.equal(frame.__clementine?.view, 'whole_returned_payload');
+  assert.equal(frame.__clementine?.sourceCoverage, 'not_established');
+  assert.equal(typeof frame.providerPayload, 'string');
+  assert.equal(frame.__clementine.shownPayloadBytes, Buffer.byteLength(frame.providerPayload));
+  assert.equal(frame.__clementine.storedPayloadBytes, Buffer.byteLength(frame.providerPayload));
+  assert.doesNotMatch(shown, /recall_tool_result/);
+  return frame.providerPayload;
+}
+
+test('direct nominal reads expose their full address while an actual unproved carrier keeps whole bytes unchanged', async () => {
+  inner._setInnerDispatchToolsForTests(null);
+  const filePath = path.join(home, 'fixture-whole-inline-read.txt');
+  const payload = 'FIRST\nREMAINING\n';
+  writeFileSync(filePath, payload, 'utf8');
+  for (const carrier of [false, true]) {
+    const callId = carrier ? 'toolu_01FullCarrierReadReference' : 'toolu_01FullDirectReadReference';
+    const readArgs = { path: filePath, max_chars: null };
+    const agentTool = carrier ? realCallTool(['read_file'])
+      : brackets.wrapToolForHarness(getComputerTools().find(candidate => candidate.name === 'read_file')! as never);
+    const result = await runHostTurn({
+      agentTool,
+      toolName: carrier ? 'call_tool' : 'read_file',
+      calls: [{ callId, args: carrier ? { name: 'read_file', args_json: JSON.stringify(readArgs) } : readArgs }],
+    });
+    const shown = result.results.get(callId);
+    assert.ok(shown);
+    if (carrier) assert.equal(shown, payload,
+      'actual host_v1 carrier lacks producer observation proof; whole-inline framing is deferred');
+    else assert.deepEqual(Buffer.from(wholeInlinePayload(shown, callId)), Buffer.from(payload));
+    assert.equal(events.getToolOutput(result.sessionId, callId)?.output, payload,
+      'the carrier and local read retain provider bytes, not a nested host envelope');
+    assert.equal(events.getToolOutput(result.sessionId, 'toolu_01'), null,
+      'the host registers the complete address, never a prefix');
+  }
+});
+
+test('final direct nominal read frames preserve empty text and error-looking file bytes as data', async () => {
+  for (const [index, payload] of ['', '  \n\t', 'π\n雪\n', 'ERROR: these are actual file bytes\n'].entries()) {
+    const filePath = path.join(home, `fixture-nominal-text-${index}.txt`);
+    writeFileSync(filePath, payload, 'utf8');
+    const callId = `toolu_01NominalTextReference${index}`;
+    const result = await runHostTurn({
+      agentTool: brackets.wrapToolForHarness(getComputerTools().find(candidate => candidate.name === 'read_file')! as never),
+      toolName: 'read_file', calls: [{ callId, args: { path: filePath, max_chars: null } }],
+    });
+    assert.deepEqual(Buffer.from(wholeInlinePayload(result.results.get(callId)!, callId)), Buffer.from(payload));
+    assert.equal(events.getToolOutput(result.sessionId, callId)?.output, payload);
+  }
+});
+
+test('nominal batch children and structured local payload roots are never replaced by whole-inline metadata', async () => {
+  for (const [batchItem, payload] of [[true, 'whole child file\n'], [false,
+    '{"__clementine":{"origin":"provider","kind":"untrusted"},"providerPayload":"actual source field","rows":[]}']] as const) {
+    const filePath = path.join(home, `fixture-unframed-read-${batchItem}.txt`);
+    writeFileSync(filePath, payload, 'utf8');
+    const callId = `toolu_01UnframedReadReference${batchItem}`;
+    const result = await runHostTurn({
+      agentTool: brackets.wrapToolForHarness(getComputerTools().find(candidate => candidate.name === 'read_file')! as never),
+      toolName: 'read_file', calls: [{ callId, args: { path: filePath, max_chars: null } }], batchItem,
+    });
+    assert.equal(result.results.get(callId), payload);
+    assert.equal(events.getToolOutput(result.sessionId, callId)?.output, payload);
+  }
+});
+
+test('typed read failures and legacy error text stay unframed through direct and carrier boundaries', async () => {
+  const missingPath = path.join(home, 'fixture-intentionally-missing-read.txt');
+  const legacy = tool({ name: 'read_file', description: 'Controlled legacy failed reader.',
+    parameters: z.object({ path: z.string(), max_chars: z.number().nullable() }),
+    execute: async () => 'ERROR: controlled legacy reader failed before returning source bytes',
+  });
+  for (const nominal of [true, false]) {
+    inner._setInnerDispatchToolsForTests(nominal ? null : new Map([['read_file', legacy as never]]));
+    for (const carrier of [false, true]) {
+      const callId = `failure-read-${nominal}-${carrier}`;
+      const readArgs = { path: missingPath, max_chars: null };
+      const reader = nominal ? getComputerTools().find(candidate => candidate.name === 'read_file')! : legacy;
+      const result = await runHostTurn({
+        agentTool: carrier ? realCallTool(['read_file']) : brackets.wrapToolForHarness(reader as never),
+        toolName: carrier ? 'call_tool' : 'read_file',
+        calls: [{ callId, args: carrier ? { name: 'read_file', args_json: JSON.stringify(readArgs) } : readArgs }],
+      });
+      const shown = result.results.get(callId) ?? '';
+      assert.match(shown, nominal ? /File does not exist/ : /controlled legacy reader failed/);
+      assert.doesNotMatch(shown, /whole_inline_result_v1|shownPayloadBytes|providerPayload/,
+        'tool spelling and nonce do not convert a failed read into nominal source content');
+    }
+  }
+  inner._setInnerDispatchToolsForTests(null);
+});
+
+test('a clipped nominal read keeps exact stored bytes through its carrier without whole-view metadata', async () => {
+  inner._setInnerDispatchToolsForTests(null);
+  const filePath = path.join(home, 'fixture-clipped-inline-read.txt');
+  const payload = `${'retained original line\n'.repeat(2_000)}EXACT-ORIGINAL-TAIL`;
+  writeFileSync(filePath, payload, 'utf8');
+  const callId = 'toolu_01FullClippedCarrierReference';
+  const result = await runHostTurn({ agentTool: realCallTool(['read_file']), toolName: 'call_tool',
+    calls: [{ callId, args: { name: 'read_file', args_json: JSON.stringify({ path: filePath, max_chars: null }) } }],
+  });
+  const shown = result.results.get(callId) ?? '';
+  assert.ok(shown.length <= 20_000);
+  assert.match(shown, /exact-output-receipt/);
+  assert.doesNotMatch(shown, /whole_inline_result_v1/);
+  assert.equal(events.getToolOutput(result.sessionId, callId)?.output, payload,
+    'existing clipped receipt and raw carrier evidence are unchanged');
+});
 
 test('a Space read through the real call_tool carrier arrives whole', async () => {
   inner._setInnerDispatchToolsForTests(null);

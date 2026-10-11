@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ChatPostCancelledError,
+  acceptedChatSessionIdentity,
   activeTurnTaskMode,
   inFlightTurnSince,
   readReattachTurn,
@@ -44,6 +45,17 @@ import {
 import type { HarnessEvent } from './types';
 
 let seq = 0;
+
+test('Stop/Continue keeps one visible chat while accepted controls move to the new physical head', () => {
+  const first = acceptedChatSessionIdentity(null, 'first-head', true)!;
+  const resumed = acceptedChatSessionIdentity(first.conversationSessionId, 'successor-head', true)!;
+  assert.deepEqual(resumed, { conversationSessionId: 'first-head', executionSessionId: 'successor-head' });
+  assert.equal(acceptedChatSessionIdentity(resumed.conversationSessionId, 'stale-old-head', false), null,
+    'a superseded acknowledgement must not replace either navigation or control identity');
+  const reopened = acceptedChatSessionIdentity('first-head', 'another-successor', true)!;
+  assert.equal(reopened.conversationSessionId, first.conversationSessionId);
+  assert.equal(reopened.executionSessionId, 'another-successor');
+});
 
 test('reopened live run restores source-bound exact Stop and Background authority', async () => {
   const sessionId = 'reopened-control';

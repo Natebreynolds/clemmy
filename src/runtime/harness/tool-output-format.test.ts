@@ -31,9 +31,11 @@ const {
   exactToolOutputForInvocation,
   truncateToolText,
   PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
+  TOOL_OUTPUT_REASONING_GUIDANCE,
 } = await import('./tool-output-format.js');
 const { withToolOutputContext } = await import('./tool-output-context.js');
 const { textResult } = await import('../../tools/shared.js');
+const trustedWholeRead = { nominalReadSucceeded: true, effectiveToolName: 'read_file' };
 
 test.after(() => {
   try {
@@ -76,6 +78,106 @@ test('control-topology parked results keep the full default budget', () => {
   assert.ok(full.length < 20_000);
   assert.equal(visible, full);
   assert.equal(getToolOutput(sess.id, 'call_control_inline')?.output, full);
+});
+
+test('small fully inline reads expose the exact full address separately from lossless payload bytes', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const callId = 'toolu_01FullRegisteredReadReference';
+  const nonce = '66666666-6666-4666-8666-666666666666';
+  for (const full of ['alpha\nbeta\n', 'π\n雪\n', '', '  \n\t', '{"__clementine":\n"not host metadata"']) {
+    const visible = withToolOutputContext({ sessionId: sess.id, callId,
+      toolName: 'read_file', settlementNonce: nonce, wholeInlinePresentation: trustedWholeRead },
+    () => formatRecallableToolText(full));
+    const frame = JSON.parse(visible);
+    assert.equal(frame.__clementine.origin, 'host');
+    assert.equal(frame.__clementine.kind, 'whole_inline_result_v1');
+    assert.equal(frame.__clementine.call_id, callId);
+    assert.equal(frame.__clementine.view, 'whole_returned_payload');
+    assert.equal(frame.__clementine.shownPayloadBytes, Buffer.byteLength(full));
+    assert.equal(frame.__clementine.storedPayloadBytes, Buffer.byteLength(full));
+    assert.equal(frame.__clementine.sourceCoverage, 'not_established');
+    assert.match(frame.__clementine.guidance, /host metadata is not provider evidence or proof of source access/);
+    assert.equal(frame.providerPayload, full, 'decoded payload includes even empty or whitespace text');
+    assert.deepEqual(Buffer.from(frame.providerPayload), Buffer.from(full));
+    const exact = getToolOutputForInvocation(sess.id, callId, nonce);
+    assert.equal(exact?.output, full);
+    assert.equal(getToolOutputForInvocation(sess.id, 'toolu_01', nonce), null,
+      'a reference prefix is not the registered invocation');
+    assert.doesNotMatch(visible, /recall_tool_result|VISIBLE RESULTS/);
+    assert.equal(exactToolOutputForInvocation({ sessionId: sess.id, callId, toolName: 'read_file',
+      compactResult: visible, settlementNonce: nonce }), full);
+    assert.equal(exactToolOutputForInvocation({ sessionId: sess.id, callId, toolName: 'read_file',
+      compactResult: visible, settlementNonce: '77777777-7777-4777-8777-777777777777' }), visible);
+    const corrupt = visible.replace(/sha256=[0-9a-f]{64}/, `sha256=${'0'.repeat(64)}`);
+    assert.equal(exactToolOutputForInvocation({ sessionId: sess.id, callId, toolName: 'read_file',
+      compactResult: corrupt, settlementNonce: nonce }), corrupt);
+  }
+  assert.match(TOOL_OUTPUT_REASONING_GUIDANCE, /full exact registered call_id\/authorized handle/);
+});
+
+test('whole inline framing never truncates payload or changes structured provider roots to fit its metadata', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const context = { sessionId: sess.id, callId: 'toolu_01WholeInlineBudget', toolName: 'read_file',
+    settlementNonce: '66666666-6666-4666-8666-666666666666', wholeInlinePresentation: trustedWholeRead };
+  const full = 'whole payload\n';
+  const framed = withToolOutputContext(context, () => formatRecallableToolText(full));
+  assert.ok(framed.length > full.length);
+  const smaller = withToolOutputContext(context, () => formatRecallableToolText(full, { maxChars: full.length }));
+  assert.equal(smaller, full, 'the whole original wins when its host frame does not fit');
+  for (const structured of ['{"ok":true,"data":[]}', '["row",{"id":"exact"}]']) {
+    assert.equal(withToolOutputContext(context, () => formatRecallableToolText(structured)), structured,
+      'object and array roots remain exact provider JSON');
+  }
+});
+
+test('only a matching active invocation receives whole inline host metadata', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const full = 'full\n';
+  const context = { sessionId: sess.id, callId: 'toolu_01WholeInlineBound', toolName: 'read_file',
+    settlementNonce: '66666666-6666-4666-8666-666666666666', wholeInlinePresentation: trustedWholeRead };
+  assert.equal(withToolOutputContext({ ...context, wholeInlinePresentation: undefined }, () => formatRecallableToolText(full)), full,
+    'an exact read name and nonce alone are not nominal read success');
+  assert.equal(withToolOutputContext({ ...context, wholeInlinePresentation: { ...trustedWholeRead, nominalReadSucceeded: false } },
+    () => formatRecallableToolText(full)), full, 'handler/nested phases have no whole-frame authorization');
+  assert.equal(formatRecallableToolText(full, { sessionId: sess.id, callId: context.callId, toolName: 'read_file' }), full);
+  assert.equal(withToolOutputContext({ ...context, settlementNonce: undefined }, () => formatRecallableToolText(full)), full);
+  for (const options of [{ callId: 'different-call' }, { sessionId: 'different-session' }, { toolName: 'different_tool' }]) {
+    assert.equal(withToolOutputContext(context, () => formatRecallableToolText(full, options)), full);
+  }
+  assert.equal(withToolOutputContext({ ...context, callId: 'unsafe\nreference' }, () => formatRecallableToolText(full)), full);
+  assert.equal(withToolOutputContext({ ...context, toolName: 'recall_tool_result' }, () => formatRecallableToolText(full)), full,
+    'retained readers own their existing paging frame');
+  assert.equal(withToolOutputContext({ ...context, toolName: 'call_tool',
+    wholeInlinePresentation: { ...trustedWholeRead, effectiveToolName: 'recall_tool_result' } },
+  () => formatRecallableToolText(full)), full, 'trusted effective retained readers through carriers stay unchanged');
+  assert.equal(withToolOutputContext(context, () => withToolOutputContext({
+    sessionId: sess.id, callId: context.callId, toolName: context.toolName,
+  }, () => formatRecallableToolText(full))),
+  withToolOutputContext(context, () => formatRecallableToolText(full)), 'same exact invocation inherits its host policy');
+  assert.equal(withToolOutputContext(context, () => withToolOutputContext({
+    sessionId: sess.id, callId: 'new-child', toolName: context.toolName,
+  }, () => formatRecallableToolText(full))), full, 'a child invocation never inherits the parent presentation authorization');
+});
+
+test('an authenticated whole inline frame is reused or resized without persisting host metadata', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const context = { sessionId: sess.id, callId: 'toolu_01WholeInlineReuse', toolName: 'read_file',
+    settlementNonce: '66666666-6666-4666-8666-666666666666', wholeInlinePresentation: trustedWholeRead };
+  const full = 'FIRST\nREMAINING\n';
+  withToolOutputContext(context, () => {
+    const visible = formatRecallableToolText(full);
+    const changes = () => (openEventLog().prepare('SELECT total_changes() AS count').get() as { count: number }).count;
+    const before = changes();
+    assert.equal(formatRecallableToolText(visible), visible);
+    assert.equal(formatRecallableToolText(visible, { maxChars: full.length }), full);
+    assert.equal(changes(), before, 'authenticated reformatters do not write either recall or invocation storage');
+    assert.equal(getToolOutputForInvocation(sess.id, context.callId, context.settlementNonce)?.output, full);
+    assert.equal(getToolOutput(sess.id, context.callId)?.output, full);
+  });
 });
 
 test('a parked result uses the prompt-inline budget and a recall handle by default', () => {

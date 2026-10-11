@@ -243,6 +243,8 @@ export interface WorkflowRunGraphOverlay {
   executionEfficiency: WorkflowRunExecutionEfficiencyOverlay | null;
   recoveryIntent: WorkflowRunRecoveryIntentOverlay | null;
   recoveryLineage: WorkflowRunRecoveryLineageEntry[];
+  /** Run-level diagnostics are retained without inventing a graph step. */
+  runAdvisories: Array<Pick<WorkflowEvent, 't' | 'meta' | 'error'>>;
   steps: WorkflowRunGraphStepOverlay[];
 }
 
@@ -286,6 +288,7 @@ interface ExecutionEfficiencyDiagnosis {
 }
 
 const RUN_GOAL_STEP_ID = '(run goal)';
+const RUN_ADVISORY_STEP_ID = '(workflow)';
 
 const STEP_STATUS_BY_KIND: Partial<Record<WorkflowEventKind, WorkflowRunGraphStepStatus>> = {
   step_started: 'running',
@@ -355,6 +358,7 @@ export function buildWorkflowRunGraphOverlay(
   let runStartedAt: string | undefined;
   let runFinishedAt: string | undefined;
   let goal: WorkflowRunGoalOverlay | null = null;
+  const runAdvisories: WorkflowRunGraphOverlay['runAdvisories'] = [];
 
   const ensureStep = (stepId: string): MutableStepOverlay => {
     const existing = byStep.get(stepId);
@@ -454,6 +458,11 @@ export function buildWorkflowRunGraphOverlay(
     }
     if (stepId === RUN_GOAL_STEP_ID) {
       applyRunGoalEvent(ensureGoal(), event);
+      continue;
+    }
+    if (stepId === RUN_ADVISORY_STEP_ID && kind === 'step_advisory') {
+      runAdvisories.push({ t: event.t, ...(event.meta ? { meta: event.meta } : {}),
+        ...(event.error ? { error: event.error } : {}) });
       continue;
     }
     if (!stepId) continue;
@@ -626,6 +635,7 @@ export function buildWorkflowRunGraphOverlay(
     executionEfficiency: executionEfficiency?.overlay ?? null,
     recoveryIntent: options.recoveryIntent ?? null,
     recoveryLineage: [...(options.recoveryLineage ?? [])],
+    runAdvisories,
     steps: overlaySteps,
   };
 }
@@ -638,7 +648,10 @@ function deriveStepOperations(
   const riskSignals: string[] = [];
 
   if (row.status === 'failed') attentionReasons.push(row.error ? `failed: ${row.error}` : 'failed');
-  if (row.status === 'awaiting_approval' || row.approvalsRequested > row.approvalsResolved) attentionReasons.push('waiting for your approval');
+  // Gate counters are historical telemetry. A resumed start or final step
+  // outcome supersedes a prior wait even when the runner did not emit a
+  // separate approval_granted event for that declarative gate.
+  if (row.status === 'awaiting_approval') attentionReasons.push('waiting for your approval');
   if (row.status === 'awaiting_input') attentionReasons.push('waiting for your answer');
   if (row.status === 'awaiting_capability') attentionReasons.push('waiting for a connection');
   if (row.status === 'blocked') attentionReasons.push(row.error ? `blocked: ${row.error}` : 'blocked without its deliverable');
@@ -662,7 +675,7 @@ function deriveStepOperations(
 
   let attentionLevel: WorkflowRunGraphAttentionLevel = 'none';
   if (row.status === 'failed') attentionLevel = 'failed';
-  else if (row.status === 'blocked' || WAITING_STEP_STATUSES.has(row.status) || row.approvalsRequested > row.approvalsResolved) attentionLevel = 'blocked';
+  else if (row.status === 'blocked' || WAITING_STEP_STATUSES.has(row.status)) attentionLevel = 'blocked';
   else if (attentionReasons.length > 0) attentionLevel = 'watch';
 
   const itemsTotal = Math.max(row.itemsStarted, row.itemsCompleted + row.itemsFailed);
@@ -767,7 +780,7 @@ function runtimeVerdictPrimaryAction(
     return 'Retry failed step';
   }
   if (status === 'blocked') {
-    if (step.status === 'awaiting_approval' || step.approvalsRequested > step.approvalsResolved) return 'Resolve approval';
+    if (step.status === 'awaiting_approval') return 'Resolve approval';
     if (step.status === 'awaiting_input') return 'Answer the question';
     if (step.status === 'awaiting_capability') return 'Connect the tool';
     if (step.status === 'blocked') return 'Review why it was blocked';
@@ -792,7 +805,7 @@ function runtimeVerdictPrimaryAction(
 
 function bottleneckForStep(row: MutableStepOverlay): string | null {
   if (row.status === 'failed') return 'failed step';
-  if (row.status === 'awaiting_approval' || row.approvalsRequested > row.approvalsResolved) return 'approval wait';
+  if (row.status === 'awaiting_approval') return 'approval wait';
   if (row.status === 'awaiting_input') return 'waiting for an answer';
   if (row.status === 'awaiting_capability') return 'waiting for a connection';
   if (row.status === 'blocked') return 'blocked step';

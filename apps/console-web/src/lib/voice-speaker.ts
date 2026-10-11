@@ -91,12 +91,19 @@ export class VoiceSpeaker {
       if (!piece) break;
       this.lookAhead(generation);
       const spoken = await (piece.spoken ?? this.request(piece.text, generation));
-      if (generation !== this.generation) return;
+      if (generation !== this.generation) {
+        if (spoken.kind === 'audio') void spoken.response.body?.cancel().catch(() => undefined);
+        return;
+      }
       try {
         if (spoken.kind === 'audio') {
           const body = spoken.response.body;
           if (body && typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(MP3)) await this.playStream(body, generation);
-          else await this.playUrl(URL.createObjectURL(await spoken.response.blob()), generation);
+          else {
+            const blob = await spoken.response.blob();
+            if (generation !== this.generation) return;
+            await this.playUrl(URL.createObjectURL(blob), generation);
+          }
         } else if (spoken.kind === 'system') {
           await this.sayWithSystemVoice(spoken.text, generation);
         } else if (spoken.kind === 'error') {
@@ -151,11 +158,13 @@ export class VoiceSpeaker {
     const url = URL.createObjectURL(source);
     const played = this.playUrl(url, generation);
     source.addEventListener('sourceopen', () => {
+      if (generation !== this.generation) { void body.cancel().catch(() => undefined); return; }
       const buffer = source.addSourceBuffer(MP3);
       const reader = body.getReader();
       const appendNext = async (): Promise<void> => {
         if (generation !== this.generation) { void reader.cancel().catch(() => undefined); return; }
         const { done, value } = await reader.read();
+        if (generation !== this.generation) { void reader.cancel().catch(() => undefined); return; }
         if (done) {
           if (source.readyState === 'open') source.endOfStream();
           return;
@@ -173,6 +182,7 @@ export class VoiceSpeaker {
   }
 
   private playUrl(url: string, generation: number): Promise<void> {
+    if (generation !== this.generation) { URL.revokeObjectURL(url); return Promise.resolve(); }
     this.releaseAudio();
     const audio = new Audio();
     this.audio = audio;
@@ -180,11 +190,12 @@ export class VoiceSpeaker {
     return new Promise<void>((resolve, reject) => {
       const finish = (error?: Error) => {
         audio.onended = null; audio.onerror = null;
-        if (this.settleCurrent) this.settleCurrent = null;
+        if (this.settleCurrent === currentFinish) this.settleCurrent = null;
         if (this.audio === audio) this.releaseAudio();
         if (error && generation === this.generation) reject(error); else resolve();
       };
-      this.settleCurrent = () => finish();
+      const currentFinish = () => finish();
+      this.settleCurrent = currentFinish;
       audio.onended = () => finish();
       audio.onerror = () => finish(new Error('The reply audio could not be played.'));
       audio.src = url;

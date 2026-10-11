@@ -117,6 +117,7 @@ import {
   checkpointGoalStage,
 } from './compaction.js';
 import { windowScaleForModel } from './model-window-observations.js';
+import { renderCancelledSuccessorReadContextForModel } from './cancelled-successor-retained-read.js';
 import {
   renderRecentActionsForHarnessHistory,
   renderSessionHistoryForModel,
@@ -11832,7 +11833,13 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
     try {
       const { replayMissingPublicTurns } = await import('./session-public-replay.js');
       compactedItems = replayMissingPublicTurns({ sessionId: options.sessionId, sourceUserSeq, history: compactedItems });
-      const actions = renderRecentActionsForHarnessHistory(openEventLog(), options.sessionId, 20, sourceUserSeq);
+      const inheritedReadContext = renderCancelledSuccessorReadContextForModel(options.sessionId, sourceUserSeq);
+      const inheritedAlreadyPresent = inheritedReadContext && compactedItems.some(item => {
+        const candidate = item as unknown as { role?: unknown; content?: unknown };
+        return candidate.role === 'system' && itemText(candidate.content).includes(inheritedReadContext);
+      });
+      const actions = [renderRecentActionsForHarnessHistory(openEventLog(), options.sessionId, 20, sourceUserSeq),
+        inheritedAlreadyPresent ? '' : inheritedReadContext].filter(Boolean).join('\n\n');
       if (actions) compactedItems = [{ role: 'system', content: `[SESSION ACTION EVIDENCE]\n${actions}` } as AgentInputItem, ...compactedItems];
     } catch { /* retained private history remains available on replay failure */ }
   }

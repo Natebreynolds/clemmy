@@ -98,9 +98,14 @@ export async function evaluateSystemOne(input: {
       role: 'router',
       account: JEV_ACCOUNT_ID,
       model: result.ok ? result.model : TYPESAFE_MODEL,
-      cacheDialect: 'none',
-      inputTokens: result.ok ? result.usage.input_tokens : 0,
-      outputTokens: result.ok ? result.usage.output_tokens : 0,
+      requestModel: TYPESAFE_MODEL,
+      ...(result.ok && result.providerReportedModel ? { providerReportedModel: result.providerReportedModel } : {}),
+      // Numeric placeholders keep existing rollups compatible, but a missing
+      // wire count is unknown usage even when the decision itself succeeded.
+      cacheDialect: result.ok && result.usage.input_tokens !== undefined && result.usage.output_tokens !== undefined
+        ? 'none' : 'unknown',
+      inputTokens: result.ok ? result.usage.input_tokens ?? 0 : 0,
+      outputTokens: result.ok ? result.usage.output_tokens ?? 0 : 0,
       durationMs,
       ok: result.ok,
       ...(result.ok ? {} : { failReason: result.reason }),
@@ -110,7 +115,8 @@ export async function evaluateSystemOne(input: {
     lane: input.channel ?? 'jev',
     ...(input.sessionId?.trim() ? { sessionId: input.sessionId.trim() } : {}),
     requestedModel: TYPESAFE_MODEL,
-    ...(result.ok ? { servedModel: result.model, inputTokens: result.usage.input_tokens } : {}),
+    ...(result.ok && result.providerReportedModel ? { servedModel: result.providerReportedModel } : {}),
+    ...(result.ok && result.usage.input_tokens !== undefined ? { inputTokens: result.usage.input_tokens } : {}),
     ok: result.ok,
     ...(result.ok ? { answers: compactJevAnswers(result.answers) } : { failReason: result.reason }),
     durationMs,

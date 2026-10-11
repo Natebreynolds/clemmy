@@ -12,12 +12,15 @@
  * agent runs are read-only.
  */
 import { SessionStore } from '../memory/session-store.js';
+import type Database from 'better-sqlite3';
+import { measureProjectionRead, type ProjectionReadObserver } from './projection-read-metrics.js';
 import { createWorkflowRunStatusReader, type UnifiedRunCoverage } from './workflow-run-status.js';
 export type { UnifiedRunCoverage } from './workflow-run-status.js';
 import {
   configuredSessionRetentionDays,
   getSession as getHarnessSession,
   listEvents as listHarnessEvents,
+  listEventsAtSequences as listHarnessEventsAtSequences,
   listSessions as listHarnessSessions,
   openEventLog,
   sessionHasAcceptedSourceReplayBinding,
@@ -27,10 +30,11 @@ import {
   activeRunSessionIds,
 } from '../runtime/harness/eventlog.js';
 import { withSessionProofCascade } from '../runtime/harness/retained-session-proof-schema.js';
+import { readAcceptedSourceConversationProjection } from '../runtime/harness/accepted-source-session-branch.js';
 import { isUserFacingSession, isInternalSessionId } from '../execution/scope.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { pendingActionApprovalViewFromArgs } from '../runtime/harness/pending-action-view.js';
-import { reconstructHarnessTranscript, harnessPreview, humanHarnessText } from '../runtime/harness/transcript.js';
+import { reconstructHarnessTranscript, reconstructHarnessTranscriptText, harnessPreview, humanHarnessText } from '../runtime/harness/transcript.js';
 import { sessionAgentState } from '../agents/session-agent-state.js';
 import { sessionProjectState } from '../projects/session-project-state.js';
 import { approvalPreviewProjection, publicUserInputText } from '../runtime/harness/public-presentation.js';
@@ -80,6 +84,8 @@ export interface UnifiedRunStep {
 }
 
 export interface UnifiedRunSummary extends UnifiedSessionSummary {
+  /** Physical head for new messages and controls; id remains the public root. */
+  executionSessionId?: string;
   runSteps?: UnifiedRunStep[];
   runCoverage?: UnifiedRunCoverage;
 }
@@ -207,13 +213,13 @@ function sessionRunning(sessionId: string): boolean {
  * carries that conversation's title, never its channel name. Live
  * 2026-10-07: every branched turn listed as "desktop". The root's stored
  * title wins; failing that, the root's first words. */
-function branchConversationTitle(row: HarnessSessionRow): string {
+function branchConversationTitle(row: HarnessSessionRow, allRows?: HarnessSessionRow[]): string {
   try {
     const branch = row.metadata?.__accepted_source_branch as { rootSessionId?: unknown; parentSessionId?: unknown } | undefined;
     const rootId = typeof branch?.rootSessionId === 'string' ? branch.rootSessionId
       : typeof branch?.parentSessionId === 'string' ? branch.parentSessionId : '';
     if (!rootId || rootId === row.id) return '';
-    const root = getHarnessSession(rootId);
+    const root = snapshotRow(allRows, rootId);
     if (!root) return '';
     const stored = root.title ? (humanizeReportBackTitle(root.title) ?? root.title) : '';
     if (stored) return stored;
@@ -248,13 +254,13 @@ function approvalRevisionProjection(value: unknown): { revises: NonNullable<Unif
   };
 }
 
-function summarizeHarness(row: HarnessSessionRow, titleOverride?: string): UnifiedSessionSummary {
+function summarizeHarness(row: HarnessSessionRow, titleOverride?: string, allRows?: HarnessSessionRow[]): UnifiedSessionSummary {
   return {
     id: `${HARNESS_PREFIX}${row.id}`,
     origin: harnessOrigin(row),
     store: 'harness',
     kind: row.kind,
-    title: titleOverride || row.title || row.objective || branchConversationTitle(row) || harnessLabel(row),
+    title: titleOverride || row.title || row.objective || branchConversationTitle(row, allRows) || harnessLabel(row),
     preview: '',
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -282,15 +288,15 @@ const HARNESS_SESSION_PAGE_SIZE = 500;
 /** Every harness row, unfiltered. The session table is paged through exactly
  *  once and the result is shared by everything that needs it in the same
  *  request — see listHarnessRowsForWorkflowRun for why that matters. */
-function listAllHarnessRows(options: { withoutConversationState?: boolean } = {}): HarnessSessionRow[] {
+function listAllHarnessRows(options: { withoutConversationState?: boolean; observer?: ProjectionReadObserver } = {}): HarnessSessionRow[] {
   const out: HarnessSessionRow[] = [];
   for (let offset = 0; ; offset += HARNESS_SESSION_PAGE_SIZE) {
-    const page = listHarnessSessions({
+    const page = measureProjectionRead(options.observer, 'catalog_pages', () => listHarnessSessions({
       limit: HARNESS_SESSION_PAGE_SIZE,
       offset,
       status: 'any',
       withoutConversationState: options.withoutConversationState,
-    });
+    }), (rows) => rows.length);
     out.push(...page);
     if (page.length < HARNESS_SESSION_PAGE_SIZE) break;
   }
@@ -305,8 +311,8 @@ function listAllHarnessRows(options: { withoutConversationState?: boolean } = {}
  * must never reach updateHarnessSession, which replaces metadata whole — the
  * patch and delete paths keep reading full rows.
  */
-function listAllHarnessRowsForDisplay(): HarnessSessionRow[] {
-  return listAllHarnessRows({ withoutConversationState: true });
+function listAllHarnessRowsForDisplay(observer?: ProjectionReadObserver): HarnessSessionRow[] {
+  return listAllHarnessRows({ withoutConversationState: true, observer });
 }
 
 function userFacingHarnessRows(all: HarnessSessionRow[]): HarnessSessionRow[] {
@@ -341,6 +347,7 @@ function listHarnessRowsForWorkflowRun(
   allRows?: HarnessSessionRow[],
 ): HarnessSessionRow[] {
   if (!workflowRunId) return [];
+  if (allRows) return snapshotIndex(allRows).workflowRows.get(JSON.stringify([workflowRunId, reference.userId])) ?? [];
   const source = allRows ?? listAllHarnessRows();
   return source.filter((row) => workflowRunIdFor(row) === workflowRunId
     && row.userId === reference.userId);
@@ -419,15 +426,48 @@ function summarizeWorkflowRun(representative: HarnessSessionRow, rows: HarnessSe
 /** The snapshot's row for an id, indexed once per snapshot. A list build
  *  already holds every row; re-reading one by id would parse its full
  *  metadata (up to ~10 MB of conversation state) just to read a few keys. */
-const snapshotIndexes = new WeakMap<HarnessSessionRow[], Map<string, HarnessSessionRow>>();
-function snapshotRow(allRows: HarnessSessionRow[] | undefined, rawId: string): HarnessSessionRow | null {
-  if (!allRows) return getHarnessSession(rawId);
+interface HarnessSnapshotIndex {
+  rows: Map<string, HarnessSessionRow>;
+  workflowRows: Map<string, HarnessSessionRow[]>;
+  conversations: Map<string, ReturnType<typeof readAcceptedSourceConversationProjection>>;
+  observer?: ProjectionReadObserver;
+}
+// These presentation indexes live only as long as this request's row array.
+// Detail, mutation and control paths do not pass a snapshot and read fresh.
+const snapshotIndexes = new WeakMap<HarnessSessionRow[], HarnessSnapshotIndex>();
+function snapshotIndex(allRows: HarnessSessionRow[], observer?: ProjectionReadObserver): HarnessSnapshotIndex {
   let index = snapshotIndexes.get(allRows);
   if (!index) {
-    index = new Map(allRows.map((row) => [row.id, row]));
+    index = { rows: new Map(), workflowRows: new Map(), conversations: new Map(), observer };
+    for (const row of allRows) {
+      index.rows.set(row.id, row);
+      const key = workflowRunGroupKey(row);
+      if (!key) continue;
+      const members = index.workflowRows.get(key);
+      if (members) members.push(row);
+      else index.workflowRows.set(key, [row]);
+    }
     snapshotIndexes.set(allRows, index);
   }
-  return index.get(rawId) ?? getHarnessSession(rawId);
+  return index;
+}
+function snapshotRow(allRows: HarnessSessionRow[] | undefined, rawId: string): HarnessSessionRow | null {
+  if (!allRows) return getHarnessSession(rawId);
+  return snapshotIndex(allRows).rows.get(rawId) ?? getHarnessSession(rawId);
+}
+
+function snapshotConversation(allRows: HarnessSessionRow[] | undefined, rawId: string): ReturnType<typeof readAcceptedSourceConversationProjection> {
+  if (!allRows) return readAcceptedSourceConversationProjection(rawId);
+  const index = snapshotIndex(allRows);
+  if (index.conversations.has(rawId)) return index.conversations.get(rawId)!;
+  const conversation = measureProjectionRead(index.observer, 'catalog_lineage',
+    () => readAcceptedSourceConversationProjection(rawId, { observer: index.observer }));
+  if (conversation) {
+    // The reader verified every member's principal and exact selector binding.
+    // Reuse that proof for summary/search/preview, never for source admission.
+    for (const id of conversation.sessionIds) index.conversations.set(id, conversation);
+  } else index.conversations.set(rawId, null);
+  return conversation;
 }
 
 function fillWorkflowRunStatus(
@@ -445,7 +485,25 @@ function fillWorkflowRunStatus(
 
 function relatedHarnessRowsForPatch(row: HarnessSessionRow): HarnessSessionRow[] {
   const workflowRunId = workflowRunIdFor(row);
-  return workflowRunId ? listHarnessRowsForWorkflowRun(workflowRunId, row) : [row];
+  if (workflowRunId) return listHarnessRowsForWorkflowRun(workflowRunId, row);
+  const conversation = readAcceptedSourceConversationProjection(row.id);
+  return conversation
+    ? conversation.sessionIds.map((id) => getHarnessSession(id)).filter((item): item is HarnessSessionRow => item !== null)
+    : [row];
+}
+
+function summarizeHarnessConversation(row: HarnessSessionRow, allRows?: HarnessSessionRow[]): UnifiedRunSummary {
+  const conversation = snapshotConversation(allRows, row.id);
+  if (!conversation) return summarizeHarness(row, undefined, allRows);
+  const root = snapshotRow(allRows, conversation.rootSessionId);
+  const head = snapshotRow(allRows, conversation.headSessionId);
+  if (!root || !head) return summarizeHarness(row, undefined, allRows);
+  const summary = summarizeHarness(root, undefined, allRows);
+  const execution = summarizeHarness(head, undefined, allRows);
+  return { ...summary, status: execution.status, updatedAt: execution.updatedAt,
+    running: execution.running, agentId: execution.agentId, agentName: execution.agentName,
+    agentIds: execution.agentIds, projectId: execution.projectId, projectName: execution.projectName,
+    ...(head.id !== root.id ? { executionSessionId: head.id } : {}) };
 }
 
 interface HarnessSummaryCollection {
@@ -456,13 +514,17 @@ interface HarnessSummaryCollection {
   rawIds: Set<string>;
 }
 
-function collectHarnessSummaries(): HarnessSummaryCollection {
-  const allRows = listAllHarnessRowsForDisplay();
+function collectHarnessSummaries(observer?: ProjectionReadObserver): HarnessSummaryCollection {
+  const allRows = listAllHarnessRowsForDisplay(observer);
+  // The observer follows this request's existing snapshot, never a global
+  // cache or any continuation/control reader.
+  if (observer) snapshotIndex(allRows, observer);
   const rows = userFacingHarnessRows(allRows);
   const out: UnifiedRunSummary[] = [];
   const rawIds = new Set(rows.map((row) => row.id));
   const workflowRows = new Map<string, HarnessSessionRow[]>();
   const seenWorkflowRuns = new Set<string>();
+  const seenConversations = new Set<string>();
 
   for (const row of rows) {
     const runId = workflowRunGroupKey(row);
@@ -482,7 +544,12 @@ function collectHarnessSummaries(): HarnessSummaryCollection {
       out.push(summarizeWorkflowRun(row, workflowRows.get(runId) ?? [row]));
       continue;
     }
-    out.push(summarizeHarness(row));
+    if (seenConversations.has(row.id)) continue;
+    const conversation = snapshotConversation(allRows, row.id);
+    if (conversation) {
+      for (const id of conversation.sessionIds) seenConversations.add(id);
+      out.push(summarizeHarnessConversation(row, allRows));
+    } else out.push(summarizeHarness(row, undefined, allRows));
   }
   return { summaries: out, rawIds, allRows };
 }
@@ -492,10 +559,46 @@ function desktopSearchText(record: SessionRecord): string {
   return `${record.title ?? ''} ${tail}`.toLowerCase();
 }
 
-function harnessSearchText(summary: UnifiedSessionSummary, allRows: HarnessSessionRow[]): string {
+/** Search keeps the exact oldest public-event window. Select its keys using
+ * sequence-only, per-type prefixes, then redeem only those exact payload rows.
+ * The covering index and primary-key seeks avoid a second sparse session scan.
+ * Nothing outside the original window is decoded.
+ * The prefix statement lives only for this request; detail and control read normally. */
+function createCatalogSearchEventReader(): typeof listHarnessEvents {
+  let prefixes: Database.Statement<[string, string, number]> | undefined;
+  return (sessionId, options = {}) => {
+    const limit = options.limit;
+    if (!options.types || options.types.length < 2 || typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1 || limit > 40
+      || options.desc || options.sinceSeq !== undefined || options.throughSeq !== undefined || options.sinceAt !== undefined) {
+      return listHarnessEvents(sessionId, options);
+    }
+    const db = openEventLog();
+    // Sequence discovery and payload reading share one read snapshot, even if
+    // another connection appends, deletes or repairs rows between the queries.
+    return db.transaction(() => {
+      let sequences: number[];
+      try {
+        prefixes ??= db.prepare(`SELECT seq FROM events INDEXED BY idx_events_session_type
+          WHERE session_id = ? AND type = ? ORDER BY seq ASC LIMIT ?`);
+        sequences = [...new Set(options.types!.flatMap((type) =>
+          (prefixes!.all(sessionId, type, limit) as Array<{ seq: number }>).map((row) => row.seq)))];
+      } catch {
+        // If this optional index/read is unavailable, retain the original reader
+        // and its result/error behavior rather than admitting an empty history.
+        return listHarnessEvents(sessionId, options);
+      }
+      if (sequences.some((seq) => !Number.isSafeInteger(seq) || seq <= 0)) return listHarnessEvents(sessionId, options);
+      if (sequences.length === 0) return [];
+      sequences.sort((left, right) => left - right);
+      return listHarnessEventsAtSequences(sessionId, sequences.slice(0, limit));
+    })();
+  };
+}
+
+function harnessSearchText(summary: UnifiedSessionSummary, allRows: HarnessSessionRow[], readEvents: typeof listHarnessEvents): string {
   const rawId = summary.id.slice(HARNESS_PREFIX.length);
   const row = snapshotRow(allRows, rawId);
-  const tail = (row ? reconstructHarnessDetailTurns(row, 40, allRows) : reconstructHarnessTranscript(rawId, 40))
+  const tail = (row ? reconstructHarnessDetailTurns(row, 40, allRows, true, readEvents) : reconstructHarnessTranscriptText(rawId, 40, readEvents))
     .slice(-20)
     .map((t) => t.text)
     .join(' ');
@@ -517,9 +620,9 @@ function workflowEventTurn(event: HarnessEventRow): (UnifiedSessionTurn & { seq:
   return null;
 }
 
-function reconstructWorkflowRunTranscript(workflowRunId: string, reference: HarnessSessionRow, perSessionLimit = 1000, allRows?: HarnessSessionRow[]): UnifiedSessionTurn[] {
+function reconstructWorkflowRunTranscript(workflowRunId: string, reference: HarnessSessionRow, perSessionLimit = 1000, allRows?: HarnessSessionRow[], readEvents: typeof listHarnessEvents = listHarnessEvents): UnifiedSessionTurn[] {
   const turns = listHarnessRowsForWorkflowRun(workflowRunId, reference, allRows)
-    .flatMap((row) => listHarnessEvents(row.id, {
+    .flatMap((row) => readEvents(row.id, {
       types: ['user_input_received', 'conversation_completed'],
       limit: perSessionLimit,
     }))
@@ -529,11 +632,16 @@ function reconstructWorkflowRunTranscript(workflowRunId: string, reference: Harn
   return turns.map(({ seq: _seq, ...turn }) => turn);
 }
 
-function reconstructHarnessDetailTurns(row: HarnessSessionRow, perSessionLimit = 1000, allRows?: HarnessSessionRow[]): UnifiedSessionTurn[] {
+function reconstructHarnessDetailTurns(row: HarnessSessionRow, perSessionLimit = 1000, allRows?: HarnessSessionRow[], textOnly = false, readEvents: typeof listHarnessEvents = listHarnessEvents): UnifiedSessionTurn[] {
   const workflowRunId = workflowRunIdFor(row);
-  return workflowRunId
-    ? reconstructWorkflowRunTranscript(workflowRunId, row, perSessionLimit, allRows)
-    : reconstructHarnessTranscript(row.id, perSessionLimit);
+  if (workflowRunId) return reconstructWorkflowRunTranscript(workflowRunId, row, perSessionLimit, allRows, readEvents);
+  const conversation = snapshotConversation(allRows, row.id);
+  const readTranscript = textOnly
+    ? (id: string, limit: number) => reconstructHarnessTranscriptText(id, limit, readEvents)
+    : reconstructHarnessTranscript;
+  return conversation
+    ? conversation.sessionIds.flatMap((id) => readTranscript(id, perSessionLimit))
+    : readTranscript(row.id, perSessionLimit);
 }
 
 function fillHarnessPreviewAndCount(summary: UnifiedSessionSummary, allRows?: HarnessSessionRow[]): void {
@@ -543,7 +651,7 @@ function fillHarnessPreviewAndCount(summary: UnifiedSessionSummary, allRows?: Ha
     summary.preview = clip(harnessPreview(rawId), 140);
     return;
   }
-  const turns = reconstructHarnessDetailTurns(row, 1000, allRows);
+  const turns = reconstructHarnessDetailTurns(row, 1000, allRows, true);
   summary.turnCount = turns.length;
   summary.preview = clip(turns[turns.length - 1]?.text ?? '', 140);
 }
@@ -557,17 +665,18 @@ function detailForHarnessRow(row: HarnessSessionRow): SessionDetail {
   const runId = workflowRunIdFor(row);
   const summary: UnifiedRunSummary = runId
     ? summarizeWorkflowRun(row, listHarnessRowsForWorkflowRun(runId, row))
-    : summarizeHarness(row);
+    : summarizeHarnessConversation(row);
   fillWorkflowRunStatus(summary, createWorkflowRunStatusReader());
   const turns = reconstructHarnessDetailTurns(row);
-  appendPendingApprovalTurns(row.id, turns);
+  const executionSessionId = summary.executionSessionId ?? row.id;
+  appendPendingApprovalTurns(executionSessionId, turns);
   // Only a continuable chat can own an inline plan decision. Workflow,
   // execution, and agent transcripts are intentionally read-only; attaching
   // an Approve card there would paint a gate whose handlers are no-ops.
-  if (row.kind === 'chat') appendPendingPlanProposalTurns(row.id, turns);
+  if (row.kind === 'chat') appendPendingPlanProposalTurns(executionSessionId, turns);
   summary.turnCount = turns.length;
   summary.preview = clip(turns[turns.length - 1]?.text ?? '', 140);
-  return { session: summary, turns, continueHint: continueHintFor(summary, row.id) };
+  return { session: summary, turns, continueHint: continueHintFor(summary, executionSessionId) };
 }
 
 function reopenedPlanText(proposal: PlanProposal): string {
@@ -694,7 +803,12 @@ export function listSessionsForAgent(agentId: string, limit = 20): UnifiedRunSum
   return buildUnifiedSessionList({ agent: agentId, limit });
 }
 
-export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedRunSummary[] {
+export function buildUnifiedSessionList(query: SessionListQuery = {}, diagnostics: { observer?: ProjectionReadObserver } = {}): UnifiedRunSummary[] {
+  return measureProjectionRead(diagnostics.observer, 'catalog_build', () => buildUnifiedSessionListObserved(query, diagnostics.observer),
+    (rows) => rows.length);
+}
+
+function buildUnifiedSessionListObserved(query: SessionListQuery, observer?: ProjectionReadObserver): UnifiedRunSummary[] {
   const store = new SessionStore();
   const q = query.q?.trim().toLowerCase() ?? '';
   const tag = query.tag?.trim() ?? '';
@@ -702,14 +816,14 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedRu
   const agent = query.agent?.trim() ?? '';
   const includeArchived = Boolean(query.includeArchived);
   const limit = Math.max(1, Math.min(500, Math.trunc(query.limit ?? 100)));
-  const harnessCollection = collectHarnessSummaries();
+  const harnessCollection = measureProjectionRead(observer, 'catalog_collect', () => collectHarnessSummaries(observer));
   const harness = harnessCollection.summaries;
   const harnessRawIds = harnessCollection.rawIds;
 
   // Desktop side — also keep the matching records for cheap search/preview.
   const desktopRecords = new Map<string, SessionRecord>();
   const desktop: UnifiedRunSummary[] = [];
-  for (const record of store.listAll()) {
+  for (const record of measureProjectionRead(observer, 'catalog_desktop', () => store.listAll(), (rows) => rows.length)) {
     if (isInternalSessionId(record.id)) continue;
     // If a raw id exists in both stores, the harness row is the canonical
     // conversation. Desktop duplicates are report-back ghosts created by older
@@ -728,37 +842,43 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedRu
   if (agent) all = all.filter((s) => s.agentId === agent || Boolean(s.agentIds?.includes(agent)));
   if (tag) all = all.filter((s) => s.tags.includes(tag));
   if (q) {
-    all = all.filter((s) => {
+    const readSearchEvents = createCatalogSearchEventReader();
+    all = measureProjectionRead(observer, 'catalog_search', () => all.filter((s) => {
       if (s.title.toLowerCase().includes(q)) return true;
       if (s.store === 'desktop') {
         const rec = desktopRecords.get(s.id.slice(DESKTOP_PREFIX.length));
         if (rec && desktopSearchText(rec).includes(q)) return true;
-      } else if (harnessSearchText(s, harnessCollection.allRows).includes(q)) {
+      } else if (harnessSearchText(s, harnessCollection.allRows, readSearchEvents).includes(q)) {
         return true;
       }
       return false;
-    });
+    }), (rows) => rows.length);
   }
 
   // Pinned first, then most-recently-updated.
-  all.sort((a, b) => {
+  measureProjectionRead(observer, 'catalog_sort', () => all.sort((a, b) => {
     if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
     return b.updatedAt.localeCompare(a.updatedAt);
-  });
+  }), (rows) => rows.length);
 
   const page = all.slice(0, limit);
-  const readRunStatus = createWorkflowRunStatusReader();
+  const readRunStatus = createWorkflowRunStatusReader(undefined, { observer });
 
   // Fill previews/turnCounts only for the returned page (bounds query cost).
   for (const summary of page) {
     if (summary.store === 'desktop') {
-      const rec = desktopRecords.get(summary.id.slice(DESKTOP_PREFIX.length));
-      const publicTurns = rec ? publicDesktopTurns(rec) : [];
-      const last = publicTurns[publicTurns.length - 1];
-      summary.preview = last ? clip(last.text, 140) : '';
+      measureProjectionRead(observer, 'catalog_preview', () => {
+        const rec = desktopRecords.get(summary.id.slice(DESKTOP_PREFIX.length));
+        const publicTurns = rec ? publicDesktopTurns(rec) : [];
+        const last = publicTurns[publicTurns.length - 1];
+        summary.preview = last ? clip(last.text, 140) : '';
+      });
     } else {
-      fillWorkflowRunStatus(summary, readRunStatus, harnessCollection.allRows);
-      fillHarnessPreviewAndCount(summary, harnessCollection.allRows);
+      if (summary.runSteps) measureProjectionRead(observer, 'catalog_status',
+        () => fillWorkflowRunStatus(summary, readRunStatus, harnessCollection.allRows));
+      else fillWorkflowRunStatus(summary, readRunStatus, harnessCollection.allRows);
+      measureProjectionRead(observer, 'catalog_preview',
+        () => fillHarnessPreviewAndCount(summary, harnessCollection.allRows));
     }
   }
   return page;
@@ -845,7 +965,7 @@ export function patchUnifiedSession(id: string, patch: SessionPatchInput): Unifi
   }
   const summary: UnifiedRunSummary = workflowRunId
     ? summarizeWorkflowRun(next, listHarnessRowsForWorkflowRun(workflowRunId, next))
-    : summarizeHarness(next);
+    : summarizeHarnessConversation(next);
   fillWorkflowRunStatus(summary, createWorkflowRunStatusReader());
   fillHarnessPreviewAndCount(summary);
   return summary;

@@ -29,7 +29,7 @@ import {
   type PhoneHeartbeat,
 } from '../lib/api';
 import { useScreenData } from '../lib/use-screen-data';
-import { haptic, inNativeShell, type ConnectionDoor } from '../lib/native-bridge';
+import { haptic, inNativeShell, nativeVoiceSetupAvailable, requestNativeVoiceSetup, type ConnectionDoor } from '../lib/native-bridge';
 import {
   getExistingSubscription,
   isStandalonePwa,
@@ -99,6 +99,7 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
   // The open page lives in the URL (?tab=settings&section=…) so the back
   // gesture, a reload and a deep link all agree on where the phone is.
   const [section, setSection] = useState<SettingsSection | null>(() => sectionFromSearch(window.location.search));
+  const [voiceSetupError, setVoiceSetupError] = useState(false);
   useEffect(() => {
     const sync = () => setSection(sectionFromSearch(window.location.search));
     window.addEventListener('popstate', sync);
@@ -213,6 +214,14 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
           note={notificationsSummary({ registered: thisDevice ? Boolean(thisDevice.pushRegistered) : undefined, heartbeats: heartbeats.data?.heartbeats })}
           onOpen={() => openSection('notifications')}
         />
+        {nativeVoiceSetupAvailable() ? (
+          <IndexRow
+            icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3" /><path d="M5 10v1a7 7 0 0 0 14 0v-1M12 18v4M8 22h8" /></svg>}
+            title="Widget voice"
+            note="Set up or reconnect Talk and Dictate on your Home Screen."
+            onOpen={() => { haptic('light'); setVoiceSetupError(!requestNativeVoiceSetup()); }}
+          />
+        ) : null}
         <IndexRow
           icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>}
           title="Home"
@@ -220,6 +229,8 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
           onOpen={() => { haptic('light'); onCustomize(); }}
         />
       </IndexGroup>
+
+      {voiceSetupError ? <p role="alert" class="settings-row-note warning">Couldn't open voice setup. Close and reopen Clem, then try again.</p> : null}
 
       <IndexGroup label="Clementine">
         <IndexRow

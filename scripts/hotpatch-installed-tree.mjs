@@ -23,8 +23,9 @@ import {
   inspectDaemonBuild,
   installBundledAssetDirectory,
   installDaemonPatch,
+  isInstalledAppRunning,
+  isUpdaterHelperRunning,
   resolveInstalledAppBundle,
-  updaterStagingPaths,
   verifyGuardedSealedPatch,
 } from './hotpatch-daemon.mjs';
 import { execFileSync } from 'node:child_process';
@@ -37,7 +38,28 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RELAUNCH = !process.argv.includes('--no-relaunch');
 const SNAPSHOT_FLAG = process.argv.indexOf('--guarded-shell-snapshot');
 const SHELL_SNAPSHOT = SNAPSHOT_FLAG >= 0 ? process.argv[SNAPSHOT_FLAG + 1] : null;
-if (SNAPSHOT_FLAG >= 0 && !SHELL_SNAPSHOT) throw new Error('--guarded-shell-snapshot needs the pre-quit snapshot file.');
+if (SNAPSHOT_FLAG >= 0 && (!SHELL_SNAPSHOT || SHELL_SNAPSHOT.startsWith('--'))) throw new Error('--guarded-shell-snapshot needs the pre-quit snapshot file.');
+if (process.argv.filter(arg => arg === '--guarded-shell-snapshot').length > 1) throw new Error('Duplicate --guarded-shell-snapshot.');
+const repeatFlags = { referenceBundle: '--signed-reference-bundle', authorizedReceipt: '--authorized-prior-receipt', authorizedReceiptSha256: '--authorized-prior-receipt-sha256', expectedPriorFingerprint: '--expected-prior-fingerprint', expectedReferenceCdHash: '--expected-reference-cdhash' };
+const ancestorFlags = { authorizedAncestorManifest: '--authorized-ancestor-manifest', authorizedAncestorManifestSha256: '--authorized-ancestor-manifest-sha256' };
+const repeatedReference = {};
+for (const [key, flag] of Object.entries({ ...repeatFlags, ...ancestorFlags })) {
+  const positions = process.argv.flatMap((arg, index) => arg === flag ? [index] : []);
+  if (positions.length > 1) throw new Error(`Duplicate ${flag}.`);
+  if (!positions.length) continue;
+  const value = process.argv[positions[0] + 1];
+  if (!value || value.startsWith('--')) throw new Error(`${flag} requires an exact value.`);
+  repeatedReference[key] = value;
+}
+if (Object.keys(repeatedReference).length && (!SHELL_SNAPSHOT || Object.keys(repeatFlags).some(key => repeatedReference[key] === undefined))) throw new Error('Repeat installation requires the shell snapshot and all five exact reference/receipt pins.');
+if (Object.keys(ancestorFlags).some(key => repeatedReference[key] !== undefined) && Object.keys(ancestorFlags).some(key => repeatedReference[key] === undefined)) throw new Error('Ancestor manifest requires both the exact path and SHA256 pin.');
+const valuedFlags = new Set(['--guarded-shell-snapshot', ...Object.values(repeatFlags), ...Object.values(ancestorFlags)]);
+for (let index = 2; index < process.argv.length; index += 1) {
+  const arg = process.argv[index];
+  if (arg === '--no-relaunch') continue;
+  if (!valuedFlags.has(arg)) throw new Error(`Unknown installer argument: ${arg}`);
+  index += 1;
+}
 
 function treeDigest(root) {
   const h = createHash('sha256');
@@ -46,19 +68,14 @@ function treeDigest(root) {
     const st = fs.lstatSync(abs);
     if (st.isDirectory()) for (const n of fs.readdirSync(abs).sort()) walk(path.join(rel, n));
     else if (st.isFile()) { h.update(rel); h.update(fs.readFileSync(abs)); }
+    else throw new Error(`Unexpected runtime entry: ${rel}`);
   };
   walk('');
   return h.digest('hex');
 }
 
 function running() {
-  try {
-    execFileSync('pgrep', ['-f', 'Clementine\\.app/Contents/'], { stdio: 'ignore' });
-    return true;
-  } catch (error) {
-    if (error.status !== 1) throw error;
-    return false;
-  }
+  return isInstalledAppRunning(APP, execFileSync);
 }
 
 /** Seconds since the newest event that is not the known restart-recovery loop. */
@@ -96,13 +113,18 @@ else if (running()) {
   console.error('REFUSED: a guarded patch runs only after the caller has quit Clementine by its bundle path.');
   process.exit(1);
 }
+const snapshot = SHELL_SNAPSHOT ? JSON.parse(fs.readFileSync(SHELL_SNAPSHOT, 'utf8')) : null;
+let guarded;
 const proveGuard = () => verifyGuardedSealedPatch({
-  app: APP,
-  shellSnapshot: JSON.parse(fs.readFileSync(SHELL_SNAPSHOT, 'utf8')),
-  updaterStagingPaths: updaterStagingPaths({ app: APP, home }),
+  app: APP, home,
+  shellSnapshot: snapshot.shellSnapshot ?? snapshot,
+  appliedUpdateEvidence: snapshot.appliedUpdateEvidence,
+  priorProof: guarded,
+  repeatedReference: Object.keys(repeatedReference).length ? repeatedReference : undefined,
   isRunning: running,
+  isUpdaterRunning: () => isUpdaterHelperRunning(execFileSync),
 });
-const guarded = SHELL_SNAPSHOT ? proveGuard() : undefined;
+guarded = SHELL_SNAPSHOT ? proveGuard() : undefined;
 
 const IDLE_REQUIRED_SECONDS = 90;
 
@@ -151,6 +173,7 @@ const trees = [
   ['mobile-web', path.join(REPO, 'apps/mobile-web/dist'), path.join(APP, 'Contents/Resources/daemon/apps/mobile-web/dist')],
 ];
 for (const [name, sourceDir, targetDir] of trees) {
+  if (guarded) proveGuard();
   const built = treeDigest(sourceDir);
   const result = installBundledAssetDirectory({ sourceDir, targetDir, guarded });
   const served = treeDigest(targetDir);
@@ -169,6 +192,22 @@ if (guarded) {
   proveGuard();
   report.guardedShell = 'unchanged';
   console.log('native parts   unchanged after the patch');
+}
+
+// A later replacement must not invalidate an earlier part's byte proof while
+// leaving the native shell unchanged. Recheck the complete runtime together
+// before the receipt or relaunch, retaining every rollback on a mismatch.
+const installedDaemon = inspectDaemonBuild(path.join(APP, 'Contents/Resources/daemon/dist'));
+report.parts.daemon.served = installedDaemon.digest;
+report.parts.daemon.match = installedDaemon.digest === daemon.digest;
+for (const [name, , targetDir] of trees) {
+  report.parts[name].served = treeDigest(targetDir);
+  report.parts[name].match = report.parts[name].served === report.parts[name].built;
+}
+if (Object.values(report.parts).some(part => !part.match)) {
+  fs.mkdirSync(path.join(REPO, 'output'), { recursive: true });
+  fs.writeFileSync(path.join(REPO, 'output/ui-hotpatch-receipt.json'), JSON.stringify(report, null, 2) + '\n');
+  throw new Error('Installed runtime changed before final byte verification. Rollbacks retained; refusing relaunch.');
 }
 
 fs.mkdirSync(path.join(REPO, 'output'), { recursive: true });

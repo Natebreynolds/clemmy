@@ -15,7 +15,7 @@ import {
 import { Button } from '@/components/ui/Button';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Skeleton } from '@/components/ui/Skeleton';
-import { Composer } from '@/components/chat/Composer';
+import { Composer, type ComposerSendInput } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { AgentPicker } from '@/components/chat/AgentPicker';
 import { ProjectPicker } from '@/components/chat/ProjectPicker';
@@ -35,7 +35,7 @@ import { unifiedChatSessionId } from '@/lib/last-session';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import { getRunAgentOutput } from '@/lib/board';
-import type { TaskMode } from '@/lib/task-mode';
+import { useConversationSendScope } from '@/lib/use-conversation-send-scope';
 import {
   getAgent, getAgentCatalog, getAgentWork, deleteAgent,
   type AgentRecord, type AgentCatalog, type AgentWorker,
@@ -267,7 +267,6 @@ function FreshThread({ agent }: { agent: AgentRecord }) {
 }
 
 type ChatHandle = ReturnType<typeof useChat>;
-type SendInput = { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode };
 
 function ThreadBody({ agent, chat, sessionId, project = null }: {
   agent: AgentRecord;
@@ -279,6 +278,7 @@ function ThreadBody({ agent, chat, sessionId, project = null }: {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
+  const captureSendScope = useConversationSendScope(`${location.key}:${agent.id}:${sessionId ?? 'new'}`, chat.sessionId);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -317,17 +317,19 @@ function ThreadBody({ agent, chat, sessionId, project = null }: {
     }
   }, [location.state, fresh, resetChat]);
 
-  const send = async (input: SendInput) => {
+  const send = async (input: ComposerSendInput) => {
+    const scope = captureSendScope();
     const [addressed, placed] = await Promise.all([
       agentChoice.prepare(chat.sessionId.current, chat.busy),
       projectChoice.prepare(chat.sessionId.current, chat.busy),
     ]);
+    scope.assertCurrent();
     await chat.send({ ...input, ...addressed, ...placed });
     qc.invalidateQueries({ queryKey: sessionKeys.lists() });
     // The server minted the session on that first send; from here the thread
     // is addressable, so the URL says which one it is.
     const minted = chat.sessionId.current;
-    if (fresh && minted) navigate(threadPath(agent.id, unifiedChatSessionId(minted)), { replace: true });
+    if (fresh && minted && scope.isCurrentRoute()) navigate(threadPath(agent.id, unifiedChatSessionId(minted)), { replace: true });
   };
 
   const resolveDecision = async (message: ChatMessage, decision: 'approve' | 'reject') => {
@@ -390,7 +392,7 @@ function ThreadBody({ agent, chat, sessionId, project = null }: {
         <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
         <Composer
           inputRef={composerRef}
-          sessionId={chat.sessionId.current ?? undefined}
+          sessionId={chat.sessionId.current ?? undefined} draftSessionId={chat.conversationSessionId.current}
           busy={chat.busy}
           mode={chat.composerMode}
           onModeChange={chat.setComposerMode}

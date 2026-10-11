@@ -32,6 +32,7 @@ const {
   getSession,
   listEvents,
   resetEventLog,
+  updateSession,
 } = await import('../runtime/harness/eventlog.js');
 const { archiveBackgroundTask, listBackgroundTasks } = await import('../execution/background-tasks.js');
 
@@ -376,11 +377,12 @@ test('explicit background commands create visible durable tasks without invoking
 
 test('command center keeps limit-exceeded harness sessions working until completion', async () => {
   resetEventLog();
+  const recoveryState = { messages: ['HOME-RECOVERY-STATE-ONLY'.repeat(16_384)] };
   const session = createSession({
     kind: 'chat',
     channel: 'desktop',
     title: 'Long research loop',
-    metadata: { source: 'desktop' },
+    metadata: { source: 'desktop', __conversation: recoveryState },
   });
   // Working Now is fed by the durable attempt and its lease, not by how fresh
   // the last event looks: a long turn under a held lease stays live however
@@ -412,6 +414,9 @@ test('command center keeps limit-exceeded harness sessions working until complet
     };
     assert.equal(activeBody.presence.status, 'working');
     assert.equal(activeBody.counts.active, 1);
+    assert.equal(JSON.stringify(activeBody).includes('HOME-RECOVERY-STATE-ONLY'), false);
+    assert.deepEqual(getSession(session.id)?.metadata.__conversation, recoveryState,
+      'Home does not write its lightweight session row back over recovery state');
     const activeActivity = await (
       await fetch(`${h.url}/api/console/activity/v2?workingNow=1`)
     ).json() as { entries?: Array<{ sessionId?: string }> };
@@ -425,12 +430,20 @@ test('command center keeps limit-exceeded harness sessions working until complet
       data: { summary: 'complete' },
     });
     finishRunAttempt(claim.attempt!, 'completed');
+    updateSession(session.id, { status: 'completed' });
     const second = await fetch(`${h.url}/api/console/home/command-center`);
     assert.equal(second.status, 200);
     const completedBody = await second.json() as {
       counts: { active: number };
+      recentCompleted: Array<{ title: string; meta: string; targetSessionId?: string }>;
     };
     assert.equal(completedBody.counts.active, 0);
+    const completedCard = completedBody.recentCompleted.find((item) => item.targetSessionId === session.id);
+    assert.ok(completedCard, 'the metadata-only Home list retains the completed session');
+    assert.equal(completedCard.title, session.title);
+    assert.match(completedCard.meta, /desktop.*done/);
+    assert.deepEqual(getSession(session.id)?.metadata.__conversation, recoveryState,
+      'completed Home reads also leave recovery state intact');
     const completedActivity = await (
       await fetch(`${h.url}/api/console/activity/v2?workingNow=1`)
     ).json() as { entries?: Array<{ sessionId?: string }> };

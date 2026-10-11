@@ -110,6 +110,72 @@ test('raw Claude usage rows are inclusive: the adapter reports fresh input, cach
   assert.equal(canonical.uncachedInputTokens, 4_229, 'uncached is the total minus what the cache served');
 });
 
+test('buffered Claude usage reads the actual model from the real AI SDK adapter response', async () => {
+  const { withTrace } = await import('@openai/agents');
+  const { aisdk } = await import('@openai/agents-extensions/ai-sdk');
+  const { createAnthropic } = await import('@ai-sdk/anthropic');
+  let calls = 0;
+  const provider = createAnthropic({ apiKey: 'fixture-only', fetch: async () => {
+    calls += 1;
+    return new Response(JSON.stringify({
+      id: 'msg_buffered_model_fixture', type: 'message', role: 'assistant', model: 'claude-sonnet-5-20261005',
+      content: [{ type: 'text', text: 'PRIVATE_BUFFERED_TEXT' }], stop_reason: 'end_turn', stop_sequence: null,
+      usage: { input_tokens: 42, output_tokens: 7 },
+    }), { headers: { 'content-type': 'application/json' } });
+  } });
+  const usage: Array<Record<string, unknown>> = [];
+  const wrapped = withRawClaudeUsageRecording(aisdk(provider('claude-sonnet-5')), 'claude-sonnet-5',
+    (entry) => usage.push(entry as unknown as Record<string, unknown>), () => {});
+  const response = await withTrace('buffered-usage-fixture', () => wrapped.getResponse({ input: 'PRIVATE_PROMPT', tools: [], handoffs: [],
+    outputType: 'text', modelSettings: {}, tracing: false } as never));
+  assert.equal(calls, 1, 'observability cannot add a provider request');
+  assert.equal((response.providerData?.response as Record<string, unknown>)?.modelId, 'claude-sonnet-5-20261005',
+    'the installed adapter exposes the model only in nested response metadata');
+  assert.equal(response.providerData?.model, undefined);
+  assert.equal(usage.length, 1);
+  assert.equal(usage[0]?.model, 'claude-sonnet-5', 'legacy grouping stays compatible');
+  assert.equal(usage[0]?.requestModel, 'claude-sonnet-5');
+  assert.equal(usage[0]?.providerReportedModel, 'claude-sonnet-5-20261005');
+  assert.equal(usage[0]?.account, undefined, 'response metadata cannot invent account authority');
+  assert.equal(usage[0]?.backendId, undefined, 'response metadata cannot invent configured backend identity');
+  assert.doesNotMatch(JSON.stringify(usage), /PRIVATE_BUFFERED_TEXT|PRIVATE_PROMPT/);
+});
+
+test('raw Claude model observations stay unqualified when explicit claims conflict or are unsafe', async () => {
+  for (const providerData of [
+    { response: { modelId: 'claude-nested-fixture' }, model: 'claude-top-fixture' },
+    { response: { modelId: 'claude-nested-fixture' }, providerReportedModel: 'claude-top-fixture' },
+    { response: { modelId: 'https://private.example/model' } },
+    { response: { modelId: 'claude-nested-fixture' }, providerReportedModelUnqualified: true },
+    {},
+  ]) {
+    const original = { output: [], usage: { inputTokens: 42, outputTokens: 7, totalTokens: 49 }, providerData };
+    const before = JSON.stringify(original);
+    const usage: Array<Record<string, unknown>> = [];
+    const wrapped = withRawClaudeUsageRecording({ getResponse: async () => original,
+      getStreamedResponse: async function* () { /* unused */ } } as never,
+    'claude-request-fixture', (entry) => usage.push(entry as unknown as Record<string, unknown>), () => {});
+    assert.equal(await wrapped.getResponse({} as never), original, 'metadata observation cannot replace a valid answer');
+    assert.equal(JSON.stringify(original), before, 'metadata observation never mutates inner response bytes');
+    assert.equal(usage.length, 1, 'unknown model does not erase known usage');
+    assert.equal(usage[0]?.requestModel, 'claude-request-fixture');
+    assert.equal(usage[0]?.providerReportedModel, undefined);
+  }
+});
+
+test('matching top-level and nested Claude model claims retain one explicit observation', async () => {
+  const usage: Array<Record<string, unknown>> = [];
+  const wrapped = withRawClaudeUsageRecording({ getResponse: async () => ({ output: [],
+    usage: { inputTokens: 42, outputTokens: 7, totalTokens: 49 }, providerData: {
+      model: 'claude-matching-fixture', providerReportedModel: 'claude-matching-fixture',
+      response: { modelId: 'claude-matching-fixture' },
+    } }), getStreamedResponse: async function* () { /* unused */ } } as never,
+  'claude-request-fixture', (entry) => usage.push(entry as unknown as Record<string, unknown>), () => {});
+  await wrapped.getResponse({} as never);
+  assert.equal(usage.length, 1);
+  assert.equal(usage[0]?.providerReportedModel, 'claude-matching-fixture');
+});
+
 for (const shape of ['empty', 'refusal', 'text', 'tool'] as const) {
   test(`raw Claude diagnostics preserve real adapter ${shape} metadata without content or another request`, async () => {
     const { aisdk } = await import('@openai/agents-extensions/ai-sdk');
@@ -267,7 +333,8 @@ test('raw Claude metadata projection preserves existing final metadata and outpu
   assert.equal(done.providerData.finishReason, 'length', 'do not erase an existing termination field');
   assert.equal(done.providerData.providerReportedModel, 'claude-provider-fixture');
   assert.equal(usage[0]?.requestModel, 'claude-request-fixture');
-  assert.equal(usage[0]?.providerReportedModel, 'claude-provider-fixture');
+  assert.equal(usage[0]?.providerReportedModel, undefined,
+    'conflicting existing and observed model metadata is preserved but cannot qualify a served-model claim');
 });
 
 test('raw Claude diagnostics persist once in the exact source trace and stay off the public event plane', async () => {

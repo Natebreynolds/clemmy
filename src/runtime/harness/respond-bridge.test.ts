@@ -5739,3 +5739,45 @@ test('held publication early bridge replay fences exact source before preparatio
   assert.equal(response.text, 'Independent source reply.'); assert.equal(calls.execute, 1);
   assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).filter(e => e.data.sourceUserSeq === source.seq).length, 1);
 });
+
+
+test('Stop transport and exact replay show plain checkpoint copy while durable receipts keep their handles', async () => {
+  const sessionId = 'stop-public-text-live-and-replay';
+  const message = 'Run the named Stop transport fixture.';
+  const durableText = 'Stopped.\n\nRetained work (durable checkpoint):\n- Source/tool fixture_read: completed result retained as rh_private_stop_transport.\nExternal write state (fixture_write): uncertain. Reconcile it before any retry.';
+  let sourceUserSeq = 0;
+  let modelLoops = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string; sourceUserSeq?: number }) => {
+      modelLoops++;
+      const source = listEvents(opts.sessionId, { types: ['user_input_received'] }).find(event => event.seq === opts.sourceUserSeq)!;
+      sourceUserSeq = source.seq;
+      const identity = { sessionId: opts.sessionId, sourceUserSeq, turn: source.turn };
+      const outcome = { version: 2 as const, id: turnOutcomeId(identity), identity,
+        status: 'cancelled' as const, resumable: false as const, presentation: { kind: 'stopped' as const, text: durableText } };
+      const presentation = presentationEventForOutcome(outcome);
+      appendEvent({ sessionId: opts.sessionId, turn: source.turn, role: 'system', type: 'conversation_completed', data: {
+        terminalKey: outcome.id, sourceUserSeq, reply: durableText, presentation,
+        turnOutcome: { version: 2, id: outcome.id, status: 'cancelled', resumable: false },
+      } });
+      return { sessionId: opts.sessionId, status: 'killed', steps: 1, lastTurn: source.turn, publicPresentation: presentation };
+    }) as never,
+  });
+  const response = await respondViaHarness('home', { sessionId, message });
+  assert.equal(response.stoppedReason, 'cancelled');
+  assert.match(response.text, /Stopped.*I kept the result/s);
+  assert.match(response.text, /can't yet confirm.*check before trying again/);
+  assert.doesNotMatch(response.text, /rh_|fixture_read|fixture_write|durable checkpoint/);
+  const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.match((terminals[0].data.presentation as { text: string }).text, /rh_private_stop_transport/);
+  _setBridgeImplsForTests({ configure: (async () => { throw new Error('Stop replay must not configure or execute'); }) as never });
+  const replay = await respondPreferHarness('home', { sessionId, sourceUserSeq, message },
+    async () => { throw new Error('Stop replay must not enter the legacy engine'); });
+  assert.equal(replay.stoppedReason, 'cancelled');
+  assert.equal(replay.text, response.text);
+  assert.equal(modelLoops, 1);
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+});

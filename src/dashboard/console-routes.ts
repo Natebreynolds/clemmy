@@ -23,6 +23,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { transcribeAudio, hasOpenAiKey } from '../runtime/transcribe.js';
 import { getBuildInfo } from '../runtime/build-info.js';
+import { catalogProjectionMetricsForRequest, sendCatalogProjectionJson } from './projection-read-metrics.js';
 import { getStorageInventory } from '../runtime/storage-inventory.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationTaskMode, connectionContinuationAudience, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { LocalWhisperRuntimeError, transcribeLocalMeetingAudio } from '../integrations/local-meetings/whisper-runtime.js';
@@ -429,6 +430,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import {
   projectHarnessEventsForPublic,
+  publicPresentationText,
   PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT,
   PUBLIC_RUN_FAILURE_TEXT,
 } from '../runtime/harness/public-presentation.js';
@@ -3522,7 +3524,7 @@ function consoleTerminalForSource(
     .find((candidate) => candidate.data.sourceUserSeq === sourceUserSeq);
   if (!event) return null;
   const presentation = presentationEventFromCompletionData(event.data);
-  return presentation ? { event, presentation } : null;
+  return presentation ? { event, presentation: { ...presentation, text: publicPresentationText(presentation) } } : null;
 }
 
 /**
@@ -14683,7 +14685,7 @@ export function registerConsoleRoutes(
       const runtimeAuth = getAuthStatus();
       const policy = getProactivityPolicySnapshot();
       const pendingWorkflowRuns = listPendingRuns();
-      const recentHarnessSessions = listHarnessSessions({ limit: 60 }).filter(isConsoleVisibleHarnessSession);
+      const recentHarnessSessions = listHarnessSessions({ limit: 60, withoutConversationState: true }).filter(isConsoleVisibleHarnessSession);
       // Chat sessions stay status='active' BETWEEN turns (see
       // project_session_status_semantics memory: that's what session
       // 'active' actually means — open + addressable, not necessarily
@@ -17487,10 +17489,11 @@ export function registerConsoleRoutes(
     // claimRunAttemptLease retires the prior row and the running work dies
     // (the old behavior: nudging Clem mid-run killed the run). Control edges
     // (cancel/new, parked-task answers) keep their existing priority above;
-    // attachments keep the normal turn path so files are never silently
-    // dropped into a note. A dead-leased attempt is NOT running — the normal
+    // attachments must wait for idle so files are never silently dropped into
+    // a note or supersede active work. A dead-leased attempt is NOT running — the normal
     // supersede path is the correct recovery there.
-    if (!priorReceipt && !proposedEarlyRoute && !intent && input && requestedSessionId && attachmentIds.length === 0 && !command) {
+    if (!priorReceipt && !proposedEarlyRoute && requestedSessionId
+      && (attachmentIds.length > 0 || (!intent && input && !command))) {
       try {
         const latestAttempt = getLatestHarnessRunAttempt(sessionId);
         const { steerReasonForRunningWork } = await import('../runtime/harness/steer-notes.js');
@@ -17506,6 +17509,10 @@ export function registerConsoleRoutes(
         } catch { steerReason = null; }
         const leaseLive = steerReason === 'lease_live';
         if (steerReason) {
+          if (attachmentIds.length > 0) {
+            res.status(409).json({ error: 'ATTACHMENTS_REQUIRE_IDLE_CHAT', code: 'ATTACHMENTS_REQUIRE_IDLE_CHAT', sessionId });
+            return;
+          }
           if (connectionContext) { res.status(409).json({ error: 'This turn is still finishing. Check the connection again shortly.' }); return; }
           if (explicitTaskMode) {
             res.status(409).json({ error: 'Finish or stop the active turn before changing its mode.', code: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' });
@@ -19361,6 +19368,9 @@ export function registerConsoleRoutes(
 
   app.get('/api/console/sessions', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const callbackStarted = performance.now();
+    const metrics = catalogProjectionMetricsForRequest({ authorized: true, peerAddress: req.socket?.remoteAddress,
+      optIn: req.headers['x-clementine-projection-timing'] });
     try {
       const q = typeof req.query.q === 'string' ? req.query.q : undefined;
       const tag = typeof req.query.tag === 'string' ? req.query.tag : undefined;
@@ -19368,10 +19378,11 @@ export function registerConsoleRoutes(
       const agent = typeof req.query.agent === 'string' ? req.query.agent : undefined;
       const includeArchived = req.query.includeArchived === '1' || req.query.includeArchived === 'true';
       const limit = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
-      const sessions = buildUnifiedSessionList({ q, tag, source, agent, includeArchived, limit });
-      res.json({ sessions, total: sessions.length });
+      const sessions = buildUnifiedSessionList({ q, tag, source, agent, includeArchived, limit }, { observer: metrics?.observe });
+      sendCatalogProjectionJson(res, { sessions, total: sessions.length }, metrics, callbackStarted);
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      res.status(500);
+      sendCatalogProjectionJson(res, { error: err instanceof Error ? err.message : String(err) }, metrics, callbackStarted, true);
     }
   });
 

@@ -25,6 +25,7 @@ import {
 import { resolveWriteEvidence } from './work-report.js';
 import {
   publicCompletionText,
+  publicPresentationText,
   publicReplyText,
   publicUserInputText,
   validTypedCompletionPresentation,
@@ -389,7 +390,7 @@ export function pullRecentTurnsForSessions(
     if (!prior || row.seq < prior.seq) {
       assistantBySource.set(key, {
         seq: row.seq,
-        text: presentation.text,
+        text: publicPresentationText(presentation),
         at: row.created_at,
       });
     }

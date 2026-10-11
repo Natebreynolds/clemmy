@@ -252,3 +252,22 @@ test('a reviewer is told the agent a reply was written as; a plain chat tells it
   assert.equal(sessionAgentReviewContext(plain.id), '');
   assert.equal(sessionAgentReviewContext(null), '');
 });
+
+test('review context preserves applicable standing and project requirements beyond the old preview cap', async () => {
+  const { createAgentRecord } = await import('../../agents/agent-record.js');
+  const { createProject } = await import('../../projects/project-record.js');
+  const { createSession } = await import('./eventlog.js');
+  const instructions = 'Reference material. '.repeat(370) + '\nRequired: preserve the contrary source and its uncertainty.';
+  const projectContext = 'Project reference. '.repeat(380) + '\nRequired: read back the actual completed artifact.';
+  assert.ok(instructions.length > 6_000 && projectContext.length > 6_000);
+  const agent = createAgentRecord({ name: 'Complete Review Context Fixture', instructions });
+  const project = createProject({ name: 'Complete Review Project Fixture', context: projectContext });
+  assert.equal(agent.ok, true);
+  assert.equal(project.ok, true);
+  if (!agent.ok || !project.ok) return;
+  const bound = createSession({ kind: 'chat', metadata: { agentId: agent.agent.id, projectId: project.project.id } });
+  const review = sessionAgentReviewContext(bound.id);
+  assert.ok(review.includes(instructions), 'review must see the saved instruction tail that could defeat completion');
+  assert.ok(review.includes(projectContext), 'project readback requirement remains in the applicable review context');
+  assert.doesNotMatch(review, /cut here for length/);
+});

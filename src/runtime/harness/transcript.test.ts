@@ -94,7 +94,26 @@ test('a reopened question or approval reads as it did live, without the retained
   const reopened = turns.find((turn) => turn.role === 'assistant' && turn.text.startsWith('Which platform'));
   assert.equal(reopened?.text, 'Which platform should I build it on?');
   const finished = turns.find((turn) => turn.role === 'assistant' && turn.text.startsWith('Built it.'));
-  assert.match(finished?.text ?? '', /Retained work/, 'a finished or failed reply still discloses it');
+  assert.equal(finished?.text, 'Built it.', 'unknown private checkpoint notes do not become chat copy');
+});
+
+test('a reopened stopped terminal shows public retained-result copy without changing durable evidence', () => {
+  const session = createSession({ kind: 'chat', title: 'reopened stopped result' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Read the named local fixture.' } });
+  const raw = 'Stopped.\n\nRetained work (durable checkpoint):\n- Source/tool fixture_read: completed result retained as rh_private_reopen.\nExternal write state: no settled external-write attempt is recorded.';
+  const terminal = typedTerminalData({ sessionId: session.id, sourceUserSeq: source.seq, text: raw });
+  const presentation = terminal.presentation as Record<string, unknown>;
+  Object.assign(presentation, { status: 'cancelled', kind: 'stopped', resumable: false });
+  terminal.turnOutcome = { version: 2, id: presentation.outcomeId, status: 'cancelled', resumable: false };
+  const event = appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'conversation_completed', data: terminal });
+
+  const turns = reconstructHarnessTranscript(session.id);
+  const reply = turns.find(turn => turn.role === 'assistant');
+  assert.equal(reply?.text, 'Stopped.\n\nI kept the result from this turn for when we continue. No changes to another app are confirmed for this turn.');
+  assert.doesNotMatch(reply?.text ?? '', /rh_private|Source\/tool|durable checkpoint/);
+  const durable = listEvents(session.id).find(row => row.seq === event.seq);
+  assert.equal((durable?.data.presentation as Record<string, unknown>)?.text, raw);
+  assert.equal(durable?.data.sourceUserSeq, source.seq);
 });
 
 test('a reopened approval reads as the question the card asked, and the owner\'s tap as their answer', () => {

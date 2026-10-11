@@ -37,7 +37,7 @@ export function sessionSupportsSteering(sessionId: string | undefined): boolean 
 export function appendSteerNote(
   sessionId: string,
   text: string,
-  options: { clientRequestId?: string | undefined } = {},
+  options: { clientRequestId?: string | undefined; voice?: boolean } = {},
 ): { seq: number } {
   // Accepted owner instructions are durable input, never a presentation slice.
   const acceptedText = text;
@@ -57,7 +57,7 @@ export function appendSteerNote(
     turn: 0,
     role: 'user',
     type: 'user_steer_note',
-    data: { text: acceptedText, ...(requestId ? { clientRequestId: requestId } : {}) },
+    data: { text: acceptedText, ...(requestId ? { clientRequestId: requestId } : {}), ...(options.voice === true ? { voice: true } : {}) },
   });
   return { seq: row.seq };
 }

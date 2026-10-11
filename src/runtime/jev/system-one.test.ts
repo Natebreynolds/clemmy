@@ -49,6 +49,7 @@ test('parseSystemOneResponse reads recorded Choice, Score, and Noul answers', ()
   assert.equal(parsed.ok, true);
   if (!parsed.ok) return;
   assert.equal(parsed.model, 'jev-1.13.0');
+  assert.equal(parsed.providerReportedModel, 'jev-1.13.0');
   assert.equal(parsed.usage.input_tokens, 318);
   assert.equal(parsed.answers.is_urgent.type, 'noul');
   if (parsed.answers.is_urgent.type === 'noul') assert.equal(parsed.answers.is_urgent.noul, 0.95);
@@ -58,6 +59,37 @@ test('parseSystemOneResponse reads recorded Choice, Score, and Noul answers', ()
     assert.equal(parsed.answers.department.confidence, 0.81);
   }
   assert.equal(parsed.answers.frustration.type, 'score');
+});
+
+test('valid System One answers retain missing and partial usage as unknown, not reported zero', () => {
+  for (const usage of [undefined, {}, { input_tokens: 12 }, { output_tokens: 3 }]) {
+    const parsed = parseSystemOneResponse({ answers: RECORDED.answers, ...(usage ? { usage } : {}) }, QUESTIONS);
+    assert.equal(parsed.ok, true, 'usage observability cannot invalidate a valid decision');
+    if (!parsed.ok) continue;
+    assert.deepEqual(parsed.answers.is_urgent, RECORDED.answers.is_urgent);
+    assert.equal(parsed.model, 'jev-1.13.0', 'legacy display identity keeps the pin fallback');
+    assert.equal(parsed.providerReportedModel, undefined, 'a request pin is not the served model');
+    assert.deepEqual(parsed.usage, usage ?? {});
+  }
+});
+
+test('System One token counts require explicit safe nonnegative integers and preserve real zero', () => {
+  const zero = parseSystemOneResponse({ ...RECORDED, usage: { input_tokens: 0, output_tokens: 0 } }, QUESTIONS);
+  assert.ok(zero.ok);
+  if (zero.ok) assert.deepEqual(zero.usage, { input_tokens: 0, output_tokens: 0 });
+  for (const invalid of [null, '12', -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    const parsed = parseSystemOneResponse({ ...RECORDED, usage: { input_tokens: invalid, output_tokens: 3 } }, QUESTIONS);
+    assert.ok(parsed.ok, 'an invalid token receipt cannot change a valid answer');
+    if (parsed.ok) assert.deepEqual(parsed.usage, { output_tokens: 3 });
+  }
+});
+
+test('System One never treats content-shaped model metadata as a reported model', () => {
+  for (const model of [undefined, '', 'https://private.example/model', 'private model prose']) {
+    const parsed = parseSystemOneResponse({ ...RECORDED, model }, QUESTIONS);
+    assert.ok(parsed.ok);
+    if (parsed.ok) assert.equal(parsed.providerReportedModel, undefined);
+  }
 });
 
 test('parseSystemOneResponse fails open on missing answers, out-of-range noul, and broken choice', () => {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -886,5 +887,414 @@ test('task timing unions validated sources once, retains ancestor execution owne
     assert.equal(partial.modelTiming?.hostStepMs, 3_000); assert.equal(partial.modelTiming?.observedHostSteps, 1);
     assert.equal(partial.modelTiming?.coverage, 'partial');
     assert.ok(partial.modelTimingIssues?.includes('unproved_task_timing_lineage'));
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+function mainCallCoverageFixture() {
+  const fixture = fixtureHome();
+  const db = new Database(fixture.dbPath);
+  const start = Date.parse('2026-08-08T09:00:00.000Z');
+  const at = (ms: number) => new Date(start + ms).toISOString();
+  const owner = { version: 1, sourceUserSeq: 1000, runAttemptId: 'main-coverage-attempt', retired: false, requestAborted: false };
+  const call = (ordinal: number, seq: number, begin: number, finish: number, stepBegin: number): FixtureEvent[] => {
+    const identity = { ...owner, requestOrdinal: ordinal, stepId: `main-step-${ordinal}` };
+    return [
+      { seq, type: 'model_resilience_observed', at: at(begin), data: { ...identity,
+        phase: 'call_started', callId: `host-main-${ordinal}`, at: start + begin } },
+      { seq: seq + 1, type: 'model_resilience_observed', at: at(finish), data: { ...identity,
+        phase: 'call_finished', callId: `host-main-${ordinal}`, at: start + finish,
+        durationMs: finish - begin, outcome: 'returned', attemptCount: 1, failedAttemptCount: 0,
+        attemptMs: finish - begin, failedAttemptMs: 0, retryWaitMs: 0 } },
+      { seq: seq + 2, type: 'model_stream_diagnostic', at: at(finish + 10), data: {
+        sourceUserSeq: 1000, attemptId: 'main-coverage-attempt', responseId: `provider-main-${ordinal}`,
+        settlement: 'completed', sawResponseDone: true } },
+      { seq: seq + 3, type: 'model_resilience_observed', at: at(finish + 20), data: { ...identity,
+        phase: 'host_step_finished', at: start + finish + 20, durationMs: finish + 20 - stepBegin, outcome: 'returned' } },
+    ];
+  };
+  seedSession(db, 'main-coverage', [
+    { seq: 1000, type: 'user_input_received', at: at(0) },
+    ...call(1, 1001, 100, 1000, 0),
+    ...call(2, 1005, 2000, 3000, 1900),
+    { seq: 1009, type: 'conversation_completed', at: at(5000), data: typedTerminal('main-coverage', 1000, 1) },
+  ]);
+  db.prepare('INSERT INTO run_attempts VALUES (?, ?, ?, ?, ?, ?)')
+    .run('main-coverage-attempt', 'main-coverage', at(0), at(5100), 'completed', 1000);
+  addTimingStore(db);
+  const dispatch = db.prepare('INSERT INTO model_request_provenance VALUES (?, ?, ?, ?, ?, ?)');
+  dispatch.run(1000, 1, 1, at(50), 'fixture-event-1000', 'main-coverage');
+  dispatch.run(1000, 2, 1, at(1950), 'fixture-event-1000', 'main-coverage');
+  db.close();
+  const usage = [1, 2].map(ordinal => ({ at: at(ordinal === 1 ? 1000 : 3000), source: 'main-coverage',
+    trace: { acceptedSource: 'main-coverage:1000', logicalTurnId: 'turn:1000', attemptId: 'main-coverage-attempt',
+      modelCallId: `host-main-${ordinal}` }, responseId: `provider-main-${ordinal}`, model: 'fixture-main', kind: 'chat',
+    cacheDialect: 'inclusive', inputTokens: ordinal * 100, cachedInputTokens: ordinal * 25,
+    outputTokens: ordinal * 10, durationMs: ordinal === 1 ? 700 : 900, providerApiDurationMs: ordinal === 1 ? 500 : 600,
+  }));
+  writeFileSync(fixture.usageFile, readFileSync(fixture.usageFile, 'utf8') + usage.map(row => JSON.stringify(row)).join('\n') + '\n');
+  return { ...fixture, at, usage };
+}
+
+function replaceMainUsage(fixture: ReturnType<typeof mainCallCoverageFixture>, rows: unknown[]): void {
+  const prior = readFileSync(fixture.usageFile, 'utf8').split('\n').filter(line => {
+    try { return JSON.parse(line).source !== 'main-coverage'; } catch { return true; }
+  });
+  writeFileSync(fixture.usageFile, prior.filter(Boolean).join('\n') + '\n' + rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+}
+
+function boundMainCallFixture() {
+  const fixture = mainCallCoverageFixture();
+  const db = new Database(fixture.dbPath);
+  const rows = db.prepare("SELECT seq FROM events WHERE session_id='main-coverage' AND seq>1000 ORDER BY seq DESC").all() as { seq: number }[];
+  for (const row of rows) db.prepare('UPDATE events SET seq=? WHERE seq=?').run(1000 + (row.seq - 1000) * 2, row.seq);
+  for (const ordinal of [1, 2]) seedSession(db, 'main-coverage', [{ seq: ordinal === 1 ? 1003 : 1011,
+    type: 'model_resilience_observed', at: fixture.at(ordinal === 1 ? 999 : 2999), data: {
+      version: 1, sourceUserSeq: 1000, runAttemptId: 'main-coverage-attempt', requestOrdinal: ordinal,
+      stepId: `main-step-${ordinal}`, callId: `host-main-${ordinal}`, phase: 'response_observed', attempt: 1,
+      retired: false, requestAborted: false,
+      providerResponseIdDigest: createHash('sha256').update(`provider-main-${ordinal}`).digest('hex'),
+    } }]);
+  db.close();
+  return fixture;
+}
+
+test('producer completed-response digests certify only their exact same-source host-call usage and preserve totals', () => {
+  const fixture = boundMainCallFixture();
+  try {
+    for (const measured of [measureAcceptedTurn(fixture.home, 'main-coverage', 1000), measureAcceptedTask(fixture.home, 'main-coverage', 1000)]) {
+      assert.equal(measured.usageAttributionCertified, true);
+      assert.deepEqual(measured.usageCertificationIssues, []);
+      assert.equal(measured.promptTokens, 300); assert.equal(measured.outputTokens, 30);
+      assert.equal(measured.sdkDurationMs, 1600); assert.equal(measured.modelTiming?.resilienceCallMs, 1900);
+    }
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('wrong digest, call, attempt, late binding or duplicate response cannot certify a producer bridge', () => {
+  for (const variant of ['digest', 'call', 'attempt', 'late', 'duplicate'] as const) {
+    const fixture = boundMainCallFixture();
+    try {
+      const db = new Database(fixture.dbPath);
+      if (variant === 'digest') db.prepare("UPDATE events SET data_json=json_set(data_json,'$.providerResponseIdDigest',?) WHERE seq=1011").run('0'.repeat(64));
+      if (variant === 'call') db.exec("UPDATE events SET data_json=json_set(data_json,'$.callId','host-other') WHERE seq=1011");
+      if (variant === 'attempt') db.exec("UPDATE events SET data_json=json_set(data_json,'$.runAttemptId','unrelated-attempt') WHERE seq=1011");
+      if (variant === 'late') db.exec('UPDATE events SET seq=1017 WHERE seq=1011');
+      if (variant === 'duplicate') db.exec('INSERT INTO events (seq,session_id,turn,role,type,data_json,created_at) SELECT 1013,session_id,turn,role,type,data_json,created_at FROM events WHERE seq=1011');
+      db.close();
+      for (const measured of [measureAcceptedTurn(fixture.home, 'main-coverage', 1000), measureAcceptedTask(fixture.home, 'main-coverage', 1000)]) {
+        assert.equal(measured.usageAttributionCertified, false, variant);
+        assert.ok(measured.usageCertificationIssues.some(issue => /main_.*(?:binding|bound_response|observation_ownership|physical_call)/.test(issue)), variant);
+        assert.equal(measured.promptTokens, 300); assert.equal(measured.outputTokens, 30);
+      }
+    } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  }
+});
+
+test('an exact producer response binding never converts cancelled or unaccounted retry usage into a certified task', () => {
+  for (const variant of ['cancelled-with-usage', 'cancelled-unknown', 'retry'] as const) {
+    const fixture = boundMainCallFixture();
+    try {
+      const db = new Database(fixture.dbPath);
+      if (variant === 'retry') db.exec("UPDATE events SET data_json=json_set(data_json,'$.attemptCount',2,'$.failedAttemptCount',1) WHERE seq=1012");
+      else db.exec("UPDATE events SET data_json=json_set(data_json,'$.outcome','cancelled','$.requestAborted',json('true')) WHERE seq=1012");
+      db.close();
+      if (variant === 'cancelled-unknown') replaceMainUsage(fixture, [fixture.usage[0]]);
+      const measured = measureAcceptedTask(fixture.home, 'main-coverage', 1000);
+      assert.equal(measured.usageAttributionCertified, false, variant);
+      assert.ok(measured.usageCertificationIssues.includes('main_failed_or_aborted_attempt_usage_unknown:1000'), variant);
+      assert.equal(measured.promptTokens, variant === 'cancelled-unknown' ? 100 : 300);
+    } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  }
+});
+
+test('exact same-tuple host and provider identities cover each main completed call without changing arithmetic or timing', () => {
+  const fixture = mainCallCoverageFixture();
+  try {
+    const beforeDb = readFileSync(fixture.dbPath), beforeUsage = readFileSync(fixture.usageFile);
+    for (const measured of [measureAcceptedTurn(fixture.home, 'main-coverage', 1000), measureAcceptedTask(fixture.home, 'main-coverage', 1000)]) {
+      assert.equal(measured.usageAttributionCertified, true);
+      assert.deepEqual(measured.usageCertificationIssues, []);
+      assert.equal(measured.exactUsageRecords, 2);
+      assert.equal(measured.promptTokens, 300); assert.equal(measured.cachedInputTokens, 75);
+      assert.equal(measured.uncachedInputTokens, 225); assert.equal(measured.outputTokens, 30);
+      assert.equal(measured.sdkDurationMs, 1600); assert.equal(measured.providerDurationMs, 1100);
+      assert.equal(measured.modelTiming?.hostStepMs, 2140); assert.equal(measured.modelTiming?.resilienceCallMs, 1900);
+      assert.equal(measured.modelTiming?.physicalAttemptCount, 2); assert.deepEqual(measured.modelTimingIssues, []);
+    }
+    assert.deepEqual(readFileSync(fixture.dbPath), beforeDb); assert.deepEqual(readFileSync(fixture.usageFile), beforeUsage);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('a completed first call cannot certify a late cancelled second call after source closeout or unrelated input', () => {
+  const fixture = mainCallCoverageFixture();
+  try {
+    replaceMainUsage(fixture, [fixture.usage[0]]);
+    const db = new Database(fixture.dbPath);
+    db.exec(`UPDATE events SET seq=1015, created_at='${fixture.at(5200)}',
+      data_json=json_set(data_json,'$.outcome','cancelled','$.requestAborted',json('true'),'$.retired',json('true'),
+        '$.failedAttemptCount',1,'$.at',${Date.parse(fixture.at(5200))},'$.durationMs',3200) WHERE seq=1006;
+      UPDATE events SET seq=1016, created_at='${fixture.at(5210)}',
+      data_json=json_set(data_json,'$.settlement','error','$.sawResponseDone',json('false')) WHERE seq=1007;
+      UPDATE events SET created_at='${fixture.at(4990)}',
+      data_json=json_set(data_json,'$.outcome','cancelled','$.at',${Date.parse(fixture.at(4990))},'$.durationMs',3090) WHERE seq=1008`);
+    seedSession(db, 'main-coverage', [
+      { seq: 1010, type: 'user_input_received', at: fixture.at(5150), turn: 2 },
+      { seq: 1012, type: 'conversation_completed', at: fixture.at(5300), turn: 2, data: typedTerminal('main-coverage', 1010, 2) },
+    ]);
+    db.close();
+    for (const measured of [measureAcceptedTurn(fixture.home, 'main-coverage', 1000), measureAcceptedTask(fixture.home, 'main-coverage', 1000)]) {
+      assert.equal(measured.usageAttributionCertified, false);
+      assert.ok(measured.usageCertificationIssues.includes('main_response_without_exact_usage:1000:1016'));
+      assert.ok(measured.usageCertificationIssues.includes('main_failed_or_aborted_attempt_usage_unknown:1000'));
+      assert.ok(measured.usageCertificationIssues.includes('main_host_call_usage_unknown:1000:1005'));
+      assert.equal(measured.exactUsageRecords, 1); assert.equal(measured.promptTokens, 100);
+      assert.equal(measured.outputTokens, 10); assert.equal(measured.providerDurationMs, 500);
+      assert.equal(measured.modelTiming?.resilienceCallMs, 900, 'late cancelled closure is coverage evidence, not added timing');
+      assert.ok(measured.modelTimingIssues?.includes('late_resilience_call_timing'));
+    }
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('provider response coverage alone cannot bridge distinct main host call identities', () => {
+  const fixture = mainCallCoverageFixture();
+  try {
+    replaceMainUsage(fixture, fixture.usage.map(row => ({ ...row, trace: { ...row.trace, modelCallId: row.responseId } })));
+    for (const measured of [measureAcceptedTurn(fixture.home, 'main-coverage', 1000), measureAcceptedTask(fixture.home, 'main-coverage', 1000)]) {
+      assert.equal(measured.usageAttributionCertified, false);
+      assert.ok(measured.usageCertificationIssues.includes('main_host_call_usage_unknown:1000:1001'));
+      assert.ok(measured.usageCertificationIssues.includes('main_host_call_usage_unknown:1000:1005'));
+      assert.ok(!measured.usageCertificationIssues.some(issue => issue.startsWith('main_response_without_exact_usage')));
+      assert.equal(measured.promptTokens, 300); assert.equal(measured.providerDurationMs, 1100);
+    }
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('separate same-attempt host and provider rows cannot invent a bridge, and one provider response cannot cover two host calls', () => {
+  for (const variant of ['separate-rows', 'reused-provider'] as const) {
+    const fixture = mainCallCoverageFixture();
+    try {
+      if (variant === 'separate-rows') replaceMainUsage(fixture, fixture.usage.flatMap(row => [
+        { ...row, responseId: undefined }, { ...row, trace: { ...row.trace, modelCallId: row.responseId } },
+      ]));
+      else {
+        replaceMainUsage(fixture, [fixture.usage[0], { ...fixture.usage[1], responseId: fixture.usage[0].responseId }]);
+        const db = new Database(fixture.dbPath);
+        db.exec("UPDATE events SET data_json=json_set(data_json,'$.responseId','provider-main-1') WHERE seq=1007"); db.close();
+      }
+      for (const measured of [measureAcceptedTurn(fixture.home, 'main-coverage', 1000), measureAcceptedTask(fixture.home, 'main-coverage', 1000)]) {
+        assert.equal(measured.usageAttributionCertified, false, variant);
+        assert.ok(measured.usageCertificationIssues.some(issue => issue.startsWith(variant === 'separate-rows'
+          ? 'main_response_host_bridge_unknown' : 'conflicting_main_response_bridge')), variant);
+        assert.equal(measured.promptTokens, variant === 'separate-rows' ? 600 : 300, 'known rows remain charged without deduplication');
+      }
+    } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  }
+});
+
+test('same-model time-overlapping or same-response foreign-source usage cannot fill a main response gap', () => {
+  for (const variant of ['unrelated-source', 'wrong-attempt', 'wrong-turn', 'wrong-response'] as const) {
+    const fixture = mainCallCoverageFixture();
+    try {
+      const second = fixture.usage[1];
+      const trace = { ...second.trace,
+        ...(variant === 'unrelated-source' ? { acceptedSource: 'main-coverage:1010', logicalTurnId: 'turn:1010', attemptId: 'foreign-main-attempt' } : {}),
+        ...(variant === 'wrong-attempt' ? { attemptId: 'foreign-main-attempt' } : {}),
+        ...(variant === 'wrong-turn' ? { logicalTurnId: 'turn:1010' } : {}),
+        ...(variant === 'wrong-response' ? { modelCallId: 'host-unrelated' } : {}),
+      };
+      replaceMainUsage(fixture, [fixture.usage[0], { ...second, trace,
+        ...(variant === 'wrong-response' ? { responseId: 'provider-unrelated' } : {}) }]);
+      for (const measured of [measureAcceptedTurn(fixture.home, 'main-coverage', 1000), measureAcceptedTask(fixture.home, 'main-coverage', 1000)]) {
+        assert.equal(measured.usageAttributionCertified, false, variant);
+        assert.ok(measured.usageCertificationIssues.includes('main_response_without_exact_usage:1000:1007'), variant);
+        assert.ok(measured.usageCertificationIssues.includes('main_host_call_usage_unknown:1000:1005'), variant);
+      }
+    } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  }
+});
+
+test('failed or aborted main calls and zero usage placeholders remain unknown despite earlier completed coverage', () => {
+  for (const variant of ['failed-retry', 'aborted', 'zero-placeholder', 'missing-close', 'unknown-attempt-count'] as const) {
+    const fixture = mainCallCoverageFixture();
+    try {
+      const db = new Database(fixture.dbPath);
+      if (variant === 'failed-retry') db.exec("UPDATE events SET data_json=json_set(data_json,'$.failedAttemptCount',1,'$.attemptCount',2) WHERE seq=1006");
+      if (variant === 'aborted') db.exec("UPDATE events SET data_json=json_set(data_json,'$.requestAborted',json('true')) WHERE seq=1006");
+      if (variant === 'missing-close') db.exec('DELETE FROM events WHERE seq=1006');
+      if (variant === 'unknown-attempt-count') db.exec("UPDATE events SET data_json=json_remove(data_json,'$.attemptCount') WHERE seq=1006");
+      db.close();
+      if (variant === 'zero-placeholder') replaceMainUsage(fixture, [fixture.usage[0], {
+        ...fixture.usage[1], ok: false, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
+      }]);
+      for (const measured of [measureAcceptedTurn(fixture.home, 'main-coverage', 1000), measureAcceptedTask(fixture.home, 'main-coverage', 1000)]) {
+        assert.equal(measured.usageAttributionCertified, false, variant);
+        assert.ok(measured.usageCertificationIssues.some(issue => issue.startsWith(variant === 'missing-close'
+          ? 'main_unsettled_physical_call_usage_unknown' : variant === 'zero-placeholder'
+            ? 'main_response_without_exact_usage' : variant === 'unknown-attempt-count'
+              ? 'main_physical_attempt_membership_unknown' : 'main_failed_or_aborted_attempt_usage_unknown')), variant);
+      }
+    } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  }
+});
+
+test('main provider observations require owned host membership and cannot reuse one host ID across steps', () => {
+  const fixture = mainCallCoverageFixture();
+  try {
+    const db = new Database(fixture.dbPath);
+    db.exec("UPDATE events SET data_json=json_set(data_json,'$.callId','host-main-1') WHERE seq IN (1005,1006)"); db.close();
+    const conflict = measureAcceptedTask(fixture.home, 'main-coverage', 1000);
+    assert.equal(conflict.usageAttributionCertified, false);
+    assert.ok(conflict.usageCertificationIssues.some(issue => issue.startsWith('conflicting_main_host_call_identity')));
+    const remove = new Database(fixture.dbPath);
+    remove.exec("DELETE FROM events WHERE session_id='main-coverage' AND type='model_resilience_observed'"); remove.close();
+    const providerOnly = measureAcceptedTurn(fixture.home, 'main-coverage', 1000);
+    assert.equal(providerOnly.usageAttributionCertified, false);
+    assert.ok(providerOnly.usageCertificationIssues.includes('main_host_call_membership_unknown:1000'));
+    assert.equal(providerOnly.promptTokens, 300);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('fresh main producer coverage remains separate from all-leg inventory and unmeasured billing', () => {
+  const fixture = boundMainCallFixture();
+  try {
+    for (const measured of [measureAcceptedTurn(fixture.home, 'main-coverage', 1000), measureAcceptedTask(fixture.home, 'main-coverage', 1000)]) {
+      const completeness = measured.usageCompleteness;
+      assert.equal(measured.usageAttributionCertified, true, 'legacy attribution meaning is preserved');
+      assert.deepEqual(completeness.mainProducerCoverage, {
+        status: 'observed_completed_calls', observedCalls: 2, responseBoundCalls: 2, issues: [],
+      });
+      assert.equal(completeness.allLegUsageCertified, false);
+      assert.equal(completeness.totals, 'recorded_lower_bound');
+      assert.deepEqual(completeness.auxiliaryPhysicalInventory, { status: 'unproved', recordedRowsOutsideMainCalls: 0 },
+        'no auxiliary row observed is not proof that no auxiliary call occurred');
+      assert.deepEqual(completeness.cost, { providerPricedCost: 'not_measured', actualBilling: 'not_measured' });
+      assert.equal(completeness.identityGaps.billedAccountRows, 2);
+      assert.equal(completeness.identityGaps.backendRows, 2);
+      assert.ok(completeness.issues.includes('all_leg_physical_inventory_unproved'));
+      assert.equal(measured.promptTokens, 300); assert.equal(measured.sdkDurationMs, 1600);
+    }
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('legacy exact main usage cannot supply a missing fresh response-observed producer phase', () => {
+  const fixture = mainCallCoverageFixture();
+  try {
+    const measured = measureAcceptedTask(fixture.home, 'main-coverage', 1000);
+    assert.equal(measured.usageAttributionCertified, true);
+    assert.equal(measured.usageCompleteness.mainProducerCoverage.status, 'incomplete');
+    assert.equal(measured.usageCompleteness.mainProducerCoverage.responseBoundCalls, 0);
+    assert.ok(measured.usageCompleteness.mainProducerCoverage.issues.some(issue => issue.startsWith('main_fresh_producer_coverage_unproved')));
+    assert.equal(measured.promptTokens, 300);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('an exactly attributed failed auxiliary rank retains unknown usage instead of certifying its zero placeholder', () => {
+  const fixture = boundMainCallFixture();
+  try {
+    const failedRank = { ...fixture.usage[0], role: 'router', channel: 'rank', ok: false,
+      responseId: undefined, trace: { ...fixture.usage[0].trace, modelCallId: undefined },
+      inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0, durationMs: 2467 };
+    replaceMainUsage(fixture, [...fixture.usage, failedRank]);
+    for (const measured of [measureAcceptedTurn(fixture.home, 'main-coverage', 1000), measureAcceptedTask(fixture.home, 'main-coverage', 1000)]) {
+      assert.equal(measured.usageAttributionCertified, true);
+      assert.equal(measured.uncertifiedUsageCalls, 1);
+      assert.equal(measured.usageCompleteness.mainProducerCoverage.status, 'observed_completed_calls');
+      assert.deepEqual(measured.usageCompleteness.recordedTokenRows, { certified: 2, unknown: 1, invalid: 0, failed: 1 });
+      assert.equal(measured.usageCompleteness.knownZeroCompletedMainCalls, 0);
+      assert.equal(measured.usageCompleteness.auxiliaryPhysicalInventory.recordedRowsOutsideMainCalls, 1);
+      assert.ok(measured.usageCompleteness.issues.includes('recorded_token_usage_unknown:1'));
+      assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+      assert.equal(measured.promptTokens, 300); assert.equal(measured.outputTokens, 30);
+      assert.equal(measured.sdkDurationMs, 4067);
+    }
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('known zero requires a valid completed-call receipt rather than missing usage or a failed zero', async t => {
+  for (const variant of ['completed', 'failed-zero', 'missing', 'missing-producer', 'cache-created'] as const) {
+    await t.test(variant, () => {
+      const fixture = boundMainCallFixture();
+      try {
+        const zeros = fixture.usage.map(row => ({ ...row, ok: true, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 }));
+        if (variant === 'failed-zero') zeros[0].ok = false;
+        if (variant === 'cache-created') Object.assign(zeros[0], { cacheCreationInputTokens: 1 });
+        replaceMainUsage(fixture, variant === 'missing' ? [] : zeros);
+        if (variant === 'missing-producer') {
+          const db = new Database(fixture.dbPath);
+          db.exec("DELETE FROM events WHERE session_id='main-coverage' AND json_extract(data_json,'$.phase')='response_observed'"); db.close();
+        }
+        const measured = measureAcceptedTask(fixture.home, 'main-coverage', 1000);
+        assert.equal(measured.usageCompleteness.knownZeroCompletedMainCalls,
+          variant === 'completed' ? 2 : variant === 'failed-zero' || variant === 'cache-created' ? 1 : 0);
+        assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+        assert.equal(measured.usageCompleteness.recordedTokenRows.unknown, variant === 'failed-zero' ? 1 : 0);
+        if (variant === 'missing') assert.equal(measured.usageCompleteness.mainProducerCoverage.status, 'incomplete');
+      } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+    });
+  }
+  const fixture = fixtureHome();
+  try {
+    const replay = measureAcceptedTurn(fixture.home, 'multi', 210);
+    assert.equal(replay.usageAttributionCertified, true);
+    assert.equal(replay.usageCompleteness.knownZeroCompletedMainCalls, 0);
+    assert.equal(replay.usageCompleteness.mainProducerCoverage.status, 'not_observed');
+    assert.equal(replay.usageCompleteness.allLegUsageCertified, false);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('exact reviewer and late memory rows are visible without inventing their physical inventory or billing proof', () => {
+  const fixture = boundMainCallFixture();
+  try {
+    const auxiliary = ['reviewer', 'memory'].map((role, index) => ({ ...fixture.usage[0], role, channel: `${role}:fixture`,
+      at: fixture.at(index ? 12_000 : 4000), model: 'fixture-auxiliary', requestModel: 'fixture-auxiliary',
+      trace: { ...fixture.usage[0].trace, modelCallId: `auxiliary-${index}` }, responseId: `auxiliary-response-${index}`,
+      providerReportedModel: 'fixture-reported', account: 'fixture-account', backendId: 'fixture-backend' }));
+    replaceMainUsage(fixture, [...fixture.usage, ...auxiliary]);
+    const measured = measureAcceptedTask(fixture.home, 'main-coverage', 1000);
+    assert.equal(measured.usageAttributionCertified, true);
+    assert.equal(measured.usageRecords, 4, 'late exact memory is retained once');
+    assert.equal(measured.promptTokens, 500);
+    assert.equal(measured.usageCompleteness.mainProducerCoverage.responseBoundCalls, 2);
+    assert.equal(measured.usageCompleteness.auxiliaryPhysicalInventory.recordedRowsOutsideMainCalls, 2);
+    assert.equal(measured.usageCompleteness.auxiliaryPhysicalInventory.status, 'unproved');
+    assert.equal(measured.usageCompleteness.identityGaps.billedAccountRows, 2,
+      'present auxiliary labels do not fill missing main accounts or prove actual billing');
+    assert.equal(measured.usageCompleteness.cost.actualBilling, 'not_measured');
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('fresh producer completeness rejects late, mismatched, aborted and reused host bindings', async t => {
+  for (const variant of ['digest', 'late', 'aborted', 'reused-call'] as const) {
+    await t.test(variant, () => {
+      const fixture = boundMainCallFixture();
+      try {
+        const db = new Database(fixture.dbPath);
+        if (variant === 'digest') db.prepare("UPDATE events SET data_json=json_set(data_json,'$.providerResponseIdDigest',?) WHERE seq=1011").run('0'.repeat(64));
+        if (variant === 'late') db.exec('UPDATE events SET seq=1021 WHERE seq=1011');
+        if (variant === 'aborted') db.exec("UPDATE events SET data_json=json_set(data_json,'$.requestAborted',json('true')) WHERE seq=1012");
+        if (variant === 'reused-call') db.exec("UPDATE events SET data_json=json_set(data_json,'$.callId','host-main-1') WHERE seq IN (1010,1011,1012)");
+        db.close();
+        const measured = measureAcceptedTask(fixture.home, 'main-coverage', 1000);
+        assert.equal(measured.usageCompleteness.mainProducerCoverage.status, 'incomplete');
+        assert.equal(measured.usageCompleteness.knownZeroCompletedMainCalls, 0);
+        assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+        assert.equal(measured.promptTokens, 300); assert.equal(measured.sdkDurationMs, 1600);
+      } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test('formatted exact attribution never labels incomplete all-leg usage or billing as a certified baseline', () => {
+  const fixture = boundMainCallFixture();
+  try {
+    const task = measureAcceptedTask(fixture.home, 'main-coverage', 1000);
+    const turn = measureAcceptedTurn(fixture.home, 'main-coverage', 1000);
+    for (const text of [formatAcceptedTaskComparison({ home: fixture.home, baseline: task, candidate: task }),
+      formatAcceptedTurnComparison({ home: fixture.home, baseline: turn, candidate: turn })]) {
+      assert.match(text, /attribution:.*certified/);
+      assert.match(text, /All-leg usage: UNQUALIFIED lower bound; auxiliary physical-call inventory is unproved/);
+      assert.match(text, /Provider-priced cost and actual billing are not measured/);
+      assert.match(text, /all_leg_physical_inventory_unproved/);
+    }
   } finally { rmSync(fixture.home, { recursive: true, force: true }); }
 });

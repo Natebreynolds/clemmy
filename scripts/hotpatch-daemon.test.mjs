@@ -4,8 +4,13 @@ import * as fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
+import { deflateRawSync } from 'node:zlib';
 import {
   SEALED_SHELL_PARTS,
+  captureAppliedUpdateEvidence,
+  isInstalledAppRunning,
+  isUpdaterHelperRunning,
   assertMutableInstallTarget,
   installBundledAssetDirectory,
   installDaemonPatch,
@@ -15,7 +20,7 @@ import {
 } from './hotpatch-daemon.mjs';
 
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'daemon-patch-'));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'daemon-patch-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const sourceDist = path.join(root, 'build');
   const targetDist = path.join(root, 'installed/dist');
@@ -250,7 +255,7 @@ function guardedFixture(t) {
     rel, createHash('sha256').update(fs.readFileSync(path.join(app, rel))).digest('hex'),
   ]));
   const prove = (overrides = {}) => verifyGuardedSealedPatch({
-    app, shellSnapshot: snapshot, updaterStagingPaths: updaterStagingPaths({ app, home }), isRunning: () => false, ...overrides,
+    app, home, shellSnapshot: snapshot, isRunning: () => false, isUpdaterRunning: () => false, ...overrides,
   });
   return { ...f, app, home, snapshot, prove, daemonDist: path.join(app, 'Contents/Resources/daemon/dist') };
 }
@@ -346,12 +351,592 @@ test('tree CLI with a guarded snapshot refuses a changed shell before staging or
     console: { log() {}, error() {} },
     execFileSync(command) {
       commands.push(command);
-      if (command === 'pgrep') throw Object.assign(new Error('no match'), { status: 1 });
+      if (command === '/bin/ps') return '';
       throw new Error(`unexpected subprocess: ${command}`);
     },
   });
   await assert.rejects(result, /changed since the pre-quit snapshot/);
-  assert.deepEqual([...new Set(commands)], ['pgrep'], 'only the process check runs; no quit, no relaunch');
+  assert.deepEqual([...new Set(commands)], ['/bin/ps'], 'only process checks run; no quit, no relaunch');
   assert.deepEqual(fs.readdirSync(path.join(g.app, 'Contents/Resources/daemon')).sort(), ['dist', 'package.json']);
   assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'old daemon');
+});
+
+// Stored synthetic ZIP entries exercise the real parser without an installer,
+// an installed app, ZIP subprocesses, credentials, or the owner's home.
+function nativeZip(g, entries = SEALED_SHELL_PARTS, compressed = false) {
+  const local = []; const central = []; let offset = 0;
+  for (const rel of entries) {
+    const name = Buffer.from(`Fixture.app/${rel}`);
+    const bytes = fs.readFileSync(path.join(g.app, rel));
+    const stored = compressed ? deflateRawSync(bytes) : bytes;
+    const header = Buffer.alloc(30);
+    header.writeUInt32LE(0x04034b50); header.writeUInt16LE(20, 4);
+    header.writeUInt16LE(compressed ? 8 : 0, 8); header.writeUInt32LE(stored.length, 18); header.writeUInt32LE(bytes.length, 22); header.writeUInt16LE(name.length, 26);
+    local.push(header, name, stored);
+    const directory = Buffer.alloc(46);
+    directory.writeUInt32LE(0x02014b50); directory.writeUInt16LE((3 << 8) | 20, 4); directory.writeUInt16LE(20, 6);
+    directory.writeUInt16LE(compressed ? 8 : 0, 10); directory.writeUInt32LE(stored.length, 20); directory.writeUInt32LE(bytes.length, 24); directory.writeUInt16LE(name.length, 28);
+    directory.writeUInt32LE((0o100644 << 16) >>> 0, 38); directory.writeUInt32LE(offset, 42);
+    central.push(directory, name); offset += header.length + name.length + stored.length;
+  }
+  const directory = Buffer.concat(central); const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50); end.writeUInt16LE(entries.length, 8); end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...local, directory, end]);
+}
+
+function appliedUpdateFixture(t) {
+  const g = guardedFixture(t);
+  fs.writeFileSync(path.join(g.app, 'Contents/Info.plist'), '<dict><key>CFBundleIdentifier</key><string>com.example.fixture</string><key>CFBundleShortVersionString</key><string>3.18.35</string></dict>');
+  g.snapshot = Object.fromEntries(SEALED_SHELL_PARTS.map(rel => [rel, createHash('sha256').update(fs.readFileSync(path.join(g.app, rel))).digest('hex')]));
+  g.cache = path.join(g.home, 'Library/Caches/@fixture-updater');
+  g.shipIt = path.join(g.home, 'Library/Caches/com.example.fixture.ShipIt');
+  g.archiveName = 'Fixture-3.18.35-arm64-mac.zip';
+  g.writeArchives = (bytes = nativeZip(g), held = false) => {
+    for (const suffix of held ? ['', '.held-latest'] : ['']) {
+      const pending = path.join(g.cache, `pending${suffix}`);
+      fs.mkdirSync(pending, { recursive: true });
+      fs.writeFileSync(path.join(pending, g.archiveName), bytes);
+      fs.writeFileSync(path.join(g.cache, `update.zip${suffix}`), bytes);
+      fs.writeFileSync(path.join(pending, 'update-info.json'), JSON.stringify({ fileName: g.archiveName, sha512: createHash('sha512').update(bytes).digest('base64'), isAdminRightsRequired: false }));
+    }
+  };
+  g.writeArchives();
+  fs.mkdirSync(g.shipIt, { recursive: true });
+  g.state = { launchAfterInstallation: true, updateBundleURL: pathToFileURL(path.join(g.shipIt, 'update.ABC123/Fixture.app')).href + '/', useUpdateBundleName: true, bundleIdentifier: 'com.example.fixture', targetBundleURL: pathToFileURL(g.app).href + '/' };
+  g.statePath = path.join(g.shipIt, 'ShipItState.plist');
+  fs.writeFileSync(g.statePath, JSON.stringify(g.state));
+  g.capture = (commands = () => {}) => captureAppliedUpdateEvidence({ app: g.app, home: g.home }, fs, commands);
+  g.proveApplied = (evidence, overrides = {}) => verifyGuardedSealedPatch({
+    app: g.app, home: g.home, shellSnapshot: g.snapshot, appliedUpdateEvidence: evidence,
+    isRunning: () => false, isUpdaterRunning: () => false, verifyNativeSignature: () => {}, ...overrides,
+  });
+  return g;
+}
+
+test('verified applied native update permits retained consumed state and active/held archives without changing them', t => {
+  const g = appliedUpdateFixture(t); g.writeArchives(nativeZip(g, SEALED_SHELL_PARTS, true), true);
+  fs.writeFileSync(path.join(g.cache, 'current.blockmap'), 'retained differential data');
+  const signatureCommands = [];
+  const evidence = g.capture((command, args) => signatureCommands.push([command, args]));
+  assert.deepEqual(signatureCommands, [['/usr/bin/codesign', ['--verify', '--deep', '--strict', g.app]]]);
+  let signatures = 0;
+  const guarded = g.proveApplied(evidence, { verifyNativeSignature: () => { signatures += 1; } });
+  const patched = installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded });
+  assert.equal(fs.readFileSync(path.join(patched.backup, 'index.js'), 'utf8'), 'old daemon');
+  assert.doesNotThrow(() => g.proveApplied(evidence, { priorProof: guarded, verifyNativeSignature: () => { throw new Error('post-patch full seal is intentionally changed'); } }));
+  assert.equal(signatures, 1);
+  assert.deepEqual(g.capture(), evidence, 'all cache, request and native bytes remain identical');
+});
+
+test('matching retained archives alone cannot bypass a failed complete native signature or forge a prior proof', t => {
+  const g = appliedUpdateFixture(t); const evidence = g.capture();
+  assert.throws(() => g.capture(() => { throw new Error('signature failed'); }), /signature failed/);
+  assert.throws(() => g.proveApplied(evidence, { verifyNativeSignature: () => { throw new Error('signature failed'); } }), /signature failed/);
+  assert.throws(() => g.proveApplied(evidence, { priorProof: { app: g.app, appliedEvidenceDigest: 'forged' } }), /no matching initial/);
+});
+
+test('every proof discovers newly queued installer state instead of reusing an earlier path list', async t => {
+  for (const entry of ['update.NEW123', 'pending-update', 'unexpected']) await t.test(entry, t => {
+    const g = appliedUpdateFixture(t); const evidence = g.capture(); const guarded = g.proveApplied(evidence);
+    fs.mkdirSync(path.join(g.shipIt, entry));
+    assert.throws(() => g.proveApplied(evidence, { priorProof: guarded, updaterStagingPaths: [] }), /unknown or unpacked installer/);
+  });
+  await t.test('same consumed staging path reappears', t => {
+    const g = appliedUpdateFixture(t); const evidence = g.capture();
+    fs.mkdirSync(path.join(g.shipIt, 'update.ABC123'), { recursive: true });
+    assert.throws(() => g.proveApplied(evidence), /unknown or unpacked installer/);
+  });
+});
+
+test('retained update classification rejects unknown, malformed, changed or linked evidence', async t => {
+  const cases = [
+    ['unknown cache file', g => fs.writeFileSync(path.join(g.cache, 'another.zip'), 'unknown')],
+    ['unpaired held archive', g => fs.writeFileSync(path.join(g.cache, 'update.zip.held-latest'), nativeZip(g))],
+    ['unexpected pending file', g => fs.writeFileSync(path.join(g.cache, 'pending/partial.tmp'), 'partial')],
+    ['changed active archive', g => fs.appendFileSync(path.join(g.cache, 'update.zip'), 'changed')],
+    ['malformed metadata', g => fs.writeFileSync(path.join(g.cache, 'pending/update-info.json'), '{}')],
+    ['duplicate metadata key', g => { const p = path.join(g.cache, 'pending/update-info.json'); fs.writeFileSync(p, fs.readFileSync(p, 'utf8').replace('{', '{"fileName":"other.zip",')); }],
+    ['unknown state key', g => fs.writeFileSync(g.statePath, JSON.stringify({ ...g.state, unexpected: true }))],
+    ['different installer target', g => fs.writeFileSync(g.statePath, JSON.stringify({ ...g.state, targetBundleURL: pathToFileURL(path.join(g.root, 'Other.app')).href }))],
+    ['different installer staging parent', g => fs.writeFileSync(g.statePath, JSON.stringify({ ...g.state, updateBundleURL: pathToFileURL(path.join(g.root, 'update.ABC123/Fixture.app')).href }))],
+    ['remote installer URL', g => fs.writeFileSync(g.statePath, JSON.stringify({ ...g.state, targetBundleURL: 'file://remote/Fixture.app' }))],
+    ['malformed JSON state', g => fs.writeFileSync(g.statePath, '{')],
+    ['duplicate state key', g => fs.writeFileSync(g.statePath, JSON.stringify(g.state).replace('{', '{"bundleIdentifier":"com.other.bundle",'))],
+    ['noncanonical state URL', g => fs.writeFileSync(g.statePath, JSON.stringify({ ...g.state, targetBundleURL: g.state.targetBundleURL.replace('/Fixture.app/', '/x/../Fixture.app/') }))],
+    ['changed config', g => fs.appendFileSync(path.join(g.app, 'Contents/Resources/app-update.yml'), '# drift\n')],
+    ['changed native bytes', g => fs.appendFileSync(path.join(g.app, 'Contents/Resources/app.asar'), 'changed')],
+    ['symlinked state', g => { const moved = path.join(g.root, 'state-copy'); fs.renameSync(g.statePath, moved); fs.symlinkSync(moved, g.statePath); }],
+    ['symlinked pending ancestor', g => { const pending = path.join(g.cache, 'pending'); const moved = path.join(g.root, 'pending-copy'); fs.renameSync(pending, moved); fs.symlinkSync(moved, pending); }],
+  ];
+  for (const [name, change] of cases) await t.test(name, t => {
+    const g = appliedUpdateFixture(t); const evidence = g.capture(); change(g);
+    assert.throws(() => g.proveApplied(evidence));
+    assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'old daemon');
+  });
+});
+
+test('held backup content, native ZIP paths and archived version must independently match the applied shell', async t => {
+  await t.test('held backup mismatch', t => {
+    const g = appliedUpdateFixture(t); g.writeArchives(nativeZip(g), true);
+    fs.appendFileSync(path.join(g.cache, 'pending.held-latest', g.archiveName), 'drift');
+    assert.throws(() => g.capture(), /checksum differs/);
+  });
+  for (const [name, entries] of [
+    ['missing native entry', SEALED_SHELL_PARTS.slice(1)],
+    ['duplicate native entry', [...SEALED_SHELL_PARTS, SEALED_SHELL_PARTS[0]]],
+  ]) await t.test(name, t => {
+    const g = appliedUpdateFixture(t); g.writeArchives(nativeZip(g, entries));
+    assert.throws(() => g.capture(), /native entries missing|duplicate retained native/);
+  });
+  await t.test('older archive after newer applied shell', t => {
+    const g = appliedUpdateFixture(t);
+    fs.appendFileSync(path.join(g.app, 'Contents/Info.plist'), '<!-- native revision -->');
+    assert.throws(() => g.capture(), /differs from applied native shell/);
+  });
+});
+
+test('running helpers and unreadable process evidence refuse, including after an authentic initial proof', t => {
+  const g = appliedUpdateFixture(t); const evidence = g.capture(); const guarded = g.proveApplied(evidence);
+  assert.throws(() => g.proveApplied(evidence, { isUpdaterRunning: () => true }), /helper is still running/);
+  assert.throws(() => g.proveApplied(evidence, { priorProof: guarded, isUpdaterRunning: () => true }), /helper is still running/);
+  assert.throws(() => g.proveApplied(evidence, { isUpdaterRunning: () => { throw new Error('cannot inspect processes'); } }), /cannot inspect/);
+  assert.equal(isUpdaterHelperRunning(() => '/path/Clementine.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt arg\n'), true);
+  assert.equal(isUpdaterHelperRunning(() => '/path/ordinary-node helper\n'), false);
+  assert.throws(() => isUpdaterHelperRunning(() => { throw new Error('ps denied'); }), /ps denied/);
+});
+
+test('a helper still refuses when staging was already consumed and no cached files remain', t => {
+  const g = guardedFixture(t);
+  assert.throws(() => g.prove({ isUpdaterRunning: () => true }), /helper is still running/);
+});
+
+test('native and externally launched daemon processes remain blockers with bundle paths containing spaces', () => {
+  const app = '/Users/Fixture Owner/Applications/Clementine.app';
+  const entry = `${app}/Contents/Resources/daemon/dist/index.js`;
+  assert.equal(isInstalledAppRunning(app, () => `${app}/Contents/MacOS/Clementine\n`), true);
+  assert.equal(isInstalledAppRunning(app, () => `/usr/local/bin/node ${entry} daemon\n`), true);
+  assert.equal(isInstalledAppRunning(app, () => `/bin/zsh -c inspect ${entry}\n`), false);
+  assert.equal(isInstalledAppRunning(app, () => `/usr/local/bin/node /Other/Clementine.app/Contents/Resources/daemon/dist/index.js\n`), false);
+  assert.throws(() => isInstalledAppRunning(app, () => { throw new Error('process inventory denied'); }), /process inventory denied/);
+});
+
+// Full signed-reference fixtures bind every entry, including official internal
+// framework links. The mocked codesign boundary never touches a real bundle.
+function fullBundleZip(root, extraRecords = []) {
+  const records = [];
+  const visit = rel => {
+    const absolute = path.join(root, rel); const stat = fs.lstatSync(absolute);
+    const directory = stat.isDirectory(); const link = stat.isSymbolicLink();
+    records.push({ name: `${path.basename(root)}/${rel}${directory && rel ? '/' : ''}`, mode: stat.mode, content: directory ? Buffer.alloc(0) : link ? Buffer.from(fs.readlinkSync(absolute)) : fs.readFileSync(absolute) });
+    if (directory) for (const name of fs.readdirSync(absolute).sort()) visit(rel ? `${rel}/${name}` : name);
+  };
+  visit(''); records.push(...extraRecords);
+  const locals = []; const central = []; let offset = 0;
+  for (const { name: text, mode, content } of records) {
+    const name = Buffer.from(text); const bytes = deflateRawSync(content);
+    const header = Buffer.alloc(30); header.writeUInt32LE(0x04034b50); header.writeUInt16LE(20, 4); header.writeUInt16LE(8, 8); header.writeUInt32LE(bytes.length, 18); header.writeUInt32LE(content.length, 22); header.writeUInt16LE(name.length, 26);
+    locals.push(header, name, bytes);
+    const entry = Buffer.alloc(46); entry.writeUInt32LE(0x02014b50); entry.writeUInt16LE((3 << 8) | 20, 4); entry.writeUInt16LE(20, 6); entry.writeUInt16LE(8, 10); entry.writeUInt32LE(bytes.length, 20); entry.writeUInt32LE(content.length, 24); entry.writeUInt16LE(name.length, 28); entry.writeUInt32LE((mode << 16) >>> 0, 38); entry.writeUInt32LE(offset, 42);
+    central.push(entry, name); offset += header.length + name.length + bytes.length;
+  }
+  const directory = Buffer.concat(central); const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50); end.writeUInt16LE(records.length, 8); end.writeUInt16LE(records.length, 10); end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, directory, end]);
+}
+
+function assetDigestForFixture(root) {
+  const hash = createHash('sha256');
+  const visit = rel => {
+    const absolute = path.join(root, rel);
+    if (fs.lstatSync(absolute).isDirectory()) for (const name of fs.readdirSync(absolute).sort()) visit(path.join(rel, name));
+    else { hash.update(rel); hash.update(fs.readFileSync(absolute)); }
+  };
+  visit(''); return hash.digest('hex');
+}
+
+function repeatedUpdateFixture(t) {
+  const g = appliedUpdateFixture(t);
+  g.parts = {
+    daemon: 'Contents/Resources/daemon/dist',
+    'builtin-skills': 'Contents/Resources/daemon/builtin-skills',
+    'console-web': 'Contents/Resources/daemon/apps/console-web/dist',
+    'mobile-web': 'Contents/Resources/daemon/apps/mobile-web/dist',
+  };
+  for (const relative of Object.values(g.parts)) {
+    fs.mkdirSync(path.join(g.app, relative), { recursive: true });
+    fs.writeFileSync(path.join(g.app, relative, 'official.txt'), 'original signed release');
+  }
+  const framework = path.join(g.app, 'Contents/Frameworks/Test.framework');
+  fs.mkdirSync(path.join(framework, 'Versions/A'), { recursive: true });
+  fs.writeFileSync(path.join(framework, 'Versions/A/Test'), 'signed framework');
+  fs.symlinkSync('A', path.join(framework, 'Versions/Current'));
+  fs.symlinkSync('Versions/Current/Test', path.join(framework, 'Test'));
+  g.reference = path.join(g.root, 'official-reference/Fixture.app');
+  fs.cpSync(g.app, g.reference, { recursive: true, verbatimSymlinks: true });
+  g.writeArchives(fullBundleZip(g.reference), true);
+  g.evidence = g.capture();
+  g.receipt = { bundle: g.app, wasVersion: '3.18.35', sourceFingerprint: 'b'.repeat(64), parts: {} };
+  for (const [name, relative] of Object.entries(g.parts)) {
+    const target = path.join(g.app, relative); const backup = `${target}.backup-Historical${name.replace(/-/g, '')}`;
+    fs.renameSync(target, backup);
+    fs.cpSync(g.sourceDist, target, { recursive: true });
+    const digest = name === 'daemon' ? inspectDaemonBuildForFixture(target) : assetDigestForFixture(target);
+    g.receipt.parts[name] = { ...(name === 'daemon' ? { digest } : { built: digest }), served: digest, backup, match: true };
+  }
+  g.receiptPath = path.join(g.root, 'authorized-prior.json');
+  const writeReceipt = () => fs.writeFileSync(g.receiptPath, JSON.stringify(g.receipt));
+  writeReceipt();
+  g.repeat = { referenceBundle: g.reference, authorizedReceipt: g.receiptPath, authorizedReceiptSha256: createHash('sha256').update(fs.readFileSync(g.receiptPath)).digest('hex'), expectedPriorFingerprint: 'b'.repeat(64), expectedReferenceCdHash: 'c'.repeat(40) };
+  g.repinReceipt = () => { writeReceipt(); g.repeat.authorizedReceiptSha256 = createHash('sha256').update(fs.readFileSync(g.receiptPath)).digest('hex'); };
+  g.signatures = [];
+  g.proveRepeat = (overrides = {}) => g.proveApplied(g.evidence, {
+    repeatedReference: g.repeat,
+    verifyNativeSignature: bundle => { g.signatures.push(bundle); assert.equal(bundle, g.reference, 'verify the pristine full seal, never claim the patched installed seal passes'); },
+    readReferenceCodeIdentity: () => ({ bundleId: 'com.example.fixture', team: '4AR3Y8XD72', cdHash: 'c'.repeat(40) }),
+    ...overrides,
+  });
+  return g;
+}
+
+function inspectDaemonBuildForFixture(root) {
+  const hash = createHash('sha256');
+  const visit = rel => {
+    const absolute = path.join(root, rel); const stat = fs.lstatSync(absolute);
+    if (stat.isDirectory()) for (const name of fs.readdirSync(absolute).sort()) visit(path.join(rel, name));
+    else { hash.update(JSON.stringify([rel, stat.size])); hash.update(fs.readFileSync(absolute)); }
+  };
+  visit(''); return hash.digest('hex');
+}
+
+/** Three installed rounds with distinct runtime bytes and exact retained
+ * siblings. No fixture uses a real application, updater or model. */
+function receiptChainFixture(t, rounds = 3) {
+  const g = repeatedUpdateFixture(t);
+  g.chain = [{ path: g.receiptPath, receipt: g.receipt }];
+  for (let round = 2; round <= rounds; round += 1) {
+    const fingerprint = String(round).repeat(64);
+    const receipt = { bundle: g.app, wasVersion: '3.18.35', sourceFingerprint: fingerprint, parts: {} };
+    for (const [name, relative] of Object.entries(g.parts)) {
+      const target = path.join(g.app, relative); const backup = `${target}.backup-Round${round}${name.replace(/-/g, '')}`;
+      fs.renameSync(target, backup);
+      fs.cpSync(g.sourceDist, target, { recursive: true });
+      fs.writeFileSync(path.join(target, 'index.js'), `runtime round ${round} ${name}`);
+      fs.writeFileSync(path.join(target, 'runtime/build-stamp.json'), JSON.stringify({ gitSha: 'a'.repeat(40), sourceFingerprint: fingerprint }));
+      const digest = name === 'daemon' ? inspectDaemonBuildForFixture(target) : assetDigestForFixture(target);
+      receipt.parts[name] = { ...(name === 'daemon' ? { digest } : { built: digest }), served: digest, backup, match: true };
+    }
+    const receiptPath = path.join(g.root, `authorized-round-${round}.json`);
+    fs.writeFileSync(receiptPath, JSON.stringify(receipt));
+    g.chain.push({ path: receiptPath, receipt });
+  }
+  g.manifestPath = path.join(g.root, 'authorized-ancestors.json');
+  g.manifest = { version: 1, receipts: g.chain.slice(0, -1).map(item => ({ path: item.path, sha256: createHash('sha256').update(fs.readFileSync(item.path)).digest('hex') })) };
+  const latest = g.chain.at(-1);
+  g.repeat.authorizedReceipt = latest.path;
+  g.repeat.authorizedReceiptSha256 = createHash('sha256').update(fs.readFileSync(latest.path)).digest('hex');
+  g.repeat.expectedPriorFingerprint = latest.receipt.sourceFingerprint;
+  g.repeat.authorizedAncestorManifest = g.manifestPath;
+  g.repinManifest = () => {
+    fs.writeFileSync(g.manifestPath, JSON.stringify(g.manifest));
+    g.repeat.authorizedAncestorManifestSha256 = createHash('sha256').update(fs.readFileSync(g.manifestPath)).digest('hex');
+  };
+  g.repinChainReceipt = index => {
+    const item = g.chain[index]; fs.writeFileSync(item.path, JSON.stringify(item.receipt));
+    const sha256 = createHash('sha256').update(fs.readFileSync(item.path)).digest('hex');
+    if (index === g.chain.length - 1) g.repeat.authorizedReceiptSha256 = sha256;
+    else g.manifest.receipts.find(pin => pin.path === item.path).sha256 = sha256;
+    g.repinManifest();
+  };
+  g.repinManifest();
+  return g;
+}
+
+test('bounded ordered receipt chain proves three installed rounds and privately retains the fourth rollback set', t => {
+  const g = receiptChainFixture(t); const proof = g.proveRepeat();
+  assert.deepEqual(g.signatures, [g.reference]);
+  fs.writeFileSync(path.join(g.sourceDist, 'index.js'), 'runtime fourth round');
+  fs.writeFileSync(path.join(g.sourceDist, 'runtime/build-stamp.json'), JSON.stringify({ gitSha: 'a'.repeat(40), sourceFingerprint: '4'.repeat(64) }));
+  const newBackups = [];
+  for (const [name, relative] of Object.entries(g.parts)) {
+    const target = path.join(g.app, relative);
+    const result = name === 'daemon'
+      ? installDaemonPatch({ sourceDist: g.sourceDist, targetDist: target, guarded: proof })
+      : installBundledAssetDirectory({ sourceDir: g.sourceDist, targetDir: target, guarded: proof });
+    newBackups.push(result.backup);
+    assert.equal(fs.readFileSync(path.join(result.backup, 'index.js'), 'utf8'), `runtime round 3 ${name}`);
+    assert.doesNotThrow(() => g.proveRepeat({ priorProof: proof }));
+  }
+  for (const item of g.chain) for (const part of Object.values(item.receipt.parts)) assert.ok(fs.existsSync(part.backup), 'every exact historical rollback remains');
+  assert.equal(new Set(newBackups).size, 4);
+  assert.throws(() => assertMutableInstallTarget(`${g.daemonDist}.backup-Unknown`, proof), /four exact runtime roots/);
+  fs.appendFileSync(path.join(newBackups[2], 'index.js'), 'tampered');
+  assert.throws(() => g.proveRepeat({ priorProof: proof }), /retained rollback footprint/);
+});
+
+test('receipt ancestry refuses skipped, reordered, extra, aliased and unpinned evidence', async t => {
+  for (const [name, change] of [
+    ['missing manifest pair', g => { delete g.repeat.authorizedAncestorManifestSha256; }],
+    ['wrong manifest pin', g => { g.repeat.authorizedAncestorManifestSha256 = '0'.repeat(64); }],
+    ['wrong ancestor pin', g => { g.manifest.receipts[0].sha256 = '0'.repeat(64); g.repinManifest(); }],
+    ['skipped oldest', g => { g.manifest.receipts.shift(); g.repinManifest(); }],
+    ['skipped middle', g => { g.manifest.receipts.pop(); g.repinManifest(); }],
+    ['reordered ancestors', g => { g.manifest.receipts.reverse(); g.repinManifest(); }],
+    ['duplicated ancestor', g => { g.manifest.receipts.push(g.manifest.receipts[0]); g.repinManifest(); }],
+    ['latest in ancestors', g => { g.manifest.receipts.push({ path: g.repeat.authorizedReceipt, sha256: g.repeat.authorizedReceiptSha256 }); g.repinManifest(); }],
+    ['relative receipt path', g => { g.manifest.receipts[0].path = './relative.json'; g.repinManifest(); }],
+    ['ancestor symlink', g => { const item = g.chain[0]; fs.renameSync(item.path, `${item.path}.real`); fs.symlinkSync(`${item.path}.real`, item.path); }],
+    ['ancestor hardlink', g => { fs.linkSync(g.chain[0].path, path.join(g.root, 'receipt-alias.json')); }],
+    ['extra ancestor keys', g => { g.manifest.receipts[0].trusted = true; g.repinManifest(); }],
+    ['extra manifest keys', g => { g.manifest.success = true; g.repinManifest(); }],
+    ['unsupported manifest version', g => { g.manifest.version = 2; g.repinManifest(); }],
+    ['unbounded ancestors', g => { g.manifest.receipts = Array.from({ length: 17 }, () => g.manifest.receipts[0]); g.repinManifest(); }],
+    ['empty manifest', g => { g.manifest.receipts = []; g.repinManifest(); }],
+    ['omitted manifest', g => { delete g.repeat.authorizedAncestorManifest; delete g.repeat.authorizedAncestorManifestSha256; }],
+  ]) await t.test(name, t => { const g = receiptChainFixture(t); change(g); assert.throws(() => g.proveRepeat()); });
+});
+
+test('every ancestor identity, four digests, daemon fingerprint and distinct rollback sibling is required', async t => {
+  for (const [name, change] of [
+    ['ancestor bundle', g => { g.chain[0].receipt.bundle = '/Other.app'; g.repinChainReceipt(0); }],
+    ['ancestor native version', g => { g.chain[1].receipt.wasVersion = '3.18.34'; g.repinChainReceipt(1); }],
+    ['ancestor fingerprint', g => { g.chain[0].receipt.sourceFingerprint = '0'.repeat(64); g.repinChainReceipt(0); }],
+    ['ancestor daemon digest', g => { g.chain[0].receipt.parts.daemon.digest = '0'.repeat(64); g.chain[0].receipt.parts.daemon.served = '0'.repeat(64); g.repinChainReceipt(0); }],
+    ['ancestor web digest', g => { g.chain[1].receipt.parts['mobile-web'].built = '0'.repeat(64); g.chain[1].receipt.parts['mobile-web'].served = '0'.repeat(64); g.repinChainReceipt(1); }],
+    ['ancestor served mismatch', g => { g.chain[0].receipt.parts['console-web'].served = '0'.repeat(64); g.repinChainReceipt(0); }],
+    ['missing ancestor part', g => { delete g.chain[0].receipt.parts['console-web']; g.repinChainReceipt(0); }],
+    ['extra ancestor part', g => { g.chain[1].receipt.parts.other = g.chain[1].receipt.parts.daemon; g.repinChainReceipt(1); }],
+    ['colliding older backup', g => { g.chain[1].receipt.parts.daemon.backup = g.chain[0].receipt.parts.daemon.backup; g.repinChainReceipt(1); }],
+    ['aliased older backup', g => { g.chain[1].receipt.parts.daemon.backup = g.chain[0].receipt.parts.daemon.backup.toUpperCase(); g.repinChainReceipt(1); }],
+    ['wrong part sibling', g => { g.chain[1].receipt.parts.daemon.backup = g.chain[1].receipt.parts['mobile-web'].backup; g.repinChainReceipt(1); }],
+    ['missing older backup', g => { fs.rmSync(g.chain[0].receipt.parts['console-web'].backup, { recursive: true }); }],
+    ['undeclared additional backup', g => { fs.mkdirSync(`${g.daemonDist}.backup-Extra`); }],
+    ['oldest backup bytes', g => { fs.appendFileSync(path.join(g.chain[0].receipt.parts.daemon.backup, 'official.txt'), 'changed'); }],
+    ['middle backup bytes', g => { fs.appendFileSync(path.join(g.chain[1].receipt.parts.daemon.backup, 'index.js'), 'changed'); }],
+    ['middle backup mode', g => { fs.chmodSync(g.chain[1].receipt.parts.daemon.backup, 0o700); }],
+    ['middle backup symlink', g => { fs.symlinkSync('index.js', path.join(g.chain[1].receipt.parts.daemon.backup, 'linked')); }],
+    ['immutable resource', g => { fs.appendFileSync(path.join(g.app, 'Contents/Frameworks/Test.framework/Versions/A/Test'), 'changed'); }],
+    ['native resource', g => { fs.appendFileSync(path.join(g.app, 'Contents/Resources/app.asar'), 'changed'); }],
+  ]) await t.test(name, t => { const g = receiptChainFixture(t); change(g); assert.throws(() => g.proveRepeat()); });
+});
+
+test('chain JSON cannot hide duplicate keys behind valid pinned bytes', async t => {
+  for (const target of ['manifest', 'receipt']) await t.test(target, t => {
+    const g = receiptChainFixture(t);
+    if (target === 'manifest') {
+      fs.writeFileSync(g.manifestPath, JSON.stringify(g.manifest).replace('"version":1', '"version":0,"version":1'));
+      g.repeat.authorizedAncestorManifestSha256 = createHash('sha256').update(fs.readFileSync(g.manifestPath)).digest('hex');
+    } else {
+      const item = g.chain[0];
+      fs.writeFileSync(item.path, JSON.stringify(item.receipt).replace('"served":', '"served":"ignored","served":'));
+      g.manifest.receipts[0].sha256 = createHash('sha256').update(fs.readFileSync(item.path)).digest('hex'); g.repinManifest();
+    }
+    assert.throws(() => g.proveRepeat(), /duplicate receipt\/manifest JSON keys/);
+  });
+});
+
+test('every chained proof rechecks all receipt bytes, manifest and rollback sets and cannot switch authority context', async t => {
+  for (const [name, change, overrides] of [
+    ['oldest receipt bytes', g => fs.appendFileSync(g.chain[0].path, ' ')],
+    ['middle receipt bytes', g => fs.appendFileSync(g.chain[1].path, ' ')],
+    ['latest receipt bytes', g => fs.appendFileSync(g.chain[2].path, ' ')],
+    ['manifest bytes', g => fs.appendFileSync(g.manifestPath, ' ')],
+    ['oldest rollback', g => fs.appendFileSync(path.join(g.chain[0].receipt.parts.daemon.backup, 'official.txt'), 'changed')],
+    ['middle rollback', g => fs.appendFileSync(path.join(g.chain[1].receipt.parts['console-web'].backup, 'index.js'), 'changed')],
+    ['latest rollback', g => fs.appendFileSync(path.join(g.chain[2].receipt.parts['mobile-web'].backup, 'index.js'), 'changed')],
+    ['manifest pin changed', g => { g.repeat.authorizedAncestorManifestSha256 = '0'.repeat(64); }],
+    ['manifest context omitted', () => {}, g => ({ repeatedReference: { ...g.repeat, authorizedAncestorManifest: undefined, authorizedAncestorManifestSha256: undefined } })],
+    ['latest receipt context changed', () => {}, g => ({ repeatedReference: { ...g.repeat, authorizedReceipt: g.chain[0].path, authorizedReceiptSha256: g.manifest.receipts[0].sha256 } })],
+    ['serialized proof', () => {}, (_g, proof) => ({ priorProof: JSON.parse(JSON.stringify(proof)) })],
+  ]) await t.test(name, t => {
+    const g = receiptChainFixture(t); const proof = g.proveRepeat(); change(g);
+    assert.throws(() => g.proveRepeat({ priorProof: proof, ...(overrides?.(g, proof) ?? {}) }));
+  });
+});
+
+test('repeat admission proves pristine full seal, exact archive/immutable tree and all historical runtime/rollback roots', t => {
+  const g = repeatedUpdateFixture(t); const proof = g.proveRepeat();
+  assert.deepEqual(g.signatures, [g.reference]);
+  assert.doesNotThrow(() => g.proveRepeat({ priorProof: proof }));
+  const withImplicitLedger = g.proveRepeat({ priorProof: proof, repeatedReference: undefined });
+  assert.throws(() => assertMutableInstallTarget(path.join(g.app, 'Contents/Resources/daemon/unknown'), withImplicitLedger), /four exact runtime roots/);
+  assert.deepEqual(g.signatures, [g.reference], 'later proof rehashes signed bytes and identity instead of asserting installed seal validity');
+  assert.throws(() => g.proveRepeat({ priorProof: JSON.parse(JSON.stringify(proof)) }), /no matching initial/);
+  assert.throws(() => assertMutableInstallTarget(path.join(g.app, 'Contents/Resources/daemon/apps/unknown/dist'), proof), /four exact runtime roots/);
+  assert.throws(() => assertMutableInstallTarget(path.join(g.daemonDist, 'nested'), proof), /four exact runtime roots/);
+});
+
+test('repeat admission refuses missing or incorrect pins and cannot use receipt success booleans as authority', async t => {
+  for (const [name, change] of [
+    ['wrong receipt hash', g => { g.repeat.authorizedReceiptSha256 = '0'.repeat(64); }],
+    ['wrong previous fingerprint', g => { g.repeat.expectedPriorFingerprint = '0'.repeat(64); }],
+    ['wrong CDHash', g => { g.repeat.expectedReferenceCdHash = '0'.repeat(40); }],
+    ['missing reference pin', g => { delete g.repeat.expectedReferenceCdHash; }],
+    ['wrong receipt runtime', g => { g.receipt.parts.daemon.digest = '0'.repeat(64); g.receipt.parts.daemon.match = true; g.repinReceipt(); }],
+    ['arbitrary rollback path', g => { g.receipt.parts.daemon.backup = g.reference; g.repinReceipt(); }],
+    ['missing rollback root', g => { fs.rmSync(g.receipt.parts['mobile-web'].backup, { recursive: true }); }],
+    ['extra receipt part', g => { g.receipt.parts.other = g.receipt.parts.daemon; g.repinReceipt(); }],
+  ]) await t.test(name, t => {
+    const g = repeatedUpdateFixture(t); change(g); assert.throws(() => g.proveRepeat());
+    assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'new daemon');
+  });
+});
+
+test('repeat reference requires official publisher, full strict signature and stable bytes through the signature boundary', async t => {
+  await t.test('different valid signer', t => {
+    const g = repeatedUpdateFixture(t);
+    assert.throws(() => g.proveRepeat({ readReferenceCodeIdentity: () => ({ bundleId: 'com.example.fixture', team: 'ANOTHERSIGNER', cdHash: 'c'.repeat(40) }) }), /publisher\/identity/);
+  });
+  await t.test('invalid full signature', t => {
+    const g = repeatedUpdateFixture(t); assert.throws(() => g.proveRepeat({ verifyNativeSignature: () => { throw new Error('full strict signature failure'); } }), /full strict signature failure/);
+  });
+  await t.test('signature boundary mutates a reference resource', t => {
+    const g = repeatedUpdateFixture(t);
+    assert.throws(() => g.proveRepeat({ verifyNativeSignature: () => fs.appendFileSync(path.join(g.reference, 'Contents/Frameworks/Test.framework/Versions/A/Test'), 'changed') }), /verified reference footprint/);
+  });
+});
+
+test('repeat typed evidence rejects undeclared immutable, rollback, runtime or framework changes', async t => {
+  for (const [name, change] of [
+    ['immutable extra file', g => fs.writeFileSync(path.join(g.app, 'Contents/Resources/extra.txt'), 'unaccounted')],
+    ['immutable mode', g => fs.chmodSync(path.join(g.app, 'Contents/MacOS'), 0o700)],
+    ['immutable changed bytes', g => fs.appendFileSync(path.join(g.app, 'Contents/Frameworks/Test.framework/Versions/A/Test'), 'changed')],
+    ['official link target changed', g => { const p = path.join(g.app, 'Contents/Frameworks/Test.framework/Test'); fs.unlinkSync(p); fs.symlinkSync('Versions/A/Test', p); }],
+    ['unknown backup wildcard', g => fs.mkdirSync(`${g.daemonDist}.backup-Unknown`)],
+    ['historical rollback bytes', g => fs.appendFileSync(path.join(g.receipt.parts.daemon.backup, 'official.txt'), 'changed')],
+    ['historical rollback root mode', g => fs.chmodSync(g.receipt.parts.daemon.backup, 0o700)],
+    ['runtime root mode', g => fs.chmodSync(g.daemonDist, 0o700)],
+    ['runtime file mode', g => fs.chmodSync(path.join(g.daemonDist, 'index.js'), 0o755)],
+    ['runtime changed bytes', g => fs.appendFileSync(path.join(g.daemonDist, 'index.js'), 'changed')],
+    ['runtime symlink', g => fs.symlinkSync('index.js', path.join(g.daemonDist, 'alias'))],
+    ['runtime hardlink', g => fs.linkSync(path.join(g.daemonDist, 'index.js'), path.join(g.daemonDist, 'alias'))],
+    ['runtime case alias', g => fs.writeFileSync(path.join(g.daemonDist, 'INDEX.js'), 'alias')],
+    ['reference extra file', g => fs.writeFileSync(path.join(g.reference, 'Contents/Resources/extra.txt'), 'changed')],
+    ['reference directory mode', g => fs.chmodSync(path.join(g.reference, 'Contents/Resources'), 0o700)],
+    ['reference linked root', g => { fs.renameSync(g.reference, g.reference + '.original'); fs.symlinkSync(g.reference + '.original', g.reference); }],
+  ]) await t.test(name, t => { const g = repeatedUpdateFixture(t); change(g); assert.throws(() => g.proveRepeat()); });
+});
+
+test('every repeat proof refreshes private immutable/runtime/rollback and process/updater evidence', async t => {
+  for (const [name, change, overrides] of [
+    ['native changed', g => fs.appendFileSync(path.join(g.app, 'Contents/Resources/app.asar'), 'changed')],
+    ['runtime changed', g => fs.appendFileSync(path.join(g.daemonDist, 'index.js'), 'changed')],
+    ['receipt changed', g => fs.appendFileSync(g.receiptPath, ' ')],
+    ['reference changed', g => fs.appendFileSync(path.join(g.reference, 'Contents/Frameworks/Test.framework/Versions/A/Test'), 'changed')],
+    ['old backup changed', g => fs.appendFileSync(path.join(g.receipt.parts.daemon.backup, 'official.txt'), 'changed')],
+    ['new queued update', g => fs.mkdirSync(path.join(g.shipIt, 'update.NEW'))],
+    ['helper running', () => {}, { isUpdaterRunning: () => true }],
+    ['app running', () => {}, { isRunning: () => true }],
+  ]) await t.test(name, t => { const g = repeatedUpdateFixture(t); const proof = g.proveRepeat(); change(g); assert.throws(() => g.proveRepeat({ priorProof: proof, ...overrides })); });
+});
+
+test('private repeat ledger carries all four replacements and exact new rollback paths through fresh proofs', t => {
+  const g = repeatedUpdateFixture(t); const original = g.proveRepeat();
+  fs.writeFileSync(path.join(g.sourceDist, 'index.js'), 'next daemon');
+  const daemon = installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded: original });
+  assert.equal(fs.readFileSync(path.join(daemon.backup, 'index.js'), 'utf8'), 'new daemon');
+  const fresh = g.proveRepeat({ priorProof: original });
+  for (const [name, relative] of Object.entries(g.parts).filter(([name]) => name !== 'daemon')) {
+    const target = path.join(g.app, relative);
+    const result = installBundledAssetDirectory({ sourceDir: g.sourceDist, targetDir: target, guarded: original });
+    assert.equal(fs.readFileSync(path.join(result.backup, 'index.js'), 'utf8'), 'new daemon');
+    assert.doesNotThrow(() => g.proveRepeat({ priorProof: fresh }), name);
+  }
+  assert.doesNotThrow(() => g.proveRepeat({ priorProof: original }));
+  assert.throws(() => installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded: original }), /fresh exact runtime root/);
+  fs.appendFileSync(path.join(daemon.backup, 'index.js'), 'tampered');
+  assert.throws(() => g.proveRepeat({ priorProof: fresh }), /retained rollback footprint/);
+});
+
+test('repeat replacement refuses source/staging type or permission drift before moving old runtime', async t => {
+  await t.test('source symlink', t => {
+    const g = repeatedUpdateFixture(t); const proof = g.proveRepeat();
+    fs.symlinkSync('index.js', path.join(g.sourceDist, 'alias'));
+    assert.throws(() => installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded: proof }), /runtime symlink/);
+  });
+  await t.test('staging directory permission drift', t => {
+    const g = repeatedUpdateFixture(t); const proof = g.proveRepeat();
+    assert.throws(() => installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded: proof }, { ...fs, cpSync(source, target, options) { fs.cpSync(source, target, options); fs.chmodSync(target, 0o700); } }), /typed staging copy/);
+    assert.doesNotThrow(() => g.proveRepeat({ priorProof: proof }));
+  });
+  await t.test('failed post-rename registration restores that part', t => {
+    const g = repeatedUpdateFixture(t); const proof = g.proveRepeat(); let renames = 0;
+    assert.throws(() => installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded: proof }, { ...fs, renameSync(from, to) { fs.renameSync(from, to); if (++renames === 2) fs.chmodSync(to, 0o700); } }), /replacement footprint/);
+    assert.doesNotThrow(() => g.proveRepeat({ priorProof: proof }));
+    assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'new daemon');
+  });
+});
+
+test('repeat proof cannot change home, applied evidence or native snapshot to leave the private ledger behind', async t => {
+  for (const [name, overrides] of [
+    ['different home', g => ({ home: path.join(g.root, 'other-home') })],
+    ['omitted retained evidence', () => ({ appliedUpdateEvidence: undefined })],
+    ['different native snapshot', g => ({ shellSnapshot: { ...g.snapshot, 'Contents/Resources/app.asar': '0'.repeat(64) } })],
+  ]) await t.test(name, t => {
+    const g = repeatedUpdateFixture(t); const proof = g.proveRepeat();
+    assert.throws(() => g.proveRepeat({ priorProof: proof, ...overrides(g) }), /private repeat/);
+  });
+});
+
+test('full archive admission rejects unsafe links, aliases and special entry types even with matching download checksum', async t => {
+  for (const [name, change] of [
+    ['escaping official link', g => fs.symlinkSync('../../../../outside', path.join(g.reference, 'Contents/Frameworks/escape'))],
+    ['aliased official file', () => {}],
+    ['special central-directory entry', () => {}],
+  ]) await t.test(name, t => {
+    const g = repeatedUpdateFixture(t); change(g); let bytes = fullBundleZip(g.reference);
+    if (name === 'aliased official file') bytes = fullBundleZip(g.reference, [{ name: 'Fixture.app/Contents/Frameworks/Test.framework/Versions/A/TEST', mode: 0o100644, content: Buffer.from('signed framework') }]);
+    if (name === 'special central-directory entry') {
+      bytes = Buffer.from(bytes); const centralOffset = bytes.readUInt32LE(bytes.length - 22 + 16);
+      bytes.writeUInt32LE((0o010755 << 16) >>> 0, centralOffset + 38);
+    }
+    g.writeArchives(bytes, true); g.evidence = g.capture();
+    assert.throws(() => g.proveRepeat());
+  });
+});
+
+test('exact cache-root archive selection also supports pending download filename update.zip', t => {
+  const g = repeatedUpdateFixture(t);
+  for (const suffix of ['', '.held-latest']) {
+    const pending = path.join(g.cache, `pending${suffix}`);
+    fs.rmSync(pending, { recursive: true });
+  }
+  g.archiveName = 'update.zip'; g.writeArchives(fullBundleZip(g.reference), true); g.evidence = g.capture();
+  assert.doesNotThrow(() => g.proveRepeat());
+});
+
+test('repeat installer CLI rejects incomplete, duplicate or unknown authority flags before subprocesses or mutation', async t => {
+  const moduleUrl = new URL('./hotpatch-installed-tree.mjs', import.meta.url);
+  const body = fs.readFileSync(moduleUrl, 'utf8').replace(/^import[\s\S]*?from ['"][^'"]+['"];\s*$/gm, '').replaceAll('import.meta.url', JSON.stringify(moduleUrl.href));
+  const helpers = await import('./hotpatch-daemon.mjs'); const { Script } = await import('node:vm'); const { fileURLToPath } = await import('node:url');
+  const repeatArgs = ['--guarded-shell-snapshot', '/snapshot', '--signed-reference-bundle', '/reference.app', '--authorized-prior-receipt', '/receipt', '--authorized-prior-receipt-sha256', 'a'.repeat(64), '--expected-prior-fingerprint', 'b'.repeat(64), '--expected-reference-cdhash', 'c'.repeat(40)];
+  for (const args of [
+    ['--signed-reference-bundle', '/reference.app'],
+    ['--signed-reference-bundle', '--no-relaunch'],
+    ['--signed-reference-bundle', '/reference.app', '--signed-reference-bundle', '/another.app'],
+    ['--guarded-shell-snapshot', '/snapshot', '--guarded-shell-snapshot', '/other'],
+    ['--skip-signature'],
+    ['--authorized-ancestor-manifest', '/manifest'],
+    ['--authorized-ancestor-manifest-sha256', 'a'.repeat(64)],
+    ['--authorized-ancestor-manifest', '/manifest', '--authorized-ancestor-manifest', '/other'],
+    [...repeatArgs, '--authorized-ancestor-manifest', '/manifest'],
+    [...repeatArgs, '--authorized-ancestor-manifest-sha256', 'a'.repeat(64)],
+  ]) await t.test(args[0], async () => {
+    const commands = [];
+    const result = new Script(`(async () => { ${body}\n})()`).runInNewContext({
+      ...helpers, fs, path, createHash, fileURLToPath,
+      process: { argv: ['node', moduleUrl.pathname, ...args], env: {} },
+      console: { log() {}, error() {} }, execFileSync(command) { commands.push(command); throw new Error('unexpected subprocess'); },
+    });
+    await assert.rejects(result, /requires|Duplicate|Unknown/); assert.deepEqual(commands, []);
+  });
+  for (const args of [repeatArgs, [...repeatArgs, '--authorized-ancestor-manifest', '/manifest', '--authorized-ancestor-manifest-sha256', 'd'.repeat(64)]]) await t.test(args.length === repeatArgs.length ? 'legacy complete pins parse' : 'complete ancestor pins parse', async () => {
+    const result = new Script(`(async () => { ${body}\n})()`).runInNewContext({
+      ...helpers, fs, path, createHash, fileURLToPath,
+      resolveInstalledAppBundle() { throw new Error('validated arguments reached bundle selection'); },
+      process: { argv: ['node', moduleUrl.pathname, ...args], env: {} },
+      console: { log() {}, error() {} }, execFileSync() { throw new Error('unexpected subprocess'); },
+    });
+    await assert.rejects(result, /validated arguments reached bundle selection/);
+  });
 });

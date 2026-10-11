@@ -580,3 +580,106 @@ test('a declarative approval gate parks the run at step_started, and that reads 
   assert.equal(resumed.steps[0].status, 'done');
   assert.equal(resumed.steps[0].error, undefined);
 });
+
+test('completed Continue keeps run advisories and approval history without phantom steps or stale waits', () => {
+  // The installed declarative runner resumes with step_started, without an
+  // approval_granted event. The inherited result and remaining effect finish.
+  const advisory = { reason: 'learned_pattern_recalled', patterns: [{ workflow: 'controlled-pattern', score: 0.8, successCount: 2 }] };
+  const events: WorkflowEvent[] = [
+    { t: '2026-10-11T15:02:04.044Z', kind: 'run_started' },
+    { t: '2026-10-11T15:02:04.070Z', kind: 'step_completed', stepId: 'first', meta: { inheritedFromRunId: 'controlled-original' } },
+    { t: '2026-10-11T15:02:04.096Z', kind: 'step_advisory', stepId: '(run goal)', meta: { reason: 'continue_carried_steps', carriedStepIds: ['first'] } },
+    { t: '2026-10-11T15:02:04.109Z', kind: 'step_advisory', stepId: '(workflow)', meta: advisory },
+    { t: '2026-10-11T15:02:04.161Z', kind: 'step_started', stepId: 'remaining', meta: { gate: 'awaiting_approval', approvalId: 'controlled-fresh-gate' } },
+    { t: '2026-10-11T15:02:04.253Z', kind: 'workflow_node_ready', stepId: 'remaining' },
+    { t: '2026-10-11T15:02:34.168Z', kind: 'run_resumed' },
+    { t: '2026-10-11T15:02:34.181Z', kind: 'step_advisory', stepId: '(workflow)', meta: advisory },
+    { t: '2026-10-11T15:02:34.201Z', kind: 'step_started', stepId: 'remaining' },
+    { t: '2026-10-11T15:02:34.428Z', kind: 'step_completed', stepId: 'remaining', output: 'controlled-completed-result' },
+    { t: '2026-10-11T15:02:34.462Z', kind: 'workflow_node_ready', stepId: 'remaining' },
+    { t: '2026-10-11T15:03:07.284Z', kind: 'run_completed' },
+  ];
+  const overlay = buildWorkflowRunGraphOverlay(events, { stepIds: ['first', 'remaining'] });
+  assert.equal(overlay.runStatus, 'completed');
+  assert.deepEqual(overlay.steps.map((step) => step.stepId), ['first', 'remaining']);
+  assert.equal(overlay.summary.totalSteps, 2);
+  assert.equal(overlay.summary.doneSteps, 2);
+  assert.equal(overlay.summary.pendingSteps, 0);
+  assert.equal(overlay.summary.waitingSteps, 0);
+  assert.equal(overlay.summary.attentionSteps, 0);
+  assert.equal(overlay.summary.bottleneck, null);
+  assert.equal(overlay.summary.bottleneckStepId, null);
+  assert.deepEqual(overlay.runAdvisories, [
+    { t: events[3]!.t, meta: advisory },
+    { t: events[7]!.t, meta: advisory },
+  ]);
+  assert.equal(overlay.goal?.reason, 'continue_carried_steps');
+  const remaining = overlay.steps[1]!;
+  assert.equal(remaining.approvalsRequested, 1);
+  assert.equal(remaining.approvalsResolved, 0, 'missing telemetry is not invented');
+  assert.ok(remaining.riskSignals.includes('approval gate'));
+  assert.equal(remaining.runVerdict.status, 'completed');
+  assert.equal(remaining.runVerdict.primaryAction, null);
+});
+
+test('current declarative gate waits, resumed execution clears the wait, and a new gate waits again', () => {
+  const events: WorkflowEvent[] = [
+    { t: '2026-10-11T10:00:00.000Z', kind: 'run_started' },
+    { t: '2026-10-11T10:00:01.000Z', kind: 'step_started', stepId: 'remaining', meta: { gate: 'awaiting_approval', approvalId: 'controlled-gate-1' } },
+    { t: '2026-10-11T10:00:02.000Z', kind: 'workflow_node_ready', stepId: 'remaining' },
+  ];
+  const build = () => buildWorkflowRunGraphOverlay(events, { stepIds: ['remaining'] });
+  const waiting = build();
+  assert.equal(waiting.summary.waitingSteps, 1);
+  assert.equal(waiting.summary.bottleneck, 'approval wait');
+  assert.equal(waiting.steps[0]!.runVerdict.primaryAction, 'Resolve approval');
+  events.push({ t: '2026-10-11T10:00:03.000Z', kind: 'run_resumed' },
+    { t: '2026-10-11T10:00:04.000Z', kind: 'step_started', stepId: 'remaining' });
+  const working = build();
+  assert.equal(working.steps[0]!.status, 'running');
+  assert.equal(working.summary.waitingSteps, 0);
+  assert.equal(working.steps[0]!.attentionLevel, 'none');
+  assert.equal(working.summary.bottleneck, 'running');
+  events.push({ t: '2026-10-11T10:00:05.000Z', kind: 'step_completed', stepId: 'remaining' },
+    { t: '2026-10-11T10:00:06.000Z', kind: 'step_invalidated', stepId: 'remaining' },
+    { t: '2026-10-11T10:00:07.000Z', kind: 'step_started', stepId: 'remaining', meta: { gate: 'awaiting_approval', approvalId: 'controlled-gate-2' } });
+  const newGate = build();
+  assert.equal(newGate.summary.waitingSteps, 1);
+  assert.equal(newGate.summary.bottleneck, 'approval wait');
+  assert.equal(newGate.steps[0]!.approvalsRequested, 2);
+  assert.equal(newGate.steps[0]!.runVerdict.primaryAction, 'Resolve approval');
+});
+
+test('superseded approval telemetry does not hide uncertain effects or failed step outcomes', () => {
+  const events: WorkflowEvent[] = [
+    { t: '2026-10-11T10:00:01.000Z', kind: 'step_started', stepId: 'remaining', meta: { gate: 'awaiting_approval', approvalId: 'controlled-gate' } },
+    { t: '2026-10-11T10:00:02.000Z', kind: 'step_started', stepId: 'remaining' },
+    { t: '2026-10-11T10:00:03.000Z', kind: 'step_completed', stepId: 'remaining' },
+    { t: '2026-10-11T10:00:04.000Z', kind: 'run_completed' },
+  ];
+  const options = {
+    stepIds: ['remaining'],
+    harnessSessions: [{ sessionId: 'workflow:controlled-uncertain:remaining', stepId: 'remaining', events: [
+      { type: 'approval_requested', data: { approvalId: 'controlled-old-harness-gate' } },
+      { type: 'external_write', data: { preDispatch: true, callId: 'controlled-write', canonicalCallId: 'controlled-write', shapeKey: 'controlled-effect' } },
+    ] }],
+  };
+  const overlay = buildWorkflowRunGraphOverlay(events, options);
+  assert.equal(overlay.summary.doneSteps, 1);
+  assert.equal(overlay.summary.waitingSteps, 0);
+  assert.equal(overlay.summary.externalWriteUncertain, 1);
+  assert.equal(overlay.summary.bottleneck, 'external write outcome uncertain');
+  assert.equal(overlay.steps[0]!.runVerdict.status, 'attention');
+  assert.equal(overlay.steps[0]!.runVerdict.primaryAction, 'Review run evidence');
+  assert.ok(overlay.steps[0]!.attentionReasons.includes('1 external write outcome uncertain'));
+  assert.ok(!overlay.steps[0]!.attentionReasons.includes('waiting for your approval'));
+  const failed = buildWorkflowRunGraphOverlay([
+    ...events.slice(0, 2),
+    { t: '2026-10-11T10:00:03.000Z', kind: 'step_failed', stepId: 'remaining', error: 'controlled-failure' },
+    { t: '2026-10-11T10:00:04.000Z', kind: 'run_failed' },
+  ], options);
+  assert.equal(failed.summary.failedSteps, 1);
+  assert.equal(failed.summary.bottleneck, 'failed step');
+  assert.equal(failed.steps[0]!.runVerdict.status, 'failed');
+  assert.equal(failed.steps[0]!.externalWriteUncertain, 1);
+});

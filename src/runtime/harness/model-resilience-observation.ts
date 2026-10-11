@@ -52,6 +52,10 @@ export function createModelResilienceObservation(input: {
     ];
     const data = event as unknown as Record<string, unknown>;
     for (const key of keys) if (Object.hasOwn(data, key)) fields[key] = data[key];
+    if (event.type === 'response_observed' && typeof data.providerResponseIdDigest === 'string'
+      && /^[a-f0-9]{64}$/.test(data.providerResponseIdDigest)) {
+      fields.providerResponseIdDigest = data.providerResponseIdDigest;
+    }
     emit(fields);
   };
   return { observer, close(outcome) {

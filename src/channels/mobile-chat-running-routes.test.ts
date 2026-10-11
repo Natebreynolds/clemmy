@@ -23,10 +23,76 @@ mkdirSync(path.join(TMP_ROOT, 'state'), { recursive: true });
 const { createMobileRouter, MOBILE_SESSION_COOKIE } = await import('./mobile-routes.js');
 const { setPin } = await import('../runtime/mobile-pin.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
+const { claimSessionForAcceptedSource } = await import('../runtime/harness/accepted-source-session-branch.js');
 
 test.after(() => {
   eventlog.closeEventLog();
   try { rmSync(TMP_ROOT, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
+test('the phone keeps one Stop/Continue conversation while history and control cursors stay with their exact execution heads', async () => {
+  const stateDir = path.join(TMP_ROOT, 'continuity-case');
+  const app = express();
+  app.use(express.json());
+  app.use('/m', createMobileRouter({ stateDir, isAdminAuthorized: () => false }));
+  const server: Server = await new Promise(resolve => {
+    const s = createServer(app); s.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/m`;
+  const identity = { provider: 'mobile', scopeId: null, conversationId: 'fixture-phone-chat', audienceId: 'fixture-owner' };
+  const root = eventlog.createSession({ kind: 'chat', channel: 'mobile', userId: identity.audienceId,
+    title: 'Named stopped phone fixture', metadata: { source: 'mobile', channelId: identity.conversationId, userId: identity.audienceId } });
+  const claim = (entrySessionId: string, run: string, continuity = identity) => claimSessionForAcceptedSource({
+    kind: 'ordinary', entrySessionId, durableSourceId: run, continuity,
+    receipt: { requestId: `${run}-request`, runId: run, inputHash: run } });
+  claim(root.id, 'phone-root');
+  const rootAttempt = eventlog.beginRunAttempt(root.id, { runId: 'phone-root' });
+  const rootSource = eventlog.recordRunAttemptUserInput(rootAttempt, { turn: 1, role: 'user', data: { text: 'Keep this phone fixture draft.' } });
+  eventlog.appendEvent({ sessionId: root.id, turn: 1, role: 'Clem', type: 'conversation_completed',
+    data: { sourceUserSeq: rootSource.seq, reason: 'cancelled', reply: 'I stopped the phone fixture.' } });
+  eventlog.finishRunAttempt(rootAttempt, 'cancelled');
+  eventlog.updateSession(root.id, { status: 'cancelled' });
+  const head = claim(root.id, 'phone-continue').selection.sessionId;
+  const headAttempt = eventlog.beginRunAttempt(head, { runId: 'phone-continue' });
+  const headSource = eventlog.recordRunAttemptUserInput(headAttempt, { turn: 1, role: 'user', data: { text: 'Continue the retained phone fixture.' } });
+  const other = claim(root.id, 'phone-other-owner', { ...identity, audienceId: 'another-owner' }).selection.sessionId;
+  eventlog.appendEvent({ sessionId: other, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Other owner private fixture.' } });
+  try {
+    await setPin('TestPin1!', { stateDir });
+    const login = await fetch(`${base}/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: 'TestPin1!', deviceLabel: 'Continuity fixture phone' }) });
+    assert.equal(login.status, 200);
+    const raw = login.headers.get('set-cookie') ?? '';
+    const cookie = `${MOBILE_SESSION_COOKIE}=${raw.slice(raw.indexOf('=') + 1).split(';')[0]}`;
+    const get = async (url: string) => (await (await fetch(`${base}${url}`, { headers: { cookie } })).json()) as any;
+    const listed = (await get('/api/chat/sessions')).sessions;
+    const matches = listed.filter((row: { id: string }) => row.id === root.id || row.id === head);
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0].id, root.id);
+    assert.equal(matches[0].executionSessionId, head);
+    assert.equal(matches[0].running, true);
+    const detail = await get(`/api/chat/sessions/${root.id}?limit=1`);
+    assert.equal(detail.session.id, root.id);
+    assert.equal(detail.session.executionSessionId, head);
+    assert.ok(detail.events.every((event: { sessionId: string }) => event.sessionId === head));
+    assert.deepEqual(detail.history.map((group: { sessionId: string }) => group.sessionId), [root.id]);
+    assert.equal(detail.history[0].page.hasMore, true, 'history has its own raw cursor, even when the first row is private');
+    const ownHead = await get(`/api/chat/sessions/${head}`);
+    assert.equal(ownHead.session.id, root.id);
+    assert.equal(ownHead.latestSeq, eventlog.getLatestEventSeq(head));
+    assert.equal((await get(`/api/chat/sessions/${root.id}/control?sourceUserSeq=${rootSource.seq}`)).activeRun, null,
+      'a public root is not the new attempt');
+    assert.equal((await get(`/api/chat/sessions/${head}/control?sourceUserSeq=${headSource.seq}`)).activeRun.attemptId, headAttempt.attemptId);
+    assert.equal((await get(`/api/chat/sessions/${head}/control?sourceUserSeq=${rootSource.seq}`)).activeRun, null);
+    const separated = await get(`/api/chat/sessions/${other}`);
+    assert.equal(separated.history, undefined);
+    assert.equal(separated.session.id, other);
+    assert.doesNotMatch(JSON.stringify(detail), /Other owner private fixture/);
+    assert.equal(eventlog.getSession(root.id)?.status, 'cancelled');
+  } finally {
+    eventlog.finishRunAttempt(headAttempt, 'cancelled');
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
 });
 
 test('the phone list marks a conversation running while its run is in flight, and only then', async () => {

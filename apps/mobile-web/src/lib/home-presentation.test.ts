@@ -366,11 +366,12 @@ test('Home leads with the presenter and prints no count it did not render', () =
   const home = read('../screens/Home.tsx');
   assert.match(home, /const lead = homeLead\(\{/, 'the lead is computed, not written inline');
   assert.match(home, /class="home-lead-head">\{lead\.headline\}/, 'and it is the headline');
-  assert.match(home, /<p class="home-lead-eyebrow">\{greeting\}<\/p>/,
-    'the greeting is an eyebrow, not the largest type on the screen');
+  assert.match(home, /<p class="home-greeting">\{greeting\}<\/p>/,
+    'the greeting remains a quiet personal detail');
+  assert.ok(home.indexOf('class="home-lead-head"') < home.indexOf('class="home-greeting"'), 'the current state precedes the greeting');
 
   assert.match(home, /const needsPane = homeNeedsYouPane\(\{/);
-  assert.match(home, /needs_you: \(\) => \(needsPane\.show \?/,
+  assert.match(home, /\{needsPane\.show \? \(/,
     'a card with no rows is never mounted');
   assert.match(home, /class="section-count">\{pane\.count\}/,
     'the pane header prints the rows it rendered');
@@ -438,6 +439,6 @@ test('the header row is fed by the chrome rule, and Home is handed the age the p
   assert.match(css, /\.home-lead-attention/,
     'a run waiting on you reads as a demand, like the other two');
   assert.match(css, /\.home-lead-say \{/, 'and the live region is laid out, not left to collapse');
-  assert.doesNotMatch(css, /\.home-greet|\.home-status \{|\.qa-chip-add|\.home-skeleton/,
+  assert.doesNotMatch(css, /\.home-greet\s*\{|\.home-status \{|\.qa-chip-add|\.home-skeleton/,
     'dead chrome styles are deleted, not left behind');
 });

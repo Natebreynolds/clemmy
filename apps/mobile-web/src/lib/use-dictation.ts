@@ -1,82 +1,53 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { haptic } from './native-bridge';
-
-/** The minimal slice of the Web Speech API this hook uses. */
-interface SpeechRecognitionLike {
-  lang: string;
-  interimResults: boolean;
-  continuous: boolean;
-  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>>; resultIndex: number }) => void) | null;
-  onend: (() => void) | null;
-  onerror: (() => void) | null;
-  start(): void;
-  stop(): void;
-  abort(): void;
-}
+import { BrowserDictationSession, type DictationPhase, type SpeechRecognitionLike } from './browser-dictation';
+import { appendDictationText, microphoneProblem } from './dictation-support';
 
 function speechRecognitionCtor(): (new () => SpeechRecognitionLike) | null {
-  const w = window as unknown as {
-    SpeechRecognition?: new () => SpeechRecognitionLike;
-    webkitSpeechRecognition?: new () => SpeechRecognitionLike;
-  };
+  if (typeof window === 'undefined') return null;
+  const w = window as unknown as { SpeechRecognition?: new () => SpeechRecognitionLike; webkitSpeechRecognition?: new () => SpeechRecognitionLike };
   return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
 }
 
-/**
- * Dictation is offered only where the platform actually provides it.
- * A microphone that does nothing is a lie.
- */
-export function useDictation(draft: string, setDraft: (next: string) => void, onEnd?: () => void) {
-  const [listening, setListening] = useState(false);
-  const recognition = useRef<SpeechRecognitionLike | null>(null);
+/** Platform speech is used only on the existing fallback path, never on failure. */
+export function useDictation(draft: string, setDraft: (next: string) => void, onEnd?: () => void, isCurrent: () => boolean = () => true) {
+  const [phase, setPhase] = useState<DictationPhase>('idle');
+  const [error, setError] = useState<string | null>(null);
+  const recognition = useRef<BrowserDictationSession | null>(null);
   const [available] = useState(() => speechRecognitionCtor() !== null);
-  const onEndRef = useRef(onEnd);
-  onEndRef.current = onEnd;
+  const current = useRef({ draft, setDraft, onEnd, isCurrent });
+  current.current = { draft, setDraft, onEnd, isCurrent };
+  const mounted = useRef(true);
 
-  useEffect(() => () => { recognition.current?.abort(); }, []);
-
-  const stop = () => {
-    recognition.current?.stop();
+  const cancel = () => {
+    recognition.current?.cancel();
+    recognition.current = null;
+    if (mounted.current) { setPhase('idle'); setError(null); }
   };
-
+  useEffect(() => () => { mounted.current = false; recognition.current?.cancel(); recognition.current = null; }, []);
+  const stop = () => { recognition.current?.stop(); };
   const toggle = () => {
-    if (listening) {
-      stop();
-      return;
-    }
+    if (recognition.current) { stop(); return; }
     const Ctor = speechRecognitionCtor();
-    if (!Ctor) return;
-    const rec = new Ctor();
-    rec.lang = navigator.language || 'en-US';
-    rec.interimResults = true;
-    rec.continuous = false;
-    const base = draft;
-    rec.onresult = (event) => {
-      let heard = '';
-      for (let i = event.resultIndex; i < event.results.length; i += 1) {
-        heard += event.results[i][0]?.transcript ?? '';
-      }
-      setDraft(`${base}${base && !base.endsWith(' ') ? ' ' : ''}${heard}`);
-    };
-    rec.onend = () => {
-      setListening(false);
-      recognition.current = null;
-      onEndRef.current?.();
-    };
-    rec.onerror = () => {
-      setListening(false);
-      recognition.current = null;
-    };
-    recognition.current = rec;
-    haptic('light');
-    setListening(true);
+    if (!Ctor || !current.current.isCurrent()) return;
+    setError(null);
+    let session: BrowserDictationSession;
+    const startedInOwner = current.current.isCurrent;
+    const owns = () => mounted.current && recognition.current === session && startedInOwner() && current.current.isCurrent();
     try {
-      rec.start();
-    } catch {
-      setListening(false);
-      recognition.current = null;
+      session = new BrowserDictationSession(new Ctor(), {
+        state: next => { if (owns()) setPhase(next); },
+        words: words => { if (owns()) current.current.setDraft(appendDictationText(current.current.draft, words)); },
+        error: message => { if (owns()) setError(message); },
+        end: () => { if (owns()) { recognition.current = null; current.current.onEnd?.(); } },
+      });
+      recognition.current = session;
+      haptic('light');
+      session.start(navigator.language || 'en-US');
+    } catch (failure) {
+      cancel();
+      setError(microphoneProblem(failure));
     }
   };
-
-  return { available, listening, toggle, stop };
+  return { available, listening: phase === 'recording', starting: phase === 'starting', transcribing: phase === 'transcribing', error, toggle, stop, cancel };
 }

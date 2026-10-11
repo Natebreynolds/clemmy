@@ -1233,9 +1233,9 @@ export function createSession(input: CreateSessionInput): SessionRow {
   return rowToSession(row);
 }
 
-export function getSession(sessionId: string): SessionRow | null {
+export function getSession(sessionId: string, options: { withoutConversationState?: boolean } = {}): SessionRow | null {
   const db = openEventLog();
-  const row = prepareCached(db, 'SELECT * FROM sessions WHERE id = ?').get(sessionId) as
+  const row = prepareCached(db, `SELECT ${options.withoutConversationState ? SESSION_COLUMNS_WITHOUT_STATE : '*'} FROM sessions WHERE id = ?`).get(sessionId) as
     | RawSessionRow
     | undefined;
   return row ? rowToSession(row) : null;
@@ -4776,6 +4776,24 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
   // back, so reverse the result. The caller can post-reverse if they
   // truly want newest-first.
   return options.desc ? mapped.reverse() : mapped;
+}
+
+/** Redeem a bounded, already-selected catalog window by its exact global keys.
+ * The session predicate is still required: a selected key grants no authority
+ * to read another session. Decode through the ordinary event reader so a
+ * malformed selected payload retains the same error behavior. */
+export function listEventsAtSequences(sessionId: string, sequences: readonly number[]): EventRow[] {
+  if (sequences.length === 0) return [];
+  if (sequences.length > 40 || sequences.some(seq => !Number.isSafeInteger(seq) || seq <= 0)) {
+    throw new Error('A selected catalog event window requires at most 40 positive sequence keys.');
+  }
+  const placeholders = sequences.map(() => '?').join(',');
+  // INTEGER PRIMARY KEY seeks avoid walking a sparse session range again.
+  // This does not depend on the optional per-type prefix index.
+  const rows = prepareCached(openEventLog(), `SELECT * FROM events NOT INDEXED
+    WHERE seq IN (${placeholders}) AND session_id = ? ORDER BY seq ASC`)
+    .all(...sequences, sessionId) as RawEventRow[];
+  return rows.map(rowToEvent);
 }
 
 /** The `tool_called` rows recorded under one call id in a session, oldest

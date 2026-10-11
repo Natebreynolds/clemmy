@@ -64,6 +64,39 @@ function ports(raw: unknown = proposal(), noul = 0.99) {
   };
 }
 
+test('valid clarification revisions retain missing or partial review token measurements without zero substitution', async () => {
+  for (const usage of [{}, { input_tokens: 204 }, { output_tokens: 1 }, { input_tokens: 0, output_tokens: 0 }]) {
+    const result = await proposeClarificationRevision(input, { ...ports(), evaluate: async () => ({
+      ok: true, model: 'jev-1.13.0', answers: { grounded_revision: { type: 'noul', noul: 0.99 } },
+      usage, decisionId: 'fixture-unknown-review-usage',
+    }) });
+    assert.equal(result.status, 'proposed', 'usage availability does not change a valid semantic verdict');
+    if (result.status !== 'proposed') continue;
+    assert.equal(result.revision.review.inputTokens, usage.input_tokens);
+    assert.equal(result.revision.review.outputTokens, usage.output_tokens);
+    assert.equal(Object.hasOwn(result.revision.review, 'inputTokens'), usage.input_tokens !== undefined);
+    assert.equal(Object.hasOwn(result.revision.review, 'outputTokens'), usage.output_tokens !== undefined);
+    assert.deepEqual(validatedClarificationRevision(input, JSON.parse(JSON.stringify(result.revision))), result.revision,
+      'unknown measurements survive exact receipt replay without weakening digest checks');
+  }
+});
+
+test('valid completeness verdicts retain missing or partial review token measurements without zero substitution', async () => {
+  for (const usage of [{}, { input_tokens: 31 }, { output_tokens: 1 }, { input_tokens: 0, output_tokens: 0 }]) {
+    const result = await checkClarificationAnswerCompleteness(input, async () => ({
+      ok: true, model: 'jev-1.13.0', answers: { complete_answer: { type: 'noul', noul: 0.99 } },
+      usage, decisionId: 'fixture-unknown-completeness-usage',
+    }));
+    assert.equal(result.status, 'complete');
+    if (result.status === 'unavailable') continue;
+    assert.equal(result.receipt.review.inputTokens, usage.input_tokens);
+    assert.equal(result.receipt.review.outputTokens, usage.output_tokens);
+    assert.equal(Object.hasOwn(result.receipt.review, 'inputTokens'), usage.input_tokens !== undefined);
+    assert.equal(Object.hasOwn(result.receipt.review, 'outputTokens'), usage.output_tokens !== undefined);
+    assert.deepEqual(validatedClarificationAnswerCompleteness(input, JSON.parse(JSON.stringify(result.receipt))), result);
+  }
+});
+
 const optionInput: ClarificationRevisionInput = {
   sessionId: 'fixture-compound-visible-options', sourceUserSeq: 91,
   rootTask: 'Prepare a local batch report only after the source, quantity, timing and RGL definition and trigger are known.',

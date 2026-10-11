@@ -2,6 +2,7 @@ import Combine
 import CryptoKit
 import SwiftUI
 import WebKit
+import WidgetKit
 
 enum PinnedWebNavigationDisposition: Equatable {
     case allowInWebView
@@ -199,6 +200,9 @@ final class WebViewModel: NSObject, ObservableObject {
     /// Deferred until the page is up so the bridge function exists.
     private var pendingApnsToken: String?
     private let pendingPushNavigations: PendingPushNavigationRepository
+    private let pendingWidgetNavigations: PendingWidgetNavigationRepository
+    private var inFlightWidgetID: UUID?
+    private var inFlightWidgetNavigation: WKNavigation?
     /// RootView owns this authorization bit. A successful web navigation while
     /// the app is backgrounded or covered by Face ID must not drain a tap.
     private var pendingPushNavigationAllowed = false
@@ -223,13 +227,21 @@ final class WebViewModel: NSObject, ObservableObject {
 
     init(
         pairing: Pairing,
-        pendingPushNavigations: PendingPushNavigationRepository = PendingPushNavigationStore.repository
+        pendingPushNavigations: PendingPushNavigationRepository = PendingPushNavigationStore.repository,
+        pendingWidgetNavigations: PendingWidgetNavigationRepository = .shared
     ) {
         self.pairing = pairing
         self.pendingPushNavigations = pendingPushNavigations
+        self.pendingWidgetNavigations = pendingWidgetNavigations
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
+        // Spoken replies arrive after transcription and chat requests. WebKit's
+        // audio gesture gate also governs speechSynthesis, so an earlier
+        // AudioContext resume alone does not admit that later utterance.
+        // Video retains its gesture requirement; microphone permission and the
+        // paired main-frame capture policy below remain independent.
+        config.mediaTypesRequiringUserActionForPlayback = .video
         config.userContentController.addUserScript(WKUserScript(
             source: "window.clemArtifactFiles = true;",
             injectionTime: .atDocumentStart,
@@ -247,6 +259,9 @@ final class WebViewModel: NSObject, ObservableObject {
             "clemHandoffResult",
             "clemConnectionLost",
             "clemNotificationHandled",
+            "clemWidgetNavigationHandled",
+            "clemWidgetNavigationReady",
+            "clemWidgetSpace",
         ] {
             config.userContentController.add(scriptProxy, name: name)
         }
@@ -290,13 +305,15 @@ final class WebViewModel: NSObject, ObservableObject {
         #endif
     }
 
-    func load(_ url: URL, pendingPushNotificationID: String? = nil) {
+    func load(_ url: URL, pendingPushNotificationID: String? = nil, pendingWidgetID: UUID? = nil) {
         connectionLost = false
         lastRequestedURL = url
         let navigation = webView.load(URLRequest(url: url))
+        inFlightWidgetID = navigation == nil ? nil : pendingWidgetID
+        inFlightWidgetNavigation = pendingWidgetID == nil ? nil : navigation
         inFlightPushNotificationID = navigation == nil ? nil : pendingPushNotificationID
         inFlightPushNavigation = pendingPushNotificationID == nil ? nil : navigation
-        if pendingPushNotificationID == nil {
+        if pendingPushNotificationID == nil && pendingWidgetID == nil {
             connectionRouteReady = false
             connectionRouteNavigation = navigation
         }
@@ -547,6 +564,8 @@ final class WebViewModel: NSObject, ObservableObject {
             // while the process stayed warm behind the privacy cover.
             inFlightPushNotificationID = nil
             inFlightPushNavigation = nil
+            inFlightWidgetID = nil
+            inFlightWidgetNavigation = nil
         }
     }
 
@@ -560,6 +579,8 @@ final class WebViewModel: NSObject, ObservableObject {
             connectionRouteNavigation = nil
             inFlightPushNotificationID = nil
             inFlightPushNavigation = nil
+            inFlightWidgetID = nil
+            inFlightWidgetNavigation = nil
         }
     }
 
@@ -567,6 +588,7 @@ final class WebViewModel: NSObject, ObservableObject {
     /// LAN/relay navigation resets that fence through `load`, while the durable
     /// envelope survives and is retried after the new door serves a page.
     func resumePendingPushNavigation() {
+        if resumePendingWidgetNavigation() { return }
         guard pendingPushNavigationAllowed,
               connectionRouteReady,
               hasLoadedOnce,
@@ -581,6 +603,66 @@ final class WebViewModel: NSObject, ObservableObject {
             return
         }
         load(url, pendingPushNotificationID: pending.notificationID)
+    }
+
+    /// Shares the biometric/connection gates with push delivery. A pending
+    /// widget remains parked across cold starts until the exact page receipt.
+    @discardableResult
+    private func resumePendingWidgetNavigation() -> Bool {
+        guard pendingPushNavigationAllowed, connectionRouteReady, hasLoadedOnce,
+              let fingerprint = pairing.fingerprint,
+              let pending = pendingWidgetNavigations.current(pairingFingerprint: fingerprint) else { return false }
+        guard pending.id != inFlightWidgetID else { return true }
+        guard let path = pending.path, let url = pairedNavigationURL(path: path) else { return false }
+        if let currentURL = webView.url,
+           PinnedWebNavigationPolicy.disposition(for: currentURL, pairing: pairing, userInitiated: false) == .allowInWebView,
+           let data = try? JSONSerialization.data(withJSONObject: ["path": path, "navigationId": pending.id.uuidString]),
+           let json = String(data: data, encoding: .utf8) {
+            // Keep the same document so unsent text, staged files and selected
+            // artifact context survive a warm widget tap. The exact landing
+            // receipt still owns consumption of the persisted intent.
+            inFlightWidgetID = pending.id
+            inFlightWidgetNavigation = nil
+            lastRequestedURL = url
+            webView.evaluateJavaScript("Boolean(window.clemNative && window.clemNative.openWidgetRoute && window.clemNative.openWidgetRoute(\(json)))") { [weak self] handled, error in
+                guard let self, self.pendingPushNavigationAllowed, self.connectionRouteReady,
+                      self.inFlightWidgetID == pending.id,
+                      self.pendingWidgetNavigations.current(pairingFingerprint: fingerprint)?.id == pending.id else { return }
+                if error != nil || (handled as? Bool) != true {
+                    // A disappearing/suspended page is uncertain. Keep the
+                    // intent parked for the next successful foreground.
+                    self.inFlightWidgetID = nil
+                }
+            }
+        } else {
+            load(url, pendingWidgetID: pending.id)
+        }
+        return true
+    }
+
+    @discardableResult
+    func acknowledgePendingWidgetNavigation(id: UUID) -> Bool {
+        guard pendingPushNavigationAllowed, connectionRouteReady, inFlightWidgetID == id,
+              let fingerprint = pairing.fingerprint,
+              pendingWidgetNavigations.acknowledge(id: id, pairingFingerprint: fingerprint) else { return false }
+        inFlightWidgetID = nil
+        inFlightWidgetNavigation = nil
+        return true
+    }
+
+    fileprivate func storeWidgetSpace(_ body: [String: Any]) {
+        guard let requestID = body["requestId"] as? String, UUID(uuidString: requestID) != nil else { return }
+        var reply: [String: Any] = ["requestId": requestID, "ok": false]
+        if Set(body.keys) == Set(["requestId", "clear"]), body["clear"] as? Bool == true {
+            ClemWidgetSpaceStore.shared.clear()
+            reply["ok"] = true
+        } else if pendingPushNavigationAllowed, let snapshot = ClemWidgetSpace.parse(body), ClemWidgetSpaceStore.shared.save(snapshot) {
+            reply["ok"] = true
+            reply["slug"] = snapshot.slug
+        }
+        if reply["ok"] as? Bool == true { WidgetCenter.shared.reloadAllTimelines() }
+        guard let data = try? JSONSerialization.data(withJSONObject: reply), let json = String(data: data, encoding: .utf8) else { return }
+        webView.evaluateJavaScript("window.clemNative && window.clemNative.widgetSpaceStored && window.clemNative.widgetSpaceStored(\(json))")
     }
 
     /// The page sends this only after it rendered/focused the addressed card or
@@ -606,7 +688,11 @@ final class WebViewModel: NSObject, ObservableObject {
     }
 
     private func pendingPushURL(for pending: PendingPushNavigation) -> URL? {
-        guard let route = URLComponents(string: pending.path),
+        pairedNavigationURL(path: pending.path)
+    }
+
+    private func pairedNavigationURL(path: String) -> URL? {
+        guard let route = URLComponents(string: path),
               var target = URLComponents(string: pairing.origin) else {
             return nil
         }
@@ -636,6 +722,9 @@ final class WebViewModel: NSObject, ObservableObject {
     }
 
     private func finishPendingPushNavigation(_ navigation: WKNavigation?) {
+        if let navigation, let inFlightWidgetNavigation, navigation === inFlightWidgetNavigation {
+            self.inFlightWidgetNavigation = nil
+        }
         guard let navigation,
               let inFlightPushNavigation,
               navigation === inFlightPushNavigation else {
@@ -657,6 +746,10 @@ final class WebViewModel: NSObject, ObservableObject {
     }
 
     private func failPendingPushNavigation(_ navigation: WKNavigation?) {
+        if let navigation, let inFlightWidgetNavigation, navigation === inFlightWidgetNavigation {
+            self.inFlightWidgetNavigation = nil
+            inFlightWidgetID = nil
+        }
         guard let navigation,
               let inFlightPushNavigation,
               navigation === inFlightPushNavigation else {
@@ -1064,6 +1157,25 @@ private final class ScriptProxy: NSObject, WKScriptMessageHandler {
             model?.acceptsBridgeMessage(message) == true
         }
         guard accepted else { return }
+
+        if message.name == "clemWidgetNavigationReady", message.body as? Bool == true {
+            MainActor.assumeIsolated { model?.resumePendingPushNavigation() }
+            return
+        }
+        if message.name == "clemWidgetSpace" {
+            guard let body = message.body as? [String: Any] else { return }
+            MainActor.assumeIsolated { model?.storeWidgetSpace(body) }
+            return
+        }
+        if message.name == "clemWidgetNavigationHandled" {
+            guard let body = message.body as? [String: Any],
+                  Set(body.keys) == Set(["navigationId", "outcome"]),
+                  let rawID = body["navigationId"] as? String, let id = UUID(uuidString: rawID),
+                  let outcome = body["outcome"] as? String,
+                  outcome == "presented" || outcome == "unavailable" else { return }
+            MainActor.assumeIsolated { _ = model?.acknowledgePendingWidgetNavigation(id: id) }
+            return
+        }
 
         if message.name == "clemConnectionLost" {
             MainActor.assumeIsolated {

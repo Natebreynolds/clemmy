@@ -9,6 +9,7 @@
  * call sensitive. More than one match is no match, so a card never shows the
  * wrong file. Nothing here writes.
  */
+import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -28,6 +29,8 @@ export interface SessionFileView {
   kind: SessionFileKind;
   bytes: number;
   modifiedAt: string;
+  /** SHA-256 of the complete stable bytes. Absent above the attachment cap. */
+  revision?: string;
   /** Text, markdown and HTML source, up to the shown limit. */
   text?: string;
   /** Static HTML preview with authored navigation removed. Original source is
@@ -278,35 +281,40 @@ export function listSessionFiles(sessionId: string): SessionFileView[] {
 
 /** What the panel shows for one saved file. */
 export function readSessionFile(sessionId: string, name: string, folder?: string | null, id?: string | null):
-  { ok: true; view: SessionFileView; file: string } | { ok: false; reason: 'file_not_found' } {
+  { ok: true; view: SessionFileView; file: string } | { ok: false; reason: 'file_not_found' | 'file_changed' } {
   const file = fileSavedBySession(sessionId, name, folder, id);
   if (!file) return { ok: false, reason: 'file_not_found' };
   let stat: ReturnType<typeof statSync>;
   try { stat = statSync(file); } catch { return { ok: false, reason: 'file_not_found' }; }
-  let kind = kindOf(file);
-  const view = fileView(file, stat);
+  // The shown text and its revision must describe the same bytes. Large files
+  // retain their bounded preview but cannot be selected as chat attachments.
+  const snapshot = stat.size <= LARGEST_SESSION_FILE_CONTENT_BYTES
+    ? readSessionFileContent(sessionId, name, folder, id) : null;
+  if (snapshot && !snapshot.ok) return { ok: false, reason: snapshot.reason === 'file_too_large' ? 'file_changed' : snapshot.reason };
+  let kind = snapshot?.ok ? snapshot.view.kind : kindOf(file);
+  const view = snapshot?.ok ? snapshot.view : fileView(file, stat);
   if (kind === 'markdown' || kind === 'text' || kind === 'html') {
     let start: Buffer;
-    try { start = readStart(file, Math.min(stat.size, LARGEST_SHOWN_TEXT_BYTES)); }
+    try { start = snapshot?.ok ? snapshot.content.subarray(0, LARGEST_SHOWN_TEXT_BYTES) : readStart(file, Math.min(stat.size, LARGEST_SHOWN_TEXT_BYTES)); }
     catch { return { ok: false, reason: 'file_not_found' }; }
     // A file named as text that holds binary data is shown as a file, not as text.
     if (start.subarray(0, 8192).includes(0)) kind = 'other';
     else {
       view.text = start.toString('utf8');
       if (kind === 'html') view.previewHtml = sessionFileHtmlPreview(view.text);
-      if (stat.size > LARGEST_SHOWN_TEXT_BYTES) view.truncated = true;
+      if (view.bytes > LARGEST_SHOWN_TEXT_BYTES) view.truncated = true;
     }
   }
-  if (kind === 'image' && stat.size > LARGEST_SHOWN_IMAGE_BYTES) kind = 'other';
+  if (kind === 'image' && view.bytes > LARGEST_SHOWN_IMAGE_BYTES) kind = 'other';
   view.kind = kind;
-  return { ok: true, view, file };
+  return { ok: true, view, file: snapshot?.ok ? snapshot.file : file };
 }
 
 /** Authenticated surfaces fetch the bytes before creating their own local
  * preview URL. Unknown types are download-only, never interpreted as HTML. */
 export function readSessionFileContent(sessionId: string, name: string, folder?: string | null, id?: string | null):
-  { ok: true; view: SessionFileView; content: Buffer; mimeType: string } |
-  { ok: false; reason: 'file_not_found' | 'file_too_large' } {
+  { ok: true; view: SessionFileView; file: string; content: Buffer; mimeType: string } |
+  { ok: false; reason: 'file_not_found' | 'file_too_large' | 'file_changed' } {
   const file = fileSavedBySession(sessionId, name, folder, id);
   if (!file) return { ok: false, reason: 'file_not_found' };
   let fd: number | undefined;
@@ -322,15 +330,23 @@ export function readSessionFileContent(sessionId: string, name: string, folder?:
       if (!read) break;
       bytes += read;
     }
-    if (fstatSync(fd).size > LARGEST_SESSION_FILE_CONTENT_BYTES) return { ok: false, reason: 'file_too_large' };
+    const after = fstatSync(fd);
+    if (after.size > LARGEST_SESSION_FILE_CONTENT_BYTES) return { ok: false, reason: 'file_too_large' };
+    const current = statSync(file);
+    if (bytes !== stat.size || realpathSync(file) !== file
+      || [after, current].some(check => check.dev !== stat.dev || check.ino !== stat.ino
+        || check.size !== stat.size || check.mtimeMs !== stat.mtimeMs || check.ctimeMs !== stat.ctimeMs)) {
+      return { ok: false, reason: 'file_changed' };
+    }
     const content = buffer.subarray(0, bytes);
     const view = fileView(file, stat);
+    view.revision = `sha256:${createHash('sha256').update(content).digest('hex')}`;
     if (['markdown', 'text', 'html'].includes(view.kind) && content.subarray(0, 8192).includes(0)) view.kind = 'other';
     const mimeType = view.kind === 'html' ? 'text/html; charset=utf-8'
       : view.kind === 'pdf' ? 'application/pdf'
         : view.kind === 'image' ? sessionFileImageType(file)!
           : view.kind === 'markdown' || view.kind === 'text' ? 'text/plain; charset=utf-8' : 'application/octet-stream';
-    return { ok: true, view, content, mimeType };
+    return { ok: true, view, file, content, mimeType };
   } catch {
     return { ok: false, reason: 'file_not_found' };
   } finally {

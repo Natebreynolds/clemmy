@@ -387,7 +387,7 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
           </div>
           <div className="border-t border-border p-2.5">
             <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
-            <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} placeholder="Ask a question or describe a change…" />
+            <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} draftSessionId={chat.conversationSessionId.current} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} placeholder="Ask a question or describe a change…" />
           </div>
         </aside>
       )}

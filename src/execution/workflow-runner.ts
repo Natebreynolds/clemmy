@@ -206,6 +206,8 @@ import {
   readWorkflowTriggerReceiptAcceptance,
   reconcileAwaitingCompiledWorkflowRunBindings,
   queueWorkflowGoalFollowUp,
+  withWorkflowContinueOwnership,
+  workflowContinueReceiptId,
   requeueWorkflowFromRun,
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
   type RequeueResult,
@@ -10103,14 +10105,79 @@ function goalFollowUpSeeded(workflowSlug: string, runId: string): boolean {
  *
  * Refused, in words the owner can act on, when a step that did not finish
  * may already have changed something, or a write's outcome is not settled:
- * re-running either could repeat it. Returns null when no completed step
- * changed anything, so the caller's whole-run retry applies.
+ * re-running either could repeat it. Recovery first resolves the durable
+ * successor of the exact Stop decision, including later stopped attempts.
  */
 export function continueWorkflowRunFromCheckpoint(
   sourceRunId: string,
   opts: { requestedFrom: string },
 ): RequeueResult | null {
   if (!/^[a-zA-Z0-9_.:-]+$/.test(sourceRunId)) return { status: 'not_found', message: 'That run was not found.' };
+  return withWorkflowContinueOwnership(sourceRunId, (actualRunId) =>
+    continueWorkflowRunFromOwnedCheckpoint(actualRunId, opts));
+}
+
+/** A never-approved declarative gate is an execution boundary, not a sent
+ * action. Certify that exact boundary before exempting an unfinished step from
+ * the completed-step write classifier. Quiet effect rows alone prove nothing:
+ * the admitted gate, its pending decision and its last execution event must
+ * agree, and no activation or mutation intent may have begun. The successor
+ * still asks for its own approval; this proof grants no execution authority. */
+function stoppedAtUntouchedDeclarativeGate(
+  record: QueuedRunRecord,
+  workflowSlug: string,
+  workflow: WorkflowDefinition,
+  stepId: string,
+): boolean {
+  try {
+    const cancellation = readWorkflowRunCancellation(record.id);
+    if (record.status !== 'cancelled' || !cancellation || record.heldExecution || record.mutationBlock
+      || record.cancelledAt !== cancellation.requestedAt || record.finishedAt !== cancellation.requestedAt) return false;
+    const admitted = resolveWorkflowRunDefinitionSnapshot(record.workflowDefinitionSnapshot);
+    if (admitted.status !== 'valid' || !isCatalogWorkflowRunDefinitionSnapshot(admitted.snapshot)
+      || admitted.snapshot.workflowSlug !== workflowSlug
+      || !workflowDefinitionMatchesSnapshotIgnoringEnabled(admitted.snapshot, workflow)) return false;
+    const step = admitted.snapshot.definition.steps.find((candidate) => candidate.id === stepId);
+    if (!step?.call || step.invocationPlan || step.forEach || step.deterministic || step.transform || step.subgraph
+      || !shouldUseDeclarativeStepApproval(admitted.snapshot.definition, step)) return false;
+    const events = readWorkflowEvents(workflowSlug, record.id).filter((event) => event.stepId === stepId);
+    const gate = events.filter((event) => event.kind === 'step_started').at(-1);
+    if (!gate || gate.meta?.gate !== 'awaiting_approval' || typeof gate.meta.approvalId !== 'string'
+      || events.some((event) => !['step_advisory', 'workflow_node_ready'].includes(event.kind) && !(event.kind === 'step_started'
+        && event.meta?.gate === 'awaiting_approval' && event.meta.approvalId === gate.meta?.approvalId))) return false;
+    const gateSessionId = `workflow-gate:${record.id}:${stepId}`;
+    const rows = approvalRegistry.listPending({ sessionId: gateSessionId, status: 'any' });
+    const row = rows.length === 1 ? rows[0] : undefined;
+    if (!row || row.approvalId !== gate.meta.approvalId || row.status !== 'pending'
+      || row.resolution || row.resolvedAt || row.consumedAt || row.tool !== 'workflow_approval_gate'
+      || row.args?.runId !== record.id || row.args.stepId !== stepId
+      || row.args.workflow !== admitted.snapshot.definition.name) return false;
+    const requestedAt = Date.parse(row.requestedAt);
+    const expiresAt = Date.parse(row.expiresAt);
+    const gateAt = Date.parse(gate.t);
+    const stoppedAt = Date.parse(cancellation.requestedAt);
+    const now = Date.now();
+    if (![requestedAt, expiresAt, gateAt, stoppedAt].every(Number.isFinite)
+      || requestedAt > gateAt || gateAt > stoppedAt || stoppedAt > now
+      || requestedAt > now || expiresAt <= requestedAt) return false;
+    const evidence = readSessionDispatchEvidence(`workflow:${record.id}:${stepId}`, { includeChildSessions: true });
+    // Any row in all three effect tables makes sessions nonzero, including
+    // returned dispatches with missing settlements. No completed write is erased.
+    if (evidence.sessions !== 0) return false;
+    const activations = openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM workflow_node_invocation_activations
+       WHERE workflow_id = ? AND run_id = ? AND node_id = ?
+    `).get(workflowSlug, record.id, stepId) as { n: number };
+    return activations.n === 0 && !workflowCallMutationSlotHasLedger({ workflowSlug, runId: record.id, stepId });
+  } catch {
+    return false;
+  }
+}
+
+function continueWorkflowRunFromOwnedCheckpoint(
+  sourceRunId: string,
+  opts: { requestedFrom: string },
+): RequeueResult {
   const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${sourceRunId}.json`));
   const workflow = record
     ? listWorkflows().find((entry) => entry.data.name === record.workflow || entry.name === record.workflow)
@@ -10130,17 +10197,21 @@ export function continueWorkflowRunFromCheckpoint(
     completedStepIds: stepIds,
     sideEffectOf: stepSideEffectClass,
   });
-  const done = readFacts(completed);
+  const observedDone = readFacts(completed);
   // A step that started but did not finish runs again, so it must not have
   // changed anything yet.
-  const unfinished = readFacts(new Set([...resume.inFlightStepIds].filter((stepId) => !completed.has(stepId))));
-  if (!done.available || !unfinished.available) {
+  const unfinished = readFacts(new Set([...resume.inFlightStepIds, ...resume.failedSteps].filter((stepId) => !completed.has(stepId))));
+  if (!observedDone.available || !unfinished.available) {
     return refuse('Its record of what each step changed can\'t be read; nothing was re-run.');
   }
-  const unsettled = done.steps.find((step) => step.disposition === 'uncertain');
+  // Inspect the current attempt before applying carried facts; lineage must
+  // never turn a new unresolved dispatch into a confirmed earlier write.
+  const unsettled = observedDone.steps.find((step) => step.disposition === 'uncertain');
   if (unsettled) return refuse(`Step "${unsettled.stepId}" has a change whose outcome isn't confirmed, so continuing could repeat it.`);
-  const partial = unfinished.steps.find((step) => step.disposition !== 'none');
+  const guardedUnfinished = unfinished.steps.filter((step) => step.disposition !== 'none');
+  const partial = guardedUnfinished.find((step) => !stoppedAtUntouchedDeclarativeGate(record, workflow.name, workflow.data, step.stepId));
   if (partial) return refuse(`Step "${partial.stepId}" stopped partway and may already have changed something, so it can't safely run again.`);
+  const done = applyGoalFollowUpLineage(observedDone, normalizeWorkflowGoalFollowUpLineage(record.goalFollowUp));
   const carried = new Map<string, 'landed' | 'sent'>();
   for (const step of done.steps) {
     if (step.disposition === 'sent') carried.set(step.stepId, 'sent');
@@ -10167,20 +10238,37 @@ export function continueWorkflowRunFromCheckpoint(
   } catch {
     return refuse('Its record of what each step changed can\'t be read; nothing was re-run.');
   }
-  if (carried.size === 0) return null;
-  return queueWorkflowGoalFollowUp(sourceRunId, {
-    lineage: {
-      fromRunId: sourceRunId,
-      carriedSteps: [...carried].map(([stepId, disposition]) => ({ stepId, disposition })),
-      continuedStepIds: [],
-    },
-    goalAttempt: record.goalAttempt ?? 0,
-    goalFeedback: '',
-    // The runner's own record is the authority that this run has settled; a
-    // finished blocked run is as final as a cancelled one.
-    sourceExecutionSettled: TERMINAL_RUN_RECORD_STATUSES.has(record.status ?? '') && Boolean(record.finishedAt),
-    recoveryIntent: { kind: 'safe_rerun', requestedFrom: opts.requestedFrom, reason: 'continue from where the run stopped' },
-  });
+  const enqueue = (): RequeueResult => {
+    if (carried.size === 0) return requeueWorkflowFromRun(sourceRunId, {
+      source: opts.requestedFrom,
+      triggerReceiptId: workflowContinueReceiptId(sourceRunId),
+      sourceExecutionSettled: TERMINAL_RUN_RECORD_STATUSES.has(record.status ?? '') && Boolean(record.finishedAt),
+      recoveryIntent: { kind: 'safe_rerun', sourceRunId, requestedFrom: opts.requestedFrom, reason: 'continue from where the run stopped' },
+    });
+    return queueWorkflowGoalFollowUp(sourceRunId, {
+      lineage: {
+        fromRunId: sourceRunId,
+        carriedSteps: [...carried].map(([stepId, disposition]) => ({ stepId, disposition })),
+        continuedStepIds: [],
+      },
+      goalAttempt: record.goalAttempt ?? 0,
+      goalFeedback: '',
+      continueFromCheckpoint: true,
+      // The runner's own record is the authority that this run has settled; a
+      // finished blocked run is as final as a cancelled one.
+      sourceExecutionSettled: TERMINAL_RUN_RECORD_STATUSES.has(record.status ?? '') && Boolean(record.finishedAt),
+      recoveryIntent: { kind: 'safe_rerun', requestedFrom: opts.requestedFrom, reason: 'continue from where the run stopped' },
+    });
+  };
+  if (guardedUnfinished.length === 0) return enqueue();
+  // Recheck before admission. A later decision on the old gate cannot revive
+  // its immutably cancelled occurrence, and cannot authorize the successor's
+  // fresh exact gate. No decision authority transfers with this certificate.
+  const latest = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${sourceRunId}.json`));
+  if (!latest || guardedUnfinished.some((step) => !stoppedAtUntouchedDeclarativeGate(latest, workflow.name, workflow.data, step.stepId))) {
+    return refuse('The stopped approval gate changed before continuing; nothing was re-run.');
+  }
+  return enqueue();
 }
 
 /**

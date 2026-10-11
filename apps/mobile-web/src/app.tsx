@@ -63,13 +63,22 @@ import { Settings } from './screens/Settings';
 import { describeThisDevice } from './lib/device-name';
 import { Inbox } from './screens/Inbox';
 import type { ChatHandoff } from './screens/Chats';
+import { mobileDrafts } from './lib/file-context';
 import { DrawerRecents } from './components/DrawerRecents';
 import { greetingName } from './lib/greeting';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
 import { AskCapsule } from './components/AskCapsule';
 import { CustomizeSheet } from './components/CustomizeSheet';
+import { MobileNavigationProvider } from './lib/mobile-navigation';
+import { NavigationMenuButton } from './components/NavigationMenuButton';
+import { useMobileViewportVariables } from './lib/use-keyboard-inset';
+import { mobileChatLocation } from './lib/chat-location';
+import { installNativeVoiceBridge } from './lib/native-voice-bridge';
+import { composeModeFromSearch, consumeComposeSearch } from './lib/compose-route';
+import { saveWidgetSpace, widgetAvailable, widgetNavigationFromSearch, WIDGET_ROUTE_EVENT } from './lib/widget-bridge';
 
 export function App() {
+  useMobileViewportVariables();
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
   const [pairing, setPairing] = useState(false);
@@ -89,20 +98,20 @@ export function App() {
   const [agentId, setAgentId] = useState<string | null>(() => agentFromSearch(window.location.search));
   // The header's "+" door asks the open list screen to start a new one.
   const [createRequest, setCreateRequest] = useState(0);
-  // The title is the navigator: tapping it opens the switcher sheet. The
-  // full section menu (the left drawer) stays behind "More".
-  // A rightward swipe across the header opens the menu.
+  // The same drawer is reachable from this header and each detail header.
+  // A rightward swipe across the header also opens the menu.
   const headerSwipe = useRef<{ x: number; y: number; horizontal: boolean | null }>({ x: 0, y: 0, horizontal: null });
   const [customizeOpen, setCustomizeOpen] = useState(false);
   // Left drawer (owner directive 2026-08-25): sections live in a slide-in
   // menu, never a bottom dock — content gets the full height.
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [detailHeaderOwned, setDetailHeaderOwned] = useState(false);
   // 'closing' keeps the drawer mounted through its exit animation — an
   // instant unmount is the one visible tell next to a native drawer.
   const [drawerClosing, setDrawerClosing] = useState(false);
   const drawerClosingRef = useRef(false);
   const drawerCloseTimer = useRef<number | null>(null);
-  const titleBtnRef = useRef<HTMLButtonElement | null>(null);
+  const drawerOpenerRef = useRef<HTMLElement | null>(null);
   const routeTitleRef = useRef<HTMLHeadingElement | null>(null);
   const routeTitleMounted = useRef(false);
   const drawerRef = useRef<HTMLElement | null>(null);
@@ -118,11 +127,20 @@ export function App() {
   /** False the moment a poll fails or the worker answers off its shelf. */
   const [decisionsLive, setDecisionsLive] = useState(false);
   /** Set when Home hands a question to Chats — consumed once on arrival. */
-  const [handoff, setHandoff] = useState<ChatHandoff | null>(null);
+  const [handoff, setHandoff] = useState<ChatHandoff | null>(() => {
+    const composeMode = composeModeFromSearch(window.location.search);
+    return composeMode ? { composeMode } : null;
+  });
   /** The Chats LIST is a capsule surface; an open thread has its own composer. */
   const [chatsListVisible, setChatsListVisible] = useState(false);
   const [door, setDoor] = useState<ConnectionDoor>(connectionDoor() ?? 'direct');
   const authenticated = Boolean(authStatus?.authenticated);
+  useEffect(() => authenticated ? installNativeVoiceBridge() : undefined, [authenticated]);
+  useEffect(() => { if (authStatus && !authenticated) {
+    mobileDrafts.clear(); mobileChatLocation.clear();
+    window.webkit?.messageHandlers?.clemNativeVoiceClear?.postMessage(true);
+    if (widgetAvailable()) void saveWidgetSpace(null).catch(() => undefined);
+  } }, [authenticated, authStatus !== null]);
   /** Reads the ONE Needs-you count again; set by the poll that owns it. */
   const recountNeedsYou = useRef<() => void>(() => undefined);
 
@@ -222,8 +240,9 @@ export function App() {
   useEffect(() => {
     const slug = workspaceFromSearch(window.location.search);
     if (!slug || !workspaceColdOpenNeedsParent(window.location.search, window.history.state)) return;
+    const widgetNavigation = widgetNavigationFromSearch(window.location.search);
     window.history.replaceState(null, '', `${window.location.pathname}?tab=spaces`);
-    window.history.pushState({ clemWorkspace: slug }, '', mobileWorkspacePath(slug));
+    window.history.pushState({ clemWorkspace: slug }, '', `${mobileWorkspacePath(slug)}${widgetNavigation ? `&widgetNavigation=${widgetNavigation}` : ''}`);
   }, []);
 
   // Push/native navigation can replace the URL while this shell is alive.
@@ -236,10 +255,36 @@ export function App() {
       setRunId(runFromSearch(window.location.search));
       setProjectId(projectFromSearch(window.location.search));
       setAgentId(agentFromSearch(window.location.search));
+      const composeMode = composeModeFromSearch(window.location.search);
+      if (composeMode) setHandoff({ composeMode });
     };
     window.addEventListener('popstate', syncLocation);
-    return () => window.removeEventListener('popstate', syncLocation);
-  }, []);
+    const widgetRoute = (event: Event) => {
+      if (!authenticated) return;
+      const { path } = (event as CustomEvent<{ path: string }>).detail;
+      event.preventDefault();
+      userNavigated.current = true;
+      window.history.pushState(null, '', path);
+      setDrawerOpen(false);
+      syncLocation();
+    };
+    window.addEventListener(WIDGET_ROUTE_EVENT, widgetRoute);
+    const nativeConversation = (event: Event) => {
+      if (!authenticated) return;
+      const sessionId = (event as CustomEvent<{ sessionId: string }>).detail?.sessionId;
+      if (typeof sessionId !== 'string' || !/^[a-zA-Z0-9:_-]{1,200}$/.test(sessionId)) return;
+      event.preventDefault();
+      userNavigated.current = true;
+      setDrawerOpen(false); setTab('chats'); setHandoff({ sessionId });
+    };
+    window.addEventListener('clem:native-voice-conversation', nativeConversation);
+    if (authenticated) window.webkit?.messageHandlers?.clemWidgetNavigationReady?.postMessage(true);
+    return () => {
+      window.removeEventListener('popstate', syncLocation);
+      window.removeEventListener(WIDGET_ROUTE_EVENT, widgetRoute);
+      window.removeEventListener('clem:native-voice-conversation', nativeConversation);
+    };
+  }, [authenticated]);
 
   // A place Clem links in a reply opens inside the app: the URL changes and
   // the same sync above moves the shell, with no page load.
@@ -586,12 +631,13 @@ export function App() {
     selectWorkspace(slug);
   };
 
-  const openDrawer = () => {
+  const openDrawer = (opener?: HTMLElement) => {
     if (drawerCloseTimer.current !== null) {
       window.clearTimeout(drawerCloseTimer.current);
       drawerCloseTimer.current = null;
     }
     drawerClosingRef.current = false;
+    drawerOpenerRef.current = opener ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     setDrawerClosing(false);
     setDrawerOpen(true);
   };
@@ -601,7 +647,7 @@ export function App() {
     drawerClosingRef.current = true;
     // End the modal contract immediately. The exiting pixels stay mounted,
     // but are hidden from assistive tech and cannot keep focus trapped.
-    if (restoreOpener) titleBtnRef.current?.focus();
+    if (restoreOpener && drawerOpenerRef.current?.isConnected) drawerOpenerRef.current.focus();
     setDrawerOpen(false);
     setDrawerClosing(true);
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -636,10 +682,10 @@ export function App() {
   const capsuleShown = tab === 'home' || tab === 'inbox' || (tab === 'chats' && chatsListVisible);
 
   return (
-    <>
+    <MobileNavigationProvider openNavigation={openDrawer} navigationOpen={drawerOpen} onDetailHeaderChange={setDetailHeaderOwned}>
       <header
         class="app-header"
-        hidden={tab === 'chats' && !chatsListVisible}
+        hidden={detailHeaderOwned}
         onTouchStart={(event) => {
           const t = event.touches[0];
           headerSwipe.current = { x: t.clientX, y: t.clientY, horizontal: null };
@@ -661,17 +707,7 @@ export function App() {
         }}
       >
         {/* ONE menu (owner 08-25, 09-26): the Clemmy mark is its handle. */}
-        <button
-          ref={titleBtnRef}
-          type="button"
-          class="menu-mark"
-          aria-label="Menu"
-          aria-haspopup="dialog"
-          aria-expanded={drawerOpen}
-          onClick={() => { haptic('light'); openDrawer(); }}
-        >
-          <img class="brand-mark" src="/m/clemmy.png" alt="" width="28" height="28" />
-        </button>
+        <NavigationMenuButton brand />
         <h1 ref={routeTitleRef} class="app-title" tabIndex={-1}>
           <span class="title-text">{TAB_TITLES[tab]}</span>
           {tab === 'inbox' && needsYou.show ? (
@@ -918,7 +954,12 @@ export function App() {
           ) : tab === 'chats' ? (
             <Chats
               handoff={handoff}
-              onHandoffConsumed={() => setHandoff(null)}
+              onHandoffConsumed={() => {
+                setHandoff(null);
+                if (composeModeFromSearch(window.location.search)) {
+                  window.history.replaceState(window.history.state, '', `${window.location.pathname}${consumeComposeSearch(window.location.search)}`);
+                }
+              }}
               onListVisibleChange={setChatsListVisible}
               onOpenRun={openRun}
               onOpenNeedsYou={() => navigateTo('inbox')}
@@ -989,7 +1030,7 @@ export function App() {
       </main>
 
       {capsuleShown ? <AskCapsule onAsk={(draft, attachments) => goToChat({ draft, attachments, autoSend: true })} /> : null}
-    </>
+    </MobileNavigationProvider>
   );
 }
 
@@ -1034,8 +1075,8 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
 };
 
 /** The places (owner 09-26, Projects added 09-29): everything else is reached from inside them or from the quiet rows. */
-const PRIMARY_TABS: ReadonlyArray<Tab> = ['home', 'inbox', 'projects', 'spaces', 'workflows', 'agents', 'memory'];
-// Conversations live in the menu's Recents, with the full list one tap away.
+const PRIMARY_TABS: ReadonlyArray<Tab> = ['home', 'chats', 'inbox', 'projects', 'spaces', 'workflows', 'agents', 'memory'];
+// Recents remain shortcuts; Chats is also a first-class section.
 const QUIET_TABS: ReadonlyArray<Tab> = ['activity'];
 
 const TAB_TITLES: Record<Tab, string> = {

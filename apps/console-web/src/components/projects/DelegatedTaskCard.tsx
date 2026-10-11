@@ -85,6 +85,9 @@ export function DelegatedTaskCard({
   const [answered, setAnswered] = useState<DelegatedTask | null>(null);
   const shown = answered && answered.taskId === task.taskId && answered.updatedAt >= task.updatedAt ? answered : task;
   const card = delegatedTaskCard(shown);
+  // A dismissed or stale question can briefly leave needs_you without a
+  // current approval. Do not present that gap as consent waiting to happen.
+  const next = card.next?.action === 'approve' && !card.approvalId ? null : card.next;
   // The task a correction to ended work became, until the list holds it.
   const [followUp, setFollowUp] = useState<DelegatedTask | null>(null);
   const listed = beside ?? [];
@@ -239,25 +242,25 @@ export function DelegatedTaskCard({
           <span className="shrink-0 text-caption font-semibold text-muted">{card.progress.label}</span>
         </div>
       )}
-      {card.next && (
+      {next && (
         <div className="mt-2.5 rounded-md bg-warning-tint px-3 py-2.5">
-          <p className="text-small text-fg">{card.next.text}</p>
+          <p className="text-small text-fg">{next.text}</p>
           <div className="mt-2 flex flex-wrap gap-1.5">
-            {card.next.action === 'resume' && card.controls.resume && (
+            {next.action === 'resume' && card.controls.resume && (
               <Button size="sm" className="h-8" disabled={busy !== null} onClick={() => { void run('resume', () => resumeTask(shown.taskId)); }}>
                 <Play className="h-3.5 w-3.5" aria-hidden /> {busy === 'resume' ? 'Resuming…' : 'Resume'}
               </Button>
             )}
-            {card.next.action === 'approve' && card.approvalId && (
+            {next.action === 'approve' && card.approvalId && (
               <Link to={`/inbox?tab=needs&select=${encodeURIComponent(card.approvalId)}`} className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-small font-semibold text-primary-fg hover:bg-primary-hover active:bg-primary-press">Review</Link>
             )}
             {card.controls.steer && (
               <Button
-                size="sm" variant={card.next.action === 'correct' ? 'primary' : 'secondary'} className="h-8" disabled={busy !== null}
+                size="sm" variant={next.action === 'correct' ? 'primary' : 'secondary'} className="h-8" disabled={busy !== null}
                 aria-expanded={panel === 'steer'} aria-controls={steerId}
                 onClick={() => setPanel((open) => (open === 'steer' ? null : 'steer'))}
               >
-                <CornerDownRight className="h-3.5 w-3.5" aria-hidden /> {card.next.action === 'correct' ? card.steer.control : 'Correct it first'}
+                <CornerDownRight className="h-3.5 w-3.5" aria-hidden /> {next.action === 'correct' ? card.steer.control : 'Correct it first'}
               </Button>
             )}
           </div>
@@ -364,14 +367,14 @@ export function DelegatedTaskCard({
         </div>
       )}
 
-      {((card.controls.steer && !card.next) || card.controls.stop || (card.controls.resume && card.next?.action !== 'resume') || hasDetails) && (
+      {((card.controls.steer && !next) || card.controls.stop || (card.controls.resume && next?.action !== 'resume') || hasDetails) && (
         <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
-          {card.controls.resume && card.next?.action !== 'resume' && (
+          {card.controls.resume && next?.action !== 'resume' && (
             <Button size="sm" variant="secondary" className="h-8" disabled={busy !== null} onClick={() => { void run('resume', () => resumeTask(shown.taskId)); }}>
               <Play className="h-3.5 w-3.5" aria-hidden /> {busy === 'resume' ? 'Resuming…' : 'Resume'}
             </Button>
           )}
-          {card.controls.steer && !card.next && (
+          {card.controls.steer && !next && (
             <Button
               size="sm" variant="secondary" className="h-8" disabled={busy !== null}
               aria-expanded={panel === 'steer'} aria-controls={steerId}

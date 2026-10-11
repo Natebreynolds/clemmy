@@ -15,6 +15,7 @@ import { parseStoredToolOutputJson } from '../runtime/harness/json-repair.js';
 import { listToolOutputCallIds } from '../runtime/harness/eventlog.js';
 import { describeJsonShape, resolveDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
+import { recordRetainedReaderProjection } from '../runtime/harness/retained-reader-projection-receipt.js';
 import { resolveRetainedOutputRead } from '../runtime/harness/retained-output-read.js';
 import { projectProviderResultEvidenceView } from '../runtime/harness/result-facts.js';
 import { describeMissingRetainedOutputForSession } from '../runtime/harness/retained-output-redirect.js';
@@ -179,7 +180,7 @@ function queryBoundRefusal(bound: QueryReplyBound, ctx: HarnessRunContext, callI
   if (!bound.charged) return null;
   if (bound.chars >= RecallBudget.QUERY_MIN_REPLY_BYTES && (ctx.recallBudget?.canServeQuery() ?? true)) return null;
   const refusal = ctx.recallBudget?.queryRefusal(RecallBudget.QUERY_MIN_REPLY_BYTES, callId);
-  return refusal ? textResult(`ERROR: ${refusal}`) : null;
+  return refusal ? textResult(`ERROR: ${refusal}`, { isError: true }) : null;
 }
 
 const QUERY_CONTINUATION_KEYS = [
@@ -269,7 +270,7 @@ function chargeQueryReply(ctx: HarnessRunContext, callId: string, bodyText: stri
   const refusal = bound.charged
     ? ctx.recallBudget?.consumeQueryBytes(Buffer.byteLength(bodyText, 'utf8'), callId)
     : null;
-  return refusal ? textResult(`ERROR: ${refusal}`) : textResult(bodyText, { maxChars: bodyText.length });
+  return refusal ? textResult(`ERROR: ${refusal}`, { isError: true }) : textResult(bodyText, { maxChars: bodyText.length });
 }
 
 /** Zod shapes exported so the tool-call-hint pin can validate every emitted
@@ -425,7 +426,7 @@ type RetainedTextSlice =
   | { status: 'missing' }
   | { status: 'incomplete'; contentBytes: number }
   | { status: 'budget'; error: string }
-  | { status: 'ok'; body: string };
+  | { status: 'ok'; body: string; range: { start: number; end: number; total: number } };
 
 /**
  * One verbatim slice of a retained output, with the header that names the
@@ -493,7 +494,7 @@ function readRetainedTextSlice(
   ]
     .filter(Boolean)
     .join(' • ');
-  return { status: 'ok', body: `${header}\n\n${slice}` };
+  return { status: 'ok', body: `${header}\n\n${slice}`, range: { start: sliceStart, end, total } };
 }
 
 /** Whether a tool_output_query asks for record shaping (a projection, filter,
@@ -529,11 +530,12 @@ export function registerRecallTools(server: McpServer): void {
         : 0;
       if (!ctx?.sessionId) {
         return textResult(
-          'recall_tool_result is only available within a harness-managed turn. (No active session context.)',
+          'recall_tool_result is only available within a harness-managed turn. (No active session context.)', { isError: true },
         );
       }
 
-      const resolved = resolveRetainedOutputRead(ctx.sessionId, callId);
+      const resolved = resolveRetainedOutputRead(ctx.sessionId, callId,
+        ctx.sourceUserSeq ? { sourceUserSeq: ctx.sourceUserSeq, attemptId: ctx.runAttemptId } : undefined);
       callId = resolved.callId;
       const read = readRetainedTextSlice(ctx, resolved, offset, maxChars);
       if (read.status === 'missing') {
@@ -545,16 +547,17 @@ export function registerRecallTools(server: McpServer): void {
           sourceUserSeq: ctx.sourceUserSeq,
           requestedId: callId,
           readerTool: 'recall_tool_result',
-        }));
+        }), { isError: true });
       }
       if (read.status === 'incomplete') {
         return textResult(
-          `ERROR: tool output "${callId}" is incomplete (${read.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks). Re-read/page the provider source or stage a complete artifact; the stored prefix cannot be recalled as authoritative data.`,
+          `ERROR: tool output "${callId}" is incomplete (${read.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks). Re-read/page the provider source or stage a complete artifact; the stored prefix cannot be recalled as authoritative data.`, { isError: true },
         );
       }
       // Unmistakably an ERROR, never data: a program must not JSON.parse a
       // budget message and call good data malformed.
-      if (read.status === 'budget') return textResult(`ERROR: ${read.error}`);
+      if (read.status === 'budget') return textResult(`ERROR: ${read.error}`, { isError: true });
+      recordRetainedReaderProjection({ toolName: 'recall_tool_result', args: input, resolved, scope: ctx, body: read.body, range: read.range });
       return textResult(read.body, { maxChars: read.body.length });
     },
   );
@@ -576,20 +579,32 @@ export function registerRecallTools(server: McpServer): void {
       let callId = String(input.call_id ?? '');
       const ctx = harnessRunContextStorage.getStore();
       if (!ctx?.sessionId) {
-        return textResult('tool_output_query is only available within a harness-managed turn. (No active session context.)');
+        return textResult('tool_output_query is only available within a harness-managed turn. (No active session context.)', { isError: true });
       }
       // Counting historical queries cannot prove that every record was seen.
       // Keep the existing run/read budgets, but do not deny a valid projection
       // just because a different turn or failed field lookup used this result.
-      const resolved = resolveRetainedOutputRead(ctx.sessionId, callId);
+      const resolved = resolveRetainedOutputRead(ctx.sessionId, callId,
+        ctx.sourceUserSeq ? { sourceUserSeq: ctx.sourceUserSeq, attemptId: ctx.runAttemptId } : undefined);
       callId = resolved.callId;
+      const queryReply = (body: string, bound: QueryReplyBound, selectionComplete = false, selection?: Record<string, unknown>) => {
+        const reply = chargeQueryReply(ctx, callId, body, bound);
+        if (reply.isError !== true) recordRetainedReaderProjection({ toolName: 'tool_output_query', args: input,
+          resolved, scope: ctx, body, selectionComplete, selection });
+        return reply;
+      };
+      const queryText = (body: string, selectionComplete = false, selection?: Record<string, unknown>) => {
+        recordRetainedReaderProjection({ toolName: 'tool_output_query', args: input, resolved, scope: ctx,
+          body, selectionComplete, selection });
+        return textResult(body, { maxChars: body.length });
+      };
       const row = resolved.receipt ?? getToolOutput(ctx.sessionId, callId);
       if (!row) {
         const suggestion = nearestToolOutputCallId(callId, listToolOutputCallIds(ctx.sessionId));
         if (suggestion) {
           return textResult(
             `No tool output found for call_id "${callId}". Did you mean "${suggestion}"? `
-              + 'Re-run this query with that exact id.',
+              + 'Re-run this query with that exact id.', { isError: true },
           );
         }
         // Not a typo of a real id. Say what the id IS (a capability reference
@@ -600,11 +615,11 @@ export function registerRecallTools(server: McpServer): void {
           sourceUserSeq: ctx.sourceUserSeq,
           requestedId: callId,
           readerTool: 'tool_output_query',
-        }));
+        }), { isError: true });
       }
       if (row.truncatedAtWrite) {
         return textResult(
-          `ERROR: tool output "${callId}" is incomplete (${row.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks). Re-read/page the provider source or stage a complete artifact; the stored prefix cannot be queried as authoritative data.`,
+          `ERROR: tool output "${callId}" is incomplete (${row.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks). Re-read/page the provider source or stage a complete artifact; the stored prefix cannot be queried as authoritative data.`, { isError: true },
         );
       }
       // One canonical recovery for every reader of a parked output. The store
@@ -621,13 +636,14 @@ export function registerRecallTools(server: McpServer): void {
           const read = readRetainedTextSlice(ctx, resolved, 0, recallSliceChars(undefined, ctx.routedModelId));
           if (read.status === 'ok') {
             const bodyText = `Tool output "${callId}" is text, not structured records, so here is its text as recall_tool_result returns it (fields, filters and figures need records).\n${read.body}`;
+            recordRetainedReaderProjection({ toolName: 'tool_output_query', args: input, resolved, scope: ctx, body: bodyText, range: read.range });
             return textResult(bodyText, { maxChars: bodyText.length });
           }
           if (read.status === 'budget') {
             return textResult(
               `ERROR: tool output "${callId}" is text, and this turn's recall budget is spent, so its text cannot be returned here. `
               + retainedResultWayThrough({ sessionId: ctx.sessionId, callId,
-                exclude: ['tool_output_query', 'recall_tool_result'], recallCallsRemaining: 0 }),
+                exclude: ['tool_output_query', 'recall_tool_result'], recallCallsRemaining: 0 }), { isError: true },
             );
           }
         }
@@ -638,7 +654,7 @@ export function registerRecallTools(server: McpServer): void {
         return textResult(
           `No JSON value could be recovered from tool output "${callId}" (${row.output.length.toLocaleString()} chars). `
           + 'It is text, not structured data. '
-          + retainedResultWayThrough({ sessionId: ctx.sessionId, callId, exclude: ['tool_output_query'] }),
+          + retainedResultWayThrough({ sessionId: ctx.sessionId, callId, exclude: ['tool_output_query'] }), { isError: true },
         );
       }
       let parsed: unknown = recovered.value;
@@ -651,13 +667,13 @@ export function registerRecallTools(server: McpServer): void {
         // A legacy prefix cannot establish that a missing node is absent from
         // the full result. Never guess another subtree or silently query it.
         if (recoveredClippedArrayPrefix) {
-          return textResult(`ERROR: cannot select path ${JSON.stringify(explicitPath)} from a clipped JSON-array prefix; retain a complete source first.`);
+          return textResult(`ERROR: cannot select path ${JSON.stringify(explicitPath)} from a clipped JSON-array prefix; retain a complete source first.`, { isError: true });
         }
         const selection = selectRetainedJson(parsed, explicitPath);
         if (selection.status === 'error') {
           const shape = selection.parent === undefined ? ''
             : `\nShape at ${JSON.stringify(selection.atPath)}:\n${describeJsonShape(selection.parent)}`;
-          return textResult(`ERROR: path ${JSON.stringify(explicitPath)} in retained output ${JSON.stringify(callId)}: ${selection.reason}.${shape}\nNo alternate data was selected.`, { maxChars: 4_000 });
+          return textResult(`ERROR: path ${JSON.stringify(explicitPath)} in retained output ${JSON.stringify(callId)}: ${selection.reason}.${shape}\nNo alternate data was selected.`, { maxChars: 4_000, isError: true });
         }
         parsed = selection.value;
       }
@@ -748,13 +764,13 @@ export function registerRecallTools(server: McpServer): void {
         if ((aggregate || sortBy) && recoveredClippedArrayPrefix) {
           const bodyText = `ERROR: tool output "${callId}" holds only ${(parsed as unknown[]).length} complete record(s) recovered from a clipped prefix; `
             + 'an exact count, total or ranking needs the complete set. Re-read the source whole (or page it) and query that result.';
-          return textResult(bodyText, { maxChars: bodyText.length });
+          return textResult(bodyText, { maxChars: bodyText.length, isError: true });
         }
         if (aggregate) {
           const valueField = typeof input.value_field === 'string' && input.value_field.trim() ? input.value_field.trim() : undefined;
           if (aggregate !== 'count' && !valueField) {
             const bodyText = `aggregate "${aggregate}" needs value_field: the numeric field to ${aggregate}. The records are an ${describeJsonShape(parsed)}.`;
-            return textResult(bodyText, { maxChars: bodyText.length });
+            return textResult(bodyText, { maxChars: bodyText.length, isError: true });
           }
           const groupBy = typeof input.group_by === 'string' && input.group_by.trim() ? input.group_by.trim() : undefined;
           const result = aggregateRows(rows, aggregate, { ...(valueField ? { valueField } : {}), ...(groupBy ? { groupBy } : {}) });
@@ -773,7 +789,7 @@ export function registerRecallTools(server: McpServer): void {
             bytes: Number.POSITIVE_INFINITY,
             charged: false,
           };
-          return chargeQueryReply(ctx, callId, clipQueryBody(lines.join('\n'), aggregateBound), aggregateBound);
+          return queryReply(clipQueryBody(lines.join('\n'), aggregateBound), aggregateBound, false, { kind: 'aggregate', matchingRecords: rows.length, totalRecords: (parsed as unknown[]).length });
         }
         if (sortBy) rows = sortRows(rows, sortBy, input.order === 'desc' ? 'desc' : 'asc');
         const matched = rows.length;
@@ -783,13 +799,13 @@ export function registerRecallTools(server: McpServer): void {
         if (matched === 0 && conditions.length > 0) {
           const bodyText = `${selectedScope}0 records met the conditions ${JSON.stringify(conditions)}.${skippedNote} The result is an ${describeJsonShape(parsed)}. `
             + 'Check the field names, values and value kinds, and re-query.';
-          return textResult(bodyText, { maxChars: bodyText.length });
+          return queryText(bodyText, false, { kind: 'empty_filtered_records' });
         }
         if (matched === 0 && ff) {
           const shape = describeJsonShape(parsed);
           const bodyText = `${selectedScope}0 records matched filter_field=${JSON.stringify(ff)}. The result is an ${shape}. `
             + 'Check the field name/value and re-query.';
-          return textResult(bodyText, { maxChars: bodyText.length });
+          return queryText(bodyText, false, { kind: 'empty_filtered_records' });
         }
         const offset = Number.isFinite(input.offset as number) ? Math.max(0, Math.trunc(input.offset as number)) : 0;
         const limit = Number.isFinite(input.limit as number) ? Math.min(200, Math.max(1, Math.trunc(input.limit as number))) : 50;
@@ -799,7 +815,7 @@ export function registerRecallTools(server: McpServer): void {
         if (fields && fields.length > 0 && page.length > 0
           && page.every((r) => r && typeof r === 'object' && !Array.isArray(r) && Object.keys(r as object).length === 0)) {
           const bodyText = `${selectedScope}None of ${JSON.stringify(fields)} exist on these records. The result is an ${describeJsonShape(rows)}. Re-query with fields that exist.`;
-          return textResult(bodyText, { maxChars: bodyText.length });
+          return textResult(bodyText, { maxChars: bodyText.length, isError: true });
         }
         const bound = queryReplyBound(input, ctx);
         const boundRefusal = queryBoundRefusal(bound, ctx, callId);
@@ -838,7 +854,12 @@ export function registerRecallTools(server: McpServer): void {
         // in the reply while claiming to represent precisely that reply.
         const displayedRefHint = refHint && fitsQueryBound(render(page.length).body + refHint, bound) ? refHint : '';
         const fitted = fitRecordPage(page.length, render, bound, displayedRefHint);
-        return chargeQueryReply(ctx, callId, fitted.text, bound);
+        return queryReply(fitted.text, bound,
+          !asksForRecordShaping(input) && !unwrappedPath && !decodedMcpPayload && !recoveredClippedArrayPrefix
+            && offset === 0 && fitted.count === matched && fitsQueryBound(render(page.length).body, bound),
+          { kind: 'records', offset, count: fitted.count, matchingRecords: matched, totalRecords: (parsed as unknown[]).length,
+            sourcePath: explicitPath ?? unwrappedPath, fields: fields ?? null,
+            clipped: !fitsQueryBound(render(fitted.count).body, bound) });
       }
 
       if (parsed && typeof parsed === 'object') {
@@ -852,27 +873,26 @@ export function registerRecallTools(server: McpServer): void {
           const bodyText = `${selectedScope}None of ${JSON.stringify(fields)} exist at the top level. The result's shape:\n`
             + `${describeJsonShape(parsed)}\n`
             + `Re-query with the fields/filter of the records themselves — this tool queries the record list directly.`;
-          return textResult(bodyText, { maxChars: bodyText.length });
+          return textResult(bodyText, { maxChars: bodyText.length, isError: true });
         }
         const bound = queryReplyBound(input, ctx);
         const boundRefusal = queryBoundRefusal(bound, ctx, callId);
         if (boundRefusal) return boundRefusal;
         const refHint = explicitPath !== undefined || resolved.receipt || decodedMcpPayload ? '' : `\n\n[grounded reference] To reuse values from this result in a later send/write WITHOUT retyping, reference them: {"$fromToolOutput":{"callId":"${callId}","path":"<path to the values, e.g. result.records[*].Email>"}} — the harness binds the real values before the call.`;
-        return chargeQueryReply(ctx, callId, clipQueryBody(
-          `${selectedScope}Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`,
-          bound,
-          refHint,
-        ), bound);
+        const wholeBody = `${selectedScope}Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`;
+        const body = clipQueryBody(wholeBody, bound, refHint);
+        return queryReply(body, bound, !asksForRecordShaping(input) && !decodedMcpPayload && body.startsWith(wholeBody),
+          { kind: 'object', sourcePath: explicitPath ?? '', fields: fields ?? null, clipped: !body.startsWith(wholeBody) });
       }
 
       // Keep the legacy scalar presentation when no selector was supplied.
       // A focused string can be arbitrarily large, so it needs the same limits
       // and reading-byte charge as a focused object or collection.
-      if (explicitPath === undefined) return textResult(`Tool output "${callId}" is a scalar: ${JSON.stringify(parsed)}`);
+      if (explicitPath === undefined) return queryText(`Tool output "${callId}" is a scalar: ${JSON.stringify(parsed)}`, true, { kind: 'scalar' });
       const bound = queryReplyBound(input, ctx);
       const boundRefusal = queryBoundRefusal(bound, ctx, callId);
       if (boundRefusal) return boundRefusal;
-      return chargeQueryReply(ctx, callId, clipQueryBody(
+      return queryReply(clipQueryBody(
         `${selectedScope}Tool output "${callId}" is a scalar: ${JSON.stringify(parsed)}`, bound,
       ), bound);
     },

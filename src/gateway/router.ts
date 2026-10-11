@@ -104,6 +104,8 @@ export interface GatewayRequest {
    *  the two are the same. Distinct from the bridge's `displayMessage`, which
    *  names the accepted text before a model directive rewrite. */
   visibleMessage?: string;
+  /** Spoken-reply presentation intent. It does not change request identity or authority. */
+  voice?: boolean;
   sessionId: string;
   userId?: string;
   channel?: string;
@@ -427,6 +429,7 @@ function acceptGatewayTurn(request: GatewayRequest, runId: string, connectionExe
       data: {
         text: request.message,
         displayText: request.visibleMessage ?? request.message,
+        ...(request.voice === true ? { voice: true } : {}),
         ...taskModeFields(request.taskMode),
         runId,
         ...(request.reviewedPlanOwnerControl

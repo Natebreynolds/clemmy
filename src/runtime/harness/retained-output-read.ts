@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   getSession,
   getToolOutput,
@@ -11,6 +12,43 @@ import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 import { readSharedWorkerResult } from './worker-retained-results.js';
+import { readCancelledSuccessorResultEvidence } from './cancelled-successor-retained-read.js';
+
+export interface RetainedProjectionProducer {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+  physicalDispatchId: string;
+  resultHandleId: string;
+  rawPayloadSha256: string;
+  rawByteCount: number;
+  retainedTextDigest: string;
+  retainedTextChars: number;
+}
+export interface RetainedOutputReadResolution {
+  callId: string;
+  receipt?: ToolOutputRecord;
+  producer?: Readonly<RetainedProjectionProducer>;
+}
+const authenticatedResolutions = new WeakSet<object>();
+function authenticatedResolution(input: { callId: string; receipt?: ToolOutputRecord;
+  producer?: Omit<RetainedProjectionProducer, 'retainedTextDigest' | 'retainedTextChars'> }): RetainedOutputReadResolution {
+  const p = input.producer, receipt = input.receipt;
+  const producer = p && receipt && !receipt.truncatedAtWrite ? Object.freeze({
+    sessionId: p.sessionId, sourceUserSeq: p.sourceUserSeq, acceptedTaskId: p.acceptedTaskId,
+    logicalToolCallId: p.logicalToolCallId, physicalDispatchId: p.physicalDispatchId,
+    resultHandleId: p.resultHandleId, rawPayloadSha256: p.rawPayloadSha256, rawByteCount: p.rawByteCount,
+    retainedTextDigest: createHash('sha256').update(receipt.output).digest('hex'), retainedTextChars: receipt.output.length,
+  }) : undefined;
+  const result = Object.freeze({ callId: input.callId, ...(receipt ? { receipt: Object.freeze({ ...receipt }) } : {}),
+    ...(producer ? { producer } : {}) });
+  if (producer) authenticatedResolutions.add(result);
+  return result;
+}
+export function isAuthenticatedRetainedOutputResolution(value: RetainedOutputReadResolution): boolean {
+  return authenticatedResolutions.has(value);
+}
 
 /** Read-only reference resolution. A receipt is redeemed under its own exact
  * durable identity in this session; a recall call points to its original
@@ -20,33 +58,34 @@ import { readSharedWorkerResult } from './worker-retained-results.js';
  * that exact id. The id may be the one the worker named or the producer its
  * own recall resolves to; either way the share, not the lineage, grants the
  * read, so an unshared parent id stays unreadable. */
-export function resolveRetainedOutputRead(sessionId: string, requestedId: string): {
-  callId: string;
-  receipt?: ToolOutputRecord;
-} {
+export function resolveRetainedOutputRead(sessionId: string, requestedId: string,
+  request?: { sourceUserSeq: number; attemptId?: string }, verificationOnly = false): RetainedOutputReadResolution {
   const local = resolveLocalRetainedOutputRead(sessionId, requestedId);
   // Whether the id is stored here is a metadata question; the bytes are for
   // the reader that reads them.
   if (local.receipt || toolOutputStoredIdentity(sessionId, local.callId)) return local;
+  if (request) {
+    const shared = readCancelledSuccessorResultEvidence({ sessionId, ...request, resultHandleId: local.callId, verificationOnly });
+    if (shared) return authenticatedResolution({ callId: local.callId, ...shared });
+  }
   const session = getSession(sessionId);
   if (session?.kind !== 'agent' || session.metadata.source !== 'delegated_worker') return local;
-  const readParent = (parentId: string, id: string): ToolOutputRecord | null => {
+  const readParent = (parentId: string, id: string): (ToolOutputRecord & { producer?: RetainedProjectionProducer }) | null => {
     // No recursive ancestry search: a share names an immediate parent's own result.
     const parent = resolveLocalRetainedOutputRead(parentId, id);
-    return parent.receipt ?? getToolOutput(parentId, parent.callId);
+    const receipt = parent.receipt ?? getToolOutput(parentId, parent.callId);
+    return receipt ? { ...receipt, ...(parent.producer ? { producer: parent.producer } : {}) } : null;
   };
   for (const id of new Set([local.callId, requestedId])) {
     const receipt = readSharedWorkerResult(id, session.metadata.parentSessionId,
       session.metadata.retainedResultShares, readParent);
-    if (receipt) return { callId: id, receipt };
+    if (receipt) return authenticatedResolution({ callId: id, receipt,
+      ...(receipt.producer ? { producer: receipt.producer } : {}) });
   }
   return local;
 }
 
-export function resolveLocalRetainedOutputRead(sessionId: string, requestedId: string): {
-  callId: string;
-  receipt?: ToolOutputRecord;
-} {
+export function resolveLocalRetainedOutputRead(sessionId: string, requestedId: string): RetainedOutputReadResolution {
   if (requestedId.startsWith('rh_')) {
     const matches = openEventLog().prepare(`
       SELECT s.source_user_seq, l.accepted_task_id, s.logical_tool_call_id, s.settled_at
@@ -61,13 +100,13 @@ export function resolveLocalRetainedOutputRead(sessionId: string, requestedId: s
     const result = redeemSuccessfulSettlementResultForHost({ sessionId, sourceUserSeq: row.source_user_seq,
       acceptedTaskId: row.accepted_task_id, logicalToolCallId: row.logical_tool_call_id });
     if (result.status !== 'ok' || result.value.resultHandleId !== requestedId) return { callId: requestedId };
-    return { callId: requestedId, receipt: {
+    return authenticatedResolution({ callId: requestedId, receipt: {
       output: result.value.rawPayloadJson,
       contentBytes: result.value.rawByteCount,
       truncatedAtWrite: false,
       tool: result.value.toolName,
       createdAt: row.settled_at,
-    } };
+    }, producer: { sessionId, sourceUserSeq: row.source_user_seq, ...result.value } });
   }
 
   let callId = requestedId;
@@ -85,7 +124,29 @@ export function resolveLocalRetainedOutputRead(sessionId: string, requestedId: s
     if (!sourceId || visited.has(sourceId)) break;
     callId = sourceId;
   }
-  return callId.startsWith('rh_') ? resolveLocalRetainedOutputRead(sessionId, callId) : { callId };
+  if (callId.startsWith('rh_')) return resolveLocalRetainedOutputRead(sessionId, callId);
+  // Legacy retained text remains readable, but projection authority requires
+  // the exact immutable successful producer, not a guessed argument string.
+  const matches = openEventLog().prepare(`SELECT s.source_user_seq, l.accepted_task_id
+    FROM logical_call_settlements s JOIN logical_tool_calls l
+      ON l.session_id=s.session_id AND l.source_user_seq=s.source_user_seq
+      AND l.logical_tool_call_id=s.logical_tool_call_id
+    WHERE s.session_id=? AND s.logical_tool_call_id=?`).all(sessionId, callId) as Array<{
+      source_user_seq: number; accepted_task_id: string;
+    }>;
+  if (matches.length === 1) {
+    const row = matches[0]!;
+    const result = redeemSuccessfulSettlementResultForHost({ sessionId, sourceUserSeq: row.source_user_seq,
+      acceptedTaskId: row.accepted_task_id, logicalToolCallId: callId });
+    const receipt = getToolOutput(sessionId, callId);
+    if (result.status === 'ok' && receipt && !receipt.truncatedAtWrite
+      && (receipt.output === result.value.rawPayloadJson
+        || (typeof result.value.rawPayload === 'string' && receipt.output === result.value.rawPayload))) {
+      return authenticatedResolution({ callId, receipt,
+        producer: { sessionId, sourceUserSeq: row.source_user_seq, ...result.value } });
+    }
+  }
+  return { callId };
 }
 
 /**

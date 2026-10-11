@@ -4400,6 +4400,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
         tool.name,
       );
       const presentationBudget = invocationPresentationBudget(tool.name, parsedInput, ctx);
+      const wholeInlineEffectiveTool = unwrapRuntimeEffectiveToolIdentity(tool.name, parsedInput).toolName;
+      let nominalWholeInlineRead = false;
       const invokeBody = async (): Promise<unknown> => {
       // Layer 1 — structural prevention. Bind $fromToolOutput references to REAL
       // values from the lossless store BEFORE gates + execution, so a high-stakes
@@ -4595,6 +4597,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           toolName: tool.name,
           settlementNonce,
           presentationBudget,
+          wholeInlinePresentation: { nominalReadSucceeded: false, effectiveToolName: wholeInlineEffectiveTool },
         }, () => originalInvoke.call(tt, runContext, input, invokeDetails)));
         const work = runWithToolAbortSignal(
           hostOwnedSignal ?? ac!.signal,
@@ -4689,6 +4692,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
           compactResult: result instanceof HostLocalReadSuccessResult ? result.output : result,
           settlementNonce,
         });
+        // Only the direct producer's nominal result authorizes a whole-text
+        // frame. Actual carriers currently lose that producer proof, so their
+        // whole payload stays unchanged rather than inferring it from a name.
+        nominalWholeInlineRead = wholeInlineEffectiveTool === 'read_file'
+          && !ctx?.nestedDispatch && !ctx?.batchItem && !typedPreDispatchFailure
+          && result instanceof HostLocalReadSuccessResult;
         const hostSignals = {
           ...attemptSignalsFromShellExecutionOutcome(shellOutcome),
           ...(carrierReturnedFailure ? { executionFailed: true } : {}),
@@ -4941,6 +4950,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           toolName: tool.name,
           settlementNonce,
           presentationBudget,
+          wholeInlinePresentation: { nominalReadSucceeded: nominalWholeInlineRead, effectiveToolName: wholeInlineEffectiveTool },
         }, () => formatRecallableToolText(value, {
           // A carrier resolves the same budget as the child it dispatches
           // (both key on the effective inner tool), so a nested child projects
@@ -5149,6 +5159,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
         toolName: tool.name,
         settlementNonce,
         presentationBudget: invocationPresentationBudget(tool.name, input, ctx),
+        wholeInlinePresentation: { nominalReadSucceeded: false,
+          effectiveToolName: unwrapRuntimeEffectiveToolIdentity(tool.name, input).toolName },
       }, () => originalExecute(input, runContext)));
       const work = runWithToolAbortSignal(
         hostOwnedSignal ?? ac!.signal,

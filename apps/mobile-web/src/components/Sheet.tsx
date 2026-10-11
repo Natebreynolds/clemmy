@@ -9,6 +9,7 @@
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import { useBackGesture } from '../lib/back-gesture';
+import { useVisibleViewport } from '../lib/use-keyboard-inset';
 
 interface Props {
   open: boolean;
@@ -33,6 +34,7 @@ interface Props {
 let sheetSequence = 0;
 
 export function Sheet({ open, onClose, title, ariaLabel, aside, footer, backGesture = false, class: extraClass, children }: Props) {
+  const viewport = useVisibleViewport(open);
   const sheetRef = useRef<HTMLElement | null>(null);
   const openerRef = useRef<HTMLElement | null>(null);
   const idRef = useRef<string>('');
@@ -90,7 +92,7 @@ export function Sheet({ open, onClose, title, ariaLabel, aside, footer, backGest
   if (!open) return null;
 
   return (
-    <div class="sheet-layer">
+    <div class="sheet-layer" style={{ top: `${viewport.top}px`, height: `${viewport.height}px`, bottom: 'auto', '--sheet-viewport-height': `${viewport.height}px` }}>
       <button class="sheet-scrim" type="button" aria-label="Close" onClick={onClose} />
       <section
         ref={sheetRef}

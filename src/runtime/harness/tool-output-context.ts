@@ -25,6 +25,14 @@ export interface ToolOutputContext {
    * formatter inside the same invocation defaults to it, so a tool's own
    * adapter and the harness bracket present one result the same way. */
   presentationBudget?: number;
+  /** Host-only presentation authorization after nominal local-read completion.
+   * Handler/nested phases leave this disabled; only the final model boundary
+   * may frame whole text. The effective name comes from canonical unwrapping,
+   * never from provider output fields. It confers no source-coverage authority. */
+  wholeInlinePresentation?: {
+    nominalReadSucceeded: boolean;
+    effectiveToolName: string | null;
+  };
 }
 
 export const toolOutputContextStorage = new AsyncLocalStorage<ToolOutputContext>();
@@ -53,12 +61,15 @@ export function withToolOutputContext<T>(
   // The presentation budget belongs to the same exact invocation as the nonce.
   const inheritedBudget = context.presentationBudget
     ?? (sameInvocation ? parent?.presentationBudget : undefined);
+  const inheritedWholeInline = context.wholeInlinePresentation
+    ?? (sameInvocation ? parent?.wholeInlinePresentation : undefined);
   return toolOutputContextStorage.run(
-    inheritedNonce || inheritedBudget !== undefined
+    inheritedNonce || inheritedBudget !== undefined || inheritedWholeInline !== undefined
       ? {
           ...context,
           ...(inheritedNonce ? { settlementNonce: inheritedNonce } : {}),
           ...(inheritedBudget !== undefined ? { presentationBudget: inheritedBudget } : {}),
+          ...(inheritedWholeInline !== undefined ? { wholeInlinePresentation: inheritedWholeInline } : {}),
         }
       : context,
     work,

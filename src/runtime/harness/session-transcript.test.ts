@@ -1018,3 +1018,27 @@ test('renderCrossSessionPrefixesForModel keeps the NEWEST prefix when the total 
   assert.doesNotMatch(rendered, /\[PREFIX 0\]/, 'oldest prefix is dropped first');
   assert.ok(rendered.length <= 6_200, `total bound holds (${rendered.length})`);
 });
+
+
+test('reopening a stopped chat presents the public checkpoint while preserving exact source and raw evidence', async () => {
+  resetEventLog();
+  const { presentationEventForOutcome, turnOutcomeId } = await import('./turn-outcome.js');
+  const { listEvents } = await import('./eventlog.js');
+  const session = createSession({ kind: 'chat', channel: 'desktop' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Run the named reopen fixture.' } });
+  const identity = { sessionId: session.id, turn: 1, sourceUserSeq: source.seq };
+  const text = 'Stopped.\n\nRetained work (durable checkpoint):\n- Source/tool fixture_read: completed result retained as rh_private_reopen.\nExternal write state: no settled external-write attempt is recorded.';
+  const outcome = { version: 2 as const, id: turnOutcomeId(identity), identity, status: 'cancelled' as const, resumable: false as const, presentation: { kind: 'stopped' as const, text } };
+  appendEvent({ sessionId: session.id, turn: source.turn, role: 'system', type: 'conversation_completed', data: {
+    terminalKey: outcome.id, sourceUserSeq: source.seq, reply: text, presentation: presentationEventForOutcome(outcome),
+    turnOutcome: { version: 2, id: outcome.id, status: 'cancelled', resumable: false },
+  } });
+  const reopened = pullRecentTurnsForSession(openEventLog(), session.id, 10);
+  assert.equal(reopened.length, 2);
+  assert.equal(reopened[0].text, 'Run the named reopen fixture.');
+  assert.match(reopened[1].text, /Stopped.*I kept the result/s);
+  assert.doesNotMatch(reopened[1].text, /rh_|fixture_read|durable checkpoint|Nothing.*changed/);
+  const terminal = listEvents(session.id, { types: ['conversation_completed'] })[0];
+  assert.equal((terminal.data.presentation as { identity: { sourceUserSeq: number } }).identity.sourceUserSeq, source.seq);
+  assert.match((terminal.data.presentation as { text: string }).text, /rh_private_reopen/);
+});

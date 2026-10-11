@@ -13,7 +13,7 @@
  * host's record; this module only compares the two. */
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 import type { JudgeEvidenceLookup } from './judge-evidence-tools.js';
-import { projectionMayCompleteSource } from './retained-projection-scope.js';
+import { projectionMayCompleteSource, retainedProjectionReadsSource } from './retained-projection-scope.js';
 
 /** The fields of a judged result row that coverage depends on. */
 export interface ReviewedEvidenceRow {
@@ -37,6 +37,8 @@ export interface ReviewedEvidenceRow {
   precedesWrite?: boolean;
   sourceLogicalToolCallId?: string;
   sourceResultHandleId?: string;
+  sourceSessionId?: string;
+  sourceUserSeq?: number;
   /** False for a focused subtree even when its reply was shown whole. */
   sourceSelectionComplete?: boolean;
 }
@@ -180,13 +182,11 @@ export function reviewEvidenceCoverage(
   // A complete retained projection of a source result is its inspection: the
   // answerer read the rest, and the review was shown that read whole.
   for (const row of results) {
-    if (row.evidenceKind !== 'retained_projection' || row.contentComplete !== true || !succeeded(row)
+    if (row.evidenceKind !== 'retained_projection' || row.contentComplete !== true || !carriesContent(row)
       || !projectionMayCompleteSource(row)) continue;
-    const sources = new Set([row.sourceLogicalToolCallId, row.sourceResultHandleId].filter(Boolean));
-    if (sources.size === 0) continue;
     for (const covered of rows) {
       if (covered.inspection !== 'unopened' && covered.inspection !== 'partial') continue;
-      if (!sources.has(covered.ref) && !(covered.resultHandleId && sources.has(covered.resultHandleId))) continue;
+      if (!retainedProjectionReadsSource(row, { logicalToolCallId: covered.ref, resultHandleId: covered.resultHandleId })) continue;
       covered.inspection = 'queried';
       covered.exhaustive = !covered.moreAtSource;
     }

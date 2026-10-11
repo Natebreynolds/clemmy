@@ -84,6 +84,28 @@ export interface SessionComparisonArgs {
 
 export type TurnUsageAttribution = 'exact' | 'mixed' | 'legacy_window' | 'none';
 
+/** Attribution and token normalization do not enumerate every physical model
+ * leg. No sealed all-leg inventory or billing evidence is read by this tool. */
+export interface AcceptedUsageCompleteness {
+  status: 'unqualified';
+  allLegUsageCertified: false;
+  totals: 'recorded_lower_bound';
+  recordedTokenRows: { certified: number; unknown: number; invalid: number; failed: number };
+  /** Zero is known only for a completed, exactly response-bound physical call.
+   * An absent row or failed zero placeholder is never a known zero call. */
+  knownZeroCompletedMainCalls: number;
+  mainProducerCoverage: {
+    status: 'not_observed' | 'incomplete' | 'observed_completed_calls';
+    observedCalls: number;
+    responseBoundCalls: number;
+    issues: string[];
+  };
+  auxiliaryPhysicalInventory: { status: 'unproved'; recordedRowsOutsideMainCalls: number };
+  identityGaps: { providerReportedModelRows: number; billedAccountRows: number; backendRows: number };
+  cost: { providerPricedCost: 'not_measured'; actualBilling: 'not_measured' };
+  issues: string[];
+}
+
 /** Optional diagnostics. These observed sums are neither token accounting nor
  * provider wall time, and host steps may contain overlapping physical calls. */
 export interface ModelTimingMeasurement {
@@ -124,10 +146,12 @@ export interface AcceptedTurnMeasurement extends SessionMeasurement {
   unscopedWindowUsageRecords: number;
   invalidUsageAttributions: number;
   usageAttribution: TurnUsageAttribution;
-  /** Exact trace rows, or a proved zero-model turn. Legacy windows stay visible
-   *  but can never be presented as certified per-turn cost. */
+  /** Exact trace attribution, additionally checked against observed physical
+   *  calls. Stores without those observations retain legacy attribution only;
+   *  this flag never proves billing or whole-task model-leg completeness. */
   usageAttributionCertified: boolean;
   usageCertificationIssues: string[];
+  usageCompleteness: AcceptedUsageCompleteness;
   governorKnownCapability: boolean | null;
   discoveryClaimsByCategory: Record<string, number>;
   discoveryClaimsByOutcome: Record<string, number>;
@@ -187,6 +211,7 @@ export interface AcceptedTaskMeasurement extends SessionMeasurement {
   unscopedWindowUsageRecords: number;
   usageAttributionCertified: boolean;
   usageCertificationIssues: string[];
+  usageCompleteness: AcceptedUsageCompleteness;
   modelRouteEvents: number;
   attemptCount: number;
   unfinishedAttempts: number;
@@ -1075,6 +1100,8 @@ export function measureAcceptedTurn(
   if (invalidExactUsage.length > 0) usageCertificationIssues.push('invalid_attempt_attribution');
   if (attempts.unfinished > 0) usageCertificationIssues.push('unfinished_source_attempt');
   if (modelRouteEvents > 0 && exactUsage.length === 0) usageCertificationIssues.push('model_route_without_exact_usage');
+  usageCertificationIssues.push(...mainModelUsageCoverageIssues(sessionId, sessionRead.events,
+    new Map([[sourceUserSeq, { source, attempts, terminal }]]), exactUsage));
   const discovery = readDiscoveryForSource(dbPath, sessionId, sourceUserSeq);
   const measured = measureRows({
     sessionId,
@@ -1106,6 +1133,9 @@ export function measureAcceptedTurn(
     usageAttribution,
     usageAttributionCertified: usageCertificationIssues.length === 0,
     usageCertificationIssues,
+    usageCompleteness: acceptedUsageCompleteness({ sessionId, events: sessionRead.events,
+      sources: new Map([[sourceUserSeq, { source, attempts, terminal }]]), usage: usageEvents,
+      attributionIssues: usageCertificationIssues }),
     governorKnownCapability: discovery.knownCapability,
     discoveryClaimsByCategory: discovery.byCategory,
     discoveryClaimsByOutcome: discovery.byOutcome,
@@ -1146,6 +1176,257 @@ const usageSourceKey = (sessionId: string, sourceUserSeq: number): string => `${
 
 function exactIdentity(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.trim() === value && !/[\u0000-\u001f]/.test(value);
+}
+
+/** Exact attribution of some rows is not coverage of every physical call in
+ * their attempt. Inspect all owned observations, including late Stop closure,
+ * without widening the event/tool/timing windows or inventing token usage.
+ * Historical stores without call observations retain their legacy attribution
+ * meaning; they do not thereby prove whole-task billing completeness. */
+function mainModelUsageCoverageIssues(
+  sessionId: string,
+  events: readonly SessionEvent[],
+  sources: ReadonlyMap<number, TimingSource>,
+  usage: readonly UsageEvent[],
+  isAncestor: (ancestor: number, descendant: number) => boolean = (ancestor, descendant) => ancestor === descendant,
+): string[] {
+  const issues = new Set<string>();
+  const sourceByAttempt = new Map<string, number>();
+  for (const [source, scope] of sources) for (const attempt of scope.attempts.ids) sourceByAttempt.set(attempt, source);
+  const calls = new Map<string, { source: number; attempt: string; callId: string; starts: SessionEvent[]; finishes: SessionEvent[]; responses: SessionEvent[] }>();
+  const observedSteps = new Map<string, { source: number; calls: Set<string> }>();
+  const providerAttempts = new Map<string, { source: number; attempt: string }>();
+  const providerResponses: { source: number; attempt: string; responseId: string; seq: number }[] = [];
+  const groupByHostId = new Map<string, string>();
+  const certifiedUsage = usage.filter(row => {
+    const accounting = canonicalCacheAccounting(row);
+    return accounting.certified && !accounting.invalid;
+  });
+  const usageFor = (source: number, attempt: string): UsageEvent[] => certifiedUsage.filter(row => (
+    row.trace?.acceptedSource === usageSourceKey(sessionId, source)
+    && row.trace.logicalTurnId === `turn:${source}` && row.trace.attemptId === attempt
+  ));
+  for (const event of events) {
+    if (event.type !== 'model_stream_diagnostic' && event.type !== 'model_resilience_observed') continue;
+    const source = positiveEventSeq(event.data.sourceUserSeq);
+    const attempt = event.type === 'model_stream_diagnostic' ? event.data.attemptId : event.data.runAttemptId;
+    const owner = exactIdentity(attempt) ? sourceByAttempt.get(attempt) : undefined;
+    if ((source === null || !sources.has(source)) && owner === undefined) continue;
+    if (event.role !== 'system' || source === null || !sources.has(source) || owner === undefined
+      || !exactIdentity(attempt) || !isAncestor(source, owner) || event.seq <= sources.get(source)!.source.seq) {
+      issues.add(`invalid_main_model_observation_ownership:${event.seq}`);
+      continue;
+    }
+    if (event.type === 'model_stream_diagnostic') {
+      providerAttempts.set(JSON.stringify([source, attempt]), { source, attempt });
+      const responseId = event.data.responseId;
+      if (event.data.settlement !== 'completed' || event.data.sawResponseDone !== true) {
+        issues.add(`main_unsettled_response_usage_unknown:${source}:${event.seq}`);
+      }
+      if (!exactIdentity(responseId)) issues.add(`main_response_identity_unknown:${source}:${event.seq}`);
+      else {
+        providerResponses.push({ source, attempt, responseId, seq: event.seq });
+        if (!usageFor(source, attempt).some(row => row.responseId === responseId || row.trace?.modelCallId === responseId)) {
+          issues.add(`main_response_without_exact_usage:${source}:${event.seq}`);
+        }
+      }
+      continue;
+    }
+    if (event.data.version !== 1 || !exactIdentity(event.data.stepId)
+      || positiveEventSeq(event.data.requestOrdinal) === null) {
+      issues.add(`main_physical_call_identity_unknown:${source}:${event.seq}`);
+      continue;
+    }
+    const stepKey = JSON.stringify([source, attempt, event.data.stepId, event.data.requestOrdinal]);
+    let step = observedSteps.get(stepKey);
+    if (!step) observedSteps.set(stepKey, step = { source, calls: new Set() });
+    if ((typeof event.data.failedAttemptCount === 'number' && event.data.failedAttemptCount > 0)
+      || (event.data.phase === 'attempt_finished' && event.data.outcome === 'failed')
+      || event.data.requestAborted === true
+      || (['call_finished', 'host_step_finished'].includes(String(event.data.phase))
+        && ['failed', 'cancelled'].includes(String(event.data.outcome)))) {
+      // Counts and zero error placeholders cannot identify every potentially
+      // billed retry/aborted physical attempt, even when a successful row exists.
+      issues.add(`main_failed_or_aborted_attempt_usage_unknown:${source}`);
+    }
+    if (!['call_started', 'call_finished', 'response_observed'].includes(String(event.data.phase))) continue;
+    if (!exactIdentity(event.data.callId)) {
+      issues.add(`main_physical_call_identity_unknown:${source}:${event.seq}`);
+      continue;
+    }
+    const callKey = JSON.stringify([stepKey, event.data.callId]);
+    const priorGroup = groupByHostId.get(event.data.callId);
+    if (priorGroup !== undefined && priorGroup !== callKey) issues.add(`conflicting_main_host_call_identity:${source}:${event.seq}`);
+    groupByHostId.set(event.data.callId, callKey);
+    step.calls.add(callKey);
+    let call = calls.get(callKey);
+    if (!call) calls.set(callKey, call = { source, attempt, callId: event.data.callId, starts: [], finishes: [], responses: [] });
+    (event.data.phase === 'call_started' ? call.starts : event.data.phase === 'call_finished' ? call.finishes : call.responses).push(event);
+  }
+  for (const call of calls.values()) {
+    const seq = (call.starts[0] ?? call.finishes[0] ?? call.responses[0])!.seq;
+    if (call.starts.length !== 1 || call.finishes.length !== 1
+      || call.finishes[0].seq <= call.starts[0].seq || call.finishes[0].data.outcome !== 'returned') {
+      issues.add(`main_unsettled_physical_call_usage_unknown:${call.source}:${seq}`);
+    }
+    if (call.finishes.some(finish => finish.data.attemptCount !== 1 || finish.data.failedAttemptCount !== 0)) {
+      issues.add(`main_physical_attempt_membership_unknown:${call.source}:${seq}`);
+    }
+    // A host UUID and a provider response ID are distinct namespaces. Only an
+    // explicit same-tuple usage trace carrying this host ID can bridge them;
+    // another response in the attempt, time, model and counts cannot do so.
+    if (!usageFor(call.source, call.attempt).some(row => row.trace?.modelCallId === call.callId)) {
+      issues.add(`main_host_call_usage_unknown:${call.source}:${seq}`);
+    }
+    for (const response of call.responses) {
+      const digest = response.data.providerResponseIdDigest;
+      if (typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest)
+        || positiveEventSeq(response.data.attempt) === null
+        || call.starts.length !== 1 || call.finishes.length !== 1
+        || response.seq <= call.starts[0].seq || response.seq >= call.finishes[0].seq) {
+        issues.add(`invalid_main_response_binding:${call.source}:${response.seq}`);
+        continue;
+      }
+      if (!usageFor(call.source, call.attempt).some(row => row.trace?.modelCallId === call.callId
+        && typeof row.responseId === 'string' && createHash('sha256').update(row.responseId, 'utf8').digest('hex') === digest)) {
+        issues.add(`main_bound_response_usage_unknown:${call.source}:${response.seq}`);
+      }
+    }
+    // A single-attempt invocation cannot own two completed provider identities.
+    if (call.finishes[0]?.data.attemptCount === 1 && (call.responses.length > 1
+      || call.responses.some(response => response.data.attempt !== 1))) {
+      issues.add(`conflicting_main_response_binding:${call.source}:${seq}`);
+    }
+  }
+  for (const step of observedSteps.values()) if (step.calls.size === 0) {
+    issues.add(`main_host_call_membership_unknown:${step.source}`);
+  }
+  const hostByProviderId = new Map<string, string>();
+  const providerByHostId = new Map<string, string>();
+  for (const response of providerResponses) {
+    const ownedCalls = [...calls.values()].filter(call => call.source === response.source && call.attempt === response.attempt);
+    if (ownedCalls.length === 0) continue;
+    const bridges = usageFor(response.source, response.attempt).filter(row => (
+      (row.responseId === response.responseId || row.trace?.modelCallId === response.responseId)
+      && ownedCalls.some(call => call.callId === row.trace?.modelCallId)
+    ));
+    if (bridges.length === 0) issues.add(`main_response_host_bridge_unknown:${response.source}:${response.seq}`);
+    for (const row of bridges) {
+      const hostKey = JSON.stringify([response.source, response.attempt, row.trace!.modelCallId]);
+      const providerKey = JSON.stringify([response.source, response.attempt, response.responseId]);
+      const priorHost = hostByProviderId.get(response.responseId);
+      const priorProvider = providerByHostId.get(row.trace!.modelCallId!);
+      if ((priorHost !== undefined && priorHost !== hostKey) || (priorProvider !== undefined && priorProvider !== providerKey)) {
+        issues.add(`conflicting_main_response_bridge:${response.source}:${response.seq}`);
+      }
+      hostByProviderId.set(response.responseId, hostKey);
+      providerByHostId.set(row.trace!.modelCallId!, providerKey);
+    }
+  }
+  for (const { source, attempt } of providerAttempts.values()) if (![...calls.values()].some(call => call.source === source && call.attempt === attempt)) {
+    issues.add(`main_host_call_membership_unknown:${source}`);
+  }
+  return [...issues];
+}
+
+function acceptedUsageCompleteness(input: {
+  sessionId: string;
+  events: readonly SessionEvent[];
+  sources: ReadonlyMap<number, TimingSource>;
+  usage: readonly UsageEvent[];
+  attributionIssues: readonly string[];
+  isAncestor?: (ancestor: number, descendant: number) => boolean;
+}): AcceptedUsageCompleteness {
+  const isAncestor = input.isAncestor ?? ((ancestor, descendant) => ancestor === descendant);
+  const sourceByAttempt = new Map<string, number>();
+  for (const [source, scope] of input.sources) for (const attempt of scope.attempts.ids) sourceByAttempt.set(attempt, source);
+  const mainIssues = new Set(mainModelUsageCoverageIssues(input.sessionId, input.events, input.sources, input.usage, isAncestor));
+  const calls = new Map<string, { source: number; attempt: string; callId: string; events: SessionEvent[] }>();
+  for (const event of input.events) {
+    const data = event.data;
+    if (event.type !== 'model_resilience_observed' || event.role !== 'system' || data.version !== 1
+      || !['call_started', 'response_observed', 'call_finished'].includes(String(data.phase))) continue;
+    const source = positiveEventSeq(data.sourceUserSeq);
+    const owner = exactIdentity(data.runAttemptId) ? sourceByAttempt.get(data.runAttemptId) : undefined;
+    if (source === null || !input.sources.has(source) || owner === undefined || !isAncestor(source, owner)
+      || !exactIdentity(data.runAttemptId) || !exactIdentity(data.stepId) || !exactIdentity(data.callId)
+      || positiveEventSeq(data.requestOrdinal) === null || event.seq <= input.sources.get(source)!.source.seq) continue;
+    const key = JSON.stringify([source, data.runAttemptId, data.stepId, data.requestOrdinal, data.callId]);
+    let call = calls.get(key);
+    if (!call) calls.set(key, call = { source, attempt: data.runAttemptId, callId: data.callId, events: [] });
+    call.events.push(event);
+  }
+  const callIdCounts = new Map<string, number>();
+  for (const call of calls.values()) callIdCounts.set(call.callId, (callIdCounts.get(call.callId) ?? 0) + 1);
+  let responseBoundCalls = 0;
+  let knownZeroCompletedMainCalls = 0;
+  const mainUsage = new Set<UsageEvent>();
+  for (const call of calls.values()) {
+    const starts = call.events.filter(event => event.data.phase === 'call_started');
+    const responses = call.events.filter(event => event.data.phase === 'response_observed');
+    const finishes = call.events.filter(event => event.data.phase === 'call_finished');
+    const ownedUsage = input.usage.filter(row => row.trace?.acceptedSource === usageSourceKey(input.sessionId, call.source)
+      && row.trace.logicalTurnId === `turn:${call.source}` && row.trace.attemptId === call.attempt
+      && row.trace.modelCallId === call.callId);
+    for (const row of ownedUsage) mainUsage.add(row);
+    const firstSeq = (starts[0] ?? responses[0] ?? finishes[0])!.seq;
+    const bound = callIdCounts.get(call.callId) === 1 && starts.length === 1 && responses.length === 1 && finishes.length === 1
+      && starts[0].seq < responses[0].seq && responses[0].seq < finishes[0].seq
+      && starts[0].data.retired !== true && responses[0].data.retired !== true && finishes[0].data.retired !== true
+      && starts[0].data.requestAborted !== true && responses[0].data.requestAborted !== true
+      && finishes[0].data.requestAborted !== true && finishes[0].data.outcome === 'returned'
+      && finishes[0].data.attemptCount === 1 && finishes[0].data.failedAttemptCount === 0
+      && responses[0].data.attempt === 1
+      && typeof responses[0].data.providerResponseIdDigest === 'string'
+      && /^[a-f0-9]{64}$/.test(responses[0].data.providerResponseIdDigest)
+      && ownedUsage.length === 1 && ownedUsage[0].ok !== false && exactIdentity(ownedUsage[0].responseId)
+      && createHash('sha256').update(ownedUsage[0].responseId, 'utf8').digest('hex') === responses[0].data.providerResponseIdDigest
+      && canonicalCacheAccounting(ownedUsage[0]).certified && !canonicalCacheAccounting(ownedUsage[0]).invalid;
+    if (!bound) mainIssues.add(`main_fresh_producer_coverage_unproved:${call.source}:${firstSeq}`);
+    else {
+      responseBoundCalls += 1;
+      const row = ownedUsage[0];
+      if (row.inputTokens === 0 && row.outputTokens === 0 && (row.cachedInputTokens ?? 0) === 0
+        && (row.cacheCreationInputTokens ?? 0) === 0
+        && (row.reasoningTokens ?? 0) === 0 && (row.totalTokens ?? 0) === 0) knownZeroCompletedMainCalls += 1;
+    }
+  }
+  // A usage row is evidence for that response, not proof that no other host or
+  // auxiliary request ran. Unknown legacy roles cannot establish absence.
+  if (calls.size === 0 && input.usage.some(row => row.role === 'brain' || row.role === 'writer')) {
+    mainIssues.add('main_fresh_producer_inventory_unproved');
+  }
+  const recordedTokenRows = { certified: 0, unknown: 0, invalid: 0, failed: 0 };
+  const identityGaps = { providerReportedModelRows: 0, billedAccountRows: 0, backendRows: 0 };
+  for (const row of input.usage) {
+    const accounting = canonicalCacheAccounting(row);
+    if (accounting.certified && !accounting.invalid) recordedTokenRows.certified += 1;
+    else recordedTokenRows.unknown += 1;
+    if (accounting.invalid) recordedTokenRows.invalid += 1;
+    if (row.ok === false) recordedTokenRows.failed += 1;
+    if (!exactIdentity(row.providerReportedModel)) identityGaps.providerReportedModelRows += 1;
+    if (!exactIdentity(row.account)) identityGaps.billedAccountRows += 1;
+    if (!exactIdentity(row.backendId)) identityGaps.backendRows += 1;
+  }
+  const issues = new Set(input.attributionIssues);
+  for (const issue of mainIssues) issues.add(issue);
+  if (recordedTokenRows.unknown > 0) issues.add(`recorded_token_usage_unknown:${recordedTokenRows.unknown}`);
+  if (recordedTokenRows.invalid > 0) issues.add(`recorded_token_usage_invalid:${recordedTokenRows.invalid}`);
+  if (identityGaps.providerReportedModelRows > 0) issues.add(`provider_reported_model_unavailable:${identityGaps.providerReportedModelRows}`);
+  if (identityGaps.billedAccountRows > 0) issues.add(`billed_account_unavailable:${identityGaps.billedAccountRows}`);
+  if (identityGaps.backendRows > 0) issues.add(`backend_identity_unavailable:${identityGaps.backendRows}`);
+  issues.add('all_leg_physical_inventory_unproved');
+  issues.add('provider_priced_cost_not_measured');
+  issues.add('actual_billing_not_measured');
+  return {
+    status: 'unqualified', allLegUsageCertified: false, totals: 'recorded_lower_bound', recordedTokenRows,
+    knownZeroCompletedMainCalls,
+    mainProducerCoverage: { status: calls.size > 0 && responseBoundCalls === calls.size && mainIssues.size === 0
+      ? 'observed_completed_calls' : calls.size > 0 || mainIssues.size > 0 ? 'incomplete' : 'not_observed',
+      observedCalls: calls.size, responseBoundCalls, issues: [...mainIssues] },
+    auxiliaryPhysicalInventory: { status: 'unproved', recordedRowsOutsideMainCalls: input.usage.length - mainUsage.size },
+    identityGaps, cost: { providerPricedCost: 'not_measured', actualBilling: 'not_measured' }, issues: [...issues],
+  };
 }
 
 function objectPayload(raw: unknown): Record<string, unknown> | null {
@@ -1581,6 +1862,9 @@ export function measureAcceptedTask(
   if (legacyWindowUsageRecords > 0) issues.add('excluded_legacy_window_usage');
   if (unscopedWindowUsageRecords > 0) issues.add('unscoped_window_usage');
   if (sessionRead.malformedEventPayloads > 0) issues.add('malformed_session_events');
+  for (const issue of mainModelUsageCoverageIssues(sessionId, sessionRead.events, new Map(
+    [...members].map(([seq, source]) => [seq, { source, attempts: attemptsBySource.get(seq)!, terminal: terminals.get(seq) }]),
+  ), exactUsage, isAncestor)) issues.add(issue);
   for (const [key, worker] of workers.scopes) {
     const usage = exactUsage.filter(row => typeof row.trace?.attemptId === 'string' && worker.attempts.ids.has(row.trace.attemptId));
     const responses = worker.events.filter(event => event.type === 'worker_model_response_completed'
@@ -1715,6 +1999,10 @@ export function measureAcceptedTask(
     legacyWindowUsageRecords, unscopedWindowUsageRecords,
     usageAttributionCertified: issues.size === 0,
     usageCertificationIssues: [...issues],
+    usageCompleteness: acceptedUsageCompleteness({ sessionId, events: sessionRead.events,
+      sources: new Map([...members].map(([seq, source]) => [seq, {
+        source, attempts: attemptsBySource.get(seq)!, terminal: terminals.get(seq),
+      }])), usage: exactUsage, attributionIssues: [...issues], isAncestor }),
     modelRouteEvents: routes.length,
     attemptCount: sourceByAttempt.size, unfinishedAttempts,
     terminalSeq: terminal?.seq ?? null,
@@ -1963,7 +2251,8 @@ export function formatAcceptedTurnComparison(comparison: AcceptedTurnComparison)
     `home:      ${comparison.home}`,
     `baseline:  ${b.acceptedSource} → terminal ${b.terminalSeq}`,
     `candidate: ${c.acceptedSource} → terminal ${c.terminalSeq}`,
-    `usage:     ${b.usageAttribution}${b.usageAttributionCertified ? ' (certified)' : ' (uncertified)'} → ${c.usageAttribution}${c.usageAttributionCertified ? ' (certified)' : ' (uncertified)'}`,
+    `attribution: ${b.usageAttribution}${b.usageAttributionCertified ? ' (certified)' : ' (uncertified)'} → ${c.usageAttribution}${c.usageAttributionCertified ? ' (certified)' : ' (uncertified)'}`,
+    'All-leg usage: UNQUALIFIED lower bound; auxiliary physical-call inventory is unproved. Provider-priced cost and actual billing are not measured.',
     `transport: ${b.terminalTransport ?? 'n/a'} → ${c.terminalTransport ?? 'n/a'}`,
     `status:    ${b.terminalStatus ?? 'n/a'} → ${c.terminalStatus ?? 'n/a'}`,
     '',
@@ -2007,6 +2296,7 @@ export function formatAcceptedTurnComparison(comparison: AcceptedTurnComparison)
   ];
   const warnings: string[] = [];
   for (const measurement of [b, c]) {
+    warnings.push(`${measurement.acceptedSource}: all-leg usage remains unqualified despite any exact attribution; recorded totals are a lower bound. ${measurement.usageCompleteness.issues.join(', ')}.`);
     if (measurement.modelTimingIssues?.length) {
       warnings.push(`${measurement.acceptedSource}: model timing is observational/incomplete: ${measurement.modelTimingIssues.join(', ')}.`);
     }
@@ -2047,7 +2337,8 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
     `home:      ${comparison.home}`,
     `baseline:  ${b.acceptedSource}; sources ${b.sourceUserSeqs.join(', ')}`,
     `candidate: ${c.acceptedSource}; sources ${c.sourceUserSeqs.join(', ')}`,
-    `usage:     ${b.usageAttributionCertified ? 'certified' : 'UNCERTIFIED lower bound'} → ${c.usageAttributionCertified ? 'certified' : 'UNCERTIFIED lower bound'}`,
+    `attribution: ${b.usageAttributionCertified ? 'certified' : 'UNCERTIFIED lower bound'} → ${c.usageAttributionCertified ? 'certified' : 'UNCERTIFIED lower bound'}`,
+    'All-leg usage: UNQUALIFIED lower bound; auxiliary physical-call inventory is unproved. Provider-priced cost and actual billing are not measured.',
     '',
     'Metric                                                               Baseline      Candidate                  Delta',
     row('Proved approval continuations', b.approvalContinuations.length, c.approvalContinuations.length),
@@ -2079,6 +2370,7 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
   ];
   const warnings: string[] = [];
   for (const measurement of [b, c]) {
+    warnings.push(`${measurement.acceptedSource}: all-leg usage remains unqualified despite any exact attribution; recorded totals are a lower bound. ${measurement.usageCompleteness.issues.join(', ')}.`);
     if (measurement.modelTimingIssues?.length) {
       warnings.push(`${measurement.acceptedSource}: model timing is observational/incomplete: ${measurement.modelTimingIssues.join(', ')}.`);
     }

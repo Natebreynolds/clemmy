@@ -55,9 +55,12 @@ export interface ChatApi {
     agentId?: string;
     /** Inbox ids of files uploaded ahead of this message. */
     attachments?: string[];
+    /** The reply will be heard aloud; does not change request identity. */
+    voice?: boolean;
   }): Promise<SendResult>;
   /** Full transcript load for opening an existing session. */
-  loadSession(sessionId: string): Promise<{ events: HarnessEvent[]; latestSeq: number; title?: string }>;
+  loadSession(sessionId: string): Promise<{ events: HarnessEvent[]; latestSeq: number; title?: string;
+    executionSessionId?: string; history?: Array<{ sessionId: string; events: HarnessEvent[] }> }>;
 }
 
 export interface ChatEngineOptions {
@@ -282,10 +285,14 @@ export class ChatEngine {
   /** Open an existing session: load the transcript, then attach live. */
   async open(): Promise<void> {
     if (!this.sessionId) return;
-    const { events, latestSeq } = await this.api.loadSession(this.sessionId);
-    if (this.disposed) return;
+    const openingSessionId = this.sessionId;
+    const openingMessages = this.messages;
+    const { events, latestSeq, executionSessionId, history } = await this.api.loadSession(openingSessionId);
+    if (this.disposed || this.sessionId !== openingSessionId || this.messages !== openingMessages) return;
+    if (executionSessionId) this.sessionId = executionSessionId;
     const unacknowledged = this.messages.filter(message => message.role === 'user' && message.pending);
-    this.messages = [...foldTranscript(events, this.sessionId), ...unacknowledged];
+    this.messages = [...(history ?? []).flatMap(group => foldTranscript(group.events, group.sessionId)),
+      ...foldTranscript(events, this.sessionId), ...unacknowledged];
     this.cursor = latestSeq;
     // A turn may still be in flight (user sent from another surface, or the
     // app was reopened mid-run): if the last user input has no terminal after
@@ -325,6 +332,7 @@ export class ChatEngine {
 
   async send(text: string, selectedMode?: TaskMode, options: {
     attachments?: ChatAttachment[];
+    voice?: boolean;
     connectionResume?: { connectionRequestId: string; clientRequestId: string };
     /** The message answers an approval card: the card shows the decision,
      *  so this exchange stays out of the transcript unless it fails. */
@@ -352,6 +360,7 @@ export class ChatEngine {
         requestSessionId: this.sessionId,
         steer: 'pending',
         idempotencyKey: this.newKey(),
+        ...(options.voice === true ? { voice: true } : {}),
       };
       this.messages = [...this.messages, steerMessage];
       this.emit();
@@ -361,6 +370,7 @@ export class ChatEngine {
           sessionId: this.sessionId,
           idempotencyKey: steerMessage.idempotencyKey!,
           steerOnly: true,
+          ...(steerMessage.voice === true ? { voice: true } : {}),
           ...this.agentField(),
         });
         this.messages = this.messages.map((entry) => (
@@ -390,6 +400,7 @@ export class ChatEngine {
       ...(taskMode ? { taskMode } : {}),
       requestSessionId: this.sessionId,
       idempotencyKey,
+      ...(options.voice === true ? { voice: true } : {}),
       ...(options.connectionResume ? { connectionRequestId: options.connectionResume.connectionRequestId } : {}),
       ...(options.cardDecision ? { cardDecision: options.cardDecision } : {}),
     };
@@ -423,6 +434,7 @@ export class ChatEngine {
       try {
         const result = await this.api.send({ message: failed.text, sessionId: failed.requestSessionId ?? this.sessionId,
           idempotencyKey: failed.idempotencyKey, steerOnly: true, ...(failed.taskMode ? { taskMode: failed.taskMode } : {}),
+          ...(failed.voice === true ? { voice: true } : {}),
           ...this.agentField() });
         this.messages = this.messages.map(message => message.id === messageId
           ? { ...message, pending: result.steered ? undefined : 'failed', steer: result.steered ? 'delivered' : 'failed' } : message);
@@ -461,6 +473,7 @@ export class ChatEngine {
           ...(userMessage.taskMode ? { taskMode: userMessage.taskMode } : {}),
           ...(userMessage.steer ? { steerOnly: true } : {}),
           ...(userMessage.attachments?.length ? { attachments: userMessage.attachments.map((a) => a.id) } : {}),
+          ...(userMessage.voice === true ? { voice: true } : {}),
           ...this.agentField(),
         });
         if (this.disposed) return;
@@ -803,11 +816,12 @@ export class ChatEngine {
         if (resumeSource) {
           // Assistant-only source: the exact edited fields stay on the card.
         } else if (pendingIndex >= 0) {
-          this.messages = this.messages.map((m, i) => (i === pendingIndex ? { ...m, pending: undefined, acceptedSource } : m));
+          this.messages = this.messages.map((m, i) => (i === pendingIndex ? { ...m, pending: undefined, acceptedSource, voice: d.voice === true ? true : undefined } : m));
         } else if (!this.messages.some((m) => m.role === 'user' && (acceptedSource
           ? m.acceptedSource?.sourceUserSeq === event.seq && m.acceptedSource.sessionId === acceptedSource.sessionId
           : m.text === text && sameTaskMode(m.taskMode, readTaskMode(d.taskMode)) && m.pending === undefined))) {
           this.messages = [...this.messages, { id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode), acceptedSource,
+            ...(d.voice === true ? { voice: true } : {}),
             ...(cardDecision ? { cardDecision } : {}) }];
         }
         if (adoptedSource) {
@@ -1193,6 +1207,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
           cardDecisionsBySource.set(event.seq, cardDecision);
         }
         if (text) messages.push({ id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode),
+          ...(d.voice === true ? { voice: true } : {}),
           acceptedSource: acceptedConversationSource(event, sessionId), ...(cardDecision ? { cardDecision } : {}) });
         currentSourceUserSeq = event.seq;
         modelRetrySourceClosed = false;

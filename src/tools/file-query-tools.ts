@@ -81,7 +81,9 @@ export function registerFileQueryTools(server: McpServer): void {
           // recall's id (however it was dispatched) names its producer, and a
           // receipt is redeemed under its own exact identity. The query
           // authority check then applies to the bytes actually read.
-          const resolved = resolveRetainedOutputRead(sessionId, callIdSource!);
+          const sourceUserSeq = getToolOutputContext()?.sourceUserSeq;
+          const resolved = resolveRetainedOutputRead(sessionId, callIdSource!,
+            sourceUserSeq ? { sourceUserSeq } : undefined);
           const readId = resolved.callId;
           const named = readId === callIdSource ? `call id "${callIdSource}"` : `call id "${callIdSource}" (read from its source "${readId}")`;
           let record: { output: string; contentBytes: number; truncatedAtWrite: boolean };

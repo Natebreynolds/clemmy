@@ -2,6 +2,7 @@ import { MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS, parseMemoryRequirementPacket, t
 import type { ResolvedRoleModel } from './model-roles.js';
 import { classifyModelError } from './resilient-model.js';
 import { READ_SCOPE_EVIDENCE_RUBRIC } from '../../agents/clem-rubric.js';
+import { STOP_CONTINUITY_REASONING_GUIDANCE } from './stop-continuity-reasoning.js';
 import { redactSensitiveText } from '../security.js';
 import { Agent, Runner } from '@openai/agents';
 import { MODELS, getRuntimeEnv } from '../../config.js';
@@ -21,14 +22,32 @@ import {
 } from './judge-evidence-tools.js';
 import {
   assessReviewCoverage, parseNeedsAllOf, reviewCoverageFinding, reviewCoverageFollowUp, reviewCoverageLedger,
-  type EvidenceCoverageRow, type ReviewCoverageStatus,
+  type EvidenceCoverageRow, type ReviewCoverageStatus, type ReviewedEvidenceRow,
 } from './review-evidence-coverage.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
-import { projectionMayCompleteSource } from './retained-projection-scope.js';
+import { projectionMayCompleteSource, retainedProjectionReadsSource } from './retained-projection-scope.js';
 import { historicalReadPacketIsCurrent, historicalReadClosureIsCurrent,
   type HistoricalReadPacket, type HistoricalReadClosure } from './historical-completion-evidence.js';
 import { judgeVerdictRepairInstructions, judgeVerdictRepairPrompt,
   type CompletionVerdictRepairContract } from './judge-verdict-repair-contract.js';
+import { createHash } from 'node:crypto';
+import { modelUsageAttributionStorage } from '../usage-log.js';
+import { composeReviewInput, createReviewInputObservation,
+  type ReviewInputComposition, type ReviewInputPart, type ReviewInputOwner,
+  type ReviewInputSeed, type ReviewInputObservation } from './review-input-observation.js';
+
+/** An observer never changes the joined bytes or becomes review authority. */
+function joinReviewParts(parts: readonly ReviewInputPart[], separator: string,
+  observe?: (composition: ReviewInputComposition) => void): string {
+  const text = parts.map(part => typeof part === 'string' ? part : part.text).join(separator);
+  if (observe) try { observe(composeReviewInput(parts, separator)); } catch { /* diagnostic only */ }
+  return text;
+}
+
+function reviewOwnerAtModelEntry(): ReviewInputOwner | undefined {
+  const owner = modelUsageAttributionStorage.getStore();
+  return owner ? { sessionId: owner.sessionId, sourceUserSeq: owner.sourceUserSeq, attemptId: owner.attemptId } : undefined;
+}
 
 /**
  * Judge system prompt — modeled on OpenAI Codex's continuation.md auditor
@@ -61,12 +80,13 @@ export const OWNER_STANDING_INSTRUCTIONS_RUBRIC =
 
 /** Exact host completion guidance. Only its existing caller opts in; the
  * source's changing objective, receipt bytes and lookup refs stay in the prompt. */
-export const HOST_COMPLETION_EVIDENCE_GUIDANCE = `Judge only the effective accepted objective. A successful empty result may complete a bounded lookup; a cancelled or replaced request does not owe its abandoned effects. Do not demand writes or artifacts the objective never requested. Unavailable optional or irrelevant reads do not create new requirements. Each result above is shown whole or as an explicitly bounded reviewer preview, as its own line says. A claim that rests on content outside what is shown, including a claim that data is missing, empty, unavailable or complete, is unverified unless another read shown here covers it, such as a filtered query, a true count or a recalled page, or you open it with the evidence tools. EARLIER TURNS evidence counts for what the reply says an earlier turn checked or found at that time; it cannot show this turn's own effects. A selected/derived projection is not the full source result, and an omitted projection field does not establish absence. Distinguish absent values from zero, empty and uninspected values. When the objective is not met and the evidence shows another attempt cannot change that, the verdict is BLOCKED.`;
+export const HOST_COMPLETION_EVIDENCE_GUIDANCE = `Judge only the effective accepted objective. A successful empty result may complete a bounded lookup; a cancelled or replaced request does not owe its abandoned effects. Do not demand writes or artifacts the objective never requested. Unavailable optional or irrelevant reads do not create new requirements. Each result above is shown whole or as an explicitly bounded reviewer preview, as its own line says. A claim that rests on content outside what is shown, including a claim that data is missing, empty, unavailable or complete, is unverified unless another read shown here covers it, such as a filtered query, a true count or a recalled page, or you open it with the evidence tools. EARLIER TURNS evidence counts for what the reply says an earlier turn checked or found at that time; it cannot show this turn's own effects. A selected/derived projection is not the full source result, and an omitted projection field does not establish absence. Distinguish absent values from zero, empty and uninspected values. When the objective is not met and the evidence shows another attempt cannot change that, the verdict is BLOCKED.\n${STOP_CONTINUITY_REASONING_GUIDANCE}`;
 
 export const JUDGE_SYSTEM_PROMPT = [
   'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',
   '',
-  'Use an AUDIT CHECKLIST: enumerate the concrete, verifiable deliverables the objective implies, then check each one against the assistant\'s response.',
+  'Use an AUDIT CHECKLIST: enumerate the concrete, verifiable deliverables the objective implies, then check both their presence and correctness against the assistant\'s response.',
+  'For each requested analysis, recommendation or scenario, check the stated condition, supporting evidence and consequence against the whole objective and applicable rules. Verify that the evidence establishes the conclusion at its claimed identity, time and scope; a missing record, valid format, correct count or present scenario is not proof of its reasoning. Require exact identity and authority bindings before using an attempt-scoped observation to establish a logical-operation or authorization conclusion. If all requested work is present but a premise is unsupported or the consequence does not follow, return CORRECT with all such claims together; otherwise retain the appropriate unmet-work verdict.',
   '',
   'Rules:',
   READ_SCOPE_EVIDENCE_RUBRIC,
@@ -180,6 +200,8 @@ export interface ObjectiveJudgeVerdict {
   /** The reviewer's output had no verdict line and it was asked for one; the
    * start of what it first wrote, kept so the cause can be read afterwards. */
   verdictRestatedFrom?: string;
+  /** Same-call SDK input diagnostics; never a semantic verdict or wire/billing proof. */
+  reviewInputObservation?: ReviewInputObservation;
   /** Typed Jev (or similar) prefilter produced this verdict. */
   fast?: boolean;
   /** Qualified past observations, separately bound from current receipts. */
@@ -575,6 +597,8 @@ export function composeJudgedObjective(input: string, priorUserMessages: string[
 /** Retained framework references plus execution evidence. The effective
  * accepted objective governs which requirements apply; loading adds no work. */
 export interface SkillExecutionContext {
+  /** Exact accepted-source owner supplied by the host for input diagnostics only. */
+  reviewInputOwner?: ReviewInputOwner;
   /** Exact-source memory branch. Missing typed output cannot qualify its completion. */
   memoryRequirementContext?: string;
   skills: SessionSkill[];
@@ -585,6 +609,9 @@ export interface SkillExecutionContext {
   verifiedReads?: string;
   /** Structured read settlements for coverage checks (not a character heuristic). */
   verifiedReadResults?: CompletionEvidenceRow[];
+  /** Exact shared parent reads. Review coverage only: never child dispatches,
+   * current-source completeness, or eligibility for historical fast closure. */
+  inheritedReadCoverage?: ReviewedEvidenceRow[];
   historicalEvidence?: HistoricalReadPacket;
   /** Source-authenticated host evidence is kept whole until the selected
    * model's request admission. Never independently clip the reply or skills
@@ -614,16 +641,17 @@ export interface SkillExecutionContext {
  * existing cache boundary. Absence preserves the legacy instructions exactly. */
 export function buildCompletionJudgeInstructions(
   context?: Pick<SkillExecutionContext, 'completionEvidenceGuidance' | 'memoryRequirementContext'>,
+  observe?: (composition: ReviewInputComposition) => void,
 ): string {
   if (context?.completionEvidenceGuidance !== undefined
     && context.completionEvidenceGuidance !== HOST_COMPLETION_EVIDENCE_GUIDANCE) {
     throw new Error('Completion evidence guidance must match the retained host rules exactly.');
   }
-  return [
-    JUDGE_SYSTEM_PROMPT,
-    ...(context?.completionEvidenceGuidance ? [HOST_COMPLETION_EVIDENCE_GUIDANCE] : []),
-    ...(context?.memoryRequirementContext ? [MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS] : []),
-  ].join('\n\n');
+  return joinReviewParts([
+    { text: JUDGE_SYSTEM_PROMPT, component: 'judge_rubric' },
+    ...(context?.completionEvidenceGuidance ? [{ text: HOST_COMPLETION_EVIDENCE_GUIDANCE, component: 'host_completion_guidance' as const }] : []),
+    ...(context?.memoryRequirementContext ? [{ text: MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS, component: 'memory_review_guidance' as const }] : []),
+  ], '\n\n', observe);
 }
 
 export interface CompletionEvidenceRow {
@@ -648,6 +676,8 @@ export interface CompletionEvidenceRow {
   sourceLogicalToolCallId?: string;
   sourceResultHandleId?: string;
   sourcePhysicalDispatchId?: string;
+  sourceSessionId?: string;
+  sourceUserSeq?: number;
   /** False for a selected subtree; contentComplete remains reply completeness. */
   sourceSelectionComplete?: boolean;
   /** What the review was shown of the retained result, and what it holds. */
@@ -695,28 +725,6 @@ function isFailedOutcomeAttempt(row: CompletionEvidenceRow): boolean {
   return !isSucceededReceipt(row);
 }
 
-function evidenceLineageIds(row: CompletionEvidenceRow): string[] {
-  const ids: string[] = [];
-  for (const value of [
-    row.logicalToolCallId,
-    row.resultHandleId,
-    row.physicalDispatchId,
-    row.contentDigest,
-    row.sourceLogicalToolCallId,
-    row.sourceResultHandleId,
-    row.sourcePhysicalDispatchId,
-  ]) {
-    if (typeof value === 'string' && value.length > 0) ids.push(value);
-  }
-  return ids;
-}
-
-function sharesEvidenceLineage(a: CompletionEvidenceRow, b: CompletionEvidenceRow): boolean {
-  const other = new Set(evidenceLineageIds(b));
-  if (other.size === 0) return false;
-  return evidenceLineageIds(a).some((id) => other.has(id));
-}
-
 /** A complete retained_projection covers only the source result it projects. */
 function projectionCompletesSource(
   source: CompletionEvidenceRow,
@@ -731,11 +739,12 @@ function projectionCompletesSource(
     // A later whole read of a focused reply may inspect that reply, but the
     // lineage cannot cross its selected scope and certify an ancestor whole.
     if (!projectionMayCompleteSource(row)) return false;
-    if (sharesEvidenceLineage(source, row)) return true;
+    if (retainedProjectionReadsSource(row, source)) return true;
     for (const next of all) {
       if (next === row || next === source || seen.has(next)) continue;
-      if (next.evidenceKind !== 'retained_projection') continue;
-      if (!sharesEvidenceLineage(row, next)) continue;
+      if (next.evidenceKind !== 'retained_projection' || !isSucceededReceipt(next)
+        || next.status === 'not_succeeded' || next.status === 'unavailable') continue;
+      if (!retainedProjectionReadsSource(row, next)) continue;
       if (visit(next)) return true;
     }
     return false;
@@ -928,24 +937,73 @@ export function clipForJudge(text: string, max = JUDGE_RESPONSE_MAX_CHARS): { te
  * the candidate is finished work. A plan is reviewed before anything runs. */
 function coverageReviewed(skillContext?: SkillExecutionContext): boolean {
   return Boolean(skillContext?.fullSourceEvidence && skillContext.evidence
-    && skillContext.verifiedReadResults && !skillContext.reviewsPlan);
+    && (skillContext.verifiedReadResults || skillContext.inheritedReadCoverage) && !skillContext.reviewsPlan);
+}
+
+function reviewCoverageResults(context?: SkillExecutionContext): ReviewedEvidenceRow[] {
+  return [...(context?.verifiedReadResults ?? []), ...(context?.inheritedReadCoverage ?? [])];
+}
+
+/** The same complete reference/standing-instruction view for both readers.
+ * Applicability comes from the effective objective, not from reading a skill.
+ * These blocks grant no execution, effect or approval authority. */
+function completionRequirementParts(skillContext?: SkillExecutionContext): ReviewInputPart[] {
+  const parts: ReviewInputPart[] = [];
+  if (skillContext && skillContext.skills.length > 0) {
+    parts.push(
+      '',
+      { component: 'retained_skill_references', text: [
+      '=== RETAINED SKILL REFERENCES — relevance is governed by the effective accepted objective ===',
+      'Reading a skill supplies reference material; it does not adopt every step or add deliverables. Interpret which framework and requirements the effective accepted objective actually adopts. Planning, inspecting or comparing a skill does not authorize executing it. Prior-source references can explain a framework the owner asks to reuse, but unrelated prior material and unknown scope cannot impose work. Different body digests are different retained versions; do not silently substitute the first or newest version. Check required steps and deliverables when they are applicable to the accepted job, using actual evidence. A missing applicable required step is a real gap; mere non-execution of a read reference is not.',
+      ...skillContext.skills.map(renderSkillReference),
+      ].join('\n') },
+    );
+  }
+  const agentInstructions = skillContext?.agentInstructions?.trim();
+  if (agentInstructions) {
+    parts.push(
+      '',
+      { component: 'standing_instructions', text: [
+      '=== THE SAVED AGENT THIS REPLY WAS WRITTEN AS — the owner\'s standing instructions for this kind of work ===',
+      'Judge against the objective. These instructions say how the owner wants this kind of work done: following them is not a defect, and a clear departure from one that applies to this reply is a real gap. They never add deliverables the objective did not ask for.',
+      agentInstructions,
+      ].join('\n') },
+    );
+  }
+  return parts;
+}
+
+function completionRequirementBlocks(skillContext?: SkillExecutionContext): string[] {
+  return completionRequirementParts(skillContext).map(part => typeof part === 'string' ? part : part.text);
+}
+
+function jevCompletionRequirementContext(context?: SkillExecutionContext): string {
+  // Reuse the exact-value guard: a fast path cannot silently drop an invalid
+  // opt-in that the configured reviewer would refuse. No dynamic source bytes
+  // enter the configured reviewer's static cache prefix.
+  buildCompletionJudgeInstructions(context);
+  return [
+    ...(context?.completionEvidenceGuidance ? [HOST_COMPLETION_EVIDENCE_GUIDANCE] : []),
+    ...completionRequirementBlocks(context),
+  ].join('\n');
 }
 
 export function buildObjectiveJudgePrompt(
   objective: string,
   assistantResponse: string,
   skillContext?: SkillExecutionContext,
+  observe?: (composition: ReviewInputComposition) => void,
 ): string {
   const shown = skillContext?.fullSourceEvidence
     ? { text: assistantResponse, truncated: false }
     : clipForJudge(assistantResponse, JUDGE_RESPONSE_MAX_CHARS);
-  const parts = [
-    `Objective: ${objective}`,
+  const parts: ReviewInputPart[] = [
+    { text: `Objective: ${objective}`, component: 'effective_objective' },
     '',
     shown.truncated
       ? "Assistant's most recent response (LONG — windowed to its head and tail with the middle elided for length; judge ONLY what is visible and do NOT mark the objective incomplete merely because an expected deliverable might fall in the omitted middle):"
       : "Assistant's most recent response:",
-    shown.text,
+    { text: shown.text, component: 'candidate_response' },
     '=== END OF CANDIDATE RESPONSE ===',
   ];
   // Tool-call evidence — surface it whenever we have it, EVEN with no skill
@@ -959,32 +1017,16 @@ export function buildObjectiveJudgePrompt(
     parts.push(
       '',
       '=== PRIVATE REVIEW EVIDENCE — not appended to the user-facing response ===',
-      skillContext?.fullSourceEvidence
+      { component: 'private_review_evidence', text: skillContext?.fullSourceEvidence
         ? `Authenticated evidence for this accepted source (raw results and retained projections are identified separately): ${toolSummary}`
-        : `Tool calls made this session (evidence the work actually ran — corroborates the reply, but the response must still contain the artifact/URL the objective named): ${toolSummary}`,
+        : `Tool calls made this session (evidence the work actually ran — corroborates the reply, but the response must still contain the artifact/URL the objective named): ${toolSummary}` },
     );
   }
   // Which results the review holds only in part is a host fact the reviewer
   // should have before it rules, not something to infer from each block.
-  const ledger = coverageReviewed(skillContext) ? reviewCoverageLedger(skillContext!.verifiedReadResults ?? []) : undefined;
-  if (ledger) parts.push('', ledger);
-  if (skillContext && skillContext.skills.length > 0) {
-    parts.push(
-      '',
-      '=== RETAINED SKILL REFERENCES — relevance is governed by the effective accepted objective ===',
-      'Reading a skill supplies reference material; it does not adopt every step or add deliverables. Interpret which framework and requirements the effective accepted objective actually adopts. Planning, inspecting or comparing a skill does not authorize executing it. Prior-source references can explain a framework the owner asks to reuse, but unrelated prior material and unknown scope cannot impose work. Different body digests are different retained versions; do not silently substitute the first or newest version. Check required steps and deliverables when they are applicable to the accepted job, using actual evidence. A missing applicable required step is a real gap; mere non-execution of a read reference is not.',
-      ...skillContext.skills.map(renderSkillReference),
-    );
-  }
-  const agentInstructions = skillContext?.agentInstructions?.trim();
-  if (agentInstructions) {
-    parts.push(
-      '',
-      '=== THE SAVED AGENT THIS REPLY WAS WRITTEN AS — the owner\'s standing instructions for this kind of work ===',
-      'Judge against the objective. These instructions say how the owner wants this kind of work done: following them is not a defect, and a clear departure from one that applies to this reply is a real gap. They never add deliverables the objective did not ask for.',
-      agentInstructions,
-    );
-  }
+  const ledger = coverageReviewed(skillContext) ? reviewCoverageLedger(reviewCoverageResults(skillContext)) : undefined;
+  if (ledger) parts.push('', { text: ledger, component: 'coverage_ledger' });
+  parts.push(...completionRequirementParts(skillContext));
   // Live 2026-09-14: the host refused a stale call before dispatch, no
   // provider call was made, and the reply said "the Outlook API won't accept
   // its event ID". The judge marked that fulfilled. A provider outcome the
@@ -995,7 +1037,7 @@ export function buildObjectiveJudgePrompt(
     + 'With no such call, treat the reported failure as unverified: the objective is not fulfilled, and the response must not be credited for explaining a failure that the evidence does not show.',
   );
   parts.push('', 'Audit it against the objective and respond with exactly one verdict line.');
-  return parts.join('\n');
+  return joinReviewParts(parts, '\n', observe);
 }
 
 /** Thrown by an attempt whose model answered but off-contract — classified
@@ -1039,6 +1081,8 @@ function quotaRefusalWords(error: unknown): string | null {
  * reviewer receives or what the attempt returns. */
 export interface JudgeAttemptObservers {
   lookup?: JudgeEvidenceLookupObserver;
+  /** Only the returned attempt may lend this nominal same-call observation to a verdict. */
+  input?: (record: ReviewInputObservation) => unknown;
   /** The reviewer's output carried no verdict line and it was asked to state
    * one; `head` is the start of what it had written. */
   restated?: (head: string) => void;
@@ -1062,12 +1106,15 @@ export async function runRoutedJudgeAttempt<T>(
   onResponder?: (modelId: string) => void,
   observe?: JudgeAttemptObservers,
   verdictRepairContract?: CompletionVerdictRepairContract,
+  reviewInput?: ReviewInputSeed,
 ): Promise<T> {
   signal?.throwIfAborted();
   // Keep per-review handles out of tool schemas and stable instructions.
   // Supply them once with the evidence whose handles they identify.
-  const reviewInstructions = evidence ? instructions + judgeEvidenceGuidance(evidence) : instructions;
-  const reviewPrompt = evidence ? `${prompt}\n\nReview evidence references: ${judgeEvidenceReferences(evidence)}` : prompt;
+  const evidenceGuidance = evidence ? judgeEvidenceGuidance(evidence) : '';
+  const evidenceReferences = evidence ? `\n\nReview evidence references: ${judgeEvidenceReferences(evidence)}` : '';
+  const reviewInstructions = evidence ? instructions + evidenceGuidance : instructions;
+  const reviewPrompt = evidence ? `${prompt}${evidenceReferences}` : prompt;
   if (requireCompletePrompt) {
     const admission = completionJudgeContextAdmission(routing.modelId, reviewInstructions, reviewPrompt);
     if (!admission.fits) {
@@ -1088,11 +1135,28 @@ export async function runRoutedJudgeAttempt<T>(
   // Review depth is provider-neutral. Each adapter maps supported effort
   // values through its wire capabilities; unsupported controls stay omitted.
   const reviewEffort = effort;
+  const agentInstructions = evidence && routing.judgeFamily === 'claude'
+    ? `${reviewInstructions}${INSTRUCTION_CACHE_DELIM}` : evidence ? reviewInstructions : instructions;
+  let inputCollector: ReturnType<typeof createReviewInputObservation> | undefined;
+  let observedRouting = routing;
+  if (reviewInput && routing.model) try {
+    // Preserve the exact assembly tree. No component claim is found by matching text.
+    inputCollector = createReviewInputObservation({ ...reviewInput,
+      instructions: composeReviewInput([
+        reviewInput.instructions,
+        ...(evidence ? [{ text: evidenceGuidance, component: 'evidence_tool_guidance' as const }] : []),
+        ...(evidence && routing.judgeFamily === 'claude' ? [INSTRUCTION_CACHE_DELIM] : []),
+      ], ''),
+      prompt: composeReviewInput([reviewInput.prompt,
+        ...(evidence ? [{ text: evidenceReferences, component: 'evidence_reference_inventory' as const }] : []),
+      ], ''),
+    }, { signal, ownerAtEntry: reviewOwnerAtModelEntry });
+    observedRouting = { ...routing, model: inputCollector.wrap(routing.model) };
+  } catch { /* input observation cannot change review routing or execution */ }
   const agent = evidence
-    ? buildJudgeAgent(routing,
-      routing.judgeFamily === 'claude' ? `${reviewInstructions}${INSTRUCTION_CACHE_DELIM}` : reviewInstructions,
+    ? buildJudgeAgent(observedRouting, agentInstructions,
       judgeEvidenceTools(evidence, JUDGE_EVIDENCE_LOOKUP_BUDGET, observe?.lookup), reviewEffort)
-    : buildJudgeAgent(routing, instructions, [], reviewEffort);
+    : buildJudgeAgent(observedRouting, instructions, [], reviewEffort);
   signal?.throwIfAborted();
   const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1, signal });
   signal?.throwIfAborted();
@@ -1107,6 +1171,7 @@ export async function runRoutedJudgeAttempt<T>(
     }
   };
   observeResponder(result.rawResponses);
+  let inputObservation = inputCollector?.finish(result.rawResponses, result.finalOutput);
   let value = parse(result.finalOutput);
   if (value === null) {
     // Live 2026-09-24 (source 294528): a flagship reviewer wrote a 2,800-token
@@ -1133,8 +1198,17 @@ export async function runRoutedJudgeAttempt<T>(
           && !instructions.includes(MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS)
           ? `${instructions}\n\n${MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS}` : instructions;
         const repairInstructions = judgeVerdictRepairInstructions(repairBaseInstructions, verdictRepairContract);
-        const repairAgent = buildJudgeAgent(routing, repairInstructions, [], VERDICT_RESTATEMENT_EFFORT);
         const repairPrompt = judgeVerdictRepairPrompt(prior, verdictRepairContract);
+        let repairCollector: ReturnType<typeof createReviewInputObservation> | undefined;
+        let repairRouting = routing;
+        if (reviewInput && routing.model) try {
+          repairCollector = createReviewInputObservation({ ...reviewInput, stage: 'verdict_restatement',
+            instructions: composeReviewInput([{ text: repairInstructions, component: 'verdict_restatement_instructions' }], ''),
+            prompt: composeReviewInput([{ text: repairPrompt, component: 'verdict_restatement_input' }], ''),
+          }, { signal, ownerAtEntry: reviewOwnerAtModelEntry });
+          repairRouting = { ...routing, model: repairCollector.wrap(routing.model) };
+        } catch { /* no observation is authority to retry or alter the request */ }
+        const repairAgent = buildJudgeAgent(repairRouting, repairInstructions, [], VERDICT_RESTATEMENT_EFFORT);
         // A missing verdict must not turn an incomplete review excerpt into
         // completion authority. Preserve the whole review or decline repair.
         const repairAdmission = completionJudgeContextAdmission(routing.modelId, repairInstructions, repairPrompt);
@@ -1145,6 +1219,7 @@ export async function runRoutedJudgeAttempt<T>(
         );
         signal?.throwIfAborted();
         observeResponder(repaired.rawResponses);
+        inputObservation = repairCollector?.finish(repaired.rawResponses, repaired.finalOutput);
         value = parse(repaired.finalOutput);
       } catch (error) {
         signal?.throwIfAborted();
@@ -1158,6 +1233,10 @@ export async function runRoutedJudgeAttempt<T>(
     }
   }
   signal?.throwIfAborted();
+  if (inputObservation) try {
+    const reported = observe?.input?.(inputObservation);
+    if (reported && typeof (reported as PromiseLike<unknown>).then === 'function') void Promise.resolve(reported).catch(() => {});
+  } catch { /* diagnostics never alter a parsed verdict */ }
   return value;
 }
 
@@ -1176,6 +1255,7 @@ interface CompletionJudgeRun {
   evidenceCoverage?: ReviewEvidenceCoverageRecord;
   /** The verdict line was asked for separately; the start of the first output. */
   verdictRestatedFrom?: string;
+  reviewInputObservation?: ReviewInputObservation;
 }
 
 /**
@@ -1205,6 +1285,7 @@ export async function runHedgedJudge<T>(
     effort?: JudgeReviewEffort;
     /** Only completion supplies additional same-answer output obligations. */
     verdictRepairContract?: CompletionVerdictRepairContract;
+    reviewInput?: ReviewInputSeed;
     /** Cancellation belongs to the caller, never to review/fallback policy. */
     signal?: AbortSignal;
   } = {},
@@ -1213,7 +1294,8 @@ export async function runHedgedJudge<T>(
   lookups?: JudgeEvidenceLookup[];
   /** Set when that attempt's verdict line had to be asked for separately:
    *  the start of what the reviewer first wrote. */
-  restatedFrom?: string }> {
+  restatedFrom?: string;
+  reviewInputObservation?: ReviewInputObservation }> {
   const startedAt = Date.now();
   let routing: BoundaryJudgeRouting | undefined;
   let callerSignal = opts.signal;
@@ -1246,11 +1328,13 @@ export async function runHedgedJudge<T>(
     // inspected nothing on behalf of the verdict that won.
     const attemptLookups = new Map<BoundaryJudgeRouting, JudgeEvidenceLookup[]>();
     const attemptRestated = new Map<BoundaryJudgeRouting, string>();
+    const attemptInputs = new Map<BoundaryJudgeRouting, ReviewInputObservation>();
     const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (deadlineSignal?: AbortSignal): Promise<T> => {
       const signals = [signal, deadlineSignal, callerSignal].filter((value): value is AbortSignal => Boolean(value));
       const lookups: JudgeEvidenceLookup[] = [];
       attemptLookups.set(r, lookups);
       attemptRestated.delete(r);
+      attemptInputs.delete(r);
       return runRoutedJudgeAttempt<T>(r, instructions, prompt, parse, opts.requireCompletePrompt === true,
         opts.evidence, signals.length ? AbortSignal.any(signals) : undefined, opts.effort, (modelId) => {
           observedRoutes.set(r, modelId === r.modelId ? r : { ...r, modelId,
@@ -1258,8 +1342,9 @@ export async function runHedgedJudge<T>(
             substituteForExactPin: true,
             substituteReason: r.substituteReason ?? 'provider_reported_model',
           });
-        }, { lookup: (lookup) => { lookups.push(lookup); }, restated: (head) => { attemptRestated.set(r, head); } },
-        opts.verdictRepairContract);
+        }, { lookup: (lookup) => { lookups.push(lookup); }, restated: (head) => { attemptRestated.set(r, head); },
+          input: (record) => { attemptInputs.set(r, record); } },
+        opts.verdictRepairContract, opts.reviewInput);
     };
     // An explicit caller deadline still wins; otherwise use the deadline the
     // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
@@ -1340,7 +1425,8 @@ export async function runHedgedJudge<T>(
     if (raced.value !== null) {
       recordCompletionJudgeMetric(isPass(raced.value) ? 'passed' : 'blocked', startedAt, winner, lane);
       return { value: raced.value, failure: null, routing: winner, lookups: [...(attemptLookups.get(winningRoute) ?? [])],
-        ...(attemptRestated.has(winningRoute) ? { restatedFrom: attemptRestated.get(winningRoute)! } : {}) };
+        ...(attemptRestated.has(winningRoute) ? { restatedFrom: attemptRestated.get(winningRoute)! } : {}),
+        ...(attemptInputs.has(winningRoute) ? { reviewInputObservation: attemptInputs.get(winningRoute)! } : {}) };
     }
     const failure =
       raced.errors.length === 0
@@ -1426,12 +1512,24 @@ async function runCompletionJudge(
   judge: { lane?: JudgeMetricLane; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<CompletionJudgeRun> {
   judge.signal?.throwIfAborted();
-  const instructions = buildCompletionJudgeInstructions(skillContext);
-  const basePrompt = buildObjectiveJudgePrompt(objective, assistantResponse, skillContext);
+  let instructionsComposition: ReviewInputComposition | undefined;
+  let basePromptComposition: ReviewInputComposition | undefined;
+  const captureInput = skillContext?.reviewInputOwner !== undefined;
+  const instructions = buildCompletionJudgeInstructions(skillContext,
+    captureInput ? value => { instructionsComposition = value; } : undefined);
+  const basePrompt = buildObjectiveJudgePrompt(objective, assistantResponse, skillContext,
+    captureInput ? value => { basePromptComposition = value; } : undefined);
   const prompt = skillContext?.memoryRequirementContext
     ? `${basePrompt}\n\n${skillContext.memoryRequirementContext}\n\n${MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS}` : basePrompt;
+  let promptComposition: ReviewInputComposition | undefined = basePromptComposition;
+  if (basePromptComposition && skillContext?.memoryRequirementContext) try {
+    promptComposition = composeReviewInput([basePromptComposition,
+      { text: skillContext.memoryRequirementContext, component: 'memory_requirement_context' },
+      { text: MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS, component: 'memory_review_guidance' },
+    ], '\n\n');
+  } catch { promptComposition = undefined; /* diagnostic only */ }
   const checksCoverage = coverageReviewed(skillContext);
-  const results = skillContext?.verifiedReadResults ?? [];
+  const results = reviewCoverageResults(skillContext);
   const verdictRepairContract: CompletionVerdictRepairContract = {
     evidenceCoverage: checksCoverage && reviewCoverageLedger(results) !== undefined,
     memoryRequirement: Boolean(skillContext?.memoryRequirementContext),
@@ -1446,7 +1544,8 @@ async function runCompletionJudge(
     return { ...verdict, ...(checksCoverage ? { needsAllOf: parseNeedsAllOf(output) } : {}),
       ...(memoryRequirement ? { memoryRequirement } : {}) };
   };
-  const hedged = (reviewPrompt: string, depth: ReviewDepthRequest) => {
+  const hedged = (reviewPrompt: string, depth: ReviewDepthRequest, stage: ReviewInputSeed['stage'],
+    composition?: ReviewInputComposition) => {
     judge.signal?.throwIfAborted();
     const timeoutMs = judge.timeoutMs ?? depth.timeoutMs;
     return runHedgedJudge(
@@ -1461,18 +1560,26 @@ async function runCompletionJudge(
         ...(skillContext?.evidence ? { evidence: skillContext.evidence } : {}),
         ...(skillContext?.reviewedAuthor ? { reviewedAuthor: skillContext.reviewedAuthor } : {}),
         ...(depth.effort ? { effort: depth.effort } : {}),
+        ...(skillContext?.reviewInputOwner && instructionsComposition && composition ? { reviewInput: {
+          owner: skillContext.reviewInputOwner, stage,
+          objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex'),
+          candidateDigest: createHash('sha256').update(assistantResponse, 'utf8').digest('hex'),
+          instructions: instructionsComposition, prompt: composition,
+        } } : {}),
         quotaAwareRoute: true, verdictRepairContract },
     );
   };
   const plain = ({ needsAllOf: _needsAllOf, ...verdict }: Parsed): NonNullable<CompletionJudgeRun['verdict']> => verdict;
+  let reviewsStarted = 0;
   const review = async (depth: ReviewDepthRequest): Promise<CompletionJudgeRun> => {
     judge.signal?.throwIfAborted();
-    const first = await hedged(prompt, depth);
+    const first = await hedged(prompt, depth, reviewsStarted++ === 0 ? 'completion' : 'confirmation', promptComposition);
     judge.signal?.throwIfAborted();
     const run: CompletionJudgeRun = { verdict: first.value ? plain(first.value) : null, failure: first.failure, routing: first.routing,
       ...(first.restatedFrom ? { verdictRestatedFrom: first.restatedFrom } : {}),
       ...(first.unavailableReason ? { unavailableReason: first.unavailableReason } : {}),
       ...(first.invalidDetail ? { invalidDetail: first.invalidDetail } : {}) };
+    if (first.reviewInputObservation) run.reviewInputObservation = first.reviewInputObservation;
     // Coverage qualifies an acceptance. A verdict that already sends the work
     // back, waits on the owner or is blocked claims nothing to qualify.
     const accepts = (value: Parsed | null): value is Parsed => Boolean(value?.done && !value.awaitingUser && !value.blocked);
@@ -1486,9 +1593,16 @@ async function runCompletionJudge(
       // and what was read of them, and the reviewer inspects or corrects. The
       // evidence prompt is resent unchanged ahead of it, so a provider that
       // caches a prefix reads it from cache.
-      const second = await hedged([
+      const followUpParts = [
         prompt, '', `Your verdict on the above: DONE: ${first.value.reason}`, '', reviewCoverageFollowUp(assessment),
-      ].join('\n'), depth);
+      ];
+      let followUpComposition: ReviewInputComposition | undefined;
+      if (promptComposition) try {
+        followUpComposition = composeReviewInput([promptComposition, '',
+          { text: followUpParts.slice(2).join('\n'), component: 'coverage_followup' },
+        ], '\n');
+      } catch { /* diagnostic only */ }
+      const second = await hedged(followUpParts.join('\n'), depth, 'coverage_followup', followUpComposition);
       judge.signal?.throwIfAborted();
       followUp = second.value ? 'answered' : 'unanswered';
       if (!second.value) followUpFailure = { failure: second.failure,
@@ -1497,6 +1611,7 @@ async function runCompletionJudge(
       if (second.value) {
         lookups.push(...(second.lookups ?? []));
         run.verdict = plain(second.value);
+        run.reviewInputObservation = second.reviewInputObservation;
         if (second.restatedFrom) run.verdictRestatedFrom = second.restatedFrom;
         if (second.routing) run.routing = second.routing;
         if (!accepts(second.value)) {
@@ -1800,6 +1915,14 @@ export async function judgeObjectiveComplete(
         ...(screening ? { screening: true } : {}),
         ...(memory ? { memory } : {}),
         sessionId: skillContext?.sessionId,
+        // Requirements are separate from source evidence so historical-only
+        // selection cannot drop the host rules, standing instructions or exact
+        // retained skill references. Neither view supplies new effect authority.
+        requirementContext: jevCompletionRequirementContext(skillContext),
+        // Exact accepted owner context may be carried in the host summary,
+        // independently of process-local courtesy memory. Keep it whole even
+        // when historical selection excludes that summary from result proof.
+        ...(historicalEligible ? { currentReviewContext: skillContext?.toolCallSummary } : {}),
         toolCallSummary: skillContext?.toolCallSummary,
         verifiedReads: skillContext?.verifiedReads,
         coverage: {
@@ -1863,7 +1986,11 @@ export async function judgeObjectiveComplete(
   // reviewer: that review is the check that what was written is right.
   const reviewsWrite = skillContext?.reviewStakes === 'write';
   const reviewsMemory = Boolean(skillContext?.memoryRequirementContext);
-  if (!reviewsPlan && !reviewsWrite && !reviewsMemory && (coverage.complete || directionQuestion || historicalEligible)) {
+  // Jev cannot open/attest exact origin-qualified inherited-read coverage.
+  // A complete current read does not discharge the stopped parent's evidence.
+  const reviewsInherited = skillContext?.inheritedReadCoverage !== undefined;
+  if (!reviewsPlan && !reviewsWrite && !reviewsMemory && !reviewsInherited
+    && (coverage.complete || directionQuestion || historicalEligible)) {
     const jevPromise = askJev(true);
     const hedgeDelayMs = skillContext?.reviewStakes === 'read' && coverage.complete && !directionQuestion
       ? JEV_READ_HEDGE_DELAY_MS : JEV_HEDGE_DELAY_MS;
@@ -1921,7 +2048,7 @@ export async function judgeObjectiveComplete(
     // One direction only: a Jev DONE still fails open below, because "the
     // reviewer was unreachable" must never be delivered as "this was reviewed".
     // failedOpen stays set, so nothing downstream claims a completed review.
-    if (!jevSaid && !reviewsPlan && !reviewsMemory) {
+    if (!jevSaid && !reviewsPlan && !reviewsMemory && !reviewsInherited) {
       const late = await askJev();
       callerSignal?.throwIfAborted();
       if (late) noteJev(late, false);
@@ -1984,6 +2111,7 @@ export async function judgeObjectiveComplete(
     ...(run.reviewConfirmation ? { reviewConfirmation: run.reviewConfirmation } : {}),
     ...(run.evidenceCoverage ? { evidenceCoverage: run.evidenceCoverage } : {}),
     ...(run.verdictRestatedFrom ? { verdictRestatedFrom: run.verdictRestatedFrom } : {}),
+    ...(run.reviewInputObservation ? { reviewInputObservation: run.reviewInputObservation } : {}),
   };
 }
 

@@ -1,4 +1,5 @@
 /** Window-local drafts survive route changes without keeping chat streams mounted. */
+import { sameArtifactDiscussion, type ArtifactDiscussion } from './artifact-discussion';
 export interface DraftAttachment {
   localId: string;
   name: string;
@@ -6,7 +7,13 @@ export interface DraftAttachment {
   id?: string;
   error?: string;
 }
-export interface ComposerDraft { text: string; attachments: DraftAttachment[] }
+export interface ComposerDraft { text: string; attachments: DraftAttachment[]; artifact?: ArtifactDiscussion }
+/** Drafts belong to the visible conversation. Its execution head can change
+ * after Stop/Continue without taking the next message's text or files with it. */
+export function composerDraftKey(routeKey: string, executionSessionId?: string, conversationSessionId?: string | null): string {
+  const owner = conversationSessionId === undefined ? executionSessionId : conversationSessionId;
+  return owner ? `session:${owner}` : routeKey;
+}
 const empty: ComposerDraft = { text: '', attachments: [] };
 const drafts = new Map<string, ComposerDraft>();
 const aliases = new Map<string, string>();
@@ -20,6 +27,25 @@ export function writeComposerDraft(key: string, update: (draft: ComposerDraft) =
 export function subscribeComposerDraft(listener: () => void): () => void {
   listeners.add(listener);
   return () => { listeners.delete(listener); };
+}
+
+/** Acceptance clears only what was sent. Typing, uploads, or a new selected
+ * file added while a request crosses the network belong to the next message. */
+export function acceptComposerDraft(key: string, sent: ComposerDraft): void {
+  writeComposerDraft(key, current => ({
+    ...current,
+    text: current.text === sent.text ? '' : current.text,
+    attachments: current.attachments.filter(attachment => !sent.attachments.some(file => file.localId === attachment.localId)),
+    artifact: sameArtifactDiscussion(current.artifact, sent.artifact) ? undefined : current.artifact,
+  }));
+}
+
+export function composerDraftForRetry(current: ComposerDraft, pending: { input: string; attachments?: string[] }): ComposerDraft {
+  return {
+    text: current.text.trim() === pending.input ? current.text : pending.input,
+    attachments: current.attachments.filter(file => file.id && pending.attachments?.includes(file.id)),
+    artifact: current.artifact?.preparedAttachmentId && pending.attachments?.includes(current.artifact.preparedAttachmentId) ? current.artifact : undefined,
+  };
 }
 /** A new conversation receives an ID after its first send. Late uploads still
  * belong to that same conversation, not the next new-chat composer. */

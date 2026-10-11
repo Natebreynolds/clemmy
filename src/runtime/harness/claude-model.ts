@@ -29,6 +29,7 @@ import type { StreamEvent } from '@openai/agents-core/types';
 import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
 import { getClaudeBrainModel, getRuntimeEnv, MODELS } from '../../config.js';
 import { withResilience } from './resilient-model.js';
+import { completedModelResponseBinding, type CompletedModelResponseBinding } from './model-response-binding.js';
 import { withModelFallback, type FallbackTarget } from './fallback-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
@@ -1089,7 +1090,8 @@ class RawClaudeUsageRecordingModel implements Model {
     private readonly diagnosticRecorder: (entry: RawClaudeStreamDiagnostic) => void,
   ) {}
 
-  private record(response: ModelResponse, startedAt: number, context: RawClaudeCallContext | undefined = harnessRunContextStorage.getStore()): void {
+  private record(response: ModelResponse, startedAt: number, context: RawClaudeCallContext | undefined = harnessRunContextStorage.getStore(),
+    binding: CompletedModelResponseBinding | undefined = completedModelResponseBinding(response)): void {
     try {
       const fields = rawClaudeUsageFields(response);
       if (fields.inputTokens === 0 && fields.outputTokens === 0) return;
@@ -1099,14 +1101,25 @@ class RawClaudeUsageRecordingModel implements Model {
       if (fields.inputTokens > 0 && fields.cachedInputTokens <= fields.inputTokens) {
         try { this.windowRecorder(this.modelId, fields.inputTokens); } catch { /* best effort */ }
       }
-      const providerReportedModel = rawClaudeReportedModel(response.providerData?.providerReportedModel)
-        ?? rawClaudeReportedModel(response.providerData?.model);
+      // Buffered AI SDK responses retain the wire model at response.modelId;
+      // streams may add the same observation at the top level. Every explicit
+      // claim must be safe and agree. The request pin is never an observation.
+      const adapterResponse = response.providerData?.response;
+      const nestedModel = adapterResponse && typeof adapterResponse === 'object' && !Array.isArray(adapterResponse)
+        ? (adapterResponse as Record<string, unknown>).modelId : undefined;
+      const claims = [response.providerData?.providerReportedModel, response.providerData?.model, nestedModel]
+        .filter((claim) => claim !== undefined);
+      const reportedModels = claims.map(rawClaudeReportedModel);
+      const providerReportedModel = response.providerData?.providerReportedModelUnqualified === true
+        || reportedModels.some((model) => model === undefined) || new Set(reportedModels).size > 1
+        ? undefined : reportedModels[0];
       this.usageRecorder({
         sessionId: context?.sessionId ?? 'unknown',
         sourceUserSeq: context?.sourceUserSeq,
         attemptId: context?.runAttemptId,
         model: this.modelId,
         requestModel: this.modelId,
+        ...(binding ? { trace: { modelCallId: binding.modelCallId } } : {}),
         ...(providerReportedModel ? { providerReportedModel } : {}),
         // The adapter reports Anthropic usage as a total: fresh input, cache
         // writes and cache reads together, with the reads broken out. The raw
@@ -1154,7 +1167,9 @@ class RawClaudeUsageRecordingModel implements Model {
               outgoing = { ...event, response: { ...event.response, providerData: enriched.providerData } } as StreamEvent;
               if (!recorded) {
                 recorded = true;
-                self.record(enriched, startedAt, context);
+                // Read the exact inner response's private binding before its
+                // metadata-only projection. Arbitrary clones gain no proof.
+                self.record(enriched, startedAt, context, completedModelResponseBinding(response));
               }
             }
           }

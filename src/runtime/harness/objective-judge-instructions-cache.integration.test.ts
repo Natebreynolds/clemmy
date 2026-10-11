@@ -64,8 +64,9 @@ test('optional host completion guidance preserves legacy instructions and refuse
   assert.equal(buildCompletionJudgeInstructions({}), JUDGE_SYSTEM_PROMPT);
   assert.equal(buildCompletionJudgeInstructions({ memoryRequirementContext: 'source-bound memory evidence' }),
     `${JUDGE_SYSTEM_PROMPT}\n\n${MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS}`);
-  assert.equal(HOST_COMPLETION_EVIDENCE_GUIDANCE.length, 1130, 'the relocated paragraph retains its exact bytes');
-  assert.equal(createHash('sha256').update(HOST_COMPLETION_EVIDENCE_GUIDANCE).digest('hex'),
+  const originalHostParagraph = HOST_COMPLETION_EVIDENCE_GUIDANCE.split('\nSTOP / CONTINUE REASONING:')[0]!;
+  assert.equal(originalHostParagraph.length, 1130, 'the original evidence rules retain their exact bytes');
+  assert.equal(createHash('sha256').update(originalHostParagraph).digest('hex'),
     '53270f13455d791552f4968d66131e857cc1e8725d426c81a6c30e45817ccf64',
     'the paragraph matches the approved original host guidance, including punctuation and whitespace');
   assert.throws(() => buildCompletionJudgeInstructions({
@@ -92,10 +93,13 @@ test('host guidance appears once in the stable prefix while changing objective a
     const system = String(request.systemInstructions);
     systems.push(system);
     assert.equal(system.split(HOST_COMPLETION_EVIDENCE_GUIDANCE).length - 1, 1);
+    assert.equal(system.match(/STOP \/ CONTINUE REASONING:/g)?.length, 1,
+      'execution and analysis receive the same replay rules once, before the cache boundary');
     assert.ok(system.endsWith(INSTRUCTION_CACHE_DELIM));
     assert.doesNotMatch(system, new RegExp(`source_${suffix}_`), 'no current-source facts or refs enter the stable prefix');
     const input = JSON.stringify(request.input);
     assert.doesNotMatch(input, /Judge only the effective accepted objective/);
+    assert.doesNotMatch(input, /STOP \/ CONTINUE REASONING:/);
     for (const kind of ['objective', 'reply', 'result', 'call']) assert.ok(input.includes(`source_${suffix}_${kind}`));
   }
   assert.equal(systems[0], systems[1], 'new source identities do not rewrite the fixed reviewer prefix');
@@ -175,7 +179,7 @@ test('on the Anthropic wire the instructions are a cache point and no marker tex
   assert.ok(text.startsWith(prompt), 'the reviewer reads the same prompt');
 });
 
-test('the unchanged host guidance reaches the Anthropic cache block exactly once', async () => {
+test('host guidance reaches the Anthropic cache block exactly once', async () => {
   const bodies: Record<string, unknown>[] = [];
   const provider = createAnthropic({
     apiKey: 'test-key',
@@ -199,7 +203,7 @@ test('the unchanged host guidance reaches the Anthropic cache block exactly once
   const cached = blocks.filter(block => block.cache_control);
   assert.equal(cached.length, 1);
   assert.ok(cached[0]!.text.includes(HOST_COMPLETION_EVIDENCE_GUIDANCE));
-  assert.equal(JSON.stringify(body).split(HOST_COMPLETION_EVIDENCE_GUIDANCE).length - 1, 1);
+  assert.equal(blocks.reduce((count, block) => count + block.text.split(HOST_COMPLETION_EVIDENCE_GUIDANCE).length - 1, 0), 1);
   const messages = body.messages as Array<{ content: Array<{ type: string; text?: string }> }>;
   const sentPrompt = messages[0]!.content.filter(block => block.type === 'text').map(block => block.text).join('');
   assert.ok(sentPrompt.startsWith(prompt), 'the current-source review input is unchanged');

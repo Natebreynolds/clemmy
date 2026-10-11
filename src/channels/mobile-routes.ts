@@ -1,4 +1,5 @@
 import { registerCloudBrowserRoutes } from './cloud-browser-routes.js';
+import { nativeVoiceControlBoundary, nativeVoiceTerminalIsExact, registerNativeVoiceStatus } from './mobile-native-voice-status.js';
 import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
@@ -14,6 +15,7 @@ import { extractApprovalContentPreview, type ApprovalContentPreview } from '../r
 import { ApprovalControlBindingUnavailable, commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { createMobileChatAdmission, prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
 import { registerMobileMemoryWorkRoutes } from './mobile-memory-work-routes.js';
+import { registerMobileNativeVoiceAuth } from './mobile-native-voice-auth.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { BrainSelectionError, CODEX_BRAIN_SLOTS, codexBrainSlotUpdates, brainSelectionReceipt, type CodexBrainSlot } from '../runtime/harness/brain-selection.js';
@@ -42,6 +44,8 @@ import { parseTaskMode, taskModeFields, type TaskMode } from '../runtime/harness
  */
 
 import express from 'express';
+import { Readable } from 'node:stream';
+import { requestSpeech, spokenReplyText } from '../dashboard/voice-speech.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import path from 'node:path';
@@ -122,12 +126,15 @@ import {
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
 import {
+  AcceptedSourceSessionIdleError,
   claimSessionForAcceptedSource,
+  readAcceptedSourceConversationProjection,
   resolveAcceptedSourceIngressLineage,
   sameConversationAncestorSessionIds,
 } from '../runtime/harness/accepted-source-session-branch.js';
 import {
   projectHarnessEventsForPublic,
+  publicPresentationText,
   publicUserInputText,
   PUBLIC_RUN_FAILURE_TEXT,
 } from '../runtime/harness/public-presentation.js';
@@ -277,6 +284,8 @@ function mobileChatDigest(deviceId: string, idempotencyKey: string): string {
 
 function mobileChatPayloadHash(message: string, requestedSessionId: string | null, taskMode?: TaskMode, agentId?: string, projectId?: string): string {
   if (taskMode?.kind === 'execute') return reviewedPlanExecuteInputHash({ text: message, taskMode });
+  // Voice is presentation intent, excluded from request identity like desktop.
+  // A replay retains the first accepted source's marker.
   // A request opened inside a saved agent is a different request; one that
   // named none keeps its historical hash.
   return createHash('sha256')
@@ -339,7 +348,9 @@ function exactMobileApprovalTerminal(
   for (const event of harnessListEvents(sessionId, { types: ['conversation_completed'], desc: true })) {
     if (event.data.sourceUserSeq !== sourceUserSeq && event.data.terminalKey !== `turn:${sourceUserSeq}`) continue;
     const presentation = presentationEventFromCompletionData(event.data);
-    if (presentation?.identity.sourceUserSeq === sourceUserSeq) return { event, presentation };
+    if (presentation?.identity.sourceUserSeq === sourceUserSeq) {
+      return { event, presentation: { ...presentation, text: publicPresentationText(presentation) } };
+    }
   }
   return null;
 }
@@ -398,6 +409,23 @@ function serializeSessionForMobile(session: HarnessSessionRow, activeRuns?: Read
     createdAt: typeof session.createdAt === 'number' ? session.createdAt : Date.parse(String(session.createdAt)),
     updatedAt: typeof session.updatedAt === 'number' ? session.updatedAt : Date.parse(String(session.updatedAt)),
   };
+}
+
+/** One visible conversation, with controls still naming its physical head.
+ * Read-only display rows must never be written back as runtime metadata. */
+function serializeConversationForMobile(session: HarnessSessionRow, activeRuns?: ReadonlySet<string>) {
+  const conversation = readAcceptedSourceConversationProjection(session.id);
+  if (!conversation) return serializeSessionForMobile(session, activeRuns);
+  const root = conversation.rootSessionId === session.id ? session
+    : harnessGetSession(conversation.rootSessionId, { withoutConversationState: true });
+  const head = conversation.headSessionId === session.id ? session
+    : harnessGetSession(conversation.headSessionId, { withoutConversationState: true });
+  if (!root || !head) return serializeSessionForMobile(session, activeRuns);
+  const publicSession = serializeSessionForMobile(root, activeRuns);
+  const execution = serializeSessionForMobile(head, activeRuns);
+  return { ...execution, id: root.id, title: publicSession.title, createdAt: publicSession.createdAt,
+    pinned: publicSession.pinned, archived: publicSession.archived,
+    ...(head.id !== root.id ? { executionSessionId: head.id } : {}) };
 }
 
 /**
@@ -850,6 +878,8 @@ export interface MobileRouterDeps {
     hasCloudKey: typeof import('../runtime/transcribe.js').hasOpenAiKey;
     transcribeCloud: typeof import('../runtime/transcribe.js').transcribeAudio;
   };
+  /** Provider-free speech route tests. Production shares desktop's speech service. */
+  voiceSpeechRuntime?: { requestSpeech: typeof requestSpeech };
   /**
    * Optional override for the built PWA assets directory. When unset,
    * the router probes the usual candidate paths (apps/mobile-web/dist
@@ -1857,6 +1887,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   }
   (router as express.Router & { requireMobileSession: typeof requireMobileSession })
     .requireMobileSession = requireMobileSession;
+
+  registerMobileNativeVoiceAuth(router, requireMobileSession, stateOpts);
 
   /** Liveness probe — setup uses this to confirm the daemon is answering. */
   /**
@@ -3757,6 +3789,30 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    * transcriber only as a fallback when the local model is not ready and a
    * key exists. Bytes are 16 kHz mono WAV; nothing is kept.
    */
+  registerNativeVoiceStatus(router, requireMobileSession, (deviceId, requestId) => {
+    const receipt = getHarnessChatRequestReceipt(`mobile:${mobileChatDigest(deviceId, requestId)}`);
+    if (!receipt) return null;
+    const attempt = getLatestRunAttemptByRunId(receipt.sessionId, receipt.runId);
+    const committed = attempt?.sourceUserSeq ? exactMobileApprovalTerminal(receipt.sessionId, attempt.sourceUserSeq) : null;
+    const published = committed ? projectHarnessEventsForPublic([committed.event])[0] : null;
+    const presentation = published ? presentationEventFromCompletionData(published.data) : null;
+    const source = attempt ? getRunAttemptSourceUserEvent(attempt) : null;
+    const exactTerminal = nativeVoiceTerminalIsExact({ receipt, attempt, source,
+      terminal: committed?.event ?? null, presentation });
+    const requiresApp = Boolean(presentation?.approvalId) || nativeVoiceControlBoundary({
+      sourceUserSeq: attempt?.sourceUserSeq ?? -1,
+      completionData: committed?.event.data,
+      sourceData: source?.data,
+      awaitingInputData: presentation?.kind === 'question'
+        ? harnessListEvents(receipt.sessionId, { types: ['awaiting_user_input'] }).map((event) => event.data) : [],
+    });
+    return { sessionId: receipt.sessionId, terminal: exactTerminal && presentation && attempt?.sourceUserSeq
+      ? { sessionId: receipt.sessionId, sourceUserSeq: attempt.sourceUserSeq, status: presentation.status,
+          kind: presentation.kind, text: presentation.text, requiresApp,
+          ordinaryQuestion: Boolean(presentation.status === 'needs_input'
+            && presentation.kind === 'question' && presentation.needs?.kind === 'input' && !requiresApp) } : null };
+  });
+
   router.post('/api/chat/transcribe', requireMobileSession, express.raw({ type: 'audio/*', limit: '15mb' }), async (req, res) => {
     const bytes = Buffer.isBuffer(req.body) && req.body.length > 44 ? (req.body as Buffer) : undefined;
     if (!bytes) { res.status(400).json({ error: 'AUDIO_REQUIRED' }); return; }
@@ -3797,6 +3853,36 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.status(500).json({ error: 'TRANSCRIBE_FAILED', message: err instanceof Error ? err.message : String(err) });
     } finally {
       await fsp.unlink(tmp).catch(() => undefined);
+    }
+  });
+
+  // The mobile voice loop speaks the ordinary chat's answer. Authentication
+  // retains both the paired cookie and the device proof; no desktop token is
+  // embedded in mobile assets. Ending voice aborts any speech request in flight.
+  router.post('/api/chat/speak', requireMobileSession, express.json({ limit: '64kb' }), async (req, res) => {
+    const heard = spokenReplyText(typeof req.body?.text === 'string' ? req.body.text : '');
+    res.setHeader('Cache-Control', 'no-store');
+    if (!heard) { res.status(400).json({ error: 'There are no words to read aloud.' }); return; }
+    const controller = new AbortController();
+    res.on('close', () => { if (!res.writableFinished) controller.abort(); });
+    try {
+      const speech = await (deps.voiceSpeechRuntime?.requestSpeech ?? requestSpeech)(heard, controller.signal);
+      if (controller.signal.aborted) {
+        if (speech.ok) void speech.response.body?.cancel().catch(() => undefined);
+        return;
+      }
+      if (!speech.ok) {
+        res.status(speech.status).json({ error: speech.error, ...(speech.fallback ? { fallback: speech.fallback } : {}), text: heard });
+        return;
+      }
+      if (!speech.response.body) { res.status(502).json({ error: 'Clem’s reply audio was empty. Try voice mode again.' }); return; }
+      res.status(200).setHeader('Content-Type', speech.contentType);
+      const body = Readable.fromWeb(speech.response.body as unknown as import('node:stream/web').ReadableStream<Uint8Array>);
+      controller.signal.addEventListener('abort', () => body.destroy(), { once: true });
+      body.on('error', () => { if (!res.writableEnded) res.end(); });
+      body.pipe(res);
+    } catch {
+      if (!controller.signal.aborted && !res.headersSent) res.status(502).json({ error: 'Clem’s voice could not connect. Try voice mode again.' });
     }
   });
 
@@ -3852,8 +3938,22 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     // put away instead.
     const archived = req.query.archived === '1' || req.query.archived === 'true';
     const activeRuns = activeRunSessionIds();
-    const sessions = harnessListSessions({ limit: 80, archived, kind: 'chat', withoutConversationState: true })
-      .map((session) => serializeSessionForMobile(session, activeRuns));
+    const sessions: ReturnType<typeof serializeConversationForMobile>[] = [];
+    const seen = new Set<string>();
+    // Page physical rows until the phone has 80 visible conversations. A
+    // long Stop/Continue lineage must not crowd the older chats off the list.
+    for (let offset = 0; sessions.length < 80; offset += 500) {
+      const rows = harnessListSessions({ limit: 500, offset, archived, kind: 'chat', withoutConversationState: true });
+      for (const row of rows) {
+        if (seen.has(row.id)) continue;
+        const conversation = readAcceptedSourceConversationProjection(row.id);
+        for (const id of conversation?.sessionIds ?? [row.id]) seen.add(id);
+        const shaped = serializeConversationForMobile(row, activeRuns);
+        if (shaped.archived === archived) sessions.push(shaped);
+        if (sessions.length === 80) break;
+      }
+      if (rows.length < 500) break;
+    }
     res.json({ sessions });
   });
 
@@ -3875,7 +3975,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       if (!updated) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
       const row = harnessGetSession(sessionId);
       if (!row) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
-      res.json({ session: serializeSessionForMobile(row) });
+      res.json({ session: serializeConversationForMobile(row) });
     } catch (err) {
       res.status(500).json({ error: 'SESSION_PATCH_FAILED', message: err instanceof Error ? err.message : String(err) });
     }
@@ -3929,14 +4029,23 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.get('/api/chat/sessions/:sessionId', requireMobileSession, (req, res) => {
     const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
-    const session = harnessGetSession(sessionId);
+    const session = harnessGetSession(sessionId, { withoutConversationState: true });
     if (!session) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
     try {
-      const ownPage = readPublicHarnessEventPage(session.id, {
+      const conversation = readAcceptedSourceConversationProjection(session.id);
+      const executionSessionId = conversation?.headSessionId ?? session.id;
+      const ownPage = readPublicHarnessEventPage(executionSessionId, {
         sinceSeq: req.query.sinceSeq, throughSeq: req.query.throughSeq, limit: req.query.limit ?? 500,
       });
-      res.json({ session: serializeSessionForMobile(session), events: ownPage.events.map(serializeEventForMobile),
-        latestSeq: ownPage.latestSeq, page: ownPage.page });
+      // Each historical member retains its own frozen raw frontier and exact
+      // session/source identity. None of its rows can advance the live head's
+      // cursor or lend an old attempt to the current Stop button.
+      const history = conversation?.sessionIds.slice(0, -1).map(id => {
+        const page = readPublicHarnessEventPage(id, { limit: req.query.limit ?? 500 });
+        return { sessionId: id, events: page.events.map(serializeEventForMobile), latestSeq: page.latestSeq, page: page.page };
+      });
+      res.json({ session: serializeConversationForMobile(session), events: ownPage.events.map(serializeEventForMobile),
+        latestSeq: ownPage.latestSeq, page: ownPage.page, ...(history?.length ? { history } : {}) });
     } catch (error) {
       res.status(error instanceof RangeError ? 400 : 500).json({ error: error instanceof RangeError ? 'INVALID_EVENT_CURSOR' : 'CATCH_UP_FAILED' });
     }
@@ -4125,9 +4234,14 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
     let taskMode: TaskMode | undefined;
     try { taskMode = parseTaskMode(req.body?.taskMode); } catch { res.status(400).json({ error: 'INVALID_TASK_MODE' }); return; }
+    if (req.body?.requireIdle === true && (req.body?.steerOnly === true || req.body?.connectionRequestId !== undefined
+      || (taskMode && taskMode.kind !== 'normal'))) {
+      res.status(409).json({ error: 'VOICE_CONTROL_REQUIRES_CHAT' }); return;
+    }
     if (taskMode && req.body?.steerOnly === true) { res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' }); return; }
     const ctx = req.mobileSession!;
     const typedMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    const voice = req.body?.voice === true;
     // Files uploaded ahead of this message through /api/chat/attach. A photo
     // with no words is a complete message; the title then names the files.
     const attachmentIds: string[] = Array.isArray(req.body?.attachments)
@@ -4259,6 +4373,18 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           res.json({ sessionId: replay.receipt.sessionId, runId: replay.receipt.runId, reply: replay.presentation.text });
           return;
         }
+        // Recovery of an admitted ordinary native request is not a new reply
+        // to whatever approval or continuation now waits in this conversation.
+        // Return its exact durable owner before any semantic card routing or
+        // preparation/dispatch; the status endpoint reports that owner's state.
+        if (req.body?.requireIdle === true && !connectionContext
+          && (!taskMode || taskMode.kind === 'normal') && !classifyMobileTypedChatControl(message)) {
+          const attempt = getLatestRunAttemptByRunId(priorReceipt.sessionId, priorReceipt.runId);
+          res.setHeader('Idempotent-Replay', '1');
+          res.status(202).json({ accepted: true, sessionId: priorReceipt.sessionId, runId: priorReceipt.runId,
+            sinceSeq: priorReceipt.sinceSeq, ...(attempt?.sourceUserSeq ? { sourceUserSeq: attempt.sourceUserSeq } : {}), replayed: true });
+          return;
+        }
       }
       if (connectionContext) taskMode = connectionContinuationTaskMode(connectionContext);
       const connectionNeedsAdmission = connectionContext && (!priorReceipt
@@ -4275,6 +4401,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       }
 
       const typedControl = !taskMode || taskMode.kind === 'normal' ? classifyMobileTypedChatControl(message) : null;
+      if (typedControl && req.body?.requireIdle === true) {
+        res.status(409).json({ error: 'VOICE_CONTROL_REQUIRES_CHAT', message: 'Open this conversation in Clem to use this control.' }); return;
+      }
       if (typedControl?.kind === 'formal_approval') {
         await resolveMobileApproval(res, typedControl.approvalId, typedControl.decision, {
           request: { requestId, runId, inputHash },
@@ -4295,6 +4424,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const cardWaiting = cardSessionId !== null && (Boolean(HarnessSession.load(cardSessionId)?.loadInterruptState())
         || approvalRegistry.listPending({ sessionId: cardSessionId, status: 'pending' })
           .some((row) => approvalRegistry.isFormalApprovalSurface(row) && approvalRegistry.isActionable(row)));
+      if (cardWaiting && req.body?.requireIdle === true) {
+        res.status(409).json({ error: 'VOICE_CONTROL_REQUIRES_CHAT' }); return;
+      }
       if (cardSessionId && cardWaiting) {
         const routed = await routeReplyToPendingApproval({ sessionId: cardSessionId, text: message, parsed: null })
           .catch(() => null);
@@ -4410,7 +4542,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // live 2026-08-26.
       //
       // Typed controls, replays, and approvals keep their existing priority
-      // above; a dead lease is NOT running and falls through to the normal turn.
+      // above. Attachment-bearing requests also respect a recorded recovering
+      // attempt: they cannot become text-only steers or supersede its work.
       if (!typedControl && !priorReceipt && requestedSessionId) {
         try {
           const latestAttempt = getLatestHarnessRunAttempt(proposedSessionId);
@@ -4420,6 +4553,17 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             && latestAttempt.leaseExpiresAt
             && Date.parse(latestAttempt.leaseExpiresAt) > Date.now(),
           );
+          if (attachmentIds.length > 0 || req.body?.requireIdle === true) {
+            const { steerReasonForRunningWork } = await import('../runtime/harness/steer-notes.js');
+            const busyReason = steerReasonForRunningWork({
+              runInFlightSince: HarnessSession.load(proposedSessionId)?.runInFlightSince() ?? null,
+              leaseExpiresAt: latestAttempt?.leaseExpiresAt ?? null,
+              attemptFinishedAt: latestAttempt?.finishedAt ?? null,
+              hasUnfinishedAttempt: Boolean(latestAttempt && !latestAttempt.finishedAt),
+              nowMs: Date.now(),
+            });
+            if (busyReason) { res.status(409).json({ error: req.body?.requireIdle === true ? 'VOICE_REQUIRES_IDLE_CHAT' : 'ATTACHMENTS_REQUIRE_IDLE_CHAT' }); return; }
+          }
           if (leaseLive) {
             if (connectionContext) { res.status(409).json({ error: 'This turn is still finishing. Check the connection again shortly.' }); return; }
             if (taskMode && taskMode.kind !== 'normal') {
@@ -4427,7 +4571,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
               return;
             }
             const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
-            const note = appendSteerNote(proposedSessionId, message);
+            const note = appendSteerNote(proposedSessionId, message, {
+              clientRequestId: requestId,
+              ...(voice ? { voice: true } : {}),
+            });
             res.json({
               ok: true,
               steered: true,
@@ -4444,6 +4591,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             return;
           }
         } catch (steerErr) {
+          if (req.body?.requireIdle === true) {
+            res.status(503).json({ error: 'VOICE_IDLE_CHECK_UNAVAILABLE' }); return;
+          }
           if (req.body?.steerOnly === true) {
             res.status(409).json({ error: 'RUN_NOT_ACTIVE' });
             return;
@@ -4517,6 +4667,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           } else {
             const selectedClaim = claimSessionForAcceptedSource({
               kind: 'ordinary',
+              ...(req.body?.requireIdle === true ? { requireIdle: true } : {}),
               entrySessionId: proposedSessionId,
               durableSourceId: runId,
               continuity: {
@@ -4540,6 +4691,14 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           : claimOrdinaryRequest();
         if (executeIngress && rejoinPlanExecution(requestClaim.receipt)) return;
       } catch (err) {
+        if (req.body?.requireIdle === true) {
+          res.status(err instanceof AcceptedSourceSessionIdleError ? 409 : 503).json({
+            error: err instanceof AcceptedSourceSessionIdleError
+              ? err.reason === 'held' ? 'VOICE_CONTROL_REQUIRES_CHAT' : 'VOICE_REQUIRES_IDLE_CHAT'
+              : 'VOICE_IDLE_CHECK_UNAVAILABLE',
+          });
+          return;
+        }
         console.warn('mobile idempotency key conflict:', err);
         res.status(409).json({ error: 'IDEMPOTENCY_KEY_CONFLICT' });
         return;
@@ -4612,6 +4771,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             ...(connectionContext ? { connectionContinuation: connectionContext, connectionContinuationVerification: connectionVerification } : {}),
             ...(admission ? { onAcceptedTurn: admission.accepted } : {}),
             message: executionMessage,
+            ...(voice ? { voice: true } : {}),
             // The bubble shows what was typed (or "Attached: …"); the fold is for the model.
             ...(ingestedAttachments.length ? { visibleMessage: message } : {}),
             sessionId,

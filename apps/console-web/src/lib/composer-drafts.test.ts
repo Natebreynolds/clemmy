@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { handoffComposerDraft, moveComposerDraft, readComposerDraft, writeComposerDraft } from './composer-drafts';
+import { acceptComposerDraft, composerDraftKey, handoffComposerDraft, moveComposerDraft, readComposerDraft, writeComposerDraft } from './composer-drafts';
 
 test('switching conversations restores their separate text and attachments', () => {
   writeComposerDraft('session:a', () => ({ text: 'Keep this draft', attachments: [{ localId: 'f1', name: 'brief.pdf', status: 'ready', id: 'attachment-1' }] }));
@@ -54,4 +54,35 @@ test('an assigned creation draft cannot be rebound to a different conversation',
   writeComposerDraft('new:once-only', current => ({ ...current, text: 'Late update' }));
   assert.equal(readComposerDraft('session:first-owner').text, 'Late update');
   assert.equal(readComposerDraft('session:second-owner').text, '');
+});
+
+test('Continue changes the execution head while acceptance and late uploads keep the visible root draft', () => {
+  const route = 'new:continue-root-route';
+  const root = 'continue-root';
+  const rootKey = composerDraftKey(route, root, root);
+  const sent = { text: 'Continue', attachments: [] };
+  writeComposerDraft(rootKey, () => sent);
+  writeComposerDraft(rootKey, current => ({ ...current, text: 'Next question', attachments: [{ localId: 'late-root-upload', name: 'next.pdf', status: 'uploading' }] }));
+  const childKey = composerDraftKey(route, 'continue-child-one', root);
+  acceptComposerDraft(rootKey, sent);
+  assert.equal(childKey, rootKey);
+  assert.equal(readComposerDraft(childKey).text, 'Next question');
+  writeComposerDraft(rootKey, current => ({ ...current, attachments: current.attachments.map(file => ({ ...file, status: 'ready', id: 'root-attachment' })) }));
+  const laterKey = composerDraftKey(route, 'continue-child-two', root);
+  assert.equal(readComposerDraft(laterKey).attachments[0]?.id, 'root-attachment');
+  assert.equal(composerDraftKey('new:unrelated', undefined, null), 'new:unrelated');
+  assert.equal(readComposerDraft('new:unrelated').text, '');
+  assert.equal(composerDraftKey(route, 'legacy-head'), 'session:legacy-head');
+});
+
+test('a first acceptance promotes the creation draft once and later heads retain the same root owner', () => {
+  const route = 'new:continue-created-route';
+  writeComposerDraft(route, () => ({ text: 'Unsent follow-up', attachments: [{ localId: 'creation-upload', name: 'draft.pdf', status: 'uploading' }] }));
+  const unassigned = { draftKey: route, sessionId: null };
+  const assigned = { draftKey: route, sessionId: 'created-root' };
+  handoffComposerDraft(unassigned, assigned);
+  const key = composerDraftKey(route, 'created-child', assigned.sessionId);
+  writeComposerDraft(route, current => ({ ...current, attachments: current.attachments.map(file => ({ ...file, status: 'ready', id: 'created-attachment' })) }));
+  assert.equal(readComposerDraft(key).text, 'Unsent follow-up');
+  assert.equal(readComposerDraft(key).attachments[0]?.id, 'created-attachment');
 });

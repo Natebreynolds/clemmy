@@ -39,6 +39,8 @@ const {
   closeEventLog,
   createSession,
   finishRunAttempt,
+  getSession,
+  listSessions,
 } = await import('../runtime/harness/eventlog.js');
 const {
   createBackgroundTask,
@@ -175,6 +177,53 @@ test('durable run records project to shared snapshots with truth rules and priva
 });
 
 // ── the unified projection, black-box through the real stores ────────────────
+
+test('metadata-only activity reads preserve routing and durable ownership without replacing recovery state', () => {
+  const metadata = {
+    source: 'controlled-source',
+    archived: false,
+    projectId: 'controlled-project',
+    __conversation: { messages: ['RECOVERY-STATE-ONLY'.repeat(16_384)] },
+    __host_recovery_state: 'CONTROLLED-RECOVERY-ONLY'.repeat(4_096),
+    __interrupt_state: { retained: 'CONTROLLED-INTERRUPT-ONLY' },
+    __source_approval_checkpoints: { checkpoint: 'CONTROLLED-APPROVAL-ONLY' },
+    __host_recovery_mcp_scope: { tools: ['CONTROLLED-SCOPE-ONLY'] },
+  };
+  const session = createSession({
+    kind: 'chat', title: 'Controlled activity title', objective: 'Controlled fallback objective', metadata,
+  });
+  const claim = claimRunAttemptLease({
+    sessionId: session.id,
+    runId: 'metadata-only-projection',
+    ownerId: 'metadata-projection-test',
+    leaseMs: 30 * 60_000,
+    nowMs: Date.now() - 5 * 60_000,
+  });
+  assert.ok(claim.attempt);
+  const fullBefore = getSession(session.id)!;
+  const lean = getSession(session.id, { withoutConversationState: true })!;
+  const omitted = [
+    '__conversation', '__host_recovery_state', '__interrupt_state',
+    '__source_approval_checkpoints', '__host_recovery_mcp_scope',
+  ];
+  const publicMetadata = Object.fromEntries(Object.entries(fullBefore.metadata)
+    .filter(([key]) => !omitted.includes(key)));
+  assert.deepEqual(lean, { ...fullBefore, metadata: publicMetadata });
+  assert.deepEqual(listSessions({ withoutConversationState: true })
+    .find((row) => row.id === session.id), lean);
+
+  const observedAt = new Date().toISOString();
+  const history = entryFor(projectActivitySnapshot({ observedAt, kinds: ['chat'] }).entries, `chat:${session.id}`);
+  const working = entryFor(projectWorkingNowSnapshot({ observedAt, kinds: ['chat'] }).entries, `chat:${session.id}`);
+  assert.deepEqual(working, history, 'the exact active attempt must project identically from either read path');
+  assert.equal(history.headline, session.title);
+  assert.equal(history.origin, metadata.source);
+  assert.equal(history.attemptId, claim.attempt.attemptId);
+  assert.equal(history.liveness, 'live');
+  assert.equal(history.needsAttention, false);
+  assert.equal(JSON.stringify(history).includes('RECOVERY-STATE-ONLY'), false);
+  assert.deepEqual(getSession(session.id), fullBefore, 'read projections must not replace full session metadata');
+});
 
 test('chat, background, and workflow work all appear in ONE projection', () => {
   const session = createSession({ kind: 'chat', channel: 'discord', title: 'Pipeline review' });

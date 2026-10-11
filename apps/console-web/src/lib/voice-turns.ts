@@ -53,55 +53,80 @@ function partCount(heard: Map<string, string>, messageId: string, draftId: strin
   return count;
 }
 
-/** What Clem said that has not been read aloud yet, in order: her answer as
- *  she writes it (each complete sentence as it lands, so the reading starts
- *  with her first sentence), what she says before her tools run, her
- *  progress notes, her first words while she works, a question or a card's
- *  ask, and whatever her finished answer adds to what was already read. A
- *  message the owner saw before voice mode started is never read; a draft
- *  sent back by review stops being read; a stop the owner pressed is not read
- *  back; the same words are never said twice in a row. */
+export interface VoiceUtterance {
+  key: string;
+  text: string;
+  messageId: string;
+  sourceText: string;
+  status?: string;
+  kind: 'tool-intent' | 'progress' | 'first' | 'answer';
+  draftId?: string;
+}
+
+const readableText = (message: VoiceChatMessage) => message.text?.trim() || message.approval?.preview?.ask?.trim() || '';
+
+/** Queued or playing speech remains bound to the exact message that permitted
+ * it. A withdrawn/replaced answer or tool intent is no longer speakable. */
+export function voiceUtteranceCurrent(utterance: VoiceUtterance, messages: readonly VoiceChatMessage[]): boolean {
+  const message = messages.find(message => message.id === utterance.messageId);
+  if (!message || message.role !== 'assistant' || readableText(message) !== utterance.sourceText || message.status !== utterance.status) return false;
+  if (utterance.kind === 'tool-intent') {
+    const draft = message.answerDraft;
+    return Boolean(draft && draft.id === utterance.draftId && draft.phase === 'withdrawn' && draft.withdrawn === 'tool_call');
+  }
+  if (message.answerDraft) return false;
+  if (utterance.kind === 'progress') return Boolean(message.checkIn);
+  if (message.checkIn) return false;
+  return utterance.kind === 'first' ? message.status === 'thinking' : Boolean(message.status && FINISHED_STATUSES.has(message.status));
+}
+
+/** Read delivered replies and canonical progress. Completion-answer drafts,
+ * including complete sentences and checking drafts, wait for terminal delivery
+ * to replace answerDraft. Review may still retract any provisional wording. */
 export function voiceUtterances(
   messages: readonly VoiceChatMessage[],
   heard: Map<string, string>,
   baseline: ReadonlySet<string>,
-): Array<{ key: string; text: string }> {
-  const out: Array<{ key: string; text: string }> = [];
+): VoiceUtterance[] {
+  const out: VoiceUtterance[] = [];
   const said = new Set([...heard.values()].map((value) => value.trim()));
-  const say = (key: string, text: string): void => {
+  const utterance = (message: VoiceChatMessage, key: string, text: string, kind: VoiceUtterance['kind']): VoiceUtterance => ({
+    key, text, messageId: message.id, sourceText: readableText(message), status: message.status, kind,
+    ...(kind === 'tool-intent' ? { draftId: message.answerDraft!.id } : {}),
+  });
+  const say = (message: VoiceChatMessage, key: string, text: string, kind: VoiceUtterance['kind']): void => {
     const words = text.trim();
     if (!words || heard.has(key) || said.has(words)) return;
     said.add(words);
-    out.push({ key, text });
+    out.push(utterance(message, key, text, kind));
   };
   for (const message of messages) {
     if (message.role !== 'assistant' || baseline.has(message.id)) continue;
     const draft = message.answerDraft;
     if (draft) {
-      const forTool = draft.phase === 'withdrawn' && draft.withdrawn === 'tool_call';
-      if (draft.phase === 'withdrawn' && !forTool) continue;
+      // Explicit tool-call withdrawal is the engine's progress projection,
+      // distinct from a provisional completion answer awaiting review.
+      if (draft.phase !== 'withdrawn' || draft.withdrawn !== 'tool_call') continue;
       const before = draftSaid(heard, message.id);
       const sofar = before.draftId === draft.id ? before.said : '';
       if (sofar.length >= SPOKEN_PER_MESSAGE_MAX) continue;
-      const part = nextSpokenPart(message.text, sofar, forTool || draft.phase === 'checking');
+      const part = nextSpokenPart(message.text, sofar, true);
       if (part.trim()) {
-        out.push({ key: `${message.id}:draft:${draft.id}:part:${partCount(heard, message.id, draft.id)}`, text: part });
+        out.push(utterance(message, `${message.id}:draft:${draft.id}:part:${partCount(heard, message.id, draft.id)}`, part, 'tool-intent'));
         said.add(part.trim());
       }
       continue;
     }
-    const text = (message.text?.trim() || message.approval?.preview?.ask?.trim() || '');
+    const text = readableText(message);
     if (!text) continue;
     if (message.checkIn) {
-      say(`${message.id}:progress`, text);
+      say(message, `${message.id}:progress`, text, 'progress');
     } else if (message.status === 'thinking') {
-      say(`${message.id}:first`, text);
+      say(message, `${message.id}:first`, text, 'first');
     } else if (message.status && FINISHED_STATUSES.has(message.status)) {
-      // The answer was read while she wrote it: add only what it adds. A
-      // reviewed answer that changed is read as itself.
       const { said: read } = draftSaid(heard, message.id);
       const rest = read && message.text.startsWith(read) ? message.text.slice(read.length) : text;
-      if (read.length < SPOKEN_PER_MESSAGE_MAX) say(`${message.id}:answer`, rest);
+      if (read.length < SPOKEN_PER_MESSAGE_MAX) say(message, `${message.id}:answer`, rest, 'answer');
     }
   }
   return out;

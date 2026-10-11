@@ -121,6 +121,7 @@ const { cancelWorkflowRunAtBoundary } = await import('./workflow-run-cancellatio
 const {
   continueWorkflowRunFromCheckpoint,
   processWorkflowRuns,
+  reapResolvedParkedRuns,
   reapCapabilityBlockedRuns,
   resumeCapabilityBlockedWorkflowRun,
   _setBeforeWorkflowCallGatewayForTests,
@@ -137,6 +138,7 @@ const {
 const { readSeenItemKeys } = await import('./workflow-watermark-store.js');
 const { loadNotifications } = await import('../runtime/notifications.js');
 const { closeEventLog, openEventLog } = await import('../runtime/harness/eventlog.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const manifests = await import('../runtime/harness/capability-manifest.js');
 const catalog = await import('../runtime/harness/host-capability-catalog-factory.js');
 const observations = await import('../runtime/harness/independent-capability-observation.js');
@@ -436,6 +438,47 @@ const QUEUE_MODULE_URL = pathToFileURL(
   path.join(process.cwd(), 'src/tools/workflow-run-queue.ts'),
 ).href;
 
+const RUNNER_MODULE_URL = pathToFileURL(path.join(process.cwd(), 'src/execution/workflow-runner.ts')).href;
+
+async function continueFromFreshProcesses(sourceRunId: string, count = 1) {
+  const raceDir = mkdtempSync(path.join(TMP_HOME, 'continue-race-'));
+  const releaseFile = path.join(raceDir, 'release');
+  const claims = Array.from({ length: count }, (_, index) => ({
+    readyFile: path.join(raceDir, `ready-${index}`),
+    resultFile: path.join(raceDir, `result-${index}.json`),
+  }));
+  const code = `
+    import { existsSync, writeFileSync } from 'node:fs';
+    const runner = await import(process.env.CLEM_RUNNER_MODULE_URL);
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    writeFileSync(process.env.CLEM_READY_FILE, 'ready', 'utf-8');
+    while (!existsSync(process.env.CLEM_RELEASE_FILE)) Atomics.wait(wait, 0, 0, 10);
+    const result = runner.continueWorkflowRunFromCheckpoint(process.env.CLEM_SOURCE_RUN_ID, { requestedFrom: 'board' });
+    writeFileSync(process.env.CLEM_RESULT_FILE, JSON.stringify(result), 'utf-8');
+  `;
+  const children = claims.map((claim) => spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', code], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env, CLEMENTINE_HOME: TMP_HOME,
+      CLEM_RUNNER_MODULE_URL: RUNNER_MODULE_URL, CLEM_SOURCE_RUN_ID: sourceRunId,
+      CLEM_READY_FILE: claim.readyFile, CLEM_RELEASE_FILE: releaseFile, CLEM_RESULT_FILE: claim.resultFile,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }));
+  const errors = children.map(() => '');
+  children.forEach((child, index) => { child.stderr?.on('data', (chunk) => { errors[index] += String(chunk); }); });
+  try {
+    const closes = children.map((child) => once(child, 'close') as Promise<[number | null]>);
+    await Promise.all(claims.map((claim) => waitForPath(claim.readyFile)));
+    writeFileSync(releaseFile, 'go', 'utf-8');
+    const codes = await Promise.all(closes);
+    codes.forEach(([exitCode], index) => assert.equal(exitCode, 0, errors[index]));
+    return claims.map((claim) => JSON.parse(readFileSync(claim.resultFile, 'utf-8')) as { status?: string; id?: string; message?: string });
+  } finally {
+    for (const child of children) if (child.exitCode === null) child.kill('SIGKILL');
+  }
+}
+
 function launchQueueClaim(input: {
   workflowName: string;
   receiptId: string;
@@ -492,11 +535,14 @@ async function raceScheduleAdmission(workflowName: string, receiptId: string) {
     releaseFile,
     resultFile: claim.resultFile,
   }));
+  const errors = children.map(() => '');
+  children.forEach((child, index) => { child.stderr?.on('data', (chunk) => { errors[index] += String(chunk); }); });
   try {
+    const closesPending = children.map((child) => once(child, 'close') as Promise<[number | null]>);
     await Promise.all(claims.map((claim) => waitForPath(claim.readyFile)));
     writeFileSync(releaseFile, 'go', 'utf-8');
-    const closes = await Promise.all(children.map((child) => once(child, 'close') as Promise<[number | null]>));
-    for (const [code] of closes) assert.equal(code, 0, 'queue claimant process exits cleanly');
+    const closes = await Promise.all(closesPending);
+    closes.forEach(([code], index) => assert.equal(code, 0, `queue claimant process exits cleanly: ${errors[index]}`));
     return claims.map((claim) => JSON.parse(readFileSync(claim.resultFile, 'utf-8')) as {
       status?: string;
       id?: string;
@@ -961,8 +1007,12 @@ test('Continue on a stopped run carries the committed step and runs only the res
 
   // ...and Continue picks up from where the run stopped instead.
   installProviderCapabilities(['DESTPROOF_APPEND_RECORD', 'SOURCEPROOF_UPDATE_RECORD']);
-  const continued = continueWorkflowRunFromCheckpoint(queued.id!, { requestedFrom: 'board' });
-  assert.equal(continued?.status, 'queued', continued?.message);
+  // Separate processes race the exact Continue decision, not generic equal
+  // inputs. Both must own the same successor before any remaining work runs.
+  const claims = await continueFromFreshProcesses(queued.id!, 2);
+  assert.deepEqual(claims.map((claim) => claim.status).sort(), ['duplicate', 'queued'], JSON.stringify(claims));
+  assert.equal(claims[0]?.id, claims[1]?.id);
+  const continued = claims.find((claim) => claim.status === 'queued')!;
   const finished = await drainUntil(continued!.id!, (run) => run.status === 'completed');
   assert.equal(finished.requeuedFromRunId, queued.id);
   const after = readProviderState();
@@ -972,8 +1022,181 @@ test('Continue on a stopped run carries the committed step and runs only the res
 
   // Continuing the same stop twice does not run the remaining step again.
   const again = continueWorkflowRunFromCheckpoint(queued.id!, { requestedFrom: 'board' });
-  if (again?.status === 'queued') await drainUntil(again.id!, (run) => ['completed', 'error', 'cancelled'].includes(run.status));
+  assert.equal(again?.status, 'duplicate', again?.message);
+  assert.equal(again?.id, continued.id);
+  const restarted = (await continueFromFreshProcesses(queued.id!))[0]!;
+  assert.equal(restarted.status, 'duplicate', restarted.message);
+  assert.equal(restarted.id, continued.id);
+  await processWorkflowRuns({ respond: async () => ({ text: 'must not run' }) } as never);
   assert.equal(readProviderState().counters.append - before.counters.append, 1);
+  assert.equal(readProviderState().counters.sourceMutation - before.counters.sourceMutation, 1, 'all remaining effects stay settled after repeated/restarted Continue');
+
+  const deliberateNewTask = queueWorkflowRun(workflowSlug, {}, { source: 'console' });
+  assert.equal(deliberateNewTask.status, 'queued', 'a deliberately new task with the same inputs is not this Continue decision');
+  assert.notEqual(deliberateNewTask.id, continued.id);
+  cancelWorkflowRunAtBoundary({ runId: deliberateNewTask.id!, reason: 'No execution needed for fresh-task admission check.', source: 'tasks-board' });
+});
+
+test('Continue through an old Stop resolves the stopped child and carries every generation of writes', async () => {
+  const workflowSlug = 'platform49-continue-stopped-child';
+  const destinationId = '1785000000.000779';
+  installProviderCapabilities(['DESTPROOF_APPEND_RECORD']);
+  writeWorkflow(workflowSlug, {
+    name: workflowSlug, description: 'Continue from the actual stopped descendant.', enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'first_write', prompt: 'Append.', sideEffect: 'write', call: { tool: 'DESTPROOF_APPEND_RECORD', args: { item_id: destinationId, value: 'once' } } },
+      { id: 'second_write', dependsOn: ['first_write'], prompt: 'Update.', sideEffect: 'write', call: { tool: 'SOURCEPROOF_UPDATE_RECORD', args: { item_id: FINAL_PAGE_ITEM_ID, value: 'second-once' } } },
+      { id: 'readback', dependsOn: ['second_write'], prompt: 'Read it.', sideEffect: 'read', call: { tool: 'DESTPROOF_GET_RECORD', args: { item_id: destinationId } } },
+    ],
+  });
+  const before = readProviderState();
+  const original = queueWorkflowRun(workflowSlug, {}, { source: 'console' });
+  assert.equal(original.status, 'queued', original.message);
+  await drainUntil(original.id!, (run) => run.status === 'blocked_capability');
+  cancelWorkflowRunAtBoundary({ runId: original.id!, reason: 'Stop original.', source: 'tasks-board' });
+  installProviderCapabilities(['DESTPROOF_APPEND_RECORD', 'SOURCEPROOF_UPDATE_RECORD']);
+  const child = continueWorkflowRunFromCheckpoint(original.id!, { requestedFrom: 'board' })!;
+  assert.equal(child.status, 'queued', child.message);
+  await drainUntil(child.id!, (run) => run.status === 'blocked_capability');
+  cancelWorkflowRunAtBoundary({ runId: child.id!, reason: 'Stop actual child.', source: 'tasks-board' });
+  installProviderCapabilities(['DESTPROOF_APPEND_RECORD', 'SOURCEPROOF_UPDATE_RECORD', 'DESTPROOF_GET_RECORD']);
+  const resumed = continueWorkflowRunFromCheckpoint(original.id!, { requestedFrom: 'board' })!;
+  assert.equal(resumed.status, 'queued', resumed.message);
+  assert.equal(readRun(resumed.id!).requeuedFromRunId, child.id, 'an old Stop cannot bypass the newer checkpoint');
+  await drainUntil(resumed.id!, (run) => run.status === 'completed');
+  for (const prior of [original.id!, child.id!]) {
+    const replay = continueWorkflowRunFromCheckpoint(prior, { requestedFrom: 'board' })!;
+    assert.equal(replay.status, 'duplicate', replay.message);
+    assert.equal(replay.id, resumed.id);
+  }
+  const after = readProviderState();
+  assert.equal(after.counters.append - before.counters.append, 1, 'the original generation is carried twice');
+  assert.equal(after.counters.sourceMutation - before.counters.sourceMutation, 1, 'the child generation is carried once');
+  assert.equal(after.counters.readback - before.counters.readback, 1);
+});
+
+test('Continue after Stop at an untouched declarative gate carries the first write and asks for fresh approval', async () => {
+  const workflowSlug = 'platform49-continue-untouched-gate';
+  installProviderCapabilities(['DESTPROOF_APPEND_RECORD', 'SOURCEPROOF_UPDATE_RECORD']);
+  writeWorkflow(workflowSlug, {
+    name: workflowSlug, description: 'Stop at the second authored approval without repeating the first write.',
+    enabled: true, trigger: { manual: true }, steps: [
+      { id: 'first', prompt: 'Append once.', requiresApproval: true, sideEffect: 'write', call: { tool: 'DESTPROOF_APPEND_RECORD', args: { item_id: '1785000000.000782', value: 'once' } } },
+      { id: 'remaining', dependsOn: ['first'], prompt: 'Update once after approval.', requiresApproval: true, sideEffect: 'write', call: { tool: 'SOURCEPROOF_UPDATE_RECORD', args: { item_id: FINAL_PAGE_ITEM_ID, value: 'approved-continuation-once' } } },
+    ],
+  });
+  const gate = (runId: string, stepId: string) => {
+    const rows = approvalRegistry.listPending({ sessionId: `workflow-gate:${runId}:${stepId}` });
+    assert.equal(rows.length, 1);
+    return rows[0]!;
+  };
+  const before = readProviderState();
+  const original = queueWorkflowRun(workflowSlug, {}, { source: 'console' });
+  assert.equal(original.status, 'queued', original.message);
+  await drainUntil(original.id!, (run) => run.status === 'parked');
+  assert.equal(approvalRegistry.resolve(gate(original.id!, 'first').approvalId, 'approved', 'fixture-owner').ok, true);
+  reapResolvedParkedRuns();
+  await drainUntil(original.id!, (run) => run.status === 'parked');
+  const pending = gate(original.id!, 'remaining');
+  assert.equal(readProviderState().counters.append - before.counters.append, 1);
+  assert.equal(readProviderState().counters.sourceMutation - before.counters.sourceMutation, 0);
+  assert.equal(inspectWorkflowV3Call({ workflowSlug, runId: original.id!, stepId: 'remaining' }).status, 'missing');
+  cancelWorkflowRunAtBoundary({ runId: original.id!, reason: 'Stop before approving the remaining write.', source: 'tasks-board' });
+
+  // Quiet effects are insufficient when the durable gate belongs elsewhere.
+  openEventLog().prepare('UPDATE pending_approvals SET args_json = ? WHERE approval_id = ?')
+    .run(JSON.stringify({ ...pending.args, runId: 'another-run' }), pending.approvalId);
+  const foreign = continueWorkflowRunFromCheckpoint(original.id!, { requestedFrom: 'board' })!;
+  assert.equal(foreign.status, 'ambiguous', foreign.message);
+  openEventLog().prepare('UPDATE pending_approvals SET args_json = ? WHERE approval_id = ?')
+    .run(JSON.stringify(pending.args), pending.approvalId);
+
+  const claims = await continueFromFreshProcesses(original.id!, 2);
+  assert.deepEqual(claims.map((claim) => claim.status).sort(), ['duplicate', 'queued'], JSON.stringify({ claims,
+    remainingEvents: readWorkflowEvents(workflowSlug, original.id!).filter((event) => event.stepId === 'remaining').map((event) => ({ kind: event.kind, meta: event.meta })) }));
+  assert.equal(claims[0]?.id, claims[1]?.id);
+  const childId = claims[0]!.id!;
+  await drainUntil(childId, (run) => run.status === 'parked');
+  const fresh = gate(childId, 'remaining');
+  assert.notEqual(fresh.approvalId, pending.approvalId, 'the old gate never authorizes the successor');
+  assert.equal(approvalRegistry.get(pending.approvalId)?.status, 'pending');
+  assert.equal(readProviderState().counters.append - before.counters.append, 1);
+  assert.equal(readProviderState().counters.sourceMutation - before.counters.sourceMutation, 0, 'Continue cannot bypass the fresh approval');
+  // A late answer on the stopped occurrence cannot revive it or transfer
+  // permission to the successor's exact gate.
+  assert.equal(approvalRegistry.resolve(pending.approvalId, 'approved', 'fixture-late-old-decision').ok, true);
+  reapResolvedParkedRuns();
+  await processWorkflowRuns({ respond: async () => ({ text: 'must not run' }) } as never);
+  assert.equal(readRun(original.id!).status, 'cancelled');
+  assert.equal(gate(childId, 'remaining').approvalId, fresh.approvalId);
+  assert.equal(readProviderState().counters.sourceMutation - before.counters.sourceMutation, 0);
+  assert.equal(approvalRegistry.resolve(fresh.approvalId, 'approved', 'fixture-owner').ok, true);
+  reapResolvedParkedRuns();
+  await drainUntil(childId, (run) => run.status === 'completed');
+  assertOneSuccessfulTerminal(workflowSlug, childId);
+  const replay = (await continueFromFreshProcesses(original.id!))[0]!;
+  assert.equal(replay.status, 'duplicate', replay.message);
+  assert.equal(replay.id, childId);
+  await processWorkflowRuns({ respond: async () => ({ text: 'must not run' }) } as never);
+  assert.equal(readProviderState().counters.append - before.counters.append, 1);
+  assert.equal(readProviderState().counters.sourceMutation - before.counters.sourceMutation, 1);
+});
+
+test('Continue cannot exempt an approved declarative gate after a real uncertain dispatch', async () => {
+  const workflowSlug = 'platform49-continue-dispatched-gate';
+  installProviderCapabilities(['ORPHANPROOF_APPEND_RECORD']);
+  writeWorkflow(workflowSlug, {
+    name: workflowSlug, description: 'An approved gate with a lost response cannot repeat.', enabled: true,
+    trigger: { manual: true }, steps: [
+      { id: 'uncertain', prompt: 'Append exactly once.', requiresApproval: true, sideEffect: 'write', call: { tool: 'ORPHANPROOF_APPEND_RECORD', args: { item_id: '1785000000.000783', value: 'may-have-landed' } } },
+    ],
+  });
+  const before = readProviderState();
+  const original = queueWorkflowRun(workflowSlug, {}, { source: 'console' });
+  await drainUntil(original.id!, (run) => run.status === 'parked');
+  const pending = approvalRegistry.listPending({ sessionId: `workflow-gate:${original.id}:uncertain` });
+  assert.equal(pending.length, 1);
+  assert.equal(approvalRegistry.resolve(pending[0]!.approvalId, 'approved', 'fixture-owner').ok, true);
+  reapResolvedParkedRuns();
+  await drainUntil(original.id!, (run) => run.status === 'running' && run.heldExecution?.hold?.wake === 'recovery');
+  cancelWorkflowRunAtBoundary({ runId: original.id!, reason: 'Stop the uncertain approved action.', source: 'tasks-board' });
+  const replay = continueWorkflowRunFromCheckpoint(original.id!, { requestedFrom: 'board' })!;
+  assert.equal(replay.status, 'ambiguous', replay.message);
+  const restarted = (await continueFromFreshProcesses(original.id!))[0]!;
+  assert.equal(restarted.status, 'ambiguous', restarted.message);
+  assert.equal(readProviderState().counters.orphan - before.counters.orphan, 1, 'the approved provider dispatch never repeats');
+});
+
+test('an old Stop cannot bypass a continuation whose provider committed with a lost response', async () => {
+  const workflowSlug = 'platform49-continue-uncertain-child';
+  installProviderCapabilities(['DESTPROOF_APPEND_RECORD']);
+  writeWorkflow(workflowSlug, {
+    name: workflowSlug, description: 'Keep uncertain descendant effects blocked.', enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'first_write', prompt: 'Append once.', sideEffect: 'write', call: { tool: 'DESTPROOF_APPEND_RECORD', args: { item_id: '1785000000.000780', value: 'once' } } },
+      { id: 'uncertain_write', dependsOn: ['first_write'], prompt: 'Append once even if the response is lost.', sideEffect: 'write', call: { tool: 'ORPHANPROOF_APPEND_RECORD', args: { item_id: '1785000000.000781', value: 'once' } } },
+    ],
+  });
+  const before = readProviderState();
+  const original = queueWorkflowRun(workflowSlug, {}, { source: 'console' });
+  await drainUntil(original.id!, (run) => run.status === 'blocked_capability');
+  cancelWorkflowRunAtBoundary({ runId: original.id!, reason: 'Stop before uncertain step.', source: 'tasks-board' });
+  installProviderCapabilities(['DESTPROOF_APPEND_RECORD', 'ORPHANPROOF_APPEND_RECORD']);
+  const child = continueWorkflowRunFromCheckpoint(original.id!, { requestedFrom: 'board' })!;
+  assert.equal(child.status, 'queued', child.message);
+  await drainUntil(child.id!, (run) => run.status === 'running' && run.heldExecution?.hold?.wake === 'recovery');
+  const pausedReplay = continueWorkflowRunFromCheckpoint(original.id!, { requestedFrom: 'board' })!;
+  assert.equal(pausedReplay.status, 'ambiguous', pausedReplay.message);
+  cancelWorkflowRunAtBoundary({ runId: child.id!, reason: 'Stop uncertain child.', source: 'tasks-board' });
+  const stoppedReplay = continueWorkflowRunFromCheckpoint(original.id!, { requestedFrom: 'board' })!;
+  assert.equal(stoppedReplay.status, 'ambiguous', stoppedReplay.message);
+  const restarted = (await continueFromFreshProcesses(original.id!))[0]!;
+  assert.equal(restarted.status, 'ambiguous', restarted.message);
+  await processWorkflowRuns({ respond: async () => ({ text: 'must not run' }) } as never);
+  assert.equal(readProviderState().counters.append - before.counters.append, 1);
+  assert.equal(readProviderState().counters.orphan - before.counters.orphan, 1, 'uncertain descendant dispatch never repeats');
 });
 
 test('provider commit with a lost response becomes ambiguous and is never blindly re-dispatched', async () => {

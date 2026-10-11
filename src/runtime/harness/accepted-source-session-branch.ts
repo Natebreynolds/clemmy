@@ -16,6 +16,8 @@ import { publicCompletionText, publicUserInputText, validTypedCompletionPresenta
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import { sessionAgentState } from '../../agents/session-agent-state.js';
 import { sessionProjectState } from '../../projects/session-project-state.js';
+import { prepareCancelledSuccessorReadShares, type CancelledSuccessorReadShare } from './cancelled-successor-retained-read.js';
+import { measureProjectionRead, type ProjectionReadObserver } from '../../dashboard/projection-read-metrics.js';
 
 const BRANCH_META = '__accepted_source_branch';
 const MOUNT_META = '__session_mount';
@@ -44,7 +46,7 @@ export type AcceptedSourceSessionSelectionInput = {
    * from arbitrary parent metadata during a split. */
   validatedMount?: AcceptedSourceValidatedMount;
 } & (
-  | { kind: 'ordinary' }
+  | { kind: 'ordinary'; /** Refuse competing work instead of branching away from it. */ requireIdle?: boolean }
   | { kind: 'bound_control'; targetSessionId: string }
 );
 
@@ -78,6 +80,14 @@ export interface ClaimedAcceptedSourceSession {
 export interface AcceptedSourceIngressLineage {
   conversationId: string;
   validatedMount?: AcceptedSourceValidatedMount;
+}
+
+export interface AcceptedSourceConversationProjection {
+  /** Stable public identity, independent of the next execution head. */
+  rootSessionId: string;
+  headSessionId: string;
+  /** Selector-owned sessions in conversation order, each included once. */
+  sessionIds: string[];
 }
 
 interface RawSession {
@@ -118,6 +128,13 @@ interface TransactionSelection {
   selection: AcceptedSourceSessionSelection;
   createdEvent: EventRow | null;
   continuityEvent?: EventRow;
+}
+
+export class AcceptedSourceSessionIdleError extends Error {
+  constructor(readonly reason: 'busy' | 'held') {
+    super(`Accepted conversation head is ${reason}.`);
+    this.name = 'AcceptedSourceSessionIdleError';
+  }
 }
 
 const SUCCESSOR_CONTEXT_MAX_CHARS = 32_000;
@@ -224,6 +241,7 @@ function seedSuccessorConversation(
   ].join('\n');
   const blocks: string[] = [];
   const sources: Array<Record<string, unknown>> = [];
+  const cancelledReadShares: CancelledSuccessorReadShare[] = [];
   const seen = new Set<number>();
   let remaining = SUCCESSOR_CONTEXT_MAX_CHARS - header.length - 100;
   for (const row of rows) {
@@ -261,6 +279,11 @@ function seedSuccessorConversation(
         terminalDigest: digest(terminalData),
         truncated: clipped,
       });
+      if (row.session_id === parent.id && cancelledTerminal(terminalData)) {
+        cancelledReadShares.push(...prepareCancelledSuccessorReadShares(db, {
+          parentSessionId: parent.id, childSessionId: child.id, terminalEventId: row.id,
+        }));
+      }
       remaining -= block.length + 2;
     } catch { /* An unreadable optional exchange cannot prevent a fresh source. */ }
   }
@@ -277,6 +300,7 @@ function seedSuccessorConversation(
       priorSessionIds: lineage,
       continuityDigest: continuityDigest(continuity),
       sources: sources.reverse(),
+      ...(cancelledReadShares.length ? { cancelledReadShares } : {}),
       totalChars: text.length,
       text,
     },
@@ -542,6 +566,75 @@ function existingBinding(db: Database.Database, sourceDigest: string): BindingRo
   `).get(sourceDigest) as BindingRow | undefined) ?? null;
 }
 
+/** Read-only presentation lineage. A metadata parent alone is never enough
+ * to join transcripts: require the selector's pointer, exact source binding,
+ * and the same provider, conversation, audience and scope at every hop. This
+ * does not transfer attempt/effect authority or reactivate a stopped session. */
+export function readAcceptedSourceConversationProjection(sessionId: string, diagnostics: { observer?: ProjectionReadObserver } = {}): AcceptedSourceConversationProjection | null {
+  try {
+    const db = openEventLog();
+    // Lists must not deserialize provider transcripts/recovery state for each
+    // member merely to establish its visible identity.
+    const readRow = (id: string): RawSession => {
+      const row = measureProjectionRead(diagnostics.observer, 'catalog_lineage_rows', () => db.prepare(`SELECT id, kind, channel, user_id, status,
+        json_object('ingressProvider', json_extract(metadata_json, '$.ingressProvider'),
+          'source', json_extract(metadata_json, '$.source'),
+          'channelId', json_extract(metadata_json, '$.channelId'),
+          'discordChannelId', json_extract(metadata_json, '$.discordChannelId'),
+          'userId', json_extract(metadata_json, '$.userId'),
+          'discordUserId', json_extract(metadata_json, '$.discordUserId'),
+          'guildId', json_extract(metadata_json, '$.guildId'),
+          'discordGuildId', json_extract(metadata_json, '$.discordGuildId'),
+          '${BRANCH_META}', json_extract(metadata_json, '$.${BRANCH_META}')) AS metadata_json
+        FROM sessions WHERE id = ? AND json_valid(metadata_json)`).get(id) as RawSession | undefined);
+      if (!row) throw new Error('Conversation identity is unavailable');
+      return row;
+    };
+    const entry = readRow(sessionId);
+    if (entry.kind !== 'chat') return null;
+    const metadata = parseMetadata(entry.metadata_json);
+    const provider = stringField(metadata, 'ingressProvider') ?? stringField(metadata, 'source') ?? entry.channel;
+    const conversationId = stringField(metadata, 'channelId') ?? stringField(metadata, 'discordChannelId');
+    const audienceId = entry.user_id ?? stringField(metadata, 'userId') ?? stringField(metadata, 'discordUserId');
+    if (!provider || !conversationId || !audienceId) return null;
+    const identity = normalizedContinuity({ provider, conversationId, audienceId,
+      scopeId: stringField(metadata, 'guildId') ?? stringField(metadata, 'discordGuildId') });
+    const continuity = continuityDigest(identity);
+    assertBoundControlTarget(entry, identity);
+    const rootId = rootSessionIdFor(entry);
+    const pointer = measureProjectionRead(diagnostics.observer, 'catalog_lineage_proofs', () => readPointer(db, rootId, continuity));
+    if (!pointer) return null;
+
+    const lineage: string[] = [];
+    const seen = new Set<string>();
+    let row = readRow(pointer.head_session_id);
+    // Fail closed if malformed/cyclic or beyond this bound, rather than show
+    // a partial lineage under an incorrectly trusted public identity.
+    while (lineage.length < 1024) {
+      if (row.kind !== 'chat' || seen.has(row.id)) return null;
+      assertBoundControlTarget(row, identity);
+      seen.add(row.id);
+      lineage.push(row.id);
+      const branch = branchMetadata(row);
+      if (branch) {
+        if (branch.rootSessionId !== rootId || branch.continuityDigest !== continuity) return null;
+        const binding = measureProjectionRead(diagnostics.observer, 'catalog_lineage_proofs', () => existingBinding(db, branch.durableSourceDigest));
+        if (!binding || binding.root_session_id !== rootId || binding.continuity_digest !== continuity
+          || binding.session_id !== row.id
+          || binding.disposition !== (row.id === rootId ? 'identity_split' : 'branched')) return null;
+      } else if (row.id !== rootId) return null;
+      // An identity-split root can refer to a different principal's old row.
+      // It is the boundary, never an ancestor of this public conversation.
+      if (row.id === rootId) {
+        if (!seen.has(entry.id)) return null;
+        return { rootSessionId: rootId, headSessionId: pointer.head_session_id, sessionIds: lineage.reverse() };
+      }
+      row = readRow(branch!.parentSessionId);
+    }
+    return null;
+  } catch { return null; }
+}
+
 function bindSelection(
   db: Database.Database,
   input: {
@@ -749,6 +842,33 @@ function canReuseProtocolHistory(db: Database.Database, sessionId: string): bool
   }
 }
 
+/** This is an admission precondition, not a read followed by a later claim.
+ * The same IMMEDIATE transaction owns the current pointer, reservations,
+ * attempts, and approval holds until the new binding/receipt is inserted. */
+function assertOrdinaryHeadIdle(db: Database.Database, head: RawSession): void {
+  if (db.prepare(`SELECT 1 FROM run_attempts WHERE session_id = ? AND finished_at IS NULL LIMIT 1`)
+    .get(head.id) || headHasUnsettledSelection(db, head.id)) {
+    throw new AcceptedSourceSessionIdleError('busy');
+  }
+  const metadata = parseMetadata(head.metadata_json);
+  const checkpoints = metadata.__source_approval_checkpoints;
+  if (checkpoints != null && (typeof checkpoints !== 'object' || Array.isArray(checkpoints))) {
+    throw new Error('Malformed source approval checkpoint index');
+  }
+  const sourceHeld = Object.values(checkpoints ?? {}).some((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Malformed source approval checkpoint');
+    const row = value as Record<string, unknown>;
+    if (typeof row.revision !== 'string' || !row.revision || !Object.prototype.hasOwnProperty.call(row, 'checkpoint')) {
+      throw new Error('Malformed source approval checkpoint');
+    }
+    return row.checkpoint !== null;
+  });
+  if (metadata.__interrupt_state != null || sourceHeld
+    || db.prepare(`SELECT 1 FROM pending_approvals WHERE session_id = ? AND status = 'pending' LIMIT 1`).get(head.id)) {
+    throw new AcceptedSourceSessionIdleError('held');
+  }
+}
+
 function selectInTransaction(
   db: Database.Database,
   input: AcceptedSourceSessionSelectionInput,
@@ -863,6 +983,7 @@ function selectInTransaction(
     };
   }
 
+  if (input.requireIdle === true) assertOrdinaryHeadIdle(db, head);
   pointer ??= ensurePointer(db, rootSessionId, continuityKey, head.id, now);
   const reusable = head.status === 'active'
     && !headHasUnsettledSelection(db, head.id)

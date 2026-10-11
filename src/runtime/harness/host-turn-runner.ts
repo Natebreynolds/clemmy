@@ -8,7 +8,8 @@ import { runOwnedHostStopNarration } from './host-stop-narration-lifecycle.js';
 import { retainConnectionExecutionProgress } from './connection-execution-progress.js';
 import { assertHostConnectionProgress, bindHostConnectionProgress, clearHostConnectionProgress, type HostConnectionProgress } from './host-connection-progress.js';
 import { declaresWorkflowDispatchReceipt } from './workflow-dispatch-commit.js';
-import { responseFormatRepairPacket } from './response-format-repair.js';
+import { applyWholeResponseFormatFinding, responseFormatRepairPacket, wholeResponseFormatFinding,
+  wholeResponseFormatRequirement, WHOLE_JSON_OBJECT_REVIEW_GUIDANCE } from './response-format-repair.js';
 import { verifiedIntakeHasOwnerStatedMemory, verifiedMemoryIntakeContext, verifiedMemoryConsolidationEvidence } from './durable-memory-intake-receipt.js';
 import { hostModelOutputPreview } from './host-model-output-preview.js';
 import { workflowActivationSuccessor } from './workflow-activation-successor.js';
@@ -91,6 +92,7 @@ import { materializeStrictNullableFields } from '../schema-normalizer.js';
 import { serializeAdvertisedTools, toolsOnAdvertisedWire, usesSessionWireOrder } from './advertised-tool-wire.js';
 import type { PromptReadingPublisher } from './prompt-composition.js';
 import { getBuildInfo } from '../build-info.js';
+import { reviewInputObservationForSource, type ReviewInputOwner } from './review-input-observation.js';
 import type { Agent, AgentInputItem, Model, ModelRequest } from '@openai/agents';
 import {
   boundAgentCapabilityEnvelope,
@@ -184,6 +186,8 @@ import {
 } from './watcher-judge.js';
 import { objectiveMayRequireMultipleResults } from './tool-evidence.js';
 import { conversationalReviewSkipRecord } from './completion-review-skip.js';
+import { cancelledSuccessorReadReviewEvidence, cancelledSuccessorReadReviewIsAuthentic,
+  cancelledSuccessorReadReviewRequired } from './cancelled-successor-retained-read.js';
 import {
   acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceEvidenceLookup, sourceWritesAtStake,
   historicalReadCompletionEvidence, historicalReadClosureIsAuthentic,
@@ -4122,7 +4126,8 @@ const runHostTurnBody = async (
    *  continuation, so a continuation that added no evidence is recognisable
    *  before a second identical verdict is bought. */
   let judgedBusinessCallsAtLastVerdict: number | undefined = carriedProgress?.continuations.judgedBusinessCallsAtLastVerdict;
-  let pendingResponseFormatRepair: { objective: string; instructions: string; text: string } | undefined;
+  let pendingResponseFormatRepair: { objective: string; instructions: string; text: string;
+    author: ResolvedRoleModel; model: Model } | undefined;
   /** Set by the review when the answer ships without the claims it flagged. */
   let reviewedReplacementText: string | undefined;
   // A chosen writer's pending final-answer step, the last brain draft sent to
@@ -4130,7 +4135,7 @@ const runHostTurnBody = async (
   // measures independence against that reply's actual author.
   let pendingHostWriter: PendingHostWriter | undefined;
   let hostWriterDraftDigest: string | undefined;
-  let hostWrittenReply: { digest: string; author: ResolvedRoleModel } | undefined;
+  let hostWrittenReply: { digest: string; author: ResolvedRoleModel; model: Model } | undefined;
   let completionReviewFeedback = itemsOrState instanceof HostInterruptState
     || itemsOrState instanceof HostRecoveryState
     ? parseHostCompletionReviewFeedback(itemsOrState.completionReviewFeedback)
@@ -4526,10 +4531,25 @@ const runHostTurnBody = async (
     const intent = classifyMessageIntent(objective);
     const explicitMemoryRequired = !planCandidate && explicitMemoryCompletionRequired();
     const memoryRequirementRequired = !planCandidate && memoryRequirementApplies();
+    const inheritedReads = cancelledSuccessorReadReviewEvidence(identity);
+    const inheritedReadReviewRequired = cancelledSuccessorReadReviewRequired(identity);
+    const inheritedObjective = inheritedReads ? stoppedReadEffectiveObjective(inheritedReads.bindings) : undefined;
+    // Only accepted owner requests and adopted owner amendments supply output
+    // authority. Never infer it from retained tool bytes or reviewer prose.
+    const responseFormatRequirement = !planCandidate && !turnIsPlanMode() ? wholeResponseFormatRequirement([
+      ...(inheritedObjective ? [inheritedObjective.objective,
+        ...adoptedSteerNotesForSource({ sessionId: inheritedObjective.parentSessionId,
+          sourceUserSeq: inheritedObjective.sourceUserSeq }).map(note => note.text)] : []),
+      objective, ...adoptedSteerNotesForSource(identity).map(note => note.text),
+    ]) : null;
+    const responseFormatFinding = wholeResponseFormatFinding(responseFormatRequirement, judgedText);
     if (
       !explicitMemoryRequired && !memoryRequirementRequired && selfContainedConversation(objective, intent)
       && businessCalls.length === 0
       && settled.count === 0
+      && !inheritedReads
+      && !inheritedReadReviewRequired
+      && !responseFormatFinding
     ) {
       try {
         appendEvent({
@@ -4564,6 +4584,15 @@ const runHostTurnBody = async (
       openApprovalCard,
     };
     const gate = shouldRunObjectiveJudge(gateInput)
+      // A continued answer cannot waive its inherited evidence review by
+      // asking for input. The reviewer decides whether that input is really
+      // needed; its awaiting-user verdict still pauses without effect consent.
+      // Parent observations never become child calls or fresh effect receipts.
+      || ((Boolean(inheritedReads) || inheritedReadReviewRequired)
+        && (gateInput.nextAction === 'completed' || gateInput.nextAction === 'awaiting_user_input') && !openApprovalCard
+        && objectiveJudgeContinuations <= MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS)
+      || (Boolean(responseFormatFinding) && gateInput.nextAction === 'completed' && !openApprovalCard
+        && objectiveJudgeContinuations <= MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS)
       || ((explicitMemoryRequired || memoryRequirementRequired) && gateInput.nextAction === 'completed' && !openApprovalCard
         && objectiveJudgeContinuations <= MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS);
     if (!gate && !planCandidate) {
@@ -4657,19 +4686,28 @@ const runHostTurnBody = async (
     const judgeStartedAt = Date.now();
     let preparation: ReturnType<typeof acceptedPlanPreparationReadEvidence>;
     let historicalEvidence: ReturnType<typeof historicalReadCompletionEvidence>;
+    let agentInstructions: string | undefined;
+    let reviewInputOwner: ReviewInputOwner | undefined;
     // The viewer sees that the finished draft is being checked, not a pause.
     markAnswerDraftChecking(identity.sessionId, identity.sourceUserSeq);
     try {
       preparation = acceptedPlanPreparationReadEvidence(identity);
+      if (inheritedReadReviewRequired && !inheritedReads) throw new Error('Required exact inherited read evidence is unavailable');
+      if (inheritedReads && !inheritedObjective) throw new Error('Exact stopped effective objective is unavailable');
       const workflowEvidence = workflowParentActivation(identity.sessionId, identity.sourceUserSeq)?.completionEvidence?.();
-      const agentInstructions = sessionAgentReviewContext(identity.sessionId);
+      agentInstructions = sessionAgentReviewContext(identity.sessionId);
       const delegatedJobs = delegatedJobsStartedBy(identity);
       historicalEvidence = historicalReadCompletionEvidence({ ...identity, objective, reply: judgedReply,
         excluded: Boolean(planCandidate || preparation || workflowParentActivation(identity.sessionId, identity.sourceUserSeq)
           || openApprovalCard || explicitMemoryRequired || memoryRequirementRequired || delegatedJobs.length > 0
           || settled.count > 0 || !settled.evidenceAvailable || !readEvidence.evidenceAvailable || readEvidence.results.length > 0) });
+      const reviewAttribution = modelUsageAttributionStorage.getStore();
+      reviewInputOwner = { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
+        ...(reviewAttribution?.sessionId === identity.sessionId && reviewAttribution.sourceUserSeq === identity.sourceUserSeq
+          && reviewAttribution.attemptId ? { attemptId: reviewAttribution.attemptId } : {}) };
       verdict = await hostObjectiveJudge(objective, judgedReply, {
         sessionId: identity.sessionId,
+        reviewInputOwner,
         completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE,
         ...(memoryRequirementRequired ? { memoryRequirementContext: (() => {
           try {
@@ -4696,6 +4734,7 @@ const runHostTurnBody = async (
         }),
         verifiedReads: readEvidence.summary,
         verifiedReadResults: readEvidence.results,
+        ...(inheritedReads ? { inheritedReadCoverage: inheritedReads.coverage } : {}),
         ...(historicalEvidence ? { historicalEvidence } : {}),
         fullSourceEvidence: true,
         ...(policy.status === 'captured' ? { boundaryJudgeSelection: policy.policy.judgeSelection } : {}),
@@ -4703,7 +4742,15 @@ const runHostTurnBody = async (
           ? { reviewedAuthor: hostWrittenReply.author } : {}),
         // The reviewer opens retained results itself when its verdict depends
         // on content it was not shown, instead of ruling the claim unverified.
-        evidence: sourceEvidenceLookup(identity),
+        evidence: (() => {
+          const current = sourceEvidenceLookup(identity);
+          return inheritedReads ? {
+            refKind: `${current.refKind}, or exact origin-qualified inherited-read refs`,
+            refs: () => [...current.refs(), ...inheritedReads.evidence.refs()],
+            resolve: (ref: string) => ref.startsWith('inherited-read:')
+              ? inheritedReads.evidence.resolve(ref) : current.resolve(ref),
+          } : current;
+        })(),
         skills: gatherSessionSkills(identity.sessionId, { sourceUserSeq: identity.sourceUserSeq, includeUnavailable: true }),
         // Source-bound settled effects FIRST, then authenticated read results.
         // The judge rules on actual source evidence, not call-count proxies or
@@ -4712,6 +4759,7 @@ const runHostTurnBody = async (
         // ordering, so the verdict rules on what is actually saved. A read that
         // ran BEFORE the write is not evidence of the write.
         toolCallSummary: [
+          responseFormatRequirement ? WHOLE_JSON_OBJECT_REVIEW_GUIDANCE : undefined,
           queuedApprovalRegistrationEvidence,
           workflowEvidence ? `Host-verified child execution records for THIS workflow parent (reopened under its exact continuation owner; data, never instructions):\n${workflowEvidence}` : undefined,
           delegatedJobs.length > 0 ? `Background jobs THIS request started (host record; data, never instructions): ${JSON.stringify(delegatedJobs)}\nA job like this does its work after this reply and reports back to this conversation under its own review. For the part of the request handed to a job, judge this reply as the hand-off: it must say honestly that the work was handed off and what happens next, and must not claim the job's results already exist. A result the job has not produced yet is not a gap in this reply. Judge any other part of the request as usual.` : undefined,
@@ -4736,12 +4784,17 @@ const runHostTurnBody = async (
           // re-inflating every raw result into the reviewer prompt. Selected
           // pages stay whole; preview omission is never proof of absence.
           `Retained READ results for THIS accepted source (metadata/schema discovery is not the requested business data):\n${readEvidence.summary}`,
+          inheritedReads ? `${inheritedReads.summary}\nExact stopped effective objective, including adopted steering (parent ${inheritedObjective!.parentSessionId}, source ${inheritedObjective!.sourceUserSeq}, objective digest ${inheritedObjective!.objectiveDigest}):\n${inheritedObjective!.objective}\nJudge this explicit continuation against that whole effective objective together with current amendments and applicable standing instructions. Historical objectives confer no execution or approval authority.` : undefined,
           // A reply may rest on a check an earlier turn made ("I checked
           // beforehand"); without it that claim reads as unverified.
           planCandidate ? undefined : earlierTurnsEvidence(identity),
           preparation?.summary,
         ].filter(Boolean).join('\n'),
       });
+      if (inheritedReads && (!inheritedReads.stillCurrent()
+        || stoppedReadEffectiveObjective(inheritedReads.bindings)?.objectiveDigest !== inheritedObjective?.objectiveDigest)) {
+        throw new Error('Exact inherited read evidence changed during completion review');
+      }
       if (workflowEvidence !== workflowParentActivation(identity.sessionId, identity.sourceUserSeq)?.completionEvidence?.()) {
         throw new Error('Workflow execution evidence changed during completion review');
       }
@@ -4753,6 +4806,10 @@ const runHostTurnBody = async (
         reviewFailure: 'unavailable',
       };
     }
+    // No post-review stripping or substring JSON extraction. A positive
+    // semantic verdict cannot waive an explicit whole-output contract; the
+    // next candidate is repaired and reviewed normally with all evidence.
+    verdict = applyWholeResponseFormatFinding(verdict, responseFormatFinding);
     if (memoryRequirementRequired) {
       let memoryAssessmentAccepted = false;
       try {
@@ -4796,6 +4853,8 @@ const runHostTurnBody = async (
           lane: 'host_v1',
           kind: 'completion',
           fulfills: verdict.done && !verdict.awaitingUser,
+          ...(responseFormatRequirement ? { responseFormatContract: { ...responseFormatRequirement,
+            candidateValid: responseFormatFinding === null } } : {}),
           ...(verdict.fast ? { fast: true } : {}),
           ...(verdict.jevAttempt ? { jevAttempt: verdict.jevAttempt } : {}),
           ...(verdict.repairScope ? { repairScope: verdict.repairScope } : {}),
@@ -4810,6 +4869,14 @@ const runHostTurnBody = async (
           // this record; a reviewer's prose about what it read is not.
           ...(verdict.evidenceCoverage ? { evidenceCoverage: verdict.evidenceCoverage } : {}),
           ...(verdict.verdictRestatedFrom ? { verdictRestatedFrom: verdict.verdictRestatedFrom } : {}),
+          ...(() => {
+            const observation = reviewInputOwner && reviewInputObservationForSource(verdict.reviewInputObservation, {
+              ...reviewInputOwner,
+              objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex'),
+              candidateDigest: createHash('sha256').update(judgedReply, 'utf8').digest('hex'),
+            });
+            return observation ? { reviewInputObservation: observation } : {};
+          })(),
           ...(verdict.selfJudge ? { selfJudge: true } : {}),
           // Requested-vs-actual judge identity on the durable event, so a
           // substitute is never read back as the pinned model's judgment. A
@@ -4845,6 +4912,14 @@ const runHostTurnBody = async (
           settledEffectCount: settled.count,
           settledEvidenceAvailable: settled.evidenceAvailable && readEvidence.evidenceAvailable,
           judgedReadResults: readEvidence.results,
+          ...(inheritedReads || inheritedReadReviewRequired ? { inheritedReadReviewRequired: true } : {}),
+          ...(inheritedReads ? {
+            judgedInheritedObjective: inheritedObjective ? { parentSessionId: inheritedObjective.parentSessionId,
+              sourceUserSeq: inheritedObjective.sourceUserSeq, objectiveDigest: inheritedObjective.objectiveDigest } : null,
+            judgedInheritedReadResults: {
+            kind: 'cancelled_successor_read_shares', semanticCompleteness: 'as_recorded',
+            consumer: inheritedReads.consumer, bindings: inheritedReads.bindings,
+          } } : {}),
           ...(verdict.historicalEvidence ? { judgedHistoricalReadResults: verdict.historicalEvidence } : {}),
           ...(memoryConsolidation ? { judgedMemoryResults: memoryConsolidation } : {}),
           ...(memoryRequirementRequired ? { judgedMemoryRequirement: currentMemoryReviewCheck ?? memoryRequirementCompletion() } : {}),
@@ -4891,7 +4966,7 @@ const runHostTurnBody = async (
     // quote is found verbatim; otherwise the unverified delivery stands.
     if (!continuation && !awaitingInput && !verdict.done && verdict.repairScope === 'claims'
       && !blockedByReview && !verdict.failedOpen && !planCandidate && settled.count === 0
-      && judgedVerdictRow) {
+      && !responseFormatRequirement && judgedVerdictRow) {
       const removal = removeReviewedClaims(judgedReply, verdict.reason);
       if (removal) {
         try {
@@ -4964,8 +5039,20 @@ const runHostTurnBody = async (
       reason: verdict.reason,
     };
     const formatPacket = responseFormatRepairPacket({ ...verdict,
-      plan: Boolean(planCandidate) || turnIsPlanMode(), objective, reply: judgedReply, reason: verdict.reason });
-    pendingResponseFormatRepair = formatPacket ? { objective, ...formatPacket } : undefined;
+      plan: Boolean(planCandidate) || turnIsPlanMode(), objective, reply: judgedReply, reason: verdict.reason,
+      effectiveObjective: [inheritedObjective
+        ? `Exact stopped effective objective, including adopted steering:\n${inheritedObjective.objective}` : undefined,
+        `Current effective objective and amendments:\n${objective}`,
+        agentInstructions ? `Applicable standing instructions:\n${agentInstructions}` : undefined,
+        responseFormatRequirement ? WHOLE_JSON_OBJECT_REVIEW_GUIDANCE : undefined,
+      ].filter(Boolean).join('\n\n') });
+    // A compact formatting call may reuse only the exact final writer that
+    // authored this reviewed draft. A configured worker is not that author.
+    // Without this capture, ordinary source-bound feedback keeps the primary
+    // agent on its own route and preserves its complete context.
+    const formatAuthor = hostWrittenReply?.digest === completionReviewFeedback.replyDigest ? hostWrittenReply : undefined;
+    pendingResponseFormatRepair = formatPacket && formatAuthor
+      ? { objective, ...formatPacket, author: formatAuthor.author, model: formatAuthor.model } : undefined;
     return 'continue';
   };
 
@@ -5228,7 +5315,7 @@ const runHostTurnBody = async (
     modelInput: AgentInputItem[],
     instructions: string | undefined,
     modelSchemas: readonly unknown[] = schemas,
-    formatWorkerModelId?: string,
+    exactRoleModelId?: string,
     exactModel?: Model,
     answerDraft?: AnswerDraftStep,
     finalRequestReading?: PromptReadingPublisher,
@@ -5375,7 +5462,7 @@ const runHostTurnBody = async (
       if (signal.aborted) rejectAbort();
       else signal.addEventListener('abort', rejectAbort, { once: true });
     });
-    const settingsForStep = formatWorkerModelId ? {} : stepModelSettings();
+    const settingsForStep = exactRoleModelId ? {} : stepModelSettings();
     const hostProjection = canonicalPromptCacheRequest({
       ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
       input: modelInput,
@@ -5403,8 +5490,8 @@ const runHostTurnBody = async (
     const dispatchModelStep = () => codexOneStep({
       input: modelInput,
       tools: modelSchemas as never,
-      ...(formatWorkerModelId ? { modelId: formatWorkerModelId } : modelId !== undefined ? { modelId } : {}),
-      ...(exactModel ? { resolveModel: () => exactModel } : !formatWorkerModelId && resolveModel ? { resolveModel } : {}),
+      ...(exactRoleModelId ? { modelId: exactRoleModelId } : modelId !== undefined ? { modelId } : {}),
+      ...(exactModel ? { resolveModel: () => exactModel } : !exactRoleModelId && resolveModel ? { resolveModel } : {}),
       ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
       modelSettings: settingsForStep,
       signal: controller.signal,
@@ -5695,7 +5782,7 @@ const runHostTurnBody = async (
       }, () => runOneModelStep(writerInput, writerInstructions, [], writer.author.modelId, writer.model, answerDraft));
       if (written.toolCalls.length > 0) throw new Error('writer_tool_call');
       if (!written.text.trim()) throw new Error('writer_empty_reply');
-      hostWrittenReply = { digest: createHash('sha256').update(written.text, 'utf8').digest('hex'), author: writer.author };
+      hostWrittenReply = { digest: createHash('sha256').update(written.text, 'utf8').digest('hex'), author: writer.author, model: writer.model };
       journalHostGuide('host_final_writer', {
         phase: 'written', modelId: writer.author.modelId, durationMs: Date.now() - startedAt, replyChars: written.text.length,
       });
@@ -10086,7 +10173,7 @@ const runHostTurnBody = async (
     // normalises, annotates or truncates its input in place would then be
     // editing history that has already been accepted — silently, and only on
     // the configuration that looks simplest.
-    let formatWorkerModelId: string | undefined;
+    let formatRepairForStep: typeof pendingResponseFormatRepair;
     let hostWriterForStep: PendingHostWriter | undefined;
     let modelInput: AgentInputItem[] = [];
     let instructions: string | undefined;
@@ -10189,13 +10276,14 @@ const runHostTurnBody = async (
       // back to the normal retained feedback path; it never loses the finding.
       if (formatRepair && !hostWriterForStep && formatRepair.objective === judgedObjective()
         && !adoptedSteering && !modelInputDirective && !watcherDirectiveForStep) {
-        formatWorkerModelId = resolveRoleModel('worker').modelId;
+        formatRepairForStep = formatRepair;
         modelInput = [{ role: 'user', content: formatRepair.text }];
         instructions = formatRepair.instructions;
-        journalHostGuide('response_format_repair', { modelId: formatWorkerModelId,
+        journalHostGuide('response_format_repair', { modelId: formatRepair.author.modelId,
+          provider: formatRepair.author.provider, role: 'writer',
           promptChars: formatRepair.text.length, tools: 0 });
       }
-      if (hostProduction && !hostWriterForStep && !formatWorkerModelId) {
+      if (hostProduction && !hostWriterForStep && !formatRepairForStep) {
         const clarification = projectClarificationPromptContext({ ...exactHostIdentity(),
           input: modelInput.slice(0, filteredInputLength) });
         if (clarification.status === 'refused') {
@@ -10214,8 +10302,8 @@ const runHostTurnBody = async (
       }
       // The reading describes the request this step sends: the composed one,
       // or the writer's or format repair's own, which carries no tools.
-      const replacedBy = hostWriterForStep?.author.modelId ?? formatWorkerModelId;
-      if (!finalRequestReading) (publishReading as PromptReadingPublisher | undefined)?.(hostWriterForStep || formatWorkerModelId
+      const replacedBy = hostWriterForStep?.author.modelId ?? formatRepairForStep?.author.modelId;
+      if (!finalRequestReading) (publishReading as PromptReadingPublisher | undefined)?.(hostWriterForStep || formatRepairForStep
         ? { input: modelInput, ...(instructions !== undefined ? { instructions } : {}), advertisedTools: [],
           ...(replacedBy ? { model: replacedBy } : {}) }
         : undefined);
@@ -10244,21 +10332,32 @@ const runHostTurnBody = async (
         // A brain draft the chosen writer may rewrite is held; the writer's
         // own reply and a format repair are the answer as written.
         let held = false;
-        if (!hostWriterForStep && !formatWorkerModelId) {
+        if (!hostWriterForStep && !formatRepairForStep) {
           try { held = hostWriterMayRewrite(stepIndex); } catch { held = false; }
         }
         answerDraft = beginAnswerDraft({ ...answerOwner, mode: held ? 'held' : 'live' });
       }
       if (hostWriterForStep) {
         step = await runHostWriterStep(hostWriterForStep, modelInput, instructions, answerDraft);
+      } else if (formatRepairForStep) {
+        const formatAuthor = formatRepairForStep;
+        const identity = exactHostIdentity();
+        const inherited = modelUsageAttributionStorage.getStore();
+        step = await withModelUsageAttribution({
+          sessionId: inherited?.sessionId ?? identity.sessionId,
+          sourceUserSeq: inherited?.sourceUserSeq ?? identity.sourceUserSeq,
+          ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}),
+          channel: 'writer:format', role: 'writer',
+        }, () => runOneModelStep(modelInput, instructions, [], formatAuthor.author.modelId,
+          formatAuthor.model, answerDraft, finalRequestReading));
+        if (step.toolCalls.length > 0) throw new UnsupportedHostCapabilityError('response_format_repair_tool_call');
+        hostWrittenReply = { digest: createHash('sha256').update(step.text, 'utf8').digest('hex'),
+          author: formatAuthor.author, model: formatAuthor.model };
       } else {
         step = await runOneModelStep(
-          modelInput, instructions, formatWorkerModelId ? [] : modelStepSchemas, formatWorkerModelId, undefined, answerDraft,
+          modelInput, instructions, modelStepSchemas, undefined, undefined, answerDraft,
           finalRequestReading,
         );
-        if (formatWorkerModelId && step.toolCalls.length > 0) {
-          throw new UnsupportedHostCapabilityError('response_format_repair_tool_call');
-        }
       }
       // Ownership can expire or move while the provider is answering. Reject
       // that frame before journaling/admission, not merely at the later tool
@@ -10428,7 +10527,7 @@ const runHostTurnBody = async (
     // Retain only producer-owned context still present after request filters,
     // and only after the model returns an admitted frame. Reviewers share that
     // exact view across activation/restart rather than guessing from searches.
-    if (hostProduction && !consumingRecoveredFrame && !hostWriterForStep) {
+    if (hostProduction && !consumingRecoveredFrame && !hostWriterForStep && !formatRepairForStep) {
       const memory = visibleModelMemory((agent as { instructions?: unknown }).instructions, instructions, modelInput);
       recordAcceptedModelMemory(exactHostIdentity(), memory, step.responseId);
     }
@@ -10682,7 +10781,8 @@ const runHostTurnBody = async (
         // A chosen writer writes this final answer from the gathered evidence
         // before review. Its own reply, or the draft it fell back to, is not
         // sent to be written again.
-        const writer = hostWriterForStep || consumingRecoveredFrame ? undefined : armHostWriter(admission.frame.text, step, stepIndex);
+        const writer = hostWriterForStep || formatRepairForStep || consumingRecoveredFrame
+          ? undefined : armHostWriter(admission.frame.text, step, stepIndex);
         if (writer) {
           pendingHostWriter = writer;
           nextDraftRetractReason = 'writer';
@@ -12312,6 +12412,15 @@ export function acceptedObjectiveForSource(input: {
   }
 }
 
+function stoppedReadEffectiveObjective(bindings: ReadonlyArray<{ parentSessionId: string; sourceUserSeq: number }>) {
+  const first = bindings[0];
+  if (!first || !bindings.every(row => row.parentSessionId === first.parentSessionId && row.sourceUserSeq === first.sourceUserSeq)) return undefined;
+  const objective = acceptedObjectiveForSource({ sessionId: first.parentSessionId, sourceUserSeq: first.sourceUserSeq });
+  if (!objective?.trim()) return undefined;
+  return { parentSessionId: first.parentSessionId, sourceUserSeq: first.sourceUserSeq, objective,
+    objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex') };
+}
+
 export function completionVerdictForAcceptedSource(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -12363,8 +12472,21 @@ export function completionVerdictForAcceptedSource(input: {
       if (!data) continue;
       if (data.lane !== 'host_v1' || data.kind !== 'completion') continue;
       if (data.sourceUserSeq !== input.sourceUserSeq) continue;
-      if (data.judgedHistoricalReadResults !== undefined && !historicalReadClosureIsAuthentic({ ...input,
-        objectiveDigest: data.objectiveDigest, replyDigest: data.replyDigest }, data.judgedHistoricalReadResults)) return null;
+      const inheritedReviewRequired = data.inheritedReadReviewRequired === true
+        || data.judgedInheritedReadResults !== undefined || cancelledSuccessorReadReviewRequired(input);
+      const invalidHistoricalProof = data.judgedHistoricalReadResults !== undefined && !historicalReadClosureIsAuthentic({ ...input,
+        objectiveDigest: data.objectiveDigest, replyDigest: data.replyDigest }, data.judgedHistoricalReadResults);
+      if (invalidHistoricalProof && !inheritedReviewRequired) return null;
+      const inheritedBinding = data.judgedInheritedReadResults as { bindings?: Array<{ parentSessionId: string; sourceUserSeq: number }> } | undefined;
+      const retainedObjective = data.judgedInheritedObjective as { parentSessionId?: unknown; sourceUserSeq?: unknown; objectiveDigest?: unknown } | undefined;
+      const currentStoppedObjective = Array.isArray(inheritedBinding?.bindings) ? stoppedReadEffectiveObjective(inheritedBinding.bindings) : undefined;
+      const invalidInheritedProof = inheritedReviewRequired
+        && (invalidHistoricalProof || !cancelledSuccessorReadReviewIsAuthentic(input, data.judgedInheritedReadResults)
+          || !currentStoppedObjective || !retainedObjective
+          || Object.keys(retainedObjective).sort().join(',') !== 'objectiveDigest,parentSessionId,sourceUserSeq'
+          || retainedObjective.parentSessionId !== currentStoppedObjective.parentSessionId
+          || retainedObjective.sourceUserSeq !== currentStoppedObjective.sourceUserSeq
+          || retainedObjective.objectiveDigest !== currentStoppedObjective.objectiveDigest);
       const judged = Array.isArray(data.judgedArtifacts) ? data.judgedArtifacts : [];
       latest = {
         eventId: String(event.id),
@@ -12420,6 +12542,14 @@ export function completionVerdictForAcceptedSource(input: {
               }]
             : [];
         }),
+        // Retain the required-review receipt when its inherited proof has
+        // drifted. Returning null would let a zero-call Continue self-exempt
+        // at delivery. This is a host evidence hold, not a provider failure.
+        ...(invalidInheritedProof ? {
+          fulfills: false, blocked: true, reviewFailure: 'invalid' as const,
+          reviewUnavailableReason: 'The exact inherited read binding no longer verifies.',
+          reason: 'The saved read evidence for this continuation changed or could not be verified. The result needs a new review before it can be confirmed.',
+        } : {}),
       };
     }
     return latest;

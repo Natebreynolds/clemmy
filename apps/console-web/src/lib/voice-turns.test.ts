@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { nextSpokenPart, spokenWords, voiceBaseline, voiceTurnEnded, voiceTurnRunning, voiceUtterances, type VoiceChatMessage } from './voice-turns.js';
+import { nextSpokenPart, spokenWords, voiceBaseline, voiceTurnEnded, voiceTurnRunning, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage } from './voice-turns.js';
 
 const owner = (id: string, text: string): VoiceChatMessage => ({ id, role: 'user', text });
 const clem = (id: string, text: string, status: string, extra: Partial<VoiceChatMessage> = {}): VoiceChatMessage =>
@@ -77,18 +77,31 @@ test('background sounds the transcriber labels never become a message; words aro
   assert.equal(spokenWords('Move it to 4 (the afternoon slot)'), 'Move it to 4');
 });
 
-test('her answer is read as she writes it: each finished sentence, the rest when the draft is done, nothing twice', () => {
+test('finished sentences and checking drafts stay silent until reviewed terminal delivery', () => {
   const heard = new Map<string, string>();
   const say = (messages: VoiceChatMessage[]) => voiceUtterances(messages, heard, new Set()).map((u) => { heard.set(u.key, u.text); return u.text.trim(); });
   const writing = (text: string) => clem('a1', text, 'thinking', { answerDraft: { id: 's1', phase: 'writing' } });
   assert.deepEqual(say([owner('u1', 'what is on tomorrow'), writing('Tomorrow has four')]), [], 'no sentence is finished yet');
-  assert.deepEqual(say([owner('u1', 'what is on tomorrow'), writing('Tomorrow has four things. The first is at')]), ['Tomorrow has four things.']);
+  assert.deepEqual(say([owner('u1', 'what is on tomorrow'), writing('Tomorrow has four things. The first is at')]), []);
   const checking = clem('a1', 'Tomorrow has four things. The first is at nine.', 'thinking', { answerDraft: { id: 's1', phase: 'checking' } });
-  assert.deepEqual(say([owner('u1', 'what is on tomorrow'), checking]), ['The first is at nine.']);
-  assert.deepEqual(say([owner('u1', 'what is on tomorrow'), clem('a1', 'Tomorrow has four things. The first is at nine.', 'complete')]), [],
-    'the delivered answer adds nothing that was not already read');
-  assert.deepEqual(say([owner('u1', 'what is on tomorrow'), clem('a1', 'Tomorrow has four things. The first is at nine. The last ends at three.', 'complete')]),
-    ['The last ends at three.'], 'only what the delivered answer adds is read');
+  assert.deepEqual(say([owner('u1', 'what is on tomorrow'), checking]), []);
+  const withdrawn = { ...checking, answerDraft: { id: 's1', phase: 'withdrawn', withdrawn: 'review' } };
+  assert.deepEqual(say([owner('u1', 'what is on tomorrow'), withdrawn]), []);
+  const delivered = [owner('u1', 'what is on tomorrow'), clem('a1', 'The reviewed answer has three things, starting at ten.', 'complete')];
+  assert.deepEqual(say(delivered), ['The reviewed answer has three things, starting at ten.']);
+  assert.deepEqual(say(delivered), [], 'accepted terminal delivery is spoken once');
+});
+
+test('queued speech loses eligibility when its source text, status, draft or message principal changes', () => {
+  const first = clem('a1', 'I will inspect the fixture.', 'thinking');
+  const utterance = voiceUtterances([first], new Map(), new Set())[0];
+  assert.equal(voiceUtteranceCurrent(utterance, [first]), true);
+  assert.equal(voiceUtteranceCurrent(utterance, [{ ...first, text: 'A revised explanation.' }]), false);
+  assert.equal(voiceUtteranceCurrent(utterance, [{ ...first, status: 'complete' }]), false);
+  assert.equal(voiceUtteranceCurrent(utterance, [{ ...first, answerDraft: { id: 's1', phase: 'checking' } }]), false);
+  assert.equal(voiceUtteranceCurrent(utterance, [{ ...first, role: 'user' }]), false);
+  assert.equal(voiceUtteranceCurrent(utterance, [{ ...first, id: 'a2' }]), false);
+  assert.deepEqual(voiceUtterances([{ ...first, answerDraft: { id: 's1' } }], new Map(), new Set()), [], 'unknown draft phase stays unreviewed');
 });
 
 test('a sentence ends at its punctuation and a following space', () => {

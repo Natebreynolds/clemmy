@@ -74,7 +74,9 @@ export interface ProposedClarificationRevision {
   /** Requested identity only: actual served model/account stay in wire usage. */
   proposalModelIdentity: string;
   proposalUsage: { inputTokens: number; outputTokens: number; latencyMs: number; usageRecorded: boolean };
-  review: { modelIdentity: string; decisionId: string | null; noul: number; inputTokens: number; outputTokens: number };
+  /** Display identity only; actual model authority lives in explicit wire usage.
+   * Absent token counts mean unreported measurements, never zero. */
+  review: { modelIdentity: string; decisionId: string | null; noul: number; inputTokens?: number; outputTokens?: number };
 }
 
 export type ClarificationRevisionResult =
@@ -90,7 +92,8 @@ export interface ClarificationAnswerCompletenessReceipt {
   purpose: 'clarification_answer_completeness_v1';
   inputDigest: string;
   sourceDigest: string;
-  review: { modelIdentity: string; decisionId: string | null; noul: number; inputTokens: number; outputTokens: number };
+  /** Display identity only; actual model authority lives in explicit wire usage. */
+  review: { modelIdentity: string; decisionId: string | null; noul: number; inputTokens?: number; outputTokens?: number };
 }
 
 export type CheckedClarificationAnswerCompleteness = {
@@ -278,8 +281,8 @@ const persistedRevisionSchema = z.object({
     modelIdentity: boundedText(512),
     decisionId: boundedText(512).nullable(),
     noul: z.number().finite().min(CLARIFICATION_REVISION_GROUNDED).max(1),
-    inputTokens: nonNegative,
-    outputTokens: nonNegative,
+    inputTokens: nonNegative.optional(),
+    outputTokens: nonNegative.optional(),
   }).strict(),
 }).strict();
 
@@ -292,8 +295,8 @@ const completenessReceiptSchema = z.object({
     modelIdentity: boundedText(512),
     decisionId: boundedText(512).nullable(),
     noul: z.number().finite().min(0).max(1),
-    inputTokens: nonNegative,
-    outputTokens: nonNegative,
+    inputTokens: nonNegative.optional(),
+    outputTokens: nonNegative.optional(),
   }).strict(),
 }).strict();
 
@@ -375,8 +378,8 @@ export async function checkClarificationAnswerCompleteness(
         modelIdentity: checked.model,
         decisionId: checked.decisionId ?? null,
         noul: answer.noul,
-        inputTokens: checked.usage.input_tokens,
-        outputTokens: checked.usage.output_tokens,
+        ...(checked.usage.input_tokens !== undefined ? { inputTokens: checked.usage.input_tokens } : {}),
+        ...(checked.usage.output_tokens !== undefined ? { outputTokens: checked.usage.output_tokens } : {}),
       },
     };
     return validatedClarificationAnswerCompleteness(input, receipt)
@@ -525,8 +528,8 @@ export async function proposeClarificationRevision(
           modelIdentity: checked.model,
           decisionId: checked.decisionId ?? null,
           noul: answer.noul,
-          inputTokens: checked.usage.input_tokens,
-          outputTokens: checked.usage.output_tokens,
+          ...(checked.usage.input_tokens !== undefined ? { inputTokens: checked.usage.input_tokens } : {}),
+          ...(checked.usage.output_tokens !== undefined ? { outputTokens: checked.usage.output_tokens } : {}),
         },
     };
     const validated = validatedClarificationRevision(input, revision);

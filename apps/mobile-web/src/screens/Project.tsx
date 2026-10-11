@@ -44,6 +44,8 @@ import {
 import { listApprovals, type ApprovalRow } from '../lib/api';
 import { Decisions, relativeTime } from '../components/Approvals';
 import { ChatBackButton } from '../components/ChatBackButton';
+import { NavigationMenuButton } from '../components/NavigationMenuButton';
+import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { DelegatedTaskCard, DelegatedTaskList } from '../components/DelegatedTaskCard';
 import { ProjectPageViewer } from '../components/ProjectPageViewer';
 import { AccountBinderSheet, AssignAgentSheet, AssignmentSheet, LocalProjectSheet } from '../components/ProjectSheets';
@@ -93,6 +95,7 @@ interface Loaded {
 const ENDED_SHOWN = 3;
 
 export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent, onOpenSpace, onOpenNeedsYou, onDecided }: Props) {
+  useMobileDetailHeader();
   const load = useCallback(async (): Promise<Loaded> => {
     try {
       const { overview } = await getProject(projectId);
@@ -162,12 +165,13 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
 
   return (
     <div class="workflow-detail project-detail">
-      <div class="chat-header">
+      <div class="chat-header detail-header">
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{project?.name ?? 'Project'}</h2>
         {project && !editing ? (
           <button type="button" class="btn-quiet" onClick={() => { haptic('light'); setDetailsOpen(true); requestAnimationFrame(() => document.getElementById('project-details')?.scrollIntoView({ block: 'start' })); }}>Details</button>
         ) : null}
+        <NavigationMenuButton />
       </div>
 
       <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={Boolean(overview)} note={note} />
@@ -177,20 +181,14 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
         <div class="project-sections">
           {project.purpose ? <p class="project-resume-purpose">{project.purpose}</p> : null}
           {archived ? <p class="project-flag" role="note">Archived. Restore this project in Details to start new work.</p> : null}
-          <nav class="project-resume-nav" aria-label="In this project">
-            {!archived ? <a href="#project-needs">Needs you{layout.waiting ? ` (${layout.waiting})` : ''}</a> : null}
-            <a href="#project-work">Current work</a><a href="#project-results">Recent results</a>
-          </nav>
-          <ProjectResume overview={overview} onOpenChat={onOpenChat} onOpenSpace={onOpenSpace} onOpenPage={page => { setNote(null); setViewing(page); }} />
 
-          {!archived ? (
+          {!archived && layout.waiting > 0 ? (
             <section aria-labelledby="project-needs">
               <h2 id="project-needs" class="section-head">
                 Needs you
-                {layout.waiting > 0 ? <span class="section-count">{layout.waiting}</span> : null}
+                <span class="section-count">{layout.waiting}</span>
               </h2>
-              {layout.waiting === 0 ? <p class="section-empty">Nothing here is waiting on you.</p> : (
-                <div class="task-list">
+              <div class="task-list">
                   {layout.questions.map((task) => (
                     <DelegatedTaskCard key={task.taskId} task={task} follows={follows(task)} listed={listedTasks} hideProject onChanged={() => decided()} onOpenRun={onOpenRun} />
                   ))}
@@ -236,10 +234,11 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
                       </div>
                     </article>
                   ))}
-                </div>
-              )}
+              </div>
             </section>
           ) : null}
+
+          <ProjectResume overview={overview} onOpenChat={onOpenChat} onOpenSpace={onOpenSpace} onOpenPage={page => { setNote(null); setViewing(page); }} />
 
           <section aria-labelledby="project-work">
             <h2 id="project-work" class="section-head">Current work</h2>

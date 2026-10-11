@@ -6,6 +6,15 @@
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
 	<string>Clem</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>ai.breakthroughcoaching.clem.widget</string>
+			<key>CFBundleURLSchemes</key>
+			<array><string>clem</string></array>
+		</dict>
+	</array>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -39,7 +48,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Clem uses the camera only to scan the pairing QR code shown on your Mac.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Clem uses the microphone only when you hold the mic button to talk instead of typing. Your speech is transcribed on your own Mac and never sent to a third party.</string>
+	<string>Clem uses the microphone when you tap Dictate or Talk to Clem to talk instead of typing. Speech is transcribed on your Mac or by your configured transcription service.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Clem finds your paired Mac on the local network; away from Wi-Fi, it can use a pinned encrypted relay to that same Mac.</string>
 	<key>NSBonjourServices</key>

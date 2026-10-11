@@ -335,9 +335,6 @@ export function composeSessionFromStore(
   });
 }
 
-/** Characters of an agent's standing instructions a reviewer is shown. */
-const AGENT_REVIEW_MAX_CHARS = 6_000;
-
 /**
  * What a reviewer needs to judge a reply written inside a saved agent: its
  * name, what it handles, its standing instructions and the skills it pins.
@@ -354,9 +351,9 @@ export function sessionAgentReviewContext(sessionId: string | null | undefined):
     const project = accepted ? renderProjectReviewContext(accepted.mount.project) : projectReviewContext(metadata, binding?.agent.id ?? null);
     if (!binding) return project;
     const { agent } = binding;
-    const instructions = agent.instructions.length > AGENT_REVIEW_MAX_CHARS
-      ? `${agent.instructions.slice(0, AGENT_REVIEW_MAX_CHARS)}\n[instructions cut here for length]`
-      : agent.instructions;
+    // Review admission owns size limits. A partial standing instruction can
+    // omit the very requirement that makes a candidate incomplete.
+    const instructions = agent.instructions;
     return [
       `Agent: ${agent.name}`,
       agent.handles ? `Handles: ${agent.handles}` : '',
@@ -377,10 +374,7 @@ function projectReviewContext(metadata: Record<string, unknown> | null | undefin
 
 function renderProjectReviewContext(project: ProjectBinding | null): string {
   if (!project) return '';
-  const context = project.context.length > AGENT_REVIEW_MAX_CHARS
-    ? `${project.context.slice(0, AGENT_REVIEW_MAX_CHARS)}\n[project context cut here for length]`
-    : project.context;
-  return `Project context:\n${context}`;
+  return `Project context:\n${project.context}`;
 }
 
 /**

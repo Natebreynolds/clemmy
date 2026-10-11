@@ -72,3 +72,19 @@ test('every Jev call is recorded with its answers and outcome, never its state',
   assert.equal(failure?.failReason, 'http_error');
   assert.doesNotMatch(JSON.stringify(rows), /PRIVATE REQUEST TEXT/, 'the state Jev read is never logged');
 });
+
+test('valid decisions omit missing served model and input measurements from the decision log', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({
+    answers: { a: { type: 'noul', noul: 0.8 } }, usage: { output_tokens: 3 },
+  }) }));
+  const result = await evaluateSystemOne({ state: 'PRIVATE_REQUEST',
+    questions: { a: { type: 'noul', instructions: 'answer' } }, channel: 'jev-missing-measurements' });
+  assert.ok(result.ok);
+  const decision = loggedRows().find((row) => row.id === result.decisionId && row.lane);
+  assert.equal(decision?.ok, true);
+  assert.deepEqual(decision?.answers, { a: { noul: 0.8 } });
+  assert.equal(decision?.requestedModel, 'jev-1.13.0');
+  assert.equal(decision?.servedModel, undefined, 'requested model fallback must never certify actual served identity');
+  assert.equal(decision?.inputTokens, undefined, 'missing token receipt is not a reported zero');
+});

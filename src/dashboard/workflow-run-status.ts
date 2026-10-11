@@ -3,6 +3,7 @@ import { lstatSync } from 'node:fs';
 import path from 'node:path';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { scanWorkflowRunRecordSnapshot } from '../execution/workflow-run-record.js';
+import { measureProjectionRead, type ProjectionReadObserver } from './projection-read-metrics.js';
 
 export interface UnifiedRunCoverage {
   version: 1;
@@ -58,11 +59,14 @@ function readExactRunStatus(runId: string, runsDirectory: string): WorkflowRunSt
 }
 
 /** One memo per API request, with no global historical-event scan or record locks. */
-export function createWorkflowRunStatusReader(runsDirectory = WORKFLOW_RUNS_DIR): (runId: string) => WorkflowRunStatusProjection {
+export function createWorkflowRunStatusReader(runsDirectory = WORKFLOW_RUNS_DIR, diagnostics: { observer?: ProjectionReadObserver } = {}): (runId: string) => WorkflowRunStatusProjection {
   const memo = new Map<string, WorkflowRunStatusProjection>();
   return (runId) => {
     let result = memo.get(runId);
-    if (!result) { result = readExactRunStatus(runId, runsDirectory); memo.set(runId, result); }
+    if (!result) {
+      result = measureProjectionRead(diagnostics.observer, 'catalog_status_records', () => readExactRunStatus(runId, runsDirectory));
+      memo.set(runId, result);
+    }
     return { ...result, runCoverage: { ...result.runCoverage } };
   };
 }

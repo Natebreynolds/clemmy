@@ -119,7 +119,7 @@ test('fast success preserves exact request, pinned model and observed usage and 
       signal = init.signal;
       return response();
     } });
-  assert.deepEqual(result, { ok: true, model: TYPESAFE_MODEL,
+  assert.deepEqual(result, { ok: true, model: TYPESAFE_MODEL, providerReportedModel: TYPESAFE_MODEL,
     answers: { delivered: { type: 'noul', noul: 0.93 } }, usage: recorded.usage, status: 200 });
   await delay(300);
   assert.equal(signal?.aborted, false, 'cleared timer cannot abort a completed request later');

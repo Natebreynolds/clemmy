@@ -28,3 +28,18 @@ export function retainedProjectionSourceScope(
 export function projectionMayCompleteSource(row: { sourceSelectionComplete?: boolean }): boolean {
   return row.sourceSelectionComplete !== false;
 }
+
+
+/** Projection edges point to one original producer. A durable source handle
+ * is exact; descriptive call/dispatch IDs and equal content cannot alias a
+ * different producer. Only legacy rows without an authenticated source scope
+ * retain their explicit logical/physical edge contract. */
+export function retainedProjectionReadsSource(projection: {
+  sourceResultHandleId?: string; sourceLogicalToolCallId?: string; sourcePhysicalDispatchId?: string;
+  sourceSessionId?: string; sourceUserSeq?: number;
+}, source: { resultHandleId?: string; logicalToolCallId?: string; physicalDispatchId?: string }): boolean {
+  if (projection.sourceResultHandleId) return projection.sourceResultHandleId === source.resultHandleId;
+  if (projection.sourceSessionId !== undefined || projection.sourceUserSeq !== undefined) return false;
+  return Boolean((projection.sourceLogicalToolCallId && projection.sourceLogicalToolCallId === source.logicalToolCallId)
+    || (projection.sourcePhysicalDispatchId && projection.sourcePhysicalDispatchId === source.physicalDispatchId));
+}

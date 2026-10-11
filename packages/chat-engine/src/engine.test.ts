@@ -56,6 +56,28 @@ const ev = (seq: number, type: string, data: Record<string, unknown> = {}): Harn
 
 const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+test('a reopened Stop/Continue conversation shows historical messages and attaches only the validated physical head', async () => {
+  const transport = new FakeTransport();
+  const oldSource = { ...ev(1, 'user_input_received', { text: 'Keep the draft.' }), sessionId: 'old-head', role: 'user', turn: 1 };
+  const headSource = { ...ev(10, 'user_input_received', { text: 'Continue the draft.' }), sessionId: 'new-head', role: 'user', turn: 1 };
+  const engine = new ChatEngine({ sessionId: 'visible-root', transport, api: {
+    send: async () => ({ sessionId: 'new-head', accepted: true }),
+    loadSession: async () => ({ executionSessionId: 'new-head', events: [headSource], latestSeq: 10,
+      history: [{ sessionId: 'old-head', events: [oldSource,
+        { ...ev(20, 'conversation_completed', { sourceUserSeq: 1, reply: 'Stopped with the draft retained.', reason: 'cancelled' }), sessionId: 'old-head', turn: 1 }] }] }),
+  } });
+  try {
+    await engine.open();
+    await wait(5);
+    assert.equal(engine.snapshot().sessionId, 'new-head');
+    assert.equal(engine.snapshot().busy, true, 'the historical terminal cannot settle the current accepted source');
+    assert.deepEqual(engine.snapshot().messages.filter(message => message.role === 'user').map(message => message.text), ['Keep the draft.', 'Continue the draft.']);
+    assert.equal(engine.snapshot().messages.find(message => message.text === 'Keep the draft.')?.acceptedSource?.sessionId, 'old-head');
+    assert.equal(engine.snapshot().messages.at(-1)?.acceptedSource?.sessionId, 'new-head');
+    assert.deepEqual(transport.connectedSessionIds, ['new-head']);
+  } finally { engine.dispose(); }
+});
+
 test('a mounted phone observes card edits and foreign-device completion after approval settlement', async () => {
   const transport = new FakeTransport();
   const engine = new ChatEngine({ sessionId: 'cross-device-card', transport, observeWhileIdle: true, streamTimings: { approvalSettleMs: 1 }, api: {

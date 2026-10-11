@@ -393,6 +393,131 @@ export function readWorkflowTriggerReceiptAcceptance(receiptId: string): string 
   return marker.runId;
 }
 
+/** Continue is one recovery decision for this exact run, rather than another
+ * task with the same inputs. Reuse the queue's durable, create-only occurrence
+ * admission so a terminal successor remains owned after a restart or retention. */
+export function workflowContinueReceiptId(sourceRunId: string): string {
+  workflowRunFile(sourceRunId); // Validate before using the identity in a receipt.
+  return `workflow-continue:v1:${sourceRunId}`;
+}
+
+function continuationParent(record: Record<string, unknown>): string | undefined {
+  const lineage = normalizeWorkflowGoalFollowUpLineage(record.goalFollowUp);
+  const recovery = record.recoveryIntent as Partial<WorkflowRunRecoveryIntent> | undefined;
+  const parent = normalizedOptionalString(record.requeuedFromRunId);
+  if (record.goalFollowUp !== undefined && (!lineage || lineage.fromRunId !== parent)) {
+    throw new Error('The continuation has malformed ancestry.');
+  }
+  if (!parent) return undefined;
+  if (lineage?.fromRunId === parent) return parent;
+  if (recovery?.kind === 'safe_rerun' && recovery.sourceRunId === parent) return parent;
+  return undefined;
+}
+
+function readContinuationRecord(runId: string): Record<string, unknown> {
+  const record = JSON.parse(readFileSync(workflowRunFile(runId), 'utf-8')) as Record<string, unknown>;
+  if (!record || typeof record !== 'object' || Array.isArray(record) || record.id !== runId) {
+    throw new Error('The continuation record has an invalid identity.');
+  }
+  return record;
+}
+
+function sameContinuationDefinition(parent: Record<string, unknown>, child: Record<string, unknown>): boolean {
+  const source = resolveWorkflowRunDefinitionSnapshot(parent.workflowDefinitionSnapshot);
+  const successor = resolveWorkflowRunDefinitionSnapshot(child.workflowDefinitionSnapshot);
+  return source.status === 'valid' && successor.status === 'valid'
+    && !isCompiledWorkflowRunDefinitionSnapshot(source.snapshot)
+    && !isCompiledWorkflowRunDefinitionSnapshot(successor.snapshot)
+    && source.snapshot.workflowSlug === successor.snapshot.workflowSlug
+    && workflowDefinitionMatchesSnapshotIgnoringEnabled(source.snapshot, successor.snapshot.definition);
+}
+
+/** Serialize a lineage's recovery decisions, then follow its durable successor
+ * edges before reading effects. An old Stop button cannot fork around a later
+ * completed/uncertain attempt. Existing goal follow-ups and pre-fix Continue
+ * children are adopted only when they have one exact, unchanged lineage. */
+export function withWorkflowContinueOwnership(
+  sourceRunId: string,
+  continueRun: (actualRunId: string) => RequeueResult,
+): RequeueResult {
+  const refuse = (message: string): RequeueResult => ({ status: 'ambiguous', message });
+  try {
+    let rootRunId = sourceRunId;
+    let ancestor = readContinuationRecord(rootRunId);
+    const ancestors = new Set<string>();
+    while (continuationParent(ancestor)) {
+      if (ancestors.has(rootRunId) || ancestors.size >= 128) {
+        return refuse('Its continuation history is inconsistent; nothing was re-run.');
+      }
+      ancestors.add(rootRunId);
+      const parentId = continuationParent(ancestor)!;
+      const parent = readContinuationRecord(parentId);
+      if (!sameContinuationDefinition(parent, ancestor)) {
+        return refuse('Its continuation changed workflow definitions; nothing was re-run.');
+      }
+      rootRunId = parentId;
+      ancestor = parent;
+    }
+    const lockFile = path.join(WORKFLOW_RUNS_DIR, '.continue-owners', `${createHash('sha256').update(rootRunId).digest('hex')}.json`);
+    return withWorkflowRunRecordLock(lockFile, () => {
+      let runId = rootRunId;
+      const seen = new Set<string>();
+      while (!seen.has(runId) && seen.size < 128) {
+        seen.add(runId);
+        const current = readContinuationRecord(runId);
+        const receiptId = workflowContinueReceiptId(runId);
+        const owned = readWorkflowTriggerReceiptAcceptance(receiptId);
+        const successors = new Set<string>();
+        if (owned) successors.add(owned);
+        for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((name) => name.endsWith('.json'))) {
+          let candidate: Record<string, unknown>;
+          try { candidate = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>; }
+          catch { continue; } // An unrelated unreadable record grants no authority.
+          if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+          if (candidate.requeuedFromRunId !== runId && candidate.triggerReceiptId !== receiptId) continue;
+          if (continuationParent(candidate) !== runId && candidate.triggerReceiptId !== receiptId) continue;
+          if (typeof candidate.id !== 'string' || file !== `${candidate.id}.json`
+            || continuationParent(candidate) !== runId || !sameContinuationDefinition(current, candidate)) {
+            return refuse('Its continuation record cannot be verified; nothing was re-run.');
+          }
+          successors.add(candidate.id);
+        }
+        if (successors.size > 1) {
+          return refuse('This stopped run has more than one continuation. Their changes must be reconciled before continuing; nothing was re-run.');
+        }
+        const successor = [...successors][0];
+        if (successor) {
+          // A durable acceptance survives terminal-record retention. Missing
+          // history is never permission to install another child.
+          const child = readContinuationRecord(successor);
+          if (continuationParent(child) !== runId || !sameContinuationDefinition(current, child)) {
+            return refuse('Its accepted continuation cannot be verified; nothing was re-run.');
+          }
+          if (persistWorkflowTriggerReceiptAcceptance(receiptId, successor) !== successor) {
+            return refuse('Its continuation ownership is inconsistent; nothing was re-run.');
+          }
+          runId = successor;
+          continue;
+        }
+        if (current.status === 'completed') {
+          return { status: 'duplicate', id: runId, message: 'This work already completed. Nothing was re-run.' };
+        }
+        const held = current.heldExecution as { hold?: { wake?: string } } | undefined;
+        if (current.status === 'blocked_mutation' || held?.hold?.wake === 'recovery') {
+          return { status: 'ambiguous', id: runId, message: 'This continuation has a change whose outcome is unresolved. Reconcile that change before continuing; nothing was re-run.' };
+        }
+        if (!workflowRunIsTerminal(current.status) && !(current.status === 'blocked' && current.finishedAt)) {
+          return { status: 'duplicate', id: runId, message: 'This continuation is already active or paused. Nothing was re-run; continue that existing run when it is safe.' };
+        }
+        return continueRun(runId);
+      }
+      return refuse('Its continuation history is inconsistent; nothing was re-run.');
+    });
+  } catch {
+    return refuse('Its continuation history or ownership cannot be read safely; nothing was re-run.');
+  }
+}
+
 /** Persist an immutable receipt-to-run marker. New queue records are installed
  * before this marker; a retry can recover that crash window from the receipt id
  * embedded in the immutable initial run record. */
@@ -3402,6 +3527,7 @@ export function requeueWorkflowFromRun(
       : opts.catchupDecidedAt,
     excludeRunId: originalRunId,
     requeuedFromRunId: originalRunId,
+    ...(opts.triggerReceiptId ? { triggerReceiptId: opts.triggerReceiptId } : {}),
     recoveryIntent: opts.recoveryIntent ?? {
       kind: opts.selfHealAttempt ? 'self_heal' : 'manual_requeue',
       sourceRunId: originalRunId,
@@ -3441,6 +3567,9 @@ export function queueWorkflowGoalFollowUp(
     /** Why the lineage was built, when it is not the pinned goal's follow-up
      *  (the board's Continue on a stopped or failed run). */
     recoveryIntent?: { kind: WorkflowRunRecoveryIntentKind; requestedFrom?: string; reason: string };
+    /** Exact board Continue decision; unlike an automatic goal follow-up, its
+     *  successor is durably reused even after that successor settles. */
+    continueFromCheckpoint?: boolean;
   },
 ): RequeueResult {
   const safe = sourceRunId.replace(/[^a-zA-Z0-9_.:-]/g, '');
@@ -3518,6 +3647,7 @@ export function queueWorkflowGoalFollowUp(
     goalAttempt: opts.goalAttempt,
     goalFeedback: opts.goalFeedback,
     goalFollowUp: lineage,
+    ...(opts.continueFromCheckpoint ? { triggerReceiptId: workflowContinueReceiptId(sourceRunId) } : {}),
     catchupFire: rec.catchupFire === true,
     ...(Number.isFinite(rec.catchupOccurrenceAtMs) ? { catchupOccurrenceAtMs: Number(rec.catchupOccurrenceAtMs) } : {}),
     workflowSlug: typeof rec.workflowSlug === 'string' ? rec.workflowSlug : workflowEntry.name,

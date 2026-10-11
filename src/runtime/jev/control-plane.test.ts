@@ -419,6 +419,66 @@ test('a completion check over clipped evidence never settles on support', async 
   assert.equal(clipped, null, 'content Jev did not see may be what a specific rests on, so the reviewer decides');
 });
 
+for (const decision of ['done', 'awaiting'] as const) {
+  test(`full requirements consume the evidence budget and cannot certify ${decision} after evidence clipping`, async () => {
+    _setTypesafeKeyForTests('ts_test');
+    const requirements = 'Applicable standing instruction, retained reference and immutable host rule. '.repeat(550);
+    const evidence = 'First contrary result. ' + 'Full observation. '.repeat(3_000) + ' Final contrary result.';
+    let posted: Record<string, any> = {};
+    _setSystemOneFetchForTests(async (_url, init) => {
+      posted = JSON.parse(String(init.body));
+      return { status: 200, ok: true, text: async () => completionAnswers(decision === 'done'
+        ? { delivered: .95, unaddressed: .03, unsupported: .03 } : { asksUser: .95 }) };
+    });
+    const verdict = await tryJevCompletionVerdict('Report the observed result.', 'Should I use the delegated presentation?', {
+      requirementContext: requirements, toolCallSummary: evidence,
+      coverage: { complete: true, outcomeEvidence: [{ toolName: 'read_file', outcome: 'succeeded', contentComplete: true }] },
+    });
+    assert.equal(posted.state.requirementContext, requirements, 'the requirement context is never trimmed to buy space');
+    assert.ok(posted.state.evidenceNote, 'the partial evidence view is explicit');
+    assert.match(posted.state.evidence, /First contrary result/);
+    assert.match(posted.state.evidence, /Final contrary result/);
+    assert.ok(JSON.stringify(posted.state).length <= 72_000, 'all serialized state fields are within the fixed budget');
+    assert.equal(verdict, null, 'neither an affirmative answer nor a direction question waives omitted evidence');
+  });
+}
+
+test('an over-budget complete requirement context is never sent clipped, including serialized escape expansion', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let calls = 0;
+  _setSystemOneFetchForTests(async () => {
+    calls++;
+    return { status: 200, ok: true, text: async () => completionAnswers({ asksUser: .95 }) };
+  });
+  for (const requirementContext of [
+    'A late applicable instruction. '.repeat(3_000),
+    '"\\\n'.repeat(19_000), // Raw text fits, but its exact JSON representation does not.
+  ]) {
+    for (const screening of [false, true]) assert.equal(await tryJevCompletionVerdict('Report the result.', 'Which option should I take?', {
+      requirementContext, screening, toolCallSummary: 'Read settled successfully.',
+      coverage: { complete: true, outcomeEvidence: [{ toolName: 'read_file', outcome: 'succeeded', contentComplete: true }] },
+    }), null);
+  }
+  assert.equal(await tryJevCompletionVerdict('Report the result.', 'Which option should I take?', {
+    currentReviewContext: 'Exact accepted owner context. '.repeat(3_000), screening: true,
+  }), null, 'the historical review-context channel has the same complete-field budget');
+  assert.equal(calls, 0, 'missing mandatory context cannot be a cheaper partial provider review');
+});
+
+test('a screen with over-budget evidence defers immediately without paying for an affirmative or awaiting answer', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let calls = 0;
+  _setSystemOneFetchForTests(async () => {
+    calls++;
+    return { status: 200, ok: true, text: async () => completionAnswers({ asksUser: .95 }) };
+  });
+  assert.equal(await tryJevCompletionVerdict('Report the result.', 'Which option should I take?', {
+    requirementContext: 'The display choice is delegated; preserve every material contrary observation.', screening: true,
+    toolCallSummary: 'Observed evidence. '.repeat(5_000),
+  }), null);
+  assert.equal(calls, 0);
+});
+
 for (const clippedPart of ['request', 'response'] as const) {
   for (const decision of ['done', 'awaiting'] as const) test(`a completion check cannot certify ${decision} with a clipped ${clippedPart}`, async () => {
     _setTypesafeKeyForTests('ts_test');

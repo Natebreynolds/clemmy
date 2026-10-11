@@ -18,6 +18,7 @@ import { readCommittedArtifactContent } from './host-local-write-commit.js';
 import { completionReviewEnabled } from './respond-bridge.js';
 import { conversationalReviewSkipMatches } from './completion-review-skip.js';
 import { sourceAttemptedCompletionWork } from './host-completion-work.js';
+import { cancelledSuccessorReadReviewRequired } from './cancelled-successor-retained-read.js';
 import { acceptedObjectiveForSource, completionVerdictForAcceptedSource, publishedPlanReplyText, readCapturedCompletionPolicy, settledSourceArtifacts } from './host-turn-runner.js';
 import { planReviewDigest } from './plan-publication-review.js';
 import { sourceRefusedAttempts } from './source-refused-attempts.js';
@@ -1274,6 +1275,9 @@ export function commitTurnOutcome(
     sessionId: proposed.identity.sessionId,
     sourceUserSeq: reviewIdentity.sourceUserSeq,
   });
+  // Negative provenance only. A zero-call child that depends on exact shared
+  // reads still requires review even if its entire verdict row is missing.
+  const inheritedReadReviewRequired = cancelledSuccessorReadReviewRequired(reviewIdentity);
   // VALIDATE before attaching. Copying a same-source verdict without checking it
   // against the bytes actually being published let a mismatched reply, a stale
   // objective, a vanished artifact and a NEGATIVE verdict all publish as
@@ -1383,7 +1387,7 @@ export function commitTurnOutcome(
   // current-source work at publication, including after restart/re-entry.
   if (!publishedVerdict && !publishedPlan && capturedRead.status === 'captured'
     && reviewWasEnabled && acceptedObjective !== null && settledNow.count === 0
-    && settledNow.evidenceAvailable && !sourceAttemptedCompletionWork(reviewIdentity)) {
+    && settledNow.evidenceAvailable && !sourceAttemptedCompletionWork(reviewIdentity) && !inheritedReadReviewRequired) {
     try {
       const skipped = listEvents(proposed.identity.sessionId, { types: ['completion_review_skipped'] })
         .some((event) => event.role === 'system' && conversationalReviewSkipMatches(event.data, {
@@ -1503,7 +1507,7 @@ export function commitTurnOutcome(
   // `evidenceAvailable:false` / count 0 was simply ignored at publication, so a
   // missing review or a prior artifact-free verdict could self-exempt.
   const verificationRequired = reviewWasEnabled
-    && (Boolean(publishedVerdict) || artifactsRequired || !settledNow.evidenceAvailable);
+    && (Boolean(publishedVerdict) || inheritedReadReviewRequired || artifactsRequired || !settledNow.evidenceAvailable);
   const verificationFailed = verificationRequired && !verdictTrustworthy;
   if (verificationFailed && effectiveOutcome.status === 'done') {
     // TYPED INDEPENDENT CAUSES, tested in order of what is actually knowable.

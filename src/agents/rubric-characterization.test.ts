@@ -186,10 +186,13 @@ const GOLDEN = {
   // offers to keep it; set_model_role is for a rule the user asks for.
   // 2026-10-09: share queued-versus-saved memory status with fresh actions,
   // preserve claim-scoped privacy, and avoid unconditional retrieval promises.
-  instructions: { len: 32464, sha16: 'cb0e3b515e6eb3d5' },
-  native: { len: 31571, sha16: '3f09d9ce21ac3189' },
-  claudeBrain: { len: 9945, sha16: 'b425913632303081' },
-  lean: { len: 11950, sha16: '808c1c78bf67646c' },
+  // 2026-10-11: shared inline-result and logical-effect reasoning. Raw tool
+  // bytes stay unchanged; past-tense claims can cite authenticated retained
+  // successes without replay. Full exact Stop policy remains context-bound.
+  instructions: { len: 33419, sha16: '200c272541930462' },
+  native: { len: 32526, sha16: 'e1f4b1f13432e52b' },
+  claudeBrain: { len: 10817, sha16: 'a8d90f249bd0a105' },
+  lean: { len: 12822, sha16: '397f2ef0fa68c50b' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -532,9 +535,10 @@ test('two-lane invariant: the decision-JSON contract NEVER leaks into the native
 // Catches accidental bloat. 2026-08-22 provider-neutral baseline: ≈ 7,594 tok. A drift
 // of >5% in either direction is a prompt-size regression worth a look.
 test('budget guard: rubric token estimate stays within 5% of the Phase-0 baseline', () => {
-  // The shared memory-status correction adds 566 legacy characters (142
-  // estimated tokens); retain the original 5% drift allowance around that delta.
-  const BASELINE_TOK = 7742;
+  // Preserve the previous 5% drift allowance around the deliberate +955
+  // legacy-character reasoning change (239 estimated tokens). This is prompt
+  // overhead, not measured model usage or an efficiency improvement.
+  const BASELINE_TOK = 7981;
   const actual = TOK(ORCHESTRATOR_INSTRUCTIONS.length);
   const drift = Math.abs(actual - BASELINE_TOK) / BASELINE_TOK;
   assert.ok(

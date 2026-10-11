@@ -35,6 +35,7 @@
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
+import { bindCompletedModelResponse } from './model-response-binding.js';
 import type { StreamEvent } from '@openai/agents-core/types';
 import type { ModelCapability } from './model-wire-registry.js';
 import { BoundaryError, type BoundaryErrorKind } from '../boundary-error.js';
@@ -84,6 +85,7 @@ interface ResilienceTelemetryBase {
  * route. A returned wrapper call is not a completion/effect verdict. */
 type ResilienceTelemetryDetail =
   | { type: 'call_started' }
+  | { type: 'response_observed'; attempt: number; providerResponseIdDigest: string }
   | { type: 'attempt_started'; attempt: number }
   | { type: 'attempt_finished'; attempt: number; durationMs: number; outcome: ResilienceOutcome;
       contentCommitted: boolean; completionObserved: boolean; failureKind?: ResilienceFailureKind; status?: number }
@@ -142,6 +144,13 @@ class ResilienceCallTelemetry {
     this.attemptCount += 1;
     this.activeAttempt = { ordinal, startedAt: this.now(), contentCommitted: false, completionObserved: false };
     this.emit({ type: 'attempt_started', attempt: ordinal });
+  }
+
+  response(response: unknown): void {
+    if (!this.activeAttempt) return;
+    const binding = bindCompletedModelResponse(response, this.callId, this.activeAttempt.ordinal);
+    if (binding) this.emit({ type: 'response_observed', attempt: binding.physicalAttempt,
+      providerResponseIdDigest: binding.providerResponseIdDigest });
   }
 
   streamState(contentCommitted: boolean, completionObserved: boolean): void {
@@ -614,6 +623,7 @@ export class ResilientModel implements Model {
       try {
         call.signal?.throwIfAborted();
         const res = await this.inner.getResponse(req);
+        telemetry.response(res);
         if (isEmptyResponse(res) && call.signal?.aborted) {
           telemetry.finishAttempt('cancelled', false, true, 'model.empty_completion');
           call.signal.throwIfAborted();
@@ -710,6 +720,7 @@ export class ResilientModel implements Model {
             throw providerRefusalError(this.policy.label);
           }
           if (e.type === 'response_done') {
+            telemetry.response(e.response);
             sawDone = true;
             const emptyOutput = !Array.isArray(e.response?.output) || e.response!.output!.length === 0;
             doneEmpty = !committed && emptyOutput;

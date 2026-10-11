@@ -1382,3 +1382,32 @@ test('a read-only answer never waits on its review longer than the read time box
   assert.ok(READ_REVIEW_TIMEOUT_MS < goalJudgeTimeoutMs(), 'tighter than the goal-judge wall');
   assert.ok(READ_REVIEW_TIMEOUT_MS < WRITE_REVIEW_TIMEOUT_MS, 'writes keep their time to finish');
 });
+
+
+test('an authenticated retained projection covers only its exact producer handle across identical call IDs and bytes', () => {
+  type Row = NonNullable<Parameters<typeof assessCompletionEvidenceCoverage>[0]['results']>[number];
+  const first: Row = { toolName: 'read_file', outcome: 'succeeded', status: 'verified', evidenceKind: 'source_result',
+    logicalToolCallId: 'same-logical-id', physicalDispatchId: 'same-physical-id', contentDigest: 'same-content-digest',
+    resultHandleId: 'rh_first_scope', contentComplete: false };
+  const second: Row = { ...first, resultHandleId: 'rh_second_scope' };
+  const projection: Row = { toolName: 'recall_tool_result', outcome: 'succeeded', status: 'verified',
+    evidenceKind: 'retained_projection', logicalToolCallId: 'consumer-read', resultHandleId: 'rh_projection',
+    contentComplete: true, sourceSelectionComplete: true, sourceResultHandleId: 'rh_first_scope',
+    sourceLogicalToolCallId: 'same-logical-id', sourcePhysicalDispatchId: 'same-physical-id',
+    sourceSessionId: 'first-owner-session', sourceUserSeq: 1, contentDigest: 'same-content-digest' };
+  const assessed = assessCompletionEvidenceCoverage({ objective: 'Inspect both owned results.', results: [first, second, projection] });
+  assert.deepEqual(assessed.incompleteReceipts, [second]);
+  assert.equal(assessed.complete, false);
+  const absentProducer = assessCompletionEvidenceCoverage({ objective: 'Inspect the second result.', results: [second, projection] });
+  assert.deepEqual(absentProducer.incompleteReceipts, [second]);
+  const missingHandle = { ...projection, sourceResultHandleId: undefined };
+  assert.deepEqual(assessCompletionEvidenceCoverage({ objective: 'Inspect both.', results: [first, missingHandle] }).incompleteReceipts, [first],
+    'authenticated scope without an exact handle cannot fall back to guessed call IDs');
+  const intermediate: Row = { ...projection, logicalToolCallId: 'intermediate', resultHandleId: 'rh_intermediate', contentComplete: false };
+  const reopened: Row = { ...projection, resultHandleId: 'rh_reopened', sourceResultHandleId: 'rh_intermediate',
+    sourceLogicalToolCallId: 'intermediate' };
+  assert.equal(assessCompletionEvidenceCoverage({ objective: 'Inspect first.', results: [first, intermediate, reopened] }).complete, true,
+    'a genuine directed producer chain remains usable');
+  assert.equal(assessCompletionEvidenceCoverage({ objective: 'Inspect first.', results: [first, { ...intermediate, sourceSelectionComplete: false }, reopened] }).complete, false,
+    'a whole later read cannot cross a focused ancestor');
+});

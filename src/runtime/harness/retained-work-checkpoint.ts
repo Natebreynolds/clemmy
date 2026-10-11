@@ -16,7 +16,7 @@ export function withoutRetainedWorkCheckpoint(text: string): string {
   const index = text.indexOf(RETAINED_WORK_TERMINAL_HEADER);
   if (index < 0) return text;
   const kept = text.slice(0, index).trimEnd();
-  return kept || text;
+  return kept || 'I need your input before continuing.';
 }
 
 /**
@@ -35,25 +35,28 @@ export function ownerFacingRetainedWorkCheckpoint(text: string): string {
   let writeState: WriteState | null = null;
   for (const line of lines) {
     if (line.startsWith('- ')) {
-      const more = /^- (\d+) additional retained result/.exec(line);
-      kept += more ? Number(more[1]) : 1;
+      const more = /^- (\d+) additional retained results?\.$/.exec(line);
+      const count = more ? Number(more[1]) : 0;
+      if (Number.isSafeInteger(count) && count > 0) kept += count;
+      else if (/^- Source\/tool [^\n]+: [^\n]+ retained as rh_[A-Za-z0-9_]+\.$/.test(line)) kept += 1;
       continue;
     }
     const state = /^External write state(?: \([^)]*\))?: (succeeded|failed|mixed|uncertain|refused|no settled)/.exec(line);
     if (state) writeState = (state[1] === 'no settled' ? 'not_recorded' : state[1]) as WriteState;
   }
   const sentences: string[] = [];
-  if (kept > 0) sentences.push(`I kept ${kept === 1 ? 'the result' : `${kept} results`} from this turn, so a retry won't fetch ${kept === 1 ? 'it' : 'them'} again.`);
+  if (kept > 0) sentences.push(`I kept ${kept === 1 ? 'the result' : `${kept} results`} from this turn for when we continue.`);
   switch (writeState) {
     case 'succeeded': sentences.push('The change outside this machine went through; I won\'t repeat it.'); break;
     case 'failed': sentences.push('The change outside this machine did not go through.'); break;
     case 'mixed': sentences.push('Some changes outside this machine went through and at least one did not; I won\'t repeat the ones that did.'); break;
     case 'uncertain': sentences.push('I can\'t yet confirm whether the change outside this machine went through; I\'ll check before trying again.'); break;
     case 'refused': sentences.push('The app turned the change down; I won\'t try it again without asking you.'); break;
-    case 'not_recorded': sentences.push('Nothing outside this machine was changed.'); break;
+    case 'not_recorded': sentences.push('No changes to another app are confirmed for this turn.'); break;
     default: break;
   }
-  // A checkpoint this reader does not recognise (free-form notes) stays as is.
-  if (sentences.length === 0) return text;
+  // Unknown checkpoint notes are still private. Their presence does not prove
+  // a result or a settled effect, so keep only the already authorized head.
+  if (sentences.length === 0) return head || 'This turn stopped before I could confirm the outcome.';
   return `${head}\n\n${sentences.join(' ')}`.trim();
 }

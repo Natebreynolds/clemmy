@@ -57,8 +57,10 @@ export interface SystemOneRequestPayload {
 }
 
 export interface SystemOneUsage {
-  input_tokens: number;
-  output_tokens: number;
+  /** Only explicit provider token counts are measurements. Missing or invalid
+   * counts do not invalidate otherwise valid answers and never become zero. */
+  input_tokens?: number;
+  output_tokens?: number;
 }
 
 export type SystemOneFailReason =
@@ -79,7 +81,10 @@ export type SystemOneFailure = {
 
 export type SystemOneSuccess = {
   ok: true;
+  /** Legacy display identity may fall back to the requested pin. */
   model: string;
+  /** Explicit safe provider identity; absent when the response did not name it. */
+  providerReportedModel?: string;
   answers: Record<string, SystemOneAnswer>;
   usage: SystemOneUsage;
   status?: number;
@@ -101,6 +106,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function finiteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function reportedTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function parseNoul(raw: unknown): NoulAnswer | null {
@@ -155,6 +164,9 @@ export function parseSystemOneResponse(
   if (!isRecord(body)) return { ok: false, reason: 'malformed', message: 'response is not an object' };
   if (!isRecord(body.answers)) return { ok: false, reason: 'malformed', message: 'answers missing' };
   const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : TYPESAFE_MODEL;
+  const providerReportedModel = typeof body.model === 'string'
+    && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(body.model.trim()) && !body.model.includes('://')
+    ? body.model.trim() : undefined;
   const answers: Record<string, SystemOneAnswer> = {};
   for (const [id, question] of Object.entries(questions)) {
     const raw = body.answers[id];
@@ -167,13 +179,17 @@ export function parseSystemOneResponse(
     answers[id] = parsed;
   }
   const usageRaw = isRecord(body.usage) ? body.usage : {};
-  const inputTokens = finiteNumber(usageRaw.input_tokens) ?? 0;
-  const outputTokens = finiteNumber(usageRaw.output_tokens) ?? 0;
+  const inputTokens = reportedTokenCount(usageRaw.input_tokens);
+  const outputTokens = reportedTokenCount(usageRaw.output_tokens);
   return {
     ok: true,
     model,
+    ...(providerReportedModel ? { providerReportedModel } : {}),
     answers,
-    usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+    usage: {
+      ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
+      ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
+    },
   };
 }
 

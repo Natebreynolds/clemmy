@@ -425,6 +425,8 @@ export interface ChatMessage {
   /** Client idempotency key for retrying a failed send verbatim. */
   idempotencyKey?: string;
   connectionRequestId?: string;
+  /** Spoken request presentation intent, retained on an uncertain send. */
+  voice?: boolean;
   /** Mid-run steer: text delivered into the live turn, not a new attempt. */
   steer?: 'pending' | 'delivered' | 'failed';
   /** Present only while this assistant bubble represents exact, source-bound

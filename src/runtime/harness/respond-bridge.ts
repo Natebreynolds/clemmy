@@ -141,6 +141,7 @@ import {
   publicProviderCapacityText,
   publicAsyncWorkDispatchedData,
   publicCompletionText,
+  publicPresentationText,
   publicReplyText,
 } from './public-presentation.js';
 import { commitTurnOutcome } from './delivery-committer.js';
@@ -1035,7 +1036,7 @@ function responseForCommittedTerminal(
 ): AssistantResponse {
   let presentation: PresentationEvent | null = null;
   try { presentation = presentationEventFromCompletionData(event.data); } catch { presentation = null; }
-  const text = presentation?.text ?? publicCompletionText(event.data, PUBLIC_RUN_FAILURE_TEXT);
+  const text = presentation ? publicPresentationText(presentation) : publicCompletionText(event.data, PUBLIC_RUN_FAILURE_TEXT);
   return {
     text,
     sessionId: event.sessionId,
@@ -1054,7 +1055,7 @@ function responseForAcceptedSourceTerminal(
 ): AssistantResponse {
   const { event, presentation } = terminal;
   return {
-    text: presentation.text,
+    text: publicPresentationText(presentation),
     sessionId: event.sessionId,
     stoppedReason: stoppedReasonForPresentation(presentation, event.data.blockedReason),
     turnsUsed: event.turn,
@@ -2119,7 +2120,7 @@ export async function respondViaHarness(
             ? 'completed'
             : 'failed';
       return withRouteDiagnostics({
-        text: presentation.text,
+        text: publicPresentationText(presentation),
         sessionId,
         stoppedReason: stoppedReasonForPresentation(presentation, result.blockedReason),
         turnsUsed: result.lastTurn,

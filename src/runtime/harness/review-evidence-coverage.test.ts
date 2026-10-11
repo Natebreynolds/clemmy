@@ -206,3 +206,23 @@ test('the line naming what a verdict needs is asked for only where a result is h
   assert.match(reviewCoverageLedger([boundedList()])!, /NEEDS ALL OF: <ref>, <ref>/);
   assert.equal(reviewCoverageLedger([writeReceipt]), undefined);
 });
+
+
+test('projection inspection uses an exact producer handle rather than duplicate logical IDs or equal content', () => {
+  const first = boundedList({ logicalToolCallId: 'same-logical-id', resultHandleId: 'rh_owner_one', contentDigest: 'same-bytes' });
+  const second = boundedList({ logicalToolCallId: 'same-logical-id', resultHandleId: 'rh_owner_two', contentDigest: 'same-bytes' });
+  const projection: Row = { toolName: 'recall_tool_result', outcome: 'succeeded', status: 'verified',
+    evidenceKind: 'retained_projection', logicalToolCallId: 'reader', resultHandleId: 'rh_reader', contentComplete: true,
+    sourceSelectionComplete: true, sourceLogicalToolCallId: 'same-logical-id', sourceResultHandleId: 'rh_owner_one',
+    sourceSessionId: 'owner-one', sourceUserSeq: 1 };
+  const rows = reviewEvidenceCoverage([first, second, projection]);
+  assert.equal(rows.find(row => row.resultHandleId === 'rh_owner_one')?.inspection, 'queried');
+  assert.equal(rows.find(row => row.resultHandleId === 'rh_owner_two')?.inspection, 'unopened');
+  assert.equal(assessReviewCoverage({ results: [first, second, projection], needsAllOf: ['rh_owner_two'] }).status, 'insufficient');
+  assert.equal(assessReviewCoverage({ results: [first, second, projection], needsAllOf: ['rh_owner_one'] }).status, 'sufficient');
+  const missingHandle = { ...projection, sourceResultHandleId: undefined };
+  assert.equal(reviewEvidenceCoverage([first, missingHandle]).find(row => row.resultHandleId === 'rh_owner_one')?.inspection, 'unopened');
+  const unknown = boundedList({ resultHandleId: 'rh_unknown', sourceExhausted: false });
+  assert.equal(assessReviewCoverage({ results: [unknown, { ...projection, sourceResultHandleId: 'rh_unknown' }], needsAllOf: ['rh_unknown'] }).status,
+    'insufficient', 'reading every stored byte does not establish unknown semantic source completeness');
+});

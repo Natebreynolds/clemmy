@@ -650,8 +650,13 @@ export function publicCompletionText(
     const typedPresentation = presentationEventFromCompletionData(data);
     const missingReply = data.reply === undefined || data.reply === null
       || (typeof data.reply === 'string' && !data.reply.trim());
-    return typedPresentation?.text
-      || publicReplyText(data.reply, '')
+    if (typedPresentation) return publicPresentationText(typedPresentation);
+    const reply = publicReplyText(data.reply, '');
+    const waitingOnPerson = data.awaitingUser === true
+      || data.reason === 'awaiting_user_input'
+      || data.reason === 'awaiting_approval'
+      || data.reason === 'awaiting_continue';
+    return (waitingOnPerson ? withoutRetainedWorkCheckpoint(reply) : ownerFacingRetainedWorkCheckpoint(reply))
       || (missingReply && fallback === SAFE_TERMINAL_FALLBACK
         ? LEGACY_MISSING_REPLY_FALLBACK : fallback);
   } catch {
@@ -660,6 +665,15 @@ export function publicCompletionText(
     // cannot be laundered into publication through the compatibility adapter.
     return fallback;
   }
+}
+
+/** Public transports and transcript readers must apply the same checkpoint
+ * projection as SSE. The durable presentation retains redeemable evidence;
+ * decoding its typed identity alone does not make that private tail chat copy. */
+export function publicPresentationText(presentation: PresentationEvent): string {
+  return presentation.status === 'needs_input'
+    ? withoutRetainedWorkCheckpoint(presentation.text)
+    : ownerFacingRetainedWorkCheckpoint(presentation.text);
 }
 
 /**
@@ -803,7 +817,7 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
     summary: reply,
     ...(typedOutcome ? { turnOutcome: typedOutcome } : {}),
     presentation: typedPresentation
-      ? { ...typedPresentation, text: readable(typedPresentation.text) }
+      ? { ...typedPresentation, text: publicPresentationText(typedPresentation) }
       : {
           version: 1,
           audience: 'user',

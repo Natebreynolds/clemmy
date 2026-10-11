@@ -23,12 +23,15 @@ import {
 } from '../lib/api';
 import { haptic } from '../lib/native-bridge';
 import { ChatBackButton } from '../components/ChatBackButton';
+import { NavigationMenuButton } from '../components/NavigationMenuButton';
+import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { relativeTime } from '../components/Approvals';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
 import { failedWorkspaceSources, workspaceNeedsSourceRepair } from '../lib/workspace-presentation';
 import { Chat } from './Chat';
 import { WorkspaceSourceControls } from '../components/WorkspaceSourceControls';
+import { reportWidgetLanding, saveWidgetSpace, widgetAvailable, widgetNavigationFromSearch, widgetText } from '../lib/widget-bridge';
 
 export function Workspaces({
   initialOpenId = null,
@@ -39,6 +42,8 @@ export function Workspaces({
   onOpenNeedsYou: () => void;
   onOpenChange?: (id: string | null) => void;
 }) {
+  const widgetNavigation = widgetNavigationFromSearch(window.location.search);
+  useEffect(() => { if (!initialOpenId) reportWidgetLanding(widgetNavigation, { tab: 'spaces' }); }, [initialOpenId, widgetNavigation]);
   const [openId, setOpenId] = useState<string | null>(initialOpenId);
   useEffect(() => setOpenId(initialOpenId), [initialOpenId]);
   const selectWorkspace = (id: string | null) => {
@@ -168,12 +173,34 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
   const [actionError, setActionError] = useState<string | null>(null);
   const [refreshNote, setRefreshNote] = useState<{ kind: 'ok' | 'approval' | 'failed'; text: string } | null>(null);
   const [chatOpen, setChatOpen] = useState<{ draft?: string } | null>(null);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [widgetNote, setWidgetNote] = useState('');
+  const [widgetSaving, setWidgetSaving] = useState(false);
+  const widgetNavigation = widgetNavigationFromSearch(window.location.search);
+  useMobileDetailHeader(chatOpen === null);
   const [showPref, setShowPref] = useState<boolean | null | undefined>(undefined);
   const [prefBusy, setPrefBusy] = useState(false);
   const { data: detail, error, offline, refresh: load } = useScreenData(
     () => getWorkspace(id),
     { intervalMs: 60_000, disabled: chatOpen !== null },
   );
+  useEffect(() => {
+    if (detail) reportWidgetLanding(widgetNavigation, { tab: 'spaces', workspace: id });
+    else if (error && !offline) reportWidgetLanding(widgetNavigation, { tab: 'spaces', workspace: id }, 'unavailable');
+  }, [detail, error, offline, widgetNavigation]);
+  const updateWidget = async (clear = false) => {
+    if (!detail || widgetSaving) return;
+    setWidgetSaving(true); setWidgetNote('');
+    try {
+      await saveWidgetSpace(clear ? null : {
+        slug: detail.id, name: widgetText(detail.title, 160),
+        summary: widgetText(detail.projection.headline.slice(0, 3).map(row => `${row.label}: ${row.value}`).join(' · ') || detail.objective || 'Open this Space in Clem.', 600),
+        updatedAt: detail.lastRefreshedAt ?? detail.updatedAt,
+      });
+      setWidgetNote(clear ? 'Space removed from your widget.' : 'Space saved. Add the Clem widget from your iPhone Home Screen. This preview updates when you save it again.');
+    } catch (error) { setWidgetNote(error instanceof Error ? error.message : 'The widget could not be updated.'); }
+    finally { setWidgetSaving(false); }
+  };
 
   async function pullFresh() {
     setRefreshing(true);
@@ -265,9 +292,7 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
 
   return (
     <div>
-      <DetailHeader title={detail.title} onBack={onBack} />
-
-      {detail.objective ? <p class="ws-objective-full">{detail.objective}</p> : null}
+      <DetailHeader title={detail.title} onBack={onBack} onDetails={() => { setDetailsOpen(true); requestAnimationFrame(() => document.getElementById('space-details')?.scrollIntoView({ block: 'start' })); }} />
 
       <div class="ws-status">
         <span class="card-when">
@@ -275,24 +300,7 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
           {freshnessLabel(detail)}
         </span>
         <button class="btn-quiet" onClick={() => setChatOpen({})}>Ask Clem</button>
-        {/* A workspace with no registered data source CANNOT refresh. Showing
-            the button anyway is the lie that made this screen feel broken:
-            nothing happened and nothing said why. */}
-        {canRefresh ? (
-          <button class="btn-quiet" disabled={refreshing} onClick={pullFresh}>
-            {refreshing ? 'Refreshing…' : 'Refresh'}
-          </button>
-        ) : null}
       </div>
-
-      {needsSourceRepair ? (
-        <div class="ws-refresh-note">
-          <div>This workspace has no data source, so it can’t refresh on its own.</div>
-          <button class="link-btn" onClick={() => setChatOpen({ draft: FIX_REFRESH_ASK })}>
-            Ask Clem to fix this →
-          </button>
-        </div>
-      ) : null}
 
       {refreshNote ? (
         <div class={`ws-refresh-note ws-refresh-${refreshNote.kind}`}>{refreshNote.text}</div>
@@ -308,14 +316,8 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
           <span>
             {failed.map((s) => s.id).join(', ')} couldn't update, so these numbers are older than they look.
           </span>
-          {failed[0].error ? <code class="ws-warn-detail">{failed[0].error}</code> : null}
         </div>
       ) : null}
-
-      {/* Diagnostics are for when you go looking, not for the first screenful:
-          the headline numbers are why you opened this. */}
-      {detail.issues.length > 0 ? <IssueDisclosure issues={detail.issues} /> : null}
-      <WorkspaceSourceControls workspaceId={id} onOpenApprovals={onOpenNeedsYou} />
 
       {projection.headline.length > 0 ? (
         <section class="home-section">
@@ -350,7 +352,7 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
             </p>
           ) : null}
         </section>
-      ) : (
+      ) : projection.headline.length === 0 && projection.breakdowns.length === 0 ? (
         <div class="empty">
           <p class="empty-title">Nothing to list</p>
           <p class="empty-body">
@@ -358,68 +360,88 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
             Open it on your computer for the full view.
           </p>
         </div>
-      )}
-
-      {thinLayout ? (
-        <div class="ws-refresh-note">
-          <div>Your phone is guessing this layout from the raw data.</div>
-          <button class="link-btn" onClick={() => setChatOpen({ draft: PHONE_LAYOUT_ASK })}>
-            Ask Clem for a phone layout →
-          </button>
-        </div>
       ) : null}
 
-      {/* Phone presence, owned by you. Absent means the app decides by
-          content — which is right until it isn't. */}
-      <div class="ws-presence">
-        <span class="card-when">
-          {preference === true ? 'Always on your phone'
-            : preference === false ? 'Hidden from your phone'
-              : 'Shown when it has something'}
-        </span>
-        {preference === false ? (
-          <button class="btn-quiet" disabled={prefBusy} onClick={() => void setPresence(true)}>Show on phone</button>
-        ) : (
-          <button class="btn-quiet" disabled={prefBusy} onClick={() => void setPresence(false)}>Hide from phone</button>
-        )}
-        {preference !== null ? (
-          <button class="link-btn" disabled={prefBusy} onClick={() => void setPresence(null)}>Automatic</button>
-        ) : null}
-      </div>
+      <details id="space-details" class="ws-details" open={detailsOpen} onToggle={event => setDetailsOpen(event.currentTarget.open)}>
+        <summary>Space details</summary>
+        <div class="ws-details-body">
+          {widgetAvailable() ? <div class="ws-widget-options">
+            <p class="card-when">Show this Space’s name and summary on your iPhone Home Screen.</p>
+            <div class="ws-details-actions">
+              <button type="button" class="btn-quiet" disabled={widgetSaving || offline} onClick={() => void updateWidget()}>{widgetSaving ? 'Saving…' : 'Use in iPhone widget'}</button>
+              <button type="button" class="btn-quiet" disabled={widgetSaving} onClick={() => void updateWidget(true)}>Clear widget Space</button>
+            </div>
+            {widgetNote ? <p class="card-when" role="status">{widgetNote}</p> : null}
+          </div> : null}
+          {detail.objective ? <p class="ws-objective-full">{detail.objective}</p> : null}
+          {canRefresh ? <div class="ws-details-actions"><button type="button" class="btn-quiet" disabled={refreshing} onClick={pullFresh}>{refreshing ? 'Refreshing…' : 'Refresh data'}</button></div> : null}
+          {needsSourceRepair ? <div class="ws-refresh-note"><p>This Space has no data source, so it can’t refresh on its own.</p><button type="button" class="link-btn" onClick={() => setChatOpen({ draft: FIX_REFRESH_ASK })}>Ask Clem to connect a source</button></div> : null}
+          {failed[0]?.error ? <code class="ws-warn-detail">{failed[0].error}</code> : null}
+          {detail.issues.length > 0 ? <IssueDisclosure issues={detail.issues} /> : null}
+          <WorkspaceSourceControls workspaceId={id} onOpenApprovals={onOpenNeedsYou} />
 
-      {(detail.successCriteria?.length || detail.invariants?.length) ? (
-        <section class="home-section">
-          <h2 class="section-head">The contract</h2>
-          {detail.successCriteria?.length ? (
-            <div class="ws-contract">
-              <div class="memory-section-head">What good looks like</div>
-              {detail.successCriteria.map((line) => <div key={line} class="ws-contract-line">{line}</div>)}
+          {thinLayout ? (
+            <div class="ws-refresh-note">
+              <div>Your phone is guessing this layout from the raw data.</div>
+              <button class="link-btn" onClick={() => setChatOpen({ draft: PHONE_LAYOUT_ASK })}>
+                Ask Clem for a phone layout →
+              </button>
             </div>
           ) : null}
-          {detail.invariants?.length ? (
-            <div class="ws-contract">
-              <div class="memory-section-head">Never</div>
-              {detail.invariants.map((line) => <div key={line} class="ws-contract-line">{line}</div>)}
-            </div>
-          ) : null}
-        </section>
-      ) : null}
 
-      {detail.linkedWorkflows?.length ? (
-        <section class="home-section">
-          <h2 class="section-head">Flows that feed this</h2>
-          <div class="stack">
-            {detail.linkedWorkflows.map((wf) => (
-              <div key={wf.name} class="card">
-                <div class="min-w-0">
-                  <div class="card-title-sm truncate">{wf.name}{wf.enabled ? '' : ' · disabled'}</div>
-                  {wf.description ? <div class="card-when">{wf.description}</div> : null}
-                </div>
-              </div>
-            ))}
+          {/* Phone presence, owned by you. Absent means the app decides by
+              content — which is right until it isn't. */}
+          <div class="ws-presence">
+            <span class="card-when">
+              {preference === true ? 'Always on your phone'
+                : preference === false ? 'Hidden from your phone'
+                  : 'Shown when it has something'}
+            </span>
+            {preference === false ? (
+              <button class="btn-quiet" disabled={prefBusy} onClick={() => void setPresence(true)}>Show on phone</button>
+            ) : (
+              <button class="btn-quiet" disabled={prefBusy} onClick={() => void setPresence(false)}>Hide from phone</button>
+            )}
+            {preference !== null ? (
+              <button class="link-btn" disabled={prefBusy} onClick={() => void setPresence(null)}>Automatic</button>
+            ) : null}
           </div>
-        </section>
-      ) : null}
+
+          {(detail.successCriteria?.length || detail.invariants?.length) ? (
+            <section class="home-section">
+              <h2 class="section-head">The contract</h2>
+              {detail.successCriteria?.length ? (
+                <div class="ws-contract">
+                  <div class="memory-section-head">What good looks like</div>
+                  {detail.successCriteria.map((line) => <div key={line} class="ws-contract-line">{line}</div>)}
+                </div>
+              ) : null}
+              {detail.invariants?.length ? (
+                <div class="ws-contract">
+                  <div class="memory-section-head">Never</div>
+                  {detail.invariants.map((line) => <div key={line} class="ws-contract-line">{line}</div>)}
+                </div>
+              ) : null}
+            </section>
+          ) : null}
+
+          {detail.linkedWorkflows?.length ? (
+            <section class="home-section">
+              <h2 class="section-head">Flows that feed this</h2>
+              <div class="stack">
+                {detail.linkedWorkflows.map((wf) => (
+                  <div key={wf.name} class="card">
+                    <div class="min-w-0">
+                      <div class="card-title-sm truncate">{wf.name}{wf.enabled ? '' : ' · disabled'}</div>
+                      {wf.description ? <div class="card-when">{wf.description}</div> : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </div>
+      </details>
     </div>
   );
 }
@@ -545,11 +567,13 @@ function IssueDisclosure({ issues }: { issues: string[] }) {
   );
 }
 
-function DetailHeader({ title, onBack }: { title: string; onBack: () => void }) {
+function DetailHeader({ title, onBack, onDetails }: { title: string; onBack: () => void; onDetails?: () => void }) {
   return (
-    <div class="chat-header">
+    <div class="chat-header detail-header">
       <ChatBackButton onClick={() => { haptic('light'); onBack(); }} />
-      <div class="chat-title">{title}</div>
+      <h2 class="chat-title">{title}</h2>
+      {onDetails ? <button type="button" class="btn-quiet" onClick={onDetails}>Details</button> : null}
+      <NavigationMenuButton />
     </div>
   );
 }

@@ -6,6 +6,8 @@ export type SessionOrigin = 'desktop' | 'cli' | 'discord' | 'workflow' | 'agent'
 
 export interface Session {
   id: string;
+  /** Physical execution head; id remains the stable visible conversation. */
+  executionSessionId?: string;
   origin: SessionOrigin;
   store: 'desktop' | 'harness';
   kind: string;

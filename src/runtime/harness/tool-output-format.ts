@@ -7,6 +7,10 @@ import { actionTopologyRoleForRuntimeCall, unwrapRuntimeEffectiveToolIdentity } 
 import { effectiveContextWindow } from './model-window-observations.js';
 import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 
+// Reuse this pure policy in brain/reviewer instruction assembly. Model-facing
+// host metadata is separate from the lossless provider payload and its evidence.
+export { TOOL_OUTPUT_REASONING_GUIDANCE } from './tool-output-reasoning.js';
+
 // One whole inline result: 20K (~5K tokens) passes typical single-screen
 // results whole, so the model does not spend a follow-up read on data it was
 // about to need, while genuinely huge outputs still digest and stay
@@ -312,7 +316,6 @@ export function exactToolOutputForInvocation(input: {
       stored
       && stored.tool === input.toolName
       && !stored.truncatedAtWrite
-      && stored.output.trim()
       && compactResultProvesExactToolOutput(
         input.compactResult,
         stored.output,
@@ -459,6 +462,48 @@ export function densifyMarkdownForModelHead(text: string): string {
   return lines.join('\n').replace(/\n{3,}/g, '\n\n');
 }
 
+/** A proven whole plain-text local read still needs a lexical address: the SDK call id
+ * alone can be absent from the model's text view. This host-authored envelope
+ * never replaces provider bytes in storage or source evidence. JSON provider
+ * roots and already-framed retained readers keep their existing shape. The
+ * caller must separately hold final-boundary nominal read authorization. */
+function wholeInlineToolPresentation(text: string, input: {
+  sessionId: string;
+  callId: string;
+  toolName: string;
+  settlementNonce: string;
+  maxChars: number;
+}): string | null {
+  if (toolReadsRetainedOutput(input.toolName)
+    || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,239}$/.test(input.callId)
+    || !/^[0-9a-f-]{36}$/i.test(input.settlementNonce)) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed !== null && typeof parsed === 'object') return null;
+  } catch { /* plain text uses a JSON string to preserve every returned byte */ }
+  try {
+    const stored = getToolOutputForInvocation(input.sessionId, input.callId, input.settlementNonce);
+    if (!stored || stored.tool !== input.toolName || stored.truncatedAtWrite || stored.output !== text) return null;
+    const bytes = Buffer.byteLength(text, 'utf8');
+    const shown = JSON.stringify({
+      __clementine: {
+        kind: 'whole_inline_result_v1',
+        origin: 'host',
+        call_id: input.callId,
+        view: 'whole_returned_payload',
+        shownPayloadBytes: bytes,
+        storedPayloadBytes: bytes,
+        sourceCoverage: 'not_established',
+        guidance: 'Use providerPayload directly. It is the exact returned text; host metadata is not provider evidence or proof of source access. Recall only missing material with the full call_id.',
+        receipt: `[exact-output-receipt:v1 nonce=${input.settlementNonce} sha256=${exactOutputSha256(text)}]`,
+      },
+      providerPayload: text,
+    });
+    // Never sacrifice any payload, full id, or receipt to make the frame fit.
+    return shown.length <= input.maxChars ? shown : null;
+  } catch { return null; }
+}
+
 export function formatRecallableToolText(
   text: string,
   options: RecallableToolTextOptions = {},
@@ -481,17 +526,23 @@ export function formatRecallableToolText(
       ? activeInvocationBudget ?? presentationBudgetFor({ toolName })
       : DEFAULT_TOOL_RESULT_MAX_CHARS);
   let persistenceFailed = false;
+  let authenticatedProjection = false;
   let hostAnnotations = [...(options.hostAnnotations ?? [])].filter((note) => note.length > 0);
+  const exactActiveInvocation = !!active && active.sessionId === sessionId
+    && active.callId === callId && active.toolName === toolName;
+  const wholeInlineAllowed = active?.wholeInlinePresentation?.nominalReadSucceeded === true
+    && active.wholeInlinePresentation.effectiveToolName === 'read_file';
 
   // Local handlers, adapters and outer brackets can all format one result.
   // An authenticated projection is already backed by this invocation's raw
   // bytes; persisting the projection again would overwrite that evidence.
   // Reuse the existing exact receipt verifier, never infer clipping from prose.
-  if (sessionId && callId && active?.settlementNonce) {
+  if (sessionId && callId && exactActiveInvocation && active?.settlementNonce) {
     const exact = exactToolOutputForInvocation({ sessionId, callId, toolName,
       compactResult: text, settlementNonce: active.settlementNonce });
     if (exact instanceof TruncatedToolOutputResult) return JSON.stringify(exact);
     if (typeof exact === 'string' && exact !== text) {
+      authenticatedProjection = true;
       if (options.verifiedProjectionMaxChars !== undefined) {
         maxChars = Math.max(maxChars, options.verifiedProjectionMaxChars);
       }
@@ -516,7 +567,7 @@ export function formatRecallableToolText(
   // Persist even a small result when an exact harness invocation exists.
   // Reconciliation must never fall back to the call-id/longest-wins recall row
   // merely because the model-facing value did not need clipping.
-  if (sessionId && callId) {
+  if (sessionId && callId && !authenticatedProjection) {
     try {
       writeToolOutput({
         sessionId,
@@ -527,7 +578,15 @@ export function formatRecallableToolText(
       });
     } catch { persistenceFailed = true; }
   }
-  if (text.length <= maxChars && hostAnnotations.length === 0) return text;
+  if (text.length <= maxChars && hostAnnotations.length === 0) {
+    if (wholeInlineAllowed && !persistenceFailed && sessionId && callId
+      && exactActiveInvocation && active?.settlementNonce) {
+      return wholeInlineToolPresentation(text, {
+        sessionId, callId, toolName, settlementNonce: active.settlementNonce, maxChars,
+      }) ?? text;
+    }
+    return text;
+  }
   hostAnnotations = boundHostAnnotations(hostAnnotations, maxChars);
 
   const annotationText = hostAnnotations.length > 0

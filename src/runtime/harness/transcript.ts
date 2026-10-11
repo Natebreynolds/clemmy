@@ -11,10 +11,10 @@ import type { WorkflowSavedEventData } from '../../execution/workflow-saved-even
 import type { UnifiedSessionTurn } from '../../types.js';
 import { listEvents } from './eventlog.js';
 import { assertPublicPresentationText } from './turn-outcome.js';
-import { withoutRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 import {
   PUBLIC_RUN_FAILURE_TEXT,
   publicCompletionText,
+  publicPresentationText,
   publicReplyText,
   publicUserInputText,
   ownerBubbleText,
@@ -67,7 +67,20 @@ export function humanHarnessText(value: unknown, fallback = ''): string {
  * never silently dropped.
  */
 export function reconstructHarnessTranscript(sessionId: string, limit = 1000): UnifiedSessionTurn[] {
-  const events = listEvents(sessionId, {
+  return reconstructTranscript(sessionId, limit, true);
+}
+
+/** Catalog text/count projection. It uses the identical public turn election
+ * and event window as detail, without reading agent or saved-file decoration.
+ * Control and detailed history callers keep the full transcript above. The
+ * catalog may supply an equivalent bounded event reader; public election is
+ * shared and unchanged. No reader override reaches decoration/control reads. */
+export function reconstructHarnessTranscriptText(sessionId: string, limit = 1000, readPublicEvents: typeof listEvents = listEvents): UnifiedSessionTurn[] {
+  return reconstructTranscript(sessionId, limit, false, readPublicEvents);
+}
+
+function reconstructTranscript(sessionId: string, limit: number, includeDecorations: boolean, readPublicEvents: typeof listEvents = listEvents): UnifiedSessionTurn[] {
+  const events = readPublicEvents(sessionId, {
     types: [
       'user_input_received',
       'conversation_completed',
@@ -189,7 +202,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
   // Workflows each reply saved, by the exact source the tool ran for; the
   // newest save of a workflow within a turn is the one shown.
   const workflowsBySource = new Map<string, Map<string, WorkflowSavedEventData>>();
-  for (const event of events) {
+  for (const event of includeDecorations ? events : []) {
     if (event.type !== 'workflow_saved') continue;
     const exactSeq = positiveSeq(event.data.sourceUserSeq);
     if (exactSeq === null) continue;
@@ -203,6 +216,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
   }
   const filesBySource = new Map<string, Map<string, { name: string; dir: string }>>();
   const withSavedWork = (key: string, turn: UnifiedSessionTurn): UnifiedSessionTurn => {
+    if (!includeDecorations) return turn;
     const saved = workflowsBySource.get(key);
     const files = filesBySource.get(key);
     return { ...turn, ...(saved?.size ? { workflows: [...saved.values()] } : {}),
@@ -215,7 +229,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
   const answeredBy = new Map<string, string | null>();
   // ...and which project it worked in, from the same marker.
   const workedIn = new Map<string, string | null>();
-  for (const event of listEvents(sessionId, { types: ['turn_model_routed'], limit })) {
+  for (const event of includeDecorations ? listEvents(sessionId, { types: ['turn_model_routed'], limit }) : []) {
     const seq = positiveSeq(event.data.sourceUserSeq);
     if (seq === null) continue;
     const key = sourceKey(event.sessionId, seq);
@@ -248,12 +262,11 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     if (!prior || event.seq < prior.seq) {
       assistantBySource.set(key, {
         seq: event.seq,
-        // A reply that waited on the owner (a question, an approval) reopens
-        // as they read it live: without the host's retained-work checkpoint,
-        // which is record counts and handle ids kept for the model.
+        // Every typed terminal reopens through the same public projection as
+        // live delivery. Raw checkpoints stay in the durable event for reuse.
         text: presentation.status === 'needs_input'
-          ? reopenedApprovalText({ ...presentation, text: withoutRetainedWorkCheckpoint(presentation.text) })
-          : presentation.text,
+          ? reopenedApprovalText({ ...presentation, text: publicPresentationText(presentation) })
+          : publicPresentationText(presentation),
         createdAt: event.createdAt,
         planProposalId: planProposalIdFrom(event.data),
         planArtifactRef: publicPlanArtifactRef(event.data.planArtifactRef),
@@ -324,7 +337,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
   // New records bind to their exact accepted source, including late async tees.
   // Legacy records have only sequence order: admit them inside exactly one
   // completed source-to-reply window; overlaps and unbound writes stay in Files.
-  for (const event of listEvents(sessionId, { types: ['deliverable_saved'], limit })) {
+  for (const event of includeDecorations ? listEvents(sessionId, { types: ['deliverable_saved'], limit }) : []) {
     if (event.role !== 'system') continue;
     const name = typeof event.data.name === 'string' ? event.data.name : '';
     const dir = typeof event.data.dir === 'string' ? event.data.dir : '';

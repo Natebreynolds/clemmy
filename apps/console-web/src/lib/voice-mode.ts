@@ -15,10 +15,10 @@
  * Interrupting stops her and listens.
  */
 import { useSyncExternalStore } from 'react';
-import { NotchVoice } from './notch-voice';
-import { VoiceSpeaker } from './voice-speaker';
+import { NotchVoice, type NotchVoiceHandlers, type NotchVoiceOptions } from './notch-voice';
+import { VoiceSpeaker, type VoiceSpeakerHandlers } from './voice-speaker';
 import { heardCue, workingTick } from './voice-cues';
-import { spokenWords, voiceBaseline, voiceTurnEnded, voiceTurnRunning, voiceUtterances, type VoiceChatMessage } from './voice-turns';
+import { spokenWords, voiceBaseline, voiceTurnEnded, voiceTurnRunning, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage, type VoiceUtterance } from './voice-turns';
 
 export type VoicePhase = 'off' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
 
@@ -41,11 +41,20 @@ const WORKING_TICK_MS = 4_000;
 
 type Send = (text: string) => Promise<void> | void;
 
-class VoiceModeController {
+export interface VoiceModeDependencies {
+  createSpeaker: (handlers: VoiceSpeakerHandlers) => Pick<VoiceSpeaker, 'speaking' | 'say' | 'stop'>;
+  createMic: (handlers: NotchVoiceHandlers, options: NotchVoiceOptions) => Pick<NotchVoice, 'startRecording' | 'cancel'>;
+}
+const defaultDependencies: VoiceModeDependencies = {
+  createSpeaker: handlers => new VoiceSpeaker(handlers),
+  createMic: (handlers, options) => new NotchVoice(handlers, options),
+};
+
+export class VoiceModeController {
   private state: VoiceModeState = { enabled: false, phase: 'off', surface: null, heard: '', error: '' };
   private listeners = new Set<() => void>();
   private send: Send | null = null;
-  private mic: NotchVoice | null = null;
+  private mic: Pick<NotchVoice, 'startRecording' | 'cancel'> | null = null;
   private heardKeys = new Map<string, string>();
   private baseline = new Set<string>();
   private baselinePending = true;
@@ -53,11 +62,22 @@ class VoiceModeController {
   private awaitingTurn = false;
   private turnFrom = 0;
   private tick: ReturnType<typeof setInterval> | null = null;
-  private readonly speaker = new VoiceSpeaker({
-    onSpeaking: () => { this.closeMic(); this.update({ phase: 'speaking' }); },
-    onIdle: () => this.afterSpeaking(),
-    onError: (message) => this.update({ error: message }),
-  });
+  private queue: VoiceUtterance[] = [];
+  private activeUtterance: VoiceUtterance | null = null;
+  private cancellingSpeech = false;
+  private readonly speaker: Pick<VoiceSpeaker, 'speaking' | 'say' | 'stop'>;
+
+  constructor(private readonly deps: VoiceModeDependencies = defaultDependencies) {
+    this.speaker = deps.createSpeaker({
+      onSpeaking: () => { this.closeMic(); this.update({ phase: 'speaking' }); },
+      onIdle: () => {
+        this.activeUtterance = null;
+        if (this.cancellingSpeech) return;
+        if (this.queue.length > 0) this.sayNext(); else this.afterSpeaking();
+      },
+      onError: message => this.update({ error: message }),
+    });
+  }
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -82,7 +102,7 @@ class VoiceModeController {
   /** The owner turns voice mode off. */
   disable(): void {
     this.closeMic();
-    this.speaker.stop();
+    this.clearSpeech();
     this.awaitingTurn = false;
     this.update({ enabled: false, phase: 'off', heard: '', error: '' });
   }
@@ -93,6 +113,7 @@ class VoiceModeController {
     this.send = send;
     if (this.state.surface === surface) return;
     this.closeMic();
+    this.clearSpeech();
     this.messages = messages;
     this.baselinePending = true;
     this.update({ surface });
@@ -104,6 +125,7 @@ class VoiceModeController {
   detach(surface: string): void {
     if (this.state.surface !== surface) return;
     this.closeMic();
+    this.clearSpeech();
     this.send = null;
     this.update({ surface: null, ...(this.speaker.speaking ? {} : { phase: this.state.enabled ? 'thinking' as const : 'off' as const }) });
   }
@@ -115,7 +137,7 @@ class VoiceModeController {
 
   /** Stop Clem mid-sentence and listen. */
   interrupt(): void {
-    if (this.state.phase === 'speaking') this.speaker.stop();
+    if (this.state.phase === 'speaking') { this.clearSpeech(); this.afterSpeaking(); }
   }
 
   /** The showing conversation changed: read aloud whatever Clem newly said. */
@@ -125,14 +147,51 @@ class VoiceModeController {
     if (!this.state.enabled) return;
     this.settleBaseline(messages);
     if (this.baselinePending) return;
+    this.queue = this.queue.filter(utterance => {
+      if (voiceUtteranceCurrent(utterance, messages)) return true;
+      this.heardKeys.delete(utterance.key);
+      return false;
+    });
+    let revokedSpeech = false;
+    if (this.activeUtterance && !voiceUtteranceCurrent(this.activeUtterance, messages)) {
+      revokedSpeech = true;
+      this.heardKeys.delete(this.activeUtterance.key);
+      this.activeUtterance = null;
+      // stop() invokes onIdle synchronously: do not reopen capture before the
+      // replacement message has been inspected and queued.
+      this.cancellingSpeech = true;
+      try { this.speaker.stop(); } finally { this.cancellingSpeech = false; }
+    }
     for (const utterance of voiceUtterances(messages, this.heardKeys, this.baseline)) {
       this.heardKeys.set(utterance.key, utterance.text);
-      this.speaker.say(utterance.text);
+      this.queue.push(utterance);
     }
+    if (this.queue.length > 0 && !this.speaker.speaking) this.sayNext();
+    else if (revokedSpeech && !this.speaker.speaking) this.afterSpeaking();
     if (this.awaitingTurn && voiceTurnEnded(messages, this.turnFrom)) {
       this.awaitingTurn = false;
       if (!this.speaker.speaking && this.state.phase === 'thinking') void this.listen();
     }
+  }
+
+  /** Keep pending text here so message withdrawal can revoke it before TTS
+   * generation; the speaker sees only the one currently eligible utterance. */
+  private sayNext(): void {
+    if (!this.state.enabled || !this.state.surface || this.speaker.speaking) return;
+    while (this.queue.length > 0) {
+      const utterance = this.queue.shift()!;
+      if (!voiceUtteranceCurrent(utterance, this.messages)) { this.heardKeys.delete(utterance.key); continue; }
+      this.activeUtterance = utterance;
+      this.speaker.say(utterance.text);
+      return;
+    }
+    this.afterSpeaking();
+  }
+
+  private clearSpeech(): void {
+    this.queue = []; this.activeUtterance = null;
+    this.cancellingSpeech = true;
+    try { this.speaker.stop(); } finally { this.cancellingSpeech = false; }
   }
 
   /** A newly shown conversation loads after it appears: its "already seen"
@@ -156,7 +215,7 @@ class VoiceModeController {
     if (!this.state.enabled || !this.state.surface) return;
     this.closeMic();
     this.update({ phase: 'listening' });
-    const mic = new NotchVoice({
+    const mic = this.deps.createMic({
       onStatus: (status, label) => {
         if (this.mic !== mic) return;
         if (status === 'recording') this.update({ phase: 'listening' });

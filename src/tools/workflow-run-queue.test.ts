@@ -29,6 +29,9 @@ const {
   requeueWorkflowFromRun,
   requeueWorkflowFailedItemsFromRun,
   queueWorkflowCreationTest,
+  queueWorkflowGoalFollowUp,
+  withWorkflowContinueOwnership,
+  workflowContinueReceiptId,
   createWorkflowChatDispatchPreparationAuthority,
   createWorkflowChatDispatchPreparedReceipt,
   createWorkflowOriginGroupCloseAuthority,
@@ -358,6 +361,75 @@ test('queueWorkflowRun: a fresh durable queued run kicks the daemon drain immedi
   const duplicate = queueWorkflowRun('audit-brief', { url: 'https://kick.example' });
   assert.equal(duplicate.status, 'duplicate');
   assert.deepEqual(kicks, [[queued.id]], 'a duplicate does not create drain churn');
+});
+
+function stoppedContinueSource(): string {
+  writeAuditWorkflow();
+  const source = queueWorkflowRun('audit-brief', { url: 'https://continue.example' });
+  assert.equal(source.status, 'queued');
+  const file = path.join(WORKFLOW_RUNS_DIR, `${source.id}.json`);
+  const record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(file, JSON.stringify({
+    ...record, status: 'cancelled', finishedAt: new Date().toISOString(),
+    mutationContractSnapshot: { version: 1, steps: {} },
+  }));
+  return source.id!;
+}
+
+test('Continue ownership: a read-only retry owns its terminal successor and refuses missing retained history', () => {
+  const sourceId = stoppedContinueSource();
+  let admissions = 0;
+  const admit = (actualRunId: string) => {
+    admissions += 1;
+    return requeueWorkflowFromRun(actualRunId, {
+      triggerReceiptId: workflowContinueReceiptId(actualRunId),
+      recoveryIntent: { kind: 'safe_rerun', sourceRunId: actualRunId, requestedFrom: 'board', reason: 'Continue' },
+    });
+  };
+  const child = withWorkflowContinueOwnership(sourceId, admit);
+  assert.equal(child.status, 'queued', child.message);
+  assert.equal(readWorkflowTriggerReceiptAcceptance(workflowContinueReceiptId(sourceId)), child.id);
+  assert.equal(withWorkflowContinueOwnership(sourceId, admit).id, child.id, 'active retry returns the same owner');
+  const childFile = path.join(WORKFLOW_RUNS_DIR, `${child.id}.json`);
+  const childRecord = JSON.parse(readFileSync(childFile, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(childFile, JSON.stringify({ ...childRecord, status: 'completed', finishedAt: new Date().toISOString() }));
+  const terminalReplay = withWorkflowContinueOwnership(sourceId, admit);
+  assert.equal(terminalReplay.status, 'duplicate', terminalReplay.message);
+  assert.equal(terminalReplay.id, child.id);
+  assert.equal(admissions, 1);
+  unlinkSync(childFile);
+  const retainedReplay = withWorkflowContinueOwnership(sourceId, admit);
+  assert.equal(retainedReplay.status, 'ambiguous', retainedReplay.message);
+  assert.equal(admissions, 1, 'a durable accepted child with pruned history never admits another effect');
+  assert.equal(existsSync(childFile), false);
+});
+
+test('Continue ownership: adopts one pre-fix goal child and refuses ambiguous sibling histories', () => {
+  const sourceId = stoppedContinueSource();
+  const legacy = queueWorkflowGoalFollowUp(sourceId, {
+    lineage: { fromRunId: sourceId, carriedSteps: [], continuedStepIds: [] },
+    goalAttempt: 0, goalFeedback: '',
+    recoveryIntent: { kind: 'safe_rerun', requestedFrom: 'board', reason: 'legacy Continue' },
+  });
+  assert.equal(legacy.status, 'queued', legacy.message);
+  const childFile = path.join(WORKFLOW_RUNS_DIR, `${legacy.id}.json`);
+  const childRecord = JSON.parse(readFileSync(childFile, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(childFile, JSON.stringify({ ...childRecord, status: 'completed', finishedAt: new Date().toISOString() }));
+  let admissions = 0;
+  const noAdmission = () => {
+    admissions += 1;
+    return { status: 'ambiguous' as const, message: 'Unexpected admission.' };
+  };
+  const adopted = withWorkflowContinueOwnership(sourceId, noAdmission);
+  assert.equal(adopted.status, 'duplicate', adopted.message);
+  assert.equal(adopted.id, legacy.id);
+  assert.equal(readWorkflowTriggerReceiptAcceptance(workflowContinueReceiptId(sourceId)), legacy.id);
+  const siblingId = 'conflicting-legacy-continue';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${siblingId}.json`), JSON.stringify({ ...childRecord, id: siblingId, status: 'error' }));
+  const conflicted = withWorkflowContinueOwnership(sourceId, noAdmission);
+  assert.equal(conflicted.status, 'ambiguous', conflicted.message);
+  assert.match(conflicted.message, /more than one continuation/);
+  assert.equal(admissions, 0);
 });
 
 test('queueCompiledWorkflowRun: requires the immutable ExecutionStore admission', () => {

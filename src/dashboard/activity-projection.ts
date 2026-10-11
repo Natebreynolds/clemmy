@@ -893,10 +893,10 @@ function projectActivitySnapshotInternal(
       : [];
     const sessions = workingNow
       ? eligibleAttempts
-          .map((attempt) => getHarnessSession(attempt.sessionId))
+          .map((attempt) => getHarnessSession(attempt.sessionId, { withoutConversationState: true }))
           .filter((session): session is SessionRow => Boolean(session))
           .filter((session) => !isBackgroundRunSession(session))
-      : listHarnessSessions({ limit: options.sessionLimit ?? 60 })
+      : listHarnessSessions({ limit: options.sessionLimit ?? 60, withoutConversationState: true })
           .filter((session) => !isBackgroundRunSession(session));
     const attempts = workingNow
       ? new Map(eligibleAttempts.map((attempt) => [attempt.sessionId, attempt]))

@@ -160,6 +160,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             return
         }
 
+        // The latest explicit destination wins across widget and Inbox taps.
+        PendingWidgetNavigationRepository.shared.clear()
         // UNUserNotificationCenter may invoke its delegate off-main. SwiftUI's
         // publisher is a wake-up optimization only, but still deliver it on the
         // main queue; the persisted envelope covers any subscriber race.

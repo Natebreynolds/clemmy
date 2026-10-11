@@ -80,6 +80,7 @@ import { modelVisibleTextSha256 } from './model-visible-text-digest.js';
 import '../../tools/callable-surface-registration.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
 import { enrichAcceptedRequestWithTaskContinuity } from './task-continuity-runtime.js';
+import { renderCancelledSuccessorReadContextForModel } from './cancelled-successor-retained-read.js';
 import {
   durableMemoryReceiptAllowsConversationOnly,
   isSafeDurableMemoryReceiptPresentation,
@@ -1359,6 +1360,8 @@ async function buildClaudeAgentBrainTurnContext(
   if (sessionHistoryEnabled()) {
     try { continuationContext = renderCrossSessionPrefixesForModel(openEventLog(), request.sessionId); } catch { continuationContext = ''; }
   }
+  continuationContext = [continuationContext,
+    renderCancelledSuccessorReadContextForModel(request.sessionId, opts?.sourceUserSeq)].filter(Boolean).join('\n\n');
   // Fan-out directive (parity with the Codex/orchestrator lane, which builds this in
   // buildAgentContextPacket). The Claude brain used to be BLIND to it — it hardcoded
   // multiItem detected=false and its rubric never mentioned run_worker — so a big same-shape
