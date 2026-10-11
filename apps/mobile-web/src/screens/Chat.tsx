@@ -945,7 +945,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       ) : null}
       <div class="chat-dock-fade" aria-hidden="true" />
       <div ref={dockRef} class="chat-dock">
-        {initialComposeMode && !voiceActive && !dictationActive && messages.length === 0 && !draft ? <p class="chat-mode-status" role="status">{initialComposeMode === 'voice' ? 'Tap Talk to Clem to begin your conversation.' : 'Tap the microphone to dictate a draft.'}</p> : null}
+        {initialComposeMode === 'dictate' && !voiceActive && !dictationActive && messages.length === 0 && !draft ? <p class="chat-mode-status" role="status">Tap the microphone to dictate a draft.</p> : null}
         {planning || executing ? <p class="chat-mode-status" role="status">{executing ? 'Executing your approved plan' : 'Plan mode · Review before execution'}</p> : null}
         <VoiceModeControl
           scope={voiceScope}
