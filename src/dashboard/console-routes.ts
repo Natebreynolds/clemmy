@@ -8453,9 +8453,11 @@ export function registerConsoleRoutes(
   app.get('/api/console/delivered', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const { listDeliveredGroups } = await import('../memory/deliverable-index.js');
+      const { deliveredGroupsForSessionQuery } = await import('../projects/session-files.js');
       const limitRaw = Number.parseInt(String(req.query.limit ?? '12'), 10);
-      res.json({ groups: listDeliveredGroups(Number.isFinite(limitRaw) ? limitRaw : 12) });
+      const result = deliveredGroupsForSessionQuery(Number.isFinite(limitRaw) ? limitRaw : 12, req.query.sessionIds);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      res.json({ groups: result.groups });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

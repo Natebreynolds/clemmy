@@ -4,17 +4,22 @@
  */
 import { useMemo, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Copy, ExternalLink, FileText, Globe, Mail, MessageCircle, RotateCw, Table2 } from 'lucide-react';
+import { ArrowLeft, Copy, ExternalLink, FileText, Globe, Mail, MessageCircle, RotateCw, Search, Table2 } from 'lucide-react';
 import { usePoll } from '@/lib/poll';
 import {
   artifactCountLabel,
   dayHeading,
+  deliveredConversationId,
+  deliveredFileRef,
   folderHref,
   groupArtifacts,
   groupKinds,
   isEmailTarget,
   isHttpTarget,
   listDelivered,
+  latestDeliveredGroups,
+  matchesDeliveredSearch,
+  matchingDeliveredFile,
   type DeliveredArtifact,
   type DeliveredGroup,
 } from '@/lib/delivered';
@@ -24,6 +29,7 @@ import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { cn } from '@/lib/cn';
+import { ArtifactWorkspace, useFileDock } from '@/components/artifacts/ArtifactWorkspace';
 
 const FILTERS = [
   { id: 'all', label: 'All' },
@@ -53,16 +59,6 @@ function ArtifactGlyph({ artifact }: { artifact: DeliveredArtifact }) {
   return <Icon className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden />;
 }
 
-function openArtifact(artifact: DeliveredArtifact) {
-  if (isHttpTarget(artifact.target)) {
-    window.open(artifact.target, '_blank', 'noopener,noreferrer');
-    return;
-  }
-  if (artifact.kind === 'file' && artifact.openable) {
-    void navigator.clipboard?.writeText(artifact.target);
-  }
-}
-
 function askClem(group: DeliveredGroup) {
   const pointer = group.filePath ?? group.url ?? group.title;
   return `/chat?prompt=${encodeURIComponent(`About "${group.title}" you delivered (${pointer}): `)}`;
@@ -75,52 +71,64 @@ function runAgain(group: DeliveredGroup) {
   )}`;
 }
 
-function FolderRow({ group }: { group: DeliveredGroup }) {
+function FolderRow({ group, query = '' }: { group: DeliveredGroup; query?: string }) {
+  const dock = useFileDock();
+  const latestFile = matchingDeliveredFile(group, query);
+  const fileRef = latestFile ? deliveredFileRef(latestFile) : null;
   return (
-    <Link
-      to={folderHref(group)}
-      className="flex items-center gap-3 border-t border-border px-4 py-3 transition-colors first:border-t-0 hover:bg-hover"
-    >
-      <span className="min-w-0 flex-1 truncate text-body font-medium text-fg" title={group.title}>{group.title}</span>
-      <span className="shrink-0 text-body text-muted">{artifactCountLabel(group)}</span>
-    </Link>
+    <div className="flex items-center gap-2 border-t border-border first:border-t-0">
+      <Link to={folderHref(group)} className="min-w-0 flex-1 px-4 py-3 transition-colors hover:bg-hover">
+        <span className="block truncate text-body font-medium text-fg" title={group.title}>{group.title}</span>
+        <span className="block truncate text-caption text-muted">{artifactCountLabel(group)}{latestFile ? ` · ${latestFile.fileRef?.name ?? latestFile.title}` : ''}</span>
+      </Link>
+      {fileRef && dock ? <button type="button" className="mr-2 inline-flex min-h-9 shrink-0 items-center gap-1 rounded-md px-2 text-small font-medium text-primary hover:bg-primary-tint" aria-label={`Open ${fileRef.name}`} onClick={() => dock.open({ kind: 'file', ref: fileRef, conversationSessionId: deliveredConversationId(group, latestFile) ?? undefined })}>Open</button> : null}
+    </div>
   );
 }
 
 export function MadeArchive() {
+  return <ArtifactWorkspace scopeKey="made:archive" returnLabel="Made"><MadeArchiveContent /></ArtifactWorkspace>;
+}
+
+function MadeArchiveContent() {
   const delivered = usePoll(['delivered-archive'], () => listDelivered(50), 30_000);
   const [filter, setFilter] = useState<FilterId>('all');
+  const [search, setSearch] = useState('');
   const groups = useMemo(
-    () => (delivered.data ?? []).filter((g) => matchesFilter(g, filter)),
-    [delivered.data, filter],
+    () => latestDeliveredGroups(delivered.data ?? []).filter((g) => matchesFilter(g, filter) && matchesDeliveredSearch(g, search)),
+    [delivered.data, filter, search],
   );
+  const recent = !search.trim() && filter === 'all' ? groups.slice(0, 3) : [];
   const sections = useMemo(() => {
     const byDay = new Map<string, DeliveredGroup[]>();
-    for (const group of groups) {
+    for (const group of groups.slice(recent.length)) {
       const heading = dayHeading(group.createdAt) || 'Earlier';
       const list = byDay.get(heading) ?? [];
       list.push(group);
       byDay.set(heading, list);
     }
     return [...byDay.entries()];
-  }, [groups]);
+  }, [groups, recent.length]);
 
   return (
     <div className="mx-auto flex w-full max-w-[760px] flex-col gap-5 px-5 py-6 animate-fade-in sm:px-10">
       <div>
         <h1 className="text-h1 text-fg">Made</h1>
-        <p className="mt-1 text-body text-muted">Finished work, by when it was made. Open a folder to see the drafts and files.</p>
+        <p className="mt-1 text-body text-muted">Pick up a finished file, or open a folder to see everything from that work.</p>
       </div>
-      <div className="flex flex-wrap gap-1.5" role="tablist" aria-label="Filter made work">
+      <label className="flex min-h-10 items-center gap-2 rounded-md border border-border bg-surface px-3 text-muted">
+        <Search className="h-4 w-4 shrink-0" aria-hidden />
+        <input type="search" value={search} onChange={event => setSearch(event.target.value)} aria-label="Search Made by title or filename" placeholder="Search titles and filenames" className="min-w-0 flex-1 bg-transparent py-2 text-body text-fg placeholder:text-muted" />
+      </label>
+      <div className="flex flex-wrap gap-1.5" role="group" aria-label="Filter made work">
         {FILTERS.map((f) => (
           <button
             key={f.id}
             type="button"
-            role="tab"
-            aria-selected={filter === f.id}
+            aria-pressed={filter === f.id}
             onClick={() => setFilter(f.id)}
             className={cn(
-              'rounded-full px-3 py-1 text-small font-medium transition-colors cursor-pointer',
+              'min-h-9 rounded-full px-3 py-1 text-small font-medium transition-colors cursor-pointer',
               filter === f.id ? 'bg-primary text-primary-fg' : 'bg-subtle text-muted hover:text-fg',
             )}
           >
@@ -136,17 +144,20 @@ export function MadeArchive() {
           description="Clementine couldn’t load the archive, so this is not an empty one. Nothing you made has been lost."
           onRetry={() => { void delivered.refetch(); }}
         />
-      ) : sections.length === 0 ? (
-        <p className="text-body text-muted">Nothing made yet — drafts, files, and sheets land here when Clem finishes them.</p>
+      ) : groups.length === 0 ? (
+        <p className="text-body text-muted">{search.trim() || filter !== 'all' ? 'No finished work matches. Try another title, filename, or filter.' : 'Nothing made yet — drafts, files, and sheets land here when Clem finishes them.'}</p>
       ) : (
-        sections.map(([heading, rows]) => (
+        <>
+        {recent.length > 0 ? <section className="flex flex-col gap-2"><h2 className="text-body font-semibold text-fg">Recent work</h2><div className="overflow-hidden rounded-lg border border-border bg-surface">{recent.map(group => <FolderRow key={group.id} group={group} />)}</div></section> : null}
+        {sections.map(([heading, rows]) => (
           <section key={heading} className="flex flex-col gap-2">
             <h2 className="text-caption font-semibold uppercase tracking-wide text-faint">{heading}</h2>
             <div className="overflow-hidden rounded-lg border border-border bg-surface">
-              {rows.map((group) => <FolderRow key={group.id} group={group} />)}
+              {rows.map((group) => <FolderRow key={group.id} group={group} query={search} />)}
             </div>
           </section>
-        ))
+        ))}
+        </>
       )}
     </div>
   );
@@ -154,15 +165,25 @@ export function MadeArchive() {
 
 export function MadeFolder() {
   const { groupId } = useParams();
+  return <ArtifactWorkspace scopeKey={`made:${groupId ?? 'unknown'}`} returnLabel="Made"><MadeFolderContent groupId={groupId} /></ArtifactWorkspace>;
+}
+
+function MadeFolderContent({ groupId }: { groupId?: string }) {
   const navigate = useNavigate();
+  const dock = useFileDock();
   const delivered = usePoll(['delivered-archive'], () => listDelivered(50), 30_000);
   const group = (delivered.data ?? []).find((g) => String(g.id) === groupId);
   const [copied, setCopied] = useState<string | null>(null);
+  const [copyProblem, setCopyProblem] = useState('');
 
-  const copyPath = (target: string) => {
-    void navigator.clipboard?.writeText(target);
-    setCopied(target);
-    window.setTimeout(() => setCopied((cur) => (cur === target ? null : cur)), 1500);
+  const copyPath = async (target: string) => {
+    setCopyProblem('');
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(target);
+      setCopied(target);
+      window.setTimeout(() => setCopied((cur) => (cur === target ? null : cur)), 1500);
+    } catch { setCopyProblem('This location could not be copied. Open the conversation to find the original.'); }
   };
 
   if (delivered.isLoading) {
@@ -173,16 +194,20 @@ export function MadeFolder() {
       </div>
     );
   }
+  if (delivered.isError && !delivered.data) {
+    return <div className="mx-auto w-full max-w-[760px] px-5 py-6 sm:px-10"><QueryUnavailable title="This work could not be loaded" description="Try loading the archive again." onRetry={() => { void delivered.refetch(); }} /></div>;
+  }
   if (!group) {
     return (
       <div className="mx-auto w-full max-w-[760px] px-5 py-6 sm:px-10">
-        <p className="text-body text-muted">That work is no longer in the archive.</p>
+        <p className="text-body text-muted">That work isn’t in the latest archive entries.</p>
         <Link to="/made" className="mt-3 inline-block text-small font-semibold text-primary hover:underline">All made</Link>
       </div>
     );
   }
 
-  const chatHref = group.sessionId ? `/chat/${encodeURIComponent(unifiedChatSessionId(group.sessionId))}` : null;
+  const conversationId = deliveredConversationId(group);
+  const chatHref = conversationId ? `/chat/${encodeURIComponent(unifiedChatSessionId(conversationId))}` : null;
   const artifacts = groupArtifacts(group);
 
   return (
@@ -219,27 +244,28 @@ export function MadeFolder() {
           const http = isHttpTarget(artifact.target);
           const email = isEmailTarget(artifact.target);
           const fileGone = artifact.kind === 'file' && artifact.stillExists === false;
+          const fileRef = deliveredFileRef(artifact);
           return (
-            <div key={artifact.target} className="flex items-center gap-3 border-t border-border px-4 py-3 first:border-t-0">
+            <div key={artifact.target} className="flex flex-wrap items-center gap-3 border-t border-border px-4 py-3 first:border-t-0">
               <ArtifactGlyph artifact={artifact} />
-              <span className="min-w-0 flex-1 truncate text-body text-fg" title={artifact.target}>{artifact.title}</span>
-              {fileGone && <StatusPill tone="warning">file moved</StatusPill>}
-              {http && artifact.openable ? (
+              <span className="min-w-0 flex-1 text-body text-fg"><span className="block truncate" title={artifact.target}>{artifact.title}</span>{artifact.kind === 'file' && (!fileRef || fileRef.name !== artifact.title.trim()) ? <span className="block truncate text-caption text-muted">{fileRef?.name ?? (fileGone ? 'File moved or unavailable' : chatHref ? 'Open the conversation for the original file' : 'A preview is unavailable for this entry')}</span> : null}</span>
+              {fileGone && <StatusPill tone="warning">unavailable</StatusPill>}
+              {fileRef && dock ? <button type="button" onClick={() => dock.open({ kind: 'file', ref: fileRef, conversationSessionId: deliveredConversationId(group, artifact) ?? undefined })} aria-label={`Open ${fileRef.name}`} className="inline-flex min-h-9 items-center gap-1 rounded-md px-2 text-small font-medium text-primary hover:bg-primary-tint"><FileText className="h-3.5 w-3.5" aria-hidden /> Open</button> : http && artifact.openable ? (
                 <button
                   type="button"
-                  onClick={() => openArtifact(artifact)}
-                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-primary hover:bg-primary-tint cursor-pointer"
+                  onClick={() => window.open(artifact.target, '_blank', 'noopener,noreferrer')}
+                  className="inline-flex min-h-9 items-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-primary hover:bg-primary-tint cursor-pointer"
                 >
                   <ExternalLink className="h-3.5 w-3.5" aria-hidden /> Open
                 </button>
               ) : artifact.target ? (
                 <button
                   type="button"
-                  onClick={() => copyPath(artifact.target)}
-                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-primary hover:bg-primary-tint cursor-pointer"
+                  onClick={() => void copyPath(artifact.target)}
+                  className="inline-flex min-h-9 items-center gap-1 rounded-md px-2 py-1 text-caption font-medium text-primary hover:bg-primary-tint cursor-pointer"
                   title={artifact.target}
                 >
-                  <Copy className="h-3.5 w-3.5" aria-hidden /> {copied === artifact.target ? 'Copied' : email ? 'Copy address' : 'Copy path'}
+                  <Copy className="h-3.5 w-3.5" aria-hidden /> {copied === artifact.target ? 'Copied' : email ? 'Copy address' : http ? 'Copy link' : 'Copy path'}
                 </button>
               ) : (
                 <span className="text-caption text-faint">No link</span>
@@ -248,6 +274,7 @@ export function MadeFolder() {
           );
         })}
       </div>
+      {copyProblem ? <p role="alert" className="text-small text-muted">{copyProblem}</p> : null}
 
       <div className="flex flex-wrap gap-2">
         <Button variant="secondary" size="sm" onClick={() => navigate(askClem(group))}>

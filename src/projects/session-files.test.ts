@@ -134,6 +134,62 @@ test('files saved in a branch of the conversation and by its workers are its own
   assert.deepEqual(files.listSessionFiles(root).map(file => file.name).sort(), ['branch-note.md', 'worker-note.csv']);
 });
 
+test('project results include exact conversations and their recorded workers, never sibling projects or guessed names', () => {
+  const origin = chat({ projectId: 'project-results-a' });
+  const sibling = chat({ channelId: origin, projectId: 'project-results-b' });
+  const worker = events.createSession({ id: 'result-worker', kind: 'agent',
+    metadata: { source: 'delegated_worker', workerScope: true, parentSessionId: origin } }).id;
+  const nested = events.createSession({ id: 'result-worker-nested', kind: 'agent',
+    metadata: { source: 'delegated_worker', workerScope: true, parentSessionId: worker } }).id;
+  const unrelated = chat();
+  for (const [parent, child] of [[origin, worker], [worker, nested], [nested, worker]]) {
+    events.appendEvent({ sessionId: parent!, turn: 0, role: 'system', type: 'worker_started', data: { childSessionId: child } });
+  }
+  events.appendEvent({ sessionId: origin, turn: 0, role: 'assistant', type: 'worker_started', data: { childSessionId: unrelated } });
+  for (const session of [origin, sibling, worker, nested, unrelated]) {
+    saved(write(`project-results/${session}/report.html`, `<p>${session}</p>`), session);
+  }
+  const result = files.deliveredGroupsForSessionQuery(50, origin);
+  assert.ok(result.ok);
+  assert.deepEqual(result.groups.map(group => group.sessionId).sort(), [origin, worker, nested].sort());
+  assert.ok(result.groups.every(group => group.conversationSessionId === origin));
+  for (const artifact of result.groups.flatMap(group => group.artifacts)) {
+    const ref = artifact.fileRef;
+    assert.ok(ref);
+    assert.equal(artifact.conversationSessionId, origin);
+    const opened = files.readSessionFile(ref.sessionId, ref.name, ref.folder, ref.fileId);
+    assert.ok(opened.ok);
+    assert.equal(opened.view.text, `<p>${ref.sessionId}</p>`);
+  }
+  const empty = files.deliveredGroupsForSessionQuery(50, 'no-recorded-project-conversation');
+  assert.deepEqual(empty, { ok: true, groups: [] });
+});
+
+test('delivered scope rejects unbounded, malformed or explicitly empty queries without global fallback', () => {
+  for (const invalid of ['', 'a,,b', ['a', 'b'], { id: 'a' }, 'a'.repeat(161), 'a'.repeat(8001), 'a\u0000b',
+    Array.from({ length: 51 }, (_, i) => `scope-${i}`).join(',')]) {
+    assert.deepEqual(files.deliveredGroupsForSessionQuery(50, invalid), { ok: false, error: 'invalid_session_ids' });
+  }
+});
+
+test('source links require a known conversation or unambiguous recorded worker ancestry', () => {
+  const origin = chat(); const other = chat();
+  const legacy = events.createSession({ id: 'legacy-result-worker', kind: 'agent' }).id;
+  const ambiguous = events.createSession({ id: 'ambiguous-result-worker', kind: 'agent' }).id;
+  const orphan = 'durable-result-owner-without-session-history';
+  for (const [parent, child] of [[origin, legacy], [origin, ambiguous], [other, ambiguous]]) {
+    events.appendEvent({ sessionId: parent!, turn: 0, role: 'system', type: 'worker_started', data: { childSessionId: child } });
+  }
+  for (const session of [legacy, ambiguous, orphan]) saved(write(`source-links/${session}/brief.pdf`, '%PDF-1.7\n'), session);
+  const result = files.deliveredGroupsForSessionQuery(50, [legacy, ambiguous, orphan].join(','));
+  assert.ok(result.ok);
+  for (const group of result.groups) {
+    assert.equal(group.conversationSessionId, group.sessionId === legacy ? origin : null);
+    assert.ok(group.artifacts[0]?.fileRef, 'durable file access does not require surviving session telemetry');
+    assert.equal(group.artifacts[0]?.conversationSessionId, group.conversationSessionId);
+  }
+});
+
 test('large text is cut for the panel, binary text is a file, pictures come as pictures', async () => {
   const session = chat();
   saved(write('big/log/run.log', 'x'.repeat(files.LARGEST_SHOWN_TEXT_BYTES + 10)), session);

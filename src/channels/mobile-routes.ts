@@ -5367,9 +5367,11 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // no execution authority lives here.
   router.get('/api/delivered', requireMobileSession, async (_req, res) => {
     try {
-      const { listDeliveredGroups } = await import('../memory/deliverable-index.js');
+      const { deliveredGroupsForSessionQuery } = await import('../projects/session-files.js');
       const limitRaw = Number.parseInt(String(_req.query.limit ?? '24'), 10);
-      res.json({ groups: listDeliveredGroups(Number.isFinite(limitRaw) ? limitRaw : 24) });
+      const result = deliveredGroupsForSessionQuery(Number.isFinite(limitRaw) ? limitRaw : 24, _req.query.sessionIds);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      res.json({ groups: result.groups });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

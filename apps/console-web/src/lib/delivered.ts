@@ -1,4 +1,5 @@
 import { apiGet } from './api';
+import type { SessionFileRef } from './session-files';
 
 /** One file, draft, or URL inside a piece of finished work. */
 export interface DeliveredArtifact {
@@ -8,6 +9,9 @@ export interface DeliveredArtifact {
   createdAt: string;
   openable: boolean;
   stillExists?: boolean;
+  /** Server-resolved identity; never infer this from target. */
+  fileRef?: SessionFileRef;
+  conversationSessionId?: string | null;
 }
 
 /** A piece of FINISHED WORK from the durable deliverable index — grouped
@@ -21,6 +25,8 @@ export interface DeliveredGroup {
   why: string;
   lane: string | null;
   sessionId: string | null;
+  /** Verified chat origin. Null means no safe conversation link is known. */
+  conversationSessionId?: string | null;
   url?: string;
   filePath?: string;
   fileStillExists?: boolean;
@@ -29,8 +35,53 @@ export interface DeliveredGroup {
   artifacts?: DeliveredArtifact[];
 }
 
-export const listDelivered = (limit = 12) =>
-  apiGet<{ groups: DeliveredGroup[] }>(`/api/console/delivered?limit=${limit}`).then((r) => r.groups);
+export function listDelivered(limit = 12, options?: { sessionIds?: readonly string[] }): Promise<DeliveredGroup[]> {
+  if (options?.sessionIds && options.sessionIds.length === 0) return Promise.resolve([]);
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (options?.sessionIds) query.set('sessionIds', options.sessionIds.join(','));
+  return apiGet<{ groups: DeliveredGroup[] }>(`/api/console/delivered?${query}`).then((r) => r.groups);
+}
+
+/** A local preview needs the server's association with the producing session. */
+export function deliveredFileRef(artifact: DeliveredArtifact): SessionFileRef | null {
+  const ref = artifact.fileRef;
+  return artifact.kind === 'file' && artifact.stillExists !== false && ref
+    && typeof ref.sessionId === 'string' && ref.sessionId.length > 0
+    && typeof ref.name === 'string' && ref.name.length > 0
+    && typeof ref.folder === 'string'
+    && typeof ref.fileId === 'string' && ref.fileId.length > 0 ? ref : null;
+}
+
+export function deliveredConversationId(group: DeliveredGroup, artifact?: DeliveredArtifact): string | null {
+  if (artifact?.conversationSessionId !== undefined) return artifact.conversationSessionId;
+  return group.conversationSessionId !== undefined ? group.conversationSessionId : group.sessionId;
+}
+
+export function latestDeliveredGroups(groups: readonly DeliveredGroup[]): DeliveredGroup[] {
+  const time = (group: DeliveredGroup) => Date.parse(group.createdAt) || 0;
+  return [...groups].sort((a, b) => time(b) - time(a) || b.id - a.id);
+}
+
+export function matchesDeliveredSearch(group: DeliveredGroup, query: string): boolean {
+  const words = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  const text = [group.title, ...groupArtifacts(group).flatMap(artifact => [
+    artifact.title, artifact.fileRef?.name ?? '', artifact.target.split(/[\\/]/).at(-1) ?? '',
+  ])].join(' ').toLocaleLowerCase();
+  return words.every(word => text.includes(word));
+}
+
+/** A folder match can span several artifacts; its direct Open must identify one. */
+export function matchingDeliveredFile(group: DeliveredGroup, query = ''): DeliveredArtifact | undefined {
+  const words = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  return [...groupArtifacts(group)]
+    .sort((a, b) => (Date.parse(b.createdAt) || 0) - (Date.parse(a.createdAt) || 0))
+    .find(artifact => {
+      const ref = deliveredFileRef(artifact);
+      if (!ref) return false;
+      const text = `${group.title} ${artifact.title} ${ref.name}`.toLocaleLowerCase();
+      return words.every(word => text.includes(word));
+    });
+}
 
 export function folderHref(group: Pick<DeliveredGroup, 'id'>): string {
   return `/made/${group.id}`;

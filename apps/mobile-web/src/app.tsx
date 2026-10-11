@@ -930,6 +930,7 @@ export function App() {
               onOpenChat={goToChat}
               onOpenRun={openRun}
               onOpenAgent={(id) => navigateTo('agents', { agentId: id })}
+              onOpenSpace={openWorkspace}
               onOpenNeedsYou={() => navigateTo('inbox')}
               onDecided={() => recountNeedsYou.current()}
               createRequest={createRequest}

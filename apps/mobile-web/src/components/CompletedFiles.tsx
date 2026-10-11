@@ -4,7 +4,7 @@ import { Sheet } from './Sheet';
 import { inNativeShell } from '../lib/native-bridge';
 import {
   fileKindWords, filePreviewHtml, fileSizeWords, listSessionFiles,
-  readSessionFile, readSessionFileContent, sessionFileProblem, type SessionFile,
+  readSessionFile, readSessionFileContent, sessionFileProblem, type SessionFile, type SessionFileRef,
 } from '../lib/session-files';
 
 const FileIcon = () => <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z" /><path d="M14 3v6h6M8 13h8M8 17h5" /></svg>;
@@ -94,7 +94,26 @@ function ConversationFiles({ sessionId }: { sessionId: string }) {
   );
 }
 
-function FilePreview({ sessionId, initialFile, onBack }: { sessionId: string; initialFile: SessionFile; onBack: () => void }) {
+/** A recorded result opens through the same reader used by a conversation. */
+export function SavedFileSheet({ fileRef, onClose, returnLabel = 'Results' }: {
+  fileRef: SessionFileRef | null;
+  onClose: () => void;
+  returnLabel?: string;
+}) {
+  return <Sheet open={Boolean(fileRef)} onClose={onClose} title="File" backGesture class="chat-files-sheet sheet-tall"
+    aside={<button type="button" class="chat-file-action" onClick={onClose}>Done</button>}>
+    {fileRef ? <FilePreview key={`${fileRef.sessionId}:${fileRef.fileId}`} sessionId={fileRef.sessionId} initialFile={fileRef} onBack={onClose} backLabel={returnLabel} autoFocusBack={false} /> : null}
+  </Sheet>;
+}
+
+function FilePreview({ sessionId, initialFile, onBack, backLabel = 'All files', autoFocusBack = true }: {
+  sessionId: string;
+  initialFile: Pick<SessionFile, 'fileId' | 'name' | 'folder'>;
+  onBack: () => void;
+  backLabel?: string;
+  /** A newly opened Sheet captures the opener before moving focus itself. */
+  autoFocusBack?: boolean;
+}) {
   const nativeArtifactFiles = !inNativeShell() || window.clemArtifactFiles === true;
   const [file, setFile] = useState<SessionFile | null>(null);
   const [objectUrl, setObjectUrl] = useState('');
@@ -107,12 +126,12 @@ function FilePreview({ sessionId, initialFile, onBack }: { sessionId: string; in
   const downloadUrls = useRef<string[]>([]);
 
   useEffect(() => {
-    back.current?.focus();
+    if (autoFocusBack) back.current?.focus();
     return () => {
       downloadRequest.current?.abort();
       downloadUrls.current.forEach(url => URL.revokeObjectURL(url));
     };
-  }, []);
+  }, [autoFocusBack]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -165,11 +184,11 @@ function FilePreview({ sessionId, initialFile, onBack }: { sessionId: string; in
       <div class="chat-file-toolbar">
         <button ref={back} type="button" class="chat-file-action" onClick={onBack}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
-          All files
+          {backLabel}
         </button>
         <button type="button" class="chat-file-action" disabled={downloading || !nativeArtifactFiles} onClick={() => { void download(); }}>{downloading ? 'Downloading…' : 'Download'}</button>
       </div>
-      <div class="chat-file-heading"><h3>{initialFile.name}</h3><p>{fileKindWords(initialFile.kind)} · {fileSizeWords(initialFile.bytes)}</p></div>
+      <div class="chat-file-heading"><h3>{initialFile.name}</h3>{file ? <p>{fileKindWords(file.kind)} · {fileSizeWords(file.bytes)}</p> : null}</div>
       {!nativeArtifactFiles ? <p class="chat-file-notice">Update the Clem iPhone app to preview PDFs and HTML files or save files to your phone. You can also open them on your computer.</p> : null}
       {downloadProblem ? <p class="chat-file-notice" role="alert">{downloadProblem}</p> : null}
       {problem ? <div class="chat-file-notice" role="alert"><p>{problem}</p><button type="button" class="chat-file-action" onClick={() => setRefresh(value => value + 1)}>Try again</button></div> : null}
