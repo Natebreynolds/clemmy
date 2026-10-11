@@ -45,22 +45,36 @@ export function contractFieldLimits(spec: Record<string, unknown> | undefined): 
 /** Keywords whose meaning a one-line field summary cannot carry. */
 const STRUCTURAL_KEYWORDS = ['$ref', 'anyOf', 'oneOf', 'allOf', 'not', 'if', 'then', 'else', 'patternProperties',
   'dependentSchemas', 'dependentRequired', 'dependencies', 'propertyNames', 'prefixItems', 'contains',
-  'minProperties', 'maxProperties'] as const;
+  'unevaluatedProperties', 'unevaluatedItems'] as const;
 
 const MAX_DEPTH = 2;
 
 type Spec = Record<string, unknown>;
 
 const asSpec = (value: unknown): Spec => (value && typeof value === 'object' && !Array.isArray(value) ? value as Spec : {});
+const hasStructure = (spec: Spec) => STRUCTURAL_KEYWORDS.some((key) => spec[key] !== undefined);
 
 function propertiesOf(spec: Spec): Record<string, Spec> | null {
   return spec.properties && typeof spec.properties === 'object' && !Array.isArray(spec.properties)
     ? spec.properties as Record<string, Spec> : null;
 }
 
-function typeList(spec: Spec): string[] {
-  if (Array.isArray(spec.type)) return spec.type.filter((entry): entry is string => typeof entry === 'string');
-  return typeof spec.type === 'string' ? [spec.type] : [];
+/** Declared types without null; inferred from `items` or `properties` when a
+ *  schema leaves `type` out. */
+function baseTypes(spec: Spec): string[] {
+  const declared = Array.isArray(spec.type)
+    ? spec.type.filter((entry): entry is string => typeof entry === 'string')
+    : typeof spec.type === 'string' ? [spec.type] : [];
+  const base = declared.filter((type) => type !== 'null');
+  if (base.length > 0) return base;
+  if (spec.items !== undefined) return ['array'];
+  if (propertiesOf(spec) || spec.additionalProperties !== undefined) return ['object'];
+  return [];
+}
+
+function isNullable(spec: Spec): boolean {
+  return (Array.isArray(spec.type) && spec.type.includes('null')) || spec.nullable === true
+    || (Array.isArray(spec.enum) && spec.enum.includes(null));
 }
 
 /** The first sentence of a description, at most `max` characters. */
@@ -71,10 +85,71 @@ function shortDescription(value: unknown, max: number): string {
   return sentence.length > max ? `${sentence.slice(0, max - 1).trimEnd()}…` : sentence;
 }
 
+/** Object-level rules a line can state: no other fields, field counts. */
+function objectRules(spec: Spec, hasFields: boolean): string[] {
+  const rules: string[] = [];
+  if (spec.additionalProperties === false) rules.push(hasFields ? 'no other fields' : 'must be empty');
+  const number = (key: string) => (typeof spec[key] === 'number' ? spec[key] as number : undefined);
+  if (number('minProperties') !== undefined) rules.push(`at least ${number('minProperties')} fields`);
+  if (number('maxProperties') !== undefined) rules.push(`at most ${number('maxProperties')} fields`);
+  return rules;
+}
+
 interface Walk {
   lines: string[];
   complete: boolean;
   count: number;
+}
+
+/** A value in words ("array of string", "object"), its limits and the rules
+ *  each element or entry must meet, and the object whose fields go on the
+ *  lines under it. */
+interface Value {
+  words: string;
+  limits: string[];
+  nested: Spec | null;
+}
+
+/** "each [one of: "a", "b"; up to 20 characters]" for an element's limits. */
+const bracket = (label: string, limits: string[]) => (limits.length ? `${label} [${limits.join('; ')}]` : '');
+
+/**
+ * What a value must be. Marks the walk incomplete for any shape a line cannot
+ * state; `layers` bounds arrays of arrays and map values.
+ */
+function describeValue(spec: Spec, walk: Walk, layers = 0): Value {
+  if (hasStructure(spec)) walk.complete = false;
+  const base = baseTypes(spec);
+  const limits = [contractFieldLimits(spec)].filter(Boolean);
+  if (layers > 3) { walk.complete = false; return { words: base.join(' or ') || 'any', limits, nested: null }; }
+  if (base.includes('array')) {
+    const items = asSpec(spec.items);
+    if (spec.items === undefined || Object.keys(items).length === 0) return { words: 'array', limits, nested: null };
+    const item = describeValue(items, walk, layers + 1);
+    const each = [...item.limits, ...(isNullable(items) ? ['may be null'] : [])];
+    const withEach = [...limits, bracket('each', each)].filter(Boolean);
+    if (item.words === 'object') return { words: 'array of objects', limits: withEach, nested: item.nested };
+    // Objects inside an array of arrays: their fields are not rendered.
+    if (item.nested) walk.complete = false;
+    return { words: `array of ${item.words}`, limits: withEach, nested: null };
+  }
+  if (base.includes('object')) {
+    const fields = propertiesOf(spec);
+    const rules = objectRules(spec, Boolean(fields));
+    const extra = spec.additionalProperties;
+    if (extra && typeof extra === 'object' && !Array.isArray(extra)) {
+      // Keys beyond the declared fields, each holding a value of this shape.
+      const value = describeValue(asSpec(extra), walk, layers + 1);
+      if (value.nested) walk.complete = false;
+      const valueWords = `each value ${value.words}${value.limits.length ? ` [${value.limits.join('; ')}]` : ''}`;
+      rules.unshift(fields ? `other keys allowed, ${valueWords}` : `any keys, ${valueWords}`);
+    } else if (!fields && extra !== false) {
+      // No declared fields and no value shape: the contract does not say.
+      walk.complete = false;
+    }
+    return { words: 'object', limits: [...limits, ...rules], nested: fields ? spec : null };
+  }
+  return { words: base.length ? base.join(' or ') : 'any', limits, nested: null };
 }
 
 function walkFields(properties: Record<string, Spec>, required: Set<string>, indent: string, depth: number,
@@ -83,43 +158,28 @@ function walkFields(properties: Record<string, Spec>, required: Set<string>, ind
     if (walk.count >= opts.maxFields) { walk.complete = false; return; }
     walk.count += 1;
     const field = asSpec(raw);
-    if (STRUCTURAL_KEYWORDS.some((key) => field[key] !== undefined)) walk.complete = false;
-    const types = typeList(field);
-    const nullable = types.includes('null') || field.nullable === true;
-    const base = types.filter((type) => type !== 'null');
-    const items = asSpec(field.items);
-    if (base.includes('array') && STRUCTURAL_KEYWORDS.some((key) => items[key] !== undefined)) walk.complete = false;
-    const nestedObject = base.includes('object') ? propertiesOf(field) : null;
-    const nestedItems = base.includes('array') ? propertiesOf(items) : null;
-    const itemTypes = typeList(items).filter((type) => type !== 'null');
-    const typeText = base.includes('array')
-      ? nestedItems ? 'array of objects' : itemTypes.length ? `array of ${itemTypes.join(' or ')}` : 'array'
-      : base.length ? base.join(' or ') : 'any';
-    const qualifiers = [contractFieldLimits(field),
+    const { words, limits, nested } = describeValue(field, walk);
+    const qualifiers = [...limits,
       field.default !== undefined && field.default !== null ? `default ${JSON.stringify(field.default)}` : '']
       .filter(Boolean).join('; ');
     const description = shortDescription(field.description, opts.descriptionChars);
-    walk.lines.push(`${indent}${name}${required.has(name) ? '*' : ''}: ${typeText}${nullable ? ' or null' : ''}`
+    walk.lines.push(`${indent}${name}${required.has(name) ? '*' : ''}: ${words}${isNullable(field) ? ' or null' : ''}`
       + `${qualifiers ? ` (${qualifiers})` : ''}${description ? ` — ${description}` : ''}`);
-    const nested = nestedObject ?? nestedItems;
     if (nested) {
       if (depth >= MAX_DEPTH) { walk.complete = false; continue; }
-      const nestedSpec = nestedObject ? field : items;
-      const nestedRequired = new Set(Array.isArray(nestedSpec.required) ? nestedSpec.required as string[] : []);
-      walkFields(nested, nestedRequired, `${indent}  `, depth + 1, walk, opts);
-    } else if ((base.includes('object') && field.additionalProperties !== undefined && field.additionalProperties !== true)
-      || (base.includes('array') && itemTypes.includes('object'))) {
-      // An object whose shape is declared some other way than its properties.
-      walk.complete = false;
+      const nestedRequired = new Set(Array.isArray(nested.required) ? nested.required as string[] : []);
+      walkFields(propertiesOf(nested)!, nestedRequired, `${indent}  `, depth + 1, walk, opts);
     }
   }
 }
 
 /**
  * One line per field, nested fields indented under their parent:
- * `name*: type or null (limits; default x) — what it is`. No field is cut to
- * fit; only descriptions are shortened. `complete` is false when the schema
- * holds structure these lines cannot state.
+ * `name*: type or null (limits; default x) — what it is`, with what each
+ * array element or map value must be and the object's own rules ("no other
+ * fields"). No field is cut to fit; only descriptions are shortened.
+ * `complete` is false when the schema holds structure these lines cannot
+ * state.
  */
 export function compactContract(
   schema: unknown,
@@ -128,8 +188,12 @@ export function compactContract(
   const root = asSpec(schema);
   const properties = propertiesOf(root);
   if (!properties) return { lines: [], complete: false };
-  const walk: Walk = { lines: [], complete: !STRUCTURAL_KEYWORDS.some((key) => root[key] !== undefined), count: 0 };
+  const walk: Walk = { lines: [], complete: !hasStructure(root), count: 0 };
   const required = new Set(Array.isArray(root.required) ? root.required as string[] : []);
   walkFields(properties, required, '', 1, walk, { maxFields: opts.maxFields ?? 40, descriptionChars: opts.descriptionChars ?? 80 });
+  // The top level's own rules ("no other fields") on a closing line.
+  const top = describeValue({ ...root, properties: {} }, walk);
+  const rules = top.limits;
+  if (rules.length > 0) walk.lines.push(`(top level: ${rules.join('; ')})`);
   return { lines: walk.lines, complete: walk.complete };
 }
