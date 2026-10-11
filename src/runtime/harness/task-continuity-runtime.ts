@@ -2,8 +2,10 @@ import { createHash } from 'node:crypto';
 import { clarificationReferenceDigest, renderClarificationUnavailable,
   type ClarificationUnavailableAnnotationV1 } from './clarification-public-annotation.js';
 import {
+  CUSTOMIZATION_SLOT_KEY,
   consumeTaskContinuityPacket,
   createTaskContinuityPacket,
+  customizationQuestionId,
   dismissTaskContinuityPacket,
   peekTaskContinuityPacket,
   readConsumedTaskContinuityPacket,
@@ -1082,13 +1084,15 @@ export function persistCommittedClarificationContinuity(input: {
             : {
                 goalId: inheritedSlot.goalId,
                 revision: inheritedSlot.revision,
-                questionId: `question:${source.seq}:customize`,
-                slotKey: 'strategy-customization',
+                questionId: customizationQuestionId(source.seq),
+                slotKey: CUSTOMIZATION_SLOT_KEY,
                 ...(inheritedSlot.predecessorRefs
                   ? { predecessorRefs: [...inheritedSlot.predecessorRefs] }
                   : {}),
               },
         },
+        // A successor never outlives the question it answers.
+        expiresAt: current.packet.expiresAt,
       }
     : awaitInput
       ? {

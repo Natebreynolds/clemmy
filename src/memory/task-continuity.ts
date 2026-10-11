@@ -1360,8 +1360,14 @@ function clarificationSourcesResult(
         || Date.parse(child.expiresAt) > Date.parse(packet.expiresAt)) return refuse('unbound_supersession');
       const a = packet.pause.slot;
       const b = child.pause.slot;
+      // A "customize" meta choice opens its own question under the same goal
+      // and revision; that exact hop, and only it, may change the question
+      // (it was refused as slot_changed since d222b5f3d, so the owner's
+      // customization details could never resume the task).
+      const customization = Boolean(a && b) && b!.slotKey === CUSTOMIZATION_SLOT_KEY
+        && b!.questionId === customizationQuestionId(child.originatingSourceUserSeq);
       if (!a || !b || a.goalId !== b.goalId || a.revision !== b.revision
-        || a.questionId !== b.questionId || a.slotKey !== b.slotKey) return refuse('slot_changed');
+        || (!customization && (a.questionId !== b.questionId || a.slotKey !== b.slotKey))) return refuse('slot_changed');
     } else if (row.superseded_at !== null) return refuse('retired_hop');
     const raw = rawSource(db, input.sessionId, packet.originatingSourceUserSeq);
     const accepted = acceptedSourceFromRow(raw);
@@ -1828,6 +1834,14 @@ export class TaskContinuityStore {
 }
 
 export const taskContinuityStore = new TaskContinuityStore();
+
+/** The slot a "customize" meta choice opens under its parent question: same
+ *  goal and revision, a question of its own keyed to the source that chose
+ *  it. The one hop in a clarification chain that changes the question. */
+export const CUSTOMIZATION_SLOT_KEY = 'strategy-customization';
+export function customizationQuestionId(sourceUserSeq: number): string {
+  return `question:${sourceUserSeq}:customize`;
+}
 
 export function createTaskContinuityPacket(
   input: CreateTaskContinuityPacketInput,
