@@ -19,6 +19,7 @@ import type { McpToolScope } from '../mcp-tool-scope.js';
 import { canonicalMcpToolIdentity } from '../mcp-tool-authority.js';
 import type { HostCapabilityDescriptorV1 } from '../semantic-boundary/turn-semantic-proposal.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
+import { compactContractLines } from '../../tools/schema-contract-lines.js';
 import { TOOL_REGISTRY, isRegistryDeclaredRead } from '../../tools/tool-registry.js';
 import { renderCarrierInvocationExample } from '../../tools/tool-search-tool.js';
 import {
@@ -415,9 +416,15 @@ export function renderProvenOperationGuidance(
       `When your tools list ${tools.join(', ')}, call it directly. Use tool_search only if it is not listed or cannot do the whole request.`,
     ].join('\n');
   }
+  // Every field with its type, required marker and limits; only descriptions
+  // are shortened. Clipping the raw JSON lost whole fields and their limits
+  // behind one long description (10-10: a page size's maximum sat past the
+  // clip, and the model asked for more than it allows).
   const schemaLines = tools.map((name) => {
     const schema = schemas[name] ?? schemas[name.toUpperCase()];
     if (!schema) return `- ${name}`;
+    const fields = compactContractLines(schema);
+    if (fields.length > 0) return [`- ${name} fields (* = required):`, ...fields.map((line) => `  ${line}`)].join('\n');
     const body = JSON.stringify(schema);
     const clipped = body.length > 1_800 ? `${body.slice(0, 1_800)}…` : body;
     return `- ${name} schema: ${clipped}`;

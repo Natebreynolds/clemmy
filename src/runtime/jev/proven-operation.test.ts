@@ -355,7 +355,8 @@ test('a proven strategy naming a native MCP read is re-attested and recorded as 
   assert.deepEqual(prepared.liveReads, [{ operation: 'records__search', kind: 'mcp', accountId: 'records-account' }]);
   assert.match(prepared.text ?? '', /re-attested for this request/);
   assert.match(prepared.text ?? '', /- records__search \(connected MCP server, account records-account\)/);
-  assert.match(prepared.text ?? '', /records__search schema: \{"type":"object"/);
+  // The proven note lists every field with its type and limits (10-10).
+  assert.match(prepared.text ?? '', /records__search fields \(\* = required\):\n  query: string/);
   const entries = provenCapabilityEntriesForTurn({ sessionId: session.id, sourceUserSeq: accepted.seq });
   const recorded = entries.find((entry) => entry.identifier === 'records__search');
   assert.ok(recorded, JSON.stringify(entries));
