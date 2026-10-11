@@ -1726,7 +1726,11 @@ function verifiedMetaContinuationInput(input: {
   if (!rootInput || !label) return null;
   const directive = meta.action === 'explain'
     ? 'Explain the rationale for the current recommendation, then reoffer the same exact visible options. Do not research, plan, or write yet.'
-    : 'Ask one bundled free-text question for audience, channels, voice, and cadence. Preserve the root task and do not research, plan, or write until those details arrive.';
+    // What to customize is the task's own: a fixed checklist (it named
+    // audience, channels, voice and cadence for every task) made a reading
+    // plan's complete details read as incomplete, and Clem asked again
+    // (live 2026-10-11).
+    : 'Ask one bundled free-text question for only the choices this task depends on, in the task\'s own terms. Preserve the root task and do not research, plan, or write until those details arrive.';
   return [
     '[task-continuation-meta:v1]',
     '[root-task]',

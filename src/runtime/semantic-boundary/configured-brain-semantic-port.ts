@@ -108,7 +108,7 @@ const SYSTEM = [
   'Copy an exact supplied capabilityRef for every operation, including host_only.',
   'Do not invent a capability id that is not in host.capabilityIds.',
   'If an open question is present, bind every answer to its exact questionId, slotKey, goal revision, and visible optionId.',
-  'A visible Q) Explain the rationale or B) Customize audience, channels, voice, or cadence choice is a meta-choice: return answer_open_slot with kind meta, its exact visible optionId, and action explain or customize; it keeps the content slot open.',
+  'A visible Q) Explain the rationale or B) Customize the plan choice (the customize option of any task) is a meta-choice: return answer_open_slot with kind meta, its exact visible optionId, and action explain or customize; it keeps the content slot open.',
   'Never infer a meta action from answer prose or question/slot identity alone. Otherwise select an exact visible option, provide allowed free text, or leave it ambiguous.',
   // Live 2026-09-14: "Yes" to "…invite Adam (recommended), or create it directly…?" was ruled ambiguous and the identical question was re-asked. The user accepts in their own words; the label already says which option that is.
   'When exactly one visible option is marked recommended or default, an answer that simply accepts the question as posed — in any affirmative wording — selects that option. If no option or more than one is marked, an affirmative alone stays ambiguous.',

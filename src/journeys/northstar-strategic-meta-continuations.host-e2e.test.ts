@@ -149,7 +149,7 @@ async function askThroughHost(input: {
           'the checked meta directive carries the original root objective to the host model');
         assert.match(systemMaterial, input.expectedMetaAction === 'explain'
           ? /reoffer the same exact visible options/i
-          : /audience, channels, voice, and cadence/i);
+          : /only the choices this task depends on/i);
       }
       return {
         responseId: `${input.callId}-response`,
