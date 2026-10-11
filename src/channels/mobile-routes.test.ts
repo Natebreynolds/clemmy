@@ -4759,7 +4759,7 @@ test('mobile chat cancel rejects a stale exact id and stops the exact live attem
 test('mobile settings routes are session-gated: anon requests get 401 at every door', async () => {
   const h = await startHarness();
   try {
-    for (const p of ['/m/api/settings/models', '/m/api/settings/usage', '/m/api/tidy/plan', '/m/api/settings/connections', '/m/api/settings/status', '/m/api/settings/storage', '/m/api/devices']) {
+    for (const p of ['/m/api/settings/models', '/m/api/models/scorecard', '/m/api/settings/usage', '/m/api/tidy/plan', '/m/api/settings/connections', '/m/api/settings/status', '/m/api/settings/storage', '/m/api/devices']) {
       const anon = await fetch(`${h.url}${p}`);
       assert.equal(anon.status, 401, `GET ${p} must demand a mobile session`);
     }

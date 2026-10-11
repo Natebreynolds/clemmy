@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileSizeWords, sameSessionFile, sessionFilePath } from '../../lib/session-files';
 
-const DOCK = readFileSync(new URL('./FileDock.tsx', import.meta.url), 'utf8');
+const DOCK = readFileSync(new URL('../artifacts/ArtifactWorkspace.tsx', import.meta.url), 'utf8');
 const RECEIPT = readFileSync(new URL('./TurnReceipt.tsx', import.meta.url), 'utf8');
 const CHAT = readFileSync(new URL('../../screens/Chat.tsx', import.meta.url), 'utf8');
 const THREAD = readFileSync(new URL('../../features/conversations/chat/ConversationThread.tsx', import.meta.url), 'utf8');

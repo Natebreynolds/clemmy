@@ -13,6 +13,7 @@ import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft, Archive, ArchiveRestore, ChevronRight, MessageSquarePlus } from 'lucide-react';
 import { delegatedTaskOpen, orderDelegatedTasks } from '@clem/chat-engine';
 import { Page } from '@/components/Page';
+import { ArtifactWorkspace } from '@/components/artifacts/ArtifactWorkspace';
 import { Button } from '@/components/ui/Button';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -26,6 +27,7 @@ import { ProjectDecisions } from '@/components/projects/ProjectDecisions';
 import { ProjectIdentity } from '@/components/projects/ProjectIdentity';
 import { ProjectPages } from '@/components/projects/ProjectPages';
 import { ProjectResources } from '@/components/projects/ProjectResources';
+import { ProjectResume } from '@/components/projects/ProjectResume';
 import { ProjectSection, QuietNote } from '@/components/projects/ProjectSection';
 import { cn } from '@/lib/cn';
 import { usePoll } from '@/lib/poll';
@@ -35,7 +37,7 @@ import {
 
 export function ProjectOverview() {
   const { id = '' } = useParams();
-  return <ProjectPage key={id} projectId={id} />;
+  return <ArtifactWorkspace scopeKey={`project:${id}`} returnLabel="project"><ProjectPage key={id} projectId={id} /></ArtifactWorkspace>;
 }
 
 function BackToProjects() {
@@ -100,10 +102,19 @@ function ProjectBody({ overview, onSettled, onReread }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [endedOpen, setEndedOpen] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
 
   const tasks = orderDelegatedTasks(overview.tasks);
   const open = tasks.filter(delegatedTaskOpen);
   const ended = tasks.filter((task) => !delegatedTaskOpen(task));
+  const coding = overview.codingRuns ?? [];
+  const currentCoding = coding.filter(run => run.phase !== 'finished');
+  const endedCoding = coding.filter(run => run.phase === 'finished');
+  const earlierCount = ended.length + endedCoding.length;
+  const showDetails = () => {
+    setDetailsOpen(true);
+    requestAnimationFrame(() => document.getElementById('project-details')?.scrollIntoView({ block: 'start' }));
+  };
 
   const setArchived = async (archive: boolean) => {
     setBusy(true);
@@ -119,14 +130,15 @@ function ProjectBody({ overview, onSettled, onReread }: {
   };
 
   return (
-    <Page width="reading" className="pb-16">
+    <Page width="wide" className="pb-16">
       <BackToProjects />
-      <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+      <header className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <h2 className="min-w-0 break-words text-h1 text-fg">{project.name}</h2>
             {archived && <StatusPill tone="neutral">Archived</StatusPill>}
           </div>
+          {project.purpose && <p className="reading mt-2 line-clamp-2 text-body text-muted">{project.purpose}</p>}
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">
           {archived ? (
@@ -135,28 +147,15 @@ function ProjectBody({ overview, onSettled, onReread }: {
             </Button>
           ) : (
             <>
-              <Button size="sm" onClick={start}>
+              <Button size="sm" variant="secondary" onClick={start}>
                 <MessageSquarePlus className="h-4 w-4" aria-hidden /> New conversation
-              </Button>
-              <Button size="sm" variant="ghost" disabled={busy} aria-expanded={confirmArchive} onClick={() => setConfirmArchive((value) => !value)}>
-                <Archive className="h-4 w-4" aria-hidden /> Archive
               </Button>
             </>
           )}
+          <Button size="sm" variant="ghost" onClick={showDetails}>Project details</Button>
         </div>
       </header>
 
-      {confirmArchive && !archived && (
-        <div className="-mt-4 mb-8 rounded-md border border-border bg-subtle px-4 py-3" role="group" aria-label="Confirm archiving this project">
-          <p className="text-small text-fg">
-            Archive {project.name}? It leaves your list and takes no new work. Everything in it is kept, and you can restore it any time.
-          </p>
-          <div className="mt-2 flex gap-2">
-            <Button size="sm" disabled={busy} onClick={() => { void setArchived(true); }}>{busy ? 'Archiving…' : 'Archive'}</Button>
-            <Button size="sm" variant="secondary" disabled={busy} onClick={() => setConfirmArchive(false)}>Keep it active</Button>
-          </div>
-        </div>
-      )}
       {archived && (
         <p className="-mt-4 mb-8 rounded-md border border-border bg-subtle px-4 py-3 text-small text-muted">
           This project is archived: it takes no new work and cannot be changed. Restore it to pick it back up.
@@ -164,19 +163,24 @@ function ProjectBody({ overview, onSettled, onReread }: {
       )}
       {error && <p role="alert" className="-mt-4 mb-8 text-small text-danger">{error}</p>}
 
-      <div className="flex flex-col gap-10">
-        <ProjectIdentity overview={overview} onSaved={onSettled} />
+      <nav aria-label="In this project" className="mb-5 flex flex-wrap gap-x-5 gap-y-2 text-small font-semibold text-muted">
+        {!archived && <a className="hover:text-primary" href="#project-needs-you">Needs you{overview.decisions.length ? ` (${overview.decisions.length})` : ''}</a>}
+        <a className="hover:text-primary" href="#project-current-work">Current work{open.length + currentCoding.length ? ` (${open.length + currentCoding.length})` : ''}</a>
+        <a className="hover:text-primary" href="#project-results">Recent results</a>
+      </nav>
+      <div className="flex flex-col gap-8">
+        <ProjectResume overview={overview} />
 
-        {!archived && <ProjectDecisions overview={overview} onDecided={onReread} />}
+        {!archived && <div id="project-needs-you" className="scroll-mt-5"><ProjectDecisions overview={overview} onDecided={onReread} /></div>}
 
-        <ProjectSection title="Current work" count={open.length}>
-          {open.length === 0 ? (
+        <div id="project-current-work" className="scroll-mt-5"><ProjectSection title="Current work" count={open.length + currentCoding.length}>
+          {open.length === 0 && currentCoding.length === 0 ? (
             <QuietNote>
-              {ended.length === 0 && (overview.codingRuns ?? []).length === 0
+              {earlierCount === 0
                 ? 'No work has been handed off in this project yet. Ask for something in a conversation here and it shows up as a task.'
                 : 'No task is running right now.'}
             </QuietNote>
-          ) : (
+          ) : open.length > 0 ? (
             <ul className="space-y-2">
               {open.map((task) => (
                 <li key={task.taskId}>
@@ -185,9 +189,9 @@ function ProjectBody({ overview, onSettled, onReread }: {
                 </li>
               ))}
             </ul>
-          )}
-          <ProjectCodingWork runs={overview.codingRuns ?? []} />
-          {ended.length > 0 && (
+          ) : null}
+          <ProjectCodingWork runs={currentCoding} />
+          {earlierCount > 0 && (
             <div>
               <button
                 type="button"
@@ -197,19 +201,24 @@ function ProjectBody({ overview, onSettled, onReread }: {
                 className="inline-flex items-center gap-1.5 rounded-sm px-1 py-1 text-small font-semibold text-muted transition-colors hover:text-fg cursor-pointer"
               >
                 <ChevronRight className={cn('h-4 w-4 transition-transform duration-fast motion-reduce:transition-none', endedOpen && 'rotate-90')} aria-hidden />
-                Earlier work ({ended.length})
+                Earlier work ({earlierCount})
               </button>
               {endedOpen && (
-                <ul id="project-ended-work" className="mt-2 space-y-2">
+                <div id="project-ended-work" className="mt-2 space-y-3"><ul className="space-y-2">
                   {ended.map((task) => (
                     <li key={task.taskId}><DelegatedTaskCard task={task} beside={tasks} onChanged={onReread} hideProject /></li>
                   ))}
-                </ul>
+                </ul><ProjectCodingWork runs={endedCoding} /></div>
               )}
             </div>
           )}
-        </ProjectSection>
+        </ProjectSection></div>
 
+        <details id="project-details" open={detailsOpen} onToggle={event => setDetailsOpen(event.currentTarget.open)} className="scroll-mt-5 border-t border-border pt-5">
+          <summary className="cursor-pointer text-h3 text-fg">Project details</summary>
+          <p className="mt-2 text-small text-muted">Purpose, agents, resources, conversations, and what was learned.</p>
+          <div className="mt-7 flex flex-col gap-9">
+        <ProjectIdentity overview={overview} onSaved={onSettled} />
         <ProjectAgents overview={overview} onSaved={onSettled} />
         <ProjectResources overview={overview} onSaved={onSettled} />
         <ProjectPages overview={overview} />
@@ -222,6 +231,12 @@ function ProjectBody({ overview, onSettled, onReread }: {
             unavailableTitle="What was learned here is unavailable"
           />
         </ProjectSection>
+        {!archived && <div className="border-t border-border pt-4">
+          <Button size="sm" variant="ghost" disabled={busy} aria-expanded={confirmArchive} onClick={() => setConfirmArchive(value => !value)}><Archive className="h-4 w-4" aria-hidden /> Archive project</Button>
+          {confirmArchive && <div className="mt-3 rounded-md border border-border bg-subtle px-4 py-3" role="group" aria-label="Confirm archiving this project"><p className="text-small text-fg">Archive {project.name}? It leaves your list and takes no new work. Everything in it is kept, and you can restore it any time.</p><div className="mt-3 flex gap-2"><Button size="sm" disabled={busy} onClick={() => { void setArchived(true); }}>{busy ? 'Archiving…' : 'Archive'}</Button><Button size="sm" variant="secondary" disabled={busy} onClick={() => setConfirmArchive(false)}>Keep it active</Button></div></div>}
+        </div>}
+          </div>
+        </details>
       </div>
     </Page>
   );

@@ -20,6 +20,7 @@ import { discoverMcpServers } from '../mcp-config.js';
 import {
   getOrCreateExternalMcpServerForTool,
   getOrCreateExternalMcpServers,
+  noteExternalMcpDefinitionDrift,
 } from '../mcp-servers.js';
 import {
   parseNamespacedTool,
@@ -709,6 +710,7 @@ export async function prepareProductionMcpInvocation(
     peekHostCapabilityCatalogFactory()?.forget(current.manifest.manifestId);
   }
   if (!snapshotMatchesManifest(snapshot, current.manifest)) {
+    noteExternalMcpDefinitionDrift();
     throw new CurrentCapabilityDefinitionUnavailableError(
       'native MCP preparation refused: live definition drifted',
     );
@@ -1219,6 +1221,7 @@ export function createProductionMcpReadCarrier(input: {
       (entry) => entry.definition.operationId === input.operationId,
     ) ?? [];
     if (matches.length === 0) {
+      noteExternalMcpDefinitionDrift();
       return block('missing', 'the disclosed MCP operation is no longer listed', true);
     }
     if (matches.length !== 1) {

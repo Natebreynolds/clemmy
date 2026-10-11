@@ -29,6 +29,7 @@ import {
 } from './brackets.js';
 import pino from 'pino';
 import { workerComposeOnlyActions } from '../../agents/worker-parent-actions.js';
+import { joinWorkerRouteOutcome, scheduleRouteOutcomeJoin } from './route-outcome-join.js';
 
 const workerLogger = pino({ name: 'worker-host-runner' });
 
@@ -282,5 +283,8 @@ export async function runPacketWorkerWithHost(input: {
     return withCallRecord(`ERROR: worker ${input.input.item}: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     finishRunAttempt(attempt, completed ? 'completed' : 'failed');
+    // The helper's own result is its route's signal for the route policy.
+    const usable = completed;
+    scheduleRouteOutcomeJoin(() => joinWorkerRouteOutcome({ sessionId: session.id, sourceUserSeq: childSource.seq, usable }));
   }
 }

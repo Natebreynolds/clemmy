@@ -368,3 +368,33 @@ test('a schema that grants no file authority is never refused over an unrelated 
     (error: unknown) => error instanceof StagedFileTransferPlanError && error.code === 'unsupported_pattern',
   );
 });
+
+test('a refused call names the field and the limit it broke, so one repair fixes it', () => {
+  const schema = {
+    type: 'object',
+    required: ['query'],
+    additionalProperties: false,
+    properties: {
+      query: { type: 'string' },
+      size: { type: 'integer', minimum: 1, maximum: 25 },
+      order: { type: 'string', enum: ['newest', 'oldest'] },
+      tags: { type: 'array', maxItems: 2, items: { type: 'string' } },
+    },
+  };
+  const refusal = (args: Record<string, unknown>) => {
+    try { planStagedFileUploads(schema, args); } catch (error) {
+      assert.ok(error instanceof StagedFileTransferPlanError && error.code === 'schema_mismatch');
+      return { pointer: error.pointer, message: error.message };
+    }
+    assert.fail('expected a schema refusal');
+  };
+  assert.deepEqual(refusal({ query: 'kickoff', size: 50 }),
+    { pointer: '/size', message: 'runtime value does not satisfy the exact schema: 50 is above the maximum 25 at /size' });
+  assert.match(refusal({ query: 'kickoff', size: 0 }).message, /0 is below the minimum 1 at \/size$/);
+  assert.match(refusal({ query: 'kickoff', order: 'latest' }).message, /"latest" is not one of "newest", "oldest" at \/order$/);
+  assert.match(refusal({ query: 'kickoff', tags: ['a', 'b', 'c'] }).message, /3 items; the most is 2 at \/tags$/);
+  assert.match(refusal({ query: 7 }).message, /7 is not a string at \/query$/);
+  assert.match(refusal({ size: 5 }).message, /a required field is missing at \/query$/);
+  assert.match(refusal({ query: 'kickoff', page: 2 }).message, /this operation has no such field at \/page$/);
+  assert.deepEqual(planStagedFileUploads(schema, { query: 'kickoff', size: 25 }), []);
+});

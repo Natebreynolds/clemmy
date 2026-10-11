@@ -451,6 +451,74 @@ export function recordModelRouteOutcome(
   }
 }
 
+export interface ModelRouteOutcomeVerdictInput {
+  /** The completion review passed the reply this call wrote; undefined when
+   *  nothing reviewed it (never false for "not reviewed"). */
+  objectiveMet?: boolean;
+  /** Every dispatched tool call of the turn landed; undefined when none ran. */
+  toolSuccess?: boolean;
+  toolCalls?: number;
+  /** Where the two facts came from, kept beside them for audit. */
+  basis?: Record<string, unknown>;
+}
+
+/**
+ * Write what the finished turn knows onto a request's outcome: whether its
+ * work passed review and whether its tool calls landed. The provider-side
+ * columns are untouched. Last write wins; writing the same values again
+ * changes nothing and returns false.
+ */
+export function updateModelRouteOutcomeVerdict(
+  decisionId: string,
+  input: ModelRouteOutcomeVerdictInput,
+  db?: Database.Database,
+): boolean {
+  try {
+    const objectiveMet = boolToInt(input.objectiveMet);
+    const toolSuccess = boolToInt(input.toolSuccess);
+    const toolCalls = input.toolCalls ?? null;
+    return (db ?? openModelRouteMetricsDb()).prepare(`
+      UPDATE model_route_outcomes
+         SET objective_met = @objectiveMet,
+             tool_success = @toolSuccess,
+             tool_calls = @toolCalls,
+             metadata_json = json_set(metadata_json, '$.verdict', json(@basis))
+       WHERE decision_id = @decisionId
+         AND (objective_met IS NOT @objectiveMet OR tool_success IS NOT @toolSuccess OR tool_calls IS NOT @toolCalls)
+    `).run({ decisionId, objectiveMet, toolSuccess, toolCalls, basis: JSON.stringify(input.basis ?? {}) }).changes === 1;
+  } catch {
+    return false; // Metrics never touch a turn.
+  }
+}
+
+/**
+ * The last answered request of one role for one accepted source: for the
+ * brain, the request whose answer the turn shipped. `since` bounds the scan to
+ * the source's own lifetime.
+ */
+export function latestSourceRouteDecision(
+  input: { sessionId: string; sourceUserSeq: number; role: ModelRouteRole; since?: string },
+  db?: Database.Database,
+): { id: string; requests: number } | null {
+  try {
+    const rows = (db ?? openModelRouteMetricsDb()).prepare(`
+      SELECT d.id AS id
+        FROM model_route_decisions d
+        JOIN model_route_outcomes o ON o.decision_id = d.id
+       WHERE d.created_at >= @since
+         AND d.session_id = @sessionId
+         AND d.role = @role
+         AND json_extract(d.reason_json, '$.sourceUserSeq') = @sourceUserSeq
+         AND o.status IN ('success', 'fallback')
+       ORDER BY o.completed_at DESC, d.created_at DESC
+    `).all({ since: input.since ?? '', sessionId: input.sessionId, role: input.role,
+      sourceUserSeq: input.sourceUserSeq }) as Array<{ id: string }>;
+    return rows.length > 0 ? { id: rows[0]!.id, requests: rows.length } : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Retention sweep (2026-07-22 legacy audit): decisions/outcomes grew unbounded
  * — one row per routing call, never deleted. Rows older than the policy
@@ -761,6 +829,7 @@ class ModelRouteMetricsModel implements Model {
     promptCacheRequest: PromptCacheRequestObservationV1,
   ): string {
     const activeContext = harnessMetricsContext(this.context);
+    const sourceUserSeq = activeSourceUserSeq(activeContext.sessionId);
     const decisionId = recordModelRouteDecision({
       ...activeContext,
       id: this.context.modelCallIdPrefix ? `${this.context.modelCallIdPrefix}:${randomUUID()}` : undefined,
@@ -768,6 +837,9 @@ class ModelRouteMetricsModel implements Model {
         ...(this.context.reason ?? {}),
         path: pathName,
         promptCacheRequest,
+        // The accepted request this call worked on, so the finished turn's
+        // review verdict can be joined back onto it (route-outcome-join.ts).
+        ...(sourceUserSeq !== undefined ? { sourceUserSeq } : {}),
       },
     }, this.db);
     if (!this.db) recordOperationalEvent({
@@ -890,6 +962,12 @@ export function summarizeRouteOutcomes(samples: ModelRouteOutcomeSample[]): Mode
   const fallbackCount = samples.filter((sample) => sample.status === 'fallback').length;
   const objectiveMetCount = samples.filter((sample) => sample.objectiveMet === true).length;
   const toolSuccessCount = samples.filter((sample) => sample.toolSuccess === true).length;
+  // A turn's verdict lands on the one request that wrote its reply, and only
+  // when something reviewed it; every other request carries no verdict. The
+  // rates are over the samples that carry the signal, so "not reviewed" never
+  // reads as "failed review".
+  const objectiveSamples = samples.filter((sample) => sample.objectiveMet !== undefined).length;
+  const toolSamples = samples.filter((sample) => sample.toolSuccess !== undefined).length;
 
   return {
     sampleCount,
@@ -902,8 +980,8 @@ export function summarizeRouteOutcomes(samples: ModelRouteOutcomeSample[]): Mode
     avgTokens: average(samples.map((sample) => sample.totalTokens)),
     avgCostUsd: average(samples.map((sample) => sample.costUsd)),
     successRate: ratio(successCount, sampleCount),
-    objectiveRate: ratio(objectiveMetCount, sampleCount),
-    toolSuccessRate: ratio(toolSuccessCount, sampleCount),
+    objectiveRate: ratio(objectiveMetCount, objectiveSamples),
+    toolSuccessRate: ratio(toolSuccessCount, toolSamples),
   };
 }
 
@@ -1062,6 +1140,14 @@ function harnessMetricsContext(context: ModelRouteMetricsContext): ModelRouteMet
     ...(sessionId ? { sessionId } : {}),
     ...(workflowRunId ? { workflowRunId } : {}),
   };
+}
+
+/** The accepted source of the run this call belongs to, only when the run is
+ *  the same session the decision is recorded under. */
+function activeSourceUserSeq(sessionId: string | undefined): number | undefined {
+  const active = harnessRunContextStorage.getStore();
+  const seq = active?.sourceUserSeq;
+  return sessionId && active?.sessionId === sessionId && Number.isSafeInteger(seq) && (seq ?? 0) > 0 ? seq : undefined;
 }
 
 function workflowRunIdFromSessionId(sessionId: string | undefined): string | undefined {

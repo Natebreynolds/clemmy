@@ -46,7 +46,7 @@ import {
 import { openLoopsForSession, renderOpenLoops } from './open-loops.js';
 import { renderSessionConstraints, sessionConstraintsForSession } from './session-constraints.js';
 import { standingRuleCaptureDirective } from '../../memory/rule-capture.js';
-import { resolveRoleModel } from './model-roles.js';
+import { readDurableBindings, resolveRoleModel } from './model-roles.js';
 import {
   BATCH_RE,
   READ_RE,
@@ -752,8 +752,18 @@ function providerAccessLine(): string {
 
 /** Role configuration is distinct from a named agent and from execution
  * evidence. Read the canonical role afresh; never advertise a stale saved
- * binding's fallback as the owner's unavailable choice. */
-function workerRoleConfigurationLine(): string {
+ * binding's fallback as the owner's unavailable choice. Said only when it
+ * changes what run_worker with model:null does or could be confused with:
+ * an owner's Worker pick (available or not), a saved intent rule, or a saved
+ * agent. On the default with none of those, model:null already is the role,
+ * and the line cost ~590 bytes on every round of every action turn (10-10
+ * Lean Rounds). Configuration state only; the request's words never decide. */
+function workerRoleConfigurationLine(opts: { savedAgents: boolean }): string {
+  try {
+    const worker = resolveRoleModel('worker');
+    const intentRules = readDurableBindings().some((binding) => binding.role === 'worker' && Boolean(binding.whenIntent));
+    if (worker.source === 'default' && !worker.inactiveBinding && !intentRules && !opts.savedAgents) return '';
+  } catch { /* an unreadable role still gets the line below, which says so */ }
   const distinction = 'A named saved agent is a separate choice: its own model pin applies even with model:null. model:null keeps ordinary routing, including matching saved intent rules. Configuration is not execution proof: report the actual model/provider from worker receipts; exact account claims need account evidence.';
   try {
     const worker = resolveRoleModel('worker');
@@ -1065,7 +1075,7 @@ export function buildAgentContextPacket(
     ...(suppressActionSemanticEnrichment
       ? []
       : renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. Shared names or keywords do not establish that a workflow fits the current task. If the user asks to run a saved workflow, call workflow_run with their exact phrasing; inspect its definition when needed to supply its inputs. Otherwise use workflow_get only when the workflow\'s purpose is relevant and its steps could help with the requested work. A candidate does not prove that its capabilities, accounts or arguments apply here. Continue directly when they do not fit. Do NOT auto-run a workflow the user did not ask to run.')),
-    suppressActionSemanticEnrichment || constrainedWorkflowNode || (reviewedExecution && !reviewedReadOnlyExecution) ? '' : workerRoleConfigurationLine(),
+    suppressActionSemanticEnrichment || constrainedWorkflowNode || (reviewedExecution && !reviewedReadOnlyExecution) ? '' : workerRoleConfigurationLine({ savedAgents: agentRecords.length > 0 }),
     ...renderCandidates('Saved agents', savedAgents, 'The owner\'s saved agents. To hand one of them a piece of work you wait on here, call run_worker with agent set to its name. To hand one longer, multi-step work that runs on its own and reports back here, call dispatch_background_task with agent set to its name, and project set to the project it works in when it has one. Either way the work runs as that agent, with its instructions and on its model. Credit a result to an agent only when the work ran as it, and say which model ran it when that matters.'),
     savedAgents.length === 0 && agentRoster
       ? `${agentRoster} This is the current list, so a question about the agents is answered from it. To hand one work, call run_worker (or dispatch_background_task for longer work) with agent set to its name.`

@@ -41,6 +41,12 @@ writeFileSync(
   JSON.stringify({ autoApproveScope: 'yolo' }, null, 2),
 );
 
+// This journey exercises dispatch, recovery and transport, not the first-time
+// card: it runs with every connected-app kind approved, like the unit fixtures
+// (70c7dd879). The ask-once rule itself (owner 2026-10-06) is the
+// balanced-user-stops journeys' subject.
+const { _setApprovedWriteKindsForTests } = await import('../agents/plan-scope.js');
+_setApprovedWriteKindsForTests('all');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const brackets = await import('../runtime/harness/brackets.js');
 const envelopes = await import('../agents/capability-envelope.js');
@@ -1162,7 +1168,7 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
       prompt: 'Change the heading in the existing Planned Fixture Workspace.',
       args: {
         slug: 'planned-fixture-space',
-        edits: [{ find: 'Fixture', replace: 'Updated Fixture' }],
+        edits: [{ find: 'Fixture', replace: 'Updated Fixture', all: null }],
       },
       result: JSON.stringify({ ok: true, slug: 'planned-fixture-space', revision: 2 }),
     },
@@ -2264,7 +2270,8 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       const ordinarySiblingArgs = ordinarySiblingLocalName
         ? {
             slug: 'release-outbound-fixture',
-            edits: [{ find: 'Draft', replace: 'Updated Draft' }],
+            edits: [{ find: 'Draft', replace: 'Updated Draft', all: null }],
+            revert_to_version: null,
           }
         : null;
       const sourceCallId = `planned-external-source-${index}`;

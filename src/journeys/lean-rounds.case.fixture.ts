@@ -349,10 +349,12 @@ let reviews = 0;
 mock.method(CodexModelProvider.prototype, 'getModel', () => ({
   async getResponse() {
     reviews += 1;
-    // The reviewer answers as it is told to: the verdict, and the one memory
-    // requirement line (ignored unless the review asked for it).
+    // The reviewer answers as it is told to: the verdict, what it rests on
+    // (a verdict that never says so fails open since 990778932), and the one
+    // memory requirement line (ignored unless the review asked for it).
     return { usage: new Usage(), responseId: `review-${reviews}`, output: [textMessage([
       'DONE: the reply answers the request from the settled results.',
+      'NEEDS ALL OF: none',
       'MEMORY_REQUIREMENT: {"version":1,"kind":"none","corrections":[],"reason":"a lookup asks nothing to be remembered"}',
     ].join('\n'))] };
   },
@@ -422,6 +424,11 @@ async function runTurn(sessionId: string): Promise<TurnRun> {
     },
   });
   assert.ok(sourceUserSeq > 0, `${sessionId}: the runner accepted one durable source`);
+  // A review that fails open learns nothing, so a warm scenario would quietly
+  // measure a cold desk (10-10: every warm read did, unseen).
+  const failedOpen = eventlog.listEvents(session.id, { types: ['goal_alignment_judged'] })
+    .filter((event) => (event.data as { failedOpen?: boolean }).failedOpen === true);
+  assert.deepEqual(failedOpen.map((event) => event.data.reason), [], `${sessionId}: no review failed open`);
   return { sessionId: session.id, sourceUserSeq, requests, route, sent, turnMs: Date.now() - started };
 }
 

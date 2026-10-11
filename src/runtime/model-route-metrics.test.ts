@@ -132,6 +132,20 @@ test('model route metrics schema applies and cascades outcomes with decisions', 
   }
 });
 
+test('summarizeRouteOutcomes rates review and tool success over the samples that carry them', () => {
+  const summary = summarizeRouteOutcomes([
+    { status: 'success' },
+    { status: 'success' },
+    { status: 'success', objectiveMet: true, toolSuccess: true },
+    { status: 'success' },
+    { status: 'success', objectiveMet: false },
+    { status: 'failed' },
+  ]);
+  assert.equal(summary.objectiveRate, 0.5, 'one of two reviewed turns passed; unreviewed requests are not failures');
+  assert.equal(summary.toolSuccessRate, 1);
+  assert.equal(summarizeRouteOutcomes([{ status: 'success' }]).objectiveRate, 0);
+});
+
 test('summarizeRouteOutcomes computes success, objective, tool, latency, token, and cost metrics', () => {
   const summary = summarizeRouteOutcomes([
     { status: 'success', latencyMs: 1000, totalTokens: 1000, costUsd: 0.01, objectiveMet: true, toolSuccess: true },

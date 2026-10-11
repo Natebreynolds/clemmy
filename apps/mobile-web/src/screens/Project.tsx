@@ -69,6 +69,7 @@ import {
 } from '../lib/project-words';
 import { useScreenData } from '../lib/use-screen-data';
 import type { ChatHandoff } from './Chats';
+import { ProjectResume } from '../components/ProjectResume';
 
 interface Props {
   projectId: string;
@@ -76,6 +77,7 @@ interface Props {
   onOpenChat: (handoff: ChatHandoff) => void;
   onOpenRun: (runSessionId: string) => void;
   onOpenAgent: (agentId: string) => void;
+  onOpenSpace: (spaceId: string) => void;
   /** Where a card is decided when this screen could not read it. */
   onOpenNeedsYou: () => void;
   onDecided: () => void;
@@ -90,7 +92,7 @@ interface Loaded {
 /** How many ended tasks are listed before "Show more". */
 const ENDED_SHOWN = 3;
 
-export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent, onOpenNeedsYou, onDecided }: Props) {
+export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent, onOpenSpace, onOpenNeedsYou, onDecided }: Props) {
   const load = useCallback(async (): Promise<Loaded> => {
     try {
       const { overview } = await getProject(projectId);
@@ -127,6 +129,7 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
   const [linking, setLinking] = useState(false);
   const [viewing, setViewing] = useState<ProjectPageView | null>(null);
   const [endedOpen, setEndedOpen] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
 
   /** A decision settled here settles it everywhere: read the project and the count again. */
   const decided = (text?: string) => {
@@ -151,7 +154,9 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
   // where the owner links one. Every other group is drawn only when it has rows.
   const localProjects = resources.find((group) => group.kind === 'folder')?.items ?? [];
   const otherResources = resources.filter((group) => group.kind !== 'folder');
-  const codingRuns = readCodingRuns(overview);
+  const allCodingRuns = readCodingRuns(overview);
+  const codingRuns = allCodingRuns.filter(run => run.phase !== 'finished');
+  const finishedCoding = allCodingRuns.filter(run => run.phase === 'finished');
   // Absent from a Mac that predates pages: then there are none to list.
   const pages = projectPages(overview);
 
@@ -161,7 +166,7 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{project?.name ?? 'Project'}</h2>
         {project && !editing ? (
-          <button type="button" class="btn-quiet" onClick={() => { haptic('light'); setNote(null); setEditing(true); }}>Edit</button>
+          <button type="button" class="btn-quiet" onClick={() => { haptic('light'); setDetailsOpen(true); requestAnimationFrame(() => document.getElementById('project-details')?.scrollIntoView({ block: 'start' })); }}>Details</button>
         ) : null}
       </div>
 
@@ -170,34 +175,13 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
 
       {overview && project && layout ? (
         <div class="project-sections">
-          {editing ? (
-            <ProjectEditor
-              overview={overview}
-              onCancel={() => setEditing(false)}
-              onSaved={(next, text) => { setEditing(false); setNote({ tone: 'success', text }); settle(next); }}
-            />
-          ) : (
-            <section class="project-about" aria-label="What this project is">
-              {archived ? <p class="project-flag" role="note">Archived. Nothing new starts here until you restore it.</p> : null}
-              <p class={`project-purpose${project.purpose ? '' : ' is-empty'}`}>
-                {project.purpose || 'No purpose written yet. Tap Edit to say what this project is for.'}
-              </p>
-              {project.goals.length > 0 ? (
-                <>
-                  <h3 class="project-sub">Goals</h3>
-                  <ul class="project-goals">
-                    {project.goals.map((goal) => <li key={goal}>{goal}</li>)}
-                  </ul>
-                </>
-              ) : null}
-              {project.context ? (
-                <>
-                  <h3 class="project-sub">Always keep in mind</h3>
-                  <p class="project-context">{project.context}</p>
-                </>
-              ) : null}
-            </section>
-          )}
+          {project.purpose ? <p class="project-resume-purpose">{project.purpose}</p> : null}
+          {archived ? <p class="project-flag" role="note">Archived. Restore this project in Details to start new work.</p> : null}
+          <nav class="project-resume-nav" aria-label="In this project">
+            {!archived ? <a href="#project-needs">Needs you{layout.waiting ? ` (${layout.waiting})` : ''}</a> : null}
+            <a href="#project-work">Current work</a><a href="#project-results">Recent results</a>
+          </nav>
+          <ProjectResume overview={overview} onOpenChat={onOpenChat} onOpenSpace={onOpenSpace} onOpenPage={page => { setNote(null); setViewing(page); }} />
 
           {!archived ? (
             <section aria-labelledby="project-needs">
@@ -267,9 +251,11 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
               onChanged={() => void refresh()}
               onOpenRun={onOpenRun}
             />
-            {layout.ended.length > 0 ? (
-              <>
-                <h3 class="project-sub">Earlier</h3>
+            {/* Coding work is followed and stopped in its source conversation. */}
+            <ProjectCodingRows runs={codingRuns} onOpenChat={onOpenChat} />
+            {layout.ended.length + finishedCoding.length > 0 ? (
+              <details class="project-earlier">
+                <summary>Earlier work ({layout.ended.length + finishedCoding.length})</summary>
                 <DelegatedTaskList
                   tasks={endedOpen ? layout.ended : layout.ended.slice(0, ENDED_SHOWN)}
                   known={overview.tasks}
@@ -282,44 +268,20 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
                     {endedOpen ? 'Show fewer' : `Show ${layout.ended.length - ENDED_SHOWN} more`}
                   </button>
                 ) : null}
-              </>
-            ) : null}
-            {/* Coding work is followed and stopped where it already is: here it
-                is a list that leads back to the conversation it came from. */}
-            {codingRuns.length > 0 ? (
-              <>
-                <h3 class="project-sub">Coding work</h3>
-                <div class="home-card">
-                  {codingRuns.map((run) => {
-                    const phase = projectCodingRunPhase(run.phase);
-                    const body = (
-                      <>
-                        <span class="project-line-text">
-                          <span class="project-line-title project-line-clamp">{run.objective}</span>
-                          <span class="project-line-sub">
-                            {[projectCodingRunPlace(run), phase.label, relativeTime(run.updatedAt)].filter(Boolean).join(' · ')}
-                          </span>
-                        </span>
-                        {run.originSessionId ? <Chevron /> : null}
-                      </>
-                    );
-                    return run.originSessionId ? (
-                      <button
-                        key={run.runId}
-                        type="button"
-                        class="home-row home-row-tap project-line"
-                        aria-label={`${run.objective}. Open the conversation it came from`}
-                        onClick={() => { haptic('light'); onOpenChat({ sessionId: run.originSessionId! }); }}
-                      >
-                        {body}
-                      </button>
-                    ) : <div key={run.runId} class="home-row project-line">{body}</div>;
-                  })}
-                </div>
-              </>
+                <ProjectCodingRows runs={finishedCoding} onOpenChat={onOpenChat} />
+              </details>
             ) : null}
           </section>
 
+          <details id="project-details" class="project-details-fold" open={detailsOpen} onToggle={event => setDetailsOpen(event.currentTarget.open)}>
+            <summary>Project details</summary>
+            <div class="project-sections project-details-body">
+              {editing ? <ProjectEditor overview={overview} onCancel={() => setEditing(false)} onSaved={(next, text) => { setEditing(false); setNote({ tone: 'success', text }); settle(next); }} /> : <section class="project-about" aria-label="What this project is">
+                <div class="project-details-title"><h2 class="section-head">What it is</h2><button type="button" class="btn-quiet" onClick={() => { haptic('light'); setNote(null); setEditing(true); }}>{archived ? 'Restore or edit' : 'Edit'}</button></div>
+                <p class={`project-purpose${project.purpose ? '' : ' is-empty'}`}>{project.purpose || 'No purpose written yet. Tap Edit to say what this project is for.'}</p>
+                {project.goals.length > 0 ? <><h3 class="project-sub">Goals</h3><ul class="project-goals">{project.goals.map(goal => <li key={goal}>{goal}</li>)}</ul></> : null}
+                {project.context ? <><h3 class="project-sub">Always keep in mind</h3><p class="project-context">{project.context}</p></> : null}
+              </section>}
           <section aria-labelledby="project-agents">
             <h2 id="project-agents" class="section-head">Agents</h2>
             {overview.agents.length === 0 ? (
@@ -461,6 +423,8 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
               </button>
             ) : null}
           </section>
+            </div>
+          </details>
         </div>
       ) : null}
 
@@ -499,6 +463,15 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
       ) : null}
     </div>
   );
+}
+
+function ProjectCodingRows({ runs, onOpenChat }: { runs: ReturnType<typeof readCodingRuns>; onOpenChat: (handoff: ChatHandoff) => void }) {
+  if (!runs.length) return null;
+  return <div><h3 class="project-sub">Coding work</h3><div class="home-card">{runs.map(run => {
+    const phase = projectCodingRunPhase(run.phase);
+    const body = <><span class="project-line-text"><span class="project-line-title project-line-clamp">{run.objective}</span><span class="project-line-sub">{[projectCodingRunPlace(run), phase.label, relativeTime(run.updatedAt)].filter(Boolean).join(' · ')}</span></span>{run.originSessionId ? <Chevron /> : null}</>;
+    return run.originSessionId ? <button key={run.runId} type="button" class="home-row home-row-tap project-line" aria-label={`${run.objective}. Open the conversation it came from`} onClick={() => { haptic('light'); onOpenChat({ sessionId: run.originSessionId! }); }}>{body}</button> : <div key={run.runId} class="home-row project-line">{body}</div>;
+  })}</div></div>;
 }
 
 function Chevron() {

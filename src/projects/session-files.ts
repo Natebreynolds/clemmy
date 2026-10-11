@@ -9,14 +9,12 @@
  * call sensitive. More than one match is no match, so a card never shows the
  * wrong file. Nothing here writes.
  */
-import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, statSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parse, serialize, type DefaultTreeAdapterTypes as Html } from 'parse5';
-import { listFileDeliverablesForSessions } from '../memory/deliverable-index.js';
-import { isSensitivePath } from '../runtime/security.js';
-import { listEvents, openEventLog } from '../runtime/harness/eventlog.js';
+import { listDeliveredGroups, listFileDeliverablesForSessions, recordedFileIdentity, sessionFileId, type DeliveredGroup } from '../memory/deliverable-index.js';
+import { getSession, listEvents, openEventLog } from '../runtime/harness/eventlog.js';
 
 export type SessionFileKind = 'markdown' | 'text' | 'html' | 'pdf' | 'image' | 'other';
 
@@ -139,24 +137,95 @@ function relatedSessions(sessionId: string): string[] {
   return [...sessions];
 }
 
-function fileId(file: string): string {
-  return `sf_${createHash('sha256').update(file).digest('hex')}`;
+/** Resolve source links once per request, not once per artifact. Modern workers
+ * carry their exact parent in session metadata (a primary-key lookup). Legacy
+ * lineage uses one bounded, type-indexed event read; ambiguity stays unlinked. */
+function withConversationSources(groups: DeliveredGroup[]): DeliveredGroup[] {
+  const cache = new Map<string, string | null>();
+  let legacyParents: Map<string, Set<string>> | undefined;
+  const legacyParent = (child: string): string | null => {
+    if (!legacyParents) {
+      legacyParents = new Map();
+      const rows = openEventLog().prepare(`
+        SELECT session_id AS parent, json_extract(data_json, '$.childSessionId') AS child
+        FROM events INDEXED BY idx_events_type_seq
+        WHERE type = 'worker_started' AND role = 'system' AND json_valid(data_json)
+        ORDER BY seq DESC LIMIT 10001
+      `).all() as Array<{ parent: string; child: unknown }>;
+      // A truncated ancestry graph cannot prove that a parent is unique.
+      if (rows.length <= 10000) for (const row of rows) {
+        if (typeof row.child !== 'string' || !row.child.trim()) continue;
+        const parents = legacyParents.get(row.child.trim()) ?? new Set<string>();
+        parents.add(row.parent);
+        legacyParents.set(row.child.trim(), parents);
+      }
+    }
+    const parents = legacyParents.get(child);
+    return parents?.size === 1 ? [...parents][0]! : null;
+  };
+  const source = (owner: string | null): string | null => {
+    if (!owner) return null;
+    if (cache.has(owner)) return cache.get(owner)!;
+    const visited = new Set<string>();
+    let current: string | null = owner;
+    let result: string | null = null;
+    try {
+      while (current && visited.size < 32 && !visited.has(current)) {
+        if (cache.has(current)) { result = cache.get(current)!; break; }
+        visited.add(current);
+        const row = getSession(current);
+        const metadata = row?.metadata;
+        const worker = metadata?.source === 'delegated_worker' && metadata.workerScope === true;
+        if (row?.kind === 'chat' && !worker) { result = row.id; break; }
+        const parent = worker && typeof metadata.parentSessionId === 'string' ? metadata.parentSessionId.trim() : '';
+        current = parent || legacyParent(current);
+      }
+    } catch { /* unavailable history means no source link, never no artifacts */ }
+    for (const session of visited) cache.set(session, result);
+    return result;
+  };
+  return groups.map(group => {
+    const conversationSessionId = source(group.sessionId);
+    return { ...group, conversationSessionId,
+      artifacts: group.artifacts.map(artifact => ({ ...artifact, conversationSessionId })) };
+  });
+}
+
+/** Both authenticated surfaces use the same bounded query. A project names
+ * exact conversations; only their recorded workers inherit that association,
+ * since a sibling branch may now work in another project. An explicit empty
+ * or invalid scope never falls back to all work. */
+export function deliveredGroupsForSessionQuery(limit: number, query: unknown):
+  { ok: true; groups: DeliveredGroup[] } | { ok: false; error: 'invalid_session_ids' | 'session_scope_too_large' } {
+  if (query === undefined) return { ok: true, groups: withConversationSources(listDeliveredGroups(limit)) };
+  if (typeof query !== 'string' || query.length > 8000) return { ok: false, error: 'invalid_session_ids' };
+  const requested = query.split(',').map(id => id.trim());
+  if (requested.length > 50 || requested.some(id => !id || id.length > 160 || /[\u0000-\u001f\u007f]/.test(id))) {
+    return { ok: false, error: 'invalid_session_ids' };
+  }
+  const sessions = new Set(requested);
+  const pending = [...sessions];
+  for (let index = 0; index < pending.length; index++) {
+    for (const event of listEvents(pending[index]!, { types: ['worker_started'] })) {
+      const child = (event.data as { childSessionId?: unknown }).childSessionId;
+      if (event.role !== 'system' || typeof child !== 'string' || !child.trim() || sessions.has(child.trim())) continue;
+      sessions.add(child.trim());
+      pending.push(child.trim());
+      if (sessions.size > 500) return { ok: false, error: 'session_scope_too_large' };
+    }
+  }
+  return { ok: true, groups: withConversationSources(listDeliveredGroups(limit, { sessionIds: [...sessions] })) };
 }
 
 /** Only canonical, non-sensitive, regular files recorded by this conversation. */
-function savedFiles(sessionId: string): string[] {
+function savedFiles(sessionId: string, limit = 400): string[] {
   const session = sessionId.trim();
   if (!session) return [];
   const matches = new Set<string>();
   try {
-    for (const row of listFileDeliverablesForSessions(relatedSessions(session), 400)) {
-      // The recorded file itself, never a link to some other file.
-      try { if (lstatSync(row.target).isSymbolicLink()) continue; } catch { continue; }
-      let file: string;
-      try { file = realpathSync(row.target); } catch { continue; }
-      if (isSensitivePath(file) || isSensitivePath(row.target)) continue;
-      try { if (!statSync(file).isFile()) continue; } catch { continue; }
-      matches.add(file);
+    for (const row of listFileDeliverablesForSessions(relatedSessions(session), limit)) {
+      const identity = recordedFileIdentity(row.target);
+      if (identity) matches.add(identity.file);
     }
   } catch {
     return [];
@@ -171,8 +240,10 @@ export function fileSavedBySession(sessionId: string, name: string, folder?: str
   const within = (folder ?? '').trim();
   const wantedId = (id ?? '').trim();
   if ((!wanted && !wantedId) || wanted.includes('/') || wanted.includes('\\')) return null;
-  const matches = savedFiles(sessionId).filter(file =>
-    (!wantedId || fileId(file) === wantedId)
+  // Explicit identities may come from an older scoped project result. Search
+  // the whole bounded ledger for those, while keeping the drawer list small.
+  const matches = savedFiles(sessionId, wantedId ? 1000 : 400).filter(file =>
+    (!wantedId || sessionFileId(file) === wantedId)
     && (!wanted || path.basename(file) === wanted)
     && (!within || path.basename(path.dirname(file)) === within));
   return matches.length === 1 ? matches[0]! : null;
@@ -192,7 +263,7 @@ function readStart(file: string, bytes: number): Buffer {
 
 function fileView(file: string, stat = statSync(file)): SessionFileView {
   return {
-    fileId: fileId(file), name: path.basename(file), folder: path.basename(path.dirname(file)), place: place(file),
+    fileId: sessionFileId(file), name: path.basename(file), folder: path.basename(path.dirname(file)), place: place(file),
     kind: kindOf(file), bytes: stat.size, modifiedAt: stat.mtime.toISOString(), openable: OPENABLE.has(path.extname(file).toLowerCase()),
   };
 }

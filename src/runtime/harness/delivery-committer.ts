@@ -62,6 +62,7 @@ import { constrainNeedsInputPresentationForRecovery } from './recovery-presentat
 import { learnVerifiedWriteCapabilitiesForAcceptedTask } from './verified-write-capability-learning.js';
 import { learnHostRunStrategyForAcceptedTask } from './host-run-strategy-learning.js';
 import { learnResolvedReferencesForAcceptedTask } from './resolved-reference-learning.js';
+import { joinRouteOutcomeVerdict, scheduleRouteOutcomeJoin } from './route-outcome-join.js';
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
 import { pendingAcceptedLocalWork } from './local-work-completion.js';
 import { getPlanRevisionForSource } from './plan-artifacts.js';
@@ -1897,6 +1898,12 @@ export function commitTurnOutcome(
     } catch { /* strategy recall stays additive */ }
     // The reviewed answer and where its results live, for a later chat to reuse with its age.
     recordAnswerWorkEpisode({ ...workIdentity, text: persisted.text });
+  }
+  // What the turn's model earned (review verdict, tool success) goes onto its
+  // route metrics for the route policy, whatever the terminal's status.
+  if (terminal.inserted) {
+    const identity = { sessionId: persisted.identity.sessionId, sourceUserSeq: persisted.identity.sourceUserSeq };
+    scheduleRouteOutcomeJoin(() => joinRouteOutcomeVerdict(identity));
   }
   // NOTE: the run attempt is closed by the terminal publication itself, in the
   // same transaction (eventlog `terminalOwner` branch). A best-effort finish

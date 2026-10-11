@@ -197,3 +197,21 @@ test('exact accepted read-only Execute retains Worker facts without changing its
     }
   });
 });
+
+test('a default Worker with no pick, no intent rule and no saved agent adds no line to the turn', async () => {
+  // model:null already is the role here; the line was ~590 bytes on every
+  // round of every action turn (10-10 Lean Rounds).
+  await withRoleEnv({ CLEMMY_MODEL_ROLES: '[]' }, () => {
+    const context = buildAgentContextPacket(request, memory,
+      { sessionKind: 'chat', suppressConfirmBeat: true, skipCapabilityHunt: true });
+    assert.doesNotMatch(context.text, /Worker model role/);
+  });
+  // An intent rule alone brings it back: model:null then routes by the rule.
+  await withRoleEnv({ CLEMMY_MODEL_ROLES: JSON.stringify([
+    { role: 'worker', modelId: 'minimax-01', whenIntent: 'research', scope: 'durable', source: 'chat-rule' },
+  ]) }, () => {
+    const context = buildAgentContextPacket(request, memory,
+      { sessionKind: 'chat', suppressConfirmBeat: true, skipCapabilityHunt: true });
+    assert.match(context.text, /Worker model role \(role-wide configuration, no intent\)/);
+  });
+});

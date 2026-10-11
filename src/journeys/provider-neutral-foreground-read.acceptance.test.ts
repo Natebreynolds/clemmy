@@ -71,6 +71,7 @@ const mcpServers = await import('../runtime/mcp-servers.js');
 const productionPorts = await import('../runtime/harness/production-capability-ports.js');
 const semanticPorts = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
 const memoryDb = await import('../memory/db.js');
+const { rememberFact } = await import('../memory/facts.js');
 const requestObservation = await import('../runtime/harness/prompt-cache-observation.js');
 const requestProvenance = await import('../runtime/harness/model-request-provenance.js');
 const authorityPayloads = await import('../runtime/harness/authority-encrypted-payload-store.js');
@@ -417,6 +418,13 @@ test('matrix rows 1 and 3: a cold two-page read stays in one graphless foregroun
   eventlog.resetEventLog();
   resetHarnessRuntimeConfig();
   capabilityIndex._resetCapabilityIndexForTest();
+  // One remembered fact about the requested records, so the governing request
+  // carries a real, recall-run memory primer to verify (the fallback primer
+  // rides only when it cites a recall run, 0d12f9ffa). The journey used to
+  // pass on the owner's own request becoming a fact before the primer read it;
+  // automatic capture now waits for review first.
+  rememberFact({ kind: 'reference', scope: null,
+    content: `The ${objective} lives in the connected account and is read page by page.` });
   const emptyStore = capabilityStores.createCapabilityManifestStore([], { durable: false });
   const emptyFactory = capabilityCatalogs.createHostCapabilityCatalogFactory();
   capabilityStores.installCapabilityManifestStore(emptyStore);

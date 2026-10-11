@@ -16,7 +16,7 @@ import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.j
 import { signProof, deviceKeySupported, exportPublicJwk } from './device-key.js';
 import { connectionDoor, reportConnectionLost, setConnectionDoor } from './native-bridge.js';
 import { LAST_GOOD_HEADER, clearLastGood, noteLastGood } from './last-good.js';
-import { readBrainSelectionResponse, type BrainSelectionResponse } from '@clem/chat-engine';
+import { readBrainSelectionResponse, type BrainSelectionResponse, type ModelScorecardLike } from '@clem/chat-engine';
 import type { WorkflowRunReceipt } from './workflow-run-receipt';
 
 /**
@@ -586,6 +586,8 @@ export interface DeliveredArtifact {
   createdAt: string;
   openable: boolean;
   stillExists?: boolean;
+  fileRef?: { sessionId: string; name: string; folder: string; fileId: string };
+  conversationSessionId?: string | null;
 }
 
 export interface DeliveredGroup {
@@ -593,13 +595,17 @@ export interface DeliveredGroup {
   createdAt: string;
   title: string;
   why: string;
+  sessionId: string | null;
+  conversationSessionId?: string | null;
   artifactCount: number;
   artifacts: DeliveredArtifact[];
   url?: string;
 }
 
-export async function listDelivered(limit = 24): Promise<{ groups: DeliveredGroup[] }> {
-  return api(`/m/api/delivered?limit=${Math.max(1, Math.min(50, Math.trunc(limit)))}`);
+export async function listDelivered(limit = 24, scope?: { sessionIds: readonly string[] }): Promise<{ groups: DeliveredGroup[] }> {
+  const query = new URLSearchParams({ limit: String(Math.max(1, Math.min(50, Math.trunc(limit)))) });
+  if (scope) query.set('sessionIds', scope.sessionIds.join(','));
+  return api(`/m/api/delivered?${query}`);
 }
 
 export async function listInboxNotifications(limit = 100): Promise<{
@@ -1917,6 +1923,11 @@ export async function forgetLearnedWriteKind(kind: { operationId: string; accoun
 
 export async function getModelSettings(): Promise<ModelSettings> {
   return api<ModelSettings>('/m/api/settings/models');
+}
+
+/** What each role's model did this week: the desktop's scorecard, read-only. */
+export async function getModelScorecard(): Promise<ModelScorecardLike> {
+  return api<ModelScorecardLike>('/m/api/models/scorecard');
 }
 
 export interface JudgeFallbackSetting {

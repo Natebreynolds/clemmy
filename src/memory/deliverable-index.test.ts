@@ -6,7 +6,7 @@
  * yesterday" must recall ~/Desktop/ML-30-AI-Search-Drafts.md instead of
  * grinding through mailbox searches.
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -296,4 +296,85 @@ test('outlook drafts captured as recipient addresses are listed, even when not a
   assert.equal(groups[0].title, 'Email drafted');
   assert.deepEqual(groups[0].artifacts.map((a) => a.title).sort(), recipients);
   assert.ok(groups[0].artifacts.every((a) => !a.openable), 'an email address is not an openable draft URL');
+});
+
+test('file refs use the exact recorded worker and canonical identity, disambiguating identical names', async () => {
+  const { listDeliveredGroups } = await import('./deliverable-index.js');
+  const { readSessionFile } = await import('../projects/session-files.js');
+  const worker = 'artifact-worker-owner';
+  const targets = ['one/same/report.html', 'two/same/report.html'].map(relative => {
+    const file = path.join(TMP_HOME, relative);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, `<p>${relative}</p>`);
+    recordDeliverable({ kind: 'file', target: file, sessionId: worker, lane: 'local' });
+    return file;
+  });
+  const artifacts = listDeliveredGroups(50, { sessionIds: [worker] })[0].artifacts;
+  assert.equal(artifacts.length, 2);
+  assert.equal(new Set(artifacts.map(row => row.fileRef?.fileId)).size, 2);
+  for (const artifact of artifacts) {
+    assert.ok(artifact.fileRef);
+    assert.equal(artifact.fileRef.sessionId, worker, 'no parent session is invented');
+    const ref = artifact.fileRef;
+    const result = readSessionFile(ref.sessionId, ref.name, ref.folder, ref.fileId);
+    assert.ok(result.ok);
+    assert.equal(result.file, realpathSync(artifact.target));
+    assert.match(result.view.text!, /<p>/);
+    assert.equal(readSessionFile('unrelated-artifact-owner', ref.name, ref.folder, ref.fileId).ok, false);
+    assert.equal(readSessionFile(ref.sessionId, ref.name, ref.folder, `${ref.fileId}-wrong`).ok, false);
+  }
+  const oldRef = artifacts.find(row => row.target === targets[0])!.fileRef!;
+  recordDeliverable({ kind: 'file', target: targets[0], sessionId: 'new-artifact-owner' });
+  assert.equal(readSessionFile(oldRef.sessionId, oldRef.name, oldRef.folder, oldRef.fileId).ok, false,
+    'a stale ref cannot retain access after the recorded owner changes');
+});
+
+test('file refs are omitted for missing association, missing files, sensitive files, links and directories', async () => {
+  const { listDeliveredGroups } = await import('./deliverable-index.js');
+  const root = path.join(TMP_HOME, 'unopenable-artifacts');
+  mkdirSync(root);
+  const cases = [
+    { file: path.join(root, 'legacy.html'), sessionId: null, contents: '<p>Legacy</p>' },
+    { file: path.join(root, 'missing.html'), sessionId: 'unopenable-owner' },
+    { file: path.join(root, '.env'), sessionId: 'unopenable-owner', contents: 'SECRET=synthetic' },
+    { file: path.join(root, 'padded-owner.html'), sessionId: ' padded-owner ', contents: '<p>No guessed owner</p>' },
+  ];
+  for (const item of cases) {
+    if (item.contents) writeFileSync(item.file, item.contents);
+    recordDeliverable({ kind: 'file', target: item.file, sessionId: item.sessionId });
+  }
+  const link = path.join(root, 'link.html');
+  symlinkSync(cases[0].file, link);
+  for (const file of [link, root]) recordDeliverable({ kind: 'file', target: file, sessionId: 'unopenable-owner' });
+  const targets = new Set([...cases.map(row => row.file), link, root]);
+  const artifacts = listDeliveredGroups(50).flatMap(group => group.artifacts).filter(row => targets.has(row.target));
+  assert.equal(artifacts.length, targets.size, 'unavailable records stay visible');
+  for (const artifact of artifacts) {
+    assert.equal(artifact.fileRef, undefined, artifact.target);
+    assert.equal(artifact.openable, false, artifact.target);
+  }
+});
+
+test('a scoped old artifact survives unrelated recency and opens beyond the drawer record window', async () => {
+  const { listDeliveredGroups } = await import('./deliverable-index.js');
+  const { readSessionFile, listSessionFiles } = await import('../projects/session-files.js');
+  const sessionId = 'old-project-artifact';
+  const target = path.join(TMP_HOME, 'old-project-report.pdf');
+  writeFileSync(target, '%PDF-1.7\ncontrolled old artifact');
+  recordDeliverable({ kind: 'file', target, sessionId, at: '2000-01-01T00:00:00.000Z' });
+  // Missing newer file records still count toward the drawer's bounded query.
+  for (let i = 0; i < 401; i++) {
+    recordDeliverable({ kind: 'file', target: path.join(TMP_HOME, `newer-${i}.md`), sessionId,
+      at: '2050-01-01T00:00:00.000Z' });
+  }
+  assert.equal(listDeliveredGroups(50).flatMap(group => group.artifacts).some(row => row.target === target), false);
+  const scoped = listDeliveredGroups(50, { sessionIds: [sessionId] });
+  const artifact = scoped[0].artifacts.find(row => row.target === target)!;
+  assert.ok(artifact.fileRef, 'scoping happens before global recency limits');
+  assert.equal(listSessionFiles(sessionId).some(row => row.name === 'old-project-report.pdf'), false, 'drawer bound unchanged');
+  const ref = artifact.fileRef;
+  const opened = readSessionFile(ref.sessionId, ref.name, ref.folder, ref.fileId);
+  assert.ok(opened.ok, 'an explicit recorded id can reach the full bounded ledger');
+  assert.equal(opened.view.kind, 'pdf');
+  assert.deepEqual(listDeliveredGroups(50, { sessionIds: [] }), []);
 });

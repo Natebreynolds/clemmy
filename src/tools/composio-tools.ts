@@ -1065,6 +1065,7 @@ function clearReconnectBreaker(sid: string | undefined, toolSlug: string): void 
 
 /** Test seam for the gateway's breaker (module-private state). */
 export const __gatewayTest__ = {
+  renderCallableContract,
   recordReconnectBreaker,
   reconnectBreakerTripped,
   clearReconnectBreaker,
@@ -1176,6 +1177,27 @@ function forgetComposioSearch(key: string, record: ComposioSearchRecord): void {
  * work. Returns '' when no schema is available, so this can never make an
  * error message worse.
  */
+/** A field's limits, as short as a person would say them ("1 to 25", "one
+ *  of: a, b"), so a call can stay inside them the first time. */
+function contractFieldLimits(spec: Record<string, unknown> | undefined): string {
+  if (!spec) return '';
+  const number = (key: string) => (typeof spec[key] === 'number' && Number.isFinite(spec[key]) ? spec[key] as number : undefined);
+  if (Array.isArray(spec.enum) && spec.enum.length > 0) {
+    const shown = spec.enum.slice(0, 8).map((value) => JSON.stringify(value)).join(', ');
+    return `one of: ${shown}${spec.enum.length > 8 ? ', …' : ''}`;
+  }
+  const minimum = number('minimum');
+  const maximum = number('maximum');
+  if (minimum !== undefined && maximum !== undefined) return `${minimum} to ${maximum}`;
+  if (maximum !== undefined) return `at most ${maximum}`;
+  if (minimum !== undefined) return `at least ${minimum}`;
+  const maxLength = number('maxLength');
+  if (maxLength !== undefined) return `up to ${maxLength} characters`;
+  const maxItems = number('maxItems');
+  if (maxItems !== undefined) return `up to ${maxItems} items`;
+  return '';
+}
+
 function renderCallableContract(toolSlug: string, schema: unknown): string {
   const shape = schema && typeof schema === 'object' ? schema as Record<string, unknown> : null;
   const properties = shape?.properties && typeof shape.properties === 'object'
@@ -1189,7 +1211,8 @@ function renderCallableContract(toolSlug: string, schema: unknown): string {
     const type = fileInput
       ? 'full path of a file on this computer, or a list of them (uploaded when the call runs)'
       : typeof spec?.type === 'string' ? spec.type : 'any';
-    return `  ${name}${required.has(name) ? '*' : ''}: ${type}`;
+    const limits = fileInput ? '' : contractFieldLimits(spec);
+    return `  ${name}${required.has(name) ? '*' : ''}: ${type}${limits ? ` (${limits})` : ''}`;
   });
   if (lines.length === 0) return '';
   return `\n\nCallable contract for ${toolSlug} (* = required):\n${lines.join('\n')}`

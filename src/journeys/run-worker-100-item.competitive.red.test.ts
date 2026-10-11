@@ -172,6 +172,8 @@ writeFileSync(path.join(HOME, 'state', 'claude-auth.json'), JSON.stringify({
 
 const { runConversation } = await import('../runtime/harness/loop.js');
 const { configureHarnessRuntime, resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
+const planScope = await import('../agents/plan-scope.js');
+const modelDiscovery = await import('../runtime/harness/model-discovery.js');
 const { buildOrchestratorAgent } = await import('../agents/orchestrator.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const capabilityCatalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
@@ -327,6 +329,8 @@ function runWorkerPacket(mode: 'declare' | 'reconcile') {
 }
 
 after(async () => {
+  planScope._setApprovedWriteKindsForTests(null);
+  modelDiscovery._setModelDiscoverersForTest(null);
   workerAdapter.setClaudeAgentSdkWorkerRunForTest(null);
   fanoutReduce._setShardReducerForTests(null);
   workerConcurrency._resetWorkerConcurrencyForTest();
@@ -355,6 +359,14 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
   // Auto mode (2026-09-30): this journey pins the provider write pipeline,
   // not the mode; in Ask mode the first change of a kind waits for the owner.
   proactivity.saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  // It pins the pipeline, not the first-time card either (owner 2026-10-06:
+  // a connected-app change asks once in both modes): every kind runs as
+  // approved, like the unit fixtures that exercise dispatch.
+  planScope._setApprovedWriteKindsForTests('all');
+  // No live model catalog. A real Anthropic discovery spawns the Claude SDK
+  // and, when it finishes first, replaces the presets the worker binding is
+  // validated against, so every worker ran on another model (10-10).
+  modelDiscovery._setModelDiscoverersForTest({ anthropic: async () => [], openai: async () => [] });
 
   const configured = await configureHarnessRuntime();
   assert.equal(configured.ok, true, configured.ok ? '' : configured.reason);

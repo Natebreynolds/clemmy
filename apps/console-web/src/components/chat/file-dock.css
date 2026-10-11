@@ -1,8 +1,9 @@
-.file-dock-root { display:flex; flex:1; min-width:0; min-height:0; height:100%; flex-direction:column; }
+.file-dock-root { display:flex; flex:1; min-width:0; min-height:0; height:100%; flex-direction:column; overflow:hidden; }
 .file-dock-bar { display:flex; align-items:center; gap:12px; padding:4px 16px; border-bottom:1px solid var(--border); background:var(--bg-surface); }
-.file-dock-workspace { display:flex; flex:1; min-height:0; min-width:0; }
+.file-dock-workspace { display:flex; flex:1; min-height:0; min-width:0; overflow:hidden; }
 .file-dock-conversation { display:flex; flex:1; min-width:0; min-height:0; flex-direction:column; }
-.file-dock-panel { display:flex; flex-direction:column; min-height:0; width:48%; min-width:360px; max-width:1000px; background:var(--bg-surface); border-left:1px solid var(--border); }
+.file-dock-root[data-scroll-content="true"] .file-dock-conversation { overflow:auto; }
+.file-dock-panel { display:flex; flex-shrink:0; overflow:hidden; flex-direction:column; min-height:0; width:48%; min-width:360px; max-width:1000px; background:var(--bg-surface); border-left:1px solid var(--border); }
 .file-dock-controls { display:flex; align-items:center; gap:4px; padding:6px 8px; border-bottom:1px solid var(--border); }
 .file-dock-document { border:0; flex:1; min-height:220px; width:100%; background:var(--bg-surface); }
 .file-dock-file { display:flex; align-items:center; width:100%; min-height:64px; gap:12px; padding:12px; border-radius:var(--radius-sm, 8px); text-align:left; }

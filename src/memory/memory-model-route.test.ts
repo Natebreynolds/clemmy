@@ -23,10 +23,9 @@ const { Usage } = await import('@openai/agents');
 const { ClaudeModelProvider } = await import('../runtime/harness/claude-model.js');
 const { CodexModelProvider } = await import('../runtime/harness/codex-model.js');
 const { resolveBoundaryJudge } = await import('../runtime/harness/debate-model.js');
-const { defaultForRole, pinnedBrainForSession, resolveRoleModel, __sessionBrainPinTest__ } = await import('../runtime/harness/model-roles.js');
+const { defaultForRole, pinnedBrainForSession, resolveRoleModel, unavailableSavedBrain, __sessionBrainPinTest__ } = await import('../runtime/harness/model-roles.js');
 const { __resetRateLimitStoreForTests, getRateLimitSnapshot, recordCodexUsageExhausted } = await import('../runtime/harness/rate-limit-store.js');
 const { _setDiscoveredModelsForTest } = await import('../runtime/harness/model-discovery.js');
-const { MODELS, DEFAULT_CODEX_FAST_MODEL } = await import('../config.js');
 const {
   describeMemoryModel,
   memoryJobModelId,
@@ -156,18 +155,20 @@ test('a same-family automatic model is named as itself, not as the checker row',
   assert.equal(defaultForRole('memory'), route.modelId, 'the role registry default is the memory route');
 });
 
-test('skills, profile and import keep today\'s fast-tier model string when automatic', () => {
-  for (const job of ['skills', 'identity'] as const) {
+test('skills, profile and import take exactly the model the owner chose to do the work when automatic', () => {
+  // Owner, 2026-10-10: "Background memory should run on what the user has selected."
+  const brain = resolveRoleModel('brain');
+  for (const job of ['skills', 'identity', 'import'] as const) {
     const route = resolveMemoryModelRoute(job);
     assert.ok(route);
-    assert.equal(route.model, MODELS.fast, `${job} keeps the bare fast-tier string`);
-    assert.equal(route.modelId, MODELS.fast);
+    assert.notEqual(typeof route.model, 'string', `${job} is built exactly, never a string for the router to place`);
+    assert.equal(route.modelId, brain.modelId);
+    assert.equal(route.provider, brain.provider);
     assert.equal(route.source, 'automatic');
-    assert.equal(route.follows, null);
+    assert.equal(route.follows, 'brain');
     assert.equal(route.boundary, undefined, 'no checker deadline or hedge');
+    assert.equal(routeContext(route.model).role, 'memory', `${job} is recorded as memory work`);
   }
-  const imported = resolveMemoryModelRoute('import');
-  assert.equal(imported?.model, MODELS.fast || MODELS.primary || DEFAULT_CODEX_FAST_MODEL);
 });
 
 test('a chosen memory model is used exactly by every governed job, with no deadline or hedge', () => {
@@ -427,15 +428,14 @@ test('with no model signed in, the automatic route resolves nothing: every gover
   }
 });
 
-test('the fast-tier jobs name the model the router actually serves them, and the meter tags that account', async () => {
+test('the jobs that follow the brain name the model the owner chose, and a signed-in subscription never takes them', async () => {
   const { rolesByAccount } = await import('../runtime/harness/provider-billing.js');
   const { getClaudeBrainModel } = await import('../config.js');
   const fast = ['skills', 'identity', 'import'] as const;
   const memoryAccounts = () => [...rolesByAccount()].filter(([, roles]) => roles.includes('memory')).map(([account]) => account).sort();
 
-  // BYO all-in with no subscription signed in: the router sends the
-  // fast-tier string to the BYO primary, so the job names it and no
-  // subscription account carries memory work.
+  // BYO all-in with no subscription signed in: the jobs follow the BYO
+  // primary the owner chose, and no subscription account carries memory work.
   Object.assign(process.env, { AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_JUDGE_ID: 'byo-judge-model' });
   useByo();
   writeAuth({ claude: false, codex: false });
@@ -443,24 +443,20 @@ test('the fast-tier jobs name the model the router actually serves them, and the
   for (const job of fast) {
     assert.equal(memoryJobModelId(job, described), 'byo-memory-model', `${job} names the BYO primary`);
     assert.equal(resolveMemoryModelRoute(job)?.modelId, 'byo-memory-model', `${job} asks for it`);
-    assert.equal(resolveMemoryModelRoute(job)?.model, job === 'import' ? (MODELS.fast || MODELS.primary || DEFAULT_CODEX_FAST_MODEL) : MODELS.fast,
-      `${job} still hands the agent today's string`);
   }
   assert.ok(!memoryAccounts().includes('codex'), 'no Codex account, no Codex memory');
 
-  // The same all-in home with Codex signed in: a connected subscription keeps
-  // its own lane (byo-providers, 10-05), so the fast-tier string is served by
-  // Codex. The job names what actually serves it, and the meter credits Codex.
+  // The same all-in home with Codex signed in: Codex being signed in does not
+  // make it the owner's choice. The jobs stay on the model the owner chose.
   writeAuth({ claude: false });
   described = describeMemoryModel();
   for (const job of fast) {
-    const served = memoryJobModelId(job, described);
-    assert.ok(served && served !== 'byo-memory-model', `${job} names the subscription model that serves it, not the BYO primary`);
+    assert.equal(memoryJobModelId(job, described), 'byo-memory-model', `${job} stays on the owner's model`);
+    assert.equal(resolveMemoryModelRoute(job)?.modelId, 'byo-memory-model');
   }
-  assert.ok(memoryAccounts().includes('codex'), 'the account that serves memory work carries it');
+  assert.ok(!memoryAccounts().includes('codex'), 'a signed-in subscription the owner did not choose carries no memory work');
 
-  // Claude signed in without Codex: the router sends a Codex-shaped string
-  // to the Claude brain.
+  // Claude signed in without Codex: the Claude brain the owner runs on.
   Object.assign(process.env, { AUTH_MODE: 'claude_oauth', MODEL_ROUTING_MODE: 'off', BYO_MODEL_BASE_URL: '', BYO_MODEL_API_KEY: '', BYO_MODEL_ID: '', BYO_MODEL_JUDGE_ID: '' });
   writeAuth({ codex: false });
   described = describeMemoryModel();
@@ -486,15 +482,54 @@ test('the token meter reads the env file and the vault once to say which account
   }
 });
 
-test('a same-family automatic route on a signed-out brain family waits, while the model strings still reach a connected provider', () => {
+test('a signed-out brain family makes every automatic job that follows it wait; nothing the owner did not choose stands in', () => {
   Object.assign(process.env, { AUTH_MODE: 'claude_oauth', CLEMMY_JUDGE_CROSS_FAMILY: 'off' });
   writeAuth({ claude: false });
   assert.equal(resolveBoundaryJudge().judgeFamily, 'claude', 'fixture: the checker stays in the brain family');
   assert.equal(resolveMemoryModelRoute('learn'), null);
   assert.deepEqual(memoryModelAvailability('learn'), { ok: false, reason: 'model_unavailable', problem: 'not_connected' });
-  // A bare model string goes through the shared router, which reaches the
-  // provider that is signed in.
-  assert.ok(resolveMemoryModelRoute('skills'), 'skills still has a model that can answer');
+  // Codex is still signed in, but the owner's brain is Claude: skills waits
+  // for it rather than running on Codex.
+  assert.equal(resolveMemoryModelRoute('skills'), null);
+  assert.deepEqual(memoryModelAvailability('skills'), { ok: false, reason: 'model_unavailable', problem: 'not_connected' });
   writeAuth();
   assert.ok(resolveMemoryModelRoute('learn'), 'signed back in, learning resumes');
+  assert.ok(resolveMemoryModelRoute('skills'), 'and so do the jobs that follow the brain');
+});
+
+test('a saved brain choice that cannot serve makes the jobs that follow it wait, and they resume on it, never on the stand-in', () => {
+  // The owner saved an API-key brain; Codex is also signed in and stands in
+  // for the conversation when that backend is removed.
+  Object.assign(process.env, { AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in' });
+  useByo();
+  assert.equal(resolveRoleModel('brain').modelId, 'byo-memory-model', 'fixture: the saved brain serves while connected');
+  assert.equal(resolveMemoryModelRoute('skills')?.modelId, 'byo-memory-model');
+
+  Object.assign(process.env, { BYO_MODEL_API_KEY: '' });
+  assert.notEqual(resolveRoleModel('brain').modelId, 'byo-memory-model', 'fixture: another model stands in for the conversation');
+  assert.deepEqual(unavailableSavedBrain(), { modelId: 'byo-memory-model', provider: 'byo' });
+  for (const job of ['skills', 'identity', 'import'] as const) {
+    assert.equal(resolveMemoryModelRoute(job), null, `${job} waits for the saved choice`);
+    assert.equal(memoryModelAvailability(job).ok, false);
+    assert.equal(memoryJobModelId(job), null, `${job} names no stand-in`);
+  }
+
+  useByo();
+  assert.equal(unavailableSavedBrain(), null);
+  for (const job of ['skills', 'identity', 'import'] as const) {
+    assert.equal(resolveMemoryModelRoute(job)?.modelId, 'byo-memory-model', `${job} resumes on the saved choice`);
+  }
+});
+
+test('a home that never saved an API-key brain is not told its brain is missing', () => {
+  // Unset AUTH_MODE reads as api_key inside the config; that default is not a
+  // saved choice, so the Codex brain it runs is the owner's brain.
+  delete process.env.AUTH_MODE;
+  Object.assign(process.env, { MODEL_ROUTING_MODE: 'off' });
+  try {
+    assert.equal(unavailableSavedBrain(), null);
+    assert.ok(resolveMemoryModelRoute('skills'), 'skills runs on the Codex brain');
+  } finally {
+    process.env.AUTH_MODE = 'codex_oauth';
+  }
 });

@@ -32,6 +32,7 @@ interface Props {
   onOpenChat: (handoff: ChatHandoff) => void;
   onOpenRun: (runSessionId: string) => void;
   onOpenAgent: (agentId: string) => void;
+  onOpenSpace: (spaceId: string) => void;
   onOpenNeedsYou: () => void;
   /** A decision was settled here, so the Needs-you count is read again. */
   onDecided: () => void;
@@ -39,7 +40,7 @@ interface Props {
   createRequest?: number;
 }
 
-export function Projects({ initialProjectId, onProjectChange, onOpenChat, onOpenRun, onOpenAgent, onOpenNeedsYou, onDecided, createRequest }: Props) {
+export function Projects({ initialProjectId, onProjectChange, onOpenChat, onOpenRun, onOpenAgent, onOpenSpace, onOpenNeedsYou, onDecided, createRequest }: Props) {
   const [openId, setOpenId] = useState<string | null>(initialProjectId ?? null);
   useBackGesture(openId !== null, () => { setOpenId(null); onProjectChange?.(null); });
   // The URL is the source of truth for which project is open.
@@ -82,6 +83,7 @@ export function Projects({ initialProjectId, onProjectChange, onOpenChat, onOpen
         onOpenChat={onOpenChat}
         onOpenRun={onOpenRun}
         onOpenAgent={onOpenAgent}
+        onOpenSpace={onOpenSpace}
         onOpenNeedsYou={onOpenNeedsYou}
         onDecided={onDecided}
       />

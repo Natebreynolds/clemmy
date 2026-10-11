@@ -44,6 +44,7 @@ const RATIONALE_REASK = 'This direction keeps the topic useful rather than trend
 const CUSTOM_QUESTION = 'Tell me your preferred audience, channels, voice, and cadence in one reply. For example: audience = IT leaders; channels = LinkedIn; voice = evidence-led; cadence = 3/week for 3 weeks.';
 const CUSTOM_DETAILS = 'audience = IT leaders; channels = LinkedIn; voice = evidence-led; cadence = 3/week for 3 weeks';
 
+const clarificationRevision = await import('../runtime/semantic-boundary/clarification-revision.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const continuity = await import('../runtime/harness/task-continuity-runtime.js');
 const taskContinuity = await import('../memory/task-continuity.js');
@@ -549,6 +550,17 @@ test('literal B opens one bundled customization slot; details resume the origina
     details.seq,
   );
   assert.deepEqual(typedDetails, { disposition: 'provided' });
+  // Since d222b5f3d a typed answer resumes the paused task only after its
+  // reply route settles; production classifies between admission and
+  // enrichment, with the completeness model answering that it is complete.
+  continuity._setClarificationAnswerCompletenessForTests((input) => clarificationRevision.checkClarificationAnswerCompleteness(input,
+    async () => ({ ok: true, model: 'fixture-jev', answers: { complete_answer: { type: 'noul', noul: 0.99 } },
+      usage: { input_tokens: 1, output_tokens: 1 }, decisionId: 'fixture-completeness' }) as never));
+  try {
+    assert.equal((await continuity.classifyUnsettledOpenQuestionReply({ sessionId: session.id, sourceUserSeq: details.seq }))?.route, 'settled');
+  } finally {
+    continuity._setClarificationAnswerCompletenessForTests(null);
+  }
   const resumed = await continuity.enrichAcceptedRequestWithTaskContinuity({
     sessionId: session.id, sourceUserSeq: details.seq, message: CUSTOM_DETAILS,
   }, details.seq, { typedClassification: typedDetails, resolveCandidates: false });

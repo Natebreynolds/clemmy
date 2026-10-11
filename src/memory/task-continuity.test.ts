@@ -898,6 +898,37 @@ for (const [field, value] of [['goalId', 'wrong-goal'], ['revision', 1], ['quest
   });
 }
 
+test('a customize meta choice opens its own question under the same goal, and only that hop may change the question', () => {
+  // Since d222b5f3d the chain refused every question change, so customization
+  // details after a literal "customize" choice could never resume the task.
+  const customizeSlot = (fixture: ReturnType<typeof clarificationChain>, overrides: Record<string, unknown> = {}) => ({
+    ...fixture.slot,
+    questionId: continuity.customizationQuestionId(fixture.leaf.originatingSourceUserSeq),
+    slotKey: continuity.CUSTOMIZATION_SLOT_KEY,
+    ...overrides,
+  });
+  const setLeafSlot = (fixture: ReturnType<typeof clarificationChain>, slot: Record<string, unknown>) => eventlog.openEventLog()
+    .prepare('UPDATE task_continuity_packets SET pause_slot_json = ? WHERE packet_id = ?')
+    .run(JSON.stringify(slot), fixture.leaf.packetId);
+
+  const admitted = clarificationChain('literal-customize-hop');
+  setLeafSlot(admitted, customizeSlot(admitted));
+  assert.notDeepEqual(readChain(admitted), { status: 'refused', reason: 'slot_changed' });
+  assert.equal((readChain(admitted) as { status: string }).status === 'refused', false, JSON.stringify(readChain(admitted)));
+
+  // The customization key with a question that is not this hop's own is refused.
+  const borrowed = clarificationChain('literal-customize-borrowed');
+  setLeafSlot(borrowed, customizeSlot(borrowed, { questionId: continuity.customizationQuestionId(borrowed.root.seq) }));
+  assert.deepEqual(readChain(borrowed), { status: 'refused', reason: 'slot_changed' });
+
+  // So is a customization hop that changes the goal or the revision.
+  for (const [field, value] of [['goalId', 'wrong-goal'], ['revision', 1]] as const) {
+    const changed = clarificationChain(`literal-customize-${field}`);
+    setLeafSlot(changed, customizeSlot(changed, { [field]: value }));
+    assert.deepEqual(readChain(changed), { status: 'refused', reason: 'slot_changed' });
+  }
+});
+
 test('clarification chain rejects malformed slot and wrong parent/root event identity', () => {
   for (const corruption of ['slot', 'parent', 'root-event', 'origin-event'] as const) {
     const fixture = clarificationChain(`literal-bad-${corruption}`);

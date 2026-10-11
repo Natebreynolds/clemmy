@@ -792,6 +792,82 @@ function schemaMentionsAnnotation(value: unknown, annotation: StagedFileAnnotati
   return false;
 }
 
+/**
+ * The first top-level field that breaks its schema, and how, so a refused call
+ * can be repaired in one step instead of guessed at. Live 2026-10-10: a page
+ * size above its field's maximum was refused twice as "does not satisfy the
+ * exact schema at /" before a call without it went through. Null when the
+ * mismatch is not one field's (the caller keeps the general refusal).
+ */
+function firstFieldMismatch(
+  rootSchema: JsonSchema,
+  value: unknown,
+  context: PlanContext,
+): { pointer: string; reason: string } | null {
+  let root = rootSchema;
+  if (typeof root !== 'boolean' && root.$ref !== undefined) root = resolveInternalRef(root.$ref, context, '');
+  if (typeof root === 'boolean' || !isPlainObject(value)) return null;
+  const properties = isPlainObject(root.properties) ? root.properties : {};
+  const required = Array.isArray(root.required) ? root.required.filter((key): key is string => typeof key === 'string') : [];
+  for (const key of required) {
+    if (!ownDataProperty(value, key, '').present) return { pointer: childPointer('', key), reason: 'a required field is missing' };
+  }
+  for (const key of Object.keys(value)) {
+    const pointer = childPointer('', key);
+    const raw = Object.getOwnPropertyDescriptor(properties, key)?.value;
+    if (raw === undefined) {
+      if (root.additionalProperties === false) return { pointer, reason: 'this operation has no such field' };
+      continue;
+    }
+    const field = asSchema(raw, pointer);
+    const fieldValue = ownDataProperty(value, key, pointer).value;
+    context.schemaSteps = 0;
+    if (matchesSchema(field, fieldValue, context, pointer, 1)) continue;
+    return { pointer, reason: describeFieldMismatch(field, fieldValue, context, pointer) };
+  }
+  return null;
+}
+
+/** The broken keyword in a person's words: "50 is above the maximum 25". */
+function describeFieldMismatch(fieldSchema: JsonSchema, value: unknown, context: PlanContext, pointer: string): string {
+  let schema = fieldSchema;
+  if (typeof schema !== 'boolean' && schema.$ref !== undefined) schema = resolveInternalRef(schema.$ref, context, pointer);
+  if (typeof schema === 'boolean') return 'this field is not accepted';
+  const shown = typeof value === 'string' ? JSON.stringify(value.length > 40 ? `${value.slice(0, 40)}…` : value) : JSON.stringify(value);
+  const type = schema.type;
+  if (typeof type === 'string' && !(value === null && schema.nullable === true) && !typeMatches(type, value)) {
+    return `${shown} is not ${/^[aeiou]/.test(type) ? 'an' : 'a'} ${type}`;
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => jsonEqual(value, candidate))) {
+    return `${shown} is not one of ${schema.enum.slice(0, 8).map((candidate) => JSON.stringify(candidate)).join(', ')}`;
+  }
+  const number = (key: string) => (typeof schema === 'object' && typeof schema[key] === 'number' ? schema[key] as number : undefined);
+  if (typeof value === 'number') {
+    const maximum = number('maximum');
+    const minimum = number('minimum');
+    if (maximum !== undefined && value > maximum) return `${value} is above the maximum ${maximum}`;
+    if (minimum !== undefined && value < minimum) return `${value} is below the minimum ${minimum}`;
+    const exclusiveMaximum = number('exclusiveMaximum');
+    const exclusiveMinimum = number('exclusiveMinimum');
+    if (exclusiveMaximum !== undefined && value >= exclusiveMaximum) return `${value} must be below ${exclusiveMaximum}`;
+    if (exclusiveMinimum !== undefined && value <= exclusiveMinimum) return `${value} must be above ${exclusiveMinimum}`;
+  }
+  if (typeof value === 'string') {
+    const length = [...value].length;
+    const maxLength = number('maxLength');
+    const minLength = number('minLength');
+    if (maxLength !== undefined && length > maxLength) return `the text is ${length} characters; the most is ${maxLength}`;
+    if (minLength !== undefined && length < minLength) return `the text is ${length} characters; the least is ${minLength}`;
+  }
+  if (Array.isArray(value)) {
+    const maxItems = number('maxItems');
+    const minItems = number('minItems');
+    if (maxItems !== undefined && value.length > maxItems) return `${value.length} items; the most is ${maxItems}`;
+    if (minItems !== undefined && value.length < minItems) return `${value.length} items; the least is ${minItems}`;
+  }
+  return 'the value does not match this field\'s schema';
+}
+
 function buildPlan(
   annotation: StagedFileAnnotation,
   schemaValue: unknown,
@@ -815,7 +891,11 @@ function buildPlan(
   const output = new Map<string, PlannedNode>();
   walkSchema(rootSchema, runtimeValue, [], output, context, 0);
   if (!matchesSchema(rootSchema, runtimeValue, context, '', 0)) {
-    throw new StagedFileTransferPlanError('schema_mismatch', 'runtime value does not satisfy the exact schema', '');
+    let mismatch: { pointer: string; reason: string } | null = null;
+    try { mismatch = firstFieldMismatch(rootSchema, runtimeValue, context); } catch { mismatch = null; }
+    throw new StagedFileTransferPlanError('schema_mismatch',
+      mismatch ? `runtime value does not satisfy the exact schema: ${mismatch.reason}` : 'runtime value does not satisfy the exact schema',
+      mismatch?.pointer ?? '');
   }
   return Object.freeze(
     [...output.values()]

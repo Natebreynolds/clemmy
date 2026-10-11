@@ -376,3 +376,25 @@ test('the OpenAI key is named for memory search only while it is the chosen embe
     } finally { await h.close(); }
   });
 });
+
+test('the model scorecard requires authorization and answers an empty home with no rows', async () => {
+  const closed = await boot({ v: false });
+  try {
+    assert.equal((await fetch(`${closed.url}/api/console/models/scorecard`)).status, 401);
+  } finally {
+    await closed.close();
+  }
+  const h = await boot();
+  try {
+    for (const days of ['7', '30']) {
+      const res = await fetch(`${h.url}/api/console/models/scorecard?days=${days}`);
+      assert.equal(res.status, 200);
+      const body = await res.json() as { version: number; window: { days: number }; rows: unknown[] };
+      assert.equal(body.version, 1);
+      assert.equal(body.window.days, Number(days));
+      assert.deepEqual(body.rows, [], 'nothing measured yet is no rows, never a row of zeros');
+    }
+  } finally {
+    await h.close();
+  }
+});

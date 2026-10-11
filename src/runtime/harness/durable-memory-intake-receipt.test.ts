@@ -836,3 +836,17 @@ test('the receipt reads volunteered statements by the same reason the drain writ
   const { UNJUDGED_OWNER_STATEMENT_REASON } = await import('../../memory/durable-consolidation.js');
   assert.equal(receipts.VOLUNTEERED_FOR_REVIEW_REASON, UNJUDGED_OWNER_STATEMENT_REASON);
 });
+
+test('a read the capture pattern takes for a first-person fact holds no turn to memory proof', () => {
+  // Journey 2026-10-10: a plain retrieve-and-report read was captured by the
+  // gap-only declarative fallback and ended as an unverified "correction".
+  const read = 'Retrieve the complete fixture records from my connected account and report every record.';
+  const captured = capture.extractAutoMemoryCandidates(read);
+  assert.ok(captured.every((candidate) => candidate.reason === receipts.INFERRED_DECLARATIVE_REASON || captured.length === 0),
+    JSON.stringify(captured));
+  // Whatever the pattern captures for it, the reason is one the receipt reads
+  // as not stated to keep; a stated remember request still is.
+  const remember = capture.extractAutoMemoryCandidates('Remember that my billing contact is the finance team.');
+  assert.ok(remember.length > 0 && remember.every((candidate) => candidate.reason !== receipts.INFERRED_DECLARATIVE_REASON
+    && candidate.reason !== receipts.VOLUNTEERED_FOR_REVIEW_REASON), JSON.stringify(remember));
+});

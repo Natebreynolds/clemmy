@@ -20,8 +20,10 @@
  * first-turn primer and every memory tool surface it BEFORE tool grinding —
  * advisory context, never a gate.
  */
-import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { isSensitivePath } from '../runtime/security.js';
 import { openMemoryDb } from './db.js';
 import { explicitlyNamesDeliverable } from './deliverable-recall-score.js';
 
@@ -168,10 +170,34 @@ export function listFileDeliverablesForSessions(sessionIds: readonly string[], l
       SELECT id, created_at AS createdAt, kind, target, title, why, session_id AS sessionId, lane
       FROM deliverables WHERE kind = 'file' AND session_id IN (${sessions.map(() => '?').join(', ')})
       ORDER BY created_at DESC LIMIT ?
-    `).all(...sessions, Math.max(1, Math.min(limit, 500))) as DeliverableRecord[];
+    `).all(...sessions, Math.max(1, Math.min(limit, MAX_ROWS))) as DeliverableRecord[];
   } catch {
     return [];
   }
+}
+
+/** A current recorded file, opened only through the authenticated session API.
+ * The id identifies its canonical path, not a historical revision. */
+export interface DeliveredFileRef {
+  sessionId: string;
+  name: string;
+  folder: string;
+  fileId: string;
+}
+
+export function sessionFileId(canonicalFile: string): string {
+  return `sf_${createHash('sha256').update(canonicalFile).digest('hex')}`;
+}
+
+/** Shared by artifact discovery and the session viewer. A caller must still
+ * establish that the target was recorded by its allowed session. */
+export function recordedFileIdentity(target: string): { file: string; fileId: string; name: string; folder: string } | null {
+  try {
+    if (!path.isAbsolute(target) || lstatSync(target).isSymbolicLink()) return null;
+    const file = realpathSync(target);
+    if (isSensitivePath(target) || isSensitivePath(file) || !statSync(file).isFile()) return null;
+    return { file, fileId: sessionFileId(file), name: path.basename(file), folder: path.basename(path.dirname(file)) };
+  } catch { return null; }
 }
 
 export interface DeliveredArtifact {
@@ -179,9 +205,13 @@ export interface DeliveredArtifact {
   title: string;
   target: string;
   createdAt: string;
-  /** True when the target is an http(s) URL or a file that still exists. */
+  /** True when the target is an http(s) URL or has an authenticated file ref. */
   openable: boolean;
   stillExists?: boolean;
+  /** Absent when a file has no recorded session or cannot safely be read. */
+  fileRef?: DeliveredFileRef;
+  /** Verified user conversation, separate from a worker's file ownership. */
+  conversationSessionId?: string | null;
 }
 
 export interface DeliveredGroup {
@@ -194,6 +224,7 @@ export interface DeliveredGroup {
   why: string;
   lane: string | null;
   sessionId: string | null;
+  conversationSessionId?: string | null;
   /** Best openable link among members, when one exists. */
   url?: string;
   /** Representative local file (prefers documents over scripts/data). */
@@ -254,7 +285,13 @@ function artifactTitle(row: DeliverableRecord): string {
 
 function toArtifact(row: DeliverableRecord): DeliveredArtifact {
   const stillExists = row.kind === 'file' ? existsSync(row.target) : undefined;
-  const openable = isHttpTarget(row.target) || (row.kind === 'file' && stillExists !== false);
+  const identity = row.kind === 'file' ? recordedFileIdentity(row.target) : null;
+  const sessionId = row.sessionId?.trim();
+  // Do not guess a session from a path, title or producing ask. Old guest
+  // records without a session remain visible, but have no in-app file door.
+  const fileRef = identity && sessionId && sessionId === row.sessionId
+    ? { sessionId, name: identity.name, folder: identity.folder, fileId: identity.fileId } : undefined;
+  const openable = row.kind === 'file' ? !!fileRef : isHttpTarget(row.target);
   return {
     kind: row.kind,
     title: artifactTitle(row),
@@ -262,6 +299,7 @@ function toArtifact(row: DeliverableRecord): DeliveredArtifact {
     createdAt: row.createdAt,
     openable,
     ...(stillExists === undefined ? {} : { stillExists }),
+    ...(fileRef ? { fileRef } : {}),
   };
 }
 
@@ -300,9 +338,17 @@ function groupTitle(rep: DeliverableRecord, members: DeliverableRecord[]): strin
  * document-shaped representative over scripts/data, humanize tool slugs, and
  * mark which groups are re-runnable asks.
  */
-export function listDeliveredGroups(limit = 12): DeliveredGroup[] {
+export function listDeliveredGroups(limit = 12, scope?: { sessionIds: readonly string[] }): DeliveredGroup[] {
   try {
-    const rows = listRecentDeliverables(100);
+    // Filter before bounding rows: unrelated recent work must not hide a
+    // project's older results. The durable ledger itself is capped at 1,000.
+    const sessions = scope ? [...new Set(scope.sessionIds)] : undefined;
+    if (sessions && (sessions.length === 0 || sessions.length > 500)) return [];
+    const rows = sessions ? ensureTable().prepare(`
+      SELECT id, created_at AS createdAt, kind, target, title, why, session_id AS sessionId, lane
+      FROM deliverables WHERE session_id IN (${sessions.map(() => '?').join(', ')})
+      ORDER BY created_at DESC, id DESC LIMIT ?
+    `).all(...sessions, MAX_ROWS) as DeliverableRecord[] : listRecentDeliverables(100);
     const byKey = new Map<string, DeliverableRecord[]>();
     for (const row of rows) {
       // One piece of work = one card. Guest-run files carry no sessionId but

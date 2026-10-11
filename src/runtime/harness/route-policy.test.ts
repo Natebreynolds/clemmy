@@ -236,6 +236,35 @@ test('weightsForSamples: absent signals redistribute onto success; present signa
   assert.equal(mixed.toolSuccess, DEFAULT_ROUTE_SCORE_WEIGHTS.toolSuccess);
 });
 
+test('job: of two models that answer equally, the one whose turns pass review scores higher', () => {
+  // A turn's verdict lands on the one request that wrote its reply; the
+  // turn's other requests carry none. Three requests per turn, all answered.
+  const turns = (model: string, passed: number, turnCount: number) => {
+    for (let turn = 0; turn < turnCount; turn += 1) {
+      for (let request = 0; request < 3; request += 1) {
+        const id = recordModelRouteDecision({ role: 'brain', resolvedModel: model, provider: 'claude', source: 'default', now: NOW });
+        const last = request === 2;
+        recordModelRouteOutcome({ decisionId: id, status: 'success', latencyMs: 2_000, now: NOW,
+          ...(last ? { objectiveMet: turn < passed, toolSuccess: true } : {}) });
+      }
+    }
+  };
+  turns('model-passes', 4, 4);
+  turns('model-misses', 1, 4);
+  // The same model with a verdict on every request: unreviewed requests must
+  // not read as failed reviews, so sparse and dense verdicts score the same.
+  for (let i = 0; i < 12; i += 1) {
+    const id = recordModelRouteDecision({ role: 'brain', resolvedModel: 'model-dense', provider: 'claude', source: 'default', now: NOW });
+    recordModelRouteOutcome({ decisionId: id, status: 'success', latencyMs: 2_000, objectiveMet: true, toolSuccess: true, now: NOW });
+  }
+  runRoutePolicyJob({ now: NOW });
+  const score = new Map((openModelRouteMetricsDb()
+    .prepare(`SELECT model, score FROM model_route_policy WHERE role = 'brain'`)
+    .all() as Array<{ model: string; score: number }>).map((row) => [row.model, row.score]));
+  assert.ok(score.get('model-passes')! > score.get('model-misses')!, 'the model whose answers pass review wins the tie on request success');
+  assert.equal(score.get('model-passes'), score.get('model-dense'));
+});
+
 // ─── Thompson pick (CLEMMY_ROUTE_POLICY_THOMPSON, default on) ──────────────
 
 /** Deterministic posterior: the Beta mean α/(α+β). */

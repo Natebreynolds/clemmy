@@ -1,13 +1,14 @@
 import { BrowserbaseConnection } from '../components/BrowserbaseConnection';
 import { useEffect, useState } from 'preact/hooks';
 import { Fragment } from 'preact';
-import { CHECKER_ROLE_WORDS, accountStatus, checkerBackupAutomaticLabel, creditRefusalSentence, presentUsageMeters } from '@clem/chat-engine';
+import { CHECKER_ROLE_WORDS, accountStatus, checkerBackupAutomaticLabel, creditRefusalSentence, modelScoreLine, presentUsageMeters } from '@clem/chat-engine';
 import {
   forgetLearnedWriteKind,
   getApprovalMode,
   getCompletionReview,
   getConnectionsHealth,
   getDaemonStatus,
+  getModelScorecard,
   getModelSettings,
   setCompletionReview,
   getUsageStatus,
@@ -582,6 +583,7 @@ function ModelsCard({ loaded, onRefresh }: {
   onRefresh: () => Promise<void>;
 }) {
   const review = useScreenData(getCompletionReview);
+  const scorecard = useScreenData(getModelScorecard, { intervalMs: 60_000 });
   const [latest, setLatest] = useState<ModelSettings | null>(null);
   const [brainOpen, setBrainOpen] = useState(false);
   const [sheet, setSheet] = useState<ModelRoleName | null>(null);
@@ -622,6 +624,7 @@ function ModelsCard({ loaded, onRefresh }: {
           <RoleRow
             title={ROLE_COPY.brain.title}
             summary={brainSummary(settings)}
+            score={modelScoreLine(scorecard.data, 'brain', settings.brain.modelId)}
             warning={inactiveNote(settings.brain, settings)}
             onOpen={() => setBrainOpen(true)}
           />
@@ -630,6 +633,7 @@ function ModelsCard({ loaded, onRefresh }: {
               <RoleRow
                 title={ROLE_COPY[role].title}
                 summary={roleSummary(role, settings)}
+                score={modelScoreLine(scorecard.data, role, settings.roles[role]?.modelId)}
                 warning={inactiveNote(settings.roles[role], settings, role)}
                 note={role === 'judge' && reviewOff ? 'Review of finished work is off.' : roleNote(role, settings)}
                 onOpen={() => setSheet(role)}
@@ -719,9 +723,11 @@ function FallbackJudgeRow({ settings, onChanged }: {
   );
 }
 
-function RoleRow({ title, summary, note, warning, onOpen }: {
+function RoleRow({ title, summary, score, note, warning, onOpen }: {
   title: string;
   summary: string;
+  /** What this role's model did this week, from the daemon's scorecard. */
+  score?: string | null;
   note?: string | null;
   warning?: string | null;
   onOpen: () => void;
@@ -731,6 +737,7 @@ function RoleRow({ title, summary, note, warning, onOpen }: {
       <span class="settings-row-main">
         <span class="settings-row-label">{title}</span>
         <span class="settings-row-note">{summary}</span>
+        {score ? <span class="settings-row-note">{score}</span> : null}
         {warning ? <span class="settings-row-note warning">{warning}</span> : null}
         {note ? <span class="settings-row-note">{note}</span> : null}
       </span>
