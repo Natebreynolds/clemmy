@@ -447,14 +447,31 @@ function deriveExactEvidence(input: { sessionId: string; sourceUserSeq: number }
  *  it was volunteered for background review, not stated as something to keep. */
 export const VOLUNTEERED_FOR_REVIEW_REASON = 'owner statement — model decides durability';
 
+/** The reason auto-capture's gap-only fallback gives a sentence it guessed is
+ *  a first-person fact because no remember, correction, preference or rule cue
+ *  matched. A pattern's guess, not something the owner stated to keep: it is
+ *  queued for background review like a volunteered statement, and neither may
+ *  hold a turn to memory proof (journey 2026-10-10: "Retrieve … from my
+ *  connected account and report every record" was captured this way, and a
+ *  plain read ended "I could not confirm that your correction replaced…"). */
+export const INFERRED_DECLARATIVE_REASON = 'durable first-person declarative';
+
+const NOT_STATED_TO_KEEP: ReadonlySet<string> = new Set([VOLUNTEERED_FOR_REVIEW_REASON, INFERRED_DECLARATIVE_REASON]);
+
+/** A captured row the owner stated as something to keep. */
+function statedToKeep(reason: string | null): boolean {
+  return reason !== null && !NOT_STATED_TO_KEEP.has(reason);
+}
+
 /** Whether this source's verified intake holds a claim the owner stated as
  *  something to keep (a remember request, a correction, a preference or a
- *  standing instruction), rather than only statements volunteered for review. */
+ *  standing instruction), rather than only statements volunteered for review
+ *  or guessed at by the capture pattern. */
 export function verifiedIntakeHasOwnerStatedMemory(input: { sessionId: string; sourceUserSeq: number }): boolean {
   try {
     const loaded = readVerifiedIntake(input);
     return loaded.status === 'ok'
-      && loaded.intake.rows.some(row => row.intake_reason !== null && row.intake_reason !== VOLUNTEERED_FOR_REVIEW_REASON);
+      && loaded.intake.rows.some(row => statedToKeep(row.intake_reason));
   } catch { return false; }
 }
 
@@ -464,7 +481,7 @@ export function verifiedMemoryIntakeContext(input: { sessionId: string; sourceUs
   // The notice stops a duplicate save of what the owner stated to keep. A
   // statement volunteered for background review was not, so an ordinary
   // question carries no memory notice.
-  if (!loaded.intake.rows.some(row => row.intake_reason !== null && row.intake_reason !== VOLUNTEERED_FOR_REVIEW_REASON)) return null;
+  if (!loaded.intake.rows.some(row => statedToKeep(row.intake_reason))) return null;
   return '[Verified memory intake] The automatic layer has durably queued these exact accepted claims and their original context. Do not duplicate those claims through memory_remember solely to save them again while consolidation is pending. Destination or canonical-fact qualification may still be unresolved; this intake is not saved-memory or completion proof. Report pending work accurately and continue any separate requested work.';
 }
 
