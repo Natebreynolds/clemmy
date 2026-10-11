@@ -1477,6 +1477,21 @@ export function validateWorkflowDefinition(
   }
 
   // ── Per-step semantic checks (the new 2026-05-21 additions) ──
+  // CALL-3 (2026-07-20 attorney-bar audit A1): the "internal builder error"
+  // class — a call node that saves green but fails at first dispatch. Layered
+  // by evidence strength: deterministic evidence ERRORS (malformed slug
+  // shape; missing required args verified against the tool's REAL cached
+  // schema), absence of evidence only WARNS (the schema cache is fail-open
+  // by design — it may make validation more precise, never more aggressive).
+  // Every call step, prompt or not: an exact call is usually authored without
+  // one, and the prompt-gated loop below skipped it (live 2026-10-11).
+  for (const step of steps) {
+    if (!step.id || !step.call) continue;
+    const callIssues = checkCallNode(step, opts.knownToolNames);
+    errors.push(...callIssues.errors);
+    warnings.push(...callIssues.warnings);
+  }
+
   for (const step of steps) {
     if (!step.id || !step.prompt) continue;
 
@@ -1532,18 +1547,6 @@ export function validateWorkflowDefinition(
     // Tool slug catalog check → warnings only (catalog may be partial)
     for (const issue of checkToolSlugs(step.id, step.prompt, opts.knownToolNames)) {
       warnings.push(issue);
-    }
-
-    // CALL-3 (2026-07-20 attorney-bar audit A1): the "internal builder error"
-    // class — a call node that saves green but fails at first dispatch. Layered
-    // by evidence strength: deterministic evidence ERRORS (malformed slug
-    // shape; missing required args verified against the tool's REAL cached
-    // schema), absence of evidence only WARNS (the schema cache is fail-open
-    // by design — it may make validation more precise, never more aggressive).
-    {
-      const callIssues = checkCallNode(step, opts.knownToolNames);
-      errors.push(...callIssues.errors);
-      warnings.push(...callIssues.warnings);
     }
 
     const missingSkill = checkSkillReference(step, opts.installedSkillNames);

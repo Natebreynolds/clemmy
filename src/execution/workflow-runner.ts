@@ -10176,6 +10176,9 @@ export function continueWorkflowRunFromCheckpoint(
     },
     goalAttempt: record.goalAttempt ?? 0,
     goalFeedback: '',
+    // The runner's own record is the authority that this run has settled; a
+    // finished blocked run is as final as a cancelled one.
+    sourceExecutionSettled: TERMINAL_RUN_RECORD_STATUSES.has(record.status ?? '') && Boolean(record.finishedAt),
     recoveryIntent: { kind: 'safe_rerun', requestedFrom: opts.requestedFrom, reason: 'continue from where the run stopped' },
   });
 }

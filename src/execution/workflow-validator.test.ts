@@ -1257,6 +1257,16 @@ test('CALL-3: every Clementine tool without an exact-call contract is refused as
   }
 });
 
+test('CALL-3 checks a call step authored without a prompt (the usual exact-call shape)', () => {
+  resetToolSchemaCache();
+  const def = {
+    name: 'call3-promptless', description: 'An exact call step with no prompt.', trigger: { manual: true },
+    steps: [{ id: 'shell', call: { tool: 'run_shell_command', args: { command: 'true' } } }],
+  } as unknown as WorkflowFrontmatter;
+  const res = validateWorkflowDefinition(def, { knownToolNames: new Set(LOCAL_MCP_TOOL_NAMES) });
+  assert.ok(res.errors.some((e) => /no exact-call contract/.test(e)), JSON.stringify(res.errors));
+});
+
 test('CALL-3 is wired into validateWorkflowDefinition (the agent save path)', () => {
   resetToolSchemaCache();
   const def = {
