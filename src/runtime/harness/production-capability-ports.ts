@@ -63,6 +63,10 @@ export interface ProductionCapabilityPort {
   implementationDigest?: string;
   /** Reviewed CLI only: structured argv. Shell strings are refused. */
   argv?: readonly string[];
+  /** Optional: the local files a call would send, checked by the provider's
+   *  own file-input contract before the owner is asked and before anything is
+   *  reserved. A message means the call does not start; null means it may. */
+  outgoingFileRefusal?: (args: unknown) => string | null;
 }
 
 const ports = new Map<string, { identity: ProductionPortIdentity; port: ProductionCapabilityPort }>();

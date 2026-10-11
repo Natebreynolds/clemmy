@@ -15,10 +15,11 @@
 import { capabilityManifestDigest, type CapabilityManifestV1 } from './capability-manifest.js';
 import type { ProductionCapabilityPort } from './production-capability-ports.js';
 import { loadShippedImplementations } from './shipped-implementation-identity.js';
+import { composioFileInputRefusal, composioOperationInputSchema } from '../../integrations/composio/file-inputs.js';
 
 type PreparationPort = Required<Pick<
   ProductionCapabilityPort,
-  'admitPreparation' | 'prepareInvocation' | 'invokeWithPreparation'
+  'admitPreparation' | 'prepareInvocation' | 'invokeWithPreparation' | 'outgoingFileRefusal'
 >>;
 
 const preparationByManifest = new Map<string, PreparationPort>();
@@ -72,6 +73,13 @@ export function composioPreparationForManifest(
       // reuse can turn one account observation into a second dispatch grant.
       preparedProofs.delete(proof as object);
       return work();
+    },
+    // This provider's operations name their file-bearing parameters in their
+    // own input schema; a file that is missing, outside the owner's folders,
+    // holds credentials or is too large is refused here.
+    outgoingFileRefusal(args: unknown): string | null {
+      const unsendable = composioFileInputRefusal(composioOperationInputSchema(manifest.operationId), args);
+      return unsendable ? unsendable.refusal.message : null;
     },
   };
   preparationByManifest.set(key, hooks);

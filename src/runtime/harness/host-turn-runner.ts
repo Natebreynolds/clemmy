@@ -1,6 +1,5 @@
 import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion } from './memory-completion-obligation.js';
 import { liftNestedCarrierFields } from './carrier-field-lift.js';
-import { composioFileInputRefusal, composioOperationInputSchema } from '../../integrations/composio/file-inputs.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
@@ -6337,14 +6336,15 @@ const runHostTurnBody = async (
       // before anything is reserved: one that does not exist, sits outside
       // the owner's folders, holds credentials or is too large is the
       // model's to correct (or the owner's to answer), never a dispatch.
-      const checksFileInputs = manifest.providerKind === 'composio'
+      // The provider's port owns its file-input contract; the kernel asks it.
+      const checksFileInputs = typeof port.outgoingFileRefusal === 'function'
         && (dispatchEffect === 'external_write' || dispatchEffect === 'admin');
       const validateForegroundPayload = (): InvalidArgumentsPreDispatchResult | null => {
         if (checksFileInputs) {
-          const unsendable = composioFileInputRefusal(composioOperationInputSchema(manifest.operationId), effectiveArgs);
+          const unsendable = port.outgoingFileRefusal!(effectiveArgs);
           if (unsendable) {
             return new InvalidArgumentsPreDispatchResult(
-              `${manifest.operationId} was not started: ${unsendable.refusal.message} Give the full path of the file to send, or ask the owner which file they mean. Nothing was sent.`,
+              `${manifest.operationId} was not started: ${unsendable} Give the full path of the file to send, or ask the owner which file they mean. Nothing was sent.`,
             );
           }
         }
@@ -7443,7 +7443,7 @@ const runHostTurnBody = async (
           // leaves nothing in the dark: the model reads the target state and
           // answers in words, and the write keeps no replay authority. The
           // hard block is for a dropped acknowledgement, where nothing can be
-          // read back yet (live 2026-10-07: Slack `not_found` on a delete).
+          // read back yet (live 2026-10-07: a provider answered a delete with its own not-found).
           settlementRequiresReconciliation =
             invoked.settlement.outcome.directive.requiresReconciliation === true
             && uncertainEffectStopsTurn(effect)
