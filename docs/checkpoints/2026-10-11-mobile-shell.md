@@ -4,7 +4,7 @@
 
 Framework UI only. User approved the mobile refinement pass after reporting clutter, clipped tabs, screen fit and navigation problems. Retain the existing light/citrus brand, drawer navigation, all general-purpose capabilities, and saved Home preferences. Live artifact-creation previews remain deferred. No personal Space, integration, preference, model or external-action changes were made.
 
-Candidate branch: `codex/mobile-shell` in `/Users/nathan.reynolds/.codex/worktrees/work-navigator-artifacts/clementine-next`.
+Candidate branch: `codex/mobile-shell` in `~/.codex/worktrees/work-navigator-artifacts/clementine-next`.
 Base: `81b0e6316a6c133ebc4e8be8efa925b988a50fa1`, then contextual assistant commit `abc98b100a13f5d5d7f8427fb3c90115c5e19554` (cherry-pick of `0556a7e9bfe3bb213fd0fa3a0cdd718ca6260eb7`). The mobile commit follows this checkpoint's parent. Do not deploy only mobile assets: saved-file discussion requires the contextual backend routes and exact-revision attachment preparation.
 
 ## Behavior
@@ -28,6 +28,6 @@ Base: `81b0e6316a6c133ebc4e8be8efa925b988a50fa1`, then contextual assistant comm
 
 Read-only installed observation during work: version3.18.35, source `0633bbd1ecbb4b931c9c7cc8f9634ccc6a1ce50e`, dirty fingerprint `064e3612646e250137ed66dba5e2e38f019d3e689f6347f4c16facb061a5b05f`, schema93, daemon PID58749 started `2026-10-11T14:47:33.607Z`, installed entry under `~/Applications/Clementine.app`. This tag is an ancestor of the candidate base; a recent process launch is not newer source evidence. No registered worktree build stamp matched that dirty installed identity. The installed backend lacks the contextual file module.
 
-Installation remains owned by the existing installer under `docs/CLEMENTINE-UI-HARNESS-REFINEMENT-HANDOFF-2026-10-02.md:36`: “The other agent owns installation/hotpatch coordination; this document does not authorize a competing install or restart.” Owner checkout `/Users/nathan.reynolds/clem-worktrees/refusal-replan` was rechecked clean at81b0e6316. Do not overwrite the installed dirty runtime from an assumed base. Reconcile its exact changes, integrate the contextual dependency plus this mobile commit, build a frozen candidate, and coordinate one installed hotpatch.
+Installation remains owned by the existing installer under `docs/CLEMENTINE-UI-HARNESS-REFINEMENT-HANDOFF-2026-10-02.md:36`: “The other agent owns installation/hotpatch coordination; this document does not authorize a competing install or restart.” Owner checkout `~/clem-worktrees/refusal-replan` was rechecked clean at81b0e6316. Do not overwrite the installed dirty runtime from an assumed base. Reconcile its exact changes, integrate the contextual dependency plus this mobile commit, build a frozen candidate, and coordinate one installed hotpatch.
 
 Still required: named controlled fixtures in the installed app/live home, physical iPhone keyboard and safe-area/rotation checks, and native Dynamic Type. Browser reduced-height/font checks are approximations, not physical-device acceptance. Preserve other agents' edits/token-meter work; no competing restart or personal-data fixture reset is authorized by this checkpoint.

@@ -512,7 +512,7 @@ test('a helper still refuses when staging was already consumed and no cached fil
 });
 
 test('native and externally launched daemon processes remain blockers with bundle paths containing spaces', () => {
-  const app = '/Users/Fixture Owner/Applications/Clementine.app';
+  const app = '/Users/example/My Applications/Clementine.app';
   const entry = `${app}/Contents/Resources/daemon/dist/index.js`;
   assert.equal(isInstalledAppRunning(app, () => `${app}/Contents/MacOS/Clementine\n`), true);
   assert.equal(isInstalledAppRunning(app, () => `/usr/local/bin/node ${entry} daemon\n`), true);

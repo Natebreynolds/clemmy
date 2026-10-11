@@ -4,7 +4,7 @@
 
 Framework work only. The owner reported that dictation and voice do not work on mobile, then asked for a more native iPhone experience with voice/dictation and Space widgets. No personal Spaces, accounts, providers, signing identities, or integrations were changed. No real microphone recording or paid provider call was made.
 
-Continue on `codex/mobile-shell` in `/Users/nathan.reynolds/.codex/worktrees/work-navigator-artifacts/clementine-next`. This change follows `dbb78d03d8e4711c01aa85689fad0681c883de66` (mobile shell), which follows contextual assistant `abc98b100a13f5d5d7f8427fb3c90115c5e19554`, based on `81b0e6316`. Preserve these dependencies. The backend, shared engine, mobile bundle and native iPhone app all participate; installing only a web bundle is insufficient.
+Continue on `codex/mobile-shell` in `~/.codex/worktrees/work-navigator-artifacts/clementine-next`. This change follows `dbb78d03d8e4711c01aa85689fad0681c883de66` (mobile shell), which follows contextual assistant `abc98b100a13f5d5d7f8427fb3c90115c5e19554`, based on `81b0e6316`. Preserve these dependencies. The backend, shared engine, mobile bundle and native iPhone app all participate; installing only a web bundle is insufficient.
 
 ## Implemented behavior
 
@@ -23,7 +23,7 @@ Continue on `codex/mobile-shell` in `/Users/nathan.reynolds/.codex/worktrees/wor
 
 ## Installation and remaining acceptance
 
-The running app changed independently during this work. The final read-only observation at `2026-10-11T15:24:57Z` found daemon `16145`, started at `2026-10-11T15:17:38Z`, matching `/Users/nathan.reynolds/.codex/worktrees/stop-continuity-takeover/clementine-next`, detached at `81b0e6316`, with dirty fingerprint `82d779fc9ccd4bfc57d701f23b7d63258da4d86bb2ac8988c9816331cc589d59`. That worktree had 32 changed paths, including separate API/chat/stop-continuity edits. Recheck its current state and the served build before integrating; do not overwrite the active installer with this branch. The redacted observation is in `output/mobile-voice-2026-10-11/installed-final.json`.
+The running app changed independently during this work. The final read-only observation at `2026-10-11T15:24:57Z` found daemon `16145`, started at `2026-10-11T15:17:38Z`, matching `~/.codex/worktrees/stop-continuity-takeover/clementine-next`, detached at `81b0e6316`, with dirty fingerprint `82d779fc9ccd4bfc57d701f23b7d63258da4d86bb2ac8988c9816331cc589d59`. That worktree had 32 changed paths, including separate API/chat/stop-continuity edits. Recheck its current state and the served build before integrating; do not overwrite the active installer with this branch. The redacted observation is in `output/mobile-voice-2026-10-11/installed-final.json`.
 
 The primary checkout's untracked `docs/CLEMENTINE-UI-HARNESS-REFINEMENT-HANDOFF-2026-10-02.md:36` reserves installation/hotpatch coordination to the existing installer and does not authorize a competing install or restart. No install, restart, TestFlight upload or production release was performed here. Merge the candidate commits with that installer's current changes, build one frozen desktop candidate, then perform the required named controlled-fixture acceptance in the installed app/live home. Never reset the live home.
 

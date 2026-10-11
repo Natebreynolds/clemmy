@@ -27,7 +27,7 @@ The installation owner remains the active framework agent. The primary checkout'
 
 Fresh read-only observation during final preparation found:
 
-- Active framework: `claude/answered-refusal-replan` in `/Users/nathan.reynolds/clem-worktrees/refusal-replan`, committed `278776b40895308a7d9169d0abb2f916355a3819` with unrelated workflow edits still in progress.
+- Active framework: `claude/answered-refusal-replan` in `~/clem-worktrees/refusal-replan`, committed `278776b40895308a7d9169d0abb2f916355a3819` with unrelated workflow edits still in progress.
 - Installed source: `278776b40895308a7d9169d0abb2f916355a3819`, clean; fingerprint `f6c0b713f1ad1a0ab78684c3ce94d34c3bcc5bdf99440e6f1f5e4048fc0b9598`.
 - Installed daemon: `~/Applications/Clementine.app/Contents/Resources/daemon/dist/index.js`, PID 39285, schema 93, retained shell version 3.18.33. This source does not include the current contextual-assistant pass.
 
