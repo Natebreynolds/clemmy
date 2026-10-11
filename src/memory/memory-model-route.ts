@@ -43,6 +43,7 @@ import {
   readDurableBindings,
   registerMemoryAutomaticModel,
   resolveRoleModel,
+  unavailableSavedBrain,
   type InactiveRoleBinding,
   type ResolvedRoleModel,
 } from '../runtime/harness/model-roles.js';
@@ -141,9 +142,14 @@ function followsFor(modelId: string): 'checker' | 'brain' | null {
   return null;
 }
 
-/** The model the owner chose to do the work, as it answers now, when its
- *  account can serve it; otherwise why not. Builds nothing. */
+/** The model the owner chose to do the work, when its account can serve it;
+ *  otherwise why not. A saved choice that cannot serve right now is still the
+ *  choice: the jobs wait for it and resume on it, never on the model standing
+ *  in for it (that fallback is the conversation's, not memory's). Builds
+ *  nothing. */
 function selectedBrain(): { brain: ResolvedRoleModel; why?: undefined } | { brain: null; why: MemoryModelUnavailable } {
+  const saved = unavailableSavedBrain();
+  if (saved) return { brain: null, why: problemForModel(saved.provider, saved.modelId) };
   const brain = resolveRoleModel('brain');
   if (!brain.modelId) return { brain: null, why: { problem: 'not_connected' } };
   if (!modelProviderLive(brain.modelId, brain.provider)) return { brain: null, why: problemForModel(brain.provider, brain.modelId) };

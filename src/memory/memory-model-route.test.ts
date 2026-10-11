@@ -23,7 +23,7 @@ const { Usage } = await import('@openai/agents');
 const { ClaudeModelProvider } = await import('../runtime/harness/claude-model.js');
 const { CodexModelProvider } = await import('../runtime/harness/codex-model.js');
 const { resolveBoundaryJudge } = await import('../runtime/harness/debate-model.js');
-const { defaultForRole, pinnedBrainForSession, resolveRoleModel, __sessionBrainPinTest__ } = await import('../runtime/harness/model-roles.js');
+const { defaultForRole, pinnedBrainForSession, resolveRoleModel, unavailableSavedBrain, __sessionBrainPinTest__ } = await import('../runtime/harness/model-roles.js');
 const { __resetRateLimitStoreForTests, getRateLimitSnapshot, recordCodexUsageExhausted } = await import('../runtime/harness/rate-limit-store.js');
 const { _setDiscoveredModelsForTest } = await import('../runtime/harness/model-discovery.js');
 const {
@@ -495,4 +495,41 @@ test('a signed-out brain family makes every automatic job that follows it wait; 
   writeAuth();
   assert.ok(resolveMemoryModelRoute('learn'), 'signed back in, learning resumes');
   assert.ok(resolveMemoryModelRoute('skills'), 'and so do the jobs that follow the brain');
+});
+
+test('a saved brain choice that cannot serve makes the jobs that follow it wait, and they resume on it, never on the stand-in', () => {
+  // The owner saved an API-key brain; Codex is also signed in and stands in
+  // for the conversation when that backend is removed.
+  Object.assign(process.env, { AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in' });
+  useByo();
+  assert.equal(resolveRoleModel('brain').modelId, 'byo-memory-model', 'fixture: the saved brain serves while connected');
+  assert.equal(resolveMemoryModelRoute('skills')?.modelId, 'byo-memory-model');
+
+  Object.assign(process.env, { BYO_MODEL_API_KEY: '' });
+  assert.notEqual(resolveRoleModel('brain').modelId, 'byo-memory-model', 'fixture: another model stands in for the conversation');
+  assert.deepEqual(unavailableSavedBrain(), { modelId: 'byo-memory-model', provider: 'byo' });
+  for (const job of ['skills', 'identity', 'import'] as const) {
+    assert.equal(resolveMemoryModelRoute(job), null, `${job} waits for the saved choice`);
+    assert.equal(memoryModelAvailability(job).ok, false);
+    assert.equal(memoryJobModelId(job), null, `${job} names no stand-in`);
+  }
+
+  useByo();
+  assert.equal(unavailableSavedBrain(), null);
+  for (const job of ['skills', 'identity', 'import'] as const) {
+    assert.equal(resolveMemoryModelRoute(job)?.modelId, 'byo-memory-model', `${job} resumes on the saved choice`);
+  }
+});
+
+test('a home that never saved an API-key brain is not told its brain is missing', () => {
+  // Unset AUTH_MODE reads as api_key inside the config; that default is not a
+  // saved choice, so the Codex brain it runs is the owner's brain.
+  delete process.env.AUTH_MODE;
+  Object.assign(process.env, { MODEL_ROUTING_MODE: 'off' });
+  try {
+    assert.equal(unavailableSavedBrain(), null);
+    assert.ok(resolveMemoryModelRoute('skills'), 'skills runs on the Codex brain');
+  } finally {
+    process.env.AUTH_MODE = 'codex_oauth';
+  }
 });

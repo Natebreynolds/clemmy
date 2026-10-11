@@ -399,6 +399,24 @@ function memoryAutomaticModelReader(): string | null {
   return (memoryAutomaticModelSlot as unknown as MemoryAutomaticModelSlot).read?.() ?? null;
 }
 
+/**
+ * The brain the owner saved, when it cannot run and another model stands in.
+ * Only an API-key brain can be stood in for: with its backend gone (key or
+ * address removed), defaultForRole('brain') falls through to the Codex
+ * primary so a conversation still has a brain. That stand-in is not the
+ * owner's choice, and background work that follows the owner's choice waits
+ * for it instead (owner, 2026-10-10). Null when the saved choice is the one
+ * that runs. A Codex or Claude brain is never swapped here: it is named
+ * whether or not its account serves, and callers check that themselves.
+ */
+export function unavailableSavedBrain(): { modelId: string; provider: ModelProviderClass } | null {
+  const savedAuthMode = (getRuntimeEnv('AUTH_MODE', '') || '').trim();
+  const savedApiKeyBrain = savedAuthMode === 'api_key' || getModelRoutingMode() === 'all_in';
+  if (!savedApiKeyBrain || getByoBackendConfig().configured) return null;
+  const modelId = (getRuntimeEnv('BYO_BRAIN_MODEL_ID', '') || '').trim() || (getRuntimeEnv('BYO_MODEL_ID', '') || '').trim();
+  return modelId ? { modelId, provider: 'byo' } : null;
+}
+
 export function defaultForRole(role: ModelRole): string {
   // With no writer chosen, the brain writes its own final answer.
   if (role === 'writer') return defaultForRole('brain');
