@@ -28,6 +28,7 @@ import {
   registerIndependentCapabilityObservation,
 } from './independent-capability-observation.js';
 import { loadShippedImplementations } from './shipped-implementation-identity.js';
+import { registryToolHasNoExactCallContract } from '../../tools/tool-registry.js';
 import {
   observeReviewedLocalTool,
   observeReviewedLocalTransport,
@@ -72,6 +73,7 @@ export type EnsureReviewedLocalWorkflowCapabilityResult =
       ok: false;
       reason:
         | 'not_reviewed'
+        | 'no_exact_contract'
         | 'arguments_invalid'
         | 'manifest_invalid'
         | 'manifest_conflict'
@@ -127,7 +129,17 @@ export function ensureReviewedLocalWorkflowCapability(input: {
   args: Record<string, unknown>;
 }): EnsureReviewedLocalWorkflowCapabilityResult {
   const observed = observeReviewedLocalTool(input.operationId);
-  if (!observed) return { ok: false, reason: 'not_reviewed' };
+  if (!observed) {
+    // One of Clementine's own tools without an exact-call contract, and no
+    // provider holds the same id: no carrier exists, so the run must stop as
+    // such rather than wait for a capability nothing can connect.
+    const providerHoldsId = registryToolHasNoExactCallContract(input.operationId)
+      && resolveCapabilityManifestStore().list().some((entry) => (
+        entry.manifest.operationId === input.operationId && entry.manifest.lifecycle.state === 'current'));
+    return registryToolHasNoExactCallContract(input.operationId) && !providerHoldsId
+      ? { ok: false, reason: 'no_exact_contract', detail: `${input.operationId} has no exact-call contract; a prompt step with it in allowedTools can use it` }
+      : { ok: false, reason: 'not_reviewed' };
+  }
   if (!reviewedLocalToolArgumentsMatch(observed, input.args)) {
     return { ok: false, reason: 'arguments_invalid' };
   }

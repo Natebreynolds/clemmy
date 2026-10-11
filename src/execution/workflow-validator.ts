@@ -23,6 +23,7 @@
  */
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { operationIdentity } from '../tools/operation-name-identity.js';
+import { registryToolHasNoExactCallContract } from '../tools/tool-registry.js';
 import { structuredCallSideEffectClass } from './workflow-step-effect.js';
 export { structuredCallSideEffectClass } from './workflow-step-effect.js';
 import {
@@ -498,6 +499,15 @@ export function checkCallNode(
   const warnings: string[] = [];
   const slug = typeof step.call?.tool === 'string' ? step.call.tool.trim() : '';
   if (!slug) return { errors, warnings }; // CALL-1 owns the missing-tool error
+  if (registryToolHasNoExactCallContract(slug)) {
+    // Being one of Clementine's own tools is not the same as having an exact
+    // carrier: without a reviewed contract the call stalls on every run
+    // waiting for a capability nothing can connect (live 2026-10-11).
+    errors.push(
+      `Step "${step.id ?? '?'}" calls ${slug} directly, but ${slug} is one of Clementine's own tools with no exact-call contract, so a call step can never run it. Make it a prompt step with allowedTools: ["${slug}"] so a model carries it out, or call a tool that has an exact contract.`,
+    );
+    return { errors, warnings };
+  }
   const isLocal = knownToolNames?.has(slug) ?? false;
   const isComposio = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(slug);
   const declaredIdentity = operationIdentity(slug);
@@ -509,7 +519,7 @@ export function checkCallNode(
   const isIdentifierToken = /^[A-Za-z][A-Za-z0-9_.:-]*$/.test(slug);
   if (!isLocal && !isIdentifierToken) {
     errors.push(
-      `Step "${step.id ?? '?'}" call.tool "${slug}" is not a valid tool reference — expected a single tool identifier (e.g. GMAIL_SEND_EMAIL, cx_gmail_send_email, run_shell_command), not prose. This step would fail at dispatch on every run.`,
+      `Step "${step.id ?? '?'}" call.tool "${slug}" is not a valid tool reference — expected a single tool identifier (e.g. GMAIL_SEND_EMAIL, cx_gmail_send_email, write_file), not prose. This step would fail at dispatch on every run.`,
     );
     return { errors, warnings };
   }

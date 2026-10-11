@@ -1,5 +1,6 @@
 import type { WorkflowAllowedTool, WorkflowStepInput } from '../memory/workflow-store.js';
 import { classifyStepSideEffect } from '../execution/workflow-enforce.js';
+import { registryToolHasNoExactCallContract } from '../tools/tool-registry.js';
 
 export interface WorkflowExecutionPlanOptions {
   stepConcurrency?: number;
@@ -904,7 +905,9 @@ function buildToolReadiness(
   }
 
   const items = Array.from(grouped.values()).map((req) => {
-    const result = readinessForRequirement(req.kind, req.name, inventory);
+    const result = req.sources.includes('step_call') && registryToolHasNoExactCallContract(req.name)
+      ? noExactCallContractReadiness(req.name)
+      : readinessForRequirement(req.kind, req.name, inventory);
     return {
       kind: req.kind,
       name: req.name,
@@ -1009,6 +1012,16 @@ function readinessForRequirement(
     default:
       return readinessForCatalogTool(name, inventory);
   }
+}
+
+/** A call step naming one of Clementine's own tools that has no exact-call
+ *  contract: present in the catalog, but nothing can dispatch it as a call. */
+function noExactCallContractReadiness(name: string): ToolReadinessResult {
+  return {
+    status: 'missing',
+    reason: 'A call step can\'t run this Clementine tool directly; a prompt step that lists it in allowedTools can.',
+    evidence: [{ kind: 'tool_catalog', name, status: 'missing', detail: 'no exact-call contract' }],
+  };
 }
 
 function readinessForCatalogTool(

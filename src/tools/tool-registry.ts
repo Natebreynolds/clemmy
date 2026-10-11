@@ -708,6 +708,18 @@ export function deriveReviewedLocalNames(): Set<string> {
   return names((d) => d.localExecution != null);
 }
 
+/**
+ * Clementine's own tools that a workflow `call` step can never dispatch: no
+ * declaration of the name carries a reviewed exact-call contract. A model can
+ * still use one in a prompt step (`allowedTools`); an exact call has no
+ * carrier for it, so authoring, readiness and the runner refuse it as such
+ * instead of treating it as an operation to connect. Derived, never listed.
+ */
+export function registryToolHasNoExactCallContract(name: string): boolean {
+  const declarations = TOOL_REGISTRY.filter((declaration) => declaration.name === name);
+  return declarations.length > 0 && declarations.every((declaration) => declaration.localExecution == null);
+}
+
 /** orchestrator.ts deduped discoveryTools (the live-chat surface). */
 export function deriveOrchestratorDiscoveryNames(): Set<string> {
   return names((d) => d.lanes.includes('orchestrator'));

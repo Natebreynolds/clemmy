@@ -22,12 +22,13 @@
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { checkCallNode } from './workflow-validator.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
+import { registryToolHasNoExactCallContract } from '../tools/tool-registry.js';
 
 export type WorkflowHealthStatus = 'ok' | 'broken' | 'unknown';
 
 export interface WorkflowHealthIssue {
   stepId: string;
-  kind: 'unknown_call_tool';
+  kind: 'unknown_call_tool' | 'call_tool_without_contract';
   detail: string;
 }
 
@@ -59,6 +60,10 @@ export function checkWorkflowHealth(def: WorkflowDefinition): WorkflowHealthRepo
   for (const step of def.steps ?? []) {
     if (!step.call || typeof step.call !== 'object' || typeof step.call.tool !== 'string') continue;
     const { errors } = checkCallNode({ id: step.id, call: step.call }, known);
+    if (registryToolHasNoExactCallContract(step.call.tool.trim())) {
+      issues.push({ stepId: step.id ?? '?', kind: 'call_tool_without_contract', detail: errors[0] ?? step.call.tool });
+      continue;
+    }
     for (const error of errors) {
       // Only the "not a valid tool reference" (dead slug) class counts as
       // broken health — missing-required-arg errors depend on a cached

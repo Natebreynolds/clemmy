@@ -1196,6 +1196,8 @@ test('steps.X.output via transitive dependency → ok', () => {
 // class — a call node that saves green and fails on first dispatch.
 // ---------------------------------------------------------------------------
 import { checkCallNode } from './workflow-validator.js';
+import { deriveReviewedLocalNames, registryToolHasNoExactCallContract } from '../tools/tool-registry.js';
+import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { rememberToolSchema, resetToolSchemaCache } from '../tools/composio-schema-cache.js';
 
 test('CALL-3: a malformed call.tool is a hard ERROR (deterministic evidence)', () => {
@@ -1228,11 +1230,31 @@ test('CALL-3: an unverifiable Composio slug only WARNS (fail-open when the cache
   assert.match(res.warnings[0], /can't be verified/);
 });
 
-test('CALL-3: a known local tool passes clean; cx_ aliases pass shape', () => {
-  const local = checkCallNode({ id: 's1', call: { tool: 'run_shell_command', args: {} } }, new Set(['run_shell_command']));
+test('CALL-3: a local tool with an exact-call contract passes clean; cx_ aliases pass shape', () => {
+  const [reviewed] = [...deriveReviewedLocalNames()];
+  assert.ok(reviewed, 'the registry declares at least one exact-call contract');
+  const local = checkCallNode({ id: 's1', call: { tool: reviewed, args: {} } }, new Set(LOCAL_MCP_TOOL_NAMES));
   assert.deepEqual([local.errors, local.warnings], [[], []]);
   const cx = checkCallNode({ id: 's1', call: { tool: 'cx_gmail_send_email', args: {} } }, undefined);
   assert.deepEqual(cx.errors, []);
+});
+
+test('CALL-3: every Clementine tool without an exact-call contract is refused as a call step, naming the prompt-step repair', () => {
+  const known = new Set(LOCAL_MCP_TOOL_NAMES);
+  const reviewed = deriveReviewedLocalNames();
+  const withoutContract = [...known].filter((name) => registryToolHasNoExactCallContract(name));
+  assert.ok(withoutContract.length > 0);
+  for (const tool of withoutContract) {
+    assert.equal(reviewed.has(tool), false, tool);
+    const res = checkCallNode({ id: 's1', call: { tool, args: {} } }, known);
+    assert.equal(res.errors.length, 1, tool);
+    assert.match(res.errors[0], /no exact-call contract/);
+    assert.ok(res.errors[0].includes(`allowedTools: ["${tool}"]`), tool);
+  }
+  for (const tool of reviewed) {
+    const res = checkCallNode({ id: 's1', call: { tool, args: {} } }, known);
+    assert.ok(!res.errors.some((error) => /no exact-call contract/.test(error)), tool);
+  }
 });
 
 test('CALL-3 is wired into validateWorkflowDefinition (the agent save path)', () => {

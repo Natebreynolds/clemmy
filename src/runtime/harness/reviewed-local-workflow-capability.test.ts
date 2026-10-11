@@ -64,10 +64,19 @@ test('reviewed local materialization publishes one exact current workflow-v3 ide
 
 test('unreviewed tools and invalid safe-mode arguments never enter the workflow catalog', () => {
   const unreviewed = reviewed.ensureReviewedLocalWorkflowCapability({
+    operationId: 'SOMEPROVIDER_SAVE_RECORD',
+    args: { record_id: 'x' },
+  });
+  assert.deepEqual(unreviewed, { ok: false, reason: 'not_reviewed' });
+
+  // One of Clementine's own tools with no exact-call contract has no carrier
+  // at all: the runner stops on it instead of waiting to "connect" it.
+  const noContract = reviewed.ensureReviewedLocalWorkflowCapability({
     operationId: 'space_save',
     args: { space_id: 'x' },
   });
-  assert.deepEqual(unreviewed, { ok: false, reason: 'not_reviewed' });
+  assert.equal(noContract.ok, false);
+  assert.equal(!noContract.ok && noContract.reason, 'no_exact_contract');
 
   const invalid = reviewed.ensureReviewedLocalWorkflowCapability({
     operationId: 'artifact_bundle_save',

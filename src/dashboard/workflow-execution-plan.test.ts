@@ -242,6 +242,20 @@ test('a step_call operation present in availableTools is ready even when its nam
   assert.equal(plan.toolReadiness.readyCount, 2);
 });
 
+test('a call step naming a Clementine tool with no exact-call contract is not ready, though a prompt step may use it', () => {
+  const calling = buildWorkflowExecutionPlan([
+    { id: 'shell', prompt: 'Run it.', call: { tool: 'run_shell_command', args: { command: 'true' } } },
+  ], { readiness: { availableTools: ['run_shell_command'], availableClis: [], installedSkills: [], workflowScripts: [], mcpServers: [] } });
+  const item = calling.toolReadiness.items.find((entry) => entry.name === 'run_shell_command');
+  assert.equal(item?.status, 'missing');
+  assert.match(item?.reason ?? '', /prompt step/);
+
+  const prompting = buildWorkflowExecutionPlan([
+    { id: 'shell', prompt: 'Run it.', allowedTools: ['run_shell_command'] },
+  ], { readiness: { availableTools: ['run_shell_command'], availableClis: [], installedSkills: [], workflowScripts: [], mcpServers: [] } });
+  assert.equal(prompting.toolReadiness.items.find((entry) => entry.name === 'run_shell_command')?.status, 'ready');
+});
+
 test('buildWorkflowExecutionPlan preflights workflow and step local project requirements', () => {
   const plan = buildWorkflowExecutionPlan([
     { id: 'inspect_repo', prompt: 'Inspect the default repo.' },
