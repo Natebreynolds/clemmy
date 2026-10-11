@@ -569,7 +569,7 @@ function IssueDisclosure({ issues }: { issues: string[] }) {
 
 function DetailHeader({ title, onBack, onDetails }: { title: string; onBack: () => void; onDetails?: () => void }) {
   return (
-    <div class="chat-header">
+    <div class="chat-header detail-header">
       <ChatBackButton onClick={() => { haptic('light'); onBack(); }} />
       <h2 class="chat-title">{title}</h2>
       {onDetails ? <button type="button" class="btn-quiet" onClick={onDetails}>Details</button> : null}

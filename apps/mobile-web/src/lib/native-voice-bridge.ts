@@ -1,4 +1,4 @@
-import { api } from './api';
+import { api, type ApiError } from './api';
 
 export interface NativeVoiceProvisioningRequest {
   /** Secret random correlation ID. Never log or put in a URL. */
@@ -12,6 +12,16 @@ interface NativeVoiceCredential {
 type VoiceBridge = NonNullable<Window['clemNative']> & {
   prepareVoice?: (request: NativeVoiceProvisioningRequest) => void;
 };
+
+/** Fixed reasons only: never pass raw server bodies or errors into diagnostics. */
+function failureReason(error: unknown, timedOut: boolean): string {
+  if (timedOut) return 'timeout';
+  const failure = error as Partial<ApiError> | null;
+  if (failure?.offline) return 'offline';
+  if (failure?.status === 401 || failure?.status === 403) return 'unauthorized';
+  if (typeof failure?.status === 'number' && failure.status >= 500) return 'unavailable';
+  return 'invalidResponse';
+}
 
 /** Install only after authenticated native readiness. Late responses from a
  * removed bridge cannot provision a different login or pairing. */
@@ -38,8 +48,9 @@ export function installNativeVoiceBridge(): () => void {
       if (!active || controller.signal.aborted) return;
       if (credential.requestId !== request.requestId) throw new Error('NATIVE_RECEIPT_MISMATCH');
       post({ ...credential, ok: true });
-    }).catch(() => {
+    }).catch(error => {
       if (active) post({ requestId: request.requestId, ok: false,
+        reason: failureReason(error, controller.signal.aborted),
         error: 'Native voice could not connect. Open Clem and try again.' });
     }).finally(() => { clearTimeout(timeout); pending.delete(request.requestId); });
   };

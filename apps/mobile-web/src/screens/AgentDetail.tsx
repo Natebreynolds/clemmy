@@ -56,7 +56,7 @@ export function AgentDetail({ agent, onBack, onMessage, onEdit, onOpenProject, o
 
   return (
     <div class="workflow-detail project-detail">
-      <div class="chat-header">
+      <div class="chat-header detail-header">
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{agent.name}</h2>
         <button type="button" class="btn-quiet" onClick={() => { haptic('light'); onEdit(agent); }}>Edit</button>

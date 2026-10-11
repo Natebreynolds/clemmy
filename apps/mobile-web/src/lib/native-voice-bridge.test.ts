@@ -40,7 +40,15 @@ test('duplicate pending requests are collapsed and mismatched receipts fail clos
   t.mock.method(globalThis, 'fetch', async () => { calls++; await settle(); return Response.json({ requestId: 'wrong' }); });
   const cleanup = installNativeVoiceBridge(); t.after(cleanup);
   f.bridge.prepareVoice!(request); f.bridge.prepareVoice!(request); await settle(); await settle();
-  assert.equal(calls, 1); assert.deepEqual(f.messages, [{ requestId: request.requestId, ok: false, error: 'Native voice could not connect. Open Clem and try again.' }]);
+  assert.equal(calls, 1); assert.deepEqual(f.messages, [{ requestId: request.requestId, ok: false, reason: 'invalidResponse', error: 'Native voice could not connect. Open Clem and try again.' }]);
+});
+test('enrollment failure reports a bounded reason without leaking server details', async t => {
+  const f = fixture(t);
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ error: 'PRIVATE_SERVER_DETAIL' }, { status: 503 }));
+  const cleanup = installNativeVoiceBridge(); t.after(cleanup);
+  f.bridge.prepareVoice!(request); await settle();
+  assert.equal((f.messages[0] as { reason: string }).reason, 'unavailable');
+  assert.equal(JSON.stringify(f.messages).includes('PRIVATE_SERVER_DETAIL'), false);
 });
 test('malformed provisioning calls never reach the network', async t => {
   const f = fixture(t); let calls = 0;

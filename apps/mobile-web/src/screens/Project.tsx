@@ -165,7 +165,7 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
 
   return (
     <div class="workflow-detail project-detail">
-      <div class="chat-header">
+      <div class="chat-header detail-header">
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{project?.name ?? 'Project'}</h2>
         {project && !editing ? (

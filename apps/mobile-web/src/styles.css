@@ -1252,6 +1252,21 @@ input, textarea, select { font: inherit; font-size: 16px; }
   overflow: hidden;
 }
 .chat-header { flex: 0 0 auto; display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-2) 0 var(--sp-3); min-width: 0; }
+/* Detail names identify the current destination. Give them a full line instead
+   of squeezing them between Back, Details/Edit and navigation on a phone. */
+@media (max-width: 600px) {
+  .detail-header { flex-wrap: wrap; gap: 8px 12px; }
+  .detail-header > .chat-back { margin-right: auto; }
+  .detail-header > .btn-quiet { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+  .detail-header > .chat-title,
+  .app-main .detail-header > h2.chat-title {
+    order: 1;
+    flex: 1 1 100%;
+    white-space: normal;
+    overflow: visible;
+    overflow-wrap: anywhere;
+  }
+}
 .chat-header .brain-chip { flex: 0 0 auto; }
 .chat-back {
   display: inline-flex;

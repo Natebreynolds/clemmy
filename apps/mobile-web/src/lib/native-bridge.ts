@@ -3,11 +3,10 @@
  * pinned WKWebView).
  *
  * The native side owns the APNs registration ceremony (permission prompt,
- * device token), but it deliberately does NOT own an authenticated transport
- * — the device-bound session key lives in this page's IndexedDB and is
- * non-extractable by design. So the shell hands the token to the page and the
- * page registers it through the normal proof-signed api() path. One auth
- * path, no second credential.
+ * device token). Push registration uses the page's device-bound session key
+ * in IndexedDB, which is non-extractable by design. The shell hands the token
+ * to the page for the normal proof-signed api() path. Widget voice has a
+ * separate native key; its enrollment lives in native-voice-bridge.ts.
  *
  * Resilience: a token can arrive before the session exists (first launch
  * races pairing) or while the daemon is briefly unreachable. Failed
@@ -58,6 +57,21 @@ export function haptic(kind: HapticKind = 'light'): void {
 /** True when the pinned native shell is hosting this page. */
 export function inNativeShell(): boolean {
   return Boolean(window.webkit?.messageHandlers?.clemHaptic);
+}
+
+/** The native capture setup is available only in supported iPhone builds. */
+export function nativeVoiceSetupAvailable(): boolean {
+  return Boolean(window.webkit?.messageHandlers?.clemNativeVoiceSetup);
+}
+
+/** Presents setup; only a later explicit native action may start recording. */
+export function requestNativeVoiceSetup(): boolean {
+  try {
+    const handler = window.webkit?.messageHandlers?.clemNativeVoiceSetup;
+    if (!handler) return false;
+    handler.postMessage(true);
+    return true;
+  } catch { return false; }
 }
 
 /**
