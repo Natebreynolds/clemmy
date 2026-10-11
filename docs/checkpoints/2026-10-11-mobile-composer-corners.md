@@ -52,3 +52,13 @@ with the prior mobile assets. This web refinement needs no new native binary.
 Browser fixture acceptance does not prove physical iPhone keyboard behavior or
 widget voice/dictation capture. Native build16 signing/device acceptance remains
 separate and pending; no live-home data, settings or provider calls were changed.
+
+## Additive integration independently checked — 20:03 UTC
+
+The installer has integrated the exact patch into its newer Chat source.
+Read-only verification confirmed its integration receipt SHA-256
+`91faad178b38b48c07f112b52c3fccfe8d0ddbf918da2cfe773a2139818a2f55`, both
+announced merged-file hashes, exact candidate CSS bytes, and a successful
+reverse-patch check. Evidence: `integration-verification.json` in the same output
+directory. This verifies source integration only: installed fingerprint remains
+batch6 `57a4df00`; the next build/hotpatch and physical phone acceptance are pending.
