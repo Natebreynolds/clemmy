@@ -17,6 +17,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const {
+  __gatewayTest__,
   formatComposioToolOutput,
   formatComposioExecuteOutput,
   detectComposioFailure,
@@ -2031,4 +2032,27 @@ test('ambiguous identities produce the mailbox question, never a doomed bare dis
     conns as never, 'OUTLOOK_CREATE_DRAFT', 'clementine-machine',
   );
   assert.match(absent!, /old@work\.com.*no longer connected/);
+});
+
+test('the callable contract shows each field\'s limits, so a call can stay inside them the first time', () => {
+  const rendered = __gatewayTest__.renderCallableContract('EXAMPLE_SEARCH', {
+    type: 'object',
+    required: ['query'],
+    properties: {
+      query: { type: 'string', maxLength: 200 },
+      size: { type: 'integer', minimum: 1, maximum: 25 },
+      start: { type: 'integer', minimum: 0 },
+      order: { type: 'string', enum: ['newest', 'oldest'] },
+      ids: { type: 'array', maxItems: 10 },
+      note: { type: 'string' },
+    },
+  });
+  assert.equal(rendered, '\n\nCallable contract for EXAMPLE_SEARCH (* = required):\n'
+    + '  query*: string (up to 200 characters)\n'
+    + '  size: integer (1 to 25)\n'
+    + '  start: integer (at least 0)\n'
+    + '  order: string (one of: "newest", "oldest")\n'
+    + '  ids: array (up to 10 items)\n'
+    + '  note: string\n'
+    + 'Correct the arguments and call it again; this attempt never dispatched.');
 });
