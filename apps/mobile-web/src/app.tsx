@@ -73,6 +73,7 @@ import { MobileNavigationProvider } from './lib/mobile-navigation';
 import { NavigationMenuButton } from './components/NavigationMenuButton';
 import { useMobileViewportVariables } from './lib/use-keyboard-inset';
 import { mobileChatLocation } from './lib/chat-location';
+import { installNativeVoiceBridge } from './lib/native-voice-bridge';
 import { composeModeFromSearch, consumeComposeSearch } from './lib/compose-route';
 import { saveWidgetSpace, widgetAvailable, widgetNavigationFromSearch, WIDGET_ROUTE_EVENT } from './lib/widget-bridge';
 
@@ -134,8 +135,10 @@ export function App() {
   const [chatsListVisible, setChatsListVisible] = useState(false);
   const [door, setDoor] = useState<ConnectionDoor>(connectionDoor() ?? 'direct');
   const authenticated = Boolean(authStatus?.authenticated);
+  useEffect(() => authenticated ? installNativeVoiceBridge() : undefined, [authenticated]);
   useEffect(() => { if (authStatus && !authenticated) {
     mobileDrafts.clear(); mobileChatLocation.clear();
+    window.webkit?.messageHandlers?.clemNativeVoiceClear?.postMessage(true);
     if (widgetAvailable()) void saveWidgetSpace(null).catch(() => undefined);
   } }, [authenticated, authStatus !== null]);
   /** Reads the ONE Needs-you count again; set by the poll that owns it. */
@@ -266,10 +269,20 @@ export function App() {
       syncLocation();
     };
     window.addEventListener(WIDGET_ROUTE_EVENT, widgetRoute);
+    const nativeConversation = (event: Event) => {
+      if (!authenticated) return;
+      const sessionId = (event as CustomEvent<{ sessionId: string }>).detail?.sessionId;
+      if (typeof sessionId !== 'string' || !/^[a-zA-Z0-9:_-]{1,200}$/.test(sessionId)) return;
+      event.preventDefault();
+      userNavigated.current = true;
+      setDrawerOpen(false); setTab('chats'); setHandoff({ sessionId });
+    };
+    window.addEventListener('clem:native-voice-conversation', nativeConversation);
     if (authenticated) window.webkit?.messageHandlers?.clemWidgetNavigationReady?.postMessage(true);
     return () => {
       window.removeEventListener('popstate', syncLocation);
       window.removeEventListener(WIDGET_ROUTE_EVENT, widgetRoute);
+      window.removeEventListener('clem:native-voice-conversation', nativeConversation);
     };
   }, [authenticated]);
 

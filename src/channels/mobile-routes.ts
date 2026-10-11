@@ -1,4 +1,5 @@
 import { registerCloudBrowserRoutes } from './cloud-browser-routes.js';
+import { nativeVoiceControlBoundary, registerNativeVoiceStatus } from './mobile-native-voice-status.js';
 import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
@@ -14,6 +15,7 @@ import { extractApprovalContentPreview, type ApprovalContentPreview } from '../r
 import { ApprovalControlBindingUnavailable, commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { createMobileChatAdmission, prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
 import { registerMobileMemoryWorkRoutes } from './mobile-memory-work-routes.js';
+import { registerMobileNativeVoiceAuth } from './mobile-native-voice-auth.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { BrainSelectionError, CODEX_BRAIN_SLOTS, codexBrainSlotUpdates, brainSelectionReceipt, type CodexBrainSlot } from '../runtime/harness/brain-selection.js';
@@ -1863,6 +1865,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   }
   (router as express.Router & { requireMobileSession: typeof requireMobileSession })
     .requireMobileSession = requireMobileSession;
+
+  registerMobileNativeVoiceAuth(router, requireMobileSession, stateOpts);
 
   /** Liveness probe — setup uses this to confirm the daemon is answering. */
   /**
@@ -3763,6 +3767,30 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    * transcriber only as a fallback when the local model is not ready and a
    * key exists. Bytes are 16 kHz mono WAV; nothing is kept.
    */
+  registerNativeVoiceStatus(router, requireMobileSession, (deviceId, requestId) => {
+    const receipt = getHarnessChatRequestReceipt(`mobile:${mobileChatDigest(deviceId, requestId)}`);
+    if (!receipt) return null;
+    const attempt = getLatestRunAttemptByRunId(receipt.sessionId, receipt.runId);
+    const committed = attempt?.sourceUserSeq ? exactMobileApprovalTerminal(receipt.sessionId, attempt.sourceUserSeq) : null;
+    const published = committed ? projectHarnessEventsForPublic([committed.event])[0] : null;
+    const presentation = published ? presentationEventFromCompletionData(published.data) : null;
+    const source = attempt ? getRunAttemptSourceUserEvent(attempt) : null;
+    const exactSource = source?.seq === attempt?.sourceUserSeq && source?.sessionId === receipt.sessionId;
+    const requiresApp = Boolean(presentation?.approvalId) || nativeVoiceControlBoundary({
+      sourceUserSeq: attempt?.sourceUserSeq ?? -1,
+      completionData: committed?.event.data,
+      sourceData: source?.data,
+      awaitingInputData: presentation?.kind === 'question'
+        ? harnessListEvents(receipt.sessionId, { types: ['awaiting_user_input'] }).map((event) => event.data) : [],
+    });
+    return { sessionId: receipt.sessionId, terminal: presentation && attempt?.sourceUserSeq
+      && presentation.identity.sessionId === receipt.sessionId && presentation.identity.sourceUserSeq === attempt.sourceUserSeq
+      ? { sessionId: receipt.sessionId, sourceUserSeq: attempt.sourceUserSeq, status: presentation.status,
+          kind: presentation.kind, text: presentation.text, requiresApp,
+          ordinaryQuestion: Boolean(exactSource && presentation.status === 'needs_input'
+            && presentation.kind === 'question' && presentation.needs?.kind === 'input' && !requiresApp) } : null };
+  });
+
   router.post('/api/chat/transcribe', requireMobileSession, express.raw({ type: 'audio/*', limit: '15mb' }), async (req, res) => {
     const bytes = Buffer.isBuffer(req.body) && req.body.length > 44 ? (req.body as Buffer) : undefined;
     if (!bytes) { res.status(400).json({ error: 'AUDIO_REQUIRED' }); return; }
@@ -4312,6 +4340,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       }
 
       const typedControl = !taskMode || taskMode.kind === 'normal' ? classifyMobileTypedChatControl(message) : null;
+      if (typedControl && req.body?.requireIdle === true) {
+        res.status(409).json({ error: 'VOICE_CONTROL_REQUIRES_CHAT', message: 'Open this conversation in Clem to use this control.' }); return;
+      }
       if (typedControl?.kind === 'formal_approval') {
         await resolveMobileApproval(res, typedControl.approvalId, typedControl.decision, {
           request: { requestId, runId, inputHash },
@@ -4458,7 +4489,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             && latestAttempt.leaseExpiresAt
             && Date.parse(latestAttempt.leaseExpiresAt) > Date.now(),
           );
-          if (attachmentIds.length > 0) {
+          if (attachmentIds.length > 0 || req.body?.requireIdle === true) {
             const { steerReasonForRunningWork } = await import('../runtime/harness/steer-notes.js');
             const busyReason = steerReasonForRunningWork({
               runInFlightSince: HarnessSession.load(proposedSessionId)?.runInFlightSince() ?? null,
@@ -4467,7 +4498,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
               hasUnfinishedAttempt: Boolean(latestAttempt && !latestAttempt.finishedAt),
               nowMs: Date.now(),
             });
-            if (busyReason) { res.status(409).json({ error: 'ATTACHMENTS_REQUIRE_IDLE_CHAT' }); return; }
+            if (busyReason) { res.status(409).json({ error: req.body?.requireIdle === true ? 'VOICE_REQUIRES_IDLE_CHAT' : 'ATTACHMENTS_REQUIRE_IDLE_CHAT' }); return; }
           }
           if (leaseLive) {
             if (connectionContext) { res.status(409).json({ error: 'This turn is still finishing. Check the connection again shortly.' }); return; }
@@ -4496,6 +4527,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             return;
           }
         } catch (steerErr) {
+          if (req.body?.requireIdle === true) {
+            res.status(503).json({ error: 'VOICE_IDLE_CHECK_UNAVAILABLE' }); return;
+          }
           if (req.body?.steerOnly === true) {
             res.status(409).json({ error: 'RUN_NOT_ACTIVE' });
             return;

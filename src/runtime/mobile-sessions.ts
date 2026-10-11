@@ -297,7 +297,7 @@ export async function createSessionForExistingDevice(
  * sessions-file lock with device revocation.
  */
 export async function createOrReuseSessionForExistingDevice(
-  input: CreateMobileSessionInput & { deviceId: string; reuseOnly?: boolean },
+  input: CreateMobileSessionInput & { deviceId: string; reuseOnly?: boolean; maxSessionsPerKey?: number },
   sessionToken: string,
   opts?: MobileSessionStoreOptions,
 ): Promise<CreatedSession | undefined> {
@@ -344,6 +344,15 @@ export async function createOrReuseSessionForExistingDevice(
         return live.length === (current.sessions ?? []).length
           ? undefined
           : { version: 2, sessions: live };
+      }
+      // Native credential provisioning may impose a per-key bound. Exact
+      // token replay above remains available at the cap; existing callers
+      // that omit it keep their previous behavior. Revocation shares this lock.
+      if (input.maxSessionsPerKey !== undefined && input.devicePublicKeyJwk
+        && live.filter(row => row.deviceId === input.deviceId
+          && row.devicePublicKeyJwk?.x === input.devicePublicKeyJwk?.x
+          && row.devicePublicKeyJwk?.y === input.devicePublicKeyJwk?.y).length >= input.maxSessionsPerKey) {
+        return live.length === (current.sessions ?? []).length ? undefined : { version: 2, sessions: live };
       }
       if (!live.some((row) => row.deviceId === input.deviceId)) {
         return { version: 2, sessions: live };
