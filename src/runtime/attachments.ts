@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { convertToMarkdown, convertUrlToMarkdown, isConvertibleExtension } from './markitdown.js';
@@ -67,6 +67,8 @@ export interface IngestInput {
   sourcePath?: string;
   /** A remote URL — YouTube/web pages convert directly; file URLs are fetched. */
   url?: string;
+  /** Prepare context without paid vision or audio calls before the user sends. */
+  localOnly?: boolean;
 }
 
 export interface IngestedAttachment {
@@ -181,6 +183,7 @@ export async function ingestAttachment(input: IngestInput): Promise<IngestedAtta
     // Audio (and audio extracted from video) → Whisper: cheap, reliable,
     // ~$0.006/min. No ffmpeg needed for plain audio files.
     if (isAudioExtension(target)) {
+      if (input.localOnly) return { name, markdown: 'Audio bytes are available in the saved snapshot. No transcription was performed during attachment preparation.' };
       const res = await transcribeAudio(target);
       return res.ok ? { name, markdown: clip(`# Transcript — ${name}\n\n${res.text}`) } : { name, error: res.error };
     }
@@ -192,10 +195,12 @@ export async function ingestAttachment(input: IngestInput): Promise<IngestedAtta
       // The raw pixels are the primary artifact: when the file lives in OUR
       // store (bytes were persisted above), carry its path so a vision brain
       // can view_image it natively — description text becomes supplementary.
-      const imagePath = target.startsWith(path.join(BASE_DIR, 'state', 'attachments-files') + path.sep)
-        ? target
+      const imageStore = path.join(BASE_DIR, 'state', 'attachments-files');
+      const imagePath = existsSync(imageStore) && realpathSync(target).startsWith(realpathSync(imageStore) + path.sep)
+        ? realpathSync(target)
         : undefined;
-      const keyed = hasOpenAiKey();
+      if (input.localOnly && imagePath) return { name, markdown: 'Image bytes are available in the saved snapshot. No image analysis was performed during attachment preparation.', imagePath };
+      const keyed = !input.localOnly && hasOpenAiKey();
       if (keyed) {
         const res = await describeImage(target);
         if (res.ok) return { name, markdown: clip(res.text), imagePath };

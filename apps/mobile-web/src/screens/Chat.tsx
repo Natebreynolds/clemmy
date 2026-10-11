@@ -105,12 +105,15 @@ import { PlanReview } from '../components/PlanReview';
 import { RunControl, delegatedRunControlForExpandedWork } from '../components/RunControl';
 import { DelegatedTaskCard } from '../components/DelegatedTaskCard';
 import { CompletedFiles } from '../components/CompletedFiles';
+import { assertDraftCurrent, currentDraftStep, fileContextKey, fileContextProblem, fileSendWasNotAdmitted, mobileDrafts, newMobileDraftScope, prepareSelectedFile, settledFileRequest, submitFileDraft, type MobileDraft, type SelectedFileContext, type DraftSendResult } from '../lib/file-context';
 
 interface Props {
   sessionId?: string;
   initialTitle?: string;
   /** Text typed on Home's ask bar, waiting in the composer on arrival. */
   initialDraft?: string;
+  initialFileContext?: SelectedFileContext;
+  draftScope?: string;
   /** Files uploaded from Home's capsule, sent with that text. */
   initialAttachments?: ChatAttachment[];
   /** Only Home's explicit Send handoff uses this; response/edit handoffs stay editable. */
@@ -130,7 +133,7 @@ interface Props {
   onBack: () => void;
 }
 
-export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialAttachments, initialAutoSend, agentId: initialAgentId, agentName: initialAgentName, projectId: initialProjectId, projectName: initialProjectName, onOpenRun, onOpenNeedsYou, onBack }: Props) {
+export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialFileContext, draftScope, initialAttachments, initialAutoSend, agentId: initialAgentId, agentName: initialAgentName, projectId: initialProjectId, projectName: initialProjectName, onOpenRun, onOpenNeedsYou, onBack }: Props) {
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
   // Who answers the next message — changeable at any time, like the brain.
   // A new conversation opens inside it; after that a change is applied just
@@ -179,7 +182,38 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     return () => { cancelled = true; };
   }, [projectPickOpen]);
   const [title, setTitle] = useState(initialTitle ?? '');
-  const [draft, setDraft] = useState(initialDraft ?? '');
+  const draftOwner = useRef(initialSessionId ? `chat:${initialSessionId}` : draftScope ?? newMobileDraftScope());
+  const [draft, setDraftState] = useState(() => mobileDrafts.read(draftOwner.current, initialDraft).text);
+  const [fileContext, setFileContext] = useState<SelectedFileContext | null>(() => initialFileContext
+    ? mobileDrafts.select(draftOwner.current, initialFileContext).context : mobileDrafts.read(draftOwner.current).context);
+  const appliedContext = useRef(initialFileContext);
+  const contextRef = useRef(fileContext);
+  contextRef.current = fileContext;
+  const activeDraftOwner = useRef(true);
+  const [preparingContext, setPreparingContext] = useState(false);
+  const [settledAttachmentIds, setSettledAttachmentIds] = useState<string[]>([]);
+  const acceptedRequests = useRef(new Set<string>());
+  const notAdmittedRequests = useRef(new Set<string>());
+  const setDraft = (value: string | ((previous: string) => string)) => {
+    const next = typeof value === 'function' ? value(mobileDrafts.read(draftOwner.current).text) : value;
+    mobileDrafts.patch(draftOwner.current, { text: next });
+    setDraftState(next);
+  };
+  const rememberDraft = (patch: Partial<MobileDraft>) => {
+    mobileDrafts.patch(draftOwner.current, patch);
+    if ('context' in patch && activeDraftOwner.current) { contextRef.current = patch.context ?? null; setFileContext(patch.context ?? null); }
+  };
+  const discussFile = (context: SelectedFileContext) => {
+    mobileDrafts.select(draftOwner.current, context);
+    contextRef.current = context;
+    setFileContext(context);
+    window.setTimeout(() => { if (activeDraftOwner.current) textareaRef.current?.focus(); }, 0);
+  };
+  useEffect(() => { activeDraftOwner.current = true; return () => { activeDraftOwner.current = false; }; }, []);
+  useEffect(() => {
+    if (initialFileContext && initialFileContext !== appliedContext.current) discussFile(initialFileContext);
+    appliedContext.current = initialFileContext;
+  }, [initialFileContext]);
   const [composerMode, setComposerMode] = useState<ComposerMode>('normal');
   const [planActing, setPlanActing] = useState<string | null>(null);
   const [approvalActing, setApprovalActing] = useState<string | null>(null);
@@ -214,10 +248,19 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           }
           projectId = openedInProject.current.get(idempotencyKey) ?? null;
         }
-        const result = await sendChatMessageAsync({
-          message, sessionId, idempotencyKey, connectionRequestId, steerOnly, taskMode, agentId, attachments,
-          ...(projectId ? { projectId } : {}),
-        });
+        let result: Awaited<ReturnType<typeof sendChatMessageAsync>>;
+        try {
+          result = await sendChatMessageAsync({
+            message, sessionId, idempotencyKey, connectionRequestId, steerOnly, taskMode, agentId, attachments,
+            ...(projectId ? { projectId } : {}),
+          });
+          notAdmittedRequests.current.delete(idempotencyKey);
+        } catch (error) {
+          if (fileSendWasNotAdmitted(error)) notAdmittedRequests.current.add(idempotencyKey);
+          else notAdmittedRequests.current.delete(idempotencyKey);
+          throw error;
+        }
+        if (result.accepted || result.steered) acceptedRequests.current.add(idempotencyKey);
         if (!sessionId) sessionProjectId.current = projectId;
         return { sessionId: result.sessionId, accepted: result.accepted, steered: result.steered };
       },
@@ -242,6 +285,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     },
     newIdempotencyKey: freshIdempotencyKey,
   }), [initialSessionId, boundAgentId]);
+  const engineOwner = useRef(engine);
+  engineOwner.current = engine;
 
   useEffect(() => {
     const unsubscribe = engine.subscribe(setSnapshot);
@@ -273,7 +318,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   useEffect(() => {
     const text = initialDraft?.trim() ?? '';
     const files = initialAttachments ?? [];
-    if (!initialAutoSend || (!text && files.length === 0) || autoSent.current) return;
+    if (initialFileContext || !initialAutoSend || (!text && files.length === 0) || autoSent.current) return;
     autoSent.current = true;
     setDraft('');
     haptic('light');
@@ -283,6 +328,12 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 
   const messages = snapshot?.messages ?? [];
   const busy = snapshot?.busy ?? false;
+  useEffect(() => {
+    if (!snapshot?.sessionId) return;
+    const next = `chat:${snapshot.sessionId}`;
+    mobileDrafts.move(draftOwner.current, next);
+    draftOwner.current = next;
+  }, [snapshot?.sessionId]);
   const planning = busy ? snapshot?.activeTaskMode?.kind === 'plan' : composerMode === 'plan';
   const executing = busy && snapshot?.activeTaskMode?.kind === 'execute';
   const connection = snapshot?.connection ?? 'idle';
@@ -377,10 +428,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   /** Tell the daemon about the agent chip. Only when the chip changed: a
    *  plain follow-up must never wait on, or fail on, a switch to what the
    *  conversation already has: a failed switch must not drop the follow-up. */
-  async function applyAgentChoice(sessionId: string | null | undefined) {
+  async function applyAgentChoice(sessionId: string | null | undefined, current: () => boolean = () => activeDraftOwner.current && engineOwner.current === engine) {
     const wanted = agent?.id ?? null;
     if (!sessionId || busy || !takesAgent || wanted === sessionAgentId.current) return;
-    const result = await switchChatAgent(sessionId, wanted);
+    const result = await currentDraftStep(current, () => switchChatAgent(sessionId, wanted));
     sessionAgentId.current = result.agentId ?? null;
     // Who actually replies (a deleted agent falls back to Clem).
     if ((result.agentId ?? null) !== wanted) {
@@ -390,19 +441,24 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 
   /** Send a new message to whoever the chip names. A message sent while a
    *  reply runs steers that reply; the choice waits for the next one. */
-  async function sendMessage(text: string, mode: TaskMode | undefined, attachments: ChatAttachment[] = []) {
-    const sessionId = snapshot?.sessionId;
-    await applyAgentChoice(sessionId);
+  async function sendMessage(text: string, mode: TaskMode | undefined, attachments: ChatAttachment[] = [], stillCurrent: () => boolean = () => true) {
+    const current = () => activeDraftOwner.current && engineOwner.current === engine && stillCurrent();
+    assertDraftCurrent(current);
+    if (attachments.length && engine.snapshot().busy) throw new Error('Files can be sent after Clem finishes this turn.');
+    const sessionId = engine.snapshot().sessionId;
+    await applyAgentChoice(sessionId, current);
+    assertDraftCurrent(current);
     // The same rule for the project: told only when it changed.
     const wantedProject = project?.id ?? null;
     if (sessionId && !busy && takesAgent && wantedProject !== sessionProjectId.current) {
       try {
-        const result = await setChatProject(sessionId, wantedProject);
+        const result = await currentDraftStep(current, () => setChatProject(sessionId, wantedProject));
         sessionProjectId.current = result.projectId ?? null;
         if ((result.projectId ?? null) !== wantedProject) {
           setProject(result.projectId ? { id: result.projectId, name: result.projectName ?? '' } : null);
         }
       } catch (err) {
+        if (!current()) throw err;
         // The message was written for a project it cannot work in. It is not
         // sent somewhere else instead: the words go back to the composer and
         // the chip goes back to what the conversation really has.
@@ -412,6 +468,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         throw new Error(refusalWords(err, 'That project could not be used, so your message was not sent.'));
       }
     }
+    assertDraftCurrent(current);
+    if (attachments.length && engine.snapshot().busy) throw new Error('Clem started working. Send the files after this turn finishes.');
     await engine.send(text, mode, { attachments });
   }
   const followingTail = useRef(true);
@@ -531,11 +589,60 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     return () => observer.disconnect();
   }, [canStop, planning]);
 
-  function submitDraft(text: string, attachments: ChatAttachment[]) {
-    if (executing) return;
-    haptic('light');
-    void sendMessage(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode }, attachments)
-      .catch(error => setError(error instanceof Error ? error.message : 'Could not send.'));
+  function requestOutcome(before: Set<string>, messageId?: string): DraftSendResult {
+    const rows = engine.snapshot().messages.filter(message => message.role === 'user' && (messageId ? message.id === messageId : !before.has(message.id)));
+    const failed = rows.find(message => message.pending === 'failed');
+    return { accepted: rows.some(message => message.idempotencyKey && acceptedRequests.current.has(message.idempotencyKey))
+      || rows.some(message => Boolean(message.acceptedSource) && message.pending !== 'failed'), failedMessageId: failed?.id,
+      notAdmitted: Boolean(failed?.idempotencyKey && notAdmittedRequests.current.has(failed.idempotencyKey)) };
+  }
+
+  async function submitDraft(text: string, attachments: ChatAttachment[]): Promise<boolean> {
+    if (executing || preparingContext) return false;
+    const selected = contextRef.current;
+    const owner = draftOwner.current;
+    const current = () => activeDraftOwner.current && engineOwner.current === engine && (contextRef.current === selected
+      || Boolean(contextRef.current && selected && fileContextKey(contextRef.current) === fileContextKey(selected)));
+    setPreparingContext(true);
+    setError(null);
+    try {
+      return await submitFileDraft({
+        draft: mobileDrafts.read(owner), text, attachments,
+        busy: () => engine.snapshot().busy,
+        current: () => Boolean(current()),
+        prepare: prepareSelectedFile,
+        remember: rememberDraft,
+        send: async (words, files) => {
+          const before = new Set(engine.snapshot().messages.map(message => message.id));
+          await sendMessage(words, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode }, files, current);
+          return requestOutcome(before);
+        },
+        retry: async messageId => { await engine.retry(messageId); return requestOutcome(new Set(), messageId); },
+        discard: messageId => engine.discard(messageId),
+      });
+    } catch (error) {
+      throw new Error(fileContextProblem(error));
+    } finally {
+      if (activeDraftOwner.current) setPreparingContext(false);
+    }
+  }
+
+  async function retryDraftMessage(id: string) {
+    const request = mobileDrafts.read(draftOwner.current).failed;
+    await engine.retry(id);
+    const result = requestOutcome(new Set(), id);
+    if (result.notAdmitted) {
+      engine.discard(id);
+      if (mobileDrafts.read(draftOwner.current).failed?.messageId === id) rememberDraft({ failed: undefined });
+      throw new Error('Clem is working. The refused message was not sent. Your draft is still here; send it after this turn finishes.');
+    }
+    if (!result.accepted || !request || request.messageId !== id) return;
+    const saved = mobileDrafts.read(draftOwner.current);
+    if (saved.failed?.messageId !== id) return;
+    const patch = settledFileRequest(saved, request);
+    if (patch.context === null || patch.text !== undefined) setSettledAttachmentIds(request.attachmentIds);
+    if (patch.text !== undefined) setDraft(patch.text);
+    rememberDraft(patch);
   }
 
   async function actOnPlan(planProposalId: string, action: 'approve' | 'reject') {
@@ -704,7 +811,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           <div class="conn-pill conn-detached">catching up in the background</div>
         ) : null}
       </div>
-      <CompletedFiles conversationId={snapshot?.sessionId ?? initialSessionId} />
+      <CompletedFiles conversationId={snapshot?.sessionId ?? initialSessionId} onDiscuss={discussFile} />
       <CloudBrowserDock conversationId={snapshot?.sessionId ?? initialSessionId} />
       <div
         class="chat-transcript"
@@ -747,8 +854,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             approvalDecided={Boolean(message.approval?.resolution) || chatApprovalDecided(messages, message.approval?.approvalId)}
             onApprovalAction={actOnApproval}
             onApproveWithEdits={actOnApprovalWithEdits}
-            onRetry={(id) => { void engine.retry(id).catch(error => setError(error instanceof Error ? error.message : 'Could not retry.')); }}
-            onDiscard={(id) => engine.discard(id)}
+            onRetry={(id) => { void retryDraftMessage(id).catch(error => setError(error instanceof Error ? error.message : 'Could not retry.')); }}
+            onDiscard={(id) => { engine.discard(id); if (mobileDrafts.read(draftOwner.current).failed?.messageId === id) rememberDraft({ failed: undefined }); }}
             // Suggested answers stay tappable only while the question is the
             // newest message; once anything follows it, they are a record.
             onConnectionContinue={index === messages.length - 1 ? (text, connectionResume) => engine.send(text, undefined, { connectionResume }) : undefined}
@@ -785,6 +892,16 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           stopping={stopping}
           onStop={stopTurn}
           onSend={submitDraft}
+          reservedAttachments={fileContext ? 1 : 0}
+          contextKey={fileContext ? fileContextKey(fileContext) : undefined}
+          settledAttachmentIds={settledAttachmentIds}
+          sendBlocked={fileContext && busy ? 'This selected file will go with your next message after Clem finishes.' : undefined}
+          context={fileContext ? <div class="composer-file-context" aria-label="Selected file context">
+            <span><strong>{fileContext.ref.name}</strong><span>Selected version · Attached to your next message</span></span>
+            <button type="button" class="composer-icon" disabled={preparingContext} aria-label={`Remove ${fileContext.ref.name} context`} onClick={() => rememberDraft({ context: null, prepared: undefined })}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+            </button>
+          </div> : null}
           chips={(
             <>
               {/* Act | Plan as one chip: tap flips it. Disabled mid-run, when

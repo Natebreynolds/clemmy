@@ -8,7 +8,7 @@
  * daemon acknowledges it.
  */
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Button } from '@/components/ui/Button';
 import { Plus, SlidersHorizontal } from 'lucide-react';
 import { HomeBuilder } from '@/components/home/HomeBuilder';
@@ -32,12 +32,14 @@ import {
 } from '@/lib/home-prefs';
 import { effectiveSpaceView, useHomeToday, useSpaceSummaries } from '@/lib/home-data';
 import { useChat } from '@/lib/useChat';
+import { moveComposerDraft, newComposerDraftKey } from '@/lib/composer-drafts';
+import { useConversationSendScope } from '@/lib/use-conversation-send-scope';
 import { unifiedChatSessionId } from '@/lib/last-session';
 import { listWorkingNowSnapshot } from '@/lib/activity';
 import { presentWorkingNow } from '@/lib/activity-presentation';
 import { listSpaces } from '@/lib/spaces';
 import type { CommandCenter } from '@/lib/types';
-import { Composer } from '@/components/chat/Composer';
+import { Composer, type ComposerSendInput } from '@/components/chat/Composer';
 import { AgentPicker } from '@/components/chat/AgentPicker';
 import { useConversationAgent } from '@/lib/conversation-agent';
 import { ProjectPicker } from '@/components/chat/ProjectPicker';
@@ -56,8 +58,6 @@ import { useFromClem, withoutFromClem } from '@/lib/from-clem';
 import { HomeNotice, SectionHeader, type HomeNoticeState } from '@/components/home/HomeSection';
 import { awayCounts, presenceLine, silentImmediatePanes, staleSuffix, type HomeFeedItem } from '@/components/home/home-model';
 import { cn } from '@/lib/cn';
-
-const OPEN_THREAD_TIMEOUT_MS = 30_000;
 
 export function Home() {
   const [params] = useSearchParams();
@@ -127,14 +127,17 @@ function LiveHome() {
   };
 
   const chat = useChat({ rememberAsLastSession: true });
+  const location = useLocation();
+  const routeDraftKey = newComposerDraftKey(location.pathname, location.key, (location.state as { newChat?: number } | null)?.newChat);
+  const captureSendScope = useConversationSendScope(routeDraftKey, chat.sessionId);
   const composerRef = useRef<HTMLTextAreaElement>(null);
-  const openTimerRef = useRef<number | null>(null);
+  const openingRef = useRef(false);
   const [opening, setOpening] = useState(false);
   const [notice, setNotice] = useState<HomeNoticeState | null>(null);
-
-  useEffect(() => () => {
-    if (openTimerRef.current !== null) window.clearTimeout(openTimerRef.current);
-  }, []);
+  useEffect(() => {
+    openingRef.current = false;
+    setOpening(false);
+  }, [routeDraftKey]);
 
   // Who answers the first message: Clem, or one of the owner's agents. The
   // same chip the thread composer has (owner 09-26: "I don't have the agent
@@ -142,42 +145,44 @@ function LiveHome() {
   const agentChoice = useConversationAgent(null);
   // Which project it opens in, chosen the same way.
   const projectChoice = useConversationProject(null);
-  const sendAndOpen = useCallback((input: { text: string; attachmentIds: string[]; attachmentNames: string[]; voice?: boolean }) => {
-    if (chat.busy || opening) return;
+  const openAcceptedConversation = useCallback((isCurrentRoute: () => boolean, onAccepted?: () => void) => {
+    const id = chat.sessionId.current;
+    // Move before clearing the accepted snapshot or navigating. New typing,
+    // late uploads and a different selected file follow their actual session.
+    if (id) moveComposerDraft(routeDraftKey, `session:${id}`);
+    onAccepted?.();
+    if (id && isCurrentRoute()) navigate(`/chat/${encodeURIComponent(unifiedChatSessionId(id))}`);
+  }, [chat.sessionId, navigate, routeDraftKey]);
+  const sendAndOpen = useCallback(async (input: ComposerSendInput) => {
+    if (chat.busy || openingRef.current) throw new Error('The previous message is still opening. Your draft is here.');
+    const scope = captureSendScope();
     setNotice(null);
+    openingRef.current = true;
     setOpening(true);
-    void (async () => {
+    try {
       const [addressed, placed] = await Promise.all([
-        agentChoice.prepare(chat.sessionId.current, chat.busy).catch(() => ({})),
-        projectChoice.prepare(chat.sessionId.current, chat.busy).catch(() => ({})),
+        agentChoice.prepare(chat.sessionId.current, chat.busy),
+        projectChoice.prepare(chat.sessionId.current, chat.busy),
       ]);
-      await chat.send({ ...input, ...addressed, ...placed });
-    })();
-    const started = Date.now();
-    const tick = () => {
-      const id = chat.sessionId.current;
-      if (id) {
-        navigate(`/chat/${encodeURIComponent(unifiedChatSessionId(id))}`);
-        return;
-      }
-      if (Date.now() - started > OPEN_THREAD_TIMEOUT_MS) {
-        setOpening(false);
-        return;
-      }
-      openTimerRef.current = window.setTimeout(tick, 100);
-    };
-    tick();
-  }, [agentChoice, projectChoice, chat, navigate, opening]);
-
-  useEffect(() => {
-    if (!opening || chat.busy || chat.sessionId.current) return;
-    const failed = [...chat.messages].reverse().find((m) => m.role === 'assistant' && m.status === 'failed');
-    if (!failed) return;
-    if (openTimerRef.current !== null) window.clearTimeout(openTimerRef.current);
-    setOpening(false);
-    setNotice({ tone: 'error', text: failed.text || 'That didn’t send. Try again.' });
-    chat.reset();
-  }, [opening, chat]);
+      scope.assertCurrent();
+      await chat.send({ ...input, ...addressed, ...placed,
+        onAccepted: () => openAcceptedConversation(scope.isCurrentRoute, input.onAccepted),
+      });
+    } finally {
+      if (scope.isCurrentRoute()) { openingRef.current = false; setOpening(false); }
+    }
+  }, [agentChoice, projectChoice, chat, captureSendScope, openAcceptedConversation]);
+  const retryAndOpen = async (onAccepted?: () => void) => {
+    if (chat.busy || openingRef.current) throw new Error('The previous message is still opening. Your draft is here.');
+    const scope = captureSendScope();
+    openingRef.current = true;
+    setOpening(true);
+    try {
+      await chat.retryPending(() => openAcceptedConversation(scope.isCurrentRoute, onAccepted));
+    } finally {
+      if (scope.isCurrentRoute()) { openingRef.current = false; setOpening(false); }
+    }
+  };
 
   const ccLoading = cc.isLoading;
   const ccError = cc.isError && !cc.data;
@@ -371,10 +376,14 @@ function LiveHome() {
         </div>
         <Composer
           inputRef={composerRef}
+          sessionId={chat.sessionId.current ?? undefined}
           busy={chat.busy || opening}
           mode={chat.composerMode}
           onModeChange={chat.setComposerMode}
           onSend={sendAndOpen}
+          pendingPost={chat.pendingPost}
+          onRetryPending={retryAndOpen}
+          onCancelPending={chat.cancelPending}
           onStop={chat.stop}
           voiceMessages={chat.messages}
           agentSlot={<><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} /><AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} /></>}
@@ -385,7 +394,7 @@ function LiveHome() {
           <QuickActions
             actions={prefs.quickActions}
             disabled={opening || chat.busy}
-            onPrompt={(text) => sendAndOpen({ text, attachmentIds: [], attachmentNames: [] })}
+            onPrompt={(text) => { void sendAndOpen({ text, attachmentIds: [], attachmentNames: [] }).catch(error => setNotice({ tone: 'error', text: error instanceof Error ? error.message : 'That didn’t send. Try again.' })); }}
           />
         )}
         {opening && !notice && <p role="status" className="text-small text-faint">Opening your conversation…</p>}

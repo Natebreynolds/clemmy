@@ -1,7 +1,7 @@
 /** A shared workspace for finished files and project pages. Open is always deliberate. */
 import { createContext, lazy, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Link } from 'react-router-dom';
-import { ArrowLeft, Download, ExternalLink, Files, FileText, Maximize2, Minimize2, RefreshCw, X } from 'lucide-react';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { ArrowLeft, Download, ExternalLink, Files, FileText, Maximize2, MessageSquare, Minimize2, RefreshCw, X } from 'lucide-react';
 import { projectPagePlace, projectPageTitle, renderMarkdown } from '@clem/chat-engine';
 import { ProjectPagePreview } from '@/screens/ProjectPageViewer';
 import { pageViewerPath, type ProjectPageView } from '@/lib/projects';
@@ -10,6 +10,8 @@ import { withToken } from '@/lib/api';
 import { unifiedChatSessionId } from '@/lib/last-session';
 import { artifactReadingKey, readArtifactReadingState, rememberArtifactReadingState } from '@/lib/artifact-reading-state';
 import { useArtifactScroll } from '@/lib/use-artifact-scroll';
+import { readArtifactDiscussion, type ArtifactDiscussion } from '@/lib/artifact-discussion';
+import { newComposerDraftKey, writeComposerDraft } from '@/lib/composer-drafts';
 import '../chat/file-dock.css';
 
 const PdfPreview = lazy(() => import('../chat/PdfPreview'));
@@ -37,7 +39,12 @@ export function ArtifactWorkspace(props: ArtifactWorkspaceProps) {
   return <Workspace key={props.scopeKey} {...props} />;
 }
 function Workspace({ scopeKey, children, returnLabel = 'work', scrollContent = true, filesSessionId, showFilesBar = false }: ArtifactWorkspaceProps) {
-  const [state, setState] = useState<DockState>(() => remembered.get(scopeKey) ?? INITIAL);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [state, setState] = useState<DockState>(() => {
+    const selection = showFilesBar ? readArtifactDiscussion((location.state as { artifactDiscussion?: unknown } | null)?.artifactDiscussion) : null;
+    return selection ? { visible: !window.matchMedia('(max-width: 949px)').matches, item: { kind: 'file', ref: selection.ref }, expanded: false } : remembered.get(scopeKey) ?? INITIAL;
+  });
   const [files, setFiles] = useState<SessionFile[]>([]);
   const [loading, setLoading] = useState(false);
   const [problem, setProblem] = useState('');
@@ -71,6 +78,26 @@ function Workspace({ scopeKey, children, returnLabel = 'work', scrollContent = t
     update({ visible: true, item: null, expanded: false });
     setRefresh(n => n + 1);
   }, [update, showFilesBar]);
+  const discuss = (file: SessionFile, ref: SessionFileRef, sourceSessionId?: string) => {
+    if (!file.fileId || !file.revision) return;
+    const selection: ArtifactDiscussion = { ref: { ...ref, fileId: file.fileId }, revision: file.revision };
+    const target = showFilesBar ? filesSessionId : sourceSessionId;
+    if (target || showFilesBar) {
+      const key = target ? `session:${target}` : newComposerDraftKey(location.pathname, location.key, (location.state as { newChat?: number } | null)?.newChat);
+      writeComposerDraft(key, draft => ({ ...draft, artifact: selection }));
+      if (showFilesBar) {
+        // A narrow window gives the composer its own turn on screen.
+        if (window.matchMedia('(max-width: 949px)').matches || state.expanded) update({ ...state, visible: false, expanded: false });
+        requestAnimationFrame(() => content.current?.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message Clementine"]')?.focus());
+      } else {
+        remembered.set(`chat:${target}`, { visible: !window.matchMedia('(max-width: 949px)').matches, item: { kind: 'file', ref: selection.ref }, expanded: false });
+        navigate(`/chat/${encodeURIComponent(unifiedChatSessionId(target!))}`, { state: { artifactDiscussion: selection } });
+      }
+    } else {
+      // Producer/worker identity is not proof of an answerable conversation.
+      navigate('/chat', { state: { newChat: Date.now(), artifactDiscussion: selection } });
+    }
+  };
   useEffect(() => {
     if (!state.visible || !filesSessionId) return;
     let current = true;
@@ -101,7 +128,7 @@ function Workspace({ scopeKey, children, returnLabel = 'work', scrollContent = t
               <button type="button" className={ACTION} onClick={close} aria-label={`Close and return to ${returnLabel}`}><X className="h-4 w-4" aria-hidden /></button>
             </div>
           </div>
-          {state.item ? state.item.kind === 'page' ? <PageBody key={dockKey(state.item)} projectId={state.item.projectId} page={state.item.page} /> : <FileBody key={dockKey(state.item)} fileRef={state.item.ref} conversationSessionId={showFilesBar ? undefined : state.item.conversationSessionId} /> : <div className="min-h-0 flex-1 overflow-y-auto p-4">
+          {state.item ? state.item.kind === 'page' ? <PageBody key={dockKey(state.item)} projectId={state.item.projectId} page={state.item.page} /> : <FileBody key={dockKey(state.item)} fileRef={state.item.ref} conversationSessionId={showFilesBar ? undefined : state.item.conversationSessionId} newConversation={!showFilesBar && !state.item.conversationSessionId} onDiscuss={discuss} /> : <div className="min-h-0 flex-1 overflow-y-auto p-4">
             {files.length > 0 ? <input type="search" value={fileSearch} onChange={event => setFileSearch(event.target.value)} aria-label="Search files from this chat" placeholder="Search filenames" className="mb-3 min-h-10 w-full rounded-md border border-border bg-surface px-3 text-body text-fg placeholder:text-muted" /> : null}
             {loading ? <p className="text-small text-muted" role="status">Loading files…</p> : null}
             {problem ? <p className="mb-3 text-small text-muted" role="alert">{problem}</p> : null}
@@ -124,7 +151,7 @@ function PageBody({ projectId, page }: { projectId: string; page: ProjectPageVie
   const scroll = useArtifactScroll(`page:${projectId}:${page.id}`, 'page', page);
   return <><PanelHeader title={projectPageTitle(page)} place={projectPagePlace(page)} actions={<Link to={pageViewerPath(projectId, page.id)} className={ACTION}><ExternalLink className="h-4 w-4" aria-hidden /> Open page</Link>} /><div {...scroll} className="flex min-h-0 flex-1 flex-col overflow-auto px-4 py-3"><ProjectPagePreview projectId={projectId} page={page} /></div></>;
 }
-function FileBody({ fileRef, conversationSessionId }: { fileRef: SessionFileRef; conversationSessionId?: string }) {
+function FileBody({ fileRef, conversationSessionId, newConversation, onDiscuss }: { fileRef: SessionFileRef; conversationSessionId?: string; newConversation: boolean; onDiscuss: (file: SessionFile, ref: SessionFileRef, sourceSessionId?: string) => void }) {
   const [file, setFile] = useState<SessionFile | null>(null);
   const readingKey = artifactReadingKey({ ...fileRef, fileId: file?.fileId ?? fileRef.fileId });
   const [media, setMedia] = useState('');
@@ -143,9 +170,9 @@ function FileBody({ fileRef, conversationSessionId }: { fileRef: SessionFileRef;
     void readSessionFile(fileRef).then(async found => {
       if (!current) return;
       setFile(found);
-      if (found.kind === 'image') { const src = await readSessionFileImage(fileRef); if (current) setMedia(src); }
+      if (found.kind === 'image') { const src = await readSessionFileImage(fileRef, found.revision); if (current) setMedia(src); }
       if (found.kind === 'pdf') {
-        const blob = await readSessionFileBlob(fileRef);
+        const blob = await readSessionFileBlob(fileRef, false, found.revision);
         if (blob.type.split(';')[0] !== 'application/pdf') throw new Error('The PDF could not be previewed. Download it or open it in its app.');
         if (current) setPdf(blob);
       }
@@ -159,7 +186,7 @@ function FileBody({ fileRef, conversationSessionId }: { fileRef: SessionFileRef;
   const download = async () => {
     setAction('download'); setProblem('');
     try {
-      const url = URL.createObjectURL(await readSessionFileBlob(fileRef, true));
+      const url = URL.createObjectURL(await readSessionFileBlob(fileRef, true, file?.revision));
       const link = document.createElement('a'); link.href = url; link.download = fileRef.name; link.click();
       setTimeout(() => URL.revokeObjectURL(url), 30_000);
     } catch (error) { setProblem(error instanceof Error ? error.message : 'Download failed. Try again.'); } finally { setAction(null); }
@@ -167,6 +194,7 @@ function FileBody({ fileRef, conversationSessionId }: { fileRef: SessionFileRef;
   return <>
     <PanelHeader title={fileRef.name} place={file ? `${file.place} · ${fileSizeWords(file.bytes)}` : fileRef.folder} actions={<>
       {conversationSessionId ? <Link to={`/chat/${encodeURIComponent(unifiedChatSessionId(conversationSessionId))}`} className={ACTION}>Conversation</Link> : null}
+      <button type="button" onClick={() => setAttempt(n => n + 1)} disabled={action !== null} className={ACTION} aria-label="Reload file" title="Reload the current version"><RefreshCw className="h-4 w-4" aria-hidden /></button>
       {file?.openable ? <button type="button" onClick={() => void openInApp()} disabled={action !== null} className={ACTION}><ExternalLink className="h-4 w-4" aria-hidden /> Open in app</button> : null}
       {file ? <button type="button" onClick={() => void download()} disabled={action !== null} className={ACTION}><Download className="h-4 w-4" aria-hidden /> {action === 'download' ? 'Downloading…' : 'Download'}</button> : null}
     </>} />
@@ -174,7 +202,7 @@ function FileBody({ fileRef, conversationSessionId }: { fileRef: SessionFileRef;
     {problem ? <div className="flex flex-wrap items-center gap-2 px-4 py-3" role="alert"><p className="flex-1 text-small text-muted">{problem}</p><button className={ACTION} type="button" onClick={() => setAttempt(n => n + 1)}>Try again</button></div> : null}
     {file?.truncated ? <p className="px-4 py-2 text-caption text-muted">Showing the start of this file. Download for the complete contents.</p> : null}
     {!file && !problem ? <p className="p-5 text-small text-muted" role="status">Opening…</p> : null}
-    {file?.kind === 'html' && !source && file.text !== undefined ? <><iframe className="file-dock-document" title={`Preview of ${file.name}`} sandbox="" referrerPolicy="no-referrer" src={withToken(sessionFilePath(fileRef, 'content'))} /><p className="border-t border-border px-4 py-2 text-caption text-muted">Document preview · Scripts and remote images are disabled.</p></> : null}
+    {file?.kind === 'html' && !source && file.text !== undefined ? <><iframe className="file-dock-document" title={`Preview of ${file.name}`} sandbox="" referrerPolicy="no-referrer" src={withToken(sessionFilePath(fileRef, 'content', file.revision))} /><p className="border-t border-border px-4 py-2 text-caption text-muted">Document preview · Scripts and remote images are disabled.</p></> : null}
     {file?.kind === 'pdf' && pdf ? <Suspense fallback={<p className="p-5 text-small text-muted" role="status">Opening PDF…</p>}><PdfPreview blob={pdf} name={file.name} readingKey={readingKey} /></Suspense> : null}
     {file?.kind === 'pdf' && !pdf && !problem ? <p className="p-5 text-small text-muted" role="status">Opening PDF…</p> : null}
     {file && file.kind !== 'pdf' && !(file.kind === 'html' && !source) ? <div {...scroll} tabIndex={0} role="region" aria-label={`Contents of ${file.name}`} className="min-h-0 flex-1 overflow-auto px-5 py-4">
@@ -182,6 +210,10 @@ function FileBody({ fileRef, conversationSessionId }: { fileRef: SessionFileRef;
       {(file.kind === 'text' || file.kind === 'html') && file.text !== undefined ? <pre className="whitespace-pre-wrap break-words font-mono text-small text-fg">{file.text}</pre> : null}
       {file.kind === 'image' ? media ? <img src={media} alt={file.name} onLoad={() => setImageReady(true)} onError={() => setProblem('This image could not be displayed. Try again or download a copy.')} className="h-auto max-w-full rounded-sm" /> : !problem ? <p className="text-small text-muted">Opening…</p> : null : null}
       {file.kind === 'other' ? <div className="py-8"><FileText className="mb-3 h-7 w-7 text-muted" aria-hidden /><h3 className="text-body font-semibold">Saved and ready to open</h3><p className="mt-2 text-small text-muted">A preview isn’t available for this format. {file.openable ? 'Open it in its app, or download a copy.' : 'Download a copy to use it in a compatible app.'}</p></div> : null}
+    </div> : null}
+    {file?.revision && file.fileId ? <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border bg-surface px-4 py-3">
+      <p className="min-w-0 flex-1 text-small text-muted">{newConversation ? 'Start a conversation with this file.' : 'Ask a question or request a change.'}</p>
+      <button type="button" onClick={() => onDiscuss(file, fileRef, conversationSessionId)} className="inline-flex min-h-10 items-center gap-2 rounded-md bg-primary px-3 text-small font-semibold text-primary-fg transition-colors hover:bg-primary-hover"><MessageSquare className="h-4 w-4" aria-hidden />{newConversation ? 'Ask Clem in a new chat' : 'Ask Clem about this'}</button>
     </div> : null}
   </>;
 }

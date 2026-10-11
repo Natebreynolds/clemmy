@@ -17487,10 +17487,11 @@ export function registerConsoleRoutes(
     // claimRunAttemptLease retires the prior row and the running work dies
     // (the old behavior: nudging Clem mid-run killed the run). Control edges
     // (cancel/new, parked-task answers) keep their existing priority above;
-    // attachments keep the normal turn path so files are never silently
-    // dropped into a note. A dead-leased attempt is NOT running — the normal
+    // attachments must wait for idle so files are never silently dropped into
+    // a note or supersede active work. A dead-leased attempt is NOT running — the normal
     // supersede path is the correct recovery there.
-    if (!priorReceipt && !proposedEarlyRoute && !intent && input && requestedSessionId && attachmentIds.length === 0 && !command) {
+    if (!priorReceipt && !proposedEarlyRoute && requestedSessionId
+      && (attachmentIds.length > 0 || (!intent && input && !command))) {
       try {
         const latestAttempt = getLatestHarnessRunAttempt(sessionId);
         const { steerReasonForRunningWork } = await import('../runtime/harness/steer-notes.js');
@@ -17506,6 +17507,10 @@ export function registerConsoleRoutes(
         } catch { steerReason = null; }
         const leaseLive = steerReason === 'lease_live';
         if (steerReason) {
+          if (attachmentIds.length > 0) {
+            res.status(409).json({ error: 'ATTACHMENTS_REQUIRE_IDLE_CHAT', code: 'ATTACHMENTS_REQUIRE_IDLE_CHAT', sessionId });
+            return;
+          }
           if (connectionContext) { res.status(409).json({ error: 'This turn is still finishing. Check the connection again shortly.' }); return; }
           if (explicitTaskMode) {
             res.status(409).json({ error: 'Finish or stop the active turn before changing its mode.', code: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' });

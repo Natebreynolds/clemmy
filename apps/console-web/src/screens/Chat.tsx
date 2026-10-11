@@ -1,19 +1,15 @@
 import { handoffComposerDraft, newComposerDraftKey } from '@/lib/composer-drafts';
+import { useConversationSendScope } from '@/lib/use-conversation-send-scope';
 import { CliSessions } from '@/components/chat/CliSessions';
 import { CloudBrowserWorkspace } from '@/components/chat/CloudBrowserDock';
 import { FileDockWorkspace } from '@/components/chat/FileDock';
 import { Fragment, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import { ArrowRight, X } from 'lucide-react';
-import { apiGet } from '@/lib/api';
-import { usePoll } from '@/lib/poll';
-import { decidePlanProposal, dismissInboxItem } from '@/lib/inbox';
+import { Navigate, useLocation, useSearchParams } from 'react-router-dom';
+import { decidePlanProposal } from '@/lib/inbox';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
-import type { CommandCenter, CommandCenterItem } from '@/lib/types';
-import type { TaskMode } from '@/lib/task-mode';
-import { Composer } from '@/components/chat/Composer';
+import { Composer, type ComposerSendInput } from '@/components/chat/Composer';
 import { AgentPicker } from '@/components/chat/AgentPicker';
 import { ProjectPicker } from '@/components/chat/ProjectPicker';
 import { ConversationChangeLine } from '@/components/chat/ConversationChangeLine';
@@ -25,62 +21,7 @@ import { reportOwner, useConversationTasks } from '@/lib/conversation-tasks';
 import type { ConversationProject } from '@/lib/projects';
 import { sessionKeys } from '@/features/conversations/hooks/keys';
 import { ChatBubble } from '@/components/chat/ChatBubble';
-import { StatusPill } from '@/components/ui/StatusPill';
 import { CHAT_COMPOSER_WRAP, CHAT_THREAD } from '@/features/conversations/lib/chatColumn';
-
-/** Where a "Needs you" card should land. Both approval- and needs-attention-
- *  notification-backed cards live on the Inbox "Needs you" tab now — deep-link
- *  straight to the item so "See all in Inbox" always lands on what it promised. */
-function inboxTarget(item: CommandCenterItem): string {
-  if (item.notifId) return `/inbox?tab=needs&select=${encodeURIComponent(item.notifId)}`;
-  if (item.approvalId) return `/inbox?tab=needs&select=${encodeURIComponent(item.approvalId)}`;
-  if (item.planProposalId) return `/inbox?tab=needs&select=${encodeURIComponent(item.planProposalId)}`;
-  if (item.questionId) return `/inbox?tab=needs&select=${encodeURIComponent(item.questionId)}`;
-  return '/inbox';
-}
-
-function AttentionStrip({ needsYou, onDismiss }: { needsYou: CommandCenterItem[]; onDismiss?: (item: CommandCenterItem) => void }) {
-  const navigate = useNavigate();
-  if (needsYou.length === 0) return null;
-  return (
-    <div className="space-y-2">
-      {needsYou.slice(0, 3).map((item, i) => (
-        <div
-          key={`n${i}`}
-          role="button"
-          tabIndex={0}
-          onClick={() => navigate(inboxTarget(item))}
-          onKeyDown={(e) => { if (e.key === 'Enter') navigate(inboxTarget(item)); }}
-          className="flex w-full items-center gap-3 rounded-md border border-warning/40 bg-warning-tint px-3 py-2.5 text-left transition-colors hover:brightness-[0.99] cursor-pointer"
-        >
-          <StatusPill tone="warning">Needs you</StatusPill>
-          <span className="min-w-0 flex-1 truncate text-body text-fg">{item.title ?? 'Pending approval'}</span>
-          {item.dismissKind && item.dismissId && onDismiss && (
-            <button
-              type="button"
-              aria-label="Dismiss"
-              title="Dismiss — I don't need this"
-              onClick={(e) => { e.stopPropagation(); onDismiss(item); }}
-              className="rounded p-1 text-muted transition-colors hover:bg-warning/20 hover:text-fg cursor-pointer"
-            >
-              <X className="h-4 w-4" aria-hidden />
-            </button>
-          )}
-          <ArrowRight className="h-4 w-4 shrink-0 text-muted" aria-hidden />
-        </div>
-      ))}
-      {needsYou.length > 3 && (
-        <button
-          type="button"
-          onClick={() => navigate('/inbox')}
-          className="text-small text-primary hover:underline cursor-pointer"
-        >
-          See all {needsYou.length} in Inbox
-        </button>
-      )}
-    </div>
-  );
-}
 
 /** The project a new conversation was opened in, from the link that opened it. */
 function openedInProject(state: unknown): ConversationProject | null {
@@ -92,14 +33,6 @@ function openedInProject(state: unknown): ConversationProject | null {
 
 export function Chat() {
   const qc = useQueryClient();
-  const cc = usePoll(['command-center'], () => apiGet<CommandCenter>('/api/console/home/command-center'), 6000);
-  const dismissCard = async (item: CommandCenterItem) => {
-    if (!item.dismissKind || !item.dismissId) return;
-    try { await dismissInboxItem(item.dismissKind, item.dismissId); } finally {
-      void qc.invalidateQueries({ queryKey: ['command-center'] });
-      void qc.invalidateQueries({ queryKey: ['notifications'] });
-    }
-  };
   const chat = useChat({ rememberAsLastSession: true });
   // Who answers: chosen on the chip at any time, applied just before the next
   // message (the first one opens the conversation inside it).
@@ -112,6 +45,7 @@ export function Chat() {
   // Transfer text typed while the first send is assigning its server session.
   const unsentDraftKey = newComposerDraftKey(location.pathname, location.key, (location.state as { newChat?: number } | null)?.newChat);
   const assignedSessionId = chat.sessionId.current;
+  const captureSendScope = useConversationSendScope(unsentDraftKey, chat.sessionId);
   const draftOwner = useRef({ draftKey: unsentDraftKey, sessionId: assignedSessionId });
   useEffect(() => {
     const next = { draftKey: unsentDraftKey, sessionId: assignedSessionId };
@@ -134,13 +68,14 @@ export function Chat() {
   const [searchParams, setSearchParams] = useSearchParams();
   const seededRef = useRef(false);
 
-  const needsYou = cc.data?.needsYou ?? [];
   const hasThread = chat.messages.length > 0;
-  const send = async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; voice?: boolean }) => {
+  const send = async (input: ComposerSendInput) => {
+    const scope = captureSendScope();
     const [addressed, placed] = await Promise.all([
       agentChoice.prepare(chat.sessionId.current, chat.busy),
       projectChoice.prepare(chat.sessionId.current, chat.busy),
     ]);
+    scope.assertCurrent();
     await chat.send({ ...input, ...addressed, ...placed });
   };
   const applyAgent = () => agentChoice.prepare(chat.sessionId.current, chat.busy);
@@ -242,12 +177,14 @@ export function Chat() {
     // New conversation only. The command center (needs you, running, done)
     // lives on Home — Chat is the thread and the composer.
     return (
+      <FileDockWorkspace conversationId={chat.sessionId.current ?? undefined}>
       <div className="flex h-full min-h-0 flex-col">
         <div className="min-h-0 flex-1" />
         <div className={CHAT_COMPOSER_WRAP}>
           <Composer inputRef={composerRef} voiceMessages={chat.messages} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} placeholder={agent ? `Message ${agent.name}…` : undefined} agentSlot={agentSlot} agentId={agent?.id ?? null} applyAgent={applyAgent} />
         </div>
       </div>
+      </FileDockWorkspace>
     );
   }
 
@@ -257,9 +194,6 @@ export function Chat() {
     <div className="flex h-full min-h-0 flex-col">
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className={CHAT_THREAD}>
-          {needsYou.length > 0 && (
-            <AttentionStrip needsYou={needsYou} onDismiss={dismissCard} />
-          )}
           {chat.messages.map((m, index) => (
             <Fragment key={m.id}>
             <ConversationChangeLine agent={marks[index]?.switchedTo} project={projectMarks[index]?.movedTo} />
@@ -285,7 +219,7 @@ export function Chat() {
             </Fragment>
           ))}
           <CliSessions sessionId={chat.sessionId.current ?? undefined} />
-          <ConversationTasks cards={delegated.cards} tasks={delegated.tasks} messages={chat.messages} onChanged={delegated.refresh} />
+          <ConversationTasks conversationId={chat.sessionId.current ?? undefined} cards={delegated.cards} tasks={delegated.tasks} messages={chat.messages} onChanged={delegated.refresh} />
           <div ref={bottomRef} />
         </div>
       </div>

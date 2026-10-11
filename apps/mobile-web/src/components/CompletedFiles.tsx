@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { renderMarkdown } from '@clem/chat-engine';
 import { Sheet } from './Sheet';
 import { inNativeShell } from '../lib/native-bridge';
+import { selectedFileContext, type SelectedFileContext } from '../lib/file-context';
 import {
   fileKindWords, filePreviewHtml, fileSizeWords, listSessionFiles,
   readSessionFile, readSessionFileContent, sessionFileProblem, type SessionFile, type SessionFileRef,
@@ -11,11 +12,11 @@ const FileIcon = () => <svg viewBox="0 0 24 24" width="20" height="20" fill="non
 
 /** Finished files are read when the owner opens them. The conversation stays
  * mounted underneath, retaining its draft and place; no creation feed or polling. */
-export function CompletedFiles({ conversationId }: { conversationId?: string }) {
-  return conversationId ? <ConversationFiles key={conversationId} sessionId={conversationId} /> : null;
+export function CompletedFiles({ conversationId, onDiscuss }: { conversationId?: string; onDiscuss?: (context: SelectedFileContext) => void }) {
+  return conversationId ? <ConversationFiles key={conversationId} sessionId={conversationId} onDiscuss={onDiscuss} /> : null;
 }
 
-function ConversationFiles({ sessionId }: { sessionId: string }) {
+function ConversationFiles({ sessionId, onDiscuss }: { sessionId: string; onDiscuss?: (context: SelectedFileContext) => void }) {
   const [open, setOpen] = useState(false);
   const [files, setFiles] = useState<SessionFile[] | null>(null);
   const [problem, setProblem] = useState('');
@@ -64,7 +65,7 @@ function ConversationFiles({ sessionId }: { sessionId: string }) {
         aside={<button type="button" class="chat-file-action" onClick={close} aria-label="Close files and return to conversation">Done</button>}
       >
         {selected ? (
-          <FilePreview key={selected.fileId} sessionId={sessionId} initialFile={selected} onBack={backToFiles} />
+          <FilePreview key={selected.fileId} sessionId={sessionId} initialFile={selected} onBack={backToFiles} onDiscuss={onDiscuss ? context => { close(); onDiscuss(context); } : undefined} />
         ) : (
           <>
             <div class="chat-files-intro">
@@ -95,24 +96,28 @@ function ConversationFiles({ sessionId }: { sessionId: string }) {
 }
 
 /** A recorded result opens through the same reader used by a conversation. */
-export function SavedFileSheet({ fileRef, onClose, returnLabel = 'Results' }: {
+export function SavedFileSheet({ fileRef, onClose, returnLabel = 'Results', onDiscuss, conversationSessionId }: {
   fileRef: SessionFileRef | null;
   onClose: () => void;
   returnLabel?: string;
+  onDiscuss?: (context: SelectedFileContext) => void;
+  conversationSessionId?: string;
 }) {
   return <Sheet open={Boolean(fileRef)} onClose={onClose} title="File" backGesture class="chat-files-sheet sheet-tall"
     aside={<button type="button" class="chat-file-action" onClick={onClose}>Done</button>}>
-    {fileRef ? <FilePreview key={`${fileRef.sessionId}:${fileRef.fileId}`} sessionId={fileRef.sessionId} initialFile={fileRef} onBack={onClose} backLabel={returnLabel} autoFocusBack={false} /> : null}
+    {fileRef ? <FilePreview key={`${fileRef.sessionId}:${fileRef.fileId}`} sessionId={fileRef.sessionId} initialFile={fileRef} onBack={onClose} backLabel={returnLabel} autoFocusBack={false} onDiscuss={onDiscuss} newConversation={!conversationSessionId} /> : null}
   </Sheet>;
 }
 
-function FilePreview({ sessionId, initialFile, onBack, backLabel = 'All files', autoFocusBack = true }: {
+function FilePreview({ sessionId, initialFile, onBack, backLabel = 'All files', autoFocusBack = true, onDiscuss, newConversation = false }: {
   sessionId: string;
   initialFile: Pick<SessionFile, 'fileId' | 'name' | 'folder'>;
   onBack: () => void;
   backLabel?: string;
   /** A newly opened Sheet captures the opener before moving focus itself. */
   autoFocusBack?: boolean;
+  onDiscuss?: (context: SelectedFileContext) => void;
+  newConversation?: boolean;
 }) {
   const nativeArtifactFiles = !inNativeShell() || window.clemArtifactFiles === true;
   const [file, setFile] = useState<SessionFile | null>(null);
@@ -189,6 +194,10 @@ function FilePreview({ sessionId, initialFile, onBack, backLabel = 'All files', 
         <button type="button" class="chat-file-action" disabled={downloading || !nativeArtifactFiles} onClick={() => { void download(); }}>{downloading ? 'Downloading…' : 'Download'}</button>
       </div>
       <div class="chat-file-heading"><h3>{initialFile.name}</h3>{file ? <p>{fileKindWords(file.kind)} · {fileSizeWords(file.bytes)}</p> : null}</div>
+      {onDiscuss && file ? <div class="chat-file-discuss">
+        <button type="button" class="chat-file-action" disabled={!selectedFileContext(sessionId, file)} onClick={() => { const context = selectedFileContext(sessionId, file); if (context) onDiscuss(context); }}>{newConversation ? 'Ask Clem in a new chat' : 'Ask Clem about this'}</button>
+        <p>{selectedFileContext(sessionId, file) ? 'Adds this selected version to your next message.' : file.bytes > 25 * 1024 * 1024 ? 'Files over 25 MB cannot be attached to a message.' : 'This version cannot be attached. Try reopening the file after updating Clem on your computer.'}</p>
+      </div> : null}
       {!nativeArtifactFiles ? <p class="chat-file-notice">Update the Clem iPhone app to preview PDFs and HTML files or save files to your phone. You can also open them on your computer.</p> : null}
       {downloadProblem ? <p class="chat-file-notice" role="alert">{downloadProblem}</p> : null}
       {problem ? <div class="chat-file-notice" role="alert"><p>{problem}</p><button type="button" class="chat-file-action" onClick={() => setRefresh(value => value + 1)}>Try again</button></div> : null}

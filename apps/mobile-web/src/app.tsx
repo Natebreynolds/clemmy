@@ -63,6 +63,7 @@ import { Settings } from './screens/Settings';
 import { describeThisDevice } from './lib/device-name';
 import { Inbox } from './screens/Inbox';
 import type { ChatHandoff } from './screens/Chats';
+import { mobileDrafts } from './lib/file-context';
 import { DrawerRecents } from './components/DrawerRecents';
 import { greetingName } from './lib/greeting';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
@@ -123,6 +124,7 @@ export function App() {
   const [chatsListVisible, setChatsListVisible] = useState(false);
   const [door, setDoor] = useState<ConnectionDoor>(connectionDoor() ?? 'direct');
   const authenticated = Boolean(authStatus?.authenticated);
+  useEffect(() => { if (authStatus && !authenticated) mobileDrafts.clear(); }, [authenticated, authStatus !== null]);
   /** Reads the ONE Needs-you count again; set by the poll that owns it. */
   const recountNeedsYou = useRef<() => void>(() => undefined);
 

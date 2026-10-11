@@ -43,7 +43,7 @@ export function ProjectResume({ overview, onOpenChat, onOpenSpace, onOpenPage }:
   const members = new Set(ids);
   const results = useScreenData(() => loadResults(ids), { intervalMs: 30_000, resourceKey: `project-results:${overview.project.id}:${ids.join(',')}`, disabled: ids.length === 0 });
   const latest = overview.conversations.filter(conversation => conversation.current).sort((a, b) => stamp(b.updatedAt) - stamp(a.updatedAt))[0];
-  const [file, setFile] = useState<SessionFileRef | null>(null);
+  const [file, setFile] = useState<{ ref: SessionFileRef; source?: string } | null>(null);
   const [allResults, setAllResults] = useState(false);
   const [allSpaces, setAllSpaces] = useState(false);
   const seen = new Set<string>();
@@ -84,7 +84,7 @@ export function ProjectResume({ overview, onOpenChat, onOpenSpace, onOpenPage }:
       {results.error ? <p class="project-hint" role="alert">Finished files could not be loaded. <button type="button" class="link-btn" onClick={() => void results.refresh()}>Retry</button></p> : null}
       {!results.loading && !results.error && rows.length === 0 ? <p class="section-empty">No finished results recorded here yet.</p> : null}
       <ul class="project-resume-list">{(allResults ? rows : rows.slice(0, 3)).map(row => <li key={row.key}>
-        {row.kind === 'record' ? row.url ? <a class="project-resume-result" href={row.url} target="_blank" rel="noopener noreferrer"><span><strong>{row.title}</strong><span>{row.count} {row.count === 1 ? 'item' : 'items'} · {relativeTime(row.at)}</span></span><Arrow /></a> : <div class="project-resume-result"><span><strong>{row.title}</strong><span>{row.count} {row.count === 1 ? 'item' : 'items'} · {relativeTime(row.at)}</span></span></div> : <button type="button" class="project-resume-result" onClick={() => { haptic('light'); if (row.kind === 'page') onOpenPage(row.page); else setFile(row.ref); }}><span><strong>{row.title}</strong><span>{relativeTime(row.at)}</span></span><span class="project-resume-open">Open</span></button>}
+        {row.kind === 'record' ? row.url ? <a class="project-resume-result" href={row.url} target="_blank" rel="noopener noreferrer"><span><strong>{row.title}</strong><span>{row.count} {row.count === 1 ? 'item' : 'items'} · {relativeTime(row.at)}</span></span><Arrow /></a> : <div class="project-resume-result"><span><strong>{row.title}</strong><span>{row.count} {row.count === 1 ? 'item' : 'items'} · {relativeTime(row.at)}</span></span></div> : <button type="button" class="project-resume-result" onClick={() => { haptic('light'); if (row.kind === 'page') onOpenPage(row.page); else setFile({ ref: row.ref, source: row.source }); }}><span><strong>{row.title}</strong><span>{relativeTime(row.at)}</span></span><span class="project-resume-open">Open</span></button>}
         {row.source ? <button type="button" class="project-resume-source" onClick={() => { haptic('light'); onOpenChat({ sessionId: row.source }); }}>Source conversation</button> : null}
       </li>)}</ul>
       {rows.length > 3 ? <button type="button" class="project-resume-new" aria-expanded={allResults} onClick={() => setAllResults(value => !value)}>{allResults ? 'Show recent results' : `Show more results (${rows.length})`}</button> : null}
@@ -94,6 +94,6 @@ export function ProjectResume({ overview, onOpenChat, onOpenSpace, onOpenPage }:
       {spaces.length === 0 ? <p class="section-empty">No Spaces are linked to this project.</p> : <ul class="project-resume-list">{(allSpaces ? spaces : spaces.slice(0, 3)).map(space => <li key={space.id}><button type="button" class="project-resume-result" onClick={() => { haptic('light'); onOpenSpace(space.ref!); }}><span><strong>{space.label || space.ref}</strong></span><Arrow /></button></li>)}</ul>}
       {spaces.length > 3 ? <button type="button" class="project-resume-new" aria-expanded={allSpaces} onClick={() => setAllSpaces(value => !value)}>{allSpaces ? 'Show fewer Spaces' : `Show all Spaces (${spaces.length})`}</button> : null}
     </section>
-    <SavedFileSheet fileRef={file} onClose={() => setFile(null)} returnLabel="Project" />
+    <SavedFileSheet fileRef={file?.ref ?? null} conversationSessionId={file?.source} onClose={() => setFile(null)} returnLabel="Project" onDiscuss={context => { const source = file?.source; setFile(null); onOpenChat({ ...(source ? { sessionId: source } : { projectId: overview.project.id, projectName: overview.project.name }), fileContext: context }); }} />
   </div>;
 }

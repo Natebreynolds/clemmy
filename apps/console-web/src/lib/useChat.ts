@@ -2053,7 +2053,7 @@ export function useChat(options?: UseChatOptions) {
     }
   }, [patch]);
 
-  const send = useCallback(async (input: { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string }; voice?: boolean }, retryRequest?: PendingChatPost) => {
+  const send = useCallback(async (input: { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string }; voice?: boolean; onAccepted?: () => void }, retryRequest?: PendingChatPost) => {
     if (busy && input.connectionResume) throw new Error('Another turn is running. Your connection is saved; check again when it finishes.');
     const taskMode = snapshotTaskMode(input.connectionResume ? undefined : input.taskMode);
     const activeMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
@@ -2079,7 +2079,7 @@ export function useChat(options?: UseChatOptions) {
       // supersede and kill the active run). steerOnly makes the server
       // steer-or-409, never silently accept a competing turn. Attachments
       // wait for the turn to finish.
-      if (attachmentIds.length > 0) return;
+      if (attachmentIds.length > 0) throw new Error('Wait for this turn to finish before sending files. Your message is still here.');
       const steerId = nextId();
       setMessages((prev) => [...prev, { id: steerId, role: 'user', text, steer: 'pending', taskMode }]);
       try {
@@ -2091,8 +2091,11 @@ export function useChat(options?: UseChatOptions) {
           steerOnly: true,
         });
         patch(steerId, { steer: res?.steered ? 'delivered' : 'failed' } as Partial<ChatMessage>);
-      } catch {
+        if (res?.steered) input.onAccepted?.();
+        else throw new Error('That addition was not accepted. Your message is still here.');
+      } catch (error) {
         patch(steerId, { steer: 'failed' } as Partial<ChatMessage>);
+        if (input.onAccepted) throw error;
       }
       return;
     }
@@ -2152,6 +2155,7 @@ export function useChat(options?: UseChatOptions) {
       // bound. Until then it remains reusable for an explicit resend.
       if (pendingPostRef.current === pending) retainPending(null);
       sessionIdRef.current = body.sessionId;
+      input.onAccepted?.();
       if (options?.rememberAsLastSession) rememberLastChatSession(unifiedChatSessionId(body.sessionId));
       activeRunRef.current = body;
       // The background button is available immediately for responsiveness,
@@ -2211,7 +2215,7 @@ export function useChat(options?: UseChatOptions) {
       const msg = (e.message || '').trim();
       const text = !msg || looksRawError(msg) ? GENERIC_TURN_ERROR : `Couldn't send: ${msg}`;
       patch(assistantId, { text, status: 'failed', progress: undefined });
-      if (input.connectionResume || retryRequest?.connectionRequestId) throw err;
+      if (input.onAccepted || input.connectionResume || retryRequest?.connectionRequestId) throw err;
     } finally {
       // A stopped POST can finish after the user has already started another
       // turn. Never let the stale promise clear the newer turn's controller,
@@ -2304,10 +2308,10 @@ export function useChat(options?: UseChatOptions) {
     setBusy(false);
   }, []);
 
-  const retryPending = () => {
+  const retryPending = (onAccepted?: () => void) => {
     const pending = pendingPostRef.current;
     if (!pending || busy) return Promise.resolve();
-    return send({ text: pending.input, attachmentIds: pending.attachments, taskMode: pending.taskMode }, pending);
+    return send({ text: pending.input, attachmentIds: pending.attachments, taskMode: pending.taskMode, onAccepted }, pending);
   };
   const cancelPending = async () => {
     const pending = pendingPostRef.current;

@@ -3636,6 +3636,14 @@ textarea:focus-visible,
 .chat-file-empty > span { max-width: 36ch; font-size: var(--t-sm); line-height: 1.6; }
 .chat-file-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .chat-file-toolbar .chat-file-action:first-child { margin-left: -8px; }
+.chat-file-discuss { padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.chat-file-discuss .chat-file-action { margin-left: -8px; }
+.chat-file-discuss p { margin: 2px 0 0; font-size: 13px; line-height: 1.5; color: var(--fg-2); }
+.composer-file-context { display: flex; align-items: center; gap: 8px; padding: 8px 4px 10px; margin-bottom: 4px; border-bottom: 1px solid var(--line); }
+.composer-file-context > span { min-width: 0; flex: 1; }
+.composer-file-context strong { display: block; overflow-wrap: anywhere; font-size: 14px; line-height: 1.4; }
+.composer-file-context > span > span { display: block; margin-top: 3px; font-size: 12px; line-height: 1.4; color: var(--fg-2); }
+.composer-file-context .composer-icon { flex: 0 0 44px; }
 .chat-file-heading { margin: 6px 0 16px; }
 .chat-file-heading h3 { margin: 0; font-size: 18px; line-height: 1.4; font-weight: 650; overflow-wrap: anywhere; }
 .chat-file-heading p { margin: 5px 0 0; color: var(--fg-2); font-size: var(--t-xs); }

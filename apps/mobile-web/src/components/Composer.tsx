@@ -21,7 +21,14 @@ export interface UploadResult { id: string; name: string; ok: boolean; error: st
 export interface ComposerProps {
   value: string;
   onChange: (next: string) => void;
-  onSend: (text: string, attachments: ChatAttachment[]) => void;
+  onSend: (text: string, attachments: ChatAttachment[]) => void | boolean | Promise<void | boolean>;
+  /** Context is rendered above the words and never folded out of sight. */
+  context?: ComponentChildren;
+  contextKey?: string;
+  sendBlocked?: string;
+  reservedAttachments?: number;
+  /** A retry in the transcript settled attachments still shown in this composer. */
+  settledAttachmentIds?: readonly string[];
   placeholder: string;
   ariaLabel: string;
   /** Uploads one picked file and returns the daemon's id. Omit to hide "+". */
@@ -48,6 +55,18 @@ export function Composer(props: ComposerProps) {
   const localRef = useRef<HTMLTextAreaElement | null>(null);
   const textareaRef = props.textareaRef ?? localRef;
   const [staged, setStaged] = useState<Staged[]>([]);
+  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const [sendProblem, setSendProblem] = useState('');
+  useEffect(() => { setSendProblem(''); }, [props.contextKey]);
+  useEffect(() => {
+    if (!props.settledAttachmentIds?.length) return;
+    const settled = new Set(props.settledAttachmentIds);
+    setStaged(current => current.filter(file => !settled.has(file.id)));
+    setSendProblem('');
+  }, [props.settledAttachmentIds]);
   const [attachOpen, setAttachOpen] = useState(false);
   const cameraRef = useRef<HTMLInputElement | null>(null);
   const photosRef = useRef<HTMLInputElement | null>(null);
@@ -123,29 +142,44 @@ export function Composer(props: ComposerProps) {
     foldTimer.current = window.setTimeout(() => { foldTimer.current = null; setFocused(false); }, 240);
   };
   useEffect(() => () => { if (foldTimer.current !== null) window.clearTimeout(foldTimer.current); }, []);
-  const slim = !focused && !value.trim() && staged.length === 0 && !listening && !transcribing && !voiceNote;
+  const slim = !focused && !value.trim() && staged.length === 0 && !props.context && !listening && !transcribing && !voiceNote;
 
   const ready = staged.filter((s) => !s.uploading && !s.error);
+  const attachmentLimit = Math.max(0, MAX_ATTACHMENTS - (props.reservedAttachments ?? 0));
   const uploading = staged.some((s) => s.uploading);
-  const canSend = !disabled && !uploading && (value.trim().length > 0 || ready.length > 0);
+  const fileSteeringBlocked = Boolean(canStop && staged.length);
+  const sendBlocked = props.sendBlocked || (staged.length > attachmentLimit ? 'Remove one attachment to include the selected file. A message can include up to 10 files.' : fileSteeringBlocked ? 'Files can be sent after Clem finishes this turn.' : '');
+  const canSend = !disabled && !submitting && !sendBlocked && !uploading && (value.trim().length > 0 || ready.length > 0);
 
-  const submit = (event?: Event) => {
+  const submit = async (event?: Event) => {
     event?.preventDefault();
-    if (!canSend) return;
+    if (!canSend || submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    setSendProblem('');
     haptic('medium');
     stopDictation();
     const text = value.trim();
     const sending: ChatAttachment[] = ready.map(({ uploading: _u, error: _e, ...rest }) => rest);
-    onChange('');
-    setStaged([]);
-    if (textareaRef.current) { textareaRef.current.value = ''; autoresize(textareaRef.current); }
-    onSend(text, sending);
+    const original = value;
+    try {
+      const accepted = await onSend(text, sending);
+      if (accepted === false) return;
+      if (valueRef.current === original) onChange('');
+      const sent = new Set(sending.map(file => file.id));
+      setStaged(current => current.filter(file => !sent.has(file.id)));
+    } catch (error) {
+      setSendProblem(error instanceof Error ? error.message : 'Your message could not be sent. Try again.');
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
   };
 
   const pick = async (files: FileList | null) => {
     setAttachOpen(false);
     if (!files || !upload) return;
-    const chosen = Array.from(files).slice(0, Math.max(0, MAX_ATTACHMENTS - staged.length));
+    const chosen = Array.from(files).slice(0, Math.max(0, attachmentLimit - staged.length));
     for (const file of chosen) {
       const kind = attachmentKind(file.name, file.type);
       const localId = `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -179,7 +213,8 @@ export function Composer(props: ComposerProps) {
   const onFiles = (event: Event) => { void pick((event.currentTarget as HTMLInputElement).files); (event.currentTarget as HTMLInputElement).value = ''; };
 
   return (
-    <form class={`composer${compact ? ' composer-compact' : ''}${slim ? ' composer-slim' : ''}${listening ? ' listening' : ''}`} onSubmit={submit}>
+    <form class={`composer${compact ? ' composer-compact' : ''}${slim ? ' composer-slim' : ''}${listening ? ' listening' : ''}`} onSubmit={event => { void submit(event); }}>
+      {props.context}
       {staged.length > 0 ? (
         <div class="composer-attachments" aria-label="Attachments">
           {staged.map((s) => (
@@ -193,7 +228,7 @@ export function Composer(props: ComposerProps) {
               )}
               <span class="composer-attachment-name">{s.error ? s.error : attachmentLabel(s)}</span>
               {s.uploading ? <span class="composer-attachment-spin" role="status" aria-label="Uploading" /> : null}
-              <button type="button" class="composer-attachment-remove" aria-label={`Remove ${attachmentLabel(s)}`} onClick={() => remove(s.id)}>×</button>
+              <button type="button" class="composer-attachment-remove" disabled={submitting} aria-label={`Remove ${attachmentLabel(s)}`} onClick={() => remove(s.id)}>×</button>
             </div>
           ))}
         </div>
@@ -213,12 +248,12 @@ export function Composer(props: ComposerProps) {
         onInput={(event) => onChange((event.currentTarget as HTMLTextAreaElement).value)}
         onKeyDown={(event) => {
           if (event.isComposing) return;
-          if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit(); }
+          if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit(); }
         }}
       />
       <div class="composer-row">
         {upload ? (
-          <button type="button" class="composer-icon composer-attach" aria-label="Attach a photo or file" aria-haspopup="dialog" aria-expanded={attachOpen} disabled={disabled || staged.length >= MAX_ATTACHMENTS} onClick={() => { haptic('light'); setAttachOpen(true); }}>
+          <button type="button" class="composer-icon composer-attach" aria-label="Attach a photo or file" aria-haspopup="dialog" aria-expanded={attachOpen} disabled={disabled || submitting || staged.length >= attachmentLimit} onClick={() => { haptic('light'); setAttachOpen(true); }}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
           </button>
         ) : null}
@@ -261,6 +296,9 @@ export function Composer(props: ComposerProps) {
           </svg>
         </button>
       </div>
+      {submitting ? <p class="composer-note" role="status">Preparing and sending…</p> : null}
+      {sendBlocked ? <p class="composer-note" role="status">{sendBlocked}</p> : null}
+      {sendProblem ? <p class="composer-note" role="alert">{sendProblem}</p> : null}
       {voiceNote ? <p class="composer-note" role="alert">{voiceNote}</p> : null}
       {upload ? (
         <>

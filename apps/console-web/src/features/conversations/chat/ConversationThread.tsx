@@ -3,12 +3,11 @@ import { CloudBrowserWorkspace } from '@/components/chat/CloudBrowserDock';
 import { FileDockWorkspace } from '@/components/chat/FileDock';
 import { isRunKind } from '@/lib/run-presentation';
 import { RunThread } from './RunThread';
-import type { TaskMode } from '@/lib/task-mode';
 import { Fragment, useEffect, useRef } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useLocation, useParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { FolderKanban, Pin, Loader2 } from 'lucide-react';
-import { Composer } from '@/components/chat/Composer';
+import { Composer, type ComposerSendInput } from '@/components/chat/Composer';
 import { AgentPicker } from '@/components/chat/AgentPicker';
 import { ProjectPicker } from '@/components/chat/ProjectPicker';
 import { ConversationChangeLine } from '@/components/chat/ConversationChangeLine';
@@ -16,6 +15,7 @@ import { ConversationTasks } from '@/components/chat/ConversationTasks';
 import { agentThreadMarks, projectThreadMarks, APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
 import { useConversationAgent } from '@/lib/conversation-agent';
 import { useConversationProject } from '@/lib/conversation-project';
+import { useConversationSendScope } from '@/lib/use-conversation-send-scope';
 import { reportOwner, useConversationTasks } from '@/lib/conversation-tasks';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
@@ -90,6 +90,8 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
   // Who answers next: the conversation's own agent until the chip changes it.
   // A Space dock takes no agent, so it shows no chip.
   const takesAgent = !rawId(session.id).startsWith('space-');
+  const location = useLocation();
+  const captureSendScope = useConversationSendScope(`${location.key}:${session.id}`, chat.sessionId);
   const agentChoice = useConversationAgent(
     session.agentId && session.agentName ? { id: session.agentId, name: session.agentName } : null,
     { onSwitched: () => { void qc.invalidateQueries({ queryKey: sessionKeys.all }); } },
@@ -120,13 +122,15 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
     bottomRef.current?.scrollIntoView({ behavior: chat.busy ? 'auto' : 'smooth', block: 'end' });
   }, [chat.messages, chat.busy]);
 
-  const send = async (input: { text: string; attachmentIds: string[]; attachmentNames: string[]; taskMode?: TaskMode; voice?: boolean }) => {
+  const send = async (input: ComposerSendInput) => {
+    const scope = captureSendScope();
     const [addressed, placed] = takesAgent
       ? await Promise.all([
           agentChoice.prepare(chat.sessionId.current, chat.busy),
           projectChoice.prepare(chat.sessionId.current, chat.busy),
         ])
       : [{}, {}];
+    scope.assertCurrent();
     await chat.send({ ...input, ...addressed, ...placed });
     // Re-sort + re-title the list now that this conversation has a new turn.
     qc.invalidateQueries({ queryKey: sessionKeys.lists() });
@@ -183,7 +187,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
             />
             </Fragment>
           ))}
-          <ConversationTasks cards={delegated.cards} tasks={delegated.tasks} messages={chat.messages} onChanged={delegated.refresh} />
+          <ConversationTasks conversationId={chat.sessionId.current ?? rawId(session.id)} cards={delegated.cards} tasks={delegated.tasks} messages={chat.messages} onChanged={delegated.refresh} />
           <div ref={bottomRef} />
         </div>
       </div>

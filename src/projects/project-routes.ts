@@ -32,6 +32,7 @@ import {
   LARGEST_SESSION_FILE_CONTENT_BYTES, LARGEST_SHOWN_IMAGE_BYTES, LARGEST_SHOWN_TEXT_BYTES, SESSION_FILE_CONTENT_POLICY,
   listSessionFiles, readSessionFile, readSessionFileContent, sessionFileHtmlPreview,
 } from './session-files.js';
+import { prepareSessionFileContext } from './session-file-context.js';
 import { moveFact } from './memory-scope-views.js';
 import { launchWindowsDefaultApp } from '../runtime/windows-powershell.js';
 
@@ -137,6 +138,7 @@ const REASON_STATUS: Record<string, number> = {
   project_not_found: 404, project_archived: 409, agent_required: 400,
   page_not_found: 404, page_too_large: 413, page_not_rendered: 503, not_supported_here: 501,
   file_not_found: 404, file_not_an_image: 415, file_not_openable: 415, file_too_large: 413,
+  file_changed: 409, invalid_file_context: 400,
   resource_incomplete: 400, too_many_resources: 409, conflicting_account: 409,
 };
 
@@ -415,6 +417,15 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
     res.json({ file: mount.origin === 'console' ? found.view : { ...found.view, openable: false } });
   });
 
+  // Prepare a normal attachment for the next user message. The session/file
+  // record and expected revision determine the bytes; callers supply no path.
+  add('post', `${mount.sessions}/:sessionId/file/context`, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const prepared = await prepareSessionFileContext(sessionParam(req), body(req));
+    if (!prepared.ok) { refuse(res, prepared.reason); return; }
+    res.json(prepared);
+  });
+
   // This route shares the surface's existing authentication, including the
   // phone's signed request proof. Clients fetch first, then preview local bytes.
   add('get', `${mount.sessions}/:sessionId/file/content`, (req, res) => {
@@ -423,6 +434,9 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
     if (!found.ok) {
       refuse(res, found.reason, found.reason === 'file_too_large' ? { maxBytes: LARGEST_SESSION_FILE_CONTENT_BYTES } : {});
       return;
+    }
+    if (req.query.expectedRevision !== undefined && req.query.expectedRevision !== found.view.revision) {
+      refuse(res, 'file_changed'); return;
     }
     const download = req.query.download === '1' || found.view.kind === 'other';
     const fallbackName = found.view.name.replace(/[^a-zA-Z0-9._ -]/g, '_');
@@ -441,6 +455,9 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
   add('get', `${mount.sessions}/:sessionId/file/image`, (req, res) => {
     const found = readSessionFileContent(sessionParam(req), String(req.query.name ?? ''), String(req.query.folder ?? ''), String(req.query.fileId ?? ''));
     if (!found.ok) { refuse(res, found.reason); return; }
+    if (req.query.expectedRevision !== undefined && req.query.expectedRevision !== found.view.revision) {
+      refuse(res, 'file_changed'); return;
+    }
     if (found.view.kind !== 'image' || found.content.length > LARGEST_SHOWN_IMAGE_BYTES) { refuse(res, 'file_not_an_image'); return; }
     res.setHeader('Cache-Control', 'no-store');
     res.json({ file: mount.origin === 'console' ? found.view : { ...found.view, openable: false }, image: found.content.toString('base64'), mimeType: found.mimeType });

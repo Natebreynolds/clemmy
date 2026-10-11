@@ -8,7 +8,10 @@ import { useDictation } from '@/lib/use-dictation';
 import { useVoiceMode, voiceMode, type VoiceChatMessage, type VoicePhase } from '@/lib/voice-mode';
 import { cn } from '@/lib/cn';
 import { useLocation } from 'react-router-dom';
-import { readComposerDraft, writeComposerDraft, handoffComposerDraft, newComposerDraftKey, subscribeComposerDraft, type DraftAttachment as Attachment } from '@/lib/composer-drafts';
+import { acceptComposerDraft, composerDraftForRetry, readComposerDraft, writeComposerDraft, handoffComposerDraft, newComposerDraftKey, subscribeComposerDraft, type DraftAttachment as Attachment } from '@/lib/composer-drafts';
+import { claimArtifactDiscussionSeed, prepareArtifactDiscussion, readArtifactDiscussion, sameArtifactDiscussion } from '@/lib/artifact-discussion';
+import { prepareSessionFileContext } from '@/lib/session-files';
+import { useFileDock } from '@/components/chat/FileDock';
 
 const MAX_BYTES = 30 * 1024 * 1024;
 
@@ -22,6 +25,16 @@ const VOICE_PHASE_WORDS: Record<VoicePhase, string> = {
 };
 
 let localSeq = 0;
+
+export interface ComposerSendInput {
+  text: string;
+  attachmentIds: string[];
+  attachmentNames: string[];
+  taskMode?: TaskMode;
+  voice?: boolean;
+  /** Clear this draft only after the host acknowledges this exact request. */
+  onAccepted?: () => void;
+}
 
 export function Composer({
   busy,
@@ -48,10 +61,10 @@ export function Composer({
   /** The conversation this composer feeds — a brain switch from the chip re-pins it. */
   sessionId?: string;
   activeTaskMode?: TaskMode;
-  pendingPost?: { input: string; taskMode?: TaskMode } | null;
-  onRetryPending?: () => Promise<void>;
+  pendingPost?: { input: string; attachments?: string[]; taskMode?: TaskMode } | null;
+  onRetryPending?: (onAccepted?: () => void) => Promise<void>;
   onCancelPending?: () => Promise<void>;
-  onSend: (input: { text: string; attachmentIds: string[]; attachmentNames: string[]; taskMode?: TaskMode; voice?: boolean }) => Promise<void> | void;
+  onSend: (input: ComposerSendInput) => Promise<void> | void;
   onStop: () => void;
   /** Detach the running turn to a durable background task (keeps the chat free). */
   onBackground?: () => void;
@@ -72,9 +85,14 @@ export function Composer({
   voiceMessages?: readonly VoiceChatMessage[];
 }) {
   const location = useLocation();
+  const dock = useFileDock();
   const newChat = (location.state as { newChat?: number } | null)?.newChat;
   const routeDraftKey = newComposerDraftKey(location.pathname, location.key, newChat);
   const draftKey = sessionId ? `session:${sessionId}` : routeDraftKey;
+  const activeScope = useRef(draftKey);
+  activeScope.current = draftKey;
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const draftOwner = useRef({ draftKey: routeDraftKey, sessionId });
   useEffect(() => {
     const next = { draftKey: routeDraftKey, sessionId };
@@ -82,6 +100,10 @@ export function Composer({
     draftOwner.current = next;
   }, [routeDraftKey, sessionId]);
   const draft = useSyncExternalStore(subscribeComposerDraft, () => readComposerDraft(draftKey));
+  useEffect(() => {
+    const selection = readArtifactDiscussion((location.state as { artifactDiscussion?: unknown } | null)?.artifactDiscussion);
+    if (selection && claimArtifactDiscussionSeed(location.key)) writeComposerDraft(draftKey, current => ({ ...current, artifact: selection }));
+  }, [location.key, location.state, draftKey]);
   const value = draft.text;
   const setValue = (text: string) => writeComposerDraft(draftKey, current => ({ ...current, text }));
   const attachments = draft.attachments;
@@ -89,7 +111,15 @@ export function Composer({
     writeComposerDraft(draftKey, current => ({ ...current, attachments: typeof update === 'function' ? update(current.attachments) : update }));
   }, [draftKey]);
   const [deliveryError, setDeliveryError] = useState('');
+  const [preparing, setPreparing] = useState(false);
+  const submitting = useRef<symbol | null>(null);
   const recover = (action?: () => Promise<void>) => { setDeliveryError(''); void action?.().catch(error => setDeliveryError(error instanceof Error ? error.message : 'Request could not be confirmed.')); };
+  const retry = async () => {
+    if (!pendingPost) return;
+    const current = readComposerDraft(draftKey);
+    const sent = composerDraftForRetry(current, pendingPost);
+    await onRetryPending?.(() => acceptComposerDraft(draftKey, sent));
+  };
   const [localMode, setLocalMode] = useState<ComposerMode>('normal');
   const mode = controlledMode ?? localMode;
   const planning = busy ? activeTaskMode?.kind === 'plan' : mode === 'plan';
@@ -104,13 +134,28 @@ export function Composer({
   // the conversation voice mode is working in.
   const voiceOn = voice.enabled;
   const voiceHere = voiceOn && voice.surface === voiceOwner;
-  const voiceSend = useCallback((text: string) => onSend({
-    text,
-    attachmentIds: [],
-    attachmentNames: [],
-    taskMode: busy ? activeTaskMode : { version: 1, kind: mode },
-    voice: true,
-  }), [onSend, busy, activeTaskMode, mode]);
+  const voiceSend = useCallback(async (text: string) => {
+    if (submitting.current || (pendingPost && !busy)) throw new Error('Finish or retry the current message before starting another.');
+    const current = readComposerDraft(draftKey);
+    if (busy && current.artifact) throw new Error('Wait for this turn to finish before asking about the selected file.');
+    const attempt = Symbol('composer-voice');
+    submitting.current = attempt;
+    setPreparing(true);
+    // A spoken file question can fail before the normal chat echo exists.
+    // Keep it editable without replacing a separate typed draft.
+    const sent = { text: current.text ? '' : text, attachments: [], artifact: current.artifact };
+    if (!current.text) writeComposerDraft(draftKey, latest => ({ ...latest, text }));
+    const settle = () => { if (submitting.current === attempt) { submitting.current = null; setPreparing(false); } };
+    try {
+      const file = await prepareArtifactDiscussion(current.artifact, prepareSessionFileContext, () => mounted.current && activeScope.current === draftKey);
+      if (file && current.artifact) writeComposerDraft(draftKey, latest => sameArtifactDiscussion(latest.artifact, current.artifact)
+        ? { ...latest, artifact: { ...current.artifact!, preparedAttachmentId: file.id } } : latest);
+      return await onSend({ text, attachmentIds: file ? [file.id] : [], attachmentNames: file ? [file.name] : [],
+        taskMode: busy ? activeTaskMode : { version: 1, kind: mode }, voice: true,
+        onAccepted: () => { acceptComposerDraft(draftKey, sent); settle(); },
+      });
+    } finally { settle(); }
+  }, [onSend, busy, activeTaskMode, mode, draftKey, pendingPost]);
   const voiceSendRef = useRef(voiceSend);
   voiceSendRef.current = voiceSend;
   const voiceSupported = Boolean(voiceMessages);
@@ -140,6 +185,14 @@ export function Composer({
   const fileInput = useRef<HTMLInputElement>(null);
   const localTextarea = useRef<HTMLTextAreaElement>(null);
   const textarea = inputRef ?? localTextarea;
+  useEffect(() => {
+    setDeliveryError('');
+    // The adjacent viewer also takes focus when it mounts. A discussion
+    // handoff belongs in the composer after both surfaces finish mounting.
+    if (!draft.artifact) return;
+    const frame = requestAnimationFrame(() => textarea.current?.focus({ preventScroll: true }));
+    return () => cancelAnimationFrame(frame);
+  }, [draft.artifact, textarea]);
 
   const autoGrow = () => {
     const el = textarea.current;
@@ -182,7 +235,7 @@ export function Composer({
     setAttachments((p) => p.filter((a) => a.localId !== localId));
 
   const uploading = attachments.some((a) => a.status === 'uploading');
-  const hasDraft = value.trim().length > 0 || attachments.length > 0;
+  const hasDraft = value.trim().length > 0 || attachments.length > 0 || Boolean(draft.artifact);
   // Like the send button's other face: offered on an empty composer, gone
   // once the owner types or dictates.
   const voiceAvailable = Boolean(dictation && voiceMessages) && !listening && !transcribing;
@@ -190,27 +243,46 @@ export function Composer({
   // Mid-run steering: TEXT can be sent while Clem is working — it reaches her
   // at the next step without stopping the run. Attachments still wait for the
   // turn to finish (a file mid-run would have to start a new turn).
-  const canSend = !uploading
+  const canSend = !uploading && !preparing
     && !(pendingPost && !busy)
     && (value.trim().length > 0 || readyIds.length > 0)
     && !(busy && readyIds.length > 0)
+    && !(busy && draft.artifact)
     && !(busy && activeTaskMode?.kind === 'execute');
 
   const submit = () => {
-    if (!canSend) return;
+    if (!canSend || submitting.current) return;
     // Sending ends the utterance: otherwise recognition keeps running and
     // appends the next thing said into an already-cleared composer.
     stopDictation();
     setDeliveryError('');
-    void Promise.resolve(onSend({
-      text: value.trim(),
-      taskMode: busy ? activeTaskMode : { version: 1, kind: mode },
-      attachmentIds: readyIds,
-      attachmentNames: attachments.filter((a) => a.status === 'ready').map((a) => a.name),
-    })).catch(error => setDeliveryError(error instanceof Error ? error.message : 'Could not send.'));
-    setValue('');
-    setAttachments([]);
-    requestAnimationFrame(autoGrow);
+    const sent = { ...draft, attachments: draft.attachments.filter(file => file.status === 'ready') };
+    const attempt = Symbol('composer-send');
+    submitting.current = attempt;
+    setPreparing(true);
+    const settle = () => {
+      if (submitting.current !== attempt) return;
+      submitting.current = null;
+      setPreparing(false);
+    };
+    void (async () => {
+      if (readyIds.length + (sent.artifact ? 1 : 0) > 10) throw new Error('A message can include up to 10 files. Remove one and try again.');
+      const file = await prepareArtifactDiscussion(sent.artifact, prepareSessionFileContext, () => mounted.current && activeScope.current === draftKey);
+      if (file && sent.artifact) writeComposerDraft(draftKey, current => sameArtifactDiscussion(current.artifact, sent.artifact)
+        ? { ...current, artifact: { ...sent.artifact!, preparedAttachmentId: file.id } } : current);
+      await onSend({
+        text: sent.text.trim(),
+        taskMode: busy ? activeTaskMode : { version: 1, kind: mode },
+        attachmentIds: [...readyIds, ...(file ? [file.id] : [])],
+        attachmentNames: [...sent.attachments.filter(a => a.status === 'ready').map(a => a.name), ...(file ? [file.name] : [])],
+        onAccepted: () => {
+          acceptComposerDraft(draftKey, sent);
+          settle();
+          requestAnimationFrame(autoGrow);
+        },
+      });
+    })().catch(error => setDeliveryError(error instanceof Error ? error.message : 'Could not send. Your message is still here.'))
+      .finally(settle);
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -223,7 +295,9 @@ export function Composer({
     }
   };
 
-  const hint = busy && activeTaskMode?.kind === 'execute'
+  const hint = preparing ? 'Preparing your message…'
+    : busy && draft.artifact ? 'The selected file can be sent when this turn finishes. Your message will stay here.'
+    : busy && activeTaskMode?.kind === 'execute'
     ? 'Executing the reviewed plan'
     : planning
       ? (busy ? 'Planning · investigating with read-only tools' : 'Plan shows you the steps first, then you say go.')
@@ -258,10 +332,18 @@ export function Composer({
       {pendingPost && !busy && <div className="border-b border-border p-3 text-small" role="status">
         <p>Delivery was not confirmed. Retry preserves the exact {pendingPost.taskMode?.kind ?? 'normal'} request.</p>
         <details><summary>View pending request</summary><p className="whitespace-pre-wrap break-words">{pendingPost.input}</p></details>
-        <button type="button" onClick={() => recover(onRetryPending)} className="mr-3 underline">Retry exact request</button>
+        <button type="button" onClick={() => recover(retry)} className="mr-3 underline">Retry exact request</button>
         <button type="button" onClick={() => recover(onCancelPending)} className="underline">Cancel request</button>
       </div>}
       {deliveryError && <p role="alert" className="p-3 text-small text-danger">{deliveryError}</p>}
+      {draft.artifact && <div className="mx-3 mt-3 flex min-w-0 items-center gap-2 rounded-md bg-subtle px-2.5 py-2 text-small">
+        <FileText className="h-4 w-4 shrink-0 text-primary" aria-hidden />
+        <div className="min-w-0 flex-1"><span className="text-caption text-muted">With your next message</span>
+          {dock ? <button type="button" className="block max-w-full truncate font-semibold text-fg underline-offset-2 hover:underline" onClick={() => dock.open({ kind: 'file', ref: draft.artifact!.ref })} title={draft.artifact.ref.name}>{draft.artifact.ref.name}</button>
+            : <span className="block truncate font-semibold text-fg" title={draft.artifact.ref.name}>{draft.artifact.ref.name}</span>}
+        </div>
+        <button type="button" className="grid h-8 w-8 shrink-0 place-items-center rounded-sm text-muted hover:bg-hover hover:text-fg" aria-label={`Remove ${draft.artifact.ref.name} from message`} onClick={() => writeComposerDraft(draftKey, current => ({ ...current, artifact: undefined }))}><X className="h-4 w-4" aria-hidden /></button>
+      </div>}
       {attachments.length > 0 && (
         <div className="flex flex-wrap gap-2 px-3 pt-3">
           {attachments.map((a) => (

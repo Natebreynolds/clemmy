@@ -4410,7 +4410,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // live 2026-08-26.
       //
       // Typed controls, replays, and approvals keep their existing priority
-      // above; a dead lease is NOT running and falls through to the normal turn.
+      // above. Attachment-bearing requests also respect a recorded recovering
+      // attempt: they cannot become text-only steers or supersede its work.
       if (!typedControl && !priorReceipt && requestedSessionId) {
         try {
           const latestAttempt = getLatestHarnessRunAttempt(proposedSessionId);
@@ -4420,6 +4421,17 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             && latestAttempt.leaseExpiresAt
             && Date.parse(latestAttempt.leaseExpiresAt) > Date.now(),
           );
+          if (attachmentIds.length > 0) {
+            const { steerReasonForRunningWork } = await import('../runtime/harness/steer-notes.js');
+            const busyReason = steerReasonForRunningWork({
+              runInFlightSince: HarnessSession.load(proposedSessionId)?.runInFlightSince() ?? null,
+              leaseExpiresAt: latestAttempt?.leaseExpiresAt ?? null,
+              attemptFinishedAt: latestAttempt?.finishedAt ?? null,
+              hasUnfinishedAttempt: Boolean(latestAttempt && !latestAttempt.finishedAt),
+              nowMs: Date.now(),
+            });
+            if (busyReason) { res.status(409).json({ error: 'ATTACHMENTS_REQUIRE_IDLE_CHAT' }); return; }
+          }
           if (leaseLive) {
             if (connectionContext) { res.status(409).json({ error: 'This turn is still finishing. Check the connection again shortly.' }); return; }
             if (taskMode && taskMode.kind !== 'normal') {

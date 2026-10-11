@@ -12,9 +12,11 @@ import { Chat } from './Chat';
 import { relativeTime } from '../components/Approvals';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
+import { newMobileDraftScope, type SelectedFileContext } from '../lib/file-context';
 
 export interface ChatHandoff {
   draft?: string;
+  fileContext?: SelectedFileContext;
   /** Files already uploaded from the capsule, sent with the draft. */
   attachments?: ChatAttachment[];
   /** Home's send arrow means send; contextual reply handoffs remain drafts. */
@@ -49,6 +51,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedDraft, setSelectedDraft] = useState<string | undefined>();
   const [selectedTitle, setSelectedTitle] = useState<string | undefined>();
+  const [selectedContext, setSelectedContext] = useState<SelectedFileContext | undefined>();
   // The thread the owner just left: marked read once the list shows how it
   // stands, unless work is still running in it (its reply is then news).
   const leftRef = useRef<string | null>(null);
@@ -57,9 +60,10 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
     setSelectedId(null);
     setSelectedDraft(undefined);
     setSelectedTitle(undefined);
+    setSelectedContext(undefined);
   };
   useBackGesture(selectedId !== null, closeSelected);
-  const [composing, setComposing] = useState<{ draft?: string; attachments?: ChatAttachment[]; autoSend?: boolean; agentId?: string; agentName?: string; projectId?: string; projectName?: string } | null>(null);
+  const [composing, setComposing] = useState<{ scope: string; draft?: string; fileContext?: SelectedFileContext; attachments?: ChatAttachment[]; autoSend?: boolean; agentId?: string; agentName?: string; projectId?: string; projectName?: string } | null>(null);
   const [pendingLatest, setPendingLatest] = useState(false);
   const [query, setQuery] = useState('');
   const [showArchived, setShowArchived] = useState(false);
@@ -138,22 +142,29 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
   useEffect(() => {
     if (!handoff) return;
     if (handoff.session) {
+      setComposing(null);
       setSelectedId(handoff.session.id);
       setSelectedTitle(handoff.session.title);
       setSelectedDraft(handoff.draft);
+      setSelectedContext(handoff.fileContext);
     } else if (handoff.sessionId) {
+      setComposing(null);
       setSelectedId(handoff.sessionId);
       setSelectedTitle(handoff.title);
       setSelectedDraft(handoff.draft);
+      setSelectedContext(handoff.fileContext);
     }
     else if (handoff.openLatest) setPendingLatest(true);
-    else setComposing({ draft: handoff.draft, attachments: handoff.attachments, autoSend: handoff.autoSend, agentId: handoff.agentId, agentName: handoff.agentName, projectId: handoff.projectId, projectName: handoff.projectName });
+    else { setSelectedId(null); setSelectedContext(undefined); setComposing({ scope: newMobileDraftScope(), draft: handoff.draft, fileContext: handoff.fileContext, attachments: handoff.attachments, autoSend: handoff.fileContext ? false : handoff.autoSend, agentId: handoff.agentId, agentName: handoff.agentName, projectId: handoff.projectId, projectName: handoff.projectName }); }
     onHandoffConsumed?.();
   }, [handoff, onHandoffConsumed]);
 
   if (composing) {
     return (
       <Chat
+        key={composing.scope}
+        draftScope={composing.scope}
+        initialFileContext={composing.fileContext}
         initialDraft={composing.draft}
         initialAttachments={composing.attachments}
         initialAutoSend={composing.autoSend}
@@ -172,7 +183,9 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
     const session = sessions.find((s) => s.id === selectedId);
     return (
       <Chat
+        key={selectedId}
         sessionId={selectedId}
+        initialFileContext={selectedContext}
         initialTitle={selectedTitle ?? session?.title ?? ''}
         initialDraft={selectedDraft}
         agentId={session?.agentId ?? undefined}

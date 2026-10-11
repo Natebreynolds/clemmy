@@ -9,6 +9,7 @@ export interface SessionFile {
   kind: SessionFileKind;
   bytes: number;
   modifiedAt: string;
+  revision?: string;
   text?: string;
   previewHtml?: string;
   truncated?: boolean;
@@ -17,9 +18,10 @@ export interface SessionFile {
 
 export type SessionFileRef = Pick<SessionFile, 'fileId' | 'name' | 'folder'> & { sessionId: string };
 
-export function sessionFilePath(sessionId: string, file: Pick<SessionFile, 'fileId' | 'name' | 'folder'>, content = false, download = false): string {
+export function sessionFilePath(sessionId: string, file: Pick<SessionFile, 'fileId' | 'name' | 'folder'> & { revision?: string }, content = false, download = false): string {
   const query = new URLSearchParams({ name: file.name, folder: file.folder, fileId: file.fileId });
   if (download) query.set('download', '1');
+  if (file.revision && content) query.set('expectedRevision', file.revision);
   return `/m/api/chat/sessions/${encodeURIComponent(sessionId)}/file${content ? '/content' : ''}?${query}`;
 }
 
@@ -53,6 +55,7 @@ export function filePreviewHtml(html: string): string {
 
 export function sessionFileProblem(error: unknown): string {
   const failure = error as ApiError;
+  if ((failure?.body as { error?: string } | undefined)?.error === 'FILE_CHANGED') return 'This file changed while it was opening. Try again to open the updated version.';
   if (failure?.offline) return 'Your computer is unreachable. Reconnect and try again.';
   if (failure?.status === 404) return 'This file is no longer where it was saved. Return to the list and refresh it.';
   if (failure?.status === 413) return 'This file is too large to open on your phone. Open it on your computer.';
