@@ -1,5 +1,5 @@
 import { registerCloudBrowserRoutes } from './cloud-browser-routes.js';
-import { nativeVoiceControlBoundary, registerNativeVoiceStatus } from './mobile-native-voice-status.js';
+import { nativeVoiceControlBoundary, nativeVoiceTerminalIsExact, registerNativeVoiceStatus } from './mobile-native-voice-status.js';
 import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
@@ -3776,7 +3776,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const published = committed ? projectHarnessEventsForPublic([committed.event])[0] : null;
     const presentation = published ? presentationEventFromCompletionData(published.data) : null;
     const source = attempt ? getRunAttemptSourceUserEvent(attempt) : null;
-    const exactSource = source?.seq === attempt?.sourceUserSeq && source?.sessionId === receipt.sessionId;
+    const exactTerminal = nativeVoiceTerminalIsExact({ receipt, attempt, source,
+      terminal: committed?.event ?? null, presentation });
     const requiresApp = Boolean(presentation?.approvalId) || nativeVoiceControlBoundary({
       sourceUserSeq: attempt?.sourceUserSeq ?? -1,
       completionData: committed?.event.data,
@@ -3784,11 +3785,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       awaitingInputData: presentation?.kind === 'question'
         ? harnessListEvents(receipt.sessionId, { types: ['awaiting_user_input'] }).map((event) => event.data) : [],
     });
-    return { sessionId: receipt.sessionId, terminal: presentation && attempt?.sourceUserSeq
-      && presentation.identity.sessionId === receipt.sessionId && presentation.identity.sourceUserSeq === attempt.sourceUserSeq
+    return { sessionId: receipt.sessionId, terminal: exactTerminal && presentation && attempt?.sourceUserSeq
       ? { sessionId: receipt.sessionId, sourceUserSeq: attempt.sourceUserSeq, status: presentation.status,
           kind: presentation.kind, text: presentation.text, requiresApp,
-          ordinaryQuestion: Boolean(exactSource && presentation.status === 'needs_input'
+          ordinaryQuestion: Boolean(presentation.status === 'needs_input'
             && presentation.kind === 'question' && presentation.needs?.kind === 'input' && !requiresApp) } : null };
   });
 

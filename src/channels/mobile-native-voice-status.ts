@@ -1,4 +1,35 @@
 import type { Router, RequestHandler } from 'express';
+import type { EventRow, HarnessChatRequestReceipt, RunAttemptRecord } from '../runtime/harness/eventlog.js';
+import type { PresentationEvent } from '../runtime/harness/turn-outcome.js';
+
+/** A source-only public presentation is valid, but speech/relisten also needs
+ * the durable executor that produced it. Never infer that from the newest
+ * runtime, reply text or a matching source number alone. */
+export function nativeVoiceTerminalIsExact(input: {
+  receipt: Pick<HarnessChatRequestReceipt, 'sessionId' | 'runId' | 'sinceSeq'>;
+  attempt: Pick<RunAttemptRecord, 'sessionId' | 'attemptId' | 'runId' | 'sourceUserSeq' | 'finishedAt' | 'status'> | null;
+  source: Pick<EventRow, 'sessionId' | 'seq' | 'turn' | 'type' | 'role' | 'data'> | null;
+  terminal: Pick<EventRow, 'sessionId' | 'seq' | 'turn' | 'type' | 'data'> | null;
+  presentation: PresentationEvent | null;
+}): boolean {
+  const { receipt, attempt, source, terminal, presentation } = input;
+  if (!attempt || !source || !terminal || !presentation || !attempt.attemptId || !attempt.runId
+    || !Number.isSafeInteger(attempt.sourceUserSeq) || Number(attempt.sourceUserSeq) <= 0) return false;
+  const owner = presentation.identity;
+  return attempt.sessionId === receipt.sessionId && attempt.runId === receipt.runId
+    && source.sessionId === receipt.sessionId && source.seq === attempt.sourceUserSeq
+    && source.seq > receipt.sinceSeq && source.type === 'user_input_received' && source.role === 'user'
+    && (source.data.synthetic === undefined || source.data.synthetic === false)
+    && source.data.attemptId === attempt.attemptId && source.data.runId === attempt.runId
+    && terminal.sessionId === receipt.sessionId && terminal.type === 'conversation_completed'
+    && terminal.seq > source.seq && terminal.turn === source.turn && owner.turn === source.turn
+    && terminal.data.sourceUserSeq === source.seq && terminal.data.attemptId === attempt.attemptId
+    && terminal.data.runId === receipt.runId
+    && owner.sessionId === receipt.sessionId && owner.sourceUserSeq === source.seq
+    && (owner.attemptId === undefined || owner.attemptId === attempt.attemptId)
+    && (owner.runId === undefined || owner.runId === receipt.runId)
+    && (presentation.status !== 'done' || (attempt.status === 'completed' && Boolean(attempt.finishedAt)));
+}
 
 export interface NativeVoiceTerminal {
   sessionId: string;
