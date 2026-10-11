@@ -42,13 +42,13 @@ test('nested fields are listed with their own required markers and limits', () =
 
 test('structure a line cannot state makes the summary incomplete, never silently partial', () => {
   const incomplete = (field: Record<string, unknown>) => compactContract({ type: 'object', properties: { f: field } }).complete;
-  assert.equal(incomplete({ anyOf: [{ type: 'string' }, { type: 'integer' }] }), false);
+  assert.equal(incomplete({ anyOf: [{ type: 'string' }, { type: 'object', properties: { a: { type: 'string' } } }] }), false);
   assert.equal(incomplete({ $ref: '#/$defs/x' }), false);
-  assert.equal(incomplete({ type: 'object' }), false, 'an object with no declared fields or value shape');
   assert.equal(incomplete({ type: 'object', additionalProperties: { type: 'object', properties: { a: { type: 'string' } } } }), false, 'map values with fields');
   assert.equal(incomplete({ type: 'array', items: { type: 'array', items: { type: 'object', properties: { a: { type: 'string' } } } } }), false, 'objects inside an array of arrays');
-  assert.equal(incomplete({ type: 'array', items: { anyOf: [{ type: 'string' }, { type: 'integer' }] } }), false, 'a combinator on the elements');
-  assert.equal(incomplete({ type: 'array', items: { type: 'object' } }), false, 'objects with no declared fields');
+  assert.equal(incomplete({ type: 'array', items: { anyOf: [{ type: 'string' }, { type: 'object', properties: { a: { type: 'string' } } }] } }), false, 'a union with structure on the elements');
+  assert.equal(incomplete({ anyOf: [{ type: 'string', maxLength: 5 }, { type: 'integer' }] }), false, 'a union whose branches carry their own limits');
+  assert.equal(incomplete({ type: 'object', description: 'x'.repeat(401) }), false, 'a free-form value whose description cannot be kept whole');
   assert.equal(incomplete({ type: 'object', properties: { a: { type: 'object', properties: { b: { type: 'object', properties: { c: { type: 'string' } } } } } } }), false, 'deeper than the summary renders');
   assert.equal(compactContract({ type: 'object', oneOf: [{}], properties: { a: { type: 'string' } } }).complete, false);
   const many = { type: 'object', properties: Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`f${i}`, { type: 'string' }])) };
@@ -103,5 +103,39 @@ test('object rules are stated: no other fields, field counts, maps and empty obj
     'empty: object (must be empty)',
     'sets: array of objects (each [any keys, each value boolean])',
     '(top level: no other fields)',
+  ] });
+});
+
+test('an optional value and a plain type union are stated without loss', () => {
+  const schema = { type: 'object', properties: {
+    folder: { anyOf: [{ type: 'string', maxLength: 64 }, { type: 'null' }], default: null, description: 'Folder to search.' },
+    ids: { anyOf: [{ type: 'array', items: { type: 'integer', minimum: 1 } }, { type: 'null' }] },
+    window: { anyOf: [{ type: 'object', additionalProperties: false, properties: { days: { type: 'integer', maximum: 30 } } }, { type: 'null' }] },
+    cell: { anyOf: [{ type: 'string' }, { type: 'integer' }, { type: 'number' }] },
+    flag: { oneOf: [{ type: 'boolean' }, { type: 'null' }] },
+  } };
+  assert.deepEqual(compactContract(schema), { complete: true, lines: [
+    'folder: string or null (up to 64 characters) — Folder to search.',
+    'ids: array of integer or null (each [at least 1])',
+    'window: object or null (no other fields)',
+    '  days: integer (at most 30)',
+    'cell: string or integer or number',
+    'flag: boolean or null',
+  ] });
+});
+
+test('a free-form value keeps its whole description, which is where its shape lives', () => {
+  const description = 'JSON object to override the input. Keys not given here keep their defaults. Example: {"maxItems": 10}.';
+  const schema = { type: 'object', properties: {
+    overrides: { type: 'object', additionalProperties: true, description },
+    options: { type: 'object', description: 'Run options.' },
+    filters: { type: 'array', description: 'Each filter is [field, operator, value]. Up to 8 filters.' },
+    rows: { type: 'array', maxItems: 5, items: { type: 'object' }, description: 'Rows to add. Keys are column names.' },
+  } };
+  assert.deepEqual(compactContract(schema), { complete: true, lines: [
+    `overrides: object (any keys) — ${description}`,
+    'options: object (any keys) — Run options.',
+    'filters: array — Each filter is [field, operator, value]. Up to 8 filters.',
+    'rows: array of objects (up to 5 items; each [any keys]) — Rows to add. Keys are column names.',
   ] });
 });

@@ -8,8 +8,10 @@
  * was refused).
  *
  * The summary says whether it is complete. Structure it cannot state in a
- * line (combinators, references, pattern or dependent rules, nesting deeper
- * than it renders, fields beyond its count) makes it incomplete, and the
+ * line (combinators other than an optional value or a plain type union,
+ * references, pattern or dependent rules, nesting deeper than it renders,
+ * fields beyond its count, a free-form value whose description is too long
+ * to keep whole) makes it incomplete, and the
  * caller must then hand over the full schema or send the model to fetch it,
  * never present the summary as the whole contract.
  */
@@ -54,6 +56,39 @@ type Spec = Record<string, unknown>;
 const asSpec = (value: unknown): Spec => (value && typeof value === 'object' && !Array.isArray(value) ? value as Spec : {});
 const hasStructure = (spec: Spec) => STRUCTURAL_KEYWORDS.some((key) => spec[key] !== undefined);
 
+const ANNOTATIONS = new Set(['title', 'description', 'default', 'examples']);
+const PRIMITIVES = new Set(['string', 'integer', 'number', 'boolean', 'null']);
+const plainType = (branch: Spec) => typeof branch.type === 'string' && PRIMITIVES.has(branch.type)
+  && Object.keys(branch).every((key) => key === 'type' || ANNOTATIONS.has(key));
+
+/**
+ * A union a line can state without loss: `anyOf: [T, null]` (or oneOf) is T
+ * that may be null, and `anyOf` of bare primitive types is "string or
+ * integer". Any other union is left as is, which keeps the summary
+ * incomplete.
+ */
+function normalized(spec: Spec): Spec {
+  for (const key of ['anyOf', 'oneOf'] as const) {
+    if (!Array.isArray(spec[key]) || (spec[key] as unknown[]).length === 0) continue;
+    const branches = (spec[key] as unknown[]).map(asSpec);
+    const others = branches.filter((branch) => !(branch.type === 'null' && plainType(branch)));
+    const nullable = others.length < branches.length;
+    const { [key]: _union, ...rest } = spec;
+    if (STRUCTURAL_KEYWORDS.some((other) => rest[other] !== undefined)) return spec;
+    if (others.length === 1) {
+      const [only] = others;
+      // The outer schema may only annotate; a second set of limits would need both.
+      if (Object.keys(rest).some((field) => !ANNOTATIONS.has(field) && field !== 'nullable' && only[field] !== undefined)) return spec;
+      return normalized({ ...only, ...rest, ...(nullable || rest.nullable === true ? { nullable: true } : {}) });
+    }
+    if (key === 'anyOf' && others.every(plainType) && rest.type === undefined) {
+      return { ...rest, type: [...new Set(others.map((branch) => branch.type as string)), ...(nullable ? ['null'] : [])] };
+    }
+    return spec;
+  }
+  return spec;
+}
+
 function propertiesOf(spec: Spec): Record<string, Spec> | null {
   return spec.properties && typeof spec.properties === 'object' && !Array.isArray(spec.properties)
     ? spec.properties as Record<string, Spec> : null;
@@ -85,6 +120,18 @@ function shortDescription(value: unknown, max: number): string {
   return sentence.length > max ? `${sentence.slice(0, max - 1).trimEnd()}…` : sentence;
 }
 
+/** Where the schema leaves a value open, its description is the contract:
+ *  kept whole up to FREE_FORM_DESCRIPTION_CHARS, else the summary is
+ *  incomplete. */
+const FREE_FORM_DESCRIPTION_CHARS = 400;
+function wholeDescription(value: unknown, walk: Walk): string {
+  if (typeof value !== 'string') return '';
+  const flat = value.replace(/\s+/g, ' ').trim();
+  if (flat.length <= FREE_FORM_DESCRIPTION_CHARS) return flat;
+  walk.complete = false;
+  return `${flat.slice(0, FREE_FORM_DESCRIPTION_CHARS - 1).trimEnd()}…`;
+}
+
 /** Object-level rules a line can state: no other fields, field counts. */
 function objectRules(spec: Spec, hasFields: boolean): string[] {
   const rules: string[] = [];
@@ -108,6 +155,8 @@ interface Value {
   words: string;
   limits: string[];
   nested: Spec | null;
+  /** The schema leaves this value's shape open; its description carries it. */
+  freeForm?: boolean;
 }
 
 /** "each [one of: "a", "b"; up to 20 characters]" for an element's limits. */
@@ -117,21 +166,22 @@ const bracket = (label: string, limits: string[]) => (limits.length ? `${label} 
  * What a value must be. Marks the walk incomplete for any shape a line cannot
  * state; `layers` bounds arrays of arrays and map values.
  */
-function describeValue(spec: Spec, walk: Walk, layers = 0): Value {
+function describeValue(raw: Spec, walk: Walk, layers = 0): Value {
+  const spec = normalized(raw);
   if (hasStructure(spec)) walk.complete = false;
   const base = baseTypes(spec);
   const limits = [contractFieldLimits(spec)].filter(Boolean);
   if (layers > 3) { walk.complete = false; return { words: base.join(' or ') || 'any', limits, nested: null }; }
   if (base.includes('array')) {
     const items = asSpec(spec.items);
-    if (spec.items === undefined || Object.keys(items).length === 0) return { words: 'array', limits, nested: null };
+    if (spec.items === undefined || Object.keys(items).length === 0) return { words: 'array', limits, nested: null, freeForm: true };
     const item = describeValue(items, walk, layers + 1);
-    const each = [...item.limits, ...(isNullable(items) ? ['may be null'] : [])];
+    const each = [...item.limits, ...(isNullable(normalized(items)) ? ['may be null'] : [])];
     const withEach = [...limits, bracket('each', each)].filter(Boolean);
-    if (item.words === 'object') return { words: 'array of objects', limits: withEach, nested: item.nested };
+    if (item.words === 'object') return { words: 'array of objects', limits: withEach, nested: item.nested, freeForm: item.freeForm };
     // Objects inside an array of arrays: their fields are not rendered.
     if (item.nested) walk.complete = false;
-    return { words: `array of ${item.words}`, limits: withEach, nested: null };
+    return { words: `array of ${item.words}`, limits: withEach, nested: null, freeForm: item.freeForm };
   }
   if (base.includes('object')) {
     const fields = propertiesOf(spec);
@@ -144,12 +194,13 @@ function describeValue(spec: Spec, walk: Walk, layers = 0): Value {
       const valueWords = `each value ${value.words}${value.limits.length ? ` [${value.limits.join('; ')}]` : ''}`;
       rules.unshift(fields ? `other keys allowed, ${valueWords}` : `any keys, ${valueWords}`);
     } else if (!fields && extra !== false) {
-      // No declared fields and no value shape: the contract does not say.
-      walk.complete = false;
+      // Free-form: the schema itself allows any keys; what goes in them is
+      // only in the description, which the caller then keeps in full.
+      return { words: 'object', limits: [...limits, 'any keys', ...rules], nested: null, freeForm: true };
     }
     return { words: 'object', limits: [...limits, ...rules], nested: fields ? spec : null };
   }
-  return { words: base.length ? base.join(' or ') : 'any', limits, nested: null };
+  return { words: base.length ? base.join(' or ') : 'any', limits, nested: null, ...(base.length ? {} : { freeForm: true }) };
 }
 
 function walkFields(properties: Record<string, Spec>, required: Set<string>, indent: string, depth: number,
@@ -157,12 +208,12 @@ function walkFields(properties: Record<string, Spec>, required: Set<string>, ind
   for (const [name, raw] of Object.entries(properties)) {
     if (walk.count >= opts.maxFields) { walk.complete = false; return; }
     walk.count += 1;
-    const field = asSpec(raw);
-    const { words, limits, nested } = describeValue(field, walk);
+    const field = normalized(asSpec(raw));
+    const { words, limits, nested, freeForm } = describeValue(field, walk);
     const qualifiers = [...limits,
       field.default !== undefined && field.default !== null ? `default ${JSON.stringify(field.default)}` : '']
       .filter(Boolean).join('; ');
-    const description = shortDescription(field.description, opts.descriptionChars);
+    const description = freeForm ? wholeDescription(field.description, walk) : shortDescription(field.description, opts.descriptionChars);
     walk.lines.push(`${indent}${name}${required.has(name) ? '*' : ''}: ${words}${isNullable(field) ? ' or null' : ''}`
       + `${qualifiers ? ` (${qualifiers})` : ''}${description ? ` — ${description}` : ''}`);
     if (nested) {
