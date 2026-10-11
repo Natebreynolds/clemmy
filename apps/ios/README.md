@@ -28,7 +28,7 @@ changing the TLS peer it trusts.
 
 ## Build & install (first time)
 
-Prereqs: Xcode from the App Store (Command Line Tools alone are not enough),
+Prereqs: Xcode 16 or later (Command Line Tools alone are not enough),
 and `brew install xcodegen`.
 
 ```bash
@@ -61,9 +61,30 @@ machinery takes over inside the pinned web view.
 ## Home Screen widgets
 
 The native build includes **Talk to Clem** (small or medium) and **Your Space**
-(small or medium). The small Talk widget opens voice; the medium size also offers
-Dictate and the chosen Space. Add them from the iPhone Home Screen widget gallery.
-Recording always requires another explicit tap inside the foreground app.
+(small or medium). Both quick-action sizes offer **Talk** and **Dictate**. On
+iOS 18 or later, these are native recording intents. After opening the paired
+app once to enable microphone access and connect native voice, a widget tap
+starts capture without navigating the full chat UI. Device authentication may
+still be required. iOS 17 keeps the existing open-app actions.
+
+A Live Activity stays visible throughout recording. Talk detects the end of an
+utterance, sends it through the normal chat engine, speaks the exact committed
+reply, and listens again for an ordinary answer or clarification. Dictate saves
+an editable draft; it never automatically sends. **Send now**, **End voice**,
+**Finish dictation**, and **Open** are available as appropriate to the current
+state. Approval decisions and other conversation controls require opening Clem.
+Recording is bounded to two minutes per utterance and ten minutes per activity.
+iOS can expire background time while the Mac is working; recovery preserves the
+request receipt so it is not sent twice.
+
+The native client holds its own P-256 key and proof-bound session in device-only
+Keychain storage, enrolled through the authenticated paired page. It never
+exports the browser key or stores credentials, transcripts, or audio in the
+widget App Group. Both LAN and relay transport pin the paired certificate.
+Unfinished transcripts and exact uncertain-send receipts stay in device-only
+Keychain storage; protected app-private audio can be retried or discarded.
+This requires the matching daemon/mobile-web native-voice endpoints in addition
+to the native build. Add the widget from the iPhone Home Screen gallery.
 
 To choose the Space, open its Details in the paired app and choose **Use in iPhone
 widget**. This copies only its bounded routing slug, name, summary, update date and local save date into the
@@ -78,8 +99,9 @@ embeds the extension; it does not configure the Apple developer account. Generat
 the project with XcodeGen, then build the Clem scheme using the existing signing
 setup. A daemon/mobile-web update alone cannot add widgets to an older native app.
 
-The only custom URL destinations are `clem://voice`, `clem://dictate`, and
-`clem://space` with an optional validated `id` slug. The app binds pending taps to
+Navigation URLs are `clem://voice`, `clem://dictate`, and `clem://space` with an
+optional validated `id` slug. `clem://voice-setup` and `clem://recording` open the
+native capture/recovery sheet. URLs alone never start the microphone. The app binds pending taps to
 the current pairing, waits for foreground unlock and connection selection, and
 consumes an intent only after the addressed screen acknowledges its exact ID.
 Warm delivery routes within the existing web document to preserve unsent drafts.
@@ -100,8 +122,8 @@ steer the app into a TLS pin check it cannot pass.
 
 The app requests notification permission after first load, gets its APNs
 device token, and hands it to the PWA (`window.clemNative.registerApnsToken`),
-which registers it over its own proof-signed session — the native shell never
-holds a credential. The daemon sends alerts directly to Apple over HTTP/2
+which registers it over its own proof-signed session. Push registration does
+not use the separate native widget-voice credential. The daemon sends alerts directly to Apple over HTTP/2
 with a provider JWT (`src/runtime/apns.ts`); no gateway, no third party.
 
 To activate push, drop an APNs signing key into the daemon:

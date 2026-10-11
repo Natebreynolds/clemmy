@@ -23,7 +23,7 @@ struct ClemQuickActionsWidget: Widget {
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: kind, provider: ClemProvider()) { QuickActionsEntryView(entry: $0) }
             .configurationDisplayName("Talk to Clem")
-            .description("Open voice or dictation. Recording starts only after you tap in Clem.")
+            .description("Talk to Clem or dictate from your Home Screen. On iOS 18 or later, tap to start recording after microphone setup in Clem.")
             .supportedFamilies([.systemSmall, .systemMedium])
     }
 }
@@ -43,5 +43,6 @@ struct ClemWidgets: WidgetBundle {
     var body: some Widget {
         ClemQuickActionsWidget()
         ClemSpaceWidget()
+        ClemRecordingActivity()
     }
 }
