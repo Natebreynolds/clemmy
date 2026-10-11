@@ -117,7 +117,9 @@ const {
   readWorkflowTriggerReceiptAcceptance,
 } = await import('../tools/workflow-run-queue.js');
 const { processWorkflowSchedules } = await import('./workflow-scheduler.js');
+const { cancelWorkflowRunAtBoundary } = await import('./workflow-run-cancellation.js');
 const {
+  continueWorkflowRunFromCheckpoint,
   processWorkflowRuns,
   reapCapabilityBlockedRuns,
   resumeCapabilityBlockedWorkflowRun,
@@ -910,6 +912,68 @@ test('unauthorized source dispatch stays zero while an authorized sibling commit
     'SOURCEPROOF_UPDATE_RECORD',
     { item_id: FINAL_PAGE_ITEM_ID, value: 'authorized-after-resume' },
   );
+});
+
+test('Continue on a stopped run carries the committed step and runs only the rest: the write never repeats', async () => {
+  const workflowSlug = 'platform49-continue-after-stop';
+  const destinationId = '1785000000.000778';
+  installProviderCapabilities(['DESTPROOF_APPEND_RECORD']);
+  writeWorkflow(workflowSlug, {
+    name: workflowSlug,
+    description: 'Prove Continue after a Stop carries a committed write and runs the remaining step once.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      {
+        id: 'write_destination',
+        prompt: 'Write the destination.',
+        sideEffect: 'write',
+        call: {
+          tool: 'DESTPROOF_APPEND_RECORD',
+          args: { item_id: destinationId, value: 'continue-destination-value' },
+        },
+      },
+      {
+        id: 'mutate_source',
+        dependsOn: ['write_destination'],
+        prompt: 'Then update the source.',
+        sideEffect: 'write',
+        call: {
+          tool: 'SOURCEPROOF_UPDATE_RECORD',
+          args: { item_id: FINAL_PAGE_ITEM_ID, value: 'continued-after-stop' },
+        },
+      },
+    ],
+  });
+
+  const before = readProviderState();
+  const queued = queueWorkflowRun(workflowSlug, {}, { source: 'console' });
+  assert.equal(queued.status, 'queued', queued.message);
+  await drainUntil(queued.id!, (run) => run.status === 'blocked_capability');
+  assert.equal(readProviderState().counters.append - before.counters.append, 1, 'the first step committed once');
+
+  // The owner presses Stop on the board.
+  const stopped = cancelWorkflowRunAtBoundary({ runId: queued.id!, reason: 'Cancelled from the Tasks board.', source: 'tasks-board' });
+  assert.notEqual(stopped.status, 'not_found');
+  assert.equal(readRun(queued.id!).status, 'cancelled');
+  // A fresh whole run would repeat the committed write, so it is refused...
+  assert.equal(requeueWorkflowFromRun(queued.id!).status, 'ambiguous');
+
+  // ...and Continue picks up from where the run stopped instead.
+  installProviderCapabilities(['DESTPROOF_APPEND_RECORD', 'SOURCEPROOF_UPDATE_RECORD']);
+  const continued = continueWorkflowRunFromCheckpoint(queued.id!, { requestedFrom: 'board' });
+  assert.equal(continued?.status, 'queued', continued?.message);
+  const finished = await drainUntil(continued!.id!, (run) => run.status === 'completed');
+  assert.equal(finished.requeuedFromRunId, queued.id);
+  const after = readProviderState();
+  assert.equal(after.counters.append - before.counters.append, 1, 'the committed write is never repeated');
+  assert.equal(after.counters.sourceMutation - before.counters.sourceMutation, 1, 'the remaining step runs once');
+  assert.deepEqual(after.source[FINAL_PAGE_ITEM_ID], { id: FINAL_PAGE_ITEM_ID, value: 'continued-after-stop' });
+
+  // Continuing the same stop twice does not run the remaining step again.
+  const again = continueWorkflowRunFromCheckpoint(queued.id!, { requestedFrom: 'board' });
+  if (again?.status === 'queued') await drainUntil(again.id!, (run) => ['completed', 'error', 'cancelled'].includes(run.status));
+  assert.equal(readProviderState().counters.append - before.counters.append, 1);
 });
 
 test('provider commit with a lost response becomes ambiguous and is never blindly re-dispatched', async () => {

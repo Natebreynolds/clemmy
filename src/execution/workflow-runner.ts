@@ -208,6 +208,7 @@ import {
   queueWorkflowGoalFollowUp,
   requeueWorkflowFromRun,
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+  type RequeueResult,
 } from '../tools/workflow-run-queue.js';
 import { ensureLiveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
 import {
@@ -374,6 +375,7 @@ import {
   WorkflowCallMutationAmbiguousError,
 } from './workflow-call-receipts.js';
 import {
+  assessWorkflowV3RunMutationRequeue,
   redeemWorkflowV3ScheduledSendOutput,
 } from './workflow-v3-call-evidence.js';
 import {
@@ -10088,6 +10090,94 @@ function failedItemRetrySeeded(workflowSlug: string, runId: string): boolean {
 function goalFollowUpSeeded(workflowSlug: string, runId: string): boolean {
   return readWorkflowEvents(workflowSlug, runId).some((ev) =>
     ev.kind === 'step_advisory' && ev.meta?.reason === 'goal_follow_up_seeded');
+}
+
+/**
+ * Continue a stopped or failed run from where it stopped: the board's
+ * Continue. A fresh whole-run retry must refuse once any step's write landed
+ * (it would repeat it), which left Continue with nothing it could do (live
+ * 2026-10-11: a stopped fixture run whose first step had written its file
+ * refused Continue outright). Here each completed step whose write landed,
+ * or that sent, is carried as completed: its recorded output feeds the steps
+ * after it and it never dispatches again. Every other step runs.
+ *
+ * Refused, in words the owner can act on, when a step that did not finish
+ * may already have changed something, or a write's outcome is not settled:
+ * re-running either could repeat it. Returns null when no completed step
+ * changed anything, so the caller's whole-run retry applies.
+ */
+export function continueWorkflowRunFromCheckpoint(
+  sourceRunId: string,
+  opts: { requestedFrom: string },
+): RequeueResult | null {
+  if (!/^[a-zA-Z0-9_.:-]+$/.test(sourceRunId)) return { status: 'not_found', message: 'That run was not found.' };
+  const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${sourceRunId}.json`));
+  const workflow = record
+    ? listWorkflows().find((entry) => entry.data.name === record.workflow || entry.name === record.workflow)
+    : undefined;
+  if (!record || !workflow) return { status: 'not_found', message: 'That run or its workflow no longer exists.' };
+  const refuse = (message: string): RequeueResult => ({ status: 'ambiguous', message });
+  let resume: ReturnType<typeof computeResumeState>;
+  try {
+    resume = computeResumeState(workflow.name, sourceRunId);
+  } catch {
+    return refuse('Its step history can\'t be read, so I can\'t tell what already happened; nothing was re-run.');
+  }
+  const completed = new Set(resume.completedSteps.keys());
+  const readFacts = (stepIds: ReadonlySet<string>) => readWorkflowRunWriteFacts({
+    runId: sourceRunId,
+    steps: workflow.data.steps,
+    completedStepIds: stepIds,
+    sideEffectOf: stepSideEffectClass,
+  });
+  const done = readFacts(completed);
+  // A step that started but did not finish runs again, so it must not have
+  // changed anything yet.
+  const unfinished = readFacts(new Set([...resume.inFlightStepIds].filter((stepId) => !completed.has(stepId))));
+  if (!done.available || !unfinished.available) {
+    return refuse('Its record of what each step changed can\'t be read; nothing was re-run.');
+  }
+  const unsettled = done.steps.find((step) => step.disposition === 'uncertain');
+  if (unsettled) return refuse(`Step "${unsettled.stepId}" has a change whose outcome isn't confirmed, so continuing could repeat it.`);
+  const partial = unfinished.steps.find((step) => step.disposition !== 'none');
+  if (partial) return refuse(`Step "${partial.stepId}" stopped partway and may already have changed something, so it can't safely run again.`);
+  const carried = new Map<string, 'landed' | 'sent'>();
+  for (const step of done.steps) {
+    if (step.disposition === 'sent') carried.set(step.stepId, 'sent');
+    else if (step.disposition === 'landed') carried.set(step.stepId, 'landed');
+  }
+  const stepById = new Map(workflow.data.steps.map((step) => [step.id, step]));
+  const carryCommitted = (stepId: string, status: string): RequeueResult | null => {
+    const step = stepById.get(stepId);
+    if (status !== 'committed' || !completed.has(stepId) || !step) {
+      return refuse(`Step "${stepId}" may already have made its change but didn't finish, so it can't safely run again.`);
+    }
+    if (!carried.has(stepId)) carried.set(stepId, stepSideEffectClass(step) === 'send' ? 'sent' : 'landed');
+    return null;
+  };
+  try {
+    for (const item of assessWorkflowV3RunMutationRequeue({ workflowSlug: workflow.name, runId: sourceRunId }).blocking) {
+      const refused = carryCommitted(item.stepId, item.status);
+      if (refused) return refused;
+    }
+    for (const item of assessWorkflowRunMutationRequeue({ workflowSlug: workflow.name, runId: sourceRunId }).blocking) {
+      const refused = carryCommitted(item.stepId, item.status);
+      if (refused) return refused;
+    }
+  } catch {
+    return refuse('Its record of what each step changed can\'t be read; nothing was re-run.');
+  }
+  if (carried.size === 0) return null;
+  return queueWorkflowGoalFollowUp(sourceRunId, {
+    lineage: {
+      fromRunId: sourceRunId,
+      carriedSteps: [...carried].map(([stepId, disposition]) => ({ stepId, disposition })),
+      continuedStepIds: [],
+    },
+    goalAttempt: record.goalAttempt ?? 0,
+    goalFeedback: '',
+    recoveryIntent: { kind: 'safe_rerun', requestedFrom: opts.requestedFrom, reason: 'continue from where the run stopped' },
+  });
 }
 
 /**

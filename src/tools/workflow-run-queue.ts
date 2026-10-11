@@ -3438,6 +3438,9 @@ export function queueWorkflowGoalFollowUp(
     /** Runner-only: the source execution has settled but its terminal record
      *  is not yet installed. */
     sourceExecutionSettled?: boolean;
+    /** Why the lineage was built, when it is not the pinned goal's follow-up
+     *  (the board's Continue on a stopped or failed run). */
+    recoveryIntent?: { kind: WorkflowRunRecoveryIntentKind; requestedFrom?: string; reason: string };
   },
 ): RequeueResult {
   const safe = sourceRunId.replace(/[^a-zA-Z0-9_.:-]/g, '');
@@ -3527,11 +3530,13 @@ export function queueWorkflowGoalFollowUp(
       : {}),
     excludeRunId: sourceRunId,
     requeuedFromRunId: sourceRunId,
-    recoveryIntent: {
-      kind: 'goal_rerun',
-      sourceRunId,
-      reason: 'pinned goal follow-up after landed writes',
-    },
+    recoveryIntent: opts.recoveryIntent
+      ? { ...opts.recoveryIntent, sourceRunId }
+      : {
+          kind: 'goal_rerun',
+          sourceRunId,
+          reason: 'pinned goal follow-up after landed writes',
+        },
   });
   return { status: queued.status, id: queued.id, message: queued.message, readiness: queued.readiness };
 }

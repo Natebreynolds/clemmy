@@ -602,6 +602,7 @@ import {
   skipWorkflowCatchupRun,
 } from '../execution/workflow-catchup-decision.js';
 import {
+  continueWorkflowRunFromCheckpoint,
   resolveWorkflowDefinitionForRun,
   resumeCapabilityBlockedWorkflowRun,
   resumeMutationBlockedWorkflowRun,
@@ -14043,7 +14044,9 @@ export function registerConsoleRoutes(
     const sourceStepId = typeof req.body?.stepId === 'string' && req.body.stepId.trim()
       ? req.body.stepId.trim()
       : undefined;
-    const result = requeueWorkflowFromRun(runId, {
+    // Continue means from where the run stopped: steps whose changes landed
+    // are carried, never repeated. Only a run that changed nothing reruns whole.
+    const result = continueWorkflowRunFromCheckpoint(runId, { requestedFrom: 'board' }) ?? requeueWorkflowFromRun(runId, {
       source: 'board',
       recoveryIntent: workflowRunRecoveryIntentFromBody(req.body, {
         kind: 'safe_rerun',
