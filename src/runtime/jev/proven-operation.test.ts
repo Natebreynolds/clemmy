@@ -860,3 +860,27 @@ test('a sure pick still wins over a corroborated one, and an unavailable decisio
   assert.equal(none.pickedBy, undefined);
   assert.equal(none.text, undefined);
 });
+
+test('a proven operation is handed over as a complete contract, whole, or with a fetch-first step, never a partial summary', () => {
+  const strategy = {
+    id: 'strat-contract', objective: 'Search the records', keywords: ['search', 'records'],
+    toolsUsed: ['records_search'], workerCount: 0, durationMs: 1_000, createdAt: new Date().toISOString(), uses: 2,
+  };
+  const call = [{ tool: 'work_call', args: {} }];
+  // Every field fits a line: the summary is the contract and the lookup is skipped.
+  const flat = renderProvenOperationGuidance(strategy, { records_search: { type: 'object', required: ['query'],
+    properties: { query: { type: 'string' }, size: { type: ['integer', 'null'], minimum: 1, maximum: 25 } } } }, call);
+  assert.match(flat, /\[PROVEN OPERATION — skip tool_search\]/);
+  assert.match(flat, /records_search fields \(\* = required\):\n  query\*: string\n  size: integer or null \(1 to 25\)/);
+  // A choice between shapes is not a line: the schema goes over whole.
+  const shaped = { type: 'object', properties: { target: { anyOf: [{ type: 'string' }, { type: 'object', properties: { id: { type: 'string' } } }] } } };
+  const whole = renderProvenOperationGuidance(strategy, { records_search: shaped }, call);
+  assert.match(whole, /records_search full schema: \{"type":"object"/);
+  assert.match(whole, /\[PROVEN OPERATION — skip tool_search\]/);
+  // Too large to send whole: the lookup is not skipped, and the note says to fetch it first.
+  const large = { ...shaped, description: 'x'.repeat(7_000) };
+  const fetchFirst = renderProvenOperationGuidance(strategy, { records_search: large }, call);
+  assert.doesNotMatch(fetchFirst, /skip tool_search/);
+  assert.match(fetchFirst, /call tool_search with the exact name records_search for the full schema before calling it/);
+  assert.match(fetchFirst, /first fetch the full schema of records_search with tool_search by exact name/);
+});

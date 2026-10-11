@@ -19,7 +19,7 @@ import type { McpToolScope } from '../mcp-tool-scope.js';
 import { canonicalMcpToolIdentity } from '../mcp-tool-authority.js';
 import type { HostCapabilityDescriptorV1 } from '../semantic-boundary/turn-semantic-proposal.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
-import { compactContractLines } from '../../tools/schema-contract-lines.js';
+import { compactContract } from '../../tools/schema-contract-lines.js';
 import { TOOL_REGISTRY, isRegistryDeclaredRead } from '../../tools/tool-registry.js';
 import { renderCarrierInvocationExample } from '../../tools/tool-search-tool.js';
 import {
@@ -398,6 +398,9 @@ function publishedProvenOperations(slugs: readonly string[]): Array<{
   }
 }
 
+/** A schema the field summary cannot state goes over whole up to this size. */
+const PROVEN_FULL_SCHEMA_CHARS = 6_000;
+
 export function renderProvenOperationGuidance(
   strategy: RunStrategyRecord,
   schemas: Record<string, unknown>,
@@ -416,24 +419,32 @@ export function renderProvenOperationGuidance(
       `When your tools list ${tools.join(', ')}, call it directly. Use tool_search only if it is not listed or cannot do the whole request.`,
     ].join('\n');
   }
-  // Every field with its type, required marker and limits; only descriptions
-  // are shortened. Clipping the raw JSON lost whole fields and their limits
-  // behind one long description (10-10: a page size's maximum sat past the
-  // clip, and the model asked for more than it allows).
+  // Every field with its type, nullability, required marker and limits,
+  // nested fields included; only descriptions are shortened. Clipping the raw
+  // JSON lost whole fields and their limits behind one long description
+  // (10-10: a page size's maximum sat past the clip, and the model asked for
+  // more than it allows). A schema whose structure the summary cannot state
+  // goes over whole, or, when too large, the model is sent to fetch it and is
+  // not told to skip the lookup.
+  const needsFullSchema: string[] = [];
   const schemaLines = tools.map((name) => {
     const schema = schemas[name] ?? schemas[name.toUpperCase()];
     if (!schema) return `- ${name}`;
-    const fields = compactContractLines(schema);
-    if (fields.length > 0) return [`- ${name} fields (* = required):`, ...fields.map((line) => `  ${line}`)].join('\n');
+    const contract = compactContract(schema);
+    if (contract.complete && contract.lines.length > 0) {
+      return [`- ${name} fields (* = required):`, ...contract.lines.map((line) => `  ${line}`)].join('\n');
+    }
     const body = JSON.stringify(schema);
-    const clipped = body.length > 1_800 ? `${body.slice(0, 1_800)}…` : body;
-    return `- ${name} schema: ${clipped}`;
+    if (body.length <= PROVEN_FULL_SCHEMA_CHARS) return `- ${name} full schema: ${body}`;
+    needsFullSchema.push(name);
+    return `- ${name}: its schema is too large to show here; call tool_search with the exact name ${name} for the full schema before calling it.`;
   });
   const callable = invocations.length > 0;
+  const skipSearch = callable && needsFullSchema.length === 0;
   return [
     opts.routed
-      ? (callable ? '[ROUTED OPERATION — skip tool_search]' : '[ROUTED OPERATION]')
-      : (callable ? '[PROVEN OPERATION — skip tool_search]' : '[PROVEN OPERATION]'),
+      ? (skipSearch ? '[ROUTED OPERATION — skip tool_search]' : '[ROUTED OPERATION]')
+      : (skipSearch ? '[PROVEN OPERATION — skip tool_search]' : '[PROVEN OPERATION]'),
     // The earlier request's text carries that instance's targets and values,
     // which are not this one's, however close the wording: the hint names
     // the tools and the roles of their arguments only.
@@ -444,9 +455,11 @@ export function renderProvenOperationGuidance(
         // fit itself instead of taking the run as the whole job.
         ? `A prior successful run of what looks like the same kind of request used these tools: ${tools.join(', ')}. They are verified and callable now. Use them where they do what this request asks, with this request's own targets and values; anything else this request needs is still yours to find.`
         : `A prior successful run of this same kind of request already proved these tools: ${tools.join(', ')}. Use this request's own targets and values.`,
-    callable
+    skipSearch
       ? 'Call them directly on this turn. tool_search stays available if these operations cannot fulfill the whole request or a call is refused.'
-      : 'Prefer these tools. Use tool_search once if their requirement_id is not already disclosed on work_call.',
+      : callable
+        ? `Call them on this turn; first fetch the full schema of ${needsFullSchema.join(', ')} with tool_search by exact name, as shown above.`
+        : 'Prefer these tools. Use tool_search once if their requirement_id is not already disclosed on work_call.',
     // How the proven run checked its own work travels with the run. A faster
     // second run must not be a less careful one.
     ...(() => {
