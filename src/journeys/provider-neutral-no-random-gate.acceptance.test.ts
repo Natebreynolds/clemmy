@@ -1168,7 +1168,7 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
       prompt: 'Change the heading in the existing Planned Fixture Workspace.',
       args: {
         slug: 'planned-fixture-space',
-        edits: [{ find: 'Fixture', replace: 'Updated Fixture' }],
+        edits: [{ find: 'Fixture', replace: 'Updated Fixture', all: null }],
       },
       result: JSON.stringify({ ok: true, slug: 'planned-fixture-space', revision: 2 }),
     },
@@ -2270,7 +2270,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       const ordinarySiblingArgs = ordinarySiblingLocalName
         ? {
             slug: 'release-outbound-fixture',
-            edits: [{ find: 'Draft', replace: 'Updated Draft' }],
+            edits: [{ find: 'Draft', replace: 'Updated Draft', all: null }],
           }
         : null;
       const sourceCallId = `planned-external-source-${index}`;
