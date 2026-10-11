@@ -98,6 +98,9 @@ import { useKeyboardInset } from '../lib/use-keyboard-inset';
 import { BrainSheet } from '../components/BrainSheet';
 import { CloudBrowserDock } from '../components/CloudBrowserDock';
 import { Composer } from '../components/Composer';
+import { VoiceModeControl } from '../components/VoiceModeControl';
+import type { ComposeMode } from '../lib/compose-route';
+import { reportWidgetLanding, widgetNavigationFromSearch } from '../lib/widget-bridge';
 import { attachmentLabel, attachmentsSummary } from '../lib/attachments';
 import { ChatBackButton } from '../components/ChatBackButton';
 import { NavigationMenuButton } from '../components/NavigationMenuButton';
@@ -110,6 +113,7 @@ import { CompletedFiles } from '../components/CompletedFiles';
 import { assertDraftCurrent, currentDraftStep, fileContextKey, fileContextProblem, fileSendWasNotAdmitted, mobileDrafts, newMobileDraftScope, prepareSelectedFile, reconcileDraftChoice, settleDraftChoice, settledFileRequest, submitFileDraft, type MobileDraft, type SelectedFileContext, type DraftSendResult } from '../lib/file-context';
 
 interface Props {
+  initialComposeMode?: ComposeMode;
   sessionId?: string;
   initialTitle?: string;
   /** Text typed on Home's ask bar, waiting in the composer on arrival. */
@@ -137,13 +141,22 @@ interface Props {
   onBack: () => void;
 }
 
-export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialFileContext, draftScope, initialAttachments, initialAutoSend, agentId: initialAgentId, agentName: initialAgentName, projectId: initialProjectId, projectName: initialProjectName, onOpenRun, onOpenNeedsYou, onSessionCreated, onBack }: Props) {
+export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialFileContext, draftScope, initialAttachments, initialAutoSend, initialComposeMode, agentId: initialAgentId, agentName: initialAgentName, projectId: initialProjectId, projectName: initialProjectName, onOpenRun, onOpenNeedsYou, onSessionCreated, onBack }: Props) {
   useMobileDetailHeader();
+  const widgetNavigation = widgetNavigationFromSearch(window.location.search);
+  useEffect(() => { if (initialComposeMode) reportWidgetLanding(widgetNavigation, { tab: 'chats', compose: initialComposeMode }); }, [initialComposeMode, widgetNavigation]);
   const draftOwner = useRef(initialSessionId ? `chat:${initialSessionId}` : draftScope ?? newMobileDraftScope());
   const draftGeneration = useRef(mobileDrafts.generation);
   const ownsDraftGeneration = () => draftGeneration.current === mobileDrafts.generation;
   const [savedChoices] = useState(() => mobileDrafts.read(draftOwner.current));
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
+  const [voiceActive, setVoiceActive] = useState(false);
+  const [dictationActive, setDictationActive] = useState(false);
+  const [voiceErrorReset, setVoiceErrorReset] = useState(0);
+  const [voiceHasFiles, setVoiceHasFiles] = useState(() => Boolean(mobileDrafts.read(draftOwner.current).stagedAttachments?.length));
+  useEffect(() => mobileDrafts.subscribe(() => {
+    setVoiceHasFiles(Boolean(mobileDrafts.read(draftOwner.current).stagedAttachments?.length));
+  }), []);
   const sessionCreated = useRef(onSessionCreated);
   sessionCreated.current = onSessionCreated;
   const reportedSession = useRef(initialSessionId);
@@ -267,7 +280,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     observeWhileIdle: true,
     pendingStore: createPendingMessageStore(localStorage, `clem.pending.mobile:${initialSessionId ?? 'new'}`),
     api: {
-      send: async ({ message, sessionId, idempotencyKey, connectionRequestId, steerOnly, taskMode, agentId, attachments }) => {
+      send: async ({ message, sessionId, idempotencyKey, connectionRequestId, steerOnly, taskMode, voice, agentId, attachments }) => {
         // Only the message that creates the conversation names its project.
         let projectId: string | null = null;
         if (!sessionId) {
@@ -279,7 +292,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         let result: Awaited<ReturnType<typeof sendChatMessageAsync>>;
         try {
           result = await sendChatMessageAsync({
-            message, sessionId, idempotencyKey, connectionRequestId, steerOnly, taskMode, agentId, attachments,
+            message, sessionId, idempotencyKey, connectionRequestId, steerOnly, taskMode, voice, agentId, attachments,
             ...(projectId ? { projectId } : {}),
           });
           notAdmittedRequests.current.delete(idempotencyKey);
@@ -320,6 +333,9 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   }), [initialSessionId, boundAgentId]);
   const engineOwner = useRef(engine);
   engineOwner.current = engine;
+  // Stable while a new conversation gains its server id; renewed only when
+  // the engine itself changes. A draft alias change must not hang up a call.
+  const voiceScope = useMemo(freshIdempotencyKey, [engine]);
 
   useEffect(() => {
     const unsubscribe = engine.subscribe(setSnapshot);
@@ -480,7 +496,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 
   /** Send a new message to whoever the chip names. A message sent while a
    *  reply runs steers that reply; the choice waits for the next one. */
-  async function sendMessage(text: string, mode: TaskMode | undefined, attachments: ChatAttachment[] = [], stillCurrent: () => boolean = () => true) {
+  async function sendMessage(text: string, mode: TaskMode | undefined, attachments: ChatAttachment[] = [], stillCurrent: () => boolean = () => true, voice = false) {
     const current = () => ownsDraftGeneration() && activeDraftOwner.current && engineOwner.current === engine && stillCurrent();
     assertDraftCurrent(current);
     if (attachments.length && engine.snapshot().busy) throw new Error('Files can be sent after Clem finishes this turn.');
@@ -513,7 +529,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     }
     assertDraftCurrent(current);
     if (attachments.length && engine.snapshot().busy) throw new Error('Clem started working. Send the files after this turn finishes.');
-    await engine.send(text, mode, { attachments });
+    await engine.send(text, mode, { attachments, ...(voice ? { voice: true } : {}) });
   }
   const followingTail = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
@@ -669,6 +685,20 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     } finally {
       if (activeDraftOwner.current) setPreparingContext(false);
     }
+  }
+
+  async function submitVoice(text: string, stillCurrent: () => boolean): Promise<void> {
+    const saved = mobileDrafts.read(draftOwner.current);
+    // Voice never silently consumes an unfinished typed message or attachment.
+    if (saved.text.trim() || saved.stagedAttachments?.length || saved.context) {
+      throw new Error('Send or clear your draft and files before starting voice mode.');
+    }
+    if (preparingContext || engine.snapshot().busy) throw new Error('Wait for Clem to finish before speaking again.');
+    const before = new Set(engine.snapshot().messages.map(message => message.id));
+    await sendMessage(text, { version: 1, kind: composerMode }, [], stillCurrent, true);
+    if (!stillCurrent()) return;
+    const result = requestOutcome(before);
+    if (!result.accepted) throw new Error('Your spoken message was not confirmed. Check the conversation before trying again.');
   }
 
   async function retryDraftMessage(id: string) {
@@ -915,7 +945,18 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       ) : null}
       <div class="chat-dock-fade" aria-hidden="true" />
       <div ref={dockRef} class="chat-dock">
+        {initialComposeMode && !voiceActive && !dictationActive && messages.length === 0 && !draft ? <p class="chat-mode-status" role="status">{initialComposeMode === 'voice' ? 'Tap Talk to Clem to begin your conversation.' : 'Tap the microphone to dictate a draft.'}</p> : null}
         {planning || executing ? <p class="chat-mode-status" role="status">{executing ? 'Executing your approved plan' : 'Plan mode · Review before execution'}</p> : null}
+        <VoiceModeControl
+          scope={voiceScope}
+          messages={messages}
+          busy={busy}
+          onSend={submitVoice}
+          onActiveChange={setVoiceActive}
+          clearErrorRequest={voiceErrorReset}
+          disabledHint={dictationActive ? 'Finish dictation first' : draft.trim() || voiceHasFiles || fileContext ? 'Send or clear your draft to talk' : busy ? 'Available when Clem finishes' : 'Getting this conversation ready…'}
+          disabled={dictationActive || preparingContext || Boolean(draft.trim() || voiceHasFiles || fileContext) || (!voiceActive && (busy || Boolean(initialSessionId && !snapshot)))}
+        />
         <Composer
           value={draft}
           onChange={setDraft}
@@ -924,6 +965,9 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           ariaLabel={agent?.name ? `Message ${agent.name}` : 'Message Clem'}
           upload={uploadChatAttachment}
           disabled={executing}
+          voiceActive={voiceActive}
+          onDictationActiveChange={setDictationActive}
+          onDictationStart={() => setVoiceErrorReset(value => value + 1)}
           canStop={canStop}
           stopping={stopping}
           onStop={stopTurn}

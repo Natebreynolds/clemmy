@@ -14,6 +14,8 @@ import { Sheet } from './Sheet';
 import { haptic } from '../lib/native-bridge';
 import { useDictation } from '../lib/use-dictation';
 import { HoldToTalk, holdToTalkAvailable } from '../lib/hold-to-talk';
+import type { DictationPhase } from '../lib/browser-dictation';
+import { appendDictationText, microphoneProblem, microphoneUnavailableReason } from '../lib/dictation-support';
 import { attachmentKind, attachmentLabel, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS } from '../lib/attachments';
 import { mobileDrafts, type MobileStagedAttachment } from '../lib/file-context';
 
@@ -38,6 +40,10 @@ export interface ComposerProps {
   upload?: (file: File) => Promise<UploadResult>;
   /** Optional secondary choices get their own wrapping row above the controls. */
   chips?: ComponentChildren;
+  /** Spoken conversation and dictation must never own the microphone together. */
+  voiceActive?: boolean;
+  onDictationActiveChange?: (active: boolean) => void;
+  onDictationStart?: () => void;
   disabled?: boolean;
   /** A turn is running: the arrow sends into it and a stop square appears. */
   canStop?: boolean;
@@ -107,54 +113,102 @@ export function Composer(props: ComposerProps) {
   const cameraRef = useRef<HTMLInputElement | null>(null);
   const photosRef = useRef<HTMLInputElement | null>(null);
   const filesRef = useRef<HTMLInputElement | null>(null);
-  const { available: dictation, listening: dictating, toggle: toggleDictation, stop: stopDictation } = useDictation(
+  const draftScopeRef = useRef(attachmentScope);
+  draftScopeRef.current = attachmentScope;
+  const changeRef = useRef(onChange);
+  changeRef.current = onChange;
+  const voiceActiveRef = useRef(props.voiceActive);
+  voiceActiveRef.current = props.voiceActive;
+  const ownsDictationDraft = () => mounted.current && draftGeneration.current === mobileDrafts.generation && draftScopeRef.current === attachmentScope && !voiceActiveRef.current;
+  const { available: dictation, listening: dictating, starting: speechStarting, transcribing: speechTranscribing, error: speechError, toggle: toggleDictation, cancel: cancelSpeech } = useDictation(
     value,
     onChange,
     () => textareaRef.current?.focus(),
+    ownsDictationDraft,
   );
-  // Hold to talk: the words are transcribed on the Mac. Web Speech remains
-  // the fallback where no microphone stream is available to the page.
+  // The Mac capture path remains preferred. A capture failure never changes
+  // the provider; platform speech keeps only its existing unsupported path.
   const holdable = holdToTalkAvailable();
   const talker = useRef<HoldToTalk | null>(null);
-  const [holding, setHolding] = useState(false);
-  const [transcribing, setTranscribing] = useState(false);
+  const [capturePhase, setCapturePhaseState] = useState<DictationPhase>('idle');
+  const capturePhaseRef = useRef<DictationPhase>('idle');
+  const setCapturePhase = (phase: DictationPhase) => { capturePhaseRef.current = phase; if (mounted.current) setCapturePhaseState(phase); };
   const [voiceNote, setVoiceNote] = useState<string | null>(null);
-  const listening = holding || dictating;
-  const beginHold = async (event: Event) => {
-    event.preventDefault();
-    if (disabled || holding || transcribing) return;
+  const starting = capturePhase === 'starting' || speechStarting;
+  const listening = capturePhase === 'recording' || dictating;
+  const transcribing = capturePhase === 'transcribing' || speechTranscribing;
+  const dictationActive = starting || listening || transcribing;
+  const activeChangeRef = useRef(props.onDictationActiveChange);
+  activeChangeRef.current = props.onDictationActiveChange;
+  useEffect(() => { activeChangeRef.current?.(dictationActive); }, [dictationActive]);
+
+  const cancelCapture = () => {
+    talker.current?.cancel();
+    talker.current = null;
+    setCapturePhase('idle');
+  };
+  const cancelDictation = () => { cancelCapture(); cancelSpeech(); };
+  const beginCapture = async () => {
+    if (disabled || submittingRef.current || talker.current || !ownsDictationDraft()) return;
     setVoiceNote(null);
     const t = new HoldToTalk();
+    const scope = attachmentScope;
+    const owns = () => ownsDictationDraft() && talker.current === t && draftScopeRef.current === scope;
     talker.current = t;
-    setHolding(true);
+    setCapturePhase('starting');
     haptic('light');
-    try { await t.start(); } catch (err) {
-      setHolding(false);
+    try {
+      const ready = await t.start();
+      if (owns() && ready) setCapturePhase('recording');
+      else t.cancel();
+    } catch (err) {
+      if (!owns()) return;
+      t.cancel();
       talker.current = null;
-      setVoiceNote(err instanceof Error ? err.message : 'The microphone is not available.');
+      setCapturePhase('idle');
+      setVoiceNote(microphoneProblem(err));
     }
   };
-  const endHold = async () => {
+  const finishCapture = async () => {
     const t = talker.current;
     if (!t) return;
-    talker.current = null;
-    setHolding(false);
-    setTranscribing(true);
+    const scope = attachmentScope;
+    const owns = () => ownsDictationDraft() && talker.current === t && draftScopeRef.current === scope;
+    setCapturePhase('transcribing');
     try {
       const words = await t.stop();
-      if (words) {
+      if (owns() && words) {
         haptic('medium');
-        const joined = value.trim() ? `${value.replace(/\s+$/, '')} ${words}` : words;
-        onChange(joined);
+        const current = scope ? mobileDrafts.read(scope).text : valueRef.current;
+        changeRef.current(appendDictationText(current, words));
         textareaRef.current?.focus();
       }
     } catch (err) {
-      setVoiceNote(err instanceof Error ? err.message : 'Could not transcribe that.');
+      if (owns()) setVoiceNote(microphoneProblem(err));
     } finally {
-      setTranscribing(false);
+      if (owns()) { talker.current = null; setCapturePhase('idle'); }
     }
   };
-  useEffect(() => () => { talker.current?.cancel(); }, []);
+  const toggleMicrophone = () => {
+    if (props.voiceActive || disabled || submittingRef.current) return;
+    if (!dictationActive) props.onDictationStart?.();
+    if (holdable) {
+      if (capturePhaseRef.current === 'recording') void finishCapture();
+      else if (capturePhaseRef.current !== 'idle') cancelCapture();
+      else void beginCapture();
+    } else if (dictation) {
+      setVoiceNote(null);
+      if (speechStarting || speechTranscribing) cancelSpeech();
+      else toggleDictation();
+    } else setVoiceNote(microphoneUnavailableReason());
+  };
+  useEffect(() => { if (props.voiceActive || disabled) { cancelDictation(); setVoiceNote(null); } }, [props.voiceActive, disabled]);
+  useEffect(() => () => { cancelDictation(); }, [attachmentScope]);
+  useEffect(() => {
+    const checkOwner = () => { if (draftGeneration.current !== mobileDrafts.generation) cancelDictation(); };
+    return mobileDrafts.subscribe(checkOwner);
+  }, []);
+  useEffect(() => () => { talker.current?.cancel(); talker.current = null; cancelSpeech(); activeChangeRef.current?.(false); }, []);
 
   const autoresize = (el: HTMLTextAreaElement | null) => {
     if (!el) return;
@@ -189,23 +243,23 @@ export function Composer(props: ComposerProps) {
     foldTimer.current = window.setTimeout(() => { foldTimer.current = null; setFocused(false); }, 240);
   };
   useEffect(() => () => { if (foldTimer.current !== null) window.clearTimeout(foldTimer.current); }, []);
-  const slim = !focused && !value.trim() && staged.length === 0 && !props.context && !listening && !transcribing && !voiceNote;
+  const slim = !focused && !value.trim() && staged.length === 0 && !props.context && !dictationActive && !voiceNote && (!speechError || props.voiceActive);
 
   const ready = staged.filter((s) => !s.uploading && !s.error);
   const attachmentLimit = Math.max(0, MAX_ATTACHMENTS - (props.reservedAttachments ?? 0));
   const uploading = staged.some((s) => s.uploading);
   const fileSteeringBlocked = Boolean(canStop && staged.length);
   const sendBlocked = props.sendBlocked || (staged.length > attachmentLimit ? 'Remove one attachment to include the selected file. A message can include up to 10 files.' : fileSteeringBlocked ? 'Files can be sent after Clem finishes this turn.' : '');
-  const canSend = !disabled && !submitting && !sendBlocked && !uploading && (value.trim().length > 0 || ready.length > 0);
+  const canSend = !disabled && !props.voiceActive && !dictationActive && !submitting && !sendBlocked && !uploading && (value.trim().length > 0 || ready.length > 0);
 
   const submit = async (event?: Event) => {
     event?.preventDefault();
-    if (!canSend || submittingRef.current) return;
+    if (!canSend || submittingRef.current || talker.current || props.voiceActive) return;
     submittingRef.current = true;
     setSubmitting(true);
     setSendProblem('');
     haptic('medium');
-    stopDictation();
+    cancelDictation();
     const text = value.trim();
     const sending: ChatAttachment[] = ready.map(({ uploading: _u, error: _e, ...rest }) => rest);
     const original = value;
@@ -288,10 +342,10 @@ export function Composer(props: ComposerProps) {
         rows={1}
         value={value}
         aria-label={ariaLabel}
-        placeholder={holding ? 'Listening… let go to finish' : transcribing ? 'Writing down what you said…' : dictating ? 'Listening…' : placeholder}
+        placeholder={starting ? 'Starting microphone…' : transcribing ? 'Writing down what you said…' : listening ? 'Listening… tap the mic to finish' : placeholder}
         enterkeyhint="send"
         autocomplete="off"
-        disabled={disabled}
+        disabled={disabled || props.voiceActive}
         onFocus={onFieldFocus}
         onBlur={onFieldBlur}
         onInput={(event) => onChange((event.currentTarget as HTMLTextAreaElement).value)}
@@ -303,35 +357,23 @@ export function Composer(props: ComposerProps) {
       {chips ? <div class="composer-chips">{chips}</div> : null}
       <div class="composer-row">
         {upload ? (
-          <button type="button" class="composer-icon composer-attach" aria-label="Attach a photo or file" aria-haspopup="dialog" aria-expanded={attachOpen} disabled={disabled || submitting || staged.length >= attachmentLimit} onClick={() => { haptic('light'); setAttachOpen(true); }}>
+          <button type="button" class="composer-icon composer-attach" aria-label="Attach a photo or file" aria-haspopup="dialog" aria-expanded={attachOpen} disabled={disabled || props.voiceActive || submitting || staged.length >= attachmentLimit} onClick={() => { haptic('light'); setAttachOpen(true); }}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
           </button>
         ) : null}
         <span class="composer-spacer" aria-hidden="true" />
-        {holdable ? (
           <button
             type="button"
-            class={`composer-icon chat-mic${holding ? ' holding' : ''}${transcribing ? ' transcribing' : ''}`}
-            aria-label={holding ? 'Let go to finish' : 'Hold to talk'}
-            aria-pressed={holding}
-            disabled={disabled || transcribing}
-            onPointerDown={(e) => { void beginHold(e); }}
-            onPointerUp={() => { void endHold(); }}
-            onPointerCancel={() => { void endHold(); }}
-            onPointerLeave={() => { if (holding) void endHold(); }}
-            onContextMenu={(e) => e.preventDefault()}
+            class={`composer-icon chat-mic${listening ? ' holding' : ''}${transcribing || starting ? ' transcribing' : ''}`}
+            aria-label={starting ? 'Cancel dictation' : transcribing ? 'Cancel transcription' : listening ? 'Finish dictation' : 'Dictate'}
+            aria-pressed={dictationActive}
+            disabled={disabled || props.voiceActive || submitting}
+            onClick={toggleMicrophone}
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3" />
             </svg>
           </button>
-        ) : dictation ? (
-          <button type="button" class="composer-icon chat-mic" aria-label={dictating ? 'Stop dictation' : 'Dictate'} aria-pressed={dictating} disabled={disabled} onClick={toggleDictation}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3" />
-            </svg>
-          </button>
-        ) : null}
         {canStop ? (
           <button class="chat-stop" type="button" onClick={onStop} disabled={stopping} aria-label="Stop">
             {stopping ? <span class="chat-stop-busy" aria-hidden="true" /> : (
@@ -348,7 +390,8 @@ export function Composer(props: ComposerProps) {
       {submitting ? <p class="composer-note" role="status">Preparing and sending…</p> : null}
       {sendBlocked ? <p class="composer-note" role="status">{sendBlocked}</p> : null}
       {sendProblem ? <p class="composer-note" role="alert">{sendProblem}</p> : null}
-      {voiceNote ? <p class="composer-note" role="alert">{voiceNote}</p> : null}
+      {dictationActive ? <p class="composer-note" role="status">{starting ? 'Starting microphone… Allow access if asked. Tap the mic again to cancel.' : transcribing ? 'Transcribing… Tap the mic again to cancel.' : 'Listening. Tap the mic again to finish.'}</p> : null}
+      {voiceNote || (!holdable && speechError) ? <p class="composer-note" role="alert">{voiceNote || speechError}</p> : null}
       {upload ? (
         <>
           <input ref={cameraRef} type="file" accept="image/*" capture="environment" hidden onChange={onFiles} />

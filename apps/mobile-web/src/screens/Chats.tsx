@@ -14,8 +14,10 @@ import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
 import { newMobileDraftScope, type SelectedFileContext } from '../lib/file-context';
 import { mobileChatLocation } from '../lib/chat-location';
+import type { ComposeMode } from '../lib/compose-route';
 
 export interface ChatHandoff {
+  composeMode?: ComposeMode;
   draft?: string;
   fileContext?: SelectedFileContext;
   /** Files already uploaded from the capsule, sent with the draft. */
@@ -65,7 +67,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
     setSelectedContext(undefined);
   };
   useBackGesture(selectedId !== null, closeSelected);
-  const [composing, setComposing] = useState<{ scope: string; draft?: string; fileContext?: SelectedFileContext; attachments?: ChatAttachment[]; autoSend?: boolean; agentId?: string; agentName?: string; projectId?: string; projectName?: string } | null>(resume.current?.kind === 'new' ? resume.current : null);
+  const [composing, setComposing] = useState<{ scope: string; composeMode?: ComposeMode; draft?: string; fileContext?: SelectedFileContext; attachments?: ChatAttachment[]; autoSend?: boolean; agentId?: string; agentName?: string; projectId?: string; projectName?: string } | null>(resume.current?.kind === 'new' ? resume.current : null);
   useLayoutEffect(() => {
     mobileChatLocation.save(composing ? { kind: 'new', ...composing }
       : selectedId ? { kind: 'chat', sessionId: selectedId, title: selectedTitle } : null);
@@ -147,6 +149,13 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
   // already in the composer; a tapped thread opens that thread.
   useEffect(() => {
     if (!handoff) return;
+    if (handoff.composeMode && composing) {
+      // A widget may wake an unfinished new conversation. Keep its scope,
+      // text, and uploaded files reachable instead of replacing the draft.
+      setComposing({ ...composing, composeMode: handoff.composeMode, autoSend: false });
+      onHandoffConsumed?.();
+      return;
+    }
     if (handoff.session) {
       setComposing(null);
       setSelectedId(handoff.session.id);
@@ -161,7 +170,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
       setSelectedContext(handoff.fileContext);
     }
     else if (handoff.openLatest) { setComposing(null); setSelectedId(null); setPendingLatest(true); }
-    else { setSelectedId(null); setSelectedContext(undefined); setComposing({ scope: newMobileDraftScope(), draft: handoff.draft, fileContext: handoff.fileContext, attachments: handoff.attachments, autoSend: handoff.fileContext ? false : handoff.autoSend, agentId: handoff.agentId, agentName: handoff.agentName, projectId: handoff.projectId, projectName: handoff.projectName }); }
+    else { setSelectedId(null); setSelectedContext(undefined); setComposing({ scope: newMobileDraftScope(), composeMode: handoff.composeMode, draft: handoff.draft, fileContext: handoff.fileContext, attachments: handoff.attachments, autoSend: handoff.fileContext ? false : handoff.autoSend, agentId: handoff.agentId, agentName: handoff.agentName, projectId: handoff.projectId, projectName: handoff.projectName }); }
     onHandoffConsumed?.();
   }, [handoff, onHandoffConsumed]);
 
@@ -174,6 +183,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
         initialDraft={composing.draft}
         initialAttachments={composing.attachments}
         initialAutoSend={composing.autoSend}
+        initialComposeMode={composing.composeMode}
         onSessionCreated={(sessionId) => mobileChatLocation.promote(composing.scope, sessionId)}
         agentId={composing.agentId}
         agentName={composing.agentName}

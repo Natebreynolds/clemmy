@@ -73,6 +73,8 @@ import { MobileNavigationProvider } from './lib/mobile-navigation';
 import { NavigationMenuButton } from './components/NavigationMenuButton';
 import { useMobileViewportVariables } from './lib/use-keyboard-inset';
 import { mobileChatLocation } from './lib/chat-location';
+import { composeModeFromSearch, consumeComposeSearch } from './lib/compose-route';
+import { saveWidgetSpace, widgetAvailable, widgetNavigationFromSearch, WIDGET_ROUTE_EVENT } from './lib/widget-bridge';
 
 export function App() {
   useMobileViewportVariables();
@@ -124,12 +126,18 @@ export function App() {
   /** False the moment a poll fails or the worker answers off its shelf. */
   const [decisionsLive, setDecisionsLive] = useState(false);
   /** Set when Home hands a question to Chats — consumed once on arrival. */
-  const [handoff, setHandoff] = useState<ChatHandoff | null>(null);
+  const [handoff, setHandoff] = useState<ChatHandoff | null>(() => {
+    const composeMode = composeModeFromSearch(window.location.search);
+    return composeMode ? { composeMode } : null;
+  });
   /** The Chats LIST is a capsule surface; an open thread has its own composer. */
   const [chatsListVisible, setChatsListVisible] = useState(false);
   const [door, setDoor] = useState<ConnectionDoor>(connectionDoor() ?? 'direct');
   const authenticated = Boolean(authStatus?.authenticated);
-  useEffect(() => { if (authStatus && !authenticated) { mobileDrafts.clear(); mobileChatLocation.clear(); } }, [authenticated, authStatus !== null]);
+  useEffect(() => { if (authStatus && !authenticated) {
+    mobileDrafts.clear(); mobileChatLocation.clear();
+    if (widgetAvailable()) void saveWidgetSpace(null).catch(() => undefined);
+  } }, [authenticated, authStatus !== null]);
   /** Reads the ONE Needs-you count again; set by the poll that owns it. */
   const recountNeedsYou = useRef<() => void>(() => undefined);
 
@@ -229,8 +237,9 @@ export function App() {
   useEffect(() => {
     const slug = workspaceFromSearch(window.location.search);
     if (!slug || !workspaceColdOpenNeedsParent(window.location.search, window.history.state)) return;
+    const widgetNavigation = widgetNavigationFromSearch(window.location.search);
     window.history.replaceState(null, '', `${window.location.pathname}?tab=spaces`);
-    window.history.pushState({ clemWorkspace: slug }, '', mobileWorkspacePath(slug));
+    window.history.pushState({ clemWorkspace: slug }, '', `${mobileWorkspacePath(slug)}${widgetNavigation ? `&widgetNavigation=${widgetNavigation}` : ''}`);
   }, []);
 
   // Push/native navigation can replace the URL while this shell is alive.
@@ -243,10 +252,26 @@ export function App() {
       setRunId(runFromSearch(window.location.search));
       setProjectId(projectFromSearch(window.location.search));
       setAgentId(agentFromSearch(window.location.search));
+      const composeMode = composeModeFromSearch(window.location.search);
+      if (composeMode) setHandoff({ composeMode });
     };
     window.addEventListener('popstate', syncLocation);
-    return () => window.removeEventListener('popstate', syncLocation);
-  }, []);
+    const widgetRoute = (event: Event) => {
+      if (!authenticated) return;
+      const { path } = (event as CustomEvent<{ path: string }>).detail;
+      event.preventDefault();
+      userNavigated.current = true;
+      window.history.pushState(null, '', path);
+      setDrawerOpen(false);
+      syncLocation();
+    };
+    window.addEventListener(WIDGET_ROUTE_EVENT, widgetRoute);
+    if (authenticated) window.webkit?.messageHandlers?.clemWidgetNavigationReady?.postMessage(true);
+    return () => {
+      window.removeEventListener('popstate', syncLocation);
+      window.removeEventListener(WIDGET_ROUTE_EVENT, widgetRoute);
+    };
+  }, [authenticated]);
 
   // A place Clem links in a reply opens inside the app: the URL changes and
   // the same sync above moves the shell, with no page load.
@@ -916,7 +941,12 @@ export function App() {
           ) : tab === 'chats' ? (
             <Chats
               handoff={handoff}
-              onHandoffConsumed={() => setHandoff(null)}
+              onHandoffConsumed={() => {
+                setHandoff(null);
+                if (composeModeFromSearch(window.location.search)) {
+                  window.history.replaceState(window.history.state, '', `${window.location.pathname}${consumeComposeSearch(window.location.search)}`);
+                }
+              }}
               onListVisibleChange={setChatsListVisible}
               onOpenRun={openRun}
               onOpenNeedsYou={() => navigateTo('inbox')}

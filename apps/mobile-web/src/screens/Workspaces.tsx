@@ -31,6 +31,7 @@ import { useScreenData } from '../lib/use-screen-data';
 import { failedWorkspaceSources, workspaceNeedsSourceRepair } from '../lib/workspace-presentation';
 import { Chat } from './Chat';
 import { WorkspaceSourceControls } from '../components/WorkspaceSourceControls';
+import { reportWidgetLanding, saveWidgetSpace, widgetAvailable, widgetNavigationFromSearch, widgetText } from '../lib/widget-bridge';
 
 export function Workspaces({
   initialOpenId = null,
@@ -41,6 +42,8 @@ export function Workspaces({
   onOpenNeedsYou: () => void;
   onOpenChange?: (id: string | null) => void;
 }) {
+  const widgetNavigation = widgetNavigationFromSearch(window.location.search);
+  useEffect(() => { if (!initialOpenId) reportWidgetLanding(widgetNavigation, { tab: 'spaces' }); }, [initialOpenId, widgetNavigation]);
   const [openId, setOpenId] = useState<string | null>(initialOpenId);
   useEffect(() => setOpenId(initialOpenId), [initialOpenId]);
   const selectWorkspace = (id: string | null) => {
@@ -171,6 +174,9 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
   const [refreshNote, setRefreshNote] = useState<{ kind: 'ok' | 'approval' | 'failed'; text: string } | null>(null);
   const [chatOpen, setChatOpen] = useState<{ draft?: string } | null>(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [widgetNote, setWidgetNote] = useState('');
+  const [widgetSaving, setWidgetSaving] = useState(false);
+  const widgetNavigation = widgetNavigationFromSearch(window.location.search);
   useMobileDetailHeader(chatOpen === null);
   const [showPref, setShowPref] = useState<boolean | null | undefined>(undefined);
   const [prefBusy, setPrefBusy] = useState(false);
@@ -178,6 +184,23 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
     () => getWorkspace(id),
     { intervalMs: 60_000, disabled: chatOpen !== null },
   );
+  useEffect(() => {
+    if (detail) reportWidgetLanding(widgetNavigation, { tab: 'spaces', workspace: id });
+    else if (error && !offline) reportWidgetLanding(widgetNavigation, { tab: 'spaces', workspace: id }, 'unavailable');
+  }, [detail, error, offline, widgetNavigation]);
+  const updateWidget = async (clear = false) => {
+    if (!detail || widgetSaving) return;
+    setWidgetSaving(true); setWidgetNote('');
+    try {
+      await saveWidgetSpace(clear ? null : {
+        slug: detail.id, name: widgetText(detail.title, 160),
+        summary: widgetText(detail.projection.headline.slice(0, 3).map(row => `${row.label}: ${row.value}`).join(' · ') || detail.objective || 'Open this Space in Clem.', 600),
+        updatedAt: detail.lastRefreshedAt ?? detail.updatedAt,
+      });
+      setWidgetNote(clear ? 'Space removed from your widget.' : 'Space saved. Add the Clem widget from your iPhone Home Screen. This preview updates when you save it again.');
+    } catch (error) { setWidgetNote(error instanceof Error ? error.message : 'The widget could not be updated.'); }
+    finally { setWidgetSaving(false); }
+  };
 
   async function pullFresh() {
     setRefreshing(true);
@@ -342,6 +365,14 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
       <details id="space-details" class="ws-details" open={detailsOpen} onToggle={event => setDetailsOpen(event.currentTarget.open)}>
         <summary>Space details</summary>
         <div class="ws-details-body">
+          {widgetAvailable() ? <div class="ws-widget-options">
+            <p class="card-when">Show this Space’s name and summary on your iPhone Home Screen.</p>
+            <div class="ws-details-actions">
+              <button type="button" class="btn-quiet" disabled={widgetSaving || offline} onClick={() => void updateWidget()}>{widgetSaving ? 'Saving…' : 'Use in iPhone widget'}</button>
+              <button type="button" class="btn-quiet" disabled={widgetSaving} onClick={() => void updateWidget(true)}>Clear widget Space</button>
+            </div>
+            {widgetNote ? <p class="card-when" role="status">{widgetNote}</p> : null}
+          </div> : null}
           {detail.objective ? <p class="ws-objective-full">{detail.objective}</p> : null}
           {canRefresh ? <div class="ws-details-actions"><button type="button" class="btn-quiet" disabled={refreshing} onClick={pullFresh}>{refreshing ? 'Refreshing…' : 'Refresh data'}</button></div> : null}
           {needsSourceRepair ? <div class="ws-refresh-note"><p>This Space has no data source, so it can’t refresh on its own.</p><button type="button" class="link-btn" onClick={() => setChatOpen({ draft: FIX_REFRESH_ASK })}>Ask Clem to connect a source</button></div> : null}

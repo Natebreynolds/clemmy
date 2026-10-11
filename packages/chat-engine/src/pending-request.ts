@@ -22,7 +22,7 @@ export function createPendingMessageStore(storage: { getItem(key: string): strin
             || typeof row.idempotencyKey !== 'string' || !row.idempotencyKey
             || (row.requestSessionId !== null && typeof row.requestSessionId !== 'string')
             || (row.taskMode !== undefined && !mode)) return [];
-          return [{ ...row, taskMode: mode, pending: 'failed' as const,
+          return [{ ...row, taskMode: mode, voice: row.voice === true ? true : undefined, pending: 'failed' as const,
             pendingError: 'Delivery was not confirmed. Retry sends the exact same request.' }];
         });
       } catch { return []; }

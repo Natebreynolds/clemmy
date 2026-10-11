@@ -27,6 +27,10 @@ targets:
     platform: iOS
     sources:
       - Clem
+      - Shared
+    dependencies:
+      - target: ClemWidgets
+        embed: true
     entitlements:
       path: Clem/Clem.entitlements
       properties:
@@ -41,6 +45,8 @@ targets:
         # A push product whose notifications quietly stop working in the
         # shipped build is worse than one with no push at all.
         aps-environment: $(APS_ENVIRONMENT)
+        com.apple.security.application-groups:
+          - group.ai.breakthroughcoaching.clem
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.breakthroughcoaching.clem
@@ -60,6 +66,35 @@ targets:
           APS_ENVIRONMENT: development
         Release:
           APS_ENVIRONMENT: production
+  ClemWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - ClemWidgets
+      - Shared
+    info:
+      path: ClemWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Clem
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: ClemWidgets/ClemWidgets.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.ai.breakthroughcoaching.clem
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.breakthroughcoaching.clem.widgets
+        PRODUCT_NAME: ClemWidgets
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: false
+        APPLICATION_EXTENSION_API_ONLY: true
+        SKIP_INSTALL: true
+        CURRENT_PROJECT_VERSION: 14
+        MARKETING_VERSION: 0.1.0
   ClemTests:
     type: bundle.unit-test
     platform: iOS

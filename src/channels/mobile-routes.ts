@@ -42,6 +42,8 @@ import { parseTaskMode, taskModeFields, type TaskMode } from '../runtime/harness
  */
 
 import express from 'express';
+import { Readable } from 'node:stream';
+import { requestSpeech, spokenReplyText } from '../dashboard/voice-speech.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import path from 'node:path';
@@ -277,6 +279,8 @@ function mobileChatDigest(deviceId: string, idempotencyKey: string): string {
 
 function mobileChatPayloadHash(message: string, requestedSessionId: string | null, taskMode?: TaskMode, agentId?: string, projectId?: string): string {
   if (taskMode?.kind === 'execute') return reviewedPlanExecuteInputHash({ text: message, taskMode });
+  // Voice is presentation intent, excluded from request identity like desktop.
+  // A replay retains the first accepted source's marker.
   // A request opened inside a saved agent is a different request; one that
   // named none keeps its historical hash.
   return createHash('sha256')
@@ -850,6 +854,8 @@ export interface MobileRouterDeps {
     hasCloudKey: typeof import('../runtime/transcribe.js').hasOpenAiKey;
     transcribeCloud: typeof import('../runtime/transcribe.js').transcribeAudio;
   };
+  /** Provider-free speech route tests. Production shares desktop's speech service. */
+  voiceSpeechRuntime?: { requestSpeech: typeof requestSpeech };
   /**
    * Optional override for the built PWA assets directory. When unset,
    * the router probes the usual candidate paths (apps/mobile-web/dist
@@ -3800,6 +3806,36 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  // The mobile voice loop speaks the ordinary chat's answer. Authentication
+  // retains both the paired cookie and the device proof; no desktop token is
+  // embedded in mobile assets. Ending voice aborts any speech request in flight.
+  router.post('/api/chat/speak', requireMobileSession, express.json({ limit: '64kb' }), async (req, res) => {
+    const heard = spokenReplyText(typeof req.body?.text === 'string' ? req.body.text : '');
+    res.setHeader('Cache-Control', 'no-store');
+    if (!heard) { res.status(400).json({ error: 'There are no words to read aloud.' }); return; }
+    const controller = new AbortController();
+    res.on('close', () => { if (!res.writableFinished) controller.abort(); });
+    try {
+      const speech = await (deps.voiceSpeechRuntime?.requestSpeech ?? requestSpeech)(heard, controller.signal);
+      if (controller.signal.aborted) {
+        if (speech.ok) void speech.response.body?.cancel().catch(() => undefined);
+        return;
+      }
+      if (!speech.ok) {
+        res.status(speech.status).json({ error: speech.error, ...(speech.fallback ? { fallback: speech.fallback } : {}), text: heard });
+        return;
+      }
+      if (!speech.response.body) { res.status(502).json({ error: 'Clem’s reply audio was empty. Try voice mode again.' }); return; }
+      res.status(200).setHeader('Content-Type', speech.contentType);
+      const body = Readable.fromWeb(speech.response.body as unknown as import('node:stream/web').ReadableStream<Uint8Array>);
+      controller.signal.addEventListener('abort', () => body.destroy(), { once: true });
+      body.on('error', () => { if (!res.writableEnded) res.end(); });
+      body.pipe(res);
+    } catch {
+      if (!controller.signal.aborted && !res.headersSent) res.status(502).json({ error: 'Clem’s voice could not connect. Try voice mode again.' });
+    }
+  });
+
   router.post('/api/chat/attach', requireMobileSession, express.raw({ type: '*/*', limit: '30mb' }), async (req, res) => {
     const name = typeof req.query.name === 'string' && req.query.name.trim() ? req.query.name.trim().slice(0, 200) : 'attachment';
     const bytes = Buffer.isBuffer(req.body) && req.body.length > 0 ? (req.body as Buffer) : undefined;
@@ -4128,6 +4164,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     if (taskMode && req.body?.steerOnly === true) { res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' }); return; }
     const ctx = req.mobileSession!;
     const typedMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    const voice = req.body?.voice === true;
     // Files uploaded ahead of this message through /api/chat/attach. A photo
     // with no words is a complete message; the title then names the files.
     const attachmentIds: string[] = Array.isArray(req.body?.attachments)
@@ -4439,7 +4476,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
               return;
             }
             const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
-            const note = appendSteerNote(proposedSessionId, message);
+            const note = appendSteerNote(proposedSessionId, message, {
+              clientRequestId: requestId,
+              ...(voice ? { voice: true } : {}),
+            });
             res.json({
               ok: true,
               steered: true,
@@ -4624,6 +4664,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             ...(connectionContext ? { connectionContinuation: connectionContext, connectionContinuationVerification: connectionVerification } : {}),
             ...(admission ? { onAcceptedTurn: admission.accepted } : {}),
             message: executionMessage,
+            ...(voice ? { voice: true } : {}),
             // The bubble shows what was typed (or "Attached: …"); the fold is for the model.
             ...(ingestedAttachments.length ? { visibleMessage: message } : {}),
             sessionId,

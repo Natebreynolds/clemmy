@@ -1,4 +1,5 @@
 import SwiftUI
+import WidgetKit
 
 /// Warm near-black behind everything — matches the web UI's --bg-0 so the
 /// native shell is invisible: no white band, no flash while loading.
@@ -45,6 +46,7 @@ struct RootView: View {
                     // newly scanned origin.
                     OriginHandoffStore.clear()
                     PendingPushNavigationStore.clear()
+                    clearWidgetState()
                     PairingStore.save(newPairing)
                     launchURL = newLaunchURL
                     model = WebViewModel(pairing: newPairing)
@@ -70,6 +72,14 @@ struct RootView: View {
         }
         .preferredColorScheme(.light)
         .onAppear { synchronizePendingNavigationDelivery() }
+        .onOpenURL { url in
+            // A widget chooses a bounded in-app destination only. Pairing and
+            // Face ID remain the authorities for delivery, including cold start.
+            guard let fingerprint = model?.pairing.fingerprint,
+                  PendingWidgetNavigationRepository.shared.park(url: url, pairingFingerprint: fingerprint) else { return }
+            PendingPushNavigationStore.clear()
+            synchronizePendingNavigationDelivery()
+        }
         .onChange(of: gate.unlocked) { _, _ in
             synchronizePendingNavigationDelivery()
         }
@@ -102,6 +112,7 @@ struct RootView: View {
     private func unpair() {
         OriginHandoffStore.clear()
         PendingPushNavigationStore.clear()
+        clearWidgetState()
         PairingStore.clear()
         launchURL = nil
         model = nil
@@ -110,6 +121,12 @@ struct RootView: View {
     private func synchronizePendingNavigationDelivery() {
         let allowed = scenePhase == .active && gate.unlocked
         model?.setPendingPushNavigationAllowed(allowed)
+    }
+
+    private func clearWidgetState() {
+        PendingWidgetNavigationRepository.shared.clear()
+        ClemWidgetSpaceStore.shared.clear()
+        WidgetCenter.shared.reloadAllTimelines()
     }
 }
 

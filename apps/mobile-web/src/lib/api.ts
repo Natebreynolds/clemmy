@@ -1128,6 +1128,8 @@ export async function sendChatMessageAsync(
     connectionRequestId?: string;
     steerOnly?: boolean;
     taskMode?: TaskMode;
+    /** Spoken in voice mode; the normal chat turn knows its reply will be heard. */
+    voice?: boolean;
     /** Binds a NEW conversation to this saved agent; ignored once it exists. */
     agentId?: string;
     /** Opens a NEW conversation inside this project; ignored once it exists. */
@@ -1142,6 +1144,7 @@ export async function sendChatMessageAsync(
     body: JSON.stringify({
       message: input.message,
       ...(input.connectionRequestId ? { connectionRequestId: input.connectionRequestId } : {}),
+      ...(input.voice ? { voice: true } : {}),
       ...(input.taskMode ? { taskMode: input.taskMode } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       ...(input.agentId ? { agentId: input.agentId } : {}),
@@ -2080,10 +2083,34 @@ export async function uploadChatAttachment(file: File): Promise<{ id: string; na
 }
 
 /** Spoken words to text, on the Mac: raw 16 kHz mono WAV in, the transcript out. */
-export async function transcribeVoice(wav: Blob): Promise<{ text: string; engine: 'local' | 'openai' }> {
-  return api<{ text: string; engine: 'local' | 'openai' }>('/m/api/chat/transcribe', {
-    method: 'POST', headers: { 'content-type': 'audio/wav' }, body: wav,
-  });
+export async function transcribeVoice(wav: Blob, signal?: AbortSignal): Promise<{ text: string; engine: 'local' | 'openai' }> {
+  try {
+    return await api<{ text: string; engine: 'local' | 'openai' }>('/m/api/chat/transcribe', {
+      method: 'POST', headers: { 'content-type': 'audio/wav' }, body: wav, signal,
+    });
+  } catch (error) {
+    // Mobile routes return a stable error code plus actionable display text.
+    // Keep the code/status on the error, but show the recovery to the owner.
+    const body = (error as ApiError)?.body as { message?: unknown } | undefined;
+    if (error instanceof Error && typeof body?.message === 'string') error.message = body.message;
+    throw error;
+  }
+}
+
+/** Voice replies use the paired device's proof, just like every chat request. */
+export async function speakVoice(text: string, signal?: AbortSignal): Promise<Blob | { text: string; fallback: 'system' }> {
+  try {
+    return await apiBlob('/m/api/chat/speak', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }), signal,
+    });
+  } catch (error) {
+    const failed = error as ApiError;
+    const body = failed?.body as { fallback?: unknown; text?: unknown } | undefined;
+    if (failed?.status === 409 && body?.fallback === 'system' && typeof body.text === 'string') {
+      return { text: body.text, fallback: 'system' };
+    }
+    throw error;
+  }
 }
 
 /** A heartbeat as the phone sees it: what it watches and whether its items reach this phone. */
