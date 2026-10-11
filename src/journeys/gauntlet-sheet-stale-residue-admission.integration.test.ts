@@ -121,6 +121,12 @@ writeFileSync(path.join(HOME, 'state', 'auth.json'), JSON.stringify({
   },
 }), 'utf8');
 
+// This journey exercises dispatch, recovery and transport, not the first-time
+// card: it runs with every connected-app kind approved, like the unit fixtures
+// (70c7dd879). The ask-once rule itself (owner 2026-10-06) is the
+// balanced-user-stops journeys' subject.
+const { _setApprovedWriteKindsForTests } = await import('../agents/plan-scope.js');
+_setApprovedWriteKindsForTests('all');
 const discord = await import('../channels/discord-harness.js');
 const bridge = await import('../runtime/harness/respond-bridge.js');
 const { configureHarnessRuntime, resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
