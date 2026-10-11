@@ -72,13 +72,20 @@ struct RootView: View {
             }
         }
         .preferredColorScheme(.light)
+        .background {
+            if #available(iOS 18.0, *) {
+                WidgetVoiceSetupPresentationObserver(paired: model != nil, unlocked: gate.unlocked,
+                    foreground: scenePhase == .active) { widgetVoiceOpen = true }
+            }
+        }
         .onAppear {
             synchronizePendingNavigationDelivery()
             connectWidgetVoice()
         }
         .sheet(isPresented: $widgetVoiceOpen) {
             if #available(iOS 18.0, *), gate.unlocked {
-                WidgetVoiceSheet(onReconnect: { model?.prepareNativeVoice(force: true) })
+                WidgetVoiceSheet(onReconnect: { model?.prepareNativeVoice(force: true) },
+                    onReload: { model?.reloadForNativeVoiceSetup() })
             }
         }
         .onOpenURL { url in
@@ -154,6 +161,31 @@ struct RootView: View {
         PendingWidgetNavigationRepository.shared.clear()
         ClemWidgetSpaceStore.shared.clear()
         WidgetCenter.shared.reloadAllTimelines()
+    }
+}
+
+/// An intent can request foreground setup after the scene already became
+/// active. Observe the request itself rather than waiting for another unlock.
+@available(iOS 18.0, *)
+private struct WidgetVoiceSetupPresentationObserver: View {
+    @ObservedObject private var voice = WidgetVoiceSession.shared
+    let paired: Bool
+    let unlocked: Bool
+    let foreground: Bool
+    let present: () -> Void
+    private var allowed: Bool {
+        WidgetVoiceRecoveryPolicy.shouldPresent(requested: voice.setupRequested,
+            paired: paired, unlocked: unlocked, foreground: foreground)
+    }
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0)
+            // @Published emits repeated true assignments, including a second
+            // widget tap after Done. Use the emitted value: it arrives in willSet.
+            .onReceive(voice.$setupRequested) { requested in
+                if WidgetVoiceRecoveryPolicy.shouldPresent(requested: requested,
+                    paired: paired, unlocked: unlocked, foreground: foreground) { present() }
+            }
+            .onChange(of: allowed, initial: true) { _, allowed in if allowed { present() } }
     }
 }
 

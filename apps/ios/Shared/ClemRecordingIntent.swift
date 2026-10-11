@@ -28,6 +28,12 @@ struct StartClemRecordingIntent: AudioRecordingIntent, LiveActivityIntent {
             throw needsToContinueInForegroundError("Open Clem to allow microphone access.")
         } catch WidgetVoiceError.pendingDraft {
             throw needsToContinueInForegroundError("Open Clem to review your saved recording.")
+        } catch is CancellationError {
+            // Cancel/unpair invalidates an in-flight start; it is not setup.
+            return .result()
+        } catch {
+            WidgetVoiceSession.shared.recordStartFailure(error)
+            throw needsToContinueInForegroundError("Open Clem to check microphone and recording setup.")
         }
         #endif
         return .result()

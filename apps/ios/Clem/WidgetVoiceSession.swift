@@ -1,6 +1,8 @@
 import AVFoundation
+import ActivityKit
 import Combine
 import Foundation
+import Network
 import Security
 import UIKit
 
@@ -13,6 +15,110 @@ enum WidgetVoiceError: LocalizedError {
         case .pendingDraft: return "Your last dictation is saved. Open Clem to review it first."
         case .unavailable(let message): return message
         }
+    }
+}
+
+/// Only fixed diagnostic codes are persisted. Never store a URL, credential,
+/// request identifier, transcript, server response, or arbitrary error text.
+enum WidgetVoiceRecoveryIssue: String, Codable, CaseIterable {
+    case pageNotReady, bridgeUnavailable, connectionTimedOut, connectionUnavailable, serviceUnavailable
+    case unauthorized, pairingChanged, secureStorage, invalidResponse, securityMismatch
+    case microphoneDenied, liveActivityUnavailable, liveActivityVisibility, liveActivityLimit, liveActivityStartRefused
+    case captureFailed, requestFailed
+
+    var message: String {
+        switch self {
+        case .pageNotReady: return "Open your connected chat in Clem, then tap Connect widget voice again."
+        case .bridgeUnavailable: return "This page needs the latest voice connection. Tap Reload Clem, then connect widget voice again."
+        case .connectionTimedOut: return "Your Mac did not answer in time. Check its connection, then try again."
+        case .connectionUnavailable: return "Clem could not reach your Mac. Check that your Mac is online, then try again."
+        case .serviceUnavailable: return "Your Mac could not prepare widget voice. Reconnect widget voice and try again."
+        case .unauthorized: return "Widget voice needs to reconnect. Your saved words and last request will stay here."
+        case .pairingChanged: return "Voice setup changed before it finished. Connect widget voice again."
+        case .secureStorage: return "Clem could not save the secure connection. Unlock your iPhone, then try again."
+        case .invalidResponse: return "Your Mac returned an unsupported voice response. Reconnect widget voice and try again."
+        case .securityMismatch: return "Your Mac’s security fingerprint no longer matches. Pair Clem with your Mac again."
+        case .microphoneDenied: return "Allow microphone access for Clem in iPhone Settings, then return here."
+        case .liveActivityUnavailable: return "Allow Live Activities for Clem in iPhone Settings, then try the widget again."
+        case .liveActivityVisibility: return "iOS could not show recording controls from the widget. Open Clem and try Talk or Dictate here."
+        case .liveActivityLimit: return "iOS has too many Live Activities open. End an existing activity, then try again."
+        case .liveActivityStartRefused: return "iOS could not start the recording controls. Open Clem and try Talk or Dictate here."
+        case .captureFailed: return "Clem could not start recording. Open Clem and try again."
+        case .requestFailed: return "That voice step could not finish. Your draft or last request is saved here."
+        }
+    }
+
+    var invalidatesConnection: Bool {
+        [.pageNotReady, .bridgeUnavailable, .unauthorized, .pairingChanged,
+         .secureStorage, .securityMismatch].contains(self)
+    }
+
+    static func httpStatus(_ status: Int) -> Self? {
+        status == 401 || status == 403 ? .unauthorized : nil
+    }
+
+    static func classify(_ error: Error) -> Self {
+        if let transport = error as? NativeVoiceTransportError {
+            switch transport {
+            case .setup: return .secureStorage
+            case .unpaired, .unauthorized: return .unauthorized
+            case .correlation: return .pairingChanged
+            case .pin, .redirect: return .securityMismatch
+            case .timeout: return .connectionTimedOut
+            case .unreachable: return .connectionUnavailable
+            case .unavailable: return .serviceUnavailable
+            default: return .invalidResponse
+            }
+        }
+        if let activity = error as? ActivityAuthorizationError {
+            switch activity {
+            case .denied: return .liveActivityUnavailable
+            case .visibility: return .liveActivityVisibility
+            case .globalMaximumExceeded, .targetMaximumExceeded: return .liveActivityLimit
+            default: return .liveActivityStartRefused
+            }
+        }
+        if let capture = error as? WidgetAudioRecorderError {
+            switch capture {
+            case .microphoneSetup, .microphoneDenied: return .microphoneDenied
+            case .activitiesDisabled, .activityLost: return .liveActivityUnavailable
+            default: return .captureFailed
+            }
+        }
+        if error is NWError || error is URLError { return .connectionUnavailable }
+        return .requestFailed
+    }
+}
+
+struct WidgetVoiceDiagnostic: Codable, Equatable {
+    enum Stage: String, Codable { case setup, connected, microphone, starting, recording, transcribing, sending, waiting, speaking, ready }
+    let stage: Stage
+    let issue: WidgetVoiceRecoveryIssue?
+    let updatedAt: Date
+    var code: String { "\(stage.rawValue).\(issue?.rawValue ?? "ok")" }
+}
+
+enum WidgetVoiceRecoveryPolicy {
+    static func shouldPresent(requested: Bool, paired: Bool, unlocked: Bool, foreground: Bool) -> Bool {
+        requested && paired && unlocked && foreground
+    }
+    static func connectionUsable(_ connected: Bool, after issue: WidgetVoiceRecoveryIssue) -> Bool {
+        connected && !issue.invalidatesConnection
+    }
+    static func showReconnect(connected: Bool, working: Bool, recording: Bool) -> Bool {
+        !connected && !working && !recording
+    }
+}
+
+private enum WidgetVoiceDiagnosticStore {
+    private static let key = "clem.widgetVoice.lastDiagnostic"
+    static func load() -> WidgetVoiceDiagnostic? {
+        guard let data = UserDefaults.standard.data(forKey: key), data.count < 1_024 else { return nil }
+        return try? JSONDecoder().decode(WidgetVoiceDiagnostic.self, from: data)
+    }
+    static func save(_ value: WidgetVoiceDiagnostic?) {
+        if let value, let data = try? JSONEncoder().encode(value) { UserDefaults.standard.set(data, forKey: key) }
+        else { UserDefaults.standard.removeObject(forKey: key) }
     }
 }
 
@@ -77,9 +183,13 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
     @Published private(set) var mode: ClemRecordingMode = .voice
     @Published private(set) var working = false
     @Published private(set) var sessionId: String?
+    @Published private(set) var diagnostic = WidgetVoiceDiagnosticStore.load()
     private var saved: WidgetVoiceSavedState?
     private var transport: NativeVoiceTransport?
     private var boundFingerprint: String?
+    /// Enrollment callbacks have their own lifetime; reconnecting must not
+    /// cancel or otherwise change a saved recording or chat request.
+    private var provisioningGeneration = UUID()
     private var epoch = UUID()
     private var handledSegments = Set<UUID>()
     private var work: Task<Void, Never>?
@@ -114,6 +224,7 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
     func refreshPairing() {
         guard let pairing = PairingStore.load(), let fingerprint = pairing.fingerprint else { return }
         guard boundFingerprint != fingerprint else { return }
+        provisioningGeneration = UUID(); connected = false
         epoch = UUID(); voiceEnabled = false; work?.cancel(); stopPlayback(); working = false
         recordingFingerprint = nil
         if boundFingerprint != nil {
@@ -129,8 +240,10 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
         draft = saved?.draft ?? ""; sessionId = saved?.sessionId
         if saved?.requestId != nil { status = "Open your conversation to check the last request." }
         let prepared = transport
+        let generation = provisioningGeneration
         Task { let ready = await prepared?.isProvisioned == true
-            guard boundFingerprint == fingerprint else { return }
+            guard generation == provisioningGeneration, prepared === transport,
+                  boundFingerprint == fingerprint else { return }
             connected = ready
         }
     }
@@ -148,21 +261,50 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
 
     func reconnect() async {
         guard !working, !recorder.hasActiveRecording else { return }
-        await transport?.clearCredentials(); connected = false
+        // Invalidate callbacks before the actor hop. A previous acceptance
+        // may already be returning while this credential is being replaced.
+        provisioningGeneration = UUID(); connected = false
+        let currentTransport = transport
+        noteProvisioningStarted()
+        await currentTransport?.clearCredentials()
+    }
+
+    func noteProvisioningStarted() { error = nil; note(.setup) }
+    func noteProvisioningWaiting(_ issue: WidgetVoiceRecoveryIssue) {
+        connected = false; error = issue.message; note(.setup, issue: issue)
+    }
+    func noteProvisioningFailure(_ failure: Error) {
+        connected = false
+        let issue = WidgetVoiceRecoveryIssue.classify(failure)
+        error = issue.message; note(.setup, issue: issue)
     }
 
     func acceptProvisioning(_ body: [String: Any]) async {
         guard let transport else { return }
-        do { try await transport.acceptProvisioning(body); connected = await transport.isProvisioned; error = nil }
-        catch { self.error = "Widget voice could not connect. Keep Clem open and try again." }
+        let fingerprint = boundFingerprint
+        let generation = provisioningGeneration
+        do {
+            guard try await transport.acceptProvisioning(body) == .accepted else { return }
+            guard generation == provisioningGeneration, self.transport === transport,
+                  fingerprint == boundFingerprint else { return }
+            let ready = await transport.isProvisioned
+            guard generation == provisioningGeneration, self.transport === transport,
+                  fingerprint == boundFingerprint else { return }
+            connected = ready; error = nil; note(ready ? .connected : .setup)
+        } catch {
+            guard generation == provisioningGeneration, self.transport === transport,
+                  fingerprint == boundFingerprint else { return }
+            noteProvisioningFailure(error)
+        }
     }
 
     func enableAndStart() async {
         do {
+            note(.microphone)
             guard await recorder.requestMicrophonePermission() else { throw WidgetVoiceError.microphonePermissionRequired }
             try await start(mode: mode)
             setupRequested = false
-        } catch { self.error = error.localizedDescription }
+        } catch { recordStartFailure(error) }
     }
 
     func start(mode: ClemRecordingMode) async throws {
@@ -175,9 +317,13 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
             setupRequested = true; throw WidgetVoiceError.pendingDraft
         }
         let admissionEpoch = epoch
-        guard let transport, await transport.isProvisioned else { setupRequested = true; throw WidgetVoiceError.setupRequired }
+        guard let transport, await transport.isProvisioned else {
+            connected = false; note(.setup, issue: .unauthorized)
+            setupRequested = true; throw WidgetVoiceError.setupRequired
+        }
         try requireCurrent(admissionEpoch)
         guard AVAudioSession.sharedInstance().recordPermission == .granted else {
+            note(.microphone, issue: .microphoneDenied)
             setupRequested = true; throw WidgetVoiceError.microphonePermissionRequired
         }
         if recorder.liveActivityActive { await recorder.endActivity(); try requireCurrent(admissionEpoch) }
@@ -185,14 +331,27 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
         saved?.sessionId = nil; try persist()
         voiceEnabled = mode == .voice
         recordingFingerprint = boundFingerprint
+        note(.starting)
         try await recorder.start(mode: mode)
+        note(.recording)
         status = mode == .voice ? "Listening · pause to send" : "Listening · finish when you’re ready"
     }
 
     func finish() async throws { _ = try await recorder.finish() }
 
     func startFromSheet(mode: ClemRecordingMode) async {
-        do { try await start(mode: mode) } catch { self.error = error.localizedDescription }
+        do { try await start(mode: mode) } catch { recordStartFailure(error) }
+    }
+
+    func recordStartFailure(_ failure: Error) {
+        setupRequested = true
+        if case WidgetVoiceError.microphonePermissionRequired = failure {
+            error = WidgetVoiceRecoveryIssue.microphoneDenied.message; note(.microphone, issue: .microphoneDenied)
+        } else if failure is WidgetVoiceError { error = failure.localizedDescription }
+        else {
+            let issue = WidgetVoiceRecoveryIssue.classify(failure)
+            error = issue.message; note(.starting, issue: issue)
+        }
     }
 
     func finishFromSheet() async {
@@ -211,6 +370,7 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
     /// Revoke synchronously at the explicit signout/unpair boundary. Cleanup
     /// captures old files and never resets a newly established pairing later.
     func beginClear() {
+        provisioningGeneration = UUID()
         NativeVoiceTransport.clearAllCredentials()
         let recordingID = recorder.completedRecording?.id
         let recordingPath = saved?.recordingPath
@@ -218,6 +378,7 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
         stopPlayback(); endBackgroundTime()
         WidgetVoiceStateStore.clear(); transport = nil; boundFingerprint = nil; recordingFingerprint = nil
         saved = nil; draft = ""; reply = ""; sessionId = nil; connected = false
+        diagnostic = nil; WidgetVoiceDiagnosticStore.save(nil)
         setupRequested = false; working = false; error = nil; status = "Ready when you are"
         resettingPairing = true
         Task {
@@ -307,7 +468,7 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
             guard let self else { return }
             do {
                 try self.requireCurrent(token)
-                self.status = "Transcribing…"; self.beginBackgroundTime()
+                self.status = "Transcribing…"; self.note(.transcribing); self.beginBackgroundTime()
                 let data = try Data(contentsOf: url)
                 let result = try await self.json(path: "/m/api/chat/transcribe", method: "POST", body: data, contentType: "audio/wav")
                 try self.requireCurrent(token); try self.requireOK(result.0)
@@ -319,7 +480,7 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
                 self.recorder.acknowledgeCompleted(id: id)
                 try? FileManager.default.removeItem(at: url)
                 if mode == .dictate || !self.voiceEnabled {
-                    self.working = false; self.status = "Draft ready · open Clem to review"
+                    self.working = false; self.status = "Draft ready · open Clem to review"; self.note(.ready)
                     await self.recorder.updatePhase(phase: .ready, message: "Draft ready · tap to review")
                     self.endBackgroundTime()
                 } else { try await self.submit(text: words, token: token, speak: true) }
@@ -336,7 +497,7 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
             saved?.requestedSessionId = previousSession; saved?.requestedVoice = speak
         }
         saved?.requestId = requestId; saved?.requestedText = text; try persist()
-        working = true; status = "Sending to Clem…"; beginBackgroundTime()
+        working = true; status = "Sending to Clem…"; note(.sending); beginBackgroundTime()
         var body: [String: Any] = ["message": text, "async": true, "voice": saved?.requestedVoice == true, "requireIdle": true]
         if let sessionId = saved?.requestedSessionId { body["sessionId"] = sessionId }
         let result = try await json(path: "/m/api/chat/send", method: "POST", body: JSONSerialization.data(withJSONObject: body), idempotencyKey: requestId)
@@ -361,6 +522,7 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
     private func observe(requestId: String, token: UUID, speak: Bool) async throws {
         try requireCurrent(token)
         status = "Clem is working…"
+        note(.waiting)
         if recorder.liveActivityActive { await recorder.updatePhase(phase: .processing, message: status) }
         try requireCurrent(token)
         let deadline = Date().addingTimeInterval(180)
@@ -401,6 +563,7 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
     private func say(_ text: String, token: UUID) async throws {
         try requireCurrent(token)
         status = "Clem is speaking…"
+        note(.speaking)
         await recorder.updatePhase(phase: .speaking, message: status)
         try requireCurrent(token)
         guard let transport else { throw WidgetVoiceError.setupRequired }
@@ -430,10 +593,16 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
     private func json(path: String, method: String = "GET", body: Data? = nil, contentType: String = "application/json", idempotencyKey: String? = nil) async throws -> (Int, [String: Any]) {
         guard let transport else { throw WidgetVoiceError.setupRequired }
         let response = try await transport.request(path: path, method: method, body: body, contentType: contentType, idempotencyKey: idempotencyKey)
+        if WidgetVoiceRecoveryIssue.httpStatus(response.status) != nil { try requireOK(response.status) }
         guard let object = try JSONSerialization.jsonObject(with: response.body) as? [String: Any] else { throw WidgetVoiceError.unavailable("Clem’s connection returned an unreadable reply. Open Clem to reconnect.") }
         return (response.status, object)
     }
     private func requireOK(_ status: Int) throws {
+        if let issue = WidgetVoiceRecoveryIssue.httpStatus(status) {
+            connected = WidgetVoiceRecoveryPolicy.connectionUsable(connected, after: issue)
+            error = issue.message; note(diagnostic?.stage ?? .setup, issue: issue)
+            throw NativeVoiceTransportError.unauthorized
+        }
         guard (200..<300).contains(status) else { throw WidgetVoiceError.unavailable(status == 401 || status == 403 ? "Open Clem to reconnect widget voice." : "Clem could not complete that step. Your draft or request is saved; open Clem to continue.") }
     }
     private func requireCurrent(_ token: UUID) throws {
@@ -443,8 +612,15 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
     private func failed(_ failure: Error, token: UUID) async {
         guard token == epoch else { return }
         voiceEnabled = false; working = false; stopPlayback(); endBackgroundTime()
-        error = failure.localizedDescription; status = "Open Clem to continue"
+        let issue = WidgetVoiceRecoveryIssue.classify(failure)
+        connected = WidgetVoiceRecoveryPolicy.connectionUsable(connected, after: issue)
+        error = failure is WidgetVoiceError ? failure.localizedDescription : issue.message
+        note(diagnostic?.stage ?? .setup, issue: issue); status = "Open Clem to continue"
         if recorder.liveActivityActive { await recorder.updatePhase(phase: .failed, message: "Open Clem to continue") }
+    }
+    private func note(_ stage: WidgetVoiceDiagnostic.Stage, issue: WidgetVoiceRecoveryIssue? = nil) {
+        let value = WidgetVoiceDiagnostic(stage: stage, issue: issue, updatedAt: Date())
+        diagnostic = value; WidgetVoiceDiagnosticStore.save(value)
     }
     private func beginBackgroundTime() {
         guard backgroundTask == .invalid else { return }

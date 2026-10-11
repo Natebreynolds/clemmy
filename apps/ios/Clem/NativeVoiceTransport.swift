@@ -9,6 +9,10 @@ struct NativeVoiceProvisioningRequest: Sendable, Encodable {
     var dictionary: [String: Any] { ["requestId": requestId, "publicKeyJwk": publicKeyJwk] }
 }
 
+enum NativeVoiceProvisioningOutcome: Sendable, Equatable {
+    case accepted, obsolete
+}
+
 struct NativeVoiceHTTPResponse: Sendable {
     let status: Int
     let headers: [String: String]
@@ -16,7 +20,7 @@ struct NativeVoiceHTTPResponse: Sendable {
 }
 
 enum NativeVoiceTransportError: LocalizedError, Equatable {
-    case setup, unpaired, unauthorized, correlation, invalidRequest, invalidResponse, oversized, redirect, busy, pin, timeout
+    case setup, unpaired, unauthorized, correlation, invalidRequest, invalidResponse, oversized, redirect, busy, pin, timeout, unreachable, unavailable
     var errorDescription: String? {
         switch self {
         case .setup: return "Native voice could not save its secure connection. Open Clem and try again."
@@ -29,6 +33,8 @@ enum NativeVoiceTransportError: LocalizedError, Equatable {
         case .busy: return "The previous voice request is still finishing."
         case .pin: return "This Mac’s security fingerprint no longer matches your pairing."
         case .timeout: return "The Mac did not answer. Check its connection and try again."
+        case .unreachable: return "Clem could not reach your Mac. Check its connection and try again."
+        case .unavailable: return "Your Mac could not prepare widget voice. Reload Clem and try again."
         }
     }
 }
@@ -77,12 +83,24 @@ actor NativeVoiceTransport {
 
     /// Call only for the trusted paired main-frame bridge. Exact request and
     /// key receipts prevent a late page response replacing a new pairing.
-    func acceptProvisioning(_ body: [String: Any]) throws {
+    @discardableResult
+    func acceptProvisioning(_ body: [String: Any]) throws -> NativeVoiceProvisioningOutcome {
         let epoch = NativeVoiceCredentialStore.generation
+        guard let requestID = body["requestId"] as? String, nativeValidSecret(requestID) else {
+            throw NativeVoiceTransportError.correlation
+        }
         guard let stored = NativeVoiceCredentialStore.load(account),
               stored.pairingFingerprint == pairing.fingerprint,
-              body["requestId"] as? String == stored.requestId,
-              body["ok"] as? Bool == true,
+              requestID == stored.requestId else {
+            // Reconnect replaces the pending request before the old page's
+            // asynchronous receipt necessarily arrives. Neither old success
+            // nor old failure may change the newer connection's UI state.
+            return .obsolete
+        }
+        if body["ok"] as? Bool == false {
+            throw NativeVoiceProvisioningFailure.error(reason: body["reason"] as? String)
+        }
+        guard body["ok"] as? Bool == true,
               body["keyThumbprint"] as? String == stored.keyThumbprint,
               let key = NativeVoiceCredentialStore.key(account, create: false),
               try nativeKeyThumbprint(nativePublicJwk(key)) == stored.keyThumbprint,
@@ -97,11 +115,12 @@ actor NativeVoiceTransport {
             // A duplicate initial receipt cannot roll a rotated credential
             // back to the token that the server has already retired.
             guard current.token == token else { throw NativeVoiceTransportError.correlation }
-            return
+            return .accepted
         }
         try NativeVoiceCredentialStore.save(NativeVoiceStoredCredential(pairingFingerprint: stored.pairingFingerprint,
             requestId: stored.requestId, keyThumbprint: stored.keyThumbprint,
             credential: .init(token: token, deviceId: deviceId, expiresAt: expiresAt)), account: account, expectedGeneration: epoch)
+        return .accepted
     }
 
     func clearCredentials() { NativeVoiceCredentialStore.remove(account) }
@@ -124,7 +143,11 @@ actor NativeVoiceTransport {
         requestInFlight = true
         defer { requestInFlight = false }
         var lastError: Error = NativeVoiceTransportError.unpaired
-        for origin in pairing.candidateOrigins {
+        // Bonjour and relay discovery can update the doors while the process
+        // stays alive. Reuse only doors for this exact paired certificate;
+        // never carry this credential to a newly paired Mac.
+        let origins = NativeVoiceOriginSelection.candidates(bound: pairing, current: PairingStore.load())
+        for origin in origins {
             try Task.checkCancellation()
             guard epoch == NativeVoiceCredentialStore.generation else { throw NativeVoiceTransportError.unauthorized }
             guard let url = URLComponents(string: origin), url.scheme == "https", let host = url.host,
@@ -166,6 +189,26 @@ actor NativeVoiceTransport {
             return response
         }
         throw lastError
+    }
+}
+
+enum NativeVoiceProvisioningFailure {
+    static func error(reason: String?) -> NativeVoiceTransportError {
+        switch reason {
+        case "timeout": return .timeout
+        case "offline": return .unreachable
+        case "unauthorized": return .unauthorized
+        case "unavailable": return .unavailable
+        default: return .invalidResponse
+        }
+    }
+}
+
+enum NativeVoiceOriginSelection {
+    static func candidates(bound: Pairing, current: Pairing?) -> [String] {
+        guard let current, let fingerprint = bound.fingerprint, !fingerprint.isEmpty,
+              current.fingerprint == fingerprint else { return [] }
+        return current.candidateOrigins
     }
 }
 
