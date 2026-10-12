@@ -58,7 +58,7 @@ export function VoiceModeControl(props: VoiceModeControlProps) {
         {state.enabled ? 'End voice' : 'Talk to Clem'}
       </button>
       <span class="voice-mode-status" role="status" aria-live="polite">
-        {state.enabled ? phaseLabels[state.phase] : blocked ? props.disabledHint || 'Available when this turn finishes' : ''}
+        {state.enabled ? state.engine === 'live' && state.phase === 'listening' ? 'Listening · just talk' : phaseLabels[state.phase] : blocked ? props.disabledHint || 'Available when this turn finishes' : ''}
       </span>
     </div>
     {state.error && <div class="voice-mode-error" role="alert">{state.error}</div>}

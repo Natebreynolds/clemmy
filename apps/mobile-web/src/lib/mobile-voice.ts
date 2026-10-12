@@ -2,11 +2,17 @@ import { speakVoice, transcribeVoice } from './api';
 import { StreamingPcmResampler, float32ToPcm16, pcm16Seconds, pcm16ToWav } from './pcm';
 import { microphoneProblem } from './dictation-support';
 import { spokenWords, voiceTurnEnded, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage, type VoiceUtterance } from './voice-turns';
+import { liveSpokenText, type LiveHistoryMessage, type LiveVoiceHandlers, type LiveVoiceLink } from '@clem/chat-engine';
+import { PhoneLiveVoice, phoneLiveVoiceAvailable } from './live-voice';
 
 export type { VoiceChatMessage } from './voice-turns';
 export type VoiceSpeech = Blob | { text: string; fallback: 'system' };
 export type MobileVoicePhase = 'off' | 'starting' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
-export interface MobileVoiceState { enabled: boolean; phase: MobileVoicePhase; heard: string; error: string }
+export interface MobileVoiceState {
+  enabled: boolean; phase: MobileVoicePhase; heard: string; error: string;
+  /** 'live' for a full-duplex conversation, 'standard' for turn by turn. */
+  engine: 'live' | 'standard' | null;
+}
 export interface MobileVoiceConversation {
   scope: string;
   messages: readonly VoiceChatMessage[];
@@ -26,18 +32,32 @@ export interface MobileVoiceDependencies {
   createAudio: (onError: (error: unknown) => void) => MobileVoiceAudio;
   transcribe: (wav: Blob, signal: AbortSignal) => Promise<string>;
   speak: (text: string, signal: AbortSignal) => Promise<VoiceSpeech>;
+  /** A full-duplex conversation, when the Mac can hold one. */
+  live?: { available: () => Promise<boolean>; create: (handlers: LiveVoiceHandlers) => LiveVoiceLink };
 }
 const defaultDependencies: MobileVoiceDependencies = {
   createAudio: onError => new BrowserVoiceAudio(onError),
   transcribe: async (wav, signal) => (await transcribeVoice(wav, signal)).text,
   speak: speakVoice,
+  live: { available: phoneLiveVoiceAvailable, create: handlers => new PhoneLiveVoice(handlers) },
+};
+/** A live conversation nobody is using ends; it is billed while it runs. */
+const LIVE_IDLE_MS = 180_000;
+const LIVE_END_WORDS: Record<string, string> = {
+  expired: 'Live voice reached its time limit. Tap Talk to Clem to start again.',
+  content: 'Live voice was ended by the voice service.',
+  remote_hangup: 'Live voice was disconnected. Tap Talk to Clem to start again.',
+  connection_lost: 'Live voice lost its connection. Tap Talk to Clem to start again.',
 };
 const errorWords = (error: unknown) => error instanceof Error ? error.message : 'Voice stopped. Tap Talk to Clem to try again.';
 
-/** One foreground conversation, one half-duplex loop. Stop cancels capture,
- * transcription and playback, but never pretends to cancel an admitted chat. */
+/** One foreground conversation. Live when the Mac can hold one: the voice
+ * listens and talks at once and every request it hears is sent as the owner's
+ * spoken turn, so Clem's brain answers and her words go back to be said.
+ * Otherwise one half-duplex loop. Stop cancels capture, transcription and
+ * playback, but never pretends to cancel an admitted chat. */
 export class MobileVoiceController {
-  private state: MobileVoiceState = { enabled: false, phase: 'off', heard: '', error: '' };
+  private state: MobileVoiceState = { enabled: false, phase: 'off', heard: '', error: '', engine: null };
   private listeners = new Set<() => void>();
   private conversation: MobileVoiceConversation | null = null;
   private generation = 0;
@@ -52,6 +72,16 @@ export class MobileVoiceController {
   private heard = new Map<string, string>();
   private queue: VoiceUtterance[] = [];
   private activeUtterance: VoiceUtterance | null = null;
+  /** Learned before the tap, so the tap itself starts the right voice. */
+  private liveAvailable: boolean | null = null;
+  private liveChecking = false;
+  private live: LiveVoiceLink | null = null;
+  /** The voice's request that the awaited turn answers. */
+  private liveRequestId: string | null = null;
+  /** A request heard while Clem was still working goes once she finishes. */
+  private heldRequest: { id: string; words: string } | null = null;
+  private liveSending = false;
+  private liveIdle: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly deps: MobileVoiceDependencies = defaultDependencies) {}
   getSnapshot = (): MobileVoiceState => this.state;
@@ -63,12 +93,14 @@ export class MobileVoiceController {
   observe(conversation: MobileVoiceConversation): void {
     if (this.conversation && this.conversation.scope !== conversation.scope) this.stop();
     this.conversation = { ...conversation };
+    this.learnLive();
     if (!this.state.enabled) return;
     if (this.awaitingTurn && !conversation.busy && conversation.messages.slice(this.turnFrom)
       .some(message => message.role === 'assistant' && !message.checkIn && message.status === 'stopped')) {
       this.stop();
       return;
     }
+    if (this.state.engine === 'live') { this.relayToLive(conversation); return; }
     this.queue = this.queue.filter(utterance => {
       if (voiceUtteranceCurrent(utterance, conversation.messages)) return true;
       this.heard.delete(utterance.key);
@@ -95,7 +127,8 @@ export class MobileVoiceController {
     const generation = ++this.generation;
     this.baseline = new Set(this.conversation.messages.map(message => message.id));
     this.heard.clear(); this.queue = []; this.awaitingTurn = false;
-    this.update({ enabled: true, phase: 'starting', heard: '', error: '' });
+    if (this.deps.live && this.liveAvailable) { this.startLive(generation); return; }
+    this.update({ enabled: true, phase: 'starting', heard: '', error: '', engine: 'standard' });
     if (!this.current(generation)) return;
     try {
       const audio = this.deps.createAudio(error => { if (this.current(generation)) this.fail(error); });
@@ -112,10 +145,132 @@ export class MobileVoiceController {
     this.closeMic();
     this.operation?.abort(); this.operation = null;
     this.audio?.close(); this.audio = null;
+    const live = this.live;
+    this.live = null; this.liveRequestId = null; this.heldRequest = null; this.liveSending = false;
+    if (this.liveIdle) { clearTimeout(this.liveIdle); this.liveIdle = null; }
+    live?.close();
     this.unlocked = false; this.processing = false; this.awaitingTurn = false; this.queue = []; this.activeUtterance = null;
-    this.update({ enabled: false, phase: 'off' });
+    this.update({ enabled: false, phase: 'off', engine: null });
   }
   private current(generation: number): boolean { return this.state.enabled && this.generation === generation; }
+
+  private learnLive(): void {
+    if (this.liveAvailable !== null || this.liveChecking || !this.deps.live) return;
+    this.liveChecking = true;
+    void this.deps.live.available().then(available => { this.liveAvailable = available; }, () => { this.liveAvailable = false; })
+      .finally(() => { this.liveChecking = false; });
+  }
+
+  private startLive(generation: number): void {
+    this.update({ enabled: true, phase: 'starting', heard: '', error: '', engine: 'live' });
+    const link: LiveVoiceLink = this.deps.live!.create({
+      onLive: () => { if (this.live === link) { this.update({ phase: this.awaitingTurn ? 'thinking' : 'listening' }); this.armLiveIdle(); } },
+      onRequest: ({ id, words }) => { if (this.live === link) this.liveRequest(link, id, words, generation); },
+      onSpeaking: (speaking) => {
+        if (this.live !== link) return;
+        this.armLiveIdle();
+        this.update({ phase: speaking ? 'speaking' : this.awaitingTurn ? 'thinking' : 'listening' });
+      },
+      onHearing: () => { if (this.live === link) this.armLiveIdle(); },
+      onClosed: (reason, expected) => {
+        if (this.live !== link) return;
+        this.live = null;
+        if (expected || !this.state.enabled) return;
+        this.stop();
+        this.update({ error: LIVE_END_WORDS[reason] ?? 'Live voice ended. Tap Talk to Clem to start again.' });
+      },
+      onError: (message) => { if (this.live === link) console.warn('live voice:', message); },
+    });
+    this.live = link;
+    link.start(liveHistory(this.conversation?.messages ?? [])).catch((error: unknown) => {
+      if (this.live !== link || !this.current(generation)) return;
+      this.live = null;
+      // The next tap talks turn by turn; this one says why live voice did not start.
+      this.liveAvailable = false;
+      this.fail(new Error(`Live voice could not start: ${errorWords(error)} Tap Talk to Clem to talk turn by turn.`));
+    });
+  }
+
+  /** The voice asked Clem for something: the owner's words become their turn,
+   *  or wait for the turn Clem is still working on. */
+  private liveRequest(link: LiveVoiceLink, id: string, heard: string, generation: number): void {
+    const words = spokenWords(heard);
+    if (!words) { link.direct('The owner\'s last request was not heard clearly. Ask them to say it again.'); return; }
+    if (this.heldRequest || this.liveSending || this.conversation?.busy) {
+      if (this.heldRequest) {
+        this.heldRequest.words = `${this.heldRequest.words} ${words}`;
+        link.note('This joins the request waiting for Clem; she answers it there.', id);
+      } else {
+        this.heldRequest = { id, words };
+        link.note('Clem is still finishing the previous request; this one goes to her as soon as she does.', id);
+      }
+      return;
+    }
+    void this.sendLive(link, id, words, generation);
+  }
+
+  private async sendLive(link: LiveVoiceLink, id: string, words: string, generation: number): Promise<void> {
+    const conversation = this.conversation;
+    if (!conversation) return;
+    this.liveSending = true;
+    this.turnFrom = conversation.messages.length;
+    this.awaitingTurn = true;
+    this.liveRequestId = id;
+    this.update({ heard: words, ...(this.state.phase === 'speaking' ? {} : { phase: 'thinking' as const }) });
+    try {
+      await conversation.onSend(words, () => this.current(generation) && this.live === link && this.conversation?.scope === conversation.scope);
+    } catch (error) {
+      if (!this.current(generation) || this.live !== link) return;
+      this.awaitingTurn = false;
+      this.liveRequestId = null;
+      if (this.state.phase === 'thinking') this.update({ phase: 'listening' });
+      link.direct(`That request did not reach Clem: ${errorWords(error)} Tell the owner briefly.`);
+    } finally {
+      if (this.current(generation) && this.live === link) {
+        this.liveSending = false;
+        this.sendHeld(link, generation);
+      }
+    }
+  }
+
+  private sendHeld(link: LiveVoiceLink, generation: number): void {
+    const held = this.heldRequest;
+    if (!held || this.liveSending || this.conversation?.busy) return;
+    this.heldRequest = null;
+    void this.sendLive(link, held.id, held.words, generation);
+  }
+
+  /** What Clem newly said goes to the voice, tied to the request it answers. */
+  private relayToLive(conversation: MobileVoiceConversation): void {
+    const link = this.live;
+    const requestId = this.awaitingTurn ? this.liveRequestId : null;
+    for (const utterance of voiceUtterances(conversation.messages, this.heard, this.baseline)) {
+      this.heard.set(utterance.key, utterance.text);
+      const words = liveSpokenText(utterance.text);
+      if (!link || !words) continue;
+      if (utterance.kind === 'progress') link.note(`Clem's progress: ${words}`, requestId);
+      else link.say(words, requestId);
+      this.armLiveIdle();
+    }
+    if (this.awaitingTurn && !conversation.busy && voiceTurnEnded(conversation.messages, this.turnFrom)) {
+      this.awaitingTurn = false;
+      this.liveRequestId = null;
+      if (this.state.phase === 'thinking') this.update({ phase: 'listening' });
+    }
+    if (link && !conversation.busy) this.sendHeld(link, this.generation);
+  }
+
+  /** A live conversation with nothing said and nothing running ends. */
+  private armLiveIdle(): void {
+    if (this.liveIdle) clearTimeout(this.liveIdle);
+    this.liveIdle = setTimeout(() => {
+      this.liveIdle = null;
+      if (!this.live) return;
+      if (this.awaitingTurn || this.heldRequest) { this.armLiveIdle(); return; }
+      this.stop();
+      this.update({ error: 'Live voice ended after a few quiet minutes.' });
+    }, LIVE_IDLE_MS);
+  }
   private fail(error: unknown): void { this.stop(); this.update({ error: errorWords(error) }); }
   private closeMic(): void { this.capture?.abort(); this.capture = null; this.audio?.stopListening(); }
   private update(patch: Partial<MobileVoiceState>): void {
@@ -191,6 +346,15 @@ export class MobileVoiceController {
       }
     }
   }
+}
+
+/** The recent conversation the voice starts with. */
+function liveHistory(messages: readonly VoiceChatMessage[]): LiveHistoryMessage[] {
+  return messages
+    .filter(message => !message.checkIn)
+    .map(message => ({ role: message.role, text: message.text?.trim() || message.approval?.preview?.ask?.trim() || '' }))
+    .filter(message => message.text)
+    .slice(-24);
 }
 
 /** Bounded audio with a short pre-roll. Quiet rooms never accumulate minutes

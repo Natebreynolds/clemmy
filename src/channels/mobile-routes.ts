@@ -47,6 +47,7 @@ import express from 'express';
 import { containAsyncRouteRejections } from './contain-async-route-rejections.js';
 import { Readable } from 'node:stream';
 import { requestSpeech, spokenReplyText } from '../dashboard/voice-speech.js';
+import { createLiveVoiceSession, liveVoiceStatus } from '../dashboard/live-voice.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import path from 'node:path';
@@ -881,6 +882,7 @@ export interface MobileRouterDeps {
   };
   /** Provider-free speech route tests. Production shares desktop's speech service. */
   voiceSpeechRuntime?: { requestSpeech: typeof requestSpeech };
+  liveVoiceRuntime?: { status: typeof liveVoiceStatus; createSession: typeof createLiveVoiceSession };
   /**
    * Optional override for the built PWA assets directory. When unset,
    * the router probes the usual candidate paths (apps/mobile-web/dist
@@ -3886,6 +3888,32 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     } catch {
       if (!controller.signal.aborted && !res.headersSent) res.status(502).json({ error: 'Clem’s voice could not connect. Try voice mode again.' });
     }
+  });
+
+  // Live voice on the phone: the same exchange as the desktop's. The phone's
+  // offer becomes a session here, so the key never reaches the phone; audio
+  // then flows between the phone and the voice service.
+  router.get('/api/voice/live', requireMobileSession, (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json((deps.liveVoiceRuntime?.status ?? liveVoiceStatus)());
+  });
+  router.post('/api/voice/live-session', requireMobileSession, express.json({ limit: '256kb' }), async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const controller = new AbortController();
+    res.on('close', () => { if (!res.writableFinished) controller.abort(); });
+    const body = req.body && typeof req.body === 'object' ? req.body as { sdp?: unknown; history?: unknown } : {};
+    let started: Awaited<ReturnType<typeof createLiveVoiceSession>>;
+    try {
+      started = await (deps.liveVoiceRuntime?.createSession ?? createLiveVoiceSession)(
+        { sdp: body.sdp, history: body.history }, controller.signal);
+    } catch (error) {
+      // A failed session is an answer for the device, never a daemon exit.
+      if (!res.headersSent) res.status(500).json({ error: error instanceof Error ? error.message : 'Live voice could not start.', code: 'LIVE_VOICE_FAILED' });
+      return;
+    }
+    if (controller.signal.aborted || res.headersSent) return;
+    if (!started.ok) { res.status(started.status).json({ error: started.error, code: started.code }); return; }
+    res.status(201).json({ sessionId: started.sessionId, sdp: started.sdp });
   });
 
   router.post('/api/chat/attach', requireMobileSession, express.raw({ type: '*/*', limit: '30mb' }), async (req, res) => {

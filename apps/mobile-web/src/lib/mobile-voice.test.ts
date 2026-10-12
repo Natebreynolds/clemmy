@@ -430,3 +430,63 @@ test('started system speech waits for its actual end and abort cancels it', asyn
   const rejected = assert.rejects(stopped, { name: 'AbortError' }); operation.abort(); await rejected;
   assert.equal(f.cancelled(), 1); f.audio.close();
 });
+
+class FakeLive {
+  started = 0;
+  said: Array<[string, string | null]> = [];
+  notes: Array<[string, string | null]> = [];
+  directions: string[] = [];
+  closes = 0;
+  constructor(readonly handlers: import('@clem/chat-engine').LiveVoiceHandlers, private readonly failure: Error | null) {}
+  async start(): Promise<void> { this.started++; if (this.failure) throw this.failure; }
+  say(text: string, id: string | null): void { this.said.push([text, id]); }
+  note(text: string, id: string | null): void { this.notes.push([text, id]); }
+  direct(text: string): void { this.directions.push(text); }
+  close(): void { this.closes++; }
+}
+
+function liveFixture(failure: Error | null = null) {
+  const links: FakeLive[] = [];
+  const f = fixture({ live: { available: async () => true, create: handlers => { const link = new FakeLive(handlers, failure); links.push(link); return link; } } });
+  return { ...f, links };
+}
+
+test('phone live voice: the tap starts a live conversation and each request becomes the owner\'s turn', async () => {
+  const f = liveFixture();
+  await settle();
+  void f.controller.start();
+  assert.equal(f.links.length, 1);
+  assert.deepEqual(f.audio.events, [], 'the turn-by-turn audio is never opened');
+  assert.equal(f.controller.getSnapshot().engine, 'live');
+  const link = f.links[0];
+  link.handlers.onLive();
+  assert.equal(f.controller.getSnapshot().phase, 'listening');
+  link.handlers.onRequest({ id: 'item_1', words: ' Add milk to my list ' });
+  await settle();
+  assert.deepEqual(f.sent, ['Add milk to my list']);
+  f.observe({ busy: true, messages: [...f.conversation.messages, { id: 'u1', role: 'user', text: 'Add milk to my list' }, reply('a1', 'Adding it.', 'thinking')] });
+  // Heard while Clem works: it waits for her, and the voice is told so.
+  link.handlers.onRequest({ id: 'item_2', words: 'and eggs' });
+  assert.deepEqual(f.sent, ['Add milk to my list']);
+  assert.equal(link.notes.at(-1)![1], 'item_2');
+  f.observe({ busy: false, messages: [...f.conversation.messages.slice(0, -1), reply('a1', '**Added** milk.')] });
+  await settle();
+  assert.deepEqual(link.said, [['Adding it.', 'item_1'], ['Added milk.', 'item_1']]);
+  assert.deepEqual(f.sent, ['Add milk to my list', 'and eggs'], 'the held request goes once she finishes');
+  f.controller.stop();
+  assert.equal(link.closes, 1);
+  assert.equal(f.controller.getSnapshot().engine, null);
+});
+
+test('phone live voice: a failed start says why and the next tap talks turn by turn', async () => {
+  const f = liveFixture(new Error('No microphone.'));
+  await settle();
+  void f.controller.start();
+  await settle(); await settle();
+  const state = f.controller.getSnapshot();
+  assert.equal(state.enabled, false);
+  assert.match(state.error, /Live voice could not start: No microphone\./);
+  void f.controller.start();
+  assert.equal(f.audio.events[0], 'unlock');
+  assert.equal(f.links.length, 1);
+});
