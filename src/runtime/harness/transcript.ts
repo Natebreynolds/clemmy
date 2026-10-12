@@ -15,6 +15,7 @@ import {
   isPublicRunFailureText,
   publicCompletionText,
   publicPresentationText,
+  publicTerminalFacts,
   publicReplyText,
   publicUserInputText,
   ownerBubbleText,
@@ -142,7 +143,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
     event: (typeof events)[number];
     userText: string;
   };
-  type AssistantTurn = { seq: number; text: string; createdAt: string; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string };
+  type AssistantTurn = { seq: number; text: string; createdAt: string; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string; terminal?: Record<string, unknown> };
   type Unit = { order: number; turns: UnifiedSessionTurn[] };
   const sourceKey = (ownerSessionId: string, seq: number): string => `${ownerSessionId}:${seq}`;
   const positiveSeq = (value: unknown): number | null => (
@@ -271,6 +272,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
         planProposalId: planProposalIdFrom(event.data),
         planArtifactRef: publicPlanArtifactRef(event.data.planArtifactRef),
         ...(presentation.kind === 'approval' && presentation.approvalId ? { pausedOnApprovalId: presentation.approvalId } : {}),
+        terminal: publicTerminalFacts(event.data, event.sessionId),
       });
     }
   }
@@ -408,6 +410,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
             planProposalId: assistant.planProposalId,
             ...(assistant.planArtifactRef || publishedPlan ? { planArtifactRef: assistant.planArtifactRef ?? publishedPlan!.ref } : {}),
             ...(assistant.pausedOnApprovalId ? { pausedOnApprovalId: assistant.pausedOnApprovalId } : {}),
+            ...(assistant.terminal ? { terminal: assistant.terminal } : {}),
           }),
         ]),
       });

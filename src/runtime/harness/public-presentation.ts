@@ -823,6 +823,25 @@ function completionSourceKey(event: EventRow): string | null {
   return sourceUserSeq === null ? null : `${event.sessionId}:${sourceUserSeq}`;
 }
 
+/**
+ * The typed facts a reopened reply needs to read as it did live: how it
+ * ended, the review ruling and finding, what was kept, and any app notice.
+ * Drawn from the same projection as live delivery, so a reopened reply shows
+ * the same status line, pill and chip, never a sentence written for Clem.
+ */
+export function publicTerminalFacts(data: Record<string, unknown>, eventSessionId: string): Record<string, unknown> {
+  const projected = terminalData(data, eventSessionId);
+  const presentation = projected.presentation && typeof projected.presentation === 'object'
+    ? projected.presentation as Record<string, unknown> : {};
+  const outcome = projected.turnOutcome && typeof projected.turnOutcome === 'object'
+    ? projected.turnOutcome as Record<string, unknown> : null;
+  return {
+    presentation: { status: presentation.status, kind: presentation.kind },
+    ...(outcome ? { turnOutcome: selected(outcome, ['status', 'resumable', 'needs']) } : {}),
+    ...selected(projected, ['review', 'reviewNote', 'retained', 'notice']),
+  };
+}
+
 function terminalData(data: Record<string, unknown>, eventSessionId: string): Record<string, unknown> {
   let typedPresentation: ReturnType<typeof presentationEventFromCompletionData> = null;
   try {

@@ -189,6 +189,9 @@ export interface UnifiedSessionTurn {
   checkIn?: boolean;
   /** Something Clem raised on her own (From Clem), not a reply to a turn. */
   fromClem?: boolean;
+  /** A reply's typed terminal facts (how it ended, review ruling, what was
+   *  kept, any app notice), so a reopened reply reads as it did live. */
+  terminal?: Record<string, unknown>;
   /** Who this exchange was answered by: a saved agent's name, null for Clem
    *  without an agent. Absent when the turn left no route marker. */
   agentName?: string | null;

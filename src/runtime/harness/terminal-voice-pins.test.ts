@@ -193,6 +193,13 @@ test('a terminal carrying the retained header projects to exactly its head on ev
   // Transcript reopen and the model-history transcript.
   const reopened = reconstructHarnessTranscript(sessionId).filter(turn => turn.role === 'assistant');
   assert.deepEqual(reopened.map(turn => turn.text), [head]);
+  // A reopened reply carries the same typed facts as live delivery, so the
+  // desktop draws its pill and status line instead of a plain bubble.
+  const reopenedTerminal = reopened[0]!.terminal as Record<string, unknown>;
+  assert.deepEqual(reopenedTerminal.presentation, { status: 'cancelled', kind: 'stopped' });
+  assert.deepEqual(reopenedTerminal.notice, { code: 'stopped' });
+  assert.deepEqual(reopenedTerminal.retained, { results: 3, outsideChange: 'refused' });
+  assert.equal((reopenedTerminal.turnOutcome as { status: string }).status, 'cancelled');
   const prior = pullRecentTurnsForSession(openEventLog(), sessionId, 10);
   assert.equal(prior.at(-1)?.text, head);
   for (const text of [...reopened.map(turn => turn.text), prior.at(-1)?.text ?? '']) {
