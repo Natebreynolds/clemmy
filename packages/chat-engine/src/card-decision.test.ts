@@ -113,3 +113,21 @@ test('after a card tap, the work it resumes shows as working until Clem answers'
     assert.equal(visible.some((row) => row.role === 'user'), false, 'the tap itself is not');
   } finally { engine.dispose(); }
 });
+
+test('a card decision notice stays out of sight, but a stop of the work the tap resumed does not', () => {
+  const noticed = (code: 'card_decision' | 'stopped', status: 'done' | 'cancelled') => event(7, 'conversation_completed', {
+    sourceUserSeq: 6, reply: code === 'card_decision' ? 'Approved.' : 'Stopped.',
+    presentation: { identity: { sessionId: 'chat', sourceUserSeq: 6 }, status, kind: 'answer', text: 'App wording.', resumable: false },
+    turnOutcome: { status }, notice: { code },
+  });
+  const decided = foldTranscript([card, tap('approve'), noticed('card_decision', 'done')], 'chat')
+    .filter((row) => row.role === 'assistant' && !row.approval);
+  assert.equal(decided.length, 1);
+  assert.equal(hiddenCardDecision(decided[0]!), true);
+  const stopped = foldTranscript([card, tap('approve'), noticed('stopped', 'cancelled')], 'chat')
+    .filter((row) => row.role === 'assistant' && !row.approval);
+  assert.equal(stopped.length, 1);
+  assert.equal(hiddenCardDecision(stopped[0]!), false, 'the Cancelled pill for the resumed work stays visible');
+  assert.equal(stopped[0]!.text, '');
+  assert.equal(stopped[0]!.terminal?.notice?.code, 'stopped');
+});

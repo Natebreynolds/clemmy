@@ -291,6 +291,25 @@ test('empty or reason-only conversation completion never fabricates Done or succ
   assert.match(malformed.text, /reply didn.t come through/i);
 });
 
+// The sentences above are for legacy events only. A typed terminal is drawn as
+// its status pill, so the client never writes a reply in Clem's place there,
+// and a notice terminal's app wording is a status line, not her reply.
+test('a typed terminal with no words, or with a notice, never gets a reply written for Clem', () => {
+  const emptyTyped = terminalCompletionPresentation({ reply: '', presentation: { status: 'failed', kind: 'answer', text: '' }, turnOutcome: { status: 'failed' } }, '');
+  assert.equal(emptyTyped.status, 'failed');
+  assert.equal(emptyTyped.text, '');
+  assert.equal(emptyTyped.terminal?.status, 'failed');
+
+  const cancelled = terminalCompletionPresentation({ reason: 'cancelled', reply: '', turnOutcome: { status: 'cancelled' }, retained: { results: 2, outsideChange: 'none' } }, '');
+  assert.equal(cancelled.status, 'stopped');
+  assert.equal(cancelled.text, '');
+  assert.equal(cancelled.terminal?.retained?.results, 2);
+
+  const notice = terminalCompletionPresentation({ reply: 'No model is connected.', turnOutcome: { status: 'failed' }, notice: { code: 'no_model_connected' } }, 'Partial words');
+  assert.equal(notice.text, '');
+  assert.equal(notice.terminal?.notice?.code, 'no_model_connected');
+});
+
 test('approval buttons address the exact card and use a real reject intent', () => {
   assert.equal(chatApprovalReply('approve', 'apr-A1b2'), 'approve apr-a1b2');
   assert.equal(chatApprovalReply('reject', 'apr-c3d4'), 'reject apr-c3d4');

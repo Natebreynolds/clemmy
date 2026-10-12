@@ -9,6 +9,7 @@ export * from './reduce-activity.js';
 export * from './reduce-lifecycle.js';
 export * from './evidence-presentation.js';
 export * from './terminal-presentation.js';
+export * from './terminal-status.js';
 export * from './stream.js';
 export * from './answer-stream.js';
 export * from './engine.js';

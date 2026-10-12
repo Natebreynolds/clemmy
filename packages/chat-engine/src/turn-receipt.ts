@@ -10,18 +10,22 @@
  */
 import { MODEL_PHASE_ACTIVITY_ID } from './reduce-activity.js';
 import { externalWriteKind, type ExternalWriteKind } from './tool-labels.js';
-import type { ActivityItem, ModelRuleOffer, WorkflowCardData } from './types.js';
+import type { ActivityItem, ModelRuleOffer, TerminalFacts, WorkflowCardData } from './types.js';
 
 /** `checked` is a review that passed. `unchecked` is a turn whose reviewer
- *  never ran: it must never read as a pass. `rejected` is the last review
- *  saying no. */
-export type TurnReview = 'checked' | 'unchecked' | 'rejected';
+ *  never ran or could not rule: it must never read as a pass. `rejected` is
+ *  the last review saying no. `needs_recheck` is an answer resting on earlier
+ *  work that needs a fresh look before it is relied on. */
+export type TurnReview = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck';
 
-/** The latest verdict decides; an earlier rejection followed by a passing
- *  rewrite is a checked answer. No verdict row means no claim at all. */
+/** The host's own ruling on the terminal decides when it sent one. Otherwise
+ *  the latest verdict decides; an earlier rejection followed by a passing
+ *  rewrite is a checked answer. No ruling and no verdict row means no claim. */
 export function turnReview(
   activity: readonly Pick<ActivityItem, 'kind' | 'verdict'>[] | undefined,
+  terminal?: Pick<TerminalFacts, 'review'>,
 ): TurnReview | null {
+  if (terminal?.review) return terminal.review;
   if (!activity) return null;
   for (let i = activity.length - 1; i >= 0; i -= 1) {
     const row = activity[i];
@@ -30,6 +34,13 @@ export function turnReview(
     return row.verdict === 'unreviewed' ? 'unchecked' : 'rejected';
   }
   return null;
+}
+
+/** The reviewer's finding, for the review chip's detail only. It belongs to
+ *  the host's ruling and is never shown without it. */
+export function turnReviewNote(terminal: Pick<TerminalFacts, 'review' | 'reviewNote'> | undefined): string | undefined {
+  const note = terminal?.review ? terminal.reviewNote?.trim() : undefined;
+  return note ? note : undefined;
 }
 
 /** The display name of the model the route chose for this turn. Only a real
@@ -110,11 +121,12 @@ function helperPhrase(helper: TurnHelper): string {
  *  events. Empty when the turn named no model. */
 export function turnByline(
   activity: readonly Pick<ActivityItem, 'id' | 'kind' | 'status' | 'verdict' | 'modelName' | 'helperFor' | 'agentName'>[] | undefined,
+  terminal?: Pick<TerminalFacts, 'review'>,
 ): string {
   const worker = turnModelName(activity);
   const reviewer = turnReviewerName(activity);
   const helpers = turnHelpers(activity).map(helperPhrase);
-  const verb = turnReview(activity) === 'checked' ? 'checked' : 'reviewed';
+  const verb = turnReview(activity, terminal) === 'checked' ? 'checked' : 'reviewed';
   const parts = [
     ...(worker ? [`${worker} did the work`] : []),
     ...helpers,

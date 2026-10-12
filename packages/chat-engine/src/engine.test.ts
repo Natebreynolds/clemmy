@@ -929,3 +929,34 @@ test('a card that links a queued exact payload says so, so a surface can offer e
   assert.equal(engine.snapshot().messages.find((m) => m.approval?.approvalId === 'apr-q')?.approval?.queued, true);
   engine.dispose();
 });
+
+test('a reopened turn carries its typed facts, and a notice reopens with no reply text', () => {
+  const messages = foldTranscript([
+    ev(1, 'user_input_received', { text: 'summarize the fixtures' }),
+    ev(2, 'conversation_completed', {
+      sourceUserSeq: 1,
+      reply: 'Stopped. 1 result kept.',
+      presentation: { status: 'cancelled', kind: 'answer', text: 'Stopped. 1 result kept.' },
+      turnOutcome: { status: 'cancelled', resumable: true },
+      notice: { code: 'stopped' },
+      retained: { results: 1, outsideChange: 'none' },
+    }),
+    ev(3, 'user_input_received', { text: 'what did you write?' }),
+    ev(4, 'conversation_completed', {
+      sourceUserSeq: 3,
+      reply: 'I wrote alpha, beta and gamma.',
+      presentation: { status: 'done', kind: 'answer', text: 'I wrote alpha, beta and gamma.' },
+      turnOutcome: { status: 'done', resumable: false },
+      review: 'unchecked',
+      reviewNote: 'The reviewer could not read the file back.',
+    }),
+  ]);
+  const [stopped, answered] = messages.filter((m) => m.role === 'assistant');
+  assert.equal(stopped?.text, '');
+  assert.equal(stopped?.status, 'stopped');
+  assert.deepEqual(stopped?.terminal?.notice, { code: 'stopped' });
+  assert.deepEqual(stopped?.terminal?.retained, { results: 1, outsideChange: 'none' });
+  assert.equal(answered?.text, 'I wrote alpha, beta and gamma.');
+  assert.equal(answered?.terminal?.review, 'unchecked');
+  assert.equal(answered?.terminal?.reviewNote, 'The reviewer could not read the file back.');
+});

@@ -82,3 +82,92 @@ test('the host approval filler is not repeated as prose under its card; words th
   const foreign = terminalCompletionPresentation(approvalTerminal('Approval required for X. Review apr-other to continue.'), '');
   assert.notEqual(foreign.text, '', 'only the filler naming this presentation\'s own approval is dropped');
 });
+
+const withFacts = (status: string, extra: Record<string, unknown>, text = 'Here is the answer.') => ({
+  reply: text,
+  presentation: { version: 1, status, kind: 'answer', text },
+  turnOutcome: { version: 2, status, resumable: true },
+  ...extra,
+});
+
+test('review, review note, retained facts and notice are read from the terminal', () => {
+  const facts = terminalFactsFrom(withFacts('blocked', {
+    review: 'needs_recheck',
+    reviewNote: '  The totals rest on   last week’s export.\n',
+    retained: { results: 3, outsideChange: 'went_through' },
+    notice: { code: 'provider_out_of_credit', model: 'Vendor V4', agentName: 'Desk', providerSaid: 'Insufficient balance.' },
+  }));
+  assert.equal(facts?.review, 'needs_recheck');
+  assert.equal(facts?.reviewNote, 'The totals rest on last week’s export.');
+  assert.deepEqual(facts?.retained, { results: 3, outsideChange: 'went_through' });
+  assert.deepEqual(facts?.notice, { code: 'provider_out_of_credit', agentName: 'Desk', model: 'Vendor V4', providerSaid: 'Insufficient balance.' });
+});
+
+test('unknown review, retained and notice values are ignored, never invented', () => {
+  const facts = terminalFactsFrom(withFacts('done', {
+    review: 'approved-ish',
+    reviewNote: 'A finding with no ruling.',
+    retained: { results: 0, outsideChange: 'none' },
+    notice: { code: 'party_time', model: 'Vendor V4' },
+  }));
+  assert.deepEqual(facts, { status: 'done', kind: 'answer', resumable: true });
+  assert.equal(terminalFactsFrom(withFacts('done', { retained: { results: -2, outsideChange: 'sideways' } }))?.retained, undefined);
+  assert.deepEqual(terminalFactsFrom(withFacts('done', { retained: { results: 1.5, outsideChange: 'refused' } }))?.retained,
+    { results: 0, outsideChange: 'refused' }, 'a settled outside change survives a malformed count');
+  assert.deepEqual(terminalFactsFrom(withFacts('done', { notice: { code: 'stopped', model: 42, agentName: '  ' } }))?.notice,
+    { code: 'stopped' });
+  assert.equal(terminalFactsFrom(withFacts('done', { notice: 'stopped' }))?.notice, undefined);
+  assert.equal(terminalFactsFrom({ review: 'checked', notice: { code: 'stopped' } }), undefined,
+    'an event with no typed terminal carries no facts at all');
+});
+
+test('the review note is bounded to the contract length', () => {
+  const facts = terminalFactsFrom(withFacts('done', { review: 'rejected', reviewNote: 'x'.repeat(900) }));
+  assert.equal(facts?.reviewNote?.length, 400);
+  assert.ok(facts?.reviewNote?.endsWith('…'));
+});
+
+test('a notice terminal yields no assistant text, whatever the event or the stream carried', () => {
+  const stopped = terminalCompletionPresentation(
+    withFacts('cancelled', { notice: { code: 'stopped' }, retained: { results: 1, outsideChange: 'none' } }, 'Stopped. 1 result kept.'),
+    'Let me read the first fi',
+    'thinking',
+  );
+  assert.equal(stopped.text, '');
+  assert.equal(stopped.status, 'stopped');
+  assert.deepEqual(stopped.terminal?.notice, { code: 'stopped' });
+  assert.deepEqual(stopped.terminal?.retained, { results: 1, outsideChange: 'none' });
+
+  const credit = terminalCompletionPresentation(withFacts('failed', { notice: { code: 'provider_out_of_credit' } }, 'The model account is out of credit.'), '');
+  assert.equal(credit.text, '');
+  assert.equal(credit.status, 'failed');
+
+  const decided = terminalCompletionPresentation(withFacts('done', { notice: { code: 'card_decision' } }, 'Approved.'), '');
+  assert.equal(decided.text, '');
+  assert.equal(decided.status, 'complete');
+});
+
+// The old fallbacks put a sentence in Clem's mouth ("I reached this run's
+// current limit…") whenever a typed terminal arrived with no words. Typed
+// terminals now carry a status the surfaces draw as a pill instead.
+test('a typed terminal with no words gets its status, never a sentence written in Clem’s place', () => {
+  for (const status of ['blocked', 'failed', 'cancelled', 'transferred', 'uncertain', 'needs_input'] as const) {
+    for (const extra of [{}, { retained: { results: 2, outsideChange: 'did_not' } }]) {
+      const m = terminalCompletionPresentation(withFacts(status, extra, ''), '');
+      assert.equal(m.text, '', `${status} ${JSON.stringify(extra)}`);
+      assert.equal(m.terminal?.status, status);
+    }
+  }
+  const cancelled = terminalCompletionPresentation(withFacts('cancelled', { reason: 'cancelled' }, ''), '');
+  assert.equal(cancelled.status, 'stopped', 'the message status is decided as before');
+  const placeholder = terminalCompletionPresentation(withFacts('blocked', {}, 'Done.'), '');
+  assert.equal(placeholder.text, '', 'a bare placeholder is no words either');
+});
+
+test('a typed terminal keeps Clem’s own words, streamed or delivered', () => {
+  const streamed = terminalCompletionPresentation(withFacts('blocked', { retained: { results: 3, outsideChange: 'none' } }, ''), 'I read two of the three files.');
+  assert.equal(streamed.text, 'I read two of the three files.');
+  const delivered = terminalCompletionPresentation(withFacts('blocked', { review: 'rejected' }, 'Here is what I found.'), '');
+  assert.equal(delivered.text, 'Here is what I found.');
+  assert.equal(delivered.terminal?.review, 'rejected');
+});

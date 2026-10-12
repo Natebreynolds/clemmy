@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { outsideWorkCards, turnAgentName, turnByline, turnHelpers, turnModelName, turnModelOffer, turnReview, turnReviewerName, workflowCardLevels, workflowCards } from './turn-receipt.js';
+import { outsideWorkCards, turnAgentName, turnByline, turnHelpers, turnModelName, turnModelOffer, turnReview, turnReviewNote, turnReviewerName, workflowCardLevels, workflowCards } from './turn-receipt.js';
 import { narrateActivity } from './activity-presentation.js';
 import { boundedModelId, modelDisplayName } from './model-name.js';
 import { readQuestionOptions } from './question-options.js';
@@ -87,6 +87,36 @@ test('the last verdict decides the review line, and no reviewer is never a pass'
   assert.equal(turnReview(verdict(false)), 'rejected');
   assert.equal(turnReview([]), null);
   assert.equal(turnReview(undefined), null);
+});
+
+// The host lane rules on a turn in its terminal, not as a verdict row, so the
+// chip never showed for it. The terminal's ruling now decides.
+test('the review chip prefers the host’s ruling on the terminal over activity', () => {
+  const verdict = (pass: boolean): ActivityItem[] => reduceActivity(
+    [], { seq: 1, type: 'verdict_recorded', data: { door: 'completion', pass } }, () => 1,
+  );
+  assert.equal(turnReview([], { review: 'checked' }), 'checked');
+  assert.equal(turnReview(undefined, { review: 'unchecked' }), 'unchecked');
+  assert.equal(turnReview(verdict(true), { review: 'rejected' }), 'rejected', 'the terminal outranks an older verdict row');
+  assert.equal(turnReview(verdict(false), { review: 'needs_recheck' }), 'needs_recheck');
+  assert.equal(turnReview(verdict(true), {}), 'checked', 'with no ruling, activity still decides');
+  assert.equal(turnReview(verdict(true), undefined), 'checked');
+});
+
+test('the reviewer’s finding rides only with a ruling', () => {
+  assert.equal(turnReviewNote({ review: 'rejected', reviewNote: 'The total omits March.' }), 'The total omits March.');
+  assert.equal(turnReviewNote({ reviewNote: 'The total omits March.' }), undefined);
+  assert.equal(turnReviewNote({ review: 'checked', reviewNote: '   ' }), undefined);
+  assert.equal(turnReviewNote(undefined), undefined);
+});
+
+test('the byline’s verb follows the same ruling as the chip', () => {
+  const rows = fold([
+    { type: 'turn_model_routed', data: { model: 'vendor-ai/Vendor-V4.1-Fast', provider: 'byo' } },
+    { type: 'verdict_recorded', data: { door: 'completion', pass: true, judgeModelId: 'acme-large-4-5' } },
+  ]);
+  assert.equal(turnByline(rows), 'Vendor V4.1 Fast did the work, Acme Large 4.5 checked it');
+  assert.equal(turnByline(rows, { review: 'rejected' }), 'Vendor V4.1 Fast did the work, Acme Large 4.5 reviewed it');
 });
 
 test('question options keep real, distinct, readable choices only', () => {

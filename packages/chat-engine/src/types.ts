@@ -337,6 +337,57 @@ export interface TerminalFacts {
    *  so a turn that wrote to two systems and saved a file still ended as prose
    *  plus a pill. See evidence-presentation.ts. */
   evidenceRefs?: TurnEvidenceRef[];
+  /** The completion review's ruling on this turn, from the host. Drawn as the
+   *  receipt's review chip; preferred over any review read from activity. */
+  review?: TerminalReview;
+  /** The reviewer's finding, bounded. Shown only as the review chip's detail,
+   *  labelled as the review: it is never Clem's words. */
+  reviewNote?: string;
+  /** What the turn kept for when it continues, and what happened outside this
+   *  machine. Present only when something was kept or an outside change has a
+   *  settled state. Drawn on the status pill, never as prose. */
+  retained?: TerminalRetained;
+  /** The app's own status for a turn no model spoke for (a stop, a provider
+   *  refusal, a missing model). The terminal's text is app wording for
+   *  channels and history; desktop and phone draw this as a status line and
+   *  show no reply, and voice never speaks it. */
+  notice?: TerminalNotice;
+}
+
+/** `needs_recheck` is an answer the host held because the evidence under it
+ *  came from earlier work that needs a fresh look. */
+export type TerminalReview = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck';
+
+export type RetainedOutsideChange = 'went_through' | 'did_not' | 'mixed' | 'refused' | 'uncertain' | 'none';
+
+export interface TerminalRetained {
+  /** Results kept for reuse when the turn continues. */
+  results: number;
+  outsideChange: RetainedOutsideChange;
+}
+
+export type TerminalNoticeCode =
+  | 'stopped'
+  | 'response_format_unmet'
+  | 'response_format_unqualified'
+  | 'provider_quota'
+  | 'card_decision'
+  | 'saved_model_unavailable'
+  | 'model_unavailable_on_sign_in'
+  | 'no_model_connected'
+  | 'codex_sign_in_expired'
+  | 'provider_out_of_credit'
+  | 'model_stalled'
+  | 'run_failed';
+
+export interface TerminalNotice {
+  code: TerminalNoticeCode;
+  /** The saved agent the turn ran as, when the notice is about its model. */
+  agentName?: string;
+  /** The model the notice is about, as the host named it. */
+  model?: string;
+  /** The provider's own refusal, verbatim and bounded. Detail, never a reply. */
+  providerSaid?: string;
 }
 
 /** Mirrors src/runtime/harness/turn-outcome.ts. Addressable proof only: bulky
