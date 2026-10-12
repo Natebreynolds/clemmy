@@ -5,15 +5,16 @@
  *
  * Every fact here is read from the turn's own events. "Checked" appears only
  * when a review passed; a turn whose reviewer never ran says so, because an
- * unchecked answer must not borrow a pass. A card for work outside Clem
- * appears only for writes the provider confirmed.
+ * unchecked answer must not borrow a pass. The reviewer's finding is the
+ * chip's detail, labelled as the review, never part of Clem's answer. A card
+ * for work outside Clem appears only for writes the provider confirmed.
  */
 import { useEffect, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { AlertCircle, Check, CheckCircle2, Copy, FileText, Lock, Mail, PenLine, Repeat, Send, Sparkles, Workflow } from 'lucide-react';
 import {
-  outsideWorkCards, projectPagePlace, projectPageTitle, turnByline, turnModelOffer, turnReview, workflowCardLevels, workflowCards,
-  type ModelRuleOffer, type OutsideWorkCard, type WorkflowCardData,
+  outsideWorkCards, projectPagePlace, projectPageTitle, turnByline, turnModelOffer, turnReview, turnReviewNote, workflowCardLevels, workflowCards,
+  type ModelRuleOffer, type OutsideWorkCard, type TurnReview, type WorkflowCardData,
 } from '@clem/chat-engine';
 import { cn } from '@/lib/cn';
 import { answerModelRuleOffer } from '@/lib/chat';
@@ -333,6 +334,38 @@ export function OutsideWorkCards({ activity, children }: { activity?: ActivityIt
   );
 }
 
+const REVIEW_CHIP: Record<TurnReview, { label: string; title?: string; ok: boolean }> = {
+  checked: { label: 'Checked', ok: true },
+  unchecked: { label: 'Not checked', title: 'The review didn’t rule on this answer, so it wasn’t checked. Ask Clem to re-check it.', ok: false },
+  rejected: { label: 'Didn’t pass review', title: 'The last review did not accept this answer.', ok: false },
+  needs_recheck: { label: 'Needs a fresh check', title: 'Part of this answer rests on earlier results that need a fresh check. Ask Clem to re-check before relying on it.', ok: false },
+};
+
+/** The review chip. With the reviewer's finding it opens to show it, on its
+ *  own line and labelled as the review. */
+function ReviewChip({ review, note }: { review: TurnReview; note?: string }) {
+  const [open, setOpen] = useState(false);
+  const chip = REVIEW_CHIP[review];
+  const Icon = chip.ok ? CheckCircle2 : AlertCircle;
+  const look = chip.ok ? 'font-semibold text-success' : 'font-medium text-warning';
+  const content = <><Icon className="h-3.5 w-3.5" aria-hidden /> {chip.label}</>;
+  if (!note) return <span className={cn('inline-flex items-center gap-1', look)} title={chip.title}>{content}</span>;
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        aria-expanded={open}
+        title={chip.title}
+        className={cn('inline-flex items-center gap-1 rounded-sm underline-offset-2 hover:underline', look)}
+      >
+        {content}
+      </button>
+      {open && <p className="order-last basis-full text-caption text-muted">Review: {note}</p>}
+    </>
+  );
+}
+
 export function TurnReceipt({
   activity,
   terminal,
@@ -344,8 +377,10 @@ export function TurnReceipt({
   text: string;
   sessionId?: string;
 }) {
-  const review = turnReview(activity);
-  const byline = turnByline(activity);
+  // The host's ruling on the terminal decides; verdict rows are the fallback.
+  const review = turnReview(activity, terminal);
+  const reviewNote = turnReviewNote(terminal);
+  const byline = turnByline(activity, terminal);
   const saved = activity?.find((row) => row.id === 'deliverables' && row.deliverable);
   const offer = turnModelOffer(activity);
   return (
@@ -353,21 +388,7 @@ export function TurnReceipt({
       <OutsideWorkCards activity={activity}>{saved ? (saved.deliverables ?? [saved.deliverable!]).map(file => <DeliverableCard key={`${file.dir}/${file.name}`} row={{ ...saved, count: 1, deliverable: file }} sessionId={sessionId} />) : null}</OutsideWorkCards>
       {offer && sessionId && <ModelRuleOfferCard key={offer.offerId} offer={offer} sessionId={sessionId} />}
       <div className="flex min-h-7 flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
-        {review === 'checked' && (
-          <span className="inline-flex items-center gap-1 font-semibold text-success">
-            <CheckCircle2 className="h-3.5 w-3.5" aria-hidden /> Checked
-          </span>
-        )}
-        {review === 'unchecked' && (
-          <span className="inline-flex items-center gap-1 font-medium text-warning" title="The reviewer was unavailable, so this answer was not checked.">
-            <AlertCircle className="h-3.5 w-3.5" aria-hidden /> Not checked
-          </span>
-        )}
-        {review === 'rejected' && (
-          <span className="inline-flex items-center gap-1 font-medium text-warning" title="The last review did not accept this answer.">
-            <AlertCircle className="h-3.5 w-3.5" aria-hidden /> Didn’t pass review
-          </span>
-        )}
+        {review && <ReviewChip review={review} note={reviewNote} />}
         {byline && <span className="text-muted">{byline}</span>}
         <TurnEvidenceLine terminal={terminal} activity={activity} inline />
         <span className="ml-auto flex items-center gap-2 opacity-0 transition-opacity duration-base group-hover/turn:opacity-100 group-focus-within/turn:opacity-100">

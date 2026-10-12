@@ -5,8 +5,8 @@ import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { answerDraftStatus, hiddenCardDecision, liveTurnText, renderMarkdown, APPROVAL_ANSWER_WORDS, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
-import type { ApprovalConfirm, ApprovalResolution } from '@clem/chat-engine';
+import { answerDraftStatus, cardDecisionNoticeOnly, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
+import type { ApprovalConfirm, ApprovalResolution, TerminalNoticeLine } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -271,6 +271,38 @@ function PayloadPreview({ value }: { value: unknown }) {
   );
 }
 
+const NOTICE_ACTION_CLASS = 'inline-flex items-center rounded-sm border border-border-strong px-2 py-0.5 text-caption font-semibold text-fg transition-colors hover:border-primary hover:bg-primary-tint disabled:opacity-50';
+
+/** A turn no model spoke for, as the app's own status line: what happened,
+ *  the provider's words when it gave any (labelled as the provider's), and the
+ *  one action that resolves it. Never a reply bubble, never read aloud.
+ *  "Try again" sends those words as the owner's next message, and only while
+ *  this is the newest turn. */
+function NoticeLine({ line, onAnswer }: { line: TerminalNoticeLine; onAnswer?: (text: string) => Promise<void> | void }) {
+  const [sent, setSent] = useState(false);
+  const action = line.action;
+  const tryAgain = () => {
+    if (sent || !onAnswer) return;
+    setSent(true);
+    void Promise.resolve(onAnswer(NOTICE_ACTION_LABEL.try_again)).catch(() => setSent(false));
+  };
+  return (
+    <>
+      <StatusPill tone={line.tone}>{line.label}</StatusPill>
+      {action === 'change_model' && (
+        <Link to="/settings#who-does-what" className={NOTICE_ACTION_CLASS}>{NOTICE_ACTION_LABEL.change_model}</Link>
+      )}
+      {(action === 'sign_in' || action === 'add_credit') && (
+        <Link to="/settings#accounts" className={NOTICE_ACTION_CLASS}>{NOTICE_ACTION_LABEL[action]}</Link>
+      )}
+      {action === 'try_again' && onAnswer && (
+        <button type="button" className={NOTICE_ACTION_CLASS} onClick={tryAgain} disabled={sent}>{NOTICE_ACTION_LABEL.try_again}</button>
+      )}
+      {line.detail && <p className="basis-full text-caption text-muted">{line.detail}</p>}
+    </>
+  );
+}
+
 /** Client-written stand-in when Stop fires before any tokens. The StatusPill
  *  is the record — do not wrap this string in a hollow reply card. */
 const STOPPED_PLACEHOLDER = 'Stopped.';
@@ -454,6 +486,7 @@ export function ChatBubble({
   // card, not the conversation; only one that failed to land is shown. A
   // decided card has done its job and leaves the conversation.
   if (hiddenCardDecision(message)) return null;
+  if (cardDecisionNoticeOnly(message)) return null;
   if (message.status === 'awaiting-approval'
     && (message.approval?.resolution === 'approved' || message.approval?.resolution === 'declined')) return null;
 
@@ -816,34 +849,30 @@ export function ChatBubble({
         {/* The backend's TYPED terminal decides the pill. The legacy MessageStatus
             collapses blocked/cancelled/uncertain into "failed"/"stopped" and cannot
             tell a question from a resumable "say continue"; when the harness sent
-            its typed facts, mirror them. Legacy events keep the old pills. */}
+            its typed facts, mirror them, with what the turn kept. A notice is the
+            app's status line in place of the pill. Legacy events keep the old
+            pills. The wording is shared with the phone (chat-engine). */}
         {(() => {
           const t = message.terminal;
-          if (t?.status === 'blocked') {
-            return <div><StatusPill tone="warning">Stopped here — your work is kept</StatusPill></div>;
-          }
-          if (t?.status === 'uncertain') {
-            return <div><StatusPill tone="warning">Outcome uncertain — check before repeating</StatusPill></div>;
-          }
-          if (t?.status === 'cancelled' || t?.status === 'transferred') {
-            return <div><StatusPill tone="neutral">{t.status === 'cancelled' ? 'Cancelled' : 'Handed off'}</StatusPill></div>;
-          }
-          if (t?.status === 'needs_input' && (t.kind === 'continue' || t.needs === 'continue')) {
-            return <div><StatusPill tone="info">Paused — say “continue” to pick up</StatusPill></div>;
-          }
-          if (t?.status === 'needs_input' && t.kind === 'approval') {
-            return <div><StatusPill tone="info">Waiting for your approval</StatusPill></div>;
-          }
+          const outside = retainedOutsideChange(t);
+          const outsideChip = outside ? <StatusPill tone={outside.tone}>{outside.label}</StatusPill> : null;
+          const row = (children: React.ReactNode) => (
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">{children}{outsideChip}</div>
+          );
+          const notice = terminalNoticeLine(t);
+          if (notice) return row(<NoticeLine line={notice} onAnswer={onAnswer} />);
+          const pill = terminalStatusPill(t, { wordless: !hasReplyText });
+          if (pill) return row(<StatusPill tone={pill.tone}>{pill.label}</StatusPill>);
           if (message.status === 'awaiting-reply' || message.status === 'stopped' || message.status === 'failed') {
-            return (
-              <div>
+            return row(
+              <>
                 {message.status === 'awaiting-reply' && <StatusPill tone="info">{answerable ? 'Waiting on you · tap an answer or reply below' : 'Reply below to continue'}</StatusPill>}
                 {message.status === 'stopped' && <StatusPill tone="neutral">Stopped</StatusPill>}
                 {message.status === 'failed' && <StatusPill tone="danger">Didn't finish</StatusPill>}
-              </div>
+              </>,
             );
           }
-          return null;
+          return outsideChip ? row(null) : null;
         })()}
 
         {/* What she made, whether it was checked, what the turn touched, and

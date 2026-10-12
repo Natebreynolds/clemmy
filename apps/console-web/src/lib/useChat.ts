@@ -2592,6 +2592,9 @@ export function inboxAdditionsFromEvents(
         role: 'assistant',
         text: presentation.text,
         status: presentation.status,
+        // A report-back that ended on a notice or a stop draws its status
+        // line like any other turn, rather than an empty reply.
+        ...(presentation.terminal ? { terminal: presentation.terminal } : {}),
         taskRef,
       });
     } else if (ev.type === 'awaiting_user_input') {
