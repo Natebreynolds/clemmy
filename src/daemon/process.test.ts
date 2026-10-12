@@ -257,6 +257,50 @@ test('daemon lease: a live same-user current-format owner still blocks acquisiti
   }
 });
 
+test('daemon lease: an owner pid now held by a process started after the lease was reused and is taken over', async () => {
+  // Windows ends the daemon with a hard kill, so its lease outlives it, and
+  // pids recycle quickly: after an update the recorded pid is often an
+  // unrelated same-user process. That process started after the lease was
+  // written, which the real owner never can.
+  const { _setProcessStartReaderForTest } = await import('./process.js');
+  const child = await spawnSameUserSleeper();
+  const token = '55555555-5555-4555-8555-555555555555';
+  const writeOwner = (startedAt: string) => {
+    rmSync(DAEMON_LEASE_DIR, { recursive: true, force: true });
+    mkdirSync(DAEMON_LEASE_DIR, { recursive: true });
+    writeFileSync(path.join(DAEMON_LEASE_DIR, `owner-${token}.json`), JSON.stringify({ version: 1, pid: child.pid, token, startedAt }));
+  };
+  try {
+    // The real start-time reader on this platform: the sleeper started now,
+    // long after a lease written an hour ago.
+    writeOwner(new Date(Date.now() - 3_600_000).toISOString());
+    assert.equal(acquireDaemonLease(process.pid), true, 'a reused pid never retains a stale lease');
+    assert.equal(readDaemonPid(), process.pid);
+    clearDaemonPid(process.pid);
+    // An unreadable start time proves nothing: the live owner keeps blocking.
+    _setProcessStartReaderForTest(() => null);
+    writeOwner(new Date(Date.now() - 3_600_000).toISOString());
+    assert.equal(acquireDaemonLease(process.pid), false);
+    // A process that predates its lease is its owner, however old the lease.
+    _setProcessStartReaderForTest((pid) => (pid === child.pid ? Date.now() - 7_200_000 : null));
+    assert.equal(acquireDaemonLease(process.pid), false);
+  } finally {
+    _setProcessStartReaderForTest(null);
+    rmSync(DAEMON_LEASE_DIR, { recursive: true, force: true });
+    child.kill('SIGKILL');
+  }
+});
+
+test('ps elapsed time reads in every form ps prints', async () => {
+  const { parsePsElapsedSeconds } = await import('./process.js');
+  assert.equal(parsePsElapsedSeconds('   00:07\n'), 7);
+  assert.equal(parsePsElapsedSeconds('12:34'), 754);
+  assert.equal(parsePsElapsedSeconds('01:02:03'), 3_723);
+  assert.equal(parsePsElapsedSeconds('2-01:02:03'), 176_523);
+  assert.equal(parsePsElapsedSeconds(''), null);
+  assert.equal(parsePsElapsedSeconds('unknown'), null);
+});
+
 test('daemon lease: a legacy bare-pid file from a dead process is taken over', () => {
   writeFileSync(PID_FILE, `${DEAD_PID}\n`);
   assert.equal(existsSync(DAEMON_LEASE_DIR), false);

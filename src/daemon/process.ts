@@ -156,6 +156,61 @@ function processPsState(pid: number): string | null {
 }
 
 let psStateReaderForTest: ((pid: number) => string | null) | null = null;
+let processStartReaderForTest: ((pid: number) => number | null) | null = null;
+
+/** Test-only: substitute the process start-time reader. */
+export function _setProcessStartReaderForTest(fn: ((pid: number) => number | null) | null): void {
+  processStartReaderForTest = fn;
+}
+
+/** When `pid`'s current process started (epoch ms), or null when unreadable. */
+function readProcessStartMs(pid: number): number | null {
+  if (processStartReaderForTest) return processStartReaderForTest(pid);
+  try {
+    if (process.platform === 'win32') {
+      const out = execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${Math.trunc(pid)}"; if ($p) { [DateTimeOffset]::new($p.CreationDate).ToUnixTimeMilliseconds() }`,
+        ],
+        { encoding: 'utf-8', timeout: 8_000, windowsHide: true },
+      );
+      const ms = Number(out.trim());
+      return Number.isFinite(ms) && ms > 0 ? ms : null;
+    }
+    // ps reports elapsed time as [[dd-]hh:]mm:ss on macOS and Linux alike.
+    const out = execFileSync('ps', ['-p', String(pid), '-o', 'etime='], { encoding: 'utf-8', timeout: 2_000 });
+    const elapsed = parsePsElapsedSeconds(out);
+    return elapsed === null ? null : Date.now() - elapsed * 1_000;
+  } catch {
+    return null;
+  }
+}
+
+/** `ps -o etime` text ("[[dd-]hh:]mm:ss") as seconds, or null. */
+export function parsePsElapsedSeconds(text: string): number | null {
+  const match = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/.exec(text);
+  if (!match) return null;
+  const [, days, hours, minutes, seconds] = match;
+  return ((Number(days ?? 0) * 24 + Number(hours ?? 0)) * 60 + Number(minutes)) * 60 + Number(seconds);
+}
+
+/** A lease's owner pid that now belongs to a process started after the lease
+ *  was written was reused: the owner wrote the lease while it was running, so
+ *  its process always predates it. Windows recycles pids quickly and every
+ *  stop there is a hard kill that leaves the lease behind, so after an update
+ *  the old pid is often an unrelated process of the same user. A competing
+ *  daemon still mid-start predates its own lease and keeps blocking. An
+ *  unreadable start time proves nothing and keeps blocking. */
+const PID_START_CLOCK_SLACK_MS = 2_000;
+function leaseOwnerPidWasReused(owner: { pid: number; startedAt: string }): boolean {
+  const leaseAt = Date.parse(owner.startedAt);
+  const started = readProcessStartMs(owner.pid);
+  return Number.isFinite(leaseAt) && started !== null && started > leaseAt + PID_START_CLOCK_SLACK_MS;
+}
 
 /** Test-only: substitute the ps state reader (Node reaps its own children, so
  *  a hermetic test cannot manufacture a real zombie). */
@@ -352,9 +407,9 @@ export function acquireDaemonLease(pid = process.pid): boolean {
         // stays a plain liveness check (NOT the daemon-shape heuristic used for
         // the legacy path): during a concurrent start the live competitor's argv
         // may not yet be daemon-shaped, and evicting it would grant two owners.
-        // The correct pid-reuse disambiguator here is process-start-time vs the
-        // lease startedAt — a follow-up, tracked 2026-07-17.
-        if (pidBlocksLeaseAcquisition(owner.pid)) return false;
+        // Process start time against the lease's startedAt tells reuse apart:
+        // see leaseOwnerPidWasReused.
+        if (pidBlocksLeaseAcquisition(owner.pid) && !leaseOwnerPidWasReused(owner)) return false;
         try {
           unlinkSync(owner.file);
         } catch {
