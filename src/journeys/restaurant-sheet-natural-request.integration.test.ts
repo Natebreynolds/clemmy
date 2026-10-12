@@ -1958,10 +1958,11 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       assert.match(String(boundedReview?.data.reason), /fixture completion reviewer unavailable/);
       assert.equal(completionReviews.length, reviewCallsBeforeBounded,
         'the unavailable fixture reviewer never publishes a positive verdict');
-      assert.ok(delivery.edits.at(-1)?.startsWith(`${BOUNDED_SUCCESS}\n\nVerification note:`));
-      // The unavailability reason stays on the review row for the console;
-      // the chat gets one plain sentence saying the result stands unreviewed.
-      assert.match(delivery.edits.at(-1) ?? '', /I could not get this result independently reviewed, so it stands unreviewed\. The review model is not reachable with the current model setup\. Ask me to re-check it, or choose a reachable review model in your model settings\./);
+      // Clem's words are delivered exactly; the unavailability reason stays on
+      // the review row for the console and the terminal carries the chip state.
+      assert.equal(delivery.edits.at(-1), BOUNDED_SUCCESS);
+      assert.equal(boundedCompletion?.data.review, 'unchecked');
+      assert.equal((boundedCompletion?.data.presentation as { text?: string } | undefined)?.text, BOUNDED_SUCCESS);
       assert.ok(!delivery.edits.at(-1)?.includes(String(boundedReview?.data.reason)), 'operator diagnosis stays out of the chat');
     },
   );

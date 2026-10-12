@@ -638,8 +638,8 @@ test('matrix rows 1 and 3: a cold two-page read stays in one graphless foregroun
   assert.deepEqual(delivery.errors, []);
   assert.deepEqual(delivery.followups, []);
   const deliveredText = delivery.edits.at(-1) ?? delivery.initial.at(-1);
-  assert.ok(deliveredText?.startsWith(`${success}\n\nVerification note:`),
-    'preserve the completed provider read and the truthful unavailable-review note');
+  assert.equal(deliveredText, success,
+    'preserve the completed provider read exactly as authored; the unavailable review is the chip');
 
   const events = eventlog.listEvents(sessionId);
   const completion = events.find(event => event.type === 'conversation_completed'
@@ -656,15 +656,16 @@ test('matrix rows 1 and 3: a cold two-page read stays in one graphless foregroun
   assert.equal(review?.data.objectiveDigest, sha256(prompt));
   assert.equal(typeof review?.data.reason, 'string');
   // The unavailability reason is operator diagnosis kept on the review row;
-  // the chat gets one plain sentence saying the result stands unreviewed.
-  assert.match(deliveredText ?? '', /I could not get this result independently reviewed, so it stands unreviewed\. The review model is not reachable with the current model setup\. Ask me to re-check it, or choose a reachable review model in your model settings\./);
+  // the chat carries Clem's words and the terminal carries the review state.
+  assert.equal(completion.data.review, 'unchecked');
+  assert.equal(completion.data.reviewNote, undefined);
   assert.ok(!deliveredText?.includes(String(review!.data.reason)), 'operator diagnosis stays out of the chat');
   assert.doesNotMatch(deliveredText ?? '', /accepting completion/);
   assert.equal(reviewRef.verified, false);
   assert.equal(reviewRef.failedOpen, true);
   assert.equal(reviewRef.disposition, 'enabled_unavailable');
   assert.equal(reviewRef.policyEvidence, 'captured');
-  assert.equal(reviewRef.deliveredTextIsJudgedText, false);
+  assert.equal(reviewRef.deliveredTextIsJudgedText, true, 'the delivered bytes are the judged bytes');
   assert.equal(completion.data.verificationDetail, 'completion_review_failed_open');
   assert.equal(completion.data.delivered, true, 'completed reads are delivered with the explicit unreviewed disposition');
   assert.equal(completion.data.reason, 'success');

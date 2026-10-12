@@ -12650,6 +12650,13 @@ export function completionVerdictForAcceptedSource(input: {
   reviewFailure?: 'timeout' | 'invalid' | 'unavailable';
   reviewDisposition?: 'answered_unqualified';
   reviewAssessment?: CompletionReviewAssessmentDiagnostic;
+  /** The host, not a reviewer, holds this result: the saved evidence the
+   *  review rested on changed. Its reason is host text, never a finding. */
+  hostEvidenceHold?: boolean;
+  /** The judged candidate did not satisfy the owner's whole-output format. */
+  responseFormatUnmet?: boolean;
+  /** The reviewer's own repair routing, as recorded. */
+  repairScope?: 'reply_format' | 'claims';
   selfJudge?: boolean;
   ownerSelectedJudge?: boolean;
   substituteForExactPin?: boolean;
@@ -12708,6 +12715,9 @@ export function completionVerdictForAcceptedSource(input: {
           ? { reviewDisposition: 'answered_unqualified' as const } : {}),
         ...(() => { const diagnostic = completionReviewAssessmentDiagnostic(data.reviewAssessment);
           return diagnostic ? { reviewAssessment: diagnostic } : {}; })(),
+        ...((data.responseFormatContract as { candidateValid?: unknown } | undefined)?.candidateValid === false
+          ? { responseFormatUnmet: true } : {}),
+        ...(data.repairScope === 'reply_format' || data.repairScope === 'claims' ? { repairScope: data.repairScope } : {}),
         ...(data.selfJudge === true ? { selfJudge: true } : {}),
         ...(data.ownerSelectedJudge === true ? { ownerSelectedJudge: true } : {}),
         ...(data.substituteForExactPin === true ? { substituteForExactPin: true } : {}),
@@ -12754,7 +12764,7 @@ export function completionVerdictForAcceptedSource(input: {
         // drifted. Returning null would let a zero-call Continue self-exempt
         // at delivery. This is a host evidence hold, not a provider failure.
         ...(invalidInheritedProof ? {
-          fulfills: false, blocked: true, reviewFailure: 'invalid' as const,
+          fulfills: false, blocked: true, hostEvidenceHold: true, reviewFailure: 'invalid' as const,
           reviewUnavailableReason: 'The exact inherited read binding no longer verifies.',
           reason: 'The saved read evidence for this continuation changed or could not be verified. The result needs a new review before it can be confirmed.',
         } : {}),

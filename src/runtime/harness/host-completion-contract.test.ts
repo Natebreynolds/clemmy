@@ -1748,10 +1748,10 @@ test('actual second-candidate host review sees current JSON and historical findi
   assert.equal(run.outcome.finalOutput, currentReply);
 });
 
-test('a blocked finding replaces the rejected draft; a plain negative keeps the generic note', () => {
+test('a blocked finding replaces the rejected draft; a plain negative keeps Clem\'s words with a rejected review chip', () => {
   for (const [blocked, expected] of [
     [true, /^The invite was not changed because the update was refused before it reached the calendar\.$/],
-    [false, /Verification note: the completion review did not accept this write-up\./],
+    [false, /^I updated the invite\.$/],
   ] as const) {
     const identity = accepted('Update the invite description.');
     host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
@@ -1771,11 +1771,15 @@ test('a blocked finding replaces the rejected draft; a plain negative keeps the 
       assert.equal(committed.event.data.rejectedCompletionText, undefined);
     }
     assert.notEqual(committed.presentation.status, 'done');
+    assert.equal(committed.event.data.review, 'rejected');
+    assert.equal(committed.event.data.reviewNote,
+      'The invite was not changed because the update was refused before it reached the calendar.');
   }
 });
 
 // Live 2026-09-25: the note stopped mid-sentence at a fixed 240 characters.
-test('a negative review note shows every finding whole, cut only between items', () => {
+// The finding is chip detail now, never text under Clem's answer.
+test('a negative review finding is bounded chip detail, cut only between items', () => {
   const identity = accepted('Summarize the three offices.');
   host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
   const items = Array.from({ length: 30 }, (_, i) => `(${i + 1}) "office ${i} grew" — the report shows no change for office ${i}`).join('; ');
@@ -1785,7 +1789,10 @@ test('a negative review note shows every finding whole, cut only between items',
     replyDigest: createHash('sha256').update('All offices grew.').digest('hex'), continuation: false } });
   const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
     presentation: { kind: 'answer', text: 'All offices grew.' } });
-  const note = committed.presentation.text.slice(committed.presentation.text.indexOf('Verification note'));
+  assert.equal(committed.presentation.text, 'All offices grew.');
+  assert.equal(committed.event.data.review, 'rejected');
+  const note = String(committed.event.data.reviewNote);
+  assert.ok(note.length <= 400, `bounded: ${note.length}`);
   assert.match(note, /\(1\) "office 0 grew" — the report shows no change for office 0/);
   assert.match(note, /\(3\) "office 2 grew" — the report shows no change for office 2/);
   assert.match(note, /no change for office \d+ …/, 'a long list ends at a whole item, marked as cut');

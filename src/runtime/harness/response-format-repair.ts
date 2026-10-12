@@ -215,14 +215,18 @@ export const WHOLE_JSON_OBJECT_REVIEW_GUIDANCE = 'The owner explicitly requires 
   + 'Do not infer an array or other nested schema that the owner did not require. If formatting is the only gap, use REVISE_REPLY; '
   + 'if work or claims are also wrong, report all those gaps rather than treating reformatting as completion.';
 
+/** The host's deterministic format finding. It is model-facing repair input;
+ * the owner sees the format miss as a terminal notice, never this sentence. */
+export const WHOLE_JSON_OBJECT_FORMAT_FINDING = 'The owner required one whole-output JSON object. The complete answer does not parse as a JSON object; '
+  + 'return that object without a Markdown fence or surrounding prose, preserving every required fact and qualification.';
+
 export function wholeResponseFormatFinding(requirement: WholeResponseFormatRequirement | null, reply: string): string | null {
   if (!requirement) return null;
   try {
     const value: unknown = JSON.parse(reply.trim());
     if (value !== null && typeof value === 'object' && !Array.isArray(value)) return null;
   } catch { /* A fenced/embedded JSON substring is not the whole response. */ }
-  return 'The owner required one whole-output JSON object. The complete answer does not parse as a JSON object; '
-    + 'return that object without a Markdown fence or surrounding prose, preserving every required fact and qualification.';
+  return WHOLE_JSON_OBJECT_FORMAT_FINDING;
 }
 
 /** A deterministic format finding is negative-only. A real semantic finding,

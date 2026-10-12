@@ -499,8 +499,12 @@ test('a zero-business-call Continue receives normal completion review with exact
     }
     const committed = delivery.commitTurnOutcome(proposed);
     assert.notEqual(committed.presentation.status, 'done', 'invalid inherited proof must fail closed at the public delivery boundary');
-    assert.match(committed.presentation.text, corruption === 'missing-review'
-      ? /no completion review was recorded/i : /saved read evidence.*changed or could not be verified/i);
+    // Clem's answer stands as written; the hold is the review chip's state.
+    // A host evidence hold is never published as though it were Clem's reply.
+    assert.equal(committed.presentation.text, answer.trim());
+    assert.equal(committed.event.data.review, corruption === 'missing-review' ? 'unchecked' : 'needs_recheck');
+    assert.equal(committed.event.data.reviewNote, undefined, 'host evidence text is not a reviewer finding');
+    if (corruption !== 'missing-review') assert.equal(invalid?.hostEvidenceHold, true);
   }
 });
 
