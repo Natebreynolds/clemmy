@@ -3,6 +3,7 @@
  * heard yet, and whether the spoken turn is still running. Pure; voice-mode.ts
  * owns the microphone and the speaker.
  */
+import { noticeReplacesReply, terminalNoticeVoiceFact, type TerminalFacts } from '@clem/chat-engine';
 
 /** The parts of a chat message voice mode reads. */
 export interface VoiceChatMessage {
@@ -13,9 +14,9 @@ export interface VoiceChatMessage {
   answerDraft?: { id: string; phase?: string; withdrawn?: string };
   checkIn?: unknown;
   approval?: { preview?: { ask?: string } };
-  /** The typed terminal. A notice is the app's status for a turn no model
-   *  spoke for: it is shown as a status line and never read aloud. */
-  terminal?: { notice?: unknown };
+  /** The typed terminal. A notice is the app's status line; for a turn no
+   *  model spoke for it stands in place of a reply and is never read aloud. */
+  terminal?: Partial<Pick<TerminalFacts, 'status' | 'notice' | 'retained'>>;
 }
 
 export const FINISHED_STATUSES = new Set(['complete', 'awaiting-reply', 'awaiting-approval', 'awaiting-plan', 'failed']);
@@ -66,10 +67,17 @@ export interface VoiceUtterance {
   draftId?: string;
 }
 
+/** A notice in place of a reply: the message's text is the app's wording,
+ *  never Clem's. A format notice sits beside her own draft, which is read. */
+function noticeOnly(message: VoiceChatMessage): boolean {
+  const code = message.terminal?.notice?.code;
+  return code !== undefined && noticeReplacesReply(code);
+}
+
 /** What of a message voice may read: Clem's words, or a card's question in
- *  her words. A notice terminal has none, whatever text it carries. */
+ *  her words. A notice in place of a reply has none, whatever text it carries. */
 export function voiceReadableText(message: VoiceChatMessage): string {
-  if (message.terminal?.notice) return '';
+  if (noticeOnly(message)) return '';
   return message.text?.trim() || message.approval?.preview?.ask?.trim() || '';
 }
 const readableText = voiceReadableText;
@@ -78,7 +86,7 @@ const readableText = voiceReadableText;
  * it. A withdrawn/replaced answer or tool intent is no longer speakable. */
 export function voiceUtteranceCurrent(utterance: VoiceUtterance, messages: readonly VoiceChatMessage[]): boolean {
   const message = messages.find(message => message.id === utterance.messageId);
-  if (!message || message.role !== 'assistant' || message.terminal?.notice
+  if (!message || message.role !== 'assistant' || noticeOnly(message)
     || readableText(message) !== utterance.sourceText || message.status !== utterance.status) return false;
   if (utterance.kind === 'tool-intent') {
     const draft = message.answerDraft;
@@ -113,7 +121,7 @@ export function voiceUtterances(
   for (const message of messages) {
     if (message.role !== 'assistant' || baseline.has(message.id)) continue;
     // The app's status for a turn no model spoke for is never Clem's to say.
-    if (message.terminal?.notice) continue;
+    if (noticeOnly(message)) continue;
     const draft = message.answerDraft;
     if (draft) {
       // Explicit tool-call withdrawal is the engine's progress projection,
@@ -142,6 +150,18 @@ export function voiceUtterances(
     }
   }
   return out;
+}
+
+/** What live voice is told when the spoken turn has just ended on a notice:
+ *  the typed fact of each reply in the turn that carries one, so the request
+ *  it was waiting on is answered rather than left in silence. A stop the owner
+ *  chose and a card decision say nothing. */
+export function voiceTurnNoticeFacts(messages: readonly VoiceChatMessage[], from: number): string[] {
+  return messages.slice(from).flatMap((message) => {
+    if (message.role !== 'assistant' || message.checkIn) return [];
+    const fact = terminalNoticeVoiceFact(message.terminal);
+    return fact ? [fact] : [];
+  });
 }
 
 /** True while Clem's reply to the last spoken turn is still being worked on. */

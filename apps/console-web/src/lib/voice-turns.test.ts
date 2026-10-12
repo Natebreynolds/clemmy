@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { nextSpokenPart, spokenWords, voiceBaseline, voiceReadableText, voiceTurnEnded, voiceTurnRunning, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage } from './voice-turns.js';
+import { nextSpokenPart, spokenWords, voiceBaseline, voiceReadableText, voiceTurnEnded, voiceTurnNoticeFacts, voiceTurnRunning, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage } from './voice-turns.js';
 
 const owner = (id: string, text: string): VoiceChatMessage => ({ id, role: 'user', text });
 const clem = (id: string, text: string, status: string, extra: Partial<VoiceChatMessage> = {}): VoiceChatMessage =>
@@ -125,4 +125,31 @@ test('a notice terminal is never spoken, whatever text it carries, and queued sp
   assert.ok(queued);
   assert.equal(voiceUtteranceCurrent(queued!, [answering]), true);
   assert.equal(voiceUtteranceCurrent(queued!, [{ ...answering, terminal: { notice: { code: 'run_failed' } } }]), false);
+});
+
+// A format notice sits beside Clem's own draft: the draft is hers and is read,
+// where skipping every notice left the owner hearing nothing at all.
+test('a draft held for its format is still read, and its queued speech keeps its place', () => {
+  const draft = 'Here is the summary as one object, though one office may be missing.';
+  for (const code of ['response_format_unmet', 'response_format_unqualified'] as const) {
+    const held = clem('f1', draft, 'failed', { terminal: { status: 'blocked', notice: { code } } });
+    assert.equal(voiceReadableText(held), draft, code);
+    const [utterance] = voiceUtterances([owner('u1', 'one JSON object please'), held], new Map(), new Set());
+    assert.equal(utterance?.text, draft);
+    assert.equal(voiceUtteranceCurrent(utterance!, [held]), true);
+  }
+});
+
+test('a spoken turn that ends on a notice hands the voice its typed fact; a chosen stop does not', () => {
+  const messages = [
+    owner('u1', 'summarize the fixtures'),
+    clem('n1', '', 'failed', { terminal: { status: 'failed', notice: { code: 'provider_quota', model: 'Vendor V4' }, retained: { results: 1, outsideChange: 'none' } } }),
+  ];
+  const [fact, ...rest] = voiceTurnNoticeFacts(messages, 1);
+  assert.equal(rest.length, 0);
+  assert.match(fact!, /provider_quota \(model: Vendor V4\)/);
+  assert.match(fact!, /1 result kept/);
+  assert.deepEqual(voiceTurnNoticeFacts([owner('u1', 'go'), clem('n2', '', 'stopped', { terminal: { status: 'cancelled', notice: { code: 'stopped' } } })], 1), []);
+  assert.deepEqual(voiceTurnNoticeFacts([owner('u1', 'go'), clem('a1', 'Done.', 'complete')], 1), []);
+  assert.deepEqual(voiceTurnNoticeFacts(messages, 2), [], 'only the turn that just ended');
 });

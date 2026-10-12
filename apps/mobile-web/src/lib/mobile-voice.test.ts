@@ -506,3 +506,24 @@ test('phone live voice: a notice terminal is never relayed to the voice', async 
   assert.deepEqual(link.said, [], 'the app’s stop is not Clem’s to say');
   f.controller.stop();
 });
+
+test('phone live voice: a request that ends on a notice is answered with its typed fact', async () => {
+  const f = liveFixture();
+  await settle();
+  void f.controller.start();
+  const link = f.links[0];
+  link.handlers.onLive();
+  link.handlers.onRequest({ id: 'item_1', words: 'Summarize the fixtures' });
+  await settle();
+  const owner = { id: 'u1', role: 'user' as const, text: 'Summarize the fixtures' };
+  f.observe({ busy: true, messages: [...f.conversation.messages, owner, reply('a1', '', 'thinking')] });
+  const stalled: VoiceChatMessage = { ...reply('a1', '', 'failed'), terminal: { status: 'failed', notice: { code: 'model_stalled', model: 'Vendor V4' } } };
+  f.observe({ busy: false, messages: [...f.conversation.messages.slice(0, -1), stalled] });
+  await settle();
+  assert.deepEqual(link.said, []);
+  const told = link.notes.filter(([text]) => /model_stalled/.test(text));
+  assert.equal(told.length, 1);
+  assert.equal(told[0]![1], 'item_1');
+  assert.match(told[0]![0], /\(model: Vendor V4\)/);
+  f.controller.stop();
+});

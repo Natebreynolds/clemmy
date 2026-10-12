@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { voiceReadableText, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage } from './voice-turns.js';
+import { voiceReadableText, voiceTurnNoticeFacts, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage } from './voice-turns.js';
 
 const clem = (id: string, text: string, status: string, extra: Partial<VoiceChatMessage> = {}): VoiceChatMessage =>
   ({ id, role: 'assistant', text, status, ...extra });
@@ -16,4 +16,19 @@ test('phone: Clem’s answer is read, a notice terminal never is', () => {
   assert.equal(voiceReadableText(notice), '');
   const [queued] = voiceUtterances([answer], new Map(), new Set());
   assert.equal(voiceUtteranceCurrent(queued!, [{ ...answer, terminal: { notice: { code: 'model_stalled' } } }]), false);
+});
+
+test('phone: a draft held for its format is read, and a notice turn gives the voice its typed fact', () => {
+  const draft = 'Here is the summary as one object, though one office may be missing.';
+  const held = clem('f1', draft, 'failed', { terminal: { status: 'blocked', notice: { code: 'response_format_unmet' } } });
+  assert.equal(voiceReadableText(held), draft);
+  const [utterance] = voiceUtterances([held], new Map(), new Set());
+  assert.equal(utterance?.text, draft);
+  assert.equal(voiceUtteranceCurrent(utterance!, [held]), true);
+
+  const stalled = clem('n1', '', 'failed', { terminal: { status: 'failed', notice: { code: 'model_stalled', model: 'Vendor V4' } } });
+  const [fact] = voiceTurnNoticeFacts([{ id: 'u1', role: 'user', text: 'go' }, stalled], 1);
+  assert.match(fact!, /model_stalled \(model: Vendor V4\)/);
+  assert.match(fact!, /Try again/);
+  assert.deepEqual(voiceTurnNoticeFacts([clem('n2', '', 'stopped', { terminal: { notice: { code: 'stopped' } } })], 0), []);
 });

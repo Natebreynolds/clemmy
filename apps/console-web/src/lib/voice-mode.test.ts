@@ -255,3 +255,47 @@ test('live voice: a notice terminal is never relayed to the voice nor given as h
   assert.deepEqual(links[0]?.started[0], [{ role: 'user', text: 'Read the fixtures' }, { role: 'assistant', text: 'Two files read.' }]);
   controller.disable();
 });
+
+// Skipping a notice used to close the voice's open request with nothing for it:
+// the owner heard silence after asking.
+test('live voice: a request that ends on a notice is answered with its typed fact, not the notice wording', async () => {
+  const f = liveFixture();
+  await settle();
+  const link = f.links[0];
+  link.handlers.onLive();
+  link.handlers.onRequest({ id: 'item_1', words: 'Summarize the fixtures' });
+  await settle();
+  const owner = { id: 'u1', role: 'user' as const, text: 'Summarize the fixtures' };
+  f.controller.observe('chat-a', [...f.history, owner, reply('a1', '', 'thinking')]);
+  const outOfCredit: VoiceChatMessage = { ...reply('a1', '', 'failed'), terminal: { status: 'failed', notice: { code: 'provider_out_of_credit', model: 'Vendor V4' } } };
+  f.controller.observe('chat-a', [...f.history, owner, outOfCredit]);
+  assert.deepEqual(link.said, [], 'nothing is said as Clem');
+  assert.equal(link.notes.length, 1);
+  const [fact, requestId] = link.notes[0]!;
+  assert.equal(requestId, 'item_1', 'the fact answers the open request');
+  assert.match(fact, /provider_out_of_credit \(model: Vendor V4\)/);
+  assert.match(fact, /Tell the owner briefly/);
+  assert.equal(f.controller.getSnapshot().phase, 'listening', 'the request is closed');
+  f.controller.observe('chat-a', [...f.history, owner, outOfCredit]);
+  assert.equal(link.notes.length, 1, 'told once');
+
+  // A draft held for its format is said as hers, with the fact beside it.
+  link.handlers.onRequest({ id: 'item_2', words: 'As one JSON object' });
+  await settle();
+  const again = { id: 'u2', role: 'user' as const, text: 'As one JSON object' };
+  const held: VoiceChatMessage = { ...reply('a2', 'Here is the object, though one office may be missing.', 'failed'), terminal: { status: 'blocked', notice: { code: 'response_format_unmet' } } };
+  f.controller.observe('chat-a', [...f.history, owner, outOfCredit, again, held]);
+  assert.deepEqual(link.said, [['Here is the object, though one office may be missing.', 'item_2']]);
+  assert.match(link.notes.at(-1)![0], /response_format_unmet/);
+  assert.equal(link.notes.at(-1)![1], 'item_2');
+
+  // A stop the owner chose needs no explaining.
+  link.handlers.onRequest({ id: 'item_3', words: 'Read everything' });
+  await settle();
+  const third = { id: 'u3', role: 'user' as const, text: 'Read everything' };
+  const stoppedTurn: VoiceChatMessage = { ...reply('a3', '', 'failed'), terminal: { status: 'failed', notice: { code: 'stopped' } } };
+  const notesBefore = link.notes.length;
+  f.controller.observe('chat-a', [...f.history, owner, outOfCredit, again, held, third, stoppedTurn]);
+  assert.equal(link.notes.length, notesBefore);
+  f.controller.disable();
+});
