@@ -229,3 +229,29 @@ test('live voice: moving between chats keeps the conversation; leaving the compo
   assert.equal(link.notes.length, 1, 'the voice is told the conversation changed');
   assert.equal(f.links.length, 1);
 });
+
+test('live voice: a notice terminal is never relayed to the voice nor given as history', async () => {
+  const f = liveFixture();
+  await settle();
+  const link = f.links[0];
+  link.handlers.onLive();
+  link.handlers.onRequest({ id: 'item_1', words: 'Read the fixtures' });
+  await settle();
+  const owner = { id: 'u1', role: 'user' as const, text: 'Read the fixtures' };
+  const stopped: VoiceChatMessage = { ...reply('a1', 'Stopped. 1 result kept.', 'failed'), terminal: { notice: { code: 'stopped' } } };
+  f.controller.observe('chat-a', [...f.history, owner, stopped]);
+  assert.deepEqual(link.said, [], 'the app’s stop is not Clem’s to say');
+  f.controller.disable();
+
+  // A conversation opened with a notice in it starts the voice without it.
+  const links: FakeLive[] = [];
+  const controller = new VoiceModeController({
+    createSpeaker: handlers => new FakeSpeaker(handlers),
+    createMic: () => ({ startRecording: async () => undefined, cancel: () => undefined }),
+    live: { available: async () => true, create: handlers => { const created = new FakeLive(handlers); links.push(created); return created; } },
+  });
+  controller.enable('chat-b', async () => undefined, [owner, stopped, reply('a2', 'Two files read.')]);
+  await settle();
+  assert.deepEqual(links[0]?.started[0], [{ role: 'user', text: 'Read the fixtures' }, { role: 'assistant', text: 'Two files read.' }]);
+  controller.disable();
+});

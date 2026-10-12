@@ -14,6 +14,9 @@ export interface VoiceChatMessage {
   answerDraft?: { id: string; phase?: string; withdrawn?: string };
   checkIn?: unknown;
   approval?: { preview?: { ask?: string } };
+  /** The typed terminal. A notice is the app's status for a turn no model
+   *  spoke for: it is shown as a status line and never read aloud. */
+  terminal?: { notice?: unknown };
 }
 
 export const FINISHED_STATUSES = new Set(['complete', 'awaiting-reply', 'awaiting-approval', 'awaiting-plan', 'failed']);
@@ -64,13 +67,20 @@ export interface VoiceUtterance {
   draftId?: string;
 }
 
-const readableText = (message: VoiceChatMessage) => message.text?.trim() || message.approval?.preview?.ask?.trim() || '';
+/** What of a message voice may read: Clem's words, or a card's question in
+ *  her words. A notice terminal has none, whatever text it carries. */
+export function voiceReadableText(message: VoiceChatMessage): string {
+  if (message.terminal?.notice) return '';
+  return message.text?.trim() || message.approval?.preview?.ask?.trim() || '';
+}
+const readableText = voiceReadableText;
 
 /** Queued or playing speech remains bound to the exact message that permitted
  * it. A withdrawn/replaced answer or tool intent is no longer speakable. */
 export function voiceUtteranceCurrent(utterance: VoiceUtterance, messages: readonly VoiceChatMessage[]): boolean {
   const message = messages.find(message => message.id === utterance.messageId);
-  if (!message || message.role !== 'assistant' || readableText(message) !== utterance.sourceText || message.status !== utterance.status) return false;
+  if (!message || message.role !== 'assistant' || message.terminal?.notice
+    || readableText(message) !== utterance.sourceText || message.status !== utterance.status) return false;
   if (utterance.kind === 'tool-intent') {
     const draft = message.answerDraft;
     return Boolean(draft && draft.id === utterance.draftId && draft.phase === 'withdrawn' && draft.withdrawn === 'tool_call');
@@ -103,6 +113,8 @@ export function voiceUtterances(
   };
   for (const message of messages) {
     if (message.role !== 'assistant' || baseline.has(message.id)) continue;
+    // The app's status for a turn no model spoke for is never Clem's to say.
+    if (message.terminal?.notice) continue;
     const draft = message.answerDraft;
     if (draft) {
       // Explicit tool-call withdrawal is the engine's progress projection,

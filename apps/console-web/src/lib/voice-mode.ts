@@ -23,7 +23,7 @@ import { useSyncExternalStore } from 'react';
 import { NotchVoice, type NotchVoiceHandlers, type NotchVoiceOptions } from './notch-voice';
 import { VoiceSpeaker, type VoiceSpeakerHandlers } from './voice-speaker';
 import { heardCue, workingTick } from './voice-cues';
-import { spokenWords, voiceBaseline, voiceTurnEnded, voiceTurnRunning, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage, type VoiceUtterance } from './voice-turns';
+import { spokenWords, voiceBaseline, voiceReadableText, voiceTurnEnded, voiceTurnRunning, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage, type VoiceUtterance } from './voice-turns';
 import { liveSpokenText, liveVoiceAvailable, WebRtcLiveVoice, type LiveHistoryMessage, type LiveVoiceHandlers, type LiveVoiceLink } from './live-voice';
 
 export type VoicePhase = 'off' | 'connecting' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
@@ -466,7 +466,7 @@ export class VoiceModeController {
 function liveHistory(messages: readonly VoiceChatMessage[]): LiveHistoryMessage[] {
   return messages
     .filter(message => !message.checkIn)
-    .map(message => ({ role: message.role, text: (message.text?.trim() || message.approval?.preview?.ask?.trim() || '') }))
+    .map(message => ({ role: message.role, text: voiceReadableText(message) }))
     .filter(message => message.text)
     .slice(-LIVE_HISTORY_MESSAGES);
 }

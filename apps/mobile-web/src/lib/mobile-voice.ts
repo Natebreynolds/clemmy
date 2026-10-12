@@ -1,7 +1,7 @@
 import { speakVoice, transcribeVoice } from './api';
 import { StreamingPcmResampler, float32ToPcm16, pcm16Seconds, pcm16ToWav } from './pcm';
 import { microphoneProblem } from './dictation-support';
-import { spokenWords, voiceTurnEnded, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage, type VoiceUtterance } from './voice-turns';
+import { spokenWords, voiceReadableText, voiceTurnEnded, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage, type VoiceUtterance } from './voice-turns';
 import { liveSpokenText, type LiveHistoryMessage, type LiveVoiceHandlers, type LiveVoiceLink } from '@clem/chat-engine';
 import { PhoneLiveVoice, phoneLiveVoiceAvailable } from './live-voice';
 
@@ -352,7 +352,7 @@ export class MobileVoiceController {
 function liveHistory(messages: readonly VoiceChatMessage[]): LiveHistoryMessage[] {
   return messages
     .filter(message => !message.checkIn)
-    .map(message => ({ role: message.role, text: message.text?.trim() || message.approval?.preview?.ask?.trim() || '' }))
+    .map(message => ({ role: message.role, text: voiceReadableText(message) }))
     .filter(message => message.text)
     .slice(-24);
 }
