@@ -291,6 +291,25 @@ test('daemon lease: an owner pid now held by a process started after the lease w
   }
 });
 
+test('daemon lease: a live daemon that looks newer than its lease (a clock step) keeps it', { skip: process.platform !== 'win32' && !psReadable() }, async () => {
+  // A positional verb first: node stops reading its own options there.
+  const daemonShaped = await spawnSignalableChild(['daemon', '--foreground']);
+  const token = '66666666-6666-4666-8666-666666666666';
+  try {
+    rmSync(DAEMON_LEASE_DIR, { recursive: true, force: true });
+    mkdirSync(DAEMON_LEASE_DIR, { recursive: true });
+    // The lease reads an hour older than the process: a clock stepped back
+    // after the owner wrote it. Its daemon signature still proves ownership.
+    writeFileSync(path.join(DAEMON_LEASE_DIR, `owner-${token}.json`), JSON.stringify({
+      version: 1, pid: daemonShaped.pid, token, startedAt: new Date(Date.now() - 3_600_000).toISOString(),
+    }));
+    assert.equal(acquireDaemonLease(process.pid), false, 'a live daemon is never evicted by a clock change');
+  } finally {
+    rmSync(DAEMON_LEASE_DIR, { recursive: true, force: true });
+    daemonShaped.kill('SIGKILL');
+  }
+});
+
 test('ps elapsed time reads in every form ps prints', async () => {
   const { parsePsElapsedSeconds } = await import('./process.js');
   assert.equal(parsePsElapsedSeconds('   00:07\n'), 7);

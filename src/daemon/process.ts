@@ -198,18 +198,25 @@ export function parsePsElapsedSeconds(text: string): number | null {
   return ((Number(days ?? 0) * 24 + Number(hours ?? 0)) * 60 + Number(minutes)) * 60 + Number(seconds);
 }
 
-/** A lease's owner pid that now belongs to a process started after the lease
- *  was written was reused: the owner wrote the lease while it was running, so
- *  its process always predates it. Windows recycles pids quickly and every
- *  stop there is a hard kill that leaves the lease behind, so after an update
- *  the old pid is often an unrelated process of the same user. A competing
- *  daemon still mid-start predates its own lease and keeps blocking. An
- *  unreadable start time proves nothing and keeps blocking. */
+/** A lease's owner pid was reused when two independent readings agree: the
+ *  process now holding it started after the lease was written (the owner wrote
+ *  the lease while it was running, so its process always predates it), and
+ *  that process carries no daemon signature. Windows recycles pids quickly and
+ *  every stop there is a hard kill that leaves the lease behind, so after an
+ *  update the old pid is often an unrelated process of the same user.
+ *
+ *  Either reading alone can be wrong: a clock step can make a live owner look
+ *  newer than its lease, and a concurrent starter is guarded by its start time.
+ *  A live daemon always carries its signature, so no clock change evicts it,
+ *  and a competing daemon mid-start predates its own lease. Anything
+ *  unreadable keeps blocking. */
 const PID_START_CLOCK_SLACK_MS = 2_000;
 function leaseOwnerPidWasReused(owner: { pid: number; startedAt: string }): boolean {
   const leaseAt = Date.parse(owner.startedAt);
   const started = readProcessStartMs(owner.pid);
-  return Number.isFinite(leaseAt) && started !== null && started > leaseAt + PID_START_CLOCK_SLACK_MS;
+  if (!Number.isFinite(leaseAt) || started === null || started <= leaseAt + PID_START_CLOCK_SLACK_MS) return false;
+  const command = readProcessCommandLine(owner.pid);
+  return command !== null && !DAEMON_ARGV_RE.test(command);
 }
 
 /** Test-only: substitute the ps state reader (Node reaps its own children, so
