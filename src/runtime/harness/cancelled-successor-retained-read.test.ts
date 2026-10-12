@@ -226,7 +226,7 @@ test('a larger unknown-completeness result is bounded in context and losslessly 
   assert.match(review.summary, /not current-source tool executions/);
   for (const privateContext of [context]) {
     assert.equal(privateContext.match(/STOP \/ CONTINUE REASONING:/g)?.length, 1);
-    assert.match(privateContext, /fresh empty read or absent target alone does not prove/);
+    assert.match(privateContext, /A fresh read of target state, including an empty or absent target, is not exact-operation settlement or no-dispatch proof/);
     assert.match(privateContext, /exact session, accepted source, attempt and run ownership/);
     assert.match(privateContext, /current accepted source and normal gates/);
     assert.match(privateContext, /durable parent-to-successor selector: repeated Continue rejoins/);
