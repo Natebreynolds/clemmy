@@ -12,6 +12,8 @@ import { getSession, openEventLog } from '../runtime/harness/eventlog.js';
 import { modelProviderLive, resolveRoleModel, type ModelRole, type ResolvedRoleModel } from '../runtime/harness/model-roles.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { routedPrimaryModel } from '../runtime/harness/router-model.js';
+import { codexModelsAvailable } from '../runtime/harness/model-role-options.js';
+import { codexQuotaExhausted } from '../runtime/harness/rate-limit-store.js';
 import { agentModelIsRole } from './agent-binding.js';
 import { getAgentRecord } from './agent-record.js';
 import { sessionAgentState } from './session-agent-state.js';
@@ -27,6 +29,8 @@ export interface SessionAgentModelDeps {
   agentModel: (agentId: string) => { name: string; model: string | null } | null;
   live: (modelId: string) => boolean;
   roleModel: (role: ModelRole) => Pick<ResolvedRoleModel, 'modelId' | 'inactiveBinding'>;
+  /** Execution-only reason; a preview Boolean cannot identify quota exhaustion. */
+  executionCheck?: (modelId: string) => SavedAgentModelExecutionBlock | null;
 }
 
 const productionDeps: SessionAgentModelDeps = {
@@ -43,8 +47,9 @@ export type SessionAgentExecutionModel =
   | { kind: 'default' }
   | ({ kind: 'pinned' } & SessionAgentModel)
   | { kind: 'unavailable'; modelId: string | null; savedModel: string | null;
-      agentId: string | null; agentName: string | null; reason: 'not_connected' | 'unverified' };
+      agentId: string | null; agentName: string | null; reason: SavedAgentModelExecutionBlock | 'unverified' };
 export type UnavailableSessionAgentModel = Extract<SessionAgentExecutionModel, { kind: 'unavailable' }>;
+export type SavedAgentModelExecutionBlock = 'not_connected' | 'codex_quota_exhausted';
 
 /** A saved name must still route to itself and its declared owning provider.
  * Canonical route selection is pure: it constructs no model and performs no
@@ -57,6 +62,27 @@ export function savedAgentModelExecutionLive(modelId: string, deps: {
     const route = deps.route(modelId);
     return route.modelId === modelId && deps.live(modelId, route.provider);
   } catch { return false; }
+}
+
+/** Classify an existing refusal without changing availability or substituting
+ * a model. Quota explains only the exact connected Codex route, and uses the
+ * same current predicate as the provider's existing liveness gate. */
+export function savedAgentModelExecutionCheck(modelId: string, deps: {
+  route: (modelId: string) => Pick<ReturnType<typeof routedPrimaryModel>, 'modelId' | 'provider'>;
+  live: typeof modelProviderLive;
+  codexConnected: () => boolean;
+  codexQuotaExhausted: () => boolean;
+} = { route: routedPrimaryModel, live: modelProviderLive,
+  codexConnected: codexModelsAvailable, codexQuotaExhausted }): SavedAgentModelExecutionBlock | null {
+  try {
+    const route = deps.route(modelId);
+    if (route.modelId !== modelId) return 'not_connected';
+    if (deps.live(modelId, route.provider)) return null;
+    if (route.provider === 'codex' && deps.codexConnected() && deps.codexQuotaExhausted()) {
+      return 'codex_quota_exhausted';
+    }
+    return 'not_connected';
+  } catch { return 'not_connected'; }
 }
 
 function time(value: unknown): number | null {
@@ -76,7 +102,10 @@ export function _setSessionAgentModelDepsForTests(overrides: Partial<SessionAgen
 export function sessionAgentExecutionModel(sessionId: string,
   overrides: Partial<SessionAgentModelDeps> = {}): SessionAgentExecutionModel {
   const deps = { ...productionDeps, ...depsForTests, ...overrides };
-  const executionLive = overrides.live ?? depsForTests.live ?? savedAgentModelExecutionLive;
+  const executionLiveOverride = overrides.live ?? depsForTests.live;
+  const executionCheck = overrides.executionCheck ?? depsForTests.executionCheck
+    ?? (executionLiveOverride ? (id: string): SavedAgentModelExecutionBlock | null =>
+      executionLiveOverride(id) ? null : 'not_connected' : savedAgentModelExecutionCheck);
   let agentId: string | null = null; let agentName: string | null = null;
   let savedModel: string | null = null; let modelId: string | null = null;
   try {
@@ -101,8 +130,10 @@ export function sessionAgentExecutionModel(sessionId: string,
       }
       modelId = resolved.modelId.trim() || null;
     }
-    if (!modelId || !executionLive(modelId)) return { kind: 'unavailable', modelId, savedModel,
+    if (!modelId) return { kind: 'unavailable', modelId, savedModel,
       agentId, agentName, reason: 'not_connected' };
+    const reason = executionCheck(modelId);
+    if (reason) return { kind: 'unavailable', modelId, savedModel, agentId, agentName, reason };
     return { kind: 'pinned', modelId, agentId, agentName };
   } catch {
     return { kind: 'unavailable', modelId, savedModel, agentId, agentName, reason: 'unverified' };

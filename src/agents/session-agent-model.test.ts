@@ -20,7 +20,9 @@ writeFileSync(path.join(HOME, 'state', 'machine-id'), 'session-agent-model\n');
 const { createAgentRecord } = await import('./agent-record.js');
 const { setSessionAgent } = await import('./session-agent.js');
 const { createSession } = await import('../runtime/harness/eventlog.js');
-const { sessionAgentAnsweringModel, sessionAgentExecutionModel, savedAgentModelExecutionLive, recordBrainChosenForSession, nextAnsweringAgentModel } = await import('./session-agent-model.js');
+const { sessionAgentAnsweringModel, sessionAgentExecutionModel, savedAgentModelExecutionLive, savedAgentModelExecutionCheck, recordBrainChosenForSession, nextAnsweringAgentModel } = await import('./session-agent-model.js');
+const { recordCodexRateLimit, codexQuotaExhausted, getRateLimitSnapshot,
+  CODEX_QUOTA_SAMPLE_FRESH_MS, __resetRateLimitStoreForTests } = await import('../runtime/harness/rate-limit-store.js');
 
 after(() => { rmSync(HOME, { recursive: true, force: true }); });
 
@@ -116,6 +118,71 @@ test('saved agent model execution uses canonical ownership and refuses model col
   assert.equal(savedAgentModelExecutionLive('ambiguous-choice', {
     route: () => { throw new Error('Two connected backends claim this name.'); }, live: () => true,
   }), false);
+});
+
+test('the exact saved Codex pin is held by a fresh exhausted sample, while a stale sample does not invent a quota hold', () => {
+  __resetRateLimitStoreForTests();
+  let at = Date.now();
+  const executionCheck = (modelId: string) => savedAgentModelExecutionCheck(modelId, {
+    route: (name) => ({ modelId: name, provider: 'codex' }),
+    live: () => !codexQuotaExhausted(at),
+    codexConnected: () => true,
+    codexQuotaExhausted: () => codexQuotaExhausted(at),
+  });
+  const deps = { metadataOf: () => ({ agentId: 'saved-codex' }),
+    agentModel: () => ({ name: 'Codex fixture', model: 'gpt-6.1-sol' }), executionCheck };
+  try {
+    assert.deepEqual(sessionAgentExecutionModel('parent', deps), { kind: 'pinned',
+      modelId: 'gpt-6.1-sol', agentId: 'saved-codex', agentName: 'Codex fixture' });
+    recordCodexRateLimit({ 'x-codex-primary-used-percent': '100',
+      'x-codex-primary-window-minutes': '10080', 'x-codex-primary-reset-at': String(at + 86_400_000),
+      'x-codex-secondary-used-percent': '0', 'x-codex-secondary-window-minutes': '0' });
+    at = getRateLimitSnapshot().codex!.capturedAt;
+    assert.equal(codexQuotaExhausted(at), true, 'zero-duration headroom cannot waive the real exhausted weekly window');
+    assert.deepEqual(sessionAgentExecutionModel('successor', deps), { kind: 'unavailable',
+      modelId: 'gpt-6.1-sol', savedModel: 'gpt-6.1-sol', agentId: 'saved-codex',
+      agentName: 'Codex fixture', reason: 'codex_quota_exhausted' });
+    at += CODEX_QUOTA_SAMPLE_FRESH_MS + 1;
+    assert.equal(codexQuotaExhausted(at), false, 'existing freshness bound is unchanged');
+    assert.equal(sessionAgentExecutionModel('after-stale-sample', deps).kind, 'pinned');
+  } finally { __resetRateLimitStoreForTests(); }
+});
+
+test('quota diagnostics cannot explain another provider, a substituted route, absent credentials or unknown quota state', () => {
+  let quotaChecks = 0;
+  const quota = () => { quotaChecks++; return true; };
+  for (const provider of ['claude', 'byo'] as const) {
+    assert.equal(savedAgentModelExecutionCheck('gpt-shaped-owned-id', {
+      route: (modelId) => ({ modelId, provider }), live: () => false,
+      codexConnected: () => { throw new Error('Other providers never inspect Codex credentials.'); }, codexQuotaExhausted: quota,
+    }), 'not_connected');
+  }
+  assert.equal(savedAgentModelExecutionCheck('gpt-6.1-sol', {
+    route: () => ({ modelId: 'claude-opus-5-5', provider: 'claude' }),
+    live: () => { throw new Error('A substituted route is never tested for service.'); },
+    codexConnected: () => true, codexQuotaExhausted: quota,
+  }), 'not_connected');
+  assert.equal(savedAgentModelExecutionCheck('gpt-6.1-sol', {
+    route: (modelId) => ({ modelId, provider: 'codex' }), live: () => false,
+    codexConnected: () => false, codexQuotaExhausted: quota,
+  }), 'not_connected');
+  assert.equal(quotaChecks, 0, 'unowned or disconnected routes cannot acquire Codex quota evidence');
+  assert.equal(savedAgentModelExecutionCheck('gpt-6.1-sol', {
+    route: (modelId) => ({ modelId, provider: 'codex' }), live: () => false,
+    codexConnected: () => true, codexQuotaExhausted: () => false,
+  }), 'not_connected');
+  assert.equal(savedAgentModelExecutionCheck('gpt-6.1-sol', {
+    route: () => { throw new Error('Unverified route'); }, live: () => true,
+    codexConnected: () => true, codexQuotaExhausted: quota,
+  }), 'not_connected');
+  assert.equal(savedAgentModelExecutionCheck('gpt-6.1-sol', {
+    route: (modelId) => ({ modelId, provider: 'codex' }), live: () => false,
+    codexConnected: () => true, codexQuotaExhausted: () => { throw new Error('Unverified quota'); },
+  }), 'not_connected');
+  const deps = { metadataOf: () => ({ agentId: 'unverified-agent' }),
+    agentModel: () => { throw new Error('Unverified saved agent'); }, executionCheck: () => 'codex_quota_exhausted' as const };
+  assert.equal(sessionAgentExecutionModel('unknown-agent', deps).kind, 'unavailable');
+  assert.equal((sessionAgentExecutionModel('unknown-agent', deps) as { reason: string }).reason, 'unverified');
 });
 
 test('the model chip reads what answers the next message, including an agent choice not yet sent', () => {

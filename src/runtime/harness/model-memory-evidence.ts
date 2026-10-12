@@ -1,7 +1,8 @@
 /** The memory view supplied to a model is distinct from memory-search hits.
  * This is advisory context provenance, never effect or permission authority. */
 import { createHash } from 'node:crypto';
-import { appendEvent, listEvents } from './eventlog.js';
+import { types as nodeTypes } from 'node:util';
+import { appendEvent, listEvents, openEventLog } from './eventlog.js';
 
 type Identity = { sessionId: string; sourceUserSeq: number };
 
@@ -87,12 +88,39 @@ export function visibleInstructionMemory(instructions: unknown, finalInstruction
 }
 
 /** This session's model-memory rows, newest first. */
-function memoryRows(sessionId: string) {
-  return listEvents(sessionId, { types: ['guardrail_tripped'], desc: true })
+function memoryRows(sessionId: string, sinceSeq?: number) {
+  return listEvents(sessionId, { types: ['guardrail_tripped'], desc: true,
+    ...(sinceSeq !== undefined ? { sinceSeq } : {}) })
     .reverse().filter(event => event.data.kind === 'model_memory_context');
 }
 
+/** A current source's model view can only have been recorded after its user
+ * event. This is a read bound, not authority; unknown/legacy identities keep
+ * their old unrestricted lookup and no request text is hydrated to prove it. */
+function canonicalMemorySource(identity: Identity): Identity | undefined {
+  if (!identity || typeof identity !== 'object' || nodeTypes.isProxy(identity)) return undefined;
+  const session = Object.getOwnPropertyDescriptor(identity, 'sessionId');
+  const source = Object.getOwnPropertyDescriptor(identity, 'sourceUserSeq');
+  if (!session || !source || !Object.hasOwn(session, 'value') || !Object.hasOwn(source, 'value')
+    || typeof session.value !== 'string' || !session.value
+    || !Number.isSafeInteger(source.value) || source.value < 1) return undefined;
+  const row = openEventLog().prepare(`SELECT seq FROM events
+    WHERE seq = ? AND session_id = ? AND type = 'user_input_received'`)
+    .get(source.value, session.value) as { seq: number } | undefined;
+  if (!row) return undefined;
+  // The metadata probe lends no durable capability. Recheck the inert input
+  // before using its bound, including under instrumented/reentrant readers.
+  const currentSession = Object.getOwnPropertyDescriptor(identity, 'sessionId');
+  const currentSource = Object.getOwnPropertyDescriptor(identity, 'sourceUserSeq');
+  if (!currentSession || !currentSource || !Object.hasOwn(currentSession, 'value') || !Object.hasOwn(currentSource, 'value')
+    || currentSession.value !== session.value || currentSource.value !== source.value) return undefined;
+  return { sessionId: session.value, sourceUserSeq: source.value };
+}
+
 function latest(identity: Identity) {
+  const canonical = canonicalMemorySource(identity);
+  if (canonical) return memoryRows(canonical.sessionId, canonical.sourceUserSeq - 1)
+    .find(event => event.data.sourceUserSeq === canonical.sourceUserSeq);
   return memoryRows(identity.sessionId).find(event => event.data.sourceUserSeq === identity.sourceUserSeq);
 }
 
@@ -158,10 +186,9 @@ export interface ModelMemoryManifestRecord {
 }
 
 export function latestModelMemoryManifest(sessionId: string, sourceUserSeq?: number): ModelMemoryManifestRecord | undefined {
-  const rows = memoryRows(sessionId);
   const row = sourceUserSeq === undefined
-    ? rows[0]
-    : rows.find(event => event.data.sourceUserSeq === sourceUserSeq);
+    ? memoryRows(sessionId)[0]
+    : latest({ sessionId, sourceUserSeq });
   if (!row || !readable(row.data)) return undefined;
   const data = row.data as Record<string, unknown>;
   return {

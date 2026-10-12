@@ -1,10 +1,31 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
+import type { ModelRequest } from '@openai/agents-core';
+import { BASE_DIR, REAL_DEFAULT_CLEMENTINE_HOME } from '../src/config.js';
+import { CodexResponsesModel } from '../src/runtime/harness/codex-model.js';
+import { harnessRunContextStorage } from '../src/runtime/harness/brackets.js';
+import {
+  appendEvent, beginRunAttempt, closeEventLog, createSession, finishRunAttempt,
+  listEvents, recordRunAttemptUserInput,
+} from '../src/runtime/harness/eventlog.js';
+import { completedModelResponseBinding } from '../src/runtime/harness/model-response-binding.js';
+import { createModelResilienceObservation } from '../src/runtime/harness/model-resilience-observation.js';
+import { withModelResilienceTelemetry } from '../src/runtime/harness/resilient-model.js';
+import { withModelTransportRecorder } from '../src/runtime/harness/model-transport-observation.js';
+import { parseUsageLedger, usageFileForDate, withModelUsageAttribution } from '../src/runtime/usage-log.js';
+import { modelUsageAttributionStorage, memoryAccountingParent } from '../src/runtime/usage-log.js';
+import { automaticMemoryOriginsForCapture, autoCaptureProvenanceFromAcceptedEvent, extractAutoMemoryCandidates } from '../src/memory/auto-capture.js';
+import { closeMemoryDb, openMemoryDb } from '../src/memory/db.js';
+import { drainDurableConsolidationCandidates, enqueueAutoCaptureCandidates } from '../src/memory/durable-consolidation.js';
+import { readMemoryCandidateAccountingOrigin } from '../src/memory/memory-causal-accounting.js';
+import { inMemoryJobTurn, runMemoryModelJob } from '../src/memory/memory-job-context.js';
+import { parseAutomaticStandingMemoryReview } from '../src/memory/standing-memory-review.js';
+import { captureFreshSourceSessionContext } from '../src/runtime/harness/source-session-context.js';
 import {
   compareAcceptedTurns,
   compareAcceptedTasks,
@@ -1297,4 +1318,668 @@ test('formatted exact attribution never labels incomplete all-leg usage or billi
       assert.match(text, /all_leg_physical_inventory_unproved/);
     }
   } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+function transportObservationFixture() {
+  const fixture = fixtureHome();
+  const db = new Database(fixture.dbPath);
+  const start = Date.parse('2026-08-08T12:00:00.000Z');
+  const at = (ms: number) => new Date(start + ms).toISOString();
+  const common = { version: 1, sourceUserSeq: 2000, logicalTurnId: 'turn:2000', runAttemptId: 'transport-attempt',
+    clock: 'host_epoch_ms', journalFailed: false, physicalAttempt: 1, purpose: 'reviewer' };
+  const observed = (seq: number, ms: number, call: string, data: Record<string, unknown>): FixtureEvent => ({
+    seq, type: 'model_transport_observed', at: at(ms), data: { ...common, at: start + ms, modelCallId: call, ...data },
+  });
+  const dispatch = (seq: number, ms: number, call: string, id: string, ordinal = 1) => observed(seq, ms, call,
+    { phase: 'dispatch_started', transport: 'raw_claude_messages', dispatchId: id, wireSubattempt: ordinal });
+  const headers = (seq: number, ms: number, call: string, id: string, status: number, ordinal = 1) => observed(seq, ms, call,
+    { phase: 'headers_received', transport: 'raw_claude_messages', dispatchId: id, wireSubattempt: ordinal, status, ok: status === 200 });
+  const completed = (seq: number, ms: number, call: string, ids: string[], responseId: string) => observed(seq, ms, call,
+    { phase: 'model_result_completed', resultScope: 'original_sdk_response', dispatchIds: ids,
+      hostResultReceiptId: `receipt-${call}`, providerResponseIdDigest: createHash('sha256').update(responseId).digest('hex'), wireUsageCoverage: 'unproved' });
+  seedSession(db, 'transport-task', [
+    { seq: 2000, type: 'user_input_received', at: at(0) },
+    dispatch(2001, 100, 'call-a', 'wire-a'), dispatch(2002, 200, 'call-b', 'wire-b'),
+    headers(2003, 300, 'call-a', 'wire-a', 200),
+    observed(2004, 450, 'call-b', { phase: 'dispatch_failed', transport: 'raw_claude_messages', dispatchId: 'wire-b', wireSubattempt: 1, usage: 'unknown' }),
+    dispatch(2005, 500, 'call-c', 'wire-c'), headers(2006, 600, 'call-c', 'wire-c', 400),
+    dispatch(2007, 700, 'call-c', 'wire-c-retry', 2),
+    observed(2008, 800, 'call-b', { phase: 'model_attempt_retired', resultScope: 'local_retirement', dispatchIds: ['wire-b'],
+      hostResultReceiptId: 'receipt-b', outcome: 'failed', remoteSettlement: 'unknown', usage: 'unknown' }),
+    headers(2009, 900, 'call-c', 'wire-c-retry', 200, 2),
+    completed(2010, 1000, 'call-a', ['wire-a'], 'provider-a'),
+    completed(2011, 1100, 'call-c', ['wire-c', 'wire-c-retry'], 'provider-c'),
+    { seq: 2012, type: 'conversation_completed', at: at(2500), data: typedTerminal('transport-task', 2000, 1) },
+  ]);
+  db.prepare('INSERT INTO run_attempts VALUES (?, ?, ?, ?, ?, ?)').run('transport-attempt', 'transport-task', at(0), at(2600), 'completed', 2000);
+  db.close();
+  const usage = [
+    { id: 'call-a', responseId: 'provider-a', ms: 1000, input: 20, ok: true },
+    { id: 'call-c', responseId: 'provider-c', ms: 1100, input: 30, ok: true },
+    { id: 'call-b', responseId: undefined, ms: 800, input: 0, ok: false },
+  ].map(row => ({ at: at(row.ms), source: 'transport-task', kind: 'chat', role: 'reviewer', model: 'fixture-model',
+    providerReportedModel: row.ok ? 'fixture-model' : undefined, responseId: row.responseId,
+    trace: { acceptedSource: 'transport-task:2000', logicalTurnId: 'turn:2000', attemptId: 'transport-attempt', modelCallId: row.id },
+    inputTokens: row.input, outputTokens: row.ok ? 2 : 0, cacheDialect: row.ok ? 'inclusive' : 'unknown', ok: row.ok }));
+  writeFileSync(fixture.usageFile, readFileSync(fixture.usageFile, 'utf8') + usage.map(row => JSON.stringify(row)).join('\n') + '\n');
+  return { ...fixture, at };
+}
+
+test('canonical transport journal distinguishes dispatches, original results, interval union and accepted delivery wall', () => {
+  const fixture = transportObservationFixture();
+  try {
+    for (const measured of [measureAcceptedTask(fixture.home, 'transport-task', 2000), measureAcceptedTurn(fixture.home, 'transport-task', 2000)]) {
+      const result = measured.transportObservation!;
+      assert.equal(result.inventory, 'partial'); assert.equal(result.observedDispatches, 4);
+      assert.equal(result.headersReceived, 3); assert.equal(result.fetchFailures, 1); assert.equal(result.localRetirements, 1);
+      assert.equal(result.completedModelResults, 2); assert.equal(result.exactResponseUsageJoins, 2);
+      assert.equal(result.dispatchToHeadersOrLocalFailureUnionMs, 650, 'overlapping real intervals do not sum to elapsed task time');
+      assert.equal(result.observedCompletedModelSpanUnionMs, 1000);
+      assert.equal(result.window.elapsedMs, 2500); assert.equal(result.criticalPath, 'not_established');
+      assert.equal(result.dispatchesWithoutCompletedUsageProof, 4, 'SDK response joins do not close wire-local usage');
+      assert.equal(result.accountAuthority, 'unproved'); assert.equal(result.schemaAndServingIdentity, 'not_bound_by_transport_journal');
+      assert.equal(measured.promptTokens, 50); assert.equal(measured.uncertifiedUsageCalls, 1);
+      assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+      assert.equal(measured.usageCompleteness.cost.actualBilling, 'not_measured');
+    }
+    assert.equal(measureAcceptedTask(fixture.home, 'transport-task', 2000).taskWallMs, 2500);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('canonical transport proof rejects foreign attempts, reused wire/result IDs and missing clocks without changing token lower bounds', () => {
+  for (const variant of ['foreign-attempt', 'duplicate-wire', 'duplicate-result', 'missing-clock', 'missing-header', 'wrong-header-transport', 'wrong-header-subattempt', 'contradictory-extra-endpoint'] as const) {
+    const fixture = transportObservationFixture();
+    try {
+      const db = new Database(fixture.dbPath);
+      if (variant === 'foreign-attempt') db.exec("UPDATE events SET data_json=json_set(data_json,'$.runAttemptId','foreign-attempt') WHERE session_id='transport-task' AND type='model_transport_observed'");
+      if (variant === 'duplicate-wire') db.exec("UPDATE events SET data_json=json_set(data_json,'$.dispatchId','wire-a') WHERE seq=2007");
+      if (variant === 'duplicate-result') db.exec("UPDATE events SET data_json=json_set(data_json,'$.hostResultReceiptId','receipt-call-a') WHERE seq=2011");
+      if (variant === 'missing-clock') db.exec("UPDATE events SET data_json=json_remove(data_json,'$.clock') WHERE session_id='transport-task' AND type='model_transport_observed'");
+      if (variant === 'missing-header') db.exec('DELETE FROM events WHERE seq=2009');
+      if (variant === 'wrong-header-transport') db.exec("UPDATE events SET data_json=json_set(data_json,'$.transport','typesafe_systemone') WHERE seq=2009");
+      if (variant === 'wrong-header-subattempt') db.exec("UPDATE events SET data_json=json_set(data_json,'$.wireSubattempt',1) WHERE seq=2009");
+      if (variant === 'contradictory-extra-endpoint') db.exec(`
+        UPDATE events SET seq=2013 WHERE seq=2012;
+        UPDATE events SET seq=2012 WHERE seq=2011;
+        UPDATE events SET seq=2011 WHERE seq=2010;
+        INSERT INTO events (seq,session_id,turn,role,type,data_json,created_at)
+          SELECT 2010,session_id,turn,role,type,json_set(data_json,'$.transport','typesafe_systemone','$.wireSubattempt',1),created_at
+          FROM events WHERE seq=2009;
+      `);
+      db.close();
+      const measured = measureAcceptedTask(fixture.home, 'transport-task', 2000); const result = measured.transportObservation!;
+      assert.equal(measured.promptTokens, 50); assert.equal(measured.taskWallMs, 2500);
+      assert.equal(result.allLegPhysicalInventory, 'unproved');
+      assert.ok(result.issues.some(issue => /invalid_transport|duplicate_transport|unproved_completed|unbounded_transport|unsettled_transport/.test(issue)), variant);
+      if (variant === 'missing-clock') {
+        assert.equal(result.dispatchToHeadersOrLocalFailureUnionMs, null);
+        assert.equal(result.observedCompletedModelSpanUnionMs, null);
+      } else assert.ok((result.exactResponseUsageJoins ?? 0) < 2, variant);
+      if (variant === 'contradictory-extra-endpoint') {
+        assert.equal(result.exactResponseUsageJoins, 1);
+        assert.equal(result.dispatchToHeadersOrLocalFailureUnionMs, 450, 'contradictory dispatch interval is omitted');
+      }
+    } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  }
+});
+
+test('missing journal and after-delivery retirement stay explicit unknown rather than zero or an extended task wall', () => {
+  const fixture = transportObservationFixture();
+  try {
+    const db = new Database(fixture.dbPath);
+    db.exec(`UPDATE events SET data_json=json_set(data_json,'$.at',${Date.parse(fixture.at(3000))}), created_at='${fixture.at(3000)}' WHERE seq=2008`);
+    db.close();
+    const result = measureAcceptedTask(fixture.home, 'transport-task', 2000).transportObservation!;
+    assert.equal(result.afterDeliveryEvents, 1); assert.equal(result.window.elapsedMs, 2500);
+    const absent = measureAcceptedTask(fixture.home, 'multi', 201).transportObservation!;
+    assert.equal(absent.inventory, 'not_observed'); assert.equal(absent.observedDispatches, null);
+    assert.equal(absent.completedModelResults, null); assert.equal(absent.dispatchToHeadersOrLocalFailureUnionMs, null);
+    assert.equal(absent.allLegPhysicalInventory, 'unproved');
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+function localAdapterFixture() {
+  const fixture = fixtureHome(); const db = new Database(fixture.dbPath);
+  const epoch = Date.parse('2026-08-09T12:00:00.000Z');
+  const at = (ms: number) => new Date(epoch + ms).toISOString();
+  const common = { version: 1, sourceUserSeq: 3000, logicalTurnId: 'turn:3000', runAttemptId: 'adapter-attempt',
+    clock: 'host_epoch_ms', journalFailed: false, physicalAttempt: 1, purpose: 'reviewer', ownerKind: 'accepted_source_scope' };
+  const event = (seq: number, ms: number, call: string, fields: Record<string, unknown>): FixtureEvent => ({
+    seq, type: 'model_transport_observed', at: at(ms), data: { ...common, at: epoch + ms, modelCallId: call, ...fields },
+  });
+  const begin = (seq: number, call: string) => event(seq, seq - 3000, call,
+    { phase: 'adapter_attempt_created', resultScope: 'local_adapter_attempt', dispatchIds: [] });
+  const finish = (seq: number, call: string, fields: Record<string, unknown>) => event(seq, seq - 3000, call,
+    { phase: 'adapter_attempt_finished', outcome: 'returned', resultScope: 'local_retirement', dispatchIds: [],
+      usage: 'unknown', remoteSettlement: 'unknown', ...fields });
+  const digest = (id: string) => createHash('sha256').update(id).digest('hex');
+  seedSession(db, 'adapter-task', [
+    { seq: 3000, type: 'user_input_received', at: at(0) },
+    begin(3001, 'sdk-ok'), finish(3002, 'sdk-ok', { resultScope: 'original_sdk_response', providerResponseIdDigest: digest('provider-ok') }),
+    begin(3003, 'sdk-empty'), finish(3004, 'sdk-empty', { outcome: 'failed', resultScope: 'original_sdk_response', providerResponseIdDigest: digest('provider-empty') }),
+    begin(3005, 'cancelled'), finish(3006, 'cancelled', { outcome: 'cancelled' }),
+    begin(3007, 'failed'), finish(3008, 'failed', { outcome: 'failed' }),
+    begin(3009, 'parsed'),
+    event(3010, 10, 'parsed', { phase: 'dispatch_started', transport: 'typesafe_systemone', dispatchId: 'wire-parsed', wireSubattempt: 1, late: false }),
+    event(3011, 11, 'parsed', { phase: 'headers_received', transport: 'typesafe_systemone', dispatchId: 'wire-parsed', wireSubattempt: 1, status: 200, ok: true, late: false }),
+    finish(3012, 'parsed', { resultScope: 'owned_systemone_parser', dispatchIds: ['wire-parsed'], usage: 'reported',
+      remoteSettlement: 'parsed_response', providerReportedModel: 'systemone-actual' }),
+    event(3013, 13, 'parsed', { phase: 'model_result_completed', resultScope: 'owned_systemone_parser',
+      outcome: 'returned', dispatchIds: ['wire-parsed'], usage: 'reported', remoteSettlement: 'parsed_response', providerReportedModel: 'systemone-actual', hostResultReceiptId: 'parser-receipt' }),
+    begin(3014, 'sdk-rowless'), finish(3015, 'sdk-rowless', { resultScope: 'original_sdk_response', providerResponseIdDigest: digest('provider-rowless') }),
+    { seq: 3030, type: 'conversation_completed', at: at(100), data: typedTerminal('adapter-task', 3000, 1) },
+  ]);
+  db.prepare('INSERT INTO run_attempts VALUES (?, ?, ?, ?, ?, ?)').run('adapter-attempt', 'adapter-task', at(0), at(100), 'completed', 3000);
+  db.close();
+  const usage = [
+    { call: 'sdk-ok', responseId: 'provider-ok', input: 20, model: 'sdk-actual', ok: true },
+    { call: 'sdk-empty', responseId: 'provider-empty', input: 0, model: 'sdk-actual', ok: false },
+    { call: 'parsed', responseId: undefined, input: 30, model: 'systemone-actual', ok: true },
+  ].map(row => ({ at: at(50), source: 'adapter-task', kind: 'chat', role: 'reviewer', model: row.model,
+    providerReportedModel: row.model, responseId: row.responseId, inputTokens: row.input, outputTokens: row.ok ? 2 : 0,
+    cacheDialect: row.ok ? 'inclusive' : 'unknown', ok: row.ok,
+    trace: { acceptedSource: 'adapter-task:3000', logicalTurnId: 'turn:3000', attemptId: 'adapter-attempt', modelCallId: row.call } }));
+  writeFileSync(fixture.usageFile, readFileSync(fixture.usageFile, 'utf8') + usage.map(row => JSON.stringify(row)).join('\n') + '\n');
+  return { ...fixture, at, event, epoch };
+}
+
+test('local adapter outcomes include SDK paths without fetches and preserve unknown usage, wire counters and billing limits', () => {
+  const fixture = localAdapterFixture();
+  try {
+    for (const measured of [measureAcceptedTask(fixture.home, 'adapter-task', 3000), measureAcceptedTurn(fixture.home, 'adapter-task', 3000)]) {
+      const transport = measured.transportObservation!; const local = transport.localAdapterAttempts!;
+      assert.equal(local.status, 'observed_local_endpoints'); assert.deepEqual(local.issues, []);
+      assert.equal(local.createdAttempts, 6); assert.equal(local.localTerminals, 6);
+      assert.equal(local.returnedAttempts, 3); assert.equal(local.failedAttempts, 2); assert.equal(local.cancelledAttempts, 1);
+      assert.equal(local.noObservedDispatchAttempts, 5); assert.equal(local.originalSdkIdentities, 3);
+      assert.equal(local.ownedParsedResults, 1); assert.equal(local.exactReportedUsageJoins, 2); assert.equal(local.unknownUsageAttempts, 4);
+      assert.equal(local.allLegPhysicalInventory, 'unproved'); assert.equal(local.publicInvocationCoverage, 'unproved');
+      assert.equal(local.accountAndBackendAuthority, 'unproved'); assert.equal(transport.observedDispatches, 1);
+      assert.equal(transport.exactResponseUsageJoins, 1); assert.equal(transport.dispatchToHeadersOrLocalFailureUnionMs, 1);
+      assert.equal(measured.promptTokens, 50); assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+      assert.equal(measured.usageCompleteness.cost.actualBilling, 'not_measured');
+    }
+    const db = new Database(fixture.dbPath); db.exec("DELETE FROM events WHERE type='model_transport_observed' AND json_extract(data_json,'$.modelCallId')='parsed'"); db.close();
+    const transport = measureAcceptedTask(fixture.home, 'adapter-task', 3000).transportObservation!;
+    assert.equal(transport.localAdapterAttempts!.createdAttempts, 5);
+    assert.equal(transport.inventory, 'not_observed'); assert.equal(transport.observedDispatches, null);
+    assert.equal(transport.completedModelResults, null); assert.equal(transport.exactResponseUsageJoins, null);
+    const absent = measureAcceptedTask(fixture.home, 'multi', 201).transportObservation!.localAdapterAttempts!;
+    assert.equal(absent.status, 'not_observed'); assert.equal(absent.createdAttempts, null); assert.equal(absent.unknownUsageAttempts, null);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('local endpoint census rejects incomplete, foreign, conflicting and late evidence even when legacy late is false', () => {
+  for (const variant of ['missing-start', 'duplicate-start', 'wrong-attempt', 'changed-job', 'changed-purpose', 'clock',
+    'journal', 'late-dispatch', 'wire-namespace', 'digest-reused', 'bad-outcome', 'after-delivery', 'wrong-source',
+    'object-purpose', 'object-owner-kind', 'object-outcome', 'nonboolean-journal', 'missing-parser-model',
+    'persisted-after-delivery', 'attempt-ended-early', 'missing-attempt-bound', 'contradictory-result', 'duplicate-result', 'wrong-result-scope', 'reused-result-receipt'] as const) {
+    const fixture = localAdapterFixture();
+    try {
+      const db = new Database(fixture.dbPath);
+      if (variant === 'missing-start') db.exec('DELETE FROM events WHERE seq=3001');
+      if (variant === 'duplicate-start') seedSession(db, 'adapter-task', [fixture.event(3016, 16, 'sdk-ok', { phase: 'adapter_attempt_created', resultScope: 'local_adapter_attempt', dispatchIds: [] })]);
+      if (variant === 'wrong-attempt') db.exec("UPDATE events SET data_json=json_set(data_json,'$.runAttemptId','foreign') WHERE seq=3002");
+      if (variant === 'changed-job') db.exec("UPDATE events SET data_json=json_set(data_json,'$.usageJobId','different-job') WHERE seq=3002");
+      if (variant === 'changed-purpose') db.exec("UPDATE events SET data_json=json_set(data_json,'$.purpose','router') WHERE seq=3002");
+      if (variant === 'clock') db.exec("UPDATE events SET data_json=json_remove(data_json,'$.clock') WHERE seq=3002");
+      if (variant === 'journal') db.exec("UPDATE events SET data_json=json_set(data_json,'$.journalFailed',json('true')) WHERE seq=3002");
+      if (variant === 'late-dispatch') seedSession(db, 'adapter-task', [fixture.event(3016, 16, 'sdk-ok', { phase: 'dispatch_started', transport: 'raw_claude_messages', dispatchId: 'late-wire', wireSubattempt: 1, late: false })]);
+      if (variant === 'wire-namespace') db.exec("UPDATE events SET data_json=json_set(data_json,'$.ownerKind','accounting_parent') WHERE seq=3010");
+      if (variant === 'digest-reused') db.exec("UPDATE events SET data_json=json_set(data_json,'$.providerResponseIdDigest',json_extract((SELECT data_json FROM events WHERE seq=3002),'$.providerResponseIdDigest')) WHERE seq=3015");
+      if (variant === 'bad-outcome') db.exec("UPDATE events SET data_json=json_set(data_json,'$.outcome','done') WHERE seq=3002");
+      if (variant === 'after-delivery') db.prepare("UPDATE events SET data_json=json_set(data_json,'$.at',?),created_at=? WHERE seq=3002").run(fixture.epoch + 150, fixture.at(150));
+      if (variant === 'wrong-source') db.exec("UPDATE events SET data_json=json_set(data_json,'$.sourceUserSeq',499,'$.logicalTurnId','turn:499') WHERE seq=3002");
+      if (variant === 'object-purpose') db.exec(`UPDATE events SET data_json=json_set(data_json,'$.purpose',json('{"toString":"invalid"}')) WHERE seq=3002`);
+      if (variant === 'object-owner-kind') db.exec(`UPDATE events SET data_json=json_set(data_json,'$.ownerKind',json('{"toString":"invalid"}')) WHERE seq=3002`);
+      if (variant === 'object-outcome') db.exec(`UPDATE events SET data_json=json_set(data_json,'$.outcome',json('{"toString":"invalid"}')) WHERE seq=3002`);
+      if (variant === 'nonboolean-journal') db.exec("UPDATE events SET data_json=json_set(data_json,'$.journalFailed','false') WHERE seq=3002");
+      if (variant === 'missing-parser-model') db.exec("UPDATE events SET data_json=json_remove(data_json,'$.providerReportedModel') WHERE seq=3012");
+      if (variant === 'persisted-after-delivery') db.prepare('UPDATE events SET created_at=? WHERE seq=3002').run(fixture.at(150));
+      if (variant === 'attempt-ended-early') db.prepare('UPDATE run_attempts SET finished_at=? WHERE attempt_id=?').run(fixture.at(1), 'adapter-attempt');
+      if (variant === 'missing-attempt-bound') db.exec("UPDATE run_attempts SET finished_at=NULL WHERE attempt_id='adapter-attempt'");
+      if (variant === 'contradictory-result') db.exec("UPDATE events SET data_json=json_set(data_json,'$.providerReportedModel','different-actual') WHERE seq=3013");
+      if (variant === 'duplicate-result') seedSession(db, 'adapter-task', [fixture.event(3016, 16, 'parsed', { phase: 'model_result_completed',
+        resultScope: 'owned_systemone_parser', outcome: 'returned', dispatchIds: ['wire-parsed'], usage: 'reported',
+        remoteSettlement: 'parsed_response', providerReportedModel: 'systemone-actual', hostResultReceiptId: 'extra-result' })]);
+      if (variant === 'wrong-result-scope') db.exec("UPDATE events SET data_json=json_set(data_json,'$.resultScope','original_sdk_response') WHERE seq=3013");
+      if (variant === 'reused-result-receipt') seedSession(db, 'adapter-task', [fixture.event(3016, 16, 'other-call', { phase: 'model_result_completed',
+        resultScope: 'owned_systemone_parser', outcome: 'returned', dispatchIds: ['other-wire'], usage: 'reported',
+        remoteSettlement: 'parsed_response', providerReportedModel: 'systemone-actual', hostResultReceiptId: 'parser-receipt' })]);
+      db.close();
+      const measured = measureAcceptedTask(fixture.home, 'adapter-task', 3000); const local = measured.transportObservation!.localAdapterAttempts!;
+      // Duplicate original response identity is a usage gap even with closed local endpoints.
+      if (variant !== 'digest-reused') assert.equal(local.status, 'incomplete', variant);
+      assert.ok(local.exactReportedUsageJoins! < 2, variant);
+      assert.equal(measured.promptTokens, 50); assert.equal(measured.taskWallMs, 100);
+      assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+      if (variant === 'after-delivery' || variant === 'persisted-after-delivery') assert.equal(local.afterDeliveryEvents, 1);
+    } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  }
+});
+
+test('SDK original wire result can precede the distinct local returned endpoint without merging their meanings', () => {
+  const fixture = localAdapterFixture();
+  try {
+    const db = new Database(fixture.dbPath);
+    db.prepare("UPDATE events SET seq=3028,created_at=?,data_json=json_set(data_json,'$.at',?,'$.dispatchIds',json('[\"sdk-wire\"]')) WHERE seq=3002").run(fixture.at(28), fixture.epoch + 28);
+    seedSession(db, 'adapter-task', [
+      fixture.event(3016, 16, 'sdk-ok', { phase: 'dispatch_started', transport: 'raw_claude_messages', dispatchId: 'sdk-wire', wireSubattempt: 1, late: false }),
+      fixture.event(3017, 17, 'sdk-ok', { phase: 'headers_received', transport: 'raw_claude_messages', dispatchId: 'sdk-wire', wireSubattempt: 1, status: 200, ok: true, late: false }),
+      fixture.event(3018, 18, 'sdk-ok', { phase: 'model_result_completed', resultScope: 'original_sdk_response',
+        hostResultReceiptId: 'sdk-receipt', dispatchIds: ['sdk-wire'], providerResponseIdDigest: createHash('sha256').update('provider-ok').digest('hex') }),
+    ]); db.close();
+    const measured = measureAcceptedTask(fixture.home, 'adapter-task', 3000); const local = measured.transportObservation!.localAdapterAttempts!;
+    assert.equal(local.status, 'observed_local_endpoints'); assert.equal(local.exactReportedUsageJoins, 2);
+    assert.equal(measured.transportObservation!.observedDispatches, 2); assert.equal(measured.promptTokens, 50);
+    assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('detached accounting parent keeps its whole local namespace without claiming the job or credit bucket is billing authority', () => {
+  const fixture = localAdapterFixture();
+  try {
+    const db = new Database(fixture.dbPath);
+    db.exec("UPDATE events SET data_json=json_set(data_json,'$.ownerKind','accounting_parent','$.usageJobId','memory-job') WHERE type='model_transport_observed'");
+    db.close();
+    const local = measureAcceptedTask(fixture.home, 'adapter-task', 3000).transportObservation!.localAdapterAttempts!;
+    assert.equal(local.status, 'observed_local_endpoints'); assert.equal(local.exactReportedUsageJoins, 2);
+    assert.equal(local.accountAndBackendAuthority, 'unproved'); assert.equal(local.publicInvocationCoverage, 'unproved');
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('usage joins require the original same-call tuple, unique row, reported model and successful accounting', () => {
+  for (const variant of ['foreign-source', 'foreign-call', 'model-mismatch', 'duplicate-row', 'failed-placeholder', 'second-ordinal'] as const) {
+    const fixture = localAdapterFixture();
+    try {
+      const lines = readFileSync(fixture.usageFile, 'utf8').trim().split('\n');
+      const rows = lines.map(line => { try { return JSON.parse(line); } catch { return undefined; } });
+      const row = rows.find(item => item?.trace?.modelCallId === 'parsed');
+      if (variant === 'foreign-source') row.trace.acceptedSource = 'adapter-task:499';
+      if (variant === 'foreign-call') row.trace.modelCallId = 'different-call';
+      if (variant === 'model-mismatch') row.providerReportedModel = 'configured-only';
+      if (variant === 'duplicate-row') rows.push(row);
+      if (variant === 'failed-placeholder') { row.ok = false; row.inputTokens = 0; row.outputTokens = 0; row.cacheDialect = 'unknown'; }
+      if (variant === 'second-ordinal') {
+        const db = new Database(fixture.dbPath);
+        seedSession(db, 'adapter-task', [
+          fixture.event(3016, 16, 'parsed', { physicalAttempt: 2, phase: 'adapter_attempt_created', resultScope: 'local_adapter_attempt', dispatchIds: [] }),
+          fixture.event(3017, 17, 'parsed', { physicalAttempt: 2, phase: 'adapter_attempt_finished', outcome: 'returned',
+            resultScope: 'owned_systemone_parser', dispatchIds: [], usage: 'reported', remoteSettlement: 'parsed_response', providerReportedModel: 'systemone-actual' }),
+        ]); db.close();
+      }
+      writeFileSync(fixture.usageFile, rows.map((item, index) => item === undefined ? lines[index] : JSON.stringify(item)).join('\n') + '\n');
+      const measured = measureAcceptedTask(fixture.home, 'adapter-task', 3000);
+      assert.equal(measured.transportObservation!.localAdapterAttempts!.exactReportedUsageJoins, 1, variant);
+      assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+    } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  }
+});
+
+test('private memory payload is redacted before JS decoding while event metadata and malformed counters stay visible', () => {
+  const fixture = localAdapterFixture();
+  try {
+    const db = new Database(fixture.dbPath);
+    seedSession(db, 'adapter-task', [
+      { seq: 3020, type: 'guardrail_tripped', at: fixture.at(20), data: { kind: 'model_memory_context', privateText: 'must-not-enter-measurement', sourceUserSeq: 3000 } },
+      { seq: 3021, type: 'guardrail_tripped', at: fixture.at(21), data: { kind: 'ordinary_guardrail' } },
+      { seq: 3022, type: 'guardrail_tripped', at: fixture.at(22) },
+    ]);
+    db.exec("UPDATE events SET data_json='{malformed' WHERE seq=3022"); db.close();
+    const originalParse = JSON.parse; let privateDecoded = false;
+    JSON.parse = ((text: string, ...args: unknown[]) => {
+      if (text.includes('must-not-enter-measurement')) privateDecoded = true;
+      return Reflect.apply(originalParse, JSON, [text, ...args]);
+    }) as typeof JSON.parse;
+    try {
+      const session = measureSession(fixture.home, 'adapter-task');
+      const task = measureAcceptedTask(fixture.home, 'adapter-task', 3000);
+      assert.equal(privateDecoded, false); assert.equal(session.malformedEventPayloads, 1);
+      assert.equal(task.promptTokens, 50); assert.equal(task.taskWallMs, 100);
+      assert.equal(task.transportObservation!.localAdapterAttempts!.createdAttempts, 6);
+      assert.equal(session.turnWallMs, 100); assert.equal(session.terminalType, 'conversation_completed');
+    } finally { JSON.parse = originalParse; }
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+// Use the actual native producer, nominal original-response binder, host
+// observation sinks and ledger writer. Only the protected provider stream is
+// scripted; no telemetry or usage row is reconstructed from expected fields.
+class AccountingCodexModel extends CodexResponsesModel {
+  attempts = 0;
+  constructor(private readonly script: (attempt: number) => AsyncGenerator<any>) {
+    super('gpt-6.1-sol');
+  }
+  protected async *streamCodex(_request: ModelRequest): AsyncGenerator<any> {
+    yield* this.script(++this.attempts);
+  }
+}
+
+async function* accountingCodexSuccess(responseId: string, reportedModel: string | null = 'gpt-6.1-sol') {
+  yield { type: 'response.created', response: { id: responseId } };
+  yield { type: 'response.output_text.delta', delta: 'Synthetic accounting answer.', sequence_number: 1 };
+  yield { type: 'response.output_item.done', item: {
+    id: `message-${responseId}`, type: 'message', role: 'assistant', status: 'completed',
+    content: [{ type: 'output_text', text: 'Synthetic accounting answer.' }],
+  } };
+  yield { type: 'response.completed', response: { id: responseId,
+    ...(reportedModel === null ? {} : { model: reportedModel }),
+    usage: { input_tokens: 40, output_tokens: 4, total_tokens: 44,
+      input_tokens_details: { cached_tokens: 12 }, output_tokens_details: {} },
+  } };
+}
+
+function nativeCodexAccountingFixture() {
+  assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1', 'native stores require the isolated test launcher');
+  assert.notEqual(path.resolve(BASE_DIR), REAL_DEFAULT_CLEMENTINE_HOME);
+  const sessionId = `canonical-native-codex-${randomUUID()}`;
+  createSession({ id: sessionId, kind: 'chat', channel: 'test' });
+  const attempt = beginRunAttempt(sessionId);
+  const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user',
+    data: { text: 'Synthetic native Codex accounting fixture.' } });
+  return { home: BASE_DIR, sessionId, attempt, source, ordinal: 0 };
+}
+
+type NativeCodexAccountingFixture = ReturnType<typeof nativeCodexAccountingFixture>;
+
+function nativeCodexAccountingRows(fixture: NativeCodexAccountingFixture) {
+  const file = usageFileForDate(new Date(fixture.source.createdAt));
+  return parseUsageLedger(readFileSync(file, 'utf8')).filter(row =>
+    row.trace?.acceptedSource === `${fixture.sessionId}:${fixture.source.seq}`);
+}
+
+async function nativeCodexAccountingCall(fixture: NativeCodexAccountingFixture, model: AccountingCodexModel,
+  mode: 'buffered' | 'streamed' | 'interrupted' = 'buffered'): Promise<unknown> {
+  const ordinal = ++fixture.ordinal;
+  const observation = createModelResilienceObservation({
+    owner: { sessionId: fixture.sessionId, sourceUserSeq: fixture.source.seq, runAttemptId: fixture.attempt.attemptId },
+    requestOrdinal: () => ordinal, retired: () => false,
+  });
+  const request = { input: 'Synthetic native Codex accounting fixture.', tools: [], handoffs: [],
+    modelSettings: {}, outputType: 'text', tracing: false } as unknown as ModelRequest;
+  const invoke = <T>(work: () => T): T => withModelTransportRecorder(data => {
+    appendEvent({ sessionId: fixture.sessionId, turn: 1, role: 'system', type: 'model_transport_observed', data: { ...data } });
+  }, () => withModelUsageAttribution({ sessionId: fixture.sessionId, sourceUserSeq: fixture.source.seq,
+    attemptId: fixture.attempt.attemptId, role: 'brain', channel: 'test:native-codex' }, () =>
+    harnessRunContextStorage.run({ sessionId: fixture.sessionId, sourceUserSeq: fixture.source.seq,
+      runAttemptId: fixture.attempt.attemptId, turn: 1 } as never, () =>
+      withModelResilienceTelemetry(observation.observer, work))));
+  let outcome: 'returned' | 'failed' | 'cancelled' = 'failed';
+  try {
+    if (mode === 'buffered') {
+      const response = await invoke(() => model.getResponse(request));
+      outcome = 'returned';
+      return response;
+    }
+    const stream = invoke(() => model.getStreamedResponse(request));
+    if (mode === 'interrupted') {
+      const iterator = stream[Symbol.asyncIterator]();
+      assert.equal((await iterator.next()).done, false);
+      await iterator.return?.();
+      outcome = 'cancelled';
+      return undefined;
+    }
+    let original: unknown;
+    for await (const event of stream) if (event.type === 'response_done') original = event.response;
+    assert.ok(original, 'the native stream must yield its original response_done object');
+    outcome = 'returned';
+    return original;
+  } finally { observation.close(outcome); }
+}
+
+function finishNativeCodexAccountingFixture(fixture: NativeCodexAccountingFixture, cancelled = false) {
+  const data = typedTerminal(fixture.sessionId, fixture.source.seq, 1);
+  if (cancelled) {
+    data.presentation = { ...(data.presentation as Record<string, unknown>), status: 'cancelled', kind: 'stopped' };
+    data.turnOutcome = { ...(data.turnOutcome as Record<string, unknown>), status: 'cancelled' };
+  }
+  appendEvent({ sessionId: fixture.sessionId, turn: 1, role: 'assistant', type: 'conversation_completed',
+    data: { ...data, attemptId: fixture.attempt.attemptId } });
+  finishRunAttempt(fixture.attempt, cancelled ? 'cancelled' : 'completed');
+  return measureAcceptedTask(fixture.home, fixture.sessionId, fixture.source.seq);
+}
+
+test('native Codex producer feeds canonical original-call accounting without inventing wire, model or billing proof', async t => {
+  const priorDelay = process.env.CLEMMY_CODEX_TRANSPARENT_RETRY_DELAY_MS;
+  process.env.CLEMMY_CODEX_TRANSPARENT_RETRY_DELAY_MS = '0';
+  try {
+    for (const mode of ['buffered', 'streamed'] as const) await t.test(mode, async () => {
+      const fixture = nativeCodexAccountingFixture();
+      const model = new AccountingCodexModel(() => accountingCodexSuccess(`provider-${mode}`));
+      const original = await nativeCodexAccountingCall(fixture, model, mode);
+      const binding = completedModelResponseBinding(original)!;
+      assert.ok(binding); assert.equal(completedModelResponseBinding({ ...(original as object) }), undefined);
+      const rows = nativeCodexAccountingRows(fixture);
+      assert.equal(rows.length, 1); assert.equal(rows[0].trace?.modelCallId, binding.modelCallId);
+      assert.notEqual(rows[0].responseId, binding.modelCallId); assert.equal(binding.physicalAttempt, 1);
+      assert.equal(rows[0].providerReportedModel, 'gpt-6.1-sol');
+      assert.equal(rows[0].requestModel, undefined, 'scripted protected streams did not execute the actual outgoing-body constructor');
+      const measured = finishNativeCodexAccountingFixture(fixture);
+      assert.equal(measured.usageCompleteness.mainProducerCoverage.status, 'observed_completed_calls');
+      assert.equal(measured.usageCompleteness.mainProducerCoverage.responseBoundCalls, 1);
+      assert.equal(measured.promptTokens, 40); assert.equal(measured.cachedInputTokens, 12);
+      assert.equal(measured.outputTokens, 4);
+      const transport = measured.transportObservation!, local = transport.localAdapterAttempts!;
+      assert.equal(local.createdAttempts, 1); assert.equal(local.originalSdkIdentities, 1);
+      assert.equal(local.exactReportedUsageJoins, 1); assert.equal(local.noObservedDispatchAttempts, 1);
+      assert.equal(transport.observedDispatches, null, 'a local SDK original is not a physical HTTP dispatch census');
+      assert.equal(transport.allLegPhysicalInventory, 'unproved');
+      assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+      assert.equal(measured.usageCompleteness.identityGaps.billedAccountRows, 1);
+      assert.equal(measured.usageCompleteness.identityGaps.backendRows, 1);
+      assert.equal(measured.usageCompleteness.cost.actualBilling, 'not_measured');
+    });
+    await t.test('missing reported model does not borrow the selected model', async () => {
+      const fixture = nativeCodexAccountingFixture();
+      await nativeCodexAccountingCall(fixture, new AccountingCodexModel(() => accountingCodexSuccess('provider-model-unknown', null)));
+      const rows = nativeCodexAccountingRows(fixture);
+      assert.equal(rows[0].model, 'gpt-6.1-sol'); assert.equal(rows[0].providerReportedModel, undefined);
+      const measured = finishNativeCodexAccountingFixture(fixture);
+      assert.equal(measured.usageCompleteness.mainProducerCoverage.responseBoundCalls, 1);
+      assert.equal(measured.usageCompleteness.identityGaps.providerReportedModelRows, 1);
+      assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+    });
+    await t.test('transparent retry preserves unknown failed-attempt usage', async () => {
+      const fixture = nativeCodexAccountingFixture();
+      const model = new AccountingCodexModel(async function* (attempt) {
+        if (attempt === 1) yield { type: 'response.created', response: { id: 'provider-truncated' } };
+        else yield* accountingCodexSuccess('provider-retried');
+      });
+      const original = await nativeCodexAccountingCall(fixture, model);
+      assert.equal(model.attempts, 2); assert.equal(completedModelResponseBinding(original)?.physicalAttempt, 2);
+      const measured = finishNativeCodexAccountingFixture(fixture);
+      assert.equal(measured.promptTokens, 40); assert.equal(measured.usageRecords, 1);
+      assert.equal(measured.usageCompleteness.mainProducerCoverage.status, 'incomplete');
+      assert.equal(measured.usageCompleteness.mainProducerCoverage.responseBoundCalls, 0);
+      const local = measured.transportObservation!.localAdapterAttempts!;
+      assert.equal(local.createdAttempts, 2); assert.equal(local.failedAttempts, 1);
+      assert.equal(local.unknownUsageAttempts, 1); assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+    });
+    await t.test('consumer interruption remains a cancelled local attempt with no completed original', async () => {
+      const fixture = nativeCodexAccountingFixture();
+      await nativeCodexAccountingCall(fixture, new AccountingCodexModel(() => accountingCodexSuccess('provider-interrupted')), 'interrupted');
+      const measured = finishNativeCodexAccountingFixture(fixture, true);
+      assert.equal(measured.usageRecords, 0); assert.equal(measured.terminalStatus, 'cancelled');
+      assert.equal(measured.usageCompleteness.mainProducerCoverage.responseBoundCalls, 0);
+      const local = measured.transportObservation!.localAdapterAttempts!;
+      assert.equal(local.cancelledAttempts, 1); assert.equal(local.originalSdkIdentities, 0);
+      assert.equal(local.unknownUsageAttempts, 1); assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+    });
+    await t.test('concurrent separate owners sharing a provider ID retain distinct local UUIDs', async () => {
+      const a = nativeCodexAccountingFixture(), b = nativeCodexAccountingFixture();
+      const originals = await Promise.all([a, b].map(fixture => nativeCodexAccountingCall(fixture,
+        new AccountingCodexModel(() => accountingCodexSuccess('provider-shared-cross-task')))));
+      assert.notEqual(completedModelResponseBinding(originals[0])?.modelCallId, completedModelResponseBinding(originals[1])?.modelCallId);
+      for (const [index, fixture] of [a, b].entries()) {
+        const rows = nativeCodexAccountingRows(fixture);
+        assert.equal(rows.length, 1); assert.equal(rows[0].trace?.attemptId, fixture.attempt.attemptId);
+        assert.equal(rows[0].trace?.modelCallId, completedModelResponseBinding(originals[index])?.modelCallId);
+        const measured = finishNativeCodexAccountingFixture(fixture);
+        assert.equal(measured.promptTokens, 40); assert.equal(measured.usageCompleteness.mainProducerCoverage.responseBoundCalls, 1);
+        assert.equal(measured.transportObservation!.localAdapterAttempts!.exactReportedUsageJoins, 1);
+      }
+    });
+    await t.test('same-owner duplicate provider IDs retain both invocations but cannot prove unique provider usage', async () => {
+      const fixture = nativeCodexAccountingFixture();
+      const originals = await Promise.all([1, 2].map(() => nativeCodexAccountingCall(fixture,
+        new AccountingCodexModel(() => accountingCodexSuccess('provider-shared-same-task')))));
+      const callIds = originals.map(original => completedModelResponseBinding(original)!.modelCallId);
+      assert.equal(new Set(callIds).size, 2);
+      const rows = nativeCodexAccountingRows(fixture);
+      assert.equal(rows.length, 2); assert.equal(new Set(rows.map(row => row.trace?.modelCallId)).size, 2);
+      const measured = finishNativeCodexAccountingFixture(fixture);
+      assert.equal(measured.promptTokens, 80); assert.equal(measured.outputTokens, 8);
+      assert.equal(measured.usageCompleteness.mainProducerCoverage.observedCalls, 2);
+      assert.equal(measured.usageCompleteness.mainProducerCoverage.responseBoundCalls, 2, 'local invocation membership is distinct from provider physical uniqueness');
+      const transport = measured.transportObservation!, local = transport.localAdapterAttempts!;
+      assert.equal(local.createdAttempts, 2);
+      assert.equal(local.originalSdkIdentities, 0, 'a reused provider digest cannot certify two unique provider identities');
+      assert.equal(local.exactReportedUsageJoins, 0); assert.equal(local.unknownUsageAttempts, 2);
+      assert.equal(transport.observedDispatches, null); assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+      assert.ok(listEvents(fixture.sessionId).filter(event => event.type === 'model_resilience_observed')
+        .every(event => event.data.sourceUserSeq === fixture.source.seq));
+      assert.equal(listEvents(fixture.sessionId).filter(event => event.type === 'model_transport_observed'
+        && event.data.phase === 'adapter_attempt_finished' && event.data.resultScope === 'original_sdk_response').length, 2,
+      'both original local outcomes remain visible despite ambiguous provider identity');
+    });
+  } finally {
+    if (priorDelay === undefined) delete process.env.CLEMMY_CODEX_TRANSPARENT_RETRY_DELAY_MS;
+    else process.env.CLEMMY_CODEX_TRANSPARENT_RETRY_DELAY_MS = priorDelay;
+    closeEventLog();
+  }
+});
+
+// The actual durable producer restores bookkeeping only. A scripted native
+// response runs under the drainer's existing harness, with no forced-A sink,
+// reconstructed telemetry, restored source authority or model-route override.
+function durableNativeCodexAccountingFixture(mode: 'owned' | 'source-only' | 'legacy' = 'owned') {
+  assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1');
+  assert.notEqual(path.resolve(BASE_DIR), REAL_DEFAULT_CLEMENTINE_HOME);
+  const sessionId = `canonical-durable-codex-${randomUUID()}`;
+  const message = 'Remember exactly: "Use short paragraphs for future reports."';
+  createSession({ id: sessionId, kind: 'chat', channel: 'test' });
+  const attempt = beginRunAttempt(sessionId);
+  const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: message } });
+  assert.ok(captureFreshSourceSessionContext({ sessionId, sourceUserSeq: source.seq }));
+  const candidates = extractAutoMemoryCandidates(message);
+  assert.equal(candidates.length, 1);
+  const origins = automaticMemoryOriginsForCapture({ sessionId, message, sourceEventId: `user-source:${source.seq}`,
+    sourceProvenance: autoCaptureProvenanceFromAcceptedEvent(source) }, candidates);
+  assert.equal(origins[0]?.claimMode, 'complete');
+  const input = { sessionId, message, sourceEventId: `user-source:${source.seq}`, candidates, origins };
+  const parent = { sessionId, sourceUserSeq: source.seq, attemptId: attempt.attemptId };
+  const queued = mode === 'source-only' ? enqueueAutoCaptureCandidates(input)
+    : withModelUsageAttribution(parent, () => enqueueAutoCaptureCandidates(input));
+  assert.equal(queued.candidateIds.length, 1);
+  const candidateId = queued.candidateIds[0]!;
+  if (mode === 'legacy') openMemoryDb().prepare('DELETE FROM memory_candidate_accounting_origins WHERE candidate_id = ?').run(candidateId);
+  closeMemoryDb();
+  const retained = memoryAccountingParent(readMemoryCandidateAccountingOrigin(candidateId, openMemoryDb()));
+  assert.deepEqual(retained, mode === 'owned' ? parent : { sessionId, sourceUserSeq: source.seq });
+  return { home: BASE_DIR, sessionId, source, attempt, ordinal: 0, input, candidateId, retained };
+}
+
+test('durable memory native Codex producer keeps original scheduling accounting through replay without restoring execution authority', async t => {
+  try {
+    for (const kind of ['foreign', 'same-source', 'source-only', 'legacy', 'late', 'failed'] as const) {
+      await t.test(kind, async () => {
+        const mode = kind === 'source-only' || kind === 'legacy' ? kind : 'owned';
+        const a = durableNativeCodexAccountingFixture(mode);
+        const b = kind === 'same-source' || kind === 'source-only' || kind === 'legacy'
+          ? { ...a, attempt: beginRunAttempt(a.sessionId) } : nativeCodexAccountingFixture();
+        if (b.sessionId === a.sessionId) {
+          const bound = recordRunAttemptUserInput(b.attempt, { turn: 1, role: 'user', data: a.source.data }, { existingEventSeq: a.source.seq });
+          assert.equal(bound.seq, a.source.seq);
+        }
+        const bScope = { sessionId: b.sessionId, sourceUserSeq: b.source.seq, attemptId: b.attempt.attemptId };
+        const retainedBefore = openMemoryDb().prepare('SELECT * FROM memory_candidate_accounting_origins WHERE candidate_id = ?').get(a.candidateId);
+        withModelUsageAttribution(bScope, () => enqueueAutoCaptureCandidates(a.input));
+        assert.deepEqual(openMemoryDb().prepare('SELECT * FROM memory_candidate_accounting_origins WHERE candidate_id = ?').get(a.candidateId), retainedBefore,
+          'duplicate intake cannot fill legacy ownership or replace the original scheduling attempt');
+        closeMemoryDb();
+        if (kind === 'late') {
+          finishNativeCodexAccountingFixture(a);
+          await new Promise(resolve => setTimeout(resolve, 2));
+        }
+        const responseId = `provider-durable-${kind}-${randomUUID()}`;
+        const model = new AccountingCodexModel(kind === 'failed' ? async function* () {
+          throw new Error('Synthetic nonretryable native accounting failure.');
+        } : () => accountingCodexSuccess(responseId));
+        let original: unknown;
+        let calls = 0;
+        const result = await harnessRunContextStorage.run({ sessionId: b.sessionId, sourceUserSeq: b.source.seq,
+          runAttemptId: b.attempt.attemptId, turn: 1 } as never, () => withModelUsageAttribution(bScope, () =>
+          drainDurableConsolidationCandidates({ ids: [a.candidateId], standingReviewer: async (_source, _candidate, _mode, origin) => {
+            assert.ok(origin);
+            return runMemoryModelJob('standing', {}, async () => {
+              calls++;
+              assert.equal(harnessRunContextStorage.getStore()?.sessionId, b.sessionId);
+              assert.equal(harnessRunContextStorage.getStore()?.runAttemptId, b.attempt.attemptId,
+                'the actual provider work never runs under restored harness A');
+              const usage = modelUsageAttributionStorage.getStore()!;
+              assert.equal(usage.sessionId, ''); assert.equal(usage.sourceUserSeq, 0);
+              assert.deepEqual(usage.usageParentTurn, a.retained);
+              assert.match(usage.usageJobId!, /^memory:standing:/);
+              const selected = inMemoryJobTurn(() => modelUsageAttributionStorage.getStore());
+              assert.equal(selected?.sessionId, b.sessionId === a.sessionId ? a.sessionId : '');
+              assert.equal(selected?.sourceUserSeq, b.sessionId === a.sessionId ? a.source.seq : 0);
+              if (b.sessionId === a.sessionId) assert.equal(selected?.attemptId, b.attempt.attemptId,
+                'same-source re-drive retains current selection B, independently of accounting A');
+              original = await model.getResponse({ input: 'Synthetic memory accounting response.', tools: [], handoffs: [],
+                modelSettings: {}, outputType: 'text', tracing: false } as unknown as ModelRequest);
+              return parseAutomaticStandingMemoryReview({ durability: 'task', claim: origin.claim,
+                destination: 'unresolved', destinationSpans: [], reason: 'Controlled accounting fixture only.' }, origin);
+            }, () => ({ outcome: 'nothing_new' }));
+          } })));
+        assert.equal(calls, 1); assert.equal(model.attempts, 1);
+        assert.equal(result.promoted, 0, 'this accounting test does not promote a standing memory');
+        assert.equal(kind === 'failed' ? result.retried : result.skipped, 1);
+        const file = usageFileForDate(new Date(a.source.createdAt));
+        const allRows = (() => { try { return parseUsageLedger(readFileSync(file, 'utf8')); } catch { return []; } })();
+        const rows = allRows.filter(row => row.responseId === responseId);
+        const events = listEvents(a.sessionId).filter(event => event.type === 'model_transport_observed'
+          && event.data.sourceUserSeq === a.source.seq);
+        assert.equal(events.filter(event => event.data.phase === 'adapter_attempt_created').length, 1);
+        if (kind === 'failed') {
+          assert.equal(rows.length, 0); assert.equal(original, undefined);
+          assert.equal(events.find(event => event.data.phase === 'adapter_attempt_finished')?.data.outcome, 'failed');
+        } else {
+          const binding = completedModelResponseBinding(original)!;
+          assert.ok(binding); assert.equal(binding.physicalAttempt, 1);
+          assert.equal(rows.length, 1); assert.equal(rows[0].trace?.modelCallId, binding.modelCallId);
+          assert.notEqual(rows[0].responseId, binding.modelCallId);
+          assert.equal(rows[0].trace?.acceptedSource, `${a.sessionId}:${a.source.seq}`);
+          assert.equal(rows[0].trace?.attemptId, mode === 'owned' ? a.attempt.attemptId : undefined);
+          assert.match(rows[0].source, /^memory:standing:/); assert.equal(rows[0].role, 'memory');
+          assert.equal(rows[0].requestModel, undefined, 'scripted transport does not prove an actual outgoing body');
+          assert.equal(rows[0].providerReportedModel, 'gpt-6.1-sol');
+          assert.ok(events.every(event => event.data.modelCallId === binding.modelCallId));
+        }
+        const measured = kind === 'late' ? measureAcceptedTask(a.home, a.sessionId, a.source.seq)
+          : finishNativeCodexAccountingFixture(a);
+        finishRunAttempt(b.attempt, 'completed');
+        const local = measured.transportObservation!.localAdapterAttempts!;
+        if (mode === 'owned' && kind !== 'failed') {
+          assert.equal(measured.promptTokens, 40); assert.equal(measured.outputTokens, 4);
+          assert.equal(measured.exactUsageRecords, 1);
+          assert.equal(local.exactReportedUsageJoins, kind === 'late' || kind === 'same-source' ? 0 : 1);
+          if (kind === 'late') assert.ok(local.afterDeliveryEvents > 0, 'post-delivery endpoints cannot borrow the foreground clock');
+          if (kind === 'same-source') assert.ok(local.issues.some(issue => issue.startsWith('unbounded_local_adapter_endpoint:')),
+            'starting B closes A; correct accounting association cannot widen A foreground attempt bounds');
+        } else if (kind === 'failed') {
+          assert.equal(measured.usageRecords, 0); assert.equal(local.failedAttempts, 1);
+          assert.equal(local.unknownUsageAttempts, 1); assert.equal(local.exactReportedUsageJoins, 0);
+        } else {
+          assert.equal(measured.exactUsageRecords, 0);
+          assert.equal(measured.unprovenUsage.usageRecords, 1);
+          assert.equal(local.exactReportedUsageJoins, 0);
+          assert.ok(local.issues.some(issue => issue.startsWith('invalid_local_adapter_ownership:')));
+        }
+        assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+        assert.equal(measured.transportObservation!.observedDispatches, null);
+        assert.equal(measured.transportObservation!.allLegPhysicalInventory, 'unproved');
+        assert.equal(measured.usageCompleteness.cost.actualBilling, 'not_measured');
+      });
+    }
+  } finally { closeMemoryDb(); closeEventLog(); }
 });

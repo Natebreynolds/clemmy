@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { modelUsageAttributionStorage, withModelUsageAttribution, type ModelUsageAttributionContext } from '../runtime/usage-log.js';
+import { readMemoryCandidateAccountingOrigin } from './memory-causal-accounting.js';
 import { openMemoryDb, type ConsolidatedFactKind, type MemoryEpisodeRow } from './db.js';
 import { consolidateFact, type ConsolidateOptions } from './reflection.js';
 import {
@@ -225,6 +226,7 @@ function candidateUsageScope(row: PendingAutoCaptureRow): ModelUsageAttributionC
     sessionId: sameTurn ? row.session_id : '',
     sourceUserSeq: sameTurn ? seq : 0,
     ...(sameTurn ? ambient : {}),
+    memoryAccountingOrigin: readMemoryCandidateAccountingOrigin(row.id, openMemoryDb()),
     usageParentTurn: verified ? {sessionId:row.session_id, sourceUserSeq:seq,
       ...(sameTurn && ambient?.attemptId ? {attemptId:ambient.attemptId} : {})} : undefined,
   };

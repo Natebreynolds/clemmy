@@ -1,6 +1,6 @@
 import { MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS, parseMemoryRequirementPacket, type MemoryRequirementAssessmentV1 } from './memory-completion-obligation.js';
 import type { ResolvedRoleModel } from './model-roles.js';
-import { classifyModelError } from './resilient-model.js';
+import { classifyModelError, withModelResilienceTelemetry, type ResilienceTelemetryEvent } from './resilient-model.js';
 import { READ_SCOPE_EVIDENCE_RUBRIC } from '../../agents/clem-rubric.js';
 import { STOP_CONTINUITY_REASONING_GUIDANCE } from './stop-continuity-reasoning.js';
 import { redactSensitiveText } from '../security.js';
@@ -30,7 +30,12 @@ import { historicalReadPacketIsCurrent, historicalReadClosureIsCurrent,
   type HistoricalReadPacket, type HistoricalReadClosure } from './historical-completion-evidence.js';
 import { judgeVerdictRepairInstructions, judgeVerdictRepairPrompt,
   type CompletionVerdictRepairContract } from './judge-verdict-repair-contract.js';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { types as nodeTypes } from 'node:util';
+import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
+import { completedModelResponseBinding, type CompletedModelResponseBinding } from './model-response-binding.js';
+import { COMPLETION_DECISION_ASSESSMENT_INSTRUCTIONS, parseCompletionDecisionAssessment,
+  type CompletionReviewAssessmentDiagnostic } from './completion-decision-assessment.js';
 import { modelUsageAttributionStorage } from '../usage-log.js';
 import { composeReviewInput, createReviewInputObservation,
   type ReviewInputComposition, type ReviewInputPart, type ReviewInputOwner,
@@ -47,6 +52,33 @@ function joinReviewParts(parts: readonly ReviewInputPart[], separator: string,
 function reviewOwnerAtModelEntry(): ReviewInputOwner | undefined {
   const owner = modelUsageAttributionStorage.getStore();
   return owner ? { sessionId: owner.sessionId, sourceUserSeq: owner.sourceUserSeq, attemptId: owner.attemptId } : undefined;
+}
+
+/** Private advisory context, never a result row, requirement or closure proof. */
+interface PriorJevOpinion { readonly kind: 'prior_jev_opinion' }
+const priorJevOpinions = new WeakMap<PriorJevOpinion, { text: string; context: SkillExecutionContext;
+  owner: ReviewInputOwner; objectiveDigest: string; candidateDigest: string; rendered: boolean;
+  isCurrent: () => boolean }>();
+type PriorOpinionDisposition = 'forwarded' | 'omitted_context_limit' | 'not_dispatched';
+/** Only the builder's exact assembly lends a no-opinion alternative. Public
+ * compositions, clones and model prose cannot authorize removing any text. */
+const optionalOpinionPrompts = new WeakMap<ReviewInputComposition, {
+  without: ReviewInputComposition; opinion: PriorJevOpinion; context: SkillExecutionContext;
+}>();
+
+/** Propagate one owned optional part through host memory/follow-up assembly. */
+function composeOpinionPrompt(parts: readonly ReviewInputPart[], separator: string): ReviewInputComposition {
+  const composition = composeReviewInput(parts, separator);
+  const optional = parts.flatMap((part, index) => {
+    const pair = typeof part !== 'string' && optionalOpinionPrompts.get(part as ReviewInputComposition);
+    return pair ? [{ pair, index }] : [];
+  });
+  if (optional.length === 1) {
+    const { pair, index } = optional[0]!;
+    optionalOpinionPrompts.set(composition, { ...pair,
+      without: composeReviewInput(parts.map((part, position) => position === index ? pair.without : part), separator) });
+  }
+  return composition;
 }
 
 /**
@@ -82,7 +114,34 @@ export const OWNER_STANDING_INSTRUCTIONS_RUBRIC =
  * source's changing objective, receipt bytes and lookup refs stay in the prompt. */
 export const HOST_COMPLETION_EVIDENCE_GUIDANCE = `Judge only the effective accepted objective. A successful empty result may complete a bounded lookup; a cancelled or replaced request does not owe its abandoned effects. Do not demand writes or artifacts the objective never requested. Unavailable optional or irrelevant reads do not create new requirements. Each result above is shown whole or as an explicitly bounded reviewer preview, as its own line says. A claim that rests on content outside what is shown, including a claim that data is missing, empty, unavailable or complete, is unverified unless another read shown here covers it, such as a filtered query, a true count or a recalled page, or you open it with the evidence tools. EARLIER TURNS evidence counts for what the reply says an earlier turn checked or found at that time; it cannot show this turn's own effects. A selected/derived projection is not the full source result, and an omitted projection field does not establish absence. Distinguish absent values from zero, empty and uninspected values. When the objective is not met and the evidence shows another attempt cannot change that, the verdict is BLOCKED.\n${STOP_CONTINUITY_REASONING_GUIDANCE}`;
 
-export const JUDGE_SYSTEM_PROMPT = [
+/** A same-call reasoning operation after the complete candidate and evidence.
+ * It asks the reviewer to test sufficiency, not to accept an evidence label or
+ * to execute hypothetical work. Neither this cue nor its rationale is proof. */
+interface OwnedReviewPresentation { readonly legacy: string; readonly assessment: string }
+function renderOwnedReviewParts(parts: readonly (string | OwnedReviewPresentation)[], assessment: boolean): string {
+  return parts.map(part => typeof part === 'string' ? part : assessment ? part.assessment : part.legacy).join('\n');
+}
+const AUDIT_OUTPUT_PRESENTATION: OwnedReviewPresentation = {
+  legacy: 'Perform this audit within this review and respond with exactly one verdict line.',
+  assessment: 'Perform this audit within this same review. Respond with the required REVIEW_ASSESSMENT line, exactly one control verdict line, then only the independently requested coverage or memory lines.',
+};
+const COMPLETION_DECISION_AUDIT_PARTS = [
+  'Before choosing the verdict, check substance before presentation. For each materially requested explanation, recommendation or proposed next action, identify its premise and applicable rule. Try a counterexample: could all the evidence stated or shown for that premise be true while the conclusion is false or the action unauthorized? If yes, the evidence is insufficient; identify the missing logical, identity, scope or authority binding instead of crediting the claim.',
+  'For a hypothetical scenario, test whether its proposed evidence would establish its conclusion; do not demand that the hypothetical action actually run. Separate a proposed check from an observed result. A named receipt, key, timestamp, count or review is not sufficient merely because it is named. Apply the whole objective and standing instructions, and resolve contrary evidence without inventing requirements.',
+  'Report every material unsupported or contradicted claim together in the existing verdict. CORRECT applies when all requested work is present but its claims need correction, even if formatting also needs repair. Use REVISE_REPLY only after all substantive work and claims are verified. Valid format, correct counts and a complete list cannot settle a reasoning gap.',
+  AUDIT_OUTPUT_PRESENTATION,
+];
+export const COMPLETION_DECISION_AUDIT_GUIDANCE = renderOwnedReviewParts(COMPLETION_DECISION_AUDIT_PARTS, false);
+
+const REPLY_PRESENTATION: OwnedReviewPresentation = {
+  legacy: 'Reply with EXACTLY ONE LINE and nothing else, one of:',
+  assessment: 'Reply with one REVIEW_ASSESSMENT JSON line, followed by exactly one control verdict line chosen below, then only independently requested NEEDS ALL OF or MEMORY_REQUIREMENT lines:',
+};
+const CONTROL_EXAMPLE_PRESENTATION: OwnedReviewPresentation = {
+  legacy: 'Examples:',
+  assessment: 'Control-line examples within the required assessment frame (these are not whole replies):',
+};
+const JUDGE_SYSTEM_PARTS = [
   'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',
   '',
   'Use an AUDIT CHECKLIST: enumerate the concrete, verifiable deliverables the objective implies, then check both their presence and correctness against the assistant\'s response.',
@@ -109,23 +168,24 @@ export const JUDGE_SYSTEM_PROMPT = [
   '- If the objective is ambiguous or is a bare conversational follow-up, judge it against the conversation context included with it. When the response reports concrete completed work with evidence for everything the objective ACTUALLY names, that is done — in an interactive chat the user will steer the next step; do not keep the loop running to chase deliverables nobody requested.',
   '- AWAITING THE USER: if the response asks the user a genuine direction or authorization question — which option to take, whether to proceed with an external action (sending, posting, deleting), or scope the objective left open — that question IS this turn\'s deliverable. The assistant must NOT take consequential external actions without the user\'s go-ahead, so demanding it "finish" instead of asking would be wrong. This includes an honest partial-progress report that pauses for the user\'s decision.',
   '',
-  'Reply with EXACTLY ONE LINE and nothing else, one of:',
-  '  "DONE: <one short sentence naming the artifact/URL/result that satisfied the objective>";',
+  REPLY_PRESENTATION,
+  '  "DONE: <concise rationale naming the verified result; for every materially requested explanation or recommendation decision, justify condition → applicable rule or exact evidence → consequence and resolve contrary evidence. Listing topics, artifacts or counts alone is insufficient for those decisions>";',
   '  "AWAITING: <one short sentence naming the decision the user was asked to make>";',
   '  "INCOMPLETE: <every missing deliverable or evidence gap, numbered (1), (2)…>";',
   '  "CORRECT: <every contradicted or unsupported claim, numbered (1), (2)…, each quoting the words at issue and what the evidence shows>" ONLY when all requested work is present and what remains is specific claims to correct or remove;',
   '  "REVISE_REPLY: <exact formatting or extraneous-wording correction>" ONLY when all requested work and factual claims are verified and the sole remaining defect is final-answer format or extra wording. Missing evidence, factual corrections, artifact edits, actions, or genuine user decisions must never use REVISE_REPLY;',
   '  "BLOCKED: <one plain sentence for the owner: what did not happen and what stands in the way>".',
   '',
-  'Examples:',
+  CONTROL_EXAMPLE_PRESENTATION,
   '  DONE: Spreadsheet created at /Users/me/Q3.xlsx with URL returned',
-  '  DONE: The requested analysis is fully present in the response with its supporting figures',
+  '  DONE: The analysis supports option B: required capacity is 12 and the verified limits are A=8/B=16, so only B meets it; A\'s lower price does not overcome its insufficient capacity',
   '  AWAITING: Assistant asked whether to send the 55 prepared emails now or review them first',
   '  INCOMPLETE: Assistant proposed steps but did not produce the deliverable the objective named',
   '  INCOMPLETE: Two of three deliverables remain — emails drafted but no send confirmation evidence',
   '  CORRECT: (1) "revenue grew 40%" — the report shows 14%; (2) "all three offices confirmed" — only two replies were retrieved',
   '  BLOCKED: The invite was not changed because the update was refused before it reached the calendar.',
-].join('\n');
+];
+export const JUDGE_SYSTEM_PROMPT = renderOwnedReviewParts(JUDGE_SYSTEM_PARTS, false);
 
 /**
  * Independent objective-completion judge for the chat continuation loop.
@@ -140,6 +200,47 @@ export const JUDGE_SYSTEM_PROMPT = [
  * never wedge a turn that the model believes is finished.
  */
 
+export interface CompletionJudgeComparisonDiagnostic {
+  /** The route used for the legacy family comparison, not served-author proof. */
+  selfJudgeBasis: 'provided_author_route' | 'implicit_brain_route_unknown' | 'unavailable';
+  servedAuthorQualification: 'unknown';
+}
+
+const UNAVAILABLE_JUDGE_COMPARISON: CompletionJudgeComparisonDiagnostic = Object.freeze({
+  selfJudgeBasis: 'unavailable', servedAuthorQualification: 'unknown',
+});
+
+function judgeDiagnosticOwnData(value: unknown, key: string): PropertyDescriptor | undefined {
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || nodeTypes.isProxy(value)) return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor : undefined;
+  } catch { return undefined; }
+}
+
+/** Reads only inert fixed diagnostic scalars; it grants no author or verdict authority. */
+export function completionJudgeComparisonDiagnostic(value: unknown): CompletionJudgeComparisonDiagnostic {
+  const basis = judgeDiagnosticOwnData(value, 'selfJudgeBasis')?.value;
+  const qualification = judgeDiagnosticOwnData(value, 'servedAuthorQualification')?.value;
+  return qualification === 'unknown' && (basis === 'provided_author_route' || basis === 'implicit_brain_route_unknown' || basis === 'unavailable')
+    ? { selfJudgeBasis: basis, servedAuthorQualification: 'unknown' }
+    : { ...UNAVAILABLE_JUDGE_COMPARISON };
+}
+
+/** Called once for the already resolved deciding route, without resolving an author. */
+export function completionJudgeComparisonForRoute(value: unknown): CompletionJudgeComparisonDiagnostic {
+  const family = (candidate: unknown): boolean => candidate === 'claude' || candidate === 'codex' || candidate === 'byo';
+  const brain = judgeDiagnosticOwnData(value, 'brainFamily');
+  const judge = judgeDiagnosticOwnData(value, 'judgeFamily');
+  const self = judgeDiagnosticOwnData(value, 'selfJudge');
+  if (!family(brain?.value) || !family(judge?.value) || typeof self?.value !== 'boolean') return { ...UNAVAILABLE_JUDGE_COMPARISON };
+  try {
+    const author = Object.getOwnPropertyDescriptor(value as object, 'authorFamily');
+    if (author && (!Object.hasOwn(author, 'value') || !family(author.value))) return { ...UNAVAILABLE_JUDGE_COMPARISON };
+    return { selfJudgeBasis: author ? 'provided_author_route' : 'implicit_brain_route_unknown', servedAuthorQualification: 'unknown' };
+  } catch { return { ...UNAVAILABLE_JUDGE_COMPARISON }; }
+}
+
 export interface ObjectiveJudgeVerdict {
   /** Semantic obligation only; the host separately verifies correction effects. */
   memoryRequirement?: MemoryRequirementAssessmentV1;
@@ -151,20 +252,27 @@ export interface ObjectiveJudgeVerdict {
    * these so a "done" the user trusts is distinguishable from an ASSUMED done:
    * - failedOpen: the judge timed out / errored / didn't parse, so completion was
    *   ACCEPTED WITHOUT a real verdict (the silent-success risk made visible).
-   * - selfJudge: graded by the SAME model family as the brain (no cross-family
-   *   judge logged in) — a real verdict, but lower-confidence (model graded its
-   *   own homework).
-   * Absent ⇒ a clean cross-family verdict (full confidence).
+   * - selfJudge: the deciding judge shares the family used by the resolved
+   *   routing comparison. That comparison uses a provided writer route or the
+   *   implicit brain route; it does not prove the candidate's served author.
+   * Absence of selfJudge does not certify actual cross-family authorship. The
+   * separate selfJudgeBasis names the comparison and servedAuthorQualification
+   * remains unknown.
    */
   failedOpen?: boolean;
   /** Why no review verdict was produced, when none was: the reviewer ran out
    *  of time, answered unreadably, or could not be reached. */
   reviewFailure?: 'timeout' | 'invalid' | 'unavailable';
+  /** Reached reviewer whose same-call assessment cannot qualify approval. */
+  reviewDisposition?: 'answered_unqualified';
+  reviewAssessment?: CompletionReviewAssessmentDiagnostic;
   /** How deep the deciding review went, and, when a fast review wanted to
    *  send the work back, whether a full review upheld or overruled it. */
   reviewDepth?: 'full' | 'fast';
   reviewConfirmation?: 'upheld' | 'overruled' | 'unavailable';
   selfJudge?: boolean;
+  selfJudgeBasis?: CompletionJudgeComparisonDiagnostic['selfJudgeBasis'];
+  servedAuthorQualification?: 'unknown';
   /** The judge was an EXPLICIT owner selection, not a no-other-family fallback.
    *  `selfJudge` stays an honest statement about model family; this says whether
    *  the owner chose it. Consumers that exist to catch the coherence trap should
@@ -217,6 +325,11 @@ export interface ObjectiveJudgeVerdict {
       /** Whether the configured reviewer was started (false = the hedge saved it). */
     reviewerStarted?: boolean;
     historicalOnly?: boolean;
+    priorAssessment?: { scope: 'non_authoritative_model_opinion'; forwardedBeforeEntry: boolean;
+      omissionReason?: 'context_limit' | 'not_dispatched';
+      modelCallId: string; requestBodySha256: string; questionnaireSha256: string;
+      originalResultSha256: string; objectiveDigest: string; candidateDigest: string; renderedSha256: string;
+      accountBackend: 'unknown'; providerResponseIdentity: 'unknown' };
 };
 }
 
@@ -597,6 +710,8 @@ export function composeJudgedObjective(input: string, priorUserMessages: string[
 /** Retained framework references plus execution evidence. The effective
  * accepted objective governs which requirements apply; loading adds no work. */
 export interface SkillExecutionContext {
+  /** Nominal caller-local opinion; public/cloned context cannot inject advice. */
+  priorJevOpinion?: PriorJevOpinion;
   /** Exact accepted-source owner supplied by the host for input diagnostics only. */
   reviewInputOwner?: ReviewInputOwner;
   /** Exact-source memory branch. Missing typed output cannot qualify its completion. */
@@ -637,20 +752,34 @@ export interface SkillExecutionContext {
   reviewStakes?: ReviewStakes;
 }
 
-/** Assemble the same review rules, with opted-in host guidance before the
- * existing cache boundary. Absence preserves the legacy instructions exactly. */
-export function buildCompletionJudgeInstructions(
-  context?: Pick<SkillExecutionContext, 'completionEvidenceGuidance' | 'memoryRequirementContext'>,
-  observe?: (composition: ReviewInputComposition) => void,
-): string {
+/** Select the same options in their original read order, including both
+ * assessment checks. Jev needs this validation, not a discarded full prompt. */
+function completionInstructionOptions(
+  context?: Pick<SkillExecutionContext, 'completionEvidenceGuidance' | 'memoryRequirementContext' | 'fullSourceEvidence'>,
+) {
   if (context?.completionEvidenceGuidance !== undefined
     && context.completionEvidenceGuidance !== HOST_COMPLETION_EVIDENCE_GUIDANCE) {
     throw new Error('Completion evidence guidance must match the retained host rules exactly.');
   }
+  const rubricAssessment = assessmentOptedIn(context);
+  const evidenceGuidance = Boolean(context?.completionEvidenceGuidance);
+  const memoryRequirement = Boolean(context?.memoryRequirementContext);
+  const packetAssessment = assessmentOptedIn(context);
+  return { rubricAssessment, evidenceGuidance, memoryRequirement, packetAssessment };
+}
+
+/** Assemble the same review rules, with opted-in host guidance before the
+ * existing cache boundary. Absence preserves the legacy instructions exactly. */
+export function buildCompletionJudgeInstructions(
+  context?: Pick<SkillExecutionContext, 'completionEvidenceGuidance' | 'memoryRequirementContext' | 'fullSourceEvidence'>,
+  observe?: (composition: ReviewInputComposition) => void,
+): string {
+  const options = completionInstructionOptions(context);
   return joinReviewParts([
-    { text: JUDGE_SYSTEM_PROMPT, component: 'judge_rubric' },
-    ...(context?.completionEvidenceGuidance ? [{ text: HOST_COMPLETION_EVIDENCE_GUIDANCE, component: 'host_completion_guidance' as const }] : []),
-    ...(context?.memoryRequirementContext ? [{ text: MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS, component: 'memory_review_guidance' as const }] : []),
+    { text: renderOwnedReviewParts(JUDGE_SYSTEM_PARTS, options.rubricAssessment), component: 'judge_rubric' },
+    ...(options.evidenceGuidance ? [{ text: HOST_COMPLETION_EVIDENCE_GUIDANCE, component: 'host_completion_guidance' as const }] : []),
+    ...(options.memoryRequirement ? [{ text: MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS, component: 'memory_review_guidance' as const }] : []),
+    ...(options.packetAssessment ? [{ text: COMPLETION_DECISION_ASSESSMENT_INSTRUCTIONS, component: 'judge_rubric' as const }] : []),
   ], '\n\n', observe);
 }
 
@@ -981,7 +1110,7 @@ function jevCompletionRequirementContext(context?: SkillExecutionContext): strin
   // Reuse the exact-value guard: a fast path cannot silently drop an invalid
   // opt-in that the configured reviewer would refuse. No dynamic source bytes
   // enter the configured reviewer's static cache prefix.
-  buildCompletionJudgeInstructions(context);
+  completionInstructionOptions(context);
   return [
     ...(context?.completionEvidenceGuidance ? [HOST_COMPLETION_EVIDENCE_GUIDANCE] : []),
     ...completionRequirementBlocks(context),
@@ -1027,6 +1156,19 @@ export function buildObjectiveJudgePrompt(
   const ledger = coverageReviewed(skillContext) ? reviewCoverageLedger(reviewCoverageResults(skillContext)) : undefined;
   if (ledger) parts.push('', { text: ledger, component: 'coverage_ledger' });
   parts.push(...completionRequirementParts(skillContext));
+  const priorOpinion = skillContext?.priorJevOpinion && priorJevOpinions.get(skillContext.priorJevOpinion);
+  const currentOwner = reviewOwnerAtModelEntry();
+  let opinionPartStart: number | undefined;
+  if (priorOpinion && priorOpinion.context === skillContext && currentOwner
+    && currentOwner.sessionId === priorOpinion.owner.sessionId && currentOwner.sourceUserSeq === priorOpinion.owner.sourceUserSeq
+    && currentOwner.attemptId === priorOpinion.owner.attemptId
+    && createHash('sha256').update(objective, 'utf8').digest('hex') === priorOpinion.objectiveDigest
+    && createHash('sha256').update(assistantResponse, 'utf8').digest('hex') === priorOpinion.candidateDigest
+    && priorOpinion.isCurrent()) {
+    opinionPartStart = parts.length;
+    parts.push('', { text: priorOpinion.text, component: 'private_review_evidence' });
+    priorOpinion.rendered = true;
+  }
   // Live 2026-09-14: the host refused a stale call before dispatch, no
   // provider call was made, and the reply said "the Outlook API won't accept
   // its event ID". The judge marked that fulfilled. A provider outcome the
@@ -1036,8 +1178,14 @@ export function buildObjectiveJudgePrompt(
     'A statement that a provider or API rejected, could not find, or failed the work counts as evidence only when a matching provider call appears in the evidence above. '
     + 'With no such call, treat the reported failure as unverified: the objective is not fulfilled, and the response must not be credited for explaining a failure that the evidence does not show.',
   );
-  parts.push('', 'Audit it against the objective and respond with exactly one verdict line.');
-  return joinReviewParts(parts, '\n', observe);
+  parts.push('', renderOwnedReviewParts(COMPLETION_DECISION_AUDIT_PARTS, assessmentOptedIn(skillContext)));
+  return joinReviewParts(parts, '\n', observe ? composition => {
+    if (opinionPartStart !== undefined && skillContext?.priorJevOpinion) {
+      optionalOpinionPrompts.set(composition, { opinion: skillContext.priorJevOpinion, context: skillContext,
+        without: composeReviewInput([...parts.slice(0, opinionPartStart), ...parts.slice(opinionPartStart + 2)], '\n') });
+    }
+    observe(composition);
+  } : undefined);
 }
 
 /** Thrown by an attempt whose model answered but off-contract — classified
@@ -1083,6 +1231,8 @@ export interface JudgeAttemptObservers {
   lookup?: JudgeEvidenceLookupObserver;
   /** Only the returned attempt may lend this nominal same-call observation to a verdict. */
   input?: (record: ReviewInputObservation) => unknown;
+  /** Assembly disposition for this actual route, not model/wire inclusion proof. */
+  priorOpinion?: (disposition: PriorOpinionDisposition) => unknown;
   /** The reviewer's output carried no verdict line and it was asked to state
    * one; `head` is the start of what it had written. */
   restated?: (head: string) => void;
@@ -1094,6 +1244,93 @@ const VERDICT_RESTATEMENT_EFFORT: JudgeReviewEffort = 'low';
 
 /** The same attempt used by the primary and hedge, exported for a provider-
  * free test of the actual assembled SDK request. This does not add a judge. */
+function assessmentOptedIn(context?: Pick<SkillExecutionContext, 'fullSourceEvidence' | 'completionEvidenceGuidance'>): boolean {
+  return context?.fullSourceEvidence === true && context.completionEvidenceGuidance === HOST_COMPLETION_EVIDENCE_GUIDANCE;
+}
+interface SameCallAssessment<T> {
+  unqualified: (value: T) => boolean;
+  answer: (output: unknown, original: CompletedModelResponseBinding | undefined) => T;
+}
+const assessmentOriginalOwners = new WeakMap<object, object>();
+const ambiguousAssessmentOriginals = new WeakSet<object>();
+/** Capture originals before Runner aggregation. Serialized observations, raw
+ * response clones and prior replies cannot mint this same-call join. */
+function captureAssessmentOriginal(inner: Model, seed: ReviewInputSeed | undefined,
+  instructions: string, prompt: string, signal?: AbortSignal) {
+  const token = {};
+  const expectedOwner = seed ? Object.freeze({ ...seed.owner }) : undefined;
+  const entries = new WeakMap<object, { snapshot: string; binding?: CompletedModelResponseBinding;
+    outputSnapshot: string; valid: boolean }>();
+  const sameOwner = () => {
+    const owner = reviewOwnerAtModelEntry();
+    return !!expectedOwner && !!owner && typeof expectedOwner.sessionId === 'string' && expectedOwner.sessionId.length > 0
+      && Number.isSafeInteger(expectedOwner.sourceUserSeq) && expectedOwner.sourceUserSeq > 0
+      && typeof expectedOwner.attemptId === 'string' && expectedOwner.attemptId.length > 0
+      && seed?.owner.sessionId === expectedOwner.sessionId && seed.owner.sourceUserSeq === expectedOwner.sourceUserSeq
+      && seed.owner.attemptId === expectedOwner.attemptId && owner.sessionId === expectedOwner.sessionId
+      && owner.sourceUserSeq === expectedOwner.sourceUserSeq && owner.attemptId === expectedOwner.attemptId;
+  };
+  const snapshot = (request: ModelRequest) => JSON.stringify({ systemInstructions: request.systemInstructions,
+    input: request.input, modelSettings: request.modelSettings, tools: request.tools, handoffs: request.handoffs,
+    outputType: request.outputType, previousResponseId: request.previousResponseId, conversationId: request.conversationId,
+    prompt: request.prompt, overridePromptModel: request.overridePromptModel, toolsExplicitlyProvided: request.toolsExplicitlyProvided });
+  const model: Model = {
+    async getResponse(request) {
+      let before: string | undefined; let valid = false;
+      try {
+        before = snapshot(request);
+        const input = request.input;
+        const first = typeof input === 'string' ? undefined : input[0] as {role?:unknown;content?:unknown} | undefined;
+        valid = sameOwner() && !signal?.aborted && !request.signal?.aborted
+          && request.systemInstructions === instructions
+          && (typeof input === 'string' ? input === prompt : first?.role === 'user' && first?.content === prompt);
+      } catch { /* absent proof cannot authorize approval */ }
+      const telemetry: Readonly<ResilienceTelemetryEvent>[] = [];
+      const response = await withModelResilienceTelemetry(event => { telemetry.push(event); },
+        () => inner.getResponse(request), { preserveParent: true });
+      try {
+        if (assessmentOriginalOwners.has(response)) ambiguousAssessmentOriginals.add(response);
+        else assessmentOriginalOwners.set(response, token);
+        const binding = completedModelResponseBinding(response);
+        const starts = telemetry.filter(row => row.type === 'call_started');
+        const finishes = telemetry.filter(row => row.type === 'call_finished');
+        const observed = telemetry.filter(row => row.type === 'response_observed' && row.callId === binding?.modelCallId
+          && row.attempt === binding?.physicalAttempt && row.providerResponseIdDigest === binding?.providerResponseIdDigest);
+        const fresh = !!binding && starts.length === 1 && finishes.length === 1 && observed.length === 1
+          && starts[0]!.callId === binding.modelCallId && starts[0]!.path === 'getResponse'
+          && finishes[0]!.callId === binding.modelCallId && finishes[0]!.type === 'call_finished'
+          && finishes[0]!.outcome === 'returned' && finishes[0]!.completionObserved
+          && telemetry.every(row => !row.requestAborted);
+        entries.set(response, { snapshot: before ?? '', binding,
+          outputSnapshot: JSON.stringify(response.output), valid: valid && fresh && sameOwner() && before === snapshot(request)
+            && !signal?.aborted && !request.signal?.aborted });
+      } catch { /* response remains unchanged */ }
+      return response;
+    },
+    // The actual reviewer uses getResponse. An unsupported streaming path keeps
+    // its original behavior and receives no assessment capability.
+    getStreamedResponse: request => inner.getStreamedResponse(request),
+  };
+  return { model, finish(responses: readonly ModelResponse[] | undefined, finalOutput: unknown): CompletedModelResponseBinding | undefined {
+    try {
+      const original = responses?.at(-1);
+      if (!original || !sameOwner() || signal?.aborted || responses!.filter(row => row === original).length !== 1
+        || ambiguousAssessmentOriginals.has(original) || assessmentOriginalOwners.get(original) !== token) return undefined;
+      const entry = entries.get(original);
+      const current = completedModelResponseBinding(original);
+      if (!entry?.valid || !entry.binding || !current || JSON.stringify(current) !== JSON.stringify(entry.binding)
+        || JSON.stringify(original.output) !== entry.outputSnapshot) return undefined;
+      const last = original.output.filter(row => row.type === 'message' && row.role === 'assistant').at(-1) as unknown as
+        { status?: unknown; content?: unknown } | undefined;
+      if (!last || last.status !== 'completed' || !Array.isArray(last.content)) return undefined;
+      const text = last.content.filter((part: unknown): part is { type: 'output_text'; text: string } =>
+        !!part && typeof part === 'object' && (part as { type?: unknown }).type === 'output_text'
+          && typeof (part as { text?: unknown }).text === 'string');
+      return text.length === 1 && text[0]?.text === finalOutput ? current : undefined;
+    } catch { return undefined; }
+  } };
+}
+
 export async function runRoutedJudgeAttempt<T>(
   routing: BoundaryJudgeRouting,
   instructions: string,
@@ -1107,6 +1344,7 @@ export async function runRoutedJudgeAttempt<T>(
   observe?: JudgeAttemptObservers,
   verdictRepairContract?: CompletionVerdictRepairContract,
   reviewInput?: ReviewInputSeed,
+  assessment?: SameCallAssessment<T>,
 ): Promise<T> {
   signal?.throwIfAborted();
   // Keep per-review handles out of tool schemas and stable instructions.
@@ -1114,9 +1352,38 @@ export async function runRoutedJudgeAttempt<T>(
   const evidenceGuidance = evidence ? judgeEvidenceGuidance(evidence) : '';
   const evidenceReferences = evidence ? `\n\nReview evidence references: ${judgeEvidenceReferences(evidence)}` : '';
   const reviewInstructions = evidence ? instructions + evidenceGuidance : instructions;
-  const reviewPrompt = evidence ? `${prompt}${evidenceReferences}` : prompt;
+  let selectedInput = reviewInput;
+  let selectedPrompt = prompt;
+  let priorOpinionDisposition: PriorOpinionDisposition | undefined;
+  const optional = reviewInput && optionalOpinionPrompts.get(reviewInput.prompt);
+  if (optional) {
+    const opinion = priorJevOpinions.get(optional.opinion);
+    const owner = reviewOwnerAtModelEntry();
+    if (!opinion || opinion.context !== optional.context || !owner || !opinion.isCurrent()
+      || reviewInput!.prompt.text !== prompt || reviewInput!.instructions.text !== instructions
+      || owner.sessionId !== opinion.owner.sessionId || owner.sourceUserSeq !== opinion.owner.sourceUserSeq
+      || owner.attemptId !== opinion.owner.attemptId
+      || reviewInput!.owner.sessionId !== owner.sessionId || reviewInput!.owner.sourceUserSeq !== owner.sourceUserSeq
+      || reviewInput!.owner.attemptId !== owner.attemptId
+      || reviewInput!.objectiveDigest !== opinion.objectiveDigest || reviewInput!.candidateDigest !== opinion.candidateDigest) {
+      throw new JudgeContextUnavailableError('Current-source optional review opinion is no longer owned; no request was dispatched.');
+    }
+    priorOpinionDisposition = 'forwarded';
+  }
+  let reviewPrompt = evidence ? `${selectedPrompt}${evidenceReferences}` : selectedPrompt;
   if (requireCompletePrompt) {
-    const admission = completionJudgeContextAdmission(routing.modelId, reviewInstructions, reviewPrompt);
+    let admission = completionJudgeContextAdmission(routing.modelId, reviewInstructions, reviewPrompt);
+    if (!admission.fits && optional) {
+      const without = evidence ? `${optional.without.text}${evidenceReferences}` : optional.without.text;
+      const withoutAdmission = completionJudgeContextAdmission(routing.modelId, reviewInstructions, without);
+      if (withoutAdmission.fits) {
+        selectedPrompt = optional.without.text;
+        reviewPrompt = without;
+        selectedInput = { ...reviewInput!, prompt: optional.without };
+        admission = withoutAdmission;
+        priorOpinionDisposition = 'omitted_context_limit';
+      }
+    }
     if (!admission.fits) {
       throw new JudgeContextUnavailableError(`Complete evidence review unavailable: ${routing.modelId} `
         + `has a ${admission.contextWindow}-token context window; the complete request is estimated at `
@@ -1139,25 +1406,32 @@ export async function runRoutedJudgeAttempt<T>(
     ? `${reviewInstructions}${INSTRUCTION_CACHE_DELIM}` : evidence ? reviewInstructions : instructions;
   let inputCollector: ReturnType<typeof createReviewInputObservation> | undefined;
   let observedRouting = routing;
-  if (reviewInput && routing.model) try {
+  if (selectedInput && routing.model) try {
     // Preserve the exact assembly tree. No component claim is found by matching text.
-    inputCollector = createReviewInputObservation({ ...reviewInput,
+    inputCollector = createReviewInputObservation({ ...selectedInput,
       instructions: composeReviewInput([
-        reviewInput.instructions,
+        selectedInput.instructions,
         ...(evidence ? [{ text: evidenceGuidance, component: 'evidence_tool_guidance' as const }] : []),
         ...(evidence && routing.judgeFamily === 'claude' ? [INSTRUCTION_CACHE_DELIM] : []),
       ], ''),
-      prompt: composeReviewInput([reviewInput.prompt,
+      prompt: composeReviewInput([selectedInput.prompt,
         ...(evidence ? [{ text: evidenceReferences, component: 'evidence_reference_inventory' as const }] : []),
       ], ''),
     }, { signal, ownerAtEntry: reviewOwnerAtModelEntry });
     observedRouting = { ...routing, model: inputCollector.wrap(routing.model) };
   } catch { /* input observation cannot change review routing or execution */ }
+  const originalCapture = assessment && observedRouting.model
+    ? captureAssessmentOriginal(observedRouting.model, selectedInput, agentInstructions, reviewPrompt, signal) : undefined;
+  if (originalCapture) observedRouting = { ...observedRouting, model: originalCapture.model };
   const agent = evidence
     ? buildJudgeAgent(observedRouting, agentInstructions,
       judgeEvidenceTools(evidence, JUDGE_EVIDENCE_LOOKUP_BUDGET, observe?.lookup), reviewEffort)
     : buildJudgeAgent(observedRouting, instructions, [], reviewEffort);
   signal?.throwIfAborted();
+  if (priorOpinionDisposition) try {
+    const observed = observe?.priorOpinion?.(priorOpinionDisposition);
+    if (observed && typeof (observed as PromiseLike<unknown>).then === 'function') void Promise.resolve(observed).catch(() => {});
+  } catch { /* diagnostics cannot change a reviewer request */ }
   const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1, signal });
   signal?.throwIfAborted();
   const observeResponder = (responses: typeof result.rawResponses): void => {
@@ -1172,7 +1446,8 @@ export async function runRoutedJudgeAttempt<T>(
   };
   observeResponder(result.rawResponses);
   let inputObservation = inputCollector?.finish(result.rawResponses, result.finalOutput);
-  let value = parse(result.finalOutput);
+  let value = assessment ? assessment.answer(result.finalOutput, originalCapture?.finish(result.rawResponses, result.finalOutput))
+    : parse(result.finalOutput);
   if (value === null) {
     // Live 2026-09-24 (source 294528): a flagship reviewer wrote a 2,800-token
     // review of three drafts and never emitted the one verdict line; the
@@ -1250,12 +1525,16 @@ interface CompletionJudgeRun {
   failure: 'timeout' | 'invalid' | 'error' | null;
   /** The winning attempt's routing (primary routing when nothing won). */
   routing?: BoundaryJudgeRouting;
+  comparisonDiagnostic?: CompletionJudgeComparisonDiagnostic;
   unavailableReason?: string;
   invalidDetail?: string;
   evidenceCoverage?: ReviewEvidenceCoverageRecord;
   /** The verdict line was asked for separately; the start of the first output. */
   verdictRestatedFrom?: string;
   reviewInputObservation?: ReviewInputObservation;
+  priorOpinionDisposition?: PriorOpinionDisposition;
+  reviewDisposition?: 'answered_unqualified';
+  reviewAssessment?: CompletionReviewAssessmentDiagnostic;
 }
 
 /**
@@ -1286,6 +1565,7 @@ export async function runHedgedJudge<T>(
     /** Only completion supplies additional same-answer output obligations. */
     verdictRepairContract?: CompletionVerdictRepairContract;
     reviewInput?: ReviewInputSeed;
+    assessment?: SameCallAssessment<T>;
     /** Cancellation belongs to the caller, never to review/fallback policy. */
     signal?: AbortSignal;
   } = {},
@@ -1295,7 +1575,8 @@ export async function runHedgedJudge<T>(
   /** Set when that attempt's verdict line had to be asked for separately:
    *  the start of what the reviewer first wrote. */
   restatedFrom?: string;
-  reviewInputObservation?: ReviewInputObservation }> {
+  reviewInputObservation?: ReviewInputObservation; priorOpinionDisposition?: PriorOpinionDisposition;
+  comparisonDiagnostic?: CompletionJudgeComparisonDiagnostic }> {
   const startedAt = Date.now();
   let routing: BoundaryJudgeRouting | undefined;
   let callerSignal = opts.signal;
@@ -1329,12 +1610,14 @@ export async function runHedgedJudge<T>(
     const attemptLookups = new Map<BoundaryJudgeRouting, JudgeEvidenceLookup[]>();
     const attemptRestated = new Map<BoundaryJudgeRouting, string>();
     const attemptInputs = new Map<BoundaryJudgeRouting, ReviewInputObservation>();
+    const attemptOpinions = new Map<BoundaryJudgeRouting, PriorOpinionDisposition>();
     const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (deadlineSignal?: AbortSignal): Promise<T> => {
       const signals = [signal, deadlineSignal, callerSignal].filter((value): value is AbortSignal => Boolean(value));
       const lookups: JudgeEvidenceLookup[] = [];
       attemptLookups.set(r, lookups);
       attemptRestated.delete(r);
       attemptInputs.delete(r);
+      attemptOpinions.delete(r);
       return runRoutedJudgeAttempt<T>(r, instructions, prompt, parse, opts.requireCompletePrompt === true,
         opts.evidence, signals.length ? AbortSignal.any(signals) : undefined, opts.effort, (modelId) => {
           observedRoutes.set(r, modelId === r.modelId ? r : { ...r, modelId,
@@ -1343,8 +1626,9 @@ export async function runHedgedJudge<T>(
             substituteReason: r.substituteReason ?? 'provider_reported_model',
           });
         }, { lookup: (lookup) => { lookups.push(lookup); }, restated: (head) => { attemptRestated.set(r, head); },
-          input: (record) => { attemptInputs.set(r, record); } },
-        opts.verdictRepairContract, opts.reviewInput);
+          input: (record) => { attemptInputs.set(r, record); },
+          priorOpinion: (disposition) => { attemptOpinions.set(r, disposition); } },
+        opts.verdictRepairContract, opts.reviewInput, opts.assessment);
     };
     // An explicit caller deadline still wins; otherwise use the deadline the
     // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
@@ -1423,10 +1707,12 @@ export async function runHedgedJudge<T>(
     const winningRoute = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : answering;
     const winner = observedRoutes.get(winningRoute) ?? winningRoute;
     if (raced.value !== null) {
-      recordCompletionJudgeMetric(isPass(raced.value) ? 'passed' : 'blocked', startedAt, winner, lane);
+      recordCompletionJudgeMetric(opts.assessment?.unqualified(raced.value) ? 'invalid' : isPass(raced.value) ? 'passed' : 'blocked', startedAt, winner, lane);
       return { value: raced.value, failure: null, routing: winner, lookups: [...(attemptLookups.get(winningRoute) ?? [])],
+        comparisonDiagnostic: completionJudgeComparisonForRoute(winner),
         ...(attemptRestated.has(winningRoute) ? { restatedFrom: attemptRestated.get(winningRoute)! } : {}),
-        ...(attemptInputs.has(winningRoute) ? { reviewInputObservation: attemptInputs.get(winningRoute)! } : {}) };
+        ...(attemptInputs.has(winningRoute) ? { reviewInputObservation: attemptInputs.get(winningRoute)! } : {}),
+        ...(attemptOpinions.has(winningRoute) ? { priorOpinionDisposition: attemptOpinions.get(winningRoute)! } : {}) };
     }
     const failure =
       raced.errors.length === 0
@@ -1449,7 +1735,8 @@ export async function runHedgedJudge<T>(
         : transportError instanceof Error
           ? `The completion reviewer was unavailable; no review was completed. ${redactSensitiveText(transportError.message).replace(/\s+/g, ' ').slice(0, 400)}`
         : undefined;
-    return { value: null, failure, routing: failedRoute, ...(unavailableReason ? { unavailableReason } : {}), ...(invalidDetail ? { invalidDetail } : {}) };
+    return { value: null, failure, routing: failedRoute, ...(unavailableReason ? { unavailableReason } : {}), ...(invalidDetail ? { invalidDetail } : {}),
+      ...(attemptOpinions.has(answering) ? { priorOpinionDisposition: attemptOpinions.get(answering)! } : {}) };
   } catch (err) {
     // The new owning caller must observe cancellation, rather than turn it
     // into unavailable/failed-open completion. Ambient-only legacy consumers
@@ -1523,7 +1810,7 @@ async function runCompletionJudge(
     ? `${basePrompt}\n\n${skillContext.memoryRequirementContext}\n\n${MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS}` : basePrompt;
   let promptComposition: ReviewInputComposition | undefined = basePromptComposition;
   if (basePromptComposition && skillContext?.memoryRequirementContext) try {
-    promptComposition = composeReviewInput([basePromptComposition,
+    promptComposition = composeOpinionPrompt([basePromptComposition,
       { text: skillContext.memoryRequirementContext, component: 'memory_requirement_context' },
       { text: MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS, component: 'memory_review_guidance' },
     ], '\n\n');
@@ -1536,7 +1823,27 @@ async function runCompletionJudge(
   };
   // What the verdict rests on is read from the same output the verdict line
   // is, so the two can never come from different answers.
-  type Parsed = NonNullable<ReturnType<typeof parseCompletionVerdict>> & { needsAllOf?: string[] | null; memoryRequirement?: MemoryRequirementAssessmentV1 };
+  type Parsed = NonNullable<ReturnType<typeof parseCompletionVerdict>> & { needsAllOf?: string[] | null; memoryRequirement?: MemoryRequirementAssessmentV1;
+    reviewDisposition?: 'answered_unqualified'; reviewAssessment?: CompletionReviewAssessmentDiagnostic };
+  const usesAssessment = assessmentOptedIn(skillContext);
+  const assessment: SameCallAssessment<Parsed> | undefined = usesAssessment ? { unqualified: value => value.reviewDisposition === 'answered_unqualified', answer(output, original) {
+    const assessed = parseCompletionDecisionAssessment(output);
+    const control = assessed.control;
+    const verdict = control ? parseCompletionVerdict(`${control.marker}: ${control.reason}`) : null;
+    let diagnostic = assessed.diagnostic;
+    if (original) diagnostic = { ...diagnostic, originalModelCallId: original.modelCallId,
+      physicalAttempt: original.physicalAttempt, providerResponseIdDigest: original.providerResponseIdDigest };
+    else diagnostic = { ...diagnostic, status: 'unqualified',
+      reason: diagnostic.status === 'qualified' ? 'original_unbound' : diagnostic.reason };
+    // An explicit negative or honest user pause makes no positive claim to
+    // qualify. Do not invent a rejection from a malformed assessment.
+    const negative = verdict && (verdict.awaitingUser || verdict.blocked || (!verdict.done && verdict.repairScope !== 'reply_format'));
+    if (!verdict || !original || (!negative && diagnostic.status !== 'qualified')) return { done: true,
+      reason: 'The reviewer answered, but its assessment could not verify all of this answer.',
+      reviewDisposition: 'answered_unqualified', reviewAssessment: diagnostic };
+    return { ...verdict, reviewAssessment: diagnostic, ...(checksCoverage ? { needsAllOf: parseNeedsAllOf(output) } : {}),
+      ...(skillContext?.memoryRequirementContext ? { memoryRequirement: parseMemoryRequirementPacket(output) ?? undefined } : {}) };
+  } } : undefined;
   const parse = (output: unknown): Parsed | null => {
     const verdict = parseCompletionVerdict(output);
     if (!verdict) return null;
@@ -1552,7 +1859,7 @@ async function runCompletionJudge(
       instructions,
       reviewPrompt,
       parse,
-      (v) => v.done,
+      (v) => v.done && !v.reviewDisposition,
       judge.lane ?? 'completion',
       { signal: judge.signal, ...(timeoutMs ? { timeoutMs } : {}),
         ...(skillContext?.fullSourceEvidence ? { requireCompletePrompt: true } : {}),
@@ -1566,7 +1873,7 @@ async function runCompletionJudge(
           candidateDigest: createHash('sha256').update(assistantResponse, 'utf8').digest('hex'),
           instructions: instructionsComposition, prompt: composition,
         } } : {}),
-        quotaAwareRoute: true, verdictRepairContract },
+        quotaAwareRoute: true, verdictRepairContract, ...(assessment ? { assessment } : {}) },
     );
   };
   const plain = ({ needsAllOf: _needsAllOf, ...verdict }: Parsed): NonNullable<CompletionJudgeRun['verdict']> => verdict;
@@ -1576,10 +1883,14 @@ async function runCompletionJudge(
     const first = await hedged(prompt, depth, reviewsStarted++ === 0 ? 'completion' : 'confirmation', promptComposition);
     judge.signal?.throwIfAborted();
     const run: CompletionJudgeRun = { verdict: first.value ? plain(first.value) : null, failure: first.failure, routing: first.routing,
+      ...(first.comparisonDiagnostic ? { comparisonDiagnostic: first.comparisonDiagnostic } : {}),
       ...(first.restatedFrom ? { verdictRestatedFrom: first.restatedFrom } : {}),
       ...(first.unavailableReason ? { unavailableReason: first.unavailableReason } : {}),
       ...(first.invalidDetail ? { invalidDetail: first.invalidDetail } : {}) };
+    if (skillContext?.priorJevOpinion) run.priorOpinionDisposition = first.priorOpinionDisposition ?? 'not_dispatched';
     if (first.reviewInputObservation) run.reviewInputObservation = first.reviewInputObservation;
+    if (first.value?.reviewAssessment) run.reviewAssessment = first.value.reviewAssessment;
+    if (first.value?.reviewDisposition) { run.reviewDisposition = first.value.reviewDisposition; return run; }
     // Coverage qualifies an acceptance. A verdict that already sends the work
     // back, waits on the owner or is blocked claims nothing to qualify.
     const accepts = (value: Parsed | null): value is Parsed => Boolean(value?.done && !value.awaitingUser && !value.blocked);
@@ -1598,7 +1909,7 @@ async function runCompletionJudge(
       ];
       let followUpComposition: ReviewInputComposition | undefined;
       if (promptComposition) try {
-        followUpComposition = composeReviewInput([promptComposition, '',
+        followUpComposition = composeOpinionPrompt([promptComposition, '',
           { text: followUpParts.slice(2).join('\n'), component: 'coverage_followup' },
         ], '\n');
       } catch { /* diagnostic only */ }
@@ -1611,8 +1922,14 @@ async function runCompletionJudge(
       if (second.value) {
         lookups.push(...(second.lookups ?? []));
         run.verdict = plain(second.value);
+        run.reviewAssessment = second.value.reviewAssessment;
         run.reviewInputObservation = second.reviewInputObservation;
-        if (second.restatedFrom) run.verdictRestatedFrom = second.restatedFrom;
+        run.routing = second.routing;
+        run.comparisonDiagnostic = second.comparisonDiagnostic;
+        run.failure = second.failure;
+        if (skillContext?.priorJevOpinion) run.priorOpinionDisposition = second.priorOpinionDisposition ?? 'not_dispatched';
+        run.verdictRestatedFrom = second.restatedFrom;
+        if (second.value.reviewDisposition) { run.reviewDisposition = second.value.reviewDisposition; return run; }
         if (second.routing) run.routing = second.routing;
         if (!accepts(second.value)) {
           return { ...run, evidenceCoverage: coverageRecord(assessment, lookups, followUp) };
@@ -1699,12 +2016,13 @@ export async function reviewAtStakes(
   }
   const fast = await review({ effort: 'medium', timeoutMs: READ_REVIEW_TIMEOUT_MS });
   evidence.signal?.throwIfAborted();
-  if (!fast.verdict || fast.verdict.done) return { ...fast, reviewDepth: 'fast' };
+  if (fast.reviewDisposition === 'answered_unqualified' || !fast.verdict || fast.verdict.done) return { ...fast, reviewDepth: 'fast' };
   if (fast.verdict.repairScope === 'claims' || fast.verdict.repairScope === 'reply_format') {
     return { ...fast, reviewDepth: 'fast' };
   }
   const full = await review({ timeoutMs: READ_REVIEW_TIMEOUT_MS });
   evidence.signal?.throwIfAborted();
+  if (full.reviewDisposition === 'answered_unqualified') return { ...full, reviewDepth: 'full', reviewConfirmation: 'unavailable' };
   if (!full.verdict) return { ...fast, reviewDepth: 'fast', reviewConfirmation: 'unavailable' };
   return { ...full, reviewDepth: 'full', reviewConfirmation: full.verdict.done ? 'overruled' : 'upheld' };
 }
@@ -1846,6 +2164,7 @@ export async function judgeObjectiveCompleteStrict(
     lane: 'goal_fidelity',
     timeoutMs: goalJudgeTimeoutMs(),
   });
+  if (run.reviewDisposition === 'answered_unqualified') throw new Error('The reviewer answered without a qualified same-call assessment.');
   if (!run.verdict) {
     throw new Error(
       run.unavailableReason ?? (run.failure === 'timeout' ? 'judge timed out'
@@ -1868,7 +2187,7 @@ export async function judgeObjectiveComplete(
   skillContext?: SkillExecutionContext,
 ): Promise<ObjectiveJudgeVerdict> {
   if (!objective.trim() || !assistantResponse.trim()) {
-    return { done: true, reason: 'insufficient text to judge — accepting completion' };
+    return { done: true, reason: 'insufficient text to judge — accepting completion', ...UNAVAILABLE_JUDGE_COMPARISON };
   }
   // Connecting Jev is the owner opt-in: a confident typed verdict (~300ms)
   // skips the 3–25s hedged chat-model judge. The configured judge remains the
@@ -1904,36 +2223,158 @@ export async function judgeObjectiveComplete(
   const historicalEligible = (skillContext?.verifiedReadResults?.length ?? 0) === 0
     && historicalReadPacketIsCurrent(skillContext?.historicalEvidence,
       { sessionId: skillContext?.sessionId, objective, reply: assistantResponse });
+  const assessmentInvocationId = randomUUID();
+  let assessmentReader: typeof import('../jev/control-plane.js').jevCompletionAssessmentForReview | undefined;
+  let readyAssessment: unknown;
+  // A completed screen may abstain without returning a verdict. Keep its
+  // private producer proof after the optional advisory has been consumed, so
+  // an unavailable reviewer does not ask the identical question again.
+  let completedScreen: { assessment: unknown; inputSnapshot: string } | undefined;
+  let screeningMemoryReader: typeof import('../../memory/judge-memory.js').judgeMemoryFor | undefined;
+  let reviewOpinion: PriorJevOpinion | undefined;
+  let reviewerEntryStarted = false;
+  const assessmentExpected = () => {
+    const owner = skillContext?.reviewInputOwner; const actual = reviewOwnerAtModelEntry();
+    if (!owner?.attemptId || !actual || actual.sessionId !== owner.sessionId
+      || actual.sourceUserSeq !== owner.sourceUserSeq || actual.attemptId !== owner.attemptId
+      || skillContext?.sessionId !== owner.sessionId) return undefined;
+    return { owner: { sessionId: owner.sessionId, sourceUserSeq: owner.sourceUserSeq, attemptId: owner.attemptId },
+      reviewInvocationId: assessmentInvocationId,
+      objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex'),
+      candidateDigest: createHash('sha256').update(assistantResponse, 'utf8').digest('hex'),
+      contextDigest: createHash('sha256').update(JSON.stringify({
+        requirementContext: jevCompletionRequirementContext(skillContext),
+        toolCallSummary: skillContext.toolCallSummary, verifiedReads: skillContext.verifiedReads,
+        verifiedReadResults: skillContext.verifiedReadResults,
+        coverage, historicalEvidence: historicalEligible ? skillContext.historicalEvidence : undefined,
+      }), 'utf8').digest('hex'),
+    };
+  };
+  const jevContext = (memory: string) => ({
+    ...(memory ? { memory } : {}),
+    sessionId: skillContext?.sessionId,
+    // Requirements remain separate from source evidence, including when the
+    // selected historical view excludes current results from result proof.
+    requirementContext: jevCompletionRequirementContext(skillContext),
+    ...(historicalEligible ? { currentReviewContext: skillContext?.toolCallSummary } : {}),
+    toolCallSummary: skillContext?.toolCallSummary,
+    verifiedReads: skillContext?.verifiedReads,
+    coverage: {
+      complete: coverage.complete,
+      outcomeEvidence: coverage.outcomeEvidence.map((row) => ({
+        toolName: row.toolName,
+        outcome: row.outcome,
+        contentComplete: row.contentComplete,
+      })),
+    },
+    ...(historicalEligible ? { historicalEvidence: skillContext?.historicalEvidence } : {}),
+  });
+  // Reuse reads only inert own data. In particular, a getter/toJSON/proxy
+  // cannot manufacture an apparently unchanged current view by alternating
+  // values between the original-proof check and the input comparison.
+  const plainScreeningContext = (): string | undefined => {
+    try {
+      let nodes = 0;
+      const active = new Set<object>();
+      const descriptors = (value: object) => {
+        if (nodeTypes.isProxy(value)) throw new Error('unsupported reuse context');
+        const prototype = Object.getPrototypeOf(value);
+        const expectedPrototype = Array.isArray(value) ? Array.prototype : Object.prototype;
+        if (prototype !== null && prototype !== expectedPrototype) throw new Error('unsupported reuse context');
+        if (prototype && Object.getOwnPropertyDescriptor(prototype, 'toJSON')) throw new Error('unsupported reuse context');
+        const before = Reflect.ownKeys(value);
+        const captured = Object.getOwnPropertyDescriptors(value);
+        const after = Reflect.ownKeys(value);
+        if (before.length !== after.length || before.some((key, index) => typeof key !== 'string'
+          || key === 'toJSON' || key !== after[index] || !Object.hasOwn(captured[key]!, 'value'))) throw new Error('unsupported reuse context');
+        return captured;
+      };
+      const clone = (value: unknown, depth = 0): unknown => {
+        if (++nodes > 10_000 || depth > 32) throw new Error('unsupported reuse context');
+        if (value === null || value === undefined || typeof value === 'string' || typeof value === 'boolean') return value;
+        if (typeof value === 'number' && Number.isFinite(value)) return value;
+        if (typeof value !== 'object' || active.has(value)) throw new Error('unsupported reuse context');
+        active.add(value);
+        try {
+          const captured = descriptors(value);
+          const array = Array.isArray(value);
+          const indexes = array ? Object.keys(captured).filter(key => key !== 'length') : [];
+          if (array && (indexes.length !== captured.length?.value
+            || indexes.some((key, index) => key !== String(index)))) throw new Error('unsupported reuse context');
+          const result: Record<string, unknown> = array ? [] as unknown as Record<string, unknown> : Object.create(null);
+          if (array) Object.setPrototypeOf(result, null);
+          for (const [key, descriptor] of Object.entries(captured)) {
+            if (array && key === 'length') continue;
+            if (!descriptor.enumerable || (array && !/^(0|[1-9]\d*)$/.test(key))) throw new Error('unsupported reuse context');
+            result[key] = clone(descriptor.value, depth + 1);
+          }
+          if (array && Object.keys(result).length !== captured.length?.value) throw new Error('unsupported reuse context');
+          return result;
+        } finally { active.delete(value); }
+      };
+      const fields = (value: object | undefined, names: string[]): unknown => {
+        if (!value) return undefined;
+        const captured = descriptors(value);
+        const result = Object.create(null) as Record<string, unknown>;
+        for (const key of names) if (captured[key]) {
+          if (!captured[key]!.enumerable) throw new Error('unsupported reuse context');
+          result[key] = clone(captured[key]!.value);
+        }
+        return result;
+      };
+      const snapshot = Object.create(null) as Record<string, unknown>;
+      snapshot.context = fields(skillContext, ['reviewInputOwner', 'sessionId', 'skills', 'agentInstructions',
+        'completionEvidenceGuidance', 'toolCallSummary', 'verifiedReads', 'verifiedReadResults', 'historicalEvidence',
+        'memoryRequirementContext', 'inheritedReadCoverage', 'reviewsPlan', 'reviewStakes', 'fullSourceEvidence']);
+      // This copy is only a change detector. Original ownership still comes
+      // from the private witness and current direct attribution, never JSON.
+      snapshot.owner = fields(modelUsageAttributionStorage.getStore(), ['sessionId', 'sourceUserSeq', 'attemptId', 'usageParentTurn', 'usageJobId']);
+      return JSON.stringify(snapshot);
+    } catch { return undefined; }
+  };
+  const screeningInputSnapshot = (context: string, memory: string): string => JSON.stringify(
+    Object.assign(Object.create(null), { objective, candidate: assistantResponse, context, memory }));
+  const completedScreenIsCurrent = (): boolean => {
+    try {
+      if (!completedScreen || !screeningMemoryReader || callerSignal?.aborted) return false;
+      const current = plainScreeningContext();
+      if (current === undefined) return false;
+      const expected = assessmentExpected();
+      const assessment = expected && assessmentReader?.(completedScreen.assessment,
+        { ...expected, signal: callerSignal });
+      return assessment?.outcome === 'abstained'
+        && completedScreen.inputSnapshot === screeningInputSnapshot(current, screeningMemoryReader(skillContext?.sessionId));
+    } catch { return false; }
+  };
   // screening: the ask ahead of the reviewer, which Jev's record may skip.
   // The late ask, when the reviewer could not run, is never skipped.
   const askJev = async (screening = false): Promise<Awaited<ReturnType<typeof import('../jev/control-plane.js').tryJevCompletionVerdict>>> => {
     try {
-      const { tryJevCompletionVerdict } = await import('../jev/control-plane.js');
+      const { tryJevCompletionVerdict, jevCompletionAssessmentForReview } = await import('../jev/control-plane.js');
+      assessmentReader = jevCompletionAssessmentForReview;
+      const before = screening ? plainScreeningContext() : undefined;
+      const expected = screening ? assessmentExpected() : undefined;
       const { judgeMemoryFor } = await import('../../memory/judge-memory.js');
       const memory = judgeMemoryFor(skillContext?.sessionId);
+      const context = jevContext(memory);
+      const current = screening && before !== undefined ? plainScreeningContext() : undefined;
+      const inputSnapshot = before !== undefined && current === before ? screeningInputSnapshot(current, memory) : undefined;
+      if (screening) screeningMemoryReader = judgeMemoryFor;
       return await tryJevCompletionVerdict(objective, assistantResponse, {
         ...(screening ? { screening: true } : {}),
-        ...(memory ? { memory } : {}),
-        sessionId: skillContext?.sessionId,
-        // Requirements are separate from source evidence so historical-only
-        // selection cannot drop the host rules, standing instructions or exact
-        // retained skill references. Neither view supplies new effect authority.
-        requirementContext: jevCompletionRequirementContext(skillContext),
-        // Exact accepted owner context may be carried in the host summary,
-        // independently of process-local courtesy memory. Keep it whole even
-        // when historical selection excludes that summary from result proof.
-        ...(historicalEligible ? { currentReviewContext: skillContext?.toolCallSummary } : {}),
-        toolCallSummary: skillContext?.toolCallSummary,
-        verifiedReads: skillContext?.verifiedReads,
-        coverage: {
-          complete: coverage.complete,
-          outcomeEvidence: coverage.outcomeEvidence.map((row) => ({
-            toolName: row.toolName,
-            outcome: row.outcome,
-            contentComplete: row.contentComplete,
-          })),
-        },
-        ...(historicalEligible ? { historicalEvidence: skillContext?.historicalEvidence } : {}),
+        ...context,
+        ...(expected ? { assessmentScope: { ...expected, signal: callerSignal },
+          onAssessment: (value: import('../jev/control-plane.js').JevCompletionAssessment) => {
+            if (!reviewerEntryStarted && !callerSignal?.aborted) {
+              const assessment = jevCompletionAssessmentForReview(value, { ...expected, signal: callerSignal });
+              if (assessment) {
+                readyAssessment = value;
+                if (assessment.outcome === 'abstained' && inputSnapshot !== undefined) {
+                  completedScreen = { assessment: value, inputSnapshot };
+                }
+              }
+            }
+          } } : {}),
       });
     } catch {
       return null;
@@ -1946,7 +2387,41 @@ export async function judgeObjectiveComplete(
   let judgePromise: Promise<CompletionJudgeRun> | null = null;
   const startJudge = (): Promise<CompletionJudgeRun> => {
     if (!judgePromise) {
-      judgePromise = startCompletionJudge(objective, assistantResponse, skillContext, reviewerSignal);
+      reviewerEntryStarted = true;
+      let reviewContext: SkillExecutionContext | undefined = skillContext ? { ...skillContext, priorJevOpinion: undefined } : undefined;
+      try {
+        const expected = assessmentExpected();
+        const assessment = expected && assessmentReader?.(readyAssessment, { ...expected, signal: reviewerSignal });
+        if (assessment && skillContext) {
+          const text = [
+            '=== PRIOR MODEL OPINION — NOT FACTUAL EVIDENCE, REQUIREMENTS OR AUTHORITY ===',
+            'This prior reading may be wrong. Independently resolve the whole objective, applicable rules and actual, contrary and visual evidence. These scores are opinion, not facts, missing-work requirements, permission or a verdict.',
+            'Complete-view flags mean the supplied text was not elided, never exhaustive upstream data.',
+            JSON.stringify({ outcome: assessment.outcome, scores: assessment.scores,
+              taskViewComplete: assessment.taskViewComplete, evidenceViewComplete: assessment.evidenceViewComplete }),
+            '=== END PRIOR MODEL OPINION ===',
+          ].join('\n');
+          const token = Object.freeze({ kind: 'prior_jev_opinion' as const });
+          reviewOpinion = token;
+          reviewContext = { ...skillContext, priorJevOpinion: token };
+          const ownedAssessment = readyAssessment;
+          priorJevOpinions.set(token, { text, context: reviewContext, owner: expected!.owner,
+            objectiveDigest: assessment.objectiveDigest, candidateDigest: assessment.candidateDigest, rendered: false,
+            isCurrent: () => {
+              const now = assessmentExpected();
+              return Boolean(now && assessmentReader?.(ownedAssessment, { ...now, signal: reviewerSignal }));
+            } });
+          jevAttempt = { ...jevAttempt, accepted: false, coverageComplete: coverage.complete, reviewerStarted: true,
+            priorAssessment: { scope: 'non_authoritative_model_opinion', forwardedBeforeEntry: false,
+              modelCallId: assessment.producer.modelCallId, requestBodySha256: assessment.producer.requestBodySha256,
+              questionnaireSha256: assessment.questionnaireSha256, originalResultSha256: assessment.producer.originalResultSha256,
+              objectiveDigest: assessment.objectiveDigest, candidateDigest: assessment.candidateDigest,
+              renderedSha256: createHash('sha256').update(text, 'utf8').digest('hex'),
+              accountBackend: 'unknown', providerResponseIdentity: 'unknown' } };
+        }
+      } catch { /* optional opinion does not change reviewer admission or execution */ }
+      readyAssessment = undefined;
+      judgePromise = startCompletionJudge(objective, assistantResponse, reviewContext, reviewerSignal);
       // The timer may start this request while Jev is still pending. Attach a
       // handler immediately: a cancelled loser is intentionally never awaited.
       void judgePromise.catch(() => {});
@@ -1965,6 +2440,7 @@ export async function judgeObjectiveComplete(
       ...(fast.awaitingUser ? { awaitingUser: true } : {}),
       ...(fast.blocked ? { blocked: true } : {}) };
     jevAttempt = {
+      ...(jevAttempt?.priorAssessment ? { priorAssessment: jevAttempt.priorAssessment } : {}),
       accepted,
       coverageComplete: coverage.complete,
       // Whether the hedge saved the reviewer call, so the saving is countable.
@@ -2021,6 +2497,7 @@ export async function judgeObjectiveComplete(
         reason: fast.reason,
         judgeModelId: fast.judgeModelId,
         fast: true,
+        ...UNAVAILABLE_JUDGE_COMPARISON,
         ...(fast.historicalEvidence ? { historicalEvidence: fast.historicalEvidence } : {}),
         ...(jevAttempt ? { jevAttempt } : {}),
         ...(fast.awaitingUser ? { awaitingUser: true } : {}),
@@ -2031,6 +2508,33 @@ export async function judgeObjectiveComplete(
   }
   const run = await startJudge();
   callerSignal?.throwIfAborted();
+  const comparisonDiagnostic = completionJudgeComparisonDiagnostic(judgeDiagnosticOwnData(run, 'comparisonDiagnostic')?.value);
+  if (reviewOpinion && jevAttempt?.priorAssessment) {
+    if (run.priorOpinionDisposition) {
+      jevAttempt = { ...jevAttempt, priorAssessment: { ...jevAttempt.priorAssessment,
+        forwardedBeforeEntry: run.priorOpinionDisposition === 'forwarded',
+        ...(run.priorOpinionDisposition !== 'forwarded' ? { omissionReason:
+          run.priorOpinionDisposition === 'omitted_context_limit' ? 'context_limit' as const : 'not_dispatched' as const } : {}) } };
+    } else {
+      const { priorAssessment: _notDispatched, ...remaining } = jevAttempt;
+      jevAttempt = remaining;
+    }
+  }
+  if (run.reviewDisposition === 'answered_unqualified') return { done: true, failedOpen: true, reviewFailure: 'invalid',
+    ...comparisonDiagnostic,
+    reviewDisposition: 'answered_unqualified', reason: 'The reviewer answered, but its assessment could not verify all of this answer.',
+    ...(run.reviewAssessment ? { reviewAssessment: run.reviewAssessment } : {}),
+    ...(run.reviewInputObservation ? { reviewInputObservation: run.reviewInputObservation } : {}),
+    ...(run.reviewDepth ? { reviewDepth: run.reviewDepth } : {}),
+    ...(run.routing?.modelId ? { judgeModelId: run.routing.modelId } : {}),
+    ...(run.routing?.judgeFamily ? { judgeProvider: run.routing.judgeFamily } : {}),
+    ...(run.routing?.judgeProviderId ? { judgeProviderId: run.routing.judgeProviderId } : {}),
+    ...(run.routing?.substituteForExactPin ? { substituteForExactPin: true,
+      ...(run.routing.requestedModelId ? { requestedJudgeModelId: run.routing.requestedModelId } : {}),
+      ...(run.routing.substituteReason ? { substituteReason: run.routing.substituteReason } : {}) } : {}),
+    ...(run.routing?.selfJudge ? { selfJudge: true } : {}),
+    ...(run.routing?.ownerSelectedJudge ? { ownerSelectedJudge: true } : {}),
+    ...(jevAttempt ? { jevAttempt } : {}) };
   if (!run.verdict) {
     // NO REVIEWER IS NOT A REASON TO ACCEPT A PROMISE.
     //
@@ -2048,7 +2552,7 @@ export async function judgeObjectiveComplete(
     // One direction only: a Jev DONE still fails open below, because "the
     // reviewer was unreachable" must never be delivered as "this was reviewed".
     // failedOpen stays set, so nothing downstream claims a completed review.
-    if (!jevSaid && !reviewsPlan && !reviewsMemory && !reviewsInherited) {
+    if (!jevSaid && !reviewsPlan && !reviewsMemory && !reviewsInherited && !completedScreenIsCurrent()) {
       const late = await askJev();
       callerSignal?.throwIfAborted();
       if (late) noteJev(late, false);
@@ -2060,6 +2564,7 @@ export async function judgeObjectiveComplete(
     if (finding && !finding.done && !finding.awaitingUser) {
       return {
         done: false,
+        ...UNAVAILABLE_JUDGE_COMPARISON,
         failedOpen: true,
         reviewFailure,
         reason: finding.reason?.trim()
@@ -2071,6 +2576,7 @@ export async function judgeObjectiveComplete(
       };
     }
     if (run.unavailableReason) return { done: true, failedOpen: true, reviewFailure,
+      ...UNAVAILABLE_JUDGE_COMPARISON,
       reason: run.unavailableReason, ...(jevAttempt ? { jevAttempt } : {}), ...unqualifiedCoverage };
     const why =
       run.failure === 'timeout'
@@ -2078,12 +2584,14 @@ export async function judgeObjectiveComplete(
         : run.failure === 'invalid'
           ? `The completion reviewer returned an unreadable verdict; no review was completed.${run.invalidDetail ? ` (${run.invalidDetail})` : ''}`
           : 'The completion reviewer was unavailable; no review was completed.';
-    return { done: true, reason: why, failedOpen: true, reviewFailure, ...(jevAttempt ? { jevAttempt } : {}), ...unqualifiedCoverage };
+    return { done: true, reason: why, failedOpen: true, reviewFailure, ...UNAVAILABLE_JUDGE_COMPARISON, ...(jevAttempt ? { jevAttempt } : {}), ...unqualifiedCoverage };
   }
   return {
     done: run.verdict.done,
+    ...comparisonDiagnostic,
     reason: run.verdict.reason,
     ...(run.verdict.memoryRequirement ? { memoryRequirement: run.verdict.memoryRequirement } : {}),
+    ...(run.reviewAssessment ? { reviewAssessment: run.reviewAssessment } : {}),
     ...(jevAttempt ? { jevAttempt } : {}),
     ...(run.verdict.repairScope ? { repairScope: run.verdict.repairScope } : {}),
     selfJudge: run.routing?.selfJudge === true,

@@ -1,0 +1,303 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomUUID } from 'node:crypto';
+import { appendEvent } from './eventlog.js';
+import { completedModelResponseBinding } from './model-response-binding.js';
+import { modelUsageAttributionStorage } from '../usage-log.js';
+import { associateOriginalReviewWireResponse, beginReviewWireTransform, captureReviewWireExpectation,
+  finishReviewWireTransform, reviewWireInclusionForDispatch, unavailableReviewWireExpectation, type ClaudeSystemTextProjection,
+  type ReviewWireExpectation, type ReviewWireInclusionObservation, type ReviewWireOwner,
+  type ReviewWireTransform } from './review-input-observation.js';
+
+export type ObservedModelTransport = 'raw_claude_messages' | 'typesafe_systemone';
+export type ModelTransportRecorder = (data: Readonly<Record<string, unknown>>) => unknown;
+
+interface ObservationOwner {
+  sessionId: string; sourceUserSeq: number; runAttemptId?: string;
+  accountingParent: boolean; usageJobId?: string;
+}
+export interface ModelTransportAttempt {
+  readonly modelCallId: string;
+  readonly physicalAttempt: number;
+  readonly owner?: Readonly<ObservationOwner>;
+  readonly purpose: 'brain' | 'worker' | 'reviewer' | 'router' | 'writer' | 'memory' | 'unknown';
+}
+/** A nominal snapshot taken at the public model call, including an explicit
+ * absent owner. A lazy stream must never borrow its later drainer's scope. */
+export interface CapturedModelTransportOwner {
+  readonly owner?: Readonly<ObservationOwner>;
+  readonly purpose: ModelTransportAttempt['purpose'];
+}
+const capturedOwners = new WeakMap<CapturedModelTransportOwner, { record?: ModelTransportRecorder; expectation: ReviewWireExpectation }>();
+interface AttemptState {
+  record: ModelTransportRecorder;
+  dispatchIds: string[];
+  terminal: boolean;
+  journalFailed: boolean;
+  expectation: ReviewWireExpectation;
+  wireInclusions: ReviewWireInclusionObservation[];
+  producer?: ClaudeModelWireProducer;
+  ambiguousProducer: boolean;
+  localOutcome?: 'failed' | 'cancelled' | 'returned';
+  localOriginal?: { response: object; providerResponseIdDigest: string };
+  ambiguousLocalOriginal?: true;
+}
+export interface ClaudeModelWireProducer { readonly kind: 'claude_raw_aisdk_producer' }
+const claudeProducers = new WeakSet<ClaudeModelWireProducer>();
+/** Minted at the raw adapter's actual aisdk factory, never from provider JSON. */
+export function createClaudeModelWireProducer(): ClaudeModelWireProducer {
+  const producer = Object.freeze({ kind: 'claude_raw_aisdk_producer' as const });
+  claudeProducers.add(producer); return producer;
+}
+export function declareActiveClaudeModelWireProducer(producer: ClaudeModelWireProducer): void {
+  const scope = activeAttempt.getStore(); const state = scope && states.get(scope);
+  if (!state || state.terminal) return;
+  if (!claudeProducers.has(producer) || (state.producer && state.producer !== producer)) state.ambiguousProducer = true;
+  else state.producer = producer;
+}
+function reviewWireOwner(scope: ModelTransportAttempt): ReviewWireOwner | undefined {
+  return scope.owner ? { sessionId: scope.owner.sessionId, sourceUserSeq: scope.owner.sourceUserSeq,
+    attemptId: scope.owner.runAttemptId, modelCallId: scope.modelCallId, physicalAttempt: scope.physicalAttempt } : undefined;
+}
+export function beginActiveClaudeReviewWireTransform(body: Record<string, unknown>): ReviewWireTransform | undefined {
+  try {
+    const scope = activeAttempt.getStore(); const state = scope && states.get(scope); const owner = scope && reviewWireOwner(scope);
+    return state?.producer && !state.terminal && !state.ambiguousProducer && owner
+      ? beginReviewWireTransform(state.expectation, owner, body) : undefined;
+  } catch { return undefined; }
+}
+export function finishActiveClaudeReviewWireTransform(transform: ReviewWireTransform | undefined,
+  body: Record<string, unknown>, projection: ClaudeSystemTextProjection | undefined, identity: string): void {
+  if (transform) try { finishReviewWireTransform(transform, body, projection, identity); } catch { /* diagnostic only */ }
+}
+const states = new WeakMap<ModelTransportAttempt, AttemptState>();
+const activeAttempt = new AsyncLocalStorage<ModelTransportAttempt>();
+const overrideRecorder = new AsyncLocalStorage<ModelTransportRecorder>();
+const identity = (value: unknown): value is string => typeof value === 'string'
+  && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/.test(value);
+
+interface WirePart { readonly sha256: string; readonly bytes: number }
+export interface ModelWireRequestSnapshot {
+  readonly serialized: Readonly<WirePart>;
+  readonly components: Readonly<Partial<Record<'system' | 'messages' | 'tools' | 'toolSchemas' | 'output_config', Readonly<WirePart>>>>;
+}
+const wireSnapshots = new WeakSet<ModelWireRequestSnapshot>();
+const wirePart = (text: string): Readonly<WirePart> => Object.freeze({
+  sha256: createHash('sha256').update(text, 'utf8').digest('hex'), bytes: Buffer.byteLength(text, 'utf8'),
+});
+
+/** Final serialized request hashes only. This does not attest that any rubric
+ * or guide was included; that requires its own exact nominal component join. */
+export function modelWireRequestSnapshot(serialized: unknown): ModelWireRequestSnapshot | undefined {
+  try {
+    if (typeof serialized !== 'string') return undefined;
+    const parsed: unknown = JSON.parse(serialized);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    const body = parsed as Record<string, unknown>;
+    const components: ModelWireRequestSnapshot['components'] = {};
+    const mutable = components as Record<string, Readonly<WirePart>>;
+    for (const key of ['system', 'messages', 'tools', 'output_config'] as const) {
+      if (Object.hasOwn(body, key)) mutable[key] = wirePart(JSON.stringify(body[key]));
+    }
+    if (Array.isArray(body.tools)) mutable.toolSchemas = wirePart(JSON.stringify(body.tools.map(tool =>
+      tool && typeof tool === 'object' && !Array.isArray(tool) ? (tool as Record<string, unknown>).input_schema ?? null : null)));
+    const snapshot = Object.freeze({ serialized: wirePart(serialized), components: Object.freeze(components) });
+    wireSnapshots.add(snapshot);
+    return snapshot;
+  } catch { return undefined; }
+}
+
+/** Avoid hashing detached/unobserved traffic. Their inventory remains unknown. */
+export function activeModelWireRequestSnapshot(serialized: unknown): ModelWireRequestSnapshot | undefined {
+  return activeAttempt.getStore()?.owner ? modelWireRequestSnapshot(serialized) : undefined;
+}
+
+/** Test/request-local sink only; concurrent requests never share mutable sinks. */
+export function withModelTransportRecorder<T>(record: ModelTransportRecorder, work: () => T): T {
+  return overrideRecorder.run(record, work);
+}
+
+function snapshotOwner(): Readonly<ObservationOwner> | undefined {
+  const current = modelUsageAttributionStorage.getStore();
+  // Select a whole existing accounting tuple. A detached memory job may carry
+  // its parent, but its own attempt must never be spliced into that tuple.
+  const value = current && identity(current.sessionId) && current.sessionId !== 'unknown'
+    && Number.isSafeInteger(current.sourceUserSeq) && current.sourceUserSeq > 0
+    ? current : current?.usageParentTurn;
+  if (!value || !identity(value.sessionId) || value.sessionId === 'unknown'
+    || !Number.isSafeInteger(value.sourceUserSeq) || value.sourceUserSeq <= 0) return undefined;
+  return Object.freeze({ sessionId: value.sessionId, sourceUserSeq: value.sourceUserSeq,
+    accountingParent: value !== current,
+    ...(identity(current?.usageJobId) ? { usageJobId: current.usageJobId } : {}),
+    ...(identity(value.attemptId) ? { runAttemptId: value.attemptId } : {}) });
+}
+
+function emit(scope: ModelTransportAttempt, fields: Record<string, unknown>): void {
+  const state = states.get(scope);
+  if (!state || !scope.owner) return;
+  try {
+    const data = Object.freeze({ ...fields, version: 1, sourceUserSeq: scope.owner.sourceUserSeq,
+    logicalTurnId: `turn:${scope.owner.sourceUserSeq}`, modelCallId: scope.modelCallId,
+    physicalAttempt: scope.physicalAttempt, purpose: scope.purpose,
+    ownerKind: scope.owner.accountingParent ? 'accounting_parent' : 'accepted_source_scope',
+    ...(scope.owner.usageJobId ? { usageJobId: scope.owner.usageJobId } : {}),
+    ...(scope.owner.runAttemptId ? { runAttemptId: scope.owner.runAttemptId } : {}),
+    at: Date.now(), clock: 'host_epoch_ms', journalFailed: state.journalFailed });
+    const returned = state.record(data);
+    if (returned && typeof (returned as PromiseLike<unknown>).then === 'function') {
+      void Promise.resolve(returned).catch(() => { state.journalFailed = true; });
+    }
+  } catch { state.journalFailed = true; /* diagnostics never change dispatch */ }
+}
+
+export function captureModelTransportOwner(): CapturedModelTransportOwner {
+  const role = modelUsageAttributionStorage.getStore()?.role;
+  const purpose = role && ['brain', 'worker', 'reviewer', 'router', 'writer', 'memory'].includes(role) ? role : 'unknown';
+  const owner = snapshotOwner();
+  const captured = Object.freeze({ ...(owner ? { owner } : {}), purpose }) as CapturedModelTransportOwner;
+  capturedOwners.set(captured, { record: overrideRecorder.getStore(), expectation: captureReviewWireExpectation() });
+  return captured;
+}
+
+/** Failed diagnostic capture is explicitly unowned, never a request to adopt
+ * a later caller's ALS. This uses the same nominal token and original sink. */
+export function captureUnavailableModelTransportOwner(): CapturedModelTransportOwner {
+  const captured = Object.freeze({ purpose: 'unknown' as const });
+  capturedOwners.set(captured, { record: overrideRecorder.getStore(), expectation: unavailableReviewWireExpectation() });
+  return captured;
+}
+
+/** An adapter attempt is not a wire request. Capture its owner before any
+ * transport work; actual fetches mint their own IDs under this immutable scope. */
+export function createModelTransportAttempt(modelCallId: string, physicalAttempt: number,
+  captured: CapturedModelTransportOwner = captureModelTransportOwner()): ModelTransportAttempt {
+  const nominal = capturedOwners.has(captured);
+  const purpose = nominal ? captured.purpose : 'unknown';
+  const owner = nominal ? captured.owner : undefined;
+  const scope = Object.freeze({ modelCallId, physicalAttempt, ...(owner ? { owner } : {}), purpose }) as ModelTransportAttempt;
+  const capturedState = nominal ? capturedOwners.get(captured) : undefined;
+  const record = capturedState?.record ?? ((data: Readonly<Record<string, unknown>>) => {
+    appendEvent({ sessionId: owner!.sessionId, turn: 0, role: 'system', type: 'model_transport_observed', data });
+  });
+  if (identity(modelCallId) && Number.isSafeInteger(physicalAttempt) && physicalAttempt > 0) {
+    states.set(scope, { record, dispatchIds: [], terminal: false, journalFailed: false,
+      expectation: capturedState?.expectation ?? unavailableReviewWireExpectation(), wireInclusions: [], ambiguousProducer: false });
+    // Creation is a local declaration, not proof that an SDK or fetch ran.
+    emit(scope, { phase: 'adapter_attempt_created', resultScope: 'local_adapter_attempt', dispatchIds: [] });
+  }
+  return scope;
+}
+
+export function withModelTransportAttempt<T>(scope: ModelTransportAttempt, work: () => T): T {
+  return activeAttempt.run(scope, work);
+}
+
+/** Generator creation does not retain ALS. Bind every next/return/throw to the
+ * same captured attempt without buffering, changing yields or retry policy. */
+export function modelTransportAttemptStream<T>(scope: ModelTransportAttempt, iterable: AsyncIterable<T>): AsyncIterable<T> {
+  return { [Symbol.asyncIterator]() {
+    const iterator = withModelTransportAttempt(scope, () => iterable[Symbol.asyncIterator]());
+    return {
+      next: (...args: [] | [unknown]) => withModelTransportAttempt(scope, () => iterator.next(...args as [])),
+      ...(iterator.return ? { return: (value?: unknown) => withModelTransportAttempt(scope, () => iterator.return!(value as never)) } : {}),
+      ...(iterator.throw ? { throw: (error?: unknown) => withModelTransportAttempt(scope, () => iterator.throw!(error)) } : {}),
+    };
+  } };
+}
+
+/** Observe only the existing fetch and its headers/failure. Never inspect or
+ * consume response bodies, URLs, headers, credentials, prompts or raw errors. */
+export async function observeModelTransportFetch<T extends { status: number; ok: boolean }>(
+  transport: ObservedModelTransport, requestedModel: unknown, work: () => Promise<T>,
+  retryReason?: 'cache_ttl_rejected',
+  wireRequest?: ModelWireRequestSnapshot,
+  reviewWire?: { transform?: ReviewWireTransform; serialized: unknown },
+): Promise<T> {
+  const scope = activeAttempt.getStore();
+  const state = scope && states.get(scope);
+  if (!scope || !state) return work();
+  const dispatchId = randomUUID();
+  const ordinal = state.dispatchIds.push(dispatchId);
+  const started = Date.now();
+  let wireInputInclusion: ReviewWireInclusionObservation | undefined;
+  if (reviewWire && transport === 'raw_claude_messages') try {
+    const owner = reviewWireOwner(scope);
+    if (owner) wireInputInclusion = reviewWireInclusionForDispatch(state.expectation,
+      state.producer && !state.ambiguousProducer && !state.terminal ? reviewWire.transform : undefined,
+      owner, dispatchId, ordinal, reviewWire.serialized);
+    if (wireInputInclusion) state.wireInclusions.push(wireInputInclusion);
+  } catch { state.journalFailed = true; }
+  emit(scope, { phase: 'dispatch_started', transport, dispatchId, wireSubattempt: ordinal,
+    ...(wireInputInclusion ? { wireInputInclusion } : {}),
+    ...(wireRequest && wireSnapshots.has(wireRequest) ? { wireRequest } : {}),
+    ...(identity(requestedModel) ? { requestedModel } : {}), ...(retryReason ? { retryReason } : {}),
+    late: state.terminal });
+  try {
+    const result = await work();
+    try {
+      emit(scope, { phase: 'headers_received', transport, dispatchId, wireSubattempt: ordinal,
+        status: result.status, ok: result.ok, durationMs: Math.max(0, Date.now() - started),
+        modelCompletion: 'unproved', late: state.terminal });
+    } catch { state.journalFailed = true; }
+    return result;
+  } catch (error) {
+    emit(scope, { phase: 'dispatch_failed', transport, dispatchId, wireSubattempt: ordinal,
+      durationMs: Math.max(0, Date.now() - started), usage: 'unknown', late: state.terminal });
+    throw error;
+  }
+}
+
+/** Called only after the original provider result acquired the private
+ * completed-response binding, before any Runner aggregate/metadata clone. */
+export function observeCompletedTransportModelResponse(scope: ModelTransportAttempt, response: unknown): void {
+  const binding = completedModelResponseBinding(response);
+  if (!binding || binding.modelCallId !== scope.modelCallId || binding.physicalAttempt !== scope.physicalAttempt) return;
+  const state = states.get(scope);
+  if (state && state.localOutcome === undefined && response && typeof response === 'object') {
+    if (state.localOriginal && (state.localOriginal.response !== response
+      || state.localOriginal.providerResponseIdDigest !== binding.providerResponseIdDigest)) state.ambiguousLocalOriginal = true;
+    else state.localOriginal = { response, providerResponseIdDigest: binding.providerResponseIdDigest };
+  }
+  if (!state || state.terminal || state.dispatchIds.length === 0) return;
+  const owner = reviewWireOwner(scope);
+  if (owner && state.wireInclusions.length) try {
+    associateOriginalReviewWireResponse(state.expectation, response, owner, state.dispatchIds, state.wireInclusions);
+  } catch { state.journalFailed = true; }
+  state.terminal = true;
+  emit(scope, { phase: 'model_result_completed', resultScope: 'original_sdk_response',
+    hostResultReceiptId: randomUUID(),
+    dispatchIds: [...state.dispatchIds], providerResponseIdDigest: binding.providerResponseIdDigest,
+    ...(state.wireInclusions.length ? { reviewWireInclusionReceipts: state.wireInclusions.map(record => record.receiptId) } : {}),
+    rawHttpBodyEof: 'not_observed', wireUsageCoverage: 'unproved' });
+}
+
+/** Jev owns its parsed result. This local retirement does not declare remote
+ * settlement, nor make missing/failed usage zero or headers a completion. */
+export function finishModelTransportAttempt(scope: ModelTransportAttempt, outcome: 'failed' | 'cancelled' | 'returned',
+  parsedResult?: { providerReportedModel?: string; usageKnown: boolean }): void {
+  const state = states.get(scope);
+  if (state && state.localOutcome === undefined) {
+    // Original response observation can precede empty-response failure or
+    // cancellation. Only this existing finish boundary supplies local outcome.
+    const binding = state.localOriginal && !state.ambiguousLocalOriginal
+      ? completedModelResponseBinding(state.localOriginal.response) : undefined;
+    const original = binding && binding.modelCallId === scope.modelCallId && binding.physicalAttempt === scope.physicalAttempt
+      && binding.providerResponseIdDigest === state.localOriginal?.providerResponseIdDigest ? binding : undefined;
+    const parsed = parsedResult && outcome === 'returned' ? parsedResult : undefined;
+    state.localOutcome = outcome;
+    emit(scope, { phase: 'adapter_attempt_finished', outcome,
+      resultScope: original ? 'original_sdk_response' : parsed ? 'owned_systemone_parser' : 'local_retirement',
+      dispatchIds: [...state.dispatchIds], usage: parsed?.usageKnown ? 'reported' : 'unknown',
+      ...(original ? { providerResponseIdDigest: original.providerResponseIdDigest } : {}),
+      ...(identity(parsed?.providerReportedModel) ? { providerReportedModel: parsed.providerReportedModel } : {}),
+      remoteSettlement: parsed ? 'parsed_response' : 'unknown' });
+  }
+  if (!state || state.terminal || state.dispatchIds.length === 0) return;
+  state.terminal = true;
+  emit(scope, { phase: parsedResult && outcome === 'returned' ? 'model_result_completed' : 'model_attempt_retired',
+    hostResultReceiptId: randomUUID(),
+    resultScope: parsedResult ? 'owned_systemone_parser' : 'local_retirement', outcome,
+    dispatchIds: [...state.dispatchIds], usage: parsedResult?.usageKnown ? 'reported' : 'unknown',
+    ...(identity(parsedResult?.providerReportedModel) ? { providerReportedModel: parsedResult.providerReportedModel } : {}),
+    remoteSettlement: parsedResult && outcome === 'returned' ? 'parsed_response' : 'unknown',
+    wireUsageCoverage: 'unproved' });
+}

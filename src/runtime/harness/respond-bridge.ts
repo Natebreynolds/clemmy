@@ -528,11 +528,14 @@ function unavailableSavedAgentResponse(surface: HarnessSurface, request: Assista
   choice: UnavailableSessionAgentModel): Promise<AssistantResponse> {
   const agent = choice.agentName ? `“${choice.agentName}”` : 'this saved agent';
   const model = choice.modelId ?? choice.savedModel;
-  const text = model
+  const quotaHeld = choice.reason === 'codex_quota_exhausted';
+  const text = quotaHeld
+    ? `Clem’s latest Codex usage check shows no available quota for ${agent}${model ? ` on “${model}”` : ''}. I couldn’t start this turn. Wait for quota to become available, or choose another model for this conversation.`
+    : model
     ? `I could not start ${agent} because its saved model “${model}” is unavailable. Connect that model in Settings > Models or choose a different model for this conversation, then try again.`
     : `I could not verify the saved model for ${agent}. Check the agent's saved model or choose a model for this conversation, then try again.`;
   return blockedPreRunResponse(surface, request, text, {
-    reason: 'saved_agent_model_unavailable', savedAgentId: choice.agentId,
+    reason: quotaHeld ? 'saved_agent_codex_quota_exhausted' : 'saved_agent_model_unavailable', savedAgentId: choice.agentId,
     savedAgentName: choice.agentName, savedModel: choice.savedModel,
     requiredModel: choice.modelId, modelCheck: choice.reason,
   }, choice);

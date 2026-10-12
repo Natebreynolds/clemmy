@@ -9,6 +9,7 @@ import { deflateRawSync } from 'node:zlib';
 import {
   SEALED_SHELL_PARTS,
   captureAppliedUpdateEvidence,
+  captureNoActiveUpdateEvidence,
   isInstalledAppRunning,
   isUpdaterHelperRunning,
   assertMutableInstallTarget,
@@ -503,7 +504,7 @@ test('running helpers and unreadable process evidence refuse, including after an
   assert.throws(() => g.proveApplied(evidence, { isUpdaterRunning: () => { throw new Error('cannot inspect processes'); } }), /cannot inspect/);
   assert.equal(isUpdaterHelperRunning(() => '/path/Clementine.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt arg\n'), true);
   assert.equal(isUpdaterHelperRunning(() => '/path/ordinary-node helper\n'), false);
-  assert.throws(() => isUpdaterHelperRunning(() => { throw new Error('ps denied'); }), /ps denied/);
+  assert.throws(() => isUpdaterHelperRunning(() => { throw new Error('ps denied'); }), /process_inventory_unavailable/);
 });
 
 test('a helper still refuses when staging was already consumed and no cached files remain', t => {
@@ -518,7 +519,78 @@ test('native and externally launched daemon processes remain blockers with bundl
   assert.equal(isInstalledAppRunning(app, () => `/usr/local/bin/node ${entry} daemon\n`), true);
   assert.equal(isInstalledAppRunning(app, () => `/bin/zsh -c inspect ${entry}\n`), false);
   assert.equal(isInstalledAppRunning(app, () => `/usr/local/bin/node /Other/Clementine.app/Contents/Resources/daemon/dist/index.js\n`), false);
-  assert.throws(() => isInstalledAppRunning(app, () => { throw new Error('process inventory denied'); }), /process inventory denied/);
+  assert.throws(() => isInstalledAppRunning(app, () => { throw new Error('process inventory denied'); }), /process_inventory_unavailable/);
+});
+
+test('bounded private inventories retain full matching evidence beyond one MiB', () => {
+  const app = '/Users/example/My Applications/Clementine.app';
+  const entry = `${app}/Contents/Resources/daemon/dist/index.js`;
+  const prefix = `/usr/bin/unrelated ${'x'.repeat(1024 * 1024)}\n`;
+  const cases = [
+    [commands => isInstalledAppRunning(app, commands), `${app}/Contents/MacOS/Clementine\n`, true],
+    [commands => isInstalledAppRunning(app, commands), `/usr/local/bin/node ${entry} daemon\n`, true],
+    [commands => isInstalledAppRunning(app, commands), `/bin/zsh -c inspect ${entry}\n`, false],
+    [commands => isInstalledAppRunning(app, commands), '/usr/local/bin/node /Other/Clementine.app/Contents/Resources/daemon/dist/index.js\n', false],
+    [isUpdaterHelperRunning, '/path/Frameworks/Squirrel.framework/Resources/ShipIt arg\n', true],
+    [isUpdaterHelperRunning, '/path/Squirrel arg\n', true],
+    [isUpdaterHelperRunning, '/path/ordinary-node helper\n', false],
+  ];
+  for (const [inspect, tail, expected] of cases) {
+    let called = 0;
+    assert.equal(inspect((command, args, options) => {
+      called++;
+      assert.equal(command, '/bin/ps');
+      assert.deepEqual(args, ['-axo', 'command=']);
+      assert.deepEqual(options, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+      return prefix + tail;
+    }), expected, 'matching at the end of the complete inventory retains existing predicate semantics');
+    assert.equal(called, 1);
+  }
+});
+
+test('private inventory errors expose only a fixed refusal, never captured argv or causes', () => {
+  const sensitive = 'private-argv-and-output-marker';
+  for (const inspect of [commands => isInstalledAppRunning('/Users/example/Clementine.app', commands), isUpdaterHelperRunning]) {
+    for (const code of ['ENOBUFS', 'EACCES']) {
+      const original = Object.assign(new Error(sensitive), { code, stdout: Buffer.from(sensitive), stderr: sensitive });
+      assert.throws(() => inspect(() => { throw original; }), error => {
+        assert.notEqual(error, original);
+        assert.equal(error.message, 'Refusing a guarded patch: process_inventory_unavailable.');
+        assert.equal(error.cause, undefined);
+        assert.deepEqual(Object.getOwnPropertyNames(error).sort(), ['message', 'stack']);
+        assert.equal(error.stack.includes(sensitive), false);
+        return true;
+      });
+    }
+  }
+});
+
+test('unavailable private app or updater inventory refuses fresh proofs and staging without writes', async t => {
+  for (const observer of ['app', 'updater']) for (const code of ['ENOBUFS', 'EACCES']) await t.test(`${observer} ${code}`, t => {
+    const g = noActiveRepeatFixture(t);
+    const sensitive = 'private-process-output-marker';
+    let unavailable = false;
+    const commands = () => {
+      if (unavailable) throw Object.assign(new Error(sensitive), { code, stdout: sensitive, stderr: sensitive });
+      return '';
+    };
+    const overrides = observer === 'app'
+      ? { isRunning: () => isInstalledAppRunning(g.app, commands) }
+      : { isUpdaterRunning: () => isUpdaterHelperRunning(commands) };
+    const proof = g.proveNoActive(overrides);
+    const before = fs.readFileSync(path.join(g.daemonDist, 'index.js'));
+    const writes = [];
+    const fileOps = { ...fs };
+    for (const operation of ['cpSync', 'mkdirSync', 'renameSync', 'rmSync', 'writeFileSync']) fileOps[operation] = () => {
+      writes.push(operation); throw new Error('unexpected write with unknown process inventory');
+    };
+    unavailable = true;
+    assert.throws(() => g.proveNoActive(overrides, fileOps), /process_inventory_unavailable/);
+    assert.throws(() => installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded: proof }, fileOps),
+      /process_inventory_unavailable/, 'an earlier authentic proof never bypasses a new observer failure');
+    assert.deepEqual(writes, []);
+    assert.deepEqual(fs.readFileSync(path.join(g.daemonDist, 'index.js')), before);
+  });
 });
 
 // Full signed-reference fixtures bind every entry, including official internal
@@ -609,13 +681,13 @@ function inspectDaemonBuildForFixture(root) {
   visit(''); return hash.digest('hex');
 }
 
-/** Three installed rounds with distinct runtime bytes and exact retained
+/** Ordered installed rounds with distinct runtime bytes and exact retained
  * siblings. No fixture uses a real application, updater or model. */
 function receiptChainFixture(t, rounds = 3) {
   const g = repeatedUpdateFixture(t);
   g.chain = [{ path: g.receiptPath, receipt: g.receipt }];
   for (let round = 2; round <= rounds; round += 1) {
-    const fingerprint = String(round).repeat(64);
+    const fingerprint = round < 10 ? String(round).repeat(64) : round.toString(16).padStart(64, '0');
     const receipt = { bundle: g.app, wasVersion: '3.18.35', sourceFingerprint: fingerprint, parts: {} };
     for (const [name, relative] of Object.entries(g.parts)) {
       const target = path.join(g.app, relative); const backup = `${target}.backup-Round${round}${name.replace(/-/g, '')}`;
@@ -674,6 +746,64 @@ test('bounded ordered receipt chain proves three installed rounds and privately 
   assert.throws(() => g.proveRepeat({ priorProof: proof }), /retained rollback footprint/);
 });
 
+for (const ancestors of [16, 17, 18, 19, 20, 21, 22]) test(`exact ${ancestors}-ancestor no-active chain retains every rollback through four replacements`, t => {
+  const g = noActiveRepeatFixture(t, ancestors + 1);
+  assert.equal(g.manifest.receipts.length, ancestors);
+  assert.equal(new Set(g.chain.map(item => item.receipt.sourceFingerprint)).size, ancestors + 1);
+  const receiptsBefore = g.chain.map(item => [item.path, fs.readFileSync(item.path)]);
+  const manifestBefore = fs.readFileSync(g.manifestPath);
+  const nativeBefore = SEALED_SHELL_PARTS.map(relative => [relative, fs.readFileSync(path.join(g.app, relative))]);
+  const backupsBefore = g.chain.flatMap(item => Object.entries(item.receipt.parts).map(([name, part]) =>
+    [part.backup, name === 'daemon' ? inspectDaemonBuildForFixture(part.backup) : assetDigestForFixture(part.backup), name]));
+  assert.equal(backupsBefore.length, (ancestors + 1) * 4);
+  const proof = g.proveNoActive();
+  assert.deepEqual(g.signatures, [g.reference], 'the pristine signed reference is still required');
+  fs.writeFileSync(path.join(g.sourceDist, 'index.js'), `next runtime after ${ancestors} ancestors`);
+  fs.writeFileSync(path.join(g.sourceDist, 'runtime/build-stamp.json'), JSON.stringify({
+    gitSha: 'a'.repeat(40), sourceFingerprint: createHash('sha256').update(`next-${ancestors}`).digest('hex'),
+  }));
+  const newBackups = [];
+  for (const [name, relative] of Object.entries(g.parts)) {
+    const target = path.join(g.app, relative);
+    const result = name === 'daemon'
+      ? installDaemonPatch({ sourceDist: g.sourceDist, targetDist: target, guarded: proof })
+      : installBundledAssetDirectory({ sourceDir: g.sourceDist, targetDir: target, guarded: proof });
+    newBackups.push(result.backup);
+    assert.equal(fs.readFileSync(path.join(result.backup, 'index.js'), 'utf8'), `runtime round ${ancestors + 1} ${name}`);
+    assert.doesNotThrow(() => g.proveNoActive({ priorProof: proof }), 'every replacement still refreshes the full private proof');
+  }
+  assert.equal(new Set(newBackups).size, 4);
+  for (const [backup, digest, name] of backupsBefore) assert.equal(
+    name === 'daemon' ? inspectDaemonBuildForFixture(backup) : assetDigestForFixture(backup), digest,
+    'no historical rollback is removed or rewritten');
+  for (const [receipt, bytes] of receiptsBefore) assert.deepEqual(fs.readFileSync(receipt), bytes);
+  assert.deepEqual(fs.readFileSync(g.manifestPath), manifestBefore);
+  for (const [relative, bytes] of nativeBefore) assert.deepEqual(fs.readFileSync(path.join(g.app, relative)), bytes);
+  assert.deepEqual(captureNoActiveUpdateEvidence({ app: g.app, home: g.home }), g.noActive);
+  if (ancestors >= 17) {
+    fs.appendFileSync(path.join(g.chain[8].receipt.parts['console-web'].backup, 'index.js'), 'changed');
+    assert.throws(() => g.proveNoActive({ priorProof: proof }), /retained rollback footprint/,
+      'the extended bound never exempts a middle historical rollback');
+  }
+});
+
+test('23 unique complete ancestors refuse at the bound before any write', t => {
+  const g = noActiveRepeatFixture(t, 24);
+  assert.equal(g.manifest.receipts.length, 23);
+  assert.equal(new Set(g.manifest.receipts.map(item => item.sha256)).size, 23);
+  const namesBefore = Object.values(g.parts).map(relative => [path.dirname(path.join(g.app, relative)),
+    fs.readdirSync(path.dirname(path.join(g.app, relative))).sort()]);
+  const writes = [];
+  const fileOps = { ...fs };
+  for (const operation of ['cpSync', 'mkdirSync', 'renameSync', 'rmSync', 'writeFileSync']) fileOps[operation] = () => {
+    writes.push(operation); throw new Error('unexpected write during rejected proof');
+  };
+  assert.throws(() => g.proveNoActive({}, fileOps), /unsupported bounded ancestor manifest/);
+  assert.deepEqual(writes, []);
+  assert.deepEqual(g.signatures, [], 'the over-bound manifest is refused before signed-reference work');
+  for (const [directory, names] of namesBefore) assert.deepEqual(fs.readdirSync(directory).sort(), names);
+});
+
 test('receipt ancestry refuses skipped, reordered, extra, aliased and unpinned evidence', async t => {
   for (const [name, change] of [
     ['missing manifest pair', g => { delete g.repeat.authorizedAncestorManifestSha256; }],
@@ -690,7 +820,7 @@ test('receipt ancestry refuses skipped, reordered, extra, aliased and unpinned e
     ['extra ancestor keys', g => { g.manifest.receipts[0].trusted = true; g.repinManifest(); }],
     ['extra manifest keys', g => { g.manifest.success = true; g.repinManifest(); }],
     ['unsupported manifest version', g => { g.manifest.version = 2; g.repinManifest(); }],
-    ['unbounded ancestors', g => { g.manifest.receipts = Array.from({ length: 17 }, () => g.manifest.receipts[0]); g.repinManifest(); }],
+    ['unbounded ancestors', g => { g.manifest.receipts = Array.from({ length: 23 }, () => g.manifest.receipts[0]); g.repinManifest(); }],
     ['empty manifest', g => { g.manifest.receipts = []; g.repinManifest(); }],
     ['omitted manifest', g => { delete g.repeat.authorizedAncestorManifest; delete g.repeat.authorizedAncestorManifestSha256; }],
   ]) await t.test(name, t => { const g = receiptChainFixture(t); change(g); assert.throws(() => g.proveRepeat()); });
@@ -938,5 +1068,106 @@ test('repeat installer CLI rejects incomplete, duplicate or unknown authority fl
       console: { log() {}, error() {} }, execFileSync() { throw new Error('unexpected subprocess'); },
     });
     await assert.rejects(result, /validated arguments reached bundle selection/);
+  });
+});
+
+function noActiveRepeatFixture(t, rounds = 3) {
+  const g = receiptChainFixture(t, rounds);
+  // Only disposable test fixtures are changed. Production capture never
+  // removes, moves or recreates updater evidence.
+  fs.rmSync(path.join(g.cache, 'pending'), { recursive: true });
+  fs.rmSync(path.join(g.cache, 'update.zip'));
+  fs.rmSync(g.statePath);
+  fs.writeFileSync(path.join(g.cache, 'current.blockmap'), 'retained blockmap');
+  fs.writeFileSync(path.join(g.shipIt, 'ShipIt_stdout.log'), 'historical updater log');
+  g.noActive = captureNoActiveUpdateEvidence({ app: g.app, home: g.home });
+  g.proveNoActive = (overrides = {}, fileOps = fs) => verifyGuardedSealedPatch({
+    app: g.app, home: g.home, shellSnapshot: g.snapshot, noActiveUpdateEvidence: g.noActive,
+    repeatedReference: g.repeat, isRunning: () => false, isUpdaterRunning: () => false,
+    verifyNativeSignature: bundle => { g.signatures.push(bundle); assert.equal(bundle, g.reference); },
+    readReferenceCodeIdentity: () => ({ bundleId: 'com.example.fixture', team: '4AR3Y8XD72', cdHash: 'c'.repeat(40) }),
+    ...overrides,
+  }, fileOps);
+  return g;
+}
+
+test('explicit no-active repeat keeps signed-reference and all ancestor proofs through four replacements', t => {
+  const g = noActiveRepeatFixture(t);
+  const cacheBefore = JSON.stringify(g.noActive);
+  assert.equal(g.noActive.mode, 'no-active-update');
+  const proof = g.proveNoActive();
+  assert.deepEqual(g.signatures, [g.reference]);
+  assert.throws(() => assertMutableInstallTarget(path.join(g.app, 'Contents/Resources/other'), proof), /four exact runtime roots/);
+  fs.writeFileSync(path.join(g.sourceDist, 'index.js'), 'next no-active daemon');
+  fs.writeFileSync(path.join(g.sourceDist, 'runtime/build-stamp.json'), JSON.stringify({ gitSha: 'a'.repeat(40), sourceFingerprint: '4'.repeat(64) }));
+  const installed = installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded: proof });
+  assert.equal(fs.readFileSync(path.join(installed.backup, 'index.js'), 'utf8'), 'runtime round 3 daemon');
+  for (const [name, relative] of Object.entries(g.parts).filter(([name]) => name !== 'daemon')) {
+    const installed = installBundledAssetDirectory({ sourceDir: g.sourceDist, targetDir: path.join(g.app, relative), guarded: proof });
+    assert.equal(fs.readFileSync(path.join(installed.backup, 'index.js'), 'utf8'), `runtime round 3 ${name}`);
+  }
+  assert.doesNotThrow(() => g.proveNoActive({ priorProof: proof }));
+  assert.equal(JSON.stringify(captureNoActiveUpdateEvidence({ app: g.app, home: g.home })), cacheBefore);
+  assert.throws(() => g.proveNoActive({ priorProof: JSON.parse(JSON.stringify(proof)) }), /no matching private/);
+  fs.appendFileSync(path.join(g.chain[0].receipt.parts.daemon.backup, 'official.txt'), 'changed');
+  assert.throws(() => g.proveNoActive({ priorProof: proof }), /retained rollback footprint/);
+});
+
+test('no-active observation cannot replace explicit signed-reference authority or revive old consumed state', t => {
+  const g = noActiveRepeatFixture(t);
+  assert.throws(() => g.proveNoActive({ repeatedReference: undefined }), /exact signed reference and receipt chain/);
+  assert.throws(() => g.proveNoActive({ appliedUpdateEvidence: g.evidence }), /mutually exclusive/);
+  assert.throws(() => g.proveRepeat(), /no longer has the captured retained state/);
+  assert.throws(() => g.proveNoActive({ verifyNativeSignature() { throw new Error('invalid official seal'); } }), /invalid official seal/);
+  assert.throws(() => g.proveNoActive({ readReferenceCodeIdentity: () => ({ bundleId: 'com.example.fixture', team: 'OTHER', cdHash: 'c'.repeat(40) }) }), /publisher\/identity/);
+  const forged = { ...g.noActive, archive: { ...g.noActive.archive, path: path.join(g.root, 'different.zip') } };
+  assert.throws(() => g.proveNoActive({ noActiveUpdateEvidence: forged }), /no-active updater evidence/);
+});
+
+test('no-active capture rejects active, unknown, linked or incomplete retained state', async t => {
+  for (const [name, change] of [
+    ['pending update', g => fs.mkdirSync(path.join(g.cache, 'pending'))],
+    ['active archive', g => fs.writeFileSync(path.join(g.cache, 'update.zip'), 'queued')],
+    ['installer request', g => fs.writeFileSync(g.statePath, JSON.stringify(g.state))],
+    ['unpacked update', g => fs.mkdirSync(path.join(g.shipIt, 'update.NEW'))],
+    ['unknown installer file', g => fs.writeFileSync(path.join(g.shipIt, 'unknown'), 'unknown')],
+    ['unknown cache file', g => fs.writeFileSync(path.join(g.cache, 'unknown'), 'unknown')],
+    ['missing held pair', g => fs.rmSync(path.join(g.cache, 'update.zip.held-latest'))],
+    ['changed held zip', g => fs.appendFileSync(path.join(g.cache, 'update.zip.held-latest'), 'changed')],
+    ['extra pending member', g => fs.writeFileSync(path.join(g.cache, 'pending.held-latest/extra'), 'extra')],
+    ['linked log', g => { const p = path.join(g.shipIt, 'ShipIt_stdout.log'); const outside = path.join(g.root, 'outside-log'); fs.renameSync(p, outside); fs.symlinkSync(outside, p); }],
+    ['hardlinked blockmap', g => { const p = path.join(g.cache, 'current.blockmap'); fs.linkSync(p, path.join(g.root, 'blockmap-alias')); }],
+  ]) await t.test(name, t => {
+    const g = noActiveRepeatFixture(t); change(g);
+    assert.throws(() => captureNoActiveUpdateEvidence({ app: g.app, home: g.home }));
+    assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'runtime round 3 daemon');
+  });
+});
+
+test('every no-active proof rechecks complete updater inventory, receipts, runtime, native and process state', async t => {
+  for (const [name, change, overrides] of [
+    ['log changed', g => fs.appendFileSync(path.join(g.shipIt, 'ShipIt_stdout.log'), 'new')],
+    ['blockmap changed', g => fs.appendFileSync(path.join(g.cache, 'current.blockmap'), 'new')],
+    ['new queued update', g => fs.mkdirSync(path.join(g.cache, 'pending'))],
+    ['receipt changed', g => fs.appendFileSync(g.repeat.authorizedReceipt, ' ')],
+    ['old backup changed', g => fs.appendFileSync(path.join(g.chain[0].receipt.parts.daemon.backup, 'official.txt'), 'new')],
+    ['native changed', g => fs.appendFileSync(path.join(g.app, 'Contents/Resources/app.asar'), 'new')],
+    ['runtime changed', g => fs.appendFileSync(path.join(g.daemonDist, 'index.js'), 'new')],
+    ['helper running', () => {}, { isUpdaterRunning: () => true }],
+    ['app running', () => {}, { isRunning: () => true }],
+  ]) await t.test(name, t => {
+    const g = noActiveRepeatFixture(t); const proof = g.proveNoActive(); change(g);
+    assert.throws(() => g.proveNoActive({ priorProof: proof, ...overrides }));
+  });
+  await t.test('changes during reference verification refuse before minting a proof', t => {
+    const g = noActiveRepeatFixture(t);
+    assert.throws(() => g.proveNoActive({ verifyNativeSignature() {
+      fs.appendFileSync(path.join(g.shipIt, 'ShipIt_stdout.log'), 'during signature verification');
+    } }), /no-active updater evidence after verification/);
+  });
+  await t.test('helper starts during reference verification', t => {
+    const g = noActiveRepeatFixture(t); let helper = false;
+    assert.throws(() => g.proveNoActive({ isUpdaterRunning: () => helper,
+      verifyNativeSignature() { helper = true; } }), /started during no-active verification/);
   });
 });

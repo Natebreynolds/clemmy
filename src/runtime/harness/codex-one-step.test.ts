@@ -59,6 +59,44 @@ test('one host invocation is exactly one model request', async () => {
   assert.equal(calls.requests.length, 1);
 });
 
+test('the optional completed observer receives the exact original object and cannot add work or alter a thrown-error result', async () => {
+  const output = [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'unchanged' }] }];
+  const response = { responseId: 'original-observer-response', output };
+  let calls = 0;
+  let observed: unknown;
+  const model = { async getResponse() { calls += 1; return response; } };
+  const result = await codexOneStep({ input: 'fixture', resolveModel: () => model as never,
+    onCompletedResponse(value) { observed = value; throw new Error('observer failure'); } });
+  assert.equal(observed, response);
+  assert.equal(result.output, output);
+  assert.equal(result.text, 'unchanged');
+  assert.equal(calls, 1);
+  const asyncResult = await codexOneStep({ input: 'fixture', resolveModel: () => model as never,
+    onCompletedResponse: async () => { throw new Error('async observer failure'); } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(asyncResult.output, output);
+  assert.equal(asyncResult.text, 'unchanged');
+  assert.equal(calls, 2, 'a rejected observer does not add a model request');
+});
+
+test('the completed observer is never called for aborted, failed or tool-only results', async () => {
+  for (const kind of ['aborted', 'failed', 'tool'] as const) {
+    const controller = new AbortController();
+    let observed = 0;
+    const model = { async getResponse() {
+      if (kind === 'aborted') controller.abort(new Error('fixture stop'));
+      return { responseId: 'refused-observer-response', ...(kind === 'failed' ? { providerData: { status: 'failed' } } : {}),
+        output: kind === 'tool' ? [{ type: 'function_call', callId: 'call-fixture', name: 'fixture', arguments: '{}' }]
+          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'partial' }] }] };
+    } };
+    const run = codexOneStep({ input: 'fixture', resolveModel: () => model as never, signal: controller.signal,
+      onCompletedResponse() { observed += 1; } });
+    if (kind === 'aborted') await assert.rejects(run, /fixture stop/);
+    else await run;
+    assert.equal(observed, 0);
+  }
+});
+
 test('provider-neutral structured output reaches the configured adapter without widening tool authority', async () => {
   const { model, calls } = stubModel([
     { type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '{"ok":true}' }] },

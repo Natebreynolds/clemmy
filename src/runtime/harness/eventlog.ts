@@ -263,6 +263,9 @@ export const EVENT_TYPES = [
   // Content-free, exact-source attempt/retry timing. This is observational;
   // it must never replenish a budget or establish task/effect completion.
   'model_resilience_observed',
+  // Actual generation dispatch/headers and separately owned model result.
+  // Partial transport inventory only; no usage, billing or completion grant.
+  'model_transport_observed',
   // Exact model/tool-loop owner selected at the RunRunnerFn boundary. This is
   // distinct from turn_model_routed: a provider can be routed through the
   // shared harness while the legacy SDK or Clem's host engine owns stepping.

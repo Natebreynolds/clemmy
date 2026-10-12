@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,15 +13,21 @@ const {
   judgeObjectiveComplete, _setCompletionJudgeForTests,
   JEV_HEDGE_DELAY_MS, JEV_READ_HEDGE_DELAY_MS,
   HOST_COMPLETION_EVIDENCE_GUIDANCE, buildObjectiveJudgePrompt,
+  buildCompletionJudgeInstructions, runRoutedJudgeAttempt, parseCompletionVerdict,
+  completionJudgeContextAdmission,
 } = await import('./objective-judge.js');
 const { _setSystemOneFetchForTests, _setTypesafeKeyForTests } = await import('../jev/client.js');
 const { _resetCompletionSizeGateForTests } = await import('../jev/control-plane.js');
 const { closeEventLog, createSession, appendEvent } = await import('./eventlog.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
-const { _resetJudgeMemoryForTest, judgeMemoryFor } = await import('../../memory/judge-memory.js');
+const { _resetJudgeMemoryForTest, judgeMemoryFor, rememberTurnMemoryForJudges } = await import('../../memory/judge-memory.js');
 const { recordAcceptedModelMemory, acceptedModelMemoryEvidence } = await import('./model-memory-evidence.js');
+const { modelUsageAttributionStorage } = await import('../usage-log.js');
 const { renderSkillReference } = await import('./skill-execution.js');
 const { admitHistoricalReadPacket, historicalEvidenceDigest } = await import('./historical-completion-evidence.js');
+const { recordCatalogWindow } = await import('./model-window-observations.js');
+const { judgeEvidenceGuidance, judgeEvidenceReferences } = await import('./judge-evidence-tools.js');
+const { INSTRUCTION_CACHE_DELIM } = await import('./model-wire-registry.js');
 
 type Context = NonNullable<Parameters<typeof judgeObjectiveComplete>[2]>;
 type Judge = NonNullable<Parameters<typeof _setCompletionJudgeForTests>[0]>;
@@ -41,11 +48,12 @@ const flush = async () => {
   await new Promise<void>(resolve => setImmediate(resolve));
 };
 
-function jevResponse(kind: 'done' | 'incomplete' | 'awaiting' = 'done') {
+function jevResponse(kind: 'done' | 'incomplete' | 'awaiting' | 'abstained' = 'done') {
   const values = { delivered: 0.95, unaddressed: 0.03, unsupported: 0.03,
     computed: 0.03, asksUser: 0.03, cannotFinish: 0.03,
     ...(kind === 'incomplete' ? { delivered: 0.1, unaddressed: 0.95 } : {}),
     ...(kind === 'awaiting' ? { delivered: 0.2, asksUser: 0.95 } : {}),
+    ...(kind === 'abstained' ? { delivered: 0.4, unaddressed: 0.7, unsupported: 0.93, computed: 0.8 } : {}),
   };
   return { status: 200, ok: true, text: async () => JSON.stringify({
     model: 'jev-1.13.0',
@@ -101,6 +109,309 @@ afterEach(() => {
 });
 after(() => { closeEventLog(); rmSync(testHome, { recursive: true, force: true }); });
 
+test('timely original Jev abstention reaches one actual reviewer request without becoming evidence or a block', async t => {
+  const owner = { sessionId: read.sessionId!, sourceUserSeq: 41, attemptId: 'attempt:timely-opinion' };
+  const requests: import('@openai/agents-core').ModelRequest[] = [];
+  const context: Context = { ...read, reviewInputOwner: owner, agentInstructions: 'Report the verified status only.',
+    completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE };
+  let capturedContext: Context | undefined;
+  const state = setup(t, async (request, candidate, supplied) => {
+    capturedContext = supplied;
+    let instructions!: import('./review-input-observation.js').ReviewInputComposition;
+    let prompt!: import('./review-input-observation.js').ReviewInputComposition;
+    buildCompletionJudgeInstructions(supplied, value => { instructions = value; });
+    buildObjectiveJudgePrompt(request, candidate, supplied, value => { prompt = value; });
+    let priorOpinionDisposition: 'forwarded' | 'omitted_context_limit' | 'not_dispatched' | undefined;
+    const model = { async getResponse(input: import('@openai/agents-core').ModelRequest) {
+      requests.push(input);
+      return { responseId: 'opinion-test', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1,
+        inputTokensDetails: [], outputTokensDetails: [] }, output: [{ type: 'message' as const, role: 'assistant' as const,
+        status: 'completed' as const, content: [{ type: 'output_text' as const, text: 'DONE: The verified status is ready.' }] }] };
+    }, async *getStreamedResponse() { throw new Error('no stream expected'); } };
+    const verdict = await runRoutedJudgeAttempt({ model: model as never, modelId: 'claude-sonnet-5', judgeFamily: 'claude',
+      brainFamily: 'byo', selfJudge: false, transport: 'test' } as never,
+    instructions.text, prompt.text, parseCompletionVerdict, true, undefined, undefined, 'medium', undefined,
+    { priorOpinion: value => { priorOpinionDisposition = value; } }, undefined,
+    { owner, stage: 'completion', objectiveDigest: historicalEvidenceDigest(request), candidateDigest: historicalEvidenceDigest(candidate),
+      instructions, prompt });
+    return { verdict, failure: null, reviewDepth: 'fast', priorOpinionDisposition };
+  });
+  let jevCalls = 0;
+  _setSystemOneFetchForTests(async () => { jevCalls++; return jevResponse('abstained'); });
+  await modelUsageAttributionStorage.run(owner, async () => {
+    const verdict = await judgeObjectiveComplete(objective, reply, context);
+    assert.equal(verdict.done, true, 'a contrary model opinion does not mechanically block a supported candidate');
+    assert.equal(state.reviewerCalls(), 1); assert.equal(jevCalls, 1); assert.equal(requests.length, 1);
+    assert.equal(requests[0]!.modelSettings.reasoning?.effort, 'medium');
+    const input = JSON.stringify(requests[0]!.input);
+    for (const text of [objective, reply, context.agentInstructions!, context.toolCallSummary]) assert.ok(input.includes(text));
+    assert.match(input, /PRIOR MODEL OPINION/); assert.match(input, /NOT FACTUAL EVIDENCE/);
+    assert.match(input, /unsupported\\\":0.93/);
+    assert.deepEqual(capturedContext?.verifiedReadResults, context.verifiedReadResults);
+    assert.equal(capturedContext?.toolCallSummary, context.toolCallSummary, 'opinion is not a source result');
+    assert.equal(verdict.jevAttempt?.priorAssessment?.forwardedBeforeEntry, true);
+    assert.equal(verdict.jevAttempt?.priorAssessment?.accountBackend, 'unknown');
+    assert.doesNotMatch(buildObjectiveJudgePrompt(objective, reply, { ...capturedContext! }), /PRIOR MODEL OPINION/,
+      'a cloned context does not transfer the private opinion');
+    assert.doesNotMatch(buildObjectiveJudgePrompt(objective, 'Different candidate.', capturedContext), /PRIOR MODEL OPINION/);
+  });
+});
+
+for (const boundary of ['fits', 'optional_overflow', 'both_overflow', 'cloned_composition', 'changed_owner', 'cancelled'] as const) {
+  test(`actual selected-route admission ${boundary} preserves all required bytes and optional ownership`, async t => {
+    const owner = { sessionId: read.sessionId!, sourceUserSeq: 50, attemptId: `attempt:opinion-${boundary}` };
+    const requests: import('@openai/agents-core').ModelRequest[] = [];
+    const context: Context = { ...read, fullSourceEvidence: true, reviewInputOwner: owner,
+      agentInstructions: 'Keep contrary evidence: ready does not authorize writing.',
+      completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE };
+    const evidence = { refKind: 'handles', refs: () => ['rh_read_status'], resolve: () => undefined } as never;
+    let attempted = 0;
+    const state = setup(t, async (request, candidate, supplied) => {
+      let instructions!: import('./review-input-observation.js').ReviewInputComposition;
+      let prompt!: import('./review-input-observation.js').ReviewInputComposition;
+      buildCompletionJudgeInstructions(supplied, value => { instructions = value; });
+      buildObjectiveJudgePrompt(request, candidate, supplied, value => { prompt = value; });
+      const without = buildObjectiveJudgePrompt(request, candidate, { ...supplied! });
+      assert.match(prompt.text, /PRIOR MODEL OPINION/);
+      assert.doesNotMatch(without, /PRIOR MODEL OPINION/);
+      const suffix = `\n\nReview evidence references: ${judgeEvidenceReferences(evidence)}`;
+      const fullInstructions = instructions.text + judgeEvidenceGuidance(evidence);
+      const withSize = completionJudgeContextAdmission('claude-sonnet-5', fullInstructions, prompt.text + suffix).estimatedTotalTokens;
+      const withoutSize = completionJudgeContextAdmission('claude-sonnet-5', fullInstructions, without + suffix).estimatedTotalTokens;
+      assert.ok(withSize > withoutSize, 'the actual optional note is large enough to distinguish both admissions');
+      const window = boundary === 'fits' ? withSize : boundary === 'both_overflow' ? withoutSize - 1 : withoutSize;
+      recordCatalogWindow('claude-sonnet-5', window, 'isolated-review-boundary');
+      const model = { async getResponse(input: import('@openai/agents-core').ModelRequest) {
+        requests.push(input);
+        return { responseId: 'optional-boundary', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1,
+          inputTokensDetails: [], outputTokensDetails: [] }, output: [{ type: 'message' as const, role: 'assistant' as const,
+          status: 'completed' as const, content: [{ type: 'output_text' as const, text: 'DONE: The verified status is ready.' }] }] };
+      }, async *getStreamedResponse() { throw new Error('no stream expected'); } };
+      const stop = new AbortController();
+      if (boundary === 'cancelled') stop.abort();
+      let priorOpinionDisposition: 'forwarded' | 'omitted_context_limit' | 'not_dispatched' | undefined;
+      const seed = { owner, stage: 'completion' as const, objectiveDigest: historicalEvidenceDigest(request),
+        candidateDigest: historicalEvidenceDigest(candidate), instructions,
+        prompt: boundary === 'cloned_composition' ? { ...prompt } : prompt };
+      const invoke = () => {
+        attempted++;
+        return runRoutedJudgeAttempt({ model: model as never, modelId: 'claude-sonnet-5', judgeFamily: 'claude',
+          brainFamily: 'byo', selfJudge: false, transport: 'test' } as never,
+        instructions.text, prompt.text, parseCompletionVerdict, true, evidence, stop.signal, 'medium', undefined,
+        { priorOpinion: value => { priorOpinionDisposition = value; } }, undefined, seed);
+      };
+      const operation = boundary === 'changed_owner'
+        ? modelUsageAttributionStorage.run({ ...owner, attemptId: 'attempt:foreign' }, invoke) : invoke();
+      if (boundary === 'both_overflow' || boundary === 'cloned_composition') {
+        await assert.rejects(operation, /Complete evidence review unavailable/);
+      } else if (boundary === 'changed_owner') {
+        await assert.rejects(operation, /optional review opinion is no longer owned/);
+      } else if (boundary === 'cancelled') {
+        await assert.rejects(operation, { name: 'AbortError' });
+      } else {
+        const verdict = await operation;
+        assert.equal(verdict.done, true); assert.equal(requests.length, 1);
+        const sent = requests[0]!.input as Array<{ role: string; content: string }>;
+        const expectedPrompt = boundary === 'optional_overflow' ? without : prompt.text;
+        assert.equal(String(sent[0]!.content), expectedPrompt + suffix, 'only the owned note differs; full source and refs are byte-identical');
+        assert.equal(requests[0]!.systemInstructions, fullInstructions + INSTRUCTION_CACHE_DELIM);
+        assert.equal(requests[0]!.modelSettings.reasoning?.effort, 'medium');
+        assert.equal(priorOpinionDisposition, boundary === 'optional_overflow' ? 'omitted_context_limit' : 'forwarded');
+        for (const required of [request, candidate, context.agentInstructions!, context.toolCallSummary, HOST_COMPLETION_EVIDENCE_GUIDANCE]) {
+          assert.ok((String(requests[0]!.systemInstructions) + String(sent[0]!.content)).includes(required));
+        }
+      }
+      assert.equal(requests.length, boundary === 'fits' || boundary === 'optional_overflow' ? 1 : 0,
+        'failed ownership/cancellation/complete admission cannot cause a provider request');
+      return { verdict: requests.length ? judged.verdict : null, failure: requests.length ? null : 'error',
+        priorOpinionDisposition: priorOpinionDisposition ?? 'not_dispatched' };
+    });
+    let jevCalls = 0;
+    _setSystemOneFetchForTests(async () => { jevCalls++; return jevResponse('abstained'); });
+    await modelUsageAttributionStorage.run(owner, async () => {
+      const verdict = await judgeObjectiveComplete(objective, reply, context);
+      assert.equal(state.reviewerCalls(), 1); assert.equal(attempted, 1);
+      assert.equal(jevCalls, 1,
+        'an unchanged producer-owned completed abstention does not need another reading when the reviewer is unavailable');
+      assert.equal(verdict.jevAttempt?.priorAssessment?.forwardedBeforeEntry, boundary === 'fits');
+      if (boundary === 'optional_overflow') assert.equal(verdict.jevAttempt?.priorAssessment?.omissionReason, 'context_limit');
+      if (boundary !== 'fits' && boundary !== 'optional_overflow') assert.equal(verdict.failedOpen, true);
+    });
+  });
+}
+
+for (const change of ['unchanged', 'requirements', 'evidence', 'memory', 'memory_requirement', 'inherited',
+  'plan_surface', 'stakes', 'full_source', 'owner_source', 'owner_attempt',
+  'accessor_context', 'accessor_owner', 'toJSON_context', 'toJSON_evidence', 'proxy_evidence', 'unstable_proxy',
+  'symbol_context', 'nonenumerable_context', 'class_evidence', 'sparse_evidence', 'sparse_extra_numeric',
+  'missing_owner', 'protocol_failure', 'partial_scores', 'cancelled'] as const) {
+  test(`reviewer timeout reuses only the original complete current Jev abstention: ${change}`, async t => {
+    const owner = { sessionId: read.sessionId!, sourceUserSeq: 60, attemptId: `attempt:screen-reuse-${change}` };
+    const context: Context = { ...read, reviewInputOwner: owner, agentInstructions: 'Original standing requirement.',
+      completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE,
+      verifiedReadResults: read.verifiedReadResults!.map(row => ({ ...row })) };
+    if (change === 'missing_owner') context.reviewInputOwner = undefined;
+    rememberTurnMemoryForJudges(owner.sessionId, 'Original supplied judge memory.');
+    const stop = new AbortController();
+    let getterReads = 0; let toJSONCalls = 0; let proxyTraps = 0;
+    const state = setup(t, async () => {
+      if (change === 'requirements') context.agentInstructions = 'Changed standing requirement.';
+      if (change === 'evidence') context.verifiedReadResults![0]!.contentComplete = false;
+      if (change === 'memory') rememberTurnMemoryForJudges(owner.sessionId, 'Changed supplied judge memory.');
+      if (change === 'memory_requirement') context.memoryRequirementContext = 'New durable memory requirement.';
+      if (change === 'inherited') context.inheritedReadCoverage = [];
+      if (change === 'plan_surface') context.reviewsPlan = true;
+      if (change === 'stakes') context.reviewStakes = 'write';
+      if (change === 'full_source') context.fullSourceEvidence = true;
+      if (change === 'accessor_context') {
+        const value = context.toolCallSummary;
+        Object.defineProperty(context, 'toolCallSummary', { enumerable: true, get() { getterReads++; return value; } });
+      }
+      if (change === 'accessor_owner') {
+        const value = owner.attemptId;
+        Object.defineProperty(owner, 'attemptId', { enumerable: true, get() { getterReads++; return value; } });
+      }
+      if (change === 'toJSON_context') Object.defineProperty(context, 'toJSON', { enumerable: true,
+        value() { toJSONCalls++; throw new Error('reuse must not execute this serializer'); } });
+      if (change === 'toJSON_evidence') Object.defineProperty(context.verifiedReadResults![0], 'toJSON', { enumerable: true,
+        value() { toJSONCalls++; return read.verifiedReadResults![0]; } });
+      if (change === 'proxy_evidence' || change === 'unstable_proxy') {
+        context.verifiedReadResults = new Proxy(context.verifiedReadResults!, {
+          get(target, key, receiver) { proxyTraps++; return Reflect.get(target, key, receiver); },
+          ownKeys(target) { proxyTraps++; if (change === 'unstable_proxy') target[0]!.contentComplete = false; return Reflect.ownKeys(target); },
+        });
+      }
+      if (change === 'symbol_context') Object.defineProperty(context, Symbol('unsupported reuse field'), { value: 'x' });
+      if (change === 'nonenumerable_context') Object.defineProperty(context, 'toolCallSummary', { value: context.toolCallSummary, enumerable: false });
+      if (change === 'class_evidence') context.verifiedReadResults![0] = Object.assign(new class UnsupportedContext {}(), context.verifiedReadResults![0]!);
+      if (change === 'sparse_evidence' || change === 'sparse_extra_numeric') {
+        const sparse = new Array<NonNullable<Context['verifiedReadResults']>[number]>(1);
+        if (change === 'sparse_extra_numeric') Object.defineProperty(sparse, '4294967295', {
+          enumerable: true, value: { ...read.verifiedReadResults![0] },
+        });
+        assert.equal(Object.hasOwn(sparse, 0), false);
+        context.verifiedReadResults = sparse;
+      }
+      if (change === 'owner_source') owner.sourceUserSeq++;
+      if (change === 'owner_attempt') owner.attemptId = 'attempt:changed-owner';
+      if (change === 'cancelled') stop.abort();
+      return { verdict: null, failure: 'timeout' };
+    });
+    const requests: Array<{ state: { memory?: string; requirementContext?: string } }> = [];
+    _setSystemOneFetchForTests(async (_url, init) => {
+      requests.push(JSON.parse(String(init.body)));
+      if (requests.length === 1 && change === 'protocol_failure') {
+        return { status: 200, ok: true, text: async () => '{invalid response' };
+      }
+      if (requests.length === 1 && change === 'partial_scores') {
+        const response = jevResponse('abstained');
+        const payload = JSON.parse(await response.text());
+        delete payload.answers.unsupported;
+        return { ...response, text: async () => JSON.stringify(payload) };
+      }
+      return jevResponse('abstained');
+    });
+    await modelUsageAttributionStorage.run(owner, async () => {
+      const run = Promise.resolve(withHarnessRunContext({ sessionId: owner.sessionId, sourceUserSeq: owner.sourceUserSeq,
+        runAttemptId: owner.attemptId, turn: 1, counter: new ToolCallsCounter(4), callerCancelSignal: stop.signal },
+      () => judgeObjectiveComplete(objective, reply, context)));
+      if (change === 'cancelled') {
+        await assert.rejects(run, { name: 'AbortError' });
+      } else {
+        const verdict = await run;
+        assert.equal(verdict.done, true, 'the existing unreviewed publication policy remains unchanged');
+        assert.equal(verdict.failedOpen, true);
+        assert.equal(verdict.reviewFailure, 'timeout');
+        assert.equal(verdict.fast, undefined, 'an abstention never becomes an accepted Jev verdict');
+        assert.equal(verdict.judgeModelId, undefined, 'no completed reviewer identity is fabricated');
+      }
+      assert.equal(state.reviewerCalls(), 1, 'the configured review is attempted once at its existing depth');
+      assert.equal(requests.length, change === 'unchanged' || change === 'cancelled' ? 1 : 2,
+        'only the same complete current original screen can suppress the late fallback; Stop starts none');
+      if (change === 'memory') assert.notEqual(requests[0]!.state.memory, requests[1]!.state.memory);
+      if (change === 'requirements') assert.notEqual(requests[0]!.state.requirementContext, requests[1]!.state.requirementContext);
+      if (change === 'accessor_context') assert.equal(getterReads, 1, 'only the existing fresh fallback request reads its supplied field');
+      if (change.startsWith('toJSON')) assert.equal(toJSONCalls, 0, 'reuse diagnostics never invoke custom serialization');
+      if (change === 'proxy_evidence' || change === 'unstable_proxy') assert.equal(proxyTraps, 0, 'actual Node proxies are rejected before traps');
+      if (['accessor_context', 'accessor_owner', 'toJSON_context', 'toJSON_evidence', 'proxy_evidence', 'unstable_proxy',
+        'symbol_context', 'nonenumerable_context', 'class_evidence', 'sparse_evidence', 'sparse_extra_numeric'].includes(change)) {
+        assert.deepEqual(requests[0], requests[1], 'unsupported reuse diagnostics do not change the legacy request payload');
+      }
+    });
+  });
+}
+
+test('an abstention completed after reviewer entry remains unsupported for late reuse', async t => {
+  const owner = { sessionId: read.sessionId!, sourceUserSeq: 61, attemptId: 'attempt:late-screen-timeout' };
+  const state = setup(t, async () => ({ verdict: null, failure: 'timeout' }));
+  let first!: (value: ReturnType<typeof jevResponse>) => void;
+  let started!: () => void;
+  const whenStarted = new Promise<void>(resolve => { started = resolve; });
+  let jevCalls = 0;
+  _setSystemOneFetchForTests(async () => {
+    jevCalls++;
+    if (jevCalls === 1) return new Promise<ReturnType<typeof jevResponse>>(resolve => { first = resolve; started(); });
+    return jevResponse('abstained');
+  });
+  await modelUsageAttributionStorage.run(owner, async () => {
+    const run = judgeObjectiveComplete(objective, reply, { ...read, reviewStakes: undefined, reviewInputOwner: owner });
+    // The existing one-second hedge enters while the initial transport still
+    // has time to return a genuinely successful abstention.
+    await whenStarted; t.mock.timers.tick(JEV_HEDGE_DELAY_MS); await flush();
+    first(jevResponse('abstained'));
+    const verdict = await run;
+    assert.equal(state.reviewerCalls(), 1); assert.equal(jevCalls, 2);
+    assert.equal(verdict.failedOpen, true); assert.equal(verdict.reviewFailure, 'timeout');
+  });
+});
+
+test('a Jev abstention arriving after hedge entry cannot alter the sent request or cause another review', async t => {
+  const owner = { sessionId: read.sessionId!, sourceUserSeq: 42, attemptId: 'attempt:late-opinion' };
+  let reviewPrompt = '';
+  const state = setup(t, async (request, candidate, context) => {
+    reviewPrompt = buildObjectiveJudgePrompt(request, candidate, context); return judged;
+  });
+  const jev = pendingJev();
+  await modelUsageAttributionStorage.run(owner, async () => {
+    const run = judgeObjectiveComplete(objective, reply, { ...read, reviewStakes: undefined, reviewInputOwner: owner });
+    await jev.whenStarted; t.mock.timers.tick(JEV_HEDGE_DELAY_MS); await flush();
+    assert.equal(state.reviewerCalls(), 1); assert.doesNotMatch(reviewPrompt, /PRIOR MODEL OPINION/);
+    jev.answer('abstained'); const result = await run;
+    assert.equal(result.done, true); assert.equal(state.reviewerCalls(), 1);
+    assert.equal(result.jevAttempt?.priorAssessment, undefined);
+    assert.doesNotMatch(reviewPrompt, /PRIOR MODEL OPINION/);
+  });
+});
+
+test('changed owner requirements invalidate an otherwise timely assessment without removing current context', async t => {
+  const owner = { sessionId: read.sessionId!, sourceUserSeq: 43, attemptId: 'attempt:changed-opinion' };
+  const context: Context = { ...read, reviewInputOwner: owner, agentInstructions: 'Original standing rule.' };
+  let sent = '';
+  const state = setup(t, async (request, candidate, supplied) => { sent = buildObjectiveJudgePrompt(request, candidate, supplied); return judged; });
+  const jev = pendingJev();
+  await modelUsageAttributionStorage.run(owner, async () => {
+    const run = judgeObjectiveComplete(objective, reply, context);
+    await jev.whenStarted; context.agentInstructions = 'Current standing rule.';
+    jev.answer('abstained'); const result = await run;
+    assert.equal(result.done, true); assert.equal(state.reviewerCalls(), 1); assert.equal(jev.calls(), 1);
+    assert.ok(sent.includes('Current standing rule.')); assert.doesNotMatch(sent, /PRIOR MODEL OPINION/);
+    assert.equal(result.jevAttempt?.priorAssessment, undefined);
+  });
+});
+
+test('cancelled same-source abstention cannot start or populate a reviewer', async t => {
+  const owner = { sessionId: read.sessionId!, sourceUserSeq: 44, attemptId: 'attempt:cancelled-opinion' };
+  const state = setup(t), jev = pendingJev(), stop = new AbortController();
+  await modelUsageAttributionStorage.run(owner, async () => {
+    const run = Promise.resolve(withHarnessRunContext({ sessionId: owner.sessionId, sourceUserSeq: owner.sourceUserSeq,
+      runAttemptId: owner.attemptId, turn: 1, counter: new ToolCallsCounter(4), callerCancelSignal: stop.signal },
+    () => judgeObjectiveComplete(objective, reply, { ...read, reviewInputOwner: owner })));
+    const rejected = assert.rejects(run, { name: 'AbortError' });
+    await jev.whenStarted; stop.abort(); jev.answer('abstained'); await rejected;
+    assert.equal(state.reviewerCalls(), 0); assert.equal(jev.calls(), 1);
+  });
+});
+
 test('Jev receives exact host semantics separately from full source evidence', async t => {
   const state = setup(t);
   let payload: { state: { evidence?: string; requirementContext?: string; request?: string; response?: string } } | undefined;
@@ -119,6 +430,51 @@ test('Jev receives exact host semantics separately from full source evidence', a
   assert.ok(payload?.state.evidence?.includes(read.verifiedReads!));
   assert.equal(payload?.state.requirementContext, HOST_COMPLETION_EVIDENCE_GUIDANCE);
   assert.equal(payload?.state.evidence?.includes(HOST_COMPLETION_EVIDENCE_GUIDANCE), false);
+});
+
+for (const owner of ['getters', 'proxy'] as const) {
+  test(`Jev instruction preflight preserves legacy ${owner} option read order without rendering a discarded prompt`, async t => {
+    const state = setup(t);
+    const reads: string[] = [];
+    let payload: { state: { requirementContext?: string; request?: string; response?: string } } | undefined;
+    _setSystemOneFetchForTests(async (_url, init) => { payload = JSON.parse(String(init.body)); return jevResponse(); });
+    const values = { completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE, fullSourceEvidence: true,
+      memoryRequirementContext: undefined };
+    const context: Context = owner === 'getters' ? { ...read,
+      get completionEvidenceGuidance() { reads.push('guide'); return values.completionEvidenceGuidance; },
+      get fullSourceEvidence() { reads.push('full'); return values.fullSourceEvidence; },
+      get memoryRequirementContext() { reads.push('memory'); return values.memoryRequirementContext; },
+    } : new Proxy({ ...read, ...values }, { get(target, key, receiver) {
+      if (key === 'completionEvidenceGuidance') reads.push('guide');
+      if (key === 'fullSourceEvidence') reads.push('full');
+      if (key === 'memoryRequirementContext') reads.push('memory');
+      return Reflect.get(target, key, receiver);
+    } });
+    const expected = ['guide', 'guide', 'full', 'guide', 'guide', 'memory', 'full', 'guide'];
+    const instructions = buildCompletionJudgeInstructions(context);
+    assert.deepEqual(reads, expected, 'actual renderer reads the original options in the original order');
+    assert.equal(instructions, buildCompletionJudgeInstructions({ ...read, ...values }));
+    reads.length = 0;
+    const verdict = await judgeObjectiveComplete(objective, reply, context);
+    assert.equal(verdict.fast, true); assert.equal(state.reviewerCalls(), 0);
+    assert.deepEqual(reads, ['memory', ...expected, 'guide'], 'read eligibility and the later requirement-context guide read keep their original order too');
+    assert.equal(payload?.state.requirementContext, HOST_COMPLETION_EVIDENCE_GUIDANCE);
+    assert.equal(payload?.state.request, objective); assert.equal(payload?.state.response, reply);
+  });
+}
+
+test('instruction option validation retains wrong-guidance and getter throw precedence', () => {
+  const reads: string[] = [];
+  const wrong = { get completionEvidenceGuidance() { reads.push('guide'); return 'different host rules'; },
+    get fullSourceEvidence() { reads.push('full'); return true; } };
+  assert.throws(() => buildCompletionJudgeInstructions(wrong as never), /must match the retained host rules exactly/);
+  assert.deepEqual(reads, ['guide', 'guide']);
+  reads.length = 0;
+  const interrupted = { get completionEvidenceGuidance() { reads.push('guide'); return HOST_COMPLETION_EVIDENCE_GUIDANCE; },
+    get fullSourceEvidence() { reads.push('full'); return true; },
+    get memoryRequirementContext(): never { reads.push('memory'); throw new Error('fixture option interrupted'); } };
+  assert.throws(() => buildCompletionJudgeInstructions(interrupted), /fixture option interrupted/);
+  assert.deepEqual(reads, ['guide', 'guide', 'full', 'guide', 'guide', 'memory']);
 });
 
 for (const historical of [false, true]) {

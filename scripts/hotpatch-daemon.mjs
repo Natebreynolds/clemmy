@@ -254,7 +254,7 @@ function repeatReceiptChain(options, context, fileOps) {
   let ancestors = []; let manifest = null;
   if (hasManifest) {
     const value = pinnedRepeatJSON(authorizedAncestorManifest, authorizedAncestorManifestSha256, fileOps, 64 * 1024);
-    if (!value || Object.keys(value).sort().join('|') !== 'receipts|version' || value.version !== 1 || !Array.isArray(value.receipts) || value.receipts.length < 1 || value.receipts.length > 16) guardRefusal('unsupported bounded ancestor manifest');
+    if (!value || Object.keys(value).sort().join('|') !== 'receipts|version' || value.version !== 1 || !Array.isArray(value.receipts) || value.receipts.length < 1 || value.receipts.length > 22) guardRefusal('unsupported bounded ancestor manifest');
     ancestors = value.receipts;
     if (ancestors.some(item => !item || Object.keys(item).sort().join('|') !== 'path|sha256')) guardRefusal('unexpected ancestor receipt pin shape');
     manifest = { path: authorizedAncestorManifest, sha256: authorizedAncestorManifestSha256 };
@@ -300,7 +300,9 @@ function inspectRepeatReference(options, context, fileOps) {
   if (fileOps.realpathSync(reference) !== reference || reference === context.bundle || reference.startsWith(context.bundle + path.sep) || context.bundle.startsWith(reference + path.sep)) guardRefusal('signed reference must be a separate canonical bundle');
   const chain = repeatReceiptChain(options, context, fileOps);
   const referenceTree = typedTree(reference, fileOps, { links: true });
-  const archive = path.join(updaterLocations({ app: context.bundle, home: context.observed.home }, fileOps).cache, 'update.zip');
+  const archive = context.observed.mode === 'no-active-update'
+    ? context.observed.archive.path
+    : path.join(updaterLocations({ app: context.bundle, home: context.observed.home }, fileOps).cache, 'update.zip');
   const checksum = context.observed.files[archive];
   if (typeof checksum !== 'string' || Buffer.from(checksum, 'base64').length !== 64) guardRefusal('no exact retained reference archive');
   if (fileDigest(archive, 'sha512', 'base64', fileOps) !== checksum) guardRefusal('reference archive checksum changed');
@@ -525,6 +527,60 @@ export function captureAppliedUpdateEvidence({ app, home }, fileOps = fs, comman
   return evidence;
 }
 
+/** Read-only observation, never installation authority on its own. An explicit
+ * no-active-update repeat must still prove the signed official archive, every
+ * immutable installed entry and the ordered runtime/rollback receipt chain. */
+export function captureNoActiveUpdateEvidence({ app, home }, fileOps = fs) {
+  return inspectNoActiveUpdateEvidence({ app, home }, fileOps);
+}
+
+function inspectNoActiveUpdateEvidence({ app, home }, fileOps = fs) {
+  const { bundle, config, cache, shipIt } = updaterLocations({ app, home }, fileOps);
+  for (const target of updaterStagingPaths({ app: bundle, home }, fileOps)) absentPath(target, fileOps);
+  regularPath(cache, fileOps, true);
+  regularPath(shipIt, fileOps, true);
+  const shipNames = fileOps.readdirSync(shipIt).sort();
+  const allowedShipNames = new Set(['ShipIt_stdout.log', 'ShipIt_stdout.log.1', 'ShipIt_stderr.log', 'ShipIt_stderr.log.1']);
+  if (shipNames.some(name => !allowedShipNames.has(name))) guardRefusal('unknown no-active installer inventory');
+  const cacheNames = fileOps.readdirSync(cache).sort();
+  const allowedCacheNames = new Set(['current.blockmap', 'pending.held-latest', 'update.zip.held-latest']);
+  if (cacheNames.some(name => !allowedCacheNames.has(name))
+    || !cacheNames.includes('pending.held-latest') || !cacheNames.includes('update.zip.held-latest')) {
+    guardRefusal('no-active update requires exact retained held archive inventory');
+  }
+  const pending = path.join(cache, 'pending.held-latest');
+  regularPath(pending, fileOps, true);
+  const metadataPath = path.join(pending, 'update-info.json');
+  const metadata = flatJSONObject(metadataPath, fileOps);
+  if (Object.keys(metadata).sort().join('|') !== 'fileName|isAdminRightsRequired|sha512'
+    || metadata.isAdminRightsRequired !== false || !/^[A-Za-z0-9._-]+\.zip$/.test(metadata.fileName)
+    || typeof metadata.sha512 !== 'string' || Buffer.from(metadata.sha512, 'base64').length !== 64
+    || Buffer.from(metadata.sha512, 'base64').toString('base64') !== metadata.sha512) {
+    guardRefusal('unrecognized no-active retained download metadata');
+  }
+  if (fileOps.readdirSync(pending).sort().join('|') !== [metadata.fileName, 'update-info.json'].sort().join('|')) {
+    guardRefusal('unexpected no-active retained download inventory');
+  }
+  const archive = path.join(pending, metadata.fileName);
+  const shellSnapshot = Object.fromEntries(SEALED_SHELL_PARTS.map(rel => [rel, fileDigest(path.join(bundle, rel), 'sha256', 'hex', fileOps)]));
+  const identity = nativeIdentity(fileOps.readFileSync(path.join(bundle, 'Contents/Info.plist'), 'utf8'));
+  const files = { [config]: fileDigest(config, 'sha256', 'hex', fileOps), [metadataPath]: fileDigest(metadataPath, 'sha256', 'hex', fileOps) };
+  for (const archivePath of [archive, path.join(cache, 'update.zip.held-latest')]) {
+    const checksum = fileDigest(archivePath, 'sha512', 'base64', fileOps);
+    if (checksum !== metadata.sha512) guardRefusal('no-active retained archive checksum differs');
+    files[archivePath] = checksum;
+  }
+  const native = archivedNativeParts(archive, path.basename(bundle), fileOps);
+  if (JSON.stringify(native['Contents/Info.plist'].identity) !== JSON.stringify(identity)
+    || SEALED_SHELL_PARTS.some(rel => native[rel].sha256 !== shellSnapshot[rel])) {
+    guardRefusal('no-active retained archive differs from native shell');
+  }
+  if (cacheNames.includes('current.blockmap')) files[path.join(cache, 'current.blockmap')] = fileDigest(path.join(cache, 'current.blockmap'), 'sha256', 'hex', fileOps);
+  return { version: 1, mode: 'no-active-update', app: bundle, home: path.resolve(home), identity, shellSnapshot,
+    shipNames, cacheNames, shipItInventory: typedTree(shipIt, fileOps), cacheInventory: typedTree(cache, fileOps),
+    archive: { path: archive, sha512: metadata.sha512 }, files };
+}
+
 function inspectAppliedUpdateEvidence({ app, home }, fileOps = fs) {
   const locations = updaterLocations({ app, home }, fileOps);
   const { bundle, config, cache, shipIt, bundleId } = locations;
@@ -582,8 +638,18 @@ function inspectAppliedUpdateEvidence({ app, home }, fileOps = fs) {
 
 /** Installer helpers can apply a request independently of the native app. An
  * unreadable process inventory throws; command arguments are never printed. */
+function privateProcessInventory(commands) {
+  try {
+    return commands('/bin/ps', ['-axo', 'command='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  } catch {
+    // Child-process errors can retain full argv in stdout/stderr. Unknown
+    // inventory still refuses, without exposing that original error or cause.
+    guardRefusal('process_inventory_unavailable');
+  }
+}
+
 export function isUpdaterHelperRunning(commands = execFileSync) {
-  const output = commands('/bin/ps', ['-axo', 'command='], { encoding: 'utf8' });
+  const output = privateProcessInventory(commands);
   return output.split('\n').some(command => /(?:^|\/)ShipIt(?:\s|$)|(?:^|\/)Squirrel(?:\s|$)/i.test(command.trim()));
 }
 
@@ -594,7 +660,7 @@ export function isUpdaterHelperRunning(commands = execFileSync) {
 export function isInstalledAppRunning(app, commands = execFileSync) {
   const bundle = path.resolve(app);
   const daemonEntry = path.join(bundle, 'Contents/Resources/daemon/dist/index.js');
-  const output = commands('/bin/ps', ['-axo', 'command='], { encoding: 'utf8' });
+  const output = privateProcessInventory(commands);
   return output.split('\n').some(line => {
     const command = line.trim();
     if (command.startsWith(`${bundle}/Contents/`)) return true;
@@ -640,7 +706,7 @@ export function updaterStagingPaths({ app, home }, fileOps = fs) {
  * is byte-identical to the snapshot the caller took before quitting. Anything
  * unproven refuses.
  */
-export function verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpdateEvidence, priorProof, repeatedReference, isRunning,
+export function verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpdateEvidence, noActiveUpdateEvidence, priorProof, repeatedReference, isRunning,
   readReferenceCodeIdentity = referenceCodeIdentity,
   isUpdaterRunning = isUpdaterHelperRunning,
   verifyNativeSignature = (bundle) => execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', bundle], { stdio: 'pipe' }),
@@ -649,10 +715,11 @@ export function verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpda
   if (isRunning()) throw new Error(`Refusing a guarded patch: ${bundle} is still running.`);
   if (isUpdaterRunning()) guardRefusal('an installer helper is still running');
   if (!home) guardRefusal('no updater home for a fresh staging inventory');
+  if (appliedUpdateEvidence && noActiveUpdateEvidence) guardRefusal('updater evidence modes are mutually exclusive');
   const previousRepeat = priorProof && REPEAT_PATCHES.get(priorProof);
   if (previousRepeat) {
     if (previousRepeat.context.bundle !== bundle || previousRepeat.context.observed.home !== path.resolve(home)) guardRefusal('private repeat proof context differs');
-    sameEvidence(appliedUpdateEvidence, previousRepeat.context.observed, 'private repeat applied-update evidence');
+    sameEvidence(noActiveUpdateEvidence ?? appliedUpdateEvidence, previousRepeat.context.observed, 'private repeat applied-update evidence');
     sameEvidence(shellSnapshot, previousRepeat.context.observed.shellSnapshot, 'private repeat shell snapshot');
     if (repeatedReference !== undefined) sameEvidence(repeatedReference, previousRepeat.optionSnapshot, 'private repeat authority context');
   }
@@ -661,8 +728,25 @@ export function verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpda
     catch (error) { if (error.code !== 'ENOENT') throw error; return false; }
   });
   let appliedEvidenceDigest = null; let repeatLedger = null;
-  if (repeatedReference && !appliedUpdateEvidence) guardRefusal('repeat admission requires exact applied-update evidence');
-  if (staged.length > 0) {
+  if (repeatedReference && !appliedUpdateEvidence && !noActiveUpdateEvidence) guardRefusal('repeat admission requires exact applied-update evidence');
+  if (noActiveUpdateEvidence) {
+    if (staged.length > 0) guardRefusal('no-active update snapshot now has staged installer state');
+    if (!repeatedReference && !previousRepeat) guardRefusal('no-active update requires the exact signed reference and receipt chain');
+    const observed = inspectNoActiveUpdateEvidence({ app: bundle, home }, fileOps);
+    sameEvidence(observed, noActiveUpdateEvidence, 'no-active updater evidence');
+    appliedEvidenceDigest = createHash('sha256').update(JSON.stringify(observed)).digest('hex');
+    if (priorProof) {
+      if (!GUARDED_PATCHES.has(priorProof) || priorProof.app !== bundle
+        || priorProof.appliedEvidenceDigest !== appliedEvidenceDigest || !previousRepeat) guardRefusal('no matching private no-active repeat-install proof');
+      repeatLedger = previousRepeat;
+      recheckRepeatReference(repeatLedger, fileOps);
+    } else {
+      const context = { bundle, observed, verifyNativeSignature, readReferenceCodeIdentity };
+      context.reprove = (proof) => verifyGuardedSealedPatch({ app: bundle, home, shellSnapshot, noActiveUpdateEvidence,
+        priorProof: proof, repeatedReference, isRunning, isUpdaterRunning, verifyNativeSignature, readReferenceCodeIdentity }, fileOps);
+      repeatLedger = inspectRepeatReference(repeatedReference, context, fileOps);
+    }
+  } else if (staged.length > 0) {
     if (!appliedUpdateEvidence) throw new Error(`Refusing a guarded patch: an update is staged to apply on quit (${staged.join(', ')}).`);
     const observed = inspectAppliedUpdateEvidence({ app: bundle, home }, fileOps);
     if (JSON.stringify(observed) !== JSON.stringify(appliedUpdateEvidence)) guardRefusal('applied-update evidence changed since the snapshot');
@@ -684,6 +768,11 @@ export function verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpda
   for (const rel of SEALED_SHELL_PARTS) {
     if (typeof shellSnapshot?.[rel] !== 'string') throw new Error(`Refusing a guarded patch: no pre-quit snapshot of ${rel}.`);
     if (digest(rel) !== shellSnapshot[rel]) throw new Error(`Refusing a guarded patch: ${rel} changed since the pre-quit snapshot.`);
+  }
+  if (noActiveUpdateEvidence) {
+    if (isRunning() || isUpdaterRunning()) guardRefusal('app or installer helper started during no-active verification');
+    sameEvidence(inspectNoActiveUpdateEvidence({ app: bundle, home }, fileOps), noActiveUpdateEvidence,
+      'no-active updater evidence after verification');
   }
   // The install guard compares resolved paths, so the proof names both.
   const proof = Object.freeze({ app: bundle, canonical: fileOps.realpathSync(bundle), appliedEvidenceDigest });

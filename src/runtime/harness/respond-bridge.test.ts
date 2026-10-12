@@ -1941,6 +1941,8 @@ test('saved agent model unavailable commits its exact-source block before any mo
   const response = await respondPreferHarness('home', request, async () => { work++; throw new Error('Legacy must not run.'); });
   assert.equal(response.stoppedReason, 'blocked');
   assert.match(response.text, /Unavailable Specialist/); assert.match(response.text, /claude-opus-5-5/);
+  assert.match(response.text, /Connect that model in Settings > Models/);
+  assert.doesNotMatch(response.text, /quota snapshot/);
   assert.notEqual(response.text, PUBLIC_RUN_FAILURE_TEXT);
   const source = listEvents(sessionId, { types: ['user_input_received'] });
   assert.equal(source.length, 1);
@@ -1955,6 +1957,63 @@ test('saved agent model unavailable commits its exact-source block before any mo
   const replay = await respondPreferHarness('home', { ...request, sourceUserSeq: source[0]!.seq }, async () => { throw new Error('Legacy must not run.'); });
   assert.equal(replay.text, response.text); assert.equal(replay.stoppedReason, 'blocked');
   assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(work, 0);
+});
+
+test('saved agent Codex quota hold keeps the exact source resumable without connectivity copy or provider work', async (t) => {
+  const { createAgentRecord } = await import('../../agents/agent-record.js');
+  const { setSessionAgent } = await import('../../agents/session-agent.js');
+  const agentModel = await import('../../agents/session-agent-model.js');
+  agentModel._setSessionAgentModelDepsForTests({ executionCheck: () => 'codex_quota_exhausted' });
+  t.after(() => agentModel._setSessionAgentModelDepsForTests({}));
+  const saved = createAgentRecord({ name: 'Quota Held Specialist', handles: 'Controlled fixture', model: 'gpt-6.1-sol' });
+  assert.ok(saved.ok); if (!saved.ok) return;
+  const sessionId = 'quota-held-agent-exact-source';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop' });
+  assert.equal(setSessionAgent(sessionId, saved.agent.id, { by: 'owner' }).ok, true);
+  let work = 0;
+  _setBridgeImplsForTests({
+    configure: (async () => { work++; throw new Error('Configuration must not run.'); }) as never,
+    buildAgent: (async () => { work++; throw new Error('Model construction must not run.'); }) as never,
+    runConversation: (async () => { work++; throw new Error('Model dispatch must not run.'); }) as never,
+    resolveTurnCandidates: (async () => { work++; throw new Error('Capability resolution must not run.'); }) as never,
+  });
+  assert.equal(listEvents(sessionId, { types: ['user_input_received'] }).length, 0, 'this is the first accepted source');
+  const request = { sessionId, message: 'Draft the controlled local plan.', channel: 'desktop', runId: 'quota-held-agent-attempt' };
+  const response = await respondPreferHarness('home', request, async () => { work++; throw new Error('Legacy must not run.'); });
+  assert.equal(response.stoppedReason, 'blocked');
+  assert.match(response.text, /latest Codex usage check shows no available quota/);
+  assert.match(response.text, /gpt-6\.1-sol/);
+  assert.match(response.text, /Quota Held Specialist/);
+  assert.match(response.text, /couldn’t start this turn/);
+  assert.doesNotMatch(response.text, /Connect that model|Settings > Models|retained task|snapshot|billing|remote refusal|automatically/i);
+  const sources = listEvents(sessionId, { types: ['user_input_received'] });
+  const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
+  assert.equal(sources.length, 1);
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0]!.data.reason, 'saved_agent_codex_quota_exhausted');
+  assert.equal(terminals[0]!.data.transport, 'harness_preflight_block');
+  const presentation = terminals[0]!.data.presentation as { identity: { sourceUserSeq: number }; status: string; resumable: boolean };
+  assert.equal(presentation.identity.sourceUserSeq, sources[0]!.seq);
+  assert.equal(presentation.status, 'blocked');
+  assert.equal(presentation.resumable, true);
+  const attempt = getLatestRunAttempt(sessionId)!;
+  assert.equal(attempt.status, 'failed');
+  assert.equal(attempt.sourceUserSeq, sources[0]!.seq);
+  assert.equal(terminals[0]!.data.attemptId, attempt.attemptId);
+  const health = capabilityHealth.readHarnessCapabilityHealth('respond_bridge_saved_agent_codex_quota_exhausted');
+  assert.equal(health?.details?.modelCheck, 'codex_quota_exhausted');
+  for (const type of ['turn_model_routed', 'turn_graph_shadow', 'tool_called', 'provider_call_started'] as const)
+    assert.equal(listEvents(sessionId, { types: [type as never] }).length, 0, type);
+  for (const table of ['logical_tool_calls', 'physical_dispatches']) assert.equal(
+    (openEventLog().prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE session_id = ?`).get(sessionId) as { n: number }).n, 0, table);
+  // A later gate change cannot reopen the already-terminal exact source.
+  agentModel._setSessionAgentModelDepsForTests({ executionCheck: () => null });
+  const replay = await respondPreferHarness('home', { ...request, sourceUserSeq: sources[0]!.seq }, async () => { work++; throw new Error('Legacy must not run.'); });
+  assert.equal(replay.text, response.text);
+  assert.equal(replay.stoppedReason, 'blocked');
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(getLatestRunAttempt(sessionId)!.attemptId, attempt.attemptId);
   assert.equal(work, 0);
 });
 

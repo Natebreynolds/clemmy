@@ -43,6 +43,7 @@ import {
 } from '../runtime/operational-telemetry.js';
 import {
   modelUsageAttributionStorage,
+  memoryAccountingOriginFromContext, memoryAccountingParent, createMemoryAccountingOrigin,
   usageRoleFromChannel,
   withModelUsageAttribution,
   withModelUsageObserver,
@@ -310,7 +311,8 @@ function runningEntry(job: MemoryJobId, startedAt: string, opts: MemoryJobRunOpt
  *  still booked as the job's. */
 function memoryJobAttribution(job: MemoryJobId, runId: string): ModelUsageAttributionContext {
   const enclosing = modelUsageAttributionStorage.getStore();
-  const parent = enclosing && enclosing.sessionId && enclosing.sourceUserSeq > 0
+  const retained = memoryAccountingOriginFromContext(enclosing);
+  const parent = retained ? memoryAccountingParent(retained) : enclosing && enclosing.sessionId && enclosing.sourceUserSeq > 0
     ? { sessionId: enclosing.sessionId, sourceUserSeq: enclosing.sourceUserSeq, attemptId: enclosing.attemptId }
     : enclosing?.usageParentTurn;
   const channel = memoryJobChannel(job);
@@ -319,6 +321,7 @@ function memoryJobAttribution(job: MemoryJobId, runId: string): ModelUsageAttrib
     sessionId: '',
     sourceUserSeq: 0,
     usageJobId: `memory:${job}:${runId}`,
+    memoryAccountingOrigin: retained ?? createMemoryAccountingOrigin(parent),
     ...(parent ? { usageParentTurn: parent } : {}),
     channel,
     ...(role ? { role } : {}),

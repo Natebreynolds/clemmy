@@ -747,6 +747,99 @@ test('a review that ran out of time says so, and never sends the owner to fix a 
   assert.equal(committed.event.data.verificationDetail, 'completion_review_failed_open');
 });
 
+for (const issue of ['missing', 'malformed', 'partial', 'uncertain', 'positive_contradiction', 'missing_control']) {
+  test(`a completed ${issue} assessment publishes an exact-source unverified answer without unreachable wording or new work`, () => {
+    const sessionId = `answered-unqualified-${issue}`;
+    createSession({ id: sessionId, kind: 'chat' });
+    const outcome = acceptedAnswer(sessionId, 'The controlled retained answer.');
+    appendEvent({ sessionId, turn: 0, role: 'system', type: 'completion_policy_captured', data: {
+      version: 1, sourceUserSeq: outcome.identity.sourceUserSeq, enabled: true,
+    } });
+    const rawDiagnosticOutput = 'REVIEW_ASSESSMENT: {"fixture":true}\nDONE: synthetic fixture';
+    const packetDiagnostic = '{"fixture":true}';
+    const diagnostic = issue === 'positive_contradiction' || issue === 'malformed' ? {
+      version: 1, status: 'unqualified', reason: issue === 'malformed' ? 'malformed' : 'contradicted',
+      ...(issue === 'malformed' ? { malformedIssue: 'row_text_enum', malformedRowIndex: 0 } : {}),
+      rawOutputSha256: createHash('sha256').update(rawDiagnosticOutput).digest('hex'),
+      rawOutputBytes: Buffer.byteLength(rawDiagnosticOutput),
+      packetSha256: createHash('sha256').update(packetDiagnostic).digest('hex'),
+      packetBytes: Buffer.byteLength(packetDiagnostic), originalModelCallId: 'fixture-completed-review',
+      physicalAttempt: 1, providerResponseIdDigest: 'c'.repeat(64),
+    } : undefined;
+    appendEvent({ sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+      lane: 'host_v1', kind: 'completion', sourceUserSeq: outcome.identity.sourceUserSeq,
+      fulfills: false, failedOpen: true, reviewFailure: 'invalid', reviewDisposition: 'answered_unqualified',
+      ...(diagnostic ? { reviewAssessment: diagnostic } : {}),
+      reason: `The required same-output assessment was ${issue}; completion is not verified.`,
+      objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+      replyDigest: createHash('sha256').update(outcome.presentation.text).digest('hex'),
+    } });
+    const before = listEvents(sessionId).filter(row => /model|goal_alignment/.test(row.type)).map(row => row.id);
+    const committed = commitTurnOutcome(outcome);
+    assert.equal(committed.presentation.text,
+      outcome.presentation.text + '\n\nVerification note: I couldn’t verify all of this answer.');
+    assert.doesNotMatch(committed.presentation.text, /not reachable|model settings|timed out|REVIEW_ASSESSMENT|same-output/);
+    const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
+    assert.equal(verdict.verified, false);
+    assert.equal(verdict.fulfills, false);
+    assert.equal(verdict.disposition, 'enabled_unavailable');
+    assert.equal(verdict.reviewDisposition, 'answered_unqualified');
+    if (diagnostic) assert.deepEqual(verdict.reviewAssessment, diagnostic,
+      'content-free original-output/response diagnostics survive without becoming a completion proof');
+    assert.doesNotMatch(JSON.stringify(verdict), /synthetic fixture|"fixture":true/);
+    assert.equal(committed.event.data.verificationDetail, 'completion_review_failed_open');
+    assert.deepEqual(listEvents(sessionId).filter(row => /model|goal_alignment/.test(row.type)).map(row => row.id), before,
+      'publication does not manufacture another model request or reviewed verdict');
+  });
+}
+
+test('the answered-unqualified note and disposition cannot move to a different objective or reply', () => {
+  for (const mismatch of ['objective', 'reply']) {
+    const sessionId = `answered-unqualified-mismatch-${mismatch}`;
+    createSession({ id: sessionId, kind: 'chat' });
+    const outcome = acceptedAnswer(sessionId, 'The current controlled answer.');
+    appendEvent({ sessionId, turn: 0, role: 'system', type: 'completion_policy_captured', data: {
+      version: 1, sourceUserSeq: outcome.identity.sourceUserSeq, enabled: true,
+    } });
+    appendEvent({ sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+      lane: 'host_v1', kind: 'completion', sourceUserSeq: outcome.identity.sourceUserSeq,
+      fulfills: false, failedOpen: true, reviewFailure: 'invalid', reviewDisposition: 'answered_unqualified',
+      reason: 'Assessment unavailable for an earlier input.',
+      objectiveDigest: createHash('sha256').update(mismatch === 'objective' ? 'Earlier objective.' : 'Accepted request.').digest('hex'),
+      replyDigest: createHash('sha256').update(mismatch === 'reply' ? 'Earlier answer.' : outcome.presentation.text).digest('hex'),
+    } });
+    const committed = commitTurnOutcome(outcome);
+    const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
+    assert.equal(verdict.verified, false);
+    assert.equal(verdict.reviewDisposition, undefined);
+    assert.doesNotMatch(committed.presentation.text, /I couldn’t verify all of this answer/);
+  }
+});
+
+test('ordinary transport unavailability and qualified success retain their existing publication behavior', () => {
+  for (const qualified of [false, true]) {
+    const sessionId = `answered-unqualified-control-${qualified}`;
+    createSession({ id: sessionId, kind: 'chat' });
+    const outcome = acceptedAnswer(sessionId, 'The unchanged controlled answer.');
+    appendEvent({ sessionId, turn: 0, role: 'system', type: 'completion_policy_captured', data: {
+      version: 1, sourceUserSeq: outcome.identity.sourceUserSeq, enabled: true,
+    } });
+    appendEvent({ sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+      lane: 'host_v1', kind: 'completion', sourceUserSeq: outcome.identity.sourceUserSeq,
+      fulfills: true, ...(qualified ? {} : { failedOpen: true, reviewFailure: 'unavailable' }),
+      reason: qualified ? 'The controlled answer is supported.' : 'The reviewer transport was unavailable.',
+      objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+      replyDigest: createHash('sha256').update(outcome.presentation.text).digest('hex'),
+    } });
+    const committed = commitTurnOutcome(outcome);
+    const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
+    assert.equal(verdict.verified, qualified);
+    assert.equal(verdict.reviewDisposition, undefined);
+    if (qualified) assert.equal(committed.presentation.text, outcome.presentation.text);
+    else assert.match(committed.presentation.text, /review model is not reachable/);
+  }
+});
+
 for (const [label, reason, expected] of [
   ['quota', 'The selected reviewer is rate-limited; no review was completed.', /reviewer is rate-limited/],
   ['retained-timeout', 'judge timed out — accepting completion', /judge timed out; no review was completed/],

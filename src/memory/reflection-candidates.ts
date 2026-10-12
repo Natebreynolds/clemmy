@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
+import { captureAutomaticMemoryAccountingOrigin, recordFirstMemoryCandidateAccounting } from './memory-causal-accounting.js';
 import { openMemoryDb } from './db.js';
 import {
   automaticMemoryCandidateIdentity, automaticMemoryEnvelopeDigest, createAutomaticMemoryEnvelope,
@@ -319,7 +320,8 @@ export function recordAutomaticMemoryCandidates(
       const token = source.eventType === 'user_steer_note' ? 'user-steer' : 'user-source';
       if (input.callId !== `auto-capture:${token}:${source.eventSeq}`) throw new Error('Automatic memory call is not its accepted owner event.');
     }
-    return { input, envelope, key: automaticMemoryCandidateIdentity(envelope.origin) };
+    return { input, envelope, key: automaticMemoryCandidateIdentity(envelope.origin),
+      accounting: captureAutomaticMemoryAccountingOrigin(envelope.origin) };
   });
   const sourceBytes = JSON.stringify(expected[0]!.envelope.origin.source);
   if (expected.some(value => JSON.stringify(value.envelope.origin.source) !== sourceBytes)
@@ -349,14 +351,16 @@ export function recordAutomaticMemoryCandidates(
        status, reason, resulting_fact_id, created_at, resolved_at, source_type,
        intake_reason, trust_level, authority, source_uri, pin, destination_json)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'auto_capture', ?, ?, 'user', ?, ?, ?)`);
-    return expected.map(({ input, envelope, key }) => {
+    return expected.map(({ input, envelope, key, accounting }) => {
       const now = input.now ?? new Date().toISOString();
       const status = input.status ?? 'pending';
-      return Number(insert.run(input.episodeId ?? null, input.sessionId, input.callId, key,
+      const id = Number(insert.run(input.episodeId ?? null, input.sessionId, input.callId, key,
         input.kind, input.text, Math.max(1, Math.min(10, input.importance)), status,
         input.reason?.slice(0, 240) ?? null, now, status === 'rejected' ? now : null,
         input.intakeReason?.slice(0, 240) ?? null, input.trustLevel ?? null, input.sourceUri ?? null,
         input.pin ? 1 : 0, JSON.stringify(envelope)).lastInsertRowid);
+      recordFirstMemoryCandidateAccounting(db, id, envelope, accounting);
+      return id;
     });
   });
   return tx.immediate();

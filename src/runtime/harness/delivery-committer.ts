@@ -1472,6 +1472,11 @@ export function commitTurnOutcome(
       && coverageComplete
       && artifactCoverage.every((entry) => entry.judgedMatch && entry.currentMatch))
     : artifactCoverage.every((entry) => entry.judgedMatch && entry.currentMatch);
+  // Negative-only qualification of this exact authored answer. A diagnostic
+  // summary cannot certify the reply, another source or a changed candidate.
+  const answeredUnqualified = publishedVerdict?.reviewDisposition === 'answered_unqualified'
+    && publishedVerdict.failedOpen === true && publishedVerdict.fulfills === false
+    && objectiveMatches && replyMatches;
   const verdictTrustworthy = Boolean(
     publishedVerdict
     && reviewDisposition === 'reviewed'
@@ -1584,7 +1589,9 @@ export function commitTurnOutcome(
     // A reviewer that ran out of time was reached; it did not finish. Saying
     // it could not be reached sends the owner to change a working setup.
     const reviewTimedOut = detail === 'completion_review_failed_open' && publishedVerdict?.reviewFailure === 'timeout';
-    const note = blockedFinding
+    const note = answeredUnqualified
+      ? 'Verification note: I couldn’t verify all of this answer.'
+      : blockedFinding
       ? `Verification note: ${blockedFinding}`
       : reviewTimedOut
         ? 'Verification note: the review of this result did not finish within its time limit, so it stands unreviewed. '
@@ -1702,6 +1709,12 @@ export function commitTurnOutcome(
     artifactCoverage,
     // Truthful qualifiers, previously dropped entirely.
     ...(publishedVerdict.failedOpen ? { failedOpen: true } : {}),
+    ...(answeredUnqualified ? { reviewDisposition: 'answered_unqualified' as const } : {}),
+    // The source reader already bounds these content-free model-opinion
+    // diagnostics. Carry them only beside the exact current input joins;
+    // their serialized form grants no review or execution capability.
+    ...(objectiveMatches && replyMatches && publishedVerdict.reviewAssessment
+      ? { reviewAssessment: publishedVerdict.reviewAssessment } : {}),
     ...(publishedVerdict.selfJudge ? { selfJudge: true } : {}),
     ...(publishedVerdict.ownerSelectedJudge ? { ownerSelectedJudge: true } : {}),
     ...(publishedVerdict.substituteForExactPin ? { substituteForExactPin: true } : {}),

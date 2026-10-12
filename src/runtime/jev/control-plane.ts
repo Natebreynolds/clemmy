@@ -4,7 +4,9 @@
  * reports unavailable so failure cannot manufacture uniqueness or absence.
  */
 
-import { evaluateSystemOne } from './client.js';
+import { evaluateSystemOne, systemOneOriginalWitnessFor, systemOneOriginalWitnessMetadata,
+  type JevAssessmentOwner, type SystemOneOriginalWitness, type SystemOneWitnessMetadata } from './client.js';
+import { createHash } from 'node:crypto';
 import { noteJevDecisionOutcome, readRecentJevDecisions, recordJevSkip } from './decision-log.js';
 import { buildSystemOneRequest, type ChoiceAnswer, type NoulAnswer, type SystemOneQuestions } from './system-one.js';
 import { historicalReadPacketIsCurrent, closeHistoricalReadSelection,
@@ -1023,6 +1025,46 @@ export interface JevCompletionVerdict {
   historicalEvidence?: HistoricalReadClosure;
 }
 
+export interface JevCompletionAssessmentScope {
+  owner: JevAssessmentOwner; reviewInvocationId: string; contextDigest: string; signal?: AbortSignal;
+}
+export interface JevCompletionAssessment { readonly kind: 'jev_completion_assessment' }
+export interface JevCompletionAssessmentMetadata {
+  readonly producer: SystemOneWitnessMetadata;
+  readonly reviewInvocationId: string;
+  readonly objectiveDigest: string;
+  readonly candidateDigest: string;
+  readonly contextDigest: string;
+  readonly stateSha256: string;
+  readonly questionnaireSha256: string;
+  readonly outcome: 'abstained' | 'typed_assessment';
+  readonly taskViewComplete: boolean;
+  readonly evidenceViewComplete: boolean;
+  readonly scores: Readonly<Record<'delivered' | 'unaddressed' | 'unsupported' | 'computed' | 'asksUser' | 'cannotFinish', number>>;
+}
+const completionAssessments = new WeakMap<JevCompletionAssessment, {
+  witness: SystemOneOriginalWitness; metadata: JevCompletionAssessmentMetadata; signal?: AbortSignal;
+}>();
+const assessmentDigest = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex');
+
+/** Only this invocation's original producer-owned reading can be forwarded. */
+export function jevCompletionAssessmentForReview(value: unknown, expected: {
+  owner: JevAssessmentOwner; reviewInvocationId: string; contextDigest: string;
+  objectiveDigest: string; candidateDigest: string; signal?: AbortSignal;
+}): JevCompletionAssessmentMetadata | undefined {
+  try {
+    if (!value || typeof value !== 'object' || expected.signal?.aborted) return undefined;
+    const entry = completionAssessments.get(value as JevCompletionAssessment);
+    const metadata = entry?.metadata; const producer = entry && systemOneOriginalWitnessMetadata(entry.witness);
+    return metadata && producer && !entry?.signal?.aborted
+      && producer === metadata.producer && producer.owner.sessionId === expected.owner.sessionId
+      && producer.owner.sourceUserSeq === expected.owner.sourceUserSeq && producer.owner.attemptId === expected.owner.attemptId
+      && metadata.reviewInvocationId === expected.reviewInvocationId && metadata.contextDigest === expected.contextDigest
+      && metadata.objectiveDigest === expected.objectiveDigest && metadata.candidateDigest === expected.candidateDigest
+      && metadata.taskViewComplete && metadata.evidenceViewComplete ? metadata : undefined;
+  } catch { return undefined; }
+}
+
 const COMPLETION_REASONS = {
   done: 'Jev found the requested result delivered and nothing left undone; nothing in it stood out as unsupported by the results.',
   incomplete: 'Jev found part of the request left without a result.',
@@ -1118,6 +1160,9 @@ export async function tryJevCompletionVerdict(
      *  preferences), so a specific that memory supports is not "unsupported". */
     memory?: string;
     historicalEvidence?: HistoricalReadPacket;
+    /** Advisory side channel only; does not alter any closure gate or return value. */
+    assessmentScope?: JevCompletionAssessmentScope;
+    onAssessment?: (assessment: JevCompletionAssessment) => unknown;
   },
 ): Promise<JevCompletionVerdict | null> {
   const historical = opts?.historicalEvidence;
@@ -1308,6 +1353,7 @@ export async function tryJevCompletionVerdict(
     sessionId: opts?.sessionId,
     channel: 'jev-completion',
     decisionContext: sizeGateContext,
+    ...(opts?.assessmentScope ? { captureOriginalWitness: true, assessmentSignal: opts.assessmentScope.signal } : {}),
   });
   if (!result.ok) return null;
   const read = (id: string): number | null => {
@@ -1370,6 +1416,29 @@ export async function tryJevCompletionVerdict(
     ...taskViewDetail,
     ...(evidence.clipped ? { evidenceClipped: true } : {}),
   });
+  try {
+    const scope = opts?.assessmentScope;
+    const scores = { delivered, unaddressed, unsupported, computed, asksUser, cannotFinish };
+    if (scope && opts?.onAssessment && !scope.signal?.aborted && taskViewComplete && !evidence.clipped
+      && Object.values(scores).every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1)) {
+      const questionnaireSha256 = assessmentDigest(JSON.stringify(questions));
+      const witness = systemOneOriginalWitnessFor(result, { owner: scope.owner, questionnaireSha256,
+        requestBodySha256: assessmentDigest(JSON.stringify(buildSystemOneRequest(state, questions))) });
+      const producer = witness && systemOneOriginalWitnessMetadata(witness);
+      if (witness && producer) {
+        const assessment = Object.freeze({ kind: 'jev_completion_assessment' as const });
+        completionAssessments.set(assessment, { witness, signal: scope.signal, metadata: Object.freeze({
+          producer, reviewInvocationId: scope.reviewInvocationId, contextDigest: scope.contextDigest,
+          objectiveDigest: assessmentDigest(objective), candidateDigest: assessmentDigest(assistantResponse),
+          stateSha256: assessmentDigest(JSON.stringify(state)), questionnaireSha256,
+          outcome: verdict ? 'typed_assessment' : 'abstained', taskViewComplete, evidenceViewComplete: !evidence.clipped,
+          scores: Object.freeze(scores as JevCompletionAssessmentMetadata['scores']),
+        }) });
+        const notified = opts.onAssessment(assessment);
+        if (notified && typeof (notified as PromiseLike<unknown>).then === 'function') void Promise.resolve(notified).catch(() => {});
+      }
+    }
+  } catch { /* an unavailable advisory assessment cannot change the Jev verdict */ }
   if (!verdict) return null;
   await recordJevJudgeMetric('completion', verdict.done ? 'passed' : 'blocked', result.model, Date.now() - started);
   return { ...verdict, judgeModelId: result.model };

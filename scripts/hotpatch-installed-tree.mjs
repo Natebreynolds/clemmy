@@ -15,6 +15,10 @@
  * hashes the caller recorded before quitting the app itself; the patch then
  * runs only while that proof holds (verifyGuardedSealedPatch) and re-proves it
  * after writing.
+ * A snapshot may explicitly capture noActiveUpdateEvidence after consumed
+ * updater records disappear. That mode still requires all signed-reference,
+ * ordered receipt and complete current updater-inventory proofs; an empty
+ * staging directory alone never grants repeat installation authority.
  *
  *   node --import tsx scripts/hotpatch-installed-tree.mjs [--no-relaunch] [--guarded-shell-snapshot <file>]
  */
@@ -119,6 +123,7 @@ const proveGuard = () => verifyGuardedSealedPatch({
   app: APP, home,
   shellSnapshot: snapshot.shellSnapshot ?? snapshot,
   appliedUpdateEvidence: snapshot.appliedUpdateEvidence,
+  noActiveUpdateEvidence: snapshot.noActiveUpdateEvidence,
   priorProof: guarded,
   repeatedReference: Object.keys(repeatedReference).length ? repeatedReference : undefined,
   isRunning: running,

@@ -474,3 +474,24 @@ test('scheduled memory gets a unique journal identity without inventing a parent
   assert.equal(row.trace?.attemptId, undefined);
   assert.equal(row.kind, 'background');
 });
+
+for (const fail of [false, true]) test(`retained memory origin survives nested own requests and ${fail ? 'failure' : 'success'} without changing harness B`, async () => {
+  const usage = await import('../runtime/usage-log.js');
+  const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+  const a = { sessionId: 'sess-retained-A', sourceUserSeq: 1901, attemptId: 'attempt:retained-A' };
+  const b = { sessionId: 'sess-active-B', sourceUserSeq: 1902, attemptId: 'attempt:active-B' };
+  const origin = usage.createMemoryAccountingOrigin(a);
+  const work = harnessRunContextStorage.run({ sessionId: b.sessionId, sourceUserSeq: b.sourceUserSeq, runAttemptId: b.attemptId } as never, () =>
+    withModelUsageAttribution({ ...b, memoryAccountingOrigin: origin }, () => runMemoryJob('learn', {}, async () => {
+      await runMemoryJob('verify', {}, async () => usage.withOwnModelRequestAttribution({ role: 'brain' }, async () => {
+        assert.equal(harnessRunContextStorage.getStore()?.sessionId, b.sessionId);
+        assert.equal(modelUsageAttributionStorage.getStore()?.sessionId, '');
+        recordModelUsage({ ...b, model: `retained-nested-${fail}`, responseId: `retained-nested-${fail}`, inputTokens: 5, outputTokens: 1, cacheDialect: 'inclusive' });
+        if (fail) throw new Error('scripted cancellation');
+      }), () => ({ outcome: 'nothing_new' }));
+    }, () => ({ outcome: 'nothing_new' }))));
+  if (fail) await assert.rejects(work, /scripted cancellation/); else await work;
+  const row = readUsageEventsForDate().find(r => r.responseId === `retained-nested-${fail}`)!;
+  assert.equal(row.trace?.acceptedSource, `${a.sessionId}:${a.sourceUserSeq}`); assert.equal(row.trace?.attemptId, a.attemptId);
+  assert.match(row.source, /^memory:verify:/); assert.equal(row.role, 'reviewer');
+});

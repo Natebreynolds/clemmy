@@ -971,3 +971,77 @@ async function collect(it: AsyncIterable<unknown>): Promise<unknown[]> {
   for await (const e of it) out.push(e);
   return out;
 }
+
+test('opted-in nested telemetry preserves parent events exactly once and isolates both observer failures', async () => {
+  for (const failure of ['parent','child','async_parent','async_child','none'] as const) {
+    const parent: Readonly<ResilienceTelemetryEvent>[]=[];
+    const child: Readonly<ResilienceTelemetryEvent>[]=[];
+    let calls=0;
+    const model=withResilience({async getResponse() {calls++;return {responseId:'telemetry-compose-fixture',
+      output:[{type:'message',role:'assistant',status:'completed',content:[{type:'output_text',text:'answer'}]}],
+      usage:{inputTokens:1,outputTokens:1,totalTokens:2,requests:1,inputTokensDetails:[],outputTokensDetails:[]}} as ModelResponse;},
+      async *getStreamedResponse(){throw new Error('not streamed');}},policy({maxRetries:0}));
+    const response=await withModelResilienceTelemetry(event=>{parent.push(event);
+      if(failure==='parent')throw new Error('parent observer');
+      if(failure==='async_parent')return Promise.reject(new Error('parent async observer'));
+    },()=>withModelResilienceTelemetry(event=>{child.push(event);
+      if(failure==='child')throw new Error('child observer');
+      if(failure==='async_child')return Promise.reject(new Error('child async observer'));
+    },()=>model.getResponse(req()),{preserveParent:true}));
+    assert.equal(calls,1);assert.equal(response.responseId,'telemetry-compose-fixture');
+    assert.equal(parent.length,child.length);assert.ok(parent.length>0);
+    assert.ok(parent.every((event,index)=>event===child[index]));
+    assert.equal(parent.filter(event=>event.type==='call_started').length,1);
+    assert.equal(parent.filter(event=>event.type==='call_finished').length,1);
+    await new Promise<void>(resolve=>setImmediate(resolve));
+  }
+});
+test('legacy nested telemetry replacement remains unchanged unless parent preservation is explicitly requested', async () => {
+  const parent: Readonly<ResilienceTelemetryEvent>[]=[];const child: Readonly<ResilienceTelemetryEvent>[]=[];
+  const model=withResilience({async getResponse(){return {responseId:'legacy-telemetry',output:[{type:'message',role:'assistant',status:'completed',content:[{type:'output_text',text:'answer'}]}],
+    usage:{inputTokens:1,outputTokens:1,totalTokens:2,requests:1,inputTokensDetails:[],outputTokensDetails:[]}} as ModelResponse;},
+    async *getStreamedResponse(){throw new Error('not streamed');}},policy({maxRetries:0}));
+  await withModelResilienceTelemetry(event=>{parent.push(event);},()=>withModelResilienceTelemetry(event=>{child.push(event);},()=>model.getResponse(req())));
+  assert.equal(parent.length,0);assert.ok(child.length>0);
+});
+
+test('native observer captures its public caller, starts at drain, preserves original under an outer decorator', async () => {
+  const { captureNativeModelCallObservation } = resilient;
+  const { completedModelResponseBinding } = await import('./model-response-binding.js');
+  const { captureModelUsageProvenance, withModelUsageAttribution } = await import('../usage-log.js');
+  const a: ResilienceTelemetryEvent[] = [], b: ResilienceTelemetryEvent[] = [];
+  const capture = withModelUsageAttribution({ sessionId: 'sess-native-a', sourceUserSeq: 811, role: 'brain' }, () =>
+    withModelResilienceTelemetry(e => a.push(e), () => captureNativeModelCallObservation('codex', 'getResponse', 3,
+      undefined, captureModelUsageProvenance())));
+  assert.equal(a.length, 0);
+  const original = { responseId: 'resp_native_nested', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }], usage: {} } as unknown as ModelResponse;
+  withModelResilienceTelemetry(e => b.push(e), () => {
+    const telemetry = capture.begin(); telemetry.startAttempt(1); telemetry.response(original); telemetry.finish('returned');
+  });
+  const proof = completedModelResponseBinding(original)!;
+  assert.equal(proof.modelCallId, capture.modelCallId); assert.equal(a.filter(e => e.type === 'response_observed').length, 1);
+  assert.equal(b.length, 0);
+  const outerEvents: ResilienceTelemetryEvent[] = [];
+  const outer = withResilience({ getResponse: async () => original, async *getStreamedResponse() { yield { type: 'response_done', response: original } as never; } }, policy());
+  assert.equal(await withModelResilienceTelemetry(e => outerEvents.push(e), () => outer.getResponse(req())), original);
+  assert.deepEqual(completedModelResponseBinding(original), proof);
+  assert.equal(outerEvents.filter(e => e.type === 'response_observed').length, 0, 'outer association is explicitly unknown');
+});
+
+test('native and ordinary duplicate original objects stay ambiguous; untracked foreign binding stays its original', async () => {
+  const { completedModelResponseBinding, bindCompletedModelResponse } = await import('./model-response-binding.js');
+  const original = { responseId: 'resp_native_duplicate', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }], usage: {} } as unknown as ModelResponse;
+  for (let i = 0; i < 2; i++) {
+    const capture = resilient.captureNativeModelCallObservation('codex', 'getResponse', 3);
+    const observation = capture.begin(); observation.startAttempt(1); observation.response(original); observation.finish('returned');
+  }
+  assert.equal(completedModelResponseBinding(original), undefined);
+  const ordinary = { ...original, responseId: 'resp_ordinary_duplicate' };
+  const wrapper = withResilience({ async getResponse() { return ordinary; }, async *getStreamedResponse() {} }, policy());
+  await wrapper.getResponse(req()); assert.ok(completedModelResponseBinding(ordinary));
+  await wrapper.getResponse(req()); assert.equal(completedModelResponseBinding(ordinary), undefined);
+  const foreign = { ...original, responseId: 'resp_foreign_original' };
+  const foreignProof = bindCompletedModelResponse(foreign, 'foreign-original-call', 1);
+  await withResilience({ async getResponse() { return foreign; }, async *getStreamedResponse() {} }, policy()).getResponse(req());
+  assert.deepEqual(completedModelResponseBinding(foreign), foreignProof);
+});

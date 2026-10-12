@@ -2113,6 +2113,57 @@ function freshPlanningFixture(sessionId: string, sourceUserSeq: number) {
   } as never;
 }
 
+test('actual fresh lean planning instructions retain logical-effect and Stop ownership guidance once', async () => {
+  const { STOP_CONTINUITY_RUBRIC_GUIDANCE, STOP_CONTINUITY_ACTION_RUBRIC_GUIDANCE, STOP_CONTINUITY_REASONING_GUIDANCE } =
+    await import('../runtime/harness/stop-continuity-reasoning.js');
+  const priorVariant = process.env.CLEMMY_RUBRIC_VARIANT;
+  const priorExperiment = process.env.CLEMMY_RUBRIC_VARIANT_AB;
+  process.env.CLEMMY_RUBRIC_VARIANT_AB = 'off';
+  try {
+    for (const [variant, fresh] of [['lean', true], ['lean', false], ['legacy', true]] as const) {
+      resetEventLog();
+      process.env.CLEMMY_RUBRIC_VARIANT = variant;
+      const sess = createSession({ kind: 'chat' });
+      const text = 'Explain how settled and uncertain effects carry across Stop and Continue. Do not perform effects.';
+      const source = appendEvent({ sessionId: sess.id, turn: 1, role: 'user',
+        type: 'user_input_received', data: { text } });
+      const agent = await buildOrchestratorAgent({
+        sessionId: sess.id, sourceUserSeq: source.seq, userInput: text,
+        acceptedRoute: 'retrieve',
+        ...(fresh ? { hostFreshPlanning: freshPlanningFixture(sess.id, source.seq) } : {}),
+        allowedToolNames: ['tool_search'],
+        mcpToolScope: { authority: 'none', reason: 'Stop reasoning instruction fixture',
+          allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+      });
+      const instructions = await renderAgentInstructions(agent);
+      assert.equal(instructions.split(STOP_CONTINUITY_RUBRIC_GUIDANCE).length - 1, 1,
+        `${variant}/${fresh ? 'fresh' : 'ordinary'} must retain the compact rule once`);
+      assert.equal(instructions.includes(STOP_CONTINUITY_REASONING_GUIDANCE), false,
+        'the compact brain rule must not duplicate the full bound handoff/review guide');
+      assert.equal(instructions.includes(STOP_CONTINUITY_ACTION_RUBRIC_GUIDANCE), variant === 'lean' && fresh,
+        'only the specialized fresh lean action receives the positive-proof supplement');
+      if (variant === 'lean' && fresh) {
+        assert.match(instructions, /positive exact no-dispatch evidence/);
+        assert.match(instructions, /an absent call, result or receipt is not that proof/);
+        assert.match(instructions, /current accepted source and normal gates/);
+        assert.match(instructions, /durable parent-to-unique-admitted-successor binding/);
+        assert.match(instructions, /same-principal current read authority and the requested scope/);
+        assert.match(instructions, /Unknown coverage remains unknown/);
+      }
+      assert.match(instructions, /missing rows or empty targets prove neither non-dispatch nor safety/);
+      assert.match(instructions, /Repeated Continue rejoins its durable successor/);
+      assert.match(instructions, /Stop targets exact session\/source\/attempt\/run, never recency/);
+      assert.equal(listEvents(sess.id).some(row => /model_call|model_response|tool_call_started/.test(row.type)), false,
+        'constructing the real instructions does not run a model or business call');
+    }
+  } finally {
+    if (priorVariant === undefined) delete process.env.CLEMMY_RUBRIC_VARIANT;
+    else process.env.CLEMMY_RUBRIC_VARIANT = priorVariant;
+    if (priorExperiment === undefined) delete process.env.CLEMMY_RUBRIC_VARIANT_AB;
+    else process.env.CLEMMY_RUBRIC_VARIANT_AB = priorExperiment;
+  }
+});
+
 function unresolvedTurnCandidatesFixture(input: {
   roleKey: string;
   text: string;

@@ -45,9 +45,10 @@ after(() => { events.closeEventLog(); rmSync(home, { recursive: true, force: tru
 const request = 'Please refresh my Facebook trends report using the Scorpion Facebook URL https://www.facebook.com/scorpion.co and report back the findings.';
 const promise = 'The check-in landed; next I’ll actually run the posts scraper against Scorpion’s Facebook page.';
 let serial = 0;
-function accepted(text = request, sessionId?: string) {
+function accepted(text = request, sessionId?: string, plan = false) {
   const id = sessionId ?? events.createSession({ id: `completion-contract-${++serial}`, kind: 'chat' }).id;
-  const source = events.appendEvent({ sessionId: id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
+  const source = events.appendEvent({ sessionId: id, turn: 1, role: 'user', type: 'user_input_received', data: { text,
+    ...(plan ? { taskMode: { version: 1, kind: 'plan' } } : {}) } });
   return { sessionId: id, sourceUserSeq: source.seq, turn: 1 };
 }
 function attempted(identity: ReturnType<typeof accepted>, tool = 'tool_search') {
@@ -95,14 +96,14 @@ function settledHostRead(identity: ReturnType<typeof accepted>) {
     .run(identity.sessionId, identity.sourceUserSeq, callId, digest, digest, settlementEvent.id, now);
 }
 function retainedRead(identity: ReturnType<typeof accepted>, name: string, payload: unknown, mutating = false, hostOwned = false, failed = false,
-  call: { id?: string; args?: Record<string, unknown> } = {}) {
+  call: { id?: string; args?: Record<string, unknown>; hostExecution?: boolean } = {}) {
   const task = { ...identity, acceptedTaskId: identities.acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq) };
   if (!hostOwned) assert.ok(shadow.recordTurnGraphShadow({ identity: task }));
   const logicalToolCallId = call.id ?? `read:${name}`;
   const args = call.args ?? {};
   const begin = () => dispatch.beginPhysicalDispatch({
     identity: { ...task, logicalToolCallId, physicalDispatchId: `dispatch:${logicalToolCallId}`, ordinal: 0 },
-    tool: name, args, executionSite: 'host',
+    tool: name, args, ...(call.hostExecution !== false ? { executionSite: 'host' as const } : {}),
   });
   const opened = hostOwned ? (() => {
     const root = callAuthority.acceptedTurnCallAuthorityFor(identity.sessionId, identity.sourceUserSeq);
@@ -127,7 +128,7 @@ function retainedRead(identity: ReturnType<typeof accepted>, name: string, paylo
   if (opened.status !== 'inserted') throw new Error('Fixture dispatch did not open');
   assert.equal(dispatch.settlePhysicalDispatch({ identity: opened.identity, tool: name, outcome: 'returned' }).status, 'inserted');
   const committed = settlements.commitLogicalCallSettlement({ identity: { ...task, logicalToolCallId },
-    contract: { toolName: name, args }, execution: { kind: 'local_execution' },
+    contract: { toolName: name, args }, execution: { kind: call.hostExecution === false ? 'provider_execution' : 'local_execution' },
     result: { payload }, outcome: outcomes.classifyAttemptOutcome(failed ? { argumentValidationFailed: true } : { envelopeSuccessful: true }),
     recovery: { businessCall: true, mutating }, observer: { lane: 'byo', turn: identity.turn } });
   assert.equal(committed.status, 'committed', JSON.stringify(committed));
@@ -468,6 +469,10 @@ test('focused query coverage is bound to exact retained invocation arguments acr
     assert.equal(focused.sourceResultHandleId, sourceHandle);
     assert.ok(evidence.summary.includes(JSON.stringify(reply).slice(1, -1)));
     assert.equal(focused.sourceSelectionComplete, false);
+    assert.doesNotMatch(evidence.summary, /Derived decoded UTF-8 result-text view/,
+      'a selected retained-reader reply is not a new decoded whole-source digest');
+    assert.doesNotMatch(evidence.summary, /Already supplied for this exact settled call:/,
+      'a fully shown focused reply cannot borrow a full-source retained-text cue');
     const coverage = assessCompletionEvidenceCoverage({ objective: 'Inspect all records.', results: evidence.results });
     assert.equal(coverage.complete, false, 'a bounded query is not whole producer coverage even without a path');
     const review = assessReviewCoverage({ results: evidence.results, needsAllOf: [sourceHandle] });
@@ -524,6 +529,7 @@ test('an image in a retained result is described for review, never inlined as ba
   assert.match(completion.summary, /Preview of \\?"Board\\?"/);
   assert.match(completion.summary, /image bytes are not shown in text evidence/);
   assert.ok(completion.results.some(r => r.presentation === 'media_described'));
+  assert.doesNotMatch(completion.summary, /Derived decoded UTF-8 result-text view/);
 });
 
 test('the active planning discovery map survives history collapse and database reopen without mixing sources', async () => {
@@ -671,6 +677,179 @@ test('reviewed text loses only its JSON transport encoding, including literal es
   assert.equal(evidence.results[0]?.rawByteCount, Buffer.byteLength(JSON.stringify(text)));
   assert.equal(evidence.results[0]?.contentComplete, true);
   assert.ok(evidence.results[0]!.shownByteCount! < evidence.results[0]!.rawByteCount!);
+});
+
+test('actual settled text review distinguishes retained JSON receipt bytes from unchanged decoded UTF-8 view bytes', () => {
+  for(const text of ['FIRST\nREMAINING\n', 'Lead "β" \\ path\n尾🙂']) {
+    const identity=accepted('Review the exact returned text without another read.');
+    const handle=retainedRead(identity,'read_file',text);
+    const db=events.openEventLog();
+    const beforeHandle=db.prepare('SELECT * FROM durable_result_handles WHERE handle_id=?').get(handle);
+    const beforeSettlement=db.prepare('SELECT * FROM logical_call_settlements WHERE session_id=? AND source_user_seq=?').all(identity.sessionId,identity.sourceUserSeq);
+    const beforeEvents=events.listEvents(identity.sessionId).map(row=>({id:row.id,data:row.data}));
+    events.closeEventLog();
+    const evidence=sourceSettledReadEvidence(identity);const result=evidence.results[0]!;
+    const retainedJson=JSON.stringify(text);
+    const rawDigest=createHash('sha256').update(retainedJson,'utf8').digest('hex');
+    const textDigest=createHash('sha256').update(text,'utf8').digest('hex');
+    assert.notEqual(rawDigest,textDigest);
+    assert.equal(readResultBlock(evidence.summary,'read_file'),text);
+    assert.match(evidence.summary,new RegExp(`retained JSON sha256=${rawDigest}`));
+    assert.match(evidence.summary,new RegExp(`Derived decoded UTF-8 result-text view: sha256=${textDigest}; bytes=${Buffer.byteLength(text)}`));
+    assert.match(evidence.summary,/not retained JSON or an original file, and adds no source-completeness or effect authority/);
+    assert.equal(result.contentDigest,rawDigest);assert.equal(result.rawByteCount,Buffer.byteLength(retainedJson));
+    assert.equal(result.shownByteCount,Buffer.byteLength(text));assert.equal(result.resultHandleId,handle);
+    assert.equal(result.physicalDispatchId,'dispatch:read:read_file');assert.equal(result.presentation,'decoded_text');
+    assert.equal(result.contentComplete,true);assert.equal(result.viewBounded,undefined);
+    assert.equal(Object.hasOwn(result,'decodedTextDigest'),false,'derived display labels add no machine evidence field');
+    if(text==='FIRST\nREMAINING\n'){assert.equal(result.rawByteCount,20);assert.equal(result.shownByteCount,16);}
+    assert.deepEqual(events.openEventLog().prepare('SELECT * FROM durable_result_handles WHERE handle_id=?').get(handle),beforeHandle);
+    assert.deepEqual(events.openEventLog().prepare('SELECT * FROM logical_call_settlements WHERE session_id=? AND source_user_seq=?').all(identity.sessionId,identity.sourceUserSeq),beforeSettlement);
+    assert.deepEqual(events.listEvents(identity.sessionId).map(row=>({id:row.id,data:row.data})),beforeEvents,
+      'rendering cannot mint a read, receipt, coverage claim or model event');
+  }
+});
+
+test('bounded, object, unknown-coverage, reader-control and write views keep JSON receipt scope without a derived text hash', () => {
+  const cases: Array<{tool:string;payload:unknown;mutating?:boolean;bounded?:boolean}>=[
+    {tool:'read_file',payload:'Wide quoted "text"\n'.repeat(4000),bounded:true},
+    {tool:'provider_list',payload:{records:[{id:'one',text:'small'}],next_page_token:'fixture-next'}},
+    {tool:'recall_tool_result',payload:'Authentic reader diagnostic, not a producer read'},
+    {tool:'write_file',payload:'Written successfully',mutating:true},
+  ];
+  for(const current of cases){
+    const identity=accepted('Inspect this exact retained call result.');
+    retainedRead(identity,current.tool,current.payload,current.mutating);
+    const evidence=sourceSettledReadEvidence(identity);const result=evidence.results[0]!;
+    assert.match(evidence.summary,/retained JSON sha256=/);
+    assert.doesNotMatch(evidence.summary,/Derived decoded UTF-8 result-text view/);
+    assert.equal(result.contentDigest,createHash('sha256').update(JSON.stringify(current.payload),'utf8').digest('hex'));
+    if(current.bounded){
+      assert.equal(result.viewBounded,true);assert.equal(result.contentComplete,false);
+      assert.equal(result.shownByteCount,Buffer.byteLength(readResultBlock(evidence.summary,current.tool)));
+      assert.match(evidence.summary,/Any review-evidence handle or digest in the bounded body\/footer below refers only to the retained JSON receipt/);
+    }
+    if(current.tool==='provider_list'){assert.equal(result.sourceExhausted,false);assert.equal(result.presentation,'raw_json');}
+    if(current.tool==='recall_tool_result'){assert.equal(result.evidenceKind,'control_diagnostic');assert.equal(result.sourceExhausted,undefined);}
+    if(current.mutating){assert.equal(result.recordCount,undefined);assert.equal(result.sourceExhausted,undefined);}
+  }
+});
+
+test('duplicate and prior-window receipts do not invent decoded digests for content they omit', () => {
+  const identity=accepted('Use each current exact retained observation.');const text='Exact "quoted" result\n';
+  retainedRead(identity,'read_file',text);retainedRead(identity,'fixture_second_read',text);
+  const whole=sourceSettledReadEvidence(identity);
+  assert.equal(whole.summary.split('Derived decoded UTF-8 result-text view:').length-1,1);
+  assert.equal(whole.results[1]?.contentDisposition,'duplicate_content');
+  assert.match(whole.summary,/same retained JSON bytes as/);
+  const prior=sourceSettledReadEvidence({...identity,afterSettlementIndex:whole.throughSettlementIndex});
+  assert.ok(prior.results.every(result=>result.contentDisposition==='prior_review_window'&&result.shownByteCount===0&&!result.contentComplete));
+  assert.doesNotMatch(prior.summary,/Derived decoded UTF-8 result-text view/);
+  assert.match(prior.summary,/retained JSON sha256=/);
+});
+
+test('a fully shown decoded provider text digest cannot turn unknown source coverage into exhaustion', () => {
+  const identity=accepted('Use exactly what this controlled provider returned.');
+  const text='Provider returned this exact "text"\n';
+  retainedRead(identity,'fixture_provider_text',text,false,false,false,{hostExecution:false});
+  events.closeEventLog();const evidence=sourceSettledReadEvidence(identity);const result=evidence.results[0]!;
+  assert.equal(readResultBlock(evidence.summary,'fixture_provider_text'),text);
+  assert.equal(result.contentComplete,true);assert.equal(result.viewBounded,undefined);
+  assert.equal(result.sourceExhausted,false,'complete display is distinct from unknown provider coverage');
+  assert.match(evidence.summary,/completeness=unknown/);
+  assert.match(evidence.summary,new RegExp(`Derived decoded UTF-8 result-text view: sha256=${createHash('sha256').update(text).digest('hex')}`));
+  assert.match(evidence.summary,/adds no source-completeness or effect authority/);
+  assert.equal(result.contentDigest,createHash('sha256').update(JSON.stringify(text)).digest('hex'));
+});
+
+test('one whole settled text body is the exact same scoped text available to the reviewer lookup', () => {
+  for (const text of ['FIRST\nREMAINING\n', 'Résumé\n🙂\n', '']) {
+    const identity = accepted('Inspect only this exact settled text, keeping its uncertainty.');
+    const handle = retainedRead(identity, 'read_file', text, false, false, false,
+      { args: { path: '/controlled/source-text.txt', max_chars: null } });
+    const db = events.openEventLog();
+    const retainedBefore = db.prepare('SELECT * FROM durable_result_handles WHERE handle_id=?').get(handle);
+    const settledBefore = db.prepare('SELECT * FROM logical_call_settlements WHERE session_id=? AND source_user_seq=?')
+      .all(identity.sessionId, identity.sourceUserSeq);
+    const eventsBefore = events.listEvents(identity.sessionId).map(row => ({ id: row.id, data: row.data }));
+    events.closeEventLog();
+    const evidence = sourceSettledReadEvidence({ ...identity, lookupBacked: true });
+    const row = evidence.results[0]!;
+    assert.equal(evidence.count, 1); assert.equal(row.status, 'verified');
+    assert.equal(row.evidenceKind, 'source_result'); assert.equal(row.sourceExhausted, true);
+    assert.equal(readResultBlock(evidence.summary, 'read_file'), text);
+    const lookup = sourceEvidenceLookup(identity);
+    assert.equal(lookup.resolve(row.logicalToolCallId!)?.text, text);
+    assert.equal(lookup.resolve(handle)?.text, text);
+    assert.equal(lookup.resolve(handle)?.value, text);
+    assert.match(evidence.summary, /opening this same logicalCall or handle returns this retained text again, not a new source observation/);
+    assert.match(evidence.summary, /Full display is not objective completion, proof of any other effect or permission/);
+    assert.equal(row.contentDigest, createHash('sha256').update(JSON.stringify(text)).digest('hex'));
+    assert.equal(row.rawByteCount, Buffer.byteLength(JSON.stringify(text)));
+    assert.equal(row.shownByteCount, Buffer.byteLength(text));
+    assert.equal(row.contentComplete, true); assert.equal(row.viewBounded, undefined);
+    assert.equal(Object.hasOwn(row, 'alreadySuppliedText'), false, 'the cue adds no machine evidence certificate');
+    assert.deepEqual(events.openEventLog().prepare('SELECT * FROM durable_result_handles WHERE handle_id=?').get(handle), retainedBefore);
+    assert.deepEqual(events.openEventLog().prepare('SELECT * FROM logical_call_settlements WHERE session_id=? AND source_user_seq=?')
+      .all(identity.sessionId, identity.sourceUserSeq), settledBefore);
+    assert.deepEqual(events.listEvents(identity.sessionId).map(item => ({ id: item.id, data: item.data })), eventsBefore,
+      'rendering and same-ref lookup neither mint a new source observation nor dispatch a model or tool');
+  }
+});
+
+test('partial, selected, control and unsupported text keep their original review inspection boundaries', () => {
+  const cases: Array<{ tool: string; payload: unknown; mutating?: boolean; hostExecution?: boolean }> = [
+    { tool: 'read_file', payload: 'Wide retained text\n'.repeat(4_000) },
+    { tool: 'read_file', payload: { text: 'A field is not a full primitive text result.' } },
+    { tool: 'read_file', payload: [{ type: 'image', mimeType: 'image/png', data: 'YQ==' }] },
+    { tool: 'recall_tool_result', payload: 'Reader control is not a source result.' },
+    { tool: 'agent_run_get', payload: 'A host control reply is not business read evidence.' },
+    { tool: 'write_file', payload: 'A settled write receipt.', mutating: true },
+    { tool: 'fixture_provider_text', payload: 'Provider coverage remains unknown.', hostExecution: false },
+  ];
+  for (const item of cases) {
+    const identity = accepted('Inspect exactly the evidence available; unknown content remains unknown.');
+    retainedRead(identity, item.tool, item.payload, item.mutating ?? false, false, false,
+      { hostExecution: item.hostExecution });
+    const evidence = sourceSettledReadEvidence({ ...identity, lookupBacked: true });
+    assert.doesNotMatch(evidence.summary, /Already supplied for this exact settled call:/, item.tool);
+    if (typeof item.payload === 'string' && item.payload.length < 1_000) {
+      assert.equal(sourceEvidenceLookup(identity).resolve(evidence.results[0]!.resultHandleId!)?.text, item.payload,
+        'absence of the cue does not remove the existing scoped lookup');
+    }
+  }
+  const producer = accepted('Only this producer owns the retained text.');
+  const handle = retainedRead(producer, 'read_file', 'Exact producer bytes.');
+  const foreign = accepted('An unrelated source cannot borrow that result.');
+  assert.equal(sourceEvidenceLookup(foreign).resolve(handle), undefined);
+  assert.doesNotMatch(sourceSettledReadEvidence(foreign).summary, /Already supplied for this exact settled call:|Exact producer bytes/);
+});
+
+test('earlier windows, delegated scopes, duplicates and reads preceding writes receive no full-text shortcut cue', () => {
+  const identity = accepted('Use only the exact applicable retained evidence.');
+  const text = 'Unchanged retained text.\n';
+  retainedRead(identity, 'read_file', text);
+  const whole = sourceSettledReadEvidence(identity);
+  const prior = sourceSettledReadEvidence({ ...identity, afterSettlementIndex: whole.throughSettlementIndex });
+  assert.doesNotMatch(prior.summary, /Already supplied for this exact settled call:/);
+  assert.ok(prior.results.every(row => row.contentDisposition === 'prior_review_window' && row.shownByteCount === 0));
+  const delegated = sourceSettledReadEvidence({ ...identity, includeWorkerResults: false, includeWriteReceipts: false });
+  assert.equal(readResultBlock(delegated.summary, 'read_file'), text);
+  assert.doesNotMatch(delegated.summary, /Already supplied for this exact settled call:/);
+  retainedRead(identity, 'fixture_second_read', text);
+  const repeated = sourceSettledReadEvidence(identity);
+  assert.equal(repeated.results[1]?.contentDisposition, 'duplicate_content');
+  assert.doesNotMatch(repeated.summary, /Already supplied for this exact settled call:/);
+  const changed = accepted('Do not confuse a prior read with evidence of a later write.');
+  retainedRead(changed, 'read_file', text);
+  retainedRead(changed, 'write_file', 'Saved after the read.', true);
+  const prewrite = sourceSettledReadEvidence(changed);
+  assert.equal(prewrite.results[0]?.precedesWrite, true);
+  assert.doesNotMatch(prewrite.summary, /Already supplied for this exact settled call:/);
+  const withoutWrites = sourceSettledReadEvidence({ ...changed, includeWriteReceipts: false });
+  assert.equal(withoutWrites.results.length, 1);
+  assert.equal(withoutWrites.results[0]?.precedesWrite, true);
+  assert.doesNotMatch(withoutWrites.summary, /Already supplied for this exact settled call:/);
 });
 
 test('corrupt retained read bytes cannot enter the judge as authenticated results', () => {
@@ -881,9 +1060,11 @@ test('large file and all Space components reach the actual completion request wi
 });
 
 async function runHost(options: { captured: boolean; incoming: boolean; text?: string; work?: boolean; reply?: string; firstReply?: string; secondReply?: string; abortAtJudge?: boolean; policyData?: Record<string, unknown>; readResult?: unknown; afterCapture?: () => void;
+  resilient?: boolean; plan?: boolean; checkIn?: boolean; abortBeforeResponse?: boolean;
+  onModelCall?: () => void;
   beforeResponse?: (identity: ReturnType<typeof accepted>) => void;
   queuedApprovalHook?: import('./loop.js').HostQueuedApprovalBeforeCompletion;
-  firstVerdict?: { done: boolean; reason: string; blocked?: boolean };
+  firstVerdict?: import('./objective-judge.js').ObjectiveJudgeVerdict;
   /** An earlier turn in the same session that settled one read. */
   earlierTurn?: { text: string; tool: string; payload: unknown; args?: Record<string, unknown> } }) {
   const earlier = options.earlierTurn ? accepted(options.earlierTurn.text) : undefined;
@@ -891,7 +1072,10 @@ async function runHost(options: { captured: boolean; incoming: boolean; text?: s
     retainedRead(earlier, options.earlierTurn.tool, options.earlierTurn.payload, false, false, false,
       { id: `earlier:${options.earlierTurn.tool}`, args: options.earlierTurn.args ?? {} });
   }
-  const identity = accepted(options.text, earlier?.sessionId);
+  const identity = accepted(options.text, earlier?.sessionId, options.plan);
+  const runAttempt = options.resilient ? events.beginRunAttempt(identity.sessionId,
+    { runId: `exact-fence-${serial}`, attemptId: `attempt:exact-fence-${serial}` }) : undefined;
+  if (runAttempt) events.bindRunAttemptSourceUserEvent(runAttempt, identity.sourceUserSeq);
   if (options.policyData) {
     events.appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'completion_policy_captured',
       data: { ...options.policyData, sourceUserSeq: identity.sourceUserSeq } });
@@ -909,22 +1093,33 @@ async function runHost(options: { captured: boolean; incoming: boolean; text?: s
       : { done: true, reason: 'The bounded lookup returned no accessible posts, accurately reported.' };
   });
   let calls = 0;
-  const model = {
-    async getResponse() {
+  const modelInputs: unknown[] = [];
+  const originalResponses: unknown[] = [];
+  const innerModel = {
+    async getResponse(request?: { input?: unknown }) {
+      modelInputs.push(request?.input);
       calls += 1;
+      options.onModelCall?.();
       if (calls === 1) options.beforeResponse?.(identity);
+      if (calls === 1 && options.abortBeforeResponse) signal.abort();
       if (calls === 1 && options.readResult !== undefined) {
         retainedRead(identity, 'read_file', options.readResult, false, true);
       }
       const text = options.reply ?? (calls === 1 ? options.firstReply ?? promise : options.secondReply ?? 'The lookup returned no accessible posts. No report data was changed.');
       return { responseId: `reply-${serial}-${calls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }] };
     },
-    async *getStreamedResponse() {
-      const response = await this.getResponse();
+    async *getStreamedResponse(request?: { input?: unknown }) {
+      const response = await this.getResponse(request);
+      const original = { id: response.responseId, usage: response.usage, output: response.output };
+      originalResponses.push(original);
       yield { type: 'response_started' } as never;
-      yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
+      yield { type: 'response_done', response: original } as never;
     },
   };
+  const { ResilientModel } = await import('./resilient-model.js');
+  const { resolveModelCapability } = await import('./model-wire-registry.js');
+  const model = options.resilient ? new ResilientModel(innerModel as never,
+    { label: 'exact-fence-fixture', capability: resolveModelCapability('claude-sonnet-5'), maxRetries: 0 }) : innerModel;
   const agent = { model, tools: [] };
   const prior = catalogs.peekHostCapabilityCatalogFactory();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
@@ -935,13 +1130,190 @@ async function runHost(options: { captured: boolean; incoming: boolean; text?: s
     envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
     envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
     const runner = Object.assign(new EventEmitter(), { run() { throw new Error('Legacy runner must not execute'); } });
-    const outcome = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(20) }, () => host.hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: options.text ?? request }] as never, { maxTurns: 4, hostTurnEngine: 'host_v1', hostJudgeCompletion: options.incoming, hostQueuedApprovalBeforeCompletion: options.queuedApprovalHook, context: identity, signal: signal.signal } as never));
-    return { identity, outcome, calls, judged };
+    const outcome = await brackets.withHarnessRunContext({ ...identity,
+      ...(runAttempt ? { runAttemptId: runAttempt.attemptId } : {}), counter: new brackets.ToolCallsCounter(20) }, () => host.hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: options.text ?? request }] as never, { maxTurns: 4, hostTurnEngine: 'host_v1', hostJudgeCompletion: options.incoming, hostQueuedApprovalBeforeCompletion: options.queuedApprovalHook,
+        ...(options.checkIn ? { hostConversationalCheckIn: true } : {}), context: identity, signal: signal.signal } as never));
+    return { identity, outcome, calls, judged, modelInputs, originalResponses };
   } finally {
     host._setHostObjectiveJudgeForTests(null);
     catalogs.installHostCapabilityCatalogFactory(prior);
   }
 }
+
+test('host completion journals bounded author comparison diagnostics without revising legacy verdict or candidate joins', async () => {
+  const reply = 'The controlled report value is present.';
+  for (const comparison of [undefined,
+    { selfJudgeBasis: 'implicit_brain_route_unknown' as const, servedAuthorQualification: 'unknown' as const },
+    { selfJudgeBasis: 'provided_author_route' as const, servedAuthorQualification: 'unknown' as const }]) {
+    const run = await runHost({ captured: true, incoming: true,
+      text: 'Update the controlled report summary from the retained fixture read.', reply, readResult: 'CONTROLLED_REPORT_VALUE',
+      firstVerdict: { done: true, reason: 'The controlled report value is supported.', selfJudge: true, ...comparison } });
+    assert.equal(run.calls, 1);
+    assert.equal(run.judged.length, 1);
+    assert.equal(run.judged[0]!.reply, reply);
+    assert.equal(run.outcome.finalOutput, reply);
+    const rows = events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] });
+    assert.equal(rows.length, 1);
+    const row = rows[0]!;
+    assert.equal(row.data.sourceUserSeq, run.identity.sourceUserSeq);
+    assert.equal(row.data.replyDigest, createHash('sha256').update(reply).digest('hex'));
+    assert.equal(row.data.fulfills, true);
+    assert.equal(row.data.selfJudge, true, 'the legacy comparison is not rewritten');
+    assert.equal(row.data.selfJudgeBasis, comparison?.selfJudgeBasis ?? 'unavailable');
+    assert.equal(row.data.servedAuthorQualification, 'unknown', 'a mock diagnostic is never served-author proof');
+  }
+});
+
+test('host mock accessor diagnostics are not invoked or promoted into a served-author claim', async () => {
+  let hooks = 0;
+  const verdict = Object.defineProperty({ done: true, reason: 'Controlled report fixture verdict.' }, 'selfJudgeBasis',
+    { get() { hooks += 1; throw new Error('must not run'); } });
+  const run = await runHost({ captured: true, incoming: true, reply: 'The controlled report value is present.',
+    text: 'Update the controlled report summary from the retained fixture read.', readResult: 'CONTROLLED_REPORT_VALUE', firstVerdict: verdict });
+  assert.equal(run.calls, 1);
+  assert.equal(hooks, 0);
+  const row = events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] })[0]!;
+  assert.equal(row.data.selfJudgeBasis, 'unavailable');
+  assert.equal(row.data.servedAuthorQualification, 'unknown');
+  assert.equal(row.data.fulfills, true);
+});
+
+test('actual ResilientModel host path reviews and delivers the same exact inner object without another model call', async () => {
+  const inner = '{"value":"CONTROLLED_REPORT_VALUE","qualification":"unknown","unicode":"é"}';
+  const raw = `\`\`\`json\n${inner}\n\`\`\``;
+  const run = await runHost({ captured: true, incoming: true, resilient: true,
+    text: 'Update the controlled report summary from the retained fixture read. Return exactly one JSON object with its value and qualification.',
+    firstReply: raw, readResult: 'CONTROLLED_REPORT_VALUE', firstVerdict: { done: true, reason: 'The exact report value and unknown qualification are retained.' } });
+  assert.equal(run.calls, 1);
+  assert.equal(run.judged.length, 1, JSON.stringify({ terminal: run.outcome.terminal, finalOutput: run.outcome.finalOutput,
+    eventKinds: events.listEvents(run.identity.sessionId).map(row => [row.type, row.data.kind, row.data.reason]) }));
+  assert.equal(run.judged[0]!.reply, inner);
+  assert.equal(run.outcome.finalOutput, inner);
+  const original = run.originalResponses[0] as { output: Array<{ content: Array<{ text: string }> }> };
+  assert.equal(original.output[0]!.content[0]!.text, raw, 'the original SDK response was not edited');
+  const { completedModelResponseBinding } = await import('./model-response-binding.js');
+  const binding = completedModelResponseBinding(original);
+  assert.ok(binding, 'production resilience produced a nominal original response, not an aggregate clone');
+  const row = events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] })[0]!;
+  const proof = row.data.responseNormalization as Record<string, unknown>;
+  assert.equal(proof.modelCallId, binding.modelCallId);
+  assert.equal(proof.originalReplyDigest, createHash('sha256').update(raw).digest('hex'));
+  assert.equal(proof.normalizedReplyDigest, createHash('sha256').update(inner).digest('hex'));
+  assert.equal(row.data.replyDigest, proof.normalizedReplyDigest);
+  assert.deepEqual(row.data.responseFormatContract, { kind: 'whole_json_object', candidateValid: true });
+});
+
+test('a private normalization preserves format-floor review for a simple lookup without function history', async () => {
+  const raw = '```json\n{"value":"CONTROLLED_LOOKUP_VALUE"}\n```';
+  const run = await runHost({ captured: true, incoming: true, resilient: true, work: false,
+    text: 'Return exactly one JSON object with the controlled lookup value.', firstReply: raw,
+    firstVerdict: { done: true, reason: 'Controlled lookup fixture verdict.' } });
+  assert.equal(run.calls, 1);
+  assert.equal(run.judged.length, 1, 'removing the format violation must not waive its existing review floor');
+  assert.equal(run.judged[0]!.reply, '{"value":"CONTROLLED_LOOKUP_VALUE"}');
+  assert.equal(run.outcome.finalOutput, run.judged[0]!.reply);
+  assert.ok(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] })[0]!.data.responseNormalization);
+});
+
+test('disabled or unreadable captured review policy cannot authorize normalization', async () => {
+  for (const policyData of [undefined, { version: 2, enabled: 'unreadable' }]) {
+    const raw = '```json\n{"value":"CONTROLLED_POLICY_VALUE"}\n```';
+    const run = await runHost({ captured: false, incoming: true, resilient: true, work: false, policyData,
+      text: 'Return exactly one JSON object with the controlled value.', firstReply: raw });
+    assert.equal(run.calls, 1);
+    assert.equal(run.judged.length, 0);
+    const original = run.originalResponses[0] as { output: Array<{ content: Array<{ text: string }> }> };
+    assert.equal(original.output[0]!.content[0]!.text, raw);
+    assert.ok(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] })
+      .every(row => row.data.responseNormalization === undefined));
+  }
+});
+
+test('a tool-free conversational check-in retains its existing no-review path without normalization', async () => {
+  const raw = '```json\n{"value":"CONTROLLED_CHECK_IN_VALUE"}\n```';
+  const run = await runHost({ captured: true, incoming: true, resilient: true, work: false, checkIn: true,
+    text: 'Return exactly one JSON object with the controlled value.', firstReply: raw });
+  assert.equal(run.calls, 1);
+  assert.equal(run.judged.length, 0);
+  assert.equal(run.outcome.finalOutput, raw);
+  const original = run.originalResponses[0] as { output: Array<{ content: Array<{ text: string }> }> };
+  assert.equal(original.output[0]!.content[0]!.text, raw);
+  assert.equal(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] }).length, 0);
+});
+
+test('a normalized object still undergoes semantic rejection and a revised candidate is reviewed normally', async () => {
+  const raw = '```json\n{"unsupported":"WRONG_CONTROLLED_CLAIM"}\n```';
+  const run = await runHost({ captured: true, incoming: true, resilient: true,
+    text: 'Update the controlled report summary from the retained fixture read. Return exactly one JSON object.', firstReply: raw, secondReply: '{"value":"SUPPORTED_CONTROLLED_VALUE"}',
+    readResult: 'SUPPORTED_CONTROLLED_VALUE', firstVerdict: { done: false, reason: 'The report contradicts the claimed value.' } });
+  assert.equal(run.judged[0]!.reply, '{"unsupported":"WRONG_CONTROLLED_CLAIM"}');
+  assert.equal(run.calls, 2);
+  assert.equal(run.judged.length, 2);
+  assert.equal(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] })[0]!.data.fulfills, false);
+});
+
+test('actual host leaves ambiguous envelopes and non-owner format requests unchanged', async () => {
+  for (const [text, raw] of [
+    ['Describe this quoted command: "Return only one JSON object."', '```json\n{}\n```'],
+    ['Return only one JSON object. Instead, reply in Markdown.', '```json\n{}\n```'],
+    ['Update the controlled report summary from the retained fixture read. Return exactly one JSON object.', 'Prose.\n```json\n{}\n```'],
+    ['Update the controlled report summary from the retained fixture read. Return exactly one JSON object.', '```json\n[]\n```'],
+    ['Update the controlled report summary from the retained fixture read. Return exactly one JSON object.', '```json\n{}\n```\n```json\n{}\n```'],
+  ]) {
+    const run = await runHost({ captured: true, incoming: true, resilient: true,
+      text, firstReply: raw, secondReply: '{}', readResult: 'CONTROLLED_REPORT_VALUE', firstVerdict: { done: true, reason: 'Controlled fixture verdict.' } });
+    if (run.judged.length) assert.equal(run.judged[0]!.reply, raw);
+    assert.equal(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] })[0]?.data.responseNormalization, undefined);
+  }
+});
+
+test('an adopted owner amendment arriving during the SDK call invalidates its earlier normalization authority', async () => {
+  const raw = '```json\n{"value":"CONTROLLED_AMENDED_VALUE"}\n```';
+  const run = await runHost({ captured: true, incoming: true, resilient: true,
+    text: 'Update the controlled report summary from the retained fixture read. Return exactly one JSON object.',
+    firstReply: raw, readResult: 'CONTROLLED_AMENDED_VALUE',
+    beforeResponse(identity) {
+      const note = events.appendEvent({ sessionId: identity.sessionId, turn: 1, role: 'user',
+        type: 'user_steer_note', data: { text: 'Instead, reply in Markdown.' } });
+      events.appendEvent({ sessionId: identity.sessionId, turn: 1, role: 'system',
+        type: 'user_steer_note_delivered', data: { sourceUserSeq: identity.sourceUserSeq, noteSeqs: [note.seq] } });
+    }, firstVerdict: { done: true, reason: 'Controlled amended fixture verdict.' } });
+  assert.equal(run.calls, 1);
+  assert.ok(run.judged[0]!.objective.includes('Instead, reply in Markdown.'));
+  assert.equal(run.judged[0]!.reply, raw);
+  assert.equal(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] })[0]!.data.responseNormalization, undefined);
+});
+
+test('missing nominal producer proof preserves the ordinary fenced reply and a Stop at review starts no new request', async () => {
+  const raw = '```json\n{}\n```';
+  const unbound = await runHost({ captured: true, incoming: true,
+    text: 'Update the controlled report summary from the retained fixture read. Return exactly one JSON object.', firstReply: raw, secondReply: '{}',
+    readResult: 'CONTROLLED_REPORT_VALUE', firstVerdict: { done: true, reason: 'Controlled fixture verdict.' } });
+  assert.equal(unbound.judged[0]!.reply, raw);
+  assert.equal(events.listEvents(unbound.identity.sessionId, { types: ['goal_alignment_judged'] })[0]!.data.responseNormalization, undefined);
+  let stoppedCalls = 0;
+  let stoppedIdentity: ReturnType<typeof accepted> | undefined;
+  await assert.rejects(runHost({ captured: true, incoming: true, resilient: true, abortAtJudge: true,
+    onModelCall: () => { stoppedCalls += 1; }, beforeResponse: identity => { stoppedIdentity = identity; },
+    text: 'Update the controlled report summary from the retained fixture read. Return exactly one JSON object.', firstReply: raw, readResult: 'CONTROLLED_REPORT_VALUE', firstVerdict: { done: true, reason: 'Controlled fixture verdict.' } }),
+    /pending kill request/);
+  assert.equal(stoppedCalls, 1);
+  assert.equal(events.listEvents(stoppedIdentity!.sessionId, { types: ['goal_alignment_judged'] }).length, 1);
+});
+
+test('actual Plan and decision-schema carriers never acquire outer-fence normalization', async () => {
+  for (const plan of [true, false]) {
+    const raw = plan ? '```json\n{"plan":"CONTROLLED_PLAN_DRAFT"}\n```'
+      : '```json\n{"summary":"CONTROLLED_DECISION_SUMMARY","nextAction":"completed","reply":"CONTROLLED_DECISION_REPLY","done":true,"reason":null}\n```';
+    const run = await runHost({ captured: true, incoming: true, resilient: true, plan,
+      text: 'Update the controlled report summary from the retained fixture read. Return exactly one JSON object.', firstReply: raw, secondReply: '{}',
+      readResult: 'CONTROLLED_REPORT_VALUE', firstVerdict: { done: true, reason: 'Controlled fixture verdict.' } });
+    const rows = events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] });
+    assert.ok(rows.every(row => row.data.responseNormalization === undefined));
+    const original = run.originalResponses[0] as { output: Array<{ content: Array<{ text: string }> }> };
+    assert.equal(original.output[0]!.content[0]!.text, raw);
+  }
+});
 
 test('failed queue registration retains ordinary required completion review and its truthful source evidence', async () => {
   const result = await runHost({ captured: true, incoming: true,
@@ -1073,6 +1445,120 @@ test('captured OFF makes zero judge calls despite incoming ON', async () => {
   assert.equal(result.calls, 1);
 });
 
+test('captured OFF preserves valid whole JSON or no explicit format with one answer and zero reviews or repairs', async () => {
+  for (const [text, reply, hasFormat] of [
+    ['Return exactly one JSON object with the value and uncertainty.', '{"value":"CONTROLLED_OFF_VALUE","uncertainty":"unknown"}', true],
+    ['Explain the controlled value and its uncertainty.', 'The controlled value is retained; its completeness is unknown.', false],
+    ['Return only one JSON object. Instead, reply in plain text.', 'The controlled value is retained; its completeness is unknown.', false],
+  ] as const) {
+    const run = await runHost({ captured: false, incoming: true, resilient: true, work: false, text, reply });
+    assert.equal(run.calls, 1);
+    assert.equal(run.judged.length, 0);
+    assert.equal(run.outcome.terminal, undefined);
+    assert.equal(run.outcome.finalOutput, reply);
+    assert.equal(JSON.stringify(run.modelInputs).includes('FINAL ANSWER FORMAT'), hasFormat);
+    assert.equal(events.listEvents(run.identity.sessionId, { types: ['tool_called', 'goal_alignment_judged'] }).length, 0);
+    assert.ok(!events.listEvents(run.identity.sessionId).some(row => row.data.kind === 'response_format_repair'));
+    const policy = host.readCapturedCompletionPolicy(run.identity);
+    assert.equal(policy.status, 'captured');
+    if (policy.status === 'captured') assert.equal(policy.policy.enabled, false);
+  }
+});
+
+test('captured OFF holds a whole-answer format violation without extracting contrary prose or buying another call', async () => {
+  const raw = '```json\n{"value":"CONTROLLED_OFF_VALUE"}\n```\nIts completeness is unknown; do not treat it as complete.';
+  const run = await runHost({ captured: false, incoming: true, resilient: true, work: false,
+    text: 'Report the retained controlled value and qualification. Return exactly one JSON object.',
+    reply: raw, readResult: 'CONTROLLED_OFF_VALUE' });
+  assert.equal(run.calls, 1);
+  assert.equal(run.judged.length, 0);
+  assert.deepEqual(run.outcome.terminal, { status: 'blocked', reason: 'owner_response_format_unmet' });
+  assert.match(String(run.outcome.finalOutput), /does not meet your requested output format/);
+  assert.match(String(run.outcome.finalOutput), /This task is not complete/);
+  assert.ok(JSON.stringify(run.outcome.history).includes(JSON.stringify(raw).slice(1, -1)), 'the full raw draft and qualification stay in admitted history');
+  const original = run.originalResponses[0] as { output: Array<{ content: Array<{ text: string }> }> };
+  assert.equal(original.output[0]!.content[0]!.text, raw, 'original SDK bytes are unchanged');
+  assert.equal(sourceSettledReadEvidence(run.identity).results.length, 1, 'the exact settled read stays retained');
+  assert.equal(host.isNarratableHostStop(run.outcome), false, 'this hold cannot buy a Stop narration call');
+  assert.equal(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged', 'tool_called'] }).length, 0);
+  const guides = events.listEvents(run.identity.sessionId, { types: ['guardrail_tripped'] });
+  assert.equal(guides.filter(row => row.data.kind === 'owner_response_format_hold').length, 1);
+  assert.equal(guides.filter(row => row.data.kind === 'response_format_repair').length, 0);
+  const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(run.identity), identity: run.identity,
+    status: 'blocked', resumable: true, presentation: { kind: 'blocked', text: String(run.outcome.finalOutput) } });
+  assert.equal(committed.presentation.status, 'blocked');
+  assert.equal((committed.event.data.completionReview as { disposition?: string }).disposition, 'disabled_by_owner');
+  assert.equal(committed.event.data.completionVerdictRef, undefined);
+});
+
+test('captured OFF never borrows an earlier format after an adopted cancellation or for check-in and ASK controls', async () => {
+  const raw = 'The value is uncertain; this is not the old JSON deliverable.';
+  const amended = await runHost({ captured: false, incoming: true, resilient: true, work: false,
+    text: 'Return exactly one JSON object.', reply: raw, beforeResponse(identity) {
+      const note = events.appendEvent({ sessionId: identity.sessionId, turn: 1, role: 'user',
+        type: 'user_steer_note', data: { text: 'Instead, reply in plain text.' } });
+      events.appendEvent({ sessionId: identity.sessionId, turn: 1, role: 'system', type: 'user_steer_note_delivered',
+        data: { sourceUserSeq: identity.sourceUserSeq, noteSeqs: [note.seq] } });
+    } });
+  assert.equal(amended.calls, 1);
+  assert.equal(amended.outcome.terminal, undefined);
+  assert.equal(amended.outcome.finalOutput, raw);
+  assert.equal(amended.judged.length, 0);
+  for (const options of [{ checkIn: true, reply: raw }, { reply: 'ASK: Which controlled value should I report?' },
+    { plan: true, reply: raw }]) {
+    const run = await runHost({ captured: false, incoming: true, resilient: true, work: false,
+      text: 'Return exactly one JSON object.', ...options });
+    assert.equal(run.calls, 1);
+    assert.equal(run.judged.length, 0);
+    assert.notEqual(run.outcome.terminal?.reason, 'owner_response_format_unmet');
+    assert.ok(!events.listEvents(run.identity.sessionId).some(row => row.data.kind === 'owner_response_format_hold'));
+  }
+});
+
+test('an already-adopted current JSON amendment under OFF cannot waive the format floor through snapshot drift', async () => {
+  const raw = '```json\n{"value":"CONTROLLED_AMENDED_OFF_VALUE"}\n```\nIts completeness remains unknown.';
+  const run = await runHost({ captured: false, incoming: true, resilient: true, work: false,
+    text: 'Return exactly one JSON object.', reply: raw, beforeResponse(identity) {
+      const note = events.appendEvent({ sessionId: identity.sessionId, turn: 1, role: 'user', type: 'user_steer_note',
+        data: { text: 'Return exactly one JSON object and retain the uncertainty qualification.' } });
+      events.appendEvent({ sessionId: identity.sessionId, turn: 1, role: 'system', type: 'user_steer_note_delivered',
+        data: { sourceUserSeq: identity.sourceUserSeq, noteSeqs: [note.seq] } });
+    } });
+  assert.equal(run.calls, 1);
+  assert.equal(run.judged.length, 0);
+  assert.deepEqual(run.outcome.terminal, { status: 'blocked', reason: 'owner_response_format_unmet' });
+  assert.equal(host.isNarratableHostStop(run.outcome), false);
+  assert.ok(JSON.stringify(run.outcome.history).includes(JSON.stringify(raw).slice(1, -1)));
+  assert.equal(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged', 'tool_called'] }).length, 0);
+  assert.ok(!events.listEvents(run.identity.sessionId).some(row => row.data.kind === 'response_format_repair'));
+});
+
+test('missing exact attempt capture under OFF holds an explicit format obligation as unqualified without another call', async () => {
+  const raw = '```json\n{"value":"CONTROLLED_UNKNOWN_OWNER_VALUE"}\n```\nNo source completeness was proved.';
+  const run = await runHost({ captured: false, incoming: true, resilient: false, work: false,
+    text: 'Return exactly one JSON object with the value and qualifications.', reply: raw });
+  assert.equal(run.calls, 1);
+  assert.equal(run.judged.length, 0);
+  assert.deepEqual(run.outcome.terminal, { status: 'blocked', reason: 'owner_response_format_unqualified' });
+  assert.equal(host.isNarratableHostStop(run.outcome), false);
+  assert.match(String(run.outcome.finalOutput), /could not verify the current output requirements/);
+  assert.ok(JSON.stringify(run.outcome.history).includes(JSON.stringify(raw).slice(1, -1)));
+  assert.ok(!JSON.stringify(run.modelInputs).includes('FINAL ANSWER FORMAT'), 'unqualified owner cannot grant author guidance');
+  assert.equal(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged', 'tool_called'] }).length, 0);
+  assert.ok(!events.listEvents(run.identity.sessionId).some(row => row.data.kind === 'response_format_repair'));
+});
+
+test('Stop during a captured-OFF answer spends no format, review or narration continuation', async () => {
+  let calls = 0;
+  let identity: ReturnType<typeof accepted> | undefined;
+  await assert.rejects(runHost({ captured: false, incoming: true, resilient: true, work: false,
+    text: 'Return exactly one JSON object.', reply: '```json\n{}\n```\nUnknown.', abortBeforeResponse: true,
+    onModelCall: () => { calls += 1; }, beforeResponse: current => { identity = current; } }), /pending kill request|abort/i);
+  assert.equal(calls, 1);
+  assert.equal(events.listEvents(identity!.sessionId, { types: ['goal_alignment_judged', 'tool_called'] }).length, 0);
+  assert.ok(!events.listEvents(identity!.sessionId).some(row => row.data.kind === 'owner_response_format_hold'));
+});
+
 test('captured ON remains eligible despite incoming OFF after re-entry', async () => {
   const result = await runHost({ captured: true, incoming: false });
   assert.equal(result.judged.length, 1);
@@ -1145,9 +1631,121 @@ test('writes that did not complete and calls refused before they ran are evidenc
   const summary = sourceIncompleteAttemptsEvidence(identity) ?? '';
   assert.match(summary, /write calendar_update_event \[logicalCall=read:calendar_update_event\] settled invalid_arguments/);
   assert.match(summary, /returned: Event id is not valid for update\./);
-  assert.match(summary, /refused before it ran \(host_disposition:refused_pre_dispatch\) for calendar_update_event: The reviewed call does not match the planned operation\./);
+  assert.match(summary, /host recorded frame-admission refusal \(host_disposition:refused_pre_dispatch\) for calendar_update_event: The reviewed call does not match the planned operation\./);
+  assert.match(summary, /"kind":"frame_admission_observation"/);
+  assert.match(summary, /"noDispatchEvidence":"not_established"/);
+  assert.match(summary, /"currentExecutionAuthority":null/);
   assert.doesNotMatch(summary, /UNRELATED_REFUSAL/);
   assert.equal(sourceIncompleteAttemptsEvidence(accepted('Nothing attempted.')), undefined);
+});
+
+test('a real refused zero-crossing write carries only exact call no-dispatch evidence, not fresh effect authority', () => {
+  const identity = accepted('Update the controlled fixture record.');
+  const exact = { ...identity, acceptedTaskId: identities.acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq),
+    logicalToolCallId: 'fixture:refused-write' };
+  assert.ok(shadow.recordTurnGraphShadow({ identity: exact }));
+  const args = { target: 'controlled-target' };
+  assert.equal(dispatch.admitLogicalCall({ identity: exact, tool: 'fixture_write', args }).status, 'inserted');
+  const committed = settlements.commitLogicalCallSettlement({ identity: exact,
+    contract: { toolName: 'fixture_write', args }, execution: { kind: 'refused_pre_dispatch' },
+    outcome: outcomes.classifyAttemptOutcome({ preDispatch: true, policyRefused: true }),
+    recovery: { businessCall: true, mutating: true }, observer: { lane: 'byo' } });
+  assert.equal(committed.status, 'committed');
+  const summary = sourceIncompleteAttemptsEvidence(identity) ?? '';
+  assert.match(summary, /"proof":"exact_settlement_verified"/);
+  assert.match(summary, /"noDispatchEvidence":"this_exact_call_zero_crossings"/);
+  assert.match(summary, /"crossings":\{"external":0,"host":0\}/);
+  assert.match(summary, /"provider":null,"account":null,"providerOperation":null,"target":null,"currentExecutionAuthority":null/);
+  assert.doesNotMatch(summary, /controlled-target/, 'scope presentation does not fetch request payload or infer target authority');
+});
+
+test('tampered incomplete settlement cannot acquire zero-crossing proof and keeps its original diagnostic', () => {
+  const identity = accepted('Update the controlled fixture record.');
+  retainedRead(identity, 'fixture_write', { error: 'CONTROLLED_FAILED_WRITE' }, true, false, true);
+  const db = events.openEventLog();
+  const rollback = new Error('rollback controlled tamper');
+  assert.throws(db.transaction(() => {
+    const triggers = db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='logical_call_settlements'").all() as Array<{ name: string }>;
+    for (const { name } of triggers) db.exec(`DROP TRIGGER "${name.replace(/"/g, '""')}"`);
+    db.prepare("UPDATE logical_call_settlements SET execution_kind='refused_pre_dispatch', physical_crossing_count=0,host_crossing_count=0 WHERE session_id=? AND source_user_seq=?")
+      .run(identity.sessionId, identity.sourceUserSeq);
+    const summary = sourceIncompleteAttemptsEvidence(identity) ?? '';
+    assert.match(summary, /settled invalid_arguments/);
+    assert.match(summary, /"proof":"unavailable"/);
+    assert.match(summary, /"noDispatchEvidence":"not_established"/);
+    assert.doesNotMatch(summary, /"noDispatchEvidence":"this_exact_call_zero_crossings"/);
+    throw rollback;
+  }), error => error === rollback);
+});
+
+test('identical refusal words retain distinct recorded occurrences without becoming operation proof', () => {
+  const identity = accepted('Explain the controlled blocked call.');
+  const data = { kind: 'refused_pre_dispatch', sourceUserSeq: identity.sourceUserSeq,
+    stage: 'host_disposition:refused_pre_dispatch', refusalDetail: 'CONTROLLED_REPEATED_REFUSAL' };
+  const first = events.appendEvent({ ...identity, role: 'system', type: 'guardrail_tripped',
+    data: { ...data, runAttemptId: 'attempt:first' } });
+  const second = events.appendEvent({ ...identity, role: 'system', type: 'guardrail_tripped',
+    data: { ...data, runAttemptId: 'attempt:second' } });
+  const summary = sourceIncompleteAttemptsEvidence(identity) ?? '';
+  assert.equal(summary.split('CONTROLLED_REPEATED_REFUSAL').length - 1, 2);
+  assert.ok(summary.includes(first.id) && summary.includes(second.id));
+  assert.match(summary, /"recordedAttemptId":"attempt:first"/);
+  assert.match(summary, /"recordedAttemptId":"attempt:second"/);
+  assert.equal(summary.split('"noDispatchEvidence":"not_established"').length - 1, 2);
+  assert.match(summary, /"crossSourceLogicalEffect":null/);
+});
+
+test('reviewer historical findings do not embed the rejected draft, while generator repair feedback remains whole', () => {
+  const previousReply = '```json\n{"obsolete":"CONTROLLED_REJECTED_DRAFT"}\n```\nCONTROLLED_OLD_TRAILING_PROSE';
+  const currentReply = '{"current":"CONTROLLED_VALID_CANDIDATE"}';
+  const objective = 'Return exactly one JSON object explaining the controlled evidence.';
+  const feedback = { version: 1 as const, sessionId: 'fixture-feedback-view', sourceUserSeq: 17,
+    objective, objectiveDigest: createHash('sha256').update(objective).digest('hex'),
+    reply: previousReply, replyDigest: createHash('sha256').update(previousReply).digest('hex'),
+    reason: 'REVISE_REPLY: The earlier draft has code fences and trailing prose; return only the JSON object.' };
+  const finding = host.hostCompletionReviewFindingContext(feedback);
+  const sourceEvidence = 'CONTROLLED_CONTRARY_TOOL_EVIDENCE\nCONTROLLED_VISUAL_EVIDENCE\nCONTROLLED_EFFECT_EVIDENCE';
+  const prompt = buildObjectiveJudgePrompt(objective, currentReply, {
+    skills: [], agentInstructions: 'CONTROLLED_STANDING_INSTRUCTION', fullSourceEvidence: true,
+    toolCallSummary: sourceEvidence + '\n' + finding,
+  });
+  assert.ok(prompt.includes(currentReply));
+  for (const evidence of [objective, sourceEvidence, 'CONTROLLED_STANDING_INSTRUCTION', feedback.reason,
+    feedback.objectiveDigest, feedback.replyDigest]) assert.ok(prompt.includes(evidence));
+  assert.match(prompt, /current candidate response above is the sole response being judged/);
+  assert.doesNotMatch(prompt, /CONTROLLED_REJECTED_DRAFT|CONTROLLED_OLD_TRAILING_PROSE|```json/);
+  assert.ok(host.hostCompletionReviewFeedbackContext(feedback).includes(JSON.stringify(feedback)),
+    'generator retains the complete previous draft, objective and finding for repair');
+  assert.match(host.hostCompletionReviewFeedbackContext(feedback), /Fix every numbered item/);
+  assert.match(prompt, /=== END OF CANDIDATE RESPONSE ===/);
+  const planFinding = host.hostCompletionReviewFindingContext({ ...feedback, phase: 'plan' });
+  assert.match(planFinding, /"phase":"plan"/);
+  assert.ok(planFinding.includes(feedback.reason));
+});
+
+test('actual second-candidate host review sees current JSON and historical finding without old draft while repair input keeps it', async () => {
+  const previousReply = '```json\n{"obsolete":"CONTROLLED_HOST_OLD_DRAFT"}\n```\nCONTROLLED_HOST_TRAILING_PROSE';
+  const currentReply = '{"current":"CONTROLLED_HOST_VALID_JSON"}';
+  const run = await runHost({ captured: true, incoming: true,
+    text: 'Update the controlled report summary to include every retained fixture record. Return exactly one JSON object.',
+    readResult: 'CONTROLLED_HOST_RETAINED_READ_EVIDENCE', firstReply: previousReply, secondReply: currentReply,
+    firstVerdict: { done: false, reason: 'The earlier candidate uses code fences and trailing prose.' } });
+  assert.equal(run.calls, 2, JSON.stringify({ judged: run.judged.length, terminal: run.outcome.terminal,
+    verdicts: events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] }).map(row => ({
+      fulfills: row.data.fulfills, continuation: row.data.continuation, blocked: row.data.blocked, failedOpen: row.data.failedOpen })) }));
+  assert.equal(run.judged.length, 2);
+  assert.equal(run.judged[0]!.reply, previousReply); assert.equal(run.judged[1]!.reply, currentReply);
+  const reviewEvidence = run.judged[1]!.evidence ?? '';
+  assert.match(reviewEvidence, /HISTORICAL COMPLETION FINDING/);
+  assert.match(reviewEvidence, /sole response being judged/);
+  assert.match(reviewEvidence, /CONTROLLED_HOST_RETAINED_READ_EVIDENCE/);
+  assert.ok(reviewEvidence.includes(createHash('sha256').update(previousReply).digest('hex')));
+  assert.doesNotMatch(reviewEvidence, /CONTROLLED_HOST_OLD_DRAFT|CONTROLLED_HOST_TRAILING_PROSE/);
+  const generatorInput = JSON.stringify(run.modelInputs[1]);
+  assert.match(generatorInput, /CONTROLLED_HOST_OLD_DRAFT/);
+  assert.match(generatorInput, /CONTROLLED_HOST_TRAILING_PROSE/);
+  assert.match(generatorInput, /RETAINED COMPLETION REVIEW/);
+  assert.equal(run.outcome.finalOutput, currentReply);
 });
 
 test('a blocked finding replaces the rejected draft; a plain negative keeps the generic note', () => {
@@ -1385,17 +1983,23 @@ type WriterRun = {
   brainCalls: number;
   writerRequests: Array<{ input: unknown; systemInstructions?: string; tools?: unknown[] }>;
   judged: Array<{ reply: string; author?: string }>;
+  originalWriterResponses: unknown[];
 };
 async function runWrittenHost(options: {
   reads: number;
   writer: 'none' | 'writes' | 'throws' | 'calls_tool';
   verdicts?: Array<{ done: boolean; reason: string }>;
+  fencedJson?: boolean;
   /** Runs before the turn, e.g. to attach a live viewer to the session. */
   onIdentity?: (identity: ReturnType<typeof accepted>) => void;
 }): Promise<WriterRun> {
   // An action request, so the completion review runs on the scripted turn.
-  const writerRequestText = 'Pull the two retained reports and write me a short snapshot I can use in the pitch.';
+  const writerRequestText = 'Pull the two retained reports and write me a short snapshot I can use in the pitch.'
+    + (options.fencedJson ? ' Return exactly one JSON object.' : '');
   const identity = accepted(writerRequestText);
+  const runAttempt = options.fencedJson ? events.beginRunAttempt(identity.sessionId,
+    { runId: `writer-fence-${serial}`, attemptId: `attempt:writer-fence-${serial}` }) : undefined;
+  if (runAttempt) events.bindRunAttemptSourceUserEvent(runAttempt, identity.sourceUserSeq);
   options.onIdentity?.(identity);
   host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
   attempted(identity);
@@ -1406,7 +2010,9 @@ async function runWrittenHost(options: {
     return verdicts.shift() ?? { done: true, reason: 'ok' };
   });
   const message = (text: string) => [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }];
-  const streamed = (model: { getResponse(request?: unknown): Promise<{ responseId: string; usage: unknown; output: unknown[] }> }) =>
+  const originalWriterResponses: unknown[] = [];
+  const streamed = (model: { getResponse(request?: unknown): Promise<{ responseId: string; usage: unknown; output: unknown[] }> },
+    originals?: unknown[]) =>
     async function* (request?: unknown) {
       const response = await model.getResponse(request);
       yield { type: 'response_started' } as never;
@@ -1415,7 +2021,9 @@ async function runWrittenHost(options: {
         const half = Math.floor(text.length / 2);
         if (text) yield* [{ type: 'output_text_delta', delta: text.slice(0, half) }, { type: 'output_text_delta', delta: text.slice(half) }] as never[];
       }
-      yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
+      const original = { id: response.responseId, usage: response.usage, output: response.output };
+      originals?.push(original);
+      yield { type: 'response_done', response: original } as never;
     };
   let brainCalls = 0;
   const brain = {
@@ -1445,14 +2053,19 @@ async function runWrittenHost(options: {
           output: [{ type: 'function_call', callId: 'writer-tool', name: 'read_file', arguments: '{}', status: 'completed' }] };
       }
       return { responseId: `writer-${serial}-${writerCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        output: message(`Written answer ${writerCalls}: 1,957 monthly visits; the site ranks 6th.`) };
+        output: message(options.fencedJson ? '```json\n{"visits":1957,"rank":6}\n```'
+          : `Written answer ${writerCalls}: 1,957 monthly visits; the site ranks 6th.`) };
     },
     getStreamedResponse: undefined as unknown,
   };
-  writerModel.getStreamedResponse = streamed(writerModel);
+  writerModel.getStreamedResponse = streamed(writerModel, originalWriterResponses);
+  const { ResilientModel } = await import('./resilient-model.js');
+  const { resolveModelCapability } = await import('./model-wire-registry.js');
+  const selectedWriter = options.fencedJson ? new ResilientModel(writerModel as never,
+    { label: 'writer-fence-fixture', capability: resolveModelCapability('claude-sonnet-5'), maxRetries: 0 }) : writerModel;
   host._setHostWriterForTests(options.writer === 'none' ? () => null : () => ({
     resolved: { modelId: 'fixture-writer-model', provider: 'claude', source: 'settings' },
-    model: writerModel as never,
+    model: selectedWriter as never,
   }));
   const agent = { model: brain, tools: [] };
   const prior = catalogs.peekHostCapabilityCatalogFactory();
@@ -1464,8 +2077,9 @@ async function runWrittenHost(options: {
     envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
     envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
     const runner = Object.assign(new EventEmitter(), { run() { throw new Error('Legacy runner must not execute'); } });
-    const outcome = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(20) }, () => host.hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: writerRequestText }] as never, { maxTurns: 8, hostTurnEngine: 'host_v1', hostJudgeCompletion: true, context: identity } as never));
-    return { identity, outcome, brainCalls, writerRequests, judged };
+    const outcome = await brackets.withHarnessRunContext({ ...identity, ...(runAttempt ? { runAttemptId: runAttempt.attemptId } : {}),
+      counter: new brackets.ToolCallsCounter(20) }, () => host.hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: writerRequestText }] as never, { maxTurns: 8, hostTurnEngine: 'host_v1', hostJudgeCompletion: true, context: identity } as never));
+    return { identity, outcome, brainCalls, writerRequests, judged, originalWriterResponses };
   } finally {
     host._setHostObjectiveJudgeForTests(null);
     host._setHostWriterForTests(null);
@@ -1478,6 +2092,26 @@ function writerJournal(identity: ReturnType<typeof accepted>): string[] {
     .filter((data) => data.kind === 'host_final_writer')
     .map((data) => String(data.phase));
 }
+
+test('actual writer fence normalization preserves its original author for independent review', async () => {
+  const run = await runWrittenHost({ reads: 2, writer: 'writes', fencedJson: true });
+  assert.equal(run.brainCalls, 1);
+  assert.equal(run.writerRequests.length, 1);
+  assert.equal(run.judged.length, 1);
+  assert.equal(run.judged[0]!.reply, '{"visits":1957,"rank":6}');
+  assert.equal(run.outcome.finalOutput, run.judged[0]!.reply);
+  assert.equal(run.judged[0]!.author, 'fixture-writer-model');
+  const original = run.originalWriterResponses[0] as { output: Array<{ content: Array<{ text: string }> }> };
+  const raw = '```json\n{"visits":1957,"rank":6}\n```';
+  assert.equal(original.output[0]!.content[0]!.text, raw);
+  const { completedModelResponseBinding } = await import('./model-response-binding.js');
+  const binding = completedModelResponseBinding(original)!;
+  assert.ok(binding);
+  const review = events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] })[0]!;
+  assert.equal((review.data.responseNormalization as Record<string, unknown>).modelCallId, binding.modelCallId);
+  assert.equal((review.data.responseNormalization as Record<string, unknown>).originalReplyDigest,
+    createHash('sha256').update(raw).digest('hex'));
+});
 
 test('a chosen writer writes the final answer from the gathered evidence before review reads it', async () => {
   const run = await runWrittenHost({ reads: 2, writer: 'writes' });

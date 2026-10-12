@@ -40,6 +40,7 @@ import { refusedModelFromProviderResponse, supportedValuesForRejectedParam } fro
 import { effectiveReasoningEffort, recordSupportedEfforts } from './model-window-observations.js';
 import { Usage } from '@openai/agents-core';
 import { createHash } from 'node:crypto';
+import { types as utilTypes } from 'node:util';
 import type {
   Model,
   ModelProvider,
@@ -61,7 +62,8 @@ import { appendEvent } from './eventlog.js';
 import { estimateInputTokens } from './token-estimator.js';
 import { stripCacheBreakSentinel, splitStableMemoryCore, INSTRUCTION_CACHE_DELIM, resolveProvider } from './model-wire-registry.js';
 import { recordCodexRateLimit, recordCodexUsageExhausted } from './rate-limit-store.js';
-import { acceptedSourceIdentity, recordModelUsage } from '../usage-log.js';
+import { acceptedSourceIdentity, recordModelUsage, captureModelUsageProvenance, type CapturedModelUsageProvenance } from '../usage-log.js';
+import { captureNativeModelCallObservation } from './resilient-model.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { assertConversationProtocolAtProviderBoundary } from './conversation-protocol-boundary.js';
 import pino from 'pino';
@@ -101,6 +103,8 @@ interface StreamDiagnostics {
   firstByteTs?: number;
   streamEndTs?: number;
   requestBytes?: number;
+  /** Actual outgoing body model, distinct from the selected adapter label. */
+  requestModel?: string;
 }
 
 /** Headers we care about for failure diagnostics. OpenAI/Codex
@@ -442,8 +446,9 @@ function journalTransparentCodexRetry(input: {
   modelId: string;
   diag: StreamDiagnostics | undefined;
   backoffMs: number;
+  captured?: CodexCallCapture;
 }): void {
-  const ctx = harnessRunContextStorage.getStore();
+  const ctx = input.captured ? input.captured.harness : harnessRunContextStorage.getStore();
   if (!ctx?.sessionId) return;
   try {
     const { err, attempt, path, modelId, diag, backoffMs } = input;
@@ -485,6 +490,8 @@ async function waitBeforeTransparentCodexRetry(
   path: 'getResponse' | 'getStreamedResponse',
   modelId: string,
   diag?: StreamDiagnostics,
+  captured?: CodexCallCapture,
+  telemetry?: ReturnType<CodexCallCapture['observation']['begin']>,
 ): Promise<void> {
   const rateLimited = isRetryableCodexRateLimit(err);
   const backoffMs = transparentCodexRetryDelayMs(attempt, rateLimited);
@@ -502,21 +509,103 @@ async function waitBeforeTransparentCodexRetry(
     },
     'Codex model call failed before real content; retrying transparently',
   );
-  journalTransparentCodexRetry({ err, attempt, path, modelId, diag, backoffMs });
-  if (backoffMs > 0) {
-    await new Promise((resolve) => setTimeout(resolve, backoffMs));
+  journalTransparentCodexRetry({ err, attempt, path, modelId, diag, backoffMs, captured });
+  const wait = () => backoffMs > 0 ? new Promise<void>(resolve => setTimeout(resolve, backoffMs)) : Promise.resolve();
+  if (telemetry) {
+    await telemetry.wait(attempt + 1, 'transient_failure', boundary?.kind ?? 'runtime.unknown', backoffMs, wait);
+  } else if (backoffMs > 0) await wait();
+}
+
+interface CodexCallerSnapshot {
+  readonly sessionId?: string; readonly sourceUserSeq?: number; readonly runAttemptId?: string;
+  readonly turn?: number; readonly promptComponents?: Record<string, number>;
+}
+interface CodexCallCapture {
+  readonly harness: CodexCallerSnapshot;
+  readonly usage: CapturedModelUsageProvenance;
+  readonly observation: ReturnType<typeof captureNativeModelCallObservation>;
+}
+function captureCodexCall(path: 'getResponse' | 'getStreamedResponse', signal?: AbortSignal): CodexCallCapture {
+  // Copy accounting/journal data only. Never run provider work in this harness
+  // scope or copy tools, gates, mutable session objects or execution authority.
+  let harness: CodexCallerSnapshot = Object.freeze({});
+  try {
+    const ctx = harnessRunContextStorage.getStore();
+    if (ctx && !utilTypes.isProxy(ctx)) {
+      const d = Object.getOwnPropertyDescriptors(ctx);
+      const own = (key: string): unknown => d[key] && 'value' in d[key] ? d[key].value : undefined;
+      const sessionId = own('sessionId'), seq = own('sourceUserSeq'), attempt = own('runAttemptId'), turn = own('turn');
+      let promptComponents: Record<string, number> | undefined;
+      const components = own('promptComponents');
+      if (components && typeof components === 'object' && !utilTypes.isProxy(components)) {
+        const fields = Object.getOwnPropertyDescriptors(components);
+        if (Object.values(fields).every(v => 'value' in v && typeof v.value === 'number' && Number.isFinite(v.value))) {
+          promptComponents = Object.freeze(Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, v.value])));
+        }
+      }
+      harness = Object.freeze({ ...(typeof sessionId === 'string' ? { sessionId } : {}),
+        ...(Number.isSafeInteger(seq) && (seq as number) > 0 ? { sourceUserSeq: seq as number } : {}),
+        ...(typeof attempt === 'string' ? { runAttemptId: attempt } : {}),
+        ...(Number.isSafeInteger(turn) ? { turn: turn as number } : {}), ...(promptComponents ? { promptComponents } : {}) });
+    }
+  } catch { /* unowned accounting/journal snapshot remains unowned */ }
+  const usage = captureModelUsageProvenance();
+  return Object.freeze({ harness, usage,
+    observation: captureNativeModelCallObservation('codex', path, CODEX_TRANSPARENT_MAX_RETRIES, signal, usage) });
+}
+function inertCodexMetadata(value: unknown, key: string): unknown {
+  try {
+    if (!value || typeof value !== 'object' || utilTypes.isProxy(value)) return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+  } catch { return undefined; }
+}
+function inertOptionalCodexMetadata(value: unknown, key: string): boolean {
+  try {
+    if (!value || typeof value !== 'object' || utilTypes.isProxy(value)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return !descriptor || 'value' in descriptor;
+  } catch { return false; }
+}
+function consistentCodexCompletion(events: readonly AnyCodexEvent[], responseId: string | undefined): AnyCodexEvent | undefined {
+  // Existing output/usage code retains its own reads. Optional provenance must
+  // never invoke a previously unused closing ID/model getter or proxy trap.
+  let completed: AnyCodexEvent | undefined;
+  for (const event of events) {
+    const type = inertCodexMetadata(event, 'type');
+    if (typeof type !== 'string' || type === 'response.failed' || type === 'error') return undefined;
+    if (type === 'response.completed' || type === 'response.done') {
+      if (completed) return undefined;
+      const envelope = inertCodexMetadata(event, 'response');
+      if (!inertOptionalCodexMetadata(envelope, 'model')) return undefined;
+      const id = inertCodexMetadata(envelope, 'id');
+      if (typeof id !== 'string' || !id || id !== responseId) return undefined;
+      completed = event;
+    } else if (type === 'response.created'
+      && inertCodexMetadata(inertCodexMetadata(event, 'response'), 'id') !== responseId) return undefined;
   }
+  return completed;
+}
+function reportedCodexModel(completed: AnyCodexEvent | undefined): string | undefined {
+  const model = inertCodexMetadata(inertCodexMetadata(completed, 'response'), 'model');
+  return typeof model === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(model) && !model.includes('://') ? model : undefined;
 }
 
 export class CodexResponsesModel implements Model {
   constructor(public readonly modelId: string) {}
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    const captured = captureCodexCall('getResponse', request.signal);
+    const telemetry = captured.observation.begin();
+    let outcome: 'returned' | 'failed' | 'cancelled' = 'failed';
+    try {
     for (let attempt = 0; attempt <= CODEX_TRANSPARENT_MAX_RETRIES; attempt++) {
       const events: AnyCodexEvent[] = [];
       const startedAt = Date.now();
+      const diag: StreamDiagnostics = {};
+      telemetry.startAttempt(attempt + 1);
       try {
-        for await (const evt of this.streamCodex(request)) {
+        for await (const evt of telemetry.attemptStream(this.streamCodex(request, diag))) {
           events.push(evt);
         }
         if (!events.some((event) => event.type === 'response.completed' || event.type === 'response.done')) {
@@ -528,21 +617,42 @@ export class CodexResponsesModel implements Model {
         }
         const response = assembleModelResponse(events);
         const completed = events.find((e) => e.type === 'response.completed' || e.type === 'response.done');
-        recordCodexHarnessUsage(completed?.response?.usage, this.modelId, response.responseId, Date.now() - startedAt);
+        const exact = consistentCodexCompletion(events, response.responseId);
+        recordCodexHarnessUsage(completed?.response?.usage, this.modelId, response.responseId, Date.now() - startedAt,
+          captured, diag.requestModel, reportedCodexModel(exact));
+        if (exact && !request.signal?.aborted) telemetry.response(response);
+        telemetry.finishAttempt(request.signal?.aborted ? 'cancelled' : 'returned', events.some(isRealContentCodexEvent), !!exact && !request.signal?.aborted);
+        outcome = 'returned';
         return response;
       } catch (err) {
         const yieldedRealContent = events.some(isRealContentCodexEvent);
+        telemetry.finishAttempt(request.signal?.aborted ? 'cancelled' : 'failed', yieldedRealContent, false);
         if (shouldRetryTransparentCodexFailure(err, yieldedRealContent, attempt)) {
-          await waitBeforeTransparentCodexRetry(err, attempt, 'getResponse', this.modelId);
+          await waitBeforeTransparentCodexRetry(err, attempt, 'getResponse', this.modelId, undefined, captured, telemetry);
           continue;
         }
         throw err;
       }
     }
     throw new CodexModelError('Codex retry loop exhausted unexpectedly.');
+    } finally { telemetry.finish(request.signal?.aborted ? 'cancelled' : outcome); }
   }
 
-  async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+  getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+    const captured = captureCodexCall('getStreamedResponse', request.signal);
+    return this.observedStreamedResponse(request, captured);
+  }
+
+  private async *observedStreamedResponse(request: ModelRequest, captured: CodexCallCapture): AsyncIterable<StreamEvent> {
+    const telemetry = captured.observation.begin();
+    let outcome: 'returned' | 'failed' | 'interrupted' = 'interrupted';
+    try { yield* this.streamedResponse(request, captured, telemetry); outcome = 'returned'; }
+    catch (err) { outcome = 'failed'; throw err; }
+    finally { telemetry.finish(request.signal?.aborted ? 'cancelled' : outcome); }
+  }
+
+  private async *streamedResponse(request: ModelRequest, captured: CodexCallCapture,
+    telemetry: ReturnType<CodexCallCapture['observation']['begin']>): AsyncIterable<StreamEvent> {
     // Transparent retry on retryable Codex transport/SSE failures when
     // NO content was yielded to the SDK yet:
     // - a headers timeout before the backend answers,
@@ -566,8 +676,11 @@ export class CodexResponsesModel implements Model {
       const seenOutputItems: CodexOutputItem[] = [];
       let responseId: string | undefined;
       let completedEvent: AnyCodexEvent | undefined;
+      const closingEvents: AnyCodexEvent[] = [];
+      let closingMetadataUnavailable = false;
       const startedAt = Date.now();
       const diag: StreamDiagnostics = {};
+      telemetry.startAttempt(attempt + 1);
       lastDiag = diag;
       // Retry-safety gate: ONLY text deltas + output_item.done count as
       // "real content the SDK has surfaced to the user." If anything
@@ -598,8 +711,11 @@ export class CodexResponsesModel implements Model {
       let eventsConsumed = 0;
       let failedEvent: AnyCodexEvent | undefined;
       try {
-        for await (const evt of this.streamCodex(request, diag)) {
+        for await (const evt of telemetry.attemptStream(this.streamCodex(request, diag))) {
           eventsConsumed += 1;
+          const metadataType = inertCodexMetadata(evt, 'type');
+          if (typeof metadataType !== 'string') closingMetadataUnavailable = true;
+          if (typeof metadataType === 'string' && ['response.created', 'response.completed', 'response.done', 'response.failed', 'error'].includes(metadataType)) closingEvents.push(evt);
           // v0.5.19 F5 — diagnostic knob: after 5 events, drop the
           // stream as if it truncated. Double-gated (NODE_ENV=test or
           // CLEMMY_DEV_OVERRIDES=1) so production cannot trip it. Lets
@@ -653,10 +769,11 @@ export class CodexResponsesModel implements Model {
       } catch (err) {
         lastResponseId = responseId;
         lastItemCount = seenOutputItems.length;
+        telemetry.finishAttempt(request.signal?.aborted ? 'cancelled' : 'failed', yieldedRealContent, false);
         if (shouldRetryTransparentCodexFailure(err, yieldedRealContent, attempt)) {
           pendingStart = undefined;
           pendingMetadata = [];
-          await waitBeforeTransparentCodexRetry(err, attempt, 'getStreamedResponse', this.modelId, diag);
+          await waitBeforeTransparentCodexRetry(err, attempt, 'getStreamedResponse', this.modelId, diag, captured, telemetry);
           continue;
         }
         throw err;
@@ -684,7 +801,11 @@ export class CodexResponsesModel implements Model {
         // details fields). Mirror the OpenAIResponsesModel's streaming
         // shape: snake_case detail spreads, camelCase token counts.
         const u = completedEvent?.response?.usage ?? {};
-        recordCodexHarnessUsage(u, this.modelId, responseId ?? completedEvent?.response?.id, Date.now() - startedAt);
+        const metadataId = responseId ?? inertCodexMetadata(inertCodexMetadata(completedEvent, 'response'), 'id');
+        const exact = closingMetadataUnavailable ? undefined : consistentCodexCompletion(closingEvents,
+          typeof metadataId === 'string' ? metadataId : undefined);
+        recordCodexHarnessUsage(u, this.modelId, responseId ?? completedEvent?.response?.id, Date.now() - startedAt,
+          captured, diag.requestModel, reportedCodexModel(exact));
         // Proven-acceptance learning: a request the provider ACCEPTED at more
         // input than we believed raises the window floor (writes only when it
         // beats the current belief — steady-state cost is zero).
@@ -692,7 +813,7 @@ export class CodexResponsesModel implements Model {
           const { recordWindowAcceptance } = await import('./model-window-observations.js');
           recordWindowAcceptance(this.modelId, u.input_tokens);
         } catch { /* learning is additive */ }
-        yield {
+        const doneEvent = {
           type: 'response_done',
           response: {
             id: responseId ?? completedEvent?.response?.id ?? '',
@@ -708,9 +829,14 @@ export class CodexResponsesModel implements Model {
           },
           providerData: {},
         } as unknown as StreamEvent;
+        if (exact && !request.signal?.aborted) telemetry.response((doneEvent as { response?: unknown }).response);
+        telemetry.streamState(yieldedRealContent, !!exact);
+        yield doneEvent;
+        telemetry.finishAttempt('returned', yieldedRealContent, !!exact);
         return;
       }
 
+      telemetry.finishAttempt(request.signal?.aborted ? 'cancelled' : 'failed', yieldedRealContent, false);
       // No content from the model — either a truncated stream (no
       // response.completed) OR an empty completion (response.completed with
       // zero output). Same class: retry IF nothing was yielded to the SDK
@@ -744,7 +870,7 @@ export class CodexResponsesModel implements Model {
         // response.created / metadata frames don't collide with stale ones.
         pendingStart = undefined;
         pendingMetadata = [];
-        await waitBeforeTransparentCodexRetry(noContentError, attempt, 'getStreamedResponse', this.modelId, diag);
+        await waitBeforeTransparentCodexRetry(noContentError, attempt, 'getStreamedResponse', this.modelId, diag, captured, telemetry);
         continue;
       }
 
@@ -845,6 +971,7 @@ export class CodexResponsesModel implements Model {
     // Request body is token-independent — build it once and reuse across a
     // possible refresh-and-retry below.
     const body = buildCodexRequestBody(this.modelId, request);
+    if (diag && typeof body.model === 'string') diag.requestModel = body.model;
     const bodyJson = JSON.stringify(body);
     logNativeCompactionRequestTelemetry(request, body);
     if (diag) {
@@ -1568,6 +1695,7 @@ interface AnyCodexEvent {
   sequence_number?: number;
   response?: {
     id?: string;
+    model?: string;
     output?: unknown[];
     usage?: {
       input_tokens?: number;
@@ -1838,6 +1966,9 @@ export function recordCodexHarnessUsage(
   modelId: string,
   responseId?: string,
   durationMs?: number,
+  captured?: CodexCallCapture,
+  requestModel?: string,
+  providerReportedModel?: string,
 ): void {
   try {
     if (!usage) return;
@@ -1846,15 +1977,16 @@ export function recordCodexHarnessUsage(
     if (inputTokens + outputTokens <= 0) return;
     const cached = usage.input_tokens_details?.cached_tokens;
     const reasoning = usage.output_tokens_details?.reasoning_tokens;
-    const harnessContext = harnessRunContextStorage.getStore();
+    const harnessContext = captured ? captured.harness : harnessRunContextStorage.getStore();
     recordModelUsage({
+      ...(captured ? { callerProvenance: captured.usage, requestModel, providerReportedModel } : {}),
       sessionId: harnessContext?.sessionId ?? 'unknown',
       sourceUserSeq: harnessContext?.sourceUserSeq,
       attemptId: harnessContext?.runAttemptId,
       model: modelId,
       trace: {
         brain: 'codex',
-        ...(responseId ? { modelCallId: responseId } : {}),
+        ...(captured ? { modelCallId: captured.observation.modelCallId } : responseId ? { modelCallId: responseId } : {}),
       },
       cacheDialect: 'inclusive', // OpenAI wire: input_tokens ⊇ cached_tokens
       inputTokens,

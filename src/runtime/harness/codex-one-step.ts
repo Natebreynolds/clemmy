@@ -83,6 +83,9 @@ export interface CodexOneStepInput {
    * the response or admission, and an observer that throws is ignored. */
   onOutputText?: (delta: string) => void;
   onToolCallStart?: () => void;
+  /** Internal read-only observation of the original, admitted completed SDK
+   * response. No clone is supplied; exceptions cannot alter the step. */
+  onCompletedResponse?: (response: Readonly<ModelResponse>) => void;
   /** Final provider-neutral request boundary. A rejection here stops before
    * either streaming or non-streaming model I/O. */
   beforeModelDispatch?: (request: ModelRequest) => Promise<void> | void;
@@ -854,7 +857,7 @@ export async function codexOneStep(input: CodexOneStepInput): Promise<CodexOneSt
   const responseId = typeof streamedOrResponseId === 'string' && streamedOrResponseId.trim()
     ? streamedOrResponseId
     : undefined;
-  return {
+  const result: CodexOneStepResult = {
     text: textOfOutput(output),
     toolCalls: toolCallsOfOutput(output),
     output,
@@ -867,4 +870,17 @@ export async function codexOneStep(input: CodexOneStepInput): Promise<CodexOneSt
     ...(response.usage !== undefined ? { usage: response.usage } : {}),
     ...(responseId !== undefined ? { responseId } : {}),
   };
+  if (input.onCompletedResponse && !input.signal?.aborted) {
+    const admission = admitModelStep(result);
+    if (admission.admitted && admission.frame.kind === 'completed') {
+      observe(() => {
+        const returned: unknown = input.onCompletedResponse!(response);
+        // Do not await a mistakenly async observer or leak its rejection.
+        if (returned && typeof (returned as PromiseLike<unknown>).then === 'function') {
+          void Promise.resolve(returned).catch(() => {});
+        }
+      });
+    }
+  }
+  return result;
 }

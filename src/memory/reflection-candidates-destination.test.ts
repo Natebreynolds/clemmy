@@ -154,3 +154,14 @@ test('frozen source and decision survive database close/reopen without ambient s
     assert.equal(recordAutomaticMemoryCandidate(input, db), id);
   }
 });
+
+test('optional accounting tables do not change destination row bytes or v37 reopening', () => {
+  const db = database(); const input = candidate(); const id = recordAutomaticMemoryCandidate(input, db);
+  const before = JSON.stringify(db.prepare('SELECT * FROM memory_reflection_candidates WHERE id = ?').get(id));
+  assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name = 'memory_candidate_accounting_origins'").get());
+  migrateMemoryDatabaseHandle(db, { targetVersion: 37 });
+  assert.equal(JSON.stringify(db.prepare('SELECT * FROM memory_reflection_candidates WHERE id = ?').get(id)), before);
+  assert.equal(readAutomaticMemoryCandidate(id, db).status, 'valid');
+  assert.equal(recordAutomaticMemoryCandidate(input, db), id);
+  assert.equal(JSON.stringify(db.prepare('SELECT * FROM memory_reflection_candidates WHERE id = ?').get(id)), before);
+});

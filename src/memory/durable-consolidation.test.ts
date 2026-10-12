@@ -911,3 +911,86 @@ for (const validSource of [true, false]) {
     assert.match(rows[0].source, /^memory:standing:/);
   });
 }
+
+for (const sameSource of [false, true]) test(`durable reopen keeps original accounting A while selection stays current (${sameSource})`, async () => {
+  const usage = await import('../runtime/usage-log.js');
+  const { runMemoryModelJob, inMemoryJobTurn } = await import('./memory-job-context.js');
+  const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+  const sessionId = `durable-origin-${sameSource}`; const message = 'Use short paragraphs for future reports.';
+  log.createSession({ id: sessionId, kind: 'chat' });
+  const source = log.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: message } });
+  const a = log.beginRunAttempt(sessionId, { attemptId: `attempt:durable-origin-${sameSource}-A` }); log.bindRunAttemptSourceUserEvent(a, source.seq);
+  const original = { sessionId, sourceUserSeq: source.seq, attemptId: a.attemptId };
+  const context = captureFreshSourceSessionContext({ sessionId, sourceUserSeq: source.seq })!;
+  const origin = createAutomaticMemoryOrigin({ source: { authority: 'accepted_user_input', sessionId, eventId: source.id,
+    eventSeq: source.seq, eventType: 'user_input_received', ownerText: message,
+    context: { sessionId, sourceUserSeq: source.seq, digest: context.digest, memoryScope: context.memoryScope } },
+    claim: { start: 0, end: message.length }, claimMode: 'complete', candidate: { kind: 'user', text: message } });
+  const input = { sessionId, message, sourceEventId: `user-source:${source.seq}`,
+    candidates: [{ kind: 'user' as const, content: message, reason: 'standing instruction' }], origins: [origin] };
+  const queued = usage.withModelUsageAttribution(original, () => enqueueLegacy(input)); closeMemoryDb();
+  const b = { sessionId: sameSource ? sessionId : 'foreign-current', sourceUserSeq: sameSource ? source.seq : source.seq + 900000, attemptId: `attempt:durable-origin-${sameSource}-B` };
+  const rowsBefore = JSON.stringify(openMemoryDb().prepare('SELECT * FROM memory_candidate_accounting_origins').all());
+  usage.withModelUsageAttribution(b, () => enqueueLegacy(input));
+  assert.equal(JSON.stringify(openMemoryDb().prepare('SELECT * FROM memory_candidate_accounting_origins').all()), rowsBefore);
+  const responseId = `durable-origin-${sameSource}-usage`;
+  const result = await harnessRunContextStorage.run({ sessionId: b.sessionId, sourceUserSeq: b.sourceUserSeq, runAttemptId: b.attemptId } as never, () =>
+    usage.withModelUsageAttribution(b, () => drainActual({ ids: queued.candidateIds, standingReviewer: async (_s, _c, _m, frozen) =>
+      runMemoryModelJob('standing', {}, async () => {
+        assert.equal(harnessRunContextStorage.getStore()?.sessionId, b.sessionId, 'provider execution retains harness B');
+        assert.equal(usage.modelUsageAttributionStorage.getStore()?.sessionId, '', 'memory job has blank direct execution selection');
+        assert.equal(inMemoryJobTurn(() => usage.modelUsageAttributionStorage.getStore()?.sessionId), sameSource ? sessionId : '', 'old same-source selection preserved');
+        usage.recordModelUsage({ sessionId: b.sessionId, sourceUserSeq: b.sourceUserSeq, attemptId: b.attemptId,
+          model: 'durable-origin-test', responseId, inputTokens: 9, outputTokens: 2, cacheDialect: 'inclusive', trace: { modelCallId: `local-${sameSource}`, acceptedSource: `${b.sessionId}:${b.sourceUserSeq}`, attemptId: b.attemptId } });
+        assert.ok(frozen); return parseAutomaticStandingMemoryReview({ durability: 'task', claim: frozen.claim,
+          destination: 'unresolved', destinationSpans: [], reason: 'fixture only' }, frozen);
+      }, () => ({ outcome: 'nothing_new' })) })));
+  assert.equal(result.skipped, 1);
+  const row = usage.readUsageEventsForDate().find(r => r.responseId === responseId)!;
+  assert.equal(row.trace?.acceptedSource, `${sessionId}:${source.seq}`); assert.equal(row.trace?.attemptId, a.attemptId);
+  assert.match(row.source, /^memory:standing:/);
+});
+
+test('accounting extension trigger is declined without changing actual automatic intake', () => {
+  const firstMessage = 'Remember this: reports use blue headings.';
+  enqueueAutoCaptureCandidates({ message: firstMessage, sessionId: 'trigger-first-intake',
+    sourceEventId: 'trigger-first', candidates: extractAutoMemoryCandidates(firstMessage) });
+  const db = openMemoryDb();
+  const originCount = (db.prepare('SELECT COUNT(*) AS n FROM memory_candidate_accounting_origins').get() as { n: number }).n;
+  db.exec(`CREATE TRIGGER unsupported_accounting_write AFTER INSERT ON memory_candidate_accounting_origins
+    BEGIN UPDATE memory_reflection_candidates SET status = 'rejected', reason = 'unexpected_trigger' WHERE id = NEW.candidate_id; END`);
+  const message = 'Remember this: reports use short paragraphs.';
+  const queued = enqueueAutoCaptureCandidates({ message, sessionId: 'trigger-second-intake',
+    sourceEventId: 'trigger-second', candidates: extractAutoMemoryCandidates(message) });
+  assert.equal(queued.candidateIds.length, 1);
+  const row = db.prepare('SELECT status, reason, destination_json FROM memory_reflection_candidates WHERE id = ?')
+    .get(queued.candidateIds[0]) as { status: string; reason: string | null; destination_json: string };
+  assert.equal(row.status, 'pending'); assert.equal(row.reason, null); assert.ok(row.destination_json);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM memory_candidate_accounting_origins').get() as { n: number }).n, originCount,
+    'no accounting INSERT can dispatch the unsupported trigger');
+  assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'unsupported_accounting_write'").get(), 'no repair/drop of foreign triggers');
+});
+
+for (const mixedCase of [false, true]) test(`first enqueue declines TEMP accounting shadow before initialization (${mixedCase})`, async () => {
+  const db = openMemoryDb();
+  assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name = 'memory_causal_accounting_meta'").get(), undefined);
+  const name = mixedCase ? 'Memory_Causal_Accounting_Meta' : 'memory_causal_accounting_meta';
+  db.exec(`CREATE TEMP TABLE ${name} (version INTEGER);
+    CREATE TEMP TRIGGER temp_accounting_side_effect AFTER INSERT ON ${name}
+    BEGIN UPDATE memory_reflection_candidates SET status = 'rejected', reason = 'temp_trigger'; END`);
+  const message = 'Remember this: use blue headings in reports.';
+  const queued = enqueueAutoCaptureCandidates({ message, sessionId: `temp-shadow-${mixedCase}`,
+    sourceEventId: 'first-owner', candidates: extractAutoMemoryCandidates(message) });
+  const row = db.prepare('SELECT status, reason, destination_json FROM memory_reflection_candidates WHERE id = ?')
+    .get(queued.candidateIds[0]) as { status: string; reason: string | null; destination_json: string };
+  assert.equal(row.status, 'pending'); assert.equal(row.reason, null); assert.ok(row.destination_json);
+  assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM temp.${name}`).get() as { n: number }).n, 0, 'no initialization INSERT resolves into TEMP');
+  assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE lower(name) IN ('memory_causal_accounting_meta','memory_candidate_accounting_origins')").get(), undefined,
+    'unsupported namespace is declined before any extension CREATE');
+  assert.ok(db.prepare("SELECT 1 FROM sqlite_temp_master WHERE name = 'temp_accounting_side_effect'").get());
+  assert.ok(db.prepare('SELECT 1 FROM memory_episodes WHERE id = ?').get(queued.episodeId), 'ordinary episode/intake remains committed');
+  const usage = await import('../runtime/usage-log.js');
+  const causal = await import('./memory-causal-accounting.js');
+  assert.equal(usage.memoryAccountingParent(causal.readMemoryCandidateAccountingOrigin(queued.candidateIds[0]!, db)), undefined,
+    'unsupported optional namespace is accounting unknown, not a later attempt');
+});

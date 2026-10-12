@@ -35,7 +35,11 @@
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import { bindCompletedModelResponse } from './model-response-binding.js';
+import { bindCompletedModelResponse, completedModelResponseBinding } from './model-response-binding.js';
+import { captureModelTransportOwner, createModelTransportAttempt, finishModelTransportAttempt, modelTransportAttemptStream,
+  observeCompletedTransportModelResponse, withModelTransportAttempt, type CapturedModelTransportOwner,
+  type ModelTransportAttempt } from './model-transport-observation.js';
+import { modelUsageAttributionStorage, capturedModelUsageAttribution, type CapturedModelUsageProvenance } from '../usage-log.js';
 import type { StreamEvent } from '@openai/agents-core/types';
 import type { ModelCapability } from './model-wire-registry.js';
 import { BoundaryError, type BoundaryErrorKind } from '../boundary-error.js';
@@ -104,13 +108,45 @@ const resilienceTelemetry = new AsyncLocalStorage<ResilienceTelemetryObserver>()
 
 /** Bind observations to this asynchronous request, never a mutable process-wide
  * callback. The wrapper captures this binding once before its first attempt. */
-export function withModelResilienceTelemetry<T>(observer: ResilienceTelemetryObserver, work: () => T): T {
-  return resilienceTelemetry.run(observer, work);
+export function withModelResilienceTelemetry<T>(observer: ResilienceTelemetryObserver, work: () => T,
+  options: { preserveParent?: boolean } = {}): T {
+  const parent = options.preserveParent ? resilienceTelemetry.getStore() : undefined;
+  if (!parent) return resilienceTelemetry.run(observer, work);
+  const composed: ResilienceTelemetryObserver = event => {
+    for (const sink of [parent, observer]) {
+      try {
+        const result: unknown = sink(event);
+        if (result && typeof (result as PromiseLike<unknown>).then === 'function') void Promise.resolve(result).catch(() => {});
+      } catch { /* each observer remains independent; neither can starve the other */ }
+    }
+  };
+  return resilienceTelemetry.run(composed, work);
+}
+
+// Native adapters retain their own original response identity under an outer
+// decorator. Ordinary reuse by another wrapper invocation still reaches the
+// binder's duplicate-object guard; a native producer is never rebound as outer.
+const observedResponseProducers = new WeakMap<object, { callId: string; native: boolean }>();
+
+/** Capture at the public invocation; start clocks/events only when its existing
+ * implementation begins work. This adds no retry wrapper or execution scope. */
+export function captureNativeModelCallObservation(label: string, path: ResiliencePath,
+  maxRetries: number, signal?: AbortSignal, usage?: CapturedModelUsageProvenance): { readonly modelCallId: string; begin(): ResilienceCallTelemetry } {
+  const observer = resilienceTelemetry.getStore();
+  const callId = randomUUID();
+  // This temporary accounting scope constructs observation data only; no
+  // provider work or tools run under a copied context. Explicit empty capture
+  // cannot borrow the later drainer or invoke exotic accounting getters.
+  const owner = usage ? modelUsageAttributionStorage.run(capturedModelUsageAttribution(usage)
+    ?? { sessionId: 'unknown', sourceUserSeq: 0 }, captureModelTransportOwner) : captureModelTransportOwner();
+  let begun: ResilienceCallTelemetry | undefined;
+  return Object.freeze({ modelCallId: callId, begin: () => begun ??= new ResilienceCallTelemetry(
+    label, path, maxRetries, Date.now(), Date.now, signal, owner, { observer, callId, native: true }) });
 }
 
 class ResilienceCallTelemetry {
-  private readonly observer = resilienceTelemetry.getStore();
-  private readonly callId = randomUUID();
+  private readonly observer: ResilienceTelemetryObserver | undefined;
+  private readonly callId: string;
   private activeAttempt?: { ordinal: number; startedAt: number; contentCommitted: boolean; completionObserved: boolean };
   private attemptCount = 0;
   private failedAttemptCount = 0;
@@ -118,10 +154,15 @@ class ResilienceCallTelemetry {
   private failedAttemptMs = 0;
   private retryWaitMs = 0;
   private completionObserved = false;
+  private transportAttempt?: ModelTransportAttempt;
 
   constructor(private readonly label: string, private readonly path: ResiliencePath,
     private readonly maxRetries: number, private readonly startedAt: number, private readonly now: () => number,
-    private readonly signal?: AbortSignal) {
+    private readonly signal?: AbortSignal,
+    private readonly transportOwner: CapturedModelTransportOwner = captureModelTransportOwner(),
+    private readonly captured?: { observer?: ResilienceTelemetryObserver; callId: string; native: true }) {
+    this.observer = captured ? captured.observer : resilienceTelemetry.getStore();
+    this.callId = captured?.callId ?? randomUUID();
     this.emit({ type: 'call_started' });
   }
 
@@ -142,15 +183,36 @@ class ResilienceCallTelemetry {
 
   startAttempt(ordinal: number): void {
     this.attemptCount += 1;
+    this.transportAttempt = createModelTransportAttempt(this.callId, ordinal, this.transportOwner);
     this.activeAttempt = { ordinal, startedAt: this.now(), contentCommitted: false, completionObserved: false };
     this.emit({ type: 'attempt_started', attempt: ordinal });
   }
 
   response(response: unknown): void {
     if (!this.activeAttempt) return;
+    if (response && typeof response === 'object') {
+      const existing = completedModelResponseBinding(response);
+      const producer = observedResponseProducers.get(response);
+      // A foreign/native original stays its producer's original. An outer
+      // association remains unknown; matching fields/IDs cannot manufacture it.
+      if (existing && existing.modelCallId !== this.callId
+        && (!producer || (producer.native && !this.captured))) return;
+    }
     const binding = bindCompletedModelResponse(response, this.callId, this.activeAttempt.ordinal);
+    if (binding && response && typeof response === 'object') {
+      observedResponseProducers.set(response, { callId: this.callId, native: !!this.captured });
+    }
+    if (binding && this.transportAttempt) observeCompletedTransportModelResponse(this.transportAttempt, response);
     if (binding) this.emit({ type: 'response_observed', attempt: binding.physicalAttempt,
       providerResponseIdDigest: binding.providerResponseIdDigest });
+  }
+
+  runAttempt<T>(work: () => T): T {
+    return this.transportAttempt ? withModelTransportAttempt(this.transportAttempt, work) : work();
+  }
+
+  attemptStream<T>(iterable: AsyncIterable<T>): AsyncIterable<T> {
+    return this.transportAttempt ? modelTransportAttemptStream(this.transportAttempt, iterable) : iterable;
   }
 
   streamState(contentCommitted: boolean, completionObserved: boolean): void {
@@ -161,6 +223,8 @@ class ResilienceCallTelemetry {
     failureKind?: ResilienceFailureKind, status?: number): void {
     if (!this.activeAttempt) return;
     const { ordinal, startedAt } = this.activeAttempt;
+    if (this.transportAttempt) finishModelTransportAttempt(this.transportAttempt,
+      outcome === 'returned' ? 'returned' : outcome === 'failed' ? 'failed' : 'cancelled');
     this.activeAttempt = undefined;
     const durationMs = Math.max(0, this.now() - startedAt);
     this.attemptMs += durationMs;
@@ -622,7 +686,7 @@ export class ResilientModel implements Model {
       telemetry.startAttempt(attempt + 1);
       try {
         call.signal?.throwIfAborted();
-        const res = await this.inner.getResponse(req);
+        const res = await telemetry.runAttempt(() => this.inner.getResponse(req));
         telemetry.response(res);
         if (isEmptyResponse(res) && call.signal?.aborted) {
           telemetry.finishAttempt('cancelled', false, true, 'model.empty_completion');
@@ -678,11 +742,16 @@ export class ResilientModel implements Model {
     } finally { telemetry.finish(outcome, failureKind); }
   }
 
-  async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+  getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+    return this.getStreamedResponseWithTransportOwner(request, captureModelTransportOwner());
+  }
+
+  private async *getStreamedResponseWithTransportOwner(request: ModelRequest,
+    transportOwner: CapturedModelTransportOwner): AsyncIterable<StreamEvent> {
     let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
     const call: NoAnswerCall = { startedAt: this.now(), signal: request.signal, noAnswerRetries: 0 };
-    const telemetry = new ResilienceCallTelemetry(this.policy.label, 'getStreamedResponse', this.maxRetries, call.startedAt, () => this.now(), request.signal);
+    const telemetry = new ResilienceCallTelemetry(this.policy.label, 'getStreamedResponse', this.maxRetries, call.startedAt, () => this.now(), request.signal, transportOwner);
     let outcome: ResilienceOutcome = 'interrupted';
     let failureKind: ResilienceFailureKind | undefined;
     let effortStripped = false;
@@ -713,7 +782,7 @@ export class ResilientModel implements Model {
 
       try {
         call.signal?.throwIfAborted();
-        for await (const ev of this.inner.getStreamedResponse(req)) {
+        for await (const ev of telemetry.attemptStream(telemetry.runAttempt(() => this.inner.getStreamedResponse(req)))) {
           const e = ev as { type?: string; event?: { type?: string; finishReason?: unknown }; response?: { output?: unknown[]; providerData?: { finishReason?: unknown } } };
           if (!committed && ((e.type === 'model' && e.event?.type === 'finish' && isProviderRefusalFinish(e.event.finishReason))
             || (e.type === 'response_done' && isProviderRefusalFinish(e.response?.providerData?.finishReason)))) {

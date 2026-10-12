@@ -130,6 +130,7 @@ export interface ModelTimingMeasurement {
 }
 
 export interface AcceptedTurnMeasurement extends SessionMeasurement {
+  transportObservation?: AcceptedTransportObservation;
   modelTiming?: ModelTimingMeasurement;
   modelTimingIssues?: string[];
   sourceUserSeq: number;
@@ -189,6 +190,7 @@ export interface ApprovalContinuationMeasurement {
 }
 
 export interface AcceptedTaskMeasurement extends SessionMeasurement {
+  transportObservation?: AcceptedTransportObservation;
   modelTiming?: ModelTimingMeasurement;
   modelTimingIssues?: string[];
   scope: 'task';
@@ -226,6 +228,53 @@ export interface AcceptedTaskMeasurement extends SessionMeasurement {
    * task wall. Includes delivery/decision time, not a claim of human CPU time. */
   recordedApprovalWaitMs: number | null;
   approvalWaitIssues: string[];
+}
+
+/** Actual fetch membership is distinct from SDK calls and task elapsed time.
+ * This first declared-transport journal never certifies absence of other legs. */
+export interface AcceptedTransportObservation {
+  /** Local declarations/outcomes are separate from actual provider traffic. */
+  localAdapterAttempts?: AcceptedLocalAdapterAttempts;
+  scope: 'declared_transports_only';
+  inventory: 'not_observed' | 'partial';
+  allLegPhysicalInventory: 'unproved';
+  declaredTransports: string[];
+  observedDispatches: number | null;
+  headersReceived: number | null;
+  fetchFailures: number | null;
+  localRetirements: number | null;
+  completedModelResults: number | null;
+  exactResponseUsageJoins: number | null;
+  dispatchesWithoutCompletedUsageProof: number | null;
+  window: { acceptedAt: string | null; deliveryAt: string | null; elapsedMs: number | null };
+  dispatchToHeadersOrLocalFailureUnionMs: number | null;
+  observedCompletedModelSpanUnionMs: number | null;
+  afterDeliveryEvents: number;
+  criticalPath: 'not_established';
+  accountAuthority: 'unproved';
+  schemaAndServingIdentity: 'not_bound_by_transport_journal';
+  issues: string[];
+}
+
+export interface AcceptedLocalAdapterAttempts {
+  scope: 'declared_local_adapter_attempts_only';
+  status: 'not_observed' | 'incomplete' | 'observed_local_endpoints';
+  createdAttempts: number | null;
+  localTerminals: number | null;
+  returnedAttempts: number | null;
+  failedAttempts: number | null;
+  cancelledAttempts: number | null;
+  noObservedDispatchAttempts: number | null;
+  originalSdkIdentities: number | null;
+  ownedParsedResults: number | null;
+  exactReportedUsageJoins: number | null;
+  unknownUsageAttempts: number | null;
+  afterDeliveryEvents: number;
+  publicInvocationCoverage: 'unproved';
+  allLegPhysicalInventory: 'unproved';
+  accountAndBackendAuthority: 'unproved';
+  coverageLimits: string[];
+  issues: string[];
 }
 
 export interface WorkerUsageParticipant {
@@ -362,7 +411,11 @@ function readSessionEvents(dbPath: string, sessionId: string): {
   try {
     db.pragma('query_only = ON');
     const rows = db.prepare(
-      `SELECT seq, turn, role, type, data_json, created_at
+      `SELECT seq, turn, role, type,
+              CASE WHEN type = 'guardrail_tripped' AND json_valid(data_json)
+                THEN CASE WHEN json_extract(data_json, '$.kind') = 'model_memory_context'
+                  THEN '{}' ELSE data_json END
+                ELSE data_json END AS data_json, created_at
          FROM events
         WHERE session_id = ?
         ORDER BY seq ASC`,
@@ -1115,6 +1168,9 @@ export function measureAcceptedTurn(
   return {
     ...measured,
     ...timing,
+    transportObservation: measureTransportObservations({ sessionId, events: sessionRead.events,
+      sources: new Map([[sourceUserSeq, { source, attempts, terminal }]]), usage: usageEvents,
+      windowStart: source, windowEnd: terminal }),
     sourceUserSeq,
     acceptedSource,
     terminalSeq: terminal.seq,
@@ -1155,6 +1211,327 @@ function intervalUnionMs(intervals: readonly [number, number][]): number {
     end = Math.max(end, finish);
   }
   return total;
+}
+
+const adapterPhase = (phase: unknown): boolean => phase === 'adapter_attempt_created' || phase === 'adapter_attempt_finished';
+
+/** Local adapter endpoints improve attribution visibility without certifying
+ * public lazy invocations, hidden retries, actual serving accounts or billing. */
+function measureLocalAdapterAttempts(input: {
+  sessionId: string; events: readonly SessionEvent[]; sources: ReadonlyMap<number, TimingSource>;
+  usage: readonly UsageEvent[]; isAncestor: (ancestor: number, descendant: number) => boolean;
+  start: number | null; end: number | null; windowProved: boolean;
+}): AcceptedLocalAdapterAttempts {
+  const issues = new Set<string>();
+  const sourceByAttempt = new Map<string, number>();
+  for (const [source, scope] of input.sources) for (const id of scope.attempts.ids) sourceByAttempt.set(id, source);
+  const groups = new Map<string, SessionEvent[]>();
+  const callOwners = new Map<string, string>();
+  const conflictingCalls = new Set<string>();
+  const enumValue = (value: unknown, allowed: readonly string[]): boolean => typeof value === 'string' && allowed.includes(value);
+  const localIdentity = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/.test(value);
+  const dispatchCounts = new Map<string, number>();
+  const receiptCounts = new Map<string, number>();
+  for (const event of input.events) if (event.type === 'model_transport_observed'
+    && (event.data.phase === 'model_result_completed' || event.data.phase === 'model_attempt_retired') && exactIdentity(event.data.hostResultReceiptId)) {
+    receiptCounts.set(event.data.hostResultReceiptId, (receiptCounts.get(event.data.hostResultReceiptId) ?? 0) + 1);
+  }
+  for (const event of input.events) if (event.type === 'model_transport_observed'
+    && event.data.phase === 'dispatch_started' && exactIdentity(event.data.dispatchId)) {
+    dispatchCounts.set(event.data.dispatchId, (dispatchCounts.get(event.data.dispatchId) ?? 0) + 1);
+  }
+  const time = (event: SessionEvent): number | null => event.data.clock === 'host_epoch_ms'
+    && typeof event.data.at === 'number' && Number.isSafeInteger(event.data.at) && event.data.at >= 0 ? event.data.at : null;
+  const bounded = (event: SessionEvent): boolean => {
+    const owner = exactIdentity(event.data.runAttemptId) ? sourceByAttempt.get(event.data.runAttemptId) : undefined;
+    const bound = owner === undefined ? undefined : input.sources.get(owner)?.attempts.bounds.get(String(event.data.runAttemptId));
+    const reported = time(event); const persisted = timestampMs(event);
+    return input.windowProved && bound?.start !== null && bound?.start !== undefined && bound.end !== null
+      && bound.end >= bound.start && [reported, persisted].every(value => value !== null
+        && value >= input.start! && value <= input.end! && value >= bound.start! && value <= bound.end!);
+  };
+  const key = (event: SessionEvent): string => JSON.stringify([
+    event.data.sourceUserSeq, event.data.runAttemptId, event.data.modelCallId, event.data.physicalAttempt,
+  ]);
+  const namespace = (event: SessionEvent): string => JSON.stringify([
+    event.data.sourceUserSeq, event.data.runAttemptId, event.data.ownerKind, event.data.usageJobId ?? null, event.data.purpose,
+  ]);
+  let observed = false; let afterDelivery = 0;
+  for (const event of input.events) {
+    if (event.type !== 'model_transport_observed' || !adapterPhase(event.data.phase)) continue;
+    const source = positiveEventSeq(event.data.sourceUserSeq);
+    const owner = exactIdentity(event.data.runAttemptId) ? sourceByAttempt.get(event.data.runAttemptId) : undefined;
+    if ((source === null || !input.sources.has(source)) && owner === undefined) continue;
+    observed = true;
+    if (event.role !== 'system' || event.data.version !== 1 || source === null || !input.sources.has(source)
+      || owner === undefined || !localIdentity(event.data.runAttemptId) || !input.isAncestor(source, owner) || event.data.logicalTurnId !== `turn:${source}`
+      || !localIdentity(event.data.modelCallId) || positiveEventSeq(event.data.physicalAttempt) === null
+      || event.seq <= input.sources.get(source)!.source.seq
+      || !enumValue(event.data.ownerKind, ['accepted_source_scope', 'accounting_parent'])
+      || !enumValue(event.data.purpose, ['brain', 'worker', 'reviewer', 'router', 'writer', 'memory', 'unknown'])
+      || (Object.hasOwn(event.data, 'usageJobId') && !localIdentity(event.data.usageJobId))) {
+      issues.add(`invalid_local_adapter_ownership:${event.seq}`); continue;
+    }
+    const call = String(event.data.modelCallId); const prior = callOwners.get(call);
+    if (prior !== undefined && prior !== namespace(event)) {
+      issues.add(`conflicting_local_adapter_call_owner:${event.seq}`); conflictingCalls.add(call);
+    }
+    callOwners.set(call, namespace(event));
+    const group = groups.get(key(event)) ?? []; group.push(event); groups.set(key(event), group);
+    if (event.data.journalFailed !== false) issues.add(`local_adapter_journal_failure:${event.seq}`);
+    const at = time(event);
+    const persisted = timestampMs(event);
+    if (input.end !== null && ((at !== null && at > input.end) || (persisted !== null && persisted > input.end))) afterDelivery++;
+    if (!bounded(event)) issues.add(`unbounded_local_adapter_endpoint:${event.seq}`);
+  }
+  const finishes = [...groups.values()].flatMap(events => events.filter(event => event.data.phase === 'adapter_attempt_finished'));
+  const digestCounts = new Map<string, number>(); const callFinishCounts = new Map<string, number>();
+  for (const finish of finishes) {
+    const digest = finish.data.providerResponseIdDigest;
+    if (typeof digest === 'string') digestCounts.set(digest, (digestCounts.get(digest) ?? 0) + 1);
+    const call = String(finish.data.modelCallId); callFinishCounts.set(call, (callFinishCounts.get(call) ?? 0) + 1);
+  }
+  let created = 0; let terminals = 0; let returned = 0; let failed = 0; let cancelled = 0;
+  let noDispatch = 0; let originals = 0; let parsed = 0; let joined = 0;
+  for (const [groupKey, events] of groups) {
+    const starts = events.filter(event => event.data.phase === 'adapter_attempt_created');
+    const ends = events.filter(event => event.data.phase === 'adapter_attempt_finished');
+    if (starts.length === 1) created++;
+    if (ends.length === 1) terminals++;
+    const first = starts[0]; const last = ends[0];
+    const traffic = input.events.filter(event => event.type === 'model_transport_observed' && !adapterPhase(event.data.phase)
+      && event.data.modelCallId === (first ?? last)?.data.modelCallId && event.data.physicalAttempt === (first ?? last)?.data.physicalAttempt);
+    const dispatches = traffic.filter(event => event.data.phase === 'dispatch_started');
+    const dispatchIds = dispatches.map(event => event.data.dispatchId);
+    const ids = last?.data.dispatchIds;
+    const validIds = Array.isArray(ids) && ids.every(exactIdentity) && new Set(ids).size === ids.length
+      && ids.length === dispatches.length && ids.every((id, i) => id === dispatchIds[i] && dispatchCounts.get(id) === 1
+        && dispatches[i].data.wireSubattempt === i + 1)
+      && traffic.every(event => key(event) === groupKey && namespace(event) === namespace(first ?? last)
+        && event.data.logicalTurnId === (first ?? last).data.logicalTurnId && event.role === 'system' && event.data.version === 1
+        && event.data.journalFailed === false && event.data.late !== true && first && last
+        && event.seq > first.seq && (event.seq < last.seq || (event.data.phase === 'model_attempt_retired' || event.data.phase === 'model_result_completed'))
+        && bounded(event) && time(event)! >= time(first)!
+        && (time(event)! <= time(last)! || (event.seq > last.seq
+          && enumValue(event.data.phase, ['model_attempt_retired', 'model_result_completed']) && time(event)! <= input.end!)))
+      && dispatches.every(dispatch => {
+        const endpoints = traffic.filter(event => event.data.dispatchId === dispatch.data.dispatchId
+          && enumValue(event.data.phase, ['headers_received', 'dispatch_failed']));
+        return enumValue(dispatch.data.transport, ['raw_claude_messages', 'typesafe_systemone']) && endpoints.length === 1
+          && endpoints[0].seq > dispatch.seq && last && endpoints[0].seq < last.seq
+          && endpoints[0].data.transport === dispatch.data.transport && endpoints[0].data.wireSubattempt === dispatch.data.wireSubattempt
+          && time(endpoints[0])! >= time(dispatch)!;
+      });
+    const results = traffic.filter(event => event.data.phase === 'model_result_completed' || event.data.phase === 'model_attempt_retired');
+    const corroborated = results.length === (dispatches.length ? 1 : 0) && results.every(result => {
+      const resultIds = result.data.dispatchIds;
+      return last && Array.isArray(resultIds) && JSON.stringify(resultIds) === JSON.stringify(ids)
+        && localIdentity(result.data.hostResultReceiptId) && receiptCounts.get(result.data.hostResultReceiptId) === 1
+        && result.data.resultScope === last.data.resultScope
+        && (last.data.resultScope === 'original_sdk_response'
+          ? result.data.phase === 'model_result_completed' && result.data.providerResponseIdDigest === last.data.providerResponseIdDigest
+          : result.data.outcome === last.data.outcome && result.data.usage === last.data.usage
+            && result.data.remoteSettlement === last.data.remoteSettlement
+            && (last.data.resultScope === 'owned_systemone_parser'
+              ? result.data.phase === 'model_result_completed' && result.data.providerReportedModel === last.data.providerReportedModel
+              : result.data.phase === 'model_attempt_retired'));
+    });
+    const valid = starts.length === 1 && ends.length === 1 && first.seq < last.seq && namespace(first) === namespace(last)
+      && first.data.resultScope === 'local_adapter_attempt' && Array.isArray(first.data.dispatchIds) && first.data.dispatchIds.length === 0
+      && enumValue(last.data.outcome, ['returned', 'failed', 'cancelled'])
+      && enumValue(last.data.resultScope, ['original_sdk_response', 'owned_systemone_parser', 'local_retirement'])
+      && enumValue(last.data.usage, ['reported', 'unknown']) && enumValue(last.data.remoteSettlement, ['parsed_response', 'unknown'])
+      && !conflictingCalls.has(String(last.data.modelCallId)) && events.every(event => event.data.journalFailed === false)
+      && bounded(first) && bounded(last) && time(last)! >= time(first)! && timestampMs(last)! >= timestampMs(first)!
+      && validIds && corroborated
+      && (last.data.resultScope !== 'original_sdk_response' || (typeof last.data.providerResponseIdDigest === 'string'
+        && /^[a-f0-9]{64}$/.test(last.data.providerResponseIdDigest)))
+      && (last.data.resultScope !== 'owned_systemone_parser' || (last.data.outcome === 'returned'
+        && last.data.remoteSettlement === 'parsed_response' && localIdentity(last.data.providerReportedModel)))
+      && (last.data.resultScope !== 'local_retirement' || (last.data.usage === 'unknown' && last.data.remoteSettlement === 'unknown'
+        && !Object.hasOwn(last.data, 'providerResponseIdDigest')));
+    if (!valid) { issues.add(`incomplete_local_adapter_endpoints:${(first ?? last).seq}`); continue; }
+    if (last.data.outcome === 'returned') returned++; else if (last.data.outcome === 'failed') failed++; else cancelled++;
+    if (ids.length === 0) noDispatch++;
+    const digest = last.data.providerResponseIdDigest;
+    const original = last.data.resultScope === 'original_sdk_response' && typeof digest === 'string' && /^[a-f0-9]{64}$/.test(digest)
+      && digestCounts.get(digest) === 1;
+    const ownedParsed = last.data.resultScope === 'owned_systemone_parser' && last.data.outcome === 'returned'
+      && last.data.remoteSettlement === 'parsed_response' && exactIdentity(last.data.providerReportedModel);
+    if (original) originals++;
+    if (ownedParsed) parsed++;
+    const rows = input.usage.filter(row => row.trace?.acceptedSource === usageSourceKey(input.sessionId, Number(last.data.sourceUserSeq))
+      && row.trace.logicalTurnId === last.data.logicalTurnId && row.trace.attemptId === last.data.runAttemptId
+      && row.trace.modelCallId === last.data.modelCallId);
+    const row = rows[0]; const accounting = row && canonicalCacheAccounting(row);
+    // A failure placeholder or another ordinal's aggregate usage cannot close
+    // this endpoint. Local account labels still have no billing authority.
+    const usageBound = rows.length === 1 && row.ok !== false && row.role === last.data.purpose && accounting?.certified && !accounting.invalid
+      && last.data.outcome === 'returned' && ((original && exactIdentity(row.responseId)
+        && createHash('sha256').update(row.responseId, 'utf8').digest('hex') === digest)
+        || (ownedParsed && last.data.usage === 'reported' && callFinishCounts.get(String(last.data.modelCallId)) === 1
+          && row.providerReportedModel === last.data.providerReportedModel));
+    if (usageBound) joined++;
+  }
+  return { scope: 'declared_local_adapter_attempts_only', status: !observed ? 'not_observed'
+    : issues.size ? 'incomplete' : 'observed_local_endpoints',
+    createdAttempts: observed ? created : null, localTerminals: observed ? terminals : null,
+    returnedAttempts: observed ? returned : null, failedAttempts: observed ? failed : null, cancelledAttempts: observed ? cancelled : null,
+    noObservedDispatchAttempts: observed ? noDispatch : null, originalSdkIdentities: observed ? originals : null,
+    ownedParsedResults: observed ? parsed : null, exactReportedUsageJoins: observed ? joined : null,
+    unknownUsageAttempts: observed ? groups.size - joined : null, afterDeliveryEvents: afterDelivery,
+    publicInvocationCoverage: 'unproved', allLegPhysicalInventory: 'unproved', accountAndBackendAuthority: 'unproved',
+    coverageLimits: ['public_lazy_invocations_and_pre_adapter_failures_unproved', 'hidden_sdk_retries_and_rowless_usage_unproved',
+      'actual_account_backend_and_billing_unproved', 'local_endpoint_counts_do_not_establish_critical_path'], issues: [...issues] };
+}
+
+function measureTransportObservations(input: {
+  sessionId: string; events: readonly SessionEvent[]; sources: ReadonlyMap<number, TimingSource>;
+  usage: readonly UsageEvent[]; isAncestor?: (ancestor: number, descendant: number) => boolean;
+  windowStart: SessionEvent | undefined; windowEnd: SessionEvent | undefined; windowProved?: boolean;
+}): AcceptedTransportObservation {
+  const issues = new Set<string>();
+  const isAncestor = input.isAncestor ?? ((a, b) => a === b);
+  const sourceByAttempt = new Map<string, number>();
+  for (const [source, scope] of input.sources) for (const attempt of scope.attempts.ids) sourceByAttempt.set(attempt, source);
+  const start = timestampMs(input.windowStart); const end = timestampMs(input.windowEnd);
+  const windowProved = input.windowProved !== false && start !== null && end !== null && end >= start;
+  if (!windowProved) issues.add('accepted_delivery_window_unproved');
+  const owned: SessionEvent[] = [];
+  for (const event of input.events) {
+    if (event.type !== 'model_transport_observed') continue;
+    // Local adapter records cannot turn absent wire observations into zero.
+    if (adapterPhase(event.data.phase)) continue;
+    const source = positiveEventSeq(event.data.sourceUserSeq);
+    const attempt = event.data.runAttemptId;
+    const owner = exactIdentity(attempt) ? sourceByAttempt.get(attempt) : undefined;
+    if ((source === null || !input.sources.has(source)) && owner === undefined) continue;
+    if (event.role !== 'system' || event.data.version !== 1 || source === null || !input.sources.has(source)
+      || owner === undefined || !isAncestor(source, owner) || event.data.logicalTurnId !== `turn:${source}`
+      || !exactIdentity(event.data.modelCallId) || positiveEventSeq(event.data.physicalAttempt) === null
+      || event.seq <= input.sources.get(source)!.source.seq) {
+      issues.add(`invalid_transport_observation_ownership:${event.seq}`); continue;
+    }
+    owned.push(event);
+  }
+  const groups = new Map<string, SessionEvent[]>();
+  for (const event of owned) {
+    const key = JSON.stringify([event.data.sourceUserSeq, event.data.runAttemptId, event.data.modelCallId, event.data.physicalAttempt]);
+    const group = groups.get(key) ?? []; group.push(event); groups.set(key, group);
+    if (event.data.journalFailed === true) issues.add(`transport_journal_failure:${event.seq}`);
+  }
+  const wireIds = new Map<string, string>();
+  const wireIdCounts = new Map<string, number>(); const digestCounts = new Map<string, number>();
+  const resultCallCounts = new Map<string, number>();
+  const receiptCounts = new Map<string, number>();
+  for (const event of owned) {
+    if (exactIdentity(event.data.hostResultReceiptId)) {
+      const id = event.data.hostResultReceiptId; receiptCounts.set(id, (receiptCounts.get(id) ?? 0) + 1);
+    }
+    if (event.data.phase === 'dispatch_started' && exactIdentity(event.data.dispatchId)) {
+      wireIdCounts.set(event.data.dispatchId, (wireIdCounts.get(event.data.dispatchId) ?? 0) + 1);
+    }
+    if (event.data.phase === 'model_result_completed') {
+      const id = String(event.data.modelCallId); resultCallCounts.set(id, (resultCallCounts.get(id) ?? 0) + 1);
+      const digest = event.data.providerResponseIdDigest;
+      if (typeof digest === 'string') digestCounts.set(digest, (digestCounts.get(digest) ?? 0) + 1);
+    }
+  }
+  const declaredTransports = new Set<string>(); const wireIntervals: [number, number][] = [];
+  const modelIntervals: [number, number][] = [];
+  let starts = 0; let headers = 0; let failures = 0; let retired = 0; let results = 0; let joined = 0; let afterDelivery = 0;
+  const eventTime = (event: SessionEvent): number | null => {
+    const value = event.data.at;
+    return event.data.clock === 'host_epoch_ms' && typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+  };
+  const interval = (first: SessionEvent, last: SessionEvent, sink: [number, number][]): void => {
+    const a = eventTime(first); const b = eventTime(last);
+    if (!windowProved || a === null || b === null || b < a || a < start! || b > end!) {
+      issues.add(`unbounded_transport_interval:${first.seq}:${last.seq}`); return;
+    }
+    sink.push([a, b]);
+  };
+  for (const event of owned) if (end !== null && eventTime(event) !== null && eventTime(event)! > end) afterDelivery++;
+  for (const [key, events] of groups) {
+    const dispatches = events.filter(e => e.data.phase === 'dispatch_started');
+    const completed = events.filter(e => e.data.phase === 'model_result_completed');
+    retired += events.filter(e => e.data.phase === 'model_attempt_retired').length;
+    for (const dispatch of dispatches) {
+      const id = dispatch.data.dispatchId; const transport = dispatch.data.transport;
+      if (!exactIdentity(id) || !['raw_claude_messages', 'typesafe_systemone'].includes(String(transport))
+        || positiveEventSeq(dispatch.data.wireSubattempt) === null) {
+        issues.add(`invalid_transport_dispatch:${dispatch.seq}`); continue;
+      }
+      starts++; declaredTransports.add(String(transport));
+      if (wireIds.has(id)) issues.add(`duplicate_transport_dispatch_identity:${dispatch.seq}`);
+      else wireIds.set(id, key);
+      const ends = events.filter(e => e.data.dispatchId === id
+        && ['headers_received', 'dispatch_failed'].includes(String(e.data.phase)));
+      if (ends.length !== 1 || ends[0].seq <= dispatch.seq || ends[0].data.transport !== transport
+        || ends[0].data.wireSubattempt !== dispatch.data.wireSubattempt) {
+        issues.add(`unsettled_transport_dispatch:${dispatch.seq}`); continue;
+      }
+      if (ends[0].data.phase === 'headers_received') headers++; else failures++;
+      interval(dispatch, ends[0], wireIntervals);
+    }
+    for (const response of completed) {
+      results++;
+      const ids = response.data.dispatchIds;
+      const validIds = Array.isArray(ids) && ids.length > 0 && ids.every(exactIdentity)
+        && new Set(ids).size === ids.length && ids.length === dispatches.length
+        && ids.every((id, index) => {
+          const dispatch = dispatches[index];
+          const ends = events.filter(e => e.data.dispatchId === id
+            && ['headers_received', 'dispatch_failed'].includes(String(e.data.phase)));
+          return wireIdCounts.get(id) === 1 && dispatch?.data.dispatchId === id
+            && dispatch.data.wireSubattempt === index + 1 && dispatch.seq < response.seq && ends.length === 1
+            && ends[0].data.transport === dispatch.data.transport && ends[0].data.wireSubattempt === dispatch.data.wireSubattempt
+            && ends[0].seq > dispatch.seq && ends[0].seq < response.seq;
+        });
+      const receipt = response.data.hostResultReceiptId;
+      const validReceipt = exactIdentity(receipt) && receiptCounts.get(receipt) === 1;
+      if (completed.length !== 1 || !validIds || !validReceipt || response.data.journalFailed === true) {
+        issues.add(`unproved_completed_transport_result:${response.seq}`); continue;
+      }
+      const rows = input.usage.filter(row => row.trace?.acceptedSource === usageSourceKey(input.sessionId, Number(response.data.sourceUserSeq))
+        && row.trace.logicalTurnId === response.data.logicalTurnId && row.trace.attemptId === response.data.runAttemptId
+        && row.trace.modelCallId === response.data.modelCallId);
+      const row = rows[0];
+      const arithmetic = row && canonicalCacheAccounting(row);
+      const sdkBound = response.data.resultScope === 'original_sdk_response' && exactIdentity(row?.responseId)
+        && typeof response.data.providerResponseIdDigest === 'string'
+        && digestCounts.get(response.data.providerResponseIdDigest) === 1
+        && createHash('sha256').update(row.responseId, 'utf8').digest('hex') === response.data.providerResponseIdDigest;
+      const parsedBound = response.data.resultScope === 'owned_systemone_parser' && response.data.usage === 'reported'
+        && response.data.remoteSettlement === 'parsed_response' && resultCallCounts.get(String(response.data.modelCallId)) === 1;
+      if (rows.length === 1 && row.ok !== false && arithmetic?.certified && !arithmetic.invalid && (sdkBound || parsedBound)) joined++;
+      else issues.add(`completed_transport_result_usage_unproved:${response.seq}`);
+      const first = dispatches.reduce((a, b) => a.seq < b.seq ? a : b);
+      interval(first, response, modelIntervals);
+    }
+  }
+  // A completed SDK result can span multiple wire dispatches. Its successful
+  // usage never certifies earlier HTTP refusals/retries or rowless failures.
+  // Joins certify a recorded original SDK/parsed result, not each wire leg's
+  // provider receipt. In particular TTL refusal costs and SDK retry aggregates
+  // cannot borrow the final result's usage. No wire-local usage seal exists.
+  const withoutUsage = starts;
+  if (starts > 0) issues.add(`transport_dispatch_usage_unproved:${withoutUsage}`);
+  issues.add('all_leg_physical_inventory_unproved');
+  const observed = owned.length > 0;
+  return { scope: 'declared_transports_only', inventory: observed ? 'partial' : 'not_observed',
+    allLegPhysicalInventory: 'unproved', declaredTransports: [...declaredTransports],
+    observedDispatches: observed ? starts : null, headersReceived: observed ? headers : null,
+    fetchFailures: observed ? failures : null, localRetirements: observed ? retired : null,
+    completedModelResults: observed ? results : null, exactResponseUsageJoins: observed ? joined : null,
+    dispatchesWithoutCompletedUsageProof: observed ? withoutUsage : null,
+    window: { acceptedAt: start === null ? null : input.windowStart!.createdAt,
+      deliveryAt: end === null ? null : input.windowEnd!.createdAt, elapsedMs: windowProved ? end! - start! : null },
+    dispatchToHeadersOrLocalFailureUnionMs: wireIntervals.length ? intervalUnionMs(wireIntervals) : null,
+    observedCompletedModelSpanUnionMs: modelIntervals.length ? intervalUnionMs(modelIntervals) : null,
+    afterDeliveryEvents: afterDelivery, criticalPath: 'not_established', accountAuthority: 'unproved',
+    schemaAndServingIdentity: 'not_bound_by_transport_journal', issues: [...issues],
+    localAdapterAttempts: measureLocalAdapterAttempts({ ...input, isAncestor, start, end, windowProved }) };
 }
 
 interface WorkerUsageScope {
@@ -1990,6 +2367,11 @@ export function measureAcceptedTask(
     // segment as the whole task. Explicit task/segment timings follow below.
     turnWallMs: null,
     scope: 'task', rootSourceUserSeq, acceptedSource,
+    transportObservation: measureTransportObservations({ sessionId, events: sessionRead.events,
+      sources: new Map([...members].map(([seq, source]) => [seq, {
+        source, attempts: attemptsBySource.get(seq)!, terminal: terminals.get(seq),
+      }])), usage: exactUsage, isAncestor, windowStart: root, windowEnd: terminal,
+      windowProved: lineageIssues.size === 0 && terminals.size === members.size }),
     sourceUserSeqs: [...members.keys()], approvalContinuations, lineageIssues: [...lineageIssues],
     workerUsageParticipants: [...workers.scopes.values()].map(scope => scope.participant),
     workerLineageIssues: [...workers.issues], workerAttemptCount, unfinishedWorkerAttempts,

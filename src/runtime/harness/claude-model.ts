@@ -30,6 +30,10 @@ import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
 import { getClaudeBrainModel, getRuntimeEnv, MODELS } from '../../config.js';
 import { withResilience } from './resilient-model.js';
 import { completedModelResponseBinding, type CompletedModelResponseBinding } from './model-response-binding.js';
+import { activeModelWireRequestSnapshot, beginActiveClaudeReviewWireTransform, createClaudeModelWireProducer,
+  declareActiveClaudeModelWireProducer, finishActiveClaudeReviewWireTransform, observeModelTransportFetch,
+  type ClaudeModelWireProducer } from './model-transport-observation.js';
+import type { ClaudeSystemTextProjection, ReviewWireTransform } from './review-input-observation.js';
 import { withModelFallback, type FallbackTarget } from './fallback-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
@@ -49,7 +53,7 @@ import {
 import { claudeSubscriptionTransport, claudeHeadlessCliAvailable, getClaudeHeadlessModel, resetClaudeHeadlessModelCache } from './claude-headless-model.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { withConversationProtocolBoundaryAssertion } from './conversation-protocol-boundary.js';
-import { recordModelUsage } from '../usage-log.js';
+import { captureMemoryModelUsageProvenance, capturedModelUsageAttribution, type CapturedModelUsageProvenance, recordModelUsage } from '../usage-log.js';
 import { recordWindowAcceptance } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { appendEvent } from './eventlog.js';
@@ -138,7 +142,7 @@ export function applyClaudeEnvelope(
   init: { headers?: HeadersInit; body?: BodyInit | null } | undefined,
   token: string,
   clientVersion = installedClaudeClientVersion(),
-): { headers: Headers; body: BodyInit | null | undefined; toolAliases: Map<string, string> } {
+): { headers: Headers; body: BodyInit | null | undefined; toolAliases: Map<string, string>; wireModel?: string; reviewWireTransform?: ReviewWireTransform } {
   const headers = new Headers(init?.headers);
   headers.delete('x-api-key'); // BILLING GUARD — never API-bill
   headers.set('authorization', `Bearer ${token}`);
@@ -149,9 +153,13 @@ export function applyClaudeEnvelope(
 
   let body = init?.body;
   let toolAliases = new Map<string, string>();
+  let wireModel: string | undefined;
+  let reviewWireTransform: ReviewWireTransform | undefined;
   if (typeof body === 'string') {
     try {
       const parsed = JSON.parse(body) as Record<string, unknown>;
+      reviewWireTransform = beginActiveClaudeReviewWireTransform(parsed);
+      let textProjection: ClaudeSystemTextProjection | undefined;
       if (Array.isArray(parsed.tools)) {
         for (const item of parsed.tools) {
           if (!item || typeof item !== 'object') continue;
@@ -182,7 +190,7 @@ export function applyClaudeEnvelope(
         // Parity path: identity-first system blocks + a cache_control breakpoint
         // on the stable prefix (G3), gated by the model's cacheMinTokens.
         const cap = resolveModelCapability(typeof parsed.model === 'string' ? parsed.model : '');
-        applyClaudeCaching(parsed, cap);
+        applyClaudeCaching(parsed, cap, reviewWireTransform ? projection => { textProjection = projection; } : undefined);
       } else {
         // Legacy path. Defensively restore legacy order / strip any stray
         // sentinel first — handling BOTH a string system AND the real
@@ -201,12 +209,14 @@ export function applyClaudeEnvelope(
       ensureUserTerminalMessage(parsed);
       if (parsed.max_tokens == null) parsed.max_tokens = CLAUDE_DEFAULT_MAX_TOKENS;
       toolAliases = aliasClaudeWireToolNames(parsed);
+      finishActiveClaudeReviewWireTransform(reviewWireTransform, parsed, textProjection, CLAUDE_CODE_IDENTITY);
       body = JSON.stringify(parsed);
+      wireModel = rawClaudeReportedModel(parsed.model);
     } catch {
       // non-JSON body (shouldn't happen for Messages) — leave as-is
     }
   }
-  return { headers, body, toolAliases };
+  return { headers, body, toolAliases, ...(wireModel ? { wireModel } : {}), ...(reviewWireTransform ? { reviewWireTransform } : {}) };
 }
 
 /** Claude bills a request whose tool definitions include a name beginning
@@ -467,8 +477,10 @@ export function buildClaudeSystemBlocks(
   cachingOn: boolean,
   toolsTokens = 0,
   stableTtl: '1h' | undefined = undefined,
+  observeTextProjection?: (projection: ClaudeSystemTextProjection) => void,
 ): { blocks: Array<Record<string, unknown>>; systemCached: boolean; systemBreakpoints: number } {
   let raw = normalizeSystemText(system);
+  const identityPrefixRemoved = raw.startsWith(CLAUDE_CODE_IDENTITY);
   if (raw.startsWith(CLAUDE_CODE_IDENTITY)) {
     raw = raw.slice(CLAUDE_CODE_IDENTITY.length).replace(/^\s+/, '');
   }
@@ -516,6 +528,10 @@ export function buildClaudeSystemBlocks(
     blocks.push(coreBlock);
   }
   if (dynamic) blocks.push({ type: 'text', text: dynamic });
+  if (observeTextProjection) try { const observed: unknown = observeTextProjection(Object.freeze({ branch: 'parity_cache', identityPrefixRemoved,
+    cacheBreakByte: sentIdx < 0 ? null : Buffer.byteLength(raw.slice(0, sentIdx), 'utf8'), role, core, dynamic }));
+    if (observed && typeof (observed as PromiseLike<unknown>).then === 'function') void Promise.resolve(observed).catch(() => {});
+  } catch { /* diagnostics never alter the existing system blocks */ }
   return { blocks, systemCached: systemBreakpoints > 0, systemBreakpoints };
 }
 
@@ -545,11 +561,12 @@ function breakpointLastMessage(msg: Record<string, unknown>): void {
  *  breakpoint on the (stable) tools array when the system prefix wasn't cached (no
  *  sentinel / empty stable, e.g. a sub-agent prompt); and — additively — a
  *  breakpoint on the transcript so the shared conversation caches (Gap #1). */
-function applyClaudeCaching(parsed: Record<string, unknown>, cap: ModelCapability): void {
+function applyClaudeCaching(parsed: Record<string, unknown>, cap: ModelCapability,
+  observeTextProjection?: (projection: ClaudeSystemTextProjection) => void): void {
   const tools = Array.isArray(parsed.tools) ? (parsed.tools as Array<Record<string, unknown>>) : [];
   const toolsTokens = tools.length > 0 ? estimateTokens(JSON.stringify(tools)) : 0;
   const stableTtl = claudeStablePrefixCacheTtl(typeof parsed.model === 'string' ? parsed.model : '');
-  const { blocks, systemCached, systemBreakpoints } = buildClaudeSystemBlocks(parsed.system, cap, true, toolsTokens, stableTtl);
+  const { blocks, systemCached, systemBreakpoints } = buildClaudeSystemBlocks(parsed.system, cap, true, toolsTokens, stableTtl, observeTextProjection);
   parsed.system = blocks;
   // breakpoint tally — Anthropic allows at most 4 cache_control markers per
   // request: rubric, memory core and transcript use at most three.
@@ -769,41 +786,43 @@ export function extractClaudeThinkingText(chunk: string): string {
   return parts.join('');
 }
 
+/** The existing TTL refusal retry, factored so the actual dispatch boundary
+ * can be exercised without authentication, an app lifecycle or provider IO. */
+export async function dispatchClaudeWithCacheTtlRetry(
+  body: BodyInit | null | undefined,
+  dispatch: (body: BodyInit | null | undefined, reason?: 'cache_ttl_rejected') => Promise<Response>,
+  rejected: (response: Response, detail: string, modelId: string) => void = (res, detail, modelId) => {
+    logger.warn({ modelId, detail: detail.slice(0, 300) }, 'Claude endpoint refused the hour-long cache marker; retrying without it');
+    void persistClaudeErrorTrace(res.clone(), body, res.status);
+  },
+): Promise<Response> {
+  const res = await dispatch(body);
+  if (res.status !== 400 || typeof body !== 'string' || !body.includes('"ttl":"1h"')) return res;
+  let detail = '';
+  try { detail = await res.clone().text(); } catch { /* the original trace still runs */ }
+  if (!claudeCacheTtlRejected(res.status, detail, body)) return res;
+  let modelId = '';
+  try { modelId = String((JSON.parse(body) as { model?: unknown }).model ?? ''); } catch { /* unreadable body */ }
+  markClaudeCacheTtlRejected(modelId);
+  rejected(res, detail, modelId);
+  return dispatch(stripClaudeCacheTtl(body), 'cache_ttl_rejected');
+}
+
 export function makeClaudeFetch(): typeof fetch {
   return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     assertLiveModelTransportAllowed('Claude Messages API');
     const token = await freshClaudeToken();
-    const { headers, body, toolAliases } = applyClaudeEnvelope(init, token);
+    const { headers, body, toolAliases, wireModel, reviewWireTransform } = applyClaudeEnvelope(init, token);
     const dispatcher = modelParityEnabled() ? getClaudeDispatcher(claudeHeadersTimeoutMs(body)) : undefined;
     const debug = claudeWireDebugEnabled();
     if (debug) logClaudeRequestShape(body);
-    let res = await fetch(input, {
+    let res = await dispatchClaudeWithCacheTtlRetry(body, (requestBody, reason) => observeModelTransportFetch('raw_claude_messages', wireModel, () => fetch(input, {
       ...init,
       headers,
-      body,
+      body: requestBody,
       ...(dispatcher ? { dispatcher } : {}),
-    } as RequestInit & { dispatcher?: unknown });
-    // An endpoint that refuses the hour-long cache marker gets the same
-    // request once more without it, and this model omits the marker from
-    // then on. The refusal itself is still traced below.
-    if (res.status === 400 && typeof body === 'string' && body.includes('"ttl":"1h"')) {
-      let detail = '';
-      try { detail = await res.clone().text(); } catch { /* the trace below still runs */ }
-      if (claudeCacheTtlRejected(res.status, detail, body)) {
-        let modelId = '';
-        try { modelId = String((JSON.parse(body) as { model?: unknown }).model ?? ''); } catch { /* unreadable body */ }
-        markClaudeCacheTtlRejected(modelId);
-        logger.warn({ modelId, detail: detail.slice(0, 300) }, 'Claude endpoint refused the hour-long cache marker; retrying without it');
-        void persistClaudeErrorTrace(res.clone(), body, res.status);
-        const retried = stripClaudeCacheTtl(body);
-        res = await fetch(input, {
-          ...init,
-          headers,
-          body: retried,
-          ...(dispatcher ? { dispatcher } : {}),
-        } as RequestInit & { dispatcher?: unknown });
-      }
-    }
+    } as RequestInit & { dispatcher?: unknown }), reason, activeModelWireRequestSnapshot(requestBody),
+      { transform: reviewWireTransform, serialized: requestBody }));
     // ALWAYS persist an error trace (request body + response) to disk on ANY
     // non-2xx — 4xx (malformed: system placement / effort / cache_control), 429
     // (rate_limit_error; scope depends on provider detail), 529 (ANTHROPIC capacity:
@@ -968,17 +987,19 @@ export function sanitizeClaudeInput(input: unknown): unknown {
  *  aisdk adapter, so a Codex-shaped reasoning item can never crash a Claude turn.
  *  Wraps the bare adapter so retries (withResilience) see sanitized input too. */
 class ClaudeInputSanitizingModel implements Model {
-  constructor(private readonly inner: Model) {}
+  constructor(private readonly inner: Model, private readonly producer?: ClaudeModelWireProducer) {}
   getResponse(request: ModelRequest): Promise<ModelResponse> {
+    if (this.producer) declareActiveClaudeModelWireProducer(this.producer);
     return this.inner.getResponse({ ...request, input: sanitizeClaudeInput((request as { input?: unknown }).input) } as ModelRequest);
   }
   getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+    if (this.producer) declareActiveClaudeModelWireProducer(this.producer);
     return this.inner.getStreamedResponse({ ...request, input: sanitizeClaudeInput((request as { input?: unknown }).input) } as ModelRequest);
   }
 }
 
-export function withClaudeInputSanitizer(inner: Model): Model {
-  return new ClaudeInputSanitizingModel(inner);
+export function withClaudeInputSanitizer(inner: Model, producer?: ClaudeModelWireProducer): Model {
+  return new ClaudeInputSanitizingModel(inner, producer);
 }
 
 /** Apply Clementine's Claude output allowance before the AI SDK adapter gets
@@ -1091,7 +1112,8 @@ class RawClaudeUsageRecordingModel implements Model {
   ) {}
 
   private record(response: ModelResponse, startedAt: number, context: RawClaudeCallContext | undefined = harnessRunContextStorage.getStore(),
-    binding: CompletedModelResponseBinding | undefined = completedModelResponseBinding(response)): void {
+    binding: CompletedModelResponseBinding | undefined = completedModelResponseBinding(response),
+    provenance?: CapturedModelUsageProvenance): void {
     try {
       const fields = rawClaudeUsageFields(response);
       if (fields.inputTokens === 0 && fields.outputTokens === 0) return;
@@ -1114,6 +1136,7 @@ class RawClaudeUsageRecordingModel implements Model {
         || reportedModels.some((model) => model === undefined) || new Set(reportedModels).size > 1
         ? undefined : reportedModels[0];
       this.usageRecorder({
+        ...(provenance ? { callerProvenance: provenance } : {}),
         sessionId: context?.sessionId ?? 'unknown',
         sourceUserSeq: context?.sourceUserSeq,
         attemptId: context?.runAttemptId,
@@ -1135,15 +1158,17 @@ class RawClaudeUsageRecordingModel implements Model {
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    const provenance = captureMemoryModelUsageProvenance();
     const startedAt = Date.now();
     const response = await this.inner.getResponse(request);
-    this.record(response, startedAt);
+    this.record(response, startedAt, undefined, undefined, provenance);
     return response;
   }
 
   getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
     // Capture before returning the iterable: the host may drain it outside the
     // original async-local scope. Never join a later session to this source.
+    const provenance = captureMemoryModelUsageProvenance();
     const current = harnessRunContextStorage.getStore();
     const context: RawClaudeCallContext | undefined = current && {
       sessionId: current.sessionId, sourceUserSeq: current.sourceUserSeq,
@@ -1169,7 +1194,7 @@ class RawClaudeUsageRecordingModel implements Model {
                 recorded = true;
                 // Read the exact inner response's private binding before its
                 // metadata-only projection. Arbitrary clones gain no proof.
-                self.record(enriched, startedAt, context, completedModelResponseBinding(response));
+                self.record(enriched, startedAt, context, completedModelResponseBinding(response), provenance);
               }
             }
           }
@@ -1182,14 +1207,19 @@ class RawClaudeUsageRecordingModel implements Model {
       } finally {
         // Exactly one best-effort record for this observed wrapper call,
         // including throw/consumer-close. Inner hidden retries are not counted.
-        if (context && rawClaudeTraceIdentity(context.sessionId) && context.sessionId !== 'unknown'
-          && Number.isSafeInteger(context.sourceUserSeq) && (context.sourceUserSeq ?? 0) > 0) {
+        const accounting = provenance && capturedModelUsageAttribution(provenance);
+        const diagnosticContext = provenance ? (accounting?.usageParentTurn ? {
+          sessionId: accounting.usageParentTurn.sessionId, sourceUserSeq: accounting.usageParentTurn.sourceUserSeq,
+          runAttemptId: accounting.usageParentTurn.attemptId, turn: 0,
+        } : undefined) : context;
+        if (diagnosticContext && rawClaudeTraceIdentity(diagnosticContext.sessionId) && diagnosticContext.sessionId !== 'unknown'
+          && Number.isSafeInteger(diagnosticContext.sourceUserSeq) && (diagnosticContext.sourceUserSeq ?? 0) > 0) {
           try {
             self.diagnosticRecorder({
               kind: 'raw_claude_stream', transport: 'raw_messages',
-              sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq!,
-              turn: Number.isSafeInteger(context.turn) && (context.turn ?? 0) >= 0 ? context.turn! : 0,
-              ...(rawClaudeTraceIdentity(context.runAttemptId) ? { attemptId: context.runAttemptId } : {}),
+              sessionId: diagnosticContext.sessionId, sourceUserSeq: diagnosticContext.sourceUserSeq!,
+              turn: Number.isSafeInteger(diagnosticContext.turn) && (diagnosticContext.turn ?? 0) >= 0 ? diagnosticContext.turn! : 0,
+              ...(rawClaudeTraceIdentity(diagnosticContext.runAttemptId) ? { attemptId: diagnosticContext.runAttemptId } : {}),
               ...(rawClaudeReportedModel(self.modelId) ? { requestModel: self.modelId } : {}),
               elapsedMs: Math.max(0, Date.now() - startedAt), settlement,
               ...observation.summary(),
@@ -1276,6 +1306,7 @@ function buildRawClaudeModel(modelId: string): Model {
   const capability = resolveModelCapability(modelId);
   let model: Model = withClaudeInputSanitizer(
     withClaudeRequestDefaults(withTracelessStep(aisdk(withProviderToolMedia(getProvider()(modelId)))), capability),
+    createClaudeModelWireProducer(),
   );
   // Parity layer: provider-agnostic resilience (retry/empty/401) + reasoning
   // translation (effort -> output_config.effort). Wrap BEFORE caching so the

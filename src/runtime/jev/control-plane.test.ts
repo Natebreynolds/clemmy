@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
+import { createHash } from 'node:crypto';
 
 const {
   _setSystemOneFetchForTests,
@@ -21,11 +22,55 @@ const {
   tryJevGroundingVerdict,
   tryJevOutputGroundingVerdict,
   tryJevTrajectoryVerdict,
+  jevCompletionAssessmentForReview,
 } = await import('./control-plane.js');
+const { modelUsageAttributionStorage } = await import('../usage-log.js');
 
 afterEach(() => {
   _setTypesafeKeyForTests(undefined);
   _setSystemOneFetchForTests(undefined);
+});
+
+test('original same-invocation abstention remains advisory with exact request and six-score bindings', async () => {
+  const owner = { sessionId: 'sess-jev-assessment', sourceUserSeq: 1, attemptId: 'attempt:jev-assessment' };
+  const objective = 'Explain the status.', reply = 'The status is ready.';
+  const hash = (s: string) => createHash('sha256').update(s).digest('hex');
+  const expected = { owner, reviewInvocationId: 'review:assessment', contextDigest: 'a'.repeat(64),
+    objectiveDigest: hash(objective), candidateDigest: hash(reply) };
+  const scores = { delivered: 0.4, unaddressed: 0.7, unsupported: 0.93, computed: 0.8, asksUser: 0.03, cannotFinish: 0.04 };
+  let posted = ''; let calls = 0; let assessment: unknown;
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async (_url, init) => { calls++; posted = init.body; return { status: 200, ok: true,
+    text: async () => JSON.stringify({ model: 'jev-1.13.0',
+      answers: Object.fromEntries(Object.entries(scores).map(([id, noul]) => [id, { type: 'noul', noul }])) }) }; });
+  await modelUsageAttributionStorage.run(owner, async () => {
+    const verdict = await tryJevCompletionVerdict(objective, reply, { sessionId: owner.sessionId,
+      toolCallSummary: 'PRIVATE_SAME_SOURCE', coverage: { complete: true, outcomeEvidence: [] },
+      assessmentScope: expected, onAssessment: value => { assessment = value; } });
+    assert.equal(verdict, null, 'forwarding does not change an abstention into a verdict');
+    const metadata = jevCompletionAssessmentForReview(assessment, expected)!;
+    assert.ok(metadata); assert.equal(metadata.outcome, 'abstained'); assert.deepEqual(metadata.scores, scores);
+    assert.equal(metadata.producer.requestBodySha256, hash(posted));
+    assert.equal(metadata.stateSha256, hash(JSON.stringify(JSON.parse(posted).state)));
+    assert.equal(metadata.questionnaireSha256, hash(JSON.stringify(JSON.parse(posted).questions)));
+    assert.doesNotMatch(JSON.stringify(metadata), /PRIVATE_SAME_SOURCE|ts_test/);
+    for (const changed of [ { candidateDigest: 'b'.repeat(64) }, { objectiveDigest: 'b'.repeat(64) },
+      { contextDigest: 'b'.repeat(64) }, { reviewInvocationId: 'review:other' },
+      { owner: { ...owner, attemptId: 'attempt:other' } } ]) {
+      assert.equal(jevCompletionAssessmentForReview(assessment, { ...expected, ...changed }), undefined);
+    }
+    assert.equal(jevCompletionAssessmentForReview({ ...(assessment as object) }, expected), undefined);
+    const controller = new AbortController(); controller.abort();
+    assert.equal(jevCompletionAssessmentForReview(assessment, { ...expected, signal: controller.signal }), undefined);
+    await modelUsageAttributionStorage.run({ ...owner, sourceUserSeq: 2 }, async () => {
+      assert.equal(jevCompletionAssessmentForReview(assessment, expected), undefined);
+    });
+    assert.equal(await tryJevCompletionVerdict(objective, reply, { sessionId: owner.sessionId,
+      assessmentScope: expected, onAssessment: () => { throw new Error('observer failed'); } }), null);
+    assert.equal(await tryJevCompletionVerdict(objective, reply, { sessionId: owner.sessionId,
+      assessmentScope: expected, onAssessment: () => Promise.reject(new Error('async observer failed')) }), null);
+  });
+  assert.equal(calls, 3, 'only the three explicitly requested screen calls occurred');
 });
 
 test('read nomination preserves accounts, ambiguity and unavailable outcomes', async () => {

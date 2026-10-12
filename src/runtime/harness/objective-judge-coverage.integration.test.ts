@@ -13,6 +13,11 @@ process.env.OPENAI_AGENTS_DISABLE_TRACING = '1';
 mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
 
 const { Usage } = await import('@openai/agents');
+const { bindCompletedModelResponse } = await import('./model-response-binding.js');
+const { withResilience } = await import('./resilient-model.js');
+const { resolveModelCapability } = await import('./model-wire-registry.js');
+const { modelUsageAttributionStorage } = await import('../usage-log.js');
+const { getJudgeMetricsSnapshot } = await import('./judge-family.js');
 const { ClaudeModelProvider } = await import('./claude-model.js');
 const { CodexModelProvider } = await import('./codex-model.js');
 const { judgeObjectiveComplete, HOST_COMPLETION_EVIDENCE_GUIDANCE } = await import('./objective-judge.js');
@@ -24,6 +29,9 @@ const { closeEventLog } = await import('./eventlog.js');
 type Step = string | Error | { tool: 'open_evidence' | 'query_evidence'; args: Record<string, unknown> };
 let script: Step[] = [];
 const requests: ModelRequest[] = [];
+let originalMode: 'bound' | 'clone' | 'unbound' | 'mutated_request' | 'mutated_owner' | 'mutated_output' | 'reused' = 'bound';
+let lastOriginalResponse: ModelResponse | undefined;
+let reviewerReturn: (() => void) | undefined;
 
 const reviewer: Model = {
   async getResponse(request): Promise<ModelResponse> {
@@ -32,9 +40,13 @@ const reviewer: Model = {
     if (step === undefined) throw new Error('the reviewer was asked more often than this review allows');
     if (step instanceof Error) throw step;
     if (typeof step === 'string') {
-      return { output: [{ type: 'message', role: 'assistant', status: 'completed',
+      const response = { output: [{ type: 'message', role: 'assistant', status: 'completed',
         content: [{ type: 'output_text', text: step, providerData: {} }] }],
         usage: new Usage(), responseId: `coverage-${requests.length}` } as ModelResponse;
+      if (originalMode === 'reused' && lastOriginalResponse) return lastOriginalResponse;
+      lastOriginalResponse=response;
+      reviewerReturn?.();
+      return response;
     }
     return { output: [{ type: 'function_call', callId: `lookup-${requests.length}`, name: step.tool,
       arguments: JSON.stringify(step.args), status: 'completed' }],
@@ -100,6 +112,8 @@ function inheritedReview(sourceExhausted = false, shown = false) {
 beforeEach(() => {
   mock.restoreAll();
   script = [];
+  originalMode = 'bound';
+  lastOriginalResponse=undefined; reviewerReturn=undefined;
   requests.length = 0;
   source = { data: { value: records(false) } };
   Object.assign(process.env, {
@@ -119,8 +133,8 @@ beforeEach(() => {
   }));
   _setDiscoveredModelsForTest({ anthropic: [], openai: [] });
   resetJudgeMetricsForTests();
-  mock.method(ClaudeModelProvider.prototype, 'getModel', () => reviewer);
-  mock.method(CodexModelProvider.prototype, 'getModel', () => reviewer);
+  mock.method(ClaudeModelProvider.prototype, 'getModel', () => routedReviewer());
+  mock.method(CodexModelProvider.prototype, 'getModel', () => routedReviewer());
 });
 
 after(() => {
@@ -182,14 +196,15 @@ test('the reviewer is told before it rules which results it holds only in part',
   assert.equal(verdict.evidenceCoverage?.followUp, undefined);
 });
 
-test('relocated host guidance preserves a sufficient verdict through the actual completion request', async () => {
+test('host assessment opt-in does not certify a legacy one-line answer lacking the packet', async () => {
   script = ['DONE: the event was created, confirmed by its write receipt.\nNEEDS ALL OF: call_write'];
   const verdict = await review({ completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE });
   assert.equal(verdict.done, true);
-  assert.equal(verdict.failedOpen, undefined);
+  assert.equal(verdict.failedOpen, true);
+  assert.equal(verdict.reviewDisposition, 'answered_unqualified');
+  assert.equal(verdict.reviewAssessment?.reason, 'missing');
   assert.equal(requests.length, 1);
-  assert.equal(verdict.evidenceCoverage?.status, 'sufficient');
-  assert.deepEqual(verdict.evidenceCoverage?.needsAllOf, ['call_write']);
+  assert.equal(verdict.evidenceCoverage, undefined, 'an absent assessment does not launch the coverage follow-up');
   const system = String(requests[0]!.systemInstructions);
   assert.equal(system.split(HOST_COMPLETION_EVIDENCE_GUIDANCE).length - 1, 1);
   assert.doesNotMatch(system, /call_list|call_write|rh_list|rh_write|Autumn Picture Day/);
@@ -202,8 +217,9 @@ test('relocated host guidance cannot qualify an acceptance resting on unopened e
   script = [
     'DONE: created; none of the records pre-existed.\nNEEDS ALL OF: call_list',
     'DONE: created; the successful count confirms absence.\nNEEDS ALL OF: call_list',
-  ];
-  const verdict = await review({ completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE });
+  ].map(withSupportedAssessment);
+  const verdict = await modelUsageAttributionStorage.run(assessmentOwner, () => review({
+    reviewInputOwner: assessmentOwner, completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE }));
   assert.equal(requests.length, 2, 'the existing one-follow-up coverage bound is retained');
   assert.equal(verdict.done, false);
   assert.equal(verdict.failedOpen, undefined);
@@ -476,12 +492,12 @@ async function inheritedAskFixture(input: { objective?: string; continuation?: s
     envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
     const runner = new EventEmitter();
     Object.assign(runner, { run: () => { throw new Error('Runner.run must not be called'); } });
-    return brackets.withHarnessRunContext({ sessionId, sourceUserSeq: childSource.seq,
+    return modelUsageAttributionStorage.run(consumer, () => brackets.withHarnessRunContext({ sessionId, sourceUserSeq: childSource.seq,
       runAttemptId: childAttempt.attemptId, interactiveForeground: true, counter: new brackets.ToolCallsCounter(8) },
       () => host.hostRunRunner(runner as never, agent as never,
         [{ type: 'message', role: 'user', content: continuation }] as never,
         { maxTurns: 4, hostTurnEngine: 'host_v1', hostJudgeCompletion: true,
-          context: { sessionId, sourceUserSeq: childSource.seq }, ...options } as never));
+          context: { sessionId, sourceUserSeq: childSource.seq }, ...options } as never)));
   }
   const reviews = () => eventlog.listEvents(sessionId, { types: ['goal_alignment_judged'] }).filter(row => row.data.kind === 'completion');
   const assertNoChildEffects = () => {
@@ -531,7 +547,7 @@ test('an inherited-read ASK is reviewed against the whole stopped objective and 
   const ask = 'ASK: I cannot see the saved read. Could you read the fixture again?';
   const answer = 'The retained read contains FIRST followed by REMAINING. Nothing was read again, written or sent.';
   script = ['INCOMPLETE: the exact saved read is already available; answer both lines without rereading.',
-    'DONE: the answer explains the two shown lines and respects the no-reread requirement.\nNEEDS ALL OF: none'];
+    'DONE: the answer explains the two shown lines and respects the no-reread requirement.\nNEEDS ALL OF: none'].map(withSupportedAssessment);
   const result = await f.run([ask, answer]);
   assert.equal(result.finalOutput, answer);
   assert.equal(f.modelCalls(), 2);
@@ -553,7 +569,7 @@ test('an inherited-read ASK is reviewed against the whole stopped objective and 
 test('review-confirmed required input remains a typed inherited-read pause without further execution', async () => {
   const f = await inheritedAskFixture();
   const ask = 'ASK: The retained lines are FIRST and REMAINING. Which interpretation did you intend?';
-  script = ['AWAITING: the owner must choose the intended interpretation of the retained lines.'];
+  script = ['AWAITING: the owner must choose the intended interpretation of the retained lines.'].map(withSupportedAssessment);
   const result = await f.run([ask]);
   assert.equal(result.finalOutput, ask);
   assert.deepEqual(result.terminal, { status: 'awaiting_user_input', reason: 'completion_review_needs_input' });
@@ -568,7 +584,7 @@ test('review-confirmed required input remains a typed inherited-read pause witho
 test('a reviewed ASK marker cannot turn an honest question into a done terminal', async () => {
   const f = await inheritedAskFixture();
   const ask = 'ASK: FIRST and REMAINING are retained. Which interpretation did you intend?';
-  script = ['DONE: the shown lines and question are supported.\nNEEDS ALL OF: none'];
+  script = ['DONE: the shown lines and question are supported.\nNEEDS ALL OF: none'].map(withSupportedAssessment);
   const result = await f.run([ask]);
   const { toOrchestratorDecision } = await import('./turn-decision.js');
   assert.equal(result.finalOutput, ask);
@@ -668,7 +684,7 @@ test('a prose-wrapped JSON candidate returns to its primary author instead of an
   const repaired: ModelRequest[] = [];
   stubFormatWorker(JSON_CONTINUATION_ANSWER, repaired);
   script = ['DONE: the counts and uncertainty qualifier are supported.\nNEEDS ALL OF: none',
-    'DONE: the whole JSON object preserves the counts and honest uncertainty.\nNEEDS ALL OF: none'];
+    'DONE: the whole JSON object preserves the counts and honest uncertainty.\nNEEDS ALL OF: none'].map(withSupportedAssessment);
   const result = await f.run([wrapped, JSON_CONTINUATION_ANSWER]);
   assert.equal(result.finalOutput, JSON_CONTINUATION_ANSWER, 'only a new reviewed candidate replaces the draft');
   assert.equal(f.modelCalls(), 2);
@@ -697,7 +713,7 @@ test('an exact whole-output JSON object with a scenario map passes its normal re
   const f = await inheritedAskFixture({ objective: JSON_CONTINUATION_OBJECTIVE });
   const repaired: ModelRequest[] = [];
   stubFormatWorker('UNEXPECTED FORMAT REPAIR', repaired);
-  script = ['DONE: the exact JSON answer is supported and unknown completeness remains unknown.\nNEEDS ALL OF: none'];
+  script = ['DONE: the exact JSON answer is supported and unknown completeness remains unknown.\nNEEDS ALL OF: none'].map(withSupportedAssessment);
   const result = await f.run([JSON_CONTINUATION_ANSWER]);
   assert.equal(result.finalOutput, JSON_CONTINUATION_ANSWER);
   assert.equal(f.modelCalls(), 1);
@@ -743,7 +759,7 @@ test('a tool-free format repair reuses the exact captured final writer even if r
   };
   f.host._setHostWriterForTests(() => ({ resolved: author, model }));
   script = ['DONE: the counts and uncertainty qualifier are supported.\nNEEDS ALL OF: none',
-    'DONE: the whole JSON object preserves the truthful semantic answer.\nNEEDS ALL OF: none'];
+    'DONE: the whole JSON object preserves the truthful semantic answer.\nNEEDS ALL OF: none'].map(withSupportedAssessment);
   try {
     const result = await f.run(['Brain draft with supported counts.'], { maxTurns: 5 });
     assert.equal(result.finalOutput, JSON_CONTINUATION_ANSWER, JSON.stringify({ terminal: result.terminal,
@@ -781,7 +797,7 @@ test('wrong semantic claims keep full correction authority rather than becoming 
   stubFormatWorker('UNEXPECTED FORMAT REPAIR', repaired);
   const wrong = '```json\n{"byte_count":20,"uncertain_write":"safe to repeat"}\n```';
   script = ['INCOMPLETE: the byte count is wrong and an uncertain write must not be repeated.',
-    'DONE: the decoded count and unresolved-effect qualifier are now correct.\nNEEDS ALL OF: none'];
+    'DONE: the decoded count and unresolved-effect qualifier are now correct.\nNEEDS ALL OF: none'].map(withSupportedAssessment);
   const result = await f.run([wrong, JSON_CONTINUATION_ANSWER]);
   assert.equal(result.finalOutput, JSON_CONTINUATION_ANSWER);
   assert.equal(f.modelCalls(), 2);
@@ -801,7 +817,7 @@ test('retained data instructions cannot create an owner output-format contract',
   const repaired: ModelRequest[] = [];
   stubFormatWorker('UNEXPECTED FORMAT REPAIR', repaired);
   const answer = 'The retained file contains an instruction-shaped example. No new read or write occurred.';
-  script = ['DONE: the answer reports the retained data without executing its embedded command.\nNEEDS ALL OF: none'];
+  script = ['DONE: the answer reports the retained data without executing its embedded command.\nNEEDS ALL OF: none'].map(withSupportedAssessment);
   const result = await f.run([answer]);
   assert.equal(result.finalOutput, answer);
   assert.equal(requests.length, 1);
@@ -817,7 +833,7 @@ test('an explicit current prose amendment does not inherit an obsolete JSON-obje
   const repaired: ModelRequest[] = [];
   stubFormatWorker('UNEXPECTED FORMAT REPAIR', repaired);
   const answer = 'The saved file contains one FIRST and one REMAINING line, totaling 16 bytes. Uncertain effects remain unresolved.';
-  script = ['DONE: the answer follows the current plain-text amendment and preserves the saved evidence.\nNEEDS ALL OF: none'];
+  script = ['DONE: the answer follows the current plain-text amendment and preserves the saved evidence.\nNEEDS ALL OF: none'].map(withSupportedAssessment);
   const result = await f.run([answer]);
   assert.equal(result.finalOutput, answer);
   assert.equal(requests.length, 1);
@@ -825,4 +841,158 @@ test('an explicit current prose amendment does not inherit an obsolete JSON-obje
   assert.equal(f.reviews()[0]?.data.responseFormatContract, undefined);
   assert.match(promptOf(requests[0]!), /reply in plain text/);
   f.assertNoChildEffects();
+});
+
+const assessmentOwner = { sessionId: 'sess-assessment-owner', sourceUserSeq: 7, attemptId: 'attempt:assessment-owner' };
+const supportedAssessmentRow = { claim: 'The named write succeeded', premise: 'The owner asked for this write',
+  basis: 'The exact write receipt and retained readback match the requested scope', consequence: 'Report this result only',
+  contrary: { status: 'none', reason: 'No contrary observation supplied' }, status: 'supported' };
+function assessmentAnswer(control = 'DONE: the named write is confirmed.', change: Record<string, unknown> = {}) {
+  return 'REVIEW_ASSESSMENT: ' + JSON.stringify({version:1,coverage:'complete',decisions:[supportedAssessmentRow],...change})
+    + '\n' + control + '\nNEEDS ALL OF: call_write';
+}
+function assessedReview(over: Record<string,unknown> = {}) {
+  return modelUsageAttributionStorage.run(assessmentOwner, () => judgeObjectiveComplete(OBJECTIVE, REPLY, {
+    skills: [], fullSourceEvidence: true, completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE,
+    reviewInputOwner: assessmentOwner, reviewStakes:'read', verifiedReadResults:[boundedList,writeReceipt], evidence,
+    toolCallSummary: 'The exact current write receipt is shown whole. The earlier list remains bounded and contrary evidence must be checked.',
+    ...over,
+  } as never));
+}
+test('host same-call packet is observed from the original response and preserves full objective, coverage and one medium request', async () => {
+  script=[assessmentAnswer()];
+  const verdict=await assessedReview();
+  assert.equal(requests.length,1);assert.equal(verdict.done,true);assert.equal(verdict.failedOpen,undefined);
+  assert.equal(verdict.reviewAssessment?.reason,'consistent');assert.match(verdict.reviewAssessment?.originalModelCallId ?? '',/^[a-f0-9-]{36}$/);
+  assert.equal(verdict.evidenceCoverage?.status,'sufficient');
+  assert.equal(requests[0]!.modelSettings.reasoning?.effort,'medium');
+  const instructions=String(requests[0]!.systemInstructions);assert.match(instructions,/HOST COMPLETION RESPONSE PROTOCOL/);
+  for(const text of [OBJECTIVE,REPLY,'earlier list remains bounded'])assert.ok(promptOf(requests[0]!).includes(text));
+});
+test('missing or malformed host packet and missing control are answered without restatement, fallback, coverage or late Jev', async () => {
+  for(const reply of ['DONE: confirmed.\nNEEDS ALL OF: call_write','REVIEW_ASSESSMENT: {bad}\nDONE: confirmed.','No verdict was emitted.',
+    assessmentAnswer('REVISE_REPLY: remove only fence.',{coverage:'uncertain'}),
+    assessmentAnswer('DONE: confirmed.',{decisions:[{...supportedAssessmentRow,status:'contradicted'}]}),
+    assessmentAnswer('DONE: confirmed.',{coverage:{toString:null}})]) {
+    requests.length=0; script=[reply];
+    const before=getJudgeMetricsSnapshot().total;
+    const verdict=await assessedReview({reviewStakes:'plan'});
+    assert.equal(requests.length,1);assert.equal(verdict.reviewDisposition,'answered_unqualified');
+    assert.equal(verdict.failedOpen,true);assert.equal(verdict.reviewFailure,'invalid');assert.equal(verdict.repairScope,undefined);
+    assert.equal(verdict.evidenceCoverage,undefined);assert.equal(verdict.verdictRestatedFrom,undefined);
+    const metrics=getJudgeMetricsSnapshot().total;assert.equal(metrics.invalid,before.invalid+1);
+    assert.equal(metrics.passed,before.passed);assert.equal(metrics.blocked,before.blocked);
+  }
+});
+test('serialized/cloned/unbound responses and mutated same-call request cannot qualify a host packet', async () => {
+  for(const mode of ['clone','unbound','mutated_request','mutated_output'] as const) {
+    requests.length=0;script=[assessmentAnswer()];originalMode=mode;
+    const verdict=await assessedReview();assert.equal(requests.length,1);
+    assert.equal(verdict.reviewDisposition,'answered_unqualified');assert.equal(verdict.reviewAssessment?.reason,'original_unbound');
+    assert.equal(verdict.reviewAssessment?.originalModelCallId,undefined);
+  }
+});
+test('foreign current owner cannot redeem another accepted source packet', async () => {
+  script=[assessmentAnswer()];
+  const verdict=await assessedReview({reviewInputOwner:{...assessmentOwner,sourceUserSeq:8}});
+  assert.equal(requests.length,1);assert.equal(verdict.reviewDisposition,'answered_unqualified');
+  assert.equal(verdict.reviewAssessment?.reason,'original_unbound');
+});
+test('genuine explicit negative, blocked and waiting host controls retain their meanings without a packet', async () => {
+  for(const [reply,expected] of [['CORRECT: unsupported claim.','claims'],['INCOMPLETE: work remains.','incomplete'],
+    ['BLOCKED: access denied.','blocked'],['AWAITING: choose which record.','awaiting']] as const) {
+    requests.length=0;script=[reply];const verdict=await assessedReview();assert.equal(requests.length,1);
+    assert.equal(verdict.reviewDisposition,undefined);assert.equal(verdict.failedOpen,undefined);
+    if(expected==='claims')assert.equal(verdict.repairScope,'claims');
+    if(expected==='incomplete')assert.equal(verdict.done,false);
+    if(expected==='blocked')assert.equal(verdict.blocked,true);
+    if(expected==='awaiting')assert.equal(verdict.awaitingUser,true);
+  }
+});
+
+function withSupportedAssessment(step: Step): Step {
+  if (typeof step !== 'string' || !/^(DONE|REVISE_REPLY):/.test(step)) return step;
+  return 'REVIEW_ASSESSMENT: ' + JSON.stringify({version:1,coverage:'complete',decisions:[supportedAssessmentRow]}) + '\n' + step;
+}
+
+function routedReviewer(): Model {
+  const actual=withResilience(reviewer,{label:'assessment-fixture',capability:resolveModelCapability('claude-sonnet-5'),maxRetries:0});
+  return {async getResponse(request) {
+    if(originalMode==='unbound')return reviewer.getResponse(request);
+    const entryOwner=modelUsageAttributionStorage.getStore();
+    const response=await actual.getResponse(request);
+    if(originalMode==='mutated_owner'){assessmentOwner.sourceUserSeq++;if(entryOwner)entryOwner.sourceUserSeq=assessmentOwner.sourceUserSeq;}
+    if(originalMode==='mutated_request')request.systemInstructions=String(request.systemInstructions)+' changed';
+    if(originalMode==='mutated_output'){const output=response.output;let reads=0;
+      const changed=structuredClone(output) as ModelResponse['output'];
+      const last=changed.at(-1) as {content:Array<{text:string}>};last.content[0]!.text=assessmentAnswer('DONE: changed output.');
+      Object.defineProperty(response,'output',{get:()=>++reads<=2 ? output : changed});}
+    return originalMode==='clone' ? structuredClone(response) as ModelResponse : response;
+  }, getStreamedResponse: request=>actual.getStreamedResponse(request)};
+}
+test('an actual fresh Resilient invocation cannot redeem an old returned original under a new call', async () => {
+  script=[assessmentAnswer()];const first=await assessedReview();assert.equal(first.failedOpen,undefined);
+  assert.ok(lastOriginalResponse);originalMode='reused';script=[assessmentAnswer()];requests.length=0;
+  const second=await assessedReview();assert.equal(requests.length,1);assert.equal(second.reviewDisposition,'answered_unqualified');
+  assert.equal(second.reviewAssessment?.reason,'original_unbound');
+});
+test('a first-seen old original without current Resilient telemetry remains unqualified', async () => {
+  originalMode='unbound';script=[assessmentAnswer()];
+  const original=await reviewer.getResponse({input:'old',modelSettings:{},tools:[],handoffs:[]} as never);
+  bindCompletedModelResponse(original,'old-completed-call',1);lastOriginalResponse=original;
+  // This fixture supplies an old nominal object directly. No current wrapper
+  // lifecycle may be borrowed from its historical binding.
+  const saved=reviewer.getResponse;reviewer.getResponse=async request=>{requests.push(request);return original;};
+  try {requests.length=0;const verdict=await assessedReview();assert.equal(requests.length,1);
+    assert.equal(verdict.reviewDisposition,'answered_unqualified');assert.equal(verdict.reviewAssessment?.originalModelCallId,undefined);
+  }finally{reviewer.getResponse=saved;}
+});
+test('caller cancellation during an actual review preserves cancellation and never restates or starts further work', async () => {
+  const {withHarnessRunContext,ToolCallsCounter}=await import('./brackets.js');
+  const controller=new AbortController();reviewerReturn=()=>controller.abort(new Error('controlled Stop'));
+  script=[assessmentAnswer()];
+  await assert.rejects(withHarnessRunContext({sessionId:assessmentOwner.sessionId,sourceUserSeq:assessmentOwner.sourceUserSeq,
+    runAttemptId:assessmentOwner.attemptId,callerCancelSignal:controller.signal,counter:new ToolCallsCounter(2)},()=>assessedReview()));
+  assert.equal(requests.length,1);assert.equal(script.length,0);
+});
+test('missing assessment halts actual host work, stamps fulfills false and keeps the draft and effect authority intact', async () => {
+  const f=await inheritedAskFixture({objective:JSON_CONTINUATION_OBJECTIVE});
+  script=['DONE: confirmed.\nNEEDS ALL OF: none'];
+  const result=await f.run([JSON_CONTINUATION_ANSWER]);assert.equal(f.modelCalls(),1);assert.equal(requests.length,1);
+  assert.equal(result.finalOutput,JSON_CONTINUATION_ANSWER);
+  const row=f.reviews()[0]!.data;assert.equal(row.fulfills,false);assert.equal(row.failedOpen,true);
+  assert.equal(row.reviewDisposition,'answered_unqualified');assert.equal(row.continuation,false);
+  const stored=f.host.completionVerdictForAcceptedSource(f.consumer);assert.equal(stored?.fulfills,false);
+  assert.equal(stored?.reviewAssessment?.reason,'missing');assert.equal(stored?.reviewDisposition,'answered_unqualified');
+  f.assertNoChildEffects();
+});
+test('a pre-existing coverage follow-up cannot invent the missing same-call packet from the prior review', async () => {
+  script=[assessmentAnswer('DONE: list absent.').replace('NEEDS ALL OF: call_write','NEEDS ALL OF: call_list'),
+    'DONE: list absent.\nNEEDS ALL OF: call_list'];
+  const verdict=await assessedReview();assert.equal(requests.length,2,'only the existing coverage call runs');
+  assert.equal(verdict.reviewDisposition,'answered_unqualified');assert.equal(verdict.reviewAssessment?.reason,'missing');
+  assert.equal(verdict.verdictRestatedFrom,undefined);
+  assert.equal(verdict.reviewInputObservation?.reviewStage,'coverage_followup');
+  assert.equal(verdict.reviewInputObservation?.modelCallId,verdict.reviewAssessment?.originalModelCallId,
+    'the unqualified follow-up is bound to its own input and original, not the first completion request');
+});
+
+test('ownership amended in both seed and ambient scope during the provider response cannot rebind the old accepted source', async () => {
+  const prior=assessmentOwner.sourceUserSeq;
+  originalMode='mutated_owner';
+  script=[assessmentAnswer()];
+  try{const verdict=await assessedReview();assert.equal(requests.length,1);
+    assert.equal(verdict.reviewDisposition,'answered_unqualified',JSON.stringify(verdict));assert.equal(verdict.reviewAssessment?.reason,'original_unbound');
+  }finally{assessmentOwner.sourceUserSeq=prior;}
+});
+
+test('cloned, unbound and foreign-owner negative controls cannot authorize work or invent a current blocker or pause', async () => {
+  for(const mode of ['clone','unbound','bound'] as const)for(const control of ['CORRECT: unsupported claim.','INCOMPLETE: work remains.',
+    'BLOCKED: access denied.','AWAITING: choose a record.']) {
+    requests.length=0;script=[control];originalMode=mode;
+    const verdict=await assessedReview(mode==='bound' ? {reviewInputOwner:{...assessmentOwner,sourceUserSeq:8}} : {});
+    assert.equal(requests.length,1);assert.equal(verdict.reviewDisposition,'answered_unqualified');
+    assert.equal(verdict.failedOpen,true);assert.equal(verdict.blocked,undefined);assert.equal(verdict.awaitingUser,undefined);
+    assert.equal(verdict.repairScope,undefined);
+  }
 });

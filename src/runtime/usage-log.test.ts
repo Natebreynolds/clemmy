@@ -541,3 +541,170 @@ test('a judge or interpretation made inside a memory job stays on the job lane w
 test('a heartbeat scope is background usage, not unclassified', () => {
   assert.deepEqual(resolveUsageKind('watch:work-review'), { kind: 'background', reason: 'prefix:watch:' });
 });
+
+test('captured usage provenance keeps exact accounting A while a later B scope records it', async () => {
+  const { captureModelUsageProvenance, readUsageEventsForDate } = await import('./usage-log.js');
+  const { withWorkflowUsageAttribution } = await import('./workflow-usage-context.js');
+  const a = { sessionId: 'sess-captured-usage-a', sourceUserSeq: 411, attemptId: 'attempt:usage-a',
+    role: 'brain' as const, channel: 'chat', promptComponents: { instructions: 3 } };
+  const captured = withModelUsageAttribution(a, captureModelUsageProvenance);
+  a.sessionId = 'sess-mutated-usage-a'; a.promptComponents.instructions = 999;
+  withWorkflowUsageAttribution('later-workflow', () => withModelUsageAttribution({ sessionId: 'sess-captured-usage-b',
+    sourceUserSeq: 412, attemptId: 'attempt:usage-b', role: 'reviewer', channel: 'judge:later' }, () =>
+    recordModelUsage({ callerProvenance: captured, sessionId: 'unknown', model: 'm', cacheDialect: 'inclusive',
+      inputTokens: 10, cachedInputTokens: 4, outputTokens: 2, responseId: 'captured-usage-a-response' })));
+  const row = readUsageEventsForDate().find(r => r.responseId === 'captured-usage-a-response')!;
+  assert.equal(row.source, 'sess-captured-usage-a');
+  assert.equal(row.trace?.acceptedSource, 'sess-captured-usage-a:411');
+  assert.equal(row.trace?.attemptId, 'attempt:usage-a');
+  assert.equal(row.trace?.modelCallId, undefined, 'provider ID is never a local invocation ID on captured paths');
+  assert.equal(row.role, 'brain'); assert.equal(row.channel, 'chat');
+  assert.equal(row.promptComponents?.instructions, 3);
+  assert.equal(row.cachedInputTokens, 4); assert.equal(row.totalTokens, 12);
+});
+
+test('captured-empty or forged provenance retains numeric rows without adopting later parent/workflow/model IDs', async () => {
+  const { captureModelUsageProvenance, readUsageEventsForDate } = await import('./usage-log.js');
+  const { withWorkflowUsageAttribution } = await import('./workflow-usage-context.js');
+  const absent = captureModelUsageProvenance();
+  for (const [label, token] of [['empty', absent], ['forged', { ...absent }]] as const) {
+    withWorkflowUsageAttribution('late-owner', () => withModelUsageAttribution({ sessionId: 'unknown', sourceUserSeq: 0,
+      usageJobId: 'memory:late-job', usageParentTurn: { sessionId: 'sess-late-parent', sourceUserSeq: 413 },
+      role: 'reviewer', channel: 'judge:late', promptComponents: { history: 9 } }, () =>
+      recordModelUsage({ callerProvenance: token, sessionId: 'unknown', model: 'm', cacheDialect: 'inclusive',
+        inputTokens: 8, outputTokens: 2, responseId: `captured-${label}-response` })));
+    const row = readUsageEventsForDate().find(r => r.responseId === `captured-${label}-response`)!;
+    assert.equal(row.source, 'unknown'); assert.equal(row.trace?.acceptedSource, undefined);
+    assert.equal(row.trace?.modelCallId, undefined); assert.equal(row.role, undefined);
+    assert.equal(row.channel, undefined); assert.equal(row.promptComponents, undefined);
+    assert.equal(row.inputTokens, 8); assert.equal(row.outputTokens, 2);
+  }
+  withWorkflowUsageAttribution('legacy-owner', () => recordModelUsage({ sessionId: 'unknown', model: 'm',
+    inputTokens: 8, outputTokens: 2, responseId: 'legacy-still-aliases' }));
+  const legacy = readUsageEventsForDate().find(r => r.responseId === 'legacy-still-aliases')!;
+  assert.equal(legacy.source, 'workflow:legacy-owner'); assert.equal(legacy.trace?.modelCallId, 'legacy-still-aliases');
+});
+
+test('captured detached accounting parent/job and original workflow are whole immutable tuples', async () => {
+  const { captureModelUsageProvenance, readUsageEventsForDate } = await import('./usage-log.js');
+  const { withWorkflowUsageAttribution } = await import('./workflow-usage-context.js');
+  const parent = { sessionId: 'sess-captured-parent', sourceUserSeq: 415, attemptId: 'attempt:captured-parent' };
+  const captured = withModelUsageAttribution({ sessionId: 'memory', sourceUserSeq: 0, usageJobId: 'memory:owned-job',
+    usageParentTurn: parent, role: 'memory' }, captureModelUsageProvenance);
+  parent.sourceUserSeq = 416;
+  recordModelUsage({ callerProvenance: captured, sessionId: 'unknown', model: 'm', inputTokens: 2, outputTokens: 1,
+    responseId: 'captured-parent-response' });
+  const row = readUsageEventsForDate().find(r => r.responseId === 'captured-parent-response')!;
+  assert.equal(row.source, 'memory:owned-job'); assert.equal(row.trace?.acceptedSource, 'sess-captured-parent:415');
+  assert.equal(row.trace?.attemptId, 'attempt:captured-parent');
+  const workflow = withWorkflowUsageAttribution('original-workflow', captureModelUsageProvenance);
+  withWorkflowUsageAttribution('later-workflow', () => recordModelUsage({ callerProvenance: workflow, sessionId: 'unknown',
+    model: 'm', inputTokens: 2, outputTokens: 1, responseId: 'captured-workflow-response' }));
+  assert.equal(readUsageEventsForDate().find(r => r.responseId === 'captured-workflow-response')?.source, 'workflow:original-workflow');
+});
+
+test('captured accounting rejects accessor/proxy nested state without reading or coercing it', async () => {
+  const { captureModelUsageProvenance, readUsageEventsForDate } = await import('./usage-log.js');
+  let hooks = 0;
+  const accessor = { sessionId: 'sess-exotic-owner', sourceUserSeq: 419 };
+  Object.defineProperty(accessor, 'promptComponents', { enumerable: true, get() { hooks++; throw new Error('private accessor'); } });
+  const proxy = new Proxy({ sessionId: 'sess-exotic-owner', sourceUserSeq: 420 }, { ownKeys() { hooks++; throw new Error('private proxy'); } });
+  for (const [label, value] of [['accessor', accessor], ['proxy', proxy]] as const) {
+    const captured = withModelUsageAttribution(value, captureModelUsageProvenance);
+    recordModelUsage({ callerProvenance: captured, sessionId: 'unknown', model: 'm', inputTokens: 2, outputTokens: 1,
+      responseId: `captured-${label}-accounting` });
+    assert.equal(readUsageEventsForDate().find(r => r.responseId === `captured-${label}-accounting`)?.source, 'unknown');
+  }
+  assert.equal(hooks, 0);
+});
+
+
+test('captured operational completion uses the sealed local call ID; provider ID and legacy behavior stay distinct', async () => {
+  const { captureModelUsageProvenance, readUsageEventsForDate } = await import('./usage-log.js');
+  const captured = captureModelUsageProvenance();
+  const cases = [
+    { source: 'usage-native-operational', responseId: 'provider-operational-id', trace: { modelCallId: 'local-operational-call' } },
+    { source: 'usage-native-operational-empty', responseId: 'provider-operational-empty', trace: undefined },
+    { source: 'usage-native-operational-forged', responseId: 'provider-operational-forged', trace: undefined, caller: { ...captured } },
+    { source: 'usage-native-operational-invalid', responseId: 'provider-operational-invalid', trace: { modelCallId: 'invalid\nraw content' } },
+  ];
+  for (const fixture of cases) {
+    recordModelUsage({ callerProvenance: 'caller' in fixture ? fixture.caller : captured, sessionId: fixture.source, responseId: fixture.responseId,
+      trace: fixture.trace, model: 'm', inputTokens: 4, outputTokens: 1 });
+    const row = readUsageEventsForDate().find(r => r.responseId === fixture.responseId)!;
+    const operational = listOperationalEvents({ source: 'model', type: 'model_call_completed', sessionId: fixture.source, limit: 5 })[0]!;
+    assert.equal(operational.modelCallId, row.trace?.modelCallId);
+    assert.equal(operational.payload?.responseId, fixture.responseId);
+    if (fixture.source !== 'usage-native-operational') assert.equal(operational.modelCallId, undefined);
+  }
+  recordModelUsage({ sessionId: 'usage-legacy-operational', responseId: 'legacy-provider-operational',
+    model: 'm', inputTokens: 4, outputTokens: 1 });
+  assert.equal(listOperationalEvents({ source: 'model', type: 'model_call_completed', sessionId: 'usage-legacy-operational', limit: 5 })[0]?.modelCallId,
+    'legacy-provider-operational');
+});
+
+test('nominal memory origin overrides foreign adapter namespace without execution adoption', async () => {
+  const api = await import('./usage-log.js');
+  const origin = api.createMemoryAccountingOrigin({ sessionId: 'sess-original-memory', sourceUserSeq: 1701, attemptId: 'attempt:original-memory' });
+  const context = { sessionId: 'sess-foreign-memory', sourceUserSeq: 1702, attemptId: 'attempt:foreign-memory',
+    memoryAccountingOrigin: origin, usageJobId: 'memory:standing:owned-job', channel: 'memory:standing', role: 'reviewer' as const };
+  await withModelUsageAttribution(context, async () => api.withOwnModelRequestAttribution({ role: 'brain' }, async () => {
+    assert.equal(api.modelUsageAttributionStorage.getStore()!.sessionId, context.sessionId, 'selection scope remains actual B');
+    const provenance = api.captureModelUsageProvenance();
+    const observerScope = api.capturedModelUsageAttribution(provenance)!;
+    assert.equal(observerScope.sessionId, ''); assert.deepEqual(observerScope.usageParentTurn, api.memoryAccountingParent(origin));
+    withModelUsageAttribution({ sessionId: 'sess-drainer', sourceUserSeq: 1703 }, () => recordModelUsage({
+      callerProvenance: provenance, sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, attemptId: context.attemptId,
+      model: 'memory-origin-model', inputTokens: 13, cachedInputTokens: 7, outputTokens: 3, cacheDialect: 'inclusive', responseId: 'memory-origin-response',
+      trace: { acceptedSource: 'foreign:1702', logicalTurnId: 'turn:1702', attemptId: context.attemptId, activationId: 'foreign-activation', modelCallId: 'local-memory-call' },
+    }));
+  }));
+  const row = api.readUsageEventsForDate().find(r => r.responseId === 'memory-origin-response')!;
+  assert.equal(row.source, context.usageJobId); assert.equal(row.channel, 'memory:standing'); assert.equal(row.role, 'reviewer');
+  assert.deepEqual(row.trace, { modelCallId: 'local-memory-call', acceptedSource: 'sess-original-memory:1701', logicalTurnId: 'turn:1701', attemptId: 'attempt:original-memory' });
+  assert.equal(row.inputTokens, 13); assert.equal(row.cachedInputTokens, 7); assert.equal(row.outputTokens, 3);
+  const operational = listOperationalEvents({ type: 'model_call_completed', limit: 100 }).find(r => r.modelCallId === 'local-memory-call')!;
+  assert.equal(operational.sessionId, context.usageJobId);
+});
+
+test('unknown/serialized/accessor memory markers cannot acquire foreign trace or attempt', async () => {
+  const api = await import('./usage-log.js'); let hooks = 0;
+  for (const mode of ['empty', 'clone', 'getter', 'proxy', 'source-only'] as const) {
+    const context: any = { sessionId: 'sess-foreign-marker', sourceUserSeq: 1800, attemptId: 'attempt:foreign-marker', usageJobId: `memory:standing:${mode}` };
+    if (mode === 'getter') Object.defineProperty(context, 'memoryAccountingOrigin', { enumerable: true, get() { hooks++; throw new Error('must not read'); } });
+    else context.memoryAccountingOrigin = mode === 'empty' ? api.createMemoryAccountingOrigin()
+      : mode === 'source-only' ? api.createMemoryAccountingOrigin({ sessionId: 'sess-source-only', sourceUserSeq: 1801 }) : { kind: 'memory_accounting_origin' };
+    const current = mode === 'proxy' ? new Proxy(context, { get() { hooks++; throw new Error('must not read'); } }) : context;
+    const provenance = withModelUsageAttribution(current, () => api.captureMemoryModelUsageProvenance()); assert.ok(provenance);
+    withModelUsageAttribution({ sessionId: 'later', sourceUserSeq: 1802 }, () => recordModelUsage({ callerProvenance: provenance,
+      sessionId: 'sess-foreign-marker', sourceUserSeq: 1800, attemptId: 'attempt:foreign-marker',
+      trace: { acceptedSource: 'sess-foreign-marker:1800', logicalTurnId: 'turn:1800', attemptId: 'attempt:foreign-marker', modelCallId: `local-${mode}` },
+      model: 'memory-marker-test', responseId: `memory-marker-${mode}`, inputTokens: 2, outputTokens: 1 }));
+    const row = api.readUsageEventsForDate().find(r => r.responseId === `memory-marker-${mode}`)!;
+    assert.equal(row.trace?.modelCallId, `local-${mode}`);
+    assert.equal(row.trace?.acceptedSource, mode === 'source-only' ? 'sess-source-only:1801' : undefined);
+    assert.equal(row.trace?.attemptId, undefined); assert.equal(row.inputTokens, 2);
+  }
+  assert.equal(hooks, 0);
+  assert.equal(withModelUsageAttribution({ sessionId: 'ordinary', sourceUserSeq: 2 }, () => api.captureMemoryModelUsageProvenance()), undefined);
+});
+
+test('direct memory bookkeeping rejects exotic marked contexts without unused session/job hooks', async () => {
+  const api = await import('./usage-log.js'); let hooks = 0;
+  for (const mode of ['session', 'job', 'channel', 'role', 'proxy'] as const) {
+    const context: any = { sessionId: 'direct-foreign', sourceUserSeq: 2400, usageJobId: 'memory:standing:direct',
+      channel: 'memory:standing', memoryAccountingOrigin: api.createMemoryAccountingOrigin({ sessionId: 'known-parent', sourceUserSeq: 2401, attemptId: 'attempt:known' }) };
+    const key = { session: 'sessionId', job: 'usageJobId', channel: 'channel', role: 'role', proxy: 'sessionId' }[mode];
+    if (mode !== 'proxy') Object.defineProperty(context, key, { enumerable: true, get() { hooks++; throw new Error('must not execute new hook'); } });
+    const current = mode === 'proxy' ? new Proxy(context, { get() { hooks++; throw new Error('must not execute proxy'); }, ownKeys() { hooks++; throw new Error('must not inspect proxy'); } }) : context;
+    assert.doesNotThrow(() => withModelUsageAttribution(current, () => recordModelUsage({
+      sessionId: 'adapter-foreign', sourceUserSeq: 2402, attemptId: 'attempt:adapter-foreign',
+      trace: { acceptedSource: 'adapter-foreign:2402', logicalTurnId: 'turn:2402', attemptId: 'attempt:adapter-foreign', modelCallId: `direct-local-${mode}` },
+      model: 'direct-marker-test', responseId: `direct-marker-${mode}`, inputTokens: 6, outputTokens: 1, cacheDialect: 'inclusive',
+    })));
+    const row = api.readUsageEventsForDate().find(r => r.responseId === `direct-marker-${mode}`)!;
+    assert.equal(row.source, 'unknown'); assert.equal(row.trace?.acceptedSource, undefined); assert.equal(row.trace?.attemptId, undefined);
+    assert.equal(row.trace?.modelCallId, `direct-local-${mode}`); assert.equal(row.inputTokens, 6); assert.equal(row.outputTokens, 1);
+  }
+  assert.equal(hooks, 0);
+});

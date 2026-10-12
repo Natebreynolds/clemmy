@@ -842,3 +842,299 @@ test('a transient backend failure is still replayed and names what the backend s
   assert.equal(model.attempts, 2);
   assert.equal(response.responseId, 'resp_after_server_error');
 });
+
+const usageModule = await import('../usage-log.js');
+const observationModule = await import('./resilient-model.js');
+const responseBindingModule = await import('./model-response-binding.js');
+const transportObservationModule = await import('./model-transport-observation.js');
+
+function capturedCodexFixture<T>(sessionId: string, sourceUserSeq: number, sink: unknown[], work: () => T): T {
+  return usageModule.withModelUsageAttribution({ sessionId, sourceUserSeq, attemptId: `attempt:${sessionId}`, role: 'brain', channel: 'chat' }, () =>
+    harnessRunContextStorage.run({ sessionId, sourceUserSeq, runAttemptId: `attempt:${sessionId}`, turn: 1 } as never, () =>
+      transportObservationModule.withModelTransportRecorder(e => sink.push(e), work)));
+}
+async function collectCodexStream(iterable: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> {
+  const events: StreamEvent[] = []; for await (const event of iterable) events.push(event); return events;
+}
+function completedSdkStream(events: StreamEvent[]): object {
+  return (events.find(e => e.type === 'response_done') as unknown as { response: object }).response;
+}
+
+test('Codex native lazy stream preserves public A owner/observer while B drains it without copied tool authority', async () => {
+  const a: any[] = [], b: any[] = [], observerA: any[] = [], observerB: any[] = [];
+  let providerContext: unknown;
+  const model = new ScriptedCodexModel(async function* () {
+    providerContext = harnessRunContextStorage.getStore()?.sessionId;
+    yield* successfulTurn('resp_lazy_public_a');
+  });
+  const stream = capturedCodexFixture('sess-native-lazy-a', 711, a, () =>
+    observationModule.withModelResilienceTelemetry(e => observerA.push(e), () => model.getStreamedResponse(modelRequest())));
+  assert.equal(model.attempts, 0); assert.equal(a.length, 0); assert.equal(observerA.length, 0);
+  const events = await capturedCodexFixture('sess-native-drainer-b', 712, b, () =>
+    observationModule.withModelResilienceTelemetry(e => observerB.push(e), () => collectCodexStream(stream)));
+  assert.equal(providerContext, 'sess-native-drainer-b', 'execution ALS is never recreated from accounting capture');
+  assert.equal(observerB.length, 0); assert.equal(b.length, 0);
+  const original = completedSdkStream(events);
+  const binding = responseBindingModule.completedModelResponseBinding(original)!;
+  assert.ok(binding); assert.equal(binding.physicalAttempt, 1);
+  assert.notEqual(binding.modelCallId, 'resp_lazy_public_a');
+  assert.equal(observerA.find(e => e.type === 'response_observed')?.callId, binding.modelCallId);
+  assert.ok(a.every(e => e.sourceUserSeq === 711 && e.modelCallId === binding.modelCallId));
+  assert.equal(a.at(-1).phase, 'adapter_attempt_finished'); assert.equal(a.at(-1).resultScope, 'original_sdk_response');
+  const row = usageModule.readUsageEventsForDate().find(r => r.responseId === 'resp_lazy_public_a')!;
+  assert.equal(row.source, 'sess-native-lazy-a'); assert.equal(row.trace?.acceptedSource, 'sess-native-lazy-a:711');
+  assert.equal(row.trace?.modelCallId, binding.modelCallId); assert.equal(row.trace?.attemptId, 'attempt:sess-native-lazy-a');
+  assert.equal(row.requestModel, undefined, 'scripted protected stream never observed an outgoing wire body');
+  assert.equal(row.providerReportedModel, undefined, 'absence stays unknown');
+  assert.equal(responseBindingModule.completedModelResponseBinding({ ...original }), undefined);
+});
+
+test('Codex initially unowned lazy response never adopts later source/workflow/parent or response-ID alias', async () => {
+  const stream = new ScriptedCodexModel(async function* () { yield* successfulTurn('resp_native_initially_unowned'); })
+    .getStreamedResponse(modelRequest());
+  const late: any[] = [];
+  await capturedCodexFixture('sess-native-too-late', 713, late, () => collectCodexStream(stream));
+  assert.equal(late.length, 0);
+  const row = usageModule.readUsageEventsForDate().find(r => r.responseId === 'resp_native_initially_unowned')!;
+  assert.equal(row.source, 'unknown'); assert.equal(row.trace?.acceptedSource, undefined);
+  assert.notEqual(row.trace?.modelCallId, row.responseId); assert.ok(row.trace?.modelCallId);
+  assert.equal(row.inputTokens, 1); assert.equal(row.outputTokens, 1); assert.equal(row.role, undefined);
+});
+
+test('concurrent native invocations use two local UUIDs for the same provider response ID and retain token parity', async () => {
+  const model = new ScriptedCodexModel(async function* () { await Promise.resolve(); yield* successfulTurn('resp_shared_provider_id'); });
+  const journals: any[][] = [[], []];
+  const responses = await Promise.all(journals.map((journal, i) => capturedCodexFixture(`sess-native-concurrent-${i}`, 720 + i, journal,
+    () => i === 0 ? model.getResponse(modelRequest()) : collectCodexStream(model.getStreamedResponse(modelRequest()))
+      .then(completedSdkStream))));
+  const proofs = responses.map(responseBindingModule.completedModelResponseBinding);
+  assert.ok(proofs.every(Boolean)); assert.notEqual(proofs[0]!.modelCallId, proofs[1]!.modelCallId);
+  const rows = usageModule.readUsageEventsForDate().filter(r => r.responseId === 'resp_shared_provider_id');
+  assert.equal(rows.length, 2); assert.deepEqual(rows.map(r => [r.inputTokens, r.outputTokens, r.totalTokens]), [[1, 1, 2], [1, 1, 2]]);
+  assert.equal(new Set(rows.map(r => r.trace?.modelCallId)).size, 2);
+});
+
+test('multiple closing envelopes retain buffered first-usage/last-output and streaming last-usage but no original/model proof', async () => {
+  const script = async function* () {
+    for await (const event of successfulTurn('resp_multiple_closing')) {
+      if (event.type === 'response.completed') {
+        event.response.model = 'gpt-first'; event.response.usage.input_tokens = 9; event.response.usage.output_tokens = 3;
+        yield event;
+        yield { type: 'response.done', response: { id: 'resp_multiple_closing', model: 'gpt-last', usage: { input_tokens: 13, output_tokens: 5, total_tokens: 18 } } };
+      } else yield event;
+    }
+  };
+  const model = new ScriptedCodexModel(script);
+  const buffered = await model.getResponse(modelRequest());
+  const streamed = completedSdkStream(await collectCodexStream(model.getStreamedResponse(modelRequest())));
+  assert.equal(buffered.usage.inputTokens, 13);
+  assert.equal(responseBindingModule.completedModelResponseBinding(buffered), undefined);
+  assert.equal(responseBindingModule.completedModelResponseBinding(streamed), undefined);
+  const rows = usageModule.readUsageEventsForDate().filter(r => r.responseId === 'resp_multiple_closing');
+  assert.deepEqual(rows.map(r => [r.inputTokens, r.outputTokens]), [[9, 3], [13, 5]]);
+  assert.ok(rows.every(r => r.providerReportedModel === undefined));
+});
+
+test('completed envelope reported model is inert exact evidence; hostile getters and missing values remain unknown', async () => {
+  let hooks = 0;
+  for (const shape of ['reported', 'getter', 'missing'] as const) {
+    const model = new ScriptedCodexModel(async function* () {
+      for await (const event of successfulTurn(`resp_model_${shape}`)) {
+        if (event.type === 'response.completed') {
+          if (shape === 'reported') event.response.model = 'gpt-reported-exact';
+          if (shape === 'getter') Object.defineProperty(event.response, 'model', { enumerable: true, get() { hooks++; throw new Error('model accessor'); } });
+        }
+        yield event;
+      }
+    });
+    const response = await model.getResponse(modelRequest());
+    if (shape === 'getter') assert.equal(responseBindingModule.completedModelResponseBinding(response), undefined);
+    else assert.ok(responseBindingModule.completedModelResponseBinding(response));
+    const row = usageModule.readUsageEventsForDate().find(r => r.responseId === `resp_model_${shape}`)!;
+    assert.equal(row.providerReportedModel, shape === 'reported' ? 'gpt-reported-exact' : undefined);
+  }
+  assert.equal(hooks, 0);
+});
+
+test('native retries keep one public UUID, distinct adapter ordinals and original retry-journal owner', async () => {
+  const a = HarnessSession.create({ kind: 'chat', title: 'native owner A' }), b = HarnessSession.create({ kind: 'chat', title: 'native owner B' }); const journal: any[] = [];
+  const model = new ScriptedCodexModel(async function* (attempt) {
+    if (attempt === 1) throw buildTransportTimeoutError('UND_ERR_HEADERS_TIMEOUT', { modelId: 'gpt-5.5', phase: 'headers' });
+    yield* successfulTurn('resp_native_after_retry');
+  });
+  const stream = capturedCodexFixture(a.id, 730, journal, () => model.getStreamedResponse(modelRequest()));
+  const response = completedSdkStream(await capturedCodexFixture(b.id, 731, [], () => collectCodexStream(stream)));
+  const proof = responseBindingModule.completedModelResponseBinding(response)!;
+  assert.equal(proof.physicalAttempt, 2); assert.equal(model.attempts, 2);
+  assert.deepEqual(journal.filter(e => e.phase === 'adapter_attempt_created').map(e => e.physicalAttempt), [1, 2]);
+  assert.equal(new Set(journal.map(e => e.modelCallId)).size, 1);
+  assert.equal(listEvents(a.id, { types: ['stall_retry_attempted'] }).length, 1);
+  assert.equal(listEvents(b.id, { types: ['stall_retry_attempted'] }).length, 0);
+});
+
+test('cancellation after numeric usage before response yield preserves usage/output but cannot mint an original proof', async () => {
+  const controller = new AbortController(); const telemetry: any[] = [];
+  const sink: import('../usage-log.js').ObservedModelUsage[] = [];
+  sink.push = (...rows) => { controller.abort(); return Array.prototype.push.apply(sink, rows); };
+  const model = new ScriptedCodexModel(async function* () { yield* successfulTurn('resp_cancel_after_usage'); });
+  const events = await usageModule.withModelUsageObserver(sink, () => observationModule.withModelResilienceTelemetry(e => telemetry.push(e),
+    () => collectCodexStream(model.getStreamedResponse({ ...modelRequest(), signal: controller.signal }))));
+  assert.equal(events.at(-1)?.type, 'response_done', 'old yielded result remains unchanged');
+  assert.equal(sink.length, 1); assert.equal(sink[0].inputTokens, 1);
+  assert.equal(responseBindingModule.completedModelResponseBinding(completedSdkStream(events)), undefined);
+  assert.equal(telemetry.find(e => e.type === 'response_observed'), undefined);
+  assert.equal(telemetry.at(-1).outcome, 'cancelled');
+});
+
+test('native observer exceptions/rejections cannot alter provider events/results or retry counts', async () => {
+  for (const kind of ['throw', 'reject'] as const) {
+    const model = new ScriptedCodexModel(async function* () { yield* successfulTurn(`resp_hostile_observer_${kind}`); });
+    const events = await observationModule.withModelResilienceTelemetry(() => {
+      if (kind === 'throw') throw new Error('observer failure');
+      return Promise.reject(new Error('async observer failure')) as never;
+    }, () => collectCodexStream(model.getStreamedResponse(modelRequest())));
+    assert.equal(events.at(-1)?.type, 'response_done'); assert.equal(model.attempts, 1);
+    assert.ok(responseBindingModule.completedModelResponseBinding(completedSdkStream(events)));
+  }
+  await Promise.resolve();
+});
+
+test('actual native stream records resolved outgoing body.model and one adapter ordinal across an inner 401 refresh', async () => {
+  const { BASE_DIR } = await import('../../config.js');
+  const { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } = await import('node:fs');
+  const path = await import('node:path');
+  const auth = await import('../auth-store.js');
+  assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1');
+  const authPath = path.join(BASE_DIR, 'state', 'auth.json');
+  const prior = existsSync(authPath) ? readFileSync(authPath) : undefined;
+  const priorFetch = globalThis.fetch; const priorDisabled = process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS;
+  const token = `fixture.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600,
+    'https://api.openai.com/auth': { chatgpt_account_id: 'fixture-account' } })).toString('base64url')}.fixture`;
+  const grant = { accessToken: token, refreshToken: 'fixture-refresh', accountId: 'fixture-account', lastRefresh: new Date().toISOString() };
+  mkdirSync(path.dirname(authPath), { recursive: true });
+  writeFileSync(authPath, JSON.stringify({ source: 'native', codexOauth: grant }));
+  let refreshes = 0; const bodies: any[] = []; const journal: any[] = [];
+  auth.__setRefreshTokenImplForTests(async () => { refreshes++; return { ...grant, idToken: 'fixture-id' }; });
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    if (bodies.length === 1) return new Response('', { status: 401 });
+    const events: any[] = [];
+    for await (const event of successfulTurn('resp_actual_body_model')) {
+      if (event.type === 'response.completed') event.response.model = 'gpt-provider-reported';
+      events.push(event);
+    }
+    return new Response(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(''), { status: 200 });
+  };
+  // Only the injected fetch above can run while this existing edge is enabled;
+  // no developer credential or network transport is available in this fixture.
+  delete process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS;
+  try {
+    const model = new CodexResponsesModel('fixture-model-label');
+    const response = await capturedCodexFixture('sess-native-real-body', 750, journal, () => model.getResponse(modelRequest()));
+    const row = usageModule.readUsageEventsForDate().find(r => r.responseId === 'resp_actual_body_model')!;
+    assert.equal(bodies.length, 2); assert.equal(refreshes, 1); assert.deepEqual(bodies[0], bodies[1]);
+    assert.equal(row.requestModel, bodies[0].model); assert.notEqual(row.requestModel, 'fixture-model-label');
+    assert.equal(row.model, 'fixture-model-label'); assert.equal(row.providerReportedModel, 'gpt-provider-reported');
+    assert.equal(journal.filter(e => e.phase === 'adapter_attempt_created').length, 1, 'inner fetch retries are not adapter ordinals');
+    assert.equal(responseBindingModule.completedModelResponseBinding(response)?.physicalAttempt, 1);
+  } finally {
+    globalThis.fetch = priorFetch; auth.__setRefreshTokenImplForTests(null);
+    if (priorDisabled === undefined) delete process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS;
+    else process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS = priorDisabled;
+    if (prior) writeFileSync(authPath, prior); else rmSync(authPath, { force: true });
+  }
+});
+
+
+test('optional closing ID/model provenance never invokes getters on old successful buffered or streamed replies', async () => {
+  for (const path of ['buffered', 'streamed'] as const) {
+    for (const field of ['id', 'model'] as const) {
+      let hooks = 0; let closing: any;
+      const responseId = `resp_inert_closing_${path}_${field}`;
+      const model = new ScriptedCodexModel(async function* () {
+        for await (const event of successfulTurn(responseId)) {
+          if (event.type === 'response.completed') {
+            closing = event.response;
+            event.response.model = 'gpt-reported-unused';
+            Object.defineProperty(event.response, field, { enumerable: true, get() { hooks++; throw new Error('unused metadata accessor'); } });
+          }
+          yield event;
+        }
+      });
+      const response = path === 'buffered' ? await model.getResponse(modelRequest())
+        : completedSdkStream(await collectCodexStream(model.getStreamedResponse(modelRequest())));
+      assert.equal(hooks, 0, 'metadata observation must not add formerly short-circuited property reads');
+      assert.equal((response as any).providerData, closing, 'raw original provider data remains unchanged');
+      assert.equal((response as any).output.length, 1);
+      assert.equal((response as any).usage.inputTokens, 1);
+      const row = usageModule.readUsageEventsForDate().find(r => r.responseId === responseId)!;
+      assert.equal(row.inputTokens, 1); assert.equal(row.outputTokens, 1);
+      assert.equal(row.providerReportedModel, undefined);
+      assert.equal(responseBindingModule.completedModelResponseBinding(response), undefined);
+    }
+  }
+});
+
+
+test('optional closing metadata declines proxy envelopes without newly invoking model or descriptor traps', async () => {
+  for (const path of ['buffered', 'streamed'] as const) {
+    let addedHooks = 0; let envelope: any;
+    const responseId = `resp_proxy_closing_${path}`;
+    const model = new ScriptedCodexModel(async function* () {
+      for await (const event of successfulTurn(responseId)) {
+        if (event.type === 'response.completed') {
+          envelope = new Proxy(event.response, {
+            get(target, key, receiver) { if (key === 'model') { addedHooks++; throw new Error('new model trap'); } return Reflect.get(target, key, receiver); },
+            getOwnPropertyDescriptor() { addedHooks++; throw new Error('new metadata descriptor trap'); },
+          });
+          event.response = envelope;
+        }
+        yield event;
+      }
+    });
+    const response = path === 'buffered' ? await model.getResponse(modelRequest())
+      : completedSdkStream(await collectCodexStream(model.getStreamedResponse(modelRequest())));
+    assert.equal(addedHooks, 0); assert.equal((response as any).providerData, envelope);
+    assert.equal(responseBindingModule.completedModelResponseBinding(response), undefined);
+    const row = usageModule.readUsageEventsForDate().find(r => r.responseId === responseId)!;
+    assert.equal(row.inputTokens, 1); assert.equal(row.providerReportedModel, undefined);
+  }
+});
+
+
+test('streamed no-created completion keeps old closing ID and envelope getter read counts and order', async () => {
+  for (const shape of ['id_accessor', 'envelope_accessor'] as const) {
+    let idReads = 0, envelopeReads = 0; const order: string[] = [];
+    const responseId = `resp_no_created_${shape}`; let envelope: any;
+    const model = new ScriptedCodexModel(async function* () {
+      for await (const event of successfulTurn(responseId)) {
+        if (event.type === 'response.created') continue;
+        if (event.type === 'response.completed') {
+          envelope = event.response;
+          envelope.model = 'gpt-reported-otherwise';
+          Object.defineProperty(envelope, 'id', { enumerable: true, get() {
+            idReads++; order.push('id');
+            if (idReads > 2) throw new Error('third closing ID read changes old success');
+            return responseId;
+          } });
+          if (shape === 'envelope_accessor') Object.defineProperty(event, 'response', { enumerable: true, get() {
+            envelopeReads++; order.push('envelope');
+            if (envelopeReads > 4) throw new Error('fifth envelope read changes old success');
+            return envelope;
+          } });
+        }
+        yield event;
+      }
+    });
+    const response = completedSdkStream(await collectCodexStream(model.getStreamedResponse(modelRequest()))) as any;
+    assert.equal(response.id, responseId); assert.equal(response.providerData, envelope);
+    assert.equal(response.output.length, 1); assert.equal(response.usage.inputTokens, 1);
+    assert.equal(idReads, 2);
+    assert.equal(envelopeReads, shape === 'envelope_accessor' ? 4 : 0);
+    assert.deepEqual(order, shape === 'envelope_accessor' ? ['envelope', 'envelope', 'id', 'envelope', 'id', 'envelope'] : ['id', 'id']);
+    assert.equal(responseBindingModule.completedModelResponseBinding(response), undefined);
+    const row = usageModule.readUsageEventsForDate().find(r => r.responseId === responseId)!;
+    assert.equal(row.inputTokens, 1); assert.equal(row.outputTokens, 1);
+    assert.equal(row.providerReportedModel, undefined);
+  }
+});

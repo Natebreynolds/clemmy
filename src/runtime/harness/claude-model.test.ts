@@ -17,14 +17,53 @@ import {
   watchClaudeThinkingForLiveness,
   claudeStreamEventKind,
   restoreClaudeWireToolNames,
+  dispatchClaudeWithCacheTtlRetry,
+  buildClaudeSystemBlocks,
 } from './claude-model.js';
+import { withModelUsageAttribution } from '../usage-log.js';
+import { activeModelWireRequestSnapshot, createModelTransportAttempt, observeModelTransportFetch,
+  createClaudeModelWireProducer, withModelTransportAttempt, withModelTransportRecorder } from './model-transport-observation.js';
+import { composeReviewInput, createReviewInputObservation, type BoundReviewInputObservation,
+  type ReviewInputSeed } from './review-input-observation.js';
+import { createHash } from 'node:crypto';
+import type { ModelRequest } from '@openai/agents-core';
+import { withResilience } from './resilient-model.js';
+import { withTracelessStep } from './traceless-step-model.js';
 import { ClaudeHeadlessModel, setClaudeHeadlessCliAvailableForTest } from './claude-headless-model.js';
-import { resolveModelCapability } from './model-wire-registry.js';
+import { resolveModelCapability, INSTRUCTION_CACHE_DELIM, CACHE_MEMORY_CORE_SENTINEL } from './model-wire-registry.js';
 import { harnessRunContextStorage } from './brackets.js';
 import type { RawClaudeStreamDiagnostic } from './claude-stream-diagnostics.js';
 
 const ID = "You are Claude Code, Anthropic's official CLI for Claude.".replace('Claude', 'Claude'); // exact identity
 const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+test('actual Claude TTL retry records two wire dispatches and distinct final body snapshots without another model round', async () => {
+  const rows: Readonly<Record<string, unknown>>[] = [];
+  const sent: string[] = [];
+  const original = JSON.stringify({ model: 'claude-ttl-fixture', system: [{ type: 'text', text: 'PRIVATE FIXTURE',
+    cache_control: { type: 'ephemeral', ttl: '1h' } }], messages: [{ role: 'user', content: 'PRIVATE REQUEST' }] });
+  const final = new Response('{"id":"fixture-response"}', { status: 200 });
+  await withModelTransportRecorder(data => rows.push(data), () => withModelUsageAttribution({
+    sessionId: 'ttl-owner', sourceUserSeq: 77, attemptId: 'ttl-attempt', role: 'reviewer',
+  }, async () => {
+    const scope = createModelTransportAttempt('ttl-host-call', 1);
+    const result = await withModelTransportAttempt(scope, () => dispatchClaudeWithCacheTtlRetry(original, (body, reason) => {
+      sent.push(String(body));
+      return observeModelTransportFetch('raw_claude_messages', 'claude-ttl-fixture', async () =>
+        sent.length === 1 ? new Response('{"error":"cache_control ttl rejected"}', { status: 400 }) : final,
+      reason, activeModelWireRequestSnapshot(body));
+    }, () => {}));
+    assert.equal(result, final);
+  }));
+  assert.equal(sent.length, 2); assert.match(sent[0], /"ttl":"1h"/); assert.doesNotMatch(sent[1], /"ttl"/);
+  const starts = rows.filter(row => row.phase === 'dispatch_started');
+  assert.equal(starts.length, 2); assert.notEqual(starts[0].dispatchId, starts[1].dispatchId);
+  assert.ok(starts.every(row => row.modelCallId === 'ttl-host-call' && row.physicalAttempt === 1));
+  assert.equal(starts[1].retryReason, 'cache_ttl_rejected');
+  assert.notDeepEqual(starts[0].wireRequest, starts[1].wireRequest);
+  assert.equal(rows.filter(row => row.phase === 'model_result_completed').length, 0, 'headers do not complete a model result');
+  assert.doesNotMatch(JSON.stringify(rows), /PRIVATE FIXTURE|PRIVATE REQUEST|cache_control ttl rejected/);
+});
 
 test('raw Claude usage normalizes cached tokens for run budgets and efficiency telemetry', () => {
   const fields = rawClaudeUsageFields({
@@ -848,4 +887,245 @@ test('a tool named with the mcp_ prefix goes on the Claude wire as mcp- and its 
     { headers: { 'content-type': 'application/json' } });
   const parsed = JSON.parse(await restoreClaudeWireToolNames(whole, toolAliases).text());
   assert.equal(parsed.content[1].name, 'mcp_status');
+});
+
+const wireFixtureDigest = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
+function wireFixtureResponse(id: string): Response {
+  const events = [
+    ['message_start', { type: 'message_start', message: { id, type: 'message', role: 'assistant', model: 'claude-sonnet-5',
+      content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } }],
+    ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+    ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'DONE: fixture.' } }],
+    ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+    ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 4 } }],
+    ['message_stop', { type: 'message_stop' }],
+  ].map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join('');
+  return new Response(events, { headers: { 'content-type': 'text/event-stream' } });
+}
+async function realWireFixture(options: { mode?: 'terminal' | 'no_marker' | 'duplicate' | 'interior' | 'trim' | 'core' | 'marked_component' | 'user_marker';
+  before?: (body: Record<string, any>) => void; after?: (body: Record<string, any>) => void;
+  producer?: boolean; ttl?: boolean; flipAfterEnvelope?: boolean; sdkPromptOverride?: boolean; emptyPrompt?: boolean } = {}) {
+  const parity = process.env.CLEMMY_MODEL_PARITY;
+  process.env.CLEMMY_MODEL_PARITY = 'on';
+  try {
+    const { aisdk } = await import('@openai/agents-extensions/ai-sdk');
+    const { createAnthropic } = await import('@ai-sdk/anthropic');
+    const owner = { sessionId: 'wire-converter-fixture', sourceUserSeq: 90, attemptId: 'attempt-wire-converter' };
+    const mode = options.mode ?? 'terminal';
+    const base = composeReviewInput([
+      { text: options.ttl ? 'rubric fixture '.repeat(4000) : 'PRIVATE rubric 🟠\r\n"quoted"', component: 'judge_rubric' },
+      { text: 'PRIVATE whole guide résumé' + (mode === 'trim' ? '\u2003' : mode === 'core' ? CACHE_MEMORY_CORE_SENTINEL + 'PRIVATE core' : ''),
+        component: 'host_completion_guidance' },
+    ], '\n\n');
+    const instructions = mode === 'no_marker' || mode === 'core' ? base
+      : mode === 'interior' ? composeReviewInput([base, INSTRUCTION_CACHE_DELIM, 'PRIVATE suffix'], '')
+      : mode === 'duplicate' ? composeReviewInput([base, INSTRUCTION_CACHE_DELIM, INSTRUCTION_CACHE_DELIM], '')
+      : mode === 'marked_component' ? composeReviewInput([base,
+        { text: INSTRUCTION_CACHE_DELIM, component: 'evidence_tool_guidance' }], '')
+      : composeReviewInput([base, INSTRUCTION_CACHE_DELIM], '');
+    const prompt = options.emptyPrompt ? composeReviewInput([{ text: '', component: 'effective_objective' }], '')
+      : composeReviewInput([{ text: 'PRIVATE objective 🟠\r\n"value"' + (mode === 'user_marker' ? INSTRUCTION_CACHE_DELIM : ''), component: 'effective_objective' },
+        { text: 'PRIVATE candidate', component: 'candidate_response' }], '\n');
+    const seed: ReviewInputSeed = { owner, stage: 'completion', objectiveDigest: wireFixtureDigest('objective'),
+      candidateDigest: wireFixtureDigest('candidate'), instructions, prompt };
+    const observed = createReviewInputObservation(seed, { ownerAtEntry: () => owner });
+    const rows: Readonly<Record<string, unknown>>[] = []; const sent: string[] = [];
+    let fetches = 0;
+    const provider = createAnthropic({ apiKey: 'fixture-only', fetch: async (_input, init) => {
+      const before = JSON.parse(String(init?.body)); options.before?.(before);
+      const envelope = applyClaudeEnvelope({ ...init, body: JSON.stringify(before) }, 'fixture-only', 'fixture');
+      const after = JSON.parse(String(envelope.body)); options.after?.(after);
+      if (options.flipAfterEnvelope) process.env.CLEMMY_MODEL_PARITY = 'off';
+      return dispatchClaudeWithCacheTtlRetry(JSON.stringify(after), (body, reason) => {
+        sent.push(String(body));
+        return observeModelTransportFetch('raw_claude_messages', 'claude-sonnet-5', async () => {
+          fetches++;
+          return options.ttl && fetches === 1 ? new Response('{"error":"cache_control ttl rejected"}', { status: 400 })
+            : wireFixtureResponse(`msg-wire-${fetches}`);
+        }, reason, activeModelWireRequestSnapshot(body), { transform: envelope.reviewWireTransform, serialized: body });
+      }, () => {});
+    } });
+    const leaf = withClaudeInputSanitizer(withTracelessStep(aisdk(provider('claude-sonnet-5'))),
+      options.producer === false ? undefined : createClaudeModelWireProducer());
+    const model = withResilience(leaf, { label: 'wire-converter-fixture', capability: resolveModelCapability('claude-sonnet-5'), maxRetries: 0 });
+    const req = { systemInstructions: seed.instructions.text, input: [{ role: 'user', content: seed.prompt.text }],
+      modelSettings: { maxTokens: 128, ...(options.sdkPromptOverride ? { providerData: { prompt: [
+        { role: 'system', content: seed.instructions.text },
+        { role: 'user', content: [{ type: 'text', text: seed.prompt.text }] },
+      ] } } : {}) }, tools: [], handoffs: [], outputType: { type: 'text' }, tracing: 'disabled' } as ModelRequest;
+    const result = await withModelTransportRecorder(row => rows.push(row), () => withModelUsageAttribution({ ...owner,
+      role: 'reviewer' }, () => observed.wrap(model).getResponse(req)));
+    const observation = observed.finish([result], 'DONE: fixture.');
+    assert.equal(observation.status, 'bound', 'wire diagnostics never weaken/change SDK review execution');
+    assert.doesNotMatch(JSON.stringify(rows), /PRIVATE|fixture-only|authorization|sk-ant|quoted|whole guide/);
+    return { observation: observation as BoundReviewInputObservation, rows, sent, fetches, seed, result };
+  } finally {
+    if (parity === undefined) delete process.env.CLEMMY_MODEL_PARITY; else process.env.CLEMMY_MODEL_PARITY = parity;
+  }
+}
+
+test('actual candidate SDK converter preserves nominal terminal marker components in final decoded wire slots', async () => {
+  const result = await realWireFixture({ flipAfterEnvelope: true });
+  const inclusion = result.observation.wireInputInclusion!;
+  assert.equal(inclusion.status, 'bound'); assert.equal(inclusion.dispatches.length, 1); assert.equal(result.fetches, 1);
+  const dispatch = inclusion.dispatches[0]; assert.equal(dispatch.status, 'bound');
+  assert.equal(dispatch.wholeInstructions, 'transformed_match');
+  assert.deepEqual(dispatch.transforms, ['nominal_terminal_cache_delimiter_removed']);
+  const wire = JSON.parse(result.sent[0]);
+  assert.doesNotMatch(wire.system[1].text, /CLEM_CACHE_BREAK/);
+  assert.equal(dispatch.wireRequestSha256, wireFixtureDigest(result.sent[0]));
+  for (const component of dispatch.components as Array<Record<string, any>>) {
+    assert.equal(component.preservation, 'same_bytes');
+    const bytes = Buffer.from(component.scope === 'instructions' ? wire.system[1].text : wire.messages[0].content[0].text);
+    const selected = bytes.subarray(component.wireStartByte, component.wireEndByte);
+    assert.equal(selected.length, component.bytes); assert.equal(wireFixtureDigest(selected.toString('utf8')), component.sha256);
+  }
+  assert.equal(inclusion.wireResponseAttribution, 'unproved'); assert.equal(inclusion.wireUsageAndEof, 'unproved');
+  const completion = result.rows.find(row => row.phase === 'model_result_completed')!;
+  assert.equal(completion.providerResponseIdDigest, result.observation.providerResponseIdDigest);
+});
+
+test('no-marker converter keeps exact whole instructions while altered actual fetch bytes lose only diagnostics', async () => {
+  const exact = await realWireFixture({ mode: 'no_marker' });
+  assert.equal(exact.observation.wireInputInclusion!.dispatches[0].wholeInstructions, 'same_bytes');
+  for (const options of [
+    { before: (body: Record<string, any>) => { body.system[0].text = body.system[0].text.slice(1); } },
+    { before: (body: Record<string, any>) => { body.messages.push({ role: 'system', content: [{ type: 'text', text: 'PRIVATE hoisted' }] }); } },
+    { before: (body: Record<string, any>) => { body.messages[0].content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA==' } }); } },
+    { before: (body: Record<string, any>) => { body.system.push({ type: 'text', text: body.system[0].text }); } },
+    { after: (body: Record<string, any>) => { body.system[1].text += 'changed'; } },
+    { after: (body: Record<string, any>) => { body.system.push({ type: 'text', text: body.system[1].text }); } },
+    { after: (body: Record<string, any>) => { body.messages[0].content[0].text = body.system[1].text; } },
+    { producer: false },
+    { sdkPromptOverride: true },
+  ]) {
+    const result = await realWireFixture(options);
+    assert.equal(result.fetches, 1); assert.equal(result.observation.wireInputInclusion!.status, 'unqualified');
+    assert.equal(result.observation.wireInputInclusion!.dispatches[0].status, 'unqualified');
+  }
+});
+
+test('duplicate/interior/component cache markers, unknown core and Unicode trim-boundary components remain unqualified', async () => {
+  for (const mode of ['duplicate', 'interior', 'marked_component', 'core', 'trim', 'user_marker'] as const) {
+    const result = await realWireFixture({ mode });
+    assert.equal(result.fetches, 1); assert.equal(result.observation.wireInputInclusion!.status, 'unqualified', mode);
+    if (mode === 'trim') {
+      const dispatch = result.observation.wireInputInclusion!.dispatches[0];
+      assert.equal(dispatch.reason, 'component_bytes_transformed'); assert.equal(dispatch.wholeInstructions, 'transformed_match');
+      assert.ok((dispatch.components as Array<Record<string, unknown>>).some(c => c.preservation === 'unqualified_trimmed_or_removed'));
+    }
+  }
+});
+
+test('empty SDK text remains present and malformed final user slots cannot inherit its byte proof', async () => {
+  const exact = await realWireFixture({ emptyPrompt: true });
+  assert.equal(exact.observation.wireInputInclusion!.status, 'bound');
+  assert.equal(JSON.parse(exact.sent[0]).messages[0].content[0].text, '');
+  for (const after of [
+    (body: Record<string, any>) => { body.messages[0].content = []; },
+    (body: Record<string, any>) => { body.messages[0].content[0] = { type: 'image', text: '' }; },
+    (body: Record<string, any>) => { delete body.messages[0].content[0].text; },
+    (body: Record<string, any>) => { body.messages[0].content[0].unsupported = true; },
+  ]) {
+    const result = await realWireFixture({ emptyPrompt: true, after });
+    assert.equal(result.fetches, 1);
+    assert.equal(result.observation.wireInputInclusion!.status, 'unqualified');
+    assert.equal(result.observation.wireInputInclusion!.dispatches[0].reason, 'actual_dispatch_text_mismatch');
+  }
+});
+
+test('actual TTL retry revalidates each serialized body without attributing refusal usage or EOF to the SDK result', async () => {
+  const result = await realWireFixture({ ttl: true });
+  assert.equal(result.fetches, 2); assert.equal(result.sent.length, 2);
+  const inclusion = result.observation.wireInputInclusion!; assert.equal(inclusion.status, 'bound');
+  assert.equal(inclusion.dispatches.length, 2);
+  assert.deepEqual(inclusion.dispatches.map(record => record.wireSubattempt), [1, 2]);
+  assert.notEqual(inclusion.dispatches[0].receiptId, inclusion.dispatches[1].receiptId);
+  assert.notEqual(inclusion.dispatches[0].wireRequestSha256, inclusion.dispatches[1].wireRequestSha256);
+  assert.equal(inclusion.wireResponseAttribution, 'unproved'); assert.equal(inclusion.wireUsageAndEof, 'unproved');
+});
+
+test('throwing or rejecting executed-projection observers cannot change system construction', async () => {
+  const cap = resolveModelCapability('claude-sonnet-5'); const input = 'PRIVATE stable rubric' + INSTRUCTION_CACHE_DELIM;
+  const control = buildClaudeSystemBlocks(input, cap, true);
+  for (const observe of [() => { throw new Error('fixture observer failure'); }, async () => { throw new Error('fixture async observer failure'); }]) {
+    assert.deepEqual(buildClaudeSystemBlocks(input, cap, true, 0, undefined, observe), control);
+  }
+  await new Promise(resolve => setImmediate(resolve));
+});
+
+for (const streamed of [false, true]) test(`raw Claude captures only memory accounting at public ${streamed ? 'lazy stream' : 'buffered'} entry`, async () => {
+  const usage = await import('../usage-log.js');
+  const a = { sessionId: 'sess-claude-memory-A', sourceUserSeq: 2001, attemptId: 'attempt:claude-memory-A' };
+  const b = { sessionId: 'sess-claude-harness-B', sourceUserSeq: 2002, runAttemptId: 'attempt:claude-harness-B', turn: 9 };
+  const responseId = `claude-memory-entry-${streamed}`;
+  const original = { id: responseId, output: [], usage: { inputTokens: 19, outputTokens: 4, totalTokens: 23,
+    inputTokensDetails: [{ cacheReadInputTokens: 11 }] } };
+  const diagnostics: RawClaudeStreamDiagnostic[] = []; const order: string[] = [];
+  let release!: () => void; const wait = new Promise<void>(resolve => { release = resolve; });
+  const wrapped = withRawClaudeUsageRecording({ getResponse: async () => { await wait; return original; },
+    getStreamedResponse: async function* () {
+      assert.equal(harnessRunContextStorage.getStore()?.sessionId, b.sessionId, 'provider work keeps the actual drainer harness');
+      order.push('provider'); yield { type: 'response_done', response: original }; order.push('after-yield');
+    } } as never, 'claude-memory-script', entry => { order.push('usage'); usage.recordModelUsage(entry); },
+    () => order.push('window'), entry => diagnostics.push(entry));
+  const invoke = () => usage.withModelUsageAttribution({ ...a, usageJobId: `memory:standing:claude-${streamed}`,
+    channel: 'memory:standing', memoryAccountingOrigin: usage.createMemoryAccountingOrigin(a) }, () =>
+    harnessRunContextStorage.run(b as never, () => streamed ? wrapped.getStreamedResponse({} as never) : wrapped.getResponse({} as never)));
+  if (streamed) {
+    const stream = invoke() as AsyncIterable<unknown>; const events: any[] = [];
+    await usage.withModelUsageAttribution({ sessionId: 'later-drainer', sourceUserSeq: 2003 }, () => harnessRunContextStorage.run(b as never, async () => {
+      for await (const event of stream) { order.push('consumer'); events.push(event); }
+    }));
+    assert.equal(events.length, 1); assert.deepEqual(events[0].response.output, original.output);
+    assert.deepEqual(order, ['provider', 'window', 'usage', 'consumer', 'after-yield']);
+    assert.equal(diagnostics.length, 1); assert.equal(diagnostics[0].sessionId, a.sessionId);
+    assert.equal(diagnostics[0].sourceUserSeq, a.sourceUserSeq); assert.equal(diagnostics[0].attemptId, a.attemptId);
+    assert.equal(diagnostics[0].turn, 0, 'no borrowed harness-B turn');
+  } else { const pending = invoke(); release(); assert.equal(await pending, original); assert.deepEqual(order, ['window', 'usage']); }
+  const row = usage.readUsageEventsForDate().find(r => r.responseId === responseId)!;
+  assert.match(row.source, /^memory:standing:/); assert.equal(row.trace?.acceptedSource, `${a.sessionId}:${a.sourceUserSeq}`);
+  assert.equal(row.trace?.attemptId, a.attemptId); assert.equal(row.trace?.modelCallId, undefined, 'scripted unbound producer does not gain a local original identity');
+  assert.equal(row.inputTokens, 19); assert.equal(row.cachedInputTokens, 11); assert.equal(row.outputTokens, 4);
+});
+
+test('raw Claude unknown memory markers decline diagnostic B and preserve plain legacy correlation', async () => {
+  const usage = await import('../usage-log.js'); let hooks = 0;
+  const b = { sessionId: 'sess-claude-marker-B', sourceUserSeq: 2100, runAttemptId: 'attempt:claude-marker-B' };
+  for (const mode of ['empty', 'clone', 'getter', 'plain', 'source-only'] as const) {
+    const context: any = { sessionId: b.sessionId, sourceUserSeq: b.sourceUserSeq, attemptId: b.runAttemptId,
+      usageJobId: `memory:standing:claude-marker-${mode}` };
+    if (mode === 'getter') Object.defineProperty(context, 'memoryAccountingOrigin', { enumerable: true, get() { hooks++; throw new Error('no new hook'); } });
+    else if (mode !== 'plain') context.memoryAccountingOrigin = mode === 'empty' ? usage.createMemoryAccountingOrigin()
+      : mode === 'source-only' ? usage.createMemoryAccountingOrigin({ sessionId: 'sess-claude-source-only', sourceUserSeq: 2101 }) : { kind: 'memory_accounting_origin' };
+    const diagnostics: RawClaudeStreamDiagnostic[] = []; const recorded: Parameters<typeof usage.recordModelUsage>[0][] = [];
+    const responseId = `claude-marker-${mode}`;
+    const wrapped = withRawClaudeUsageRecording({ getResponse: async () => { throw new Error('unused'); },
+      getStreamedResponse: async function* () { yield { type: 'response_done', response: { id: responseId, output: [], usage: { inputTokens: 3, outputTokens: 1 } } }; } } as never,
+      'claude-marker-script', entry => { recorded.push(entry); usage.recordModelUsage(entry); }, () => {}, entry => diagnostics.push(entry));
+    const stream = usage.withModelUsageAttribution(context, () => harnessRunContextStorage.run(b as never, () => wrapped.getStreamedResponse({} as never)));
+    await usage.withModelUsageAttribution({ sessionId: 'late-foreign', sourceUserSeq: 2200 }, async () => { for await (const _ of stream) { /* original events */ } });
+    const row = usage.readUsageEventsForDate().find(r => r.responseId === responseId)!;
+    if (mode === 'plain') {
+      assert.equal(recorded[0].callerProvenance, undefined); assert.equal(row.trace?.modelCallId, responseId);
+      assert.equal(row.trace?.acceptedSource, `${b.sessionId}:${b.sourceUserSeq}`); assert.equal(diagnostics[0].sessionId, b.sessionId);
+    } else {
+      assert.ok(recorded[0].callerProvenance); assert.equal(row.trace?.attemptId, undefined);
+      assert.equal(row.trace?.acceptedSource, mode === 'source-only' ? 'sess-claude-source-only:2101' : undefined);
+      assert.equal(diagnostics.length, mode === 'source-only' ? 1 : 0);
+      if (mode === 'source-only') { assert.equal(diagnostics[0].sessionId, 'sess-claude-source-only'); assert.equal(diagnostics[0].attemptId, undefined); }
+    }
+  }
+  assert.equal(hooks, 0);
+});
+
+test('raw Claude memory consumer-close retains one usage row and truthful closed diagnostic', async () => {
+  const usage = await import('../usage-log.js'); const diagnostics: RawClaudeStreamDiagnostic[] = []; let calls = 0;
+  const origin = usage.createMemoryAccountingOrigin({ sessionId: 'sess-closed-memory', sourceUserSeq: 2300, attemptId: 'attempt:closed-memory' });
+  const wrapped = withRawClaudeUsageRecording({ getResponse: async () => { throw new Error('unused'); },
+    getStreamedResponse: async function* () { yield { type: 'response_done', response: { id: 'closed-memory-response', output: [], usage: { inputTokens: 2, outputTokens: 1 } } }; yield { type: 'response_started' }; } } as never,
+    'claude-closed-script', entry => { calls++; usage.recordModelUsage(entry); }, () => {}, entry => diagnostics.push(entry));
+  const stream = usage.withModelUsageAttribution({ sessionId: '', sourceUserSeq: 0, usageJobId: 'memory:standing:closed', memoryAccountingOrigin: origin }, () => wrapped.getStreamedResponse({} as never));
+  const iterator = stream[Symbol.asyncIterator](); assert.equal((await iterator.next()).done, false); await iterator.return?.();
+  assert.equal(calls, 1); assert.equal(diagnostics[0].settlement, 'closed'); assert.equal(diagnostics[0].sessionId, 'sess-closed-memory');
 });
