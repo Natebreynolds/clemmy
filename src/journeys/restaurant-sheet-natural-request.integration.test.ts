@@ -143,6 +143,8 @@ const { _setApprovedWriteKindsForTests } = await import('../agents/plan-scope.js
 _setApprovedWriteKindsForTests('all');
 const { Usage } = await import('@openai/agents');
 const { CodexModelProvider } = await import('../runtime/harness/codex-model.js');
+const { withResilience } = await import('../runtime/harness/resilient-model.js');
+const { resolveModelCapability } = await import('../runtime/harness/model-wire-registry.js');
 const discord = await import('../channels/discord-harness.js');
 const bridge = await import('../runtime/harness/respond-bridge.js');
 const { configureHarnessRuntime, resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
@@ -609,7 +611,9 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   const completionReviews: Array<{ sessionId: string; seq: number; modelId: string }> = [];
   mock.method(CodexModelProvider.prototype, 'getModel', (modelId?: string) => {
     assert.equal(modelId, 'gpt-5.5', 'the isolated owner-selected same-provider reviewer is honored');
-    return {
+    // Wrapped like the production reviewer, so each answer is bound to its
+    // own review call the way a real one is.
+    return withResilience({
       async getResponse(request: unknown) {
         if (modelUsageAttributionStorage.getStore()?.channel === 'memory:standing') {
           // Background scope review is a separate model request from the
@@ -653,7 +657,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
           output: [textMessage('DONE: the exact ten settled restaurant rows and successful new Sheet receipt satisfy this accepted request.')] };
       },
       async *getStreamedResponse() { throw new Error('completion review uses the existing one-turn nonstreaming Runner'); },
-    } as never;
+    } as never, { label: 'restaurant-reviewer', capability: resolveModelCapability('gpt-5.5'), maxRetries: 0 });
   });
 
   const gateway = composioTools.getComposioRuntimeTools()

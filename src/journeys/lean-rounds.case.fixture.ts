@@ -107,6 +107,8 @@ writeFileSync(path.join(HOME, 'state', 'auth.json'), JSON.stringify({
 
 const { Usage } = await import('@openai/agents');
 const { CodexModelProvider } = await import('../runtime/harness/codex-model.js');
+const { withResilience } = await import('../runtime/harness/resilient-model.js');
+const { resolveModelCapability } = await import('../runtime/harness/model-wire-registry.js');
 const discord = await import('../channels/discord-harness.js');
 const bridge = await import('../runtime/harness/respond-bridge.js');
 const { configureHarnessRuntime } = await import('../runtime/harness/codex-client.js');
@@ -346,7 +348,9 @@ const rulesBefore = (await heartbeats.heartbeatStatus(HEARTBEAT_ID)).contract.ru
 // The completion reviewer's model wire: a fixed verdict, counted.
 // ---------------------------------------------------------------------------
 let reviews = 0;
-mock.method(CodexModelProvider.prototype, 'getModel', () => ({
+// Wrapped like the production reviewer, so each answer is bound to its own
+// review call the way a real one is.
+mock.method(CodexModelProvider.prototype, 'getModel', () => withResilience({
   async getResponse() {
     reviews += 1;
     // The reviewer answers as it is told to: the verdict, what it rests on
@@ -359,7 +363,7 @@ mock.method(CodexModelProvider.prototype, 'getModel', () => ({
     ].join('\n'))] };
   },
   async *getStreamedResponse() { throw new Error('completion review uses the one-turn nonstreaming Runner'); },
-}) as never);
+} as never, { label: 'lean-rounds-reviewer', capability: resolveModelCapability('gpt-5.5'), maxRetries: 0 }) as never);
 
 // ---------------------------------------------------------------------------
 // One turn: the evidence-seeking scripted model as the brain, driven through
