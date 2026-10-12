@@ -284,7 +284,9 @@ function ensurePrivateQuarantineDir(): void {
       throw new Error('legacy Composio quarantine directory changed while opening');
     }
     fchmodSync(fd, 0o700);
-    fsyncSync(fd);
+    // Windows has no directory flush: a read-only handle refuses fsync with
+    // EPERM, and this boot migration treats any error as a readiness failure.
+    if (process.platform !== 'win32') fsyncSync(fd);
   } finally {
     closeSync(fd);
   }

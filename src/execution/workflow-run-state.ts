@@ -26,6 +26,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
+import { syncDirectoryMetadata } from '../runtime/sync-directory.js';
 
 const logger = pino({ name: 'clementine.workflow-run-state' });
 
@@ -100,8 +101,9 @@ function retainUnavailableState(file: string): void {
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
-  const directory = openSync(path.dirname(file), 'r');
-  try { fsyncSync(directory); } finally { closeSync(directory); }
+  // The marker bytes were flushed through their own write descriptor above.
+  // Windows has no directory flush (a read-only handle refuses it with EPERM).
+  syncDirectoryMetadata(path.dirname(file));
 }
 
 export function readWorkflowState(workflowName: string): WorkflowDurableState {

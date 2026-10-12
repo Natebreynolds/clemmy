@@ -19,6 +19,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { WORKFLOW_RUNS_DIR } from './shared.js';
 import { getNotification } from '../runtime/notifications.js';
+import { syncExistingFileBytes, syncDirectoryMetadata } from '../runtime/sync-directory.js';
 import { listWorkflows, readWorkflow, type WorkflowDefinition } from '../memory/workflow-store.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
 import { computeResumeState, listFinalFailedItems } from '../execution/workflow-events.js';
@@ -374,17 +375,13 @@ export function readWorkflowTriggerReceiptAcceptance(receiptId: string): string 
   // Visibility is not durability: a competing writer's hard link can be read
   // before that writer fsyncs the directory. Promote both proof files and their
   // directory entries before SQLite is allowed to mark the receipt enqueued.
-  const runFd = openSync(runFile, 'r');
-  try { fsyncSync(runFd); } finally { closeSync(runFd); }
+  // Every writer of these files fsynced its own write descriptor before
+  // link/rename, which is the precondition syncExistingFileBytes relies on where
+  // Windows refuses a flush (it always refuses one through a read-only handle).
+  syncExistingFileBytes(runFile);
   const markerFile = triggerReceiptAcceptanceFile(marker.receiptId);
-  const markerFd = openSync(markerFile, 'r');
-  try { fsyncSync(markerFd); } finally { closeSync(markerFd); }
-  if (process.platform !== 'win32') {
-    for (const dir of [path.dirname(runFile), path.dirname(markerFile)]) {
-      const dirFd = openSync(dir, 'r');
-      try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-    }
-  }
+  syncExistingFileBytes(markerFile);
+  for (const dir of [path.dirname(runFile), path.dirname(markerFile)]) syncDirectoryMetadata(dir);
   if (marker.version === 1) {
     // The legacy marker was created before the run. Its now-verified durable
     // run upgrades that provisional proof to V2 before retention can reap it.
