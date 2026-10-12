@@ -23,7 +23,7 @@ import { useSyncExternalStore } from 'react';
 import { NotchVoice, type NotchVoiceHandlers, type NotchVoiceOptions } from './notch-voice';
 import { VoiceSpeaker, type VoiceSpeakerHandlers } from './voice-speaker';
 import { heardCue, workingTick } from './voice-cues';
-import { spokenWords, voiceBaseline, voiceTurnEnded, voiceTurnRunning, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage, type VoiceUtterance } from './voice-turns';
+import { spokenWords, voiceBaseline, voiceReadableText, voiceTurnEnded, voiceTurnNoticeFacts, voiceTurnRunning, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage, type VoiceUtterance } from './voice-turns';
 import { liveSpokenText, liveVoiceAvailable, WebRtcLiveVoice, type LiveHistoryMessage, type LiveVoiceHandlers, type LiveVoiceLink } from './live-voice';
 
 export type VoicePhase = 'off' | 'connecting' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
@@ -392,6 +392,9 @@ export class VoiceModeController {
       this.armLiveIdle();
     }
     if (this.awaitingTurn && voiceTurnEnded(messages, this.turnFrom)) {
+      // A turn that ended on the app's notice has no words of Clem's for the
+      // request; the voice gets the typed fact so it can tell the owner.
+      if (link) for (const fact of voiceTurnNoticeFacts(messages, this.turnFrom)) link.note(fact, requestId);
       this.awaitingTurn = false;
       this.liveRequestId = null;
       if (this.state.phase === 'thinking') this.update({ phase: 'listening' });
@@ -466,7 +469,7 @@ export class VoiceModeController {
 function liveHistory(messages: readonly VoiceChatMessage[]): LiveHistoryMessage[] {
   return messages
     .filter(message => !message.checkIn)
-    .map(message => ({ role: message.role, text: (message.text?.trim() || message.approval?.preview?.ask?.trim() || '') }))
+    .map(message => ({ role: message.role, text: voiceReadableText(message) }))
     .filter(message => message.text)
     .slice(-LIVE_HISTORY_MESSAGES);
 }

@@ -143,6 +143,18 @@ function withApprovalConfirmation(message: ChatMessage, confirm: ApprovalConfirm
   return { ...message, approval: { ...message.approval!, confirm } };
 }
 
+/** A notice is the app's status for the work the tap resumed (a stop, a
+ *  refusal), never the tap's echo, unless it is the card decision itself. A
+ *  typed terminal with no words is not an echo either: it is drawn as its pill
+ *  (what was kept, the reply prompt, a question's answers), so only a finished
+ *  turn quoting the card's own id is. Legacy events keep the text rule. */
+function cardDecisionReplyEcho(message: Pick<ChatMessage, 'text' | 'terminal'>, decision: CardDecision): boolean {
+  const terminal = message.terminal;
+  if (!terminal) return cardDecisionEcho(message.text, decision);
+  if (terminal.notice) return terminal.notice.code === 'card_decision';
+  return terminal.status === 'done' && (message.text ?? '').includes(decision.approvalId);
+}
+
 /** Only the typed question for this exact card/source is already rendered.
  * Ordinary questions, failures and later results keep their own bubbles. */
 function isApprovalConfirmationTerminal(messages: readonly ChatMessage[], event: HarnessEvent, sessionId?: string | null): boolean {
@@ -1042,7 +1054,7 @@ export class ChatEngine {
     this.messages = this.messages.map((message) => (
       message.role === 'assistant' && !message.cardDecision
         && (message.acceptedSource?.sourceUserSeq === source || message.id === `a-${event.seq}`)
-        && cardDecisionEcho(message.text, cardDecision)
+        && cardDecisionReplyEcho(message, cardDecision)
         ? { ...message, cardDecision }
         : message
     ));
@@ -1261,12 +1273,16 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
           ? undefined
           : messages[awaitingIndex];
         const tappedDecision = sourceUserSeq === null ? undefined : cardDecisionsBySource.get(sourceUserSeq);
-        const cardDecision = tappedDecision && cardDecisionEcho(presentation.text, tappedDecision) ? tappedDecision : undefined;
+        const cardDecision = tappedDecision && cardDecisionReplyEcho(presentation, tappedDecision) ? tappedDecision : undefined;
         const terminalMessage: ChatMessage = {
           id: delegatedMessage?.id ?? awaitingMessage?.id ?? `a-${event.seq}`,
           role: 'assistant',
           text: presentation.text,
           status: presentation.status,
+          // A reopened turn draws the same status line, notice and review
+          // chip as it did live; without its typed facts a notice reopened
+          // as an empty reply.
+          ...(presentation.terminal ? { terminal: presentation.terminal } : {}),
           ...(cardDecision ? { cardDecision } : {}),
           taskMode: taskModesBySource.get(sourceUserSeq ?? currentSourceUserSeq ?? -1),
           planArtifactRef: readPlanRevisionRef(d.planArtifactRef ?? d.artifact) ?? (sourceUserSeq === null ? undefined : planRefsBySource.get(sourceUserSeq)),

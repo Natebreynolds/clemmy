@@ -52,6 +52,14 @@ import {
   type TimelineBounds,
   turnModelOffer,
   turnReview,
+  turnReviewNote,
+  retainedOutsideChange,
+  terminalNoticeLine,
+  terminalStatusPill,
+  cardDecisionNoticeOnly,
+  NOTICE_ACTION_LABEL,
+  type TerminalNoticeLine,
+  type TurnReview,
   readChatStopReceipt,
   workflowStopNotice,
   type ActivityItem,
@@ -136,12 +144,15 @@ interface Props {
   onOpenRun?: (runSessionId: string) => void;
   /** Where an approval a task waits on is decided. */
   onOpenNeedsYou?: () => void;
+  /** Where model accounts and their credit live. Absent where the screen
+   *  cannot leave for Settings, so a notice offers no Add credit there. */
+  onOpenSettings?: () => void;
   /** Keeps the list's new-chat selection bound to its assigned conversation. */
   onSessionCreated?: (sessionId: string) => void;
   onBack: () => void;
 }
 
-export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialFileContext, draftScope, initialAttachments, initialAutoSend, initialComposeMode, agentId: initialAgentId, agentName: initialAgentName, projectId: initialProjectId, projectName: initialProjectName, onOpenRun, onOpenNeedsYou, onSessionCreated, onBack }: Props) {
+export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialFileContext, draftScope, initialAttachments, initialAutoSend, initialComposeMode, agentId: initialAgentId, agentName: initialAgentName, projectId: initialProjectId, projectName: initialProjectName, onOpenRun, onOpenNeedsYou, onOpenSettings, onSessionCreated, onBack }: Props) {
   useMobileDetailHeader();
   const widgetNavigation = widgetNavigationFromSearch(window.location.search);
   useEffect(() => { if (initialComposeMode) reportWidgetLanding(widgetNavigation, { tab: 'chats', compose: initialComposeMode }); }, [initialComposeMode, widgetNavigation]);
@@ -939,6 +950,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
               engine.setDelegatedWorkState(sourceUserSeq, state);
             }}
             onDelegatedChanged={() => engine.resume()}
+            onChangeModel={() => setConversationPanel('model')}
+            onOpenSettings={onOpenSettings}
           />
           {placedTasks.byMessage.get(message.id)?.map(taskCard)}
           </Fragment>
@@ -1004,7 +1017,7 @@ function approvalFieldLabel(name: string): string {
 function MessageRow({
   message, speaker, sessionId, busy, onExecutePlan, onRevisePlan, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
   approvalActing, approvalDecided, onApprovalAction, onApproveWithEdits,
-  onDelegatedStateChange, onDelegatedChanged, onAnswer, onConnectionContinue,
+  onDelegatedStateChange, onDelegatedChanged, onAnswer, onConnectionContinue, onChangeModel, onOpenSettings,
 }: {
   message: ChatMessage;
   /** Who wrote this reply, drawn above it. Absent in a thread only Clem answered. */
@@ -1032,6 +1045,9 @@ function MessageRow({
    *  Absent once the question is no longer the newest message. */
   onAnswer?: (text: string) => void;
   onConnectionContinue?: ConnectionContinuation;
+  /** Opens this conversation's model choice. */
+  onChangeModel?: () => void;
+  onOpenSettings?: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [editedValue, setEditedValue] = useState('');
@@ -1082,6 +1098,7 @@ function MessageRow({
   // A card tap and the host's reply to it are the card's business, not the
   // conversation's; only a decision that failed to land is shown.
   if (hiddenCardDecision(message)) return null;
+  if (cardDecisionNoticeOnly(message)) return null;
 
   if (message.approval) {
     // A decided card has done its job and leaves the conversation.
@@ -1280,21 +1297,26 @@ function MessageRow({
           ) : null}
         </>
       ) : null}
-      {/* Mirror the backend's TYPED terminal (desktop shows the same pills).
-          Without this the phone showed a blocked or paused turn as plain prose,
-          indistinguishable from a finished answer. Legacy events show nothing. */}
+      {/* Mirror the backend's TYPED terminal with the desktop's wording (one
+          source, chat-engine), with what the turn kept. Without this the phone
+          showed a blocked or paused turn as plain prose, indistinguishable from
+          a finished answer. A notice is the app's status line in place of the
+          pill. Legacy events show nothing. */}
       {(() => {
         const t = message.terminal;
         if (!t || thinking) return null;
-        const line = t.status === 'blocked' ? 'Stopped here — your work is kept'
-          : t.status === 'uncertain' ? 'Outcome uncertain — check before repeating'
-          : t.status === 'cancelled' ? 'Cancelled'
-          : t.status === 'transferred' ? 'Handed off'
-          : t.status === 'needs_input' && (t.kind === 'continue' || t.needs === 'continue') ? 'Paused — say “continue” to pick up'
-          : t.status === 'needs_input' && t.kind === 'approval' ? 'Waiting for your approval'
-          : t.status === 'needs_input' ? 'Needs your reply'
-          : null;
-        return line ? <p class={`reply-state reply-state-${t.status}`} role="status">{line}</p> : null;
+        const outside = retainedOutsideChange(t)?.label;
+        const notice = terminalNoticeLine(t);
+        if (notice) {
+          return (
+            <NoticeLine line={notice} status={t.status} outside={outside}
+              onAnswer={onAnswer} onChangeModel={onChangeModel} onOpenSettings={onOpenSettings} />
+          );
+        }
+        const line = terminalStatusPill(t, { wordless: !turnText.showReply })?.label
+          ?? (t.status === 'needs_input' ? 'Needs your reply' : null);
+        const shown = [line, outside].filter(Boolean).join(' · ');
+        return shown ? <p class={`reply-state reply-state-${t.status}`} role="status">{shown}</p> : null;
       })()}
       {/* The harness's ledger for this turn — what it wrote, saved, read and
           remembered. Desktop makes the file chips openable; a phone has nowhere
@@ -1684,10 +1706,50 @@ function ModelRuleOfferCard({ offer, sessionId }: { offer: ModelRuleOffer; sessi
   );
 }
 
+const REVIEW_CHIP: Record<TurnReview, { label: string; ok: boolean }> = {
+  checked: { label: '✓ Checked', ok: true },
+  unchecked: { label: 'Not checked', ok: false },
+  rejected: { label: 'Didn’t pass review', ok: false },
+  needs_recheck: { label: 'Needs a fresh check', ok: false },
+};
+
+/** A turn no model spoke for, as the app's own status line: what happened,
+ *  the provider's words labelled as theirs, and the action that resolves it
+ *  where this phone can take it. Signing in happens on the computer. */
+function NoticeLine({ line, status, outside, onAnswer, onChangeModel, onOpenSettings }: {
+  line: TerminalNoticeLine;
+  status: string;
+  outside?: string;
+  onAnswer?: (text: string) => void;
+  onChangeModel?: () => void;
+  onOpenSettings?: () => void;
+}) {
+  const [sent, setSent] = useState(false);
+  const action = line.action === 'change_model' && onChangeModel
+    ? { label: NOTICE_ACTION_LABEL.change_model, run: onChangeModel }
+    : line.action === 'add_credit' && onOpenSettings
+      ? { label: NOTICE_ACTION_LABEL.add_credit, run: onOpenSettings }
+      : line.action === 'try_again' && onAnswer
+        ? { label: NOTICE_ACTION_LABEL.try_again, run: () => { setSent(true); onAnswer(NOTICE_ACTION_LABEL.try_again); } }
+        : null;
+  return (
+    <div class={`reply-notice reply-state-${status}`} role="status">
+      <span class="reply-notice-label">{[line.label, outside].filter(Boolean).join(' · ')}</span>
+      {line.detail ? <span class="reply-notice-detail">{line.detail}</span> : null}
+      {line.action === 'sign_in' ? <span class="reply-notice-detail">Sign in again on your computer, in Settings.</span> : null}
+      {action ? (
+        <button type="button" class="reply-offer-button" disabled={sent} onClick={action.run}>{action.label}</button>
+      ) : null}
+    </div>
+  );
+}
+
 function TurnReceipt({ message, sessionId }: { message: ChatMessage; sessionId?: string }) {
   const [reveal, setReveal] = useState(false);
-  const review = turnReview(message.activity);
-  const byline = turnByline(message.activity);
+  // The host's ruling on the terminal decides; verdict rows are the fallback.
+  const review = turnReview(message.activity, message.terminal);
+  const reviewNote = turnReviewNote(message.terminal);
+  const byline = turnByline(message.activity, message.terminal);
   const outside = outsideWorkCards(message.activity);
   const offer = turnModelOffer(message.activity);
   const proven = evidenceChips(message.terminal?.evidenceRefs);
@@ -1700,10 +1762,9 @@ function TurnReceipt({ message, sessionId }: { message: ChatMessage; sessionId?:
       {offer && sessionId ? <ModelRuleOfferCard key={offer.offerId} offer={offer} sessionId={sessionId} /> : null}
       {review || touched || byline ? (
         <button type="button" class="reply-receipt" onClick={() => setReveal(!reveal)} aria-expanded={reveal}>
-          {review === 'checked' ? <span class="receipt-ok">✓ Checked</span> : null}
-          {review === 'unchecked' ? <span class="receipt-warn">Not checked</span> : null}
-          {review === 'rejected' ? <span class="receipt-warn">Didn’t pass review</span> : null}
+          {review ? <span class={REVIEW_CHIP[review].ok ? 'receipt-ok' : 'receipt-warn'}>{REVIEW_CHIP[review].label}</span> : null}
           {touched ? <span>{touched}</span> : null}
+          {reveal && reviewNote ? <span class="receipt-model receipt-review-note">Review: {reviewNote}</span> : null}
           {reveal && byline ? <span class="receipt-model">{byline}</span> : null}
         </button>
       ) : null}

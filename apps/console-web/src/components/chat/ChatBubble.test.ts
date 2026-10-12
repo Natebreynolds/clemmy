@@ -39,9 +39,34 @@ test('suggested answers are buttons only where an answer can land', () => {
 });
 
 test('the receipt never lets an unchecked answer borrow a pass', () => {
-  assert.match(RECEIPT, /review === 'checked'/);
+  // Only a passed review draws the success chip; every other ruling is a warning.
+  assert.match(RECEIPT, /checked: \{ label: 'Checked', ok: true \}/);
+  for (const ruling of ['unchecked', 'rejected', 'needs_recheck']) {
+    assert.match(RECEIPT, new RegExp(`${ruling}: \\{ label: '[^']+', title: '[^']+', ok: false \\}`), ruling);
+  }
   assert.match(RECEIPT, /Not checked/);
   assert.match(RECEIPT, /group-hover\/turn:opacity-100/, 'the model name shows on hover only');
+});
+
+test('the review chip reads the host’s ruling, and its finding is detail labelled as the review', () => {
+  assert.match(RECEIPT, /turnReview\(activity, terminal\)/);
+  assert.match(RECEIPT, /turnReviewNote\(terminal\)/);
+  assert.match(RECEIPT, /needs_recheck: \{ label: 'Needs a fresh check'/);
+  assert.match(RECEIPT, />Review: \{note\}</, 'the finding is labelled as the review');
+  assert.doesNotMatch(SOURCE, /reviewNote/, 'the finding never reaches the reply');
+});
+
+test('a notice is the app’s status line with its action, and pills carry what was kept', () => {
+  // One wording for desktop and phone, from chat-engine.
+  assert.match(SOURCE, /const notice = terminalNoticeLine\(t\);\s*if \(notice\) return row\(<NoticeLine line=\{notice\} onAnswer=\{onAnswer\} \/>\)/);
+  assert.match(SOURCE, /terminalStatusPill\(t, \{ wordless: !hasReplyText \}\)/);
+  assert.match(SOURCE, /retainedOutsideChange\(t\)/);
+  assert.match(SOURCE, /to="\/settings#who-does-what"[^>]*>\{NOTICE_ACTION_LABEL\.change_model\}/);
+  assert.match(SOURCE, /to="\/settings#accounts"/);
+  assert.match(SOURCE, /onAnswer\(NOTICE_ACTION_LABEL\.try_again\)/);
+  assert.match(SOURCE, /if \(cardDecisionNoticeOnly\(message\)\) return null;/);
+  // The old hand-written typed pills are gone from this file.
+  assert.doesNotMatch(SOURCE, /Stopped here — your work is kept/);
 });
 
 test('suggested answers stop being buttons once anything follows the question', () => {

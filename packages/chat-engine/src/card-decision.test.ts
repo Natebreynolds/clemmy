@@ -113,3 +113,44 @@ test('after a card tap, the work it resumes shows as working until Clem answers'
     assert.equal(visible.some((row) => row.role === 'user'), false, 'the tap itself is not');
   } finally { engine.dispose(); }
 });
+
+test('a card decision notice stays out of sight, but a stop of the work the tap resumed does not', () => {
+  const noticed = (code: 'card_decision' | 'stopped', status: 'done' | 'cancelled') => event(7, 'conversation_completed', {
+    sourceUserSeq: 6, reply: code === 'card_decision' ? 'Approved.' : 'Stopped.',
+    presentation: { identity: { sessionId: 'chat', sourceUserSeq: 6 }, status, kind: 'answer', text: 'App wording.', resumable: false },
+    turnOutcome: { status }, notice: { code },
+  });
+  const decided = foldTranscript([card, tap('approve'), noticed('card_decision', 'done')], 'chat')
+    .filter((row) => row.role === 'assistant' && !row.approval);
+  assert.equal(decided.length, 1);
+  assert.equal(hiddenCardDecision(decided[0]!), true);
+  const stopped = foldTranscript([card, tap('approve'), noticed('stopped', 'cancelled')], 'chat')
+    .filter((row) => row.role === 'assistant' && !row.approval);
+  assert.equal(stopped.length, 1);
+  assert.equal(hiddenCardDecision(stopped[0]!), false, 'the Cancelled pill for the resumed work stays visible');
+  assert.equal(stopped[0]!.text, '');
+  assert.equal(stopped[0]!.terminal?.notice?.code, 'stopped');
+});
+
+// An empty typed terminal used to count as the tap's echo, so the pill for the
+// work the tap resumed (what it kept, the reply prompt, a question's answers)
+// was hidden with it.
+test('a wordless typed terminal after a tap is the resumed work, not the tap’s echo', () => {
+  const wordless = (status: 'needs_input' | 'cancelled' | 'transferred' | 'done', text = '') => event(7, 'conversation_completed', {
+    sourceUserSeq: 6, reply: text,
+    presentation: { identity: { sessionId: 'chat', sourceUserSeq: 6 }, status, kind: status === 'needs_input' ? 'question' : 'answer', text, resumable: true },
+    turnOutcome: { status, resumable: true },
+    retained: { results: 2, outsideChange: 'none' },
+  });
+  for (const [status, shown] of [['needs_input', 'awaiting-reply'], ['cancelled', 'stopped'], ['transferred', 'stopped']] as const) {
+    const rows = foldTranscript([card, tap('approve'), wordless(status)], 'chat')
+      .filter((row) => row.role === 'assistant' && !row.approval);
+    assert.equal(rows.length, 1, status);
+    assert.equal(hiddenCardDecision(rows[0]!), false, `${status} stays visible`);
+    assert.equal(rows[0]!.status, shown);
+    assert.equal(rows[0]!.terminal?.retained?.results, 2);
+  }
+  const echoed = foldTranscript([card, tap('approve'), wordless('done', 'Approved apr-card.')], 'chat')
+    .filter((row) => row.role === 'assistant' && !row.approval);
+  assert.equal(hiddenCardDecision(echoed[0]!), true, 'a finished turn quoting the card’s own id is still its echo');
+});

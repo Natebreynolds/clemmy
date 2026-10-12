@@ -48,9 +48,11 @@ interface Props {
   /** Opens the run view for a delegated task's work. */
   onOpenRun?: (runSessionId: string) => void;
   onOpenNeedsYou?: () => void;
+  /** Where model accounts and their credit live. */
+  onOpenSettings?: () => void;
 }
 
-export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenRun, onOpenNeedsYou }: Props) {
+export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenRun, onOpenNeedsYou, onOpenSettings }: Props) {
   const resume = useRef(handoff ? null : mobileChatLocation.resume());
   const [selectedId, setSelectedId] = useState<string | null>(resume.current?.kind === 'chat' ? resume.current.sessionId : null);
   const [selectedDraft, setSelectedDraft] = useState<string | undefined>();
@@ -191,6 +193,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
         projectName={composing.projectName}
         onOpenRun={onOpenRun}
         onOpenNeedsYou={onOpenNeedsYou}
+        onOpenSettings={onOpenSettings}
         onBack={() => { setComposing(null); void refresh(); }}
       />
     );
@@ -211,6 +214,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
         projectName={session?.projectName ?? undefined}
         onOpenRun={onOpenRun}
         onOpenNeedsYou={onOpenNeedsYou}
+        onOpenSettings={onOpenSettings}
         onBack={() => { closeSelected(); void refresh(); }}
       />
     );

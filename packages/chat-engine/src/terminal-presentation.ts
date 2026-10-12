@@ -1,11 +1,16 @@
-import type { ChatMessage, MessageStatus, TerminalFacts, TurnEvidenceRef } from './types.js';
-import { humanHarnessText } from './types.js';
+import type {
+  ChatMessage, MessageStatus, RetainedOutsideChange, TerminalFacts, TerminalNotice, TerminalNoticeCode,
+  TerminalRetained, TerminalReview, TurnEvidenceRef,
+} from './types.js';
+import { humanHarnessText, noticeReplacesReply } from './types.js';
 
 /** Every user-visible terminal string in this module must name a NEXT EDGE —
  *  something the reader can say or do — because a stop that only reports its own
  *  failure makes the owner nudge the assistant to get anywhere. "Try again" is
  *  not an edge: it hands the work back without saying what changes on a retry.
- *  `terminal-next-edge.test.ts` locks this for every export here. */
+ *  `terminal-next-edge.test.ts` locks this for every export here. A typed
+ *  terminal with no words gets none of these: its status line carries the
+ *  edge (terminal-status.ts). */
 export const GENERIC_TURN_ERROR = 'That turn stopped before I had an answer for you. Say “continue” and I’ll pick it back up.';
 export const EMPTY_COMPLETION_ERROR = 'I worked through the steps but didn’t come out with an answer worth giving you. Say “continue” and I’ll take another run at it.';
 
@@ -76,7 +81,69 @@ export function terminalFactsFrom(data: Record<string, unknown>): TerminalFacts 
   if (typeof outcome.resumable === 'boolean') facts.resumable = outcome.resumable;
   const evidenceRefs = evidenceRefsFrom(outcome.evidenceRefs);
   if (evidenceRefs.length > 0) facts.evidenceRefs = evidenceRefs;
+  const review = typeof data.review === 'string' && REVIEWS.has(data.review) ? data.review as TerminalReview : undefined;
+  if (review) {
+    facts.review = review;
+    // A finding with no ruling has no chip to sit under, so it is dropped.
+    const reviewNote = boundedText(data.reviewNote, REVIEW_NOTE_MAX);
+    if (reviewNote) facts.reviewNote = reviewNote;
+  }
+  const retained = retainedFrom(data.retained);
+  if (retained) facts.retained = retained;
+  const notice = noticeFrom(data.notice);
+  if (notice) facts.notice = notice;
   return facts;
+}
+
+const REVIEWS: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected', 'needs_recheck']);
+const OUTSIDE_CHANGES: ReadonlySet<string> = new Set(['went_through', 'did_not', 'mixed', 'refused', 'uncertain', 'none']);
+const NOTICE_CODES: ReadonlySet<string> = new Set<TerminalNoticeCode>([
+  'stopped', 'response_format_unmet', 'response_format_unqualified', 'provider_quota', 'card_decision',
+  'saved_model_unavailable', 'model_unavailable_on_sign_in', 'no_model_connected', 'codex_sign_in_expired',
+  'provider_out_of_credit', 'model_stalled', 'run_failed',
+]);
+
+/** The most of a reviewer's finding the receipt carries. */
+export const REVIEW_NOTE_MAX = 400;
+const NOTICE_NAME_MAX = 120;
+const PROVIDER_SAID_MAX = 400;
+
+/** One line of display text, bounded; anything else is absent. */
+function boundedText(value: unknown, max: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = value.replace(/\s+/g, ' ').trim();
+  if (!text) return undefined;
+  return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
+}
+
+/** Retained facts are kept only when they say something: a result kept, or
+ *  an outside change with a settled state. A malformed count or state is no
+ *  claim at all, never a guess. */
+function retainedFrom(value: unknown): TerminalRetained | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const results = typeof record.results === 'number' && Number.isSafeInteger(record.results) && record.results > 0
+    ? record.results : 0;
+  const outsideChange = typeof record.outsideChange === 'string' && OUTSIDE_CHANGES.has(record.outsideChange)
+    ? record.outsideChange as RetainedOutsideChange : 'none';
+  if (results === 0 && outsideChange === 'none') return undefined;
+  return { results, outsideChange };
+}
+
+/** A notice with a code this client does not know is ignored. */
+function noticeFrom(value: unknown): TerminalNotice | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.code !== 'string' || !NOTICE_CODES.has(record.code)) return undefined;
+  const agentName = boundedText(record.agentName, NOTICE_NAME_MAX);
+  const model = boundedText(record.model, NOTICE_NAME_MAX);
+  const providerSaid = boundedText(record.providerSaid, PROVIDER_SAID_MAX);
+  return {
+    code: record.code as TerminalNoticeCode,
+    ...(agentName ? { agentName } : {}),
+    ...(model ? { model } : {}),
+    ...(providerSaid ? { providerSaid } : {}),
+  };
 }
 
 const EVIDENCE_KINDS: ReadonlySet<string> = new Set([
@@ -116,11 +183,24 @@ export function terminalCompletionPresentation(
   currentText: string,
   currentStatus?: MessageStatus,
 ): Pick<ChatMessage, 'text' | 'status' | 'progress' | 'terminal'> {
-  // Every branch below decides text/status the same way it always has; the
-  // backend's typed terminal rides along so renderers stop re-deriving it.
+  // The core decides status the same way it always has; the backend's typed
+  // terminal rides along so renderers stop re-deriving it. Its fallback
+  // sentences remain only for legacy events, where no typed status is drawn.
   const terminal = terminalFactsFrom(data);
   const core = terminalCompletionPresentationCore(data, currentText, currentStatus);
-  return terminal ? { ...core, terminal } : core;
+  if (!terminal) return { text: core.text, status: core.status, progress: core.progress };
+  // A notice terminal for a turn no model spoke for is the app's status, not
+  // a reply: its text is app wording kept for channels and history, and the
+  // surfaces draw the notice as a status line instead. A format notice sits
+  // beside Clem's own draft, so her words stay and the line is drawn as well.
+  if (terminal.notice && noticeReplacesReply(terminal.notice.code)) {
+    return { text: '', status: core.status, progress: core.progress, terminal };
+  }
+  // A typed terminal with no words of Clem's is drawn as its status pill, with
+  // any retained facts on it. The app never writes a sentence in her place.
+  // A finished turn has no pill, so its placeholder line stays.
+  if (core.wordless && terminal.status !== 'done') return { text: '', status: core.status, progress: core.progress, terminal };
+  return { text: core.text, status: core.status, progress: core.progress, terminal };
 }
 
 /**
@@ -143,11 +223,15 @@ function hostApprovalFiller(data: Record<string, unknown>): boolean {
       && text.endsWith(`(${id}). Approve or reject each and I'll continue.`));
 }
 
+/** `wordless`: neither the event nor the stream carried words, so any text
+ *  below was written here rather than by Clem. */
+type CorePresentation = Pick<ChatMessage, 'text' | 'status' | 'progress'> & { wordless?: true };
+
 function terminalCompletionPresentationCore(
   data: Record<string, unknown>,
   currentText: string,
   currentStatus?: MessageStatus,
-): Pick<ChatMessage, 'text' | 'status' | 'progress'> {
+): CorePresentation {
   if (hostApprovalFiller(data)) return { text: '', status: 'awaiting-approval', progress: undefined };
   const canonicalStatus = canonicalTerminalStatus(data);
   const reason = typeof data.reason === 'string' ? data.reason : '';
@@ -183,6 +267,7 @@ function terminalCompletionPresentationCore(
       text: 'I need something from you before I can continue, but my question didn’t come through — say “continue” and I’ll ask it again.',
       status: 'awaiting-reply',
       progress: undefined,
+      wordless: true,
     };
   }
   if (reasonKey === 'no_structured_output') {
@@ -190,6 +275,7 @@ function terminalCompletionPresentationCore(
       text: 'That step finished but my reply didn’t come through — say “continue” and I’ll pick it right back up.',
       status: 'failed',
       progress: undefined,
+      wordless: true,
     };
   }
   if (
@@ -201,12 +287,13 @@ function terminalCompletionPresentationCore(
       text: 'I reached this run’s current limit before I had a usable answer. Say “continue” and I’ll keep working.',
       status: 'stopped',
       progress: undefined,
+      wordless: true,
     };
   }
   // Delivered-but-unrenderable (e.g. a placeholder-only reply): the server
   // vouched for the delivery — never contradict it with a failure banner.
   if (canonicalStatus === 'done' || (canonicalStatus === null && judgedDelivered && !stopped)) {
-    return { text: 'Done — the full reply is in the activity above.', status: 'complete', progress: undefined };
+    return { text: 'Done — the full reply is in the activity above.', status: 'complete', progress: undefined, wordless: true };
   }
-  return { text: EMPTY_COMPLETION_ERROR, status: stopped ? 'stopped' : 'failed', progress: undefined };
+  return { text: EMPTY_COMPLETION_ERROR, status: stopped ? 'stopped' : 'failed', progress: undefined, wordless: true };
 }

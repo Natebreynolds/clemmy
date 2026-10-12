@@ -55,3 +55,24 @@ test('the phone shows a confirmed change in another app while the turn is still 
   assert.match(chat, /function TurnReceipt[\s\S]*?<OutsideWork activity=\{message\.activity\} \/>/,
     'the finished receipt keeps the cards in the same place');
 });
+
+test('a notice is the app’s status line with its action, and pills carry what was kept, as on the desktop', () => {
+  const chat = read('../screens/Chat.tsx');
+  // One wording for both surfaces, from chat-engine.
+  assert.match(chat, /const notice = terminalNoticeLine\(t\);/);
+  assert.match(chat, /terminalStatusPill\(t, \{ wordless: !turnText\.showReply \}\)/);
+  assert.match(chat, /retainedOutsideChange\(t\)/);
+  assert.match(chat, /if \(cardDecisionNoticeOnly\(message\)\) return null;/);
+  assert.match(chat, /onAnswer\(NOTICE_ACTION_LABEL\.try_again\)/);
+  assert.match(chat, /onChangeModel=\{\(\) => setConversationPanel\('model'\)\}/);
+  assert.doesNotMatch(chat, /'Stopped here — your work is kept'/, 'the hand-written typed pills are gone');
+  const chats = read('../screens/Chats.tsx');
+  assert.equal(chats.match(/onOpenSettings=\{onOpenSettings\}/g)?.length, 2, 'both chat mounts can open Settings');
+});
+
+test('the phone review chip reads the host’s ruling, and its finding is detail labelled as the review', () => {
+  const chat = read('../screens/Chat.tsx');
+  assert.match(chat, /turnReview\(message\.activity, message\.terminal\)/);
+  assert.match(chat, /needs_recheck: \{ label: 'Needs a fresh check', ok: false \}/);
+  assert.match(chat, /reveal && reviewNote \? <span class="receipt-model receipt-review-note">Review: \{reviewNote\}<\/span>/);
+});

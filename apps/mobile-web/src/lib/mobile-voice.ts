@@ -1,7 +1,7 @@
 import { speakVoice, transcribeVoice } from './api';
 import { StreamingPcmResampler, float32ToPcm16, pcm16Seconds, pcm16ToWav } from './pcm';
 import { microphoneProblem } from './dictation-support';
-import { spokenWords, voiceTurnEnded, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage, type VoiceUtterance } from './voice-turns';
+import { spokenWords, voiceReadableText, voiceTurnEnded, voiceTurnNoticeFacts, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage, type VoiceUtterance } from './voice-turns';
 import { liveSpokenText, type LiveHistoryMessage, type LiveVoiceHandlers, type LiveVoiceLink } from '@clem/chat-engine';
 import { PhoneLiveVoice, phoneLiveVoiceAvailable } from './live-voice';
 
@@ -253,6 +253,9 @@ export class MobileVoiceController {
       this.armLiveIdle();
     }
     if (this.awaitingTurn && !conversation.busy && voiceTurnEnded(conversation.messages, this.turnFrom)) {
+      // A turn that ended on the app's notice has no words of Clem's for the
+      // request; the voice gets the typed fact so it can tell the owner.
+      if (link) for (const fact of voiceTurnNoticeFacts(conversation.messages, this.turnFrom)) link.note(fact, requestId);
       this.awaitingTurn = false;
       this.liveRequestId = null;
       if (this.state.phase === 'thinking') this.update({ phase: 'listening' });
@@ -352,7 +355,7 @@ export class MobileVoiceController {
 function liveHistory(messages: readonly VoiceChatMessage[]): LiveHistoryMessage[] {
   return messages
     .filter(message => !message.checkIn)
-    .map(message => ({ role: message.role, text: message.text?.trim() || message.approval?.preview?.ask?.trim() || '' }))
+    .map(message => ({ role: message.role, text: voiceReadableText(message) }))
     .filter(message => message.text)
     .slice(-24);
 }
