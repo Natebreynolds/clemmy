@@ -5800,7 +5800,7 @@ test('held publication early bridge replay fences exact source before preparatio
 });
 
 
-test('Stop transport and exact replay show plain checkpoint copy while durable receipts keep their handles', async () => {
+test('Stop transport and exact replay show only the authored head while durable receipts keep their handles', async () => {
   const sessionId = 'stop-public-text-live-and-replay';
   const message = 'Run the named Stop transport fixture.';
   const durableText = 'Stopped.\n\nRetained work (durable checkpoint):\n- Source/tool fixture_read: completed result retained as rh_private_stop_transport.\nExternal write state (fixture_write): uncertain. Reconcile it before any retry.';
@@ -5826,8 +5826,9 @@ test('Stop transport and exact replay show plain checkpoint copy while durable r
   });
   const response = await respondViaHarness('home', { sessionId, message });
   assert.equal(response.stoppedReason, 'cancelled');
-  assert.match(response.text, /Stopped.*I kept the result/s);
-  assert.match(response.text, /can't yet confirm.*check before trying again/);
+  // What was kept and the uncertain outside change are terminal data for the
+  // clients' chrome; the bridge text is the authored words alone.
+  assert.equal(response.text, 'Stopped.');
   assert.doesNotMatch(response.text, /rh_|fixture_read|fixture_write|durable checkpoint/);
   const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
   assert.equal(terminals.length, 1);

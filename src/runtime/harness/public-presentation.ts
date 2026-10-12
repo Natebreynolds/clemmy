@@ -35,7 +35,8 @@ import {
   stripLeakedDecisionAssignment,
 } from './presentation-hygiene.js';
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
-import { ownerFacingRetainedWorkCheckpoint, withoutRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
+import { parseRetainedWorkCheckpoint, type RetainedOutsideChange } from './retained-work-checkpoint.js';
+import { normalizeTerminalNotice, type TerminalNotice } from './terminal-notice.js';
 import {
   isSettledReadReplayReturnData,
   settledReadReplayCallId,
@@ -652,11 +653,7 @@ export function publicCompletionText(
       || (typeof data.reply === 'string' && !data.reply.trim());
     if (typedPresentation) return publicPresentationText(typedPresentation);
     const reply = publicReplyText(data.reply, '');
-    const waitingOnPerson = data.awaitingUser === true
-      || data.reason === 'awaiting_user_input'
-      || data.reason === 'awaiting_approval'
-      || data.reason === 'awaiting_continue';
-    return (waitingOnPerson ? withoutRetainedWorkCheckpoint(reply) : ownerFacingRetainedWorkCheckpoint(reply))
+    return parseRetainedWorkCheckpoint(reply).head
       || (missingReply && fallback === SAFE_TERMINAL_FALLBACK
         ? LEGACY_MISSING_REPLY_FALLBACK : fallback);
   } catch {
@@ -669,11 +666,51 @@ export function publicCompletionText(
 
 /** Public transports and transcript readers must apply the same checkpoint
  * projection as SSE. The durable presentation retains redeemable evidence;
- * decoding its typed identity alone does not make that private tail chat copy. */
+ * decoding its typed identity alone does not make that private tail chat copy.
+ * Every status reads the authored words before the checkpoint and nothing
+ * more: what was kept travels as `retained` data on the terminal, never as a
+ * sentence written for Clem. The head may be empty. */
 export function publicPresentationText(presentation: PresentationEvent): string {
-  return presentation.status === 'needs_input'
-    ? withoutRetainedWorkCheckpoint(presentation.text)
-    : ownerFacingRetainedWorkCheckpoint(presentation.text);
+  return parseRetainedWorkCheckpoint(presentation.text).head;
+}
+
+const PUBLIC_REVIEW_STATES: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected', 'needs_recheck']);
+const PUBLIC_REVIEW_NOTE_MAX_CHARS = 400;
+
+/** The committer's review state for the exact published text. Only the
+ * committer writes it (it is not caller metadata); an unknown value stays
+ * private rather than being guessed into a chip. */
+function publicTerminalReview(data: Record<string, unknown>): {
+  review?: 'checked' | 'unchecked' | 'rejected' | 'needs_recheck';
+  reviewNote?: string;
+} {
+  const review = typeof data.review === 'string' && PUBLIC_REVIEW_STATES.has(data.review)
+    ? data.review as 'checked' | 'unchecked' | 'rejected' | 'needs_recheck'
+    : undefined;
+  if (!review) return {};
+  const note = typeof data.reviewNote === 'string'
+    ? data.reviewNote.replace(/\s+/g, ' ').trim().slice(0, PUBLIC_REVIEW_NOTE_MAX_CHARS)
+    : '';
+  return { review, ...(note ? { reviewNote: note } : {}) };
+}
+
+/** What the checkpoint kept, as counts. A needs-input terminal shows the
+ * question alone, so its checkpoint stays private there. */
+function publicTerminalRetained(
+  textWithCheckpoint: string,
+  waitingOnPerson: boolean,
+): { retained?: { results: number; outsideChange: RetainedOutsideChange } } {
+  if (waitingOnPerson) return {};
+  const parsed = parseRetainedWorkCheckpoint(textWithCheckpoint);
+  if (parsed.results <= 0 && parsed.outsideChange === 'none') return {};
+  return { retained: { results: Math.max(0, parsed.results), outsideChange: parsed.outsideChange } };
+}
+
+/** An app status the clients render as chrome instead of a Clem bubble. Only
+ * a known code passes; every string beside it is bounded again here. */
+function publicTerminalNotice(data: Record<string, unknown>): { notice?: TerminalNotice } {
+  const notice = normalizeTerminalNotice(data.hostNotice);
+  return notice ? { notice } : {};
 }
 
 /**
@@ -757,16 +794,19 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
     || reason === 'awaiting_user_input'
     || reason === 'awaiting_approval'
     || reason === 'awaiting_continue';
-  // While Clem waits on the person, they read the question or approval, not
-  // the host's retained-work checkpoint; the durable terminal keeps it for the
-  // model. A failed or blocked terminal still discloses what was kept and
-  // whether anything outside this machine changed — in plain words, never
-  // record handles or tool names (owner 2026-10-06: ids out of replies).
+  // Every terminal reads as its authored words before the host's retained-work
+  // checkpoint; the durable terminal keeps the checkpoint for the model. What
+  // was kept and whether anything outside this machine changed travel as the
+  // `retained` counts below, for clients to show as chrome — never as record
+  // handles, tool names, or a sentence written for Clem.
   const waitingOnPerson = typedPresentation
     ? typedPresentation.status === 'needs_input'
     : legacyNeedsInput;
-  const readable = (value: string) => (waitingOnPerson ? withoutRetainedWorkCheckpoint(value) : ownerFacingRetainedWorkCheckpoint(value));
-  const reply = readable(publicCompletionText(data));
+  const reply = parseRetainedWorkCheckpoint(publicCompletionText(data)).head;
+  const retained = publicTerminalRetained(
+    typedPresentation ? typedPresentation.text : publicReplyText(data.reply, ''),
+    waitingOnPerson,
+  );
   const legacyStatus = legacyNeedsInput
     ? 'needs_input'
     : data.delivered === false
@@ -812,6 +852,9 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
     ]),
     ...(typedPresentation && publicPlanArtifactRef(data.planArtifactRef)
       ? { planArtifactRef: publicPlanArtifactRef(data.planArtifactRef) } : {}),
+    ...publicTerminalReview(data),
+    ...retained,
+    ...publicTerminalNotice(data),
     reply,
     // Compatibility for consumers that historically read summary first.
     summary: reply,

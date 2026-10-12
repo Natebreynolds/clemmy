@@ -99,7 +99,8 @@ test('catalog text/count retains full public election, source binding and exact 
   assert.ok(full.some(t => t.agentName === 'Fixture Agent' && t.projectName === 'Fixture Project'));
   assert.ok(full.some(t => t.files?.length && t.workflows?.length), 'detail keeps the saved artifacts');
   const texts = reconstructHarnessTranscriptText(sessionId).map(t => t.text);
-  assert.ok(texts.some(t => t.startsWith('Stopped.') && t.includes('I kept the result')));
+  assert.ok(texts.includes('Stopped.'), 'a stopped terminal reopens as its authored head alone');
+  assert.doesNotMatch(texts.join('\n'), /I kept|for when we continue|No changes to another app/);
   assert.ok(texts.includes('Recovered fixture answer.'));
   assert.ok(texts.includes('Can I perform the controlled fixture action?'));
   assert.ok(texts.includes('Plan ready for review.'));

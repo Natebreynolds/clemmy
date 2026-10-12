@@ -1020,7 +1020,7 @@ test('renderCrossSessionPrefixesForModel keeps the NEWEST prefix when the total 
 });
 
 
-test('reopening a stopped chat presents the public checkpoint while preserving exact source and raw evidence', async () => {
+test('reopening a stopped chat presents only the authored head while preserving exact source and raw evidence', async () => {
   resetEventLog();
   const { presentationEventForOutcome, turnOutcomeId } = await import('./turn-outcome.js');
   const { listEvents } = await import('./eventlog.js');
@@ -1036,7 +1036,7 @@ test('reopening a stopped chat presents the public checkpoint while preserving e
   const reopened = pullRecentTurnsForSession(openEventLog(), session.id, 10);
   assert.equal(reopened.length, 2);
   assert.equal(reopened[0].text, 'Run the named reopen fixture.');
-  assert.match(reopened[1].text, /Stopped.*I kept the result/s);
+  assert.equal(reopened[1].text, 'Stopped.', 'what was kept is chrome, never a sentence written for Clem');
   assert.doesNotMatch(reopened[1].text, /rh_|fixture_read|durable checkpoint|Nothing.*changed/);
   const terminal = listEvents(session.id, { types: ['conversation_completed'] })[0];
   assert.equal((terminal.data.presentation as { identity: { sourceUserSeq: number } }).identity.sourceUserSeq, source.seq);

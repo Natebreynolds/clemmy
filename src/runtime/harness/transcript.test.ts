@@ -97,7 +97,7 @@ test('a reopened question or approval reads as it did live, without the retained
   assert.equal(finished?.text, 'Built it.', 'unknown private checkpoint notes do not become chat copy');
 });
 
-test('a reopened stopped terminal shows public retained-result copy without changing durable evidence', () => {
+test('a reopened stopped terminal shows only its authored head without changing durable evidence', () => {
   const session = createSession({ kind: 'chat', title: 'reopened stopped result' });
   const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Read the named local fixture.' } });
   const raw = 'Stopped.\n\nRetained work (durable checkpoint):\n- Source/tool fixture_read: completed result retained as rh_private_reopen.\nExternal write state: no settled external-write attempt is recorded.';
@@ -109,7 +109,9 @@ test('a reopened stopped terminal shows public retained-result copy without chan
 
   const turns = reconstructHarnessTranscript(session.id);
   const reply = turns.find(turn => turn.role === 'assistant');
-  assert.equal(reply?.text, 'Stopped.\n\nI kept the result from this turn for when we continue. No changes to another app are confirmed for this turn.');
+  // What was kept is chrome (the terminal's retained counts), never a
+  // sentence written for Clem on reopen.
+  assert.equal(reply?.text, 'Stopped.');
   assert.doesNotMatch(reply?.text ?? '', /rh_private|Source\/tool|durable checkpoint/);
   const durable = listEvents(session.id).find(row => row.seq === event.seq);
   assert.equal((durable?.data.presentation as Record<string, unknown>)?.text, raw);
