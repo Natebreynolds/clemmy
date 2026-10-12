@@ -15,14 +15,3 @@ export const STOP_CONTINUITY_REASONING_GUIDANCE = [
  * host-owned, and authenticated handoffs/reviews receive the full guide. */
 export const STOP_CONTINUITY_RUBRIC_GUIDANCE =
   'STOP / CONTINUE — track logical effects across attempts. Reuse settled success; never replay it. Exact prior-operation outcome evidence settles uncertainty. A recorded provider same-operation/key/account/target idempotency guarantee may allow covered retry with current authority/gates; prior outcome stays unknown. State is not settlement; a key is no guarantee; missing rows or empty targets prove neither non-dispatch nor safety. Repeated Continue rejoins its durable successor. Stop targets exact session/source/attempt/run, never recency.';
-
-/** Fresh accepted action reasoning needs the proof distinctions before making
- * a first proposal or explaining hypothetical recovery. This text creates no
- * receipt, continuation selector or permission; their host bindings still own
- * those decisions. Keep the shared conversation cue and full guide unchanged. */
-export const STOP_CONTINUITY_ACTION_RUBRIC_GUIDANCE = [
-  STOP_CONTINUITY_RUBRIC_GUIDANCE,
-  'Before-dispatch Stop needs positive exact no-dispatch evidence; an absent call, result or receipt is not that proof. No-dispatch proves no prior effect, not current permission: remaining work needs the current accepted source and normal gates.',
-  'Resolve repeated Continue through its durable parent-to-unique-admitted-successor binding, not a matching objective or recent run.',
-  'Reuse a retained read only with exact source/result digest bindings, same-principal current read authority and the requested scope. Unknown coverage remains unknown.',
-].join('\n\n');

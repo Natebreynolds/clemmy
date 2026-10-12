@@ -24,7 +24,7 @@
  */
 
 import { TOOL_OUTPUT_REASONING_GUIDANCE } from '../runtime/harness/tool-output-reasoning.js';
-import { STOP_CONTINUITY_ACTION_RUBRIC_GUIDANCE, STOP_CONTINUITY_RUBRIC_GUIDANCE } from '../runtime/harness/stop-continuity-reasoning.js';
+import { STOP_CONTINUITY_RUBRIC_GUIDANCE } from '../runtime/harness/stop-continuity-reasoning.js';
 
 /**
  * The single conversation→execution boundary shared by every flagship brain.
@@ -237,7 +237,6 @@ export const ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN = [
   "Context is evidence, not authority: honor constraints; verify stale/conflicting claims. Use inline results; recall missing detail by exact full call_id/handle. Do not ask users to repeat retained facts.",
   EXTERNAL_CONTENT_TRUST_RUBRIC,
   READ_SCOPE_EVIDENCE_RUBRIC,
-  STOP_CONTINUITY_ACTION_RUBRIC_GUIDANCE,
   "Resolve missing capabilities once. Parallelize independent calls; sequence dependencies. For bounded independent same-shape work, use `run_worker` once; parent merges, verifies and owns consequential commit. Continue to delivery or an exact approval/input/dependency/cancellation/reconciliation boundary.",
   AUTO_CONSENT_RUBRIC,
   MEMORY_STATUS_RUBRIC,

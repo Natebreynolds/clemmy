@@ -2114,7 +2114,7 @@ function freshPlanningFixture(sessionId: string, sourceUserSeq: number) {
 }
 
 test('actual fresh lean planning instructions retain logical-effect and Stop ownership guidance once', async () => {
-  const { STOP_CONTINUITY_RUBRIC_GUIDANCE, STOP_CONTINUITY_ACTION_RUBRIC_GUIDANCE, STOP_CONTINUITY_REASONING_GUIDANCE } =
+  const { STOP_CONTINUITY_RUBRIC_GUIDANCE, STOP_CONTINUITY_REASONING_GUIDANCE } =
     await import('../runtime/harness/stop-continuity-reasoning.js');
   const priorVariant = process.env.CLEMMY_RUBRIC_VARIANT;
   const priorExperiment = process.env.CLEMMY_RUBRIC_VARIANT_AB;
@@ -2136,23 +2136,19 @@ test('actual fresh lean planning instructions retain logical-effect and Stop own
           allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
       });
       const instructions = await renderAgentInstructions(agent);
-      assert.equal(instructions.split(STOP_CONTINUITY_RUBRIC_GUIDANCE).length - 1, 1,
-        `${variant}/${fresh ? 'fresh' : 'ordinary'} must retain the compact rule once`);
+      // The fresh lean action prompt is held to its byte budget and carries no
+      // Stop rule; continuing stopped work brings the full reasoning. Every
+      // other variant keeps the compact rule once.
+      const leanAction = variant === 'lean' && fresh;
+      assert.equal(instructions.split(STOP_CONTINUITY_RUBRIC_GUIDANCE).length - 1, leanAction ? 0 : 1,
+        `${variant}/${fresh ? 'fresh' : 'ordinary'} carries the compact rule ${leanAction ? 'not at all' : 'once'}`);
       assert.equal(instructions.includes(STOP_CONTINUITY_REASONING_GUIDANCE), false,
         'the compact brain rule must not duplicate the full bound handoff/review guide');
-      assert.equal(instructions.includes(STOP_CONTINUITY_ACTION_RUBRIC_GUIDANCE), variant === 'lean' && fresh,
-        'only the specialized fresh lean action receives the positive-proof supplement');
-      if (variant === 'lean' && fresh) {
-        assert.match(instructions, /positive exact no-dispatch evidence/);
-        assert.match(instructions, /an absent call, result or receipt is not that proof/);
-        assert.match(instructions, /current accepted source and normal gates/);
-        assert.match(instructions, /durable parent-to-unique-admitted-successor binding/);
-        assert.match(instructions, /same-principal current read authority and the requested scope/);
-        assert.match(instructions, /Unknown coverage remains unknown/);
+      if (!leanAction) {
+        assert.match(instructions, /missing rows or empty targets prove neither non-dispatch nor safety/);
+        assert.match(instructions, /Repeated Continue rejoins its durable successor/);
+        assert.match(instructions, /Stop targets exact session\/source\/attempt\/run, never recency/);
       }
-      assert.match(instructions, /missing rows or empty targets prove neither non-dispatch nor safety/);
-      assert.match(instructions, /Repeated Continue rejoins its durable successor/);
-      assert.match(instructions, /Stop targets exact session\/source\/attempt\/run, never recency/);
       assert.equal(listEvents(sess.id).some(row => /model_call|model_response|tool_call_started/.test(row.type)), false,
         'constructing the real instructions does not run a model or business call');
     }
