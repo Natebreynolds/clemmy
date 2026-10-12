@@ -869,11 +869,21 @@ test('host same-call packet is observed from the original response and preserves
   const instructions=String(requests[0]!.systemInstructions);assert.match(instructions,/HOST COMPLETION RESPONSE PROTOCOL/);
   for(const text of [OBJECTIVE,REPLY,'earlier list remains bounded'])assert.ok(promptOf(requests[0]!).includes(text));
 });
-test('missing or malformed host packet and missing control are answered without restatement, fallback, coverage or late Jev', async () => {
-  for(const reply of ['DONE: confirmed.\nNEEDS ALL OF: call_write','REVIEW_ASSESSMENT: {bad}\nDONE: confirmed.','No verdict was emitted.',
-    assessmentAnswer('REVISE_REPLY: remove only fence.',{coverage:'uncertain'}),
-    assessmentAnswer('DONE: confirmed.',{decisions:[{...supportedAssessmentRow,status:'contradicted'}]}),
+test('a missing or garbled assessment from the bound review call leaves the reviewer\'s own verdict standing', async () => {
+  for(const reply of ['DONE: confirmed.\nNEEDS ALL OF: call_write','REVIEW_ASSESSMENT: {bad}\nDONE: confirmed.\nNEEDS ALL OF: call_write',
     assessmentAnswer('DONE: confirmed.',{coverage:{toString:null}})]) {
+    requests.length=0; script=[reply];
+    const verdict=await assessedReview({reviewStakes:'plan'});
+    assert.equal(requests.length,1,'no restatement or fallback call');
+    assert.equal(verdict.reviewDisposition,undefined,JSON.stringify(reply));
+    assert.equal(verdict.done,true);assert.ok(!verdict.failedOpen,'the reviewer answered; its verdict stands');
+    assert.equal(verdict.verdictRestatedFrom,undefined);
+  }
+});
+test('no verdict, or an assessment that is uncertain or contradicts the verdict, stays unqualified', async () => {
+  for(const reply of ['No verdict was emitted.',
+    assessmentAnswer('REVISE_REPLY: remove only fence.',{coverage:'uncertain'}),
+    assessmentAnswer('DONE: confirmed.',{decisions:[{...supportedAssessmentRow,status:'contradicted'}]})]) {
     requests.length=0; script=[reply];
     const before=getJudgeMetricsSnapshot().total;
     const verdict=await assessedReview({reviewStakes:'plan'});
@@ -955,26 +965,27 @@ test('caller cancellation during an actual review preserves cancellation and nev
     runAttemptId:assessmentOwner.attemptId,callerCancelSignal:controller.signal,counter:new ToolCallsCounter(2)},()=>assessedReview()));
   assert.equal(requests.length,1);assert.equal(script.length,0);
 });
-test('missing assessment halts actual host work, stamps fulfills false and keeps the draft and effect authority intact', async () => {
+test('a missing assessment from the bound review call leaves the reviewer\'s verdict standing for host work', async () => {
   const f=await inheritedAskFixture({objective:JSON_CONTINUATION_OBJECTIVE});
   script=['DONE: confirmed.\nNEEDS ALL OF: none'];
   const result=await f.run([JSON_CONTINUATION_ANSWER]);assert.equal(f.modelCalls(),1);assert.equal(requests.length,1);
   assert.equal(result.finalOutput,JSON_CONTINUATION_ANSWER);
-  const row=f.reviews()[0]!.data;assert.equal(row.fulfills,false);assert.equal(row.failedOpen,true);
-  assert.equal(row.reviewDisposition,'answered_unqualified');assert.equal(row.continuation,false);
-  const stored=f.host.completionVerdictForAcceptedSource(f.consumer);assert.equal(stored?.fulfills,false);
-  assert.equal(stored?.reviewAssessment?.reason,'missing');assert.equal(stored?.reviewDisposition,'answered_unqualified');
+  const row=f.reviews()[0]!.data;assert.ok(!row.failedOpen);assert.equal(row.reviewDisposition,undefined);
+  const stored=f.host.completionVerdictForAcceptedSource(f.consumer);
+  assert.equal(stored?.reviewAssessment?.reason,'missing','the missing assessment stays visible in the diagnostic');
+  assert.equal(stored?.reviewDisposition,undefined);
   f.assertNoChildEffects();
 });
-test('a pre-existing coverage follow-up cannot invent the missing same-call packet from the prior review', async () => {
+test('a coverage follow-up that leaves out its assessment stands on its own verdict, never on the prior review\'s packet', async () => {
   script=[assessmentAnswer('DONE: list absent.').replace('NEEDS ALL OF: call_write','NEEDS ALL OF: call_list'),
     'DONE: list absent.\nNEEDS ALL OF: call_list'];
   const verdict=await assessedReview();assert.equal(requests.length,2,'only the existing coverage call runs');
-  assert.equal(verdict.reviewDisposition,'answered_unqualified');assert.equal(verdict.reviewAssessment?.reason,'missing');
+  assert.equal(verdict.reviewDisposition,undefined);assert.equal(verdict.reviewAssessment?.reason,'missing',
+    'the follow-up\'s own missing assessment, not the first review\'s packet');
   assert.equal(verdict.verdictRestatedFrom,undefined);
   assert.equal(verdict.reviewInputObservation?.reviewStage,'coverage_followup');
   assert.equal(verdict.reviewInputObservation?.modelCallId,verdict.reviewAssessment?.originalModelCallId,
-    'the unqualified follow-up is bound to its own input and original, not the first completion request');
+    'the follow-up is bound to its own input and original, not the first completion request');
 });
 
 test('ownership amended in both seed and ambient scope during the provider response cannot rebind the old accepted source', async () => {

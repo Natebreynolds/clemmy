@@ -241,6 +241,10 @@ export function completionJudgeComparisonForRoute(value: unknown): CompletionJud
   } catch { return { ...UNAVAILABLE_JUDGE_COMPARISON }; }
 }
 
+/** Assessment outcomes that mean the reviewer left it out, not that it
+ * judged the answer unverifiable. */
+const ASSESSMENT_ABSENT: ReadonlySet<string> = new Set(['missing', 'malformed']);
+
 export interface ObjectiveJudgeVerdict {
   /** Semantic obligation only; the host separately verifies correction effects. */
   memoryRequirement?: MemoryRequirementAssessmentV1;
@@ -1838,11 +1842,22 @@ async function runCompletionJudge(
     // An explicit negative or honest user pause makes no positive claim to
     // qualify. Do not invent a rejection from a malformed assessment.
     const negative = verdict && (verdict.awaitingUser || verdict.blocked || (!verdict.done && verdict.repairScope !== 'reply_format'));
-    if (!verdict || !original || (!negative && diagnostic.status !== 'qualified')) return { done: true,
+    if (verdict && original && (negative || diagnostic.status === 'qualified')) {
+      return { ...verdict, reviewAssessment: diagnostic, ...(checksCoverage ? { needsAllOf: parseNeedsAllOf(output) } : {}),
+        ...(skillContext?.memoryRequirementContext ? { memoryRequirement: parseMemoryRequirementPacket(output) ?? undefined } : {}) };
+    }
+    // The assessment informs the verdict; it does not replace it. When this
+    // exact review call answered (its original response is bound) with a
+    // readable verdict line and simply left the assessment out or garbled it,
+    // the reviewer stands on its own verdict, as review did before the
+    // assessment existed. An unbound, copied or foreign answer can neither
+    // authorize work nor invent a blocker, and an assessment that is partial,
+    // uncertain, unverified or contradicts the verdict stays unqualified.
+    const plain = original && ASSESSMENT_ABSENT.has(assessed.diagnostic.reason) ? parse(output) : null;
+    if (plain) return { ...plain, reviewAssessment: diagnostic };
+    return { done: true,
       reason: 'The reviewer answered, but its assessment could not verify all of this answer.',
       reviewDisposition: 'answered_unqualified', reviewAssessment: diagnostic };
-    return { ...verdict, reviewAssessment: diagnostic, ...(checksCoverage ? { needsAllOf: parseNeedsAllOf(output) } : {}),
-      ...(skillContext?.memoryRequirementContext ? { memoryRequirement: parseMemoryRequirementPacket(output) ?? undefined } : {}) };
   } } : undefined;
   const parse = (output: unknown): Parsed | null => {
     const verdict = parseCompletionVerdict(output);
