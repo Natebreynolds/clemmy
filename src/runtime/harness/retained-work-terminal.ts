@@ -62,16 +62,10 @@ function externalWriteState(rows: readonly SettlementInventoryRow[]): {
   if (writes.length === 0) return { state: 'not_recorded', tools: [] };
   const tools = [...new Set(writes.map((row) => boundedIdentity(row.tool_name, 96)).filter(Boolean))]
     .slice(0, 4);
-  const answeredRefusal = (row: SettlementInventoryRow) => row.outcome_kind === 'uncertain_write'
-    && row.outcome_detail === 'provider_refused_envelope';
-  if (writes.some((row) => (row.requires_reconciliation === 1 || row.outcome_kind === 'uncertain_write') && !answeredRefusal(row))) {
+  // A failure reply does not settle whether a crossed mutation took effect.
+  // Preserve the ledger's uncertainty, even beside a separately settled success.
+  if (writes.some((row) => row.requires_reconciliation === 1 || row.outcome_kind === 'uncertain_write')) {
     return { state: 'uncertain', tools };
-  }
-  // Every unsettled write was refused by the app in its own reply, and none
-  // landed: say so, rather than "uncertain, reconcile before any retry".
-  if (writes.some(answeredRefusal)
-    && !writes.some((row) => row.outcome_kind === 'succeeded' || row.outcome_kind === 'empty_result')) {
-    return { state: 'refused', tools };
   }
   const knownSuccess = writes.some((row) => (
     row.outcome_kind === 'succeeded' || row.outcome_kind === 'empty_result'

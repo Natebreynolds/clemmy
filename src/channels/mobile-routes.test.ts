@@ -1373,6 +1373,60 @@ test('live mobile exact approvals preserve the executor through approve, reject,
   } finally { unsubscribePublic(); await h.close(); }
 });
 
+test('mobile terminal steering refusal cannot become a competing ordinary turn', async () => {
+  resetEventLog();
+  const steering = await import('../runtime/harness/steer-notes.js');
+  const authority = await import('../runtime/harness/accepted-turn-call-authority.js');
+  const leases = await import('../runtime/harness/dispatch-lease.js');
+  const { getLatestRunAttempt } = await import('../runtime/harness/eventlog.js');
+  let modelCalls = 0;
+  const h = await startHarness({ assistant: { respond: async () => {
+    modelCalls++;
+    throw new Error('a refused steer cannot dispatch');
+  } } as Parameters<typeof createMobileRouter>[0]['assistant'] });
+  try {
+    const cookie = await loginMobile(h, 'Terminal steering phone');
+    const me = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    const { deviceId } = await me.json() as { deviceId: string };
+    const session = createHarnessSession({ id: 'sess-mobile-terminal-steering', kind: 'chat', channel: 'mobile', userId: deviceId,
+      metadata: { source: 'mobile', ingressProvider: 'mobile', channelId: 'mobile-terminal-steering', userId: deviceId } });
+    const attempt = claimRunAttemptLease({ sessionId: session.id, runId: 'mobile:terminal-steering',
+      ownerId: 'mobile-terminal-test', leaseMs: 60_000 }).attempt!;
+    const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Finish the controlled answer.' } });
+    const digest = (text: string) => createHash('sha256').update(text).digest('hex');
+    assert.equal(authority.armHostReadOnlyCallAuthority({ sessionId: session.id, sourceUserSeq: source.seq,
+      surfaceVersion: 'configured_harness_tools_v1', catalogRevisionDigest: digest('mobile-terminal-catalog'),
+      bindingRevisionDigest: digest('mobile-terminal-bindings'), maxLogicalCalls: 8, maxParallelCalls: 4 }).status, 'armed');
+    const lease = leases.activateDispatchLease({ sessionId: session.id, scopeId: 'mobile-terminal-test', runAttemptId: attempt.attemptId });
+    const send = (key: string, extra: Record<string, unknown> = {}, auth = cookie) => fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST', headers: { cookie: auth, 'content-type': 'application/json', 'idempotency-key': key },
+      body: JSON.stringify({ message: 'Add this detail.', sessionId: session.id, async: true, ...extra }),
+    });
+    const accepted = await send('terminal-steering-before');
+    assert.equal(accepted.status, 200);
+    assert.equal((await accepted.json() as { steered: boolean }).steered, true);
+    assert.equal(getLatestRunAttempt(session.id)?.attemptId, attempt.attemptId);
+    assert.equal(steering.takeUndeliveredSteerNotes(session.id, source.seq).length, 1);
+    assert.equal(steering.closeTerminalSteering({ sessionId: session.id, sourceUserSeq: source.seq,
+      attemptId: attempt.attemptId, lease }, digest('mobile-current-objective'), digest('mobile-current-answer')).status, 'closed');
+    const before = listEvents(session.id);
+    assert.equal((await send('terminal-steering-no-auth', {}, '')).status, 401);
+    for (const [key, extra] of [['terminal-steering-ordinary', {}], ['terminal-steering-only', { steerOnly: true }]] as const) {
+      const refused = await send(key, extra);
+      assert.equal(refused.status, 409);
+      const body = await refused.json() as { error: string; steered?: boolean };
+      assert.equal(body.error, 'STEER_NOTE_CUTOVER');
+      assert.notEqual(body.steered, true);
+    }
+    assert.deepEqual(listEvents(session.id), before, 'refusal admits neither a note nor an ordinary accepted source');
+    assert.equal(getLatestRunAttempt(session.id)?.attemptId, attempt.attemptId);
+    assert.equal(getLatestRunAttempt(session.id)?.finishedAt, null);
+    assert.equal(modelCalls, 0);
+  } finally {
+    await h.close();
+  }
+});
+
 test('a failed live mobile approval acknowledgement rolls back its receipt, source and decision without waking the executor', async () => {
   resetEventLog();
   let unsubscribeEvents = () => {};

@@ -22,6 +22,7 @@ import { createMobileChatAdmission, prepareAndDispatchMobileChat } from './mobil
 import { registerMobileMemoryWorkRoutes } from './mobile-memory-work-routes.js';
 import { registerMobileNativeVoiceAuth } from './mobile-native-voice-auth.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
+import { isSteerNoteAdmissionError } from '../runtime/harness/steer-notes.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { BrainSelectionError, CODEX_BRAIN_SLOTS, codexBrainSlotUpdates, brainSelectionReceipt, type CodexBrainSlot } from '../runtime/harness/brain-selection.js';
 import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
@@ -4607,9 +4608,11 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
               res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' });
               return;
             }
+            const expectedAttemptId = latestAttempt!.attemptId;
             const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
             const note = appendSteerNote(proposedSessionId, message, {
               clientRequestId: requestId,
+              expectedAttemptId,
               ...(voice ? { voice: true } : {}),
             });
             res.json({
@@ -4628,6 +4631,13 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             return;
           }
         } catch (steerErr) {
+          if (isSteerNoteAdmissionError(steerErr)) {
+            res.status(409).json({
+              error: steerErr.code,
+              message: 'Your message wasn’t added to the running turn. Send it again as a new message.',
+            });
+            return;
+          }
           if (req.body?.requireIdle === true) {
             res.status(503).json({ error: 'VOICE_IDLE_CHECK_UNAVAILABLE' }); return;
           }

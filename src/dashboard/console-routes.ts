@@ -379,6 +379,7 @@ import {
   deriveTaskTitle,
 } from '../execution/background-tasks.js';
 import { classifyBackgroundInputReply } from '../execution/background-input-reply.js';
+import { isSteerNoteAdmissionError } from '../runtime/harness/steer-notes.js';
 import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
@@ -17556,6 +17557,7 @@ export function registerConsoleRoutes(
           const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
           const note = appendSteerNote(sessionId, input, {
             clientRequestId: requestIdentity.requestId,
+            expectedAttemptId: latestAttempt?.attemptId,
           });
           res.json({
             ok: true,
@@ -17579,6 +17581,10 @@ export function registerConsoleRoutes(
           return;
         }
       } catch (steerErr) {
+        if (isSteerNoteAdmissionError(steerErr)) {
+          res.status(409).json({ error: steerErr.message, code: steerErr.code, sessionId });
+          return;
+        }
         if ((body as Record<string, unknown>).steerOnly === true) {
           res.status(409).json({ error: 'steering unavailable — send again as a normal message', code: 'RUN_NOT_ACTIVE', sessionId });
           return;

@@ -102,6 +102,7 @@ const ORDINARY_PROMPT = [
   'The provider is cursor-paginated. Keep exact settled source handles, bound concurrent partition windows to two, retry each failed window at most once, resume after process restart, and deduplicate each scheduled occurrence.',
   'Create only a reviewable automation opportunity for me now; do not invoke the provider, create a workflow, create a Space, or schedule anything.',
 ].join(' ');
+const ORDINARY_CANDIDATE = 'I saved one inert large-partition automation opportunity for review; nothing was run or scheduled.';
 
 const OPPORTUNITY = opportunities.parseAutomationOpportunity({
   version: 1,
@@ -254,6 +255,25 @@ function delivery() {
   } };
 }
 
+function partitionFixtureChildEnvironment(lineage: {
+  ROW10_RUN_ID: string;
+  ROW10_ACTIVATION_ID: string;
+  ROW10_WORKFLOW_ID: string;
+  ROW10_FIRST_FIRE_AT: string;
+  ROW10_PROPOSAL_ID: string;
+}): NodeJS.ProcessEnv {
+  const childEnvironment: NodeJS.ProcessEnv = {
+    ...process.env,
+    CLEMENTINE_HOME: TEST_HOME,
+    CLEMMY_TEST_ISOLATED_HOME: '1',
+    ...lineage,
+  };
+  // This is a plain restart fixture, not another child of Node's test protocol.
+  // Keep its isolated home and exact lineage while dropping only that marker.
+  delete childEnvironment.NODE_TEST_CONTEXT;
+  return childEnvironment;
+}
+
 function authoringCandidate(prompt: string) {
   const projected = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2)) as {
     request: {
@@ -374,10 +394,88 @@ test.after(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
+test('partition recording lanes distinguish whole ordinary context and preserve strict workflow context', async t => {
+  const recording = support.installRecordingPartitionReview({ objective: ORDINARY_PROMPT, candidate: ORDINARY_CANDIDATE });
+  t.after(recording.restore);
+  const evidenceTools = [{ type: 'function', function: { name: 'open_evidence' } }];
+  const ordinaryFrame = `Objective: ${ORDINARY_PROMPT}\n\nAssistant's most recent response:\n${ORDINARY_CANDIDATE}\n=== END OF CANDIDATE RESPONSE ===`;
+  const ordinaryMessages = [{ role: 'user', content: ordinaryFrame }];
+  const workflowMessages = [{ role: 'system', content: 'Complete the full workflow objective, including its constraints' },
+    { role: 'user', content: 'workflow_execution' }];
+  const send = (messages: unknown, tools: unknown = evidenceTools) => globalThis.fetch(
+    'https://partition-review.invalid/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify({ model: 'partition-review-fixture', messages, tools }),
+    });
+  const ordinaryResponse = await (await send(ordinaryMessages)).json() as { id: string };
+  assert.equal(ordinaryResponse.id, 'partition-ordinary-recording-review');
+  assert.equal(recording.ordinaryRequests.length, 1);
+  assert.equal(recording.requests.length, 0);
+  const workflowResponse = await (await send(workflowMessages)).json() as { id: string };
+  assert.equal(workflowResponse.id, 'partition-recording-review');
+  assert.equal(recording.requests.length, 1);
+  for (const [messages, tools] of [
+    [[{ role: 'user', content: ordinaryFrame.replace(ORDINARY_PROMPT, ORDINARY_PROMPT.slice(1)) }], evidenceTools],
+    [[{ role: 'user', content: ordinaryFrame.replace(ORDINARY_CANDIDATE, `${ORDINARY_CANDIDATE} changed`) }], evidenceTools],
+    [[{ role: 'user', content: `Objective: ${ORDINARY_PROMPT}` }], evidenceTools],
+    [ordinaryMessages, []],
+    [[{ role: 'user', content: 'workflow_execution' }], evidenceTools],
+    [[workflowMessages[0]], evidenceTools],
+    [workflowMessages, []],
+    [[...ordinaryMessages, workflowMessages[0]], evidenceTools],
+  ] as const) {
+    await assert.rejects(send(messages, tools), { code: 'ERR_ASSERTION' });
+  }
+  assert.equal(recording.ordinaryRequests.length, 1, 'malformed context never receives a positive ordinary verdict');
+  assert.equal(recording.requests.length, 1, 'missing workflow context never receives a positive workflow verdict');
+});
+
+test('partition recording lanes keep the restart recorder workflow-only by default', async t => {
+  const recording = support.installRecordingPartitionReview();
+  t.after(recording.restore);
+  const request = (messages: unknown) => globalThis.fetch('https://partition-review.invalid/v1/chat/completions', {
+    method: 'POST', body: JSON.stringify({ model: 'partition-review-fixture', messages,
+      tools: [{ type: 'function', function: { name: 'open_evidence' } }] }),
+  });
+  await assert.rejects(request([{ role: 'user', content: `${ORDINARY_PROMPT} ${ORDINARY_CANDIDATE}` }]), { code: 'ERR_ASSERTION' });
+  assert.equal(recording.ordinaryRequests.length, 0);
+  assert.equal(recording.requests.length, 0);
+  await request([{ role: 'user', content: 'Complete the full workflow objective, including its constraints: workflow_execution' }]);
+  assert.equal(recording.requests.length, 1);
+});
+
+test('partition child environment preserves exact isolated lineage and emits a fresh plain-process result', () => {
+  const lineage = { ROW10_RUN_ID: 'probe-run', ROW10_ACTIVATION_ID: 'probe-activation', ROW10_WORKFLOW_ID: 'probe-workflow',
+    ROW10_FIRST_FIRE_AT: '2026-08-27T12:00:00.000Z', ROW10_PROPOSAL_ID: 'probe-proposal' };
+  const childEnvironment = partitionFixtureChildEnvironment(lineage);
+  const expected = { CLEMENTINE_HOME: TEST_HOME, CLEMMY_TEST_ISOLATED_HOME: '1', ...lineage };
+  const script = `const keys = ${JSON.stringify(Object.keys(expected))};
+    process.stdout.write('PARTITION_CHILD_ENV ' + JSON.stringify(Object.fromEntries(keys.map(key => [key, process.env[key]]))) + '\\n');`;
+  const sanitized = spawnSync(process.execPath, ['-e', script], {
+    env: childEnvironment, cwd: process.cwd(), encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
+  });
+  assert.equal(sanitized.signal, null);
+  assert.equal(sanitized.status, 0, sanitized.stderr);
+  assert.equal(childEnvironment.NODE_TEST_CONTEXT, undefined);
+  const line = sanitized.stdout.split('\n').find(value => value.startsWith('PARTITION_CHILD_ENV '));
+  assert.ok(line, 'exit zero alone is not fresh-process output proof');
+  assert.deepEqual(JSON.parse(line.slice('PARTITION_CHILD_ENV '.length)), expected);
+  const unsanitized = spawnSync(process.execPath, ['-e', script], {
+    env: { ...childEnvironment, ...(process.env.NODE_TEST_CONTEXT === undefined ? {} : { NODE_TEST_CONTEXT: process.env.NODE_TEST_CONTEXT }) },
+    cwd: process.cwd(), encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
+  });
+  console.log('PARTITION_CHILD_CONTEXT_PROBE', JSON.stringify({ nodeVersion: process.versions.node,
+    inheritedMarkerPresent: process.env.NODE_TEST_CONTEXT !== undefined,
+    sanitizedExactResult: true, unsanitizedStatus: unsanitized.status, unsanitizedSignal: unsanitized.signal,
+    unsanitizedResultObserved: unsanitized.stdout.split('\n').some(value => value.startsWith('PARTITION_CHILD_ENV ')) }));
+});
+
 test('10,001 naturally reviewed partitions survive fresh-process restart, backpressure, retry, and occurrence dedupe', {
   timeout: 900_000,
 }, async (t) => {
-  const { requests: reviewRequests, restore } = support.installRecordingPartitionReview();
+  const { requests: reviewRequests, ordinaryRequests, restore } = support.installRecordingPartitionReview({
+    objective: ORDINARY_PROMPT,
+    candidate: ORDINARY_CANDIDATE,
+  });
   // Restore the pre-fixture transport even when a later assertion fails.
   t.after(restore);
   assert.ok(support.PARTITION_RECORD_COUNT > topology.WORK_TOPOLOGY_MAX_UNIVERSE_MEMBERS);
@@ -425,7 +523,7 @@ test('10,001 naturally reviewed partitions survive fresh-process restart, backpr
       assert.match(serialized, /user_review/);
       return {
         usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
-        output: [finalMessage('I saved one inert large-partition automation opportunity for review; nothing was run or scheduled.')],
+        output: [finalMessage(ORDINARY_CANDIDATE)],
         responseId: 'partition-opportunity-3',
       };
     },
@@ -452,6 +550,15 @@ test('10,001 naturally reviewed partitions survive fresh-process restart, backpr
   assert.equal(ordinaryStep, 3);
   assert.deepEqual(chatDelivery.errors, []);
   assert.match(chatDelivery.edits.at(-1) ?? '', /saved one inert/i);
+  assert.equal(ordinaryRequests.length, 1, 'the ordinary accepted-source completion receives one recording review');
+  const ordinaryReviews = eventlog.listEvents(OWNER_SESSION_ID, { types: ['goal_alignment_judged'] })
+    .filter((event) => event.data.sourceUserSeq === acceptedSource!.seq);
+  assert.equal(ordinaryReviews.length, 1, 'the exact ordinary source owns one completion verdict');
+  assert.notEqual(ordinaryReviews[0]!.data.failedOpen, true, 'an unavailable ordinary reviewer is not accepted');
+  assert.equal(ordinaryReviews[0]!.data.reviewFailure, undefined);
+  assert.equal(ordinaryReviews[0]!.data.reviewDisposition, undefined);
+  assert.equal(ordinaryReviews[0]!.data.fulfills, true);
+  assert.equal(reviewRequests.length, 0, 'ordinary review is separate from the workflow/pilot count');
   const proposals = opportunityStore.listAutomationOpportunityProposals({ limit: 10 });
   assert.equal(proposals.length, 1);
   assert.equal(proposals[0]?.status, 'proposed');
@@ -612,16 +719,13 @@ test('10,001 naturally reviewed partitions survive fresh-process restart, backpr
   const fixture = path.join(import.meta.dirname, 'automation-partition-ledger.fixture.ts');
   const child = spawnSync(process.execPath, ['--import', 'tsx', fixture], {
     cwd: process.cwd(),
-    env: {
-      ...process.env,
-      CLEMENTINE_HOME: TEST_HOME,
-      CLEMMY_TEST_ISOLATED_HOME: '1',
+    env: partitionFixtureChildEnvironment({
       ROW10_RUN_ID: scheduledRun.id!,
       ROW10_ACTIVATION_ID: recurrence.activation.activationId,
       ROW10_WORKFLOW_ID: pilotSuccess.evidence.workflowId,
       ROW10_FIRST_FIRE_AT: recurrence.preview.firstFireAt,
       ROW10_PROPOSAL_ID: pilotSuccess.evidence.proposalId,
-    },
+    }),
     encoding: 'utf8', timeout: 600_000, maxBuffer: 20 * 1024 * 1024,
   });
   assert.equal(child.signal, null, `${child.stdout}\n${child.stderr}`);

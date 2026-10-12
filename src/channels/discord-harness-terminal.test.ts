@@ -21,6 +21,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 const {
   __test__,
   bindDiscordHarnessSession,
+  handleDiscordHarnessMessage,
   tryHandleHarnessApprovalReply,
   UnboundDurableApprovalReplyError,
 } = await import('./discord-harness.js');
@@ -28,8 +29,12 @@ const {
   appendConversationPreambleOnce,
   appendEvent,
   createSession,
+  claimRunAttemptLease,
+  recordRunAttemptUserInput,
+  getLatestRunAttempt,
   listEvents,
 } = await import('../runtime/harness/eventlog.js');
+
 const contexts = await import('../runtime/harness/source-session-context.js');
 const { projectHarnessEventForPublic } = await import('../runtime/harness/public-presentation.js');
 const { _setLocalProviderForTest } = await import('../memory/embeddings.js');
@@ -1032,4 +1037,42 @@ for (const channel of ['discord', 'slack'] as const) test(`${channel} source adm
     assert.equal(again.seq, accepted.seq);
     assert.equal(contexts.readSourceSessionContext({ sessionId: session.id, sourceUserSeq: again.seq })?.digest, context.digest);
   } finally { __test__.unregisterActiveChannelRunForTest(active); }
+});
+
+test('Discord terminal steering refusal never falls through, including a failed refusal reply', async () => {
+  const steering = await import('../runtime/harness/steer-notes.js');
+  const authority = await import('../runtime/harness/accepted-turn-call-authority.js');
+  const leases = await import('../runtime/harness/dispatch-lease.js');
+  const channelId = 'discord-terminal-steering';
+  const userId = 'discord-terminal-owner';
+  const session = createSession({ id: 'sess-discord-terminal-steering', kind: 'chat', channel: 'discord', userId,
+    metadata: { source: 'discord', channelId, userId } });
+  assert.equal(bindDiscordHarnessSession({ sessionId: session.id, channelId, userId, guildId: null }), true);
+  const attempt = claimRunAttemptLease({ sessionId: session.id, runId: 'discord:terminal-steering',
+    ownerId: 'discord-terminal-test', leaseMs: 60_000 }).attempt!;
+  const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Finish the controlled answer.' } });
+  const digest = (text: string) => createHash('sha256').update(text).digest('hex');
+  assert.equal(authority.armHostReadOnlyCallAuthority({ sessionId: session.id, sourceUserSeq: source.seq,
+    surfaceVersion: 'configured_harness_tools_v1', catalogRevisionDigest: digest('discord-terminal-catalog'),
+    bindingRevisionDigest: digest('discord-terminal-bindings'), maxLogicalCalls: 8, maxParallelCalls: 4 }).status, 'armed');
+  const lease = leases.activateDispatchLease({ sessionId: session.id, scopeId: 'discord-terminal-test', runAttemptId: attempt.attemptId });
+  const replies: string[] = [];
+  const message = { channelId, guildId: null, author: { id: userId }, attachments: { size: 0 },
+    reply: async (text: string) => { replies.push(text); return {}; } } as unknown as Parameters<typeof handleDiscordHarnessMessage>[0];
+  await handleDiscordHarnessMessage(message, 'Add this detail.');
+  assert.equal(replies.length, 1);
+  assert.match(replies[0], /Noted/);
+  assert.equal(getLatestRunAttempt(session.id)?.attemptId, attempt.attemptId);
+  assert.equal(steering.takeUndeliveredSteerNotes(session.id, source.seq).length, 1);
+  assert.equal(steering.closeTerminalSteering({ sessionId: session.id, sourceUserSeq: source.seq,
+    attemptId: attempt.attemptId, lease }, digest('discord-current-objective'), digest('discord-current-answer')).status, 'closed');
+  const before = listEvents(session.id);
+  await handleDiscordHarnessMessage(message, 'Add another detail.');
+  assert.equal(replies.length, 2);
+  assert.match(replies[1], /wasn’t added/);
+  const failedReply = { ...message, reply: async () => { throw new Error('fixture reply unavailable'); } } as unknown as typeof message;
+  await assert.rejects(handleDiscordHarnessMessage(failedReply, 'Add a final detail.'), /fixture reply unavailable/);
+  assert.deepEqual(listEvents(session.id), before, 'refusal admits neither a note nor an ordinary accepted source');
+  assert.equal(getLatestRunAttempt(session.id)?.attemptId, attempt.attemptId);
+  assert.equal(getLatestRunAttempt(session.id)?.finishedAt, null);
 });

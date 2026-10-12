@@ -60,6 +60,7 @@ function admitProviderCall(input: {
   toolName: string;
   args: unknown;
   executionSite?: 'host';
+  physicalOutcome?: 'returned' | 'threw';
 }) {
   const begun = dispatch.beginPhysicalDispatch({
     identity: {
@@ -77,7 +78,7 @@ function admitProviderCall(input: {
   assert.equal(dispatch.settlePhysicalDispatch({
     identity: begun.identity,
     tool: input.toolName,
-    outcome: 'returned',
+    outcome: input.physicalOutcome ?? 'returned',
   }).status, 'inserted');
 }
 
@@ -154,6 +155,34 @@ function settleWrite(
     observer: { lane: 'composio', turn: task.turn },
   });
   assert.equal(settled.status, 'committed', JSON.stringify(settled));
+}
+
+/** The provider failure category is retained without a status or result that
+ * could settle the effect. The physical call really crossed and then threw. */
+function settleRefusalEnvelopeWrite(task: ReturnType<typeof accept>): string {
+  const logicalToolCallId = `logical:statusless-write-${task.sourceUserSeq}`;
+  const toolName = 'GOOGLESHEETS_BATCH_UPDATE';
+  const args = { spreadsheet_id: 'sheet-2', rows: [['Grace']] };
+  admitProviderCall({ task, logicalToolCallId, toolName, args, physicalOutcome: 'threw' });
+  const settled = settlements.commitLogicalCallSettlement({
+    identity: { ...task, logicalToolCallId },
+    contract: { toolName, args },
+    execution: { kind: 'provider_execution' },
+    outcome: outcomes.classifyAttemptOutcome({ mutating: true, providerAnsweredFailure: true }),
+    recovery: { businessCall: true, mutating: true },
+    observer: { lane: 'byo', turn: task.turn },
+  });
+  assert.equal(settled.status, 'committed', JSON.stringify(settled));
+  return logicalToolCallId;
+}
+
+function writeLedgerRow(task: ReturnType<typeof accept>, logicalToolCallId: string) {
+  return eventlog.openEventLog().prepare(`
+    SELECT outcome_kind, outcome_detail, provider_status, requires_reconciliation,
+           retry_same_candidate, recovery_action, physical_crossing_count, result_handle_id
+      FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, logicalToolCallId);
 }
 
 function blockedOutcome(task: ReturnType<typeof accept>, text: string): TurnOutcome {
@@ -382,6 +411,72 @@ test('mixed successful and failed writes never describe the whole write set as r
   assert.match(mixed, /External write state .*mixed known results/i);
   assert.match(mixed, /Do not repeat successful writes/i);
   assert.doesNotMatch(mixed, /the retained work can be reused/i);
+});
+
+test('a crossed refusal-envelope write keeps its exact ledger uncertainty and public uncertainty', async () => {
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const task = accept('Read the source and make one controlled change.');
+  const readHandle = settleRead(task, 3);
+  const callId = settleRefusalEnvelopeWrite(task);
+  const before = writeLedgerRow(task, callId);
+  assert.deepEqual(before, {
+    outcome_kind: 'uncertain_write', outcome_detail: 'provider_refused_envelope',
+    provider_status: null, requires_reconciliation: 1, retry_same_candidate: 0,
+    recovery_action: 'reconcile_then_decide', physical_crossing_count: 1, result_handle_id: null,
+  });
+  const inventory = retained.retainedWorkInventoryForAcceptedSource(task)!;
+  assert.equal(inventory.downstreamWriteState, 'uncertain');
+  assert.equal(inventory.items[0]!.resultHandleId, readHandle);
+  const committed = delivery.commitTurnOutcome(blockedOutcome(task, hostRunner.HOST_TOOL_UNCERTAIN_BLOCKED_TEXT));
+  assert.match(committed.presentation.text, /External write state .*uncertain\. Reconcile it before any retry/);
+  assert.doesNotMatch(committed.presentation.text, /refused by the app|turned the change down|did not go through/i);
+  const data = projectHarnessEventForPublic(committed.event)!.data as Record<string, unknown>;
+  assert.deepEqual(data.retained, { results: 1, outsideChange: 'uncertain' });
+  assert.equal((data.turnOutcome as Record<string, unknown>).status, 'blocked');
+  assert.equal(data.delivered, false);
+  assert.deepEqual(writeLedgerRow(task, callId), before, 'presentation does not rewrite settlement or replay authority');
+});
+
+test('a settled success beside a refusal-envelope write stays uncertain rather than mixed known failures', async () => {
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const task = accept();
+  const readHandle = settleRead(task, 3);
+  settleWrite(task, 'succeeded');
+  const callId = settleRefusalEnvelopeWrite(task);
+  const before = writeLedgerRow(task, callId);
+  const inventory = retained.retainedWorkInventoryForAcceptedSource(task)!;
+  assert.equal(inventory.downstreamWriteState, 'uncertain');
+  assert.equal(inventory.items.length, 2, 'both independently settled success results remain redeemable');
+  assert.ok(inventory.items.some(item => item.resultHandleId === readHandle));
+  const committed = delivery.commitTurnOutcome(blockedOutcome(task, hostRunner.HOST_TOOL_UNCERTAIN_BLOCKED_TEXT));
+  assert.match(committed.presentation.text, /External write state .*uncertain\. Reconcile it before any retry/);
+  assert.doesNotMatch(committed.presentation.text, /mixed known results|refused by the app|failed with a known terminal result/i);
+  const data = projectHarnessEventForPublic(committed.event)!.data as Record<string, unknown>;
+  assert.deepEqual(data.retained, { results: 2, outsideChange: 'uncertain' });
+  assert.equal(data.delivered, false);
+  assert.deepEqual(writeLedgerRow(task, callId), before);
+});
+
+test('a real zero-crossing refusal does not become an uncertain external change', () => {
+  const task = accept();
+  settleRead(task, 3);
+  const logicalToolCallId = `logical:refused-before-dispatch-${task.sourceUserSeq}`;
+  const toolName = 'GOOGLESHEETS_BATCH_UPDATE';
+  const args = { spreadsheet_id: 'sheet-3', rows: [['Katherine']] };
+  assert.equal(dispatch.admitLogicalCall({ identity: { ...task, logicalToolCallId }, tool: toolName, args }).status, 'inserted');
+  const settled = settlements.commitLogicalCallSettlement({
+    identity: { ...task, logicalToolCallId }, contract: { toolName, args },
+    execution: { kind: 'refused_pre_dispatch' },
+    outcome: outcomes.classifyAttemptOutcome({ mutating: true, preDispatch: true, policyRefused: true }),
+    recovery: { businessCall: true, mutating: true }, observer: { lane: 'byo', turn: task.turn },
+  });
+  assert.equal(settled.status, 'committed', JSON.stringify(settled));
+  assert.deepEqual(writeLedgerRow(task, logicalToolCallId), {
+    outcome_kind: 'policy_denial', outcome_detail: 'policy', provider_status: null,
+    requires_reconciliation: 0, retry_same_candidate: 0, recovery_action: 'stop_and_explain',
+    physical_crossing_count: 0, result_handle_id: null,
+  });
+  assert.equal(retained.retainedWorkInventoryForAcceptedSource(task)!.downstreamWriteState, 'not_recorded');
 });
 
 test('a needs-input terminal discloses exact retained work before asking for clarification', () => {

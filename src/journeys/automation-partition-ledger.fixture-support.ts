@@ -148,23 +148,46 @@ export function installGeneratedPartitionCarrier(): GeneratedPartitionCarrier {
 
 /** Recording provider transport used in both processes; the real review runner
  * and verdict parser remain in charge of workflow completion. */
-export function installRecordingPartitionReview() {
+export function installRecordingPartitionReview(ordinary?: { objective: string; candidate: string }) {
   const previous = globalThis.fetch;
   const requests: unknown[] = [];
+  const ordinaryRequests: unknown[] = [];
   globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
     const request = new Request(input, init);
     assert.equal(request.url, 'https://partition-review.invalid/v1/chat/completions');
     const body = await request.json() as Record<string, unknown>;
     assert.equal(body.model, 'partition-review-fixture');
-    assert.match(JSON.stringify(body.messages), /Complete the full workflow objective, including its constraints/);
-    assert.match(JSON.stringify(body.messages), /workflow_execution/);
-    assert.match(JSON.stringify(body.tools), /open_evidence/);
-    requests.push(body);
-    return new Response(JSON.stringify({ id: 'partition-recording-review', object: 'chat.completion', created: 1,
+    const messages = JSON.stringify(body.messages);
+    const ordinaryFrame = ordinary === undefined ? undefined
+      : `Objective: ${ordinary.objective}\n\nAssistant's most recent response:\n${ordinary.candidate}\n=== END OF CANDIDATE RESPONSE ===`;
+    // Bind the whole candidate boundary produced by the real completion judge;
+    // a shorter prefix inside a different response is not the expected draft.
+    const ordinaryLane = ordinaryFrame !== undefined && Array.isArray(body.messages)
+      && body.messages.some((message: { role?: unknown; content?: unknown }) => message?.role === 'user'
+        && typeof message.content === 'string'
+        && (message.content === ordinaryFrame || message.content.startsWith(`${ordinaryFrame}\n`)))
+      && !messages.includes('Complete the full workflow objective, including its constraints');
+    let content: string;
+    if (ordinaryLane) {
+      assert.ok(messages.includes(ordinary!.objective), 'the whole exact accepted ordinary objective remains present');
+      assert.ok(messages.includes(ordinary!.candidate), 'the whole exact ordinary candidate remains present');
+      assert.match(messages, /Create only a reviewable automation opportunity for me now/);
+      assert.match(messages, /do not invoke the provider, create a workflow, create a Space, or schedule anything/);
+      assert.match(JSON.stringify(body.tools), /open_evidence/);
+      ordinaryRequests.push(body);
+      content = 'DONE: the inert proposal satisfies the whole accepted ordinary request; nothing was run or scheduled.\nNEEDS ALL OF: none';
+    } else {
+      assert.match(messages, /Complete the full workflow objective, including its constraints/);
+      assert.match(messages, /workflow_execution/);
+      assert.match(JSON.stringify(body.tools), /open_evidence/);
+      requests.push(body);
+      content = 'DONE: the recording pilot evidence satisfies its bounded objective';
+    }
+    return new Response(JSON.stringify({ id: ordinaryLane ? 'partition-ordinary-recording-review' : 'partition-recording-review', object: 'chat.completion', created: 1,
       model: 'partition-review-fixture', choices: [{ index: 0, message: { role: 'assistant',
-        content: 'DONE: the recording pilot evidence satisfies its bounded objective' }, finish_reason: 'stop' }],
+        content }, finish_reason: 'stop' }],
       usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   };
-  return { requests, restore: () => { globalThis.fetch = previous; } };
+  return { requests, ordinaryRequests, restore: () => { globalThis.fetch = previous; } };
 }

@@ -20,6 +20,7 @@ import { captureFreshSourceSessionContext } from '../runtime/harness/source-sess
  */
 import type { Message } from 'discord.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
+import { isSteerNoteAdmissionError } from '../runtime/harness/steer-notes.js';
 import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { actionBus } from '../runtime/action-bus.js';
@@ -5328,12 +5329,19 @@ export async function handleDiscordHarnessMessage(
         && Date.parse(latest.leaseExpiresAt) > Date.now(),
       );
       if (boundSessionId && leaseLive) {
+        const expectedAttemptId = latest!.attemptId;
         const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
-        appendSteerNote(boundSessionId, prompt);
+        appendSteerNote(boundSessionId, prompt, { expectedAttemptId });
         await message.reply('📝 Noted — she’s mid-run, and your message reaches her at the next step without restarting anything.');
         return;
       }
-    } catch { /* fall through to the normal conversation path */ }
+    } catch (steerErr) {
+      if (isSteerNoteAdmissionError(steerErr)) {
+        await message.reply('Your message wasn’t added to the running turn. Send it again as a new message.');
+        return;
+      }
+      /* fall through to the normal conversation path */
+    }
   }
   const transport: DiscordHarnessTransport = {
     async sendInitial(content) {

@@ -26,7 +26,8 @@ import { currentManifestOperationContract } from './current-manifest-operation-s
 import { redactSensitiveText } from '../security.js';
 import { workspaceDatasetHostFileCommit } from '../../spaces/workspace-set-data-contract.js';
 import { reviewedPlanCallRefusal, materializeReviewedPlanCallArguments } from './reviewed-plan-runtime.js';
-import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering, takeUndeliveredSteerNotes, hasUndeliveredSteerNotes, formatSteerBlock, type SteerNote } from './steer-notes.js';
+import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering, takeUndeliveredSteerNotes, hasUndeliveredSteerNotes, formatSteerBlock,
+  closeTerminalSteering, reopenTerminalSteering, sessionSupportsSteering, type TerminalSteeringOwner, type SteerNote } from './steer-notes.js';
 import { autoCaptureProvenanceFromAcceptedEvent, captureInteractionSignals, explicitMemoryInstructionFor, isEligibleAutoCaptureSourceProvenance } from '../../memory/auto-capture.js';
 import { TOOL_REGISTRY,
   isEffectDecidedPerCall,
@@ -3838,7 +3839,7 @@ const runHostTurnBody = async (
     }
   };
 
-  const runOutputGuardrails = async (output: string): Promise<string> => {
+  const runOutputGuardrails = async (output: string, outputHistory = history): Promise<string> => {
     const guardrails = (agent as { outputGuardrails?: unknown }).outputGuardrails;
     if (!Array.isArray(guardrails)) return output;
     for (const candidate of guardrails) {
@@ -3858,7 +3859,7 @@ const runHostTurnBody = async (
           agent,
           agentOutput: output,
           context: runContext,
-          details: { output: history },
+          details: { output: outputHistory },
         });
       } catch (error) {
         const cause = error instanceof Error ? error : new Error(String(error));
@@ -5342,8 +5343,15 @@ const runHostTurnBody = async (
     } satisfies RunOutcome;
   };
 
-  const completedOutcome = async (text: string): Promise<RunOutcome> => {
-    const guarded = await runOutputGuardrails(text);
+  function completedOutcome(text: string): Promise<RunOutcome>;
+  function completedOutcome(text: string, boundary: {
+    current: () => boolean; commit: () => boolean; outputHistory: AgentInputItem[];
+  }): Promise<RunOutcome | undefined>;
+  async function completedOutcome(text: string, boundary?: {
+    current: () => boolean; commit: () => boolean; outputHistory: AgentInputItem[];
+  }): Promise<RunOutcome | undefined> {
+    const guarded = await runOutputGuardrails(text, boundary?.outputHistory);
+    if (boundary && !boundary.current()) return undefined;
     // THE CHECK-IN EXISTS BECAUSE THE WORK IS UNFINISHED.
     //
     // Refusing to publish a reply while local work is pending is right for an
@@ -5362,22 +5370,33 @@ const runHostTurnBody = async (
       const decision = toOrchestratorDecision(text);
       if (decision?.nextAction !== 'awaiting_user_input' && decision?.nextAction !== 'awaiting_approval') {
         const incompleteMemory = incompleteExplicitMemory();
-        if (incompleteMemory) return blockedOutcome(
-          incompleteMemory === 'pending'
-            ? 'The memory request is captured, but its update is still pending. I cannot confirm completion yet.'
-            : 'I could not confirm a saved memory for this request. The requested memory change is still unfinished.',
-          incompleteMemory === 'pending' ? 'memory_consolidation_pending' : 'memory_work_unverified',
-        );
+        if (incompleteMemory) {
+          if (boundary && !boundary.commit()) return undefined;
+          return blockedOutcome(
+            incompleteMemory === 'pending'
+              ? 'The memory request is captured, but its update is still pending. I cannot confirm completion yet.'
+              : 'I could not confirm a saved memory for this request. The requested memory change is still unfinished.',
+            incompleteMemory === 'pending' ? 'memory_consolidation_pending' : 'memory_work_unverified',
+          );
+        }
         // The review's reason stays in its judged event; the owner gets words.
         const requiredMemory = memoryRequirementCompletion();
-        if (requiredMemory.status === 'unverified') return blockedOutcome(
-          'I could not confirm that your correction replaced what I had saved before. The change is still unfinished.',
-          'memory_correction_unverified');
+        if (requiredMemory.status === 'unverified') {
+          if (boundary && !boundary.commit()) return undefined;
+          return blockedOutcome(
+            'I could not confirm that your correction replaced what I had saved before. The change is still unfinished.',
+            'memory_correction_unverified');
+        }
       }
       const { pendingAcceptedLocalWork } = await import('./local-work-completion.js');
+      if (boundary && !boundary.current()) return undefined;
       const pending = pendingAcceptedLocalWork(exactHostIdentity());
-      if (pending) return blockedOutcome(guarded, 'local_work_incomplete');
+      if (pending) {
+        if (boundary && !boundary.commit()) return undefined;
+        return blockedOutcome(guarded, 'local_work_incomplete');
+      }
     }
+    if (boundary && !boundary.commit()) return undefined;
     emit('agent_end', runContext, agent, guarded);
     retainConnectionProgress();
     return {
@@ -5385,7 +5404,7 @@ const runHostTurnBody = async (
       lastResponseId,
       finalOutput: guarded,
     } satisfies RunOutcome;
-  };
+  }
 
   let resumedToolSurfaceUnavailable = false;
   if (resumedHostState) {
@@ -9843,6 +9862,61 @@ const runHostTurnBody = async (
   /** Why the host is taking another step after a shown draft, so the viewer
    *  can say so instead of the draft silently disappearing. */
   let nextDraftRetractReason: AnswerDraftRetractReason | undefined;
+  const terminalSteeringOwner = hostProduction ? {
+    ...exactHostIdentity(), attemptId: harnessRunContextStorage.getStore()?.runAttemptId,
+  } : undefined;
+  const terminalSteeringLease = harnessRunContextStorage.getStore()?.dispatchLease;
+  const terminalCutoverOwner: TerminalSteeringOwner | undefined = terminalSteeringOwner?.attemptId && terminalSteeringLease
+    && sessionSupportsSteering(terminalSteeringOwner.sessionId)
+    ? { sessionId: terminalSteeringOwner.sessionId, sourceUserSeq: terminalSteeringOwner.sourceUserSeq,
+      attemptId: terminalSteeringOwner.attemptId, lease: { ...terminalSteeringLease } } : undefined;
+  if (terminalCutoverOwner && !signal?.aborted) {
+    try {
+      assertRecoveryActivationOwned();
+      reopenTerminalSteering(terminalCutoverOwner);
+    } catch {
+      return blockedOutcome('I could not safely reopen this turn’s final handoff. No further action was started.',
+        'owner_steering_cutover_reopen_unavailable');
+    }
+  }
+  const reopenForOwnerSteering = (objective: string, draft?: AnswerDraftStep): boolean => {
+    if (!hostProduction || signal?.aborted) return false;
+    assertRecoveryActivationOwned();
+    const identity = exactHostIdentity();
+    if (!terminalSteeringOwner || identity.sessionId !== terminalSteeringOwner.sessionId
+      || identity.sourceUserSeq !== terminalSteeringOwner.sourceUserSeq
+      || harnessRunContextStorage.getStore()?.runAttemptId !== terminalSteeringOwner.attemptId) {
+      throw new HostCallAuthorityBoundaryError('owner_steering_terminal_owner_mismatch');
+    }
+    const pending = hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
+    const arrived = takeUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
+    if (pending && arrived.length === 0) throw new HostCallAuthorityBoundaryError('owner_steering_adoption_unavailable');
+    if (arrived.length) captureExplicitSteerInstructions(identity.sessionId, arrived);
+    if (!arrived.length && objective === judgedObjective()) return false;
+    // The review and any compact repair/replacement apply to the old objective.
+    // Keep settled call history and the attempt's budgets; only its draft is stale.
+    reviewedReplacementText = undefined;
+    completionReviewFeedback = undefined;
+    pendingResponseFormatRepair = undefined;
+    ownerResponseFormatHeld = undefined;
+    judgedBusinessCallsAtLastVerdict = undefined;
+    nextDraftRetractReason = 'review';
+    draft?.retract();
+    journalHostGuide('owner_steering_before_terminal', { noteSeqs: arrived.map(note => note.seq) });
+    return true;
+  };
+  const closeForOwnerSteering = (objective: string, text: string, draft?: AnswerDraftStep): boolean => {
+    if (reopenForOwnerSteering(objective, draft)) return false;
+    if (!terminalCutoverOwner || signal?.aborted) return true;
+    assertRecoveryActivationOwned();
+    const result = closeTerminalSteering(terminalCutoverOwner,
+      createHash('sha256').update(objective, 'utf8').digest('hex'),
+      createHash('sha256').update(text, 'utf8').digest('hex'));
+    if (result.status === 'closed') return true;
+    captureExplicitSteerInstructions(terminalCutoverOwner.sessionId, result.notes);
+    reopenForOwnerSteering(objective, draft);
+    return false;
+  };
   for (let stepIndex = currentHostStepIndex; ; stepIndex += 1) {
     const activationContext = harnessRunContextStorage.getStore();
     if (activationContext) workflowParentActivation(activationContext.sessionId, activationContext.sourceUserSeq);
@@ -10969,10 +11043,13 @@ const runHostTurnBody = async (
         }
         const candidateText = normalization?.text ?? admission.frame.text;
         if (normalization) answerDraft?.complete(candidateText);
+        const completionObjective = judgedObjective();
         const judged = await judgeHostCompletion(candidateText, admission.frame.history, step.responseId, undefined,
           normalization ? { normalization, originalReply: admission.frame.text } : undefined,
           ownerResponseFormatForStep, ownerResponseFormatRequiredForStep);
+        if (reopenForOwnerSteering(completionObjective, answerDraft)) continue;
         if (ownerResponseFormatHeld) {
+          if (!closeForOwnerSteering(completionObjective, admission.frame.text, answerDraft)) continue;
           // Keep the complete admitted draft, including prose/qualifications,
           // and prior settlements. No extraction, replacement or retry. Clem's
           // own draft is what the owner reads; the format miss travels as the
@@ -10986,10 +11063,7 @@ const runHostTurnBody = async (
         if (normalization) {
           assertRecoveryActivationOwned();
           const current = currentFenceOwner();
-          const identity = exactHostIdentity();
-          const arrived = takeUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
-          if (arrived.length) captureExplicitSteerInstructions(identity.sessionId, arrived);
-          if (signal?.aborted || arrived.length || !current
+          if (signal?.aborted || !current
             || !responseFenceNormalizationCurrent(normalization, current, admission.frame.text)) {
             nextDraftRetractReason = 'review';
             continue;
@@ -11001,18 +11075,36 @@ const runHostTurnBody = async (
           continue;
         }
         if (judged === 'awaiting_user_input') {
+          const guarded = await runOutputGuardrails(candidateText, [...history, ...admission.frame.history]);
+          if (reopenForOwnerSteering(completionObjective, answerDraft)) continue;
+          if (!closeForOwnerSteering(completionObjective, guarded, answerDraft)) continue;
           history.push(...admission.frame.history);
           if (step.responseId !== undefined) lastResponseId = step.responseId;
           retainConnectionProgress();
-          return { history, lastResponseId, finalOutput: await runOutputGuardrails(candidateText),
+          return { history, lastResponseId, finalOutput: guarded,
             terminal: { status: 'awaiting_user_input', reason: 'completion_review_needs_input' } };
         }
       }
-      history.push(...admission.frame.history);
-      if (step.responseId !== undefined) lastResponseId = step.responseId;
+      const completionObjective = hostProduction ? judgedObjective() : '';
       const deliveredText = reviewedReplacementText ?? admission.frame.text;
       reviewedReplacementText = undefined;
-      return await completedOutcome(deliveredText);
+      if (!hostProduction) {
+        history.push(...admission.frame.history);
+        if (step.responseId !== undefined) lastResponseId = step.responseId;
+        return await completedOutcome(deliveredText);
+      }
+      const completed = await completedOutcome(deliveredText, {
+        current: () => !reopenForOwnerSteering(completionObjective, answerDraft),
+        outputHistory: [...history, ...admission.frame.history],
+        commit: () => {
+          if (!closeForOwnerSteering(completionObjective, deliveredText, answerDraft)) return false;
+          history.push(...admission.frame.history);
+          if (step.responseId !== undefined) lastResponseId = step.responseId;
+          return true;
+        },
+      });
+      if (!completed) continue;
+      return completed;
     }
 
     const canonicalCalls = admission.frame.calls;

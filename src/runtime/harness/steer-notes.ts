@@ -20,7 +20,261 @@ import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
  * a note that asks for a new external effect meets the same gates the
  * original objective did.
  */
-import { appendEvent, listEvents } from './eventlog.js';
+import { randomUUID } from 'node:crypto';
+import { types } from 'node:util';
+import { appendEvent, listEvents, openEventLog } from './eventlog.js';
+import { isDispatchLeaseCurrent, type DispatchLeaseRef } from './dispatch-lease.js';
+import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
+import { readApprovalExecutionSource } from './approval-execution-source.js';
+import { readConnectionExecutionDelivery } from './connection-execution-activation-proof.js';
+
+export type SteerNoteAdmissionErrorCode = 'STEER_NOTE_CUTOVER' | 'STEER_NOTE_OWNER_CHANGED' | 'STEER_NOTE_UNAVAILABLE';
+
+/** A refused enqueue is never permission to start a competing turn. */
+export class SteerNoteAdmissionError extends Error {
+  readonly code: SteerNoteAdmissionErrorCode;
+  constructor(code: SteerNoteAdmissionErrorCode) {
+    const fixed = typeof code === 'string' && ['STEER_NOTE_CUTOVER', 'STEER_NOTE_OWNER_CHANGED', 'STEER_NOTE_UNAVAILABLE'].includes(code)
+      ? code : 'STEER_NOTE_UNAVAILABLE';
+    super(fixed === 'STEER_NOTE_CUTOVER' ? 'This turn is finishing; the message was not queued.'
+      : fixed === 'STEER_NOTE_OWNER_CHANGED' ? 'The running turn changed; the message was not queued.'
+      : 'I could not verify the running turn; the message was not queued.');
+    this.code = fixed;
+    this.name = 'SteerNoteAdmissionError';
+  }
+}
+
+export function isSteerNoteAdmissionError(error: unknown): error is SteerNoteAdmissionError {
+  try { return !types.isProxy(error) && error instanceof SteerNoteAdmissionError; }
+  catch { return false; }
+}
+
+export interface TerminalSteeringOwner {
+  sessionId: string;
+  sourceUserSeq: number;
+  attemptId: string;
+  lease: DispatchLeaseRef;
+}
+
+interface TerminalSteeringMarker {
+  version: 1;
+  state: 'closed' | 'open';
+  nonce: string;
+  sourceUserSeq: number;
+  attemptId: string;
+  runId: string;
+  scopeId: string;
+  leaseId: string;
+  objectiveDigest: string;
+  candidateDigest: string;
+  previousNonce?: string;
+}
+
+const CUTOVER_METADATA_KEY = '__host_terminal_steering_cutover';
+const CUTOVER_EVENT_KIND = 'host_terminal_steering_cutover';
+const safeId = (value: unknown): value is string => typeof value === 'string'
+  && value.length > 0 && value.length <= 240 && /^[A-Za-z0-9:._/-]+$/.test(value);
+const digest = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+
+function inertRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || types.isProxy(value)
+    || Object.getPrototypeOf(value) !== Object.prototype) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  const result: Record<string, unknown> = Object.create(null);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (typeof key !== 'string' || !descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) {
+      throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+    }
+    result[key] = descriptor.value;
+  }
+  return result;
+}
+
+function snapshotTerminalOwner(value: TerminalSteeringOwner): TerminalSteeringOwner {
+  const owner = inertRecord(value);
+  const lease = inertRecord(owner.lease);
+  if (Object.keys(owner).some(key => !['sessionId', 'sourceUserSeq', 'attemptId', 'lease'].includes(key))
+    || Object.keys(lease).some(key => !['sessionId', 'scopeId', 'leaseId', 'runAttemptId', 'parentScopeId', 'parentLeaseId'].includes(key))
+    || !safeId(owner.sessionId) || !safeId(owner.attemptId) || !Number.isSafeInteger(owner.sourceUserSeq)
+    || Number(owner.sourceUserSeq) <= 0 || lease.sessionId !== owner.sessionId || lease.runAttemptId !== owner.attemptId
+    || !safeId(lease.scopeId) || !safeId(lease.leaseId)
+    || (lease.parentScopeId !== undefined && !safeId(lease.parentScopeId))
+    || (lease.parentLeaseId !== undefined && !safeId(lease.parentLeaseId))) {
+    throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
+  }
+  return { sessionId: owner.sessionId, sourceUserSeq: Number(owner.sourceUserSeq), attemptId: owner.attemptId,
+    lease: lease as unknown as DispatchLeaseRef };
+}
+
+function currentTerminalOwner(owner: TerminalSteeringOwner): { runId: string } {
+  const db = openEventLog();
+  const row = db.prepare(`SELECT run_id, source_user_seq FROM run_attempts
+    WHERE session_id = ? AND attempt_id = ? AND finished_at IS NULL AND status = 'active'`)
+    .get(owner.sessionId, owner.attemptId) as { run_id: string; source_user_seq: number | null } | undefined;
+  const physical = db.prepare(`SELECT run_attempt_id, source_user_seq, accepted_task_id, logical_tool_call_id FROM run_dispatch_leases
+    WHERE session_id = ? AND scope_id = ? AND lease_id = ?`).get(owner.sessionId, owner.lease.scopeId, owner.lease.leaseId) as {
+      run_attempt_id: string | null; source_user_seq: number | null; accepted_task_id: string | null; logical_tool_call_id: string | null;
+    } | undefined;
+  if (!row || !safeId(row.run_id) || !physical || physical.run_attempt_id !== owner.attemptId
+    || physical.source_user_seq !== null || physical.accepted_task_id !== null || physical.logical_tool_call_id !== null
+    || !isDispatchLeaseCurrent(owner.lease)) throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
+  // Approval/connection delivery owns a later input; execution still belongs
+  // to its proven parent. No latest-input or equal-attempt-source shortcut.
+  const executionSource = row.source_user_seq === owner.sourceUserSeq ? row.source_user_seq
+    : row.source_user_seq === null ? null
+      : readApprovalExecutionSource(db, { sessionId: owner.sessionId, sourceUserSeq: row.source_user_seq })
+        ?? readConnectionExecutionDelivery(db, { sessionId: owner.sessionId, deliverySourceUserSeq: row.source_user_seq }, true)
+          ?.activation.executionSourceUserSeq;
+  const authority = acceptedTurnCallAuthorityFor(owner.sessionId, owner.sourceUserSeq);
+  const activeCount = db.prepare(`SELECT COUNT(*) AS count FROM run_attempts WHERE session_id = ? AND finished_at IS NULL AND status = 'active'`)
+    .get(owner.sessionId) as { count: number };
+  if (activeCount.count !== 1 || executionSource !== owner.sourceUserSeq || authority.status !== 'ok' || authority.authority.state !== 'open') {
+    throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
+  }
+  return { runId: row.run_id };
+}
+
+function parsedTerminalMarker(raw: unknown): TerminalSteeringMarker {
+  const marker = inertRecord(raw);
+  const keys = ['version', 'state', 'nonce', 'sourceUserSeq', 'attemptId', 'runId', 'scopeId', 'leaseId', 'objectiveDigest', 'candidateDigest', 'previousNonce'];
+  if (Object.keys(marker).some(key => !keys.includes(key)) || marker.version !== 1
+    || !['closed', 'open'].includes(typeof marker.state === 'string' ? marker.state : '')
+    || !safeId(marker.nonce) || !safeId(marker.attemptId) || !safeId(marker.runId)
+    || !safeId(marker.scopeId) || !safeId(marker.leaseId) || !Number.isSafeInteger(marker.sourceUserSeq)
+    || Number(marker.sourceUserSeq) <= 0 || !digest(marker.objectiveDigest) || !digest(marker.candidateDigest)
+    || (marker.state === 'open' ? !safeId(marker.previousNonce) : marker.previousNonce !== undefined)) {
+    throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  }
+  return marker as unknown as TerminalSteeringMarker;
+}
+
+function terminalMarkerEvent(sessionId: string, nonce: string): { seq: number; marker: TerminalSteeringMarker } {
+  const events = openEventLog().prepare(`SELECT seq, data_json FROM events WHERE session_id = ? AND type = 'guardrail_tripped' AND role = 'system'
+    AND json_valid(data_json) AND json_extract(data_json, '$.kind') = ?
+    AND json_extract(data_json, '$.marker.nonce') = ? LIMIT 2`)
+    .all(sessionId, CUTOVER_EVENT_KIND, nonce) as Array<{ seq: number; data_json: string }>;
+  if (events.length !== 1) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  return { seq: events[0]!.seq, marker: parsedTerminalMarker(JSON.parse(events[0]!.data_json).marker) };
+}
+
+function readTerminalMarker(sessionId: string): TerminalSteeringMarker | undefined {
+  const db = openEventLog();
+  const row = db.prepare(`SELECT metadata_json FROM sessions WHERE id = ?`).get(sessionId) as { metadata_json: string | null } | undefined;
+  if (!row) throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
+  const metadata = row.metadata_json ? JSON.parse(row.metadata_json) : {};
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  const raw = metadata[CUTOVER_METADATA_KEY];
+  const latest = db.prepare(`SELECT seq, data_json FROM events WHERE session_id = ? AND type = 'guardrail_tripped' AND role = 'system'
+    AND json_valid(data_json) AND json_extract(data_json, '$.kind') = ? ORDER BY seq DESC LIMIT 1`)
+    .get(sessionId, CUTOVER_EVENT_KIND) as { seq: number; data_json: string } | undefined;
+  let marker: TerminalSteeringMarker;
+  if (raw === undefined) {
+    // Losing a convenience metadata slot cannot erase a durable refusal.
+    // Reconstruct only the negative closed boundary, never an open capability.
+    if (!latest) return undefined;
+    const retained = parsedTerminalMarker(JSON.parse(latest.data_json).marker);
+    marker = retained.state === 'closed' ? retained : terminalMarkerEvent(sessionId, retained.previousNonce!).marker;
+    if (marker.state !== 'closed') throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  } else marker = parsedTerminalMarker(raw);
+  const recorded = terminalMarkerEvent(sessionId, marker.nonce);
+  if (JSON.stringify(recorded.marker) !== JSON.stringify(marker)
+    || (raw !== undefined && recorded.seq !== latest?.seq)) {
+    throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  }
+  if (marker.state === 'open') {
+    // A serialized open bit cannot erase an earlier fence. It must retain
+    // the exact closed predecessor and its revoked physical generation.
+    const previous = terminalMarkerEvent(sessionId, marker.previousNonce!);
+    if (previous.marker.state !== 'closed' || previous.seq >= recorded.seq
+      || ['sourceUserSeq', 'attemptId', 'runId', 'objectiveDigest', 'candidateDigest']
+        .some(key => previous.marker[key as keyof TerminalSteeringMarker] !== marker[key as keyof TerminalSteeringMarker])
+      || (previous.marker.scopeId === marker.scopeId && previous.marker.leaseId === marker.leaseId)) {
+      throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+    }
+    const oldLease = db.prepare(`SELECT revoked_at FROM run_dispatch_leases
+      WHERE session_id = ? AND scope_id = ? AND lease_id = ? AND run_attempt_id = ?`)
+      .get(sessionId, previous.marker.scopeId, previous.marker.leaseId, marker.attemptId) as { revoked_at: string | null } | undefined;
+    if (!oldLease?.revoked_at) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  }
+  return marker;
+}
+
+function writeTerminalMarker(sessionId: string, marker: TerminalSteeringMarker): void {
+  // Publish the negative slot before appendEvent's synchronous observers run.
+  // Both writes commit together; re-entrant enqueues cannot slip between them.
+  const changed = openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(COALESCE(metadata_json, '{}'), ?, json(?))
+    WHERE id = ? AND (metadata_json IS NULL OR json_valid(metadata_json))`)
+    .run(`$.${CUTOVER_METADATA_KEY}`, JSON.stringify(marker), sessionId);
+  if (changed.changes !== 1) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: CUTOVER_EVENT_KIND, marker } });
+}
+
+function hasPublishedTerminal(sessionId: string, attemptId: string, sourceUserSeq: number): boolean {
+  return Boolean(openEventLog().prepare(`SELECT 1 FROM events WHERE session_id = ? AND type = 'conversation_completed'
+    AND json_valid(data_json) AND (json_extract(data_json, '$.attemptId') = ?
+      OR json_extract(data_json, '$.sourceUserSeq') = ?) LIMIT 1`).get(sessionId, attemptId, sourceUserSeq));
+}
+
+/** Negative-only handoff fence: either adopt pending input or close enqueue.
+ * It finishes no attempt and grants no model, tool, approval or effect work. */
+export function closeTerminalSteering(input: TerminalSteeringOwner, objectiveDigest: string, candidateDigest: string):
+  { status: 'closed' } | { status: 'pending'; notes: SteerNote[] } {
+  try {
+    const owner = snapshotTerminalOwner(input);
+    if (!digest(objectiveDigest) || !digest(candidateDigest)) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+    return openEventLog().transaction(() => {
+      const active = currentTerminalOwner(owner);
+      const prior = readTerminalMarker(owner.sessionId);
+      if (hasUndeliveredSteerNotes(owner.sessionId, owner.sourceUserSeq)) {
+        if (prior?.attemptId === owner.attemptId && prior.runId === active.runId && prior.state === 'closed') {
+          throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+        }
+        const notes = takeUndeliveredSteerNotes(owner.sessionId, owner.sourceUserSeq);
+        if (!notes.length) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+        return { status: 'pending' as const, notes };
+      }
+      if (prior?.attemptId === owner.attemptId && prior.runId === active.runId && prior.state === 'closed') {
+        if (prior.sourceUserSeq === owner.sourceUserSeq && prior.scopeId === owner.lease.scopeId && prior.leaseId === owner.lease.leaseId
+          && prior.objectiveDigest === objectiveDigest && prior.candidateDigest === candidateDigest) return { status: 'closed' as const };
+        throw new SteerNoteAdmissionError('STEER_NOTE_CUTOVER');
+      }
+      writeTerminalMarker(owner.sessionId, { version: 1, state: 'closed', nonce: randomUUID(), sourceUserSeq: owner.sourceUserSeq,
+        attemptId: owner.attemptId, runId: active.runId, scopeId: owner.lease.scopeId, leaseId: owner.lease.leaseId,
+        objectiveDigest, candidateDigest });
+      return { status: 'closed' as const };
+    }).immediate();
+  } catch (error) {
+    if (isSteerNoteAdmissionError(error)) throw error;
+    throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  }
+}
+
+/** Failed publication may reopen only the same still-active execution under a
+ * newly authorized physical generation. A stored marker never grants work. */
+export function reopenTerminalSteering(input: TerminalSteeringOwner): void {
+  try {
+    const owner = snapshotTerminalOwner(input);
+    openEventLog().transaction(() => {
+      const prior = readTerminalMarker(owner.sessionId);
+      if (!prior || prior.attemptId !== owner.attemptId) return;
+      const active = currentTerminalOwner(owner);
+      if (prior.sourceUserSeq !== owner.sourceUserSeq || prior.runId !== active.runId) throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
+      if (hasPublishedTerminal(owner.sessionId, owner.attemptId, owner.sourceUserSeq)) throw new SteerNoteAdmissionError('STEER_NOTE_CUTOVER');
+      if (prior.state === 'open' && prior.scopeId === owner.lease.scopeId && prior.leaseId === owner.lease.leaseId) return;
+      const previous = openEventLog().prepare(`SELECT revoked_at FROM run_dispatch_leases
+        WHERE session_id = ? AND scope_id = ? AND lease_id = ? AND run_attempt_id = ?`)
+        .get(owner.sessionId, prior.scopeId, prior.leaseId, owner.attemptId) as { revoked_at: string | null } | undefined;
+      if (!previous?.revoked_at || (prior.scopeId === owner.lease.scopeId && prior.leaseId === owner.lease.leaseId)) {
+        throw new SteerNoteAdmissionError('STEER_NOTE_CUTOVER');
+      }
+      writeTerminalMarker(owner.sessionId, { ...prior, state: 'open', nonce: randomUUID(), previousNonce: prior.state === 'closed' ? prior.nonce : prior.previousNonce,
+        scopeId: owner.lease.scopeId, leaseId: owner.lease.leaseId });
+    }).immediate();
+  } catch (error) {
+    if (isSteerNoteAdmissionError(error)) throw error;
+    throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  }
+}
 
 export interface SteerNote {
   seq: number;
@@ -37,29 +291,46 @@ export function sessionSupportsSteering(sessionId: string | undefined): boolean 
 export function appendSteerNote(
   sessionId: string,
   text: string,
-  options: { clientRequestId?: string | undefined; voice?: boolean } = {},
+  options: { clientRequestId?: string | undefined; voice?: boolean; expectedAttemptId?: string } = {},
 ): { seq: number } {
-  // Accepted owner instructions are durable input, never a presentation slice.
-  const acceptedText = text;
-  // A retried delivery of the SAME client request is one instruction, not two.
-  // Appending it twice would show the model the same steer again and, now that
-  // adopted notes shape the judged objective, count it twice there too.
-  const requestId = options.clientRequestId?.trim();
-  if (requestId) {
-    try {
-      const existing = listEvents(sessionId, { types: ['user_steer_note'] })
-        .find((row) => (row.data as { clientRequestId?: unknown }).clientRequestId === requestId);
-      if (existing) return { seq: existing.seq };
-    } catch { /* fall through and append */ }
+  try {
+    // A retried SAME request remains its original instruction, even after the
+    // handoff. A new request must atomically compare the current owner/fence.
+    const requestId = options.clientRequestId?.trim();
+    return openEventLog().transaction(() => {
+      if (requestId) {
+        const existing = listEvents(sessionId, { types: ['user_steer_note'] })
+          .find(row => row.data.clientRequestId === requestId);
+        if (existing) return { seq: existing.seq };
+      }
+      const marker = readTerminalMarker(sessionId);
+      const expectedAttemptId = options.expectedAttemptId;
+      if (marker || expectedAttemptId !== undefined) {
+        const active = openEventLog().prepare(`SELECT attempt_id, run_id FROM run_attempts
+          WHERE session_id = ? AND finished_at IS NULL AND status = 'active' LIMIT 2`)
+          .all(sessionId) as Array<{ attempt_id: string; run_id: string }>;
+        if (active.length !== 1 || (expectedAttemptId !== undefined && active[0]!.attempt_id !== expectedAttemptId)) {
+          throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
+        }
+        if (marker?.attemptId === active[0]!.attempt_id && marker.runId === active[0]!.run_id && marker.state === 'closed') {
+          throw new SteerNoteAdmissionError('STEER_NOTE_CUTOVER');
+        }
+        if (marker?.attemptId === active[0]!.attempt_id && marker.runId === active[0]!.run_id && marker.state === 'open') {
+          const current = currentTerminalOwner({ sessionId, sourceUserSeq: marker.sourceUserSeq, attemptId: marker.attemptId,
+            lease: { sessionId, scopeId: marker.scopeId, leaseId: marker.leaseId, runAttemptId: marker.attemptId } });
+          if (current.runId !== marker.runId || hasPublishedTerminal(sessionId, marker.attemptId, marker.sourceUserSeq)) {
+            throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
+          }
+        }
+      }
+      const row = appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_steer_note',
+        data: { text, ...(requestId ? { clientRequestId: requestId } : {}), ...(options.voice === true ? { voice: true } : {}) } });
+      return { seq: row.seq };
+    }).immediate();
+  } catch (error) {
+    if (isSteerNoteAdmissionError(error)) throw error;
+    throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
   }
-  const row = appendEvent({
-    sessionId,
-    turn: 0,
-    role: 'user',
-    type: 'user_steer_note',
-    data: { text: acceptedText, ...(requestId ? { clientRequestId: requestId } : {}), ...(options.voice === true ? { voice: true } : {}) },
-  });
-  return { seq: row.seq };
 }
 
 /**

@@ -501,8 +501,8 @@ export function ChatBubble({
           {message.steer && (
             <p className="mt-1 text-caption text-muted">
               {message.steer === 'pending' && 'Reaching her mid-run…'}
-              {message.steer === 'delivered' && '✓ Reaches her at the next step — the run keeps going'}
-              {message.steer === 'failed' && 'The run just ended before this landed — send it again'}
+              {message.steer === 'delivered' && 'Queued for Clem’s next step'}
+              {message.steer === 'failed' && 'Couldn’t confirm this addition — check the run before resending'}
             </p>
           )}
         </div>

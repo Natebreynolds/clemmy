@@ -9883,6 +9883,174 @@ for (const staleKind of ['call', 'answer'] as const) test(`owner steering during
   assert.equal(eventlog.listEvents(session.id, { types: ['tool_called'] }).length, 0);
 });
 
+for (const boundary of ['review_done', 'review_awaiting', 'review_correction',
+  'output_done', 'output_awaiting', 'format_hold', 'foreign_note', 'cancelled_review'] as const) {
+  test(`owner steering at final ${boundary} reopens the same attempt without replaying settled work`, { timeout: 15_000 }, async t => {
+    const host = await import('./host-turn-runner.js');
+    const steering = await import('./steer-notes.js');
+    const answerStream = await import('./answer-stream.js');
+    const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+    process.env.HARNESS_TOOL_BRACKETS = 'on';
+    t.after(() => {
+      host._setHostObjectiveJudgeForTests(null);
+      if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+      else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+    });
+    const objective = boundary === 'format_hold'
+      ? 'Create a report of both the local status and its limitations from the local file. Return a bare JSON object.'
+      : 'Create a report of both the local status and its limitations from the local file.';
+    const session = eventlog.createSession({ id: `sess-final-steer-${boundary}-${++acceptedSerial}`, kind: 'chat' });
+    const attempt = eventlog.beginRunAttempt(session.id, { runId: `final-steer-${acceptedSerial}` });
+    const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: objective } }, { armRunInFlight: true });
+    const fixture = { session, source, context: { sessionId: session.id, sourceUserSeq: source.seq },
+      parent: { sessionId: session.id, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId,
+        counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::turn:1` } };
+    host.captureEffectiveCompletionPolicyOnce({ ...fixture.context, enabled: boundary !== 'format_hold' });
+    let reads = 0;
+    const reportPath = path.join(TMP_HOME, `controlled-status-${acceptedSerial}.txt`);
+    writeFileSync(reportPath, 'retained-status: ready\n', 'utf8');
+    const reader = brackets.wrapToolForHarness(tool({ name: 'read_file',
+      description: 'Read one local report for the controlled summary.', parameters: z.object({ path: z.string() }),
+      execute: async () => { reads++; return { status: 'ready', limitation: 'not externally verified', label: 'retained-status' }; },
+    }) as never);
+    const oldReply = 'The status is ready. This result is not externally verified.';
+    assert.equal(answerStream.completedDraftReply(oldReply), oldReply, 'the controlled old reply is a showable draft');
+    const finalReply = boundary === 'format_hold' ? '{"status":"ready","language":"French"}' : 'Le statut est prêt. Ce résultat n’est pas vérifié à l’extérieur.';
+    const model = scriptedRecordingModel([[toolCall('settled-before-review', 'read_file', { path: reportPath })],
+      [textMsg(oldReply)], [textMsg(finalReply)]]);
+    model.getStreamedResponse = async function* (request) {
+      const response = await model.getResponse(request);
+      yield { type: 'response_started' } as never;
+      for (const item of response.output as Array<{ type?: string; content?: Array<{ text?: string }> }>) {
+        const text = item.type === 'message' ? item.content?.[0]?.text : undefined;
+        if (text) yield { type: 'output_text_delta', delta: text } as never;
+      }
+      yield { type: 'response_done', response: { id: response.responseId,
+        usage: response.usage, output: response.output } } as never;
+    };
+    let release!: () => void;
+    const paused = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const atBoundary = new Promise<void>(resolve => { entered = resolve; });
+    const reviewed: Array<{ objective: string; reply: string }> = [];
+    const controller = new AbortController();
+    host._setHostObjectiveJudgeForTests(async (currentObjective, reply) => {
+      reviewed.push({ objective: currentObjective, reply });
+      if (reviewed.length === 1 && (boundary.startsWith('review_') || boundary === 'foreign_note'
+        || boundary === 'cancelled_review')) { entered(); await paused; }
+      return reviewed.length === 1 && (boundary === 'review_awaiting' || boundary === 'output_awaiting')
+        ? { done: true, awaitingUser: true, reason: 'The old objective needs an audience choice.' }
+        : reviewed.length === 1 && boundary === 'review_correction'
+          ? { done: false, reason: 'Obsolete finding for the old draft.' }
+          : { done: true, reason: 'The whole current objective and retained status are satisfied.' };
+    });
+    const frames: Array<Record<string, unknown>> = [];
+    const detachStream = answerStream.attachAnswerStream(session.id, event => { frames.push(event.data); });
+    t.after(detachStream);
+    let guardCalls = 0;
+    const agent = { model, tools: [reader], outputGuardrails: [{ name: 'controlled-output-check',
+      execute: async ({ agentOutput, details }: { agentOutput: string; details: { output: unknown[] } }) => {
+        guardCalls++;
+        const outputTexts = details.output.flatMap(item => {
+          const content = (item as { content?: unknown }).content;
+          return typeof content === 'string' ? [content] : Array.isArray(content)
+            ? content.map(part => (part as { text?: unknown }).text) : [];
+        });
+        assert.ok(outputTexts.includes(agentOutput), 'output guards retain the exact candidate-inclusive history');
+        assert.equal(details.output.filter(item => (item as { type?: string }).type === 'function_call_result').length, 1);
+        if (guardCalls === 1 && boundary.startsWith('output_')) { entered(); await paused; }
+        return { tripwireTriggered: false, outputInfo: {} };
+      } }] };
+    bindHostCanarySurface(fixture, agent, [reader]);
+    let note: { seq: number } | undefined;
+    const noteText = 'Keep the settled status. Write the summary in French instead.';
+    const detachEvents = actionBus.subscribe(event => {
+      if (boundary === 'format_hold' && event.kind === 'harness.event' && event.sessionId === session.id
+        && event.event.type === 'guardrail_tripped' && event.event.data.kind === 'owner_response_format_hold' && !note) {
+        note = steering.appendSteerNote(session.id, noteText);
+      }
+    });
+    t.after(detachEvents);
+    const running = runProductionHost(fixture, agent, undefined, { hostJudgeCompletion: true, maxTurns: 6,
+      ...(boundary === 'cancelled_review' ? { signal: controller.signal } : {}) });
+    if (boundary !== 'format_hold') {
+      await Promise.race([atBoundary, running.then(outcome => {
+        throw new Error(`Runner ended before the controlled boundary: ${JSON.stringify({ terminal: outcome.terminal,
+          finalOutput: outcome.finalOutput, reviews: reviewed.length, reads, calls: model.calls() })}`);
+      })]);
+      assert.equal(reads, 1, 'the named read settled before review/output checks');
+      const noteSession = boundary === 'foreign_note'
+        ? eventlog.createSession({ id: `${session.id}-foreign`, kind: 'chat' }).id : session.id;
+      note = steering.appendSteerNote(noteSession, noteText);
+      if (boundary === 'cancelled_review') controller.abort(new Error('controlled owner Stop'));
+      release();
+    }
+    const outcome = await running;
+    assert.ok(note, 'a durable note arrived at the selected final boundary');
+    if (boundary === 'foreign_note' || boundary === 'cancelled_review') {
+      assert.equal(model.calls(), 2, 'foreign steering and cancellation cannot authorize another request');
+      assert.equal(reads, 1);
+      assert.equal(eventlog.listEvents(session.id, { types: ['user_steer_note_delivered'] }).length, 0);
+      if (boundary === 'foreign_note') {
+        assert.equal(outcome.finalOutput, oldReply);
+        assert.equal(steering.takeUndeliveredSteerNotes(`${session.id}-foreign`).length, 1);
+      }
+      return;
+    }
+    assert.equal(outcome.finalOutput, finalReply);
+    assert.equal(outcome.terminal, undefined, 'an obsolete awaiting/format-held decision cannot end this attempt');
+    assert.equal(model.calls(), 3, 'one replacement draft, without another tool/model bootstrap');
+    assert.equal(reads, 1, 'the settled tool body is never repeated');
+    const updatedRequest = JSON.stringify(model.requests[2]);
+    assert.ok(updatedRequest.includes(noteText));
+    assert.ok(updatedRequest.includes(objective), 'the original whole objective is retained');
+    assert.match(updatedRequest, /retained-status/);
+    assert.doesNotMatch(updatedRequest, /Obsolete finding/);
+    assert.ok(!updatedRequest.includes(oldReply));
+    assert.ok(!JSON.stringify(outcome.history).includes(oldReply));
+    assert.equal(outcome.history.filter(item => (item as { type?: string }).type === 'function_call_result').length, 1);
+    assert.ok(frames.some(frame => frame.reset === true), 'the shown obsolete draft is retracted');
+    const delivered = eventlog.listEvents(session.id, { types: ['user_steer_note_delivered'] });
+    assert.equal(delivered.filter(row => Array.isArray(row.data.noteSeqs) && row.data.noteSeqs.includes(note!.seq)).length, 1);
+    assert.equal(delivered.at(-1)?.data.sourceUserSeq, source.seq);
+    const active = eventlog.getRunAttemptBySourceUserSeq(session.id, source.seq);
+    assert.equal(active?.attemptId, attempt.attemptId, 'steering retains the same accepted attempt');
+    if (boundary !== 'format_hold') {
+      assert.equal(reviewed.length, 2);
+      assert.ok(reviewed[1]!.objective.includes(noteText));
+      assert.ok(reviewed[1]!.objective.includes(objective));
+      assert.equal(reviewed[1]!.reply, finalReply);
+    } else assert.equal(reviewed.length, 0, 'owner-disabled review is not silently enabled');
+    const handoffs = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+      .filter(row => row.data.kind === 'host_terminal_steering_cutover');
+    assert.equal(handoffs.length, 1, 'the eventual candidate closes enqueue before returning to publication');
+    const marker = handoffs[0]!.data.marker as { sourceUserSeq: number; attemptId: string; candidateDigest: string };
+    assert.equal(marker.sourceUserSeq, source.seq);
+    assert.equal(marker.attemptId, attempt.attemptId);
+    assert.equal(marker.candidateDigest, createHash('sha256').update(finalReply).digest('hex'));
+    const beforeLate = eventlog.listEvents(session.id).length;
+    assert.throws(() => steering.appendSteerNote(session.id, 'New input in the publication gap.', { expectedAttemptId: attempt.attemptId }),
+      error => steering.isSteerNoteAdmissionError(error) && error.code === 'STEER_NOTE_CUTOVER');
+    assert.equal(eventlog.listEvents(session.id).length, beforeLate, 'a refused late input is never queued or a new attempt');
+  });
+}
+
+test('terminal steering compatibility: source-only direct runConversation and noninteractive workflow do not require attempts', async () => {
+  for (const id of [`sess-direct-terminal-${++acceptedSerial}`, `workflow:direct-terminal-${++acceptedSerial}:main`]) {
+    const session = eventlog.createSession({ id, kind: id.startsWith('workflow:') ? 'agent' : 'chat' });
+    const model = stubModel([[textMsg('4')]]);
+    const result = await runConversation({ sessionId: session.id, input: 'What is 2 plus 2? Reply only with the number.',
+      turnEngine: 'host_v1', maxSteps: 1, maxTurns: 2, judgeCompletion: false,
+      buildAgent: async () => ({ model, instructions: 'Answer the exact question.', tools: [] } as never),
+      makeRunner: () => throwingRunner() as never });
+    assert.equal(result.publicPresentation?.status, 'done');
+    assert.equal(model.calls(), 1);
+    assert.equal(eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+      .filter(row => row.data.kind === 'host_terminal_steering_cutover').length, 0,
+    'unsupported lifecycle owners retain prior completion behavior without a fabricated atomic fence');
+  }
+});
+
 /** A real accepted source whose text is the request the judge measures against. */
 function acceptJudgedSource(label: string, text: string, sourceData: Record<string, unknown> = {}) {
   const session = eventlog.createSession({ id: `host-judged-${++acceptedSerial}-${label}`, kind: 'chat' });

@@ -75,14 +75,27 @@ test('a failure reads as a failure, not a success', () => {
   assert.match(writeRowLabel(row), /failed$/);
 });
 
-test('an orphan says it may have landed -- never "failed", never "done"', () => {
+test('a public orphan with no cause says unconfirmed, without inventing a timeout or completed write', () => {
   const row = only(foldWriteLedger([
     ev('external_write', write('c1', { preDispatch: true })),
     ev('external_write_orphaned', write('c1')),
   ]));
   assert.equal(row.disposition, 'orphaned');
   assert.equal(writeRowStatus(row), 'interrupted');
-  assert.match(writeRowLabel(row), /may have landed$/);
+  assert.equal(writeRowTone(row), 'warning');
+  assert.equal(writeRowLabel(row), 'Creating a draft to paul@example.com — unconfirmed — may have landed');
+  assert.doesNotMatch(writeRowLabel(row), /timed out|^Created|failed/i);
+});
+
+test('an unpaired public orphan keeps send uncertainty without a confirmed past-tense claim', () => {
+  const row = only(foldWriteLedger([
+    ev('external_write_orphaned', write('send-orphan', { shapeKey: 'OUTLOOK_SEND_EMAIL', toolName: 'outlook_send_email' })),
+  ]));
+  assert.equal(row.disposition, 'orphaned');
+  assert.equal(writeRowStatus(row), 'interrupted');
+  assert.equal(writeRowTone(row), 'warning');
+  assert.equal(writeRowLabel(row), 'Sending a message to paul@example.com — unconfirmed — may have landed');
+  assert.doesNotMatch(writeRowLabel(row), /timed out|^Sent/i);
 });
 
 test('a decisive terminal outranks an orphan, in either arrival order', () => {
@@ -115,7 +128,10 @@ test('two open reservations sharing one callId both go unknown, never "never dis
   ]);
   const row = only(rows);
   assert.equal(row.disposition, 'unknown');
-  assert.match(writeRowLabel(row), /couldn't confirm this one$/);
+  assert.equal(writeRowStatus(row), 'interrupted');
+  assert.equal(writeRowTone(row), 'warning');
+  assert.equal(writeRowLabel(row), 'Creating a draft to paul@example.com — unconfirmed — may have landed');
+  assert.doesNotMatch(writeRowLabel(row), /timed out|^Created/i);
 });
 
 test('a write with no callId is kept, and cannot claim a settlement', () => {
@@ -133,6 +149,9 @@ test('an unsettled reservation at turn end is unknown, not success', () => {
   const open = foldWriteLedger([ev('external_write', write('c1', { preDispatch: true }))]);
   const sealed = sealOpenWrites(open);
   assert.equal(only(sealed).disposition, 'unknown');
+  assert.equal(writeRowLabel(only(sealed)), 'Creating a draft to paul@example.com — unconfirmed — may have landed');
+  assert.equal(writeRowStatus(only(sealed)), 'interrupted');
+  assert.equal(writeRowTone(only(sealed)), 'warning');
   // Sealing a settled ledger changes nothing.
   const settled = foldWriteLedger([
     ev('external_write', write('c2', { preDispatch: true })),

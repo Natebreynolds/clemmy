@@ -84,6 +84,52 @@ async function boot(): Promise<{ url: string; close: () => Promise<void> }> {
   };
 }
 
+test('desktop terminal steering cutover refuses ordinary and steer-only messages without a competing attempt', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  let brainCalls = 0;
+  _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+    runConversation: (async () => { brainCalls++; throw new Error('a refused steer cannot dispatch'); }) as never,
+    claudeAgentBrain: (async () => { brainCalls++; throw new Error('a refused steer cannot dispatch'); }) as never });
+  const steering = await import('../runtime/harness/steer-notes.js');
+  const { armHostReadOnlyCallAuthority } = await import('../runtime/harness/accepted-turn-call-authority.js');
+  const { activateDispatchLease } = await import('../runtime/harness/dispatch-lease.js');
+  const harness = await boot();
+  try {
+    const session = createSession({ id: 'sess-desktop-terminal-steering', kind: 'chat', channel: 'desktop', userId: 'desktop' });
+    const attempt = claimRunAttemptLease({ sessionId: session.id, runId: 'desktop:terminal-steering', ownerId: 'fixture-owner', leaseMs: 60_000 }).attempt!;
+    const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Report the retained status.' } }, { armRunInFlight: true });
+    const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+    assert.equal(armHostReadOnlyCallAuthority({ sessionId: session.id, sourceUserSeq: source.seq,
+      surfaceVersion: 'configured_harness_tools_v1', catalogRevisionDigest: sha('catalog'), bindingRevisionDigest: sha('binding'),
+      maxLogicalCalls: 8, maxParallelCalls: 4 }).status, 'armed');
+    const lease = activateDispatchLease({ sessionId: session.id, scopeId: `${session.id}:host`, runAttemptId: attempt.attemptId });
+    const before = await fetch(`${harness.url}/api/harness/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: session.id, input: 'Use French.', clientRequestId: 'desktop-before-cutover' }) });
+    assert.equal(before.status, 200);
+    const beforeBody = await before.json() as { steered?: boolean; noteSeq: number };
+    assert.equal(beforeBody.steered, true);
+    const owner = { sessionId: session.id, sourceUserSeq: source.seq, attemptId: attempt.attemptId, lease };
+    const pending = steering.closeTerminalSteering(owner, sha('old objective'), sha('old draft'));
+    assert.equal(pending.status, 'pending');
+    assert.deepEqual(pending.status === 'pending' ? pending.notes.map(note => note.seq) : [], [beforeBody.noteSeq]);
+    assert.equal(steering.closeTerminalSteering(owner, sha('French objective'), sha('French reply')).status, 'closed');
+    const eventsBefore = listEvents(session.id);
+    for (const steerOnly of [false, true]) {
+      const response = await fetch(`${harness.url}/api/harness/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: session.id, input: 'Another detail.', clientRequestId: `desktop-after-cutover-${steerOnly}`, steerOnly }) });
+      assert.equal(response.status, 409);
+      assert.equal((await response.json() as { code: string }).code, 'STEER_NOTE_CUTOVER');
+    }
+    assert.equal(brainCalls, 0);
+    assert.equal(getActiveRunAttempt(session.id)?.attemptId, attempt.attemptId);
+    assert.equal(listEvents(session.id, { types: ['user_input_received'] }).length, 1);
+    assert.equal(listEvents(session.id, { types: ['user_steer_note'] }).length, 1);
+    assert.deepEqual(listEvents(session.id).map(row => row.id), eventsBefore.map(row => row.id));
+    assert.equal(getHarnessChatRequestReceipt('desktop-after-cutover-false'), null);
+  } finally { _setBridgeImplsForTests({}); await harness.close(); }
+});
+
 test('desktop paused-card confirmation stays with the exact card after its original attempt finished', async () => {
   resetEventLog();
   resetHarnessRuntimeConfig();

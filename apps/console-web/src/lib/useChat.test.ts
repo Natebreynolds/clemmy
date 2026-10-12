@@ -1010,8 +1010,11 @@ test('reduceActivity: a failed / orphaned external write reads honestly (danger 
   assert.match(a[0].label, /Sent a message to x@y\.example — failed/);
 
   a = reduceActivity(a, ev('external_write_orphaned', { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['z@y.example'], callId: 'o1' }));
+  assert.equal(a[1].status, 'interrupted');
   assert.equal(a[1].tone, 'warning');
-  assert.match(a[1].label, /timed out, may have landed/);
+  assert.equal(a[1].write?.disposition, 'orphaned');
+  assert.equal(a[1].label, 'Sending a message to z@y.example — unconfirmed — may have landed');
+  assert.doesNotMatch(a[1].label, /timed out|^Sent/i);
 });
 
 test('reduceActivity: codemode_program_summary folds into ONE "ran a batch program" row', () => {
