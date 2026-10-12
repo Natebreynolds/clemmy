@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { AlertTriangle, X } from 'lucide-react';
-import { Sidebar, readSidebarCollapsed, writeSidebarCollapsed } from './Sidebar';
+import { Sidebar } from './Sidebar';
+import { sidebarCollapsedFor, writeSidebarCollapsed } from '@/lib/sidebar-collapsed';
 import { TopBar } from './TopBar';
 import { CommandPalette } from './CommandPalette';
 import { CustomizePanel } from './home/CustomizePanel';
@@ -34,10 +35,8 @@ function titleForPath(pathname: string): string {
 export function AppShell() {
   // A narrow window always starts collapsed; otherwise the user's last
   // choice (localStorage, best-effort) wins.
-  const [collapsed, setCollapsed] = useState(() => (
-    typeof window !== 'undefined' && window.matchMedia(NARROW_QUERY).matches
-      ? true
-      : readSidebarCollapsed()
+  const [collapsed, setCollapsed] = useState(() => sidebarCollapsedFor(
+    typeof window !== 'undefined' && window.matchMedia(NARROW_QUERY).matches,
   ));
   const toggleSidebar = () => {
     setCollapsed((v) => {
@@ -92,8 +91,11 @@ export function AppShell() {
 
   useEffect(() => {
     const media = window.matchMedia(NARROW_QUERY);
-    // Forced by the viewport, not chosen — so it is not persisted.
-    const sync = () => { if (media.matches) setCollapsed(true); };
+    // Forced by the viewport, not chosen — so it is not persisted, and it
+    // lasts only while the window is narrow. A window loaded while minimized,
+    // hidden or snapped small reads as narrow; once it widens, the owner's
+    // own last choice comes back.
+    const sync = () => setCollapsed(sidebarCollapsedFor(media.matches));
     sync();
     media.addEventListener('change', sync);
     return () => media.removeEventListener('change', sync);

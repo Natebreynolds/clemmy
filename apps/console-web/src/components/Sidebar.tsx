@@ -15,19 +15,11 @@ import { RecentWork, WorkCollection } from './WorkNavigator';
  * The sidebar the user shapes: pinned, then shown, then a "More" fold —
  * all from HomePreferences.nav (persisted server-side, so the phone agrees).
  * Two per-window conveniences live in localStorage: whether the rail is
- * collapsed and whether More is open. Both are best-effort (private window,
- * cleared site data) and the sidebar renders correctly without them.
+ * collapsed (lib/sidebar-collapsed.ts) and whether More is open. Both are
+ * best-effort (private window, cleared site data) and the sidebar renders
+ * correctly without them.
  */
-const COLLAPSED_PREF_KEY = 'clem.sidebar.collapsed';
 const MORE_PREF_KEY = 'clem.sidebar.more';
-
-export function readSidebarCollapsed(): boolean {
-  try { return localStorage.getItem(COLLAPSED_PREF_KEY) === 'collapsed'; } catch { return false; }
-}
-
-export function writeSidebarCollapsed(collapsed: boolean): void {
-  try { localStorage.setItem(COLLAPSED_PREF_KEY, collapsed ? 'collapsed' : 'open'); } catch { /* preference only */ }
-}
 
 function readMoreOpen(): boolean {
   try { return localStorage.getItem(MORE_PREF_KEY) === 'open'; } catch { return false; }
