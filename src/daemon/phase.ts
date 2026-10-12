@@ -204,6 +204,26 @@ export async function withDaemonRuntimePhase<T>(
 }
 
 /**
+ * Run one daemon-loop step as its own phase and contain its failure. An error
+ * that escapes the loop reaches main(), which exits; the supervisor restarts
+ * into the same durable state and usually the same error. `contain` receives
+ * the error (after the phase has ended) and returns the value the loop uses
+ * instead, so one failing step never ends the daemon or skips later steps.
+ */
+export async function withContainedDaemonRuntimePhase<T>(
+  name: string,
+  detail: unknown,
+  fn: () => Promise<T> | T,
+  contain: (error: unknown) => T,
+): Promise<T> {
+  try {
+    return await withDaemonRuntimePhase(name, detail, fn);
+  } catch (error) {
+    return contain(error);
+  }
+}
+
+/**
  * Take the label back for the phase that owns the code now executing, and
  * stamp the beacon. Call it right before synchronous work that follows an
  * await: nothing else can run between the stamp and that work, so the label is

@@ -153,7 +153,7 @@ import { runRecursiveReflection, consolidateActiveFacts, recursiveReflectionOutc
 import { decayAndEvictFacts } from '../memory/facts.js';
 import { appendHygieneAudit } from '../memory/hygiene-audit.js';
 import { autoCleanSafeMemory } from '../autoresearch/memory-apply.js';
-import { setDaemonRuntimePhase, withDaemonRuntimePhase } from './phase.js';
+import { setDaemonRuntimePhase, withContainedDaemonRuntimePhase, withDaemonRuntimePhase } from './phase.js';
 import {
   CRON_FILE,
 } from '../memory/vault.js';
@@ -2308,7 +2308,11 @@ export async function startDaemon(
     .then(({ warmByoProviderCatalogs }) => warmByoProviderCatalogs())
     .then((n) => { if (n > 0) logger.info({ windows: n }, 'BYO provider catalog windows recorded'); })
     .catch(() => { /* warm is additive — never blocks startup */ });
-  ensureDir(CRON_PROGRESS_DIR);
+  try {
+    ensureDir(CRON_PROGRESS_DIR);
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Cron progress directory unavailable on boot (continuing; cron heartbeats degrade)');
+  }
   // Warm capability retrieval OFF the request path. The local model takes a few
   // seconds the first time and milliseconds afterwards; doing it here means the
   // first real request finds it ready instead of paying for it, and a failure
@@ -2344,11 +2348,19 @@ export async function startDaemon(
   // Surface "we missed N scheduled runs while you were offline" BEFORE
   // any other startup work so the user has the bad news first. Safe to
   // call even on first boot (no-op without a previous heartbeat).
-  reportMissedCronRunsOnBoot(state);
+  try {
+    reportMissedCronRunsOnBoot(state);
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Missed-cron report failed on boot (continuing)');
+  }
   // Daily-bucketed setup-gap notifications so the user discovers
   // missing auth / broken config when they open the dashboard, not
   // when they go looking for a missing notification.
-  reportBootSetupIssues();
+  try {
+    reportBootSetupIssues();
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot setup-issue report failed (continuing)');
+  }
   // Stale-workflow sweep (2026-07-21 break-scenario B): an ENABLED workflow
   // whose structured call references a since-killed/renamed tool would fire
   // on schedule and fail — surface it once so it's fixed before the next
@@ -2469,9 +2481,13 @@ export async function startDaemon(
       'Approved-plan admission boot reconcile failed; ordinary tick will retry',
     );
   }
-  const interrupted = interruptStaleRunningBackgroundTasks();
-  if (interrupted > 0) {
-    logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');
+  try {
+    const interrupted = interruptStaleRunningBackgroundTasks();
+    if (interrupted > 0) {
+      logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Stale running background-task interruption failed on boot (continuing; stale sweeps retry)');
   }
   // Foreground activations still 'active' at daemon boot belonged to the dead
   // process. Exact dispatched workflow owners remain unfinished until their
@@ -2617,9 +2633,13 @@ export async function startDaemon(
   }
   // Re-queue tasks interrupted by a previous restart/crash so the work
   // resumes instead of stranding (bounded by resumeCount to avoid loops).
-  const autoResumed = resumeInterruptedBackgroundTasks({ cap: 2 });
-  if (autoResumed > 0) {
-    logger.warn({ autoResumed }, 'Auto-resumed interrupted background tasks on boot');
+  try {
+    const autoResumed = resumeInterruptedBackgroundTasks({ cap: 2 });
+    if (autoResumed > 0) {
+      logger.warn({ autoResumed }, 'Auto-resumed interrupted background tasks on boot');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Interrupted background-task auto-resume failed on boot (continuing; tasks stay resumable)');
   }
   // A foreground → background handoff interrupted mid-ladder is the one shape
   // that can leave a turn with NO owner: the foreground fenced, the worker never
@@ -2801,13 +2821,17 @@ export async function startDaemon(
     const published = drainPendingHeldStopPublications();
     if (published) logger.info({ published }, 'Recovered held-stop publication owners before chat restart');
   } catch { logger.warn('Held-stop publication recovery remains pending'); }
-  const recoveredChats = reportInterruptedChatRuns(
-    Date.now,
-    dispatchInterruptedChatResume,
-    interruptedChatRecoveryOptions,
-  );
-  if (recoveredChats > 0) {
-    logger.warn({ recoveredChats }, 'Surfaced chat runs interrupted by a previous restart (safe ones auto-resumed)');
+  try {
+    const recoveredChats = reportInterruptedChatRuns(
+      Date.now,
+      dispatchInterruptedChatResume,
+      interruptedChatRecoveryOptions,
+    );
+    if (recoveredChats > 0) {
+      logger.warn({ recoveredChats }, 'Surfaced chat runs interrupted by a previous restart (safe ones auto-resumed)');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Interrupted chat recovery failed on boot (continuing; the ordinary tick retries exact checkpoints)');
   }
   // A FOREGROUND chat run that finishes while the user is away used to end in
   // silence — the result sat in a transcript nobody was looking at until they
@@ -2815,22 +2839,31 @@ export async function startDaemon(
   // task emits, on the same channels, so "always reports back" stops depending
   // on the user staying in the room (2026-07-31).
   startTerminalReportBackWatcher();
-  const reconciledHarnessSessions = reconcileDormantTerminalWorkSessions();
-  if (reconciledHarnessSessions.reconciled > 0) {
-    logger.warn(
-      {
-        reconciled: reconciledHarnessSessions.reconciled,
-        completed: reconciledHarnessSessions.completed,
-        failed: reconciledHarnessSessions.failed,
-      },
-      'Reconciled stale non-chat harness sessions with terminal event evidence',
-    );
+  try {
+    const reconciledHarnessSessions = reconcileDormantTerminalWorkSessions();
+    if (reconciledHarnessSessions.reconciled > 0) {
+      logger.warn(
+        {
+          reconciled: reconciledHarnessSessions.reconciled,
+          completed: reconciledHarnessSessions.completed,
+          failed: reconciledHarnessSessions.failed,
+        },
+        'Reconciled stale non-chat harness sessions with terminal event evidence',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Dormant harness session reconcile failed on boot (continuing)');
   }
   // Sweep records that got stuck active across a previous crash/restart.
   // Without this, the dashboard "NOW" panel still reports phantom in-flight
   // work from runs that the model forgot to close out (executions) or that
   // the gateway never got to finishRun() on (runs).
-  const sweptRuns = sweepStaleRuns();
+  let sweptRuns = 0;
+  try {
+    sweptRuns = sweepStaleRuns();
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Stale run sweep failed on boot (continuing)');
+  }
   let sweptExecutions = 0;
   let sweptCrashed = 0;
   let sweptBlocked = 0;
@@ -2851,10 +2884,20 @@ export async function startDaemon(
       'Execution ledger sweep failed closed; continuing daemon boot',
     );
   }
-  const sweptApprovals = sweepStaleApprovals();
-  const repairedDoneTasks = (getRuntimeEnv('CLEMMY_BGTASK_INTEGRITY_SWEEP', 'on') ?? 'on').toLowerCase() === 'off'
-    ? { repaired: 0, ids: [] as string[] }
-    : sweepInvalidDoneBackgroundTasks();
+  let sweptApprovals = 0;
+  try {
+    sweptApprovals = sweepStaleApprovals();
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Stale approval sweep failed on boot (continuing)');
+  }
+  let repairedDoneTasks: { repaired: number; ids: string[] } = { repaired: 0, ids: [] };
+  if ((getRuntimeEnv('CLEMMY_BGTASK_INTEGRITY_SWEEP', 'on') ?? 'on').toLowerCase() !== 'off') {
+    try {
+      repairedDoneTasks = sweepInvalidDoneBackgroundTasks();
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Background-task integrity sweep failed on boot (continuing)');
+    }
+  }
   if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0 || sweptCrashed > 0 || sweptBlocked > 0 || repairedDoneTasks.repaired > 0) {
     logger.warn(
       { sweptRuns, sweptExecutions, sweptApprovals, sweptCrashed, sweptBlocked, repairedDoneTasks },
@@ -2915,7 +2958,11 @@ export async function startDaemon(
   // First-tick init: ensure built-in proactive check-in templates
   // exist on disk (disabled). Re-runs are no-ops because the seeder
   // skips seededIds it already created.
-  ensureSeedTemplates();
+  try {
+    ensureSeedTemplates();
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Check-in template seeding failed (continuing)');
+  }
   try {
     const seeded = ensureBuiltInWorkflows();
     if (seeded.installed.length > 0) {
@@ -3618,14 +3665,29 @@ export async function startDaemon(
 
   // Stagger monitor runs — don't run them every 15s tick
   let tickCount = 0;
+  // Every loop step runs through loopStep. A step that throws is logged and
+  // the tick moves on to the next step; nothing in this loop may end the
+  // process. An escaped error reaches main(), which exits, and the supervisor
+  // restarts into the same durable state and the same failure, so one bad
+  // read would crash every boot. Each step reloads its state from disk or
+  // rolls back its in-memory commit on a failed save, so continuing
+  // in-process is never less safe than that restart.
+  const loopStep = <T = void>(name: string, fn: () => Promise<T> | T, fallback?: T): Promise<T> =>
+    withContainedDaemonRuntimePhase(name, { tickCount }, fn, (err) => {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err), phase: name, tickCount },
+        'Daemon loop step failed; continuing with the next step',
+      );
+      return fallback as T;
+    });
 
   while (true) {
     tickCount++;
     setDaemonRuntimePhase('daemon.loop.tick', { tickCount });
-    await withDaemonRuntimePhase('daemon.loop.cron_schedules', { tickCount }, () => processCronSchedules(assistant, state));
-    await withDaemonRuntimePhase('daemon.loop.workflow_improvements', { tickCount }, () => processWorkflowImprovements(assistant));
-    await withDaemonRuntimePhase('daemon.loop.cron_triggers', { tickCount }, () => processCronTriggers(assistant));
-    await withDaemonRuntimePhase('daemon.loop.plan_task_preparation_recovery', { tickCount }, async () => {
+    await loopStep('daemon.loop.cron_schedules', () => processCronSchedules(assistant, state));
+    await loopStep('daemon.loop.workflow_improvements', () => processWorkflowImprovements(assistant));
+    await loopStep('daemon.loop.cron_triggers', () => processCronTriggers(assistant));
+    await loopStep('daemon.loop.plan_task_preparation_recovery', async () => {
       try {
         const { recoverPendingPlanTaskBindingSealPreparations } = await import('../tools/plan-tools.js');
         const recovered = await recoverPendingPlanTaskBindingSealPreparations({ limit: 8 });
@@ -3644,13 +3706,13 @@ export async function startDaemon(
         );
       }
     });
-    await withDaemonRuntimePhase('daemon.loop.held_stop_publication', { tickCount }, async () => {
+    await loopStep('daemon.loop.held_stop_publication', async () => {
       try {
         const { drainPendingHeldStopPublications } = await import('../runtime/harness/loop.js');
         drainPendingHeldStopPublications();
       } catch { /* publication-only ownership remains durable for a later pass */ }
     });
-    await withDaemonRuntimePhase('daemon.loop.async_read_refinement_recovery', { tickCount }, async () => {
+    await loopStep('daemon.loop.async_read_refinement_recovery', async () => {
       try {
         const { claimPendingAsyncReadRefinementRecoveries } = await import('../runtime/harness/async-read-refinement-recovery.js');
         const claimed = claimPendingAsyncReadRefinementRecoveries({ limit: 8 });
@@ -3677,7 +3739,7 @@ export async function startDaemon(
     // report-backs. Boot + ~60s cadence; unchanged definitions are true DB
     // no-ops. Existing source engines remain execution-authoritative.
     if (tickCount === 1 || tickCount % 4 === 0) {
-      await withDaemonRuntimePhase('daemon.loop.prospective_sync', { tickCount }, async () => {
+      await loopStep('daemon.loop.prospective_sync', async () => {
         try {
           syncProspectiveIntentions();
         } catch (err) {
@@ -3691,11 +3753,11 @@ export async function startDaemon(
     // set_timer reminders (2026-07-20): fire everything past-due. Durable
     // due-compare (fireAt <= now) → survives restart AND laptop sleep — the
     // tool used to be WRITE-ONLY (no consumer; every reminder silently lost).
-    await withDaemonRuntimePhase('daemon.loop.timers', { tickCount }, async () => { fireDueTimers(); });
+    await loopStep('daemon.loop.timers', async () => { fireDueTimers(); });
     // Standing interval consent is repaired/installed before schedule
     // discovery. A workflow definition alone is configuration, never runtime
     // authority; the scheduler independently rechecks the active receipt.
-    await withDaemonRuntimePhase('daemon.loop.automation_recurrence', { tickCount }, async () => {
+    await loopStep('daemon.loop.automation_recurrence', async () => {
       try {
         const recurrences = reconcileAutomationRecurrences();
         if (
@@ -3713,12 +3775,12 @@ export async function startDaemon(
     });
     // Match workflows with trigger.schedule/interval against wall-clock time
     // and enqueue runs. processWorkflowRuns (below) then drains the queue.
-    await withDaemonRuntimePhase('daemon.loop.workflow_schedules', { tickCount }, () => processWorkflowSchedules());
+    await loopStep('daemon.loop.workflow_schedules', () => processWorkflowSchedules());
     // T2.1: keep the trigger registry in sync with each enabled workflow's
     // declared event/webhook triggers so fireWorkflowSystemEvent / the
     // /api/hooks/workflows route can match them. Cheap (no-op upserts are
     // skipped) and best-effort.
-    await withDaemonRuntimePhase('daemon.loop.workflow_trigger_registry', { tickCount }, async () => {
+    await loopStep('daemon.loop.workflow_trigger_registry', async () => {
       try {
         syncWorkflowTriggerRegistry();
         recoverPendingWorkflowTriggerEvents();
@@ -3728,23 +3790,17 @@ export async function startDaemon(
     });
     // Workspaces: silently refresh any scheduled data sources (no LLM).
     {
-      await withDaemonRuntimePhase('daemon.loop.space_schedules', { tickCount }, () => processSpaceSchedules()).catch((err) => {
-        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'processSpaceSchedules tick failed');
-      });
+      await loopStep('daemon.loop.space_schedules', () => processSpaceSchedules());
       // Paused-build auto-retry: a workspace parked by a TRANSIENT build-time
       // failure re-pulls its sources (2 attempts, spaced) and reactivates on
       // success instead of stranding until the user notices the banner.
-      await withDaemonRuntimePhase('daemon.loop.space_retry_paused', { tickCount }, () => retryPausedSpaces()).catch((err) => {
-        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'retryPausedSpaces tick failed');
-      });
+      await loopStep('daemon.loop.space_retry_paused', () => retryPausedSpaces());
       // First-ten-minutes activation: once-ever SUGGEST when the user has zero
       // workspaces but a usable connection ("I can build you a Deal Board").
       // Deterministic + marker-guarded + probe-throttled; never auto-builds.
-      await withDaemonRuntimePhase('daemon.loop.space_starter_offer', { tickCount }, () => maybeOfferStarterWorkspace({
+      await loopStep('daemon.loop.space_starter_offer', () => maybeOfferStarterWorkspace({
         listConnectedSlugs: async () => (await listUsableConnectedToolkits()).map((t) => t.slug).filter(Boolean),
-      })).catch((err) => {
-        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'starter-workspace offer check failed');
-      });
+      }));
     }
     // When the run lane is active, draining happens on its own timer
     // (above) so a long run can't block this loop. Only drain inline
@@ -3753,7 +3809,7 @@ export async function startDaemon(
       // P0 parking: re-admit resolved parked runs on the inline path too
       // (no-op when WORKFLOW_APPROVAL_PARKING is off). Keeps parking
       // correct even when the independent run lane is disabled.
-      await withDaemonRuntimePhase('daemon.loop.workflow_runs_inline', { tickCount }, async () => {
+      await loopStep('daemon.loop.workflow_runs_inline', async () => {
         try {
           const recovered = reconcileClosedWorkflowDispatchBatches();
           if (recovered.finalized > 0 || recovered.published > 0) {
@@ -3831,19 +3887,19 @@ export async function startDaemon(
 
     // Run monitors every 4 ticks (~60s) - they have their own internal rate limiting.
     if (proactivity.proactiveWorkAllowed && tickCount % 4 === 0) {
-      await withDaemonRuntimePhase('daemon.loop.monitors', { tickCount }, async () => {
+      await loopStep('daemon.loop.monitors', async () => {
         processMonitors();
       });
     }
 
     if (proactivity.proactiveWorkAllowed) {
-      await withDaemonRuntimePhase('daemon.loop.execution_controller', { tickCount }, () => processExecutionController(assistant));
+      await loopStep('daemon.loop.execution_controller', () => processExecutionController(assistant));
       // Autonomy v1 (processAgentAutonomy) was deleted in Phase-2 Wave 2 — v2
       // owns every standing agent (AUTONOMY_V2_AGENTS) and self-driving goals
       // own the rest. Only v2 + goals run the standing-work cadence now.
       // The assistant handle lets cycles run through the brain runtime on
       // OAuth-primary installs (no raw OpenAI key — the shipped default).
-      await withDaemonRuntimePhase('daemon.loop.agent_autonomy_v2', { tickCount }, () => processAgentAutonomyV2(assistant));
+      await loopStep('daemon.loop.agent_autonomy_v2', () => processAgentAutonomyV2(assistant));
       // Self-driving goals (A2): re-enter active goals due for a heartbeat.
       // Inside proactiveWorkAllowed ⇒ quiet hours pause resumption for free
       // (the autonomous-hours window, reusing proactivity-policy). ~60s scan
@@ -3851,16 +3907,20 @@ export async function startDaemon(
       // principled replacement for processAgentAutonomy{,V2} — do NOT add new
       // standing-work features to those two engines; land them as goals here.
       if (tickCount % 4 === 0) {
-        await withDaemonRuntimePhase('daemon.loop.goal_resumptions', { tickCount }, () => processGoalResumptions());
+        await loopStep('daemon.loop.goal_resumptions', () => processGoalResumptions());
       }
       // Reunify tools left in flight when a turn died on an infra error — fire a
       // follow-up report turn once the tool (e.g. a long run_batch) completes.
-      await withDaemonRuntimePhase('daemon.loop.orphaned_tool_reports', { tickCount }, () => processOrphanedToolReports());
-      await withDaemonRuntimePhase('daemon.loop.proactive_briefs', { tickCount }, () => processProactiveBriefs(assistant));
+      await loopStep('daemon.loop.orphaned_tool_reports', () => processOrphanedToolReports());
+      await loopStep('daemon.loop.proactive_briefs', () => processProactiveBriefs(assistant));
       // Evaluate user-defined check-in templates — fires open
       // questions through the existing check-in path when their
       // trigger (schedule / condition) is hot and cooldown elapsed.
-      const checkInResult = await withDaemonRuntimePhase('daemon.loop.proactive_check_ins', { tickCount }, async () => processProactiveCheckIns());
+      const checkInResult = await loopStep(
+        'daemon.loop.proactive_check_ins',
+        async () => processProactiveCheckIns(),
+        { evaluated: 0, triggered: 0, fired: [], skipped: [] },
+      );
       if (checkInResult.fired.length > 0) {
         logger.info({
           fired: checkInResult.fired.length,
@@ -3880,9 +3940,9 @@ export async function startDaemon(
       // execution gets at most one entry per UTC day per pause window.
       annotateDueExecutionsAsPolicyPaused(proactivity);
     }
-    await withDaemonRuntimePhase('daemon.loop.memory_maintenance', { tickCount }, () => processMemoryMaintenance(tickCount));
-    await withDaemonRuntimePhase('daemon.loop.recursive_reflection', { tickCount }, () => processRecursiveReflectionTick(state));
-    await withDaemonRuntimePhase('daemon.loop.memory_hygiene', { tickCount }, () => processMemoryHygieneTick(state));
+    await loopStep('daemon.loop.memory_maintenance', () => processMemoryMaintenance(tickCount));
+    await loopStep('daemon.loop.recursive_reflection', () => processRecursiveReflectionTick(state));
+    await loopStep('daemon.loop.memory_hygiene', () => processMemoryHygieneTick(state));
     // Notification delivery used to run inline here. It now ticks on
     // its own independent setInterval above, so deliveries keep
     // flowing while this loop is parked on a long workflow / cron /
@@ -3892,8 +3952,13 @@ export async function startDaemon(
     // ≈ 15 minutes, which is plenty fast for dashboard correctness without
     // hammering disk.
     if (tickCount % 60 === 0) {
-      await withDaemonRuntimePhase('daemon.loop.stale_record_sweep', { tickCount }, async () => {
-        const sweptRuns = sweepStaleRuns();
+      await loopStep('daemon.loop.stale_record_sweep', async () => {
+        let sweptRuns = 0;
+        try {
+          sweptRuns = sweepStaleRuns();
+        } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Stale run sweep failed; continuing independent maintenance');
+        }
         let sweptExecutions = 0;
         let sweptBlocked = 0;
         try {
@@ -3905,10 +3970,20 @@ export async function startDaemon(
             'Execution ledger sweep failed closed; continuing independent maintenance',
           );
         }
-        const sweptApprovals = sweepStaleApprovals();
-        const repairedDoneTasks = (getRuntimeEnv('CLEMMY_BGTASK_INTEGRITY_SWEEP', 'on') ?? 'on').toLowerCase() === 'off'
-          ? { repaired: 0, ids: [] as string[] }
-          : sweepInvalidDoneBackgroundTasks();
+        let sweptApprovals = 0;
+        try {
+          sweptApprovals = sweepStaleApprovals();
+        } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Stale approval sweep failed; continuing independent maintenance');
+        }
+        let repairedDoneTasks: { repaired: number; ids: string[] } = { repaired: 0, ids: [] };
+        if ((getRuntimeEnv('CLEMMY_BGTASK_INTEGRITY_SWEEP', 'on') ?? 'on').toLowerCase() !== 'off') {
+          try {
+            repairedDoneTasks = sweepInvalidDoneBackgroundTasks();
+          } catch (err) {
+            logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Background-task integrity sweep failed; continuing independent maintenance');
+          }
+        }
         if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0 || sweptBlocked > 0 || repairedDoneTasks.repaired > 0) {
           logger.warn({ sweptRuns, sweptExecutions, sweptApprovals, sweptBlocked, repairedDoneTasks }, 'Periodic stale-record sweep auto-closed records');
         }
@@ -3919,7 +3994,7 @@ export async function startDaemon(
     // controller cycles quickly. tickCount * sleep(15s) = tickCount in
     // 15-second units, so 20 ticks ≈ 5 min.
     if (tickCount % 20 === 0) {
-      await withDaemonRuntimePhase('daemon.loop.crashed_execution_sweep', { tickCount }, async () => {
+      await loopStep('daemon.loop.crashed_execution_sweep', async () => {
         let sweptCrashed = 0;
         try {
           sweptCrashed = sweepCrashedExecutions();
@@ -3940,7 +4015,7 @@ export async function startDaemon(
     // 1440 files re-parsed on every 15s tick, slowly browning out the
     // main loop. Hourly cadence keeps disk traffic minimal.
     if (tickCount % 240 === 0) {
-      await withDaemonRuntimePhase('daemon.loop.workflow_run_reaper', { tickCount }, async () => {
+      await loopStep('daemon.loop.workflow_run_reaper', async () => {
         try {
           const reaped = reapStaleWorkflowRuns();
           if (reaped.deleted > 0) {
@@ -3959,7 +4034,7 @@ export async function startDaemon(
       // schedules untouched); week-idle parked/finished tasks soft-archive
       // with a reason (restorable). Both primitives are the same idempotent
       // verbs the user's own buttons call.
-      await withDaemonRuntimePhase('daemon.loop.home_clutter_reaper', { tickCount }, async () => {
+      await loopStep('daemon.loop.home_clutter_reaper', async () => {
         try {
           const skipped = reapStaleWorkflowCatchups();
           if (skipped.length > 0) {
@@ -4026,7 +4101,7 @@ export async function startDaemon(
     //     Keeps disk traffic minimal while staying inside cron's
     //     minute-resolution gap detection threshold.
     if (tickCount === 1 || tickCount % 4 === 0) {
-      await withDaemonRuntimePhase('daemon.loop.persist_heartbeat', { tickCount }, async () => {
+      await loopStep('daemon.loop.persist_heartbeat', async () => {
         state.lastHealthyTickAt = new Date().toISOString();
         saveState(state);
       });

@@ -11,6 +11,7 @@ const {
   listInFlightDaemonPhases,
   resumeDaemonRuntimePhase,
   setDaemonRuntimePhase,
+  withContainedDaemonRuntimePhase,
   withDaemonRuntimePhase,
   yieldToEventLoop,
 } = await import('./phase.js');
@@ -303,4 +304,24 @@ test('metered phases are the long memory passes', () => {
   assert.equal(isMeteredDaemonPhase('daemon.http'), false);
   assert.equal(isMeteredDaemonPhase('daemon.loop.memory_maintenance'), false);
   assert.equal(isMeteredDaemonPhase('daemon.timer.background_tasks'), false);
+});
+
+test('a contained loop step that throws yields its fallback after its phase has ended', async () => {
+  setDaemonRuntimePhase('daemon.loop.tick', { tickCount: 1 });
+  const failure = Object.assign(new Error('EPERM: operation not permitted, fsync'), { code: 'EPERM' });
+  const seen: Array<{ error: unknown; inFlight: string[] }> = [];
+  const value = await withContainedDaemonRuntimePhase('daemon.loop.workflow_schedules', { tickCount: 1 }, async () => {
+    await delay(1);
+    throw failure;
+  }, (error) => {
+    seen.push({ error, inFlight: listInFlightDaemonPhases().map((phase) => phase.name) });
+    return 'fallback';
+  });
+  assert.equal(value, 'fallback');
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]!.error, failure);
+  assert.ok(!seen[0]!.inFlight.includes('daemon.loop.workflow_schedules'), 'the failed phase is no longer in flight');
+  assert.equal(getDaemonRuntimePhase().name, 'daemon.loop.tick', 'the loop label is restored for the next step');
+  const ok = await withContainedDaemonRuntimePhase('daemon.loop.next', {}, () => 7, () => -1);
+  assert.equal(ok, 7, 'a step that succeeds returns its own value and never calls contain');
 });
