@@ -174,6 +174,14 @@ export const AUTH_POLICY: readonly AuthPolicyRule[] = [
   },
   {
     method: 'POST',
+    pattern: '/m/auth/native-voice-session',
+    realm: 'mobile-session',
+    reason:
+      'Enforced by requireMobileSession, including the device proof; it binds a credential '
+      + 'for widget voice to the native shell key of that same proven phone session.',
+  },
+  {
+    method: 'POST',
     pattern: '/m/auth/origin-handoff/finalize',
     realm: 'mobile-session',
     reason:
@@ -210,6 +218,12 @@ export const AUTH_POLICY: readonly AuthPolicyRule[] = [
     pattern: '/m/push/subscribe',
     realm: 'mobile-session',
     reason: 'Enforced by requireMobileSession inside the mobile router.',
+  },
+  {
+    method: 'POST',
+    pattern: '/m/push/apns',
+    realm: 'mobile-session',
+    reason: 'The native shell registers its APNs token for its own proven session; enforced by requireMobileSession.',
   },
   {
     method: '*',

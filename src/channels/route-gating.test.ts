@@ -28,7 +28,7 @@ test.after(() => {
 const { AUTH_POLICY, classifyRoute, realmFor, EXPECTED_PUBLIC_PATTERNS } = await import('./auth-policy.js');
 const { createMobilePairingCode } = await import('../runtime/mobile-pairing.js');
 
-interface DiscoveredRoute { method: string; path: string }
+interface DiscoveredRoute { method: string; path: string; handlers: string[] }
 
 /**
  * Recursively walks an Express router stack, descending through mounted
@@ -39,7 +39,7 @@ function walkRoutes(stack: unknown[], prefix = ''): DiscoveredRoute[] {
   const found: DiscoveredRoute[] = [];
   for (const rawLayer of stack) {
     const layer = rawLayer as {
-      route?: { path?: unknown; methods?: Record<string, boolean> };
+      route?: { path?: unknown; methods?: Record<string, boolean>; stack?: Array<{ handle?: { name?: string } }> };
       name?: string;
       handle?: { stack?: unknown[] };
       regexp?: RegExp;
@@ -51,7 +51,11 @@ function walkRoutes(stack: unknown[], prefix = ''): DiscoveredRoute[] {
         if (typeof p !== 'string') continue;
         const methods = Object.keys(layer.route.methods ?? {}).filter((m) => m !== '_all');
         for (const method of methods.length > 0 ? methods : ['get']) {
-          found.push({ method: method.toUpperCase(), path: normalizeJoin(prefix, p) });
+          found.push({
+            method: method.toUpperCase(),
+            path: normalizeJoin(prefix, p),
+            handlers: (layer.route.stack ?? []).map((entry) => entry.handle?.name ?? ''),
+          });
         }
       }
       continue;
@@ -105,6 +109,21 @@ test('every reachable route resolves to an explicit realm or the admin default',
     if (!realm) unclassified.push(`${route.method} ${route.path}`);
   }
   assert.deepEqual(unclassified, [], 'every route must resolve to a realm');
+});
+
+test('every phone-session route has an explicit rule, or the global gate refuses every phone', () => {
+  // Live 2026-10-11: POST /m/auth/native-voice-session was session-gated in its
+  // own router but absent from AUTH_POLICY, so the default-deny gate answered
+  // 401 Unauthorized before the router ran and no phone could ever set up
+  // widget voice. A route that asks for a phone session must say so here.
+  const missing = routes
+    .filter((route) => route.handlers.includes('requireMobileSession'))
+    .filter((route) => classifyRoute(route.method, route.path) === undefined)
+    .map((route) => `${route.method} ${route.path}`);
+  assert.ok(routes.some((route) => route.handlers.includes('requireMobileSession')), 'the walk sees session-gated phone routes');
+  assert.deepEqual(missing, []);
+  assert.equal(realmFor('POST', '/m/auth/native-voice-session'), 'mobile-session');
+  assert.equal(realmFor('POST', '/m/push/apns'), 'mobile-session');
 });
 
 test('the public surface is exactly the intended list and cannot grow silently', () => {
