@@ -2147,6 +2147,23 @@ export async function speakVoice(text: string, signal?: AbortSignal): Promise<Bl
   }
 }
 
+/** Whether the Mac can hold a live voice conversation with this phone. */
+export async function liveVoiceStatus(): Promise<{ available: boolean }> {
+  return api<{ available: boolean }>('/m/api/voice/live');
+}
+
+/** The phone's WebRTC offer, exchanged on the Mac for the voice service's
+ *  answer; the key never reaches the phone. */
+export async function startLiveVoiceSession(body: { sdp: string; history: readonly { role: 'user' | 'assistant'; text: string }[] }): Promise<{ sessionId: string; sdp: string }> {
+  try {
+    return await api<{ sessionId: string; sdp: string }>('/m/api/voice/live-session', { method: 'POST', body: JSON.stringify(body) });
+  } catch (error) {
+    const reason = (error as ApiError)?.body as { error?: unknown } | undefined;
+    if (error instanceof Error && typeof reason?.error === 'string') error.message = reason.error;
+    throw error;
+  }
+}
+
 /** A heartbeat as the phone sees it: what it watches and whether its items reach this phone. */
 export interface PhoneHeartbeat {
   id: string;
