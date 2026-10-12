@@ -127,3 +127,27 @@ test('a control acknowledgement never restarts listening merely because it is do
   const answer = { ...question, status: 'done', kind: 'answer', requiresApp: true };
   assert.equal(nativeVoiceStatus(answer).canResumeVoice, false);
 });
+
+test('a notice terminal is never spoken: no app line and no fallback sentence reach the voice', () => {
+  for (const [status, kind, code, text] of [
+    ['cancelled', 'stopped', 'stopped', 'Stopped. Nothing further runs for this turn.'],
+    ['blocked', 'blocked', 'provider_quota', 'No Codex quota is available for this saved agent, so this turn did not start.'],
+    ['failed', 'error', 'run_failed', 'This request stopped on an error before it finished.'],
+    ['blocked', 'blocked', 'response_format_unmet', '```json\n{"value":"fixture"}\n```'],
+  ] as const) {
+    const voiced = nativeVoiceStatus({ sessionId: 'fixture', sourceUserSeq: 14, status, kind, text,
+      notice: { code } });
+    assert.equal(voiced.state, 'needs_app', code);
+    assert.equal(voiced.canResumeVoice, false, code);
+    // The widget speaks `text` whenever it is non-empty, and a missing field
+    // falls back to a spoken line: the explicit empty string keeps it silent.
+    assert.equal(voiced.text, '', code);
+    assert.deepEqual(voiced.notice, { code }, code);
+  }
+  // An unknown code is no notice: Clem's finished answer is still spoken.
+  const answered = nativeVoiceStatus({ sessionId: 'fixture', sourceUserSeq: 14, status: 'done', kind: 'answer',
+    text: 'Done with the fixture.', notice: { code: 'not_a_notice' } as never });
+  assert.equal(answered.state, 'answered');
+  assert.equal(answered.text, 'Done with the fixture.');
+  assert.equal('notice' in answered, false);
+});
