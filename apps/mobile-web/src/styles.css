@@ -4245,6 +4245,12 @@ textarea.cz-input { resize: vertical; }
    default; warning tint only when the harness itself says stopped/uncertain. */
 .reply-state { margin: 6px 0 0; font-size: 13px; color: var(--fg-2); }
 .reply-state-blocked, .reply-state-uncertain { color: var(--accent-deep); }
+/* A turn no model spoke for: the app's status line with the one action that
+   resolves it. It sits where the reply would, quieter than one. */
+.reply-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 6px 0 0; font-size: 13px; color: var(--fg-2); }
+.reply-notice.reply-state-blocked, .reply-notice.reply-state-uncertain, .reply-notice.reply-state-failed { color: var(--accent-deep); }
+.reply-notice-label { font-weight: 600; }
+.reply-notice-detail { flex-basis: 100%; font-size: var(--t-xs); color: var(--fg-3, var(--fg-2)); }
 /* The turn's evidence counts. Quieter than the status line above it: this is
    what the harness proved, not what it needs from you. */
 .reply-evidence { margin: 4px 0 0; font-size: 12px; color: var(--fg-3, var(--fg-2)); }
@@ -4437,6 +4443,7 @@ textarea.cz-input { resize: vertical; }
 .receipt-ok { color: var(--accent-2); font-weight: 650; }
 .receipt-warn { color: var(--accent-warn); font-weight: 600; }
 .receipt-model { flex-basis: 100%; color: var(--fg-2); }
+.receipt-review-note { overflow-wrap: anywhere; }
 
 /* Work outside Clem that the app confirmed: one card per app and kind. */
 .reply-outside { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-3); }

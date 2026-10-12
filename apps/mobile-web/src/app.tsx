@@ -963,6 +963,7 @@ export function App() {
               onListVisibleChange={setChatsListVisible}
               onOpenRun={openRun}
               onOpenNeedsYou={() => navigateTo('inbox')}
+              onOpenSettings={() => navigateTo('settings')}
             />
           ) : tab === 'projects' ? (
             <Projects
