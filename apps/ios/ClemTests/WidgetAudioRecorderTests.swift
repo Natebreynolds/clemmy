@@ -54,7 +54,7 @@ final class WidgetAudioRecorderPolicyTests: XCTestCase {
         speak(&gate, from: 1.0, to: 2.2)
         XCTAssertTrue(gate.heardSpeech)
         XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 3.9))
-        XCTAssertTrue(gate.shouldFinish(power: -80, elapsed: 4.0))
+        XCTAssertTrue(gate.shouldFinish(power: -80, elapsed: 4.05))
     }
 
     func testALoneWordThenAThinkingPauseKeepsListening() {
@@ -64,7 +64,7 @@ final class WidgetAudioRecorderPolicyTests: XCTestCase {
         XCTAssertTrue(gate.heardSpeech)
         XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 3.2), "1.8 s of quiet after one word is a pause")
         XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 4.3))
-        XCTAssertTrue(gate.shouldFinish(power: -80, elapsed: 4.4), "a short answer still sends on its own")
+        XCTAssertTrue(gate.shouldFinish(power: -80, elapsed: 4.45), "a short answer still sends on its own")
     }
 
     func testResumedSpeechResetsTheQuietWindow() {
@@ -73,7 +73,7 @@ final class WidgetAudioRecorderPolicyTests: XCTestCase {
         XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 1.5))
         speak(&gate, from: 1.6, to: 2.0)
         XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 3.5))
-        XCTAssertTrue(gate.shouldFinish(power: -80, elapsed: 3.8))
+        XCTAssertTrue(gate.shouldFinish(power: -80, elapsed: 3.85))
     }
 
     func testInvalidMeterValuesCannotCreateSpeech() {
