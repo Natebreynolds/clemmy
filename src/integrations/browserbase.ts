@@ -5,6 +5,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { browserbaseStoreFile } from './browserbase-setup.js';
 import { readSecret, writeSecret } from '../runtime/secrets/index.js';
+import { syncDirectoryMetadata } from '../runtime/sync-directory.js';
 import { BrowserbaseApiClient, BrowserbaseClientError, type BrowserbaseSession, type BrowserbaseRunningSession } from './browserbase-client.js';
 import { BrowserbaseCdpClient, BrowserbaseCdpError, parseBrowserbaseOperation, type BrowserbaseOperation, type BrowserbasePage, type BrowserbaseCdpResult } from './browserbase-cdp.js';
 
@@ -167,10 +168,11 @@ export class BrowserbaseService {
       if (disk.revision !== this.store.revision) throw new BrowserbaseServiceError('resource_store_conflict');
       const next = { ...this.store, revision: this.store.revision + 1 };
       temp = path.join(this.directory, `.resources-${this.uuid()}.tmp`);
-      writeFileSync(temp, JSON.stringify(next), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-      const fd = openSync(temp, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); }
+      // Flush through the descriptor that wrote the bytes: Windows refuses a
+      // flush through a read-only handle, and nothing earlier flushed them.
+      const fd = openSync(temp, 'wx', 0o600); try { writeFileSync(fd, JSON.stringify(next), 'utf8'); fsyncSync(fd); } finally { closeSync(fd); }
       renameSync(temp, this.file); temp = undefined; this.store.revision = next.revision;
-      try { const dir = openSync(this.directory, 'r'); try { fsyncSync(dir); } finally { closeSync(dir); } } catch { /* Some platforms cannot fsync directories. */ }
+      try { syncDirectoryMetadata(this.directory); } catch { /* Some platforms cannot fsync directories. */ }
       lock.exec('COMMIT');
     } catch (error) { this.storeUnavailable = true; throw new BrowserbaseServiceError(error instanceof BrowserbaseServiceError ? error.code : 'resource_store_unavailable', effect); }
     finally { if (temp) { try { unlinkSync(temp); } catch {} } if (lock) { try { lock.close(); } catch {} } }

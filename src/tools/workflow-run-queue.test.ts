@@ -10,7 +10,7 @@ import fsForInterleave from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, utimesSync } from 'node:fs';
+import { constants, existsSync, mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, utimesSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { createHash } from 'node:crypto';
@@ -1797,6 +1797,73 @@ test('queueWorkflowRun: a verified legacy v1 marker is promoted before its run c
   assert.equal((JSON.parse(readFileSync(markerFile, 'utf-8')) as { version: number }).version, 2);
   unlinkSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`));
   assert.equal(readWorkflowTriggerReceiptAcceptance(receiptId), queued.id);
+});
+
+/** Windows flush rules on any OS: FlushFileBuffers needs write access, so an
+ * fsync through a descriptor opened without write access fails with EPERM.
+ * `refuseWriteOpen` also refuses the write-capable reopen of an existing file
+ * (read-only attribute: EPERM; another process holding it: EBUSY). */
+function withWindowsFlushSemantics<T>(fn: () => T, refuseWriteOpen?: 'EPERM' | 'EBUSY'): T {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  const realOpen = fsForInterleave.openSync;
+  const realFsync = fsForInterleave.fsyncSync;
+  const readOnly = new Set<number>();
+  fsForInterleave.openSync = ((file: Parameters<typeof realOpen>[0], flags: Parameters<typeof realOpen>[1] = 'r', mode?: Parameters<typeof realOpen>[2]) => {
+    const writable = typeof flags === 'number'
+      ? (flags & (constants.O_WRONLY | constants.O_RDWR)) !== 0
+      : /[wa+]/.test(flags);
+    if (refuseWriteOpen && flags === 'r+') {
+      throw Object.assign(new Error(`${refuseWriteOpen}: simulated Windows refusal, open '${String(file)}'`), { code: refuseWriteOpen, syscall: 'open' });
+    }
+    const fd = realOpen(file, flags, mode);
+    if (writable) readOnly.delete(fd); else readOnly.add(fd);
+    return fd;
+  }) as typeof realOpen;
+  fsForInterleave.fsyncSync = ((fd: number) => {
+    if (readOnly.has(fd)) {
+      throw Object.assign(new Error('EPERM: operation not permitted, fsync'), { code: 'EPERM', syscall: 'fsync' });
+    }
+    realFsync(fd);
+  }) as typeof realFsync;
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  syncBuiltinESMExports();
+  try {
+    return fn();
+  } finally {
+    fsForInterleave.openSync = realOpen;
+    fsForInterleave.fsyncSync = realFsync;
+    Object.defineProperty(process, 'platform', platform);
+    syncBuiltinESMExports();
+  }
+}
+
+test('readWorkflowTriggerReceiptAcceptance: Windows flush rules never fail an accepted receipt (3.18.35 boot crash)', () => {
+  writeAuditWorkflow();
+  const receiptId = 'windows-readonly-flush-receipt';
+  const queued = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { triggerReceiptId: receiptId });
+  assert.equal(queued.status, 'queued');
+  assert.ok(existsSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`)), 'the run file is present, so the proof files are flushed');
+  for (const refusal of [undefined, 'EPERM', 'EBUSY'] as const) {
+    assert.equal(
+      withWindowsFlushSemantics(() => readWorkflowTriggerReceiptAcceptance(receiptId), refusal),
+      queued.id,
+      `refusal=${refusal ?? 'none'}`,
+    );
+  }
+  const markerFile = path.join(
+    WORKFLOW_RUNS_DIR,
+    '.trigger-receipts',
+    `${createHash('sha256').update(receiptId).digest('hex')}.json`,
+  );
+  const marker = JSON.parse(readFileSync(markerFile, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(markerFile, JSON.stringify({ ...marker, version: 1 }), 'utf-8');
+  assert.equal(withWindowsFlushSemantics(() => readWorkflowTriggerReceiptAcceptance(receiptId)), queued.id);
+  assert.equal((JSON.parse(readFileSync(markerFile, 'utf-8')) as { version: number }).version, 2, 'the v1 upgrade still runs on Windows');
+  const replay = withWindowsFlushSemantics(
+    () => queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { triggerReceiptId: receiptId }),
+  );
+  assert.equal(replay.status, 'duplicate');
+  assert.equal(replay.id, queued.id);
 });
 
 test('queueWorkflowRun: omits originSessionId when absent for notification-only runs (Gap E)', () => {

@@ -13,6 +13,7 @@ import {
 import path from 'node:path';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { markWorkflowCapabilityNotificationsSettled } from '../runtime/notifications.js';
+import { syncExistingFileBytes } from '../runtime/sync-directory.js';
 import {
   readWorkflowRunRecordUnlocked,
   withWorkflowRunRecordLock,
@@ -101,11 +102,10 @@ function syncDirectory(dir: string): void {
 }
 
 function promoteExistingCancellationDurability(file: string): void {
-  // Windows refuses to flush a read-only handle (EPERM, live 2026-10-07 on the
-  // beta runner); the writer already flushed the bytes before linking.
-  if (process.platform === 'win32') return;
-  const fd = openSync(file, 'r');
-  try { fsyncSync(fd); } finally { closeSync(fd); }
+  // The writer flushed the bytes through its own descriptor before linking.
+  // Windows refuses a flush through a read-only handle; the shared helper owns
+  // that platform rule.
+  syncExistingFileBytes(file);
   syncDirectory(CANCELLATION_DIR);
   syncDirectory(WORKFLOW_RUNS_DIR);
 }

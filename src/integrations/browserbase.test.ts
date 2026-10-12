@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import fs, { constants, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import os from 'node:os';
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-browserbase-tests-'));
@@ -486,5 +487,41 @@ test('starting with a website opens it in the first page, and a second start in 
     const second = await withToolOutputContext({ sessionId: 'task-a', sourceUserSeq: 9 }, () => executeCloudBrowserTool('cloud_browser_start', {}, t.service)) as { rejoined?: boolean; pages: unknown[] };
     assert.equal(second.rejoined, true);
     assert.equal(t.counts().creates, 1, 'a later request in the same chat does not buy a second browser');
+  } finally { t.close(); }
+});
+
+/** Windows flush rules on any OS: fsync through a descriptor opened without
+ * write access fails with EPERM (FlushFileBuffers needs write access). */
+async function withWindowsFlushSemantics<T>(fn: () => Promise<T>): Promise<T> {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  const realOpen = fs.openSync, realFsync = fs.fsyncSync;
+  const readOnly = new Set<number>();
+  fs.openSync = ((file: Parameters<typeof realOpen>[0], flags: Parameters<typeof realOpen>[1] = 'r', mode?: Parameters<typeof realOpen>[2]) => {
+    const writable = typeof flags === 'number' ? (flags & (constants.O_WRONLY | constants.O_RDWR)) !== 0 : /[wa+]/.test(flags);
+    const fd = realOpen(file, flags, mode);
+    if (writable) readOnly.delete(fd); else readOnly.add(fd);
+    return fd;
+  }) as typeof realOpen;
+  fs.fsyncSync = ((fd: number) => {
+    if (readOnly.has(fd)) throw Object.assign(new Error('EPERM: operation not permitted, fsync'), { code: 'EPERM', syscall: 'fsync' });
+    realFsync(fd);
+  }) as typeof realFsync;
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  syncBuiltinESMExports();
+  try { return await fn(); } finally {
+    fs.openSync = realOpen; fs.fsyncSync = realFsync;
+    Object.defineProperty(process, 'platform', platform);
+    syncBuiltinESMExports();
+  }
+}
+test('Windows flush rules: the resource store persists, so the cloud browser stays usable', async () => {
+  const t = setup(); try {
+    await withWindowsFlushSemantics(async () => {
+      await t.service.configure({ projectId: project });
+      const resource = await t.service.create({ conversationId: 'task-win', requestId: 'source-win' });
+      assert.equal(resource.state, 'active');
+    });
+    const store = JSON.parse(readFileSync(path.join(t.baseDir, 'state/browserbase/resources.json'), 'utf8'));
+    assert.equal(store.resources.length, 1);
   } finally { t.close(); }
 });

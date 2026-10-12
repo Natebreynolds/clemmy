@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { constants, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { chmodSync, constants, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { syncDirectoryMetadata } from './sync-directory.js';
+import { syncDirectoryMetadata, syncExistingFileBytes } from './sync-directory.js';
 
 function recordingIo(failure?: 'open' | 'sync' | 'close') {
   const calls: unknown[][] = [];
@@ -68,3 +68,52 @@ test('real POSIX directory flush works and supplied no-follow flags still reject
     assert.throws(() => syncDirectoryMetadata(path.join(root, 'link'), { flags }), error => ['ELOOP', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? ''));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+function scriptedIo(steps: { open?: string; sync?: string } = {}) {
+  const calls: unknown[][] = [];
+  const fail = (code: string) => Object.assign(new Error(`${code} failed`), { code });
+  return {
+    calls,
+    io: {
+      open(file: string, flags: string | number) { calls.push(['open', file, flags]); if (steps.open) throw fail(steps.open); return 41; },
+      sync(fd: number) { calls.push(['sync', fd]); if (steps.sync) throw fail(steps.sync); },
+      close(fd: number) { calls.push(['close', fd]); },
+    },
+  };
+}
+
+test('an existing file is flushed through a writable handle on Windows and a read-only one on POSIX', () => {
+  const win = scriptedIo();
+  assert.equal(syncExistingFileBytes('C:\\Clem\\run.json', { platform: 'win32', io: win.io }), 'synced');
+  assert.deepEqual(win.calls, [['open', 'C:\\Clem\\run.json', 'r+'], ['sync', 41], ['close', 41]]);
+  const posix = scriptedIo();
+  assert.equal(syncExistingFileBytes('/clem/run.json', { platform: 'darwin', io: posix.io }), 'synced');
+  assert.deepEqual(posix.calls, [['open', '/clem/run.json', 'r'], ['sync', 41], ['close', 41]]);
+});
+
+test('a file Windows will not open or flush for writing was flushed by its writer; POSIX errors still surface', () => {
+  for (const code of ['EPERM', 'EACCES', 'EBUSY']) {
+    assert.equal(syncExistingFileBytes('C:\\Clem\\marker.json', { platform: 'win32', io: scriptedIo({ open: code }).io }), 'writer_flushed_on_windows');
+    const flush = scriptedIo({ sync: code });
+    assert.equal(syncExistingFileBytes('C:\\Clem\\marker.json', { platform: 'win32', io: flush.io }), 'writer_flushed_on_windows');
+    assert.deepEqual(flush.calls.at(-1), ['close', 41], 'the handle is closed');
+  }
+  assert.throws(() => syncExistingFileBytes('C:\\Clem\\gone.json', { platform: 'win32', io: scriptedIo({ open: 'ENOENT' }).io }), /ENOENT/);
+  assert.throws(() => syncExistingFileBytes('C:\\Clem\\disk.json', { platform: 'win32', io: scriptedIo({ sync: 'EIO' }).io }), /EIO/);
+  assert.throws(() => syncExistingFileBytes('/clem/run.json', { platform: 'linux', io: scriptedIo({ sync: 'EPERM' }).io }), /EPERM/);
+});
+
+test('a real existing file is flushed on this platform, including one marked read-only', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-sync-file-'));
+  try {
+    const file = path.join(dir, 'receipt.json');
+    writeFileSync(file, '{"runId":"r1"}', { mode: 0o600 });
+    assert.equal(syncExistingFileBytes(file), 'synced');
+    chmodSync(file, 0o444);
+    const result = syncExistingFileBytes(file);
+    assert.equal(result, process.platform === 'win32' ? 'writer_flushed_on_windows' : 'synced');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

@@ -12,6 +12,7 @@ import {
 import path from 'node:path';
 
 import { BASE_DIR } from '../config.js';
+import { syncExistingFileBytes, syncDirectoryMetadata } from '../runtime/sync-directory.js';
 import {
   canonicalEntityJson,
   canonicalEntitySha256,
@@ -32,11 +33,6 @@ function directory(): string {
 
 function receiptPath(receiptId: string): string {
   return path.join(directory(), `${canonicalEntitySha256({ version: 1, receiptId })}.json`);
-}
-
-function fsyncPath(target: string): void {
-  const descriptor = openSync(target, 'r');
-  try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
 }
 
 export function canonicalEntityWorkflowLineageReceiptDigest(input: {
@@ -84,25 +80,34 @@ export function putCanonicalEntityWorkflowLineageReceipt(input: {
         : { ok: false, kind: 'conflict', reason: 'lineage receipt identity is already bound to different bytes' };
     }
     const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
-    writeFileSync(temporary, bytes, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
     // A terminal claim may be published immediately after this function
-    // returns. Flush the inode before linking it into the authoritative name,
-    // then flush the directory after the link/unlink mutation so that claim
-    // can never durably outrun its receipt across a power loss.
-    fsyncPath(temporary);
+    // returns. Flush the inode through the descriptor that wrote it before
+    // linking it into the authoritative name (Windows refuses a flush through a
+    // read-only handle), then flush the directory after the link/unlink
+    // mutation so that claim can never durably outrun its receipt across a
+    // power loss.
+    const descriptor = openSync(temporary, 'wx', 0o600);
     try {
-      linkSync(temporary, target);
-    } catch (error) {
-      const retained = existsSync(target) ? readFileSync(target, 'utf8') : null;
-      if (retained !== bytes) throw error;
-      fsyncPath(target);
-      fsyncPath(directory());
-      return { ok: true, inserted: false, receipt };
+      try {
+        writeFileSync(descriptor, bytes, 'utf8');
+        fsyncSync(descriptor);
+      } finally {
+        closeSync(descriptor);
+      }
+      try {
+        linkSync(temporary, target);
+      } catch (error) {
+        const retained = existsSync(target) ? readFileSync(target, 'utf8') : null;
+        if (retained !== bytes) throw error;
+        syncExistingFileBytes(target);
+        syncDirectoryMetadata(directory());
+        return { ok: true, inserted: false, receipt };
+      }
     } finally {
       try { unlinkSync(temporary); } catch { /* orphan temp is non-authoritative */ }
     }
-    fsyncPath(target);
-    fsyncPath(directory());
+    syncExistingFileBytes(target);
+    syncDirectoryMetadata(directory());
     return { ok: true, inserted: true, receipt };
   } catch (error) {
     return { ok: false, kind: 'storage_error', reason: error instanceof Error ? error.message : String(error) };

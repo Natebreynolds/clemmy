@@ -1,4 +1,6 @@
-/** Directory metadata flush is separate from file fsync and atomic publication. */
+/** Directory metadata flush is separate from file fsync and atomic publication.
+ * The same module promotes an existing file's bytes (written and linked by
+ * another writer) to durable storage. */
 import { closeSync, fsyncSync, openSync } from 'node:fs';
 
 interface DirectorySyncIo {
@@ -32,5 +34,44 @@ export function syncDirectoryMetadata(directory: string, options: {
   const io = options.io ?? nativeIo;
   const fd = io.open(directory, options.flags ?? 'r');
   try { io.sync(fd); } finally { io.close(fd); }
+  return 'synced';
+}
+
+/** Windows answers these when a file cannot be opened for writing: a
+ * read-only attribute, an access rule, or another process holding it. */
+const WINDOWS_UNWRITABLE = new Set(['EPERM', 'EACCES', 'EBUSY']);
+
+/**
+ * Flush an existing file's bytes, whoever wrote them.
+ *
+ * POSIX flushes through a read-only handle. Windows refuses to flush a handle
+ * without write access (EPERM, every time), so there the file is opened for
+ * writing without truncation and flushed; Windows flushes the file's cached
+ * data, not one handle's. A file Windows will not open for writing was
+ * flushed by its writer before it was published, so that is reported, not
+ * thrown. POSIX errors propagate unchanged.
+ */
+export function syncExistingFileBytes(file: string, options: {
+  /** Narrow test seams; production uses the current OS and Node filesystem. */
+  platform?: NodeJS.Platform;
+  io?: DirectorySyncIo;
+} = {}): 'synced' | 'writer_flushed_on_windows' {
+  const io = options.io ?? nativeIo;
+  const windows = (options.platform ?? process.platform) === 'win32';
+  let fd: number;
+  try {
+    fd = io.open(file, windows ? 'r+' : 'r');
+  } catch (error) {
+    if (windows && WINDOWS_UNWRITABLE.has((error as NodeJS.ErrnoException)?.code ?? '')) return 'writer_flushed_on_windows';
+    throw error;
+  }
+  try {
+    io.sync(fd);
+  } catch (error) {
+    if (!windows || !WINDOWS_UNWRITABLE.has((error as NodeJS.ErrnoException)?.code ?? '')) throw error;
+    return 'writer_flushed_on_windows';
+  } finally {
+    io.close(fd);
+  }
   return 'synced';
 }
