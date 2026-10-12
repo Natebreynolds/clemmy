@@ -84,6 +84,16 @@ export function liveVoiceHistory(raw: unknown): LiveVoiceHistoryItem[] {
   return kept.reverse();
 }
 
+/** Whether an OpenAI error body says the account has no credit left. */
+export function openAiOutOfCredit(body: string): boolean {
+  try {
+    const error = (JSON.parse(body) as { error?: { type?: unknown; code?: unknown } }).error;
+    return error?.type === 'insufficient_quota' || error?.code === 'insufficient_quota' || error?.code === 'credit_balance_exhausted';
+  } catch {
+    return false;
+  }
+}
+
 export interface LiveVoiceStatus {
   available: boolean;
   reason?: string;
@@ -124,7 +134,7 @@ export type LiveVoiceSessionResult =
   | {
     ok: false;
     status: number;
-    code: 'LIVE_VOICE_BAD_OFFER' | 'LIVE_VOICE_NEEDS_KEY' | 'LIVE_VOICE_KEY_UNREADABLE' | 'LIVE_VOICE_KEY_REFUSED' | 'LIVE_VOICE_UNAVAILABLE' | 'LIVE_VOICE_FAILED';
+    code: 'LIVE_VOICE_BAD_OFFER' | 'LIVE_VOICE_NEEDS_KEY' | 'LIVE_VOICE_KEY_UNREADABLE' | 'LIVE_VOICE_KEY_REFUSED' | 'LIVE_VOICE_UNAVAILABLE' | 'LIVE_VOICE_NO_CREDIT' | 'LIVE_VOICE_BUSY' | 'LIVE_VOICE_FAILED';
     error: string;
   };
 
@@ -171,8 +181,16 @@ export async function createLiveVoiceSession(
     return { ok: false, status: 502, code: 'LIVE_VOICE_FAILED', error: `The voice service could not be reached (${reason}).` };
   }
   if (!response.ok) {
-    const detail = redactSensitiveText(await response.text().catch(() => '')).slice(0, 400);
+    const raw = await response.text().catch(() => '');
+    const detail = redactSensitiveText(raw).slice(0, 400);
     logger.warn({ status: response.status, detail }, 'live voice session was refused');
+    if (response.status === 429) {
+      // The service answers 429 both for an account with no credit left and
+      // for a momentary rate limit; the error type tells them apart.
+      return openAiOutOfCredit(raw)
+        ? { ok: false, status: 409, code: 'LIVE_VOICE_NO_CREDIT', error: 'The OpenAI account is out of credit. Add credit in the OpenAI billing settings to use live voice.' }
+        : { ok: false, status: 503, code: 'LIVE_VOICE_BUSY', error: 'The voice service is busy right now. Try again in a moment.' };
+    }
     if (response.status === 401) {
       return { ok: false, status: 409, code: 'LIVE_VOICE_KEY_REFUSED', error: 'The saved OpenAI key was refused for live voice.' };
     }

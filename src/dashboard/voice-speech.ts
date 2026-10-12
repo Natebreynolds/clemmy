@@ -14,6 +14,7 @@ import pino from 'pino';
 import { getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { toSpokenSentences } from './spoken-text.js';
+import { openAiOutOfCredit } from './live-voice.js';
 
 /** The most a single spoken reply says aloud; the rest stays on screen. */
 export const SPOKEN_REPLY_MAX_CHARS = 900;
@@ -91,6 +92,9 @@ export async function requestSpeech(text: string, signal?: AbortSignal): Promise
   if (!response.ok || !response.body) {
     const detail = await response.text().catch(() => '');
     logger.warn({ status: response.status, detail: redactSensitiveText(detail).slice(0, 300), chars: text.length }, 'voice speech failed');
+    if (response.status === 429 && openAiOutOfCredit(detail)) {
+      return { ok: false, status: 409, error: 'The OpenAI account is out of credit; using this computer’s voice.', fallback: 'system' };
+    }
     return { ok: false, status: 502, error: `The speech service answered HTTP ${response.status}.` };
   }
   return { ok: true, response, contentType: response.headers.get('content-type') || 'audio/mpeg' };

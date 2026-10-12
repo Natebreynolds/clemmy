@@ -97,6 +97,11 @@ test('a missing offer, a missing key and service refusals each say what happened
   assert.ok(!refused.ok && refused.code === 'LIVE_VOICE_KEY_REFUSED');
   const unavailable = await withKey('sk-synthetic-live', () => live.createLiveVoiceSession({ sdp: offer }, undefined, answering(404)));
   assert.ok(!unavailable.ok && unavailable.code === 'LIVE_VOICE_UNAVAILABLE');
+  const noCredit = (async () => new Response('{"error":{"message":"You have no credits remaining.","type":"insufficient_quota","code":"credit_balance_exhausted"}}', { status: 429 })) as unknown as typeof fetch;
+  const outOfCredit = await withKey('sk-synthetic-live', () => live.createLiveVoiceSession({ sdp: offer }, undefined, noCredit));
+  assert.ok(!outOfCredit.ok && outOfCredit.code === 'LIVE_VOICE_NO_CREDIT' && /out of credit/.test(outOfCredit.error));
+  const busy = await withKey('sk-synthetic-live', () => live.createLiveVoiceSession({ sdp: offer }, undefined, answering(429)));
+  assert.ok(!busy.ok && busy.code === 'LIVE_VOICE_BUSY');
   const failed = await withKey('sk-synthetic-live', () => live.createLiveVoiceSession({ sdp: offer }, undefined, answering(500)));
   assert.ok(!failed.ok && failed.code === 'LIVE_VOICE_FAILED' && failed.status === 502);
   const empty = (async () => new Response('{}', { status: 201 })) as unknown as typeof fetch;
