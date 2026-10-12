@@ -47,17 +47,31 @@ export type SpeechRequestResult =
 
 /** Ask the speech service to say `text`; the audio streams in the response. */
 export async function requestSpeech(text: string, signal?: AbortSignal): Promise<SpeechRequestResult> {
-  const key = getOpenAiApiKey();
+  let key: string;
+  let base: string;
+  let model: string;
+  let voice: string;
+  try {
+    key = getOpenAiApiKey();
+    base = getRuntimeEnv('OPENAI_BASE_URL', 'https://api.openai.com/v1').replace(/\/+$/, '');
+    model = getRuntimeEnv('OPENAI_TTS_MODEL', DEFAULT_SPEECH_MODEL);
+    voice = getRuntimeEnv('OPENAI_TTS_VOICE', DEFAULT_SPEECH_VOICE);
+  } catch (error) {
+    // A saved key whose privacy cannot be verified is not read; the reply is
+    // still heard, in the computer's own voice.
+    const reason = error instanceof Error ? error.message : String(error);
+    logger.warn({ reason: redactSensitiveText(reason).slice(0, 300) }, 'voice speech could not read its saved key');
+    return { ok: false, status: 409, error: 'The saved OpenAI key could not be read safely; using this computer’s voice.', fallback: 'system' };
+  }
   if (!key) return { ok: false, status: 409, error: 'Voice replies need an OpenAI key; using this computer’s voice.', fallback: 'system' };
-  const base = getRuntimeEnv('OPENAI_BASE_URL', 'https://api.openai.com/v1').replace(/\/+$/, '');
   let response: Response;
   try {
     response = await fetch(`${base}/audio/speech`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: getRuntimeEnv('OPENAI_TTS_MODEL', DEFAULT_SPEECH_MODEL),
-        voice: getRuntimeEnv('OPENAI_TTS_VOICE', DEFAULT_SPEECH_VOICE),
+        model,
+        voice,
         input: text,
         instructions: SPEECH_DELIVERY,
         response_format: 'mp3',

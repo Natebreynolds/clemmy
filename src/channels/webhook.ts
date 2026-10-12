@@ -1,4 +1,5 @@
 import express from 'express';
+import { containAsyncRouteRejections } from './contain-async-route-rejections.js';
 import { registerConnectionSetupRoutes } from './connection-setup-routes.js';
 import pino from 'pino';
 import { withDaemonRuntimePhase } from '../daemon/phase.js';
@@ -1387,6 +1388,7 @@ async function resolveApprovalOrQueueBackgroundContinuation(
  * declares an auth realm). Nothing here listens; callers bind the app.
  */
 export async function buildWebhookApp(assistant: ClementineAssistant): Promise<express.Express> {
+  containAsyncRouteRejections();
   const app = express();
   // Explicit: req.ip must stay the socket peer. Ingress classification is
   // decided by which listener a request arrived on (see mobile-ingress.ts),
