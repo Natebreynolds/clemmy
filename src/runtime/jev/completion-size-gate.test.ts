@@ -137,7 +137,10 @@ function skipRows(): Array<Record<string, unknown>> {
 }
 
 // ~100k characters of evidence (clipped to the state budget): estimated well above a 13.8k-token bar.
-const BIG_EVIDENCE = Array.from({ length: 3_000 }, (_, i) => `row ${i}: value ${i * 7} status ok`).join('\n');
+// Above the size bar in tokens, yet whole within the review's evidence budget:
+// the size gate, not clipping, decides.
+const BIG_EVIDENCE = Array.from({ length: 2_000 }, (_, i) => `row ${i}: value ${i * 7} status ok`).join('\n');
+const CLIPPED_EVIDENCE = Array.from({ length: 3_000 }, (_, i) => `row ${i}: value ${i * 7} status ok`).join('\n');
 
 test('a screen Jev has never settled at this size is not made, and the skip is logged with its reason', async () => {
   seedLog(COMPLETION_GATE_MIN_OBSERVATIONS);
@@ -159,6 +162,19 @@ test('a screen Jev has never settled at this size is not made, and the skip is l
   assert.equal(context.observedAboveBar, COMPLETION_GATE_MIN_OBSERVATIONS);
   assert.equal(context.largestSettledTokens, 12_000);
   assert.ok(Number(context.expectedTokens) > 13_800);
+});
+
+test('a screen whose evidence would be clipped is not made: the configured reviewer reads it whole', async () => {
+  seedLog(COMPLETION_GATE_MIN_OBSERVATIONS);
+  const jev = countingJev();
+  const verdict = await tryJevCompletionVerdict('List every row', 'Here are the rows.', {
+    screening: true, sessionId: 'clipped', toolCallSummary: CLIPPED_EVIDENCE,
+  });
+  assert.equal(verdict, null);
+  assert.equal(jev.calls(), 0);
+  const row = skipRows().at(-1)!;
+  assert.equal(row.reason, 'evidence_text_clipped');
+  assert.equal((row.context as Record<string, unknown>).evidenceClipped, true);
 });
 
 test('without the screening flag (the reviewer could not run) Jev is always asked, whatever the size', async () => {
