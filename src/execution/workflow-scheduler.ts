@@ -1013,7 +1013,19 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       // The queue's existing immutable receipt is the completion cursor. It
       // survives scheduler-state loss and queue-file retirement, and is only
       // minted when that exact occurrence has durably entered the run queue.
-      const accepted = readWorkflowTriggerReceiptAcceptance(`workflow-schedule:v1:${entry.name}:${onceAtMs}`);
+      let accepted: string | null;
+      try {
+        accepted = readWorkflowTriggerReceiptAcceptance(`workflow-schedule:v1:${entry.name}:${onceAtMs}`);
+      } catch (err) {
+        // Unknown is not "not accepted": leave this workflow's durable pending
+        // state exactly as it was (a pending fire still replays through the
+        // queue's own receipt check) and keep discovering the others.
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err), workflow: wf.name },
+          'One-time workflow receipt could not be read; occurrence left unchanged for a later tick',
+        );
+        continue;
+      }
       if (accepted) {
         delete state.pendingByWorkflow[dedupeKey];
         result.deduped.push(wf.name);
@@ -1231,7 +1243,16 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
           payload: { workflowName, schedule, reason: 'backpressure', pending },
         });
         markWorkflowOccurrenceHandled(state, dedupeKey, occurrence);
-        saveScheduleState(state);
+        try {
+          saveScheduleState(state);
+        } catch (err) {
+          // The occurrence stays pending on disk; the next tick re-evaluates
+          // the same backpressure. Other candidates still get their turn.
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err), workflow: workflowName },
+            'Could not persist backpressure-handled workflow occurrence; it will be re-evaluated',
+          );
+        }
         try {
           recordProspectiveOutcome(
             prospectiveId,
@@ -1407,11 +1428,20 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       } catch { /* best-effort control-plane receipt */ }
     }
   }
-  const intervalResult = await processWorkflowIntervalSchedules(workflows, now);
-  result.fired.push(...intervalResult.fired);
-  result.held.push(...intervalResult.held);
-  result.deferred.push(...intervalResult.deferred);
-  result.deduped.push(...intervalResult.deduped);
+  try {
+    const intervalResult = await processWorkflowIntervalSchedules(workflows, now);
+    result.fired.push(...intervalResult.fired);
+    result.held.push(...intervalResult.held);
+    result.deferred.push(...intervalResult.deferred);
+    result.deduped.push(...intervalResult.deduped);
+  } catch (err) {
+    // Interval occurrences are checkpointed in their own state file and retry
+    // next tick; a failure there must not discard the cron/once-at result.
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Interval workflow scheduling tick failed; pending interval occurrences retry next tick',
+    );
+  }
   return result;
 }
 
