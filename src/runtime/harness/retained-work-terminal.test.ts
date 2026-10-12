@@ -59,6 +59,7 @@ function admitProviderCall(input: {
   logicalToolCallId: string;
   toolName: string;
   args: unknown;
+  executionSite?: 'host';
 }) {
   const begun = dispatch.beginPhysicalDispatch({
     identity: {
@@ -69,6 +70,7 @@ function admitProviderCall(input: {
     },
     tool: input.toolName,
     args: input.args,
+    ...(input.executionSite ? { executionSite: input.executionSite } : {}),
   });
   assert.equal(begun.status, 'inserted', JSON.stringify(begun));
   if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
@@ -105,6 +107,27 @@ function settleRead(task: ReturnType<typeof accept>, count = 8): string {
   if (settled.status !== 'committed') throw new Error('fixture read did not settle');
   assert.ok(settled.settlement.resultHandleId);
   return settled.settlement.resultHandleId!;
+}
+
+/** A completed read that ran on this machine: the ledger proves nothing
+ * outside it ran, yet the result is retained for the next turn. */
+function settleHostRead(task: ReturnType<typeof accept>): string {
+  const logicalToolCallId = `logical:local-read-${task.sourceUserSeq}`;
+  const toolName = 'read_file';
+  const args = { path: '/fixture/operators.json' };
+  admitProviderCall({ task, logicalToolCallId, toolName, args, executionSite: 'host' });
+  const settled = settlements.commitLogicalCallSettlement({
+    identity: { ...task, logicalToolCallId },
+    contract: { toolName, args },
+    execution: { kind: 'local_execution' },
+    result: { payload: { successful: true, data: { records: [{ id: 'operator-1' }], complete: true } } },
+    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: false },
+    observer: { lane: 'agents_runner', turn: task.turn },
+  });
+  assert.equal(settled.status, 'committed', JSON.stringify(settled));
+  if (settled.status !== 'committed' || !settled.settlement.resultHandleId) throw new Error('fixture host read did not settle');
+  return settled.settlement.resultHandleId;
 }
 
 function settleWrite(
@@ -406,4 +429,36 @@ test('without a redeemable successful result, the generic fallback remains exact
     question,
     'a clarification with no retained work stays byte-exact',
   );
+});
+
+test('an owner Stop over a host-only uncertain block keeps the checkpoint, so the projection carries the stopped notice and the kept count', async () => {
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const { OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT } = await import('./terminal-notice.js');
+  const task = accept('Read the operators, then stop.');
+  // The committer turns only a provably effect-free block into an owner Stop.
+  const handleId = settleHostRead(task);
+  const attempt = eventlog.beginRunAttempt(task.sessionId, { runId: `owner-stop-kept-${task.sourceUserSeq}` });
+  eventlog.bindRunAttemptSourceUserEvent(attempt, task.sourceUserSeq);
+  eventlog.requestKill(task.sessionId, 'owner stop', { attemptId: attempt.attemptId });
+  // The runner already appended the checkpoint after its own fixed copy.
+  const runnerText = retained.renderFailureWithRetainedWork({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    fallbackText: hostRunner.HOST_TOOL_UNCERTAIN_BLOCKED_TEXT,
+  });
+  assert.match(runnerText, /Retained work \(durable checkpoint\):/);
+
+  const committed = delivery.commitTurnOutcome(
+    blockedOutcome(task, runnerText),
+    { metadata: { blockedReason: 'tool_effect_uncertain' } },
+  );
+
+  assert.equal(committed.presentation.status, 'cancelled');
+  assert.ok(committed.presentation.text.startsWith(OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT));
+  assert.ok(committed.presentation.text.includes(`retained as ${handleId}`),
+    'the durable Stop keeps the redeemable handle for the next turn');
+  const data = projectHarnessEventForPublic(committed.event)!.data as Record<string, unknown>;
+  assert.equal(data.reply, OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT);
+  assert.deepEqual(data.notice, { code: 'stopped' });
+  assert.deepEqual(data.retained, { results: 1, outsideChange: 'none' });
 });

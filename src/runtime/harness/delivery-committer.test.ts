@@ -779,10 +779,12 @@ for (const issue of ['missing', 'malformed', 'partial', 'uncertain', 'positive_c
     } });
     const before = listEvents(sessionId).filter(row => /model|goal_alignment/.test(row.type)).map(row => row.id);
     const committed = commitTurnOutcome(outcome);
-    // A reviewer that answered but could not qualify the exact answer never
-    // fired a finding: the turn follows the brain and the chip says unchecked.
+    // A reviewer that answered but could not qualify the exact answer keeps
+    // the unverified hold: Clem's words unchanged, blocked and resumable, and
+    // the chip says unchecked. No sentence is added under her answer.
     assert.equal(committed.presentation.text, outcome.presentation.text);
-    assert.equal(committed.presentation.status, 'done');
+    assert.equal(committed.presentation.status, 'blocked');
+    assert.equal(committed.presentation.resumable, true);
     assert.equal(committed.event.data.review, 'unchecked');
     assert.equal(committed.event.data.reviewNote, undefined);
     const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
@@ -820,8 +822,8 @@ test('the answered-unqualified note and disposition cannot move to a different o
     assert.equal(verdict.verified, false);
     assert.equal(verdict.reviewDisposition, undefined);
     assert.equal(committed.presentation.text, outcome.presentation.text);
-    // The disposition does not follow a different input, so neither does the
-    // follow-the-brain status: a join mismatch still holds.
+    // The disposition does not follow a different input: a join mismatch
+    // holds, and the chip says unchecked.
     assert.equal(committed.presentation.status, 'blocked');
     assert.equal(committed.event.data.review, 'unchecked');
   }

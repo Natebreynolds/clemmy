@@ -94,6 +94,8 @@ const REVIEW_CAUSES: ReadonlyArray<{
   status: 'done' | 'blocked';
   note?: string;
   notice?: string;
+  /** The verdict was recorded against different reply bytes. */
+  otherReply?: true;
 }> = [
   { cause: 'reviewed', verdict: () => ({ fulfills: true, settledEvidenceAvailable: true }), review: 'checked', status: 'done' },
   { cause: 'unavailable', verdict: () => ({ fulfills: true, failedOpen: true, reviewFailure: 'unavailable',
@@ -102,7 +104,7 @@ const REVIEW_CAUSES: ReadonlyArray<{
     reason: 'The completion reviewer timed out; no review was completed.' }), review: 'unchecked', status: 'done' },
   { cause: 'answered_unqualified', verdict: () => ({ fulfills: false, failedOpen: true, reviewFailure: 'invalid',
     reviewDisposition: 'answered_unqualified', reason: 'The required same-output assessment was missing.' }),
-  review: 'unchecked', status: 'done' },
+  review: 'unchecked', status: 'blocked' },
   { cause: 'negative', verdict: () => ({ fulfills: false, reason: 'The count in the reply does not match the read.' }),
     review: 'rejected', status: 'blocked', note: 'The count in the reply does not match the read.' },
   { cause: 'format_only', verdict: () => ({ fulfills: false, repairScope: 'reply_format',
@@ -113,10 +115,22 @@ const REVIEW_CAUSES: ReadonlyArray<{
     responseFormatContract: { kind: 'whole_json_object', candidateValid: false },
     reason: `The total omits one office.\n${WHOLE_JSON_OBJECT_FORMAT_FINDING}` }),
   review: 'rejected', status: 'blocked', note: 'The total omits one office.', notice: 'response_format_unmet' },
+  // A finished answer never carries a notice: clients draw a notice terminal
+  // in place of the bubble, so a notice here would hide Clem's answer.
+  { cause: 'format_miss_review_unreachable', verdict: () => ({ fulfills: true, failedOpen: true, reviewFailure: 'unavailable',
+    responseFormatContract: { kind: 'whole_json_object', candidateValid: false },
+    reason: 'The fixture reviewer route was unavailable.' }), review: 'unchecked', status: 'done' },
+  // A negative verdict about other reply bytes is not a finding about these.
+  { cause: 'negative_other_reply', verdict: () => ({ fulfills: false, replyDigest: sha('An earlier draft of the answer.'),
+    reason: 'The earlier draft claims all offices grew.' }), review: 'unchecked', status: 'blocked', otherReply: true },
+  { cause: 'format_other_reply', verdict: () => ({ fulfills: false, replyDigest: sha('An earlier draft of the answer.'),
+    responseFormatContract: { kind: 'whole_json_object', candidateValid: false },
+    reason: `The earlier draft omits one office.\n${WHOLE_JSON_OBJECT_FORMAT_FINDING}` }),
+  review: 'unchecked', status: 'blocked', otherReply: true },
   { cause: 'objective_mismatch', verdict: () => ({ fulfills: true, objectiveDigest: sha('A different request.') }),
     review: 'unchecked', status: 'blocked' },
   { cause: 'reply_mismatch', verdict: () => ({ fulfills: true, replyDigest: sha('A different reply.') }),
-    review: 'unchecked', status: 'blocked' },
+    review: 'unchecked', status: 'blocked', otherReply: true },
   { cause: 'evidence_unreadable', verdict: () => ({ fulfills: true, settledEvidenceAvailable: false }),
     review: 'unchecked', status: 'blocked' },
   { cause: 'host_evidence_hold', verdict: () => ({ fulfills: true, inheritedReadReviewRequired: true }),
@@ -142,8 +156,10 @@ for (const entry of REVIEW_CAUSES) {
     assert.doesNotMatch(JSON.stringify(data), /owner required one whole-output JSON object/,
       'the host format finding is model-facing and never quoted');
     const ref = committed.event.data.completionVerdictRef as Record<string, unknown>;
-    assert.equal(ref.deliveredTextIsJudgedText, entry.cause !== 'reply_mismatch',
+    assert.equal(ref.deliveredTextIsJudgedText, entry.otherReply !== true,
       'judged-text equality is the real byte comparison of the published text');
+    if (entry.otherReply) assert.doesNotMatch(JSON.stringify(data), /earlier draft/i,
+      'a finding about other reply bytes is never quoted beside these');
   });
 }
 

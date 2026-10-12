@@ -1202,7 +1202,9 @@ export function commitTurnOutcome(
     if (stopped) {
       // The owner's own Stop is app chrome, not something Clem says: an
       // app-voice line for the CLI, channels and model history, plus a notice
-      // the clients render as the Stop pill. What was kept travels as counts.
+      // the clients render as the Stop pill. The retained-work checkpoint is
+      // re-projected from the ledger onto this line below, so the durable row
+      // keeps its handles and what was kept travels as counts.
       effectiveOutcome = {
         ...effectiveOutcome,
         status: 'cancelled',
@@ -1547,15 +1549,20 @@ export function commitTurnOutcome(
   // carry no review state at all.
   const reviewApplies = outcome.status === 'done'
     && (effectiveOutcome.status === 'done' || effectiveOutcome.status === 'blocked');
-  // The format miss on the exact judged reply is an app notice, whatever the
-  // semantic verdict said: the owner asked for one shape and did not get it.
+  // The format miss on the exact judged reply, for the request it was judged
+  // against. It becomes an app notice only on a terminal that is not a
+  // finished answer (see below), whatever the semantic verdict said.
   const formatUnmetNotice = reviewApplies && reviewWasEnabled
-    && publishedVerdict?.responseFormatUnmet === true && replyMatches;
+    && publishedVerdict?.responseFormatUnmet === true && objectiveMatches && replyMatches;
   const reviewState: TerminalReviewState | undefined = (() => {
     if (!reviewApplies || !reviewWasEnabled || reviewDisposition === 'not_required') return undefined;
     if (verdictTrustworthy) return 'checked';
     if (!verificationRequired) return undefined;
     if (!publishedVerdict) return 'unchecked';
+    // A verdict recorded against another request, reply or plan says nothing
+    // about the text being published: unchecked, and none of its findings are
+    // quoted beside words the owner is not reading.
+    if (!objectiveMatches || !replyMatches || !planMatches) return 'unchecked';
     // A host evidence hold is not a reviewer finding: the saved evidence the
     // review rested on changed, so the result needs a fresh check.
     if (publishedVerdict.hostEvidenceHold === true) return 'needs_recheck';
@@ -1651,8 +1658,10 @@ export function commitTurnOutcome(
     //
     // A reviewer that answered but could not qualify the exact authored answer
     // (`answered_unqualified`: its assessment was missing, malformed or
-    // unbound) is the same case: it never fired a finding. It follows the
-    // brain too, on the same joins.
+    // unbound) keeps the unverified hold: blocked and resumable, Clem's words
+    // unchanged, the chip unchecked. Whether it should follow the brain like an
+    // unreachable reviewer is a review-policy decision of its own, not part of
+    // how the result is worded.
     //
     // Honesty is kept exactly where it belongs. The review chip says the result
     // is unchecked, and the verdict record still carries verified:false with
@@ -1677,8 +1686,8 @@ export function commitTurnOutcome(
       && artifactsMatch
       && (!artifactsRequired || coverageComplete);
     const reviewCouldNotFire = detail === 'completion_review_failed_open'
-      && (publishedVerdict?.fulfills === true || answeredUnqualified)
-      && publishedVerdict?.hostEvidenceHold !== true
+      && publishedVerdict?.fulfills === true
+      && publishedVerdict.hostEvidenceHold !== true
       && joinsStand;
     unverifiedHoldFallback = reviewCouldNotFire
       ? () => unverifiedCompletionOutcome(reviewedOutcome, true)
@@ -1692,13 +1701,21 @@ export function commitTurnOutcome(
       metadata: { ...(effectiveOptions.metadata ?? {}), verificationDetail: detail },
     };
   }
-  if (formatUnmetNotice && effectiveOptions.metadata?.hostNotice === undefined) {
-    // The owner asked for one whole JSON object and the reviewed reply is not
-    // one. Nothing is added to a reply that must be JSON only; the miss is an
-    // app notice beside Clem's own words.
+  // The owner asked for one whole JSON object and the reviewed reply is not
+  // one. Nothing is added to a reply that must be JSON only. On the hold that
+  // keeps Clem's draft the miss is an app notice. A finished answer never
+  // carries a notice: clients draw a notice terminal as app status in place of
+  // the bubble, so a notice there would hide Clem's answer; its review chip
+  // carries the state instead.
+  const withFormatUnmetNotice = (
+    status: TurnOutcome['status'],
+    options: DeliveryCommitOptions,
+  ): DeliveryCommitOptions => {
+    if (!formatUnmetNotice || status === 'done' || options.metadata?.hostNotice !== undefined) return options;
     const hostNotice: TerminalNotice = { code: 'response_format_unmet' };
-    effectiveOptions = { ...effectiveOptions, metadata: { ...(effectiveOptions.metadata ?? {}), hostNotice } };
-  }
+    return { ...options, metadata: { ...(options.metadata ?? {}), hostNotice } };
+  };
+  effectiveOptions = withFormatUnmetNotice(effectiveOutcome.status, effectiveOptions);
   // The review chip for the exact text being published, derived here from the
   // durable verdict rather than accepted from caller metadata.
   const reviewMetadata = reviewState
@@ -1809,6 +1826,7 @@ export function commitTurnOutcome(
     // changes; only the outcome does.
     if (unverifiedHoldFallback) {
       effectiveOutcome = unverifiedHoldFallback();
+      effectiveOptions = withFormatUnmetNotice(effectiveOutcome.status, effectiveOptions);
       const heldPresentation = presentationEventForOutcome(effectiveOutcome);
       data = {
         ...completionDataForTurnOutcome(effectiveOutcome, effectiveOptions),
