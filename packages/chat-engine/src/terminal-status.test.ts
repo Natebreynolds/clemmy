@@ -9,6 +9,7 @@ import {
   cardDecisionNoticeOnly,
   retainedOutsideChange,
   terminalNoticeLine,
+  terminalNoticeVoiceFact,
   terminalStatusPill,
 } from './terminal-status.js';
 import type { RetainedOutsideChange, TerminalFacts, TerminalNoticeCode } from './types.js';
@@ -118,4 +119,27 @@ test('no status line, chip or notice the app writes ever speaks as Clem', () => 
   }
   assert.ok(seen.length > 100);
   for (const label of seen) assert.doesNotMatch(label, firstPerson, label);
+});
+
+test('live voice gets a notice as its typed fact, never its wording, and nothing for a chosen stop or a card decision', () => {
+  const fact = terminalNoticeVoiceFact({
+    notice: { code: 'provider_out_of_credit', model: 'Vendor V4', agentName: 'Desk', providerSaid: 'Insufficient balance.' },
+    retained: { results: 2, outsideChange: 'none' },
+  });
+  assert.ok(fact);
+  assert.match(fact!, /provider_out_of_credit \(model: Vendor V4; agent: Desk\)/);
+  assert.match(fact!, /The provider said: Insufficient balance\./);
+  assert.match(fact!, /Add credit/);
+  assert.match(fact!, /2 results kept/);
+  assert.match(fact!, /not Clem's words/);
+  const line = terminalNoticeLine({ status: 'failed', notice: { code: 'provider_out_of_credit', model: 'Vendor V4' } });
+  assert.equal(fact!.includes(line!.label), false, 'the status line wording is not handed over');
+  assert.equal(terminalNoticeVoiceFact({ notice: { code: 'stopped' } }), null);
+  assert.equal(terminalNoticeVoiceFact({ notice: { code: 'card_decision' } }), null);
+  assert.equal(terminalNoticeVoiceFact({ retained: { results: 3, outsideChange: 'none' } }), null);
+  assert.equal(terminalNoticeVoiceFact(undefined), null);
+  for (const code of ALL_NOTICES) {
+    const said = terminalNoticeVoiceFact({ notice: { code } });
+    if (said) assert.match(said, new RegExp(`: ${code}\\.`), code);
+  }
 });

@@ -960,3 +960,21 @@ test('a reopened turn carries its typed facts, and a notice reopens with no repl
   assert.equal(answered?.terminal?.review, 'unchecked');
   assert.equal(answered?.terminal?.reviewNote, 'The reviewer could not read the file back.');
 });
+
+test('phone: a reopened draft held for its format keeps Clem’s words with the notice beside them', () => {
+  const draft = '```json\n{"value":"fixture"}\n```\nIts completeness is unknown.';
+  const [held] = foldTranscript([
+    ev(1, 'user_input_received', { text: 'Return exactly one JSON object.' }),
+    ev(2, 'conversation_completed', {
+      sourceUserSeq: 1,
+      reply: draft,
+      presentation: { status: 'blocked', kind: 'answer', text: draft },
+      turnOutcome: { status: 'blocked', resumable: true },
+      review: 'rejected',
+      notice: { code: 'response_format_unmet' },
+    }),
+  ]).filter((m) => m.role === 'assistant');
+  assert.equal(held?.text, draft);
+  assert.equal(held?.terminal?.notice?.code, 'response_format_unmet');
+  assert.equal(held?.terminal?.review, 'rejected');
+});

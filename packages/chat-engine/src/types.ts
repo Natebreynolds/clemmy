@@ -347,10 +347,12 @@ export interface TerminalFacts {
    *  machine. Present only when something was kept or an outside change has a
    *  settled state. Drawn on the status pill, never as prose. */
   retained?: TerminalRetained;
-  /** The app's own status for a turn no model spoke for (a stop, a provider
-   *  refusal, a missing model). The terminal's text is app wording for
-   *  channels and history; desktop and phone draw this as a status line and
-   *  show no reply, and voice never speaks it. */
+  /** The app's own status for the turn, drawn as a status line. For a turn
+   *  no model spoke for (a stop, a provider refusal, a missing model) the
+   *  terminal's text is app wording for channels and history: desktop and
+   *  phone show no reply and voice never speaks it. A format notice is the one
+   *  exception: it sits beside Clem's own draft, which is shown and read as
+   *  usual. See `noticeReplacesReply`. */
   notice?: TerminalNotice;
 }
 
@@ -388,6 +390,21 @@ export interface TerminalNotice {
   model?: string;
   /** The provider's own refusal, verbatim and bounded. Detail, never a reply. */
   providerSaid?: string;
+}
+
+/** Notices that sit beside Clem's own words rather than in place of them: the
+ *  host held her draft because it may not be in the format the owner asked
+ *  for, and the draft is still hers to show and read aloud. */
+const NOTICES_BESIDE_REPLY: ReadonlySet<string> = new Set<TerminalNoticeCode>([
+  'response_format_unmet',
+  'response_format_unqualified',
+]);
+
+/** Whether a notice stands in place of a reply, so the terminal's text is the
+ *  app's wording and never shown or spoken as Clem's. False only for the
+ *  format notices, whose terminal text is Clem's own draft. */
+export function noticeReplacesReply(code: string): boolean {
+  return !NOTICES_BESIDE_REPLY.has(code);
 }
 
 /** Mirrors src/runtime/harness/turn-outcome.ts. Addressable proof only: bulky

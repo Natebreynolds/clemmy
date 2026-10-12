@@ -6,7 +6,7 @@ import {
   terminalCompletionPresentation,
 } from './terminal-presentation.js';
 import { terminalNoticeLine, terminalStatusPill } from './terminal-status.js';
-import type { TerminalNoticeCode } from './types.js';
+import { noticeReplacesReply, type TerminalNoticeCode } from './types.js';
 
 /**
  * A stop is allowed to be a stop. It is not allowed to be a DEAD END.
@@ -104,7 +104,7 @@ test('a terminal that already carries the server’s own words is left alone', (
   assert.equal(answered.status, 'complete');
 });
 
-test('a notice terminal renders no reply, and its line names what resolves it', () => {
+test('a notice in place of a reply renders none, a format notice keeps her draft, and each line names what resolves it', () => {
   const codes: TerminalNoticeCode[] = [
     'response_format_unmet', 'response_format_unqualified', 'provider_quota', 'saved_model_unavailable',
     'model_unavailable_on_sign_in', 'no_model_connected', 'codex_sign_in_expired', 'provider_out_of_credit',
@@ -112,11 +112,11 @@ test('a notice terminal renders no reply, and its line names what resolves it', 
   ];
   for (const code of codes) {
     const rendered = terminalCompletionPresentation({
-      reply: 'App wording for channels.',
+      reply: 'Terminal text.',
       turnOutcome: { status: 'failed' },
       notice: { code },
     }, '');
-    assert.equal(rendered.text, '', code);
+    assert.equal(rendered.text, noticeReplacesReply(code) ? '' : 'Terminal text.', code);
     const line = terminalNoticeLine(rendered.terminal);
     assert.ok(line, code);
     assert.ok(line.action || namesANextEdge(line.label), `${code} is a dead end: ${line.label}`);

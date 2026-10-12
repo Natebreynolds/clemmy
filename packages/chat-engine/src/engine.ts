@@ -144,10 +144,15 @@ function withApprovalConfirmation(message: ChatMessage, confirm: ApprovalConfirm
 }
 
 /** A notice is the app's status for the work the tap resumed (a stop, a
- *  refusal), never the tap's echo, unless it is the card decision itself. */
+ *  refusal), never the tap's echo, unless it is the card decision itself. A
+ *  typed terminal with no words is not an echo either: it is drawn as its pill
+ *  (what was kept, the reply prompt, a question's answers), so only a finished
+ *  turn quoting the card's own id is. Legacy events keep the text rule. */
 function cardDecisionReplyEcho(message: Pick<ChatMessage, 'text' | 'terminal'>, decision: CardDecision): boolean {
-  const notice = message.terminal?.notice?.code;
-  return notice ? notice === 'card_decision' : cardDecisionEcho(message.text, decision);
+  const terminal = message.terminal;
+  if (!terminal) return cardDecisionEcho(message.text, decision);
+  if (terminal.notice) return terminal.notice.code === 'card_decision';
+  return terminal.status === 'done' && (message.text ?? '').includes(decision.approvalId);
 }
 
 /** Only the typed question for this exact card/source is already rendered.

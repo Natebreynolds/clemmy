@@ -2,7 +2,7 @@ import type {
   ChatMessage, MessageStatus, RetainedOutsideChange, TerminalFacts, TerminalNotice, TerminalNoticeCode,
   TerminalRetained, TerminalReview, TurnEvidenceRef,
 } from './types.js';
-import { humanHarnessText } from './types.js';
+import { humanHarnessText, noticeReplacesReply } from './types.js';
 
 /** Every user-visible terminal string in this module must name a NEXT EDGE —
  *  something the reader can say or do — because a stop that only reports its own
@@ -189,10 +189,13 @@ export function terminalCompletionPresentation(
   const terminal = terminalFactsFrom(data);
   const core = terminalCompletionPresentationCore(data, currentText, currentStatus);
   if (!terminal) return { text: core.text, status: core.status, progress: core.progress };
-  // A notice terminal is the app's status, not a reply: its text is app
-  // wording kept for channels and history, and the surfaces draw the notice
-  // as a status line instead. Nothing here is Clem's to say.
-  if (terminal.notice) return { text: '', status: core.status, progress: core.progress, terminal };
+  // A notice terminal for a turn no model spoke for is the app's status, not
+  // a reply: its text is app wording kept for channels and history, and the
+  // surfaces draw the notice as a status line instead. A format notice sits
+  // beside Clem's own draft, so her words stay and the line is drawn as well.
+  if (terminal.notice && noticeReplacesReply(terminal.notice.code)) {
+    return { text: '', status: core.status, progress: core.progress, terminal };
+  }
   // A typed terminal with no words of Clem's is drawn as its status pill, with
   // any retained facts on it. The app never writes a sentence in her place.
   // A finished turn has no pill, so its placeholder line stays.

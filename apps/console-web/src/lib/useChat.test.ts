@@ -310,6 +310,22 @@ test('a typed terminal with no words, or with a notice, never gets a reply writt
   assert.equal(notice.terminal?.notice?.code, 'no_model_connected');
 });
 
+// The daemon publishes Clem's own draft with a format notice beside it; the
+// desktop used to blank it and show only the status line.
+test('desktop: a draft held for its format keeps Clem’s words beside the format notice', () => {
+  const draft = '```json\n{"value":"fixture"}\n```\nIts completeness is unknown.';
+  const held = terminalCompletionPresentation({
+    reply: draft,
+    presentation: { status: 'blocked', kind: 'answer', text: draft },
+    turnOutcome: { status: 'blocked' },
+    review: 'rejected',
+    notice: { code: 'response_format_unmet' },
+  }, '');
+  assert.equal(held.text, draft);
+  assert.equal(held.terminal?.notice?.code, 'response_format_unmet');
+  assert.equal(held.terminal?.review, 'rejected');
+});
+
 test('approval buttons address the exact card and use a real reject intent', () => {
   assert.equal(chatApprovalReply('approve', 'apr-A1b2'), 'approve apr-a1b2');
   assert.equal(chatApprovalReply('reject', 'apr-c3d4'), 'reject apr-c3d4');

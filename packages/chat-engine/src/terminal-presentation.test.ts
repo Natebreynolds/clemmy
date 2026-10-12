@@ -11,6 +11,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { terminalCompletionPresentation, terminalFactsFrom } from './terminal-presentation.js';
+import { terminalNoticeLine } from './terminal-status.js';
+import { noticeReplacesReply } from './types.js';
 
 const typed = (status: string, kind: string, needs?: string, resumable?: boolean) => ({
   reply: 'Here is the answer.',
@@ -127,7 +129,7 @@ test('the review note is bounded to the contract length', () => {
   assert.ok(facts?.reviewNote?.endsWith('…'));
 });
 
-test('a notice terminal yields no assistant text, whatever the event or the stream carried', () => {
+test('a notice in place of a reply yields no assistant text, whatever the event or the stream carried', () => {
   const stopped = terminalCompletionPresentation(
     withFacts('cancelled', { notice: { code: 'stopped' }, retained: { results: 1, outsideChange: 'none' } }, 'Stopped. 1 result kept.'),
     'Let me read the first fi',
@@ -170,4 +172,37 @@ test('a typed terminal keeps Clem’s own words, streamed or delivered', () => {
   const delivered = terminalCompletionPresentation(withFacts('blocked', { review: 'rejected' }, 'Here is what I found.'), '');
   assert.equal(delivered.text, 'Here is what I found.');
   assert.equal(delivered.terminal?.review, 'rejected');
+});
+
+// The host holds a draft that may not be in the format the owner asked for and
+// publishes Clem's own words with the format notice beside them. Blanking every
+// notice terminal hid her answer, leaving only the status line.
+test('a format notice sits beside Clem’s own draft: her words stay and the notice line is drawn', () => {
+  const draft = '```json\n{"value":"fixture"}\n```\nIts completeness is unknown.';
+  for (const code of ['response_format_unmet', 'response_format_unqualified'] as const) {
+    assert.equal(noticeReplacesReply(code), false);
+    const held = terminalCompletionPresentation({
+      reply: draft,
+      presentation: { status: 'blocked', kind: 'answer', text: draft },
+      turnOutcome: { status: 'blocked', resumable: true },
+      review: 'rejected',
+      notice: { code },
+    }, '');
+    assert.equal(held.text, draft, code);
+    assert.equal(held.status, 'failed');
+    assert.equal(held.terminal?.review, 'rejected');
+    assert.deepEqual(held.terminal?.notice, { code });
+    assert.ok(terminalNoticeLine(held.terminal)?.label, 'the notice line is drawn as well');
+
+    const streamed = terminalCompletionPresentation({
+      reply: '',
+      presentation: { status: 'blocked', kind: 'answer', text: '' },
+      turnOutcome: { status: 'blocked' },
+      notice: { code },
+    }, 'Streamed words of hers.', 'thinking');
+    assert.equal(streamed.text, 'Streamed words of hers.', 'words she streamed are kept too');
+  }
+  for (const code of ['stopped', 'provider_quota', 'card_decision', 'run_failed'] as const) {
+    assert.equal(noticeReplacesReply(code), true, code);
+  }
 });

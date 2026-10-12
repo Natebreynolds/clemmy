@@ -1,8 +1,8 @@
 /**
  * The app's own status line under a turn: the pill for how the turn ended,
  * what it kept, what happened in another app, and the notice for a turn no
- * model spoke for. Desktop and phone draw these from one place so they never
- * disagree.
+ * model spoke for (or, for a format notice, beside the draft Clem wrote).
+ * Desktop and phone draw these from one place so they never disagree.
  *
  * This is chrome, not Clem. Nothing here says "I", and nothing here is ever
  * shown as her reply or read aloud as her words.
@@ -148,4 +148,30 @@ export function cardDecisionNoticeOnly(message: Pick<ChatMessage, 'terminal' | '
     && !message.text.trim()
     && !(message.activity?.length)
     && message.status !== 'failed';
+}
+
+/**
+ * What live voice is told when the request it is waiting on ends on a notice:
+ * the typed fact (the code, the model or agent it names, the provider's own
+ * words, the action on screen, what was kept), never the notice's wording, so
+ * the voice tells the owner in its own words and the request is not left in
+ * silence. Null for a stop the owner chose and for a card decision, which need
+ * no explaining, and for a terminal with no notice.
+ */
+export function terminalNoticeVoiceFact(terminal: Pick<TerminalFacts, 'notice' | 'retained'> | undefined): string | null {
+  const notice = terminal?.notice;
+  if (!notice || notice.code === 'stopped' || notice.code === 'card_decision') return null;
+  const named = [
+    notice.model ? `model: ${notice.model}` : '',
+    notice.agentName ? `agent: ${notice.agentName}` : '',
+  ].filter(Boolean).join('; ');
+  const action = terminalNoticeLine({ status: 'failed', notice })?.action;
+  const kept = retainedResultsPhrase(terminal?.retained);
+  return [
+    `App status for this request, not Clem's words: ${notice.code}${named ? ` (${named})` : ''}.`,
+    notice.providerSaid ? `The provider said: ${notice.providerSaid}` : '',
+    action ? `On screen the owner can choose ${NOTICE_ACTION_LABEL[action]}.` : '',
+    kept ? `${kept[0]!.toUpperCase()}${kept.slice(1)}.` : '',
+    'Tell the owner briefly, in your own words.',
+  ].filter(Boolean).join(' ');
 }
