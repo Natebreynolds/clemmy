@@ -1,6 +1,7 @@
 import { registerCloudBrowserRoutes } from '../channels/cloud-browser-routes.js';
 import { Readable } from 'node:stream';
 import { requestSpeech, spokenReplyText } from './voice-speech.js';
+import { createLiveVoiceSession, liveVoiceStatus } from './live-voice.js';
 import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { SAVED_SOURCE_SCRIPT_CONSENT_TOOL } from '../runtime/harness/saved-source-consent.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
@@ -3931,7 +3932,10 @@ export function registerConsoleRoutes(
     transcribeLocal: typeof transcribeLocalMeetingAudio;
     hasCloudKey: typeof hasOpenAiKey;
     transcribeCloud: typeof transcribeAudio;
-  }; voiceSpeechRuntime?: { requestSpeech: typeof requestSpeech }; fileOpenRuntime?: {
+  }; voiceSpeechRuntime?: { requestSpeech: typeof requestSpeech }; liveVoiceRuntime?: {
+    status: typeof liveVoiceStatus;
+    createSession: typeof createLiveVoiceSession;
+  }; fileOpenRuntime?: {
     platform: NodeJS.Platform;
     launchWindowsDefaultApp: typeof launchWindowsDefaultApp;
   } },
@@ -17040,6 +17044,25 @@ export function registerConsoleRoutes(
     const body = Readable.fromWeb(speech.response.body as unknown as import('node:stream/web').ReadableStream<Uint8Array>);
     body.on('error', () => { if (!res.writableEnded) res.end(); });
     body.pipe(res);
+  });
+
+  // Live voice: whether a full-duplex conversation is available, and the
+  // exchange of the device's WebRTC offer for the voice service's answer.
+  // The key stays here; audio flows between the device and the service.
+  app.get('/api/console/voice/live', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.json((opts?.liveVoiceRuntime?.status ?? liveVoiceStatus)());
+  });
+  app.post('/api/console/voice/live-session', express.json({ limit: '256kb' }), async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const controller = new AbortController();
+    res.on('close', () => { if (!res.writableFinished) controller.abort(); });
+    const body = req.body && typeof req.body === 'object' ? req.body as { sdp?: unknown; history?: unknown } : {};
+    const started = await (opts?.liveVoiceRuntime?.createSession ?? createLiveVoiceSession)(
+      { sdp: body.sdp, history: body.history }, controller.signal);
+    if (controller.signal.aborted || res.headersSent) return;
+    if (!started.ok) { res.status(started.status).json({ error: started.error, code: started.code }); return; }
+    res.status(201).json({ sessionId: started.sessionId, sdp: started.sdp });
   });
 
   /**

@@ -18,6 +18,7 @@ const MAX_BYTES = 30 * 1024 * 1024;
 /** What voice mode is doing, in a few words under the composer. */
 const VOICE_PHASE_WORDS: Record<VoicePhase, string> = {
   off: '',
+  connecting: 'Connecting…',
   listening: 'Listening… talk, then pause.',
   transcribing: 'Got it…',
   thinking: 'Clem is on it…',
@@ -515,7 +516,8 @@ export function Composer({
     </div>
     {voiceHere ? (
       <p className="mt-2 flex items-center justify-center gap-2 text-center text-caption text-muted" role="status">
-        <span>{voice.error || VOICE_PHASE_WORDS[voice.phase]}</span>
+        <span>{voice.error || (voice.engine === 'live' && voice.phase === 'listening' ? 'Listening… just talk.' : VOICE_PHASE_WORDS[voice.phase])}</span>
+        {voice.notice && !voice.error && <span className="text-faint">{voice.notice}</span>}
         {voice.phase === 'speaking' && (
           <button type="button" onClick={() => voiceMode.interrupt()} className="cursor-pointer font-medium text-primary underline-offset-2 hover:underline">Interrupt</button>
         )}
