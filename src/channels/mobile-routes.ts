@@ -3900,8 +3900,15 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const controller = new AbortController();
     res.on('close', () => { if (!res.writableFinished) controller.abort(); });
     const body = req.body && typeof req.body === 'object' ? req.body as { sdp?: unknown; history?: unknown } : {};
-    const started = await (deps.liveVoiceRuntime?.createSession ?? createLiveVoiceSession)(
-      { sdp: body.sdp, history: body.history }, controller.signal);
+    let started: Awaited<ReturnType<typeof createLiveVoiceSession>>;
+    try {
+      started = await (deps.liveVoiceRuntime?.createSession ?? createLiveVoiceSession)(
+        { sdp: body.sdp, history: body.history }, controller.signal);
+    } catch (error) {
+      // A failed session is an answer for the device, never a daemon exit.
+      if (!res.headersSent) res.status(500).json({ error: error instanceof Error ? error.message : 'Live voice could not start.', code: 'LIVE_VOICE_FAILED' });
+      return;
+    }
     if (controller.signal.aborted || res.headersSent) return;
     if (!started.ok) { res.status(started.status).json({ error: started.error, code: started.code }); return; }
     res.status(201).json({ sessionId: started.sessionId, sdp: started.sdp });

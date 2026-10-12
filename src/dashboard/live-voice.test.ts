@@ -104,6 +104,36 @@ test('a missing offer, a missing key and service refusals each say what happened
   assert.ok(!incomplete.ok && incomplete.code === 'LIVE_VOICE_FAILED');
 });
 
+test('a saved key that cannot be read safely is an answer, never an exception', async () => {
+  const refused: import('./live-voice.js').LiveVoiceConfigReader = {
+    openAiKey: () => { throw new Error('Credential storage privacy or integrity could not be verified'); },
+    env: (_key, fallback) => fallback,
+  };
+  const never = (async () => { throw new Error('must not call the service'); }) as unknown as typeof fetch;
+  const result = await live.createLiveVoiceSession({ sdp: offer }, undefined, never, refused);
+  assert.ok(!result.ok && result.code === 'LIVE_VOICE_KEY_UNREADABLE' && result.status === 503);
+  assert.deepEqual(live.liveVoiceStatus(refused), { available: false, reason: 'The saved OpenAI key could not be read safely.' });
+});
+
+test('a session that throws answers 500 and the server keeps serving', async () => {
+  const app = express();
+  registerConsoleRoutes(app, req => req.get('authorization') === bearer, {} as never, {
+    serveLegacyAtRoot: false,
+    liveVoiceRuntime: { status: () => ({ available: true }), createSession: async () => { throw new Error('vault refused'); } },
+  });
+  const server = await new Promise<Server>(resolve => { const listener = createServer(app); listener.listen(0, '127.0.0.1', () => resolve(listener)); });
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const post = () => fetch(`${base}/api/console/voice/live-session`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: bearer }, body: JSON.stringify({ sdp: offer }),
+    });
+    const first = await post();
+    assert.equal(first.status, 500);
+    assert.equal((await first.json() as { code: string }).code, 'LIVE_VOICE_FAILED');
+    assert.equal((await post()).status, 500, 'still serving');
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
 test('the console routes are owner-only and return the session answer', async () => {
   const offers: unknown[] = [];
   const app = express();

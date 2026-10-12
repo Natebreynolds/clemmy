@@ -89,8 +89,32 @@ export interface LiveVoiceStatus {
   reason?: string;
 }
 
-export function liveVoiceStatus(): LiveVoiceStatus {
-  return getOpenAiApiKey()
+/** The key and settings the session needs. Reading saved credentials can be
+ *  refused (on Windows when their privacy cannot be verified); that is an
+ *  answer for the device, never an exception that reaches the daemon. */
+export interface LiveVoiceConfigReader { openAiKey: () => string; env: (key: string, fallback: string) => string }
+const savedConfig: LiveVoiceConfigReader = { openAiKey: getOpenAiApiKey, env: getRuntimeEnv };
+
+function liveVoiceSettings(config: LiveVoiceConfigReader = savedConfig): { ok: true; key: string; base: string; model: string; voice: string } | { ok: false; reason: string } {
+  try {
+    return {
+      ok: true,
+      key: config.openAiKey(),
+      base: config.env('OPENAI_BASE_URL', 'https://api.openai.com/v1').replace(/\/+$/, ''),
+      model: config.env('OPENAI_LIVE_MODEL', DEFAULT_LIVE_MODEL),
+      voice: config.env('OPENAI_LIVE_VOICE', config.env('OPENAI_TTS_VOICE', DEFAULT_LIVE_VOICE)),
+    };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    logger.warn({ reason: redactSensitiveText(reason).slice(0, 300) }, 'live voice could not read its saved settings');
+    return { ok: false, reason };
+  }
+}
+
+export function liveVoiceStatus(config: LiveVoiceConfigReader = savedConfig): LiveVoiceStatus {
+  const settings = liveVoiceSettings(config);
+  if (!settings.ok) return { available: false, reason: 'The saved OpenAI key could not be read safely.' };
+  return settings.key
     ? { available: true }
     : { available: false, reason: 'Live voice needs an OpenAI key.' };
 }
@@ -100,7 +124,7 @@ export type LiveVoiceSessionResult =
   | {
     ok: false;
     status: number;
-    code: 'LIVE_VOICE_BAD_OFFER' | 'LIVE_VOICE_NEEDS_KEY' | 'LIVE_VOICE_KEY_REFUSED' | 'LIVE_VOICE_UNAVAILABLE' | 'LIVE_VOICE_FAILED';
+    code: 'LIVE_VOICE_BAD_OFFER' | 'LIVE_VOICE_NEEDS_KEY' | 'LIVE_VOICE_KEY_UNREADABLE' | 'LIVE_VOICE_KEY_REFUSED' | 'LIVE_VOICE_UNAVAILABLE' | 'LIVE_VOICE_FAILED';
     error: string;
   };
 
@@ -109,14 +133,18 @@ export async function createLiveVoiceSession(
   input: { sdp?: unknown; history?: unknown },
   signal?: AbortSignal,
   fetchImpl: typeof fetch = fetch,
+  config: LiveVoiceConfigReader = savedConfig,
 ): Promise<LiveVoiceSessionResult> {
   const sdp = typeof input.sdp === 'string' ? input.sdp : '';
   if (!sdp.trim() || sdp.length > SDP_MAX_CHARS) {
     return { ok: false, status: 400, code: 'LIVE_VOICE_BAD_OFFER', error: 'A WebRTC offer is required.' };
   }
-  const key = getOpenAiApiKey();
+  const settings = liveVoiceSettings(config);
+  if (!settings.ok) {
+    return { ok: false, status: 503, code: 'LIVE_VOICE_KEY_UNREADABLE', error: 'The saved OpenAI key could not be read safely, so live voice did not start.' };
+  }
+  const { key, base, model, voice } = settings;
   if (!key) return { ok: false, status: 409, code: 'LIVE_VOICE_NEEDS_KEY', error: 'Live voice needs an OpenAI key.' };
-  const base = getRuntimeEnv('OPENAI_BASE_URL', 'https://api.openai.com/v1').replace(/\/+$/, '');
   const history = liveVoiceHistory(input.history);
   const timeout = AbortSignal.timeout(SESSION_REQUEST_TIMEOUT_MS);
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
@@ -127,10 +155,10 @@ export async function createLiveVoiceSession(
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         session: {
-          model: getRuntimeEnv('OPENAI_LIVE_MODEL', DEFAULT_LIVE_MODEL),
+          model,
           instructions: liveVoiceInstructions(),
           ...(history.length > 0 ? { input: history } : {}),
-          audio: { output: { voice: getRuntimeEnv('OPENAI_LIVE_VOICE', getRuntimeEnv('OPENAI_TTS_VOICE', DEFAULT_LIVE_VOICE)) } },
+          audio: { output: { voice } },
           delegation: { type: 'client' },
         },
         transport: { type: 'webrtc', sdp },
