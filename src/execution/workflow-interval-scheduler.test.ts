@@ -383,6 +383,33 @@ test('restart after queue acceptance converges on the accepted occurrence instea
   assert.equal(state.byWorkflow[`wf:${name}`]?.pending, undefined);
 });
 
+test('an unreadable occurrence receipt defers only that workflow and never fails the scheduler tick', async () => {
+  const name = 'generated-unreadable-receipt';
+  const recurrence = interval();
+  seed(name, recurrence);
+  await processWorkflowSchedules(new Date(ANCHOR_MS + 2 * HOUR));
+  assert.equal(runRecords(name).length, 1);
+  // Same durable pre-commit cursor as the restart test, but the receipt
+  // marker that would converge the replay is unreadable.
+  writeFileSync(INTERVAL_STATE_FILE, JSON.stringify({
+    version: 1,
+    byWorkflow: {
+      [`wf:${name}`]: {
+        contractDigest: workflowIntervalDigest(recurrence),
+        lastHandledOrdinal: 0,
+      },
+    },
+  }, null, 2));
+  const occurrenceId = workflowIntervalOccurrenceId({ workflowKey: name, interval: recurrence, ordinal: 1 });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, '.trigger-receipts', `${digest(occurrenceId)}.json`), '{');
+
+  const tick = await processWorkflowSchedules(new Date(ANCHOR_MS + 2 * HOUR));
+  assert.ok(tick.deferred.includes(name), JSON.stringify(tick));
+  assert.equal(runRecords(name).length, 1, 'an unreadable receipt never mints a second run');
+  const state = workflowIntervalSchedulerInternalsForTest.loadIntervalState();
+  assert.equal(state.byWorkflow[`wf:${name}`]?.pending?.ordinal, 1, 'the exact pending unit stays for a later tick');
+});
+
 test('missed occurrences obey run_once and skip without enumerating backlog', async () => {
   const runOnce = 'generated-run-once';
   const skip = 'generated-skip-catchup';

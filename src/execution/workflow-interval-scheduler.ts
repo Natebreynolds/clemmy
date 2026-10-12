@@ -528,7 +528,25 @@ export async function processWorkflowIntervalSchedules(
   let recoveryEnqueues = 0;
   for (const candidate of candidates) {
     const { occurrence } = candidate;
-    if (readWorkflowTriggerReceiptAcceptance(occurrence.occurrenceId)) {
+    let accepted: string | null;
+    try {
+      accepted = readWorkflowTriggerReceiptAcceptance(occurrence.occurrenceId);
+    } catch (error) {
+      // Unknown is not "not accepted": never enqueue on a receipt we cannot
+      // read. The exact pending unit stays durable and retries next tick.
+      result.deferred.push(candidate.workflowName);
+      logger.warn(
+        {
+          workflow: candidate.workflowName,
+          workflowSlug: candidate.workflowSlug,
+          occurrenceId: occurrence.occurrenceId,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        'Interval occurrence receipt could not be read; exact pending unit will retry',
+      );
+      continue;
+    }
+    if (accepted) {
       markIntervalOccurrenceHandled(state, candidate);
       saveIntervalState(state);
       result.deduped.push(candidate.workflowName);

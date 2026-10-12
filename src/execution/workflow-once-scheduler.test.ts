@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -81,4 +82,21 @@ test('one-time authoring preserves the instant and switches the existing time au
   assert.equal(repeat.ok, true);
   if (repeat.ok) assert.equal(repeat.trigger.onceAt, undefined);
   assert.equal(applyWorkflowTriggerPatch({}, { triggerOnceAt: due, triggerSchedule: '* * * * *' }).ok, false);
+});
+
+test('one unreadable once-at receipt never stops the scheduler tick or a sibling commitment', async () => {
+  const broken = 'once-unreadable-receipt'; seed(broken);
+  closeEventLog();
+  const first = await processWorkflowSchedules(new Date(due));
+  assert.ok(first.fired.includes(broken), JSON.stringify(first));
+  const receiptId = `workflow-schedule:v1:${broken}:${Date.parse(due)}`;
+  const marker = path.join(WORKFLOW_RUNS_DIR, '.trigger-receipts', `${createHash('sha256').update(receiptId).digest('hex')}.json`);
+  writeFileSync(marker, '{');
+  const siblingAt = '2026-09-12T10:00:00.000Z';
+  const sibling = 'once-sibling'; seed(sibling, siblingAt);
+  closeEventLog();
+  const tick = await processWorkflowSchedules(new Date(siblingAt));
+  assert.ok(tick.fired.includes(sibling), JSON.stringify(tick));
+  assert.equal(runs(broken).length, 1, 'an unreadable receipt is neither re-fired nor treated as absent');
+  assert.equal(runs(sibling).length, 1);
 });
