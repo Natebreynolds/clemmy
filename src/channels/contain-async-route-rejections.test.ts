@@ -22,6 +22,9 @@ test('a rejecting async route is that request\'s 500; nothing reaches the proces
     app.get('/refused', guard, async () => { throw new Error('Credential storage privacy or integrity could not be verified'); });
     app.get('/silent', async () => { await Promise.reject(undefined); });
     app.get('/ok', async (_req, res) => { res.json({ ok: true }); });
+    // A promise-like result that rejects, and one whose then itself throws.
+    app.get('/thenable', (() => ({ then: (_ok: unknown, fail: (e: unknown) => void) => fail(new Error('thenable refusal')) })) as unknown as express.RequestHandler);
+    app.get('/broken-then', (() => ({ then: () => { throw new Error('then threw'); } })) as unknown as express.RequestHandler);
     const router = express.Router();
     router.post('/mounted', async () => { throw new Error('mounted refusal'); });
     app.use('/m', router);
@@ -34,6 +37,8 @@ test('a rejecting async route is that request\'s 500; nothing reaches the proces
       assert.equal((await fetch(`${base}/refused`)).status, 500);
       assert.equal((await fetch(`${base}/silent`)).status, 500);
       assert.equal((await fetch(`${base}/m/mounted`, { method: 'POST' })).status, 500);
+      assert.equal((await fetch(`${base}/thenable`)).status, 500);
+      assert.equal((await fetch(`${base}/broken-then`)).status, 500);
       assert.deepEqual(await (await fetch(`${base}/ok`)).json(), { ok: true }, 'still serving');
     });
     await new Promise(resolve => setImmediate(resolve));
@@ -42,6 +47,8 @@ test('a rejecting async route is that request\'s 500; nothing reaches the proces
       'Credential storage privacy or integrity could not be verified',
       'A route handler rejected without a reason.',
       'mounted refusal',
+      'thenable refusal',
+      'then threw',
     ]);
     // Settings reads and the route stack keep their own functions.
     app.set('probe', 7);
