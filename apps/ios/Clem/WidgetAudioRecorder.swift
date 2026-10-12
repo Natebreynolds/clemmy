@@ -15,23 +15,37 @@ struct WidgetAudioRecording: Identifiable, Equatable {
 /// Metering is only an end-of-utterance hint, never a transcript or authority to
 /// send a message. Quiet beginnings do not immediately finish a voice turn.
 struct WidgetSpeechSilenceGate {
-    var speechThreshold: Float = -35
-    var silenceDuration: TimeInterval = 1.2
+    var speechThreshold: Float = -38
+    /// Quiet that ends a turn once the speaker has said a phrase.
+    var silenceDuration: TimeInterval = 1.8
+    /// A lone word followed by a thinking pause is not a finished thought
+    /// (live 2026-10-11: "the" was sent on its own). Until this much speech
+    /// has been heard, the turn waits for the longer quiet below.
+    var shortUtteranceSpeech: TimeInterval = 1.0
+    var shortUtteranceSilence: TimeInterval = 3.0
     var minimumSpeechDuration: TimeInterval = 0.35
     private(set) var heardSpeech = false
+    private(set) var spokenTime: TimeInterval = 0
     private var speechBeganAt: TimeInterval?
     private var lastSpeechAt: TimeInterval?
+    private var lastSampleAt: TimeInterval?
 
     mutating func shouldFinish(power: Float, elapsed: TimeInterval) -> Bool {
         guard power.isFinite, elapsed.isFinite, elapsed >= 0 else { return false }
+        // Meter samples arrive about every 100 ms; a long gap never counts as speech.
+        let step = lastSampleAt.map { max(0, min(elapsed - $0, 0.5)) } ?? 0
+        lastSampleAt = elapsed
         if power >= speechThreshold {
             if speechBeganAt == nil { speechBeganAt = elapsed }
             if let began = speechBeganAt, elapsed - began >= minimumSpeechDuration { heardSpeech = true }
+            spokenTime += step
             lastSpeechAt = elapsed
             return false
         }
         if !heardSpeech { speechBeganAt = nil }
-        return heardSpeech && lastSpeechAt.map { elapsed - $0 >= silenceDuration } == true
+        guard heardSpeech, let last = lastSpeechAt else { return false }
+        let quietNeeded = spokenTime >= shortUtteranceSpeech ? silenceDuration : shortUtteranceSilence
+        return elapsed - last >= quietNeeded
     }
 }
 
