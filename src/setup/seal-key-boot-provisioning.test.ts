@@ -33,5 +33,5 @@ test('both daemon boot paths provision the key on their own and log loudly if th
 
 test('a provenance refusal names its cause and the user is told about the vault, not "something went wrong"', () => {
   assert.match(PROV, /causeSuffix\(options\?\.cause\)/);
-  assert.match(LOOP, /authority_seal_key_missing[^\n]*\n\s*\? PUBLIC_VAULT_NOT_READY_TEXT/);
+  assert.match(LOOP, /authority_seal_key_missing[^\n]*\n\s*\? \{ text: PUBLIC_VAULT_NOT_READY_TEXT\b/);
 });

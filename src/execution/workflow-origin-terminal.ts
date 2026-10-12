@@ -30,6 +30,7 @@ import {
 import type { ExactWorkflowRunOriginRecord } from '../tools/workflow-run-queue.js';
 import type { ExactOriginDeliveryTarget } from '../runtime/exact-origin-delivery.js';
 import {
+  isPublicRunFailureText,
   PUBLIC_RUN_FAILURE_TEXT,
   publicReplyText,
   publicUserInputText,
@@ -319,7 +320,7 @@ export function workflowOriginTerminalCommitMatches(input: {
   ) return true;
   if (
     presentation.status === 'failed'
-    && presentation.text === PUBLIC_RUN_FAILURE_TEXT
+    && isPublicRunFailureText(presentation.text)
     && input.expectedText === PUBLIC_RUN_FAILURE_TEXT
   ) return true;
   if (input.outcome === 'failed' || input.outcome === 'cancelled') return false;

@@ -32,6 +32,7 @@ const {
 const { HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, captureEffectiveCompletionPolicyOnce } = await import('./host-turn-runner.js');
 const { WHOLE_JSON_OBJECT_FORMAT_FINDING } = await import('./response-format-repair.js');
 const { OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT, OWNER_STOP_TERMINAL_TEXT } = await import('./terminal-notice.js');
+const presentationModule = await import('./public-presentation.js');
 const { reconstructHarnessTranscript } = await import('./transcript.js');
 const { pullRecentTurnsForSession } = await import('./session-transcript.js');
 const loop = await import('./loop.js');
@@ -251,6 +252,42 @@ test('the committer\'s Stop over a host-only uncertain block is an app-voice lin
   assert.equal(committed.presentation.status, 'cancelled');
   assert.equal(committed.presentation.text, OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT);
   assert.deepEqual(record('stop:committer', committed.event).notice, { code: 'stopped' });
+});
+
+const FIRST_PERSON = /\b(?:I|I’m|I'm|I’ll|I'll|I’ve|I've|me|my)\b/;
+
+test('a failed run is an app-voice line with a notice for every failure kind', () => {
+  const cases: ReadonlyArray<{ name: string; result: Record<string, unknown>; code: string; providerSaid?: string }> = [
+    { name: 'codex-expired', result: { failureKind: 'codex.auth_expired', error: 'PRIVATE revoked' }, code: 'codex_sign_in_expired' },
+    { name: 'empty', result: { failureKind: 'model.empty_completion', error: 'PRIVATE empty' }, code: 'model_stalled' },
+    { name: 'credit', result: { error: 'Your credit balance is too low to access the API.' }, code: 'provider_out_of_credit',
+      providerSaid: 'Your credit balance is too low to access the API.' },
+    { name: 'usage', result: { error: "You're out of extra usage." }, code: 'provider_quota', providerSaid: "You're out of extra usage." },
+    { name: 'generic', result: { error: 'PRIVATE socket hang up' }, code: 'run_failed' },
+  ];
+  for (const entry of cases) {
+    const sessionId = `voice-failed-${entry.name}`;
+    createSession({ id: sessionId, kind: 'chat' });
+    const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: OBJECTIVE } });
+    loop._testOnly_reduceStandardConversationTerminal({
+      result: { sessionId, status: 'failed', steps: 1, lastTurn: source.turn, ...entry.result } as never,
+      sourceUserSeq: source.seq,
+    });
+    const terminal = listEvents(sessionId, { types: ['conversation_completed'] })[0]!;
+    const data = record(`failed:${entry.name}`, terminal);
+    assert.deepEqual(data.notice, { code: entry.code, ...(entry.providerSaid ? { providerSaid: entry.providerSaid } : {}) });
+    assert.doesNotMatch(String(data.reply), FIRST_PERSON, `${entry.name}: ${String(data.reply)}`);
+    assert.doesNotMatch(JSON.stringify(data), /PRIVATE/);
+  }
+  for (const line of [
+    presentationModule.PUBLIC_RUN_FAILURE_TEXT,
+    presentationModule.PUBLIC_MODEL_EMPTY_COMPLETION_TEXT,
+    presentationModule.PUBLIC_CODEX_AUTH_EXPIRED_TEXT,
+    presentationModule.PUBLIC_VAULT_NOT_READY_TEXT,
+    presentationModule.PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT,
+    presentationModule.publicProviderCapacityText('Your credit balance is too low to access the API.') ?? '',
+    presentationModule.publicProviderCapacityText("You're out of extra usage.") ?? '',
+  ]) assert.doesNotMatch(line, FIRST_PERSON, line);
 });
 
 test('the stop and quota sites never author the old first-person lines', () => {

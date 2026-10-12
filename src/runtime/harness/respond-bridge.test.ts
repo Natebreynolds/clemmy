@@ -1683,7 +1683,10 @@ test('respondPreferHarness: harness auth unavailable blocks by default instead o
   assert.equal(res.stoppedReason, 'blocked');
   assert.match(res.text, /no model runtime is connected/i);
   assert.doesNotMatch(res.text, /no auth/i, 'provider diagnostics stay out of public copy');
+  assert.doesNotMatch(res.text, /\b(?:I|I’m|I'm|me|my)\b/, 'an app status, never a sentence written for Clem');
   assert.equal(listEvents('bridge-t3', { types: ['conversation_completed'] }).length, 1);
+  assert.deepEqual(projectHarnessEventForPublic(listEvents('bridge-t3', { types: ['conversation_completed'] })[0]!)?.data.notice,
+    { code: 'no_model_connected' });
   assert.equal((res.raw as { terminalCommitted?: boolean })?.terminalCommitted, true);
   assert.equal(HarnessSession.load('bridge-t3')?.runInFlightSince(), null);
 });
@@ -1944,10 +1947,14 @@ test('saved agent model unavailable commits its exact-source block before any mo
   assert.match(response.text, /Connect that model in Settings > Models/);
   assert.doesNotMatch(response.text, /quota snapshot/);
   assert.notEqual(response.text, PUBLIC_RUN_FAILURE_TEXT);
+  // An app status, not something Clem says: no model ran this turn.
+  assert.doesNotMatch(response.text, /\b(?:I|I’m|I'm|me|my)\b/);
   const source = listEvents(sessionId, { types: ['user_input_received'] });
   assert.equal(source.length, 1);
   const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
   assert.equal(terminals.length, 1);
+  assert.deepEqual(projectHarnessEventForPublic(terminals[0]!)?.data.notice,
+    { code: 'saved_model_unavailable', agentName: 'Unavailable Specialist', model: 'claude-opus-5-5' });
   assert.equal((terminals[0]?.data.presentation as { identity: { sourceUserSeq: number }; status: string }).identity.sourceUserSeq, source[0]!.seq);
   assert.equal((terminals[0]?.data.presentation as { status: string }).status, 'blocked');
   for (const type of ['turn_model_routed', 'turn_graph_shadow', 'tool_called', 'provider_call_started'] as const)
@@ -4239,10 +4246,11 @@ test('typed empty stop in the bridge uses the exact public failure winner withou
   const response = await respondViaHarness('webhook', { sessionId, message: 'Answer once.' });
   assert.equal(calls, 1);
   assert.equal(response.stoppedReason, 'error');
-  assert.equal(response.text, 'I did not receive a usable reply or next step from the model, so this request is still unfinished. Ask me to continue the unfinished work, or choose another model.');
+  assert.equal(response.text, 'The model returned no usable reply or next step, so this request is unfinished. Continue the unfinished work, or choose another model.');
   assert.doesNotMatch(response.text, /PRIVATE|no tools|nothing changed|usage|sign.in/i);
   const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
   assert.equal(terminals.length, 1);
+  assert.deepEqual(projectHarnessEventForPublic(terminals[0]!)?.data.notice, { code: 'model_stalled' });
   const presentation = terminals[0].data.presentation as { identity: { sourceUserSeq: number }; status: string; resumable: boolean };
   assert.equal(presentation.status, 'failed');
   assert.equal(presentation.resumable, false);

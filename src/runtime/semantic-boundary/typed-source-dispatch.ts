@@ -338,7 +338,10 @@ function dispatchPersistedRunResult(
         hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
       };
     }
-    presentation = commitTurnOutcome(safeFallbackOutcome(identity, result.status)).presentation;
+    // The generic failure is app status: its notice is what desktop and phone
+    // draw, never the line as Clem's reply.
+    presentation = commitTurnOutcome(safeFallbackOutcome(identity, result.status),
+      result.status === 'failed' ? { metadata: { hostNotice: { code: 'run_failed' } } } : {}).presentation;
   }
 
   if (!presentation) {

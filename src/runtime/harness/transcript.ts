@@ -12,7 +12,7 @@ import type { UnifiedSessionTurn } from '../../types.js';
 import { listEvents } from './eventlog.js';
 import { assertPublicPresentationText } from './turn-outcome.js';
 import {
-  PUBLIC_RUN_FAILURE_TEXT,
+  isPublicRunFailureText,
   publicCompletionText,
   publicPresentationText,
   publicReplyText,
@@ -395,7 +395,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
       // passively reads as the work failing (live 2026-08-04, a rate-limited
       // relay). The deferred re-fire speaks the real outcome once the brain
       // recovers; a successful relay reply still renders normally.
-      if (userTurns.length === 0 && assistant.text === PUBLIC_RUN_FAILURE_TEXT) continue;
+      if (userTurns.length === 0 && isPublicRunFailureText(assistant.text)) continue;
       settled.push({
         order: source.event.seq,
         turns: attributed(source.key, [

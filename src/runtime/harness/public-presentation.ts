@@ -162,13 +162,25 @@ const SAFE_TERMINAL_FALLBACK =
 const LEGACY_MISSING_REPLY_FALLBACK =
   'I do not have a final reply to confirm this request is complete. Ask me to check what completed and what remains before continuing.';
 /** The host could not seal a model request because its local vault has no
- *  seal key. Live 2026-09-08: a desktop user's every first message died as
- *  "Something went wrong" while the only trace was a boot-time warning. */
-export const PUBLIC_VAULT_NOT_READY_TEXT = 'Clementine\'s local vault isn\'t ready, so no model request can start. Quit and reopen Clementine; if this keeps happening, tell me and I\'ll walk you through repairing the home folder.';
-export const PUBLIC_RUN_FAILURE_TEXT = 'I couldn\'t finish this request. The error\'s cause is not confirmed yet. Ask me to check what completed and what remains before retrying.';
-export const PUBLIC_MODEL_EMPTY_COMPLETION_TEXT = 'I did not receive a usable reply or next step from the model, so this request is still unfinished. Ask me to continue the unfinished work, or choose another model.';
+ *  seal key, so every model request fails before it starts. */
+export const PUBLIC_VAULT_NOT_READY_TEXT = 'Clementine\'s local vault isn\'t ready, so no model request can start. Quit and reopen Clementine; if this keeps happening, the home folder needs repair.';
+// The failure lines below are app status, not Clem's words: no first person.
+// They serve the CLI, channels and model history; desktop and phone draw the
+// notice published beside them instead (see publicRunFailureTerminal).
+export const PUBLIC_RUN_FAILURE_TEXT = 'This request stopped on an error before it finished. The cause is not confirmed yet. Check what completed and what remains before retrying.';
+export const PUBLIC_MODEL_EMPTY_COMPLETION_TEXT = 'The model returned no usable reply or next step, so this request is unfinished. Continue the unfinished work, or choose another model.';
 
-export const PUBLIC_CODEX_AUTH_EXPIRED_TEXT = 'Your Codex sign-in expired or was revoked, so this request is still unfinished. Sign in again in Settings > Model accounts, then ask me to continue the unfinished work.';
+export const PUBLIC_CODEX_AUTH_EXPIRED_TEXT = 'The Codex sign-in expired or was revoked, so this request is unfinished. Sign in again in Settings > Model accounts, then continue the unfinished work.';
+
+/** The generic failure line as earlier releases stored it. Durable rows keep
+ * their bytes, so readers that recognize the generic failure accept both. */
+const LEGACY_PUBLIC_RUN_FAILURE_TEXT = 'I couldn\'t finish this request. The error\'s cause is not confirmed yet. Ask me to check what completed and what remains before retrying.';
+
+/** Whether a stored terminal text is the generic failure line, current or as
+ * an earlier release stored it. */
+export function isPublicRunFailureText(text: string): boolean {
+  return text === PUBLIC_RUN_FAILURE_TEXT || text === LEGACY_PUBLIC_RUN_FAILURE_TEXT;
+}
 
 export const PUBLIC_BLOCKED_NEXT_STEP_TEXT = 'The next step is blocked, so this request is still unfinished. Ask me to check the blocker and any completed work before continuing.';
 
@@ -188,32 +200,76 @@ export function publicRunFailureText(kind?: PublicRunFailureKind): string {
     : kind === 'codex.auth_expired' ? PUBLIC_CODEX_AUTH_EXPIRED_TEXT
       : PUBLIC_RUN_FAILURE_TEXT;
 }
-/**
- * A model account that has used up its allowance or credit is not a mystery
- * failure: its owner can fix it, and trying again unchanged meets the same
- * refusal. Says so, and quotes the provider's own words when they are one
- * short plain sentence (they usually name where to add more). Null for any
- * other failure, which keeps the generic text and its diagnostic private.
- */
-export function publicProviderCapacityText(error: unknown): string | null {
+/** A provider refusal for lack of credit or usage, read from the provider's
+ * error text, with the words quotable only when they are one short plain
+ * sentence (they usually name where to add more). */
+function providerCapacityRefusal(error: unknown): { credit: boolean; providerSaid?: string } | null {
   const raw = typeof error === 'string' ? error.replace(/\s+/g, ' ').trim() : '';
   if (!raw) return null;
   const credit = isProviderCreditRefusal(undefined, raw);
   if (!credit && !isProviderCapacityExhausted(raw)) return null;
   const quotable = raw.length <= 240 && !/[{}[\]<>"]/.test(raw);
+  return { credit, ...(quotable ? { providerSaid: raw } : {}) };
+}
+
+function providerCapacityLine(refusal: { credit: boolean; providerSaid?: string }): string {
   return [
-    credit
-      ? 'The model account this work runs on is out of credit, so I stopped here.'
-      : 'The model account this work runs on has used up its usage, so I stopped here.',
-    quotable ? `Its provider said: “${raw}”` : '',
-    credit
+    refusal.credit
+      ? 'The model account this work runs on is out of credit, so this run stopped.'
+      : 'The model account this work runs on has used up its usage, so this run stopped.',
+    refusal.providerSaid ? `Its provider said: “${refusal.providerSaid}”` : '',
+    refusal.credit
       ? 'Add credit on that account or choose a different model for this work, then resume or ask again.'
       : 'Add usage on that account (or wait for its limit to reset) or choose a different model for this work, then resume or ask again.',
     'The work done so far is saved.',
   ].filter(Boolean).join(' ');
 }
+
+/**
+ * A model account that has used up its allowance or credit is not a mystery
+ * failure: its owner can fix it, and trying again unchanged meets the same
+ * refusal. Says so in app voice, and quotes the provider's own words when they
+ * are one short plain sentence. Null for any other failure, which keeps the
+ * generic text and its diagnostic private.
+ */
+export function publicProviderCapacityText(error: unknown): string | null {
+  const refusal = providerCapacityRefusal(error);
+  return refusal ? providerCapacityLine(refusal) : null;
+}
+
+/**
+ * The failed terminal for a run: an app-voice line for the CLI, channels and
+ * model history, and the notice desktop and phone draw as a status line with
+ * its action. Closed facts only: a typed failure kind first, then a provider's
+ * credit or usage refusal, else the generic failure. Private error text never
+ * becomes the line; only a quotable provider refusal travels, as the
+ * provider's words.
+ */
+export function publicRunFailureTerminal(input: {
+  failureKind?: PublicRunFailureKind;
+  /** Provider error text, read only for a credit or usage refusal. */
+  error?: unknown;
+}): { text: string; notice: TerminalNotice } {
+  if (input.failureKind === 'codex.auth_expired') {
+    return { text: PUBLIC_CODEX_AUTH_EXPIRED_TEXT, notice: { code: 'codex_sign_in_expired' } };
+  }
+  if (input.failureKind === 'model.empty_completion') {
+    return { text: PUBLIC_MODEL_EMPTY_COMPLETION_TEXT, notice: { code: 'model_stalled' } };
+  }
+  const refusal = providerCapacityRefusal(input.error);
+  if (refusal) {
+    return {
+      text: providerCapacityLine(refusal),
+      notice: {
+        code: refusal.credit ? 'provider_out_of_credit' : 'provider_quota',
+        ...(refusal.providerSaid ? { providerSaid: refusal.providerSaid } : {}),
+      },
+    };
+  }
+  return { text: PUBLIC_RUN_FAILURE_TEXT, notice: { code: 'run_failed' } };
+}
 export const PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT =
-  'I could not start this turn because no model runtime is connected. Open Settings > Models, connect a model, and try again.';
+  'No model runtime is connected, so this turn could not start. Open Settings > Models, connect a model, and try again.';
 
 export type PublicHeldKind = 'blocked' | 'uncertain';
 

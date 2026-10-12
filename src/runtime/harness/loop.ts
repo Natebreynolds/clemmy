@@ -166,14 +166,12 @@ import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from '.
 import { synthesizeTurnReport } from './work-report.js';
 import {
   approvalPreviewProjection,
-  PUBLIC_RUN_FAILURE_TEXT,
   PUBLIC_BLOCKED_NEXT_STEP_TEXT,
   PUBLIC_CODEX_AUTH_EXPIRED_TEXT,
   publicRunFailureKind,
-  publicRunFailureText,
+  publicRunFailureTerminal,
   type PublicRunFailureKind,
   PUBLIC_VAULT_NOT_READY_TEXT,
-  publicProviderCapacityText,
   publicAsyncWorkDispatchedData,
   publicReplyText,
 } from './public-presentation.js';
@@ -1400,22 +1398,24 @@ function reduceStandardConversationTerminal(input: {
       if (result.blockedReason === 'owner_response_format_unmet') hostNotice = { code: 'response_format_unmet' };
       else if (result.blockedReason === 'owner_response_format_unqualified') hostNotice = { code: 'response_format_unqualified' };
       break;
-    case 'failed':
+    case 'failed': {
+      // A failure is app status, never Clem's words: an app-voice line for
+      // the CLI, channels and model history, and a notice desktop and phone
+      // draw as a status line with its action. A vault that is not ready has
+      // no notice of its own and draws as the generic failure.
+      const failure = !result.failureKind
+        && /authority_seal_key_missing|authority seal key is missing/.test(String(result.error ?? ''))
+        ? { text: PUBLIC_VAULT_NOT_READY_TEXT, notice: { code: 'run_failed' } satisfies TerminalNotice }
+        : publicRunFailureTerminal({ failureKind: result.failureKind, error: result.error });
       outcome = {
         version: 2,
         id: turnOutcomeId(identity),
         identity,
         status: 'failed',
         resumable: false,
-        presentation: {
-          kind: 'error',
-          text: result.failureKind
-            ? publicRunFailureText(result.failureKind)
-            : /authority_seal_key_missing|authority seal key is missing/.test(String(result.error ?? ''))
-            ? PUBLIC_VAULT_NOT_READY_TEXT
-            : publicProviderCapacityText(result.error) ?? PUBLIC_RUN_FAILURE_TEXT,
-        },
+        presentation: { kind: 'error', text: failure.text },
       };
+      hostNotice = failure.notice;
       legacyReason = 'failed';
       // The returned failure owns the diagnostic. An advisory run_failed
       // append can be absent (for example after source-scoped journaling
@@ -1435,6 +1435,7 @@ function reduceStandardConversationTerminal(input: {
         } catch { /* advisory metadata only */ }
       }
       break;
+    }
   }
 
   const committed = commitStopSettlingRevokedCalls(outcome, () => commitTurnOutcome(outcome, {

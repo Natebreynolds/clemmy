@@ -3344,7 +3344,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           text: PUBLIC_RUN_FAILURE_TEXT,
           status: 'failed',
           reason: stage,
-          metadata: { approvalId: id, decision },
+          metadata: { approvalId: id, decision, hostNotice: { code: 'run_failed' } },
         });
         committed = true;
       } catch (commitErr) {
@@ -3534,7 +3534,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             text: PUBLIC_RUN_FAILURE_TEXT,
             status: 'failed',
             reason: 'mobile_approval_resume_failed',
-            metadata: { approvalId: id, decision },
+            metadata: { approvalId: id, decision, hostNotice: { code: 'run_failed' } },
           });
           committed = true;
         } catch (commitErr) {
@@ -3733,6 +3733,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           text: PUBLIC_RUN_FAILURE_TEXT,
           status: 'failed',
           reason: 'mobile_session_control_failed',
+          metadata: { hostNotice: { code: 'run_failed' } },
         });
       } catch { /* the accepted source remains the durable retry fence */ }
       settleMobileApprovalAttempt(attempt, 'failed');

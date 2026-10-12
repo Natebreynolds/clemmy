@@ -20,7 +20,7 @@ const { BoundaryError } = await import('../boundary-error.js');
 const { CodexModelError } = await import('./codex-model.js');
 const { projectHarnessEventForPublic, PUBLIC_CODEX_AUTH_EXPIRED_TEXT, PUBLIC_BLOCKED_NEXT_STEP_TEXT } = await import('./public-presentation.js');
 
-const EMPTY_STOP_TEXT = 'I did not receive a usable reply or next step from the model, so this request is still unfinished. Ask me to continue the unfinished work, or choose another model.';
+const EMPTY_STOP_TEXT = 'The model returned no usable reply or next step, so this request is unfinished. Continue the unfinished work, or choose another model.';
 
 test('typed empty stop survives the production result carrier and replay preserves a settled effect receipt', async () => {
   const sessionId = 'typed-empty-effect-replay';
@@ -52,6 +52,7 @@ test('typed empty stop survives the production result carrier and replay preserv
   assert.equal(eventlog.listEvents(sessionId, { types: ['run_failed'] }).at(-1)?.data.failureKind, 'model.empty_completion');
   assert.equal(terminal.data.failureDetail, 'PRIVATE_EMPTY_DIAGNOSTIC');
   assert.doesNotMatch(JSON.stringify(projectHarnessEventForPublic(terminal)), /PRIVATE_EMPTY_DIAGNOSTIC|failureDetail/);
+  assert.deepEqual(projectHarnessEventForPublic(terminal)?.data.notice, { code: 'model_stalled' });
   assert.doesNotMatch(failed.publicPresentation?.text ?? '', /PRIVATE|no tools|nothing changed|usage|sign.in/i);
   const replay = await runConversation(options);
   assert.equal(calls, 1, 'reading the exact failed winner must not re-run the model or effect');
@@ -105,6 +106,7 @@ test('proven Codex revocation retains reconnect instructions across result, exac
     assert.equal(failed.failureKind, 'codex.auth_expired');
     assert.equal(eventlog.listEvents(sessionId, { types: ['run_failed'] }).at(-1)?.data.failureKind, 'codex.auth_expired');
     assert.doesNotMatch(JSON.stringify(projectHarnessEventForPublic(terminal)), /PRIVATE|token_revoked|login-native|failureDetail/);
+    assert.deepEqual(projectHarnessEventForPublic(terminal)?.data.notice, { code: 'codex_sign_in_expired' });
     assert.deepEqual((await runConversation(options)).publicPresentation, failed.publicPresentation);
     assert.equal(calls, 1, 'exact failed source replay never retries revoked auth');
     const next = eventlog.appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Different request.' } });
@@ -475,10 +477,16 @@ test('a job handed to an agent explains its stop in words too; a plain backgroun
 });
 
 test('a model account out of usage or credit is named, with the provider words; other failures stay generic', () => {
+  const notices = new Map<string, unknown>();
   const reduceFailed = (sessionId: string, error: string) => {
     const source = acceptedSource(sessionId);
-    return reduceStandardConversationTerminal({ sourceUserSeq: source.sourceUserSeq,
+    const text = reduceStandardConversationTerminal({ sourceUserSeq: source.sourceUserSeq,
       result: { sessionId, status: 'failed', steps: 1, lastTurn: source.turn, error } }).publicPresentation?.text ?? '';
+    const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)!;
+    notices.set(sessionId, projectHarnessEventForPublic(terminal)?.data.notice);
+    // A failure is app status: never a sentence written in Clem's voice.
+    assert.doesNotMatch(text, /\b(?:I|I’m|I'm|I’ll|I'll|me|my)\b/, `${sessionId}: ${text}`);
+    return text;
   };
   const usage = reduceFailed('capacity-usage', "You're out of extra usage. Add more at the provider's usage settings and keep going.");
   assert.match(usage, /used up its usage/);
@@ -494,6 +502,17 @@ test('a model account out of usage or credit is named, with the provider words; 
   assert.match(other, /cause.*not.*confirmed/i);
   assert.match(other, /what completed.*what remains.*before retrying/i);
   assert.doesNotMatch(other, /socket/);
+  // The clients draw these as status lines with their actions; only a
+  // quotable provider refusal travels, as the provider's words.
+  assert.deepEqual(notices.get('capacity-usage'), { code: 'provider_quota',
+    providerSaid: "You're out of extra usage. Add more at the provider's usage settings and keep going." });
+  assert.deepEqual(notices.get('capacity-credit'), { code: 'provider_out_of_credit',
+    providerSaid: 'Your credit balance is too low to access the API.' });
+  assert.deepEqual(notices.get('capacity-shaped'), { code: 'provider_quota' });
+  assert.deepEqual(notices.get('capacity-other'), { code: 'run_failed' }, 'private error text never travels');
+  const vault = reduceFailed('vault-not-ready', 'authority_seal_key_missing: PRIVATE');
+  assert.match(vault, /local vault isn't ready/);
+  assert.deepEqual(notices.get('vault-not-ready'), { code: 'run_failed' });
 });
 
 test('a stop explained as a question reaches the owner without the decision marker', async () => {
