@@ -65,22 +65,33 @@ import { learnHostRunStrategyForAcceptedTask } from './host-run-strategy-learnin
 import { learnResolvedReferencesForAcceptedTask } from './resolved-reference-learning.js';
 import { joinRouteOutcomeVerdict, scheduleRouteOutcomeJoin } from './route-outcome-join.js';
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
+import { parseRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 import { pendingAcceptedLocalWork } from './local-work-completion.js';
 import { getPlanRevisionForSource } from './plan-artifacts.js';
+import { WHOLE_JSON_OBJECT_FORMAT_FINDING } from './response-format-repair.js';
+import {
+  normalizeTerminalNotice,
+  OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT,
+  type TerminalNotice,
+} from './terminal-notice.js';
 
-/** A matching blocked review supersedes the rejected draft. Appending a
- * warning left claims such as "all succeeded" as the headline. Other review
- * qualifications retain the draft because they do not establish a replacement
- * account of the outcome. The caller retains the rejected text for audit. */
+/** A matching blocked review supersedes the rejected draft. Every other
+ * review outcome publishes the authored text unchanged: the review travels as
+ * terminal data (`review`, `reviewNote`) that clients show as a chip, never as
+ * a sentence added under Clem's words. The caller retains a superseded draft
+ * for audit. */
 export function completionReviewPresentation(input: {
-  authored: string; note: string; blockedFinding: string;
+  authored: string; blockedFinding: string;
   objectiveMatches: boolean; replyMatches: boolean;
 }): string {
   if (input.blockedFinding && input.objectiveMatches && input.replyMatches) {
     return input.blockedFinding;
   }
-  return input.authored ? `${input.authored}\n\n${input.note}` : input.note;
+  return input.authored;
 }
+
+/** The committer's review state for the exact published text. */
+export type TerminalReviewState = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck';
 
 export interface DeliveryCommitResult {
   event: EventRow;
@@ -140,6 +151,9 @@ const DELIVERY_METADATA_KEYS: ReadonlySet<string> = new Set([
   'autoResume',
   'autoResumeAttempt',
   'autoResumeCap',
+  // An app status (Stop, quota, format hold …) that clients render as chrome.
+  // Normalized to its closed shape below; an unknown code is dropped.
+  'hostNotice',
 ]);
 const WARM_DELIVERY_METADATA_KEYS: ReadonlySet<string> = new Set([
   'artifactId',
@@ -661,6 +675,11 @@ function safeDeliveryMetadata(
   for (const key of DELIVERY_METADATA_KEYS) {
     if (metadata[key] !== undefined) selected[key] = metadata[key];
   }
+  if (selected.hostNotice !== undefined) {
+    const notice = normalizeTerminalNotice(selected.hostNotice);
+    if (notice) selected.hostNotice = notice;
+    else delete selected.hostNotice;
+  }
   if (warmTransport) {
     for (const key of WARM_DELIVERY_METADATA_KEYS) {
       if (metadata[key] !== undefined) selected[key] = metadata[key];
@@ -1181,14 +1200,20 @@ export function commitTurnOutcome(
       attemptId: attempt.attemptId, runId: attempt.runId,
     }) !== null;
     if (stopped) {
+      // The owner's own Stop is app chrome, not something Clem says: an
+      // app-voice line for the CLI, channels and model history, plus a notice
+      // the clients render as the Stop pill. The retained-work checkpoint is
+      // re-projected from the ledger onto this line below, so the durable row
+      // keeps its handles and what was kept travels as counts.
       effectiveOutcome = {
         ...effectiveOutcome,
         status: 'cancelled',
         resumable: false,
-        presentation: { kind: 'stopped', text: 'Stopped as requested. Completed results are kept.' },
+        presentation: { kind: 'stopped', text: OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT },
       };
       const { blockedReason: _reason, blockedDetail: _detail, ...metadata } = effectiveOptions.metadata ?? {};
-      effectiveOptions = { ...effectiveOptions, legacyReason: 'cancelled', metadata };
+      const hostNotice: TerminalNotice = { code: 'stopped' };
+      effectiveOptions = { ...effectiveOptions, legacyReason: 'cancelled', metadata: { ...metadata, hostNotice } };
     } else {
       effectiveOutcome = {
         ...effectiveOutcome,
@@ -1514,6 +1539,46 @@ export function commitTurnOutcome(
   const verificationRequired = reviewWasEnabled
     && (Boolean(publishedVerdict) || inheritedReadReviewRequired || artifactsRequired || !settledNow.evidenceAvailable);
   const verificationFailed = verificationRequired && !verdictTrustworthy;
+  // THE REVIEW IS CHROME, NEVER A SENTENCE UNDER CLEM'S WORDS.
+  //
+  // A completed answer publishes exactly as authored; what its review found
+  // travels as `review` (and, for a real reviewer finding, `reviewNote`) for
+  // the clients' review chip. Only a completed answer the caller proposed
+  // carries it: a stop, a question or a plan ask is not a reviewed answer.
+  // A run whose owner turned review off, and the narrow conversational skip,
+  // carry no review state at all.
+  const reviewApplies = outcome.status === 'done'
+    && (effectiveOutcome.status === 'done' || effectiveOutcome.status === 'blocked');
+  // The format miss on the exact judged reply, for the request it was judged
+  // against. It becomes an app notice only on a terminal that is not a
+  // finished answer (see below), whatever the semantic verdict said.
+  const formatUnmetNotice = reviewApplies && reviewWasEnabled
+    && publishedVerdict?.responseFormatUnmet === true && objectiveMatches && replyMatches;
+  const reviewState: TerminalReviewState | undefined = (() => {
+    if (!reviewApplies || !reviewWasEnabled || reviewDisposition === 'not_required') return undefined;
+    if (verdictTrustworthy) return 'checked';
+    if (!verificationRequired) return undefined;
+    if (!publishedVerdict) return 'unchecked';
+    // A verdict recorded against another request, reply or plan says nothing
+    // about the text being published: unchecked, and none of its findings are
+    // quoted beside words the owner is not reading.
+    if (!objectiveMatches || !replyMatches || !planMatches) return 'unchecked';
+    // A host evidence hold is not a reviewer finding: the saved evidence the
+    // review rested on changed, so the result needs a fresh check.
+    if (publishedVerdict.hostEvidenceHold === true) return 'needs_recheck';
+    if (publishedVerdict.failedOpen === true) return 'unchecked';
+    if (publishedVerdict.responseFormatUnmet === true || !publishedVerdict.fulfills) return 'rejected';
+    return 'unchecked';
+  })();
+  // The reviewer's own finding, bounded, for the chip's detail. The host's
+  // format finding is model-facing repair input and is never quoted; a
+  // format-only miss (the reviewer otherwise passed the reply) has no finding.
+  const reviewNote = (() => {
+    if (reviewState !== 'rejected' || !publishedVerdict?.reason) return undefined;
+    if (publishedVerdict.responseFormatUnmet === true && publishedVerdict.repairScope === 'reply_format') return undefined;
+    const finding = publishedVerdict.reason.split(WHOLE_JSON_OBJECT_FORMAT_FINDING).join(' ').replace(/\s+/g, ' ').trim();
+    return finding ? reviewFindingForOwner(finding, 400) : undefined;
+  })();
   if (verificationFailed && effectiveOutcome.status === 'done') {
     // TYPED INDEPENDENT CAUSES, tested in order of what is actually knowable.
     // Previously a MISSING verdict fell through to "reply mismatch" (there was
@@ -1542,67 +1607,19 @@ export function commitTurnOutcome(
                   : !artifactsMatch
                     ? 'completion_review_artifact_drift'
                     : 'completion_review_did_not_stand';
-    // Ordinary qualifications retain the draft plus a note. A matching BLOCKED
-    // finding supersedes the rejected draft below; neither path repeats or
-    // undoes any effect. Retain superseded prose in internal event history.
-    const NOTES: Record<string, string> = {
-      completion_review_plan_mismatch: 'Verification note: the saved plan differs from the plan that was reviewed. Its final contents need review.',
-      completion_review_absent:
-        'Verification note: no completion review was recorded for this request, so nothing '
-        + 'has confirmed the result. Ask me to check it.',
-      completion_review_failed_open:
-        'Verification note: I could not get this result independently reviewed, so it stands unreviewed. '
-        + 'The review model is not reachable with the current model setup. Ask me to re-check it, '
-        + 'or choose a reachable review model in your model settings.',
-      completion_review_negative:
-        'Verification note: the completion review did not accept this write-up. '
-        + (publishedVerdict?.reason ? `${reviewFindingForOwner(publishedVerdict.reason)} ` : '')
-        + 'The tool receipts from this request are still retained; I can re-read those next.',
-      completion_review_evidence_unreadable:
-        'Verification note: I could not read the record of what this request wrote, so I '
-        + 'cannot confirm the result. Ask me to re-check it.',
-      completion_review_coverage_incomplete:
-        'Verification note: the review did not cover everything this request wrote. The '
-        + 'files themselves still match their receipts. Ask me to review the remaining work.',
-      completion_review_objective_mismatch:
-        'Verification note: the completion review was recorded against a different request, '
-        + 'so it does not vouch for this one. Ask me to re-check this result.',
-      completion_review_reply_mismatch:
-        'Verification note: the completion review was recorded against different reply text, '
-        + 'so it does not vouch for what you are reading. Ask me to re-check this result.',
-      completion_review_artifact_drift:
-        'Verification note: the saved file no longer matches the receipt for this write, so '
-        + 'I could not confirm the result. Ask me to re-read it and report what it now '
-        + 'contains before relying on this.',
-      completion_review_did_not_stand:
-        'Verification note: the completion review did not stand for this result, so it is '
-        + 'unconfirmed. Ask me to re-check it.',
-    };
-    // The reviewer's unavailability reason is operator diagnosis (model ids,
-    // routing modes, settings to change). It is recorded on the verdict row
-    // for the console; the person in the chat gets one plain sentence.
-    // A BLOCKED review already names what did not happen and what stands in
-    // the way, written for the owner; that finding is the note.
-    const blockedFinding = detail === 'completion_review_blocked'
+    // The draft stands exactly as authored for every cause. A matching BLOCKED
+    // reviewer finding still supersedes the rejected draft below; neither path
+    // repeats or undoes any effect. Superseded prose stays in internal history.
+    // A host evidence hold is not a reviewer finding and never replaces the
+    // answer: Clem's words stand and the chip asks for a fresh check.
+    const blockedFinding = detail === 'completion_review_blocked' && publishedVerdict?.hostEvidenceHold !== true
       ? (publishedVerdict?.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 400)
       : '';
-    // A reviewer that ran out of time was reached; it did not finish. Saying
-    // it could not be reached sends the owner to change a working setup.
-    const reviewTimedOut = detail === 'completion_review_failed_open' && publishedVerdict?.reviewFailure === 'timeout';
-    const note = answeredUnqualified
-      ? 'Verification note: I couldn’t verify all of this answer.'
-      : blockedFinding
-      ? `Verification note: ${blockedFinding}`
-      : reviewTimedOut
-        ? 'Verification note: the review of this result did not finish within its time limit, so it stands unreviewed. '
-          + 'Ask me to re-check it.'
-        : NOTES[detail]
-          ?? (detail === 'completion_review_blocked' ? NOTES.completion_review_negative! : NOTES.completion_review_did_not_stand!);
     const authored = effectiveOutcome.presentation.text.trim();
     const reviewedPresentation = completionReviewPresentation({
-      authored, note, blockedFinding, objectiveMatches, replyMatches,
+      authored, blockedFinding, objectiveMatches, replyMatches,
     });
-    if (reviewedPresentation === blockedFinding && authored !== reviewedPresentation) {
+    if (blockedFinding && reviewedPresentation === blockedFinding && authored !== reviewedPresentation) {
       // Terminal metadata intentionally excludes arbitrary prose. Keep the
       // rejected draft in internal history, never in the public answer envelope.
       const replyDigest = createHash('sha256').update(authored).digest('hex');
@@ -1621,7 +1638,7 @@ export function commitTurnOutcome(
         },
       });
     }
-    const withNote = {
+    const reviewedOutcome = {
       ...effectiveOutcome,
       presentation: {
         ...effectiveOutcome.presentation,
@@ -1639,8 +1656,15 @@ export function commitTurnOutcome(
     // Claude login in that home. Blocking finished work on the absence of a
     // check teaches people to distrust the check, not the work.
     //
-    // Honesty is kept exactly where it belongs. The note still says the result
-    // is unreviewed, and the verdict record still carries verified:false with
+    // A reviewer that answered but could not qualify the exact authored answer
+    // (`answered_unqualified`: its assessment was missing, malformed or
+    // unbound) keeps the unverified hold: blocked and resumable, Clem's words
+    // unchanged, the chip unchecked. Whether it should follow the brain like an
+    // unreachable reviewer is a review-policy decision of its own, not part of
+    // how the result is worded.
+    //
+    // Honesty is kept exactly where it belongs. The review chip says the result
+    // is unchecked, and the verdict record still carries verified:false with
     // disposition enabled_unavailable, so nothing here ever claims a review
     // happened. Only the terminal follows the brain.
     //
@@ -1653,20 +1677,22 @@ export function commitTurnOutcome(
     // state-machine-hold branch, which deliberately drops the verdict reference:
     // the turn was held anyway AND lost its review record, strictly worse than
     // doing nothing. So the fallback for THIS branch is the exact terminal this
-    // decision replaced — the unverified hold, with its note and its verdict
-    // reference intact — and never the generic hold.
-    const reviewCouldNotFire = detail === 'completion_review_failed_open'
-      && publishedVerdict?.fulfills === true
-      && publishedVerdict.settledEvidenceAvailable !== false
+    // decision replaced — the unverified hold, with its review state and its
+    // verdict reference intact — and never the generic hold.
+    const joinsStand = publishedVerdict?.settledEvidenceAvailable !== false
       && settledNow.evidenceAvailable
       && replyMatches
       && objectiveMatches
       && artifactsMatch
       && (!artifactsRequired || coverageComplete);
+    const reviewCouldNotFire = detail === 'completion_review_failed_open'
+      && publishedVerdict?.fulfills === true
+      && publishedVerdict.hostEvidenceHold !== true
+      && joinsStand;
     unverifiedHoldFallback = reviewCouldNotFire
-      ? () => unverifiedCompletionOutcome(withNote, true)
+      ? () => unverifiedCompletionOutcome(reviewedOutcome, true)
       : null;
-    effectiveOutcome = reviewCouldNotFire ? withNote : unverifiedCompletionOutcome(withNote, true);
+    effectiveOutcome = reviewCouldNotFire ? reviewedOutcome : unverifiedCompletionOutcome(reviewedOutcome, true);
     effectiveOptions = {
       ...effectiveOptions,
       // The verification projection changed done to blocked. Derive the
@@ -1675,6 +1701,26 @@ export function commitTurnOutcome(
       metadata: { ...(effectiveOptions.metadata ?? {}), verificationDetail: detail },
     };
   }
+  // The owner asked for one whole JSON object and the reviewed reply is not
+  // one. Nothing is added to a reply that must be JSON only. On the hold that
+  // keeps Clem's draft the miss is an app notice. A finished answer never
+  // carries a notice: clients draw a notice terminal as app status in place of
+  // the bubble, so a notice there would hide Clem's answer; its review chip
+  // carries the state instead.
+  const withFormatUnmetNotice = (
+    status: TurnOutcome['status'],
+    options: DeliveryCommitOptions,
+  ): DeliveryCommitOptions => {
+    if (!formatUnmetNotice || status === 'done' || options.metadata?.hostNotice !== undefined) return options;
+    const hostNotice: TerminalNotice = { code: 'response_format_unmet' };
+    return { ...options, metadata: { ...(options.metadata ?? {}), hostNotice } };
+  };
+  effectiveOptions = withFormatUnmetNotice(effectiveOutcome.status, effectiveOptions);
+  // The review chip for the exact text being published, derived here from the
+  // durable verdict rather than accepted from caller metadata.
+  const reviewMetadata = reviewState
+    ? { review: reviewState, ...(reviewNote ? { reviewNote } : {}) }
+    : {};
   const verdictMetadata = publishedVerdict ? { completionVerdictRef: {
     ...(publishedPlan ? { planMatches, planDigest: publishedVerdict.planDigest } : {}),
     version: 1 as const,
@@ -1698,10 +1744,14 @@ export function commitTurnOutcome(
         : verdictTrustworthy ? reviewDisposition : 'enabled_unavailable',
     policyEvidence,
     replyMatches,
-    // The digest above describes the AUTHORED text the review saw. When a host
-    // verification note is appended the delivered bytes differ from it, so the
-    // published text is not what was judged and must not read as though it were.
-    deliveredTextIsJudgedText: !verificationFailed,
+    // The digest above describes the AUTHORED text the review saw. This is the
+    // byte comparison of that digest with the text a person is actually given
+    // (the words before any durable retained-work checkpoint): a superseded
+    // draft, a rendering or any other rewrite is not what was judged and must
+    // not read as though it were.
+    deliveredTextIsJudgedText: Boolean(publishedVerdict.replyDigest)
+      && publishedVerdict.replyDigest
+        === replyDigestOf(parseRetainedWorkCheckpoint(effectiveOutcome.presentation.text.trim()).head),
     objectiveMatches,
     artifactsMatch,
     // Judged-vs-now per artifact, so a post-judgment change is visible rather
@@ -1749,7 +1799,7 @@ export function commitTurnOutcome(
   } : {};
   let data = {
     ...completionDataForTurnOutcome(effectiveOutcome, effectiveOptions),
-    ...planMetadata, ...verdictMetadata, ...refusalMetadata,
+    ...planMetadata, ...verdictMetadata, ...reviewMetadata, ...refusalMetadata,
   };
   let terminal;
   try {
@@ -1776,10 +1826,11 @@ export function commitTurnOutcome(
     // changes; only the outcome does.
     if (unverifiedHoldFallback) {
       effectiveOutcome = unverifiedHoldFallback();
+      effectiveOptions = withFormatUnmetNotice(effectiveOutcome.status, effectiveOptions);
       const heldPresentation = presentationEventForOutcome(effectiveOutcome);
       data = {
         ...completionDataForTurnOutcome(effectiveOutcome, effectiveOptions),
-        ...planMetadata, ...verdictMetadata, ...refusalMetadata,
+        ...planMetadata, ...verdictMetadata, ...reviewMetadata, ...refusalMetadata,
       };
       terminal = appendTerminalEventOnce({
         sessionId: heldPresentation.identity.sessionId,

@@ -1,6 +1,7 @@
 import type { Router, RequestHandler } from 'express';
 import type { EventRow, HarnessChatRequestReceipt, RunAttemptRecord } from '../runtime/harness/eventlog.js';
 import type { PresentationEvent } from '../runtime/harness/turn-outcome.js';
+import { normalizeTerminalNotice, type TerminalNotice } from '../runtime/harness/terminal-notice.js';
 
 /** A source-only public presentation is valid, but speech/relisten also needs
  * the durable executor that produced it. Never infer that from the newest
@@ -40,6 +41,9 @@ export interface NativeVoiceTerminal {
   /** Positive proof from the exact committed/source events, never reply prose. */
   ordinaryQuestion?: boolean;
   requiresApp?: boolean;
+  /** The projected terminal's app status. A notice terminal's text is never
+   * Clem's reply, so it is never spoken. */
+  notice?: TerminalNotice;
 }
 
 type EventData = Record<string, unknown>;
@@ -77,6 +81,21 @@ export function nativeVoiceControlBoundary(input: {
  * Streaming drafts, child completions, and another turn never become speech. */
 export function nativeVoiceStatus(terminal: NativeVoiceTerminal | null) {
   if (!terminal) return { state: 'working' as const, canResumeVoice: false };
+  // An app status (a Stop, a quota or sign-in hold, a format hold) is chrome,
+  // not Clem's words: nothing is spoken for it, not even a fallback line. The
+  // explicit empty text is what keeps the widget silent; the notice is there
+  // for a surface that draws it.
+  const notice = normalizeTerminalNotice(terminal.notice);
+  if (notice) {
+    return {
+      state: 'needs_app' as const,
+      canResumeVoice: false,
+      sessionId: terminal.sessionId,
+      sourceUserSeq: terminal.sourceUserSeq,
+      text: '',
+      notice,
+    };
+  }
   const text = terminal.text.trim().slice(0, 12_000);
   const canContinue = !terminal.requiresApp && Boolean(text) && (
     (terminal.status === 'done' && terminal.kind === 'answer')

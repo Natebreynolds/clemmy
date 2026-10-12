@@ -1,5 +1,10 @@
 import { registerCloudBrowserRoutes } from './cloud-browser-routes.js';
-import { nativeVoiceControlBoundary, nativeVoiceTerminalIsExact, registerNativeVoiceStatus } from './mobile-native-voice-status.js';
+import {
+  nativeVoiceControlBoundary,
+  nativeVoiceTerminalIsExact,
+  registerNativeVoiceStatus,
+  type NativeVoiceTerminal,
+} from './mobile-native-voice-status.js';
 import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
@@ -3339,7 +3344,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           text: PUBLIC_RUN_FAILURE_TEXT,
           status: 'failed',
           reason: stage,
-          metadata: { approvalId: id, decision },
+          metadata: { approvalId: id, decision, hostNotice: { code: 'run_failed' } },
         });
         committed = true;
       } catch (commitErr) {
@@ -3529,7 +3534,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             text: PUBLIC_RUN_FAILURE_TEXT,
             status: 'failed',
             reason: 'mobile_approval_resume_failed',
-            metadata: { approvalId: id, decision },
+            metadata: { approvalId: id, decision, hostNotice: { code: 'run_failed' } },
           });
           committed = true;
         } catch (commitErr) {
@@ -3728,6 +3733,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           text: PUBLIC_RUN_FAILURE_TEXT,
           status: 'failed',
           reason: 'mobile_session_control_failed',
+          metadata: { hostNotice: { code: 'run_failed' } },
         });
       } catch { /* the accepted source remains the durable retry fence */ }
       settleMobileApprovalAttempt(attempt, 'failed');
@@ -3813,6 +3819,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     return { sessionId: receipt.sessionId, terminal: exactTerminal && presentation && attempt?.sourceUserSeq
       ? { sessionId: receipt.sessionId, sourceUserSeq: attempt.sourceUserSeq, status: presentation.status,
           kind: presentation.kind, text: presentation.text, requiresApp,
+          ...(published?.data.notice !== undefined ? { notice: published.data.notice as NativeVoiceTerminal['notice'] } : {}),
           ordinaryQuestion: Boolean(presentation.status === 'needs_input'
             && presentation.kind === 'question' && presentation.needs?.kind === 'input' && !requiresApp) } : null };
   });

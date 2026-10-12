@@ -1683,7 +1683,10 @@ test('respondPreferHarness: harness auth unavailable blocks by default instead o
   assert.equal(res.stoppedReason, 'blocked');
   assert.match(res.text, /no model runtime is connected/i);
   assert.doesNotMatch(res.text, /no auth/i, 'provider diagnostics stay out of public copy');
+  assert.doesNotMatch(res.text, /\b(?:I|I’m|I'm|me|my)\b/, 'an app status, never a sentence written for Clem');
   assert.equal(listEvents('bridge-t3', { types: ['conversation_completed'] }).length, 1);
+  assert.deepEqual(projectHarnessEventForPublic(listEvents('bridge-t3', { types: ['conversation_completed'] })[0]!)?.data.notice,
+    { code: 'no_model_connected' });
   assert.equal((res.raw as { terminalCommitted?: boolean })?.terminalCommitted, true);
   assert.equal(HarnessSession.load('bridge-t3')?.runInFlightSince(), null);
 });
@@ -1944,10 +1947,14 @@ test('saved agent model unavailable commits its exact-source block before any mo
   assert.match(response.text, /Connect that model in Settings > Models/);
   assert.doesNotMatch(response.text, /quota snapshot/);
   assert.notEqual(response.text, PUBLIC_RUN_FAILURE_TEXT);
+  // An app status, not something Clem says: no model ran this turn.
+  assert.doesNotMatch(response.text, /\b(?:I|I’m|I'm|me|my)\b/);
   const source = listEvents(sessionId, { types: ['user_input_received'] });
   assert.equal(source.length, 1);
   const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
   assert.equal(terminals.length, 1);
+  assert.deepEqual(projectHarnessEventForPublic(terminals[0]!)?.data.notice,
+    { code: 'saved_model_unavailable', agentName: 'Unavailable Specialist', model: 'claude-opus-5-5' });
   assert.equal((terminals[0]?.data.presentation as { identity: { sourceUserSeq: number }; status: string }).identity.sourceUserSeq, source[0]!.seq);
   assert.equal((terminals[0]?.data.presentation as { status: string }).status, 'blocked');
   for (const type of ['turn_model_routed', 'turn_graph_shadow', 'tool_called', 'provider_call_started'] as const)
@@ -1982,10 +1989,12 @@ test('saved agent Codex quota hold keeps the exact source resumable without conn
   const request = { sessionId, message: 'Draft the controlled local plan.', channel: 'desktop', runId: 'quota-held-agent-attempt' };
   const response = await respondPreferHarness('home', request, async () => { work++; throw new Error('Legacy must not run.'); });
   assert.equal(response.stoppedReason, 'blocked');
-  assert.match(response.text, /latest Codex usage check shows no available quota/);
+  // An app status, not something Clem says: no model ran this turn.
+  assert.match(response.text, /No Codex quota is available/);
   assert.match(response.text, /gpt-6\.1-sol/);
   assert.match(response.text, /Quota Held Specialist/);
-  assert.match(response.text, /couldn’t start this turn/);
+  assert.match(response.text, /this turn did not start/);
+  assert.doesNotMatch(response.text, /\b(?:I|I’m|I'm|me|my)\b|Clem’s|usage check/);
   assert.doesNotMatch(response.text, /Connect that model|Settings > Models|retained task|snapshot|billing|remote refusal|automatically/i);
   const sources = listEvents(sessionId, { types: ['user_input_received'] });
   const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
@@ -1993,6 +2002,10 @@ test('saved agent Codex quota hold keeps the exact source resumable without conn
   assert.equal(terminals.length, 1);
   assert.equal(terminals[0]!.data.reason, 'saved_agent_codex_quota_exhausted');
   assert.equal(terminals[0]!.data.transport, 'harness_preflight_block');
+  assert.deepEqual(terminals[0]!.data.hostNotice,
+    { code: 'provider_quota', agentName: 'Quota Held Specialist', model: 'gpt-6.1-sol' });
+  assert.deepEqual(projectHarnessEventForPublic(terminals[0]!)?.data.notice,
+    { code: 'provider_quota', agentName: 'Quota Held Specialist', model: 'gpt-6.1-sol' });
   const presentation = terminals[0]!.data.presentation as { identity: { sourceUserSeq: number }; status: string; resumable: boolean };
   assert.equal(presentation.identity.sourceUserSeq, sources[0]!.seq);
   assert.equal(presentation.status, 'blocked');
@@ -4233,10 +4246,11 @@ test('typed empty stop in the bridge uses the exact public failure winner withou
   const response = await respondViaHarness('webhook', { sessionId, message: 'Answer once.' });
   assert.equal(calls, 1);
   assert.equal(response.stoppedReason, 'error');
-  assert.equal(response.text, 'I did not receive a usable reply or next step from the model, so this request is still unfinished. Ask me to continue the unfinished work, or choose another model.');
+  assert.equal(response.text, 'The model returned no usable reply or next step, so this request is unfinished. Continue the unfinished work, or choose another model.');
   assert.doesNotMatch(response.text, /PRIVATE|no tools|nothing changed|usage|sign.in/i);
   const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
   assert.equal(terminals.length, 1);
+  assert.deepEqual(projectHarnessEventForPublic(terminals[0]!)?.data.notice, { code: 'model_stalled' });
   const presentation = terminals[0].data.presentation as { identity: { sourceUserSeq: number }; status: string; resumable: boolean };
   assert.equal(presentation.status, 'failed');
   assert.equal(presentation.resumable, false);
@@ -5800,7 +5814,7 @@ test('held publication early bridge replay fences exact source before preparatio
 });
 
 
-test('Stop transport and exact replay show plain checkpoint copy while durable receipts keep their handles', async () => {
+test('Stop transport and exact replay show only the authored head while durable receipts keep their handles', async () => {
   const sessionId = 'stop-public-text-live-and-replay';
   const message = 'Run the named Stop transport fixture.';
   const durableText = 'Stopped.\n\nRetained work (durable checkpoint):\n- Source/tool fixture_read: completed result retained as rh_private_stop_transport.\nExternal write state (fixture_write): uncertain. Reconcile it before any retry.';
@@ -5826,8 +5840,9 @@ test('Stop transport and exact replay show plain checkpoint copy while durable r
   });
   const response = await respondViaHarness('home', { sessionId, message });
   assert.equal(response.stoppedReason, 'cancelled');
-  assert.match(response.text, /Stopped.*I kept the result/s);
-  assert.match(response.text, /can't yet confirm.*check before trying again/);
+  // What was kept and the uncertain outside change are terminal data for the
+  // clients' chrome; the bridge text is the authored words alone.
+  assert.equal(response.text, 'Stopped.');
   assert.doesNotMatch(response.text, /rh_|fixture_read|fixture_write|durable checkpoint/);
   const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
   assert.equal(terminals.length, 1);

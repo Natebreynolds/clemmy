@@ -1672,6 +1672,7 @@ export class ClementineGateway {
           status: 'failed',
           text: PUBLIC_RUN_FAILURE_TEXT,
           legacyReason: 'gateway_failed',
+          metadata: { hostNotice: { code: 'run_failed' } },
         });
         try { settleGatewayAttempt(activeAttempt, 'failed'); } catch { /* best effort */ }
         if (failed.presentation.status !== 'failed') {

@@ -11972,11 +11972,15 @@ test('named workflow dispatch seals before review and final child evidence owns 
         // that CANNOT FIRE follows the brain, so 'unavailable' publishes done
         // while still disclosing that the result is unreviewed and recording
         // verified:false. A review that RAN and came back NEGATIVE still blocks.
+        // The disclosure is the terminal's review state (the clients' chip),
+        // never a sentence under the delivered words.
         assert.equal(committed.presentation.status, 'done');
         if (variant === 'unavailable') {
-          assert.match(committed.presentation.text, /unreviewed/i, 'an unfired review is still disclosed');
+          assert.equal(committed.event.data.review, 'unchecked', 'an unfired review is still disclosed');
+          assert.doesNotMatch(committed.presentation.text, /Verification note|unreviewed/i);
           assert.equal((committed.event.data.completionVerdictRef as Record<string, unknown> | undefined)?.verified, false);
         }
+        if (variant === 'positive') assert.equal(committed.event.data.review, 'checked');
         const ref = committed.event.data.completionVerdictRef as Record<string, unknown> | undefined;
         if (variant === 'positive') {
           assert.equal(ref?.verified, true);
@@ -12409,12 +12413,19 @@ for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'tim
     assert.equal((terminal.event.data.completionVerdictRef as any)?.planMatches, true);
   } else if (variant === 'wrong_plan_digest') {
     assert.equal((terminal.event.data.completionVerdictRef as any)?.verified, false);
-    assert.match(terminal.presentation.text, /saved plan differs/);
+    // The plan reply publishes as written; the mismatch is the review chip.
+    assert.equal(terminal.presentation.text, committedText.trim());
+    assert.equal(terminal.event.data.review, 'unchecked');
+    assert.equal(terminal.event.data.verificationDetail, 'completion_review_plan_mismatch');
   } else if (variant === 'disabled') assert.equal((terminal.event.data.completionReview as any)?.disposition, 'disabled_by_owner');
   else assert.equal((terminal.event.data.completionVerdictRef as any)?.verified, false);
   if (variant === 'timed_out') {
-    assert.match(terminal.presentation.text, /did not finish within its time limit/);
-    assert.doesNotMatch(terminal.presentation.text, /not reachable/);
+    assert.equal(terminal.presentation.text, committedText.trim());
+    assert.equal(terminal.event.data.review, 'unchecked');
+    assert.equal(terminal.event.data.reviewNote, undefined);
+  }
+  if (variant === 'positive' || variant === 'correction' || variant === 'card_reply') {
+    assert.equal(terminal.event.data.review, 'checked');
   }
 
 });

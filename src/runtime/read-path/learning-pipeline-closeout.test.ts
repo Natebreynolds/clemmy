@@ -894,11 +894,12 @@ test('a warm paraphrase crosses the real host work carrier without planning or d
     assert.ok(typeof unavailableReason === 'string' && unavailableReason.trim().length > 0,
       'an unavailable completion review retains its actionable cause');
     // The reviewer's reason is operator diagnosis: it stays on the verdict row
-    // (asserted above) and the chat carries one plain sentence.
+    // (asserted above); the chat carries Clem's words and the review chip.
     assert.ok(!res.text.includes(unavailableReason),
       'the operator reason is not pasted into the chat text');
-    assert.match(res.text, /stands unreviewed/,
+    assert.equal(completion?.data.review, 'unchecked',
       `the authored read result is preserved without presenting unavailable review as verification: ${JSON.stringify({res, completion})}`);
+    assert.doesNotMatch(res.text, /Verification note|stands unreviewed/);
     assert.doesNotMatch(res.text, /accepting completion/,
       'the historical internal fail-open label is not a claim of successful completion');
   } finally {

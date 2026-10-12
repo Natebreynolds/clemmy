@@ -30,6 +30,7 @@ import {
 import type { ExactWorkflowRunOriginRecord } from '../tools/workflow-run-queue.js';
 import type { ExactOriginDeliveryTarget } from '../runtime/exact-origin-delivery.js';
 import {
+  isPublicRunFailureText,
   PUBLIC_RUN_FAILURE_TEXT,
   publicReplyText,
   publicUserInputText,
@@ -38,6 +39,7 @@ import {
   RETAINED_WORK_TERMINAL_HEADER,
   renderFailureWithRetainedWork,
 } from '../runtime/harness/retained-work-terminal.js';
+import { OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT } from '../runtime/harness/terminal-notice.js';
 export { resolveWorkflowOriginReplyTarget } from '../runtime/workflow-origin-authority.js';
 
 export type WorkflowOriginReplyTarget = ExactOriginDeliveryTarget;
@@ -318,7 +320,7 @@ export function workflowOriginTerminalCommitMatches(input: {
   ) return true;
   if (
     presentation.status === 'failed'
-    && presentation.text === PUBLIC_RUN_FAILURE_TEXT
+    && isPublicRunFailureText(presentation.text)
     && input.expectedText === PUBLIC_RUN_FAILURE_TEXT
   ) return true;
   if (input.outcome === 'failed' || input.outcome === 'cancelled') return false;
@@ -387,8 +389,8 @@ function commitParkedParentCancellation(
       } });
     return commitTurnOutcome(workflowTurnOutcome(
       { ...prepared.identity, runId: attempt.runId ?? attempt.attemptId, attemptId: attempt.attemptId },
-      'cancelled', 'Stopped as requested. Completed results are kept.', prepared.evidenceRunIds,
-    ), { legacyReason: 'cancelled', metadata: { transport: 'workflow_report_back' } });
+      'cancelled', OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT, prepared.evidenceRunIds,
+    ), { legacyReason: 'cancelled', metadata: { transport: 'workflow_report_back', hostNotice: { code: 'stopped' } } });
   }).immediate();
 }
 

@@ -456,7 +456,7 @@ test('the durable verdict of a real review names the stand-in and the checker it
   assert.equal(ref.substituteForExactPin, true);
 });
 
-test('with no family left, the durable verdict and the delivered answer say unreviewed, with the reason', async () => {
+test('with no family left, the durable verdict keeps the reason and the delivered terminal says unchecked', async () => {
   const run = await reportedBackWorkflow('checker-quota-durable-unreviewed');
   __setClaudeUsageForTests(claudeReading(100));
   claudeWire = 'bare_429';
@@ -473,5 +473,8 @@ test('with no family left, the durable verdict and the delivered answer say unre
   assert.equal(recorded.judgeModelId, undefined);
   const ref = committed.event.data.completionVerdictRef as Record<string, unknown>;
   assert.equal(ref.failedOpen, true);
-  assert.match(committed.presentation.text, /stands unreviewed/, 'the owner is told; nothing passes silently');
+  // The owner is told through the review chip; nothing passes silently and
+  // nothing is written under the delivered words.
+  assert.equal(committed.event.data.review, 'unchecked', 'the owner is told; nothing passes silently');
+  assert.doesNotMatch(committed.presentation.text, /Verification note|stands unreviewed/);
 });

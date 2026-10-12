@@ -28,6 +28,7 @@ const { shouldRunObjectiveJudge, buildObjectiveJudgePrompt, JUDGE_SYSTEM_PROMPT,
 const { recordCatalogWindow, recordWindowRejection } = await import('./model-window-observations.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
+const { withoutRetainedWorkCheckpoint } = await import('./retained-work-checkpoint.js');
 const { armHostCallAuthority } = await import('./accepted-turn-call-authority.js');
 const callAuthority = await import('./accepted-turn-call-authority.js');
 const hostBindings = await import('./host-call-capability-binding.js');
@@ -1473,8 +1474,10 @@ test('captured OFF holds a whole-answer format violation without extracting cont
   assert.equal(run.calls, 1);
   assert.equal(run.judged.length, 0);
   assert.deepEqual(run.outcome.terminal, { status: 'blocked', reason: 'owner_response_format_unmet' });
-  assert.match(String(run.outcome.finalOutput), /does not meet your requested output format/);
-  assert.match(String(run.outcome.finalOutput), /This task is not complete/);
+  // Clem's own draft is what the owner reads; the format miss is a notice the
+  // reducer derives from the terminal reason, never a sentence written for her.
+  assert.equal(withoutRetainedWorkCheckpoint(String(run.outcome.finalOutput)).trim(), raw.trim());
+  assert.doesNotMatch(String(run.outcome.finalOutput), /My answer is saved|requested output format|This task is not complete/);
   assert.ok(JSON.stringify(run.outcome.history).includes(JSON.stringify(raw).slice(1, -1)), 'the full raw draft and qualification stay in admitted history');
   const original = run.originalResponses[0] as { output: Array<{ content: Array<{ text: string }> }> };
   assert.equal(original.output[0]!.content[0]!.text, raw, 'original SDK bytes are unchanged');
@@ -1541,7 +1544,8 @@ test('missing exact attempt capture under OFF holds an explicit format obligatio
   assert.equal(run.judged.length, 0);
   assert.deepEqual(run.outcome.terminal, { status: 'blocked', reason: 'owner_response_format_unqualified' });
   assert.equal(host.isNarratableHostStop(run.outcome), false);
-  assert.match(String(run.outcome.finalOutput), /could not verify the current output requirements/);
+  assert.equal(withoutRetainedWorkCheckpoint(String(run.outcome.finalOutput)).trim(), raw.trim());
+  assert.doesNotMatch(String(run.outcome.finalOutput), /My answer is saved|could not verify the current output requirements/);
   assert.ok(JSON.stringify(run.outcome.history).includes(JSON.stringify(raw).slice(1, -1)));
   assert.ok(!JSON.stringify(run.modelInputs).includes('FINAL ANSWER FORMAT'), 'unqualified owner cannot grant author guidance');
   assert.equal(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged', 'tool_called'] }).length, 0);
@@ -1748,10 +1752,10 @@ test('actual second-candidate host review sees current JSON and historical findi
   assert.equal(run.outcome.finalOutput, currentReply);
 });
 
-test('a blocked finding replaces the rejected draft; a plain negative keeps the generic note', () => {
+test('a blocked finding replaces the rejected draft; a plain negative keeps Clem\'s words with a rejected review chip', () => {
   for (const [blocked, expected] of [
     [true, /^The invite was not changed because the update was refused before it reached the calendar\.$/],
-    [false, /Verification note: the completion review did not accept this write-up\./],
+    [false, /^I updated the invite\.$/],
   ] as const) {
     const identity = accepted('Update the invite description.');
     host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
@@ -1771,11 +1775,15 @@ test('a blocked finding replaces the rejected draft; a plain negative keeps the 
       assert.equal(committed.event.data.rejectedCompletionText, undefined);
     }
     assert.notEqual(committed.presentation.status, 'done');
+    assert.equal(committed.event.data.review, 'rejected');
+    assert.equal(committed.event.data.reviewNote,
+      'The invite was not changed because the update was refused before it reached the calendar.');
   }
 });
 
 // Live 2026-09-25: the note stopped mid-sentence at a fixed 240 characters.
-test('a negative review note shows every finding whole, cut only between items', () => {
+// The finding is chip detail now, never text under Clem's answer.
+test('a negative review finding is bounded chip detail, cut only between items', () => {
   const identity = accepted('Summarize the three offices.');
   host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
   const items = Array.from({ length: 30 }, (_, i) => `(${i + 1}) "office ${i} grew" — the report shows no change for office ${i}`).join('; ');
@@ -1785,7 +1793,10 @@ test('a negative review note shows every finding whole, cut only between items',
     replyDigest: createHash('sha256').update('All offices grew.').digest('hex'), continuation: false } });
   const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
     presentation: { kind: 'answer', text: 'All offices grew.' } });
-  const note = committed.presentation.text.slice(committed.presentation.text.indexOf('Verification note'));
+  assert.equal(committed.presentation.text, 'All offices grew.');
+  assert.equal(committed.event.data.review, 'rejected');
+  const note = String(committed.event.data.reviewNote);
+  assert.ok(note.length <= 400, `bounded: ${note.length}`);
   assert.match(note, /\(1\) "office 0 grew" — the report shows no change for office 0/);
   assert.match(note, /\(3\) "office 2 grew" — the report shows no change for office 2/);
   assert.match(note, /no change for office \d+ …/, 'a long list ends at a whole item, marked as cut');

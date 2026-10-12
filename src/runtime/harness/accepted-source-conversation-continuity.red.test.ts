@@ -290,7 +290,7 @@ test('a cancelled exchange rides into the successor so "continue" has its refere
   memoryDatabase.resetMemoryDb();
   const parent = parentSession();
   completedExchange(parent, 'Write five fables into fable-1.md through fable-5.md, one animal each.',
-    'Stopped — this turn was cancelled. Nothing further will execute; tell me how you’d like to proceed.', 1, 'cancelled');
+    'Stopped. Nothing further runs for this turn.', 1, 'cancelled');
   parent.markStatus('cancelled');
   const selected = claimSessionForAcceptedSource({
     kind: 'ordinary', entrySessionId: parent.id, durableSourceId: 'continue-after-cancel', continuity,
@@ -302,7 +302,7 @@ test('a cancelled exchange rides into the successor so "continue" has its refere
   const text = String(prefix[0]!.data.text);
   assert.ok(text.includes('USER: Write five fables into fable-1.md through fable-5.md, one animal each.'), text);
   assert.match(text, /Stopped at the person's request before this finished; the request itself still stands/);
-  assert.match(text, /this turn was cancelled/);
+  assert.match(text, /Stopped\. Nothing further runs for this turn\./);
 
   // Failed and blocked exchanges keep their own recovery path and still do not seed.
   const other = parentSession();

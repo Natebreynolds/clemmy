@@ -136,7 +136,9 @@ import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
 import {
   PUBLIC_RUN_FAILURE_TEXT,
   PUBLIC_BLOCKED_NEXT_STEP_TEXT,
+  PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT,
   publicRunFailureKind,
+  publicRunFailureTerminal,
   publicRunFailureText,
   publicProviderCapacityText,
   publicAsyncWorkDispatchedData,
@@ -144,6 +146,7 @@ import {
   publicPresentationText,
   publicReplyText,
 } from './public-presentation.js';
+import { type TerminalNotice } from './terminal-notice.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import { renderTypedControlState } from './typed-control-state.js';
 import {
@@ -427,6 +430,8 @@ async function blockedPreRunResponse(
   /** Host-only unavailable saved-pin refusal. It has no execution graph to
    * interpret: accepting the source and committing the block are sufficient. */
   unavailableSavedPin?: UnavailableSessionAgentModel,
+  /** An app status the clients render as chrome instead of a Clem bubble. */
+  hostNotice?: TerminalNotice,
 ): Promise<AssistantResponse> {
   const route = routeForHarness(surface, request);
   if (unavailableSavedPin) {
@@ -497,7 +502,7 @@ async function blockedPreRunResponse(
       presentation: { kind: 'blocked', text: userText },
     }, {
       legacyReason: code,
-      metadata: { transport: 'harness_preflight_block' },
+      metadata: { transport: 'harness_preflight_block', ...(hostNotice ? { hostNotice } : {}) },
     }).presentation.text;
     terminalCommitted = true;
   } catch {
@@ -529,16 +534,23 @@ function unavailableSavedAgentResponse(surface: HarnessSurface, request: Assista
   const agent = choice.agentName ? `“${choice.agentName}”` : 'this saved agent';
   const model = choice.modelId ?? choice.savedModel;
   const quotaHeld = choice.reason === 'codex_quota_exhausted';
+  // The refusal is an app status, not something Clem says: no model ran.
+  // The stored line (CLI, channels, model history) is app voice; desktop and
+  // phone render the notice with its own action.
   const text = quotaHeld
-    ? `Clem’s latest Codex usage check shows no available quota for ${agent}${model ? ` on “${model}”` : ''}. I couldn’t start this turn. Wait for quota to become available, or choose another model for this conversation.`
+    ? `No Codex quota is available for ${agent}${model ? ` on “${model}”` : ''}, so this turn did not start. Wait for quota to return, or choose another model for this conversation.`
     : model
-    ? `I could not start ${agent} because its saved model “${model}” is unavailable. Connect that model in Settings > Models or choose a different model for this conversation, then try again.`
-    : `I could not verify the saved model for ${agent}. Check the agent's saved model or choose a model for this conversation, then try again.`;
+    ? `The saved model “${model}” for ${agent} is unavailable, so this turn did not start. Connect that model in Settings > Models or choose a different model for this conversation, then try again.`
+    : `The saved model for ${agent} could not be verified, so this turn did not start. Check the agent's saved model or choose a model for this conversation, then try again.`;
   return blockedPreRunResponse(surface, request, text, {
     reason: quotaHeld ? 'saved_agent_codex_quota_exhausted' : 'saved_agent_model_unavailable', savedAgentId: choice.agentId,
     savedAgentName: choice.agentName, savedModel: choice.savedModel,
     requiredModel: choice.modelId, modelCheck: choice.reason,
-  }, choice);
+  }, choice, {
+    code: quotaHeld ? 'provider_quota' : 'saved_model_unavailable',
+    ...(choice.agentName ? { agentName: choice.agentName } : {}),
+    ...(model ? { model } : {}),
+  });
 }
 
 function responseForWarmReadPolicyConflict(
@@ -1466,6 +1478,9 @@ function commitBridgeFailedTerminal(input: {
     : redactSensitiveText(providerCapacityErrorText(input.error)).replace(/\s+/g, ' ').trim().slice(0, 300);
   const capacityText = detail ? publicProviderCapacityText(detail) : null;
   const failureKind = publicRunFailureKind(input.error);
+  // App status, not Clem's words: the line serves the CLI, channels and model
+  // history; desktop and phone draw the notice with its action.
+  const failure = publicRunFailureTerminal({ failureKind, error: detail });
   const identity = logicalTurnIdentity({
     sessionId: input.request.sessionId,
     sourceUserSeq: input.turn.sourceUserSeq,
@@ -1477,13 +1492,17 @@ function commitBridgeFailedTerminal(input: {
     identity,
     status: 'failed',
     resumable: false,
-    presentation: { kind: 'error', text: failureKind ? publicRunFailureText(failureKind) : capacityText ?? PUBLIC_RUN_FAILURE_TEXT },
+    presentation: { kind: 'error', text: failure.text },
   }, {
     legacyReason: input.reason,
     // Raw exception text stays in the private logs; only a provider's usage
     // or credit refusal is kept, so the turn's owner can be told and a job
     // can wait it out.
-    metadata: { transport: input.transport, ...(capacityText ? { failureDetail: detail } : {}) },
+    metadata: {
+      transport: input.transport,
+      hostNotice: failure.notice,
+      ...(capacityText ? { failureDetail: detail } : {}),
+    },
   });
   return committed.event;
 }
@@ -2577,8 +2596,10 @@ async function respondPreferHarnessOnce(
     return await blockedPreRunResponse(
       surface,
       request,
-      'I could not start this turn because no model runtime is connected. Open Settings > Models, connect a model, and try again.',
+      PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT,
       { reason: 'harness_auth_unavailable', authReason: auth.reason },
+      undefined,
+      { code: 'no_model_connected' },
     );
   }
   // Freeze the fresh-turn owner before any eager resolver can consume the

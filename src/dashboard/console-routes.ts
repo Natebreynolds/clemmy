@@ -18117,6 +18117,7 @@ export function registerConsoleRoutes(
             text: PUBLIC_RUN_FAILURE_TEXT,
             status: 'failed',
             legacyReason: 'desktop_early_route_failed',
+            metadata: { hostNotice: { code: 'run_failed' } },
           });
         } catch (commitErr) {
           console.error('accepted desktop control could not commit its stable failure terminal:', commitErr);
@@ -18681,6 +18682,7 @@ export function registerConsoleRoutes(
             text: PUBLIC_RUN_FAILURE_TEXT,
             status: 'failed',
             legacyReason: 'desktop_turn_failed',
+            metadata: { hostNotice: { code: 'run_failed' } },
           });
         } catch (commitErr) {
           console.error('accepted desktop turn could not commit its stable failure terminal:', commitErr);

@@ -25,7 +25,7 @@ test('after a finished turn with nothing pending, the brain is told nothing is w
 });
 
 test('after the owner stopped a turn, the brain is told it was their decision, not a failure to reconcile', () => {
-  const id = sessionWithTerminal('turn-facts-stopped', { status: 'cancelled', kind: 'stopped', text: 'Stopped as requested. Completed results are kept.' });
+  const id = sessionWithTerminal('turn-facts-stopped', { status: 'cancelled', kind: 'stopped', text: 'Stopped. Completed results are kept.' });
   const facts = turnFactsFor(id);
   assert.match(facts!, /The owner stopped your previous turn themselves/);
   assert.match(facts!, /not a failure to reconcile/);

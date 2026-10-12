@@ -9,8 +9,10 @@ import {
   HOST_STOP_AND_EXPLAIN_BLOCKED_TEXT,
   HOST_TOOL_UNCERTAIN_BLOCKED_TEXT,
   hostStopNarrationDirective,
+  hostStopRetainedFact,
   isNarratableHostStop,
 } from './host-turn-runner.js';
+import { parseRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 
 const blocked = (finalOutput: string) => ({ finalOutput, terminal: { status: 'blocked' as const, reason: 'x' } }) as never;
 
@@ -37,6 +39,26 @@ test('the narration directive carries the host fact and asks for Clem\'s words w
   assert.match(directive, /as yourself/);
   assert.match(directive, /Do not call tools/);
   assert.match(directive, /Do not mention the harness, checkpoints, reconciliation, tool names, ids or handles/);
+});
+
+// What is kept reaches the owner in Clem's own words: the directive carries
+// the counts, and the checkpoint's sentences are no longer appended after her.
+test('the narration directive carries the retained facts as counts, with no handles or tool names', () => {
+  const tail = 'Retained work (durable checkpoint):\n'
+    + '- Source/tool fixture_read: completed result retained as rh_narration_pin.\n'
+    + '- 2 additional retained results.\n'
+    + 'External write state (fixture_write): succeeded. Do not repeat it.';
+  const directive = hostStopNarrationDirective(HOST_STOP_AND_EXPLAIN_BLOCKED_TEXT, undefined, parseRetainedWorkCheckpoint(tail));
+  assert.match(directive, /Kept for when the owner continues: 3 results; changes in other apps: went through; it must not be repeated\./);
+  assert.match(directive, /what is kept/);
+  assert.doesNotMatch(directive, /rh_|fixture_read|fixture_write|durable checkpoint/);
+  assert.equal(hostStopRetainedFact({ results: 1, outsideChange: 'none' }),
+    'Kept for when the owner continues: 1 result; changes in other apps: none recorded.');
+  assert.equal(hostStopRetainedFact({ results: 0, outsideChange: 'refused' }),
+    'Kept for when the owner continues: 0 results; changes in other apps: the app refused the change; it does not rerun without asking the owner.');
+  assert.equal(hostStopRetainedFact({ results: 0, outsideChange: 'none' }), undefined, 'nothing kept adds no line');
+  assert.doesNotMatch(hostStopNarrationDirective(HOST_STOP_AND_EXPLAIN_BLOCKED_TEXT, undefined, { results: 0, outsideChange: 'none' }),
+    /Kept for when/);
 });
 
 test('narration is on in production and opt-in under the test runner, so exact model-call counts keep their meaning', async () => {

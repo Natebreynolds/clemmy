@@ -739,11 +739,14 @@ test('a review that ran out of time says so, and never sends the owner to fix a 
   } });
   const committed = commitTurnOutcome(outcome);
   assert.equal(committed.presentation.status, 'done');
-  assert.match(committed.presentation.text, /did not finish within its time limit, so it stands unreviewed/);
-  assert.doesNotMatch(committed.presentation.text, /not reachable|choose a reachable review model/);
+  // Clem's words publish exactly; the unfinished review is the chip's state.
+  assert.equal(committed.presentation.text, outcome.presentation.text);
+  assert.equal(committed.event.data.review, 'unchecked');
+  assert.equal(committed.event.data.reviewNote, undefined, 'operator diagnosis is never chip detail');
   const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
   assert.equal(verdict.verified, false);
   assert.equal(verdict.disposition, 'enabled_unavailable');
+  assert.equal(verdict.deliveredTextIsJudgedText, true);
   assert.equal(committed.event.data.verificationDetail, 'completion_review_failed_open');
 });
 
@@ -776,10 +779,16 @@ for (const issue of ['missing', 'malformed', 'partial', 'uncertain', 'positive_c
     } });
     const before = listEvents(sessionId).filter(row => /model|goal_alignment/.test(row.type)).map(row => row.id);
     const committed = commitTurnOutcome(outcome);
-    assert.equal(committed.presentation.text,
-      outcome.presentation.text + '\n\nVerification note: I couldn’t verify all of this answer.');
-    assert.doesNotMatch(committed.presentation.text, /not reachable|model settings|timed out|REVIEW_ASSESSMENT|same-output/);
+    // A reviewer that answered but could not qualify the exact answer keeps
+    // the unverified hold: Clem's words unchanged, blocked and resumable, and
+    // the chip says unchecked. No sentence is added under her answer.
+    assert.equal(committed.presentation.text, outcome.presentation.text);
+    assert.equal(committed.presentation.status, 'blocked');
+    assert.equal(committed.presentation.resumable, true);
+    assert.equal(committed.event.data.review, 'unchecked');
+    assert.equal(committed.event.data.reviewNote, undefined);
     const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
+    assert.equal(verdict.deliveredTextIsJudgedText, true);
     assert.equal(verdict.verified, false);
     assert.equal(verdict.fulfills, false);
     assert.equal(verdict.disposition, 'enabled_unavailable');
@@ -812,7 +821,11 @@ test('the answered-unqualified note and disposition cannot move to a different o
     const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
     assert.equal(verdict.verified, false);
     assert.equal(verdict.reviewDisposition, undefined);
-    assert.doesNotMatch(committed.presentation.text, /I couldn’t verify all of this answer/);
+    assert.equal(committed.presentation.text, outcome.presentation.text);
+    // The disposition does not follow a different input: a join mismatch
+    // holds, and the chip says unchecked.
+    assert.equal(committed.presentation.status, 'blocked');
+    assert.equal(committed.event.data.review, 'unchecked');
   }
 });
 
@@ -835,8 +848,9 @@ test('ordinary transport unavailability and qualified success retain their exist
     const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
     assert.equal(verdict.verified, qualified);
     assert.equal(verdict.reviewDisposition, undefined);
-    if (qualified) assert.equal(committed.presentation.text, outcome.presentation.text);
-    else assert.match(committed.presentation.text, /review model is not reachable/);
+    assert.equal(committed.presentation.text, outcome.presentation.text);
+    assert.equal(committed.presentation.status, 'done');
+    assert.equal(committed.event.data.review, qualified ? 'checked' : 'unchecked');
   }
 });
 
@@ -868,12 +882,12 @@ test(`publication keeps the ${label} reason and never calls a missing review an 
   // enabled_unavailable. A review that RAN and did not stand still blocks.
   assert.equal(committed.presentation.status, 'done');
   // The reviewer's reason is operator diagnosis: it survives verbatim on the
-  // verdict row for the console, never in the chat sentence, which says only
-  // that the result stands unreviewed.
+  // verdict row for the console, never in the chat. The answer publishes as
+  // Clem wrote it and the review chip says unchecked.
   assert.doesNotMatch(committed.presentation.text, expected);
-  assert.match(committed.presentation.text, /stands unreviewed/);
-  assert.match(committed.presentation.text, /independently reviewed/);
-  assert.doesNotMatch(committed.presentation.text, /accepting completion|accepted this result|without actually checking it/);
+  assert.equal(committed.presentation.text, outcome.presentation.text);
+  assert.equal(committed.event.data.review, 'unchecked');
+  assert.equal(committed.event.data.reviewNote, undefined);
   const recorded = listEvents(sessionId, { types: ['goal_alignment_judged'] }).at(-1);
   assert.equal(recorded?.data.reason, reason);
   const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
@@ -989,9 +1003,14 @@ for (const variant of ['judged-account', 'other-account', 'no-digest'] as const)
         assert.equal(result.presentation.text, rendered, 'the judge rendering is delivered as written');
         assert.equal(result.event.data.verificationDetail, undefined);
         assert.equal((result.event.data.completionVerdictRef as { verified: boolean }).verified, true);
+        assert.equal(result.event.data.review, 'checked');
       } else {
         assert.equal(result.presentation.status, 'blocked');
         assert.equal(result.event.data.verificationDetail, 'completion_review_reply_mismatch');
+        assert.equal(result.presentation.text, rendered, 'a reply mismatch publishes the rendering unchanged');
+        assert.equal(result.event.data.review, 'unchecked');
+        assert.equal((result.event.data.completionVerdictRef as { deliveredTextIsJudgedText: boolean })
+          .deliveredTextIsJudgedText, false);
       }
     } finally {
       if (prior === undefined) delete process.env.CLEMMY_COMPLETION_REVIEW; else process.env.CLEMMY_COMPLETION_REVIEW = prior;

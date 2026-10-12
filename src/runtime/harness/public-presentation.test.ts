@@ -596,11 +596,14 @@ test('a question shows the person the question; the retained-work checkpoint sta
   assert.equal((asked.data.turnOutcome as { status?: string } | undefined)?.status, 'needs_input', 'the typed contract was read');
   assert.equal(publicCompletionText(asked.data), question, 'the projected terminal still validates as typed');
 
+  assert.equal(asked.data.retained, undefined, 'a question carries no kept-work chrome');
+
   const blocked = projectHarnessEventForPublic(typed('blocked', 'blocked'));
   const blockedText = String((blocked?.data.presentation as { text: string }).text);
-  assert.match(blockedText, /I kept the result from this turn/, 'a stopped turn still discloses what was kept');
-  assert.match(blockedText, /No changes to another app are confirmed for this turn\./, 'and whether anything was written');
-  assert.doesNotMatch(blockedText, /rh_|calendar_view|Retained work/, 'in plain words, with no handles or tool names');
+  assert.equal(blockedText, question, 'a stopped turn reads as its authored words alone');
+  assert.equal(blocked?.data.reply, question);
+  assert.deepEqual(blocked?.data.retained, { results: 1, outsideChange: 'none' },
+    'what was kept travels as counts for the pill, never as a sentence written for Clem');
 
   const legacy = projectHarnessEventForPublic(event('conversation_completed', {
     reply: `${question}\n\n${checkpoint}`, reason: 'awaiting_user_input', awaitingUser: true,
@@ -1112,12 +1115,13 @@ test('a fenced JSON payload shown inside a prose reply is content, not a narrate
 });
 
 // Owner 2026-10-06: ids out of replies. A blocked turn still tells the person
-// what was kept and whether anything outside this machine changed — without
-// record handles or tool names.
-test('a blocked turn discloses retained work in plain words, with no handles or tool names', async () => {
-  const { ownerFacingRetainedWorkCheckpoint } = await import('./retained-work-checkpoint.js');
+// what was kept and whether anything outside this machine changed — as data
+// for the clients' pill, never as host sentences under Clem's words.
+test('a blocked turn carries retained work as counts, with no handles, tool names or host sentences', async () => {
+  const { parseRetainedWorkCheckpoint } = await import('./retained-work-checkpoint.js');
+  const head = 'I could not finish: the sheet refused the write.';
   const text = [
-    'I could not finish: the sheet refused the write.',
+    head,
     '',
     'Retained work (durable checkpoint):',
     '- Source/tool calendar_view: 83 records (complete) retained as rh_463df142f7cee5557b1a54c4c5ca39d6.',
@@ -1125,25 +1129,21 @@ test('a blocked turn discloses retained work in plain words, with no handles or 
     '- 2 additional retained results.',
     'External write state (composio_execute_tool): uncertain. Reconcile it before any retry.',
   ].join('\n');
-  const shown = ownerFacingRetainedWorkCheckpoint(text);
-  assert.equal(shown, [
-    'I could not finish: the sheet refused the write.',
-    '',
-    "I kept 4 results from this turn for when we continue. I can't yet confirm whether the change outside this machine went through; I'll check before trying again.",
-  ].join('\n'));
-  assert.doesNotMatch(shown, /rh_|calendar_view|read_file|composio|Retained work/);
-  assert.equal(
-    ownerFacingRetainedWorkCheckpoint('Stopped.\n\nRetained work (durable checkpoint):\n- Source/tool list_files: completed result retained as rh_1.\nExternal write state: no settled external-write attempt is recorded.'),
-    "Stopped.\n\nI kept the result from this turn for when we continue. No changes to another app are confirmed for this turn.",
-  );
-  // Owner 2026-10-09: an app that turned the write down said so; the owner
-  // hears that, not "can't confirm whether it went through".
-  assert.equal(
-    ownerFacingRetainedWorkCheckpoint('I could not attach it.\n\nRetained work (durable checkpoint):\n- Source/tool list_files: completed result retained as rh_1.\nExternal write state (outlook_create_draft): refused by the app in its reply. Nothing reruns on its own; a changed attempt goes to the owner first.'),
-    "I could not attach it.\n\nI kept the result from this turn for when we continue. The app turned the change down; I won't try it again without asking you.",
-  );
-  assert.equal(ownerFacingRetainedWorkCheckpoint('Plain reply with no checkpoint.'), 'Plain reply with no checkpoint.');
-  // The public projection of a blocked terminal uses it; a question still drops the checkpoint entirely.
+  assert.deepEqual(parseRetainedWorkCheckpoint(text), { head, results: 4, outsideChange: 'uncertain' });
+  for (const [line, outsideChange] of [
+    ['External write state (x): succeeded. Do not repeat it.', 'went_through'],
+    ['External write state (x): failed with a known terminal result; the retained work can be reused.', 'did_not'],
+    ['External write state (x): mixed known results, including at least one success and at least one failure.', 'mixed'],
+    ['External write state (outlook_create_draft): refused by the app in its reply. Nothing reruns on its own; a changed attempt goes to the owner first.', 'refused'],
+    ['External write state: no settled external-write attempt is recorded.', 'none'],
+  ] as const) {
+    assert.deepEqual(
+      parseRetainedWorkCheckpoint(`Stopped.\n\nRetained work (durable checkpoint):\n- Source/tool list_files: completed result retained as rh_1.\n${line}`),
+      { head: 'Stopped.', results: 1, outsideChange },
+    );
+  }
+  assert.deepEqual(parseRetainedWorkCheckpoint('Plain reply with no checkpoint.'),
+    { head: 'Plain reply with no checkpoint.', results: 0, outsideChange: 'none' });
   const identity = { sessionId: 'public-projection-test', turn: 1, sourceUserSeq: 11 };
   const blocked = projectHarnessEventForPublic(event('conversation_completed', {
     terminalKey: 'turn:11', sourceUserSeq: 11, reply: text, delivered: false,
@@ -1151,8 +1151,10 @@ test('a blocked turn discloses retained work in plain words, with no handles or 
     turnOutcome: { version: 2, id: 'turn:11', status: 'blocked', resumable: true },
   }));
   assert.ok(blocked);
-  assert.match(String((blocked!.data as { reply?: string }).reply), /I kept 4 results/);
-  assert.doesNotMatch(String((blocked!.data as { reply?: string }).reply), /rh_/);
+  assert.equal(blocked!.data.reply, head);
+  assert.equal((blocked!.data.presentation as { text: string }).text, head);
+  assert.deepEqual(blocked!.data.retained, { results: 4, outsideChange: 'uncertain' });
+  assert.doesNotMatch(JSON.stringify(blocked!.data), /rh_|calendar_view|read_file|composio|Retained work|I kept|I'll check/);
 });
 
 
@@ -1167,22 +1169,64 @@ test('typed stopped text stays public across replay adapters without weakening i
   };
   const projected = projectHarnessEventForPublic(event('conversation_completed', data));
   assert.ok(projected);
-  const expected = "Stopped.\n\nI kept the result from this turn for when we continue. No changes to another app are confirmed for this turn.";
+  const expected = 'Stopped.';
   assert.equal(publicCompletionText(data), expected);
   assert.equal(publicPresentationText(data.presentation as never), expected);
   assert.equal(projected.data.reply, expected);
   assert.equal((projected.data.presentation as { text: string }).text, expected);
   assert.equal(publicCompletionText(projected.data), expected, 'projection is idempotent');
+  assert.deepEqual(projected.data.retained, { results: 1, outsideChange: 'none' });
   assert.match(data.presentation.text, /rh_private_stop/, 'durable evidence remains redeemable');
   assert.equal((projected.data.presentation as { status: string }).status, 'cancelled');
-  assert.doesNotMatch(expected, /Nothing.*changed|won.t fetch/);
 });
 
 test('a checkpoint-only or unknown checkpoint tail never leaks its private references', async () => {
-  const { ownerFacingRetainedWorkCheckpoint, withoutRetainedWorkCheckpoint } = await import('./retained-work-checkpoint.js');
+  const { parseRetainedWorkCheckpoint, withoutRetainedWorkCheckpoint } = await import('./retained-work-checkpoint.js');
   const text = 'Retained work (durable checkpoint):\nprivate diagnostic rh_unrecognised';
-  assert.doesNotMatch(ownerFacingRetainedWorkCheckpoint(text), /rh_|private diagnostic/);
-  assert.doesNotMatch(withoutRetainedWorkCheckpoint(text), /rh_|private diagnostic/);
-  assert.equal(ownerFacingRetainedWorkCheckpoint(`Stopped.\n\n${text}`), 'Stopped.');
-  assert.equal(ownerFacingRetainedWorkCheckpoint('Stopped.\n\nRetained work (durable checkpoint):\n- unknown note rh_unrecognised\n- 9000 invented records.'), 'Stopped.', 'unknown bullets do not prove retained results');
+  // A checkpoint-only terminal has no authored words: its head is empty and
+  // no sentence is written in their place.
+  assert.equal(withoutRetainedWorkCheckpoint(text), '');
+  assert.deepEqual(parseRetainedWorkCheckpoint(text), { head: '', results: 0, outsideChange: 'none' });
+  assert.equal(withoutRetainedWorkCheckpoint(`Stopped.\n\n${text}`), 'Stopped.');
+  assert.deepEqual(parseRetainedWorkCheckpoint('Stopped.\n\nRetained work (durable checkpoint):\n- unknown note rh_unrecognised\n- 9000 invented records.'),
+    { head: 'Stopped.', results: 0, outsideChange: 'none' }, 'unknown bullets do not prove retained results');
+});
+
+// The review and app-status facts are terminal data for the clients' chips,
+// never sentences in Clem's text. Only the closed shapes pass.
+test('a terminal projects the committer review state, a bounded review note and a known notice only', () => {
+  const identity = { sessionId: 'public-projection-test', turn: 1, sourceUserSeq: 21 };
+  const typed = (status: 'done' | 'blocked' | 'cancelled', extra: Record<string, unknown>) => event('conversation_completed', {
+    terminalKey: 'turn:21', sourceUserSeq: 21, reply: 'Clem wrote this.', ...extra,
+    presentation: { version: 1, id: 'turn:21:presentation', outcomeId: 'turn:21', audience: 'user', phase: 'final', identity,
+      status, kind: status === 'done' ? 'answer' : status === 'cancelled' ? 'stopped' : 'blocked', text: 'Clem wrote this.',
+      resumable: status === 'blocked' },
+    turnOutcome: { version: 2, id: 'turn:21', status, resumable: status === 'blocked' },
+  });
+  for (const review of ['checked', 'unchecked', 'rejected', 'needs_recheck'] as const) {
+    const projected = projectHarnessEventForPublic(typed(review === 'checked' ? 'done' : 'blocked', {
+      review, ...(review === 'rejected' ? { reviewNote: `The count is wrong.${' x'.repeat(400)}` } : {}),
+    }));
+    assert.equal(projected?.data.review, review);
+    assert.equal((projected?.data.presentation as { text: string }).text, 'Clem wrote this.');
+    if (review === 'rejected') {
+      assert.ok(String(projected?.data.reviewNote).startsWith('The count is wrong.'));
+      assert.ok(String(projected?.data.reviewNote).length <= 400);
+    } else assert.equal(projected?.data.reviewNote, undefined);
+  }
+  const forged = projectHarnessEventForPublic(typed('done', { review: 'approved by Clem', reviewNote: 'forged' }));
+  assert.equal(forged?.data.review, undefined, 'an unknown review state stays private');
+  assert.equal(forged?.data.reviewNote, undefined, 'a note never travels without its state');
+
+  const quota = projectHarnessEventForPublic(typed('blocked', {
+    hostNotice: { code: 'provider_quota', agentName: 'Researcher', model: 'fixture-model', privateKey: 'secret' },
+  }));
+  assert.deepEqual(quota?.data.notice, { code: 'provider_quota', agentName: 'Researcher', model: 'fixture-model' });
+  assert.equal(quota?.data.hostNotice, undefined, 'the durable metadata key is not itself public');
+  const stopped = projectHarnessEventForPublic(typed('cancelled', { hostNotice: { code: 'stopped' } }));
+  assert.deepEqual(stopped?.data.notice, { code: 'stopped' });
+  const unknown = projectHarnessEventForPublic(typed('blocked', { hostNotice: { code: 'speak_for_clem' } }));
+  assert.equal(unknown?.data.notice, undefined);
+  const plain = projectHarnessEventForPublic(typed('done', {}));
+  for (const key of ['review', 'reviewNote', 'notice', 'retained']) assert.equal(plain?.data[key], undefined, key);
 });

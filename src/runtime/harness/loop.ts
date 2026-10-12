@@ -166,14 +166,12 @@ import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from '.
 import { synthesizeTurnReport } from './work-report.js';
 import {
   approvalPreviewProjection,
-  PUBLIC_RUN_FAILURE_TEXT,
   PUBLIC_BLOCKED_NEXT_STEP_TEXT,
   PUBLIC_CODEX_AUTH_EXPIRED_TEXT,
   publicRunFailureKind,
-  publicRunFailureText,
+  publicRunFailureTerminal,
   type PublicRunFailureKind,
   PUBLIC_VAULT_NOT_READY_TEXT,
-  publicProviderCapacityText,
   publicAsyncWorkDispatchedData,
   publicReplyText,
 } from './public-presentation.js';
@@ -373,6 +371,7 @@ import {
   sizedFirstByteStallMs,
 } from './model-stall-policy.js';
 import { heldExecutionTextForInternalReason, isHostAuthorityHeldReason } from './public-presentation.js';
+import { OWNER_STOP_TERMINAL_TEXT, type TerminalNotice } from './terminal-notice.js';
 // Lane wiring: the callable-surface oracle serves exact local schemas on this
 // lane (guardrail mandates are constructible only from proof).
 import '../../tools/callable-surface-registration.js';
@@ -1185,6 +1184,7 @@ function reduceStandardConversationTerminal(input: {
   let blockedDetail: string | undefined;
   let transferredToTaskId: string | undefined;
   let connectionExecutionPause: ConnectionExecutionPauseV1 | undefined;
+  let hostNotice: TerminalNotice | undefined;
   switch (result.status) {
     case 'dispatched':
       // A durable async edge is deliberately nonterminal. Callers must release
@@ -1349,16 +1349,16 @@ function reduceStandardConversationTerminal(input: {
             resumable: false,
             presentation: {
               kind: 'stopped',
-              // A cancelled turn is still not allowed to be a dead end. The
-              // status carries resumable:false (the schema requires it here),
-              // so the EDGE has to live in the words — as it already does on
-              // the sibling stop in claude-agent-brain.ts. Without this the
-              // owner is told only that nothing will happen, and has to nudge.
-              text: 'Stopped — this turn was cancelled. Nothing further will execute; tell me how you’d like to proceed and I’ll start from there.',
+              // The owner's own Stop is app chrome, not something Clem says.
+              // This app-voice line serves the CLI, channels and model
+              // history; desktop and phone show the notice as the Stop pill
+              // (with what was kept) and the composer is the next step.
+              text: OWNER_STOP_TERMINAL_TEXT,
             },
           };
       legacyReason = transfer ? 'transferred' : 'cancelled';
       transferredToTaskId = transfer?.backgroundTaskId;
+      if (!transfer) hostNotice = { code: 'stopped' };
       break;
     }
     case 'held':
@@ -1393,23 +1393,29 @@ function reduceStandardConversationTerminal(input: {
       // literal blockedReason 'blocked' and cannot be triaged from data.
       blockedReason = result.blockedReason;
       blockedDetail = result.blockedDetail;
+      // The owner's format hold publishes Clem's own draft; the miss is an
+      // app notice beside it, never a sentence written for her.
+      if (result.blockedReason === 'owner_response_format_unmet') hostNotice = { code: 'response_format_unmet' };
+      else if (result.blockedReason === 'owner_response_format_unqualified') hostNotice = { code: 'response_format_unqualified' };
       break;
-    case 'failed':
+    case 'failed': {
+      // A failure is app status, never Clem's words: an app-voice line for
+      // the CLI, channels and model history, and a notice desktop and phone
+      // draw as a status line with its action. A vault that is not ready has
+      // no notice of its own and draws as the generic failure.
+      const failure = !result.failureKind
+        && /authority_seal_key_missing|authority seal key is missing/.test(String(result.error ?? ''))
+        ? { text: PUBLIC_VAULT_NOT_READY_TEXT, notice: { code: 'run_failed' } satisfies TerminalNotice }
+        : publicRunFailureTerminal({ failureKind: result.failureKind, error: result.error });
       outcome = {
         version: 2,
         id: turnOutcomeId(identity),
         identity,
         status: 'failed',
         resumable: false,
-        presentation: {
-          kind: 'error',
-          text: result.failureKind
-            ? publicRunFailureText(result.failureKind)
-            : /authority_seal_key_missing|authority seal key is missing/.test(String(result.error ?? ''))
-            ? PUBLIC_VAULT_NOT_READY_TEXT
-            : publicProviderCapacityText(result.error) ?? PUBLIC_RUN_FAILURE_TEXT,
-        },
+        presentation: { kind: 'error', text: failure.text },
       };
+      hostNotice = failure.notice;
       legacyReason = 'failed';
       // The returned failure owns the diagnostic. An advisory run_failed
       // append can be absent (for example after source-scoped journaling
@@ -1429,6 +1435,7 @@ function reduceStandardConversationTerminal(input: {
         } catch { /* advisory metadata only */ }
       }
       break;
+    }
   }
 
   const committed = commitStopSettlingRevokedCalls(outcome, () => commitTurnOutcome(outcome, {
@@ -1441,6 +1448,7 @@ function reduceStandardConversationTerminal(input: {
       ...(failureDetail ? { failureDetail } : {}),
       ...(blockedReason ? { blockedReason } : {}),
       ...(blockedDetail ? { blockedDetail } : {}),
+      ...(hostNotice ? { hostNotice } : {}),
     },
   }));
   return {
