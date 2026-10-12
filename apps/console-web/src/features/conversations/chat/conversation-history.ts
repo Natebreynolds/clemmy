@@ -1,5 +1,5 @@
 import { readTaskMode, readPlanRevisionRef } from '../../../lib/task-mode';
-import { approvalPreviewFrom, approvalRevisionFrom, recordedTurnProject } from '@clem/chat-engine';
+import { approvalPreviewFrom, approvalRevisionFrom, recordedTurnProject, terminalCompletionPresentation } from '@clem/chat-engine';
 import { pendingActionFromEvent, type ChatMessage } from '../../../lib/useChat';
 import type { Turn } from '../types';
 
@@ -84,12 +84,27 @@ function historyMessage(turn: Turn): ChatMessage {
       },
     };
   }
+  const typed = turn.role === 'assistant' ? reopenedTerminal(turn) : null;
   return {
     id: `h${++seedSeq}`,
     role: turn.role,
-    text: turn.text,
+    text: typed ? typed.text : turn.text,
     taskMode: readTaskMode(turn.taskMode),
     planArtifactRef: readPlanRevisionRef(turn.planArtifactRef),
-    status: turn.role === 'assistant' ? ('complete' as const) : undefined,
+    status: typed ? typed.status : turn.role === 'assistant' ? ('complete' as const) : undefined,
+    ...(typed?.terminal ? { terminal: typed.terminal } : {}),
   };
+}
+
+/** A reply the server reopened with its typed terminal reads exactly as it
+ *  did live: a notice in place of a reply is the app's status line rather
+ *  than a finished reply in Clem's place, a stop keeps its pill and what it
+ *  kept, and the review chip keeps its ruling. Without one (an older Mac) the
+ *  reply stays plain text. */
+function reopenedTerminal(turn: Turn): Pick<ChatMessage, 'text' | 'status' | 'terminal'> | null {
+  const terminal = turn.terminal;
+  if (!terminal || typeof terminal !== 'object' || Array.isArray(terminal)) return null;
+  const presentation = terminal.presentation && typeof terminal.presentation === 'object' ? terminal.presentation : {};
+  const reopened = terminalCompletionPresentation({ ...terminal, reply: turn.text, presentation: { ...presentation, text: turn.text } }, '');
+  return reopened.terminal ? { text: reopened.text, status: reopened.status, terminal: reopened.terminal } : null;
 }

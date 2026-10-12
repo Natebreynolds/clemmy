@@ -52,6 +52,12 @@ export interface Turn {
   /** The project this exchange worked in, by name. Absent when it worked in
    *  none, or when the turn left no record. */
   projectName?: string | null;
+  /** The reply's typed terminal, as live delivery projected it: how it ended
+   *  (presentation and outcome status), the review ruling and finding, what
+   *  was kept, and any app notice. Lets a reopened reply draw the same status
+   *  line, pill and review chip it did live. Absent from an older Mac, whose
+   *  history is plain text. */
+  terminal?: TurnTerminal;
   /** Exact still-pending plan proposal restored by the server on reopen. */
   planProposalId?: string;
   /** A still-pending approval attached by the server so a reopened chat
@@ -67,6 +73,17 @@ export interface Turn {
     /** 'expired': nobody answered in time; render the card settled. */
     resolution?: unknown;
   };
+}
+
+/** The typed terminal facts a reopened assistant turn carries, in the same
+ *  shapes as the live terminal event; the chat engine revalidates every field. */
+export interface TurnTerminal {
+  presentation?: { status?: unknown; kind?: unknown };
+  turnOutcome?: { status?: unknown; resumable?: unknown; needs?: unknown };
+  review?: unknown;
+  reviewNote?: unknown;
+  retained?: unknown;
+  notice?: unknown;
 }
 
 export interface ContinueHint {
