@@ -309,10 +309,13 @@ test('actual host producer receipt places the prior public question after its re
   const merged = replayMissingPublicTurns({ sessionId: run.identity.sessionId, sourceUserSeq: next.seq, history: original });
   assert.equal(JSON.stringify(merged.slice(0, original.length)), JSON.stringify(original), 'reopen preserves every original tool byte and its order');
   const recovered = merged.slice(original.length) as Array<{ role?: string; status?: string; content?: unknown }>;
+  // The reads themselves stay in the preserved history; the replayed terminal
+  // is the public text, the same one the chat shows.
+  const { publicPresentationText } = await import('./public-presentation.js');
   assert.ok(recovered.some(item => item.role === 'assistant' && item.status === 'completed'
     && Array.isArray(item.content) && item.content.length === 1
-    && item.content[0]?.type === 'output_text' && item.content[0]?.text === terminal.text),
-    'the complete public terminal, including retained-work evidence, follows its authenticated current-source reads');
+    && item.content[0]?.type === 'output_text' && item.content[0]?.text === publicPresentationText(terminal)),
+    'the public terminal follows its authenticated current-source reads');
   assert.ok(!recovered.some(item => item.role === 'system'), 'public assistant prose is never promoted to system authority');
   assert.ok(!JSON.stringify(recovered).includes('Separate question'), 'the new source is not duplicated into prior history');
 });

@@ -799,7 +799,7 @@ test('the shared snapshot is taken exactly once per list build', () => {
     source.indexOf('function collectHarnessSummaries'),
     source.indexOf('function desktopSearchText'),
   );
-  assert.match(collect, /const allRows = listAllHarnessRowsForDisplay\(\);/);
+  assert.match(collect, /const allRows = listAllHarnessRowsForDisplay\((observer)?\);/);
   assert.match(collect, /userFacingHarnessRows\(allRows\)/,
     'the user-facing filter must reuse the same scan, not start a second one');
   assert.match(collect, /return \{ summaries: out, rawIds, allRows \}/,
