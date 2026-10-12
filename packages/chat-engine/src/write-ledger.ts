@@ -263,8 +263,8 @@ export function writeRowLabel(row: WriteLedgerRow): string {
   const base = describeExternalWrite(row.shapeKey, row.toolName ?? '', row.targets, {
     ...(row.irreversible === null ? {} : { irreversible: row.irreversible }),
     ...(row.consequence ? { consequence: row.consequence } : {}),
-    ...(row.disposition === 'reserved' || row.disposition === 'orphaned' || row.disposition === 'unknown'
-      ? { tense: 'present' as const } : {}),
+    ...(row.disposition === 'reserved' ? { tense: 'present' as const }
+      : row.disposition === 'orphaned' || row.disposition === 'unknown' ? { tense: 'neutral' as const } : {}),
   });
   switch (row.disposition) {
     case 'reserved':

@@ -119,25 +119,28 @@ export function describeExternalWrite(
   targets: string[],
   /** `tense: 'present'` is for a write that has been RESERVED but has not
    *  settled — "Creating a draft to …". Past tense is a claim about the world
-   *  and must never be made before a terminal says so. */
-  write?: { irreversible?: boolean; actionKey?: string; consequence?: string; tense?: 'past' | 'present' },
+   *  and must never be made before a terminal says so. `neutral` names the
+   *  operation without claiming that it completed or is still in flight. */
+  write?: { irreversible?: boolean; actionKey?: string; consequence?: string; tense?: 'past' | 'present' | 'neutral' },
 ): string {
   const key = shapeKey || write?.actionKey || toolName || 'action';
   const to = targets.length
     ? ` to ${targets.slice(0, 3).join(', ')}${targets.length > 3 ? ` (+${targets.length - 3} more)` : ''}`
     : '';
-  /** Pick the verb for the tense asked for. One table, two readings. */
-  const v = (past: string, present: string): string => (write?.tense === 'present' ? present : past);
+  const v = (past: string, present: string, neutral: string): string => {
+    const tense = write?.tense;
+    return tense === 'neutral' ? neutral : tense === 'present' ? present : past;
+  };
   switch (externalWriteKind(shapeKey, toolName, write)) {
-    case 'draft_updated': return `${v('Updated', 'Updating')} a draft${to}`;
-    case 'draft_created': return `${v('Created', 'Creating')} a draft${to}`;
-    case 'record_deleted': return `${v('Deleted', 'Deleting')} a record${to}`;
-    case 'post_published': return `${v('Published', 'Publishing')} a post${to}`;
-    case 'message_sent': return `${v('Sent', 'Sending')} a message${to}`;
-    case 'file_saved': return `${v('Saved', 'Saving')} a file${to}`;
-    case 'record_updated': return `${v('Updated', 'Updating')} a record${to}`;
-    case 'record_created': return `${v('Created', 'Creating')} a record${to}`;
-    case 'other': return `${v('Ran', 'Running')} ${key.toLowerCase().replace(/[_:]/g, ' ')}${to}`;
+    case 'draft_updated': return `${v('Updated a draft', 'Updating a draft', 'Draft update')}${to}`;
+    case 'draft_created': return `${v('Created a draft', 'Creating a draft', 'Draft creation')}${to}`;
+    case 'record_deleted': return `${v('Deleted a record', 'Deleting a record', 'Record deletion')}${to}`;
+    case 'post_published': return `${v('Published a post', 'Publishing a post', 'Post publication')}${to}`;
+    case 'message_sent': return `${v('Sent a message', 'Sending a message', 'Message delivery')}${to}`;
+    case 'file_saved': return `${v('Saved a file', 'Saving a file', 'File save')}${to}`;
+    case 'record_updated': return `${v('Updated a record', 'Updating a record', 'Record update')}${to}`;
+    case 'record_created': return `${v('Created a record', 'Creating a record', 'Record creation')}${to}`;
+    case 'other': return `${v('Ran', 'Running', 'Operation')} ${key.toLowerCase().replace(/[_:]/g, ' ')}${to}`;
   }
 }
 

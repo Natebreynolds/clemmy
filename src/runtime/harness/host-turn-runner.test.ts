@@ -10051,6 +10051,54 @@ test('terminal steering compatibility: source-only direct runConversation and no
   }
 });
 
+for (const scope of ['worker', 'nondirect', 'agent'] as const) {
+  test(`terminal steering compatibility: ${scope} host context cannot adopt or close its parent input queue`, async () => {
+    const steering = await import('./steer-notes.js');
+    const session = eventlog.createSession({ id: `sess-steering-child-${scope}-${++acceptedSerial}`,
+      kind: scope === 'agent' ? 'agent' : 'chat' });
+    const attempt = eventlog.beginRunAttempt(session.id, { runId: `child-steering-${acceptedSerial}` });
+    const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Report the supplied status.' } });
+    const parent = { sessionId: session.id, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId,
+      counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::turn:1` };
+    const fixture = { session, source, parent, context: { sessionId: session.id, sourceUserSeq: source.seq } };
+    const noteText = 'Write the parent summary in French.';
+    let note!: { seq: number };
+    const childModel = scriptedRecordingModel([[textMsg('The delegated status is ready.')]]);
+    const respond = childModel.getResponse.bind(childModel);
+    childModel.getResponse = async request => {
+      note = steering.appendSteerNote(session.id, noteText);
+      return respond(request);
+    };
+    const agent = { model: childModel, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const childParent = { ...parent, ...(scope === 'worker' ? { workerScope: true }
+      : scope === 'nondirect' ? { directOrchestrator: false } : {}) };
+    const outcome = await brackets.withHarnessRunContext(childParent, () => productionHostRunRunner(
+      throwingRunner() as never, agent as never, [{ type: 'message', role: 'user', content: source.data.text }] as never,
+      { maxTurns: 3, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: false } as never));
+    assert.equal(outcome.finalOutput, 'The delegated status is ready.');
+    assert.equal(childModel.calls(), 1, 'the child neither retries for nor consumes a parent correction');
+    assert.equal(eventlog.listEvents(session.id, { types: ['user_steer_note_delivered'] }).length, 0);
+    assert.equal(steering.hasUndeliveredSteerNotes(session.id, source.seq), true);
+    assert.equal(eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+      .filter(row => row.data.kind === 'host_terminal_steering_cutover').length, 0);
+    if (scope !== 'agent') {
+      const parentModel = scriptedRecordingModel([[textMsg('Le statut est prêt.')]]);
+      const parentAgent = { model: parentModel, tools: [] };
+      bindHostCanarySurface(fixture, parentAgent, []);
+      const resumed = await runProductionHost(fixture, parentAgent, undefined, { hostJudgeCompletion: false });
+      assert.equal(resumed.finalOutput, 'Le statut est prêt.');
+      assert.ok(JSON.stringify(parentModel.requests[0]).includes(noteText));
+      assert.equal(eventlog.listEvents(session.id, { types: ['user_steer_note_delivered'] })
+        .filter(row => Array.isArray(row.data.noteSeqs) && row.data.noteSeqs.includes(note.seq)).length, 1);
+      assert.equal(steering.hasUndeliveredSteerNotes(session.id, source.seq), false);
+      assert.equal(eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+        .filter(row => row.data.kind === 'host_terminal_steering_cutover').length, 1,
+      'only the genuine top-level owner closes its eventual handoff');
+    }
+  });
+}
+
 /** A real accepted source whose text is the request the judge measures against. */
 function acceptJudgedSource(label: string, text: string, sourceData: Record<string, unknown> = {}) {
   const session = eventlog.createSession({ id: `host-judged-${++acceptedSerial}-${label}`, kind: 'chat' });

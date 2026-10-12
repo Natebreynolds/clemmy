@@ -288,8 +288,9 @@ test('a reservation left open when the run ended is sealed, not shown as sending
   assert.equal(onceOver[0].tone, 'warning');
   assert.equal(onceOver[0].settled, true);
   assert.equal(onceOver[0].note, null, 'no "not confirmed yet" on a run that is over');
-  assert.match(onceOver[0].what, /couldn’t confirm|couldn't confirm/);
+  assert.match(onceOver[0].what, /unconfirmed — may have landed$/);
   assert.doesNotMatch(onceOver[0].what, /^Sending /, 'a finished run has nothing in flight');
+  assert.doesNotMatch(onceOver[0].what, /^Sent |timed out| — failed$/i, 'an unknown send is not a successful send, timeout or known failure');
 });
 
 test('a run parked on an approval does not seal a write that may still be in flight', () => {

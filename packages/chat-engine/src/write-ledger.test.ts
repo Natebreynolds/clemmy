@@ -83,7 +83,7 @@ test('a public orphan with no cause says unconfirmed, without inventing a timeou
   assert.equal(row.disposition, 'orphaned');
   assert.equal(writeRowStatus(row), 'interrupted');
   assert.equal(writeRowTone(row), 'warning');
-  assert.equal(writeRowLabel(row), 'Creating a draft to paul@example.com — unconfirmed — may have landed');
+  assert.equal(writeRowLabel(row), 'Draft creation to paul@example.com — unconfirmed — may have landed');
   assert.doesNotMatch(writeRowLabel(row), /timed out|^Created|failed/i);
 });
 
@@ -94,7 +94,7 @@ test('an unpaired public orphan keeps send uncertainty without a confirmed past-
   assert.equal(row.disposition, 'orphaned');
   assert.equal(writeRowStatus(row), 'interrupted');
   assert.equal(writeRowTone(row), 'warning');
-  assert.equal(writeRowLabel(row), 'Sending a message to paul@example.com — unconfirmed — may have landed');
+  assert.equal(writeRowLabel(row), 'Message delivery to paul@example.com — unconfirmed — may have landed');
   assert.doesNotMatch(writeRowLabel(row), /timed out|^Sent/i);
 });
 
@@ -130,7 +130,7 @@ test('two open reservations sharing one callId both go unknown, never "never dis
   assert.equal(row.disposition, 'unknown');
   assert.equal(writeRowStatus(row), 'interrupted');
   assert.equal(writeRowTone(row), 'warning');
-  assert.equal(writeRowLabel(row), 'Creating a draft to paul@example.com — unconfirmed — may have landed');
+  assert.equal(writeRowLabel(row), 'Draft creation to paul@example.com — unconfirmed — may have landed');
   assert.doesNotMatch(writeRowLabel(row), /timed out|^Created/i);
 });
 
@@ -149,7 +149,7 @@ test('an unsettled reservation at turn end is unknown, not success', () => {
   const open = foldWriteLedger([ev('external_write', write('c1', { preDispatch: true }))]);
   const sealed = sealOpenWrites(open);
   assert.equal(only(sealed).disposition, 'unknown');
-  assert.equal(writeRowLabel(only(sealed)), 'Creating a draft to paul@example.com — unconfirmed — may have landed');
+  assert.equal(writeRowLabel(only(sealed)), 'Draft creation to paul@example.com — unconfirmed — may have landed');
   assert.equal(writeRowStatus(only(sealed)), 'interrupted');
   assert.equal(writeRowTone(only(sealed)), 'warning');
   // Sealing a settled ledger changes nothing.
@@ -158,6 +158,49 @@ test('an unsettled reservation at turn end is unknown, not success', () => {
     ev('external_write_succeeded', write('c2')),
   ]);
   assert.equal(only(sealOpenWrites(settled)).disposition, 'confirmed');
+});
+
+test('unconfirmed write operations are neutral without changing live or confirmed labels', () => {
+  const cases = [
+    { shapeKey: 'OUTLOOK_CREATE_DRAFT', neutral: 'Draft creation', present: 'Creating a draft', past: 'Created a draft' },
+    { shapeKey: 'OUTLOOK_UPDATE_DRAFT', neutral: 'Draft update', present: 'Updating a draft', past: 'Updated a draft' },
+    { shapeKey: 'SLACK_DELETE_MESSAGE', neutral: 'Record deletion', present: 'Deleting a record', past: 'Deleted a record' },
+    { shapeKey: 'LINKEDIN_PUBLISH_POST', neutral: 'Post publication', present: 'Publishing a post', past: 'Published a post' },
+    { shapeKey: 'GMAIL_SEND_EMAIL', neutral: 'Message delivery', present: 'Sending a message', past: 'Sent a message' },
+    { shapeKey: 'DRIVE_UPLOAD_FILE', neutral: 'File save', present: 'Saving a file', past: 'Saved a file' },
+    { shapeKey: 'HUBSPOT_UPDATE_CONTACT', neutral: 'Record update', present: 'Updating a record', past: 'Updated a record' },
+    { shapeKey: 'HUBSPOT_CREATE_CONTACT', neutral: 'Record creation', present: 'Creating a record', past: 'Created a record' },
+    { shapeKey: 'PROVIDER_EXECUTE_ACTION', neutral: 'Operation provider execute action', present: 'Running provider execute action', past: 'Ran provider execute action' },
+    { shapeKey: 'GMAIL_SEND_EMAIL', neutral: 'Operation gmail send email', present: 'Running gmail send email', past: 'Ran gmail send email', extra: { irreversible: false } },
+    { shapeKey: 'GMAIL_SEND_EMAIL', neutral: 'Operation gmail send email', present: 'Running gmail send email', past: 'Ran gmail send email', extra: { consequence: 'execute' } },
+  ];
+  const targetSuffix = ' to a, b, c (+2 more)';
+  for (const [index, entry] of cases.entries()) {
+    const payload = write(`neutral-${index}`, { shapeKey: entry.shapeKey, targets: ['a', 'b', 'c', 'd', 'e'], ...entry.extra });
+    const reservation = ev('external_write', payload);
+    const live = foldWriteLedger([reservation]);
+    assert.equal(writeRowLabel(only(live)), entry.present + targetSuffix);
+    const confirmed = only(foldWriteLedger([reservation, ev('external_write_succeeded', payload)]));
+    assert.equal(writeRowLabel(confirmed), entry.past + targetSuffix);
+    assert.equal(confirmed.disposition, 'confirmed');
+
+    const unknown = only(sealOpenWrites(live));
+    const orphaned = only(foldWriteLedger([reservation, ev('external_write_orphaned', payload)]));
+    for (const unconfirmed of [unknown, orphaned]) {
+      const before = structuredClone(unconfirmed);
+      const label = writeRowLabel(unconfirmed);
+      assert.equal(label, entry.neutral + targetSuffix + ' — unconfirmed — may have landed');
+      assert.doesNotMatch(label, /^(Creating|Updating|Deleting|Publishing|Sending|Saving|Running|Created|Updated|Deleted|Published|Sent|Saved|Ran)\b|timed out| — failed$/i);
+      assert.equal(writeRowStatus(unconfirmed), 'interrupted');
+      assert.equal(writeRowTone(unconfirmed), 'warning');
+      assert.deepEqual(unconfirmed, before, 'presentation preserves the exact ledger row');
+    }
+    assert.equal(unknown.disposition, 'unknown');
+    assert.equal(orphaned.disposition, 'orphaned');
+    const reconciled = only(foldWriteLedger([reservation, ev('external_write_orphaned', payload), ev('external_write_succeeded', payload)]));
+    assert.equal(writeRowLabel(reconciled), entry.past + targetSuffix);
+    assert.equal(reconciled.disposition, 'confirmed', 'only the exact decisive terminal settles the uncertainty');
+  }
 });
 
 test('irreversible is null on the public bus, and null never reads as irreversible', () => {

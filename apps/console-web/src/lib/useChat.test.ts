@@ -1013,7 +1013,7 @@ test('reduceActivity: a failed / orphaned external write reads honestly (danger 
   assert.equal(a[1].status, 'interrupted');
   assert.equal(a[1].tone, 'warning');
   assert.equal(a[1].write?.disposition, 'orphaned');
-  assert.equal(a[1].label, 'Sending a message to z@y.example — unconfirmed — may have landed');
+  assert.equal(a[1].label, 'Message delivery to z@y.example — unconfirmed — may have landed');
   assert.doesNotMatch(a[1].label, /timed out|^Sent/i);
 });
 

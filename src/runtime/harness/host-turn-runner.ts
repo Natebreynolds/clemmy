@@ -3260,6 +3260,12 @@ const runHostTurnBody = async (
   const hostTurnEngine = optionTurnEngine;
   const hostReadOnlyCanary = hostTurnEngine === 'host_v1_read_only';
   const hostProduction = hostTurnEngine === 'host_v1';
+  // A delegated child can inherit a chat-shaped namespace or its parent's
+  // context. It does not own that chat's input queue or terminal handoff.
+  const steeringContext = harnessRunContextStorage.getStore();
+  const hostOwnerSteering = hostProduction && steeringContext?.workerScope !== true
+    && steeringContext?.directOrchestrator !== false && !!steeringContext
+    && sessionSupportsSteering(steeringContext.sessionId) && getSession(steeringContext.sessionId)?.kind === 'chat';
   // Retain original model bytes in the accepted batch. Every execution check
   // below consumes the same locally schema-completed carrier bytes instead.
   const localArgumentPreparations = new Map<string, string>();
@@ -9862,7 +9868,7 @@ const runHostTurnBody = async (
   /** Why the host is taking another step after a shown draft, so the viewer
    *  can say so instead of the draft silently disappearing. */
   let nextDraftRetractReason: AnswerDraftRetractReason | undefined;
-  const terminalSteeringOwner = hostProduction ? {
+  const terminalSteeringOwner = hostOwnerSteering ? {
     ...exactHostIdentity(), attemptId: harnessRunContextStorage.getStore()?.runAttemptId,
   } : undefined;
   const terminalSteeringLease = harnessRunContextStorage.getStore()?.dispatchLease;
@@ -9880,7 +9886,7 @@ const runHostTurnBody = async (
     }
   }
   const reopenForOwnerSteering = (objective: string, draft?: AnswerDraftStep): boolean => {
-    if (!hostProduction || signal?.aborted) return false;
+    if (!hostOwnerSteering || signal?.aborted) return false;
     assertRecoveryActivationOwned();
     const identity = exactHostIdentity();
     if (!terminalSteeringOwner || identity.sessionId !== terminalSteeringOwner.sessionId
@@ -10430,7 +10436,7 @@ const runHostTurnBody = async (
         const steerIdentity = exactHostIdentity();
         const memoryIntake = verifiedMemoryIntakeContext(steerIdentity);
         if (memoryIntake) modelInput.push({ role: 'system', content: memoryIntake } as AgentInputItem);
-        const deliveredNotes = takeUndeliveredSteerNotes(steerIdentity.sessionId, steerIdentity.sourceUserSeq);
+        const deliveredNotes = hostOwnerSteering ? takeUndeliveredSteerNotes(steerIdentity.sessionId, steerIdentity.sourceUserSeq) : [];
         captureExplicitSteerInstructions(steerIdentity.sessionId, deliveredNotes);
         adoptedSteering = formatSteerBlock(adoptedSteerNotesForSource(steerIdentity));
         if (turnIsPlanMode()) {
@@ -10691,7 +10697,7 @@ const runHostTurnBody = async (
     // dispatch a frame authored without that correction, or publish its final
     // answer. Nothing from this fresh frame has been admitted or executed yet;
     // retain prior settlements and let the next request see the durable note.
-    if (hostProduction && ranModelStep) {
+    if (hostOwnerSteering && ranModelStep) {
       const identity = exactHostIdentity();
       const arrived = takeUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
       if (arrived.length > 0) {
