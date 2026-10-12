@@ -35,16 +35,17 @@ export function containAsyncRouteRejections(): void {
       next(err);
       return;
     }
-    // Any thenable counts (native promises and promise-like results alike);
-    // a `then` that itself throws is that request's error too.
-    if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
-      try {
-        (result as PromiseLike<unknown>).then(undefined, (err: unknown) => {
+    // Getter acquisition and invocation belong to the same error boundary.
+    // Read once and keep the thenable as receiver, like the original call.
+    try {
+      const then = result && (result as PromiseLike<unknown>).then;
+      if (typeof then === 'function') {
+        Reflect.apply(then, result, [undefined, (err: unknown) => {
           next(err ?? new Error('A route handler rejected without a reason.'));
-        });
-      } catch (err) {
-        next(err);
+        }]);
       }
+    } catch (err) {
+      next(err);
     }
   };
 }

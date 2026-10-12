@@ -241,8 +241,8 @@ test('characterization: ORCHESTRATOR_INSTRUCTIONS_LEAN is byte-stable (reviewabl
 });
 
 test('fresh accepted actions keep model judgment while omitting unreachable policy', () => {
-  // Preserve the prior 7,048-byte composition plus only the 118-byte
-  // settlement/retry distinction; keep the same two bytes of assembly headroom.
+  // Keep the fresh-action prefix within its budget. Checkpoint-specific replay
+  // reasoning belongs to the resumed turn, rather than every fresh action.
   assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, 'utf8') <= 7_168,
     'fresh-action stable policy must leave room for the exact turn snapshot and tool schemas');
   for (const required of [
@@ -251,7 +251,7 @@ test('fresh accepted actions keep model judgment while omitting unreachable poli
     'run_worker',
     'AUTO CONSENT',
     'ACCEPTED WORK AUTHORITY',
-    'STOP / CONTINUE',
+    'cancellation/reconciliation boundary',
     'END YOUR TURN WITH PLAIN TEXT',
     'CLOSE THE LOOP',
   ]) {
@@ -259,6 +259,10 @@ test('fresh accepted actions keep model judgment while omitting unreachable poli
   }
   assert.doesNotMatch(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /BACKGROUND STATUS|DURABLE OPPORTUNITIES/,
     'fresh foreground action policy must not repeat unreachable background/workflow guidance');
+  assert.doesNotMatch(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /STOP \/ CONTINUE/,
+    'fresh actions leave retained-effect reasoning to the checkpoint-bound continuation context');
+  assert.match(ORCHESTRATOR_INSTRUCTIONS_LEAN, /STOP \/ CONTINUE/,
+    'ordinary conversation still keeps the compact Stop and Continue rule');
 });
 
 test('provider parity: external content is evidence and cannot rewrite task authority', () => {

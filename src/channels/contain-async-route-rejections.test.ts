@@ -25,6 +25,34 @@ test('a rejecting async route is that request\'s 500; nothing reaches the proces
     // A promise-like result that rejects, and one whose then itself throws.
     app.get('/thenable', (() => ({ then: (_ok: unknown, fail: (e: unknown) => void) => fail(new Error('thenable refusal')) })) as unknown as express.RequestHandler);
     app.get('/broken-then', (() => ({ then: () => { throw new Error('then threw'); } })) as unknown as express.RequestHandler);
+    let throwingGetterReads = 0;
+    app.get('/throwing-then-getter', (() => ({ get then() {
+      throwingGetterReads += 1;
+      throw new Error('then getter refused');
+    } })) as unknown as express.RequestHandler);
+    let thenGetterReads = 0;
+    const receiver = { get then() {
+      thenGetterReads += 1;
+      assert.equal(thenGetterReads, 1, 'then is acquired exactly once');
+      return function (this: unknown, _ok: unknown, fail: (e: unknown) => void) {
+        assert.equal(this, receiver, 'the original thenable remains the receiver');
+        fail(new Error('single-read receiver refusal'));
+      };
+    } };
+    app.get('/single-read-then-getter', (() => receiver) as unknown as express.RequestHandler);
+    let ownCallReads = 0;
+    let ownCallThenInvocations = 0;
+    const ownCallThen = function (this: unknown, _ok: unknown, fail: (e: unknown) => void) {
+      assert.equal(this, ownCallReceiver, 'the callable is invoked with its original receiver');
+      ownCallThenInvocations += 1;
+      fail(new Error('own-call-independent refusal'));
+    };
+    Object.defineProperty(ownCallThen, 'call', { get() {
+      ownCallReads += 1;
+      throw new Error('own call getter must not be read');
+    } });
+    const ownCallReceiver = { then: ownCallThen };
+    app.get('/own-call-getter', (() => ownCallReceiver) as unknown as express.RequestHandler);
     const router = express.Router();
     router.post('/mounted', async () => { throw new Error('mounted refusal'); });
     app.use('/m', router);
@@ -39,6 +67,9 @@ test('a rejecting async route is that request\'s 500; nothing reaches the proces
       assert.equal((await fetch(`${base}/m/mounted`, { method: 'POST' })).status, 500);
       assert.equal((await fetch(`${base}/thenable`)).status, 500);
       assert.equal((await fetch(`${base}/broken-then`)).status, 500);
+      assert.equal((await fetch(`${base}/throwing-then-getter`)).status, 500);
+      assert.equal((await fetch(`${base}/single-read-then-getter`)).status, 500);
+      assert.equal((await fetch(`${base}/own-call-getter`)).status, 500);
       assert.deepEqual(await (await fetch(`${base}/ok`)).json(), { ok: true }, 'still serving');
     });
     await new Promise(resolve => setImmediate(resolve));
@@ -49,7 +80,14 @@ test('a rejecting async route is that request\'s 500; nothing reaches the proces
       'mounted refusal',
       'thenable refusal',
       'then threw',
+      'then getter refused',
+      'single-read receiver refusal',
+      'own-call-independent refusal',
     ]);
+    assert.equal(throwingGetterReads, 1);
+    assert.equal(thenGetterReads, 1);
+    assert.equal(ownCallReads, 0, 'invocation never reads the function\'s overridable call property');
+    assert.equal(ownCallThenInvocations, 1);
     // Settings reads and the route stack keep their own functions.
     app.set('probe', 7);
     assert.equal(app.get('probe'), 7);
