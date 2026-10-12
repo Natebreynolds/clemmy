@@ -14047,8 +14047,11 @@ export function registerConsoleRoutes(
       ? req.body.stepId.trim()
       : undefined;
     // Continue means from where the run stopped: steps whose changes landed
-    // are carried, never repeated. Only a run that changed nothing reruns whole.
-    const result = continueWorkflowRunFromCheckpoint(runId, { requestedFrom: 'board' }) ?? requeueWorkflowFromRun(runId, {
+    // are carried, never repeated. A caller that names its own recovery
+    // (an optimization rerun, say) gets that recovery instead.
+    const explicitRecovery = workflowRunRecoveryKindField((req.body as { recoveryIntent?: { kind?: unknown } } | undefined)?.recoveryIntent?.kind);
+    const continued = explicitRecovery ? null : continueWorkflowRunFromCheckpoint(runId, { requestedFrom: 'board' });
+    const result = continued ?? requeueWorkflowFromRun(runId, {
       source: 'board',
       recoveryIntent: workflowRunRecoveryIntentFromBody(req.body, {
         kind: 'safe_rerun',
