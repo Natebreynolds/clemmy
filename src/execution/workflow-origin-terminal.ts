@@ -38,6 +38,7 @@ import {
   RETAINED_WORK_TERMINAL_HEADER,
   renderFailureWithRetainedWork,
 } from '../runtime/harness/retained-work-terminal.js';
+import { OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT } from '../runtime/harness/terminal-notice.js';
 export { resolveWorkflowOriginReplyTarget } from '../runtime/workflow-origin-authority.js';
 
 export type WorkflowOriginReplyTarget = ExactOriginDeliveryTarget;
@@ -387,8 +388,8 @@ function commitParkedParentCancellation(
       } });
     return commitTurnOutcome(workflowTurnOutcome(
       { ...prepared.identity, runId: attempt.runId ?? attempt.attemptId, attemptId: attempt.attemptId },
-      'cancelled', 'Stopped as requested. Completed results are kept.', prepared.evidenceRunIds,
-    ), { legacyReason: 'cancelled', metadata: { transport: 'workflow_report_back' } });
+      'cancelled', OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT, prepared.evidenceRunIds,
+    ), { legacyReason: 'cancelled', metadata: { transport: 'workflow_report_back', hostNotice: { code: 'stopped' } } });
   }).immediate();
 }
 

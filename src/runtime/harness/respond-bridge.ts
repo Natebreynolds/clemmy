@@ -144,6 +144,7 @@ import {
   publicPresentationText,
   publicReplyText,
 } from './public-presentation.js';
+import { type TerminalNotice } from './terminal-notice.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import { renderTypedControlState } from './typed-control-state.js';
 import {
@@ -427,6 +428,8 @@ async function blockedPreRunResponse(
   /** Host-only unavailable saved-pin refusal. It has no execution graph to
    * interpret: accepting the source and committing the block are sufficient. */
   unavailableSavedPin?: UnavailableSessionAgentModel,
+  /** An app status the clients render as chrome instead of a Clem bubble. */
+  hostNotice?: TerminalNotice,
 ): Promise<AssistantResponse> {
   const route = routeForHarness(surface, request);
   if (unavailableSavedPin) {
@@ -497,7 +500,7 @@ async function blockedPreRunResponse(
       presentation: { kind: 'blocked', text: userText },
     }, {
       legacyReason: code,
-      metadata: { transport: 'harness_preflight_block' },
+      metadata: { transport: 'harness_preflight_block', ...(hostNotice ? { hostNotice } : {}) },
     }).presentation.text;
     terminalCommitted = true;
   } catch {
@@ -529,8 +532,11 @@ function unavailableSavedAgentResponse(surface: HarnessSurface, request: Assista
   const agent = choice.agentName ? `“${choice.agentName}”` : 'this saved agent';
   const model = choice.modelId ?? choice.savedModel;
   const quotaHeld = choice.reason === 'codex_quota_exhausted';
+  // The quota refusal is an app status, not something Clem says: no model ran.
+  // The stored line (CLI, channels, model history) is app voice; desktop and
+  // phone render the notice with its own action.
   const text = quotaHeld
-    ? `Clem’s latest Codex usage check shows no available quota for ${agent}${model ? ` on “${model}”` : ''}. I couldn’t start this turn. Wait for quota to become available, or choose another model for this conversation.`
+    ? `No Codex quota is available for ${agent}${model ? ` on “${model}”` : ''}, so this turn did not start. Wait for quota to return, or choose another model for this conversation.`
     : model
     ? `I could not start ${agent} because its saved model “${model}” is unavailable. Connect that model in Settings > Models or choose a different model for this conversation, then try again.`
     : `I could not verify the saved model for ${agent}. Check the agent's saved model or choose a model for this conversation, then try again.`;
@@ -538,7 +544,11 @@ function unavailableSavedAgentResponse(surface: HarnessSurface, request: Assista
     reason: quotaHeld ? 'saved_agent_codex_quota_exhausted' : 'saved_agent_model_unavailable', savedAgentId: choice.agentId,
     savedAgentName: choice.agentName, savedModel: choice.savedModel,
     requiredModel: choice.modelId, modelCheck: choice.reason,
-  }, choice);
+  }, choice, quotaHeld ? {
+    code: 'provider_quota',
+    ...(choice.agentName ? { agentName: choice.agentName } : {}),
+    ...(model ? { model } : {}),
+  } : undefined);
 }
 
 function responseForWarmReadPolicyConflict(

@@ -66,6 +66,7 @@ import { requireActionExpectedWorkActivation } from './action-expected-work-boun
 import { ToolCallsCounter, withHarnessRunContext } from './brackets.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import { expectedWorkPlanLines } from './expected-work-admission.js';
+import { OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT, type TerminalNotice } from './terminal-notice.js';
 
 const logger = pino({ name: 'clementine.chat-approval-resume' });
 
@@ -332,7 +333,7 @@ function approvalSourceIsSafeToDispatch(row: approvalRegistry.PendingApprovalRow
 async function settleConversationalSource(
   row: approvalRegistry.PendingApprovalRow,
   source: EventRow,
-  input: { text: string; status: 'done' | 'failed' | 'needs_input' | 'cancelled' },
+  input: { text: string; status: 'done' | 'failed' | 'needs_input' | 'cancelled'; hostNotice?: TerminalNotice },
 ): Promise<boolean> {
   const identity: TurnIdentity = {
     sessionId: source.sessionId,
@@ -372,7 +373,11 @@ async function settleConversationalSource(
           };
     commitTurnOutcome(outcome, {
       legacyReason: 'conversational_send_consent_resolved',
-      metadata: { approvalId: row.approvalId, pendingActionId: pendingActionIdFromArgs(row.args) },
+      metadata: {
+        approvalId: row.approvalId,
+        pendingActionId: pendingActionIdFromArgs(row.args),
+        ...(input.hostNotice ? { hostNotice: input.hostNotice } : {}),
+      },
     });
     const attempt = getActiveRunAttempt(row.sessionId);
     if (attempt && getRunAttemptSourceUserEvent(attempt)?.seq === source.seq) {
@@ -523,9 +528,12 @@ async function executeApprovedLinkedActionAndSettle(
   const actionAttempt = getRunAttemptBySourceUserSeq(source.sessionId, source.seq);
   if (actionAttempt?.status === 'cancelled'
     || isKillRequested(source.sessionId, { sourceUserSeq: source.seq })) {
+    // The owner's own Stop: an app-voice line (no first person) for the CLI,
+    // channels and model history, and a notice the clients show as the pill.
     return await settleConversationalSource(row, source, {
       status: 'cancelled',
-      text: 'Stopped as requested. Completed results are kept; this action will not run again on its own.',
+      text: `${OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT} This action will not run again on its own.`,
+      hostNotice: { code: 'stopped' },
     });
   }
   if (pendingAction.status === 'executed') {

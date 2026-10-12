@@ -28,6 +28,7 @@ const { shouldRunObjectiveJudge, buildObjectiveJudgePrompt, JUDGE_SYSTEM_PROMPT,
 const { recordCatalogWindow, recordWindowRejection } = await import('./model-window-observations.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
+const { withoutRetainedWorkCheckpoint } = await import('./retained-work-checkpoint.js');
 const { armHostCallAuthority } = await import('./accepted-turn-call-authority.js');
 const callAuthority = await import('./accepted-turn-call-authority.js');
 const hostBindings = await import('./host-call-capability-binding.js');
@@ -1473,8 +1474,10 @@ test('captured OFF holds a whole-answer format violation without extracting cont
   assert.equal(run.calls, 1);
   assert.equal(run.judged.length, 0);
   assert.deepEqual(run.outcome.terminal, { status: 'blocked', reason: 'owner_response_format_unmet' });
-  assert.match(String(run.outcome.finalOutput), /does not meet your requested output format/);
-  assert.match(String(run.outcome.finalOutput), /This task is not complete/);
+  // Clem's own draft is what the owner reads; the format miss is a notice the
+  // reducer derives from the terminal reason, never a sentence written for her.
+  assert.equal(withoutRetainedWorkCheckpoint(String(run.outcome.finalOutput)).trim(), raw.trim());
+  assert.doesNotMatch(String(run.outcome.finalOutput), /My answer is saved|requested output format|This task is not complete/);
   assert.ok(JSON.stringify(run.outcome.history).includes(JSON.stringify(raw).slice(1, -1)), 'the full raw draft and qualification stay in admitted history');
   const original = run.originalResponses[0] as { output: Array<{ content: Array<{ text: string }> }> };
   assert.equal(original.output[0]!.content[0]!.text, raw, 'original SDK bytes are unchanged');
@@ -1541,7 +1544,8 @@ test('missing exact attempt capture under OFF holds an explicit format obligatio
   assert.equal(run.judged.length, 0);
   assert.deepEqual(run.outcome.terminal, { status: 'blocked', reason: 'owner_response_format_unqualified' });
   assert.equal(host.isNarratableHostStop(run.outcome), false);
-  assert.match(String(run.outcome.finalOutput), /could not verify the current output requirements/);
+  assert.equal(withoutRetainedWorkCheckpoint(String(run.outcome.finalOutput)).trim(), raw.trim());
+  assert.doesNotMatch(String(run.outcome.finalOutput), /My answer is saved|could not verify the current output requirements/);
   assert.ok(JSON.stringify(run.outcome.history).includes(JSON.stringify(raw).slice(1, -1)));
   assert.ok(!JSON.stringify(run.modelInputs).includes('FINAL ANSWER FORMAT'), 'unqualified owner cannot grant author guidance');
   assert.equal(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged', 'tool_called'] }).length, 0);

@@ -1982,10 +1982,12 @@ test('saved agent Codex quota hold keeps the exact source resumable without conn
   const request = { sessionId, message: 'Draft the controlled local plan.', channel: 'desktop', runId: 'quota-held-agent-attempt' };
   const response = await respondPreferHarness('home', request, async () => { work++; throw new Error('Legacy must not run.'); });
   assert.equal(response.stoppedReason, 'blocked');
-  assert.match(response.text, /latest Codex usage check shows no available quota/);
+  // An app status, not something Clem says: no model ran this turn.
+  assert.match(response.text, /No Codex quota is available/);
   assert.match(response.text, /gpt-6\.1-sol/);
   assert.match(response.text, /Quota Held Specialist/);
-  assert.match(response.text, /couldn’t start this turn/);
+  assert.match(response.text, /this turn did not start/);
+  assert.doesNotMatch(response.text, /\b(?:I|I’m|I'm|me|my)\b|Clem’s|usage check/);
   assert.doesNotMatch(response.text, /Connect that model|Settings > Models|retained task|snapshot|billing|remote refusal|automatically/i);
   const sources = listEvents(sessionId, { types: ['user_input_received'] });
   const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
@@ -1993,6 +1995,10 @@ test('saved agent Codex quota hold keeps the exact source resumable without conn
   assert.equal(terminals.length, 1);
   assert.equal(terminals[0]!.data.reason, 'saved_agent_codex_quota_exhausted');
   assert.equal(terminals[0]!.data.transport, 'harness_preflight_block');
+  assert.deepEqual(terminals[0]!.data.hostNotice,
+    { code: 'provider_quota', agentName: 'Quota Held Specialist', model: 'gpt-6.1-sol' });
+  assert.deepEqual(projectHarnessEventForPublic(terminals[0]!)?.data.notice,
+    { code: 'provider_quota', agentName: 'Quota Held Specialist', model: 'gpt-6.1-sol' });
   const presentation = terminals[0]!.data.presentation as { identity: { sourceUserSeq: number }; status: string; resumable: boolean };
   assert.equal(presentation.identity.sourceUserSeq, sources[0]!.seq);
   assert.equal(presentation.status, 'blocked');

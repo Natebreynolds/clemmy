@@ -3,7 +3,11 @@ import { liftNestedCarrierFields } from './carrier-field-lift.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
-import { RETAINED_WORK_TERMINAL_HEADER } from './retained-work-checkpoint.js';
+import {
+  parseRetainedWorkCheckpoint,
+  RETAINED_WORK_TERMINAL_HEADER,
+  type RetainedOutsideChange,
+} from './retained-work-checkpoint.js';
 import { runOwnedHostStopNarration } from './host-stop-narration-lifecycle.js';
 import { retainConnectionExecutionProgress } from './connection-execution-progress.js';
 import { assertHostConnectionProgress, bindHostConnectionProgress, clearHostConnectionProgress, type HostConnectionProgress } from './host-connection-progress.js';
@@ -5752,9 +5756,13 @@ const runHostTurnBody = async (
             narrationInput = structuredClone(filtered.input);
             if (typeof filtered.instructions !== 'undefined') narrationInstructions = filtered.instructions;
           }
+          // What is kept, as counts: the owner reads it in Clem's words and as
+          // the pill's count; the checkpoint itself stays durable for reuse.
+          const { results, outsideChange } = parseRetainedWorkCheckpoint(retained);
           narrationInput.push({
             role: 'system',
-            content: hostStopNarrationDirective(fact, (outcome as HostRunOutcome).blockedDetail),
+            content: hostStopNarrationDirective(fact, (outcome as HostRunOutcome).blockedDetail,
+              { results, outsideChange }),
           } as AgentInputItem);
           const narrationSettings = stepModelSettings();
           const hostProjection = canonicalPromptCacheRequest({
@@ -10966,16 +10974,14 @@ const runHostTurnBody = async (
           ownerResponseFormatForStep, ownerResponseFormatRequiredForStep);
         if (ownerResponseFormatHeld) {
           // Keep the complete admitted draft, including prose/qualifications,
-          // and prior settlements. No extraction, replacement or retry.
+          // and prior settlements. No extraction, replacement or retry. Clem's
+          // own draft is what the owner reads; the format miss travels as the
+          // terminal reason, which the reducer turns into an app notice.
           history.push(...admission.frame.history);
           if (step.responseId !== undefined) lastResponseId = step.responseId;
           retainConnectionProgress();
-          return blockedOutcome(ownerResponseFormatHeld === 'unmet'
-            ? 'My answer is saved, but it does not meet your requested output format. This task is not complete. '
-              + 'Say “continue” to correct the answer using the saved work.'
-            : 'My answer is saved, but I could not verify the current output requirements for this response. '
-              + 'This task is not complete. Continue from the saved work after those requirements are confirmed.',
-          ownerResponseFormatHeld === 'unmet' ? 'owner_response_format_unmet' : 'owner_response_format_unqualified');
+          return blockedOutcome(admission.frame.text,
+            ownerResponseFormatHeld === 'unmet' ? 'owner_response_format_unmet' : 'owner_response_format_unqualified');
         }
         if (normalization) {
           assertRecoveryActivationOwned();
@@ -12349,13 +12355,36 @@ export function isNarratableHostStop(outcome: RunOutcome): boolean {
   return !HOST_STOP_TEXTS_NOT_NARRATED().some((fixed) => text.startsWith(fixed));
 }
 
+const RETAINED_OUTSIDE_CHANGE_FACT: Readonly<Record<RetainedOutsideChange, string>> = {
+  went_through: 'went through; it must not be repeated',
+  did_not: 'did not go through',
+  mixed: 'some went through and at least one did not; the ones that went through must not be repeated',
+  refused: 'the app refused the change; it does not rerun without asking the owner',
+  uncertain: 'not yet confirmed whether it went through; it is checked before any retry',
+  none: 'none recorded',
+};
+
+/** What the checkpoint kept, as one fact line for the narration directive.
+ * Absent when nothing was kept and nothing outside this machine is recorded. */
+export function hostStopRetainedFact(retained: { results: number; outsideChange: RetainedOutsideChange }): string | undefined {
+  if (retained.results <= 0 && retained.outsideChange === 'none') return undefined;
+  const results = `${retained.results} result${retained.results === 1 ? '' : 's'}`;
+  return `Kept for when the owner continues: ${results}; changes in other apps: ${RETAINED_OUTSIDE_CHANGE_FACT[retained.outsideChange]}.`;
+}
+
 /** The host's fact, for Clem to say. Facts only; the words are hers. */
-export function hostStopNarrationDirective(fact: string, detail?: string): string {
+export function hostStopNarrationDirective(
+  fact: string,
+  detail?: string,
+  retained?: { results: number; outsideChange: RetainedOutsideChange },
+): string {
+  const kept = retained ? hostStopRetainedFact(retained) : undefined;
   return [
     '[turn-facts:v1]',
     'This turn has to stop here. What the harness knows, in its own terms:',
     fact,
     ...(detail ? [`Machine detail: ${detail}`] : []),
+    ...(kept ? [kept] : []),
     'Write your reply to the owner now, as yourself, from the conversation above and this fact: what you did, what did not happen or is not certain, what is kept, and the one next step (what you need from them, or what you will do when they say go).',
     'Do not call tools. Claim nothing the conversation does not show. Do not mention the harness, checkpoints, reconciliation, tool names, ids or handles.',
   ].join('\n');

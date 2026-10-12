@@ -71,6 +71,7 @@ import { getPlanRevisionForSource } from './plan-artifacts.js';
 import { WHOLE_JSON_OBJECT_FORMAT_FINDING } from './response-format-repair.js';
 import {
   normalizeTerminalNotice,
+  OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT,
   type TerminalNotice,
 } from './terminal-notice.js';
 
@@ -1199,14 +1200,18 @@ export function commitTurnOutcome(
       attemptId: attempt.attemptId, runId: attempt.runId,
     }) !== null;
     if (stopped) {
+      // The owner's own Stop is app chrome, not something Clem says: an
+      // app-voice line for the CLI, channels and model history, plus a notice
+      // the clients render as the Stop pill. What was kept travels as counts.
       effectiveOutcome = {
         ...effectiveOutcome,
         status: 'cancelled',
         resumable: false,
-        presentation: { kind: 'stopped', text: 'Stopped as requested. Completed results are kept.' },
+        presentation: { kind: 'stopped', text: OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT },
       };
       const { blockedReason: _reason, blockedDetail: _detail, ...metadata } = effectiveOptions.metadata ?? {};
-      effectiveOptions = { ...effectiveOptions, legacyReason: 'cancelled', metadata };
+      const hostNotice: TerminalNotice = { code: 'stopped' };
+      effectiveOptions = { ...effectiveOptions, legacyReason: 'cancelled', metadata: { ...metadata, hostNotice } };
     } else {
       effectiveOutcome = {
         ...effectiveOutcome,

@@ -207,7 +207,7 @@ test('a resumed approval preserves the original unresolved external effect in it
 });
 
 
-test('an exact stopped attempt publishes cancelled rather than a host failure', () => {
+test('an exact stopped attempt publishes cancelled rather than a host failure', async () => {
   const source = acceptedSource('sess-effect-truth-exact-stop');
   const attempt = eventlog.beginRunAttempt(source.sessionId, { runId: 'run-exact-stop' });
   eventlog.bindRunAttemptSourceUserEvent(attempt, source.sourceUserSeq);
@@ -218,7 +218,14 @@ test('an exact stopped attempt publishes cancelled rather than a host failure', 
   assert.equal((terminal.data.turnOutcome as { status: string }).status, 'cancelled');
   assert.equal(terminal.data.reason, 'cancelled');
   assert.equal(terminal.data.blockedReason, undefined);
-  assert.match(committedText(source.sessionId), /stopped as requested/i);
+  // The owner's own Stop is app chrome: an app-voice line with no first
+  // person, plus the notice the clients render as the Stop pill.
+  const { OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT } = await import('./terminal-notice.js');
+  assert.equal(committedText(source.sessionId), OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT);
+  assert.doesNotMatch(committedText(source.sessionId), /\b(?:I|me|my)\b/);
+  assert.deepEqual(terminal.data.hostNotice, { code: 'stopped' });
+  const [projected] = projectHarnessEventsForPublic([terminal]);
+  assert.deepEqual(projected?.data.notice, { code: 'stopped' });
 });
 
 test('a stop for a different accepted source cannot relabel this host failure', () => {
