@@ -42,6 +42,7 @@ import { parseTaskMode, taskModeFields, type TaskMode } from '../runtime/harness
  */
 
 import express from 'express';
+import { containAsyncRouteRejections } from './contain-async-route-rejections.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import path from 'node:path';
@@ -1508,6 +1509,7 @@ declare module 'express-serve-static-core' {
 const mobileDoorLog = pino({ name: 'clementine-next.mobile-door' });
 
 export function createMobileRouter(deps: MobileRouterDeps): express.Router {
+  containAsyncRouteRejections();
   const router = express.Router();
   const stateOpts = deps.stateDir ? { stateDir: deps.stateDir } : undefined;
 

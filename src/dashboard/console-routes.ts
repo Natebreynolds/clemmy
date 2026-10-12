@@ -14,6 +14,7 @@ import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, 
 import { parseTaskMode, taskModeFields, type TaskMode } from '../runtime/harness/task-mode.js';
 import type { Express, Request, Response } from 'express';
 import express from 'express';
+import { containAsyncRouteRejections } from '../channels/contain-async-route-rejections.js';
 import * as fs from 'node:fs';
 import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -3933,6 +3934,7 @@ export function registerConsoleRoutes(
     launchWindowsDefaultApp: typeof launchWindowsDefaultApp;
   } },
 ): void {
+  containAsyncRouteRejections();
   // Module load identifies this daemon process. Any unfinished desktop lease
   // owned by a prior process is necessarily orphaned, so make it resumable now
   // instead of forcing the first browser replay to wait out the full TTL.
