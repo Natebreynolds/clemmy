@@ -1752,32 +1752,33 @@ test('actual second-candidate host review sees current JSON and historical findi
   assert.equal(run.outcome.finalOutput, currentReply);
 });
 
-test('a blocked finding replaces the rejected draft; a plain negative keeps Clem\'s words with a rejected review chip', () => {
-  for (const [blocked, expected] of [
-    [true, /^The invite was not changed because the update was refused before it reached the calendar\.$/],
-    [false, /^I updated the invite\.$/],
-  ] as const) {
+test('a BLOCKED finding and a plain negative both keep Clem\'s words; the finding is the rejected review chip', () => {
+  const finding = 'The invite was not changed because the update was refused before it reached the calendar.';
+  for (const blocked of [true, false]) {
     const identity = accepted('Update the invite description.');
     host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
     events.appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
-      lane: 'host_v1', kind: 'completion', sourceUserSeq: identity.sourceUserSeq, fulfills: false,
-      reason: 'The invite was not changed because the update was refused before it reached the calendar.',
+      lane: 'host_v1', kind: 'completion', sourceUserSeq: identity.sourceUserSeq, fulfills: false, reason: finding,
       objectiveDigest: createHash('sha256').update('Update the invite description.').digest('hex'),
       replyDigest: createHash('sha256').update('I updated the invite.').digest('hex'),
       ...(blocked ? { blocked: true } : {}), continuation: false } });
     const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
       presentation: { kind: 'answer', text: 'I updated the invite.' } });
-    assert.match(committed.presentation.text, expected);
-    if (blocked) {
-      const audit = events.listEvents(identity.sessionId, { types: ['guardrail_tripped'] })
-        .find(event => event.data.kind === 'completion_review_rejected_draft');
-      assert.equal(audit?.data.rejectedText, 'I updated the invite.');
-      assert.equal(committed.event.data.rejectedCompletionText, undefined);
-    }
-    assert.notEqual(committed.presentation.status, 'done');
+    // The reviewer's sentence is never delivered as the reply.
+    assert.equal(committed.presentation.text, 'I updated the invite.');
+    assert.equal(committed.presentation.status, 'blocked');
+    assert.equal(committed.presentation.resumable, true);
+    assert.equal(committed.event.data.verificationDetail, blocked ? 'completion_review_blocked' : 'completion_review_negative');
     assert.equal(committed.event.data.review, 'rejected');
-    assert.equal(committed.event.data.reviewNote,
-      'The invite was not changed because the update was refused before it reached the calendar.');
+    assert.equal(committed.event.data.reviewNote, finding);
+    assert.equal(committed.event.data.rejectedCompletionText, undefined);
+    // No draft was superseded, so no rejected-draft audit row is written.
+    assert.equal(events.listEvents(identity.sessionId, { types: ['guardrail_tripped'] })
+      .some(event => event.data.kind === 'completion_review_rejected_draft'), false);
+    const ref = committed.event.data.completionVerdictRef as Record<string, unknown>;
+    assert.equal(ref.disposition, 'rejected', 'a reviewer that answered no is not an unavailable reviewer');
+    assert.equal(ref.verified, false);
+    assert.equal(ref.deliveredTextIsJudgedText, true);
   }
 });
 
