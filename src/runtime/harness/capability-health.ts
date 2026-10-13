@@ -14,6 +14,9 @@ export interface HarnessCapabilityHealthRecord {
   count: number;
   sessionId?: string;
   details?: Record<string, unknown>;
+  /** Retention boundary of a one-time observation. A record without one
+   * stays until it is replaced or cleared. */
+  expiresAt?: string;
 }
 
 interface HarnessCapabilityHealthFile {
@@ -41,16 +44,32 @@ function load(): void {
         && typeof rec.firstSeenAt === 'string'
         && typeof rec.lastSeenAt === 'string'
       ) {
+        const { expiresAt: _expiresAt, ...rest } = rec;
         records.set(id, {
-          ...rec,
+          ...rest,
           reason: typeof rec.reason === 'string' ? rec.reason : null,
           count: Number.isFinite(rec.count) && rec.count > 0 ? rec.count : 1,
+          ...(typeof rec.expiresAt === 'string' ? { expiresAt: rec.expiresAt } : {}),
         });
       }
     }
   } catch {
     records.clear();
   }
+}
+
+/** Drop records whose retention has passed. Every read goes through here, so
+ * an expired observation leaves prompts and harness_status at the same moment. */
+function pruneExpired(now: Date): void {
+  const at = now.toISOString();
+  let pruned = false;
+  for (const [id, rec] of records) {
+    if (rec.expiresAt && rec.expiresAt <= at) {
+      records.delete(id);
+      pruned = true;
+    }
+  }
+  if (pruned) persist();
 }
 
 function persist(): void {
@@ -76,10 +95,15 @@ export function recordHarnessCapabilityHealth(input: {
   sessionId?: string;
   details?: Record<string, unknown>;
   now?: Date;
+  /** Retention of this observation from `now`. Omitted: the record is
+   * open-ended until replaced or cleared; a repeat without it drops any
+   * earlier boundary. */
+  ttlMs?: number;
 }): HarnessCapabilityHealthRecord {
   load();
   const id = input.id.trim();
-  const ts = (input.now ?? new Date()).toISOString();
+  const now = input.now ?? new Date();
+  const ts = now.toISOString();
   const existing = records.get(id);
   const rec: HarnessCapabilityHealthRecord = {
     id,
@@ -91,21 +115,34 @@ export function recordHarnessCapabilityHealth(input: {
     count: (existing?.count ?? 0) + 1,
     ...(input.sessionId ? { sessionId: input.sessionId } : existing?.sessionId ? { sessionId: existing.sessionId } : {}),
     ...(input.details ? { details: input.details } : existing?.details ? { details: existing.details } : {}),
+    ...(Number.isFinite(input.ttlMs) && (input.ttlMs as number) > 0
+      ? { expiresAt: new Date(now.getTime() + (input.ttlMs as number)).toISOString() }
+      : {}),
   };
   records.set(id, rec);
   persist();
   return rec;
 }
 
-export function listHarnessCapabilityHealth(options: { includeHealthy?: boolean } = {}): HarnessCapabilityHealthRecord[] {
+/** Retire one observation, for the caller that has re-probed what it reported. */
+export function clearHarnessCapabilityHealth(id: string): boolean {
   load();
+  const removed = records.delete(id.trim());
+  if (removed) persist();
+  return removed;
+}
+
+export function listHarnessCapabilityHealth(options: { includeHealthy?: boolean; now?: Date } = {}): HarnessCapabilityHealthRecord[] {
+  load();
+  pruneExpired(options.now ?? new Date());
   return [...records.values()]
     .filter((rec) => options.includeHealthy || rec.state !== 'healthy')
     .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
 }
 
-export function readHarnessCapabilityHealth(id: string): HarnessCapabilityHealthRecord | null {
+export function readHarnessCapabilityHealth(id: string, options: { now?: Date } = {}): HarnessCapabilityHealthRecord | null {
   load();
+  pruneExpired(options.now ?? new Date());
   return records.get(id) ?? null;
 }
 

@@ -10948,6 +10948,26 @@ test('runConversation: past-tense FALSE CLAIM with zero tools is flagged', async
   assert.equal(completed[0].data.reason, 'sub_agent_stalled');
 });
 
+/** What the model sees on one pass: the transient per-request context the SDK
+ *  applies through callModelInputFilter, split into the system text and the
+ *  last user item. A stall retry's instruction rides in the former; the latter
+ *  stays a plain continuation and is never the harness speaking as the owner. */
+type ComposedModelTexts = { system: string; lastUser: string };
+async function composedModelTexts(items: AgentInputItem[], opts: Record<string, unknown>): Promise<ComposedModelTexts> {
+  const filter = opts.callModelInputFilter as (args: { modelData: { input: AgentInputItem[]; instructions?: string } }) =>
+    Promise<{ input: AgentInputItem[] }> | { input: AgentInputItem[] };
+  const sent = await filter({ modelData: { input: items, instructions: '' } });
+  const text = (item: unknown): string => {
+    const content = (item as { content?: unknown } | undefined)?.content;
+    return typeof content === 'string' ? content : JSON.stringify(content ?? '');
+  };
+  const roleOf = (item: unknown): string | undefined => (item as { role?: string }).role;
+  return {
+    system: sent.input.filter((item) => roleOf(item) === 'system').map(text).join('\n\n'),
+    lastUser: text(sent.input.filter((item) => roleOf(item) === 'user').at(-1)),
+  };
+}
+
 test('runConversation: stall triggers one auto-retry; retry success completes conversation normally', async () => {
   // Regression trace shape:
   // Orchestrator did discovery + tool_choice_remember + handoff with
@@ -10987,14 +11007,13 @@ test('runConversation: stall triggers one auto-retry; retry success completes co
   // a real reply — simulates the retry working. The scripted runner
   // walks turns sequentially, so the retry hits the second entry.
   let scriptIndex = 0;
-  const modelInputs: string[] = [];
+  const modelInputs: ComposedModelTexts[] = [];
   const scripted = [
     'I’ll search Outlook for “Marlow” and check whether anything came in today.',
     'Found 1 email from Marlowe Rary today, subject "Account question".',
   ];
-  const runRunner: RunRunnerFn = async (_r, _a, items) => {
-    const last = items.at(-1) as { content?: unknown } | undefined;
-    modelInputs.push(typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? ''));
+  const runRunner: RunRunnerFn = async (_r, _a, items, opts) => {
+    modelInputs.push(await composedModelTexts(items, opts));
     const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
     // The second pass represents the successful mailbox lookup described by
     // the fixture. Record its durable read settlement so the terminal test
@@ -11030,12 +11049,15 @@ test('runConversation: stall triggers one auto-retry; retry success completes co
   assert.equal(retryData.signal, 'A_zero_tools');
   assert.match(retryData.rawOutput, /search Outlook for/);
 
-  // The retry input that drove turn 2 should mention the slug the
-  // Orchestrator pre-resolved — the model gets the action inlined without
-  // manufacturing a second accepted-user authority event.
+  // The retry instruction that drove turn 2 should mention the slug the
+  // Orchestrator pre-resolved — the model gets the action inlined as system
+  // context for that request, without manufacturing a second accepted-user
+  // authority event or a user item the harness authored.
   const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
   assert.equal(userInputs.length, 1, 'the private retry never becomes a second accepted user event');
-  assert.match(modelInputs[1], /OUTLOOK_LIST_MESSAGES/, 'retry message should inline the pre-resolved slug');
+  assert.match(modelInputs[1].system, /OUTLOOK_LIST_MESSAGES/, 'retry instruction should inline the pre-resolved slug');
+  assert.match(modelInputs[1].lastUser, /^Continue with the next step of your plan\./);
+  assert.doesNotMatch(modelInputs[1].lastUser, /OUTLOOK_LIST_MESSAGES|MUST call a tool/, 'the retry is not a user item');
 });
 
 test('runConversation: existing-work stall retry forces focus and memory before asking user', async () => {
@@ -11051,11 +11073,10 @@ test('runConversation: existing-work stall retry forces focus and memory before 
     'I’ll edit the gala silent auction animation post now.',
     'I found the gala-reel project in memory and loaded it.',
   ];
-  const modelInputs: string[] = [];
+  const modelInputs: ComposedModelTexts[] = [];
   let outputIndex = 0;
-  const runner: RunRunnerFn = async (_runner, _agent, items) => {
-    const last = items.at(-1) as { content?: unknown } | undefined;
-    modelInputs.push(typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? ''));
+  const runner: RunRunnerFn = async (_runner, _agent, items, opts) => {
+    modelInputs.push(await composedModelTexts(items, opts));
     return {
       history: items,
       lastResponseId: undefined,
@@ -11074,7 +11095,8 @@ test('runConversation: existing-work stall retry forces focus and memory before 
   assert.equal(result.status, 'completed');
   const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
   assert.equal(userInputs.length, 1, 'the retry remains a private continuation');
-  const retryText = modelInputs[1];
+  const retryText = modelInputs[1].system;
+  assert.match(modelInputs[1].lastUser, /^Continue with the next step of your plan\./);
   assert.match(retryText, /existing work/i);
   assert.match(retryText, /gala silet acution animation post/i);
   assert.match(retryText, /focus_get/);
@@ -11090,11 +11112,10 @@ test('runConversation: fresh stall retry keeps generic ask-user fallback', async
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
   const outputs = ['I’ll write a quick greeting now.', 'Hello there.'];
-  const modelInputs: string[] = [];
+  const modelInputs: ComposedModelTexts[] = [];
   let outputIndex = 0;
-  const runner: RunRunnerFn = async (_runner, _agent, items) => {
-    const last = items.at(-1) as { content?: unknown } | undefined;
-    modelInputs.push(typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? ''));
+  const runner: RunRunnerFn = async (_runner, _agent, items, opts) => {
+    modelInputs.push(await composedModelTexts(items, opts));
     return {
       history: items,
       lastResponseId: undefined,
@@ -11113,7 +11134,8 @@ test('runConversation: fresh stall retry keeps generic ask-user fallback', async
   assert.equal(result.status, 'completed');
   const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
   assert.equal(userInputs.length, 1, 'the retry remains a private continuation');
-  const retryText = modelInputs[1];
+  const retryText = modelInputs[1].system;
+  assert.match(modelInputs[1].lastUser, /^Continue with the next step of your plan\./);
   assert.match(retryText, /call ask_user_question instead of producing announcement text/);
   assert.doesNotMatch(retryText, /existing work/i);
   assert.doesNotMatch(retryText, /memory_recall_all/);
@@ -11154,7 +11176,7 @@ test('runConversation: structured false tool-unavailable decision is retried', a
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
   let scriptIndex = 0;
-  const modelInputs: string[] = [];
+  const modelInputs: ComposedModelTexts[] = [];
   const scripted: unknown[] = [
     {
       summary: 'Need to continue the local file test but no tools are available.',
@@ -11172,9 +11194,8 @@ test('runConversation: structured false tool-unavailable decision is retried', a
       reason: null,
     },
   ];
-  const runRunner: RunRunnerFn = async (_r, _a, items) => {
-    const last = items.at(-1) as { content?: unknown } | undefined;
-    modelInputs.push(typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? ''));
+  const runRunner: RunRunnerFn = async (_r, _a, items, opts) => {
+    modelInputs.push(await composedModelTexts(items, opts));
     const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
     scriptIndex += 1;
     return { history: items, lastResponseId: undefined, finalOutput: output };
@@ -11198,7 +11219,8 @@ test('runConversation: structured false tool-unavailable decision is retried', a
 
   const userInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
   assert.equal(userInputs.length, 1, 'the retry does not invent a new user authority edge');
-  assert.match(modelInputs[1], /tool surface is available/i);
+  assert.match(modelInputs[1].system, /tool surface is available/i);
+  assert.match(modelInputs[1].lastUser, /^Continue with the next step of your plan\./);
 });
 
 test('runConversation: structured tool-unavailable after only probe tools is retried', async () => {

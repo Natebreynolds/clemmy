@@ -127,7 +127,7 @@ import { withRouteDiagnostics, routeDiagnosticsFromResponse } from './response-r
 import { acceptedResponseRoute } from './accepted-response-route.js';
 import { resolveWriteEvidence, synthesizeTurnReport, synthesizeWorkReport } from './work-report.js';
 import { nonFilterableToolExcludes } from './tool-policy.js';
-import { recordHarnessCapabilityHealth } from './capability-health.js';
+import { clearHarnessCapabilityHealth, listHarnessCapabilityHealth, recordHarnessCapabilityHealth } from './capability-health.js';
 import pino from 'pino';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import { actionBus } from '../action-bus.js';
@@ -422,6 +422,20 @@ function readRawString(value: unknown, key: string): string | undefined {
   return typeof got === 'string' && got.trim() ? got.trim() : undefined;
 }
 
+/** A preflight refusal is a one-time observation about the runtime, not a
+ * standing fact. It is retained only this long, and the next request that
+ * passes the same checks retires it earlier: that pass is the re-probe. */
+const PREFLIGHT_BLOCK_HEALTH_ID_PREFIX = 'respond_bridge_';
+const PREFLIGHT_BLOCK_HEALTH_TTL_MS = 15 * 60 * 1000;
+
+function retirePreflightBlockHealth(): void {
+  try {
+    for (const rec of listHarnessCapabilityHealth({ includeHealthy: true })) {
+      if (rec.id.startsWith(PREFLIGHT_BLOCK_HEALTH_ID_PREFIX)) clearHarnessCapabilityHealth(rec.id);
+    }
+  } catch { /* Capability health is advisory; it never changes admission. */ }
+}
+
 async function blockedPreRunResponse(
   surface: HarnessSurface,
   request: AssistantRequest,
@@ -446,11 +460,12 @@ async function blockedPreRunResponse(
       ? details.reason.trim().replace(/[^a-z0-9_-]+/gi, '_').toLowerCase()
       : 'preflight_block';
     recordHarnessCapabilityHealth({
-      id: `respond_bridge_${code}`,
+      id: `${PREFLIGHT_BLOCK_HEALTH_ID_PREFIX}${code}`,
       state: 'unavailable',
       summary: 'Respond bridge preflight blocked a harness run before model or tool work started.',
       reason: `${surface}: ${code}`,
       sessionId: request.sessionId,
+      ttlMs: PREFLIGHT_BLOCK_HEALTH_TTL_MS,
       details: {
         surface,
         route,
@@ -2620,6 +2635,10 @@ async function respondPreferHarnessOnce(
       { reason: 'invalid_turn_engine' },
     );
   }
+  // Every preflight check above passed on this request, which is the re-probe
+  // of whatever an earlier refusal reported. Retire those observations so they
+  // stop riding into prompts as a current warning.
+  retirePreflightBlockHealth();
   // Deliberately no pre-brain provider read runs at this boundary. The typed
   // resolver components remain dormant until they can enter through the same
   // durable carrier and physical-authority kernel as every other provider I/O.
