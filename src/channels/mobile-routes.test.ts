@@ -1414,8 +1414,14 @@ test('mobile terminal steering refusal cannot become a competing ordinary turn',
     for (const [key, extra] of [['terminal-steering-ordinary', {}], ['terminal-steering-only', { steerOnly: true }]] as const) {
       const refused = await send(key, extra);
       assert.equal(refused.status, 409);
-      const body = await refused.json() as { error: string; steered?: boolean };
-      assert.equal(body.error, 'STEER_NOTE_CUTOVER');
+      const body = await refused.json() as { error: string; code?: string; message?: string; sessionId?: string; steered?: boolean };
+      // The console shape: the plain line the phone shows in `error`, the
+      // machine code beside it. The owner never reads the code.
+      assert.equal(body.code, 'STEER_NOTE_CUTOVER');
+      assert.equal(body.error, steering.STEER_NOTE_ADMISSION_MESSAGE.STEER_NOTE_CUTOVER);
+      assert.doesNotMatch(body.error, /\b(?:I|I’m|I'm|I’ll|I'll|me|my)\b|STEER_NOTE/);
+      assert.equal(body.message, undefined);
+      assert.equal(body.sessionId, session.id);
       assert.notEqual(body.steered, true);
     }
     assert.deepEqual(listEvents(session.id), before, 'refusal admits neither a note nor an ordinary accepted source');

@@ -77,6 +77,20 @@ function makeError(status: number, body?: unknown, message?: string): ApiError {
   return error;
 }
 
+/** The line a refusal shows the owner. A route that sends a plain `message`
+ *  beside its machine `error` code means the message to be read; a route that
+ *  sends only `error` means that field, which the chat routes fill with the
+ *  plain line and keep the code in `code`. The body stays on the error for
+ *  callers that branch on the code. */
+export function displayMessage(body: unknown, status: number): string {
+  const record = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : null;
+  for (const field of ['message', 'error'] as const) {
+    const value = record?.[field];
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return `HTTP ${status}`;
+}
+
 export function isOfflineError(err: unknown): boolean {
   return Boolean((err as ApiError | undefined)?.offline);
 }
@@ -193,13 +207,7 @@ async function request(path: string, init: RequestInit | undefined, format: 'jso
     }
     throw makeError(401, body, 'Not authenticated');
   }
-  if (!res.ok) {
-    const message =
-      (body && typeof body === 'object' && body !== null && 'error' in body && typeof (body as Record<string, unknown>).error === 'string')
-        ? String((body as Record<string, unknown>).error)
-        : `HTTP ${res.status}`;
-    throw makeError(res.status, body, message);
-  }
+  if (!res.ok) throw makeError(res.status, body, displayMessage(body, res.status));
   return body;
 }
 

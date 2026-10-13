@@ -4632,10 +4632,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           }
         } catch (steerErr) {
           if (isSteerNoteAdmissionError(steerErr)) {
-            res.status(409).json({
-              error: steerErr.code,
-              message: 'Your message wasn’t added to the running turn. Send it again as a new message.',
-            });
+            // The console shape: the plain line in `error` (what the phone
+            // shows under the message), the machine code beside it.
+            res.status(409).json({ error: steerErr.message, code: steerErr.code, sessionId: proposedSessionId });
             return;
           }
           if (req.body?.requireIdle === true) {
