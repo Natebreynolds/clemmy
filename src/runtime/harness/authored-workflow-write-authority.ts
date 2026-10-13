@@ -754,6 +754,60 @@ function journalConstraintCheckerUnavailable(attestation: HostCallAttestation, r
   } catch { /* a journal miss never changes the decision */ }
 }
 
+/** A WRITE GETS TWO REFUSALS FROM ITS CONSTRAINT REVIEW, THEN A DECISION.
+ *
+ * Live 2026-10-13, a scheduled sheet review: the one digest row it appends
+ * each run was refused six times in ten minutes, each time for a different
+ * reason (a count, the date style, "the inspected tail does not establish
+ * absence"), re-read, re-proposed, refused again; the previous day's run had
+ * ended the same way, and the owner's sheet got no row either day. Nothing
+ * bounded the rounds but the no-progress governor, and the reviewer judged
+ * a compacted view while demanding completeness. The owner's rule: there is
+ * never a world where Clem stops like that.
+ *
+ * So: an "uncertain" verdict is asked once more with the full retained
+ * evidence before it counts; the reviewer is told to name every objection at
+ * once; and after two refusals of one step's write of one tool, the review
+ * decides. An ordinary (recoverable) write proceeds and the checker's last
+ * objection rides to the model so the report says it; a high-stakes write
+ * stops truthfully, with the objection, as not done. */
+const MAX_CONSTRAINT_REVIEW_REFUSALS = 2;
+const constraintRefusalRounds = new Map<string, { count: number; lastReason: string }>();
+const boundedConstraintNotes = new Map<string, string>();
+
+function constraintReviewKey(reopened: ReopenedAuthoredStep, toolName: string): string {
+  return `${reopened.receipt.workflowRunId}:${reopened.receipt.stepId}:${toolName}`;
+}
+
+function journalConstraintReviewBounded(attestation: HostCallAttestation, input: {
+  refusals: number; lastReason: string; stakes: 'ordinary' | 'high'; decision: 'proceeded_with_note' | 'stopped_as_not_done';
+}): void {
+  try {
+    appendEvent({
+      sessionId: attestation.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+      data: { kind: 'workflow_write_review_bounded', sourceUserSeq: attestation.sourceUserSeq,
+        tool: attestation.toolName, refusals: input.refusals, stakes: input.stakes, decision: input.decision,
+        lastReason: input.lastReason.slice(0, 600) },
+    });
+  } catch { /* a journal miss never changes the decision */ }
+}
+
+/** The checker's standing objection for a write that proceeded after its two
+ *  refusals, handed to the model with that write's result so the report says
+ *  it. Read once, by the source that made the write. */
+export function takeBoundedConstraintNote(identity: { sessionId: string; sourceUserSeq: number }): string | undefined {
+  const key = `${identity.sessionId}#${identity.sourceUserSeq}`;
+  const note = boundedConstraintNotes.get(key);
+  boundedConstraintNotes.delete(key);
+  return note;
+}
+
+/** Test seam: forget the rounds between fixtures. */
+export function _resetConstraintReviewRoundsForTests(): void {
+  constraintRefusalRounds.clear();
+  boundedConstraintNotes.clear();
+}
+
 async function reviewAuthoredWriteConstraints(input: {
   attestation: HostCallAttestation;
   args: Record<string, unknown>;
@@ -771,6 +825,21 @@ async function reviewAuthoredWriteConstraints(input: {
     }
     const schema = input.schema ?? (await resolveConfiguredLocalPlanningTool(input.attestation.toolName, 'work_call'))?.parameters;
     if (!schema) return { status: 'hold', retryable: true, reason: 'workflow_write_schema_unavailable' };
+    const stakes = input.stakes ?? 'high';
+    const roundsKey = constraintReviewKey(input.reopened, input.attestation.toolName);
+    const rounds = constraintRefusalRounds.get(roundsKey);
+    if (rounds && rounds.count >= MAX_CONSTRAINT_REVIEW_REFUSALS) {
+      const decision = stakes === 'ordinary' ? 'proceeded_with_note' : 'stopped_as_not_done';
+      journalConstraintReviewBounded(input.attestation, { refusals: rounds.count, lastReason: rounds.lastReason, stakes, decision });
+      constraintRefusalRounds.delete(roundsKey);
+      if (stakes === 'ordinary') {
+        boundedConstraintNotes.set(`${input.attestation.sessionId}#${input.attestation.sourceUserSeq}`, rounds.lastReason);
+        return null;
+      }
+      // The hold's edge (publish_partial) is chosen by its reason downstream, as
+      // for an unavailable checker; the retry flag keeps the type's one shape.
+      return { status: 'hold', retryable: true, reason: `workflow_write_constraints_disputed: ${rounds.lastReason}` };
+    }
     const { readWorkflowTargetEvidence } = await import('../../execution/workflow-target-evidence.js');
     // The step's own instructions name upstream values it was handed in its
     // step context; the reviewer sees those exact recorded values too.
@@ -779,15 +848,33 @@ async function reviewAuthoredWriteConstraints(input: {
       consumerStepId: input.reopened.receipt.stepId,
     });
     const review = mutationReviewerOverride ?? (await import('./workflow-mutation-review.js')).reviewWorkflowMutation;
-    const result = await review({
+    let result = await review({
       sessionId: input.attestation.sessionId,
       instructions: input.reopened.step.prompt,
       tool: input.attestation.toolName,
       schema,
       args: input.args,
       observations: { summary: evidence.summary, complete: evidence.available, evidence: evidence.evidence },
-      stakes: input.stakes ?? 'high',
+      stakes,
     });
+    if (result.verdict === 'uncertain' && !result.checkerFailure) {
+      // The compact view names each retained result in a line; a reviewer
+      // that cannot see a record cannot establish its absence. Ask once more
+      // with the whole retained evidence before the doubt counts as a refusal.
+      const full = readWorkflowTargetEvidence(input.reopened.receipt.workflowRunId, {
+        compactResults: false,
+        consumerStepId: input.reopened.receipt.stepId,
+      });
+      result = await review({
+        sessionId: input.attestation.sessionId,
+        instructions: input.reopened.step.prompt,
+        tool: input.attestation.toolName,
+        schema,
+        args: input.args,
+        observations: { summary: full.summary, complete: full.available, evidence: full.evidence },
+        stakes: 'high',
+      });
+    }
     // Model review is asynchronous. Do not project a verdict into an attempt
     // that ended or whose adopted authority changed while it was running.
     const current = reopenAuthoredStepAuthority(input.attestation);
@@ -795,7 +882,10 @@ async function reviewAuthoredWriteConstraints(input: {
       || digest(input.args) !== argsDigest) {
       return { status: 'hold', retryable: true, reason: 'workflow_write_authority_changed_during_review' };
     }
-    if (result.verdict === 'compatible') return null;
+    if (result.verdict === 'compatible') {
+      constraintRefusalRounds.delete(roundsKey);
+      return null;
+    }
     if (result.checkerFailure) {
       // No reviewer answered. That is the checker's outage, not a fact about
       // the write, so it is never handed to the model as evidence to
@@ -806,6 +896,7 @@ async function reviewAuthoredWriteConstraints(input: {
       if (input.ownerApprovedExactly) return null;
       return { status: 'hold', retryable: true, reason: `workflow_write_checker_unavailable: ${result.reason}` };
     }
+    constraintRefusalRounds.set(roundsKey, { count: (rounds?.count ?? 0) + 1, lastReason: result.reason });
     return result.verdict === 'conflict'
       ? { status: 'repair', retryable: true, reason: `workflow_write_constraint_conflict: ${result.reason}` }
       : { status: 'hold', retryable: true, reason: `workflow_write_constraints_unverified: ${result.reason}` };

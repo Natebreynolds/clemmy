@@ -42,6 +42,7 @@ const SYSTEM = [
   'valueProvenance, when present, lists for each proposed value the retained results that contain it verbatim. It is a search, not a judgement: a value found in a read of the destination may already be there, a value found in a source read was taken from it, a value found nowhere was not read from this run. Judge what that means; open a result only when the verdict needs more than where a value appears.',
   'compatible means this exact proposed write respects the applicable saved constraints. conflict means it contradicts them.',
   'uncertain means required facts are missing or ambiguous. Never resolve uncertainty by assuming a safe destination or unchanged contents.',
+  'Name every conflict and every missing piece of evidence you can see in this one answer, each as a specific correction or the exact read that would settle it. A corrected write is reviewed once more, not again for what could have been said now.',
   'Return JSON with verdict (compatible, conflict, uncertain), reason (specific correction or missing evidence), and the supplied proposalDigest exactly.',
 ].join(' ');
 

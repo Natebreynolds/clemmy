@@ -825,7 +825,7 @@ import {
   parseHostInteractiveConsentSubjectV1,
   type HostInteractiveConsentSubjectV1,
 } from './host-interactive-consent.js';
-import { evaluateAuthoredWorkflowMutationConsent } from './authored-workflow-write-authority.js';
+import { evaluateAuthoredWorkflowMutationConsent, takeBoundedConstraintNote } from './authored-workflow-write-authority.js';
 import { mintHostConsentCallAuthority } from './authored-call-authority.js';
 import type { CapabilityRiskAttestationV1, InteractiveConsentProceedBasis } from './interactive-consent-policy.js';
 import { settledPlanTaskActivationWinner } from './plan-task-post-settlement.js';
@@ -7884,7 +7884,19 @@ const runHostTurnBody = async (
       ? 'The app replied without confirming this change; its reply is above. Nothing is known to have landed: '
         + 'read the target before saying it did. This exact call is not resent; a changed call goes through the gate like any write.'
       : undefined;
-    const steer = [hostSteer, refusedWriteNote, repliedUnverifiedNote].filter(Boolean).join('\n') || undefined;
+    // A write that proceeded after its constraint review's two refusals
+    // carries the checker's last objection to the model, so the report says it.
+    const boundedConstraintNote = (() => {
+      if (structuredToolOutputs(output) || !['local_write', 'external_write', 'admin'].includes(admittedEffect)) return undefined;
+      try {
+        const note = takeBoundedConstraintNote(exactHostIdentity());
+        return note
+          ? `The constraint checker refused this write twice and its objections kept changing, so the write went through on this proposal. Its last objection: ${note} `
+            + 'Say so in your report, with the objection, so the owner can check the result.'
+          : undefined;
+      } catch { return undefined; }
+    })();
+    const steer = [hostSteer, refusedWriteNote, repliedUnverifiedNote, boundedConstraintNote].filter(Boolean).join('\n') || undefined;
     return {
       historyItem: functionResultItem(call.callId, call.name, modelOutput, steer),
       ...(tool ? { tool } : {}),
@@ -8176,6 +8188,12 @@ const runHostTurnBody = async (
             // finish with this write named as not done.
             ? nextEdge({ tool: innerTool, change: 'publish_partial',
               say: 'The constraint checker could not judge this write. Do not retry it: finish the step and report this write as not done, with the values it would have written.' })
+          : input.diagnostic && input.diagnostic.includes('workflow_write_constraints_disputed')
+            // Two corrections did not satisfy the checker. A third round is
+            // the loop the owner never wants; the honest move is to finish
+            // with this write named as not done and the objection quoted.
+            ? nextEdge({ tool: innerTool, change: 'publish_partial',
+              say: 'The constraint checker still objected after two corrections. Do not retry this write and do not route around it: finish the step and report this write as not done, with the values it would have written and the checker\'s objection, so the owner can decide.' })
           : input.diagnostic && input.diagnostic.includes('workflow_write_authority_changed_during_review')
             // This attempt no longer owns the step: another attempt took it
             // over while the write was under review. Nothing here is wrong

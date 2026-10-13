@@ -773,6 +773,49 @@ test('a constraint checker that cannot answer stops the step truthfully instead 
   } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
 });
 
+test('a constraint checker whose objections keep changing gets two refusals, then an ordinary write proceeds with its note', async () => {
+  // Live 2026-10-13: a scheduled sheet review's one digest row was refused six
+  // times in ten minutes, each for a different reason, until the run was
+  // cancelled by hand; the day before it had ended the same way with no row.
+  const authority = await import('./authored-workflow-write-authority.js');
+  authority._resetConstraintReviewRoundsForTests();
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
+    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
+  const { bodies, tools } = fixtureTools(['goal_upsert']);
+  const objections = ['The title case does not match the saved style.', 'The status must be confirmed against the current record.', 'The retained read does not establish the record is absent.'];
+  const reviewed: string[] = [];
+  authorityAdapter._setWorkflowMutationReviewerForTests(async input => {
+    reviewed.push(String(input.args.title));
+    return { verdict: 'conflict', reason: objections[Math.min(reviewed.length - 1, objections.length - 1)]!, proposalDigest: 'fixture-review' };
+  });
+  try {
+    const model = stubModel([
+      [toolCall('bounded-first', 'goal_upsert', { title: 'Approved title', status: 'active' })],
+      [toolCall('bounded-second', 'goal_upsert', { title: 'Approved Title', status: 'active' })],
+      [toolCall('bounded-third', 'goal_upsert', { title: 'Approved title', status: 'active' })],
+      [textMsg('Approved goal saved; the checker still objected to the status confirmation, which I noted.')],
+    ]);
+    const agent = { model, tools };
+    bindSurface(fixture, agent, tools);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(reviewed.length, 2, 'the third proposal is not reviewed again: the review decides');
+    assert.equal(bodies.goal_upsert, 1, 'the ordinary write proceeds once after two refusals');
+    assert.deepEqual(nonRefusedSettlements(fixture).map(row => row.logical_tool_call_id), ['bounded-third']);
+    const history = JSON.stringify(outcome.history);
+    assert.match(history, /workflow_write_constraint_conflict/);
+    assert.match(history, /refused this write twice/, 'the checker\'s standing objection rides with the result');
+    assert.match(history, /status must be confirmed/, 'the last objection is quoted');
+    assert.equal(pendingApprovalCount(fixture), 0);
+    const bounded = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+      .filter(event => event.data.kind === 'workflow_write_review_bounded');
+    assert.equal(bounded.length, 1);
+    assert.equal(bounded[0]!.data.decision, 'proceeded_with_note');
+  } finally {
+    authorityAdapter._setWorkflowMutationReviewerForTests(null);
+    authority._resetConstraintReviewRoundsForTests();
+  }
+});
+
 test('an attempt superseded while its write was under review is told so, not sent to repair or route around the write', async () => {
   // Live 2026-09-30: a second attempt of the same step began during a
   // minute-long review; the first attempt's write was then held as
