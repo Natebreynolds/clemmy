@@ -106,6 +106,30 @@ interface SettlementRow {
   execution_kind: string;
   mutating: number;
   requirement_id: string | null;
+  settled_at?: string | null;
+}
+
+/** A write that ended without acknowledgement (a timeout, a dropped
+ * connection) and was READ BACK: a non-mutating call settled successfully
+ * after it in the same accepted source. That read is the independent
+ * target-state evidence the uncertainty called for, and the runner's write
+ * freeze made the model take it before saying anything landed. The ledger
+ * keeps the write uncertain (no replay); the audit owes no reconciliation
+ * stop for it (live 2026-10-13: a note that landed, read back and reported,
+ * still ended "1 irreversible external write(s) require reconciliation"). */
+export function darkWriteReadBackAfter(
+  row: Pick<SettlementRow, 'mutating' | 'execution_kind' | 'outcome_kind' | 'outcome_detail' | 'settled_at'>,
+  rows: ReadonlyArray<Pick<SettlementRow, 'mutating' | 'outcome_kind' | 'settled_at'>>,
+): boolean {
+  if (!(row.mutating === 1
+    && (row.execution_kind === 'provider_execution' || row.execution_kind === 'local_execution')
+    && row.outcome_kind === 'uncertain_write'
+    && row.outcome_detail === 'unacknowledged_mutation'
+    && typeof row.settled_at === 'string')) return false;
+  return rows.some((other) => other.mutating === 0
+    && (other.outcome_kind === 'succeeded' || other.outcome_kind === 'empty_result')
+    && typeof other.settled_at === 'string'
+    && other.settled_at > row.settled_at!);
 }
 
 /** An exact adapter-proven rejection is an answered attempt with no effect.
@@ -493,7 +517,8 @@ export function auditAcceptedSourceSettlementTruth(input: {
     `).get(input.sessionId, input.sourceUserSeq) as { started_dispatches: number };
     const settlements = db.prepare(`
       SELECT s.logical_tool_call_id, l.tool_name, l.argument_digest,
-             s.outcome_kind, s.outcome_detail, s.execution_kind, s.mutating, s.requirement_id
+             s.outcome_kind, s.outcome_detail, s.execution_kind, s.mutating, s.requirement_id,
+             s.settled_at
       FROM logical_call_settlements s
       JOIN logical_tool_calls l
         ON l.session_id = s.session_id
@@ -509,7 +534,8 @@ export function auditAcceptedSourceSettlementTruth(input: {
     // step pass — a brain-dependent gate.
     const localSettlements = db.prepare(`
       SELECT s.logical_tool_call_id, l.tool_name, l.argument_digest,
-             s.outcome_kind, s.execution_kind, s.mutating, s.requirement_id
+             s.outcome_kind, s.outcome_detail, s.execution_kind, s.mutating, s.requirement_id,
+             s.settled_at
       FROM logical_call_settlements s
       JOIN logical_tool_calls l
         ON l.session_id = s.session_id
@@ -658,9 +684,14 @@ export function auditAcceptedSourceSettlementTruth(input: {
     const answeredRefusals = failed.filter((row) => (
       providerAnsweredRefusal(row) && failedWriteCallIds.has(row.logical_tool_call_id)
     ));
+    // A write that ended without acknowledgement and was read back (a
+    // successful read settled after it, on either lane) is answered by that
+    // read: the model took it under the write freeze before speaking.
+    const readBacks = [...settlements, ...localSettlements];
+    const readBackAnswered = (row: SettlementRow): boolean => answeredRefusalSettlement(row) || darkWriteReadBackAfter(row, readBacks);
     const answeredRefusalCallIds = new Set([
       ...answeredRefusals.map((row) => row.logical_tool_call_id),
-      ...failed.filter(answeredRefusalSettlement).map((row) => row.logical_tool_call_id),
+      ...failed.filter(readBackAnswered).map((row) => row.logical_tool_call_id),
     ]);
     // A REPAIRED WRITE IS A RECOVERED WRITE, for an uncertain attempt too,
     // when the host classified the shape repairable or exact-artifact
@@ -675,7 +706,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
         done.shapeTargetKey === attempted.shapeTargetKey && done.seq > attempted.seq));
     };
     const uncertainSettlements = failed.filter((row) => row.outcome_kind === 'uncertain_write'
-      && !answeredRefusalSettlement(row) && !repairedByLaterShape(row));
+      && !readBackAnswered(row) && !repairedByLaterShape(row));
     // Logical ambiguity clears only when the exact reservation has a durable
     // terminal. Reversibility means the host can repair after readback; it does
     // not prove whether the original effect happened.
@@ -687,7 +718,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
       // namespace or reversibility. Only the exact reservation's terminal
       // reconciliation may discharge its ambiguity.
       if (row.outcome_kind === 'uncertain_write') {
-        return !answeredRefusalSettlement(row) && !repairedByLaterShape(row) && !resolvedWriteCallIds.has(row.logical_tool_call_id);
+        return !readBackAnswered(row) && !repairedByLaterShape(row) && !resolvedWriteCallIds.has(row.logical_tool_call_id);
       }
       // A REFUSAL IS NOT A FAILED EFFECT. `refused_pre_dispatch` means the
       // harness blocked the call before it crossed the boundary: no request was

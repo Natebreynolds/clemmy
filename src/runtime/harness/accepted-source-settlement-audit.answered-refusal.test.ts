@@ -21,3 +21,23 @@ test('an answered refusal is exactly a mutating execution settled uncertain by t
   assert.equal(answeredRefusalSettlement({ ...base, execution_kind: 'local_execution' }), true);
   assert.equal(answeredRefusalSettlement({ ...base, execution_kind: 'refused_pre_dispatch' }), false);
 });
+
+const { darkWriteReadBackAfter } = await import('./accepted-source-settlement-audit.js');
+
+test('a write that ended without acknowledgement is answered by a successful read settled after it, and by nothing else', () => {
+  // Live 2026-10-13: a note that landed while the connection dropped, read
+  // back under the write freeze and reported, still ended "1 irreversible
+  // external write(s) require reconciliation".
+  const dark = { mutating: 1, execution_kind: 'provider_execution', outcome_kind: 'uncertain_write', outcome_detail: 'unacknowledged_mutation', settled_at: '2026-10-13T23:24:51.700Z' };
+  const readAfter = { mutating: 0, outcome_kind: 'succeeded', settled_at: '2026-10-13T23:25:02.100Z' };
+  const readBefore = { mutating: 0, outcome_kind: 'succeeded', settled_at: '2026-10-13T23:24:25.700Z' };
+  const failedReadAfter = { mutating: 0, outcome_kind: 'unknown', settled_at: '2026-10-13T23:24:57.600Z' };
+  const writeAfter = { mutating: 1, outcome_kind: 'succeeded', settled_at: '2026-10-13T23:25:30.000Z' };
+  assert.equal(darkWriteReadBackAfter(dark, [readBefore, failedReadAfter, readAfter]), true, 'a read that returned after it answers it');
+  assert.equal(darkWriteReadBackAfter(dark, [readBefore, failedReadAfter]), false, 'a read before it, or a read that failed, does not');
+  assert.equal(darkWriteReadBackAfter(dark, [writeAfter]), false, 'a later write is not a read');
+  assert.equal(darkWriteReadBackAfter({ ...dark, outcome_detail: 'provider_refused_envelope' }, [readAfter]), false, 'only the dark needs the read; a refusal is answered already');
+  assert.equal(darkWriteReadBackAfter({ ...dark, execution_kind: 'refused_pre_dispatch' }, [readAfter]), false);
+  assert.equal(darkWriteReadBackAfter({ ...dark, settled_at: null }, [readAfter]), false, 'no settlement time, no ordering, no answer');
+  assert.equal(darkWriteReadBackAfter({ ...dark, execution_kind: 'local_execution' }, [readAfter]), true, 'a command that left the machine is the same case');
+});

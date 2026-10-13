@@ -1004,7 +1004,6 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
   }
 
   function noteTransportDeath(server: MCPServer): void {
-    connectPromises.delete(server);
     const existing = serverHealth.get(server);
     serverHealth.set(server, {
       state: 'degraded',
@@ -1016,6 +1015,23 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     lastToolCounts.set(server, 0);
     cachedTools = null;
     cachedToolToServer = null;
+    // The SDK's server object keeps its dead session until it is closed, and
+    // connect() on it leaves the next call "Not connected" (live 2026-10-13,
+    // second proof). Close it, then connect, as the in-flight connect every
+    // later use awaits; a failure here records itself the ordinary way.
+    const reconnect = (async () => {
+      if (typeof server.close === 'function') {
+        try { await server.close(); } catch { /* the transport is already gone */ }
+      }
+      await withTimeout(server.connect!(), mcpConnectTimeoutMs(), `mcp.reconnect[${server.name}]`);
+      markServerConnected(server);
+    })();
+    reconnect.catch((err) => {
+      if (connectPromises.get(server) === reconnect) connectPromises.delete(server);
+      markServerFailed(server, err);
+    });
+    if (typeof server.connect === 'function') connectPromises.set(server, reconnect);
+    else connectPromises.delete(server);
     syncHealthRegistry(server);
   }
 

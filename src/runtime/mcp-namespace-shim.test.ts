@@ -666,8 +666,8 @@ test('shim: a connection that dies under a call reconnects on the very next use,
   await shim.listTools();
   assert.equal(b._connected, 1);
   await assert.rejects(callWithAcceptedTask(shim, 'dies-under-call__get_note', { id: 'n1' }), /Connection closed/);
-  assert.notEqual(listMcpServerHealth().find((s) => s.slug === 'dies-under-call')?.state, 'connected', 'the death is recorded at the call');
   const tools = await shim.listTools();
+  assert.equal(b._closed, 1, 'the dead session is closed first, so the SDK object drops it');
   assert.equal(b._connected, 2, 'the next use reconnects at once, inside no backoff window');
   assert.ok(tools.some((t: any) => t.name === 'dies-under-call__get_note'), 'real tools, never the connecting stub');
   assert.equal(listMcpServerHealth().find((s) => s.slug === 'dies-under-call')?.state, 'connected');
