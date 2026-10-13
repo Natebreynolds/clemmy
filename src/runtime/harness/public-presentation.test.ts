@@ -1230,3 +1230,25 @@ test('a terminal projects the committer review state, a bounded review note and 
   const plain = projectHarnessEventForPublic(typed('done', {}));
   for (const key of ['review', 'reviewNote', 'notice', 'retained']) assert.equal(plain?.data[key], undefined, key);
 });
+
+// The successor's model-facing history reads the durable terminal whole; the
+// public projection of the same row keeps only the head.
+test('the model-facing durable completion text keeps the checkpoint that every public projection strips', async () => {
+  const { durableCompletionTextForModel } = await import('./public-presentation.js');
+  const head = 'Stopped.';
+  const text = `${head}\n\nRetained work (durable checkpoint):\n- Source/tool read_file: completed result retained as rh_model_history.\n- landed: write_file "Appended notes.md (12 chars)." at seq 7.\nExternal write state: no settled external-write attempt is recorded.`;
+  const identity = { sessionId: 'public-projection-test', turn: 1, sourceUserSeq: 31 };
+  const typed = {
+    terminalKey: 'turn:31', sourceUserSeq: 31, reply: text,
+    presentation: { version: 1, id: 'turn:31:presentation', outcomeId: 'turn:31', audience: 'user', phase: 'final', identity, status: 'cancelled', kind: 'stopped', text, resumable: false },
+    turnOutcome: { version: 2, id: 'turn:31', status: 'cancelled', resumable: false },
+  };
+  assert.equal(durableCompletionTextForModel(typed), text);
+  assert.equal(publicCompletionText(typed), head);
+  assert.equal(durableCompletionTextForModel({ terminalKey: 'turn:31', sourceUserSeq: 31, reply: text }), text, 'a legacy row reads its whole reply');
+  assert.equal(publicCompletionText({ terminalKey: 'turn:31', sourceUserSeq: 31, reply: text }), head);
+  assert.equal(durableCompletionTextForModel({ ...typed, turnOutcome: undefined, presentation: typed.presentation }), '', 'a row that claims the typed contract and breaks it carries nothing');
+  const projected = projectHarnessEventForPublic(event('conversation_completed', typed));
+  assert.equal(projected!.data.reply, head);
+  assert.doesNotMatch(JSON.stringify(projected!.data), /rh_|landed:/);
+});

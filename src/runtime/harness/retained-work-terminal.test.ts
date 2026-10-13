@@ -557,3 +557,93 @@ test('an owner Stop over a host-only uncertain block keeps the checkpoint, so th
   assert.deepEqual(data.notice, { code: 'stopped' });
   assert.deepEqual(data.retained, { results: 1, outsideChange: 'none' });
 });
+
+/** A write that ran on this machine and returned its own receipt. */
+function settleLocalWrite(task: ReturnType<typeof accept>, options: { receipt?: string | null; label?: string } = {}): string {
+  const logicalToolCallId = `logical:local-write-${options.label ?? 'notes'}-${task.sourceUserSeq}`;
+  const toolName = 'write_file';
+  const args = { path: '/fixture/notes.md', mode: 'append', content: 'summary line' };
+  admitProviderCall({ task, logicalToolCallId, toolName, args, executionSite: 'host' });
+  const receipt = options.receipt === undefined ? 'Appended /fixture/notes.md (12 chars).' : options.receipt;
+  const settled = settlements.commitLogicalCallSettlement({
+    identity: { ...task, logicalToolCallId },
+    contract: { toolName, args },
+    execution: { kind: 'local_execution' },
+    ...(receipt === null ? {} : { result: { payload: receipt } }),
+    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: true },
+    observer: { lane: 'agents_runner', turn: task.turn },
+  });
+  assert.equal(settled.status, 'committed', JSON.stringify(settled));
+  return logicalToolCallId;
+}
+
+test('a landed local write and the file the runtime saw land ride in the checkpoint as facts, counted as no result', async () => {
+  const { parseRetainedWorkCheckpoint } = await import('./retained-work-checkpoint.js');
+  const task = accept('Read the operators, then append the summary line.');
+  const handleId = settleHostRead(task);
+  const logicalToolCallId = settleLocalWrite(task);
+  const saved = eventlog.appendEvent({ sessionId: task.sessionId, turn: 0, role: 'system', type: 'deliverable_saved',
+    data: { sourceUserSeq: task.sourceUserSeq, name: 'notes.md', dir: 'fixture', bytes: 12 } });
+  const settledSeq = (eventlog.openEventLog().prepare(`SELECT e.seq FROM logical_call_settlements s JOIN events e ON e.id = s.settlement_event_id
+    WHERE s.session_id = ? AND s.logical_tool_call_id = ?`).get(task.sessionId, logicalToolCallId) as { seq: number }).seq;
+  const inventory = retained.retainedWorkInventoryForAcceptedSource(task)!;
+  assert.deepEqual(inventory.items.map((item) => item.toolName), ['read_file', 'write_file'], 'the write receipt stays redeemable beside the read');
+  assert.equal(inventory.landedWrites.length, 2);
+  const [settledWrite, savedFile] = inventory.landedWrites;
+  if (settledWrite?.kind !== 'settled_write' || savedFile?.kind !== 'saved_file') throw new Error('unexpected landed facts');
+  assert.equal(settledWrite.acceptedTaskId, task.acceptedTaskId);
+  assert.equal(settledWrite.logicalToolCallId, logicalToolCallId);
+  assert.equal(settledWrite.toolName, 'write_file');
+  assert.equal(settledWrite.settlementSeq, settledSeq);
+  assert.equal(settledWrite.outcomeKind, 'succeeded');
+  assert.equal(settledWrite.physicalCrossingCount, 0);
+  assert.ok(settledWrite.resultHandleId);
+  assert.equal(settledWrite.receipt, 'Appended /fixture/notes.md (12 chars).');
+  assert.deepEqual(savedFile, { kind: 'saved_file', eventId: saved.id, seq: saved.seq, name: 'notes.md', dir: 'fixture', bytes: 12 });
+  const text = retained.renderFailureWithRetainedWork({ ...task, fallbackText: 'Stopped.' });
+  assert.ok(text.includes(`retained as ${handleId}`));
+  assert.ok(text.includes(`- landed: write_file "Appended /fixture/notes.md (12 chars)." at seq ${settledSeq}.`), text);
+  assert.ok(text.includes(`- landed: file "fixture/notes.md" 12 bytes at seq ${saved.seq}.`), text);
+  assert.match(text, /External write state: no settled external-write attempt is recorded\./);
+  assert.equal(retained.renderFailureWithRetainedWork({ ...task, fallbackText: text }), text, 'the projection stays idempotent');
+  // The public projection reads the head and counts the redeemable results
+  // alone; a landed effect is a fact for the model, not a chip for the owner.
+  const parsed = parseRetainedWorkCheckpoint(text);
+  assert.equal(parsed.head, 'Stopped.');
+  assert.equal(parsed.results, inventory.items.length);
+  assert.equal(parsed.outsideChange, 'none');
+  assert.deepEqual(retained.landedWritesForAcceptedSource({ ...task, beforeSeq: settledSeq }), [], 'a terminal bound excludes later effects');
+  assert.equal(retained.landedWritesForAcceptedSource({ ...task, beforeSeq: saved.seq }).length, 1);
+});
+
+test('a source whose only settled work is a local write without a retained receipt still gets a checkpoint naming the landed effect', () => {
+  const task = accept('Append the summary line.');
+  const logicalToolCallId = settleLocalWrite(task, { receipt: null, label: 'silent' });
+  const inventory = retained.retainedWorkInventoryForAcceptedSource(task);
+  assert.ok(inventory, 'a landed write is retained work');
+  assert.equal(inventory!.items.length, 0);
+  assert.equal(inventory!.landedWrites.length, 1);
+  const text = retained.renderFailureWithRetainedWork({ ...task, fallbackText: 'Stopped.' });
+  assert.match(text, /Retained work \(durable checkpoint\):/);
+  assert.match(text, /- landed: write_file succeeded, no receipt text retained at seq \d+\./);
+  assert.doesNotMatch(text, /retained as rh_/);
+  assert.ok(logicalToolCallId);
+  const committed = delivery.commitTurnOutcome(blockedOutcome(task, 'A bounded local step failed.'));
+  assert.match(committed.presentation.text, /- landed: write_file succeeded, no receipt text retained/);
+});
+
+test('an uncertain or failed write is never a landed fact, and a crossed success says it left this machine', () => {
+  const task = accept();
+  settleWrite(task, 'failed');
+  settleWrite(task, 'uncertain');
+  settleWrite(task, 'succeeded');
+  const landed = retained.landedWritesForAcceptedSource(task);
+  assert.equal(landed.length, 1);
+  assert.equal(landed[0]!.kind, 'settled_write');
+  if (landed[0]!.kind !== 'settled_write') throw new Error('unreachable');
+  assert.equal(landed[0]!.toolName, 'googlesheets_batch_update');
+  assert.equal(landed[0]!.physicalCrossingCount, 1);
+  assert.match(retained.landedWriteLine(landed[0]!), /^landed: googlesheets_batch_update "\{\\"successful\\":true,\\"message\\":\\"opaque provider response\\"\}" at seq \d+ \(left this machine\)$/);
+  assert.match(retained.renderFailureWithRetainedWork({ ...task, fallbackText: 'Stopped.' }), /External write state \(googlesheets_batch_update\): uncertain/);
+});

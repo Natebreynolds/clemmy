@@ -314,3 +314,51 @@ test('a cancelled exchange rides into the successor so "continue" has its refere
   });
   assert.equal(eventlog.listEvents(retry.selection.sessionId, { types: ['cross_session_prefix'] }).length, 0);
 });
+
+test('a stopped exchange rides into the successor with its durable checkpoint, while every public reader keeps the head', async () => {
+  // The successor's prefix is the model's history. A Stop whose checkpoint
+  // names the retained handle and the landed write must reach the brain
+  // whole, or "continue" repeats the effect the checkpoint says already
+  // happened. The owner's projection of the same terminal stays the head.
+  const { turnOutcomeId, presentationEventForOutcome } = await import('./turn-outcome.js');
+  const { publicCompletionText, durableCompletionTextForModel, projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const { reconstructHarnessTranscript } = await import('./transcript.js');
+  memoryDatabase.resetMemoryDb();
+  const parent = parentSession();
+  const source = parent.recordUserInput('Append the summary line to notes.md, then read it back.', 1);
+  const head = 'Stopped. Nothing further runs for this turn.';
+  const durable = [head, '', 'Retained work (durable checkpoint):',
+    '- Source/tool read_file: completed result retained as rh_fixture_checkpoint.',
+    '- landed: write_file "Appended notes.md (12 chars)." at seq 7.',
+    'External write state: no settled external-write attempt is recorded.'].join('\n');
+  const identity = { sessionId: parent.id, turn: 1, sourceUserSeq: source.seq };
+  const outcome = { version: 2 as const, id: turnOutcomeId(identity), identity, status: 'cancelled' as const, resumable: false as const,
+    presentation: { kind: 'stopped' as const, text: durable } };
+  const terminal = eventlog.appendEvent({ sessionId: parent.id, turn: 1, role: 'system', type: 'conversation_completed', data: {
+    terminalKey: outcome.id, sourceUserSeq: source.seq, reply: durable, presentation: presentationEventForOutcome(outcome),
+    hostNotice: { code: 'stopped' }, turnOutcome: { version: 2, id: outcome.id, status: 'cancelled', resumable: false },
+  } });
+  parent.markStatus('cancelled');
+  assert.equal(publicCompletionText(terminal.data), head);
+  assert.equal(durableCompletionTextForModel(terminal.data), durable);
+  const selected = claimSessionForAcceptedSource({
+    kind: 'ordinary', entrySessionId: parent.id, durableSourceId: 'continue-after-checkpointed-stop', continuity,
+    receipt: { requestId: 'continue-checkpoint-request', runId: 'continue-after-checkpointed-stop', inputHash: '4'.repeat(64) },
+  });
+  assert.equal(selected.selection.disposition, 'branched');
+  const prefix = eventlog.listEvents(selected.selection.sessionId, { types: ['cross_session_prefix'] });
+  assert.equal(prefix.length, 1);
+  const text = String(prefix[0]!.data.text);
+  assert.ok(text.includes('USER: Append the summary line to notes.md, then read it back.'), text);
+  assert.match(text, /Stopped at the person's request before this finished; the request itself still stands/);
+  assert.ok(text.includes(durable), 'the model-facing prefix carries the whole durable terminal, checkpoint included');
+  // No public reader of the parent or the successor gains the checkpoint.
+  assert.equal((projectHarnessEventForPublic(terminal)!.data.presentation as { text: string }).text, head);
+  assert.doesNotMatch(JSON.stringify(reconstructHarnessTranscript(parent.id)), /rh_|landed:/);
+  assert.doesNotMatch(JSON.stringify(reconstructHarnessTranscript(selected.selection.sessionId)), /rh_|landed:/);
+  assert.doesNotMatch(JSON.stringify(eventlog.listEvents(selected.selection.sessionId).map(projectHarnessEventForPublic).filter(Boolean)), /rh_|landed:/);
+  const child = HarnessSession.load(selected.selection.sessionId)!;
+  const { wire } = await captureModelRequest(child, 'Continue where you left off');
+  assert.ok(wire.includes('rh_fixture_checkpoint'), 'the first model request after the Stop names the retained handle');
+  assert.ok(wire.includes('landed: write_file'), 'and the landed write');
+});
