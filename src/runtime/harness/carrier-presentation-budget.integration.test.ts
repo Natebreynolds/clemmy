@@ -255,7 +255,7 @@ test('nominal batch children and structured local payload roots are never replac
   }
 });
 
-test('typed read failures and legacy error text stay unframed through direct and carrier boundaries', async () => {
+test('an absent-path read answer and legacy error text stay unframed through direct and carrier boundaries', async () => {
   const missingPath = path.join(home, 'fixture-intentionally-missing-read.txt');
   const legacy = tool({ name: 'read_file', description: 'Controlled legacy failed reader.',
     parameters: z.object({ path: z.string(), max_chars: z.number().nullable() }),
@@ -273,7 +273,19 @@ test('typed read failures and legacy error text stay unframed through direct and
         calls: [{ callId, args: carrier ? { name: 'read_file', args_json: JSON.stringify(readArgs) } : readArgs }],
       });
       const shown = result.results.get(callId) ?? '';
-      assert.match(shown, nominal ? /File does not exist/ : /controlled legacy reader failed/);
+      if (nominal) {
+        // The nominal reader answers an absent path as the read's content:
+        // the absence, path echoed, presented exactly as any read it returns
+        // (framed whole on the direct lane; the unproved carrier keeps the
+        // bytes unchanged, as the whole-inline test above establishes).
+        const payload = carrier ? shown : wholeInlinePayload(shown, callId);
+        assert.match(payload, /^No file at /);
+        assert.ok(payload.includes(missingPath), 'the path is echoed');
+        if (carrier) assert.doesNotMatch(shown, /whole_inline_result_v1|shownPayloadBytes|providerPayload/);
+        continue;
+      }
+      // The legacy reader's error text stays what it is.
+      assert.match(shown, /controlled legacy reader failed/);
       assert.doesNotMatch(shown, /whole_inline_result_v1|shownPayloadBytes|providerPayload/,
         'tool spelling and nonce do not convert a failed read into nominal source content');
     }

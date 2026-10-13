@@ -689,3 +689,55 @@ test('a shell command whose working folder does not exist is refused before it s
   assert.equal(signals.preDispatch, true);
   assert.equal(signals.argumentValidationFailed, true);
 });
+
+test('read_file on an absent path is a completed read whose content is the absence, never an argument error', async () => {
+  // A read of a file that is not there settled as a refused argument, so a
+  // read turn lost its complete coverage, left the cheap review path and
+  // entered argument repair for a path that was simply empty. The filesystem
+  // answered; that answer is the read's content and settles as a read.
+  const { executeLocalFileReadForTool } = await import('./computer-tools.js');
+  const { HostLocalReadSuccessResult, InvalidArgumentsPreDispatchResult, attemptSignalsFromTypedResult } = await import('../runtime/harness/attempt-settlement.js');
+  const { classifyAttemptOutcome } = await import('../runtime/harness/attempt-outcome.js');
+  const folder = path.join(tmpHome, 'notes');
+  mkdirSync(folder, { recursive: true });
+  const absent = path.join(folder, 'absent.md');
+  const read = await executeLocalFileReadForTool({ path: absent, max_chars: null });
+  assert.ok(read instanceof HostLocalReadSuccessResult, 'the absence is read content, carried as a nominal read');
+  assert.equal(read.output, `No file at ${absent}. The folder ${folder} exists; list_files shows what is in it.`);
+  const signals = attemptSignalsFromTypedResult(read);
+  assert.deepEqual(signals, { hostExecuted: true, hostReadCompleted: true });
+  assert.equal(classifyAttemptOutcome({ ...signals, mutating: false }).kind, 'succeeded');
+  // A missing parent folder is part of the answer.
+  const deeper = path.join(tmpHome, 'no-such-notes', 'absent.md');
+  const deepRead = await executeLocalFileReadForTool({ path: deeper, max_chars: null });
+  assert.ok(deepRead instanceof HostLocalReadSuccessResult);
+  assert.equal(deepRead.output, `No file at ${deeper}. The folder ${path.dirname(deeper)} does not exist either.`);
+  // A folder at the path is what is there, not a wrong argument.
+  const folderRead = await executeLocalFileReadForTool({ path: folder, max_chars: null });
+  assert.ok(folderRead instanceof HostLocalReadSuccessResult);
+  assert.equal(folderRead.output, `${folder} is a folder, not a file; list_files shows what is in it.`);
+  // Credential material is still refused before any read starts.
+  const credential = path.join(tmpHome, '.env');
+  writeFileSync(credential, 'secret=never-read\n');
+  const refused = await executeLocalFileReadForTool({ path: credential, max_chars: null });
+  assert.ok(refused instanceof InvalidArgumentsPreDispatchResult, 'a credential file is a refusal, not a read');
+});
+
+test('convert_to_markdown and list_files answer an absent path as a read result too', async () => {
+  const invokeTool = async (name: string, input: Record<string, unknown>): Promise<unknown> => {
+    const found = getComputerTools().find((tool) => tool.name === name) as unknown as {
+      invoke: (runContext: unknown, input: string, details: unknown) => Promise<unknown>;
+    };
+    return found.invoke({ context: { sessionId: 'sess-read-test', turn: 0 } }, JSON.stringify(input), { toolCall: { callId: `call_${name}_${Date.now()}` } });
+  };
+  const absentDocument = path.join(tmpHome, 'absent.pdf');
+  assert.equal(await invokeTool('convert_to_markdown', { path: absentDocument, max_chars: null }),
+    `No file at ${absentDocument}. The folder ${tmpHome} exists; list_files shows what is in it.`);
+  const missingFolder = path.join(tmpHome, 'no-such-folder');
+  assert.equal(await invokeTool('list_files', { directory: missingFolder, limit: null }),
+    `No folder at ${missingFolder}. The folder ${tmpHome} exists; list_files shows what is in it.`);
+  const file = path.join(tmpHome, 'plain-listing.txt');
+  writeFileSync(file, 'plain\n');
+  assert.equal(await invokeTool('list_files', { directory: file, limit: null }),
+    `${file} is a file, not a folder; read_file reads it.`);
+});

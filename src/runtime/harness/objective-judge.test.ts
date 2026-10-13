@@ -370,6 +370,49 @@ test('evidence coverage: a proven authoring commit is the outcome of an authorin
   assert.equal(failed.complete, false);
 });
 
+test('evidence coverage: a read whose target is absent is a complete read, and Jev may settle it', async () => {
+  // The absence is the read's content. The row settles like any other read,
+  // so coverage stays complete and the read turn stays on the Jev path. The
+  // argument-error shape it used to take closed that gate, and every such
+  // turn went to the configured reviewer with argument repair behind it.
+  const absentRead = {
+    toolName: 'read_file', outcome: 'succeeded', status: 'verified', contentComplete: true,
+    evidenceKind: 'source_result', logicalToolCallId: 'read-absent',
+  } as const;
+  const objective = 'What does my notes file say?';
+  const coverage = assessCompletionEvidenceCoverage({ objective, results: [absentRead] });
+  assert.equal(coverage.complete, true);
+  assert.deepEqual(coverage.failedAttempts, []);
+  assert.deepEqual(coverage.outcomeEvidence.map((row) => row.logicalToolCallId), ['read-absent']);
+  const asArgumentError = assessCompletionEvidenceCoverage({ objective,
+    results: [{ ...absentRead, outcome: 'invalid_arguments', status: 'not_succeeded' }] });
+  assert.equal(asArgumentError.complete, false);
+  assert.equal(asArgumentError.failedAttempts.length, 1);
+
+  _setTypesafeKeyForTests('ts_test');
+  const jev = { count: 0 };
+  _setSystemOneFetchForTests(async () => {
+    jev.count += 1;
+    return { status: 200, ok: true, text: async () => JSON.stringify(jevCompletionReading('done')) };
+  });
+  let reviewerCalls = 0;
+  _setCompletionJudgeForTests(async () => { reviewerCalls += 1; return { verdict: { done: true, reason: 'reviewer ran' }, failure: null }; });
+  try {
+    const v = await judgeObjectiveComplete(objective, 'There is no notes file at that path; the folder is there, but the file is not.', {
+      sessionId: 'probe-absent-read', skills: [], reviewStakes: 'read',
+      toolCallSummary: 'read_file succeeded once; no writes.',
+      verifiedReadResults: [absentRead],
+    });
+    assert.equal(jev.count, 1);
+    assert.equal(v.jevAttempt?.coverageComplete, true);
+    assert.equal(v.jevAttempt?.reviewerStarted, false, 'the read settles without the configured reviewer');
+    assert.equal(v.fast, true);
+    assert.equal(v.done, true);
+    assert.equal(v.judgeModelId, 'jev-1.13.0');
+    assert.equal(reviewerCalls, 0);
+  } finally { _setCompletionJudgeForTests(unavailableSettingsJudge); }
+});
+
 test('evidence coverage uses registry role and completeness, not vendor names', () => {
   const empty = assessCompletionEvidenceCoverage({
     objective: 'look up the named record and its window',

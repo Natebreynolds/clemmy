@@ -10,7 +10,6 @@ const testHome = mkdtempSync(path.join(os.tmpdir(), 'clem-workspace-info-'));
 process.env.CLEMENTINE_HOME = testHome;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 const { getLocalRuntimeTools, getLocalDeferredDispatchTools } = await import('./local-runtime-tools.js');
-const { InvalidArgumentsPreDispatchResult, attemptSignalsFromTypedResult } = await import('../runtime/harness/attempt-settlement.js');
 const { createSession, getToolOutputForInvocation } = await import('../runtime/harness/eventlog.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { exactToolOutputForInvocation } = await import('../runtime/harness/tool-output-format.js');
@@ -21,7 +20,7 @@ for (const [surface, tools] of [
   ['native', getLocalRuntimeTools],
   ['deferred', getLocalDeferredDispatchTools],
 ] as const) {
-  test(`${surface} workspace_info file/missing path is a repairable non-dispatch result`, async () => {
+  test(`${surface} workspace_info names what is at a file or missing path as a completed read`, async () => {
     const info = tools().find(t => t.name === 'workspace_info');
     assert.ok(info && info.type === 'function');
     const file = path.join(testHome, `${surface}-performance.csv`);
@@ -29,13 +28,12 @@ for (const [surface, tools] of [
     for (const projectPath of [file, path.join(testHome, `${surface}-absent`)]) {
       const result = await info.invoke(new RunContext({ sessionId: `workspace-info-${surface}` }),
         JSON.stringify({ project_path: projectPath, include_tree: false }));
-      assert.ok(result instanceof InvalidArgumentsPreDispatchResult,
-        'a directory precondition failure must not become a succeeded read');
-      assert.deepEqual(attemptSignalsFromTypedResult(result), {
-        preDispatch: true, argumentValidationFailed: true, schemaAvailable: true,
-      });
-      assert.match(String(result), /directory/i);
-      if (projectPath === file) assert.match(String(result), /read_file/);
+      // Nothing inspectable at the path is the inspection's answer, carried
+      // back as a read result, never an argument error to repair.
+      assert.equal(typeof result, 'string', 'what is at the path is a read result');
+      assert.ok(String(result).includes(projectPath), 'the path is echoed');
+      assert.match(String(result), projectPath === file ? /is a file, not a folder; read_file reads it/ : /^No folder at /);
+      assert.match(String(result), /workspace_info inspects a project folder/);
     }
     const repaired = await info.invoke(new RunContext({ sessionId: `workspace-info-${surface}` }),
       JSON.stringify({ project_path: testHome, include_tree: false }));

@@ -563,6 +563,106 @@
         "recall_tool_result",
         "tool_output_query"
       ]
+    },
+    "g_local_read_absent/jev_off": {
+      "rounds": 2,
+      "round1Bytes": 28672,
+      "totalRequestBytes": 58803,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "session_search",
+        "tool_search",
+        "workspace_roots",
+        "work_call"
+      ],
+      "round1OnRequestTools": [
+        "check_in",
+        "recall_tool_result",
+        "skill_read",
+        "tool_output_query",
+        "app_guide",
+        "file_query"
+      ]
+    },
+    "g_local_read_absent/jev_hang": {
+      "rounds": 2,
+      "round1Bytes": 28672,
+      "totalRequestBytes": 58809,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "session_search",
+        "tool_search",
+        "workspace_roots",
+        "work_call"
+      ],
+      "round1OnRequestTools": [
+        "check_in",
+        "recall_tool_result",
+        "skill_read",
+        "tool_output_query",
+        "app_guide",
+        "file_query"
+      ]
+    },
+    "g_local_read_absent/jev_http_500": {
+      "rounds": 2,
+      "round1Bytes": 28672,
+      "totalRequestBytes": 58833,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "session_search",
+        "tool_search",
+        "workspace_roots",
+        "work_call"
+      ],
+      "round1OnRequestTools": [
+        "check_in",
+        "recall_tool_result",
+        "skill_read",
+        "tool_output_query",
+        "app_guide",
+        "file_query"
+      ]
+    },
+    "g_local_read_absent/jev_scripted": {
+      "rounds": 2,
+      "round1Bytes": 28672,
+      "totalRequestBytes": 58833,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "session_search",
+        "tool_search",
+        "workspace_roots",
+        "work_call"
+      ],
+      "round1OnRequestTools": [
+        "check_in",
+        "recall_tool_result",
+        "skill_read",
+        "tool_output_query",
+        "app_guide",
+        "file_query"
+      ]
     }
   }
 }

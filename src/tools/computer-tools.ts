@@ -1565,10 +1565,40 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
   });
 }
 
+/**
+ * What a read found when nothing of the expected kind is at its path.
+ *
+ * The read ran and the filesystem answered; that answer is the read's
+ * content. It is returned as a completed read with the path echoed, so the
+ * model carries the absence back as a fact, the completion review sees a
+ * complete read, and the turn never enters argument repair for a file that
+ * is simply not there. Only a malformed path, credential material or a
+ * refused root is refused before the read starts.
+ */
+export function absentReadTargetText(target: string, expected: 'file' | 'folder'): string {
+  let found: 'missing' | 'file' | 'folder' | 'other' = 'missing';
+  try {
+    if (existsSync(target)) {
+      const stat = statSync(target);
+      found = stat.isDirectory() ? 'folder' : stat.isFile() ? 'file' : 'other';
+    }
+  } catch { found = 'missing'; }
+  if (found === 'missing') {
+    const parent = path.dirname(target);
+    let parentExists = false;
+    try { parentExists = parent !== target && existsSync(parent); } catch { parentExists = false; }
+    return `No ${expected} at ${target}. ${parentExists
+      ? `The folder ${parent} exists; list_files shows what is in it.`
+      : `The folder ${parent} does not exist either.`}`;
+  }
+  if (expected === 'file' && found === 'folder') return `${target} is a folder, not a file; list_files shows what is in it.`;
+  if (expected === 'folder' && found === 'file') return `${target} is a file, not a folder; read_file reads it.`;
+  return `${target} is not a ${expected}.`;
+}
+
 function listDirectory(dir: string, limit: number): string {
   const resolved = resolveAllowedPath(dir);
-  if (!existsSync(resolved)) return `Directory does not exist: ${resolved}`;
-  if (!statSync(resolved).isDirectory()) return `Not a directory: ${resolved}`;
+  if (!existsSync(resolved) || !statSync(resolved).isDirectory()) return absentReadTargetText(resolved, 'folder');
   const cap = Math.max(1, Math.min(500, limit));
   const entries = readdirSync(resolved, { withFileTypes: true })
     .filter((entry) => entry.name !== 'node_modules' && entry.name !== '.git')
@@ -1764,14 +1794,17 @@ async function executeLocalFileReadWithDependencies(
         + 'Nothing was read and no approval is needed — the provider connections are already authenticated, so use '
         + 'the connection/toolkit directly (composio_status for configuration state).';
     }
-    if (!timing.sync('path_checks', () => existsSync(filePath))) {
-      outcome = 'missing';
-      return new InvalidArgumentsPreDispatchResult(`File does not exist: ${filePath}`);
-    }
-    if (!timing.sync('path_checks', () => statSync(filePath).isFile())) {
-      outcome = 'not_file';
-      return new InvalidArgumentsPreDispatchResult(`Not a file: ${filePath}`);
-    }
+    // Nothing readable at the path is the read's content, never an argument
+    // error (see absentReadTargetText). A structured workflow step was
+    // promised the file's bytes as data, so that lane keeps the typed
+    // refusal rather than feeding prose about the absence to the next step.
+    const absence = (stage: LocalReadTimingOutcome) => {
+      outcome = stage;
+      const text = absentReadTargetText(filePath, 'file');
+      return options?.completeOutput ? new InvalidArgumentsPreDispatchResult(text) : text;
+    };
+    if (!timing.sync('path_checks', () => existsSync(filePath))) return absence('missing');
+    if (!timing.sync('path_checks', () => statSync(filePath).isFile())) return absence('not_file');
     // HTML/HTM are TEXT — read the raw source. A Workspace view is edited AS
     // HTML, so routing it through markitdown strips the tags (and was erroring
     // on workspace views: "An error occurred while running the tool"). Only
@@ -1908,8 +1941,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
         return 'Refused: that file holds credential material, and Clementine never needs raw secrets to do work. '
           + 'Nothing was read and no approval is needed — use the already-authenticated connection instead.';
       }
-      if (!existsSync(filePath)) return new InvalidArgumentsPreDispatchResult(`File does not exist: ${filePath}`);
-      if (!statSync(filePath).isFile()) return new InvalidArgumentsPreDispatchResult(`Not a file: ${filePath}`);
+      if (!existsSync(filePath) || !statSync(filePath).isFile()) return absentReadTargetText(filePath, 'file');
       const ingested = await ingestAttachment({ name: path.basename(filePath), sourcePath: filePath });
       if (ingested.error) return `Conversion failed: ${ingested.error}`;
       return formatToolOutput(

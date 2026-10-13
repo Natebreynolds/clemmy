@@ -10,13 +10,13 @@ import {
   ensureDir,
   listWorkspaceProjects,
   textResult,
-  invalidArgumentsTextResult,
 } from './shared.js';
 import { appendTimer, cancelTimers, listPendingTimers, resolveTimerFireAt, type TimerEntry } from '../runtime/timers.js';
 import { timerProspectiveDefinition } from '../runtime/prospective-adapters.js';
 import { upsertProspectiveIntention } from '../runtime/prospective-intentions.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { getSession as getHarnessSession } from '../runtime/harness/eventlog.js';
+import { absentReadTargetText } from './computer-tools.js';
 
 // Timer store moved to src/runtime/timers.ts (2026-07-20): set_timer used to be
 // WRITE-ONLY — no consumer ever fired what this tool wrote, so every reminder
@@ -258,8 +258,10 @@ export function registerAdminTools(server: McpServer): void {
     },
     async ({ project_path, include_tree }) => {
       const resolved = resolveHomePath(project_path);
+      // No project folder at the path is what the inspection found: the
+      // result of the read, not a malformed argument.
       if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
-        return invalidArgumentsTextResult(`Not a directory: ${resolved}. workspace_info requires a project directory. To read a known file, use read_file with its path.`);
+        return textResult(`${absentReadTargetText(resolved, 'folder')} workspace_info inspects a project folder.`);
       }
 
       const sections: string[] = [`# ${path.basename(resolved)}`, `Path: ${resolved}`];
