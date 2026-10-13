@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ChatEngine, type ChatApi } from './engine.js';
+import { ChatEngine, STEER_NOT_DELIVERED_TEXT, type ChatApi } from './engine.js';
 import type { HarnessEvent } from './types.js';
 import type { StreamTransport } from './stream.js';
 
@@ -137,5 +137,39 @@ test('a delayed refused request cannot clear a different accepted source that is
     assert.equal(engine.snapshot().activeSourceUserSeq, 3);
     assert.deepEqual(engine.snapshot().messages.find(message => message.id === candidate.id), candidate);
     assert.equal(engine.snapshot().messages.find(message => message.text === 'Old refused reply')?.pending, 'failed');
+  } finally { engine.dispose(); }
+});
+
+test('a refused mid-turn message shows the route’s plain line on its failed row, an offline one the transport’s, and never a connection guess', async () => {
+  const line = 'This turn is finishing; the message was not queued.';
+  const offline = "Can't reach your computer right now";
+  const failures: unknown[] = [
+    Object.assign(new Error(line), { status: 409, body: { error: line, code: 'STEER_NOTE_CUTOVER', sessionId } }),
+    Object.assign(new Error(offline), { status: 0, offline: true }),
+    'a failure with no words',
+  ];
+  let steers = 0;
+  const engine = new ChatEngine({ sessionId, transport: quietTransport, api: {
+    loadSession: empty, send: async input => {
+      if (!input.steerOnly) return { sessionId, accepted: true };
+      throw failures[steers++];
+    },
+  } });
+  try {
+    await engine.send('Start the controlled work.');
+    assert.equal(engine.snapshot().busy, true, 'the accepted turn is live');
+    await engine.send('Add this detail.');
+    await engine.send('And this one.');
+    await engine.send('And a third.');
+    assert.equal(steers, 3);
+    const rows = engine.snapshot().messages.filter(message => message.steer);
+    assert.deepEqual(rows.map(message => [message.pending, message.steer, message.pendingError]), [
+      ['failed', 'failed', line],
+      ['failed', 'failed', offline],
+      ['failed', 'failed', STEER_NOT_DELIVERED_TEXT],
+    ]);
+    assert.doesNotMatch(rows[0]!.pendingError!, /STEER_NOTE/, 'the owner reads the line, never the code');
+    assert.doesNotMatch(STEER_NOT_DELIVERED_TEXT, /reach|\b(?:I|I’m|I'm|me|my)\b/, 'a wordless failure claims nothing about the connection');
+    assert.equal(engine.snapshot().busy, true, 'a refused mid-turn message never clears the live turn');
   } finally { engine.dispose(); }
 });
