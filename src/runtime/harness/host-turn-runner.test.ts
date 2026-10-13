@@ -7,7 +7,7 @@
  * exactly once, and Runner.run is unreachable (a throwing stub proves it).
  * The model is stubbed — no Codex quota, no OPENAI_API_KEY.
  */
-import { existsSync, mkdtempSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -13534,3 +13534,163 @@ test('inline work settlement binds exact accepted source and a single phase, and
   assert.equal(item.phases.verify!.status, 'pending');
   assert.ok(item.phases.transform!.evidence.some((ref) => ref.ref === 'logical:phase-write'));
 });
+
+
+// A production host read A is retained by a fresh owned computation B.
+function freshComputationFixture(session: ReturnType<typeof eventlog.createSession>, text: string,
+  label: string, data: Record<string, unknown> = {}, legacySource = false) {
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: `fresh-compute-${label}-${++acceptedSerial}` });
+  const source = legacySource
+    ? eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text, ...data } })
+    : eventlog.recordRunAttemptUserInput(attempt, { turn: 2, role: 'user',
+      data: { text, attemptId: attempt.attemptId, runId: attempt.runId, ...data } }, { armRunInFlight: true });
+  eventlog.bindRunAttemptSourceUserEvent(attempt, source.seq);
+  return { session, source, attempt,
+    parent: { sessionId: session.id, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId,
+      counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::source:${source.seq}` },
+    context: { sessionId: session.id, sourceUserSeq: source.seq } };
+}
+
+for (const variant of ['fresh', 'current_refusal', 'prior_uncertain', 'missing_attempt_payload',
+  'null_attempt_payload', 'missing_run_payload', 'no_ambient_attempt', 'foreign_ambient_attempt'] as const) {
+  test(`fresh computation over an actual retained read keeps exact source ownership: ${variant}`, async t => {
+    const { _setHostObjectiveJudgeForTests, captureEffectiveCompletionPolicyOnce } = await import('./host-turn-runner.js');
+    const { sourceHasNoCompletionWork } = await import('./host-completion-work.js');
+    const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+    process.env.HARNESS_TOOL_BRACKETS = 'on';
+    t.after(() => {
+      _setHostObjectiveJudgeForTests(null);
+      if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+      else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+    });
+    const session = eventlog.createSession({ id: `host-owned-computation-${++acceptedSerial}-${variant}`, kind: 'chat' });
+    const standing = 'CONTROLLED_STANDING_RULE: retain the complete owner request and contrary evidence.';
+    const { createAgentRecord, deleteAgentRecord } = await import('../../agents/agent-record.js');
+    const { setSessionAgent } = await import('../../agents/session-agent.js');
+    const { sessionAgentReviewContext } = await import('./session-composition.js');
+    const savedAgent = createAgentRecord({ name: `Fresh computation standing ${acceptedSerial}`, instructions: standing });
+    assert.equal(savedAgent.ok, true);
+    if (!savedAgent.ok) throw new Error('controlled standing instructions were not registered');
+    t.after(() => { deleteAgentRecord(savedAgent.agent.id); });
+    assert.equal(setSessionAgent(session.id, savedAgent.agent.id, { by: 'owner' }).ok, true);
+    assert.ok(sessionAgentReviewContext(session.id).includes(standing), 'the actual saved session standing context exists');
+    const first = freshComputationFixture(session, 'Read the controlled local text once and report it.', 'first');
+    const publicFile = path.join(TMP_HOME, `fresh-computation-public-${first.source.seq}.txt`);
+    writeFileSync(publicFile, 'OWN_PRIOR_READ: controlled public content', 'utf8');
+    let actualReads = 0, workerEntries = 0;
+    const readParameters = z.object({ path: z.string(), max_chars: z.number().int().nullable() }).strict();
+    const sdkRead = tool({ name: 'read_file',
+      description: 'Read only the controlled public fixture.',
+      parameters: readParameters,
+      needsApproval: async () => false,
+      execute: async args => {
+        assert.equal(args.path, publicFile);
+        actualReads += 1; return readFileSync(args.path, 'utf8');
+      } });
+    const read = brackets.wrapToolForHarness(brackets.attestToolLocalInputInvalidity(sdkRead,
+      ({ rawInput, parsedInput }) => {
+        if (typeof rawInput !== 'string') return 'unproven';
+        return readParameters.safeParse(parsedInput).success ? 'unproven' : 'invalid';
+      }));
+    const worker = brackets.wrapToolForHarness({ type: 'function', name: 'run_worker', description: 'Controlled unresolved worker.',
+      parameters: { type: 'object', properties: { item: { type: 'string' }, prompt: { type: 'string' } }, required: ['item', 'prompt'] },
+      needsApproval: async () => false, invoke: async () => {
+        workerEntries += 1; const error = new Error('controlled unresolved worker'); error.name = 'TimeoutError'; throw error;
+      } });
+    const oldModel = scriptedRecordingModel([
+      [toolCall(`owned-read-${first.source.seq}`, 'read_file', { path: publicFile, max_chars: null })],
+      variant === 'prior_uncertain'
+        ? [toolCall(`owned-uncertain-${first.source.seq}`, 'run_worker', { item: 'controlled', prompt: 'Controlled model-free fixture.' })]
+        : [textMsg('The controlled text was read.')],
+    ]);
+    const oldAgent = { model: oldModel, tools: variant === 'prior_uncertain' ? [read, worker] : [read] };
+    bindHostCanarySurface(first, oldAgent, oldAgent.tools);
+    const old = await runProductionHost(first, oldAgent, undefined, { hostJudgeCompletion: false });
+    assert.equal(actualReads, 1, 'the prior read must actually invoke through the production host');
+    const priorSettlements = () => eventlog.openEventLog().prepare(`SELECT logical_tool_call_id, outcome_kind,
+      mutating, requires_reconciliation, host_crossing_count FROM logical_call_settlements
+      WHERE session_id=? AND source_user_seq=? ORDER BY logical_tool_call_id`).all(session.id, first.source.seq);
+    const savedSettlements = priorSettlements();
+    assert.ok(savedSettlements.length > 0, 'retained history is backed by actual durable work');
+    if (variant === 'prior_uncertain') {
+      assert.equal(workerEntries, 1); assert.equal(old.terminal?.reason, 'tool_effect_uncertain');
+      assert.ok((savedSettlements as Array<{ outcome_kind: string; requires_reconciliation: number }>).some(row =>
+        row.outcome_kind === 'uncertain_write' && row.requires_reconciliation === 1));
+    } else assert.equal(old.finalOutput, 'The controlled text was read.');
+    eventlog.finishRunAttempt(first.attempt, variant === 'prior_uncertain' ? 'failed' : 'completed');
+    const text = 'What is 23 × 29? Reply only with the number. Do not use tools.';
+    const second = freshComputationFixture(session, text, 'second',
+      variant === 'null_attempt_payload' ? { attemptId: null }
+        : variant === 'missing_attempt_payload' ? { attemptId: undefined }
+          : variant === 'missing_run_payload' ? { runId: undefined } : {});
+    if (variant === 'no_ambient_attempt') delete (second.parent as { runAttemptId?: string }).runAttemptId;
+    if (variant === 'foreign_ambient_attempt') second.parent.runAttemptId = first.attempt.attemptId;
+    captureEffectiveCompletionPolicyOnce({ ...second.context, enabled: true });
+    const historical = JSON.stringify(old.history);
+    const reviewed: Array<{ objective: string; reply: string; agentInstructions?: string; toolCallSummary?: string }> = [];
+    _setHostObjectiveJudgeForTests(async (objective, reply, context) => {
+      // Assertions belong outside the host's reviewer failure catch.
+      reviewed.push({ objective, reply, agentInstructions: context?.agentInstructions, toolCallSummary: context?.toolCallSummary });
+      return { done: true, failedOpen: false, reason: 'Controlled reached-review fixture, not real semantic validation.' };
+    });
+    const model = scriptedRecordingModel(variant === 'current_refusal'
+      ? [[toolCall(`current-refused-${second.source.seq}`, 'read_file', {})], [textMsg('667')]]
+      : [[textMsg('667')]]);
+    const agent = { model, tools: variant === 'current_refusal' ? [read] : [], instructions: standing };
+    bindHostCanarySurface(second, agent, agent.tools);
+    const input = [...old.history, { type: 'message', role: 'user', content: text }];
+    const beforeProof = sourceHasNoCompletionWork({ ...second.context, attemptId: second.attempt.attemptId });
+    assert.equal(beforeProof, !['prior_uncertain','missing_attempt_payload','null_attempt_payload','missing_run_payload'].includes(variant));
+    const result = await runProductionHost(second, agent, input, { hostJudgeCompletion: true });
+    assert.equal(JSON.stringify(old.history), historical); assert.deepEqual(priorSettlements(), savedSettlements);
+    assert.equal(actualReads, 1, 'the new computation must not repeat the settled read');
+    const skips = eventlog.listEvents(session.id, { types: ['completion_review_skipped'] })
+      .filter(event => event.data.sourceUserSeq === second.source.seq && event.data.reason === 'self_contained_computation');
+    if (variant === 'fresh') {
+      assert.equal(result.finalOutput, '667'); assert.equal(model.calls(), 1); assert.equal(reviewed.length, 0); assert.equal(skips.length, 1);
+      assert.equal(eventlog.listEvents(session.id, { types: ['tool_called'] }).filter(event => event.data.sourceUserSeq === second.source.seq).length, 0);
+    } else {
+      assert.equal(skips.length, 0, 'unknown or attempted work cannot receive the new shortcut');
+      assert.equal(reviewed.length, 1, 'the actual configured completion gate must still be reached');
+      const [review] = reviewed;
+      assert.equal(review.objective, text); assert.equal(review.reply, '667');
+      assert.ok(review.agentInstructions?.includes(standing));
+      assert.ok(review.toolCallSummary?.includes('OWN_PRIOR_READ'), 'complete retained read context is still presented');
+      if (variant === 'prior_uncertain') assert.ok(review.toolCallSummary?.includes('uncertain_write'));
+      const goals = eventlog.listEvents(session.id, { types: ['goal_alignment_judged'] })
+        .filter(event => event.data.sourceUserSeq === second.source.seq);
+      assert.equal(goals.length, 1); assert.equal(goals[0].data.fulfills, true);
+      assert.equal(Boolean(goals[0].data.failedOpen), false, 'a caught assertion cannot masquerade as a reached valid review');
+      assert.equal(goals[0].data.reviewFailure, undefined);
+      assert.equal(goals[0].data.objectiveDigest, createHash('sha256').update(text).digest('hex'));
+      assert.equal(goals[0].data.replyDigest, createHash('sha256').update('667').digest('hex'));
+      if (variant === 'foreign_ambient_attempt') {
+        assert.equal(sourceHasNoCompletionWork({ ...second.context, attemptId: first.attempt.attemptId }), false,
+          'the stale ambient owner cannot obtain the new no-work proof');
+        // This legacy direct host fixture has no dispatch lease. Preserve its
+        // pre-existing review policy; it is not a physical owner-admission test.
+        assert.equal(model.calls(), 1); assert.equal(result.finalOutput, '667');
+        assert.equal((eventlog.openEventLog().prepare(`SELECT COUNT(*) AS n FROM physical_dispatches
+          WHERE session_id=? AND source_user_seq=?`).get(session.id, second.source.seq) as { n: number }).n, 0);
+        assert.equal(eventlog.listEvents(session.id, { types: ['tool_called'] })
+          .filter(event => event.data.sourceUserSeq === second.source.seq).length, 0);
+      }
+      if (variant === 'current_refusal') {
+        assert.equal(model.calls(), 2);
+        assert.equal(sourceHasNoCompletionWork({ ...second.context, attemptId: second.attempt.attemptId }), false);
+        assert.ok(eventlog.openEventLog().prepare(`SELECT 1 FROM accepted_model_batch_admissions
+          WHERE session_id=? AND source_user_seq=? AND call_count>0`).get(session.id, second.source.seq));
+        const refusal = eventlog.openEventLog().prepare(`SELECT execution_kind, outcome_kind,
+          physical_crossing_count, requires_reconciliation FROM logical_call_settlements
+          WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?`)
+          .get(session.id, second.source.seq, `current-refused-${second.source.seq}`) as {
+            execution_kind: string; outcome_kind: string; physical_crossing_count: number; requires_reconciliation: number };
+        assert.ok(refusal, 'the real SDK parser produces a durable pre-dispatch refusal');
+        assert.equal(refusal.execution_kind, 'refused_pre_dispatch');
+        assert.equal(refusal.outcome_kind, 'invalid_arguments');
+        assert.equal(refusal.physical_crossing_count, 0); assert.equal(refusal.requires_reconciliation, 0);
+      }
+    }
+    eventlog.finishRunAttempt(second.attempt, result.terminal?.status === 'blocked' ? 'failed' : 'completed');
+  });
+}

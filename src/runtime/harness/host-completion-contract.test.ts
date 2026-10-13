@@ -2541,3 +2541,126 @@ test('selected query flags and separately retained legacy bytes cannot manufactu
   assert.equal(result.evidenceKind, 'control_diagnostic');
   assert.equal(result.sourceResultHandleId, undefined, 'a logical id alone cannot bind different legacy bytes to the immutable producer');
 });
+
+
+// Certified no-work is stricter than the legacy attempted-work hint.
+for (const [kind, field] of [
+  ['tool_called', undefined], ['tool_called', null], ['tool_called', '1'], ['tool_called', 0],
+  ['run_resumed', undefined], ['run_resumed', null], ['run_resumed', '1'], ['run_resumed', 0],
+] as const) test(`fresh no-work proof refuses valid JSON with unknown ${kind} source ${String(field)}`, async () => {
+  const { sourceHasNoCompletionWork } = await import('./host-completion-work.js');
+  const session = events.createSession({ id: `no-work-unknown-${++serial}`, kind: 'chat' });
+  const attempt = events.beginRunAttempt(session.id, { runId: `no-work-${serial}` });
+  const source = events.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user',
+    data: { text: 'What is 23 × 29?', attemptId: attempt.attemptId, runId: attempt.runId } });
+  events.bindRunAttemptSourceUserEvent(attempt, source.seq);
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, attemptId: attempt.attemptId };
+  assert.equal(sourceHasNoCompletionWork(identity), true, 'a genuine fresh source is eligible before the unknown record');
+  events.appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: kind,
+    data: kind === 'tool_called' ? { tool: 'read_file', ...(field === undefined ? {} : { sourceUserSeq: field }) }
+      : { ...(field === undefined ? {} : { executionSourceUserSeq: field, deliverySourceUserSeq: field }) } });
+  assert.equal(sourceHasNoCompletionWork(identity), false, 'valid JSON is not known ownership');
+  assert.equal(sourceAttemptedCompletionWork(identity), false, 'legacy API behavior stays unchanged and is not a no-work certificate');
+  events.finishRunAttempt(attempt, 'completed');
+});
+
+test('fresh no-work proof refuses legacy source-only or mismatched original attempts without adopting a current owner', async () => {
+  const { sourceHasNoCompletionWork } = await import('./host-completion-work.js');
+  const identity = accepted('What is 23 × 29?');
+  assert.equal(sourceAttemptedCompletionWork(identity), false);
+  assert.equal(sourceHasNoCompletionWork({ ...identity, attemptId: 'missing' }), false);
+  const attempt = events.beginRunAttempt(identity.sessionId, { runId: 'legacy-no-work-attempt' });
+  events.bindRunAttemptSourceUserEvent(attempt, identity.sourceUserSeq);
+  assert.equal(sourceHasNoCompletionWork({ ...identity, attemptId: attempt.attemptId }), false,
+    'binding a source-only row later cannot manufacture its original payload join');
+  assert.equal(sourceHasNoCompletionWork({ ...identity, attemptId: 'foreign' }), false);
+  events.finishRunAttempt(attempt, 'completed');
+});
+
+
+for (const mode of ['reserved', 'started', 'returned_without_settlement'] as const)
+  test(`fresh computation no-work proof holds incomplete prior durable producer inventory: ${mode}`, async () => {
+    const { sourceHasNoCompletionWork } = await import('./host-completion-work.js');
+    const session = events.createSession({ id: `no-work-incomplete-${++serial}`, kind: 'chat' });
+    const firstAttempt = events.beginRunAttempt(session.id, { runId: `no-work-prior-${serial}` });
+    const first = events.recordRunAttemptUserInput(firstAttempt, { turn: 1, role: 'user',
+      data: { text: 'Perform the controlled write.', attemptId: firstAttempt.attemptId, runId: firstAttempt.runId } });
+    events.bindRunAttemptSourceUserEvent(firstAttempt, first.seq);
+    const task = { sessionId: session.id, sourceUserSeq: first.seq,
+      acceptedTaskId: identities.acceptedTaskIdFor(session.id, first.seq), logicalToolCallId: `pending-write-${serial}` };
+    assert.ok(shadow.recordTurnGraphShadow({ identity: task }));
+    let scriptedWriteEntries = 0;
+    if (mode === 'reserved') assert.equal(dispatch.admitLogicalCall({ identity: task,
+      tool: 'fixture_write', args: { controlled: true } }).status, 'inserted');
+    else {
+      const opened = dispatch.beginPhysicalDispatch({ identity: { ...task,
+        physicalDispatchId: `pending-physical-${serial}`, ordinal: 0 }, tool: 'fixture_write', args: { controlled: true } });
+      assert.equal(opened.status, 'inserted');
+      if (opened.status !== 'inserted') throw new Error('controlled physical producer did not enter');
+      scriptedWriteEntries += 1; // Fake provider body executes once; no external service is contacted.
+      if (mode === 'returned_without_settlement') assert.equal(dispatch.settlePhysicalDispatch({
+        identity: opened.identity, tool: 'fixture_write', outcome: 'returned' }).status, 'inserted');
+    }
+    const db = events.openEventLog();
+    const settlementCount = db.prepare(`SELECT COUNT(*) n FROM logical_call_settlements
+      WHERE session_id=? AND source_user_seq=?`).get(session.id, first.seq) as { n: number };
+    assert.equal(settlementCount.n, 0,
+      'the producer never supplied an outcome settlement, so absence is not closure');
+    events.finishRunAttempt(firstAttempt, 'failed');
+    const attempt = events.beginRunAttempt(session.id, { runId: `no-work-fresh-${serial}` });
+    const source = events.recordRunAttemptUserInput(attempt, { turn: 2, role: 'user',
+      data: { text: 'What is 23 × 29?', attemptId: attempt.attemptId, runId: attempt.runId } });
+    events.bindRunAttemptSourceUserEvent(attempt, source.seq);
+    const before = db.prepare(`SELECT logical_tool_call_id,state FROM logical_tool_calls WHERE session_id=?`).all(session.id);
+    const physicalBefore = db.prepare(`SELECT physical_dispatch_id,state FROM physical_dispatches WHERE session_id=?`).all(session.id);
+    assert.equal(sourceHasNoCompletionWork({ sessionId: session.id, sourceUserSeq: source.seq, attemptId: attempt.attemptId }), false);
+    assert.deepEqual(db.prepare(`SELECT logical_tool_call_id,state FROM logical_tool_calls WHERE session_id=?`).all(session.id), before);
+    assert.deepEqual(db.prepare(`SELECT physical_dispatch_id,state FROM physical_dispatches WHERE session_id=?`).all(session.id), physicalBefore);
+    assert.equal(scriptedWriteEntries, mode === 'reserved' ? 0 : 1, 'the query never resumes or repeats the callback');
+    events.finishRunAttempt(attempt, 'completed');
+  });
+
+test('fresh no-work proof rejects numeric JSON attempt ID even when SQLite TEXT affinity could compare it', async () => {
+  const { sourceHasNoCompletionWork } = await import('./host-completion-work.js');
+  const session = events.createSession({ id: `no-work-affinity-${++serial}`, kind: 'chat' });
+  const attempt = events.beginRunAttempt(session.id, { attemptId: String(700000 + serial), runId: `no-work-affinity-${serial}` });
+  const source = events.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user',
+    data: { text: 'What is 23 × 29?', attemptId: Number(attempt.attemptId), runId: attempt.runId } });
+  events.bindRunAttemptSourceUserEvent(attempt, source.seq);
+  assert.equal(sourceHasNoCompletionWork({ sessionId: session.id, sourceUserSeq: source.seq, attemptId: attempt.attemptId }), false);
+  events.finishRunAttempt(attempt, 'completed');
+});
+
+
+for (const carrier of ['tool', 'resume_execution', 'resume_delivery'] as const)
+  for (const target of ['unused', 'foreign_session'] as const)
+    test(`fresh no-work proof refuses positive but unbound source reference: ${carrier}/${target}`, async () => {
+      const { sourceHasNoCompletionWork } = await import('./host-completion-work.js');
+      const session = events.createSession({ id: `no-work-positive-ref-${++serial}`, kind: 'chat' });
+      const firstAttempt = events.beginRunAttempt(session.id, { runId: `positive-ref-prior-${serial}` });
+      const prior = events.recordRunAttemptUserInput(firstAttempt, { turn: 1, role: 'user', data: {
+        text: 'Previous controlled owner request.', attemptId: firstAttempt.attemptId, runId: firstAttempt.runId } });
+      events.finishRunAttempt(firstAttempt, 'completed');
+      const other = events.createSession({ id: `no-work-positive-foreign-${serial}`, kind: 'chat' });
+      const otherAttempt = events.beginRunAttempt(other.id, { runId: `positive-ref-foreign-${serial}` });
+      const foreign = events.recordRunAttemptUserInput(otherAttempt, { turn: 1, role: 'user', data: {
+        text: 'Different controlled owner request.', attemptId: otherAttempt.attemptId, runId: otherAttempt.runId } });
+      events.finishRunAttempt(otherAttempt, 'completed');
+      const attempt = events.beginRunAttempt(session.id, { runId: `positive-ref-current-${serial}` });
+      const source = events.recordRunAttemptUserInput(attempt, { turn: 2, role: 'user', data: {
+        text: 'What is 23 × 29?', attemptId: attempt.attemptId, runId: attempt.runId } });
+      events.bindRunAttemptSourceUserEvent(attempt, source.seq);
+      const identity = { sessionId: session.id, sourceUserSeq: source.seq, attemptId: attempt.attemptId };
+      assert.equal(sourceHasNoCompletionWork(identity), true, 'real fresh ownership is established first');
+      const invalid = target === 'unused' ? source.seq + 1_000_000 : foreign.seq;
+      assert.ok(Number.isSafeInteger(invalid) && invalid > 0 && invalid !== source.seq);
+      events.appendEvent({ sessionId: session.id, turn: 2, role: 'system',
+        type: carrier === 'tool' ? 'tool_called' : 'run_resumed', data: carrier === 'tool'
+          ? { tool: 'read_file', sourceUserSeq: invalid }
+          : { executionSourceUserSeq: carrier === 'resume_execution' ? invalid : prior.seq,
+              deliverySourceUserSeq: carrier === 'resume_delivery' ? invalid : prior.seq } });
+      assert.equal(sourceHasNoCompletionWork(identity), false,
+        'a positive integer alone is not a same-session accepted source binding');
+      assert.equal(sourceAttemptedCompletionWork(identity), false, 'the existing legacy hint is unchanged');
+      events.finishRunAttempt(attempt, 'completed');
+    });

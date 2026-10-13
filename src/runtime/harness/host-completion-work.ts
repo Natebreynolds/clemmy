@@ -50,6 +50,86 @@ export function sourceAttemptedCompletionWork(input: {
   }
 }
 
+/** Conservative eligibility for a fresh computation over retained history.
+ * One exact snapshot replaces the later attempted-work query only on this
+ * branch. It grants no effect/result authority and never edits that history. */
+export function sourceHasNoCompletionWork(input: {
+  sessionId: string; sourceUserSeq: number; attemptId: string;
+}): boolean {
+  try {
+    const { sessionId, sourceUserSeq, attemptId } = input;
+    if (typeof sessionId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/.test(sessionId)
+      || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0
+      || typeof attemptId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/.test(attemptId)) return false;
+    const row = openEventLog().prepare(`
+      SELECT 1 AS no_work FROM main.run_attempts a JOIN main.events e
+        ON e.session_id = a.session_id AND e.seq = a.source_user_seq
+       WHERE a.session_id = @sessionId AND a.attempt_id = @attemptId
+         AND a.source_user_seq = @sourceUserSeq AND a.status = 'active' AND a.finished_at IS NULL
+         AND e.type = 'user_input_received' AND e.role = 'user' AND json_valid(e.data_json)
+         AND COALESCE(json_extract(e.data_json, '$.synthetic'), 0) = 0
+         AND json_type(e.data_json, '$.attemptId') = 'text'
+         AND json_extract(e.data_json, '$.attemptId') = a.attempt_id
+         AND json_type(e.data_json, '$.runId') IN ('text', 'null')
+         AND json_extract(e.data_json, '$.runId') IS a.run_id
+         AND json_type(e.data_json, '$.approvalId') IS NULL
+         AND json_type(e.data_json, '$.taskContinuation') IS NULL
+         AND json_type(e.data_json, '$.taskMode') IS NULL
+         AND (SELECT COUNT(*) FROM main.run_attempts WHERE session_id = @sessionId
+           AND status = 'active' AND finished_at IS NULL) = 1
+         AND NOT EXISTS (SELECT 1 FROM main.logical_tool_calls
+           WHERE session_id = @sessionId AND source_user_seq = @sourceUserSeq)
+         AND NOT EXISTS (SELECT 1 FROM main.physical_dispatches
+           WHERE session_id = @sessionId AND source_user_seq = @sourceUserSeq)
+         AND NOT EXISTS (SELECT 1 FROM main.accepted_model_batch_admissions
+           WHERE session_id = @sessionId AND source_user_seq = @sourceUserSeq AND call_count > 0)
+         AND NOT EXISTS (SELECT 1 FROM main.events work WHERE work.session_id = @sessionId AND work.type = 'tool_called'
+           AND (NOT json_valid(work.data_json) OR COALESCE(json_type(data_json, '$.sourceUserSeq'), '') != 'integer'
+             OR json_extract(data_json, '$.sourceUserSeq') <= 0
+             OR json_extract(data_json, '$.sourceUserSeq') = @sourceUserSeq
+             OR NOT EXISTS (SELECT 1 FROM main.events accepted
+               WHERE accepted.session_id = work.session_id
+                 AND accepted.seq = json_extract(work.data_json, '$.sourceUserSeq')
+                 AND accepted.type = 'user_input_received' AND accepted.role = 'user'
+                 AND json_valid(accepted.data_json)
+                 AND COALESCE(json_extract(accepted.data_json, '$.synthetic'), 0) = 0)))
+         AND NOT EXISTS (SELECT 1 FROM main.events resumed WHERE resumed.session_id = @sessionId AND resumed.type = 'run_resumed'
+           AND (NOT json_valid(resumed.data_json)
+             OR COALESCE(json_type(data_json, '$.executionSourceUserSeq'), '') != 'integer'
+             OR COALESCE(json_type(data_json, '$.deliverySourceUserSeq'), '') != 'integer'
+             OR json_extract(data_json, '$.executionSourceUserSeq') <= 0
+             OR json_extract(data_json, '$.deliverySourceUserSeq') <= 0
+             OR json_extract(data_json, '$.executionSourceUserSeq') = @sourceUserSeq
+             OR json_extract(data_json, '$.deliverySourceUserSeq') = @sourceUserSeq
+             OR NOT EXISTS (SELECT 1 FROM main.events accepted
+               WHERE accepted.session_id = resumed.session_id
+                 AND accepted.seq = json_extract(resumed.data_json, '$.executionSourceUserSeq')
+                 AND accepted.type = 'user_input_received' AND accepted.role = 'user'
+                 AND json_valid(accepted.data_json)
+                 AND COALESCE(json_extract(accepted.data_json, '$.synthetic'), 0) = 0)
+             OR NOT EXISTS (SELECT 1 FROM main.events accepted
+               WHERE accepted.session_id = resumed.session_id
+                 AND accepted.seq = json_extract(resumed.data_json, '$.deliverySourceUserSeq')
+                 AND accepted.type = 'user_input_received' AND accepted.role = 'user'
+                 AND json_valid(accepted.data_json)
+                 AND COALESCE(json_extract(accepted.data_json, '$.synthetic'), 0) = 0)))
+         AND NOT EXISTS (SELECT 1 FROM main.logical_tool_calls l WHERE l.session_id = @sessionId
+           AND (l.state IS NOT 'settled' OR NOT EXISTS (SELECT 1 FROM main.logical_call_settlements s
+             WHERE s.session_id=l.session_id AND s.source_user_seq=l.source_user_seq
+               AND s.logical_tool_call_id=l.logical_tool_call_id)))
+         AND NOT EXISTS (SELECT 1 FROM main.physical_dispatches p WHERE p.session_id = @sessionId
+           AND (p.state NOT IN ('returned', 'threw') OR p.state IS NULL
+             OR NOT EXISTS (SELECT 1 FROM main.logical_call_settlements s
+               WHERE s.session_id=p.session_id AND s.source_user_seq=p.source_user_seq
+                 AND s.logical_tool_call_id=p.logical_tool_call_id)))
+         AND NOT EXISTS (SELECT 1 FROM main.logical_call_settlements WHERE session_id = @sessionId
+           AND mutating = 1 AND (requires_reconciliation IS NOT 0 OR outcome_kind = 'uncertain_write'))
+         AND NOT EXISTS (SELECT 1 FROM main.pending_approvals WHERE session_id = @sessionId AND status = 'pending')
+    `).get({ sessionId, sourceUserSeq, attemptId }) as { no_work: number } | undefined;
+    return row?.no_work === 1;
+  } catch { return false; } // Unknown ownership/storage keeps the full reviewer.
+}
+
 /** Writes this accepted source attempted, whatever their outcome. A write that
  *  failed or was refused counts: the answer must not claim it happened. */
 export function sourceAttemptedWrites(input: {

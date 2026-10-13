@@ -199,7 +199,7 @@ import { conversationalReviewSkipRecord } from './completion-review-skip.js';
 import { cancelledSuccessorReadReviewEvidence, cancelledSuccessorReadReviewIsAuthentic,
   cancelledSuccessorReadReviewRequired } from './cancelled-successor-retained-read.js';
 import {
-  acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceEvidenceLookup, sourceWritesAtStake,
+  acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceHasNoCompletionWork, sourceEvidenceLookup, sourceWritesAtStake,
   historicalReadCompletionEvidence, historicalReadClosureIsAuthentic,
   sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence, sourceSucceededResultCount,
   earlierTurnsEvidence,
@@ -4631,9 +4631,20 @@ const runHostTurnBody = async (
       objective, ...adoptedSteerNotesForSource(identity).map(note => note.text),
     ]) : null;
     const responseFormatFinding = wholeResponseFormatFinding(responseFormatRequirement, judgedText);
+    let attemptedSourceWork: boolean | undefined;
+    const freshSourceHasNoWork = (): boolean => {
+      const active = harnessRunContextStorage.getStore();
+      if (!hostProduction || planCandidate || resumedHostState || resumedRecoveryState || carriedProgress
+        || openApprovalCard || !active?.runAttemptId || active.sessionId !== identity.sessionId
+        || active.sourceUserSeq !== identity.sourceUserSeq) return false;
+      const noWork = sourceHasNoCompletionWork({ ...identity, attemptId: active.runAttemptId });
+      // The same single read supplies the conservative eligibility below.
+      attemptedSourceWork = !noWork;
+      return noWork;
+    };
     if (
       !explicitMemoryRequired && !memoryRequirementRequired && selfContainedConversation(objective, intent)
-      && businessCalls.length === 0
+      && (businessCalls.length === 0 || freshSourceHasNoWork())
       && settled.count === 0
       && !inheritedReads
       && !inheritedReadReviewRequired
@@ -4656,7 +4667,7 @@ const runHostTurnBody = async (
       optIn: true,
       actionIntent: intent.intent === 'action' || explicitMemoryRequired || memoryRequirementRequired,
       meaningfulToolEvidence: businessCalls.length > 0,
-      sourceWorkAttempted: sourceAttemptedCompletionWork(identity),
+      sourceWorkAttempted: attemptedSourceWork ?? sourceAttemptedCompletionWork(identity),
       settledSourceEffects: settled.count,
       settledEvidenceAvailable: settled.evidenceAvailable,
       multiResultObjective: objectiveMayRequireMultipleResults(objective),

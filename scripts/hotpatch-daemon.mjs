@@ -254,7 +254,7 @@ function repeatReceiptChain(options, context, fileOps) {
   let ancestors = []; let manifest = null;
   if (hasManifest) {
     const value = pinnedRepeatJSON(authorizedAncestorManifest, authorizedAncestorManifestSha256, fileOps, 64 * 1024);
-    if (!value || Object.keys(value).sort().join('|') !== 'receipts|version' || value.version !== 1 || !Array.isArray(value.receipts) || value.receipts.length < 1 || value.receipts.length > 25) guardRefusal('unsupported bounded ancestor manifest');
+    if (!value || Object.keys(value).sort().join('|') !== 'receipts|version' || value.version !== 1 || !Array.isArray(value.receipts) || value.receipts.length < 1 || value.receipts.length > 26) guardRefusal('unsupported bounded ancestor manifest');
     ancestors = value.receipts;
     if (ancestors.some(item => !item || Object.keys(item).sort().join('|') !== 'path|sha256')) guardRefusal('unexpected ancestor receipt pin shape');
     manifest = { path: authorizedAncestorManifest, sha256: authorizedAncestorManifestSha256 };
