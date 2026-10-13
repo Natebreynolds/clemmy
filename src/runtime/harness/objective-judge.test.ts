@@ -732,6 +732,30 @@ test('incomplete read evidence gets one light review with the reviewer\'s own de
   assert.equal(complete.reviewDepth, 'fast');
 });
 
+test('a read-depth review of a turn that wrote keeps the write deadline', async () => {
+  const { READ_REVIEW_TIMEOUT_MS, WRITE_REVIEW_TIMEOUT_MS, reviewAtStakes } = await import('./objective-judge.js');
+  const asked: unknown[] = [];
+  const wrote = await reviewAtStakes('read', async depth => {
+    asked.push(depth);
+    return { verdict: { done: true, reason: 'Every appended line matches its receipt.' }, failure: null };
+  }, { readEvidenceComplete: true, attemptedWrites: 5 });
+  assert.deepEqual(asked, [{ effort: 'medium', timeoutMs: WRITE_REVIEW_TIMEOUT_MS }],
+    'restorable local writes keep the read effort but the reviewer reads five receipts: the write deadline');
+  assert.equal(wrote.reviewDepth, 'fast');
+  const readOnly: unknown[] = [];
+  await reviewAtStakes('read', async depth => {
+    readOnly.push(depth);
+    return { verdict: { done: true, reason: 'Answered from the read.' }, failure: null };
+  }, { readEvidenceComplete: true, attemptedWrites: 0 });
+  assert.deepEqual(readOnly, [{ effort: 'medium', timeoutMs: READ_REVIEW_TIMEOUT_MS }], 'a turn that wrote nothing keeps the read deadline');
+  const inspecting: unknown[] = [];
+  await reviewAtStakes('read', async depth => {
+    inspecting.push(depth);
+    return { verdict: { done: true, reason: 'Inspected.' }, failure: null };
+  }, { readEvidenceComplete: false, attemptedWrites: 2 });
+  assert.deepEqual(inspecting, [{ effort: 'medium' }], 'incomplete receipts still leave the reviewer its own deadline');
+});
+
 test('a bounded reply correction goes to repair before a second review of the unchanged draft', async () => {
   const { READ_REVIEW_TIMEOUT_MS, reviewAtStakes, WRITE_REVIEW_TIMEOUT_MS } = await import('./objective-judge.js');
   for (const repairScope of ['claims', 'reply_format'] as const) {

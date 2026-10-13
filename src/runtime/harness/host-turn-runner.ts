@@ -206,7 +206,7 @@ import { cancelledSuccessorReadReviewEvidence, cancelledSuccessorReadReviewIsAut
   cancelledSuccessorReadReviewRequired } from './cancelled-successor-retained-read.js';
 import {
   acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceHasNoCompletionWork, sourceEvidenceLookup, sourceWritesAtStake,
-  historicalReadCompletionEvidence, historicalReadClosureIsAuthentic,
+  sourceAttemptedWrites, historicalReadCompletionEvidence, historicalReadClosureIsAuthentic,
   sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence, sourceSucceededResultCount,
   earlierTurnsEvidence,
 } from './host-completion-work.js';
@@ -4849,6 +4849,8 @@ const runHostTurnBody = async (
           plan: Boolean(planCandidate),
           attemptedWrites: sourceWritesAtStake(identity),
         }),
+        // Every write it attempted still sets the review's deadline.
+        attemptedWrites: sourceAttemptedWrites(identity),
         verifiedReads: readEvidence.summary,
         verifiedReadResults: readEvidence.results,
         ...(inheritedReads ? { inheritedReadCoverage: inheritedReads.coverage } : {}),

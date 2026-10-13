@@ -754,6 +754,10 @@ export interface SkillExecutionContext {
   /** What the review protects: work that wrote to an app or file, a plan
    *  that runs only after the owner approves it, or a read-only answer. */
   reviewStakes?: ReviewStakes;
+  /** Writes this turn attempted, the restorable local ones included. The
+   *  reviewer reads every one of their receipts, so even a read-depth review
+   *  of a turn that wrote waits the write deadline, not the read one. */
+  attemptedWrites?: number;
 }
 
 /** Select the same options in their original read order, including both
@@ -1978,6 +1982,7 @@ async function runCompletionJudge(
     readEvidenceComplete: assessCompletionEvidenceCoverage({
       objective, results: skillContext.verifiedReadResults,
     }).complete,
+    ...(skillContext.attemptedWrites !== undefined ? { attemptedWrites: skillContext.attemptedWrites } : {}),
   }) : review({});
 }
 
@@ -2010,7 +2015,7 @@ export const READ_REVIEW_TIMEOUT_MS = 30_000;
 export async function reviewAtStakes(
   stakes: ReviewStakes,
   review: (depth: ReviewDepthRequest) => Promise<CompletionJudgeRun>,
-  evidence: { readEvidenceComplete?: boolean; signal?: AbortSignal } = {},
+  evidence: { readEvidenceComplete?: boolean; signal?: AbortSignal; attemptedWrites?: number } = {},
 ): Promise<CompletionJudgeRun> {
   evidence.signal?.throwIfAborted();
   if (stakes === 'write') {
@@ -2023,9 +2028,14 @@ export async function reviewAtStakes(
   // verdict stands; it reads the same evidence with the same lookups. With
   // incomplete receipts it keeps the reviewer's own deadline, since inspecting
   // retained data before accepting a coverage or absence claim takes longer.
+  // A turn whose only writes were restorable local ones is reviewed at this
+  // depth too, but its reviewer still reads every write's receipt: live, a
+  // five-append Continue hit the read deadline and shipped unchecked. The
+  // deadline follows what the turn did; the effort follows what it risked.
   if (stakes === 'read') {
+    const deadline = (evidence.attemptedWrites ?? 0) > 0 ? WRITE_REVIEW_TIMEOUT_MS : READ_REVIEW_TIMEOUT_MS;
     const light = await review({ effort: 'medium',
-      ...(evidence.readEvidenceComplete === false ? {} : { timeoutMs: READ_REVIEW_TIMEOUT_MS }) });
+      ...(evidence.readEvidenceComplete === false ? {} : { timeoutMs: deadline }) });
     evidence.signal?.throwIfAborted();
     return { ...light, reviewDepth: 'fast' };
   }
