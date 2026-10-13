@@ -4,6 +4,10 @@ import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
 import {
+  STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON,
+  STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT,
+} from './terminal-notice.js';
+import {
   parseRetainedWorkCheckpoint,
   RETAINED_WORK_TERMINAL_HEADER,
   type RetainedOutsideChange,
@@ -9892,8 +9896,10 @@ const runHostTurnBody = async (
       assertRecoveryActivationOwned();
       reopenTerminalSteering(terminalCutoverOwner);
     } catch {
-      return blockedOutcome('I could not safely reopen this turn’s final handoff. No further action was started.',
-        'owner_steering_cutover_reopen_unavailable');
+      // App voice, not Clem's: the loop attaches the steering notice by this
+      // reason and the clients draw it as chrome, with the next edge on the
+      // notice. Resumable: no work began, so nothing is lost to a new start.
+      return blockedOutcome(STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT, STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON);
     }
   }
   const reopenForOwnerSteering = (objective: string, draft?: AnswerDraftStep): boolean => {
@@ -12459,6 +12465,9 @@ export function isNarratableHostStop(outcome: RunOutcome): boolean {
   // This truthful owner-format hold deliberately spends no narration/repair
   // model call when optional semantic review was disabled by the owner.
   if (outcome.terminal.reason === 'owner_response_format_unmet' || outcome.terminal.reason === 'owner_response_format_unqualified') return false;
+  // A terminal the loop gives a notice is app chrome: the clients draw the
+  // notice in place of a reply, so a narrated sentence would never be shown.
+  if (outcome.terminal.reason === STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON) return false;
   const text = typeof outcome.finalOutput === 'string' ? outcome.finalOutput.trim() : '';
   if (!text) return false;
   return !HOST_STOP_TEXTS_NOT_NARRATED().some((fixed) => text.startsWith(fixed));

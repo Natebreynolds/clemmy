@@ -94,6 +94,18 @@ function isPermanentChatSendConflict(error: unknown): boolean {
     && (error as { status?: unknown }).status === 409;
 }
 
+/** The line under a mid-turn message that was not delivered, when the failure
+ *  carried none of its own. App voice, and never a claim about the connection:
+ *  a refusal brings the route's plain line and an offline send brings the
+ *  transport's, so this is only for a failure with no words. */
+export const STEER_NOT_DELIVERED_TEXT = 'This message wasn’t added to the running turn.';
+
+/** What the failed row shows: the failure's own line (a refusal's plain line,
+ *  or the transport's offline line), never a guess at the cause. */
+function steerFailureLine(error: unknown): string {
+  return error instanceof Error && error.message.trim() ? error.message : STEER_NOT_DELIVERED_TEXT;
+}
+
 const DELEGATED_ASSISTANT_ID_PREFIX = 'a-delegated-';
 
 function delegatedAssistantMessageId(sourceUserSeq: number, dispatchSeq: number): string {
@@ -394,9 +406,11 @@ export class ChatEngine {
               }
             : entry
         ));
-      } catch {
+      } catch (error) {
+        // The computer may well have answered (a refusal is a 409 with its
+        // own line): the row shows that line, not a connection guess.
         this.messages = this.messages.map((entry) => (
-          entry.id === steerId ? { ...entry, pending: 'failed', steer: 'failed' } : entry
+          entry.id === steerId ? { ...entry, pending: 'failed', steer: 'failed', pendingError: steerFailureLine(error) } : entry
         ));
       }
       this.emit();
@@ -452,7 +466,7 @@ export class ChatEngine {
           ? { ...message, pending: result.steered ? undefined : 'failed', steer: result.steered ? 'delivered' : 'failed' } : message);
       } catch (error) {
         this.messages = this.messages.map(message => message.id === messageId
-          ? { ...message, pending: 'failed', pendingError: error instanceof Error ? error.message : 'Steering was not confirmed.' } : message);
+          ? { ...message, pending: 'failed', pendingError: steerFailureLine(error) } : message);
       }
       this.emit();
       return;

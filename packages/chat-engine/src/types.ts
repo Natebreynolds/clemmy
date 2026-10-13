@@ -380,7 +380,8 @@ export type TerminalNoticeCode =
   | 'codex_sign_in_expired'
   | 'provider_out_of_credit'
   | 'model_stalled'
-  | 'run_failed';
+  | 'run_failed'
+  | 'steering_unavailable';
 
 export interface TerminalNotice {
   code: TerminalNoticeCode;

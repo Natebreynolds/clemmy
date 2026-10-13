@@ -138,6 +138,10 @@ export function terminalNoticeLine(terminal: TerminalFacts | undefined): Termina
       return line(`${model ?? 'The model'} stopped responding`, 'warning', 'try_again');
     case 'run_failed':
       return line('This run stopped on an error', 'danger', 'try_again');
+    case 'steering_unavailable':
+      // The record is the conversation's, so sending again meets the same
+      // block: no "Try again"; the line names the edge that does clear it.
+      return line('This conversation’s steering record couldn’t be read — the message didn’t start. Start a new conversation to continue', 'warning');
   }
 }
 

@@ -18,7 +18,7 @@ const ALL_STATUSES: TerminalFacts['status'][] = ['done', 'needs_input', 'blocked
 const ALL_NOTICES: TerminalNoticeCode[] = [
   'stopped', 'response_format_unmet', 'response_format_unqualified', 'provider_quota', 'card_decision',
   'saved_model_unavailable', 'model_unavailable_on_sign_in', 'no_model_connected', 'codex_sign_in_expired',
-  'provider_out_of_credit', 'model_stalled', 'run_failed',
+  'provider_out_of_credit', 'model_stalled', 'run_failed', 'steering_unavailable',
 ];
 const ALL_OUTSIDE: RetainedOutsideChange[] = ['went_through', 'did_not', 'mixed', 'refused', 'uncertain', 'none'];
 
@@ -78,6 +78,11 @@ test('each notice is an app status line with the action that resolves it', () =>
   assert.equal(line('provider_out_of_credit')?.action, 'add_credit');
   assert.equal(line('model_stalled')?.action, 'try_again');
   assert.equal(line('run_failed')?.action, 'try_again');
+  // A steering record that cannot be read blocks every message in that
+  // conversation: a retry reproduces it, so the line names the edge instead.
+  assert.deepEqual(line('steering_unavailable'),
+    { label: 'This conversation’s steering record couldn’t be read — the message didn’t start. Start a new conversation to continue', tone: 'warning' });
+  assert.equal(line('steering_unavailable')?.action, undefined);
   assert.equal(line('response_format_unmet')?.action, undefined);
   assert.deepEqual(line('provider_quota', { model: 'Vendor V4', providerSaid: 'Weekly limit reached.' }),
     { label: 'Vendor V4 reached its usage limit', tone: 'warning', detail: 'The provider said: Weekly limit reached.', action: 'change_model' });

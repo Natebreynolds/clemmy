@@ -30,7 +30,7 @@ const {
   steerBlockForToolBoundary,
   hasUndeliveredSteerNotes,
   sessionSupportsSteering,
-  closeTerminalSteering, reopenTerminalSteering, isSteerNoteAdmissionError, SteerNoteAdmissionError,
+  closeTerminalSteering, reopenTerminalSteering, isSteerNoteAdmissionError, SteerNoteAdmissionError, STEER_NOTE_ADMISSION_MESSAGE,
 } = await import('./steer-notes.js');
 
 after(() => { rmSync(TMP_HOME, { recursive: true, force: true }); });
@@ -353,6 +353,21 @@ test('terminal steering: an unproven serialized reopen and a note behind a close
   }
 });
 
+test('a refused enqueue is a plain app-voice line for its code: no first person, no code in the line', () => {
+  const codes = ['STEER_NOTE_CUTOVER', 'STEER_NOTE_OWNER_CHANGED', 'STEER_NOTE_UNAVAILABLE'] as const;
+  assert.deepEqual(Object.keys(STEER_NOTE_ADMISSION_MESSAGE).sort(), [...codes].sort());
+  for (const code of codes) {
+    const error = new SteerNoteAdmissionError(code);
+    assert.equal(error.code, code);
+    assert.equal(error.message, STEER_NOTE_ADMISSION_MESSAGE[code]);
+    assert.match(error.message, /the message was not queued\.$/);
+    assert.doesNotMatch(error.message, /\b(?:I|I’m|I'm|I’ll|I'll|I’ve|I've|me|my)\b/, error.message);
+    assert.ok(!error.message.includes('STEER_NOTE'), error.message);
+  }
+  assert.equal(new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE').message,
+    'The running turn could not be verified; the message was not queued.');
+});
+
 test('terminal steering: hostile diagnostic shapes never run hooks or impersonate a typed refusal', () => {
   const f = acceptedCutoverOwner();
   let hooks = 0;
@@ -363,6 +378,7 @@ test('terminal steering: hostile diagnostic shapes never run hooks or impersonat
   assert.equal(hooks, 0);
   assert.equal(isSteerNoteAdmissionError({ code: 'STEER_NOTE_CUTOVER' }), false);
   assert.equal(new SteerNoteAdmissionError('private payload' as never).code, 'STEER_NOTE_UNAVAILABLE');
+  assert.equal(new SteerNoteAdmissionError('constructor' as never).code, 'STEER_NOTE_UNAVAILABLE');
   const proto = JSON.parse('{"__proto__":{"sessionId":"borrowed","sourceUserSeq":1,"attemptId":"borrowed"}}');
   refused(() => closeTerminalSteering(proto, hash('objective'), hash('reply')), 'STEER_NOTE_UNAVAILABLE');
   closeTerminalSteering(f.owner, hash('objective'), hash('reply'));

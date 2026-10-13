@@ -30,15 +30,39 @@ import { readConnectionExecutionDelivery } from './connection-execution-activati
 
 export type SteerNoteAdmissionErrorCode = 'STEER_NOTE_CUTOVER' | 'STEER_NOTE_OWNER_CHANGED' | 'STEER_NOTE_UNAVAILABLE';
 
+/** The plain line each refusal shows. App voice, no first person: the chat
+ * routes return it as the error field beside the code, and the clients show
+ * it under the message that was not queued. */
+export const STEER_NOTE_ADMISSION_MESSAGE: Readonly<Record<SteerNoteAdmissionErrorCode, string>> = {
+  STEER_NOTE_CUTOVER: 'This turn is finishing; the message was not queued.',
+  STEER_NOTE_OWNER_CHANGED: 'The running turn changed; the message was not queued.',
+  STEER_NOTE_UNAVAILABLE: 'The running turn could not be verified; the message was not queued.',
+};
+
+/** The refusals a chat route makes on its own for a message the client
+ * promised must never become a competing turn (steerOnly), in the same shape
+ * as an admission refusal: the plain line in `error`, the machine code beside
+ * it. App voice, no first person, no code in the line. The clients branch on
+ * the code and show the line. */
+export const CHAT_STEER_REFUSAL = {
+  /** The run the message meant to join has already ended. */
+  run_ended: { code: 'RUN_NOT_ACTIVE', error: 'The run just finished; send this again as a new message.' },
+  /** The route could not tell whether the run is still live. */
+  run_unverified: { code: 'RUN_NOT_ACTIVE', error: 'The running turn could not be checked; send this again as a new message.' },
+  /** A mode change cannot ride a message into a turn already underway. */
+  task_mode_on_active_turn: {
+    code: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN',
+    error: 'Finish or stop the running turn before changing its mode.',
+  },
+} as const satisfies Record<string, { code: string; error: string }>;
+
 /** A refused enqueue is never permission to start a competing turn. */
 export class SteerNoteAdmissionError extends Error {
   readonly code: SteerNoteAdmissionErrorCode;
   constructor(code: SteerNoteAdmissionErrorCode) {
-    const fixed = typeof code === 'string' && ['STEER_NOTE_CUTOVER', 'STEER_NOTE_OWNER_CHANGED', 'STEER_NOTE_UNAVAILABLE'].includes(code)
+    const fixed: SteerNoteAdmissionErrorCode = typeof code === 'string' && Object.hasOwn(STEER_NOTE_ADMISSION_MESSAGE, code)
       ? code : 'STEER_NOTE_UNAVAILABLE';
-    super(fixed === 'STEER_NOTE_CUTOVER' ? 'This turn is finishing; the message was not queued.'
-      : fixed === 'STEER_NOTE_OWNER_CHANGED' ? 'The running turn changed; the message was not queued.'
-      : 'I could not verify the running turn; the message was not queued.');
+    super(STEER_NOTE_ADMISSION_MESSAGE[fixed]);
     this.code = fixed;
     this.name = 'SteerNoteAdmissionError';
   }

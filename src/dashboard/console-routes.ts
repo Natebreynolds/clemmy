@@ -379,7 +379,7 @@ import {
   deriveTaskTitle,
 } from '../execution/background-tasks.js';
 import { classifyBackgroundInputReply } from '../execution/background-input-reply.js';
-import { isSteerNoteAdmissionError } from '../runtime/harness/steer-notes.js';
+import { CHAT_STEER_REFUSAL, isSteerNoteAdmissionError } from '../runtime/harness/steer-notes.js';
 import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
@@ -17167,7 +17167,7 @@ export function registerConsoleRoutes(
     const body = req.body ?? {};
     let taskMode: TaskMode | undefined;
     try { taskMode = parseTaskMode(body.taskMode); } catch { res.status(400).json({ error: 'INVALID_TASK_MODE' }); return; }
-    if (taskMode && body.steerOnly === true) { res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' }); return; }
+    if (taskMode && body.steerOnly === true) { res.status(409).json({ ...CHAT_STEER_REFUSAL.task_mode_on_active_turn }); return; }
     let explicitTaskMode = taskMode !== undefined && taskMode.kind !== 'normal';
     const input = typeof body.input === 'string' ? body.input.trim() : '';
     const attachmentIds: string[] = Array.isArray(body.attachments)
@@ -17551,7 +17551,7 @@ export function registerConsoleRoutes(
           }
           if (connectionContext) { res.status(409).json({ error: 'This turn is still finishing. Check the connection again shortly.' }); return; }
           if (explicitTaskMode) {
-            res.status(409).json({ error: 'Finish or stop the active turn before changing its mode.', code: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' });
+            res.status(409).json({ ...CHAT_STEER_REFUSAL.task_mode_on_active_turn, sessionId });
             return;
           }
           const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
@@ -17577,7 +17577,7 @@ export function registerConsoleRoutes(
         // become a competing turn. If the run is no longer live, refuse
         // instead of accepting — the client re-sends as a normal turn.
         if ((body as Record<string, unknown>).steerOnly === true) {
-          res.status(409).json({ error: 'the run just finished — send again as a normal message', code: 'RUN_NOT_ACTIVE', sessionId });
+          res.status(409).json({ ...CHAT_STEER_REFUSAL.run_ended, sessionId });
           return;
         }
       } catch (steerErr) {
@@ -17586,7 +17586,7 @@ export function registerConsoleRoutes(
           return;
         }
         if ((body as Record<string, unknown>).steerOnly === true) {
-          res.status(409).json({ error: 'steering unavailable — send again as a normal message', code: 'RUN_NOT_ACTIVE', sessionId });
+          res.status(409).json({ ...CHAT_STEER_REFUSAL.run_unverified, sessionId });
           return;
         }
         void steerErr; /* any failure falls through to the normal turn path */

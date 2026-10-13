@@ -22,7 +22,7 @@ import { createMobileChatAdmission, prepareAndDispatchMobileChat } from './mobil
 import { registerMobileMemoryWorkRoutes } from './mobile-memory-work-routes.js';
 import { registerMobileNativeVoiceAuth } from './mobile-native-voice-auth.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
-import { isSteerNoteAdmissionError } from '../runtime/harness/steer-notes.js';
+import { CHAT_STEER_REFUSAL, isSteerNoteAdmissionError } from '../runtime/harness/steer-notes.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { BrainSelectionError, CODEX_BRAIN_SLOTS, codexBrainSlotUpdates, brainSelectionReceipt, type CodexBrainSlot } from '../runtime/harness/brain-selection.js';
 import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
@@ -4276,7 +4276,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       || (taskMode && taskMode.kind !== 'normal'))) {
       res.status(409).json({ error: 'VOICE_CONTROL_REQUIRES_CHAT' }); return;
     }
-    if (taskMode && req.body?.steerOnly === true) { res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' }); return; }
+    if (taskMode && req.body?.steerOnly === true) { res.status(409).json({ ...CHAT_STEER_REFUSAL.task_mode_on_active_turn }); return; }
     const ctx = req.mobileSession!;
     const typedMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
     const voice = req.body?.voice === true;
@@ -4605,7 +4605,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           if (leaseLive) {
             if (connectionContext) { res.status(409).json({ error: 'This turn is still finishing. Check the connection again shortly.' }); return; }
             if (taskMode && taskMode.kind !== 'normal') {
-              res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' });
+              res.status(409).json({ ...CHAT_STEER_REFUSAL.task_mode_on_active_turn, sessionId: proposedSessionId });
               return;
             }
             const expectedAttemptId = latestAttempt!.attemptId;
@@ -4625,24 +4625,24 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           }
           // steerOnly is the client's promise that this text must never become
           // a competing turn. If the run just ended, refuse so the phone can
-          // re-send it deliberately as a normal message.
+          // re-send it deliberately as a normal message. The console shape:
+          // the plain line the phone shows, the machine code beside it.
           if (req.body?.steerOnly === true) {
-            res.status(409).json({ error: 'RUN_NOT_ACTIVE' });
+            res.status(409).json({ ...CHAT_STEER_REFUSAL.run_ended, sessionId: proposedSessionId });
             return;
           }
         } catch (steerErr) {
           if (isSteerNoteAdmissionError(steerErr)) {
-            res.status(409).json({
-              error: steerErr.code,
-              message: 'Your message wasn’t added to the running turn. Send it again as a new message.',
-            });
+            // The console shape: the plain line in `error` (what the phone
+            // shows under the message), the machine code beside it.
+            res.status(409).json({ error: steerErr.message, code: steerErr.code, sessionId: proposedSessionId });
             return;
           }
           if (req.body?.requireIdle === true) {
             res.status(503).json({ error: 'VOICE_IDLE_CHECK_UNAVAILABLE' }); return;
           }
           if (req.body?.steerOnly === true) {
-            res.status(409).json({ error: 'RUN_NOT_ACTIVE' });
+            res.status(409).json({ ...CHAT_STEER_REFUSAL.run_unverified, sessionId: proposedSessionId });
             return;
           }
           void steerErr; /* any failure falls through to the normal turn path */
