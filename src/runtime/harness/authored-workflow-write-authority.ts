@@ -857,10 +857,12 @@ async function reviewAuthoredWriteConstraints(input: {
       observations: { summary: evidence.summary, complete: evidence.available, evidence: evidence.evidence },
       stakes,
     });
-    if (result.verdict === 'uncertain' && !result.checkerFailure) {
+    if (result.verdict === 'uncertain' && !result.checkerFailure && stakes === 'ordinary') {
       // The compact view names each retained result in a line; a reviewer
-      // that cannot see a record cannot establish its absence. Ask once more
-      // with the whole retained evidence before the doubt counts as a refusal.
+      // that cannot see a record cannot establish its absence. A recoverable
+      // write reviewed at measured depth is asked once more with the whole
+      // retained evidence before the doubt counts as a refusal. A high-stakes
+      // write (a send) gets its one review at full stakes; its doubt holds.
       const full = readWorkflowTargetEvidence(input.reopened.receipt.workflowRunId, {
         compactResults: false,
         consumerStepId: input.reopened.receipt.stepId,
