@@ -21,7 +21,10 @@
  *      round 1 carried stays reachable that round, under the desk owner's
  *      no-signal rule (NO_TARGET_STARTS_LEAN in agents/turn-desk.ts);
  *   f  the calendar read again, after the same request already ran once in
- *      another conversation, so remembered runs and proven operations exist.
+ *      another conversation, so remembered runs and proven operations exist;
+ *   g  a local read of a file that is not there: the absence is the read's
+ *      answer, settled as a verified read with complete coverage, so the turn
+ *      is one read and one answer with no repair stage.
  * Jev arms: off with no key; key present but the System One wire hangs until
  * the caller's timeout; key present but it answers HTTP 500; scripted answers.
  *
@@ -68,6 +71,7 @@ const SCENARIOS: readonly ScenarioId[] = [
   'd_calendar_read',
   'e_no_signal_control',
   'f_calendar_read_warm',
+  'g_local_read_absent',
 ];
 const CONCURRENCY = 4;
 const CASE_TIMEOUT_MS = 180_000;

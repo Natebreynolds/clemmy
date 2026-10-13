@@ -22,7 +22,17 @@ export type ScenarioId =
   | 'c_provider_carrier_read'
   | 'd_calendar_read'
   | 'e_no_signal_control'
-  | 'f_calendar_read_warm';
+  | 'f_calendar_read_warm'
+  | 'g_local_read_absent';
+
+/** The local file scenario g asks for, under the case's own home: its folder
+ *  exists, the file does not. Read at call time, so the home is the case's. */
+export const ABSENT_NOTES_RELATIVE_PATH = 'notes/absent.md';
+export function absentNotesPath(): string {
+  const home = process.env.CLEMENTINE_HOME;
+  if (!home) throw new Error('scenario g needs the case home');
+  return `${home}/${ABSENT_NOTES_RELATIVE_PATH}`;
+}
 
 // ---------------------------------------------------------------------------
 // Fixture data
@@ -534,6 +544,21 @@ export function scenarioScripts(): Record<ScenarioId, ScenarioScript> {
       evidence: [],
       steps: [],
       answer: () => 'Which thing do you mean? I do not see an earlier request in this conversation.',
+    },
+    g_local_read_absent: {
+      id: 'g_local_read_absent',
+      // The prompt names the file by its relative path so the round-1 surface
+      // is byte-identical across arms; the call itself uses the case's home.
+      prompt: `What does my notes file (${ABSENT_NOTES_RELATIVE_PATH} in my Clementine home) say?`,
+      evidence: [],
+      steps: [{
+        tool: 'read_file',
+        need: 'read a local file',
+        args: () => ({ path: absentNotesPath(), max_chars: null }),
+        // The absence is the read's answer; the oracle reads it like any content.
+        done: (view) => view.outputText.includes('No file at '),
+      }],
+      answer: () => 'There is no notes file at notes/absent.md: the notes folder is there, but that file is not in it.',
     },
   };
 }

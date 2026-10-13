@@ -25,6 +25,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 import { mock } from 'node:test';
 import {
+  absentNotesPath,
   CALENDAR_ACCOUNT,
   CALENDAR_INPUT_SCHEMA,
   CALENDAR_OPERATION,
@@ -99,6 +100,8 @@ process.env.CLEMMY_JEV = arm === 'jev_off' ? 'off' : 'on';
 delete process.env.TYPESAFE_API_KEY;
 
 mkdirSync(path.join(HOME, 'state'), { recursive: true });
+// Scenario g reads a file that is not there, inside a folder that is.
+mkdirSync(path.dirname(absentNotesPath()), { recursive: true });
 writeFileSync(path.join(HOME, 'state', 'machine-id'), 'machine-lean-rounds\n', 'utf8');
 writeFileSync(path.join(HOME, 'state', 'auth.json'), JSON.stringify({
   source: 'native',
@@ -509,6 +512,27 @@ if (scenario === 'd_calendar_read' || scenario === 'f_calendar_read_warm') {
 }
 if (scenario === 'a_saved_work_lookup' || scenario === 'b_heartbeat_edit' || scenario === 'e_no_signal_control') {
   assert.deepEqual(providerCalls, [], 'no provider crossing');
+}
+if (scenario === 'g_local_read_absent') {
+  // A file that is not there is the read's answer, not an argument error:
+  // the read settles as a verified read, the completion review sees complete
+  // coverage, and the turn ends in its two rounds with no repair stage (the
+  // rounds ratchet in the baseline holds that line).
+  assert.deepEqual(providerCalls, [], 'no provider crossing');
+  const { sourceSettledReadEvidence } = await import('../runtime/harness/host-completion-work.js');
+  const { assessCompletionEvidenceCoverage } = await import('../runtime/harness/objective-judge.js');
+  const evidence = sourceSettledReadEvidence({ sessionId: measured.sessionId, sourceUserSeq: measured.sourceUserSeq });
+  const reads = evidence.results.filter((row) => row.toolName === 'read_file');
+  assert.equal(reads.length, 1, `one local read settled: ${JSON.stringify(evidence.results)}`);
+  assert.equal(reads[0]!.outcome, 'succeeded', 'the absence settles as a completed read');
+  assert.equal(reads[0]!.status, 'verified');
+  assert.equal(assessCompletionEvidenceCoverage({ objective: script.prompt, results: evidence.results }).complete, true,
+    'an absent target keeps completion coverage complete');
+  for (const event of eventlog.listEvents(measured.sessionId, { types: ['goal_alignment_judged'] })) {
+    const jevAttempt = (event.data as { jevAttempt?: { coverageComplete?: boolean } }).jevAttempt;
+    if (jevAttempt) assert.equal(jevAttempt.coverageComplete, true, 'the review saw complete coverage');
+  }
+  assert.ok(reply.includes('no notes file'), `the reply carries the absence: ${reply}`);
 }
 
 const metrics: CaseMetrics = {
