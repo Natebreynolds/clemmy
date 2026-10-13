@@ -71,7 +71,23 @@ interface TerminalSteeringMarker {
 }
 
 const CUTOVER_METADATA_KEY = '__host_terminal_steering_cutover';
+/** Where the marker's own event sits, so reads seek the primary key instead
+ * of scanning every guardrail row of the session. Convenience only: a missing
+ * or stale slot falls back to the scan, and the marker slot stays the authority. */
+const CUTOVER_SEQ_METADATA_KEY = '__host_terminal_steering_cutover_seq';
 const CUTOVER_EVENT_KIND = 'host_terminal_steering_cutover';
+
+interface TerminalMarkerSeqSlot {
+  nonce: string;
+  seq: number;
+  previousSeq?: number;
+}
+
+interface TerminalMarkerState {
+  marker: TerminalSteeringMarker;
+  seq: number;
+  previousSeq?: number;
+}
 const safeId = (value: unknown): value is string => typeof value === 'string'
   && value.length > 0 && value.length <= 240 && /^[A-Za-z0-9:._/-]+$/.test(value);
 const safeRunId = (value: unknown): value is string | null => value === null || safeId(value);
@@ -149,8 +165,24 @@ function parsedTerminalMarker(raw: unknown): TerminalSteeringMarker {
   return marker as unknown as TerminalSteeringMarker;
 }
 
-function terminalMarkerEvent(sessionId: string, nonce: string): { seq: number; marker: TerminalSteeringMarker } {
-  const events = openEventLog().prepare(`SELECT seq, data_json FROM events WHERE session_id = ? AND type = 'guardrail_tripped' AND role = 'system'
+function parsedSeqSlot(raw: unknown): TerminalMarkerSeqSlot | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const slot = raw as Record<string, unknown>;
+  if (!safeId(slot.nonce) || !Number.isSafeInteger(slot.seq) || Number(slot.seq) <= 0) return undefined;
+  if (slot.previousSeq !== undefined && (!Number.isSafeInteger(slot.previousSeq) || Number(slot.previousSeq) <= 0)) return undefined;
+  return { nonce: slot.nonce, seq: Number(slot.seq),
+    ...(slot.previousSeq !== undefined ? { previousSeq: Number(slot.previousSeq) } : {}) };
+}
+
+function terminalMarkerEvent(sessionId: string, nonce: string, seqHint?: number): { seq: number; marker: TerminalSteeringMarker } {
+  const db = openEventLog();
+  if (seqHint !== undefined) {
+    const row = db.prepare(`SELECT seq, data_json FROM events WHERE seq = ? AND session_id = ? AND type = 'guardrail_tripped' AND role = 'system'
+      AND json_valid(data_json) AND json_extract(data_json, '$.kind') = ? AND json_extract(data_json, '$.marker.nonce') = ?`)
+      .get(seqHint, sessionId, CUTOVER_EVENT_KIND, nonce) as { seq: number; data_json: string } | undefined;
+    if (row) return { seq: row.seq, marker: parsedTerminalMarker(JSON.parse(row.data_json).marker) };
+  }
+  const events = db.prepare(`SELECT seq, data_json FROM events WHERE session_id = ? AND type = 'guardrail_tripped' AND role = 'system'
     AND json_valid(data_json) AND json_extract(data_json, '$.kind') = ?
     AND json_extract(data_json, '$.marker.nonce') = ? LIMIT 2`)
     .all(sessionId, CUTOVER_EVENT_KIND, nonce) as Array<{ seq: number; data_json: string }>;
@@ -158,56 +190,83 @@ function terminalMarkerEvent(sessionId: string, nonce: string): { seq: number; m
   return { seq: events[0]!.seq, marker: parsedTerminalMarker(JSON.parse(events[0]!.data_json).marker) };
 }
 
-function readTerminalMarker(sessionId: string): TerminalSteeringMarker | undefined {
+function readTerminalMarkerState(sessionId: string): TerminalMarkerState | undefined {
   const db = openEventLog();
-  const row = db.prepare(`SELECT metadata_json FROM sessions WHERE id = ?`).get(sessionId) as { metadata_json: string | null } | undefined;
+  // Only the two slots are read; the rest of the metadata (the conversation
+  // snapshot among it) never leaves SQLite.
+  const row = db.prepare(`SELECT json_type(metadata_json) AS shape,
+      json_type(metadata_json, ?) AS marker_type, json_extract(metadata_json, ?) AS marker,
+      json_type(metadata_json, ?) AS slot_type, json_extract(metadata_json, ?) AS slot
+    FROM sessions WHERE id = ?`)
+    .get(`$.${CUTOVER_METADATA_KEY}`, `$.${CUTOVER_METADATA_KEY}`, `$.${CUTOVER_SEQ_METADATA_KEY}`, `$.${CUTOVER_SEQ_METADATA_KEY}`, sessionId) as {
+      shape: string | null; marker_type: string | null; marker: unknown; slot_type: string | null; slot: unknown;
+    } | undefined;
   if (!row) throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
-  const metadata = row.metadata_json ? JSON.parse(row.metadata_json) : {};
-  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
-  const raw = metadata[CUTOVER_METADATA_KEY];
-  const latest = db.prepare(`SELECT seq, data_json FROM events WHERE session_id = ? AND type = 'guardrail_tripped' AND role = 'system'
-    AND json_valid(data_json) AND json_extract(data_json, '$.kind') = ? ORDER BY seq DESC LIMIT 1`)
-    .get(sessionId, CUTOVER_EVENT_KIND) as { seq: number; data_json: string } | undefined;
+  if (row.shape !== null && row.shape !== 'object') throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  const raw: unknown = row.marker_type === null ? undefined
+    : row.marker_type === 'object' && typeof row.marker === 'string' ? JSON.parse(row.marker) : row.marker;
   let marker: TerminalSteeringMarker;
+  let recorded: { seq: number; marker: TerminalSteeringMarker };
   if (raw === undefined) {
     // Losing a convenience metadata slot cannot erase a durable refusal.
     // Reconstruct only the negative closed boundary, never an open capability.
+    const latest = db.prepare(`SELECT seq, data_json FROM events WHERE session_id = ? AND type = 'guardrail_tripped' AND role = 'system'
+      AND json_valid(data_json) AND json_extract(data_json, '$.kind') = ? ORDER BY seq DESC LIMIT 1`)
+      .get(sessionId, CUTOVER_EVENT_KIND) as { seq: number; data_json: string } | undefined;
     if (!latest) return undefined;
     const retained = parsedTerminalMarker(JSON.parse(latest.data_json).marker);
     marker = retained.state === 'closed' ? retained : terminalMarkerEvent(sessionId, retained.previousNonce!).marker;
     if (marker.state !== 'closed') throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
-  } else marker = parsedTerminalMarker(raw);
-  const recorded = terminalMarkerEvent(sessionId, marker.nonce);
-  if (JSON.stringify(recorded.marker) !== JSON.stringify(marker)
-    || (raw !== undefined && recorded.seq !== latest?.seq)) {
+    recorded = terminalMarkerEvent(sessionId, marker.nonce);
+    if (JSON.stringify(recorded.marker) !== JSON.stringify(marker)) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+    return { marker, seq: recorded.seq };
+  }
+  marker = parsedTerminalMarker(raw);
+  const slot = row.slot_type === 'object' && typeof row.slot === 'string' ? parsedSeqSlot(JSON.parse(row.slot)) : undefined;
+  const hint = slot?.nonce === marker.nonce ? slot : undefined;
+  recorded = terminalMarkerEvent(sessionId, marker.nonce, hint?.seq);
+  if (JSON.stringify(recorded.marker) !== JSON.stringify(marker)) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  // The slot must still name the latest cutover event. An index range from
+  // the recorded row forward is enough; the earlier rows are not revisited.
+  const later = db.prepare(`SELECT 1 FROM events WHERE session_id = ? AND type = 'guardrail_tripped' AND seq > ? AND role = 'system'
+    AND json_valid(data_json) AND json_extract(data_json, '$.kind') = ? LIMIT 1`)
+    .get(sessionId, recorded.seq, CUTOVER_EVENT_KIND);
+  if (later) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  if (marker.state !== 'open') return { marker, seq: recorded.seq };
+  // A serialized open bit cannot erase an earlier fence. It must retain
+  // the exact closed predecessor and its revoked physical generation.
+  const previous = terminalMarkerEvent(sessionId, marker.previousNonce!, hint?.previousSeq);
+  if (previous.marker.state !== 'closed' || previous.seq >= recorded.seq
+    || ['sourceUserSeq', 'attemptId', 'runId', 'objectiveDigest', 'candidateDigest']
+      .some(key => previous.marker[key as keyof TerminalSteeringMarker] !== marker[key as keyof TerminalSteeringMarker])
+    || (previous.marker.scopeId === marker.scopeId && previous.marker.leaseId === marker.leaseId)) {
     throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
   }
-  if (marker.state === 'open') {
-    // A serialized open bit cannot erase an earlier fence. It must retain
-    // the exact closed predecessor and its revoked physical generation.
-    const previous = terminalMarkerEvent(sessionId, marker.previousNonce!);
-    if (previous.marker.state !== 'closed' || previous.seq >= recorded.seq
-      || ['sourceUserSeq', 'attemptId', 'runId', 'objectiveDigest', 'candidateDigest']
-        .some(key => previous.marker[key as keyof TerminalSteeringMarker] !== marker[key as keyof TerminalSteeringMarker])
-      || (previous.marker.scopeId === marker.scopeId && previous.marker.leaseId === marker.leaseId)) {
-      throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
-    }
-    const oldLease = db.prepare(`SELECT revoked_at FROM run_dispatch_leases
-      WHERE session_id = ? AND scope_id = ? AND lease_id = ? AND run_attempt_id = ?`)
-      .get(sessionId, previous.marker.scopeId, previous.marker.leaseId, marker.attemptId) as { revoked_at: string | null } | undefined;
-    if (!oldLease?.revoked_at) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
-  }
-  return marker;
+  const oldLease = db.prepare(`SELECT revoked_at FROM run_dispatch_leases
+    WHERE session_id = ? AND scope_id = ? AND lease_id = ? AND run_attempt_id = ?`)
+    .get(sessionId, previous.marker.scopeId, previous.marker.leaseId, marker.attemptId) as { revoked_at: string | null } | undefined;
+  if (!oldLease?.revoked_at) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  return { marker, seq: recorded.seq, previousSeq: previous.seq };
 }
 
-function writeTerminalMarker(sessionId: string, marker: TerminalSteeringMarker): void {
+function readTerminalMarker(sessionId: string): TerminalSteeringMarker | undefined {
+  return readTerminalMarkerState(sessionId)?.marker;
+}
+
+function writeTerminalMarker(sessionId: string, marker: TerminalSteeringMarker, previousSeq?: number): void {
+  const db = openEventLog();
   // Publish the negative slot before appendEvent's synchronous observers run.
   // Both writes commit together; re-entrant enqueues cannot slip between them.
-  const changed = openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(COALESCE(metadata_json, '{}'), ?, json(?))
+  // The sequence slot is cleared here and filled once the event has its
+  // sequence, so an observer inside the append reads this marker by scan.
+  const changed = db.prepare(`UPDATE sessions SET metadata_json = json_remove(json_set(COALESCE(metadata_json, '{}'), ?, json(?)), ?)
     WHERE id = ? AND (metadata_json IS NULL OR json_valid(metadata_json))`)
-    .run(`$.${CUTOVER_METADATA_KEY}`, JSON.stringify(marker), sessionId);
+    .run(`$.${CUTOVER_METADATA_KEY}`, JSON.stringify(marker), `$.${CUTOVER_SEQ_METADATA_KEY}`, sessionId);
   if (changed.changes !== 1) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
-  appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: CUTOVER_EVENT_KIND, marker } });
+  const row = appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: CUTOVER_EVENT_KIND, marker } });
+  const slot: TerminalMarkerSeqSlot = { nonce: marker.nonce, seq: row.seq, ...(previousSeq !== undefined ? { previousSeq } : {}) };
+  db.prepare(`UPDATE sessions SET metadata_json = json_set(metadata_json, ?, json(?)) WHERE id = ? AND json_valid(metadata_json)`)
+    .run(`$.${CUTOVER_SEQ_METADATA_KEY}`, JSON.stringify(slot), sessionId);
 }
 
 function hasPublishedTerminal(sessionId: string, attemptId: string, sourceUserSeq: number): boolean {
@@ -259,8 +318,9 @@ export function reopenTerminalSteering(input: TerminalSteeringOwner): void {
   try {
     const owner = snapshotTerminalOwner(input);
     openEventLog().transaction(() => {
-      const prior = readTerminalMarker(owner.sessionId);
-      if (!prior || prior.attemptId !== owner.attemptId) return;
+      const priorState = readTerminalMarkerState(owner.sessionId);
+      const prior = priorState?.marker;
+      if (!priorState || !prior || prior.attemptId !== owner.attemptId) return;
       const active = currentTerminalOwner(owner);
       if (prior.sourceUserSeq !== owner.sourceUserSeq || prior.runId !== active.runId) throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
       if (hasPublishedTerminal(owner.sessionId, owner.attemptId, owner.sourceUserSeq)) throw new SteerNoteAdmissionError('STEER_NOTE_CUTOVER');
@@ -272,7 +332,8 @@ export function reopenTerminalSteering(input: TerminalSteeringOwner): void {
         throw new SteerNoteAdmissionError('STEER_NOTE_CUTOVER');
       }
       writeTerminalMarker(owner.sessionId, { ...prior, state: 'open', nonce: randomUUID(), previousNonce: prior.state === 'closed' ? prior.nonce : prior.previousNonce,
-        scopeId: owner.lease.scopeId, leaseId: owner.lease.leaseId });
+        scopeId: owner.lease.scopeId, leaseId: owner.lease.leaseId },
+      prior.state === 'closed' ? priorState.seq : priorState.previousSeq);
     }).immediate();
   } catch (error) {
     if (isSteerNoteAdmissionError(error)) throw error;
