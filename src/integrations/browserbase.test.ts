@@ -537,3 +537,15 @@ test('a key the credential store cannot read back or save is explained in plain 
   assert.match(browserbaseErrorText('credential_save_failed'), /could not be saved in this computer's credential store/);
   assert.doesNotMatch(browserbaseErrorText('credential_unavailable'), /\(credential_unavailable\)/, 'a code in parentheses is not an explanation');
 });
+
+test('a provider limit is explained by its HTTP status: 402 is the plan, 429 is concurrency, and without a status both stay possible', async () => {
+  // Live 2026-10-13: every start since 10-09 was a 402 (payment required),
+  // read as "plan or concurrency limit", and the owner looked for a stuck browser.
+  const { browserbaseErrorText } = await import('./browserbase.js');
+  assert.match(browserbaseErrorText('provider_limit', 402), /plan has no browser time left or needs payment/);
+  assert.match(browserbaseErrorText('provider_limit', 402), /no browser was started/);
+  assert.doesNotMatch(browserbaseErrorText('provider_limit', 402), /concurrency/);
+  assert.match(browserbaseErrorText('provider_limit', 429), /another browser on this account already holds the concurrency slot/);
+  assert.match(browserbaseErrorText('provider_limit'), /plan or concurrency limit/);
+  assert.match(browserbaseErrorText('provider_limit', 500), /plan or concurrency limit/);
+});

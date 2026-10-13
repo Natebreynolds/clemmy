@@ -79,7 +79,7 @@ export async function executeCloudBrowserTool(name: CloudBrowserOperationName, r
         // The browser started either way; the navigation's own outcome is reported, not hidden.
         const failure = error instanceof BrowserbaseServiceError ? error : null;
         return { ...handles, navigated: { target_id: page.targetId, ok: false, effect: failure?.effect ?? 'uncertain',
-          error: failure && failure.effect === 'none' ? browserbaseErrorText(failure.code) : 'The navigation did not settle. Check the page with cloud_browser_tabs before trying again.' } };
+          error: failure && failure.effect === 'none' ? browserbaseErrorText(failure.code, failure.httpStatus) : 'The navigation did not settle. Check the page with cloud_browser_tabs before trying again.' } };
       }
     }
     if (name === 'cloud_browser_status') return { resource: resourceForTool(await service.get(String(args.resource_id), conversationId)) };
@@ -94,7 +94,7 @@ export async function executeCloudBrowserTool(name: CloudBrowserOperationName, r
     // No effect is not proof that provider I/O never began. Preserve the same
     // nominal recovery cause on both MCP and direct reviewed-storage lanes.
     if (error instanceof BrowserbaseServiceError) {
-      if (error.effect === 'none') throw new LocalNonWriteError(browserbaseErrorText(error.code), error.code, browserFailureClassification(error));
+      if (error.effect === 'none') throw new LocalNonWriteError(browserbaseErrorText(error.code, error.httpStatus), error.code, browserFailureClassification(error));
       throw new LocalExecutionFailureError('Cloud browser operation did not settle. Inspect its status; do not repeat a possible write.', 'uncertain');
     }
     throw error;

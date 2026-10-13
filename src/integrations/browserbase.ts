@@ -60,8 +60,21 @@ const ERROR_TEXT: Record<string, string> = {
   configuration_missing: "Browserbase isn't set up. Add the project and API key in Clem's Browserbase connection.",
   provider_refused: 'Browserbase refused the request, so nothing was started.',
 };
-/** What the owner and the model read for a refusal that changed nothing. */
-export function browserbaseErrorText(code: string): string {
+/** What the owner and the model read for a refusal that changed nothing. The
+ * provider's HTTP status, when the service kept it, tells a plan refusal
+ * (402: the account has no browser time or an unpaid plan) from a concurrency
+ * one (429: another browser holds the slot); the two have different fixes.
+ * Live 2026-10-13: every start since 10-09 was a 402, read as "plan or
+ * concurrency limit", and the owner looked for a stuck browser. */
+export function browserbaseErrorText(code: string, httpStatus?: number): string {
+  if (code === 'provider_limit' && httpStatus === 402) {
+    return "Browserbase refused because the connected account's plan has no browser time left or needs payment (it answered 402), "
+      + 'so no browser was started. Check the plan and billing on the Browserbase account, then try again.';
+  }
+  if (code === 'provider_limit' && httpStatus === 429) {
+    return 'Browserbase refused because another browser on this account already holds the concurrency slot (it answered 429), '
+      + 'so no browser was started. Close the other browser, or wait for it to end, then try again.';
+  }
   return ERROR_TEXT[code] ?? `The cloud browser could not do that (${code}). Nothing was changed.`;
 }
 interface Policy { projectId: string; idleSeconds: number; sessionTimeoutSeconds: number; contextId?: string; }
