@@ -41,3 +41,19 @@ test('a write that ended without acknowledgement is answered by a successful rea
   assert.equal(darkWriteReadBackAfter({ ...dark, settled_at: null }, [readAfter]), false, 'no settlement time, no ordering, no answer');
   assert.equal(darkWriteReadBackAfter({ ...dark, execution_kind: 'local_execution' }, [readAfter]), true, 'a command that left the machine is the same case');
 });
+
+test('a host adapter that reported the provider\'s own refusal with no effect is an answered refusal too', () => {
+  // Live 2026-10-05: Browserbase refused a new session (plan or concurrency
+  // limit); the cloud browser tool reported it in a typed field, the model
+  // said so, and the turn still ended "1 business call failure(s) have no
+  // successful recovery".
+  const limit = { mutating: 1, execution_kind: 'local_execution', outcome_kind: 'input_required', outcome_detail: 'host_reported:provider_limit' };
+  assert.equal(answeredRefusalSettlement(limit), true);
+  assert.equal(answeredRefusalSettlement({ ...limit, outcome_kind: 'invalid_arguments', outcome_detail: 'host_reported:cloud_browser_not_dispatched' }), true);
+  assert.equal(answeredRefusalSettlement({ ...limit, outcome_kind: 'auth_failure', outcome_detail: 'host_reported:credential_unavailable' }), true);
+  assert.equal(answeredRefusalSettlement({ ...limit, outcome_kind: 'unknown', outcome_detail: 'execution_failed' }), false, 'a failure nobody reported stays unrecovered');
+  assert.equal(answeredRefusalSettlement({ ...limit, outcome_detail: 'host_reported_failure' }), false, 'a report without a token names no refusal');
+  assert.equal(answeredRefusalSettlement({ ...limit, mutating: 0 }), false);
+  assert.equal(answeredRefusalSettlement({ ...limit, execution_kind: 'refused_pre_dispatch' }), false);
+  assert.equal(answeredRefusalSettlement({ ...limit, outcome_kind: 'uncertain_write' }), false, 'an uncertain write needs its own reply detail');
+});

@@ -152,11 +152,25 @@ export function answeredRefusalSettlement(row: Pick<SettlementRow, 'mutating' | 
   // its answered refusal settles as local execution; it is the same answer.
   // A reply whose own bytes contradict its success flag is the same kind of
   // answer: the provider spoke and the model read it.
-  return row.mutating === 1
-    && (row.execution_kind === 'provider_execution' || row.execution_kind === 'local_execution')
-    && row.outcome_kind === 'uncertain_write'
-    && (row.outcome_detail === 'provider_refused_envelope'
-      || row.outcome_detail === 'provider_envelope_contradiction');
+  if (row.mutating !== 1
+    || !(row.execution_kind === 'provider_execution' || row.execution_kind === 'local_execution')) return false;
+  if (row.outcome_kind === 'uncertain_write') {
+    return row.outcome_detail === 'provider_refused_envelope'
+      || row.outcome_detail === 'provider_envelope_contradiction';
+  }
+  // A host adapter that reported the provider's own refusal with no effect
+  // (a cloud browser the provider would not start: a plan or concurrency
+  // limit, a session it did not dispatch) is the same answer: nothing
+  // landed, the model read the reason and said so. Live 2026-10-05: "Nate,
+  // Browserbase refused the new session because of a plan or concurrency
+  // limit. No browser was started" still ended "1 business call failure(s)
+  // have no successful recovery".
+  return typeof row.outcome_detail === 'string'
+    && row.outcome_detail.startsWith('host_reported:')
+    && (row.outcome_kind === 'input_required'
+      || row.outcome_kind === 'auth_failure'
+      || row.outcome_kind === 'policy_denial'
+      || row.outcome_kind === 'invalid_arguments');
 }
 
 function boundedReason(error: unknown): string {
