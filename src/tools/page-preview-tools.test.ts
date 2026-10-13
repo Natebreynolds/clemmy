@@ -64,12 +64,21 @@ test('page_preview returns the rendered page as an image and changes nothing', a
   assert.equal(readFileSync(file, 'utf8'), source, 'the page is unchanged');
 });
 
-test('page_preview refuses what read_file would refuse, and anything that is not a page', async () => {
+test('page_preview answers a missing page or a folder as what is there, and refuses what read_file refuses or cannot render', async () => {
   const notes = path.join(dir, 'notes.txt');
   writeFileSync(notes, 'plain', 'utf8');
+  // Nothing at the path is what the look found: a read result, never a
+  // failure that sends the turn into argument repair, and never an image.
   for (const [requested, expected] of [
-    [path.join(dir, 'missing.html'), /File does not exist/],
-    [dir, /Not a file/],
+    [path.join(dir, 'missing.html'), /^No file at /],
+    [dir, /is a folder, not a file/],
+  ] as const) {
+    const found = await tool().invoke(context(), JSON.stringify({ path: requested }));
+    assert.equal(typeof found, 'string', `${requested}: what is at the path is a read result`);
+    assert.match(found as string, expected, requested);
+    assert.ok((found as string).includes(requested), 'the path is echoed');
+  }
+  for (const [requested, expected] of [
     [notes, /Not an HTML page/],
     [path.join(dir, 'mcp', 'servers.json'), /credential material/],
   ] as const) {

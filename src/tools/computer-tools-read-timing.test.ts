@@ -122,10 +122,8 @@ test('actual nominal SDK reader still records one diagnostic and redeems full cl
   assert.equal(diagnostic(rows, ctx, file).outcome, 'returned');
 });
 
-for (const kind of ['sensitive', 'missing', 'directory', 'ingest_error'] as const) test(`${kind} refusal/error remains unchanged and private`, async () => {
-  const file = kind === 'sensitive' ? fixture('.env', 'secret=never-read')
-    : kind === 'missing' ? path.join(home, 'absent.txt')
-    : kind === 'directory' ? home : fixture('broken.pdf', 'inert input');
+for (const kind of ['sensitive', 'ingest_error'] as const) test(`${kind} refusal/error remains unchanged and private`, async () => {
+  const file = kind === 'sensitive' ? fixture('.env', 'secret=never-read') : fixture('broken.pdf', 'inert input');
   const ctx = context(kind); const rows: AppendEventInput[] = [];
   const result = await withToolOutputContext(ctx, () => readWithDependencies({ path: file, max_chars: null },
     undefined, undefined, { failOnReadError: true }, dependencies(rows, {
@@ -133,11 +131,40 @@ for (const kind of ['sensitive', 'missing', 'directory', 'ingest_error'] as cons
     })));
   assert.ok(result instanceof InvalidArgumentsPreDispatchResult);
   const d = diagnostic(rows, ctx, file);
-  assert.equal(d.outcome, kind === 'sensitive' ? 'sensitive_refusal' : kind === 'directory' ? 'not_file' : kind);
+  assert.equal(d.outcome, kind === 'sensitive' ? 'sensitive_refusal' : kind);
   assert.ok(!('file_read' in (d.durationsMs as object)));
   assert.ok(!('redaction' in (d.durationsMs as object)));
   assert.ok(!('format_retain' in (d.durationsMs as object)));
   assert.doesNotMatch(JSON.stringify(rows), /never-read|fixture conversion failed/);
+});
+
+for (const kind of ['missing', 'directory'] as const) test(`a ${kind} target is a completed read whose content is what is there, with the same private diagnostic`, async () => {
+  // Nothing readable at the path is the read's answer, not an argument error:
+  // the model carries it back as a fact and the turn never enters argument
+  // repair. The diagnostic still records which check answered, and no read,
+  // redaction or retention stage ran.
+  const file = kind === 'missing' ? path.join(home, 'absent.txt') : home;
+  const ctx = context(kind); const rows: AppendEventInput[] = [];
+  const result = await withToolOutputContext(ctx, () => readWithDependencies({ path: file, max_chars: null },
+    undefined, undefined, { failOnReadError: true }, dependencies(rows)));
+  assert.equal(typeof result, 'string');
+  assert.match(String(result), kind === 'missing' ? /^No file at / : /is a folder, not a file/);
+  assert.ok(String(result).includes(file), 'the path is echoed');
+  const d = diagnostic(rows, ctx, file);
+  assert.equal(d.outcome, kind === 'missing' ? 'missing' : 'not_file');
+  assert.ok(!('file_read' in (d.durationsMs as object)));
+  assert.ok(!('redaction' in (d.durationsMs as object)));
+  assert.ok(!('format_retain' in (d.durationsMs as object)));
+  // The SDK surface carries nominal read completion with that text.
+  const nominal = await withToolOutputContext(context(`${kind}-nominal`), () => executeLocalFileReadForTool({ path: file, max_chars: null }));
+  assert.ok(nominal instanceof HostLocalReadSuccessResult);
+  assert.equal(nominal.output, result);
+  // A structured workflow step was promised the file's bytes as data, so that
+  // lane keeps the typed refusal instead of prose about the absence.
+  const data = await withToolOutputContext(context(`${kind}-data`), () => readWithDependencies({ path: file, max_chars: null },
+    undefined, undefined, { failOnReadError: true, completeOutput: true }, dependencies([])));
+  assert.ok(data instanceof InvalidArgumentsPreDispatchResult);
+  assert.equal(data.output, result);
 });
 
 test('conversion throw identity is preserved while best-effort diagnostic marks the observed stage', async () => {

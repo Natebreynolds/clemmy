@@ -79,11 +79,10 @@ function legacyReadCrossing(identity: ReturnType<typeof source>, callId: string,
     tool: 'read_file', outcome: 'returned' }).status, 'inserted');
 }
 
-for (const maxChars of [null, 100_000]) test(`host invoke retains nominal read bytes with preview ${maxChars}`, async () => {
-  const identity = source(`host-${maxChars}`, false);
-  const file = path.join(home, `host-${maxChars}.json`);
-  writeFileSync(file, raw);
-  const callId = 'actual-local-read';
+/** One production host turn: the real read_file tool reads `file` once through
+ * the brackets, then the inert model answers. Returns what the producer
+ * returned and the invocation context it ran under. */
+async function hostReadTurn(identity: ReturnType<typeof source>, file: string, maxChars: number | null, callId: string) {
   const original = getComputerTools().find(candidate => candidate.name === 'read_file')!;
   const invoke = (original as unknown as { invoke(context: unknown, input: string, details?: unknown): Promise<unknown> }).invoke;
   let observed: InstanceType<typeof HostLocalReadSuccessResult> | undefined;
@@ -123,11 +122,48 @@ for (const maxChars of [null, 100_000]) test(`host invoke retains nominal read b
   assert.equal(outcome.finalOutput, 'Controlled data read.', JSON.stringify(outcome.terminal));
   assert.equal(requests, 2);
   assert.ok(observed && context?.settlementNonce && context.callId);
-  assert.equal(events.getToolOutputForInvocation(identity.sessionId, context.callId, context.settlementNonce)?.output, raw);
+  return { observed, context };
+}
+
+for (const maxChars of [null, 100_000]) test(`host invoke retains nominal read bytes with preview ${maxChars}`, async () => {
+  const identity = source(`host-${maxChars}`, false);
+  const file = path.join(home, `host-${maxChars}.json`);
+  writeFileSync(file, raw);
+  const callId = 'actual-local-read';
+  const { observed, context } = await hostReadTurn(identity, file, maxChars, callId);
+  assert.equal(events.getToolOutputForInvocation(identity.sessionId, context.callId!, context.settlementNonce!)?.output, raw);
   assert.equal(exactToolOutputForInvocation({ ...context, toolName: 'read_file', compactResult: observed.output }), raw);
   if (maxChars === null) assert.notEqual(observed.output, raw, 'the real handler returned a smaller public preview');
   else assert.equal(observed.output, raw, 'a requested whole preview is unchanged');
   verifyRetained(identity, callId, maxChars);
+});
+
+test('host invoke settles a read of an absent path as a verified read whose content is the absence', async () => {
+  // The read ran and the filesystem answered: that answer is the read's
+  // content. Settled as a read, it keeps completion coverage complete, so the
+  // turn stays on the cheap review path instead of argument repair and a
+  // full completion review for a file that was simply not there.
+  const identity = source('host-absent', false);
+  const file = path.join(home, 'absent', 'notes.json');
+  const callId = 'absent-local-read';
+  const { observed, context } = await hostReadTurn(identity, file, null, callId);
+  assert.equal(observed.output, `No file at ${file}. The folder ${path.dirname(file)} does not exist either.`);
+  assert.equal(exactToolOutputForInvocation({ ...context, toolName: 'read_file', compactResult: observed.output }), observed.output);
+  const retained = redeemSuccessfulSettlementResultForHost({ ...identity,
+    acceptedTaskId: acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq), logicalToolCallId: callId });
+  assert.equal(retained.status, 'ok', JSON.stringify(retained));
+  if (retained.status !== 'ok') throw new Error('The absent read was not retained');
+  assert.equal(retained.value.toolName, 'read_file');
+  assert.equal(retained.value.outcomeKind, 'succeeded', 'the absence settles as a completed read');
+  assert.equal(retained.value.rawPayload, observed.output);
+  const view = sourceSettledReadEvidence(identity);
+  const row = view.results.find(result => result.logicalToolCallId === callId);
+  assert.ok(row);
+  assert.equal(row.status, 'verified');
+  assert.equal(row.outcome, 'succeeded');
+  const coverage = assessCompletionEvidenceCoverage({ objective: identity.text, results: view.results });
+  assert.equal(coverage.complete, true, 'an absent target keeps completion coverage complete');
+  assert.deepEqual(coverage.failedAttempts, []);
 });
 
 for (const maxChars of [null, 100_000]) test(`execute twin retains nominal read bytes with preview ${maxChars}`, async () => {

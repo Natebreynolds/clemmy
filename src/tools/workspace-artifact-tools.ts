@@ -6,6 +6,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
 import { isSensitivePath } from '../runtime/security.js';
+import { absentReadTargetText } from './computer-tools.js';
 import { getWorkspaceDirs, textResult } from './shared.js';
 
 const ARTIFACT_QUERY_MAX_CHARS = 50_000;
@@ -37,7 +38,9 @@ function allowedArtifactRoots(): string[] {
 
 function resolveAllowedArtifactPath(input: string): string {
   const resolved = path.resolve(expandHome(input));
-  if (!existsSync(resolved)) throw new Error(`File does not exist: ${resolved}`);
+  // The handler returns this message as the query's plain result: nothing at
+  // the path is what the query found. The refusals below still refuse.
+  if (!existsSync(resolved)) throw new Error(absentReadTargetText(resolved, 'file'));
   const real = realpathSync(resolved);
   if (isSensitivePath(resolved) || isSensitivePath(real)) {
     throw new Error(`workspace_artifact_query refuses sensitive paths: ${resolved}`);
@@ -47,7 +50,7 @@ function resolveAllowedArtifactPath(input: string): string {
     const rootsList = roots.map((root) => `  - ${root}`).join('\n');
     throw new Error(`Path is outside allowed artifact roots: ${real}.\nAllowed roots:\n${rootsList}`);
   }
-  if (!statSync(real).isFile()) throw new Error(`Not a file: ${real}`);
+  if (!statSync(real).isFile()) throw new Error(absentReadTargetText(real, 'file'));
   return real;
 }
 

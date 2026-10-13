@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { isSensitivePath } from '../runtime/security.js';
-import { resolveAllowedPath } from './computer-tools.js';
+import { absentReadTargetText, resolveAllowedPath } from './computer-tools.js';
 
 const PAGE_EXTENSIONS = new Set(['.html', '.htm']);
 
@@ -31,8 +31,11 @@ export function registerPagePreviewTools(server: McpServer): void {
       try { file = resolveAllowedPath(requested); }
       catch (error) { return refusal(error instanceof Error ? error.message : String(error)); }
       if (isSensitivePath(file)) return refusal('Refused: that file holds credential material. Nothing was read.');
-      if (!existsSync(file)) return refusal(`File does not exist: ${file}`);
-      if (!statSync(file).isFile()) return refusal(`Not a file: ${file}`);
+      // No page at the path is what the look found, not a failed look: the
+      // same completed-read rule as read_file, with nothing to render.
+      if (!existsSync(file) || !statSync(file).isFile()) {
+        return { content: [{ type: 'text' as const, text: absentReadTargetText(file, 'file') }] };
+      }
       if (!PAGE_EXTENSIONS.has(path.extname(file).toLowerCase())) {
         return refusal(`Not an HTML page: ${file}. page_preview renders .html and .htm files; read_file reads any other file.`);
       }
