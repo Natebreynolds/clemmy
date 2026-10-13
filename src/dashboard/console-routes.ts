@@ -234,6 +234,7 @@ import {
   getOrCreateExternalMcpServers,
   invalidateConfiguredMcpServers,
   prewarmMcpServers,
+  reconnectConfiguredMcpServer,
 } from '../runtime/mcp-servers.js';
 import {
   getWorkflowImportJob,
@@ -11677,13 +11678,15 @@ export function registerConsoleRoutes(
     try {
       const server = discoverMcpServers().find((candidate) => candidate.name === name || slugifyServerName(candidate.name) === slugifyServerName(name));
       if (!server) { res.status(404).json({ error: 'server not found' }); return; }
-      await invalidateConfiguredMcpServers();
+      const done = await reconnectConfiguredMcpServer(server.name);
       clearAutonomyAgentCache();
       const servers = listMcpServerHealth();
       res.json({
         ok: true,
         server: server.name,
-        message: `MCP connections cleared; "${server.name}" will reconnect on the next tool call.`,
+        message: done === 'reconnected'
+          ? `Reconnecting "${server.name}" now; other servers kept their connections.`
+          : `MCP connections cleared; "${server.name}" will reconnect on the next tool call.`,
         servers,
       });
     } catch (err) {

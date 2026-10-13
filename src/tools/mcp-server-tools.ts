@@ -13,7 +13,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
-import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
+import { invalidateConfiguredMcpServers, reconnectConfiguredMcpServer } from '../runtime/mcp-servers.js';
 import { listMcpServerHealth, slugifyServerName } from '../runtime/mcp-namespace-shim.js';
 import { readBaseEnv, textResult } from './shared.js';
 import type { ManagedMcpServer } from '../types.js';
@@ -71,24 +71,34 @@ export function registerMcpServerTools(server: McpServer): void {
     'mcp_reconnect',
     [
       'Recover an external MCP server that is degraded/unavailable (stuck in the connection backoff).',
-      'Drops the cached MCP connections and closes the child processes, so every server reconnects fresh on the next use — clearing any backoff window.',
+      'With server_name: drops that one server\'s connection (closing its child process) and starts it again, clearing its backoff window; other servers keep their live connections.',
+      'Without server_name: drops every MCP connection, so all servers reconnect fresh on the next use.',
       'Use after mcp_status shows a server in state "degraded"/"unavailable", or right after the user enters missing credentials in the dashboard, so the new env is picked up.',
+      'A server shown as "connecting" is not broken: search for its tools with tool_search, which waits for the handshake.',
       'Does NOT change config or write secrets. Safe to call between turns.',
     ].join(' '),
     {
-      server_name: z.string().optional().describe('The server to recover (for the message). Reconnect clears ALL MCP connections regardless; pass the name you care about.'),
+      server_name: z.string().optional().describe('The server to reconnect (its name from mcp_status). Omit to clear every MCP connection.'),
     },
     async ({ server_name }) => {
       const before = server_name ? healthFor(server_name) : null;
+      let done: 'reconnected' | 'cleared_all';
       try {
-        invalidateConfiguredMcpServers();
+        if (server_name) {
+          done = await reconnectConfiguredMcpServer(server_name);
+        } else {
+          await invalidateConfiguredMcpServers();
+          done = 'cleared_all';
+        }
       } catch (err) {
-        return textResult(`mcp_reconnect: failed to clear MCP connections — ${err instanceof Error ? err.message : String(err)}`);
+        return textResult(`mcp_reconnect: failed to reconnect — ${err instanceof Error ? err.message : String(err)}`);
       }
       return textResult([
-        'MCP connections cleared — all servers will reconnect fresh on the next tool call (backoff windows reset).',
-        server_name ? `Target "${server_name}" prior state: ${before?.state ?? 'unknown'}${before?.lastError ? ` (last error: ${before.lastError})` : ''}.` : '',
-        'Call mcp_status next turn to confirm it reconnected.',
+        done === 'reconnected'
+          ? `Reconnecting "${server_name}" now (prior state: ${before?.state ?? 'unknown'}${before?.lastError ? `; last error: ${before.lastError}` : ''}); other servers were left connected.`
+          : 'MCP connections cleared — all servers will reconnect fresh on the next tool call (backoff windows reset).',
+        done === 'cleared_all' && server_name ? `Target "${server_name}" prior state: ${before?.state ?? 'unknown'}${before?.lastError ? ` (last error: ${before.lastError})` : ''}.` : '',
+        'tool_search waits for the handshake, so search for the tools you need next; mcp_status shows the new state.',
       ].filter(Boolean).join(' '));
     },
   );

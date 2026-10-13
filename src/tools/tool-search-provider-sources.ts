@@ -16,6 +16,7 @@ import {
   getOrCreateExternalMcpServers,
   resolveAuthorizedExternalMcpToolDefinition,
 } from '../runtime/mcp-servers.js';
+import type { McpNamespaceShim } from '../runtime/mcp-namespace-shim.js';
 import {
   canonicalMcpToolIdentity,
   mcpServerAliasMatches,
@@ -2489,7 +2490,13 @@ export function buildAuthorizedToolSearchCandidateSources(
         || externalMcpDefinitionDriftAt() >= lastExternalMcpListedAt
         || Date.now() - lastExternalMcpListedAt > EXTERNAL_MCP_LIST_FRESH_MS;
       if (relist) await server.invalidateToolsCache();
-      const tools = await server.listTools();
+      // The model is asking for these tools now: hold for a server that is
+      // still connecting until this source's deadline, rather than hand back
+      // the connecting stub the per-turn attach budget leaves behind.
+      const waiting = (server as Partial<McpNamespaceShim>).listToolsWaiting;
+      const tools = waiting && typeof deadlineAt === 'number' && Number.isFinite(deadlineAt)
+        ? await waiting.call(server, { deadlineAt })
+        : await server.listTools();
       if (relist) lastExternalMcpListedAt = Date.now();
       if (signal?.aborted) return [];
       const ranked = rankCatalogEntriesLexically(query, tools.map(tool => ({

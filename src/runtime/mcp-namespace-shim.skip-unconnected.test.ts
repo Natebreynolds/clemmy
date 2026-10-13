@@ -139,3 +139,95 @@ test('prewarm() reports allConnected and connects servers for later turns', asyn
   const tools = await shim.listTools();
   assert.ok(tools.some((t: any) => t.name === 'a__x'), 'pre-warmed server attaches real tools');
 });
+
+// ── Discovery waits; the stub names that door; reconnect is per server ───────
+// Live 2026-10-13: the first search after an install met a server still
+// spawning (npx + remote handshake, well past the 2.5s attach budget), was
+// handed the connecting stub, reconnected the server (which dropped every
+// connection) and searched four more times: nine discovery calls and ninety
+// seconds before one delete. A search is the model asking for the tools now.
+
+test('a discovery listing holds for a warming server until its deadline and returns the real tools', async () => {
+  process.env.MCP_ATTACH_CONNECTED_ONLY = 'on';
+  process.env.MCP_ATTACH_CONNECT_BUDGET_MS = '100';
+  const slow = fakeServer('slowdisc' + Date.now(), { connect: 'slow', connectMs: 350, tools: [{ name: 'q' }] });
+  const shim = createMcpNamespaceShim({ servers: [slow] });
+  const started = Date.now();
+  const tools = await shim.listToolsWaiting({ deadlineAt: Date.now() + 2_000 });
+  assert.ok(tools.some((t: any) => t.name === `${slow.name}__q`), 'the real tool, not the stub');
+  assert.ok(!tools.some((t: any) => t.name.endsWith('__unavailable')), 'no connecting stub once it waited');
+  assert.ok(Date.now() - started >= 300, 'it waited for the handshake rather than returning at the attach budget');
+  delete process.env.MCP_ATTACH_CONNECT_BUDGET_MS;
+});
+
+test('the wait ends at the deadline: a hanging server still stubs as connecting, a failed one stubs at once', async () => {
+  process.env.MCP_ATTACH_CONNECTED_ONLY = 'on';
+  process.env.MCP_ATTACH_CONNECT_BUDGET_MS = '100';
+  const hang = fakeServer('hangdisc' + Date.now(), { connect: 'hang' });
+  const failed = fakeServer('faildisc' + Date.now(), { connect: 'fail' });
+  const shim = createMcpNamespaceShim({ servers: [hang, failed] });
+  const started = Date.now();
+  const tools = await shim.listToolsWaiting({ deadlineAt: Date.now() + 400 });
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 1_500, `bounded by the deadline, not the connect timeout (took ${elapsed}ms)`);
+  const hangStub = tools.find((t: any) => t.name === `${hang.name}__unavailable`);
+  const failStub = tools.find((t: any) => t.name === `${failed.name}__unavailable`);
+  assert.match(hangStub.description, /CONNECTING/);
+  assert.match(failStub.description, /UNAVAILABLE/);
+  delete process.env.MCP_ATTACH_CONNECT_BUDGET_MS;
+});
+
+test('the connecting stub sends the model back to tool_search, never to reconnect or to tell the user it is warming up', async () => {
+  process.env.MCP_ATTACH_CONNECTED_ONLY = 'on';
+  process.env.MCP_ATTACH_CONNECT_BUDGET_MS = '100';
+  const warming = fakeServer('warmdoor' + Date.now(), { connect: 'hang' });
+  const shim = createMcpNamespaceShim({ servers: [warming] });
+  const tools = await shim.listTools();
+  const stub = tools.find((t: any) => t.name === `${warming.name}__unavailable`);
+  assert.match(stub.description, /CONNECTING/);
+  assert.match(stub.description, /search again .*tool_search/i, 'names the door that waits');
+  assert.match(stub.description, /not an outage/i);
+  assert.doesNotMatch(stub.description, /tell the user/i, 'no instruction to end the turn on the harness\'s behalf');
+  assert.doesNotMatch(stub.description, /within a turn or two/i);
+  delete process.env.MCP_ATTACH_CONNECT_BUDGET_MS;
+});
+
+test('reconnectServer(slug) drops and restarts only that server; the other keeps its live connection', async () => {
+  process.env.MCP_ATTACH_CONNECTED_ONLY = 'on';
+  const counting = (name: string) => {
+    const counts = { connect: 0, close: 0 };
+    let connected = false;
+    return {
+      counts,
+      server: {
+        name,
+        cacheToolsList: true,
+        async connect() { counts.connect += 1; connected = true; },
+        async close() { counts.close += 1; connected = false; },
+        async listTools() {
+          if (!connected) throw new Error(`${name} not connected`);
+          return [{ name: 't', description: 'tool t', inputSchema: { type: 'object', properties: {} } }];
+        },
+        async callTool() { return []; },
+        async invalidateToolsCache() {},
+      } as any,
+    };
+  };
+  const alpha = counting('alpha' + Date.now());
+  const beta = counting('beta' + Date.now());
+  const shim = createMcpNamespaceShim({ servers: [alpha.server, beta.server] });
+  const first = await shim.listTools();
+  assert.ok(first.some((t: any) => t.name === `${alpha.server.name}__t`));
+  assert.deepEqual([alpha.counts.connect, beta.counts.connect], [1, 1]);
+
+  assert.equal(await shim.reconnectServer('no-such-server'), false, 'an unknown slug reconnects nothing');
+  assert.equal(await shim.reconnectServer(alpha.server.name), true);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(alpha.counts.close, 1, 'alpha was closed');
+  assert.equal(alpha.counts.connect, 2, 'alpha reconnected right away, not on the next use');
+  assert.deepEqual([beta.counts.close, beta.counts.connect], [0, 1], 'beta was left alone');
+  const again = await shim.listTools();
+  assert.ok(again.some((t: any) => t.name === `${alpha.server.name}__t`), 'alpha lists its real tools from the fresh connection');
+  assert.ok(again.some((t: any) => t.name === `${beta.server.name}__t`));
+  assert.equal(listMcpServerHealth().find((h) => h.slug === alpha.server.name)?.state, 'connected');
+});

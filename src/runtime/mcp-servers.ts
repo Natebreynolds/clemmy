@@ -445,15 +445,22 @@ function createScopedExternalShim(
   base: MCPServer,
   scope: McpToolScope,
   opts: { semantic?: boolean } = {},
-): MCPServer & Pick<McpNamespaceShim, 'listToolsAuthoritative'> {
+): MCPServer & Pick<McpNamespaceShim, 'listToolsAuthoritative' | 'listToolsWaiting'> {
   let selectedToolNames: Set<string> | null = null;
   // Where an acquired tool actually lives. Without this the first cross-server
   // call succeeds and the second one goes back to the turn's base — which never
   // hosted that server — so a recovery that worked once broke on the next call.
   const acquiredTargets = new Map<string, MCPServer>();
-  const listScopedTools = async (authoritative = false) => {
+  const listScopedTools = async (
+    mode: 'advertised' | 'authoritative' | { waitUntil: number } = 'advertised',
+  ) => {
     const exact = (base as Partial<McpNamespaceShim>).listToolsAuthoritative;
-    const tools = authoritative && exact ? await exact.call(base) : await base.listTools();
+    const waiting = (base as Partial<McpNamespaceShim>).listToolsWaiting;
+    const tools = mode === 'authoritative' && exact
+      ? await exact.call(base)
+      : typeof mode === 'object' && waiting
+        ? await waiting.call(base, { deadlineAt: mode.waitUntil })
+        : await base.listTools();
     // T1: on the fail-open surface, rank the user's connected tools by
     // semantic relevance to the query (returns undefined → keyword/index
     // order, zero behavior change). Only the fresh per-query fail-open shim
@@ -483,7 +490,10 @@ function createScopedExternalShim(
       return listScopedTools();
     },
     async listToolsAuthoritative() {
-      return listScopedTools(true);
+      return listScopedTools('authoritative');
+    },
+    async listToolsWaiting(opts: { deadlineAt: number }) {
+      return listScopedTools({ waitUntil: opts.deadlineAt });
     },
     async callTool(toolName, args) {
       const executableToolName = stripMcpToolCarrier(toolName);
@@ -1031,6 +1041,45 @@ export async function invalidateConfiguredMcpServers(): Promise<void> {
 }
 
 /**
+ * Reconnect ONE configured server by name, in every shim that hosts it, and
+ * leave the other servers' live connections alone. The all-connections clear
+ * above is the fallback for a name no live shim carries (a server added since
+ * the shims were built): there is nothing narrower to restart.
+ *
+ * Live 2026-10-13: the model reconnected one warming server to get its tools,
+ * and the clear-everything path restarted every other server's handshake too,
+ * so the next search stubbed again. Returns what was done, in the user's words.
+ */
+export async function reconnectConfiguredMcpServer(name: string): Promise<'reconnected' | 'cleared_all'> {
+  const slug = slugifyServerName(name);
+  const hosts = [
+    cachedShim,
+    cachedExternalShim,
+    ...cachedScopedExternalBaseShims.values(),
+  ].filter((s): s is MCPServer => s !== null);
+  const outcomes = await Promise.all(hosts.map(async (host) => {
+    const reconnect = (host as Partial<McpNamespaceShim>).reconnectServer;
+    if (typeof reconnect !== 'function') return false;
+    try {
+      return await reconnect.call(host, slug);
+    } catch {
+      return false;
+    }
+  }));
+  if (outcomes.some(Boolean)) {
+    // Scoped views keep a name selection over the base; the base's own
+    // listing cache was dropped by reconnectServer, so the next listing
+    // through any view rebuilds from the fresh connection.
+    await Promise.all([...cachedScopedExternalShims.values(), cachedFailOpenExternalShim]
+      .filter((view): view is MCPServer => view !== null)
+      .map((view) => view.invalidateToolsCache?.().catch(() => undefined)));
+    return 'reconnected';
+  }
+  await invalidateConfiguredMcpServers();
+  return 'cleared_all';
+}
+
+/**
  * Escape hatch — return the raw per-server list when the caller
  * really needs it (e.g. the dashboard `/api/console/mcp-servers`
  * route which lists configured servers regardless of namespacing).
@@ -1069,6 +1118,12 @@ export const mcpServersTestHooks = {
   /** The real constructor, so a pin can assert what was (and was not) built. */
   getOrCreate(scope?: McpToolScope): MCPServer {
     return getOrCreateExternalMcpServers(scope);
+  },
+  /** Stand a fake all-external base in, so a pin can watch what a per-server
+   *  reconnect does to it without spawning a configured child process. */
+  seedAllExternalBaseShimForTests(shim: MCPServer): () => void {
+    cachedExternalShim = shim;
+    return () => { if (cachedExternalShim === shim) cachedExternalShim = null; };
   },
   resetCachesForTests(): void {
     cachedExternalShim = null;

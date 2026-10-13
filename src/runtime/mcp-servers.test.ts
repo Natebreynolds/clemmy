@@ -610,3 +610,62 @@ test('npx stdio external servers launch with isolated npm cache defaults', () =>
   assert.notEqual(direct.env.npm_config_cache, dataforseo.env.npm_config_cache);
   assert.notEqual(direct.env.npm_config_cache, supabase.env.npm_config_cache);
 });
+
+test('a scoped view forwards a waiting listing to its base with the deadline, then applies the scope', async () => {
+  const seen: Array<{ deadlineAt: number }> = [];
+  const base = {
+    name: 'base',
+    cacheToolsList: true,
+    async connect() {},
+    async close() {},
+    async listTools() { throw new Error('the plain listing must not be used for a waiting listing'); },
+    async listToolsWaiting(opts: { deadlineAt: number }) {
+      seen.push(opts);
+      return [
+        { name: 'dataforseo__keywords', description: 'keywords', inputSchema: { type: 'object', properties: {} } },
+        { name: 'other__tool', description: 'other', inputSchema: { type: 'object', properties: {} } },
+      ];
+    },
+    async callTool() { return []; },
+    async invalidateToolsCache() {},
+  };
+  const view = mcpServersTestHooks.scopedView(base as never, {
+    reason: 'seo turn',
+    allowedServerSlugs: ['dataforseo'],
+    toolPatterns: ['dataforseo__'],
+    maxTools: 25,
+  });
+  const deadlineAt = Date.now() + 5_000;
+  const tools = await (view as { listToolsWaiting: (o: { deadlineAt: number }) => Promise<Array<{ name: string }>> }).listToolsWaiting({ deadlineAt });
+  assert.deepEqual(seen, [{ deadlineAt }], 'the base waited with the caller\'s deadline');
+  assert.deepEqual(tools.map((t) => t.name), ['dataforseo__keywords'], 'the scope still filters the waited listing');
+});
+
+test('reconnecting one named server restarts it in the live base and leaves every other connection alone', async () => {
+  const { reconnectConfiguredMcpServer } = await import('./mcp-servers.js');
+  const calls: string[] = [];
+  let closedAll = 0;
+  const base = {
+    name: 'seeded-base',
+    cacheToolsList: true,
+    async connect() {},
+    async close() { closedAll += 1; },
+    async listTools() { return []; },
+    async callTool() { return []; },
+    async invalidateToolsCache() {},
+    async reconnectServer(slug: string) { calls.push(slug); return slug === 'dataforseo'; },
+  };
+  const release = mcpServersTestHooks.seedAllExternalBaseShimForTests(base as never);
+  try {
+    assert.equal(await reconnectConfiguredMcpServer('DataForSEO'), 'reconnected', 'the name resolves to the slug the shim carries');
+    assert.deepEqual(calls, ['dataforseo']);
+    assert.equal(closedAll, 0, 'no shim was closed: the other servers kept their connections');
+    assert.equal(mcpServersTestHooks.cacheState().allExternalBaseCreated, true, 'the base shim survives a per-server reconnect');
+
+    assert.equal(await reconnectConfiguredMcpServer('not-configured-here'), 'cleared_all', 'a slug no live shim hosts falls back to the full clear');
+    assert.equal(closedAll, 1, 'the fallback is the old all-connections clear');
+    assert.equal(mcpServersTestHooks.cacheState().allExternalBaseCreated, false);
+  } finally {
+    release();
+  }
+});

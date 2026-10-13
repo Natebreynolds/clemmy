@@ -833,6 +833,12 @@ export type McpNamespaceShim = MCPServer & {
   prewarm: () => Promise<boolean>;
   /** Await real metadata; never return advertisement placeholders as evidence. */
   listToolsAuthoritative: MCPServer['listTools'];
+  /** The listing a discovery search uses: holds for a warming server until the
+   *  caller's deadline before it settles for the connecting stub. */
+  listToolsWaiting: (opts: { deadlineAt: number }) => Promise<MCPTool[]>;
+  /** Drop and restart one server's connection by slug; every other server keeps
+   *  its live connection. False when no server here carries the slug. */
+  reconnectServer: (slug: string) => Promise<boolean>;
 };
 
 export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNamespaceShim {
@@ -1077,9 +1083,15 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
    */
   function buildUnavailableStubTool(server: MCPServer, slug: string, health?: ServerHealth): MCPTool {
     const warming = !health || health.failureCount === 0;
+    // The connecting flavor names the door that waits for the handshake:
+    // tool_search holds for a warming server up to its own deadline, so the
+    // model searches again instead of reconnecting the server (which dropped
+    // every connection) or ending the turn with "it is warming up" (live
+    // 2026-10-13: nine discovery calls and ninety seconds before one delete).
     const description = warming
-      ? `[${slug}] CONNECTING — ${server.name} is still establishing its connection; its tools ` +
-        `will be available within a turn or two. If you need it right now, tell the user it's warming up.`
+      ? `[${slug}] CONNECTING — ${server.name} is still establishing its connection. ` +
+        `This is not an outage: search again for its tools with tool_search, which waits for ` +
+        `the connection to finish. Do not reconnect it and do not report it unavailable.`
       : `[${slug}] UNAVAILABLE — ${server.name} failed to connect ` +
         `(${health!.failureCount} consecutive failures: ${(health!.lastError?.message ?? 'unknown error').slice(0, 160)}). ` +
         `Tools from this server are temporarily unavailable. ` +
@@ -1097,7 +1109,10 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
    *  the caller (listTools) uses it to AVOID caching a partial surface, so a
    *  background-warmed server is picked up on the next turn's rebuild (no stale
    *  cache, no explicit invalidation needed). */
-  async function buildFlattenedTools(authoritative = false): Promise<{ tools: MCPTool[]; routing: Map<string, MCPServer>; allConnected: boolean }> {
+  async function buildFlattenedTools(
+    authoritative = false,
+    attachBudgetMs: number = attachConnectBudgetMs(),
+  ): Promise<{ tools: MCPTool[]; routing: Map<string, MCPServer>; allConnected: boolean }> {
     const tools: MCPTool[] = [];
     const routing = new Map<string, MCPServer>(); // namespaced name -> underlying server
     const skipUnconnected = !authoritative && attachConnectedOnly();
@@ -1134,7 +1149,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
             connectAttempt.catch(() => { /* keeps warming; ensureConnected records any failure */ });
             let budgetTimer: ReturnType<typeof setTimeout> | undefined;
             const budget = new Promise<never>((_, reject) => {
-              budgetTimer = setTimeout(() => reject(new ServerWarmingError()), attachConnectBudgetMs());
+              budgetTimer = setTimeout(() => reject(new ServerWarmingError()), attachBudgetMs);
             });
             try {
               await Promise.race([connectAttempt, budget]);
@@ -1220,6 +1235,34 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     return { tools, routing, allConnected };
   }
 
+  async function listToolsWithAttachBudget(attachBudgetMs: number): Promise<MCPTool[]> {
+    if (cacheToolsList && cachedTools && cachedToolToServer && cachedLabelStamp === mcpToolEffectLabelStamp()) {
+      return cachedTools;
+    }
+    const labelStamp = mcpToolEffectLabelStamp();
+    const { tools, routing, allConnected } = await buildFlattenedTools(false, attachBudgetMs);
+    // Cache the flattened surface ONLY when stable. In skip-unconnected mode
+    // a partial surface (some servers still warming) must NOT be cached, or a
+    // background-warmed server would stay hidden behind the stub until an
+    // unrelated invalidate — so rebuild next turn and pick it up then. The
+    // rebuild is cheap (connected servers list fast; pending ones return
+    // immediately). Legacy mode (flag off) caches exactly as before.
+    // shouldCache: legacy (attachConnectedOnly=off) caches whenever cacheToolsList;
+    // new mode additionally requires allConnected (no partial surface cached).
+    const shouldCache = cacheToolsList && (!attachConnectedOnly() || allConnected);
+    if (shouldCache) {
+      cachedTools = tools;
+      cachedToolToServer = routing;
+      cachedLabelStamp = labelStamp;
+    } else {
+      // We still need the routing map for the immediately-following
+      // callTool, so cache transiently — invalidated on next listTools.
+      cachedTools = null;
+      cachedToolToServer = routing;
+    }
+    return tools;
+  }
+
   const shim: McpNamespaceShim = {
     cacheToolsList,
     // `toolFilter` is intentionally unset — filtering is the right
@@ -1294,31 +1337,44 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     },
 
     async listTools(): Promise<MCPTool[]> {
-      if (cacheToolsList && cachedTools && cachedToolToServer && cachedLabelStamp === mcpToolEffectLabelStamp()) {
-        return cachedTools;
+      return listToolsWithAttachBudget(attachConnectBudgetMs());
+    },
+
+    // A discovery search is the model asking for a server's tools now, so it
+    // holds for a warming handshake as long as its own deadline allows instead
+    // of handing back the connecting stub after the per-turn attach budget
+    // (that budget protects the passive first-class listing, where nobody
+    // asked). A server in backoff still stubs at once as unavailable; a server
+    // that has not connected by the deadline still stubs as connecting.
+    async listToolsWaiting(opts: { deadlineAt: number }): Promise<MCPTool[]> {
+      const remaining = Number.isFinite(opts.deadlineAt) ? opts.deadlineAt - Date.now() : 0;
+      return listToolsWithAttachBudget(Math.max(attachConnectBudgetMs(), remaining));
+    },
+
+    // Drop one server's connection and start it again, leaving every other
+    // server's live connection alone. Returns false when no server here
+    // carries that slug. The backoff record goes too: an owner-directed
+    // reconnect is the reset the ladder was waiting for.
+    async reconnectServer(slug: string): Promise<boolean> {
+      const server = servers.find((candidate) => serverSlugs.get(candidate) === slug);
+      if (!server) return false;
+      connectPromises.delete(server);
+      serverHealth.delete(server);
+      lastToolCounts.set(server, 0);
+      if (typeof server.close === 'function') {
+        try {
+          await server.close();
+        } catch {
+          // Best-effort: a child that is already gone is what we wanted.
+        }
       }
-      const labelStamp = mcpToolEffectLabelStamp();
-      const { tools, routing, allConnected } = await buildFlattenedTools();
-      // Cache the flattened surface ONLY when stable. In skip-unconnected mode
-      // a partial surface (some servers still warming) must NOT be cached, or a
-      // background-warmed server would stay hidden behind the stub until an
-      // unrelated invalidate — so rebuild next turn and pick it up then. The
-      // rebuild is cheap (connected servers list fast; pending ones return
-      // immediately). Legacy mode (flag off) caches exactly as before.
-      // shouldCache: legacy (attachConnectedOnly=off) caches whenever cacheToolsList;
-      // new mode additionally requires allConnected (no partial surface cached).
-      const shouldCache = cacheToolsList && (!attachConnectedOnly() || allConnected);
-      if (shouldCache) {
-        cachedTools = tools;
-        cachedToolToServer = routing;
-        cachedLabelStamp = labelStamp;
-      } else {
-        // We still need the routing map for the immediately-following
-        // callTool, so cache transiently — invalidated on next listTools.
-        cachedTools = null;
-        cachedToolToServer = routing;
-      }
-      return tools;
+      cachedTools = null;
+      cachedToolToServer = null;
+      syncHealthRegistry(server);
+      // Warm it now so the next listing finds the handshake in flight rather
+      // than starting it; ensureConnected records any failure itself.
+      ensureConnected(server).catch(() => undefined);
+      return true;
     },
 
     async callTool(toolName: string, args: Record<string, unknown> | null): Promise<CallToolResultContent> {
