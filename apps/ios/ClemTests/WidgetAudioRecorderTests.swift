@@ -43,23 +43,37 @@ final class WidgetAudioRecorderPolicyTests: XCTestCase {
         XCTAssertFalse(gate.heardSpeech)
     }
 
-    func testSustainedSpeechFinishesOnlyAfterTheQuietWindow() {
+    /// Speech sampled every 100 ms from `start` through `end`.
+    private func speak(_ gate: inout WidgetSpeechSilenceGate, from start: Double, to end: Double) {
+        var t = start
+        while t <= end + 0.0001 { XCTAssertFalse(gate.shouldFinish(power: -20, elapsed: t)); t += 0.1 }
+    }
+
+    func testAPhraseFinishesAfterTheQuietWindow() {
         var gate = WidgetSpeechSilenceGate()
-        XCTAssertFalse(gate.shouldFinish(power: -20, elapsed: 1))
-        XCTAssertFalse(gate.shouldFinish(power: -20, elapsed: 1.4))
+        speak(&gate, from: 1.0, to: 2.2)
         XCTAssertTrue(gate.heardSpeech)
-        XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 2.5))
-        XCTAssertTrue(gate.shouldFinish(power: -80, elapsed: 2.7))
+        XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 3.9))
+        XCTAssertTrue(gate.shouldFinish(power: -80, elapsed: 4.05))
+    }
+
+    func testALoneWordThenAThinkingPauseKeepsListening() {
+        // Live 2026-10-11: "the", a pause, and the turn was sent.
+        var gate = WidgetSpeechSilenceGate()
+        speak(&gate, from: 1.0, to: 1.4)
+        XCTAssertTrue(gate.heardSpeech)
+        XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 3.2), "1.8 s of quiet after one word is a pause")
+        XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 4.3))
+        XCTAssertTrue(gate.shouldFinish(power: -80, elapsed: 4.45), "a short answer still sends on its own")
     }
 
     func testResumedSpeechResetsTheQuietWindow() {
         var gate = WidgetSpeechSilenceGate()
-        _ = gate.shouldFinish(power: -20, elapsed: 0)
-        _ = gate.shouldFinish(power: -20, elapsed: 0.4)
-        XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 1))
-        XCTAssertFalse(gate.shouldFinish(power: -20, elapsed: 1.2))
-        XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 2))
-        XCTAssertTrue(gate.shouldFinish(power: -80, elapsed: 2.5))
+        speak(&gate, from: 0, to: 0.7)
+        XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 1.5))
+        speak(&gate, from: 1.6, to: 2.0)
+        XCTAssertFalse(gate.shouldFinish(power: -80, elapsed: 3.5))
+        XCTAssertTrue(gate.shouldFinish(power: -80, elapsed: 3.85))
     }
 
     func testInvalidMeterValuesCannotCreateSpeech() {
