@@ -917,6 +917,27 @@ test('publication distinguishes an intentional history-only review skip from an 
   }
 });
 
+// A workflow step's surface never reviews in its own loop (the run's target
+// review owns that). Leaving it off is the harness's rule, and the step's
+// terminal must not call it the owner's decision while the run record says
+// review is on; only the owner's switch is the owner's decision.
+test('a surface that leaves review to its caller records not required, never an owner decision', async () => {
+  const { captureEffectiveCompletionPolicyOnce } = await import('./host-turn-runner.js');
+  for (const [ownerEnabled, expected] of [[true, 'not_required'], [false, 'disabled_by_owner'], [undefined, 'disabled_by_owner']] as const) {
+    const sessionId = `step-review-left-to-run-${String(ownerEnabled)}`;
+    createSession({ id: sessionId, kind: 'workflow', metadata: { workflowRunId: 'fixture-run', stepId: 'work' } });
+    const proposed = acceptedAnswer(sessionId, 'The file holds 323.');
+    captureEffectiveCompletionPolicyOnce({ ...proposed.identity, enabled: false,
+      ...(ownerEnabled === undefined ? {} : { ownerEnabled }) });
+    const committed = commitTurnOutcome(proposed);
+    const review = committed.event.data.completionReview as { disposition: string; policyEvidence: string };
+    assert.equal(review.disposition, expected, `owner switch ${String(ownerEnabled)}`);
+    assert.equal(review.policyEvidence, 'captured');
+    assert.equal(committed.presentation.status, 'done');
+    assert.equal(committed.event.data.review, undefined, 'no review chip for a review this turn never owned');
+  }
+});
+
 for (const variant of ['valid', 'changed-reply', 'foreign-card', 'untrusted-marker', 'disabled'] as const) {
   test(`approval resume review follows exact durable work lineage: ${variant}`, async () => {
     const approvals = await import('./approval-registry.js');
