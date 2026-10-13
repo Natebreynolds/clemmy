@@ -35,7 +35,7 @@ const {
   OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT, OWNER_STOP_TERMINAL_TEXT,
   STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON, STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT,
 } = await import('./terminal-notice.js');
-const { STEER_NOTE_ADMISSION_MESSAGE } = await import('./steer-notes.js');
+const { CHAT_STEER_REFUSAL, STEER_NOTE_ADMISSION_MESSAGE } = await import('./steer-notes.js');
 const presentationModule = await import('./public-presentation.js');
 const { reconstructHarnessTranscript } = await import('./transcript.js');
 const { pullRecentTurnsForSession } = await import('./session-transcript.js');
@@ -270,9 +270,16 @@ test('a turn that could not reopen its mid-turn message handoff is an app-voice 
   assert.deepEqual(data.notice, { code: 'steering_unavailable' });
   assert.equal(data.reply, STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT);
   assert.doesNotMatch(STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT, /\b(?:I|I’ll|I'll|me|my)\b/);
-  for (const message of Object.values(STEER_NOTE_ADMISSION_MESSAGE)) {
+  const refusalLines = [
+    ...Object.values(STEER_NOTE_ADMISSION_MESSAGE),
+    ...Object.values(CHAT_STEER_REFUSAL).map(refusal => refusal.error),
+  ];
+  for (const message of refusalLines) {
     assert.doesNotMatch(message, /\b(?:I|I’m|I'm|I’ll|I'll|I’ve|I've|me|my)\b/, message);
     committedPublicTexts.push({ cause: 'steering:refusal', text: message });
+  }
+  for (const refusal of Object.values(CHAT_STEER_REFUSAL)) {
+    assert.ok(!refusal.error.includes(refusal.code), `${refusal.code} appears in its own line`);
   }
 });
 

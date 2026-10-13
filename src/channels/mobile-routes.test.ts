@@ -1433,6 +1433,62 @@ test('mobile terminal steering refusal cannot become a competing ordinary turn',
   }
 });
 
+test('mobile steerOnly after the run ended, and a mode change on a steer, are refused with a plain line beside the code', async () => {
+  resetEventLog();
+  _clearMobileChatInFlightForTests();
+  const { CHAT_STEER_REFUSAL } = await import('../runtime/harness/steer-notes.js');
+  const { finishRunAttempt, getLatestRunAttempt } = await import('../runtime/harness/eventlog.js');
+  let modelCalls = 0;
+  const h = await startHarness({ assistant: { respond: async () => {
+    modelCalls++;
+    throw new Error('a refused steer cannot dispatch');
+  } } as Parameters<typeof createMobileRouter>[0]['assistant'] });
+  try {
+    const cookie = await loginMobile(h, 'Ended run phone');
+    const { deviceId } = await (await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } })).json() as { deviceId: string };
+    const session = createHarnessSession({ id: 'sess-mobile-steer-after-ended', kind: 'chat', channel: 'mobile', userId: deviceId,
+      metadata: { source: 'mobile', ingressProvider: 'mobile', channelId: 'mobile-steer-after-ended', userId: deviceId } });
+    const original = beginRunAttempt(session.id, { runId: 'mobile:steer-after-ended' });
+    recordRunAttemptUserInput(original, { turn: 1, role: 'user', data: { text: 'Finish the controlled answer.' } });
+    finishRunAttempt(original, 'interrupted');
+    assert.equal(getActiveRunAttempt(session.id), null);
+    const before = listEvents(session.id);
+    const send = (key: string, extra: Record<string, unknown>) => fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json', 'idempotency-key': key },
+      body: JSON.stringify({ message: 'Add this detail.', sessionId: session.id, async: true, steerOnly: true, ...extra }),
+    });
+    const firstPersonOrCode = /\b(?:I|I’m|I'm|I’ll|I'll|me|my)\b|RUN_NOT_ACTIVE|TASK_MODE/;
+    // The normal sequence after a refused steer: the run has ended by the time
+    // the owner taps retry. The phone shows the line, never the code.
+    const ended = await send('steer-after-ended', {});
+    assert.equal(ended.status, 409);
+    const endedBody = await ended.json() as { error: string; code?: string; message?: string; sessionId?: string; steered?: boolean };
+    assert.equal(endedBody.code, 'RUN_NOT_ACTIVE');
+    assert.equal(endedBody.error, CHAT_STEER_REFUSAL.run_ended.error);
+    assert.doesNotMatch(endedBody.error, firstPersonOrCode);
+    assert.equal(endedBody.message, undefined);
+    assert.equal(endedBody.sessionId, session.id);
+    assert.notEqual(endedBody.steered, true);
+    // A mode cannot ride a steer, whatever the run's state: the same shape.
+    const moded = await send('steer-with-mode', { taskMode: { version: 1, kind: 'plan' } });
+    assert.equal(moded.status, 409);
+    const modedBody = await moded.json() as { error: string; code?: string; message?: string };
+    assert.equal(modedBody.code, 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN');
+    assert.equal(modedBody.error, CHAT_STEER_REFUSAL.task_mode_on_active_turn.error);
+    assert.doesNotMatch(modedBody.error, firstPersonOrCode);
+    assert.equal(modedBody.message, undefined);
+    for (const refusal of Object.values(CHAT_STEER_REFUSAL)) {
+      assert.doesNotMatch(refusal.error, firstPersonOrCode, refusal.error);
+      assert.ok(!refusal.error.includes(refusal.code), 'the code never appears in its own line');
+    }
+    assert.deepEqual(listEvents(session.id), before, 'a refusal admits neither a note nor a competing turn');
+    assert.equal(getLatestRunAttempt(session.id)?.attemptId, original.attemptId);
+    assert.equal(modelCalls, 0);
+  } finally {
+    await h.close();
+  }
+});
+
 test('a failed live mobile approval acknowledgement rolls back its receipt, source and decision without waking the executor', async () => {
   resetEventLog();
   let unsubscribeEvents = () => {};

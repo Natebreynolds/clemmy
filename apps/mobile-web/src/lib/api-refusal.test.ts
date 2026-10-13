@@ -26,7 +26,9 @@ test('a refused chat send shows its plain line and keeps the code on the body', 
 test('a plain message beside a machine code is the line shown; a bare code or no body falls back', () => {
   assert.equal(displayMessage({ error: 'TRANSCRIPTION_STOPPED', message: 'Wait for cleanup, then try again.' }, 409),
     'Wait for cleanup, then try again.');
-  assert.equal(displayMessage({ error: 'RUN_NOT_ACTIVE' }, 409), 'RUN_NOT_ACTIVE');
+  // A route that sends only a code shows that code: the fallback for routes
+  // outside chat. The chat routes always put the plain line in `error`.
+  assert.equal(displayMessage({ error: 'INVALID_TASK_MODE' }, 400), 'INVALID_TASK_MODE');
   assert.equal(displayMessage({ error: 'CHAT_SEND_FAILED', message: '   ' }, 500), 'CHAT_SEND_FAILED');
   assert.equal(displayMessage({ error: '', message: '' }, 500), 'HTTP 500');
   assert.equal(displayMessage(['not', 'an', 'object'], 502), 'HTTP 502');
