@@ -89,8 +89,9 @@ test('boundary composition: one call takes, formats, and marks — empty when qu
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 let cutoverSerial = 0;
-function acceptedCutoverOwner(nullableRun = false) {
+function acceptedCutoverOwner(nullableRun = false, beforeOwner?: (sessionId: string) => void) {
   const session = createSession({ id: `sess-terminal-cutover-${++cutoverSerial}`, kind: 'chat' });
+  beforeOwner?.(session.id);
   const claimed = nullableRun ? undefined : claimRunAttemptLease({ sessionId: session.id, runId: `desktop:cutover-${cutoverSerial}`,
     ownerId: 'fixture-owner', leaseMs: 60_000 });
   if (claimed) assert.ok(claimed.attempt && claimed.claimed);
@@ -482,4 +483,53 @@ test('terminal steering: a fresh ordinary accepted source is not held by an olde
   const pending = closeTerminalSteering(owner, hash('new objective'), hash('new reply'));
   assert.deepEqual(pending.status === 'pending' ? pending.notes.map(n => n.seq) : [], [note.seq]);
   assert.equal(closeTerminalSteering(owner, hash('new objective'), hash('new reply')).status, 'closed');
+});
+
+/** An earlier chat request Clem handed to a durable workflow. The retirement
+ * fence keeps its attempt active beside the next foreground request. */
+function preservedWorkflowHandoff(sessionId: string, serial: number) {
+  const attempt = beginRunAttempt(sessionId, { runId: `desktop:handoff-${serial}` });
+  const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Run the controlled workflow.' } });
+  const sourceGroupId = `workflow-origin-group-v1:${'a'.repeat(64)}`;
+  const sourceGroupDigest = 'b'.repeat(64);
+  appendEvent({ sessionId, turn: 1, role: 'system', type: 'async_work_dispatched', parentEventId: source.id,
+    data: { version: 2, kind: 'workflow_run_group', status: 'dispatched', sourceUserSeq: source.seq, sourceGroupId, sourceGroupDigest,
+      runIds: [`workflow-run-${serial}`], replyTargetDigest: 'c'.repeat(64),
+      dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}` } });
+  return { attempt, source };
+}
+const attemptRow = (attemptId: string) => openEventLog()
+  .prepare('SELECT finished_at, status FROM run_attempts WHERE attempt_id = ?').get(attemptId) as { finished_at: string | null; status: string };
+
+test('terminal steering: an attempt a workflow handoff keeps alive beside the owner is not a rival owner', () => {
+  let handoff!: ReturnType<typeof preservedWorkflowHandoff>;
+  const f = acceptedCutoverOwner(false, sessionId => { handoff = preservedWorkflowHandoff(sessionId, cutoverSerial); });
+  assert.deepEqual(attemptRow(handoff.attempt.attemptId), { finished_at: null, status: 'active' }, 'the handed-off request kept its attempt');
+  const note = appendSteerNote(f.session.id, 'Keep the workflow running; report in French.', { expectedAttemptId: f.attempt.attemptId });
+  const pending = closeTerminalSteering(f.owner, hash('objective'), hash('draft'));
+  assert.deepEqual(pending.status === 'pending' ? pending.notes.map(n => n.seq) : [], [note.seq]);
+  assert.equal(closeTerminalSteering(f.owner, hash('amended objective'), hash('French reply')).status, 'closed');
+  refused(() => appendSteerNote(f.session.id, 'Too late.', { expectedAttemptId: f.attempt.attemptId }), 'STEER_NOTE_CUTOVER');
+  revokeDispatchLease(f.owner.lease);
+  const lease = activateDispatchLease({ sessionId: f.session.id, scopeId: `${f.session.id}:recovery`, runAttemptId: f.attempt.attemptId });
+  const reopened = { ...f.owner, lease };
+  reopenTerminalSteering(reopened);
+  // Without a named attempt the note still reaches the foreground owner.
+  const second = appendSteerNote(f.session.id, 'Also include the totals.');
+  const adopted = closeTerminalSteering(reopened, hash('objective with totals'), hash('reply with totals'));
+  assert.deepEqual(adopted.status === 'pending' ? adopted.notes.map(n => n.seq) : [], [second.seq]);
+  assert.equal(closeTerminalSteering(reopened, hash('objective with totals'), hash('reply with totals')).status, 'closed');
+  assert.deepEqual(attemptRow(handoff.attempt.attemptId), { finished_at: null, status: 'active' }, 'the fence neither adopts nor retires the handoff');
+  assert.deepEqual(attemptRow(f.attempt.attemptId), { finished_at: null, status: 'active' });
+});
+
+test('terminal steering: a second foreground attempt without a handoff is still a rival owner', () => {
+  const f = acceptedCutoverOwner();
+  // A rival foreground row the retirement fence did not reach.
+  openEventLog().prepare(`INSERT INTO run_attempts (attempt_id, session_id, run_id, started_at, finished_at, status)
+    VALUES (?, ?, ?, ?, NULL, 'active')`).run(`attempt:rival-${cutoverSerial}`, f.session.id, `desktop:rival-${cutoverSerial}`, new Date().toISOString());
+  const count = listEvents(f.session.id).length;
+  refused(() => appendSteerNote(f.session.id, 'Which turn owns this?', { expectedAttemptId: f.attempt.attemptId }), 'STEER_NOTE_OWNER_CHANGED');
+  refused(() => closeTerminalSteering(f.owner, hash('objective'), hash('reply')), 'STEER_NOTE_OWNER_CHANGED');
+  assert.equal(listEvents(f.session.id).length, count);
 });

@@ -10137,13 +10137,39 @@ for (const boundary of ['negative_before_close', 'malformed_after_negative', 'in
     const agent = { model, tools: [reader] };
     bindHostCanarySurface(fixture, agent, [reader]);
     const running = runProductionHost(fixture, agent, undefined, { hostJudgeCompletion: true, maxTurns: 6 });
+    const fenceHeld = boundary === 'pending_without_delivery' || boundary === 'malformed_after_review' || boundary === 'malformed_after_negative';
+    if (fenceHeld) {
+      // A fence refusal at the completion boundary is a typed, resumable stop
+      // that keeps Clem's judged candidate. It is never an exit from the host.
+      const outcome = await running;
+      assert.equal(outcome.terminal?.status, 'blocked');
+      assert.equal(outcome.terminal?.reason, 'owner_steering_fence_unavailable');
+      assert.equal((outcome.terminal as { resumable?: false }).resumable, undefined, 'the stop stays resumable');
+      assert.ok(outcome.finalOutput.startsWith(oldReply), `the judged candidate is kept: ${outcome.finalOutput}`);
+      assert.equal(model.calls(), 2, 'no replacement draft or narration request');
+      assert.equal(reads, 1);
+      assert.equal(reviewed.length, 1);
+      if (boundary !== 'malformed_after_review') assert.equal(injected, true, 'the selected real indexed checkpoint was exercised');
+      const journal = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] });
+      assert.equal(journal.filter(row => row.data.kind === 'host_terminal_steering_cutover').length, 0);
+      const held = journal.filter(row => row.data.kind === 'owner_steering_fence_unavailable');
+      assert.equal(held.length, 1);
+      assert.equal(held[0]!.data.code, boundary === 'pending_without_delivery' ? 'owner_steering_adoption_unavailable' : 'STEER_NOTE_UNAVAILABLE');
+      assert.equal(journal.filter(row => row.data.kind === 'host_blocked_terminal_site' && row.data.reason === 'owner_steering_fence_unavailable'
+        && row.data.resumable === true).length, 1);
+      if (boundary.startsWith('malformed_')) {
+        assert.equal(eventlog.listEvents(session.id, { types: ['user_steer_note_delivered'] }).length, 0);
+        assert.ok(!JSON.stringify(model.requests).includes('must not become a model instruction'));
+        assert.ok(!outcome.finalOutput.includes('privateDirective'));
+      }
+      assert.equal(eventlog.getRunAttemptBySourceUserSeq(session.id, source.seq)?.attemptId, attempt.attemptId);
+      return;
+    }
     if (boundary !== 'negative_before_close') {
       await assert.rejects(running, error => boundary === 'indexed_unavailable'
         ? error instanceof Error && error.message === 'controlled indexed steering read unavailable'
-        : boundary === 'pending_without_delivery'
-          ? error instanceof Error && (error as { boundaryKind?: string }).boundaryKind === 'owner_steering_adoption_unavailable'
-          : steering.isSteerNoteAdmissionError(error) && error.code === 'STEER_NOTE_UNAVAILABLE'
-            && !error.message.includes('privateDirective'));
+        : steering.isSteerNoteAdmissionError(error) && error.code === 'STEER_NOTE_UNAVAILABLE'
+          && !error.message.includes('privateDirective'));
       assert.equal(model.calls(), boundary === 'malformed_input' || boundary === 'strict_read_unavailable' ? 0 : boundary === 'malformed_after_model' ? 1 : 2);
       assert.equal(reads, boundary === 'malformed_input' || boundary === 'strict_read_unavailable' || boundary === 'malformed_after_model' ? 0 : 1);
       if (!['malformed_input', 'strict_read_unavailable', 'malformed_after_model'].includes(boundary)) {
@@ -10176,7 +10202,7 @@ for (const boundary of ['negative_before_close', 'malformed_after_negative', 'in
   });
 }
 
-test('terminal steering: a handoff that cannot be reopened stops in app voice with the steering reason before any model step', async () => {
+test('terminal steering: a marker this attempt cannot reopen never refuses the turn, and a refused reopen is app voice', async () => {
   const host = await import('./host-turn-runner.js');
   const notice = await import('./terminal-notice.js');
   const session = eventlog.createSession({ id: `sess-steer-reopen-${++acceptedSerial}`, kind: 'chat' });
@@ -10187,25 +10213,28 @@ test('terminal steering: a handoff that cannot be reopened stops in app voice wi
     parent: { sessionId: session.id, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId,
       counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::turn:1` } };
   host.captureEffectiveCompletionPolicyOnce({ ...fixture.context, enabled: true });
-  // A stored handoff marker that no longer parses. The host must not guess
-  // its way past it, and no model step may start.
+  // A stored handoff marker that no longer parses is not permission to refuse
+  // the owner's turn: the turn runs without the atomic handoff fence and the
+  // refusal is journaled, in app voice.
   eventlog.openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(COALESCE(metadata_json, '{}'),
     '$.__host_terminal_steering_cutover', json('{}')) WHERE id = ?`).run(session.id);
-  const model = stubModel([[textMsg('must not be asked')]]);
+  const model = stubModel([[textMsg('Picked back up.')]]);
   const agent = { model, tools: [] };
   bindHostCanarySurface(fixture, agent, []);
-  const result = await runProductionHost(fixture, agent, undefined, { maxTurns: 2 });
-  assert.equal(result.terminal?.status, 'blocked');
-  assert.equal(result.terminal?.reason, notice.STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON);
-  assert.notEqual(result.terminal?.resumable, false, 'no work began, so the turn resumes');
-  const text = String(result.finalOutput);
-  assert.ok(text.startsWith(notice.STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT), text);
-  assert.doesNotMatch(text, /\b(?:I|I’m|I'm|I’ll|I'll|I’ve|I've|me|my)\b/, 'the host never speaks as Clem');
-  assert.ok(!text.includes('could not safely reopen'), text);
-  assert.equal(model.calls(), 0);
-  assert.equal(host.isNarratableHostStop(result), false, 'an app notice is drawn as chrome, never narrated into a sentence');
-  assert.equal(eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
-    .filter(row => row.data.kind === 'host_terminal_steering_cutover').length, 0, 'a refused reopen writes no marker');
+  const result = await runProductionHost(fixture, agent, undefined, { hostJudgeCompletion: false });
+  assert.equal(result.finalOutput, 'Picked back up.');
+  assert.equal(result.terminal, undefined, 'a marker this attempt cannot reopen never refuses the turn');
+  assert.equal(model.calls(), 1);
+  const journaled = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+    .filter(row => row.data.kind === 'owner_steering_reopen_unavailable');
+  assert.equal(journaled.length, 1, 'the refused reopen is journaled once');
+  // The stop a refused reopen produces (any failure that is not an admission
+  // refusal) is app voice, drawn as chrome, never narrated into a sentence.
+  assert.doesNotMatch(notice.STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT, /\b(?:I|I’m|I'm|I’ll|I'll|I’ve|I've|me|my)\b/);
+  assert.ok(!notice.STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT.includes('could not safely reopen'));
+  const refused = { terminal: { status: 'blocked', reason: notice.STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON, resumable: true },
+    finalOutput: notice.STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT } as never;
+  assert.equal(host.isNarratableHostStop(refused), false, 'an app notice is drawn as chrome, never narrated into a sentence');
 });
 
 test('terminal steering compatibility: source-only direct runConversation and noninteractive workflow do not require attempts', async () => {
@@ -10271,6 +10300,91 @@ for (const scope of ['worker', 'nondirect', 'agent'] as const) {
     }
   });
 }
+
+const attemptRow = (attemptId: string) => eventlog.openEventLog()
+  .prepare('SELECT finished_at, status FROM run_attempts WHERE attempt_id = ?').get(attemptId) as { finished_at: string | null; status: string };
+
+test('terminal steering: a chat keeping a workflow handoff attempt still adopts a steer note and closes its own handoff', async () => {
+  const steering = await import('./steer-notes.js');
+  const session = eventlog.createSession({ id: `sess-steering-handoff-${++acceptedSerial}`, kind: 'chat' });
+  // An earlier request Clem handed to a durable workflow keeps its attempt
+  // active beside the next foreground request instead of being superseded.
+  const handoff = eventlog.beginRunAttempt(session.id, { runId: `handoff-${acceptedSerial}` });
+  const handoffSource = eventlog.recordRunAttemptUserInput(handoff, { turn: 1, role: 'user', data: { text: 'Run the controlled workflow.' } });
+  const sourceGroupId = `workflow-origin-group-v1:${'a'.repeat(64)}`;
+  const sourceGroupDigest = 'b'.repeat(64);
+  eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'async_work_dispatched', parentEventId: handoffSource.id,
+    data: { version: 2, kind: 'workflow_run_group', status: 'dispatched', sourceUserSeq: handoffSource.seq, sourceGroupId, sourceGroupDigest,
+      runIds: [`workflow-run-${acceptedSerial}`], replyTargetDigest: 'c'.repeat(64),
+      dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}` } });
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: `foreground-${acceptedSerial}` });
+  const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 2, role: 'user', data: { text: 'Report the supplied status.' } },
+    { armRunInFlight: true });
+  assert.deepEqual(attemptRow(handoff.attemptId), { finished_at: null, status: 'active' }, 'the handed-off request kept its attempt');
+  const parent = { sessionId: session.id, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId,
+    counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::turn:2` };
+  const fixture = { session, source, parent, context: { sessionId: session.id, sourceUserSeq: source.seq } };
+  const noteText = 'Write the status in French.';
+  let note!: { seq: number };
+  const model = scriptedRecordingModel([[textMsg('The status is ready.')], [textMsg('Le statut est prêt.')]]);
+  const respond = model.getResponse.bind(model);
+  model.getResponse = async request => {
+    const result = await respond(request);
+    if (model.calls() === 1) note = steering.appendSteerNote(session.id, noteText, { expectedAttemptId: attempt.attemptId });
+    return result;
+  };
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const outcome = await runProductionHost(fixture, agent, undefined, { hostJudgeCompletion: false });
+  assert.equal(outcome.finalOutput, 'Le statut est prêt.');
+  assert.equal(outcome.terminal, undefined);
+  assert.equal(model.calls(), 2);
+  assert.ok(JSON.stringify(model.requests[1]).includes(noteText));
+  assert.equal(eventlog.listEvents(session.id, { types: ['user_steer_note_delivered'] })
+    .filter(row => Array.isArray(row.data.noteSeqs) && row.data.noteSeqs.includes(note.seq)).length, 1);
+  const handoffs = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+    .filter(row => row.data.kind === 'host_terminal_steering_cutover');
+  assert.equal(handoffs.length, 1, 'the foreground owner closes its own handoff beside the preserved workflow attempt');
+  assert.equal((handoffs[0]!.data.marker as { attemptId: string }).attemptId, attempt.attemptId);
+  assert.deepEqual(attemptRow(handoff.attemptId), { finished_at: null, status: 'active' }, 'the handed-off request is neither adopted nor retired');
+  assert.throws(() => steering.appendSteerNote(session.id, 'After the handoff.', { expectedAttemptId: attempt.attemptId }),
+    error => steering.isSteerNoteAdmissionError(error) && error.code === 'STEER_NOTE_CUTOVER');
+});
+
+test('terminal steering: a stale cutover marker does not refuse the next turn', async () => {
+  const steering = await import('./steer-notes.js');
+  const session = eventlog.createSession({ id: `sess-steering-stale-marker-${++acceptedSerial}`, kind: 'chat' });
+  // A closed marker whose durable event is gone: the convenience slot alone
+  // can neither prove nor reopen any handoff.
+  const stale = { version: 1, state: 'closed', nonce: `stale-${acceptedSerial}`, sourceUserSeq: 1, attemptId: `attempt:stale-${acceptedSerial}`,
+    runId: null, scopeId: `${session.id}:stale`, leaseId: `lease-stale-${acceptedSerial}`,
+    objectiveDigest: createHash('sha256').update('old objective').digest('hex'),
+    candidateDigest: createHash('sha256').update('old reply').digest('hex') };
+  eventlog.openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.__host_terminal_steering_cutover', json(?))
+    WHERE id = ?`).run(JSON.stringify(stale), session.id);
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: `stale-marker-${acceptedSerial}` });
+  const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Report the supplied status.' } },
+    { armRunInFlight: true });
+  assert.throws(() => steering.reopenTerminalSteering({ sessionId: session.id, sourceUserSeq: source.seq, attemptId: attempt.attemptId,
+    lease: { sessionId: session.id, scopeId: `${session.id}:probe`, leaseId: 'probe', runAttemptId: attempt.attemptId } }),
+  error => steering.isSteerNoteAdmissionError(error) && error.code === 'STEER_NOTE_UNAVAILABLE', 'the slot is one the fence cannot read');
+  const parent = { sessionId: session.id, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId,
+    counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::turn:1` };
+  const fixture = { session, source, parent, context: { sessionId: session.id, sourceUserSeq: source.seq } };
+  const model = scriptedRecordingModel([[textMsg('The status is ready.')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const outcome = await runProductionHost(fixture, agent, undefined, { hostJudgeCompletion: false });
+  assert.equal(outcome.finalOutput, 'The status is ready.');
+  assert.equal(outcome.terminal, undefined, 'a stale marker never refuses the turn');
+  assert.equal(model.calls(), 1);
+  const journal = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] });
+  assert.equal(journal.filter(row => row.data.kind === 'owner_steering_reopen_unavailable'
+    && row.data.code === 'STEER_NOTE_UNAVAILABLE' && row.data.attemptId === attempt.attemptId).length, 1, 'the refusal is journaled');
+  assert.equal(journal.filter(row => row.data.kind === 'host_terminal_steering_cutover').length, 0,
+    'no fence is fabricated over a slot this attempt cannot own');
+  assert.equal(journal.filter(row => row.data.kind === 'host_blocked_terminal_site').length, 0);
+});
 
 /** A real accepted source whose text is the request the judge measures against. */
 function acceptJudgedSource(label: string, text: string, sourceData: Record<string, unknown> = {}) {

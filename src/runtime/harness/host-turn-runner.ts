@@ -31,7 +31,8 @@ import { redactSensitiveText } from '../security.js';
 import { workspaceDatasetHostFileCommit } from '../../spaces/workspace-set-data-contract.js';
 import { reviewedPlanCallRefusal, materializeReviewedPlanCallArguments } from './reviewed-plan-runtime.js';
 import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering, takeUndeliveredSteerNotes, hasUndeliveredSteerNotes, formatSteerBlock,
-  closeTerminalSteering, reopenTerminalSteering, sessionSupportsSteering, type TerminalSteeringOwner, type SteerNote } from './steer-notes.js';
+  closeTerminalSteering, reopenTerminalSteering, sessionSupportsSteering, isSteerNoteAdmissionError,
+  type TerminalSteeringOwner, type SteerNote } from './steer-notes.js';
 import { autoCaptureProvenanceFromAcceptedEvent, captureInteractionSignals, explicitMemoryInstructionFor, isEligibleAutoCaptureSourceProvenance } from '../../memory/auto-capture.js';
 import { TOOL_REGISTRY,
   isEffectDecidedPerCall,
@@ -1803,6 +1804,16 @@ class HostCallAuthorityBoundaryError extends Error {
   constructor(readonly boundaryKind: string) {
     super(`host call-authority boundary refused: ${boundaryKind}`);
     this.name = 'HostCallAuthorityBoundaryError';
+  }
+}
+
+/** The owner-steering fence could not be read, adopted or closed at a
+ * completion boundary. The judged candidate is kept and the turn stops
+ * resumable; a refused fence is a typed stop, never an exit. */
+class OwnerSteeringFenceError extends Error {
+  constructor(readonly fenceCode: string) {
+    super(`owner steering fence unavailable: ${fenceCode}`);
+    this.name = 'OwnerSteeringFenceError';
   }
 }
 
@@ -9888,7 +9899,7 @@ const runHostTurnBody = async (
     ...exactHostIdentity(), attemptId: harnessRunContextStorage.getStore()?.runAttemptId,
   } : undefined;
   const terminalSteeringLease = harnessRunContextStorage.getStore()?.dispatchLease;
-  const terminalCutoverOwner: TerminalSteeringOwner | undefined = terminalSteeringOwner?.attemptId && terminalSteeringLease
+  let terminalCutoverOwner: TerminalSteeringOwner | undefined = terminalSteeringOwner?.attemptId && terminalSteeringLease
     && sessionSupportsSteering(terminalSteeringOwner.sessionId)
     ? { sessionId: terminalSteeringOwner.sessionId, sourceUserSeq: terminalSteeringOwner.sourceUserSeq,
       attemptId: terminalSteeringOwner.attemptId, lease: { ...terminalSteeringLease } } : undefined;
@@ -9896,14 +9907,35 @@ const runHostTurnBody = async (
     try {
       assertRecoveryActivationOwned();
       reopenTerminalSteering(terminalCutoverOwner);
-    } catch {
-      // App voice, not Clem's: the loop attaches the steering notice by this
-      // reason and the clients draw it as chrome, with the next edge on the
-      // notice. Resumable: no work began, so nothing is lost to a new start.
-      return blockedOutcome(STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT, STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON);
+    } catch (error) {
+      if (!isSteerNoteAdmissionError(error)) {
+        // App voice, not Clem's: the loop attaches the steering notice by this
+        // reason and the clients draw it as chrome, with the next edge on the
+        // notice. Resumable: no work began, so nothing is lost to a new start.
+        return blockedOutcome(STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT, STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON);
+      }
+      // A marker this attempt cannot reopen (a stale slot, a changed owner, a
+      // published predecessor) is not permission to refuse the owner's turn.
+      // The turn runs without the atomic handoff fence: pending notes are
+      // still adopted before any terminal, and the refusal is journaled.
+      hostTurnLogger.warn({ code: error.code, attemptId: terminalCutoverOwner.attemptId },
+        'host turn proceeds without terminal steering ownership');
+      journalHostGuide('owner_steering_reopen_unavailable', { code: error.code, attemptId: terminalCutoverOwner.attemptId });
+      terminalCutoverOwner = undefined;
     }
   }
-  const reopenForOwnerSteering = (objective: string, draft?: AnswerDraftStep): boolean => {
+  /** Fence refusals at a completion boundary become one typed stop that keeps
+   * the judged candidate. Any other failure keeps its own type. */
+  const ownerSteeringFence = <T>(work: () => T): T => {
+    try {
+      return work();
+    } catch (error) {
+      if (isSteerNoteAdmissionError(error)) throw new OwnerSteeringFenceError(error.code);
+      if (error instanceof HostCallAuthorityBoundaryError) throw new OwnerSteeringFenceError(error.boundaryKind);
+      throw error;
+    }
+  };
+  const reopenForOwnerSteering = (objective: string, draft?: AnswerDraftStep): boolean => ownerSteeringFence(() => {
     if (!hostOwnerSteering || signal?.aborted) return false;
     assertRecoveryActivationOwned();
     const identity = exactHostIdentity();
@@ -9928,8 +9960,8 @@ const runHostTurnBody = async (
     draft?.retract();
     journalHostGuide('owner_steering_before_terminal', { noteSeqs: arrived.map(note => note.seq) });
     return true;
-  };
-  const closeForOwnerSteering = (objective: string, text: string, draft?: AnswerDraftStep): boolean => {
+  });
+  const closeForOwnerSteering = (objective: string, text: string, draft?: AnswerDraftStep): boolean => ownerSteeringFence(() => {
     if (reopenForOwnerSteering(objective, draft)) return false;
     if (!terminalCutoverOwner || signal?.aborted) return true;
     assertRecoveryActivationOwned();
@@ -9940,6 +9972,18 @@ const runHostTurnBody = async (
     captureExplicitSteerInstructions(terminalCutoverOwner.sessionId, result.notes);
     reopenForOwnerSteering(objective, draft);
     return false;
+  });
+  /** The fence refused at a completion boundary. The owner reads Clem's own
+   * judged candidate, the fence code travels as the terminal reason, and the
+   * turn stops resumable with its settled history: nothing is retried or
+   * thrown out of the host. */
+  const heldByOwnerSteeringFence = (error: OwnerSteeringFenceError, candidate: string,
+    frameHistory: AgentInputItem[], responseId: string | undefined): RunOutcome => {
+    journalHostGuide('owner_steering_fence_unavailable', { code: error.fenceCode });
+    history.push(...frameHistory);
+    if (responseId !== undefined) lastResponseId = responseId;
+    retainConnectionProgress();
+    return blockedOutcome(candidate, 'owner_steering_fence_unavailable');
   };
   for (let stepIndex = currentHostStepIndex; ; stepIndex += 1) {
     const activationContext = harnessRunContextStorage.getStore();
@@ -11071,42 +11115,47 @@ const runHostTurnBody = async (
         const judged = await judgeHostCompletion(candidateText, admission.frame.history, step.responseId, undefined,
           normalization ? { normalization, originalReply: admission.frame.text } : undefined,
           ownerResponseFormatForStep, ownerResponseFormatRequiredForStep);
-        if (reopenForOwnerSteering(completionObjective, answerDraft)) continue;
-        if (ownerResponseFormatHeld) {
-          if (!closeForOwnerSteering(completionObjective, admission.frame.text, answerDraft)) continue;
-          // Keep the complete admitted draft, including prose/qualifications,
-          // and prior settlements. No extraction, replacement or retry. Clem's
-          // own draft is what the owner reads; the format miss travels as the
-          // terminal reason, which the reducer turns into an app notice.
-          history.push(...admission.frame.history);
-          if (step.responseId !== undefined) lastResponseId = step.responseId;
-          retainConnectionProgress();
-          return blockedOutcome(admission.frame.text,
-            ownerResponseFormatHeld === 'unmet' ? 'owner_response_format_unmet' : 'owner_response_format_unqualified');
-        }
-        if (normalization) {
-          assertRecoveryActivationOwned();
-          const current = currentFenceOwner();
-          if (signal?.aborted || !current
-            || !responseFenceNormalizationCurrent(normalization, current, admission.frame.text)) {
+        try {
+          if (reopenForOwnerSteering(completionObjective, answerDraft)) continue;
+          if (ownerResponseFormatHeld) {
+            if (!closeForOwnerSteering(completionObjective, admission.frame.text, answerDraft)) continue;
+            // Keep the complete admitted draft, including prose/qualifications,
+            // and prior settlements. No extraction, replacement or retry. Clem's
+            // own draft is what the owner reads; the format miss travels as the
+            // terminal reason, which the reducer turns into an app notice.
+            history.push(...admission.frame.history);
+            if (step.responseId !== undefined) lastResponseId = step.responseId;
+            retainConnectionProgress();
+            return blockedOutcome(admission.frame.text,
+              ownerResponseFormatHeld === 'unmet' ? 'owner_response_format_unmet' : 'owner_response_format_unqualified');
+          }
+          if (normalization) {
+            assertRecoveryActivationOwned();
+            const current = currentFenceOwner();
+            if (signal?.aborted || !current
+              || !responseFenceNormalizationCurrent(normalization, current, admission.frame.text)) {
+              nextDraftRetractReason = 'review';
+              continue;
+            }
+            if (judged !== 'continue') reviewedReplacementText = candidateText;
+          }
+          if (judged === 'continue') {
             nextDraftRetractReason = 'review';
             continue;
           }
-          if (judged !== 'continue') reviewedReplacementText = candidateText;
-        }
-        if (judged === 'continue') {
-          nextDraftRetractReason = 'review';
-          continue;
-        }
-        if (judged === 'awaiting_user_input') {
-          const guarded = await runOutputGuardrails(candidateText, [...history, ...admission.frame.history]);
-          if (reopenForOwnerSteering(completionObjective, answerDraft)) continue;
-          if (!closeForOwnerSteering(completionObjective, guarded, answerDraft)) continue;
-          history.push(...admission.frame.history);
-          if (step.responseId !== undefined) lastResponseId = step.responseId;
-          retainConnectionProgress();
-          return { history, lastResponseId, finalOutput: guarded,
-            terminal: { status: 'awaiting_user_input', reason: 'completion_review_needs_input' } };
+          if (judged === 'awaiting_user_input') {
+            const guarded = await runOutputGuardrails(candidateText, [...history, ...admission.frame.history]);
+            if (reopenForOwnerSteering(completionObjective, answerDraft)) continue;
+            if (!closeForOwnerSteering(completionObjective, guarded, answerDraft)) continue;
+            history.push(...admission.frame.history);
+            if (step.responseId !== undefined) lastResponseId = step.responseId;
+            retainConnectionProgress();
+            return { history, lastResponseId, finalOutput: guarded,
+              terminal: { status: 'awaiting_user_input', reason: 'completion_review_needs_input' } };
+          }
+        } catch (error) {
+          if (!(error instanceof OwnerSteeringFenceError)) throw error;
+          return heldByOwnerSteeringFence(error, candidateText, admission.frame.history, step.responseId);
         }
       }
       const completionObjective = hostProduction ? judgedObjective() : '';
@@ -11117,16 +11166,22 @@ const runHostTurnBody = async (
         if (step.responseId !== undefined) lastResponseId = step.responseId;
         return await completedOutcome(deliveredText);
       }
-      const completed = await completedOutcome(deliveredText, {
-        current: () => !reopenForOwnerSteering(completionObjective, answerDraft),
-        outputHistory: [...history, ...admission.frame.history],
-        commit: () => {
-          if (!closeForOwnerSteering(completionObjective, deliveredText, answerDraft)) return false;
-          history.push(...admission.frame.history);
-          if (step.responseId !== undefined) lastResponseId = step.responseId;
-          return true;
-        },
-      });
+      let completed: RunOutcome | undefined;
+      try {
+        completed = await completedOutcome(deliveredText, {
+          current: () => !reopenForOwnerSteering(completionObjective, answerDraft),
+          outputHistory: [...history, ...admission.frame.history],
+          commit: () => {
+            if (!closeForOwnerSteering(completionObjective, deliveredText, answerDraft)) return false;
+            history.push(...admission.frame.history);
+            if (step.responseId !== undefined) lastResponseId = step.responseId;
+            return true;
+          },
+        });
+      } catch (error) {
+        if (!(error instanceof OwnerSteeringFenceError)) throw error;
+        return heldByOwnerSteeringFence(error, deliveredText, admission.frame.history, step.responseId);
+      }
       if (!completed) continue;
       return completed;
     }
@@ -12464,8 +12519,10 @@ const HOST_STOP_TEXTS_NOT_NARRATED = (): readonly string[] => [
 export function isNarratableHostStop(outcome: RunOutcome): boolean {
   if (!outcome.terminal || outcome.terminal.status !== 'blocked') return false;
   // This truthful owner-format hold deliberately spends no narration/repair
-  // model call when optional semantic review was disabled by the owner.
-  if (outcome.terminal.reason === 'owner_response_format_unmet' || outcome.terminal.reason === 'owner_response_format_unqualified') return false;
+  // model call when optional semantic review was disabled by the owner. A
+  // refused steering fence likewise publishes Clem's own judged candidate.
+  if (outcome.terminal.reason === 'owner_response_format_unmet' || outcome.terminal.reason === 'owner_response_format_unqualified'
+    || outcome.terminal.reason === 'owner_steering_fence_unavailable') return false;
   // A terminal the loop gives a notice is app chrome: the clients draw the
   // notice in place of a reply, so a narrated sentence would never be shown.
   if (outcome.terminal.reason === STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON) return false;
