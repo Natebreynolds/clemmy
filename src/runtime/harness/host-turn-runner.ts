@@ -3265,7 +3265,8 @@ const runHostTurnBody = async (
   const steeringContext = harnessRunContextStorage.getStore();
   const hostOwnerSteering = hostProduction && steeringContext?.workerScope !== true
     && steeringContext?.directOrchestrator !== false && !!steeringContext
-    && sessionSupportsSteering(steeringContext.sessionId) && getSession(steeringContext.sessionId)?.kind === 'chat';
+    && sessionSupportsSteering(steeringContext.sessionId)
+    && getSession(steeringContext.sessionId, { withoutConversationState: true })?.kind === 'chat';
   // Retain original model bytes in the accepted batch. Every execution check
   // below consumes the same locally schema-completed carrier bytes instead.
   const localArgumentPreparations = new Map<string, string>();
@@ -12246,7 +12247,7 @@ export const hostRunRunner: RunRunnerFn = async (runner, agent, itemsOrState, op
       ?? parent.sessionId}::host-runner:${randomUUID()}`
     : undefined;
   const lease: DispatchLeaseRef | undefined =
-    parent && scopeId && getSession(parent.sessionId)
+    parent && scopeId && getSession(parent.sessionId, { withoutConversationState: true })
       ? activateDispatchLease({
           sessionId: parent.sessionId,
           scopeId,
