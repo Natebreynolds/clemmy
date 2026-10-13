@@ -75,23 +75,15 @@ import {
   type TerminalNotice,
 } from './terminal-notice.js';
 
-/** A matching blocked review supersedes the rejected draft. Every other
- * review outcome publishes the authored text unchanged: the review travels as
- * terminal data (`review`, `reviewNote`) that clients show as a chip, never as
- * a sentence added under Clem's words. The caller retains a superseded draft
- * for audit. */
-export function completionReviewPresentation(input: {
-  authored: string; blockedFinding: string;
-  objectiveMatches: boolean; replyMatches: boolean;
-}): string {
-  if (input.blockedFinding && input.objectiveMatches && input.replyMatches) {
-    return input.blockedFinding;
-  }
-  return input.authored;
-}
-
 /** The committer's review state for the exact published text. */
 export type TerminalReviewState = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck';
+
+/** What the completion review did for this source, as the terminal records
+ * it beside the verdict reference. `rejected` is a reviewer that answered and
+ * said no; `enabled_unavailable` is one that never answered, could not read
+ * its evidence, or whose verdict cannot be bound to the published text. */
+export type CompletionReviewDisposition =
+  | 'disabled_by_owner' | 'reviewed' | 'rejected' | 'enabled_unavailable' | 'not_required';
 
 export interface DeliveryCommitResult {
   event: EventRow;
@@ -1323,7 +1315,7 @@ export function commitTurnOutcome(
     ? capturedRead.policy.enabled
     : capturedRead.status === 'absent' && completionReviewEnabled();
   const policyEvidence = capturedRead.status;
-  let reviewDisposition: 'disabled_by_owner' | 'reviewed' | 'enabled_unavailable' | 'not_required' = (() => {
+  let reviewDisposition: CompletionReviewDisposition = (() => {
     // A policy we could not read cannot certify anything about this run.
     if (capturedRead.status === 'unreadable') return 'enabled_unavailable';
     if (!reviewWasEnabled) return 'disabled_by_owner';
@@ -1333,7 +1325,9 @@ export function commitTurnOutcome(
     // failed-open publish look like a successful evaluation.
     if (publishedVerdict.failedOpen === true) return 'enabled_unavailable';
     if (publishedVerdict.settledEvidenceAvailable === false) return 'enabled_unavailable';
-    if (!publishedVerdict.fulfills) return 'enabled_unavailable';
+    // A reviewer that answered and said no is a working reviewer. Reporting
+    // it as unavailable hid a real finding behind a transport label.
+    if (!publishedVerdict.fulfills) return 'rejected';
     return 'reviewed';
   })();
   // OBJECTIVE VALIDATION against the same authority-aware expression the judge
@@ -1607,44 +1601,12 @@ export function commitTurnOutcome(
                   : !artifactsMatch
                     ? 'completion_review_artifact_drift'
                     : 'completion_review_did_not_stand';
-    // The draft stands exactly as authored for every cause. A matching BLOCKED
-    // reviewer finding still supersedes the rejected draft below; neither path
-    // repeats or undoes any effect. Superseded prose stays in internal history.
-    // A host evidence hold is not a reviewer finding and never replaces the
-    // answer: Clem's words stand and the chip asks for a fresh check.
-    const blockedFinding = detail === 'completion_review_blocked' && publishedVerdict?.hostEvidenceHold !== true
-      ? (publishedVerdict?.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 400)
-      : '';
-    const authored = effectiveOutcome.presentation.text.trim();
-    const reviewedPresentation = completionReviewPresentation({
-      authored, blockedFinding, objectiveMatches, replyMatches,
-    });
-    if (blockedFinding && reviewedPresentation === blockedFinding && authored !== reviewedPresentation) {
-      // Terminal metadata intentionally excludes arbitrary prose. Keep the
-      // rejected draft in internal history, never in the public answer envelope.
-      const replyDigest = createHash('sha256').update(authored).digest('hex');
-      const prior = openEventLog().prepare(`SELECT 1 FROM events WHERE session_id = ?
-        AND type = 'guardrail_tripped'
-        AND json_extract(data_json, '$.kind') = 'completion_review_rejected_draft'
-        AND json_extract(data_json, '$.sourceUserSeq') = ?
-        AND json_extract(data_json, '$.replyDigest') = ? LIMIT 1`)
-        .get(proposed.identity.sessionId, proposed.identity.sourceUserSeq, replyDigest);
-      if (!prior) appendEvent({
-        sessionId: proposed.identity.sessionId, turn: 0, role: 'system',
-        type: 'guardrail_tripped', data: {
-          kind: 'completion_review_rejected_draft',
-          sourceUserSeq: proposed.identity.sourceUserSeq, replyDigest,
-          rejectedText: authored, finding: blockedFinding,
-        },
-      });
-    }
-    const reviewedOutcome = {
-      ...effectiveOutcome,
-      presentation: {
-        ...effectiveOutcome.presentation,
-        text: reviewedPresentation,
-      },
-    };
+    // THE DRAFT STANDS EXACTLY AS AUTHORED FOR EVERY CAUSE, a matching BLOCKED
+    // reviewer finding included. The reviewer's sentence is never Clem's
+    // reply: it travels as `review` 'rejected' with its `reviewNote` (derived
+    // above) for the clients' chip, while the turn holds blocked and
+    // resumable. Neither path repeats or undoes any effect.
+    const authoredOutcome = effectiveOutcome;
     // A REVIEWER THAT CANNOT FIRE FOLLOWS THE BRAIN (owner decision 2026-09-09).
     //
     // Every other cause in this block is a real finding: a negative verdict,
@@ -1690,9 +1652,9 @@ export function commitTurnOutcome(
       && publishedVerdict.hostEvidenceHold !== true
       && joinsStand;
     unverifiedHoldFallback = reviewCouldNotFire
-      ? () => unverifiedCompletionOutcome(reviewedOutcome, true)
+      ? () => unverifiedCompletionOutcome(authoredOutcome, true)
       : null;
-    effectiveOutcome = reviewCouldNotFire ? reviewedOutcome : unverifiedCompletionOutcome(reviewedOutcome, true);
+    effectiveOutcome = reviewCouldNotFire ? authoredOutcome : unverifiedCompletionOutcome(authoredOutcome, true);
     effectiveOptions = {
       ...effectiveOptions,
       // The verification projection changed done to blocked. Derive the
@@ -1737,11 +1699,15 @@ export function commitTurnOutcome(
     // A VALID captured-off with a retained verdict is genuinely owner-disabled.
     // An UNREADABLE policy is not: we do not know what the owner chose, so it
     // must not be presented as their decision.
+    // A positive verdict that does not stand against the published text is
+    // not a review of it. A rejection keeps its name: the reviewer answered,
+    // and `replyMatches` / `objectiveMatches` beside it say which text it
+    // answered about.
     disposition: capturedRead.status === 'unreadable'
       ? 'enabled_unavailable'
       : !reviewWasEnabled
         ? 'disabled_by_owner'
-        : verdictTrustworthy ? reviewDisposition : 'enabled_unavailable',
+        : verdictTrustworthy || reviewDisposition === 'rejected' ? reviewDisposition : 'enabled_unavailable',
     policyEvidence,
     replyMatches,
     // The digest above describes the AUTHORED text the review saw. This is the

@@ -897,6 +897,68 @@ test(`publication keeps the ${label} reason and never calls a missing review an 
 }
 
 
+// The verdict reference must let a reader tell a reviewer that answered no
+// from one that never answered. Both leave `verified` false; only the
+// disposition says which happened.
+for (const entry of [
+  { label: 'blocked', verdict: { fulfills: false, blocked: true, reason: 'The named file does not exist.' },
+    disposition: 'rejected', review: 'rejected', status: 'blocked', detail: 'completion_review_blocked' },
+  { label: 'negative', verdict: { fulfills: false, reason: 'One of the three totals is wrong.' },
+    disposition: 'rejected', review: 'rejected', status: 'blocked', detail: 'completion_review_negative' },
+  { label: 'failed-open', verdict: { fulfills: true, failedOpen: true, reviewFailure: 'unavailable', reason: 'The reviewer route was unavailable.' },
+    disposition: 'enabled_unavailable', review: 'unchecked', status: 'done', detail: 'completion_review_failed_open' },
+  { label: 'negative-with-unreadable-evidence', verdict: { fulfills: false, settledEvidenceAvailable: false, reason: 'Could not read the settled work.' },
+    disposition: 'enabled_unavailable', review: 'rejected', status: 'blocked', detail: 'completion_review_negative' },
+] as const) {
+  test(`verdict disposition ${entry.label}: a reviewer that said no is reported as rejected, never as unavailable`, () => {
+    const sessionId = `verdict-disposition-${entry.label}`;
+    createSession({ id: sessionId, kind: 'chat' });
+    const outcome = acceptedAnswer(sessionId, 'Here is the requested answer.');
+    appendEvent({ sessionId, turn: 0, role: 'system', type: 'completion_policy_captured', data: {
+      version: 1, sourceUserSeq: outcome.identity.sourceUserSeq, enabled: true,
+    } });
+    appendEvent({ sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+      lane: 'host_v1', kind: 'completion', sourceUserSeq: outcome.identity.sourceUserSeq, ...entry.verdict,
+      objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+      replyDigest: createHash('sha256').update(outcome.presentation.text).digest('hex'),
+    } });
+    const committed = commitTurnOutcome(outcome);
+    assert.equal(committed.presentation.text, outcome.presentation.text, 'the reply is Clem\'s text for every disposition');
+    assert.equal(committed.presentation.status, entry.status);
+    assert.equal(committed.event.data.review, entry.review);
+    assert.equal(committed.event.data.verificationDetail, entry.detail);
+    const ref = committed.event.data.completionVerdictRef as Record<string, unknown>;
+    assert.equal(ref.verified, false);
+    assert.equal(ref.disposition, entry.disposition);
+  });
+}
+
+test('a rejection recorded against other reply bytes keeps its disposition while the join says which text it judged', () => {
+  const sessionId = 'verdict-disposition-rejected-other-reply';
+  createSession({ id: sessionId, kind: 'chat' });
+  const outcome = acceptedAnswer(sessionId, 'The current answer.');
+  appendEvent({ sessionId, turn: 0, role: 'system', type: 'completion_policy_captured', data: {
+    version: 1, sourceUserSeq: outcome.identity.sourceUserSeq, enabled: true,
+  } });
+  appendEvent({ sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+    lane: 'host_v1', kind: 'completion', sourceUserSeq: outcome.identity.sourceUserSeq,
+    fulfills: false, blocked: true, reason: 'The earlier draft claims a file that does not exist.',
+    objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+    replyDigest: createHash('sha256').update('An earlier draft.').digest('hex'),
+  } });
+  const committed = commitTurnOutcome(outcome);
+  assert.equal(committed.presentation.text, 'The current answer.');
+  assert.equal(committed.presentation.status, 'blocked');
+  // Not a finding about these words: unchecked, and the finding is not quoted.
+  assert.equal(committed.event.data.review, 'unchecked');
+  assert.equal(committed.event.data.reviewNote, undefined);
+  const ref = committed.event.data.completionVerdictRef as Record<string, unknown>;
+  assert.equal(ref.disposition, 'rejected');
+  assert.equal(ref.replyMatches, false);
+  assert.equal(ref.deliveredTextIsJudgedText, false);
+  assert.equal(ref.verified, false);
+});
+
 test('publication distinguishes an intentional history-only review skip from an unavailable review', async () => {
   const { captureEffectiveCompletionPolicyOnce } = await import('./host-turn-runner.js');
   const { conversationalReviewSkipRecord } = await import('./completion-review-skip.js');

@@ -108,6 +108,11 @@ const REVIEW_CAUSES: ReadonlyArray<{
   review: 'unchecked', status: 'blocked' },
   { cause: 'negative', verdict: () => ({ fulfills: false, reason: 'The count in the reply does not match the read.' }),
     review: 'rejected', status: 'blocked', note: 'The count in the reply does not match the read.' },
+  // A BLOCKED finding is a rejection another attempt cannot change. It is
+  // still chip detail: the reviewer's sentence never replaces Clem's draft.
+  { cause: 'blocked', verdict: () => ({ fulfills: false, blocked: true,
+    reason: 'The requested file does not exist, so the summary cannot be produced.' }),
+  review: 'rejected', status: 'blocked', note: 'The requested file does not exist, so the summary cannot be produced.' },
   { cause: 'format_only', verdict: () => ({ fulfills: false, repairScope: 'reply_format',
     responseFormatContract: { kind: 'whole_json_object', candidateValid: false },
     reason: `The reply covers the request.\n${WHOLE_JSON_OBJECT_FORMAT_FINDING}` }),
@@ -163,6 +168,48 @@ for (const entry of REVIEW_CAUSES) {
       'a finding about other reply bytes is never quoted beside these');
   });
 }
+
+test('a BLOCKED review delivers the authored draft byte for byte; the finding is review rejected with its note, on every transport', () => {
+  // A long shortfall account, as Clem writes one: the reviewer's one-line
+  // finding must not stand in for it anywhere the reply is read.
+  const authored = 'I couldn\'t complete this one: there is no quarterly-summary.pdf in the folder you named.\n\n'
+    + Array.from({ length: 12 }, (_, i) => `- Checked location ${i + 1}: nothing matching the name, only the earlier monthly files.`).join('\n')
+    + '\n\nIf you can point me at where it lives, or share it here, I will pick this up from there.';
+  const finding = 'The reply reports the file missing; no summary was produced and another attempt cannot change that.';
+  const outcome = acceptedAnswer('voice-blocked-review-draft', authored);
+  verdict(outcome, { fulfills: false, blocked: true, reason: finding });
+  const committed = commitTurnOutcome(outcome);
+  assert.equal(committed.presentation.text, authored);
+  assert.equal(committed.presentation.status, 'blocked');
+  assert.equal(committed.presentation.resumable, true);
+  assert.equal(committed.event.data.review, 'rejected');
+  assert.equal(committed.event.data.reviewNote, finding);
+  assert.equal(committed.event.data.verificationDetail, 'completion_review_blocked');
+  const ref = committed.event.data.completionVerdictRef as Record<string, unknown>;
+  assert.equal(ref.disposition, 'rejected');
+  assert.equal(ref.deliveredTextIsJudgedText, true);
+  assert.equal(listEvents(outcome.identity.sessionId, { types: ['guardrail_tripped'] })
+    .some(event => event.data.kind === 'completion_review_rejected_draft'), false, 'nothing was superseded, so nothing is retained as a rejected draft');
+  // SSE / event replay.
+  const data = record('review:blocked_long_draft', committed.event);
+  assert.equal((data.presentation as { text: string }).text, authored);
+  assert.equal(data.reply, authored);
+  assert.equal(data.review, 'rejected');
+  assert.equal(data.reviewNote, finding);
+  assert.ok(!authored.includes(finding));
+  // Bridge replies, console and mobile terminal routes.
+  assert.equal(publicPresentationText(committed.presentation), authored);
+  assert.equal(publicCompletionText(committed.event.data), authored);
+  // Transcript reopen carries Clem's words and the same typed review facts.
+  const reopened = reconstructHarnessTranscript(outcome.identity.sessionId).filter(turn => turn.role === 'assistant');
+  assert.deepEqual(reopened.map(turn => turn.text), [authored]);
+  const reopenedTerminal = reopened[0]!.terminal as Record<string, unknown>;
+  assert.equal(reopenedTerminal.review, 'rejected');
+  assert.equal(reopenedTerminal.reviewNote, finding);
+  assert.deepEqual(reopenedTerminal.presentation, { status: 'blocked', kind: 'blocked' });
+  const prior = pullRecentTurnsForSession(openEventLog(), outcome.identity.sessionId, 10);
+  assert.equal(prior.at(-1)?.text, authored);
+});
 
 test('a terminal carrying the retained header projects to exactly its head on every transport while the durable row keeps the rh_ handles', () => {
   const sessionId = 'voice-retained-transports';
