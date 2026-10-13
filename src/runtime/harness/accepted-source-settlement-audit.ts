@@ -126,10 +126,13 @@ function providerAnsweredRefusal(row: SettlementRow): boolean {
 export function answeredRefusalSettlement(row: Pick<SettlementRow, 'mutating' | 'execution_kind' | 'outcome_kind' | 'outcome_detail'>): boolean {
   // A command that leaves the machine runs on the host's own crossing, so
   // its answered refusal settles as local execution; it is the same answer.
+  // A reply whose own bytes contradict its success flag is the same kind of
+  // answer: the provider spoke and the model read it.
   return row.mutating === 1
     && (row.execution_kind === 'provider_execution' || row.execution_kind === 'local_execution')
     && row.outcome_kind === 'uncertain_write'
-    && row.outcome_detail === 'provider_refused_envelope';
+    && (row.outcome_detail === 'provider_refused_envelope'
+      || row.outcome_detail === 'provider_envelope_contradiction');
 }
 
 function boundedReason(error: unknown): string {

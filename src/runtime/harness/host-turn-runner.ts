@@ -131,6 +131,7 @@ import {
   InvalidArgumentsPreDispatchResult,
   settleAdmittedLogicalCallPreDispatchDisposition,
   providerAnsweredWithRefusal,
+  providerRepliedWithoutProof,
   providerRefusedExactRequest,
 } from './attempt-settlement.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
@@ -7399,6 +7400,7 @@ const runHostTurnBody = async (
     let returnedPreDispatchRefusal = false;
     let settlementRequiresReconciliation = false;
     let providerRejectedBeforeEffect = false;
+    let providerRepliedUnverified = false;
     let committedVerificationHolds: CommittedMutationVerificationHold[] = [];
     if (canaryRefusal) {
       output = canaryRefusal;
@@ -7715,16 +7717,21 @@ const runHostTurnBody = async (
           // settles and the model gets the ordinary result. Live 2026-09-08:
           // platform-49 blocked on space_refresh, a non-mutating local view
           // rebuild, because the flag tripped for every effect class.
-          // A provider that answered the write with its own refusal envelope
-          // leaves nothing in the dark: the model reads the target state and
-          // answers in words, and the write keeps no replay authority. The
-          // hard block is for a dropped acknowledgement, where nothing can be
-          // read back yet (live 2026-10-07: a provider answered a delete with its own not-found).
+          // A provider that REPLIED to the write leaves nothing in the dark:
+          // its own refusal, or a reply whose bytes do not prove the effect.
+          // The model reads the provider's words and answers, and the write
+          // keeps no replay authority. The hard block is for a dropped
+          // acknowledgement, where nothing came back to read (live
+          // 2026-10-07: a provider answered a delete with its own not-found;
+          // live 2026-10-13: an app answered a delete with a success flag
+          // over a body that said failure).
           settlementRequiresReconciliation =
             invoked.settlement.outcome.directive.requiresReconciliation === true
             && uncertainEffectStopsTurn(effect)
-            && !providerAnsweredWithRefusal(invoked.settlement.outcome);
+            && !providerRepliedWithoutProof(invoked.settlement.outcome);
           providerRejectedBeforeEffect = providerRefusedExactRequest(invoked.settlement.outcome);
+          providerRepliedUnverified = providerRepliedWithoutProof(invoked.settlement.outcome)
+            && !providerAnsweredWithRefusal(invoked.settlement.outcome);
           if (
             preserveWorkCallCarrier
             && (effect === 'local_write' || effect === 'external_write' || effect === 'admin')
@@ -7869,7 +7876,15 @@ const runHostTurnBody = async (
         + 'Use the stated reason to correct the request once within the original authority. '
         + 'Independent exact target-state evidence is still required to claim the requested end state.'
       : undefined;
-    const steer = [hostSteer, refusedWriteNote].filter(Boolean).join('\n') || undefined;
+    // The reply came back but its own bytes do not prove the change took:
+    // the model reads them and answers, and claims nothing it has not read.
+    const repliedUnverifiedNote = !structuredToolOutputs(output)
+      && admittedEffect === 'external_write'
+      && providerRepliedUnverified
+      ? 'The app replied without confirming this change; its reply is above. Nothing is known to have landed: '
+        + 'read the target before saying it did. This exact call is not resent; a changed call goes through the gate like any write.'
+      : undefined;
+    const steer = [hostSteer, refusedWriteNote, repliedUnverifiedNote].filter(Boolean).join('\n') || undefined;
     return {
       historyItem: functionResultItem(call.callId, call.name, modelOutput, steer),
       ...(tool ? { tool } : {}),
@@ -8079,7 +8094,7 @@ const runHostTurnBody = async (
       // aibs__create_site the app refused ended the turn "may have begun…
       // must be reconciled" with a blank effect_unknown marker, and the
       // owner never learned what the app had said.
-      if (providerAnsweredWithRefusal(settlement.outcome)) return 'answered_refusal';
+      if (providerRepliedWithoutProof(settlement.outcome)) return 'answered_refusal';
       // A DECLARED-READ call with zero crossings that left the machine has no
       // external effect to reconcile: the settlement is host-authored at mint
       // (never the model, never a name heuristic), physicalCrossingCount

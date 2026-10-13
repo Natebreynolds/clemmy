@@ -797,7 +797,7 @@ function signalsFromResult(result: unknown): AttemptSignals {
  * The settled adapter proof, never a second reading of provider bytes.
  * A generic unsuccessful envelope cannot prove that nothing committed.
  */
-export { providerAnsweredWithRefusal } from './attempt-outcome.js';
+export { providerAnsweredWithRefusal, providerRepliedWithoutProof } from './attempt-outcome.js';
 
 export function providerRefusedExactRequest(outcome: AttemptOutcome): boolean {
   return outcome.kind === 'invalid_arguments'
@@ -1478,6 +1478,34 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     : extracted.preDispatch === true
       ? 'refused_pre_dispatch' as const
       : 'local_execution' as const;
+
+  // THE TWO READERS OF ONE REPLY NEVER KILL THE ATTEMPT. The classifier reads
+  // the protocol: a returned MCP result whose isError is false is a success.
+  // The result-handle facts read the bytes: an envelope that says
+  // `success: false`, an error field, a non-HTTP failure code. When a
+  // mutating provider reply is a success by protocol and a failure by its
+  // own bytes, the settlement store used to throw "successful provider
+  // result did not produce redeemable result authority"; the attempt died,
+  // the frame could never be recorded, and the turn ended in host prose
+  // (live 2026-10-13: an approved aibs__delete_backend the app answered,
+  // five commit retries, "I could not reopen the saved checkpoint"). The
+  // disagreement is the provider's own contradiction: the write stays
+  // uncertain, its bytes are retained for the model, nothing is replayed,
+  // and the turn goes on.
+  if (
+    outcome.kind === 'succeeded'
+    && settlementMutating
+    && executionKind === 'provider_execution'
+    && input.thrown === undefined
+    && deriveResultHandleFactsFromRaw(input.result).success === false
+  ) {
+    outcome = classifyAttemptOutcome({
+      ...extracted,
+      envelopeSuccessful: undefined,
+      providerReportedError: undefined,
+      providerEnvelopeContradicted: true,
+    });
+  }
 
   // THE HOST'S OWN EXECUTION IS EVIDENCE. Nothing left the machine, so there
   // was no crossing to record and therefore no durable result to redeem, no

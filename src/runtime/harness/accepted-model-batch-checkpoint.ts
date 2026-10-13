@@ -965,8 +965,11 @@ function settledNonSuccessProjectionDisposition(input: {
   // keeps the reconciliation stop (live 2026-10-12: an approved
   // aibs__create_site the app refused ended "may have begun… must be
   // reconciled" and the model never saw why).
+  // A reply whose own bytes contradict its success flag is the same kind of
+  // answer: the provider spoke, the model reads it, nothing is replayed.
   const answeredRefusal = settlement.outcome_kind === 'uncertain_write'
-    && settlement.outcome_detail === 'provider_refused_envelope'
+    && (settlement.outcome_detail === 'provider_refused_envelope'
+      || settlement.outcome_detail === 'provider_envelope_contradiction')
     && settlement.unanswered_crossing_count === 0;
   const mutatingSafeFailure = answeredRefusal || new Set([
     'invalid_arguments',

@@ -519,3 +519,15 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
 export function providerAnsweredWithRefusal(outcome: AttemptOutcome): boolean {
   return outcome.kind === 'uncertain_write' && outcome.detail === 'provider_refused_envelope';
 }
+
+/** The provider REPLIED to the write with bytes the model can read, without
+ * proving the effect: a refusal, or a reply whose own envelope contradicts
+ * success (a protocol-level success whose body says failure). Nothing is in
+ * the dark. The ledger keeps the uncertain write's directive (no replay, no
+ * success handle, read back before claiming), and the turn goes on: the
+ * model reads the provider's words and answers. The dark is a reply that
+ * never came. */
+export function providerRepliedWithoutProof(outcome: AttemptOutcome): boolean {
+  return outcome.kind === 'uncertain_write'
+    && (outcome.detail === 'provider_refused_envelope' || outcome.detail === 'provider_envelope_contradiction');
+}

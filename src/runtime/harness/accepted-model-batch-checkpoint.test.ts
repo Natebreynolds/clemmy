@@ -1903,6 +1903,47 @@ test('a refusal the provider answered by throwing is still answered: its crossin
   leases.revokeDispatchLease(task.parentLease);
 });
 
+test('a mutating reply that is a success by protocol and a failure by its own bytes settles as a contradicted envelope, checkpoints ready and never throws', async () => {
+  // Live 2026-10-13: an approved aibs__delete_backend came back as an MCP
+  // result with isError false whose body said failure. The classifier called
+  // it a success, the result-handle facts called it a failure, and the
+  // settlement store threw "successful provider result did not produce
+  // redeemable result authority": the attempt died, the frame could never be
+  // recorded, five commit retries spent the checkpoint budget, and the turn
+  // ended "I could not reopen the saved checkpoint" in host prose.
+  const task = fixture('Delete the exact hosted backend once.', 'execute');
+  const callId = 'call:protocol-success-body-failure-write';
+  const toolName = 'aibs__delete_backend';
+  const args = { backend_id: 'fixture-does-not-exist' };
+  const admitted = checkpoints.admitAcceptedModelBatch({
+    sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq,
+    preHistory: preHistory(task), frameHistory: openFrame({ callId, toolName, args }),
+    providerResponseId: 'response:protocol-success-body-failure-write',
+  });
+  assert.equal(admitted.status, 'admitted');
+  if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+  const payload = { content: [{ type: 'text', text: '{"success": false, "error": "Backend not found"}' }], isError: false };
+  let bodies = 0;
+  const invoked = await runCall({
+    task, callId, toolName, args, effect: 'external_write', boundary: 'host_owned_external',
+    invoke: async () => { bodies += 1; return payload; },
+  });
+  assert.equal(invoked.settlement.outcome.kind, 'uncertain_write');
+  assert.equal(invoked.settlement.outcome.detail, 'provider_envelope_contradiction', 'the disagreement is the provider\'s own contradiction, not an exception');
+  assert.deepEqual(physicalRows(task, callId).map((row) => row.state), ['returned']);
+  const resultItem = projectedTextResult({ callId, toolName, value: payload });
+  recordLogicalResult(admitted.admission, resultItem);
+  const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, { committedResultItems: [resultItem] });
+  assert.ok(finalized.status === 'committed' || finalized.status === 'existing', JSON.stringify(finalized));
+  assert.equal(finalized.checkpoint.disposition, 'ready', 'the model reads the reply; nothing waits for reconciliation');
+  const recovered = checkpoints.recoverAcceptedModelBatchForRestart({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq });
+  assert.equal(recovered.status, 'ready');
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM durable_result_handles WHERE session_id = ? AND logical_tool_call_id = ? AND success = 1').get(task.sessionId, callId) as { n: number }).n, 0,
+    'a reply without proof never gets a success handle');
+  assert.equal(bodies, 1, 'and is never run again');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
 test('an uncertain host-owned mutation with zero provider crossings checkpoints reconciliation', async () => {
   const task = fixture('Attempt one host-owned mutation whose effect is not acknowledged.', 'execute');
   const callId = 'call:host-owned-unknown-write';
