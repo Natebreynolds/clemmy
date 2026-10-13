@@ -1217,6 +1217,23 @@ function settlementConsequence(input: {
       recoveryToolNames: [call.name, 'tool_search', 'ask_user_question'],
     });
   }
+  // A provider that REPLIED without proving the effect — a success by
+  // protocol whose own bytes say failure — is the same kind of answer: the
+  // model has the reply and reads the target before claiming anything;
+  // nothing is owed to the reconcile stop. Live 2026-10-13: an approved
+  // backend delete the app answered `not found` under a clean error flag
+  // settled as the provider's contradiction, reached the model, and this
+  // projection still ended the turn "may have begun… must be reconciled".
+  const repliedUnverified = settlement.outcome_kind === 'uncertain_write'
+    && settlement.outcome_detail === 'provider_envelope_contradiction';
+  if (repliedUnverified) {
+    return createNoProgressConsequence({
+      stage: `execution:provider_replied_unverified:${providerRefusedRequestIdentity(call)}`,
+      recovery: 'repair_model',
+      effectState: 'known_terminal',
+      recoveryToolNames: [call.name, 'tool_search', 'ask_user_question'],
+    });
+  }
   if (
     settlement.requires_reconciliation === 1
     || settlement.outcome_kind === 'uncertain_write'

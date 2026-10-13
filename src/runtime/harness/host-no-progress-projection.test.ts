@@ -1950,6 +1950,40 @@ test('a write the provider answered with its own refusal is a known terminal the
   db.close();
 });
 
+test('a write the provider answered without proving it (a success by protocol, a failure by its bytes) is read back by the model, never a reconciliation stop', () => {
+  // Live 2026-10-13: an approved backend delete the app answered `not found`
+  // under a clean error flag settled as the provider's own contradiction and
+  // reached the model, and this projection still ended the turn "may have
+  // begun… must be reconciled".
+  const identity = accepted('replied-unverified');
+  const db = settlementDb([{
+    callId: 'unverified-write',
+    executionKind: 'provider_execution',
+    outcomeKind: 'uncertain_write',
+    outcomeDetail: 'provider_envelope_contradiction',
+    recoveryAction: 'reconcile_then_decide',
+    businessCall: 1,
+    mutating: 1,
+    requiresReconciliation: 1,
+    physicalCrossingCount: 1,
+  }], identity);
+  const projected = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('unverified-write', 'mcp__fixture__delete'),
+      result('unverified-write', 'mcp__fixture__delete'),
+    ],
+  }, db);
+  assert.equal(projected.status, 'ok');
+  if (projected.status === 'ok') {
+    assert.match(projected.consequence?.stage ?? '', /^execution:provider_replied_unverified:/);
+    assert.equal(projected.consequence?.recovery, 'repair_model');
+    assert.equal(projected.consequence?.effectState, 'known_terminal');
+    assert.deepEqual(projected.consequence?.recoveryToolNames, ['ask_user_question', 'mcp__fixture__delete', 'tool_search']);
+  }
+  db.close();
+});
+
 test('an unknown external crossing remains reconciliation-owned', () => {
   const identity = accepted('unknown-crossing');
   const db = settlementDb([{
