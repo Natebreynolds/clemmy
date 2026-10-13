@@ -71,6 +71,21 @@ test('workflow review carries complete source evidence and the complete delivera
   assert.ok(!prompt.includes('elided from the MIDDLE'));
 });
 
+test('review depth follows what the run did: read stakes forward as read, a write or unknown work keeps the full review', async () => {
+  const stakes: string[] = [];
+  const judgeFn = async (_objective: string, _reply: string, context?: { reviewStakes?: string }) => {
+    stakes.push(context?.reviewStakes ?? 'none');
+    return { done: true, reason: 'Reviewed.' };
+  };
+  await judgeWorkflowTarget({ workflow: wf(), inputs: {}, finalOutput: 'The file holds 323.',
+    executionEvidence: () => ({ available: true, summary: 'read_file -> read_file [outcome=succeeded; mutating=0]', reviewStakes: 'read' }), judgeFn });
+  await judgeWorkflowTarget({ workflow: wf(), inputs: {}, finalOutput: 'Saved 323.',
+    executionEvidence: () => ({ available: true, summary: 'write -> write [outcome=succeeded; mutating=1]', reviewStakes: 'write' }), judgeFn });
+  await judgeWorkflowTarget({ workflow: wf(), inputs: {}, finalOutput: 'Saved 323.',
+    executionEvidence: () => ({ available: true, summary: 'evidence without a stakes reading' }), judgeFn });
+  assert.deepEqual(stakes, ['read', 'write', 'write']);
+});
+
 test('a fail-open model result is unavailable, never a successful workflow review', async () => {
   const verdict = await judgeWorkflowTarget({ workflow: wf(), inputs: {}, finalOutput: 'A real result',
     judgeFn: async () => ({ done: true, failedOpen: true, reason: 'Selected model capacity unavailable' }) });
