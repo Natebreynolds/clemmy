@@ -4676,6 +4676,11 @@ function inFlightCompactionEnabled(): boolean {
 const CONTINUATION_INPUT =
   'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';
 
+/** The model-visible item of a stall retry. The retry's own instruction rides
+ * beside it as transient system context for that one request, so it is never
+ * recorded or learned as something the owner said. */
+const STALL_RETRY_CONTINUATION_INPUT = 'Continue with the next step of your plan.';
+
 /** Exact authority projected from a trusted producer's durable graph event. */
 export interface VerifiedWorkflowRunDispatchReceipt {
   sourceGroupId: string;
@@ -7465,6 +7470,11 @@ async function runConversationCore(
 
   let stepIndex = 0;
   let nextInput = options.input;
+  // A harness directive for exactly one step (the stall retry). It is model-only
+  // context for that request: never the user item, never a recorded or learned
+  // owner statement. A fallover re-attempt of the same step keeps it.
+  let stepDirective: string | undefined;
+  let stepDirectiveStep = 0;
   // CONVERGENCE: if Clem's previous turn ended by asking a clarifying question,
   // carry one private guidance beat so the model does not re-ask it.
   // This standard harness lane serves Codex, OpenAI, and BYO models. Derive the
@@ -7668,10 +7678,11 @@ async function runConversationCore(
     // the same goal/objective/fresh-write/delivery doors as every other terminal.
     let stallJudgeDelivery: { signal: string; detail: Record<string, unknown> } | null = null;
 
-    // True when THIS turn's input is a harness directive that forbids tool
+    if (stepIndex !== stepDirectiveStep) stepDirective = undefined;
+    // True when THIS turn carries a harness directive that forbids tool
     // calls and demands a plain-text reply (the draft-present stall retry).
     // The zero-tool stall detectors must not fire on a turn that complied.
-    const plainTextContractTurn = isPlainTextContractDirective(nextInput);
+    const plainTextContractTurn = isPlainTextContractDirective(stepDirective ?? nextInput);
 
     // Baseline for the canSwitch guard: if this turn lands or may have landed
     // an external write, we must NOT re-dispatch it to another brain. Exact
@@ -7716,15 +7727,15 @@ async function runConversationCore(
         ? { suppressAutomaticMemoryForRequest: true as const }
         : {}),
       ...(options.taskContinuation ? { taskContinuation: options.taskContinuation } : {}),
-      ...((stepIndex === 1 || falloverReattempt)
-        && (options.continuationSteer || resolvingClarification)
-        ? {
-            continuationSteer: [
-              options.continuationSteer,
-              resolvingClarification ? CONVERGENCE_STEER : '',
-            ].filter(Boolean).join('\n\n'),
-          }
-        : {}),
+      ...((() => {
+        const steer = [
+          ...((stepIndex === 1 || falloverReattempt) && (options.continuationSteer || resolvingClarification)
+            ? [options.continuationSteer, resolvingClarification ? CONVERGENCE_STEER : '']
+            : []),
+          stepDirective,
+        ].filter(Boolean).join('\n\n');
+        return steer ? { continuationSteer: steer } : {};
+      })()),
       authoritativeUserInput: stepIndex === 1 ? options.input : undefined,
       // Only the first step carries the real user message; every later step is a
       // harness continuation (judge/stall/grounding re-prompt) → don't learn it.
@@ -8528,7 +8539,9 @@ async function runConversationCore(
         if (backoffMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, backoffMs));
         }
-        nextInput = `${buildStallRetryMessage(options.sessionId, structuredStallInfo)} The tool surface is available in this run; do not ask the user to resend a tool-enabled message. Pick the needed local, shell, web, memory, or external-service tool and call it now.`;
+        stepDirective = `${buildStallRetryMessage(options.sessionId, structuredStallInfo)} The tool surface is available in this run; do not ask the user to resend a tool-enabled message. Pick the needed local, shell, web, memory, or external-service tool and call it now.`;
+        stepDirectiveStep = stepIndex + 1;
+        nextInput = STALL_RETRY_CONTINUATION_INPUT;
         continue;
       }
       // Recovery-summary turn (2026-07-23): before ANY user-facing fallback,
@@ -8884,7 +8897,9 @@ async function runConversationCore(
           if (backoffMs > 0) {
             await new Promise((resolve) => setTimeout(resolve, backoffMs));
           }
-          nextInput = buildStallRetryMessage(options.sessionId, stallInfo);
+          stepDirective = buildStallRetryMessage(options.sessionId, stallInfo);
+          stepDirectiveStep = stepIndex + 1;
+          nextInput = STALL_RETRY_CONTINUATION_INPUT;
           continue;
         }
         // Retry budget exhausted. v0.5.19 F4 — instead of terminating
@@ -14569,6 +14584,8 @@ async function runConversationFromResumeCore(opts: {
   let missingReplyRetriesUsed = 0;
   let workflowStepResultContinuationsUsed = 0;
   let resumeContinuationInput = CONTINUATION_INPUT;
+  // One-step model-only directive beside the continuation item (stall retry).
+  let resumeStepDirective: string | undefined;
   let infraRecoveryEpisodeId: string | undefined;
   let terminalJudgeConsecutiveResumes: 0 | 1 = 0;
 
@@ -15367,10 +15384,13 @@ async function runConversationFromResumeCore(opts: {
     }
 
     stepIndex += 1;
+    const resumeDirective = resumeStepDirective;
+    resumeStepDirective = undefined;
     const turnResult = await runTurn({
       agent: opts.agent,
       sessionId: opts.sessionId,
       input: resumeContinuationInput,
+      ...(resumeDirective ? { continuationSteer: resumeDirective } : {}),
       // Resume continuations are always harness-synthetic, never a user message.
       suppressMemoryCapture: true,
       internalContinuation: true,
@@ -15581,8 +15601,9 @@ async function runConversationFromResumeCore(opts: {
       });
       const backoffMs = STALL_RETRY_BACKOFF_MS[stallRetriesUsed - 1] ?? 1000;
       if (backoffMs > 0) await new Promise((resolve) => setTimeout(resolve, backoffMs));
-      resumeContinuationInput =
+      resumeStepDirective =
         `${buildStallRetryMessage(opts.sessionId, resumeStall)} The tool surface is available in this run; do not ask the user to resend a tool-enabled message. Pick the needed local, shell, web, memory, or external-service tool and call it now.`;
+      resumeContinuationInput = STALL_RETRY_CONTINUATION_INPUT;
     } else {
       resumeContinuationInput = CONTINUATION_INPUT;
     }
