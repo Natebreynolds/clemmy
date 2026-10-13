@@ -1594,6 +1594,8 @@ test('respondPreferHarness: preflight blocks are recorded in harness capability 
   assert.equal(rec.reason, 'cron: surface_disabled');
   assert.equal(rec.details?.surface, 'cron');
   assert.equal(rec.details?.reason, 'surface_disabled');
+  assert.ok(rec.expiresAt && Date.parse(rec.expiresAt) > Date.parse(rec.lastSeenAt),
+    'a one-time preflight refusal carries its own retention boundary');
 
   const completions = listEvents('bridge-health-block', { types: ['conversation_completed'] });
   assert.equal(completions.length, 1, 'a blocked preflight has one durable terminal');
@@ -1608,6 +1610,54 @@ test('respondPreferHarness: preflight blocks are recorded in harness capability 
   );
   assert.equal((res.raw as { terminalCommitted?: boolean })?.terminalCommitted, true);
   assert.equal(HarnessSession.load('bridge-health-block')?.runInFlightSince(), null);
+});
+
+test('respondPreferHarness: a preflight block is retired by the next request that passes preflight, or by its own retention', async () => {
+  const blockedId = 'respond_bridge_surface_disabled';
+  process.env.CLEMMY_HARNESS_CRON = 'off';
+  const blocked = await respondPreferHarness('cron', { message: 'hi', sessionId: 'bridge-health-retire-block' }, async (req) => ({
+    text: 'legacy',
+    sessionId: req.sessionId,
+  }));
+  assert.equal(blocked.stoppedReason, 'blocked');
+  assert.equal(capabilityHealth.readHarnessCapabilityHealth(blockedId)?.state, 'unavailable');
+  assert.match(capabilityHealth.renderHarnessCapabilityHealthForContext(), /respond_bridge_surface_disabled: unavailable/);
+
+  // The surface is back. The next request passes the same preflight checks,
+  // which is the re-probe: the one-time refusal leaves prompts and harness_status.
+  delete process.env.CLEMMY_HARNESS_CRON;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string; sourceUserSeq?: number; buildAgent: (identity: ReturnType<typeof stubBuildIdentity>) => Promise<unknown> }) => {
+      await opts.buildAgent(stubBuildIdentity(opts));
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        publicPresentation: stubAnswerPresentation(opts, 'The lane is back.'),
+      };
+    }) as never,
+  });
+  const passed = await respondPreferHarness('cron', { message: 'hi again', sessionId: 'bridge-health-retire-pass' },
+    async () => { throw new Error('legacy path must not run'); });
+  assert.equal(passed.stoppedReason, 'success');
+  assert.equal(capabilityHealth.readHarnessCapabilityHealth(blockedId), null, 'a passing preflight retires the refusal');
+  assert.equal(capabilityHealth.renderHarnessCapabilityHealthForContext(), '');
+
+  // Without a later request the refusal still expires on its own.
+  process.env.CLEMMY_HARNESS_CRON = 'off';
+  const again = await respondPreferHarness('cron', { message: 'hi', sessionId: 'bridge-health-retire-expire' }, async (req) => ({
+    text: 'legacy',
+    sessionId: req.sessionId,
+  }));
+  assert.equal(again.stoppedReason, 'blocked');
+  const rec = capabilityHealth.readHarnessCapabilityHealth(blockedId);
+  assert.ok(rec?.expiresAt, 'the refusal carries its retention boundary');
+  const pastRetention = new Date(Date.parse(rec.expiresAt) + 1);
+  assert.equal(capabilityHealth.readHarnessCapabilityHealth(blockedId, { now: pastRetention }), null);
+  assert.equal(capabilityHealth.listHarnessCapabilityHealth({ now: pastRetention }).some((row) => row.id === blockedId), false);
 });
 
 test('preflight terminal write failure returns only stable failure and preserves restart ownership', async () => {
