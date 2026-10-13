@@ -10176,6 +10176,38 @@ for (const boundary of ['negative_before_close', 'malformed_after_negative', 'in
   });
 }
 
+test('terminal steering: a handoff that cannot be reopened stops in app voice with the steering reason before any model step', async () => {
+  const host = await import('./host-turn-runner.js');
+  const notice = await import('./terminal-notice.js');
+  const session = eventlog.createSession({ id: `sess-steer-reopen-${++acceptedSerial}`, kind: 'chat' });
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: `steer-reopen-${acceptedSerial}` });
+  const source = eventlog.recordRunAttemptUserInput(attempt,
+    { turn: 1, role: 'user', data: { text: 'Pick the work back up.' } }, { armRunInFlight: true });
+  const fixture = { session, source, context: { sessionId: session.id, sourceUserSeq: source.seq },
+    parent: { sessionId: session.id, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId,
+      counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::turn:1` } };
+  host.captureEffectiveCompletionPolicyOnce({ ...fixture.context, enabled: true });
+  // A stored handoff marker that no longer parses. The host must not guess
+  // its way past it, and no model step may start.
+  eventlog.openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(COALESCE(metadata_json, '{}'),
+    '$.__host_terminal_steering_cutover', json('{}')) WHERE id = ?`).run(session.id);
+  const model = stubModel([[textMsg('must not be asked')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await runProductionHost(fixture, agent, undefined, { maxTurns: 2 });
+  assert.equal(result.terminal?.status, 'blocked');
+  assert.equal(result.terminal?.reason, notice.STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON);
+  assert.notEqual(result.terminal?.resumable, false, 'no work began, so the turn resumes');
+  const text = String(result.finalOutput);
+  assert.ok(text.startsWith(notice.STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT), text);
+  assert.doesNotMatch(text, /\b(?:I|I’m|I'm|I’ll|I'll|I’ve|I've|me|my)\b/, 'the host never speaks as Clem');
+  assert.ok(!text.includes('could not safely reopen'), text);
+  assert.equal(model.calls(), 0);
+  assert.equal(host.isNarratableHostStop(result), false, 'an app notice is drawn as chrome, never narrated into a sentence');
+  assert.equal(eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+    .filter(row => row.data.kind === 'host_terminal_steering_cutover').length, 0, 'a refused reopen writes no marker');
+});
+
 test('terminal steering compatibility: source-only direct runConversation and noninteractive workflow do not require attempts', async () => {
   for (const id of [`sess-direct-terminal-${++acceptedSerial}`, `workflow:direct-terminal-${++acceptedSerial}:main`]) {
     const session = eventlog.createSession({ id, kind: id.startsWith('workflow:') ? 'agent' : 'chat' });

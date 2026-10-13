@@ -30,15 +30,22 @@ import { readConnectionExecutionDelivery } from './connection-execution-activati
 
 export type SteerNoteAdmissionErrorCode = 'STEER_NOTE_CUTOVER' | 'STEER_NOTE_OWNER_CHANGED' | 'STEER_NOTE_UNAVAILABLE';
 
+/** The plain line each refusal shows. App voice, no first person: the chat
+ * routes return it as the error field beside the code, and the clients show
+ * it under the message that was not queued. */
+export const STEER_NOTE_ADMISSION_MESSAGE: Readonly<Record<SteerNoteAdmissionErrorCode, string>> = {
+  STEER_NOTE_CUTOVER: 'This turn is finishing; the message was not queued.',
+  STEER_NOTE_OWNER_CHANGED: 'The running turn changed; the message was not queued.',
+  STEER_NOTE_UNAVAILABLE: 'The running turn could not be verified; the message was not queued.',
+};
+
 /** A refused enqueue is never permission to start a competing turn. */
 export class SteerNoteAdmissionError extends Error {
   readonly code: SteerNoteAdmissionErrorCode;
   constructor(code: SteerNoteAdmissionErrorCode) {
-    const fixed = typeof code === 'string' && ['STEER_NOTE_CUTOVER', 'STEER_NOTE_OWNER_CHANGED', 'STEER_NOTE_UNAVAILABLE'].includes(code)
+    const fixed: SteerNoteAdmissionErrorCode = typeof code === 'string' && Object.hasOwn(STEER_NOTE_ADMISSION_MESSAGE, code)
       ? code : 'STEER_NOTE_UNAVAILABLE';
-    super(fixed === 'STEER_NOTE_CUTOVER' ? 'This turn is finishing; the message was not queued.'
-      : fixed === 'STEER_NOTE_OWNER_CHANGED' ? 'The running turn changed; the message was not queued.'
-      : 'I could not verify the running turn; the message was not queued.');
+    super(STEER_NOTE_ADMISSION_MESSAGE[fixed]);
     this.code = fixed;
     this.name = 'SteerNoteAdmissionError';
   }

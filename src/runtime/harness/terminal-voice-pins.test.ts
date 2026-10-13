@@ -31,7 +31,11 @@ const {
 } = await import('./public-presentation.js');
 const { HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, captureEffectiveCompletionPolicyOnce } = await import('./host-turn-runner.js');
 const { WHOLE_JSON_OBJECT_FORMAT_FINDING } = await import('./response-format-repair.js');
-const { OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT, OWNER_STOP_TERMINAL_TEXT } = await import('./terminal-notice.js');
+const {
+  OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT, OWNER_STOP_TERMINAL_TEXT,
+  STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON, STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT,
+} = await import('./terminal-notice.js');
+const { STEER_NOTE_ADMISSION_MESSAGE } = await import('./steer-notes.js');
 const presentationModule = await import('./public-presentation.js');
 const { reconstructHarnessTranscript } = await import('./transcript.js');
 const { pullRecentTurnsForSession } = await import('./session-transcript.js');
@@ -52,6 +56,8 @@ const BANNED = [
   'latest Codex usage check',
   'Stopped — this turn was cancelled',
   'Stopped as requested',
+  'I could not safely reopen',
+  'I could not verify the running turn',
 ] as const;
 
 /** Every committed public text these pins produce, for the sweep below. */
@@ -246,6 +252,30 @@ test('an owner Stop reduced by the loop is an app-voice line with a stopped noti
   }
 });
 
+test('a turn that could not reopen its mid-turn message handoff is an app-voice line with a steering notice', () => {
+  const sessionId = 'voice-steering-reopen';
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Pick the work back up.' } });
+  loop._testOnly_reduceStandardConversationTerminal({
+    result: { sessionId, status: 'blocked', steps: 0, lastTurn: source.turn, error: STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT,
+      blockedReason: STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON } as never,
+    sourceUserSeq: source.seq,
+  });
+  const held = listEvents(sessionId, { types: ['conversation_completed'] })[0]!;
+  assert.equal((held.data.presentation as { text: string }).text, STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT);
+  assert.equal((held.data.presentation as { status: string }).status, 'blocked');
+  assert.equal(held.data.blockedReason, STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON);
+  assert.notEqual((held.data.turnOutcome as { resumable: boolean }).resumable, false, 'no work began, so the turn resumes');
+  const data = record('steering:reopen', held);
+  assert.deepEqual(data.notice, { code: 'steering_unavailable' });
+  assert.equal(data.reply, STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT);
+  assert.doesNotMatch(STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT, /\b(?:I|I’ll|I'll|me|my)\b/);
+  for (const message of Object.values(STEER_NOTE_ADMISSION_MESSAGE)) {
+    assert.doesNotMatch(message, /\b(?:I|I’m|I'm|I’ll|I'll|I’ve|I've|me|my)\b/, message);
+    committedPublicTexts.push({ cause: 'steering:refusal', text: message });
+  }
+});
+
 test('the committer\'s Stop over a host-only uncertain block is an app-voice line with a stopped notice', () => {
   const sessionId = 'voice-committer-stop';
   createSession({ id: sessionId, kind: 'chat' });
@@ -302,7 +332,8 @@ test('the stop and quota sites never author the old first-person lines', () => {
   // end (their behavior is pinned in respond-bridge and chat-approval tests);
   // their source must not carry the retired sentences either.
   for (const file of ['loop.ts', 'delivery-committer.ts', 'chat-approval-resume.ts', 'respond-bridge.ts',
-    'host-turn-runner.ts', 'retained-work-checkpoint.ts', 'public-presentation.ts', '../../execution/workflow-origin-terminal.ts']) {
+    'host-turn-runner.ts', 'retained-work-checkpoint.ts', 'public-presentation.ts', 'steer-notes.ts', 'terminal-notice.ts',
+    '../../execution/workflow-origin-terminal.ts', '../../channels/mobile-routes.ts', '../../dashboard/console-routes.ts']) {
     const source = readFileSync(new URL(file, import.meta.url), 'utf8');
     for (const banned of BANNED) assert.ok(!source.includes(banned), `${file} still authors "${banned}"`);
   }

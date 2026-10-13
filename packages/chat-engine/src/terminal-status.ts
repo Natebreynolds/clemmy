@@ -138,6 +138,8 @@ export function terminalNoticeLine(terminal: TerminalFacts | undefined): Termina
       return line(`${model ?? 'The model'} stopped responding`, 'warning', 'try_again');
     case 'run_failed':
       return line('This run stopped on an error', 'danger', 'try_again');
+    case 'steering_unavailable':
+      return line('This turn couldn’t be picked back up safely — nothing further ran', 'warning', 'try_again');
   }
 }
 

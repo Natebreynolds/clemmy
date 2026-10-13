@@ -108,7 +108,7 @@ test('a notice in place of a reply renders none, a format notice keeps her draft
   const codes: TerminalNoticeCode[] = [
     'response_format_unmet', 'response_format_unqualified', 'provider_quota', 'saved_model_unavailable',
     'model_unavailable_on_sign_in', 'no_model_connected', 'codex_sign_in_expired', 'provider_out_of_credit',
-    'model_stalled', 'run_failed',
+    'model_stalled', 'run_failed', 'steering_unavailable',
   ];
   for (const code of codes) {
     const rendered = terminalCompletionPresentation({

@@ -19,6 +19,7 @@ export const TERMINAL_NOTICE_CODES = [
   'provider_out_of_credit',
   'model_stalled',
   'run_failed',
+  'steering_unavailable',
 ] as const;
 
 export type TerminalNoticeCode = typeof TERMINAL_NOTICE_CODES[number];
@@ -62,3 +63,12 @@ export const OWNER_STOP_TERMINAL_TEXT = 'Stopped. Nothing further runs for this 
 
 /** The same Stop when completed results exist to keep. */
 export const OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT = 'Stopped. Completed results are kept.';
+
+/** The host's machine reason when a turn cannot reopen its mid-turn message
+ * handoff before starting work. The loop maps it to the notice below. */
+export const STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON = 'owner_steering_cutover_reopen_unavailable';
+
+/** App-voice line for that stop. No first person: the handoff is a host fact
+ * no model phrased, and the clients draw its notice as chrome. */
+export const STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT =
+  'This turn could not be picked back up safely. Nothing further was started.';

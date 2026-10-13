@@ -371,7 +371,7 @@ import {
   sizedFirstByteStallMs,
 } from './model-stall-policy.js';
 import { heldExecutionTextForInternalReason, isHostAuthorityHeldReason } from './public-presentation.js';
-import { OWNER_STOP_TERMINAL_TEXT, type TerminalNotice } from './terminal-notice.js';
+import { OWNER_STOP_TERMINAL_TEXT, STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON, type TerminalNotice } from './terminal-notice.js';
 // Lane wiring: the callable-surface oracle serves exact local schemas on this
 // lane (guardrail mandates are constructible only from proof).
 import '../../tools/callable-surface-registration.js';
@@ -1397,6 +1397,9 @@ function reduceStandardConversationTerminal(input: {
       // app notice beside it, never a sentence written for her.
       if (result.blockedReason === 'owner_response_format_unmet') hostNotice = { code: 'response_format_unmet' };
       else if (result.blockedReason === 'owner_response_format_unqualified') hostNotice = { code: 'response_format_unqualified' };
+      // A turn that could not reopen its mid-turn message handoff stopped
+      // before any work: its app-voice line travels with a steering notice.
+      else if (result.blockedReason === STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON) hostNotice = { code: 'steering_unavailable' };
       break;
     case 'failed': {
       // A failure is app status, never Clem's words: an app-voice line for
