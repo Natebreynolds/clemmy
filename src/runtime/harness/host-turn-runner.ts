@@ -45,6 +45,7 @@ import { resolvedOperationsFor } from './resolution-ledger.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { registeredToolSideEffect } from '../../tools/tool-registry.js';
 import { BASE_DIR } from '../../config.js';
+import { completionReviewEnabled } from './completion-review-setting.js';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { hostLocalWriteCommitResultIsProven, parseHostLocalWriteCommitFacts, readCommittedArtifactContent } from './host-local-write-commit.js';
@@ -9358,6 +9359,10 @@ const runHostTurnBody = async (
         sessionId: policyIdentity.sessionId,
         sourceUserSeq: policyIdentity.sourceUserSeq,
         enabled: hostJudgeCompletion,
+        // `enabled` is the surface's posture combined with the owner's switch;
+        // the switch alone is recorded beside it so a surface that leaves its
+        // own review to its caller never reads as the owner's decision.
+        ownerEnabled: completionReviewEnabled(),
       });
     } catch { /* capture failure is reported as such, never as a policy */ }
   }
@@ -12647,7 +12652,15 @@ export function lastHostRefusalDetail(history: readonly AgentInputItem[]): strin
  * failures rather than as "no policy".
  */
 export interface CapturedCompletionPolicy {
+  /** Whether THIS accepted source reviews completion in its own loop: the
+   * surface's posture combined with the owner's switch. */
   enabled: boolean;
+  /** The owner's switch alone, read at the same boundary. `enabled:false`
+   * with the switch on is the surface's own rule (its work is reviewed by the
+   * caller that owns report-back, such as a workflow run's target review),
+   * not an owner decision; a reader must never present it as one. Absent on
+   * rows captured before the two were told apart. */
+  ownerEnabled?: boolean;
   judgeModelId?: string;
   judgeSource?: string;
   /** v1 rows retain known policy, but lack enough identity to route after reopen. */
@@ -12658,6 +12671,9 @@ export function captureEffectiveCompletionPolicyOnce(input: {
   sessionId: string;
   sourceUserSeq: number;
   enabled: boolean;
+  /** The owner's switch at this boundary, so a surface that leaves its own
+   * review off is never recorded as the owner's choice. */
+  ownerEnabled?: boolean;
 }): void {
   // Idempotent: one accepted source gets one policy record, so a resumed or
   // re-entered turn cannot append a second, later one.
@@ -12676,6 +12692,7 @@ export function captureEffectiveCompletionPolicyOnce(input: {
       version: 2,
       sourceUserSeq: input.sourceUserSeq,
       enabled: input.enabled,
+      ...(typeof input.ownerEnabled === 'boolean' ? { ownerEnabled: input.ownerEnabled } : {}),
       judgeSelection,
       ...(judge?.modelId ? { judgeModelId: judge.modelId } : {}),
       ...(judge?.source ? { judgeSource: judge.source } : {}),
@@ -12713,6 +12730,7 @@ export function readCapturedCompletionPolicy(input: {
         status: 'captured',
         policy: {
           enabled: data.enabled,
+          ...(typeof data.ownerEnabled === 'boolean' ? { ownerEnabled: data.ownerEnabled } : {}),
           judgeSelection: data.version === 2
             ? data.judgeSelection as CapturedBoundaryJudgeSelection
             : { status: 'unavailable', reason: 'This legacy completion policy did not capture the judge provider identity.' },

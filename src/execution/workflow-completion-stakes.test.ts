@@ -4,7 +4,6 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import type { AgentInputItem } from '@openai/agents';
 import type { HostAdmissibleEffect } from '../runtime/harness/accepted-turn-call-authority.js';
 
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-workflow-review-stakes-'));
@@ -19,25 +18,24 @@ const identity = await import('../runtime/harness/attempt-identity.js');
 const authority = await import('../runtime/harness/accepted-turn-call-authority.js');
 const contracts = await import('../runtime/harness/logical-call-contract.js');
 const hostBindings = await import('../runtime/harness/host-call-capability-binding.js');
-const { admitAcceptedModelBatch } = await import('../runtime/harness/accepted-model-batch-checkpoint.js');
-const { settleAdmittedLogicalCallPreDispatchDisposition } = await import('../runtime/harness/attempt-settlement.js');
 const { withHostLocalWriteCommitFromFile } = await import('../runtime/harness/host-local-write-commit.js');
 const { readWorkflowTargetEvidence } = await import('./workflow-target-evidence.js');
-const { readWorkflowCompletionStakes, workflowEvidenceCallKey } = await import('./workflow-completion-stakes.js');
+const { readWorkflowCompletionStakes } = await import('./workflow-completion-stakes.js');
 const { workflowDefinitionHash } = await import('./workflow-run-definition.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const { judgeWorkflowTarget } = await import('./workflow-objective-judge.js');
 const { _setCompletionJudgeForTests } = await import('../runtime/harness/objective-judge.js');
+const { _resetCompletionSizeGateForTests } = await import('../runtime/jev/control-plane.js');
 const { _setSystemOneFetchForTests, _setTypesafeKeyForTests } = await import('../runtime/jev/client.js');
 after(() => { events.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
-afterEach(() => { _setCompletionJudgeForTests(null); _setSystemOneFetchForTests(undefined); _setTypesafeKeyForTests(null); });
+afterEach(() => { _setCompletionJudgeForTests(null); _setSystemOneFetchForTests(undefined); _setTypesafeKeyForTests(null); _resetCompletionSizeGateForTests(); });
 
 let serial = 0;
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
-function fixture(options: { prefix?: boolean; wrongRun?: boolean } = {}) {
+function fixture(options: { prefix?: boolean; wrongRun?: boolean; kind?: string } = {}) {
   const runId = `stakes-run-${++serial}`, stepId = 'work';
   const session = events.createSession({ id: options.prefix === false ? `parked-fixture-${serial}` : `workflow:${runId}:${stepId}`,
-    kind: 'workflow', metadata: { workflowRunId: options.wrongRun ? 'another-run' : runId, stepId } });
+    kind: (options.kind ?? 'workflow') as never, metadata: { workflowRunId: options.wrongRun ? 'another-run' : runId, stepId } });
   const source = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: 'Perform the synthetic workflow step.', workflowRunId: runId, stepId } });
   const task = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1,
@@ -73,7 +71,7 @@ function attested<T>(f: ReturnType<typeof fixture>, callId: string, tool: string
 
 function settle(f: ReturnType<typeof fixture>, input: { tool?: string; local?: boolean; mutating?: boolean;
   succeeded?: boolean; payload?: unknown; requirementId?: string; args?: unknown } = {}) {
-  const tool = input.tool ?? 'FIXTURE_READ', callId = `logical:stakes-${serial}`;
+  const tool = input.tool ?? 'FIXTURE_READ', callId = `logical:stakes-${++serial}`;
   const args = input.args ?? { fixture: serial };
   const opened = attested(f, callId, tool, args, input.mutating ? input.local ? 'local_write' : 'external_write' : 'read',
     () => dispatch.beginPhysicalDispatch({ identity: { ...f.task, logicalToolCallId: callId,
@@ -90,60 +88,74 @@ function settle(f: ReturnType<typeof fixture>, input: { tool?: string; local?: b
     recovery: { businessCall: true, mutating: input.mutating === true, ...(input.requirementId ? { requirementId: input.requirementId } : {}) },
     observer: { lane: input.local ? 'byo' : 'composio', turn: 1 } });
   assert.equal(result.status, 'committed');
-  return workflowEvidenceCallKey(f.task.sessionId, f.task.sourceUserSeq, callId);
+  return callId;
 }
 
-function classify(f: ReturnType<typeof fixture>, key: string, overrides: Partial<Parameters<typeof readWorkflowCompletionStakes>[0]> = {}) {
-  return readWorkflowCompletionStakes({ runId: f.runId, available: true, definitionVerified: true,
-    verifiedCalls: new Set([key]), recoverableCalls: new Set(), verifiedTransforms: [], ...overrides });
-}
+const classify = (f: ReturnType<typeof fixture>) => readWorkflowCompletionStakes({ runId: f.runId });
 
-test('exact authenticated successful read gets read; external mutation retains full review', () => {
-  const read = fixture(), readKey = settle(read);
-  assert.equal(classify(read, readKey).reviewStakes, 'read');
-  const write = fixture(), writeKey = settle(write, { mutating: true });
-  assert.equal(classify(write, writeKey).reviewStakes, 'write');
+/** A System One answer that reads the reply as delivered, complete and
+ * supported: Jev's confident DONE. */
+const jevDone = async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-fixture',
+  answers: Object.fromEntries(Object.entries({ delivered: .95, unaddressed: .03, unsupported: .03, computed: .03, asksUser: .03,
+    cannotFinish: .03 }).map(([id, noul]) => [id, { type: 'noul', noul }])),
+  usage: { input_tokens: 100, output_tokens: 20 } }) });
+
+test('a run that only read takes the fast review; an external mutation takes the full one', () => {
+  const read = fixture(); settle(read);
+  assert.equal(classify(read).reviewStakes, 'read');
+  const write = fixture(); settle(write, { mutating: true });
+  assert.equal(classify(write).reviewStakes, 'write');
+  const mixed = fixture(); settle(mixed); settle(mixed, { mutating: true }); settle(mixed);
+  assert.equal(classify(mixed).reviewStakes, 'write', 'one write among reads is still a write');
+});
+
+test('a run with no settled work has nothing at stake', () => {
+  const f = fixture();
+  assert.equal(classify(f).reviewStakes, 'read');
+  assert.equal(readWorkflowTargetEvidence('missing-exact-run').reviewStakes, 'read');
 });
 
 test('a parked UUID workflow source is inventoried by host owner metadata', () => {
-  const f = fixture({ prefix: false }), key = settle(f);
-  assert.equal(classify(f, key).reviewStakes, 'read');
-  assert.equal(classify(f, key, { verifiedCalls: new Set() }).reviewStakes, 'write');
+  const read = fixture({ prefix: false }); settle(read);
+  assert.equal(classify(read).reviewStakes, 'read');
+  const write = fixture({ prefix: false }); settle(write, { mutating: true });
+  assert.equal(classify(write).reviewStakes, 'write', 'a parked step\'s write is not hidden by its session name');
 });
 
-test('recoverable local exemption needs succeeded exact capability and current commit proof', () => {
-  const f = fixture(), key = settle(f, { tool: 'write_file', local: true, mutating: true,
-    requirementId: 'cap:local:write_file:replace' });
-  assert.equal(classify(f, key).reviewStakes, 'write');
-  assert.equal(classify(f, key, { recoverableCalls: new Set([key]) }).reviewStakes, 'read');
-  const destructive = fixture(), destructiveKey = settle(destructive, { tool: 'delete_file', local: true, mutating: true });
-  assert.equal(classify(destructive, destructiveKey, { recoverableCalls: new Set([destructiveKey]) }).reviewStakes, 'write');
+test('a local artifact write the owner can get back takes the fast review; destructive or failed ones do not', () => {
+  const replace = fixture(); settle(replace, { tool: 'write_file', local: true, mutating: true, requirementId: 'cap:local:write_file:replace' });
+  assert.equal(classify(replace).reviewStakes, 'read');
+  const destructive = fixture(); settle(destructive, { tool: 'delete_file', local: true, mutating: true });
+  assert.equal(classify(destructive).reviewStakes, 'write');
+  const failed = fixture(); settle(failed, { succeeded: false, local: true, tool: 'write_file', mutating: true });
+  assert.equal(classify(failed).reviewStakes, 'write', 'a failed write is at stake: the answer must not claim it happened');
 });
 
-test('failed/refused, wrong-run, unavailable and missing admitted definition remain full', () => {
-  const failed = fixture(), key = settle(failed, { succeeded: false, local: true, tool: 'write_file', mutating: true });
-  assert.equal(classify(failed, key, { recoverableCalls: new Set([key]) }).reviewStakes, 'write');
-  const wrong = fixture({ wrongRun: true }), wrongKey = settle(wrong);
-  assert.equal(classify(wrong, wrongKey).reviewStakes, 'write');
-  const read = fixture(), readKey = settle(read);
-  assert.equal(classify(read, readKey, { available: false }).reviewStakes, 'write');
-  assert.equal(classify(read, readKey, { definitionVerified: false }).reviewStakes, 'write');
-  assert.equal(readWorkflowTargetEvidence('missing-exact-run').reviewStakes, 'write');
+test('inventory the run cannot own is read as a write', () => {
+  const wrong = fixture({ wrongRun: true }); settle(wrong);
+  assert.equal(classify(wrong).reviewStakes, 'write', 'a session named for this run but owned by another');
+  const foreign = fixture({ kind: 'chat' }); settle(foreign);
+  assert.equal(classify(foreign).reviewStakes, 'write', 'a session of a kind the runner never activates');
 });
 
-test('an unsettled raw logical call is not hidden by the settled result projection', () => {
-  const f = fixture(), key = settle(f), before = classify(f, key);
+test('the frontier digest moves when the run\'s settled work moves, without changing what reads cost', () => {
+  const f = fixture(); settle(f);
+  const before = classify(f);
   assert.equal(before.reviewStakes, 'read');
   const extra = attested(f, 'logical:unfinished', 'FIXTURE_READ', { other: true }, 'read',
     () => dispatch.admitLogicalCall({ identity: { ...f.task, logicalToolCallId: 'logical:unfinished' },
       tool: 'FIXTURE_READ', args: { other: true } }));
   assert.equal(extra.status, 'inserted');
-  const after = classify(f, key);
-  assert.equal(after.reviewStakes, 'write');
-  assert.notEqual(after.reviewStakesDigest, before.reviewStakesDigest);
+  const admitted = classify(f);
+  assert.equal(admitted.reviewStakes, 'read');
+  assert.notEqual(admitted.reviewStakesDigest, before.reviewStakesDigest);
+  settle(f, { mutating: true });
+  const written = classify(f);
+  assert.equal(written.reviewStakes, 'write');
+  assert.notEqual(written.reviewStakesDigest, admitted.reviewStakesDigest);
 });
 
-test('actual target facade verifies host commit content and carries stakes', () => {
+test('the evidence reader verifies host commit content and carries the run\'s stakes', () => {
   const f = fixture();
   const committedPath = path.join(home, 'artifacts', f.runId, 'fixture.txt');
   mkdirSync(path.dirname(committedPath), { recursive: true });
@@ -155,36 +167,26 @@ test('actual target facade verifies host commit content and carries stakes', () 
   assert.equal(evidence.available, true, evidence.summary);
   assert.equal(evidence.reviewStakes, 'read');
   writeFileSync(committedPath, 'tampered');
-  assert.equal(readWorkflowTargetEvidence(f.runId).reviewStakes, 'write');
+  const tampered = readWorkflowTargetEvidence(f.runId);
+  assert.equal(tampered.available, false, 'changed bytes are a verification failure, which the review reports as unverified');
+  assert.equal(tampered.reviewStakes, 'read', 'what the run did is unchanged: a restorable local write');
 });
 
-test('a positive admitted frame without corresponding logical work stays full, including refused work', () => {
-  const f = fixture(), key = settle(f), before = classify(f, key);
-  const callId = 'call:refused-frame', tool = 'FIXTURE_READ', args = { denied: true };
-  const admission = admitAcceptedModelBatch({ ...f.task,
-    preHistory: [{ role: 'user', content: 'Perform the synthetic workflow step.' } as AgentInputItem],
-    frameHistory: [{ type: 'function_call', callId, name: tool, arguments: JSON.stringify(args), status: 'completed' } as AgentInputItem] });
-  assert.equal(admission.status, 'admitted', JSON.stringify(admission));
-  assert.equal(classify(f, key).reviewStakes, 'write');
-  assert.notEqual(classify(f, key).reviewStakesDigest, before.reviewStakesDigest);
-  const opened = attested(f, callId, tool, args, 'read', () => dispatch.admitLogicalCall({
-    identity: { ...f.task, logicalToolCallId: callId }, tool, args }));
-  assert.equal(opened.status, 'inserted');
-  settleAdmittedLogicalCallPreDispatchDisposition({ ...f.task, logicalToolCallId: callId, toolName: tool,
-    args, lane: 'byo', reason: 'Controlled policy refusal.', disposition: 'policy_refusal' });
-  const refusedKey = workflowEvidenceCallKey(f.task.sessionId, f.task.sourceUserSeq, callId);
-  assert.equal(classify(f, key, { verifiedCalls: new Set([key, refusedKey]) }).reviewStakes, 'write');
-});
-
-test('corrupt physical task identity cannot inherit its logical parent\'s lean proof', () => {
-  const f = fixture(), key = settle(f);
-  const db = events.openEventLog();
-  const trigger = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'trg_physical_dispatch_identity_immutable'").get() as { sql: string };
-  db.exec('DROP TRIGGER trg_physical_dispatch_identity_immutable');
-  try {
-    db.prepare('UPDATE physical_dispatches SET accepted_task_id = ? WHERE session_id = ?').run('another-exact-task', f.task.sessionId);
-    assert.equal(classify(f, key).reviewStakes, 'write');
-  } finally { db.exec(trigger.sql); }
+test('a host transform alone puts nothing at stake', async () => {
+  const { recordStepOutput } = await import('./workflow-run-workspace.js');
+  const { appendWorkflowEvent } = await import('./workflow-events.js');
+  const f = fixture(), value = { product: 323 };
+  const definition = { ...f.def, steps: [{ id: 'work', prompt: '', transform: {
+    version: 1, expression: { op: 'literal', value } } }] };
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${f.runId}.json`), JSON.stringify({ id: f.runId,
+    workflowDefinitionSnapshot: { version: 1, workflowSlug: f.runId, admittedAt: new Date().toISOString(),
+      definition, definitionHash: workflowDefinitionHash(definition as never) } }));
+  const artifact = recordStepOutput({ workflowName: f.runId, runId: f.runId, stepId: 'work', output: value, nowIso: new Date().toISOString() });
+  appendWorkflowEvent(f.runId, f.runId, { kind: 'step_completed', stepId: 'work', output: value,
+    meta: { mode: 'transform', stepOutputArtifact: artifact } });
+  const evidence = readWorkflowTargetEvidence(f.runId);
+  assert.equal(evidence.reviewStakes, 'read');
+  assert.equal(evidence.results?.[0]?.toolName, 'workflow_transform');
 });
 
 test('successful actual read reaches the legacy judge at read depth with the captured reviewer', async () => {
@@ -205,27 +207,9 @@ test('successful actual read reaches the legacy judge at read depth with the cap
   assert.equal(result.judged, true);
 });
 
-test('only a verified uninvalidated host transform can use the no-tool lean path', async () => {
-  const { recordStepOutput } = await import('./workflow-run-workspace.js');
-  const { appendWorkflowEvent } = await import('./workflow-events.js');
-  const f = fixture(), value = { product: 323 };
-  const definition = { ...f.def, steps: [{ id: 'work', prompt: '', transform: {
-    version: 1, expression: { op: 'literal', value } } }] };
-  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${f.runId}.json`), JSON.stringify({ id: f.runId,
-    workflowDefinitionSnapshot: { version: 1, workflowSlug: f.runId, admittedAt: new Date().toISOString(),
-      definition, definitionHash: workflowDefinitionHash(definition as never) } }));
-  const artifact = recordStepOutput({ workflowName: f.runId, runId: f.runId, stepId: 'work', output: value, nowIso: new Date().toISOString() });
-  appendWorkflowEvent(f.runId, f.runId, { kind: 'step_completed', stepId: 'work', output: value,
-    meta: { mode: 'transform', stepOutputArtifact: artifact } });
-  const evidence = readWorkflowTargetEvidence(f.runId);
-  assert.equal(evidence.reviewStakes, 'read');
-  appendWorkflowEvent(f.runId, f.runId, { kind: 'step_invalidated', stepId: 'work' });
-  assert.equal(readWorkflowTargetEvidence(f.runId).reviewStakes, 'write');
-});
-
 test('legacy target review forwards captured selection and refuses stale consequence frontier', async () => {
-  const f = fixture(), key = settle(f, { mutating: true });
-  const proof = classify(f, key);
+  const f = fixture(); settle(f, { mutating: true });
+  const proof = classify(f);
   const selection = { fixtureSavedModel: 'owner-chosen-reviewer', fixtureSavedAccount: 'exact-account' };
   const evidence = { available: true, summary: 'Exact authenticated result.', ...proof,
     results: [{ toolName: 'FIXTURE_WRITE', outcome: 'succeeded', status: 'verified', contentComplete: true }] };
@@ -243,22 +227,43 @@ test('legacy target review forwards captured selection and refuses stale consequ
   assert.equal(verdict.unavailable, true);
 });
 
-test('external or unknown legacy effects cannot accept a Jev-only completion', async () => {
+// The owner's rule, held for workflows as for chat turns: a run that only
+// read closes on Jev's confident reading with complete receipts, and the
+// configured reviewer is never started.
+test('a run that only read closes on Jev without starting the configured reviewer', async () => {
   let jevCalls = 0, reviewerCalls = 0;
   _setTypesafeKeyForTests('fixture-key');
-  _setSystemOneFetchForTests(async () => { jevCalls++; throw new Error('write must not ask Jev'); });
+  _setSystemOneFetchForTests(async () => { jevCalls++; return jevDone(); });
+  _setCompletionJudgeForTests(async () => { reviewerCalls++; throw new Error('a read must not start the configured reviewer'); });
+  const f = fixture(); settle(f);
+  const verdict = await judgeWorkflowTarget({ workflow: f.def as never, inputs: {}, finalOutput: 'The fixture result is 323.',
+    executionEvidence: () => readWorkflowTargetEvidence(f.runId) });
+  assert.equal(verdict.judged, true, verdict.gap);
+  assert.equal(verdict.reached, true);
+  assert.equal(verdict.reviewer?.judgeModelId, 'jev-fixture');
+  assert.equal(jevCalls, 1);
+  assert.equal(reviewerCalls, 0);
+});
+
+test('a run that wrote, sent or created takes the full configured review and never a Jev-only completion', async () => {
+  let jevCalls = 0, reviewerCalls = 0;
+  _setTypesafeKeyForTests('fixture-key');
+  _setSystemOneFetchForTests(async () => { jevCalls++; throw new Error('a write must not ask Jev'); });
   _setCompletionJudgeForTests(async (_objective, _reply, context) => {
     assert.equal(context?.reviewStakes, 'write'); reviewerCalls++;
     return { verdict: { done: true, reason: 'Configured fixture reviewer.' }, failure: null };
   });
-  const f = fixture();
-  for (const stakes of ['write', undefined] as const) {
-    const evidence = { available: true, summary: 'Settled external fixture result.', reviewStakes: stakes,
-      results: [{ toolName: 'FIXTURE_WRITE', outcome: 'succeeded', status: 'verified', contentComplete: true }] };
-    const result = await judgeWorkflowTarget({ workflow: f.def as never, inputs: {}, finalOutput: 'Saved 323.',
-      executionEvidence: () => evidence });
-    assert.equal(result.judged, true);
-  }
+  const external = fixture(); settle(external); settle(external, { mutating: true });
+  const result = await judgeWorkflowTarget({ workflow: external.def as never, inputs: {}, finalOutput: 'Saved 323.',
+    executionEvidence: () => readWorkflowTargetEvidence(external.runId) });
+  assert.equal(result.judged, true);
+  // Unknown work never acquires the read shortcut either.
+  const unknown = fixture();
+  const evidence = { available: true, summary: 'Settled external fixture result.',
+    results: [{ toolName: 'FIXTURE_WRITE', outcome: 'succeeded', status: 'verified', contentComplete: true }] };
+  const unknownResult = await judgeWorkflowTarget({ workflow: unknown.def as never, inputs: {}, finalOutput: 'Saved 323.',
+    executionEvidence: () => evidence });
+  assert.equal(unknownResult.judged, true);
   assert.equal(reviewerCalls, 2);
   assert.equal(jevCalls, 0);
 });

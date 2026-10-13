@@ -1,7 +1,7 @@
-import { getRuntimeEnv } from '../config.js';
 import { captureBoundaryJudgeSelection, isCapturedBoundaryJudgeSelection, type CapturedBoundaryJudgeSelection } from '../runtime/harness/debate-model.js';
+import { completionReviewEnabled } from '../runtime/harness/completion-review-setting.js';
 import { readCapturedCompletionPolicy } from '../runtime/harness/host-turn-runner.js';
-import { readWorkflowRunOriginRecords } from '../tools/workflow-run-queue.js';
+import { readWorkflowRunOriginRecords, type ExactWorkflowRunOriginRecord } from '../tools/workflow-run-queue.js';
 import { readWorkflowRunRecordUnlocked, withWorkflowRunRecordLock, writeWorkflowRunRecordDurablyUnlocked } from './workflow-run-record.js';
 
 export type WorkflowTargetReviewPolicy = {
@@ -27,26 +27,35 @@ export function parseWorkflowTargetReviewPolicy(value: unknown): WorkflowTargetR
   return unavailable('The saved workflow review policy is unreadable.');
 }
 
+/** The run's review follows the owner's choice as the originating requests
+ * captured it. An origin surface that leaves its own in-loop review off
+ * (`enabled:false` with the owner's switch on) has deferred the review to this
+ * run; it has not switched it off. Rows captured before the two were told
+ * apart carry only the combined value. */
+export function workflowTargetReviewPolicyFromOriginCaptures(
+  captures: ReadonlyArray<ReturnType<typeof readCapturedCompletionPolicy>>,
+): WorkflowTargetReviewPolicy {
+  const policies: WorkflowTargetReviewPolicy[] = [];
+  for (const captured of captures) {
+    if (captured.status === 'unreadable') return unavailable('The originating request review policy is unreadable.');
+    if (captured.status === 'captured') policies.push({ version: 1, status: 'captured',
+      enabled: captured.policy.ownerEnabled ?? captured.policy.enabled, judgeSelection: captured.policy.judgeSelection });
+  }
+  if (policies.length) return policies.every((value) => JSON.stringify(value) === JSON.stringify(policies[0]))
+    ? policies[0]!
+    : unavailable('Joined requests have different review policies; their own report-back reviews retain those choices.');
+  return { version: 1, status: 'captured', enabled: completionReviewEnabled(), judgeSelection: captureBoundaryJudgeSelection() };
+}
+
 /** This optional reviewer follows the accepted chat's capture when there is
  * one. Scheduled/legacy runs capture the owner's setting at first execution
  * admission. A resumed run never chooses again from mutable global settings.
  * A capture outage disables only optional review, never workflow execution.
  */
 function effectivePolicy(runId: string): WorkflowTargetReviewPolicy {
-  const policies: WorkflowTargetReviewPolicy[] = [];
-  for (const origin of readWorkflowRunOriginRecords(runId)) {
-    if (origin.version !== 2) continue;
-    const captured = readCapturedCompletionPolicy({ sessionId: origin.originSessionId, sourceUserSeq: origin.sourceUserSeq });
-    if (captured.status === 'unreadable') return unavailable('The originating request review policy is unreadable.');
-    if (captured.status === 'captured') policies.push({ version: 1, status: 'captured',
-      enabled: captured.policy.enabled, judgeSelection: captured.policy.judgeSelection });
-  }
-  if (policies.length) return policies.every((value) => JSON.stringify(value) === JSON.stringify(policies[0]))
-    ? policies[0]!
-    : unavailable('Joined requests have different review policies; their own report-back reviews retain those choices.');
-  return { version: 1, status: 'captured',
-    enabled: (getRuntimeEnv('CLEMMY_COMPLETION_REVIEW', 'on') || 'on').trim().toLowerCase() !== 'off',
-    judgeSelection: captureBoundaryJudgeSelection() };
+  return workflowTargetReviewPolicyFromOriginCaptures(readWorkflowRunOriginRecords(runId)
+    .filter((origin): origin is ExactWorkflowRunOriginRecord => origin.version === 2)
+    .map((origin) => readCapturedCompletionPolicy({ sessionId: origin.originSessionId, sourceUserSeq: origin.sourceUserSeq })));
 }
 
 export function captureWorkflowTargetReviewPolicy(filePath: string, runId: string): WorkflowTargetReviewPolicy {

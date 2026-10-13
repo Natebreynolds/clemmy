@@ -273,8 +273,11 @@ export async function judgeWorkflowTarget(
   try {
     const verdict = await withJudgeTimeout('workflow_objective', () => judge(objectivePrompt, deliverable, (evidence || opts.reviewPolicy) ? {
       skills: [], fullSourceEvidence: Boolean(evidence), toolCallSummary: evidence?.summary ?? '',
-      // Unknown effects never acquire the read shortcut. The run-evidence
-      // reader derives this from exact settlements and current host artifacts.
+      // Review depth follows what the run actually did, by the chat turn's
+      // rule: the run-evidence reader reads its settled work and says read or
+      // write, and the shared judge then takes the fast (Jev-first) path for
+      // reads and the full reviewer for writes. A run whose work is unknown
+      // never acquires the read shortcut.
       reviewStakes: evidence?.reviewStakes ?? 'write',
       ...(evidence?.results ? { verifiedReadResults: evidence.results } : {}),
       ...(evidence?.evidence ? { evidence: evidence.evidence } : {}),

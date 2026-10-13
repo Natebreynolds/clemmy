@@ -1315,10 +1315,18 @@ export function commitTurnOutcome(
     ? capturedRead.policy.enabled
     : capturedRead.status === 'absent' && completionReviewEnabled();
   const policyEvidence = capturedRead.status;
+  // A source whose surface never reviews in its own loop (its work is reviewed
+  // by the caller that owns report-back, such as a workflow run's target
+  // review) is captured with review off while the owner's switch is on. That
+  // is the harness's own rule, so it reads as not required here; only the
+  // owner's switch reads as the owner's decision.
+  const reviewOffDisposition: 'disabled_by_owner' | 'not_required' = capturedRead.status === 'captured'
+    && !capturedRead.policy.enabled && capturedRead.policy.ownerEnabled === true
+    ? 'not_required' : 'disabled_by_owner';
   let reviewDisposition: CompletionReviewDisposition = (() => {
     // A policy we could not read cannot certify anything about this run.
     if (capturedRead.status === 'unreadable') return 'enabled_unavailable';
-    if (!reviewWasEnabled) return 'disabled_by_owner';
+    if (!reviewWasEnabled) return reviewOffDisposition;
     if (!publishedVerdict) return 'enabled_unavailable';
     // A review that ran but did not stand — negative, failed open, or with
     // unreadable evidence — is NOT 'reviewed'. Calling it reviewed is what let a
@@ -1706,7 +1714,7 @@ export function commitTurnOutcome(
     disposition: capturedRead.status === 'unreadable'
       ? 'enabled_unavailable'
       : !reviewWasEnabled
-        ? 'disabled_by_owner'
+        ? reviewOffDisposition
         : verdictTrustworthy || reviewDisposition === 'rejected' ? reviewDisposition : 'enabled_unavailable',
     policyEvidence,
     replyMatches,
