@@ -1004,6 +1004,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
   }
 
   function noteTransportDeath(server: MCPServer): void {
+    logger.warn({ server: server.name }, 'MCP transport died under a call; closing the dead session and reconnecting at once');
     const existing = serverHealth.get(server);
     serverHealth.set(server, {
       state: 'degraded',
