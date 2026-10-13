@@ -11685,7 +11685,7 @@ export function registerConsoleRoutes(
         ok: true,
         server: server.name,
         message: done === 'reconnected'
-          ? `Reconnecting "${server.name}" now; other servers kept their connections.`
+          ? `"${server.name}" was dropped and will reconnect now; other servers kept their connections.`
           : `MCP connections cleared; "${server.name}" will reconnect on the next tool call.`,
         servers,
       });

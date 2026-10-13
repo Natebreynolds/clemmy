@@ -2311,7 +2311,7 @@ test('POST /api/console/workflows/:name/contract-actions audits MCP credential a
   }
 });
 
-test('POST /api/console/mcp-servers/:name/reconnect clears MCP runtime connections for workflow repairs', async () => {
+test('POST /api/console/mcp-servers/:name/reconnect restarts the named MCP server (or clears every connection when no live shim hosts it)', async () => {
   saveUserMcpServers({
     'clemflow-mcp': {
       name: 'clemflow-mcp',
@@ -2333,7 +2333,10 @@ test('POST /api/console/mcp-servers/:name/reconnect clears MCP runtime connectio
     const body = await res.json() as { ok?: boolean; server?: string; message?: string; servers?: unknown[] };
     assert.equal(body.ok, true);
     assert.equal(body.server, 'clemflow-mcp');
+    // Either branch answers in the same shape: the named server will
+    // reconnect; a per-server restart also says the others were left alone.
     assert.match(body.message || '', /will reconnect/);
+    assert.match(body.message || '', /other servers kept their connections|connections cleared/);
     assert.ok(Array.isArray(body.servers));
   } finally {
     await h.close();
