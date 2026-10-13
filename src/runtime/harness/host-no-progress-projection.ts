@@ -1234,6 +1234,20 @@ function settlementConsequence(input: {
       recoveryToolNames: [call.name, 'tool_search', 'ask_user_question'],
     });
   }
+  // A write that ended without acknowledgement: the runner froze the write
+  // boundary and told the model to read first. The model's reads are the
+  // recovery; the frozen call is not on the surface (it is never resent).
+  // The effect stays unknown until a read says otherwise.
+  const unacknowledged = settlement.outcome_kind === 'uncertain_write'
+    && settlement.outcome_detail === 'unacknowledged_mutation';
+  if (unacknowledged) {
+    return createNoProgressConsequence({
+      stage: `execution:provider_unacknowledged:${providerRefusedRequestIdentity(call)}`,
+      recovery: 'repair_model',
+      effectState: 'unknown_frozen',
+      recoveryToolNames: ['tool_search', 'ask_user_question'],
+    });
+  }
   if (
     settlement.requires_reconciliation === 1
     || settlement.outcome_kind === 'uncertain_write'

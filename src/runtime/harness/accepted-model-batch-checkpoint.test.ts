@@ -2082,3 +2082,42 @@ test('a timed-out external write remains reconciliation-only and is never blindl
   assert.equal(physicalRows(task, callId).length, 1);
   leases.revokeDispatchLease(task.parentLease);
 });
+
+test('a write whose carrier raised without acknowledgement checkpoints ready under the write freeze: its crossing threw, the error is its result, and it is never run again', async () => {
+  // Live 2026-10-08: a write that ended without any acknowledgement (a
+  // timeout, a dropped connection) ended the turn with nothing read and
+  // nothing decided. The crossing answered (it threw) and proved nothing;
+  // the model has the error and goes on under the runner's write freeze.
+  const task = fixture('Create the exact hosted site once.', 'execute');
+  const callId = 'call:dark-write';
+  const toolName = 'aibs__create_site';
+  const args = { slug: 'fixture-brief', title: 'Fixture brief' };
+  const admitted = checkpoints.admitAcceptedModelBatch({
+    sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq,
+    preHistory: preHistory(task), frameHistory: openFrame({ callId, toolName, args }),
+    providerResponseId: 'response:dark-write',
+  });
+  assert.equal(admitted.status, 'admitted');
+  if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+  let bodies = 0;
+  await assert.rejects(runCall({
+    task, callId, toolName, args, effect: 'external_write', boundary: 'host_owned_external',
+    invoke: async () => { bodies += 1; throw new Error('socket hang up'); },
+  }));
+  assert.deepEqual(physicalRows(task, callId).map((row) => row.state), ['threw'], 'the crossing answered: it threw');
+  const settlement = eventlog.openEventLog().prepare(`
+    SELECT outcome_kind, outcome_detail FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, callId);
+  assert.deepEqual(settlement, { outcome_kind: 'uncertain_write', outcome_detail: 'unacknowledged_mutation' });
+  assert.equal(checkpoints.countUnansweredCrossings({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, logicalToolCallId: callId }), 0);
+  const resultItem = projectedTextResult({ callId, toolName, value: { ok: false, effect_unknown: true, error: 'socket hang up' } });
+  recordLogicalResult(admitted.admission, resultItem);
+  const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, { committedResultItems: [resultItem] });
+  assert.ok(finalized.status === 'committed' || finalized.status === 'existing', JSON.stringify(finalized));
+  assert.equal(finalized.checkpoint.disposition, 'ready', 'the turn goes on under the freeze; nothing waits for a reconcile stop');
+  const recovered = checkpoints.recoverAcceptedModelBatchForRestart({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq });
+  assert.equal(recovered.status, 'ready');
+  assert.equal(bodies, 1, 'and is never run again');
+  leases.revokeDispatchLease(task.parentLease);
+});

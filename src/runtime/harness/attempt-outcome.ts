@@ -531,3 +531,13 @@ export function providerRepliedWithoutProof(outcome: AttemptOutcome): boolean {
   return outcome.kind === 'uncertain_write'
     && (outcome.detail === 'provider_refused_envelope' || outcome.detail === 'provider_envelope_contradiction');
 }
+
+/** A write that ended with no acknowledgement at all: a timeout, a dropped
+ * connection, a process that ended early. It may have landed. Whether the
+ * turn goes on under a write freeze or stops depends on the crossing: one
+ * that answered (returned or threw) continues, with the model told to read
+ * before any further external write; one still open, lost or timed out
+ * stops. The ledger keeps the directive either way: no replay. */
+export function providerLeftInTheDark(outcome: AttemptOutcome): boolean {
+  return outcome.kind === 'uncertain_write' && outcome.detail === 'unacknowledged_mutation';
+}

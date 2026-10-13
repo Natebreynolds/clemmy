@@ -3053,3 +3053,38 @@ test("Clem's own shell safety refusal closes that route, not the job; other refu
   assert.equal(shell.consequence?.effectState, 'not_started');
   assert.equal(other.consequence?.recovery, 'stop_factual', 'a refusal that is not the shell rule keeps its stop');
 });
+
+test('a write that ended without acknowledgement, where the crossing answered, is read back under the write freeze, never a reconciliation stop', () => {
+  // Live 2026-10-08: two shell commands that timed out ended the turn "I
+  // can't tell whether the command went through… I won't retry it on my
+  // own", with nothing read and nothing decided. The runner now freezes the
+  // write boundary and tells the model to read; the governor's recovery is
+  // the model's reads, and the effect stays unknown until one says otherwise.
+  const identity = accepted('dark-write');
+  const db = settlementDb([{
+    callId: 'dark-write',
+    executionKind: 'provider_execution',
+    outcomeKind: 'uncertain_write',
+    outcomeDetail: 'unacknowledged_mutation',
+    recoveryAction: 'reconcile_then_decide',
+    businessCall: 1,
+    mutating: 1,
+    requiresReconciliation: 1,
+    physicalCrossingCount: 1,
+  }], identity);
+  const projected = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('dark-write', 'mcp__fixture__delete'),
+      result('dark-write', 'mcp__fixture__delete'),
+    ],
+  }, db);
+  assert.equal(projected.status, 'ok', JSON.stringify(projected));
+  if (projected.status === 'ok') {
+    assert.match(projected.consequence?.stage ?? '', /^execution:provider_unacknowledged:/);
+    assert.equal(projected.consequence?.recovery, 'repair_model');
+    assert.equal(projected.consequence?.effectState, 'unknown_frozen');
+    assert.deepEqual(projected.consequence?.recoveryToolNames, ['ask_user_question', 'tool_search'], 'the frozen write is not on the recovery surface');
+  }
+  db.close();
+});

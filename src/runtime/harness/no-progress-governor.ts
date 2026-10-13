@@ -45,7 +45,10 @@ export type NoProgressRecovery =
   | 'stop_factual'
   | 'reconcile';
 
-export type NoProgressEffectState = 'not_started' | 'known_terminal' | 'unknown';
+/** `unknown_frozen`: the effect is unknown and the runner holds the write
+ * boundary until a read returns; the model reads to find out, so its
+ * recovery is model-led, never a reconcile stop. */
+export type NoProgressEffectState = 'not_started' | 'known_terminal' | 'unknown' | 'unknown_frozen';
 
 export interface NoProgressUserInput {
   readonly question: string;
@@ -82,6 +85,7 @@ const EFFECT_STATES = new Set<NoProgressEffectState>([
   'not_started',
   'known_terminal',
   'unknown',
+  'unknown_frozen',
 ]);
 
 function normalizedBoundedText(value: string, label: string, max: number): string {
@@ -175,6 +179,12 @@ export function createNoProgressConsequence(input: {
   }
   if (input.effectState === 'unknown' && input.recovery !== 'reconcile') {
     throw new Error('NoProgressGovernor unknown effect state requires reconciliation.');
+  }
+  // An unknown effect under the runner's write freeze is the model's to find
+  // out: reads are open and every further external write waits for one, so
+  // the recovery is model-led and never a reconcile stop.
+  if (input.effectState === 'unknown_frozen' && input.recovery !== 'repair_model') {
+    throw new Error('NoProgressGovernor frozen unknown effect state requires model-led recovery.');
   }
   const recoveryToolNames = normalizedRecoveryToolNames(input.recoveryToolNames);
   const userInput = normalizedUserInput(input.userInput, input.recovery);

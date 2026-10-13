@@ -9127,9 +9127,14 @@ test('an unresolved worker timeout checkpoints its actual uncertainty once witho
       throw error;
     },
   });
+  // The worker's hard timeout is a call that ended without acknowledgement:
+  // its uncertainty is kept (the settlement, no replay) and the turn goes on
+  // under the write freeze, with the timeout as the call's result; the model
+  // is asked again and answers. It is never run again.
+  const answer = 'The worker did not finish inside its deadline; nothing more was started.';
   const model = stubModel([
     [toolCall('worker-hard-timeout', 'run_worker', { item: 'review', prompt: 'Review the retained results.' })],
-    [textMsg('This must not be reached while the worker effect is unresolved.')],
+    [textMsg(answer)],
   ]);
   const agent = { model, tools: [worker] };
   bindHostCanarySurface(fixture, agent, [worker]);
@@ -9140,19 +9145,23 @@ test('an unresolved worker timeout checkpoints its actual uncertainty once witho
       AND logical_tool_call_id = ?`).get(fixture.session.id, fixture.source.seq, 'worker-hard-timeout');
   assert.deepEqual(settled, { outcome_kind: 'uncertain_write', requires_reconciliation: 1, host_crossing_count: 1 });
   assert.equal(bodies, 1);
-  assert.equal(model.calls(), 1);
-  assert.equal(outcome.hold, undefined, 'an admissible reconciliation checkpoint must not enter the checkpoint-store retry loop');
-  assert.equal(outcome.terminal?.reason, 'tool_effect_uncertain');
-  assert.deepEqual(dispositionMarkers(outcome.history), [{
-    disposition: 'effect_unknown', effect: 'may_have_started', retry: 'do_not_retry', requiresReconciliation: true,
-  }]);
+  assert.equal(model.calls(), 2, 'the model is asked again with the timeout in hand');
+  assert.equal(outcome.hold, undefined, 'an admissible checkpoint must not enter the checkpoint-store retry loop');
+  assert.notDeepEqual(outcome.terminal, { status: 'blocked', reason: 'tool_effect_uncertain' }, 'no reconciliation stop');
+  assert.equal(outcome.finalOutput, answer);
+  assert.deepEqual(dispositionMarkers(outcome.history), [], 'no effect_unknown marker: the timeout is the call\'s result');
+  const paired = outcome.history.find((item) => (item as { type?: string }).type === 'function_call_result'
+    && (item as { callId?: string }).callId === 'worker-hard-timeout') as { output?: { text?: string } } | undefined;
+  assert.match(String(paired?.output?.text ?? ''), /"effect_unknown":true/);
+  assert.match(String(paired?.output?.text ?? ''), /did not drain before its deadline/);
   const checkpoints = db.prepare(`SELECT disposition FROM accepted_model_batch_checkpoints
-    WHERE session_id = ? AND source_user_seq = ?`).all(fixture.session.id, fixture.source.seq);
-  assert.deepEqual(checkpoints, [{ disposition: 'reconciliation_required' }]);
+    WHERE session_id = ? AND source_user_seq = ?`).all(fixture.session.id, fixture.source.seq) as Array<{ disposition: string }>;
+  assert.ok(checkpoints.length >= 1);
+  assert.deepEqual([...new Set(checkpoints.map((row) => row.disposition))], ['ready'], 'the frame checkpoints ready under the freeze');
   eventlog.closeEventLog();
   const { prepareAcceptedModelBatchRestart } = await import('./accepted-model-batch-checkpoint.js');
   const reopened = prepareAcceptedModelBatchRestart({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq });
-  assert.equal(reopened.status, 'reconciliation_required', JSON.stringify(reopened));
+  assert.notEqual(reopened.status, 'reconciliation_required', JSON.stringify(reopened));
   assert.equal(bodies, 1, 'reopening recovery evidence never invokes the stalled worker again');
 });
 
@@ -13777,9 +13786,13 @@ for (const variant of ['fresh', 'current_refusal', 'prior_uncertain', 'missing_a
       } });
     const oldModel = scriptedRecordingModel([
       [toolCall(`owned-read-${first.source.seq}`, 'read_file', { path: publicFile, max_chars: null })],
-      variant === 'prior_uncertain'
-        ? [toolCall(`owned-uncertain-${first.source.seq}`, 'run_worker', { item: 'controlled', prompt: 'Controlled model-free fixture.' })]
-        : [textMsg('The controlled text was read.')],
+      ...(variant === 'prior_uncertain'
+        // The worker's timeout ends no turn: the model gets it as the call's
+        // result under the write freeze and answers; the settlement stays
+        // uncertain (no replay) and is what the next turn's review sees.
+        ? [[toolCall(`owned-uncertain-${first.source.seq}`, 'run_worker', { item: 'controlled', prompt: 'Controlled model-free fixture.' })],
+          [textMsg('The controlled worker did not finish inside its deadline.')]]
+        : [[textMsg('The controlled text was read.')]]),
     ]);
     const oldAgent = { model: oldModel, tools: variant === 'prior_uncertain' ? [read, worker] : [read] };
     bindHostCanarySurface(first, oldAgent, oldAgent.tools);
@@ -13791,7 +13804,9 @@ for (const variant of ['fresh', 'current_refusal', 'prior_uncertain', 'missing_a
     const savedSettlements = priorSettlements();
     assert.ok(savedSettlements.length > 0, 'retained history is backed by actual durable work');
     if (variant === 'prior_uncertain') {
-      assert.equal(workerEntries, 1); assert.equal(old.terminal?.reason, 'tool_effect_uncertain');
+      assert.equal(workerEntries, 1);
+      assert.notEqual(old.terminal?.reason, 'tool_effect_uncertain', 'the timeout is read back under the freeze, never a reconciliation stop');
+      assert.equal(old.finalOutput, 'The controlled worker did not finish inside its deadline.');
       assert.ok((savedSettlements as Array<{ outcome_kind: string; requires_reconciliation: number }>).some(row =>
         row.outcome_kind === 'uncertain_write' && row.requires_reconciliation === 1));
     } else assert.equal(old.finalOutput, 'The controlled text was read.');
@@ -13872,3 +13887,56 @@ for (const variant of ['fresh', 'current_refusal', 'prior_uncertain', 'missing_a
     eventlog.finishRunAttempt(second.attempt, result.terminal?.status === 'blocked' ? 'failed' : 'completed');
   });
 }
+
+test('a write whose carrier raised without acknowledgement goes on under a write freeze: reads open, writes wait for a read, the frozen write never resent, and she answers', async (t) => {
+  // Live 2026-10-08: two shell commands that timed out ended the turn "I
+  // can't tell whether the command went through… I won't retry it on my
+  // own", with nothing read and nothing decided. A write that ended without
+  // acknowledgement may have landed: the model gets the error as the call's
+  // result, every further external write waits until a read returns, the
+  // frozen call is never resent, and the model reads, then speaks.
+  const accepted = acceptHostCanarySource('dark-write-freeze',
+    'Create one reversible draft on the controlled provider account and report its receipt.');
+  let entered = 0;
+  let lateRuns = 0;
+  const writer = await transportWriteFixture(
+    async () => { entered++; throw new Error('socket hang up'); },
+    async () => { lateRuns++; return 'created after the read'; },
+  );
+  t.after(() => writer.restore());
+  let reads = 0;
+  const reader = tool({
+    name: 'read_file',
+    description: 'read the target',
+    parameters: z.object({}),
+    execute: async () => { reads++; return 'no draft exists on the controlled account'; },
+  });
+  const answer = 'The connection dropped before the app answered. I checked the account: no draft existed, so I created it after the read.';
+  const model = stubModel([
+    [writer.call('dark-write')],
+    [writer.call('dark-write-while-frozen', true)],
+    [toolCall('dark-read', 'read_file', {})],
+    [writer.call('dark-write-after-read', true)],
+    [textMsg(answer)],
+  ]);
+  const agent = { model, tools: [writer.carrier, brackets.wrapToolForHarness(reader as never)] };
+  bindHostCanarySurface(accepted, agent, agent.tools);
+  const outcome = await runProductionHost(accepted, agent, undefined, { maxTurns: 5 });
+  assert.equal(entered, 1, 'the dark write ran once and is never resent');
+  assert.equal(reads, 1, 'the read went through while the write boundary was frozen');
+  assert.equal(lateRuns, 1, 'a changed write after the read goes through the gate like any write');
+  assert.equal(model.calls(), 5, 'the turn went on; no reconciliation stop');
+  assert.equal(outcome.finalOutput, answer);
+  assert.notDeepEqual(outcome.terminal, { status: 'blocked', reason: 'tool_effect_uncertain' }, 'the turn did not end in the harness\'s words');
+  const resultText = (id: string) => {
+    const paired = outcome.history.find((item) => (item as { type?: string }).type === 'function_call_result'
+      && (item as { callId?: string }).callId === id) as { output?: { text?: string } } | undefined;
+    return String(paired?.output?.text ?? '');
+  };
+  assert.match(resultText('dark-write'), /"effect_unknown":true/);
+  assert.match(resultText('dark-write'), /socket hang up/, 'the error is the call\'s result');
+  assert.match(resultText('dark-write'), /send no other external write until you have read/);
+  assert.match(resultText('dark-write-while-frozen'), /write_frozen_until_read/, 'an external write before a read is refused before dispatch');
+  assert.deepEqual(dispositionMarkers(outcome.history).map((marker) => marker.disposition), ['refused_pre_dispatch'],
+    'no effect_unknown marker: the frozen write is the only host disposition');
+});

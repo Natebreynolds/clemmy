@@ -24,8 +24,12 @@ test('settlementRequiresReconciliation is gated on the irreversible boundary', a
     // hard-stops. v3.18.37 widened that clause to every reply without proof:
     // a refusal, or a success-by-protocol whose own bytes say failure. Both
     // are answers the model reads; neither is the dark.
-    /settlementRequiresReconciliation =\s*\n\s*invoked\.settlement\.outcome\.directive\.requiresReconciliation === true\s*\n\s*&& uncertainEffectStopsTurn\(effect\)\s*\n\s*&& !providerRepliedWithoutProof\(invoked\.settlement\.outcome\);/,
-    'a local write or read that may have started must not hard-block; only external_write/admin reconcile, and a provider that replied (refusal or contradiction) never does',
+    // The fourth clause: a write that RETURNED without acknowledgement (a
+    // timeout the tool reported, a process that ended early) goes on under
+    // the runner's write freeze; the hard block is for a crossing that never
+    // answered at all.
+    /settlementRequiresReconciliation =\s*\n\s*invoked\.settlement\.outcome\.directive\.requiresReconciliation === true\s*\n\s*&& uncertainEffectStopsTurn\(effect\)\s*\n\s*&& !providerRepliedWithoutProof\(invoked\.settlement\.outcome\)\s*\n\s*&& !providerLeftInTheDark\(invoked\.settlement\.outcome\);/,
+    'a local write or read that may have started must not hard-block; only external_write/admin reconcile, and a provider that replied (refusal, contradiction, or a returned call with no acknowledgement) never does',
   );
   // One rule, shared with the checkpoint that must accept what the runner showed.
   const { uncertainEffectStopsTurn } = await import('./reconciliation-stop.js');

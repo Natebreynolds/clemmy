@@ -967,9 +967,15 @@ function settledNonSuccessProjectionDisposition(input: {
   // reconciled" and the model never saw why).
   // A reply whose own bytes contradict its success flag is the same kind of
   // answer: the provider spoke, the model reads it, nothing is replayed.
+  // A write that ended without acknowledgement, where the crossing itself
+  // answered (returned or threw) and proved nothing, is the same shape for
+  // the checkpoint: the model has what came back and goes on under the
+  // runner's write freeze; the ledger keeps the call from being resent. Only
+  // a crossing still open, lost or timed out keeps the reconciliation stop.
   const answeredRefusal = settlement.outcome_kind === 'uncertain_write'
     && (settlement.outcome_detail === 'provider_refused_envelope'
-      || settlement.outcome_detail === 'provider_envelope_contradiction')
+      || settlement.outcome_detail === 'provider_envelope_contradiction'
+      || settlement.outcome_detail === 'unacknowledged_mutation')
     && settlement.unanswered_crossing_count === 0;
   const mutatingSafeFailure = answeredRefusal || new Set([
     'invalid_arguments',
@@ -1668,4 +1674,22 @@ export function inspectRetainedModelBatchFromToken(token: AcceptedModelBatchRest
 /** Exact JSON-byte digest for tests and cross-process crash assertions. */
 export function acceptedModelBatchItemDigest(item: AgentInputItem): string {
   return conversationProtocolItemBytesSha256(item);
+}
+
+/** Crossings of one logical call that never answered: still open, lost or
+ *  timed out (neither returned nor threw). The runner reads this where it
+ *  decides whether a write that ended without acknowledgement goes on under
+ *  a write freeze (answered crossings) or stops to reconcile (an unanswered
+ *  one), the same count this checkpoint's projection reads. */
+export function countUnansweredCrossings(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  logicalToolCallId: string;
+}): number {
+  const row = openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+       AND state NOT IN ('returned', 'threw')
+  `).get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId) as { n: number } | undefined;
+  return row?.n ?? 0;
 }
