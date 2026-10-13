@@ -779,12 +779,13 @@ for (const issue of ['missing', 'malformed', 'partial', 'uncertain', 'positive_c
     } });
     const before = listEvents(sessionId).filter(row => /model|goal_alignment/.test(row.type)).map(row => row.id);
     const committed = commitTurnOutcome(outcome);
-    // A reviewer that answered but could not qualify the exact answer keeps
-    // the unverified hold: Clem's words unchanged, blocked and resumable, and
-    // the chip says unchecked. No sentence is added under her answer.
+    // A reviewer that answered but could not vouch for the exact answer is the
+    // same absence of a check as one that could not fire: the terminal follows
+    // the brain, Clem's words unchanged, and the chip says unchecked. No
+    // sentence is added under her answer, and finished work is never held.
     assert.equal(committed.presentation.text, outcome.presentation.text);
-    assert.equal(committed.presentation.status, 'blocked');
-    assert.equal(committed.presentation.resumable, true);
+    assert.equal(committed.presentation.status, 'done');
+    assert.notEqual(committed.presentation.resumable, true);
     assert.equal(committed.event.data.review, 'unchecked');
     assert.equal(committed.event.data.reviewNote, undefined);
     const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;

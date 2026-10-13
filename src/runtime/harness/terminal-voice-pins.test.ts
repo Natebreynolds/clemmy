@@ -109,9 +109,12 @@ const REVIEW_CAUSES: ReadonlyArray<{
     reason: 'The fixture reviewer route was unavailable.' }), review: 'unchecked', status: 'done' },
   { cause: 'timeout', verdict: () => ({ fulfills: true, failedOpen: true, reviewFailure: 'timeout',
     reason: 'The completion reviewer timed out; no review was completed.' }), review: 'unchecked', status: 'done' },
+  // A reviewer that answered but could not vouch for its answer is the same
+  // absence of a check as one that could not fire: the terminal follows the
+  // brain and the chip says unchecked.
   { cause: 'answered_unqualified', verdict: () => ({ fulfills: false, failedOpen: true, reviewFailure: 'invalid',
     reviewDisposition: 'answered_unqualified', reason: 'The required same-output assessment was missing.' }),
-  review: 'unchecked', status: 'blocked' },
+  review: 'unchecked', status: 'done' },
   { cause: 'negative', verdict: () => ({ fulfills: false, reason: 'The count in the reply does not match the read.' }),
     review: 'rejected', status: 'blocked', note: 'The count in the reply does not match the read.' },
   // A BLOCKED finding is a rejection another attempt cannot change. It is

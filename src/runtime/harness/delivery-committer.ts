@@ -1626,17 +1626,21 @@ export function commitTurnOutcome(
     // Claude login in that home. Blocking finished work on the absence of a
     // check teaches people to distrust the check, not the work.
     //
-    // A reviewer that answered but could not qualify the exact authored answer
-    // (`answered_unqualified`: its assessment was missing, malformed or
-    // unbound) keeps the unverified hold: blocked and resumable, Clem's words
-    // unchanged, the chip unchecked. Whether it should follow the brain like an
-    // unreachable reviewer is a review-policy decision of its own, not part of
-    // how the result is worded.
+    // A reviewer that answered but could not vouch for the exact authored
+    // answer (`answered_unqualified`: its assessment failed its own control,
+    // was partial, uncertain or unbound) is the same absence of a check, and
+    // follows the brain the same way (owner decision 2026-10-13, after an
+    // afternoon in which five finished, correct replies were held as blocked
+    // on it, and the packaged cold turn ended `blocked` on a fixture reviewer).
+    // A reviewer's doubt about its own reading is not a finding against the
+    // work; a finding arrives as a verdict that says no, and that path is
+    // untouched: it still rejects.
     //
     // Honesty is kept exactly where it belongs. The review chip says the result
     // is unchecked, and the verdict record still carries verified:false with
-    // disposition enabled_unavailable, so nothing here ever claims a review
-    // happened. Only the terminal follows the brain.
+    // disposition enabled_unavailable and the reviewer's own diagnostic, so
+    // nothing here ever claims a review happened. Only the terminal follows
+    // the brain.
     //
     // WHY THIS IS CONDITIONAL ON THE PUBLISH SUCCEEDING (learned the hard way,
     // 2026-09-10): a `done` terminal must CLOSE the accepted-task authority, and
@@ -1656,8 +1660,8 @@ export function commitTurnOutcome(
       && artifactsMatch
       && (!artifactsRequired || coverageComplete);
     const reviewCouldNotFire = detail === 'completion_review_failed_open'
-      && publishedVerdict?.fulfills === true
-      && publishedVerdict.hostEvidenceHold !== true
+      && (publishedVerdict?.fulfills === true || answeredUnqualified)
+      && publishedVerdict?.hostEvidenceHold !== true
       && joinsStand;
     unverifiedHoldFallback = reviewCouldNotFire
       ? () => unverifiedCompletionOutcome(authoredOutcome, true)
