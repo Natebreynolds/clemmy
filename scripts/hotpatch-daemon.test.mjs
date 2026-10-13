@@ -746,7 +746,7 @@ test('bounded ordered receipt chain proves three installed rounds and privately 
   assert.throws(() => g.proveRepeat({ priorProof: proof }), /retained rollback footprint/);
 });
 
-for (const ancestors of [16, 17, 18, 19, 20, 21, 22, 23, 24]) test(`exact ${ancestors}-ancestor no-active chain retains every rollback through four replacements`, t => {
+for (const ancestors of [16, 17, 18, 19, 20, 21, 22, 23, 24, 25]) test(`exact ${ancestors}-ancestor no-active chain retains every rollback through four replacements`, t => {
   const g = noActiveRepeatFixture(t, ancestors + 1);
   assert.equal(g.manifest.receipts.length, ancestors);
   assert.equal(new Set(g.chain.map(item => item.receipt.sourceFingerprint)).size, ancestors + 1);
@@ -787,10 +787,10 @@ for (const ancestors of [16, 17, 18, 19, 20, 21, 22, 23, 24]) test(`exact ${ance
   }
 });
 
-test('25 unique complete ancestors refuse at the bound before any write', t => {
-  const g = noActiveRepeatFixture(t, 26);
-  assert.equal(g.manifest.receipts.length, 25);
-  assert.equal(new Set(g.manifest.receipts.map(item => item.sha256)).size, 25);
+test('26 unique complete ancestors refuse at the bound before any write', t => {
+  const g = noActiveRepeatFixture(t, 27);
+  assert.equal(g.manifest.receipts.length, 26);
+  assert.equal(new Set(g.manifest.receipts.map(item => item.sha256)).size, 26);
   const namesBefore = Object.values(g.parts).map(relative => [path.dirname(path.join(g.app, relative)),
     fs.readdirSync(path.dirname(path.join(g.app, relative))).sort()]);
   const writes = [];
@@ -820,7 +820,7 @@ test('receipt ancestry refuses skipped, reordered, extra, aliased and unpinned e
     ['extra ancestor keys', g => { g.manifest.receipts[0].trusted = true; g.repinManifest(); }],
     ['extra manifest keys', g => { g.manifest.success = true; g.repinManifest(); }],
     ['unsupported manifest version', g => { g.manifest.version = 2; g.repinManifest(); }],
-    ['unbounded ancestors', g => { g.manifest.receipts = Array.from({ length: 25 }, () => g.manifest.receipts[0]); g.repinManifest(); }],
+    ['unbounded ancestors', g => { g.manifest.receipts = Array.from({ length: 26 }, () => g.manifest.receipts[0]); g.repinManifest(); }],
     ['empty manifest', g => { g.manifest.receipts = []; g.repinManifest(); }],
     ['omitted manifest', g => { delete g.repeat.authorizedAncestorManifest; delete g.repeat.authorizedAncestorManifestSha256; }],
   ]) await t.test(name, t => { const g = receiptChainFixture(t); change(g); assert.throws(() => g.proveRepeat()); });

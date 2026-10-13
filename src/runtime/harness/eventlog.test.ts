@@ -2179,6 +2179,109 @@ test('appendEvent emits a harness.event on the global actionBus', async () => {
   assert.equal(seen[0].hasConversation, false);
 });
 
+test('committed event fanout omits private state hydration and keeps current session signals and workflow correlation', async () => {
+  resetEventLog();
+  const { actionBus } = await import('../action-bus.js');
+  const { listOperationalEvents } = await import('../operational-telemetry.js');
+  const { withEventPublicationTransaction } = await import('./eventlog.js');
+  const privateKeys = ['__conversation', '__host_recovery_state', '__interrupt_state',
+    '__source_approval_checkpoints', '__host_recovery_mcp_scope'];
+  const privateState = Object.fromEntries(privateKeys.map((key, index) => [key, {
+    retained: `controlled-private-state-${index}`,
+  }]));
+  const sess = createSession({
+    id: 'fixture-publication-state-workflow',
+    kind: 'workflow',
+    channel: 'desktop',
+    userId: 'fixture-publication-user',
+    title: 'before commit',
+    objective: 'controlled publication',
+    metadata: { source: 'workflow', workflowRunId: 'workflow-publication-before', ...privateState },
+  });
+  assert.deepEqual(getSession(sess.id)?.metadata, sess.metadata);
+  listOperationalEvents({ sessionId: sess.id, limit: 10 });
+  const db = openEventLog();
+  const signals: Array<{ kind: string; event: import('./eventlog.js').EventRow;
+    session: import('./eventlog.js').HarnessSessionSignal | undefined }> = [];
+  const unsubscribe = actionBus.subscribe((message) => {
+    if ((message.kind === 'harness.event' || message.kind === 'harness.public_event')
+      && message.sessionId === sess.id) {
+      signals.push({ kind: message.kind, event: message.event, session: message.session });
+    }
+  });
+  const originalParse = JSON.parse;
+  const previousMirror = process.env.CLEMMY_EVENTLOG_OPERATIONAL_MIRROR;
+  process.env.CLEMMY_EVENTLOG_OPERATIONAL_MIRROR = 'on';
+  let metadataParses = 0;
+  const hydratedPrivateKeys: string[] = [];
+  let committed!: ReturnType<typeof updateSession>;
+  let published!: ReturnType<typeof appendEvent>;
+  let persistedMetadata!: string;
+  try {
+    try {
+      withEventPublicationTransaction(() => {
+        published = appendEvent({ sessionId: sess.id, turn: 1, role: 'system',
+          type: 'turn_started', data: { phase: 'controlled-publication' } });
+        assert.equal(signals.length, 0, 'the managed event is not published before its commit');
+        committed = updateSession(sess.id, {
+          title: 'current committed title', status: 'paused',
+          metadata: { source: 'workflow', channelId: 'fixture-channel', guildId: 'fixture-guild',
+            workflowName: 'controlled workflow', workflowRunId: 'workflow-publication-current',
+            stepId: 'fixture-step', fanoutFixtureMetadata: true, ...privateState },
+        });
+        persistedMetadata = (db.prepare('SELECT metadata_json FROM sessions WHERE id = ?')
+          .get(sess.id) as { metadata_json: string }).metadata_json;
+        // Imports and ordinary full-state reads are complete. Guard only the
+        // deferred post-commit publication, regardless of its SQL shape.
+        JSON.parse = (text, reviver) => {
+          if (text.includes('"fanoutFixtureMetadata"')) metadataParses++;
+          const found = privateKeys.filter((key) => text.includes(JSON.stringify(key)));
+          hydratedPrivateKeys.push(...found);
+          if (found.length) throw new Error('Private session state reached JavaScript event fanout');
+          return originalParse(text, reviver);
+        };
+      });
+    } finally {
+      JSON.parse = originalParse;
+    }
+    assert.ok(metadataParses > 0, 'the guard observed the fresh committed session metadata');
+    assert.deepEqual(hydratedPrivateKeys, []);
+    assert.deepEqual(signals.map((signal) => signal.kind), ['harness.event', 'harness.public_event']);
+    const expectedSignal = {
+      id: sess.id, kind: 'workflow', channel: 'desktop', userId: 'fixture-publication-user',
+      status: 'paused', title: 'current committed title', objective: 'controlled publication',
+      updatedAt: committed.updatedAt,
+      metadata: { source: 'workflow', channelId: 'fixture-channel', guildId: 'fixture-guild',
+        workflowName: 'controlled workflow', workflowRunId: 'workflow-publication-current', stepId: 'fixture-step' },
+    };
+    assert.deepEqual(signals.map((signal) => signal.session), [expectedSignal, expectedSignal]);
+    assert.equal(signals[0].event.id, published.id);
+    assert.equal(signals[1].event.id, published.id);
+    assert.deepEqual(signals[0].event.data, { phase: 'controlled-publication' });
+    assert.deepEqual(signals[1].event.data, {});
+    const mirrored = listOperationalEvents({ sessionId: sess.id, limit: 10 });
+    assert.equal(mirrored.length, 1);
+    assert.equal(mirrored[0].workflowRunId, 'workflow-publication-current');
+    assert.equal(mirrored[0].payload.sessionTitle, 'current committed title');
+    assert.equal(mirrored[0].payload.sessionKind, 'workflow');
+    assert.equal(mirrored[0].payload.phase, 'controlled-publication');
+    assert.deepEqual(getSession(sess.id), committed, 'default reads still hydrate all retained private state');
+    assert.equal((db.prepare('SELECT metadata_json FROM sessions WHERE id = ?')
+      .get(sess.id) as { metadata_json: string }).metadata_json, persistedMetadata);
+    db.prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run('{invalid metadata', sess.id);
+    assert.throws(() => appendEvent({ sessionId: sess.id, turn: 2, role: 'system',
+      type: 'heartbeat', data: {} }), SyntaxError, 'malformed metadata still fails publication rather than becoming an empty session');
+    assert.throws(() => getSession(sess.id), SyntaxError);
+    assert.equal(signals.length, 2, 'invalid metadata does not publish a misleading session signal');
+  } finally {
+    JSON.parse = originalParse;
+    unsubscribe();
+    if (previousMirror === undefined) delete process.env.CLEMMY_EVENTLOG_OPERATIONAL_MIRROR;
+    else process.env.CLEMMY_EVENTLOG_OPERATIONAL_MIRROR = previousMirror;
+    resetEventLog();
+  }
+});
+
 test('actionBus subscribers filtered by sessionId never see other sessions', async () => {
   const { actionBus } = await import('../action-bus.js');
   const a = createSession({ kind: 'chat' });

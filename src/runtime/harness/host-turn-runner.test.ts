@@ -10035,6 +10035,147 @@ for (const boundary of ['review_done', 'review_awaiting', 'review_correction',
   });
 }
 
+for (const boundary of ['negative_before_close', 'malformed_after_negative', 'indexed_unavailable', 'strict_read_unavailable', 'pending_without_delivery',
+  'malformed_input', 'malformed_after_model', 'malformed_after_review'] as const) {
+  test(`steering indexed checkpoint: ${boundary} preserves the owner and refuses obsolete completion`, { timeout: 15_000 }, async t => {
+    const host = await import('./host-turn-runner.js');
+    const steering = await import('./steer-notes.js');
+    const { prepareCached } = await import('../sqlite-statement-cache.js');
+    const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+    process.env.HARNESS_TOOL_BRACKETS = 'on';
+    t.after(() => {
+      host._setHostObjectiveJudgeForTests(null);
+      if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+      else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+    });
+    const objective = 'Create a report of both the local status and its limitations from the local file.';
+    const session = eventlog.createSession({ id: `sess-indexed-steer-${boundary}-${++acceptedSerial}`, kind: 'chat' });
+    const attempt = eventlog.beginRunAttempt(session.id, { runId: `indexed-steer-${acceptedSerial}` });
+    const source = eventlog.recordRunAttemptUserInput(attempt,
+      { turn: 1, role: 'user', data: { text: objective } }, { armRunInFlight: true });
+    const fixture = { session, source, context: { sessionId: session.id, sourceUserSeq: source.seq },
+      parent: { sessionId: session.id, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId,
+        counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::turn:1` } };
+    host.captureEffectiveCompletionPolicyOnce({ ...fixture.context, enabled: true });
+    let reads = 0;
+    const reportPath = path.join(TMP_HOME, `indexed-status-${acceptedSerial}.txt`);
+    writeFileSync(reportPath, 'retained-status: ready\n', 'utf8');
+    const reader = brackets.wrapToolForHarness(tool({ name: 'read_file',
+      description: 'Read a retained controlled status once.', parameters: z.object({ path: z.string() }),
+      execute: async () => { reads++; return { status: 'ready', limitation: 'not externally verified' }; },
+    }) as never);
+    const oldReply = 'The retained status is ready and not externally verified.';
+    const finalReply = 'Le statut conservé est prêt et n’est pas vérifié à l’extérieur.';
+    const noteText = 'Keep the settled status and its limitation. Report it in French.';
+    const model = scriptedRecordingModel([[toolCall('settled-indexed-read', 'read_file', { path: reportPath })],
+      [textMsg(oldReply)], [textMsg(finalReply)]]);
+    const malformed = () => eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user',
+      type: 'user_steer_note', data: { text: { privateDirective: 'must not become a model instruction' } } });
+    if (boundary === 'malformed_input') malformed();
+    if (boundary === 'malformed_after_model') {
+      const response = model.getResponse.bind(model);
+      model.getResponse = async request => {
+        const result = await response(request);
+        if (model.calls() === 1) malformed();
+        return result;
+      };
+    }
+    const reviewed: Array<{ objective: string; reply: string }> = [];
+    let pendingNote: { seq: number } | undefined;
+    host._setHostObjectiveJudgeForTests(async (currentObjective, reply) => {
+      reviewed.push({ objective: currentObjective, reply });
+      assert.equal(reads, 1, 'the exact read settled before the real configured review checkpoint');
+      assert.equal(model.calls(), reviewed.length + 1, 'this fixture reached the configured review for its current draft');
+      if (reviewed.length === 1 && boundary === 'malformed_after_review') malformed();
+      if (reviewed.length === 1 && boundary === 'pending_without_delivery') {
+        pendingNote = steering.appendSteerNote(session.id, noteText, { expectedAttemptId: attempt.attemptId });
+      }
+      return { done: true, reason: 'The current controlled objective is reviewed.' };
+    });
+    // Interleave an actual journal write immediately after the real indexed
+    // read snapshot. This models another writer at the negative-read boundary;
+    // the returned query rows are never invented or replaced.
+    const statement = prepareCached(eventlog.openEventLog(),
+      'SELECT * FROM events WHERE session_id = ? AND seq > ? AND type IN (?,?,?) ORDER BY seq ASC');
+    const originalAll = statement.all;
+    let injected = false;
+    statement.all = function (...parameters: unknown[]) {
+      const rows = originalAll.apply(statement, parameters);
+      if (parameters[0] === session.id && parameters[1] === source.seq && reviewed.length === 1 && !injected) {
+        const caller = new Error().stack ?? '';
+        if (boundary === 'indexed_unavailable' && caller.includes('reopenForOwnerSteering')) {
+          injected = true;
+          throw new Error('controlled indexed steering read unavailable');
+        }
+        if ((boundary === 'negative_before_close' || boundary === 'malformed_after_negative') && caller.includes('closeForOwnerSteering')) {
+          assert.equal(rows.length, 0, 'the indexed snapshot was genuinely negative');
+          injected = true;
+          if (boundary === 'malformed_after_negative') malformed();
+          else pendingNote = steering.appendSteerNote(session.id, noteText, { expectedAttemptId: attempt.attemptId });
+        }
+        if (boundary === 'pending_without_delivery' && caller.includes('reopenForOwnerSteering')) {
+          assert.ok(pendingNote);
+          injected = true;
+          eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'user_steer_note_delivered',
+            data: { noteSeqs: [pendingNote.seq], sourceUserSeq: source.seq } });
+        }
+      }
+      return rows;
+    };
+    t.after(() => { statement.all = originalAll; });
+    const fullStatement = prepareCached(eventlog.openEventLog(),
+      'SELECT * FROM events WHERE session_id = ? AND type IN (?,?,?) ORDER BY seq ASC');
+    const originalFullAll = fullStatement.all;
+    fullStatement.all = function (...parameters: unknown[]) {
+      if (boundary === 'strict_read_unavailable' && parameters[0] === session.id
+        && (new Error().stack ?? '').includes('takeUndeliveredSteerNotes')) {
+        throw new Error('controlled source read unavailable');
+      }
+      return originalFullAll.apply(fullStatement, parameters);
+    };
+    t.after(() => { fullStatement.all = originalFullAll; });
+    const agent = { model, tools: [reader] };
+    bindHostCanarySurface(fixture, agent, [reader]);
+    const running = runProductionHost(fixture, agent, undefined, { hostJudgeCompletion: true, maxTurns: 6 });
+    if (boundary !== 'negative_before_close') {
+      await assert.rejects(running, error => boundary === 'indexed_unavailable'
+        ? error instanceof Error && error.message === 'controlled indexed steering read unavailable'
+        : boundary === 'pending_without_delivery'
+          ? error instanceof Error && (error as { boundaryKind?: string }).boundaryKind === 'owner_steering_adoption_unavailable'
+          : steering.isSteerNoteAdmissionError(error) && error.code === 'STEER_NOTE_UNAVAILABLE'
+            && !error.message.includes('privateDirective'));
+      assert.equal(model.calls(), boundary === 'malformed_input' || boundary === 'strict_read_unavailable' ? 0 : boundary === 'malformed_after_model' ? 1 : 2);
+      assert.equal(reads, boundary === 'malformed_input' || boundary === 'strict_read_unavailable' || boundary === 'malformed_after_model' ? 0 : 1);
+      if (!['malformed_input', 'strict_read_unavailable', 'malformed_after_model'].includes(boundary)) {
+        assert.equal(reviewed.length, 1, 'a post-review boundary must actually enter its configured reviewer');
+        if (boundary !== 'malformed_after_review') assert.equal(injected, true, 'the selected real indexed checkpoint was exercised');
+      }
+      assert.equal(eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+        .filter(row => row.data.kind === 'host_terminal_steering_cutover').length, 0);
+      if (boundary.startsWith('malformed_')) {
+        assert.equal(eventlog.listEvents(session.id, { types: ['user_steer_note_delivered'] }).length, 0);
+        assert.ok(!JSON.stringify(model.requests).includes('must not become a model instruction'));
+      }
+      return;
+    }
+    const result = await running;
+    assert.ok(injected && pendingNote, 'a real accepted note crossed the indexed negative snapshot');
+    const adoptedNote = pendingNote;
+    assert.equal(result.finalOutput, finalReply);
+    assert.equal(model.calls(), 3);
+    assert.equal(reads, 1, 'the exact settled read is not repeated');
+    assert.equal(reviewed.length, 2, 'the whole amended objective receives a fresh review');
+    assert.ok(reviewed[1]!.objective.includes(objective) && reviewed[1]!.objective.includes(noteText));
+    assert.ok(JSON.stringify(model.requests[2]).includes(noteText));
+    assert.ok(!JSON.stringify(result.history).includes(oldReply));
+    assert.equal(eventlog.getRunAttemptBySourceUserSeq(session.id, source.seq)?.attemptId, attempt.attemptId);
+    const deliveries = eventlog.listEvents(session.id, { types: ['user_steer_note_delivered'] });
+    assert.equal(deliveries.filter(row => Array.isArray(row.data.noteSeqs) && row.data.noteSeqs.includes(adoptedNote.seq)).length, 1);
+    assert.throws(() => steering.appendSteerNote(session.id, 'Too late for the closed handoff.', { expectedAttemptId: attempt.attemptId }),
+      error => steering.isSteerNoteAdmissionError(error) && error.code === 'STEER_NOTE_CUTOVER');
+  });
+}
+
 test('terminal steering compatibility: source-only direct runConversation and noninteractive workflow do not require attempts', async () => {
   for (const id of [`sess-direct-terminal-${++acceptedSerial}`, `workflow:direct-terminal-${++acceptedSerial}:main`]) {
     const session = eventlog.createSession({ id, kind: id.startsWith('workflow:') ? 'agent' : 'chat' });

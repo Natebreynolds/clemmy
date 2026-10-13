@@ -1566,7 +1566,7 @@ function publishPersistedEvent(event: EventRow): EventRow {
     eventPublicationFrame.publications.push(() => { publishPersistedEvent(event); });
     return event;
   }
-  const session = getSession(event.sessionId);
+  const session = getSession(event.sessionId, { withoutConversationState: true });
   const sessionSignal = session ? summarizeSessionForSignal(session) : undefined;
   // Fan out for live SSE subscribers. Best-effort — emit errors are
   // swallowed inside actionBus so a flaky listener can never block

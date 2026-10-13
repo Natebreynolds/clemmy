@@ -9895,7 +9895,7 @@ const runHostTurnBody = async (
       throw new HostCallAuthorityBoundaryError('owner_steering_terminal_owner_mismatch');
     }
     const pending = hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
-    const arrived = takeUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
+    const arrived = pending ? takeUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq, true) : [];
     if (pending && arrived.length === 0) throw new HostCallAuthorityBoundaryError('owner_steering_adoption_unavailable');
     if (arrived.length) captureExplicitSteerInstructions(identity.sessionId, arrived);
     if (!arrived.length && objective === judgedObjective()) return false;
@@ -10436,7 +10436,7 @@ const runHostTurnBody = async (
         const steerIdentity = exactHostIdentity();
         const memoryIntake = verifiedMemoryIntakeContext(steerIdentity);
         if (memoryIntake) modelInput.push({ role: 'system', content: memoryIntake } as AgentInputItem);
-        const deliveredNotes = hostOwnerSteering ? takeUndeliveredSteerNotes(steerIdentity.sessionId, steerIdentity.sourceUserSeq) : [];
+        const deliveredNotes = hostOwnerSteering ? takeUndeliveredSteerNotes(steerIdentity.sessionId, steerIdentity.sourceUserSeq, true) : [];
         captureExplicitSteerInstructions(steerIdentity.sessionId, deliveredNotes);
         adoptedSteering = formatSteerBlock(adoptedSteerNotesForSource(steerIdentity));
         if (turnIsPlanMode()) {
@@ -10699,7 +10699,7 @@ const runHostTurnBody = async (
     // retain prior settlements and let the next request see the durable note.
     if (hostOwnerSteering && ranModelStep) {
       const identity = exactHostIdentity();
-      const arrived = takeUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
+      const arrived = takeUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq, true);
       if (arrived.length > 0) {
         captureExplicitSteerInstructions(identity.sessionId, arrived);
         answerDraft?.retract();

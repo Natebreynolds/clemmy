@@ -2630,7 +2630,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     true,
     createHash('sha256').update(JSON.stringify(['run_worker', ...new Set(repairShapes)].sort())).digest('hex').slice(0, 32),
   );
-  const runWorkerTool = tool({
+  const runWorkerTool = plainConversationSurface ? null : tool({
     name: 'run_worker',
     description: runWorkerToolDescription,
     parameters: WorkerToolCallSchema,
@@ -3613,9 +3613,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const allCoreTools = factorySkip
     ? []
     : await getCoreToolsAsync({ includeDynamicComposioTools: false });
-  const turnOwnedDiscoveryTools = new Map<string, Tool<RuntimeContextValue>>([
-    [runWorkerTool.name, runWorkerTool],
-  ]);
+  const turnOwnedDiscoveryTools = new Map<string, Tool<RuntimeContextValue>>(
+    runWorkerTool ? [[runWorkerTool.name, runWorkerTool]] : [],
+  );
   const byName = (n: string) =>
     (turnOwnedDiscoveryTools.get(n) ?? allCoreTools.find((t) => (t as { name?: string }).name === n)) as
       | Tool<RuntimeContextValue>
@@ -4224,9 +4224,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const structuralTools = factorySkip
     ? []
     : planMode
-      ? [buildPublishPlanTool(hostFreshPlanning), buildAskUserQuestionTool(), runWorkerTool]
+      ? [buildPublishPlanTool(hostFreshPlanning), buildAskUserQuestionTool(), runWorkerTool!]
     : reviewedReadOnlyExecution
-      ? [...reviewedComputeResults, buildAskUserQuestionTool(), runWorkerTool]
+      ? [...reviewedComputeResults, buildAskUserQuestionTool(), runWorkerTool!]
     : carrierWork
     // run_worker stays DIRECT on action turns: it is the fan-out coordination
     // primitive (control role), not a business operation — dropping it made
@@ -4253,15 +4253,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // toolsOnAdvertisedWire also exposes it when acquisition doors are
           // absent. Enablement and exact plan admission are unchanged.
           deferLoading: options.acceptedRoute !== 'act' || resumesChatTurn,
-        }), buildAskUserQuestionTool(), runWorkerTool]
-      : [buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool]
+        }), buildAskUserQuestionTool(), runWorkerTool!]
+      : [buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool!]
     : localMemoryScope
     ? [plannerTool!, buildAskUserQuestionTool()]
     : [
         plannerTool!,
         buildRequestApprovalTool(),
         buildAskUserQuestionTool(),
-        runWorkerTool,
+        runWorkerTool!,
       ];
   // Structural capabilities are constructed here because their exact tool
   // objects carry orchestration-specific pause/continuation behavior. The

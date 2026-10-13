@@ -17,7 +17,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { createSession, listEvents, claimRunAttemptLease, recordRunAttemptUserInput, openEventLog, appendEvent, finishRunAttempt } = await import('./eventlog.js');
+const { createSession, listEvents, beginRunAttempt, claimRunAttemptLease, recordRunAttemptUserInput, openEventLog, appendEvent, finishRunAttempt } = await import('./eventlog.js');
 const { activateDispatchLease, revokeDispatchLease } = await import('./dispatch-lease.js');
 const { armHostReadOnlyCallAuthority } = await import('./accepted-turn-call-authority.js');
 const { acceptedTurnCallAuthorityFor } = await import('./accepted-turn-call-authority.js');
@@ -28,6 +28,7 @@ const {
   takeUndeliveredSteerNotes,
   formatSteerBlock,
   steerBlockForToolBoundary,
+  hasUndeliveredSteerNotes,
   sessionSupportsSteering,
   closeTerminalSteering, reopenTerminalSteering, isSteerNoteAdmissionError, SteerNoteAdmissionError,
 } = await import('./steer-notes.js');
@@ -88,12 +89,12 @@ test('boundary composition: one call takes, formats, and marks — empty when qu
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 let cutoverSerial = 0;
-function acceptedCutoverOwner() {
+function acceptedCutoverOwner(nullableRun = false) {
   const session = createSession({ id: `sess-terminal-cutover-${++cutoverSerial}`, kind: 'chat' });
-  const claimed = claimRunAttemptLease({ sessionId: session.id, runId: `desktop:cutover-${cutoverSerial}`,
+  const claimed = nullableRun ? undefined : claimRunAttemptLease({ sessionId: session.id, runId: `desktop:cutover-${cutoverSerial}`,
     ownerId: 'fixture-owner', leaseMs: 60_000 });
-  assert.ok(claimed.attempt && claimed.claimed);
-  const attempt = claimed.attempt;
+  if (claimed) assert.ok(claimed.attempt && claimed.claimed);
+  const attempt = nullableRun ? beginRunAttempt(session.id) : claimed!.attempt!;
   const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Report the retained result.' } }, { armRunInFlight: true });
   const authority = armHostReadOnlyCallAuthority({ sessionId: session.id, sourceUserSeq: source.seq,
     surfaceVersion: 'configured_harness_tools_v1', catalogRevisionDigest: hash('catalog'), bindingRevisionDigest: hash('binding'),
@@ -105,6 +106,159 @@ function acceptedCutoverOwner() {
 function refused(work: () => unknown, code: string) {
   assert.throws(work, error => isSteerNoteAdmissionError(error) && error.code === code);
 }
+
+for (const [label, data] of [
+  ['missing', {}], ['null', { text: null }], ['number', { text: 13 }],
+  ['boolean', { text: true }], ['array', { text: ['private directive'] }],
+  ['object', { text: { privateDirective: 'not an instruction' } }],
+] as const) {
+  test(`steering indexed scan: malformed ${label} input holds without coercion or partial delivery`, () => {
+    const f = acceptedCutoverOwner();
+    const malformed = appendEvent({ sessionId: f.session.id, turn: 1, role: 'user', type: 'user_steer_note', data });
+    for (const check of [
+      () => hasUndeliveredSteerNotes(f.session.id, f.source.seq),
+      () => takeUndeliveredSteerNotes(f.session.id, f.source.seq, true),
+      () => closeTerminalSteering(f.owner, hash('objective'), hash('obsolete draft')),
+    ]) {
+      assert.throws(check, error => isSteerNoteAdmissionError(error) && error.code === 'STEER_NOTE_UNAVAILABLE'
+        && !error.message.includes('private directive') && !error.message.includes('privateDirective'));
+    }
+    assert.equal(listEvents(f.session.id, { types: ['user_steer_note_delivered'] }).length, 0);
+    assert.equal(listEvents(f.session.id, { types: ['guardrail_tripped'] })
+      .filter(row => row.data.kind === 'host_terminal_steering_cutover').length, 0);
+    assert.equal(listEvents(f.session.id, { types: ['user_steer_note'] })[0]?.seq, malformed.seq);
+    assert.equal(acceptedTurnCallAuthorityFor(f.session.id, f.source.seq).status, 'ok');
+  });
+}
+
+test('steering indexed scan: a valid sibling cannot be partially delivered beside malformed input', () => {
+  const f = acceptedCutoverOwner();
+  const valid = appendSteerNote(f.session.id, 'Keep the settled result.');
+  appendEvent({ sessionId: f.session.id, turn: 1, role: 'user', type: 'user_steer_note', data: { text: { unsupported: true } } });
+  assert.equal(hasUndeliveredSteerNotes(f.session.id, f.source.seq), true);
+  refused(() => takeUndeliveredSteerNotes(f.session.id, f.source.seq, true), 'STEER_NOTE_UNAVAILABLE');
+  refused(() => closeTerminalSteering(f.owner, hash('objective'), hash('old draft')), 'STEER_NOTE_UNAVAILABLE');
+  assert.equal(listEvents(f.session.id, { types: ['user_steer_note_delivered'] }).length, 0);
+  assert.ok(listEvents(f.session.id, { types: ['user_steer_note'] }).some(row => row.seq === valid.seq));
+});
+
+test('steering indexed scan: malformed past, delivered, foreign and newer-source rows do not change this source', () => {
+  const session = createSession({ id: `sess-scoped-steering-${++cutoverSerial}`, kind: 'chat' });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_steer_note', data: { text: 1 } });
+  const source = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Current source.' } });
+  const delivered = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_steer_note', data: {} });
+  appendEvent({ sessionId: session.id, turn: 2, role: 'system', type: 'user_steer_note_delivered', data: { noteSeqs: [delivered.seq], sourceUserSeq: source.seq } });
+  appendSteerNote(session.id, '   ');
+  appendEvent({ sessionId: session.id, turn: 3, role: 'user', type: 'user_input_received', data: { text: 'Newer source.' } });
+  appendEvent({ sessionId: session.id, turn: 3, role: 'user', type: 'user_steer_note', data: { text: [] } });
+  const foreign = createSession({ id: `${session.id}-foreign`, kind: 'chat' });
+  appendEvent({ sessionId: foreign.id, turn: 1, role: 'user', type: 'user_steer_note', data: { text: null } });
+  assert.equal(hasUndeliveredSteerNotes(session.id, source.seq), false);
+  assert.deepEqual(takeUndeliveredSteerNotes(session.id, source.seq, true), []);
+  assert.equal(listEvents(session.id, { types: ['user_steer_note_delivered'] }).length, 1);
+});
+
+test('steering indexed scan: an approval acknowledgement does not hide malformed parent-source input', () => {
+  const f = acceptedCutoverOwner();
+  const control = appendEvent({ sessionId: f.session.id, turn: 2, role: 'user', type: 'user_input_received',
+    parentEventId: f.source.id, data: { text: 'Approve the held card.', synthetic: true,
+      liveApprovalControl: { version: 1, mode: 'paused_card', approvalId: 'fixture-card',
+        ownerAttemptId: f.attempt.attemptId, ownerSourceUserSeq: f.source.seq } } });
+  appendEvent({ sessionId: f.session.id, turn: 2, role: 'user', type: 'user_steer_note', data: { text: null } });
+  refused(() => hasUndeliveredSteerNotes(f.session.id, f.source.seq), 'STEER_NOTE_UNAVAILABLE');
+  refused(() => takeUndeliveredSteerNotes(f.session.id, f.source.seq, true), 'STEER_NOTE_UNAVAILABLE');
+  assert.equal(acceptedTurnCallAuthorityFor(f.session.id, control.seq).status, 'missing');
+  assert.equal(listEvents(f.session.id, { types: ['user_steer_note_delivered'] }).length, 0);
+});
+
+test('steering strict reader: legacy result composition keeps its original coercion and error fallback', () => {
+  const number = createSession({ id: `sess-legacy-steering-${++cutoverSerial}`, kind: 'chat' });
+  appendEvent({ sessionId: number.id, turn: 1, role: 'user', type: 'user_steer_note', data: { text: 13 } });
+  assert.equal(takeUndeliveredSteerNotes(number.id)[0]?.text, '13', 'the default legacy reader keeps its historical coercion');
+  const unavailable = createSession({ id: `sess-legacy-unavailable-${++cutoverSerial}`, kind: 'chat' });
+  appendEvent({ sessionId: unavailable.id, turn: 1, role: 'user', type: 'user_steer_note', data: { text: { toString: null } } });
+  const settledResult = 'Controlled operation succeeded.';
+  assert.equal(settledResult + steerBlockForToolBoundary(unavailable.id), settledResult,
+    'a default legacy projection error cannot replace an already-settled result');
+  assert.equal(listEvents(unavailable.id, { types: ['user_steer_note_delivered'] }).length, 0);
+  for (const [session, seq] of [[undefined, 1], ['workflow:unsupported:main', 1], [number.id, undefined], [number.id, 0]] as const) {
+    refused(() => takeUndeliveredSteerNotes(session, seq, true), 'STEER_NOTE_UNAVAILABLE');
+  }
+});
+
+for (const shape of ['accessor', 'proxy'] as const) {
+  test(`steering strict reader: unsupported ${shape} text cannot run hooks or be delivered`, () => {
+    const f = acceptedCutoverOwner();
+    const data = { controlledSteeringShape: `${shape}-${cutoverSerial}` };
+    const serialized = JSON.stringify(data);
+    appendEvent({ sessionId: f.session.id, turn: 1, role: 'user', type: 'user_steer_note', data });
+    let hooks = 0;
+    const unsupported = shape === 'accessor'
+      ? Object.defineProperty({}, 'text', { enumerable: true, get() { hooks++; return 'not a trusted directive'; } })
+      : new Proxy({}, { get() { hooks++; throw new Error('must not run'); },
+        getOwnPropertyDescriptor() { hooks++; throw new Error('must not run'); } });
+    const originalParse = JSON.parse;
+    // Event storage is real; only the selected decoder result is adversarial.
+    // The reader must not treat unsupported in-memory shapes as owner words.
+    JSON.parse = ((text: string, reviver?: Parameters<typeof JSON.parse>[1]) => text === serialized
+      ? unsupported : originalParse(text, reviver)) as typeof JSON.parse;
+    try {
+      refused(() => hasUndeliveredSteerNotes(f.session.id, f.source.seq), 'STEER_NOTE_UNAVAILABLE');
+      refused(() => takeUndeliveredSteerNotes(f.session.id, f.source.seq, true), 'STEER_NOTE_UNAVAILABLE');
+    } finally { JSON.parse = originalParse; }
+    assert.equal(hooks, 0);
+    assert.equal(listEvents(f.session.id, { types: ['user_steer_note_delivered'] }).length, 0);
+  });
+}
+
+test('terminal steering: a supported null run ID closes, refuses late input, and reopens only its fresh physical generation', () => {
+  const f = acceptedCutoverOwner(true);
+  const actual = openEventLog().prepare('SELECT run_id FROM run_attempts WHERE attempt_id = ?')
+    .get(f.attempt.attemptId) as { run_id: string | null };
+  assert.equal(actual.run_id, null, 'the real caller omitted runId; none is invented');
+  assert.equal(closeTerminalSteering(f.owner, hash('objective'), hash('reply')).status, 'closed');
+  const closed = listEvents(f.session.id, { types: ['guardrail_tripped'] })
+    .find(row => row.data.kind === 'host_terminal_steering_cutover')!.data.marker as { runId: string | null };
+  assert.equal(closed.runId, null);
+  refused(() => appendSteerNote(f.session.id, 'Too late.', { expectedAttemptId: f.attempt.attemptId }), 'STEER_NOTE_CUTOVER');
+  refused(() => reopenTerminalSteering(f.owner), 'STEER_NOTE_CUTOVER');
+  revokeDispatchLease(f.owner.lease);
+  const lease = activateDispatchLease({ sessionId: f.session.id, scopeId: `${f.session.id}:null-recovery`, runAttemptId: f.attempt.attemptId });
+  const next = { ...f.owner, lease };
+  reopenTerminalSteering(next);
+  const note = appendSteerNote(f.session.id, 'Preserve the original objective.', { expectedAttemptId: f.attempt.attemptId });
+  const pending = closeTerminalSteering(next, hash('amended objective'), hash('new reply'));
+  assert.deepEqual(pending.status === 'pending' ? pending.notes.map(row => row.seq) : [], [note.seq]);
+  assert.equal(closeTerminalSteering(next, hash('amended objective'), hash('new reply')).status, 'closed');
+  const attempt = openEventLog().prepare('SELECT run_id, finished_at FROM run_attempts WHERE attempt_id = ?')
+    .get(f.attempt.attemptId) as { run_id: null; finished_at: null };
+  assert.deepEqual(attempt, { run_id: null, finished_at: null });
+  assert.equal(acceptedTurnCallAuthorityFor(f.session.id, f.source.seq).status, 'ok');
+});
+
+for (const originalNull of [true, false]) {
+  test(`terminal steering: changing durable run ID ${originalNull ? 'null to string' : 'string to null'} cannot hide its exact closed owner`, () => {
+    const f = acceptedCutoverOwner(originalNull);
+    closeTerminalSteering(f.owner, hash('objective'), hash('reply'));
+    const count = listEvents(f.session.id).length;
+    openEventLog().prepare('UPDATE run_attempts SET run_id = ? WHERE attempt_id = ?')
+      .run(originalNull ? 'different-owned-run' : null, f.attempt.attemptId);
+    refused(() => closeTerminalSteering(f.owner, hash('objective'), hash('reply')), 'STEER_NOTE_OWNER_CHANGED');
+    refused(() => appendSteerNote(f.session.id, 'Not owned by this marker.', { expectedAttemptId: f.attempt.attemptId }), 'STEER_NOTE_OWNER_CHANGED');
+    revokeDispatchLease(f.owner.lease);
+    const lease = activateDispatchLease({ sessionId: f.session.id, scopeId: `${f.session.id}:mismatched-run`, runAttemptId: f.attempt.attemptId });
+    refused(() => reopenTerminalSteering({ ...f.owner, lease }), 'STEER_NOTE_OWNER_CHANGED');
+    assert.equal(listEvents(f.session.id).length, count);
+  });
+}
+
+test('terminal steering: missing run ID marker is unknown rather than explicit null', () => {
+  const f = acceptedCutoverOwner(true);
+  closeTerminalSteering(f.owner, hash('objective'), hash('reply'));
+  openEventLog().prepare(`UPDATE sessions SET metadata_json = json_remove(metadata_json, '$.__host_terminal_steering_cutover.runId') WHERE id = ?`).run(f.session.id);
+  refused(() => appendSteerNote(f.session.id, 'No implicit null.', { expectedAttemptId: f.attempt.attemptId }), 'STEER_NOTE_UNAVAILABLE');
+  refused(() => closeTerminalSteering(f.owner, hash('objective'), hash('reply')), 'STEER_NOTE_UNAVAILABLE');
+});
 
 test('terminal steering: accepted-before-cutover is adopted, then new input is refused without retiring its owner', () => {
   const f = acceptedCutoverOwner();

@@ -62,7 +62,7 @@ interface TerminalSteeringMarker {
   nonce: string;
   sourceUserSeq: number;
   attemptId: string;
-  runId: string;
+  runId: string | null;
   scopeId: string;
   leaseId: string;
   objectiveDigest: string;
@@ -74,6 +74,7 @@ const CUTOVER_METADATA_KEY = '__host_terminal_steering_cutover';
 const CUTOVER_EVENT_KIND = 'host_terminal_steering_cutover';
 const safeId = (value: unknown): value is string => typeof value === 'string'
   && value.length > 0 && value.length <= 240 && /^[A-Za-z0-9:._/-]+$/.test(value);
+const safeRunId = (value: unknown): value is string | null => value === null || safeId(value);
 const digest = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 
 function inertRecord(value: unknown): Record<string, unknown> {
@@ -106,16 +107,16 @@ function snapshotTerminalOwner(value: TerminalSteeringOwner): TerminalSteeringOw
     lease: lease as unknown as DispatchLeaseRef };
 }
 
-function currentTerminalOwner(owner: TerminalSteeringOwner): { runId: string } {
+function currentTerminalOwner(owner: TerminalSteeringOwner): { runId: string | null } {
   const db = openEventLog();
   const row = db.prepare(`SELECT run_id, source_user_seq FROM run_attempts
     WHERE session_id = ? AND attempt_id = ? AND finished_at IS NULL AND status = 'active'`)
-    .get(owner.sessionId, owner.attemptId) as { run_id: string; source_user_seq: number | null } | undefined;
+    .get(owner.sessionId, owner.attemptId) as { run_id: string | null; source_user_seq: number | null } | undefined;
   const physical = db.prepare(`SELECT run_attempt_id, source_user_seq, accepted_task_id, logical_tool_call_id FROM run_dispatch_leases
     WHERE session_id = ? AND scope_id = ? AND lease_id = ?`).get(owner.sessionId, owner.lease.scopeId, owner.lease.leaseId) as {
       run_attempt_id: string | null; source_user_seq: number | null; accepted_task_id: string | null; logical_tool_call_id: string | null;
     } | undefined;
-  if (!row || !safeId(row.run_id) || !physical || physical.run_attempt_id !== owner.attemptId
+  if (!row || !safeRunId(row.run_id) || !physical || physical.run_attempt_id !== owner.attemptId
     || physical.source_user_seq !== null || physical.accepted_task_id !== null || physical.logical_tool_call_id !== null
     || !isDispatchLeaseCurrent(owner.lease)) throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
   // Approval/connection delivery owns a later input; execution still belongs
@@ -139,7 +140,7 @@ function parsedTerminalMarker(raw: unknown): TerminalSteeringMarker {
   const keys = ['version', 'state', 'nonce', 'sourceUserSeq', 'attemptId', 'runId', 'scopeId', 'leaseId', 'objectiveDigest', 'candidateDigest', 'previousNonce'];
   if (Object.keys(marker).some(key => !keys.includes(key)) || marker.version !== 1
     || !['closed', 'open'].includes(typeof marker.state === 'string' ? marker.state : '')
-    || !safeId(marker.nonce) || !safeId(marker.attemptId) || !safeId(marker.runId)
+    || !safeId(marker.nonce) || !safeId(marker.attemptId) || !safeRunId(marker.runId)
     || !safeId(marker.scopeId) || !safeId(marker.leaseId) || !Number.isSafeInteger(marker.sourceUserSeq)
     || Number(marker.sourceUserSeq) <= 0 || !digest(marker.objectiveDigest) || !digest(marker.candidateDigest)
     || (marker.state === 'open' ? !safeId(marker.previousNonce) : marker.previousNonce !== undefined)) {
@@ -225,11 +226,14 @@ export function closeTerminalSteering(input: TerminalSteeringOwner, objectiveDig
     return openEventLog().transaction(() => {
       const active = currentTerminalOwner(owner);
       const prior = readTerminalMarker(owner.sessionId);
+      if (prior?.attemptId === owner.attemptId && prior.runId !== active.runId) {
+        throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
+      }
       if (hasUndeliveredSteerNotes(owner.sessionId, owner.sourceUserSeq)) {
         if (prior?.attemptId === owner.attemptId && prior.runId === active.runId && prior.state === 'closed') {
           throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
         }
-        const notes = takeUndeliveredSteerNotes(owner.sessionId, owner.sourceUserSeq);
+        const notes = takeUndeliveredSteerNotes(owner.sessionId, owner.sourceUserSeq, true);
         if (!notes.length) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
         return { status: 'pending' as const, notes };
       }
@@ -308,8 +312,11 @@ export function appendSteerNote(
       if (marker || expectedAttemptId !== undefined) {
         const active = openEventLog().prepare(`SELECT attempt_id, run_id FROM run_attempts
           WHERE session_id = ? AND finished_at IS NULL AND status = 'active' LIMIT 2`)
-          .all(sessionId) as Array<{ attempt_id: string; run_id: string }>;
+          .all(sessionId) as Array<{ attempt_id: string; run_id: string | null }>;
         if (active.length !== 1 || (expectedAttemptId !== undefined && active[0]!.attempt_id !== expectedAttemptId)) {
+          throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
+        }
+        if (marker?.attemptId === active[0]!.attempt_id && marker.runId !== active[0]!.run_id) {
           throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
         }
         if (marker?.attemptId === active[0]!.attempt_id && marker.runId === active[0]!.run_id && marker.state === 'closed') {
@@ -409,16 +416,37 @@ export function objectiveWithAdoptedSteering(
   ].join('\n');
 }
 
+function requireSourceSteerText(data: unknown): string {
+  if (!data || typeof data !== 'object' || types.isProxy(data) || Array.isArray(data)) {
+    throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  }
+  const text = Object.getOwnPropertyDescriptor(data, 'text');
+  if (!text || !('value' in text) || typeof text.value !== 'string') {
+    throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+  }
+  return text.value;
+}
+
 /**
  * Read the notes not yet delivered to the model and durably mark them
  * delivered. Host turns project the complete adopted same-source notes after
  * result budgeting on every model request, including reopen. Consequently a
  * crash after this marker cannot permanently hide an accepted instruction.
  * Legacy tool boundaries retain their existing delivery marker contract.
+ * The source-owned host opts into strict text validation before fresh work;
+ * that negative-only mode does not change legacy post-settlement projections.
  */
-export function takeUndeliveredSteerNotes(sessionId: string | undefined, sourceUserSeq?: number): SteerNote[] {
-  if (!sessionSupportsSteering(sessionId)) return [];
-  if (sourceUserSeq !== undefined && (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0)) return [];
+export function takeUndeliveredSteerNotes(sessionId: string | undefined, sourceUserSeq?: number, strictSourceText = false): SteerNote[] {
+  const strict = strictSourceText === true;
+  if (!sessionSupportsSteering(sessionId)) {
+    if (strict) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+    return [];
+  }
+  if ((sourceUserSeq !== undefined && (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0))
+    || (strict && sourceUserSeq === undefined)) {
+    if (strict) throw new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
+    return [];
+  }
   try {
     const rows = listEvents(sessionId as string, {
       types: ['user_steer_note', 'user_steer_note_delivered', 'user_input_received'],
@@ -435,11 +463,10 @@ export function takeUndeliveredSteerNotes(sessionId: string | undefined, sourceU
     const pending = rows
       .filter((row) => row.type === 'user_steer_note' && !delivered.has(row.seq)
         && (sourceUserSeq === undefined || (row.seq > sourceUserSeq && row.seq < nextSourceSeq)))
-      .map((row) => ({
-        seq: row.seq,
-        text: String((row.data as { text?: unknown }).text ?? ''),
-        createdAt: row.createdAt,
-      }))
+      .map((row) => {
+        if (!strict) return { seq: row.seq, text: String((row.data as { text?: unknown }).text ?? ''), createdAt: row.createdAt };
+        return { seq: row.seq, text: requireSourceSteerText(row.data), createdAt: row.createdAt };
+      })
       .filter((note) => note.text.trim().length > 0);
     if (pending.length === 0) return [];
     appendEvent({
@@ -450,7 +477,8 @@ export function takeUndeliveredSteerNotes(sessionId: string | undefined, sourceU
       data: { noteSeqs: pending.map((note) => note.seq), ...(sourceUserSeq === undefined ? {} : { sourceUserSeq }) },
     });
     return pending;
-  } catch {
+  } catch (error) {
+    if (strict) throw isSteerNoteAdmissionError(error) ? error : new SteerNoteAdmissionError('STEER_NOTE_UNAVAILABLE');
     return []; // steering must never break a tool result
   }
 }
@@ -466,8 +494,11 @@ export function hasUndeliveredSteerNotes(sessionId: string, sourceUserSeq: numbe
     ?? Number.MAX_SAFE_INTEGER;
   const delivered = new Set(rows.flatMap(row => row.type === 'user_steer_note_delivered'
     && Array.isArray(row.data.noteSeqs) ? row.data.noteSeqs : []));
-  return rows.some(row => row.type === 'user_steer_note' && row.seq < next && !delivered.has(row.seq)
-    && typeof row.data.text === 'string' && row.data.text.trim().length > 0);
+  return rows.some(row => {
+    if (row.type !== 'user_steer_note' || row.seq >= next || delivered.has(row.seq)) return false;
+    const text = requireSourceSteerText(row.data);
+    return text.trim().length > 0;
+  });
 }
 
 /** The model-facing block appended to the next tool result. Verbatim user
