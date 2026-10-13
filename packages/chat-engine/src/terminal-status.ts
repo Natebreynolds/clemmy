@@ -139,7 +139,9 @@ export function terminalNoticeLine(terminal: TerminalFacts | undefined): Termina
     case 'run_failed':
       return line('This run stopped on an error', 'danger', 'try_again');
     case 'steering_unavailable':
-      return line('This turn couldn’t be picked back up safely — nothing further ran', 'warning', 'try_again');
+      // The record is the conversation's, so sending again meets the same
+      // block: no "Try again"; the line names the edge that does clear it.
+      return line('This conversation’s steering record couldn’t be read — the message didn’t start. Start a new conversation to continue', 'warning');
   }
 }
 

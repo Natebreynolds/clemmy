@@ -25,7 +25,7 @@ import { noticeReplacesReply, type TerminalNoticeCode } from './types.js';
 function namesANextEdge(text: string): boolean {
   const saysContinue = /say\s+[“"']?continue[”"']?/i.test(text);
   const asksSomething = /\?/.test(text);
-  const tellsYouHow = /tell me |let me know |reply with |pick |choose |approve |review |check before /i.test(text);
+  const tellsYouHow = /tell me |let me know |reply with |pick |choose |approve |review |check before |start a new conversation/i.test(text);
   return saysContinue || asksSomething || tellsYouHow;
 }
 

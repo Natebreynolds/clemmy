@@ -64,11 +64,14 @@ export const OWNER_STOP_TERMINAL_TEXT = 'Stopped. Nothing further runs for this 
 /** The same Stop when completed results exist to keep. */
 export const OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT = 'Stopped. Completed results are kept.';
 
-/** The host's machine reason when a turn cannot reopen its mid-turn message
- * handoff before starting work. The loop maps it to the notice below. */
+/** The host's machine reason when a turn cannot read or reopen the
+ * conversation's mid-turn message record before starting work. The loop maps
+ * it to the notice below. */
 export const STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON = 'owner_steering_cutover_reopen_unavailable';
 
-/** App-voice line for that stop. No first person: the handoff is a host fact
- * no model phrased, and the clients draw its notice as chrome. */
+/** App-voice line for that stop. No first person: the record is a host fact
+ * no model phrased, and the clients draw its notice as chrome. It is worded
+ * for a new message, since the block meets every message in the conversation,
+ * and names the edge that clears it rather than a retry that cannot. */
 export const STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT =
-  'This turn could not be picked back up safely. Nothing further was started.';
+  'This conversation’s steering record could not be read; the message did not start. Start a new conversation to continue.';

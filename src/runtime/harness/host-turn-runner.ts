@@ -9897,7 +9897,8 @@ const runHostTurnBody = async (
       reopenTerminalSteering(terminalCutoverOwner);
     } catch {
       // App voice, not Clem's: the loop attaches the steering notice by this
-      // reason and the clients draw it as chrome. Resumable: no work began.
+      // reason and the clients draw it as chrome, with the next edge on the
+      // notice. Resumable: no work began, so nothing is lost to a new start.
       return blockedOutcome(STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT, STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON);
     }
   }
