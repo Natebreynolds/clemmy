@@ -908,7 +908,12 @@ function settledNonSuccessProjectionDisposition(input: {
              WHERE crossing.session_id = settlement.session_id
                AND crossing.source_user_seq = settlement.source_user_seq
                AND crossing.logical_tool_call_id = settlement.logical_tool_call_id
-               AND crossing.state <> 'returned') AS nonreturned_crossing_count
+               AND crossing.state <> 'returned') AS nonreturned_crossing_count,
+           (SELECT COUNT(*) FROM physical_dispatches crossing
+             WHERE crossing.session_id = settlement.session_id
+               AND crossing.source_user_seq = settlement.source_user_seq
+               AND crossing.logical_tool_call_id = settlement.logical_tool_call_id
+               AND crossing.state NOT IN ('returned', 'threw')) AS unanswered_crossing_count
       FROM logical_tool_calls logical
       JOIN logical_call_settlements settlement
         ON settlement.session_id = logical.session_id
@@ -935,6 +940,8 @@ function settledNonSuccessProjectionDisposition(input: {
     recovery_action: string;
     requires_reconciliation: number;
     nonreturned_crossing_count: number;
+    /** Crossings still open, lost or timed out: neither returned nor threw. */
+    unanswered_crossing_count: number;
   }>;
   const settlement = rows.length === 1 ? rows[0]! : null;
   if (
@@ -951,9 +958,16 @@ function settledNonSuccessProjectionDisposition(input: {
   // (its settlement says so). The checkpoint projects it like any returned
   // failure the model saw; without this it projected nothing, and the turn
   // ended "I could not reopen the saved checkpoint" (live 2026-10-07).
+  // The answer is answered whether it came back as a result or as a throw:
+  // a native MCP `isError` reaches the host as ProviderAnsweredError and its
+  // crossing settles `threw`, and the settlement's detail is the authority
+  // that the provider spoke. Only a crossing still open, lost or timed out
+  // keeps the reconciliation stop (live 2026-10-12: an approved
+  // aibs__create_site the app refused ended "may have begun… must be
+  // reconciled" and the model never saw why).
   const answeredRefusal = settlement.outcome_kind === 'uncertain_write'
     && settlement.outcome_detail === 'provider_refused_envelope'
-    && settlement.nonreturned_crossing_count === 0;
+    && settlement.unanswered_crossing_count === 0;
   const mutatingSafeFailure = answeredRefusal || new Set([
     'invalid_arguments',
     'transient',

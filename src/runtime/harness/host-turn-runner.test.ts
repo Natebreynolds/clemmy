@@ -4783,6 +4783,38 @@ test('FunctionTool errors remain model-visible and post-invocation control error
   }
 });
 
+test('a refusal the provider answered by throwing reaches the model as the provider\'s words, and the turn goes on', async (t) => {
+  // Live 2026-10-12: a native MCP `isError` reached the host as
+  // ProviderAnsweredError; the thrown-call classifier called it "may have
+  // started", the model got a blank effect_unknown marker, and the turn ended
+  // "may have begun… must be reconciled". The owner never learned what the
+  // app had said. An answered refusal is answered whether it came back as a
+  // result or as a throw: the model reads the provider's words and answers.
+  const accepted = acceptHostCanarySource('thrown-answered-refusal',
+    'Create one reversible draft on the controlled provider account and report its receipt.');
+  const said = 'native MCP operation failed: a draft with this title already exists';
+  let entered = 0;
+  const writer = await transportWriteFixture(async () => { entered++; throw new outcomes.ProviderAnsweredError(said); }, async () => 'must not run');
+  t.after(() => writer.restore());
+  const answer = 'The app turned it down: a draft with this title already exists.';
+  const model = stubModel([[writer.call('thrown-answered-refusal')], [textMsg(answer)]]);
+  const agent = { model, tools: [writer.carrier] };
+  bindHostCanarySurface(accepted, agent, agent.tools);
+  const outcome = await runProductionHost(accepted, agent, undefined, { maxTurns: 2 });
+  assert.equal(entered, 1, 'the admitted provider body threw the provider\'s refusal');
+  assert.equal(model.calls(), 2, 'the model is asked again with the refusal in hand');
+  assert.equal(outcome.finalOutput, answer);
+  assert.notDeepEqual(outcome.terminal, { status: 'blocked', reason: 'tool_effect_uncertain' }, 'nothing is in the dark');
+  assert.deepEqual(dispositionMarkers(outcome.history), [], 'no effect_unknown marker for an answered refusal');
+  const paired = outcome.history.find((item) => (item as { type?: string }).type === 'function_call_result'
+    && (item as { callId?: string }).callId === 'thrown-answered-refusal') as { output?: { text?: string } } | undefined;
+  assert.ok(paired, 'the refused call is paired with a result');
+  const text = String(paired?.output?.text ?? '');
+  assert.match(text, /"provider_refused":true/);
+  assert.match(text, /already exists/, 'the provider\'s own words reach the model');
+  assert.match(text, /Change what it refused before trying again/);
+});
+
 test('a response-window limit retries a smaller piece without accepting or executing the truncated frame', async () => {
   const fixture = acceptHostCanarySource('response-window-recovery', 'Read the complete local result.');
   let calls = 0;

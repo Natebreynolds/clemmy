@@ -32,6 +32,7 @@ const protocolSession = await import('./conversation-protocol-session.js');
 const hostResults = await import('./host-model-result-receipt.js');
 const logicalResults = await import('./logical-model-result-projection-receipt.js');
 const connectionCheckpoints = await import('./source-connection-checkpoints.js');
+const attemptOutcome = await import('./attempt-outcome.js');
 const plans = await import('./plan-artifacts.js');
 const sessionStore = await import('./session.js');
 const agentEnvelopes = await import('../../agents/capability-envelope.js');
@@ -1858,6 +1859,46 @@ test('an external write the provider answered with its own refusal checkpoints r
   assert.equal(recovered.status, 'ready');
   assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM durable_result_handles WHERE session_id = ?').get(task.sessionId) as { n: number }).n, 0,
     'an answered refusal never gets a success handle');
+  assert.equal(bodies, 1, 'and is never run again');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('a refusal the provider answered by throwing is still answered: its crossing threw, and the checkpoint is ready, never a reconciliation stop', async () => {
+  // Live 2026-10-12: a native MCP `isError` reached the host as
+  // ProviderAnsweredError, the crossing settled `threw`, and the checkpoint
+  // trusted only `returned`, so an approved aibs__create_site the app refused
+  // ended the turn "may have begun… must be reconciled" and the owner never
+  // learned what the app had said.
+  const task = fixture('Create the exact hosted site once.', 'execute');
+  const callId = 'call:thrown-answered-refusal-write';
+  const toolName = 'aibs__create_site';
+  const args = { slug: 'fixture-brief', title: 'Fixture brief' };
+  const admitted = checkpoints.admitAcceptedModelBatch({
+    sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq,
+    preHistory: preHistory(task), frameHistory: openFrame({ callId, toolName, args }),
+    providerResponseId: 'response:thrown-answered-refusal-write',
+  });
+  assert.equal(admitted.status, 'admitted');
+  if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+  const said = 'native MCP operation failed: a site with this slug already exists';
+  let bodies = 0;
+  await assert.rejects(runCall({
+    task, callId, toolName, args, effect: 'external_write', boundary: 'host_owned_external',
+    invoke: async () => { bodies += 1; throw new attemptOutcome.ProviderAnsweredError(said); },
+  }));
+  assert.deepEqual(physicalRows(task, callId).map((row) => row.state), ['threw'], 'the carrier raised the refusal; the crossing says so');
+  const settlement = eventlog.openEventLog().prepare(`
+    SELECT outcome_kind, outcome_detail FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, callId);
+  assert.deepEqual(settlement, { outcome_kind: 'uncertain_write', outcome_detail: 'provider_refused_envelope' });
+  const resultItem = projectedTextResult({ callId, toolName, value: { ok: false, provider_refused: true, error: said } });
+  recordLogicalResult(admitted.admission, resultItem);
+  const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, { committedResultItems: [resultItem] });
+  assert.ok(finalized.status === 'committed' || finalized.status === 'existing', JSON.stringify(finalized));
+  assert.equal(finalized.checkpoint.disposition, 'ready', 'answered whether it came back as a result or as a throw');
+  const recovered = checkpoints.recoverAcceptedModelBatchForRestart({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq });
+  assert.equal(recovered.status, 'ready');
   assert.equal(bodies, 1, 'and is never run again');
   leases.revokeDispatchLease(task.parentLease);
 });

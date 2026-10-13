@@ -8046,7 +8046,7 @@ const runHostTurnBody = async (
   const failedCallCrossingDisposition = (
     call: CanonicalHostCall,
     attempt: Extract<HostCallExecutionAttempt<ExecutedHostCall>, { status: 'failed' }>,
-  ): 'zero_crossing' | 'effect_may_have_started' => {
+  ): 'zero_crossing' | 'effect_may_have_started' | 'answered_refusal' => {
     if (!attempt.invocationEntered) return 'zero_crossing';
     // The immutable settlement owns recovery after entry, including local
     // coordinators. Their effect class does not prove that children drained or
@@ -8070,6 +8070,16 @@ const runHostTurnBody = async (
         && settlement.physicalCrossingCount === 0
         && settlement.hostCrossingCount === 0
       ) return 'zero_crossing';
+      // A REFUSAL THE PROVIDER ANSWERED IS ANSWERED whether it came back as a
+      // result or as a throw. A native MCP `isError` reaches the host as
+      // ProviderAnsweredError and the settlement reads it as
+      // provider_refused_envelope, the same reading a returned `successful:
+      // false` envelope gets; nothing is in the dark, and the model reads the
+      // provider's words and answers. Live 2026-10-12: an approved
+      // aibs__create_site the app refused ended the turn "may have begun…
+      // must be reconciled" with a blank effect_unknown marker, and the
+      // owner never learned what the app had said.
+      if (providerAnsweredWithRefusal(settlement.outcome)) return 'answered_refusal';
       // A DECLARED-READ call with zero crossings that left the machine has no
       // external effect to reconcile: the settlement is host-authored at mint
       // (never the model, never a name heuristic), physicalCrossingCount
@@ -8162,6 +8172,23 @@ const runHostTurnBody = async (
               toolName: innerTool,
             }) }),
     });
+  };
+
+  /** The provider's own refusal, handed to the model as the call's result when
+   *  the carrier raised it instead of returning it: the same thing the model
+   *  reads when a `successful: false` envelope comes back. Bounded and
+   *  redacted; the steer says what the ledger already enforces (no replay of
+   *  this exact call; a changed call goes through the gate like any write). */
+  const answeredRefusalResult = (call: CanonicalHostCall, error: unknown): AgentInputItem => {
+    const raw = error instanceof Error ? error.message : String(error ?? '');
+    const said = redactSensitiveText(raw).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1_500);
+    return functionResultItem(
+      call.callId,
+      call.name,
+      JSON.stringify({ ok: false, provider_refused: true, error: said || 'The app refused this call without saying why.' }),
+      'The app answered this call with its own refusal and said why. Nothing is known to have landed; read the target if the answer depends on it. '
+        + 'Change what it refused before trying again; this exact call is not resent.',
+    );
   };
 
   const executeCallAttempts = async (
@@ -8351,6 +8378,9 @@ const runHostTurnBody = async (
           frameSize: calls.length,
           countsRefusal,
         });
+      }
+      if (crossing === 'answered_refusal' && attempt?.status === 'failed') {
+        return answeredRefusalResult(call, attempt.error);
       }
       return dispositionResult({
         call,
