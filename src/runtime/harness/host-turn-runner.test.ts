@@ -13937,6 +13937,9 @@ test('a write whose carrier raised without acknowledgement goes on under a write
   assert.match(resultText('dark-write'), /socket hang up/, 'the error is the call\'s result');
   assert.match(resultText('dark-write'), /send no other external write until you have read/);
   assert.match(resultText('dark-write-while-frozen'), /write_frozen_until_read/, 'an external write before a read is refused before dispatch');
+  assert.match(resultText('dark-read'), /ground truth for the earlier (TRANSPORT_CREATE_DRAFT|call_tool) call that ended without acknowledgement/,
+    'the read that lifts the freeze is named as the answer to the dark write, by the inner operation');
+  assert.match(resultText('dark-read'), /External writes are open again/);
   assert.deepEqual(dispositionMarkers(outcome.history).map((marker) => marker.disposition), ['refused_pre_dispatch'],
     'no effect_unknown marker: the frozen write is the only host disposition');
 });

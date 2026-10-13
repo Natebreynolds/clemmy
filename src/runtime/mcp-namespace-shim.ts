@@ -990,6 +990,35 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     return next;
   }
 
+  /** The connection died under a call: the SDK's CONNECTION_CLOSED, or a body
+   *  that found the transport gone. The old process is not coming back, so
+   *  there is nothing to pace: drop the connect record and let the very next
+   *  use reconnect at once. Live 2026-10-13: the read that a write freeze was
+   *  waiting for failed once with "Not connected" and "MCP authoritative tool
+   *  inventory is unavailable", because the death was first seen at the next
+   *  listing and then paced by the backoff ladder. */
+  function isTransportDeathError(error: unknown): boolean {
+    const code = (error as { code?: unknown } | null)?.code;
+    const message = error instanceof Error ? error.message : String(error ?? '');
+    return code === -32000 || /\bConnection closed\b|\bNot connected\b/i.test(message);
+  }
+
+  function noteTransportDeath(server: MCPServer): void {
+    connectPromises.delete(server);
+    const existing = serverHealth.get(server);
+    serverHealth.set(server, {
+      state: 'degraded',
+      lastError: new Error('transport closed during a call'),
+      failureCount: (existing?.failureCount ?? 0) + 1,
+      nextRetryAt: 0,
+      reconnectBackoffMs: BACKOFF_LADDER_MS[0],
+    });
+    lastToolCounts.set(server, 0);
+    cachedTools = null;
+    cachedToolToServer = null;
+    syncHealthRegistry(server);
+  }
+
   function markServerConnected(server: MCPServer): void {
     serverHealth.set(server, {
       state: 'connected',
@@ -2055,6 +2084,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
           }
         }
         const errMsg = err instanceof Error ? err.message : String(err);
+        if (providerBodyEntered && isTransportDeathError(err)) noteTransportDeath(server);
         let writeOutcomeError: unknown;
         // Resolve the write reservation BEFORE publishing logical pre-dispatch
         // settlement. If settlement storage fails, the exact parented

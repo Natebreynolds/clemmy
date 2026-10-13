@@ -7414,6 +7414,7 @@ const runHostTurnBody = async (
     let providerRejectedBeforeEffect = false;
     let providerRepliedUnverified = false;
     let providerUnacknowledged = false;
+    let freezeLiftedFrom: string | null = null;
     let committedVerificationHolds: CommittedMutationVerificationHold[] = [];
     if (canaryRefusal) {
       output = canaryRefusal;
@@ -7761,8 +7762,13 @@ const runHostTurnBody = async (
             && !providerAnsweredWithRefusal(invoked.settlement.outcome);
           providerUnacknowledged = providerLeftInTheDark(invoked.settlement.outcome)
             && uncertainEffectStopsTurn(effect);
-          if (providerUnacknowledged) darkWriteFreeze.tool = call.name;
-          else if (effect === 'read' && darkWriteFreeze.tool !== null) darkWriteFreeze.tool = null;
+          if (providerUnacknowledged) darkWriteFreeze.tool = edgeToolName(call.name, parsedArguments);
+          else if (effect === 'read' && darkWriteFreeze.tool !== null) {
+            // The read the freeze was waiting for: it is the ground truth for
+            // the write that ended without acknowledgement, and lifts the freeze.
+            freezeLiftedFrom = darkWriteFreeze.tool;
+            darkWriteFreeze.tool = null;
+          }
           if (
             preserveWorkCallCarrier
             && (effect === 'local_write' || effect === 'external_write' || effect === 'admin')
@@ -7935,7 +7941,15 @@ const runHostTurnBody = async (
         + 'It may have landed. Do not send this call again, and send no other external write until you have read the target and know what happened; reads are open. '
         + 'Then say exactly what you found. If you cannot read it, say that plainly and name what the owner can check.'
       : undefined;
-    const steer = [hostSteer, refusedWriteNote, repliedUnverifiedNote, darkWriteNote, boundedConstraintNote].filter(Boolean).join('\n') || undefined;
+    // The read that lifted the freeze answers the earlier write's fate. Live
+    // 2026-10-13: the model listed the notebook, saw the note it had tried to
+    // create, and still asked the owner to check; the read is the answer.
+    const freezeLiftedNote = !structuredToolOutputs(output) && freezeLiftedFrom
+      ? `This read is the ground truth for the earlier ${freezeLiftedFrom} call that ended without acknowledgement. Answer from it: `
+        + 'if the record it would have created or changed is there, that write landed (do not make it again); if it is not there, it did not land. '
+        + 'External writes are open again.'
+      : undefined;
+    const steer = [hostSteer, refusedWriteNote, repliedUnverifiedNote, darkWriteNote, freezeLiftedNote, boundedConstraintNote].filter(Boolean).join('\n') || undefined;
     return {
       historyItem: functionResultItem(call.callId, call.name, modelOutput, steer),
       ...(tool ? { tool } : {}),
@@ -8498,7 +8512,7 @@ const runHostTurnBody = async (
         return answeredRefusalResult(call, attempt.error);
       }
       if (crossing === 'dark_write' && attempt?.status === 'failed') {
-        darkWriteFreeze.tool = call.name;
+        darkWriteFreeze.tool = edgeToolName(call.name, parsedArgs(call.argumentsJson));
         return darkWriteResult(call, attempt.error);
       }
       return dispositionResult({

@@ -652,3 +652,23 @@ test('shim: a native MCP call credits its proven-path memo (closes the 0% MCP co
 after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
 });
+
+test('shim: a connection that dies under a call reconnects on the very next use, with no backoff and no stub', async () => {
+  // Live 2026-10-13: a fixture server exited mid-call (the client saw
+  // "MCP error -32000: Connection closed"). The next call, the read a write
+  // freeze was waiting for, failed with "Not connected" and "MCP
+  // authoritative tool inventory is unavailable": the death was first seen
+  // at that listing and then paced by the backoff ladder. The old process is
+  // gone; the very next use reconnects at once.
+  const died = Object.assign(new Error('MCP error -32000: Connection closed'), { code: -32000 });
+  const b = makeFakeServer({ name: 'dies-under-call', tools: [{ name: 'get_note' }], failCallTool: died });
+  const shim = createMcpNamespaceShim({ servers: [b], cacheToolsList: false });
+  await shim.listTools();
+  assert.equal(b._connected, 1);
+  await assert.rejects(callWithAcceptedTask(shim, 'dies-under-call__get_note', { id: 'n1' }), /Connection closed/);
+  assert.notEqual(listMcpServerHealth().find((s) => s.slug === 'dies-under-call')?.state, 'connected', 'the death is recorded at the call');
+  const tools = await shim.listTools();
+  assert.equal(b._connected, 2, 'the next use reconnects at once, inside no backoff window');
+  assert.ok(tools.some((t: any) => t.name === 'dies-under-call__get_note'), 'real tools, never the connecting stub');
+  assert.equal(listMcpServerHealth().find((s) => s.slug === 'dies-under-call')?.state, 'connected');
+});
