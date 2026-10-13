@@ -102,7 +102,10 @@ export async function executeCloudBrowserTool(name: CloudBrowserOperationName, r
 }
 
 function browserFailureClassification(error: BrowserbaseServiceError): LocalNonWriteClassification {
-  const kind = ['credential_rejected', 'credential_missing', 'credential_changed'].includes(error.code)
+  // A key the store cannot read back (credential_unavailable) or save
+  // (credential_save_failed) is the same class as a missing one: nothing to
+  // retry until the owner's credential store answers.
+  const kind = ['credential_rejected', 'credential_missing', 'credential_changed', 'credential_unavailable', 'credential_save_failed'].includes(error.code)
     ? 'auth_failure'
     : ['provider_limit', 'project_not_found', 'configuration_missing', 'human_controls_browser', 'control_return_pending'].includes(error.code)
       ? 'input_required'

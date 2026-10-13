@@ -11,7 +11,11 @@ export interface CloudBrowserResource {
 export function browserFocusPage(resource: Pick<CloudBrowserResource, 'pages' | 'focusTargetId'>): CloudBrowserResource['pages'][number] | undefined {
   return resource.pages.find((page) => page.targetId === resource.focusTargetId) ?? resource.pages[0];
 }
-export interface CloudBrowserStatus { configured: boolean; projectId?: string; idleSeconds?: number; sessionTimeoutSeconds?: number }
+export interface CloudBrowserStatus {
+  configured: boolean; projectId?: string; idleSeconds?: number; sessionTimeoutSeconds?: number;
+  /** Whether the saved API key can be read back from the computer's credential store. */
+  credentialConfigured?: boolean; credentialStatus?: 'available' | 'missing' | 'unavailable' | 'not_checked';
+}
 export interface CloudBrowserView { url: string; expiresAt: string; targetId?: string; viewerLeaseId: string; controlVersion: number }
 export interface CloudBrowserInputResponse { resource: CloudBrowserResource; result: { ok: boolean }; receipt: unknown }
 export type CloudBrowserCloseResponse = { closed: true; status: 'closed' } | { closed: false; status: 'releasing' | 'unknown' };

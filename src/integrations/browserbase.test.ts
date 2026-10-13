@@ -525,3 +525,15 @@ test('Windows flush rules: the resource store persists, so the cloud browser sta
     assert.equal(store.resources.length, 1);
   } finally { t.close(); }
 });
+
+test('a key the credential store cannot read back or save is explained in plain words, with the Windows folder-permission cause', async () => {
+  // Live 2026-10-13 (Windows tester): "connected Browserbase, Clem can't
+  // use it." A saved key the store refuses to read back answered only "could
+  // not do that (credential_unavailable)".
+  const { browserbaseErrorText } = await import('./browserbase.js');
+  assert.match(browserbaseErrorText('credential_unavailable'), /could not be read back from this computer's credential store/);
+  assert.match(browserbaseErrorText('credential_unavailable'), /On Windows .*private to your account/);
+  assert.match(browserbaseErrorText('credential_unavailable'), /no browser was started/);
+  assert.match(browserbaseErrorText('credential_save_failed'), /could not be saved in this computer's credential store/);
+  assert.doesNotMatch(browserbaseErrorText('credential_unavailable'), /\(credential_unavailable\)/, 'a code in parentheses is not an explanation');
+});

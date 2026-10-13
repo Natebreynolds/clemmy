@@ -48,6 +48,15 @@ const ERROR_TEXT: Record<string, string> = {
   project_not_found: "Browserbase couldn't find that project for this API key. Check the project ID in Clem's Browserbase connection.",
   provider_limit: 'Browserbase refused because of a plan or concurrency limit, so no browser was started. Check the Browserbase account, or close another browser, then try again.',
   credential_missing: "No Browserbase API key is saved. Add it in Clem's Browserbase connection.",
+  // The key was saved but cannot be read back: the computer's credential
+  // store refused or timed out (on Windows, Clementine's data folder must be
+  // private to the signed-in account). Nothing was started; retrying the
+  // browser changes nothing until the store answers.
+  credential_unavailable: "The saved Browserbase API key could not be read back from this computer's credential store, so no browser was started. "
+    + 'On Windows this usually means the Clementine data folder is not private to your account (check its NTFS permissions); '
+    + "open Clem's Browserbase connection to see the store's status, then save the key again.",
+  credential_save_failed: "The Browserbase API key could not be saved in this computer's credential store, so the connection was not made. "
+    + 'On Windows, check that the Clementine data folder is private to your account, then save the key again.',
   configuration_missing: "Browserbase isn't set up. Add the project and API key in Clem's Browserbase connection.",
   provider_refused: 'Browserbase refused the request, so nothing was started.',
 };
