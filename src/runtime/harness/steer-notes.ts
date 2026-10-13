@@ -22,7 +22,7 @@ import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
  */
 import { randomUUID } from 'node:crypto';
 import { types } from 'node:util';
-import { appendEvent, listEvents, openEventLog } from './eventlog.js';
+import { appendEvent, listActiveRunAttemptOwnership, listEvents, openEventLog } from './eventlog.js';
 import { isDispatchLeaseCurrent, type DispatchLeaseRef } from './dispatch-lease.js';
 import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
 import { readApprovalExecutionSource } from './approval-execution-source.js';
@@ -127,9 +127,11 @@ function currentTerminalOwner(owner: TerminalSteeringOwner): { runId: string | n
         ?? readConnectionExecutionDelivery(db, { sessionId: owner.sessionId, deliverySourceUserSeq: row.source_user_seq }, true)
           ?.activation.executionSourceUserSeq;
   const authority = acceptedTurnCallAuthorityFor(owner.sessionId, owner.sourceUserSeq);
-  const activeCount = db.prepare(`SELECT COUNT(*) AS count FROM run_attempts WHERE session_id = ? AND finished_at IS NULL AND status = 'active'`)
-    .get(owner.sessionId) as { count: number };
-  if (activeCount.count !== 1 || executionSource !== owner.sourceUserSeq || authority.status !== 'ok' || authority.authority.state !== 'open') {
+  // A source handed to a durable workflow keeps its attempt beside the next
+  // foreground request. Only another foreground attempt is a rival owner.
+  const rival = listActiveRunAttemptOwnership(owner.sessionId)
+    .some(active => active.attemptId !== owner.attemptId && !active.workflowHandoff);
+  if (rival || executionSource !== owner.sourceUserSeq || authority.status !== 'ok' || authority.authority.state !== 'open') {
     throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
   }
   return { runId: row.run_id };
@@ -310,19 +312,23 @@ export function appendSteerNote(
       const marker = readTerminalMarker(sessionId);
       const expectedAttemptId = options.expectedAttemptId;
       if (marker || expectedAttemptId !== undefined) {
-        const active = openEventLog().prepare(`SELECT attempt_id, run_id FROM run_attempts
-          WHERE session_id = ? AND finished_at IS NULL AND status = 'active' LIMIT 2`)
-          .all(sessionId) as Array<{ attempt_id: string; run_id: string | null }>;
-        if (active.length !== 1 || (expectedAttemptId !== undefined && active[0]!.attempt_id !== expectedAttemptId)) {
+        // The note goes to the one attempt that owns the foreground. An
+        // attempt a durable workflow handoff keeps alive beside it is not a
+        // rival; a second foreground attempt is, and refuses the note.
+        const active = listActiveRunAttemptOwnership(sessionId);
+        const foreground = active.filter(row => !row.workflowHandoff);
+        const ownerAttempt = expectedAttemptId !== undefined ? active.find(row => row.attemptId === expectedAttemptId)
+          : foreground.length === 1 ? foreground[0] : active.length === 1 ? active[0] : undefined;
+        if (!ownerAttempt || active.some(row => row.attemptId !== ownerAttempt.attemptId && !row.workflowHandoff)) {
           throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
         }
-        if (marker?.attemptId === active[0]!.attempt_id && marker.runId !== active[0]!.run_id) {
+        if (marker?.attemptId === ownerAttempt.attemptId && marker.runId !== ownerAttempt.runId) {
           throw new SteerNoteAdmissionError('STEER_NOTE_OWNER_CHANGED');
         }
-        if (marker?.attemptId === active[0]!.attempt_id && marker.runId === active[0]!.run_id && marker.state === 'closed') {
+        if (marker?.attemptId === ownerAttempt.attemptId && marker.runId === ownerAttempt.runId && marker.state === 'closed') {
           throw new SteerNoteAdmissionError('STEER_NOTE_CUTOVER');
         }
-        if (marker?.attemptId === active[0]!.attempt_id && marker.runId === active[0]!.run_id && marker.state === 'open') {
+        if (marker?.attemptId === ownerAttempt.attemptId && marker.runId === ownerAttempt.runId && marker.state === 'open') {
           const current = currentTerminalOwner({ sessionId, sourceUserSeq: marker.sourceUserSeq, attemptId: marker.attemptId,
             lease: { sessionId, scopeId: marker.scopeId, leaseId: marker.leaseId, runAttemptId: marker.attemptId } });
           if (current.runId !== marker.runId || hasPublishedTerminal(sessionId, marker.attemptId, marker.sourceUserSeq)) {

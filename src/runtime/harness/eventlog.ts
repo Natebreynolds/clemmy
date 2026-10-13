@@ -5121,6 +5121,34 @@ function supersedeForegroundAttempts(db: Database.Database, sessionId: string, n
   }
 }
 
+export interface ActiveRunAttemptOwnership {
+  attemptId: string;
+  runId: string | null;
+  sourceUserSeq: number | null;
+  /** This attempt's source was handed to a durable workflow. The retirement
+   * fence keeps it beside the next foreground request, so it is a preserved
+   * owner of its own handoff, never a rival for the chat's foreground. */
+  workflowHandoff: boolean;
+}
+
+/** Every unfinished attempt of a session, newest first, carrying the same
+ * workflow-handoff predicate the retirement fence applies. Foreground
+ * ownership checks read this instead of a bare count of active rows. */
+export function listActiveRunAttemptOwnership(sessionId: string): ActiveRunAttemptOwnership[] {
+  const db = openEventLog();
+  const rows = db.prepare(`SELECT attempt_id, run_id, source_user_seq FROM run_attempts
+    WHERE session_id = ? AND finished_at IS NULL AND status = 'active'
+    ORDER BY started_at DESC, rowid DESC`).all(sessionId) as Array<{
+      attempt_id: string; run_id: string | null; source_user_seq: number | null;
+    }>;
+  return rows.map((row) => ({
+    attemptId: row.attempt_id,
+    runId: row.run_id,
+    sourceUserSeq: row.source_user_seq,
+    workflowHandoff: hasWorkflowHandoff(db, sessionId, row.source_user_seq),
+  }));
+}
+
 /** Register the foreground attempt without retiring transferred workflow owners. */
 export function beginRunAttempt(
   sessionId: string,
