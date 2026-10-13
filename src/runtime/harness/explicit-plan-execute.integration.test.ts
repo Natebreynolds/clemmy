@@ -627,7 +627,9 @@ for (const [wholeText, repair, review] of [[false, false, false], [true, false, 
       assert.equal(inputs.version, 2);
       if (wholeText) {
         assert.ok(inputs.supplementalReads.some((row: any) => row.callId === 'supplement-runtime-synthesis' && row.digest.length === 64), 'the optional read survives reopen with the synthesis');
-        assert.ok(!inputs.supplementalReads.some((row: any) => row.callId === 'missing-supplement-runtime-synthesis'), 'a failed read is not represented as evidence of its missing content');
+        // A read of a path with nothing at it completes with the absence as its
+        // content: an observation the synthesis rested on, retained like any other.
+        assert.ok(inputs.supplementalReads.some((row: any) => row.callId === 'missing-supplement-runtime-synthesis' && row.digest.length === 64), 'a read that found nothing is retained as the observation it was');
         const corrupted = structuredClone(inputs);
         corrupted.supplementalReads[0].digest = '0'.repeat(64);
         const updateInputs = eventlog.openEventLog().prepare('UPDATE reviewed_plan_step_results_v1 SET inputs_json=? WHERE session_id=? AND source_user_seq=?');

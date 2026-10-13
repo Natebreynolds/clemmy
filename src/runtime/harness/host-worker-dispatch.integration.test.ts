@@ -59,6 +59,10 @@ for (const variant of ['boundary', 'full', 'partial', 'uniform', 'recover'] as c
   const args = JSON.parse(CAPTURED_ARGUMENTS);
   const noncePath = path.join(TEST_HOME, `worker-nonces-${variant}.json`);
   writeFileSync(noncePath, JSON.stringify({ items: Object.fromEntries(args.items.map((item: string) => [item, `fixture-${item}`])) }));
+  // The failed-read variants need a read that is still refused before it
+  // starts: credential material. A path with nothing at it completes with
+  // the absence as its content and is a finished read.
+  const refusedPath = path.join(TEST_HOME, '.env');
   // The boundary pin retains the byte-identical captured frame. The real child
   // variants substitute only the isolated filesystem fixture's absolute path.
   const oldPath = '/private/tmp/clem-p2-audit.Suyi4z/home/probe/worker-sources.json';
@@ -126,7 +130,7 @@ for (const variant of ['boundary', 'full', 'partial', 'uniform', 'recover'] as c
             : `ITEM=${packet.item} NONCE=fixture-${packet.item}`;
           return { responseId: `child-${packet.item}-${childSteps}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
             output: childSteps === 1
-              ? [{ type: 'function_call', callId: `child-read-${packet.item}`, name: 'read_file', arguments: JSON.stringify({ path: failed ? `${noncePath}.missing` : noncePath, max_chars: null }) }]
+              ? [{ type: 'function_call', callId: `child-read-${packet.item}`, name: 'read_file', arguments: JSON.stringify({ path: failed ? refusedPath : noncePath, max_chars: null }) }]
               : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }],
           };
         }, getStreamedResponse: modelStream,
