@@ -730,6 +730,20 @@ export function publicPresentationText(presentation: PresentationEvent): string 
   return parseRetainedWorkCheckpoint(presentation.text).head;
 }
 
+/** The durable terminal as the MODEL's history carries it: the authored
+ * words plus the host's retained-work checkpoint, with its redeemable rh_
+ * handles and landed writes. A successor that continues a stopped turn reads
+ * this, so it knows what already happened; every public transport still
+ * projects the head alone. Never publish this text. */
+export function durableCompletionTextForModel(data: Record<string, unknown>): string {
+  try {
+    const typedPresentation = presentationEventFromCompletionData(data);
+    return typedPresentation ? typedPresentation.text : publicReplyText(data.reply, '');
+  } catch {
+    return '';
+  }
+}
+
 const PUBLIC_REVIEW_STATES: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected', 'needs_recheck']);
 const PUBLIC_REVIEW_NOTE_MAX_CHARS = 400;
 

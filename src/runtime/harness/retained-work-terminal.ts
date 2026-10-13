@@ -30,8 +30,38 @@ export interface RetainedWorkItem {
   completeness?: 'complete' | 'partial' | 'unknown';
 }
 
+/**
+ * One effect that settled under an accepted source: a mutating logical call
+ * the ledger closed as succeeded (with the receipt its tool returned), or a
+ * file the runtime saw land. A fact, never a result to reopen or re-run.
+ */
+export type LandedWrite =
+  | {
+      kind: 'settled_write';
+      acceptedTaskId: string;
+      logicalToolCallId: string;
+      toolName: string;
+      argumentDigest: string;
+      settlementEventId: string;
+      settlementSeq: number;
+      outcomeKind: 'succeeded' | 'empty_result';
+      physicalCrossingCount: number;
+      resultHandleId: string | null;
+      /** The tool's own returned receipt, bounded; null when none was retained. */
+      receipt: string | null;
+    }
+  | {
+      kind: 'saved_file';
+      eventId: string;
+      seq: number;
+      name: string;
+      dir: string;
+      bytes: number;
+    };
+
 export interface RetainedWorkInventory {
   items: RetainedWorkItem[];
+  landedWrites: LandedWrite[];
   downstreamWriteState: RetainedExternalWriteState;
   downstreamWriteTools: string[];
 }
@@ -52,6 +82,122 @@ interface SettlementInventoryRow {
 
 function boundedIdentity(value: string, max = 120): string {
   return value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+const LANDED_RECEIPT_MAX_CHARS = 200;
+const LANDED_WRITES_MAX = 8;
+
+/** The receipt a write's tool returned, as bounded text: a string payload as
+ * written, anything else as its JSON. Data from the ledger, never a sentence. */
+function boundedReceipt(payload: unknown): string | null {
+  if (payload === undefined || payload === null) return null;
+  const text = boundedIdentity(typeof payload === 'string' ? payload : JSON.stringify(payload), Number.MAX_SAFE_INTEGER);
+  if (!text) return null;
+  const codepoints = [...text];
+  return codepoints.length > LANDED_RECEIPT_MAX_CHARS ? `${codepoints.slice(0, LANDED_RECEIPT_MAX_CHARS).join('')}…` : text;
+}
+
+/**
+ * The effects that settled under one accepted source, read from the ledger
+ * alone: every mutating business call the settlement store closed as a
+ * success with nothing left to reconcile, in settlement order, plus every
+ * file the runtime recorded landing for that source. Tool names come from the
+ * rows. `beforeSeq` bounds both to events before a terminal.
+ */
+export function landedWritesForAcceptedSource(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  beforeSeq?: number;
+}): LandedWrite[] {
+  if (!input.sessionId.trim() || !Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) return [];
+  try {
+    const db = openEventLog();
+    const bound = Number.isSafeInteger(input.beforeSeq) ? Number(input.beforeSeq) : Number.MAX_SAFE_INTEGER;
+    const settled = db.prepare(`
+      SELECT l.accepted_task_id, l.logical_tool_call_id, l.tool_name, l.argument_digest,
+             s.outcome_kind, s.physical_crossing_count, s.result_handle_id, s.settlement_event_id,
+             e.seq AS settlement_seq
+        FROM logical_call_settlements s
+        JOIN logical_tool_calls l
+          ON l.session_id = s.session_id
+         AND l.source_user_seq = s.source_user_seq
+         AND l.logical_tool_call_id = s.logical_tool_call_id
+        JOIN events e ON e.id = s.settlement_event_id
+       WHERE s.session_id = ? AND s.source_user_seq = ?
+         AND s.business_call = 1 AND s.mutating = 1 AND s.requires_reconciliation = 0
+         AND s.outcome_kind IN ('succeeded', 'empty_result')
+         AND e.seq < ?
+       ORDER BY e.seq ASC, l.logical_tool_call_id ASC
+       LIMIT ?
+    `).all(input.sessionId, input.sourceUserSeq, bound, LANDED_WRITES_MAX) as Array<{
+      accepted_task_id: string; logical_tool_call_id: string; tool_name: string; argument_digest: string;
+      outcome_kind: 'succeeded' | 'empty_result'; physical_crossing_count: number;
+      result_handle_id: string | null; settlement_event_id: string; settlement_seq: number;
+    }>;
+    const writes: LandedWrite[] = settled.map((row) => {
+      let receipt: string | null = null;
+      if (row.result_handle_id) {
+        const redeemed = redeemSuccessfulSettlementResultForHost({
+          sessionId: input.sessionId,
+          sourceUserSeq: input.sourceUserSeq,
+          acceptedTaskId: row.accepted_task_id,
+          logicalToolCallId: row.logical_tool_call_id,
+        });
+        if (redeemed.status === 'ok' && redeemed.value.resultHandleId === row.result_handle_id) {
+          receipt = boundedReceipt(redeemed.value.rawPayload);
+        }
+      }
+      return {
+        kind: 'settled_write',
+        acceptedTaskId: row.accepted_task_id,
+        logicalToolCallId: boundedIdentity(row.logical_tool_call_id, 120),
+        toolName: boundedIdentity(row.tool_name, 96),
+        argumentDigest: row.argument_digest,
+        settlementEventId: row.settlement_event_id,
+        settlementSeq: row.settlement_seq,
+        outcomeKind: row.outcome_kind,
+        physicalCrossingCount: row.physical_crossing_count,
+        resultHandleId: row.result_handle_id,
+        receipt,
+      };
+    });
+    const saved = db.prepare(`
+      SELECT id, seq, data_json FROM events
+       WHERE session_id = ? AND type = 'deliverable_saved'
+         AND json_extract(data_json, '$.sourceUserSeq') = ? AND seq < ?
+       ORDER BY seq ASC
+       LIMIT ?
+    `).all(input.sessionId, input.sourceUserSeq, bound, LANDED_WRITES_MAX) as Array<{ id: string; seq: number; data_json: string }>;
+    for (const row of saved) {
+      try {
+        const data = JSON.parse(row.data_json) as Record<string, unknown>;
+        if (typeof data.name !== 'string' || !data.name.trim() || typeof data.dir !== 'string') continue;
+        const bytes = Number.isSafeInteger(data.bytes) && Number(data.bytes) >= 0 ? Number(data.bytes) : 0;
+        writes.push({
+          kind: 'saved_file',
+          eventId: row.id,
+          seq: row.seq,
+          name: boundedIdentity(data.name, 160),
+          dir: boundedIdentity(data.dir, 160),
+          bytes,
+        });
+      } catch { /* an unreadable visibility row is not a landed fact */ }
+    }
+    return writes;
+  } catch {
+    return [];
+  }
+}
+
+/** One landed effect as a line of data: the tool and its own receipt, or the
+ * file and its size, and the event sequence it settled at. */
+export function landedWriteLine(write: LandedWrite): string {
+  if (write.kind === 'saved_file') {
+    return `landed: file ${JSON.stringify(write.dir ? `${write.dir}/${write.name}` : write.name)} ${write.bytes} bytes at seq ${write.seq}`;
+  }
+  const detail = write.receipt === null ? `${write.outcomeKind}, no receipt text retained` : JSON.stringify(write.receipt);
+  const crossing = write.physicalCrossingCount > 0 ? ' (left this machine)' : '';
+  return `landed: ${write.toolName} ${detail} at seq ${write.settlementSeq}${crossing}`;
 }
 
 function externalWriteState(rows: readonly SettlementInventoryRow[]): {
@@ -135,10 +281,12 @@ export function retainedWorkInventoryForAcceptedSource(input: {
           : {}),
       });
     }
-    if (items.length === 0) return null;
+    const landedWrites = landedWritesForAcceptedSource(input);
+    if (items.length === 0 && landedWrites.length === 0) return null;
     const write = externalWriteState(rows);
     return {
       items,
+      landedWrites,
       downstreamWriteState: write.state,
       downstreamWriteTools: write.tools,
     };
@@ -194,12 +342,16 @@ export function renderFailureWithRetainedWork(input: {
 
   const displayed = inventory.items.slice(0, 5);
   const omitted = inventory.items.length - displayed.length;
+  // Landed effects ride beside the retained results as bullets of data. The
+  // public projection counts none of them as a result; a later turn reads
+  // them as settled and continues after them.
   return [
     fallbackText.trim(),
     '',
     RETAINED_WORK_TERMINAL_HEADER,
     ...displayed.map(retainedItemLine),
     ...(omitted > 0 ? [`- ${omitted} additional retained result${omitted === 1 ? '' : 's'}.`] : []),
+    ...inventory.landedWrites.map((write) => `- ${landedWriteLine(write)}.`),
     downstreamWriteLine(inventory),
   ].join('\n');
 }

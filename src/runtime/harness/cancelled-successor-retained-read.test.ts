@@ -12,6 +12,8 @@ process.env.CLEMENTINE_HOME = HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 process.env.EMBEDDINGS_DISABLED = 'true';
+process.env.CLEMMY_UNIFIED_RECALL = 'off';
+process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'off';
 mkdirSync(path.join(HOME, 'state'), { recursive: true });
 writeFileSync(path.join(HOME, 'state', 'machine-id'), 'cancelled-read-share\n');
 
@@ -130,7 +132,10 @@ test('an exact explicit Continue privately reuses settled read bytes once, throu
   const prefix = eventlog.listEvents(child.sessionId, { types: ['cross_session_prefix'] })[0]!;
   assert.equal((prefix.data.cancelledReadShares as unknown[]).length, 1);
   assert.ok(JSON.stringify(prefix.data).includes(handleId), 'private journal preserves the exact share');
-  assert.doesNotMatch(String(prefix.data.text), /rh_|FIRST/, 'public historical prefix excludes the payload and private handle');
+  // The prefix is the model's history: it keeps the stopped turn's durable
+  // checkpoint (so the handle it names can be recalled) and never the bytes.
+  assert.doesNotMatch(String(prefix.data.text), /FIRST/, 'the model-facing prefix never carries the payload');
+  assert.ok(String(prefix.data.text).includes(`retained as ${handleId}`), 'the model-facing prefix carries the durable checkpoint');
   assert.doesNotMatch(JSON.stringify(reconstructHarnessTranscript(fixture.parent.id)), /rh_|FIRST/);
   assert.doesNotMatch(JSON.stringify(reconstructHarnessTranscript(child.sessionId)), /rh_|FIRST/);
   const publicEvents = eventlog.listEvents(child.sessionId).map(projectHarnessEventForPublic).filter(Boolean);
@@ -375,7 +380,11 @@ test('missing selector ownership, corrupted source/checkpoint/share or changed r
 test('successful writes and unknown-effect calls are never shared as reads; uncertain effects suppress the automatic handoff', () => {
   const write = accept(); const writeResult = settle(write, { tool: 'write_file', mutating: true }); stop(write);
   const writeChild = continueFixture(write);
-  assert.equal(readContext(writeChild), '');
+  // A settled write is a landed fact for the successor, never a read share.
+  const writeContext = readContext(writeChild);
+  assert.doesNotMatch(writeContext, /EXACT RETAINED READS|READ write_file/);
+  assert.match(writeContext, /\[LANDED EFFECTS OF THE STOPPED SOURCE\]/);
+  assert.match(writeContext, /landed: write_file "FIRST REMAINING" at seq \d+; logical call logical:write_file-\d+/);
   assert.equal(reader.resolveRetainedOutputRead(writeChild.sessionId, writeResult.handleId, writeChild.request).receipt, undefined);
   const unknown = accept(); settle(unknown, { tool: 'unknown_transport' }); stop(unknown);
   assert.equal(readContext(continueFixture(unknown)), '');
@@ -576,4 +585,192 @@ test('a successor reader credits only the authorized bare producer and actual ra
   assert.equal(wrongPrincipal.sourceResultHandleId, undefined);
   assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) n FROM physical_dispatches WHERE session_id=?')
     .get(fixture.parent.id) as { n: number }).n, 1, 'original provider read was never repeated');
+});
+
+/** A write that settled on this machine, plus the file the runtime saw land. */
+function settleLandedWrite(fixture: ReturnType<typeof accept>, label = 'notes') {
+  const receipt = `Appended named-controlled-${label}.md (12 chars).`;
+  const settled = settle(fixture, { tool: 'write_file', mutating: true, payload: receipt, label });
+  const saved = eventlog.appendEvent({ sessionId: fixture.parent.id, turn: 0, role: 'system', type: 'deliverable_saved',
+    data: { sourceUserSeq: fixture.source.seq, name: `named-controlled-${label}.md`, dir: 'fixtures', bytes: 12 } });
+  return { ...settled, receipt, saved };
+}
+
+test('a settled local write rides into the successor as a landed fact the brain and the reviewer both see, never as a read', () => {
+  const fixture = accept(), { handleId } = settle(fixture);
+  const write = settleLandedWrite(fixture);
+  stop(fixture);
+  // The durable Stop lists the landed effects beside the retained results;
+  // the owner's projection stays the authored head.
+  const terminal = eventlog.listEvents(fixture.parent.id, { types: ['conversation_completed'] })[0]!;
+  const durable = (terminal.data.presentation as { text: string }).text;
+  assert.ok(durable.includes(`- landed: write_file ${JSON.stringify(write.receipt)} at seq `), durable);
+  assert.match(durable, /- landed: file "fixtures\/named-controlled-notes\.md" 12 bytes at seq \d+\./);
+  assert.doesNotMatch(JSON.stringify(projectHarnessEventForPublic(terminal)!.data), /landed:|rh_|write_file/);
+  const child = continueFixture(fixture, 'Continue the stopped fixture objective. [named controlled fixture]');
+  const prefix = eventlog.listEvents(child.sessionId, { types: ['cross_session_prefix'] })[0]!;
+  const landed = prefix.data.cancelledLandedWrites as Array<{ parentSessionId: string; sourceUserSeq: number; fact: Record<string, unknown> }>;
+  assert.equal(landed.length, 2);
+  assert.deepEqual(landed.map(row => row.fact.kind), ['settled_write', 'saved_file']);
+  assert.equal(landed[0]!.parentSessionId, fixture.parent.id);
+  assert.equal(landed[0]!.sourceUserSeq, fixture.source.seq);
+  assert.equal(landed[0]!.fact.toolName, 'write_file');
+  assert.equal(landed[0]!.fact.receipt, write.receipt);
+  assert.equal(landed[0]!.fact.resultHandleId, write.handleId);
+  assert.equal((prefix.data.cancelledReadShares as unknown[]).length, 1, 'the read is still shared as a read');
+  assert.ok(String(prefix.data.text).includes('- landed: write_file'), 'the model-facing prefix carries the checkpoint with its landed writes');
+  // The brain's private context: the read as data, the write as a fact.
+  const context = readContext(child);
+  assert.match(context, /FIRST\\nREMAINING\\n/);
+  assert.match(context, /\[LANDED EFFECTS OF THE STOPPED SOURCE\]/);
+  assert.ok(context.includes(`landed: write_file ${JSON.stringify(write.receipt)} at seq `), context);
+  assert.ok(context.includes(`; logical call ${write.logicalToolCallId}`), context);
+  assert.match(context, /landed: file "fixtures\/named-controlled-notes\.md" 12 bytes at seq \d+/);
+  assert.match(context, /never repeat one to make sure/);
+  assert.doesNotMatch(context, /READ write_file/, 'a write is never offered as a retained read');
+  assert.equal(reader.resolveRetainedOutputRead(child.sessionId, write.handleId, child.request).receipt, undefined,
+    'the landed fact grants no reader authority over the write receipt');
+  assert.equal(reader.resolveRetainedOutputRead(child.sessionId, handleId, child.request).receipt?.output, JSON.stringify('FIRST\nREMAINING\n'));
+  // The reviewer sees the same facts, so a reply that reports the write as
+  // already done is a true claim about the stopped run.
+  const evidence = shares.cancelledSuccessorReadReviewEvidence({ sessionId: child.sessionId, sourceUserSeq: child.source.seq })!;
+  assert.ok(evidence);
+  assert.match(evidence.summary, /Origin-qualified historical READ evidence/);
+  assert.match(evidence.summary, /a fact about the earlier stopped run/);
+  assert.match(evidence.summary, /landed: write_file/);
+  assert.match(evidence.summary, /landed: file "fixtures\/named-controlled-notes\.md"/);
+  assert.equal(evidence.bindings.length, 3, 'one read share and two landed facts bind the attestation');
+  assert.deepEqual(evidence.evidence.refs(), [`inherited-read:${handleId}`], 'landed facts open nothing');
+  assert.equal(evidence.coverage.length, 1);
+  assert.equal(shares.cancelledSuccessorReadReviewRequired({ sessionId: child.sessionId, sourceUserSeq: child.source.seq }), true);
+  const attestation = { kind: 'cancelled_successor_read_shares', semanticCompleteness: 'as_recorded', consumer: evidence.consumer, bindings: evidence.bindings };
+  assert.equal(shares.cancelledSuccessorReadReviewIsAuthentic({ sessionId: child.sessionId, sourceUserSeq: child.source.seq }, attestation), true);
+  eventlog.closeEventLog();
+  assert.equal(readContext(child), context, 'the landed facts survive process storage reopen');
+  assert.equal(evidence.stillCurrent(), true);
+  // A journaled fact the ledger no longer states disappears rather than drifts.
+  const db = eventlog.openEventLog();
+  db.prepare("UPDATE events SET data_json=json_set(data_json,'$.cancelledLandedWrites[0].fact.receipt','Appended something else.') WHERE session_id=? AND type='cross_session_prefix'").run(child.sessionId);
+  const narrowed = readContext(child);
+  assert.doesNotMatch(narrowed, /landed: write_file/);
+  assert.match(narrowed, /landed: file "fixtures\/named-controlled-notes\.md"/);
+  assert.equal(evidence.stillCurrent(), false, 'the reviewer snapshot covers the landed facts');
+  assert.equal(shares.cancelledSuccessorReadReviewIsAuthentic({ sessionId: child.sessionId, sourceUserSeq: child.source.seq }, attestation), false);
+  assert.doesNotMatch(JSON.stringify(eventlog.listEvents(child.sessionId).map(projectHarnessEventForPublic).filter(Boolean)), /landed:|cancelledLandedWrites|rh_/);
+});
+
+test('a stopped source whose only settled work is a landed write still hands the successor that fact', () => {
+  const fixture = accept();
+  const write = settleLandedWrite(fixture, 'only');
+  stop(fixture);
+  const terminal = eventlog.listEvents(fixture.parent.id, { types: ['conversation_completed'] })[0]!;
+  assert.match((terminal.data.presentation as { text: string }).text, /Retained work \(durable checkpoint\):/);
+  assert.deepEqual(projectHarnessEventForPublic(terminal)!.data.retained, { results: 1, outsideChange: 'none' },
+    'the write receipt stays the one redeemable result; landed lines add nothing to the count');
+  const child = continueFixture(fixture);
+  const prefix = eventlog.listEvents(child.sessionId, { types: ['cross_session_prefix'] })[0]!;
+  assert.equal(prefix.data.cancelledReadShares, undefined);
+  assert.equal((prefix.data.cancelledLandedWrites as unknown[]).length, 2);
+  const context = readContext(child);
+  assert.doesNotMatch(context, /EXACT RETAINED READS/);
+  assert.ok(context.includes(`landed: write_file ${JSON.stringify(write.receipt)} at seq `), context);
+  const evidence = shares.cancelledSuccessorReadReviewEvidence({ sessionId: child.sessionId, sourceUserSeq: child.source.seq });
+  assert.ok(evidence, 'the reviewer is bound to the landed facts even with no read to inherit');
+  assert.equal(evidence!.bindings.length, 2);
+  assert.deepEqual(evidence!.evidence.refs(), []);
+  assert.equal(evidence!.coverage.length, 0);
+  assert.equal(shares.cancelledSuccessorReadReviewRequired({ sessionId: child.sessionId, sourceUserSeq: child.source.seq }), true);
+  // Wrong principal and a deliberate new task inherit no fact either.
+  const db = eventlog.openEventLog();
+  db.prepare('UPDATE sessions SET user_id=? WHERE id=?').run('other-owner', child.sessionId);
+  assert.equal(readContext(child), '');
+  db.prepare('UPDATE sessions SET user_id=? WHERE id=?').run(fixture.continuity.audienceId, child.sessionId);
+  const fresh = accept(); settleLandedWrite(fresh, 'fresh'); stop(fresh);
+  assert.equal(readContext(continueFixture(fresh, 'Start a new task. Ignore the previous request. Continue with something else.')), '');
+});
+
+test('the first model request of a Continue after Stop carries the landed write as settled, and its completion review sees the same fact', async t => {
+  const host = await import('./host-turn-runner.js');
+  const brackets = await import('./brackets.js');
+  const envelopes = await import('../../agents/capability-envelope.js');
+  const { runTurn } = await import('./loop.js');
+  const fixture = accept();
+  const write = settleLandedWrite(fixture, 'wire');
+  stop(fixture);
+  const text = 'Continue the stopped fixture objective. [named controlled fixture]';
+  const child = continueFixture(fixture, text, false);
+  // Loop level: the brain's first request after the Stop carries the stopped
+  // exchange with its durable checkpoint, so the landed write is in its history
+  // before any authority is armed.
+  const requests: unknown[] = [];
+  const model = {
+    async getResponse(request: unknown): Promise<never> { requests.push(request); throw new Error('fixture captured first successor request'); },
+    async *getStreamedResponse(request: unknown): AsyncGenerator<never> { await this.getResponse(request); },
+  };
+  const agent = { model, tools: [], instructions: 'Controlled fixture brain.' };
+  const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId: child.sessionId, universeTools: [], activeToolNames: [],
+    policyHash: 'controlled-landed-write-policy', budget: { maxUncachedTokens: 30_000, maxModelCalls: 1, maxToolCalls: 1, maxElapsedMs: 10_000 } });
+  assert.equal(sealed.ok, true, JSON.stringify(sealed)); if (!sealed.ok) throw new Error('fixture surface not sealed');
+  envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+  envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  await runTurn({ sessionId: child.sessionId, input: text, sourceUserSeq: child.source.seq, reuseRecordedUserInput: true,
+    runAttemptId: child.attempt.attemptId, turnEngine: 'host_v1', agent: agent as never, judgeCompletion: false,
+    suppressMemoryCapture: true, suppressAutomaticMemoryForRequest: true, makeRunner: () => new EventEmitter() as never, maxTurns: 1 });
+  assert.equal(requests.length, 1, 'reach the actual first model boundary');
+  const wire = JSON.stringify(requests[0]);
+  const receipt = JSON.stringify(JSON.stringify(write.receipt)).slice(1, -1);
+  assert.ok(wire.includes(`- landed: write_file ${receipt} at seq`), 'the brain sees the write as a settled fact');
+  assert.ok(wire.includes('Retained work (durable checkpoint):'), 'the stopped exchange keeps its durable checkpoint in the model history');
+  assert.ok(wire.includes('Stopped at the person\'s request before this finished'));
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) n FROM physical_dispatches WHERE session_id=?').get(child.sessionId) as { n: number }).n, 0);
+
+  // Host level: a fresh successor's completion review is bound to the fact.
+  const reviewed = accept();
+  const reviewedWrite = settleLandedWrite(reviewed, 'review');
+  stop(reviewed);
+  const successor = continueFixture(reviewed, 'Continue', false);
+  const answer = 'The append already landed before the stop; nothing further was written.';
+  let reviews = 0, modelCalls = 0;
+  host._setHostObjectiveJudgeForTests(async (objective, reply, context) => {
+    reviews += 1;
+    assert.equal(reply, answer);
+    assert.equal(objective, 'Continue');
+    assert.match(context?.toolCallSummary ?? '', /a fact about the earlier stopped run/);
+    assert.ok((context?.toolCallSummary ?? '').includes(`landed: write_file ${JSON.stringify(reviewedWrite.receipt)}`));
+    assert.match(context?.toolCallSummary ?? '', /Read the named local fixture and explain its contents\. Do not write or send\./);
+    assert.deepEqual(context?.inheritedReadCoverage, [], 'a landed fact is not read coverage');
+    return { done: true, reason: 'The reply reports the settled write truthfully and repeats nothing.' };
+  });
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const judged = { tools: [], model: { async getResponse() {
+    modelCalls += 1;
+    return { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1, inputTokensDetails: [], outputTokensDetails: [] },
+      output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: answer }] }],
+      responseId: `controlled-landed-write-${modelCalls}` };
+  }, async *getStreamedResponse(this: { getResponse: () => Promise<{ output: unknown[]; usage: Record<string, unknown>; responseId: string }> }) {
+    const response = await this.getResponse();
+    yield { type: 'response_started' };
+    yield { type: 'model', event: { type: 'finish', finishReason: 'stop' } };
+    yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } };
+  } } };
+  const sealedJudged = envelopes.sealAgentCapabilityUniverse({ sessionId: successor.sessionId, universeTools: [], activeToolNames: [],
+    policyHash: 'controlled-landed-write-review-policy', budget: { maxUncachedTokens: 1_000, maxModelCalls: 8, maxToolCalls: 8, maxElapsedMs: 60_000 } });
+  assert.equal(sealedJudged.ok, true, JSON.stringify(sealedJudged)); if (!sealedJudged.ok) throw new Error('fixture surface not sealed');
+  envelopes.bindAgentCapabilityEnvelope(judged, sealedJudged.envelope);
+  envelopes.bindAgentCapabilityRevision(judged, sealedJudged.revision);
+  const runner = new EventEmitter();
+  Object.assign(runner, { run: () => { throw new Error('Runner.run must not be called'); } });
+  const result = await brackets.withHarnessRunContext({ sessionId: successor.sessionId, sourceUserSeq: successor.source.seq,
+    runAttemptId: successor.attempt.attemptId, interactiveForeground: true, counter: new brackets.ToolCallsCounter(8) },
+    () => host.hostRunRunner(runner as never, judged as never, [{ type: 'message', role: 'user', content: 'Continue' }] as never,
+      { maxTurns: 4, hostTurnEngine: 'host_v1', hostJudgeCompletion: true,
+        context: { sessionId: successor.sessionId, sourceUserSeq: successor.source.seq } } as never));
+  assert.equal(result.finalOutput, answer);
+  assert.equal(reviews, 1, 'a landed fact never waives completion review');
+  const review = eventlog.listEvents(successor.sessionId, { types: ['goal_alignment_judged'] }).find(event => event.data.kind === 'completion')!;
+  assert.equal(review.data.inheritedReadReviewRequired, true);
+  assert.equal((review.data.judgedInheritedReadResults as { bindings: unknown[] }).bindings.length, 2);
+  assert.equal(host.completionVerdictForAcceptedSource({ sessionId: successor.sessionId, sourceUserSeq: successor.source.seq })?.fulfills, true);
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) n FROM physical_dispatches WHERE session_id=?').get(reviewed.parent.id) as { n: number }).n, 1,
+    'the original write was never repeated');
 });

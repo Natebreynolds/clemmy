@@ -12,11 +12,16 @@ import {
   type SessionStatus,
 } from './eventlog.js';
 import { previewPersistedSessionConversationProtocolInTransaction } from './conversation-protocol-session.js';
-import { publicCompletionText, publicUserInputText, validTypedCompletionPresentation } from './public-presentation.js';
+import { durableCompletionTextForModel, publicUserInputText, validTypedCompletionPresentation } from './public-presentation.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import { sessionAgentState } from '../../agents/session-agent-state.js';
 import { sessionProjectState } from '../../projects/session-project-state.js';
-import { prepareCancelledSuccessorReadShares, type CancelledSuccessorReadShare } from './cancelled-successor-retained-read.js';
+import {
+  prepareCancelledSuccessorLandedWrites,
+  prepareCancelledSuccessorReadShares,
+  type CancelledSuccessorLandedWrite,
+  type CancelledSuccessorReadShare,
+} from './cancelled-successor-retained-read.js';
 import { measureProjectionRead, type ProjectionReadObserver } from '../../dashboard/projection-read-metrics.js';
 
 const BRANCH_META = '__accepted_source_branch';
@@ -242,6 +247,7 @@ function seedSuccessorConversation(
   const blocks: string[] = [];
   const sources: Array<Record<string, unknown>> = [];
   const cancelledReadShares: CancelledSuccessorReadShare[] = [];
+  const cancelledLandedWrites: CancelledSuccessorLandedWrite[] = [];
   const seen = new Set<number>();
   let remaining = SUCCESSOR_CONTEXT_MAX_CHARS - header.length - 100;
   for (const row of rows) {
@@ -254,7 +260,11 @@ function seedSuccessorConversation(
         if (!presentation || presentation.identity.sourceUserSeq !== row.source_seq) continue;
       }
       const request = publicUserInputText(sourceData);
-      const reply = publicCompletionText(terminalData, '');
+      // This prefix is the MODEL's history, never a public transport: it keeps
+      // the durable terminal whole, with the host's retained-work checkpoint
+      // (redeemable rh_ handles and landed writes), so a successor knows what
+      // the stopped turn already did instead of doing it again.
+      const reply = durableCompletionTextForModel(terminalData);
       if (!request || !reply) continue;
       seen.add(row.source_seq);
       // Do not teach a fresh model to print an old tool frame as an action.
@@ -280,9 +290,9 @@ function seedSuccessorConversation(
         truncated: clipped,
       });
       if (row.session_id === parent.id && cancelledTerminal(terminalData)) {
-        cancelledReadShares.push(...prepareCancelledSuccessorReadShares(db, {
-          parentSessionId: parent.id, childSessionId: child.id, terminalEventId: row.id,
-        }));
+        const handoff = { parentSessionId: parent.id, childSessionId: child.id, terminalEventId: row.id };
+        cancelledReadShares.push(...prepareCancelledSuccessorReadShares(db, handoff));
+        cancelledLandedWrites.push(...prepareCancelledSuccessorLandedWrites(db, handoff));
       }
       remaining -= block.length + 2;
     } catch { /* An unreadable optional exchange cannot prevent a fresh source. */ }
@@ -301,6 +311,7 @@ function seedSuccessorConversation(
       continuityDigest: continuityDigest(continuity),
       sources: sources.reverse(),
       ...(cancelledReadShares.length ? { cancelledReadShares } : {}),
+      ...(cancelledLandedWrites.length ? { cancelledLandedWrites } : {}),
       totalChars: text.length,
       text,
     },
