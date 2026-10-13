@@ -4678,7 +4678,9 @@ const CONTINUATION_INPUT =
 
 /** The model-visible item of a stall retry. The retry's own instruction rides
  * beside it as transient system context for that one request, so it is never
- * recorded or learned as something the owner said. */
+ * recorded or learned as something the owner said. The turn still classifies,
+ * ranks and budgets against the owner's request it retries, exactly as the
+ * synthetic retry sentences it replaced did (isSyntheticStallRetryInput). */
 const STALL_RETRY_CONTINUATION_INPUT = 'Continue with the next step of your plan.';
 
 /** Exact authority projected from a trusted producer's durable graph event. */
@@ -5532,7 +5534,8 @@ export const TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS = positiveIntEnv('CLEMMY_TURN_
 // used by the Claude SDK brain lane (claude-agent-brain.ts) so BOTH brains get it.
 
 function isSyntheticStallRetryInput(text: string): boolean {
-  return text.startsWith('Your previous response was prose, not an action.')
+  return text === STALL_RETRY_CONTINUATION_INPUT
+    || text.startsWith('Your previous response was prose, not an action.')
     || text.startsWith('Your previous response did not make progress on the directive.')
     || text.startsWith('Your previous response could not be parsed into the required structured decision');
 }
