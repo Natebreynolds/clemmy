@@ -137,6 +137,7 @@ import {
 } from './attempt-settlement.js';
 import { StaleDispatchLeaseError } from './dispatch-lease.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
+import { readPendingUnacknowledgedWritesForSource } from './pending-unacknowledged-writes.js';
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
 import {
   canonicalGatewayCarrier,
@@ -5436,6 +5437,19 @@ const runHostTurnBody = async (
         return blockedOutcome(guarded, 'local_work_incomplete');
       }
     }
+    // Reporting is still useful when the original crossing never answered.
+    // Keep the guarded, model-authored report instead of buying a narrator or
+    // an outer "done" repair. The durable effect stays unknown and is never
+    // counted as successful work or learning from a completed task.
+    const writeFreeze = hostProduction ? currentWriteFreeze() : null;
+    if (writeFreeze?.frozen) {
+      if (boundary && !boundary.commit()) return undefined;
+      emit('agent_end', runContext, agent, guarded);
+      retainConnectionProgress();
+      return { history, lastResponseId, finalOutput: guarded,
+        terminal: { status: 'blocked', reason: writeFreeze.tools.length > 0
+          ? 'unacknowledged_write_unverified' : 'write_inventory_unavailable' } };
+    }
     if (boundary && !boundary.commit()) return undefined;
     emit('agent_end', runContext, agent, guarded);
     retainConnectionProgress();
@@ -6261,15 +6275,41 @@ const runHostTurnBody = async (
   // the proven read won at only two of them, so a read the classifier called
   // a write still serialized as a barrier and armed consent as 'unknown'.
   let currentFrameEffects = new Map<string, RuntimeToolEffect>();
-  // A write that ended without acknowledgement may have landed. Until a read
-  // returns, every further external write in this turn waits (refused before
-  // dispatch, with the reason); the frozen call itself is never resent (the
-  // ledger holds that). The model is told to read first and then speak.
-  const darkWriteFreeze: { tool: string | null } = { tool: null };
-  const frozenWriteDiagnostic = (): string =>
-    `write_frozen_until_read: an earlier external write in this turn (${darkWriteFreeze.tool}) ended without acknowledgement and may have landed. `
-    + 'Read the target first; every external write waits until a read returns. The frozen write itself is never resent; '
-    + 'after the read, a changed write goes through the gate like any write.';
+  // Retained source-local uncertainty, not the spelling of the last tool.
+  // A read is evidence the model can reason from; it is not a certificate for
+  // an unrelated write, another account, an omitted page or a lost reply.
+  // This fallback also holds if recording the crossing itself was interrupted.
+  const observedDarkWrites = new Map<string, string>();
+  const observedDarkWriteKey = (identity: { sessionId: string; sourceUserSeq: number }, callId: string) =>
+    JSON.stringify([identity.sessionId, identity.sourceUserSeq, callId]);
+  const noteUnacknowledgedWrite = (identity: { sessionId: string; sourceUserSeq: number }, callId: string, toolName: string) => {
+    const recorded = readPendingUnacknowledgedWritesForSource(identity);
+    // A recorded call is already reconstructed from the immutable ledger.
+    // Keep volatile state only when that exact recording cannot be reopened;
+    // otherwise it would outlive a later typed settlement of the same call.
+    if (recorded.status === 'ok' && [...recorded.pending, ...recorded.resolved].some(write => write.logicalToolCallId === callId)) return;
+    observedDarkWrites.set(observedDarkWriteKey(identity, callId), toolName);
+  };
+  function currentWriteFreeze(identity: { sessionId: string; sourceUserSeq: number } = exactHostIdentity()): { frozen: boolean; tools: string[] } {
+    const durable = readPendingUnacknowledgedWritesForSource(identity);
+    if (durable.status === 'ok') {
+      for (const write of durable.resolved) observedDarkWrites.delete(observedDarkWriteKey(identity, write.logicalToolCallId));
+    }
+    const local = [...observedDarkWrites].filter(([key]) => {
+      const [sessionId, sourceUserSeq] = JSON.parse(key) as [string, number, string];
+      return sessionId === identity.sessionId && sourceUserSeq === identity.sourceUserSeq;
+    }).map(([, toolName]) => toolName);
+    const tools = [...new Set([...local, ...(durable.status === 'ok' ? durable.pending.map(write => write.toolName) : [])])];
+    return { frozen: durable.status !== 'ok' || tools.length > 0, tools };
+  }
+  const frozenWriteDiagnostic = (freeze = currentWriteFreeze()): string =>
+    freeze.tools.length > 0
+      ? `write_frozen_until_verified: an earlier external write in this source (${freeze.tools.join(', ')}) has no independently verified outcome. `
+        + 'Read the exact target on the original account and explain what the evidence establishes. Reads remain open. '
+        + 'A failed, unrelated or incomplete read does not unlock writes or establish absence. The original call is never resent; '
+        + 'other external writes wait for an exact verified reconciliation, not merely another tool result.'
+      : 'write_inventory_unavailable: the stored outcomes for this source could not be verified. This does not establish that an earlier write occurred. '
+        + 'Reads remain open. Explain the unavailable evidence and keep external changes on hold until the stored source outcomes can be verified.';
   // One JIT read-provisioning attempt per carried operation per turn.
   const jitReadProvisionAttempted = new Set<string>();
   const exactProductionHostCall = (
@@ -7414,7 +7454,6 @@ const runHostTurnBody = async (
     let providerRejectedBeforeEffect = false;
     let providerRepliedUnverified = false;
     let providerUnacknowledged = false;
-    let freezeLiftedFrom: string | null = null;
     let committedVerificationHolds: CommittedMutationVerificationHold[] = [];
     if (canaryRefusal) {
       output = canaryRefusal;
@@ -7628,15 +7667,29 @@ const runHostTurnBody = async (
             deadlineMs,
             callerSignal: signal,
             isKillRequested: () => isKillRequested(exactSource.sessionId, killTarget),
+            ...(uncertainEffectStopsTurn(effect) ? {
+              // One fresh check at the actual crossing edge, including
+              // nested carriers and their provider-owned physical rows.
+              // Earlier batch consent never clears a newly uncertain sibling.
+              beforePhysicalCrossing: () => {
+                const freeze = currentWriteFreeze(exactSource);
+                return freeze.frozen
+                  ? new InvalidArgumentsPreDispatchResult(frozenWriteDiagnostic(freeze))
+                  : undefined;
+              },
+            } : {}),
             ...(boundary !== 'nested_owned' ? {
               beforePhysicalPreparation: async () => {
                 // The write freeze's backstop for a write that reached
                 // physical preparation without passing the consent gate.
-                const prepared = boundary === 'host_owned_external'
-                  ? (darkWriteFreeze.tool !== null && uncertainEffectStopsTurn(effect)
-                    ? new InvalidArgumentsPreDispatchResult(frozenWriteDiagnostic())
-                    : await exactProduction?.prepareBeforePhysical?.())
-                  : undefined;
+                let prepared;
+                if (boundary === 'host_owned_external') {
+                  const before = uncertainEffectStopsTurn(effect) ? currentWriteFreeze(exactSource) : null;
+                  if (before?.frozen) return new InvalidArgumentsPreDispatchResult(frozenWriteDiagnostic(before));
+                  prepared = await exactProduction?.prepareBeforePhysical?.();
+                  // Provisioning can await; beforePhysicalCrossing reopens
+                  // the inventory afterward at the actual reservation edge.
+                }
                 if (hasUndeliveredSteerNotes(exactSource.sessionId, exactSource.sourceUserSeq)) {
                   // The invocation kernel owns the zero-crossing settlement;
                   // this is a changed objective, not a failed provider write.
@@ -7762,13 +7815,7 @@ const runHostTurnBody = async (
             && !providerAnsweredWithRefusal(invoked.settlement.outcome);
           providerUnacknowledged = providerLeftInTheDark(invoked.settlement.outcome)
             && uncertainEffectStopsTurn(effect);
-          if (providerUnacknowledged) darkWriteFreeze.tool = edgeToolName(call.name, parsedArguments);
-          else if (effect === 'read' && darkWriteFreeze.tool !== null) {
-            // The read the freeze was waiting for: it is the ground truth for
-            // the write that ended without acknowledgement, and lifts the freeze.
-            freezeLiftedFrom = darkWriteFreeze.tool;
-            darkWriteFreeze.tool = null;
-          }
+          if (providerUnacknowledged) noteUnacknowledgedWrite(exactSource, call.callId, edgeToolName(call.name, parsedArguments));
           if (
             preserveWorkCallCarrier
             && (effect === 'local_write' || effect === 'external_write' || effect === 'admin')
@@ -7938,18 +7985,11 @@ const runHostTurnBody = async (
     // finds; the harness never says it for her.
     const darkWriteNote = !structuredToolOutputs(output) && providerUnacknowledged
       ? 'This call ended without any acknowledgement that the change took (a timeout, a dropped connection or a process that ended early); what came back is above. '
-        + 'It may have landed. Do not send this call again, and send no other external write until you have read the target and know what happened; reads are open. '
-        + 'Then say exactly what you found. If you cannot read it, say that plainly and name what the owner can check.'
+        + 'It may have landed. Do not send this call again. Read the exact target on the original account; reads are open, while external writes remain frozen until exact reconciliation is verified. '
+        + 'Say exactly what the read establishes and what remains unknown. An omitted record in a partial listing is not proof of absence, and a pre-existing record does not prove this call created it. '
+        + 'If you cannot verify the outcome, explain the concrete missing evidence and next way to check it; do not ask the owner to resend the original call.'
       : undefined;
-    // The read that lifted the freeze answers the earlier write's fate. Live
-    // 2026-10-13: the model listed the notebook, saw the note it had tried to
-    // create, and still asked the owner to check; the read is the answer.
-    const freezeLiftedNote = !structuredToolOutputs(output) && freezeLiftedFrom
-      ? `This read is the ground truth for the earlier ${freezeLiftedFrom} call that ended without acknowledgement. Answer from it: `
-        + 'if the record it would have created or changed is there, that write landed (do not make it again); if it is not there, it did not land. '
-        + 'External writes are open again.'
-      : undefined;
-    const steer = [hostSteer, refusedWriteNote, repliedUnverifiedNote, darkWriteNote, freezeLiftedNote, boundedConstraintNote].filter(Boolean).join('\n') || undefined;
+    const steer = [hostSteer, refusedWriteNote, repliedUnverifiedNote, darkWriteNote, boundedConstraintNote].filter(Boolean).join('\n') || undefined;
     return {
       historyItem: functionResultItem(call.callId, call.name, modelOutput, steer),
       ...(tool ? { tool } : {}),
@@ -8305,8 +8345,8 @@ const runHostTurnBody = async (
 
   /** A write whose carrier raised without any acknowledgement (a dropped
    *  connection, a transport error after the request left): the error is the
-   *  call's result, the boundary freezes until a read returns, and the model
-   *  reads before it says anything landed. The exact call is never resent. */
+   *  call's result, the boundary waits for exact verified reconciliation, and
+   *  reads and reporting remain open. The exact call is never resent. */
   const darkWriteResult = (call: CanonicalHostCall, error: unknown): AgentInputItem => {
     const raw = error instanceof Error ? error.message : String(error ?? '');
     const said = redactSensitiveText(raw).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1_500);
@@ -8315,8 +8355,9 @@ const runHostTurnBody = async (
       call.name,
       JSON.stringify({ ok: false, effect_unknown: true, error: said || 'The call ended without a reply.' }),
       'This call ended without any acknowledgement that the change took; the error is above. It may have landed. '
-        + 'Do not send this call again, and send no other external write until you have read the target and know what happened; reads are open. '
-        + 'Then say exactly what you found. If you cannot read it, say that plainly and name what the owner can check.',
+        + 'Do not send this call again. Read the exact target on the original account; reads are open, while external writes remain frozen until exact reconciliation is verified. '
+        + 'Say exactly what the read establishes and what remains unknown. An omitted record in a partial listing is not proof of absence, and a pre-existing record does not prove this call created it. '
+        + 'If you cannot verify the outcome, explain the concrete missing evidence and next way to check it; do not ask the owner to resend the original call.',
     );
   };
 
@@ -8512,7 +8553,7 @@ const runHostTurnBody = async (
         return answeredRefusalResult(call, attempt.error);
       }
       if (crossing === 'dark_write' && attempt?.status === 'failed') {
-        darkWriteFreeze.tool = edgeToolName(call.name, parsedArgs(call.argumentsJson));
+        noteUnacknowledgedWrite(exactHostIdentity(), call.callId, edgeToolName(call.name, parsedArgs(call.argumentsJson)));
         return darkWriteResult(call, attempt.error);
       }
       return dispositionResult({
@@ -12006,10 +12047,11 @@ const runHostTurnBody = async (
         }
         const identity = exactHostIdentity();
         // The write boundary holds while an earlier write's fate is unknown:
-        // reads are open, external writes wait for one to return. Refused
+        // reads are open, external writes wait for exact verification. Refused
         // here, before the owner is asked about a write that cannot go yet.
-        if (darkWriteFreeze.tool !== null && uncertainEffectStopsTurn(approvalExactProduction.effect)) {
-          preApprovalRepairDiagnostics.set(call.callId, { diagnostic: frozenWriteDiagnostic() });
+        const writeFreeze = uncertainEffectStopsTurn(approvalExactProduction.effect) ? currentWriteFreeze(identity) : null;
+        if (writeFreeze?.frozen) {
+          preApprovalRepairDiagnostics.set(call.callId, { diagnostic: frozenWriteDiagnostic(writeFreeze) });
           preApprovalTypedRefusals.set(call.callId, 'repair_arguments');
           preApprovalRefused = true;
           break;
@@ -12701,7 +12743,9 @@ export function isNarratableHostStop(outcome: RunOutcome): boolean {
   // model call when optional semantic review was disabled by the owner. A
   // refused steering fence likewise publishes Clem's own judged candidate.
   if (outcome.terminal.reason === 'owner_response_format_unmet' || outcome.terminal.reason === 'owner_response_format_unqualified'
-    || outcome.terminal.reason === 'owner_steering_fence_unavailable') return false;
+    || outcome.terminal.reason === 'owner_steering_fence_unavailable'
+    || outcome.terminal.reason === 'unacknowledged_write_unverified'
+    || outcome.terminal.reason === 'write_inventory_unavailable') return false;
   // A terminal the loop gives a notice is app chrome: the clients draw the
   // notice in place of a reply, so a narrated sentence would never be shown.
   if (outcome.terminal.reason === STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON) return false;

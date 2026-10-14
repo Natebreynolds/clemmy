@@ -63,6 +63,7 @@ import {
 import { settleDiscoveryClaimForCallId } from './discovery-boundary.js';
 import { parseExactPlanTaskRefusal } from './plan-task-result-contract.js';
 import { isHostDurableContinuationPendingError } from './host-durable-continuation.js';
+import { hostPreDispatchRefusal } from './host-pre-dispatch-refusal.js';
 import { ASYNC_READ_REFINEMENT_INTENTS_TABLE } from './async-read-refinement-schema.js';
 import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 import {
@@ -176,6 +177,13 @@ export interface InvokeHostToolCallInput<T> {
   beforePhysicalPreparation?: (
     context: HostToolBeforePhysicalAdmissionContext,
   ) => Promise<void | InvalidArgumentsPreDispatchResult>;
+  /** Synchronous policy recheck at the actual crossing edge. Ordinary calls
+   * run it after awaited preparation; nested wrappers run it inside their
+   * final reserve callback. It grants no consent or execution authority. A
+   * nominal refusal proves only that this crossing has not started. */
+  beforePhysicalCrossing?: (
+    context: HostToolBeforePhysicalAdmissionContext,
+  ) => void | InvalidArgumentsPreDispatchResult;
   invoke: (context: { signal: AbortSignal; lease: DispatchLeaseRef }) => Promise<T> | T;
 }
 
@@ -1702,11 +1710,157 @@ export async function invokeHostToolCall<T>(
             throw new HostToolInvocationAuthorityError(settled.reason);
           }
         };
+        const refuseBeforePhysical = async (
+          reason: string,
+          cause?: unknown,
+        ): Promise<never> => {
+          if (externalWriteReservation) {
+            const physicalState = exactHostPhysicalState(input, childLease);
+            projectExternalWrite(
+              physicalState === 'missing' ? 'external_write_failed' : 'external_write_orphaned',
+              reason,
+              physicalState === 'missing' ? 'not_started' : physicalState,
+            );
+          }
+          await revokeDispatchLeaseBeforeRecovery(childLease);
+          try {
+            reconcileRevokedHostToolInvocation({ lease: childLease });
+          } catch (recoveryError) {
+            throw new HostToolInvocationAuthorityError(
+              `${reason}; revoked generation recovery failed`,
+              { cause: recoveryError },
+            );
+          }
+          throw new HostToolInvocationAuthorityError(
+            reason, cause === undefined ? undefined : { cause },
+          );
+        };
+        // A nested SDK wrapper may turn a thrown refusal into ordinary text.
+        // Keep the host's process-local fact, never inspect that text, and
+        // intercept either completion path before adopting a nested result.
+        let crossingRefusal: InvalidArgumentsPreDispatchResult | undefined;
+        let crossingFault: { error: unknown } | undefined;
+        const checkPhysicalCrossing = (tool: string, args: unknown): void => {
+          if (!input.beforePhysicalCrossing) return;
+          if (crossingRefusal) throw hostPreDispatchRefusal(crossingRefusal.output);
+          if (crossingFault) throw crossingFault.error;
+          try {
+            assertRecoveryActivationOwned();
+            assertDispatchLeaseCurrent(childLease);
+            const decision: unknown = input.beforePhysicalCrossing({
+              sessionId: input.identity.sessionId,
+              sourceUserSeq: input.identity.sourceUserSeq,
+              acceptedTaskId, logicalToolCallId: modelCallId, tool, args, lease: childLease,
+            });
+            if (decision && typeof decision === 'object' && 'then' in decision) {
+              throw new Error('beforePhysicalCrossing must be synchronous');
+            }
+            if (decision !== undefined && !(decision instanceof InvalidArgumentsPreDispatchResult)) {
+              throw new Error('beforePhysicalCrossing returned an invalid policy decision');
+            }
+            if (decision instanceof InvalidArgumentsPreDispatchResult) {
+              crossingRefusal = decision;
+              throw hostPreDispatchRefusal(decision.output);
+            }
+          } catch (error) {
+            if (!crossingRefusal) crossingFault = { error };
+            throw error;
+          }
+        };
+        const settleCrossingRefusal = async (): Promise<HostToolInvocationResult<T>> => {
+          assertDispatchLeaseCurrent(childLease);
+          if (!crossingRefusal || topCrossing || (openEventLog().prepare(`
+            SELECT COUNT(*) AS n FROM physical_dispatches
+             WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+          `).get(input.identity.sessionId, input.identity.sourceUserSeq, modelCallId) as { n: number }).n !== 0) {
+            throw new HostToolInvocationAuthorityError('crossing refusal cannot prove an undispatched call');
+          }
+          const prior = redeemDurableLogicalCallSettlementForHost({
+            sessionId: input.identity.sessionId, sourceUserSeq: input.identity.sourceUserSeq,
+            acceptedTaskId, logicalToolCallId: modelCallId,
+          });
+          let settlement: SettledToolAttempt;
+          if (prior.status === 'ok') {
+            if (prior.settlement.executionKind !== 'refused_pre_dispatch'
+              || prior.settlement.physicalCrossingCount !== 0
+              || prior.settlement.hostCrossingCount !== 0
+              || !['invalid_arguments', 'policy_denial'].includes(prior.settlement.outcome.kind)
+              || prior.settlement.outcome.directive.requiresReconciliation) {
+              throw new HostToolInvocationAuthorityError('nested crossing refusal conflicts with its durable settlement');
+            }
+            settlement = { outcome: prior.settlement.outcome,
+              openedDiscoveryEpoch: prior.settlement.recovery.openedDiscoveryEpoch,
+              creditedProgress: prior.settlement.recovery.creditedProgress,
+              duplicate: false };
+          } else if (prior.status === 'missing') {
+            settlement = settleToolAttempt({
+              sessionId: input.identity.sessionId, sourceUserSeq: input.identity.sourceUserSeq,
+              acceptedTaskId, callId: modelCallId, turn: input.identity.turn, lane: 'byo',
+              toolName: input.identity.toolName, args: input.identity.args, dispatchLease: childLease,
+              mutating: invocationMutating(input), businessCall: frozenBusinessCall,
+              ...(input.consentBasis ? { consentBasis: input.consentBasis } : {}), result: crossingRefusal,
+            });
+          } else {
+            throw new HostToolInvocationAuthorityError(`crossing refusal settlement is ${prior.status}: ${prior.reason}`);
+          }
+          // A nested wrapper may reserve before its adapter reaches this
+          // physical edge, then orphan that reservation while formatting the
+          // refusal. The exact call above is now proven never dispatched.
+          // Close only its original durable reservation; do not reconstruct
+          // arguments, invent a reservation, or touch any crossed call.
+          const reservations = listEvents(input.identity.sessionId, { types: ['external_write'] }).filter(event =>
+            event.role === 'system' && event.data.preDispatch === true
+            && event.data.sourceUserSeq === input.identity.sourceUserSeq
+            && event.data.acceptedTaskId === acceptedTaskId
+            && (event.data.canonicalCallId ?? event.data.callId) === modelCallId);
+          if (reservations.length > 1) {
+            throw new HostToolInvocationAuthorityError('crossing refusal has conflicting original reservations');
+          }
+          if (reservations.length === 1) {
+            const original = reservations[0]!;
+            const projection = externalWriteProjectionIdentityFromReservation(original);
+            if (!projection || projection.reservation.callId !== modelCallId
+              || projection.descriptor.toolName !== contract.toolName
+              || typeof original.data.projectionKey !== 'string'
+              || !original.data.projectionKey.startsWith('external-write-reservation:')) {
+              throw new HostToolInvocationAuthorityError('crossing refusal reservation identity is not exact');
+            }
+            projectExternalWriteTerminal({ sessionId: input.identity.sessionId, turn: input.identity.turn,
+              sourceUserSeq: input.identity.sourceUserSeq, acceptedTaskId,
+              ...(typeof original.data.physicalDispatchId === 'string'
+                ? { physicalDispatchId: original.data.physicalDispatchId } : {}),
+              ...projection, type: 'external_write_failed', reason: 'host_physical_crossing_refused',
+              data: { dispatch: 'not_started', effect: 'none', physicalOutcome: 'not_started' } });
+          }
+          writeToolOutput({ sessionId: input.identity.sessionId, callId: modelCallId,
+            tool: contract.toolName, output: crossingRefusal.output });
+          await revokeDispatchLeaseBeforeRecovery(childLease);
+          return { value: crossingRefusal.output as T, settlement };
+        };
         const nestedPhysicalDispatch = input.boundary === 'nested_owned'
           ? {
+              beforeProviderCrossing: (request: import('./tool-invocation-observation-context.js').HostToolInvocationProviderCrossingRequest): void => {
+                // Only this host mutation's exact primary provider lane may
+                // inherit its policy check. Ancillary reads/probes and calls
+                // owned by another source, logical parent or lease stay with
+                // their existing admission boundaries.
+                if ((input.effect !== 'external_write' && input.effect !== 'admin')
+                  || request.sessionId !== input.identity.sessionId
+                  || request.sourceUserSeq !== input.identity.sourceUserSeq
+                  || request.acceptedTaskId !== acceptedTaskId
+                  || request.logicalToolCallId !== modelCallId
+                  || request.lease.sessionId !== childLease.sessionId
+                  || request.lease.scopeId !== childLease.scopeId
+                  || request.lease.leaseId !== childLease.leaseId
+                  || request.lease.sourceUserSeq !== childLease.sourceUserSeq
+                  || request.lease.acceptedTaskId !== childLease.acceptedTaskId
+                  || request.lease.logicalToolCallId !== childLease.logicalToolCallId) return;
+                checkPhysicalCrossing(request.toolName, request.args);
+              },
               reserve: (request: { toolName: string; args?: unknown }): void => {
                 assertRecoveryActivationOwned();
                 assertDispatchLeaseCurrent(childLease);
+                checkPhysicalCrossing(request.toolName, request.args);
                 const admitted = beginPhysicalDispatch({
                   identity: {
                     sessionId: input.identity.sessionId,
@@ -1745,36 +1899,6 @@ export async function invokeHostToolCall<T>(
           : undefined;
         return runWithHostToolInvocationObservation(async () => {
         if (input.boundary !== 'nested_owned') {
-          const refuseBeforePhysical = async (
-            reason: string,
-            cause?: unknown,
-          ): Promise<never> => {
-            if (externalWriteReservation) {
-              const physicalState = exactHostPhysicalState(input, childLease);
-              projectExternalWrite(
-                physicalState === 'missing' ? 'external_write_failed' : 'external_write_orphaned',
-                reason,
-                physicalState === 'missing' ? 'not_started' : physicalState,
-              );
-            }
-            await revokeDispatchLeaseBeforeRecovery(childLease);
-            try {
-              // This exact revoked generation is now the sole recovery owner.
-              // Its durable inspector decides whether the call has provably
-              // zero crossings or an existing crossing whose terminal truth
-              // must be preserved. Neither path re-enters the tool body.
-              reconcileRevokedHostToolInvocation({ lease: childLease });
-            } catch (recoveryError) {
-              throw new HostToolInvocationAuthorityError(
-                `${reason}; revoked generation recovery failed`,
-                { cause: recoveryError },
-              );
-            }
-            throw new HostToolInvocationAuthorityError(
-              reason,
-              cause === undefined ? undefined : { cause },
-            );
-          };
           if (input.beforePhysicalAdmission) {
             try {
               assertDispatchLeaseCurrent(childLease);
@@ -1859,6 +1983,11 @@ export async function invokeHostToolCall<T>(
           // continuation immediately before reserving any effect or crossing.
           try { assertRecoveryActivationOwned(); }
           catch (error) { await refuseBeforePhysical('recovery activation refused before physical dispatch', error); }
+          try { checkPhysicalCrossing(contract.toolName, input.identity.args); }
+          catch (error) {
+            if (crossingRefusal) return settleCrossingRefusal();
+            await refuseBeforePhysical('before-physical crossing refused', error);
+          }
           if (externalWriteDescriptor && externalWritePhysicalDispatchId) {
             try {
               externalWriteReservation = projectExternalWriteReservation({
@@ -2331,6 +2460,11 @@ export async function invokeHostToolCall<T>(
                 try {
                   await yieldBeforeParallelSettlement();
                   assertDispatchLeaseCurrent(childLease);
+                  if (crossingRefusal) {
+                    const refused = await settleCrossingRefusal();
+                    state = 'done'; resolve(refused); return;
+                  }
+                  if (crossingFault) await refuseBeforePhysical('before-physical crossing refused', crossingFault.error);
                   closeTop('returned');
                   if (contract.toolName === 'plan_task') {
                     const refusal = parseExactPlanTaskRefusal(value);
@@ -2388,6 +2522,11 @@ export async function invokeHostToolCall<T>(
                 try {
                   await yieldBeforeParallelSettlement();
                   assertDispatchLeaseCurrent(childLease);
+                  if (crossingRefusal) {
+                    const refused = await settleCrossingRefusal();
+                    state = 'done'; resolve(refused); return;
+                  }
+                  if (crossingFault) await refuseBeforePhysical('before-physical crossing refused', crossingFault.error);
                   if (isHostDurableContinuationPendingError(error)) {
                     if (
                       input.boundary !== 'nested_owned'

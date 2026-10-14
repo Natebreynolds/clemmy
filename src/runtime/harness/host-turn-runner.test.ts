@@ -13057,7 +13057,7 @@ test('the host model request liveness clears on both a response and a rejected r
 
 // A declared reversible provider write gives transport tests real call authority.
 // The provider body is recording-only; no network or live-home mutation occurs.
-async function transportWriteFixture(write: () => Promise<string>, late: () => Promise<string>, prepare?: () => void) {
+async function transportWriteFixture(write: () => Promise<string>, late: () => Promise<string>, prepare?: () => void, unacknowledgedReturn = false) {
   const adapters = await import('./production-capability-adapter.js');
   const observations = await import('./independent-capability-observation.js');
   const schemas = await import('../../tools/composio-schema-cache.js');
@@ -13095,6 +13095,7 @@ async function transportWriteFixture(write: () => Promise<string>, late: () => P
   const invoke = async (request: { payload: { late: boolean }; authority?: unknown }) => {
     assert.ok(request.authority, 'a settled fixture write must carry an exact consent grant');
     const receipt = await (request.payload.late ? late() : write());
+    if (!request.payload.late && unacknowledgedReturn) return { successful: false, status_code: 502, error: 'controlled missing acknowledgement' };
     return { successful: true, data: { id: 'transport-draft', receipt } };
   };
   assert.equal(productionPorts.registerFixtureCapabilityPort(productionPorts.productionPortIdentityFromManifest(manifest), {
@@ -13888,12 +13889,12 @@ for (const variant of ['fresh', 'current_refusal', 'prior_uncertain', 'missing_a
   });
 }
 
-test('a write whose carrier raised without acknowledgement goes on under a write freeze: reads open, writes wait for a read, the frozen write never resent, and she answers', async (t) => {
+test('an unacknowledged write remains frozen after an unrelated read while Clem reports the uncertainty in her own words', async (t) => {
   // Live 2026-10-08: two shell commands that timed out ended the turn "I
   // can't tell whether the command went through… I won't retry it on my
   // own", with nothing read and nothing decided. A write that ended without
   // acknowledgement may have landed: the model gets the error as the call's
-  // result, every further external write waits until a read returns, the
+  // result, every further external write waits for exact verification, the
   // frozen call is never resent, and the model reads, then speaks.
   const accepted = acceptHostCanarySource('dark-write-freeze',
     'Create one reversible draft on the controlled provider account and report its receipt.');
@@ -13911,7 +13912,7 @@ test('a write whose carrier raised without acknowledgement goes on under a write
     parameters: z.object({}),
     execute: async () => { reads++; return 'no draft exists on the controlled account'; },
   });
-  const answer = 'The connection dropped before the app answered. I checked the account: no draft existed, so I created it after the read.';
+  const answer = 'The connection dropped before the app answered. The unrelated local read does not verify the provider draft. I have not resent it; the exact provider account still needs a verified check.';
   const model = stubModel([
     [writer.call('dark-write')],
     [writer.call('dark-write-while-frozen', true)],
@@ -13924,9 +13925,13 @@ test('a write whose carrier raised without acknowledgement goes on under a write
   const outcome = await runProductionHost(accepted, agent, undefined, { maxTurns: 5 });
   assert.equal(entered, 1, 'the dark write ran once and is never resent');
   assert.equal(reads, 1, 'the read went through while the write boundary was frozen');
-  assert.equal(lateRuns, 1, 'a changed write after the read goes through the gate like any write');
-  assert.equal(model.calls(), 5, 'the turn went on; no reconciliation stop');
+  assert.equal(lateRuns, 0, 'an unrelated local read cannot unlock a changed provider write');
+  assert.equal(model.calls(), 5, 'reads and reporting remain available without an extra narrator');
   assert.equal(outcome.finalOutput, answer);
+  assert.deepEqual(outcome.terminal, { status: 'blocked', reason: 'unacknowledged_write_unverified' },
+    'a useful report does not become a completed write task');
+  const { isNarratableHostStop } = await import('./host-turn-runner.js');
+  assert.equal(isNarratableHostStop(outcome), false, 'the already-authored report is never rewritten by a stop narrator');
   assert.notDeepEqual(outcome.terminal, { status: 'blocked', reason: 'tool_effect_uncertain' }, 'the turn did not end in the harness\'s words');
   const resultText = (id: string) => {
     const paired = outcome.history.find((item) => (item as { type?: string }).type === 'function_call_result'
@@ -13935,11 +13940,89 @@ test('a write whose carrier raised without acknowledgement goes on under a write
   };
   assert.match(resultText('dark-write'), /"effect_unknown":true/);
   assert.match(resultText('dark-write'), /socket hang up/, 'the error is the call\'s result');
-  assert.match(resultText('dark-write'), /send no other external write until you have read/);
-  assert.match(resultText('dark-write-while-frozen'), /write_frozen_until_read/, 'an external write before a read is refused before dispatch');
-  assert.match(resultText('dark-read'), /ground truth for the earlier (TRANSPORT_CREATE_DRAFT|call_tool) call that ended without acknowledgement/,
-    'the read that lifts the freeze is named as the answer to the dark write, by the inner operation');
-  assert.match(resultText('dark-read'), /External writes are open again/);
-  assert.deepEqual(dispositionMarkers(outcome.history).map((marker) => marker.disposition), ['refused_pre_dispatch'],
-    'no effect_unknown marker: the frozen write is the only host disposition');
+  assert.match(resultText('dark-write'), /external writes remain frozen until exact reconciliation is verified/);
+  assert.match(resultText('dark-write'), /partial listing is not proof of absence/);
+  assert.match(resultText('dark-write-while-frozen'), /write_frozen_until_verified/, 'an external write before a read is refused before dispatch');
+  assert.match(resultText('dark-write-after-read'), /write_frozen_until_verified/, 'a write after an unrelated read is still refused before dispatch');
+  assert.doesNotMatch(resultText('dark-read'), /ground truth for the earlier|External writes are open again/);
+  assert.deepEqual(dispositionMarkers(outcome.history).map((marker) => marker.disposition), ['refused_pre_dispatch', 'refused_pre_dispatch'],
+    'both further writes are zero-crossing refusals; the original uncertainty is retained');
+});
+
+test('a fresh runner reopens an earlier own-source unacknowledged write instead of resetting its freeze', async (t) => {
+  const accepted = acceptHostCanarySource('dark-write-reentry',
+    'Create one reversible draft on the controlled provider account and report its receipt.');
+  let originalRuns = 0;
+  let laterRuns = 0;
+  const writer = await transportWriteFixture(
+    async () => { originalRuns++; throw new Error('socket hang up'); },
+    async () => { laterRuns++; return 'must not cross on reentry'; },
+  );
+  t.after(() => writer.restore());
+  const firstReply = 'The provider did not acknowledge the write. Its result is unknown and I have not repeated it.';
+  const firstModel = stubModel([[writer.call('dark-reentry-original')], [textMsg(firstReply)]]);
+  const firstAgent = { model: firstModel, tools: [writer.carrier] };
+  bindHostCanarySurface(accepted, firstAgent, firstAgent.tools);
+  const first = await runProductionHost(accepted, firstAgent, undefined, { maxTurns: 2 });
+  assert.equal(originalRuns, 1);
+  assert.equal(first.finalOutput, firstReply);
+  assert.equal(first.terminal?.reason, 'unacknowledged_write_unverified');
+  const finalReply = 'The earlier write is still unverified. I have not made another change; I need the exact account readback to continue.';
+  const secondModel = stubModel([[writer.call('dark-reentry-further', true)], [textMsg(finalReply)]]);
+  const secondAgent = { model: secondModel, tools: [writer.carrier] };
+  bindHostCanarySurface(accepted, secondAgent, secondAgent.tools);
+  const { recoverAcceptedModelBatchForRestart } = await import('./accepted-model-batch-checkpoint.js');
+  const reopened = recoverAcceptedModelBatchForRestart(accepted.context);
+  assert.equal(reopened.status, 'ready', 'the returned transport error is paired; its effect remains unknown');
+  if (reopened.status !== 'ready') throw new Error('controlled returned-write checkpoint is not continuation-ready');
+  const checkpoint = reopened.checkpoint;
+  const ref = { sessionId: checkpoint.sessionId, sourceUserSeq: checkpoint.sourceUserSeq,
+    acceptedTaskId: checkpoint.acceptedTaskId, batchOrdinal: checkpoint.batchOrdinal,
+    batchId: checkpoint.batchId, authorityDigest: checkpoint.authorityDigest };
+  const continued = HostRecoveryState.fromString(new HostRecoveryState(
+    accepted.session.id, accepted.source.seq, 'continue', checkpoint.history, [], [],
+    checkpoint.lastResponseId, undefined, 'host_v1', undefined, 2, ref,
+  ).toString());
+  const originalSettlement = () => eventlog.openEventLog().prepare(`SELECT outcome_kind, outcome_detail,
+    requires_reconciliation, physical_crossing_count FROM logical_call_settlements
+    WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?`)
+    .get(accepted.session.id, accepted.source.seq, 'dark-reentry-original');
+  const before = originalSettlement() as { outcome_kind: string; outcome_detail: string; requires_reconciliation: number; physical_crossing_count: number };
+  assert.equal(before.outcome_kind, 'uncertain_write');
+  assert.equal(before.outcome_detail, 'unacknowledged_mutation');
+  assert.equal(before.requires_reconciliation, 1);
+  assert.equal(before.physical_crossing_count, 1);
+  const second = await runProductionHost(accepted, secondAgent, continued, { maxTurns: 4 });
+  assert.equal(originalRuns, 1);
+  assert.equal(laterRuns, 0, 'a new physical runner does not forget durable uncertainty');
+  assert.equal(second.finalOutput, finalReply);
+  assert.equal(second.terminal?.reason, 'unacknowledged_write_unverified');
+  assert.equal(secondModel.calls(), 2);
+  assert.deepEqual(originalSettlement(), before, 'reporting and reentry never rewrite the original effect');
+});
+
+test('a returned unacknowledged write freezes the next external sibling after its earlier consent check', async (t) => {
+  const accepted = acceptHostCanarySource('dark-write-batch',
+    'Create the two reversible controlled fixture drafts and report their outcomes.');
+  let originalRuns = 0, laterRuns = 0;
+  const writer = await transportWriteFixture(async () => { originalRuns++; return 'reply lost'; },
+    async () => { laterRuns++; return 'must not execute'; }, undefined, true);
+  t.after(() => writer.restore());
+  const answer = 'The first provider response was a server failure, so its effect is unknown. I did not create the second draft or repeat the first; the original account needs an exact verified check.';
+  const model = stubModel([[writer.call('dark-batch-original'), writer.call('dark-batch-sibling', true)], [textMsg(answer)]]);
+  const agent = { model, tools: [writer.carrier] };
+  bindHostCanarySurface(accepted, agent, agent.tools);
+  const result = await runProductionHost(accepted, agent, undefined, { maxTurns: 2 });
+  assert.equal(originalRuns, 1);
+  assert.equal(laterRuns, 0, 'pre-approved siblings must still recheck at execution');
+  assert.equal(result.finalOutput, answer);
+  assert.equal(result.terminal?.reason, 'unacknowledged_write_unverified');
+  assert.equal(model.calls(), 2);
+  const rows = eventlog.openEventLog().prepare(`SELECT logical_tool_call_id, execution_kind, outcome_kind,
+    physical_crossing_count, requires_reconciliation FROM logical_call_settlements
+    WHERE session_id=? AND source_user_seq=? ORDER BY logical_tool_call_id`).all(accepted.session.id, accepted.source.seq);
+  assert.deepEqual(rows, [
+    { logical_tool_call_id: 'dark-batch-original', execution_kind: 'provider_execution', outcome_kind: 'uncertain_write', physical_crossing_count: 1, requires_reconciliation: 1 },
+    { logical_tool_call_id: 'dark-batch-sibling', execution_kind: 'refused_pre_dispatch', outcome_kind: 'invalid_arguments', physical_crossing_count: 0, requires_reconciliation: 0 },
+  ]);
 });

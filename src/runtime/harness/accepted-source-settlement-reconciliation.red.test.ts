@@ -908,14 +908,13 @@ test('an EARLIER success does not recover a write rejected after it', () => {
   );
 });
 
-test('host-v1 durable exact-artifact semantics let a corrected provider call recover without legacy write events', () => {
+test('declared exact-artifact recovery and a corrected sibling write do not resolve the original unacknowledged external call', () => {
   // Host-v1 dispatches providers directly; it does not traverse the legacy
   // brackets.ts external_write reservation emitter. The live Platform 49 run
-  // therefore completed a corrected Sheets update but terminal publication
-  // could not prove that it repaired the provider-confirmed HTTP 400. The live
-  // manifest intentionally has no general reversibility declaration: its
-  // positive authority is exact-artifact reconciliation + required
-  // idempotency on one current, trusted Composio callable.
+  // completed a corrected Sheets update, but this fixture never invokes its
+  // declared reconcile port or produces an exact original-call terminal.
+  // Retain that historical shape: a declared exact-artifact contract and a
+  // later successful sibling cannot prove the earlier unknown effect.
   const sessionId = 'workflow:host-v1-repaired-write:main';
   eventlog.createSession({ id: sessionId, kind: 'workflow' });
   const source = eventlog.appendEvent({
@@ -1104,8 +1103,15 @@ test('host-v1 durable exact-artifact semantics let a corrected provider call rec
     sourceUserSeq: source.seq,
     requireEveryBusinessReadToSettle: true,
   });
-  assert.equal(audit.status, 'clean', JSON.stringify(audit));
-  assert.equal(audit.facts.unrecoveredBusinessFailures, 0);
+  assert.equal(audit.status, 'uncertain_write', JSON.stringify(audit));
+  assert.equal(audit.facts.blockingUncertainWrites, 1);
+  assert.equal(audit.facts.unrecoveredBusinessFailures, 1);
+  const original = eventlog.openEventLog().prepare(`SELECT outcome_kind, outcome_detail,
+      requires_reconciliation FROM logical_call_settlements
+    WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`).get(
+    sessionId, source.seq, 'call-host-bad-range');
+  assert.deepEqual(original, { outcome_kind: 'uncertain_write', outcome_detail: 'unacknowledged_mutation',
+    requires_reconciliation: 1 }, 'the corrected sibling cannot rewrite the original unknown outcome');
 });
 
 // ── A call that never crossed cannot hold a source open ────────────────────

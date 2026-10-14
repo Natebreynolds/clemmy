@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AttemptSignals } from './attempt-outcome.js';
+import type { DispatchLeaseRef } from './dispatch-lease.js';
 
 export interface HostToolInvocationObservation {
   resultPresent: boolean;
@@ -25,6 +26,17 @@ export type HostToolInvocationPhysicalDispatchOutcome = 'returned' | 'threw';
 export interface HostToolInvocationPhysicalDispatchCallbacks {
   reserve: (request: HostToolInvocationPhysicalDispatchRequest) => void;
   settle: (outcome: HostToolInvocationPhysicalDispatchOutcome) => void;
+  /** Policy only: a terminal adapter owns its provider row instead of using
+   * reserve above, but must still visit the exact host call's last edge. */
+  beforeProviderCrossing?: (request: HostToolInvocationProviderCrossingRequest) => void;
+}
+
+export interface HostToolInvocationProviderCrossingRequest extends HostToolInvocationPhysicalDispatchRequest {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+  lease: DispatchLeaseRef;
 }
 
 interface MutableObservation extends HostToolInvocationObservation {
@@ -59,6 +71,12 @@ export function reserveHostToolInvocationPhysicalDispatch(
   if (!callback) return false;
   callback.reserve(request);
   return true;
+}
+
+/** No-op outside an enclosing host call. It grants no physical authority and
+ * never creates a host duplicate of the adapter's own provider reservation. */
+export function checkHostToolInvocationProviderCrossing(request: HostToolInvocationProviderCrossingRequest): void {
+  storage.getStore()?.physicalDispatch?.beforeProviderCrossing?.(request);
 }
 
 /** Close a row reserved through the matching nested invocation context before
