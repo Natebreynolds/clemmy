@@ -220,6 +220,38 @@ export async function withDaemonRuntimePhase<T>(
 }
 
 /**
+ * Synchronous work as its own named phase. A hold inside it is charged to this
+ * name, never to whichever concurrent async phase last took the label.
+ */
+export function withDaemonRuntimePhaseSync<T>(name: string, detail: unknown, fn: () => T): T {
+  const nowMs = Date.now();
+  phaseSequence += 1;
+  const entry: StoredDaemonRuntimePhase = {
+    name,
+    detail: cleanDetail(detail),
+    startedAt: new Date(nowMs).toISOString(),
+    startedAtMs: nowMs,
+    sequence: phaseSequence,
+    parent: context.getStore(),
+  };
+  const metered = isMeteredDaemonPhase(name);
+  inFlight.set(entry.sequence, entry);
+  inFlightVersion += 1;
+  if (metered) meteredInFlight += 1;
+  runningPhase = entry;
+  stampBeacon();
+  try {
+    return context.run(entry, fn);
+  } finally {
+    inFlight.delete(entry.sequence);
+    inFlightVersion += 1;
+    if (metered) meteredInFlight = Math.max(0, meteredInFlight - 1);
+    runningPhase = ownerAtKnownPoint(context.getStore(), Date.now());
+    stampBeacon();
+  }
+}
+
+/**
  * Run one daemon-loop step as its own phase and contain its failure. An error
  * that escapes the loop reaches main(), which exits; the supervisor restarts
  * into the same durable state and usually the same error. `contain` receives

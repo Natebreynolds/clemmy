@@ -27,6 +27,7 @@ import { resolveRoleModel, defaultForRole, readDurableBindings } from '../runtim
 import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harness/model-role-options.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
+import { withDaemonRuntimePhaseSync } from '../daemon/phase.js';
 import {
   appendEvent as appendHarnessEvent,
   beginRunAttempt,
@@ -17109,10 +17110,13 @@ async function processOneRunFile(
         outcome: workflowReportLaneForOutcome({ needsAttention, advisories: publicQualityAdvisories }),
         detail: reportBody,
       };
-      const terminalRecord = writeRunRecord(filePath, terminalProjection, terminalReport);
+      // Each synchronous publication step is its own phase, so a hold names it.
+      const finalizeStep = <T>(step: string, work: () => T): T =>
+        withDaemonRuntimePhaseSync('daemon.workflow.finalize', { step }, work);
+      const terminalRecord = finalizeStep('run_record', () => writeRunRecord(filePath, terminalProjection, terminalReport));
       if (!terminalPublicationMatches(filePath, terminalRecord, terminalReport)) return;
       appendWorkflowEvent(workflow.name, run.id, { kind: 'run_completed' });
-      recordPublishedOutcomeLearning();
+      finalizeStep('learning', recordPublishedOutcomeLearning);
       try {
         appendWorkflowEvent(workflow.name, run.id, {
           kind: 'run_summary',
@@ -17124,7 +17128,7 @@ async function processOneRunFile(
           },
         });
       } catch { /* summary event is best-effort */ }
-      attemptWorkflowRunReportBack(filePath);
+      finalizeStep('report_back', () => attemptWorkflowRunReportBack(filePath));
       // An exact observer already produced the one source-bound terminal
       // carrier in attemptWorkflowRunReportBack above. A second, silent global
       // completion row is still duplicate Activity/inbox content even though
@@ -17139,14 +17143,14 @@ async function processOneRunFile(
       const adoptedStepReport = !hasExactOriginObserver
         && !suppressGlobalTerminal
         && stepAlreadyNotified
-        ? adoptWorkflowStepReportAsOutcome({
+        ? finalizeStep('adopt_step_report', () => adoptWorkflowStepReportAsOutcome({
           runId: run.id,
           workflow: workflow.data.name,
           ...(hasAdvisories ? { appendix: advisorySummary, qualityAdvisories: publicQualityAdvisories } : {}),
-        })
+        }))
         : null;
       if (!hasExactOriginObserver && !adoptedStepReport) {
-        addNotification({
+        finalizeStep('notification', () => addNotification({
           id: `workflow-${run.id}-completed`,
           kind: 'workflow',
           title: runIsNoOp
@@ -17183,11 +17187,11 @@ async function processOneRunFile(
             qualityAdvisories: hasAdvisories ? publicQualityAdvisories : undefined,
             ...(runIsNoOp ? { noOp: true, noOpReason: 'no new items' } : {}),
           },
-        });
+        }));
       }
       markRunNotified(filePath);
       try {
-        finishRun(run.id, {
+        finalizeStep('finish_run', () => finishRun(run.id, {
           status: 'completed',
           message: needsAttention
             ? (blockedSteps.length > 0
@@ -17196,7 +17200,7 @@ async function processOneRunFile(
             : `Completed${hasFailures ? ` with ${publicForEachFailures.length} item failure${publicForEachFailures.length === 1 ? '' : 's'}` : ''}${hasAdvisories ? ` · ${publicQualityAdvisories.length} quality advisory${publicQualityAdvisories.length === 1 ? '' : 'ies'}` : ''}`,
           outputPreview: reportBody.slice(0, 800),
           needsAttention,
-        });
+        }));
       } catch { /* best-effort */ }
       // Gap E: re-enter the origin chat in-context (no-op for scheduled/cron).
       // Needs-attention OR a review-required advisory → 'blocked' so Clem knows
