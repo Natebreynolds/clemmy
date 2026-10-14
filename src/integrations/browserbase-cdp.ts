@@ -1,3 +1,4 @@
+import { kernelConnectUrlFor } from './kernel-client.js';
 import { WebSocket } from 'undici';
 import { z } from 'zod';
 import { BROWSER_HTTP_URL } from '../tools/browser-operation-contract.js';
@@ -61,7 +62,9 @@ export class BrowserbaseCdpClient {
     const args = parseBrowserbaseOperation(operation, input);
     let endpoint: URL;
     try { endpoint = new URL(connectUrl); } catch { throw new BrowserbaseCdpError('connection_unavailable', 'none'); }
-    if (!browserbaseConnectUrlFor(endpoint.href, providerSessionId)) throw new BrowserbaseCdpError('connection_identity_changed', 'none');
+    // The endpoint must be one the provider minted for this session: Browserbase's
+    // signed connect URL, or Kernel's secure CDP websocket on its own hosts.
+    if (!browserbaseConnectUrlFor(endpoint.href, providerSessionId) && !kernelConnectUrlFor(endpoint.href)) throw new BrowserbaseCdpError('connection_identity_changed', 'none');
     if (options.signal?.aborted) throw new BrowserbaseCdpError('cancelled', 'none');
     let mutated = false, sequence = 0, closed = false, socket: BrowserbaseSocket;
     const pending = new Map<number, { resolve: (value: Record<string, any>) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();

@@ -46,6 +46,7 @@ export type SecretName =
   | 'recall_api_key'
   | 'browser_use_api_key'
   | 'browserbase_api_key'
+  | 'kernel_api_key'
   | 'typesafe_api_key'
   | 'codex_oauth_access_token'
   | 'codex_oauth_refresh_token'

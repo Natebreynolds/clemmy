@@ -8,9 +8,11 @@ import { readSecret, writeSecret } from '../runtime/secrets/index.js';
 import { syncDirectoryMetadata } from '../runtime/sync-directory.js';
 import { BrowserbaseApiClient, BrowserbaseClientError, type BrowserbaseSession, type BrowserbaseRunningSession } from './browserbase-client.js';
 import { BrowserbaseCdpClient, BrowserbaseCdpError, parseBrowserbaseOperation, type BrowserbaseOperation, type BrowserbasePage, type BrowserbaseCdpResult } from './browserbase-cdp.js';
+import { CLOUD_BROWSER_PROVIDER_INFO, isBrowserChoice, isCloudBrowserProvider, type BrowserChoice, type CloudBrowserProvider } from './cloud-browser-provider.js';
+import { KernelApiClient, KERNEL_DEFAULT_PROJECT } from './kernel-client.js';
 
 export interface BrowserbaseResource {
-  id: string; conversationId: string; provider: 'browserbase'; providerSessionId: string | null; projectId: string;
+  id: string; conversationId: string; provider: CloudBrowserProvider; providerSessionId: string | null; projectId: string;
   state: 'starting' | 'active' | 'stopped' | 'expired' | 'uncertain'; controller: 'agent' | 'human'; controlVersion: number;
   createdAt: string; updatedAt: string; recording: boolean; elapsedSeconds: number; pages: BrowserbasePage[]; errorCode?: string;
   returnPending?: boolean;
@@ -31,7 +33,7 @@ export interface BrowserbaseUnlinkedSession { providerSessionId: string; created
 export type BrowserbaseCloseUnlinkedResult = { closed: true; status: 'closed' } | { closed: false; status: 'releasing' | 'unknown' };
 export interface BrowserbaseOverview { browsers: BrowserbaseOpenBrowser[]; unlinked: BrowserbaseUnlinkedSession[]; unlinkedChecked: boolean }
 export interface BrowserbaseOperationReceipt {
-  version: 1; kind: 'browserbase_dispatch_receipt'; resourceId: string; provider: 'browserbase'; providerSessionId: string;
+  version: 1; kind: 'browserbase_dispatch_receipt'; resourceId: string; provider: CloudBrowserProvider; providerSessionId: string;
   projectId: string; operation: string; targetId: string | null; controlVersion: number; effect: 'none' | 'confirmed'; at: string;
 }
 export interface BrowserbaseOperationResponse { resource: BrowserbaseResource; result: Record<string, unknown>; receipt: BrowserbaseOperationReceipt; }
@@ -77,7 +79,7 @@ export function browserbaseErrorText(code: string, httpStatus?: number): string 
   }
   return ERROR_TEXT[code] ?? `The cloud browser could not do that (${code}). Nothing was changed.`;
 }
-interface Policy { projectId: string; idleSeconds: number; sessionTimeoutSeconds: number; contextId?: string; }
+interface Policy { provider: CloudBrowserProvider; projectId: string; idleSeconds: number; sessionTimeoutSeconds: number; contextId?: string; }
 /** Long enough to hand a page back and forth; short enough not to leave a
  * forgotten browser running. Browserbase ends a session at its timeout. */
 const DEFAULT_IDLE_SECONDS = 900, DEFAULT_SESSION_TIMEOUT_SECONDS = 7200;
@@ -94,9 +96,13 @@ interface PrivateResource extends Omit<BrowserbaseResource, 'elapsedSeconds'> {
   usesProfile?: boolean;
   focusTargetId?: string;
 }
-interface Store { version: 1; revision: number; policy: Policy | null; resources: PrivateResource[]; }
+/** `policy` mirrors the chosen provider's policy for readers that know one
+ * policy; `providers` holds every connected provider and `choice` the owner's
+ * pick (a provider, or this computer's Chrome). */
+interface Store { version: 1; revision: number; policy: Policy | null; resources: PrivateResource[]; providers?: Partial<Record<CloudBrowserProvider, Policy>>; choice?: BrowserChoice; }
 interface Api {
-  create: BrowserbaseApiClient['create']; retrieve: BrowserbaseApiClient['retrieve']; release: BrowserbaseApiClient['release']; liveView: BrowserbaseApiClient['liveView'];
+  create: BrowserbaseApiClient['create']; retrieve: BrowserbaseApiClient['retrieve']; release: BrowserbaseApiClient['release'];
+  liveView: (sessionId: string, options?: { expiresIn?: number; targetId?: string; mode?: 'watch' | 'human' }) => Promise<{ url: string; expiresAt: string; targetId?: string }>;
   verifyProject?: BrowserbaseApiClient['verifyProject'];
   listRunning?: (projectId: string) => Promise<BrowserbaseRunningSession[]>;
   createContext?: (projectId: string) => Promise<string>;
@@ -106,8 +112,14 @@ export interface BrowserbaseDependencies {
   baseDir?: string; now?: () => number; uuid?: () => string; getApiKey?: () => Promise<string | undefined>; setApiKey?: (value: string) => Promise<void>;
   api?: Api; cdp?: Cdp; autoMaintenance?: boolean;
   credentialTimeoutMs?: number;
+  /** Per-provider seams for tests; `api`, `getApiKey` and `setApiKey` above are Browserbase's. */
+  providerApis?: Partial<Record<CloudBrowserProvider, Api>>;
+  getProviderApiKey?: (provider: CloudBrowserProvider) => Promise<string | undefined>;
+  setProviderApiKey?: (provider: CloudBrowserProvider, value: string) => Promise<void>;
 }
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Provider identifiers: Browserbase's are UUIDs, Kernel's are cuid-like. */
+const PROVIDER_ID = /^[A-Za-z0-9_.-]{1,128}$/;
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const nonterminal = (value: PrivateResource) => value.state !== 'stopped' && value.state !== 'expired';
 // A record with no provider session has nothing a credential change could strand.
@@ -128,7 +140,7 @@ export class BrowserbaseService {
   private readonly queues = new Map<string, Promise<unknown>>();
   private timer?: ReturnType<typeof setInterval>;
   private storeUnavailable = false;
-  private keyRead?: Promise<string | undefined>;
+  private readonly keyReads = new Map<CloudBrowserProvider, Promise<string | undefined>>();
   private readonly credentialTimeoutMs: number;
   /** The overview is polled; Browserbase's running list is asked at most this often. */
   private running?: { at: number; projectId: string; rows: Promise<BrowserbaseRunningSession[]> };
@@ -158,10 +170,10 @@ export class BrowserbaseService {
     try {
       const value = JSON.parse(readFileSync(this.file, 'utf8')) as Store;
       if (value.version !== 1 || !Number.isSafeInteger(value.revision) || !Array.isArray(value.resources)
-        || (value.policy !== null && (!value.policy || !UUID.test(value.policy.projectId) || !Number.isInteger(value.policy.idleSeconds)
+        || (value.policy !== null && (!value.policy || !PROVIDER_ID.test(value.policy.projectId) || !Number.isInteger(value.policy.idleSeconds)
           || !Number.isInteger(value.policy.sessionTimeoutSeconds) || value.policy.idleSeconds < 60 || value.policy.sessionTimeoutSeconds > 21600 || value.policy.idleSeconds > value.policy.sessionTimeoutSeconds))
-        || value.resources.some(resource => !resource || !UUID.test(resource.id) || typeof resource.conversationId !== 'string' || resource.provider !== 'browserbase'
-          || !UUID.test(resource.projectId) || (resource.providerSessionId !== null && !UUID.test(resource.providerSessionId))
+        || value.resources.some(resource => !resource || !UUID.test(resource.id) || typeof resource.conversationId !== 'string' || !isCloudBrowserProvider(resource.provider)
+          || !PROVIDER_ID.test(resource.projectId) || (resource.providerSessionId !== null && !PROVIDER_ID.test(resource.providerSessionId))
           || !Number.isSafeInteger(resource.controlVersion) || resource.controlVersion < 1 || !/^[a-f0-9]{64}$/.test(resource.requestKey)
           || !/^[a-f0-9]{64}$/.test(resource.credentialIdentity) || !['starting','active','stopped','expired','uncertain'].includes(resource.state)
           || !['agent','human'].includes(resource.controller) || !Number.isFinite(resource.lastActivityAt) || !Number.isFinite(resource.expiresAt)
@@ -169,10 +181,22 @@ export class BrowserbaseService {
           || (resource.pages !== undefined && (!Array.isArray(resource.pages) || resource.pages.length > 100 || resource.pages.some(page => typeof page.targetId !== 'string' || !page.targetId || page.targetId.length > 128 || typeof page.title !== 'string' || page.title.length > 1000 || typeof page.url !== 'string' || page.url.length > 2000)))
           || (resource.returnPending !== undefined && typeof resource.returnPending !== 'boolean')
           || (resource.viewerLeases !== undefined && (!Array.isArray(resource.viewerLeases) || resource.viewerLeases.some(lease => !UUID.test(lease.id) || !Number.isSafeInteger(lease.controlVersion) || lease.controlVersion < 1 || !Number.isFinite(lease.expiresAt) || !['watch','human'].includes(lease.mode) || typeof lease.detached !== 'boolean' || (lease.targetId !== null && (typeof lease.targetId !== 'string' || !lease.targetId || lease.targetId.length > 128))))))) throw new Error();
-      if (value.policy?.contextId !== undefined && (typeof value.policy.contextId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(value.policy.contextId))) throw new Error('invalid profile');
-      if (value.policy && value.policy.idleSeconds === EARLIER_DEFAULTS.idleSeconds && value.policy.sessionTimeoutSeconds === EARLIER_DEFAULTS.sessionTimeoutSeconds) {
-        value.policy = { ...value.policy, idleSeconds: DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds: DEFAULT_SESSION_TIMEOUT_SECONDS };
+      // Stores written before providers existed hold one Browserbase policy.
+      if (value.providers === undefined) {
+        value.providers = value.policy ? { [isCloudBrowserProvider(value.policy.provider) ? value.policy.provider : 'browserbase']: value.policy } : {};
       }
+      if (!value.providers || typeof value.providers !== 'object' || Array.isArray(value.providers)) throw new Error('invalid providers');
+      for (const [name, policy] of Object.entries(value.providers)) {
+        if (!isCloudBrowserProvider(name) || !policy || !(name === 'browserbase' ? UUID : PROVIDER_ID).test(policy.projectId) || !Number.isInteger(policy.idleSeconds)
+          || !Number.isInteger(policy.sessionTimeoutSeconds) || policy.idleSeconds < 60 || policy.sessionTimeoutSeconds > 21600 || policy.idleSeconds > policy.sessionTimeoutSeconds) throw new Error('invalid provider policy');
+        if (policy.contextId !== undefined && (typeof policy.contextId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(policy.contextId))) throw new Error('invalid profile');
+        policy.provider = name;
+        if (policy.idleSeconds === EARLIER_DEFAULTS.idleSeconds && policy.sessionTimeoutSeconds === EARLIER_DEFAULTS.sessionTimeoutSeconds) {
+          value.providers[name] = { ...policy, idleSeconds: DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds: DEFAULT_SESSION_TIMEOUT_SECONDS };
+        }
+      }
+      if (value.choice !== undefined && !isBrowserChoice(value.choice)) throw new Error('invalid choice');
+      value.policy = this.activePolicyOf(value);
       return value;
     } catch { throw new BrowserbaseServiceError('resource_store_invalid'); }
   }
@@ -188,6 +212,7 @@ export class BrowserbaseService {
       lock = new Database(lockPath, { timeout: 1000 }); chmodSync(lockPath, 0o600); lock.exec('BEGIN IMMEDIATE');
       const disk = existsSync(this.file) ? JSON.parse(readFileSync(this.file, 'utf8')) as Store : { revision: 0 };
       if (disk.revision !== this.store.revision) throw new BrowserbaseServiceError('resource_store_conflict');
+      this.store.policy = this.activePolicyOf(this.store);
       const next = { ...this.store, revision: this.store.revision + 1 };
       temp = path.join(this.directory, `.resources-${this.uuid()}.tmp`);
       // Flush through the descriptor that wrote the bytes: Windows refuses a
@@ -214,7 +239,7 @@ export class BrowserbaseService {
   }
   private public(resource: PrivateResource): BrowserbaseResource {
     // Deliberate projection: private reservation/account identity never rides in a tool receipt.
-    return { id: resource.id, conversationId: resource.conversationId, provider: 'browserbase', providerSessionId: resource.providerSessionId,
+    return { id: resource.id, conversationId: resource.conversationId, provider: resource.provider, providerSessionId: resource.providerSessionId,
       projectId: resource.projectId, state: resource.state, controller: resource.controller, controlVersion: resource.controlVersion,
       createdAt: resource.createdAt, updatedAt: resource.updatedAt, recording: resource.recording,
       elapsedSeconds: Math.max(0, Math.floor(((nonterminal(resource) ? this.now() : Date.parse(resource.updatedAt)) - Date.parse(resource.createdAt)) / 1000)),
@@ -226,24 +251,55 @@ export class BrowserbaseService {
     const id = resource.focusTargetId;
     return id && (resource.pages ?? []).some(page => page.targetId === id) ? id : undefined;
   }
+  /** The provider the owner chose, when it is set up; null means this computer's Chrome. */
+  private choiceOf(store: Store): BrowserChoice {
+    const providers = store.providers ?? {};
+    return store.choice ?? (providers.browserbase ? 'browserbase' : providers.kernel ? 'kernel' : 'local');
+  }
+  private activePolicyOf(store: Store): Policy | null {
+    const choice = this.choiceOf(store);
+    return isCloudBrowserProvider(choice) ? store.providers?.[choice] ?? null : null;
+  }
+  private activePolicy(): Policy | null { return this.activePolicyOf(this.store); }
+  private policyFor(provider: CloudBrowserProvider): Policy | null { return this.store.providers?.[provider] ?? null; }
+  private getKeyFor(provider: CloudBrowserProvider): () => Promise<string | undefined> {
+    if (provider === 'browserbase') return this.getKey;
+    const custom = this.dependencies.getProviderApiKey;
+    const secretName = CLOUD_BROWSER_PROVIDER_INFO[provider].secretName as Parameters<typeof readSecret>[0];
+    return custom ? () => custom(provider) : () => readSecret(secretName);
+  }
+  private setKeyFor(provider: CloudBrowserProvider, value: string): Promise<void> {
+    if (provider === 'browserbase') return this.setKey(value);
+    const custom = this.dependencies.setProviderApiKey;
+    const secretName = CLOUD_BROWSER_PROVIDER_INFO[provider].secretName as Parameters<typeof writeSecret>[0];
+    return custom ? custom(provider, value) : writeSecret(secretName, value);
+  }
+  private clientFor(provider: CloudBrowserProvider, key: string): Api {
+    const custom = this.dependencies.providerApis?.[provider];
+    if (custom) return custom;
+    if (provider === 'browserbase') return this.dependencies.api ?? new BrowserbaseApiClient({ getApiKey: async () => key });
+    return new KernelApiClient({ getApiKey: async () => key });
+  }
   private async api(resource?: PrivateResource): Promise<{ api: Api; credentialIdentity: string }> {
+    const provider = resource?.provider ?? this.activePolicy()?.provider;
+    if (!provider) throw new BrowserbaseServiceError('configuration_missing');
     let key: string | undefined;
-    try { key = (await this.readKey())?.trim(); } catch { throw new BrowserbaseServiceError('credential_unavailable'); }
+    try { key = (await this.readKey(provider))?.trim(); } catch { throw new BrowserbaseServiceError('credential_unavailable'); }
     if (!key?.trim()) throw new BrowserbaseServiceError('credential_missing');
     const credentialIdentity = hash(key);
     if (resource && credentialIdentity !== resource.credentialIdentity) throw new BrowserbaseServiceError('credential_changed');
-    return { api: this.dependencies.api ?? new BrowserbaseApiClient({ getApiKey: async () => key }), credentialIdentity };
+    return { api: this.clientFor(provider, key), credentialIdentity };
   }
-  private async readKey(): Promise<string | undefined> {
-    if (!this.keyRead) {
-      const current = Promise.resolve().then(this.getKey); this.keyRead = current;
+  private async readKey(provider: CloudBrowserProvider): Promise<string | undefined> {
+    if (!this.keyReads.get(provider)) {
+      const current = Promise.resolve().then(this.getKeyFor(provider)); this.keyReads.set(provider, current);
       // A timed-out lookup stays deduplicated until it actually settles. This
       // never piles up additional Keychain reads behind one blocked backend.
-      void current.then(() => { if (this.keyRead === current) this.keyRead = undefined; }, () => { if (this.keyRead === current) this.keyRead = undefined; });
+      void current.then(() => { if (this.keyReads.get(provider) === current) this.keyReads.delete(provider); }, () => { if (this.keyReads.get(provider) === current) this.keyReads.delete(provider); });
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await Promise.race([this.keyRead, new Promise<never>((_resolve,reject) => { timer = setTimeout(() => reject(new BrowserbaseServiceError('credential_unavailable')), this.credentialTimeoutMs); })]);
+      return await Promise.race([this.keyReads.get(provider)!, new Promise<never>((_resolve,reject) => { timer = setTimeout(() => reject(new BrowserbaseServiceError('credential_unavailable')), this.credentialTimeoutMs); })]);
     } catch { throw new BrowserbaseServiceError('credential_unavailable'); }
     finally { if (timer) clearTimeout(timer); }
   }
@@ -269,40 +325,69 @@ export class BrowserbaseService {
     if (error instanceof BrowserbaseClientError) return new BrowserbaseServiceError(error.code, error.dispatched && effect === 'uncertain' ? 'uncertain' : 'none', error.httpStatus);
     return new BrowserbaseServiceError('browser_service_unavailable', effect);
   }
-  async status(): Promise<{ configured: boolean; credentialConfigured: boolean; credentialStatus: 'available' | 'missing' | 'unavailable' | 'not_checked'; projectId: string | null; idleSeconds: number; sessionTimeoutSeconds: number; activeResources: number; privacy: { logSession: false; recordSession: false } }> {
-    // Chat docks poll this passive health surface. An unconfigured integration
+  async status(): Promise<{
+    configured: boolean; choice: BrowserChoice; provider: CloudBrowserProvider | null;
+    providers: Partial<Record<CloudBrowserProvider, { configured: boolean; credentialConfigured: boolean; credentialStatus: 'available' | 'missing' | 'unavailable' | 'not_checked'; projectId: string | null }>>;
+    credentialConfigured: boolean; credentialStatus: 'available' | 'missing' | 'unavailable' | 'not_checked'; projectId: string | null; idleSeconds: number; sessionTimeoutSeconds: number; activeResources: number; privacy: { logSession: boolean; recordSession: boolean };
+  }> {
+    // Chat docks poll this passive health surface. An unconfigured provider
     // must not touch Keychain merely because an ordinary conversation is open.
-    if (!this.store.policy) return { configured: false, credentialConfigured: false, credentialStatus: 'not_checked', projectId: null,
-      idleSeconds: DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds: DEFAULT_SESSION_TIMEOUT_SECONDS, activeResources: this.store.resources.filter(nonterminal).length,
-      privacy: { logSession: false, recordSession: false } };
-    let credentialConfigured = false, credentialStatus: 'available' | 'missing' | 'unavailable' = 'missing';
-    try { credentialConfigured = Boolean((await this.readKey())?.trim()); credentialStatus = credentialConfigured ? 'available' : 'missing'; } catch { credentialStatus = 'unavailable'; }
-    return { configured: Boolean(this.store.policy && credentialConfigured), credentialConfigured, credentialStatus, projectId: this.store.policy?.projectId ?? null,
-      idleSeconds: this.store.policy?.idleSeconds ?? DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds: this.store.policy?.sessionTimeoutSeconds ?? DEFAULT_SESSION_TIMEOUT_SECONDS,
+    const choice = this.choiceOf(this.store);
+    const providers: Awaited<ReturnType<BrowserbaseService['status']>>['providers'] = {};
+    for (const [name, policy] of Object.entries(this.store.providers ?? {})) {
+      if (!isCloudBrowserProvider(name) || !policy) continue;
+      let credentialConfigured = false, credentialStatus: 'available' | 'missing' | 'unavailable' = 'missing';
+      try { credentialConfigured = Boolean((await this.readKey(name))?.trim()); credentialStatus = credentialConfigured ? 'available' : 'missing'; } catch { credentialStatus = 'unavailable'; }
+      providers[name] = { configured: credentialConfigured, credentialConfigured, credentialStatus, projectId: policy.projectId };
+    }
+    const active = this.activePolicy();
+    const activeStatus = active ? providers[active.provider] : undefined;
+    return {
+      configured: Boolean(active && activeStatus?.configured), choice, provider: active && activeStatus?.configured ? active.provider : null, providers,
+      credentialConfigured: activeStatus?.credentialConfigured ?? false, credentialStatus: activeStatus?.credentialStatus ?? 'not_checked',
+      projectId: active?.projectId ?? null, idleSeconds: active?.idleSeconds ?? DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds: active?.sessionTimeoutSeconds ?? DEFAULT_SESSION_TIMEOUT_SECONDS,
       activeResources: this.store.resources.filter(nonterminal).length, privacy: { logSession: false, recordSession: false } };
   }
-  async configure(input: { apiKey?: string; projectId: string; idleSeconds?: number; sessionTimeoutSeconds?: number }): Promise<Awaited<ReturnType<BrowserbaseService['status']>>> {
+  /** The owner's pick: a connected cloud provider, or this computer's Chrome.
+   *  Browsers already open keep their own provider until they end. */
+  async select(choice: BrowserChoice): Promise<Awaited<ReturnType<BrowserbaseService['status']>>> {
     return this.serial('configuration', async () => {
-      if (!UUID.test(input.projectId)) throw new BrowserbaseServiceError('invalid_project');
-      const idleSeconds = input.idleSeconds ?? this.store.policy?.idleSeconds ?? DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds = input.sessionTimeoutSeconds ?? this.store.policy?.sessionTimeoutSeconds ?? DEFAULT_SESSION_TIMEOUT_SECONDS;
-      if (!Number.isInteger(idleSeconds) || !Number.isInteger(sessionTimeoutSeconds) || idleSeconds < 60 || sessionTimeoutSeconds > 21600 || idleSeconds > sessionTimeoutSeconds) throw new BrowserbaseServiceError('invalid_lifetime_policy');
-      if (this.store.resources.some(holdsProviderSession)) throw new BrowserbaseServiceError('configuration_has_live_resources');
+      if (!isBrowserChoice(choice)) throw new BrowserbaseServiceError('invalid_arguments');
+      if (isCloudBrowserProvider(choice) && !this.store.providers?.[choice]) throw new BrowserbaseServiceError('provider_not_configured');
+      this.store.choice = choice; this.persist(); return this.status();
+    });
+  }
+  async configure(input: { provider?: CloudBrowserProvider; apiKey?: string; projectId?: string; idleSeconds?: number; sessionTimeoutSeconds?: number }): Promise<Awaited<ReturnType<BrowserbaseService['status']>>> {
+    return this.serial('configuration', async () => {
+      const provider = input.provider ?? 'browserbase';
+      if (!isCloudBrowserProvider(provider)) throw new BrowserbaseServiceError('invalid_arguments');
+      // Browserbase names a project; Kernel's key is organization-scoped and
+      // a project is optional (the key's default project otherwise).
+      const projectId = provider === 'kernel' ? (input.projectId?.trim() || KERNEL_DEFAULT_PROJECT) : input.projectId ?? '';
+      if (provider === 'browserbase' ? !UUID.test(projectId) : !PROVIDER_ID.test(projectId)) throw new BrowserbaseServiceError('invalid_project');
+      const prior = this.store.providers?.[provider];
+      const idleSeconds = input.idleSeconds ?? prior?.idleSeconds ?? DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds = input.sessionTimeoutSeconds ?? prior?.sessionTimeoutSeconds ?? DEFAULT_SESSION_TIMEOUT_SECONDS;
+      if (!Number.isInteger(idleSeconds) || !Number.isInteger(sessionTimeoutSeconds) || idleSeconds < 60 || sessionTimeoutSeconds > 21600 || idleSeconds > sessionTimeoutSeconds) throw new BrowserbaseServiceError('invalid_arguments');
+      if (this.store.resources.some(value => value.provider === provider && holdsProviderSession(value))) throw new BrowserbaseServiceError('configuration_has_live_resources');
       if (input.apiKey !== undefined && (!input.apiKey.trim() || input.apiKey.length > 2000)) throw new BrowserbaseServiceError('invalid_credential');
-      await this.verifyBeforeSave(input.apiKey?.trim(), input.projectId);
-      if (input.apiKey !== undefined) { try { await this.setKey(input.apiKey.trim()); this.keyRead = undefined; } catch { throw new BrowserbaseServiceError('credential_save_failed'); } }
-      const contextId = this.store.policy?.projectId === input.projectId ? this.store.policy.contextId : undefined;
-      this.store.policy = { projectId: input.projectId, idleSeconds, sessionTimeoutSeconds, ...(contextId ? { contextId } : {}) }; this.persist(); return this.status();
+      await this.verifyBeforeSave(provider, input.apiKey?.trim(), projectId);
+      if (input.apiKey !== undefined) { try { await this.setKeyFor(provider, input.apiKey.trim()); this.keyReads.delete(provider); } catch { throw new BrowserbaseServiceError('credential_save_failed'); } }
+      const contextId = prior?.projectId === projectId ? prior.contextId : undefined;
+      this.store.providers = { ...(this.store.providers ?? {}), [provider]: { provider, projectId, idleSeconds, sessionTimeoutSeconds, ...(contextId ? { contextId } : {}) } };
+      // The first connected provider becomes the browser; a choice the owner
+      // already made (another provider, or this computer's Chrome) stands.
+      if (this.store.choice === undefined) this.store.choice = provider;
+      this.persist(); return this.status();
     });
   }
   /** A key or project Browserbase itself refuses is never saved. When
    *  Browserbase cannot be reached the save goes ahead unverified, and the
    *  first browser start reports the provider's answer. */
-  private async verifyBeforeSave(candidateKey: string | undefined, projectId: string): Promise<void> {
+  private async verifyBeforeSave(provider: CloudBrowserProvider, candidateKey: string | undefined, projectId: string): Promise<void> {
     let key = candidateKey;
-    if (key === undefined) { try { key = (await this.readKey())?.trim(); } catch { return; } }
+    if (key === undefined) { try { key = (await this.readKey(provider))?.trim(); } catch { return; } }
     if (!key) return;
-    const verifyKey = key;
-    const api = this.dependencies.api ?? new BrowserbaseApiClient({ getApiKey: async () => verifyKey });
+    const api = this.clientFor(provider, key);
     if (!api.verifyProject) return;
     try { await api.verifyProject(projectId); }
     catch (error) {
@@ -327,19 +412,19 @@ export class BrowserbaseService {
         }
         return this.public(prior);
       }
-      const policy = this.store.policy; if (!policy) throw new BrowserbaseServiceError('configuration_missing');
+      const policy = this.activePolicy(); if (!policy) throw new BrowserbaseServiceError('configuration_missing');
       const { api, credentialIdentity } = await this.api();
       // One open browser at a time holds the saved sign-in profile: two
       // sessions on one Browserbase context can log each other out.
       const contextId = this.store.resources.some(value => value.usesProfile && (holdsProviderSession(value) || value.state === 'starting')) ? undefined : await this.profile(api, policy);
-      const resource: PrivateResource = { id: this.uuid(), conversationId: input.conversationId, provider: 'browserbase', providerSessionId: null,
+      const resource: PrivateResource = { id: this.uuid(), conversationId: input.conversationId, provider: policy.provider, providerSessionId: null,
         projectId: policy.projectId, state: 'starting', controller: 'agent', controlVersion: 1, createdAt: this.iso(), updatedAt: this.iso(),
         recording: Boolean(input.recording), pages: [], requestKey, credentialIdentity, lastActivityAt: this.now(), expiresAt: this.now() + policy.sessionTimeoutSeconds * 1000,
         pending: { id: this.uuid(), operation: 'create', targetId: null, controlVersion: 1, startedAt: this.now() }, ...(contextId ? { usesProfile: true } : {}) };
       this.store.resources.push(resource); this.persist(); // Must land before POST.
       try {
         const created = await api.create({ projectId: resource.projectId, recording: resource.recording, timeoutSeconds: policy.sessionTimeoutSeconds, ...(contextId ? { contextId } : {}) });
-        if (!UUID.test(created.sessionId) || created.projectId !== resource.projectId) throw new BrowserbaseServiceError('provider_identity_changed', 'uncertain');
+        if (!PROVIDER_ID.test(created.sessionId) || created.projectId !== resource.projectId) throw new BrowserbaseServiceError('provider_identity_changed', 'uncertain');
         resource.providerSessionId = created.sessionId; resource.pending = undefined; this.settleProvider(resource, created); this.persist('uncertain'); return this.public(resource);
       } catch (error) {
         const failed = this.serviceError(error, 'uncertain');
@@ -356,14 +441,15 @@ export class BrowserbaseService {
     if (!api.createContext) return undefined;
     try {
       const contextId = await api.createContext(policy.projectId);
-      if (this.store.policy?.projectId !== policy.projectId) return undefined;
-      this.store.policy = { ...this.store.policy, contextId }; this.persist(); return contextId;
+      const current = this.store.providers?.[policy.provider];
+      if (!current || current.projectId !== policy.projectId) return undefined;
+      this.store.providers = { ...this.store.providers, [policy.provider]: { ...current, contextId } }; this.persist(); return contextId;
     } catch { return undefined; }
   }
   /** Every open browser on this machine, across conversations, and the
    *  running sessions Clem started that no open record holds. */
   async overview(): Promise<BrowserbaseOverview> {
-    const policy = this.store.policy;
+    const policy = this.activePolicy();
     const open = this.store.resources.filter(nonterminal);
     const browsers = open.map((resource): BrowserbaseOpenBrowser => ({ ...this.public(resource),
       idleClosesAt: resource.providerSessionId && policy ? new Date(Math.min(resource.lastActivityAt + policy.idleSeconds * 1000, resource.expiresAt)).toISOString() : null,
@@ -399,13 +485,13 @@ export class BrowserbaseService {
    *  conversation. It arrives under the owner's control. */
   async adoptUnlinked(input: { providerSessionId: string; conversationId: string }): Promise<BrowserbaseResource> {
     return this.serial('configuration', async () => {
-      if (!UUID.test(input.providerSessionId) || !input.conversationId || input.conversationId.length > 200) throw new BrowserbaseServiceError('invalid_arguments');
-      const policy = this.store.policy; if (!policy) throw new BrowserbaseServiceError('configuration_missing');
+      if (!PROVIDER_ID.test(input.providerSessionId) || !input.conversationId || input.conversationId.length > 200) throw new BrowserbaseServiceError('invalid_arguments');
+      const policy = this.activePolicy(); if (!policy) throw new BrowserbaseServiceError('configuration_missing');
       if (this.store.resources.some(value => nonterminal(value) && value.providerSessionId === input.providerSessionId)) throw new BrowserbaseServiceError('session_already_owned');
       const { api, credentialIdentity } = await this.api();
       const observed = await api.retrieve(input.providerSessionId, policy.projectId);
       if (observed.status !== 'RUNNING') throw new BrowserbaseServiceError('resource_not_ready');
-      const resource: PrivateResource = { id: this.uuid(), conversationId: input.conversationId, provider: 'browserbase', providerSessionId: input.providerSessionId,
+      const resource: PrivateResource = { id: this.uuid(), conversationId: input.conversationId, provider: policy.provider, providerSessionId: input.providerSessionId,
         projectId: policy.projectId, state: 'active', controller: 'human', controlVersion: 1, createdAt: observed.createdAt ?? this.iso(), updatedAt: this.iso(),
         recording: false, pages: [], requestKey: hash(JSON.stringify(['adopted', input.providerSessionId, this.uuid()])), credentialIdentity,
         lastActivityAt: this.now(), expiresAt: observed.expiresAt ? Date.parse(observed.expiresAt) : this.now() + policy.sessionTimeoutSeconds * 1000,
@@ -417,8 +503,8 @@ export class BrowserbaseService {
    *  session another tool started in the project is never touched. */
   async closeUnlinked(providerSessionId: string): Promise<BrowserbaseCloseUnlinkedResult> {
     return this.serial<BrowserbaseCloseUnlinkedResult>('configuration', async () => {
-      if (!UUID.test(providerSessionId)) throw new BrowserbaseServiceError('invalid_arguments');
-      const policy = this.store.policy; if (!policy) throw new BrowserbaseServiceError('configuration_missing');
+      if (!PROVIDER_ID.test(providerSessionId)) throw new BrowserbaseServiceError('invalid_arguments');
+      const policy = this.activePolicy(); if (!policy) throw new BrowserbaseServiceError('configuration_missing');
       if (this.store.resources.some(value => nonterminal(value) && value.providerSessionId === providerSessionId)) throw new BrowserbaseServiceError('session_already_owned');
       const { api } = await this.api();
       if (!api.listRunning) throw new BrowserbaseServiceError('browser_service_unavailable');
@@ -506,7 +592,7 @@ export class BrowserbaseService {
           targetId = undefined; lease.targetId = null;
         }
       }
-      const view = await api.liveView(resource.providerSessionId!, { expiresIn: 60, ...(targetId ? { targetId: targetId } : {}) });
+      const view = await api.liveView(resource.providerSessionId!, { expiresIn: 60, mode, ...(targetId ? { targetId: targetId } : {}) });
       if (targetId && view.targetId !== targetId) throw new BrowserbaseServiceError('viewer_target_unavailable');
       // URL expiry does not prove an already-connected iframe detached.
       lease.expiresAt = Date.parse(view.expiresAt);
@@ -635,7 +721,7 @@ export class BrowserbaseService {
       if (crossed) { resource.pending = undefined; resource.state = 'active'; resource.errorCode = undefined; resource.lastEffect = { operation, effect: 'confirmed', targetId: value.targetId, at: this.now() }; }
       if (value.targetId && operation !== 'tabs') resource.focusTargetId = value.targetId;
       this.persist(crossed ? 'uncertain' : 'none');
-      return { resource: this.public(resource), result: value.result, receipt: { version: 1, kind: 'browserbase_dispatch_receipt', resourceId: resource.id, provider: 'browserbase',
+      return { resource: this.public(resource), result: value.result, receipt: { version: 1, kind: 'browserbase_dispatch_receipt', resourceId: resource.id, provider: resource.provider,
         providerSessionId: resource.providerSessionId!, projectId: resource.projectId, operation, targetId: value.targetId, controlVersion: resource.controlVersion, effect: value.effect, at: this.iso() } };
     } catch (error) {
       const failed = this.serviceError(error, crossed ? 'uncertain' : 'none');
@@ -645,11 +731,11 @@ export class BrowserbaseService {
     }
   }
   async maintenance(): Promise<void> {
-    const policy = this.store.policy; if (!policy) return;
     for (const candidate of this.store.resources.filter(nonterminal)) {
       await this.serial(candidate.id, async () => {
         const resource = this.resource(candidate.id, candidate.conversationId);
         if (!nonterminal(resource)) return;
+        const policy = this.policyFor(resource.provider) ?? this.activePolicy(); if (!policy) return;
         if (!resource.providerSessionId) {
           // Nothing to observe without a session id; the provider's own
           // session timeout bounds any session an unanswered create started.

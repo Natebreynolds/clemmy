@@ -11,8 +11,21 @@ export interface CloudBrowserResource {
 export function browserFocusPage(resource: Pick<CloudBrowserResource, 'pages' | 'focusTargetId'>): CloudBrowserResource['pages'][number] | undefined {
   return resource.pages.find((page) => page.targetId === resource.focusTargetId) ?? resource.pages[0];
 }
+export type CloudBrowserProvider = 'browserbase' | 'kernel';
+export type CloudBrowserChoice = CloudBrowserProvider | 'local';
+export interface CloudBrowserProviderStatus {
+  configured: boolean; credentialConfigured?: boolean;
+  credentialStatus?: 'available' | 'missing' | 'unavailable' | 'not_checked'; projectId?: string | null;
+}
 export interface CloudBrowserStatus {
-  configured: boolean; projectId?: string; idleSeconds?: number; sessionTimeoutSeconds?: number;
+  /** The chosen cloud provider is set up: a cloud browser is the browser here. */
+  configured: boolean;
+  /** What the owner chose: a provider, or this computer's Chrome. */
+  choice?: CloudBrowserChoice;
+  /** The cloud provider in use when `configured`, else null. */
+  provider?: CloudBrowserProvider | null;
+  providers?: Partial<Record<CloudBrowserProvider, CloudBrowserProviderStatus>>;
+  projectId?: string; idleSeconds?: number; sessionTimeoutSeconds?: number;
   /** Whether the saved API key can be read back from the computer's credential store. */
   credentialConfigured?: boolean; credentialStatus?: 'available' | 'missing' | 'unavailable' | 'not_checked';
 }
@@ -89,7 +102,9 @@ export function createCloudBrowserClient(request: BrowserRequest, base: string) 
   const resourceResponse = (result: { resource: unknown }, conversationId: string, id?: string) => ({ resource: readBrowserResource(result.resource, conversationId, id) });
   return {
     status: () => request<CloudBrowserStatus>(`${base}/status`),
-    configure: (apiKey: string, projectId: string) => post<CloudBrowserStatus>('/configuration', { apiKey, projectId }),
+    configure: (provider: CloudBrowserProvider, apiKey: string, projectId?: string) =>
+      post<CloudBrowserStatus>('/configuration', { provider, apiKey, ...(projectId ? { projectId } : {}) }),
+    select: (choice: CloudBrowserChoice) => post<CloudBrowserStatus>('/selection', { browser: choice }),
     list: (conversationId: string) => request<{ resources: unknown[] }>(`${base}/resources${query(conversationId)}`).then((result) => ({ resources: result.resources.map((item) => readBrowserResource(item, conversationId)) })),
     start: (conversationId: string, requestId: string, recording: boolean) => post<{ resource: unknown }>('/resources', { conversationId, requestId, recording }).then((result) => resourceResponse(result, conversationId)),
     read: (resource: CloudBrowserResource) => request<{ resource: unknown }>(`${base}/resources/${encodeURIComponent(resource.id)}${query(resource.conversationId)}`).then((result) => resourceResponse(result, resource.conversationId, resource.id)),

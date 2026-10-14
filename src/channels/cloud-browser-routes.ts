@@ -47,9 +47,14 @@ export function registerCloudBrowserRoutes(
   const path = `${prefix}/cloud-browser`;
   router.get(`${path}/status`, guard, noStore, handler(async (_req, res) => { res.json(await service().status()); }));
   router.post(`${path}/configuration`, guard, noStore, handler(async (req, res) => {
-    const input = z.strictObject({ apiKey: z.string().min(1).max(4096).optional(), projectId: z.string().min(1).max(128),
+    const input = z.strictObject({ provider: z.enum(['browserbase', 'kernel']).optional(), apiKey: z.string().min(1).max(4096).optional(), projectId: z.string().min(1).max(128).optional(),
       idleSeconds: z.number().int().min(60).max(21600).optional(), sessionTimeoutSeconds: z.number().int().min(60).max(21600).optional() }).parse(req.body);
     res.json(await service().configure(input));
+  }));
+  // The owner's pick among the connected cloud providers, or this computer's Chrome.
+  router.post(`${path}/selection`, guard, noStore, handler(async (req, res) => {
+    const input = z.strictObject({ browser: z.enum(['browserbase', 'kernel', 'local']) }).parse(req.body);
+    res.json(await service().select(input.browser));
   }));
   router.get(`${path}/resources`, guard, noStore, handler(async (req, res) => {
     const input = bound(req, z.strictObject({ conversationId: conversation }), true) as { conversationId: string };

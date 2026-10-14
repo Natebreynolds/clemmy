@@ -549,3 +549,60 @@ test('a provider limit is explained by its HTTP status: 402 is the plan, 429 is 
   assert.match(browserbaseErrorText('provider_limit'), /plan or concurrency limit/);
   assert.match(browserbaseErrorText('provider_limit', 500), /plan or concurrency limit/);
 });
+
+// ── Providers: Browserbase, Kernel, or this computer's Chrome ────────────────
+function kernelApi(counts: { creates: number }) {
+  const session = () => ({ sessionId: 'cmh3k2j9a0001abc', projectId: 'default', status: 'RUNNING' as const, connectUrl: 'wss://abc.onkernel.com:8443/cdp?token=never-public' });
+  return {
+    async create(input: { projectId: string }) { counts.creates++; assert.equal(input.projectId, 'default'); return session(); },
+    async retrieve() { return session(); },
+    async release() {},
+    async liveView(_id: string, options: { targetId?: string; mode?: 'watch' | 'human' } = {}) {
+      return { url: `https://abc.kernel.sh:8443/live${options.mode === 'watch' ? '?readOnly=true' : ''}`, expiresAt: new Date(Date.now() + 60000).toISOString(), ...(options.targetId ? { targetId: options.targetId } : {}) };
+    },
+    async verifyProject() {},
+  };
+}
+test('a second provider connects beside the first; the owner\'s choice decides which one opens browsers, and each browser keeps its own provider', async () => {
+  const t = setup(); const kernelCounts = { creates: 0 }; let kernelKey: string | undefined;
+  const service = new BrowserbaseService({ ...t.options, providerApis: { kernel: kernelApi(kernelCounts) },
+    getProviderApiKey: async (provider) => provider === 'kernel' ? kernelKey : 'private-test-key', setProviderApiKey: async (provider, value) => { if (provider === 'kernel') kernelKey = value; } });
+  try {
+    await service.configure({ projectId: project });
+    let status = await service.status();
+    assert.equal(status.choice, 'browserbase', 'the first connected provider is the browser');
+    assert.deepEqual(Object.keys(status.providers), ['browserbase']);
+    status = await service.configure({ provider: 'kernel', apiKey: 'kernel-private-key' });
+    assert.equal(kernelKey, 'kernel-private-key', 'the key goes to the provider\'s own secret');
+    assert.equal(status.choice, 'browserbase', 'connecting a second provider does not change the choice');
+    assert.equal(status.providers.kernel?.configured, true); assert.equal(status.providers.kernel?.projectId, 'default');
+    status = await service.select('kernel');
+    assert.equal(status.choice, 'kernel'); assert.equal(status.provider, 'kernel'); assert.equal(status.configured, true);
+    const browser = await service.create({ conversationId: 'task-k', requestId: 'source-k' });
+    assert.equal(browser.provider, 'kernel'); assert.equal(kernelCounts.creates, 1); assert.equal(t.counts().creates, 0, 'Browserbase was not asked');
+    const view = await service.view(browser.id, 'task-k', { expectedVersion: browser.controlVersion, viewerLeaseId: randomUUID() });
+    assert.match(view.url, /readOnly=true/, 'the agent-controlled browser is watched read-only');
+    status = await service.select('local');
+    assert.equal(status.choice, 'local'); assert.equal(status.provider, null); assert.equal(status.configured, false, 'this computer\'s Chrome is the browser');
+    assert.equal(status.providers.kernel?.configured, true, 'the connections stay');
+    await assert.rejects(service.create({ conversationId: 'task-l', requestId: 'source-l' }), /configuration_missing/);
+    await assert.rejects(service.select('zzz' as never), /invalid_arguments/, 'an unknown choice is refused');
+    const file = JSON.parse(readFileSync(path.join(t.baseDir, 'state/browserbase/resources.json'), 'utf8'));
+    assert.equal(file.choice, 'local'); assert.deepEqual(Object.keys(file.providers).sort(), ['browserbase', 'kernel']);
+    assert.equal(file.policy, null, 'the mirrored policy follows the choice');
+  } finally { service.dispose(); t.close(); }
+});
+test('a store written before providers existed loads as one Browserbase connection that is the browser', async () => {
+  const t = setup(); try {
+    fs.mkdirSync(path.join(t.baseDir, 'state/browserbase'), { recursive: true });
+    writeFileSync(path.join(t.baseDir, 'state/browserbase/resources.json'), JSON.stringify({ version: 1, revision: 3, resources: [],
+      policy: { projectId: project, idleSeconds: 900, sessionTimeoutSeconds: 7200 } }));
+    const service = new BrowserbaseService(t.options);
+    try {
+      const status = await service.status();
+      assert.equal(status.choice, 'browserbase'); assert.equal(status.provider, 'browserbase'); assert.equal(status.configured, true);
+      assert.equal(status.providers.browserbase?.projectId, project);
+      await assert.rejects(service.select('kernel'), /provider_not_configured/);
+    } finally { service.dispose(); }
+  } finally { t.close(); }
+});

@@ -139,6 +139,14 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     keyUrl: 'https://www.browserbase.com/settings',
   },
   {
+    name: 'kernel_api_key',
+    description: 'Kernel API key — optional cloud browser with live viewing and explicit human takeover, an alternative to Browserbase.',
+    envVarName: 'KERNEL_API_KEY',
+    required: false,
+    setupHint: 'Create an API key at https://dashboard.onkernel.com. Choose Kernel as the browser on the Connect screen once it is connected.',
+    keyUrl: 'https://dashboard.onkernel.com',
+  },
+  {
     name: 'typesafe_api_key',
     description: 'TypeSafe Jev API key — fast typed decisions (Choice / Score / Noul) that skip the Settings judge on confident completion, ranking, and primer questions.',
     envVarName: 'TYPESAFE_API_KEY',

@@ -1,3 +1,4 @@
+import { cloudBrowserLiveViewConnectOrigins, cloudBrowserLiveViewFrameOrigins } from '../integrations/cloud-browser-provider.js';
 import express from 'express';
 import { containAsyncRouteRejections } from './contain-async-route-rejections.js';
 import { registerConnectionSetupRoutes } from './connection-setup-routes.js';
@@ -1426,7 +1427,7 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
         // where frame navigation cannot carry device proof.
         // First-party task browser uses only provider-minted Browserbase views.
         // Authored HTML retains its own independent frame-src 'none' sandbox.
-        "frame-src 'self' blob: https://www.browserbase.com https://browserbase.com",
+        `frame-src 'self' blob: ${cloudBrowserLiveViewFrameOrigins().join(' ')}`,
         "object-src 'none'",
         // Allow remote app/toolkit logos (Composio CDN, etc.) to load. Loopback
         // Electron surface — images are inert; this just stops broken-logo icons.
@@ -1437,7 +1438,7 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
         // through a blob: URL (MediaSource); without this the audio is
         // refused by default-src and nothing is heard.
         "media-src 'self' blob:",
-        "connect-src 'self'",
+        `connect-src 'self' ${cloudBrowserLiveViewConnectOrigins().join(' ')}`.trimEnd(),
       ].join('; '),
     );
     next();
