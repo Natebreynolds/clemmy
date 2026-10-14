@@ -44,12 +44,26 @@ test('measured catalog is exactly equal and diagnostics cannot mutate authority 
   assert.equal(measured[0]!.preview, 'Fixture answer.');
   assert.deepEqual(authoritativeRows(), before);
   const headers = metrics.headers();
-  for (const phase of ['catalog_pages', 'catalog_lineage', 'catalog_lineage_rows', 'catalog_lineage_proofs',
+  for (const phase of ['catalog_pages', 'catalog_lineage', 'catalog_lineage_proofs',
     'catalog_desktop', 'catalog_search', 'catalog_preview', 'catalog_sort', 'catalog_build']) {
     assert.match(headers['Server-Timing']!, new RegExp(`${phase};dur=[\\d.]+`));
   }
+  // The catalog already holds every lineage row; only actual fallback SQL
+  // reads produce this phase. Skipped work must not acquire a fake duration.
+  assert.match(headers['Server-Timing']!, /catalog_lineage_rows;desc="unobserved"/);
+  assert.doesNotMatch(headers['Server-Timing']!, /catalog_lineage_rows;dur=/);
+  assert.doesNotMatch(headers['X-Clementine-Projection-Counts']!, /catalog_lineage_rows_calls=/);
   assert.match(headers['Server-Timing']!, /catalog_status;desc="unobserved"/);
   assert.doesNotMatch(JSON.stringify(headers), /fixture-only|metrics-owner|metrics-chat|Fixture answer|private query/);
+  const directMetrics = new ProjectionReadMetrics();
+  const direct = readAcceptedSourceConversationProjection(row.id);
+  assert.ok(direct);
+  assert.deepEqual(readAcceptedSourceConversationProjection(row.id, { observer: directMetrics.observe }), direct);
+  const directHeaders = directMetrics.headers();
+  assert.match(directHeaders['Server-Timing']!, /catalog_lineage_rows;dur=[\d.]+/);
+  assert.match(directHeaders['X-Clementine-Projection-Counts']!, /catalog_lineage_rows_calls=[1-9]\d*/);
+  assert.doesNotMatch(JSON.stringify(directHeaders), /fixture-only|metrics-owner|metrics-chat|Fixture answer|private query/);
+  assert.deepEqual(authoritativeRows(), before);
   assert.deepEqual(buildUnifiedSessionList(query, { observer: () => { throw new Error('observer'); } }), normal);
   assert.deepEqual(readAcceptedSourceConversationProjection(row.id, { observer: () => { throw new Error('observer'); } }),
     readAcceptedSourceConversationProjection(row.id));

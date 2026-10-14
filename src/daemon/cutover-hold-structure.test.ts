@@ -122,6 +122,11 @@ test('held parent and migration child have exact minimal runtime import closures
       // on every phase change, so the beacon rides along — a leaf whose only
       // import is node:worker_threads, adding no package to this closure.
       'src/daemon/liveness-beacon.ts',
+      // phase.ts also starts this optional diagnostic beside the beacon.
+      // Its only imports are Node filesystem/performance built-ins; it reads
+      // and writes the diagnostic journal only when explicitly started with
+      // a beacon path, and adds no task runtime or package dependency.
+      'src/daemon/loop-holds.ts',
       'src/daemon/phase.ts',
       'src/daemon/process.ts',
       // The held parent reads its home through the credential policy
