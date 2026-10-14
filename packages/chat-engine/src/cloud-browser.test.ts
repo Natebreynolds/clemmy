@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { browserLiveUrl, isBrowserDisconnected, browserResourceKey, canApplyBrowserResponse, canApplyBrowserControlResponse, browserInputAllowed, browserBoundInputAllowed, browserStopMessage, createCloudBrowserClient, createBrowserViewerLeases, canStartBrowserInTask, readBrowserResource, type CloudBrowserResource, type CloudBrowserView } from './cloud-browser.js';
+import { browserLiveUrl, isBrowserDisconnected, browserResourceKey, canApplyBrowserResponse, canApplyBrowserControlResponse, browserInputAllowed, browserBoundInputAllowed, browserStopMessage, createCloudBrowserClient, createBrowserViewerLeases, canStartBrowserInTask, readBrowserResource, type CloudBrowserResource, type CloudBrowserView, cloudBrowserProviderLabel } from './cloud-browser.js';
 const resource: CloudBrowserResource = { id: 'r', conversationId: 'c', provider: 'browserbase', providerSessionId: 'ps', projectId: 'p', state: 'active', controller: 'agent', controlVersion: 2, createdAt: '', updatedAt: '', recording: false, elapsedSeconds: 10, pages: [{ targetId: 'page-a', title: 'Page', url: 'https://example.org' }] };
 test('provider-returned live bearer URLs accept only approved HTTPS origins without inventing a path', () => {
   assert.ok(browserLiveUrl('https://www.browserbase.com/live?session=secret'));
@@ -158,4 +158,22 @@ test('the panel names the page Clem is on, else the first page', async () => {
   assert.equal(browserFocusPage({ pages, focusTargetId: 'b' })?.title, 'Facebook');
   assert.equal(browserFocusPage({ pages, focusTargetId: 'closed' })?.title, 'Blank');
   assert.equal(browserFocusPage({ pages: [] }), undefined);
+});
+
+test('a Kernel browser is read like a Browserbase one, and an unknown provider is refused', () => {
+  const kernel = { ...resource, provider: 'kernel' };
+  assert.equal(readBrowserResource(kernel, resource.conversationId).provider, 'kernel');
+  assert.throws(() => readBrowserResource({ ...resource, provider: 'elsewhere' }, resource.conversationId));
+  assert.equal(cloudBrowserProviderLabel('kernel'), 'Kernel');
+  assert.equal(cloudBrowserProviderLabel('browserbase'), 'Browserbase');
+});
+
+test('a Kernel live view on its hosts and port is accepted; other ports, plain http and lookalikes are not', () => {
+  assert.equal(browserLiveUrl('https://prod-iad-hypeman-19.kernel.sh:8443/browser/live/synthetic'),
+    'https://prod-iad-hypeman-19.kernel.sh:8443/browser/live/synthetic');
+  for (const value of ['https://prod-iad-hypeman-19.kernel.sh/browser/live/x', 'http://prod.kernel.sh:8443/x',
+    'https://kernel.sh.evil.example:8443/x', 'https://www.browserbase.com:8443/x']) {
+    assert.equal(browserLiveUrl(value), null, value);
+  }
+  assert.notEqual(browserLiveUrl('https://www.browserbase.com/devtools-fullscreen/?token=synthetic'), null);
 });

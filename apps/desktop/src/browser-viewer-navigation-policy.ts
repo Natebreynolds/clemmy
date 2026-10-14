@@ -12,18 +12,36 @@ export interface BrowserViewerFrame {
   readonly top: BrowserViewerFrame | null;
 }
 
+/** Each cloud browser provider mints its live view on its own hosts, on one
+ *  port. Nothing else is a viewer. */
+const VIEWER_PROVIDERS = [
+  { provider: 'browserbase', host: (host: string) => host === 'www.browserbase.com' || host === 'browserbase.com', port: '' },
+  { provider: 'kernel', host: (host: string) => host.endsWith('.kernel.sh') || host.endsWith('.onkernel.com'), port: '8443' },
+] as const;
+
+/** The providers whose live view this shell embeds; the dashboard reads it to
+ *  decide whether to mount a viewer or say it shows after an update. */
+export const EMBEDDED_BROWSER_VIEWER_PROVIDERS: readonly string[] = VIEWER_PROVIDERS.map((entry) => entry.provider);
+
+function viewerProviderFor(rawUrl: string | null | undefined): (typeof VIEWER_PROVIDERS)[number] | null {
+  try {
+    const host = new URL(rawUrl ?? '').hostname;
+    return VIEWER_PROVIDERS.find((entry) => entry.host(host)) ?? null;
+  } catch { return null; }
+}
+
 /** Recognize the provider boundary even when a URL is unsafe to embed. A
  * rejected viewer URL is a private capability, never an external link. */
 export function isBrowserViewerNavigationUrl(rawUrl: string | null | undefined): boolean {
-  try { return ['www.browserbase.com', 'browserbase.com'].includes(new URL(rawUrl ?? '').hostname); }
-  catch { return false; }
+  return viewerProviderFor(rawUrl) !== null;
 }
 
 function safeViewerUrl(rawUrl: string): boolean {
   try {
     const url = new URL(rawUrl);
-    return !/[\u0000-\u0020\u007f]/.test(rawUrl) && isBrowserViewerNavigationUrl(rawUrl)
-      && url.protocol === 'https:' && !url.port && !url.username && !url.password && !url.hash;
+    const provider = viewerProviderFor(rawUrl);
+    return !/[\u0000-\u0020\u007f]/.test(rawUrl) && provider !== null
+      && url.protocol === 'https:' && url.port === provider.port && !url.username && !url.password && !url.hash;
   } catch { return false; }
 }
 

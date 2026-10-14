@@ -12,6 +12,9 @@ export interface UpdaterEvent {
 }
 
 interface ClemmyBridge {
+  /** Cloud browser providers whose live view this desktop shell may embed.
+   *  Absent in shells that predate it, which embed Browserbase only. */
+  browserViewerProviders?: readonly string[];
   supervisorStatus?: () => Promise<{ running: boolean; port: number; url: string }>;
   restartDaemon?: () => Promise<unknown>;
   openLogs?: () => Promise<unknown>;
@@ -46,6 +49,17 @@ export function clemmy(): ClemmyBridge | null {
   if (typeof window === 'undefined') return null;
   const bridge = (window as Window & { clemmy?: unknown }).clemmy;
   return bridge && typeof bridge === 'object' ? (bridge as ClemmyBridge) : null;
+}
+
+/** Whether this host can show a provider's live view inside the app. A plain
+ *  browser or the phone can; the desktop shell only embeds the providers its
+ *  navigation guard admits, and would otherwise hand the viewer elsewhere. */
+export function embedsBrowserViewer(provider: string): boolean {
+  const bridge = clemmy();
+  if (!bridge) return true;
+  return Array.isArray(bridge.browserViewerProviders)
+    ? bridge.browserViewerProviders.includes(provider)
+    : provider === 'browserbase';
 }
 
 /** True when running inside the Electron desktop shell. */

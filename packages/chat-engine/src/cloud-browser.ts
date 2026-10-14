@@ -1,6 +1,6 @@
 /** Portable first-party browser view contract. Secrets and live URLs are never persisted here. */
 export interface CloudBrowserResource {
-  id: string; conversationId: string; provider: 'browserbase'; providerSessionId: string | null; projectId: string;
+  id: string; conversationId: string; provider: CloudBrowserProvider; providerSessionId: string | null; projectId: string;
   state: 'starting' | 'active' | 'stopping' | 'stopped' | 'expired' | 'uncertain'; controller: 'agent' | 'human';
   controlVersion: number; createdAt: string; updatedAt: string; recording: boolean; elapsedSeconds: number;
   pages: Array<{ targetId: string; title: string; url: string }>; errorCode?: string; returnPending?: boolean;
@@ -13,6 +13,11 @@ export function browserFocusPage(resource: Pick<CloudBrowserResource, 'pages' | 
 }
 export type CloudBrowserProvider = 'browserbase' | 'kernel';
 export type CloudBrowserChoice = CloudBrowserProvider | 'local';
+export const CLOUD_BROWSER_PROVIDERS: readonly CloudBrowserProvider[] = ['browserbase', 'kernel'];
+/** The provider's name as the owner knows it. */
+export function cloudBrowserProviderLabel(provider: CloudBrowserProvider | null | undefined): string {
+  return provider === 'kernel' ? 'Kernel' : provider === 'browserbase' ? 'Browserbase' : 'the cloud browser provider';
+}
 export interface CloudBrowserProviderStatus {
   configured: boolean; credentialConfigured?: boolean;
   credentialStatus?: 'available' | 'missing' | 'unavailable' | 'not_checked'; projectId?: string | null;
@@ -44,7 +49,7 @@ type BrowserRequest = <T>(path: string, init?: RequestInit) => Promise<T>;
 export function readBrowserResource(value: unknown, conversationId: string, id?: string): CloudBrowserResource {
   const row = value as Partial<CloudBrowserResource> | null;
   if (!row || typeof row.id !== 'string' || !row.id || (id !== undefined && row.id !== id)
-    || row.conversationId !== conversationId || row.provider !== 'browserbase'
+    || row.conversationId !== conversationId || !CLOUD_BROWSER_PROVIDERS.includes(row.provider as CloudBrowserProvider)
     || (row.providerSessionId !== null && typeof row.providerSessionId !== 'string') || typeof row.projectId !== 'string'
     || !['starting', 'active', 'stopping', 'stopped', 'expired', 'uncertain'].includes(row.state ?? '')
     || !['human', 'agent'].includes(row.controller ?? '') || !Number.isInteger(row.controlVersion) || (row.controlVersion ?? -1) < 0
@@ -175,10 +180,16 @@ export function browserBoundInputAllowed(resource: CloudBrowserResource, targetI
   return browserInputAllowed(resource, targetId) && view?.targetId === targetId
     && view.controlVersion === resource.controlVersion && browserLiveUrl(view.url) !== null && Date.parse(view.expiresAt) > Date.now();
 }
+/** Each provider mints its live view on its own hosts and one port; the
+ *  desktop shell admits the same set (browser-viewer-navigation-policy.ts). */
+const LIVE_VIEW_HOSTS: ReadonlyArray<{ host: (hostname: string) => boolean; port: string }> = [
+  { host: (hostname) => hostname === 'www.browserbase.com' || hostname === 'browserbase.com', port: '' },
+  { host: (hostname) => hostname.endsWith('.kernel.sh') || hostname.endsWith('.onkernel.com'), port: '8443' },
+];
 export function browserLiveUrl(value: string): string | null {
   try {
     const url = new URL(value);
-    return url.protocol === 'https:' && ['www.browserbase.com', 'browserbase.com'].includes(url.hostname) && !url.port
+    return url.protocol === 'https:' && LIVE_VIEW_HOSTS.some((entry) => entry.host(url.hostname) && url.port === entry.port)
       && !url.username && !url.password && !url.hash ? url.href : null;
   } catch { return null; }
 }

@@ -20,6 +20,9 @@ import { isWorkspaceViewUrl } from './workspace-view-url.cjs';
  */
 
 const api = {
+  /** Cloud browser providers whose live view this shell embeds (see
+   *  browser-viewer-navigation-policy.ts). */
+  browserViewerProviders: ['browserbase', 'kernel'] as const,
   /** Current daemon status (running flag, chosen port, dashboard URL). */
   supervisorStatus: () => ipcRenderer.invoke('clemmy:supervisor-status') as Promise<{ running: boolean; port: number; url: string }>,
   /** Stop + start the daemon. Renderer should show a spinner — main

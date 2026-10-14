@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { browserViewerNavigationDecision, createBrowserViewerNavigationGuard, isBrowserViewerNavigationUrl, type BrowserViewerFrame } from './browser-viewer-navigation-policy.js';
+import { browserViewerNavigationDecision, createBrowserViewerNavigationGuard, EMBEDDED_BROWSER_VIEWER_PROVIDERS, isBrowserViewerNavigationUrl, type BrowserViewerFrame } from './browser-viewer-navigation-policy.js';
 import { isPrivilegedDashboardRendererUrl } from './workspace-navigation-policy.js';
 
 const origins = new Set(['http://127.0.0.1:43123']);
@@ -156,4 +156,22 @@ test('only removed frames or a committed main-document replacement clear the den
   assert.equal(guard.navigation(empty), 'allow');
   guard.clear();
   assert.equal(guard.redirect(escape), 'unhandled', 'a new main document gets a clean tracker');
+});
+
+test('the trusted dashboard mounts a Kernel live view on Kernel hosts and port only; lookalikes fail closed', () => {
+  const { input } = fixture();
+  const kernel = 'https://prod-iad-hypeman-19.kernel.sh:8443/browser/live/synthetic-private-view';
+  assert.equal(isBrowserViewerNavigationUrl(kernel), true);
+  assert.equal(browserViewerNavigationDecision({ ...input, targetUrl: kernel }), 'allow');
+  assert.equal(browserViewerNavigationDecision({ ...input, targetUrl: 'https://live.onkernel.com:8443/browser/live/synthetic' }), 'allow');
+  for (const targetUrl of [
+    'https://prod-iad-hypeman-19.kernel.sh/browser/live/synthetic',
+    'https://prod-iad-hypeman-19.kernel.sh:9443/browser/live/synthetic',
+    'http://prod-iad-hypeman-19.kernel.sh:8443/browser/live/synthetic',
+    'https://kernel.sh.evil.example:8443/browser/live/synthetic',
+    'https://user:pass@prod-iad-hypeman-19.kernel.sh:8443/browser/live/synthetic',
+  ]) {
+    assert.equal(browserViewerNavigationDecision({ ...input, targetUrl }), isBrowserViewerNavigationUrl(targetUrl) ? 'block' : 'unhandled', targetUrl);
+  }
+  assert.ok(EMBEDDED_BROWSER_VIEWER_PROVIDERS.includes('kernel'));
 });
