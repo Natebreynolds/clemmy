@@ -3605,7 +3605,7 @@ const runHostTurnBody = async (
     // model loop still checks every call's exact current capability, but must
     // not pin a second, process-wide inventory. Discovery can replace a read's
     // metadata without invalidating the whole workflow step (Platform 49).
-    const workflowControllerOwned = getSession(identity.sessionId)?.kind === 'workflow';
+    const workflowControllerOwned = getSession(identity.sessionId, { withoutConversationState: true })?.kind === 'workflow';
     const progressivePlanningRoot = freshPlan || settledPlanControl || investigationOnly || workflowControllerOwned;
     const planActivated = progressivePlanningRoot && actionExpectedWorkRequired(identity);
     const emptyModelSurface = tools.length === 0;

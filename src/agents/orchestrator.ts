@@ -2329,7 +2329,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   }
   const workflowDiscoveryIdentity = !carrierWork && options.sessionId
     && Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
-    && getSession(options.sessionId)?.kind === 'workflow'
+    && getSession(options.sessionId, { withoutConversationState: true })?.kind === 'workflow'
     && mcpToolScopeAuthority(mcpToolScope) !== 'none'
     ? { sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq! }
     : undefined;
