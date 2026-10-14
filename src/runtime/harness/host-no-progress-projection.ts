@@ -880,10 +880,9 @@ function schemaInvalidStage(repairKeys: readonly string[]): string {
  * refusal (the pinned loop-breaker: it terminalizes), while a call the model
  * repaired — `recovery: 'repair_model'` is exactly that instruction — is a new
  * request the provider has not answered yet, and it spends the bounded
- * budgets like any other distinct consequence. Live 2026-10-06: "delete that
- * reminder" → not_found → the brain tried the other copy's id → not_found
- * again, and that second answer was read as the first one repeating, so the
- * turn stopped as blocked before Clem could say "both are already gone".
+ * budgets like any other distinct consequence. Two records answered
+ * not_found in turn are two answers, not one answer repeating; read as a
+ * repeat, the turn stops before Clem can say both are already gone.
  * Response wording and status churn stay out of the identity, as before. */
 function providerRefusedRequestIdentity(call: HistoryCall): string {
   const effective = unwrapRuntimeEffectiveToolIdentity(call.name, call.arguments);
@@ -1201,9 +1200,9 @@ function settlementConsequence(input: {
   // uncertain in the ledger (no replay), but its effect state is known to
   // the model — the provider said no — and nothing is owed to
   // reconciliation (the settlement's directive says so). The model reads the
-  // target and answers; it may repair the request once within its authority.
-  // Live 2026-10-07: a Slack `not_found` on an approved delete ended the turn
-  // "its effect must be reconciled" from this very consequence. A change of
+  // target and answers; it may repair the request once within its authority,
+  // and a not_found on an approved delete is never "its effect must be
+  // reconciled". A change of
   // plan may need something only the owner knows (which file, which
   // recipient), so the question is on the surface too; the changed write
   // itself waits for the owner at the consent gate.
@@ -1220,10 +1219,8 @@ function settlementConsequence(input: {
   // A provider that REPLIED without proving the effect — a success by
   // protocol whose own bytes say failure — is the same kind of answer: the
   // model has the reply and reads the target before claiming anything;
-  // nothing is owed to the reconcile stop. Live 2026-10-13: an approved
-  // backend delete the app answered `not found` under a clean error flag
-  // settled as the provider's contradiction, reached the model, and this
-  // projection still ended the turn "may have begun… must be reconciled".
+  // nothing is owed to the reconcile stop, even when the reply contradicts
+  // its own flag (not found under a clean error flag).
   const repliedUnverified = settlement.outcome_kind === 'uncertain_write'
     && settlement.outcome_detail === 'provider_envelope_contradiction';
   if (repliedUnverified) {
@@ -1403,10 +1400,9 @@ function settlementConsequence(input: {
       // A LOCAL change that failed is observable. A command the host ran on
       // this Mac with nothing leaving the machine (zero physical crossings)
       // left its state right here for Clem to read: she looks, then finishes
-      // or repairs it, and the governor still bounds a loop. Live 2026-10-08:
-      // `printf … > greeting.txt && cat -A` wrote the file, then exited 1 on a
-      // flag macOS lacks; the turn was stopped as an unknown mutation although
-      // Clem had read the output and knew the file was written. Local work is
+      // or repairs it, and the governor still bounds a loop. A command that
+      // wrote its file and then exited non-zero on a later flag is not an
+      // unknown mutation when Clem has read the output. Local work is
       // ordinary work (owner 2026-09-29).
       if (settlement.execution_kind === 'local_execution' && settlement.physical_crossing_count === 0) {
         return createNoProgressConsequence({

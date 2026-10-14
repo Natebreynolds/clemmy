@@ -830,7 +830,7 @@ let lastExternalMcpDefinitionDrift = 0;
  *  no longer listed, or listed differently). The next search refreshes its
  *  namespace listing instead of reusing a fresh-looking one: search is the
  *  recovery path after drift, and a reused listing kept advertising the
- *  retired tool for up to a minute (journey 2026-10-10, after fa2ff0a9f). */
+ *  retired tool for up to a minute. */
 export function noteExternalMcpDefinitionDrift(now = Date.now()): void {
   lastExternalMcpDefinitionDrift = Math.max(lastExternalMcpDefinitionDrift, now);
 }
@@ -1060,9 +1060,9 @@ export async function invalidateConfiguredMcpServers(): Promise<void> {
  * above is the fallback for a name no live shim carries (a server added since
  * the shims were built): there is nothing narrower to restart.
  *
- * Live 2026-10-13: the model reconnected one warming server to get its tools,
- * and the clear-everything path restarted every other server's handshake too,
- * so the next search stubbed again. Returns what was done, in the user's words.
+ * Reconnecting one warming server through the clear-everything path restarts
+ * every other server's handshake too, so the next search stubs again. Returns
+ * what was done, in the user's words.
  */
 export async function reconnectConfiguredMcpServer(name: string): Promise<'reconnected' | 'cleared_all'> {
   const slug = slugifyServerName(name);

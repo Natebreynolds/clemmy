@@ -993,10 +993,9 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
   /** The connection died under a call: the SDK's CONNECTION_CLOSED, or a body
    *  that found the transport gone. The old process is not coming back, so
    *  there is nothing to pace: drop the connect record and let the very next
-   *  use reconnect at once. Live 2026-10-13: the read that a write freeze was
-   *  waiting for failed once with "Not connected" and "MCP authoritative tool
-   *  inventory is unavailable", because the death was first seen at the next
-   *  listing and then paced by the backoff ladder. */
+   *  use reconnect at once; a death first seen at the next listing and then
+   *  paced by the backoff ladder fails the very read a write freeze waits
+   *  for ("Not connected", "inventory is unavailable"). */
   function isTransportDeathError(error: unknown): boolean {
     const code = (error as { code?: unknown } | null)?.code;
     const message = error instanceof Error ? error.message : String(error ?? '');
@@ -1017,8 +1016,8 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     cachedTools = null;
     cachedToolToServer = null;
     // The SDK's server object keeps its dead session until it is closed, and
-    // connect() on it leaves the next call "Not connected" (live 2026-10-13,
-    // second proof). Close it, then connect, as the in-flight connect every
+    // connect() on it leaves the next call "Not connected". Close it, then
+    // connect, as the in-flight connect every
     // later use awaits; a failure here records itself the ordinary way.
     const reconnect = (async () => {
       if (typeof server.close === 'function') {
@@ -1132,8 +1131,8 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     // The connecting flavor names the door that waits for the handshake:
     // tool_search holds for a warming server up to its own deadline, so the
     // model searches again instead of reconnecting the server (which dropped
-    // every connection) or ending the turn with "it is warming up" (live
-    // 2026-10-13: nine discovery calls and ninety seconds before one delete).
+    // every connection) or ending the turn with "it is warming up" after
+    // minutes of discovery calls.
     const description = warming
       ? `[${slug}] CONNECTING — ${server.name} is still establishing its connection. ` +
         `This is not an outage: search again for its tools with tool_search, which waits for ` +
@@ -1442,8 +1441,8 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         exactHandoff.used = true;
         // The carrier owns settlement on this route, but the connection is
         // still this shim's: a death under the call is noted here too, or
-        // the next use finds a dead session and a backoff (live 2026-10-13,
-        // third proof: every carried write took this path).
+        // the next use finds a dead session and a backoff; every carried
+        // write takes this path.
         try {
           return await server.callTool(parsed.toolName, args);
         } catch (error) {
