@@ -160,6 +160,19 @@ function createLocalServer(): MCPServerStdio | null {
   });
 }
 
+/** A remote server's headers may name a declared environment value, the way a
+ *  stdio launch's arguments do: `Bearer ${KERNEL_API_KEY}` reads the value the
+ *  owner entered for that key. An unknown name is left as written. */
+function expandedHeaders(server: ManagedMcpServer): Record<string, string> | undefined {
+  if (!server.headers) return undefined;
+  const env = mergedEnv(server.env);
+  const expanded: Record<string, string> = {};
+  for (const [name, value] of Object.entries(server.headers)) {
+    expanded[name] = value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, key: string) => (typeof env[key] === 'string' ? env[key] : match));
+  }
+  return expanded;
+}
+
 function createExternalServer(server: ManagedMcpServer): MCPServer | null {
   if (!server.enabled) return null;
 
@@ -176,12 +189,13 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
   }
 
   if (server.type === 'http' && server.url) {
+    const headers = expandedHeaders(server);
     return new MCPServerStreamableHttp({
       name: server.name,
       url: server.url,
       clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
       timeout: MCP_REQUEST_TIMEOUT_MS,
-      requestInit: server.headers ? { headers: server.headers } : undefined,
+      requestInit: headers ? { headers } : undefined,
     });
   }
 
@@ -191,7 +205,7 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
       url: server.url,
       clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
       timeout: MCP_REQUEST_TIMEOUT_MS,
-      eventSourceInit: server.headers ? { fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, { ...init, headers: server.headers }) } : undefined,
+      eventSourceInit: expandedHeaders(server) ? { fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, { ...init, headers: expandedHeaders(server) }) } : undefined,
     });
   }
 
@@ -1131,6 +1145,13 @@ export const mcpServersTestHooks = {
     cachedScopedExternalShims.clear();
     cachedFailOpenExternalShim = null;
     cachedFailOpenKey = '';
+  },
+  /** The headers a remote server will send, after declared-environment expansion. */
+  rawExternalHttpHeaders(allowedServerSlugs?: string[]): Array<{ name: string; headers: Record<string, string> | undefined }> {
+    return discoverMcpServers()
+      .filter((server) => server.enabled && (server.type === 'http' || server.type === 'sse'))
+      .filter((server) => serverMatchesAllowedSlugs(server, allowedServerSlugs))
+      .map((server) => ({ name: server.name, headers: expandedHeaders(server) }));
   },
   rawExternalStdioLaunches(allowedServerSlugs?: string[]): Array<{
     name: string;

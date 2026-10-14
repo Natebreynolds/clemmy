@@ -669,3 +669,14 @@ test('reconnecting one named server restarts it in the live base and leaves ever
     release();
   }
 });
+
+test('a remote server\'s headers read declared environment values by name, like a stdio launch\'s arguments', () => {
+  writeMcpServers({
+    kernelish: { name: 'kernelish', type: 'http', url: 'https://example.test/mcp', enabled: true, description: 'remote',
+      headers: { Authorization: 'Bearer ${KERNELISH_KEY}', 'X-Plain': 'as-written', 'X-Unknown': '${NOT_DECLARED}' },
+      env: { KERNELISH_KEY: 'declared-value' } },
+  } as never);
+  invalidateMcpServerDiscoveryCache();
+  const [row] = mcpServersTestHooks.rawExternalHttpHeaders(['kernelish']);
+  assert.deepEqual(row?.headers, { Authorization: 'Bearer declared-value', 'X-Plain': 'as-written', 'X-Unknown': '${NOT_DECLARED}' });
+});

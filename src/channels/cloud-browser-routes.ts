@@ -2,6 +2,7 @@ import type { Request, RequestHandler, Response, Router } from 'express';
 import { z } from 'zod';
 import { BrowserbaseServiceError, getBrowserbaseService } from '../integrations/browserbase.js';
 import { getSession } from '../runtime/harness/eventlog.js';
+import { registerKernelMcpServer, type KernelMcpRegistration } from '../integrations/kernel-mcp.js';
 
 const conversation = z.string().min(1).max(256);
 const resourceId = z.string().min(1).max(128);
@@ -14,7 +15,7 @@ const owned = { conversationId: conversation, expectedVersion: version };
  * execution authority for an old task. */
 export function registerCloudBrowserRoutes(
   router: Pick<Router, 'get' | 'post'>, guard: RequestHandler, prefix: string,
-  dependencies: { service?: ReturnType<typeof getBrowserbaseService>; hasConversation?: (id: string) => boolean; conversationTitle?: (id: string) => string | null } = {},
+  dependencies: { service?: ReturnType<typeof getBrowserbaseService>; hasConversation?: (id: string) => boolean; conversationTitle?: (id: string) => string | null; registerKernelMcp?: (apiKey: string) => KernelMcpRegistration } = {},
 ): void {
   const service = () => dependencies.service ?? getBrowserbaseService();
   const hasConversation = dependencies.hasConversation ?? (id => Boolean(getSession(id)));
@@ -49,7 +50,15 @@ export function registerCloudBrowserRoutes(
   router.post(`${path}/configuration`, guard, noStore, handler(async (req, res) => {
     const input = z.strictObject({ provider: z.enum(['browserbase', 'kernel']).optional(), apiKey: z.string().min(1).max(4096).optional(), projectId: z.string().min(1).max(128).optional(),
       idleSeconds: z.number().int().min(60).max(21600).optional(), sessionTimeoutSeconds: z.number().int().min(60).max(21600).optional() }).parse(req.body);
-    res.json(await service().configure(input));
+    const status = await service().configure(input);
+    // Kernel's own MCP server rides along with the key, so its wider toolset
+    // (computer actions, Playwright, profiles, replays) is on the catalog too.
+    let mcp: KernelMcpRegistration | { registered: false; error: 'mcp_registration_failed' } | undefined;
+    if (input.provider === 'kernel' && input.apiKey && status.providers.kernel?.configured) {
+      try { mcp = (dependencies.registerKernelMcp ?? registerKernelMcpServer)(input.apiKey); }
+      catch { mcp = { registered: false, error: 'mcp_registration_failed' }; }
+    }
+    res.json(mcp ? { ...status, mcp } : status);
   }));
   // The owner's pick among the connected cloud providers, or this computer's Chrome.
   router.post(`${path}/selection`, guard, noStore, handler(async (req, res) => {
