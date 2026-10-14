@@ -791,6 +791,20 @@ export function parseWorkflowInputsSchemaJson(
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new Error('Workflow inputs schema must be a JSON object mapping input names to {type, default, description}.');
   }
+  const unsupportedInputs: string[] = [];
+  for (const [name, metadata] of Object.entries(parsed)) {
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) continue;
+    const definition = metadata as Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(definition, 'type')
+      && definition.type !== 'string' && definition.type !== 'number') {
+      unsupportedInputs.push(JSON.stringify(name));
+    }
+  }
+  if (unsupportedInputs.length > 0) {
+    throw new Error(`Workflow inputs ${unsupportedInputs.join(', ')} have unsupported explicit type declarations. `
+      + 'Supported annotations are "string" and "number"; native run values are text. '
+      + 'For structured values, use type:"string", supply JSON text and apply jsonParse to that input before row operators.');
+  }
   return parsed as Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
 }
 

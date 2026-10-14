@@ -19,7 +19,8 @@ const { traceToWorkflowDraft } = await import('../execution/trace-to-workflow.js
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 const { fireWorkflowSystemEvent } = await import('../execution/workflow-trigger-engine.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
-const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
+const { WORKFLOW_RUNS_DIR, CRON_TRIGGERS_DIR, localNonWriteStatus } = await import('./shared.js');
+const { default: InputDeclarationDatabase } = await import('better-sqlite3');
 const { readWorkflowRunOriginRecords } = await import('./workflow-run-queue.js');
 const { exactOriginDeliveryTargetDigest } = await import('../runtime/exact-origin-delivery.js');
 const { parseHostLocalWriteCommitFacts } = await import('../runtime/harness/host-local-write-commit.js');
@@ -2682,4 +2683,180 @@ test('workflow list supplies exact count and queryable names without prose extra
   assert.deepEqual(summary.workflows[0].trigger, { manual: true });
   resetState();
   assert.deepEqual(JSON.parse((await handler({})).content[0].text), { total: 0, workflows: [] });
+});
+
+
+// These snapshots cover saved authoring state, not provider/SDK dispatch authority.
+function inputDeclarationDurableSnapshot() {
+  const files: Array<{ path: string; sha256: string }> = [];
+  const visit = (directory: string): void => {
+    if (!existsSync(directory)) return;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const file = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(file);
+      else if (entry.isFile()) files.push({
+        path: path.relative(TMP_HOME, file),
+        sha256: createHash('sha256').update(readFileSync(file)).digest('hex'),
+      });
+      else assert.fail('controlled authoring state contains an unexpected non-file entry');
+    }
+  };
+  for (const directory of [WORKFLOWS_DIR, WORKFLOW_RUNS_DIR, CRON_TRIGGERS_DIR]) visit(directory);
+  files.sort((left, right) => left.path.localeCompare(right.path));
+  const databasePath = path.join(TMP_HOME, 'state', 'workflow-triggers.db');
+  let triggerRows: unknown = null;
+  if (existsSync(databasePath)) {
+    const database = new InputDeclarationDatabase(databasePath, { readonly: true, fileMustExist: true });
+    try {
+      triggerRows = {
+        triggers: database.prepare('SELECT * FROM workflow_triggers ORDER BY id').all(),
+        events: database.prepare('SELECT * FROM workflow_trigger_events ORDER BY id').all(),
+      };
+    } finally { database.close(); }
+  }
+  return { files, triggerRows };
+}
+
+function inputDeclarationSteps() {
+  return [{ id: 'select_rows', sideEffect: 'read', transform: JSON.stringify({
+    version: 1, expression: {
+      op: 'select', value: { op: 'jsonParse', value: { op: 'get', from: 'input.rows' } },
+      where: { column: 'group', op: 'eq', value: 'pilot' }, columns: ['id', 'group', 'amount'],
+    },
+  }), output: { type: 'array' } }];
+}
+
+function assertInputDeclarationRefusal(result: ToolResult, fields: string[]): void {
+  assert.equal(localNonWriteStatus(result), 'invalid_inputs', 'the native handler preserves a typed non-write');
+  assert.equal(result.isError, true);
+  assert.equal(parseHostLocalWriteCommitFacts(resultText(result)), null, 'a refusal supplies no commit receipt');
+  const message = resultText(result);
+  for (const field of fields) assert.ok(message.includes(field), 'all offending input names are returned together: ' + field);
+  assert.match(message, /string/i);
+  assert.match(message, /number/i);
+  assert.match(message, /JSON/i);
+  assert.match(message, /jsonParse/);
+}
+
+const unsupportedInputDeclarations = {
+  rows: { type: 'array', description: 'Runtime rows.' },
+  record: { type: 'object' }, flag: { type: 'boolean' }, custom: { type: 'integer' },
+  null_type: { type: null }, numeric_type: { type: 7 }, list_type: { type: ['string'] },
+};
+
+test('native input declarations reject unsupported create metadata before persistence', async () => {
+  const before = inputDeclarationDurableSnapshot();
+  const result = await workflowCreate()({
+    name: 'Input Declaration Rejected Create', description: 'Select controlled rows.',
+    enabled: false, allowSends: false, steps: inputDeclarationSteps(),
+    trigger_webhook_path: 'input-declaration-rejected-create',
+    inputs: JSON.stringify(unsupportedInputDeclarations),
+  });
+  assertInputDeclarationRefusal(result, Object.keys(unsupportedInputDeclarations));
+  assert.equal(readWorkflow('input-declaration-rejected-create'), null);
+  assert.deepEqual(inputDeclarationDurableSnapshot(), before,
+    'refusal cannot create a definition, native file, trigger registration or run');
+});
+
+test('native input declarations refuse invalid updates without changing saved bytes or trigger state', async () => {
+  const slug = 'input-declaration-rejected-update';
+  const created = await workflowCreate()({ name: slug, description: 'The retained description.',
+    enabled: false, allowSends: false, steps: inputDeclarationSteps(),
+    inputs: JSON.stringify({ rows: { type: 'string', description: 'JSON rows.' } }),
+  });
+  assert.equal(created.isError, undefined);
+  const receipt = parseHostLocalWriteCommitFacts(resultText(created));
+  assert.ok(receipt);
+  const saved = readWorkflow(slug)!;
+  const bytes = readFileSync(saved.filePath);
+  assert.equal(receipt.contentDigest, createHash('sha256').update(bytes).digest('hex'));
+  const before = inputDeclarationDurableSnapshot();
+  const result = await workflowUpdate()({ name: slug, description: 'Must not be saved.',
+    trigger_webhook_path: 'input-declaration-must-not-register',
+    inputs: JSON.stringify(unsupportedInputDeclarations),
+  });
+  assertInputDeclarationRefusal(result, Object.keys(unsupportedInputDeclarations));
+  assert.deepEqual(readWorkflow(slug)!.data, saved.data);
+  assert.deepEqual(readFileSync(saved.filePath), bytes);
+  assert.deepEqual(inputDeclarationDurableSnapshot(), before,
+    'an invalid inputs patch cannot partly save its description, trigger or any native/run state');
+});
+
+test('native input declarations recover through supported metadata with normal commit and readback', async () => {
+  const slug = 'input-declaration-recovery';
+  const request = { name: slug, description: 'Select controlled JSON-text rows.',
+    enabled: false, allowSends: false, steps: inputDeclarationSteps() };
+  const refused = await workflowCreate()({ ...request, inputs: JSON.stringify({ rows: { type: 'array' } }) });
+  assertInputDeclarationRefusal(refused, ['rows']);
+  assert.equal(readWorkflow(slug), null, 'the same name remains available for the corrected declaration');
+  const supported = {
+    rows: { type: 'string', required: true, description: 'JSON rows parsed by jsonParse.',
+      extension: { type: 'array', preserved: false } },
+    limit: { type: 'number', default: 0, required: false },
+    flag: { default: false, required: false }, label: { description: 'No type required.', extra: 'kept' },
+  };
+  const created = await workflowCreate()({ ...request, inputs: JSON.stringify(supported) });
+  assert.equal(created.isError, undefined);
+  const createReceipt = parseHostLocalWriteCommitFacts(resultText(created));
+  assert.ok(createReceipt);
+  const first = readWorkflow(slug)!;
+  assert.equal(createReceipt.contentDigest, createHash('sha256').update(readFileSync(first.filePath)).digest('hex'));
+  const expected = { ...supported, limit: { ...supported.limit, default: '0' },
+    flag: { ...supported.flag, default: 'false' } };
+  assert.deepEqual(first.data.inputs, expected,
+    'text defaults, false required values, absent types and unknown nested metadata survive reopening');
+  const patched = { ...supported, label: { ...supported.label, extra: 'still kept' } };
+  const updated = await workflowUpdate()({ name: slug, inputs: JSON.stringify(patched) });
+  assert.equal(updated.isError, undefined);
+  const updateReceipt = parseHostLocalWriteCommitFacts(resultText(updated));
+  assert.ok(updateReceipt);
+  assert.equal(updateReceipt.createdId, createReceipt.createdId);
+  assert.equal(updateReceipt.handle, createReceipt.handle);
+  const reopened = readWorkflow(slug)!;
+  assert.deepEqual(reopened.data.inputs, { ...expected, label: patched.label });
+  assert.deepEqual(reopened.data.steps, first.data.steps);
+  assert.deepEqual(reopened.data.trigger, first.data.trigger);
+  assert.equal(reopened.data.enabled, false);
+  assert.equal(reopened.data.allowSends, false);
+  const currentBytes = readFileSync(reopened.filePath);
+  assert.equal(updateReceipt.contentDigest, createHash('sha256').update(currentBytes).digest('hex'));
+  const readback = resultText(await workflowGet()({ name: slug }));
+  assert.match(readback, /jsonParse/);
+  assert.match(readback, /Enabled: false/);
+  assert.match(readback, /Trigger: manual only/);
+  assert.deepEqual(readFileSync(reopened.filePath), currentBytes, 'readback does not repair or rewrite saved bytes');
+  assert.deepEqual(workflowRunFiles(), [], 'disabled authoring recovery never queues the transform');
+});
+
+test('native input declarations preserve omitted updates and legacy loader metadata', async () => {
+  const slug = 'input-declaration-legacy-description';
+  writeWorkflow(slug, { name: slug, description: 'Legacy metadata remains readable.', enabled: false,
+    allowSends: false, trigger: { manual: true },
+    inputs: { rows: { type: 'array', required: false }, flag: { type: 'boolean', default: 'false', required: false } },
+    steps: [{ id: 'prepare', sideEffect: 'read',
+      transform: { version: 1, expression: { op: 'literal', value: 'No execution.' } }, output: { type: 'string' } }],
+  });
+  const original = readWorkflow(slug)!;
+  const patches: Record<string, unknown>[] = [{}, { inputs: null }, { inputs: '' }, { inputs: '  ' }, { inputs: '{}' }];
+  for (const [index, patch] of patches.entries()) {
+    const description = 'Description-only revision ' + index + '.';
+    const result = await workflowUpdate()({ name: slug, description, ...patch });
+    assert.equal(result.isError, undefined, 'omitted or empty input patches do not reparse the loaded legacy schema');
+    const receipt = parseHostLocalWriteCommitFacts(resultText(result));
+    assert.ok(receipt);
+    const reopened = readWorkflow(slug)!;
+    assert.equal(reopened.data.description, description);
+    assert.deepEqual(reopened.data.inputs, original.data.inputs);
+    assert.deepEqual(reopened.data.steps, original.data.steps);
+    assert.deepEqual(reopened.data.trigger, original.data.trigger);
+    assert.equal(reopened.data.enabled, false);
+    assert.equal(receipt.contentDigest, createHash('sha256').update(readFileSync(reopened.filePath)).digest('hex'));
+  }
+  const before = inputDeclarationDurableSnapshot();
+  const invalidOuter = await workflowUpdate()({ name: slug, description: 'Must not save.', inputs: 'null' });
+  assert.equal(localNonWriteStatus(invalidOuter), 'invalid_inputs', 'JSON text null retains its existing outer-object refusal');
+  assert.equal(invalidOuter.isError, true);
+  assert.equal(parseHostLocalWriteCommitFacts(resultText(invalidOuter)), null);
+  assert.deepEqual(inputDeclarationDurableSnapshot(), before);
+  assert.deepEqual(workflowRunFiles(), []);
 });
