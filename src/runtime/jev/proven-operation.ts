@@ -35,9 +35,9 @@ import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surfa
 
 /** Bound so a slow provider refresh cannot stall the first model step. */
 const PROVEN_PROVISION_BUDGET_MS = 10_000;
-/** The most a request's first model frame waits on the turn-start Jev
- *  decision. It is a hard cut on the turn's wait, not only on the transport:
- *  an answer that arrives later is not used. */
+/** Admission budget for the optional turn-start Jev decision. Preparation
+ *  before it and event-loop stalls can take longer; an answer admitted after
+ *  this deadline is never used. */
 export const PROVEN_PICK_BUDGET_MS = 1_500;
 /** One request's candidates: every operation a named family holds, as a rule. */
 const OPERATION_ROUTE_CANDIDATES = 10;
@@ -97,7 +97,8 @@ export interface ProvenOperationPreparation {
   narrowSurface: boolean;
   /** How the remembered run was chosen; absent when none was. */
   pickedBy?: ProvenPickSource;
-  /** How long the first frame waited on the turn-start decision, when asked. */
+  /** Existing Date.now elapsed around the decision, when asked. Wall-clock
+   *  diagnostic only; not the whole preparation span or a timing guarantee. */
   decisionWaitMs?: number;
 }
 
@@ -674,8 +675,8 @@ function familiarRunStrategiesFromStrategies(
 
 type TurnStartDecisionFor = TurnStartDecision<ProvenStrategyCandidate, RoutableOperation>;
 
-/** The first frame waits on the turn-start decision for at most the budget,
- *  whatever the transport does; a later answer is not used. */
+/** Admit a turn-start result only within its budget. The race cannot preempt
+ *  synchronous work or a descheduled process; its later answer is not used. */
 async function decideWithinBudget(
   decide: () => Promise<TurnStartDecisionFor>,
   budgetMs: number,

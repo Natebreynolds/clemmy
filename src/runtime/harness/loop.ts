@@ -7189,6 +7189,7 @@ async function runConversationWithinRuntimeConfig(
         outcome: 'selected' | 'empty' | 'resolved' | 'error',
         started: number,
         ended: number,
+        decisionWaitMs?: number,
       ): void => {
         try {
           const totalMs = ended - started;
@@ -7201,6 +7202,13 @@ async function runConversationWithinRuntimeConfig(
             data: {
               version: 1, lane, clock: 'monotonic', sourceUserSeq, outcome, totalMs,
               ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
+              // This existing inner elapsed value uses Date.now, unlike the
+              // whole preparation span. Keep its clock explicit and retain it
+              // even when the optional decision selects nothing. It is not a
+              // second span to add to totalMs or a transport/cost measurement.
+              ...(decisionWaitMs !== undefined && Number.isFinite(decisionWaitMs) && decisionWaitMs >= 0
+                ? { decisionWait: { clock: 'wall', totalMs: decisionWaitMs } }
+                : {}),
             },
           });
         } catch { /* Observing an await cannot change preparation or execution. */ }
@@ -7210,6 +7218,7 @@ async function runConversationWithinRuntimeConfig(
         const started = performance.now();
         let ended: number | undefined;
         let outcome: 'selected' | 'empty' | 'error' = 'error';
+        let decisionWaitMs: number | undefined;
         try {
           const proven = await (await import('../jev/proven-operation.js')).prepareProvenOperationForRequest({
             query: String(options.semanticTaskInput ?? options.input ?? ''),
@@ -7220,6 +7229,7 @@ async function runConversationWithinRuntimeConfig(
           // Stop at the awaited preparation, before selected-event publication.
           // A transport's later retirement is a different span, not this wait.
           ended = performance.now();
+          decisionWaitMs = proven.decisionWaitMs;
           outcome = 'empty';
           if (proven.text) {
             outcome = 'selected';
@@ -7248,7 +7258,7 @@ async function runConversationWithinRuntimeConfig(
           }
         } catch { /* proven recall is fail-open */ }
         finally {
-          recordPreparationTiming('proven_operation_preparation', outcome, started, ended ?? performance.now());
+          recordPreparationTiming('proven_operation_preparation', outcome, started, ended ?? performance.now(), decisionWaitMs);
         }
       }
       const capabilityStarted = performance.now();

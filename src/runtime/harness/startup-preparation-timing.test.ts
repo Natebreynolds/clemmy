@@ -23,11 +23,17 @@ globalThis.fetch = async () => { throw new Error('Unexpected network in startup 
 const events = await import('./eventlog.js');
 const { runConversation } = await import('./loop.js');
 const strategies = await import('../../memory/run-strategy-store.js');
+const jev = await import('../jev/client.js');
 const { evaluateLearningCandidate } = await import('../../memory/learning-receipt.js');
 const strategyPath = path.join(home, 'state', 'run-strategies.json');
 const lanes = ['proven_operation_preparation', 'capability_preparation'];
 const excluded = { version: 1, mode: 'exclude', reason: 'controlled_test' } as const;
-beforeEach(() => { rmSync(strategyPath, { force: true }); });
+beforeEach(() => {
+  rmSync(strategyPath, { force: true });
+  process.env.CLEMMY_JEV = 'off';
+  jev._setSystemOneFetchForTests(undefined);
+  jev._setTypesafeKeyForTests(undefined);
+});
 after(() => {
   globalThis.fetch = originalFetch;
   events.closeEventLog();
@@ -144,6 +150,71 @@ test('startup timings preserve selected-operation publication before capability 
   assert.equal(f.calls(), 1);
   assert.equal(timings(f).length, 2);
 });
+
+for (const wallDelta of [7, 0, -7]) {
+  test(`empty startup receipt preserves or omits its actual wall decision wait (${wallDelta}ms)`, async () => {
+    const f = fixture(`empty-decision-${wallDelta}`);
+    const receipt = evaluateLearningCandidate({ target: 'strategy', authority: 'background_delivery_verifier',
+      sessionId: 'background:controlled-startup', sourceId: `controlled-startup-empty-decision-${wallDelta}`,
+      terminalSuccess: true, controllerValidation: true }).receipt;
+    assert.ok(receipt);
+    assert.ok(strategies.recordRunStrategy({ objective: 'Inspect a different controlled fixture',
+      toolsUsed: ['read_file'], workerCount: 0, durationMs: 1, learningReceipt: receipt }));
+    let decisions = 0;
+    const originalNow = Date.now;
+    let wallNow = originalNow();
+    process.env.CLEMMY_JEV = 'on';
+    jev._setTypesafeKeyForTests('controlled_startup_fixture_key');
+    jev._setSystemOneFetchForTests(async (_url, init) => {
+      decisions++;
+      const request = JSON.parse(init.body) as { questions: Record<string, { type: string }> };
+      wallNow += wallDelta;
+      return { ok: true, status: 200, text: async () => JSON.stringify({ model: 'jev-1.13.0',
+        answers: Object.fromEntries(Object.entries(request.questions).map(([key, question]) => [key,
+          question.type === 'choice'
+            ? { type: 'choice', choice: 'none', probabilities: { none: 1 }, confidence: 1 }
+            : { type: 'noul', noul: 0 }])) }) };
+    });
+    // Private offline fixture only: exact existing Date.now elapsed semantics,
+    // including a backwards wall adjustment, without waiting on real time.
+    Date.now = () => wallNow;
+    try {
+      const result = await run(f, async () => {
+        Date.now = originalNow;
+        process.env.CLEMMY_JEV = 'off';
+        const rows = timings(f);
+        assert.equal(rows.length, 1, 'decision timing stays on the existing preparation receipt');
+        const row = rows[0]!;
+        assert.equal(row.data.lane, 'proven_operation_preparation');
+        assert.equal(row.data.outcome, 'empty');
+        assert.equal(row.data.sourceUserSeq, f.source.seq);
+        assert.equal(row.data.runAttemptId, f.attempt.attemptId);
+        assert.equal(row.data.clock, 'monotonic');
+        assert.ok(Number.isFinite(row.data.totalMs) && Number(row.data.totalMs) >= 0);
+        if (wallDelta >= 0) {
+          assert.deepEqual(row.data.decisionWait, { clock: 'wall', totalMs: wallDelta },
+            'retain the exact inner elapsed value, including zero, on its own clock');
+          assert.deepEqual(Object.keys(row.data).sort(),
+            ['version', 'lane', 'clock', 'sourceUserSeq', 'outcome', 'totalMs', 'runAttemptId', 'decisionWait'].sort());
+        } else {
+          assert.equal(row.data.decisionWait, undefined, 'a backwards wall clock is unavailable, not a clamped zero');
+          assertTiming(row, f, 'empty');
+        }
+        return f.agent;
+      });
+      assert.equal(result.status, 'completed');
+      assert.equal(decisions, 1, 'recording the duration adds no decision/retry');
+      assert.equal(f.calls(), 1);
+      assert.equal(events.listEvents(f.session.id, { types: ['proven_operation_selected', 'tool_called'] }).length, 0);
+      assertTiming(timings(f)[1]!, f, 'resolved');
+    } finally {
+      Date.now = originalNow;
+      process.env.CLEMMY_JEV = 'off';
+      jev._setSystemOneFetchForTests(undefined);
+      jev._setTypesafeKeyForTests(undefined);
+    }
+  });
+}
 
 test('startup preparation error timing leaves malformed optional recall fail-open', async () => {
   const f = fixture('malformed');
