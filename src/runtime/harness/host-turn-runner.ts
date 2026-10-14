@@ -1936,7 +1936,7 @@ interface HostCompletionReviewFeedback {
   reason: string;
   /** A claims-only finding, with the reviewer's quoted claims, so a read-only
    *  answer's one revision can be checked against them without a second review. */
-  repairScope?: 'claims';
+  repairScope?: 'claims' | 'reply_format';
   quotes?: string[];
 }
 
@@ -1954,14 +1954,14 @@ function parseHostCompletionReviewFeedback(value: unknown): HostCompletionReview
     || row.replyDigest !== createHash('sha256').update(row.reply, 'utf8').digest('hex')) {
     throw new Error('paused host state has invalid completion-review feedback');
   }
-  if (row.repairScope !== undefined && row.repairScope !== 'claims') throw new Error('paused host state has invalid completion-review feedback');
+  if (row.repairScope !== undefined && row.repairScope !== 'claims' && row.repairScope !== 'reply_format') throw new Error('paused host state has invalid completion-review feedback');
   if (row.quotes !== undefined && (!Array.isArray(row.quotes) || row.quotes.some((quote) => typeof quote !== 'string'))) {
     throw new Error('paused host state has invalid completion-review feedback');
   }
   return { version: 1, sessionId: row.sessionId, sourceUserSeq: Number(row.sourceUserSeq),
     objective: row.objective, objectiveDigest: String(row.objectiveDigest),
     reply: row.reply, replyDigest: String(row.replyDigest), reason: row.reason, ...(row.phase === 'plan' ? { phase: 'plan' } : {}),
-    ...(row.repairScope === 'claims' ? { repairScope: 'claims' as const } : {}),
+    ...(row.repairScope === 'claims' || row.repairScope === 'reply_format' ? { repairScope: row.repairScope as 'claims' | 'reply_format' } : {}),
     ...(Array.isArray(row.quotes) ? { quotes: (row.quotes as string[]).slice(0, 24) } : {}) };
 }
 
@@ -5198,8 +5198,8 @@ const runHostTurnBody = async (
       objective, objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex'),
       reply: judgedReply, replyDigest: createHash('sha256').update(judgedReply, 'utf8').digest('hex'),
       reason: verdict.reason,
-      ...(verdict.repairScope === 'claims' && !planCandidate
-        ? { repairScope: 'claims' as const, quotes: reviewQuotes(verdict.reason).slice(0, 24) } : {}),
+      ...((verdict.repairScope === 'claims' || verdict.repairScope === 'reply_format') && !planCandidate
+        ? { repairScope: verdict.repairScope, quotes: reviewQuotes(verdict.reason).slice(0, 24) } : {}),
     };
     const formatPacket = responseFormatRepairPacket({ ...verdict,
       plan: Boolean(planCandidate) || turnIsPlanMode(), objective, reply: judgedReply, reason: verdict.reason,

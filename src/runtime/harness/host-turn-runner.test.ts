@@ -10783,6 +10783,29 @@ test('a read-only answer revised once to a claims-only finding ships on the host
   } finally { _setHostObjectiveJudgeForTests(null); }
 });
 
+test('a read-only answer revised to the exact replacement line a format finding spelled out ships without a second review', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const draft = 'Cloud browser on this machine:\n- Kernel selected\n- credentials configured';
+  const line = 'Cloud browser on this machine: Kernel selected; credentials configured.';
+  let judgeCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { done: false, repairScope: 'reply_format', reason: `Replace the response with one line: “${line}”` } as never;
+  });
+  try {
+    const fixture = acceptJudgedSource('format-replaced-once', 'Post the browser snapshot to the channel');
+    const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(line)]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const outcome = await runJudgedHost(fixture, agent, true);
+    assert.equal(judgeCalls, 1, 'the exact replacement is checked by the host, not reviewed again');
+    assert.equal(String(outcome.finalOutput), line);
+    const last = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] }).at(-1)!;
+    assert.equal(last.data.fulfills, true);
+    assert.equal((last.data.claimRevision as { scope: string }).scope, 'reply_format');
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
 test('a revision that still carries a quoted claim is reviewed again', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const draft = 'Kernel is the chosen browser. Both providers are connected with live credentials.';
