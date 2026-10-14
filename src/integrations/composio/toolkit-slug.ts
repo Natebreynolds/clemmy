@@ -15,10 +15,41 @@ function normalizedToolkit(value: string): string {
 /** Adapter-owned presentation namespaces for source/capability alignment.
  * These names can only veto a mismatched plan; they are never execution or
  * discovery authority. The live cached catalog extends the bootstrap list, so
- * the semantic kernel does not need a provider-name allowlist. */
-export function listRegisteredToolkitNamespaces(): CapabilityNamespaceDescriptorV1[] {
+ * the semantic kernel does not need a provider-name allowlist. The inventory
+ * is rebuilt only when the cached catalog or the connected slugs change. */
+export function listRegisteredToolkitNamespaces(): readonly CapabilityNamespaceDescriptorV1[] {
+  return currentNamespaceInventory().descriptors;
+}
+
+let namespaceInventory: {
+  catalog: readonly unknown[];
+  connectedSlugs: string;
+  descriptors: readonly CapabilityNamespaceDescriptorV1[];
+  longestFirst: readonly string[];
+} | null = null;
+
+function currentNamespaceInventory(): NonNullable<typeof namespaceInventory> {
+  const catalog = listCachedToolkits();
+  const connected = peekConnectedToolkits();
+  const connectedSlugs = connected.map((connection) => connection.slug).join('\n');
+  if (namespaceInventory?.catalog === catalog && namespaceInventory.connectedSlugs === connectedSlugs) {
+    return namespaceInventory;
+  }
+  const descriptors = Object.freeze(buildNamespaceDescriptors(catalog, connected));
+  namespaceInventory = {
+    catalog, connectedSlugs, descriptors,
+    longestFirst: Object.freeze(descriptors.map((entry) => entry.namespaceId)
+      .sort((left, right) => right.length - left.length)),
+  };
+  return namespaceInventory;
+}
+
+function buildNamespaceDescriptors(
+  catalog: ReturnType<typeof listCachedToolkits>,
+  connected: ReturnType<typeof peekConnectedToolkits>,
+): CapabilityNamespaceDescriptorV1[] {
   const byId = new Map<string, Set<string>>();
-  for (const toolkit of [...CURATED_TOOLKITS, ...listCachedToolkits()]) {
+  for (const toolkit of [...CURATED_TOOLKITS, ...catalog]) {
     const namespaceId = normalizedToolkit(toolkit.slug);
     if (!namespaceId) continue;
     const aliases = byId.get(namespaceId) ?? new Set<string>();
@@ -41,7 +72,7 @@ export function listRegisteredToolkitNamespaces(): CapabilityNamespaceDescriptor
   // catalog cache has ever been written. Its provider-owned connection slug is
   // still an exact namespace identity; include that slug without inventing a
   // display name from operation text.
-  for (const connection of peekConnectedToolkits()) {
+  for (const connection of connected) {
     const namespaceId = normalizedToolkit(connection.slug);
     if (!namespaceId) continue;
     const aliases = byId.get(namespaceId) ?? new Set<string>();
@@ -62,9 +93,7 @@ export function listRegisteredToolkitNamespaces(): CapabilityNamespaceDescriptor
 export function registeredToolkitNamespaceOfOperation(toolSlug: string): string | null {
   const normalizedTool = normalizedToolkit(toolSlug);
   if (!normalizedTool) return null;
-  return listRegisteredToolkitNamespaces()
-    .map((entry) => entry.namespaceId)
-    .sort((left, right) => right.length - left.length)
+  return currentNamespaceInventory().longestFirst
     .find((namespaceId) => (
       normalizedTool === namespaceId || normalizedTool.startsWith(`${namespaceId}_`)
     )) ?? null;

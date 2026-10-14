@@ -28,3 +28,21 @@ test('a toolkit in a days-old catalog cache is still a registered namespace', ()
   assert.equal(toolkits.isRegisteredToolkitSlug('firecrawl'), true, 'a stale cache is not an empty cache');
   assert.equal(toolkits.registeredToolkitOfSlug('FIRECRAWL_SCRAPE'), 'firecrawl');
 });
+
+test('the catalog is parsed once while the file is unchanged, and a rewritten file is read again', async () => {
+  const { listCachedToolkits } = await import('./client.js');
+  const first = listCachedToolkits();
+  assert.equal(listCachedToolkits(), first, 'an unchanged file is not parsed again');
+  assert.equal(toolkits.listRegisteredToolkitNamespaces(), toolkits.listRegisteredToolkitNamespaces(),
+    'the namespace inventory is rebuilt only when its inputs change');
+  writeFileSync(path.join(stateDir, 'composio-catalog-cache.json'), JSON.stringify({
+    at: Date.now(),
+    data: [
+      { slug: 'firecrawl', name: 'Firecrawl', authMode: 'managed', categories: [] },
+      { slug: 'one_drive', name: 'OneDrive', authMode: 'managed', categories: [] },
+    ],
+  }), 'utf8');
+  assert.notEqual(listCachedToolkits(), first);
+  assert.equal(toolkits.isRegisteredToolkitSlug('one_drive'), true, 'a toolkit added to the file is a namespace at once');
+  assert.equal(toolkits.registeredToolkitOfSlug('ONE_DRIVE_LIST_FILES'), 'one_drive', 'the longest registered prefix still wins');
+});

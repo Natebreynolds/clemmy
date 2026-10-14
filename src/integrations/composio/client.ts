@@ -1530,14 +1530,24 @@ function normalizeCatalogItem(item: RawCatalogItem): CatalogToolkit | null {
   };
 }
 
-function readCatalogCache(): CatalogToolkit[] {
+/** The parsed catalog file, held while the file on disk is the same file.
+ *  Namespace checks read it once per workflow step and per tool name; a stat
+ *  is enough to know a reread would parse the same bytes. */
+let parsedCatalogFile: { identity: string; data: readonly CatalogToolkit[] } | null = null;
+const NO_CACHED_TOOLKITS: readonly CatalogToolkit[] = Object.freeze([]);
+
+function readCatalogCache(): readonly CatalogToolkit[] {
   try {
-    if (!existsSync(CATALOG_CACHE_FILE)) return [];
+    if (!existsSync(CATALOG_CACHE_FILE)) { parsedCatalogFile = null; return NO_CACHED_TOOLKITS; }
+    const stat = statSync(CATALOG_CACHE_FILE, { bigint: true });
+    const identity = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}`;
+    if (parsedCatalogFile?.identity === identity) return parsedCatalogFile.data;
     const parsed = JSON.parse(readFileSync(CATALOG_CACHE_FILE, 'utf-8')) as { at?: number; data?: CatalogToolkit[] };
-    if (!parsed.at || !Array.isArray(parsed.data)) return [];
-    return parsed.data;
+    const data = parsed.at && Array.isArray(parsed.data) ? Object.freeze(parsed.data) : NO_CACHED_TOOLKITS;
+    parsedCatalogFile = { identity, data };
+    return data;
   } catch {
-    return [];
+    return NO_CACHED_TOOLKITS;
   }
 }
 
@@ -1551,12 +1561,13 @@ function readCatalogCache(): CatalogToolkit[] {
  *  FIRECRAWL_SCRAPE as an invalid operation and scorpion-facebook-trends died
  *  on its first read. Freshness for the live catalog is listAllToolkits'
  *  own in-memory TTL, which this never touches. */
-export function listCachedToolkits(): CatalogToolkit[] {
+export function listCachedToolkits(): readonly CatalogToolkit[] {
   return readCatalogCache();
 }
 
 function writeCatalogCache(data: CatalogToolkit[]): void {
   catalogNames = null;
+  parsedCatalogFile = null;
   mkdirSync(CACHE_DIR, { recursive: true });
   writeFileSync(CATALOG_CACHE_FILE, JSON.stringify({ at: Date.now(), data }, null, 2), { encoding: 'utf-8', mode: 0o600 });
 }
@@ -1591,7 +1602,7 @@ export async function listAllToolkits(): Promise<CatalogToolkit[]> {
   }
 
   if (result.length === 0) {
-    const stale = readCatalogCache();
+    const stale = [...readCatalogCache()];
     if (stale.length > 0) {
       catalogCache = { at: now, data: stale };
       return stale;
@@ -4162,7 +4173,7 @@ async function buildComposioDashboardSnapshotLive(): Promise<ComposioDashboardSn
       catalogError = composioReadProblem(error);
       logger.warn({ reason: redactSensitiveText(composioErrorDetail(error)).slice(0, 400), problem: catalogError },
         'composio catalog read failed; the Connect screen shows why');
-      const stale = readCatalogCache();
+      const stale = [...readCatalogCache()];
       return stale.length > 0 ? stale : CURATED_TOOLKITS.map((toolkit) => ({
         slug: toolkit.slug,
         name: toolkit.displayName,
