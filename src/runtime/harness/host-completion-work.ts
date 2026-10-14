@@ -4,7 +4,7 @@ import { isToolMediaImageBlock } from './tool-media-content.js';
 import { acceptedTaskIdFor } from './attempt-identity.js';
 import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
 import { redeemSuccessfulSettlementResultForHost, redeemedReadIsExhausted } from './result-handle.js';
-import { TOOL_REGISTRY, toolReadsRetainedOutput } from '../../tools/tool-registry.js';
+import { TOOL_REGISTRY, toolReadsRetainedOutput, type LocalPlanningSemantics } from '../../tools/tool-registry.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { discoveryNavigation } from './discovered-tool-context.js';
 import { PROMPT_INLINE_RECALLABLE_RESULT_CHARS, answererViewBudgetFor, presentationBudgetFor, densifyMarkdownForModelHead, extractResourceIdIndex } from './tool-output-format.js';
@@ -152,6 +152,29 @@ export function sourceAttemptedWrites(input: {
  *  it ran (its capability's variant, or every way the tool may run) is a
  *  non-destructive local artifact write. */
 export function undoableLocalArtifactWrite(toolName: string, requirementId: string | null): boolean {
+  return everyWayItRan(toolName, requirementId, (semantics) => semantics.consequence === 'local_artifact'
+    && !semantics.destructive
+    && (semantics.reversibility === 'reversible' || semantics.reversibility === 'create_only'));
+}
+
+/** Whether a write only moved something this task runs locally and can put
+ *  back or start over: a non-destructive local execution declared reversible
+ *  or create-only. Opening or navigating a browser page is one; it leaves no
+ *  file, record or message behind. A shell command keeps nothing to restore,
+ *  so it is not. */
+export function restorableLocalExecution(toolName: string, requirementId: string | null): boolean {
+  return everyWayItRan(toolName, requirementId, (semantics) => semantics.consequence === 'local_execution'
+    && !semantics.destructive
+    && (semantics.reversibility === 'reversible' || semantics.reversibility === 'create_only'));
+}
+
+/** The way it ran (its capability's variant, or every way the tool may run)
+ *  satisfies `holds`. A tool with no declared local semantics never does. */
+function everyWayItRan(
+  toolName: string,
+  requirementId: string | null,
+  holds: (semantics: LocalPlanningSemantics) => boolean,
+): boolean {
   const row = TOOL_REGISTRY.find((entry) => entry.name === toolName);
   if (!row) return false;
   const ways = [row.localPlanning, ...(row.localPlanningVariants ?? [])]
@@ -159,17 +182,18 @@ export function undoableLocalArtifactWrite(toolName: string, requirementId: stri
   if (ways.length === 0) return false;
   const ref = requirementId?.match(/^cap:local:([^:]+):(.+)$/);
   const named = ref && ref[1] === toolName ? ways.filter((semantics) => semantics.safeMode?.id === ref[2]) : [];
-  return (named.length > 0 ? named : ways).every((semantics) => semantics.consequence === 'local_artifact'
-    && !semantics.destructive
-    && (semantics.reversibility === 'reversible' || semantics.reversibility === 'create_only'));
+  return (named.length > 0 ? named : ways).every(holds);
 }
 
 /**
  * The writes of this source that call for the full completion review:
  * anything that reached outside the machine, failed or was refused, or
  * changed local state that cannot simply be restored. A local file write
- * that succeeded and kept the file's earlier bytes is not among them. An
- * unreadable ledger counts as one, so the full review is the safe side.
+ * that succeeded and kept the file's earlier bytes is not among them. Nor is
+ * a restorable local execution such as a browser page visit, whatever its
+ * outcome short of an uncertain write: it produced nothing to guard, and the
+ * read-depth review still reads its receipt. An unreadable ledger counts as
+ * one, so the full review is the safe side.
  */
 export function sourceWritesAtStake(input: {
   sessionId: string;
@@ -188,10 +212,11 @@ export function sourceWritesAtStake(input: {
     `).all(input.sessionId, input.sourceUserSeq) as Array<{
       executionKind: string | null; outcomeKind: string | null; requirementId: string | null; toolName: string | null;
     }>;
-    return rows.filter((row) => !(row.executionKind === 'local_execution'
+    return rows.filter((row) => !(row.toolName && ((row.executionKind === 'local_execution'
       && row.outcomeKind === 'succeeded'
-      && row.toolName
-      && undoableLocalArtifactWrite(row.toolName, row.requirementId))).length;
+      && undoableLocalArtifactWrite(row.toolName, row.requirementId))
+      || (row.outcomeKind !== 'uncertain_write'
+        && restorableLocalExecution(row.toolName, row.requirementId))))).length;
   } catch {
     return 1;
   }

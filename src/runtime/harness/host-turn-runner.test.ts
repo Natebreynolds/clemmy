@@ -11059,6 +11059,37 @@ test('the full review guards writes that reached outside or cannot be restored; 
   assert.equal(sourceWritesAtStake(post.context), 1, 'an outside write is always reviewed in full');
 });
 
+test('a browser page visit is reviewed at the read depth; a shell command or a workflow change keeps the full review', async () => {
+  const { sourceAttemptedWrites, sourceWritesAtStake, restorableLocalExecution } = await import('./host-completion-work.js');
+  assert.equal(restorableLocalExecution('cloud_browser_navigate', 'cap:local:cloud_browser_navigate:reversible'), true);
+  assert.equal(restorableLocalExecution('cloud_browser_start', null), true, 'starting a session creates only a page to read');
+  assert.equal(restorableLocalExecution('browser_navigate', null), true);
+  assert.equal(restorableLocalExecution('run_shell_command', 'cap:local:run_shell_command:ordinary'), false, 'a shell edit keeps nothing to restore');
+  assert.equal(restorableLocalExecution('write_file', null), false, 'a file write is judged as a file write');
+  assert.equal(restorableLocalExecution('workflow_create', null), false, 'an internal creation is not a page visit');
+  assert.equal(restorableLocalExecution('slack_send_message', null), false, 'a tool with no local semantics never qualifies');
+
+  const browse = acceptJudgedSource('stakes-browser-visit', 'TEST FIXTURE: find a pillow on the open page');
+  settleFixtureCall({ ...browse.context, turn: 1 }, 'stakes-browser-visit', {
+    tool: 'cloud_browser_navigate', execution: 'local_execution', mutating: true, succeeded: true,
+    requirementId: 'cap:local:cloud_browser_navigate:reversible' });
+  settleFixtureCall({ ...browse.context, turn: 1 }, 'stakes-browser-visit-failed', {
+    tool: 'cloud_browser_navigate', execution: 'local_execution', mutating: true, succeeded: false,
+    requirementId: 'cap:local:cloud_browser_navigate:reversible' });
+  assert.equal(sourceAttemptedWrites(browse.context), 2, 'the ledger still records both visits as writes');
+  assert.equal(sourceWritesAtStake(browse.context), 0, 'a page visit, landed or not, produced nothing for a full review to guard');
+
+  const shell = acceptJudgedSource('stakes-shell', 'TEST FIXTURE: tidy the scratch folder');
+  settleFixtureCall({ ...shell.context, turn: 1 }, 'stakes-shell', {
+    tool: 'run_shell_command', execution: 'local_execution', mutating: true, succeeded: true });
+  assert.equal(sourceWritesAtStake(shell.context), 1);
+
+  const created = acceptJudgedSource('stakes-workflow', 'TEST FIXTURE: create a weekly digest workflow');
+  settleFixtureCall({ ...created.context, turn: 1 }, 'stakes-workflow', {
+    tool: 'workflow_create', execution: 'local_execution', mutating: true, succeeded: true });
+  assert.equal(sourceWritesAtStake(created.context), 1, 'an internal creation is reviewed in full');
+});
+
 test('a run settles a work item it finished itself only from its own successful calls', async () => {
   const { declareWorkManifest, checkpointWorkItem, summarizeWorkManifests, settleWorkItemFromOwnCalls } = await import('./work-manifest.js');
   const run = acceptJudgedSource('settle-own-item', 'TEST FIXTURE: gather two evidence blocks');
