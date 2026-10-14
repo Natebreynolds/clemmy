@@ -34,6 +34,7 @@ import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
 import { createHash, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { HarnessSession } from './session.js';
 import { workflowParentActivation } from './workflow-parent-activation.js';
 import { composeRunProgressLine } from './run-progress.js';
@@ -7183,8 +7184,32 @@ async function runConversationWithinRuntimeConfig(
       } else {
         await resolveContext();
       }
+      const recordPreparationTiming = (
+        lane: 'proven_operation_preparation' | 'capability_preparation',
+        outcome: 'selected' | 'empty' | 'resolved' | 'error',
+        started: number,
+        ended: number,
+      ): void => {
+        try {
+          const totalMs = ended - started;
+          if (!Number.isFinite(totalMs) || totalMs < 0) return;
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'turn_phase_timings',
+            data: {
+              version: 1, lane, clock: 'monotonic', sourceUserSeq, outcome, totalMs,
+              ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
+            },
+          });
+        } catch { /* Observing an await cannot change preparation or execution. */ }
+      };
       let provenOperationText: string | undefined;
       if (!hostPlainConversation && !isUnattendedSession(options.sessionId)) {
+        const started = performance.now();
+        let ended: number | undefined;
+        let outcome: 'selected' | 'empty' | 'error' = 'error';
         try {
           const proven = await (await import('../jev/proven-operation.js')).prepareProvenOperationForRequest({
             query: String(options.semanticTaskInput ?? options.input ?? ''),
@@ -7192,7 +7217,12 @@ async function runConversationWithinRuntimeConfig(
             sourceUserSeq,
             mcpToolScope: options.mcpToolScope,
           });
+          // Stop at the awaited preparation, before selected-event publication.
+          // A transport's later retirement is a different span, not this wait.
+          ended = performance.now();
+          outcome = 'empty';
           if (proven.text) {
+            outcome = 'selected';
             provenOperationText = proven.text;
             appendEvent({
               sessionId: options.sessionId,
@@ -7217,8 +7247,18 @@ async function runConversationWithinRuntimeConfig(
             });
           }
         } catch { /* proven recall is fail-open */ }
+        finally {
+          recordPreparationTiming('proven_operation_preparation', outcome, started, ended ?? performance.now());
+        }
       }
-      await resolveCapability?.();
+      const capabilityStarted = performance.now();
+      let capabilityOutcome: 'resolved' | 'empty' | 'error' = 'error';
+      try {
+        await resolveCapability?.();
+        capabilityOutcome = resolveCapability ? 'resolved' : 'empty';
+      } finally {
+        recordPreparationTiming('capability_preparation', capabilityOutcome, capabilityStarted, performance.now());
+      }
       if (!activeAgent) throw new Error('capability resolution did not produce an agent before the host core.');
       const hostTurnOptions: RunTurnOptions = {
         hostActivationStartedAt: activationStartedAt,
