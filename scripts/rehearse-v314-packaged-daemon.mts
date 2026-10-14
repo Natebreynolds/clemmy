@@ -1470,6 +1470,7 @@ export type PackagedFirstBootAddedFileCategory =
   | 'recovery_projection'
   | 'deterministic_boot_seed'
   | 'scheduler_observation'
+  | 'storage_report'
   | 'ephemeral_process_owner'
   | 'unexpected';
 
@@ -1497,6 +1498,7 @@ export function classifyPackagedFirstBootAddedFile(
     || (relativePath === 'state/runs.json' && causalFiles.recoveredWorkflowRuns === true)
   ) return 'recovery_projection';
   if (relativePath === 'state/space-schedule-state.json') return 'scheduler_observation';
+  if (STORAGE_REPORT_FILES.includes(relativePath)) return 'storage_report';
   if (
     CHECK_IN_SEED_IDS.some((id) => relativePath === `state/check-in-templates/${id}.json`)
     || relativePath === 'vault/00-System/workflows/objective-execution-loop/SKILL.md'
@@ -1525,6 +1527,7 @@ function addedFilesByCategory(
     recovery_projection: [],
     deterministic_boot_seed: [],
     scheduler_observation: [],
+    storage_report: [],
     ephemeral_process_owner: [],
     unexpected: [],
   };
@@ -1609,6 +1612,31 @@ export function validDeterministicBootSeed(home: string, relativePath: string): 
     && stable(record.report) === stable({
       aliasesScanned: 0, aliasesLinked: 0, proceduresCreated: 0, quarantinedAliases: 0,
     });
+}
+
+/** The daily storage pass's report and clock. An upgraded home's first boot
+ *  may run it, and then it must only have reported: nothing removed, nothing
+ *  distilled or pruned, and a clock that holds the next pass for a day. */
+export const STORAGE_REPORT_FILES: readonly string[] = ['state/storage-retention-due.json', 'state/storage-retention.json'];
+
+export function validReportOnlyStorageRetention(
+  report: Record<string, Json> | null,
+  due: Record<string, Json> | null,
+): boolean {
+  const record = (value: Json | undefined) => value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, Json>
+    : null;
+  const copies = record(report?.requestCopies);
+  const orphans = record(report?.orphanPayloads);
+  const toolResults = record(report?.toolResults);
+  const cache = record(report?.pythonToolCache);
+  return report?.version === 1
+    && report.mode === 'report'
+    && copies?.removed === 0 && copies.removedBytes === 0
+    && orphans?.removed === 0
+    && toolResults?.removedRows === 0 && toolResults.distilled === false
+    && cache?.pruned === false
+    && typeof due?.lastRunMs === 'number' && Number.isFinite(due.lastRunMs) && due.lastRunMs > 0;
 }
 
 function validEmptySpaceScheduleObservation(state: Record<string, Json> | null): boolean {
@@ -2654,8 +2682,19 @@ export async function runPackagedV314DaemonRehearsal(
     canonicalMigrationSeed,
     ...BUILTIN_SKILL_SEED_IDS.flatMap(builtinSkillSeedFiles),
   ].sort();
+  // The storage pass runs on the maintenance clock, so the first snapshot may
+  // or may not hold it; when it does, both files, report-only, unchanged after.
+  const storageReportAdded = firstBootAdded.storage_report.length === 0 || (
+    stable(firstBootAdded.storage_report) === stable([...STORAGE_REPORT_FILES])
+    && validReportOnlyStorageRetention(
+      readJsonStateRecord(daemonHome, 'state/storage-retention.json'),
+      readJsonStateRecord(daemonHome, 'state/storage-retention-due.json'))
+    && STORAGE_REPORT_FILES.every((relativePath) =>
+      first.allNonSqliteFiles[relativePath] === postExercise.allNonSqliteFiles[relativePath]
+      && postExercise.allNonSqliteFiles[relativePath] === second.allNonSqliteFiles[relativePath]));
   add('first_packaged_boot_added_files_are_closed_causal_categories_with_exact_seed_semantics',
     firstBootAdded.unexpected.length === 0
+      && storageReportAdded
       && firstBootAdded.ephemeral_process_owner.length === 0
       && stable(firstBootAdded.recovery_projection) === stable(expectedRecoveryAddedFiles)
       && stable(firstBootAdded.scheduler_observation) === stable(['state/space-schedule-state.json'])
@@ -2671,6 +2710,7 @@ export async function runPackagedV314DaemonRehearsal(
       recovery: expectedRecoveryAddedFiles,
       deterministicSeeds: expectedDeterministicSeedFiles,
       schedulerObservation: ['state/space-schedule-state.json'],
+      storageReport: 'none, or both files from one report-only pass that a restart does not repeat',
       ephemeralProcessOwners: [],
     },
   });

@@ -26,6 +26,7 @@ import {
   sanitizePackagedGateEnvironment,
   seedPackagedGateState,
   validDeterministicBootSeed,
+  validReportOnlyStorageRetention,
 } from './rehearse-v314-packaged-daemon.mts';
 import { V314_GATE_MACHINE_ID } from './rehearse-v314-upgrade.mts';
 
@@ -229,6 +230,22 @@ test('packaged daemon and exercise PATH is the exact empty gate directory', () =
   assert.doesNotMatch(runtime.PATH ?? '', /salesforce|node_modules/);
 });
 
+test('an upgraded home\'s first storage pass is accepted only when it reported and removed nothing', () => {
+  const report = {
+    version: 1, at: '2026-10-14T00:00:00.000Z', mode: 'report', budgetBytes: 1, scratchDays: 7,
+    footprintBefore: 10, footprintAfter: 10, footprintComplete: true,
+    requestCopies: { eligible: 3, eligibleBytes: 30, removed: 0, removedBytes: 0 },
+    orphanPayloads: { removed: 0 }, toolResults: { removedRows: 0, distilled: false },
+    pythonToolCache: { pruned: false }, overBudgetBytes: 9, notes: [],
+  };
+  const due = { lastRunMs: 1_792_000_000_000 };
+  assert.equal(validReportOnlyStorageRetention(report, due), true);
+  assert.equal(validReportOnlyStorageRetention({ ...report, mode: 'enforce' }, due), false);
+  assert.equal(validReportOnlyStorageRetention({ ...report, requestCopies: { ...report.requestCopies, removed: 1, removedBytes: 10 } }, due), false);
+  assert.equal(validReportOnlyStorageRetention({ ...report, toolResults: { removedRows: 2, distilled: true } }, due), false);
+  assert.equal(validReportOnlyStorageRetention(report, null), false, 'a pass without its clock would repeat on every restart');
+});
+
 test('first-boot added-file classifier is closed over causal recovery, seed, scheduler, and owner paths', () => {
   const eventFile = 'vault/00-System/workflows/upgrade-rehearsal-workflow/runs/run-1/events.jsonl';
   const recovery = new Set([eventFile]);
@@ -241,6 +258,8 @@ test('first-boot added-file classifier is closed over causal recovery, seed, sch
     ['skills/workspace-builder/SKILL.md', 'deterministic_boot_seed'],
     ['skills/workspace-builder/.builtin.json', 'deterministic_boot_seed'],
     ['state/space-schedule-state.json', 'scheduler_observation'],
+    ['state/storage-retention.json', 'storage_report'],
+    ['state/storage-retention-due.json', 'storage_report'],
     ['daemon.lock/owner-123e4567-e89b-12d3-a456-426614174000.json', 'ephemeral_process_owner'],
     ['daemon.pid.123.123e4567-e89b-12d3-a456-426614174000.tmp', 'ephemeral_process_owner'],
   ] as const;
