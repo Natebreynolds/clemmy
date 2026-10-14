@@ -285,8 +285,10 @@ test('unverified count boundaries allow overlapping flags up to twice the declar
 });
 
 test('new observations never change earlier parser precedence or add fields outside complete unverified results', () => {
-  assert.equal(Buffer.byteLength(instructions, 'utf8'), 2718);
-  assert.equal(createHash('sha256').update(instructions, 'utf8').digest('hex'), 'ec5ac786896158ef6619191ad7505f3b91c89bfee03505a246a012bf97d153b1');
+  // Historical 99cb wording: 2718 bytes, ec5ac786896158ef6619191ad7505f3b91c89bfee03505a246a012bf97d153b1.
+  // Round17 intentionally clarifies execution restrictions; parser precedence and diagnostic assertions below remain unchanged.
+  assert.equal(Buffer.byteLength(instructions, 'utf8'), 3059);
+  assert.equal(createHash('sha256').update(instructions, 'utf8').digest('hex'), '9224e1d14ca877eb258d5b5ed8df19998b764120b8f4e4c8a93233a28bc6e5b6');
   const flagged = { ...row, status: 'unverified', contrary: { status: 'unresolved', reason: 'x' } };
   for (const [output, expected] of [
     [answer(), 'consistent'], [answer(packet({ coverage: 'partial', decisions: [flagged] })), 'partial'],
@@ -344,4 +346,36 @@ test('new diagnostic scalars use the existing inert snapshot without nested coer
   assert.deepEqual(diagnostic(proxy), d, 'stable top-level descriptor capture retains its existing behavior');
   assert.ok(topLevelReads > 0, 'this change does not promise zero pre-existing top-level Proxy hooks');
   assert.equal(diagnostic({ ...d, rawClaim: 'private text' }), undefined);
+});
+
+test('round17 execution restrictions: the same assessment contract includes material actor constraints without changing its schema', () => {
+  assert.match(instructions, /execution and source\/authorization restrictions as decisions/);
+  assert.match(instructions, /neither candor nor a correct artifact resolves it/);
+  assert.match(instructions, /honest-unavailable-capability exception/);
+  assert.match(instructions, /root has only version,coverage,decisions/);
+  assert.match(instructions, /DONE and format-only REVISE_REPLY require complete assessment/);
+});
+
+test('round17 execution restrictions: declared violations stay negative while unavailable, refused and currently permitted controls remain consistent', () => {
+  const violation = { claim: 'Only the permitted workflow was read', premise: 'The owner excluded sibling workflows',
+    basis: 'A sibling read succeeded before creation', consequence: 'The prohibited past read cannot be undone',
+    contrary: { status: 'unresolved', reason: 'Disclosure and a correct artifact do not restore compliance' }, status: 'contradicted' };
+  for (const marker of ['DONE', 'REVISE_REPLY', 'BLOCKED']) {
+    const found = parse(answer(packet({ decisions: [violation] }), `${marker}: The source restriction was violated.`));
+    assert.equal(found.diagnostic.status, 'unqualified'); assert.equal(found.diagnostic.reason, 'contradicted');
+    assert.equal(found.control?.marker, marker, 'existing control parsing stays independent from declared assessment consistency');
+  }
+  for (const basis of ['The optional endpoint was genuinely unavailable and no forbidden action ran',
+    'The one permitted attempt was refused before execution; no retry ran',
+    'The current accepted owner amendment explicitly authorized this read; the earlier restriction is historical',
+    'The objective permits the reference read and its actual result supports the answer']) {
+    const allowed = { claim: 'The current request is fulfilled within permission', premise: 'Apply the effective owner scope', basis,
+      consequence: 'The bounded result may be reported', contrary: { status: 'resolved', reason: 'No contrary current restriction remains' }, status: 'supported' };
+    assert.equal(parse(answer(packet({ decisions: [allowed] }), 'DONE: The bounded current request is fulfilled.')).diagnostic.status, 'qualified');
+  }
+  assert.equal(parse(answer(packet({ decisions: [{ ...violation, status: 'unverified' }] }))).diagnostic.reason, 'unverified');
+  // This parser is not a semantic classifier: a structurally consistent lie is
+  // still only the reviewer's declaration, never host-certified compliance.
+  const declared = { ...violation, status: 'supported', contrary: { status: 'resolved', reason: 'Reviewer declares this resolved' } };
+  assert.equal(parse(answer(packet({ decisions: [declared] }))).diagnostic.status, 'qualified');
 });

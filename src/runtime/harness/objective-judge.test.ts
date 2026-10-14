@@ -1478,3 +1478,176 @@ test('an authenticated retained projection covers only its exact producer handle
   assert.equal(assessCompletionEvidenceCoverage({ objective: 'Inspect first.', results: [first, { ...intermediate, sourceSelectionComplete: false }, reopened] }).complete, false,
     'a whole later read cannot cross a focused ancestor');
 });
+
+// These are request-assembly/parser controls with scripted providers, not a
+// semantic evaluation of a real reviewer or permission to perform these actions.
+const restrictionCases = [
+  { id: 'performed', objective: 'Create only the controlled workflow; do not read any other workflow.',
+    candidate: 'The controlled output is verified. I also read a sibling workflow for syntax.',
+    evidence: 'The controlled output matches. A separate sibling workflow_get succeeded before creation.',
+    answer: 'BLOCKED: The result is kept, but the prohibited read already occurred and cannot be undone.' },
+  { id: 'unavailable', objective: 'Report the available local result and identify the unavailable optional endpoint without retrying it.',
+    candidate: 'Local status is ready. The optional endpoint is unavailable; I did not retry it.',
+    evidence: 'The local read returned ready. The named optional endpoint was unavailable; no other call ran.',
+    answer: 'DONE: The verified result and genuine unavailable capability are reported within permission.' },
+  { id: 'refused', objective: 'Try the controlled read at most once; report a refusal and do not retry.',
+    candidate: 'The one permitted read was refused before execution. I did not retry.',
+    evidence: 'The exact permitted attempt was refused before any read executed; attempt count is one.',
+    answer: 'DONE: The bounded permitted attempt was refused before execution and its result is reported.' },
+  { id: 'ordinary', objective: 'Read the controlled reference and report its status.',
+    candidate: 'The controlled reference says ready.', evidence: 'The requested reference read succeeded and returned ready.',
+    answer: 'DONE: The permitted reference read supports ready.' },
+  { id: 'amended', objective: 'For this new task I authorize reading controlled reference B; the earlier task restricted reads to A. Report B now.',
+    candidate: 'The newly authorized B reference says ready.',
+    evidence: 'The earlier task allowed only A. The current accepted owner amendment explicitly permits B, whose current read returned ready.',
+    answer: 'DONE: The current effective owner amendment authorizes B and its verified status is reported.' },
+] as const;
+
+function restrictionRequestModel(responseText: string) {
+  const requests: import('@openai/agents-core').ModelRequest[] = [];
+  return { requests, model: {
+    async getResponse(request: import('@openai/agents-core').ModelRequest) {
+      requests.push(request);
+      return { responseId: `restriction-response-${requests.length}`,
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1, inputTokensDetails: [], outputTokensDetails: [] },
+        output: [{ type: 'message' as const, role: 'assistant' as const, status: 'completed' as const,
+          content: [{ type: 'output_text' as const, text: responseText }] }] };
+    },
+    async *getStreamedResponse() { throw new Error('buffered reviewer fixture only'); },
+  } };
+}
+
+test('round17 execution restrictions: default requests retain scope evidence, honest blockers and current owner amendments', async () => {
+  const { buildCompletionJudgeInstructions, runRoutedJudgeAttempt, HOST_COMPLETION_EVIDENCE_GUIDANCE } = await import('./objective-judge.js');
+  const { modelUsageAttributionStorage } = await import('../usage-log.js');
+  const { withResilience } = await import('./resilient-model.js');
+  const { resolveModelCapability } = await import('./model-wire-registry.js');
+  const { createHash } = await import('node:crypto');
+  const observations: Array<{ fixture: typeof restrictionCases[number]; request: import('@openai/agents-core').ModelRequest;
+    observation: import('./review-input-observation.js').ReviewInputObservation | undefined; verdict: ReturnType<typeof parseCompletionVerdict> }> = [];
+  for (const fixture of restrictionCases) {
+    const owner = { sessionId: `round17-restriction-${fixture.id}`, sourceUserSeq: 17, attemptId: `attempt:restriction-${fixture.id}` };
+    const context = { skills: [], sessionId: owner.sessionId, fullSourceEvidence: true,
+      completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE,
+      agentInstructions: 'Follow the current accepted owner scope and its applicable explicit exceptions; do not replay effects.',
+      toolCallSummary: fixture.evidence, reviewInputOwner: owner };
+    let instructions!: import('./review-input-observation.js').ReviewInputComposition;
+    let prompt!: import('./review-input-observation.js').ReviewInputComposition;
+    buildCompletionJudgeInstructions(context, value => { instructions = value; });
+    buildObjectiveJudgePrompt(fixture.objective, fixture.candidate, context, value => { prompt = value; });
+    const captured = restrictionRequestModel(fixture.answer);
+    const producer = withResilience(captured.model as never, {
+      label: 'round17-restriction-review', capability: resolveModelCapability('claude-sonnet-5'), maxRetries: 0,
+    });
+    let observation: import('./review-input-observation.js').ReviewInputObservation | undefined;
+    const digest = (text: string) => createHash('sha256').update(text).digest('hex');
+    const verdict = await modelUsageAttributionStorage.run(owner, () => runRoutedJudgeAttempt({
+      model: producer, modelId: 'claude-sonnet-5', judgeFamily: 'claude', brainFamily: 'byo', selfJudge: false, transport: 'test',
+    } as never, instructions.text, prompt.text, parseCompletionVerdict, true, undefined, undefined, 'medium', undefined,
+    { input: value => { observation = value; } }, undefined,
+    { owner, stage: 'completion', objectiveDigest: digest(fixture.objective), candidateDigest: digest(fixture.candidate), instructions, prompt }));
+    assert.equal(captured.requests.length, 1, 'one existing review request, with no restatement, cleanup or replay');
+    observations.push({ fixture, request: captured.requests[0]!, observation, verdict });
+  }
+  for (const { fixture, request, observation, verdict } of observations) {
+    assert.deepEqual(verdict, parseCompletionVerdict(fixture.answer));
+    assert.equal(Boolean(verdict?.done), fixture.id !== 'performed');
+    assert.equal(observation?.status, 'bound', 'the actual SDK entry still binds the complete source/candidate input');
+    const sent = JSON.stringify(request.input);
+    for (const retained of [fixture.objective, fixture.candidate, fixture.evidence]) assert.ok(sent.includes(retained));
+    assert.ok(sent.includes('current accepted owner scope'));
+    assert.equal(request.modelSettings.reasoning?.effort, 'medium');
+  }
+  // All positive/negative route controls run before the new instruction RED.
+  const system = String(observations[0]!.request.systemInstructions);
+  assert.match(system, /prohibited action that already occurred/);
+  assert.match(system, /HONEST BLOCKER:[^\n]*does not excuse a prohibited action/);
+  assert.doesNotMatch(system, /Mark not-done ONLY when/);
+});
+
+test('round17 execution restrictions: actual Jev payload keeps the same constraint and one existing fallback review', async () => {
+  const { HOST_COMPLETION_EVIDENCE_GUIDANCE, buildCompletionJudgeInstructions, runRoutedJudgeAttempt } = await import('./objective-judge.js');
+  const fixture = {
+    objective: 'Read only controlled local reference A and report its status. Do not read sibling reference B.',
+    candidate: 'A says ready. I also read sibling reference B.',
+    evidence: 'read_file A succeeded with ready; a separate read_file B also succeeded despite the current A-only restriction.',
+    answer: 'BLOCKED: The requested status is known, but the prohibited sibling read already occurred and cannot be undone.',
+  };
+  const payloads: Array<{ state: Record<string, unknown> }> = [];
+  const captured = restrictionRequestModel(fixture.answer);
+  let reviewerCalls = 0;
+  _setTypesafeKeyForTests('ts_round17_request_fixture');
+  _setSystemOneFetchForTests(async (_url, init) => {
+    payloads.push(JSON.parse(String(init.body)));
+    return { status: 200, ok: true, text: async () => JSON.stringify(jevCompletionReading('incomplete')) };
+  });
+  _setCompletionJudgeForTests(async (objective, candidate, context) => {
+    reviewerCalls++;
+    const verdict = await runRoutedJudgeAttempt({ model: captured.model as never, modelId: 'fixture-reviewer',
+      judgeFamily: 'byo', brainFamily: 'byo', selfJudge: false, transport: 'test' } as never,
+    buildCompletionJudgeInstructions(context), buildObjectiveJudgePrompt(objective, candidate, context), parseCompletionVerdict, true);
+    return { verdict, failure: null };
+  });
+  const verdict = await judgeObjectiveComplete(fixture.objective, fixture.candidate, {
+    sessionId: 'round17-jev-restriction', skills: [], fullSourceEvidence: true, reviewStakes: 'read',
+    completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE, toolCallSummary: fixture.evidence,
+    agentInstructions: 'Apply only the current effective owner instructions and explicit exceptions.',
+    verifiedReadResults: [
+      { toolName: 'read_file', logicalToolCallId: 'read-A', resultHandleId: 'rh_A', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
+      { toolName: 'read_file', logicalToolCallId: 'read-B', resultHandleId: 'rh_B', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
+    ],
+  });
+  assert.equal(payloads.length, 1); assert.equal(reviewerCalls, 1); assert.equal(captured.requests.length, 1);
+  assert.equal(verdict.done, false); assert.equal(verdict.blocked, true); assert.notEqual(verdict.failedOpen, true);
+  assert.equal(verdict.jevAttempt?.accepted, false);
+  assert.equal(payloads[0]!.state.request, fixture.objective); assert.equal(payloads[0]!.state.response, fixture.candidate);
+  assert.ok(JSON.stringify(payloads[0]!.state).includes(fixture.evidence));
+  const requirements = String(payloads[0]!.state.requirementContext);
+  assert.ok(requirements.includes('current effective owner instructions'));
+  assert.match(requirements, /Execution restrictions apply to the actual work as well as the reply/);
+  assert.match(requirements, /keep that whole-objective violation unmet/);
+});
+
+test('round17 execution restrictions: the existing hedged entry sends one complete independent-family request', async t => {
+  const { buildCompletionJudgeInstructions, runHedgedJudge, HOST_COMPLETION_EVIDENCE_GUIDANCE } = await import('./objective-judge.js');
+  const { ClaudeModelProvider } = await import('./claude-model.js');
+  const { mkdirSync, readFileSync, writeFileSync, rmSync } = await import('node:fs');
+  const path = await import('node:path');
+  assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1', 'no fake authentication may touch the live home');
+  assert.ok(process.env.CLEMENTINE_HOME);
+  const authPath = path.join(process.env.CLEMENTINE_HOME!, 'state', 'claude-auth.json');
+  const env = { AUTH_MODE: 'claude_oauth', MODEL_ROUTING_MODE: 'off', CLAUDE_MODEL: 'claude-opus-5-5',
+    OPENAI_MODEL_PRIMARY: 'gpt-6.1-sol', CLEMMY_JUDGE_CROSS_FAMILY: 'on', CLEMMY_JUDGE_HEDGE: 'off',
+    CLEMMY_COMPLETION_REVIEW: 'on', CLEMMY_CLAUDE_OVERLOAD_FALLBACK: 'off', CLEMMY_CLAUDE_TRANSPORT: 'raw_messages',
+    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'judge', modelId: 'claude-sonnet-5', scope: 'durable', source: 'settings' }]),
+    CLEMMY_DEBATE_JUDGE: '', BYO_MODEL_BASE_URL: '', BYO_MODEL_API_KEY: '', BYO_MODEL_ID: '', BYO_PROVIDERS: '',
+    CLEMMY_BOUNDARY_JUDGE_CLAUDE_MODEL: '', CLEMMY_BOUNDARY_JUDGE_CODEX_MODEL: '', JEV_API_KEY: '', JEV_ENABLED: 'off' };
+  const prior = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
+  let auth: Buffer | undefined;
+  try { auth = readFileSync(authPath); } catch { /* empty isolated fixture */ }
+  const fixture = restrictionCases[0]; const captured = restrictionRequestModel(fixture.answer);
+  const context = { skills: [], fullSourceEvidence: true, completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE,
+    agentInstructions: 'Current owner scope and explicit applicable exceptions govern.', toolCallSummary: fixture.evidence };
+  let result!: Awaited<ReturnType<typeof runHedgedJudge>>;
+  Object.assign(process.env, env); mkdirSync(path.dirname(authPath), { recursive: true });
+  writeFileSync(authPath, JSON.stringify({ accessToken: 'sk-ant-oat01-round17-fixture', expiresAt: Date.now() + 3_600_000 }));
+  t.mock.method(ClaudeModelProvider.prototype, 'getModel', () => captured.model);
+  try {
+    result = await runHedgedJudge(buildCompletionJudgeInstructions(context),
+      buildObjectiveJudgePrompt(fixture.objective, fixture.candidate, context), parseCompletionVerdict, value => value.done,
+      'completion', { timeoutMs: 30_000, requireCompletePrompt: true,
+        boundaryJudgeSelection: { status: 'captured', role: { modelId: 'claude-sonnet-5', provider: 'claude', source: 'settings' },
+          crossFamily: true, fallback: { mode: 'off' }, defaultModels: { claude: 'claude-sonnet-5', codex: 'gpt-6.1-sol' } },
+        reviewedAuthor: { provider: 'byo', modelId: 'fixture-author', source: 'settings' } });
+  } finally {
+    t.mock.restoreAll();
+    for (const [key, value] of Object.entries(prior)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    if (auth) writeFileSync(authPath, auth); else rmSync(authPath, { force: true });
+  }
+  assert.equal(result.failure, null); assert.deepEqual(result.value, parseCompletionVerdict(fixture.answer));
+  assert.equal(result.routing?.judgeFamily, 'claude'); assert.equal(result.routing?.selfJudge, false);
+  assert.equal(captured.requests.length, 1, 'no real provider/quota, competing request or added review round');
+  const sent = JSON.stringify(captured.requests[0]!.input);
+  for (const retained of [fixture.objective, fixture.candidate, fixture.evidence, context.agentInstructions]) assert.ok(sent.includes(retained));
+  assert.match(String(captured.requests[0]!.systemInstructions), /prohibited action that already occurred/);
+});

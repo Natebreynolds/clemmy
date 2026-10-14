@@ -10987,6 +10987,7 @@ function rebasePersistedGraphAfterPreRunRepair(input: {
     workflowName: input.workflowSlug,
     runId: input.runId,
     graph: candidate,
+    authoredSteps: input.afterSteps,
   });
   return true;
 }
@@ -11082,7 +11083,7 @@ function loadLiveWorkflowExecutionPlan(
         `Workflow subgraph for run "${runId}" is invalid: ${validation.errors.join('; ')}`,
       );
     }
-    persistWorkflowGraphSnapshot({ workflowName: workflowSlug, runId, graph });
+    persistWorkflowGraphSnapshot({ workflowName: workflowSlug, runId, graph, authoredSteps });
     snapshot = loadWorkflowGraphSnapshotByRunId(runId);
     if (!snapshot) {
       throw new Error(`Workflow subgraph for run "${runId}" could not be persisted; no specialist work was started.`);
@@ -15898,6 +15899,7 @@ async function processOneRunFile(
             workflowName: workflow.name,
             runId: run.id,
             graph,
+            authoredSteps: workflow.data.steps,
           });
           appendWorkflowEvent(workflow.name, run.id, {
             kind: 'workflow_graph_created',

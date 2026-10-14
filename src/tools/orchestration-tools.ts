@@ -866,7 +866,10 @@ const WorkflowReadParallelSubgraphSchema = z.object({
 const WORKFLOW_TRANSFORM_INPUT_GUIDANCE =
   'Runtime inputs containing rows use JSON strings: apply jsonParse before row/array operations. '
   + 'select.where is one object with column, op and optional value; where.value is a literal string, not an expression. '
-  + 'aggregate.groupBy requires 1–32 field names. ';
+  + 'aggregate.groupBy requires 1–32 field names. '
+  + 'Each expression is a JSON object with an op key. '
+  + 'Example: {"version":1,"expression":{"op":"jsonParse","value":{"op":"get","from":"input.rows"}}}. '
+  + 'The tool schema supplies syntax; a saved-workflow lookup is not a prerequisite. ';
 
 const STEP_INPUT_CONTRACT_DESC =
   'Argument bindings keyed by argument name; see each binding for source syntax. '

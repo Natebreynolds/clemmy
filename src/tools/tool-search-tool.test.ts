@@ -1866,3 +1866,121 @@ test('a request for two operations keeps both on the first page beside the real 
   assert.ok(firstPage.includes('VENUES_SEARCH'), `the search operation is on the first page: ${firstPage.join(', ')}`);
   assert.ok(firstPage.includes('GRIDAPP_SHEET_FROM_ROWS'), `the create operation is on the first page: ${firstPage.join(', ')}`);
 });
+
+function documentedTransformExample(text: string, scope: string): unknown {
+  const examples = [...text.matchAll(/\bExample:\s*(\{.+?\})\.(?:\s|$)/g)];
+  assert.equal(examples.length, 1, `${scope}: one concrete JSON transform example is directly available`);
+  return JSON.parse(examples[0]![1]!);
+}
+
+async function assertRuntimeRowsExample(example: unknown, scope: string): Promise<void> {
+  const { validateWorkflowTransform, executeWorkflowTransform } = await import('../execution/workflow-transform.js');
+  const validation = validateWorkflowTransform(example);
+  assert.equal(validation.ok, true, `${scope}: the advertised example uses the actual op-key expression grammar`);
+  if (!validation.ok) throw new Error(`${scope}: invalid advertised transform`);
+  assert.deepEqual(validation.references, [{ kind: 'input', source: 'input.rows', key: 'rows' }],
+    `${scope}: the example reads runtime rows rather than a saved workflow or baked sample`);
+  for (const rows of [
+    [{ id: 'generic-a', amount: 2 }, { id: 'generic-b', amount: 5 }],
+    [{ id: 'different-input', amount: 11 }],
+  ]) {
+    assert.deepEqual(executeWorkflowTransform({
+      transform: example, inputs: { rows: JSON.stringify(rows) }, stepOutputs: {},
+    }), rows, `${scope}: nested JSON expressions decode the supplied input without a model or workflow run`);
+  }
+}
+
+test('native transform help examples: exact create and update disclosures carry the same executable JSON on both carriers', async () => {
+  const local = await import('../runtime/harness/local-planning-capability.js');
+  let firstExample: unknown;
+  for (const carrier of ['work_call', 'call_tool'] as const) {
+    for (const name of ['workflow_create', 'workflow_update']) {
+      let handler!: Handler;
+      registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+        allowedNames: new Set([name]), candidateSources: [],
+        dispatchViaCallTool: carrier === 'call_tool', dispatchCarrierForName: () => carrier,
+        async discloseForPlanning(candidates) {
+          return Object.fromEntries(candidates.flatMap(candidate => {
+            const definitions = local.inspectAuthorizedLocalPlanningDisclosureCandidates(candidate);
+            return definitions?.length ? [[candidate.name, definitions[0]!.capabilityRef]] : [];
+          }));
+        },
+      });
+      const query = `${name} exact schema`;
+      const raw = await handler({ query, limit: 1 });
+      const body = JSON.parse(raw.content[0]!.text);
+      assert.deepEqual(body.results.map((row: { name: string }) => row.name), [name]);
+      const row = body.results[0];
+      const schema = body.schemas[name];
+      assert.ok(schema, `${carrier}/${name}: actual selected schema remains inline`);
+      assert.ok(body.schema_handles?.[name], `${carrier}/${name}: complete original contract keeps its handle`);
+      const fullSchema = await redeemSchema(handler, query, { schemas: {}, schema_handles: body.schema_handles }, name) as typeof schema;
+      if (JSON.stringify(schema) !== JSON.stringify(fullSchema)) {
+        assert.ok(body.schema_read_required?.includes(name), 'an executable example does not waive the complete-schema requirement');
+      }
+      const description = workflowTransformDescription(schema);
+      assert.equal(description, workflowTransformDescription(fullSchema), 'the inline grammar and example are not clipped');
+      assertWorkflowTransformDiscoveryGrammar(description, `${carrier}/${name}`);
+      const example = documentedTransformExample(description, `${carrier}/${name}`);
+      await assertRuntimeRowsExample(example, `${carrier}/${name}`);
+      if (firstExample === undefined) firstExample = example;
+      else assert.deepEqual(example, firstExample, 'create/update and both carriers teach the same native grammar');
+      assert.equal(row.carrier, carrier);
+      if (carrier === 'work_call') {
+        assert.equal(row.effect, 'local_write');
+        assert.equal(row.capabilityRef, `cap:local:${name}:reversible`);
+        assert.equal(row.invocation.name, name);
+      } else {
+        assert.equal(row.effect, undefined);
+        assert.equal(row.capabilityRef, undefined);
+        assert.equal(row.invocation, undefined);
+        assert.match(body.hint, /call_tool\(name, args_json\)/);
+      }
+      assert.ok(raw.content[0]!.text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
+    }
+  }
+});
+
+test('native transform help examples: broad create summary teaches executable JSON within its first600 characters', async () => {
+  const local = await import('../runtime/harness/local-planning-capability.js');
+  const { getCoreTools } = await import('./registry.js');
+  const registered = getCoreTools();
+  const create = registered.find(tool => 'name' in tool && tool.name === 'workflow_create');
+  assert.ok(create && 'description' in create && typeof create.description === 'string', 'the real native create tool is registered');
+  let handler!: Handler;
+  registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+    allowedNames: new Set(registered.map(tool => tool.name)), candidateSources: [],
+    dispatchCarrierForName: () => 'work_call',
+    async discloseForPlanning(candidates) {
+      return Object.fromEntries(candidates.flatMap(candidate => {
+        const definitions = local.inspectAuthorizedLocalPlanningDisclosureCandidates(candidate);
+        return definitions?.length ? [[candidate.name, definitions[0]!.capabilityRef]] : [];
+      }));
+    },
+  });
+  const query = 'create a new manual workflow with a deterministic transform step and enable it';
+  const raw = await handler({ query, limit: 8 });
+  const body = JSON.parse(raw.content[0]!.text);
+  assert.equal(body.results[0].name, 'workflow_create');
+  assert.equal(body.results.length, 8, 'secondary capabilities remain discoverable');
+  const row = body.results[0];
+  assert.equal(row.summary, create.description.slice(0, 600), 'the example comes from registered help on the actual discovery surface');
+  assert.ok(row.summary.length <= 600);
+  assertWorkflowTransformDiscoveryGrammar(row.summary, 'broad create summary');
+  const example = documentedTransformExample(row.summary, 'broad create summary');
+  await assertRuntimeRowsExample(example, 'broad create summary');
+  const description = workflowTransformDescription(body.schemas.workflow_create);
+  assert.deepEqual(documentedTransformExample(description, 'broad create transform field'), example,
+    'summary and nested field provide the same example without reading another workflow');
+  assert.ok(body.schema_handles?.workflow_create);
+  const fullSchema = await redeemSchema(handler, query, { schemas: {}, schema_handles: body.schema_handles }, 'workflow_create') as typeof body.schemas.workflow_create;
+  assert.equal(description, workflowTransformDescription(fullSchema));
+  if (JSON.stringify(body.schemas.workflow_create) !== JSON.stringify(fullSchema)) {
+    assert.ok(body.schema_read_required?.includes('workflow_create'));
+  }
+  assert.equal(row.carrier, 'work_call');
+  assert.equal(row.effect, 'local_write');
+  assert.equal(row.capabilityRef, 'cap:local:workflow_create:reversible');
+  assert.equal(row.invocation.name, 'workflow_create');
+  assert.ok(raw.content[0]!.text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
+});

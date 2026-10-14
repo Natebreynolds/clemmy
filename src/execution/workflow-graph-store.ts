@@ -3,8 +3,10 @@ import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { BASE_DIR } from '../config.js';
+import type { WorkflowStepInput } from '../memory/workflow-store.js';
 import {
   validateWorkflowGraph,
+  validateWorkflowGraphAgainstAuthoredSteps,
   type WorkflowGraphDefinition,
   type WorkflowGraphEdge,
   type WorkflowGraphNode,
@@ -89,6 +91,9 @@ export interface PersistWorkflowGraphSnapshotInput {
   workflowName: string;
   runId: string;
   graph: WorkflowGraphDefinition;
+  /** The caller's already-selected execution definition, for diagnostics only.
+   * Persisted validation never replaces execution-time authored-step checks. */
+  authoredSteps?: WorkflowStepInput[];
   snapshotId?: string;
   now?: Date;
   db?: Database.Database;
@@ -138,7 +143,9 @@ export function resetWorkflowGraphDbForTest(): void {
 export function persistWorkflowGraphSnapshot(input: PersistWorkflowGraphSnapshotInput): string {
   const db = input.db ?? openWorkflowGraphDb();
   db.exec(WORKFLOW_GRAPH_SCHEMA_SQL);
-  const validation = validateWorkflowGraph(input.graph);
+  const validation = input.authoredSteps === undefined
+    ? validateWorkflowGraph(input.graph)
+    : validateWorkflowGraphAgainstAuthoredSteps(input.graph, input.authoredSteps);
   const snapshotId = input.snapshotId ?? `${input.runId}:graph`;
   const createdAt = (input.now ?? new Date()).toISOString();
   const tx = db.transaction(() => {
