@@ -185,6 +185,12 @@ const TOOLS: Record<'task_hygiene' | 'goal_upsert' | 'write_file' | 'workflow_de
       additionalProperties: false,
     },
   },
+  // A browser instrument: the registry declares it as a reversible LOCAL
+  // EXECUTION write (a tab), the kind of write a read step drives.
+  browser_open: {
+    name: 'browser_open',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+  },
 };
 
 function fixtureTools(names: Array<keyof typeof TOOLS>) {
@@ -629,6 +635,38 @@ test('authored local work covers recoverable file revisions and ledger writes, w
     nonRefusedSettlements(fixture).map((row) => row.logical_tool_call_id),
     ['hyg-2', 'ow-1'],
   );
+});
+
+test('a READ step covers the browser instrument it drives and nothing else: the tab opens, the artifact write and the ledger compaction stay refused', async () => {
+  // Live 2026-10-13: a read step told to open a page in the chosen cloud
+  // browser was refused before dispatch (coverage_missing) on both attempts
+  // and ended blocked, while the same request in chat ran without a card.
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'read',
+    prompt: 'Open a browser tab, read the page and return a structured result.' });
+  assert.equal(fixture.recorded.status, 'ready', JSON.stringify(fixture.recorded));
+  const { bodies, tools } = fixtureTools(['browser_open', 'write_file', 'task_hygiene']);
+  const model = stubModel([
+    [toolCall('open-1', 'browser_open', {})],
+    [toolCall('create-1', 'write_file', { path: 'notes/read-step.md', content: 'Read.\n', mode: 'create', append: null })],
+    [toolCall('hyg-3', 'task_hygiene', { apply: true })],
+    [textMsg('tab opened; nothing written')],
+  ]);
+  const agent = { model, tools };
+  bindSurface(fixture, agent, tools);
+
+  const outcome = await runProductionHost(fixture, agent);
+  assert.equal(outcome.finalOutput, 'tab opened; nothing written', JSON.stringify(outcome.history));
+  assert.deepEqual(bodies, { browser_open: 1, write_file: 0, task_hygiene: 0 });
+  assert.deepEqual(dispositionMarkers(outcome.history), [
+    { disposition: 'refused_pre_dispatch', retry: 'replan' },
+    { disposition: 'refused_pre_dispatch', retry: 'replan' },
+  ]);
+  assert.equal(pendingApprovalCount(fixture), 0);
+  assert.deepEqual(nonRefusedSettlements(fixture).map((row) => row.logical_tool_call_id), ['open-1']);
+  const receipt = db().prepare(`SELECT data_json FROM events WHERE session_id = ? AND type = 'authored_workflow_write_authority'`)
+    .all(fixture.session.id) as Array<{ data_json: string }>;
+  assert.equal(receipt.length, 1);
+  assert.equal((JSON.parse(receipt[0]!.data_json) as { stepSideEffect: string }).stepSideEffect, 'read');
 });
 
 test('create and recoverable overwrite retain distinct exact authored-work risk projections', async () => {

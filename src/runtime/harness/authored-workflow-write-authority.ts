@@ -107,8 +107,11 @@ interface AuthoredWorkflowWriteReceiptV1 {
   admissionHash: string;
   /** The immutable step's authored side-effect class. A `send` step also
    * covers the ordinary/local writes it contains; the send itself is decided
-   * by its own effect-aware branch. */
-  stepSideEffect: 'write' | 'send';
+   * by its own effect-aware branch. A `read` step's receipt covers only the
+   * reversible local-execution instruments a read drives (a browser session,
+   * a tab, a navigation): no artifact, ledger, configuration or external
+   * write ever binds to it. */
+  stepSideEffect: 'read' | 'write' | 'send';
   requiresApproval: boolean;
   promptDigest: string;
   /** Exact external write identities named by the immutable step. Empty for a
@@ -117,7 +120,7 @@ interface AuthoredWorkflowWriteReceiptV1 {
   authorityDigest: string;
 }
 
-const AUTHORED_STEP_SIDE_EFFECTS = new Set<string>(['write', 'send']);
+const AUTHORED_STEP_SIDE_EFFECTS = new Set<string>(['read', 'write', 'send']);
 
 export type RecordAuthoredWorkflowWriteAuthorityResult =
   | { status: 'ready'; authorityDigest: string }
@@ -400,10 +403,28 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
     // send step AUTHORED `requiresApproval` also gets a receipt — it carries
     // the gate (requiresApproval:true) so its one approval card can bind to
     // the exact immutable step instead of a TTL-wide scope.
+    //
+    // A READ step is accepted work too. Reading the web means driving a
+    // browser, and the registry declares a browser session, tab or navigation
+    // as a reversible local-execution write. Live 2026-10-13: a read step
+    // asked to open a page in the chosen cloud browser was refused before
+    // dispatch (coverage_missing) twice and ended blocked, while the same
+    // request in chat ran without a card. The read step's receipt names no
+    // external identity and the local branch admits only local-execution
+    // instruments under it; artifacts, ledgers and configuration stay
+    // uncovered exactly as before.
+    const declared: AuthoredWorkflowWriteReceiptV1['stepSideEffect'] | null = !step
+      ? null
+      : step.sideEffect === 'send' || step.sideEffect === 'write'
+        ? step.sideEffect
+        : step.sideEffect === 'read' || step.sideEffect === undefined
+          ? 'read'
+          : null;
     if (
       !step
-      || (step.sideEffect !== 'write' && step.sideEffect !== 'send')
-      || (step.sideEffect === 'write' && step.requiresApproval === true)
+      || declared === null
+      || (declared === 'write' && step.requiresApproval === true)
+      || (declared === 'read' && (step.requiresApproval === true || externalWrites.length > 0))
     ) {
       return { status: 'none' };
     }
@@ -448,7 +469,7 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
       planProposalId: input.expectedPlanProposalId,
       definitionHash: resolved.snapshot.definitionHash,
       admissionHash: resolved.snapshot.admissionHash,
-      stepSideEffect: step.sideEffect,
+      stepSideEffect: declared,
       requiresApproval: step.requiresApproval === true,
       promptDigest: digest(step.prompt),
       catalogIdentities: externalWrites,
@@ -628,7 +649,7 @@ function reopenAuthoredStepAuthority(
   const step = steps.length === 1 ? steps[0]! : null;
   if (
     !step
-    || step.sideEffect !== receipt.stepSideEffect
+    || (step.sideEffect ?? 'read') !== receipt.stepSideEffect
     || (step.requiresApproval === true) !== receipt.requiresApproval
     || digest(step.prompt) !== receipt.promptDigest
   ) return null;
@@ -1385,6 +1406,11 @@ async function authoredLocalWriteRisk(input: {
       || definition.descriptor.effect !== 'local_write'
       || (definition.reversibility !== 'reversible' && definition.reversibility !== 'create_only')
     ) return null;
+    // A read step's receipt covers the instruments a read drives and nothing
+    // that produces or configures: only a registry row declared as a
+    // reversible LOCAL EXECUTION (a browser session, tab or navigation) binds
+    // to it. An artifact or definition write under a read step stays uncovered.
+    if (input.receipt.stepSideEffect === 'read' && definition.consequence !== 'local_execution') return null;
     const posture = definition.descriptor.destinationPosture ?? 'not_applicable';
     return {
       risk: {
@@ -1408,6 +1434,9 @@ async function authoredLocalWriteRisk(input: {
       semanticBasis: { kind: 'local_registry', digest: definition.envelopeFingerprint },
     };
   }
+  // Clementine's own ledgers are a write step's accepted work, never a read
+  // step's: a read step gets no control-plane coverage.
+  if (input.receipt.stepSideEffect === 'read') return null;
   if (actionTopologyRoleForRuntimeCall(attestation.toolName, input.args) !== 'control') return null;
   return {
     risk: { reversibility: 'reversible', consequence: 'update', destructive: false },

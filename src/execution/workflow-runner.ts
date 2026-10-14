@@ -5710,7 +5710,9 @@ async function runStepViaHarness(
     // operations: a prose step whose only writes are Clementine's registry
     // ledgers (tasks, goals, spaces) gets an identity-free receipt so the host
     // can cover those reversible local writes instead of refusing them for
-    // lack of a plan. `none` (read step / authored approval gate) is ordinary.
+    // lack of a plan. A read step gets an instrument-only receipt: the browser
+    // session, tab or navigation a read drives is covered, nothing that
+    // produces or configures is. `none` (authored approval gate) is ordinary.
     {
       const writeAuthority = recordAuthoredWorkflowWriteAuthority({
         sessionId: realSessionId,
