@@ -2226,6 +2226,9 @@ export async function startDaemon(
   options: StartDaemonOptions = {},
 ): Promise<void> {
   setDaemonRuntimePhase('daemon.boot.start', { build: describeBuild() });
+  // Each boot step is its own known point, so a boot that holds the main
+  // thread names the step that held it.
+  const bootStep = (step: string): void => { setDaemonRuntimePhase('daemon.boot.start', { step }); };
   // Upgrade containment runs before runtime configuration, model discovery,
   // background drains, or network ingress. A legacy async-job JSON is evidence
   // of a remote handle, never fresh dispatch authority; migrate it into one
@@ -2279,6 +2282,7 @@ export async function startDaemon(
     recordOperationalEventOnce(ambientComposioMonitorDisabledVerdict(configuredAmbientComposioMonitors));
   }
   try {
+    bootStep('harness_runtime');
     await configureHarnessRuntime();
   } catch {
     // Port install still proceeds; unavailable semantics block typed turns.
@@ -2288,6 +2292,7 @@ export async function startDaemon(
   // Surface exactly which build is running so a stale packaged bundle
   // can't masquerade as the latest src silently (see build-info.ts).
   logger.info({ build: getBuildInfo() }, `Clementine daemon build: ${describeBuild()}`);
+  bootStep('model_discovery');
   const modelDiscovery = await warmModelDiscovery();
   logger.info(
     {
@@ -2318,6 +2323,7 @@ export async function startDaemon(
   // first real request finds it ready instead of paying for it, and a failure
   // to load simply leaves retrieval on its exact/lexical tier.
   void warmCapabilityRetrieval().catch(() => false);
+  bootStep('state_and_migrations');
   const state = loadState();
   // Canonical tool-memory migration is an explicit boot phase. Never hide it
   // behind list/recall/pre-warm: those hot paths must remain read-only. A
@@ -2339,6 +2345,7 @@ export async function startDaemon(
   // upgrade it copies every row once, so it runs here before the door opens,
   // never inside a model call or a role resolution. Never throws.
   const wideningStartedAt = Date.now();
+  bootStep('route_metrics');
   const widenedRouteTables = widenModelRouteMetricsDb();
   if (widenedRouteTables.length > 0) {
     // How long the one-time copy held boot (it grows with the ledger).
@@ -2365,11 +2372,13 @@ export async function startDaemon(
   // whose structured call references a since-killed/renamed tool would fire
   // on schedule and fail — surface it once so it's fixed before the next
   // occurrence, not discovered as a silent miss.
+  bootStep('broken_workflows');
   reportBrokenWorkflowsOnBoot();
   // 3.0 Workspace history: index file-backed manifests, preserve pre-upgrade
   // data as comparison baselines, heal a DB-commit/file-projection crash, and
   // enforce bounded local retention before any scheduled refresh can run.
   try {
+    bootStep('workspace_temporal');
     const temporal = await initializeWorkspaceTemporalStorage();
     if (temporal.errors.length > 0 || temporal.memoryFailures > 0) {
       logger.warn(temporal, 'Some Workspace temporal histories could not initialize');
@@ -2394,6 +2403,7 @@ export async function startDaemon(
   try {
     // The alignment beat names the standard governing the work; wire that
     // lookup at boot so turn-control keeps no memory-layer dependency.
+    bootStep('memory_finalization');
     try { installProvenStandardBeatLine(); } catch { /* beat degrades to generic */ }
     const identityFinalization = finalizeMemoryIdentityOnBoot();
     if (identityFinalization.reason === 'backup_failed') {
@@ -2471,6 +2481,7 @@ export async function startDaemon(
   // process death between them before the first background drain so accepted
   // plans cannot remain approved-but-never-started after restart.
   try {
+    bootStep('plan_admissions');
     const admissions = reconcileApprovedPlanTaskAdmissions();
     if (admissions.materialized > 0 || admissions.completed > 0 || admissions.failed > 0) {
       logger.warn(admissions, 'Reconciled approved-plan background admissions on boot');
@@ -2496,6 +2507,7 @@ export async function startDaemon(
   // desktop-only foreign-lease sweep never reached them and they showed as
   // phantom running sessions forever (workflow recovery review).
   try {
+    bootStep('orphaned_attempts');
     const orphanedAttempts = interruptOrphanedRunAttemptsAtBoot(Date.now(), {
       preserveAttemptIds: workflowOwnedUnfinishedAttemptIds(),
     });
@@ -2539,6 +2551,7 @@ export async function startDaemon(
   // listener is latency-only; this boot pass and the ordinary tick close every
   // crash window around a registry decision.
   try {
+    bootStep('background_approvals');
     installBackgroundTaskApprovalReconciler();
     const approvals = reconcileBackgroundTaskApprovals();
     if (
@@ -2562,6 +2575,7 @@ export async function startDaemon(
   // Run it after dead attempts and background approval ownership are settled,
   // but before any chat or generic restart resumer can inspect stale state.
   try {
+    bootStep('historical_harness');
     const historical = reconcileHistoricalHarnessStateOnBoot();
     if (
       historical.roots.closed > 0
@@ -2602,6 +2616,7 @@ export async function startDaemon(
   // restart recovery (so an approved parked card resumes with its exact
   // approval directive/source rather than a generic "continue" prompt).
   try {
+    bootStep('chat_approval_resume');
     const { startChatApprovalResume } = await import('../runtime/harness/chat-approval-resume.js');
     await startChatApprovalResume(async (sessionId, directive, source) => {
       const response = await respondPreferHarness('background', {
@@ -2649,6 +2664,7 @@ export async function startDaemon(
   // fresh foreground alongside a live worker. A failure here fails READINESS —
   // reporting healthy while unable to read the ownership record is the
   // dishonest option, and this throw is what stops onReady from being reached.
+  bootStep('handoffs');
   const reconciledHandoffs = await reconcileHandoffsForBoot();
   if (reconciledHandoffs.length > 0) {
     logger.warn({ reconciled: reconciledHandoffs }, 'Reconciled incomplete foreground handoffs on boot');
@@ -2659,6 +2675,7 @@ export async function startDaemon(
   // the work is complete — a worker that is neither pending nor running is not
   // coming back, whatever its activation rows still claim.
   try {
+    bootStep('fanout_and_dispatch');
     const fanout = reconcileDurableFanout({ taskState: fanoutTaskState });
     if (fanout.rescheduled.length > 0 || fanout.reduced.length > 0 || fanout.failedPlans.length > 0) {
       logger.warn(fanout, 'Reconciled durable fan-out plans on boot');
@@ -2760,6 +2777,7 @@ export async function startDaemon(
   // later run of that workflow, because the correct no-duplicate check kept
   // finding it. One interrupted turn disabled a workflow permanently.
   try {
+    bootStep('interrupted_chat_recovery');
     const reaped = reapOrphanedWorkflowChatDispatches(
       (input) => cancelWorkflowRunAtBoundary(input),
     );
@@ -2838,6 +2856,7 @@ export async function startDaemon(
   // came back and asked. This arms the same terminal report-back a background
   // task emits, on the same channels, so "always reports back" stops depending
   // on the user staying in the room (2026-07-31).
+  bootStep('sweeps');
   startTerminalReportBackWatcher();
   try {
     const reconciledHarnessSessions = reconcileDormantTerminalWorkSessions();
@@ -2909,6 +2928,7 @@ export async function startDaemon(
   // provably unstarted records before Inbox hygiene or workflow draining can
   // observe them. This pass changes local control-plane state only.
   try {
+    bootStep('readiness_and_hygiene');
     const readinessHolds = reconcileLegacyScheduledReadinessHolds();
     if (
       readinessHolds.migrated > 0
@@ -2959,6 +2979,7 @@ export async function startDaemon(
   // exist on disk (disabled). Re-runs are no-ops because the seeder
   // skips seededIds it already created.
   try {
+    bootStep('workflow_seeding');
     ensureSeedTemplates();
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Check-in template seeding failed (continuing)');
@@ -3002,6 +3023,7 @@ export async function startDaemon(
   // approval/compilation/binding/control lineage; it never scans chat prose or
   // infers cadence/recurrence authority.
   try {
+    bootStep('automation_reconcile');
     installAutomationOpportunityReviewControlPlaneReconciler();
     const reviewed = reconcileAutomationOpportunityReviewProjections();
     if (reviewed.approved > 0 || reviewed.rejected > 0 || reviewed.refused > 0 || reviewed.failed > 0) {
@@ -3083,6 +3105,7 @@ export async function startDaemon(
   }
   // A previous process can stop after the exact recurring enumeration settles
   // but before its normalized partition authority reaches durable fan-out.
+  bootStep('lanes_and_timers');
   reconcileAutomationPartitionsOnDaemon('on boot');
 
   // Start the approval reaper. Every 60s it expires past-due rows in
@@ -3599,6 +3622,7 @@ export async function startDaemon(
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Coding run executor failed to start');
   }
 
+  bootStep('heartbeats');
   // Calendar watch heartbeat: a minute-level check that ticks on the policy
   // cadence, reads every connected calendar through the prepared read path,
   // diffs deterministically, and asks Jev only about low-signal changes. It
