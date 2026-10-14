@@ -11618,6 +11618,25 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * A bounded CPU profile of the daemon's main thread (at most two minutes),
+   * taken in-process with no inspector port. Writes the profile beside the
+   * logs and answers with the heaviest functions by self time.
+   */
+  app.post('/api/console/diagnostics/cpu-profile', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const requested = Number((req.body ?? {}).seconds);
+    try {
+      const { captureMainThreadCpuProfile } = await import('../daemon/cpu-profile.js');
+      res.json(await captureMainThreadCpuProfile({
+        seconds: Number.isFinite(requested) ? requested : 30,
+        dir: path.join(BASE_DIR, 'logs', 'profiles'),
+      }));
+    } catch (err) {
+      res.status(409).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Ruflo-inspired harness audit: read-only scorecard over the concrete
    * Clementine substrate (tools, workflows, approvals, agents, learning).
    * This is intentionally separate from diagnostics: diagnostics shows raw
