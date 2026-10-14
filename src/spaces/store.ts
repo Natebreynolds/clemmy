@@ -43,7 +43,7 @@ import {
 } from '../runtime/harness/host-local-write-commit.js';
 import { bootstrapWorkspaceObservationHistory, commitWorkspaceObservationBatch, deleteWorkspaceIndex, getCurrentWorkspaceDatasetObservation, indexWorkspaceRecord, openWorkspaceDb, reindexWorkspaceRecords, serializeWorkspaceProjection } from './workspace-db.js';
 import { canonicalWorkspaceJson, workspaceDataContentDigest } from './workspace-set-data-contract.js';
-import { assertWorkspaceUpdateJournalFits, clearWorkspaceUpdateJournal, persistWorkspaceUpdateJournal, recoverWorkspaceSnapshotUnderOwner, withWorkspaceSnapshotMutation, withWorkspaceSnapshotRead, workspaceSnapshotRevision, writeWorkspaceSnapshotFile } from './workspace-snapshot.js';
+import { assertWorkspaceUpdateJournalFits, clearWorkspaceUpdateJournal, persistWorkspaceUpdateJournal, recoverWorkspaceSnapshotUnderOwner, withWorkspaceSnapshotMutation, withWorkspaceSnapshotRead, workspaceSnapshotRecoveryPending, workspaceSnapshotRevision, writeWorkspaceSnapshotFile } from './workspace-snapshot.js';
 
 export const SPACES_DIR = path.join(BASE_DIR, 'spaces');
 /** Hidden, invalid-as-a-slug directory used as the durable hard-delete marker. */
@@ -1386,6 +1386,21 @@ function commitSpaceViewRevisionUnlocked(slug: string, nextView: string, expecte
 export class SpaceStore {
   /** List every Space by scanning each spaces/<slug>/space.json (newest first). */
   list(includeArchived = false): SpaceRecord[] {
+    return this.listMatching(includeArchived, null);
+  }
+
+  /**
+   * The Spaces a caller has work for (newest first). A Space whose committed
+   * manifest does not match, and that has no update a locked read would first
+   * complete, is passed over without taking its lock: the locked read would
+   * return that same manifest. Everything else is read under the lock and
+   * matched again, so a match is always the current record.
+   */
+  listWhere(matches: (space: SpaceRecord) => boolean, includeArchived = false): SpaceRecord[] {
+    return this.listMatching(includeArchived, matches);
+  }
+
+  private listMatching(includeArchived: boolean, matches: ((space: SpaceRecord) => boolean) | null): SpaceRecord[] {
     try {
       recoverWorkspaceDeletionQuarantine();
     } catch {
@@ -1405,10 +1420,17 @@ export class SpaceStore {
       let isDir = false;
       try { isDir = statSync(path.join(SPACES_DIR, name)).isDirectory(); } catch { continue; }
       if (!isDir) continue;
+      if (matches) {
+        const committed = readManifest(name);
+        let pending = true;
+        try { pending = workspaceSnapshotRecoveryPending(name); } catch { /* unknown: take the locked read */ }
+        if (committed && !pending && ((committed.status === 'archived' && !includeArchived) || !matches(committed))) continue;
+      }
       let rec: SpaceRecord | undefined;
       try { rec = this.get(name); } catch { continue; } // one unrecoverable snapshot cannot hide unrelated Spaces
       if (!rec) continue;
       if (!includeArchived && rec.status === 'archived') continue;
+      if (matches && !matches(rec)) continue;
       out.push(rec);
     }
     return out.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));

@@ -261,7 +261,9 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
     fedOnSchedule = await scheduledFeedCollectionsBySpace();
   } catch { /* the feed index is unreadable: every source keeps its own timer */ }
 
-  for (const space of spaceStore.list()) {
+  const scheduledSpaces = spaceStore.listWhere((space) => space.status === 'active'
+    && space.dataSources.some((ds) => Boolean(ds.schedule)));
+  for (const space of scheduledSpaces) {
     if (space.status !== 'active') continue;
     for (const ds of space.dataSources) {
       if (!ds.schedule) continue;
@@ -431,7 +433,11 @@ async function retryPausedSpacesOwned(now: Date): Promise<PausedRetryResult> {
   const out: PausedRetryResult = { examined: 0, reactivated: 0, stillPaused: 0 };
   const nowMs = now.getTime();
 
-  for (const space of spaceStore.list()) {
+  // Only a build-paused Space with sources, or an active one still holding a
+  // retry budget, has anything for this pass to do.
+  const candidates = spaceStore.listWhere((space) => (space.status === 'paused' && space.pausedBy === 'build_check'
+    && space.dataSources.length > 0) || (space.status === 'active' && Boolean(retries[space.id])));
+  for (const space of candidates) {
     if (space.status !== 'paused' || space.pausedBy !== 'build_check' || space.dataSources.length === 0) {
       if (space.status === 'active' && retries[space.id]) delete retries[space.id]; // fixed via re-save → reset budget
       continue;
