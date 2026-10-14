@@ -443,6 +443,62 @@ export function reconcileIdleChatEvent(messages: readonly ChatMessage[], event: 
       activity: settleTerminalActivity(message.activity ?? EMPTY_ACTIVITY, activityTerminalOutcomeForMessageStatus(presentation.status)) } : {}) } : message);
 }
 
+/** One own-session recovery observation can update both admission and the
+ * visible reply before the primary live stream observes the same row. */
+export function deliverObservedOwnChatEvent(event: HarnessEvent, sessionId: string, observeReply: boolean, handlers: {
+  observeReceipt(event: HarnessEvent): void;
+  updateMessages(update: (previous: ChatMessage[]) => ChatMessage[]): void;
+  settleTerminal?(event: HarnessEvent): void;
+}): void {
+  handlers.observeReceipt(event);
+  handlers.settleTerminal?.(event);
+  handlers.updateMessages(previous => reconcileIdleChatEvent(previous, event, sessionId, observeReply));
+}
+
+/** Release presentation ownership only for this exact active source. A
+ * recovered terminal need not wait for the primary connection's promise. */
+export function settleObservedChatTerminal(event: HarnessEvent, owner: {
+  sessionId: string | null; activeAssistantId: string | null;
+  accepted: { assistantId: string; source: AcceptedChatSource } | null;
+  workflowReport?: { assistantId: string; source: AcceptedChatSource } | null;
+}, settleLocal: () => void): boolean {
+  const accepted = owner.accepted;
+  if (!accepted || !owner.activeAssistantId || accepted.assistantId !== owner.activeAssistantId
+    || event.type !== 'conversation_completed' || readLiveApprovalControl(event)
+    || event.sessionId !== owner.sessionId || accepted.source.sessionId !== event.sessionId
+    || event.data?.sourceUserSeq !== accepted.source.sourceUserSeq || !(event.seq > accepted.source.sourceUserSeq)) return false;
+  // A dispatched workflow owns a separate report watch; its origin terminal
+  // cannot close a newer foreground stream or substitute for that watcher.
+  if (owner.workflowReport?.assistantId === accepted.assistantId
+    && owner.workflowReport.source.sessionId === accepted.source.sessionId
+    && owner.workflowReport.source.sourceUserSeq === accepted.source.sourceUserSeq) return false;
+  const data = event.data ?? {};
+  const presentation = data.presentation as Record<string, any> | undefined;
+  const outcome = data.turnOutcome as Record<string, any> | undefined;
+  if (presentation?.version !== 1 || presentation.audience !== 'user' || presentation.phase !== 'final'
+    || presentation.identity?.sessionId !== accepted.source.sessionId
+    || presentation.identity?.sourceUserSeq !== accepted.source.sourceUserSeq
+    || presentation.identity?.turn !== accepted.source.turn || outcome?.version !== 2
+    || typeof presentation.status !== 'string'
+    || presentation.status !== outcome.status
+    || terminalCompletionPresentation(data, '').terminal?.status !== presentation.status) return false;
+  settleLocal();
+  return true;
+}
+
+export function releaseLocalChatStream(reference: { current: StreamHandle | null }, handle: StreamHandle): boolean {
+  if (reference.current !== handle) return false;
+  reference.current = null;
+  return true;
+}
+
+export function finishLocalChatSend(assistantId: string, active: { current: string | null }, setIdle: () => void): boolean {
+  if (active.current !== assistantId) return false;
+  active.current = null;
+  setIdle();
+  return true;
+}
+
 let idSeq = 0;
 const nextId = () => `m${++idSeq}-${performance.now().toFixed(0)}`;
 const EMPTY_ACTIVITY: ActivityItem[] = [];
@@ -1630,6 +1686,19 @@ export function useChat(options?: UseChatOptions) {
   const patch = useCallback((id: string, fields: Partial<ChatMessage>) => {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...fields } : m)));
   }, []);
+  const settleRecoveredTerminal = useCallback((event: HarnessEvent) => {
+    settleObservedChatTerminal(event, { sessionId: sessionIdRef.current, activeAssistantId: activeAssistantId.current,
+      accepted: acceptedStreamSourceRef.current, workflowReport: awaitingWorkflowReportRef.current }, () => {
+      // This is a local watch closeout, never a server Stop or cancellation.
+      activeAssistantId.current = null;
+      activeRunRef.current = null;
+      acceptedStreamSourceRef.current = null;
+      const localStream = streamRef.current;
+      streamRef.current = null;
+      setBusy(false); // updates busyRef synchronously before the next send
+      localStream?.stop();
+    });
+  }, [setBusy]);
 
   // Workflow/background approval events stay small and reference the durable
   // action by id. Hydrate those cards asynchronously so live and reopened
@@ -1699,6 +1768,7 @@ export function useChat(options?: UseChatOptions) {
           fetchPage: (url) => apiGet<RecentEventsPage>(url),
           onEvents: (events) => {
             for (const event of events) observePendingSteerReceipt(event);
+            for (const event of events) settleRecoveredTerminal(event);
             setMessages(previous => events.reduce((current, event) => reconcileIdleChatEvent(current, event, sid), previous));
           },
         });
@@ -1720,7 +1790,7 @@ export function useChat(options?: UseChatOptions) {
     void tick();
     const timer = window.setInterval(() => { void tick(); }, 5000);
     return () => { stopped = true; window.clearInterval(timer); };
-  }, [busy, observePendingSteerReceipt]);
+  }, [busy, observePendingSteerReceipt, settleRecoveredTerminal]);
 
   // Mount identity + teardown (2026-08-04 static-window work). Recording the
   // restored session keeps the chat index pointing at the conversation the
@@ -1807,7 +1877,8 @@ export function useChat(options?: UseChatOptions) {
         const handle = runHarnessStream(sid, { sinceSeq: lastUserSeq, onEvent: (ev) => applyEvent(assistantId, ev) });
         streamRef.current = handle;
         const result = await handle.promise;
-        if (cancelled) return;
+        const ownedStream = releaseLocalChatStream(streamRef, handle);
+        if (cancelled || !ownedStream || activeAssistantId.current !== assistantId || sessionIdRef.current !== sid) return;
         if (!result.ok) {
           // Stream gave up but the run may still finish — same late-recovery
           // net send() uses.
@@ -1908,10 +1979,12 @@ export function useChat(options?: UseChatOptions) {
         return next;
       });
     }, noteDelegatedTask, (event, observeReply) => {
-      observePendingSteerReceipt(event);
-      setMessages(previous => reconcileIdleChatEvent(previous, event, sid, observeReply));
+      deliverObservedOwnChatEvent(event, sid, observeReply, {
+        observeReceipt: observePendingSteerReceipt, updateMessages: setMessages,
+        settleTerminal: settleRecoveredTerminal,
+      });
     });
-  }, [busy, noteDelegatedTask, observePendingSteerReceipt]);
+  }, [busy, noteDelegatedTask, observePendingSteerReceipt, settleRecoveredTerminal]);
 
   const applyEvent = useCallback((assistantId: string, ev: HarnessEvent, sourceBoundary?: { sessionId: string; afterSeq: number }) => {
     if (ev.type === 'delegated_task_state') noteDelegatedTask();
@@ -1919,6 +1992,7 @@ export function useChat(options?: UseChatOptions) {
     const d = (ev.data ?? {}) as Record<string, unknown>;
     setMessages(previous => applySteerReceiptEvent(previous, ev, sessionIdRef.current));
     if (ev.type === 'user_steer_note' || ev.type === 'user_steer_receipt') return;
+    settleRecoveredTerminal(ev);
     if (ev.type === 'user_input_received' && sourceBoundary) {
       const source = acceptedChatSource(ev, sourceBoundary.sessionId);
       if (source && source.sourceUserSeq > sourceBoundary.afterSeq && sessionIdRef.current === source.sessionId
@@ -2062,7 +2136,7 @@ export function useChat(options?: UseChatOptions) {
       setMessages(previous => previous.map(message => message.id === assistantId
         ? applyChatProgressEvent(message, ev, owner) : message));
     }
-  }, [noteDelegatedTask, observePendingSteerReceipt]);
+  }, [noteDelegatedTask, observePendingSteerReceipt, settleRecoveredTerminal]);
 
   const handoffAcceptedRun = useCallback(async (
     accepted: ChatPostResult,
@@ -2096,10 +2170,11 @@ export function useChat(options?: UseChatOptions) {
   }, [patch]);
 
   const send = useCallback(async (input: { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string }; voice?: boolean; onAccepted?: () => void }, retryRequest?: PendingChatPost) => {
-    if (busy && input.connectionResume) throw new Error('Another turn is running. Your connection is saved; check again when it finishes.');
+    const running = busyRef.current;
+    if (running && input.connectionResume) throw new Error('Another turn is running. Your connection is saved; check again when it finishes.');
     const taskMode = snapshotTaskMode(input.connectionResume ? undefined : input.taskMode);
     const activeMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
-    if (busy && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, activeMode))) {
+    if (running && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, activeMode))) {
       throw new Error('Wait for the current turn to finish before changing modes or executing a plan.');
     }
     const text = input.text.trim();
@@ -2111,11 +2186,11 @@ export function useChat(options?: UseChatOptions) {
     const agentId = sessionIdRef.current ? undefined : (input.agentId || undefined);
     // The same for the project a new session opens in (lib/conversation-project).
     const projectId = sessionIdRef.current ? undefined : (input.projectId || undefined);
-    if (!busy && pendingPostRef.current && !retryRequest) {
+    if (!running && pendingPostRef.current && !retryRequest) {
       const candidate = retainPendingChatPost(pendingPostRef.current, { input: text, attachments: attachmentIds, sessionId: sessionIdRef.current, taskMode, agentId, projectId, connectionRequestId: input.connectionResume?.connectionRequestId });
       if (candidate !== pendingPostRef.current) throw new Error('Retry or cancel the unconfirmed request before sending a different one.');
     }
-    if (busy) {
+    if (running) {
       // MID-RUN STEERING: the message reaches the RUNNING turn at its next
       // tool-result boundary — it must not claim a new attempt (that would
       // supersede and kill the active run). steerOnly makes the server
@@ -2239,7 +2314,9 @@ export function useChat(options?: UseChatOptions) {
       });
       streamRef.current = handle;
       const result = await handle.promise;
-      streamRef.current = null;
+      const ownedStream = releaseLocalChatStream(streamRef, handle);
+      if (!ownedStream || postAbortRef.current !== postAbort || activeAssistantId.current !== assistantId
+        || sessionIdRef.current !== body.sessionId) return;
       // Stream callbacks can update this ref while the promise is pending.
       const waitingWorkflowReport = awaitingWorkflowReportRef.current as { assistantId: string; source: AcceptedChatSource } | null;
       if (!result.ok) {
@@ -2287,8 +2364,7 @@ export function useChat(options?: UseChatOptions) {
       // active bubble, or busy state.
       if (postAbortRef.current === postAbort) {
         postAbortRef.current = null;
-        if (activeAssistantId.current === assistantId) activeAssistantId.current = null;
-        setBusy(false);
+        finishLocalChatSend(assistantId, activeAssistantId, () => setBusy(false));
       }
       const pendingBackground = pendingBackgroundRef.current as { assistantId: string } | null;
       if (pendingBackground?.assistantId === assistantId) pendingBackgroundRef.current = null;

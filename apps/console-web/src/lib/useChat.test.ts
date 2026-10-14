@@ -1610,7 +1610,7 @@ test('steer receipt idle cache: own-session push and idle poll observe committed
   const source = readFileSync(new URL('./useChat.ts', import.meta.url), 'utf8');
   assert.match(source, /onEvents: \(events\) => \{\s+for \(const event of events\) observePendingSteerReceipt\(event\);/,
     'idle poll must observe the receipt before scheduling its message reducer');
-  assert.match(source, /noteDelegatedTask, \(event, observeReply\) => \{\s+observePendingSteerReceipt\(event\);/,
+  assert.match(source, /noteDelegatedTask, \(event, observeReply\) => \{\s+deliverObservedOwnChatEvent\(event, sid, observeReply, \{\s+observeReceipt: observePendingSteerReceipt/,
     'own-session delegated events take the own callback, not the foreign activity callback');
   const { observePendingSteerReceiptEchoes } = await import('./useChat');
   const sid = 'sess-console-idle-cache';
@@ -1633,4 +1633,122 @@ test('steer receipt idle cache: own-session push and idle poll observe committed
   assert.equal(unknownCache.get('console-idle-key')?.steerNoteSeq, 11);
   assert.equal(unknownCache.get('console-idle-key')?.steerReceipt, undefined);
   assert.equal(hasSteerAdmission(original), false);
+});
+
+test('recovered own terminal releases the composer while the primary stream is still waiting', async () => {
+  const { runHarnessStream, subscribeDelegatedActivity } = await import('./chat');
+  const { deliverObservedOwnChatEvent, settleObservedChatTerminal } = await import('./useChat');
+  type Listener = (event: { data: string }) => void;
+  class FakeEventSource {
+    static instances: FakeEventSource[] = [];
+    listeners = new Map<string, Listener>(); onerror: (() => void) | null = null;
+    closed = false;
+    constructor(_url: string) { FakeEventSource.instances.push(this); }
+    addEventListener(type: string, listener: Listener) { this.listeners.set(type, listener); }
+    close() { this.closed = true; }
+    emit(type: string, value: unknown) { this.listeners.get(type)?.({ data: JSON.stringify(value) }); }
+  }
+  const oldSource = globalThis.EventSource; const oldWindow = globalThis.window;
+  Object.assign(globalThis, { EventSource: FakeEventSource,
+    window: { __CLEM_BOOTSTRAP__: { token: 'synthetic-local-watch', version: '', flags: {} } } });
+  let busy = true; const busyRef = { current: true }; let localCloses = 0;
+  let messages: ChatMessage[] = [{ id: 'reattached-owner', role: 'assistant', text: '', status: 'thinking',
+    acceptedSource: { sessionId: 'sess-recovered-owner', sourceUserSeq: 10, turn: 1 } }];
+  const owner: Parameters<typeof settleObservedChatTerminal>[1] = { sessionId: 'sess-recovered-owner', activeAssistantId: 'reattached-owner',
+    accepted: { assistantId: 'reattached-owner', source: { sessionId: 'sess-recovered-owner', sourceUserSeq: 10, turn: 1 } } };
+  const primary = runHarnessStream('sess-recovered-owner', { sinceSeq: 10, onEvent: () => {} });
+  let primarySettled = false; void primary.promise.then(() => { primarySettled = true; });
+  const detach = subscribeDelegatedActivity('sess-recovered-owner', () => {}, undefined, (event, observeReply) => {
+    deliverObservedOwnChatEvent(event, 'sess-recovered-owner', observeReply, {
+      observeReceipt: () => {}, updateMessages: update => { messages = update(messages); },
+      settleTerminal: terminal => { settleObservedChatTerminal(terminal, owner, () => {
+        owner.activeAssistantId = null; owner.accepted = null;
+        busyRef.current = false; busy = false; localCloses++; primary.stop();
+      }); },
+    });
+  });
+  try {
+    const id = 'turn:10';
+    FakeEventSource.instances[1]!.emit('event', { seq: 20, turn: 1, role: 'Clem', type: 'conversation_completed',
+      sessionId: 'sess-recovered-owner', data: { sourceUserSeq: 10, logicalTerminalVersion: 1, terminalKey: id,
+        reply: 'Synthetic completed answer', delivered: true,
+        presentation: { version: 1, id: `${id}:presentation`, outcomeId: id, audience: 'user', phase: 'final',
+          identity: { sessionId: 'sess-recovered-owner', sourceUserSeq: 10, turn: 1 }, status: 'done', kind: 'answer', text: 'Synthetic completed answer', resumable: false },
+        turnOutcome: { version: 2, id, status: 'done', resumable: false } } });
+    assert.equal(messages[0]!.status, 'complete', 'secondary own observer already painted the terminal');
+    assert.equal(busyRef.current, false, 'the immediate next send must not enter steerOnly');
+    assert.equal(busy, false, 'the composer must leave its active-run presentation synchronously');
+    await Promise.resolve();
+    assert.equal(primarySettled, true, 'only the local primary watch is settled');
+    assert.equal(localCloses, 1);
+  } finally { primary.stop(); detach(); Object.assign(globalThis, { EventSource: oldSource, window: oldWindow }); }
+});
+
+test('recovered terminal closeout preserves foreign, prior, newer and workflow owners and ignores approval acknowledgements', async () => {
+  const { settleObservedChatTerminal } = await import('./useChat');
+  const sid = 'sess-recovered-guards';
+  const source = { sessionId: sid, sourceUserSeq: 10, turn: 1 };
+  const owner = { sessionId: sid, activeAssistantId: 'active-owner', accepted: { assistantId: 'active-owner', source } };
+  const terminal: HarnessEvent = { seq: 20, turn: 1, role: 'Clem', sessionId: sid, type: 'conversation_completed', data: {
+    sourceUserSeq: 10, presentation: { version: 1, audience: 'user', phase: 'final', identity: source, status: 'done', kind: 'answer' },
+    turnOutcome: { version: 2, status: 'done' }, reply: 'Synthetic finished answer' } };
+  let closed = 0;
+  const settle = () => { closed++; };
+  const data = terminal.data!;
+  const badEvents: HarnessEvent[] = [
+    { ...terminal, sessionId: 'foreign' },
+    { ...terminal, seq: 10 },
+    { ...terminal, data: { ...data, sourceUserSeq: 9 } },
+    { ...terminal, data: { ...data, sourceUserSeq: 11 } },
+    { ...terminal, data: { ...data, presentation: { ...(data.presentation as object), identity: { ...source, sourceUserSeq: 9 } } } },
+    { ...terminal, data: { ...data, presentation: { ...(data.presentation as object), identity: { ...source, turn: 2 } } } },
+    { ...terminal, data: { ...data, turnOutcome: { version: 2, status: 'blocked' } } },
+    { ...terminal, data: { sourceUserSeq: 10, reply: 'Legacy row without typed ownership' } },
+    { ...terminal, data: { ...data, presentation: { ...(data.presentation as object), status: undefined }, turnOutcome: { version: 2 } } },
+    { ...terminal, type: 'approval_requested' },
+    { ...terminal, data: { ...data, liveApprovalControl: { version: 1, ownerAttemptId: 'synthetic-attempt', ownerSourceUserSeq: 9 } } },
+  ];
+  for (const event of badEvents) assert.equal(settleObservedChatTerminal(event, owner, settle), false);
+  for (const otherOwner of [
+    { ...owner, activeAssistantId: 'newer-owner' },
+    { ...owner, activeAssistantId: null },
+    { ...owner, accepted: { ...owner.accepted, source: { ...source, sourceUserSeq: 11 } } },
+    { ...owner, workflowReport: owner.accepted },
+  ]) assert.equal(settleObservedChatTerminal(terminal, otherOwner, settle), false);
+  assert.equal(closed, 0);
+  for (const status of ['done', 'needs_input', 'blocked', 'failed', 'cancelled', 'transferred', 'uncertain']) {
+    assert.equal(settleObservedChatTerminal({ ...terminal, data: { ...data,
+      presentation: { ...(data.presentation as object), status }, turnOutcome: { version: 2, status } } }, owner, settle), true);
+  }
+  assert.equal(closed, 7, 'known own typed terminals end only their local presentation ownership');
+  const { readFileSync } = await import('node:fs');
+  const hook = readFileSync(new URL('./useChat.ts', import.meta.url), 'utf8');
+  assert.match(hook, /for \(const event of events\) settleRecoveredTerminal\(event\);/, 'idle poll recovery closes the same exact local owner');
+  assert.match(hook, /settleTerminal: settleRecoveredTerminal/, 'own-session secondary stream routes terminal closeout');
+});
+
+test('older stream promise cleanup cannot clear a synchronously installed newer owner', async () => {
+  const { releaseLocalChatStream, finishLocalChatSend } = await import('./useChat');
+  let finishOld!: () => void;
+  const oldStream = { promise: new Promise<{ ok: boolean; error: string | null }>(resolve => { finishOld = () => resolve({ ok: true, error: null }); }),
+    stop: () => finishOld(), getLastSeq: () => 10, getReplayCursor: () => ({ scanSeq: 10, seen: new Set<string>() }) };
+  const newerStream = { ...oldStream, stop: () => {} };
+  const stream = { current: oldStream as typeof oldStream | null };
+  const active = { current: 'older-owner' as string | null }; let busy = true;
+  const oldContinuation = (async () => {
+    await oldStream.promise;
+    releaseLocalChatStream(stream, oldStream);
+    // This also covers a newer recovered owner that did not create a POST
+    // controller: the old request's guard can still be current in that edge.
+    finishLocalChatSend('older-owner', active, () => { busy = false; });
+  })();
+  oldStream.stop();
+  stream.current = newerStream; active.current = 'newer-owner'; busy = true;
+  await oldContinuation;
+  assert.deepEqual({ streamPreserved: stream.current === newerStream, active: active.current, busy },
+    { streamPreserved: true, active: 'newer-owner', busy: true });
+  assert.equal(releaseLocalChatStream(stream, newerStream), true);
+  assert.equal(finishLocalChatSend('newer-owner', active, () => { busy = false; }), true);
+  assert.equal(stream.current, null); assert.equal(active.current, null); assert.equal(busy, false,
+    'ordinary owner failure/closeout still frees its own composer');
 });
