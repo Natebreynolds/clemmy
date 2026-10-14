@@ -10076,6 +10076,10 @@ for (const boundary of ['review_done', 'review_awaiting', 'review_correction',
     t.after(detachEvents);
     const running = runProductionHost(fixture, agent, undefined, { hostJudgeCompletion: true, maxTurns: 6,
       ...(boundary === 'cancelled_review' ? { signal: controller.signal } : {}) });
+    const cancelled = boundary === 'cancelled_review'
+      ? assert.rejects(running, error => error === controller.signal.reason,
+        'a genuine caller Stop keeps its exact error instead of becoming a review verdict')
+      : undefined;
     if (boundary !== 'format_hold') {
       await Promise.race([atBoundary, running.then(outcome => {
         throw new Error(`Runner ended before the controlled boundary: ${JSON.stringify({ terminal: outcome.terminal,
@@ -10088,9 +10092,19 @@ for (const boundary of ['review_done', 'review_awaiting', 'review_correction',
       if (boundary === 'cancelled_review') controller.abort(new Error('controlled owner Stop'));
       release();
     }
+    if (boundary === 'cancelled_review') {
+      await cancelled;
+      assert.ok(note, 'a durable note arrived at the selected final boundary');
+      assert.equal(model.calls(), 2, 'foreign steering and cancellation cannot authorize another request');
+      assert.equal(reads, 1);
+      assert.equal(eventlog.listEvents(session.id, { types: ['user_steer_note_delivered'] }).length, 0);
+      assert.equal(eventlog.listEvents(session.id, { types: ['goal_alignment_judged'] }).length, 0,
+        'caller Stop cannot publish a completed or failed-open reviewer verdict');
+      return;
+    }
     const outcome = await running;
     assert.ok(note, 'a durable note arrived at the selected final boundary');
-    if (boundary === 'foreign_note' || boundary === 'cancelled_review') {
+    if (boundary === 'foreign_note') {
       assert.equal(model.calls(), 2, 'foreign steering and cancellation cannot authorize another request');
       assert.equal(reads, 1);
       assert.equal(eventlog.listEvents(session.id, { types: ['user_steer_note_delivered'] }).length, 0);

@@ -3,6 +3,7 @@ import { liftNestedCarrierFields } from './carrier-field-lift.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
+import { CompletionReviewSupersededError, reviewWithOwnerSteering } from './completion-review-steering.js';
 import {
   STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON,
   STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT,
@@ -4667,6 +4668,7 @@ const runHostTurnBody = async (
     ownerFormatCapture?: OwnerResponseFormatCapture,
     ownerFormatRequiredAtRequest = false,
     formatRepairReviewRequired = false,
+    ordinaryReviewOwner?: TerminalSteeringOwner,
   ): Promise<'continue' | 'done' | 'awaiting_user_input'> => {
     ownerResponseFormatHeld = undefined;
     // This host-owned, tool-free activation explains why the work stopped.
@@ -4928,7 +4930,7 @@ const runHostTurnBody = async (
       });
       // A changed candidate needs the whole objective and current evidence.
       // Missing quotes and quoted format suggestions do not prove fulfillment.
-      verdict = await hostObjectiveJudge(objective, judgedReply, {
+      const reviewed = await reviewWithOwnerSteering(planCandidate ? undefined : ordinaryReviewOwner, () => hostObjectiveJudge(objective, judgedReply, {
         sessionId: identity.sessionId,
         reviewInputOwner,
         completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE,
@@ -5015,7 +5017,9 @@ const runHostTurnBody = async (
           planCandidate ? undefined : earlierTurnsEvidence(identity),
           preparation?.summary,
         ].filter(Boolean).join('\n'),
-      });
+      }), signal);
+      if (reviewed.status === 'superseded') throw new CompletionReviewSupersededError();
+      verdict = reviewed.value;
       if (inheritedReads && (!inheritedReads.stillCurrent()
         || stoppedReadEffectiveObjective(inheritedReads.bindings)?.objectiveDigest !== inheritedObjective?.objectiveDigest)) {
         throw new Error('Exact inherited read evidence changed during completion review');
@@ -5024,6 +5028,13 @@ const runHostTurnBody = async (
         throw new Error('Workflow execution evidence changed during completion review');
       }
     } catch (error) {
+      // An admitted amendment retires this candidate, never into failed-open
+      // completion or another review-repair round. Caller Stop still wins.
+      if (ordinaryReviewOwner) {
+        signal?.throwIfAborted();
+        harnessRunContextStorage.getStore()?.callerCancelSignal?.throwIfAborted();
+      }
+      if (error instanceof CompletionReviewSupersededError) throw error;
       verdict = {
         done: true,
         reason: `The completion reviewer failed; no review was completed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300),
@@ -11521,10 +11532,10 @@ const runHostTurnBody = async (
           && sameReplyOwner(actualAuthor.owner, owner)
           ? { ...actualAuthor, digest: createHash('sha256').update(candidateText, 'utf8').digest('hex') } : undefined;
         const completionObjective = judgedObjective();
-        const judged = await judgeHostCompletion(candidateText, admission.frame.history, step.responseId, undefined,
-          normalization ? { normalization, originalReply: admission.frame.text } : undefined,
-          ownerResponseFormatForStep, ownerResponseFormatRequiredForStep, Boolean(formatRepairForStep));
         try {
+          const judged = await judgeHostCompletion(candidateText, admission.frame.history, step.responseId, undefined,
+            normalization ? { normalization, originalReply: admission.frame.text } : undefined,
+            ownerResponseFormatForStep, ownerResponseFormatRequiredForStep, Boolean(formatRepairForStep), terminalCutoverOwner);
           if (reopenForOwnerSteering(completionObjective, answerDraft)) continue;
           if (ownerResponseFormatHeld) {
             if (!closeForOwnerSteering(completionObjective, admission.frame.text, answerDraft)) continue;
@@ -11563,6 +11574,20 @@ const runHostTurnBody = async (
               terminal: { status: 'awaiting_user_input', reason: 'completion_review_needs_input' } };
           }
         } catch (error) {
+          if (error instanceof CompletionReviewSupersededError) {
+            try {
+              if (reopenForOwnerSteering(completionObjective, answerDraft)) {
+                journalHostGuide('completion_review_superseded', {
+                  objectiveDigest: createHash('sha256').update(completionObjective, 'utf8').digest('hex'),
+                  replyDigest: createHash('sha256').update(candidateText, 'utf8').digest('hex') });
+                continue;
+              }
+              throw new OwnerSteeringFenceError('STEER_NOTE_UNAVAILABLE');
+            } catch (fenceError) {
+              if (!(fenceError instanceof OwnerSteeringFenceError)) throw fenceError;
+              return heldByOwnerSteeringFence(fenceError, candidateText, admission.frame.history, step.responseId);
+            }
+          }
           if (!(error instanceof OwnerSteeringFenceError)) throw error;
           return heldByOwnerSteeringFence(error, candidateText, admission.frame.history, step.responseId);
         }
