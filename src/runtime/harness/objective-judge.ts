@@ -274,6 +274,10 @@ export interface ObjectiveJudgeVerdict {
    *  send the work back, whether a full review upheld or overruled it. */
   reviewDepth?: 'full' | 'fast';
   reviewConfirmation?: 'upheld' | 'overruled' | 'unavailable';
+  /** A read-only answer revised once to a claims-only finding: the host
+   *  verified that none of the reviewer's quoted claims remain, and the
+   *  revised answer shipped on that check instead of a second review. */
+  claimRevision?: { scope: 'claims' | 'reply_format'; fromReplyDigest: string; quotes: string[] };
   selfJudge?: boolean;
   selfJudgeBasis?: CompletionJudgeComparisonDiagnostic['selfJudgeBasis'];
   servedAuthorQualification?: 'unknown';

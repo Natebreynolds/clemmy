@@ -1248,6 +1248,12 @@ test('a schema refusal preserves its carrier and the turn\'s available discovery
   assert.deepEqual([...hostNoProgressRecoveryToolNames(consequence,
     ['call_tool', 'work_call', 'proven_read', 'unknown_mutation'], ['proven_read'])],
   ['call_tool', 'work_call', 'proven_read'], 'proven reads retain their existing carrier');
+  // Live 2026-10-13: a step that reported itself blocked after a refused send
+  // was refused again for reporting. The control that ends a step is on
+  // every recovery surface, like publish_plan on a plan turn.
+  assert.deepEqual([...hostNoProgressRecoveryToolNames(consequence,
+    ['workflow_step_result', 'unknown_mutation', 'tool_search'])],
+  ['workflow_step_result', 'tool_search'], 'the step terminal is always available in recovery');
 
   const initial = initializeNoProgressGovernor({
     taskKey: attemptIdentity.acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq),

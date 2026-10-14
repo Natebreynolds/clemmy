@@ -66,8 +66,8 @@ const ERROR_TEXT: Record<string, string> = {
  * provider's HTTP status, when the service kept it, tells a plan refusal
  * (402: the account has no browser time or an unpaid plan) from a concurrency
  * one (429: another browser holds the slot); the two have different fixes.
- * Live 2026-10-13: every start since 10-09 was a 402, read as "plan or
- * concurrency limit", and the owner looked for a stuck browser. */
+ * Read together as "plan or concurrency limit", a payment refusal sends the
+ * owner looking for a stuck browser. */
 export function browserbaseErrorText(code: string, httpStatus?: number): string {
   if (code === 'provider_limit' && httpStatus === 402) {
     return "Browserbase refused because the connected account's plan has no browser time left or needs payment (it answered 402), "
@@ -171,12 +171,11 @@ export class BrowserbaseService {
     if (dependencies.autoMaintenance !== false) { this.timer = setInterval(() => { void this.maintenance().catch(() => {}); }, 30000); this.timer.unref(); }
   }
   dispose(): void { if (this.timer) clearInterval(this.timer); }
-  /** Live 2026-10-13: a workflow step opened a Kernel browser to read one page
-   *  and the session stayed active, billed, for the whole idle window after
-   *  the run had finished. Nobody is watching an unattended run's browser once
-   *  the run is over: an agent-controlled browser owned by a finished workflow
-   *  run is released at the next maintenance pass. A browser a human took
-   *  over is theirs and keeps the idle policy. */
+  /** A workflow step's browser otherwise stays active, billed, for the whole
+   *  idle window after its run has finished. Nobody is watching an unattended
+   *  run's browser once the run is over: an agent-controlled browser owned by
+   *  a finished workflow run is released at the next maintenance pass. A
+   *  browser a human took over is theirs and keeps the idle policy. */
   private readonly ownerFinished: (conversationId: string) => boolean;
   private static workflowRunFinished(conversationId: string): boolean {
     const match = /^workflow:([A-Za-z0-9_.-]+):.+$/.exec(conversationId.trim());

@@ -10757,7 +10757,125 @@ test('the host explanation survives an enabled completion judge without claiming
 
 // Live 2026-09-24/25: after the last review round an answer was delivered
 // "blocked" while still containing the figures the reviewer flagged.
-test('when the rounds are spent on claims-only findings, the answer ships without them and passes delivery', async () => {
+test('a claims paraphrase receives a whole-objective review even after the quoted substring is gone', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const draft = 'Kernel is the chosen browser. Both providers are connected with live credentials.';
+  const revised = 'Kernel is the chosen browser. Both providers are configured with credentials available.';
+  const finding = '(1) "connected with live credentials" overstates the evidence: credentials are available, not tested.';
+  let judgeCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    judgeCalls += 1;
+    return judgeCalls === 1 ? { done: false, repairScope: 'claims', reason: finding } as never
+      : { done: true, reason: 'The revision states only the supplied configured-credential evidence.' };
+  });
+  try {
+    const fixture = acceptJudgedSource('claims-revised-once',
+      'Write a browser snapshot from this supplied record: Kernel is selected; both providers have credentials configured, but no live connection was tested.');
+    const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(revised)]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const outcome = await runJudgedHost(fixture, agent, true);
+    assert.equal(judgeCalls, 2, 'the changed claim must reach the whole-objective reviewer');
+    assert.equal(String(outcome.finalOutput), revised);
+    const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
+    const last = verdicts.at(-1)!;
+    assert.equal(last.data.fulfills, true);
+    assert.equal(last.data.claimRevision, undefined, 'quote disappearance is not semantic review provenance');
+    assert.equal(last.data.replyDigest, createHash('sha256').update(revised, 'utf8').digest('hex'));
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
+test('a quoted format replacement receives whole-objective review before fulfillment', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const draft = 'Cloud browser on this machine:\n- Kernel selected\n- credentials configured';
+  const line = 'Cloud browser on this machine: Kernel selected; credentials configured.';
+  let judgeCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    judgeCalls += 1;
+    return judgeCalls === 1
+      ? { done: false, repairScope: 'reply_format', reason: `Replace the response with one line: “${line}”` } as never
+      : { done: true, reason: 'The complete supplied snapshot is present in the required line.' };
+  });
+  try {
+    const fixture = acceptJudgedSource('format-replaced-once',
+      'Write one line from this supplied browser snapshot: Kernel selected; credentials configured.');
+    const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(line)]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const outcome = await runJudgedHost(fixture, agent, true);
+    assert.equal(judgeCalls, 2, 'a quoted replacement alone is not whole-objective approval');
+    assert.equal(String(outcome.finalOutput), line);
+    const last = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] }).at(-1)!;
+    assert.equal(last.data.fulfills, true);
+    assert.equal(last.data.claimRevision, undefined);
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
+test('a revision that still carries a quoted claim is reviewed again', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const draft = 'Kernel is the chosen browser. Both providers are connected with live credentials.';
+  const finding = '(1) "connected with live credentials" overstates the evidence.';
+  let judgeCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    judgeCalls += 1;
+    return judgeCalls === 1
+      ? { done: false, repairScope: 'claims', reason: finding } as never
+      : { done: true, reason: 'The reply matches the evidence.' } as never;
+  });
+  try {
+    const fixture = acceptJudgedSource('claims-still-present',
+      'Write a browser snapshot from this supplied record: Kernel selected; credentials configured but untested.');
+    const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(`${draft} (checked again)`)]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    await runJudgedHost(fixture, agent, true);
+    assert.equal(judgeCalls, 2, 'a quoted claim that remains goes back to the reviewer');
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
+test('changed replies cannot waive unsupported paraphrases, missing deliverables or rejected format examples', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const cases = [
+    { label: 'paraphrased-unsupported', scope: 'claims' as const,
+      objective: 'Write a browser snapshot: credentials are configured but no provider connection was tested.',
+      draft: 'Both providers are connected with live credentials.',
+      revised: 'Both providers have live authenticated connections.',
+      finding: '"connected with live credentials" is unsupported; credentials were configured, not tested.' },
+    { label: 'missing-deliverable', scope: 'claims' as const,
+      objective: 'Write the browser snapshot and post it to the channel.',
+      draft: 'Both providers are connected with live credentials. The snapshot is ready.',
+      revised: 'The snapshot is ready.',
+      finding: '"connected with live credentials" is unsupported.' },
+    { label: 'rejected-format-quote', scope: 'reply_format' as const,
+      objective: 'Write one browser-status line: credentials are configured but no connection was tested.',
+      draft: 'Browser status:\n- credentials configured\n- connections untested',
+      revised: 'All provider connections passed live tests.',
+      finding: 'Do not use "All provider connections passed live tests."; retain the untested qualification on one line.' },
+  ];
+  try {
+    for (const scenario of cases) {
+      const reviewed: Array<{ objective: string; reply: string }> = [];
+      _setHostObjectiveJudgeForTests(async (objective, reply) => {
+        reviewed.push({ objective, reply });
+        return reviewed.length === 1
+          ? { done: false, repairScope: scenario.scope, reason: scenario.finding }
+          : { done: false, blocked: true, reason: 'The changed response still does not fulfill the complete accepted request.' };
+      });
+      const fixture = acceptJudgedSource(scenario.label, scenario.objective);
+      const model = scriptedRecordingModel([[textMsg(scenario.draft)], [textMsg(scenario.revised)]]);
+      const agent = { model, tools: [] };
+      bindHostCanarySurface(fixture, agent, []);
+      await runJudgedHost(fixture, agent, true);
+      assert.equal(reviewed.length, 2, `${scenario.label}: the whole-objective reviewer sees the changed candidate`);
+      assert.deepEqual(reviewed[1], { objective: scenario.objective, reply: scenario.revised });
+      const last = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] }).at(-1)!;
+      assert.equal(last.data.fulfills, false, `${scenario.label}: quote manipulation cannot create fulfillment`);
+      assert.equal(last.data.claimRevision, undefined);
+    }
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
+test('when claims-only repair rounds are spent, deletion can sanitize the report without certifying the whole task', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const draft = 'Traffic is about 1,200 visits a month. Revenue grew 40% this year. The site ranks for 180 keywords. Full report: https://example.test/firm-report.';
   const finding = '(1) "Revenue grew 40% this year" — the report shows 14%';
@@ -10767,8 +10885,8 @@ test('when the rounds are spent on claims-only findings, the answer ships withou
     return { done: false, repairScope: 'claims', reason: finding } as never;
   });
   try {
-    // Review runs for requested work; the checker here is a stub that keeps
-    // finding the same claim, so the objective only needs to invite review.
+    // No channel call ran: removing a bad number cannot complete the posting
+    // obligation, even if the reviewer incorrectly labeled its finding claims-only.
     const fixture = acceptJudgedSource('claims-removed', 'Post the firm snapshot to the channel');
     const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(draft)], [textMsg(draft)]]);
     const agent = { model, tools: [] };
@@ -10781,7 +10899,8 @@ test('when the rounds are spent on claims-only findings, the answer ships withou
     assert.match(delivered, /I took out one claim the review could not verify/);
     const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
     const last = verdicts.at(-1)!;
-    assert.equal(last.data.fulfills, true);
+    assert.equal(last.data.fulfills, false, 'a missing requested effect remains unfulfilled after quote deletion');
+    assert.equal(last.data.carriedVerdict, true, 'the host carries a negative finding rather than inventing a new review');
     assert.deepEqual((last.data.claimRemoval as { removed: string[] }).removed, ['Revenue grew 40% this year']);
     assert.equal(last.data.replyDigest, createHash('sha256').update(delivered, 'utf8').digest('hex'),
       'the recorded review names the exact bytes delivered');

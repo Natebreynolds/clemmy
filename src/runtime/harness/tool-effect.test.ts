@@ -1027,3 +1027,27 @@ test('declared status branches are reads through local carriers, never foreign l
   assert.notEqual(classifyRuntimeToolEffect('mcp__foreign__heartbeat_refine', {action:'status'}).effect, 'read');
   assert.equal(runtimeToolAccountingMetadata('heartbeat_refine', JSON.stringify({action:'status'})).effect, 'read');
 });
+
+test('a Composio carrier whose arguments the model quoted once more still names its operation and arguments', () => {
+  // Live 2026-10-13: the retry of a refused send arrived with `arguments`
+  // serialized twice; it unwrapped to no operation and the retry the refusal
+  // had asked for was refused as off the recovery surface.
+  const inner = { channel: 'C0FIXTURE0001', markdown_text: '*Fixture update*' };
+  const quotedTwice = unwrapRuntimeEffectiveToolIdentity('composio_execute_tool', {
+    tool_slug: 'SLACK_SEND_MESSAGE', arguments: JSON.stringify(JSON.stringify(inner)),
+  });
+  assert.equal(quotedTwice.toolName, 'SLACK_SEND_MESSAGE');
+  assert.deepEqual(quotedTwice.args, inner);
+  assert.equal(quotedTwice.composioCarrier, true);
+  // A quoted string that is not a JSON object stays unreadable: no operation.
+  const quotedText = unwrapRuntimeEffectiveToolIdentity('composio_execute_tool', {
+    tool_slug: 'SLACK_SEND_MESSAGE', arguments: JSON.stringify('hello'),
+  });
+  assert.equal(quotedText.toolName, null);
+  // The same slip inside call_tool's args_json unwraps the same way.
+  const carried = unwrapRuntimeEffectiveToolIdentity('call_tool', {
+    name: 'goal_upsert', args_json: JSON.stringify(JSON.stringify({ title: 'Approved title', status: 'active' })),
+  });
+  assert.equal(carried.toolName, 'goal_upsert');
+  assert.deepEqual(carried.args, { title: 'Approved title', status: 'active' });
+});

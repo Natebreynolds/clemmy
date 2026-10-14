@@ -10128,9 +10128,8 @@ function goalFollowUpSeeded(workflowSlug: string, runId: string): boolean {
 /**
  * Continue a stopped or failed run from where it stopped: the board's
  * Continue. A fresh whole-run retry must refuse once any step's write landed
- * (it would repeat it), which left Continue with nothing it could do (live
- * 2026-10-11: a stopped fixture run whose first step had written its file
- * refused Continue outright). Here each completed step whose write landed,
+ * (it would repeat it), which would leave Continue with nothing it could do
+ * once any step had written its file. Here each completed step whose write landed,
  * or that sent, is carried as completed: its recorded output feeds the steps
  * after it and it never dispatches again. Every other step runs.
  *

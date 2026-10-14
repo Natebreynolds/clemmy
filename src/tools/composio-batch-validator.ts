@@ -67,6 +67,10 @@ function parseJsonObject(value: unknown): { value?: Record<string, unknown>; err
   if (typeof value !== 'string') return { error: 'arguments must be a JSON object or JSON object string' };
   try {
     const parsed = JSON.parse(value) as unknown;
+    // The object string quoted once more (the model serialized its own
+    // serialization). The identity unwrap reads it as the object, so
+    // execution must too.
+    if (typeof parsed === 'string') return parseJsonObject(parsed);
     if (!isRecordValue(parsed)) return { error: 'arguments must parse to a JSON object' };
     return { value: parsed };
   } catch {

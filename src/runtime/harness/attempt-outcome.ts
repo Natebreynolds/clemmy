@@ -372,9 +372,8 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
   // in the dark: the reply says why, and the target can be read. The host
   // keeps the turn going so the model reads the refusal, decides what has to
   // change, and puts that change to the owner, whatever lane carried the
-  // call (live 2026-10-07: a Slack reminder already gone answered
-  // `not_found`; live 2026-10-09: a draft whose attachment the provider
-  // rejected with a 400 ended three times on a reconciliation block).
+  // call: a record already gone, or an attachment the provider rejected,
+  // is an answer, never a reconciliation block.
   const status = typeof signals.httpStatus === 'number' ? signals.httpStatus : undefined;
   const statusInTheDark = status !== undefined && (status >= 500 || TRANSIENT_STATUS.has(status));
   const statusRefused = isAnsweredRefusalStatus(status);
@@ -432,9 +431,8 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
     if (TRANSIENT_STATUS.has(status)) return outcome('transient', 'structured', `http_${status}`, status);
     // A mutation that succeeded with nothing to return (a DELETE's 204, a
     // provider's `{}`) is acknowledged work, not an empty answer to shop
-    // around: live 2026-10-06 a successful Outlook draft delete settled as
-    // empty_result → try_sibling_candidate, and Clem asked the owner to
-    // check Outlook by hand for a draft she had just verified was gone.
+    // around; read as empty_result it sends the owner to check by hand for
+    // a record the model had just verified was gone.
     if (status >= 200 && status < 300 && signals.emptyResult && signals.mutating !== true) {
       return outcome('empty_result', 'structured', `http_${status}`);
     }

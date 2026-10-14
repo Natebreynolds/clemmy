@@ -300,6 +300,16 @@ function composioSlug(args: unknown): string | undefined {
 function decodedToolArgs(args: unknown): unknown {
   if (typeof args !== 'string') return args;
   const trimmed = args.trim();
+  // A JSON object string, or that same string quoted once more as a JSON
+  // string (the model serialized its own serialization: `"{\"channel\": …}"`).
+  // Double-encoded, a retry unwraps to no operation and the very retry a
+  // refusal asked for is refused as off the recovery surface.
+  if (trimmed.startsWith('"')) {
+    try {
+      const inner = JSON.parse(trimmed) as unknown;
+      return typeof inner === 'string' ? decodedToolArgs(inner) : args;
+    } catch { return args; }
+  }
   if (!trimmed.startsWith('{')) return args;
   try { return JSON.parse(trimmed) as unknown; } catch { return args; }
 }

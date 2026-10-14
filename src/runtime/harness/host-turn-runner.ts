@@ -117,7 +117,7 @@ import type { HostQueuedApprovalBeforeCompletion, InterruptionInfo, RunOutcome, 
 import { approvalCallPreview } from './approval-call-preview.js';
 import { approvalPreviewLabels, type ApprovalLabelMemo } from './approval-preview-labels.js';
 import { approvalPrecheck } from './approval-precheck.js';
-import { removeReviewedClaims } from './reviewed-claim-removal.js';
+import { removeReviewedClaims, reviewQuotes } from './reviewed-claim-removal.js';
 import { acceptedTaskIdFor, withLogicalToolCall } from './attempt-identity.js';
 import { persistHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { isRegistryDeclaredLocalPlanningCapability, isRegistryDeclaredLocalPlanningMutation, isRegistryDeclaredNativePlanningRead, nominateDisclosedLocalPlanningDefinition } from './local-planning-capability.js';
@@ -1237,6 +1237,13 @@ export function hostNoProgressRecoveryToolNames(
         || provenReads.includes(name)
         || (provenReads.length > 0 && (bare === 'call_tool' || bare === 'work_call')))) return true;
     if (exact.has(name)) return true;
+    // THE CONTROL THAT ENDS A STEP IS ALWAYS AVAILABLE IN RECOVERY.
+    //
+    // A step that reports itself blocked after a refused write crosses
+    // nothing; refusing that report leaves the governor to exhaust and speak
+    // in the model's place. The step terminal is on every recovery surface,
+    // as publish_plan is on a plan turn's.
+    if (bare === 'workflow_step_result') return true;
     // READERS OF ALREADY-RETAINED EVIDENCE ARE ALWAYS PERMITTED IN RECOVERY.
     //
     // These consult bytes this turn already fetched. They cross nothing, mutate
@@ -1927,6 +1934,10 @@ interface HostCompletionReviewFeedback {
   reply: string;
   replyDigest: string;
   reason: string;
+  /** Repair guidance for the next candidate, never transferable approval of
+   *  a changed reply or permission to omit whole-objective review. */
+  repairScope?: 'claims' | 'reply_format';
+  quotes?: string[];
 }
 
 function parseHostCompletionReviewFeedback(value: unknown): HostCompletionReviewFeedback | undefined {
@@ -1943,9 +1954,15 @@ function parseHostCompletionReviewFeedback(value: unknown): HostCompletionReview
     || row.replyDigest !== createHash('sha256').update(row.reply, 'utf8').digest('hex')) {
     throw new Error('paused host state has invalid completion-review feedback');
   }
+  if (row.repairScope !== undefined && row.repairScope !== 'claims' && row.repairScope !== 'reply_format') throw new Error('paused host state has invalid completion-review feedback');
+  if (row.quotes !== undefined && (!Array.isArray(row.quotes) || row.quotes.some((quote) => typeof quote !== 'string'))) {
+    throw new Error('paused host state has invalid completion-review feedback');
+  }
   return { version: 1, sessionId: row.sessionId, sourceUserSeq: Number(row.sourceUserSeq),
     objective: row.objective, objectiveDigest: String(row.objectiveDigest),
-    reply: row.reply, replyDigest: String(row.replyDigest), reason: row.reason, ...(row.phase === 'plan' ? { phase: 'plan' } : {}) };
+    reply: row.reply, replyDigest: String(row.replyDigest), reason: row.reason, ...(row.phase === 'plan' ? { phase: 'plan' } : {}),
+    ...(row.repairScope === 'claims' || row.repairScope === 'reply_format' ? { repairScope: row.repairScope as 'claims' | 'reply_format' } : {}),
+    ...(Array.isArray(row.quotes) ? { quotes: (row.quotes as string[]).slice(0, 24) } : {}) };
 }
 
 /** What a completion review protects: work that wrote or tried to write
@@ -4827,6 +4844,12 @@ const runHostTurnBody = async (
       reviewInputOwner = { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
         ...(reviewAttribution?.sessionId === identity.sessionId && reviewAttribution.sourceUserSeq === identity.sourceUserSeq
           && reviewAttribution.attemptId ? { attemptId: reviewAttribution.attemptId } : {}) };
+      const reviewStakesForTurn = completionReviewStakes({
+        plan: Boolean(planCandidate),
+        attemptedWrites: sourceWritesAtStake(identity),
+      });
+      // A changed candidate needs the whole objective and current evidence.
+      // Missing quotes and quoted format suggestions do not prove fulfillment.
       verdict = await hostObjectiveJudge(objective, judgedReply, {
         sessionId: identity.sessionId,
         reviewInputOwner,
@@ -4850,10 +4873,7 @@ const runHostTurnBody = async (
         ...(planCandidate ? { reviewsPlan: true } : {}),
         // The full review guards what reached outside or cannot be restored;
         // a local file write that kept its earlier bytes takes the read depth.
-        reviewStakes: completionReviewStakes({
-          plan: Boolean(planCandidate),
-          attemptedWrites: sourceWritesAtStake(identity),
-        }),
+        reviewStakes: reviewStakesForTurn,
         // Every write it attempted still sets the review's deadline.
         attemptedWrites: sourceAttemptedWrites(identity),
         verifiedReads: readEvidence.summary,
@@ -4986,6 +5006,7 @@ const runHostTurnBody = async (
           ...(verdict.fast ? { fast: true } : {}),
           ...(verdict.jevAttempt ? { jevAttempt: verdict.jevAttempt } : {}),
           ...(verdict.repairScope ? { repairScope: verdict.repairScope } : {}),
+          ...(verdict.claimRevision ? { claimRevision: verdict.claimRevision } : {}),
           reason: verdict.reason.slice(0, 1_600),
           ...(blockedByReview ? { blocked: true } : {}),
           ...(verdict.failedOpen ? { failedOpen: true } : {}),
@@ -5091,11 +5112,12 @@ const runHostTurnBody = async (
       });
     } catch { /* telemetry never blocks the reply */ }
     // A CLAIMS-ONLY FINDING NEVER SHIPS INSIDE THE ANSWER. With the rounds
-    // spent and only specific claims found wrong (the work itself is there),
+    // spent and only specific claims found wrong,
     // the host deletes exactly the sentences carrying the reviewer's quotes and
     // names them; nothing is reworded or added (reviewed-claim-removal.ts).
     // Only for an answer that changed nothing outside, and only when every
-    // quote is found verbatim; otherwise the unverified delivery stands.
+    // quote is found verbatim; otherwise the unverified delivery stands. This
+    // presentation repair never proves that all requested work remains done.
     if (!continuation && !awaitingInput && !verdict.done && verdict.repairScope === 'claims'
       && !blockedByReview && !verdict.failedOpen && !planCandidate && settled.count === 0
       && !responseFormatRequirement && judgedVerdictRow) {
@@ -5111,8 +5133,9 @@ const runHostTurnBody = async (
             type: 'goal_alignment_judged',
             data: {
               ...negative,
-              fulfills: true,
-              reason: `The review's findings were removed from the answer: ${removal.removed.map((quote) => `"${quote}"`).join('; ')}`.slice(0, 1_600),
+              fulfills: false,
+              carriedVerdict: true,
+              reason: `The quoted claims were removed, but the whole objective remains unverified. Earlier review: ${verdict.reason}`.slice(0, 1_600),
               replyDigest: createHash('sha256').update(removal.text, 'utf8').digest('hex'),
               claimRemoval: { fromEventId: judgedVerdictRow.id, removed: removal.removed.slice(0, 12) },
               continuation: false,
@@ -5169,6 +5192,8 @@ const runHostTurnBody = async (
       objective, objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex'),
       reply: judgedReply, replyDigest: createHash('sha256').update(judgedReply, 'utf8').digest('hex'),
       reason: verdict.reason,
+      ...((verdict.repairScope === 'claims' || verdict.repairScope === 'reply_format') && !planCandidate
+        ? { repairScope: verdict.repairScope, quotes: reviewQuotes(verdict.reason).slice(0, 24) } : {}),
     };
     const formatPacket = responseFormatRepairPacket({ ...verdict,
       plan: Boolean(planCandidate) || turnIsPlanMode(), objective, reply: judgedReply, reason: verdict.reason,
@@ -7793,18 +7818,16 @@ const runHostTurnBody = async (
           // its own refusal, or a reply whose bytes do not prove the effect.
           // The model reads the provider's words and answers, and the write
           // keeps no replay authority. The hard block is for a dropped
-          // acknowledgement, where nothing came back to read (live
-          // 2026-10-07: a provider answered a delete with its own not-found;
-          // live 2026-10-13: an app answered a delete with a success flag
-          // over a body that said failure).
+          // acknowledgement, where nothing came back to read; a provider's
+          // own not-found, or a success flag over a body that says failure,
+          // is a reply the model reads.
           // A write that RETURNED without acknowledgement (a timeout the tool
           // reported, a process that ended early) is not the dark either: the
           // model has what came back, the turn goes on under a write freeze
           // (reads open, external writes wait for a read), and the ledger
-          // keeps the call from ever being resent. Live 2026-10-08: two shell
-          // commands that timed out ended the turn "I can't tell whether the
-          // command went through… I won't retry it on my own", with nothing
-          // read and nothing decided.
+          // keeps the call from ever being resent; a timed-out command is
+          // never "I can't tell whether it went through… I won't retry", with
+          // nothing read and nothing decided.
           settlementRequiresReconciliation =
             invoked.settlement.outcome.directive.requiresReconciliation === true
             && uncertainEffectStopsTurn(effect)
@@ -8205,10 +8228,8 @@ const runHostTurnBody = async (
       // ProviderAnsweredError and the settlement reads it as
       // provider_refused_envelope, the same reading a returned `successful:
       // false` envelope gets; nothing is in the dark, and the model reads the
-      // provider's words and answers. Live 2026-10-12: an approved
-      // aibs__create_site the app refused ended the turn "may have begun…
-      // must be reconciled" with a blank effect_unknown marker, and the
-      // owner never learned what the app had said.
+      // provider's words and answers; a refusal the app spelled out is never
+      // reported as "may have begun" with a blank effect marker.
       if (providerRepliedWithoutProof(settlement.outcome)) return 'answered_refusal';
       // A WRITE THAT ENDED WITHOUT ACKNOWLEDGEMENT, where the crossing itself
       // answered (it threw) and proved nothing, goes on under a write freeze:
@@ -11541,6 +11562,12 @@ const runHostTurnBody = async (
       // The recovery request exposed no dependency/provider/business schema.
       // A model-authored call outside that exact subset is paired locally and
       // terminalized before approval, preparation, or body invocation.
+      // A named recovery operation the surface lists under no name of its own
+      // is reached through its carrier; the diagnostic says so below.
+      const offSurfaceRecoveryOperations = noProgressState?.lastConsequence?.effectState === 'not_started'
+        && noProgressState.lastConsequence.recovery === 'repair_model'
+        ? noProgressState.lastConsequence.recoveryToolNames.filter((name) => !toolByName.has(name))
+        : [];
       // NAME THE SURFACE IN THE REFUSAL ITSELF.
       //
       // Without a diagnostic this committed the generic marker "correct the
@@ -11562,6 +11589,9 @@ const runHostTurnBody = async (
                   && noProgressState.lastConsequence.recovery === 'repair_model'
                   && permittedRecoveryReadOperations.length > 0
                   ? `Proven read operations may also use their configured carriers: ${permittedRecoveryReadOperations.join(', ')}. `
+                  : '')
+                + (offSurfaceRecoveryOperations.length > 0
+                  ? `The refused operation ${offSurfaceRecoveryOperations.join(', ')} may be proposed again through its carrier with corrected arguments. `
                   : '')
                 + `Call one of them, or say what you need.`,
             ] as const)
@@ -12154,6 +12184,10 @@ const runHostTurnBody = async (
               args: authoredMaterial.args,
               acceptedBatch: acceptedFrame.ref,
               callIndex,
+              // The call as the model wrote it; the review names the write the
+              // way its author would (carrier and operation), never the host's
+              // normalized operation name alone.
+              carrierToolName: call.name,
             }
           : null;
         let authoredWorkflowConsent = authoredConsentInput

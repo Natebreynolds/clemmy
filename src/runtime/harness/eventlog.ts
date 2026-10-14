@@ -1271,6 +1271,80 @@ function addListFilter(
   params.push(...values);
 }
 
+/**
+ * Every session row for a display list, without conversation state, reusing
+ * the rows whose content has not changed since the last list.
+ *
+ * Removing conversation state from each row makes SQLite parse the whole
+ * metadata blob, and nearly all of it is that state: listing every row parsed
+ * the full table's metadata on every poll of the conversation rail, the
+ * largest steady hold on the daemon's main loop. A row is re-read only when it
+ * changed. Changes made through this process's connection are counted by
+ * temporary triggers that live only on that connection; a commit by any other
+ * connection changes SQLite's data_version and drops every reused row. Rows
+ * are shared across lists and must not be mutated.
+ */
+interface DisplaySessionRowCache {
+  db: Database.Database;
+  dataVersion: number;
+  rows: Map<string, { version: number; row: SessionRow }>;
+}
+let displaySessionRowCache: DisplaySessionRowCache | null = null;
+const DISPLAY_ROW_FETCH_CHUNK = 400;
+
+function installDisplaySessionRowVersions(db: Database.Database): boolean {
+  try {
+    const bump = (id: 'NEW.id' | 'OLD.id') => `INSERT INTO session_display_versions(session_id, version) VALUES (${id}, 1)
+        ON CONFLICT(session_id) DO UPDATE SET version = version + 1;`;
+    db.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS session_display_versions (session_id TEXT PRIMARY KEY, version INTEGER NOT NULL);
+      CREATE TEMP TRIGGER IF NOT EXISTS session_display_version_insert AFTER INSERT ON main.sessions BEGIN ${bump('NEW.id')} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS session_display_version_update AFTER UPDATE ON main.sessions BEGIN ${bump('NEW.id')} ${bump('OLD.id')} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS session_display_version_delete AFTER DELETE ON main.sessions BEGIN ${bump('OLD.id')} END;
+    `);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Null when the change counters cannot be installed on this connection; the
+ *  caller then pages through the table as before. */
+export function listSessionRowsForDisplay(): SessionRow[] | null {
+  const db = openEventLog();
+  if (!displaySessionRowCache || displaySessionRowCache.db !== db) {
+    displaySessionRowCache = installDisplaySessionRowVersions(db) ? { db, dataVersion: Number.NaN, rows: new Map() } : null;
+  }
+  const cache = displaySessionRowCache;
+  if (!cache) return null;
+  return db.transaction(() => {
+    const dataVersion = Number(db.pragma('data_version', { simple: true }));
+    if (dataVersion !== cache.dataVersion) {
+      cache.rows.clear();
+      cache.dataVersion = dataVersion;
+    }
+    const index = prepareCached(db, `SELECT s.id AS id, COALESCE(v.version, 0) AS version
+        FROM sessions s LEFT JOIN temp.session_display_versions v ON v.session_id = s.id
+       ORDER BY s.updated_at DESC, s.id DESC`).all() as Array<{ id: string; version: number }>;
+    const stale = index.filter((entry) => cache.rows.get(entry.id)?.version !== entry.version);
+    for (let start = 0; start < stale.length; start += DISPLAY_ROW_FETCH_CHUNK) {
+      const chunk = stale.slice(start, start + DISPLAY_ROW_FETCH_CHUNK);
+      const rows = db.prepare(`SELECT ${SESSION_COLUMNS_WITHOUT_STATE} FROM sessions WHERE id IN (${chunk.map(() => '?').join(', ')})`)
+        .all(...chunk.map((entry) => entry.id)) as RawSessionRow[];
+      const versions = new Map(chunk.map((entry) => [entry.id, entry.version]));
+      for (const raw of rows) cache.rows.set(raw.id, { version: versions.get(raw.id)!, row: rowToSession(raw) });
+    }
+    if (cache.rows.size > index.length) {
+      const present = new Set(index.map((entry) => entry.id));
+      for (const id of cache.rows.keys()) if (!present.has(id)) cache.rows.delete(id);
+    }
+    return index.flatMap((entry) => {
+      const held = cache.rows.get(entry.id);
+      return held ? [held.row] : [];
+    });
+  })();
+}
+
 export function listSessions(options: ListSessionsOptions = {}): SessionRow[] {
   const db = openEventLog();
   const clauses: string[] = [];

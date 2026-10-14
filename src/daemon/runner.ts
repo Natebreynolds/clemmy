@@ -3480,7 +3480,7 @@ export async function startDaemon(
         // exact frozen batch from the event ledger before ordinary activation
         // reconciliation or queue draining.
         try {
-          const recovered = reconcileClosedWorkflowDispatchBatches();
+          const recovered = await withDaemonRuntimePhase('daemon.timer.workflow_runs.closed_batches', {}, () => reconcileClosedWorkflowDispatchBatches(), { ipc: false });
           if (recovered.finalized > 0 || recovered.published > 0) {
             logger.info(recovered, 'Recovered closed workflow dispatch batches');
           }
@@ -3492,7 +3492,7 @@ export async function startDaemon(
         // durable window before scanning executable runs; groups without the
         // full receipt remain held and invisible.
         try {
-          const recovered = reconcileActivatedWorkflowDispatchGroups();
+          const recovered = await withDaemonRuntimePhase('daemon.timer.workflow_runs.activated_groups', {}, () => reconcileActivatedWorkflowDispatchGroups(), { ipc: false });
           if (recovered.membersReleased > 0) {
             logger.info(recovered, 'Recovered activated workflow source-group members');
           }
@@ -3503,11 +3503,11 @@ export async function startDaemon(
         // when WORKFLOW_APPROVAL_PARKING is off) BEFORE draining, so a freed
         // parked run is picked up in the same tick. setImmediate below also
         // runs this on boot, covering approvals resolved during downtime.
-        try { reapResolvedParkedRuns(); } catch (err) {
+        try { await withDaemonRuntimePhase('daemon.timer.workflow_runs.parked_runs', {}, () => reapResolvedParkedRuns(), { ipc: false }); } catch (err) {
           logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reapResolvedParkedRuns tick failed');
         }
         try {
-          const reviewed = reconcileAutomationOpportunityReviewProjections();
+          const reviewed = await withDaemonRuntimePhase('daemon.timer.workflow_runs.opportunity_reviews', {}, () => reconcileAutomationOpportunityReviewProjections(), { ipc: false });
           if (reviewed.approved > 0 || reviewed.rejected > 0 || reviewed.refused > 0 || reviewed.failed > 0) {
             logger.info(reviewed, 'Reconciled exact automation opportunity review projections');
           }
@@ -3518,7 +3518,7 @@ export async function startDaemon(
           );
         }
         try {
-          const workspaces = reconcileAutomationReadPilotWorkspaceCreations();
+          const workspaces = await withDaemonRuntimePhase('daemon.timer.workflow_runs.pilot_workspaces', {}, () => reconcileAutomationReadPilotWorkspaceCreations(), { ipc: false });
           if (workspaces.created > 0 || workspaces.refused > 0 || workspaces.failed > 0) {
             logger.info(workspaces, 'Reconciled exact automation read-pilot Workspace creations');
           }
@@ -3529,7 +3529,7 @@ export async function startDaemon(
           );
         }
         try {
-          const projected = reconcileAutomationReadPilotProjections();
+          const projected = await withDaemonRuntimePhase('daemon.timer.workflow_runs.pilot_projections', {}, () => reconcileAutomationReadPilotProjections(), { ipc: false });
           if (projected.queued > 0 || projected.refused > 0 || projected.failed > 0) {
             logger.info(projected, 'Reconciled exact automation read-pilot projections');
           }
@@ -3563,7 +3563,8 @@ export async function startDaemon(
           'daemon.timer.workflow_runs.execution', {},
           () => processWorkflowRuns(assistant),
         );
-        reconcileAutomationPartitionsOnDaemon('after workflow drain');
+        await withDaemonRuntimePhase('daemon.timer.workflow_runs.partitions', {},
+          () => reconcileAutomationPartitionsOnDaemon('after workflow drain'), { ipc: false });
       }).catch((err) => {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },

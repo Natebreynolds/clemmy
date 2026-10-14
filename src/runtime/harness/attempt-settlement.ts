@@ -472,11 +472,10 @@ export function settleAdmittedLogicalCallPreDispatchDisposition(input: {
  *
  * A logical call the model admitted but the host never dispatched (no lease,
  * no physical crossing) can only settle through its runner, and the runner is
- * gone once the kill latch lands. Live 2026-10-06: a 12-file fan-out was
- * stopped mid-way; one write_file call stayed `open` with no lease, the stop
- * could not publish ("host call authority still owns unsettled work"), the
- * attempt stayed active with an expired lease and "continue where you left
- * off" was filed as a note to a dead run. Settle such calls as cancelled
+ * gone once the kill latch lands. A call left `open` with no lease keeps
+ * the stop from publishing ("host call authority still owns unsettled
+ * work"), the attempt active on an expired lease, and the owner's "continue
+ * where you left off" filed as a note to a dead run. Settle such calls as cancelled
  * before dispatch, exactly once, so the cancelled terminal can publish.
  * A call that holds a lease or crossed physically is never touched here.
  */
@@ -1385,9 +1384,8 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     // has not proved that nothing landed either (treating it as a clean miss
     // is exactly how a send gets repeated), so the classifier keeps it an
     // uncertain write with no replay — as `provider_refused_envelope` — but
-    // leaves the turn running so the model observes the target and answers
-    // (live 2026-10-07: a Slack delete answered `not_found` parked the owner
-    // on "its effect must be reconciled" where a readback was the answer).
+    // leaves the turn running so the model observes the target and answers;
+    // a readback is the answer, never "its effect must be reconciled".
     // Forcing it to unacknowledged here used to erase that distinction.
     // A throw that carries the provider's own refusal status (a client that
     // raises on a 400 or 404 response) was answered too: the reply exists
@@ -1487,8 +1485,7 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // own bytes, the settlement store used to throw "successful provider
   // result did not produce redeemable result authority"; the attempt died,
   // the frame could never be recorded, and the turn ended in host prose
-  // (live 2026-10-13: an approved aibs__delete_backend the app answered,
-  // five commit retries, "I could not reopen the saved checkpoint"). The
+  // after commit retries ("I could not reopen the saved checkpoint"). The
   // disagreement is the provider's own contradiction: the write stays
   // uncertain, its bytes are retained for the model, nothing is replayed,
   // and the turn goes on.

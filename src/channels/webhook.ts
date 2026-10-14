@@ -1360,7 +1360,7 @@ async function resolveApprovalOrQueueBackgroundContinuation(
   }
   // A registry-owned card (a chat turn waiting on a work_call) is not an SDK
   // runtime approval: the runtime answered "Approval … not found" and this
-  // route returned 500 for a real pending card (live 2026-10-05). Decide the
+  // route returned 500 for a real pending card. Decide the
   // registry row the way a person surface does; its resolution hook resumes
   // the waiting work.
   const registryRow = approvalRegistry.get(approvalId);

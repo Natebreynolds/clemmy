@@ -3673,9 +3673,9 @@ function tryCommitLiveApprovalControl(input: {
         const parked = listHarnessEvents(input.sessionId, { types: ['approval_parked'] })
           .some((event) => event.data.approvalId === row.approvalId);
         if (linked?.id && linked.approvalId === row.approvalId) {
-          // Live 2026-10-06: "Yes, go ahead." to a waiting `ssh localhost`
-          // card resolved it and then entered the parked re-drive, which
-          // armed authority and went silent — no terminal, nothing ran. The
+          // "Yes, go ahead." to a waiting card must not resolve it and then
+          // enter the parked re-drive, which arms authority and goes silent
+          // (no terminal, nothing runs). The
           // card button never takes that path: it resolves the row and the
           // registry listener runs the stored action. Do the same here.
           // An exact approval releases only the saved action after its card
@@ -11622,6 +11622,25 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * A bounded CPU profile of the daemon's main thread (at most two minutes),
+   * taken in-process with no inspector port. Writes the profile beside the
+   * logs and answers with the heaviest functions by self time.
+   */
+  app.post('/api/console/diagnostics/cpu-profile', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const requested = Number((req.body ?? {}).seconds);
+    try {
+      const { captureMainThreadCpuProfile } = await import('../daemon/cpu-profile.js');
+      res.json(await captureMainThreadCpuProfile({
+        seconds: Number.isFinite(requested) ? requested : 30,
+        dir: path.join(BASE_DIR, 'logs', 'profiles'),
+      }));
+    } catch (err) {
+      res.status(409).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Ruflo-inspired harness audit: read-only scorecard over the concrete
    * Clementine substrate (tools, workflows, approvals, agents, learning).
    * This is intentionally separate from diagnostics: diagnostics shows raw
@@ -17464,9 +17483,9 @@ export function registerConsoleRoutes(
     let approvalConfirm: { approvalId: string; leaning: 'approves' | 'declines' | 'unread'; question: string } | undefined;
     let approvalInquiry: { approvalIds: string[]; decision: 'approve' | 'reject' } | undefined;
     // Registry-owned cards (a chat turn waiting on a work_call) get the same
-    // reading as an SDK interrupt. Live 2026-10-05: "Yes, delete it." to a
-    // waiting delete card was never read, started a fresh turn on a successor
-    // session and minted a second card for the same action.
+    // reading as an SDK interrupt; otherwise "Yes, delete it." to a waiting
+    // card starts a fresh turn on a successor session and mints a second
+    // card for the same action.
     if (!connectionContext && (isPausedOnApproval || registryApprovalPending) && !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0 && input.trim()) {
       const routed = await routeReplyToPendingApproval({ sessionId: cardSessionId, text: input, parsed: parsedIntent })
         .catch(() => null);
@@ -17482,9 +17501,9 @@ export function registerConsoleRoutes(
           && getActiveHarnessRunAttempt(cardSessionId) !== null ? undefined : routed.confirm;
         // A change in words on a queued exact payload: the card is resolved
         // as changed and the owner's words run as this turn, whose fresh
-        // card names the one it revises. Live 2026-10-07 ("Yes, but add -v"):
-        // the words ran as a turn but the old card stayed pending forever and
-        // the new card stood alone.
+        // card names the one it revises; otherwise the words run as a turn
+        // while the old card stays pending forever and the new card stands
+        // alone.
         if (intent?.decision === 'reject' && intent.approvalId && approvalChangeRequest
           && resolveQueuedCardAsChanged({ sessionId: cardSessionId, approvalId: intent.approvalId, changeRequest: approvalChangeRequest })) {
           intent = null;

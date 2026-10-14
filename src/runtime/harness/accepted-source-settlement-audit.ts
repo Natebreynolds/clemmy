@@ -122,9 +122,7 @@ function providerAnsweredRefusal(row: SettlementRow): boolean {
 /** A provider (or command) that answered the write with its own refusal: the
  * write stays uncertain in the ledger (no replay, no success), but the
  * attempt was answered and the model read the target back, so the audit
- * owes no reconciliation stop for it (live 2026-10-07: a Slack delete
- * answered `not_found`, read back and explained, still ended "1 irreversible
- * external write(s) require reconciliation"). */
+ * owes no reconciliation stop for a refusal that was read back and explained. */
 export function answeredRefusalSettlement(row: Pick<SettlementRow, 'mutating' | 'execution_kind' | 'outcome_kind' | 'outcome_detail'>): boolean {
   // A command that leaves the machine runs on the host's own crossing, so
   // its answered refusal settles as local execution; it is the same answer.
@@ -139,10 +137,8 @@ export function answeredRefusalSettlement(row: Pick<SettlementRow, 'mutating' | 
   // A host adapter that reported the provider's own refusal with no effect
   // (a cloud browser the provider would not start: a plan or concurrency
   // limit, a session it did not dispatch) is the same answer: nothing
-  // landed, the model read the reason and said so. Live 2026-10-05: "Nate,
-  // Browserbase refused the new session because of a plan or concurrency
-  // limit. No browser was started" still ended "1 business call failure(s)
-  // have no successful recovery".
+  // landed, the model read the reason and said so, and that is not a
+  // business call failure without recovery.
   return typeof row.outcome_detail === 'string'
     && row.outcome_detail.startsWith('host_reported:')
     && (row.outcome_kind === 'input_required'

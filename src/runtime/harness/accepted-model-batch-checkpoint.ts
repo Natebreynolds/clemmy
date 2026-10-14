@@ -956,15 +956,14 @@ function settledNonSuccessProjectionDisposition(input: {
   // A provider that ANSWERED the write with its own refusal: an uncertain
   // write the model reads back, with no replay and no reconciliation stop
   // (its settlement says so). The checkpoint projects it like any returned
-  // failure the model saw; without this it projected nothing, and the turn
-  // ended "I could not reopen the saved checkpoint" (live 2026-10-07).
+  // failure the model saw; projecting nothing ends the turn with "I could
+  // not reopen the saved checkpoint".
   // The answer is answered whether it came back as a result or as a throw:
   // a native MCP `isError` reaches the host as ProviderAnsweredError and its
   // crossing settles `threw`, and the settlement's detail is the authority
   // that the provider spoke. Only a crossing still open, lost or timed out
-  // keeps the reconciliation stop (live 2026-10-12: an approved
-  // aibs__create_site the app refused ended "may have begun… must be
-  // reconciled" and the model never saw why).
+  // keeps the reconciliation stop; a refusal the app spelled out must reach
+  // the model, never end as "may have begun… must be reconciled".
   // A reply whose own bytes contradict its success flag is the same kind of
   // answer: the provider spoke, the model reads it, nothing is replayed.
   // A write that ended without acknowledgement, where the crossing itself
