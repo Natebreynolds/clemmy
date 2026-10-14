@@ -196,3 +196,17 @@ test('cloud task binding comes from the host and repeated start rejoins the same
   assert.deepEqual(dispatched[0], ['owned', 'chat-a', { operation: 'read', expectedVersion: 3, args: { targetId: 'exact-page', maxChars: 1234 } }, undefined]);
   assert.deepEqual(value, { resource: { id: 'owned', pageCount: 100, pagesOmitted: true }, result: { text: 'exact requested page evidence' }, receipt: { targetId: 'exact-page' } }, 'retained dock metadata never rides beside every read, but requested evidence stays intact');
 });
+
+test('the resources listing names the browser the owner chose for this machine and each configured provider', async () => {
+  // A model asked which browser is in use otherwise has no tool that says.
+  const service = { list: async () => [], status: async () => ({ choice: 'kernel', provider: 'kernel',
+    providers: { browserbase: { configured: true, credentialStatus: 'available' }, kernel: { configured: true, credentialStatus: 'available' } } }) };
+  const value = await withToolOutputContext({ sessionId: 'chat-a', sourceUserSeq: 7 },
+    () => executeCloudBrowserTool('cloud_browser_resources', {}, service as never));
+  assert.deepEqual(value, { resources: [], truncated: false, browser: { choice: 'kernel', provider: 'kernel',
+    providers: { browserbase: { configured: true, credentialStatus: 'available' }, kernel: { configured: true, credentialStatus: 'available' } } } });
+  const local = { list: async () => [], status: async () => ({ choice: 'local', provider: null, providers: {} }) };
+  const chrome = await withToolOutputContext({ sessionId: 'chat-a', sourceUserSeq: 7 },
+    () => executeCloudBrowserTool('cloud_browser_resources', {}, local as never)) as { browser: { choice: string; provider: null } };
+  assert.equal(chrome.browser.choice, 'local'); assert.equal(chrome.browser.provider, null);
+});

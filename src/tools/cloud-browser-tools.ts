@@ -32,8 +32,14 @@ export async function executeCloudBrowserTool(name: CloudBrowserOperationName, r
   try {
     if (name === 'cloud_browser_resources') {
       const resources = await service.list(conversationId);
+      // The machine's browser choice is part of what this listing answers: a
+      // model asked which browser is in use otherwise has no tool that says.
+      const status = await service.status();
       return { resources: resources.slice(-20).map(resourceForTool),
-        truncated: resources.length > 20 };
+        truncated: resources.length > 20,
+        browser: { choice: status.choice, provider: status.provider,
+          providers: Object.fromEntries(Object.entries(status.providers).map(([provider, entry]) => [provider,
+            { configured: entry?.configured === true, credentialStatus: entry?.credentialStatus ?? 'not_checked' }])) } };
     }
     if (name === 'cloud_browser_start') {
       const source = tool?.sourceUserSeq ?? run?.sourceUserSeq;
@@ -118,7 +124,7 @@ function browserFailureClassification(error: BrowserbaseServiceError): LocalNonW
 export function registerCloudBrowserTools(server: McpServer): void {
   const descriptions: Record<CloudBrowserOperationName, string> = {
     cloud_browser_start: 'Start the cloud browser for this chat, or rejoin the one already open here (including one the owner opened or handed over). Pass url to open a website in its first page in the same call. Returns the resource id, controlVersion and page handles (target_id) to read or navigate directly. This operation already finds the existing browser; no preliminary resources call or separate open call is needed. Respects human control. Cloud usage is billed by the connected provider; recording stays off.',
-    cloud_browser_resources: 'List the recent cloud browser resources already owned by this task, including one the user started in the UI. Use this to inspect or select an existing resource and its exact controlVersion. cloud_browser_start already resolves and rejoins this chat\'s browser; a preliminary list is unnecessary.',
+    cloud_browser_resources: 'List the recent cloud browser resources already owned by this task, including one the user started in the UI, and report which browser the owner chose for this machine (browser.choice: a cloud provider or local Chrome) with each configured provider. Use this to inspect or select an existing resource and its exact controlVersion. cloud_browser_start already resolves and rejoins this chat\'s browser; a preliminary list is unnecessary.',
     cloud_browser_status: 'Observe this exact task-owned cloud browser and its current controlVersion. Use after a handoff or a stale-version refusal. Reports pending or uncertain effects honestly; does not replay actions or grant control. Page metadata is omitted here; cloud_browser_tabs provides fresh exact handles.',
     cloud_browser_tabs: 'Freshly observe pages in this exact task-owned cloud browser. Returns current targetId handles. Refuses while the user has control or the controlVersion changed; never substitutes another session.',
     cloud_browser_read: 'Read bounded visible text from the exact task-owned cloud browser page. Uses a fixed observation, no caller script. Requires its current controlVersion and targetId. Refuses during human control.',
