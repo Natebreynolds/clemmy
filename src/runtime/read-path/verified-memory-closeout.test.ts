@@ -244,13 +244,13 @@ test('the same phrase proven against two accounts keeps both, each with its own 
   }, Date.now());
   recordCanonicalReadSuccess(sessionId, 'MAILCO_FETCH_INVOICES', 'call:ap@northco.example');
   await composio._settleVerifiedComposioReadForTest({
-    toolSlug: 'MAILCO_FETCH_INVOICES', sessionId,
+    toolSlug: 'MAILCO_FETCH_INVOICES', sessionId, sourceUserSeq: acceptedBySession.get(sessionId)!.sourceUserSeq,
     result: { successful: true, data: { items: [{ id: 'i-1' }] } },
     accountIdentity: 'ap@northco.example',
   });
   recordCanonicalReadSuccess(sessionId, 'MAILCO_FETCH_INVOICES', 'call:billing@southco.example');
   await composio._settleVerifiedComposioReadForTest({
-    toolSlug: 'MAILCO_FETCH_INVOICES', sessionId,
+    toolSlug: 'MAILCO_FETCH_INVOICES', sessionId, sourceUserSeq: acceptedBySession.get(sessionId)!.sourceUserSeq,
     result: { successful: true, data: { items: [{ id: 'i-9' }] } },
     accountIdentity: 'billing@southco.example',
   });

@@ -183,3 +183,246 @@ test('failed, unreported-usage and legacy raw stream-fallback calls remain expli
   await drain(await run(scope, () => fallback(body({ stream: true, response_format: { type: 'json_schema', json_schema: { name: 'fixture', schema: { type: 'object' } } } }))));
   assert.equal(rows(scope).length, 0, 'additive provenance never invents usage or certifies these unrecorded paths');
 });
+
+
+// Real accepted owners and actual SDK producers exercise the public lazy boundary.
+function nominalBridgeOwner() {
+  assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1');
+  const sessionId = `sess-byo-nominal-${++count}`;
+  log.createSession({ id: sessionId, kind: 'chat', channel: 'test' });
+  const attempt = log.beginRunAttempt(sessionId);
+  const source = log.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user',
+    data: { text: 'Synthetic BYO invocation accounting control.' } });
+  return { sessionId, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId, attempt };
+}
+function nominalBridgeUnder<T>(scope: ReturnType<typeof nominalBridgeOwner>, work: () => T): T {
+  return withModelUsageAttribution({ sessionId: scope.sessionId, sourceUserSeq: scope.sourceUserSeq,
+    attemptId: scope.runAttemptId, role: 'brain', channel: 'test:byo-nominal' }, () => run(scope, work));
+}
+const nominalBridgeRequest = { input: 'Synthetic BYO invocation accounting control.', modelSettings: {},
+  tools: [], handoffs: [], outputType: 'text', tracing: false } as never;
+function nominalBridgeModel(t: { after: (work: () => void) => void }, providerId = 'zai', id = 'nominal-provider',
+  script?: (url: unknown, init?: RequestInit) => Promise<Response>) {
+  const parity = process.env.CLEMMY_MODEL_PARITY;
+  process.env.CLEMMY_MODEL_PARITY = 'on';
+  t.after(() => { if (parity === undefined) delete process.env.CLEMMY_MODEL_PARITY; else process.env.CLEMMY_MODEL_PARITY = parity; });
+  mock.method(globalThis, 'fetch', async (url: unknown, init?: RequestInit) => {
+    assert.ok(String(url).startsWith('https://nominal-byo-fixture.invalid/'), 'unexpected network target refuses');
+    if (script) return script(url, init);
+    const sent = JSON.parse(String(init?.body)); assert.equal(sent.model, 'glm-5.3');
+    const result = completion(id);
+    if (!sent.stream) return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
+    const start = { ...result, object: 'chat.completion.chunk', usage: undefined,
+      choices: [{ index: 0, delta: { role: 'assistant', content: 'ready' }, finish_reason: null }] };
+    const end = { ...result, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+    return new Response(`data: ${JSON.stringify(start)}\n\ndata: ${JSON.stringify(end)}\n\ndata: [DONE]\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } });
+  });
+  return getByoModel('glm-5.3', { configured: true, baseURL: 'https://nominal-byo-fixture.invalid/v1',
+    apiKey: 'synthetic-no-auth', providerId, primaryId: 'glm-5.3', judgeId: 'glm-5.3' });
+}
+async function nominalBridgeDone(stream: AsyncIterable<unknown>): Promise<unknown> {
+  let original: unknown;
+  for await (const item of stream) {
+    const event = item as { type?: string; response?: unknown };
+    if (event.type === 'response_done') original = event.response;
+  }
+  assert.ok(original, 'actual SDK response_done is required'); return original;
+}
+
+for (const mode of ['buffered', 'native_stream', 'assembled_stream'] as const) {
+  test(`BYO nominal bridge supported public same-owner ${mode} retains original UUID separately from provider ID`, async t => {
+    const scope = nominalBridgeOwner(); const id = `nominal-${mode}-${count}`;
+    const { completedModelResponseBinding } = await import('./model-response-binding.js');
+    const { withModelResilienceTelemetry } = await import('./resilient-model.js');
+    const events: Array<{ readonly type: string; readonly callId: string; readonly outcome?: string }> = [];
+    try {
+      const model = nominalBridgeModel(t, mode === 'native_stream' ? 'zai' : 'minimax', id);
+      const original = await nominalBridgeUnder(scope, () => withModelResilienceTelemetry(event => { events.push(event); }, async () =>
+        mode === 'buffered' ? model.getResponse(nominalBridgeRequest)
+          : nominalBridgeDone(model.getStreamedResponse(nominalBridgeRequest))));
+      const binding = completedModelResponseBinding(original)!; assert.ok(binding);
+      const [row] = rows(scope); assert.equal(rows(scope).length, 1);
+      assertIdentity(row, scope, id, mode === 'native_stream' ? 'zai' : 'minimax');
+      assert.equal(row.trace?.modelCallId, binding.modelCallId); assert.notEqual(row.responseId, binding.modelCallId);
+      assert.equal(binding.physicalAttempt, 1); assert.equal(completedModelResponseBinding({ ...(original as object) }), undefined);
+      assert.equal(events.filter(e => e.type === 'call_started').length, 1);
+      assert.equal(events.find(e => e.type === 'call_started')?.callId, binding.modelCallId);
+      assert.equal(events.find(e => e.type === 'call_finished')?.outcome, 'returned');
+      const { listOperationalEvents } = await import('../operational-telemetry.js');
+      const operational = listOperationalEvents({ source: 'model', type: 'model_call_completed', sessionId: scope.sessionId, limit: 5 });
+      assert.equal(operational.length, 1); assert.equal(operational[0].modelCallId, binding.modelCallId);
+      assert.equal(operational[0].payload.responseId, id, 'provider ID stays in its distinct payload field');
+    } finally { log.finishRunAttempt(scope.attempt, 'completed'); }
+  });
+}
+
+test('BYO nominal bridge required public A-create then B-drain cannot attribute the original call to B', async t => {
+  const a = nominalBridgeOwner(), b = nominalBridgeOwner();
+  try {
+    const model = nominalBridgeModel(t, 'zai', `public-lazy-${count}`);
+    const { withModelResilienceTelemetry } = await import('./resilient-model.js');
+    const originalEvents: string[] = [], foreignEvents: string[] = [];
+    const stream = nominalBridgeUnder(a, () => withModelResilienceTelemetry(e => originalEvents.push(e.type), () => model.getStreamedResponse(nominalBridgeRequest)));
+    assert.equal(rows(a).length, 0, 'public creation must not start provider work');
+    assert.equal(originalEvents.length, 0);
+    await nominalBridgeUnder(b, () => withModelResilienceTelemetry(e => foreignEvents.push(e.type), () => nominalBridgeDone(stream)));
+    assert.equal(originalEvents.filter(x => x === 'call_started').length, 1);
+    assert.equal(foreignEvents.length, 0, 'foreign drainer cannot acquire the original observer');
+    assert.equal(rows(a).length, 1, 'the original public owner A must own its usage');
+    assert.equal(rows(b).length, 0, 'a drainer cannot become original accounting owner');
+  } finally { log.finishRunAttempt(a.attempt, 'completed'); log.finishRunAttempt(b.attempt, 'completed'); }
+});
+
+for (const phase of ['retired_before_create', 'retired_before_record'] as const) {
+  test(`BYO nominal bridge ${phase} keeps measured quantities and original owner with UUID unknown`, async () => {
+    const a = nominalBridgeOwner(), b = nominalBridgeOwner();
+    const transport = await import('./model-transport-observation.js');
+    const id = `retired-provider-${phase}-${count}`;
+    const scope = nominalBridgeUnder(a, () => transport.createModelTransportAttempt(`retired-local-${count}`, 1, transport.captureModelTransportUsageOwner()));
+    let release!: () => void, entered!: () => void;
+    const atWire = new Promise<void>(resolve => { entered = resolve; });
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const create = wrapCompletionsCreate(async () => { entered(); await hold; return completion(id); }, { backendId: 'zai-fixture' });
+    try {
+      if (phase === 'retired_before_create') transport.finishModelTransportAttempt(scope, 'cancelled');
+      const result = nominalBridgeUnder(b, () => transport.withModelTransportAttempt(scope, () => create(body())));
+      await atWire;
+      if (phase === 'retired_before_record') transport.finishModelTransportAttempt(scope, 'cancelled');
+      release(); const output = await result;
+      assert.equal((output as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message?.content, 'ready');
+      const [row] = rows(a); assert.equal(rows(a).length, 1); assert.equal(rows(b).length, 0);
+      assertIdentity(row, a, id); assert.equal(row.trace?.modelCallId, undefined, 'retirement cannot certify a UUID');
+    } finally { release?.(); log.finishRunAttempt(a.attempt, 'completed'); log.finishRunAttempt(b.attempt, 'completed'); }
+  });
+}
+
+for (const mode of ['unsupported', 'captured_empty'] as const) {
+  test(`BYO nominal bridge present ${mode} scope cannot adopt foreign chat or workflow B`, async () => {
+    const b = nominalBridgeOwner(); const transport = await import('./model-transport-observation.js');
+    const { withWorkflowUsageAttribution } = await import('../workflow-usage-context.js');
+    const id = `unowned-provider-${mode}-${count}`;
+    const scope = mode === 'unsupported'
+      ? { modelCallId: `forged-local-${count}`, physicalAttempt: 1, purpose: 'brain' as const,
+          owner: { sessionId: b.sessionId, sourceUserSeq: b.sourceUserSeq, runAttemptId: b.runAttemptId, accountingParent: false } }
+      : transport.createModelTransportAttempt(`empty-local-${count}`, 1, transport.captureUnavailableModelTransportOwner());
+    try {
+      const create = wrapCompletionsCreate(async () => completion(id), { backendId: 'zai-fixture' });
+      await nominalBridgeUnder(b, () => withWorkflowUsageAttribution('foreign-workflow-b', () =>
+        transport.withModelTransportAttempt(scope, () => create(body()))));
+      const matches = readUsageEventsForDate().filter(row => row.responseId === id); assert.equal(matches.length, 1);
+      const [row] = matches; assert.equal(row.source, 'byo:unowned'); assert.equal(row.kind, 'other');
+      assert.equal(row.trace?.acceptedSource, undefined); assert.equal(row.trace?.attemptId, undefined);
+      assert.equal(row.trace?.modelCallId, undefined); assert.equal(row.role, undefined); assert.equal(row.runId, undefined);
+      assert.equal(row.inputTokens, 100); assert.equal(row.cachedInputTokens, 80); assert.equal(row.outputTokens, 7);
+      assert.equal(row.account, undefined); assert.equal(rows(b).length, 0);
+    } finally { log.finishRunAttempt(b.attempt, 'completed'); }
+  });
+}
+
+test('BYO nominal bridge shared provider IDs retain both real SDK invocations and quantity rows', async t => {
+  const a = nominalBridgeOwner(); const { completedModelResponseBinding } = await import('./model-response-binding.js');
+  try {
+    const id = `shared-provider-${count}`; const model = nominalBridgeModel(t, 'zai', id);
+    const originals = await nominalBridgeUnder(a, () => Promise.all([1, 2].map(() => model.getResponse(nominalBridgeRequest))));
+    const ids = originals.map(original => completedModelResponseBinding(original)?.modelCallId);
+    assert.equal(new Set(ids).size, 2); assert.ok(ids.every(Boolean));
+    const recorded = rows(a); assert.equal(recorded.length, 2);
+    assert.equal(new Set(recorded.map(row => row.trace?.modelCallId)).size, 2);
+    assert.ok(recorded.every(row => row.responseId === id && ids.includes(row.trace?.modelCallId)));
+    assert.equal(recorded.reduce((sum, row) => sum + row.inputTokens, 0), 200);
+    assert.equal(recorded.reduce((sum, row) => sum + row.outputTokens, 0), 14);
+  } finally { log.finishRunAttempt(a.attempt, 'completed'); }
+});
+
+test('BYO public empty entry cannot adopt the later accepted drainer', async t => {
+  const b = nominalBridgeOwner(); const id = `empty-public-${count}`;
+  const { modelUsageAttributionStorage } = await import('../usage-log.js');
+  try {
+    const model = nominalBridgeModel(t, 'zai', id);
+    const stream = modelUsageAttributionStorage.run({ sessionId: 'unknown', sourceUserSeq: 0 }, () => model.getStreamedResponse(nominalBridgeRequest));
+    await nominalBridgeUnder(b, () => nominalBridgeDone(stream));
+    const matches = readUsageEventsForDate().filter(row => row.responseId === id);
+    assert.equal(matches.length, 1); assert.equal(matches[0].source, 'byo:unowned');
+    assert.equal(matches[0].trace?.modelCallId, undefined); assert.equal(matches[0].trace?.acceptedSource, undefined);
+    assert.equal(matches[0].inputTokens, 100); assert.equal(matches[0].outputTokens, 7); assert.equal(rows(b).length, 0);
+  } finally { log.finishRunAttempt(b.attempt, 'completed'); }
+});
+
+test('BYO public harness-only entry retains A across B drain, but present-empty accounting never falls back', async t => {
+  const a = nominalBridgeOwner(), b = nominalBridgeOwner();
+  const { modelUsageAttributionStorage } = await import('../usage-log.js');
+  try {
+    const model = nominalBridgeModel(t, 'zai', `harness-public-${count}`);
+    const stream = modelUsageAttributionStorage.run(undefined as never, () => run(a, () => model.getStreamedResponse(nominalBridgeRequest)));
+    await nominalBridgeUnder(b, () => nominalBridgeDone(stream));
+    assert.equal(rows(a).length, 1); assert.equal(rows(b).length, 0);
+    assert.equal(rows(a)[0].trace?.modelCallId, undefined, 'unknown legacy role cannot certify a main-call UUID');
+    assert.equal(rows(a)[0].trace?.attemptId, a.runAttemptId);
+    const unowned = modelUsageAttributionStorage.run({ sessionId: 'unknown', sourceUserSeq: 0 }, () => run(a, () => model.getStreamedResponse(nominalBridgeRequest)));
+    await nominalBridgeUnder(b, () => nominalBridgeDone(unowned));
+    assert.equal(rows(a).length, 1); assert.equal(rows(b).length, 0);
+    assert.equal(readUsageEventsForDate().filter(row => row.responseId === `harness-public-${count}` && row.source === 'byo:unowned').length, 1);
+  } finally { log.finishRunAttempt(a.attempt, 'completed'); log.finishRunAttempt(b.attempt, 'completed'); }
+});
+
+test('BYO public entry snapshots original prompt counts and mutable accounting before foreign drain', async t => {
+  const a = nominalBridgeOwner(), b = nominalBridgeOwner();
+  const { modelUsageAttributionStorage } = await import('../usage-log.js');
+  const { completedModelResponseBinding } = await import('./model-response-binding.js');
+  try {
+    const id = `mutated-public-${count}`, model = nominalBridgeModel(t, 'zai', id);
+    const context = { sessionId: a.sessionId, sourceUserSeq: a.sourceUserSeq, attemptId: a.runAttemptId, role: 'brain' as const };
+    const components = { system: 40, history: 60 };
+    const stream = modelUsageAttributionStorage.run(context, () => harnessRunContextStorage.run({ ...a, promptComponents: components } as never,
+      () => model.getStreamedResponse(nominalBridgeRequest)));
+    context.sessionId = b.sessionId; context.sourceUserSeq = b.sourceUserSeq; context.attemptId = b.runAttemptId;
+    components.system = 999;
+    const original = await nominalBridgeUnder(b, () => nominalBridgeDone(stream));
+    const [row] = rows(a); assert.equal(rows(a).length, 1); assert.equal(rows(b).length, 0);
+    assert.equal(row.trace?.modelCallId, completedModelResponseBinding(original)?.modelCallId);
+    assert.equal(row.promptComponents?.system, 40); assert.equal(row.promptComponents?.history, 60);
+  } finally { log.finishRunAttempt(a.attempt, 'completed'); log.finishRunAttempt(b.attempt, 'completed'); }
+});
+
+test('BYO public retry, failed fallback, cancel and missing usage keep distinct local outcomes without invented token rows', async t => {
+  const a = nominalBridgeOwner(), b = nominalBridgeOwner();
+  const { withModelTransportRecorder } = await import('./model-transport-observation.js');
+  const { completedModelResponseBinding } = await import('./model-response-binding.js');
+  let mode: 'retry' | 'failed' | 'success' | 'no-usage' = 'retry', fetches = 0;
+  const local: Readonly<Record<string, unknown>>[] = [];
+  try {
+    const script = async (_url: unknown, init?: RequestInit) => {
+      fetches++;
+      if (mode === 'failed' || (mode === 'retry' && fetches === 1)) return new Response(JSON.stringify({ error: { message: 'Synthetic fixture refusal' } }),
+        { status: mode === 'failed' ? 400 : 500, headers: { 'content-type': 'application/json' } });
+      const sent = JSON.parse(String(init?.body));
+      const result = completion(`outcome-${fetches}`);
+      if (mode === 'no-usage') delete (result as Partial<typeof result>).usage;
+      if (!sent.stream) return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
+      return new Response(`data: ${JSON.stringify({ ...result, object: 'chat.completion.chunk', choices: [{ index: 0,
+        delta: { content: 'ready' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+    };
+    const model = nominalBridgeModel(t, 'zai', `outcomes-public-${count}`, script);
+    const under = <T>(work: () => T) => withModelTransportRecorder(row => local.push(row), () => nominalBridgeUnder(a, work));
+    const stream = under(() => model.getStreamedResponse(nominalBridgeRequest));
+    const original = await nominalBridgeUnder(b, () => nominalBridgeDone(stream));
+    assert.equal(fetches, 2); assert.equal(rows(a).length, 1); assert.equal(rows(b).length, 0);
+    assert.equal(completedModelResponseBinding(original)?.physicalAttempt, 2);
+    assert.deepEqual(local.filter(row => row.phase === 'adapter_attempt_finished').map(row => row.outcome), ['failed', 'returned']);
+    assert.equal(rows(a)[0].inputTokens, 100); assert.equal(rows(a)[0].outputTokens, 7);
+    mode = 'failed'; await assert.rejects(under(() => model.getResponse(nominalBridgeRequest)));
+    assert.equal(rows(a).length, 1, 'a failed route has unknown usage, not a zero debit');
+    mode = 'success'; await under(() => model.getResponse(nominalBridgeRequest));
+    assert.equal(rows(a).length, 2, 'a later successful route records its own separate invocation');
+    assert.notEqual(rows(a)[0].trace?.modelCallId, rows(a)[1].trace?.modelCallId);
+    const abort = new AbortController();
+    const cancelled = under(() => model.getStreamedResponse({ ...(nominalBridgeRequest as Record<string, unknown>), signal: abort.signal } as never));
+    abort.abort(); const before = fetches;
+    await assert.rejects(nominalBridgeUnder(b, () => nominalBridgeDone(cancelled)));
+    assert.equal(fetches, before); assert.equal(rows(a).length, 2);
+    mode = 'no-usage'; await under(() => model.getResponse(nominalBridgeRequest));
+    assert.equal(rows(a).length, 2, 'a completion lacking usage cannot fabricate quantities');
+    assert.ok(local.some(row => row.phase === 'adapter_attempt_finished' && row.outcome === 'failed'));
+  } finally { log.finishRunAttempt(a.attempt, 'completed'); log.finishRunAttempt(b.attempt, 'completed'); }
+});

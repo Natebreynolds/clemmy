@@ -347,3 +347,38 @@ test('cloned/ambiguous producers, foreign recipes and retired dispatches cannot 
     }
   } finally { if (parity === undefined) delete process.env.CLEMMY_MODEL_PARITY; else process.env.CLEMMY_MODEL_PARITY = parity; }
 });
+
+
+// existing nominal state is reopened, never fabricated
+// from provider IDs or serialized records. Real accepted owners are disposable.
+for (const mode of ['live', 'retired', 'unsupported', 'empty', 'wrong_token'] as const) {
+  test(`BYO accounting capture distinguishes absent from present ${mode} attempts without ambient adoption`, async () => {
+    assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1');
+    const log = await import('./eventlog.js');
+    const { captureModelTransportUsageOwner, captureActiveModelTransportUsage, capturedModelTransportUsageCallId } = await import('./model-transport-observation.js');
+    const { capturedModelUsageAttribution, captureModelUsageProvenance } = await import('../usage-log.js');
+    const session = log.createSession({ kind: 'chat', channel: 'test' });
+    const attempt = log.beginRunAttempt(session.id);
+    const source = log.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Synthetic nominal state control.' } });
+    const owner = { sessionId: session.id, sourceUserSeq: source.seq, attemptId: attempt.attemptId, role: 'brain' as const };
+    try {
+      assert.equal(captureActiveModelTransportUsage(), undefined, 'only absent active scope is legacy');
+      const scope = mode === 'unsupported' ? { modelCallId: 'unsupported-nominal', physicalAttempt: 1, purpose: 'brain' as const }
+        : withModelUsageAttribution(owner, () => createModelTransportAttempt(`nominal-${mode}`, 1,
+          mode === 'empty' ? captureUnavailableModelTransportOwner() : captureModelTransportUsageOwner()));
+      if (mode === 'retired') finishModelTransportAttempt(scope, 'cancelled');
+      withModelUsageAttribution({ sessionId: 'foreign-b', sourceUserSeq: 999, attemptId: 'foreign-attempt', role: 'brain' }, () =>
+        withModelTransportAttempt(scope, () => {
+          const captured = captureActiveModelTransportUsage()!; assert.ok(captured);
+          const usage = capturedModelUsageAttribution(captured.callerProvenance);
+          if (mode === 'unsupported' || mode === 'empty') {
+            assert.equal(captured.owner, undefined); assert.equal(usage?.sourceUserSeq, 0);
+          } else {
+            assert.equal(captured.owner?.sessionId, session.id); assert.equal(usage?.attemptId, attempt.attemptId);
+          }
+          const token = mode === 'wrong_token' ? captureModelUsageProvenance() : captured.callerProvenance;
+          assert.equal(capturedModelTransportUsageCallId(captured.attempt, token), mode === 'live' ? scope.modelCallId : undefined);
+        }));
+    } finally { log.finishRunAttempt(attempt, 'completed'); }
+  });
+}

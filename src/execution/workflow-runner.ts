@@ -49,6 +49,7 @@ import {
 } from '../runtime/harness/accepted-source-settlement-audit.js';
 import { evidenceLooksFailedOrBlocked, peekToolChoice, rememberToolChoice, stripBakedConnectionId, type ToolChoiceAlsoProven } from '../memory/tool-choice-store.js';
 import { explicitlyOptsOutOfAutomaticMemoryRecall } from '../memory/automatic-recall-opt-out.js';
+import { readTurnLearningPolicyForSource, type TurnLearningSource } from '../memory/turn-learning-policy.js';
 import {
   loadPriorSuccessfulStepOutputs,
   resolveCertifiedStepOutput,
@@ -1421,6 +1422,27 @@ function workflowRunOriginSource(runId: string): { sessionId: string; sourceUser
   } catch {
     return null;
   }
+}
+
+/** Learning follows this run's frozen origin, never account discovery's latest
+ * conversation or another creation test. Missing provenance suppresses only
+ * optional learning; scheduled runs without an origin use their own source. */
+function workflowRunLearningSource(runId: string): TurnLearningSource | undefined {
+  const unavailable = { sessionId: '', sourceUserSeq: 0 };
+  try {
+    const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+    if (!record || record.id !== runId) return unavailable;
+    const exact = (value: unknown): TurnLearningSource | undefined => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+      const row = value as Record<string, unknown>;
+      return typeof row.sessionId === 'string' && row.sessionId.trim() === row.sessionId && row.sessionId.length > 0
+        && typeof row.sourceUserSeq === 'number' && Number.isSafeInteger(row.sourceUserSeq) && row.sourceUserSeq > 0
+        ? { sessionId: row.sessionId, sourceUserSeq: row.sourceUserSeq } : undefined;
+    };
+    if (record.creationTestSource !== undefined) return exact(record.creationTestSource) ?? unavailable;
+    if (record.originSessionId === undefined && record.sourceUserSeq === undefined) return undefined;
+    return exact({ sessionId: record.originSessionId, sourceUserSeq: record.sourceUserSeq }) ?? unavailable;
+  } catch { return unavailable; }
 }
 
 function workflowCreationOriginSource(workflowName: string): { sessionId: string; sourceUserSeq: number } | null {
@@ -5297,6 +5319,7 @@ export const workflowRunnerInternalsForTest = {
   uniqueCompiledProjectTerminalSink,
   persistWorkflowHarnessHold,
   rememberProvenWorkflowStepTool,
+  workflowRunLearningSource,
 };
 
 interface InvocationArtifactReference {
@@ -5664,6 +5687,7 @@ async function runStepViaHarness(
     // acquired. Missing-manifest provisioning records account/schema/effect
     // proof against this exact event; without a durable source first, that
     // proof is intentionally inadmissible.
+    const learningSource = workflowRunLearningSource(workflowRunId);
     const sourceUserEvent = recordRunAttemptUserInput(stepAttempt, {
       turn: 1,
       role: 'user',
@@ -5673,6 +5697,7 @@ async function runStepViaHarness(
         workflowRunId,
         stepId: step.id,
         attemptId: stepAttempt.attemptId,
+        ...(learningSource ? { learningPolicySource: learningSource } : {}),
       },
     });
     acceptedStepSourceSeq = sourceUserEvent.seq;
@@ -6328,7 +6353,7 @@ async function runStepViaHarness(
     // of this step starts with the pin injected instead of re-discovering.
     if (!isItemInvocation && captured.found
       && !(captured.value && typeof captured.value === 'object' && (captured.value as { blocked?: unknown }).blocked === true)) {
-      rememberProvenWorkflowStepTool({ sessionId: realSessionId, workflowName, stepId: step.id });
+      rememberProvenWorkflowStepTool({ sessionId: realSessionId, sourceUserSeq: sourceUserEvent.seq, workflowName, stepId: step.id });
     }
 
     // A step is "done" only when the harness reports `completed`. The
@@ -7016,15 +7041,19 @@ function pinTemplateFromArgs(args: unknown): string | undefined {
 
 function rememberProvenWorkflowStepTool(input: {
   sessionId: string;
+  sourceUserSeq: number;
   workflowName: string;
   stepId: string;
 }): void {
   try {
+    if (readTurnLearningPolicyForSource(input).status !== 'allowed') return;
+    const sameSource = (event: { data?: Record<string, unknown> }): boolean =>
+      event.data?.sourceUserSeq === input.sourceUserSeq;
     const resultText = (e: { data?: Record<string, unknown> }): string | undefined => (
       typeof e.data?.result === 'string' ? e.data.result : undefined
     );
     const returned = listHarnessEvents(input.sessionId, { types: ['tool_returned'] })
-      .filter((e) => isProvenCarrierToolName(e.data?.tool)
+      .filter((e) => sameSource(e) && isProvenCarrierToolName(e.data?.tool)
         // Deterministic checks FIRST (review: prose-based
         // evidenceLooksFailedOrBlocked let every real composio failure
         // through — the step pinned a FAILED tool as proven).
@@ -7032,7 +7061,7 @@ function rememberProvenWorkflowStepTool(input: {
         && !renderedComposioResultLooksFailed(resultText(e))
         && !evidenceLooksFailedOrBlocked(resultText(e)));
     if (returned.length === 0) return;
-    const calls = listHarnessEvents(input.sessionId, { types: ['tool_called'] });
+    const calls = listHarnessEvents(input.sessionId, { types: ['tool_called'] }).filter(sameSource);
     // Every clean provider crossing on this step is a pin, not only the last
     // one. Live Platform 49: digest BATCH_UPDATE evicted a settled INSERT
     // shape, and the next new-row run rediscovered flattened insert_dimension

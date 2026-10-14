@@ -3717,3 +3717,76 @@ test('fresh-host account warmup respects resolved external authority and preserv
     client.__test__.setComposioApiKeyOverride(null);
   }
 });
+
+test('workflow discovery construction reads current kind without hydrating retained state', async (t) => {
+  const eventlog = await import('../runtime/harness/eventlog.js');
+  const learning = await import('../memory/turn-learning-policy.js');
+  const privateKeys = ['__conversation', '__host_recovery_state', '__interrupt_state',
+    '__source_approval_checkpoints', '__host_recovery_mcp_scope'];
+  const scope = { authority: 'catalog', reason: 'controlled workflow discovery',
+    allowedServerSlugs: [], toolPatterns: [], maxTools: 0 } as const;
+  let normalToolNames: string[] | undefined;
+  for (const variant of ['normal', 'excluded'] as const) {
+    const marker = `workflow-construction-kind-${variant}`;
+    const privateState = Object.fromEntries(privateKeys.map((key, index) => [key, {
+      retained: `${marker}-${index}:` + 'controlled-retained-history-'.repeat(4096),
+    }]));
+    assert.ok(Buffer.byteLength(JSON.stringify(privateState)) > 512 * 1024);
+    const metadata = { workflowName: marker, workflowRunId: `workflow-construction-run-${variant}`, ...privateState };
+    const session = createSession({ kind: 'workflow', metadata });
+    const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+      data: { text: 'Inspect the exact current workflow capability.', ...(variant === 'excluded'
+        ? { learningPolicy: { version: 1, mode: 'exclude', reason: 'controlled_test' } } : {}) } });
+    const originalParse = JSON.parse;
+    let kindProbeParses = 0;
+    const otherSessionReadCallers = new Set<string>();
+    const hydratedPrivateKeys: string[] = [];
+    let agent: Awaited<ReturnType<typeof buildOrchestratorAgent>>;
+    try {
+      JSON.parse = (text, reviver) => {
+        if (typeof text === 'string' && text.includes(marker)) {
+          const frames = new Error().stack?.split('\n') ?? [];
+          const sessionFrame = frames.findIndex(frame => /\bat (?:\S+\.)?getSession \(/.test(frame));
+          const caller = frames[sessionFrame + 1]?.trim().match(/^at (\S+) /)?.[1].split('.').at(-1);
+          if (caller === 'buildOrchestratorAgent') {
+            kindProbeParses += 1;
+            const found = privateKeys.filter(key => text.includes(JSON.stringify(key)));
+            hydratedPrivateKeys.push(...found);
+          } else {
+            otherSessionReadCallers.add(caller ?? 'unobserved');
+          }
+        }
+        return originalParse(text, reviver);
+      };
+      agent = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: source.seq,
+        userInput: String(source.data.text), allowToolJit: true,
+        mcpToolScope: { ...scope, allowedServerSlugs: [], toolPatterns: [] } });
+    } finally {
+      JSON.parse = originalParse;
+    }
+    assert.ok(kindProbeParses > 0, 'the actual builder kind probe consumed current workflow metadata');
+    t.diagnostic(JSON.stringify({ variant, kindProbeParses, otherSessionReadCallers: [...otherSessionReadCallers].sort() }));
+    assert.deepEqual(hydratedPrivateKeys, []);
+    const names = (agent.tools ?? []).map(toolRef => toolRef.name).sort();
+    assert.ok(names.includes('tool_search'), 'the workflow keeps its real discovery door');
+    if (normalToolNames) assert.deepEqual(names, normalToolNames, 'learning exclusion does not change discovery availability');
+    else normalToolNames = names;
+    assert.deepEqual(boundAgentMcpToolScope(agent).scope, { ...scope, queryText: String(source.data.text) });
+    assert.equal(learning.readTurnLearningPolicyForSource({ sessionId: session.id,
+      sourceUserSeq: source.seq }).status, variant === 'excluded' ? 'excluded' : 'allowed');
+    const current = eventlog.getSession(session.id);
+    assert.equal(current?.kind, 'workflow');
+    assert.deepEqual(current?.metadata, metadata, 'full retained context stays available to its actual readers');
+    assert.equal(listEvents(session.id, { types: ['tool_called', 'model_resilience_observed'] }).length, 0,
+      'agent construction performs no model or tool execution');
+    const db = eventlog.openEventLog();
+    const saved = (db.prepare('SELECT metadata_json FROM sessions WHERE id = ?').get(session.id) as { metadata_json: string }).metadata_json;
+    try {
+      db.prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run('{invalid metadata', session.id);
+      assert.throws(() => eventlog.getSession(session.id, { withoutConversationState: true }), SyntaxError);
+      assert.throws(() => eventlog.getSession(session.id), SyntaxError);
+    } finally {
+      db.prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run(saved, session.id);
+    }
+  }
+});

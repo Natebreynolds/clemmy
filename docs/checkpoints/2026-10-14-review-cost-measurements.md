@@ -38,3 +38,20 @@ question that broke a one-line format). Each cost a full second review.
 - The local check almost never vouches (`coverageComplete: false`); until it
   does, "reads get the local check only" is in practice "reads get the fast
   second-model review", twice when claims are found.
+
+
+## Combined-candidate qualification (2026-10-13 local review)
+
+These aggregate observations identify repeated review as a useful investigation
+target. They do not certify common-window accepted-task accounting, actual
+critical-path delay, complete provider usage, attributable cost or billing.
+The last model/tool event is a timing proxy, not proof that the task was done.
+Unknown or failed review legs remain part of the accounting gap.
+
+The proposed quoted-text shortcut cannot qualify completion: removing a quoted
+substring can leave a paraphrased unsupported claim or omit a required action.
+An arbitrary quote in a format finding is not a typed replacement attestation.
+The combined harness retains whole-objective review for these revisions and
+keeps sanitized but unverified reports distinguishable from accepted completion.
+Future round reduction must use exact qualified evidence and preserve the whole
+effective objective, standing instructions and contrary/visual evidence.

@@ -1983,3 +1983,98 @@ test('durable memory native Codex producer keeps original scheduling accounting 
     }
   } finally { closeMemoryDb(); closeEventLog(); }
 });
+
+
+// actual BYO SDK/resilience and ordinary event/usage
+// writers feed the unchanged canonical reducer. No model telemetry is seeded.
+test('BYO nominal producer feeds canonical single-invocation membership while empty capture remains unknown', async t => {
+  const { getByoModel, resetByoModelCache } = await import('../src/runtime/harness/byo-model.js');
+  const transportApi = await import('../src/runtime/harness/model-transport-observation.js');
+  const parity = process.env.CLEMMY_MODEL_PARITY; process.env.CLEMMY_MODEL_PARITY = 'on';
+  let responseId = '', retire = false;
+  t.mock.method(globalThis, 'fetch', async (url: unknown, init?: RequestInit) => {
+    assert.ok(String(url).startsWith('https://canonical-byo-fixture.invalid/'), 'all wire work must terminate at this fake');
+    const sent = JSON.parse(String(init?.body)); assert.equal(sent.model, 'glm-5.3');
+    if (retire) {
+      const captured = transportApi.captureActiveModelTransportUsage(); assert.ok(captured);
+      assert.ok(captured.attempt); transportApi.finishModelTransportAttempt(captured.attempt, 'cancelled');
+    }
+    const usage = { prompt_tokens: 100, completion_tokens: 7, total_tokens: 107, prompt_tokens_details: { cached_tokens: 80 } };
+    const result = { id: responseId, object: 'chat.completion', created: 1, model: 'glm-5.2', usage,
+      choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'Synthetic accounting answer.' } }] };
+    if (!sent.stream) return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
+    const chunk = { ...result, object: 'chat.completion.chunk', choices: [{ index: 0,
+      delta: { role: 'assistant', content: 'Synthetic accounting answer.' }, finish_reason: 'stop' }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  });
+  try {
+    for (const mode of ['buffered', 'streamed', 'foreign-drain', 'retired', 'empty'] as const) await t.test(mode, async () => {
+      const fixture = nativeCodexAccountingFixture(); responseId = `canonical-byo-${mode}-${randomUUID()}`; retire = mode === 'retired';
+      const model = getByoModel('glm-5.3', { configured: true, baseURL: 'https://canonical-byo-fixture.invalid/v1',
+        apiKey: 'synthetic-no-auth', providerId: 'zai', primaryId: 'glm-5.3', judgeId: 'glm-5.3' });
+      // Keep one ordinal for the actual invocation; no phases are authored.
+      fixture.ordinal = 1;
+      const stableObservation = createModelResilienceObservation({
+        owner: { sessionId: fixture.sessionId, sourceUserSeq: fixture.source.seq, runAttemptId: fixture.attempt.attemptId },
+        requestOrdinal: () => fixture.ordinal, retired: () => false,
+      });
+      const request = { input: 'Synthetic accounting answer.', tools: [], handoffs: [], modelSettings: {}, outputType: 'text', tracing: false } as unknown as ModelRequest;
+      const execute = async () => harnessRunContextStorage.run({ sessionId: fixture.sessionId,
+        sourceUserSeq: fixture.source.seq, runAttemptId: fixture.attempt.attemptId, turn: 1 } as never, () =>
+        withModelResilienceTelemetry(stableObservation.observer, async () => {
+          if (mode === 'foreign-drain') return model.getStreamedResponse(request);
+          if (mode !== 'streamed') return model.getResponse(request);
+          let original: unknown;
+          for await (const event of model.getStreamedResponse(request)) if (event.type === 'response_done') original = event.response;
+          assert.ok(original); return original;
+        }));
+      let original: unknown;
+      try {
+        original = await withModelTransportRecorder(data => appendEvent({ sessionId: fixture.sessionId, turn: 1,
+          role: 'system', type: 'model_transport_observed', data: { ...data } }), () => mode === 'empty'
+          ? modelUsageAttributionStorage.run({ sessionId: 'unknown', sourceUserSeq: 0 }, execute)
+          : withModelUsageAttribution({ sessionId: fixture.sessionId, sourceUserSeq: fixture.source.seq,
+              attemptId: fixture.attempt.attemptId, role: 'brain', channel: 'test:byo-accounting' }, execute));
+        if (mode === 'foreign-drain') {
+          const foreign = nativeCodexAccountingFixture();
+          try {
+            original = await withModelUsageAttribution({ sessionId: foreign.sessionId, sourceUserSeq: foreign.source.seq,
+              attemptId: foreign.attempt.attemptId, role: 'brain' }, () => harnessRunContextStorage.run({ sessionId: foreign.sessionId,
+              sourceUserSeq: foreign.source.seq, runAttemptId: foreign.attempt.attemptId } as never, async () => {
+                let response: unknown;
+                for await (const event of original as AsyncIterable<{ type: string; response?: unknown }>) if (event.type === 'response_done') response = event.response;
+                return response;
+              }));
+            assert.equal(nativeCodexAccountingRows(foreign).length, 0);
+          } finally { finishRunAttempt(foreign.attempt, 'completed'); }
+        }
+      } finally { stableObservation.close('returned'); }
+      const binding = completedModelResponseBinding(original); assert.ok(binding);
+      const recorded = parseUsageLedger(readFileSync(usageFileForDate(new Date(fixture.source.createdAt)), 'utf8'))
+        .filter(row => row.responseId === responseId);
+      assert.equal(recorded.length, 1); const [row] = recorded;
+      assert.equal(row.inputTokens, 100); assert.equal(row.cachedInputTokens, 80); assert.equal(row.outputTokens, 7);
+      assert.equal(row.responseId, responseId); assert.equal(row.providerReportedModel, 'glm-5.2'); assert.equal(row.account, undefined);
+      const measured = finishNativeCodexAccountingFixture(fixture);
+      assert.equal(measured.usageCompleteness.mainProducerCoverage.observedCalls, 1);
+      if (mode === 'buffered' || mode === 'streamed' || mode === 'foreign-drain') {
+        assert.equal(row.trace?.modelCallId, binding.modelCallId); assert.notEqual(row.responseId, binding.modelCallId);
+        assert.equal(measured.usageCompleteness.mainProducerCoverage.responseBoundCalls, 1);
+        assert.equal(measured.promptTokens, 100); assert.equal(measured.cachedInputTokens, 80); assert.equal(measured.outputTokens, 7);
+      } else {
+        assert.equal(row.trace?.modelCallId, undefined);
+        assert.equal(measured.usageCompleteness.mainProducerCoverage.responseBoundCalls, 0);
+        assert.equal(measured.usageCompleteness.mainProducerCoverage.status, 'incomplete');
+        if (mode === 'retired') assert.equal(row.trace?.attemptId, fixture.attempt.attemptId);
+        else { assert.equal(row.source, 'byo:unowned'); assert.equal(row.trace?.acceptedSource, undefined); }
+      }
+      assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+      assert.equal(measured.usageCompleteness.cost.actualBilling, 'not_measured');
+      assert.equal(measured.transportObservation!.allLegPhysicalInventory, 'unproved');
+    });
+  } finally {
+    resetByoModelCache(); t.mock.restoreAll();
+    if (parity === undefined) delete process.env.CLEMMY_MODEL_PARITY; else process.env.CLEMMY_MODEL_PARITY = parity;
+    closeEventLog();
+  }
+});

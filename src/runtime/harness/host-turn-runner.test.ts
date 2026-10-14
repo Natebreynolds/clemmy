@@ -841,68 +841,130 @@ function bindHostCanarySurface(
   capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
 }
 
-test('workflow controller-owned discovery can replace metadata without freezing the entire step catalog', async () => {
-  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
-  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
-  process.env.HARNESS_TOOL_BRACKETS = 'on';
-  const fixture = acceptHostCanarySource('workflow-metadata-refresh');
-  eventlog.openEventLog().prepare('UPDATE sessions SET kind = ? WHERE id = ?')
-    .run('workflow', fixture.session.id);
-  const manifest = capabilityManifests.attachSemanticContract({
-    version: 1, manifestId: 'cap:fixture:workflow-existing-read',
-    providerKind: 'native_mcp', operationId: 'fixture__read_records',
-    providerIdentity: 'fixture-provider', providerVersion: '1', operationVersion: '1',
-    definitionFingerprint: 'c'.repeat(64), effect: 'read', accountId: 'fixture-account',
-    outputContract: { kind: 'records' },
-    evidenceContract: { kinds: ['payload'], readbackRequired: false },
-    provenance: { issuer: 'host:test', issuedAt: '2026-09-14T00:00:00.000Z', trusted: true },
-    lifecycle: { state: 'current' }, advisoryRoles: ['source'],
-  });
-  const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
-  let businessCalls = 0;
-  const register = (m: typeof manifest) => factory.register({
-    capabilityId: m.manifestId, toolName: m.operationId,
-    schemaVersion: m.operationVersion, schemaDigest: m.definitionFingerprint,
-    effect: m.effect, account: m.accountId,
-    manifestDigest: capabilityManifests.capabilityManifestDigest(m),
-    providerKind: m.providerKind, liveFingerprint: m.definitionFingerprint,
-    manifest: m, invoke: async () => { businessCalls += 1; return {}; },
-  });
-  register(manifest);
-  capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
-  let discoveryCalls = 0;
-  const lookup = brackets.wrapToolForHarness({
-    type: 'function', name: 'tool_search', description: 'Refresh exact current capabilities.',
-    parameters: { type: 'object', properties: {}, additionalProperties: false },
-    needsApproval: async () => false,
-    invoke: async () => {
-      discoveryCalls += 1;
-      factory.forget(manifest.manifestId);
-      register({ ...manifest, manifestId: `${manifest.manifestId}:successor` });
-      return { refreshed: true };
-    },
-  });
-  const model = stubModel([
-    [toolCall('workflow-metadata-refresh', 'tool_search', {})],
-    [textMsg('Current metadata is available; no business changes were made.')],
-  ]);
-  const agent = { model, tools: [lookup] };
-  bindHostCanarySurface(fixture, agent, [lookup]);
-  try {
-    const result = await runProductionHost(fixture, agent);
-    assert.equal(result.finalOutput, 'Current metadata is available; no business changes were made.');
-    assert.equal(model.calls(), 2);
-    assert.equal(discoveryCalls, 1);
-    assert.equal(businessCalls, 0, 'metadata refresh must not invoke a business capability');
-    const frozen = eventlog.openEventLog().prepare(`
-      SELECT COUNT(*) AS n FROM accepted_source_catalog_snapshots
-      WHERE session_id = ? AND source_user_seq = ?
-    `).get(fixture.session.id, fixture.source.seq) as { n: number };
-    assert.equal(frozen.n, 0, 'the workflow controller owns execution; its model step must not freeze ambient inventory');
-  } finally {
-    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
-    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
-    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+test('workflow controller-owned discovery can replace metadata without freezing the entire step catalog', async (t) => {
+  for (const variant of ['normal', 'excluded'] as const) {
+    await t.test(variant, async () => {
+      const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+      const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+      process.env.HARNESS_TOOL_BRACKETS = 'on';
+      const fixture = acceptHostCanarySource(`workflow-metadata-refresh-${variant}`, undefined,
+        variant === 'excluded' ? { learningPolicy: { version: 1, mode: 'exclude', reason: 'controlled_test' } } : {});
+      eventlog.openEventLog().prepare('UPDATE sessions SET kind = ? WHERE id = ?')
+        .run('workflow', fixture.session.id);
+      const privateKeys = ['__conversation', '__host_recovery_state', '__interrupt_state',
+        '__source_approval_checkpoints', '__host_recovery_mcp_scope'];
+      const privateState = Object.fromEntries(privateKeys.map((key, index) => [key, {
+        retained: `${variant}-private-state-${index}:` + 'controlled-retained-history-'.repeat(4096),
+      }]));
+      const publicMarker = `kind-probe-metadata-${variant}`;
+      const metadata = { workflowName: publicMarker, workflowRunId: `kind-probe-run-${variant}`, ...privateState };
+      eventlog.updateSession(fixture.session.id, { metadata });
+      assert.ok(Buffer.byteLength(JSON.stringify(privateState)) > 512 * 1024,
+        'the fixture carries substantial retained state, not just empty private keys');
+      assert.deepEqual(eventlog.getSession(fixture.session.id)?.metadata, metadata,
+        'ordinary readers still receive every retained state value');
+      const manifest = capabilityManifests.attachSemanticContract({
+        version: 1, manifestId: 'cap:fixture:workflow-existing-read',
+        providerKind: 'native_mcp', operationId: 'fixture__read_records',
+        providerIdentity: 'fixture-provider', providerVersion: '1', operationVersion: '1',
+        definitionFingerprint: 'c'.repeat(64), effect: 'read', accountId: 'fixture-account',
+        outputContract: { kind: 'records' },
+        evidenceContract: { kinds: ['payload'], readbackRequired: false },
+        provenance: { issuer: 'host:test', issuedAt: '2026-09-14T00:00:00.000Z', trusted: true },
+        lifecycle: { state: 'current' }, advisoryRoles: ['source'],
+      });
+      const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
+      let businessCalls = 0;
+      const register = (m: typeof manifest) => factory.register({
+        capabilityId: m.manifestId, toolName: m.operationId,
+        schemaVersion: m.operationVersion, schemaDigest: m.definitionFingerprint,
+        effect: m.effect, account: m.accountId,
+        manifestDigest: capabilityManifests.capabilityManifestDigest(m),
+        providerKind: m.providerKind, liveFingerprint: m.definitionFingerprint,
+        manifest: m, invoke: async () => { businessCalls += 1; return {}; },
+      });
+      register(manifest);
+      capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+      let discoveryCalls = 0;
+      const lookup = brackets.wrapToolForHarness({
+        type: 'function', name: 'tool_search', description: 'Refresh exact current capabilities.',
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+        needsApproval: async () => false,
+        invoke: async () => {
+          discoveryCalls += 1;
+          factory.forget(manifest.manifestId);
+          register({ ...manifest, manifestId: `${manifest.manifestId}:successor` });
+          return { refreshed: true };
+        },
+      });
+      const model = stubModel([
+        [toolCall('workflow-metadata-refresh', 'tool_search', {})],
+        [textMsg('Current metadata is available; no business changes were made.')],
+      ]);
+      const agent = { model, tools: [lookup] };
+      bindHostCanarySurface(fixture, agent, [lookup]);
+      const originalParse = JSON.parse;
+      const kindProbeParses = { currentProductionHostSurface: 0, acceptedSourceIsWorkflowInternal: 0 };
+      const otherSessionReadCallers = new Set<string>();
+      const hydratedPrivateKeys: string[] = [];
+      JSON.parse = (text, reviver) => {
+        if (typeof text === 'string' && text.includes(publicMarker)) {
+          // Observe the actual direct session consumer. Other readers still
+          // need full retained context; their reads must not be prohibited.
+          const frames = new Error().stack?.split('\n') ?? [];
+          const sessionFrame = frames.findIndex(frame => /\bat (?:\S+\.)?getSession \(/.test(frame));
+          const caller = frames[sessionFrame + 1]?.trim().match(/^at (\S+) /)?.[1].split('.').at(-1);
+          if (caller === 'currentProductionHostSurface' || caller === 'acceptedSourceIsWorkflowInternal') {
+            kindProbeParses[caller] += 1;
+            const privateFound = privateKeys.filter(key => text.includes(JSON.stringify(key)));
+            hydratedPrivateKeys.push(...privateFound);
+          } else {
+            otherSessionReadCallers.add(caller ?? 'unobserved');
+          }
+        }
+        return originalParse(text, reviver);
+      };
+      try {
+        const result = await runProductionHost(fixture, agent);
+        JSON.parse = originalParse;
+        assert.ok(kindProbeParses.currentProductionHostSurface > 0, 'the real model-boundary kind probe read current workflow metadata');
+        assert.ok(kindProbeParses.acceptedSourceIsWorkflowInternal > 0, 'the real named-workflow kind probe read current metadata');
+        t.diagnostic(JSON.stringify({ variant, kindProbeParses, otherSessionReadCallers: [...otherSessionReadCallers].sort() }));
+        assert.deepEqual(hydratedPrivateKeys, [], 'kind probes never hydrated the five retained private states');
+        const current = eventlog.getSession(fixture.session.id);
+        assert.ok(current);
+        assert.equal(current.kind, 'workflow');
+        assert.deepEqual(current.metadata, metadata, 'the narrower read does not alter persisted context or public metadata');
+        const policy = await import('../../memory/turn-learning-policy.js');
+        assert.equal(policy.readTurnLearningPolicyForSource({ sessionId: fixture.session.id,
+          sourceUserSeq: fixture.source.seq }).status, variant === 'excluded' ? 'excluded' : 'allowed');
+        assert.equal(result.finalOutput, 'Current metadata is available; no business changes were made.');
+        assert.equal(model.calls(), 2);
+        assert.equal(discoveryCalls, 1);
+        assert.equal(businessCalls, 0, 'metadata refresh must not invoke a business capability');
+        const frozen = eventlog.openEventLog().prepare(`
+          SELECT COUNT(*) AS n FROM accepted_source_catalog_snapshots
+          WHERE session_id = ? AND source_user_seq = ?
+        `).get(fixture.session.id, fixture.source.seq) as { n: number };
+        assert.equal(frozen.n, 0, 'the workflow controller owns execution; its model step must not freeze ambient inventory');
+        const db = eventlog.openEventLog();
+        const retainedMetadata = (db.prepare('SELECT metadata_json FROM sessions WHERE id = ?')
+          .get(fixture.session.id) as { metadata_json: string }).metadata_json;
+        try {
+          db.prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run('{invalid metadata', fixture.session.id);
+          assert.throws(() => eventlog.getSession(fixture.session.id, { withoutConversationState: true }), SyntaxError,
+            'omitting unused state must not turn malformed metadata into an empty session');
+          assert.throws(() => eventlog.getSession(fixture.session.id), SyntaxError);
+        } finally {
+          db.prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run(retainedMetadata, fixture.session.id);
+        }
+      } finally {
+        JSON.parse = originalParse;
+        capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+        if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+        else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+      }
+    });
   }
 });
 
@@ -10757,7 +10819,7 @@ test('the host explanation survives an enabled completion judge without claiming
 
 // Live 2026-09-24/25: after the last review round an answer was delivered
 // "blocked" while still containing the figures the reviewer flagged.
-test('a read-only answer revised once to a claims-only finding ships on the host check that the quoted claims are gone, without a second review', async () => {
+test('a claims paraphrase receives a whole-objective review even after the quoted substring is gone', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const draft = 'Kernel is the chosen browser. Both providers are connected with live credentials.';
   const revised = 'Kernel is the chosen browser. Both providers are configured with credentials available.';
@@ -10765,44 +10827,49 @@ test('a read-only answer revised once to a claims-only finding ships on the host
   let judgeCalls = 0;
   _setHostObjectiveJudgeForTests(async () => {
     judgeCalls += 1;
-    return { done: false, repairScope: 'claims', reason: finding } as never;
+    return judgeCalls === 1 ? { done: false, repairScope: 'claims', reason: finding } as never
+      : { done: true, reason: 'The revision states only the supplied configured-credential evidence.' };
   });
   try {
-    const fixture = acceptJudgedSource('claims-revised-once', 'Post the browser snapshot to the channel');
+    const fixture = acceptJudgedSource('claims-revised-once',
+      'Write a browser snapshot from this supplied record: Kernel is selected; both providers have credentials configured, but no live connection was tested.');
     const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(revised)]]);
     const agent = { model, tools: [] };
     bindHostCanarySurface(fixture, agent, []);
     const outcome = await runJudgedHost(fixture, agent, true);
-    assert.equal(judgeCalls, 1, 'the revision is checked by the host, not reviewed again');
+    assert.equal(judgeCalls, 2, 'the changed claim must reach the whole-objective reviewer');
     assert.equal(String(outcome.finalOutput), revised);
     const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
     const last = verdicts.at(-1)!;
     assert.equal(last.data.fulfills, true);
-    assert.deepEqual((last.data.claimRevision as { quotes: string[] }).quotes, ['connected with live credentials']);
+    assert.equal(last.data.claimRevision, undefined, 'quote disappearance is not semantic review provenance');
     assert.equal(last.data.replyDigest, createHash('sha256').update(revised, 'utf8').digest('hex'));
   } finally { _setHostObjectiveJudgeForTests(null); }
 });
 
-test('a read-only answer revised to the exact replacement line a format finding spelled out ships without a second review', async () => {
+test('a quoted format replacement receives whole-objective review before fulfillment', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const draft = 'Cloud browser on this machine:\n- Kernel selected\n- credentials configured';
   const line = 'Cloud browser on this machine: Kernel selected; credentials configured.';
   let judgeCalls = 0;
   _setHostObjectiveJudgeForTests(async () => {
     judgeCalls += 1;
-    return { done: false, repairScope: 'reply_format', reason: `Replace the response with one line: “${line}”` } as never;
+    return judgeCalls === 1
+      ? { done: false, repairScope: 'reply_format', reason: `Replace the response with one line: “${line}”` } as never
+      : { done: true, reason: 'The complete supplied snapshot is present in the required line.' };
   });
   try {
-    const fixture = acceptJudgedSource('format-replaced-once', 'Post the browser snapshot to the channel');
+    const fixture = acceptJudgedSource('format-replaced-once',
+      'Write one line from this supplied browser snapshot: Kernel selected; credentials configured.');
     const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(line)]]);
     const agent = { model, tools: [] };
     bindHostCanarySurface(fixture, agent, []);
     const outcome = await runJudgedHost(fixture, agent, true);
-    assert.equal(judgeCalls, 1, 'the exact replacement is checked by the host, not reviewed again');
+    assert.equal(judgeCalls, 2, 'a quoted replacement alone is not whole-objective approval');
     assert.equal(String(outcome.finalOutput), line);
     const last = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] }).at(-1)!;
     assert.equal(last.data.fulfills, true);
-    assert.equal((last.data.claimRevision as { scope: string }).scope, 'reply_format');
+    assert.equal(last.data.claimRevision, undefined);
   } finally { _setHostObjectiveJudgeForTests(null); }
 });
 
@@ -10818,7 +10885,8 @@ test('a revision that still carries a quoted claim is reviewed again', async () 
       : { done: true, reason: 'The reply matches the evidence.' } as never;
   });
   try {
-    const fixture = acceptJudgedSource('claims-still-present', 'Post the browser snapshot to the channel');
+    const fixture = acceptJudgedSource('claims-still-present',
+      'Write a browser snapshot from this supplied record: Kernel selected; credentials configured but untested.');
     const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(`${draft} (checked again)`)]]);
     const agent = { model, tools: [] };
     bindHostCanarySurface(fixture, agent, []);
@@ -10827,7 +10895,49 @@ test('a revision that still carries a quoted claim is reviewed again', async () 
   } finally { _setHostObjectiveJudgeForTests(null); }
 });
 
-test('when the rounds are spent on claims-only findings, the answer ships without them and passes delivery', async () => {
+test('changed replies cannot waive unsupported paraphrases, missing deliverables or rejected format examples', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const cases = [
+    { label: 'paraphrased-unsupported', scope: 'claims' as const,
+      objective: 'Write a browser snapshot: credentials are configured but no provider connection was tested.',
+      draft: 'Both providers are connected with live credentials.',
+      revised: 'Both providers have live authenticated connections.',
+      finding: '"connected with live credentials" is unsupported; credentials were configured, not tested.' },
+    { label: 'missing-deliverable', scope: 'claims' as const,
+      objective: 'Write the browser snapshot and post it to the channel.',
+      draft: 'Both providers are connected with live credentials. The snapshot is ready.',
+      revised: 'The snapshot is ready.',
+      finding: '"connected with live credentials" is unsupported.' },
+    { label: 'rejected-format-quote', scope: 'reply_format' as const,
+      objective: 'Write one browser-status line: credentials are configured but no connection was tested.',
+      draft: 'Browser status:\n- credentials configured\n- connections untested',
+      revised: 'All provider connections passed live tests.',
+      finding: 'Do not use "All provider connections passed live tests."; retain the untested qualification on one line.' },
+  ];
+  try {
+    for (const scenario of cases) {
+      const reviewed: Array<{ objective: string; reply: string }> = [];
+      _setHostObjectiveJudgeForTests(async (objective, reply) => {
+        reviewed.push({ objective, reply });
+        return reviewed.length === 1
+          ? { done: false, repairScope: scenario.scope, reason: scenario.finding }
+          : { done: false, blocked: true, reason: 'The changed response still does not fulfill the complete accepted request.' };
+      });
+      const fixture = acceptJudgedSource(scenario.label, scenario.objective);
+      const model = scriptedRecordingModel([[textMsg(scenario.draft)], [textMsg(scenario.revised)]]);
+      const agent = { model, tools: [] };
+      bindHostCanarySurface(fixture, agent, []);
+      await runJudgedHost(fixture, agent, true);
+      assert.equal(reviewed.length, 2, `${scenario.label}: the whole-objective reviewer sees the changed candidate`);
+      assert.deepEqual(reviewed[1], { objective: scenario.objective, reply: scenario.revised });
+      const last = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] }).at(-1)!;
+      assert.equal(last.data.fulfills, false, `${scenario.label}: quote manipulation cannot create fulfillment`);
+      assert.equal(last.data.claimRevision, undefined);
+    }
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
+test('when claims-only repair rounds are spent, deletion can sanitize the report without certifying the whole task', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const draft = 'Traffic is about 1,200 visits a month. Revenue grew 40% this year. The site ranks for 180 keywords. Full report: https://example.test/firm-report.';
   const finding = '(1) "Revenue grew 40% this year" — the report shows 14%';
@@ -10837,8 +10947,8 @@ test('when the rounds are spent on claims-only findings, the answer ships withou
     return { done: false, repairScope: 'claims', reason: finding } as never;
   });
   try {
-    // Review runs for requested work; the checker here is a stub that keeps
-    // finding the same claim, so the objective only needs to invite review.
+    // No channel call ran: removing a bad number cannot complete the posting
+    // obligation, even if the reviewer incorrectly labeled its finding claims-only.
     const fixture = acceptJudgedSource('claims-removed', 'Post the firm snapshot to the channel');
     const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(draft)], [textMsg(draft)]]);
     const agent = { model, tools: [] };
@@ -10851,7 +10961,8 @@ test('when the rounds are spent on claims-only findings, the answer ships withou
     assert.match(delivered, /I took out one claim the review could not verify/);
     const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
     const last = verdicts.at(-1)!;
-    assert.equal(last.data.fulfills, true);
+    assert.equal(last.data.fulfills, false, 'a missing requested effect remains unfulfilled after quote deletion');
+    assert.equal(last.data.carriedVerdict, true, 'the host carries a negative finding rather than inventing a new review');
     assert.deepEqual((last.data.claimRemoval as { removed: string[] }).removed, ['Revenue grew 40% this year']);
     assert.equal(last.data.replyDigest, createHash('sha256').update(delivered, 'utf8').digest('hex'),
       'the recorded review names the exact bytes delivered');
@@ -12007,6 +12118,8 @@ test('retained review feedback rejects foreign sources and yields to actual deli
 
 test('a delivered mid-run "remember …" steer reaches durable memory; a plain steer does not', async () => {
   const steering = await import('./steer-notes.js');
+  const { captureFreshSourceSessionContext } = await import('./source-session-context.js');
+  const { withSourceSessionContext } = await import('./source-session-context-scope.js');
   const session = eventlog.createSession({ id: `sess-steer-memory-${++acceptedSerial}`, kind: 'chat' });
   const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user',
     type: 'user_input_received', data: { text: 'Draft the three follow-up emails.' } });
@@ -12021,10 +12134,14 @@ test('a delivered mid-run "remember …" steer reaches durable memory; a plain s
   const model = scriptedRecordingModel([[textMsg('Drafted.')]]);
   const agent = { model, tools: [] };
   bindHostCanarySurface(fixture, agent, []);
-  const result = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+  // runConversation freezes this at acceptance; runTurn reopens it around the
+  // host. Direct host fixtures must provide the same exact task context.
+  const composition = captureFreshSourceSessionContext(fixture.context);
+  assert.ok(composition);
+  const result = await withSourceSessionContext(composition, () => brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
     throwingRunner() as never, agent as never, HostInterruptState.fromString(state.toString()) as never,
     { maxTurns: 4, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: false } as never,
-  ));
+  )));
   assert.equal(result.finalOutput, 'Drafted.');
   await new Promise((resolve) => setImmediate(resolve));
   const rows = eventlog.listEvents(session.id, { types: ['memory_signals_captured'] });
@@ -12034,6 +12151,87 @@ test('a delivered mid-run "remember …" steer reaches durable memory; a plain s
   assert.notEqual(rows[0]?.data.sourceSteerSeq, plain.seq);
   assert.equal(rows[0]?.data.conversationOnly, true);
   assert.equal(rows[0]?.data.sourceUserSeq, null);
+  assert.equal(rows[0]?.data.queuedCandidateCount, 1, 'the claim reaches durable intake, not just a presentation receipt');
+  const candidate = memoryDatabase.openMemoryDb().prepare(`SELECT call_id, destination_json
+    FROM memory_reflection_candidates WHERE session_id = ?`).get(session.id) as { call_id: string; destination_json: string };
+  assert.equal(candidate.call_id, `auto-capture:user-steer:${remembered.seq}`);
+  const origin = JSON.parse(candidate.destination_json).origin;
+  assert.equal(origin.source.eventSeq, remembered.seq);
+  assert.equal(origin.source.eventType, 'user_steer_note');
+  assert.equal(origin.source.context.sourceUserSeq, source.seq);
+  assert.equal(origin.source.context.digest, composition.digest);
+});
+
+test('delivered remember steers inherit the exact task exclusion without suppressing an ordinary sibling', async () => {
+  const steering = await import('./steer-notes.js');
+  const { captureFreshSourceSessionContext } = await import('./source-session-context.js');
+  const { withSourceSessionContext } = await import('./source-session-context-scope.js');
+  const session = eventlog.createSession({ id: `sess-steer-memory-policy-${++acceptedSerial}`, kind: 'chat' });
+  for (const [index, reason] of ['controlled_test', 'owner_opt_out', undefined].entries()) {
+    const source = eventlog.appendEvent({ sessionId: session.id, turn: index + 1, role: 'user', type: 'user_input_received',
+      data: { text: 'Draft the three follow-up emails.',
+        ...(reason ? { learningPolicy: { version: 1, mode: 'exclude', reason } } : {}) } });
+    const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+    const fixture = { session, source, context: identity,
+      parent: { ...identity, counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::turn:${index + 1}` } };
+    const composition = captureFreshSourceSessionContext(identity);
+    assert.ok(composition);
+    const rememberText = `remember subject: Harbor follow-up ${index + 1}`;
+    const remembered = steering.appendSteerNote(session.id, rememberText);
+    const model = scriptedRecordingModel([[textMsg('Drafted.')]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const state = new HostInterruptState([{ role: 'user', content: source.data.text as string }] as never,
+      [], undefined, 'host_v1', undefined, undefined, 1);
+    const result = await withSourceSessionContext(composition, () => brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+      throwingRunner() as never, agent as never, HostInterruptState.fromString(state.toString()) as never,
+      { maxTurns: 4, hostTurnEngine: 'host_v1', context: identity, hostJudgeCompletion: false } as never,
+    )));
+    assert.equal(result.finalOutput, 'Drafted.', 'learning exclusion does not stop task execution');
+    assert.equal(model.calls(), 1);
+    assert.ok(JSON.stringify(model.requests[0]).includes(rememberText), 'the model still receives owner guidance');
+    await new Promise((resolve) => setImmediate(resolve));
+    const receipts = eventlog.listEvents(session.id, { types: ['memory_signals_captured'] });
+    const candidates = memoryDatabase.openMemoryDb().prepare(`SELECT call_id, destination_json
+      FROM memory_reflection_candidates WHERE session_id = ?`).all(session.id) as Array<{ call_id: string; destination_json: string }>;
+    if (reason) {
+      assert.equal(receipts.length, 0, `${reason} cannot produce automatic memory receipts`);
+      assert.equal(candidates.length, 0, `${reason} cannot queue automatic memory`);
+    } else {
+      assert.equal(receipts.length, 1, 'an ordinary later request still captures its own steer');
+      assert.equal(receipts[0]?.data.sourceSteerSeq, remembered.seq);
+      assert.equal(candidates.length, 1);
+      assert.equal(candidates[0]?.call_id, `auto-capture:user-steer:${remembered.seq}`);
+      assert.equal(JSON.parse(candidates[0]!.destination_json).origin.source.context.sourceUserSeq, source.seq);
+    }
+  }
+});
+
+test('remember steer capture cannot borrow missing or foreign task context even when an ordinary source exists', async () => {
+  const steering = await import('./steer-notes.js');
+  const capture = await import('../../memory/auto-capture.js');
+  const { captureFreshSourceSessionContext } = await import('./source-session-context.js');
+  const { withSourceSessionContext } = await import('./source-session-context-scope.js');
+  const fixture = acceptHostCanarySource('steer-memory-unbound', 'Draft the follow-up emails.');
+  const own = captureFreshSourceSessionContext(fixture.context);
+  assert.ok(own, 'an ordinary accepted source exists but is not an ambient fallback');
+  const rememberText = 'remember subject: Harbor follow-up unbound';
+  const note = steering.appendSteerNote(fixture.session.id, rememberText);
+  const row = eventlog.listEvents(fixture.session.id, { types: ['user_steer_note'] }).find(event => event.seq === note.seq);
+  assert.ok(row);
+  const input = { message: rememberText, sessionId: fixture.session.id, sourceEventId: `user-steer:${note.seq}`,
+    sourceProvenance: capture.autoCaptureProvenanceFromAcceptedEvent(row) };
+  assert.deepEqual(capture.captureInteractionSignals(input).candidates, []);
+  const foreign = acceptHostCanarySource('steer-memory-foreign', 'Draft the unrelated follow-up emails.');
+  const foreignComposition = captureFreshSourceSessionContext(foreign.context);
+  assert.ok(foreignComposition);
+  const captured = withSourceSessionContext(foreignComposition, () => capture.captureInteractionSignals(input));
+  assert.deepEqual(captured.candidates, []);
+  assert.equal((memoryDatabase.openMemoryDb().prepare('SELECT count(*) AS n FROM memory_reflection_candidates WHERE session_id = ?')
+    .get(fixture.session.id) as { n: number }).n, 0);
+  const ownCapture = withSourceSessionContext(own, () => capture.captureInteractionSignals(input));
+  assert.equal(ownCapture.candidates.length, 1, 'the identical owner words are eligible under their exact task context');
+  assert.equal(ownCapture.queuedCandidateIds?.length, 1);
 });
 
 test('a codex transport timeout on the production host journals one public stall_retry_attempted twin beside the private row', async () => {
@@ -13127,7 +13325,7 @@ test('the host model request liveness clears on both a response and a rejected r
 
 // A declared reversible provider write gives transport tests real call authority.
 // The provider body is recording-only; no network or live-home mutation occurs.
-async function transportWriteFixture(write: () => Promise<string>, late: () => Promise<string>, prepare?: () => void) {
+async function transportWriteFixture(write: () => Promise<string>, late: () => Promise<string>, prepare?: () => void, unacknowledgedReturn = false) {
   const adapters = await import('./production-capability-adapter.js');
   const observations = await import('./independent-capability-observation.js');
   const schemas = await import('../../tools/composio-schema-cache.js');
@@ -13165,6 +13363,7 @@ async function transportWriteFixture(write: () => Promise<string>, late: () => P
   const invoke = async (request: { payload: { late: boolean }; authority?: unknown }) => {
     assert.ok(request.authority, 'a settled fixture write must carry an exact consent grant');
     const receipt = await (request.payload.late ? late() : write());
+    if (!request.payload.late && unacknowledgedReturn) return { successful: false, status_code: 502, error: 'controlled missing acknowledgement' };
     return { successful: true, data: { id: 'transport-draft', receipt } };
   };
   assert.equal(productionPorts.registerFixtureCapabilityPort(productionPorts.productionPortIdentityFromManifest(manifest), {
@@ -13416,6 +13615,16 @@ test('a result completed on the last repair receives a fresh positive verdict', 
   assert.deepEqual(verdicts.map(e => e.data.fulfills), [false, false, true]);
   assert.deepEqual(verdicts.map(e => e.data.continuationsUsed), [0, 1, 2]);
   assert.equal(verdicts[2]?.data.replyDigest, createHash('sha256').update(corrected).digest('hex'));
+  // Assertions inside the judge callback can be caught as reviewer failure.
+  // Check its successful return and the actual read outside that boundary.
+  assert.notEqual(verdicts[2]?.data.failedOpen, true, 'a caught assertion is not a successful review');
+  assert.equal(verdicts[2]?.data.reviewFailure, undefined);
+  assert.equal(verdicts[2]?.data.reason, 'The current result now answers the request.');
+  assert.deepEqual(eventlog.openEventLog().prepare(`SELECT logical_tool_call_id, outcome_kind, mutating, requires_reconciliation
+    FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ? ORDER BY logical_tool_call_id`)
+    .all(fixture.session.id, fixture.source.seq), [
+      { logical_tool_call_id: 'final-repair-read', outcome_kind: 'succeeded', mutating: 0, requires_reconciliation: 0 },
+    ], 'the real harness_status call succeeded exactly once under this accepted source');
 });
 
 // ─── Advertised surface is append-only within one accepted source ───────────
@@ -13958,12 +14167,12 @@ for (const variant of ['fresh', 'current_refusal', 'prior_uncertain', 'missing_a
   });
 }
 
-test('a write whose carrier raised without acknowledgement goes on under a write freeze: reads open, writes wait for a read, the frozen write never resent, and she answers', async (t) => {
+test('an unacknowledged write remains frozen after an unrelated read while Clem reports the uncertainty in her own words', async (t) => {
   // Live 2026-10-08: two shell commands that timed out ended the turn "I
   // can't tell whether the command went through… I won't retry it on my
   // own", with nothing read and nothing decided. A write that ended without
   // acknowledgement may have landed: the model gets the error as the call's
-  // result, every further external write waits until a read returns, the
+  // result, every further external write waits for exact verification, the
   // frozen call is never resent, and the model reads, then speaks.
   const accepted = acceptHostCanarySource('dark-write-freeze',
     'Create one reversible draft on the controlled provider account and report its receipt.');
@@ -13981,7 +14190,7 @@ test('a write whose carrier raised without acknowledgement goes on under a write
     parameters: z.object({}),
     execute: async () => { reads++; return 'no draft exists on the controlled account'; },
   });
-  const answer = 'The connection dropped before the app answered. I checked the account: no draft existed, so I created it after the read.';
+  const answer = 'The connection dropped before the app answered. The unrelated local read does not verify the provider draft. I have not resent it; the exact provider account still needs a verified check.';
   const model = stubModel([
     [writer.call('dark-write')],
     [writer.call('dark-write-while-frozen', true)],
@@ -13994,9 +14203,13 @@ test('a write whose carrier raised without acknowledgement goes on under a write
   const outcome = await runProductionHost(accepted, agent, undefined, { maxTurns: 5 });
   assert.equal(entered, 1, 'the dark write ran once and is never resent');
   assert.equal(reads, 1, 'the read went through while the write boundary was frozen');
-  assert.equal(lateRuns, 1, 'a changed write after the read goes through the gate like any write');
-  assert.equal(model.calls(), 5, 'the turn went on; no reconciliation stop');
+  assert.equal(lateRuns, 0, 'an unrelated local read cannot unlock a changed provider write');
+  assert.equal(model.calls(), 5, 'reads and reporting remain available without an extra narrator');
   assert.equal(outcome.finalOutput, answer);
+  assert.deepEqual(outcome.terminal, { status: 'blocked', reason: 'unacknowledged_write_unverified' },
+    'a useful report does not become a completed write task');
+  const { isNarratableHostStop } = await import('./host-turn-runner.js');
+  assert.equal(isNarratableHostStop(outcome), false, 'the already-authored report is never rewritten by a stop narrator');
   assert.notDeepEqual(outcome.terminal, { status: 'blocked', reason: 'tool_effect_uncertain' }, 'the turn did not end in the harness\'s words');
   const resultText = (id: string) => {
     const paired = outcome.history.find((item) => (item as { type?: string }).type === 'function_call_result'
@@ -14005,11 +14218,89 @@ test('a write whose carrier raised without acknowledgement goes on under a write
   };
   assert.match(resultText('dark-write'), /"effect_unknown":true/);
   assert.match(resultText('dark-write'), /socket hang up/, 'the error is the call\'s result');
-  assert.match(resultText('dark-write'), /send no other external write until you have read/);
-  assert.match(resultText('dark-write-while-frozen'), /write_frozen_until_read/, 'an external write before a read is refused before dispatch');
-  assert.match(resultText('dark-read'), /ground truth for the earlier (TRANSPORT_CREATE_DRAFT|call_tool) call that ended without acknowledgement/,
-    'the read that lifts the freeze is named as the answer to the dark write, by the inner operation');
-  assert.match(resultText('dark-read'), /External writes are open again/);
-  assert.deepEqual(dispositionMarkers(outcome.history).map((marker) => marker.disposition), ['refused_pre_dispatch'],
-    'no effect_unknown marker: the frozen write is the only host disposition');
+  assert.match(resultText('dark-write'), /external writes remain frozen until exact reconciliation is verified/);
+  assert.match(resultText('dark-write'), /partial listing is not proof of absence/);
+  assert.match(resultText('dark-write-while-frozen'), /write_frozen_until_verified/, 'an external write before a read is refused before dispatch');
+  assert.match(resultText('dark-write-after-read'), /write_frozen_until_verified/, 'a write after an unrelated read is still refused before dispatch');
+  assert.doesNotMatch(resultText('dark-read'), /ground truth for the earlier|External writes are open again/);
+  assert.deepEqual(dispositionMarkers(outcome.history).map((marker) => marker.disposition), ['refused_pre_dispatch', 'refused_pre_dispatch'],
+    'both further writes are zero-crossing refusals; the original uncertainty is retained');
+});
+
+test('a fresh runner reopens an earlier own-source unacknowledged write instead of resetting its freeze', async (t) => {
+  const accepted = acceptHostCanarySource('dark-write-reentry',
+    'Create one reversible draft on the controlled provider account and report its receipt.');
+  let originalRuns = 0;
+  let laterRuns = 0;
+  const writer = await transportWriteFixture(
+    async () => { originalRuns++; throw new Error('socket hang up'); },
+    async () => { laterRuns++; return 'must not cross on reentry'; },
+  );
+  t.after(() => writer.restore());
+  const firstReply = 'The provider did not acknowledge the write. Its result is unknown and I have not repeated it.';
+  const firstModel = stubModel([[writer.call('dark-reentry-original')], [textMsg(firstReply)]]);
+  const firstAgent = { model: firstModel, tools: [writer.carrier] };
+  bindHostCanarySurface(accepted, firstAgent, firstAgent.tools);
+  const first = await runProductionHost(accepted, firstAgent, undefined, { maxTurns: 2 });
+  assert.equal(originalRuns, 1);
+  assert.equal(first.finalOutput, firstReply);
+  assert.equal(first.terminal?.reason, 'unacknowledged_write_unverified');
+  const finalReply = 'The earlier write is still unverified. I have not made another change; I need the exact account readback to continue.';
+  const secondModel = stubModel([[writer.call('dark-reentry-further', true)], [textMsg(finalReply)]]);
+  const secondAgent = { model: secondModel, tools: [writer.carrier] };
+  bindHostCanarySurface(accepted, secondAgent, secondAgent.tools);
+  const { recoverAcceptedModelBatchForRestart } = await import('./accepted-model-batch-checkpoint.js');
+  const reopened = recoverAcceptedModelBatchForRestart(accepted.context);
+  assert.equal(reopened.status, 'ready', 'the returned transport error is paired; its effect remains unknown');
+  if (reopened.status !== 'ready') throw new Error('controlled returned-write checkpoint is not continuation-ready');
+  const checkpoint = reopened.checkpoint;
+  const ref = { sessionId: checkpoint.sessionId, sourceUserSeq: checkpoint.sourceUserSeq,
+    acceptedTaskId: checkpoint.acceptedTaskId, batchOrdinal: checkpoint.batchOrdinal,
+    batchId: checkpoint.batchId, authorityDigest: checkpoint.authorityDigest };
+  const continued = HostRecoveryState.fromString(new HostRecoveryState(
+    accepted.session.id, accepted.source.seq, 'continue', checkpoint.history, [], [],
+    checkpoint.lastResponseId, undefined, 'host_v1', undefined, 2, ref,
+  ).toString());
+  const originalSettlement = () => eventlog.openEventLog().prepare(`SELECT outcome_kind, outcome_detail,
+    requires_reconciliation, physical_crossing_count FROM logical_call_settlements
+    WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?`)
+    .get(accepted.session.id, accepted.source.seq, 'dark-reentry-original');
+  const before = originalSettlement() as { outcome_kind: string; outcome_detail: string; requires_reconciliation: number; physical_crossing_count: number };
+  assert.equal(before.outcome_kind, 'uncertain_write');
+  assert.equal(before.outcome_detail, 'unacknowledged_mutation');
+  assert.equal(before.requires_reconciliation, 1);
+  assert.equal(before.physical_crossing_count, 1);
+  const second = await runProductionHost(accepted, secondAgent, continued, { maxTurns: 4 });
+  assert.equal(originalRuns, 1);
+  assert.equal(laterRuns, 0, 'a new physical runner does not forget durable uncertainty');
+  assert.equal(second.finalOutput, finalReply);
+  assert.equal(second.terminal?.reason, 'unacknowledged_write_unverified');
+  assert.equal(secondModel.calls(), 2);
+  assert.deepEqual(originalSettlement(), before, 'reporting and reentry never rewrite the original effect');
+});
+
+test('a returned unacknowledged write freezes the next external sibling after its earlier consent check', async (t) => {
+  const accepted = acceptHostCanarySource('dark-write-batch',
+    'Create the two reversible controlled fixture drafts and report their outcomes.');
+  let originalRuns = 0, laterRuns = 0;
+  const writer = await transportWriteFixture(async () => { originalRuns++; return 'reply lost'; },
+    async () => { laterRuns++; return 'must not execute'; }, undefined, true);
+  t.after(() => writer.restore());
+  const answer = 'The first provider response was a server failure, so its effect is unknown. I did not create the second draft or repeat the first; the original account needs an exact verified check.';
+  const model = stubModel([[writer.call('dark-batch-original'), writer.call('dark-batch-sibling', true)], [textMsg(answer)]]);
+  const agent = { model, tools: [writer.carrier] };
+  bindHostCanarySurface(accepted, agent, agent.tools);
+  const result = await runProductionHost(accepted, agent, undefined, { maxTurns: 2 });
+  assert.equal(originalRuns, 1);
+  assert.equal(laterRuns, 0, 'pre-approved siblings must still recheck at execution');
+  assert.equal(result.finalOutput, answer);
+  assert.equal(result.terminal?.reason, 'unacknowledged_write_unverified');
+  assert.equal(model.calls(), 2);
+  const rows = eventlog.openEventLog().prepare(`SELECT logical_tool_call_id, execution_kind, outcome_kind,
+    physical_crossing_count, requires_reconciliation FROM logical_call_settlements
+    WHERE session_id=? AND source_user_seq=? ORDER BY logical_tool_call_id`).all(accepted.session.id, accepted.source.seq);
+  assert.deepEqual(rows, [
+    { logical_tool_call_id: 'dark-batch-original', execution_kind: 'provider_execution', outcome_kind: 'uncertain_write', physical_crossing_count: 1, requires_reconciliation: 1 },
+    { logical_tool_call_id: 'dark-batch-sibling', execution_kind: 'refused_pre_dispatch', outcome_kind: 'invalid_arguments', physical_crossing_count: 0, requires_reconciliation: 0 },
+  ]);
 });

@@ -11,6 +11,7 @@ import type { UserProfile } from '../runtime/user-profile.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { readSourceSessionContext } from '../runtime/harness/source-session-context.js';
 import { currentSourceSessionContext } from '../runtime/harness/source-session-context-scope.js';
+import { parseTurnLearningPolicy, readTurnLearningPolicyForSource, turnLearningPolicyFields, type TurnLearningPolicy } from './turn-learning-policy.js';
 import { createAutomaticMemoryOrigin, type AutomaticMemoryOrigin,
   type AutomaticMemoryOriginInput, type MemoryDestinationSpan } from './memory-destination.js';
 import { getRuntimeEnv } from '../config.js';
@@ -121,12 +122,13 @@ export function autoCaptureProvenanceFromAcceptedEvent(
 
 export function autoCaptureProvenanceFromDirectUserInput(
   source: string,
+  learningPolicy?: TurnLearningPolicy,
 ): AutoCaptureSourceProvenance {
   return {
     authority: 'direct_user_input',
     role: 'user',
     type: 'direct_user_input',
-    data: { synthetic: false, source },
+    data: { synthetic: false, source, ...turnLearningPolicyFields(learningPolicy) },
   };
 }
 
@@ -173,6 +175,8 @@ export function isEligibleAutoCaptureSourceProvenance(
   }
 
   const data = provenance.data;
+  try { if (parseTurnLearningPolicy(data.learningPolicy)) return false; }
+  catch { return false; }
   if (data.synthetic === true || data.system === true || data.notification === true) return false;
   // Malformed/non-boolean machine flags fail closed instead of being coerced.
   if ('synthetic' in data && data.synthetic !== undefined && typeof data.synthetic !== 'boolean') return false;
@@ -303,6 +307,7 @@ function automaticMemorySource(input: {
 export function automaticMemoryOriginSourceIsCurrent(origin: AutomaticMemoryOrigin): boolean {
   const source = origin.source;
   if (source.authority !== 'accepted_user_input' || !source.context) return false;
+  if (readTurnLearningPolicyForSource(source.context).status !== 'allowed') return false;
   try {
     const row = openEventLog().prepare('SELECT id, seq, role, type, data_json FROM events WHERE session_id = ? AND seq = ?')
       .get(source.sessionId, source.eventSeq) as { id: string; seq: number; role: string; type: string; data_json: string } | undefined;
@@ -1361,6 +1366,15 @@ export function captureInteractionSignals(input: {
     sourceEventId: input.sourceEventId,
   })) {
     return emptyAutoCaptureResult();
+  }
+  if (input.sourceProvenance.authority === 'accepted_user_input') {
+    // A steer inherits the exact active execution, never the most recent
+    // source in this reusable session. The retained origin rechecks it again
+    // when deferred consolidation materializes the candidate.
+    const source = input.sourceProvenance.type === 'user_input_received'
+      ? { sessionId: input.sourceProvenance.sessionId, sourceUserSeq: input.sourceProvenance.seq }
+      : currentSourceSessionContext(input.sourceProvenance.sessionId);
+    if (!source || readTurnLearningPolicyForSource(source).status !== 'allowed') return emptyAutoCaptureResult();
   }
   if (!captureMessageIsOwnerAuthored(input.message, input.sourceProvenance)) {
     logger.warn(

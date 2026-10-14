@@ -19,6 +19,7 @@ import { listEvents, openEventLog, type EventRow } from './eventlog.js';
 import { extractExternalWriteIdentityKeys } from './grounding-gate.js';
 import { catalogOperationIdentitiesEqual } from './runtime-tool-identity.js';
 import { resolveWriteEvidence } from './work-report.js';
+import { readPendingUnacknowledgedWritesForSource } from './pending-unacknowledged-writes.js';
 
 export type AcceptedSourceSettlementAuditStatus =
   | 'clean'
@@ -107,28 +108,6 @@ interface SettlementRow {
   mutating: number;
   requirement_id: string | null;
   settled_at?: string | null;
-}
-
-/** A write that ended without acknowledgement (a timeout, a dropped
- * connection) and was READ BACK: a non-mutating call settled successfully
- * after it in the same accepted source. That read is the independent
- * target-state evidence the uncertainty called for, and the runner's write
- * freeze made the model take it before saying anything landed. The ledger
- * keeps the write uncertain (no replay); the audit owes no reconciliation
- * stop for a write that landed, was read back and was reported. */
-export function darkWriteReadBackAfter(
-  row: Pick<SettlementRow, 'mutating' | 'execution_kind' | 'outcome_kind' | 'outcome_detail' | 'settled_at'>,
-  rows: ReadonlyArray<Pick<SettlementRow, 'mutating' | 'outcome_kind' | 'settled_at'>>,
-): boolean {
-  if (!(row.mutating === 1
-    && (row.execution_kind === 'provider_execution' || row.execution_kind === 'local_execution')
-    && row.outcome_kind === 'uncertain_write'
-    && row.outcome_detail === 'unacknowledged_mutation'
-    && typeof row.settled_at === 'string')) return false;
-  return rows.some((other) => other.mutating === 0
-    && (other.outcome_kind === 'succeeded' || other.outcome_kind === 'empty_result')
-    && typeof other.settled_at === 'string'
-    && other.settled_at > row.settled_at!);
 }
 
 /** An exact adapter-proven rejection is an answered attempt with no effect.
@@ -693,41 +672,49 @@ export function auditAcceptedSourceSettlementTruth(input: {
     const answeredRefusals = failed.filter((row) => (
       providerAnsweredRefusal(row) && failedWriteCallIds.has(row.logical_tool_call_id)
     ));
-    // A write that ended without acknowledgement and was read back (a
-    // successful read settled after it, on either lane) is answered by that
-    // read: the model took it under the write freeze before speaking.
-    const readBacks = [...settlements, ...localSettlements];
-    const readBackAnswered = (row: SettlementRow): boolean => answeredRefusalSettlement(row) || darkWriteReadBackAfter(row, readBacks);
+    // A later read is an observation, not authority over the original write.
+    // The runner and this audit reopen the same exact source-local pending
+    // inventory; only a verified original reservation terminal clears it.
+    const unacknowledged = (row: SettlementRow): boolean => row.mutating === 1
+      && row.outcome_kind === 'uncertain_write' && row.outcome_detail === 'unacknowledged_mutation';
+    const unacknowledgedRows = [...settlements, ...localSettlements].filter(unacknowledged);
+    const pendingWrites = unacknowledgedRows.length > 0
+      ? readPendingUnacknowledgedWritesForSource(input, db) : null;
+    const resolvedUnacknowledgedCallIds = new Set(pendingWrites?.status === 'ok'
+      ? pendingWrites.resolved.map(row => row.logicalToolCallId) : []);
+    const unresolvedUnacknowledgedCount = pendingWrites?.status === 'ok'
+      ? pendingWrites.pending.length : unacknowledgedRows.length;
+    const exactWriteResolved = (row: SettlementRow): boolean => unacknowledged(row)
+      ? resolvedUnacknowledgedCallIds.has(row.logical_tool_call_id)
+      : resolvedWriteCallIds.has(row.logical_tool_call_id);
     const answeredRefusalCallIds = new Set([
       ...answeredRefusals.map((row) => row.logical_tool_call_id),
-      ...failed.filter(readBackAnswered).map((row) => row.logical_tool_call_id),
+      ...failed.filter(answeredRefusalSettlement).map((row) => row.logical_tool_call_id),
     ]);
-    // A REPAIRED WRITE IS A RECOVERED WRITE, for an uncertain attempt too,
-    // when the host classified the shape repairable or exact-artifact
-    // reconciled and a LATER attempt of the same shape against the same
-    // target succeeded: the reconcile port verified the one artifact, which
-    // is the independent target-state evidence the uncertainty called for
-    // (host-v1 exact-artifact recovery, pinned; the batch's wider
-    // "uncertain" reading had left the corrected call's turn blocked).
+    // Correcting a repairable known failure may recover that work identity.
+    // A declared reconcile port and a later same-target successful write do
+    // not prove the outcome of an unacknowledged original mutation. That call
+    // needs its own verified terminal, shared with the runner's write freeze.
     const repairedByLaterShape = (row: SettlementRow): boolean => {
+      if (unacknowledged(row)) return false;
       const attempted = reversibleWrites.get(row.logical_tool_call_id);
       return Boolean(attempted && repairedReversibleWrites.some((done) =>
         done.shapeTargetKey === attempted.shapeTargetKey && done.seq > attempted.seq));
     };
     const uncertainSettlements = failed.filter((row) => row.outcome_kind === 'uncertain_write'
-      && !readBackAnswered(row) && !repairedByLaterShape(row));
+      && !answeredRefusalSettlement(row) && !repairedByLaterShape(row));
     // Logical ambiguity clears only when the exact reservation has a durable
     // terminal. Reversibility means the host can repair after readback; it does
     // not prove whether the original effect happened.
     const blockingUncertainSettlements = uncertainSettlements.filter(
-      (row) => !resolvedWriteCallIds.has(row.logical_tool_call_id),
+      (row) => !exactWriteResolved(row),
     );
     const unrecovered = failed.filter((row) => {
       // An acknowledged-false mutation is consequential regardless of its
       // namespace or reversibility. Only the exact reservation's terminal
       // reconciliation may discharge its ambiguity.
       if (row.outcome_kind === 'uncertain_write') {
-        return !readBackAnswered(row) && !repairedByLaterShape(row) && !resolvedWriteCallIds.has(row.logical_tool_call_id);
+        return !answeredRefusalSettlement(row) && !repairedByLaterShape(row) && !exactWriteResolved(row);
       }
       // A REFUSAL IS NOT A FAILED EFFECT. `refused_pre_dispatch` means the
       // harness blocked the call before it crossed the boundary: no request was
@@ -804,6 +791,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
         writeEvidence.uncertain.filter((event) => !answeredRefusalCallIds.has(writeCallId(event))
           && !failed.some((row) => row.logical_tool_call_id === writeCallId(event) && repairedByLaterShape(row))).length,
         blockingUncertainSettlements.length,
+        unresolvedUnacknowledgedCount,
       ),
       successfulBusinessIdentities: successfulIdentities,
       unrecoveredBusinessFailureIdentities: unrecovered.map(recoveryIdentity),

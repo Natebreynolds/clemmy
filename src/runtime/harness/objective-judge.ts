@@ -333,6 +333,16 @@ export interface ObjectiveJudgeVerdict {
       /** Whether the configured reviewer was started (false = the hedge saved it). */
     reviewerStarted?: boolean;
     historicalOnly?: boolean;
+    /** Content-free original producer correlation only; never review authority or billing proof. */
+    originalReading?: {
+      scope: 'diagnostic_only';
+      modelCallId: string; physicalAttempt: number;
+      owner: { sessionId: string; sourceUserSeq: number; attemptId: string };
+      requestBodySha256: string; questionnaireSha256: string; originalResultSha256: string;
+      reviewInvocationId: string; objectiveDigest: string; candidateDigest: string; contextDigest: string;
+      requestedModel: string; providerReportedModel?: string;
+      accountBackend: 'unknown'; providerResponseIdentity: 'unknown';
+    };
     priorAssessment?: { scope: 'non_authoritative_model_opinion'; forwardedBeforeEntry: boolean;
       omissionReason?: 'context_limit' | 'not_dispatched';
       modelCallId: string; requestBodySha256: string; questionnaireSha256: string;
@@ -2521,6 +2531,25 @@ export async function judgeObjectiveComplete(
     if (fast) noteJev(fast, acceptJev);
     if (fast && acceptJev) {
       if (judgePromise) reviewerController.abort();
+      // Correlate only this initial accepted fast reading. A later fallback or
+      // configured verdict must never inherit the earlier screen's original.
+      try {
+        const expected = assessmentExpected();
+        const assessment = expected && assessmentReader?.(readyAssessment, { ...expected, signal: callerSignal });
+        if (assessment?.outcome === 'typed_assessment' && jevAttempt) {
+          const producer = assessment.producer;
+          jevAttempt = { ...jevAttempt, originalReading: {
+            scope: 'diagnostic_only', modelCallId: producer.modelCallId, physicalAttempt: producer.physicalAttempt,
+            owner: { ...producer.owner }, requestBodySha256: producer.requestBodySha256,
+            questionnaireSha256: assessment.questionnaireSha256, originalResultSha256: producer.originalResultSha256,
+            reviewInvocationId: assessment.reviewInvocationId, objectiveDigest: assessment.objectiveDigest,
+            candidateDigest: assessment.candidateDigest, contextDigest: assessment.contextDigest,
+            requestedModel: producer.requestedModel,
+            ...(producer.providerReportedModel ? { providerReportedModel: producer.providerReportedModel } : {}),
+            accountBackend: producer.accountBackend, providerResponseIdentity: producer.providerResponseIdentity,
+          } };
+        }
+      } catch { /* unavailable observation never changes the accepted verdict */ }
       return {
         done: fast.done,
         reason: fast.reason,

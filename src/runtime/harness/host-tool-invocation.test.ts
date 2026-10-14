@@ -34,6 +34,7 @@ const writeProjection = await import('./external-write-event-projection.js');
 const { removeV65StructuresFromHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
 const { tool: sdkTool } = await import('@openai/agents');
 const { z } = await import('zod');
+const invocationObservation = await import('./tool-invocation-observation-context.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -212,6 +213,7 @@ function runCall<T>(
     isKillRequested?: () => boolean;
     beforePhysicalAdmission?: invocation.InvokeHostToolCallInput<T>['beforePhysicalAdmission'];
     beforePhysicalPreparation?: invocation.InvokeHostToolCallInput<T>['beforePhysicalPreparation'];
+    beforePhysicalCrossing?: invocation.InvokeHostToolCallInput<T>['beforePhysicalCrossing'];
     invoke: invocation.InvokeHostToolCallInput<T>['invoke'];
   },
 ) {
@@ -275,6 +277,7 @@ function runCall<T>(
     killPollMs: 5,
     beforePhysicalAdmission: options.beforePhysicalAdmission,
     beforePhysicalPreparation: options.beforePhysicalPreparation,
+    beforePhysicalCrossing: options.beforePhysicalCrossing,
     invoke: options.invoke,
   }))) as Promise<invocation.HostToolInvocationResult<T>>;
 }
@@ -954,6 +957,255 @@ test('async physical preparation failure is a zero-business pre-dispatch refusal
     physical_crossing_count: 0,
     outcome_kind: 'policy_denial',
   });
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+function zeroCrossingRefusal(task: ReturnType<typeof fixture>, callId: string) {
+  assert.equal(rows(task, callId).length, 0, 'no physical reservation was acquired');
+  const row = eventlog.openEventLog().prepare(`SELECT execution_kind, outcome_kind,
+    physical_crossing_count, host_crossing_count, requires_reconciliation, credited_progress
+    FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+    .get(task.sessionId, task.sourceUserSeq, callId) as Record<string, unknown>;
+  assert.equal(row.execution_kind, 'refused_pre_dispatch');
+  assert.ok(['invalid_arguments', 'policy_denial'].includes(String(row.outcome_kind)));
+  assert.equal(row.physical_crossing_count, 0);
+  assert.equal(row.host_crossing_count, 0);
+  assert.equal(row.requires_reconciliation, 0);
+  assert.equal(row.credited_progress, 0);
+  const child = eventlog.openEventLog().prepare(`SELECT revoked_at FROM run_dispatch_leases
+    WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+    .get(task.sessionId, task.sourceUserSeq, callId) as { revoked_at: string | null };
+  assert.ok(child.revoked_at, 'the exact child generation was revoked after its no-effect settlement');
+  assert.equal(leases.isDispatchLeaseCurrent(task.parentLease), true, 'the parent remains available for reads/reporting');
+}
+
+test('the last physical edge rechecks after awaited preparation under the current exact child lease', async () => {
+  const task = fixture('Create the controlled draft.');
+  const callId = 'model:last-edge-after-preparation';
+  const args = { entry_id: 'alpha' };
+  let frozen = false;
+  let bodies = 0;
+  const order: string[] = [];
+  const result = await runCall(task, { callId, args, effect: 'external_write', boundary: 'host_owned_external',
+    deadlineMs: 200,
+    beforePhysicalPreparation: async () => {
+      order.push('preparation');
+      await new Promise<void>(resolve => setImmediate(resolve));
+      frozen = true;
+    },
+    beforePhysicalCrossing: context => {
+      order.push('last-edge');
+      assert.equal(frozen, true);
+      assert.equal(context.sessionId, task.sessionId);
+      assert.equal(context.sourceUserSeq, task.sourceUserSeq);
+      assert.equal(context.acceptedTaskId, task.acceptedTaskId);
+      assert.equal(context.logicalToolCallId, callId);
+      assert.deepEqual(context.args, args);
+      assert.equal(context.tool, 'space_publish');
+      assert.notEqual(context.lease.scopeId, task.parentLease.scopeId);
+      assert.equal(context.lease.logicalToolCallId, callId);
+      assert.equal(leases.isDispatchLeaseCurrent(context.lease), true);
+      assert.equal(leases.currentDispatchLease()?.leaseId, context.lease.leaseId);
+      return new attemptSettlements.InvalidArgumentsPreDispatchResult('write_frozen_until_verified: original call remains unknown');
+    },
+    invoke: async () => { bodies++; return { successful: true }; },
+  });
+  assert.deepEqual(order, ['preparation', 'last-edge']);
+  assert.equal(bodies, 0);
+  assert.match(String(result.value), /write_frozen_until_verified/);
+  assert.equal(result.settlement.outcome.kind, 'invalid_arguments');
+  zeroCrossingRefusal(task, callId);
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['external_write', 'external_write_succeeded'] }).length, 0,
+    'a final-edge hold precedes even the external-write reservation');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+for (const mode of ['thrown', 'laundered', 'already-settled-denial'] as const) {
+  test(`a nested physical edge refuses without a body or success even when ${mode}`, async () => {
+    const task = fixture('Create the controlled draft.');
+    const callId = `model:last-edge-nested-${mode}`;
+    const args = { entry_id: 'alpha' };
+    let bodies = 0;
+    let checks = 0;
+    const result = await runCall(task, { callId, args, effect: 'external_write', boundary: 'nested_owned',
+      deadlineMs: 200,
+      beforePhysicalCrossing: context => {
+        checks++;
+        assert.equal(context.logicalToolCallId, callId);
+        assert.equal(context.tool, 'space_publish');
+        assert.deepEqual(context.args, args);
+        assert.equal(leases.isDispatchLeaseCurrent(context.lease), true);
+        assert.equal(leases.currentDispatchLease()?.leaseId, context.lease.leaseId);
+        return new attemptSettlements.InvalidArgumentsPreDispatchResult('write_frozen_until_verified: exact original write is held');
+      },
+      invoke: async () => {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        try {
+          assert.equal(invocationObservation.reserveHostToolInvocationPhysicalDispatch({ toolName: 'space_publish', args }), true);
+        } catch (error) {
+          if (mode === 'thrown') throw error;
+          if (mode === 'already-settled-denial') attemptSettlements.settleToolAttempt({
+            ...task, callId, toolName: 'space_publish', args, lane: 'byo',
+            mutating: true, businessCall: true, thrown: error });
+          return 'An SDK error formatter returned ordinary text.';
+        }
+        bodies++;
+        return { successful: true };
+      },
+    });
+    assert.equal(checks, 1);
+    assert.equal(bodies, 0);
+    assert.match(String(result.value), /write_frozen_until_verified/);
+    assert.ok(['invalid_arguments', 'policy_denial'].includes(result.settlement.outcome.kind));
+    zeroCrossingRefusal(task, callId);
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
+
+for (const boundary of ['host_owned_external', 'nested_owned'] as const) {
+  test(`a clear ${boundary} last-edge check preserves ordinary one-crossing success`, async () => {
+    const task = fixture('Create the controlled draft.');
+    const callId = `model:last-edge-clear-${boundary}`;
+    const args = { entry_id: 'alpha' };
+    let checks = 0;
+    let bodies = 0;
+    const value = { successful: true, data: { id: 'alpha', updated: true } };
+    const result = await runCall(task, { callId, args, effect: 'external_write', boundary, deadlineMs: 200,
+      beforePhysicalCrossing: context => { checks++; assert.equal(leases.isDispatchLeaseCurrent(context.lease), true); },
+      invoke: async () => {
+        if (boundary === 'nested_owned') invocationObservation.reserveHostToolInvocationPhysicalDispatch({ toolName: 'space_publish', args });
+        bodies++;
+        if (boundary === 'nested_owned') {
+          invocationObservation.settleHostToolInvocationPhysicalDispatch('returned');
+          attemptSettlements.settleToolAttempt({ ...task, callId, toolName: 'space_publish', args,
+            lane: 'byo', mutating: true, businessCall: true, result: value });
+        }
+        return value;
+      },
+    });
+    assert.equal(checks, 1);
+    assert.equal(bodies, 1);
+    assert.equal(result.settlement.outcome.kind, 'succeeded');
+    assert.equal(rows(task, callId).length, 1);
+    assert.equal(rows(task, callId)[0]?.state, 'returned');
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
+
+for (const boundary of ['host_owned_external', 'nested_owned'] as const) {
+  test(`an asynchronous ${boundary} last-edge callback fails closed with zero crossings`, async () => {
+    const task = fixture('Create the controlled draft.');
+    const callId = `model:last-edge-invalid-async-${boundary}`;
+    let bodies = 0;
+    await assert.rejects(runCall(task, { callId, effect: 'external_write', boundary, deadlineMs: 200,
+      beforePhysicalCrossing: (async () => undefined) as never,
+      invoke: async () => {
+        if (boundary === 'nested_owned') invocationObservation.reserveHostToolInvocationPhysicalDispatch({ toolName: 'space_publish', args: { query: 'alpha' } });
+        bodies++;
+        return { successful: true };
+      },
+    }), error => error instanceof invocation.HostToolInvocationAuthorityError);
+    assert.equal(bodies, 0);
+    zeroCrossingRefusal(task, callId);
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
+
+for (const frozen of [true, false]) {
+  test(`a marked provider adapter visits the same exact mutation edge after its own await (frozen=${frozen})`, async () => {
+    const task = fixture('Publish the controlled alpha record.');
+    const callId = `model:marked-last-edge-${frozen}`;
+    const args = { entry_id: 'alpha' };
+    let adapterBodies = 0;
+    let providerBodies = 0;
+    let checks = 0;
+    let preparationFinished = false;
+    // This deliberately exercises the legacy SDK adapter lane. Its existing
+    // execution-wrap gate must be satisfied before reaching the physical edge.
+    const { ExecutionStore } = await import('../../execution/store.js');
+    new ExecutionStore().create({ sessionId: task.sessionId, channel: 'cli',
+      title: 'Controlled alpha publication', objective: 'Publish the controlled alpha record.',
+      reason: 'bounded kernel fixture', startedFromMessage: 'Publish the controlled alpha record.',
+      confidence: 1, reasons: ['controlled kernel acceptance'] });
+    const value = { successful: true, data: { id: 'alpha', updated: true } };
+    const configured = terminalDispatchOwners.attestTerminalPhysicalDispatchOwner(sdkTool({
+      name: 'space_publish', description: 'Hermetic adapter with its own provider-final physical row.',
+      parameters: z.object({ entry_id: z.string() }),
+      execute: async input => {
+        adapterBodies++;
+        await new Promise<void>(resolve => setImmediate(resolve));
+        preparationFinished = true;
+        const result = await identities.withPhysicalDispatch({ ...task, tool: 'space_publish', args: input }, async () => {
+          providerBodies++;
+          return value;
+        });
+        attemptSettlements.settleToolAttempt({ ...task, callId, lane: 'byo', toolName: 'space_publish',
+          args: input, mutating: true, businessCall: true, result });
+        return result;
+      },
+    }));
+    const wrapped = brackets.wrapToolForHarness(configured) as unknown as {
+      invoke: (runContext: unknown, input: string, details: unknown) => Promise<unknown>;
+    };
+    const result = await runCall(task, { callId, args, effect: 'external_write', boundary: 'nested_owned', deadlineMs: 200,
+      beforePhysicalCrossing: context => {
+        checks++;
+        assert.equal(preparationFinished, true);
+        assert.equal(context.logicalToolCallId, callId);
+        assert.equal(context.lease.logicalToolCallId, callId);
+        assert.equal(leases.currentDispatchLease()?.leaseId, context.lease.leaseId);
+        assert.equal(leases.isDispatchLeaseCurrent(context.lease), true);
+        if (frozen) return new attemptSettlements.InvalidArgumentsPreDispatchResult('write_frozen_until_verified: provider-final hold');
+      },
+      invoke: ({ signal }) => wrapped.invoke({ context: { sessionId: task.sessionId } }, JSON.stringify(args), { toolCall: { callId }, signal }),
+    });
+    assert.equal(adapterBodies, 1, 'adapter preparation remains open');
+    assert.equal(checks, 1, 'the marked adapter does not skip or duplicate the policy edge');
+    assert.equal(providerBodies, frozen ? 0 : 1);
+    if (frozen) {
+      assert.match(String(result.value), /write_frozen_until_verified/);
+      zeroCrossingRefusal(task, callId);
+      assert.equal(eventlog.listEvents(task.sessionId, { types: ['external_write_succeeded'] }).length, 0);
+      assert.equal(settlementAudit.auditAcceptedSourceSettlementTruth(task).facts.blockingUncertainWrites, 0,
+        'a proved zero-crossing hold must not leave a nested write projection falsely uncertain');
+    } else {
+      assert.equal(result.settlement.outcome.kind, 'succeeded');
+      assert.equal(rows(task, callId).length, 1);
+      assert.equal(rows(task, callId)[0]?.execution_site, null, 'the provider owns its row without a host duplicate');
+      assert.equal(rows(task, callId)[0]?.state, 'returned');
+    }
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
+
+test('a marked provider read retains its own edge and does not inherit a mutation freeze', async () => {
+  const task = fixture();
+  const callId = 'model:marked-read-no-mutation-freeze';
+  const args = { query: 'alpha' };
+  let bodies = 0;
+  let mutationChecks = 0;
+  const configured = terminalDispatchOwners.attestTerminalPhysicalDispatchOwner(sdkTool({
+    name: 'read_file', description: 'Hermetic provider read.', parameters: z.object({ query: z.string() }),
+    execute: async input => {
+      const result = await identities.withPhysicalDispatch({ ...task, tool: 'read_file', args: input }, async () => {
+        bodies++; return { successful: true, data: ['alpha'] };
+      });
+      attemptSettlements.settleToolAttempt({ ...task, callId, lane: 'byo', toolName: 'read_file',
+        args: input, mutating: false, businessCall: true, result });
+      return result;
+    },
+  }));
+  const wrapped = brackets.wrapToolForHarness(configured) as unknown as {
+    invoke: (runContext: unknown, input: string, details: unknown) => Promise<unknown>;
+  };
+  const result = await runCall(task, { callId, args, boundary: 'nested_owned', deadlineMs: 200,
+    beforePhysicalCrossing: () => { mutationChecks++; return new attemptSettlements.InvalidArgumentsPreDispatchResult('must not block read'); },
+    invoke: ({ signal }) => wrapped.invoke({ context: { sessionId: task.sessionId } }, JSON.stringify(args), { toolCall: { callId }, signal }),
+  });
+  assert.equal(mutationChecks, 0);
+  assert.equal(bodies, 1);
+  assert.equal(result.settlement.outcome.kind, 'succeeded');
+  assert.equal(rows(task, callId).length, 1);
   leases.revokeDispatchLease(task.parentLease);
 });
 

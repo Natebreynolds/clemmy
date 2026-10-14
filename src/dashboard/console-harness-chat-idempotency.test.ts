@@ -284,6 +284,58 @@ async function waitUntil(
   assert.fail(message);
 }
 
+test('automatic-learning exclusion is exact-source durable, request-id bound, and never a public ancestry override', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  let calls = 0;
+  _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+    claudeAgentBrain: (async (request: { sessionId: string }) => {
+      calls++; return { sessionId: request.sessionId, text: 'Controlled fixture complete.', stoppedReason: 'success' };
+    }) as never,
+    runConversation: (async (request: { sessionId: string; sourceUserSeq: number }) => {
+      calls++;
+      const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+      const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+      const source = listEvents(request.sessionId, { types: ['user_input_received'] }).find(event => event.seq === request.sourceUserSeq)!;
+      const identity = { sessionId: request.sessionId, sourceUserSeq: request.sourceUserSeq, turn: source.turn };
+      commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
+        presentation: { kind: 'answer', text: 'Controlled fixture complete.' } });
+      return { sessionId: request.sessionId, status: 'completed', steps: 1, lastTurn: source.turn,
+        lastDecision: { reply: 'Controlled fixture complete.', done: true, nextAction: 'completed' } };
+    }) as never });
+  const harness = await boot();
+  const policy = { version: 1, mode: 'exclude', reason: 'controlled_test' };
+  const request = { input: 'Choose using the controlled local requirements.', clientRequestId: 'learning-policy-once', learningPolicy: policy };
+  const post = (body: unknown) => fetch(`${harness.url}/api/harness/chat`, { method: 'POST',
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  try {
+    const first = await post(request);
+    assert.equal(first.status, 202);
+    const accepted = await first.json() as { sessionId: string; runId: string };
+    await waitUntil(() => getLatestRunAttemptByRunId(accepted.sessionId, accepted.runId)?.finishedAt != null, 'controlled turn did not settle');
+    const sources = listEvents(accepted.sessionId, { types: ['user_input_received'] });
+    assert.equal(sources.length, 1);
+    assert.deepEqual(sources[0]!.data.learningPolicy, policy);
+    assert.equal((await post(request)).status, 202);
+    assert.equal((await post({ ...request, learningPolicy: undefined })).status, 409);
+    assert.equal((await post({ ...request, learningPolicy: { ...policy, reason: 'owner_opt_out' } })).status, 409);
+    assert.equal(listEvents(accepted.sessionId, { types: ['user_input_received'] }).length, 1);
+    const sibling = await post({ input: 'Report the next controlled result.', sessionId: accepted.sessionId,
+      clientRequestId: 'learning-policy-normal-sibling', learningPolicySource: { sessionId: accepted.sessionId, sourceUserSeq: sources[0]!.seq } });
+    assert.equal(sibling.status, 202);
+    const normal = await sibling.json() as { runId: string };
+    await waitUntil(() => getLatestRunAttemptByRunId(accepted.sessionId, normal.runId)?.finishedAt != null, 'normal sibling did not settle');
+    const next = listEvents(accepted.sessionId, { types: ['user_input_received'] }).at(-1)!;
+    assert.notEqual(next.seq, sources[0]!.seq);
+    assert.equal(next.data.learningPolicy, undefined);
+    assert.equal(next.data.learningPolicySource, undefined);
+    const malformed = await post({ ...request, clientRequestId: 'learning-policy-invalid', learningPolicy: { ...policy, mode: 'allow' } });
+    assert.equal(malformed.status, 400);
+    assert.equal(getHarnessChatRequestReceipt('learning-policy-invalid'), null);
+    assert.equal(calls, 2);
+  } finally { _setBridgeImplsForTests({}); await harness.close(); }
+});
+
 test('Execute taps with different request IDs rejoin the accepted revision before steering or attempt replacement', async () => {
   resetEventLog();
   const { appendEvent } = await import('../runtime/harness/eventlog.js');

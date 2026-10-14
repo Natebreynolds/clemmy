@@ -36,7 +36,8 @@ import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { bindCompletedModelResponse, completedModelResponseBinding } from './model-response-binding.js';
-import { captureModelTransportOwner, createModelTransportAttempt, finishModelTransportAttempt, modelTransportAttemptStream,
+import { captureModelTransportOwner, captureModelTransportUsageOwner, withPublicModelTransportUsageOwner,
+  createModelTransportAttempt, finishModelTransportAttempt, modelTransportAttemptStream,
   observeCompletedTransportModelResponse, withModelTransportAttempt, type CapturedModelTransportOwner,
   type ModelTransportAttempt } from './model-transport-observation.js';
 import { modelUsageAttributionStorage, capturedModelUsageAttribution, type CapturedModelUsageProvenance } from '../usage-log.js';
@@ -105,6 +106,43 @@ export type ResilienceTelemetryEvent = ResilienceTelemetryBase & ResilienceTelem
 
 export type ResilienceTelemetryObserver = (event: Readonly<ResilienceTelemetryEvent>) => void;
 const resilienceTelemetry = new AsyncLocalStorage<ResilienceTelemetryObserver>();
+interface PublicModelObservation {
+  target: Model;
+  observer: ResilienceTelemetryObserver | undefined;
+  transportOwner: CapturedModelTransportOwner;
+}
+const publicModelObservation = new AsyncLocalStorage<PublicModelObservation>();
+
+/** BYO's outer protocol assertion is lazy. Retain only observation metadata
+ * at its actual public entry, scoped to the exact inner resilience instance.
+ * No request access, assertion, clocks, provider call or execution ALS restore. */
+export function withPublicModelCallObservation(inner: Model, target: Model,
+  captureOwner: () => CapturedModelTransportOwner = captureModelTransportUsageOwner): Model {
+  const capture = (): PublicModelObservation => ({ target, observer: resilienceTelemetry.getStore(),
+    transportOwner: captureOwner() });
+  const run = <T>(entry: PublicModelObservation, work: () => T): T => publicModelObservation.run(entry,
+    () => withPublicModelTransportUsageOwner(entry.transportOwner, work));
+  return {
+    getResponse(request) {
+      const entry = capture();
+      return run(entry, () => inner.getResponse(request));
+    },
+    getStreamedResponse(request) {
+      const entry = capture();
+      let bound: AsyncIterator<StreamEvent> | undefined;
+      return { [Symbol.asyncIterator]() {
+        if (bound) return bound;
+        const iterator = run(entry, () => inner.getStreamedResponse(request)[Symbol.asyncIterator]());
+        bound = {
+          next: (...args: [] | [undefined]) => run(entry, () => iterator.next(...args)),
+          ...(iterator.return ? { return: (value?: unknown) => run(entry, () => iterator.return!(value as never)) } : {}),
+          ...(iterator.throw ? { throw: (error?: unknown) => run(entry, () => iterator.throw!(error)) } : {}),
+        };
+        return bound;
+      } };
+    },
+  };
+}
 
 /** Bind observations to this asynchronous request, never a mutable process-wide
  * callback. The wrapper captures this binding once before its first attempt. */
@@ -160,8 +198,9 @@ class ResilienceCallTelemetry {
     private readonly maxRetries: number, private readonly startedAt: number, private readonly now: () => number,
     private readonly signal?: AbortSignal,
     private readonly transportOwner: CapturedModelTransportOwner = captureModelTransportOwner(),
-    private readonly captured?: { observer?: ResilienceTelemetryObserver; callId: string; native: true }) {
-    this.observer = captured ? captured.observer : resilienceTelemetry.getStore();
+    private readonly captured?: { observer?: ResilienceTelemetryObserver; callId: string; native: true },
+    observerCapture?: { observer: ResilienceTelemetryObserver | undefined }) {
+    this.observer = captured ? captured.observer : observerCapture ? observerCapture.observer : resilienceTelemetry.getStore();
     this.callId = captured?.callId ?? randomUUID();
     this.emit({ type: 'call_started' });
   }
@@ -676,7 +715,10 @@ export class ResilientModel implements Model {
     let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
     const call: NoAnswerCall = { startedAt: this.now(), signal: request.signal, noAnswerRetries: 0 };
-    const telemetry = new ResilienceCallTelemetry(this.policy.label, 'getResponse', this.maxRetries, call.startedAt, () => this.now(), request.signal);
+    const entry = publicModelObservation.getStore();
+    const observation = entry?.target === this ? entry : undefined;
+    const telemetry = new ResilienceCallTelemetry(this.policy.label, 'getResponse', this.maxRetries, call.startedAt, () => this.now(), request.signal,
+      observation?.transportOwner ?? captureModelTransportOwner(), undefined, observation);
     let outcome: ResilienceOutcome = 'failed';
     let failureKind: ResilienceFailureKind | undefined;
     let effortStripped = false;
@@ -743,15 +785,19 @@ export class ResilientModel implements Model {
   }
 
   getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
-    return this.getStreamedResponseWithTransportOwner(request, captureModelTransportOwner());
+    const entry = publicModelObservation.getStore();
+    const observation = entry?.target === this ? entry : {
+      observer: resilienceTelemetry.getStore(), transportOwner: captureModelTransportOwner(),
+    };
+    return this.getStreamedResponseWithTransportOwner(request, observation);
   }
 
   private async *getStreamedResponseWithTransportOwner(request: ModelRequest,
-    transportOwner: CapturedModelTransportOwner): AsyncIterable<StreamEvent> {
+    observation: { transportOwner: CapturedModelTransportOwner; observer: ResilienceTelemetryObserver | undefined }): AsyncIterable<StreamEvent> {
     let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
     const call: NoAnswerCall = { startedAt: this.now(), signal: request.signal, noAnswerRetries: 0 };
-    const telemetry = new ResilienceCallTelemetry(this.policy.label, 'getStreamedResponse', this.maxRetries, call.startedAt, () => this.now(), request.signal, transportOwner);
+    const telemetry = new ResilienceCallTelemetry(this.policy.label, 'getStreamedResponse', this.maxRetries, call.startedAt, () => this.now(), request.signal, observation.transportOwner, undefined, observation);
     let outcome: ResilienceOutcome = 'interrupted';
     let failureKind: ResilienceFailureKind | undefined;
     let effortStripped = false;

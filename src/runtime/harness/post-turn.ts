@@ -5,6 +5,8 @@ import { gatherSessionSkills } from './skill-execution.js';
 import { safeDetectCorrection } from './correction-hook.js';
 import { appendEvent } from './eventlog.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
+import { parseTurnLearningPolicy, readTurnLearningPolicyForSource, type TurnLearningPolicy } from '../../memory/turn-learning-policy.js';
+import { currentSourceSessionContext } from './source-session-context-scope.js';
 
 /**
  * The ONE post-turn hook spine every brain lane calls.
@@ -24,6 +26,10 @@ import { maybeAutoFocusSession } from './auto-focus.js';
  */
 export interface PostTurnHookInput {
   sessionId: string;
+  /** Exact accepted source; approval/resume retains its original sequence. */
+  sourceUserSeq?: number;
+  /** Restrictive option for the legacy direct-user boundary without events. */
+  learningPolicy?: TurnLearningPolicy;
   turn: number;
   /** The user's message this turn — the correction detector's input. */
   userInput: unknown;
@@ -54,6 +60,15 @@ export interface PostTurnHookInput {
 }
 
 export function runPostTurnHooks(input: PostTurnHookInput): void {
+  try { if (parseTurnLearningPolicy(input.learningPolicy)) return; }
+  catch { return; }
+  const source = input.sourceUserSeq === undefined
+    ? currentSourceSessionContext(input.sessionId)
+    : { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq };
+  // Event-backed lanes supply their exact source and fail closed if it cannot
+  // be reopened. The supported legacy direct-user boundary has no event at
+  // all and carries its restrictive option above. Never select a later row.
+  if (source && readTurnLearningPolicyForSource(source).status !== 'allowed') return;
   // Negative half of the credit loop — BEFORE auto-credit so the prior turn's
   // credited facts are the ones a correction reads. Opt-out only for turns with
   // no new user message (approval-resume).
@@ -105,7 +120,10 @@ export function runPostTurnHooks(input: PostTurnHookInput): void {
   // standard, live 2026-07-31). Lives in the shared spine so both brains learn
   // identically. Best-effort — learning must never fail a turn.
   try {
-    const loaded = gatherSessionSkills(input.sessionId).map((s) => s.name);
+    const loaded = gatherSessionSkills(input.sessionId, source ? { sourceUserSeq: source.sourceUserSeq } : {})
+      .filter((skill) => !source || skill.origins?.some((origin) => origin.scope === 'current_source'
+        && origin.sourceUserSeq === source.sourceUserSeq))
+      .map((skill) => skill.name);
     if (loaded.length > 0) {
       captureProvenSkill({
         request: typeof input.userInput === 'string' ? input.userInput : (input.queryText ?? ''),

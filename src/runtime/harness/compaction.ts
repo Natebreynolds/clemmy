@@ -1341,7 +1341,7 @@ async function runSummarizerTurn(serializedOlder: string): Promise<SummarizerTur
 }
 
 /**
- * Validate that every [call_xxx] reference in the summary text exists
+ * Validate that every [call_xxx] or native Claude [toolu_xxx] reference exists
  * in the session's actual tool_called events. Rewrite hallucinated ids
  * to `[invalid call_id]` so the agent doesn't waste a recall budget on
  * something that isn't there.
@@ -1352,8 +1352,8 @@ export function validateCallIdReferences(
 ): { sanitized: string; referenced: string[]; hallucinated: string[] } {
   const referenced: string[] = [];
   const hallucinated: string[] = [];
-  // Match [call_xxx] — call_ids from the SDK are alphanumeric.
-  const sanitized = summary.replace(/\[(call_[A-Za-z0-9_-]+)\]/g, (match, id: string) => {
+  // Recognize supported tool-call ID formats, not arbitrary bracketed text.
+  const sanitized = summary.replace(/\[((?:call_|toolu_)[A-Za-z0-9_-]+)\]/g, (match, id: string) => {
     if (validCallIds.has(id)) {
       if (!referenced.includes(id)) referenced.push(id);
       return match;

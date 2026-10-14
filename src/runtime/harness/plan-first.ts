@@ -14,6 +14,7 @@ import { deliverableContextBlock } from '../../memory/deliverable-index.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import { turnOutcomeId, type TurnIdentity, type TurnOutcome } from './turn-outcome.js';
 import { modelVisibleTextSha256 } from './model-visible-text-digest.js';
+import { turnLearningPolicyFields, type TurnLearningPolicy } from '../../memory/turn-learning-policy.js';
 
 export interface PlanFirstInput {
   input: string;
@@ -27,6 +28,7 @@ export interface PlanFirstInput {
 }
 
 export interface PlanFirstRunInput extends PlanFirstInput {
+  learningPolicy?: TurnLearningPolicy;
   sessionId: string;
   channel?: string;
   /**
@@ -319,7 +321,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       turn: 0,
       role: 'user',
       type: 'user_input_received',
-      data: { text: input.input },
+      data: { text: input.input, ...turnLearningPolicyFields(input.learningPolicy) },
     });
   }
   const sourceUserSeq = acceptedSource.seq;
@@ -482,6 +484,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
     // Post-turn hooks (correction + auto-credit) via the ONE shared spine.
     runPostTurnHooks({
       sessionId: input.sessionId,
+      sourceUserSeq,
       turn: 0,
       userInput: input.input,
       recallIds: [memoryRecallId],

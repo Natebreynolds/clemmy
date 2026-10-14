@@ -20,6 +20,7 @@ import { projectArchivedContext } from './archived-context-projection.js';
 import { revalidateReviewedPlanPreparation } from './reviewed-plan-runtime.js';
 import { thisTurnSearchAccountSelectionBlockers } from '../../tools/tool-search-provider-sources.js';
 import { acceptedTaskMode } from './accepted-task-mode.js';
+import { turnLearningPolicyFields, type TurnLearningPolicy, type TurnLearningSource } from '../../memory/turn-learning-policy.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { captureSourceBudgetPolicy, readSourceBudgetPolicy } from './source-budget-policy.js';
 import { retainedHistoryPrefixProjection } from './retained-history-prefix.js';
@@ -33,6 +34,7 @@ import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
 import { createHash, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { HarnessSession } from './session.js';
 import { workflowParentActivation } from './workflow-parent-activation.js';
 import { composeRunProgressLine } from './run-progress.js';
@@ -857,7 +859,8 @@ function acceptFreshConversationInput(options: RunConversationOptions): number {
     sessionId: options.sessionId,
     turn: nextTurnNumber(row),
     role: 'user',
-    data: { text: options.input },
+    data: { text: options.input, ...turnLearningPolicyFields(options.learningPolicy),
+      ...(options.learningPolicySource ? { learningPolicySource: options.learningPolicySource } : {}) },
   }).seq;
 }
 
@@ -3913,6 +3916,10 @@ function declinesAutomaticContextWarm(options: RunConversationOptions): boolean 
 }
 
 export interface RunConversationOptions {
+  /** Excludes automatic learning from a fresh accepted source, never a session global. */
+  learningPolicy?: TurnLearningPolicy;
+  /** Host-only exact ancestry for restrictive automatic-learning policy. */
+  learningPolicySource?: TurnLearningSource;
   /** Internal executor's exact lease owner for a durable connection control.
    * Never accepted from a browser, model, or retained historical receipt. */
   connectionExecutionLeaseOwner?: string;
@@ -7177,8 +7184,32 @@ async function runConversationWithinRuntimeConfig(
       } else {
         await resolveContext();
       }
+      const recordPreparationTiming = (
+        lane: 'proven_operation_preparation' | 'capability_preparation',
+        outcome: 'selected' | 'empty' | 'resolved' | 'error',
+        started: number,
+        ended: number,
+      ): void => {
+        try {
+          const totalMs = ended - started;
+          if (!Number.isFinite(totalMs) || totalMs < 0) return;
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'turn_phase_timings',
+            data: {
+              version: 1, lane, clock: 'monotonic', sourceUserSeq, outcome, totalMs,
+              ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
+            },
+          });
+        } catch { /* Observing an await cannot change preparation or execution. */ }
+      };
       let provenOperationText: string | undefined;
       if (!hostPlainConversation && !isUnattendedSession(options.sessionId)) {
+        const started = performance.now();
+        let ended: number | undefined;
+        let outcome: 'selected' | 'empty' | 'error' = 'error';
         try {
           const proven = await (await import('../jev/proven-operation.js')).prepareProvenOperationForRequest({
             query: String(options.semanticTaskInput ?? options.input ?? ''),
@@ -7186,7 +7217,12 @@ async function runConversationWithinRuntimeConfig(
             sourceUserSeq,
             mcpToolScope: options.mcpToolScope,
           });
+          // Stop at the awaited preparation, before selected-event publication.
+          // A transport's later retirement is a different span, not this wait.
+          ended = performance.now();
+          outcome = 'empty';
           if (proven.text) {
+            outcome = 'selected';
             provenOperationText = proven.text;
             appendEvent({
               sessionId: options.sessionId,
@@ -7211,8 +7247,18 @@ async function runConversationWithinRuntimeConfig(
             });
           }
         } catch { /* proven recall is fail-open */ }
+        finally {
+          recordPreparationTiming('proven_operation_preparation', outcome, started, ended ?? performance.now());
+        }
       }
-      await resolveCapability?.();
+      const capabilityStarted = performance.now();
+      let capabilityOutcome: 'resolved' | 'empty' | 'error' = 'error';
+      try {
+        await resolveCapability?.();
+        capabilityOutcome = resolveCapability ? 'resolved' : 'empty';
+      } finally {
+        recordPreparationTiming('capability_preparation', capabilityOutcome, capabilityStarted, performance.now());
+      }
       if (!activeAgent) throw new Error('capability resolution did not produce an agent before the host core.');
       const hostTurnOptions: RunTurnOptions = {
         hostActivationStartedAt: activationStartedAt,
@@ -13120,6 +13166,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
     // spine — identical on every brain lane. New post-turn behavior wires there.
     runPostTurnHooks({
       sessionId: options.sessionId,
+      sourceUserSeq,
       turn,
       userInput: options.taskContinuation?.disposition === 'declined_with_new_task'
         ? options.taskContinuation.activeTaskInput
@@ -13373,6 +13420,10 @@ export async function resumePendingApproval(
     : (() => {
         try { return getLatestRunAttempt(options.sessionId)?.sourceUserSeq ?? undefined; } catch { return undefined; }
       })();
+  // Historical execution compatibility may use a latest-attempt fallback.
+  // Optional learning must never treat that fallback as proof of the parked
+  // task's source. Only the pause's own retained subject can supply it.
+  let resumeLearningSourceUserSeq = 0;
   // Agent construction happens before RunState deserialization. Capture its
   // exact bound connector scope now so a second approval pause persists the
   // same authority even when tool brackets are disabled.
@@ -13409,7 +13460,9 @@ export async function resumePendingApproval(
         error: 'The selected approval belongs to a different paused action; no decision was applied.' };
     }
     try {
-      resumeSourceUserSeq = pausedHostApprovalSource(state, options.sessionId) ?? resumeSourceUserSeq;
+      const pausedSource = pausedHostApprovalSource(state, options.sessionId);
+      resumeSourceUserSeq = pausedSource ?? resumeSourceUserSeq;
+      resumeLearningSourceUserSeq = pausedSource ?? 0;
     } catch (error) {
       const message = normalizeError(error);
       safeAppend({
@@ -14034,6 +14087,7 @@ export async function resumePendingApproval(
     // prior answer) — so any future post-turn hook reaches the resume path too.
     runPostTurnHooks({
       sessionId: options.sessionId,
+      sourceUserSeq: resumeLearningSourceUserSeq,
       turn,
       userInput: undefined,
       detectCorrection: false,

@@ -3,6 +3,7 @@
  * tool_search. Fail-open: no match, low confidence, missing schema, or a
  * provision miss leaves discovery unchanged.
  */
+import { performance } from 'node:perf_hooks';
 import { withSessionMemoryScope } from '../../memory/memory-scope.js';
 import { listEvents } from '../harness/eventlog.js';
 import {
@@ -567,6 +568,14 @@ export function routableOperationsForRequest(
   query: string,
   scope: 'chat' | 'any',
 ): Array<{ id: string; purpose: string }> {
+  return routableOperationsFromStrategies(query, scope, listVerifiedRunStrategies());
+}
+
+function routableOperationsFromStrategies(
+  query: string,
+  scope: 'chat' | 'any',
+  strategies: readonly RunStrategyRecord[],
+): Array<{ id: string; purpose: string }> {
   const rows = new Map<string, { name: string; oneLiner: string }>();
   for (const row of TOOL_REGISTRY) {
     if (!isHandoverRegistryTool(row.name)) continue;
@@ -577,7 +586,7 @@ export function routableOperationsForRequest(
     if (!isRegistryDeclaredRead(row.name) && !NATIVE_PRODUCT_AUTHORING_TOOLS.has(row.name)) continue;
     rows.set(row.name.toLowerCase(), { name: row.name, oneLiner: (row.description ?? '').trim() });
   }
-  for (const strategy of listVerifiedRunStrategies()) {
+  for (const strategy of strategies) {
     if (scope !== 'any' && (strategy.scope ?? 'chat') !== 'chat') continue;
     for (const raw of selectLearnedStrategyTools(strategy.toolsUsed)) {
       const name = raw.trim();
@@ -628,7 +637,16 @@ export function familiarRunStrategiesForRequest(
   scope: 'chat' | 'any',
   limit = FAMILIAR_RUN_CANDIDATES,
 ): RunStrategyRecord[] {
-  const offered = listVerifiedRunStrategies()
+  return familiarRunStrategiesFromStrategies(query, scope, listVerifiedRunStrategies(), limit);
+}
+
+function familiarRunStrategiesFromStrategies(
+  query: string,
+  scope: 'chat' | 'any',
+  strategies: readonly RunStrategyRecord[],
+  limit = FAMILIAR_RUN_CANDIDATES,
+): RunStrategyRecord[] {
+  const offered = strategies
     .filter((strategy) => scope === 'any' || (strategy.scope ?? 'chat') === 'chat')
     .filter((strategy) => bindableStrategyTools(strategy.toolsUsed).length > 0);
   if (offered.length === 0) return [];
@@ -667,12 +685,16 @@ async function decideWithinBudget(
     route: { pick: null, outcome: 'unavailable' },
     failedOpen: true,
   };
+  const deadline = performance.now() + budgetMs;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expired = new Promise<TurnStartDecisionFor>((resolve) => {
     timer = setTimeout(() => resolve(unavailable), budgetMs);
   });
   try {
-    return await Promise.race([decide().catch(() => unavailable), expired]);
+    const decision = await Promise.race([decide().catch(() => unavailable), expired]);
+    // A fulfilled microtask can precede an overdue timer after an event-loop
+    // stall. Only a result admitted inside the original budget may be used.
+    return performance.now() < deadline ? decision : unavailable;
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -735,8 +757,11 @@ async function prepareProvenOperationInScope(
     // request: discovery finds the operation instead.
     const decideTurnStart = dependencies.decideTurnStart
       ?? (await jevAvailable() ? decideTurnStartWithJev : null);
-    const familiar = decideTurnStart ? familiarRunStrategiesForRequest(input.query, strategyScope) : [];
-    const operations = decideTurnStart ? routableOperationsForRequest(input.query, strategyScope) : [];
+    // Both candidate windows describe this one decision. Read the verified,
+    // scoped runs once; selected operations are still re-attested below.
+    const verified = decideTurnStart ? listVerifiedRunStrategies() : [];
+    const familiar = decideTurnStart ? familiarRunStrategiesFromStrategies(input.query, strategyScope, verified) : [];
+    const operations = decideTurnStart ? routableOperationsFromStrategies(input.query, strategyScope, verified) : [];
     if (decideTurnStart && (familiar.length > 0 || operations.length > 0)) {
       const startedAt = Date.now();
       const decision = await decideWithinBudget(() => decideTurnStart(

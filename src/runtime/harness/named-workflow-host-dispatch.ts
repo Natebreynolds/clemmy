@@ -145,7 +145,7 @@ export function acceptedSourceIsWorkflowInternal(sessionId: string, sourceUserSe
   // session with no report-back target, and ended the turn before a single
   // authoring call. Host-internal sources never manufacture run authority.
   if (isWorkflowImprovementSessionId(sessionId)) return true;
-  if (getSession(sessionId)?.kind === 'workflow') return true;
+  if (getSession(sessionId, { withoutConversationState: true })?.kind === 'workflow') return true;
   const accepted = listEvents(sessionId, {
     sinceSeq: sourceUserSeq - 1,
     types: ['user_input_received'],

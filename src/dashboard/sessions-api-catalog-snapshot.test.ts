@@ -10,7 +10,8 @@ const fixtureHome = mkdtempSync(path.join(os.tmpdir(), 'clem-catalog-snapshot-')
 process.env.CLEMENTINE_HOME = fixtureHome;
 mkdirSync(path.join(fixtureHome, 'state'), { recursive: true });
 const log = await import('../runtime/harness/eventlog.js');
-const { claimSessionForAcceptedSource } = await import('../runtime/harness/accepted-source-session-branch.js');
+const { claimSessionForAcceptedSource, readAcceptedSourceConversationProjection } =
+  await import('../runtime/harness/accepted-source-session-branch.js');
 const { buildUnifiedSessionList, getUnifiedSessionDetail } = await import('./sessions-api.js');
 test.after(() => { log.closeEventLog(); rmSync(fixtureHome, { recursive: true, force: true }); });
 
@@ -72,15 +73,21 @@ test('search and preview validate a stopped lineage once and avoid decoration/fu
     return statement;
   }) as typeof db.prepare;
   try {
-    const listed = buildUnifiedSessionList({ q: 'catalog needle', tag: 'catalog-lineage', source: 'desktop', limit: 100 });
+    const phases: string[] = [];
+    const listed = buildUnifiedSessionList({ q: 'catalog needle', tag: 'catalog-lineage', source: 'desktop', limit: 100 },
+      { observer: (phase) => { phases.push(phase); } });
     assert.equal(listed.length, 1);
     assert.equal(listed[0]!.id, `harness:${root.id}`);
     assert.equal(listed[0]!.executionSessionId, ids[2]);
     assert.equal(listed[0]!.turnCount, 6);
     assert.equal(listed[0]!.preview, 'Catalog answer 2.');
     assert.equal(listed[0]!.pinned, true);
-    assert.equal(identityReads.length, ids.length + 1,
-      'one verified projection: entry plus head/ancestors; summary, search and preview reuse it');
+    assert.equal(identityReads.length, 0, 'identity comes from the list rows already held, without point reads');
+    assert.equal(phases.filter(phase => phase === 'catalog_lineage').length, 1,
+      'summary, search and preview reuse one principal-checked lineage projection');
+    assert.equal(phases.filter(phase => phase === 'catalog_lineage_rows').length, 0);
+    assert.equal(phases.filter(phase => phase === 'catalog_lineage_proofs').length, ids.length,
+      'the pointer and each branched member still redeem their exact persisted selector proofs');
     assert.equal(fullStateReads.length, 0, 'list must not deserialize recovery/provider state per member');
     assert.equal(eventReads.length, 6, 'one public row query per member for search and preview, not three decoration queries');
     assert.ok(!eventReads.some(args => args.includes('turn_model_routed') || args.includes('deliverable_saved')));
@@ -89,6 +96,14 @@ test('search and preview validate a stopped lineage once and avoid decoration/fu
     assert.deepEqual(db.prepare('SELECT * FROM accepted_source_session_bindings ORDER BY durable_source_digest').all(), beforeBindings);
   } finally { db.prepare = prepare; log.closeEventLog(); }
 
+  const expectedProjection = { rootSessionId: root.id, headSessionId: ids[2]!, sessionIds: ids };
+  const displayRows = log.listSessionRowsForDisplay();
+  assert.ok(displayRows);
+  const held = new Map(displayRows.map(row => [row.id, row]));
+  assert.deepEqual(readAcceptedSourceConversationProjection(root.id, { rows: id => held.get(id) }), expectedProjection,
+    'the held-row path validates every member of the same complete lineage');
+  assert.deepEqual(readAcceptedSourceConversationProjection(root.id), expectedProjection,
+    'detail/control readers without held rows still reopen the same persisted lineage');
   const detail = getUnifiedSessionDetail(`harness:${root.id}`)!;
   assert.equal(detail.turns.length, 6);
   assert.ok(detail.turns.some(turn => turn.agentName === 'Catalog Agent' && turn.files?.length), 'full history still has decoration');
@@ -113,10 +128,21 @@ test('a later forged pointer invalidates presentation reuse; principal splits ne
   const child = accept(root.id);
   exchange(child.sessionId, 'Continue owner catalog needle.', 'Owner continuation answer.');
   assert.equal(buildUnifiedSessionList({ tag: 'catalog-corrupt', q: 'owner catalog needle' }).length, 1);
+  const db = log.openEventLog();
+  db.prepare('UPDATE sessions SET user_id = ? WHERE id = ?').run('foreign-catalog-owner', child.sessionId);
+  const changedPrincipal = buildUnifiedSessionList({ tag: 'catalog-corrupt', includeArchived: true, limit: 500 })
+    .find(row => row.id === `harness:${root.id}`)!;
+  assert.equal(changedPrincipal.executionSessionId, undefined, 'a warmed row cache cannot retain the old principal');
+  assert.equal(changedPrincipal.turnCount, 2);
+  assert.equal(changedPrincipal.preview, 'Private owner answer.');
+  db.prepare('UPDATE sessions SET user_id = ? WHERE id = ?').run(continuity.audienceId, child.sessionId);
+  const restored = buildUnifiedSessionList({ tag: 'catalog-corrupt', includeArchived: true, limit: 500 })
+    .find(row => row.id === `harness:${root.id}`)!;
+  assert.equal(restored.executionSessionId, child.sessionId);
+  assert.equal(restored.turnCount, 4, 'restoring the exact principal restores only that owner lineage');
   const forged = log.createSession({ id: 'catalog-forged-child', kind: 'chat', channel: 'desktop', userId: continuity.audienceId,
     metadata: { ...log.getSession(child.sessionId)!.metadata } });
   exchange(forged.id, 'Forged catalog fixture.', 'Forged catalog answer.');
-  const db = log.openEventLog();
   db.prepare('UPDATE accepted_source_session_pointers SET head_session_id = ? WHERE root_session_id = ?').run(forged.id, root.id);
   const listed = buildUnifiedSessionList({ includeArchived: true, limit: 500 });
   const owner = listed.find(row => row.id === `harness:${root.id}`)!;

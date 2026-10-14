@@ -759,3 +759,104 @@ test('Stop during the read window clears the hedge and a later Jev DONE cannot d
   jev.answer(); await stopped;
   assert.equal(state.reviewerCalls(), 0);
 });
+
+for (const reportedModel of [true, false]) {
+  test(`accepted Jev-fast original reading joins its actual invocation and usage: reported model ${reportedModel}`, async t => {
+    const state = setup(t);
+    const session = createSession({ id: `fast-reading-original-${reportedModel}`, kind: 'chat' });
+    const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: objective } });
+    const owner = { sessionId: session.id, sourceUserSeq: source.seq, attemptId: `attempt:fast-reading-${reportedModel}` };
+    const context: Context = { ...read, sessionId: session.id, reviewInputOwner: owner,
+      agentInstructions: 'PRIVATE_FAST_READING_INSTRUCTIONS' };
+    const { withModelTransportRecorder } = await import('./model-transport-observation.js');
+    const { readUsageEventsForDate } = await import('../usage-log.js');
+    const { parseSystemOneResponse } = await import('../jev/system-one.js');
+    const rows: Readonly<Record<string, unknown>>[] = [];
+    let calls = 0, posted = '', returnedBody: unknown;
+    _setSystemOneFetchForTests(async (_url, init) => {
+      calls++; posted = init.body;
+      const payload = JSON.parse(await jevResponse().text());
+      if (!reportedModel) delete payload.model;
+      returnedBody = payload;
+      return { status: 200, ok: true, text: async () => JSON.stringify(payload) };
+    });
+    const verdict = await withModelTransportRecorder(row => rows.push(row), () => modelUsageAttributionStorage.run(owner,
+      () => judgeObjectiveComplete(objective, reply, context)));
+    assert.equal(verdict.done, true); assert.equal(verdict.fast, true);
+    assert.equal(verdict.jevAttempt?.accepted, true); assert.equal(state.reviewerCalls(), 0); assert.equal(calls, 1);
+    const reading = verdict.jevAttempt?.originalReading;
+    assert.ok(reading, 'a same-call private assessment supplies an optional original-reading diagnostic');
+    assert.equal(reading.scope, 'diagnostic_only'); assert.deepEqual(reading.owner, owner);
+    assert.equal(reading.physicalAttempt, 1);
+    const local = rows.filter(row => row.phase === 'adapter_attempt_created' || row.phase === 'adapter_attempt_finished');
+    assert.equal(local.length, 2); assert.equal(local[1].outcome, 'returned');
+    assert.equal(reading.modelCallId, local[0].modelCallId); assert.equal(local[1].modelCallId, reading.modelCallId);
+    const usage = readUsageEventsForDate().filter(row => row.trace?.modelCallId === reading.modelCallId);
+    assert.equal(usage.length, 1); assert.equal(usage[0].trace?.acceptedSource, `${owner.sessionId}:${owner.sourceUserSeq}`);
+    assert.equal(usage[0].trace?.attemptId, owner.attemptId); assert.equal(usage[0].role, 'router');
+    const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+    const request = JSON.parse(posted);
+    assert.equal(reading.requestBodySha256, hash(posted));
+    assert.equal(reading.questionnaireSha256, hash(JSON.stringify(request.questions)));
+    assert.equal(reading.originalResultSha256, hash(JSON.stringify({ ...parseSystemOneResponse(returnedBody, request.questions), status: 200 })));
+    assert.equal(reading.objectiveDigest, hash(objective)); assert.equal(reading.candidateDigest, hash(reply));
+    assert.match(reading.contextDigest, /^[a-f0-9]{64}$/); assert.match(reading.reviewInvocationId, /^[a-f0-9-]{36}$/);
+    assert.equal(reading.requestedModel, 'jev-1.13.0');
+    assert.equal(reading.providerReportedModel, reportedModel ? 'jev-1.13.0' : undefined);
+    assert.equal(Object.hasOwn(reading, 'providerReportedModel'), reportedModel);
+    assert.equal(reading.accountBackend, 'unknown'); assert.equal(reading.providerResponseIdentity, 'unknown');
+    assert.equal(verdict.jevAttempt?.priorAssessment, undefined, 'a fast return does not claim reviewer forwarding');
+    assert.doesNotMatch(JSON.stringify(reading), /PRIVATE_FAST_READING_INSTRUCTIONS|read_file|source says|ts_read_first_fixture/);
+  });
+}
+
+for (const change of ['stale_context', 'stale_owner', 'foreign_owner', 'unowned', 'projection_error'] as const) {
+  test(`accepted Jev-fast omits an unavailable original reading without changing its verdict: ${change}`, async t => {
+    const state = setup(t), jev = pendingJev();
+    const owner = { sessionId: read.sessionId!, sourceUserSeq: 71, attemptId: `attempt:fast-reading-${change}` };
+    const context: Context = { ...read, reviewInputOwner: { ...owner }, agentInstructions: 'Original standing requirement.' };
+    if (change === 'foreign_owner') context.reviewInputOwner = { ...owner, attemptId: 'attempt:foreign-reading' };
+    const invoke = () => judgeObjectiveComplete(objective, reply, context);
+    const run = change === 'unowned' ? invoke() : modelUsageAttributionStorage.run(owner, invoke);
+    await jev.whenStarted;
+    if (change === 'stale_context') context.agentInstructions = 'Changed current standing requirement.';
+    if (change === 'stale_owner') context.reviewInputOwner = { ...owner, attemptId: 'attempt:changed-current-reading' };
+    if (change === 'projection_error') Object.defineProperty(context, 'toolCallSummary', {
+      enumerable: true, get() { throw new Error('PRIVATE_OPTIONAL_PROJECTION_ERROR'); },
+    });
+    jev.answer();
+    const verdict = await run;
+    assert.equal(verdict.done, true); assert.equal(verdict.fast, true); assert.equal(verdict.jevAttempt?.accepted, true);
+    assert.equal(verdict.jevAttempt?.originalReading, undefined);
+    assert.equal(verdict.jevAttempt?.reviewerStarted, false); assert.equal(state.reviewerCalls(), 0); assert.equal(jev.calls(), 1);
+  });
+}
+
+test('Stop while an original Jev-fast reading is pending emits no accepted verdict or reviewer request', async t => {
+  const state = setup(t), jev = pendingJev(), stop = new AbortController();
+  const owner = { sessionId: read.sessionId!, sourceUserSeq: 72, attemptId: 'attempt:fast-reading-cancelled' };
+  const run = Promise.resolve(modelUsageAttributionStorage.run(owner, () => withHarnessRunContext({
+    sessionId: owner.sessionId, sourceUserSeq: owner.sourceUserSeq, runAttemptId: owner.attemptId,
+    turn: 1, counter: new ToolCallsCounter(4), callerCancelSignal: stop.signal,
+  }, () => judgeObjectiveComplete(objective, reply, { ...read, reviewInputOwner: owner }))));
+  const rejected = assert.rejects(run, { name: 'AbortError' });
+  await jev.whenStarted; stop.abort(); jev.answer(); await rejected;
+  assert.equal(state.reviewerCalls(), 0); assert.equal(jev.calls(), 1);
+});
+
+for (const lane of ['configured_reviewer', 'late_fallback'] as const) {
+  test(`original-reading diagnostic is confined to the initial accepted fast return: ${lane}`, async t => {
+    const state = setup(t, async () => lane === 'late_fallback' ? { verdict: null, failure: 'timeout' } : judged);
+    const owner = { sessionId: read.sessionId!, sourceUserSeq: 73, attemptId: `attempt:fast-reading-${lane}` };
+    let calls = 0;
+    _setSystemOneFetchForTests(async () => { calls++; return jevResponse(lane === 'late_fallback' ? 'done' : 'incomplete'); });
+    const verdict = await modelUsageAttributionStorage.run(owner, () => judgeObjectiveComplete(objective, reply, {
+      ...read, reviewInputOwner: owner, ...(lane === 'late_fallback' ? { reviewStakes: 'write' } : {}),
+    }));
+    assert.equal(verdict.done, true); assert.equal(verdict.fast, undefined);
+    assert.equal(verdict.jevAttempt?.originalReading, undefined);
+    assert.equal(state.reviewerCalls(), 1); assert.equal(calls, 1);
+    assert.equal(Boolean(verdict.failedOpen), lane === 'late_fallback');
+    assert.equal(verdict.jevAttempt?.accepted, false);
+  });
+}

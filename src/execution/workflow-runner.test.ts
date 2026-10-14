@@ -7866,6 +7866,10 @@ test('a step whose session already crossed irreversibly is never re-run for a co
 // ─── Ever-learning: the learned pin is the CORRECTED call, never the refused one
 const learnedPinToolChoices = await import('../memory/tool-choice-store.js');
 const learnedPinBindings = await import('../memory/workflow-certified-binding.js');
+function acceptedLearnedPinSource(sessionId: string) {
+  return harnessEventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Controlled workflow step learning fixture.' } }).seq;
+}
 
 test('rememberProvenWorkflowStepTool records the corrected invocation template, never a refused attempt', () => {
   const toolChoices = learnedPinToolChoices;
@@ -7885,26 +7889,28 @@ test('rememberProvenWorkflowStepTool records the corrected invocation template, 
   const correctedArgs = JSON.stringify({ tool_slug: 'FIXTURE_SHEETS_UPDATE', arguments: JSON.stringify({ range: { sheetId: 0, startIndex: 1 }, values: [[1]] }) });
   const seed = (sessionId: string, order: 'refused_then_corrected' | 'corrected_then_refused') => {
     harnessEventlog.createSession({ id: sessionId, kind: 'workflow', channel: 'workflow' });
+    const sourceUserSeq = acceptedLearnedPinSource(sessionId);
     const pairs = order === 'refused_then_corrected'
       ? [['refused-1', refusedArgs, refusedMarker], ['corrected-1', correctedArgs, '{"successful":true,"data":{"updatedRows":1}}']]
       : [['corrected-1', correctedArgs, '{"successful":true,"data":{"updatedRows":1}}'], ['refused-2', refusedArgs, refusedMarker]];
     for (const [callId, args, result] of pairs) {
       harnessEventlog.appendEvent({
         sessionId, turn: 1, role: 'agent', type: 'tool_called',
-        data: { tool: 'composio_execute_tool', callId, arguments: args },
+        data: { sourceUserSeq, tool: 'composio_execute_tool', callId, arguments: args },
       });
       harnessEventlog.appendEvent({
         sessionId, turn: 1, role: 'agent', type: 'tool_returned',
-        data: { tool: 'composio_execute_tool', callId, result },
+        data: { sourceUserSeq, tool: 'composio_execute_tool', callId, result },
       });
     }
+    return sourceUserSeq;
   };
   for (const [index, order] of (['refused_then_corrected', 'corrected_then_refused'] as const).entries()) {
     const workflowName = `Learned Pin ${order}`;
     const stepId = 'update_sheet';
     const sessionId = `workflow:learned-pin-${index}:${stepId}`;
-    seed(sessionId, order);
-    workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId, workflowName, stepId });
+    const sourceUserSeq = seed(sessionId, order);
+    workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId, sourceUserSeq, workflowName, stepId });
     const record = toolChoices.peekToolChoice(workflowStepPinIntent(workflowName, stepId));
     assert.ok(record, `${order}: a proven call is pinned`);
     assert.equal(record?.choice.identifier, 'FIXTURE_SHEETS_UPDATE');
@@ -7913,15 +7919,16 @@ test('rememberProvenWorkflowStepTool records the corrected invocation template, 
   }
   const emptySession = 'workflow:learned-pin-refused-only:update_sheet';
   harnessEventlog.createSession({ id: emptySession, kind: 'workflow', channel: 'workflow' });
+  const emptySource = acceptedLearnedPinSource(emptySession);
   harnessEventlog.appendEvent({
     sessionId: emptySession, turn: 1, role: 'agent', type: 'tool_called',
-    data: { tool: 'composio_execute_tool', callId: 'refused-only', arguments: refusedArgs },
+    data: { sourceUserSeq: emptySource, tool: 'composio_execute_tool', callId: 'refused-only', arguments: refusedArgs },
   });
   harnessEventlog.appendEvent({
     sessionId: emptySession, turn: 1, role: 'agent', type: 'tool_returned',
-    data: { tool: 'composio_execute_tool', callId: 'refused-only', result: refusedMarker },
+    data: { sourceUserSeq: emptySource, tool: 'composio_execute_tool', callId: 'refused-only', result: refusedMarker },
   });
-  workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId: emptySession, workflowName: 'Learned Pin refused only', stepId: 'update_sheet' });
+  workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId: emptySession, sourceUserSeq: emptySource, workflowName: 'Learned Pin refused only', stepId: 'update_sheet' });
   assert.ok(!toolChoices.peekToolChoice(workflowStepPinIntent('Learned Pin refused only', 'update_sheet')),
     'a step whose only provider call was refused learns nothing');
 });
@@ -7937,24 +7944,25 @@ test('rememberProvenWorkflowStepTool learns a provider call that crossed wrapped
   const wrapped = JSON.stringify({ name: 'composio_execute_tool', args_json: inner, requirement_id: 'send_standup' });
   const sessionId = 'workflow:learned-pin-wrapped:send';
   harnessEventlog.createSession({ id: sessionId, kind: 'workflow', channel: 'workflow' });
+  const sourceUserSeq = acceptedLearnedPinSource(sessionId);
   harnessEventlog.appendEvent({
     sessionId, turn: 1, role: 'agent', type: 'tool_called',
-    data: { tool: 'work_call', callId: 'wrapped-1', arguments: wrapped },
+    data: { sourceUserSeq, tool: 'work_call', callId: 'wrapped-1', arguments: wrapped },
   });
   harnessEventlog.appendEvent({
     sessionId, turn: 1, role: 'agent', type: 'tool_returned',
-    data: { tool: 'work_call', callId: 'wrapped-1', result: '{"successful":true,"data":{"id":"AAMk"}}' },
+    data: { sourceUserSeq, tool: 'work_call', callId: 'wrapped-1', result: '{"successful":true,"data":{"id":"AAMk"}}' },
   });
   // A later wrapped LOCAL call that also succeeded must not shadow the provider pin.
   harnessEventlog.appendEvent({
     sessionId, turn: 1, role: 'agent', type: 'tool_called',
-    data: { tool: 'work_call', callId: 'local-2', arguments: JSON.stringify({ name: 'read_file', args_json: '{"path":"notes.md"}' }) },
+    data: { sourceUserSeq, tool: 'work_call', callId: 'local-2', arguments: JSON.stringify({ name: 'read_file', args_json: '{"path":"notes.md"}' }) },
   });
   harnessEventlog.appendEvent({
     sessionId, turn: 1, role: 'agent', type: 'tool_returned',
-    data: { tool: 'work_call', callId: 'local-2', result: 'ok' },
+    data: { sourceUserSeq, tool: 'work_call', callId: 'local-2', result: 'ok' },
   });
-  workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId, workflowName: 'Learned Pin wrapped', stepId: 'send' });
+  workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId, sourceUserSeq, workflowName: 'Learned Pin wrapped', stepId: 'send' });
   const record = toolChoices.peekToolChoice(workflowStepPinIntent('Learned Pin wrapped', 'send'));
   assert.ok(record, 'the wrapped provider call is pinned');
   assert.equal(record?.choice.identifier, 'FIXTURE_OUTLOOK_SEND_EMAIL');
@@ -7962,15 +7970,16 @@ test('rememberProvenWorkflowStepTool learns a provider call that crossed wrapped
 
   const localOnly = 'workflow:learned-pin-wrapped-local:send';
   harnessEventlog.createSession({ id: localOnly, kind: 'workflow', channel: 'workflow' });
+  const localSource = acceptedLearnedPinSource(localOnly);
   harnessEventlog.appendEvent({
     sessionId: localOnly, turn: 1, role: 'agent', type: 'tool_called',
-    data: { tool: 'work_call', callId: 'local-only', arguments: JSON.stringify({ name: 'read_file', args_json: '{"path":"notes.md"}' }) },
+    data: { sourceUserSeq: localSource, tool: 'work_call', callId: 'local-only', arguments: JSON.stringify({ name: 'read_file', args_json: '{"path":"notes.md"}' }) },
   });
   harnessEventlog.appendEvent({
     sessionId: localOnly, turn: 1, role: 'agent', type: 'tool_returned',
-    data: { tool: 'work_call', callId: 'local-only', result: 'ok' },
+    data: { sourceUserSeq: localSource, tool: 'work_call', callId: 'local-only', result: 'ok' },
   });
-  workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId: localOnly, workflowName: 'Learned Pin wrapped local', stepId: 'send' });
+  workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId: localOnly, sourceUserSeq: localSource, workflowName: 'Learned Pin wrapped local', stepId: 'send' });
   assert.ok(!toolChoices.peekToolChoice(workflowStepPinIntent('Learned Pin wrapped local', 'send')),
     'a wrapper around a local tool is not a provider pin');
 });
@@ -8016,6 +8025,7 @@ test('rememberProvenWorkflowStepTool keeps a settled nested insert shape after a
   });
   const sessionId = 'workflow:learned-pin-insert-shape:main';
   harnessEventlog.createSession({ id: sessionId, kind: 'workflow', channel: 'workflow' });
+  const sourceUserSeq = acceptedLearnedPinSource(sessionId);
   const events: Array<[string, string, string]> = [
     ['refused-flat', flatRefused, refusedMarker],
     ['insert-ok', insertArgs, '{"successful":true,"data":{"updatedRows":1}}'],
@@ -8024,15 +8034,15 @@ test('rememberProvenWorkflowStepTool keeps a settled nested insert shape after a
   for (const [callId, args, result] of events) {
     harnessEventlog.appendEvent({
       sessionId, turn: 1, role: 'agent', type: 'tool_called',
-      data: { tool: 'composio_execute_tool', callId, arguments: args },
+      data: { sourceUserSeq, tool: 'composio_execute_tool', callId, arguments: args },
     });
     harnessEventlog.appendEvent({
       sessionId, turn: 1, role: 'agent', type: 'tool_returned',
-      data: { tool: 'composio_execute_tool', callId, result },
+      data: { sourceUserSeq, tool: 'composio_execute_tool', callId, result },
     });
   }
   workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({
-    sessionId, workflowName: 'Learned Pin insert shape', stepId: 'main',
+    sessionId, sourceUserSeq, workflowName: 'Learned Pin insert shape', stepId: 'main',
   });
   const record = toolChoices.peekToolChoice(workflowStepPinIntent('Learned Pin insert shape', 'main'));
   assert.equal(record?.choice.identifier, 'FIXTURE_SHEETS_UPDATE');
@@ -8051,6 +8061,112 @@ test('rememberProvenWorkflowStepTool keeps a settled nested insert shape after a
   assert.match(hint, /insert_dimension\/range\/sheet_id/);
 });
 
+
+test('rememberProvenWorkflowStepTool excludes original A and never borrows tagged sibling evidence', () => {
+  const sessionId = 'workflow:learning-policy-source:pin';
+  harnessEventlog.createSession({ id: sessionId, kind: 'workflow', channel: 'workflow' });
+  const a = harnessEventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Controlled original step.', learningPolicy: { version: 1, mode: 'exclude', reason: 'controlled_test' } } });
+  // Older rows without source tags remain evidence of observed work, but
+  // cannot certify a new automatic pin for a later accepted source.
+  harnessEventlog.appendEvent({ sessionId, turn: 1, role: 'agent', type: 'tool_called', data: {
+    tool: 'composio_execute_tool', callId: 'untagged-old-call',
+    arguments: JSON.stringify({ tool_slug: 'FIXTURE_UNTAGGED_OLD_READ', arguments: '{}' }),
+  } });
+  harnessEventlog.appendEvent({ sessionId, turn: 1, role: 'agent', type: 'tool_returned', data: {
+    tool: 'composio_execute_tool', callId: 'untagged-old-call', result: '{"successful":true,"data":{"rows":1}}',
+  } });
+  const b = harnessEventlog.appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Ordinary independent step.' } });
+  const pair = (sourceUserSeq: number, callId: string, slug: string) => {
+    harnessEventlog.appendEvent({ sessionId, turn: 1, role: 'agent', type: 'tool_called', data: {
+      sourceUserSeq, tool: 'composio_execute_tool', callId, arguments: JSON.stringify({ tool_slug: slug, arguments: '{}' }),
+    } });
+    harnessEventlog.appendEvent({ sessionId, turn: 1, role: 'agent', type: 'tool_returned', data: {
+      sourceUserSeq, tool: 'composio_execute_tool', callId, result: '{"successful":true,"data":{"rows":1}}',
+    } });
+  };
+  const write = (sourceUserSeq: number, workflowName: string) => workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({
+    sessionId, sourceUserSeq, workflowName, stepId: 'pin',
+  });
+  const peek = (name: string) => learnedPinToolChoices.peekToolChoice(learnedPinBindings.workflowStepPinIntent(name, 'pin'));
+  write(b.seq, 'Ordinary B untagged inventory'); assert.equal(peek('Ordinary B untagged inventory'), null);
+  harnessEventlog.appendEvent({ sessionId, turn: 2, role: 'agent', type: 'tool_returned', data: {
+    sourceUserSeq: b.seq, tool: 'composio_execute_tool', callId: 'untagged-old-call', result: '{"successful":true}',
+  } });
+  write(b.seq, 'Ordinary B untagged called row'); assert.equal(peek('Ordinary B untagged called row'), null);
+  pair(a.seq, 'foreign-call', 'FIXTURE_FOREIGN_READ');
+  write(a.seq, 'Excluded original A'); assert.equal(peek('Excluded original A'), null);
+  write(b.seq, 'Ordinary B with only A evidence'); assert.equal(peek('Ordinary B with only A evidence'), null);
+  // Matching only callId must not splice B's return onto A's called arguments.
+  harnessEventlog.appendEvent({ sessionId, turn: 2, role: 'agent', type: 'tool_returned', data: {
+    sourceUserSeq: b.seq, tool: 'composio_execute_tool', callId: 'foreign-call', result: '{"successful":true}',
+  } });
+  write(b.seq, 'Ordinary B mismatched call source'); assert.equal(peek('Ordinary B mismatched call source'), null);
+  pair(b.seq, 'own-call', 'FIXTURE_OWN_READ');
+  write(b.seq, 'Ordinary B exact source');
+  const record = peek('Ordinary B exact source'); assert.equal(record?.choice.identifier, 'FIXTURE_OWN_READ');
+  assert.equal(record?.choice.alsoProven?.some(row => row.identifier === 'FIXTURE_FOREIGN_READ') ?? false, false);
+  write(0, 'Unavailable source'); assert.equal(peek('Unavailable source'), null);
+});
+
+test('workflow learning origin selector uses only this frozen run, never account-discovery latest', () => {
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const sessionId = 'workflow-learning-origin';
+  harnessEventlog.createSession({ id: sessionId, kind: 'chat' });
+  const a = acceptedLearnedPinSource(sessionId), b = acceptedLearnedPinSource(sessionId);
+  const inspect = (id: string, fields: Record<string, unknown>) => {
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, id + '.json'), JSON.stringify({ id, workflow: 'Learning Source', ...fields }));
+    return workflowRunnerInternalsForTest.workflowRunLearningSource(id);
+  };
+  const original = { sessionId, sourceUserSeq: a };
+  assert.deepEqual(inspect('learning-creation-origin', { creationTestSource: { ...original, logicalToolCallId: 'fixture-call' },
+    originSessionId: sessionId, sourceUserSeq: b }), original, 'creation source takes its own frozen precedence');
+  assert.deepEqual(inspect('learning-explicit-origin', { originSessionId: sessionId, sourceUserSeq: a }), original);
+  assert.equal(inspect('learning-no-origin', {}), undefined, 'scheduled/standalone own source remains eligible');
+  for (const [i, fields] of [
+    { originSessionId: sessionId }, { sourceUserSeq: a }, { creationTestSource: null },
+    { creationTestSource: { sessionId, sourceUserSeq: '1' }, originSessionId: sessionId, sourceUserSeq: b },
+    { originSessionId: sessionId, sourceUserSeq: 0 }, { id: 'another-run', originSessionId: sessionId, sourceUserSeq: a },
+  ].entries()) {
+    const unknown = inspect('learning-corrupt-' + i, fields)!;
+    assert.ok(unknown); assert.equal(unknown.sourceUserSeq, 0, 'malformed origin never becomes a latest source');
+  }
+  assert.equal(workflowRunnerInternalsForTest.workflowRunLearningSource('learning-missing-record')?.sourceUserSeq, 0);
+});
+
+test('workflow learning origin is persisted on the actual accepted step without stopping execution', async t => {
+  const { readTurnLearningPolicyForSource } = await import('../memory/turn-learning-policy.js');
+  const origin = 'workflow-learning-step-origin';
+  harnessEventlog.createSession({ id: origin, kind: 'chat' });
+  const a = harnessEventlog.appendEvent({ sessionId: origin, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Controlled workflow test.', learningPolicy: { version: 1, mode: 'exclude', reason: 'controlled_test' } } });
+  acceptedLearnedPinSource(origin); // A newer ordinary input must not replace A.
+  for (const mode of ['creation', 'origin', 'scheduled', 'corrupt'] as const) await t.test(mode, async () => {
+    const runId = 'learning-real-step-' + mode, workflowSlug = 'learning-real-' + mode;
+    const step = { id: 'report', prompt: 'Report the controlled result.', sideEffect: 'read' as const,
+      output: { type: 'object' as const, required_keys: ['summary'] } };
+    mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, runId + '.json'), JSON.stringify({ id: runId, workflow: 'Contract Repair ' + runId,
+      status: 'running', ...(mode === 'creation' ? { creationTestSource: { sessionId: origin, sourceUserSeq: a.seq, logicalToolCallId: 'fixture-call' } }
+        : mode === 'origin' ? { originSessionId: origin, sourceUserSeq: a.seq }
+          : mode === 'corrupt' ? { originSessionId: origin } : {}) }));
+    await withStubbedHarnessLane(() => '{"summary":"Controlled result recorded."}', async inputs => {
+      const ctx = contractRepairCtx(workflowSlug, runId, step, async () => { throw new Error('No legacy/provider call permitted'); });
+      const output = await workflowRunnerInternalsForTest.runStepVerifiedAttempt(step, ctx);
+      assert.deepEqual(output, { summary: 'Controlled result recorded.' });
+      assert.equal(inputs.length, 1, 'optional learning metadata adds no continuation or model call');
+      const sessionId = 'workflow:' + runId + ':' + step.id;
+      const [source] = harnessEventlog.listEvents(sessionId, { types: ['user_input_received'] });
+      assert.ok(source);
+      const status = readTurnLearningPolicyForSource({ sessionId, sourceUserSeq: source.seq }).status;
+      assert.equal(status, mode === 'scheduled' ? 'allowed' : mode === 'corrupt' ? 'unavailable' : 'excluded');
+      if (mode === 'scheduled') assert.equal(source.data.learningPolicySource, undefined);
+      else if (mode === 'corrupt') assert.equal((source.data.learningPolicySource as { sourceUserSeq: number }).sourceUserSeq, 0);
+      else assert.deepEqual(source.data.learningPolicySource, { sessionId: origin, sourceUserSeq: a.seq });
+    });
+  });
+});
 
 test('a blocked JSON-text step finalizes as blocked and withholds its dependent write', () => {
   const blocked = { blocked: true, reason: 'The brief write was refused before dispatch.' };

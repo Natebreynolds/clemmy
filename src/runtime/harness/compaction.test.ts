@@ -25,7 +25,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AgentInputItem } from '@openai/agents';
 
-const { resetEventLog, closeEventLog, createSession, writeToolOutput, getToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('./eventlog.js');
+const { resetEventLog, closeEventLog, createSession, appendEvent, writeToolOutput, getToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('./eventlog.js');
 const { inFlightCompactionThresholds } = await import('./compaction.js');
 const {
   clipOldToolResults,
@@ -682,6 +682,111 @@ test('validateCallIdReferences — sanitizes hallucinated ids', () => {
   assert.match(sanitized, /\[invalid call_id\]/);
   assert.doesNotMatch(sanitized, /call_xyz/);
 });
+
+test('validateCallIdReferences — native Claude references require exact membership and leave unrelated brackets unchanged', () => {
+  const valid = new Set(['call_known-1', 'toolu_known-1', 'ordinary_reference']);
+  const summary = '[call_known-1] [toolu_known-1] [toolu_known-1] [call_missing] [toolu_missing] '
+    + '[ordinary_reference] [footnote] [toolu_] [toolu.invalid]';
+  assert.deepEqual(validateCallIdReferences(summary, valid), {
+    sanitized: '[call_known-1] [toolu_known-1] [toolu_known-1] [invalid call_id] [invalid call_id] '
+      + '[ordinary_reference] [footnote] [toolu_] [toolu.invalid]',
+    referenced: ['call_known-1', 'toolu_known-1'],
+    hallucinated: ['call_missing', 'toolu_missing'],
+  });
+});
+
+for (const transport of ['buffered', 'streamed'] as const) {
+  test(`summarizeOlderMessages — validates actual ${transport} native Claude IDs and preserves exact history`, async () => {
+    const { NoopTrace, withTrace } = await import('@openai/agents-core');
+    const { aisdk } = await import('@openai/agents-extensions/ai-sdk');
+    const { createAnthropic } = await import('@ai-sdk/anthropic');
+    const nativeId = `toolu_compaction_${transport}`;
+    let adapterCalls = 0;
+    const provider = createAnthropic({ apiKey: 'fixture-only', fetch: async () => {
+      adapterCalls += 1;
+      if (transport === 'buffered') {
+        return new Response(JSON.stringify({ id: `msg_compaction_${transport}`, type: 'message', role: 'assistant',
+          model: 'claude-sonnet-5', content: [{ type: 'tool_use', id: nativeId, name: 'read_file',
+            input: { path: 'controlled.txt' } }], stop_reason: 'tool_use', stop_sequence: null,
+          usage: { input_tokens: 42, output_tokens: 7 } }), { headers: { 'content-type': 'application/json' } });
+      }
+      const blocks = [
+        { type: 'message_start', message: { id: `msg_compaction_${transport}`, type: 'message', role: 'assistant',
+          model: 'claude-sonnet-5', content: [], stop_reason: null, stop_sequence: null,
+          usage: { input_tokens: 42, output_tokens: 1 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: nativeId,
+          name: 'read_file', input: {} } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta',
+          partial_json: '{"path":"controlled.txt"}' } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 7 } },
+        { type: 'message_stop' },
+      ];
+      return new Response(blocks.map(block => `event: ${block.type}\ndata: ${JSON.stringify(block)}\n\n`).join(''),
+        { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    const model = aisdk(provider('claude-sonnet-5'));
+    const request = { input: 'Read the controlled fixture.', tools: [], handoffs: [],
+      outputType: 'text', modelSettings: {}, tracing: false } as never;
+    let output: unknown[] | undefined;
+    if (transport === 'buffered') output = (await withTrace(new NoopTrace(), () => model.getResponse(request))).output;
+    else {
+      for await (const event of model.getStreamedResponse(request)) {
+        if (event.type === 'response_done') output = event.response.output;
+      }
+    }
+    assert.equal(adapterCalls, 1, 'the scripted real adapter performs one response conversion');
+    assert.ok(output);
+    const nativeCall = output.find(item => (item as { type?: string }).type === 'function_call') as
+      { type: string; callId: string; name: string; arguments: string } | undefined;
+    assert.ok(nativeCall, 'the real adapter must produce a harness function call');
+    assert.equal(nativeCall.callId, nativeId, 'the native ID must survive adapter conversion unchanged');
+    assert.equal(nativeCall.name, 'read_file');
+    assert.deepEqual(JSON.parse(nativeCall.arguments), { path: 'controlled.txt' });
+
+    resetEventLog();
+    const session = HarnessSession.create({ kind: 'chat', title: `native ${transport} references` });
+    const foreign = createSession({ kind: 'chat' });
+    appendEvent({ sessionId: session.id, turn: 1, role: 'assistant', type: 'tool_called',
+      data: { callId: nativeCall.callId, tool: nativeCall.name, arguments: nativeCall.arguments } });
+    appendEvent({ sessionId: foreign.id, turn: 1, role: 'assistant', type: 'tool_called',
+      data: { callId: 'toolu_foreign', tool: 'read_file', arguments: '{}' } });
+    const retainedText = 'Controlled retained result. No write was requested.';
+    writeToolOutput({ sessionId: session.id, callId: nativeCall.callId, tool: nativeCall.name, output: retainedText });
+    const checkpoint = systemMessage('[summary of older completed tool activity]\nSettled work remains retained.');
+    const nativeItem = nativeCall as unknown as AgentInputItem;
+    const resultItem = toolResult(nativeCall.callId, retainedText);
+    const items = [userMessage('Use the controlled result, preserving the read-only constraint.'), checkpoint,
+      nativeItem, resultItem, assistantMessage('The result still needs a final explanation. '.repeat(40)),
+      userMessage('Keep the original limitation.'), assistantMessage('Recent answer remains verbatim.')];
+    const originalHistory = JSON.stringify(items);
+    let summaries = 0;
+    _setCompactionSummarizerForTests(async () => {
+      summaries += 1;
+      return { summary: `- Result [${nativeId}] remains available. Unknown [toolu_missing] and [toolu_foreign]. [footnote]`,
+        modelUsed: 'test-summarizer' };
+    });
+    try {
+      const result = await summarizeOlderMessages(items, session.id, 2);
+      assert.equal(result.applied, true);
+      assert.equal(summaries, 1, 'reference validation must not add a summarizer round');
+      assert.deepEqual(result.callIdsReferenced, [nativeId]);
+      assert.deepEqual(result.hallucinatedCallIds, ['toolu_missing', 'toolu_foreign']);
+      const summary = result.mutatedItems?.find(item =>
+        typeof (item as { content?: unknown }).content === 'string'
+        && (item as { content: string }).content.startsWith('[summary of earlier conversation]'));
+      assert.ok(summary);
+      assert.equal((summary as { content: string }).content,
+        `[summary of earlier conversation]\n- Result [${nativeId}] remains available. Unknown [invalid call_id] and [invalid call_id]. [footnote]`);
+      assert.deepEqual(result.mutatedItems, [items[0], checkpoint, nativeItem, resultItem, summary, items[5], items[6]]);
+      for (const index of [0, 1, 2, 3, 5, 6]) assert.equal(result.mutatedItems?.[index], items[index]);
+      assert.equal(JSON.stringify(items), originalHistory, 'the original history must not mutate');
+      assert.equal(getToolOutput(session.id, nativeId)?.output, retainedText, 'parked result bytes must remain exact');
+    } finally {
+      _setCompactionSummarizerForTests(null);
+    }
+  });
+}
 
 test('summarizeOlderMessages — preserves compaction summaries instead of re-summarizing recall maps', async () => {
   resetEventLog();

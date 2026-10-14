@@ -48,6 +48,7 @@ import {
   assertDispatchLeaseCurrent,
   currentDispatchLease,
 } from './dispatch-lease.js';
+import { checkHostToolInvocationProviderCrossing } from './tool-invocation-observation-context.js';
 
 export interface LogicalCallIdentity {
   acceptedTaskId: string;
@@ -531,6 +532,17 @@ async function withPhysicalDispatchMode<T>(
     );
   } else {
     admitPhysicalSourceAtCurrentEdge(input, acceptedTaskId, owned, dispatchLease);
+  }
+  // Preparation/probe/retry children retain their existing owners. The
+  // primary business crossing of the exact enclosing host call also visits
+  // its synchronous policy edge. A marked adapter still owns its provider
+  // row; this check grants nothing and creates no second reservation.
+  if (!preparation && owned && dispatchLease && !input.retryOf
+    && (input.relation === undefined || input.relation === 'primary')) {
+    checkHostToolInvocationProviderCrossing({ sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq, acceptedTaskId,
+      logicalToolCallId: owned.logicalToolCallId, toolName: input.tool, args: input.args,
+      lease: dispatchLease });
   }
   if (owned) owned.crossings += 1;
 

@@ -13,6 +13,7 @@ import { claimPlanExecutionIngress, inspectPlanExecutionIngress, preflightPlanEx
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, withReviewedPlanExecuteAdmission, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import { parseTaskMode, taskModeFields, type TaskMode } from '../runtime/harness/task-mode.js';
+import { parseTurnLearningPolicy, turnLearningPolicyFields, type TurnLearningPolicy } from '../memory/turn-learning-policy.js';
 import type { Express, Request, Response } from 'express';
 import express from 'express';
 import { containAsyncRouteRejections } from '../channels/contain-async-route-rejections.js';
@@ -3314,12 +3315,15 @@ function harnessChatStableDigest(requestId: string): string {
   return createHash('sha256').update(requestId).digest('hex');
 }
 
-function harnessChatPayloadHash(input: string, attachmentIds: string[], taskMode?: TaskMode, agentId?: string, projectId?: string): string {
-  if (taskMode?.kind === 'execute') return reviewedPlanExecuteInputHash({ text: input, attachmentIds, taskMode });
+function harnessChatPayloadHash(input: string, attachmentIds: string[], taskMode?: TaskMode, agentId?: string, projectId?: string, learningPolicy?: TurnLearningPolicy): string {
+  if (taskMode?.kind === 'execute') {
+    const executionHash = reviewedPlanExecuteInputHash({ text: input, attachmentIds, taskMode });
+    return learningPolicy ? createHash('sha256').update(JSON.stringify({ executionHash, ...turnLearningPolicyFields(learningPolicy) })).digest('hex') : executionHash;
+  }
   // A request opened inside a saved agent is a different request; one that
   // named none keeps its historical hash.
   return createHash('sha256')
-    .update(JSON.stringify({ input, attachmentIds, ...taskModeFields(taskMode), ...(agentId ? { agentId } : {}), ...(projectId ? { projectId } : {}) }))
+    .update(JSON.stringify({ input, attachmentIds, ...taskModeFields(taskMode), ...(agentId ? { agentId } : {}), ...(projectId ? { projectId } : {}), ...turnLearningPolicyFields(learningPolicy) }))
     .digest('hex');
 }
 
@@ -17210,6 +17214,9 @@ export function registerConsoleRoutes(
     const body = req.body ?? {};
     let taskMode: TaskMode | undefined;
     try { taskMode = parseTaskMode(body.taskMode); } catch { res.status(400).json({ error: 'INVALID_TASK_MODE' }); return; }
+    let learningPolicy: TurnLearningPolicy | undefined;
+    try { learningPolicy = parseTurnLearningPolicy(body.learningPolicy); } catch { res.status(400).json({ error: 'INVALID_TURN_LEARNING_POLICY' }); return; }
+    if (learningPolicy && body.steerOnly === true) { res.status(409).json({ error: 'LEARNING_POLICY_REQUIRES_NEW_TASK', code: 'LEARNING_POLICY_REQUIRES_NEW_TASK' }); return; }
     if (taskMode && body.steerOnly === true) { res.status(409).json({ ...CHAT_STEER_REFUSAL.task_mode_on_active_turn }); return; }
     let explicitTaskMode = taskMode !== undefined && taskMode.kind !== 'normal';
     const input = typeof body.input === 'string' ? body.input.trim() : '';
@@ -17245,9 +17252,9 @@ export function registerConsoleRoutes(
     const requestedSessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
     let connectionContext: { sessionId: string; connectionRequestId: string } | undefined;
     let connectionVerification: ConnectionContinuationVerification | undefined;
-    let payloadHash = harnessChatPayloadHash(input, attachmentIds, taskMode, requestedAgent?.agent.id, requestedProject?.id);
+    let payloadHash = harnessChatPayloadHash(input, attachmentIds, taskMode, requestedAgent?.agent.id, requestedProject?.id, learningPolicy);
     if (body.connectionRequestId !== undefined) {
-      if (typeof body.connectionRequestId !== 'string' || attachmentIds.length || body.steerOnly === true || taskMode) {
+      if (typeof body.connectionRequestId !== 'string' || attachmentIds.length || body.steerOnly === true || taskMode || learningPolicy) {
         res.status(400).json({ error: 'Invalid connection continuation.' }); return;
       }
       connectionContext = { sessionId: requestedSessionId, connectionRequestId: body.connectionRequestId };
@@ -17540,6 +17547,9 @@ export function registerConsoleRoutes(
     }
 
     try {
+      if (learningPolicy && (intent || approvalConfirm || approvalInquiry)) {
+        res.status(409).json({ error: 'LEARNING_POLICY_REQUIRES_NEW_TASK', code: 'LEARNING_POLICY_REQUIRES_NEW_TASK' }); return;
+      }
       const control = tryCommitLiveApprovalControl({ sessionId: cardSessionId, requestId: requestIdentity.requestId,
         inputHash: payloadHash, text: input, intent,
         eligible: !explicitTaskMode && !proposedEarlyRoute && !isPausedOnApproval
@@ -17588,6 +17598,9 @@ export function registerConsoleRoutes(
         } catch { steerReason = null; }
         const leaseLive = steerReason === 'lease_live';
         if (steerReason) {
+          if (learningPolicy) {
+            res.status(409).json({ error: 'LEARNING_POLICY_REQUIRES_NEW_TASK', code: 'LEARNING_POLICY_REQUIRES_NEW_TASK', sessionId }); return;
+          }
           if (attachmentIds.length > 0) {
             res.status(409).json({ error: 'ATTACHMENTS_REQUIRE_IDLE_CHAT', code: 'ATTACHMENTS_REQUIRE_IDLE_CHAT', sessionId });
             return;
@@ -17959,6 +17972,7 @@ export function registerConsoleRoutes(
           data: {
             text: turnInput,
             ...taskModeFields(taskMode),
+            ...turnLearningPolicyFields(learningPolicy),
             ...(connectionContext ? connectionContinuationAudience(connectionContext, requestRunId, input) : {}),
             displayText: input || (attachmentIds.length ? 'Attached file' : ''),
             ...(reviewedPlanOwnerControl ? { reviewedPlanOwnerControl, userId: reviewedPlanOwnerControl.conversationPrincipalId } : {}),
