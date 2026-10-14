@@ -406,10 +406,9 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
     //
     // A READ step is accepted work too. Reading the web means driving a
     // browser, and the registry declares a browser session, tab or navigation
-    // as a reversible local-execution write. Live 2026-10-13: a read step
-    // asked to open a page in the chosen cloud browser was refused before
-    // dispatch (coverage_missing) twice and ended blocked, while the same
-    // request in chat ran without a card. The read step's receipt names no
+    // as a reversible local-execution write; without a receipt that write is
+    // refused before dispatch and the step ends blocked, while the same
+    // request in chat runs without a card. The read step's receipt names no
     // external identity and the local branch admits only local-execution
     // instruments under it; artifacts, ledgers and configuration stay
     // uncovered exactly as before.
@@ -777,14 +776,10 @@ function journalConstraintCheckerUnavailable(attestation: HostCallAttestation, r
 
 /** A WRITE GETS TWO REFUSALS FROM ITS CONSTRAINT REVIEW, THEN A DECISION.
  *
- * Live 2026-10-13, a scheduled sheet review: the one digest row it appends
- * each run was refused six times in ten minutes, each time for a different
- * reason (a count, the date style, "the inspected tail does not establish
- * absence"), re-read, re-proposed, refused again; the previous day's run had
- * ended the same way, and the owner's sheet got no row either day. Nothing
- * bounded the rounds but the no-progress governor, and the reviewer judged
- * a compacted view while demanding completeness. The owner's rule: there is
- * never a world where Clem stops like that.
+ * A reviewer that objects to one row for a different reason each round, judging
+ * a compacted view while demanding completeness, can refuse without end; only
+ * the no-progress governor would bound it, and the owner's sheet gets no row.
+ * There is never a world where Clem stops like that.
  *
  * So: an "uncertain" verdict is asked once more with the full retained
  * evidence before it counts; the reviewer is told to name every objection at
@@ -829,11 +824,28 @@ export function _resetConstraintReviewRoundsForTests(): void {
   boundedConstraintNotes.clear();
 }
 
+/** The write named as its author would name it: the carrier the model called
+ *  and the operation it carried. Shown only the host's normalized operation
+ *  name, a reviewer refuses a correct write whose saved instructions name the
+ *  carrier; the carrier and the authored operation id resolve that reading. */
+function reviewedToolLabel(input: { attestation: HostCallAttestation; carrierToolName?: string }): string {
+  const toolName = input.attestation.toolName;
+  const carrier = input.carrierToolName?.trim() ?? '';
+  if (!carrier || carrier === toolName) return toolName;
+  // A catalog operation keeps the id its author wrote beside the host's
+  // normalized name; a local tool's operation id is the carrier itself.
+  const operation = input.attestation.operationId?.trim() ?? '';
+  return operation && operation !== toolName && operation !== carrier
+    ? `${carrier} → ${operation} (${toolName})`
+    : `${carrier} → ${toolName}`;
+}
+
 async function reviewAuthoredWriteConstraints(input: {
   attestation: HostCallAttestation;
   args: Record<string, unknown>;
   reopened: ReopenedAuthoredStep;
   schema?: unknown;
+  carrierToolName?: string;
   /** The consent that reached this review was the owner's exact grant of this write. */
   ownerApprovedExactly?: boolean;
   /** An ordinary recoverable write is reviewed at a measured depth first. */
@@ -869,10 +881,11 @@ async function reviewAuthoredWriteConstraints(input: {
       consumerStepId: input.reopened.receipt.stepId,
     });
     const review = mutationReviewerOverride ?? (await import('./workflow-mutation-review.js')).reviewWorkflowMutation;
+    const toolLabel = reviewedToolLabel(input);
     let result = await review({
       sessionId: input.attestation.sessionId,
       instructions: input.reopened.step.prompt,
-      tool: input.attestation.toolName,
+      tool: toolLabel,
       schema,
       args: input.args,
       observations: { summary: evidence.summary, complete: evidence.available, evidence: evidence.evidence },
@@ -891,7 +904,7 @@ async function reviewAuthoredWriteConstraints(input: {
       result = await review({
         sessionId: input.attestation.sessionId,
         instructions: input.reopened.step.prompt,
-        tool: input.attestation.toolName,
+        tool: toolLabel,
         schema,
         args: input.args,
         observations: { summary: full.summary, complete: full.available, evidence: full.evidence },
@@ -1548,6 +1561,9 @@ export async function evaluateAuthoredWorkflowMutationConsent(input: {
   args: Record<string, unknown>;
   acceptedBatch: AcceptedModelBatchRef;
   callIndex: number;
+  /** The tool name the model called (a carrier such as a gateway or call_tool
+   *  when the operation rode inside it). */
+  carrierToolName?: string;
 }): Promise<HostInteractiveConsentResult | null> {
   try {
     const attestation = input.attestation;

@@ -677,3 +677,20 @@ console.log('composio-batch-validator tests passed');
   }
   console.log('✓ nested schema shape is refused with exact pointers and a fillable skeleton (carrier sweep)');
 }
+
+// A wrapper whose `arguments` the model serialized twice (a JSON string of a
+// JSON object string) is read as that object. Live 2026-10-13: a refused
+// send's retry arrived this way and the identity unwrap now reads it, so
+// execution must agree.
+{
+  const inner = { channel: 'C0FIXTURE0001', markdown_text: '*Fixture update*' };
+  const twice = normalizeComposioBatchItemArgs('SLACK_SEND_MESSAGE', {
+    tool_slug: 'SLACK_SEND_MESSAGE', arguments: JSON.stringify(JSON.stringify(inner)),
+  });
+  if (twice.errors.length > 0) throw new Error(`twice-serialized arguments must normalize: ${twice.errors.join('; ')}`);
+  if ((twice.args as { channel?: unknown }).channel !== inner.channel) throw new Error('twice-serialized arguments must yield the inner object');
+  const text = normalizeComposioBatchItemArgs('SLACK_SEND_MESSAGE', {
+    tool_slug: 'SLACK_SEND_MESSAGE', arguments: JSON.stringify('hello'),
+  });
+  if (text.errors.length === 0) throw new Error('a quoted non-object string must still be an error');
+}

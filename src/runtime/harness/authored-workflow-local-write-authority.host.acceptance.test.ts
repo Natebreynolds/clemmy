@@ -774,6 +774,67 @@ test('native workflow write constraints reject before execution and allow correc
 });
 
 
+test('the constraint reviewer is shown the write as its author named it: the carrier and the operation it carried', async () => {
+  // Shown only the host's normalized operation name, a reviewer refuses a
+  // correct write whose saved instructions name the carrier.
+  const { buildWorkflowStepAgent } = await import('../../agents/workflow-step-agent.js');
+  const target = path.join(TEST_HOME, 'workspace', 'carried-label.md');
+  mkdirSync(path.dirname(target), { recursive: true });
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
+    prompt: `Use exactly one call_tool call carrying write_file to write ${target} with the text Prepared.` });
+  assert.equal(fixture.recorded.status, 'ready');
+  const seen: string[] = [];
+  authorityAdapter._setWorkflowMutationReviewerForTests(async (input) => {
+    seen.push(input.tool);
+    return { verdict: 'compatible', reason: 'The carried write matches the saved instructions.', proposalDigest: 'fixture-label' };
+  });
+  try {
+    const model = stubModel([
+      [toolCall('carried-label', 'call_tool', { name: 'write_file', args_json: JSON.stringify({ path: target, content: 'Prepared.\n', mode: 'create', append: null }) })],
+      [textMsg('Prepared.')],
+    ]);
+    const agent = await buildWorkflowStepAgent({ sessionId: fixture.session.id, userInput: fixture.source.data.text as string });
+    agent.model = model as never;
+    const outcome = await runProductionHost(fixture, agent as unknown as Record<string, unknown>);
+    assert.ok(existsSync(target), JSON.stringify(outcome.history));
+    assert.deepEqual(seen, ['call_tool → write_file'], 'the reviewer sees the carrier and the operation, never the operation alone');
+  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+});
+
+test('a corrected write the model serialized twice still reaches the reviewer after a constraint refusal', async () => {
+  // Double-encoded, a retry unwraps to no operation and the very retry the
+  // refusal asked for is refused as off the recovery surface; the step then
+  // exhausts into a blocked terminal with the write undone.
+  const { buildWorkflowStepAgent } = await import('../../agents/workflow-step-agent.js');
+  const target = path.join(TEST_HOME, 'workspace', 'carried-twice.md');
+  mkdirSync(path.dirname(target), { recursive: true });
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
+    prompt: `Write ${target} with the text Prepared.` });
+  assert.equal(fixture.recorded.status, 'ready');
+  const reviewed: string[] = [];
+  authorityAdapter._setWorkflowMutationReviewerForTests(async (input) => {
+    reviewed.push(String(input.args.content));
+    const ok = input.args.content === 'Prepared.\n';
+    return { verdict: ok ? 'compatible' : 'conflict', reason: ok ? 'ok' : 'The saved instructions name the text Prepared.', proposalDigest: 'fixture-twice' };
+  });
+  try {
+    const corrected = { path: target, content: 'Prepared.\n', mode: 'create', append: null };
+    const model = stubModel([
+      [toolCall('twice-conflict', 'call_tool', { name: 'write_file', args_json: JSON.stringify({ ...corrected, content: 'Wrong.\n' }) })],
+      [toolCall('twice-corrected', 'call_tool', { name: 'write_file', args_json: JSON.stringify(JSON.stringify(corrected)) })],
+      [textMsg('Prepared.')],
+    ]);
+    const agent = await buildWorkflowStepAgent({ sessionId: fixture.session.id, userInput: fixture.source.data.text as string });
+    agent.model = model as never;
+    const outcome = await runProductionHost(fixture, agent as unknown as Record<string, unknown>);
+    assert.deepEqual(reviewed, ['Wrong.\n', 'Prepared.\n'], JSON.stringify(outcome.history).slice(0, 3000));
+    assert.ok(existsSync(target), JSON.stringify(outcome.history).slice(0, 3000));
+    assert.equal(readFileSync(target, 'utf8'), 'Prepared.\n');
+    assert.doesNotMatch(JSON.stringify(outcome.history), /only these capabilities are available/);
+    assert.deepEqual(nonRefusedSettlements(fixture).map(row => row.logical_tool_call_id), ['twice-corrected']);
+  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+});
+
 test('a constraint checker that cannot answer stops the step truthfully instead of looping the model', async () => {
   // Live 2026-09-30: three reviewer timeouts in one step were reported as
   // "could not be verified"; the model re-proposed the same write each time

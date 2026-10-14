@@ -1236,6 +1236,13 @@ export function hostNoProgressRecoveryToolNames(
         || provenReads.includes(name)
         || (provenReads.length > 0 && (bare === 'call_tool' || bare === 'work_call')))) return true;
     if (exact.has(name)) return true;
+    // THE CONTROL THAT ENDS A STEP IS ALWAYS AVAILABLE IN RECOVERY.
+    //
+    // A step that reports itself blocked after a refused write crosses
+    // nothing; refusing that report leaves the governor to exhaust and speak
+    // in the model's place. The step terminal is on every recovery surface,
+    // as publish_plan is on a plan turn's.
+    if (bare === 'workflow_step_result') return true;
     // READERS OF ALREADY-RETAINED EVIDENCE ARE ALWAYS PERMITTED IN RECOVERY.
     //
     // These consult bytes this turn already fetched. They cross nothing, mutate
@@ -7740,18 +7747,16 @@ const runHostTurnBody = async (
           // its own refusal, or a reply whose bytes do not prove the effect.
           // The model reads the provider's words and answers, and the write
           // keeps no replay authority. The hard block is for a dropped
-          // acknowledgement, where nothing came back to read (live
-          // 2026-10-07: a provider answered a delete with its own not-found;
-          // live 2026-10-13: an app answered a delete with a success flag
-          // over a body that said failure).
+          // acknowledgement, where nothing came back to read; a provider's
+          // own not-found, or a success flag over a body that says failure,
+          // is a reply the model reads.
           // A write that RETURNED without acknowledgement (a timeout the tool
           // reported, a process that ended early) is not the dark either: the
           // model has what came back, the turn goes on under a write freeze
           // (reads open, external writes wait for a read), and the ledger
-          // keeps the call from ever being resent. Live 2026-10-08: two shell
-          // commands that timed out ended the turn "I can't tell whether the
-          // command went through… I won't retry it on my own", with nothing
-          // read and nothing decided.
+          // keeps the call from ever being resent; a timed-out command is
+          // never "I can't tell whether it went through… I won't retry", with
+          // nothing read and nothing decided.
           settlementRequiresReconciliation =
             invoked.settlement.outcome.directive.requiresReconciliation === true
             && uncertainEffectStopsTurn(effect)
@@ -7941,9 +7946,9 @@ const runHostTurnBody = async (
         + 'It may have landed. Do not send this call again, and send no other external write until you have read the target and know what happened; reads are open. '
         + 'Then say exactly what you found. If you cannot read it, say that plainly and name what the owner can check.'
       : undefined;
-    // The read that lifted the freeze answers the earlier write's fate. Live
-    // 2026-10-13: the model listed the notebook, saw the note it had tried to
-    // create, and still asked the owner to check; the read is the answer.
+    // The read that lifted the freeze answers the earlier write's fate: a
+    // listing that shows the record the write tried to create is the
+    // answer, not a reason to ask the owner to check.
     const freezeLiftedNote = !structuredToolOutputs(output) && freezeLiftedFrom
       ? `This read is the ground truth for the earlier ${freezeLiftedFrom} call that ended without acknowledgement. Answer from it: `
         + 'if the record it would have created or changed is there, that write landed (do not make it again); if it is not there, it did not land. '
@@ -8165,10 +8170,8 @@ const runHostTurnBody = async (
       // ProviderAnsweredError and the settlement reads it as
       // provider_refused_envelope, the same reading a returned `successful:
       // false` envelope gets; nothing is in the dark, and the model reads the
-      // provider's words and answers. Live 2026-10-12: an approved
-      // aibs__create_site the app refused ended the turn "may have begun…
-      // must be reconciled" with a blank effect_unknown marker, and the
-      // owner never learned what the app had said.
+      // provider's words and answers; a refusal the app spelled out is never
+      // reported as "may have begun" with a blank effect marker.
       if (providerRepliedWithoutProof(settlement.outcome)) return 'answered_refusal';
       // A WRITE THAT ENDED WITHOUT ACKNOWLEDGEMENT, where the crossing itself
       // answered (it threw) and proved nothing, goes on under a write freeze:
@@ -11500,6 +11503,12 @@ const runHostTurnBody = async (
       // The recovery request exposed no dependency/provider/business schema.
       // A model-authored call outside that exact subset is paired locally and
       // terminalized before approval, preparation, or body invocation.
+      // A named recovery operation the surface lists under no name of its own
+      // is reached through its carrier; the diagnostic says so below.
+      const offSurfaceRecoveryOperations = noProgressState?.lastConsequence?.effectState === 'not_started'
+        && noProgressState.lastConsequence.recovery === 'repair_model'
+        ? noProgressState.lastConsequence.recoveryToolNames.filter((name) => !toolByName.has(name))
+        : [];
       // NAME THE SURFACE IN THE REFUSAL ITSELF.
       //
       // Without a diagnostic this committed the generic marker "correct the
@@ -11521,6 +11530,9 @@ const runHostTurnBody = async (
                   && noProgressState.lastConsequence.recovery === 'repair_model'
                   && permittedRecoveryReadOperations.length > 0
                   ? `Proven read operations may also use their configured carriers: ${permittedRecoveryReadOperations.join(', ')}. `
+                  : '')
+                + (offSurfaceRecoveryOperations.length > 0
+                  ? `The refused operation ${offSurfaceRecoveryOperations.join(', ')} may be proposed again through its carrier with corrected arguments. `
                   : '')
                 + `Call one of them, or say what you need.`,
             ] as const)
@@ -12112,6 +12124,10 @@ const runHostTurnBody = async (
               args: authoredMaterial.args,
               acceptedBatch: acceptedFrame.ref,
               callIndex,
+              // The call as the model wrote it; the review names the write the
+              // way its author would (carrier and operation), never the host's
+              // normalized operation name alone.
+              carrierToolName: call.name,
             }
           : null;
         let authoredWorkflowConsent = authoredConsentInput

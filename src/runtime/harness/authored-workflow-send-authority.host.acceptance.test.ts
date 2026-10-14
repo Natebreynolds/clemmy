@@ -858,7 +858,10 @@ test('constraint rejection repairs the proposal without dispatch or spending the
   const reviewed: string[] = [];
   authorityAdapter._setWorkflowMutationReviewerForTests(async input => {
     assert.match(input.instructions, /Preserve the authored subject/);
-    assert.equal(input.tool, SEND.manifest.operationId.toLowerCase());
+    // The reviewer is shown the write as its author named it: the carrier
+    // the model called and the operation it carried, never the host's
+    // normalized operation name alone.
+    assert.equal(input.tool, `call_tool → ${SEND.manifest.operationId} (${SEND.manifest.operationId.toLowerCase()})`);
     reviewed.push(String(input.args.subject));
     return { verdict: input.args.subject === 'WRONG' ? 'conflict' : 'compatible',
       reason: input.args.subject === 'WRONG' ? 'Restore the authored subject.' : 'The subject matches.',

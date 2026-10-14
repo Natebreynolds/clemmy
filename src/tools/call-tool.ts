@@ -1023,6 +1023,10 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       if (raw) {
         try {
           args = JSON.parse(raw);
+          // The object string quoted once more (the model serialized its own
+          // serialization) is that object; the host identifies the carried
+          // operation the same way, so dispatch must agree.
+          if (typeof args === 'string' && args.trim().startsWith('{')) args = JSON.parse(args.trim());
         } catch {
           return refuse({ error: 'arg_validation', detail: 'args_json is not valid JSON' });
         }
