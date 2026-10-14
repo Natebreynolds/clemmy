@@ -811,6 +811,24 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
+  // Working copies (request copies, raw tool results) end once a day, inside
+  // the storage budget; memory is never a candidate. See storage-retention.ts.
+  if (!shouldDeferDiscretionaryWork('storage-retention')) {
+    try {
+      const { storageRetentionDue, markStorageRetentionRun, runProductionStorageRetention } = await import('../runtime/storage-retention.js');
+      if (storageRetentionDue(Date.now())) {
+        markStorageRetentionRun(Date.now());
+        const { withDaemonRuntimePhase } = await import('../daemon/phase.js');
+        const report = await withDaemonRuntimePhase('daemon.maintenance.storage_retention', {}, () => runProductionStorageRetention());
+        logger.info({ mode: report.mode, requestCopies: report.requestCopies, toolResults: report.toolResults,
+          orphanPayloads: report.orphanPayloads, footprintBefore: report.footprintBefore, footprintAfter: report.footprintAfter,
+          overBudgetBytes: report.overBudgetBytes }, 'storage retention pass');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'storage retention pass failed');
+    }
+  }
+
   // Procedural-memory self-heal (Wave 2 ever-learning robustness). Sweeps the
   // tool-choice store for cross-service / async-task-post mis-bindings and
   // invalidates them (recoverable). Best-effort; no-ops without a known-toolkit

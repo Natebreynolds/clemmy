@@ -8996,6 +8996,27 @@ export function registerConsoleRoutes(
    * Tiny endpoint the dashboard hits on first load to populate the
    * version chip in the header + foot bar. Reads from package.json.
    */
+  /** The storage budget pass: its policy and last report, and a way to run it
+   *  now (report-only on request, so the numbers can be seen before deletion). */
+  app.get('/api/console/storage/retention', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const { storageRetentionPolicy, readStorageRetentionReport } = await import('../runtime/storage-retention.js');
+    res.json({ policy: storageRetentionPolicy(), report: readStorageRetentionReport() });
+  });
+  app.post('/api/console/storage/retention/run', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { storageRetentionPolicy, runProductionStorageRetention } = await import('../runtime/storage-retention.js');
+      const { withDaemonRuntimePhase } = await import('../daemon/phase.js');
+      const policy = storageRetentionPolicy();
+      const reportOnly = (req.body ?? {}).mode === 'report';
+      res.json(await withDaemonRuntimePhase('daemon.maintenance.storage_retention', { requested: true },
+        () => runProductionStorageRetention(reportOnly ? { ...policy, mode: 'report' } : policy)));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/storage', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     res.setHeader('Cache-Control', 'no-store');
