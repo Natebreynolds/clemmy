@@ -1440,7 +1440,16 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
           throw new Error('accepted exact MCP transport route is no longer present');
         }
         exactHandoff.used = true;
-        return server.callTool(parsed.toolName, args);
+        // The carrier owns settlement on this route, but the connection is
+        // still this shim's: a death under the call is noted here too, or
+        // the next use finds a dead session and a backoff (live 2026-10-13,
+        // third proof: every carried write took this path).
+        try {
+          return await server.callTool(parsed.toolName, args);
+        } catch (error) {
+          if (isTransportDeathError(error)) noteTransportDeath(server);
+          throw error;
+        }
       }
       // Open the physical attempt here, before lease and routing checks, so an
       // unknown tool or an unavailable server is still a correlated attempt

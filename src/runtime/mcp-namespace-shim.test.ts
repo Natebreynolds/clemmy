@@ -672,3 +672,25 @@ test('shim: a connection that dies under a call reconnects on the very next use,
   assert.ok(tools.some((t: any) => t.name === 'dies-under-call__get_note'), 'real tools, never the connecting stub');
   assert.equal(listMcpServerHealth().find((s) => s.slug === 'dies-under-call')?.state, 'connected');
 });
+
+test('shim: a connection that dies under a carried (exact hand-off) call is noted there too, and the next use reconnects at once', async () => {
+  // Live 2026-10-13, third proof: every carried write takes the exact
+  // hand-off route, which returned the raw server call without the shim's
+  // dispatch block, so the death went unnoted and the read the write freeze
+  // waited for met a dead session and a backoff.
+  const { withAcceptedExactMcpTransportHandoff: handoff } = await import('./mcp-namespace-shim.js');
+  const died = Object.assign(new Error('MCP error -32000: Connection closed'), { code: -32000 });
+  const b = makeFakeServer({ name: 'dies-under-handoff', tools: [{ name: 'create_note' }], failCallTool: died });
+  const shim = createMcpNamespaceShim({ servers: [b], cacheToolsList: true });
+  await shim.listTools();
+  assert.equal(b._connected, 1);
+  const args = { title: 'x' };
+  await assert.rejects(
+    handoff({ toolName: 'dies-under-handoff__create_note', args }, () => shim.callTool('dies-under-handoff__create_note', args)),
+    /Connection closed/,
+  );
+  const tools = await shim.listTools();
+  assert.equal(b._closed, 1, 'the dead session was closed at the call');
+  assert.equal(b._connected, 2, 'the next use reconnected at once');
+  assert.ok(tools.some((t: any) => t.name === 'dies-under-handoff__create_note'), 'real tools, no stub');
+});
