@@ -461,7 +461,7 @@ function snapshotConversation(allRows: HarnessSessionRow[] | undefined, rawId: s
   const index = snapshotIndex(allRows);
   if (index.conversations.has(rawId)) return index.conversations.get(rawId)!;
   const conversation = measureProjectionRead(index.observer, 'catalog_lineage',
-    () => readAcceptedSourceConversationProjection(rawId, { observer: index.observer }));
+    () => readAcceptedSourceConversationProjection(rawId, { observer: index.observer, rows: (id) => index.rows.get(id) }));
   if (conversation) {
     // The reader verified every member's principal and exact selector binding.
     // Reuse that proof for summary/search/preview, never for source admission.

@@ -23,6 +23,7 @@ import {
   type CancelledSuccessorReadShare,
 } from './cancelled-successor-retained-read.js';
 import { measureProjectionRead, type ProjectionReadObserver } from '../../dashboard/projection-read-metrics.js';
+import { prepareCached } from '../sqlite-statement-cache.js';
 
 const BRANCH_META = '__accepted_source_branch';
 const MOUNT_META = '__session_mount';
@@ -561,7 +562,7 @@ function readPointer(
   rootSessionId: string,
   continuity: string,
 ): PointerRow | null {
-  return (db.prepare(`
+  return (prepareCached(db, `
     SELECT root_session_id, continuity_digest, head_session_id, revision
       FROM accepted_source_session_pointers
      WHERE root_session_id = ? AND continuity_digest = ?
@@ -569,7 +570,7 @@ function readPointer(
 }
 
 function existingBinding(db: Database.Database, sourceDigest: string): BindingRow | null {
-  return (db.prepare(`
+  return (prepareCached(db, `
     SELECT durable_source_digest, root_session_id, continuity_digest,
            session_id, disposition, selected_after_seq
       FROM accepted_source_session_bindings
@@ -581,13 +582,43 @@ function existingBinding(db: Database.Database, sourceDigest: string): BindingRo
  * to join transcripts: require the selector's pointer, exact source binding,
  * and the same provider, conversation, audience and scope at every hop. This
  * does not transfer attempt/effect authority or reactivate a stopped session. */
-export function readAcceptedSourceConversationProjection(sessionId: string, diagnostics: { observer?: ProjectionReadObserver } = {}): AcceptedSourceConversationProjection | null {
+/** A session row a list already holds, as the identity fields lineage reads. */
+export interface ConversationIdentityRow {
+  id: string;
+  kind: SessionKind;
+  channel: string | null;
+  userId: string | null;
+  status: SessionStatus;
+  metadata: Record<string, unknown>;
+}
+
+const IDENTITY_KEYS = ['ingressProvider', 'source', 'channelId', 'discordChannelId', 'userId', 'discordUserId',
+  'guildId', 'discordGuildId', BRANCH_META] as const;
+
+/** The same identity subset the reader selects with json_object, from a row
+ *  a list already parsed: missing keys are null, exactly as json_extract. */
+function identityRawSession(row: ConversationIdentityRow): RawSession {
+  const identity: Record<string, unknown> = {};
+  for (const key of IDENTITY_KEYS) identity[key] = row.metadata[key] ?? null;
+  return { id: row.id, kind: row.kind, channel: row.channel, user_id: row.userId, status: row.status,
+    metadata_json: JSON.stringify(identity) };
+}
+
+export function readAcceptedSourceConversationProjection(sessionId: string, diagnostics: {
+  observer?: ProjectionReadObserver;
+  /** Rows the caller already read in this request. A list holds every row; re-reading each member from
+   *  the database parsed its whole metadata blob again, thousands of times per list. Members it lacks are
+   *  read from the database as before. */
+  rows?: (id: string) => ConversationIdentityRow | undefined;
+} = {}): AcceptedSourceConversationProjection | null {
   try {
     const db = openEventLog();
     // Lists must not deserialize provider transcripts/recovery state for each
     // member merely to establish its visible identity.
     const readRow = (id: string): RawSession => {
-      const row = measureProjectionRead(diagnostics.observer, 'catalog_lineage_rows', () => db.prepare(`SELECT id, kind, channel, user_id, status,
+      const held = diagnostics.rows?.(id);
+      if (held) return identityRawSession(held);
+      const row = measureProjectionRead(diagnostics.observer, 'catalog_lineage_rows', () => prepareCached(db, `SELECT id, kind, channel, user_id, status,
         json_object('ingressProvider', json_extract(metadata_json, '$.ingressProvider'),
           'source', json_extract(metadata_json, '$.source'),
           'channelId', json_extract(metadata_json, '$.channelId'),
