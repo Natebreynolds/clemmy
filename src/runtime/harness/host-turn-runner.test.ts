@@ -13553,6 +13553,16 @@ test('a result completed on the last repair receives a fresh positive verdict', 
   assert.deepEqual(verdicts.map(e => e.data.fulfills), [false, false, true]);
   assert.deepEqual(verdicts.map(e => e.data.continuationsUsed), [0, 1, 2]);
   assert.equal(verdicts[2]?.data.replyDigest, createHash('sha256').update(corrected).digest('hex'));
+  // Assertions inside the judge callback can be caught as reviewer failure.
+  // Check its successful return and the actual read outside that boundary.
+  assert.notEqual(verdicts[2]?.data.failedOpen, true, 'a caught assertion is not a successful review');
+  assert.equal(verdicts[2]?.data.reviewFailure, undefined);
+  assert.equal(verdicts[2]?.data.reason, 'The current result now answers the request.');
+  assert.deepEqual(eventlog.openEventLog().prepare(`SELECT logical_tool_call_id, outcome_kind, mutating, requires_reconciliation
+    FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ? ORDER BY logical_tool_call_id`)
+    .all(fixture.session.id, fixture.source.seq), [
+      { logical_tool_call_id: 'final-repair-read', outcome_kind: 'succeeded', mutating: 0, requires_reconciliation: 0 },
+    ], 'the real harness_status call succeeded exactly once under this accepted source');
 });
 
 // ─── Advertised surface is append-only within one accepted source ───────────
