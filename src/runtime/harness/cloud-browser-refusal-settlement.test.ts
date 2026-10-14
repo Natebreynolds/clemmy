@@ -307,7 +307,8 @@ test('a successful create followed by a tabs refusal cannot become whole-call no
     assert.equal(settlement.outcome.directive.retrySameCandidate, false);
     assert.equal(settlement.outcome.directive.requiresReconciliation, false);
     const retained = JSON.parse(String(result));
-    assert.equal(retained.resource.providerSessionId, providerSessionId);
+    assert.equal(retained.resource.id, fixture.stored()[0]!.id, 'the retained failure names the browser the model can act on');
+    assert.equal(retained.resource.providerSessionId, undefined, "the provider's own session id stays with the host");
     assert.equal(retained.resource.state, 'active');
     assert.equal(retained.observation.ok, false);
     assert.equal(retained.observation.effect, 'none');
@@ -371,7 +372,9 @@ test('reviewed storage reports failed page observation without denying an acknow
     assert.equal(settlement.outcome.directive.retrySameCandidate, false);
     assert.equal(settlement.outcome.directive.requiresReconciliation, false);
     const retained = JSON.parse(thrown.message);
-    assert.equal(retained.resource.providerSessionId, providerSessionId);
+    assert.equal(retained.resource.id, fixture.stored()[0]!.id);
+    assert.equal(retained.resource.providerSessionId, undefined);
+    assert.equal(fixture.stored()[0]!.providerSessionId, providerSessionId, 'the host keeps the provider session it must stop');
     assert.equal(retained.resource.state, 'active');
     assert.equal(retained.observation.ok, false);
     assert.equal(retained.observation.effect, 'none');

@@ -14,10 +14,14 @@ import { hostPreDispatchRefusal } from '../runtime/harness/host-pre-dispatch-ref
 
 /** UI metadata belongs in the dock. Do not repeat every retained page beside
  * each bounded read or inflate a resource-list discovery response. Actual page
- * evidence and exact handles remain in the requested operation's result. */
-function resourceForTool(resource: BrowserbaseResource): Omit<BrowserbaseResource, 'pages'> & { pageCount: number; pagesOmitted: true } {
-  const { pages, ...identity } = resource;
-  return { ...identity, pageCount: pages.length, pagesOmitted: true };
+ * evidence and exact handles remain in the requested operation's result. The
+ * provider's own session and project, the conversation and the timestamps stay
+ * with the host: no operation takes them, so the model only ever repeats them. */
+type ResourceForTool = Omit<BrowserbaseResource, 'pages' | 'providerSessionId' | 'projectId' | 'conversationId' | 'createdAt' | 'updatedAt'>
+  & { pageCount: number; pagesOmitted: true };
+function resourceForTool(resource: BrowserbaseResource): ResourceForTool {
+  const { pages, providerSessionId: _provider, projectId: _project, conversationId: _conversation, createdAt: _created, updatedAt: _updated, ...handles } = resource;
+  return { ...handles, pageCount: pages.length, pagesOmitted: true };
 }
 
 /** Task identity comes from the authenticated host invocation, never a model field. */
@@ -123,7 +127,7 @@ function browserFailureClassification(error: BrowserbaseServiceError): LocalNonW
 
 export function registerCloudBrowserTools(server: McpServer): void {
   const descriptions: Record<CloudBrowserOperationName, string> = {
-    cloud_browser_start: 'Start the cloud browser for this chat, or rejoin the one already open here (including one the owner opened or handed over). Pass url to open a website in its first page in the same call. Returns the resource id, controlVersion and page handles (target_id) to read or navigate directly. This operation already finds the existing browser; no preliminary resources call or separate open call is needed. Respects human control. Cloud usage is billed by the connected provider; recording stays off.',
+    cloud_browser_start: 'Start the cloud browser for this chat, or rejoin the one already open here (including one the owner opened or handed over). Pass url to open a website in its first page in the same call. Returns the resource id, controlVersion and page handles (target_id) to read or navigate directly; they are for your next calls, since the owner watches this browser in the side panel. This operation already finds the existing browser; no preliminary resources call or separate open call is needed. Respects human control. Cloud usage is billed by the connected provider; recording stays off.',
     cloud_browser_resources: 'List the recent cloud browser resources already owned by this task, including one the user started in the UI, and report which browser the owner chose for this machine (browser.choice: a cloud provider or local Chrome) with each configured provider. Use this to inspect or select an existing resource and its exact controlVersion. cloud_browser_start already resolves and rejoins this chat\'s browser; a preliminary list is unnecessary.',
     cloud_browser_status: 'Observe this exact task-owned cloud browser and its current controlVersion, or, with no resource_id, list this task\'s browsers and the browser the owner chose for this machine. Use after a handoff or a stale-version refusal. Reports pending or uncertain effects honestly; does not replay actions or grant control. Page metadata is omitted here; cloud_browser_tabs provides fresh exact handles.',
     cloud_browser_tabs: 'Freshly observe pages in this exact task-owned cloud browser. Returns current targetId handles. Refuses while the user has control or the controlVersion changed; never substitutes another session.',
