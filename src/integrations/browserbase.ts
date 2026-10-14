@@ -111,6 +111,12 @@ interface Cdp { execute: BrowserbaseCdpClient['execute']; humanText: Browserbase
 export interface BrowserbaseDependencies {
   baseDir?: string; now?: () => number; uuid?: () => string; getApiKey?: () => Promise<string | undefined>; setApiKey?: (value: string) => Promise<void>;
   api?: Api; cdp?: Cdp; autoMaintenance?: boolean;
+  /** Whether the task that owns a browser has finished for good. A workflow
+   *  step session (`workflow:<runId>:<stepId>`) is finished once its run
+   *  record carries finishedAt; a chat never is (its browser stays for the
+   *  owner and closes on idle). Injected by tests; production reads the run
+   *  record. */
+  ownerFinished?: (conversationId: string) => boolean;
   credentialTimeoutMs?: number;
   /** Per-provider seams for tests; `api`, `getApiKey` and `setApiKey` above are Browserbase's. */
   providerApis?: Partial<Record<CloudBrowserProvider, Api>>;
@@ -147,6 +153,7 @@ export class BrowserbaseService {
   constructor(private readonly dependencies: BrowserbaseDependencies = {}) {
     this.file = browserbaseStoreFile(dependencies.baseDir ?? BASE_DIR); this.directory = path.dirname(this.file);
     this.now = dependencies.now ?? Date.now; this.uuid = dependencies.uuid ?? randomUUID;
+    this.ownerFinished = dependencies.ownerFinished ?? BrowserbaseService.workflowRunFinished;
     this.getKey = dependencies.getApiKey ?? (() => readSecret('browserbase_api_key'));
     this.setKey = dependencies.setApiKey ?? (value => writeSecret('browserbase_api_key', value));
     this.credentialTimeoutMs = dependencies.credentialTimeoutMs ?? 5000;
@@ -164,6 +171,21 @@ export class BrowserbaseService {
     if (dependencies.autoMaintenance !== false) { this.timer = setInterval(() => { void this.maintenance().catch(() => {}); }, 30000); this.timer.unref(); }
   }
   dispose(): void { if (this.timer) clearInterval(this.timer); }
+  /** Live 2026-10-13: a workflow step opened a Kernel browser to read one page
+   *  and the session stayed active, billed, for the whole idle window after
+   *  the run had finished. Nobody is watching an unattended run's browser once
+   *  the run is over: an agent-controlled browser owned by a finished workflow
+   *  run is released at the next maintenance pass. A browser a human took
+   *  over is theirs and keeps the idle policy. */
+  private readonly ownerFinished: (conversationId: string) => boolean;
+  private static workflowRunFinished(conversationId: string): boolean {
+    const match = /^workflow:([A-Za-z0-9_.-]+):.+$/.exec(conversationId.trim());
+    if (!match) return false;
+    try {
+      const record = JSON.parse(readFileSync(path.join(BASE_DIR, 'workflows', 'runs', `${match[1]}.json`), 'utf8')) as { finishedAt?: unknown };
+      return typeof record.finishedAt === 'string' && record.finishedAt.length > 0;
+    } catch { return false; }
+  }
   private iso(): string { return new Date(this.now()).toISOString(); }
   private load(): Store {
     if (!existsSync(this.file)) return { version: 1, revision: 0, policy: null, resources: [] };
@@ -742,6 +764,7 @@ export class BrowserbaseService {
           if (this.now() >= resource.expiresAt) { resource.state = 'expired'; resource.pending = undefined; resource.updatedAt = this.iso(); this.persist(); }
           return;
         }
+        if (resource.controller === 'agent' && this.ownerFinished(resource.conversationId)) { try { await this.release(resource); } catch {} return; }
         if (resource.pending?.operation === 'stop') { try { const { api } = await this.api(resource); this.settleProvider(resource, await api.retrieve(resource.providerSessionId, resource.projectId)); this.persist(); } catch {} return; }
         if (this.now() - resource.lastActivityAt >= policy.idleSeconds * 1000 || this.now() >= resource.expiresAt) { try { await this.release(resource); } catch {} }
       });

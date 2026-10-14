@@ -95,6 +95,31 @@ test('release acknowledgment is not terminal proof, later polls cannot duplicate
     t.setStatus('COMPLETED'); const ended=await t.service.get(r.id,'task-a'); assert.equal(ended.state,'stopped'); assert.equal(t.counts().releases,1);
   } finally {t.close();}
 });
+test('a browser owned by a finished workflow run is released at the next maintenance pass; a human-held one and a live chat one keep the idle policy', async () => {
+  // Live 2026-10-13: a workflow step read one page in a Kernel browser and the
+  // session stayed active, billed, for the whole idle window after the run.
+  const t = setup(); try {
+    const finished = new Set<string>();
+    const service = new BrowserbaseService({ ...t.options, ownerFinished: (id) => finished.has(id) });
+    await service.configure({ projectId: project });
+    const stepBrowser = await service.create({ conversationId: 'workflow:run-1:open_page', requestId: 'source-step' });
+    const chatBrowser = await service.create({ conversationId: 'task-a', requestId: 'source-chat' });
+    await service.maintenance();
+    assert.equal(t.counts().releases, 0, 'a running workflow keeps its browser');
+    finished.add('workflow:run-1:open_page');
+    await service.maintenance();
+    assert.equal(t.counts().releases, 1, 'the finished run\'s browser is released without waiting for idle');
+    assert.notEqual((await service.get(stepBrowser.id, 'workflow:run-1:open_page')).state, 'active');
+    assert.equal((await service.get(chatBrowser.id, 'task-a')).state, 'active', 'a chat browser is untouched');
+    const held = await service.create({ conversationId: 'workflow:run-2:open_page', requestId: 'source-held' });
+    const taken = await service.control(held.id, 'workflow:run-2:open_page', { expectedVersion: held.controlVersion, controller: 'human' });
+    assert.equal(taken.controller, 'human');
+    finished.add('workflow:run-2:open_page');
+    await service.maintenance();
+    assert.equal(t.counts().releases, 1, 'a browser a human took over stays until idle');
+    service.dispose();
+  } finally { t.close(); }
+});
 test('idle policy preserves visible human activity and releases exact idle sessions within configured lifetime', async () => {
   const t=setup(); try {
     await t.service.configure({projectId:project,idleSeconds:60,sessionTimeoutSeconds:120}); const r=await t.service.create({conversationId:'task-a',requestId:'source'});
