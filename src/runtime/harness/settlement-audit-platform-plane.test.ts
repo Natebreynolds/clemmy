@@ -418,7 +418,7 @@ test('a later similar write does not reconcile an earlier ambiguous reservation'
   assert.equal(audit.facts.blockingUncertainWrites, 1);
 });
 
-test('the exact reservation terminal clears logical uncertainty after readback reconciliation', () => {
+test('an unverified readback marker cannot clear the exact logical write uncertainty', () => {
   const accepted = acceptedSource(
     'workflow:exact-reconciliation:update_rows',
     'Update the tracker rows.',
@@ -477,9 +477,12 @@ test('the exact reservation terminal clears logical uncertainty after readback r
     sourceUserSeq: accepted.sourceUserSeq,
     requiresBusinessEvidence: true,
   });
-  assert.equal(audit.status, 'clean', JSON.stringify(audit));
-  assert.equal(audit.facts.blockingUncertainWrites, 0);
-  assert.equal(audit.facts.unrecoveredBusinessFailures, 0);
+  // Naming an evidence call is not a read settlement or exact original
+  // account/target authority. The compatibility event projection can say
+  // confirmed while the stronger logical write inventory correctly holds.
+  assert.equal(audit.status, 'uncertain_write', JSON.stringify(audit));
+  assert.equal(audit.facts.blockingUncertainWrites, 1);
+  assert.equal(audit.facts.unrecoveredBusinessFailures, 1);
   assert.equal(audit.facts.confirmedWrites, 1);
 });
 

@@ -144,6 +144,10 @@ interface FixtureOptions {
   posture?: 'create_new' | 'named_existing' | 'not_applicable';
   destructive?: boolean | null;
   accountId?: string;
+  /** Optional policy on this exact durable fixture source, including malformed controls. */
+  learningPolicy?: unknown;
+  /** A later same-session source owns only ambient learning context, never this call. */
+  ambientSibling?: { learningPolicy?: unknown };
   operationSemantics?: { version: 1; reversibility: 'reversible' | 'ordinary_non_destructive' | 'irreversible' };
 }
 
@@ -192,7 +196,8 @@ async function acceptedCall(options: FixtureOptions) {
     operationVersion: '1', observedAt: Date.now(), origin: 'independent' }).ok, true);
   eventlog.createSession({ id: sessionId, kind: 'chat' });
   const source = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
-    data: { text: 'Message my teammate about the interview.' } });
+    data: { text: 'Message my teammate about the interview.',
+      ...(options.learningPolicy === undefined ? {} : { learningPolicy: options.learningPolicy }) } });
   const catalogRevisionDigest = sha(`catalog:${sessionId}`);
   const bindingRevisionDigest = sha(`binding:${sessionId}`);
   const root = authority.armHostCallAuthority({ sessionId, sourceUserSeq: source.seq,
@@ -223,7 +228,17 @@ async function acceptedCall(options: FixtureOptions) {
     assert.equal(bound.status, 'bound', JSON.stringify(bound));
   });
   const request = { attestation, args: options.args, inputSchema: options.schema };
-  const result = await consent.evaluateUncoveredHostMutationConsent(request);
+  let result: Awaited<ReturnType<typeof consent.evaluateUncoveredHostMutationConsent>>;
+  if (options.ambientSibling) {
+    const sibling = eventlog.appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received',
+      data: { text: 'Separate ordinary fixture request.',
+        ...(options.ambientSibling.learningPolicy === undefined ? {} : { learningPolicy: options.ambientSibling.learningPolicy }) } });
+    const { withAcceptedSourceSessionContext } = await import('./source-session-context.js');
+    result = await withAcceptedSourceSessionContext({ sessionId, sourceUserSeq: sibling.seq },
+      () => consent.evaluateUncoveredHostMutationConsent(request), { newlyAccepted: true });
+  } else {
+    result = await consent.evaluateUncoveredHostMutationConsent(request);
+  }
   assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
     .get(sessionId) as { n: number }).n, 0, 'consent never dispatches');
   return { result, request, sourceCreatedAt: source.createdAt };
@@ -583,4 +598,71 @@ test('no declared provider contract lowers consent: an unlearned preparation cal
     assertAsks(call.result, 'with the learner unavailable the conservative card stands');
     assert.equal(jevRequests.length, calls);
   } finally { jev._setTypesafeKeyForTests('fixture-key'); }
+});
+
+
+test('exact conditional learning policy holds do not poison later ordinary sources or rewrite frozen cards', async () => {
+  const holds = [
+    { label: 'controlled', policy: { version: 1, mode: 'exclude', reason: 'controlled_test' } },
+    { label: 'owner', policy: { version: 1, mode: 'exclude', reason: 'owner_opt_out' } },
+    { label: 'malformed', policy: { version: 1, mode: 'allow', reason: 'controlled_test' } },
+  ];
+  for (const { label, policy } of holds) {
+    const tag = `policy-no-cooldown-${label}`;
+    const args = { users: `U-${tag}`, lookup_only: true };
+    const beforeScreen = jevRequests.length;
+    const beforeJudge = judgeRequests.length;
+    const held = await acceptedCall({ tag, operationId: OPEN_OPERATION,
+      schema: CONDITIONAL_SCHEMA, args, learningPolicy: policy });
+    const originalCard = assertAsks(held.result, 'excluded or unreadable accepted source keeps its card');
+    assert.equal(jevRequests.length, beforeScreen, 'no classifier work for held optional learning');
+    assert.equal(judgeRequests.length, beforeJudge, 'no confirmation work for held optional learning');
+    const basis = eventlog.listEvents(held.request.attestation.sessionId,
+      { types: ['exact_call_delivery_basis'] });
+    assert.equal(basis.length, 1);
+    assert.equal(basis[0]!.data.sourceUserSeq, held.request.attestation.sourceUserSeq);
+    assert.equal(basis[0]!.data.verdict, null, 'retain this call\'s exact first null basis');
+
+    const ordinary = await acceptedCall({ tag, operationId: OPEN_OPERATION,
+      schema: CONDITIONAL_SCHEMA, args });
+    assertProceedsWithoutCard(ordinary.result, 'a later ordinary source can earn its own exact proof');
+    assert.equal(jevRequests.length, beforeScreen + 1, 'one real classifier request, not a retry');
+    assert.equal(judgeRequests.length, beforeJudge + 1, 'one real configured confirmation');
+    const again = await consent.evaluateUncoveredHostMutationConsent(held.request);
+    assert.deepEqual(decided(again).call, originalCard.call,
+      'later learning cannot rewrite a frozen approval subject');
+    assertAsks(again, 'the original held source remains on its original card');
+    assert.equal(jevRequests.length, beforeScreen + 1, 'replay adds no semantic calls');
+    assert.equal(deliveryStore.learnedOperationDeliveryVerdict('composio', OPEN_OPERATION), null,
+      'an exact lookup proof never becomes an operation-wide waiver');
+  }
+});
+
+test('exact conditional learning follows its accepted source rather than a later same-session ambient source', async () => {
+  const cases = [
+    { label: 'ordinary-under-excluded', original: undefined,
+      ambient: { version: 1, mode: 'exclude', reason: 'controlled_test' }, learns: true },
+    { label: 'excluded-under-ordinary', original: { version: 1, mode: 'exclude', reason: 'controlled_test' },
+      ambient: undefined, learns: false },
+    { label: 'unavailable-under-ordinary', original: { version: 1, mode: 'allow', reason: 'controlled_test' },
+      ambient: undefined, learns: false },
+  ];
+  for (const row of cases) {
+    const beforeScreen = jevRequests.length;
+    const beforeJudge = judgeRequests.length;
+    const args = { users: `U-${row.label}`, lookup_only: true };
+    const own = await acceptedCall({ tag: `exact-source-${row.label}`, operationId: OPEN_OPERATION,
+      schema: CONDITIONAL_SCHEMA, args, learningPolicy: row.original,
+      ambientSibling: { learningPolicy: row.ambient } });
+    if (row.learns) assertProceedsWithoutCard(own.result, 'ordinary original source earns the exact lookup proof');
+    else assertAsks(own.result, 'ordinary ambient source cannot authorize held original learning');
+    assert.equal(jevRequests.length, beforeScreen + Number(row.learns));
+    assert.equal(judgeRequests.length, beforeJudge + Number(row.learns));
+    const basis = eventlog.listEvents(own.request.attestation.sessionId,
+      { types: ['exact_call_delivery_basis'] });
+    assert.equal(basis.length, 1);
+    assert.equal(basis[0]!.data.sourceUserSeq, own.request.attestation.sourceUserSeq,
+      'the actual producer binds the original accepted call, never the newer sibling');
+    assert.equal(basis[0]!.data.verdict !== null, row.learns);
+  }
 });

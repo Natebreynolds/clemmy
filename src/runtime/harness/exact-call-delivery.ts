@@ -5,10 +5,15 @@
 import { appendEvent, openEventLog } from './eventlog.js';
 import { hasAmbiguousDeliveryAction } from './external-capability-risk.js';
 import { exactDeliveryCallBindingDigest, type LoadCatalogManifestExternalRiskAttestationInputV1 } from './external-capability-risk-loader.js';
-import { learnOperationDelivery } from './learned-operation-delivery.js';
+import { learnOperationDelivery, type OperationDeliveryLearningOutcome } from './learned-operation-delivery.js';
 import { learnedOperationDeliveryVerdict, parseLearnedOperationDeliveryVerdictV1, type LearnedOperationDeliveryVerdictV1 } from './learned-operation-delivery-store.js';
 
-const inFlight = new Map<string, Promise<LearnedOperationDeliveryVerdictV1 | null>>();
+interface ExactDeliveryReading {
+  outcome: OperationDeliveryLearningOutcome;
+  verdict: LearnedOperationDeliveryVerdictV1 | null;
+}
+
+const inFlight = new Map<string, Promise<ExactDeliveryReading>>();
 const unsuccessful = new Map<string, number>();
 
 export async function exactCallDeliveryProof(input: {
@@ -57,21 +62,30 @@ export async function exactCallDeliveryProof(input: {
       let pending = inFlight.get(digest);
       if (!pending && inFlight.size < 2) {
         pending = (async () => {
-          await learnOperationDelivery({
+          const outcome = await learnOperationDelivery({
             providerKind: input.providerKind,
             operationId: request.binding.operationId,
             semanticName: input.semanticName,
             description: schema.description as string,
             inputSchema: schema,
             exactCall: { bindingDigest: digest, arguments: input.arguments },
-          }, { sessionId: input.sessionId });
-          return learnedOperationDeliveryVerdict(input.providerKind, request.binding.operationId, digest);
+          }, { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq });
+          // A source-policy hold is not a semantic answer or a cache miss.
+          // Never pick up a concurrently stored verdict on that held reading.
+          const policyHeld = outcome === 'learning_excluded' || outcome === 'learning_source_unavailable';
+          return { outcome, verdict: policyHeld ? null
+            : learnedOperationDeliveryVerdict(input.providerKind, request.binding.operationId, digest) };
         })();
         inFlight.set(digest, pending);
         void pending.finally(() => inFlight.delete(digest)).catch(() => {});
       }
-      verdict = pending ? await pending : null;
-      if (!verdict) {
+      const reading = pending ? await pending : null;
+      verdict = reading?.verdict ?? null;
+      // Preserve the existing cooldown for actual semantic/model outcomes.
+      // A policy-held source or lack of local capacity must not poison a
+      // later accepted source; this call still freezes its own null basis.
+      if (!verdict && reading && reading.outcome !== 'learning_excluded'
+        && reading.outcome !== 'learning_source_unavailable') {
         unsuccessful.set(digest, Date.now() + 10 * 60_000);
         if (unsuccessful.size > 500) unsuccessful.delete(unsuccessful.keys().next().value!);
       }

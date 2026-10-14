@@ -1320,10 +1320,10 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
             ? resolvedArgs as Record<string, unknown>
             : {},
         );
-        return refuse({ error: 'arg_validation', schema: prepared.schema,
+        return refuse({ error: 'arg_validation', detail: prepared.detail, violations: prepared.violations,
           ...(prepared.guidance ? { guidance: prepared.guidance } : {}),
           ...(next ? { next } : {}),
-          detail: prepared.detail, violations: prepared.violations });
+          schema: prepared.schema });
       }
       const dispatchArgs = prepared.status === 'prepared' ? prepared.args : resolvedArgs;
       // The canonical deferred schema stays authoritative for local open data;

@@ -146,9 +146,56 @@ for (const [type, expected] of [['external_write_succeeded', 'present'], ['exter
     assert.equal(auditResult.facts.blockingUncertainWrites, 1);
     events.closeEventLog();
     assert.deepEqual(read(task), result, 'resolution belongs to that same original call after re-entry');
+    // Exercise the existing authoritative terminal boundary to completion.
+    // This is not a claim that a generic readback producer minted that truth.
+    const secondReservation = resolved(task, 'two', type);
+    const complete = read(task);
+    assert.equal(complete.status, 'ok');
+    if (complete.status !== 'ok') throw new Error('exact terminal inventory unavailable');
+    assert.deepEqual(complete.pending, []);
+    assert.deepEqual(complete.resolved.map(row => row.reservationEventId).sort(),
+      [reservation.id, secondReservation.id].sort());
+    assert.ok(complete.resolved.every(row => row.resolution === expected));
+    const completeAudit = audit.auditAcceptedSourceSettlementTruth(task);
+    assert.equal(completeAudit.status, 'clean', JSON.stringify(completeAudit));
+    assert.equal(completeAudit.facts.blockingUncertainWrites, 0);
+    assert.equal(completeAudit.facts.unrecoveredBusinessFailures, 0);
+    const originals = events.openEventLog().prepare(`SELECT outcome_kind, outcome_detail, requires_reconciliation
+      FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ?
+        AND logical_tool_call_id IN ('one', 'two') ORDER BY logical_tool_call_id`)
+      .all(task.sessionId, task.sourceUserSeq);
+    assert.deepEqual(originals, [1, 2].map(() => ({ outcome_kind: 'uncertain_write',
+      outcome_detail: 'unacknowledged_mutation', requires_reconciliation: 1 })),
+    'resolution never rewrites the original unknown outcome or grants replay');
+    events.closeEventLog();
+    assert.deepEqual(read(task), complete, 'complete exact resolution survives database re-entry');
     leases.revokeDispatchLease(task.parentLease);
   });
 }
+
+test('an unsettled read and its later successful return cannot mint write-resolution authority', async () => {
+  const task = fixture();
+  await unknown(task, 'held');
+  const before = read(task);
+  let announceEntered!: () => void;
+  let releaseRead!: (value: unknown) => void;
+  const entered = new Promise<void>(resolve => { announceEntered = resolve; });
+  const pendingRead = call(task, 'readback-pending', 'read', () => new Promise(resolve => {
+    releaseRead = resolve;
+    announceEntered();
+  }));
+  await entered;
+  try {
+    assert.deepEqual(read(task), before, 'a read body in flight cannot clear the original write');
+    assert.equal(audit.auditAcceptedSourceSettlementTruth(task).status, 'in_flight');
+  } finally {
+    releaseRead({ successful: true, data: { record_id: 'held' } });
+    await pendingRead;
+    leases.revokeDispatchLease(task.parentLease);
+  }
+  assert.deepEqual(read(task), before, 'even a returned matching record is not a sealed original-write readback contract');
+  assert.equal(audit.auditAcceptedSourceSettlementTruth(task).status, 'uncertain_write');
+});
 
 test('generic execution reconciliation and account-conflicting terminals are not promoted', async () => {
   for (const data of [{ reconciledBy: 'execution_reconcile_write' }, { reconciledBy: 'artifact_ledger' }, { accountId: 'account:other' }]) {

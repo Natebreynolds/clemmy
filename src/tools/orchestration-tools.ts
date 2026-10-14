@@ -1107,14 +1107,15 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_create',
-    'Create a reusable workflow from the step graph you author. '
+    'Create directly under a new name; duplicates leave the existing workflow unchanged. '
       + WORKFLOW_TRANSFORM_INPUT_GUIDANCE
+      + 'Create a reusable workflow from the step graph you author. '
       + "Saved goals apply to EVERY future run: express correctness against current inputs, not today's example answer. Verify example-specific expected values after the current run. "
       + "For absolute-path file work, omit project unless the user selected a verified configured workspace. A file's parent directory is not a project binding. "
       + "Choose the executor for each job: exact known tool/arguments use `call`; parsing, filtering, counts, sums and data shaping use `transform`; use a model prompt for reasoning that those executors cannot express. An operation this turn already proved or discovered (its id and args are in the PROVEN OPERATION note or the tool_search result) IS known: author it as `call` with that exact operation id, literal args and time tokens ({{now}}, {{now+24h}}, {{date}}), not as a prompt step that re-describes the read; the host binds the account. Do not turn deterministic arithmetic into a model step. Transforms are closed v1 JSON expressions; their schema lists the operations. Raw script runners are legacy and refused. "
       + "Keep meaningful steps and declare sideEffect (read/write/send), dependsOn for required upstream data, and output contracts for downstream consumers. `inputs` binds tool arguments from input.<key> or steps.<id>.output.<path>. Upstream outputs also arrive in STEP CONTEXT. Independent branches can run concurrently; forEach handles collections. Heavy read-only analysis can use subgraph read_parallel_v1 with 2–6 result-only specialists; keep fetches and effects separate. "
       + "Enabling provides one-time workflow consent; requiresApproval can pause irreversible actions. Sends never auto-retry; interrupted writes/sends need reconciliation. Declare loopSafe only for genuinely idempotent writes. A saved goal is checked at completion; max_attempts bounds re-pursuit and irreversible effects prevent replay. "
-      + "Create directly under a new name; duplicates leave the existing workflow unchanged. Use workflow_list for discovery/comparison and workflow_get before updates. The host validates your graph and never invents missing business steps.",
+      + "Use workflow_list for discovery/comparison and workflow_get before updates. The host validates your graph and never invents missing business steps.",
     {
       name: z.string().min(1),
       description: z.string().min(1),

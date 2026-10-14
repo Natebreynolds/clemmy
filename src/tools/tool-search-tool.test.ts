@@ -1966,6 +1966,10 @@ test('native transform help examples: broad create summary teaches executable JS
   const row = body.results[0];
   assert.equal(row.summary, create.description.slice(0, 600), 'the example comes from registered help on the actual discovery surface');
   assert.ok(row.summary.length <= 600);
+  assert.match(row.summary, /Create directly under a new name; duplicates leave the existing workflow unchanged\./,
+    'direct safe creation and duplicate preservation are visible without listing unrelated workflows');
+  assert.match(row.summary, /The tool schema supplies syntax; a saved-workflow lookup is not a prerequisite\./,
+    'the complete no-lookup prerequisite sentence remains beside the executable example');
   assertWorkflowTransformDiscoveryGrammar(row.summary, 'broad create summary');
   const example = documentedTransformExample(row.summary, 'broad create summary');
   await assertRuntimeRowsExample(example, 'broad create summary');

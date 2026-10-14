@@ -2444,7 +2444,7 @@ test('a carried local tool that returns an image delivers image content, never b
   const { spaceStore } = await import('../spaces/store.js');
   const png = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000', 'hex');
   const browser = path.join(TMP_HOME, 'fake-carried-preview-browser.js');
-  writeFileSync(browser, `#!/usr/bin/env node
+  writeFileSync(browser, `#!${process.execPath}
 const fs = require('node:fs');
 const shot = process.argv.find((v) => v.startsWith('--screenshot=')).slice('--screenshot='.length);
 fs.writeFileSync(shot, Buffer.from('${png.toString('hex')}', 'hex'));
@@ -2536,5 +2536,93 @@ test('a carried read naming its identifier the way another tool does is complete
     assert.ok(!(received && typeof received === 'object' && 'space_id' in received), 'the dispatched arguments carry only the schema name');
   } finally {
     _setInnerDispatchToolsForTests(null);
+  }
+});
+
+
+test('native workflow_update schema refusal exposes repair details before its complete schema', async () => {
+  _resetHotSetForTest();
+  _resetCallToolSchemaCacheForTest();
+  const { z } = await import('zod');
+  const { InvalidArgumentsPreDispatchResult } = await import('../runtime/harness/attempt-settlement.js');
+  const { withLogicalToolCall } = await import('../runtime/harness/attempt-identity.js');
+  const nativeSchema = getLocalToolSchemas().get('workflow_update');
+  assert.ok(nativeSchema, 'use the actual registered native workflow_update parser');
+  const authoritativeSchema = z.toJSONSchema(nativeSchema);
+  assert.ok(JSON.stringify(authoritativeSchema).length > 8_000,
+    'exercise a real schema larger than the ordinary event-preview prefix');
+
+  let dispatches = 0;
+  _setInnerDispatchToolsForTests(new Map([['workflow_update', {
+    name: 'workflow_update',
+    invoke: async () => {
+      dispatches += 1;
+      throw new Error('invalid workflow_update arguments must never reach the body');
+    },
+  }]]));
+  const callTool = buildCallTool({ reachableBuiltinNames: new Set(['workflow_update']) }) as unknown as ToolLike;
+  const outputs: Array<{ serialized: string; repairKey: string }> = [];
+  try {
+    // `enabled` belongs to workflow_set_enabled, not workflow_update. Changing
+    // only its offered value must not create a different repair stage.
+    for (const enabled of [false, true]) {
+      const sessionId = `sess-workflow-update-error-order-${enabled}`;
+      const callId = `call-workflow-update-error-order-${enabled}`;
+      const accepted = acceptedSourceForCallToolFixture(sessionId);
+      const carrierArgs = {
+        name: 'workflow_update',
+        args_json: JSON.stringify({ name: 'round18-never-dispatched-workflow', enabled }),
+      };
+      const output = await withLogicalToolCall({
+        sessionId, sourceUserSeq: accepted.sourceUserSeq, logicalToolCallId: callId,
+        tool: 'call_tool', args: carrierArgs,
+      }, () => invokeCallToolFixture(callTool, sessionId, JSON.stringify(carrierArgs), callId));
+      assert.ok(output instanceof InvalidArgumentsPreDispatchResult,
+        'serialization must retain the nominal pre-dispatch refusal');
+      const serialized = String(output);
+      const parsed = JSON.parse(serialized);
+      assert.equal(parsed.error, 'arg_validation');
+      assert.equal(parsed.detail, '(root): Unrecognized key: "enabled"');
+      assert.deepEqual(parsed.violations, ['enabled']);
+      assert.deepEqual(parsed.schema, authoritativeSchema,
+        'the complete schema equals the real native authority, including annotations');
+      assert.match(String(output.repairKey), /^[a-f0-9]{32}$/);
+      outputs.push({ serialized, repairKey: output.repairKey! });
+      assert.equal(dispatches, 0, 'native argument validation must precede dispatch');
+      assert.ok(!getHotSet(sessionId).includes('workflow_update'), 'a refusal is not a reached tool');
+
+      const redeemed = settlements.redeemDurableLogicalCallSettlementForHost({
+        sessionId,
+        sourceUserSeq: accepted.sourceUserSeq,
+        acceptedTaskId: acceptedTaskIdFor(sessionId, accepted.sourceUserSeq),
+        logicalToolCallId: callId,
+      });
+      assert.equal(redeemed.status, 'ok', 'the actual carrier leaves an adoptable refusal');
+      if (redeemed.status !== 'ok') throw new Error('missing pre-dispatch refusal settlement');
+      assert.equal(redeemed.settlement.identity.logicalToolCallId, callId);
+      assert.equal(redeemed.settlement.identity.sourceUserSeq, accepted.sourceUserSeq);
+      assert.equal(redeemed.settlement.executionKind, 'refused_pre_dispatch');
+      assert.equal(redeemed.settlement.physicalCrossingCount, 0);
+    }
+    assert.equal(outputs[0]!.repairKey, outputs[1]!.repairKey,
+      'same failing path retains the same value-free repair key');
+
+    // Check presentation only after the producer/schema/settlement controls.
+    // The full JSON intentionally changes order; its full schema does not.
+    for (const { serialized } of outputs) {
+      const schemaOffset = serialized.indexOf('"schema":');
+      const detailOffset = serialized.indexOf('"detail":');
+      const violationsOffset = serialized.indexOf('"violations":');
+      assert.ok(schemaOffset >= 0 && detailOffset >= 0 && violationsOffset >= 0);
+      assert.ok(detailOffset < schemaOffset && violationsOffset < schemaOffset,
+        'actionable native validation detail and paths must precede the large schema');
+      const boundedPrefix = serialized.slice(0, 512);
+      assert.ok(boundedPrefix.includes(JSON.stringify('(root): Unrecognized key: "enabled"')),
+        'a bounded preview contains the exact corrective, not only schema boilerplate');
+      assert.ok(boundedPrefix.includes('"violations":["enabled"]'));
+    }
+  } finally {
+    _setInnerDispatchToolsForTests(null);
+    _resetCallToolSchemaCacheForTest();
   }
 });

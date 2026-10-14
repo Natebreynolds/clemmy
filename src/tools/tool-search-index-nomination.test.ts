@@ -200,14 +200,19 @@ function nominate(identifier: string, carrier = 'outlook'): void {
   }]);
 }
 
-async function composioCandidates(query: string, signal?: AbortSignal, deadlineAt?: number) {
+async function composioCandidates(
+  query: string,
+  signal?: AbortSignal,
+  deadlineAt?: number,
+  planningIdentity?: { sessionId: string; sourceUserSeq: number },
+) {
   const sources = providerSources.buildAuthorizedToolSearchCandidateSources({
     reason: 'index nomination proof',
     authority: 'catalog',
     allowedServerSlugs: [],
     toolPatterns: [],
     maxTools: 0,
-  } as never);
+  } as never, planningIdentity);
   const source = sources.find((entry) => entry.kind === 'authorized_composio');
   assert.ok(source, 'the composio candidate source must exist');
   return source!.search({ query, limit: 8, signal, deadlineAt });
@@ -1179,7 +1184,15 @@ test('a matching Tool Memory row receives the live fingerprint without a provide
   const live = schemaCache.liveComposioSchemaFingerprint(CREATE_EVENT);
   assert.ok(live);
 
-  await composioCandidates(CREATE_EVENT, undefined, Date.now() + 2_000);
+  const session = eventlog.createSession({ id: 'owned-tool-memory-fingerprint', kind: 'chat' });
+  const attempt = eventlog.beginRunAttempt(session.id, {});
+  const accepted = eventlog.recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Find the exact Outlook calendar create operation.', attemptId: attempt.attemptId },
+  }, { armRunInFlight: true });
+  const identity = { sessionId: session.id, sourceUserSeq: accepted.seq };
+  await composioCandidates(CREATE_EVENT, undefined, Date.now() + 2_000, identity);
   assert.equal(toolChoices.peekToolChoice(intent)?.choice?.schemaFingerprint, live);
   assert.equal(exactLookups.length, 0);
 });
