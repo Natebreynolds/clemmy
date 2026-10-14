@@ -1,5 +1,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { startLivenessBeacon, stampLiveness } from './liveness-beacon.js';
+import { startLoopHoldMonitor, type LoopKnownPoint } from './loop-holds.js';
 
 const SUPERVISOR_IPC_HEARTBEAT_TYPE = 'clementine.daemon.heartbeat';
 const DEFAULT_SUPERVISOR_IPC_HEARTBEAT_INTERVAL_MS = 5_000;
@@ -89,6 +92,18 @@ function cleanDetail(detail: unknown): string | undefined {
   return text.trim().slice(0, MAX_DETAIL_CHARS) || undefined;
 }
 
+/** The last known points at which a phase took the main thread, so a hold
+ *  the loop-hold monitor measures can be split among the phases that ran. */
+const KNOWN_POINT_CAPACITY = 512;
+const knownPoints: LoopKnownPoint[] = [];
+let knownPointNext = 0;
+function noteKnownPoint(phase: StoredDaemonRuntimePhase): void {
+  const point: LoopKnownPoint = { at: performance.now(), name: phase.name, ...(phase.detail ? { detail: phase.detail } : {}) };
+  if (knownPoints.length < KNOWN_POINT_CAPACITY) knownPoints.push(point);
+  else knownPoints[knownPointNext] = point;
+  knownPointNext = (knownPointNext + 1) % KNOWN_POINT_CAPACITY;
+}
+
 function supervisorSend(): ((message: unknown) => boolean) | undefined {
   const owner = process as NodeJS.Process & { send?: (message: unknown) => boolean };
   return typeof owner.send === 'function' ? owner.send.bind(owner) : undefined;
@@ -136,6 +151,7 @@ function ownerAtKnownPoint(phase: StoredDaemonRuntimePhase | undefined, nowMs: n
 /** Tell the beacon where the main thread is: a few float stores, plus one post
  *  only when the running phase or the in-flight set changed. Never sends IPC. */
 function stampBeacon(): void {
+  noteKnownPoint(runningPhase);
   stampLiveness(runningPhase, inFlightVersion, meteredInFlight > 0, listStoredInFlight);
 }
 
@@ -247,6 +263,7 @@ export function sendSupervisorIpcHeartbeat(reason: 'heartbeat' | 'phase' | 'phas
   // Stamp the loop-independent beacon FIRST and unconditionally. It is the
   // signal that survives a blocked event loop, so it must not sit behind the
   // IPC channel's availability check below.
+  if (reason !== 'heartbeat') noteKnownPoint(runningPhase);
   stampLiveness(runningPhase, inFlightVersion, meteredInFlight > 0, listStoredInFlight);
   const send = supervisorSend();
   if (typeof send !== 'function') return;
@@ -269,8 +286,20 @@ export function startSupervisorIpcHeartbeat(intervalMs = DEFAULT_SUPERVISOR_IPC_
   // started even if the parent gave us no IPC, and it keeps reporting when the
   // interval below can no longer fire because the loop is blocked.
   startLivenessBeacon();
+  startLoopHolds();
   if (typeof supervisorSend() !== 'function') return;
   sendSupervisorIpcHeartbeat();
   const timer = setInterval(() => sendSupervisorIpcHeartbeat(), intervalMs);
   timer.unref?.();
+}
+
+let loopHoldsStarted = false;
+/** Journal main-loop holds beside the liveness beacon. No beacon file (CLI,
+ *  tests, headless) means no journal. */
+function startLoopHolds(): void {
+  if (loopHoldsStarted) return;
+  const beacon = process.env.CLEMMY_LIVENESS_BEACON_FILE?.trim();
+  if (!beacon) return;
+  loopHoldsStarted = true;
+  startLoopHoldMonitor({ file: path.join(path.dirname(beacon), 'daemon-loop-holds.jsonl'), readPoints: () => knownPoints });
 }
