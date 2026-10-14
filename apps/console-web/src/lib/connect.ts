@@ -216,6 +216,8 @@ export interface McpServer {
   unsetEnvKeys?: string[];
   builtin?: boolean;
   type?: string;
+  description?: string;
+  source?: string;
   [k: string]: unknown;
 }
 export interface McpToolSummary { name: string; description?: string }
@@ -372,18 +374,26 @@ export const getMcpServerTools = (name: string) =>
 export interface McpServerInput {
   name: string;
   type: 'stdio' | 'http' | 'sse';
+  enabled?: boolean;
   description?: string;
   command?: string;
   args?: string[];
   url?: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
 }
 export const addMcpServer = (body: McpServerInput) => apiPost('/api/console/mcp-servers', body);
+export const setMcpServerEnabled = (name: string, enabled: boolean) =>
+  api(`/api/console/mcp-servers/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) });
+export const reconnectMcpServer = (name: string) =>
+  apiPost(`/api/console/mcp-servers/${encodeURIComponent(name)}/reconnect`);
 export const deleteMcpServer = (name: string) =>
   api(`/api/console/mcp-servers/${encodeURIComponent(name)}`, { method: 'DELETE' });
 // Human-only credential entry for an MCP server's declared env key. The value is
 // written to the daemon env + the server reconnects. Never echoed back.
 export const setMcpCredential = (name: string, key: string, value: string) =>
-  apiPost(`/api/console/mcp-servers/${encodeURIComponent(name)}/credential`, { key, value });
+  apiPost<{ ok: boolean; state?: 'disabled' | 'needs_credentials' | 'connecting' | 'connected' | 'unavailable'; toolCount?: number }>(
+    `/api/console/mcp-servers/${encodeURIComponent(name)}/credential`, { key, value });
 export const getClis = () => apiGet<{ clis?: CliRow[]; cliCount?: number; detectedCount?: number }>('/api/console/clis');
 // User-saved CLIs the user explicitly told Clementine they use.
 export const getSavedClis = () => apiGet<{ saved: string[]; health?: Record<string, CliHealth> }>('/api/console/clis/saved');
@@ -427,7 +437,7 @@ export interface CatalogEntry {
   installed?: boolean; resolvedPath?: string; score?: number;
 }
 export interface ConnectedCli {
-  id: string; command: string; vendor: string; name: string; installedAt: string; authDocsUrl: string; authCommand?: string;
+  id: string; command: string; vendor: string; name: string; installedAt?: string; authDocsUrl: string; authCommand?: string;
   authHeadless?: boolean;
 }
 /** Persisted auth-health snapshot for a roster CLI (id = catalog id or `saved:<command>`). */
@@ -435,7 +445,18 @@ export interface CliHealth {
   id: string; command: string; installed: boolean;
   authStatus: 'ok' | 'signed_out' | 'unknown' | 'error';
   username?: string; checkedAt: string;
+  issue?: 'credential_store_unavailable' | 'configuration_required';
+  staleSince?: string;
+  lastProbeError?: { timedOut: boolean; exitCode: number | null };
 }
+/** Passive connection metadata: fetching this never starts CLI discovery or sign-in. */
+export interface CliConnectionSnapshot {
+  connected: Record<string, ConnectedCli>;
+  saved: string[];
+  health: Record<string, CliHealth>;
+  authRequired: Record<string, boolean>;
+}
+export const getCliConnections = () => apiGet<CliConnectionSnapshot>('/api/console/clis/connections');
 export interface CatalogResp {
   query: string; results: CatalogEntry[]; connected: Record<string, ConnectedCli>; autoPromoted: string[];
   health?: Record<string, CliHealth>;

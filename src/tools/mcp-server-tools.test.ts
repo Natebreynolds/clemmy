@@ -8,9 +8,42 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { validateMcpServerConfig, serverEnvStatus } from './mcp-server-tools.js';
+import { validateMcpServerConfig, serverEnvStatus, registerMcpServerTools } from './mcp-server-tools.js';
 import { rankMcpToolInventory } from './mcp-status-tools.js';
 import { classifyTool } from '../agents/tool-taxonomy.js';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { MCP_SERVERS_FILE } from '../config.js';
+import { discoverMcpServers, invalidateMcpServerDiscoveryCache } from '../runtime/mcp-config.js';
+import { listMcpServerHealth } from '../runtime/mcp-namespace-shim.js';
+
+for (const requestedName of ['controlled-cache', 'CONTROLLED-CACHE']) {
+  test(`mcp_add cannot overwrite a fresh file definition hidden by cached discovery: ${requestedName}`, async () => {
+    assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1', 'Use the isolated runner for private configuration controls.');
+    const original = existsSync(MCP_SERVERS_FILE) ? readFileSync(MCP_SERVERS_FILE) : undefined;
+    const handlers = new Map<string, (args: unknown) => Promise<unknown>>();
+    registerMcpServerTools({ tool(name: string, ...args: unknown[]) {
+      handlers.set(name, args.at(-1) as (args: unknown) => Promise<unknown>);
+    } } as unknown as Parameters<typeof registerMcpServerTools>[0]);
+    mkdirSync(path.dirname(MCP_SERVERS_FILE), { recursive: true });
+    try {
+      writeFileSync(MCP_SERVERS_FILE, '{}');
+      invalidateMcpServerDiscoveryCache();
+      assert.deepEqual(discoverMcpServers(), [], 'prime an empty discovery cache');
+      const fresh = JSON.stringify({ 'controlled-cache': { type: 'stdio', command: '/synthetic/must-not-launch', enabled: false } });
+      writeFileSync(MCP_SERVERS_FILE, fresh); // Simulate a separate writer without refreshing this process's discovery cache.
+      const healthBefore = listMcpServerHealth();
+      const result = await handlers.get('mcp_add')!({ name: requestedName, type: 'stdio', command: '/synthetic/must-not-launch',
+        required_env_keys: ['CONTROLLED_MCP_KEY_THAT_IS_NOT_SET'] });
+      assert.match(JSON.stringify(result), /mcp_add refused/);
+      assert.equal(readFileSync(MCP_SERVERS_FILE, 'utf8'), fresh, 'refusal preserves exact current configuration bytes');
+      assert.deepEqual(listMcpServerHealth(), healthBefore, 'collision is refused before setup/connection observation');
+    } finally {
+      if (original) writeFileSync(MCP_SERVERS_FILE, original); else unlinkSync(MCP_SERVERS_FILE);
+      invalidateMcpServerDiscoveryCache();
+    }
+  });
+}
 
 test('validateMcpServerConfig: accepts well-formed stdio/http, rejects malformed', () => {
   assert.equal(validateMcpServerConfig({ name: 'dataforseo', type: 'stdio', command: 'npx' }), null);

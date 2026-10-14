@@ -230,11 +230,13 @@ import {
 } from '../runtime/mobile-sessions.js';
 import { getManagedCliJob, startManagedCliJob, type ManagedCliAction, type ManagedCliKind } from '../runtime/managed-cli-jobs.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
+import { mcpServerCreateSummary, prepareMcpServerCreateRequest } from '../runtime/mcp-server-request.js';
 import { buildDevFlagsSnapshot, setDevFlag, clearDevFlag, setDevMode, isDevModeEnabled } from '../runtime/dev-flags.js';
 import {
   getOrCreateExternalMcpServers,
   invalidateConfiguredMcpServers,
   prewarmMcpServers,
+  observeConfiguredMcpServerSetup,
   reconnectConfiguredMcpServer,
 } from '../runtime/mcp-servers.js';
 import {
@@ -7713,6 +7715,59 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Polling connection state must not discover executables, promote records,
+  // or refresh authentication. Explicit setup/check actions own that work.
+  app.get('/api/console/clis/connections', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
+      const { readPersistedHealth } = await import('../integrations/cli-catalog/auth-health.js');
+      const connected = Object.fromEntries(Object.entries(readConnectedClis()).flatMap(([id, record]) => {
+        const entry = CLI_CATALOG.find((candidate) => candidate.id === id);
+        if (!record || !entry || record.command !== entry.command) return [];
+        // Public metadata comes from the catalog, not persisted probe/job data.
+        return [[id, {
+          id: entry.id, command: entry.command, name: entry.name, vendor: entry.vendor,
+          ...(typeof record.installedAt === 'string' ? { installedAt: record.installedAt } : {}),
+          authDocsUrl: entry.authDocsUrl,
+          ...(entry.authCommand ? { authCommand: entry.authCommand } : {}),
+          ...(typeof entry.authHeadless === 'boolean' ? { authHeadless: entry.authHeadless } : {}),
+        }]];
+      }));
+      const health = Object.fromEntries(Object.entries(readPersistedHealth()).flatMap(([id, value]) => {
+        if (!value || typeof value.id !== 'string' || typeof value.command !== 'string'
+          || typeof value.installed !== 'boolean' || typeof value.checkedAt !== 'string'
+          || !['ok', 'signed_out', 'unknown', 'error'].includes(value.authStatus)) return [];
+        return [[id, {
+          id: value.id, command: value.command, installed: value.installed,
+          authStatus: value.authStatus, checkedAt: value.checkedAt,
+          ...(typeof value.username === 'string' && value.username.length >= 1 && value.username.length <= 160
+            && !/[\s\p{Cc}/\\:<>]/u.test(value.username) ? { username: value.username } : {}),
+          ...(['credential_store_unavailable', 'configuration_required'].includes(value.issue ?? '')
+            ? { issue: value.issue } : {}),
+          ...(typeof value.staleSince === 'string' ? { staleSince: value.staleSince } : {}),
+          ...(value.lastProbeError && typeof value.lastProbeError === 'object' ? {
+            lastProbeError: {
+              timedOut: value.lastProbeError.timedOut === true,
+              exitCode: typeof value.lastProbeError.exitCode === 'number' && Number.isInteger(value.lastProbeError.exitCode)
+                ? value.lastProbeError.exitCode : null,
+            },
+          } : {}),
+        }]];
+      }));
+      const authRequired: Record<string, boolean> = {};
+      for (const entry of CLI_CATALOG) {
+        if (!entry.authCommand && !entry.authProbe) continue;
+        authRequired[entry.id] = true;
+        authRequired[entry.command] = true;
+        authRequired[`saved:${entry.command}`] = true;
+      }
+      res.json({ connected, saved: getSavedClis(), health, authRequired });
+    } catch {
+      res.status(500).json({ error: 'Could not read CLI connection state.' });
+    }
+  });
+
   // User-saved CLIs — the tools the user has explicitly told Clementine they
   // use (works even when the PATH scan can't see/probe them, e.g. sf).
   app.get('/api/console/clis/saved', async (req, res) => {
@@ -11533,11 +11588,12 @@ export function registerConsoleRoutes(
         const h = health.find((x) => x.slug === slugifyServerName(s.name) || x.name === s.name);
         const { declaredEnvKeys, unsetEnvKeys } = serverEnvStatus(s);
         return {
-          ...s,
+          ...mcpServerCreateSummary(s),
+          source: s.source,
           state: h?.state ?? 'unknown',
           toolCount: h?.toolCount,
           failureCount: h?.failureCount ?? 0,
-          lastError: h?.lastError,
+          lastError: h?.lastError ? 'The server could not connect. Check its setup and try again.' : undefined,
           declaredEnvKeys,
           unsetEnvKeys,
         };
@@ -11559,9 +11615,16 @@ export function registerConsoleRoutes(
         },
         ...externalServers.filter((server) => slugifyServerName(server.name) !== 'clementine-local'),
       ];
-      res.json({ servers, userOverrides: user });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      const userOverrides = Object.fromEntries(Object.entries(user).map(([name, server]) => [name, {
+        ...mcpServerCreateSummary({
+          name, type: server.type ?? 'stdio', enabled: server.enabled !== false, description: server.description,
+        }),
+        source: 'user',
+        ...serverEnvStatus(server),
+      }]));
+      res.json({ servers, userOverrides });
+    } catch {
+      res.status(500).json({ error: 'Could not load the MCP server list. Try refreshing the list.' });
     }
   });
 
@@ -11740,45 +11803,25 @@ export function registerConsoleRoutes(
 
   app.post('/api/console/mcp-servers', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const body = (req.body ?? {}) as Record<string, unknown>;
-    const name = typeof body.name === 'string' ? body.name.trim() : '';
-    if (!name || !/^[A-Za-z0-9_.-]{2,40}$/.test(name)) {
-      res.status(400).json({ error: 'name required (2-40 chars, alphanumeric / _ . -)' });
-      return;
-    }
-    const type = body.type === 'http' || body.type === 'sse' ? body.type : 'stdio';
-    const enabled = body.enabled !== false;
-    const description = typeof body.description === 'string' ? body.description : undefined;
-    const command = typeof body.command === 'string' ? body.command : undefined;
-    const args = Array.isArray(body.args) ? body.args.filter((a): a is string => typeof a === 'string') : undefined;
-    const url = typeof body.url === 'string' ? body.url : undefined;
-    const headers = body.headers && typeof body.headers === 'object' && !Array.isArray(body.headers)
-      ? Object.fromEntries(Object.entries(body.headers as Record<string, unknown>).filter(([, v]) => typeof v === 'string')) as Record<string, string>
-      : undefined;
-    const env = body.env && typeof body.env === 'object' && !Array.isArray(body.env)
-      ? Object.fromEntries(Object.entries(body.env as Record<string, unknown>).filter(([, v]) => typeof v === 'string')) as Record<string, string>
-      : undefined;
-
-    if (type === 'stdio' && !command) {
-      res.status(400).json({ error: 'stdio servers require a command (e.g. "npx @modelcontextprotocol/server-filesystem")' });
-      return;
-    }
-    if ((type === 'http' || type === 'sse') && !url) {
-      res.status(400).json({ error: `${type} servers require a url` });
-      return;
-    }
-
     try {
       const current = loadUserMcpServers();
-      current[name] = { name, type, enabled, description, command, args, url, headers, env };
-      saveUserMcpServers(current);
+      const prepared = prepareMcpServerCreateRequest(req.body, {
+        existingNames: [...Object.keys(current), ...discoverMcpServers().map((server) => server.name)],
+        slugifyName: slugifyServerName,
+      });
+      if (!prepared.ok) {
+        res.status(prepared.status).json({ error: prepared.error, code: prepared.code });
+        return;
+      }
+      const { server } = prepared;
+      saveUserMcpServers({ ...current, [server.name]: server });
       // Drop the cached MCP shim + autonomy agents so the next chat
       // request picks up the new server. No daemon restart needed.
       await invalidateConfiguredMcpServers();
       clearAutonomyAgentCache();
-      res.status(201).json({ server: current[name] });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      res.status(201).json({ server: mcpServerCreateSummary(server) });
+    } catch {
+      res.status(500).json({ error: 'Could not finish adding the MCP server. Refresh the server list before trying again.' });
     }
   });
 
@@ -11817,9 +11860,16 @@ export function registerConsoleRoutes(
       saveUserMcpServers(current);
       await invalidateConfiguredMcpServers();
       clearAutonomyAgentCache();
-      res.json({ server: current[name] });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      const server = current[name];
+      res.json({ server: {
+        ...mcpServerCreateSummary({
+          name, type: server.type ?? 'stdio', enabled: server.enabled !== false, description: server.description,
+        }),
+        source: server.source === 'auto-detected' ? 'auto-detected' : 'user',
+        ...serverEnvStatus(server),
+      } });
+    } catch {
+      res.status(500).json({ error: 'Could not finish updating the MCP server. Refresh the server list before trying again.' });
     }
   });
 
@@ -11849,7 +11899,8 @@ export function registerConsoleRoutes(
       }
       updateEnvKey(key, value); // writes .env + mirrors process.env (value never logged)
       await invalidateConfiguredMcpServers(); // reconnect picks up the new credential
-      res.json({ ok: true, server: name, key, set: true });
+      const setup = await observeConfiguredMcpServerSetup(server.name);
+      res.json({ ok: true, server: name, key, set: true, ...setup });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

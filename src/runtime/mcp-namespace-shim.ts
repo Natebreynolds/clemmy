@@ -657,6 +657,7 @@ export interface MCPServerHealthSnapshot {
 // is shim-agnostic so /api/console/mcp/health doesn't need to know
 // which shim each server belongs to). Cleared on shim close().
 const HEALTH_REGISTRY = new Map<string, MCPServerHealthSnapshot>();
+const HEALTH_OWNERS = new WeakMap<MCPServerHealthSnapshot, object>();
 
 /** Read-only snapshot of all MCP server health. Sorted by slug for
  *  stable rendering. */
@@ -833,6 +834,8 @@ export type McpNamespaceShim = MCPServer & {
   prewarm: () => Promise<boolean>;
   /** Await real metadata; never return advertisement placeholders as evidence. */
   listToolsAuthoritative: MCPServer['listTools'];
+  /** Host-only validity for inventory observers/indexers that complete later. */
+  captureConnectionLifetime: () => () => boolean;
   /** The listing a discovery search uses: holds for a warming server until the
    *  caller's deadline before it settles for the connecting stub. */
   listToolsWaiting: (opts: { deadlineAt: number }) => Promise<MCPTool[]>;
@@ -843,6 +846,23 @@ export type McpNamespaceShim = MCPServer & {
 
 export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNamespaceShim {
   const { servers, name = 'clemmy-mcp', cacheToolsList = true } = options;
+  const healthOwner = {};
+  let healthClosed = false;
+  let connectionLifetime = 0;
+  const serverConnectionLifetimes = new Map<MCPServer, number>();
+  const captureConnectionLifetime = (): (() => boolean) => {
+    const captured = connectionLifetime;
+    return () => !healthClosed && captured === connectionLifetime;
+  };
+  const captureServerConnectionLifetime = (server: MCPServer): (() => boolean) => {
+    const captured = serverConnectionLifetimes.get(server) ?? 0;
+    return () => !healthClosed && captured === (serverConnectionLifetimes.get(server) ?? 0);
+  };
+  const publishHealth = (slug: string, snapshot: MCPServerHealthSnapshot): void => {
+    if (healthClosed) return;
+    HEALTH_OWNERS.set(snapshot, healthOwner);
+    HEALTH_REGISTRY.set(slug, snapshot);
+  };
 
   // Index servers by their slugified name. Detect collisions on slug
   // (rare but possible: "Foo Bar" and "foo-bar" both → "foo_bar").
@@ -868,7 +888,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     // immediately shows what servers exist even before any connect
     // attempt has resolved. Updated by syncHealthRegistry on transitions.
     if (!HEALTH_REGISTRY.has(slug)) {
-      HEALTH_REGISTRY.set(slug, {
+      publishHealth(slug, {
         slug,
         name: server.name,
         state: 'connecting',
@@ -973,7 +993,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     // Fire ONE user notification per server-down event (rate-limited
     // to 10 min). Without this, a flapping server spams the log; with
     // it the user gets one actionable message and the rest aggregate.
-    if (next.state === 'unavailable') {
+    if (next.state === 'unavailable' && !healthClosed) {
       const slug = serverSlugs.get(server) ?? server.name;
       rateLimitedAlert(`mcp-server-down-${slug}`, {
         title: `MCP server "${server.name}" is unavailable`,
@@ -1068,7 +1088,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       state = 'degraded';
     }
     const toolCount = lastToolCounts.get(server) ?? 0;
-    HEALTH_REGISTRY.set(slug, {
+    publishHealth(slug, {
       slug,
       name: server.name,
       state,
@@ -1085,6 +1105,8 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
   }
 
   async function ensureConnected(server: MCPServer): Promise<void> {
+    const isCurrentLifetime = captureServerConnectionLifetime(server);
+    if (!isCurrentLifetime()) throw new Error('MCP connection was retired');
     if (typeof server.connect !== 'function') return;
     // Backoff guard — if we just tried and failed, don't immediately
     // retry; let the next listTools call after nextRetryAt elapses
@@ -1098,13 +1120,16 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     const existing = connectPromises.get(server);
     if (existing) {
       await existing;
+      if (!isCurrentLifetime()) throw new Error('MCP connection was retired');
       return;
     }
     const promise = (async () => {
       try {
         await withTimeout(server.connect!(), mcpConnectTimeoutMs(), `mcp.connect[${server.name}]`);
+        if (!isCurrentLifetime()) throw new Error('MCP connection was retired');
         markServerConnected(server);
       } catch (err) {
+        if (!isCurrentLifetime()) throw err;
         // Clear so a future call can retry instead of resolving instantly.
         connectPromises.delete(server);
         markServerFailed(server, err);
@@ -1158,6 +1183,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     authoritative = false,
     attachBudgetMs: number = attachConnectBudgetMs(),
   ): Promise<{ tools: MCPTool[]; routing: Map<string, MCPServer>; allConnected: boolean }> {
+    const isCurrentLifetime = captureConnectionLifetime();
     const tools: MCPTool[] = [];
     const routing = new Map<string, MCPServer>(); // namespaced name -> underlying server
     const skipUnconnected = !authoritative && attachConnectedOnly();
@@ -1210,6 +1236,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
           return { server, slug, list: [] as MCPTool[], status: err instanceof ServerWarmingError ? 'pending' as const : 'failed' as const };
         }
 
+        if (!isCurrentLifetime()) return { server, slug, list: [] as MCPTool[], status: 'failed' as const };
         // Phase 2 — connected; list its tools. A listTools failure is FIRST seen
         // here (connect succeeded), so this is the right place to mark it failed.
         try {
@@ -1218,12 +1245,13 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
             mcpListToolsTimeoutMs(),
             `mcp.listTools[${server.name}]`,
           );
+          if (!isCurrentLifetime()) throw new Error('MCP tool inventory connection was retired');
           lastToolCounts.set(server, list.length);
           markServerConnected(server);
           return { server, slug, list, status: 'ok' as const };
         } catch (err) {
           logger.warn({ server: server.name, err: err instanceof Error ? err.message : String(err) }, 'MCP server listTools failed; surfacing as unavailable stub');
-          markServerFailed(server, err);
+          if (isCurrentLifetime()) markServerFailed(server, err);
           return { server, slug, list: [] as MCPTool[], status: 'failed' as const };
         }
       }),
@@ -1281,11 +1309,14 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
   }
 
   async function listToolsWithAttachBudget(attachBudgetMs: number): Promise<MCPTool[]> {
+    const isCurrentLifetime = captureConnectionLifetime();
+    if (!isCurrentLifetime()) throw new Error('MCP tool inventory connection was retired');
     if (cacheToolsList && cachedTools && cachedToolToServer && cachedLabelStamp === mcpToolEffectLabelStamp()) {
       return cachedTools;
     }
     const labelStamp = mcpToolEffectLabelStamp();
     const { tools, routing, allConnected } = await buildFlattenedTools(false, attachBudgetMs);
+    if (!isCurrentLifetime()) throw new Error('MCP tool inventory connection was retired');
     // Cache the flattened surface ONLY when stable. In skip-unconnected mode
     // a partial surface (some servers still warming) must NOT be cached, or a
     // background-warmed server would stay hidden behind the stub until an
@@ -1331,6 +1362,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     },
 
     async connect() {
+      healthClosed = false;
       // Eager connect for the easy servers so first listTools() is
       // faster. By default this is deliberately non-blocking: a dead
       // local MCP server should not make daemon startup look hung.
@@ -1352,6 +1384,16 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     },
 
     async close() {
+      // Retiring a cached definition must not leave it displayed as connected.
+      // A different live shim may own the latest observation for the same slug;
+      // neither this close nor a late old handshake may overwrite that owner.
+      healthClosed = true;
+      connectionLifetime++;
+      for (const server of servers) serverConnectionLifetimes.set(server, (serverConnectionLifetimes.get(server) ?? 0) + 1);
+      for (const slug of serverSlugs.values()) {
+        const snapshot = HEALTH_REGISTRY.get(slug);
+        if (snapshot && HEALTH_OWNERS.get(snapshot) === healthOwner) HEALTH_REGISTRY.delete(slug);
+      }
       await Promise.allSettled(
         servers.map(async (server) => {
           // Drop the connect record so a subsequent connect() on this
@@ -1369,11 +1411,16 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       cachedToolToServer = null;
     },
 
+    captureConnectionLifetime,
+
     async listToolsAuthoritative(): Promise<MCPTool[]> {
       // Exact acquisition pays the existing bounded connect/list cost. The
       // fast advertisement path can still return a connecting placeholder.
       const labelStamp = mcpToolEffectLabelStamp();
+      const isCurrentLifetime = captureConnectionLifetime();
+      if (!isCurrentLifetime()) throw new Error('MCP authoritative inventory connection was retired');
       const { tools, routing, allConnected } = await buildFlattenedTools(true);
+      if (!isCurrentLifetime()) throw new Error('MCP authoritative inventory connection was retired');
       if (!allConnected) throw new Error('MCP authoritative tool inventory is unavailable');
       cachedTools = cacheToolsList ? tools : null;
       cachedLabelStamp = labelStamp;
@@ -1403,6 +1450,8 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     async reconnectServer(slug: string): Promise<boolean> {
       const server = servers.find((candidate) => serverSlugs.get(candidate) === slug);
       if (!server) return false;
+      connectionLifetime++;
+      serverConnectionLifetimes.set(server, (serverConnectionLifetimes.get(server) ?? 0) + 1);
       connectPromises.delete(server);
       serverHealth.delete(server);
       lastToolCounts.set(server, 0);

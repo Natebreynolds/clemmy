@@ -161,7 +161,7 @@ export function loadUserMcpServers(): Record<string, Partial<ManagedMcpServer>> 
   }
 }
 
-export function saveUserMcpServers(servers: Record<string, Partial<ManagedMcpServer>>): void {
+export function saveUserMcpServers(servers: Record<string, Partial<ManagedMcpServer>>, options: { deferIndex?: boolean } = {}): void {
   const dir = path.dirname(MCP_SERVERS_FILE);
   mkdirSync(dir, { recursive: true });
   hardenUserMcpConfigPermissions();
@@ -172,7 +172,7 @@ export function saveUserMcpServers(servers: Record<string, Partial<ManagedMcpSer
   // routes, the agent's own mcp_add/mcp_configure, and plugin installs all pass
   // through here — so it is where a newly added server becomes indexable. The
   // listing itself is detached: adding a server must not block on starting it.
-  scheduleUserMcpCapabilityIndex();
+  if (!options.deferIndex) scheduleUserMcpCapabilityIndex();
 }
 
 /**

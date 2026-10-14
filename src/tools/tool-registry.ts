@@ -370,14 +370,15 @@ export interface ToolDecl {
 // Installing, signing in or repairing a CLI on this Mac is local work, named
 // as what it is — the same as the shell that can run the same install. One
 // rule per kind of effect.
-function cliSetupSemantics(action: 'auth' | 'install' | 'repair'): LocalPlanningSemantics {
+function cliSetupSemantics(action: 'auth' | 'install' | 'repair' | 'remember'): LocalPlanningSemantics {
   return {
     consequence: 'runtime_configuration', reversibility: 'ordinary_non_destructive', destructive: false,
-    purpose: `cli_${action}`, inputKind: 'cli_configuration_request', outputKind: 'cli_job_receipt',
+    purpose: `cli_${action}`, inputKind: 'cli_configuration_request', outputKind: action === 'remember' ? 'cli_registry_receipt' : 'cli_job_receipt',
     deliverableKind: 'cli_configuration', destinationPosture: 'named_existing', advisoryRoles: ['configure', 'repair'],
     safeMode: { id: action, requiredEquals: { action },
       absentOrNull: action === 'auth' ? ['command', 'saveAs', 'jobId', 'repairId', 'values']
-        : action === 'repair' ? ['command', 'saveAs', 'jobId'] : ['jobId', 'repairId', 'values'] },
+        : action === 'repair' ? ['command', 'saveAs', 'jobId']
+          : action === 'remember' ? ['catalogId', 'saveAs', 'jobId', 'repairId', 'values'] : ['jobId', 'repairId', 'values'] },
   };
 }
 
@@ -432,7 +433,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'check_in', sideEffect: 'read', runtimeEffect: 'host_only', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', blockedFor: ['worker'], actionTopologyRole: 'control', desk: { rung: 'full', promotedBy: ['long_work', 'delegation'], purpose: 'post a progress note without stopping' }, description: 'Tell the user what you found or what you are doing, mid-task, without stopping. Lands in the conversation so they can read it whenever they come back.' },
   { name: 'check_capability', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', delegationPrimitive: true, description: 'Check whether a CLI / binary is available on this machine.' },
   { name: 'cli_inspect', sideEffect: 'read', localPlanningRead: true, tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'Inspect connected CLI health, signed-in account and its public connection origin (instance URL / hostname), declared repairs, or a managed CLI job. Read-only; never starts login, installation, or repair.' },
-  { name: 'cli_setup', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], loopClass: 'mutating', blockedFor: ['workflow-step', 'worker'], delegationPrimitive: true, localPlanning: cliSetupSemantics('auth'), localPlanningVariants: [cliSetupSemantics('install'), cliSetupSemantics('repair')], description: 'Install, re-authenticate, or REPAIR a local CLI via the approved runners: status | install | auth | repairs | repair | job_status. Repairs fix a tool\'s own configuration — for example a CLI that is signed in but has no default org, account, project or app selected, so every command fails. Installing or signing in a CLI is local work: do it when the request needs it; an interactive sign-in still needs the user at their browser or Terminal.' },
+  { name: 'cli_setup', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], loopClass: 'mutating', blockedFor: ['workflow-step', 'worker'], delegationPrimitive: true, localPlanning: cliSetupSemantics('auth'), localPlanningVariants: [cliSetupSemantics('install'), cliSetupSemantics('repair'), cliSetupSemantics('remember')], description: 'Install, remember, re-authenticate, or REPAIR a local CLI via the approved local paths: status | install | remember | auth | repairs | repair | job_status. Remember adds an already installed bare executable to Connect without reinstalling or authenticating it. Repairs fix a tool\'s own configuration — for example a CLI that is signed in but has no default org, account, project or app selected, so every command fails. Installing or signing in a CLI is local work: do it when the request needs it; an interactive sign-in still needs the user at their browser or Terminal.' },
   { name: 'project_get', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'Read one project: purpose, goals, context, assigned agents, bound accounts and resources, delegated tasks.' },
   { name: 'project_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'List the owner\'s projects (ongoing bodies of work, not code folders) and who is assigned to each.' },
   { name: 'project_run', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], loopClass: 'mutating', blockedFor: ['workflow-step', 'worker'], delegationPrimitive: true, description: 'Inspect or stop coding runs in the user\'s local projects: status | runs | kill. New runs start with dispatch_coding_task.' },

@@ -1,42 +1,53 @@
 import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Terminal, Search, X, Check, Plus, Loader2, Github, RotateCw, Download, KeyRound, ExternalLink, Copy } from 'lucide-react';
+import { Terminal, Search, X, Check, Plus, Loader2, Github, RotateCw, Download, KeyRound, ExternalLink, Copy, MessageCircle } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { usePoll } from '@/lib/poll';
 import {
-  getClis, getSavedClis, saveCli, removeSavedCli, probeCli,
+  getClis, getCliConnections, saveCli, removeSavedCli, probeCli,
   getManagedClis, startManagedCliJob, getManagedCliJob,
   getCliCatalog, installCatalogCli, forgetCatalogCli, getInstallJob,
   authCatalogCli, runInstallCommand, openTerminalAuth,
   type ManagedCliStatus, type ManagedCliKind, type ManagedCliAction,
-  type CatalogEntry, type ConnectedCli, type CliHealth,
+  type CatalogEntry, type ConnectedCli, type CliHealth, type CliConnectionSnapshot,
 } from '@/lib/connect';
 import { isMac } from '@/lib/platform';
+import { cliConnectionHealth, cliConnectionPresentation } from '@/lib/cli-connection-view';
 
 const BARE = /^[A-Za-z0-9._+-]{1,60}$/;
 // gh + composio are shown as rich managed cards; don't duplicate them in the catalog list.
 const MANAGED_IDS = new Set(['gh', 'github', 'composio']);
 
 export function CliTools() {
+  const navigate = useNavigate();
+  const connections = usePoll(['cli-connections'], getCliConnections, 5000);
   return (
-    <section className="mb-8">
-      <div className="mb-3 flex items-center gap-2.5">
-        <Terminal className="h-5 w-5 text-primary" aria-hidden />
-        <div className="flex-1">
-          <h3 className="text-h3 text-fg">Command-line tools</h3>
-          <p className="text-small text-muted">Install tools, sign in, and save any CLI so Clementine can use it</p>
+    <section className="mb-8" aria-labelledby="cli-tools-heading">
+      <div className="mb-3 flex flex-wrap items-start gap-3">
+        <Terminal className="mt-1 h-5 w-5 shrink-0 text-primary" aria-hidden />
+        <div className="min-w-0 flex-1 basis-64">
+          <h3 id="cli-tools-heading" className="text-h3 text-fg">Command-line tools</h3>
+          <p className="max-w-prose text-small text-muted">Tell Clem which tool you need. She can install it, remember tools already on your computer, and check access. Finish any browser or private sign-in prompts when asked.</p>
         </div>
+        <Button variant="secondary" size="sm" onClick={() => navigate('/chat')}>
+          <MessageCircle className="h-4 w-4" aria-hidden /> Ask Clem
+        </Button>
       </div>
-      <ManagedClis />
-      <CatalogTools />
+      {connections.isError && <div role="status" className="mb-3 flex flex-wrap items-center gap-2 text-small text-muted">
+        Connection status could not refresh. Saved tools are kept.
+        <Button size="sm" variant="ghost" onClick={() => { void connections.refetch(); }}>Refresh status</Button>
+      </div>}
+      <ManagedClis connections={connections.data} unavailable={connections.isError} />
+      <CatalogTools connections={connections.data} unavailable={connections.isError} />
     </section>
   );
 }
 
 // ─── Auto-discovered managed CLIs: GitHub + Composio (live auth state) ──
-function ManagedClis() {
+function ManagedClis({ connections, unavailable }: { connections?: CliConnectionSnapshot; unavailable: boolean }) {
   const qc = useQueryClient();
   const managed = usePoll(['managed-clis'], getManagedClis, 0);
   const [jobId, setJobId] = useState<string | null>(null);
@@ -51,7 +62,11 @@ function ManagedClis() {
   });
   const job = jobQ.data?.job;
   useEffect(() => {
-    if (job && job.status !== 'running') { void qc.invalidateQueries({ queryKey: ['managed-clis'] }); setPending(null); }
+    if (job && job.status !== 'running') {
+      void qc.invalidateQueries({ queryKey: ['managed-clis'] });
+      void qc.invalidateQueries({ queryKey: ['cli-connections'] });
+      setPending(null);
+    }
   }, [job?.status, qc]);
 
   const run = async (kind: ManagedCliKind, action: ManagedCliAction) => {
@@ -62,8 +77,8 @@ function ManagedClis() {
 
   return (
     <div className="mb-4 grid gap-3 sm:grid-cols-2">
-      <ManagedCard label="GitHub CLI" command="gh" icon={Github} status={managed.data?.github} busy={pending} loading={managed.isLoading} onRun={(a) => run('github', a)} />
-      <ManagedCard label="Composio CLI" command="composio" icon={Terminal} status={managed.data?.composio?.cli} busy={pending} loading={managed.isLoading} onRun={(a) => run('composio', a)} />
+      <ManagedCard label="GitHub CLI" command="gh" icon={Github} status={managed.data?.github} health={cliConnectionHealth(connections?.health, 'github', 'gh')} unavailable={unavailable} busy={pending} loading={managed.isLoading} onRun={(a) => run('github', a)} />
+      <ManagedCard label="Composio CLI" command="composio" icon={Terminal} status={managed.data?.composio?.cli} health={cliConnectionHealth(connections?.health, 'composio', 'composio')} unavailable={unavailable} busy={pending} loading={managed.isLoading} onRun={(a) => run('composio', a)} />
       {job && (
         <div className="sm:col-span-2 rounded-md border border-border bg-subtle p-3">
           <div className="mb-1 flex items-center gap-2 text-small">
@@ -78,30 +93,33 @@ function ManagedClis() {
   );
 }
 
-function ManagedCard({ label, command, icon: Icon, status, busy, loading, onRun }: {
-  label: string; command: string; icon: typeof Terminal; status?: ManagedCliStatus; busy: string | null; loading: boolean; onRun: (a: ManagedCliAction) => void;
+function ManagedCard({ label, command, icon: Icon, status, health, unavailable, busy, loading, onRun }: {
+  label: string; command: string; icon: typeof Terminal; status?: ManagedCliStatus; health?: CliHealth; unavailable: boolean;
+  busy: string | null; loading: boolean; onRun: (a: ManagedCliAction) => void;
 }) {
+  const navigate = useNavigate();
   const kind = command === 'gh' ? 'github' : 'composio';
   const isBusy = (a: ManagedCliAction) => busy === `${kind}:${a}`;
   const anyBusy = Boolean(busy?.startsWith(`${kind}:`));
-  const tone = !status || !status.installed ? 'neutral' : status.authenticated ? 'success' : status.authStatus === 'missing' ? 'warning' : 'danger';
-  const pill = !status ? '—' : !status.installed ? 'Not installed' : status.authenticated ? (status.username ? `@${status.username}` : 'Signed in') : status.authStatus === 'missing' ? 'Sign-in needed' : 'Auth needs repair';
+  const installed = health?.installed ?? status?.installed;
+  const presentation = cliConnectionPresentation({ health, installed, authRequired: true, unavailable });
   return (
     <Card className="p-4">
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <Icon className="h-5 w-5 shrink-0 text-muted" aria-hidden />
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2"><span className="text-body font-medium text-fg">{label}</span><span className="font-mono text-caption text-faint">{command}</span></div>
+        <div className="min-w-0 flex-1 basis-32">
+          <div className="flex flex-wrap items-center gap-x-2"><span className="text-body font-medium text-fg">{label}</span><span className="font-mono text-caption text-faint">{command}</span></div>
           {status?.version && <div className="truncate text-caption text-faint">{status.version}</div>}
         </div>
-        {loading ? <Loader2 className="h-4 w-4 animate-spin text-faint" aria-hidden /> : <StatusPill tone={tone}>{pill}</StatusPill>}
+        {loading && !health ? <Loader2 className="h-4 w-4 animate-spin text-faint" aria-hidden /> : <StatusPill tone={presentation.tone} title={presentation.help} className="max-w-full whitespace-normal break-words">{presentation.label}{presentation.account ? ` · ${presentation.account}` : ''}</StatusPill>}
       </div>
-      {status && (
+      {presentation.state !== 'connected' && <p className="mt-2 text-caption text-muted">{presentation.help}</p>}
+      {(status || health) && (
         <div className="mt-3 flex flex-wrap gap-2">
-          {!status.installed && <Button size="sm" disabled={anyBusy} onClick={() => onRun('install')}>{isBusy('install') ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Download className="h-3.5 w-3.5" aria-hidden />} Install</Button>}
-          {status.installed && !status.authenticated && <Button size="sm" disabled={anyBusy} onClick={() => onRun('auth')}>{isBusy('auth') ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} Sign in</Button>}
-          {status.installed && status.authenticated && <Button size="sm" variant="secondary" disabled={anyBusy} onClick={() => onRun('repair')}>{isBusy('repair') ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RotateCw className="h-3.5 w-3.5" aria-hidden />} Re-auth</Button>}
-          {status.installed && !status.authenticated && status.authStatus !== 'missing' && <Button size="sm" variant="secondary" disabled={anyBusy} onClick={() => onRun('repair')}>{isBusy('repair') ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RotateCw className="h-3.5 w-3.5" aria-hidden />} Repair</Button>}
+          {presentation.state === 'not_installed' && <Button size="sm" disabled={anyBusy} onClick={() => onRun('install')}>{isBusy('install') ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Download className="h-3.5 w-3.5" aria-hidden />} Install</Button>}
+          {presentation.state === 'signed_out' && <Button size="sm" disabled={anyBusy} onClick={() => onRun('auth')}>{isBusy('auth') ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} Sign in</Button>}
+          {presentation.state === 'connected' && <Button size="sm" variant="secondary" disabled={anyBusy} onClick={() => onRun('repair')}>{isBusy('repair') ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RotateCw className="h-3.5 w-3.5" aria-hidden />} Re-auth</Button>}
+          {!['not_installed', 'signed_out', 'connected'].includes(presentation.state) && <Button size="sm" variant="secondary" disabled={anyBusy} onClick={() => navigate('/chat')}><MessageCircle className="h-3.5 w-3.5" aria-hidden /> Ask Clem to check</Button>}
         </div>
       )}
     </Card>
@@ -149,27 +167,22 @@ function AuthReveal({ command, authCommand, authDocsUrl, catalogId }: { command:
   );
 }
 
-/** Auth pill for a roster CLI from the persisted health snapshot. `unknown`
- *  renders nothing — absence of a probe must not read as a problem. */
-function HealthPill({ health }: { health?: CliHealth }) {
-  if (!health || !health.installed) return null;
-  if (health.authStatus === 'ok') {
-    return <StatusPill tone="success">{health.username ? health.username : 'Signed in'}</StatusPill>;
-  }
-  if (health.authStatus === 'signed_out') return <StatusPill tone="warning">Signed out</StatusPill>;
-  if (health.authStatus === 'error') return <StatusPill tone="danger">Auth check failed</StatusPill>;
-  return null;
+/** Membership and availability alone never mean an account is connected. */
+function HealthPill({ health, installed, authRequired, unavailable }: {
+  health?: CliHealth; installed?: boolean; authRequired?: boolean; unavailable: boolean;
+}) {
+  const presentation = cliConnectionPresentation({ health, installed, authRequired, unavailable });
+  return <StatusPill tone={presentation.tone} title={presentation.help} className="max-w-full whitespace-normal break-words">{presentation.label}{presentation.account ? ` · ${presentation.account}` : ''}</StatusPill>;
 }
 
 // ─── CLI catalog (install + connect) + free-form saved tools ──────────
-function CatalogTools() {
+function CatalogTools({ connections, unavailable }: { connections?: CliConnectionSnapshot; unavailable: boolean }) {
   const qc = useQueryClient();
   const catalog = usePoll(['cli-catalog', ''], () => getCliCatalog(), 0);
-  const clis = usePoll(['clis'], getClis, 30000);
-  const savedQ = usePoll(['clis-saved'], getSavedClis, 0);
-  const connected: ConnectedCli[] = Object.values(catalog.data?.connected ?? {}).filter((c) => !MANAGED_IDS.has(c.id));
+  const clis = usePoll(['clis'], getClis, 0);
+  const connected: ConnectedCli[] = Object.values(connections?.connected ?? catalog.data?.connected ?? {}).filter((c) => !MANAGED_IDS.has(c.id));
   const connectedCmds = new Set(connected.map((c) => c.command));
-  const saved = savedQ.data?.saved ?? [];
+  const saved = connections?.saved ?? [];
   const savedSet = new Set(saved);
   const savedOnly = saved.filter((name) => !connectedCmds.has(name));
 
@@ -180,11 +193,8 @@ function CatalogTools() {
   const [installJobId, setInstallJobId] = useState<string | null>(null);
   const [authJobId, setAuthJobId] = useState<string | null>(null);
 
-  const healthMap = catalog.data?.health ?? {};
-  const healthFor = (idOrCommand: string): CliHealth | undefined =>
-    healthMap[idOrCommand]
-    ?? healthMap[`saved:${idOrCommand}`]
-    ?? Object.values(healthMap).find((h) => h.command === idOrCommand);
+  const healthFor = (id: string, command: string) => cliConnectionHealth(connections?.health, id, command);
+  const authRequiredFor = (id: string, command: string) => connections?.authRequired[id] ?? connections?.authRequired[command];
 
   const q = query.trim();
   const searchQ = useQuery({ queryKey: ['cli-catalog', q], queryFn: () => getCliCatalog(q), enabled: q.length > 0 });
@@ -192,6 +202,7 @@ function CatalogTools() {
   const catCommands = new Set(catResults.map((r) => r.command));
 
   const rows = clis.data?.clis ?? [];
+  const detectedInstalled = (command: string) => rows.some((row) => row.command === command && row.isLikelyCli) ? true : undefined;
   const pathResults = q
     ? rows.filter((c) => (c.command ?? '').toLowerCase().includes(q.toLowerCase()) && !catCommands.has(c.command ?? ''))
         .sort((a, b) => Number(Boolean(b.isLikelyCli)) - Number(Boolean(a.isLikelyCli)) || (a.command ?? '').localeCompare(b.command ?? ''))
@@ -213,6 +224,7 @@ function CatalogTools() {
     if (installJob && installJob.status !== 'running') {
       void qc.invalidateQueries({ queryKey: ['cli-catalog'] });
       void qc.invalidateQueries({ queryKey: ['clis'] });
+      void qc.invalidateQueries({ queryKey: ['cli-connections'] });
       setBusy(null);
     }
   }, [installJob?.status, qc]);
@@ -227,6 +239,7 @@ function CatalogTools() {
   useEffect(() => {
     if (authJob && authJob.status !== 'running') {
       void qc.invalidateQueries({ queryKey: ['cli-catalog'] });
+      void qc.invalidateQueries({ queryKey: ['cli-connections'] });
       setBusy(null);
     }
   }, [authJob?.status, qc]);
@@ -237,33 +250,33 @@ function CatalogTools() {
     catch (e) { setBusy(null); setError((e as Error).message); }
   };
 
-  const refresh = () => { void qc.invalidateQueries({ queryKey: ['cli-catalog'] }); void qc.invalidateQueries({ queryKey: ['clis-saved'] }); };
+  const refresh = () => { void qc.invalidateQueries({ queryKey: ['cli-catalog'] }); void qc.invalidateQueries({ queryKey: ['cli-connections'] }); };
   const install = async (id: string) => {
     setBusy(`install:${id}`); setError('');
     try { const { job } = await installCatalogCli(id); setInstallJobId(job.id); }
     catch (e) { setBusy(null); setError((e as Error).message); }
   };
   const forget = async (id: string) => { setBusy(`forget:${id}`); try { await forgetCatalogCli(id); refresh(); } finally { setBusy(null); } };
-  const save = async (command: string) => { setBusy(`save:${command}`); setError(''); try { await saveCli(command); void qc.invalidateQueries({ queryKey: ['clis-saved'] }); } catch (e) { setError((e as Error).message); } finally { setBusy(null); } };
-  const unsave = async (command: string) => { setBusy(`save:${command}`); try { await removeSavedCli(command); void qc.invalidateQueries({ queryKey: ['clis-saved'] }); } finally { setBusy(null); } };
+  const save = async (command: string) => { setBusy(`save:${command}`); setError(''); try { await saveCli(command); void qc.invalidateQueries({ queryKey: ['cli-connections'] }); } catch (e) { setError((e as Error).message); } finally { setBusy(null); } };
+  const unsave = async (command: string) => { setBusy(`save:${command}`); try { await removeSavedCli(command); void qc.invalidateQueries({ queryKey: ['cli-connections'] }); } finally { setBusy(null); } };
 
   return (
     <>
-      {/* Connected catalog CLIs — installed tools with re-auth + forget */}
+      {/* Remembered catalog tools; the separate health pill describes access. */}
       {connected.length > 0 && (
         <div className="mb-3 space-y-2">
           {connected.map((c) => (
             <Card key={c.id} className="p-3.5">
-              <div className="flex items-center gap-3">
-                <Check className="h-4 w-4 shrink-0 text-success" aria-hidden />
+              <div className="flex flex-wrap items-center gap-3">
+                <Terminal className="h-4 w-4 shrink-0 text-muted" aria-hidden />
                 <div className="min-w-0 flex-1">
                   <span className="text-body font-medium text-fg">{c.name}</span>
                   <span className="ml-2 font-mono text-caption text-faint">{c.command}</span>
                 </div>
-                <HealthPill health={healthFor(c.id)} />
+                <HealthPill health={healthFor(c.id, c.command)} installed={detectedInstalled(c.command)} authRequired={authRequiredFor(c.id, c.command)} unavailable={unavailable} />
                 {c.authHeadless
-                  ? <Button size="sm" variant={healthFor(c.id)?.authStatus === 'signed_out' ? 'primary' : 'ghost'} disabled={busy === `auth:${c.id}`} onClick={() => signIn(c.id)}>{busy === `auth:${c.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} {healthFor(c.id)?.authStatus === 'signed_out' ? 'Sign in' : 'Re-auth'}</Button>
-                  : <Button size="sm" variant="ghost" onClick={() => setReveal(reveal === c.id ? null : c.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Re-auth</Button>}
+                  ? <Button size="sm" variant="ghost" disabled={busy === `auth:${c.id}`} onClick={() => signIn(c.id)}>{busy === `auth:${c.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} Manage sign-in</Button>
+                  : <Button size="sm" variant="ghost" onClick={() => setReveal(reveal === c.id ? null : c.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign-in options</Button>}
                 <Button size="sm" variant="ghost" aria-label={`Forget ${c.name}`} title="Disconnect" disabled={busy === `forget:${c.id}`} onClick={() => forget(c.id)}>
                   {busy === `forget:${c.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <X className="h-3.5 w-3.5" aria-hidden />}
                 </Button>
@@ -279,11 +292,11 @@ function CatalogTools() {
         <div className="mb-3 space-y-2">
           {savedOnly.map((name) => (
             <Card key={name} className="p-3.5">
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <Terminal className="h-4 w-4 shrink-0 text-primary" aria-hidden />
-                <span className="min-w-0 flex-1 truncate font-mono text-small text-fg">{name}</span>
-                <HealthPill health={healthFor(name)} />
-                <Button size="sm" variant="ghost" onClick={() => setReveal(reveal === `saved:${name}` ? null : `saved:${name}`)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Re-auth</Button>
+                <span className="min-w-0 flex-1 basis-40 break-words font-mono text-small text-fg">{name}</span>
+                <HealthPill health={healthFor(`saved:${name}`, name)} installed={detectedInstalled(name)} authRequired={authRequiredFor(`saved:${name}`, name)} unavailable={unavailable} />
+                <Button size="sm" variant="ghost" onClick={() => setReveal(reveal === `saved:${name}` ? null : `saved:${name}`)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign-in options</Button>
                 <Button size="sm" variant="ghost" aria-label={`Remove ${name}`} title="Remove" disabled={busy === `save:${name}`} onClick={() => unsave(name)}>
                   {busy === `save:${name}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <X className="h-3.5 w-3.5" aria-hidden />}
                 </Button>
@@ -322,7 +335,7 @@ function CatalogTools() {
         <Search className="h-4 w-4 text-faint" aria-hidden />
         <input value={query} onChange={(e) => { setQuery(e.target.value); setError(''); }}
           placeholder="Search to install or save a CLI (netlify, vercel, sf, jq…)" aria-label="Search CLIs"
-          className="h-11 flex-1 bg-transparent text-body text-fg outline-none placeholder:text-faint" />
+          className="h-11 min-w-0 flex-1 bg-transparent text-body text-fg outline-none placeholder:text-faint" />
         {query && <button type="button" onClick={() => setQuery('')} aria-label="Clear" className="cursor-pointer text-faint hover:text-fg"><X className="h-4 w-4" aria-hidden /></button>}
       </div>
 
@@ -330,22 +343,25 @@ function CatalogTools() {
 
       {!q ? (
         <Card className="p-4 text-body text-muted">
-          Search to <span className="text-fg">install</span> a known tool (netlify, vercel, railway, stripe…) or <span className="text-fg">save</span> any CLI already on your machine.
+          Prefer to manage setup yourself? Search to <span className="text-fg">install</span> a known tool or <span className="text-fg">save</span> a command already on your computer.
           {clis.data?.cliCount ? <span className="text-faint"> {clis.data.cliCount.toLocaleString()} detected on your PATH.</span> : null}
         </Card>
       ) : (
         <div className="space-y-2">
           {/* Catalog matches — install or (if installed) re-auth */}
-          {catResults.map((e) => (
+          {catResults.map((e) => {
+            const health = healthFor(e.id, e.command);
+            const installed = health?.installed ?? e.installed;
+            return (
             <Card key={`cat:${e.id}`} className="p-3.5">
-              <div className="flex items-center gap-3">
-                {e.installed ? <Check className="h-4 w-4 shrink-0 text-success" aria-hidden /> : <Download className="h-4 w-4 shrink-0 text-muted" aria-hidden />}
+              <div className="flex flex-wrap items-center gap-3">
+                {installed ? <Terminal className="h-4 w-4 shrink-0 text-muted" aria-hidden /> : <Download className="h-4 w-4 shrink-0 text-muted" aria-hidden />}
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2"><span className="text-body font-medium text-fg">{e.name}</span><span className="font-mono text-caption text-faint">{e.command}</span></div>
                   <div className="truncate text-caption text-muted">{e.description}</div>
                 </div>
-                <HealthPill health={healthFor(e.id)} />
-                {e.installed
+                <HealthPill health={health} installed={installed} authRequired={authRequiredFor(e.id, e.command) ?? (e.authCommand ? true : undefined)} unavailable={unavailable} />
+                {installed
                   ? (e.authHeadless
                       ? <Button size="sm" variant="secondary" disabled={busy === `auth:${e.id}`} onClick={() => signIn(e.id)}>{busy === `auth:${e.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} Sign in</Button>
                       : <Button size="sm" variant="secondary" onClick={() => setReveal(reveal === e.id ? null : e.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign in</Button>)
@@ -353,12 +369,13 @@ function CatalogTools() {
               </div>
               {reveal === e.id && <AuthReveal command={e.command} authCommand={e.authCommand} authDocsUrl={e.authDocsUrl} catalogId={e.id} />}
             </Card>
-          ))}
+            );
+          })}
 
           {/* PATH matches not in the catalog — save them */}
           {pathResults.map((c, i) => (
             <Card key={`path:${c.command || i}`} className="flex items-center gap-3 p-3.5">
-              {c.isLikelyCli ? <Check className="h-4 w-4 shrink-0 text-success" aria-hidden /> : <Terminal className="h-4 w-4 shrink-0 text-faint" aria-hidden />}
+              <Terminal className="h-4 w-4 shrink-0 text-faint" aria-hidden />
               <div className="min-w-0 flex-1"><div className="truncate font-mono text-small text-fg">{c.command}</div>{c.isLikelyCli && c.version && <div className="truncate text-caption text-faint">{c.version}</div>}</div>
               {savedSet.has(c.command ?? '')
                 ? <span className="inline-flex items-center gap-1 text-caption text-success"><Check className="h-3.5 w-3.5" aria-hidden /> Saved</span>
@@ -423,7 +440,7 @@ function CustomInstall({ onJob }: { onJob: (jobId: string) => void }) {
     return (
       <button type="button" onClick={() => setOpen(true)}
         className="mt-3 cursor-pointer text-small text-muted underline-offset-2 hover:text-fg hover:underline">
-        Have an install command? Paste it and Clementine runs it safely.
+        Have an install command? Paste it to review and run it here.
       </button>
     );
   }

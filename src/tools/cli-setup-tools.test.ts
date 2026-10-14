@@ -9,7 +9,7 @@
  */
 import { test, before, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -183,9 +183,91 @@ test('a planning turn may run a declared repair, and may not run an undeclared o
     { action: 'repair', catalogId: 'salesforce', repairId: 'invented' },
     { action: 'install', catalogId: 'salesforce' },
     { action: 'auth', catalogId: 'salesforce' },
+    { action: 'remember', command: 'controlled-cli' },
   ]) {
     assert.match(String(planModeCallRefusal({ mode, toolName: 'cli_setup', args })), /Plan/,
       `${JSON.stringify(args)} must stay refused in Plan`);
+  }
+});
+
+test('remember validates one bare executable name before resolution or registry mutation', async () => {
+  const { rememberInstalledCliAction } = await import('./cli-setup-tools.js');
+  let resolved = 0; let saved = 0;
+  for (const command of [undefined, '', 'cli --version', '/usr/bin/cli', './cli', '../cli', 'C:\\cli.exe', '-option',
+    'cli;echo', 'cli&&echo', '$(cli)', 'cli\n', ' cli', 'cli\0', 'cli\t', 'cli/child', '.', '..', '~cli', 'x'.repeat(61)]) {
+    const result = await rememberInstalledCliAction(command, {
+      findSafeCliCommand() { resolved++; throw new Error('invalid input must not resolve'); },
+      addSavedCli() { saved++; throw new Error('invalid input must not save'); },
+    });
+    assert.match(result.content.map(part => part.text ?? '').join('\n'), /bare CLI name/);
+  }
+  assert.equal(resolved, 0); assert.equal(saved, 0);
+});
+
+test('remember refuses missing, skipped and unresolved executables without changing the registry', async () => {
+  const { rememberInstalledCliAction } = await import('./cli-setup-tools.js');
+  let saved = 0;
+  for (const safe of [null, { skipped: true as const, command: 'controlled-cli', path: '/synthetic/blocked', reason: 'private guard detail' },
+    { skipped: false as const, command: 'controlled-cli', path: '' }]) {
+    const result = await rememberInstalledCliAction('controlled-cli', {
+      findSafeCliCommand: () => safe, addSavedCli() { saved++; return []; },
+    });
+    const text = result.content.map(part => part.text ?? '').join('\n');
+    assert.match(text, /no safely resolved installed executable/);
+    assert.doesNotMatch(text, /private guard detail|\/synthetic\/blocked/);
+  }
+  assert.equal(saved, 0);
+});
+
+test('remember keeps the requested bare name idempotently and leaves authentication unverified', async () => {
+  const { rememberInstalledCliAction } = await import('./cli-setup-tools.js');
+  const saved = new Set<string>();
+  for (let repeat = 0; repeat < 2; repeat++) {
+    const result = await rememberInstalledCliAction('controlled-cli.v2+', {
+      findSafeCliCommand: command => ({ skipped: false, command: '/synthetic/backing-executable', path: '/synthetic/backing-executable' }),
+      addSavedCli(command) { saved.add(command); return [...saved]; },
+    });
+    const text = result.content.map(part => part.text ?? '').join('\n');
+    assert.match(text, /is remembered in Connect/); assert.match(text, /Authentication is unverified/);
+    assert.doesNotMatch(text, /\bready\b|\bconnected\b|\bsigned in\b|\/synthetic\//i);
+  }
+  assert.deepEqual([...saved], ['controlled-cli.v2+']);
+});
+
+test('remember handler exposes an already installed non-catalog executable without running it or accepting aliases', async () => {
+  const { augmentPath } = await import('../runtime/spawn-env.js');
+  const { getSavedClis, removeSavedCli } = await import('../runtime/saved-clis.js');
+  const command = 'controlled-remember-cli';
+  const binDir = path.join(TMP_HOME, 'remember-bin'); const marker = path.join(TMP_HOME, 'remember-must-not-execute');
+  mkdirSync(binDir, { recursive: true });
+  const executable = path.join(binDir, command + (process.platform === 'win32' ? '.cmd' : ''));
+  writeFileSync(executable, process.platform === 'win32' ? `@echo off\r\necho executed > "${marker}"\r\n`
+    : `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)}, 'executed');\n`, 'utf8');
+  chmodSync(executable, 0o700);
+  const priorPath = process.env.PATH; const previouslySaved = getSavedClis().includes(command);
+  process.env.PATH = `${binDir}${path.delimiter}${augmentPath(priorPath)}`;
+  let authProbes = 0;
+  _testOnly_setProbeExec(async () => { authProbes++; throw new Error('remember must not authenticate'); });
+  try {
+    const before = getSavedClis();
+    for (const collision of [{ saveAs: 'different-cli' }, { catalogId: 'github' }, { values: {} }, { repairId: 'invented' }, { jobId: 'job' }]) {
+      assert.match(await call({ action: 'remember', command, ...collision }), /only command/);
+      assert.deepEqual(getSavedClis(), before, 'mixed install/auth/alias arguments must not modify roster membership');
+    }
+    for (let repeat = 0; repeat < 2; repeat++) {
+      const out = await call({ action: 'remember', command });
+      assert.match(out, /is remembered in Connect/); assert.match(out, /Authentication is unverified/);
+      assert.doesNotMatch(out, /\bready\b|\bconnected\b|\bsigned in\b/i);
+    }
+    assert.equal(getSavedClis().filter(name => name === command).length, 1);
+    assert.equal(existsSync(marker), false, 'the real guarded resolver only stats the private fixture; --help/--version are not run');
+    assert.equal(authProbes, 0);
+    const inspected = await tools.get('cli_inspect')!({ action: 'status', catalogId: `saved:${command}` });
+    assert.match(inspected.content.map(part => part.text ?? '').join('\n'), /installed \(auth state unknown\)/);
+    assert.equal(authProbes, 0, 'a remembered non-catalog CLI does not invent an authentication probe');
+  } finally {
+    if (!previouslySaved) removeSavedCli(command);
+    if (priorPath === undefined) delete process.env.PATH; else process.env.PATH = priorPath;
   }
 });
 

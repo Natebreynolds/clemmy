@@ -22,6 +22,8 @@ import {
   type McpToolScope,
 } from './mcp-tool-scope.js';
 import type { ManagedMcpServer } from '../types.js';
+import { readMcpServerEnv, resolveMcpServerEnv, type McpServerEnvSources } from './mcp-server-env.js';
+import { observeMcpServerSetup, type McpSetupReadiness } from './mcp-server-setup.js';
 
 function positiveIntEnv(key: string, fallback: number): number {
   const raw = process.env[key];
@@ -85,8 +87,14 @@ function applyNpmConfigPair(
   env[upperKey] = value;
 }
 
-function stdioLaunchEnv(server: ManagedMcpServer): Record<string, string> {
-  const env = mergedEnv(server.env);
+function declaredServerEnv(server: ManagedMcpServer, sources?: McpServerEnvSources): Record<string, string> {
+  return (sources ? resolveMcpServerEnv(server.env, sources)
+    : readMcpServerEnv(server.env, path.join(BASE_DIR, '.env'))).values;
+}
+
+function stdioLaunchEnv(server: ManagedMcpServer, sources?: McpServerEnvSources,
+  merge: typeof mergedEnv = mergedEnv): Record<string, string> {
+  const env = merge(declaredServerEnv(server, sources));
   if (!server.command || !isNpxCommand(server.command)) return env;
   if (!runtimeFlagEnabled('CLEMMY_MCP_NPX_ISOLATED_CACHE', true)) return env;
 
@@ -163,9 +171,10 @@ function createLocalServer(): MCPServerStdio | null {
 /** A remote server's headers may name a declared environment value, the way a
  *  stdio launch's arguments do: `Bearer ${KERNEL_API_KEY}` reads the value the
  *  owner entered for that key. An unknown name is left as written. */
-function expandedHeaders(server: ManagedMcpServer): Record<string, string> | undefined {
+function expandedHeaders(server: ManagedMcpServer, sources?: McpServerEnvSources,
+  merge: typeof mergedEnv = mergedEnv): Record<string, string> | undefined {
   if (!server.headers) return undefined;
-  const env = mergedEnv(server.env);
+  const env = merge(declaredServerEnv(server, sources));
   const expanded: Record<string, string> = {};
   for (const [name, value] of Object.entries(server.headers)) {
     expanded[name] = value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, key: string) => (typeof env[key] === 'string' ? env[key] : match));
@@ -459,7 +468,7 @@ function createScopedExternalShim(
   base: MCPServer,
   scope: McpToolScope,
   opts: { semantic?: boolean } = {},
-): MCPServer & Pick<McpNamespaceShim, 'listToolsAuthoritative' | 'listToolsWaiting'> {
+): MCPServer & Pick<McpNamespaceShim, 'listToolsAuthoritative' | 'listToolsWaiting' | 'captureConnectionLifetime'> {
   let selectedToolNames: Set<string> | null = null;
   // Where an acquired tool actually lives. Without this the first cross-server
   // call succeeds and the second one goes back to the turn's base — which never
@@ -505,6 +514,9 @@ function createScopedExternalShim(
     },
     async listToolsAuthoritative() {
       return listScopedTools('authoritative');
+    },
+    captureConnectionLifetime() {
+      return (base as Partial<McpNamespaceShim>).captureConnectionLifetime?.() ?? (() => false);
     },
     async listToolsWaiting(opts: { deadlineAt: number }) {
       return listScopedTools({ waitUntil: opts.deadlineAt });
@@ -1093,6 +1105,51 @@ export async function reconnectConfiguredMcpServer(name: string): Promise<'recon
   return 'cleared_all';
 }
 
+/** Complete an approved setup with one named server's handshake and real tool
+ * inventory. Normal turn scope remains the ceiling; no vendor tool is invoked. */
+export async function observeConfiguredMcpServerSetup(name: string): Promise<McpSetupReadiness> {
+  const server = discoverMcpServers().find(candidate => candidate.name === name);
+  if (!server) return { state: 'unavailable', unsetEnvKeys: [], reason: 'configuration_changed' };
+  const definition = JSON.stringify(server);
+  const serverSlug = slugifyServerName(server.name);
+  let inventoryLifetimeIsCurrent: (() => boolean) | undefined;
+  const isCurrent = (): boolean => {
+    const matching = discoverMcpServers().filter(candidate => candidate.enabled && mcpServerAliasMatches(candidate.name, serverSlug));
+    return matching.length === 1 && JSON.stringify(matching[0]) === definition && inventoryLifetimeIsCurrent?.() !== false;
+  };
+  const validTransport = server.type === 'stdio' ? Boolean(server.command)
+    : (server.type === 'http' || server.type === 'sse') && Boolean(server.url);
+  if (server.enabled && (!validTransport || !isCurrent())) {
+    return { state: 'unavailable', unsetEnvKeys: [], reason: 'configuration_changed' };
+  }
+  const scope = withoutDeniedServers(narrowToAmbientAuthority({ reason: 'approved MCP setup inventory',
+    authority: 'server_set', allowedServerSlugs: [serverSlug] })!);
+  const scopeAuthority = mcpToolScopeAuthority(scope);
+  const allowed = (scopeAuthority === 'catalog' || scopeAuthority === 'server_set')
+    && (scope.allowedServerSlugs ?? []).some(slug => mcpServerAliasMatches(server.name, slug));
+  const { unsetEnvKeys } = readMcpServerEnv(server.env, path.join(BASE_DIR, '.env'));
+  return observeMcpServerSetup({ enabled: server.enabled, unsetEnvKeys, allowed, serverSlug,
+    isCurrent,
+    listTools: async () => {
+      const shim = getOrCreateExternalMcpServers(scope) as Partial<McpNamespaceShim> & MCPServer;
+      if (typeof shim.listToolsAuthoritative !== 'function' || typeof shim.captureConnectionLifetime !== 'function') throw new Error('Authoritative MCP inventory unavailable');
+      inventoryLifetimeIsCurrent = shim.captureConnectionLifetime();
+      // This method refreshes connect + actual tools/list and throws unless
+      // every server in this exact one-server base succeeded. No passive
+      // advertisement, stale global health or filtered placeholder proves zero.
+      const tools = await shim.listToolsAuthoritative();
+      return { tools, connectionVerified: inventoryLifetimeIsCurrent() };
+    },
+    indexTools: tools => {
+      // Index the exact successful listing, not a connecting placeholder or a
+      // detached enumeration of unrelated configured servers.
+      void import('./local-capability-enumeration.js').then(({ indexMcpServerTools }) => {
+        if (isCurrent()) indexMcpServerTools(serverSlug, tools);
+      }).catch(() => undefined);
+    },
+  });
+}
+
 /**
  * Escape hatch — return the raw per-server list when the caller
  * really needs it (e.g. the dashboard `/api/console/mcp-servers`
@@ -1103,6 +1160,10 @@ export function listRawMcpServers(): MCPServer[] {
 }
 
 export const mcpServersTestHooks = {
+  /** Real launch/header construction with synthetic environment sources; no
+   * child, network or credential/config read is needed by these controls. */
+  stdioLaunchEnv,
+  expandedHeaders,
   scopedView(
     base: MCPServer,
     scope: McpToolScope,

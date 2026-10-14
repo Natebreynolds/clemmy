@@ -1,6 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { textResult } from './shared.js';
+import type { SafeCliProbe } from '../runtime/cli-discovery.js';
 
 /**
  * `cli_setup` — chat-side install + re-auth for the user's CLI roster.
@@ -23,7 +24,7 @@ import { textResult } from './shared.js';
  * job_status. An interactive sign-in still needs the user.
  */
 
-const ACTION = z.enum(['status', 'install', 'auth', 'job_status', 'repairs', 'repair']);
+const ACTION = z.enum(['status', 'install', 'auth', 'remember', 'job_status', 'repairs', 'repair']);
 
 export function registerCliSetupTools(server: McpServer): void {
   server.tool('cli_inspect',
@@ -39,10 +40,11 @@ export function registerCliSetupTools(server: McpServer): void {
   server.tool(
     'cli_setup',
     [
-      'Install or re-authenticate a local CLI for the user, via the approved runners. Actions:',
+      'Install, remember or re-authenticate a local CLI for the user, via the approved local paths. Actions:',
       '- For read-only diagnostics prefer cli_inspect (status | repairs | job_status).',
       '- status: auth/install state of catalogId, or the connected/saved roster when catalogId is omitted.',
       `- install: install a CLI. Pass catalogId (preferred — e.g. "railway", "github") OR a raw command, which must match the install allowlist (npm install -g / ${process.platform === 'win32' ? '' : 'brew install / '}uv tool install / pipx install / pip install --user / git clone https).`,
+      '- remember: add an ALREADY installed CLI to Connect → Command-line tools without reinstalling it. Pass only command, a bare executable name (no paths, arguments or shell). This checks safe executable resolution and saves its name; authentication remains unverified and no command is executed.',
       '- auth: sign a catalog CLI in again. The conversation shows its managed process and private input controls. Browser and system credential prompts remain user-owned. Never ask for a password in chat or run login through run_shell_command.',
       '- job_status: check a previously started install/auth job by id.',
       '- repairs: the bounded fixes a CLI declares for its own local configuration (for example: it is authenticated but no default account/org/project is selected, so every command fails).',
@@ -50,11 +52,11 @@ export function registerCliSetupTools(server: McpServer): void {
       'Install, auth and repair are local work on this computer: run them when the request needs them, without asking first; status, job_status and repairs are read-only. Never report that you cannot fix a tool without first checking repairs.',
     ].join('\n'),
     {
-      action: ACTION.describe('What to do: status | install | auth | job_status.'),
+      action: ACTION.describe('What to do: status | install | auth | remember | job_status | repairs | repair.'),
       catalogId: z.string().max(60).optional()
         .describe('Catalog CLI id for status/install/auth (e.g. "railway", "netlify", "github"). See status output for ids.'),
       command: z.string().max(300).optional()
-        .describe('install only: a raw install command when the CLI is not in the catalog. Validated against the allowlist server-side.'),
+        .describe('install: a raw allowed install command. remember: one bare name of an already installed executable, with no path or arguments.'),
       saveAs: z.string().max(60).optional()
         .describe('install with a raw command: bare binary name to remember on the user\'s roster after success.'),
       jobId: z.string().max(120).optional()
@@ -68,6 +70,12 @@ export function registerCliSetupTools(server: McpServer): void {
       try {
         if (action === 'status') return await statusAction(catalogId);
         if (action === 'install') return await installAction(catalogId, command, saveAs);
+        if (action === 'remember') {
+          if ([catalogId, saveAs, jobId, repairId, values].some(value => value !== undefined && value !== null)) {
+            return textResult('remember accepts only command, the bare name of an already installed CLI. No alias, install, authentication or repair was started.');
+          }
+          return await rememberInstalledCliAction(command);
+        }
         if (action === 'auth') return await authAction(catalogId);
         if (action === 'repairs') return await repairsAction(catalogId);
         if (action === 'repair') {
@@ -81,6 +89,25 @@ export function registerCliSetupTools(server: McpServer): void {
       }
     },
   );
+}
+
+/** Save only a safely resolved executable name. Metadata resolution is enough
+ * for roster membership; it is never authentication or working-tool proof. */
+export async function rememberInstalledCliAction(command: string | undefined, dependencies?: {
+  findSafeCliCommand: (command: string) => SafeCliProbe | null;
+  addSavedCli: (command: string) => string[];
+}): Promise<ReturnType<typeof textResult>> {
+  if (typeof command !== 'string' || !/^[A-Za-z0-9_][A-Za-z0-9._+-]{0,59}$/.test(command)) {
+    return textResult('remember needs one bare CLI name (up to 60 letters, numbers, underscores, dots, pluses or hyphens, starting with a letter, number or underscore). Paths, options, spaces, control characters and shell commands are refused; nothing was saved.');
+  }
+  const findCommand = dependencies?.findSafeCliCommand ?? (await import('../runtime/cli-discovery.js')).findSafeCliCommand;
+  const safe = findCommand(command);
+  if (!safe || safe.skipped || !safe.path) {
+    return textResult(`Cannot remember CLI "${command}": no safely resolved installed executable was found. Nothing was saved, installed or executed.`);
+  }
+  const remember = dependencies?.addSavedCli ?? (await import('../runtime/saved-clis.js')).addSavedCli;
+  remember(command);
+  return textResult(`Installed CLI "${command}" is remembered in Connect → Command-line tools. Authentication is unverified; no sign-in, version/help probe or CLI command was run.`);
 }
 
 async function statusAction(catalogId?: string): Promise<ReturnType<typeof textResult>> {

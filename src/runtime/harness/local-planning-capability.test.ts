@@ -61,7 +61,7 @@ test('CLI recovery publishes exact action variants and a separate read-only insp
   const row = body.results.find(entry => entry.name === 'cli_setup');
   assert.ok(row, JSON.stringify(body));
   assert.deepEqual(row.capabilityVariants?.map(v => v.capabilityRef).sort(), [
-    'cap:local:cli_setup:auth', 'cap:local:cli_setup:install', 'cap:local:cli_setup:repair',
+    'cap:local:cli_setup:auth', 'cap:local:cli_setup:install', 'cap:local:cli_setup:remember', 'cap:local:cli_setup:repair',
   ]);
   const auth = await local.observeCurrentLocalPlanningDefinition({ name: 'cli_setup', carrier: 'work_call' });
   assert.equal(auth.ok, true);
@@ -83,7 +83,12 @@ test('installing, signing in or repairing a CLI is ordinary local work, named li
   assert.equal(shell.ok, true);
   if (!installer.ok || !shell.ok) return;
   assert.deepEqual(installer.definitions.map((d) => d.capabilityRef).sort(),
-    ['cap:local:cli_setup:auth', 'cap:local:cli_setup:install', 'cap:local:cli_setup:repair']);
+    ['cap:local:cli_setup:auth', 'cap:local:cli_setup:install', 'cap:local:cli_setup:remember', 'cap:local:cli_setup:repair']);
+  const remember = installer.definitions.find(definition => definition.capabilityRef === 'cap:local:cli_setup:remember');
+  assert.ok(remember);
+  assert.equal(local.localPlanningArgumentsMatch(remember, { action: 'remember', command: 'controlled-cli' }), true);
+  assert.equal(local.localPlanningArgumentsMatch(remember, { action: 'remember', command: 'controlled-cli', saveAs: 'different-cli' }), false);
+  assert.equal(local.localPlanningArgumentsMatch(remember, { action: 'remember', command: 'controlled-cli', catalogId: 'github' }), false);
   for (const definition of installer.definitions) {
     assert.equal(definition.reversibility, shell.definition.reversibility, definition.capabilityRef);
     assert.equal(definition.reversibility, 'ordinary_non_destructive', definition.capabilityRef);
