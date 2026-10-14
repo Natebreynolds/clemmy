@@ -18,9 +18,12 @@ import { assertHostConnectionProgress, bindHostConnectionProgress, clearHostConn
 import { declaresWorkflowDispatchReceipt } from './workflow-dispatch-commit.js';
 import { applyWholeResponseFormatFinding, responseFormatRepairPacket, wholeResponseFormatFinding,
   wholeResponseFormatRequirement, WHOLE_JSON_OBJECT_REVIEW_GUIDANCE, normalizeWholeResponseFence,
+  captureReplyFormatModelSettings,
   responseFenceNormalizationCurrent, captureOwnerResponseFormat, ownerResponseFormatGuidance, currentOwnerResponseFormatRequirement,
   type OwnerResponseFormatCapture, type ResponseFenceOwner, type ResponseFenceNormalization } from './response-format-repair.js';
 import { completedModelResponseBinding, type CompletedModelResponseBinding } from './model-response-binding.js';
+import { getCompletedResponseAuthor, withModelRouteMetrics } from '../model-route-metrics.js';
+import { claimReplyFormatRepairSlot } from './reply-format-repair-slot.js';
 import { verifiedIntakeHasOwnerStatedMemory, verifiedMemoryIntakeContext, verifiedMemoryConsolidationEvidence } from './durable-memory-intake-receipt.js';
 import { hostModelOutputPreview } from './host-model-output-preview.js';
 import { workflowActivationSuccessor } from './workflow-activation-successor.js';
@@ -85,7 +88,7 @@ import { parseModelToolArgumentObject } from './model-tool-argument-json.js';
  * the conversation owner persists that resumable state.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { isDeepStrictEqual } from 'node:util';
+import { isDeepStrictEqual, types as utilTypes } from 'node:util';
 import { withPlanCompletionReview, planReviewDigest, type PlanReviewCandidate } from './plan-publication-review.js';
 import {
   GuardrailExecutionError,
@@ -4196,13 +4199,44 @@ const runHostTurnBody = async (
    *  continuation, so a continuation that added no evidence is recognisable
    *  before a second identical verdict is bought. */
   let judgedBusinessCallsAtLastVerdict: number | undefined = carriedProgress?.continuations.judgedBusinessCallsAtLastVerdict;
+  type CompletedReplyAuthor = { author: NonNullable<ReturnType<typeof getCompletedResponseAuthor>>;
+    response: unknown; modelSettings: ModelRequest['modelSettings'];
+    binding: CompletedModelResponseBinding; owner: ResponseFenceOwner };
   let pendingResponseFormatRepair: { objective: string; instructions: string; text: string;
-    author: ResolvedRoleModel; model: Model } | undefined;
+    author: { modelId: string; provider: string }; model: Model; reviewedAuthor?: ResolvedRoleModel;
+    original?: CompletedReplyAuthor; slotEventId?: string; standingInstructions?: string } | undefined;
   /** Set by the review when the answer ships without the claims it flagged. */
   let reviewedReplacementText: string | undefined;
   let ownerResponseFormatHeld: 'unmet' | 'unqualified' | undefined;
   const originalCompletedStepResponses = new WeakMap<object, { response: unknown; binding: CompletedModelResponseBinding;
     sessionId: string; sourceUserSeq: number; attemptId: string; owner: ResponseFenceOwner }>();
+  // Invocation-local proof only. Neither serialized route metadata nor today's
+  // configured brain can recreate the model that actually wrote this draft.
+  const originalCompletedStepAuthors = new WeakMap<object, CompletedReplyAuthor>();
+  let selectedReplyAuthor: (CompletedReplyAuthor & { digest: string }) | undefined;
+  const sameReplyOwner = (left: ResponseFenceOwner, right: ResponseFenceOwner | undefined): boolean => Boolean(right
+    && left.sessionId === right.sessionId && left.sourceUserSeq === right.sourceUserSeq
+    && left.attemptId === right.attemptId && left.objective === right.objective
+    && JSON.stringify(left.ownerInstructions) === JSON.stringify(right.ownerInstructions));
+  const inertReplyResponse = (response: unknown): response is object => {
+    try {
+      if (!response || typeof response !== 'object' || utilTypes.isProxy(response)
+        || ![Object.prototype, null].includes(Object.getPrototypeOf(response))) return false;
+      for (const key of ['id', 'responseId', 'output']) {
+        const descriptor = Object.getOwnPropertyDescriptor(response, key);
+        if ((descriptor && !Object.hasOwn(descriptor, 'value')) || (!descriptor && key in response)) return false;
+      }
+      return true;
+    } catch { return false; }
+  };
+  const currentReplyAuthor = (proof: CompletedReplyAuthor): boolean => {
+    if (!sameReplyOwner(proof.owner, currentFenceOwner()) || !inertReplyResponse(proof.response)
+      || getCompletedResponseAuthor(proof.response) !== proof.author) return false;
+    const binding = completedModelResponseBinding(proof.response);
+    return Boolean(binding && binding.modelCallId === proof.binding.modelCallId
+      && binding.physicalAttempt === proof.binding.physicalAttempt
+      && binding.providerResponseIdDigest === proof.binding.providerResponseIdDigest);
+  };
 
   const currentFenceOwner = (): ResponseFenceOwner | undefined => {
     try {
@@ -4220,6 +4254,48 @@ const runHostTurnBody = async (
         objective, ...adoptedSteerNotesForSource(identity).map(note => note.text),
       ] };
     } catch { return undefined; }
+  };
+  // A restarted invocation cannot reconstruct its private author/packet from
+  // current defaults. This is a negative meter check, never dispatch consent.
+  const readSourceFormatSpend = (): { status: 'absent' | 'unavailable' }
+    | { status: 'spent'; objectiveDigest: string; ownerInstructionsDigest: string } => {
+    try {
+      const identity = exactHostIdentity();
+      const db = openEventLog();
+      const rows = db.prepare(`SELECT parent_event_id AS parent,
+          CASE WHEN length(data_json) <= 8192 THEN data_json END AS data
+        FROM events WHERE session_id = ? AND seq >= ? AND type = 'guardrail_tripped' AND role = 'system'
+        AND CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.kind') = 'source_reply_format_repair_spent'
+          AND (json_type(data_json, '$.sourceUserSeq') IS NOT 'integer' OR json_extract(data_json, '$.sourceUserSeq') = ?)
+          ELSE 1 END LIMIT 2`).all(identity.sessionId, identity.sourceUserSeq, identity.sourceUserSeq) as Array<{ parent: string | null; data: string | null }>;
+      if (!rows.length) return { status: 'absent' };
+      if (rows.length !== 1 || !rows[0]!.data) return { status: 'unavailable' };
+      const marker = JSON.parse(rows[0]!.data) as Record<string, unknown>;
+      const source = db.prepare(`SELECT id FROM events WHERE session_id = ? AND seq = ?
+        AND type = 'user_input_received' AND role = 'user'
+        AND CASE WHEN json_valid(data_json) THEN json_type(data_json) = 'object'
+          AND (json_type(data_json, '$.synthetic') IS NULL OR json_type(data_json, '$.synthetic') = 'false') ELSE 0 END`)
+        .get(identity.sessionId, identity.sourceUserSeq) as { id: string } | undefined;
+      if (!source || rows[0]!.parent !== source.id
+        || !['kind', 'version', 'sessionId', 'sourceUserSeq', 'objectiveDigest', 'ownerInstructionsDigest'].every(key => Object.hasOwn(marker, key))
+        || marker.kind !== 'source_reply_format_repair_spent' || marker.version !== 1
+        || marker.sessionId !== identity.sessionId || marker.sourceUserSeq !== identity.sourceUserSeq
+        || typeof marker.objectiveDigest !== 'string' || !/^[a-f0-9]{64}$/.test(marker.objectiveDigest)
+        || typeof marker.ownerInstructionsDigest !== 'string' || !/^[a-f0-9]{64}$/.test(marker.ownerInstructionsDigest)) return { status: 'unavailable' };
+      return { status: 'spent', objectiveDigest: marker.objectiveDigest, ownerInstructionsDigest: marker.ownerInstructionsDigest };
+    } catch { return { status: 'unavailable' }; }
+  };
+  const sourceFormatSpendHoldsFreshModel = (): boolean => {
+    const spend = readSourceFormatSpend();
+    if (spend.status === 'absent') return false;
+    if (spend.status !== 'spent') return true;
+    const owner = currentFenceOwner();
+    const accepted = acceptedObjectiveForSource(exactHostIdentity());
+    if (!owner || !accepted?.trim() || accepted !== owner.objective) return true;
+    // Only current accepted/adopted owner instructions can permit the ordinary
+    // path again. A new attempt, candidate, route or settings change cannot.
+    return createHash('sha256').update(owner.objective, 'utf8').digest('hex') === spend.objectiveDigest
+      && createHash('sha256').update(JSON.stringify(owner.ownerInstructions), 'utf8').digest('hex') === spend.ownerInstructionsDigest;
   };
   // A chosen writer's pending final-answer step, the last brain draft sent to
   // it (a draft is never written twice), and the reply it wrote, so review
@@ -4590,6 +4666,7 @@ const runHostTurnBody = async (
     normalizedResponse?: { normalization: ResponseFenceNormalization; originalReply: string },
     ownerFormatCapture?: OwnerResponseFormatCapture,
     ownerFormatRequiredAtRequest = false,
+    formatRepairReviewRequired = false,
   ): Promise<'continue' | 'done' | 'awaiting_user_input'> => {
     ownerResponseFormatHeld = undefined;
     // This host-owned, tool-free activation explains why the work stopped.
@@ -4683,7 +4760,7 @@ const runHostTurnBody = async (
       return noWork;
     };
     if (
-      !explicitMemoryRequired && !memoryRequirementRequired && selfContainedConversation(objective, intent)
+      !formatRepairReviewRequired && !explicitMemoryRequired && !memoryRequirementRequired && selfContainedConversation(objective, intent)
       && (businessCalls.length === 0 || freshSourceHasNoWork())
       && settled.count === 0
       && !inheritedReads
@@ -4723,7 +4800,7 @@ const runHostTurnBody = async (
       conversationalIntent: intentRequestsNoToolWork(intent.intent),
       openApprovalCard,
     };
-    const gate = shouldRunObjectiveJudge(gateInput)
+    const gate = formatRepairReviewRequired || shouldRunObjectiveJudge(gateInput)
       // A continued answer cannot waive its inherited evidence review by
       // asking for input. The reviewer decides whether that input is really
       // needed; its awaiting-user verdict still pauses without effect consent.
@@ -4753,7 +4830,7 @@ const runHostTurnBody = async (
     // A read answer can correct missing records using already-retained evidence
     // without a new call or a "done" verb. Carrying its old verdict would mark
     // the correction unfulfilled without ever showing it to the reviewer.
-    if (!planCandidate && completionReviewFeedback && objectiveJudgeContinuations >= 1
+    if (!formatRepairReviewRequired && !planCandidate && completionReviewFeedback && objectiveJudgeContinuations >= 1
       && completionReviewFeedback.replyDigest === createHash('sha256').update(judgedReply, 'utf8').digest('hex')
       && judgedBusinessCallsAtLastVerdict === businessCalls.length
       && honestFailureReportSettles({
@@ -4986,10 +5063,61 @@ const runHostTurnBody = async (
     // A BLOCKED verdict says another attempt cannot change the outcome; the
     // reviewer's finding goes to the owner instead of a re-run.
     const blockedByReview = verdict.blocked === true && !verdict.failedOpen;
-    const continuation = verdict.reviewDisposition !== 'answered_unqualified' && !honestStop && !blockedByReview
+    const ordinaryContinuation = verdict.reviewDisposition !== 'answered_unqualified' && !honestStop && !blockedByReview
       && !(memoryRequirementRequired && verdict.failedOpen) && ((!verdict.done && !awaitingInput)
       || (awaitingInput && planCandidate?.readiness === 'ready')) && !signal?.aborted
       && (Boolean(planCandidate) || objectiveJudgeContinuations < MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS);
+    const formatPacket = responseFormatRepairPacket({ ...verdict,
+      plan: Boolean(planCandidate) || turnIsPlanMode(), objective, reply: judgedReply, reason: verdict.reason,
+      effectiveObjective: [inheritedObjective
+        ? `Exact stopped effective objective, including adopted steering:\n${inheritedObjective.objective}` : undefined,
+        `Current effective objective and amendments:\n${objective}`,
+        agentInstructions ? `Applicable standing instructions:\n${agentInstructions}` : undefined,
+        responseFormatRequirement ? WHOLE_JSON_OBJECT_REVIEW_GUIDANCE : undefined,
+      ].filter(Boolean).join('\n\n') });
+    const candidateDigest = createHash('sha256').update(judgedReply, 'utf8').digest('hex');
+    const actualAuthor = selectedReplyAuthor?.digest === candidateDigest
+      && currentReplyAuthor(selectedReplyAuthor) ? selectedReplyAuthor : undefined;
+    // A qualified format-only finding can spend a distinct, source-wide slot
+    // after ordinary task repairs are exhausted. It cannot authorize more task
+    // work, reset the claims budget, or turn an unqualified review into a pass.
+    const assessment = completionReviewAssessmentDiagnostic(verdict.reviewAssessment);
+    const observation = reviewInputOwner && reviewInputObservationForSource(verdict.reviewInputObservation, {
+      ...reviewInputOwner, objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex'), candidateDigest });
+    const qualifiedFormatFinding = assessment?.status === 'qualified' && assessment.reason === 'consistent'
+      && Boolean(assessment.packetSha256 && assessment.packetBytes && assessment.originalModelCallId
+        && assessment.physicalAttempt && assessment.providerResponseIdDigest)
+      && observation?.status === 'bound' && observation.scope === 'sdk_model_entry'
+      && observation.modelCallId === assessment.originalModelCallId
+      && observation.physicalAttempt === assessment.physicalAttempt
+      && observation.providerResponseIdDigest === assessment.providerResponseIdDigest
+      && !verdict.failedOpen && !verdict.reviewFailure && !verdict.fast && !verdict.substituteForExactPin
+      && verdict.reviewDisposition !== 'answered_unqualified'
+      && verdict.reviewConfirmation !== 'unavailable' && verdict.reviewConfirmation !== 'overruled'
+      && (!verdict.evidenceCoverage || (verdict.evidenceCoverage.status === 'sufficient'
+        && !verdict.evidenceCoverage.returnedForCorrection && verdict.evidenceCoverage.followUp !== 'unanswered'));
+    let formatSlotEventId: string | undefined;
+    if (!ordinaryContinuation && objectiveJudgeContinuations === MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS
+      && !honestStop && !blockedByReview && !awaitingInput && !signal?.aborted && !openApprovalCard
+      && formatPacket && actualAuthor && qualifiedFormatFinding
+      && !hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq)) {
+      const slot = claimReplyFormatRepairSlot({ sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
+        attemptId: actualAuthor.owner.attemptId,
+        objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex'),
+        ownerInstructionsDigest: createHash('sha256').update(JSON.stringify(actualAuthor.owner.ownerInstructions), 'utf8').digest('hex'),
+        candidateDigest, original: actualAuthor.binding,
+        author: { modelId: actualAuthor.author.modelId, provider: actualAuthor.author.provider } });
+      if (slot.status === 'claimed') formatSlotEventId = slot.eventId;
+    }
+    const continuation = ordinaryContinuation || Boolean(formatSlotEventId);
+    if (formatPacket && !ordinaryContinuation && objectiveJudgeContinuations === MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS
+      && !formatSlotEventId) journalHostGuide('response_format_repair', { phase: 'not_armed',
+      authorBound: Boolean(actualAuthor), qualifiedFinding: qualifiedFormatFinding,
+      assessment: assessment?.status ?? 'missing', inputObservation: observation?.status ?? 'missing',
+      originalReviewBound: Boolean(assessment?.originalModelCallId && observation?.status === 'bound'
+        && observation.modelCallId === assessment.originalModelCallId
+        && observation.physicalAttempt === assessment.physicalAttempt
+        && observation.providerResponseIdDigest === assessment.providerResponseIdDigest) });
     let judgedVerdictRow: ReturnType<typeof appendEvent> | undefined;
     try {
       judgedVerdictRow = appendEvent({
@@ -5109,6 +5237,7 @@ const runHostTurnBody = async (
           ...(verdict.awaitingUser ? { awaitingUser: true } : {}),
           continuation,
           continuationsUsed: objectiveJudgeContinuations,
+          ...(formatSlotEventId ? { formatRepairContinuation: { slotEventId: formatSlotEventId, tools: 0 } } : {}),
         },
       });
     } catch { /* telemetry never blocks the reply */ }
@@ -5181,7 +5310,7 @@ const runHostTurnBody = async (
     } catch { /* telemetry never blocks the reply */ }
     if (awaitingInput && !continuation) return 'awaiting_user_input';
     if (!continuation) return 'done';
-    objectiveJudgeContinuations += 1;
+    if (!formatSlotEventId) objectiveJudgeContinuations += 1;
     judgedBusinessCallsAtLastVerdict = businessCalls.length;
     // A rejected final draft has no accepted tool-batch checkpoint. Putting
     // it in canonical history breaks the next batch's exact prehistory. Keep
@@ -5196,21 +5325,22 @@ const runHostTurnBody = async (
       ...((verdict.repairScope === 'claims' || verdict.repairScope === 'reply_format') && !planCandidate
         ? { repairScope: verdict.repairScope, quotes: reviewQuotes(verdict.reason).slice(0, 24) } : {}),
     };
-    const formatPacket = responseFormatRepairPacket({ ...verdict,
-      plan: Boolean(planCandidate) || turnIsPlanMode(), objective, reply: judgedReply, reason: verdict.reason,
-      effectiveObjective: [inheritedObjective
-        ? `Exact stopped effective objective, including adopted steering:\n${inheritedObjective.objective}` : undefined,
-        `Current effective objective and amendments:\n${objective}`,
-        agentInstructions ? `Applicable standing instructions:\n${agentInstructions}` : undefined,
-        responseFormatRequirement ? WHOLE_JSON_OBJECT_REVIEW_GUIDANCE : undefined,
-      ].filter(Boolean).join('\n\n') });
-    // A compact formatting call may reuse only the exact final writer that
-    // authored this reviewed draft. A configured worker is not that author.
-    // Without this capture, ordinary source-bound feedback keeps the primary
-    // agent on its own route and preserves its complete context.
+    // Reuse the actual completed author, including a rescued primary draft.
+    // An older explicit-writer capture keeps its ordinary-budget path only;
+    // it cannot prove a concrete winning author for the separate late slot.
     const formatAuthor = hostWrittenReply?.digest === completionReviewFeedback.replyDigest ? hostWrittenReply : undefined;
-    pendingResponseFormatRepair = formatPacket && formatAuthor
-      ? { objective, ...formatPacket, author: formatAuthor.author, model: formatAuthor.model } : undefined;
+    pendingResponseFormatRepair = formatPacket && actualAuthor
+      ? { objective, ...formatPacket, author: actualAuthor.author,
+        model: withModelRouteMetrics(actualAuthor.author.model, { sessionId: identity.sessionId, role: 'writer',
+          requestedModel: actualAuthor.author.modelId, resolvedModel: actualAuthor.author.modelId,
+          provider: actualAuthor.author.provider, source: 'explicit' }), original: actualAuthor,
+        standingInstructions: agentInstructions,
+        ...(formatAuthor?.author.modelId === actualAuthor.author.modelId && formatAuthor.author.provider === actualAuthor.author.provider
+          ? { reviewedAuthor: formatAuthor.author } : {}),
+        ...(formatSlotEventId ? { slotEventId: formatSlotEventId } : {}) }
+      : formatPacket && formatAuthor && ordinaryContinuation
+        ? { objective, ...formatPacket, author: formatAuthor.author, reviewedAuthor: formatAuthor.author, model: formatAuthor.model }
+        : undefined;
     return 'continue';
   };
 
@@ -5508,6 +5638,7 @@ const runHostTurnBody = async (
     exactModel?: Model,
     answerDraft?: AnswerDraftStep,
     finalRequestReading?: PromptReadingPublisher,
+    exactModelSettings?: ModelRequest['modelSettings'],
   ): Promise<Awaited<ReturnType<typeof codexOneStep>>> => {
     reachedModel = true;
     let publishedFinalReading = false;
@@ -5651,7 +5782,7 @@ const runHostTurnBody = async (
       if (signal.aborted) rejectAbort();
       else signal.addEventListener('abort', rejectAbort, { once: true });
     });
-    const settingsForStep = exactRoleModelId ? {} : stepModelSettings();
+    const settingsForStep = exactModelSettings ?? (exactRoleModelId ? {} : stepModelSettings());
     const hostProjection = canonicalPromptCacheRequest({
       ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
       input: modelInput,
@@ -5677,6 +5808,7 @@ const runHostTurnBody = async (
     } catch { /* Observation cannot move or replace the dispatch authority fence. */ }
     let observedOutcome: 'returned' | 'failed' = 'failed';
     let originalCompletedResponse: unknown;
+    let completedReplySettings: ModelRequest['modelSettings'] | undefined;
     const observedResponseBindings = new Map<string, CompletedModelResponseBinding>();
     const returnedAttempts = new Set<string>();
     const returnedCalls = new Set<string>();
@@ -5693,7 +5825,7 @@ const runHostTurnBody = async (
       modelSettings: settingsForStep,
       signal: controller.signal,
       stream: true,
-      ...(producerOwner ? { onCompletedResponse: (response: unknown) => { originalCompletedResponse = response; } } : {}),
+      ...(potentialProducerOwner ? { onCompletedResponse: (response: unknown) => { originalCompletedResponse = response; } } : {}),
       ...(hostProduction
         ? {
             beforeModelDispatch: (request: ModelRequest) => {
@@ -5707,6 +5839,7 @@ const runHostTurnBody = async (
                 request,
                 hostProjection,
               });
+              if (potentialProducerOwner) completedReplySettings = captureReplyFormatModelSettings(request.modelSettings);
               observedRequestOrdinal = provenance.record.requestOrdinal;
               if (provenance.removedOptionalLayer) {
                 console.warn(
@@ -5766,22 +5899,27 @@ const runHostTurnBody = async (
         aborted,
       ]);
       observedOutcome = 'returned';
-      if (producerOwner && originalCompletedResponse && !signal?.aborted && !cancelAuthority.signal.aborted) {
+      if (potentialProducerOwner && originalCompletedResponse && !signal?.aborted && !cancelAuthority.signal.aborted) {
         try {
+          // Newly observed ordinary responses must add no accessor/proxy reads.
+          // The pre-existing whole-output normalization path retains its policy.
+          const inertOriginal = inertReplyResponse(originalCompletedResponse);
+          if (!producerOwner && !inertOriginal) return result;
           const binding = completedModelResponseBinding(originalCompletedResponse);
           const current = currentFenceOwner();
           const key = binding && `${binding.modelCallId}:${binding.physicalAttempt}`;
           const observed = key && observedResponseBindings.get(key);
-          if (binding && observed && current && current.sessionId === producerOwner.sessionId
-            && current.sourceUserSeq === producerOwner.sourceUserSeq && current.attemptId === producerOwner.attemptId
-            && current.objective === producerOwner.objective
-            && JSON.stringify(current.ownerInstructions) === JSON.stringify(producerOwner.ownerInstructions)
+          if (binding && observed && current && sameReplyOwner(potentialProducerOwner, current)
             && returnedAttempts.has(key!) && returnedCalls.has(binding.modelCallId)
             && observed.providerResponseIdDigest === binding.providerResponseIdDigest
             && result.output === (originalCompletedResponse as { output?: unknown }).output) {
-            originalCompletedStepResponses.set(result, { response: originalCompletedResponse, binding,
+            if (producerOwner) originalCompletedStepResponses.set(result, { response: originalCompletedResponse, binding,
               sessionId: current.sessionId, sourceUserSeq: current.sourceUserSeq, attemptId: current.attemptId,
               owner: producerOwner });
+            const author = inertOriginal ? getCompletedResponseAuthor(originalCompletedResponse) : undefined;
+            if (author && completedReplySettings !== undefined) originalCompletedStepAuthors.set(result, {
+              author, response: originalCompletedResponse, modelSettings: completedReplySettings,
+              binding, owner: potentialProducerOwner });
           }
         } catch { /* Missing original proof keeps the original reply unchanged. */ }
       }
@@ -10070,7 +10208,7 @@ const runHostTurnBody = async (
     }
   }
 
-  if (hostProduction && !resumedHostState && !resumedRecoveryState) {
+  if (hostProduction && !resumedHostState && !resumedRecoveryState && readSourceFormatSpend().status === 'absent') {
     let namedWorkflowDispatchInput: {
       sessionId: string;
       sourceUserSeq: number;
@@ -10783,16 +10921,22 @@ const runHostTurnBody = async (
       }
       const formatRepair = pendingResponseFormatRepair;
       pendingResponseFormatRepair = undefined;
-      // New owner/recovery guidance wins. An interrupted optimization falls
-      // back to the normal retained feedback path; it never loses the finding.
+      // New owner guidance wins. A late wording allowance itself cannot fall
+      // through into another task round when its proof or host guidance changes.
       if (formatRepair && !hostWriterForStep && formatRepair.objective === judgedObjective()
-        && !adoptedSteering && !modelInputDirective && !watcherDirectiveForStep) {
+        && (formatRepair.original ? currentReplyAuthor(formatRepair.original) : !adoptedSteering)
+        && (!formatRepair.original || formatRepair.standingInstructions === sessionAgentReviewContext(exactHostIdentity().sessionId))
+        && !modelInputDirective && !watcherDirectiveForStep) {
         formatRepairForStep = formatRepair;
         modelInput = [{ role: 'user', content: formatRepair.text }];
         instructions = formatRepair.instructions;
         journalHostGuide('response_format_repair', { modelId: formatRepair.author.modelId,
           provider: formatRepair.author.provider, role: 'writer',
           promptChars: formatRepair.text.length, tools: 0 });
+      } else if (formatRepair?.slotEventId
+        && (!formatRepair.original || sameReplyOwner(formatRepair.original.owner, currentFenceOwner()))) {
+        return blockedOutcome('The work is kept, but I could not safely finish the final wording correction. The answer is still unverified.',
+          'reply_format_repair_unavailable');
       }
       if (hostProduction && !hostWriterForStep && !formatRepairForStep) {
         const clarification = projectClarificationPromptContext({ ...exactHostIdentity(),
@@ -10860,10 +11004,17 @@ const runHostTurnBody = async (
         }
         answerDraft = beginAnswerDraft({ ...answerOwner, mode: held ? 'held' : 'live' });
       }
+      if (hostProduction && !formatRepairForStep && sourceFormatSpendHoldsFreshModel()) {
+        answerDraft?.retract();
+        return blockedOutcome('The completed work is kept, but I could not restore its one-time wording correction. The answer is still unverified. Tell me to finish the answer from the saved results so I can continue from that work.',
+          'reply_format_repair_unavailable');
+      }
       if (hostWriterForStep) {
         step = await runHostWriterStep(hostWriterForStep, modelInput, instructions, answerDraft);
       } else if (formatRepairForStep) {
         const formatAuthor = formatRepairForStep;
+        const formatSettings = formatAuthor.original ? captureReplyFormatModelSettings(formatAuthor.original.modelSettings) : undefined;
+        if (formatAuthor.original && formatSettings === undefined) throw new UnsupportedHostCapabilityError('response_format_repair_settings_unavailable');
         const identity = exactHostIdentity();
         const inherited = modelUsageAttributionStorage.getStore();
         step = await withModelUsageAttribution({
@@ -10872,10 +11023,12 @@ const runHostTurnBody = async (
           ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}),
           channel: 'writer:format', role: 'writer',
         }, () => runOneModelStep(modelInput, instructions, [], formatAuthor.author.modelId,
-          formatAuthor.model, answerDraft, finalRequestReading));
+          formatAuthor.model, answerDraft, finalRequestReading,
+          formatSettings));
         if (step.toolCalls.length > 0) throw new UnsupportedHostCapabilityError('response_format_repair_tool_call');
-        hostWrittenReply = { digest: createHash('sha256').update(step.text, 'utf8').digest('hex'),
-          author: formatAuthor.author, model: formatAuthor.model };
+        hostWrittenReply = formatAuthor.reviewedAuthor
+          ? { digest: createHash('sha256').update(step.text, 'utf8').digest('hex'),
+            author: formatAuthor.reviewedAuthor, model: formatAuthor.model } : undefined;
       } else {
         step = await runOneModelStep(
           modelInput, instructions, modelStepSchemas, undefined, undefined, answerDraft,
@@ -10917,6 +11070,13 @@ const runHostTurnBody = async (
       if (error instanceof SourceBudgetBoundaryError) {
         journalHostGuide('accepted_source_budget_reached', { reason: error.reason, ...error.evidence });
         return blockedOutcome(error.message, error.reason);
+      }
+      if (formatRepairForStep?.slotEventId && !(error instanceof KillRequested) && !signal?.aborted) {
+        // The debit remains spent even when transport/output fails. Never turn
+        // this tool-free attempt into an ordinary retry with tools or a new route.
+        assertRecoveryActivationOwned();
+        return blockedOutcome('The work is kept, but the final wording correction did not finish safely. The answer is still unverified.',
+          'reply_format_repair_unavailable');
       }
       // This host admits a complete model frame before running any of its
       // tools. Even after partial text or arguments streamed, a rejected frame
@@ -11022,6 +11182,17 @@ const runHostTurnBody = async (
     // not the raw stream, is what the draft settles on.
     if (admission.admitted && admission.frame.kind === 'completed') answerDraft?.complete(admission.frame.text);
     else answerDraft?.retract(admission.admitted ? 'tool_call' : undefined);
+    const lateFormatCandidate = Boolean(formatRepairForStep?.slotEventId);
+    if (lateFormatCandidate) {
+      const decision = admission.admitted && admission.frame.kind === 'completed'
+        ? toOrchestratorDecision(admission.frame.text) : undefined;
+      if (!admission.admitted || admission.frame.kind !== 'completed' || (decision
+        && (decision.controlReceipt || decision.nextAction !== 'completed' || decision.reply !== admission.frame.text))) {
+        answerDraft?.retract();
+        return blockedOutcome('The work is kept, but the final wording correction did not produce a complete answer. The answer is still unverified.',
+          'reply_format_repair_unavailable');
+      }
+    }
     if (!admission.admitted) {
       if (admission.reason === 'provider_limit_hit') {
         // A response window limits one emission, not the accepted job. None
@@ -11064,7 +11235,7 @@ const runHostTurnBody = async (
       // them. The existing reducer persists public ownership before starting
       // any member; unprepared prose and another source cannot take this path.
       // Report-back joins every sealed member and reviews the actual result.
-      if (hostProduction) {
+      if (hostProduction && !lateFormatCandidate) {
         const identity = exactHostIdentity();
         // Read-only eligibility avoids entering the filesystem close lock for
         // an ordinary reply. This prefilter grants nothing; the shared reducer
@@ -11119,7 +11290,7 @@ const runHostTurnBody = async (
         if (step.responseId !== undefined) lastResponseId = step.responseId;
         return stopNoProgress('required_question_not_issued');
       }
-      if (hostProduction && !acceptedReadPlanContinuationUsed) {
+      if (hostProduction && !lateFormatCandidate && !acceptedReadPlanContinuationUsed) {
         const identity = exactHostIdentity();
         const pendingReadPlan = pendingAcceptedReadPlan(identity);
         if (pendingReadPlan) {
@@ -11134,6 +11305,7 @@ const runHostTurnBody = async (
       }
       if (
         hostProduction
+        && !lateFormatCandidate
         && !acceptedReadPlanContinuationUsed
         && pendingGraphNeutralReadFromHistory(history)
       ) {
@@ -11151,7 +11323,7 @@ const runHostTurnBody = async (
         }, 'host retained the nominated graph-neutral read instead of publishing a prose stop');
         continue;
       }
-      if (hostProduction && !acceptedUniqueWorkflowContinuationUsed) {
+      if (hostProduction && !lateFormatCandidate && !acceptedUniqueWorkflowContinuationUsed) {
         const workflowName = pendingUniqueWorkflowNameFromHistory(history);
         if (workflowName) {
           acceptedUniqueWorkflowContinuationUsed = true;
@@ -11163,7 +11335,7 @@ const runHostTurnBody = async (
           continue;
         }
       }
-      if (hostProduction) {
+      if (hostProduction && !lateFormatCandidate) {
         const identity = exactHostIdentity();
         const missingWorkflowResult = missingWorkflowStepResultContinuation({
           sessionId: identity.sessionId,
@@ -11192,7 +11364,7 @@ const runHostTurnBody = async (
           continue;
         }
       }
-      if (hostProduction) {
+      if (hostProduction && !lateFormatCandidate) {
         const decision = toOrchestratorDecision(admission.frame.text);
         // The bare CONTINUE: shape (turn-decision.ts): done:false,
         // awaiting_handoff_result, reply null, the note in reason. A narrated
@@ -11265,7 +11437,7 @@ const runHostTurnBody = async (
           }
         }
       }
-      if (hostProduction) {
+      if (hostProduction && !lateFormatCandidate) {
         const { pendingAcceptedLocalWork, pendingLocalWorkContinuation } = await import('./local-work-completion.js');
         const identity = exactHostIdentity();
         const pending = pendingAcceptedLocalWork(identity);
@@ -11344,10 +11516,14 @@ const runHostTurnBody = async (
         }
         const candidateText = normalization?.text ?? admission.frame.text;
         if (normalization) answerDraft?.complete(candidateText);
+        const actualAuthor = originalCompletedStepAuthors.get(step);
+        selectedReplyAuthor = actualAuthor && step.text === admission.frame.text && step.toolCalls.length === 0
+          && sameReplyOwner(actualAuthor.owner, owner)
+          ? { ...actualAuthor, digest: createHash('sha256').update(candidateText, 'utf8').digest('hex') } : undefined;
         const completionObjective = judgedObjective();
         const judged = await judgeHostCompletion(candidateText, admission.frame.history, step.responseId, undefined,
           normalization ? { normalization, originalReply: admission.frame.text } : undefined,
-          ownerResponseFormatForStep, ownerResponseFormatRequiredForStep);
+          ownerResponseFormatForStep, ownerResponseFormatRequiredForStep, Boolean(formatRepairForStep));
         try {
           if (reopenForOwnerSteering(completionObjective, answerDraft)) continue;
           if (ownerResponseFormatHeld) {
@@ -12780,7 +12956,8 @@ export function isNarratableHostStop(outcome: RunOutcome): boolean {
   if (outcome.terminal.reason === 'owner_response_format_unmet' || outcome.terminal.reason === 'owner_response_format_unqualified'
     || outcome.terminal.reason === 'owner_steering_fence_unavailable'
     || outcome.terminal.reason === 'unacknowledged_write_unverified'
-    || outcome.terminal.reason === 'write_inventory_unavailable') return false;
+    || outcome.terminal.reason === 'write_inventory_unavailable'
+    || outcome.terminal.reason === 'reply_format_repair_unavailable') return false;
   // A terminal the loop gives a notice is app chrome: the clients draw the
   // notice in place of a reply, so a narrated sentence would never be shown.
   if (outcome.terminal.reason === STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON) return false;

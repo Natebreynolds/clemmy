@@ -1,6 +1,66 @@
 import { createHash } from 'node:crypto';
 import { types as utilTypes } from 'node:util';
+import type { ModelRequest } from '@openai/agents-core';
 import { completedModelResponseBinding, type CompletedModelResponseBinding } from './model-response-binding.js';
+
+/** Private request settings only. Unsupported values decline the optional
+ * answer-only shortcut; they never alter ordinary model dispatch. */
+export function captureReplyFormatModelSettings(settings: unknown): ModelRequest['modelSettings'] | undefined {
+  try {
+    let nodes = 0, bytes = 0;
+    const active = new Set<object>();
+    const clone = (value: unknown, depth = 0): unknown => {
+      if (++nodes > 1_024 || depth > 16) throw new Error('unsupported settings');
+      if (typeof value === 'string') {
+        bytes += Buffer.byteLength(value, 'utf8');
+        if (bytes > 16_384) throw new Error('unsupported settings');
+        return value;
+      }
+      if (value === null || value === undefined || typeof value === 'boolean'
+        || (typeof value === 'number' && Number.isFinite(value))) return value;
+      if (typeof value !== 'object' || utilTypes.isProxy(value) || active.has(value)) throw new Error('unsupported settings');
+      const array = Array.isArray(value), prototype = Object.getPrototypeOf(value);
+      if ((prototype !== null && prototype !== (array ? Array.prototype : Object.prototype))
+        || (prototype && Object.getOwnPropertyDescriptor(prototype, 'toJSON'))) throw new Error('unsupported settings');
+      const keys = Reflect.ownKeys(value);
+      if (keys.length > 1_024) throw new Error('unsupported settings');
+      const descriptors = Object.getOwnPropertyDescriptors(value);
+      const entries = keys.filter(key => !(array && key === 'length'));
+      if (array && (entries.length !== descriptors.length?.value
+        || entries.some((key, index) => key !== String(index)))) throw new Error('unsupported settings');
+      const copy = array ? [] : Object.create(prototype);
+      active.add(value);
+      try {
+        for (const key of entries) {
+          if (typeof key !== 'string' || key === 'toJSON') throw new Error('unsupported settings');
+          bytes += Buffer.byteLength(key, 'utf8');
+          const entry = descriptors[key]!;
+          if (bytes > 16_384 || !entry.enumerable || !Object.hasOwn(entry, 'value')) throw new Error('unsupported settings');
+          Object.defineProperty(copy, key, { value: clone(entry.value, depth + 1), enumerable: true, writable: true, configurable: true });
+        }
+      } finally { active.delete(value); }
+      return copy;
+    };
+    const captured = clone(settings);
+    if (!captured || typeof captured !== 'object' || Array.isArray(captured)) return undefined;
+    const fields = captured as Record<string, unknown>;
+    if (fields.parallelToolCalls === true || (fields.toolChoice !== undefined
+      && fields.toolChoice !== 'auto' && fields.toolChoice !== 'none')) return undefined;
+    // Raw SDK body overrides could replace the tool-free packet itself. Reuse
+    // only a model override, unchanged; never strip an unsupported setting.
+    if (Object.hasOwn(fields, 'providerData')) {
+      const data = fields.providerData;
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return undefined;
+      const keys = Object.keys(data);
+      if (keys.length && (keys.length !== 1 || keys[0] !== 'model'
+        || typeof (data as Record<string, unknown>).model !== 'string'
+        || !(data as { model: string }).model.trim())) return undefined;
+    }
+    if (['tools', 'messages', 'input', 'instructions', 'systemInstructions', 'handoffs', 'tool_choice', 'functions',
+      'function_call', 'previous_response_id', 'previousResponseId'].some(key => Object.hasOwn(fields, key))) return undefined;
+    return captured as ModelRequest['modelSettings'];
+  } catch { return undefined; }
+}
 
 export interface WholeResponseFormatRequirement { kind: 'whole_json_object' }
 

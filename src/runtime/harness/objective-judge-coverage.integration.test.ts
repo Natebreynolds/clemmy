@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { after, beforeEach, mock, test } from 'node:test';
+import { after, beforeEach, mock, test, type TestContext } from 'node:test';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -403,7 +404,7 @@ test('a plan review and a review without evidence tools keep their existing sing
 });
 
 let inheritedAskSerial = 0;
-async function inheritedAskFixture(input: { objective?: string; continuation?: string; payload?: string } = {}) {
+async function inheritedAskFixture(input: { objective?: string; continuation?: string; payload?: string; primaryModel?: Model; primaryModelSettings?: ModelRequest['modelSettings']; primaryTools?: Array<{ name: string }>; maxModelCalls?: number; leasedAttempt?: boolean } = {}) {
   const eventlog = await import('./eventlog.js');
   const shadow = await import('../graph/turn-graph-shadow.js');
   const dispatch = await import('./dispatch-ledger.js');
@@ -460,7 +461,10 @@ async function inheritedAskFixture(input: { objective?: string; continuation?: s
     durableSourceId: runId, continuity, receipt: { requestId: `inherited-ask-request-${n}`, runId, inputHash: '1'.repeat(64) } });
   assert.equal(claimed.selection.disposition, 'branched');
   const sessionId = claimed.selection.sessionId;
-  const childAttempt = eventlog.beginRunAttempt(sessionId, { runId });
+  const lease = input.leasedAttempt ? eventlog.claimRunAttemptLease({ sessionId, runId,
+    ownerId: 'controlled-inherited-ask-owner', leaseMs: 60_000 }) : undefined;
+  if (lease) assert.equal(lease.claimed, true, 'the new fixture owns its real child attempt lease');
+  const childAttempt = lease?.attempt ?? eventlog.beginRunAttempt(sessionId, { runId });
   const childSource = eventlog.recordRunAttemptUserInput(childAttempt, { turn: 1, role: 'user',
     data: { text: continuation, runId, attemptId: childAttempt.attemptId } });
   const consumer = { sessionId, sourceUserSeq: childSource.seq, attemptId: childAttempt.attemptId };
@@ -468,7 +472,9 @@ async function inheritedAskFixture(input: { objective?: string; continuation?: s
   let writerEvidencePending = false;
   const primaryRequests: ModelRequest[] = [];
   async function run(replies: string[], options: Record<string, unknown> = {}, beforeModelFinish?: () => void) {
-    const agent = { tools: [], model: {
+    const { controlledRecoveryState, ...hostOptions } = options;
+    const agent = { tools: input.primaryTools ?? [], ...(input.primaryModelSettings ? { modelSettings: input.primaryModelSettings } : {}),
+      model: input.primaryModel ?? {
       async getResponse(request: ModelRequest) {
         primaryRequests.push(request);
         if (modelCalls === 0 && writerEvidencePending) commitWriterReadEvidence();
@@ -485,8 +491,9 @@ async function inheritedAskFixture(input: { objective?: string; continuation?: s
         yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } };
       },
     } };
-    const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId, universeTools: [], activeToolNames: [],
-      policyHash: 'controlled-inherited-ask-policy', budget: { maxUncachedTokens: 1_000, maxModelCalls: 8, maxToolCalls: 8, maxElapsedMs: 60_000 } });
+    const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId, universeTools: input.primaryTools ?? [],
+      activeToolNames: (input.primaryTools ?? []).map(tool => tool.name),
+      policyHash: 'controlled-inherited-ask-policy', budget: { maxUncachedTokens: 1_000, maxModelCalls: input.maxModelCalls ?? 8, maxToolCalls: 8, maxElapsedMs: 60_000 } });
     assert.equal(sealed.ok, true); if (!sealed.ok) throw new Error('fixture surface not sealed');
     envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
     envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
@@ -495,9 +502,10 @@ async function inheritedAskFixture(input: { objective?: string; continuation?: s
     return modelUsageAttributionStorage.run(consumer, () => brackets.withHarnessRunContext({ sessionId, sourceUserSeq: childSource.seq,
       runAttemptId: childAttempt.attemptId, interactiveForeground: true, counter: new brackets.ToolCallsCounter(8) },
       () => host.hostRunRunner(runner as never, agent as never,
-        [{ type: 'message', role: 'user', content: continuation }] as never,
+        (controlledRecoveryState === undefined ? [{ type: 'message', role: 'user', content: continuation }]
+          : controlledRecoveryState) as never,
         { maxTurns: 4, hostTurnEngine: 'host_v1', hostJudgeCompletion: true,
-          context: { sessionId, sourceUserSeq: childSource.seq }, ...options } as never)));
+          context: { sessionId, sourceUserSeq: childSource.seq }, ...hostOptions } as never)));
   }
   const reviews = () => eventlog.listEvents(sessionId, { types: ['goal_alignment_judged'] }).filter(row => row.data.kind === 'completion');
   const assertNoChildEffects = () => {
@@ -1006,4 +1014,463 @@ test('cloned, unbound and foreign-owner negative controls cannot authorize work 
     assert.equal(verdict.failedOpen,true);assert.equal(verdict.blocked,undefined);assert.equal(verdict.awaitingUser,undefined);
     assert.equal(verdict.repairScope,undefined);
   }
+});
+
+
+const LATE_FORMAT_PREFIX = 'late format repair after the claims budget';
+const LATE_FORMAT_OBJECTIVE = JSON_CONTINUATION_OBJECTIVE
+  + ' Include retained_read_status for whether the already settled parent read completed; this is historical read status, not a new action.';
+const LATE_FORMAT_ANSWER = JSON.stringify({ ...JSON.parse(JSON_CONTINUATION_ANSWER), retained_read_status: 'completed' });
+const LATE_FORMAT_WRAPPED = 'Saved evidence:\n```json\n' + LATE_FORMAT_ANSWER + '\n```\nNo new writes.';
+const LATE_FORMAT_STANDING = 'CONTROLLED_FORMAT_STANDING: preserve unknown completeness and never repeat an unresolved write.';
+const lateFormatDigest = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
+
+async function lateFormatFixture(t: TestContext, options: {
+  checkpointPrelude?: boolean;
+  preserveSettings?: boolean;
+  exoticSettings?: boolean;
+  formatToolCall?: boolean;
+  formatProviderLimit?: boolean;
+  formatContinue?: boolean;
+  duringFormat?: (f: Awaited<ReturnType<typeof inheritedAskFixture>>) => void;
+  amendedAnswer?: string;
+} = {}) {
+  const { RouterModelProvider } = await import('./router-model.js');
+  const { clearRateLimitedBrainsForTest } = await import('./fallback-model.js');
+  clearRateLimitedBrainsForTest();
+  t.after(() => { clearRateLimitedBrainsForTest(); });
+  const { getCompletedResponseAuthor } = await import('../model-route-metrics.js');
+  const { completedModelResponseBinding } = await import('./model-response-binding.js');
+  const { createAgentRecord, deleteAgentRecord } = await import('../../agents/agent-record.js');
+  const { setSessionAgent } = await import('../../agents/session-agent.js');
+  const { sessionAgentReviewContext } = await import('./session-composition.js');
+  const previous = Object.fromEntries(['CLAUDE_MODEL', 'OPENAI_MODEL_PRIMARY', 'CLEMMY_BRAIN_FALLOVER', 'CLEMMY_MODEL_ROLES', 'HARNESS_TOOL_BRACKETS']
+    .map(key => [key, process.env[key]]));
+  t.after(() => { for (const [key, value] of Object.entries(previous)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  } });
+  process.env.CLAUDE_MODEL = 'claude-opus-5.5';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const primaryRequests: ModelRequest[] = [], rescueRequests: ModelRequest[] = [], unrelatedRequests: ModelRequest[] = [];
+  stubFormatWorker('UNEXPECTED CONFIGURED WORKER', unrelatedRequests);
+  let f: Awaited<ReturnType<typeof inheritedAskFixture>>;
+  const completedRescueResponses: ModelResponse[] = [];
+  let preludeRuns = 0;
+  const primaryTools: Array<{ name: string }> = [];
+  if (options.checkpointPrelude) {
+    process.env.HARNESS_TOOL_BRACKETS = 'on';
+    const { tool } = await import('@openai/agents');
+    const { z } = await import('zod');
+    const { wrapToolForHarness } = await import('./brackets.js');
+    primaryTools.push(wrapToolForHarness(tool({ name: 'harness_status',
+      description: 'Controlled in-memory arithmetic checkpoint; touches no file or provider.',
+      parameters: z.object({ left: z.literal(1), right: z.literal(1) }).strict(),
+      needsApproval: async () => false,
+      execute: async ({ left, right }) => { preludeRuns++; return JSON.stringify({ sum: left + right, completed: true }); },
+    })));
+  }
+  const primaryModelSettings: ModelRequest['modelSettings'] | undefined = options.preserveSettings || options.exoticSettings
+    ? { temperature: 0.15, maxTokens: 768, reasoning: { effort: 'low' }, text: { verbosity: 'low' },
+      providerData: { model: options.exoticSettings ? new Date('2026-10-14T00:00:00.000Z') : 'controlled-wire-A' } }
+    : undefined;
+  let authoredSettingsSnapshot: ModelRequest['modelSettings'] | undefined;
+  let configuredSettingsChanged = false;
+  if (options.preserveSettings) {
+    const previousReviewerReturn = reviewerReturn;
+    reviewerReturn = () => {
+      previousReviewerReturn?.();
+      if (requests.length !== 3) return;
+      primaryModelSettings!.temperature = 0.85;
+      primaryModelSettings!.maxTokens = 128;
+      primaryModelSettings!.reasoning!.effort = 'none';
+      primaryModelSettings!.text!.verbosity = 'high';
+      primaryModelSettings!.providerData!.model = 'controlled-wire-B';
+      configuredSettingsChanged = true;
+    };
+    t.after(() => { reviewerReturn = previousReviewerReturn; });
+  }
+  const response = (text: string, id: string, toolCall = false): ModelResponse => ({
+    usage: new Usage(), responseId: id, id,
+    output: toolCall ? [{ type: 'function_call', name: 'read_file', callId: 'forbidden-format-call',
+      arguments: JSON.stringify({ path: 'must-not-be-opened.txt' }), status: 'completed' }]
+      : [{ type: 'message', role: 'assistant', status: 'completed',
+        content: [{ type: 'output_text', text, providerData: {} }] }],
+  } as ModelResponse);
+  const leaf = (reply: (request: ModelRequest) => ModelResponse): Model => ({
+    async getResponse(request) { return reply(request); },
+    async *getStreamedResponse(request) {
+      const result = reply(request);
+      yield { type: 'response_started' } as never;
+      const incomplete = (result as ModelResponse & { providerData?: { status?: string } }).providerData?.status === 'incomplete';
+      const finishReason = incomplete ? 'length' : result.output.some(item => item.type === 'function_call') ? 'tool_calls' : 'stop';
+      yield { type: 'model', event: { type: 'finish', finishReason } } as never;
+      yield { type: 'response_done', response: result } as never;
+    },
+  });
+  const primary = withResilience(leaf(request => {
+    primaryRequests.push(request);
+    const requestOrdinal = primaryRequests.length;
+    if (options.checkpointPrelude && requestOrdinal === 1) return {
+      ...response('', 'late-format-prelude'), output: [{ type: 'function_call', callId: 'late-format-prelude',
+        name: 'harness_status', arguments: JSON.stringify({ left: 1, right: 1 }), status: 'completed' }],
+    } as ModelResponse;
+    const ordinal = requestOrdinal - (options.checkpointPrelude ? 1 : 0);
+    if (ordinal === 3) throw Object.assign(new Error('controlled primary overload before candidate three'), { status: 529 });
+    if (ordinal > 3) {
+      assert.ok(options.amendedAnswer, 'no normal brain round is permitted beyond the two claims corrections');
+      return response(options.amendedAnswer, 'late-format-amended-' + ordinal);
+    }
+    return response(JSON.stringify({ first_count: 1, remaining_count: ordinal === 1 ? 2 : 1,
+      byte_count: ordinal === 1 ? 16 : 20, scenarios: { uncertain_write: 'Unresolved: do not repeat the write.' },
+      semanticCompleteness: 'unknown', retained_read_status: 'completed' }), 'late-format-primary-' + ordinal);
+  }), { label: 'gpt-5.6-terra', capability: resolveModelCapability('gpt-5.6-terra'), maxRetries: 0 });
+  const rescue = withResilience(leaf(request => {
+    rescueRequests.push(request);
+    const ordinal = rescueRequests.length;
+    assert.ok(ordinal <= 2 || (ordinal === 3 && (options.amendedAnswer || options.checkpointPrelude)),
+      'only a new owner amendment may cause another normal routed request');
+    if (ordinal === 1) {
+      if (options.preserveSettings) authoredSettingsSnapshot = structuredClone(request.modelSettings);
+      // Route settings can change after drafting. They cannot select the formatter.
+      process.env.CLAUDE_MODEL = 'claude-sonnet-5';
+      process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.6-luna';
+    } else if (ordinal === 2) options.duringFormat?.(f);
+    const text = ordinal === 3 ? (options.amendedAnswer ?? LATE_FORMAT_ANSWER) : ordinal === 1 ? LATE_FORMAT_WRAPPED : options.formatContinue ? 'CONTINUE: finish the remaining task'
+      : options.formatProviderLimit ? '{"retained_read_status":' : LATE_FORMAT_ANSWER;
+    const result = response(text, 'late-format-rescue-' + ordinal, ordinal === 2 && options.formatToolCall === true);
+    if (ordinal === 2 && options.formatProviderLimit) {
+      Object.assign(result, { providerData: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } });
+    }
+    completedRescueResponses.push(result);
+    return result;
+  }), { label: 'claude-opus-5.5', capability: resolveModelCapability('claude-opus-5.5'), maxRetries: 0 });
+  let routed: Model | undefined;
+  const route = () => routed ??= new RouterModelProvider({
+    codex: { getModel: () => primary }, claude: { getModel: () => rescue },
+    resolveEffectiveProvider: () => 'codex', codexAvailable: () => true, claudeAvailable: () => true,
+  }).getModel('gpt-5.6-terra');
+  const model: Model = { getResponse: request => route().getResponse(request),
+    getStreamedResponse: request => route().getStreamedResponse(request) };
+  f = await inheritedAskFixture({ objective: LATE_FORMAT_OBJECTIVE,
+    ...(options.checkpointPrelude ? { continuation: 'Continue. Preserve the same no-write requirement. Preserve uncertainty. '
+      + 'First use the controlled in-memory harness_status once to add 1 and 1; it reads no file or provider. '
+      + 'Then report the retained fixture counts in the required JSON.' } : {}),
+    primaryModel: model, primaryModelSettings, primaryTools, maxModelCalls: 12, leasedAttempt: true });
+  const saved = createAgentRecord({ name: 'Late format standing ' + f.consumer.sourceUserSeq,
+    instructions: LATE_FORMAT_STANDING });
+  assert.equal(saved.ok, true);
+  if (!saved.ok) throw new Error('controlled standing context was not registered');
+  t.after(() => { deleteAgentRecord(saved.agent.id); });
+  assert.equal(setSessionAgent(f.consumer.sessionId, saved.agent.id, { by: 'owner' }).ok, true);
+  assert.ok(sessionAgentReviewContext(f.consumer.sessionId).includes(LATE_FORMAT_STANDING));
+  script = ['CORRECT: (1) remaining_count must be one, supported by the retained REMAINING line.',
+    'CORRECT: (1) byte_count must be sixteen, supported by the retained exact bytes.',
+    'REVISE_REPLY: keep the supported values and uncertainty, but remove the prose and fence so the entire reply is one JSON object.',
+    'DONE: the entire short JSON answer and its uncertainty qualifier satisfy the complete objective.\nNEEDS ALL OF: none',
+  ].map(withSupportedAssessment);
+  const spent = () => f.eventlog.listEvents(f.consumer.sessionId, { types: ['guardrail_tripped'] })
+    .filter(row => row.data.kind === 'source_reply_format_repair_spent' && row.data.sourceUserSeq === f.consumer.sourceUserSeq);
+  const assertReachedLateRepair = () => {
+    assert.equal(primaryRequests.length, 3 + (options.checkpointPrelude ? 1 : 0),
+      'the original brain makes exactly its three candidate attempts plus the optional settled prelude');
+    assert.equal(rescueRequests.length, 2, 'the rescue that authored candidate three also formats it exactly once');
+    assert.equal(unrelatedRequests.length, 0, 'a configured worker cannot replace the actual author');
+    assert.deepEqual(rescueRequests[1]!.tools, []);
+    assert.deepEqual(rescueRequests[1]!.handoffs, []);
+    if (options.preserveSettings) {
+      assert.equal(configuredSettingsChanged, true, 'the configuration changed only after the rescue draft completed');
+      assert.equal(authoredSettingsSnapshot?.reasoning?.effort, 'medium', 'capture the effective raised tier, not the original low configuration');
+      assert.deepEqual(authoredSettingsSnapshot?.text, { verbosity: 'low' });
+      assert.equal(authoredSettingsSnapshot?.providerData?.model, 'controlled-wire-A');
+      assert.equal(authoredSettingsSnapshot?.providerData?.providerOptions?.anthropic?.effort, 'medium',
+        'the effective authored request includes the resilience adapter effort mapping');
+      assert.deepEqual(rescueRequests[1]!.modelSettings, authoredSettingsSnapshot,
+        'the formatter retains the exact effective authored settings rather than clearing or freshly resolving them');
+      assert.notDeepEqual(rescueRequests[1]!.modelSettings, primaryModelSettings, 'later configuration must not rewrite the original settings snapshot');
+    }
+    const capsule = getCompletedResponseAuthor(completedRescueResponses[0]);
+    assert.ok(capsule, 'real route metrics retain the original completed rescue author');
+    assert.equal(capsule.model, rescue);
+    assert.equal(capsule.modelId, 'claude-opus-5.5');
+    assert.equal(capsule.provider, 'claude');
+    const binding = completedModelResponseBinding(completedRescueResponses[0]);
+    assert.ok(binding, 'real resilience binds the same returned original');
+    const markers = spent();
+    assert.equal(markers.length, 1, 'the independent formatting allowance is durably spent once');
+    assert.equal(markers[0]!.data.attemptId, f.consumer.attemptId);
+    assert.equal(markers[0]!.data.candidateDigest, lateFormatDigest(LATE_FORMAT_WRAPPED));
+    assert.deepEqual(markers[0]!.data.original, binding);
+    assert.deepEqual(markers[0]!.data.author, { modelId: 'claude-opus-5.5', provider: 'claude' });
+    const packet = JSON.parse((rescueRequests[1]!.input as Array<{ content: string }>)[0]!.content);
+    assert.equal(packet.draft, LATE_FORMAT_WRAPPED);
+    assert.ok(packet.objective.includes(LATE_FORMAT_STANDING), 'the format request preserves actual session standing instructions');
+    for (const fragment of ['Keep the original line order', 'Preserve the same no-write requirement', 'Preserve unknown completeness']) {
+      assert.ok(packet.objective.includes(fragment), fragment);
+    }
+  };
+  return { f, primaryRequests, rescueRequests, unrelatedRequests, spent, assertReachedLateRepair, preludeRuns: () => preludeRuns };
+}
+
+test(`${LATE_FORMAT_PREFIX} gives the actual rescued primary author one durable tool-free request and full fresh review`, async t => {
+  const x = await lateFormatFixture(t, { preserveSettings: true });
+  const result = await x.f.run([], { maxTurns: 6 });
+  const notArmed = x.f.eventlog.listEvents(x.f.consumer.sessionId, { types: ['guardrail_tripped'] })
+    .filter(row => row.data.sourceUserSeq === x.f.consumer.sourceUserSeq
+      && row.data.kind === 'response_format_repair' && row.data.phase === 'not_armed')
+    .map(row => Object.fromEntries(['authorBound', 'qualifiedFinding', 'assessment', 'inputObservation', 'originalReviewBound']
+      .map(key => [key, row.data[key]])));
+  assert.equal(result.finalOutput, LATE_FORMAT_ANSWER, JSON.stringify(notArmed));
+  assert.notEqual(result.terminal?.status, 'blocked');
+  x.assertReachedLateRepair();
+  assert.equal(x.f.host.MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS, 2, 'ordinary claims work keeps its original cap');
+  const rows = x.f.reviews();
+  assert.equal(rows.length, 4);
+  assert.deepEqual(rows.map(row => row.data.continuationsUsed), [0, 1, 2, 2]);
+  assert.deepEqual(rows.map(row => row.data.fulfills), [false, false, false, true]);
+  assert.deepEqual(rows.slice(0, 3).map(row => row.data.repairScope), ['claims', 'claims', 'reply_format']);
+  for (const row of rows) {
+    assert.ok(!row.data.failedOpen);
+    assert.equal(row.data.sourceUserSeq, x.f.consumer.sourceUserSeq);
+    assert.ok(row.data.judgedInheritedReadResults);
+  }
+  assert.equal(requests.length, 4, 'the formatted candidate receives normal whole-objective review');
+  for (const request of requests) {
+    const prompt = promptOf(request);
+    for (const fragment of [LATE_FORMAT_STANDING, 'Keep the original line order',
+      'Preserve unknown completeness', 'whole effective objective together with current amendments']) assert.ok(prompt.includes(fragment), fragment);
+  }
+  assert.equal(rows[3]!.data.replyDigest, lateFormatDigest(LATE_FORMAT_ANSWER));
+  const marker = x.spent()[0]!;
+  x.f.eventlog.closeEventLog();
+  x.f.eventlog.openEventLog();
+  const { claimReplyFormatRepairSlot } = await import('./reply-format-repair-slot.js');
+  assert.equal(claimReplyFormatRepairSlot({ ...x.f.consumer,
+    objectiveDigest: String(marker.data.objectiveDigest), ownerInstructionsDigest: String(marker.data.ownerInstructionsDigest),
+    candidateDigest: lateFormatDigest('different candidate after reopening'), original: marker.data.original as never,
+    author: { modelId: 'claude-opus-5.5', provider: 'claude' } }).status, 'spent');
+  assert.equal(x.spent().length, 1, 'reopening the store cannot reset the source allowance');
+  x.f.assertNoChildEffects();
+});
+
+test(`${LATE_FORMAT_PREFIX} never buys another format request after a still-negative fresh review`, async t => {
+  const x = await lateFormatFixture(t);
+  script[3] = 'CORRECT: (1) the answer still makes an unsupported claim; retain the negative verdict.';
+  const result = await x.f.run([], { maxTurns: 6 });
+  x.assertReachedLateRepair();
+  assert.equal(requests.length, 4);
+  assert.equal(x.f.reviews().at(-1)?.data.fulfills, false);
+  assert.equal(x.f.reviews().at(-1)?.data.continuation, false);
+  assert.equal(x.f.reviews().at(-1)?.data.continuationsUsed, 2);
+  assert.equal(x.f.host.completionVerdictForAcceptedSource(x.f.consumer)?.fulfills, false);
+  assert.notEqual(result.terminal?.status, 'completed');
+  x.f.assertNoChildEffects();
+});
+
+test(`${LATE_FORMAT_PREFIX} refuses a formatter tool call before any dispatch`, async t => {
+  const x = await lateFormatFixture(t, { formatToolCall: true });
+  let result: Awaited<ReturnType<typeof x.f.run>> | undefined, failure: unknown;
+  try { result = await x.f.run([], { maxTurns: 6 }); } catch (error) { failure = error; }
+  x.assertReachedLateRepair();
+  assert.ok(result?.terminal?.status === 'blocked'
+    || (failure instanceof Error && failure.name === 'UnsupportedHostCapabilityError'), 'a formatter tool intent must stop without admission');
+  assert.notEqual(result?.finalOutput, LATE_FORMAT_ANSWER);
+  assert.equal(requests.length, 3, 'an unadmitted tool frame cannot get a fabricated positive final review');
+  assert.equal(x.f.reviews().at(-1)?.data.fulfills, false);
+  x.f.assertNoChildEffects();
+});
+
+test(`${LATE_FORMAT_PREFIX} keeps Stop authoritative while the format response is in flight`, async t => {
+  const controller = new AbortController();
+  const x = await lateFormatFixture(t, { duringFormat: () => controller.abort(new Error('controlled Stop during format')) });
+  await assert.rejects(x.f.run([], { maxTurns: 6, signal: controller.signal }), (error: unknown) =>
+    error instanceof Error && error.name === 'KillRequested');
+  x.assertReachedLateRepair();
+  assert.equal(requests.length, 3);
+  assert.equal(x.f.reviews().at(-1)?.data.fulfills, false);
+  assert.notEqual(x.f.host.completionVerdictForAcceptedSource(x.f.consumer)?.fulfills, true);
+  x.f.assertNoChildEffects();
+});
+
+test(`${LATE_FORMAT_PREFIX} discards a stale format response when an owner note arrives and preserves the spent marker`, async t => {
+  const { appendSteerNote } = await import('./steer-notes.js');
+  const amended = JSON.stringify({ ...JSON.parse(LATE_FORMAT_ANSWER), owner_note: 'acknowledged' });
+  let noteSeq: number | undefined;
+  const x = await lateFormatFixture(t, { amendedAnswer: amended, duringFormat: f => {
+    noteSeq = appendSteerNote(f.consumer.sessionId,
+      'Also include owner_note with value acknowledged. Preserve every no-write and uncertainty requirement.',
+      { expectedAttemptId: f.consumer.attemptId }).seq;
+  } });
+  const result = await x.f.run([], { maxTurns: 7 });
+  assert.ok(noteSeq, 'the note was accepted while the format request was in flight');
+  assert.equal(result.finalOutput, amended);
+  assert.equal(x.primaryRequests.length, 3, 'normal routing preserves the overloaded primary cooldown');
+  assert.equal(x.rescueRequests.length, 3, 'the amended objective uses the normal healthy rescue after one stale format request');
+  assert.equal(x.unrelatedRequests.length, 0);
+  assert.equal(x.spent().length, 1);
+  assert.match(promptOf(x.rescueRequests[2]!), /owner_note with value acknowledged/);
+  assert.notEqual(promptOf(x.rescueRequests[2]!), promptOf(x.rescueRequests[1]!), 'normal amended context cannot replay the spent format packet');
+  const rows = x.f.reviews();
+  assert.equal(rows.length, 4, 'the discarded format candidate is not reviewed or accepted');
+  assert.equal(rows.at(-1)?.data.replyDigest, lateFormatDigest(amended));
+  assert.notEqual(rows.at(-1)?.data.objectiveDigest, rows[2]?.data.objectiveDigest);
+  assert.equal(rows.at(-1)?.data.fulfills, true);
+  assert.ok(rows.every(row => !row.data.failedOpen));
+  assert.match(promptOf(requests.at(-1)!), /owner_note with value acknowledged/);
+  const delivered = x.f.eventlog.listEvents(x.f.consumer.sessionId, { types: ['user_steer_note_delivered'] });
+  assert.ok(delivered.some(row => row.data.sourceUserSeq === x.f.consumer.sourceUserSeq
+    && (row.data.noteSeqs as number[]).includes(noteSeq!)));
+  x.f.assertNoChildEffects();
+});
+
+
+test(`${LATE_FORMAT_PREFIX} holds a returned provider output limit without reopening the ordinary tool surface`, async t => {
+  const x = await lateFormatFixture(t, { formatProviderLimit: true });
+  const result = await x.f.run([], { maxTurns: 7 });
+  x.assertReachedLateRepair();
+  assert.equal(result.terminal?.status, 'blocked', 'a spent formatting slot cannot become generic provider-limit continuation');
+  assert.notEqual(result.terminal?.reason, 'provider_stop_contradiction', 'the fixture returns a consistent length/limit frame');
+  assert.equal(requests.length, 3, 'an incomplete formatting response is not reviewed as a finished answer');
+  assert.equal(x.f.reviews().at(-1)?.data.fulfills, false);
+  assert.notEqual(result.finalOutput, LATE_FORMAT_ANSWER);
+  x.f.assertNoChildEffects();
+});
+
+test(`${LATE_FORMAT_PREFIX} holds a bare CONTINUE response without another primary request`, async t => {
+  const x = await lateFormatFixture(t, { formatContinue: true });
+  const result = await x.f.run([], { maxTurns: 7 });
+  x.assertReachedLateRepair();
+  assert.equal(result.terminal?.status, 'blocked', 'a formatter response cannot authorize ordinary execution continuation');
+  assert.equal(requests.length, 3);
+  assert.equal(x.f.reviews().at(-1)?.data.fulfills, false);
+  assert.notEqual(result.finalOutput, LATE_FORMAT_ANSWER);
+  x.f.assertNoChildEffects();
+});
+
+
+test(`${LATE_FORMAT_PREFIX} declines exotic authored settings without coercion or a new ordinary request`, async t => {
+  const x = await lateFormatFixture(t, { exoticSettings: true });
+  const result = await x.f.run([], { maxTurns: 6 });
+  assert.notEqual(result.terminal?.status, 'completed');
+  assert.equal(result.finalOutput, LATE_FORMAT_WRAPPED, 'unsupported settings retain the truthful unformatted draft');
+  assert.equal(x.f.host.completionVerdictForAcceptedSource(x.f.consumer)?.fulfills, false,
+    'the existing durable negative verdict remains authoritative for central delivery');
+  assert.equal(x.primaryRequests.length, 3);
+  assert.equal(x.rescueRequests.length, 1, 'an exotic override cannot mint a same-author formatting request');
+  assert.equal(x.unrelatedRequests.length, 0);
+  assert.equal(x.spent().length, 0, 'declining unsupported settings must not debit an unissued shortcut');
+  assert.equal(requests.length, 3);
+  assert.equal(x.f.reviews().at(-1)?.data.fulfills, false);
+  assert.equal(x.f.reviews().at(-1)?.data.continuationsUsed, 2);
+  x.f.assertNoChildEffects();
+});
+
+
+function lateFormatOwnedCallInventory(f: Awaited<ReturnType<typeof inheritedAskFixture>>) {
+  const db = f.eventlog.openEventLog();
+  const scope = [f.consumer.sessionId, f.consumer.sourceUserSeq];
+  return {
+    logical: db.prepare(`SELECT logical_tool_call_id, tool_name, state, outcome_kind, settlement_event_id
+      FROM logical_tool_calls WHERE session_id=? AND source_user_seq=? ORDER BY logical_tool_call_id`).all(...scope),
+    physical: db.prepare(`SELECT logical_tool_call_id, physical_dispatch_id, tool_name, state, start_event_id, settle_event_id
+      FROM physical_dispatches WHERE session_id=? AND source_user_seq=? ORDER BY physical_dispatch_id`).all(...scope),
+    settlements: db.prepare(`SELECT logical_tool_call_id, execution_kind, outcome_kind, mutating,
+      semantic_digest, physical_crossing_count FROM logical_call_settlements
+      WHERE session_id=? AND source_user_seq=? ORDER BY logical_tool_call_id`).all(...scope),
+  };
+}
+
+async function lateFormatRecoveryAfterActualStop(t: TestContext, amendedAnswer?: string) {
+  const controller = new AbortController();
+  const x = await lateFormatFixture(t, { checkpointPrelude: true, amendedAnswer,
+    duringFormat: () => controller.abort(new Error('controlled Stop after the format allowance was spent')) });
+  await assert.rejects(x.f.run([], { maxTurns: 8, signal: controller.signal }), (error: unknown) =>
+    error instanceof Error && error.name === 'KillRequested');
+  x.assertReachedLateRepair();
+  assert.equal(x.preludeRuns(), 1, 'a real controlled tool call settled before the wording attempt');
+  assert.equal(requests.length, 3);
+  const third = x.f.reviews()[2]!;
+  assert.equal(third.data.repairScope, 'reply_format');
+  assert.equal(third.data.continuationsUsed, 2);
+  assert.ok(!third.data.failedOpen);
+  const objective = x.f.host.acceptedObjectiveForSource(x.f.consumer);
+  assert.ok(objective);
+  assert.equal(lateFormatDigest(objective), third.data.objectiveDigest, 'recovery retains the actual reviewed objective');
+  assert.equal(lateFormatDigest(LATE_FORMAT_WRAPPED), third.data.replyDigest);
+  const feedback = { version: 1 as const, sessionId: x.f.consumer.sessionId, sourceUserSeq: x.f.consumer.sourceUserSeq, objective,
+    objectiveDigest: String(third.data.objectiveDigest), reply: LATE_FORMAT_WRAPPED,
+    replyDigest: String(third.data.replyDigest), reason: String(third.data.reason), repairScope: 'reply_format' as const };
+  const { recoverAcceptedModelBatchForRestart } = await import('./accepted-model-batch-checkpoint.js');
+  const recovered = recoverAcceptedModelBatchForRestart(x.f.consumer);
+  assert.equal(recovered.status, 'ready', 'the source must have a genuine settled call-bearing checkpoint');
+  if (recovered.status !== 'ready') throw new Error('controlled checkpoint is not ready');
+  const checkpoint = recovered.checkpoint;
+  const ref = { sessionId: checkpoint.sessionId, sourceUserSeq: checkpoint.sourceUserSeq,
+    acceptedTaskId: checkpoint.acceptedTaskId, batchOrdinal: checkpoint.batchOrdinal,
+    batchId: checkpoint.batchId, authorityDigest: checkpoint.authorityDigest };
+  const encoded = new x.f.host.HostRecoveryState(x.f.consumer.sessionId, x.f.consumer.sourceUserSeq,
+    'continue', checkpoint.history, [], [], checkpoint.lastResponseId, undefined,
+    'host_v1', undefined, 5, ref, 2, feedback).toString();
+  const state = x.f.host.HostRecoveryState.fromString(encoded);
+  assert.equal(state.phase, 'continue');
+  assert.equal(state.objectiveJudgeContinuations, 2);
+  assert.deepEqual(state.completionReviewFeedback, feedback, 'the actual source-bound review feedback survives serialization');
+  const inventory = lateFormatOwnedCallInventory(x.f);
+  assert.equal(inventory.logical.length, 1, 'the child owns exactly one admitted deterministic call');
+  assert.equal(inventory.physical.length, 1, 'the deterministic call crossed the real local dispatch boundary once');
+  assert.equal(inventory.settlements.length, 1, 'the completed prelude has one durable canonical settlement');
+  assert.deepEqual(inventory.settlements.map(row => {
+    const value = row as { execution_kind: string; outcome_kind: string; mutating: number; physical_crossing_count: number };
+    return [value.execution_kind, value.outcome_kind, value.mutating, value.physical_crossing_count];
+  }), [['local_execution', 'succeeded', 0, 0]], 'the one durable host dispatch settled locally with zero external crossings and no file or provider effect');
+  return { ...x, state, third, inventory };
+}
+
+test(`${LATE_FORMAT_PREFIX} preserves its spent boundary through real serialized same-owner recovery`, async t => {
+  const x = await lateFormatRecoveryAfterActualStop(t);
+  const beforeModels = [x.primaryRequests.length, x.rescueRequests.length, x.unrelatedRequests.length];
+  const beforeReviews = requests.length;
+  const beforeAttempt = x.f.eventlog.getRunAttemptBySourceUserSeq(x.f.consumer.sessionId, x.f.consumer.sourceUserSeq);
+  x.f.eventlog.closeEventLog();
+  x.f.eventlog.openEventLog();
+  const result = await x.f.run([], { maxTurns: 10, controlledRecoveryState: x.state });
+  assert.equal(result.terminal?.status, 'blocked');
+  assert.equal(result.terminal?.reason, 'reply_format_repair_unavailable');
+  assert.deepEqual([x.primaryRequests.length, x.rescueRequests.length, x.unrelatedRequests.length], beforeModels,
+    'a fresh host cannot replace the lost formatter proof with an ordinary model request');
+  assert.equal(requests.length, beforeReviews);
+  assert.equal(x.preludeRuns(), 1);
+  assert.deepEqual(lateFormatOwnedCallInventory(x.f), x.inventory, 'restart preserves every settled call and dispatch without another crossing');
+  assert.equal(x.spent().length, 1);
+  assert.equal(x.f.eventlog.getRunAttemptBySourceUserSeq(x.f.consumer.sessionId, x.f.consumer.sourceUserSeq)?.attemptId,
+    beforeAttempt?.attemptId);
+  assert.equal(x.f.host.completionVerdictForAcceptedSource(x.f.consumer)?.fulfills, false);
+});
+
+test(`${LATE_FORMAT_PREFIX} keeps genuine adopted owner steering authoritative after serialized recovery`, async t => {
+  const amended = JSON.stringify({ ...JSON.parse(LATE_FORMAT_ANSWER), owner_note: 'acknowledged' });
+  const x = await lateFormatRecoveryAfterActualStop(t, amended);
+  const { appendSteerNote } = await import('./steer-notes.js');
+  const accepted = appendSteerNote(x.f.consumer.sessionId,
+    'Also include owner_note with value acknowledged. Preserve every no-write and uncertainty requirement.',
+    { expectedAttemptId: x.f.consumer.attemptId });
+  assert.ok(accepted.seq > x.f.consumer.sourceUserSeq);
+  x.f.eventlog.closeEventLog();
+  x.f.eventlog.openEventLog();
+  const result = await x.f.run([], { maxTurns: 10, controlledRecoveryState: x.state });
+  assert.equal(result.finalOutput, amended);
+  assert.notEqual(result.terminal?.status, 'blocked');
+  assert.equal(x.primaryRequests.length, 4, 'the previously overloaded primary is not revived for a new owner amendment');
+  assert.equal(x.rescueRequests.length, 3, 'one normal current-objective request follows the interrupted formatter');
+  assert.equal(x.unrelatedRequests.length, 0);
+  assert.match(promptOf(x.rescueRequests[2]!), /owner_note with value acknowledged/);
+  assert.equal(requests.length, 4);
+  assert.equal(x.f.reviews().at(-1)?.data.fulfills, true);
+  assert.notEqual(x.f.reviews().at(-1)?.data.objectiveDigest, x.third.data.objectiveDigest);
+  assert.equal(x.f.reviews().at(-1)?.data.continuationsUsed, 2, 'steering does not refund ordinary claims corrections');
+  assert.equal(x.preludeRuns(), 1);
+  assert.deepEqual(lateFormatOwnedCallInventory(x.f), x.inventory);
+  assert.equal(x.spent().length, 1, 'new instructions do not mint another wording slot');
+  const delivered = x.f.eventlog.listEvents(x.f.consumer.sessionId, { types: ['user_steer_note_delivered'] });
+  assert.ok(delivered.some(row => row.data.sourceUserSeq === x.f.consumer.sourceUserSeq
+    && (row.data.noteSeqs as number[]).includes(accepted.seq)), 'the actual accepted note is adopted by this same source');
 });

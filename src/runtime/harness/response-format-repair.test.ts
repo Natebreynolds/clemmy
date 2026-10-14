@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { applyWholeResponseFormatFinding, responseFormatRepairPacket, wholeResponseFormatFinding,
   wholeResponseFormatRequirement, exactJsonObjectOuterFence, normalizeWholeResponseFence,
   responseFenceNormalizationCurrent, captureOwnerResponseFormat, ownerResponseFormatCurrent,
-  ownerResponseFormatGuidance, currentOwnerResponseFormatRequirement } from './response-format-repair.js';
+  ownerResponseFormatGuidance, currentOwnerResponseFormatRequirement, captureReplyFormatModelSettings } from './response-format-repair.js';
 import { bindCompletedModelResponse } from './model-response-binding.js';
 
 test('author format guidance belongs only to the private exact current request owner and never approves a reply', () => {
@@ -312,4 +312,90 @@ test('bare-format amendments retain ordering and cannot borrow a stale owner cap
     assert.equal(ownerResponseFormatGuidance(capture, { ...owner, ...change }), undefined);
   }
   assert.equal(ownerResponseFormatGuidance({ ...capture }, owner), undefined, 'serialized copy grants no format-owner proof');
+});
+
+test('format repair settings: capture is independent and preserves generation values, key order and dense undefined members', () => {
+  const settings = {
+    maxTokens: 731, temperature: 0.2, topP: 0.8,
+    reasoning: { effort: 'medium' as 'low' | 'medium' | 'high', summary: undefined }, text: { verbosity: 'low' as const },
+    contextManagement: [{ type: 'compaction', annotations: ['z', undefined, { z: 7, a: false }] }],
+    providerData: { model: 'controlled-wire-A' }, store: false, optional: undefined,
+  };
+  const captured = captureReplyFormatModelSettings(settings);
+  assert.ok(captured, 'supported settings must remain available to the exact author repair');
+  assert.notEqual(captured, settings);
+  assert.notEqual(captured.reasoning, settings.reasoning);
+  assert.notEqual(captured.text, settings.text);
+  assert.notEqual(captured.providerData, settings.providerData);
+  assert.notEqual(captured.contextManagement, settings.contextManagement);
+  assert.deepEqual(Object.keys(captured), Object.keys(settings), 'capture must not sort or drop own undefined keys');
+  assert.equal(JSON.stringify(captured), JSON.stringify(settings), 'generation values and nested object order are preserved');
+  assert.ok(Object.hasOwn(captured, 'optional'));
+  assert.equal((captured as Record<string, unknown>).optional, undefined);
+  assert.ok(Object.hasOwn(captured.reasoning!, 'summary'));
+  const items = (captured.contextManagement as unknown as typeof settings.contextManagement)[0].annotations;
+  assert.ok(Array.isArray(items));
+  assert.notEqual(items, settings.contextManagement[0].annotations);
+  assert.equal(items.length, 3);
+  assert.ok(Object.hasOwn(items, 1), 'undefined array member stays dense, rather than becoming a hole');
+  assert.equal(items[1], undefined);
+  assert.deepEqual(Object.keys(items[2]!), ['z', 'a']);
+  const before = JSON.stringify(captured);
+  settings.maxTokens = 999; settings.temperature = 1; settings.reasoning.effort = 'high';
+  settings.providerData.model = 'controlled-wire-B'; settings.contextManagement[0].annotations[0] = 'changed';
+  assert.equal(JSON.stringify(captured), before, 'later caller mutation cannot redirect or change captured settings');
+});
+
+test('format repair settings: absent or empty provider data and only exact model override remain supported', () => {
+  for (const settings of [{}, { providerData: {} }, { providerData: { model: 'controlled-wire-model' } },
+    { toolChoice: 'auto', parallelToolCalls: false }, { toolChoice: 'none' },
+    { reasoning: { effort: 'low' }, text: { verbosity: 'medium' }, maxTokens: 500 },
+    Object.assign(Object.create(null), { maxTokens: 300, providerData: { model: 'controlled-wire-model' } })]) {
+    const captured = captureReplyFormatModelSettings(settings);
+    assert.ok(captured);
+    assert.equal(JSON.stringify(captured), JSON.stringify(settings));
+    assert.deepEqual(Object.keys(captured), Object.keys(settings));
+  }
+  for (const providerData of [{ tools: [] }, { messages: [] }, { input: [] }, { model: 'A', tools: [] },
+    { model: 'A', reasoning_effort: 'low' }, { model: undefined }, { model: null }, { model: 7 }, { model: '' }]) {
+    assert.equal(captureReplyFormatModelSettings({ providerData }), undefined,
+      'unknown or structural provider overrides must decline, never be stripped');
+  }
+  for (const settings of [{ parallelToolCalls: true }, { toolChoice: 'required' }, { toolChoice: 'read_file' },
+    { toolChoice: { type: 'function', name: 'read_file' } }]) {
+    assert.equal(captureReplyFormatModelSettings(settings), undefined, 'repair cannot preserve settings that require tools');
+  }
+});
+
+test('format repair settings: nested accessors, proxies and serialization hooks decline without being invoked', () => {
+  let hooks = 0;
+  const getter = Object.defineProperty({}, 'effort', { enumerable: true, get() { hooks++; return 'low'; } });
+  const arrayGetter = ['value'];
+  Object.defineProperty(arrayGetter, '0', { enumerable: true, get() { hooks++; return 'value'; } });
+  const proxy = new Proxy({ model: 'A' }, { get() { hooks++; throw new Error('no hook'); },
+    ownKeys() { hooks++; throw new Error('no hook'); }, getPrototypeOf() { hooks++; throw new Error('no hook'); } });
+  const withToJSON = { toJSON() { hooks++; return {}; } };
+  const topGetter = Object.defineProperty({}, 'providerData', { enumerable: true, get() { hooks++; return { model: 'A' }; } });
+  const revoked = Proxy.revocable({}, {}); revoked.revoke();
+  for (const settings of [topGetter, proxy, { reasoning: getter }, { contextManagement: arrayGetter },
+    { providerData: proxy }, { contextManagement: [{ type: 'compaction', nested: withToJSON }] },
+    { nested: revoked.proxy }]) {
+    assert.equal(captureReplyFormatModelSettings(settings), undefined);
+  }
+  assert.equal(hooks, 0, 'optional snapshot must not add getter, proxy or toJSON calls');
+});
+
+test('format repair settings: unknown shapes and bounded resource failures decline rather than coerce', () => {
+  const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic;
+  const sparse: unknown[] = []; sparse.length = 2; sparse[1] = 'present';
+  const extraArray = ['value'] as string[] & { extra?: string }; extraArray.extra = 'not an index';
+  const hidden = Object.defineProperty({}, 'maxTokens', { value: 100 });
+  const symbol = { [Symbol('controlled')]: 'not wire data' };
+  let deep: unknown = 'bottom'; for (let i = 0; i < 80; i++) deep = { child: deep };
+  for (const settings of [undefined, null, false, 5, 'settings', [], { nested: cyclic }, { nested: sparse },
+    { nested: extraArray }, hidden, symbol, { nested: new Date(0) }, { nested: Object.create({ inherited: true }) },
+    { nested: Number.NaN }, { nested: Infinity }, { nested: () => 1 }, { nested: 1n },
+    { nested: deep }, { nested: Array.from({ length: 50_000 }, () => 1) }, { nested: 'x'.repeat(2_000_000) }]) {
+    assert.equal(captureReplyFormatModelSettings(settings), undefined, 'unsupported input cannot become a partial settings snapshot');
+  }
 });
