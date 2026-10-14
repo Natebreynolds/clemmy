@@ -11937,6 +11937,8 @@ test('retained review feedback rejects foreign sources and yields to actual deli
 
 test('a delivered mid-run "remember …" steer reaches durable memory; a plain steer does not', async () => {
   const steering = await import('./steer-notes.js');
+  const { captureFreshSourceSessionContext } = await import('./source-session-context.js');
+  const { withSourceSessionContext } = await import('./source-session-context-scope.js');
   const session = eventlog.createSession({ id: `sess-steer-memory-${++acceptedSerial}`, kind: 'chat' });
   const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user',
     type: 'user_input_received', data: { text: 'Draft the three follow-up emails.' } });
@@ -11951,10 +11953,14 @@ test('a delivered mid-run "remember …" steer reaches durable memory; a plain s
   const model = scriptedRecordingModel([[textMsg('Drafted.')]]);
   const agent = { model, tools: [] };
   bindHostCanarySurface(fixture, agent, []);
-  const result = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+  // runConversation freezes this at acceptance; runTurn reopens it around the
+  // host. Direct host fixtures must provide the same exact task context.
+  const composition = captureFreshSourceSessionContext(fixture.context);
+  assert.ok(composition);
+  const result = await withSourceSessionContext(composition, () => brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
     throwingRunner() as never, agent as never, HostInterruptState.fromString(state.toString()) as never,
     { maxTurns: 4, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: false } as never,
-  ));
+  )));
   assert.equal(result.finalOutput, 'Drafted.');
   await new Promise((resolve) => setImmediate(resolve));
   const rows = eventlog.listEvents(session.id, { types: ['memory_signals_captured'] });
@@ -11964,6 +11970,87 @@ test('a delivered mid-run "remember …" steer reaches durable memory; a plain s
   assert.notEqual(rows[0]?.data.sourceSteerSeq, plain.seq);
   assert.equal(rows[0]?.data.conversationOnly, true);
   assert.equal(rows[0]?.data.sourceUserSeq, null);
+  assert.equal(rows[0]?.data.queuedCandidateCount, 1, 'the claim reaches durable intake, not just a presentation receipt');
+  const candidate = memoryDatabase.openMemoryDb().prepare(`SELECT call_id, destination_json
+    FROM memory_reflection_candidates WHERE session_id = ?`).get(session.id) as { call_id: string; destination_json: string };
+  assert.equal(candidate.call_id, `auto-capture:user-steer:${remembered.seq}`);
+  const origin = JSON.parse(candidate.destination_json).origin;
+  assert.equal(origin.source.eventSeq, remembered.seq);
+  assert.equal(origin.source.eventType, 'user_steer_note');
+  assert.equal(origin.source.context.sourceUserSeq, source.seq);
+  assert.equal(origin.source.context.digest, composition.digest);
+});
+
+test('delivered remember steers inherit the exact task exclusion without suppressing an ordinary sibling', async () => {
+  const steering = await import('./steer-notes.js');
+  const { captureFreshSourceSessionContext } = await import('./source-session-context.js');
+  const { withSourceSessionContext } = await import('./source-session-context-scope.js');
+  const session = eventlog.createSession({ id: `sess-steer-memory-policy-${++acceptedSerial}`, kind: 'chat' });
+  for (const [index, reason] of ['controlled_test', 'owner_opt_out', undefined].entries()) {
+    const source = eventlog.appendEvent({ sessionId: session.id, turn: index + 1, role: 'user', type: 'user_input_received',
+      data: { text: 'Draft the three follow-up emails.',
+        ...(reason ? { learningPolicy: { version: 1, mode: 'exclude', reason } } : {}) } });
+    const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+    const fixture = { session, source, context: identity,
+      parent: { ...identity, counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::turn:${index + 1}` } };
+    const composition = captureFreshSourceSessionContext(identity);
+    assert.ok(composition);
+    const rememberText = `remember subject: Harbor follow-up ${index + 1}`;
+    const remembered = steering.appendSteerNote(session.id, rememberText);
+    const model = scriptedRecordingModel([[textMsg('Drafted.')]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const state = new HostInterruptState([{ role: 'user', content: source.data.text as string }] as never,
+      [], undefined, 'host_v1', undefined, undefined, 1);
+    const result = await withSourceSessionContext(composition, () => brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+      throwingRunner() as never, agent as never, HostInterruptState.fromString(state.toString()) as never,
+      { maxTurns: 4, hostTurnEngine: 'host_v1', context: identity, hostJudgeCompletion: false } as never,
+    )));
+    assert.equal(result.finalOutput, 'Drafted.', 'learning exclusion does not stop task execution');
+    assert.equal(model.calls(), 1);
+    assert.ok(JSON.stringify(model.requests[0]).includes(rememberText), 'the model still receives owner guidance');
+    await new Promise((resolve) => setImmediate(resolve));
+    const receipts = eventlog.listEvents(session.id, { types: ['memory_signals_captured'] });
+    const candidates = memoryDatabase.openMemoryDb().prepare(`SELECT call_id, destination_json
+      FROM memory_reflection_candidates WHERE session_id = ?`).all(session.id) as Array<{ call_id: string; destination_json: string }>;
+    if (reason) {
+      assert.equal(receipts.length, 0, `${reason} cannot produce automatic memory receipts`);
+      assert.equal(candidates.length, 0, `${reason} cannot queue automatic memory`);
+    } else {
+      assert.equal(receipts.length, 1, 'an ordinary later request still captures its own steer');
+      assert.equal(receipts[0]?.data.sourceSteerSeq, remembered.seq);
+      assert.equal(candidates.length, 1);
+      assert.equal(candidates[0]?.call_id, `auto-capture:user-steer:${remembered.seq}`);
+      assert.equal(JSON.parse(candidates[0]!.destination_json).origin.source.context.sourceUserSeq, source.seq);
+    }
+  }
+});
+
+test('remember steer capture cannot borrow missing or foreign task context even when an ordinary source exists', async () => {
+  const steering = await import('./steer-notes.js');
+  const capture = await import('../../memory/auto-capture.js');
+  const { captureFreshSourceSessionContext } = await import('./source-session-context.js');
+  const { withSourceSessionContext } = await import('./source-session-context-scope.js');
+  const fixture = acceptHostCanarySource('steer-memory-unbound', 'Draft the follow-up emails.');
+  const own = captureFreshSourceSessionContext(fixture.context);
+  assert.ok(own, 'an ordinary accepted source exists but is not an ambient fallback');
+  const rememberText = 'remember subject: Harbor follow-up unbound';
+  const note = steering.appendSteerNote(fixture.session.id, rememberText);
+  const row = eventlog.listEvents(fixture.session.id, { types: ['user_steer_note'] }).find(event => event.seq === note.seq);
+  assert.ok(row);
+  const input = { message: rememberText, sessionId: fixture.session.id, sourceEventId: `user-steer:${note.seq}`,
+    sourceProvenance: capture.autoCaptureProvenanceFromAcceptedEvent(row) };
+  assert.deepEqual(capture.captureInteractionSignals(input).candidates, []);
+  const foreign = acceptHostCanarySource('steer-memory-foreign', 'Draft the unrelated follow-up emails.');
+  const foreignComposition = captureFreshSourceSessionContext(foreign.context);
+  assert.ok(foreignComposition);
+  const captured = withSourceSessionContext(foreignComposition, () => capture.captureInteractionSignals(input));
+  assert.deepEqual(captured.candidates, []);
+  assert.equal((memoryDatabase.openMemoryDb().prepare('SELECT count(*) AS n FROM memory_reflection_candidates WHERE session_id = ?')
+    .get(fixture.session.id) as { n: number }).n, 0);
+  const ownCapture = withSourceSessionContext(own, () => capture.captureInteractionSignals(input));
+  assert.equal(ownCapture.candidates.length, 1, 'the identical owner words are eligible under their exact task context');
+  assert.equal(ownCapture.queuedCandidateIds?.length, 1);
 });
 
 test('a codex transport timeout on the production host journals one public stall_retry_attempted twin beside the private row', async () => {
