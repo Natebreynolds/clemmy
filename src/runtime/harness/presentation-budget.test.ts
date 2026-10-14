@@ -50,6 +50,7 @@ test('a carrier resolves exactly the budget of the inner tool it names', () => {
       ['memory_recall_all', {}],
       ['tool_search', { query: 'fixture' }],
       ['read_file', { path: '/tmp/x' }],
+      ['read_file', { path: '/tmp/x', max_chars: 20_000 }],
       ['read_file', { path: '/tmp/x', max_chars: 40_000 }],
       ['composio_execute_tool', { tool_slug: 'FIXTURE_READ', arguments: '{}' }],
       ['fixtureserver__fixture_read', {}],
@@ -78,6 +79,23 @@ test('Clementine state reads keep the whole-result budget; provider results keep
   }
   // A local reader's explicit larger preview survives a carrier too.
   assert.equal(presentationBudgetFor(carried('work_call', 'read_file', { path: '/tmp/x', max_chars: 40_000 })), 40_000);
+});
+
+test('explicit medium local previews keep their requested budget while default and foreign reads keep the keyhole', () => {
+  for (const name of ['read_file', 'convert_to_markdown']) {
+    for (const requested of [4001, 5000, 20_000]) {
+      const args = { path: '/tmp/controlled-medium-read.txt', max_chars: requested };
+      for (const input of [{ toolName: name, args }, carried('call_tool', name, args), carried('work_call', name, args)]) {
+        assert.equal(presentationBudgetFor(input), requested);
+      }
+    }
+    for (const requested of [undefined, null, 1000, 4000]) {
+      assert.equal(presentationBudgetFor({ toolName: name, args: { max_chars: requested } }), PROMPT_INLINE_RECALLABLE_RESULT_CHARS);
+    }
+  }
+  for (const name of ['fixtureserver__read_file', 'external_api']) {
+    assert.equal(presentationBudgetFor(carried('work_call', name, { max_chars: 20_000 })), PROMPT_INLINE_RECALLABLE_RESULT_CHARS);
+  }
 });
 
 test('the whole-result budget scales down for a small window and never up for a large one', () => {

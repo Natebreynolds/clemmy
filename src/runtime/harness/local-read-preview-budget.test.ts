@@ -10,12 +10,19 @@ test('outer local read rendering preserves the explicitly requested larger previ
   assert.notEqual(formatRecallableToolText(inner), raw, 'old default demonstrably clipped the reader output');
 });
 
+test('explicit local previews above the recallable keyhole survive the outer bracket', () => {
+  for (const requested of [4001, 5000, 20000, 20001, 40000]) {
+    assert.equal(explicitLocalReadPreviewBudget('read_file', { max_chars: requested }), requested);
+    assert.equal(explicitLocalReadPreviewBudget('convert_to_markdown', { max_chars: requested }), requested);
+  }
+});
+
 test('only valid larger local-read previews override the generic default', () => {
   assert.equal(explicitLocalReadPreviewBudget('convert_to_markdown', { max_chars: 40000 }), 40000);
-  for (const value of [undefined, null, 0, -1, 1000, 20000, '40000', Infinity, 40000.5]) {
+  for (const value of [undefined, null, 0, -1, 1000, 4000, '40000', Infinity, NaN, 40000.5]) {
     assert.equal(explicitLocalReadPreviewBudget('read_file', { max_chars: value }), undefined);
   }
-  for (const tool of ['work_call', 'call_tool', 'external_api', 'recall_tool_result']) {
+  for (const tool of ['work_call', 'call_tool', 'external_api', 'recall_tool_result', 'fixtureserver__read_file']) {
     assert.equal(explicitLocalReadPreviewBudget(tool, { max_chars: 40000 }), undefined);
   }
 });

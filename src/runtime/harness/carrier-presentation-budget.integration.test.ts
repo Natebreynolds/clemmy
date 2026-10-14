@@ -226,6 +226,37 @@ test('direct nominal reads expose their full address while an actual unproved ca
   }
 });
 
+test('an explicit 20000-character local preview delivers a medium file whole through actual direct and carrier boundaries', async () => {
+  inner._setInnerDispatchToolsForTests(null);
+  const payload = `BEGIN\n${'prefix α data\n'.repeat(190)}CRITICAL-MIDDLE-EVIDENCE\n${'suffix Ω data\n'.repeat(150)}END\n`;
+  assert.ok(payload.length > 4000 && payload.length < 5000);
+  const filePath = path.join(home, 'fixture-medium-explicit-read.txt');
+  writeFileSync(filePath, payload, 'utf8');
+  for (const carrier of [false, true]) {
+    for (const requested of [null, 20_000]) {
+      const callId = `toolu_01MediumExplicitRead${carrier}${requested}`;
+      const readArgs = { path: filePath, max_chars: requested };
+      const result = await runHostTurn({
+        agentTool: carrier ? realCallTool(['read_file'])
+          : brackets.wrapToolForHarness(getComputerTools().find(candidate => candidate.name === 'read_file')! as never),
+        toolName: carrier ? 'call_tool' : 'read_file',
+        calls: [{ callId, args: carrier ? { name: 'read_file', args_json: JSON.stringify(readArgs) } : readArgs }],
+      });
+      const shown = result.results.get(callId)!;
+      assert.equal(events.getToolOutput(result.sessionId, callId)?.output, payload, 'raw retention is unchanged for both preview choices');
+      if (requested === null) {
+        assert.ok(shown.length <= PROMPT_INLINE_RECALLABLE_RESULT_CHARS);
+        assert.match(shown, /middle omitted/);
+        assert.doesNotMatch(shown, /CRITICAL-MIDDLE-EVIDENCE/);
+      } else {
+        const visible = carrier ? shown : wholeInlinePayload(shown, callId);
+        assert.deepEqual(Buffer.from(visible), Buffer.from(payload), 'every UTF-8 byte, including the missing middle, reaches the next model request');
+        if (carrier) assert.doesNotMatch(shown, /whole_inline_result_v1/, 'a wider preview does not mint nominal producer authority for an unproved carrier');
+      }
+    }
+  }
+});
+
 test('final direct nominal read frames preserve empty text and error-looking file bytes as data', async () => {
   for (const [index, payload] of ['', '  \n\t', 'π\n雪\n', 'ERROR: these are actual file bytes\n'].entries()) {
     const filePath = path.join(home, `fixture-nominal-text-${index}.txt`);

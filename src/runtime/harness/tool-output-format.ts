@@ -22,7 +22,8 @@ export const DEFAULT_TOOL_RESULT_MAX_CHARS = 20_000;
 export const PROMPT_INLINE_RECALLABLE_RESULT_CHARS = 4_000;
 
 /** These local readers already validate max_chars and format their preview.
- * The outer bracket must not silently impose its smaller default afterwards.
+ * The outer bracket must not silently impose its smaller recallable keyhole
+ * afterwards, including when the explicit request equals the old 20K default.
  * Smaller previews remain the handler's responsibility; unrelated tools do
  * not gain a larger result budget from an arbitrary argument of this name. */
 export function explicitLocalReadPreviewBudget(toolName: string, args: unknown): number | undefined {
@@ -30,7 +31,7 @@ export function explicitLocalReadPreviewBudget(toolName: string, args: unknown):
     || !args || typeof args !== 'object' || Array.isArray(args)) return undefined;
   const requested = (args as Record<string, unknown>).max_chars;
   return typeof requested === 'number' && Number.isSafeInteger(requested)
-    && requested > DEFAULT_TOOL_RESULT_MAX_CHARS ? requested : undefined;
+    && requested > PROMPT_INLINE_RECALLABLE_RESULT_CHARS ? requested : undefined;
 }
 
 /** Inline characters one result may take per token of the routed model's
