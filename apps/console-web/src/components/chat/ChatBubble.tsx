@@ -5,7 +5,7 @@ import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { answerDraftStatus, canContinueTerminal, cardDecisionNoticeOnly, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
+import { steerReceiptLabel, answerDraftStatus, canContinueTerminal, cardDecisionNoticeOnly, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
 import type { ApprovalConfirm, ApprovalResolution, TerminalNoticeLine } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
@@ -529,9 +529,7 @@ export function ChatBubble({
           )}
           {message.steer && (
             <p className="mt-1 text-caption text-muted">
-              {message.steer === 'pending' && 'Reaching her mid-run…'}
-              {message.steer === 'delivered' && 'Queued for Clem’s next step'}
-              {message.steer === 'failed' && 'Couldn’t confirm this addition — check the run before resending'}
+              {steerReceiptLabel(message)}
             </p>
           )}
         </div>

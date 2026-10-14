@@ -1577,3 +1577,60 @@ test('a spoken message reaches the chat route marked voice; a typed one keeps it
   assert.equal(calls[0].at(-1), true, 'the spoken post carries voice');
   assert.equal(calls[1].length, 5, 'the typed post makes the call it always made');
 });
+
+test('steer receipt integration: console idle events and reopened history keep one exact addition and truthful stopped handling', () => {
+  const sid = 'sess-console-steer-receipt';
+  const receipt = { version: 1 as const, sessionId: sid, sourceUserSeq: 10, noteSeq: 11,
+    clientRequestId: 'console-steer-key', state: 'accepted' as const, changedAtSeq: 11 };
+  let messages: ChatMessage[] = [{ id: 'optimistic', role: 'user', text: 'Synthetic addition', steer: 'pending',
+    requestSessionId: sid, idempotencyKey: 'console-steer-key' }];
+  messages = reconcileIdleChatEvent(messages, { seq: 11, turn: 0, role: 'user', sessionId: sid, type: 'user_steer_note',
+    data: { text: 'Synthetic addition', steerReceipt: receipt } }, sid);
+  const unhandled = { ...receipt, state: 'unhandled' as const, changedAtSeq: 12 };
+  messages = reconcileIdleChatEvent(messages, { seq: 12, turn: 1, role: 'Clem', sessionId: sid, type: 'conversation_completed',
+    data: { sourceUserSeq: 10, steerReceipts: [unhandled] } }, sid, false);
+  assert.equal(messages.length, 1); assert.equal(messages[0]!.id, 'optimistic');
+  assert.equal(messages[0]!.steerReceipt?.state, 'unhandled');
+  const reopened = historyToMessages([
+    { role: 'user', text: 'Synthetic addition', createdAt: new Date(0).toISOString(), steerNote: true, steerReceipt: unhandled },
+    { role: 'user', text: 'Bounded unknown addition', createdAt: new Date(0).toISOString(), steerNote: true,
+      steerNoteSessionId: sid, steerNoteSeq: 13 },
+  ]);
+  assert.equal(reopened[0]!.steerReceipt?.state, 'unhandled');
+  assert.equal(reopened[1]!.steer, 'delivered'); assert.equal(reopened[1]!.steerReceipt, undefined);
+  assert.equal(reopened[0]!.acceptedSource, undefined);
+  const replayed = reconcileIdleChatEvent(reopened, { seq: 13, turn: 0, role: 'user', sessionId: sid,
+    type: 'user_steer_note', data: { text: 'Bounded unknown addition' } }, sid);
+  assert.equal(replayed.length, reopened.length, 'unknown history and source-window replay retain one canonical note');
+  assert.equal(replayed[1]!.steerReceipt, undefined, 'identity does not invent handling');
+});
+
+test('steer receipt idle cache: own-session push and idle poll observe committed admission before deferred UI state', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./useChat.ts', import.meta.url), 'utf8');
+  assert.match(source, /onEvents: \(events\) => \{\s+for \(const event of events\) observePendingSteerReceipt\(event\);/,
+    'idle poll must observe the receipt before scheduling its message reducer');
+  assert.match(source, /noteDelegatedTask, \(event, observeReply\) => \{\s+observePendingSteerReceipt\(event\);/,
+    'own-session delegated events take the own callback, not the foreign activity callback');
+  const { observePendingSteerReceiptEchoes } = await import('./useChat');
+  const sid = 'sess-console-idle-cache';
+  const original: ChatMessage = { id: 'pending-note', role: 'user', text: 'Synthetic addition', steer: 'pending',
+    requestSessionId: sid, idempotencyKey: 'console-idle-key' };
+  const cache = new Map([['console-idle-key', original]]);
+  const event: HarnessEvent = { seq: 11, turn: 0, role: 'user', sessionId: sid, type: 'user_steer_note', data: {
+    text: original.text, steerReceipt: { version: 1, sessionId: sid, sourceUserSeq: 10, noteSeq: 11,
+      clientRequestId: 'console-idle-key', state: 'accepted', changedAtSeq: 11 } } };
+  observePendingSteerReceiptEchoes(cache, event);
+  assert.equal(original.steerReceipt, undefined, 'the deferred message state need not have rendered yet');
+  assert.equal(cache.get('console-idle-key')?.steerReceipt?.state, 'accepted', 'the HTTP completion sees canonical admission immediately');
+  observePendingSteerReceiptEchoes(cache, { ...event, sessionId: 'foreign-session' });
+  assert.equal(cache.get('console-idle-key')?.steerReceipt?.sessionId, sid);
+  const unknownCache = new Map([['console-idle-key', original]]);
+  observePendingSteerReceiptEchoes(unknownCache, { ...event, data: { text: original.text, clientRequestId: 'console-idle-key' } });
+  const { hasSteerAdmission } = await import('@clem/chat-engine');
+  assert.equal(hasSteerAdmission(unknownCache.get('console-idle-key')), true,
+    'a canonical note confirms admission even when the bounded window cannot certify handling');
+  assert.equal(unknownCache.get('console-idle-key')?.steerNoteSeq, 11);
+  assert.equal(unknownCache.get('console-idle-key')?.steerReceipt, undefined);
+  assert.equal(hasSteerAdmission(original), false);
+});

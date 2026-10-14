@@ -978,3 +978,104 @@ test('phone: a reopened draft held for its format keeps Clem’s words with the 
   assert.equal(held?.terminal?.notice?.code, 'response_format_unmet');
   assert.equal(held?.terminal?.review, 'rejected');
 });
+
+test('steer receipt integration: live adoption wins a delayed or lost HTTP acknowledgement and replays once', async () => {
+  for (const acknowledgement of ['success', 'lost', 'refused'] as const) {
+    const transport = new FakeTransport(); const sid = 'sess-steer-receipt-live';
+    const source = { ...ev(10, 'user_input_received', { text: 'Synthetic task' }), sessionId: sid, role: 'user' };
+    let settle!: (value: any) => void; let fail!: (error: Error) => void; let sends = 0;
+    const engine = new ChatEngine({ sessionId: sid, transport, api: {
+      send: async () => { sends++; return new Promise((resolve, reject) => { settle = resolve; fail = reject; }); },
+      loadSession: async () => ({ events: [source], latestSeq: 10 }),
+    } });
+    try {
+      await engine.open(); await wait(5);
+      const sending = engine.send('Synthetic addition'); await wait(5);
+      const key = engine.snapshot().messages.find(message => message.steer)?.idempotencyKey;
+      // The real mobile route retains its device-scoped hash as canonical
+      // identity; the raw caller key is a separate display-only echo.
+      const { createHash } = await import('node:crypto');
+      const canonicalKey = `mobile:${createHash('sha256').update(`synthetic-device\0${key}`).digest('hex')}`;
+      const receipt = { version: 1, sessionId: sid, sourceUserSeq: 10, noteSeq: 11, clientRequestId: canonicalKey, clientEchoId: key,
+        state: 'accepted', changedAtSeq: 11 };
+      const note = { ...ev(11, 'user_steer_note', { text: 'Synthetic addition', steerReceipt: receipt }), sessionId: sid, role: 'user' };
+      const adopted = { ...receipt, state: 'adopted', changedAtSeq: 12 };
+      const marker = { ...ev(12, 'user_steer_receipt', { receipts: [adopted] }), sessionId: sid, role: 'system' };
+      transport.live!.onEvent(note); transport.live!.onEvent(marker);
+      if (acknowledgement === 'lost') fail(new Error('Synthetic lost response'));
+      else settle({ sessionId: sid, accepted: false, steered: acknowledgement === 'success', noteSeq: 11 });
+      await sending;
+      const addition = engine.snapshot().messages.filter(message => message.text === 'Synthetic addition');
+      assert.equal(addition.length, 1); assert.equal(addition[0]!.pending, undefined);
+      assert.equal(addition[0]!.steerReceipt?.state, 'adopted'); assert.equal(sends, 1, 'no automatic resend or new turn');
+      const ended = { ...ev(13, 'conversation_completed', { sourceUserSeq: 10, reply: 'Synthetic unfinished work', reason: 'blocked', steerReceipts: [adopted] }), sessionId: sid };
+      transport.live!.onEvent(ended);
+      assert.equal(engine.snapshot().busy, false);
+      assert.equal(engine.snapshot().messages.find(message => message.steer)?.steerReceipt?.state, 'adopted');
+      const reopened = foldTranscript([source, note, marker, ended], sid);
+      assert.equal(reopened.filter(message => message.text === 'Synthetic addition').length, 1);
+      assert.equal(reopened.find(message => message.steer)?.steerReceipt?.state, 'adopted');
+      assert.equal(reopened.find(message => message.steer)?.acceptedSource, undefined);
+    } finally { engine.dispose(); }
+  }
+});
+
+test('steer receipt retry: the same request and early canonical receipt survive lost or false acknowledgement', async () => {
+  for (const loseResponse of [true, false]) {
+    const transport = new FakeTransport(); const sid = 'sess-steer-retry';
+    const source = { ...ev(10, 'user_input_received', { text: 'Synthetic task' }), sessionId: sid, role: 'user' };
+    let sends = 0; let settle!: (value: any) => void; let fail!: (error: Error) => void;
+    const keys: string[] = [];
+    const engine = new ChatEngine({ sessionId: sid, transport, api: {
+      send: async request => { keys.push(request.idempotencyKey); if (++sends === 1) throw new Error('Synthetic initial loss');
+        return new Promise((resolve, reject) => { settle = resolve; fail = reject; }); },
+      loadSession: async () => ({ events: [source], latestSeq: 10 }),
+    } });
+    try {
+      await engine.open(); await wait(5); await engine.send('Synthetic retry addition');
+      const original = engine.snapshot().messages.find(message => message.steer)!;
+      assert.equal(original.pending, 'failed');
+      const retry = engine.retry(original.id); await wait(5);
+      const { createHash } = await import('node:crypto');
+      const clientRequestId = `mobile:${createHash('sha256').update(`synthetic-device\0${keys[0]}`).digest('hex')}`;
+      transport.live!.onEvent({ ...ev(11, 'user_steer_note', { text: original.text,
+        steerReceipt: { version: 1, sessionId: sid, sourceUserSeq: 10, noteSeq: 11, clientRequestId,
+          clientEchoId: keys[0], state: 'accepted', changedAtSeq: 11 } }), sessionId: sid, role: 'user' });
+      if (loseResponse) fail(new Error('Synthetic retry response loss')); else settle({ sessionId: sid, accepted: false, steered: false, noteSeq: 11 });
+      await retry;
+      const additions = engine.snapshot().messages.filter(message => message.text === original.text);
+      assert.equal(additions.length, 1); assert.equal(additions[0]!.pending, undefined);
+      assert.equal(additions[0]!.steer, 'delivered'); assert.equal(additions[0]!.steerNoteSeq, 11);
+      assert.deepEqual(keys, [original.idempotencyKey, original.idempotencyKey]);
+      await engine.retry(original.id); assert.equal(sends, 2, 'confirmed admission cannot offer another retry');
+    } finally { engine.dispose(); }
+  }
+});
+
+for (const manualRetry of [false, true]) test(`steer receipt unknown handling: ${manualRetry ? 'manual retry' : 'initial send'} admits a canonical note despite lost or false ACK`, async () => {
+  for (const loseResponse of [true, false]) {
+    const transport = new FakeTransport(); const sid = 'sess-steer-unknown-ack';
+    const source = { ...ev(10, 'user_input_received', { text: 'Synthetic task' }), sessionId: sid, role: 'user' };
+    let sends = 0; let settle!: (value: any) => void; let fail!: (error: Error) => void;
+    const engine = new ChatEngine({ sessionId: sid, transport, api: {
+      send: async () => { if (++sends === 1 && manualRetry) throw new Error('Synthetic initial loss');
+        return new Promise((resolve, reject) => { settle = resolve; fail = reject; }); },
+      loadSession: async () => ({ events: [source], latestSeq: 10 }),
+    } });
+    try {
+      await engine.open(); await wait(5);
+      let sending = engine.send('Synthetic unknown addition'); await wait(5);
+      const original = engine.snapshot().messages.find(message => message.steer)!;
+      if (manualRetry) { await sending; sending = engine.retry(original.id); await wait(5); }
+      transport.live!.onEvent({ ...ev(11, 'user_steer_note', { text: original.text,
+        clientRequestId: 'mobile:synthetic-device-hash', clientEchoId: original.idempotencyKey }), sessionId: sid, role: 'user' });
+      if (loseResponse) fail(new Error('Synthetic response loss')); else settle({ sessionId: sid, accepted: false, steered: false });
+      await sending;
+      const additions = engine.snapshot().messages.filter(message => message.text === original.text);
+      assert.equal(additions.length, 1); assert.equal(additions[0]!.pending, undefined);
+      assert.equal(additions[0]!.steer, 'delivered'); assert.equal(additions[0]!.steerNoteSeq, 11);
+      assert.equal(additions[0]!.steerReceipt, undefined, 'canonical admission never fabricates handling evidence');
+      assert.equal(sends, manualRetry ? 2 : 1, 'no automatic resend');
+    } finally { engine.dispose(); }
+  }
+});

@@ -498,6 +498,9 @@ export interface ChatMessage {
   voice?: boolean;
   /** Mid-run steer: text delivered into the live turn, not a new attempt. */
   steer?: 'pending' | 'delivered' | 'failed';
+  /** Display-only durable acknowledgement, never task/effect authority. */
+  steerReceipt?: import('./steer-receipt.js').SteerReceipt;
+  steerNoteSeq?: number;
   /** Present only while this assistant bubble represents exact, source-bound
    * delegated workflow work. A canonical terminal removes the control. */
   delegatedWork?: DelegatedWorkControl;

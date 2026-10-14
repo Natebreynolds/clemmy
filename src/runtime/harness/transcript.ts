@@ -1,3 +1,4 @@
+import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 /**
  * Read a harness eventlog session back into a clean user/assistant
  * transcript for display in the desktop Conversations UI.
@@ -22,6 +23,7 @@ import {
   validTypedCompletionPresentation,
   publicPlanArtifactRef,
   publicTaskMode,
+  publicSteerReceiptsForSource,
 } from './public-presentation.js';
 
 /** The longest message of her own her thread shows: a workflow report (its
@@ -84,6 +86,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
   const events = readPublicEvents(sessionId, {
     types: [
       'user_input_received',
+      ...(includeDecorations ? ['user_steer_note' as const] : []),
       'conversation_completed',
       'conversation_superseded',
       // Her mid-task words replay too: the point of a check-in is that
@@ -167,6 +170,25 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
       event,
       userText: event.data.synthetic === true ? '' : ownerBubbleText(event.data),
     });
+  }
+
+  // Additions are user rows within their existing source, never new turns.
+  // Text-only catalog previews keep their original bounded event surface.
+  const steerBySource = new Map<string, UnifiedSessionTurn[]>();
+  const receiptBatches = new Map<string, ReturnType<typeof publicSteerReceiptsForSource>>();
+  const steeringSources = [...sources.values()].filter(source => !isLiveApprovalAcknowledgement(source.event));
+  for (const event of events) {
+    if (event.type !== 'user_steer_note' || event.role !== 'user') continue;
+    const source = steeringSources.filter(source => source.event.sessionId === event.sessionId && source.event.seq < event.seq).at(-1);
+    const text = typeof event.data.text === 'string' ? event.data.text : '';
+    if (!source || !text) continue;
+    const key = source.key;
+    if (!receiptBatches.has(key)) receiptBatches.set(key, publicSteerReceiptsForSource(event.sessionId, source.event.seq));
+    const receipt = receiptBatches.get(key)!.find(receipt => receipt.noteSeq === event.seq);
+    const rows = steerBySource.get(key) ?? [];
+    rows.push({ role: 'user', text, createdAt: event.createdAt, steerNote: true,
+      steerNoteSessionId: event.sessionId, steerNoteSeq: event.seq, ...(receipt ? { steerReceipt: receipt } : {}) });
+    steerBySource.set(key, rows);
   }
 
   // Publication is already durable while the final Plan reply may still be
@@ -390,6 +412,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
       ? [{ role: 'user', text: source.userText, createdAt: source.event.createdAt,
         ...(publicTaskMode(source.event.data.taskMode) ? { taskMode: publicTaskMode(source.event.data.taskMode) } : {}) }]
       : [];
+    userTurns.push(...(steerBySource.get(source.key) ?? []));
     if (assistant) {
       // A DAEMON-DRIVEN turn (synthetic source — an outcome relay the user
       // never typed) that FAILED renders nothing: painting "Something went

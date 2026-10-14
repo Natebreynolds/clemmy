@@ -2,6 +2,7 @@ import { TerminalContinueButton } from '../components/TerminalContinueButton';
 import { ConnectionSetup } from '../components/ConnectionSetup';
 import type { ConnectionContinuation } from '../lib/connection-setup';
 import { ApprovalReview } from '../components/ApprovalReview';
+import { SteerReceiptStatus } from '../components/SteerReceiptStatus';
 import { CliSessions } from '../components/CliSessions';
 /**
  * The chat screen, rebuilt on the shared chat engine (@clem/chat-engine —
@@ -320,7 +321,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         }
         if (result.accepted || result.steered) acceptedRequests.current.add(idempotencyKey);
         if (!sessionId) sessionProjectId.current = projectId;
-        return { sessionId: result.sessionId, accepted: result.accepted, steered: result.steered };
+        return { sessionId: result.sessionId, accepted: result.accepted, steered: result.steered, noteSeq: result.noteSeq };
       },
       loadSession: async (sessionId) => {
         try {
@@ -1077,10 +1078,11 @@ function MessageRow({
           </div>
         ) : null}
         {message.text ? <div class="user-said">{message.text}</div> : null}
-        {message.pending === 'sending' ? <div class="pending-status">sending…</div> : null}
+        <SteerReceiptStatus message={message} />
+        {!message.steer && message.pending === 'sending' ? <div class="pending-status">sending…</div> : null}
         {message.pending === 'failed' ? (
           <div class="pending-status pending-failed">
-            <span>failed — {message.pendingError ?? 'couldn’t reach your computer'}</span>
+            {!message.steer ? <span>failed — {message.pendingError ?? 'couldn’t reach your computer'}</span> : null}
             <button class="pending-action" onClick={() => onRetry(message.id)}>retry</button>
             <button class="pending-action" onClick={() => onDiscard(message.id)}>discard</button>
           </div>

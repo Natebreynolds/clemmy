@@ -177,6 +177,12 @@ export interface UnifiedSessionSummary {
 
 /** A single normalized turn for rendering a conversation's history. */
 export interface UnifiedSessionTurn {
+  steerNote?: true;
+  /** Durable display identity survives even when handling evidence is bounded. */
+  steerNoteSessionId?: string;
+  steerNoteSeq?: number;
+  /** Display-only mid-run addition acknowledgement. */
+  steerReceipt?: import('./runtime/harness/public-presentation.js').PublicSteerReceipt;
   role: 'user' | 'assistant';
   text: string;
   createdAt: string;

@@ -1,3 +1,4 @@
+import { applySteerReceiptEvent, hasSteerAdmission } from './steer-receipt.js';
 import { readQuestionOptions } from './question-options.js';
 import { readLiveApprovalControl } from './live-approval-control.js';
 import type { PendingMessageStore } from './pending-request.js';
@@ -29,6 +30,7 @@ export interface SendResult {
   sessionId: string;
   accepted: boolean;
   steered?: boolean;
+  noteSeq?: number;
 }
 
 /** The user's own words for a user_input_received row: displayText when the
@@ -401,8 +403,10 @@ export class ChatEngine {
           entry.id === steerId
             ? {
                 ...entry,
-                pending: result.steered ? undefined : 'failed',
-                steer: result.steered ? 'delivered' : 'failed',
+                pending: result.steered || hasSteerAdmission(entry) ? undefined : 'failed',
+                steer: result.steered || hasSteerAdmission(entry) ? 'delivered' : 'failed',
+                ...(result.steered && result.sessionId === steerMessage.requestSessionId && Number.isSafeInteger(result.noteSeq)
+                  && Number(result.noteSeq) > 0 ? { steerNoteSeq: result.noteSeq } : {}),
               }
             : entry
         ));
@@ -410,7 +414,7 @@ export class ChatEngine {
         // The computer may well have answered (a refusal is a 409 with its
         // own line): the row shows that line, not a connection guess.
         this.messages = this.messages.map((entry) => (
-          entry.id === steerId ? { ...entry, pending: 'failed', steer: 'failed', pendingError: steerFailureLine(error) } : entry
+          entry.id === steerId && !hasSteerAdmission(entry) ? { ...entry, pending: 'failed', steer: 'failed', pendingError: steerFailureLine(error) } : entry
         ));
       }
       this.emit();
@@ -463,9 +467,12 @@ export class ChatEngine {
           ...(failed.voice === true ? { voice: true } : {}),
           ...this.agentField() });
         this.messages = this.messages.map(message => message.id === messageId
-          ? { ...message, pending: result.steered ? undefined : 'failed', steer: result.steered ? 'delivered' : 'failed' } : message);
+          ? { ...message, pending: result.steered || hasSteerAdmission(message) ? undefined : 'failed',
+            steer: result.steered || hasSteerAdmission(message) ? 'delivered' : 'failed',
+            ...(result.steered && result.sessionId === failed.requestSessionId && Number.isSafeInteger(result.noteSeq)
+              && Number(result.noteSeq) > 0 ? { steerNoteSeq: result.noteSeq } : {}) } : message);
       } catch (error) {
-        this.messages = this.messages.map(message => message.id === messageId
+        this.messages = this.messages.map(message => message.id === messageId && !hasSteerAdmission(message)
           ? { ...message, pending: 'failed', pendingError: steerFailureLine(error) } : message);
       }
       this.emit();
@@ -705,6 +712,8 @@ export class ChatEngine {
     if (event.seq > this.cursor && (!event.sessionId || event.sessionId === this.sessionId)) {
       this.cursor = event.seq;
     }
+    this.messages = applySteerReceiptEvent(this.messages, event, this.sessionId);
+    if (event.type === 'user_steer_note' || event.type === 'user_steer_receipt') { this.emit(); return; }
     if (readLiveApprovalControl(event)) {
       if (event.sessionId && event.sessionId !== this.sessionId) return;
       if (event.type === 'conversation_completed') {
@@ -1130,7 +1139,7 @@ function eventClock(event: HarnessEvent): () => number {
 }
 
 export function foldTranscript(events: readonly HarnessEvent[], sessionId?: string | null): ChatMessage[] {
-  const messages: ChatMessage[] = [];
+  let messages: ChatMessage[] = [];
   let activity: ChatMessage['activity'] = [];
   let opening = '';
   // awaiting_user_input is independently deliverable, while the canonical
@@ -1153,6 +1162,8 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
   const planRefsBySource = new Map<number, NonNullable<ChatMessage['planArtifactRef']>>();
   const cardDecisionsBySource = new Map<number, CardDecision>();
   for (const event of events) {
+    messages = applySteerReceiptEvent(messages, event, sessionId);
+    if (event.type === 'user_steer_note' || event.type === 'user_steer_receipt') continue;
     const d = (event.data ?? {}) as Record<string, unknown>;
     if ((event.type === 'conversation_completed' || event.type === 'run_failed') && sessionId
       && event.sessionId && event.sessionId !== sessionId && sourceUserSeqOf(event) !== null

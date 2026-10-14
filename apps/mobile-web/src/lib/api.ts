@@ -1179,7 +1179,7 @@ export async function sendChatMessageAsync(
     /** Inbox ids from uploadChatAttachment, sent with this message. */
     attachments?: string[];
   },
-): Promise<{ accepted: boolean; sessionId: string; runId?: string; sinceSeq?: number; steered?: boolean }> {
+): Promise<{ accepted: boolean; sessionId: string; runId?: string; sinceSeq?: number; steered?: boolean; noteSeq?: number }> {
   return api('/m/api/chat/send', {
     method: 'POST',
     headers: { 'idempotency-key': input.idempotencyKey },

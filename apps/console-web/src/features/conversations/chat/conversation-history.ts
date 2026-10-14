@@ -1,5 +1,5 @@
 import { readTaskMode, readPlanRevisionRef } from '../../../lib/task-mode';
-import { approvalPreviewFrom, approvalRevisionFrom, recordedTurnProject, terminalCompletionPresentation } from '@clem/chat-engine';
+import { readSteerReceipt, approvalPreviewFrom, approvalRevisionFrom, recordedTurnProject, terminalCompletionPresentation } from '@clem/chat-engine';
 import { pendingActionFromEvent, type ChatMessage } from '../../../lib/useChat';
 import type { Turn } from '../types';
 
@@ -85,10 +85,16 @@ function historyMessage(turn: Turn): ChatMessage {
     };
   }
   const typed = turn.role === 'assistant' ? reopenedTerminal(turn) : null;
+  const steerReceipt = turn.role === 'user' ? readSteerReceipt(turn.steerReceipt) : null;
   return {
     id: `h${++seedSeq}`,
     role: turn.role,
     text: typed ? typed.text : turn.text,
+    ...(steerReceipt ? { steer: 'delivered' as const, steerReceipt } : turn.steerNote ? { steer: 'delivered' as const } : {}),
+    ...(steerReceipt ? { requestSessionId: steerReceipt.sessionId, steerNoteSeq: steerReceipt.noteSeq }
+      : turn.steerNote && typeof turn.steerNoteSessionId === 'string' && /^[A-Za-z0-9:._/-]{1,240}$/.test(turn.steerNoteSessionId)
+        && Number.isSafeInteger(turn.steerNoteSeq) && Number(turn.steerNoteSeq) > 0
+        ? { requestSessionId: turn.steerNoteSessionId, steerNoteSeq: turn.steerNoteSeq } : {}),
     taskMode: readTaskMode(turn.taskMode),
     planArtifactRef: readPlanRevisionRef(turn.planArtifactRef),
     status: typed ? typed.status : turn.role === 'assistant' ? ('complete' as const) : undefined,

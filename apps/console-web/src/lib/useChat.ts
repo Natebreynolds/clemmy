@@ -2,8 +2,8 @@ import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../
 import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { ChatStopReceipt, DelegatedWorkControl, LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
 import { boundedModelId, modelDisplayName } from '@clem/chat-engine';
-import { acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
-import type { ApprovalConfirm, ApprovalPreview, ApprovalResolution, ApprovalRevision } from '@clem/chat-engine';
+import { applySteerReceiptEvent, hasSteerAdmission, acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
+import type { SteerReceipt, ApprovalConfirm, ApprovalPreview, ApprovalResolution, ApprovalRevision } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -147,6 +147,10 @@ export interface ChatMessage {
   /** Mid-run steering: this user message was sent while a run was active and
    *  rides to the model at its next step instead of starting a new turn. */
   steer?: 'pending' | 'delivered' | 'failed';
+  steerReceipt?: SteerReceipt;
+  steerNoteSeq?: number;
+  idempotencyKey?: string;
+  requestSessionId?: string | null;
   approval?: {
     subject: string;
     reason?: string;
@@ -390,9 +394,20 @@ export function attachApprovalConfirm(
 /** Own-session card updates can arrive while the foreground stream is closed
  * (an edit on this device, or a decision on the other one). Reconcile the
  * existing card and exact reply source instead of appending another card. */
+export function observePendingSteerReceiptEchoes(cache: Map<string, ChatMessage>, event: HarnessEvent): void {
+  if (!['user_steer_note', 'user_steer_receipt', 'conversation_completed'].includes(event.type)) return;
+  for (const [key, message] of cache) {
+    const next = applySteerReceiptEvent([message], event, message.requestSessionId);
+    if (next[0] && hasSteerAdmission(next[0])) cache.set(key, next[0]);
+  }
+}
+
 export function reconcileIdleChatEvent(messages: readonly ChatMessage[], event: HarnessEvent, sessionId: string,
   observeReply = true): ChatMessage[] {
   if (event.sessionId && event.sessionId !== sessionId) return messages as ChatMessage[];
+  const steered = applySteerReceiptEvent(messages as ChatMessage[], event, sessionId);
+  if (event.type === 'user_steer_note' || event.type === 'user_steer_receipt') return steered;
+  messages = steered;
   const d = event.data ?? {};
   if (event.type === 'approval_resolved') return applyApprovalResolution(messages, d);
   const confirm = event.type === 'awaiting_user_input' ? approvalConfirmFromEvent(d) : null;
@@ -1577,6 +1592,12 @@ export function useChat(options?: UseChatOptions) {
   }, []);
   const [composerMode, setComposerMode] = useState<ComposerMode>('normal');
   const sessionIdRef = useRef<string | null>(options?.initialSessionId ?? null);
+  // Only in-flight POST echoes: an SSE receipt can confirm admission even
+  // when the HTTP acknowledgement is lost. No retry or extra request.
+  const pendingSteerEchoes = useRef(new Map<string, ChatMessage>());
+  const observePendingSteerReceipt = useCallback((event: HarnessEvent) => {
+    observePendingSteerReceiptEchoes(pendingSteerEchoes.current, event);
+  }, []);
   const conversationSessionIdRef = useRef<string | null>(options?.conversationSessionId ?? options?.initialSessionId ?? null);
   const streamRef = useRef<StreamHandle | null>(null);
   const activeAssistantId = useRef<string | null>(null);
@@ -1676,7 +1697,10 @@ export function useChat(options?: UseChatOptions) {
         const additions = await pollInboxOutcomeEvents(cursor, {
           active: () => !stopped && inboxOutcomeCursorRef.current === cursor,
           fetchPage: (url) => apiGet<RecentEventsPage>(url),
-          onEvents: (events) => setMessages(previous => events.reduce((current, event) => reconcileIdleChatEvent(current, event, sid), previous)),
+          onEvents: (events) => {
+            for (const event of events) observePendingSteerReceipt(event);
+            setMessages(previous => events.reduce((current, event) => reconcileIdleChatEvent(current, event, sid), previous));
+          },
         });
         if (additions.length) {
           setMessages((prev) => {
@@ -1696,7 +1720,7 @@ export function useChat(options?: UseChatOptions) {
     void tick();
     const timer = window.setInterval(() => { void tick(); }, 5000);
     return () => { stopped = true; window.clearInterval(timer); };
-  }, [busy]);
+  }, [busy, observePendingSteerReceipt]);
 
   // Mount identity + teardown (2026-08-04 static-window work). Recording the
   // restored session keeps the chat index pointing at the conversation the
@@ -1824,6 +1848,7 @@ export function useChat(options?: UseChatOptions) {
     const sid = sessionIdRef.current;
     if (!sid) return;
     return subscribeDelegatedActivity(sid, (ev) => {
+      observePendingSteerReceipt(ev);
       // Activity bridged from a task's own run does not say the task record
       // moved, but a finished or parked run usually means it did.
       if (ev.type === 'conversation_completed' || ev.type === 'approval_requested' || ev.type === 'approval_resolved') noteDelegatedTask();
@@ -1883,13 +1908,17 @@ export function useChat(options?: UseChatOptions) {
         return next;
       });
     }, noteDelegatedTask, (event, observeReply) => {
+      observePendingSteerReceipt(event);
       setMessages(previous => reconcileIdleChatEvent(previous, event, sid, observeReply));
     });
-  }, [busy, noteDelegatedTask]);
+  }, [busy, noteDelegatedTask, observePendingSteerReceipt]);
 
   const applyEvent = useCallback((assistantId: string, ev: HarnessEvent, sourceBoundary?: { sessionId: string; afterSeq: number }) => {
     if (ev.type === 'delegated_task_state') noteDelegatedTask();
+    observePendingSteerReceipt(ev);
     const d = (ev.data ?? {}) as Record<string, unknown>;
+    setMessages(previous => applySteerReceiptEvent(previous, ev, sessionIdRef.current));
+    if (ev.type === 'user_steer_note' || ev.type === 'user_steer_receipt') return;
     if (ev.type === 'user_input_received' && sourceBoundary) {
       const source = acceptedChatSource(ev, sourceBoundary.sessionId);
       if (source && source.sourceUserSeq > sourceBoundary.afterSeq && sessionIdRef.current === source.sessionId
@@ -2033,7 +2062,7 @@ export function useChat(options?: UseChatOptions) {
       setMessages(previous => previous.map(message => message.id === assistantId
         ? applyChatProgressEvent(message, ev, owner) : message));
     }
-  }, [noteDelegatedTask]);
+  }, [noteDelegatedTask, observePendingSteerReceipt]);
 
   const handoffAcceptedRun = useCallback(async (
     accepted: ChatPostResult,
@@ -2094,22 +2123,30 @@ export function useChat(options?: UseChatOptions) {
       // wait for the turn to finish.
       if (attachmentIds.length > 0) throw new Error('Wait for this turn to finish before sending files. Your message is still here.');
       const steerId = nextId();
-      setMessages((prev) => [...prev, { id: steerId, role: 'user', text, steer: 'pending', taskMode }]);
+      const steerRequestId = createChatClientRequestId();
+      const steerSessionId = sessionIdRef.current;
+      const echo: ChatMessage = { id: steerId, role: 'user', text, steer: 'pending', taskMode,
+        idempotencyKey: steerRequestId, requestSessionId: steerSessionId };
+      pendingSteerEchoes.current.set(steerRequestId, echo);
+      setMessages((prev) => [...prev, echo]);
       try {
-        const res = await apiPost<{ steered?: boolean }>('/api/harness/chat', {
+        const res = await apiPost<{ steered?: boolean; sessionId?: string; noteSeq?: number }>('/api/harness/chat', {
           input: text,
           sessionId: sessionIdRef.current || undefined,
           attachments: [],
-          clientRequestId: createChatClientRequestId(),
+          clientRequestId: steerRequestId,
           steerOnly: true,
         });
-        patch(steerId, { steer: res?.steered ? 'delivered' : 'failed' } as Partial<ChatMessage>);
-        if (res?.steered) input.onAccepted?.();
+        patch(steerId, { steer: res?.steered || hasSteerAdmission(pendingSteerEchoes.current.get(steerRequestId)) ? 'delivered' : 'failed',
+          ...(res?.steered && res.sessionId === steerSessionId && Number.isSafeInteger(res.noteSeq) && Number(res.noteSeq) > 0
+            ? { steerNoteSeq: res.noteSeq } : {}) } as Partial<ChatMessage>);
+        if (res?.steered || hasSteerAdmission(pendingSteerEchoes.current.get(steerRequestId))) input.onAccepted?.();
         else throw new Error('That addition was not accepted. Your message is still here.');
       } catch (error) {
+        if (hasSteerAdmission(pendingSteerEchoes.current.get(steerRequestId))) { input.onAccepted?.(); return; }
         patch(steerId, { steer: 'failed' } as Partial<ChatMessage>);
         if (input.onAccepted) throw error;
-      }
+      } finally { pendingSteerEchoes.current.delete(steerRequestId); }
       return;
     }
 

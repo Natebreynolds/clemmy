@@ -45,3 +45,5 @@ export * from './browser-view-lifecycle.js';
 export * from './model-role-words.js';
 export * from './model-scorecard-presentation.js';
 export * from './live-voice.js';
+
+export * from './steer-receipt.js';

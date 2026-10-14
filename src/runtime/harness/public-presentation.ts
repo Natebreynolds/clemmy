@@ -16,7 +16,7 @@
  * The returned rows deliberately keep the legacy EventRow wire shape so the
  * desktop clients can adopt the boundary without a protocol rewrite.
  */
-import { getRunAttemptSourceUserEvent, listEvents, type EventRow } from './eventlog.js';
+import { getRunAttemptSourceUserEvent, listEvents, openEventLog, type EventRow } from './eventlog.js';
 import { BoundaryError } from '../boundary-error.js';
 import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 import {
@@ -1260,7 +1260,11 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     // same trust class as user_input_received. Delivery markers stay internal.
     case 'user_steer_note': {
       const text = typeof data.text === 'string' ? data.text : '';
-      return text ? { text } : null;
+      const receipt = publicSteerReceipt(event);
+      const clientRequestId = publicSteerRequestId(data.clientRequestId);
+      const clientEchoId = publicSteerRequestId(data.clientEchoId);
+      return text ? { text, ...(clientRequestId ? { clientRequestId } : {}), ...(clientEchoId ? { clientEchoId } : {}),
+        ...(receipt ? { steerReceipt: receipt } : {}) } : null;
     }
     case 'turn_model_routed': {
       // Route identity is useful, but route diagnostics are not presentation:
@@ -1646,8 +1650,108 @@ function projectData(event: EventRow): Record<string, unknown> | null {
   }
 }
 
+/** Wire shape mirrored by the client parser; display-only, never authority. */
+export interface PublicSteerReceipt {
+  version: 1; sessionId: string; sourceUserSeq: number; noteSeq: number;
+  clientRequestId?: string; clientEchoId?: string; state: 'accepted' | 'adopted' | 'unhandled'; changedAtSeq: number;
+}
+
+const STEER_RECEIPT_WINDOW = 512;
+const publicSteerRequestId = (value: unknown): string | undefined => typeof value === 'string'
+  && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/.test(value) ? value : undefined;
+
+/** One bounded, source-owned read for a receipt batch. An incomplete window
+ * proves no handling state: in particular it cannot turn missing adoption
+ * evidence into an "unhandled" claim. No current-attempt/runtime inference. */
+export function publicSteerReceiptsForSource(sessionId: string, sourceSeq: number, throughSeq = Number.MAX_SAFE_INTEGER): PublicSteerReceipt[] {
+  try {
+    const db = openEventLog();
+    if (db.inTransaction || !Number.isSafeInteger(sourceSeq) || sourceSeq <= 0) return [];
+    const source = listEvents(sessionId, { sinceSeq: sourceSeq - 1, throughSeq: sourceSeq, limit: 1 })[0];
+    if (!source || source.type !== 'user_input_received' || source.role !== 'user' || source.data.synthetic === true
+      || isLiveApprovalAcknowledgement(source)) return [];
+    const following = db.prepare("SELECT seq FROM events WHERE session_id = ? AND type = 'user_input_received' AND seq > ? ORDER BY seq LIMIT 32")
+      .all(sessionId, sourceSeq) as Array<{ seq: number }>;
+    const next = following.find(row => {
+      const source = listEvents(sessionId, { sinceSeq: row.seq - 1, throughSeq: row.seq, limit: 1 })[0];
+      return source && !isLiveApprovalAcknowledgement(source);
+    });
+    if (!next && following.length === 32) return [];
+    const rows = listEvents(sessionId, { sinceSeq: sourceSeq, throughSeq: Math.min(throughSeq, next ? next.seq - 1 : Number.MAX_SAFE_INTEGER),
+      types: ['user_input_received', 'user_steer_note', 'user_steer_note_delivered', 'conversation_completed'],
+      limit: STEER_RECEIPT_WINDOW + 1 });
+    if (rows.length > STEER_RECEIPT_WINDOW) return [];
+    const receipts = new Map<number, PublicSteerReceipt>();
+    let terminalSeq: number | undefined;
+    for (const row of rows) {
+      if (row.type === 'user_input_received' && !isLiveApprovalAcknowledgement(row)) break;
+      if (row.type === 'user_steer_note' && row.role === 'user' && !terminalSeq) {
+        const clientRequestId = publicSteerRequestId(row.data.clientRequestId);
+        const clientEchoId = publicSteerRequestId(row.data.clientEchoId);
+        receipts.set(row.seq, { version: 1, sessionId, sourceUserSeq: sourceSeq, noteSeq: row.seq,
+          state: 'accepted', changedAtSeq: row.seq, ...(clientRequestId ? { clientRequestId } : {}), ...(clientEchoId ? { clientEchoId } : {}) });
+      } else if (row.type === 'user_steer_note_delivered' && row.role === 'system' && !terminalSeq
+        && row.data.sourceUserSeq === sourceSeq && Array.isArray(row.data.noteSeqs)) {
+        // An oversized marker also makes handling unknown, never negative.
+        if (row.data.noteSeqs.length > STEER_RECEIPT_WINDOW) return [];
+        const delivered = new Set(row.data.noteSeqs.filter(seq => Number.isSafeInteger(seq) && seq > 0));
+        for (const receipt of receipts.values()) {
+          if (receipt.state === 'accepted' && delivered.has(receipt.noteSeq)) {
+            receipt.state = 'adopted'; receipt.changedAtSeq = row.seq;
+          }
+        }
+      } else if (row.type === 'conversation_completed'
+        && validTypedCompletionPresentation(row.data, sessionId)?.identity.sourceUserSeq === sourceSeq) {
+        terminalSeq ??= row.seq;
+      }
+    }
+    if (terminalSeq) for (const receipt of receipts.values()) if (receipt.state === 'accepted') {
+      receipt.state = 'unhandled'; receipt.changedAtSeq = terminalSeq;
+    }
+    return [...receipts.values()];
+  } catch { return []; }
+}
+
+/** The note's canonical predecessor is the same source interval used by
+ * adoptedSteerNotesForSource; live approval acknowledgements never replace it.
+ * A later nonapproval accepted source closes the interval. */
+export function publicSteerReceipt(note: EventRow, throughSeq?: number): PublicSteerReceipt | null {
+  try {
+    const db = openEventLog();
+    if (db.inTransaction || note.type !== 'user_steer_note' || note.role !== 'user'
+      || !Number.isSafeInteger(note.seq) || note.seq <= 0) return null;
+    const retained = listEvents(note.sessionId, { sinceSeq: note.seq - 1, throughSeq: note.seq, limit: 1 })[0];
+    if (!retained || retained.id !== note.id || retained.type !== note.type || retained.role !== note.role) return null;
+    const candidates = db.prepare("SELECT seq FROM events WHERE session_id = ? AND type = 'user_input_received' AND seq < ? ORDER BY seq DESC LIMIT 32")
+      .all(note.sessionId, note.seq) as Array<{ seq: number }>;
+    for (const candidate of candidates) {
+      const source = listEvents(note.sessionId, { sinceSeq: candidate.seq - 1, throughSeq: candidate.seq, limit: 1 })[0];
+      if (!source || isLiveApprovalAcknowledgement(source)) continue;
+      return publicSteerReceiptsForSource(note.sessionId, source.seq, throughSeq).find(receipt => receipt.noteSeq === note.seq) ?? null;
+    }
+    return null;
+  } catch { return null; }
+}
+
+function publicSteerReceiptsAt(event: EventRow): PublicSteerReceipt[] {
+  if (event.type === 'user_steer_note_delivered' && event.role === 'system' && Array.isArray(event.data.noteSeqs)
+    && Number.isSafeInteger(event.data.sourceUserSeq)) {
+    return publicSteerReceiptsForSource(event.sessionId, Number(event.data.sourceUserSeq), event.seq)
+      .filter(receipt => receipt.state === 'adopted' && receipt.changedAtSeq === event.seq).slice(0, 64);
+  }
+  if (event.type !== 'conversation_completed') return [];
+  const source = validTypedCompletionPresentation(event.data, event.sessionId)?.identity.sourceUserSeq;
+  return source ? publicSteerReceiptsForSource(event.sessionId, source, event.seq).slice(0, 64) : [];
+}
+
 /** Project one raw harness row into the public chat event plane. */
 export function projectHarnessEventForPublic(event: EventRow): EventRow | null {
+  // The raw control marker remains private. This separately named, bounded
+  // acknowledgement carries only validated display identities and state.
+  if (event.type === 'user_steer_note_delivered') {
+    const receipts = publicSteerReceiptsAt(event);
+    return receipts.length ? { ...event, type: 'user_steer_receipt' as EventRow['type'], parentEventId: null, data: { receipts } } : null;
+  }
   if (PRIVATE_EVENT_TYPES.has(event.type)) return null;
   if (
     (event.type === 'tool_called' || event.type === 'tool_returned')
@@ -1656,6 +1760,10 @@ export function projectHarnessEventForPublic(event: EventRow): EventRow | null {
   let data: Record<string, unknown> | null;
   try { data = projectData(event); } catch { return null; }
   if (data === null) return null;
+  if (event.type === 'conversation_completed') {
+    const receipts = publicSteerReceiptsAt(event);
+    if (receipts.length) data = { ...data, steerReceipts: receipts };
+  }
   return {
     ...event,
     // Parent links are execution topology, not presentation state.

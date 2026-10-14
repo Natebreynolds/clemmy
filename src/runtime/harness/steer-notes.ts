@@ -382,12 +382,16 @@ export function sessionSupportsSteering(sessionId: string | undefined): boolean 
 export function appendSteerNote(
   sessionId: string,
   text: string,
-  options: { clientRequestId?: string | undefined; voice?: boolean; expectedAttemptId?: string } = {},
+  options: { clientRequestId?: string | undefined; clientEchoId?: string; voice?: boolean; expectedAttemptId?: string } = {},
 ): { seq: number } {
   try {
     // A retried SAME request remains its original instruction, even after the
     // handoff. A new request must atomically compare the current owner/fence.
     const requestId = options.clientRequestId?.trim();
+    // Presentation correlation only. Admission and idempotency continue to
+    // use the canonical requestId (device-scoped on mobile), never this echo.
+    const clientEchoId = typeof options.clientEchoId === 'string'
+      && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/.test(options.clientEchoId) ? options.clientEchoId : undefined;
     return openEventLog().transaction(() => {
       if (requestId) {
         const existing = listEvents(sessionId, { types: ['user_steer_note'] })
@@ -422,7 +426,8 @@ export function appendSteerNote(
         }
       }
       const row = appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_steer_note',
-        data: { text, ...(requestId ? { clientRequestId: requestId } : {}), ...(options.voice === true ? { voice: true } : {}) } });
+        data: { text, ...(requestId ? { clientRequestId: requestId } : {}),
+          ...(clientEchoId ? { clientEchoId } : {}), ...(options.voice === true ? { voice: true } : {}) } });
       return { seq: row.seq };
     }).immediate();
   } catch (error) {

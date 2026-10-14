@@ -1642,6 +1642,14 @@ function publishPersistedEvent(event: EventRow): EventRow {
     eventPublicationFrame.publications.push(() => { publishPersistedEvent(event); });
     return event;
   }
+  // A raw bus publication can occur inside an unmanaged outer transaction.
+  // Only these new steering presentation receipts wait for a canonical,
+  // committed re-read; raw controls and all other publication order stay put.
+  const publicationDb = openEventLog();
+  const deferredSteer = publicationDb.inTransaction
+    && (event.type === 'user_steer_note' || event.type === 'user_steer_note_delivered');
+  const steerIdentity = deferredSteer
+    ? { id: event.id, seq: event.seq, sessionId: event.sessionId, type: event.type, role: event.role } : null;
   const session = getSession(event.sessionId, { withoutConversationState: true });
   const sessionSignal = session ? summarizeSessionForSignal(session) : undefined;
   // Fan out for live SSE subscribers. Best-effort — emit errors are
@@ -1656,14 +1664,32 @@ function publishPersistedEvent(event: EventRow): EventRow {
   // The raw ledger is not a presentation protocol. Publish a separate,
   // fail-closed projection for user-facing transports while retaining the
   // original event above for operator/audit consumers.
-  const publicEvent = projectHarnessEventForPublic(event);
-  if (publicEvent) {
-    actionBus.emit({
-      kind: 'harness.public_event',
-      sessionId: event.sessionId,
-      event: publicEvent,
-      session: sessionSignal,
+  if (steerIdentity) {
+    queueMicrotask(() => {
+      try {
+        if (!publicationDb.open || openEventLog() !== publicationDb || publicationDb.inTransaction) return;
+        const row = prepareCached(publicationDb, `SELECT * FROM events
+          WHERE id = ? AND seq = ? AND session_id = ? AND type = ? AND role = ?`)
+          .get(steerIdentity.id, steerIdentity.seq, steerIdentity.sessionId, steerIdentity.type, steerIdentity.role) as RawEventRow | undefined;
+        if (!row) return; // rollback or same sequence reused by another row
+        const canonical = rowToEvent(row);
+        const publicEvent = projectHarnessEventForPublic(canonical);
+        if (!publicEvent) return;
+        const current = getSession(canonical.sessionId, { withoutConversationState: true });
+        actionBus.emit({ kind: 'harness.public_event', sessionId: canonical.sessionId,
+          event: publicEvent, session: current ? summarizeSessionForSignal(current) : undefined });
+      } catch { /* presentation cannot retry or disturb execution */ }
     });
+  } else {
+    const publicEvent = projectHarnessEventForPublic(event);
+    if (publicEvent) {
+      actionBus.emit({
+        kind: 'harness.public_event',
+        sessionId: event.sessionId,
+        event: publicEvent,
+        session: sessionSignal,
+      });
+    }
   }
   // Mirror whitelisted events into the operational-telemetry store so the
   // dashboard / Slack / Discord see run lifecycle, swarms, verdicts and

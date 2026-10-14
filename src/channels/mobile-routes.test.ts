@@ -1405,6 +1405,14 @@ test('mobile terminal steering refusal cannot become a competing ordinary turn',
     const accepted = await send('terminal-steering-before');
     assert.equal(accepted.status, 200);
     assert.equal((await accepted.json() as { steered: boolean }).steered, true);
+    const savedNote = listEvents(session.id, { types: ['user_steer_note'] })[0]!;
+    const mobileRequest = `mobile:${createHash('sha256').update(`${deviceId}\0terminal-steering-before`).digest('hex')}`;
+    assert.equal(savedNote.data.clientRequestId, mobileRequest, 'canonical device-scoped request identity is unchanged');
+    assert.equal(savedNote.data.clientEchoId, 'terminal-steering-before', 'caller key is only presentation metadata');
+    const { projectHarnessEventForPublic } = await import('../runtime/harness/public-presentation.js');
+    const publicNote = projectHarnessEventForPublic(savedNote)!;
+    assert.equal((publicNote.data.steerReceipt as any)?.clientRequestId, mobileRequest);
+    assert.equal((publicNote.data.steerReceipt as any)?.clientEchoId, 'terminal-steering-before');
     assert.equal(getLatestRunAttempt(session.id)?.attemptId, attempt.attemptId);
     assert.equal(steering.takeUndeliveredSteerNotes(session.id, source.seq).length, 1);
     assert.equal(steering.closeTerminalSteering({ sessionId: session.id, sourceUserSeq: source.seq,

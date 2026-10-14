@@ -4612,6 +4612,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
             const note = appendSteerNote(proposedSessionId, message, {
               clientRequestId: requestId,
+              clientEchoId: idempotencyKey,
               expectedAttemptId,
               ...(voice ? { voice: true } : {}),
             });
