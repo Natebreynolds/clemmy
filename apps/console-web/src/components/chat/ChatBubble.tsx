@@ -5,7 +5,7 @@ import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { answerDraftStatus, cardDecisionNoticeOnly, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
+import { answerDraftStatus, canContinueTerminal, cardDecisionNoticeOnly, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
 import type { ApprovalConfirm, ApprovalResolution, TerminalNoticeLine } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
@@ -303,6 +303,32 @@ function NoticeLine({ line, onAnswer }: { line: TerminalNoticeLine; onAnswer?: (
   );
 }
 
+/** The parent owns the latest idle reply target. This gate owns only one
+ * request from this terminal, never the task's eventual outcome. */
+function TerminalContinueButton({ onContinue }: { onContinue: () => Promise<void> }) {
+  const gate = useRef(new TerminalContinueGate());
+  const [phase, setPhase] = useState(gate.current.phase);
+  const [error, setError] = useState(false);
+  const request = () => {
+    if (gate.current.phase !== 'idle') return;
+    setError(false);
+    const pending = gate.current.run(onContinue);
+    setPhase(gate.current.phase);
+    void pending.then(
+      () => setPhase(gate.current.phase),
+      () => { setPhase(gate.current.phase); setError(true); },
+    );
+  };
+  return (
+    <div className="inline-flex flex-wrap items-center gap-2">
+      <Button size="sm" variant="secondary" disabled={phase !== 'idle'} aria-busy={phase === 'sending'} onClick={request}>
+        {phase === 'sending' ? 'Continuing…' : phase === 'sent' ? 'Continue requested' : 'Continue'}
+      </Button>
+      {error && <p className="basis-full text-caption text-danger" role="alert">The request didn’t send. Choose Continue to try again.</p>}
+    </div>
+  );
+}
+
 /** Client-written stand-in when Stop fires before any tokens. The StatusPill
  *  is the record — do not wrap this string in a hollow reply card. */
 const STOPPED_PLACEHOLDER = 'Stopped.';
@@ -315,6 +341,7 @@ export function ChatBubble({
   onBackground,
   traceHref,
   onAnswer,
+  onContinue,
   speaker,
   project,
   ownedTaskIds,
@@ -350,6 +377,8 @@ export function ChatBubble({
   /** Send a suggested answer as the reply. Absent on a read-only transcript,
    *  where a question is a record and its choices are not buttons. */
   onAnswer?: (text: string, resume?: ConnectionResume) => Promise<void> | void;
+  /** The latest idle continuation target, guarded again by its owner before send. */
+  onContinue?: () => Promise<void>;
 }) {
   const isUser = message.role === 'user';
   // Approve/Reject fire a follow-up turn but never patch THIS bubble's status, so
@@ -862,7 +891,12 @@ export function ChatBubble({
           const notice = terminalNoticeLine(t);
           if (notice) return row(<NoticeLine line={notice} onAnswer={onAnswer} />);
           const pill = terminalStatusPill(t, { wordless: !hasReplyText });
-          if (pill) return row(<StatusPill tone={pill.tone}>{pill.label}</StatusPill>);
+          if (pill) return row(<>
+            <StatusPill tone={pill.tone}>{pill.label}</StatusPill>
+            {onContinue && !executionBusy && !live && canContinueTerminal(message) && (
+              <TerminalContinueButton key={message.id} onContinue={onContinue} />
+            )}
+          </>);
           if (message.status === 'awaiting-reply' || message.status === 'stopped' || message.status === 'failed') {
             return row(
               <>

@@ -1,3 +1,4 @@
+import { TerminalContinueButton } from '../components/TerminalContinueButton';
 import { ConnectionSetup } from '../components/ConnectionSetup';
 import type { ConnectionContinuation } from '../lib/connection-setup';
 import { ApprovalReview } from '../components/ApprovalReview';
@@ -56,6 +57,8 @@ import {
   retainedOutsideChange,
   terminalNoticeLine,
   terminalStatusPill,
+  canContinueTerminal,
+  sameTerminalContinuation,
   cardDecisionNoticeOnly,
   NOTICE_ACTION_LABEL,
   type TerminalNoticeLine,
@@ -941,6 +944,15 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             // Suggested answers stay tappable only while the question is the
             // newest message; once anything follows it, they are a record.
             onConnectionContinue={index === messages.length - 1 ? (text, connectionResume) => engine.send(text, undefined, { connectionResume }) : undefined}
+            onContinue={index === messages.length - 1 && !busy ? () => {
+              const expectedSession = snapshot?.sessionId;
+              const current = () => {
+                const now = engine.snapshot();
+                return Boolean(expectedSession && now.sessionId === expectedSession && !now.busy
+                  && sameTerminalContinuation(message, now.messages.at(-1)));
+              };
+              return sendMessage('continue', message.taskMode, [], current);
+            } : undefined}
             onAnswer={index === messages.length - 1 ? (text) => {
               haptic('light');
               void sendMessage(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
@@ -1017,7 +1029,7 @@ function approvalFieldLabel(name: string): string {
 function MessageRow({
   message, speaker, sessionId, busy, onExecutePlan, onRevisePlan, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
   approvalActing, approvalDecided, onApprovalAction, onApproveWithEdits,
-  onDelegatedStateChange, onDelegatedChanged, onAnswer, onConnectionContinue, onChangeModel, onOpenSettings,
+  onDelegatedStateChange, onDelegatedChanged, onAnswer, onContinue, onConnectionContinue, onChangeModel, onOpenSettings,
 }: {
   message: ChatMessage;
   /** Who wrote this reply, drawn above it. Absent in a thread only Clem answered. */
@@ -1044,6 +1056,7 @@ function MessageRow({
   /** Send a suggested answer as the reply, exactly as if it were typed.
    *  Absent once the question is no longer the newest message. */
   onAnswer?: (text: string) => void;
+  onContinue?: () => Promise<void>;
   onConnectionContinue?: ConnectionContinuation;
   /** Opens this conversation's model choice. */
   onChangeModel?: () => void;
@@ -1316,7 +1329,11 @@ function MessageRow({
         const line = terminalStatusPill(t, { wordless: !turnText.showReply })?.label
           ?? (t.status === 'needs_input' ? 'Needs your reply' : null);
         const shown = [line, outside].filter(Boolean).join(' · ');
-        return shown ? <p class={`reply-state reply-state-${t.status}`} role="status">{shown}</p> : null;
+        return <>
+          {shown ? <p class={`reply-state reply-state-${t.status}`} role="status">{shown}</p> : null}
+          {onContinue && !busy && canContinueTerminal(message)
+            ? <TerminalContinueButton key={message.id} onContinue={onContinue} /> : null}
+        </>;
       })()}
       {/* The harness's ledger for this turn — what it wrote, saved, read and
           remembered. Desktop makes the file chips openable; a phone has nowhere

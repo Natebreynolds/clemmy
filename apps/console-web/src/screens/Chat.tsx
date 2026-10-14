@@ -14,7 +14,7 @@ import { AgentPicker } from '@/components/chat/AgentPicker';
 import { ProjectPicker } from '@/components/chat/ProjectPicker';
 import { ConversationChangeLine } from '@/components/chat/ConversationChangeLine';
 import { ConversationTasks } from '@/components/chat/ConversationTasks';
-import { agentThreadMarks, projectThreadMarks, APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
+import { agentThreadMarks, projectThreadMarks, APPROVAL_ANSWER_WORDS, sameTerminalContinuation } from '@clem/chat-engine';
 import { useConversationAgent } from '@/lib/conversation-agent';
 import { useConversationProject } from '@/lib/conversation-project';
 import { reportOwner, useConversationTasks } from '@/lib/conversation-tasks';
@@ -69,13 +69,31 @@ export function Chat() {
   const seededRef = useRef(false);
 
   const hasThread = chat.messages.length > 0;
-  const send = async (input: ComposerSendInput) => {
+  const continuationState = useRef({ busy: chat.busy, latest: chat.messages.at(-1), pending: chat.pendingPost });
+  continuationState.current = { busy: chat.busy, latest: chat.messages.at(-1), pending: chat.pendingPost };
+  const renderedSessionId = chat.sessionId.current;
+  const continuePaused = (message: ChatMessage) => {
+    const assertCurrent = () => {
+      const current = continuationState.current;
+      if (!renderedSessionId || chat.sessionId.current !== renderedSessionId || current.busy || current.pending
+        || !sameTerminalContinuation(message, current.latest)) {
+        throw new Error('This pause has changed. Check the latest reply before continuing.');
+      }
+    };
+    return send({ text: 'continue', attachmentIds: [], attachmentNames: [], taskMode: message.taskMode,
+      // The existing frontdoor propagates failed admission when a caller waits
+      // for acknowledgement. Its pending request identity remains untouched.
+      onAccepted: () => {} }, assertCurrent);
+  };
+  const send = async (input: ComposerSendInput, assertCurrent: () => void = () => {}) => {
+    assertCurrent();
     const scope = captureSendScope();
     const [addressed, placed] = await Promise.all([
       agentChoice.prepare(chat.sessionId.current, chat.busy),
       projectChoice.prepare(chat.sessionId.current, chat.busy),
     ]);
     scope.assertCurrent();
+    assertCurrent();
     await chat.send({ ...input, ...addressed, ...placed });
   };
   const applyAgent = () => agentChoice.prepare(chat.sessionId.current, chat.busy);
@@ -214,6 +232,7 @@ export function Chat() {
               // Suggested answers stay tappable only while the question is the
               // newest message; once anything follows it, they are a record.
               onAnswer={index === chat.messages.length - 1 ? (text, connectionResume) => connectionResume ? chat.send({ text, connectionResume }) : send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
+              onContinue={index === chat.messages.length - 1 && !chat.busy && !chat.pendingPost ? () => continuePaused(m) : undefined}
               traceHref={chat.sessionId.current ? `/tasks?select=${encodeURIComponent(chat.sessionId.current)}` : undefined}
             />
             </Fragment>
