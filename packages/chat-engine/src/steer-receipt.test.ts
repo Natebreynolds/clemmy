@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { applySteerReceiptEvent, readSteerReceipt, steerReceiptLabel } from './steer-receipt.js';
+import type { ChatMessage } from './types.js';
 
 const receipt = (state = 'accepted', changedAtSeq = 11) => ({ version: 1, sessionId: 'sess-receipt',
   sourceUserSeq: 10, noteSeq: 11, clientRequestId: 'request-note', state, changedAtSeq });
@@ -12,7 +13,7 @@ const status = (state = 'adopted', changedAtSeq = 12) => ({ type: 'user_steer_re
 test('steer receipt: an exact request echo, adoption and replay are one user row without claiming fulfillment', () => {
   const local = { id: 'local', role: 'user' as const, text: 'Synthetic addition', steer: 'pending' as const,
     idempotencyKey: 'request-note', requestSessionId: 'sess-receipt' };
-  let rows = applySteerReceiptEvent([local], note(), 'sess-receipt');
+  let rows = applySteerReceiptEvent<ChatMessage>([local], note(), 'sess-receipt');
   assert.equal(rows.length, 1); assert.equal(rows[0]!.id, 'local');
   assert.equal(rows[0]!.steerReceipt?.state, 'accepted');
   rows = applySteerReceiptEvent(rows, status(), 'sess-receipt');
@@ -25,25 +26,25 @@ test('steer receipt: an exact request echo, adoption and replay are one user row
 test('steer receipt: adoption before HTTP acknowledgement cannot regress to accepted', () => {
   const local = { id: 'local', role: 'user' as const, text: 'Synthetic addition', steer: 'pending' as const,
     idempotencyKey: 'request-note', requestSessionId: 'sess-receipt' };
-  let rows = applySteerReceiptEvent([local], status(), 'sess-receipt');
+  let rows = applySteerReceiptEvent<ChatMessage>([local], status(), 'sess-receipt');
   rows = applySteerReceiptEvent(rows, note(), 'sess-receipt');
   assert.equal(rows.length, 1); assert.equal(rows[0]!.steerReceipt?.state, 'adopted');
 });
 
 test('steer receipt: terminal receipts distinguish an unhandled saved addition from adoption', () => {
-  let rows = applySteerReceiptEvent([], note(), 'sess-receipt');
+  let rows = applySteerReceiptEvent<ChatMessage>([], note(), 'sess-receipt');
   rows = applySteerReceiptEvent(rows, { type: 'conversation_completed', sessionId: 'sess-receipt', seq: 14,
     data: { sourceUserSeq: 10, steerReceipts: [receipt('unhandled', 14)] } }, 'sess-receipt');
   assert.equal(rows[0]!.steerReceipt?.state, 'unhandled');
   assert.match(steerReceiptLabel(rows[0]!), /ended.*kept/i);
-  const adopted = applySteerReceiptEvent([], note('adopted', 12), 'sess-receipt');
+  const adopted = applySteerReceiptEvent<ChatMessage>([], note('adopted', 12), 'sess-receipt');
   const final = applySteerReceiptEvent(adopted, { type: 'conversation_completed', sessionId: 'sess-receipt', seq: 14,
     data: { sourceUserSeq: 10, steerReceipts: [receipt('adopted', 12)] } }, 'sess-receipt');
   assert.equal(final[0]!.steerReceipt?.state, 'adopted');
 });
 
 test('steer receipt: foreign identity, wrong source, malformed bounds and text-only matches are inert', () => {
-  const rows = applySteerReceiptEvent([], note(), 'sess-receipt');
+  const rows = applySteerReceiptEvent<ChatMessage>([], note(), 'sess-receipt');
   assert.equal(applySteerReceiptEvent(rows, { ...status(), sessionId: 'sess-foreign' }, 'sess-receipt'), rows);
   assert.equal(applySteerReceiptEvent(rows, { ...status(), data: { receipts: [{ ...receipt('adopted', 12), sourceUserSeq: 9 }] } }, 'sess-receipt'), rows);
   for (const bad of [{ ...receipt(), noteSeq: 10 }, { ...receipt(), changedAtSeq: 9 },
@@ -56,7 +57,7 @@ test('steer receipt: foreign identity, wrong source, malformed bounds and text-o
 });
 
 test('steer receipt: reopen reconstructs exact source-bound notes and distinct equal text stays distinct', () => {
-  let rows = applySteerReceiptEvent([], note('adopted', 12), 'sess-receipt');
+  let rows = applySteerReceiptEvent<ChatMessage>([], note('adopted', 12), 'sess-receipt');
   rows = applySteerReceiptEvent(rows, { ...note(), seq: 13,
     data: { text: 'Synthetic addition', steerReceipt: { ...receipt('unhandled', 14), noteSeq: 13, clientRequestId: 'request-two' } } }, 'sess-receipt');
   assert.equal(rows.length, 2); assert.equal(rows[0]!.steerReceipt?.state, 'adopted');
@@ -64,7 +65,7 @@ test('steer receipt: reopen reconstructs exact source-bound notes and distinct e
 });
 
 test('steer receipt: unknown bounded or legacy handling stays visible without a future queue promise', () => {
-  let rows = applySteerReceiptEvent([], { ...note(), data: { text: 'Synthetic addition' } }, 'sess-receipt');
+  let rows = applySteerReceiptEvent<ChatMessage>([], { ...note(), data: { text: 'Synthetic addition' } }, 'sess-receipt');
   rows = applySteerReceiptEvent(rows, { ...note(), data: { text: 'Synthetic addition' } }, 'sess-receipt');
   assert.equal(rows.length, 1); assert.equal(rows[0]!.steerReceipt, undefined);
   assert.equal(steerReceiptLabel(rows[0]!), 'Received for this run');
