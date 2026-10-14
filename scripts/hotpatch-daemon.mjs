@@ -517,13 +517,59 @@ function updaterLocations({ app, home }, fileOps = fs) {
   return { bundle, config, cache: path.join(caches, cacheDir), shipIt: path.join(caches, `${bundleId}.ShipIt`), bundleId };
 }
 
+const RETAINED_ARCHIVE_REFERENCE_KEYS = Object.freeze(['referenceBundle', 'historicalSnapshot', 'historicalSnapshotSha256', 'expectedReferenceCdHash']);
+
+/** An older retained download is historical evidence only. It cannot stand in
+ * for the active archive, the installed shell or a current runtime receipt. */
+function inspectRetainedArchiveReference(options, { bundle, home, identity, archive, metadataPath, files }, fileOps, readCodeIdentity) {
+  if (!options || Object.keys(options).sort().join('|') !== [...RETAINED_ARCHIVE_REFERENCE_KEYS].sort().join('|')
+    || !/^[a-f0-9]{40}$/.test(options.expectedReferenceCdHash ?? '')) guardRefusal('invalid retained archive reference options');
+  const { referenceBundle, historicalSnapshot, historicalSnapshotSha256, expectedReferenceCdHash } = options;
+  if (typeof referenceBundle !== 'string' || path.resolve(referenceBundle) !== referenceBundle) guardRefusal('missing canonical retained reference bundle');
+  regularPath(referenceBundle, fileOps, true);
+  if (fileOps.realpathSync(referenceBundle) !== referenceBundle || referenceBundle === bundle
+    || referenceBundle.startsWith(bundle + path.sep) || bundle.startsWith(referenceBundle + path.sep)) guardRefusal('retained reference must be a separate canonical bundle');
+  if (typeof historicalSnapshot !== 'string' || historicalSnapshot === bundle || historicalSnapshot.startsWith(bundle + path.sep)) guardRefusal('historical snapshot must be outside the installed bundle');
+  const snapshot = pinnedRepeatJSON(historicalSnapshot, historicalSnapshotSha256, fileOps);
+  const prior = snapshot?.appliedUpdateEvidence;
+  const referenceIdentity = nativeIdentity(fileOps.readFileSync(path.join(referenceBundle, 'Contents/Info.plist'), 'utf8'));
+  const stableVersion = value => {
+    if (typeof value !== 'string' || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value)) guardRefusal('retained version order is unsupported');
+    const parts = value.split('.').map(Number);
+    if (!parts.every(Number.isSafeInteger)) guardRefusal('retained version order is unsupported');
+    return parts;
+  };
+  const older = stableVersion(referenceIdentity.version); const current = stableVersion(identity.version);
+  const different = older.findIndex((part, index) => part !== current[index]);
+  if (different < 0 || older[different] >= current[different] || referenceIdentity.bundleId !== identity.bundleId
+    || prior?.version !== 1 || prior.app !== bundle || prior.home !== path.resolve(home)) guardRefusal('retained reference is not a pinned older same-bundle generation');
+  sameEvidence(prior.identity, referenceIdentity, 'historical retained identity');
+  for (const rel of SEALED_SHELL_PARTS) {
+    const digest = fileDigest(path.join(referenceBundle, rel), 'sha256', 'hex', fileOps);
+    if (digest !== prior.shellSnapshot?.[rel] || digest !== snapshot.shellSnapshot?.[rel]) guardRefusal('retained reference native part differs from historical snapshot');
+  }
+  const pairedArchive = path.join(path.dirname(path.dirname(archive)), 'update.zip.held-latest');
+  for (const name of [archive, pairedArchive, metadataPath]) {
+    if (typeof prior.files?.[name] !== 'string' || prior.files[name] !== files[name]) guardRefusal('retained archive or metadata differs from historical snapshot');
+  }
+  const referenceTree = typedTree(referenceBundle, fileOps, { links: true });
+  sameEvidence(archivedBundleTree(archive, path.basename(bundle), fileOps), referenceTree, 'retained archive/reference typed footprint');
+  const codeIdentity = readCodeIdentity(referenceBundle);
+  sameEvidence(codeIdentity, { bundleId: identity.bundleId, team: DESKTOP_TEAM_IDENTIFIER, cdHash: expectedReferenceCdHash }, 'retained signed reference publisher/identity');
+  return { identity: referenceIdentity, codeIdentity,
+    archiveSha256: fileDigest(archive, 'sha256', 'hex', fileOps),
+    referenceTreeDigest: createHash('sha256').update(JSON.stringify(referenceTree)).digest('hex') };
+}
+
 /** A completed native update can retain downloads and its consumed request.
  * Admit only bytes that independently match the installed signed native shell,
  * with no remaining staging directory. Capture while that full seal is valid.
  * The serialized receipt is evidence to recheck, never a boolean bypass. */
-export function captureAppliedUpdateEvidence({ app, home }, fileOps = fs, commands = execFileSync) {
-  const evidence = inspectAppliedUpdateEvidence({ app, home }, fileOps);
+export function captureAppliedUpdateEvidence({ app, home, retainedArchiveReference }, fileOps = fs, commands = execFileSync, readCodeIdentity = referenceCodeIdentity) {
+  const evidence = inspectAppliedUpdateEvidence({ app, home, retainedArchiveReference }, fileOps, readCodeIdentity);
+  if (retainedArchiveReference !== undefined) commands('/usr/bin/codesign', ['--verify', '--deep', '--strict', retainedArchiveReference.referenceBundle], { stdio: 'pipe' });
   commands('/usr/bin/codesign', ['--verify', '--deep', '--strict', evidence.app], { stdio: 'pipe' });
+  if (retainedArchiveReference !== undefined) sameEvidence(inspectAppliedUpdateEvidence({ app, home, retainedArchiveReference }, fileOps, readCodeIdentity), evidence, 'verified applied-update evidence');
   return evidence;
 }
 
@@ -581,7 +627,7 @@ function inspectNoActiveUpdateEvidence({ app, home }, fileOps = fs) {
     archive: { path: archive, sha512: metadata.sha512 }, files };
 }
 
-function inspectAppliedUpdateEvidence({ app, home }, fileOps = fs) {
+function inspectAppliedUpdateEvidence({ app, home, retainedArchiveReference }, fileOps = fs, readCodeIdentity = referenceCodeIdentity) {
   const locations = updaterLocations({ app, home }, fileOps);
   const { bundle, config, cache, shipIt, bundleId } = locations;
   regularPath(cache, fileOps, true);
@@ -612,6 +658,8 @@ function inspectAppliedUpdateEvidence({ app, home }, fileOps = fs) {
   const shellSnapshot = Object.fromEntries(SEALED_SHELL_PARTS.map(rel => [rel, fileDigest(path.join(bundle, rel), 'sha256', 'hex', fileOps)]));
   const identity = nativeIdentity(fileOps.readFileSync(path.join(bundle, 'Contents/Info.plist'), 'utf8'));
   const files = { [config]: fileDigest(config, 'sha256', 'hex', fileOps), [statePath]: fileDigest(statePath, 'sha256', 'hex', fileOps) };
+  let retainedArchive;
+  if (retainedArchiveReference !== undefined && !cacheNames.includes('pending.held-latest')) guardRefusal('retained reference has no held archive');
   for (const suffix of ['', '.held-latest'].filter(suffix => cacheNames.includes(`pending${suffix}`))) {
     const pending = path.join(cache, `pending${suffix}`);
     regularPath(pending, fileOps, true);
@@ -630,10 +678,13 @@ function inspectAppliedUpdateEvidence({ app, home }, fileOps = fs) {
       files[archivePath] = checksum;
     }
     const native = archivedNativeParts(pendingArchive, path.basename(bundle), fileOps);
-    if (JSON.stringify(native['Contents/Info.plist'].identity) !== JSON.stringify(identity) || SEALED_SHELL_PARTS.some(rel => native[rel].sha256 !== shellSnapshot[rel])) guardRefusal('retained archive differs from applied native shell');
+    if (suffix === '.held-latest' && retainedArchiveReference !== undefined) {
+      retainedArchive = inspectRetainedArchiveReference(retainedArchiveReference, { bundle, home, identity, archive: pendingArchive, metadataPath, files }, fileOps, readCodeIdentity);
+    } else if (JSON.stringify(native['Contents/Info.plist'].identity) !== JSON.stringify(identity) || SEALED_SHELL_PARTS.some(rel => native[rel].sha256 !== shellSnapshot[rel])) guardRefusal('retained archive differs from applied native shell');
   }
   if (cacheNames.includes('current.blockmap')) files[path.join(cache, 'current.blockmap')] = fileDigest(path.join(cache, 'current.blockmap'), 'sha256', 'hex', fileOps);
-  return { version: 1, app: bundle, home: path.resolve(home), identity, shellSnapshot, shipNames, cacheNames, stagedDirectory, files };
+  return { version: retainedArchiveReference === undefined ? 1 : 2, app: bundle, home: path.resolve(home), identity, shellSnapshot, shipNames, cacheNames, stagedDirectory, files,
+    ...(retainedArchiveReference === undefined ? {} : { retainedArchiveReference: { ...retainedArchiveReference }, retainedArchive }) };
 }
 
 /** Installer helpers can apply a request independently of the native app. An
@@ -748,9 +799,10 @@ export function verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpda
     }
   } else if (staged.length > 0) {
     if (!appliedUpdateEvidence) throw new Error(`Refusing a guarded patch: an update is staged to apply on quit (${staged.join(', ')}).`);
-    const observed = inspectAppliedUpdateEvidence({ app: bundle, home }, fileOps);
+    const observed = inspectAppliedUpdateEvidence({ app: bundle, home, retainedArchiveReference: appliedUpdateEvidence.retainedArchiveReference }, fileOps, readReferenceCodeIdentity);
     if (JSON.stringify(observed) !== JSON.stringify(appliedUpdateEvidence)) guardRefusal('applied-update evidence changed since the snapshot');
     appliedEvidenceDigest = createHash('sha256').update(JSON.stringify(observed)).digest('hex');
+    if (!priorProof && observed.version === 2) verifyNativeSignature(observed.retainedArchiveReference.referenceBundle);
     // Only an authentic initial proof allows resource-seal changes from this
     // patch. Before minting it, independently verify the complete native seal.
     if (priorProof) {
@@ -773,6 +825,11 @@ export function verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpda
     if (isRunning() || isUpdaterRunning()) guardRefusal('app or installer helper started during no-active verification');
     sameEvidence(inspectNoActiveUpdateEvidence({ app: bundle, home }, fileOps), noActiveUpdateEvidence,
       'no-active updater evidence after verification');
+  }
+  if (appliedUpdateEvidence?.version === 2) {
+    sameEvidence(inspectAppliedUpdateEvidence({ app: bundle, home, retainedArchiveReference: appliedUpdateEvidence.retainedArchiveReference }, fileOps, readReferenceCodeIdentity), appliedUpdateEvidence,
+      'applied-update evidence after verification');
+    if (isRunning() || isUpdaterRunning()) guardRefusal('app or installer helper started during applied-update verification');
   }
   // The install guard compares resolved paths, so the proof names both.
   const proof = Object.freeze({ app: bundle, canonical: fileOps.realpathSync(bundle), appliedEvidenceDigest });

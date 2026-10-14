@@ -1171,3 +1171,208 @@ test('every no-active proof rechecks complete updater inventory, receipts, runti
       verifyNativeSignature() { helper = true; } }), /started during no-active verification/);
   });
 });
+
+
+// Synthetic full official generations only: no installed bundle, subprocess,
+// actual signature/keychain, updater cache or model/provider is used.
+function mixedAppliedGenerationsFixture(t, { priorVersion = '3.18.37', oldRepeat = false } = {}) {
+  const g = oldRepeat ? repeatedUpdateFixture(t) : appliedUpdateFixture(t);
+  const setNative = (bundle, version) => {
+    fs.writeFileSync(path.join(bundle, 'Contents/Info.plist'), `<dict><key>CFBundleIdentifier</key><string>com.example.fixture</string><key>CFBundleShortVersionString</key><string>${version}</string></dict>`);
+    fs.writeFileSync(path.join(bundle, 'Contents/MacOS/Clementine'), `native launcher ${version}`);
+    fs.writeFileSync(path.join(bundle, 'Contents/Resources/app.asar'), `packaged shell ${version}`);
+    fs.writeFileSync(path.join(bundle, 'Contents/_CodeSignature/CodeResources'), `seal ${version}`);
+  };
+  const snapshot = () => Object.fromEntries(SEALED_SHELL_PARTS.map(rel => [rel,
+    createHash('sha256').update(fs.readFileSync(path.join(g.app, rel))).digest('hex')]));
+  setNative(g.app, priorVersion);
+  if (oldRepeat) setNative(g.reference, priorVersion);
+  else {
+    const framework = path.join(g.app, 'Contents/Frameworks/Prior.framework');
+    fs.mkdirSync(path.join(framework, 'Versions/A'), { recursive: true });
+    fs.writeFileSync(path.join(framework, 'Versions/A/Prior'), 'complete old signed framework');
+    fs.symlinkSync('A', path.join(framework, 'Versions/Current'));
+    fs.symlinkSync('Versions/Current/Prior', path.join(framework, 'Prior'));
+    g.reference = path.join(g.root, 'official-prior/Fixture.app');
+    fs.cpSync(g.app, g.reference, { recursive: true, verbatimSymlinks: true });
+  }
+  for (const suffix of ['', '.held-latest']) fs.rmSync(path.join(g.cache, `pending${suffix}`), { recursive: true, force: true });
+  g.archiveName = `Fixture-${priorVersion}-arm64-mac.zip`;
+  g.writeArchives(fullBundleZip(g.reference), true);
+  g.snapshot = snapshot();
+  g.evidence = g.capture();
+  assert.equal(g.evidence.version, 1, 'the prior generation is genuinely captured under the original same-version contract');
+  if (oldRepeat) {
+    g.receipt.wasVersion = priorVersion;
+    g.repinReceipt();
+    g.proveRepeat(); // The old repeat chain is valid before the native update.
+  }
+  const historical = { appliedUpdateEvidence: g.evidence, shellSnapshot: g.snapshot };
+  g.historicalPath = path.join(g.root, 'prior-applied-snapshot.json');
+  fs.writeFileSync(g.historicalPath, JSON.stringify(historical));
+  g.retained = {
+    referenceBundle: g.reference,
+    historicalSnapshot: g.historicalPath,
+    historicalSnapshotSha256: createHash('sha256').update(fs.readFileSync(g.historicalPath)).digest('hex'),
+    expectedReferenceCdHash: 'c'.repeat(40),
+  };
+  g.priorNative = Object.fromEntries(SEALED_SHELL_PARTS.map(rel => [rel, fs.readFileSync(path.join(g.app, rel))]));
+  g.heldArchive = path.join(g.cache, 'pending.held-latest', g.archiveName);
+  g.heldPair = path.join(g.cache, 'update.zip.held-latest');
+  g.heldMetadata = path.join(g.cache, 'pending.held-latest/update-info.json');
+  setNative(g.app, '3.18.38');
+  g.snapshot = snapshot();
+  fs.rmSync(path.join(g.cache, 'pending'), { recursive: true });
+  g.archiveName = 'Fixture-3.18.38-arm64-mac.zip';
+  g.writeArchives(fullBundleZip(g.app));
+  g.readIdentity = bundle => {
+    assert.equal(bundle, g.reference, 'only the separately pinned prior reference supplies old publisher identity');
+    return { bundleId: 'com.example.fixture', team: '4AR3Y8XD72', cdHash: 'c'.repeat(40) };
+  };
+  g.signatures = [];
+  g.commands = (command, args) => {
+    assert.equal(command, '/usr/bin/codesign');
+    assert.deepEqual(args.slice(0, 3), ['--verify', '--deep', '--strict']);
+    assert.ok([g.app, g.reference].includes(args[3]));
+    assert.equal(args.length, 4);
+    g.signatures.push(args[3]);
+  };
+  g.captureMixed = (options = {}, operations = fs, commands = g.commands, readIdentity = g.readIdentity) =>
+    captureAppliedUpdateEvidence({ app: g.app, home: g.home, retainedArchiveReference: g.retained, ...options }, operations, commands, readIdentity);
+  g.proveMixed = (evidence, overrides = {}, operations = fs) => verifyGuardedSealedPatch({
+    app: g.app, home: g.home, shellSnapshot: g.snapshot, appliedUpdateEvidence: evidence,
+    isRunning: () => false, isUpdaterRunning: () => false,
+    verifyNativeSignature: bundle => { assert.ok([g.app, g.reference].includes(bundle)); g.signatures.push(bundle); },
+    readReferenceCodeIdentity: g.readIdentity, ...overrides,
+  }, operations);
+  g.retainedBytes = () => [g.heldArchive, g.heldPair, g.heldMetadata, g.historicalPath]
+    .map(file => [file, createHash('sha256').update(fs.readFileSync(file)).digest('hex')]);
+  return g;
+}
+
+function refusesMixedBeforeInstall(g, acquire) {
+  const spy = forbiddenMutations();
+  assert.throws(() => {
+    const guarded = acquire(spy.operations);
+    installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded }, spy.operations);
+  }, /Refusing a guarded patch|signature failure/);
+  assert.deepEqual(spy.calls, [], 'refusal precedes target staging/copy/backup/cleanup');
+  assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'old daemon');
+}
+
+test('mixed retained generations require the actual applied shell, not merely the newer active archive', t => {
+  const g = mixedAppliedGenerationsFixture(t);
+  assert.throws(() => g.capture(), /differs from applied native shell/, 'without explicit old-generation proof the original policy still refuses');
+  for (const [rel, bytes] of Object.entries(g.priorNative)) fs.writeFileSync(path.join(g.app, rel), bytes);
+  refusesMixedBeforeInstall(g, operations => g.proveMixed(g.captureMixed({}, operations), {}, operations));
+});
+
+test('mixed retained generations admit exact pinned older full reference and preserve it through a real temporary patch', t => {
+  const g = mixedAppliedGenerationsFixture(t);
+  const retainedBefore = g.retainedBytes();
+  const currentNativeBefore = SEALED_SHELL_PARTS.map(rel => [rel, fs.readFileSync(path.join(g.app, rel))]);
+  const evidence = g.captureMixed();
+  assert.equal(evidence.version, 2);
+  assert.equal(evidence.identity.version, '3.18.38');
+  assert.equal(evidence.retainedArchive.identity.version, '3.18.37');
+  assert.equal(evidence.retainedArchive.codeIdentity.cdHash, g.retained.expectedReferenceCdHash);
+  assert.deepEqual(evidence.retainedArchiveReference, g.retained);
+  assert.deepEqual(new Set(g.signatures), new Set([g.app, g.reference]), 'both complete seals are inspected at capture');
+  const guarded = g.proveMixed(evidence);
+  const installed = installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded });
+  assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'new daemon');
+  assert.equal(fs.readFileSync(path.join(installed.backup, 'index.js'), 'utf8'), 'old daemon');
+  assert.deepEqual(g.retainedBytes(), retainedBefore, 'old archive pair, metadata and history are retained exactly');
+  for (const [rel, bytes] of currentNativeBefore) assert.deepEqual(fs.readFileSync(path.join(g.app, rel)), bytes);
+  assert.doesNotThrow(() => g.proveMixed(evidence, { priorProof: guarded,
+    verifyNativeSignature: bundle => assert.notEqual(bundle, g.app, 'patched current app cannot claim a pristine full seal') }));
+});
+
+test('mixed retained generations refuse missing, unknown or inconsistent independent pins before writes', async t => {
+  for (const [label, change] of [
+    ['missing historical hash', g => { delete g.retained.historicalSnapshotSha256; }],
+    ['unknown option', g => { g.retained.allowOlder = true; }],
+    ['wrong history hash', g => { g.retained.historicalSnapshotSha256 = '0'.repeat(64); }],
+    ['wrong CDHash pin', g => { g.retained.expectedReferenceCdHash = 'd'.repeat(40); }],
+    ['missing CDHash', g => { delete g.retained.expectedReferenceCdHash; }],
+    ['another historical home', g => {
+      const old = JSON.parse(fs.readFileSync(g.historicalPath, 'utf8')); old.appliedUpdateEvidence.home = path.join(g.root, 'another-home');
+      fs.writeFileSync(g.historicalPath, JSON.stringify(old));
+      g.retained.historicalSnapshotSha256 = createHash('sha256').update(fs.readFileSync(g.historicalPath)).digest('hex');
+    }],
+  ]) await t.test(label, t => {
+    const g = mixedAppliedGenerationsFixture(t); change(g);
+    refusesMixedBeforeInstall(g, operations => g.proveMixed(g.captureMixed({}, operations), {}, operations));
+  });
+});
+
+test('mixed retained generations require a strictly older publisher-verified complete official archive reference', async t => {
+  await t.test('future full signed generation', t => {
+    const g = mixedAppliedGenerationsFixture(t, { priorVersion: '3.18.39' });
+    refusesMixedBeforeInstall(g, operations => g.proveMixed(g.captureMixed({}, operations), {}, operations));
+  });
+  await t.test('same version is not an older-generation exception', t => {
+    const g = mixedAppliedGenerationsFixture(t, { priorVersion: '3.18.38' });
+    refusesMixedBeforeInstall(g, operations => g.proveMixed(g.captureMixed({}, operations), {}, operations));
+  });
+  await t.test('archive tamper with two matching newly computed checksums', t => {
+    const g = mixedAppliedGenerationsFixture(t); const bytes = Buffer.concat([fs.readFileSync(g.heldArchive), Buffer.from('tamper')]);
+    fs.writeFileSync(g.heldArchive, bytes); fs.writeFileSync(g.heldPair, bytes);
+    const metadata = JSON.parse(fs.readFileSync(g.heldMetadata, 'utf8')); metadata.sha512 = createHash('sha512').update(bytes).digest('base64');
+    fs.writeFileSync(g.heldMetadata, JSON.stringify(metadata));
+    refusesMixedBeforeInstall(g, operations => g.proveMixed(g.captureMixed({}, operations), {}, operations));
+  });
+  await t.test('reference non-native resource differs from its archive', t => {
+    const g = mixedAppliedGenerationsFixture(t);
+    fs.appendFileSync(path.join(g.reference, 'Contents/Frameworks/Prior.framework/Versions/A/Prior'), 'changed');
+    refusesMixedBeforeInstall(g, operations => g.proveMixed(g.captureMixed({}, operations), {}, operations));
+  });
+  await t.test('valid signature from another publisher', t => {
+    const g = mixedAppliedGenerationsFixture(t);
+    refusesMixedBeforeInstall(g, operations => g.proveMixed(g.captureMixed({}, operations, g.commands,
+      () => ({ bundleId: 'com.example.fixture', team: 'ANOTHERSIGNER', cdHash: 'c'.repeat(40) })), {}, operations));
+  });
+  await t.test('old full signature fails', t => {
+    const g = mixedAppliedGenerationsFixture(t);
+    refusesMixedBeforeInstall(g, operations => g.proveMixed(g.captureMixed({}, operations, (_command, args) => {
+      if (args[3] === g.reference) throw new Error('signature failure');
+    }), {}, operations));
+  });
+});
+
+test('mixed retained generations recheck history, cache, full reference and app/helper races before proof or writes', async t => {
+  for (const [label, mutate] of [
+    ['held cache changed', g => fs.appendFileSync(g.heldPair, 'changed')],
+    ['history changed', g => fs.appendFileSync(g.historicalPath, ' ')],
+    ['old full reference changed', g => fs.appendFileSync(path.join(g.reference, 'Contents/Frameworks/Prior.framework/Versions/A/Prior'), 'changed')],
+  ]) await t.test(label, t => {
+    const g = mixedAppliedGenerationsFixture(t); const evidence = g.captureMixed(); mutate(g);
+    refusesMixedBeforeInstall(g, operations => g.proveMixed(evidence, {}, operations));
+  });
+  await t.test('reference changes across capture signature inspection', t => {
+    const g = mixedAppliedGenerationsFixture(t);
+    refusesMixedBeforeInstall(g, operations => g.proveMixed(g.captureMixed({}, operations, (command, args) => {
+      g.commands(command, args);
+      if (args[3] === g.reference) fs.appendFileSync(path.join(g.reference, 'Contents/Frameworks/Prior.framework/Versions/A/Prior'), 'changed');
+    }), {}, operations));
+  });
+  for (const actor of ['app', 'helper']) await t.test(`${actor} starts across verification`, t => {
+    const g = mixedAppliedGenerationsFixture(t); const evidence = g.captureMixed(); let running = false;
+    refusesMixedBeforeInstall(g, operations => g.proveMixed(evidence, {
+      isRunning: () => actor === 'app' && running,
+      isUpdaterRunning: () => actor === 'helper' && running,
+      verifyNativeSignature: () => { running = true; },
+    }, operations));
+  });
+});
+
+test('mixed retained generations never promote an old valid repeat chain into current native authority', t => {
+  const g = mixedAppliedGenerationsFixture(t, { oldRepeat: true });
+  const evidence = g.captureMixed();
+  const spy = forbiddenMutations();
+  assert.throws(() => {
+    const guarded = g.proveMixed(evidence, { repeatedReference: g.repeat }, spy.operations);
+    installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded }, spy.operations);
+  }, /Refusing a guarded patch/);
+  assert.deepEqual(spy.calls, [], 'old chain was valid for37 but cannot authorize38 mutation');
+});
