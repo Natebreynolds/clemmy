@@ -22,6 +22,7 @@ import {
   listEvents as listHarnessEvents,
   listEventsAtSequences as listHarnessEventsAtSequences,
   listSessions as listHarnessSessions,
+  listSessionRowsForDisplay,
   openEventLog,
   sessionHasAcceptedSourceReplayBinding,
   updateSession as updateHarnessSession,
@@ -312,7 +313,8 @@ function listAllHarnessRows(options: { withoutConversationState?: boolean; obser
  * patch and delete paths keep reading full rows.
  */
 function listAllHarnessRowsForDisplay(observer?: ProjectionReadObserver): HarnessSessionRow[] {
-  return listAllHarnessRows({ withoutConversationState: true, observer });
+  const reused = measureProjectionRead(observer, 'catalog_pages', () => listSessionRowsForDisplay(), (rows) => rows?.length ?? 0);
+  return reused ?? listAllHarnessRows({ withoutConversationState: true, observer });
 }
 
 function userFacingHarnessRows(all: HarnessSessionRow[]): HarnessSessionRow[] {

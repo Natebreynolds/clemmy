@@ -943,3 +943,30 @@ test('a session branched off a conversation lists under that conversation\'s tit
   assert.equal(titles.get(`harness:${branch2.id}`), 'Draft the Q3 retreat note', 'the root\'s first words title the branch');
   assert.notEqual(titles.get(`harness:${branch2.id}`), 'desktop');
 });
+
+test('the display list re-reads only changed rows: an own write, a pin, a delete and another connection\'s write all show on the next list', async () => {
+  const eventlogModule = await import('../runtime/harness/eventlog.js');
+  const Database = (await import('better-sqlite3')).default;
+  const { HARNESS_DB_PATH } = eventlogModule;
+  const a = eventlogModule.createSession({ id: 'display-cache-a', kind: 'chat', channel: 'desktop', title: 'Alpha' });
+  const b = eventlogModule.createSession({ id: 'display-cache-b', kind: 'chat', channel: 'desktop', title: 'Bravo' });
+  const first = eventlogModule.listSessionRowsForDisplay();
+  assert.ok(first, 'the change counters install on the event log connection');
+  const firstA = first!.find((row) => row.id === a.id)!;
+  const again = eventlogModule.listSessionRowsForDisplay()!;
+  assert.equal(again.find((row) => row.id === a.id), firstA, 'an unchanged row is reused, not re-parsed');
+  eventlogModule.appendEvent({ sessionId: b.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'hello' } });
+  eventlogModule.openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(metadata_json, '$.pinned', json('true')) WHERE id = ?`).run(a.id);
+  const afterOwn = eventlogModule.listSessionRowsForDisplay()!;
+  assert.equal(afterOwn.find((row) => row.id === a.id)!.metadata.pinned, true, 'a metadata write without an update-time bump is seen');
+  assert.notEqual(afterOwn.find((row) => row.id === a.id), firstA);
+  assert.equal(afterOwn[0]!.id, b.id, 'order follows the update time');
+  eventlogModule.openEventLog().prepare('DELETE FROM sessions WHERE id = ?').run(b.id);
+  assert.equal(eventlogModule.listSessionRowsForDisplay()!.some((row) => row.id === b.id), false, 'a deleted row leaves the list');
+  const other = new Database(HARNESS_DB_PATH);
+  try {
+    other.prepare(`UPDATE sessions SET title = 'Renamed elsewhere' WHERE id = ?`).run(a.id);
+  } finally { other.close(); }
+  assert.equal(eventlogModule.listSessionRowsForDisplay()!.find((row) => row.id === a.id)!.title, 'Renamed elsewhere',
+    'another connection\'s commit drops every reused row');
+});
