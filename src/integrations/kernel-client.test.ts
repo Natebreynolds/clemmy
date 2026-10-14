@@ -32,8 +32,8 @@ function fakeFetch(routes: Array<{ match: (call: Call) => boolean; status?: numb
 
 const session = {
   session_id: 'cmh3k2j9a0001abc',
-  cdp_ws_url: 'wss://abc.onkernel.com:8443/cdp?token=never-public',
-  browser_live_view_url: 'https://abc.kernel.sh:8443/live?token=never-public',
+  cdp_ws_url: 'wss://abc.onkernel.com:8443/cdp',
+  browser_live_view_url: 'https://abc.kernel.sh:8443/live',
   created_at: '2026-10-14T00:00:00.000Z',
   headless: false,
   tags: { createdBy: 'clementine' },
@@ -47,7 +47,7 @@ test('create asks for a headful browser with the saved profile, tagged as Clem\'
   assert.deepEqual(calls[0]?.body, { headless: false, stealth: false, timeout_seconds: 7200, profile: { id: 'prof_123', save_changes: true }, tags: { createdBy: 'clementine' } });
   assert.deepEqual(created, { sessionId: session.session_id, projectId: KERNEL_DEFAULT_PROJECT, status: 'RUNNING', connectUrl: session.cdp_ws_url, createdAt: session.created_at });
   const view = await client.liveView(session.session_id, { mode: 'watch' });
-  assert.equal(view.url, `${session.browser_live_view_url}&readOnly=true`, 'the watch view is read-only, from the create answer, with no second request');
+  assert.equal(view.url, `${session.browser_live_view_url}?readOnly=true`, 'the watch view is read-only, from the create answer, with no second request');
   assert.equal(calls.length, 1);
 });
 

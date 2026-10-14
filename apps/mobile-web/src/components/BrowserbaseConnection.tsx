@@ -16,7 +16,7 @@ export function BrowserbaseConnection() {
   useEffect(() => { mounted.current = true; void refreshStatus(); return () => { mounted.current = false; }; }, [refreshStatus]);
   const save = async (event: Event) => {
     event.preventDefault(); if (busy) return; setBusy(true); setNotice('');
-    try { const next = await cloudBrowser.configure(apiKey.trim(), projectId.trim()); setStatus(next); setApiKey(''); setEditing(false); setNotice(next.configured ? 'Connection saved. Open Browser in a conversation to verify it.' : 'The connection was not saved. Check the project and key.'); }
+    try { const next = await cloudBrowser.configure('browserbase', apiKey.trim(), projectId.trim()); setStatus(next); setApiKey(''); setEditing(false); setNotice(next.configured ? 'Connection saved. Open Browser in a conversation to verify it.' : 'The connection was not saved. Check the project and key.'); }
     catch { setApiKey(''); setNotice('The connection was not confirmed. Check the project and key, then try again.'); }
     finally { setBusy(false); }
   };
