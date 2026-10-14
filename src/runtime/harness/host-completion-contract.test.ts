@@ -1204,6 +1204,38 @@ test('actual ResilientModel host path reviews and delivers the same exact inner 
   assert.deepEqual(row.data.responseFormatContract, { kind: 'whole_json_object', candidateValid: true });
 });
 
+test('reply-only-with live wording delivers an exact reviewed object without a format repair round', async () => {
+  const inner = '{"caseId":"controlled","selectedId":"B","monthlyCost":98,"p95Seconds":28,"retentionDays":30,"rejected":[]}';
+  for (const raw of [inner, `\`\`\`json\n${inner}\n\`\`\``]) {
+    const run = await runHost({ captured: true, incoming: true, resilient: true,
+      text: 'Read both named controlled fixture files and apply every constraint. Make the delegated choice without asking me to pick. '
+        + 'Reply only with a JSON object containing caseId, selectedId, monthlyCost, p95Seconds, retentionDays, '
+        + 'and rejected (an array of objects with id and reason). Do not guess unread values.',
+      firstReply: raw, readResult: 'CONTROLLED_DECISION_EVIDENCE',
+      firstVerdict: { done: true, reason: 'Controlled decision fixture verdict.' } });
+    assert.equal(run.calls, 1, 'existing syntax handling needs no further author call');
+    assert.equal(run.judged.length, 1, 'the whole objective still undergoes its existing review');
+    assert.ok(JSON.stringify(run.modelInputs).includes('FINAL ANSWER FORMAT'), 'the first author request gets the owner format guidance');
+    assert.equal(run.judged[0]!.reply, inner);
+    assert.equal(run.outcome.finalOutput, inner, 'delivery and semantic review rule on the same exact bytes');
+    assert.deepEqual(JSON.parse(run.outcome.finalOutput!), JSON.parse(inner));
+    const original = run.originalResponses[0] as { output: Array<{ content: Array<{ text: string }> }> };
+    assert.equal(original.output[0]!.content[0]!.text, raw, 'the original provider response stays immutable');
+    const row = events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] })[0]!;
+    assert.equal(row.data.sourceUserSeq, run.identity.sourceUserSeq);
+    assert.equal(row.data.fulfills, true);
+    assert.notEqual(row.data.failedOpen, true, 'an unavailable review cannot stand in for the expected semantic verdict');
+    assert.equal(row.data.replyDigest, createHash('sha256').update(inner).digest('hex'));
+    assert.deepEqual(row.data.responseFormatContract, { kind: 'whole_json_object', candidateValid: true });
+    if (raw === inner) assert.equal(row.data.responseNormalization, undefined);
+    else {
+      const proof = row.data.responseNormalization as Record<string, unknown>;
+      assert.equal(proof.originalReplyDigest, createHash('sha256').update(raw).digest('hex'));
+      assert.equal(proof.normalizedReplyDigest, row.data.replyDigest);
+    }
+  }
+});
+
 test('a private normalization preserves format-floor review for a simple lookup without function history', async () => {
   const raw = '```json\n{"value":"CONTROLLED_LOOKUP_VALUE"}\n```';
   const run = await runHost({ captured: true, incoming: true, resilient: true, work: false,
@@ -1245,7 +1277,7 @@ test('a tool-free conversational check-in retains its existing no-review path wi
 test('a normalized object still undergoes semantic rejection and a revised candidate is reviewed normally', async () => {
   const raw = '```json\n{"unsupported":"WRONG_CONTROLLED_CLAIM"}\n```';
   const run = await runHost({ captured: true, incoming: true, resilient: true,
-    text: 'Update the controlled report summary from the retained fixture read. Return exactly one JSON object.', firstReply: raw, secondReply: '{"value":"SUPPORTED_CONTROLLED_VALUE"}',
+    text: 'Update the controlled report summary from the retained fixture read. Reply only with a JSON object.', firstReply: raw, secondReply: '{"value":"SUPPORTED_CONTROLLED_VALUE"}',
     readResult: 'SUPPORTED_CONTROLLED_VALUE', firstVerdict: { done: false, reason: 'The report contradicts the claimed value.' } });
   assert.equal(run.judged[0]!.reply, '{"unsupported":"WRONG_CONTROLLED_CLAIM"}');
   assert.equal(run.calls, 2);
@@ -1260,11 +1292,19 @@ test('actual host leaves ambiguous envelopes and non-owner format requests uncha
     ['Update the controlled report summary from the retained fixture read. Return exactly one JSON object.', 'Prose.\n```json\n{}\n```'],
     ['Update the controlled report summary from the retained fixture read. Return exactly one JSON object.', '```json\n[]\n```'],
     ['Update the controlled report summary from the retained fixture read. Return exactly one JSON object.', '```json\n{}\n```\n```json\n{}\n```'],
+    ['Update the controlled report summary from the retained fixture read. Reply only with a JSON object.', 'Prose.\n```json\n{}\n```'],
   ]) {
     const run = await runHost({ captured: true, incoming: true, resilient: true,
       text, firstReply: raw, secondReply: '{}', readResult: 'CONTROLLED_REPORT_VALUE', firstVerdict: { done: true, reason: 'Controlled fixture verdict.' } });
     if (run.judged.length) assert.equal(run.judged[0]!.reply, raw);
     assert.equal(events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] })[0]?.data.responseNormalization, undefined);
+    if (text.includes('Reply only with')) {
+      const first = events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] })[0]!;
+      assert.equal(first.data.replyDigest, createHash('sha256').update(raw).digest('hex'));
+      assert.equal(first.data.fulfills, false, 'a positive semantic fixture verdict cannot waive the malformed whole output');
+      assert.notEqual(first.data.failedOpen, true);
+      assert.deepEqual(first.data.responseFormatContract, { kind: 'whole_json_object', candidateValid: false });
+    }
   }
 });
 

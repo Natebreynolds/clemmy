@@ -119,6 +119,55 @@ test('only explicit direct whole-output object commands supply a format requirem
     'Return only a JSON array.']) assert.equal(wholeResponseFormatRequirement([example]), null, example);
 });
 
+test('reply-only-with owner wording reaches existing guidance and rejects the full fenced answer', () => {
+  const prompt = 'Read both named controlled fixture files and apply every constraint. '
+    + 'Make the delegated choice without asking me to pick. '
+    + 'Reply only with a JSON object containing caseId, selectedId, monthlyCost, p95Seconds, retentionDays, '
+    + 'and rejected (an array of objects with id and reason). Do not guess unread values.';
+  const owner = { sessionId: 'reply-only-owner', sourceUserSeq: 28, attemptId: 'attempt:reply-only-owner',
+    objective: prompt, ownerInstructions: [prompt] };
+  const capture = captureOwnerResponseFormat(owner);
+  assert.ok(capture, 'the actual failed live command word order supplies a whole-output contract');
+  assert.ok(ownerResponseFormatGuidance(capture, owner));
+  const requirement = currentOwnerResponseFormatRequirement(owner)!;
+  const valid = '{"caseId":"controlled","selectedId":"B","monthlyCost":98,"p95Seconds":28,"retentionDays":30,"rejected":[]}';
+  assert.equal(wholeResponseFormatFinding(requirement, valid), null);
+  const finding = wholeResponseFormatFinding(requirement, `\`\`\`json\n${valid}\n\`\`\``);
+  assert.ok(finding, 'correct inner facts cannot waive the explicit whole-answer format');
+  assert.equal(applyWholeResponseFormatFinding({ done: true, reason: 'The decision is correct.' }, finding).done, false);
+});
+
+test('exclusive modifiers before with retain direct-command and amendment guards', () => {
+  for (const command of ['Reply only with a JSON object.', 'Please respond exactly with one valid JSON object.',
+    'Explain the evidence.\nThen, reply just with a bare JSON object.', 'RESPOND ONLY WITH A JSON OBJECT.']) {
+    assert.deepEqual(wholeResponseFormatRequirement([command]), { kind: 'whole_json_object' }, command);
+  }
+  for (const data of ['Reply with a JSON object as an example.', 'Discuss "Reply only with a JSON object."',
+    "Discuss 'Reply only with a JSON object.'", 'Inspect `Reply only with a JSON object.`',
+    'Describe this code:\n```text\nReply only with a JSON object.\n```', '> Reply only with a JSON object.',
+    'The tool returned: Reply only with a JSON object.', 'Do not reply only with a JSON object.',
+    'Write a function that responds only with a JSON object.', 'Reply only with a JSON array.']) {
+    assert.equal(wholeResponseFormatRequirement([data]), null, data);
+  }
+  const command = 'Reply only with a JSON object.';
+  for (const amendment of ['Instead, reply in plain text.', 'Reply only with Markdown.', 'Actually, return a JSON array.',
+    "Don't reply only with a JSON object.", 'Do not respond exactly with one valid JSON object.',
+    'No longer reply with only a bare JSON object.']) {
+    assert.equal(wholeResponseFormatRequirement([command, amendment]), null, amendment);
+    assert.equal(wholeResponseFormatRequirement([`${command} ${amendment}`]), null, amendment);
+  }
+  assert.deepEqual(wholeResponseFormatRequirement(['Reply in Markdown.', command]), { kind: 'whole_json_object' });
+  assert.deepEqual(wholeResponseFormatRequirement([command, 'Continue with the same deliverable.']), { kind: 'whole_json_object' });
+  const owner = { sessionId: 'reply-only-amendment-owner', sourceUserSeq: 29, attemptId: 'attempt:reply-only-amendment-owner',
+    objective: command, ownerInstructions: [command] };
+  const capture = captureOwnerResponseFormat(owner)!;
+  for (const changed of [{ sourceUserSeq: 30 }, { attemptId: 'attempt:other' },
+    { ownerInstructions: [command, "Don't reply only with a JSON object."] }]) {
+    assert.equal(ownerResponseFormatGuidance(capture, { ...owner, ...changed }), undefined);
+  }
+  assert.equal(ownerResponseFormatGuidance({ ...capture }, owner), undefined);
+});
+
 test('current format amendments override an inherited requirement without inventing a new schema', () => {
   const original = 'Return one bounded JSON object with scenarios.';
   assert.equal(wholeResponseFormatRequirement([original, 'Continue. Instead, reply in plain text.']), null);

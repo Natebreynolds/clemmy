@@ -192,11 +192,12 @@ export function wholeResponseFormatRequirement(ownerInstructions: readonly strin
   for (const instruction of ownerInstructions) {
     const direct = instruction.replace(/```[^]*?(?:```|$)|`[^`\n]*`|"(?:\\[^]|[^"\\])*(?:"|$)|(?:^|[\s:([{])'[^'\n]*'(?![a-z])|(?:^|\n)[\t ]*>[^\n]*/gi, ' ');
     const commands: Array<{ index: number; required: boolean }> = [];
-    const command = /(?:^|[.!?]\s+|\n\s*)(?:(?:actually|instead|then),?\s+)?(?:please\s+)?(?:return|output|emit|respond\s+with|reply\s+with)\s+((?:(?:only|exactly|just)\s+)?(?:(?:a|an)\s+)?(?:(?:one|single)\s+)?(?:(?:bounded|bare)\s+)?(?:valid\s+)?json\s+object)\b/gi;
+    const command = /(?:^|[.!?]\s+|\n\s*)(?:(?:actually|instead|then),?\s+)?(?:please\s+)?((?:return|output|emit|(?:respond|reply)(?:\s+(?:only|exactly|just))?\s+with)\s+(?:(?:only|exactly|just)\s+)?(?:(?:a|an)\s+)?(?:(?:one|single)\s+)?(?:(?:bounded|bare)\s+)?(?:valid\s+)?json\s+object)\b/gi;
     let match: RegExpExecArray | null;
     while ((match = command.exec(direct)) !== null) {
       // "Return a JSON object" may be an ordinary formatted explanation.
-      // Only an explicit singular/whole-output command supplies this floor.
+      // Only an explicit singular/whole-output command supplies this floor,
+      // including an exclusive modifier before "with" in Reply/Respond.
       if (/\b(?:only|exactly|just|one|single|bounded|bare)\b/i.test(match[1]!)) commands.push({ index: match.index, required: true });
     }
     // An explicit different format or cancellation prevents an older JSON
@@ -204,6 +205,8 @@ export function wholeResponseFormatRequirement(ownerInstructions: readonly strin
     // the format itself, never "no prose" or prose inside requested values.
     const replacement = /(?:^|[.!?]\s+|\n\s*)(?:(?:actually|instead|then),?\s+)?(?:please\s+)?(?:(?:return|output|emit|use|respond|reply|format)\s+(?:(?:the|your)\s+(?:answer|response)\s+)?(?:(?:only|just|with|as|in|a|an)\s+)*(?:prose|plain text|markdown|csv|yaml|xml|json array)\b|(?:do not|don't|no longer)\s+(?:use|return|output)\s+(?:only\s+)?json\b)/gi;
     while ((match = replacement.exec(direct)) !== null) commands.push({ index: match.index, required: false });
+    const replyCancellation = /(?:^|[.!?]\s+|\n\s*)(?:(?:actually|instead|then),?\s+)?(?:please\s+)?(?:do not|don't|no longer)\s+(?:respond|reply)\s+(?:(?:only|exactly|just)\s+)?with\s+(?:(?:only|exactly|just)\s+)?(?:(?:a|an)\s+)?(?:(?:one|single)\s+)?(?:(?:bounded|bare)\s+)?(?:valid\s+)?json\s+object\b/gi;
+    while ((match = replyCancellation.exec(direct)) !== null) commands.push({ index: match.index, required: false });
     for (const entry of commands.sort((a, b) => a.index - b.index)) required = entry.required;
   }
   return required ? { kind: 'whole_json_object' } : null;
