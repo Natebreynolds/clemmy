@@ -1890,9 +1890,41 @@ async function assertRuntimeRowsExample(example: unknown, scope: string): Promis
   }
 }
 
+async function assertAggregateRuntimeRowsExample(text: string, scope: string): Promise<unknown> {
+  for (const metric of ['count', 'sum', 'avg', 'min', 'max']) {
+    assert.match(text, new RegExp('\\b' + metric + '\\b'), scope + ': every supported metric stays discoverable');
+  }
+  const examples = [...text.matchAll(/\bAggregate JSON:\s*(\{.+?\})\.(?:\s|$)/g)];
+  assert.equal(examples.length, 1, scope + ': one executable aggregate JSON example is available');
+  const example = JSON.parse(examples[0]![1]!);
+  const { validateWorkflowTransform, executeWorkflowTransform } = await import('../execution/workflow-transform.js');
+  const validation = validateWorkflowTransform(example);
+  assert.equal(validation.ok, true, scope + ': the actual DSL accepts the advertised grouping expression');
+  if (!validation.ok) throw new Error(scope + ': invalid advertised aggregate');
+  assert.deepEqual(validation.references, [{ kind: 'input', source: 'input.rows', key: 'rows' }]);
+  for (const fixture of [
+    { rows: [{ category: 'north', amount: 2 }, { category: 'north', amount: 3 }, { category: 'south', amount: 7 }],
+      expected: [{ category: 'north', count: 2, sum_amount: 5 }, { category: 'south', count: 1, sum_amount: 7 }] },
+    { rows: [{ category: 'different', amount: 11 }], expected: [{ category: 'different', count: 1, sum_amount: 11 }] },
+  ]) {
+    assert.deepEqual(executeWorkflowTransform({ transform: example, inputs: { rows: JSON.stringify(fixture.rows) }, stepOutputs: {} }),
+      fixture.expected, scope + ': grouping and metrics use the current runtime input');
+  }
+  for (const groupBy of [undefined, [], 'category', Array.from({ length: 33 }, (_, i) => 'field' + i)]) {
+    const invalid = structuredClone(example);
+    if (groupBy === undefined) delete invalid.expression.groupBy;
+    else invalid.expression.groupBy = groupBy;
+    const rejected = validateWorkflowTransform(invalid);
+    assert.equal(rejected.ok, false, scope + ': the example does not relax nonempty bounded grouping');
+    if (!rejected.ok) assert.match(rejected.errors.join(' '), /transform\.expression\.groupBy must contain 1-32 field names/);
+  }
+  return example;
+}
+
 test('native transform help examples: exact create and update disclosures carry the same executable JSON on both carriers', async () => {
   const local = await import('../runtime/harness/local-planning-capability.js');
   let firstExample: unknown;
+  let firstAggregateExample: unknown;
   for (const carrier of ['work_call', 'call_tool'] as const) {
     for (const name of ['workflow_create', 'workflow_update']) {
       let handler!: Handler;
@@ -1923,6 +1955,9 @@ test('native transform help examples: exact create and update disclosures carry 
       assertWorkflowTransformDiscoveryGrammar(description, `${carrier}/${name}`);
       const example = documentedTransformExample(description, `${carrier}/${name}`);
       await assertRuntimeRowsExample(example, `${carrier}/${name}`);
+      const aggregate = await assertAggregateRuntimeRowsExample(description, `${carrier}/${name}`);
+      if (firstAggregateExample === undefined) firstAggregateExample = aggregate;
+      else assert.deepEqual(aggregate, firstAggregateExample, 'both carriers and create/update keep one aggregate example');
       if (firstExample === undefined) firstExample = example;
       else assert.deepEqual(example, firstExample, 'create/update and both carriers teach the same native grammar');
       assert.equal(row.carrier, carrier);
