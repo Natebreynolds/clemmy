@@ -10757,6 +10757,53 @@ test('the host explanation survives an enabled completion judge without claiming
 
 // Live 2026-09-24/25: after the last review round an answer was delivered
 // "blocked" while still containing the figures the reviewer flagged.
+test('a read-only answer revised once to a claims-only finding ships on the host check that the quoted claims are gone, without a second review', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const draft = 'Kernel is the chosen browser. Both providers are connected with live credentials.';
+  const revised = 'Kernel is the chosen browser. Both providers are configured with credentials available.';
+  const finding = '(1) "connected with live credentials" overstates the evidence: credentials are available, not tested.';
+  let judgeCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { done: false, repairScope: 'claims', reason: finding } as never;
+  });
+  try {
+    const fixture = acceptJudgedSource('claims-revised-once', 'Post the browser snapshot to the channel');
+    const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(revised)]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const outcome = await runJudgedHost(fixture, agent, true);
+    assert.equal(judgeCalls, 1, 'the revision is checked by the host, not reviewed again');
+    assert.equal(String(outcome.finalOutput), revised);
+    const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
+    const last = verdicts.at(-1)!;
+    assert.equal(last.data.fulfills, true);
+    assert.deepEqual((last.data.claimRevision as { quotes: string[] }).quotes, ['connected with live credentials']);
+    assert.equal(last.data.replyDigest, createHash('sha256').update(revised, 'utf8').digest('hex'));
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
+test('a revision that still carries a quoted claim is reviewed again', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const draft = 'Kernel is the chosen browser. Both providers are connected with live credentials.';
+  const finding = '(1) "connected with live credentials" overstates the evidence.';
+  let judgeCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    judgeCalls += 1;
+    return judgeCalls === 1
+      ? { done: false, repairScope: 'claims', reason: finding } as never
+      : { done: true, reason: 'The reply matches the evidence.' } as never;
+  });
+  try {
+    const fixture = acceptJudgedSource('claims-still-present', 'Post the browser snapshot to the channel');
+    const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(`${draft} (checked again)`)]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    await runJudgedHost(fixture, agent, true);
+    assert.equal(judgeCalls, 2, 'a quoted claim that remains goes back to the reviewer');
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
 test('when the rounds are spent on claims-only findings, the answer ships without them and passes delivery', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const draft = 'Traffic is about 1,200 visits a month. Revenue grew 40% this year. The site ranks for 180 keywords. Full report: https://example.test/firm-report.';

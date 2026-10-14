@@ -117,7 +117,8 @@ import type { HostQueuedApprovalBeforeCompletion, InterruptionInfo, RunOutcome, 
 import { approvalCallPreview } from './approval-call-preview.js';
 import { approvalPreviewLabels, type ApprovalLabelMemo } from './approval-preview-labels.js';
 import { approvalPrecheck } from './approval-precheck.js';
-import { removeReviewedClaims } from './reviewed-claim-removal.js';
+import { removeReviewedClaims, reviewQuotes } from './reviewed-claim-removal.js';
+import { reviewedClaimsRevision, reviewedClaimsRevisionReason } from './reviewed-claims-revision.js';
 import { acceptedTaskIdFor, withLogicalToolCall } from './attempt-identity.js';
 import { persistHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { isRegistryDeclaredLocalPlanningCapability, isRegistryDeclaredLocalPlanningMutation, isRegistryDeclaredNativePlanningRead, nominateDisclosedLocalPlanningDefinition } from './local-planning-capability.js';
@@ -1933,6 +1934,10 @@ interface HostCompletionReviewFeedback {
   reply: string;
   replyDigest: string;
   reason: string;
+  /** A claims-only finding, with the reviewer's quoted claims, so a read-only
+   *  answer's one revision can be checked against them without a second review. */
+  repairScope?: 'claims';
+  quotes?: string[];
 }
 
 function parseHostCompletionReviewFeedback(value: unknown): HostCompletionReviewFeedback | undefined {
@@ -1949,9 +1954,15 @@ function parseHostCompletionReviewFeedback(value: unknown): HostCompletionReview
     || row.replyDigest !== createHash('sha256').update(row.reply, 'utf8').digest('hex')) {
     throw new Error('paused host state has invalid completion-review feedback');
   }
+  if (row.repairScope !== undefined && row.repairScope !== 'claims') throw new Error('paused host state has invalid completion-review feedback');
+  if (row.quotes !== undefined && (!Array.isArray(row.quotes) || row.quotes.some((quote) => typeof quote !== 'string'))) {
+    throw new Error('paused host state has invalid completion-review feedback');
+  }
   return { version: 1, sessionId: row.sessionId, sourceUserSeq: Number(row.sourceUserSeq),
     objective: row.objective, objectiveDigest: String(row.objectiveDigest),
-    reply: row.reply, replyDigest: String(row.replyDigest), reason: row.reason, ...(row.phase === 'plan' ? { phase: 'plan' } : {}) };
+    reply: row.reply, replyDigest: String(row.replyDigest), reason: row.reason, ...(row.phase === 'plan' ? { phase: 'plan' } : {}),
+    ...(row.repairScope === 'claims' ? { repairScope: 'claims' as const } : {}),
+    ...(Array.isArray(row.quotes) ? { quotes: (row.quotes as string[]).slice(0, 24) } : {}) };
 }
 
 /** What a completion review protects: work that wrote or tried to write
@@ -4833,7 +4844,21 @@ const runHostTurnBody = async (
       reviewInputOwner = { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
         ...(reviewAttribution?.sessionId === identity.sessionId && reviewAttribution.sourceUserSeq === identity.sourceUserSeq
           && reviewAttribution.attemptId ? { attemptId: reviewAttribution.attemptId } : {}) };
-      verdict = await hostObjectiveJudge(objective, judgedReply, {
+      const reviewStakesForTurn = completionReviewStakes({
+        plan: Boolean(planCandidate),
+        attemptedWrites: sourceWritesAtStake(identity),
+      });
+      // A read-only answer revised once to a claims-only finding ships on the
+      // host's own check that none of the quoted claims remain; a second
+      // review of the whole reply cost as much as the first and found nothing.
+      const claimsRevision = reviewedClaimsRevision({
+        feedback: completionReviewFeedback, reply: judgedReply,
+        replyDigest: createHash('sha256').update(judgedReply, 'utf8').digest('hex'),
+        stakes: reviewStakesForTurn, settledCount: settled.count,
+      });
+      verdict = claimsRevision
+        ? { done: true, reason: reviewedClaimsRevisionReason(claimsRevision), reviewDepth: 'fast', claimRevision: claimsRevision }
+        : await hostObjectiveJudge(objective, judgedReply, {
         sessionId: identity.sessionId,
         reviewInputOwner,
         completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE,
@@ -4856,10 +4881,7 @@ const runHostTurnBody = async (
         ...(planCandidate ? { reviewsPlan: true } : {}),
         // The full review guards what reached outside or cannot be restored;
         // a local file write that kept its earlier bytes takes the read depth.
-        reviewStakes: completionReviewStakes({
-          plan: Boolean(planCandidate),
-          attemptedWrites: sourceWritesAtStake(identity),
-        }),
+        reviewStakes: reviewStakesForTurn,
         // Every write it attempted still sets the review's deadline.
         attemptedWrites: sourceAttemptedWrites(identity),
         verifiedReads: readEvidence.summary,
@@ -4992,6 +5014,7 @@ const runHostTurnBody = async (
           ...(verdict.fast ? { fast: true } : {}),
           ...(verdict.jevAttempt ? { jevAttempt: verdict.jevAttempt } : {}),
           ...(verdict.repairScope ? { repairScope: verdict.repairScope } : {}),
+          ...(verdict.claimRevision ? { claimRevision: verdict.claimRevision } : {}),
           reason: verdict.reason.slice(0, 1_600),
           ...(blockedByReview ? { blocked: true } : {}),
           ...(verdict.failedOpen ? { failedOpen: true } : {}),
@@ -5175,6 +5198,8 @@ const runHostTurnBody = async (
       objective, objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex'),
       reply: judgedReply, replyDigest: createHash('sha256').update(judgedReply, 'utf8').digest('hex'),
       reason: verdict.reason,
+      ...(verdict.repairScope === 'claims' && !planCandidate
+        ? { repairScope: 'claims' as const, quotes: reviewQuotes(verdict.reason).slice(0, 24) } : {}),
     };
     const formatPacket = responseFormatRepairPacket({ ...verdict,
       plan: Boolean(planCandidate) || turnIsPlanMode(), objective, reply: judgedReply, reason: verdict.reason,
