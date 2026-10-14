@@ -3,6 +3,7 @@
  * tool_search. Fail-open: no match, low confidence, missing schema, or a
  * provision miss leaves discovery unchanged.
  */
+import { performance } from 'node:perf_hooks';
 import { withSessionMemoryScope } from '../../memory/memory-scope.js';
 import { listEvents } from '../harness/eventlog.js';
 import {
@@ -684,12 +685,16 @@ async function decideWithinBudget(
     route: { pick: null, outcome: 'unavailable' },
     failedOpen: true,
   };
+  const deadline = performance.now() + budgetMs;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expired = new Promise<TurnStartDecisionFor>((resolve) => {
     timer = setTimeout(() => resolve(unavailable), budgetMs);
   });
   try {
-    return await Promise.race([decide().catch(() => unavailable), expired]);
+    const decision = await Promise.race([decide().catch(() => unavailable), expired]);
+    // A fulfilled microtask can precede an overdue timer after an event-loop
+    // stall. Only a result admitted inside the original budget may be used.
+    return performance.now() < deadline ? decision : unavailable;
   } finally {
     if (timer) clearTimeout(timer);
   }
