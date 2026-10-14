@@ -2400,6 +2400,13 @@ export function buildAuthorizedToolSearchCandidateSources(
   planningIdentity?: { sessionId: string; sourceUserSeq: number },
   carrier: 'work_call' | 'call_tool' = 'work_call',
 ): readonly ToolSearchCandidateSource[] {
+  // A model-mounted search without exact task identity is not standalone
+  // maintenance. Discovery and conservative invalidation still work, but
+  // missing ownership never authorizes automatic learning.
+  const learningIdentity = Object.freeze({
+    sessionId: planningIdentity?.sessionId ?? '',
+    sourceUserSeq: planningIdentity?.sourceUserSeq ?? 0,
+  });
   const prepareExternalMcpCandidates: NonNullable<ToolSearchCandidateSource['prepareCandidates']> = async ({
     candidates, signal, deadlineAt,
   }) => {
@@ -2709,7 +2716,7 @@ export function buildAuthorizedToolSearchCandidateSources(
           if (currentConnections) {
             const lease = rememberedExactComposioLease(exactOperation);
             if (lease) {
-              reconcileExactSlugMemory(exactOperation, lease.fingerprint, planningIdentity);
+              reconcileExactSlugMemory(exactOperation, lease.fingerprint, learningIdentity);
               const memo = composioMemoriesForSlug(exactOperation)[0];
               exactCandidates.push(rememberPreparedSearchCandidate(exactComposioSearchCandidate(
                 exactOperation,
@@ -2728,9 +2735,9 @@ export function buildAuthorizedToolSearchCandidateSources(
           scheduleOperationDeliveryLearning(exact.map((candidate) => ({
             providerKind: 'composio' as const, operationId: candidate.slug,
             description: candidate.description, inputSchema: candidate.inputParameters,
-          })), planningIdentity ? { sessionId: planningIdentity.sessionId, sourceUserSeq: planningIdentity.sourceUserSeq } : {});
+          })), learningIdentity);
           const liveFingerprint = liveComposioSchemaFingerprint(exactOperation);
-          if (liveFingerprint) reconcileExactSlugMemory(exactOperation, liveFingerprint, planningIdentity);
+          if (liveFingerprint) reconcileExactSlugMemory(exactOperation, liveFingerprint, learningIdentity);
           exactCandidates.push(...exact.map((candidate): ToolSearchBrokerCandidate => ({
             name: candidate.slug,
             summary: candidate.description?.trim()
@@ -2775,7 +2782,7 @@ export function buildAuthorizedToolSearchCandidateSources(
       ) {
         const lease = rememberedExactComposioLease(rememberedWinner.slug);
         if (lease) {
-          reconcileExactSlugMemory(rememberedWinner.slug, lease.fingerprint, planningIdentity);
+          reconcileExactSlugMemory(rememberedWinner.slug, lease.fingerprint, learningIdentity);
           return [rememberPreparedSearchCandidate(exactComposioSearchCandidate(
             rememberedWinner.slug,
             lease.schema,
@@ -2790,7 +2797,7 @@ export function buildAuthorizedToolSearchCandidateSources(
         if (signal?.aborted) return [];
         if (exact.length > 0) {
           const liveFingerprint = liveComposioSchemaFingerprint(rememberedWinner.slug);
-          if (liveFingerprint) reconcileExactSlugMemory(rememberedWinner.slug, liveFingerprint, planningIdentity);
+          if (liveFingerprint) reconcileExactSlugMemory(rememberedWinner.slug, liveFingerprint, learningIdentity);
           return exact.map((candidate, index): ToolSearchBrokerCandidate => ({
             name: candidate.slug,
             summary: candidate.description?.trim()
@@ -2874,7 +2881,7 @@ export function buildAuthorizedToolSearchCandidateSources(
       try {
         await learnComposioOperationEffects(
           merged.slice(0, 20).map((candidate) => ({ slug: candidate.slug, description: candidate.description, inputSchema: candidate.inputParameters })),
-          { ...(planningIdentity ? { sessionId: planningIdentity.sessionId, sourceUserSeq: planningIdentity.sourceUserSeq } : {}), ...(deadlineAt !== undefined ? { deadlineAt } : {}) },
+          { ...learningIdentity, ...(deadlineAt !== undefined ? { deadlineAt } : {}) },
         );
       } catch { /* the conservative write default stands */ }
       // Whether a send-shaped operation delivers anything is learned from its
@@ -2887,7 +2894,7 @@ export function buildAuthorizedToolSearchCandidateSources(
             description: candidate.description,
             inputSchema: candidate.inputParameters,
           })),
-          planningIdentity ? { sessionId: planningIdentity.sessionId, sourceUserSeq: planningIdentity.sourceUserSeq } : {},
+          learningIdentity,
         );
       } catch { /* learning never blocks discovery */ }
       const liveCandidates = merged
@@ -2977,7 +2984,7 @@ export function buildAuthorizedToolSearchCandidateSources(
         operationId: candidate.slug,
         description: candidate.description,
         inputSchema: candidate.inputParameters,
-      })), planningIdentity ? { sessionId: planningIdentity.sessionId, sourceUserSeq: planningIdentity.sourceUserSeq } : {});
+      })), learningIdentity);
       return [...alreadyPrepared, ...current.flatMap((candidate): ToolSearchBrokerCandidate[] => {
         const nominated = requested.get(candidate.slug);
         return nominated ? [{

@@ -2336,7 +2336,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const actionToolSearchCandidateSources = carrierWork || workflowDiscoveryIdentity
     ? buildAuthorizedToolSearchCandidateSources(
         mcpToolScope,
-        hostFreshPlanning?.identity,
+        hostFreshPlanning?.identity ?? workflowDiscoveryIdentity,
         workflowDiscoveryIdentity ? 'call_tool' : 'work_call',
       )
     : undefined;

@@ -13,6 +13,7 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.EMBEDDINGS_DISABLED = 'true';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
+process.env.COMPOSIO_BACKEND = 'sdk';
 mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TEST_HOME, 'state', 'machine-id'), 'machine-exact-slug-memory\n');
 const store = await import('../memory/tool-choice-store.js');
@@ -92,4 +93,75 @@ test('exact-slug excluded discovery still invalidates a drifted learned contract
   assert.equal(store.peekToolChoice(memo.intent)?.choice, null, 'conservative invalidation survives exclusion');
   assert.equal(procedure(memo.procedureId)?.impressionCount, beforeImpressions);
   assert.equal(store.peekToolChoice(memo.intent)?.choice?.schemaFingerprint, undefined);
+});
+
+
+test('built model-mounted discovery without identity cannot learn even inside an excluded source; exact normal source can', async () => {
+  const composio = await import('../integrations/composio/client.js');
+  const schemaCache = await import('./composio-schema-cache.js');
+  const slug = 'OUTLOOK_GET_CALENDAR_VIEW';
+  const schema = { type: 'object', properties: { calendarId: { type: 'string' } }, required: ['calendarId'] };
+  const memo = store.rememberToolChoice({ intent: 'fixture.mounted.calendar', choice: { kind: 'composio', identifier: slug } });
+  assert.ok(memo.procedureId);
+  const original = store.peekToolChoice(memo.intent);
+  const originalProcedure = procedure(memo.procedureId);
+  assert.ok(originalProcedure);
+  let connections = 0, exactLookups = 0, executions = 0;
+  composio.resetComposioClient();
+  composio.__test__.setComposioApiKeyOverride('controlled-missing-identity-key');
+  composio.__test__.setConnectedAccountsLoader(async () => {
+    connections += 1;
+    return [{ id: 'ca_controlled_calendar', status: 'ACTIVE', user_id: 'controlled-owner', toolkit: { slug: 'outlook' } }];
+  });
+  composio.__test__.setComposioClient({ tools: {
+    async getRawComposioTools() { exactLookups += 1; throw new Error('current lease must not refetch the provider'); },
+    async execute() { executions += 1; throw new Error('discovery must not execute'); },
+  } } as never);
+  try {
+    schemaCache.rememberToolSchema(slug, schema, Date.now(), 'controlled-calendar-v1', null);
+    const liveFingerprint = schemaCache.liveComposioSchemaFingerprint(slug);
+    assert.ok(liveFingerprint);
+    const scope = { reason: 'controlled mounted-source identity', authority: 'catalog', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 } as never;
+    const excluded = memorySource(EXCLUDED_LEARNING);
+    const withoutIdentity = sources.buildAuthorizedToolSearchCandidateSources(scope, undefined, 'call_tool')
+      .find(source => source.kind === 'authorized_composio');
+    assert.ok(withoutIdentity);
+    const rows = await contexts.withAcceptedSourceSessionContext(excluded,
+      () => withoutIdentity.search({ query: slug, limit: 4 }), { newlyAccepted: true });
+    assert.deepEqual(rows.map(row => row.name), [slug], 'missing learning identity does not hide a live operation');
+    assert.deepEqual(rows[0]?.schema, schema);
+    assert.deepEqual(store.peekToolChoice(memo.intent), original);
+    assert.deepEqual(procedure(memo.procedureId), originalProcedure, 'mounted source must not fall through to standalone learning');
+
+    const exactExcluded = sources.buildAuthorizedToolSearchCandidateSources(scope, excluded, 'call_tool')
+      .find(source => source.kind === 'authorized_composio');
+    assert.ok(exactExcluded);
+    assert.deepEqual((await exactExcluded.search({ query: slug, limit: 4 })).map(row => row.name), [slug]);
+    assert.deepEqual(store.peekToolChoice(memo.intent), original);
+    assert.deepEqual(procedure(memo.procedureId), originalProcedure);
+
+    const normal = memorySource();
+    const exactNormal = sources.buildAuthorizedToolSearchCandidateSources(scope, normal, 'call_tool')
+      .find(source => source.kind === 'authorized_composio');
+    assert.ok(exactNormal);
+    assert.deepEqual((await exactNormal.search({ query: slug, limit: 4 })).map(row => row.name), [slug]);
+    assert.equal(store.peekToolChoice(memo.intent)?.choice?.schemaFingerprint, liveFingerprint);
+    assert.equal(procedure(memo.procedureId)?.impressionCount, originalProcedure.impressionCount + 1);
+
+    const drifted = store.rememberToolChoice({ intent: 'fixture.mounted.drift',
+      choice: { kind: 'composio', identifier: slug, schemaFingerprint: '0'.repeat(64) } });
+    assert.ok(drifted.procedureId);
+    const driftedImpressions = procedure(drifted.procedureId)?.impressionCount;
+    assert.deepEqual((await withoutIdentity.search({ query: slug, limit: 4 })).map(row => row.name), [slug]);
+    assert.equal(store.peekToolChoice(drifted.intent)?.choice, null, 'missing identity still permits conservative schema-drift invalidation');
+    assert.equal(procedure(drifted.procedureId)?.impressionCount, driftedImpressions);
+    assert.ok(connections > 0, 'real provider source consumed the controlled current connection loader');
+    assert.equal(exactLookups, 0);
+    assert.equal(executions, 0);
+  } finally {
+    schemaCache.resetToolSchemaCache();
+    composio.__test__.setConnectedAccountsLoader(null);
+    composio.__test__.setComposioApiKeyOverride(null);
+    composio.resetComposioClient();
+  }
 });

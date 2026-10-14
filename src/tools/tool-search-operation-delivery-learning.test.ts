@@ -29,6 +29,14 @@ const jev = await import('../runtime/jev/client.js');
 const ports = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
 const { configuredBrainSemanticPort } = await import('../runtime/semantic-boundary/configured-brain-semantic-port.js');
 
+let discoverySourceSerial = 0;
+function discoveryIdentity(learningPolicy?: unknown) {
+  const session = eventlog.createSession({ id: `delivery-discovery-source-${++discoverySourceSerial}`, kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Inspect the controlled operation definitions.', ...(learningPolicy === undefined ? {} : { learningPolicy }) } });
+  return { sessionId: session.id, sourceUserSeq: source.seq };
+}
+
 const TOOLKIT = 'example';
 const OPEN = `${TOOLKIT.toUpperCase()}_OPEN_DM`;
 const SEND = `${TOOLKIT.toUpperCase()}_SEND_MESSAGE`;
@@ -125,7 +133,7 @@ test('discovery schedules delivery learning for its send-shaped definitions and 
     allowedServerSlugs: [],
     toolPatterns: [],
     maxTools: 0,
-  } as never);
+  } as never, discoveryIdentity());
   const source = sources.find((entry) => entry.kind === 'authorized_composio');
   assert.ok(source, 'the composio candidate source must exist');
 
@@ -159,7 +167,7 @@ test('deferred exact preparation learns from the full definition, not the index 
   exactDefinitionsAvailable = true;
   const sources = providerSources.buildAuthorizedToolSearchCandidateSources({
     reason: 'deferred delivery learning', authority: 'catalog', allowedServerSlugs: [], toolPatterns: [], maxTools: 0,
-  } as never);
+  } as never, discoveryIdentity());
   const source = sources.find((entry) => entry.kind === 'authorized_composio')!;
   const prepared = await source.prepareCandidates!({
     candidates: [{ name: OPEN, summary: 'Untrusted index prose', carrier: 'work_call' }],
@@ -167,5 +175,34 @@ test('deferred exact preparation learns from the full definition, not the index 
   assert.equal(prepared.length, 1);
   await learner._drainOperationDeliveryLearningForTests();
   assert.deepEqual(screened, [DESCRIPTIONS[OPEN]]);
+  assert.ok(deliveryStore.learnedOperationDeliveryVerdict('composio', OPEN));
+});
+
+
+test('model-mounted discovery without exact identity or with exclusion schedules no automatic learner; normal source still learns', async () => {
+  const scope = { reason: 'controlled learning owner', authority: 'catalog', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 } as never;
+  const excluded = discoveryIdentity({ version: 1, mode: 'exclude', reason: 'controlled_test' });
+  for (const identity of [undefined, excluded]) {
+    deliveryStore._resetLearnedOperationDeliveryForTests();
+    learner._resetOperationDeliveryLearningForTests();
+    screened.length = 0;
+    const previousJudges = judgeCalls;
+    const source = providerSources.buildAuthorizedToolSearchCandidateSources(scope, identity)
+      .find(entry => entry.kind === 'authorized_composio');
+    assert.ok(source);
+    const rows = await source.search({ query: 'open a conversation and message my teammate', limit: 8 });
+    assert.deepEqual(rows.map(row => row.name).sort(), [LIST, OPEN, SEND].sort());
+    await learner._drainOperationDeliveryLearningForTests();
+    assert.deepEqual(screened, []);
+    assert.equal(judgeCalls, previousJudges);
+    assert.equal(deliveryStore.learnedOperationDeliveryVerdict('composio', OPEN), null);
+  }
+  const source = providerSources.buildAuthorizedToolSearchCandidateSources(scope, discoveryIdentity())
+    .find(entry => entry.kind === 'authorized_composio');
+  assert.ok(source);
+  const rows = await source.search({ query: 'open a conversation and message my teammate', limit: 8 });
+  assert.deepEqual(rows.map(row => row.name).sort(), [LIST, OPEN, SEND].sort());
+  await learner._drainOperationDeliveryLearningForTests();
+  assert.deepEqual([...screened].sort(), [DESCRIPTIONS[OPEN], DESCRIPTIONS[SEND]].sort(), 'ordinary sibling retains the original two-definition reading');
   assert.ok(deliveryStore.learnedOperationDeliveryVerdict('composio', OPEN));
 });
