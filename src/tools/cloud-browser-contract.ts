@@ -9,7 +9,9 @@ export const CLOUD_BROWSER_PARAMETERS = {
   // model-selected option on a routine browsing request.
   cloud_browser_start: { url: BROWSER_HTTP_URL.nullable().optional().describe('A website to open in the browser\'s first page, so no separate open or navigate call is needed.') },
   cloud_browser_resources: {},
-  cloud_browser_status: { resource_id: resource },
+  // Without a resource id the status is the listing: this task's browsers
+  // and the browser the owner chose for this machine.
+  cloud_browser_status: { resource_id: resource.nullable().optional() },
   cloud_browser_tabs: { resource_id: resource, expected_version: version },
   cloud_browser_read: { resource_id: resource, expected_version: version, target_id: target,
     max_chars: z.number().int().min(100).max(16000).nullable().optional() },

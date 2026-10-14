@@ -30,7 +30,7 @@ export async function executeCloudBrowserTool(name: CloudBrowserOperationName, r
   const conversationId = tool?.sessionId ?? run?.sessionId;
   if (!conversationId) throw hostPreDispatchRefusal('A cloud browser requires an authenticated task context.');
   try {
-    if (name === 'cloud_browser_resources') {
+    if (name === 'cloud_browser_resources' || (name === 'cloud_browser_status' && !args.resource_id)) {
       const resources = await service.list(conversationId);
       // The machine's browser choice is part of what this listing answers: a
       // model asked which browser is in use otherwise has no tool that says.
@@ -125,7 +125,7 @@ export function registerCloudBrowserTools(server: McpServer): void {
   const descriptions: Record<CloudBrowserOperationName, string> = {
     cloud_browser_start: 'Start the cloud browser for this chat, or rejoin the one already open here (including one the owner opened or handed over). Pass url to open a website in its first page in the same call. Returns the resource id, controlVersion and page handles (target_id) to read or navigate directly. This operation already finds the existing browser; no preliminary resources call or separate open call is needed. Respects human control. Cloud usage is billed by the connected provider; recording stays off.',
     cloud_browser_resources: 'List the recent cloud browser resources already owned by this task, including one the user started in the UI, and report which browser the owner chose for this machine (browser.choice: a cloud provider or local Chrome) with each configured provider. Use this to inspect or select an existing resource and its exact controlVersion. cloud_browser_start already resolves and rejoins this chat\'s browser; a preliminary list is unnecessary.',
-    cloud_browser_status: 'Observe this exact task-owned cloud browser and its current controlVersion. Use after a handoff or a stale-version refusal. Reports pending or uncertain effects honestly; does not replay actions or grant control. Page metadata is omitted here; cloud_browser_tabs provides fresh exact handles.',
+    cloud_browser_status: 'Observe this exact task-owned cloud browser and its current controlVersion, or, with no resource_id, list this task\'s browsers and the browser the owner chose for this machine. Use after a handoff or a stale-version refusal. Reports pending or uncertain effects honestly; does not replay actions or grant control. Page metadata is omitted here; cloud_browser_tabs provides fresh exact handles.',
     cloud_browser_tabs: 'Freshly observe pages in this exact task-owned cloud browser. Returns current targetId handles. Refuses while the user has control or the controlVersion changed; never substitutes another session.',
     cloud_browser_read: 'Read bounded visible text from the exact task-owned cloud browser page. Uses a fixed observation, no caller script. Requires its current controlVersion and targetId. Refuses during human control.',
     cloud_browser_open: 'Open an additional blank page in this chat\'s cloud browser and return its targetId. cloud_browser_start already returns a first page; use this only when a second tab is needed. Uses the current controlVersion; refuses during human control. Does not click, submit or send.',
