@@ -1760,7 +1760,10 @@ test('reviewer historical findings do not embed the rejected draft, while genera
   assert.doesNotMatch(prompt, /CONTROLLED_REJECTED_DRAFT|CONTROLLED_OLD_TRAILING_PROSE|```json/);
   assert.ok(host.hostCompletionReviewFeedbackContext(feedback).includes(JSON.stringify(feedback)),
     'generator retains the complete previous draft, objective and finding for repair');
-  assert.match(host.hostCompletionReviewFeedbackContext(feedback), /Fix every numbered item/);
+  const repairContext = host.hostCompletionReviewFeedbackContext(feedback);
+  assert.match(repairContext, /every numbered (?:item|finding)/i);
+  assert.match(repairContext, /(?:unsupported|contradicted)[^\n]*(?:refut|reject|explain)|(?:refut|reject|explain)[^\n]*(?:unsupported|contradicted)/i,
+    'retained reviewer feedback can be refuted against current verified evidence');
   assert.match(prompt, /=== END OF CANDIDATE RESPONSE ===/);
   const planFinding = host.hostCompletionReviewFindingContext({ ...feedback, phase: 'plan' });
   assert.match(planFinding, /"phase":"plan"/);
@@ -2852,4 +2855,208 @@ test('shared settled-read guidance for a reference-only window carries digest ru
   assert.match(evidence.summary, /Reference-only content is NOT included in this review/);
   assert.doesNotMatch(evidence.summary, /A plan binds this inner value|String bindings:|Non-string bindings:/);
   assert.equal((evidence.summary.match(/digest binds the JSON-encoded result, not decoded text or original-file bytes\./g) ?? []).length, 1);
+});
+
+
+function chronologyScope(summary: string, identity: Pick<ReturnType<typeof accepted>, 'sessionId' | 'sourceUserSeq'>): string {
+  const header = `Receipt chronology scope: session=${identity.sessionId}; source=${identity.sourceUserSeq}`;
+  assert.equal(summary.split(header).length - 1, 1, 'each exact source renders its chronology header once');
+  const start = summary.indexOf(header);
+  const end = summary.indexOf('Receipt chronology scope:', start + header.length);
+  return summary.slice(start, end < 0 ? undefined : end);
+}
+
+function assertChronologyReceipt(summary: string, callId: string, ordinal: number,
+  logicalOpenedAt: string, canonicalSettledAt: string): void {
+  const lines = summary.split('\n').filter(line => line.includes(`logicalCall=${callId}`)
+    && line.includes('sourceSettlementOrdinal='));
+  assert.equal(lines.length, 1, `${callId} retains one call-bound chronology presentation`);
+  const line = lines[0]!;
+  for (const field of [`sourceSettlementOrdinal=${ordinal}`, `logicalOpenedAt=${logicalOpenedAt}`,
+    `canonicalSettledAt=${canonicalSettledAt}`]) assert.ok(line.includes(field), `${callId}: ${field}`);
+}
+
+test('receipt chronology preserves completed run evidence before the later disable and filtered source ordinals', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-14T12:17:00.000Z') });
+  const identity = accepted('Inspect the completed controlled workflow run, then disable this workflow and verify its saved state.');
+  const fixtures = [
+    { id: 'chronology-discovery', tool: 'tool_search', args: { query: 'controlled workflow status' }, payload: [],
+      at: '2026-10-14T12:17:00.000Z' },
+    { id: 'chronology-enabled', tool: 'workflow_get', args: { name: 'controlled-chronology' },
+      payload: { name: 'controlled-chronology', enabled: true }, at: '2026-10-14T12:17:00.000Z' },
+    { id: 'chronology-completed', tool: 'workflow_run_status', args: { run_id: 'controlled-run' },
+      payload: { runId: 'controlled-run', status: 'completed', finishedAt: '2026-10-14T12:17:04.000Z',
+        output: { group: 'main', policyRevision: 'r2', ids: ['Q', 'R'], count: 2, amountTotal: 16 } },
+      at: '2026-10-14T12:17:05.000Z' },
+    { id: 'chronology-disabled', tool: 'workflow_set_enabled', args: { name: 'controlled-chronology', enabled: false },
+      payload: 'Controlled workflow is now disabled.', mutating: true, at: '2026-10-14T12:17:10.000Z' },
+    { id: 'chronology-readback', tool: 'workflow_get', args: { name: 'controlled-chronology' },
+      payload: { name: 'controlled-chronology', enabled: false }, at: '2026-10-14T12:17:15.000Z' },
+  ];
+  const handles = fixtures.map(fixture => {
+    t.mock.timers.setTime(Date.parse(fixture.at));
+    return retainedRead(identity, fixture.tool, fixture.payload, fixture.mutating ?? false, false, false,
+      { id: fixture.id, args: fixture.args });
+  });
+  const db = events.openEventLog();
+  const settlementsBefore = db.prepare('SELECT * FROM logical_call_settlements WHERE session_id=? AND source_user_seq=? ORDER BY rowid')
+    .all(identity.sessionId, identity.sourceUserSeq);
+  const callsBefore = db.prepare('SELECT * FROM logical_tool_calls WHERE session_id=? AND source_user_seq=? ORDER BY logical_tool_call_id')
+    .all(identity.sessionId, identity.sourceUserSeq);
+  const journalBefore = events.listEvents(identity.sessionId).map(row => ({ id: row.id, data: row.data }));
+  events.closeEventLog();
+  const evidence = sourceSettledReadEvidence(identity);
+  assert.equal(evidence.evidenceAvailable, true);
+  assert.deepEqual(evidence.results.map(row => row.logicalToolCallId), fixtures.map(fixture => fixture.id));
+  for (const [index, fixture] of fixtures.entries()) {
+    const row = evidence.results[index]!;
+    assert.equal(row.resultHandleId, handles[index]);
+    assert.equal(row.physicalDispatchId, `dispatch:${fixture.id}`);
+    assert.equal(row.contentDigest, createHash('sha256').update(JSON.stringify(fixture.payload)).digest('hex'));
+    assert.equal(row.contentComplete, true);
+    const callStart = evidence.summary.indexOf(`${fixture.tool} [logicalCall=${fixture.id}`);
+    assert.ok(callStart >= 0);
+    const body = readResultBlock(evidence.summary.slice(callStart), fixture.tool);
+    assert.equal(row.shownByteCount, Buffer.byteLength(body));
+    if (typeof fixture.payload === 'string') assert.equal(body, fixture.payload);
+    else assert.deepEqual(JSON.parse(body), fixture.payload);
+    assert.deepEqual(sourceEvidenceLookup(identity).resolve(handles[index]!)?.value, fixture.payload);
+    assert.equal(Object.hasOwn(row, 'logicalOpenedAt'), false, 'chronology is presentation, not a new result or authority object');
+  }
+  assert.deepEqual(JSON.parse(readResultBlock(evidence.summary, 'workflow_run_status')), fixtures[2]!.payload,
+    'completed child facts remain present, even though the source later writes');
+  assert.equal(evidence.results[2]!.precedesWrite, true, 'the earlier completed-phase observation is still marked before the latest write');
+  assert.equal(evidence.results[3]!.recordCount, undefined, 'a disable receipt is not source coverage');
+  assert.equal(evidence.results[4]!.precedesWrite, undefined);
+  const whole = chronologyScope(evidence.summary, identity);
+  for (const [index, fixture] of fixtures.entries()) assertChronologyReceipt(whole, fixture.id, index + 1, fixture.at, fixture.at);
+  assert.match(whole, /logical[^\n]*(?:interval|admission)[^\n]*canonical/i);
+  assert.match(whole, /not physical effect times/i);
+  assert.match(whole, /overlap[^\n]*(?:unknown|indeterminate|not[^\n]*order)|(?:unknown|indeterminate)[^\n]*overlap/i);
+  assert.match(whole, /(?:historical|earlier)[^\n]*(?:valid|evidence)|(?:valid|evidence)[^\n]*(?:historical|earlier)/i);
+  const withoutWrites = sourceSettledReadEvidence({ ...identity, includeWriteReceipts: false });
+  assert.deepEqual(withoutWrites.results.map(row => row.logicalToolCallId), fixtures.filter(row => !row.mutating).map(row => row.id));
+  for (const [index, fixture] of fixtures.entries()) {
+    if (!fixture.mutating) assertChronologyReceipt(chronologyScope(withoutWrites.summary, identity), fixture.id, index + 1, fixture.at, fixture.at);
+  }
+  assert.equal(withoutWrites.results.find(row => row.logicalToolCallId === 'chronology-completed')!.precedesWrite, true);
+  const withoutDiscovery = sourceSettledReadEvidence({ ...identity, omitSuccessfulDiscovery: true });
+  assert.deepEqual(withoutDiscovery.results.map(row => row.logicalToolCallId), fixtures.slice(1).map(row => row.id));
+  for (const [index, fixture] of fixtures.entries()) {
+    if (index > 0) assertChronologyReceipt(chronologyScope(withoutDiscovery.summary, identity), fixture.id, index + 1, fixture.at, fixture.at);
+  }
+  assert.deepEqual(events.openEventLog().prepare('SELECT * FROM logical_call_settlements WHERE session_id=? AND source_user_seq=? ORDER BY rowid')
+    .all(identity.sessionId, identity.sourceUserSeq), settlementsBefore);
+  assert.deepEqual(events.openEventLog().prepare('SELECT * FROM logical_tool_calls WHERE session_id=? AND source_user_seq=? ORDER BY logical_tool_call_id')
+    .all(identity.sessionId, identity.sourceUserSeq), callsBefore);
+  assert.deepEqual(events.listEvents(identity.sessionId).map(row => ({ id: row.id, data: row.data })), journalBefore,
+    'presentation/filtering does not add work, observations or call authority');
+});
+
+test('receipt chronology keeps overlapping real dispatch intervals distinct from settlement order', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-14T13:00:00.000Z') });
+  const identity = accepted('Compare the two controlled concurrent reads without guessing which physical effect happened first.');
+  const task = { ...identity, acceptedTaskId: identities.acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq) };
+  assert.ok(shadow.recordTurnGraphShadow({ identity: task }));
+  const open = (id: string) => {
+    const args = { scope: id };
+    const started = dispatch.beginPhysicalDispatch({ identity: { ...task, logicalToolCallId: id,
+      physicalDispatchId: `dispatch:${id}`, ordinal: 0 }, tool: 'fixture_interval_read', args, executionSite: 'host' });
+    assert.equal(started.status, 'inserted');
+    if (started.status !== 'inserted') throw new Error('Controlled interval did not open');
+    return { identity: started.identity, args };
+  };
+  const finish = (started: ReturnType<typeof open>, payload: string) => {
+    assert.equal(dispatch.settlePhysicalDispatch({ identity: started.identity, tool: 'fixture_interval_read', outcome: 'returned' }).status, 'inserted');
+    const result = settlements.commitLogicalCallSettlement({ identity: { ...task, logicalToolCallId: started.identity.logicalToolCallId },
+      contract: { toolName: 'fixture_interval_read', args: started.args }, execution: { kind: 'local_execution' },
+      result: { payload }, outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+      recovery: { businessCall: true, mutating: false }, observer: { lane: 'byo', turn: identity.turn } });
+    assert.equal(result.status, 'committed');
+    if (result.status !== 'committed') throw new Error('Controlled interval did not settle');
+    return result.settlement.resultHandleId!;
+  };
+  const firstOpened = open('overlap-open-first');
+  t.mock.timers.tick(1_000);
+  const secondOpened = open('overlap-open-second');
+  t.mock.timers.tick(1_000);
+  const secondHandle = finish(secondOpened, 'SECOND_OPENED_RESULT');
+  t.mock.timers.tick(1_000);
+  const firstHandle = finish(firstOpened, 'FIRST_OPENED_RESULT');
+  events.closeEventLog();
+  const evidence = sourceSettledReadEvidence(identity);
+  assert.deepEqual(evidence.results.map(row => row.logicalToolCallId), ['overlap-open-second', 'overlap-open-first']);
+  assert.equal(sourceEvidenceLookup(identity).resolve(firstHandle)?.text, 'FIRST_OPENED_RESULT');
+  assert.equal(sourceEvidenceLookup(identity).resolve(secondHandle)?.text, 'SECOND_OPENED_RESULT');
+  const scope = chronologyScope(evidence.summary, identity);
+  assertChronologyReceipt(scope, 'overlap-open-second', 1, '2026-10-14T13:00:01.000Z', '2026-10-14T13:00:02.000Z');
+  assertChronologyReceipt(scope, 'overlap-open-first', 2, '2026-10-14T13:00:00.000Z', '2026-10-14T13:00:03.000Z');
+  assert.match(scope, /settlement[^\n]*order[^\n]*(?:not|does not)[^\n]*(?:dispatch|effect)/i);
+  assert.match(scope, /overlap[^\n]*(?:unknown|indeterminate|not[^\n]*order)|(?:unknown|indeterminate)[^\n]*overlap/i);
+  assert.doesNotMatch(scope, /physicalEffectAt=|physicalEffectOrder=/,
+    'recorded logical intervals never invent a physical effect instant or total order');
+});
+
+test('receipt chronology keeps verified child ordinals local and rejects another accepted source', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-14T14:00:00.000Z') });
+  const parent = accepted('Use the controlled worker read and preserve its distinct source provenance.');
+  retainedRead(parent, 'run_worker', { status: 'completed' });
+  t.mock.timers.tick(1_000);
+  const parentHandle = retainedRead(parent, 'read_file', 'PARENT_CHRONOLOGY_BODY', false, false, false,
+    { id: 'scope-shared-read', args: { path: '/controlled/parent.txt' } });
+  const session = events.createSession({ id: `chronology-worker-${++serial}`, kind: 'chat' });
+  const binding = { parentSessionId: parent.sessionId, parentSourceUserSeq: parent.sourceUserSeq,
+    parentAcceptedTaskId: identities.acceptedTaskIdFor(parent.sessionId, parent.sourceUserSeq),
+    parentLogicalCallId: 'read:run_worker', packetDigest: 'chronology-controlled-packet', item: 'child' };
+  const source = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Read the controlled child record.', delegatedWorker: binding } });
+  const child = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
+  events.appendEvent({ sessionId: parent.sessionId, turn: 1, role: 'system', type: 'worker_started',
+    data: { ...binding, childSessionId: child.sessionId, childSourceUserSeq: child.sourceUserSeq } });
+  t.mock.timers.tick(1_000);
+  retainedRead(child, 'read_file', 'CHILD_CHRONOLOGY_BODY', false, false, false,
+    { id: 'scope-shared-read', args: { path: '/controlled/child.txt' } });
+  const foreign = accepted('A later source owns a separate observation.', parent.sessionId);
+  const foreignHandle = retainedRead(foreign, 'read_file', 'FOREIGN_CHRONOLOGY_MUST_STAY_OUT', false, false, false,
+    { id: 'scope-shared-read', args: { path: '/controlled/foreign.txt' } });
+  const evidence = sourceSettledReadEvidence(parent);
+  assert.equal(sourceEvidenceLookup(parent).resolve(parentHandle)?.text, 'PARENT_CHRONOLOGY_BODY');
+  assert.equal(sourceEvidenceLookup(parent).resolve(`worker:${child.sessionId}:${child.sourceUserSeq}:scope-shared-read`)?.text,
+    'CHILD_CHRONOLOGY_BODY');
+  assert.equal(sourceEvidenceLookup(parent).resolve(foreignHandle), undefined);
+  assert.doesNotMatch(evidence.summary, /FOREIGN_CHRONOLOGY_MUST_STAY_OUT/);
+  assertChronologyReceipt(chronologyScope(evidence.summary, parent), 'scope-shared-read', 2,
+    '2026-10-14T14:00:01.000Z', '2026-10-14T14:00:01.000Z');
+  assertChronologyReceipt(chronologyScope(evidence.summary, child), 'scope-shared-read', 1,
+    '2026-10-14T14:00:02.000Z', '2026-10-14T14:00:02.000Z');
+  assert.match(evidence.summary, /(?:ordinal|settlement order)[^\n]*(?:source.local|within[^\n]*source|different sources)/i);
+});
+
+test('completion repair can refute unsupported chronology while retaining every finding and the whole objective', () => {
+  const objective = 'Report the actual completed workflow output and disable it after completion; retain the stated scope.';
+  const previousReply = 'The run completed, then I disabled the workflow. Its amount total is 17. CONTROLLED_UNAFFECTED_SENTENCE.';
+  const reason = '(1) Disabling occurred before activation, so replace the post-completion chronology. (2) The amount total is 16, not 17.';
+  const feedback = { version: 1 as const, sessionId: 'controlled-chronology-feedback', sourceUserSeq: 29,
+    objective, objectiveDigest: createHash('sha256').update(objective).digest('hex'),
+    reply: previousReply, replyDigest: createHash('sha256').update(previousReply).digest('hex'), reason };
+  const repair = host.hostCompletionReviewFeedbackContext(feedback);
+  assert.ok(repair.includes(JSON.stringify(feedback)), 'all original findings, objective and rejected draft remain available');
+  assert.match(repair, /every numbered (?:item|finding)/i);
+  assert.match(repair, /(?:unsupported|contradicted)[^\n]*(?:refut|reject|explain)|(?:refut|reject|explain)[^\n]*(?:unsupported|contradicted)/i);
+  assert.match(repair, /(?:verified|authenticated|exact)[^\n]*(?:evidence|receipt|record)/i);
+  assert.match(repair, /(?:preserve|keep)[^\n]*(?:unaffected|supported|unchanged)/i);
+  assert.doesNotMatch(repair, /Fix every numbered item the review lists in this one revision, and change nothing else/,
+    'a reviewer opinion cannot compel replacing an evidenced fact with its unsupported premise');
+  const currentReply = 'The run completed, then I disabled the workflow. Its amount total is 16. CONTROLLED_UNAFFECTED_SENTENCE.';
+  const sourceEvidence = 'CONTROLLED_CONTRARY_EVIDENCE\nCONTROLLED_VISUAL_EVIDENCE\n'
+    + 'Exact completed child record: finishedAt=2026-10-14T12:17:51.016Z.\n'
+    + 'Exact disable receipt: logicalOpenedAt=2026-10-14T12:18:10.385Z; canonicalSettledAt=2026-10-14T12:18:17.282Z.';
+  const finding = host.hostCompletionReviewFindingContext(feedback);
+  const prompt = buildObjectiveJudgePrompt(objective, currentReply, { skills: [], fullSourceEvidence: true,
+    agentInstructions: 'CONTROLLED_STANDING_INSTRUCTION', toolCallSummary: sourceEvidence + '\n' + finding });
+  for (const required of [objective, currentReply, sourceEvidence, reason, feedback.objectiveDigest,
+    feedback.replyDigest, 'CONTROLLED_STANDING_INSTRUCTION']) assert.ok(prompt.includes(required));
+  assert.match(prompt, /current candidate response above is the sole response being judged/);
+  assert.match(prompt, /not owner instructions or execution authority/);
+  assert.doesNotMatch(prompt, /Its amount total is 17\./, 'the reviewer sees the current candidate, not another obsolete draft');
 });

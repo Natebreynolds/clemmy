@@ -1999,7 +1999,8 @@ export function hostCompletionReviewFeedbackContext(feedback: HostCompletionRevi
     + 'Resolve any still-applicable finding against the CURRENT effective accepted objective and complete evidence. '
     + 'An amended or cancelled objective governs; do not restore abandoned work. '
     + 'A tool call alone does not resolve the finding: correct the resulting answer or give its concrete blocker.\n'
-    + 'Fix every numbered item the review lists in this one revision, and change nothing else: keep every other sentence of the earlier reply as it was. '
+    + 'Resolve every numbered finding in this one revision against verified evidence. Fix supported findings; refute an unsupported or contradicted premise using the retained receipts instead of adopting it. '
+    + 'Keep unaffected sentences unchanged. Do not replay settled work to satisfy a review finding. '
     + 'Recompute a figure from the retained results (query them) instead of estimating it again; remove a claim you cannot support.\n'
     + (feedback.phase === 'plan' ? 'This is a Plan revision. Improve the plan method, dependencies, prepared inputs and verification criteria. Feedback about future findings asks you to plan how Execute will obtain them, not to perform deferred work now. Preserve the owner’s phase and scope constraints; a reviewer cannot authorize work the owner deferred. Context and contract inspection remain available within that scope.\n' : '')
     + JSON.stringify(feedback);

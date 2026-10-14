@@ -577,6 +577,22 @@ export function sourceSucceededResultCount(input: { sessionId: string; sourceUse
  * distinct observed states of repeated calls, with identical bytes referenced
  * once rather than repeated, and discovery summarized once a
  * business read has answered. Every result keeps its handle and digest. */
+function recordedLogicalCallInterval(opened: unknown, settled: unknown): {
+  logicalOpenedAt: string; canonicalSettledAt: string;
+} {
+  const timestamp = (value: unknown): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) && new Date(parsed).toISOString() === value ? value : undefined;
+  };
+  const logicalOpenedAt = timestamp(opened);
+  const canonicalSettledAt = timestamp(settled);
+  if (logicalOpenedAt && canonicalSettledAt && Date.parse(logicalOpenedAt) > Date.parse(canonicalSettledAt)) {
+    return { logicalOpenedAt: 'unknown', canonicalSettledAt: 'unknown' };
+  }
+  return { logicalOpenedAt: logicalOpenedAt ?? 'unknown', canonicalSettledAt: canonicalSettledAt ?? 'unknown' };
+}
+
 export function sourceSettledReadEvidence(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -606,18 +622,29 @@ export function sourceSettledReadEvidence(input: {
     : harnessRunContextStorage.getStore()?.routedModelId;
   try {
     const rows = openEventLog().prepare(`
-      SELECT s.rowid AS settlementIndex, s.logical_tool_call_id AS callId, l.tool_name AS toolName,
+      WITH source_settlements AS (
+        SELECT rowid AS settlementIndex,
+               ROW_NUMBER() OVER (ORDER BY rowid) AS sourceSettlementOrdinal,
+               session_id, source_user_seq, logical_tool_call_id,
+               outcome_kind, outcome_detail, mutating, settled_at
+          FROM logical_call_settlements
+         WHERE session_id = ? AND source_user_seq = ?
+      )
+      SELECT s.settlementIndex, s.sourceSettlementOrdinal,
+             l.opened_at AS logicalOpenedAt, s.settled_at AS canonicalSettledAt,
+             s.logical_tool_call_id AS callId, l.tool_name AS toolName,
              s.outcome_kind AS outcome, s.outcome_detail AS detail, s.mutating AS mutating,
              COALESCE(l.effective_argument_digest, l.argument_digest) AS callDigest
-        FROM logical_call_settlements s
+        FROM source_settlements s
         JOIN logical_tool_calls l
           ON l.session_id = s.session_id AND l.source_user_seq = s.source_user_seq
          AND l.logical_tool_call_id = s.logical_tool_call_id
-       WHERE s.session_id = ? AND s.source_user_seq = ? AND (? = 1 OR s.mutating = 0)
-       ORDER BY s.rowid
+       WHERE (? = 1 OR s.mutating = 0)
+       ORDER BY s.settlementIndex
     `).all(input.sessionId, input.sourceUserSeq, input.includeWriteReceipts !== false ? 1 : 0) as Array<{
       mutating: number; settlementIndex: number; callId: string; toolName: string; outcome: string; detail: string | null;
       callDigest: string | null;
+      sourceSettlementOrdinal: number; logicalOpenedAt: string | null; canonicalSettledAt: string | null;
     }>;
     const results: CompletionReadEvidence['results'] = [];
     const blocks: string[] = [];
@@ -626,6 +653,7 @@ export function sourceSettledReadEvidence(input: {
     let hasRetainedJsonDigest = false;
     let hasStringBindings = false;
     let hasNonStringBindings = false;
+    let chronologyShown = false;
     const incremental = input.afterSettlementIndex !== undefined;
     // Order against this source's own writes, whether or not their receipts
     // are part of this evidence scope.
@@ -663,6 +691,18 @@ export function sourceSettledReadEvidence(input: {
     if (incremental) blocks.push('Incremental trajectory evidence: new distinct results are expanded below; earlier windows and duplicate content retain authenticated handles/digests. Reference-only content is NOT included in this review. Do not infer a missing fact or an unavailable capability from omitted content, and do not certify completion from this advisory view.');
     for (const row of rows) {
       if (!incremental && input.omitSuccessfulDiscovery && row.toolName === 'tool_search' && row.outcome === 'succeeded') continue;
+      if (!chronologyShown) {
+        blocks.push(`Receipt chronology scope: session=${input.sessionId}; source=${input.sourceUserSeq}\n`
+          + 'sourceSettlementOrdinal records settlement order within this source, not dispatch or effect order; filters may omit records. '
+          + 'logicalOpenedAt/canonicalSettledAt bound a recorded logical admission-to-canonical-settlement interval, not physical effect times. '
+          + 'Overlapping intervals or unknown bounds leave effect order unknown. '
+          + 'Earlier evidence remains valid for its historical phase; it cannot verify a later write. '
+          + 'Different source/child scopes have separate ordinals.');
+        chronologyShown = true;
+      }
+      const interval = recordedLogicalCallInterval(row.logicalOpenedAt, row.canonicalSettledAt);
+      blocks.push(`Receipt timing: logicalCall=${row.callId}; sourceSettlementOrdinal=${row.sourceSettlementOrdinal}; `
+        + `logicalOpenedAt=${interval.logicalOpenedAt}; canonicalSettledAt=${interval.canonicalSettledAt}`);
       const readsRetained = toolReadsRetainedOutput(row.toolName);
       let evidenceKind: CompletionReadEvidence['results'][number]['evidenceKind'] = readsRetained
         ? 'control_diagnostic' : 'source_result';
