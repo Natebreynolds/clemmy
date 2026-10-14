@@ -2705,3 +2705,151 @@ for (const carrier of ['tool', 'resume_execution', 'resume_delivery'] as const)
       assert.equal(sourceAttemptedCompletionWork(identity), false, 'the existing legacy hint is unchanged');
       events.finishRunAttempt(attempt, 'completed');
     });
+
+test('shared settled-read guidance keeps each real call, body, digest and coverage fact', (t) => {
+  const identity = accepted('Compare the before and after observations without hiding contrary or unknown evidence.');
+  const beforeText = 'BEFORE: the controlled report is not ready. "Keep this contrary fact."\n';
+  const afterText = 'AFTER: the controlled report is ready. Preserve the earlier observation.\n';
+  const fixtures: Array<{
+    id: string; tool: string; payload: unknown; args: Record<string, unknown>;
+    mutating?: boolean; failed?: boolean; hostExecution?: boolean;
+  }> = [
+    { id: 'guidance-before', tool: 'read_file', payload: beforeText,
+      args: { path: '/controlled/before.txt', max_chars: null } },
+    { id: 'guidance-page', tool: 'fixture_record_list',
+      payload: { value: [{ id: 'controlled-record', state: 'pending' }], next_page_token: 'controlled-next' },
+      args: { scope: 'controlled-first-page' } },
+    { id: 'guidance-write', tool: 'write_file', payload: 'Controlled revision receipt; no later delivery is established.',
+      args: { path: '/controlled/report.txt', content: afterText, mode: 'create' }, mutating: true },
+    { id: 'guidance-after', tool: 'fixture_after_read', payload: afterText,
+      args: { path: '/controlled/report.txt' } },
+    { id: 'guidance-empty', tool: 'fixture_empty_list', payload: { value: [], next_page_token: null },
+      args: { scope: 'controlled-empty-range' } },
+    { id: 'guidance-control', tool: 'recall_tool_result', payload: 'CONTROL DIAGNOSTIC: no producer read is attested.',
+      args: { call_id: 'not-an-attested-producer' } },
+    { id: 'guidance-unknown', tool: 'fixture_provider_text', payload: 'Provider returned this text without an exhaustion claim.',
+      args: { scope: 'controlled-provider-range' }, hostExecution: false },
+    { id: 'guidance-failed', tool: 'fixture_failed_read', payload: { error: 'controlled argument refusal' },
+      args: { scope: 'controlled-invalid-request' }, failed: true },
+    { id: 'guidance-duplicate', tool: 'fixture_duplicate_read', payload: afterText,
+      args: { scope: 'another-controlled-query-with-identical-bytes' } },
+  ];
+  const handles = fixtures.map(fixture => retainedRead(identity, fixture.tool, fixture.payload,
+    fixture.mutating ?? false, false, fixture.failed ?? false,
+    { id: fixture.id, args: fixture.args, hostExecution: fixture.hostExecution }));
+  const foreign = accepted('This unrelated source owns different controlled evidence.');
+  const foreignHandle = retainedRead(foreign, 'read_file', 'FOREIGN_GUIDANCE_BODY_MUST_STAY_OUT');
+  const settledBefore = events.openEventLog().prepare(
+    'SELECT * FROM logical_call_settlements WHERE session_id=? AND source_user_seq=? ORDER BY rowid',
+  ).all(identity.sessionId, identity.sourceUserSeq);
+  const eventsBefore = events.listEvents(identity.sessionId).map(row => ({ id: row.id, data: row.data }));
+  events.closeEventLog();
+
+  const evidence = sourceSettledReadEvidence(identity);
+  assert.equal(evidence.evidenceAvailable, true);
+  assert.equal(evidence.count, fixtures.length);
+  assert.deepEqual(evidence.results.map(row => row.logicalToolCallId), fixtures.map(fixture => fixture.id),
+    'the settled order includes the earlier contrary state, write, later read, unknown and failed calls');
+  for (const [index, fixture] of fixtures.entries()) {
+    const row = evidence.results[index]!;
+    assert.equal(row.toolName, fixture.tool);
+    if (fixture.failed) {
+      assert.equal(row.status, 'not_succeeded');
+      assert.equal(row.resultHandleId, undefined);
+      continue;
+    }
+    assert.equal(row.status, 'verified');
+    assert.equal(row.resultHandleId, handles[index]);
+    assert.equal(row.physicalDispatchId, `dispatch:${fixture.id}`);
+    const retainedJson = JSON.stringify(fixture.payload);
+    const retainedDigest = createHash('sha256').update(retainedJson, 'utf8').digest('hex');
+    assert.equal(row.contentDigest, retainedDigest);
+    assert.equal(row.rawByteCount, Buffer.byteLength(retainedJson));
+    assert.ok(evidence.summary.includes(`retained JSON sha256=${retainedDigest}`), fixture.id);
+    const label = `${fixture.tool} [logicalCall=${fixture.id}, outcome=succeeded`;
+    const scopeAt = evidence.summary.indexOf(label);
+    assert.ok(scopeAt >= 0, `${fixture.id} retains its own request-scope label`);
+    assert.deepEqual(JSON.parse(evidence.summary.slice(scopeAt).split('\n')[1]!), fixture.args,
+      `${fixture.id} retains the exact independently admitted request arguments`);
+    if (fixture.id === 'guidance-duplicate') {
+      assert.equal(row.contentDisposition, 'duplicate_content');
+      assert.equal(row.shownByteCount, 0);
+      assert.equal(row.contentComplete, false);
+      continue;
+    }
+    const body = readResultBlock(evidence.summary, fixture.tool);
+    if (typeof fixture.payload === 'string') assert.equal(body, fixture.payload);
+    else assert.deepEqual(JSON.parse(body), fixture.payload);
+    assert.equal(row.shownByteCount, Buffer.byteLength(body));
+    assert.equal(row.contentComplete, true);
+    assert.equal(row.viewBounded, undefined);
+    assert.equal(row.presentation, typeof fixture.payload === 'string' ? 'decoded_text' : 'raw_json');
+    assert.ok(evidence.summary.includes(`Retained binding value type=${typeof fixture.payload}`), fixture.id);
+  }
+  assert.equal(evidence.results[0]!.precedesWrite, true);
+  assert.equal(evidence.results[1]!.precedesWrite, true);
+  assert.equal(evidence.results[1]!.recordCount, 1);
+  assert.equal(evidence.results[1]!.sourceExhausted, false, 'a visible page with a continuation remains partial');
+  assert.equal(evidence.results[2]!.recordCount, undefined);
+  assert.equal(evidence.results[2]!.sourceExhausted, undefined, 'a write receipt is not source coverage');
+  assert.equal(evidence.results[3]!.precedesWrite, undefined, 'the later read does not erase the earlier state');
+  assert.equal(evidence.results[4]!.recordCount, 0);
+  assert.equal(evidence.results[4]!.sourceExhausted, true);
+  assert.equal(evidence.results[5]!.evidenceKind, 'control_diagnostic');
+  assert.equal(evidence.results[5]!.sourceLogicalToolCallId, undefined);
+  assert.equal(evidence.results[5]!.sourceExhausted, undefined);
+  assert.equal(evidence.results[6]!.sourceExhausted, false, 'complete display cannot invent provider exhaustion');
+  assert.match(evidence.summary, /never repeat the write to obtain evidence/);
+  assert.match(evidence.summary, /No producer-owned retained-read receipt was verified/);
+  assert.match(evidence.summary, /not proof that retained source bytes were read/);
+  assert.match(evidence.summary, /same retained JSON bytes as guidance-after/);
+  const lookup = sourceEvidenceLookup(identity);
+  for (const [index, fixture] of fixtures.entries()) {
+    if (fixture.failed) continue;
+    assert.deepEqual(lookup.resolve(handles[index]!)?.value, fixture.payload,
+      `${fixture.id} remains independently reopenable, including a duplicate and a diagnostic`);
+  }
+  assert.equal(lookup.resolve(foreignHandle), undefined);
+  assert.doesNotMatch(evidence.summary, /FOREIGN_GUIDANCE_BODY_MUST_STAY_OUT/);
+  assert.deepEqual(events.openEventLog().prepare(
+    'SELECT * FROM logical_call_settlements WHERE session_id=? AND source_user_seq=? ORDER BY rowid',
+  ).all(identity.sessionId, identity.sourceUserSeq), settledBefore);
+  assert.deepEqual(events.listEvents(identity.sessionId).map(row => ({ id: row.id, data: row.data })), eventsBefore,
+    'summary rendering and scoped lookup cannot create a call, result, read observation or authority');
+  t.diagnostic(JSON.stringify({ kind: 'shared_settled_read_guidance_fixture_v1',
+    summaryBytes: Buffer.byteLength(evidence.summary),
+    orderedResultsSha256: createHash('sha256').update(JSON.stringify(evidence.results)).digest('hex'),
+    fixtureCalls: fixtures.length, expandedBodies: 7, foreignScopesExcluded: 1,
+    orderedBodyDigests: fixtures.filter(fixture => !fixture.failed && fixture.id !== 'guidance-duplicate')
+      .map(fixture => ({ call: fixture.id, sha256: createHash('sha256').update(
+        typeof fixture.payload === 'string' ? fixture.payload : JSON.stringify(fixture.payload), 'utf8').digest('hex') })),
+  }));
+  assert.equal((evidence.summary.match(/digest binds the JSON-encoded result, not decoded text or original-file bytes\./g) ?? []).length, 1);
+  assert.equal(evidence.summary.split('A plan binds this inner value, not a carrier envelope.').length - 1, 1);
+  assert.equal(evidence.summary.split('There is no /output or /content field; interpret or parse the string in a compute step if needed.').length - 1, 1);
+  assert.equal(evidence.summary.split('Use only observed fields or a known output contract; unknown structure can be interpreted in a compute step.').length - 1, 1);
+  assert.match(evidence.summary, /String bindings:[^]*For this string use outputPath=""/);
+  assert.match(evidence.summary, /Non-string bindings:[^]*Use only observed fields or a known output contract/);
+});
+
+test('shared settled-read guidance for a reference-only window carries digest rules without expanded binding claims', () => {
+  const identity = accepted('Keep earlier observations as references; nothing in this window has been opened.');
+  const text = 'Same controlled retained bytes, independently settled twice.\n';
+  retainedRead(identity, 'read_file', text, false, false, false, { id: 'guidance-prior-first' });
+  retainedRead(identity, 'fixture_second_read', text, false, false, false, { id: 'guidance-prior-second' });
+  const whole = sourceSettledReadEvidence(identity);
+  const evidence = sourceSettledReadEvidence({ ...identity, afterSettlementIndex: whole.throughSettlementIndex });
+  assert.deepEqual(evidence.results.map(row => row.logicalToolCallId), ['guidance-prior-first', 'guidance-prior-second']);
+  for (const [index, row] of evidence.results.entries()) {
+    assert.equal(row.contentDisposition, 'prior_review_window');
+    assert.equal(row.contentComplete, false);
+    assert.equal(row.shownByteCount, 0);
+    assert.equal(row.contentDigest, whole.results[index]!.contentDigest);
+    assert.equal(row.resultHandleId, whole.results[index]!.resultHandleId);
+    assert.equal(sourceEvidenceLookup(identity).resolve(row.resultHandleId!)?.text, text);
+  }
+  assert.doesNotMatch(evidence.summary, /Same controlled retained bytes|<<<READ RESULT DATA/);
+  assert.match(evidence.summary, /Reference-only content is NOT included in this review/);
+  assert.doesNotMatch(evidence.summary, /A plan binds this inner value|String bindings:|Non-string bindings:/);
+  assert.equal((evidence.summary.match(/digest binds the JSON-encoded result, not decoded text or original-file bytes\./g) ?? []).length, 1);
+});
