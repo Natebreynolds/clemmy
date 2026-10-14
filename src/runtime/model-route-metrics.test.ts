@@ -709,3 +709,310 @@ test('a job reads the route that served it, and a fallback lane is a stand-in by
     db.close();
   }
 });
+
+// The public reader is optional only while these regressions run RED against
+// the old producer. Positives then fail on missing actual author evidence,
+// rather than preventing all existing tests from loading for a missing export.
+import * as authorMetrics from './model-route-metrics.js';
+import { RouterModelProvider } from './harness/router-model.js';
+
+type CapturedResponseAuthor = Readonly<{ model: Model; modelId: string; provider: string; providerId?: string }>;
+function completedAuthor(response: unknown): CapturedResponseAuthor | undefined {
+  return (authorMetrics as typeof authorMetrics & {
+    getCompletedResponseAuthor?: (value: unknown) => CapturedResponseAuthor | undefined;
+  }).getCompletedResponseAuthor?.(response);
+}
+
+function authorResponse(id: string): ModelResponse {
+  return { responseId: id, id,
+    output: [{ type: 'message', role: 'assistant', status: 'completed',
+      content: [{ type: 'output_text', text: 'Controlled author fixture.' }] }],
+    usage: { inputTokens: 11, outputTokens: 3, totalTokens: 14, requests: 1,
+      inputTokensDetails: [], outputTokensDetails: [] },
+  } as unknown as ModelResponse;
+}
+
+function authorRoute(model: Model, db: Database.Database, modelId = 'author-fixture', provider: 'claude' | 'codex' | 'byo' | 'unknown' = 'claude') {
+  return withModelRouteMetrics(model, { role: 'brain', resolvedModel: modelId,
+    provider, source: 'explicit' }, db);
+}
+
+async function collectAuthorStream(model: Model, request = requestWithSentinel()) {
+  const events = [];
+  for await (const event of model.getStreamedResponse(request)) events.push(event);
+  return events;
+}
+
+test('completed response author: actual router primary failure retains the exact rescue leaf on both transports', async () => {
+  const keys = ['AUTH_MODE', 'MODEL_ROUTING_MODE', 'CLEMMY_BRAIN_FALLOVER', 'CLAUDE_MODEL',
+    'BYO_MODEL_BASE_URL', 'BYO_MODEL_ID', 'BYO_MODEL_API_KEY', 'BYO_PROVIDERS'] as const;
+  const before = new Map(keys.map(key => [key, process.env[key]]));
+  for (const key of keys) delete process.env[key];
+  Object.assign(process.env, { AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: 'off',
+    CLEMMY_BRAIN_FALLOVER: 'on', CLAUDE_MODEL: 'claude-sonnet-5' });
+  try {
+    for (const stream of [false, true]) {
+      const calls: string[] = [];
+      const response = authorResponse(`author-router-${stream}`);
+      const bytesBefore = JSON.stringify(response);
+      const rescue: Model = {
+        async getResponse() { calls.push('rescue'); return response; },
+        async *getStreamedResponse() {
+          calls.push('rescue');
+          yield { type: 'response_done', response } as never;
+        },
+      };
+      const primary: Model = {
+        async getResponse() { calls.push('primary'); throw { statusCode: 529, message: 'overloaded' }; },
+        async *getStreamedResponse() { calls.push('primary'); throw { statusCode: 529, message: 'overloaded' }; },
+      };
+      let rescueModelId: string | undefined;
+      const router = new RouterModelProvider({
+        codex: { getModel: () => primary },
+        claude: { getModel(id) { rescueModelId = id; return rescue; } },
+        resolveEffectiveProvider: () => 'codex', codexAvailable: () => true, claudeAvailable: () => true,
+      });
+      const routed = router.getModel(stream ? 'gpt-5.6-luna' : 'gpt-5.6-sol');
+      const routes: ObservedModelRoute[] = [];
+      if (stream) {
+        const events = await withModelRouteObserver(routes, () => collectAuthorStream(routed));
+        assert.equal((events.at(-1) as { response?: unknown }).response, response);
+      } else {
+        assert.equal(await withModelRouteObserver(routes, () => routed.getResponse(requestWithSentinel())), response);
+      }
+      assert.deepEqual(calls, ['primary', 'rescue']);
+      const author = completedAuthor(response);
+      assert.ok(author, 'successful original response needs private concrete-author evidence');
+      assert.equal(author.model, rescue, 'the aggregate router/fallback is not a reusable author');
+      assert.equal(author.modelId, rescueModelId);
+      assert.equal(author.provider, 'claude');
+      assert.equal(author.providerId, undefined, 'a route family cannot invent a backend registry or account identity');
+      assert.equal(Object.isFrozen(author), true);
+      assert.deepEqual(Object.keys(author).sort(), ['model', 'modelId', 'provider']);
+      assert.equal(completedAuthor({ ...response }), undefined, 'a serialized or same-ID clone has no capsule');
+      assert.equal(JSON.stringify(response), bytesBefore, 'capture never edits provider output or token quantities');
+      assert.equal(routes.length, 2, 'one failed primary and one successful rescue, with no aggregate mirror');
+      assert.equal(routes[1]?.resolvedModel, rescueModelId);
+      // Reuse the captured instance without another registry/model resolution.
+      await author.model.getResponse({ ...requestWithSentinel(), tools: [] });
+      assert.deepEqual(calls, ['primary', 'rescue', 'rescue']);
+    }
+  } finally {
+    for (const [key, value] of before) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
+
+test('completed response author: recursively instrumented nested fallback preserves the deepest winning leaf', async () => {
+  const db = metricsDb();
+  try {
+    for (const stream of [false, true]) {
+      const response = authorResponse(`author-nested-${stream}`);
+      const rescue = responseModel(response);
+      const fail: Model = {
+        async getResponse() { throw { statusCode: 529, message: 'overloaded' }; },
+        async *getStreamedResponse() { throw { statusCode: 529, message: 'overloaded' }; },
+      };
+      const nested = withModelFallback([
+        { label: `author-nested-primary-${stream}`, provider: 'claude', model: 'nested-primary', getModel: () => fail },
+        { label: `author-nested-rescue-${stream}`, provider: 'byo', model: 'nested-rescue', getModel: () => rescue },
+      ]);
+      const routed = authorRoute(withModelFallback([
+        { label: `author-outer-primary-${stream}`, provider: 'codex', model: 'outer-primary', getModel: () => fail },
+        { label: `author-outer-wrapper-${stream}`, provider: 'claude', model: 'outer-wrapper', getModel: () => nested },
+      ]), db, 'outer-primary', 'codex');
+      if (stream) await collectAuthorStream(routed); else await routed.getResponse(requestWithSentinel());
+      const author = completedAuthor(response);
+      assert.ok(author);
+      assert.equal(author.model, rescue);
+      assert.equal(author.modelId, 'nested-rescue');
+      assert.equal(author.provider, 'byo', 'outer fallback descriptor cannot replace the actual deeper winner');
+    }
+    assert.equal((db.prepare('SELECT COUNT(*) n FROM model_route_outcomes').get() as { n: number }).n, 6,
+      'two failed targets and the deepest success per request remain the entire metrics inventory');
+  } finally { db.close(); }
+});
+
+test('completed response author: streamed response is unavailable until the original successful drain finishes', async () => {
+  const db = metricsDb();
+  try {
+    const response = authorResponse('author-drain-boundary');
+    let release!: () => void;
+    const finished = new Promise<void>(resolve => { release = resolve; });
+    const leaf: Model = {
+      async getResponse() { return response; },
+      async *getStreamedResponse() { yield { type: 'response_done', response } as never; await finished; },
+    };
+    const iterator = authorRoute(leaf, db).getStreamedResponse(requestWithSentinel())[Symbol.asyncIterator]();
+    assert.equal((await iterator.next()).done, false);
+    assert.equal(completedAuthor(response), undefined, 'response_done alone does not settle the stream');
+    const drain = iterator.next();
+    release();
+    assert.equal((await drain).done, true);
+    assert.equal(completedAuthor(response)?.model, leaf);
+  } finally { db.close(); }
+});
+
+test('completed response author: interrupted, failed, aborted and contradictory streams never certify a leaf', async () => {
+  const db = metricsDb();
+  try {
+    for (const mode of ['return', 'throw', 'abort', 'contradictory'] as const) {
+      const response = authorResponse(`author-incomplete-${mode}`);
+      const other = authorResponse(`author-other-${mode}`);
+      const controller = new AbortController();
+      const leaf: Model = {
+        async getResponse() { return response; },
+        async *getStreamedResponse() {
+          yield { type: 'response_done', response } as never;
+          if (mode === 'throw') throw new Error('controlled failure after done');
+          if (mode === 'abort') controller.abort();
+          if (mode === 'contradictory') yield { type: 'response_done', response: other } as never;
+        },
+      };
+      const request = { ...requestWithSentinel(), signal: controller.signal };
+      const iterator = authorRoute(leaf, db).getStreamedResponse(request)[Symbol.asyncIterator]();
+      await iterator.next();
+      if (mode === 'return') await iterator.return?.(undefined);
+      else if (mode === 'throw') await assert.rejects(iterator.next(), /controlled failure after done/);
+      else { while (!(await iterator.next()).done) { /* drain exact original stream */ } }
+      assert.equal(completedAuthor(response), undefined, `${mode} cannot certify a completed author`);
+      assert.equal(completedAuthor(other), undefined);
+    }
+  } finally { db.close(); }
+});
+
+test('completed response author: buffered failure or abort and unknown route do not fabricate author proof', async () => {
+  const db = metricsDb();
+  try {
+    for (const mode of ['throw', 'abort', 'reported_failure', 'unknown'] as const) {
+      const response = authorResponse(`author-buffered-${mode}`);
+      if (mode === 'reported_failure') (response as unknown as { providerData: unknown }).providerData = { status: 'failed' };
+      const controller = new AbortController();
+      const leaf: Model = {
+        async getResponse() {
+          if (mode === 'throw') throw new Error('controlled buffered failure');
+          if (mode === 'abort') controller.abort();
+          return response;
+        },
+        async *getStreamedResponse() { throw new Error('unused'); },
+      };
+      const routed = authorRoute(leaf, db, 'author-buffered', mode === 'unknown' ? 'unknown' : 'claude');
+      const call = routed.getResponse({ ...requestWithSentinel(), signal: controller.signal });
+      if (mode === 'throw') await assert.rejects(call, /controlled buffered failure/); else assert.equal(await call, response);
+      assert.equal(completedAuthor(response), undefined);
+    }
+    assert.equal(completedAuthor(authorResponse('unregistered-custom-response')), undefined);
+    assert.equal(completedAuthor({ model: responseModel(authorResponse('forged')), modelId: 'forged', provider: 'claude' }), undefined);
+  } finally { db.close(); }
+});
+
+test('completed response author: reusing an original response across different concrete leaves makes identity ambiguous', async () => {
+  const db = metricsDb();
+  try {
+    const response = authorResponse('author-reused-original');
+    const first = responseModel(response);
+    const second = responseModel(response);
+    await authorRoute(first, db, 'first-author').getResponse(requestWithSentinel());
+    assert.equal(completedAuthor(response)?.model, first);
+    await authorRoute(second, db, 'second-author').getResponse(requestWithSentinel());
+    assert.equal(completedAuthor(response), undefined, 'later ownership cannot overwrite the first physical producer');
+    await authorRoute(first, db, 'first-author').getResponse(requestWithSentinel());
+    assert.equal(completedAuthor(response), undefined, 'an ambiguous object stays unavailable');
+  } finally { db.close(); }
+});
+
+test('completed response author: a Proxy leaf is not inspected for new diagnostic prototype hooks', async () => {
+  const db = metricsDb();
+  try {
+    const response = authorResponse('author-proxy-leaf');
+    let prototypeReads = 0;
+    const proxy = new Proxy(responseModel(response), {
+      getPrototypeOf(target) { prototypeReads += 1; return Reflect.getPrototypeOf(target); },
+    });
+    const routed = authorRoute(proxy, db);
+    const existingConstructionReads = prototypeReads;
+    assert.equal(await routed.getResponse(requestWithSentinel()), response);
+    assert.equal(prototypeReads, existingConstructionReads,
+      'proof-only capture cannot add getPrototypeOf work to a custom model');
+    assert.equal(completedAuthor(response), undefined);
+  } finally { db.close(); }
+});
+
+test('completed response author: incomplete fallback identity remains display metadata and never concrete-author evidence', async () => {
+  const db = metricsDb();
+  try {
+    for (const missing of ['provider', 'model'] as const) for (const stream of [false, true]) {
+      const response = authorResponse(`author-unknown-target-${missing}-${stream}`);
+      const leaf = responseModel(response);
+      const fail: Model = {
+        async getResponse() { throw { statusCode: 529, message: 'overloaded' }; },
+        async *getStreamedResponse() { throw { statusCode: 529, message: 'overloaded' }; },
+      };
+      const routes: ObservedModelRoute[] = [];
+      const label = `author-display-only-${missing}-${stream}`;
+      const routed = authorRoute(withModelFallback([
+        { label: `author-explicit-primary-${missing}-${stream}`, provider: 'codex', model: 'explicit-primary', getModel: () => fail },
+        { label, ...(missing !== 'provider' ? { provider: 'byo' } : {}),
+          ...(missing !== 'model' ? { model: 'declared-model' } : {}), getModel: () => leaf },
+      ]), db, 'explicit-primary', 'codex');
+      if (stream) await withModelRouteObserver(routes, () => collectAuthorStream(routed));
+      else assert.equal(await withModelRouteObserver(routes, () => routed.getResponse(requestWithSentinel())), response);
+      assert.equal(routes.length, 2);
+      assert.equal(routes[1]?.resolvedModel, missing === 'model' ? label : 'declared-model');
+      assert.equal(routes[1]?.provider, missing === 'provider' ? 'codex' : 'byo',
+        'legacy metrics retain their parent-provider/display-label compatibility');
+      assert.equal(completedAuthor(response), undefined, `${missing} is not proved by inherited metrics fields`);
+    }
+  } finally { db.close(); }
+});
+
+test('completed response author: an opaque internal fallback without a captured deeper leaf cannot certify the outer model', async () => {
+  const db = metricsDb();
+  try {
+    for (const stream of [false, true]) {
+      const response = authorResponse(`author-opaque-fallback-${stream}`);
+      const fail: Model = {
+        async getResponse() { throw { statusCode: 529, message: 'overloaded' }; },
+        async *getStreamedResponse() { throw { statusCode: 529, message: 'overloaded' }; },
+      };
+      const internal = withModelFallback([
+        { label: `author-opaque-primary-${stream}`, provider: 'claude', model: 'opaque-primary', getModel: () => fail },
+        { label: `author-opaque-rescue-${stream}`, provider: 'byo', model: 'opaque-rescue', getModel: () => responseModel(response) },
+      ]);
+      const opaque: Model = { getResponse: request => internal.getResponse(request),
+        getStreamedResponse: request => internal.getStreamedResponse(request) };
+      const routed = authorRoute(opaque, db, 'opaque-primary', 'claude');
+      if (stream) await collectAuthorStream(routed); else assert.equal(await routed.getResponse(requestWithSentinel()), response);
+      assert.equal(completedAuthor(response), undefined,
+        'actual rescue strings cannot turn the outer rerouting object into an exact concrete author');
+    }
+  } finally { db.close(); }
+});
+
+for (const stream of [false, true]) test(`completed response author: opaque first-target success is not a concrete leaf (${stream ? 'stream' : 'buffered'})`, async () => {
+  const db = metricsDb();
+  try {
+    const response = authorResponse(`author-opaque-primary-success-${stream}`);
+    let primaryCalls = 0;
+    let rescueConstructions = 0;
+    const primary: Model = {
+      async getResponse() { primaryCalls += 1; return response; },
+      async *getStreamedResponse() { primaryCalls += 1; yield { type: 'response_done', response } as never; },
+    };
+    const internal = withModelFallback([
+      { label: `author-opaque-matching-${stream}`, provider: 'claude', model: 'opaque-matching-model', getModel: () => primary },
+      { label: `author-opaque-unreached-${stream}`, provider: 'codex', model: 'unreached-rescue', getModel: () => {
+        rescueConstructions += 1; throw new Error('unreached rescue must remain lazy');
+      } },
+    ]);
+    const opaque: Model = { getResponse: request => internal.getResponse(request),
+      getStreamedResponse: request => internal.getStreamedResponse(request) };
+    const routed = authorRoute(opaque, db, 'opaque-matching-model', 'claude');
+    if (stream) await collectAuthorStream(routed); else assert.equal(await routed.getResponse(requestWithSentinel()), response);
+    assert.equal(primaryCalls, 1);
+    assert.equal(rescueConstructions, 0);
+    assert.equal(completedAuthor(response), undefined,
+      'matching first-target labels do not prove the opaque graph is a reusable non-rerouting leaf');
+  } finally { db.close(); }
+});

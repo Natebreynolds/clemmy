@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
+import { types as utilTypes } from 'node:util';
 import { estimateTokens } from './harness/budget.js';
 import { providerReportedModel } from './harness/traceless-step-model.js';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
@@ -586,6 +587,120 @@ export function readRouteStandIn(routes: readonly ObservedModelRoute[]): {
   return null;
 }
 
+/** A private original-response capability, not serialized route/account proof.
+ * The model is the concrete reached instance, never a newly resolved role or
+ * the aggregate fallback graph. Its transport may refresh its own credentials;
+ * that does not certify a billed account or a future provider-reported model. */
+export interface CompletedResponseAuthor {
+  readonly model: Model;
+  readonly modelId: string;
+  readonly provider: string;
+  readonly providerId?: string;
+}
+
+const completedResponseAuthors = new WeakMap<object, { author: Readonly<CompletedResponseAuthor>; scope: object }>();
+const ambiguousResponseAuthors = new WeakSet<object>();
+const pendingAuthorDrains = new WeakMap<object, Set<object>>();
+const authorIneligibleContexts = new WeakSet<object>();
+// Observation only. This never restores harness, model-selection, tool, lease
+// or usage authority; it distinguishes a deeper result of THIS call from an
+// old capsule on a response object that a different call happens to reuse.
+const responseAuthorScope = new AsyncLocalStorage<object>();
+
+export function getCompletedResponseAuthor(response: unknown): Readonly<CompletedResponseAuthor> | undefined {
+  if (!response || typeof response !== 'object' || ambiguousResponseAuthors.has(response)
+    || pendingAuthorDrains.get(response)?.size) return undefined;
+  return completedResponseAuthors.get(response)?.author;
+}
+
+const UNREADABLE_AUTHOR_FIELD = Symbol('unreadable_author_field');
+const authorAbortGetter = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')?.get;
+function inertAuthorField(value: unknown, key: string): unknown {
+  if (!value || typeof value !== 'object' || utilTypes.isProxy(value)) return UNREADABLE_AUTHOR_FIELD;
+  const field = Object.getOwnPropertyDescriptor(value, key);
+  return field === undefined ? undefined : 'value' in field ? field.value : UNREADABLE_AUTHOR_FIELD;
+}
+
+function authorIdentity(context: ModelRouteMetricsContext): { modelId: string; provider: string } | undefined {
+  try {
+    if (authorIneligibleContexts.has(context)) return undefined;
+    const modelId = inertAuthorField(context, 'resolvedModel');
+    const provider = inertAuthorField(context, 'provider');
+    return typeof modelId === 'string' && modelId.trim() === modelId && modelId.length > 0
+      && typeof provider === 'string' && ['codex', 'claude', 'byo', 'openai'].includes(provider)
+      ? { modelId, provider } : undefined;
+  } catch { return undefined; }
+}
+
+function authorResponseObject(response: unknown): object | undefined {
+  return response && typeof response === 'object' && !Array.isArray(response) && !utilTypes.isProxy(response)
+    ? response : undefined;
+}
+
+function failedAuthorResponse(response: object): boolean {
+  // Inspect only inert lifecycle fields, never invoke optional metadata hooks.
+  for (const value of [response, inertAuthorField(response, 'providerData')]) {
+    if (value === undefined) continue;
+    if (value === UNREADABLE_AUTHOR_FIELD) return true;
+    const status = inertAuthorField(value, 'status');
+    if (status === UNREADABLE_AUTHOR_FIELD || (typeof status === 'string'
+      && ['failed', 'error', 'cancelled', 'canceled', 'aborted', 'incomplete', 'in_progress', 'queued'].includes(status))) return true;
+  }
+  return false;
+}
+
+function authorRequestAborted(request: ModelRequest): boolean {
+  try {
+    const signal = inertAuthorField(request, 'signal');
+    if (signal === undefined) return false;
+    return !signal || typeof signal !== 'object' || utilTypes.isProxy(signal) || !authorAbortGetter
+      || Reflect.apply(authorAbortGetter, signal, []) !== false;
+  } catch { return true; /* unknown cancellation cannot mint a capability */ }
+}
+
+function invalidateResponseAuthor(response: object): void {
+  completedResponseAuthors.delete(response);
+  ambiguousResponseAuthors.add(response);
+}
+
+function retainResponseAuthor(response: unknown, model: Model,
+  identity: ReturnType<typeof authorIdentity>, scope: object,
+  resolution: FallbackRouteResolution | undefined, aborted: boolean): void {
+  try {
+    const original = authorResponseObject(response);
+    if (!original || ambiguousResponseAuthors.has(original)) return;
+    if (aborted || failedAuthorResponse(original)) { invalidateResponseAuthor(original); return; }
+    if (utilTypes.isProxy(model)) { invalidateResponseAuthor(original); return; }
+    const prior = completedResponseAuthors.get(original);
+    const actualModel = resolution && inertAuthorField(resolution, 'model');
+    const actualProvider = resolution && inertAuthorField(resolution, 'provider');
+    const fellOver = resolution && inertAuthorField(resolution, 'fellOver');
+    const unreadableResolution = actualModel === UNREADABLE_AUTHOR_FIELD
+      || actualProvider === UNREADABLE_AUTHOR_FIELD || fellOver === UNREADABLE_AUTHOR_FIELD;
+    if (prior?.scope === scope && prior.author.model !== model) {
+      // Known nested instrumentation is stronger than an outer descriptor.
+      // Opaque rerouting needs its actual deeper capture, not a guessed rebuild.
+      const matchesResolution = !unreadableResolution && resolution
+        && (actualModel === undefined || actualModel === prior.author.modelId)
+        && (actualProvider === undefined || actualProvider === prior.author.provider);
+      if (model instanceof ModelRouteMetricsModel || matchesResolution) return;
+      invalidateResponseAuthor(original);
+      return;
+    }
+    // Even a matching, first-target success belongs to a graph that may reroute
+    // on the next request. Only the same-call deeper capture above can resolve
+    // that graph to a concrete reusable instance.
+    if (!identity || model instanceof ModelRouteMetricsModel || model instanceof FallbackModel
+      || unreadableResolution || resolution !== undefined) {
+      invalidateResponseAuthor(original);
+      return;
+    }
+    if (prior && (prior.author.model !== model || prior.author.modelId !== identity.modelId
+      || prior.author.provider !== identity.provider)) { invalidateResponseAuthor(original); return; }
+    completedResponseAuthors.set(original, { author: Object.freeze({ model, ...identity }), scope });
+  } catch { /* missing author evidence never changes model behavior */ }
+}
+
 export function withModelRouteMetrics(
   model: Model,
   context: ModelRouteMetricsContext,
@@ -613,17 +728,31 @@ function instrumentFallbackTarget(
 ): FallbackTarget {
   return {
     ...target,
-    getModel: () => withModelRouteMetrics(target.getModel(), {
-      ...context,
-      resolvedModel: target.model ?? target.label,
-      provider: modelRouteProvider(target.provider) ?? context.provider,
-      source: index === 0 ? context.source : 'fallback',
-      reason: {
-        ...(context.reason ?? {}),
-        routeTargetIndex: index,
-        initialResolvedModel: context.resolvedModel,
-      },
-    }, db),
+    getModel: () => {
+      const reachedModel = target.getModel();
+      const reachedContext: ModelRouteMetricsContext = {
+        ...context,
+        resolvedModel: target.model ?? target.label,
+        provider: modelRouteProvider(target.provider) ?? context.provider,
+        source: index === 0 ? context.source : 'fallback',
+        reason: {
+          ...(context.reason ?? {}),
+          routeTargetIndex: index,
+          initialResolvedModel: context.resolvedModel,
+        },
+      };
+      // The legacy display/metrics fallback above remains unchanged. Neither
+      // a human label nor the parent provider proves an unknown target's author.
+      try {
+        const explicitModel = inertAuthorField(target, 'model');
+        const explicitProvider = inertAuthorField(target, 'provider');
+        if (typeof explicitModel !== 'string' || !explicitModel.trim() || explicitModel.trim() !== explicitModel
+          || typeof explicitProvider !== 'string' || !['codex', 'claude', 'byo', 'openai'].includes(explicitProvider)) {
+          authorIneligibleContexts.add(reachedContext);
+        }
+      } catch { authorIneligibleContexts.add(reachedContext); }
+      return withModelRouteMetrics(reachedModel, reachedContext, db);
+    },
   };
 }
 
@@ -736,8 +865,11 @@ class ModelRouteMetricsModel implements Model {
     const usageContext = routeAttributionContext(this.context.role, request);
     const promptCacheRequest = observePromptCacheRequest(request);
     const decisionId = this.startCall('getResponse', promptCacheRequest);
+    const identity = authorIdentity(this.context);
+    const authorScope = responseAuthorScope.getStore() ?? {};
     try {
-      const response = await this.inRouteRole(usageContext, () => this.inner.getResponse(request));
+      const response = await responseAuthorScope.run(authorScope,
+        () => this.inRouteRole(usageContext, () => this.inner.getResponse(request)));
       const usage = modelRouteUsageFromResponse(response);
       const resolution = fallbackRouteResolution(response);
       const providerResponseIdDigest = completedProviderResponseIdDigest(response, 'responseId');
@@ -754,6 +886,7 @@ class ModelRouteMetricsModel implements Model {
         undefined,
         outcome.falloverToModel,
       );
+      retainResponseAuthor(response, this.inner, identity, authorScope, resolution, authorRequestAborted(request));
       return response;
     } catch (err) {
       this.finishCall(decisionId, 'failed', startedAt, {}, {
@@ -768,6 +901,12 @@ class ModelRouteMetricsModel implements Model {
     const usageContext = routeAttributionContext(this.context.role, request);
     const promptCacheRequest = observePromptCacheRequest(request);
     const decisionId = this.startCall('getStreamedResponse', promptCacheRequest);
+    const identity = authorIdentity(this.context);
+    const authorScope = responseAuthorScope.getStore() ?? {};
+    const drain = {};
+    const authorResponses = new Set<object>();
+    let authorCompletionCount = 0;
+    let authorResponse: object | undefined;
     let usage: ModelRouteCallUsage = {};
     let completed = false;
     let responseCompleted = false;
@@ -778,16 +917,29 @@ class ModelRouteMetricsModel implements Model {
     try {
       // Each pull of the inner stream runs inside the route's attribution scope,
       // so the wire's usage row (written when the stream settles) carries the role.
-      const innerStream = this.inRouteRole(usageContext, () => this.inner.getStreamedResponse(request));
+      const innerStream = responseAuthorScope.run(authorScope,
+        () => this.inRouteRole(usageContext, () => this.inner.getStreamedResponse(request)));
       const iterator = innerStream[Symbol.asyncIterator]();
       const scoped: AsyncIterable<StreamEvent> = {
         [Symbol.asyncIterator]: () => ({
-          next: () => this.inRouteRole(usageContext, () => iterator.next()),
-          return: (value?: unknown) => this.inRouteRole(usageContext, () => iterator.return?.(value) ?? Promise.resolve({ done: true as const, value: undefined })),
-          throw: (error?: unknown) => this.inRouteRole(usageContext, () => iterator.throw?.(error) ?? Promise.reject(error)),
+          next: () => responseAuthorScope.run(authorScope, () => this.inRouteRole(usageContext, () => iterator.next())),
+          return: (value?: unknown) => responseAuthorScope.run(authorScope, () => this.inRouteRole(usageContext, () => iterator.return?.(value) ?? Promise.resolve({ done: true as const, value: undefined }))),
+          throw: (error?: unknown) => responseAuthorScope.run(authorScope, () => this.inRouteRole(usageContext, () => iterator.throw?.(error) ?? Promise.reject(error))),
         }),
       };
       for await (const event of scoped) {
+        // The nested response_done object is the one codexOneStep receives.
+        // Its arrival alone is not successful drain, even if usage is present.
+        if (inertAuthorField(event, 'type') === 'response_done') {
+          authorCompletionCount += 1;
+          authorResponse = authorResponseObject(inertAuthorField(event, 'response'));
+          if (authorResponse) {
+            authorResponses.add(authorResponse);
+            const pending = pendingAuthorDrains.get(authorResponse) ?? new Set<object>();
+            pending.add(drain);
+            pendingAuthorDrains.set(authorResponse, pending);
+          }
+        }
         servedModel = providerReportedModel(event) ?? servedModel;
         const doneUsage = usageFromStreamEvent(event);
         if (doneUsage) {
@@ -812,6 +964,9 @@ class ModelRouteMetricsModel implements Model {
         undefined,
         outcome.falloverToModel,
       );
+      if (authorCompletionCount === 1 && authorResponse) {
+        retainResponseAuthor(authorResponse, this.inner, identity, authorScope, resolution, authorRequestAborted(request));
+      }
     } catch (err) {
       failed = true;
       this.finishCall(decisionId, 'failed', startedAt, usage, {
@@ -820,6 +975,12 @@ class ModelRouteMetricsModel implements Model {
       }, errorClass(err));
       throw err;
     } finally {
+      for (const response of authorResponses) {
+        if (!completed || failed || authorCompletionCount !== 1 || authorRequestAborted(request)) invalidateResponseAuthor(response);
+        const pending = pendingAuthorDrains.get(response);
+        pending?.delete(drain);
+        if (pending?.size === 0) pendingAuthorDrains.delete(response);
+      }
       if (!completed && !failed) {
         this.finishCall(decisionId, 'cancelled', startedAt, usage, { path: 'getStreamedResponse',
           ...(providerResponseIdDigest ? { providerResponseIdDigest } : {}) });
