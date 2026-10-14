@@ -19,6 +19,11 @@
  * updater records disappear. That mode still requires all signed-reference,
  * ordered receipt and complete current updater-inventory proofs; an empty
  * staging directory alone never grants repeat installation authority.
+ * A lost historical receipt has no legacy fallback. Explicit present-state
+ * recovery instead needs --current-state-recovery <capture>, its SHA256,
+ * --recovery-evidence-directory <external durable directory>, and the same
+ * pre-quit shell snapshot. Future receipts descended from that admission also
+ * require --authorized-recovery-genesis and its SHA256; never invent history.
  *
  *   node --import tsx scripts/hotpatch-installed-tree.mjs [--no-relaunch] [--guarded-shell-snapshot <file>]
  */
@@ -31,6 +36,10 @@ import {
   isUpdaterHelperRunning,
   resolveInstalledAppBundle,
   verifyGuardedSealedPatch,
+  verifyCurrentStateRecoveryPatch,
+  initializeCurrentStateRecoveryArtifacts,
+  writeCurrentStateRecoveryReceipt,
+  recordCurrentStateRecoveryFailure,
 } from './hotpatch-daemon.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -46,18 +55,26 @@ if (SNAPSHOT_FLAG >= 0 && (!SHELL_SNAPSHOT || SHELL_SNAPSHOT.startsWith('--'))) 
 if (process.argv.filter(arg => arg === '--guarded-shell-snapshot').length > 1) throw new Error('Duplicate --guarded-shell-snapshot.');
 const repeatFlags = { referenceBundle: '--signed-reference-bundle', authorizedReceipt: '--authorized-prior-receipt', authorizedReceiptSha256: '--authorized-prior-receipt-sha256', expectedPriorFingerprint: '--expected-prior-fingerprint', expectedReferenceCdHash: '--expected-reference-cdhash' };
 const ancestorFlags = { authorizedAncestorManifest: '--authorized-ancestor-manifest', authorizedAncestorManifestSha256: '--authorized-ancestor-manifest-sha256' };
+const genesisFlags = { authorizedRecoveryGenesis: '--authorized-recovery-genesis', authorizedRecoveryGenesisSha256: '--authorized-recovery-genesis-sha256' };
+const recoveryFlags = { path: '--current-state-recovery', sha256: '--current-state-recovery-sha256', directory: '--recovery-evidence-directory' };
 const repeatedReference = {};
-for (const [key, flag] of Object.entries({ ...repeatFlags, ...ancestorFlags })) {
+const recovery = {};
+for (const [key, flag] of Object.entries({ ...repeatFlags, ...ancestorFlags, ...genesisFlags, ...recoveryFlags })) {
   const positions = process.argv.flatMap((arg, index) => arg === flag ? [index] : []);
   if (positions.length > 1) throw new Error(`Duplicate ${flag}.`);
   if (!positions.length) continue;
   const value = process.argv[positions[0] + 1];
   if (!value || value.startsWith('--')) throw new Error(`${flag} requires an exact value.`);
-  repeatedReference[key] = value;
+  (key in recoveryFlags ? recovery : repeatedReference)[key] = value;
 }
 if (Object.keys(repeatedReference).length && (!SHELL_SNAPSHOT || Object.keys(repeatFlags).some(key => repeatedReference[key] === undefined))) throw new Error('Repeat installation requires the shell snapshot and all five exact reference/receipt pins.');
 if (Object.keys(ancestorFlags).some(key => repeatedReference[key] !== undefined) && Object.keys(ancestorFlags).some(key => repeatedReference[key] === undefined)) throw new Error('Ancestor manifest requires both the exact path and SHA256 pin.');
-const valuedFlags = new Set(['--guarded-shell-snapshot', ...Object.values(repeatFlags), ...Object.values(ancestorFlags)]);
+if (Object.keys(genesisFlags).some(key => repeatedReference[key] !== undefined) && Object.keys(genesisFlags).some(key => repeatedReference[key] === undefined)) throw new Error('Recovery genesis requires both the exact path and SHA256 pin.');
+const currentRecovery = recovery.path !== undefined || recovery.sha256 !== undefined;
+if (currentRecovery && (!SHELL_SNAPSHOT || !recovery.path || !recovery.sha256 || !recovery.directory || Object.keys(repeatedReference).length)) throw new Error('Current-state recovery requires its exact capture pins, shell snapshot and durable evidence directory, and cannot use prior-receipt authority.');
+if (repeatedReference.authorizedRecoveryGenesis && !recovery.directory) throw new Error('A recovery-derived repeat requires a durable evidence directory.');
+if (recovery.directory && !currentRecovery && !repeatedReference.authorizedRecoveryGenesis) throw new Error('Recovery evidence directory requires explicit recovery authority.');
+const valuedFlags = new Set(['--guarded-shell-snapshot', ...Object.values(repeatFlags), ...Object.values(ancestorFlags), ...Object.values(genesisFlags), ...Object.values(recoveryFlags)]);
 for (let index = 2; index < process.argv.length; index += 1) {
   const arg = process.argv[index];
   if (arg === '--no-relaunch') continue;
@@ -118,8 +135,13 @@ else if (running()) {
   process.exit(1);
 }
 const snapshot = SHELL_SNAPSHOT ? JSON.parse(fs.readFileSync(SHELL_SNAPSHOT, 'utf8')) : null;
+if (currentRecovery && snapshot.noActiveUpdateEvidence) throw new Error('Current-state recovery cannot use no-active-update admission.');
 let guarded;
-const proveGuard = () => verifyGuardedSealedPatch({
+const proveGuard = () => currentRecovery ? verifyCurrentStateRecoveryPatch({
+  app: APP, home, evidence: { path: recovery.path, sha256: recovery.sha256 },
+  shellSnapshot: snapshot.shellSnapshot, appliedUpdateEvidence: snapshot.appliedUpdateEvidence,
+  priorProof: guarded, isRunning: running, isUpdaterRunning: () => isUpdaterHelperRunning(execFileSync),
+}) : verifyGuardedSealedPatch({
   app: APP, home,
   shellSnapshot: snapshot.shellSnapshot ?? snapshot,
   appliedUpdateEvidence: snapshot.appliedUpdateEvidence,
@@ -130,6 +152,7 @@ const proveGuard = () => verifyGuardedSealedPatch({
   isUpdaterRunning: () => isUpdaterHelperRunning(execFileSync),
 });
 guarded = SHELL_SNAPSHOT ? proveGuard() : undefined;
+if (recovery.directory) initializeCurrentStateRecoveryArtifacts({ guarded, directory: recovery.directory, forbiddenRoots: [REPO] });
 
 const IDLE_REQUIRED_SECONDS = 90;
 
@@ -162,6 +185,7 @@ console.log(`target ${APP} (was ${installed.version})\n`);
 const { stamp } = inspectDaemonBuild(path.join(REPO, 'dist'));
 const report = { patchedAt: new Date().toISOString(), bundle: APP, wasVersion: installed.version, sourceFingerprint: stamp.sourceFingerprint, gitSha: stamp.gitSha, parts: {} };
 
+try {
 // 1. The daemon itself.
 const daemon = installDaemonPatch({
   sourceDist: path.join(REPO, 'dist'),
@@ -188,6 +212,7 @@ for (const [name, sourceDir, targetDir] of trees) {
   if (!match) {
     console.error(`\nServed ${name} bytes do not match the candidate. Stopping before relaunch.`);
     fs.writeFileSync(path.join(REPO, 'output/ui-hotpatch-receipt.json'), JSON.stringify(report, null, 2) + '\n');
+    if (recovery.directory) throw new Error('Recovery asset bytes do not match; no completed recovery receipt was written.');
     process.exit(2);
   }
 }
@@ -216,9 +241,21 @@ if (Object.values(report.parts).some(part => !part.match)) {
 }
 
 fs.mkdirSync(path.join(REPO, 'output'), { recursive: true });
+if (recovery.directory) {
+  const completed = writeCurrentStateRecoveryReceipt({ guarded, report });
+  Object.assign(report, completed.receipt);
+  console.log(`durable recovery receipt: ${completed.pin.path}`);
+}
 fs.writeFileSync(path.join(REPO, 'output/ui-hotpatch-receipt.json'), JSON.stringify(report, null, 2) + '\n');
 console.log(`\nsource fingerprint ${stamp.sourceFingerprint}`);
 console.log('receipt: output/ui-hotpatch-receipt.json');
+} catch (error) {
+  if (recovery.directory) {
+    try { recordCurrentStateRecoveryFailure({ guarded }); }
+    catch { console.error('Could not persist the incomplete recovery observation; existing genesis and root observations are retained.'); }
+  }
+  throw error;
+}
 
 if (RELAUNCH) {
   execFileSync('open', ['-a', APP]);
