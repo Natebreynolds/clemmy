@@ -849,6 +849,11 @@ const WorkflowReadParallelSubgraphSchema = z.object({
   + 'Specialists cannot write, send, call external tools, nest fan-out, or request approval; put data-fetch and effect nodes elsewhere in the workflow graph.',
 );
 
+const WORKFLOW_TRANSFORM_INPUT_GUIDANCE =
+  'Runtime inputs containing rows use JSON strings: apply jsonParse before row/array operations. '
+  + 'select.where is one object with column, op and optional value; where.value is a literal string, not an expression. '
+  + 'aggregate.groupBy requires 1–32 field names. ';
+
 const STEP_INPUT_CONTRACT_DESC =
   'Argument bindings keyed by argument name; see each binding for source syntax. '
   + 'Declare inputs and output on mechanical single-tool steps to allow compilation to direct calls. '
@@ -1085,7 +1090,9 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_create',
-    "Create a reusable workflow from the step graph you author. Saved goals apply to EVERY future run: express correctness against current inputs, not today's example answer. Verify example-specific expected values after the current run. "
+    'Create a reusable workflow from the step graph you author. '
+      + WORKFLOW_TRANSFORM_INPUT_GUIDANCE
+      + "Saved goals apply to EVERY future run: express correctness against current inputs, not today's example answer. Verify example-specific expected values after the current run. "
       + "For absolute-path file work, omit project unless the user selected a verified configured workspace. A file's parent directory is not a project binding. "
       + "Choose the executor for each job: exact known tool/arguments use `call`; parsing, filtering, counts, sums and data shaping use `transform`; use a model prompt for reasoning that those executors cannot express. An operation this turn already proved or discovered (its id and args are in the PROVEN OPERATION note or the tool_search result) IS known: author it as `call` with that exact operation id, literal args and time tokens ({{now}}, {{now+24h}}, {{date}}), not as a prompt step that re-describes the read; the host binds the account. Do not turn deterministic arithmetic into a model step. Transforms are closed v1 JSON expressions; their schema lists the operations. Raw script runners are legacy and refused. "
       + "Keep meaningful steps and declare sideEffect (read/write/send), dependsOn for required upstream data, and output contracts for downstream consumers. `inputs` binds tool arguments from input.<key> or steps.<id>.output.<path>. Upstream outputs also arrive in STEP CONTEXT. Independent branches can run concurrently; forEach handles collections. Heavy read-only analysis can use subgraph read_parallel_v1 with 2–6 result-only specialists; keep fetches and effects separate. "
@@ -1108,7 +1115,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         forEach: z.string().optional().describe('Array source (upstream output, input.<key>, or JSON array text). Runs per item; returns [{itemKey,output}]. Object/scalar contracts check items; array contracts check aggregate.'),
         forEachNewOnly: z.boolean().optional().describe('With forEach, skip items completed in prior runs using stable item.id/key/slug. Failed items retry next run.'),
         subgraph: WorkflowReadParallelSubgraphSchema.optional(),
-        transform: z.string().optional().describe('PURE REVIEWED TRANSFORM as exact JSON text: {"version":1,"expression":<expr>}. Closed expr ops: literal(value), get(from input.<key> | steps.<id>.output[.<path>] | item[.<path>] inside map), jsonParse(value), jsonStringify(value), object(fields:[{key,value}]), array(items), count(value), map(value,each), sort(value,by:[{column,direction:"asc"|"desc"}]), unique(value,keys:[column]), select(value,where?,columns?,limit?), aggregate(value,groupBy:[column],metrics:[{fn:"count"|"sum"|"avg"|"min"|"max",column?}]). Metrics use fn, not op; count needs no column. Output keys are count or <fn>_<column> (for example sum_amount); rename with object/map if needed. No code, shell, network, files, tools, or ambient clock. Declare sideEffect:"read" and dependsOn for every referenced upstream step.'),
+        transform: z.string().optional().describe('PURE REVIEWED TRANSFORM as exact JSON text: {"version":1,"expression":<expr>}. ' + WORKFLOW_TRANSFORM_INPUT_GUIDANCE + 'Closed expr ops: literal(value), get(from input.<key> | steps.<id>.output[.<path>] | item[.<path>] inside map), jsonParse(value), jsonStringify(value), object(fields:[{key,value}]), array(items), count(value), map(value,each), sort(value,by:[{column,direction:"asc"|"desc"}]), unique(value,keys:[column]), select(value,where?,columns?,limit?), aggregate(value,groupBy:[column],metrics:[{fn:"count"|"sum"|"avg"|"min"|"max",column?}]). Metrics use fn, not op; count needs no column. Output keys are count or <fn>_<column> (for example sum_amount); rename with object/map if needed. No code, shell, network, files, tools, or ambient clock. Declare sideEffect:"read" and dependsOn for every referenced upstream step.'),
         call: z.object({
           tool: z.string().min(1).describe('Exact discovered tool name (e.g. read_file) or the exact provider operation id this turn proved or discovered (the UPPER_SNAKE id from the PROVEN OPERATION note or the tool_search result); never a cap:… capabilityRef.'),
           args_json: z.string().optional().describe('Preferred JSON-object text; preserves nested types. Omit args. Templates resolve at run time: {{input.x}}, {{steps.<id>.output[.path]}}, {{now}}, {{now+24h}}, {{now-2h}}, {{date}}, {{date+1d}} — a relative window such as "the next 24 hours" is {{now}}..{{now+24h}}.'),
@@ -1906,7 +1913,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         forEach: z.string().optional().describe('Array source (upstream output, input.<key>, or JSON array text). Runs per item; returns [{itemKey,output}]. Object/scalar contracts check items; array contracts check aggregate.'),
         forEachNewOnly: z.boolean().optional().describe('With forEach, skip items completed in prior runs using stable item.id/key/slug. Failed items retry next run.'),
         subgraph: WorkflowReadParallelSubgraphSchema.optional(),
-        transform: z.string().optional().describe('PURE REVIEWED TRANSFORM as exact JSON text: {"version":1,"expression":<expr>}. Closed expr ops: literal, get, jsonParse, jsonStringify, object, array, count, map, sort, unique, select, aggregate(value,groupBy:[column],metrics:[{fn:"count"|"sum"|"avg"|"min"|"max",column?}]). Metrics use fn, not op; count needs no column. Output keys are count or <fn>_<column> (for example sum_amount). No code or effect access. Declare sideEffect:"read" and dependsOn for referenced upstream steps.'),
+        transform: z.string().optional().describe('PURE REVIEWED TRANSFORM as exact JSON text: {"version":1,"expression":<expr>}. ' + WORKFLOW_TRANSFORM_INPUT_GUIDANCE + 'Closed expr ops: literal, get, jsonParse, jsonStringify, object, array, count, map, sort, unique, select, aggregate(value,groupBy:[column],metrics:[{fn:"count"|"sum"|"avg"|"min"|"max",column?}]). Metrics use fn, not op; count needs no column. Output keys are count or <fn>_<column> (for example sum_amount). No code or effect access. Declare sideEffect:"read" and dependsOn for referenced upstream steps.'),
         call: z.object({
           tool: z.string().min(1).describe('Exact discovered tool name (e.g. read_file) or the exact provider operation id this turn proved or discovered (the UPPER_SNAKE id from the PROVEN OPERATION note or the tool_search result); never a cap:… capabilityRef.'),
           args_json: z.string().optional().describe('Preferred JSON-object text; preserves nested types. Omit args. Templates resolve at run time: {{input.x}}, {{steps.<id>.output[.path]}}, {{now}}, {{now+24h}}, {{now-2h}}, {{date}}, {{date+1d}} — a relative window such as "the next 24 hours" is {{now}}..{{now+24h}}.'),

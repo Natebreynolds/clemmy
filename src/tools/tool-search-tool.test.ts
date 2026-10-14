@@ -1628,6 +1628,39 @@ test('invented schema cursor is a repairable argument refusal through the produc
   assert.equal(sourceCalls, 0, 'malformed cursor never discovers or executes a provider operation');
 });
 
+function assertWorkflowTransformDiscoveryGrammar(text: string, scope: string): void {
+  assert.match(text, /\bjsonParse\b/, `${scope}: JSON text must be parsed explicitly`);
+  assert.match(text, /\b(?:runtime|run)[ -]inputs?\b|\binput\.[a-z_]\w*\b/i,
+    `${scope}: parsing instructions identify runtime inputs`);
+  assert.match(text, /\bstrings?\b/i, `${scope}: runtime JSON text is a string`);
+  assert.match(text, /\b(?:arrays?|rows?)\b/i, `${scope}: parsing precedes row/array operations`);
+  assert.match(text, /\bwhere\b[^.]*\b(?:single|one)\b[^.]*\bobject\b/i,
+    `${scope}: select.where is one object, not an array`);
+  assert.match(text, /\b(?:literal\s+string|string\s+literal)\b/i,
+    `${scope}: where.value is a literal string, not a nested expression`);
+  assert.match(text, /\bgroupBy\b[\s\S]*\b1\s*(?:[-–—]|to|\.\.)\s*32\b/i,
+    `${scope}: grouping has a nonempty bounded field list`);
+}
+
+type WorkflowStepArraySchema = {
+  type?: string;
+  items?: { properties?: { transform?: { description?: string } } };
+};
+
+function workflowTransformDescription(schema: {
+  properties?: { steps?: WorkflowStepArraySchema & { anyOf?: WorkflowStepArraySchema[] } };
+}): string {
+  const steps = schema.properties?.steps;
+  const arrays = [
+    ...(steps?.type === 'array' ? [steps] : []),
+    ...(steps?.anyOf ?? []).filter(branch => branch.type === 'array'),
+  ];
+  assert.equal(arrays.length, 1, 'required and nullable steps each expose one real array contract');
+  const description = arrays[0]?.items?.properties?.transform?.description;
+  assert.equal(typeof description, 'string', 'the actual step array contains transform instructions');
+  return description!;
+}
+
 test('workflow input encoding instructions remain in the actual selected schema on both carriers', async () => {
   const local = await import('../runtime/harness/local-planning-capability.js');
   for (const carrier of ['work_call', 'call_tool'] as const) {
@@ -1651,6 +1684,22 @@ test('workflow input encoding instructions remain in the actual selected schema 
       const example = /Example JSON text: (\{.+\})\./.exec(schema.properties.inputs.description)?.[1];
       assert.deepEqual(JSON.parse(example!), { text: { type: 'string', description: 'Text supplied at runtime to summarize' } });
       const row = body.results.find((item: { name: string }) => item.name === name);
+      assert.deepEqual(body.results.map((item: { name: string }) => item.name), [name]);
+      assert.ok(body.schema_handles?.[name], 'the complete original schema remains losslessly addressable');
+      const fullSchema = await redeemSchema(handler, `${name} exact schema`, {
+        schemas: {}, schema_handles: body.schema_handles,
+      }, name) as typeof schema;
+      if (JSON.stringify(schema) !== JSON.stringify(fullSchema)) {
+        assert.ok(body.schema_read_required?.includes(name), 'a partial preview still requires its exact full schema');
+      }
+      const transformDescription = workflowTransformDescription(schema);
+      assertWorkflowTransformDiscoveryGrammar(transformDescription, `${carrier}/${name} transform preview`);
+      assert.equal(transformDescription, workflowTransformDescription(fullSchema),
+        'the inline transform grammar is not a clipped version of its retained contract');
+      if (name === 'workflow_create') {
+        assert.ok(row.summary.length <= 600, 'grammar must fit the existing public summary limit');
+        assertWorkflowTransformDiscoveryGrammar(row.summary, `${carrier}/${name} public summary`);
+      }
       assert.equal(row.carrier, carrier);
       if (carrier === 'work_call') {
         assert.equal(row.effect, 'local_write');
@@ -1689,6 +1738,24 @@ test('broad native workflow discovery retains the nested transform contract insi
   assert.equal(body.results.length, 8, 'secondary operations remain discoverable');
   assert.match(body.schemas.workflow_create.properties.steps.items.properties.transform.description, /JSON/);
   assert.match(body.schemas.workflow_create.properties.steps.items.properties.transform.description, /expression/);
+  assertWorkflowTransformDiscoveryGrammar(body.results[0].summary, 'broad workflow_create public summary');
+  assert.ok(body.results[0].summary.length <= 600, 'the first-call guidance is inside the existing summary limit');
+  assertWorkflowTransformDiscoveryGrammar(
+    body.schemas.workflow_create.properties.steps.items.properties.transform.description,
+    'broad workflow_create transform preview',
+  );
+  assert.ok(body.schema_handles?.workflow_create, 'the complete contract keeps its existing schema handle');
+  const fullSchema = await redeemSchema(handler,
+    'create a new manual workflow with a deterministic transform step and enable it', {
+      schemas: {}, schema_handles: body.schema_handles,
+    }, 'workflow_create') as typeof body.schemas.workflow_create;
+  assert.equal(body.schemas.workflow_create.properties.steps.items.properties.transform.description,
+    fullSchema.properties.steps.items.properties.transform.description,
+    'bounded discovery retains the entire executable transform grammar');
+  if (JSON.stringify(body.schemas.workflow_create) !== JSON.stringify(fullSchema)) {
+    assert.ok(body.schema_read_required?.includes('workflow_create'),
+      'inline grammar does not waive the rest of the full-schema reading requirement');
+  }
   assert.ok(raw.content[0].text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
   assert.equal(body.results[0].capabilityRef, 'cap:local:workflow_create:reversible');
 });

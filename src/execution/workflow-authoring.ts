@@ -500,11 +500,22 @@ export function prepareWorkflowCreateForWrite(
 }
 
 export function prepareWorkflowUpdateForWrite(
-  _before: WorkflowDefinition,
+  before: WorkflowDefinition,
   next: WorkflowDefinition,
   opts: WorkflowPrepareForWriteOptions = {},
 ): WorkflowPreparedWrite {
-  const portability = normalizeWorkflowModelPortability(next, opts.modelPortability);
+  // The writer uses description as the prose fallback; reopening makes that
+  // mirror an explicit description_body. Keep an unchanged mirror in sync,
+  // while preserving custom prose and any body explicitly changed by the caller.
+  const updated = typeof before.description === 'string'
+    && typeof next.description === 'string'
+    && before.description !== next.description
+    && typeof before.description_body === 'string'
+    && before.description_body.trim() === before.description.trim()
+    && next.description_body === before.description_body
+    ? { ...next, description_body: next.description }
+    : next;
+  const portability = normalizeWorkflowModelPortability(updated, opts.modelPortability);
   const compiled = compileWorkflowForWrite(portability.def, opts.codifyMechanicalSteps === true);
   const prep = prepareWorkflowForWrite(compiled.def, {
     allowDisabledExactSendDraft: compiled.def.enabled === false && (opts.allowInvalidDisabled ?? true),

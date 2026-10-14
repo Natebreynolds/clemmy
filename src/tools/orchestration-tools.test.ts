@@ -3,6 +3,7 @@
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -12,6 +13,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
 import type { ToolChoiceRecord } from '../memory/tool-choice-store.js';
+import type { WorkflowDefinition } from '../memory/workflow-store.js';
 const { registerOrchestrationTools, renderAuthoringAdvisories, bindStepsToToolChoices, draftToDefinition, commitAuthoredWorkflow, bindDiscussedToolkitsIntoSteps, autoTagStepsWithModelRoleIntents, _setWorkflowDispatchEventAppenderForTests } = await import('./orchestration-tools.js');
 const { traceToWorkflowDraft } = await import('../execution/trace-to-workflow.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
@@ -21,6 +23,7 @@ const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
 const { readWorkflowRunOriginRecords } = await import('./workflow-run-queue.js');
 const { exactOriginDeliveryTargetDigest } = await import('../runtime/exact-origin-delivery.js');
 const { parseHostLocalWriteCommitFacts } = await import('../runtime/harness/host-local-write-commit.js');
+const { prepareWorkflowUpdateForWrite } = await import('../execution/workflow-authoring.js');
 const {
   _setToolSchemaLoaderForTests,
   resetToolSchemaCache,
@@ -794,7 +797,11 @@ test('workflow_get exposes the saved transform and exact-slug updates preserve i
   const commit = parseHostLocalWriteCommitFacts(resultText(updated));
   assert.equal(commit?.createdId, slug);
   const reopened = readWorkflow(slug)!;
-  assert.deepEqual(reopened.data, { ...before.data, description: 'After exact-slug update.' });
+  assert.deepEqual(reopened.data, {
+    ...before.data,
+    description: 'After exact-slug update.',
+    description_body: 'After exact-slug update.',
+  });
   assert.deepEqual(workflowRunFiles(), [], 'a disabled metadata-only patch schedules no execution');
 
   const renamedDescription = await workflowUpdate()({
@@ -803,6 +810,118 @@ test('workflow_get exposes the saved transform and exact-slug updates preserve i
   assert.equal(renamedDescription.isError, undefined);
   assert.deepEqual(readWorkflow(slug)!.data.steps, before.data.steps);
   assert.deepEqual(readWorkflow(slug)!.data.trigger, before.data.trigger);
+});
+
+test('workflow description update refreshes its generated body through registered create and readback without another write', async () => {
+  const name = 'Generated Description Mirror Boundary';
+  const slug = 'generated-description-mirror-boundary';
+  const original = 'The per-group amount total is a single entry.';
+  const corrected = 'The per-group amount total has at most one entry, and none when no rows match.';
+  const transform = { version: 1, expression: { op: 'literal', value: { prepared: true } } };
+  const created = await workflowCreate()({
+    name, description: original, enabled: false, allowSends: false,
+    steps: [{ id: 'prepare', sideEffect: 'read', transform: JSON.stringify(transform),
+      output: { type: 'object', required_keys: ['prepared'] } }],
+  });
+  assert.equal(created.isError, undefined);
+  const createReceipt = parseHostLocalWriteCommitFacts(resultText(created));
+  assert.ok(createReceipt, 'the registered create commits the native workflow');
+  assert.equal(createReceipt.createdId, slug);
+  assert.equal(createReceipt.handle, 'vault/00-System/workflows/' + slug + '/SKILL.md');
+  const nativePath = path.join(TMP_HOME, createReceipt.handle);
+  const createdBytes = readFileSync(nativePath);
+  assert.equal(createReceipt.contentDigest, createHash('sha256').update(createdBytes).digest('hex'));
+  const before = readWorkflow(slug)!;
+  assert.equal(before.data.description, original);
+  assert.equal(before.data.description_body, original,
+    'reopening the generated fallback makes its exact mirror explicit');
+  const firstReadback = resultText(await workflowGet()({ name }));
+  assert.ok(firstReadback.includes(original));
+  assert.match(firstReadback, /Enabled: false/);
+  assert.match(firstReadback, /Trigger: manual only/);
+  assert.deepEqual(workflowRunFiles(), [], 'authoring and readback must not run the disabled transform');
+
+  const updated = await workflowUpdate()({ name, description: corrected });
+  assert.equal(updated.isError, undefined);
+  const updateReceipt = parseHostLocalWriteCommitFacts(resultText(updated));
+  assert.ok(updateReceipt, 'the same registered update must commit the entire corrected definition');
+  assert.equal(updateReceipt.createdId, createReceipt.createdId);
+  assert.equal(updateReceipt.handle, createReceipt.handle);
+  const updatedBytes = readFileSync(nativePath);
+  assert.equal(updateReceipt.contentDigest, createHash('sha256').update(updatedBytes).digest('hex'),
+    'the returned commit covers the bytes actually saved, without a later shell repair');
+  assert.notEqual(updateReceipt.contentDigest, createReceipt.contentDigest);
+  const reopened = readWorkflow(slug)!;
+  assert.equal(reopened.data.description, corrected);
+  assert.equal(reopened.data.description_body, corrected,
+    'description-only native updates must not retain a contradictory generated paragraph');
+  assert.deepEqual(reopened.data.steps, before.data.steps);
+  assert.deepEqual(reopened.data.trigger, before.data.trigger);
+  assert.equal(reopened.data.enabled, false);
+  assert.equal(reopened.data.allowSends, false);
+  assert.equal(updatedBytes.toString('utf8').includes(original), false,
+    'neither frontmatter nor the generated body may keep the superseded claim');
+  assert.ok(updatedBytes.toString('utf8').includes(corrected));
+  const secondReadback = resultText(await workflowGet()({ name: slug }));
+  assert.ok(secondReadback.includes(corrected));
+  assert.equal(secondReadback.includes(original), false);
+  assert.match(secondReadback, /Enabled: false/);
+  assert.match(secondReadback, /Trigger: manual only/);
+  assert.deepEqual(readFileSync(nativePath), updatedBytes, 'readback cannot rewrite the committed bytes');
+  assert.equal(updateReceipt.contentDigest, createHash('sha256').update(readFileSync(nativePath)).digest('hex'));
+  assert.deepEqual(workflowRunFiles(), [], 'a description repair must not queue execution or a creation test');
+});
+
+test('workflow description update preserves authored or explicitly replaced bodies and caller values', () => {
+  const original = 'Original catalog description.';
+  const corrected = 'Corrected catalog description.';
+  const common: WorkflowDefinition = {
+    name: 'Description Mirror Preservation', description: original, description_body: original,
+    enabled: false, trigger: { manual: true }, allowSends: false,
+    inputs: { label: { type: 'string', default: 'Keep this default.' } },
+    steps: [{ id: 'prepare', sideEffect: 'read',
+      transform: { version: 1, expression: { op: 'literal', value: 'No execution during authoring.' } },
+      output: { type: 'string' } }],
+  };
+  const cases: Array<{
+    name: string; beforeBody?: string; nextBody?: string; nextDescription: string; expectedBody?: string;
+  }> = [
+    { name: 'custom authored body', beforeBody: 'Owner-authored detail beyond the catalog description.',
+      nextBody: 'Owner-authored detail beyond the catalog description.',
+      nextDescription: corrected, expectedBody: 'Owner-authored detail beyond the catalog description.' },
+    { name: 'explicitly replaced body', beforeBody: original, nextBody: 'The owner supplied this new body.',
+      nextDescription: corrected, expectedBody: 'The owner supplied this new body.' },
+    { name: 'explicitly empty body', beforeBody: original, nextBody: '',
+      nextDescription: corrected, expectedBody: '' },
+    { name: 'explicitly removed body', beforeBody: original, nextBody: undefined,
+      nextDescription: corrected, expectedBody: undefined },
+    { name: 'unchanged description', beforeBody: original, nextBody: original,
+      nextDescription: original, expectedBody: original },
+    { name: 'no earlier body', beforeBody: undefined, nextBody: undefined,
+      nextDescription: corrected, expectedBody: undefined },
+    { name: 'generated mirror with boundary whitespace', beforeBody: ' \n' + original + '\n',
+      nextBody: ' \n' + original + '\n', nextDescription: corrected, expectedBody: corrected },
+    { name: 'generated exact mirror', beforeBody: original, nextBody: original,
+      nextDescription: corrected, expectedBody: corrected },
+  ];
+  for (const fixture of cases) {
+    const before = { ...structuredClone(common), description_body: fixture.beforeBody };
+    const next = { ...structuredClone(before), description: fixture.nextDescription,
+      description_body: fixture.nextBody };
+    const beforeSnapshot = structuredClone(before);
+    const nextSnapshot = structuredClone(next);
+    const prepared = prepareWorkflowUpdateForWrite(before, next);
+    assert.equal(prepared.status, 'ready', fixture.name);
+    assert.equal(prepared.def.description, fixture.nextDescription, fixture.name);
+    assert.equal(prepared.def.description_body, fixture.expectedBody, fixture.name);
+    assert.deepEqual(prepared.def.steps, common.steps, fixture.name);
+    assert.deepEqual(prepared.def.inputs, common.inputs, fixture.name);
+    assert.deepEqual(prepared.def.trigger, common.trigger, fixture.name);
+    assert.equal(prepared.def.enabled, false, fixture.name);
+    assert.equal(prepared.def.allowSends, false, fixture.name);
+    assert.deepEqual(before, beforeSnapshot, fixture.name + ': old definition stays immutable');
+    assert.deepEqual(next, nextSnapshot, fixture.name + ': caller patch stays immutable');
+  }
 });
 
 test('workflow_update refuses fuzzy names and exact name/slug collisions without changing either workflow', async () => {
