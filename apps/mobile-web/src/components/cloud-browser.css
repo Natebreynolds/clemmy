@@ -167,6 +167,34 @@
   margin-top:16px}
 .m-browser-connection>p {
   margin-top:12px}
+.m-browser-choices {
+  border:0;
+  padding:0;
+  margin:16px 0 0;
+  display:flex;
+  flex-direction:column;
+  gap:12px}
+.m-browser-choice,.m-browser-choice>label {
+  display:flex;
+  gap:12px;
+  align-items:center}
+.m-browser-choice>label {
+  flex:1;
+  min-width:0}
+.m-browser-choice input[type=radio] {
+  width:20px;
+  height:20px;
+  flex:none;
+  accent-color:var(--clem-primary)}
+.m-browser-choice span {
+  display:flex;
+  flex-direction:column;
+  min-width:0}
+.m-browser-choice strong {
+  font-weight:600}
+.m-browser-choice small {
+  color:var(--fg-2);
+  font-size:13px}
 .m-browser-layer .m-browser-primary,.m-browser-connection .m-browser-primary {
   background:var(--clem-primary);
   color:var(--clem-primary-fg)}

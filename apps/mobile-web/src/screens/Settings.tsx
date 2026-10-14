@@ -1,4 +1,4 @@
-import { BrowserbaseConnection } from '../components/BrowserbaseConnection';
+import { BrowserConnection } from '../components/BrowserConnection';
 import { useEffect, useState } from 'preact/hooks';
 import { Fragment } from 'preact';
 import { CHECKER_ROLE_WORDS, accountStatus, checkerBackupAutomaticLabel, creditRefusalSentence, modelScoreLine, presentUsageMeters } from '@clem/chat-engine';
@@ -169,7 +169,7 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
             />
             {/* Stateful, so it sits beside the stateless connections page
                 rather than inside it. */}
-            <BrowserbaseConnection />
+            <BrowserConnection />
           </>
         ) : (
           <DevicesPage
