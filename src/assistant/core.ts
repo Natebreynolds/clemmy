@@ -127,6 +127,7 @@ export class ClementineAssistant {
           : `desktop-turn:${sessionBeforeReply.turns.length}`,
         sourceProvenance: autoCaptureProvenanceFromDirectUserInput(
           request.channel ?? 'assistant-core',
+          request.learningPolicy,
         ),
       });
       if (request.runId && (captured.candidates.length > 0 || captured.profilePatch)) {
@@ -224,6 +225,7 @@ export class ClementineAssistant {
         prompt: promptParts.join('\n\n'),
         sessionId: request.sessionId,
         sourceUserSeq: request.sourceUserSeq,
+        learningPolicy: request.learningPolicy,
         userId: request.userId,
         channel: request.channel,
         maxWallClockMs: request.maxWallClockMs ?? defaultWallClockForChannel(request.channel),
@@ -301,6 +303,8 @@ export class ClementineAssistant {
     try {
       runPostTurnHooks({
         sessionId: request.sessionId,
+        sourceUserSeq: request.sourceUserSeq,
+        learningPolicy: request.learningPolicy,
         turn: 0,
         userInput: request.message,
         recallIds: [recallId],

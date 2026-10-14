@@ -18,12 +18,28 @@ const learner = await import('./learned-operation-delivery.js');
 const store = await import('./learned-operation-delivery-store.js');
 const jev = await import('../jev/client.js');
 const ports = await import('../semantic-boundary/turn-semantic-port-registry.js');
+const eventlog = await import('./eventlog.js');
+const sourceContexts = await import('./source-session-context.js');
 const {
   configuredBrainSemanticPort,
   semanticModelRoleForPurpose,
 } = await import('../semantic-boundary/configured-brain-semantic-port.js');
 
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+
+const EXCLUDED_LEARNING = { version: 1, mode: 'exclude', reason: 'controlled_test' } as const;
+let learningSourceSerial = 0;
+function learningSource(policy?: unknown) {
+  const session = eventlog.createSession({ id: `delivery-learning-source-${++learningSourceSerial}`, kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Inspect the controlled definition.', ...(policy === undefined ? {} : { learningPolicy: policy }) } });
+  return { sessionId: session.id, sourceUserSeq: source.seq };
+}
+function replaceLearningPolicy(source: { sessionId: string; sourceUserSeq: number }, policy: unknown) {
+  eventlog.openEventLog().prepare('UPDATE events SET data_json=? WHERE session_id=? AND seq=?')
+    .run(JSON.stringify({ text: 'Inspect the controlled definition.', learningPolicy: policy }), source.sessionId, source.sourceUserSeq);
+}
+
 
 const OPEN = {
   providerKind: 'composio' as const,
@@ -96,11 +112,12 @@ after(() => {
   jev._setSystemOneFetchForTests(undefined);
   jev._setTypesafeKeyForTests(undefined);
   ports.installTurnSemanticModelPort(null);
+  eventlog.closeEventLog();
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
 test('both models read the definition, never the name, and only their agreement is recorded', async () => {
-  assert.equal(await learner.learnOperationDelivery(OPEN, { sessionId: 'session-a' }), 'learned');
+  assert.equal(await learner.learnOperationDelivery(OPEN, learningSource()), 'learned');
   const verdict = store.learnedOperationDeliveryVerdict('composio', 'example_open_dm');
   assert.ok(verdict, 'the provider operation id is matched case-insensitively for this provider');
   assert.equal(verdict.verdict, 'delivers_nothing_non_destructive');
@@ -389,4 +406,95 @@ test('the store parses only closed, agreeing, independent verdicts', () => {
   }
   assert.equal(store.rememberLearnedOperationDelivery({ ...valid, confirm: { ...valid.confirm, confidence: 0.2 } } as never), false);
   assert.equal(store.learnedOperationDeliveryVerdict('composio', 'EXAMPLE_OPEN_DM'), null);
+});
+
+
+test('excluded and unavailable delivery sources leave the learning slot for an ordinary sibling', async () => {
+  const excluded = learningSource(EXCLUDED_LEARNING);
+  assert.equal(await learner.learnOperationDelivery(OPEN, excluded), 'learning_excluded');
+  assert.equal(learner.scheduleOperationDeliveryLearning([OPEN], excluded), 0);
+  for (const scope of [{ sessionId: excluded.sessionId }, { ...excluded, sourceUserSeq: 0 },
+    { ...excluded, sourceUserSeq: excluded.sourceUserSeq + 100000 },
+    { sessionId: 'foreign-delivery-session', sourceUserSeq: excluded.sourceUserSeq }]) {
+    assert.equal(await learner.learnOperationDelivery(OPEN, scope), 'learning_source_unavailable');
+    assert.equal(learner.scheduleOperationDeliveryLearning([OPEN], scope), 0);
+  }
+  assert.equal(jevRequests.length, 0);
+  assert.equal(judgeRequests.length, 0);
+  assert.equal(learner.scheduleOperationDeliveryLearning([OPEN], learningSource()), 1);
+  await learner._drainOperationDeliveryLearningForTests();
+  assert.equal(jevRequests.length, 1);
+  assert.equal(judgeRequests.length, 1);
+  assert.ok(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId));
+});
+
+test('delivery queue keeps the captured source and releases policy-declined entries without backoff', async () => {
+  const source = learningSource();
+  const row = eventlog.appendEvent({ sessionId: source.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Inspect another definition.', learningPolicy: EXCLUDED_LEARNING } });
+  const sibling = { sessionId: source.sessionId, sourceUserSeq: row.seq };
+  assert.equal(sourceContexts.withAcceptedSourceSessionContext(source,
+    () => learner.scheduleOperationDeliveryLearning([OPEN], { sessionId: source.sessionId }), { newlyAccepted: true }), 1);
+  await sourceContexts.withAcceptedSourceSessionContext(sibling,
+    () => learner._drainOperationDeliveryLearningForTests(), { newlyAccepted: true });
+  assert.ok(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId));
+  assert.equal(jevRequests.length, 1);
+
+  store._resetLearnedOperationDeliveryForTests();
+  const revoked = learningSource();
+  assert.equal(learner.scheduleOperationDeliveryLearning([OPEN], revoked), 1);
+  replaceLearningPolicy(revoked, EXCLUDED_LEARNING);
+  await learner._drainOperationDeliveryLearningForTests();
+  assert.equal(jevRequests.length, 1);
+  assert.equal(learner.scheduleOperationDeliveryLearning([OPEN], learningSource()), 1);
+  await learner._drainOperationDeliveryLearningForTests();
+  assert.equal(jevRequests.length, 2);
+  assert.ok(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId));
+});
+
+test('delivery learning rechecks before confirmation and storage without backoff from a policy hold', async () => {
+  const source = learningSource();
+  let confirms = 0;
+  assert.equal(await learner.learnOperationDelivery(OPEN, { ...source,
+    screen: async () => { replaceLearningPolicy(source, EXCLUDED_LEARNING); return { ok: false }; },
+    confirm: async () => { confirms += 1; return { ok: false }; },
+  }), 'learning_excluded');
+  assert.equal(confirms, 0);
+  const writable = learningSource();
+  assert.equal(await learner.learnOperationDelivery(OPEN, { ...writable,
+    screen: async () => ({ ok: true, model: 'screen', deliveryProbability: 0.01, irreversibleProbability: 0.01 }),
+    confirm: async ({ definitionDigest }) => {
+      replaceLearningPolicy(writable, { ...EXCLUDED_LEARNING, mode: 'allow' });
+      return { ok: true, model: 'judge', deliversToOthers: 'no', deletesOrIrreversible: 'no', confidence: 1, definitionDigest };
+    },
+  }), 'learning_source_unavailable');
+  assert.equal(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId), null);
+  assert.equal(learner.scheduleOperationDeliveryLearning([OPEN], learningSource()), 1, 'policy hold does not set retry backoff');
+  await learner._drainOperationDeliveryLearningForTests();
+  assert.ok(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId));
+});
+
+test('excluded changed or unreadable definitions still retire stale risk-lowering exceptions', async () => {
+  const source = learningSource(EXCLUDED_LEARNING);
+  for (const changed of [{ ...OPEN, description: `${OPEN.description} It also posts a greeting.` }, { ...OPEN, description: null }]) {
+    assert.equal(await learner.learnOperationDelivery(OPEN), 'learned');
+    const screens = jevRequests.length;
+    assert.equal(learner.scheduleOperationDeliveryLearning([changed], source), 0);
+    assert.equal(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId), null, 'conservative invalidation is not new learning');
+    assert.equal(jevRequests.length, screens);
+    assert.equal(learner.scheduleOperationDeliveryLearning([OPEN], learningSource()), 1);
+    await learner._drainOperationDeliveryLearningForTests();
+    assert.ok(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId));
+    store._resetLearnedOperationDeliveryForTests();
+  }
+});
+
+
+test('delivery screen rechecks after its lazy client import before actual dispatch', async () => {
+  const source = learningSource();
+  const pending = learner.learnOperationDelivery(OPEN, source);
+  replaceLearningPolicy(source, EXCLUDED_LEARNING);
+  assert.equal(await pending, 'learning_excluded');
+  assert.equal(jevRequests.length, 0);
+  assert.equal(judgeRequests.length, 0);
 });

@@ -11,12 +11,13 @@
 import { createHash } from 'node:crypto';
 import { openMemoryDb } from './db.js';
 import { canonicalRef, upsertResourcePointer, type UpsertResourceInput } from './source-map.js';
-import { openEventLog } from '../runtime/harness/eventlog.js';
+import { appendEvent, openEventLog } from '../runtime/harness/eventlog.js';
 import { redeemSuccessfulSettlementResultForHost } from '../runtime/harness/result-handle.js';
 import { verifyCanonicalDocumentedCreateResult } from '../runtime/harness/documented-create-result-evidence.js';
 import { digestToolOutput } from '../runtime/harness/tool-output-digest.js';
 import { presentationEventFromCompletionData } from '../runtime/harness/turn-outcome.js';
 import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
+import { readTurnLearningPolicyForSource, type TurnLearningPolicyResult } from './turn-learning-policy.js';
 
 const TERMINAL_SCAN_LIMIT = 24;
 const SELECTED_SOURCE_MAX_CHARS = 3_000;
@@ -126,6 +127,7 @@ export interface TerminalLearningIntakeSummary {
   unstructuredMembers: number;
   shardsCreated: number;
   skippedTerminals: number;
+  heldTerminals: number;
   failures: number;
 }
 
@@ -218,6 +220,43 @@ function advanceScanCursor(rowid: number): void {
        SET terminal_event_rowid = MAX(terminal_event_rowid, ?), updated_at = ?
      WHERE id = 1
   `).run(rowid, new Date().toISOString());
+}
+
+/**
+ * An immutable unqualified source must not starve unrelated later sources.
+ * Preserve one exact operational hold before consuming its scan position.
+ * This is quarantine, not a learning receipt or a successful extraction;
+ * deliberate requalification may reopen the retained canonical evidence.
+ */
+function holdUnavailableTerminalLearning(
+  source: TerminalSource,
+  reason: Extract<TurnLearningPolicyResult, { status: 'unavailable' }>['reason'],
+): void {
+  const db = openEventLog();
+  db.transaction(() => {
+    const held = db.prepare(`SELECT role, parent_event_id, data_json FROM events
+      WHERE session_id=? AND type='memory_learning_intake_held'
+        AND json_extract(data_json, '$.terminalEventId')=?
+        AND json_extract(data_json, '$.terminalDigest')=? LIMIT 2`)
+      .all(source.sessionId, source.terminalEventId, source.terminalDigest) as Array<{
+        role: string; parent_event_id: string | null; data_json: string;
+      }>;
+    if (held.length > 0) {
+      const row = held[0]!;
+      const data = record(JSON.parse(row.data_json));
+      if (held.length !== 1 || row.role !== 'system' || row.parent_event_id !== source.terminalEventId
+        || data?.version !== 1 || data.disposition !== 'held'
+        || data.sourceUserSeq !== source.sourceUserSeq
+        || !['learning_source_unavailable', 'learning_policy_invalid', 'learning_lineage_unavailable'].includes(String(data.reason))) {
+        throw new Error('The exact learning intake hold is inconsistent.');
+      }
+      return;
+    }
+    appendEvent({ sessionId: source.sessionId, turn: 0, role: 'system',
+      type: 'memory_learning_intake_held', parentEventId: source.terminalEventId,
+      data: { version: 1, disposition: 'held', sourceUserSeq: source.sourceUserSeq,
+        terminalEventId: source.terminalEventId, terminalDigest: source.terminalDigest, reason } });
+  }).immediate();
 }
 
 function terminalRows(afterRowid: number, limit: number): TerminalRow[] {
@@ -739,6 +778,7 @@ export function discoverTerminalLearningBatches(
     unstructuredMembers: 0,
     shardsCreated: 0,
     skippedTerminals: 0,
+    heldTerminals: 0,
     failures: 0,
   };
   const rows = terminalRows(scanCursor(), limit);
@@ -748,6 +788,30 @@ export function discoverTerminalLearningBatches(
     if (!source || !isCanonicalTypedTerminal(source)) {
       summary.skippedTerminals += 1;
       advanceScanCursor(row.terminal_event_rowid);
+      continue;
+    }
+    const policy = readTurnLearningPolicyForSource(source);
+    if (policy.status === 'excluded') {
+      // Consume the canonical terminal as zero intake. Its result handles,
+      // task receipts and usage remain in the execution ledger.
+      summary.skippedTerminals += 1;
+      advanceScanCursor(row.terminal_event_rowid);
+      continue;
+    }
+    if (policy.status === 'unavailable') {
+      try {
+        // Canonical source, terminal and result custody stay in the event
+        // ledger. Advance only after its exact durable quarantine audit won.
+        holdUnavailableTerminalLearning(source, policy.reason);
+        advanceScanCursor(row.terminal_event_rowid);
+        summary.heldTerminals += 1;
+        summary.skippedTerminals += 1;
+      } catch {
+        // A missing audit is not a durable hold. Retain the cursor on genuine
+        // storage failure so this source cannot silently disappear.
+        summary.failures += 1;
+        break;
+      }
       continue;
     }
     const settlements = taskSettlements(source);
@@ -832,6 +896,7 @@ export function selectedLearningSource(member: MemoryLearningMemberReceipt): str
     accepted_task_id: string;
   } | undefined;
   if (!batch) return null;
+  if (readTurnLearningPolicyForSource({ sessionId: batch.session_id, sourceUserSeq: batch.source_user_seq }).status !== 'allowed') return null;
   const redeemed = redeemSuccessfulSettlementResultForHost({
     sessionId: batch.session_id,
     sourceUserSeq: batch.source_user_seq,

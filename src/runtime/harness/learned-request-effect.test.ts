@@ -33,8 +33,23 @@ const identities = await import('./attempt-identity.js');
 const dispatch = await import('./dispatch-ledger.js');
 const outcomes = await import('./attempt-outcome.js');
 const settlements = await import('./logical-call-settlement-store.js');
+const sourceContexts = await import('./source-session-context.js');
 
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+
+const EXCLUDED_LEARNING = { version: 1, mode: 'exclude', reason: 'controlled_test' } as const;
+let learningSourceSerial = 0;
+function learningSource(policy?: unknown) {
+  const session = eventlog.createSession({ id: `request-learning-source-${++learningSourceSerial}`, kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Inspect the controlled request.', ...(policy === undefined ? {} : { learningPolicy: policy }) } });
+  return { sessionId: session.id, sourceUserSeq: source.seq };
+}
+function replaceLearningPolicy(source: { sessionId: string; sourceUserSeq: number }, policy: unknown) {
+  eventlog.openEventLog().prepare('UPDATE events SET data_json=? WHERE session_id=? AND seq=?')
+    .run(JSON.stringify({ text: 'Inspect the controlled request.', learningPolicy: policy }), source.sessionId, source.sourceUserSeq);
+}
+
 
 // A generic request tool: one definition for every endpoint it can reach.
 const TOOL = 'mcp__seo_vendor__api_request';
@@ -141,7 +156,7 @@ test('a verdict round-trips through the store and is exact to its shape', () => 
 test('both models read the request and the response, never the tool name, and only their agreement is recorded', async () => {
   const outcome = await learner.learnRequestEffect(
     { providerKind: 'native_mcp', operationId: OPERATION, args: LIVE_ARGS, result: LIVE_RESPONSE },
-    { sessionId: 'session-a' },
+    learningSource(),
   );
   assert.equal(outcome, 'learned');
   const verdict = store.learnedRequestEffectVerdict('native_mcp', OPERATION, LIVE_SHAPE);
@@ -450,4 +465,84 @@ test('a worker runs a request shape learned to only read; unknown shapes, writes
   const refusal = runner.indexOf('WORKER_COMPOSE_ONLY: ${name} is an external mutation');
   assert.ok(refusal > 0);
   assert.match(runner.slice(Math.max(0, refusal - 600), refusal), /workerScope && workerMustComposeForParent\(/);
+});
+
+
+test('exact excluded or unavailable request sources never reserve learning against a normal sibling', async () => {
+  const excluded = learningSource(EXCLUDED_LEARNING);
+  const input = { providerKind: 'native_mcp' as const, operationId: OPERATION, args: LIVE_ARGS, result: LIVE_RESPONSE };
+  assert.equal(await learner.learnRequestEffect(input, excluded), 'learning_excluded');
+  assert.equal(learner.scheduleRequestEffectLearning(input, excluded), false);
+  for (const scope of [{ sessionId: excluded.sessionId }, { ...excluded, sourceUserSeq: 0 },
+    { ...excluded, sourceUserSeq: excluded.sourceUserSeq + 100000 },
+    { sessionId: 'other-request-session', sourceUserSeq: excluded.sourceUserSeq }]) {
+    assert.equal(await learner.learnRequestEffect(input, scope), 'learning_source_unavailable');
+    assert.equal(learner.scheduleRequestEffectLearning(input, scope), false);
+  }
+  assert.equal(await learner.learnRequestEffect({ ...input, sessionId: excluded.sessionId }), 'learning_source_unavailable', 'an input session cannot silently become standalone');
+  assert.equal(learner.scheduleRequestEffectLearning({ ...input, sessionId: 'foreign-input-session' }, learningSource()), false);
+  assert.equal(jevRequests.length, 0);
+  assert.equal(judgeRequests.length, 0);
+  assert.equal(store.learnedRequestEffectVerdict('native_mcp', OPERATION, LIVE_SHAPE), null);
+  assert.equal(learner.scheduleRequestEffectLearning(input, learningSource()), true);
+  await learner._drainRequestEffectLearningForTests();
+  assert.equal(jevRequests.length, 1);
+  assert.equal(judgeRequests.length, 1);
+  assert.ok(store.learnedRequestEffectVerdict('native_mcp', OPERATION, LIVE_SHAPE));
+});
+
+test('queued request learning retains its captured source and rechecks before dispatch without backoff', async () => {
+  const source = learningSource();
+  const next = eventlog.appendEvent({ sessionId: source.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Inspect the next controlled request.', learningPolicy: EXCLUDED_LEARNING } });
+  const sibling = { sessionId: source.sessionId, sourceUserSeq: next.seq };
+  const input = { providerKind: 'native_mcp' as const, operationId: OPERATION, args: LIVE_ARGS, result: LIVE_RESPONSE };
+  assert.equal(sourceContexts.withAcceptedSourceSessionContext(source,
+    () => learner.scheduleRequestEffectLearning(input, { sessionId: source.sessionId }), { newlyAccepted: true }), true);
+  await sourceContexts.withAcceptedSourceSessionContext(sibling,
+    () => learner._drainRequestEffectLearningForTests(), { newlyAccepted: true });
+  assert.equal(jevRequests.length, 1, 'later excluded ambient context cannot replace the captured allowed source');
+  assert.ok(store.learnedRequestEffectVerdict('native_mcp', OPERATION, LIVE_SHAPE));
+
+  store._resetLearnedRequestEffectsForTests();
+  const revoked = learningSource();
+  assert.equal(learner.scheduleRequestEffectLearning(input, revoked), true);
+  replaceLearningPolicy(revoked, EXCLUDED_LEARNING);
+  await learner._drainRequestEffectLearningForTests();
+  assert.equal(jevRequests.length, 1, 'queued policy is reopened before the screen');
+  assert.equal(learner.scheduleRequestEffectLearning(input, learningSource()), true, 'declined queue entry leaves no backoff');
+  await learner._drainRequestEffectLearningForTests();
+  assert.equal(jevRequests.length, 2);
+  assert.ok(store.learnedRequestEffectVerdict('native_mcp', OPERATION, LIVE_SHAPE));
+});
+
+test('request policy is reopened between models and immediately before persistence', async () => {
+  const input = { providerKind: 'native_mcp' as const, operationId: OPERATION, args: LIVE_ARGS, result: LIVE_RESPONSE };
+  const source = learningSource();
+  let confirms = 0;
+  assert.equal(await learner.learnRequestEffect(input, { ...source,
+    screen: async () => { replaceLearningPolicy(source, EXCLUDED_LEARNING); return { ok: false }; },
+    confirm: async () => { confirms += 1; return { ok: false }; },
+  }), 'learning_excluded');
+  assert.equal(confirms, 0);
+  const writable = learningSource();
+  assert.equal(await learner.learnRequestEffect(input, { ...writable,
+    screen: async () => ({ ok: true, model: 'screen', changeProbability: 0.01 }),
+    confirm: async ({ evidenceDigest }) => {
+      replaceLearningPolicy(writable, { ...EXCLUDED_LEARNING, mode: 'allow' });
+      return { ok: true, model: 'judge', changesProvider: 'no', confidence: 1, evidenceDigest };
+    },
+  }), 'learning_source_unavailable');
+  assert.equal(store.learnedRequestEffectVerdict('native_mcp', OPERATION, LIVE_SHAPE), null);
+  assert.equal(await learner.learnRequestEffect(input, learningSource()), 'learned');
+});
+
+
+test('request screen rechecks after its lazy client import before actual dispatch', async () => {
+  const source = learningSource();
+  const pending = learner.learnRequestEffect({ providerKind: 'native_mcp', operationId: OPERATION, args: LIVE_ARGS, result: LIVE_RESPONSE }, source);
+  replaceLearningPolicy(source, EXCLUDED_LEARNING);
+  assert.equal(await pending, 'learning_excluded');
+  assert.equal(jevRequests.length, 0);
+  assert.equal(judgeRequests.length, 0);
 });

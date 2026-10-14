@@ -20,6 +20,7 @@ import { projectArchivedContext } from './archived-context-projection.js';
 import { revalidateReviewedPlanPreparation } from './reviewed-plan-runtime.js';
 import { thisTurnSearchAccountSelectionBlockers } from '../../tools/tool-search-provider-sources.js';
 import { acceptedTaskMode } from './accepted-task-mode.js';
+import { turnLearningPolicyFields, type TurnLearningPolicy, type TurnLearningSource } from '../../memory/turn-learning-policy.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { captureSourceBudgetPolicy, readSourceBudgetPolicy } from './source-budget-policy.js';
 import { retainedHistoryPrefixProjection } from './retained-history-prefix.js';
@@ -857,7 +858,8 @@ function acceptFreshConversationInput(options: RunConversationOptions): number {
     sessionId: options.sessionId,
     turn: nextTurnNumber(row),
     role: 'user',
-    data: { text: options.input },
+    data: { text: options.input, ...turnLearningPolicyFields(options.learningPolicy),
+      ...(options.learningPolicySource ? { learningPolicySource: options.learningPolicySource } : {}) },
   }).seq;
 }
 
@@ -3913,6 +3915,10 @@ function declinesAutomaticContextWarm(options: RunConversationOptions): boolean 
 }
 
 export interface RunConversationOptions {
+  /** Excludes automatic learning from a fresh accepted source, never a session global. */
+  learningPolicy?: TurnLearningPolicy;
+  /** Host-only exact ancestry for restrictive automatic-learning policy. */
+  learningPolicySource?: TurnLearningSource;
   /** Internal executor's exact lease owner for a durable connection control.
    * Never accepted from a browser, model, or retained historical receipt. */
   connectionExecutionLeaseOwner?: string;
@@ -13120,6 +13126,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
     // spine — identical on every brain lane. New post-turn behavior wires there.
     runPostTurnHooks({
       sessionId: options.sessionId,
+      sourceUserSeq,
       turn,
       userInput: options.taskContinuation?.disposition === 'declined_with_new_task'
         ? options.taskContinuation.activeTaskInput
@@ -13373,6 +13380,10 @@ export async function resumePendingApproval(
     : (() => {
         try { return getLatestRunAttempt(options.sessionId)?.sourceUserSeq ?? undefined; } catch { return undefined; }
       })();
+  // Historical execution compatibility may use a latest-attempt fallback.
+  // Optional learning must never treat that fallback as proof of the parked
+  // task's source. Only the pause's own retained subject can supply it.
+  let resumeLearningSourceUserSeq = 0;
   // Agent construction happens before RunState deserialization. Capture its
   // exact bound connector scope now so a second approval pause persists the
   // same authority even when tool brackets are disabled.
@@ -13409,7 +13420,9 @@ export async function resumePendingApproval(
         error: 'The selected approval belongs to a different paused action; no decision was applied.' };
     }
     try {
-      resumeSourceUserSeq = pausedHostApprovalSource(state, options.sessionId) ?? resumeSourceUserSeq;
+      const pausedSource = pausedHostApprovalSource(state, options.sessionId);
+      resumeSourceUserSeq = pausedSource ?? resumeSourceUserSeq;
+      resumeLearningSourceUserSeq = pausedSource ?? 0;
     } catch (error) {
       const message = normalizeError(error);
       safeAppend({
@@ -14034,6 +14047,7 @@ export async function resumePendingApproval(
     // prior answer) — so any future post-turn hook reaches the resume path too.
     runPostTurnHooks({
       sessionId: options.sessionId,
+      sourceUserSeq: resumeLearningSourceUserSeq,
       turn,
       userInput: undefined,
       detectCorrection: false,

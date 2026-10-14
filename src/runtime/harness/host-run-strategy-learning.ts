@@ -17,6 +17,7 @@ import {
 import { recordRunStrategy, runStrategyScopeForSession, shapeOfProvenArguments, type ProvenCallShape, type ProvenStep } from '../../memory/run-strategy-store.js';
 import { actionTopologyRoleFor, TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { TOOL_SEARCH_ALWAYS_LOADED } from '../../agents/tool-catalog.js';
+import { readTurnLearningPolicyForSource } from '../../memory/turn-learning-policy.js';
 
 /** Prefer the settled business tools. Kernel inspection tools only count when
  *  they were the whole run — otherwise they pollute the next proven skip. */
@@ -182,6 +183,9 @@ export function learnHostRunStrategyForAcceptedTask(input: {
   sessionId: string;
   sourceUserSeq: number;
 }): { status: 'learned' | 'updated' | 'replayed' | 'not_proven'; reason?: string } {
+  const policy = readTurnLearningPolicyForSource(input);
+  if (policy.status !== 'allowed') return { status: 'not_proven', reason: policy.status === 'excluded'
+    ? `turn_learning_excluded:${policy.policy.reason}` : policy.reason };
   // Terminal delivery can be replayed after background handoff or restart.
   // One accepted source is one learning observation, not another success.
   const prior = openEventLog().prepare(`SELECT 1 FROM events WHERE session_id=?

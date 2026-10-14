@@ -1,10 +1,10 @@
 /**
  * Run: npx tsx --test src/runtime/harness/auto-remember.test.ts
  */
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { detectNativeMcpSuccess, detectRememberableSuccess, autoRememberOnSuccess } from './auto-remember.js';
-import { appendEvent, createSession, resetEventLog } from './eventlog.js';
+import { appendEvent, createSession, resetEventLog, openEventLog, closeEventLog } from './eventlog.js';
 import { peekToolChoice } from '../../memory/tool-choice-store.js';
 import { withToolOutputContext } from './tool-output-context.js';
 
@@ -204,4 +204,81 @@ test('autoRememberOnSuccess: CLI aliases bind the originating accepted ask, not 
   const stored = peekToolChoice('sf.data.query');
   assert.ok(stored?.aliases?.some((alias) => /net MRR we sold/i.test(alias.intent)), JSON.stringify(stored?.aliases));
   assert.equal(stored?.aliases?.some((alias) => /2x3/.test(alias.intent)), false);
+});
+
+
+// The external isolated runner binds config before this file's static imports.
+assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1', 'auto-remember tests require the disposable-home runner');
+const { withAcceptedSourceSessionContext } = await import('./source-session-context.js');
+const { harnessRunContextStorage } = await import('./brackets.js');
+const { createFocus } = await import('../../memory/focus.js');
+const { closeMemoryDb } = await import('../../memory/db.js');
+after(() => { closeEventLog(); closeMemoryDb(); });
+const EXCLUDED_LEARNING = { version: 1, mode: 'exclude', reason: 'controlled_test' } as const;
+let procedureSourceSerial = 0;
+function procedureSource(policy?: unknown, text = 'Inspect the controlled procedure.') {
+  const session = createSession({ id: `auto-procedure-source-${++procedureSourceSerial}`, kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text, ...(policy === undefined ? {} : { learningPolicy: policy }) } });
+  return { sessionId: session.id, sourceUserSeq: source.seq };
+}
+
+test('autoRememberOnSuccess: excluded and unreadable exact sources create no memo or alias, ordinary sibling still learns', () => {
+  const excluded = procedureSource(EXCLUDED_LEARNING, 'Excluded procedure phrase.');
+  const normalRow = appendEvent({ sessionId: excluded.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Ordinary procedure phrase.' } });
+  const normal = { sessionId: excluded.sessionId, sourceUserSeq: normalRow.seq };
+  const success = { toolName: 'fixture__policy_read', resultStr: 'Returned controlled rows.' };
+  for (const identity of [excluded, { sessionId: excluded.sessionId },
+    { ...excluded, sourceUserSeq: 0 }, { ...excluded, sourceUserSeq: normalRow.seq + 100000 },
+    { sessionId: 'foreign-procedure-session', sourceUserSeq: normalRow.seq }]) {
+    autoRememberOnSuccess({ ...success, ...identity });
+    assert.equal(peekToolChoice('fixture.policy_read'), null);
+  }
+  withAcceptedSourceSessionContext(normal, () => {
+    autoRememberOnSuccess({ ...success, ...excluded });
+    assert.equal(peekToolChoice('fixture.policy_read'), null, 'explicit excluded source cannot borrow an ordinary current sibling');
+    autoRememberOnSuccess({ ...success, sessionId: normal.sessionId });
+  }, { newlyAccepted: true });
+  const memo = peekToolChoice('fixture.policy_read');
+  assert.ok(memo?.choice);
+  assert.ok(memo.aliases?.some(alias => alias.intent === 'Ordinary procedure phrase.'));
+  assert.equal(memo.aliases?.some(alias => alias.intent === 'Excluded procedure phrase.'), false);
+});
+
+test('autoRememberOnSuccess: an excluded CLI success cannot enrich an existing canonical operation', () => {
+  const normal = procedureSource(undefined, 'Read the controlled CLI summary.');
+  const input = { toolName: 'run_shell_command', resultStr: 'exit_code: 0\n{"status":0}',
+    args: { command: 'sf data query --json --query "SELECT Id FROM Opportunity"' } };
+  autoRememberOnSuccess({ ...input, ...normal });
+  const before = peekToolChoice('sf.data.query');
+  assert.ok(before?.aliases?.some(alias => alias.intent === 'Read the controlled CLI summary.'));
+  autoRememberOnSuccess({ ...input, ...procedureSource(EXCLUDED_LEARNING, 'Never attach this controlled alias.') });
+  assert.deepEqual(peekToolChoice('sf.data.query'), before, 'exclusion leaves old procedure and aliases byte-equivalent');
+});
+
+test('autoRememberOnSuccess: known ambient session is not standalone and exact empty source never adopts later focus', () => {
+  const excluded = procedureSource(EXCLUDED_LEARNING);
+  harnessRunContextStorage.run({ ...excluded } as never, () => {
+    autoRememberOnSuccess({ toolName: 'fixture__ambient_read', resultStr: 'Returned controlled rows.' });
+  });
+  assert.equal(peekToolChoice('fixture.ambient_read'), null, 'a known session without validated source scope cannot learn');
+  createFocus({ resourceRef: 'controlled:standalone-procedure', title: 'Standalone procedure', summary: 'Controlled maintenance context.' });
+  autoRememberOnSuccess({ toolName: 'fixture__standalone_read', resultStr: 'Returned controlled rows.' });
+  assert.ok(peekToolChoice('fixture.standalone_read')?.choice, 'true no-session standalone maintenance remains supported');
+  const empty = procedureSource(undefined, '');
+  autoRememberOnSuccess({ toolName: 'fixture__empty_read', resultStr: 'Returned controlled rows.', ...empty });
+  assert.equal(peekToolChoice('fixture.empty_read'), null, 'known exact source with no ask cannot use global focus');
+});
+
+test('autoRememberOnSuccess: policy is reopened immediately before the memo write', () => {
+  const source = procedureSource();
+  autoRememberOnSuccess({ ...source, toolName: 'fixture__revoked_read', resultStr: 'Returned controlled rows.',
+    get args() {
+      openEventLog().prepare('UPDATE events SET data_json=? WHERE session_id=? AND seq=?')
+        .run(JSON.stringify({ text: 'Inspect the controlled procedure.', learningPolicy: EXCLUDED_LEARNING }), source.sessionId, source.sourceUserSeq);
+      return undefined;
+    },
+  });
+  assert.equal(peekToolChoice('fixture.revoked_read'), null);
 });

@@ -2,7 +2,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendEvent } from './eventlog.js';
 import { completedModelResponseBinding } from './model-response-binding.js';
-import { modelUsageAttributionStorage } from '../usage-log.js';
+import { modelUsageAttributionStorage, captureModelUsageProvenance, capturedModelUsageAttribution,
+  type CapturedModelUsageProvenance, type ModelUsageAttributionContext } from '../usage-log.js';
 import { associateOriginalReviewWireResponse, beginReviewWireTransform, captureReviewWireExpectation,
   finishReviewWireTransform, reviewWireInclusionForDispatch, unavailableReviewWireExpectation, type ClaudeSystemTextProjection,
   type ReviewWireExpectation, type ReviewWireInclusionObservation, type ReviewWireOwner,
@@ -27,13 +28,16 @@ export interface CapturedModelTransportOwner {
   readonly owner?: Readonly<ObservationOwner>;
   readonly purpose: ModelTransportAttempt['purpose'];
 }
-const capturedOwners = new WeakMap<CapturedModelTransportOwner, { record?: ModelTransportRecorder; expectation: ReviewWireExpectation }>();
+const capturedOwners = new WeakMap<CapturedModelTransportOwner, { record?: ModelTransportRecorder; expectation: ReviewWireExpectation; usage?: CapturedModelUsageProvenance; framePromptComponents?: Record<string, number> }>();
+const publicUsageOwner = new AsyncLocalStorage<CapturedModelTransportOwner>();
 interface AttemptState {
   record: ModelTransportRecorder;
   dispatchIds: string[];
   terminal: boolean;
   journalFailed: boolean;
   expectation: ReviewWireExpectation;
+  usage?: CapturedModelUsageProvenance;
+  framePromptComponents?: Record<string, number>;
   wireInclusions: ReviewWireInclusionObservation[];
   producer?: ClaudeModelWireProducer;
   ambiguousProducer: boolean;
@@ -166,6 +170,27 @@ export function captureUnavailableModelTransportOwner(): CapturedModelTransportO
   return captured;
 }
 
+/** BYO public-entry accounting only. Snapshot before its outer lazy assertion;
+ * never run provider work under copied harness or usage attribution authority.
+ * Other providers' ordinary owner capture does not perform this usage capture. */
+export function captureModelTransportUsageOwner(fallback?: ModelUsageAttributionContext): CapturedModelTransportOwner {
+  const usage = modelUsageAttributionStorage.getStore() === undefined && fallback
+    ? modelUsageAttributionStorage.run(fallback, captureModelUsageProvenance) : captureModelUsageProvenance();
+  const captured = modelUsageAttributionStorage.run(capturedModelUsageAttribution(usage)
+    ?? { sessionId: 'unknown', sourceUserSeq: 0 }, captureModelTransportOwner);
+  capturedOwners.get(captured)!.usage = usage;
+  const owner = captured.owner;
+  if (owner && fallback && owner.sessionId === fallback.sessionId && owner.sourceUserSeq === fallback.sourceUserSeq
+    && owner.runAttemptId === fallback.attemptId && fallback.promptComponents) {
+    capturedOwners.get(captured)!.framePromptComponents = fallback.promptComponents;
+  }
+  return captured;
+}
+
+export function withPublicModelTransportUsageOwner<T>(owner: CapturedModelTransportOwner, work: () => T): T {
+  return publicUsageOwner.run(owner, work);
+}
+
 /** An adapter attempt is not a wire request. Capture its owner before any
  * transport work; actual fetches mint their own IDs under this immutable scope. */
 export function createModelTransportAttempt(modelCallId: string, physicalAttempt: number,
@@ -180,11 +205,60 @@ export function createModelTransportAttempt(modelCallId: string, physicalAttempt
   });
   if (identity(modelCallId) && Number.isSafeInteger(physicalAttempt) && physicalAttempt > 0) {
     states.set(scope, { record, dispatchIds: [], terminal: false, journalFailed: false,
-      expectation: capturedState?.expectation ?? unavailableReviewWireExpectation(), wireInclusions: [], ambiguousProducer: false });
+      expectation: capturedState?.expectation ?? unavailableReviewWireExpectation(), usage: capturedState?.usage,
+      framePromptComponents: capturedState?.framePromptComponents,
+      wireInclusions: [], ambiguousProducer: false });
     // Creation is a local declaration, not proof that an SDK or fetch ran.
     emit(scope, { phase: 'adapter_attempt_created', resultScope: 'local_adapter_attempt', dispatchIds: [] });
   }
   return scope;
+}
+
+export interface CapturedModelTransportUsage {
+  readonly attempt?: ModelTransportAttempt;
+  readonly callerProvenance: CapturedModelUsageProvenance;
+  readonly owner?: Readonly<ObservationOwner>;
+  readonly framePromptComponents?: Record<string, number>;
+}
+function usageMatchesAttempt(scope: ModelTransportAttempt, usage: CapturedModelUsageProvenance): boolean {
+  const current = capturedModelUsageAttribution(usage);
+  const value = current && identity(current.sessionId) && current.sessionId !== 'unknown'
+    && Number.isSafeInteger(current.sourceUserSeq) && current.sourceUserSeq > 0 ? current : current?.usageParentTurn;
+  const owner = scope.owner;
+  return !!owner && !!value && owner.sessionId === value.sessionId
+    && owner.sourceUserSeq === value.sourceUserSeq && owner.runAttemptId === value.attemptId
+    && owner.accountingParent === (value !== current) && owner.usageJobId === current?.usageJobId
+    && scope.purpose === (current?.role ?? 'unknown');
+}
+function emptyUsage(): CapturedModelUsageProvenance {
+  return modelUsageAttributionStorage.run({ sessionId: 'unknown', sourceUserSeq: 0 }, captureModelUsageProvenance);
+}
+/** Absent is legacy. Present unsupported/retired metadata must not become
+ * permission to borrow the later drainer's accounting namespace. */
+export function captureActiveModelTransportUsage(): CapturedModelTransportUsage | undefined {
+  const scope = activeAttempt.getStore();
+  if (scope) {
+    const state = states.get(scope);
+    if (!state?.usage || !usageMatchesAttempt(scope, state.usage)) {
+      return Object.freeze({ attempt: scope, callerProvenance: emptyUsage() });
+    }
+    return Object.freeze({ attempt: scope, callerProvenance: state.usage, owner: scope.owner,
+      framePromptComponents: state.framePromptComponents });
+  }
+  const captured = publicUsageOwner.getStore();
+  if (!captured) return undefined;
+  const state = capturedOwners.get(captured);
+  return Object.freeze({ callerProvenance: state?.usage ?? emptyUsage(), ...(state ? {
+    owner: captured.owner, framePromptComponents: state.framePromptComponents } : {}) });
+}
+/** Only the same live nominal attempt can provide the invocation UUID. Usage
+ * still records with its captured tuple when the UUID cannot be certified. */
+export function capturedModelTransportUsageCallId(scope: ModelTransportAttempt | undefined,
+  usage: CapturedModelUsageProvenance): string | undefined {
+  const state = scope && states.get(scope);
+  return scope && scope.purpose !== 'unknown' && state && !state.terminal && state.localOutcome === undefined
+    && !state.journalFailed && state.usage === usage
+    && usageMatchesAttempt(scope, usage) ? scope.modelCallId : undefined;
 }
 
 export function withModelTransportAttempt<T>(scope: ModelTransportAttempt, work: () => T): T {

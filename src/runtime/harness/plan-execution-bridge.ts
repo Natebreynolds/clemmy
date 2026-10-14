@@ -4,6 +4,7 @@ import { resolveExactTerminalForAcceptedSource } from './accepted-source-termina
 import { beginRunAttempt, getSession, getRunAttemptSourceUserEvent, listEvents, openEventLog, recordRunAttemptUserInput } from './eventlog.js';
 import { claimPlanExecution, getLatestPlanRevision, getPlanExecutionClaim, getPlanRevision, PlanArtifactError } from './plan-artifacts.js';
 import { parseTaskMode, taskModeDigest, type TaskMode } from './task-mode.js';
+import { turnLearningPolicyFields, type TurnLearningPolicy, type TurnLearningSource } from '../../memory/turn-learning-policy.js';
 
 export function admitPlanExecutionBridgeSource(input: {
   sessionId: string;
@@ -13,6 +14,8 @@ export function admitPlanExecutionBridgeSource(input: {
   displayText: string;
   modelDirectiveApplied: boolean;
   surface: string;
+  learningPolicy?: TurnLearningPolicy;
+  learningPolicySource?: TurnLearningSource;
 }) {
   return openEventLog().transaction(() => {
     const session = getSession(input.sessionId);
@@ -46,6 +49,8 @@ export function admitPlanExecutionBridgeSource(input: {
     const newlyAccepted = input.sourceUserSeq === undefined && getRunAttemptSourceUserEvent(attempt) === null;
     const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
       text: input.displayText, taskMode: input.mode, runId, attemptId: attempt.attemptId,
+      ...turnLearningPolicyFields(input.learningPolicy),
+      ...(input.learningPolicySource ? { learningPolicySource: input.learningPolicySource } : {}),
       ...(input.modelDirectiveApplied ? { modelDirectiveApplied: true } : {}), source: `bridge:${input.surface}`,
     } }, { existingEventSeq: input.sourceUserSeq, armRunInFlight: true });
     const selected = claimPlanExecution({ ...scope, sourceUserSeq: source.seq, executeRef: scope.ref });

@@ -9,6 +9,7 @@ import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
 import { getPlanRevision, type PlanArtifactV1 } from './plan-artifacts.js';
 import { checkReviewedPlanPreparation } from './reviewed-plan-runtime.js';
 import { parseTaskMode, taskModeDigest, taskModeFields } from './task-mode.js';
+import { turnLearningPolicyFields } from '../../memory/turn-learning-policy.js';
 import { acceptedTaskMode } from './accepted-task-mode.js';
 import { readConnectionExecutionActivation } from './connection-execution-activation-proof.js';
 import { assertConnectionExecutionOwned } from './connection-execution-activation.js';
@@ -479,6 +480,8 @@ async function blockedPreRunResponse(
       data: {
         text: request.displayMessage ?? request.message,
         ...taskModeFields(request.taskMode),
+        ...turnLearningPolicyFields(request.learningPolicy),
+        ...(request.learningPolicySource ? { learningPolicySource: request.learningPolicySource } : {}),
         ...(request.runId ? { runId: request.runId } : {}),
         ...(request.hostDirective === true ? { hostDirective: true } : {}),
         attemptId: preflightAttempt.attemptId,
@@ -911,6 +914,8 @@ async function ensureAcceptedRecoveryTurn(
     data: {
       text: displayMessage,
       ...taskModeFields(request.taskMode),
+      ...turnLearningPolicyFields(request.learningPolicy),
+      ...(request.learningPolicySource ? { learningPolicySource: request.learningPolicySource } : {}),
       ...(request.runId ? { runId: request.runId } : {}),
       ...(request.hostDirective === true ? { hostDirective: true } : {}),
       attemptId: attempt.attemptId,
@@ -1654,6 +1659,8 @@ export async function respondViaHarness(
   const reviewedAdmission = !connection && requestedMode?.kind === 'execute' ? admitPlanExecutionBridgeSource({
     sessionId, sourceUserSeq: acceptedSourceUserSeq, runId: request.runId, mode: requestedMode,
     displayText: displayMessage, modelDirectiveApplied: displayMessage !== request.message, surface,
+    learningPolicy: request.learningPolicy,
+    learningPolicySource: request.learningPolicySource,
   }) : null;
   if (reviewedAdmission?.kind === 'joined') {
     return { sessionId, text: 'This reviewed revision already has an execution. The existing run remains its owner; no duplicate work was started.', stoppedReason: 'awaiting-input',
@@ -1672,6 +1679,8 @@ export async function respondViaHarness(
       text: displayMessage,
       ...(ownerChoice ? { ownerChoice } : {}),
       ...taskModeFields(request.taskMode),
+      ...turnLearningPolicyFields(request.learningPolicy),
+      ...(request.learningPolicySource ? { learningPolicySource: request.learningPolicySource } : {}),
       ...(displayMessage !== request.message ? { modelDirectiveApplied: true } : {}),
       ...(request.runId ? { runId: request.runId } : {}),
       attemptId: requestAttempt.attemptId,

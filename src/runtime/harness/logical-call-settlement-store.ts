@@ -662,7 +662,7 @@ function observeSettledRequestEffect(input: CommitLogicalCallSettlementInput): v
     if (!requestEffectLearnable(`mcp__${operationId}`, input.contract.args)) return;
     scheduleRequestEffectLearning(
       { providerKind: 'native_mcp', operationId, args: input.contract.args, result: input.result?.payload },
-      { sessionId: input.identity.sessionId },
+      { sessionId: input.identity.sessionId, sourceUserSeq: input.identity.sourceUserSeq },
     );
   } catch {
     // Learning is additive; the settlement stands on its own.

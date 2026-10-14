@@ -28,6 +28,7 @@
 import { AsyncResource } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import pino from 'pino';
+import { captureTurnLearningScope, readTurnLearningPolicyForScope, type TurnLearningScope } from '../../memory/turn-learning-policy.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { peekTurnSemanticModelPort } from '../semantic-boundary/turn-semantic-port-registry.js';
 import { OPERATION_DELIVERY_JUDGE_PURPOSE } from '../semantic-boundary/turn-semantic-model-port.js';
@@ -94,6 +95,8 @@ export type OperationDeliveryLearningOutcome =
   | 'already_learned'
   | 'not_send_shaped'
   | 'definition_unreadable'
+  | 'learning_excluded'
+  | 'learning_source_unavailable'
   | 'screen_unavailable'
   | 'screen_not_confident'
   | 'confirm_unavailable'
@@ -280,8 +283,9 @@ async function screenWithJev(input: {
   inputSchema: string;
   effectiveArguments?: Record<string, unknown>;
   sessionId?: string;
-}): Promise<OperationDeliveryScreenResult> {
+}, scope: TurnLearningScope): Promise<OperationDeliveryScreenResult> {
   const { evaluateSystemOne } = await import('../jev/client.js');
+  if (learningHold(scope)) return { ok: false };
   const result = await evaluateSystemOne({
     state: { description: input.description, inputSchema: input.inputSchema,
       ...(input.effectiveArguments ? { effectiveArguments: input.effectiveArguments } : {}) },
@@ -362,6 +366,12 @@ function probabilityAtMost(value: unknown, max: number): boolean {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= max;
 }
 
+function learningHold(scope: TurnLearningScope): OperationDeliveryLearningOutcome | null {
+  const policy = readTurnLearningPolicyForScope(scope);
+  return policy.status === 'allowed' ? null
+    : policy.status === 'excluded' ? 'learning_excluded' : 'learning_source_unavailable';
+}
+
 async function learnPrepared(
   prepared: PreparedDefinition,
   options: {
@@ -370,20 +380,26 @@ async function learnPrepared(
     sessionId?: string;
     now?: () => Date;
   },
+  scope: TurnLearningScope,
 ): Promise<OperationDeliveryLearningOutcome> {
+  const beforeScreen = learningHold(scope);
+  if (beforeScreen) return beforeScreen;
   // A queued reading can become obsolete before it starts. Do not spend a
   // model call on metadata discovery has already replaced or invalidated.
   if (latestObserved.get(prepared.key) !== prepared.definitionDigest) return 'superseded';
   const session = options.sessionId ? { sessionId: options.sessionId } : {};
+  const screenInput = {
+    description: prepared.description,
+    inputSchema: prepared.schemaText,
+    ...(prepared.effectiveArguments ? { effectiveArguments: prepared.effectiveArguments } : {}),
+    ...session,
+  };
   const screen = await boundedWait(
-    (options.screen ?? screenWithJev)({
-      description: prepared.description,
-      inputSchema: prepared.schemaText,
-      ...(prepared.effectiveArguments ? { effectiveArguments: prepared.effectiveArguments } : {}),
-      ...session,
-    }),
+    options.screen ? options.screen(screenInput) : screenWithJev(screenInput, scope),
     SCREEN_TIMEOUT_MS + 2_000,
   );
+  const beforeConfirm = learningHold(scope);
+  if (beforeConfirm) return beforeConfirm;
   if (latestObserved.get(prepared.key) !== prepared.definitionDigest) return 'superseded';
   if (!screen?.ok || typeof screen.model !== 'string' || !screen.model.trim()) return 'screen_unavailable';
   if (
@@ -401,6 +417,8 @@ async function learnPrepared(
     }),
     CONFIRM_TIMEOUT_MS + 2_000,
   );
+  const afterConfirm = learningHold(scope);
+  if (afterConfirm) return afterConfirm;
   if (!confirm?.ok || typeof confirm.model !== 'string' || !confirm.model.trim()) return 'confirm_unavailable';
   // Two readings by one model are one reading.
   if (confirm.model.trim() === screen.model.trim()) return 'confirm_unavailable';
@@ -417,6 +435,8 @@ async function learnPrepared(
 
   // A newer definition observed while the models were reading wins.
   if (latestObserved.get(prepared.key) !== prepared.definitionDigest) return 'superseded';
+  const beforeStore = learningHold(scope);
+  if (beforeStore) return beforeStore;
   const stored = rememberLearnedOperationDelivery({
     version: LEARNED_OPERATION_DELIVERY_VERSION,
     providerKind: prepared.providerKind,
@@ -453,13 +473,19 @@ export async function learnOperationDelivery(
     screen?: OperationDeliveryScreen;
     confirm?: OperationDeliveryConfirm;
     sessionId?: string;
+    sourceUserSeq?: number;
     now?: () => Date;
   } = {},
 ): Promise<OperationDeliveryLearningOutcome> {
+  const scope = captureTurnLearningScope(options);
+  // Observed metadata must still retire a stale risk-lowering exception,
+  // even when this source cannot schedule new learning.
   const preparation = observeDefinition(definition);
+  const hold = learningHold(scope);
+  if (hold) return hold;
   if (preparation.status !== 'prepared') return preparation.outcome;
   try {
-    const outcome = await learnPrepared(preparation.definition, options);
+    const outcome = await learnPrepared(preparation.definition, options, scope);
     noteOutcome(preparation.definition, outcome);
     return outcome;
   } catch {
@@ -541,14 +567,16 @@ function pump(): void {
  */
 export function scheduleOperationDeliveryLearning(
   definitions: readonly OperationDefinitionForDelivery[],
-  options: { sessionId?: string } = {},
+  options: { sessionId?: string; sourceUserSeq?: number } = {},
 ): number {
+  const scope = captureTurnLearningScope(options);
   let scheduled = 0;
   for (const definition of definitions) {
     try {
       // The budget bounds new model work, not freshness of definitions the
       // caller already observed. Later rows can retire old verdicts too.
       const preparation = observeDefinition(definition);
+      if (learningHold(scope)) continue;
       if (preparation.status !== 'prepared') continue;
       if (scheduled >= MAX_NEW_PER_CALL || queue.length >= MAX_QUEUED) continue;
       const prepared = preparation.definition;
@@ -559,7 +587,7 @@ export function scheduleOperationDeliveryLearning(
       const learnOptions = options.sessionId ? { sessionId: options.sessionId } : {};
       queue.push({
         prepared,
-        run: AsyncResource.bind(() => learnPrepared(prepared, learnOptions)),
+        run: AsyncResource.bind(() => learnPrepared(prepared, learnOptions, scope)),
       });
       scheduled += 1;
     } catch {

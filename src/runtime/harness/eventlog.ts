@@ -200,6 +200,8 @@ export const EVENT_TYPES = [
   // captureInteractionSignals. Lets the trace show "Clementine learned
   // X from this turn" so memory growth is observable.
   'memory_signals_captured',
+  // Optional learning held without blocking later accepted tasks' intake.
+  'memory_learning_intake_held',
   // Content-addressed host authority for an acknowledgement-only durable
   // memory action. Unlike memory_signals_captured telemetry, this event is
   // issued only after the host independently redeems the exact accepted source

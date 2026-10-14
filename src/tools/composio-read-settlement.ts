@@ -33,6 +33,8 @@ import {
 } from '../memory/verified-read-learning.js';
 import { scheduleLearningDrain } from '../memory/learning-worker.js';
 import { normalizeProcedureAccountIdentity } from '../runtime/read-path/procedure-scope.js';
+import { readTurnLearningPolicyForSource } from '../memory/turn-learning-policy.js';
+import { currentSourceSessionContext } from '../runtime/harness/source-session-context-scope.js';
 
 function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
@@ -90,8 +92,13 @@ export function settleVerifiedComposioRead(input: VerifiedComposioSettlementInpu
   }
   // The accepted source and live attempt exist NOW and are gone by the time
   // the worker runs — capture the intent phrase and identity here.
-  const captured = acceptedIntentPhraseForSettlement(input.sessionId, input.sourceUserSeq);
+  const sourceUserSeq = input.sourceUserSeq ?? currentSourceSessionContext(input.sessionId)?.sourceUserSeq;
+  if (sourceUserSeq === undefined) return { queued: false, reason: 'no exact accepted source identity' };
+  const captured = acceptedIntentPhraseForSettlement(input.sessionId, sourceUserSeq);
   if (!captured) return { queued: false, reason: 'no exact accepted source phrase' };
+  const policy = readTurnLearningPolicyForSource({ sessionId: input.sessionId, sourceUserSeq: captured.sourceUserSeq });
+  if (policy.status !== 'allowed') return { queued: false, reason: policy.status === 'excluded'
+    ? `turn_learning_excluded:${policy.policy.reason}` : policy.reason };
   const activeAttempt = getActiveRunAttempt(input.sessionId);
   const activeSource = activeAttempt ? getRunAttemptSourceUserEvent(activeAttempt) : null;
   const exactActiveAuthority = Boolean(activeAttempt

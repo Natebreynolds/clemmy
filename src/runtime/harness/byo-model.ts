@@ -32,6 +32,7 @@ import { recordByoRateLimit } from './rate-limit-store.js';
 import { noteCreditAnswered, noteCreditRefused } from '../provider-credit.js';
 import { isProviderCreditRefusal } from '../../shared/provider-capacity.js';
 import { createHash } from 'node:crypto';
+import { types as utilTypes } from 'node:util';
 import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
 import type { Model } from '@openai/agents-core';
 import { withTracelessStep } from './traceless-step-model.js';
@@ -39,7 +40,7 @@ import { withChatToolImages } from './chat-tool-images.js';
 import type { ByoBackendConfig } from '../../config.js';
 import { getRuntimeEnv } from '../../config.js';
 import { repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } from './json-repair.js';
-import { withResilience } from './resilient-model.js';
+import { withResilience, withPublicModelCallObservation } from './resilient-model.js';
 import {
   completionsReasoningEffort,
   completionsThinkingSwitch,
@@ -49,6 +50,8 @@ import {
   INSTRUCTION_CACHE_DELIM,
 } from './model-wire-registry.js';
 import { recordModelUsage } from '../usage-log.js';
+import { captureModelTransportUsageOwner, captureActiveModelTransportUsage, capturedModelTransportUsageCallId,
+  type CapturedModelTransportUsage } from './model-transport-observation.js';
 import { recordWindowAcceptance, recordWindowRejection } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
@@ -145,7 +148,7 @@ const downgradedSchemas = new WeakMap<object, unknown>();
 
 /** Immutable scalar identity captured after the SDK/providerData merge and
  * compat rewrites. Kept off the wire and off all prompt/content telemetry. */
-interface ByoRequestIdentity { requestModel?: string; backendId?: string }
+interface ByoRequestIdentity { requestModel?: string; backendId?: string; usageCapture?: CapturedModelTransportUsage }
 const requestIdentities = new WeakMap<object, Readonly<ByoRequestIdentity>>();
 
 /** Observed-once-per-body report that the harness chose an effort tier and this
@@ -812,6 +815,7 @@ async function wrappedCompletionsCreate(
     requestIdentities.set(relaxed, Object.freeze({
       ...(typeof relaxed.model === 'string' ? { requestModel: relaxed.model } : {}),
       ...(backendId ? { backendId } : {}),
+      usageCapture: captureActiveModelTransportUsage(),
     }));
     const structured = downgradedBodies.has(relaxed as object);
 
@@ -1205,11 +1209,15 @@ function recordByoUsage(
     if (inputTokens === 0 && outputTokens === 0) return;
     const cached = n(details?.cached_tokens) || n(u.cached_tokens);
     const harnessContext = context;
-    const sessionId = harnessContext?.sessionId ?? 'unknown';
+    const capture = wire?.identity?.usageCapture;
+    const callId = capture && capturedModelTransportUsageCallId(capture.attempt, capture.callerProvenance);
+    const sessionId = capture ? capture.owner?.sessionId ?? 'byo:unowned' : harnessContext?.sessionId ?? 'unknown';
     recordModelUsage({
+      ...(capture ? { callerProvenance: capture.callerProvenance } : {}),
+      ...(callId ? { trace: { modelCallId: callId } } : {}),
       sessionId,
-      sourceUserSeq: harnessContext?.sourceUserSeq,
-      attemptId: harnessContext?.runAttemptId,
+      sourceUserSeq: capture ? capture.owner?.sourceUserSeq : harnessContext?.sourceUserSeq,
+      attemptId: capture ? capture.owner?.runAttemptId : harnessContext?.runAttemptId,
       model: (completion as { model?: string })?.model || (typeof fallbackModel === 'string' ? fallbackModel : 'byo'),
       requestModel: wire?.identity?.requestModel,
       backendId: wire?.identity?.backendId,
@@ -1229,7 +1237,7 @@ function recordByoUsage(
         ? { durationMs: Math.max(0, Date.now() - startedAt) }
         : {}),
       ...byoWireObservations(u, wire, startedAt),
-      framePromptComponents: harnessContext?.promptComponents,
+      framePromptComponents: capture ? capture.framePromptComponents : harnessContext?.promptComponents,
     });
     // Proven-acceptance learning: an accepted request above our believed
     // window raises the budgeting floor (writes only when it beats the
@@ -1243,6 +1251,33 @@ function recordByoUsage(
 
 const clientCache = new Map<string, OpenAI>();
 const modelCache = new Map<string, Model>();
+
+/** Preserve the legacy harness-only accounting tuple at public creation, never
+ * a drainer's tuple. Own-data snapshots cannot execute context getters/proxies.
+ * The transport helper uses this fallback only when usage ALS is absent. */
+function captureByoPublicOwner() {
+  let fallback: { sessionId: string; sourceUserSeq: number; attemptId?: string; promptComponents?: Record<string, number> } | undefined;
+  try {
+    const context = harnessRunContextStorage.getStore();
+    if (context && !utilTypes.isProxy(context)) {
+      const descriptors = Object.getOwnPropertyDescriptors(context);
+      const data = (key: string) => descriptors[key] && 'value' in descriptors[key] ? descriptors[key].value : undefined;
+      const sessionId = data('sessionId'), sourceUserSeq = data('sourceUserSeq'), attemptId = data('runAttemptId');
+      if (typeof sessionId === 'string' && typeof sourceUserSeq === 'number' && Number.isSafeInteger(sourceUserSeq)) {
+        fallback = { sessionId, sourceUserSeq, ...(typeof attemptId === 'string' ? { attemptId } : {}) };
+        const components = data('promptComponents');
+        if (components && typeof components === 'object' && !utilTypes.isProxy(components)) {
+          const fields = Object.getOwnPropertyDescriptors(components);
+          if (Reflect.ownKeys(fields).every(key => typeof key === 'string' && 'value' in fields[key]
+            && typeof fields[key].value === 'number' && Number.isFinite(fields[key].value))) {
+            fallback.promptComponents = Object.freeze(Object.fromEntries(Object.entries(fields).map(([key, field]) => [key, field.value])));
+          }
+        }
+      }
+    }
+  } catch { /* diagnostic capture stays unowned */ }
+  return captureModelTransportUsageOwner(fallback);
+}
 
 function clientKey(byo: ByoBackendConfig): string {
   // A rotation with the same suffix is a different credential. Keep the full
@@ -1358,7 +1393,8 @@ export function getByoModel(modelId: string, byo: ByoBackendConfig): Model {
   if (modelParityEnabled()) {
     model = withResilience(model, { label: 'byo', capability: resolveModelCapability(modelId) });
   }
-  model = withConversationProtocolBoundaryAssertion(model, `byo.openai_compatible:${modelId}`);
+  model = withPublicModelCallObservation(
+    withConversationProtocolBoundaryAssertion(model, `byo.openai_compatible:${modelId}`), model, captureByoPublicOwner);
   modelCache.set(mkey, model);
   return model;
 }

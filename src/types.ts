@@ -1,5 +1,6 @@
 import type { TaskMode } from './runtime/harness/task-mode.js';
 import type { WorkflowDefinition } from './memory/workflow-store.js';
+import type { TurnLearningPolicy, TurnLearningSource } from './memory/turn-learning-policy.js';
 
 export interface Models {
   fast: string;
@@ -10,6 +11,8 @@ export interface Models {
 export type AuthMode = 'api_key' | 'codex_oauth' | 'claude_oauth';
 
 export interface RunRequest {
+  /** Excludes automatic learning from a newly accepted task; retained on its exact source. */
+  learningPolicy?: TurnLearningPolicy;
   instructions?: string;
   model?: string;
   prompt: string;
@@ -316,6 +319,12 @@ export interface TaskContinuationContext {
 }
 
 export interface AssistantRequest {
+  /** Exclusion-only automatic-learning policy for a newly accepted task.
+   * Reentry always reads the immutable accepted source's policy. */
+  learningPolicy?: TurnLearningPolicy;
+  /** Host-only frozen background/delegation origin. Restricts automatic
+   * learning and grants no execution, recall, or effect authority. */
+  learningPolicySource?: TurnLearningSource;
   /** A one-time token for a choice the owner tapped on Home, minted by the
    * From Clem reply path and redeemed once by the bridge into the accepted
    * source's own event. Any other value is nothing. */

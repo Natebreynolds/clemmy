@@ -1045,3 +1045,58 @@ test('native and ordinary duplicate original objects stay ambiguous; untracked f
   await withResilience({ async getResponse() { return foreign; }, async *getStreamedResponse() {} }, policy()).getResponse(req());
   assert.deepEqual(completedModelResponseBinding(foreign), foreignProof);
 });
+
+// The public BYO assertion must stay lazy while its observation owner does not.
+test('public observation entry keeps the original observer and transport, without restoring provider execution context', async () => {
+  const { withPublicModelCallObservation } = await import('./resilient-model.js');
+  const { withConversationProtocolBoundaryAssertion } = await import('./conversation-protocol-boundary.js');
+  const { withModelUsageAttribution, modelUsageAttributionStorage } = await import('../usage-log.js');
+  const { harnessRunContextStorage } = await import('./brackets.js');
+  const { withModelTransportRecorder } = await import('./model-transport-observation.js');
+  const a: ResilienceTelemetryEvent[] = [], b: ResilienceTelemetryEvent[] = [];
+  const transport: Readonly<Record<string, unknown>>[] = [];
+  let calls = 0;
+  const inner = withResilience({ async getResponse() { throw new Error('unused'); }, async *getStreamedResponse() {
+    calls++;
+    assert.equal(modelUsageAttributionStorage.getStore()?.sessionId, 'execution-b');
+    assert.equal(harnessRunContextStorage.getStore()?.sessionId, 'execution-b');
+    yield { type: 'response_done', response: { responseId: 'entry-provider', output: [{ type: 'message' }], usage: {} } } as never;
+  } }, policy({ maxRetries: 0 }));
+  const model = withPublicModelCallObservation(withConversationProtocolBoundaryAssertion(inner, 'fixture'), inner);
+  const stream = withModelTransportRecorder(row => transport.push(row), () =>
+    withModelUsageAttribution({ sessionId: 'original-a', sourceUserSeq: 10, attemptId: 'attempt-a', role: 'brain' }, () =>
+      withModelResilienceTelemetry(event => a.push(event), () => model.getStreamedResponse(req()))));
+  assert.equal(calls, 0); assert.equal(a.length, 0); assert.equal(transport.length, 0);
+  assert.equal(stream[Symbol.asyncIterator](), stream[Symbol.asyncIterator](), 'one public stream retains one original iterator');
+  await withModelUsageAttribution({ sessionId: 'execution-b', sourceUserSeq: 20, attemptId: 'attempt-b', role: 'brain' }, () =>
+    harnessRunContextStorage.run({ sessionId: 'execution-b' } as never, () => withModelResilienceTelemetry(event => b.push(event), async () => {
+      for await (const _event of stream) { /* exact original iterator */ }
+    })));
+  for await (const _event of stream) { assert.fail('a drained stream cannot reopen its provider'); }
+  assert.equal(calls, 1); assert.equal(b.length, 0); assert.equal(a.filter(e => e.type === 'call_started').length, 1);
+  assert.equal(a.at(-1)?.type, 'call_finished');
+  assert.ok(transport.length > 0); assert.ok(transport.every(row => row.sourceUserSeq === 10 && row.runAttemptId === 'attempt-a'));
+});
+
+test('public observation entry does not read requests or move assertion/return/throw timing', async () => {
+  const { withPublicModelCallObservation } = await import('./resilient-model.js');
+  const { withConversationProtocolBoundaryAssertion, ConversationProtocolBoundaryAssertionError } = await import('./conversation-protocol-boundary.js');
+  let calls = 0;
+  const inner = withResilience({ async getResponse() { throw new Error('unused'); }, async *getStreamedResponse() {
+    calls++; yield { type: 'response_started' } as never;
+  } }, policy({ maxRetries: 0 }));
+  const model = withPublicModelCallObservation(withConversationProtocolBoundaryAssertion(inner, 'fixture'), inner);
+  let reads = 0;
+  const request = { ...req(), get input() { reads++; return [{ type: 'function_call', callId: 'open', name: 'fixture', arguments: '{}' },
+    { role: 'user', content: 'cannot cross the open frame' }]; } } as unknown as ModelRequest;
+  const unopened = model.getStreamedResponse(request);
+  assert.equal(reads, 0); assert.equal(calls, 0);
+  await unopened[Symbol.asyncIterator]().return?.();
+  assert.equal(reads, 0); assert.equal(calls, 0);
+  const iterator = model.getStreamedResponse(request)[Symbol.asyncIterator]();
+  await assert.rejects(iterator.next(), ConversationProtocolBoundaryAssertionError);
+  assert.equal(reads, 1); assert.equal(calls, 0);
+  const thrown = new Error('caller stopped before drain');
+  await assert.rejects(model.getStreamedResponse(req())[Symbol.asyncIterator]().throw!(thrown), error => error === thrown);
+  assert.equal(calls, 0);
+});

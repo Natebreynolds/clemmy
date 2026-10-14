@@ -86,6 +86,8 @@ import { claudeAccountHasRoom } from '../runtime/harness/claude-usage.js';
 import { publicProviderCapacityText } from '../runtime/harness/public-presentation.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { recordRunStrategy } from '../memory/run-strategy-store.js';
+import { readTurnLearningPolicyForSource } from '../memory/turn-learning-policy.js';
+import { backgroundTaskLearningSource } from './background-task-learning.js';
 import { updateLinkedFocusAction } from '../memory/focus.js';
 import {
   evaluateLearningCandidate,
@@ -2959,6 +2961,8 @@ const STRATEGY_META_TOOLS = new Set([
 ]);
 
 function captureRunStrategyFromTrace(updated: BackgroundTaskRecord): void {
+  const learningSource = backgroundTaskLearningSource(updated);
+  if (learningSource && readTurnLearningPolicyForSource(learningSource).status !== 'allowed') return;
   const db = openEventLog();
   const toolRows = db.prepare(
     'SELECT tool, COUNT(*) AS n FROM tool_outputs WHERE session_id = ? GROUP BY tool ORDER BY n DESC LIMIT 24',
@@ -6451,6 +6455,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        const requestedModel = executionModelPin?.modelId ?? task.model ?? resolveRoleModel('brain').modelId;
 	        response = await backgroundResponseExecutor(assistant, {
 	          sessionId: task.runSessionId,
+              learningPolicySource: backgroundTaskLearningSource(task),
 	          channel: task.channel ?? 'background',
 	          userId: task.userId,
 	          model: requestedModel,

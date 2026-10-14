@@ -19,6 +19,7 @@
 import { AsyncResource } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import pino from 'pino';
+import { captureTurnLearningScope, readTurnLearningPolicyForScope, type TurnLearningScope } from '../../memory/turn-learning-policy.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { peekTurnSemanticModelPort } from '../semantic-boundary/turn-semantic-port-registry.js';
 import { REQUEST_EFFECT_JUDGE_PURPOSE } from '../semantic-boundary/turn-semantic-model-port.js';
@@ -85,6 +86,8 @@ export type RequestEffectLearningOutcome =
   | 'already_learned'
   | 'no_shape'
   | 'no_evidence'
+  | 'learning_excluded'
+  | 'learning_source_unavailable'
   | 'screen_unavailable'
   | 'screen_not_confident'
   | 'confirm_unavailable'
@@ -199,8 +202,9 @@ async function boundedWait<T>(work: Promise<T>, timeoutMs: number): Promise<T | 
 async function screenWithJev(input: {
   evidence: RequestEffectEvidence;
   sessionId?: string;
-}): Promise<RequestEffectScreenResult> {
+}, scope: TurnLearningScope): Promise<RequestEffectScreenResult> {
   const { evaluateSystemOne } = await import('../jev/client.js');
+  if (learningHold(scope)) return { ok: false };
   const result = await evaluateSystemOne({
     state: input.evidence,
     questions: {
@@ -255,6 +259,12 @@ function probabilityAtMost(value: unknown, max: number): boolean {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= max;
 }
 
+function learningHold(scope: TurnLearningScope): RequestEffectLearningOutcome | null {
+  const policy = readTurnLearningPolicyForScope(scope);
+  return policy.status === 'allowed' ? null
+    : policy.status === 'excluded' ? 'learning_excluded' : 'learning_source_unavailable';
+}
+
 async function learnPrepared(
   prepared: PreparedRequest,
   options: {
@@ -263,12 +273,18 @@ async function learnPrepared(
     sessionId?: string;
     now?: () => Date;
   },
+  scope: TurnLearningScope,
 ): Promise<RequestEffectLearningOutcome> {
+  const beforeScreen = learningHold(scope);
+  if (beforeScreen) return beforeScreen;
   const session = options.sessionId ? { sessionId: options.sessionId } : {};
+  const screenInput = { evidence: prepared.evidence, ...session };
   const screen = await boundedWait(
-    (options.screen ?? screenWithJev)({ evidence: prepared.evidence, ...session }),
+    options.screen ? options.screen(screenInput) : screenWithJev(screenInput, scope),
     SCREEN_TIMEOUT_MS + 2_000,
   );
+  const beforeConfirm = learningHold(scope);
+  if (beforeConfirm) return beforeConfirm;
   if (!screen?.ok || typeof screen.model !== 'string' || !screen.model.trim()) return 'screen_unavailable';
   if (!probabilityAtMost(screen.changeProbability, LEARNED_REQUEST_EFFECT_SCREEN_MAX)) {
     logger.info({ operationId: prepared.operationId, shape: prepared.shape, screen: screen.model,
@@ -285,6 +301,8 @@ async function learnPrepared(
     }),
     CONFIRM_TIMEOUT_MS + 2_000,
   );
+  const afterConfirm = learningHold(scope);
+  if (afterConfirm) return afterConfirm;
   if (!confirm?.ok || typeof confirm.model !== 'string' || !confirm.model.trim()) return 'confirm_unavailable';
   // Two readings by one model are one reading.
   if (confirm.model.trim() === screen.model.trim()) return 'confirm_unavailable';
@@ -310,6 +328,8 @@ async function learnPrepared(
     return 'confirm_not_confident';
   }
 
+  const beforeStore = learningHold(scope);
+  if (beforeStore) return beforeStore;
   const stored = rememberLearnedRequestEffect({
     version: LEARNED_REQUEST_EFFECT_VERSION,
     providerKind: prepared.providerKind,
@@ -335,13 +355,19 @@ export async function learnRequestEffect(
     screen?: RequestEffectScreen;
     confirm?: RequestEffectConfirm;
     sessionId?: string;
+    sourceUserSeq?: number;
     now?: () => Date;
   } = {},
 ): Promise<RequestEffectLearningOutcome> {
+  const sessionId = options.sessionId ?? input.sessionId;
+  const scope = options.sessionId !== undefined && input.sessionId !== undefined && options.sessionId !== input.sessionId
+    ? { kind: 'unavailable' } as const : captureTurnLearningScope({ sessionId, sourceUserSeq: options.sourceUserSeq });
+  const hold = learningHold(scope);
+  if (hold) return hold;
   const preparation = prepare(input);
   if (preparation.status !== 'prepared') return preparation.outcome;
   try {
-    return await learnPrepared(preparation.request, options);
+    return await learnPrepared(preparation.request, { ...options, sessionId }, scope);
   } catch {
     return 'screen_unavailable';
   }
@@ -422,9 +448,13 @@ function pump(): void {
  */
 export function scheduleRequestEffectLearning(
   input: SettledRequestForEffect,
-  options: { sessionId?: string } = {},
+  options: { sessionId?: string; sourceUserSeq?: number } = {},
 ): boolean {
   try {
+    const sessionId = options.sessionId ?? input.sessionId;
+    const scope = options.sessionId !== undefined && input.sessionId !== undefined && options.sessionId !== input.sessionId
+      ? { kind: 'unavailable' } as const : captureTurnLearningScope({ sessionId, sourceUserSeq: options.sourceUserSeq });
+    if (learningHold(scope)) return false;
     const preparation = prepare(input);
     if (preparation.status !== 'prepared') return false;
     if (queue.length >= MAX_QUEUED) return false;
@@ -433,8 +463,8 @@ export function scheduleRequestEffectLearning(
     const retryAt = retryAfter.get(prepared.key);
     if (retryAt !== undefined && retryAt > Date.now()) return false;
     pending.add(prepared.key);
-    const learnOptions = options.sessionId ? { sessionId: options.sessionId } : {};
-    queue.push({ prepared, run: AsyncResource.bind(() => learnPrepared(prepared, learnOptions)) });
+    const learnOptions = sessionId ? { sessionId } : {};
+    queue.push({ prepared, run: AsyncResource.bind(() => learnPrepared(prepared, learnOptions, scope)) });
     if (!pumpScheduled) {
       pumpScheduled = true;
       setImmediate(pump);

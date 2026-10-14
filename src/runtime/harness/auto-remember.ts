@@ -20,7 +20,8 @@
  *   - Skips error/approval/unavailable results.
  * Best-effort + silent: learning is additive and must never break a tool call.
  */
-import { getActiveObjective, getActiveObjectiveForSession } from '../../memory/focus.js';
+import { getActiveObjective } from '../../memory/focus.js';
+import { captureTurnLearningScope, readTurnLearningPolicyForScope, type TurnLearningSource } from '../../memory/turn-learning-policy.js';
 import { peekToolChoice, rememberToolChoice } from '../../memory/tool-choice-store.js';
 import { cliCommandHead } from '../../memory/capability-effect-scope.js';
 import { classifyToolError, detectStructuredToolFailure } from './tool-error-corrective.js';
@@ -242,33 +243,22 @@ export function detectRememberableSuccess(
  * objective, record one canonical procedure (once), with the objective
  * retained as context.
  */
-function recallContextPhrase(opts?: { sessionId?: string; sourceUserSeq?: number }): string {
-  let sessionId = opts?.sessionId;
-  try {
-    const ambient = getToolOutputContext();
-    const run = harnessRunContextStorage.getStore();
-    sessionId = sessionId || ambient?.sessionId || run?.sessionId;
-    const sourceUserSeq = opts?.sourceUserSeq
-      || ambient?.sourceUserSeq
-      || run?.sourceUserSeq;
-    if (sessionId && Number.isSafeInteger(sourceUserSeq) && Number(sourceUserSeq) > 0) {
-      const seq = Number(sourceUserSeq);
-      const event = listEvents(sessionId, {
-        sinceSeq: seq - 1,
+function recallContextPhrase(source?: Readonly<TurnLearningSource>): string {
+  if (source) {
+    try {
+      const event = listEvents(source.sessionId, {
+        sinceSeq: source.sourceUserSeq - 1,
         types: ['user_input_received'],
         limit: 1,
-      }).find((row) => row.seq === seq);
+      }).find((row) => row.seq === source.sourceUserSeq);
       const display = typeof event?.data?.displayText === 'string' ? event.data.displayText : '';
       const text = typeof event?.data?.text === 'string' ? event.data.text : '';
       const phrase = (display || text).replace(/\s+/g, ' ').trim();
       if (phrase) return phrase.slice(0, 240);
-    }
-  } catch { /* session recall is additive */ }
-  return (
-    sessionId
-      ? getActiveObjectiveForSession(sessionId)
-      : getActiveObjective()
-  )?.trim() ?? '';
+    } catch { /* a missing exact ask never adopts a later objective */ }
+    return '';
+  }
+  return getActiveObjective()?.trim() ?? '';
 }
 
 function rememberableIntent(success: RememberableSuccess): string {
@@ -296,12 +286,14 @@ export function autoRememberOnSuccess(input: {
 }): void {
   try {
     if (!recallFromSuccessEnabled()) return;
+    const explicitSource = input.sessionId !== undefined || input.sourceUserSeq !== undefined;
+    const scope = captureTurnLearningScope(explicitSource ? input : {
+      sessionId: getToolOutputContext()?.sessionId ?? harnessRunContextStorage.getStore()?.sessionId,
+    });
+    if (readTurnLearningPolicyForScope(scope).status !== 'allowed') return;
     const success = detectRememberableSuccess(input.toolName, input.resultStr, input.args);
     if (!success) return;
-    const phrase = recallContextPhrase({
-      sessionId: input.sessionId,
-      sourceUserSeq: input.sourceUserSeq,
-    });
+    const phrase = recallContextPhrase(scope.kind === 'source' ? scope.source : undefined);
     if (!phrase) return;
     // The operation is the stable key. The accepted ask is a contextual alias
     // so the next paraphrase can retrieve this path without naming the tool.
@@ -311,6 +303,7 @@ export function autoRememberOnSuccess(input: {
     // otherwise "net MRR we sold" never becomes retrievable after the first
     // successful sf query. Other kinds keep the no-clobber rule.
     if (existing?.choice && success.kind !== 'cli') return;
+    if (readTurnLearningPolicyForScope(scope).status !== 'allowed') return;
     rememberToolChoice({
       intent,
       description: success.kind === 'cli'

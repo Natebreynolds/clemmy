@@ -184,7 +184,7 @@ test('identical data from two accounts yields two unique receipts and two candid
   for (const account of ['ap@northco.example', 'billing@southco.example']) {
     recordCanonicalReadSuccess(sessionId, 'MAILCO_FETCH_INVOICES', `call:${account}`);
     await composio._settleVerifiedComposioReadForTest({
-      toolSlug: 'MAILCO_FETCH_INVOICES', sessionId, result: identicalPayload,
+      toolSlug: 'MAILCO_FETCH_INVOICES', sessionId, sourceUserSeq: acceptedBySession.get(sessionId)!.sourceUserSeq, result: identicalPayload,
       accountIdentity: account,
     });
   }
@@ -478,7 +478,7 @@ test('the candidate card names every distinct account provenance for one identif
   for (const account of ['legal@northco.example', 'deals@southco.example']) {
     recordCanonicalReadSuccess(sessionId, 'MAILCO_SCAN_CONTRACTS', `call:${account}`);
     await composio._settleVerifiedComposioReadForTest({
-      toolSlug: 'MAILCO_SCAN_CONTRACTS', sessionId,
+      toolSlug: 'MAILCO_SCAN_CONTRACTS', sessionId, sourceUserSeq: acceptedBySession.get(sessionId)!.sourceUserSeq,
       result: { successful: true, data: { items: [{ id: 'c-1' }] } },
       accountIdentity: account,
     });

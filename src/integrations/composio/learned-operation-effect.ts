@@ -6,6 +6,7 @@
  * unsure or absent verdict leaves the conservative write default in place.
  */
 import { createHash } from 'node:crypto';
+import { captureTurnLearningScope, readTurnLearningPolicyForScope, type TurnLearningScope } from '../../memory/turn-learning-policy.js';
 import { composioSlugVerbEvidence } from './slug-effect.js';
 import { learnedComposioOperationEffect, rememberComposioOperationEffect } from './learned-operation-effect-store.js';
 
@@ -26,8 +27,9 @@ const READ_MIN = 0.9;
 const WRITE_MAX = 0.15;
 const TIMEOUT_MS = 2_500;
 
-async function evaluateWithJev(input: { slug: string; description: string; schemaText: string; sessionId?: string }) {
+async function evaluateWithJev(input: { slug: string; description: string; schemaText: string; sessionId?: string }, scope: TurnLearningScope) {
   const { evaluateSystemOne } = await import('../../runtime/jev/client.js');
+  if (readTurnLearningPolicyForScope(scope).status !== 'allowed') return { ok: false as const };
   const result = await evaluateSystemOne({
     state: { operation: input.slug, description: input.description, inputSchema: input.schemaText },
     questions: {
@@ -61,9 +63,12 @@ function definitionDigest(description: string, schemaText: string): string {
  */
 export async function learnComposioOperationEffects(
   definitions: readonly OperationDefinitionForEffect[],
-  options: { sessionId?: string; evaluate?: OperationEffectEvaluate; deadlineAt?: number } = {},
+  options: { sessionId?: string; sourceUserSeq?: number; evaluate?: OperationEffectEvaluate; deadlineAt?: number } = {},
 ): Promise<string[]> {
-  const evaluate = options.evaluate ?? evaluateWithJev;
+  const scope = captureTurnLearningScope(options);
+  if (readTurnLearningPolicyForScope(scope).status !== 'allowed') return [];
+  const sessionId = options.sessionId;
+  const evaluate: OperationEffectEvaluate = options.evaluate ?? ((input) => evaluateWithJev(input, scope));
   const learned: string[] = [];
   const seen = new Set<string>();
   for (const definition of definitions) {
@@ -80,10 +85,12 @@ export async function learnComposioOperationEffects(
     const existing = learnedComposioOperationEffect(slug);
     if (existing && existing.definitionDigest === digest) continue;
     try {
-      const verdict = await evaluate({ slug, description, schemaText, ...(options.sessionId ? { sessionId: options.sessionId } : {}) });
+      if (readTurnLearningPolicyForScope(scope).status !== 'allowed') break;
+      const verdict = await evaluate({ slug, description, schemaText, ...(sessionId ? { sessionId } : {}) });
       if (!verdict.ok) continue;
       const effect = verdict.readOnly >= READ_MIN ? 'read' : verdict.readOnly <= WRITE_MAX ? 'write' : null;
       if (!effect) continue;
+      if (readTurnLearningPolicyForScope(scope).status !== 'allowed') break;
       rememberComposioOperationEffect(slug, {
         effect, source: 'model', model: verdict.model, confidence: verdict.readOnly,
         definitionDigest: digest, at: new Date().toISOString(),
