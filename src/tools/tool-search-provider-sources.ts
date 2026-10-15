@@ -40,8 +40,10 @@ import {
   composioToolOperationVersion,
   composioToolSchemaObservedAt,
   getExactComposioToolsBySlugs,
+  listCachedToolkits,
   listUsableConnectedToolkits,
   peekConnectedToolkits,
+  searchConnectedComposioTools,
   selectToolkitConnection,
 } from '../integrations/composio/client.js';
 import {
@@ -2676,7 +2678,67 @@ export function buildAuthorizedToolSearchCandidateSources(
     },
     prepareCandidates: (input) => prepareCandidatesLive(input),
   };
-  async function searchLive({ query, signal, deadlineAt, accountSelection, deferPreparation }: Parameters<ToolSearchCandidateSource['search']>[0]): Promise<ToolSearchBrokerCandidate[]> {
+  // An app the query names that has no current connection. Discovery answers
+  // from connected apps only, so an owner asking about an app they have not
+  // connected was never shown it, and so never offered it. Its operations that
+  // match the query are listed, marked not connected. Whether the owner meant
+  // that app is the model's call (an app's name can also be an ordinary word);
+  // searching one of these exact operation names raises the Connect card.
+  async function namedUnconnectedCandidates(
+    query: string,
+    signal: AbortSignal | undefined,
+    deadlineAt: number | undefined,
+  ): Promise<ToolSearchBrokerCandidate[]> {
+    try {
+      const connected = new Set(peekConnectedToolkits()
+        .filter((connection) => /active|enabled|initiat/i.test(connection.status ?? ''))
+        .map((connection) => connection.slug.trim().toLowerCase()));
+      const lower = query.toLowerCase();
+      const words = new Set(lower.split(/[^a-z0-9]+/).filter(Boolean));
+      const compactQuery = lower.replace(/[^a-z0-9]/g, '');
+      const named = listCachedToolkits().filter((toolkit) => {
+        const slug = toolkit.slug.trim().toLowerCase();
+        if (!slug || connected.has(slug)) return false;
+        const name = toolkit.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+        return words.has(slug) || words.has(name) || (name.length >= 6 && compactQuery.includes(name));
+      }).slice(0, 2);
+      if (named.length === 0 || signal?.aborted) return [];
+      const outcome = await awaitBounded({
+        start: () => searchConnectedComposioTools(named.map((toolkit) => toolkit.slug), query, 8),
+        signal,
+        ...(deadlineAt !== undefined ? { deadlineAt: deadlineAt - PROVIDER_SOURCE_RETURN_MARGIN_MS } : {}),
+      });
+      if (outcome.kind !== 'settled') return [];
+      const appNames = new Map(named.map((toolkit) => [toolkit.slug.trim().toLowerCase(), toolkit.name]));
+      return outcome.value.filter((tool) => tool.inputParameters !== undefined).slice(0, 4).map((tool): ToolSearchBrokerCandidate => {
+        const toolkit = (tool.toolkitSlug ?? registeredToolkitOfSlug(tool.slug)).trim().toLowerCase();
+        const app = appNames.get(toolkit) ?? toolkit;
+        const slug = tool.slug.trim().toUpperCase();
+        return {
+          name: slug,
+          summary: `${tool.description?.trim() || tool.name} (${app} is not connected yet.)`,
+          schema: tool.inputParameters,
+          carrier: 'work_call',
+          score: composioDiscoveryScore(0.5, toolkit, slug),
+          invocation: { name: 'composio_execute_tool', fixedArgs: { tool_slug: slug }, payloadField: 'arguments' },
+          guidance: `${app} is not connected for the owner, so this cannot run yet. If the owner means ${app}, search tool_search for this exact operation name, ${slug}: that offers them the card to connect ${app}.`,
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+  async function searchLive(input: Parameters<ToolSearchCandidateSource['search']>[0]): Promise<ToolSearchBrokerCandidate[]> {
+    const [connected, unconnected] = await Promise.all([
+      searchConnectedLive(input),
+      exactComposioOperationsFromQuery(input.query).length > 0
+        ? Promise.resolve([] as ToolSearchBrokerCandidate[])
+        : namedUnconnectedCandidates(input.query, input.signal, input.deadlineAt),
+    ]);
+    const seen = new Set(connected.map((candidate) => candidate.name.trim().toUpperCase()));
+    return [...connected, ...unconnected.filter((candidate) => !seen.has(candidate.name.trim().toUpperCase()))];
+  }
+  async function searchConnectedLive({ query, signal, deadlineAt, accountSelection, deferPreparation }: Parameters<ToolSearchCandidateSource['search']>[0]): Promise<ToolSearchBrokerCandidate[]> {
       preparedSearchCandidates.clear();
       if (signal?.aborted) return [];
       const exactOperations = exactComposioOperationsFromQuery(query);
