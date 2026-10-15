@@ -1,5 +1,5 @@
 import { workerStandingInstructions } from './workflow-worker-standing-instructions.js';
-import { forEachSourceStepId } from './workflow-foreach-source.js';
+import { forEachSourcePath, forEachSourceStepId } from './workflow-foreach-source.js';
 import { brainBackupsConfigured } from '../runtime/harness/brain-backups.js';
 import { workflowVerificationDependencyState } from '../tools/workflow-verification-state.js';
 import { withWorkflowCommit as activationWorkflowCommit } from './workflow-commit.js';
@@ -13,6 +13,7 @@ import { LOGIN_KEYCHAIN_LOCKED_GUIDANCE, probeLoginKeychain } from '../runtime/l
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
 import { peekConnectedToolkits } from '../integrations/composio/client.js';
+import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
 import { describeWorkflowStepAction } from '../runtime/approval-summary.js';
 import {
@@ -1638,6 +1639,20 @@ export function catalogPreparationRefusalToCapabilityBlock(
         accountChoiceSet,
       });
     }
+  }
+  // An app that IS connected here is never reported as unconnected: the
+  // operation itself could not be provisioned (a name the provider does not
+  // have, or a definition that has not settled). Say that instead.
+  const toolkitSlug = tool ? registeredToolkitOfSlug(tool).trim().toLowerCase() : '';
+  if (toolkitSlug && peekConnectedToolkits().some((connection) => connection.slug?.trim().toLowerCase() === toolkitSlug)) {
+    return new WorkflowCapabilityBlockedError({
+      stepId: step.id,
+      tool,
+      toolkit: exactSchemaToolkitLabel(tool),
+      reason: 'exact_schema_boundary_mismatch',
+      message: `Step "${step.id}" names ${tool}; ${exactSchemaToolkitLabel(tool)} is connected, but that exact operation could not be provisioned (${why}). `
+        + 'No provider dispatch occurred. Check the operation name on the step; otherwise the run retries when the definition settles.',
+    });
   }
   return new WorkflowCapabilityBlockedError({
     stepId: step.id,
@@ -4457,10 +4472,8 @@ function resolveForEachSource(
     return { sourceId: null, value: resolveFrom(inputFrom, inputs, stepOutputs, undefined) };
   }
   const sourceId = forEachSourceStepId(raw);
-  if (!sourceId) return { sourceId: null, value: undefined };
-  const templated = /^\{\{\s*(steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?)\s*\}\}$/.exec(raw);
-  const directPath = /^(steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?)$/.exec(raw);
-  const from = templated?.[1] ?? directPath?.[1] ?? `steps.${sourceId}.output`;
+  const from = forEachSourcePath(raw);
+  if (!sourceId || !from) return { sourceId: null, value: undefined };
   return { sourceId, value: resolveFrom(from, {}, stepOutputs, undefined) };
 }
 
@@ -14230,7 +14243,7 @@ export interface CreationTestStepResult {
    * (append a row, read it back; upsert a record, confirm it) is the exact
    * pattern the evidence architecture asks users to build.
    */
-  status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error' | 'unverifiable' | 'needs_choice';
+  status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error' | 'unverifiable' | 'needs_choice' | 'needs_connection';
   detail?: string;
   /** The exact proven-pre-dispatch block behind a `needs_choice`, so the
    * creation test can PARK on it like any run instead of only describing it. */
@@ -14265,6 +14278,14 @@ function capabilityAppName(toolkit: string): string {
   return name ? name.charAt(0).toUpperCase() + name.slice(1) : 'the app';
 }
 
+/** The apps a creation test found missing in this setup, as one phrase. */
+function missingConnectionApps(steps: readonly CreationTestStepResult[]): string {
+  const apps = [...new Set(steps
+    .filter((s) => s.status === 'needs_connection')
+    .map((s) => capabilityAppName(s.block?.toolkit ?? '')))];
+  return apps.length <= 1 ? (apps[0] ?? 'an app') : `${apps.slice(0, -1).join(', ')} and ${apps.at(-1)}`;
+}
+
 /** One line per creation-test step, shared by the parked report and the
  *  terminal. Words, not emoji: this is read in Clem's own reply. */
 export function creationTestStepLines(steps: readonly CreationTestStepResult[]): string[] {
@@ -14276,6 +14297,7 @@ export function creationTestStepLines(steps: readonly CreationTestStepResult[]):
     if (s.status === 'needs_choice') {
       return [`- ${name} — needs your answer`, ...(s.detail ?? '').split('\n').map((line) => `    ${line}`)].join('\n');
     }
+    if (s.status === 'needs_connection') return `- ${name} — ${s.detail ?? 'needs an app connected here'}`;
     if (s.status === 'previewed') return `- ${name} — previewed; it makes a change, so the test didn't run it`;
     // Unverifiable is honest, not alarming: it names WHY the check could
     // not run so the report never implies a broken step.
@@ -14459,11 +14481,11 @@ export async function runCreationTest(
         previewTainted.add(step.id);
       } else if (dependsOnChoiceBlock(step)) {
         choiceBlocked.add(step.id);
-        stepOutputs[step.id] = { blocked: true, reason: 'a step it depends on is waiting for your choice' };
+        stepOutputs[step.id] = { blocked: true, reason: 'a step it depends on could not run yet' };
         results.push({
           stepId: step.id,
           status: 'unverifiable',
-          detail: 'waits on a step that needs your choice first',
+          detail: 'waits on a step above that could not run yet',
         });
       } else if (dependsOnPreview(step)) {
         // Verifying a write that was intentionally skipped is not possible.
@@ -14489,8 +14511,8 @@ export async function runCreationTest(
           results.push(creationTestVerdict(step.id, out));
         } catch (err) {
           if (err instanceof WorkflowCapabilityBlockedError
-            && workflowCapabilityBlockIsRecoverable(err.reason)) {
-            // Proven pre-dispatch: nothing ran. Ask, do not fail.
+            && err.reason === 'ambiguous-account' && err.accountChoiceSet) {
+            // Proven pre-dispatch: nothing ran. One real question: ask it.
             choiceBlocked.add(step.id);
             stepOutputs[step.id] = { blocked: true, reason: 'awaiting an exact capability choice' };
             results.push({
@@ -14498,6 +14520,29 @@ export async function runCreationTest(
               status: 'needs_choice',
               detail: creationTestCapabilityQuestion(workflow.name, err),
               block: err,
+            });
+          } else if (err instanceof WorkflowCapabilityBlockedError
+            && (err.reason === 'not-connected' || err.reason === 'identity-absent' || err.reason === 'suppressed')) {
+            // An app this step names is not connected in this setup. That is
+            // a dependency to connect, not a question and not a broken step.
+            choiceBlocked.add(step.id);
+            stepOutputs[step.id] = { blocked: true, reason: `${capabilityAppName(err.toolkit)} is not connected here` };
+            results.push({
+              stepId: step.id,
+              status: 'needs_connection',
+              detail: `needs ${capabilityAppName(err.toolkit)} connected here (it names ${err.tool}); nothing ran`,
+              block: err,
+            });
+          } else if (err instanceof WorkflowCapabilityBlockedError
+            && workflowCapabilityBlockIsRecoverable(err.reason)) {
+            // The app is there but the provider's exact definition has not
+            // settled. A run parks and retries; the test cannot check it yet.
+            choiceBlocked.add(step.id);
+            stepOutputs[step.id] = { blocked: true, reason: 'provider definition not settled' };
+            results.push({
+              stepId: step.id,
+              status: 'unverifiable',
+              detail: `${capabilityAppName(err.toolkit)} is connected, but the exact definition of ${err.tool} has not settled, so the test could not run it; a run waits for it and retries`,
             });
           } else {
             stepOutputs[step.id] = { blocked: true, reason: 'creation-test error' };
@@ -15529,6 +15574,11 @@ async function processOneRunFile(
           ? autoRetestRunId
             ? `The creation test passed, but ${activationBlockedReason}, so that pass no longer covers what's saved. I'm testing the newer version now; ${activateAfterCreationTest ? 'it turns on here if it passes' : 'it stays off'}.\n\n${lines.join('\n')}`
             : `The creation test passed for the version I checked, but I left "${workflow.data.name}" as it was because ${activationBlockedReason}. Run a fresh creation test on the newer version before turning it on.\n\n${lines.join('\n')}`
+        : result.steps.some((s) => s.status === 'needs_connection')
+          && result.steps.every((s) => ['ok', 'previewed', 'unverifiable', 'needs_connection', 'needs_choice'].includes(s.status))
+          // NOT a broken workflow: an app it names is not connected in this
+          // setup. Say which, and what connecting it leads to.
+          ? `"${workflow.data.name}" is ready except it needs ${missingConnectionApps(result.steps)} connected here, so it stays off.\n\n${lines.join('\n')}\n\nConnect ${missingConnectionApps(result.steps)} and I'll test it again${activateAfterCreationTest ? ' and turn it on if it passes' : ''}.`
         : result.steps.some((s) => s.status === 'needs_choice')
           // NOT a broken workflow — one unanswered question. Everything else
           // that stopped is downstream of it. Ask for the answer and say what

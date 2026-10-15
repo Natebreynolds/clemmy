@@ -428,3 +428,33 @@ test('an unanswered account choice during authoring is a QUESTION, and its depen
   assert.equal(result.steps.some((step) => step.status === 'error' || step.status === 'failed'), false,
     `nothing is reported broken: ${JSON.stringify(result.steps)}`);
 });
+
+test('a step naming an app this setup has not connected is a dependency to connect, not a question or a broken step', async (t) => {
+  runner._setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    prepareExternalCatalog: async () => ({
+      status: 'refused', reason: 'exact_operation_provisioning_refused', operationId: 'ACMECRM_LIST_LEADS', detail: 'toolkit_not_connected',
+    }) as never,
+    runConversation: (async () => { throw new Error('a step that cannot be provisioned never reaches its model'); }) as never,
+  });
+  t.after(() => runner._setWorkflowHarnessLoopImplsForTests());
+  const saved = workflows.writeWorkflow('connection-dependency-canary', {
+    name: 'Connection dependency canary', description: 'Reads leads from an app this setup has not connected.',
+    enabled: false, trigger: { manual: true },
+    steps: [
+      { id: 'pull_leads', prompt: 'List the newest leads with ACMECRM_LIST_LEADS.', sideEffect: 'read', allowedTools: ['ACMECRM_LIST_LEADS'] },
+      { id: 'summarize', prompt: 'Summarize the leads.', sideEffect: 'read', dependsOn: ['pull_leads'] },
+    ],
+  });
+  const result = await runner.runCreationTest(saved.data, saved.name, 'creation-connection-dependency', {},
+    { respond: async () => { throw new Error('legacy responder must not execute'); } } as never);
+  assert.equal(result.pass, false, 'it stays off until the app is connected');
+  const pull = result.steps.find((step) => step.stepId === 'pull_leads');
+  assert.equal(pull?.status, 'needs_connection', JSON.stringify(result.steps));
+  assert.match(pull?.detail ?? '', /connected here/);
+  assert.equal(result.steps.find((step) => step.stepId === 'summarize')?.status, 'unverifiable');
+  const lines = runner.creationTestStepLines(result.steps).join('\n');
+  assert.doesNotMatch(lines, /needs your answer|hit an error|failed/);
+  assert.match(lines, /connected here/);
+});
