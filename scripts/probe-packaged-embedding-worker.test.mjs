@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -217,7 +217,9 @@ test('canonical runtime is launched and logical model-directory retargeting refu
     renameSync(logicalModel, first); cpSync(first, second, { recursive: true });
     symlinkSync(first, logicalModel, process.platform === 'win32' ? 'junction' : 'dir');
     await assert.rejects(runPackagedEmbeddingProbe(f.settings, { spawnProcess: successfulSpawn(() => {
-      rmSync(logicalModel); symlinkSync(second, logicalModel, process.platform === 'win32' ? 'junction' : 'dir');
+      // Remove only the owned link: rmSync refuses directory symlinks on Node24.
+      unlinkSync(logicalModel); symlinkSync(second, logicalModel, process.platform === 'win32' ? 'junction' : 'dir');
+      assert.equal(realpathSync(logicalModel), realpathSync(second));
     }) }), /candidate_changed_during_probe/);
   } finally { f.cleanup(); }
 });
