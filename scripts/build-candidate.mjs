@@ -12,7 +12,9 @@ const gitHead = execFileSync('git', ['rev-parse', 'HEAD'], {
 const fingerprintBefore = fingerprintRuntimeSourceFromGit({ repoRoot, gitHead });
 
 const compiler = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
-const result = spawnSync(process.execPath, [compiler, '--outDir', 'dist'], {
+// The whole-program compile outgrew the default heap of a 7 GB release
+// runner (about 2 GB); give it room instead of failing out of memory.
+const result = spawnSync(process.execPath, ['--max-old-space-size=6144', compiler, '--outDir', 'dist'], {
   cwd: repoRoot,
   stdio: 'inherit',
 });
