@@ -122,7 +122,7 @@ test('Windows project paths resolve drive, UNC and spaces without shell interpre
   assert.equal(setup.resolveProjectMcpPath('C:\\Work\\Project Files', '.\\server.cjs', 'win32'), 'C:\\Work\\Project Files\\server.cjs');
   assert.equal(setup.resolveProjectMcpPath('\\\\host\\share\\Project', '${workspaceFolder}\\server.py', 'win32'), '\\\\host\\share\\Project\\server.py');
   assert.equal(setup.resolveProjectMcpPath('/work/project', '../data.json', 'linux', '/work/project/scripts'), '/work/project/data.json');
-  for (const bad of ['C:server.py', '\\server.py', '/Users/owner/server.py', '..\\outside.cjs']) {
+  for (const bad of ['C:server.py', '\\server.py', '/srv/elsewhere/server.py', '..\\outside.cjs']) {
     assert.throws(() => setup.resolveProjectMcpPath('C:\\Work\\Project Files', bad, 'win32'));
   }
 });
