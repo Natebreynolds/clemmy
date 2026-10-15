@@ -6930,7 +6930,14 @@ const runHostTurnBody = async (
         attestation,
         manifest,
         effect: dispatchEffect,
-        boundary: preserveExternalCarrier ? 'nested_owned' : 'host_owned_external',
+        // Clementine's own registry tools reached through a reviewed catalog
+        // entry run in this process: the crossing is host-local, so its
+        // returned value is the host's own evidence. Recording it as a
+        // provider crossing settled a returned local read (a workflow step's
+        // read_file on a bring-your-own model) as an unclassifiable reply.
+        boundary: preserveExternalCarrier
+          ? 'nested_owned'
+          : manifest.providerKind === 'local_registry' ? 'host_owned_local' : 'host_owned_external',
         logicalToolName: manifest.operationId,
         logicalArgs: effectiveArgs,
         ...(sourceCapability ? { sourceCapability } : {}),
