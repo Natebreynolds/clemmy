@@ -202,6 +202,30 @@ export interface RequestEffectJudgeResult {
   modelIdentity: string;
 }
 
+export const OPERATION_VARIANT_READ_JUDGE_PURPOSE = 'operation_variant_read_judge' as const;
+
+/** One action of a multi-action external operation, judged from the
+ * operation's own definition: does every call that fixes these argument
+ * values, whatever else it passes, only read? The operation's name is
+ * deliberately not part of the call. */
+export interface OperationVariantReadJudgeCall {
+  purpose: typeof OPERATION_VARIANT_READ_JUDGE_PURPOSE;
+  sessionId?: string;
+  description: string;
+  /** Canonical JSON text of the exact input schema. */
+  inputSchema: string;
+  /** The enumerated argument values this call fixes. */
+  fixedArguments: Readonly<Record<string, string | number | boolean>>;
+  definitionDigest: string;
+}
+
+export interface OperationVariantReadJudgeResult {
+  changesAnything: 'yes' | 'no' | 'uncertain';
+  confidence: number;
+  definitionDigest: string;
+  modelIdentity: string;
+}
+
 export const CALENDAR_READ_OPERATION_PURPOSE = 'calendar_read_operation' as const;
 
 /** Every connected provider's whole operation list, by id only (no
@@ -358,6 +382,9 @@ export interface TurnSemanticModelPort {
    * anything on its provider. A verdict is evidence for the learned
    * request-effect store only. */
   judgeRequestEffect?(call: RequestEffectJudgeCall): Promise<RequestEffectJudgeResult>;
+  /** Confirms, on the judge role, whether one action of a multi-action
+   * operation only reads. Evidence for one exact call's consent only. */
+  judgeOperationVariantRead?(call: OperationVariantReadJudgeCall): Promise<OperationVariantReadJudgeResult>;
   /** On the judge role: which current read lists calendar events in a
    * window, and how its arguments and fields are read. Evidence for the
    * learned calendar-read store only. */

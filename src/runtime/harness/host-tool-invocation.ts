@@ -628,9 +628,12 @@ export function hostCallAccounting(
   input: Pick<InvokeHostToolCallInput<unknown>, 'identity' | 'effect' | 'boundary' | 'consentBasis'>,
 ): { mutating: boolean; projectsExternalWrite: boolean; learnedRead: boolean } {
   const probe = preparationProbeInvocation(input);
+  // A call admitted as one action of a multi-action tool that only reads
+  // (consent basis exact_variant_read) is booked the same way.
   const learnedRead = input.boundary === 'host_owned_external'
     && input.effect === 'external_write'
-    && learnedReadRequest(input.identity.toolName, input.identity.args);
+    && (input.consentBasis === 'exact_variant_read'
+      || learnedReadRequest(input.identity.toolName, input.identity.args));
   return {
     learnedRead,
     mutating: !probe && mutatingEffect(input.effect) && !learnedRead,

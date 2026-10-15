@@ -688,6 +688,30 @@ function snapshotMatchesManifest(
 }
 
 /**
+ * The provider's own description of one native tool, read from its server's
+ * current tool list and returned only when that tool's bytes are exactly the
+ * definition `operationVersion` binds. Anything else, including a server that
+ * cannot list, is null.
+ */
+export async function nativeMcpToolDescription(input: {
+  operationId: string;
+  operationVersion: string;
+}): Promise<string | null> {
+  const parsed = parseNamespacedTool(input.operationId);
+  if (!parsed) return null;
+  try {
+    const server = productionRuntime().serverForEnumeration(parsed.serverSlug);
+    const entry = parseClosedToolList(await server.listTools(), parsed.serverSlug)
+      .find(({ tool }) => tool.name === input.operationId);
+    if (!entry || `mcp-tool-v1:${sha256(entry.bytes)}` !== input.operationVersion) return null;
+    const description = entry.tool.description;
+    return typeof description === 'string' && description.trim() ? description : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Perform the network/stdio tools/list freshness probe as its own provider
  * crossing. The caller owns physical admission/settlement around this method;
  * the returned opaque proof can authorize exactly one following callTool.

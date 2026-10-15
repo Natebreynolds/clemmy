@@ -665,6 +665,9 @@ export const EVENT_TYPES = [
   // Operational evidence for the write boundary; never a public projection.
   'interactive_consent_decided',
   'exact_call_delivery_basis',
+  // The frozen two-model reading of whether one call of a multi-action
+  // operation only reads. Private consent evidence; never a projection.
+  'exact_call_variant_read_basis',
   'workflow_node_invocation_activated',
   // Metadata preparation for one persisted Space read, never a user turn or
   // an executable call authority. The existing read kernel owns dispatch.

@@ -227,6 +227,10 @@ export type InteractiveConsentDecisionV1 =
         /** The owner tapped exactly this action on a choice Clem offered
          * on Home (owner 2026-10-09: the tap is the approval). One call. */
         | 'owner_choice'
+        /** Two models read the operation's own definition with this call's
+         * enumerated values fixed and agreed every such call only reads.
+         * One action of a multi-action tool, never the whole tool. */
+        | 'exact_variant_read'
         | 'settled_replay';
       authorityDigest: string;
       reservationKey?: string;
@@ -297,6 +301,9 @@ export interface EvaluateInteractiveConsentInputV1 {
   /** The owner tapped exactly this change on a choice Clem offered on Home;
    * the host read it from the accepted source and a judge confirmed it. */
   ownerChoice?: { authorityDigest: string };
+  /** Two models agreed, from the operation's own definition, that every call
+   * fixing this call's enumerated values only reads. */
+  variantRead?: { verdictDigest: string };
 }
 
 function sameDestination(
@@ -476,6 +483,29 @@ export function evaluateInteractiveConsentV1(
       kind: 'proceed',
       basis: 'no_effect',
       authorityDigest: call.bindingDigest,
+    };
+  }
+
+  // ONE ACTION OF A MULTI-ACTION TOOL THAT ONLY READS IS A READ.
+  //
+  // A tool that can also delete declares itself destructive for every
+  // action, so its list asked like its delete. Two models read this exact
+  // action from the tool's own definition and agreed it changes nothing.
+  // That lowers only the tool-wide declaration: a send or recipients in the
+  // arguments, a delete or admin operation, or a documented irreversible
+  // change still takes the path below.
+  if (
+    input.variantRead
+    && call.effect === 'external_write'
+    && call.risk.consequence !== 'send'
+    && call.risk.consequence !== 'delete'
+    && call.risk.consequence !== 'admin'
+    && call.risk.reversibility !== 'irreversible'
+  ) {
+    return {
+      kind: 'proceed',
+      basis: 'exact_variant_read',
+      authorityDigest: input.variantRead.verdictDigest,
     };
   }
 

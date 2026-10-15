@@ -481,3 +481,30 @@ test('an exact destructive, irreversible local change always asks the owner, in 
   assert.equal(evaluateInteractiveConsentV1(input(deletion, { preparationProbe: true })).kind, 'refuse');
   assert.equal(evaluateInteractiveConsentV1(input(deletion, { coverage: null })).kind, 'repair', 'never without exact accepted work');
 });
+
+test('a judged read of one action lowers only the tool-wide destructive declaration', () => {
+  const variantRead = { verdictDigest: digest('9') };
+  const declared = call({
+    effect: 'external_write',
+    risk: { reversibility: 'unknown', consequence: 'unknown', destructive: true },
+  });
+  assert.deepEqual(evaluateInteractiveConsentV1(input(declared, { coverage: null, variantRead })), {
+    kind: 'proceed', basis: 'exact_variant_read', authorityDigest: digest('9'),
+  }, 'a read needs no work coverage, in Plan mode too');
+  assert.equal(evaluateInteractiveConsentV1(input(declared, { variantRead, preparationProbe: true })).kind, 'proceed');
+  assert.equal(evaluateInteractiveConsentV1(input(declared)).kind, 'needs_user', 'without the reading it still asks');
+  for (const risk of [
+    { reversibility: 'unknown', consequence: 'send', destructive: true },
+    { reversibility: 'unknown', consequence: 'delete', destructive: true },
+    { reversibility: 'unknown', consequence: 'admin', destructive: true },
+    { reversibility: 'irreversible', consequence: 'unknown', destructive: true },
+  ] as const) {
+    const decision = evaluateInteractiveConsentV1(input(call({ effect: 'external_write', risk }), { variantRead }));
+    assert.notEqual(decision.kind === 'proceed' ? decision.basis : null, 'exact_variant_read', JSON.stringify(risk));
+  }
+  assert.notEqual(evaluateInteractiveConsentV1(input(call({ effect: 'admin',
+    risk: { reversibility: 'unknown', consequence: 'unknown', destructive: true } }), { variantRead })).kind, 'proceed');
+  assert.equal(evaluateInteractiveConsentV1(input(declared, { variantRead, crossing: 'possibly_started' })).kind, 'reconcile');
+  assert.equal(evaluateInteractiveConsentV1(input(call({ effect: 'external_write', safety: 'protected',
+    risk: declared.risk }), { variantRead })).kind, 'refuse');
+});

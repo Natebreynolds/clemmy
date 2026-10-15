@@ -1369,14 +1369,18 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // caller's claim, is the authority for that basis.
   const preparationProbe = input.consentBasis === 'plan_preparation_probe'
     && loadJournaledConsentBasis(identity) === 'plan_preparation_probe';
-  // A bound write whose request shape was learned to read only is booked as
-  // a read, as the host lane books it (hostCallAccounting).
-  const settlementMutating = preparationProbe
+  // A bound write whose request shape was learned to read only, or that was
+  // admitted as one action of a multi-action tool that only reads, is booked
+  // as a read, as the host lane books it (hostCallAccounting). The journaled
+  // receipt, not the caller's claim, is the authority for the latter.
+  const variantRead = input.consentBasis === 'exact_variant_read'
+    && loadJournaledConsentBasis(identity) === 'exact_variant_read';
+  const settlementMutating = preparationProbe || variantRead
     ? false
     : binding
       ? runtimeEffectIsMutation(binding.effect) && !learnedReadRequest(input.toolName, input.args)
       : input.mutating === true;
-  if (binding || preparationProbe) extracted.mutating = settlementMutating;
+  if (binding || preparationProbe || variantRead) extracted.mutating = settlementMutating;
   if (settlementMutating && extracted.acknowledged === undefined) {
     // A mutation that threw was never acknowledged: nothing came back, so it
     // is the dark, and the turn stops to reconcile. A mutation whose envelope

@@ -1,4 +1,5 @@
 import { exactCallDeliveryProof } from './exact-call-delivery.js';
+import { exactCallVariantRead, type OperationVariantReadVerdictV1 } from './exact-call-variant-read.js';
 import { gateApprovedStepWriteCoverage } from './workflow-gate-write-coverage.js';
 import { reviewedFileCorrectionReservation, retainedFileCorrectionReservation } from './reviewed-file-correction.js';
 import path from 'node:path';
@@ -799,6 +800,8 @@ interface PreparedConsentSemanticBasis {
   carrier: HostConsentCarrierEvidence | null;
   /** Where a learned semantic came from, for the decision receipt. */
   semanticSource: HostConsentSemanticSourceEvidence | null;
+  /** Two models agreed this call's action of a multi-action operation only reads. */
+  variantRead?: { verdictDigest: string; verdict: OperationVariantReadVerdictV1 };
 }
 
 /** The accepted source's own creation time, or null when it cannot be read. */
@@ -1131,7 +1134,12 @@ async function semanticBasisForExactCall(input: {
   ) {
     return { status: 'hold', reason: 'bound_catalog_risk_projection_identity_mismatch' };
   }
+  const variantRead = await variantReadForExactCall({
+    prepared: input.prepared, external, arguments: externalCall.arguments,
+    inputSchema: externalCall.inputSchema, callSignals: callSignals.callSignals,
+  });
   return { status: 'ready', semantic: {
+    ...(variantRead ? { variantRead } : {}),
     operationId: binding.operationId,
     schemaFingerprint: binding.schemaFingerprint,
     effect: external.projection.effect,
@@ -1160,6 +1168,50 @@ async function semanticBasisForExactCall(input: {
         }
       : null,
   } };
+}
+
+/**
+ * Whether this call's action of a multi-action operation only reads. Asked
+ * only for a call that would otherwise wait on the owner for the tool's own
+ * reasons (it declares itself destructive, or nothing can classify it), and
+ * never for a call whose arguments carry a send, recipients or a request
+ * method.
+ */
+async function variantReadForExactCall(input: {
+  prepared: PreparedConsentTarget;
+  external: { manifest: { providerKind: string }; projection: { effect: string; risk: CapabilityRiskAttestationV1['risk'] };
+    currentDefinition: { operationId: string; operationVersion: string; behaviorHints: { destructive: boolean | null } } };
+  arguments: Record<string, unknown>;
+  inputSchema: unknown;
+  callSignals: { outboundDelivery: boolean | null; recipientsPresent: boolean | null; requestMethod: string | null };
+}): Promise<{ verdictDigest: string; verdict: OperationVariantReadVerdictV1 } | null> {
+  const { external, prepared } = input;
+  const providerKind = external.manifest.providerKind;
+  if (providerKind !== 'composio' && providerKind !== 'native_mcp') return null;
+  if (prepared.sourceUserSeq === null || external.projection.effect !== 'external_write') return null;
+  if (input.callSignals.outboundDelivery === true || input.callSignals.recipientsPresent === true
+    || input.callSignals.requestMethod !== null) return null;
+  const risk = external.projection.risk;
+  const waitsOnTool = external.currentDefinition.behaviorHints.destructive === true
+    || (risk.consequence === 'unknown' && risk.reversibility === 'unknown');
+  if (!waitsOnTool) return null;
+  const definition = external.currentDefinition;
+  const verdict = await exactCallVariantRead({
+    providerKind,
+    operationId: definition.operationId,
+    inputSchema: input.inputSchema,
+    arguments: input.arguments,
+    description: async () => {
+      if (providerKind !== 'native_mcp') return null;
+      const { nativeMcpToolDescription } = await import('./production-mcp-read-carrier.js');
+      return nativeMcpToolDescription({ operationId: definition.operationId, operationVersion: definition.operationVersion });
+    },
+    sessionId: prepared.sessionId,
+    sourceUserSeq: prepared.sourceUserSeq,
+    acceptedTaskId: prepared.acceptedTaskId,
+    logicalToolCallId: prepared.logicalToolCallId,
+  });
+  return verdict ? { verdictDigest: digest({ version: 1, kind: 'operation_variant_read', verdict }), verdict } : null;
 }
 
 /** A planning source turns the reducer into probe-or-refuse: read from the
@@ -1336,13 +1388,15 @@ function reduceHostConsentEvidence(input: {
   durableApproval?: DurableHostConsentApproval;
   learnedApplies?: boolean;
   ownerChoice?: { authorityDigest: string };
+  variantRead?: { verdictDigest: string };
 }) {
   const { call, coverage, crossing, reservationAlreadyClaimed } = input;
   const preparationProbe = planPreparationProbe(input.identity);
   const consentMode = consentModeForCall(call, input.identity, input.learnedApplies, input.ownerChoice);
+  const variantRead = input.variantRead ? { variantRead: input.variantRead } : {};
   const ungrantedDecision = evaluateInteractiveConsentV1({
     call, coverage, userGrant: null, readiness: { kind: 'ready' },
-    crossing, reservationAlreadyClaimed, preparationProbe, ...consentMode,
+    crossing, reservationAlreadyClaimed, preparationProbe, ...consentMode, ...variantRead,
   });
   const consentSubject = exactConsentSubject({
     prepared: input.identity, call, coverage,
@@ -1357,7 +1411,7 @@ function reduceHostConsentEvidence(input: {
     ? { kind: 'repair', reason: 'scope_mismatch' }
     : userGrant ? evaluateInteractiveConsentV1({
         call, coverage, userGrant, readiness: { kind: 'ready' },
-        crossing, reservationAlreadyClaimed, preparationProbe, ...consentMode,
+        crossing, reservationAlreadyClaimed, preparationProbe, ...consentMode, ...variantRead,
       }) : ungrantedDecision;
   // The approval teaches. A pause that was Ask mode's, and nothing riskier,
   // is remembered by the operation and account the receipt names, so the
@@ -1488,10 +1542,12 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
   const { decision, consentSubject, userGrant, consentMode } = reduceHostConsentEvidence({
     identity: prepared, call, coverage, crossing, reservationAlreadyClaimed,
     durableApproval: input.durableApproval, learnedApplies, ...(ownerChoice ? { ownerChoice } : {}),
+    ...(semantic.variantRead ? { variantRead: { verdictDigest: semantic.variantRead.verdictDigest } } : {}),
   });
   journalInteractiveConsentDecision({
     sessionId: prepared.sessionId, sourceUserSeq: prepared.sourceUserSeq,
     call, decision, carrier: semantic.carrier, semanticSource: semantic.semanticSource,
+    ...(semantic.variantRead ? { variantRead: semantic.variantRead } : {}),
   });
   if (decision.kind !== 'proceed') {
     return {
@@ -1661,10 +1717,12 @@ export async function evaluateUncoveredHostMutationConsent(input: {
     const { decision, consentSubject } = reduceHostConsentEvidence({
       identity: binding, call, coverage, crossing, reservationAlreadyClaimed: false,
       durableApproval: input.durableApproval, learnedApplies, ...(ownerChoice ? { ownerChoice } : {}),
+      ...(semantic.variantRead ? { variantRead: { verdictDigest: semantic.variantRead.verdictDigest } } : {}),
     });
     journalInteractiveConsentDecision({
       sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq,
       call, decision, carrier: semantic.carrier, semanticSource: semantic.semanticSource,
+    ...(semantic.variantRead ? { variantRead: semantic.variantRead } : {}),
     });
     // A local call proceeds on its own exactness (reversible or ordinary
     // work) or on the owner's exact grant for the one call that asked (a

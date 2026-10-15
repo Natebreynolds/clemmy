@@ -89,12 +89,15 @@ export function journalInteractiveConsentDecision(input: {
   decision: InteractiveConsentDecisionV1;
   carrier: HostConsentCarrierEvidence | null;
   semanticSource?: HostConsentSemanticSourceEvidence | null;
+  /** The two-model reading behind an exact_variant_read decision. */
+  variantRead?: { verdictDigest: string; verdict: unknown };
 }): void {
   const { decision } = input;
   if (decision.kind !== 'proceed') return;
   if (
     decision.basis !== 'exact_carrier_bounded_work'
     && decision.basis !== 'plan_preparation_probe'
+    && decision.basis !== 'exact_variant_read'
     && !input.semanticSource
   ) return;
   try {
@@ -118,6 +121,9 @@ export function journalInteractiveConsentDecision(input: {
         carrierHints: { destructive: input.carrier?.destructive ?? null },
         requestMethod: input.carrier?.requestMethod ?? null,
         ...(input.semanticSource ? { semanticSource: input.semanticSource } : {}),
+        ...(decision.basis === 'exact_variant_read' && input.variantRead
+          ? { variantRead: { verdictDigest: input.variantRead.verdictDigest, verdict: input.variantRead.verdict } }
+          : {}),
       },
     });
   } catch {
