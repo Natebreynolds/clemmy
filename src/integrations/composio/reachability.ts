@@ -68,13 +68,53 @@ export function composioReadProblem(reason: unknown): string {
   return 'Composio didn’t return the list';
 }
 
+/** A deadline that fires this long after it was due was held up by this
+ * process (a busy main thread or a sleeping machine), not by Composio. */
+const LATE_DEADLINE_TOLERANCE_MS = 1_000;
+/** The one extra wait such a deadline grants. A reply that arrived while the
+ * process was held is waiting to be read; timers run before network events,
+ * so without it the read is called unanswered before its reply is seen. */
+export const LATE_DEADLINE_GRACE_MS = 3_000;
+
+/**
+ * Call `expire` once Composio has had `ms` to answer. When the timer itself
+ * runs late, the wait was this process's, so the reply gets one short grace
+ * period before the read is given up. Returns the cancel function.
+ */
+export function startComposioDeadline(
+  ms: number,
+  expire: () => void,
+  options: { graceMs?: number } = {},
+): () => void {
+  const graceMs = options.graceMs ?? LATE_DEADLINE_GRACE_MS;
+  let dueAt = Date.now() + ms;
+  let graced = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const check = (): void => {
+    if (!graced && Date.now() - dueAt > LATE_DEADLINE_TOLERANCE_MS) {
+      graced = true;
+      dueAt = Date.now() + graceMs;
+      timer = setTimeout(check, graceMs);
+      return;
+    }
+    timer = undefined;
+    expire();
+  };
+  timer = setTimeout(check, ms);
+  return () => { if (timer) clearTimeout(timer); timer = undefined; };
+}
+
 /** Settle within `ms`: the work's own result, or a deadline error. The work
  * keeps running and fills its caches when it finishes. */
-export function withComposioDeadline<T>(work: Promise<T>, ms = COMPOSIO_DASHBOARD_READ_DEADLINE_MS): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
+export function withComposioDeadline<T>(
+  work: Promise<T>,
+  ms = COMPOSIO_DASHBOARD_READ_DEADLINE_MS,
+  options: { graceMs?: number } = {},
+): Promise<T> {
+  let cancel: (() => void) | undefined;
   const deadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(`Composio did not answer within ${Math.round(ms / 1000)} s`)), ms);
+    cancel = startComposioDeadline(ms, () => reject(new Error(`Composio did not answer within ${Math.round(ms / 1000)} s`)), options);
   });
   work.catch(() => { /* a late failure after the deadline is the caller's cache's concern */ });
-  return Promise.race([work, deadline]).finally(() => { if (timer) clearTimeout(timer); });
+  return Promise.race([work, deadline]).finally(() => { cancel?.(); });
 }

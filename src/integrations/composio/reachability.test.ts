@@ -62,3 +62,25 @@ test('a failed connected-account listing is a named problem, never "no apps", un
   assert.deepEqual(await client.listConnectedToolkits(), []);
   assert.equal(client.composioConnectionsProblem(), null, 'a genuine empty listing clears the problem');
 });
+
+test('a reply that arrived while this process was held is read, not called unanswered', async () => {
+  const { createServer } = await import('node:http');
+  const server = createServer((_req, res) => { res.end('{"items":[]}'); });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  const blockFor = (ms: number) => { const until = Date.now() + ms; while (Date.now() < until) { /* held */ } };
+  try {
+    // The main thread is held past the deadline before the reply can be read.
+    const graced = reachability.withComposioDeadline(fetch(`http://127.0.0.1:${port}/`).then((res) => res.json()), 100, { graceMs: 2_000 });
+    blockFor(1_300);
+    assert.deepEqual(await graced, { items: [] }, 'the waiting reply is read within the grace period');
+
+    // A deadline that fires on time still answers at its deadline.
+    const never = new Promise<never>(() => { /* the provider never answers */ });
+    const started = Date.now();
+    await assert.rejects(reachability.withComposioDeadline(never, 100, { graceMs: 2_000 }), /did not answer within/);
+    assert.ok(Date.now() - started < 1_000, 'an on-time deadline grants no grace');
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});

@@ -36,6 +36,7 @@ import pino from 'pino';
 import {
   composioErrorDetail,
   composioReadProblem,
+  startComposioDeadline,
   withComposioDeadline,
 } from './reachability.js';
 
@@ -1188,12 +1189,14 @@ async function loadConnectedAccountItems(): Promise<ConnectedAccountItemsLoadOut
   if (!apiKey) return connectedAccountLoadFailure('Composio API key is unavailable');
 
   const controller = new AbortController();
-  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  let cancelDeadline: (() => void) | undefined;
   const deadline = new Promise<ConnectedAccountItemsLoadOutcome>((resolve) => {
-    deadlineTimer = setTimeout(() => {
+    // A deadline held up by this process grants the reply one short grace
+    // period instead of calling Composio unanswered.
+    cancelDeadline = startComposioDeadline(CONNECTED_ACCOUNTS_LIST_TIMEOUT_MS, () => {
       controller.abort();
       resolve(connectedAccountLoadFailure('connected-account listing deadline exceeded'));
-    }, CONNECTED_ACCOUNTS_LIST_TIMEOUT_MS);
+    });
   });
   // Start the deadline before either provider leg. Raw failure therefore leaves
   // only the remaining phase time for the SDK; it never opens a second 15s wait.
@@ -1201,7 +1204,7 @@ async function loadConnectedAccountItems(): Promise<ConnectedAccountItemsLoadOut
   try {
     return await Promise.race([providerPhase, deadline]);
   } finally {
-    if (deadlineTimer) clearTimeout(deadlineTimer);
+    cancelDeadline?.();
   }
 }
 
