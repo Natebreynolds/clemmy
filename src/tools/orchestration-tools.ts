@@ -690,6 +690,81 @@ function formatRunAge(iso?: string): string {
  * every in-flight (queued/running/finalizing/parked/dependency/mutation-review) or needs-attention run, plus the few
  * most-recent finished ones. Reads the run-record files directly — token-cheap.
  */
+const STEP_OUTPUT_PAGE_CHARS = 12_000;
+
+/**
+ * One step's output from a run, whole and paged: what the step actually
+ * produced, so a conversation about a run reads the work itself rather than
+ * a 300-character clip of it.
+ */
+export function renderWorkflowRunStepOutput(record: Record<string, unknown>, runId: string, stepId: string, offset = 0): string {
+  const outputs = record.stepOutputs && typeof record.stepOutputs === 'object' && !Array.isArray(record.stepOutputs)
+    ? record.stepOutputs as Record<string, unknown>
+    : {};
+  if (!(stepId in outputs)) {
+    const known = Object.keys(outputs);
+    return `Run ${runId} has no output recorded for step "${stepId}".${known.length > 0 ? ` Steps with output: ${known.join(', ')}.` : ' No step recorded output.'}`;
+  }
+  const out = outputs[stepId];
+  const text = typeof out === 'string' ? out : JSON.stringify(out, null, 2) ?? '';
+  const start = Math.max(0, Math.min(Math.trunc(offset), text.length));
+  const end = Math.min(text.length, start + STEP_OUTPUT_PAGE_CHARS);
+  return [
+    `Run ${runId} · step ${stepId} · output characters ${start}–${end} of ${text.length}`,
+    text.slice(start, end) || '(empty)',
+    end < text.length ? `More: call workflow_run_status again with run_id="${runId}", step_id="${stepId}", offset=${end}.` : '',
+  ].filter(Boolean).join('\n');
+}
+
+/**
+ * One workflow's run history, newest first: each run's kind, when, how long,
+ * how it ended and why it needs a look, so Clem can talk about what the runs
+ * actually did and improve the workflow from it.
+ */
+export function renderWorkflowRunHistory(workflow: string, limit = 10): string {
+  const entry = listWorkflows().find((candidate) => candidate.data.name === workflow || candidate.name === workflow);
+  const names = new Set([workflow, ...(entry ? [entry.name, entry.data.name] : [])]);
+  const displayName = entry?.data.name ?? workflow;
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return `"${displayName}" has no runs yet.`;
+  const lines: string[] = [];
+  const files = readdirSync(WORKFLOW_RUNS_DIR).filter((file) => file.endsWith('.json')).sort().reverse();
+  for (const file of files.slice(0, 5_000)) {
+    if (lines.length >= limit) break;
+    let r: Record<string, unknown>;
+    try { r = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>; } catch { continue; }
+    if (typeof r.id !== 'string' || typeof r.workflow !== 'string' || !names.has(r.workflow)) continue;
+    const terminalOutcome = deriveWorkflowTerminalOutcome({
+      status: r.status,
+      finishedAt: r.finishedAt,
+      needsAttention: r.needsAttention,
+      terminalOutcome: r.terminalOutcome,
+      reportBack: r.reportBack && typeof r.reportBack === 'object' && !Array.isArray(r.reportBack)
+        ? { outcome: (r.reportBack as Record<string, unknown>).outcome }
+        : undefined,
+    });
+    const started = Date.parse(String(r.startedAt ?? r.createdAt ?? ''));
+    const finished = Date.parse(String(r.finishedAt ?? ''));
+    const took = Number.isFinite(started) && Number.isFinite(finished) && finished >= started
+      ? `${Math.round((finished - started) / 1000)} s`
+      : '';
+    const kind = r.status === 'creation_test' ? 'test' : 'run';
+    const outcome = terminalOutcome ? workflowTerminalOutcomeLabel(terminalOutcome) : String(r.status ?? 'unknown');
+    const steps = r.stepOutputs && typeof r.stepOutputs === 'object' && !Array.isArray(r.stepOutputs)
+      ? Object.keys(r.stepOutputs as Record<string, unknown>)
+      : [];
+    const why = typeof r.needsAttentionReason === 'string' ? r.needsAttentionReason
+      : typeof r.error === 'string' ? r.error : '';
+    lines.push(`- ${r.id} · ${kind} · ${String(r.createdAt ?? '')} · ${outcome}${took ? ` · ${took}` : ''}`
+      + `${steps.length > 0 ? ` · steps with output: ${steps.join(', ')}` : ''}${why ? ` · ${why.slice(0, 200)}` : ''}`);
+  }
+  if (lines.length === 0) return `"${displayName}" has no runs yet.`;
+  return [
+    `Runs of "${displayName}", newest first:`,
+    ...lines,
+    'A run\'s step results: workflow_run_status run_id="<id>". One step\'s full output: add step_id="<step>".',
+  ].join('\n');
+}
+
 export function renderWorkflowRunsOverview(limit = 15): string {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return 'No workflow runs yet — nothing is running.';
   interface RunRow {
@@ -2579,11 +2654,27 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_run_status',
-    'Check workflow runs. Pass run_id for one run\'s detail, OR omit it to LIST what is running right now — use the no-id form to answer "what workflows are running / how is my flow going". Lists in-flight (queued/running/parked/mutation-review) + needs-attention runs and the few most-recent finished ones.',
+    'Check workflow runs and read what they produced. Pass run_id for one run\'s detail (each step\'s result, clipped); add step_id to read that step\'s full output, paged with offset. Pass workflow (and no run_id) for that workflow\'s run history. Omit both to LIST what is running right now — use that form to answer "what workflows are running / how is my flow going".',
     {
       run_id: z.string().optional().describe('A specific run id for its full record. Omit to list active + recent runs.'),
+      workflow: z.string().optional().describe('A workflow name: list its runs, newest first. Ignored when run_id is given.'),
+      step_id: z.string().optional().describe('With run_id: return this step\'s full output instead of the run summary.'),
+      offset: z.number().int().min(0).optional().describe('With step_id: the character to continue reading from.'),
     },
-    async ({ run_id }) => {
+    async ({ run_id, workflow, step_id, offset }) => {
+      if (run_id && run_id.trim() && step_id && step_id.trim()) {
+        const filePath = path.join(WORKFLOW_RUNS_DIR, `${run_id}.json`);
+        if (!existsSync(filePath)) return textResult(`Workflow run "${run_id}" not found.`);
+        try {
+          const record = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+          return textResult(renderWorkflowRunStepOutput(record, run_id, step_id.trim(), offset ?? 0));
+        } catch (err) {
+          return textResult(`Failed to read run ${run_id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      if ((!run_id || !run_id.trim()) && workflow && workflow.trim()) {
+        return textResult(renderWorkflowRunHistory(workflow.trim()));
+      }
       if (run_id && run_id.trim()) {
         const filePath = path.join(WORKFLOW_RUNS_DIR, `${run_id}.json`);
         if (!existsSync(filePath)) return textResult(`Workflow run "${run_id}" not found.`);
@@ -2691,7 +2782,9 @@ export function registerOrchestrationTools(server: McpServer): void {
             failedItemLines.length > 0
               ? `Failed fan-out items:\n${failedItemLines.join('\n')}\nRetry: call workflow_rerun_failed_items with run_id="${run_id}"${new Set(failedItems.map((f) => f.stepId)).size > 1 ? ' and step_id set to one failed step' : ''}.`
               : '',
-            stepLines.length > 0 ? `Step results:\n${stepLines.join('\n')}` : '',
+            stepLines.length > 0
+              ? `Step results (clipped; add step_id="<step>" for one step's full output):\n${stepLines.join('\n')}`
+              : '',
             reportDetail && reportDetail !== output ? `Run report:\n${reportDetail}` : '',
             output ? `Final output (truncated):\n${output.length > 1500 ? `${output.slice(0, 1500)}…` : output}` : '',
           ].filter(Boolean);

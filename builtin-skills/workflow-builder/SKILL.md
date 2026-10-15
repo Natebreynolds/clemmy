@@ -95,7 +95,7 @@ To fix a step, use `workflow_edit_step` with a patch of only the fields that cha
 When the user asks you to optimize, improve, review or clean up a workflow, look at all of it before changing anything:
 
 1. **Read the whole definition** with `workflow_get`: every step's prompt or call, its `allowedTools`, the skills it uses, its inputs, resources, trigger and goal.
-2. **Read how it has actually run.** Look at its recent runs: which steps take the time, which fail, which come back empty, and what each run costs.
+2. **Read how it has actually run.** `workflow_run_status` with `workflow` lists its runs. With a `run_id` it shows each step's result, and adding `step_id` gives that step's full output: the work the run actually did. Look for which steps take the time, which fail, which come back empty or thin, and what each run costs.
 3. **Question every step and every tool it names**, against what this setup actually has connected:
    - Is this the best tool here, or does a connected tool do the job more directly? Examples: an API instead of driving a browser, one batched call instead of one per item, a `call` step instead of an agent for a fixed read or write.
    - Does the step name a tool or app this setup doesn't have or doesn't use? Workflows written elsewhere often do. Replace it with what is here, and tell the user.
@@ -107,6 +107,8 @@ When the user asks you to optimize, improve, review or clean up a workflow, look
 Finish the work before you report. Never end on "let me check X next": check it, change it, test it, then report.
 
 When the user also asks you to make sure it works end to end, the rehearsal is not the end. Writes and sends are only previewed there. Offer one real run with the smallest input that exercises every step, run it once they agree, and fix what it shows.
+
+When the user asks about a run ("About run … of my … workflow"), read that run first: its step results, then the full output of the steps that matter. Talk about what it actually produced, then offer the improvements it points to.
 
 ## 7. When a real run stops
 

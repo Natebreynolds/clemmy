@@ -86,7 +86,7 @@ import {
   type CanvasPosition,
 } from '@/lib/workflow-canvas';
 import {
-  askAboutStepPrompt, dependentsOf, describeStepRun, draftChanged, RUN_STILL_GOING, stepDraftFrom,
+  askAboutRunPrompt, askAboutStepPrompt, dependentsOf, describeStepRun, draftChanged, RUN_STILL_GOING, stepDraftFrom,
   stepPatchFromDraft, workflowShape, type StepDraft,
 } from '@/lib/workflow-step-view';
 
@@ -622,9 +622,14 @@ function WorkflowView({ name }: { name: string }) {
                   ))}
                 </select>
                 {shownRun ? (
-                  <Link to={`/automate?workflow=${encodeURIComponent(detail.name)}&run=${encodeURIComponent(shownRun.id)}`} className="inline-flex items-center gap-1 text-small text-muted underline-offset-2 hover:text-fg hover:underline">
-                    Open run <ExternalLink size={12} aria-hidden />
-                  </Link>
+                  <>
+                    <Link to={`/automate?workflow=${encodeURIComponent(detail.name)}&run=${encodeURIComponent(shownRun.id)}`} className="inline-flex items-center gap-1 text-small text-muted underline-offset-2 hover:text-fg hover:underline">
+                      Open run <ExternalLink size={12} aria-hidden />
+                    </Link>
+                    <Link to={`/chat?prompt=${encodeURIComponent(askAboutRunPrompt(detail.name, shownRun.id))}`} className="inline-flex items-center gap-1 text-small text-muted underline-offset-2 hover:text-fg hover:underline">
+                      Ask Clementine about this run
+                    </Link>
+                  </>
                 ) : null}
               </>
             ) : (

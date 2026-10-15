@@ -89,6 +89,11 @@ export function askAboutStepPrompt(workflowName: string, stepId: string): string
   return `About the "${stepId}" step of my "${workflowName}" workflow: `;
 }
 
+/** Opens a conversation about one run: Clem reads what it actually produced. */
+export function askAboutRunPrompt(workflowName: string, runId: string): string {
+  return `About run ${runId} of my "${workflowName}" workflow: `;
+}
+
 export interface WorkflowShape {
   steps: number;
   reads: number;

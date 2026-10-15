@@ -2094,6 +2094,30 @@ test('renderWorkflowRunsOverview lists in-flight + needs-attention runs, and rec
   assert.match(out, /old-flow · outcome Succeeded · run r-done/);
 });
 
+test('a workflow\'s run history lists its runs newest first, and a step\'s full output reads in pages', async () => {
+  resetState();
+  const { renderWorkflowRunHistory, renderWorkflowRunStepOutput } = await import('./orchestration-tools.js');
+  writeRunRecord({ id: '1792100000000-aaaaaa', workflow: 'history-flow', status: 'creation_test', createdAt: '2026-10-15T20:00:00.000Z',
+    startedAt: '2026-10-15T20:00:00.000Z', finishedAt: '2026-10-15T20:01:10.000Z', stepOutputs: { pull: { rows: 2 } } });
+  writeRunRecord({ id: '1792100500000-bbbbbb', workflow: 'history-flow', status: 'completed', needsAttention: true,
+    needsAttentionReason: 'goal not met', createdAt: '2026-10-15T21:00:00.000Z', stepOutputs: { pull: { rows: 3 }, draft: 'x'.repeat(13_000) } });
+  writeRunRecord({ id: '1792100600000-cccccc', workflow: 'other-flow', status: 'completed', createdAt: '2026-10-15T21:30:00.000Z' });
+  const history = renderWorkflowRunHistory('history-flow');
+  assert.ok(history.indexOf('1792100500000-bbbbbb') < history.indexOf('1792100000000-aaaaaa'), history);
+  assert.match(history, /1792100000000-aaaaaa · test · .* · 70 s · steps with output: pull/);
+  assert.match(history, /goal not met/);
+  assert.doesNotMatch(history, /other-flow|cccccc/);
+
+  const record = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, '1792100500000-bbbbbb.json'), 'utf-8')) as Record<string, unknown>;
+  const first = renderWorkflowRunStepOutput(record, '1792100500000-bbbbbb', 'draft');
+  assert.match(first, /output characters 0–12000 of 13000/);
+  assert.match(first, /offset=12000/);
+  const rest = renderWorkflowRunStepOutput(record, '1792100500000-bbbbbb', 'draft', 12_000);
+  assert.match(rest, /output characters 12000–13000 of 13000/);
+  assert.doesNotMatch(rest, /More:/);
+  assert.match(renderWorkflowRunStepOutput(record, '1792100500000-bbbbbb', 'missing'), /Steps with output: pull, draft/);
+});
+
 test('renderWorkflowRunsOverview: nothing active → says so (still lists recent)', () => {
   resetState();
   writeRunRecord({ id: 'r-old', workflow: 'x', status: 'completed', createdAt: new Date().toISOString() });
