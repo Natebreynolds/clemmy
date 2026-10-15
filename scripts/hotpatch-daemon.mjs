@@ -1058,9 +1058,17 @@ function inspectAppliedUpdateEvidence({ app, home, retainedArchiveReference }, f
     regularPath(metadataPath, fileOps);
     const metadata = flatJSONObject(metadataPath, fileOps);
     if (Object.keys(metadata).sort().join('|') !== 'fileName|isAdminRightsRequired|sha512' || metadata.isAdminRightsRequired !== false || !/^[A-Za-z0-9._-]+\.zip$/.test(metadata.fileName) || typeof metadata.sha512 !== 'string' || Buffer.from(metadata.sha512, 'base64').length !== 64 || Buffer.from(metadata.sha512, 'base64').toString('base64') !== metadata.sha512) guardRefusal('unrecognized retained download metadata');
+    // The updater keeps the download's blockmap beside it for the next
+    // differential download; it is the only other file it writes there.
     const names = fileOps.readdirSync(pending).sort();
-    if (names.join('|') !== [metadata.fileName, 'update-info.json'].sort().join('|')) guardRefusal('unexpected retained pending download inventory');
+    const blockmap = names.includes('current.blockmap');
+    if (names.filter(name => name !== 'current.blockmap').join('|') !== [metadata.fileName, 'update-info.json'].sort().join('|')) guardRefusal('unexpected retained pending download inventory');
     files[metadataPath] = fileDigest(metadataPath, 'sha256', 'hex', fileOps);
+    if (blockmap) {
+      const pendingBlockmap = path.join(pending, 'current.blockmap');
+      regularPath(pendingBlockmap, fileOps);
+      files[pendingBlockmap] = fileDigest(pendingBlockmap, 'sha256', 'hex', fileOps);
+    }
     const pendingArchive = path.join(pending, metadata.fileName);
     const archive = path.join(cache, `update.zip${suffix}`);
     for (const archivePath of [pendingArchive, archive]) {

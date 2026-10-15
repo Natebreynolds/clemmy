@@ -450,6 +450,17 @@ test('every proof discovers newly queued installer state instead of reusing an e
   });
 });
 
+test('the updater blockmap kept beside its download is recognized, and a changed one is refused', t => {
+  const g = appliedUpdateFixture(t);
+  fs.writeFileSync(path.join(g.cache, 'pending/current.blockmap'), 'differential map');
+  const evidence = g.capture();
+  assert.ok(Object.keys(evidence.files).some(file => file.endsWith(path.join('pending', 'current.blockmap'))));
+  assert.doesNotThrow(() => g.proveApplied(evidence));
+  fs.appendFileSync(path.join(g.cache, 'pending/current.blockmap'), 'changed');
+  assert.throws(() => g.proveApplied(evidence));
+  assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'old daemon');
+});
+
 test('retained update classification rejects unknown, malformed, changed or linked evidence', async t => {
   const cases = [
     ['unknown cache file', g => fs.writeFileSync(path.join(g.cache, 'another.zip'), 'unknown')],
