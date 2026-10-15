@@ -17,7 +17,7 @@ import { Agent, Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
 import pino from 'pino';
 import { z } from 'zod';
-import { listEvents } from '../runtime/harness/eventlog.js';
+import { listEvents, openEventLog } from '../runtime/harness/eventlog.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import {
   compactConversationState,
@@ -34,6 +34,8 @@ import {
 import { openMemoryDb } from './db.js';
 import { memoryJobFailed, memoryJobRoute, memoryTidyOutcome, noteMemoryModelFailure, runMemoryModelJob } from './memory-job-context.js';
 import { recordMemoryEpisode } from './temporal-memory.js';
+import { parseTurnLearningPolicy } from './turn-learning-policy.js';
+import { WORK_EPISODE_SUBTYPE } from './work-episodes.js';
 
 const logger = pino({ name: 'clementine.conversation-memory' });
 
@@ -70,14 +72,35 @@ function clipped(text: string, max: number): string {
 }
 
 /** The visible transcript, the owner's words and Clem's replies, in order. */
+/** The accepted request's own learning exclusion (a controlled test, an
+ *  owner opt-out): that turn and its answer never become memory. */
+function excludedFromLearning(data: Record<string, unknown>): boolean {
+  try {
+    return parseTurnLearningPolicy(data.learningPolicy)?.mode === 'exclude';
+  } catch {
+    return true;
+  }
+}
+
+/** The accepted request a completion answers, when it names one. */
+function completionSourceSeq(data: Record<string, unknown>): number | null {
+  const identity = (data.presentation as { identity?: { sourceUserSeq?: unknown } } | undefined)?.identity;
+  const seq = typeof data.sourceUserSeq === 'number' ? data.sourceUserSeq : identity?.sourceUserSeq;
+  return typeof seq === 'number' && Number.isSafeInteger(seq) ? seq : null;
+}
+
 export function conversationTranscript(sessionId: string, throughSeq?: number): { text: string; turns: number } {
   const lines: string[] = [];
+  const excluded = new Set<number>();
   for (const event of listEvents(sessionId, { types: ['user_input_received', 'conversation_completed'], throughSeq })) {
     const data = event.data as Record<string, unknown>;
     if (event.type === 'user_input_received') {
+      if (excludedFromLearning(data)) { excluded.add(event.seq); continue; }
       const text = typeof data.displayText === 'string' ? data.displayText : typeof data.text === 'string' ? data.text : '';
       if (text.trim()) lines.push(`Owner: ${clipped(text, TRANSCRIPT_MESSAGE_CHARS)}`);
     } else {
+      const source = completionSourceSeq(data);
+      if (source !== null && excluded.has(source)) continue;
       const presentation = data.presentation as Record<string, unknown> | undefined;
       const text = typeof presentation?.text === 'string' ? presentation.text : typeof data.reply === 'string' ? data.reply : '';
       if (text.trim()) lines.push(`Clem: ${clipped(text, TRANSCRIPT_MESSAGE_CHARS)}`);
@@ -168,6 +191,8 @@ export interface ConversationConsolidation {
   faded: number;
   /** Provenance-bound results restored from their retained outputs. */
   repaired: number;
+  /** Memories expired because their turn was marked not to learn from. */
+  unlearned: number;
   waiting: boolean;
 }
 
@@ -225,6 +250,51 @@ export function fadeConversationMemories(nowIso = new Date().toISOString()): num
  * what has been idle a month, fade year-old memories. Bounded per pass; the
  * next pass picks up the rest.
  */
+let lastUnlearnDay = '';
+
+/**
+ * Memory made from a turn the owner marked not to learn from (a controlled
+ * test, an opt-out) is expired, once a day: the work episode that turn left,
+ * and the conversation memory of a chat that holds one, whose note is cleared
+ * so the chat is remembered again from what may be learned. Expired episodes
+ * leave recall; nothing is deleted.
+ */
+export function expireLearningExcludedMemories(now: Date = new Date(), force = false): number {
+  const day = now.toISOString().slice(0, 10);
+  if (!force && lastUnlearnDay === day) return 0;
+  lastUnlearnDay = day;
+  const excluded = openEventLog().prepare(`SELECT session_id AS sessionId, seq, data_json AS dataJson FROM events
+      WHERE type = 'user_input_received' AND json_extract(data_json, '$.learningPolicy.mode') = 'exclude'`)
+    .all() as Array<{ sessionId: string; seq: number; dataJson: string }>;
+  if (excluded.length === 0) return 0;
+  const memory = openMemoryDb();
+  const expireWork = memory.prepare(`UPDATE memory_episodes SET status = 'expired'
+      WHERE subtype = ? AND session_id = ? AND call_id IN (?, ?) AND status IN ('available', 'partial')`);
+  const conversationEpisodes = memory.prepare(`SELECT id FROM memory_episodes
+      WHERE subtype = ? AND session_id = ? AND call_id = ? AND status IN ('available', 'partial')`);
+  const expireEpisode = memory.prepare(`UPDATE memory_episodes SET status = 'expired' WHERE id = ?`);
+  const clearNote = openEventLog().prepare(`UPDATE session_conversation_state SET memory_episode_id = NULL
+      WHERE session_id = ? AND memory_episode_id = ?`);
+  let expired = 0;
+  const sessions = new Set<string>();
+  for (const row of excluded) {
+    let data: Record<string, unknown>;
+    try { data = JSON.parse(row.dataJson) as Record<string, unknown>; } catch { continue; }
+    if (!excludedFromLearning(data)) continue;
+    expired += expireWork.run(WORK_EPISODE_SUBTYPE, row.sessionId, `work:answer:${row.seq}`, `work:plan:${row.seq}`).changes;
+    sessions.add(row.sessionId);
+  }
+  for (const sessionId of sessions) {
+    const episodes = conversationEpisodes.all(CONVERSATION_MEMORY_SUBTYPE, sessionId, CONVERSATION_MEMORY_CALL_ID) as Array<{ id: string }>;
+    for (const episode of episodes) {
+      expired += expireEpisode.run(episode.id).changes;
+      clearNote.run(sessionId, episode.id);
+    }
+  }
+  if (expired > 0) logger.info({ expired, sessions: sessions.size }, 'memory from turns marked not to learn expired');
+  return expired;
+}
+
 export async function consolidateIdleConversations(input: {
   now?: Date;
   compactLimit?: number;
@@ -233,7 +303,7 @@ export async function consolidateIdleConversations(input: {
 } = {}): Promise<ConversationConsolidation> {
   const now = input.now ?? new Date();
   const nowMs = now.getTime();
-  const result: ConversationConsolidation = { compacted: 0, remembered: 0, retired: 0, held: 0, faded: 0, repaired: 0, waiting: false };
+  const result: ConversationConsolidation = { compacted: 0, remembered: 0, retired: 0, held: 0, faded: 0, repaired: 0, unlearned: 0, waiting: false };
   const weekAgo = new Date(nowMs - CONVERSATION_COMPACT_IDLE_DAYS * 86_400_000).toISOString();
   const monthAgo = new Date(nowMs - CONVERSATION_MEMORY_ONLY_IDLE_DAYS * 86_400_000).toISOString();
 
@@ -290,6 +360,7 @@ export async function consolidateIdleConversations(input: {
       else if (step === 'held') result.held += 1;
     }
     result.faded = fadeConversationMemories(now.toISOString());
-  }, () => memoryTidyOutcome([], result.compacted + result.retired + result.faded));
+    result.unlearned = expireLearningExcludedMemories(now);
+  }, () => memoryTidyOutcome([], result.compacted + result.retired + result.faded + result.unlearned));
   return result;
 }

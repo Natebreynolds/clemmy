@@ -13,6 +13,7 @@
  */
 import { openMemoryDb } from './db.js';
 import { recordMemoryEpisode } from './temporal-memory.js';
+import { readTurnLearningPolicyForSource } from './turn-learning-policy.js';
 
 export const WORK_EPISODE_SUBTYPE = 'completed_work';
 export const WORK_EPISODE_SOURCE_APP = 'clementine';
@@ -94,6 +95,9 @@ export function recordWorkEpisode(input: WorkEpisodeInput): { id: string } | nul
   try {
     const objective = clip(input.objective, 200);
     if (!objective) return null;
+    // A turn marked not to learn from (a controlled test, an owner opt-out)
+    // leaves no episode.
+    if (readTurnLearningPolicyForSource({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq }).status === 'excluded') return null;
     const finishedAt = input.finishedAt ?? new Date().toISOString();
     const title = `Completed ${input.kind}: ${objective}`;
     const content = [

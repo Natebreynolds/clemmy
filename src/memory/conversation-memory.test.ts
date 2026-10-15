@@ -258,3 +258,49 @@ test('a resumed chat with an unusable summary retains working state instead of r
   assert.match(currentMemory.summary, /NEW-RETIRE-WORK-9321/);
   assert.match(JSON.stringify(state(sessionId).state), /NEW-RETIRE-WORK-9321/);
 });
+
+test('a turn marked not to learn from never becomes memory, and memory already made from one is expired', async () => {
+  const { recordMemoryEpisode } = await import('./temporal-memory.js');
+  const work = await import('./work-episodes.js');
+  const policy = { version: 1, mode: 'exclude', reason: 'controlled_test' };
+  const turn = (sessionId: string, tag: string, excluded: boolean) => {
+    const source = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+      data: { text: `Find the ${tag} report`, ...(excluded ? { learningPolicy: policy } : {}) } });
+    eventlog.appendEvent({ sessionId, turn: 1, role: 'assistant', type: 'conversation_completed',
+      data: { reply: `The ${tag} report is in /reports/${tag}.pdf.`, sourceUserSeq: source.seq } });
+    return source.seq;
+  };
+  const testOnly = chat('testonly', 9, { transcript: false });
+  const testSeq = turn(testOnly, 'testonly', true);
+  const mixed = chat('mixed', 9, { transcript: false });
+  turn(mixed, 'probe', true);
+  turn(mixed, 'quarterly', false);
+  for (const id of [testOnly, mixed]) {
+    eventlog.openEventLog().prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(daysAgo(9), id);
+  }
+
+  assert.equal(conversationMemory.conversationTranscript(testOnly).turns, 0, 'a test-only chat has nothing to remember');
+  const kept = conversationMemory.conversationTranscript(mixed).text;
+  assert.match(kept, /Find the quarterly report/);
+  assert.doesNotMatch(kept, /probe/, 'the excluded turn and its answer stay out');
+  assert.equal(work.recordWorkEpisode({ kind: 'answer', sessionId: testOnly, sourceUserSeq: testSeq, objective: 'Find the testonly report', outcome: 'found' }), null,
+    'an excluded turn leaves no work episode');
+
+  // Memory an earlier version made from them anyway.
+  const leakedWork = recordMemoryEpisode({ kind: 'user_turn', subtype: 'completed_work', title: 'Completed answer', content: 'Answered: testonly',
+    sessionId: testOnly, callId: `work:answer:${testSeq}`, occurredAt: daysAgo(9), status: 'available' });
+  const leakedConversation = recordMemoryEpisode({ kind: 'reflection', subtype: 'conversation', title: 'probe and quarterly', content: 'The owner asked for the probe report.',
+    sessionId: mixed, callId: 'conversation-memory', occurredAt: daysAgo(9), status: 'available' });
+  eventlog.openEventLog().prepare('UPDATE session_conversation_state SET memory_episode_id = ? WHERE session_id = ?').run(leakedConversation.id, mixed);
+
+  assert.ok(conversationMemory.expireLearningExcludedMemories(NOW, true) >= 2);
+  const status = (id: string) => (openMemoryDb().prepare('SELECT status FROM memory_episodes WHERE id = ?').get(id) as { status: string }).status;
+  assert.equal(status(leakedWork.id), 'expired');
+  assert.equal(status(leakedConversation.id), 'expired');
+  assert.equal(state(mixed).memoryEpisodeId, null, 'the chat is remembered again from what may be learned');
+  assert.equal(conversationMemory.expireLearningExcludedMemories(NOW), 0, 'once a day');
+
+  await conversationMemory.consolidateIdleConversations({ now: NOW, rememberLimit: 500 });
+  assert.match(summaries.join('\n'), /Find the quarterly report/, 'the mixed chat is remembered again');
+  assert.doesNotMatch(summaries.join('\n'), /probe|testonly/, 'the model never sees an excluded turn');
+});
