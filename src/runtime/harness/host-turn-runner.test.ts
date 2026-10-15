@@ -13557,6 +13557,41 @@ for (const failure of ['codex.transport_timeout', 'codex.sse_truncated', 'raw', 
   });
 }
 
+test('a provider server error after the model boundary retried waits to continue with the saved work', async () => {
+  const fixture = acceptHostCanarySource('provider-5xx-unavailable', 'Create one reversible draft on the controlled provider account and report its receipt.');
+  const prior = process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+  process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = '1';
+  let requests = 0, writes = 0, rejectedWrites = 0;
+  const writeFixture = await transportWriteFixture(async () => { writes++; return 'SAVED_RECEIPT'; }, async () => { rejectedWrites++; return 'must not execute'; });
+  const model = {
+    async getResponse(): Promise<never> { throw new Error('stream required'); },
+    async *getStreamedResponse() {
+      requests++;
+      if (requests > 1) {
+        throw new BoundaryError({ kind: 'model.http_5xx', retryable: true,
+          userMessage: 'The model provider returned a server error.', operatorMessage: 'HTTP 503 from the provider.' });
+      }
+      yield { type: 'response_done', response: { usage: {}, output: [writeFixture.call('settled-write')] } } as never;
+    },
+  };
+  try {
+    const agent = { model, tools: [writeFixture.carrier] };
+    bindHostCanarySurface(fixture, agent, agent.tools);
+    const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 5 });
+    assert.equal(requests, 2, 'the model boundary already retried; the host does not ask again');
+    assert.equal(outcome.terminal?.status, 'awaiting_user_input');
+    assert.equal(outcome.terminal?.reason, 'model_transport_unavailable');
+    assert.match(outcome.finalOutput!, /model provider is not answering/);
+    assert.match(JSON.stringify(outcome.history), /SAVED_RECEIPT/, 'the waiting turn retains accepted work for continuation');
+    assert.equal(writes, 1);
+    assert.equal(rejectedWrites, 0);
+  } finally {
+    writeFixture.restore();
+    if (prior === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+    else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = prior;
+  }
+});
+
 test('persistent transport failure becomes a visible continuation question with saved conversation history', async () => {
   const prior = process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
   process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = '1';

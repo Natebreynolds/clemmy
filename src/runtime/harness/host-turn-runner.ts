@@ -11153,6 +11153,22 @@ const runHostTurnBody = async (
         );
         return { ...waiting, terminal: { status: 'awaiting_user_input', reason: 'model_transport_unavailable' } };
       }
+      // A provider that answered with a server error or overload after the
+      // model boundary spent its retries (and any connected fallback brain)
+      // is an unavailable model too: the work is kept and the turn waits to
+      // continue. Retrying here again would only lengthen the outage's wait.
+      const providerFailureKind = error instanceof BoundaryError ? error.kind
+        : !(error instanceof KillRequested) && !(error instanceof ModelStreamStalledError)
+          ? classifyModelError(error).kind : null;
+      if ((providerFailureKind === 'model.http_5xx' || providerFailureKind === 'model.overloaded'
+        || providerFailureKind === 'codex.http_5xx')
+        && !signal?.aborted && !bufferedRequestInFlight) {
+        const waiting = blockedOutcome(
+          'My model provider is not answering right now. I saved the completed work and have not run any tool calls from the failed response. Would you like me to try continuing from here?',
+          'model_transport_unavailable',
+        );
+        return { ...waiting, terminal: { status: 'awaiting_user_input', reason: 'model_transport_unavailable' } };
+      }
       throw error;
     }
     if (ranModelStep && writingNoProgressRecoveryDirective) {
