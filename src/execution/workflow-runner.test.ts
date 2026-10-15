@@ -8370,3 +8370,17 @@ test('a reviewer\'s change request is recorded on the parked run that owns the g
   assert.equal(persisted.parked.changeRequest?.requestedBy, 'mobile-inbox:dev1');
   rmSync(filePath, { force: true });
 });
+
+test('a run flagged for attention without a blocked step says why; a blocked or clean run adds nothing', async () => {
+  const runner = await import('./workflow-runner.js');
+  // Live 2026-10-15: a completed run was flagged needs-attention with no
+  // blocked step, and its report read as plain success, so Clem could only
+  // say it "still needs attention".
+  assert.equal(
+    runner.workflowAttentionNote({ needsAttention: true, blockedSteps: [], attentionReason: 'target not confirmed: the brief file was not found.' }),
+    '\n\nWhy this needs a look: target not confirmed: the brief file was not found.',
+  );
+  assert.equal(runner.workflowAttentionNote({ needsAttention: true, blockedSteps: [{ stepId: 'a' }], attentionReason: 'x' }), '');
+  assert.equal(runner.workflowAttentionNote({ needsAttention: false, blockedSteps: [], attentionReason: 'x' }), '');
+  assert.equal(runner.workflowAttentionNote({ needsAttention: true, blockedSteps: [], attentionReason: undefined }), '');
+});

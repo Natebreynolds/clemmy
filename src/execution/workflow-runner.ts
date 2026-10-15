@@ -9867,6 +9867,20 @@ export function settlementGuardedStepOutput(input: {
   };
 }
 
+/** The reason a run flagged for attention owes its reader when no blocked
+ *  step already names one: a target not confirmed, a goal not met, a
+ *  review-required advisory. Empty otherwise. */
+export function workflowAttentionNote(input: {
+  needsAttention: boolean;
+  blockedSteps: readonly unknown[];
+  attentionReason: string | undefined;
+}): string {
+  const reason = input.attentionReason?.trim().replace(/[.\s]+$/, '');
+  return input.needsAttention && input.blockedSteps.length === 0 && reason
+    ? `\n\nWhy this needs a look: ${reason}.`
+    : '';
+}
+
 /** Does `consumer` read `sourceId`'s output — via dependsOn, a forEach over it,
  *  or a {{steps.<sourceId>.output…}} reference in its prompt? Pure. */
 export function stepConsumesOutput(consumer: WorkflowStepInput, sourceId: string): boolean {
@@ -15569,12 +15583,18 @@ async function processOneRunFile(
       }
       const activationFailed = activation !== null && !activation.activated;
       const lines = creationTestStepLines(result.steps);
+      // Checks a rehearsal cannot make honestly (whether the workflow's goal
+      // is met judges the changes it only previewed) belong to the first real
+      // run; a pass says so instead of implying them.
+      const realRunChecks = workflow.data.goal?.objective
+        ? '\n\nIts goal is judged on each real run; a rehearsal only previews the changes that goal is judged on.'
+        : '';
       const body = creationReady
         ? activateAfterCreationTest
           ? activation && !activation.activated
             ? `Creation test passed for "${workflow.data.name}" — the read steps returned real data — but it is still off: ${activation.reason}.\n\n${lines.join('\n')}\n\nAsk me to turn it on and I'll test the saved version first.`
-            : `Creation test passed for "${workflow.data.name}" — the read steps returned real data, so I turned it on.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run. It will run on its schedule or when you start it.`
-          : `Creation test passed for "${workflow.data.name}" — the read steps returned real data. It stays off, as you asked.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run.`
+            : `Creation test passed for "${workflow.data.name}" — the read steps returned real data, so I turned it on.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run. It will run on its schedule or when you start it.${realRunChecks}`
+          : `Creation test passed for "${workflow.data.name}" — the read steps returned real data. It stays off, as you asked.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run.${realRunChecks}`
         : result.pass
           ? autoRetestRunId
             ? `The creation test passed, but ${activationBlockedReason}, so that pass no longer covers what's saved. I'm testing the newer version now; ${activateAfterCreationTest ? 'it turns on here if it passes' : 'it stays off'}.\n\n${lines.join('\n')}`
@@ -16924,7 +16944,12 @@ async function processOneRunFile(
           ? { canonicalEntityWorkspaceProjectionClaim, canonicalEntityWorkspaceProjectionFinishedAt }
           : {}),
         ...(needsAttention
-          ? { needsAttention: true, blockedSteps, proposedFixId: proposedFix?.id ?? null }
+          ? {
+              needsAttention: true,
+              blockedSteps,
+              proposedFixId: proposedFix?.id ?? null,
+              ...(attentionReason ? { needsAttentionReason: attentionReason } : {}),
+            }
           : {}),
         ...(goalDecision ? { goalOutcome: goalDecision.action, goalReason: goalDecision.reason } : {}),
         ...(goalValidation ? { goalValidation } : {}),
@@ -17160,9 +17185,14 @@ async function processOneRunFile(
       const suppressGlobalTerminal = originObserverState !== 'none';
       // Single report body (escalation banner prepended when auto-heal is
       // paused), reused for the notification, dashboard preview, and chat re-entry.
+      // A run flagged for attention with no blocked step (a target not
+      // confirmed, a goal not met, a review-required advisory) still owes the
+      // reader its reason; without it the report read as success while the
+      // run was flagged, and Clem could only say it "needs attention".
+      const unblockedAttentionNote = workflowAttentionNote({ needsAttention, blockedSteps, attentionReason });
       let reportBody = isCompiledProjectRun && !needsAttention
         ? finalOutput
-        : `${escalationBanner}${needsAttention ? outcome.body : successBody}${advisorySummary}`;
+        : `${escalationBanner}${needsAttention ? outcome.body : successBody}${unblockedAttentionNote}${advisorySummary}`;
       reportBody = scrubWorkflowTerminalPresentation(reportBody);
       // Warm the tone into Clementine's voice + let her flag a routine no-op.
       // Best-effort/fail-open: any hiccup returns the original text. We skip the
