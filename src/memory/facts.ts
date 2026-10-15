@@ -13,7 +13,12 @@ import {
   EVERYWHERE, currentMemoryReadScope, currentMemoryWriteScope, hiddenFromScope, isEverywhere, memoryScopeOf, recordVisible, sameScope,
   scopeHashSuffix, scopeOfSession, scopedRecords, stampMemoryScope, visibleInScope, type MemoryScope,
 } from './memory-scope.js';
-import { cosine, embedQuery, isEmbeddingsEnabled, loadActiveFactEmbeddings, loadArchivedFactEmbeddings, loadFactEmbeddings } from './embeddings.js';
+import {
+  activeEmbeddingDim, activeEmbeddingModel, activeEmbeddingSpaceKey, cosine,
+  embeddingSelectionRevision, embedQueryWithSpace, isEmbeddingsEnabled,
+  loadActiveFactEmbeddings, loadArchivedFactEmbeddings, loadFactEmbeddings,
+  type EmbeddingSpace,
+} from './embeddings.js';
 import { getRecallStats } from './recall.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { appendFactRecallTrace } from './recall-trace.js';
@@ -36,8 +41,10 @@ import {
 // vector can never leak into an unrelated later call. Flag CLEMMY_SEMANTIC_RECALL
 // (default on); off → byte-identical to the prior lexical ranking.
 const TURN_QUERY_TTL_MS = 60_000;
+const TURN_QUERY_PRIME_BUDGET_MS = 900;
 interface TurnQueryScope {
-  query: { text: string; vector: Float32Array; atMs: number } | null;
+  query: (EmbeddingSpace & { text: string; vector: Float32Array; atMs: number; selectionRevision: string }) | null;
+  revision: number;
 }
 
 // A daemon can drive several chat/workflow turns concurrently. The old single
@@ -46,44 +53,76 @@ interface TurnQueryScope {
 // but production turns run inside an isolated async scope installed by the
 // harness entry point.
 const turnQueryStorage = new AsyncLocalStorage<TurnQueryScope>();
-let unscopedTurnQuery: TurnQueryScope['query'] = null;
+const unscopedTurnQuery: TurnQueryScope = { query: null, revision: 0 };
+
+function currentTurnQueryScope(): TurnQueryScope {
+  return turnQueryStorage.getStore() ?? unscopedTurnQuery;
+}
 
 export function withTurnQueryVectorScope<T>(run: () => T): T {
-  return turnQueryStorage.run({ query: null }, run);
+  return turnQueryStorage.run({ query: null, revision: 0 }, run);
 }
 
-export function setTurnQueryVector(text: string, vector: Float32Array | null, nowMs: number = Date.now()): void {
-  const query = vector && vector.length > 0 ? { text, vector, atMs: nowMs } : null;
-  const scope = turnQueryStorage.getStore();
-  if (scope) scope.query = query;
-  else unscopedTurnQuery = query;
+function boundTurnQuery(
+  text: string,
+  vector: Float32Array | null,
+  nowMs: number,
+  space?: EmbeddingSpace,
+): TurnQueryScope['query'] {
+  const model = space?.model ?? activeEmbeddingModel();
+  const dim = space?.dim ?? activeEmbeddingDim();
+  if (!vector || vector.length === 0 || !model || dim !== vector.length) return null;
+  return {
+    text, vector, atMs: nowMs, model, dim,
+    spaceKey: space?.spaceKey ?? activeEmbeddingSpaceKey(),
+    selectionRevision: embeddingSelectionRevision(),
+  };
+}
+
+export function setTurnQueryVector(
+  text: string,
+  vector: Float32Array | null,
+  nowMs: number = Date.now(),
+  space?: EmbeddingSpace,
+): void {
+  const scope = currentTurnQueryScope();
+  scope.revision++;
+  scope.query = boundTurnQuery(text, vector, nowMs, space);
 }
 export function clearTurnQueryVector(): void {
-  const scope = turnQueryStorage.getStore();
-  if (scope) scope.query = null;
-  else unscopedTurnQuery = null;
+  const scope = currentTurnQueryScope();
+  scope.revision++;
+  scope.query = null;
 }
 
 /** Compute + stash the turn's query embedding so the (sync) per-turn fact
  *  recall can add a semantic-relevance term. Fire concurrently with the memory
- *  primer — it never throws and never blocks recall (embedQuery is breaker- and
- *  timeout-guarded). No-op when the flag is off or embeddings are unavailable,
+ *  primer — it never throws, and its default foreground deadline is bounded.
+ *  No-op when the flag is off or embeddings are unavailable,
  *  leaving recall on the prior lexical ranking. */
-export async function primeTurnRecallVector(input: string): Promise<void> {
+export async function primeTurnRecallVector(input: string, options: { deadlineAtMs?: number } = {}): Promise<void> {
   if (!semanticRecallEnabled() || !input || !input.trim()) { clearTurnQueryVector(); return; }
+  const scope = currentTurnQueryScope();
+  const revision = ++scope.revision;
+  scope.query = null;
+  const selectionRevision = embeddingSelectionRevision();
+  const isCurrent = () => scope.revision === revision && embeddingSelectionRevision() === selectionRevision;
   try {
-    setTurnQueryVector(input, await embedQuery(input));
+    const result = await embedQueryWithSpace(input, {
+      priority: 'foreground', deadlineAtMs: options.deadlineAtMs ?? Date.now() + TURN_QUERY_PRIME_BUDGET_MS,
+    });
+    if (isCurrent()) scope.query = result ? boundTurnQuery(input, result.vector, Date.now(), result) : null;
   } catch {
-    setTurnQueryVector(input, null);
+    if (isCurrent()) scope.query = null;
   }
 }
 
-function getActiveTurnQueryVector(nowMs: number): Float32Array | null {
-  const scope = turnQueryStorage.getStore();
-  const query = scope ? scope.query : unscopedTurnQuery;
+function getActiveTurnQueryVector(nowMs: number): TurnQueryScope['query'] {
+  const query = currentTurnQueryScope().query;
   if (!query) return null;
   if (nowMs - query.atMs > TURN_QUERY_TTL_MS) return null;
-  return query.vector;
+  if (query.selectionRevision !== embeddingSelectionRevision()) return null;
+  return query;
 }
 
 function semanticRecallEnabled(): boolean {
@@ -896,7 +935,7 @@ export interface ScoredFact {
  */
 export async function findSimilarFactsScored(
   content: string,
-  options: { kind?: ConsolidatedFactKind; topK?: number; asOf?: string } = {},
+  options: { kind?: ConsolidatedFactKind; topK?: number; asOf?: string; deadlineAtMs?: number } = {},
 ): Promise<ScoredFact[]> {
   const db = openMemoryDb();
   const topK = Math.max(1, Math.min(20, options.topK ?? 5));
@@ -906,30 +945,33 @@ export async function findSimilarFactsScored(
   // Semantic path — cosine over the embedded fact pool.
   if (isEmbeddingsEnabled()) {
     try {
-      // Full-pool semantic search. The vectors are generation-cached in the
-      // active provider space, so tail facts are never discarded by recency
-      // before cosine relevance is computed.
+      // Keep the no-stored-vectors fast path. After awaiting the query, reload
+      // the pool in its ACTUAL producing space and recheck current validity and
+      // visibility: a same-call rescue can differ from the selected provider,
+      // while an edited/superseded fact must not retain its old cosine score.
       const historicalAt = options.asOf && Number.isFinite(Date.parse(options.asOf))
         ? new Date(Date.parse(options.asOf)).toISOString()
         : undefined;
-      const vectors = historicalAt
+      const loadVectors = (space?: Pick<EmbeddingSpace, 'model' | 'dim'>) => historicalAt
         ? loadFactEmbeddings((db.prepare(`
             SELECT DISTINCT cf.id
             FROM consolidated_facts cf
             JOIN fact_validity_intervals fvi ON fvi.fact_id = cf.id
             WHERE fvi.valid_from <= ? AND (fvi.valid_to IS NULL OR fvi.valid_to > ?)
               ${options.kind ? 'AND cf.kind = ?' : ''}
-          `).all(historicalAt, historicalAt, ...(options.kind ? [options.kind] : [])) as Array<{ id: number }>).map((row) => row.id))
-        : loadActiveFactEmbeddings(options.kind);
-      const ids = visibleInScope('fact', Array.from(vectors.keys()), (id) => id);
-      if (vectors.size > 0) {
-        const queryVector = await embedQuery(normalized);
-        if (queryVector) {
+          `).all(historicalAt, historicalAt, ...(options.kind ? [options.kind] : [])) as Array<{ id: number }>).map((row) => row.id), space)
+        : loadActiveFactEmbeddings(options.kind, space);
+      if (loadVectors().size > 0) {
+        const selectionRevision = embeddingSelectionRevision();
+        const queryResult = await embedQueryWithSpace(normalized, { priority: 'foreground', deadlineAtMs: options.deadlineAtMs });
+        if (queryResult && embeddingSelectionRevision() === selectionRevision) {
+          const vectors = loadVectors(queryResult);
+          const ids = visibleInScope('fact', Array.from(vectors.keys()), (id) => id);
           const scored: Array<{ id: number; sim: number }> = [];
           for (const id of ids) {
             const vec = vectors.get(id);
             if (!vec) continue;
-            scored.push({ id, sim: cosine(queryVector, vec) });
+            scored.push({ id, sim: cosine(queryResult.vector, vec) });
           }
           scored.sort((a, b) => b.sim - a.sim);
           const top = scored.slice(0, topK);
@@ -1183,7 +1225,7 @@ const ARCHIVED_MIN_SIM = 0.5;
  */
 export async function searchArchivedFactsScored(
   query: string,
-  options: { topK?: number } = {},
+  options: { topK?: number; deadlineAtMs?: number } = {},
 ): Promise<ScoredFact[]> {
   const topK = Math.max(1, Math.min(10, options.topK ?? 5));
   const normalized = normalizeContent(query);
@@ -1192,15 +1234,16 @@ export async function searchArchivedFactsScored(
 
   if (isEmbeddingsEnabled()) {
     try {
-      const vectors = loadArchivedFactEmbeddings();
-      if (vectors.size > 0) {
-        const queryVector = await embedQuery(normalized);
-        if (queryVector) {
+      if (loadArchivedFactEmbeddings().size > 0) {
+        const selectionRevision = embeddingSelectionRevision();
+        const queryResult = await embedQueryWithSpace(normalized, { priority: 'foreground', deadlineAtMs: options.deadlineAtMs });
+        if (queryResult && embeddingSelectionRevision() === selectionRevision) {
+          const vectors = loadArchivedFactEmbeddings(undefined, queryResult);
           const scored: Array<{ id: number; sim: number }> = [];
           const readable = new Set(visibleInScope('fact', Array.from(vectors.keys()), (id) => id));
           for (const [id, vec] of vectors) {
             if (!readable.has(id)) continue;
-            const sim = cosine(queryVector, vec);
+            const sim = cosine(queryResult.vector, vec);
             if (sim >= ARCHIVED_MIN_SIM) scored.push({ id, sim });
           }
           scored.sort((a, b) => b.sim - a.sim);
@@ -1216,7 +1259,7 @@ export async function searchArchivedFactsScored(
               .filter((r): r is ConsolidatedFactRow => Boolean(r))
               .map((r) => ({ fact: rowToFact(r), sim: simById.get(r.id) ?? null }));
           }
-          return [];
+          if (vectors.size > 0) return [];
         }
       }
       // No archived vectors / query embed failed — fall through to lexical.
@@ -1599,8 +1642,9 @@ export function listActiveFacts(options: {
     // Bonus-only semantic-relevance term: blend cosine(queryVector, factVector)
     // when the harness stashed a turn query embedding. Loaded once for the whole
     // candidate pool (sync DB read). No vector / flag off → s is unchanged.
-    const queryVec = semanticRecallEnabled() ? getActiveTurnQueryVector(now) : null;
-    const factVectors = queryVec ? loadActiveFactEmbeddings(options.kind) : null;
+    const query = semanticRecallEnabled() ? getActiveTurnQueryVector(now) : null;
+    const queryVec = query?.vector;
+    const factVectors = query ? loadActiveFactEmbeddings(options.kind, query) : null;
     const wSem = semanticRecallWeight();
     return visibleInScope('fact', rows, (row) => row.id)
       .map(rowToFact)

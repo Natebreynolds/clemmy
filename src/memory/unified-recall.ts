@@ -23,6 +23,7 @@ export interface UnifiedHit {
 }
 
 export interface UnifiedRecallOptions {
+  deadlineAtMs?: number;
   purpose?: 'ambient' | 'targeted';
   limit?: number;
   perStore?: number;
@@ -117,6 +118,7 @@ export async function recallEverything(objective: string, opts: UnifiedRecallOpt
   if (!obj) return { objective: '', hits: [], perStore: {}, answerability: 'insufficient' };
   const result = await recallMemory(obj, {
     purpose: opts.purpose,
+    deadlineAtMs: opts.deadlineAtMs,
     limit: opts.limit,
     perStore: opts.perStore,
     stores: opts.stores?.map(recallStore),

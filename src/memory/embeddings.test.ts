@@ -90,7 +90,7 @@ test('embedQuery in-flight cache: two CONCURRENT identical embeds make ONE provi
     dim: EMBEDDING_DIM,
     embed: async (texts: string[]) => {
       calls += 1;
-      return texts.map(() => new Float32Array(EMBEDDING_DIM));
+      return texts.map(() => new Float32Array(EMBEDDING_DIM).fill(1));
     },
   } as any);
   try {
