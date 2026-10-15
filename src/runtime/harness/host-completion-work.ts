@@ -211,16 +211,37 @@ export function sourceWritesAtStake(input: {
 
 /** Whether this source wrote or created anything: any write other than a
  *  restorable local execution such as a browser page visit, local file edits
- *  included. An unreadable ledger counts as output. */
+ *  included. A host-only creation (a saved proposal, a note) settles without
+ *  the mutating flag, so a tool the registry declares a write counts too. An
+ *  unreadable ledger counts as output. */
 export function sourceProducedOutput(input: {
   sessionId: string;
   sourceUserSeq: number;
 }): boolean {
   try {
-    return mutatingSettlements(input).some((row) => !isRestorableExecution(row));
+    return settledCalls(input).some((row) => (row.mutating === 1 || registryDeclaresWrite(row.toolName))
+      && !isRestorableExecution(row));
   } catch {
     return true;
   }
+}
+
+function registryDeclaresWrite(toolName: string | null): boolean {
+  const row = toolName ? TOOL_REGISTRY.find((entry) => entry.name === toolName) : undefined;
+  return row?.sideEffect === 'write';
+}
+
+function settledCalls(input: { sessionId: string; sourceUserSeq: number }): Array<MutatingSettlementRow & { mutating: number }> {
+  return openEventLog().prepare(`
+    SELECT s.mutating AS mutating, s.execution_kind AS executionKind, s.outcome_kind AS outcomeKind,
+           s.requirement_id AS requirementId, l.tool_name AS toolName
+      FROM logical_call_settlements s
+      LEFT JOIN logical_tool_calls l
+        ON l.session_id = s.session_id
+       AND l.source_user_seq = s.source_user_seq
+       AND l.logical_tool_call_id = s.logical_tool_call_id
+     WHERE s.session_id = ? AND s.source_user_seq = ?
+  `).all(input.sessionId, input.sourceUserSeq) as Array<MutatingSettlementRow & { mutating: number }>;
 }
 
 interface MutatingSettlementRow {
