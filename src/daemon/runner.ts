@@ -3135,6 +3135,7 @@ export async function startDaemon(
   // and approvals in near-real-time even while a deep job is in flight.
   // An in-flight guard prevents overlap when a single delivery pass
   // is unusually slow.
+  bootStep('lanes_notifications');
   let deliveryInFlight = false;
   let deliveryRerunRequested = false;
   const drainNotificationDeliveries = (phase: 'timer' | 'kick'): void => {
@@ -3173,6 +3174,7 @@ export async function startDaemon(
   // progress. Drain the background queue independently; the processor
   // itself has an in-flight guard, so explicit approval kicks and this
   // timer cannot double-run the same task.
+  bootStep('lanes_background');
   const drainBackgroundTasks = () => {
     try {
       const approvalSurfaces = recoverParkedApprovalSurfaces();
@@ -3278,6 +3280,7 @@ export async function startDaemon(
   // the table (resolveRoleModel, kill-switch CLEMMY_ROUTE_POLICY); this tick is
   // observe-only bookkeeping and always runs. Hourly + once shortly after boot
   // so a fresh install has scores as soon as it has outcomes. Never throws.
+  bootStep('lanes_watchdogs');
   const tickRoutePolicy = () => {
     void withDaemonRuntimePhase('daemon.timer.route_policy', {}, async () => {
       const result = runRoutePolicyJob();
@@ -3385,6 +3388,7 @@ export async function startDaemon(
   // assistant runtime, which can select a different provider than the active
   // harness brain and races the first real turn. Keep it dormant until the
   // warmup uses the unified provider-qualified core.
+  bootStep('lanes_warmup');
   if (bootModelWarmupEnabled()) {
     setTimeout(() => {
       void (async () => {
@@ -3493,6 +3497,7 @@ export async function startDaemon(
   // with no progress. processWorkflowRuns single-flights internally, so
   // overlapping ticks are safe. Disable with CLEMMY_WORKFLOW_RUN_LANE=off
   // to fall back to draining inline on the main tick.
+  bootStep('lanes_workflow_runs');
   const workflowRunLane = (getRuntimeEnv('CLEMMY_WORKFLOW_RUN_LANE', 'on') ?? 'on').toLowerCase() !== 'off';
   if (workflowRunLane) {
     let immediateWorkflowDrainScheduled = false;
