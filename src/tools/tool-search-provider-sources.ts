@@ -2654,9 +2654,19 @@ export function buildAuthorizedToolSearchCandidateSources(
     kind: 'authorized_composio',
     async search(input) {
       const { query, deadlineAt } = input;
-      if (deadlineAt === undefined || exactComposioOperationsFromQuery(query).length > 0) return searchLive(input);
+      // Started first and joined on every answer below, so a live search that
+      // answers late (the cached fallback holds connected apps only) cannot
+      // drop the apps the query named that are not connected.
+      const unconnected = exactComposioOperationsFromQuery(query).length > 0
+        ? Promise.resolve([] as ToolSearchBrokerCandidate[])
+        : namedUnconnectedCandidates(query, input.signal, deadlineAt);
+      const withUnconnected = async (rows: ToolSearchBrokerCandidate[]): Promise<ToolSearchBrokerCandidate[]> => {
+        const seen = new Set(rows.map((candidate) => candidate.name.trim().toUpperCase()));
+        return [...rows, ...(await unconnected).filter((candidate) => !seen.has(candidate.name.trim().toUpperCase()))];
+      };
+      if (deadlineAt === undefined || exactComposioOperationsFromQuery(query).length > 0) return withUnconnected(await searchLive(input));
       const fallbackMs = deadlineAt - Date.now() - COMPOSIO_LEASED_FALLBACK_MARGIN_MS;
-      if (fallbackMs <= 0) return leasedIndexedComposioCandidates(query);
+      if (fallbackMs <= 0) return withUnconnected(leasedIndexedComposioCandidates(query));
       const live = searchLive(input);
       // A query that names a connected app with current contracts that match
       // it is answered from them after a short wait, not the whole budget.
@@ -2667,14 +2677,14 @@ export function buildAuthorizedToolSearchCandidateSources(
       const late = new Promise<'late'>((resolve) => { timer = setTimeout(() => resolve('late'), budgetMs); });
       try {
         const raced = await Promise.race([live, late]);
-        if (raced !== 'late') return raced;
+        if (raced !== 'late') return withUnconnected(raced);
       } finally {
         if (timer) clearTimeout(timer);
       }
       // The live search keeps going and teaches what it learns; this answer
       // uses what is already proven current.
       live.catch(() => undefined);
-      return leasedIndexedComposioCandidates(query);
+      return withUnconnected(leasedIndexedComposioCandidates(query));
     },
     prepareCandidates: (input) => prepareCandidatesLive(input),
   };
@@ -2730,14 +2740,7 @@ export function buildAuthorizedToolSearchCandidateSources(
     }
   }
   async function searchLive(input: Parameters<ToolSearchCandidateSource['search']>[0]): Promise<ToolSearchBrokerCandidate[]> {
-    const [connected, unconnected] = await Promise.all([
-      searchConnectedLive(input),
-      exactComposioOperationsFromQuery(input.query).length > 0
-        ? Promise.resolve([] as ToolSearchBrokerCandidate[])
-        : namedUnconnectedCandidates(input.query, input.signal, input.deadlineAt),
-    ]);
-    const seen = new Set(connected.map((candidate) => candidate.name.trim().toUpperCase()));
-    return [...connected, ...unconnected.filter((candidate) => !seen.has(candidate.name.trim().toUpperCase()))];
+    return searchConnectedLive(input);
   }
   async function searchConnectedLive({ query, signal, deadlineAt, accountSelection, deferPreparation }: Parameters<ToolSearchCandidateSource['search']>[0]): Promise<ToolSearchBrokerCandidate[]> {
       preparedSearchCandidates.clear();
