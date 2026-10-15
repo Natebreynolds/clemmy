@@ -381,7 +381,7 @@ interface TurnRun {
   turnMs: number;
 }
 
-async function runTurn(sessionId: string): Promise<TurnRun> {
+async function runTurn(sessionId: string, options: { jevMayAbstain?: boolean } = {}): Promise<TurnRun> {
   const requests: unknown[] = [];
   const route: string[] = [];
   const scriptedModel = {
@@ -433,18 +433,23 @@ async function runTurn(sessionId: string): Promise<TurnRun> {
   assert.ok(sourceUserSeq > 0, `${sessionId}: the runner accepted one durable source`);
   // A review that fails open learns nothing, so a warm scenario would quietly
   // measure a cold desk (10-10: every warm read did, unseen).
+  // A read is checked by Jev alone (owner rule): with Jev off, hanging or
+  // failing it ships unreviewed by design, which is not a review failing.
   const failedOpen = eventlog.listEvents(session.id, { types: ['goal_alignment_judged'] })
-    .filter((event) => (event.data as { failedOpen?: boolean }).failedOpen === true);
+    .filter((event) => (event.data as { failedOpen?: boolean }).failedOpen === true)
+    .filter((event) => !(options.jevMayAbstain && /checked by Jev alone, and Jev gave no verdict/.test(String(event.data.reason ?? ''))));
   assert.deepEqual(failedOpen.map((event) => event.data.reason), [], `${sessionId}: no review failed open`);
   return { sessionId: session.id, sourceUserSeq, requests, route, sent, turnMs: Date.now() - started };
 }
 
 // ---------------------------------------------------------------------------
 // A warm scenario first asks the same thing once in another conversation,
-// with no Jev key, so every arm starts from the same learned state.
+// checked by the scripted Jev (a read is checked by Jev alone), so every arm
+// starts from the same learned state.
 // ---------------------------------------------------------------------------
 if (script.warmUp) {
-  jevClient._setTypesafeKeyForTests(null);
+  jevClient._setTypesafeKeyForTests('fixture-jev-key');
+  jevClient._setSystemOneFetchForTests(scriptedJevFetch(script.steps.map((step) => step.tool), []));
   const warm = await runTurn(`lean-${scenario}-${arm}-warmup`);
   assert.equal(scoreAcceptedTurnRounds(HOME, warm.sessionId, warm.sourceUserSeq).terminal?.status, 'done',
     'the warm-up turn completes');
@@ -467,7 +472,7 @@ if (arm === 'jev_off') {
     : scriptedJevFetch(script.steps.map((step) => step.tool), jevLog));
 }
 reviews = 0;
-const measured = await runTurn(`lean-${scenario}-${arm}`);
+const measured = await runTurn(`lean-${scenario}-${arm}`, { jevMayAbstain: arm !== 'jev_scripted' });
 const { requests, route, sent, turnMs } = measured;
 if (process.env.LEAN_ROUNDS_DUMP_DIR) {
   writeFileSync(path.join(process.env.LEAN_ROUNDS_DUMP_DIR, `${scenario}-${arm}.json`), JSON.stringify({
