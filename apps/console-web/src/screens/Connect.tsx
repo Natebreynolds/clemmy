@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug, Mail, Tag, Plus, Pencil, ExternalLink, MessageCircle, ChevronRight } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { Page } from '@/components/Page';
 import { PluginsPanel } from '@/components/connect/PluginsPanel';
 import { Card } from '@/components/ui/Card';
@@ -20,6 +20,7 @@ import { BrowserHarness } from '@/components/connect/BrowserHarness';
 import { BrowserConnection } from '@/components/connect/BrowserConnection';
 import { AppSetupFormView, type AppSetupForm } from '@/components/connect/AppConnectionSetup';
 import { usePoll } from '@/lib/poll';
+import { connectionSetupChatNavigation } from '@/lib/connection-setup-draft';
 import { CodexReauth } from './settings/CodexLoginForm';
 import {
   getComposioStatus, getComposioToolkits, authorizeComposio, reconnectComposio, refreshComposio, disconnectComposio,
@@ -65,6 +66,7 @@ function Section({ icon: Icon, title, subtitle, children, action }: {
 }
 
 export function Connect() {
+  const navigate = useNavigate();
   const qc = useQueryClient();
   const composio = usePoll(['composio-status'], getComposioStatus, 20000);
   const toolkits = usePoll(['composio-toolkits'], getComposioToolkits, 30000);
@@ -72,6 +74,8 @@ export function Connect() {
   const creds = usePoll(['credentials'], getCredentials, 20000);
 
   const [appQuery, setAppQuery] = useState('');
+  const [connectionRequest, setConnectionRequest] = useState('');
+  const [connectionRequestError, setConnectionRequestError] = useState('');
   const snap = toolkits.data;
   const connected = connectedToolkits(snap);
   const results = searchToolkits(snap, appQuery);
@@ -174,6 +178,23 @@ export function Connect() {
 
   return (
     <Page title="Connect" subtitle="Give Clementine access to your apps, tools, and phone">
+      <section className="mb-8 max-w-3xl" aria-labelledby="connection-setup-heading">
+        <h2 id="connection-setup-heading" className="text-h2 text-fg">What would you like to connect?</h2>
+        <p id="connection-setup-help" className="mt-2 max-w-prose text-body text-muted">Tell Clem what you need. She’ll check the setup and guide you through any sign-in.</p>
+        <form className="mt-4 flex flex-col gap-3 sm:flex-row" onSubmit={event => {
+          event.preventDefault();
+          const target = connectionSetupChatNavigation('apps', connectionRequest);
+          if (target) navigate(target.pathname, { state: target.state });
+          else setConnectionRequestError('Use a short app or tool name, without line breaks.');
+        }}>
+          <Input value={connectionRequest} onChange={event => { setConnectionRequest(event.target.value); setConnectionRequestError(''); }}
+            maxLength={200} placeholder="Name an app or tool (optional)" aria-label="App or tool to connect"
+            aria-describedby="connection-setup-help connection-setup-draft-help" className="min-w-0 flex-1" />
+          <Button type="submit" className="shrink-0"><MessageCircle className="h-4 w-4" aria-hidden /> Ask Clem</Button>
+        </form>
+        {connectionRequestError && <p role="alert" className="mt-2 text-small text-danger">{connectionRequestError}</p>}
+        <p id="connection-setup-draft-help" className="mt-2 text-caption text-muted">Opens a draft you can edit before sending. You can also set things up below.</p>
+      </section>
       {/* Apps */}
       <Section
         icon={Plug}
@@ -186,9 +207,9 @@ export function Connect() {
               aria-label="Refresh apps" title="Refresh connection status">
               {refreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RefreshCw className="h-3.5 w-3.5" aria-hidden />} Refresh
             </button>
-            <StatusPill tone={composio.data.apiKeyPresent || cliAuthenticated ? 'success' : 'neutral'}>
+            <StatusPill tone={!composio.data.apiKeyPresent && cliAuthenticated ? 'success' : 'neutral'}>
               {composio.data.apiKeyPresent
-                ? 'Composio connected'
+                ? 'Composio key saved'
                 : cliAuthenticated
                   ? 'Composio CLI connected'
                   : 'Not set up'}
@@ -230,10 +251,13 @@ export function Connect() {
         {/* Composio API key — the ONE thing you get from composio.dev. Enter/reset
             it here; everything else (connect, add accounts, label) stays in-app. */}
         {!appsUnavailable && composio.data && (
-          <ComposioApiKeyCard
-            present={Boolean(composio.data.apiKeyPresent)}
-            onSaved={() => { void refreshApps(); }}
-          />
+          <details className="mb-4">
+            <summary className="mb-3 cursor-pointer rounded-md py-2 text-small font-medium text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">Set up app connections manually</summary>
+            <ComposioApiKeyCard
+              present={Boolean(composio.data.apiKeyPresent)}
+              onSaved={() => { void refreshApps(); }}
+            />
+          </details>
         )}
         {!appsUnavailable && cliOnlyComposio && cliAuthenticated && (
           <CliDefaultAccountsCard

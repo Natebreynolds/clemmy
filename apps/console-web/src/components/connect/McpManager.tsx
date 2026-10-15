@@ -9,6 +9,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { usePoll } from '@/lib/poll';
+import { connectionSetupChatNavigation } from '@/lib/connection-setup-draft';
 import {
   getMcpServers, getMcpServerTools, addMcpServer, deleteMcpServer,
   setMcpCredential, reconnectMcpServer, setMcpServerEnabled,
@@ -37,7 +38,7 @@ export function McpManager() {
           <h3 id="mcp-heading" className="text-h3 text-fg">MCP servers</h3>
           <p className="max-w-prose text-small text-muted">Tell Clem which tool you want to connect. She can set it up and check the connection; any keys she needs from you appear here.</p>
         </div>
-        <Button variant="secondary" size="sm" onClick={() => navigate('/chat')}>
+        <Button variant="secondary" size="sm" onClick={() => { const target = connectionSetupChatNavigation('mcp'); if (target) navigate(target.pathname, { state: target.state }); }}>
           <MessageCircle className="h-4 w-4" aria-hidden /> Ask Clem
         </Button>
         <Button variant="ghost" size="sm" onClick={() => setOpen(v => !v)} aria-expanded={open} aria-controls="mcp-manual-setup">

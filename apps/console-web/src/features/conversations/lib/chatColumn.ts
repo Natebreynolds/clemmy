@@ -7,4 +7,4 @@
  */
 export const CHAT_COLUMN = 'mx-auto w-full max-w-[60rem]';
 export const CHAT_THREAD = `${CHAT_COLUMN} flex min-h-full flex-col justify-end gap-7 px-8 py-8`;
-export const CHAT_COMPOSER_WRAP = `${CHAT_COLUMN} px-8 pb-5 pt-2`;
+export const CHAT_COMPOSER_WRAP = `${CHAT_COLUMN} px-4 pb-5 pt-2 sm:px-8`;

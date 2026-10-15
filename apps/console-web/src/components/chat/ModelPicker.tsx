@@ -250,32 +250,38 @@ export function ModelPicker({ sessionId, agentId, applyAgent, className }: {
           </div>
           {roster && <Roster rows={roles.brains} value={rosterValue} busy={busy} onPick={pickBrain} />}
           {roles.claudeSignInFor && <div className="mx-4 mb-2"><ClaudeLoginForm embedded /></div>}
-          <div className={cn(ROLE_ROW, 'border-t border-border')}>
-            <span><span className="block text-small font-semibold text-fg">Helps in parallel</span><span className="block text-caption text-faint">side tasks · everywhere</span></span>
-            <RoleSelect
-              label="Model that helps in parallel"
-              title={mr.roles.worker.source === 'default' ? 'Same model that does the work' : `${roleLabel(mr, 'worker')} · ${PROVIDER_LABEL[workerProv] ?? workerProv}`}
-              disabled={busy}
-              value={mr.roles.worker.source === 'default' ? '__default__' : mr.roles.worker.modelId}
-              onChange={(v) => void roles.onRole('worker', v)}
-            >
-              <option value="__default__">Same model that does the work</option>
-              {roles.workers.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
-            </RoleSelect>
-          </div>
-          <div className={cn(ROLE_ROW, 'border-t border-border')}>
-            <span><span className="block text-small font-semibold text-fg">Checks the work</span><span className="block text-caption text-faint">reviews · everywhere</span></span>
-            <RoleSelect
-              label="Model that checks the work"
-              title={mr.roles.judge.source === 'default' ? `Automatic · ${roleLabel(mr, 'judge')}` : `${roleLabel(mr, 'judge')} · ${PROVIDER_LABEL[judgeProv] ?? judgeProv}`}
-              disabled={busy}
-              value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId}
-              onChange={(v) => void roles.onRole('judge', v)}
-            >
-              <option value="__default__">Automatic{mr.roles.judge.source === 'default' ? ` · ${roleLabel(mr, 'judge')}` : ''}</option>
-              {roles.judges.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
-            </RoleSelect>
-          </div>
+          <details className="group border-t border-border" onToggle={place}>
+            <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-2 px-4 py-2 text-small font-semibold text-muted hover:text-fg focus-visible:ring-2 focus-visible:ring-primary [&::-webkit-details-marker]:hidden">
+              More model options
+              <ChevronUp className="h-3.5 w-3.5 shrink-0 rotate-180 transition-transform group-open:rotate-0 motion-reduce:transition-none" aria-hidden />
+            </summary>
+            <div className={ROLE_ROW}>
+              <span><span className="block text-small font-semibold text-fg">Helps in parallel</span><span className="block text-caption text-faint">side tasks · everywhere</span></span>
+              <RoleSelect
+                label="Model that helps in parallel"
+                title={mr.roles.worker.source === 'default' ? 'Same model that does the work' : `${roleLabel(mr, 'worker')} · ${PROVIDER_LABEL[workerProv] ?? workerProv}`}
+                disabled={busy}
+                value={mr.roles.worker.source === 'default' ? '__default__' : mr.roles.worker.modelId}
+                onChange={(v) => void roles.onRole('worker', v)}
+              >
+                <option value="__default__">Same model that does the work</option>
+                {roles.workers.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
+              </RoleSelect>
+            </div>
+            <div className={cn(ROLE_ROW, 'border-t border-border')}>
+              <span><span className="block text-small font-semibold text-fg">Checks the work</span><span className="block text-caption text-faint">reviews · everywhere</span></span>
+              <RoleSelect
+                label="Model that checks the work"
+                title={mr.roles.judge.source === 'default' ? `Automatic · ${roleLabel(mr, 'judge')}` : `${roleLabel(mr, 'judge')} · ${PROVIDER_LABEL[judgeProv] ?? judgeProv}`}
+                disabled={busy}
+                value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId}
+                onChange={(v) => void roles.onRole('judge', v)}
+              >
+                <option value="__default__">Automatic{mr.roles.judge.source === 'default' ? ` · ${roleLabel(mr, 'judge')}` : ''}</option>
+                {roles.judges.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
+              </RoleSelect>
+            </div>
+          </details>
           <div className="mt-1 flex items-start gap-2 border-t border-border px-4 pb-1 pt-2 text-caption text-faint">
             <Info className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden />
             {/* A failed change is said in full, never truncated to a line. */}
