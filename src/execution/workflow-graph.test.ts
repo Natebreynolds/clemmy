@@ -269,7 +269,7 @@ test('every forEach spelling authoring accepts is a source the run graph accepts
   // Live 2026-10-15: authoring and the creation test accepted
   // "steps.parse_rows.output"; the first real run refused the persisted graph
   // with "no such node exists".
-  for (const forEach of ['steps.parse_rows.output', '{{steps.parse_rows.output}}', 'steps.parse_rows.output.rows', 'parse_rows', 'input.rows', '{{input.rows}}']) {
+  for (const forEach of ['steps.parse_rows.output', '{{steps.parse_rows.output}}', 'steps.parse_rows.output.rows', 'parse_rows.output', 'parse_rows.output.rows', 'parse_rows', 'input.rows', '{{input.rows}}']) {
     const steps = [
       { id: 'parse_rows', prompt: 'Parse the rows.', sideEffect: 'read' as const },
       { id: 'research', prompt: 'Research {{item}}.', dependsOn: ['parse_rows'], forEach, sideEffect: 'read' as const },
@@ -282,4 +282,20 @@ test('every forEach spelling authoring accepts is a source the run graph accepts
     { id: 'research', prompt: 'Research {{item}}.', forEach: 'steps.nowhere.output', sideEffect: 'read' },
   ]);
   assert.match(validateWorkflowGraph(missing).errors.join('; '), /forEach "steps\.nowhere\.output" but no such node exists/);
+});
+
+test('every step-sourced forEach spelling reads the same canonical output path', async () => {
+  const { forEachSourcePath, forEachSourceStepId } = await import('./workflow-foreach-source.js');
+  const cases: Array<[string, string | null]> = [
+    ['steps.parse_rows.output', 'steps.parse_rows.output'],
+    ['{{steps.parse_rows.output.rows}}', 'steps.parse_rows.output.rows'],
+    ['parse_rows.output', 'steps.parse_rows.output'],
+    ['parse_rows.output.rows', 'steps.parse_rows.output.rows'],
+    ['parse_rows', 'steps.parse_rows.output'],
+    ['input.rows', null],
+  ];
+  for (const [spelling, path] of cases) {
+    assert.equal(forEachSourcePath(spelling), path, spelling);
+    if (path) assert.equal(forEachSourceStepId(spelling), 'parse_rows', spelling);
+  }
 });

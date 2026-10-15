@@ -6,11 +6,13 @@
  * different spelling of the same rule.
  *
  * Accepted spellings: `steps.<id>.output[.path]`, `{{steps.<id>.output[.path]}}`,
- * a bare step id, and `input.<key>` / `{{input.<key>}}` for a run input.
+ * `<id>.output[.path]`, a bare step id, and `input.<key>` / `{{input.<key>}}`
+ * for a run input.
  */
 
 const TEMPLATED_STEP = /^\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?\s*\}\}$/;
 const DIRECT_STEP = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?$/;
+const SHORT_STEP = /^([a-zA-Z0-9_-]+)\.output(\.[a-zA-Z0-9_.-]+)?$/;
 const BARE_STEP = /^[a-zA-Z0-9_-]+$/;
 const TEMPLATED_INPUT = /^\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}$/;
 const DIRECT_INPUT = /^input\.([a-zA-Z0-9_-]+)$/;
@@ -24,7 +26,22 @@ export function forEachSourceStepId(expr: string | undefined): string | null {
   if (templated) return templated[1]!;
   const direct = DIRECT_STEP.exec(raw);
   if (direct) return direct[1]!;
+  const short = SHORT_STEP.exec(raw);
+  if (short) return short[1]!;
   return BARE_STEP.test(raw) ? raw : null;
+}
+
+/** The canonical `steps.<id>.output[.path]` a step-sourced `forEach` reads,
+ * whichever accepted spelling the author used; null for an input source. */
+export function forEachSourcePath(expr: string | undefined): string | null {
+  const raw = (expr ?? '').trim();
+  const sourceId = forEachSourceStepId(raw);
+  if (!sourceId) return null;
+  const templated = /^\{\{\s*(steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?)\s*\}\}$/.exec(raw);
+  if (templated) return templated[1]!;
+  if (DIRECT_STEP.test(raw)) return raw;
+  const short = SHORT_STEP.exec(raw);
+  return `steps.${sourceId}.output${short?.[2] ?? ''}`;
 }
 
 /** The run input a `forEach` iterates, or null when it iterates a step. */

@@ -1340,7 +1340,7 @@ export function validateWorkflowDefinition(
       }
     } else if (!src) {
       errors.push(
-        `Step "${step.id}" has unsupported forEach source "${raw}". Use input.<key>, an upstream step id, or {{steps.<stepId>.output[.<path>]}}.`,
+        `Step "${step.id}" has unsupported forEach source "${raw}". Use input.<key>, an upstream step id, <stepId>.output[.<path>], or steps.<stepId>.output[.<path>].`,
       );
     } else if (!ids.has(src)) {
       errors.push(
