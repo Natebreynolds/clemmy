@@ -68,10 +68,25 @@ import { callableContractIdentity, normalizeCallableArguments } from './callable
 import { loadPersistedCallAuthority, loadPhysicalRequestEvidence } from './dispatch-ledger.js';
 import { normalizeWorkflowGoalFollowUpLineage } from '../../execution/workflow-run-write-facts.js';
 import type { reviewWorkflowMutation } from './workflow-mutation-review.js';
+import { classifyStepSideEffect } from '../../execution/workflow-enforce.js';
 
 let mutationReviewerOverride: typeof reviewWorkflowMutation | null = null;
 export function _setWorkflowMutationReviewerForTests(review: typeof reviewWorkflowMutation | null): void {
   mutationReviewerOverride = review;
+}
+
+/**
+ * What a saved step does, as its run is granted: the author's declaration, or,
+ * when the author left it unsaid, what the step is recognized as — the same
+ * reading the rehearsal previews it by. A step recognized as writing is the
+ * owner's accepted write once the workflow is saved and turned on, exactly as
+ * a declared one is.
+ */
+function authoredStepEffect(step: Parameters<typeof classifyStepSideEffect>[0]): 'read' | 'write' | 'send' | null {
+  if (step.sideEffect === 'send' || step.sideEffect === 'write' || step.sideEffect === 'read') return step.sideEffect;
+  if (step.sideEffect !== undefined) return null;
+  const recognized = classifyStepSideEffect(step);
+  return recognized === 'write' || recognized === 'send' ? recognized : 'read';
 }
 
 const VERSION = 1 as const;
@@ -413,13 +428,7 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
     // external identity and the local branch admits only local-execution
     // instruments under it; artifacts, ledgers and configuration stay
     // uncovered exactly as before.
-    const declared: AuthoredWorkflowWriteReceiptV1['stepSideEffect'] | null = !step
-      ? null
-      : step.sideEffect === 'send' || step.sideEffect === 'write'
-        ? step.sideEffect
-        : step.sideEffect === 'read' || step.sideEffect === undefined
-          ? 'read'
-          : null;
+    const declared: AuthoredWorkflowWriteReceiptV1['stepSideEffect'] | null = step ? authoredStepEffect(step) : null;
     if (
       !step
       || declared === null
@@ -656,7 +665,7 @@ function reopenAuthoredStepAuthority(
   const step = steps.length === 1 ? steps[0]! : null;
   if (
     !step
-    || (step.sideEffect ?? 'read') !== receipt.stepSideEffect
+    || authoredStepEffect(step) !== receipt.stepSideEffect
     || (step.requiresApproval === true) !== receipt.requiresApproval
     || digest(step.prompt) !== receipt.promptDigest
   ) return null;
@@ -1182,17 +1191,35 @@ async function evaluateAuthoredCatalogWrite(input: {
   // and durable resume are a separate branch); never the standing grant.
   if (receipt.requiresApproval || reopened.step.requiresApproval === true) return null;
   const acceptedScope = currentAcceptedSourceCatalogManifestScope();
-  if (!acceptedScope) return null;
   const candidates = receipt.catalogIdentities.filter((identity) => (
     identity.capabilityId === attestation.capabilityId
     && identity.manifestId === attestation.manifestId
     && identity.operationId === attestation.operationId
   ));
-  if (candidates.length !== 1) return null;
-  const identity = candidates[0]!;
-  if (
-    !acceptedScope.manifestIds.has(identity.manifestId)
+  const factory = peekHostCapabilityCatalogFactory();
+  const entry = factory?.get(attestation.capabilityId);
+  const current = entry && isCurrentCallableCatalogEntry(entry)
+    ? canonicalCatalogIdentityOf(entry)
+    : null;
+  // A step the owner accepted as a write may find the exact operation while
+  // it works ("stage the drafts in Outlook" names no operation id). That
+  // operation is bound to the current catalog entry below exactly as a named
+  // one is, and only an ordinary reversible write is granted this way: a send
+  // still has to be named by the step, and delete, admin and destructive
+  // operations are never granted by the standing workflow scope.
+  const foundWhileWorking = candidates.length === 0 && receipt.stepSideEffect !== 'read';
+  if (candidates.length !== 1 && !foundWhileWorking) return null;
+  const identity = foundWhileWorking ? current : candidates[0]!;
+  if (!identity) return null;
+  if (!foundWhileWorking && (
+    !acceptedScope
+    || !acceptedScope.manifestIds.has(identity.manifestId)
     || !acceptedScope.operationIds.has(identity.operationId.toUpperCase())
+  )) return null;
+  if (
+    identity.capabilityId !== attestation.capabilityId
+    || identity.manifestId !== attestation.manifestId
+    || identity.operationId !== attestation.operationId
     || identity.manifestDigest !== attestation.manifestDigest
     || identity.schemaDigest !== attestation.schemaFingerprint
     || identity.account !== attestation.accountId
@@ -1200,11 +1227,6 @@ async function evaluateAuthoredCatalogWrite(input: {
     || identity.invokePortId !== attestation.invokePortId
     || identity.providerInputSchemaDigest !== attestation.providerInputSchemaDigest
   ) return null;
-  const factory = peekHostCapabilityCatalogFactory();
-  const entry = factory?.get(identity.capabilityId);
-  const current = entry && isCurrentCallableCatalogEntry(entry)
-    ? canonicalCatalogIdentityOf(entry)
-    : null;
   if (!entry || !current || !catalogIdentityBytesEqual(current, identity)) return null;
   const schema = getCachedToolSchema(identity.operationId);
   if (
@@ -1255,7 +1277,7 @@ async function evaluateAuthoredCatalogWrite(input: {
   if (!risk.ok) return null;
   const projection = risk.attestation.projection;
   const gate = authoredCatalogGate(receipt.stepSideEffect, projection);
-  if (!gate) return null;
+  if (!gate || (foundWhileWorking && gate !== 'ordinary_write')) return null;
   const crossing = crossingFor({
     sessionId: attestation.sessionId,
     sourceUserSeq: attestation.sourceUserSeq,

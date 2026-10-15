@@ -172,6 +172,7 @@ let serial = 0;
 function createRunFixture(
   kind: 'workflow' | 'chat' = 'workflow',
   authorOperation = true,
+  stepOverrides: Record<string, unknown> = {},
 ) {
   const suffix = String(++serial);
   const workflowRunId = `run-authored-write-${suffix}`;
@@ -194,6 +195,7 @@ function createRunFixture(
       sideEffect: 'write' as const,
       requiresApproval: false,
       allowedTools: authorOperation ? [OPERATION_ID] : [],
+      ...stepOverrides,
     }],
   };
   const snapshot = workflowDefinitions.createWorkflowRunDefinitionSnapshot(
@@ -591,5 +593,74 @@ test('a current but foreign operation absent from immutable prompt and allowlist
     status: 'refused',
     reason: 'write_operation_not_authored_in_immutable_step',
   });
+  leases.revokeDispatchLease(fixture.parentLease);
+});
+
+async function evaluateUnnamedWrite(fixture: ReturnType<typeof createRunFixture>, label: string) {
+  const recorded = authorityAdapter.recordAuthoredWorkflowWriteAuthority({
+    sessionId: fixture.session.id,
+    sourceUserSeq: fixture.source.seq,
+    attemptId: fixture.attempt.attemptId,
+    workflowRunId: fixture.workflowRunId,
+    workflowSlug: fixture.workflowSlug,
+    stepId: fixture.stepId,
+    expectedPlanProposalId: fixture.planProposalId,
+    // The step names no operation, so nothing was prepared up front.
+    catalogIdentities: [],
+  });
+  const callId = `call:authored-write:${label}`;
+  const admitted = checkpoints.admitAcceptedModelBatch({
+    sessionId: fixture.session.id,
+    sourceUserSeq: fixture.source.seq,
+    preHistory: [{ role: 'user', content: String(fixture.snapshot.definition.steps[0].prompt) } as AgentInputItem],
+    frameHistory: toolFrame(callId),
+    providerResponseId: `response:authored-write:${label}`,
+  });
+  assert.equal(admitted.status, 'admitted', JSON.stringify(admitted));
+  if (admitted.status !== 'admitted') throw new Error('batch not admitted');
+  const attestation = attestationFor(fixture, callId);
+  const evaluate = (candidate: callAuthority.HostCallAttestation = attestation) => (
+    authorityAdapter.evaluateAuthoredWorkflowMutationConsent({
+      attestation: candidate, args: PROVIDER_ARGS, acceptedBatch: admitted.admission, callIndex: 0,
+    })
+  );
+  return { recorded, attestation, evaluate };
+}
+
+test('a write step covers an ordinary write it finds while it works, bound to the current exact catalog entry', async () => {
+  const fixture = createRunFixture('workflow', false);
+  const { recorded, attestation, evaluate } = await evaluateUnnamedWrite(fixture, 'found');
+  assert.equal(recorded.status, 'ready', JSON.stringify(recorded));
+  const evaluated = await evaluate();
+  assert.equal(evaluated?.status, 'decided', JSON.stringify(evaluated));
+  assert.equal(evaluated?.decision.kind, 'proceed', JSON.stringify(evaluated));
+  for (const [label, candidate] of [
+    ['wrong account', { ...attestation, accountId: 'account:foreign' }],
+    ['wrong manifest digest', { ...attestation, manifestDigest: 'f'.repeat(64) }],
+    ['wrong schema', { ...attestation, schemaFingerprint: 'e'.repeat(64) }],
+    ['wrong invoke port', { ...attestation, invokePortId: 'fixture:foreign:invoke' }],
+  ] as const) {
+    assert.equal(await evaluate(candidate as callAuthority.HostCallAttestation), null, label);
+  }
+  leases.revokeDispatchLease(fixture.parentLease);
+});
+
+test('a step that leaves its effect unsaid is granted as what it is recognized as', async () => {
+  const fixture = createRunFixture('workflow', false, {
+    sideEffect: undefined,
+    prompt: 'Update the review status on each reviewed record in the records table.',
+  });
+  const { recorded, evaluate } = await evaluateUnnamedWrite(fixture, 'recognized');
+  assert.equal(recorded.status, 'ready', JSON.stringify(recorded));
+  const receiptEvent = eventlog.listEvents(fixture.session.id, { types: ['authored_workflow_write_authority'] })[0];
+  assert.equal(receiptEvent?.data.stepSideEffect, 'write');
+  assert.equal((await evaluate())?.decision.kind, 'proceed');
+  leases.revokeDispatchLease(fixture.parentLease);
+});
+
+test('a step declared as a read is never granted a write it finds', async () => {
+  const fixture = createRunFixture('workflow', false, { sideEffect: 'read' });
+  const { evaluate } = await evaluateUnnamedWrite(fixture, 'read-step');
+  assert.equal(await evaluate(), null);
   leases.revokeDispatchLease(fixture.parentLease);
 });
