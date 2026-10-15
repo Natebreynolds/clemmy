@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Terminal, Search, X, Check, Plus, Loader2, Github, RotateCw, Download, KeyRound, ExternalLink, Copy, MessageCircle } from 'lucide-react';
@@ -13,6 +13,7 @@ import {
   authCatalogCli, runInstallCommand, openTerminalAuth,
   type ManagedCliStatus, type ManagedCliKind, type ManagedCliAction,
   type CatalogEntry, type ConnectedCli, type CliHealth, type CliConnectionSnapshot,
+  type ManagedCliJob, type InstallJob,
 } from '@/lib/connect';
 import { isMac } from '@/lib/platform';
 import { cliConnectionHealth, cliConnectionPresentation } from '@/lib/cli-connection-view';
@@ -20,6 +21,64 @@ import { cliConnectionHealth, cliConnectionPresentation } from '@/lib/cli-connec
 const BARE = /^[A-Za-z0-9._+-]{1,60}$/;
 // gh + composio are shown as rich managed cards; don't duplicate them in the catalog list.
 const MANAGED_IDS = new Set(['gh', 'github', 'composio']);
+
+type ObservedJob = { id: string; status: string; title: string; output: string };
+const JOB_STATES = new Set(['running', 'succeeded', 'failed', 'cancelled', 'interrupted']);
+
+/** A lost observation never authorizes another install or sign-in. Retain the
+ * acknowledged job, observe only its exact ID, and bound automatic recovery. */
+function useCliJobObservation<T extends ObservedJob>(prefix: string, read: (id: string) => Promise<{ job: T }>) {
+  const qc = useQueryClient();
+  type Entry = { job: T; token: object; errorBaseline: number; observedErrors: number };
+  const [entry, setEntry] = useState<Entry | null>(null);
+  const selected = useRef<Entry | null>(null);
+  const active = useRef(true);
+  const retrying = useRef<Entry | null>(null);
+  useEffect(() => { active.current = true; return () => { active.current = false; selected.current = null; }; }, []);
+  const query = useQuery<{ job: T }>({
+    queryKey: [prefix, entry?.job.id ?? null], enabled: Boolean(entry), retry: false,
+    initialData: entry ? { job: entry.job } : undefined,
+    queryFn: async () => {
+      if (!entry) throw new Error('No acknowledged job.');
+      const result = await read(entry.job.id);
+      if (!result?.job || result.job.id !== entry.job.id || !JOB_STATES.has(result.job.status)
+        || typeof result.job.title !== 'string' || typeof result.job.output !== 'string') throw new Error('Job status unavailable.');
+      return result;
+    },
+    refetchInterval: q => {
+      if (!entry || !active.current || selected.current !== entry) return false;
+      const job = q.state.data?.job ?? entry.job;
+      if (job.id !== entry.job.id || job.status !== 'running') return false;
+      entry.observedErrors = q.state.errorUpdateCount;
+      if (q.state.status === 'error') return q.state.errorUpdateCount - entry.errorBaseline < 3 ? 5000 : false;
+      entry.errorBaseline = q.state.errorUpdateCount;
+      return 1500;
+    },
+  });
+  const accept = (job: T, token: object) => {
+    if (!active.current) return;
+    const next = { job, token, errorBaseline: 0, observedErrors: 0 };
+    selected.current = next;
+    qc.setQueryData([prefix, job.id], { job });
+    setEntry(next);
+  };
+  const retryStatus = async () => {
+    if (!entry || !active.current || selected.current !== entry || retrying.current === entry) return;
+    retrying.current = entry; entry.errorBaseline = entry.observedErrors;
+    try { await query.refetch(); } catch { /* Query state retains observation failure; never re-dispatch work. */ }
+    finally { if (retrying.current === entry) retrying.current = null; }
+  };
+  const job = query.data?.job?.id === entry?.job.id ? query.data?.job : entry?.job;
+  return { job, token: entry?.token, accept, unavailable: Boolean(entry && query.isError), checking: query.isFetching, retryStatus };
+}
+
+function JobStatusRecovery({ unavailable, checking, onRetry }: { unavailable: boolean; checking: boolean; onRetry: () => Promise<unknown> }) {
+  if (!unavailable) return null;
+  return <div role="status" className="mb-3 flex flex-wrap items-center gap-2 text-small text-muted">
+    Status unavailable; work may still be running. Check this job before starting it again.
+    <Button size="sm" variant="secondary" disabled={checking} onClick={() => { void onRetry(); }}>{checking ? 'Checking status…' : 'Retry status'}</Button>
+  </div>;
+}
 
 export function CliTools() {
   const navigate = useNavigate();
@@ -50,29 +109,26 @@ export function CliTools() {
 function ManagedClis({ connections, unavailable }: { connections?: CliConnectionSnapshot; unavailable: boolean }) {
   const qc = useQueryClient();
   const managed = usePoll(['managed-clis'], getManagedClis, 0);
-  const [jobId, setJobId] = useState<string | null>(null);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState('');
-
-  const jobQ = useQuery({
-    queryKey: ['managed-cli-job', jobId],
-    queryFn: () => getManagedCliJob(jobId!),
-    enabled: Boolean(jobId),
-    refetchInterval: (q) => (q.state.data?.job?.status === 'running' ? 1500 : false),
-  });
-  const job = jobQ.data?.job;
+  const operation = useRef<object | null>(null);
+  useEffect(() => () => { operation.current = null; }, []);
+  const observation = useCliJobObservation<ManagedCliJob>('managed-cli-job', getManagedCliJob);
+  const job = observation.job;
   useEffect(() => {
-    if (job && job.status !== 'running') {
+    if (job && job.status !== 'running' && observation.token && operation.current === observation.token) {
       void qc.invalidateQueries({ queryKey: ['managed-clis'] });
       void qc.invalidateQueries({ queryKey: ['cli-connections'] });
-      setPending(null);
+      operation.current = null; setPending(null);
     }
-  }, [job?.status, qc]);
+  }, [job?.id, job?.status, observation.token, qc]);
 
   const run = async (kind: ManagedCliKind, action: ManagedCliAction) => {
+    if (operation.current) return;
+    const token = {}; operation.current = token;
     setPending(`${kind}:${action}`); setError('');
-    try { const { job } = await startManagedCliJob(kind, action); setJobId(job.id); }
-    catch (e) { setPending(null); setError((e as Error).message); }
+    try { const { job } = await startManagedCliJob(kind, action); if (operation.current === token) observation.accept(job, token); }
+    catch { if (operation.current === token) { operation.current = null; setPending(null); setError('The setup could not be started. Check the tool status before trying again.'); } }
   };
 
   return (
@@ -88,6 +144,7 @@ function ManagedClis({ connections, unavailable }: { connections?: CliConnection
           {job.output && <pre className="max-h-40 overflow-auto whitespace-pre-wrap font-mono text-caption text-muted">{job.output}</pre>}
         </div>
       )}
+      {observation.unavailable && <div className="sm:col-span-2"><JobStatusRecovery unavailable checking={observation.checking} onRetry={observation.retryStatus} /></div>}
       {error && <p className="sm:col-span-2 text-small text-danger">{error}</p>}
     </div>
   );
@@ -100,7 +157,7 @@ function ManagedCard({ label, command, icon: Icon, status, health, unavailable, 
   const navigate = useNavigate();
   const kind = command === 'gh' ? 'github' : 'composio';
   const isBusy = (a: ManagedCliAction) => busy === `${kind}:${a}`;
-  const anyBusy = Boolean(busy?.startsWith(`${kind}:`));
+  const anyBusy = Boolean(busy);
   const installed = health?.installed ?? status?.installed;
   const presentation = cliConnectionPresentation({ health, installed, authRequired: true, unavailable });
   return (
@@ -190,8 +247,10 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [reveal, setReveal] = useState<string | null>(null);
-  const [installJobId, setInstallJobId] = useState<string | null>(null);
-  const [authJobId, setAuthJobId] = useState<string | null>(null);
+  const operation = useRef<object | null>(null);
+  useEffect(() => () => { operation.current = null; }, []);
+  const installObservation = useCliJobObservation<InstallJob>('install-job', getInstallJob);
+  const authObservation = useCliJobObservation<ManagedCliJob>('catalog-auth-job', getManagedCliJob);
 
   const healthFor = (id: string, command: string) => cliConnectionHealth(connections?.health, id, command);
   const authRequiredFor = (id: string, command: string) => connections?.authRequired[id] ?? connections?.authRequired[command];
@@ -213,52 +272,54 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
   const exactKnown = catResults.some((c) => c.command.toLowerCase() === q.toLowerCase()) || pathResults.some((c) => c.command?.toLowerCase() === q.toLowerCase()) || savedSet.has(q);
   const probeQ = useQuery({ queryKey: ['cli-probe', q], queryFn: () => probeCli(q), enabled: Boolean(q) && isBare && !exactKnown, retry: false });
 
-  const installJobQ = useQuery({
-    queryKey: ['install-job', installJobId],
-    queryFn: () => getInstallJob(installJobId!),
-    enabled: Boolean(installJobId),
-    refetchInterval: (qq) => (qq.state.data?.job?.status === 'running' ? 1500 : false),
-  });
-  const installJob = installJobQ.data?.job;
+  const installJob = installObservation.job;
   useEffect(() => {
-    if (installJob && installJob.status !== 'running') {
+    if (installJob && installJob.status !== 'running' && installObservation.token && operation.current === installObservation.token) {
       void qc.invalidateQueries({ queryKey: ['cli-catalog'] });
       void qc.invalidateQueries({ queryKey: ['clis'] });
       void qc.invalidateQueries({ queryKey: ['cli-connections'] });
-      setBusy(null);
+      operation.current = null; setBusy(null);
     }
-  }, [installJob?.status, qc]);
+  }, [installJob?.id, installJob?.status, installObservation.token, qc]);
 
-  const authJobQ = useQuery({
-    queryKey: ['catalog-auth-job', authJobId],
-    queryFn: () => getManagedCliJob(authJobId!),
-    enabled: Boolean(authJobId),
-    refetchInterval: (qq) => (qq.state.data?.job?.status === 'running' ? 1500 : false),
-  });
-  const authJob = authJobQ.data?.job;
+  const authJob = authObservation.job;
   useEffect(() => {
-    if (authJob && authJob.status !== 'running') {
+    if (authJob && authJob.status !== 'running' && authObservation.token && operation.current === authObservation.token) {
       void qc.invalidateQueries({ queryKey: ['cli-catalog'] });
       void qc.invalidateQueries({ queryKey: ['cli-connections'] });
-      setBusy(null);
+      operation.current = null; setBusy(null);
     }
-  }, [authJob?.status, qc]);
+  }, [authJob?.id, authJob?.status, authObservation.token, qc]);
+
+  const begin = (label: string) => {
+    if (operation.current) return null;
+    const token = {}; operation.current = token; setBusy(label); setError(''); return token;
+  };
+  const finish = (token: object) => { if (operation.current === token) { operation.current = null; setBusy(null); } };
 
   const signIn = async (id: string) => {
-    setBusy(`auth:${id}`); setError('');
-    try { const { job } = await authCatalogCli(id); setAuthJobId(job.id); }
-    catch (e) { setBusy(null); setError((e as Error).message); }
+    const token = begin(`auth:${id}`); if (!token) return;
+    try { const { job } = await authCatalogCli(id); if (operation.current === token) authObservation.accept(job, token); }
+    catch { if (operation.current === token) { setError('Sign-in could not be started. Check the tool status before trying again.'); finish(token); } }
   };
 
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['cli-catalog'] }); void qc.invalidateQueries({ queryKey: ['cli-connections'] }); };
   const install = async (id: string) => {
-    setBusy(`install:${id}`); setError('');
-    try { const { job } = await installCatalogCli(id); setInstallJobId(job.id); }
-    catch (e) { setBusy(null); setError((e as Error).message); }
+    const token = begin(`install:${id}`); if (!token) return;
+    try { const { job } = await installCatalogCli(id); if (operation.current === token) installObservation.accept(job, token); }
+    catch { if (operation.current === token) { setError('Installation could not be started. Check the tool status before trying again.'); finish(token); } }
   };
-  const forget = async (id: string) => { setBusy(`forget:${id}`); try { await forgetCatalogCli(id); refresh(); } finally { setBusy(null); } };
-  const save = async (command: string) => { setBusy(`save:${command}`); setError(''); try { await saveCli(command); void qc.invalidateQueries({ queryKey: ['cli-connections'] }); } catch (e) { setError((e as Error).message); } finally { setBusy(null); } };
-  const unsave = async (command: string) => { setBusy(`save:${command}`); try { await removeSavedCli(command); void qc.invalidateQueries({ queryKey: ['cli-connections'] }); } finally { setBusy(null); } };
+  const forget = async (id: string) => { const token = begin(`forget:${id}`); if (!token) return; try { await forgetCatalogCli(id); if (operation.current === token) refresh(); } catch { if (operation.current === token) setError('The saved tool could not be changed. Refresh its status before trying again.'); } finally { finish(token); } };
+  const save = async (command: string) => { const token = begin(`save:${command}`); if (!token) return; try { await saveCli(command); if (operation.current === token) void qc.invalidateQueries({ queryKey: ['cli-connections'] }); } catch { if (operation.current === token) setError('The tool could not be saved. Refresh its status before trying again.'); } finally { finish(token); } };
+  const unsave = async (command: string) => { const token = begin(`save:${command}`); if (!token) return; try { await removeSavedCli(command); if (operation.current === token) void qc.invalidateQueries({ queryKey: ['cli-connections'] }); } catch { if (operation.current === token) setError('The saved tool could not be changed. Refresh its status before trying again.'); } finally { finish(token); } };
+  const customInstall = async (command: string, name?: string) => {
+    const token = begin('install:custom'); if (!token) return false;
+    try {
+      const { job } = await runInstallCommand(command, name);
+      if (operation.current !== token) return false;
+      installObservation.accept(job, token); return true;
+    } catch { if (operation.current === token) finish(token); throw new Error('Installation could not be started. Check the tool status before trying again.'); }
+  };
 
   return (
     <>
@@ -275,9 +336,9 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
                 </div>
                 <HealthPill health={healthFor(c.id, c.command)} installed={detectedInstalled(c.command)} authRequired={authRequiredFor(c.id, c.command)} unavailable={unavailable} />
                 {c.authHeadless
-                  ? <Button size="sm" variant="ghost" disabled={busy === `auth:${c.id}`} onClick={() => signIn(c.id)}>{busy === `auth:${c.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} Manage sign-in</Button>
-                  : <Button size="sm" variant="ghost" onClick={() => setReveal(reveal === c.id ? null : c.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign-in options</Button>}
-                <Button size="sm" variant="ghost" aria-label={`Forget ${c.name}`} title="Disconnect" disabled={busy === `forget:${c.id}`} onClick={() => forget(c.id)}>
+                  ? <Button size="sm" variant="ghost" disabled={Boolean(busy)} onClick={() => signIn(c.id)}>{busy === `auth:${c.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} Manage sign-in</Button>
+                  : <Button size="sm" variant="ghost" disabled={Boolean(busy)} onClick={() => setReveal(reveal === c.id ? null : c.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign-in options</Button>}
+                <Button size="sm" variant="ghost" aria-label={`Forget ${c.name}`} title="Disconnect" disabled={Boolean(busy)} onClick={() => forget(c.id)}>
                   {busy === `forget:${c.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <X className="h-3.5 w-3.5" aria-hidden />}
                 </Button>
               </div>
@@ -296,8 +357,8 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
                 <Terminal className="h-4 w-4 shrink-0 text-primary" aria-hidden />
                 <span className="min-w-0 flex-1 basis-40 break-words font-mono text-small text-fg">{name}</span>
                 <HealthPill health={healthFor(`saved:${name}`, name)} installed={detectedInstalled(name)} authRequired={authRequiredFor(`saved:${name}`, name)} unavailable={unavailable} />
-                <Button size="sm" variant="ghost" onClick={() => setReveal(reveal === `saved:${name}` ? null : `saved:${name}`)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign-in options</Button>
-                <Button size="sm" variant="ghost" aria-label={`Remove ${name}`} title="Remove" disabled={busy === `save:${name}`} onClick={() => unsave(name)}>
+                <Button size="sm" variant="ghost" disabled={Boolean(busy)} onClick={() => setReveal(reveal === `saved:${name}` ? null : `saved:${name}`)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign-in options</Button>
+                <Button size="sm" variant="ghost" aria-label={`Remove ${name}`} title="Remove" disabled={Boolean(busy)} onClick={() => unsave(name)}>
                   {busy === `save:${name}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <X className="h-3.5 w-3.5" aria-hidden />}
                 </Button>
               </div>
@@ -318,6 +379,7 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
           {authJob.output && <pre className="max-h-40 overflow-auto whitespace-pre-wrap font-mono text-caption text-muted">{authJob.output}</pre>}
         </div>
       )}
+      <JobStatusRecovery unavailable={authObservation.unavailable} checking={authObservation.checking} onRetry={authObservation.retryStatus} />
 
       {/* Install job output */}
       {installJob && (
@@ -329,6 +391,7 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
           {installJob.output && <pre className="max-h-40 overflow-auto whitespace-pre-wrap font-mono text-caption text-muted">{installJob.output}</pre>}
         </div>
       )}
+      <JobStatusRecovery unavailable={installObservation.unavailable} checking={installObservation.checking} onRetry={installObservation.retryStatus} />
 
       {/* One search: catalog (install/connect) + your PATH (save) */}
       <div className="mb-3 flex items-center gap-2 rounded-md border border-border bg-surface px-3 focus-within:ring-2 focus-within:ring-primary">
@@ -363,9 +426,9 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
                 <HealthPill health={health} installed={installed} authRequired={authRequiredFor(e.id, e.command) ?? (e.authCommand ? true : undefined)} unavailable={unavailable} />
                 {installed
                   ? (e.authHeadless
-                      ? <Button size="sm" variant="secondary" disabled={busy === `auth:${e.id}`} onClick={() => signIn(e.id)}>{busy === `auth:${e.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} Sign in</Button>
-                      : <Button size="sm" variant="secondary" onClick={() => setReveal(reveal === e.id ? null : e.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign in</Button>)
-                  : <Button size="sm" disabled={busy === `install:${e.id}`} onClick={() => install(e.id)}>{busy === `install:${e.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Download className="h-3.5 w-3.5" aria-hidden />} Install</Button>}
+                      ? <Button size="sm" variant="secondary" disabled={Boolean(busy)} onClick={() => signIn(e.id)}>{busy === `auth:${e.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} Sign in</Button>
+                      : <Button size="sm" variant="secondary" disabled={Boolean(busy)} onClick={() => setReveal(reveal === e.id ? null : e.id)}><KeyRound className="h-3.5 w-3.5" aria-hidden /> Sign in</Button>)
+                  : <Button size="sm" disabled={Boolean(busy)} onClick={() => install(e.id)}>{busy === `install:${e.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Download className="h-3.5 w-3.5" aria-hidden />} Install</Button>}
               </div>
               {reveal === e.id && <AuthReveal command={e.command} authCommand={e.authCommand} authDocsUrl={e.authDocsUrl} catalogId={e.id} />}
             </Card>
@@ -379,7 +442,7 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
               <div className="min-w-0 flex-1"><div className="truncate font-mono text-small text-fg">{c.command}</div>{c.isLikelyCli && c.version && <div className="truncate text-caption text-faint">{c.version}</div>}</div>
               {savedSet.has(c.command ?? '')
                 ? <span className="inline-flex items-center gap-1 text-caption text-success"><Check className="h-3.5 w-3.5" aria-hidden /> Saved</span>
-                : <Button size="sm" variant="secondary" disabled={busy === `save:${c.command}`} onClick={() => save(c.command ?? '')}>{busy === `save:${c.command}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Plus className="h-3.5 w-3.5" aria-hidden />} Save</Button>}
+                : <Button size="sm" variant="secondary" disabled={Boolean(busy)} onClick={() => save(c.command ?? '')}>{busy === `save:${c.command}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Plus className="h-3.5 w-3.5" aria-hidden />} Save</Button>}
             </Card>
           ))}
 
@@ -390,7 +453,7 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
               <div className="min-w-0 flex-1"><div className="truncate font-mono text-small text-fg">{q}</div><div className="truncate text-caption text-faint">{probeQ.isLoading ? 'Checking your PATH…' : probeQ.data ? `Found at ${probeQ.data.path}` : 'Not auto-detected — save it and Clementine will still try it'}</div></div>
               {savedSet.has(q)
                 ? <span className="inline-flex items-center gap-1 text-caption text-success"><Check className="h-3.5 w-3.5" aria-hidden /> Saved</span>
-                : <Button size="sm" variant="secondary" disabled={busy === `save:${q}`} onClick={() => save(q)}>{busy === `save:${q}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Plus className="h-3.5 w-3.5" aria-hidden />} Save</Button>}
+                : <Button size="sm" variant="secondary" disabled={Boolean(busy)} onClick={() => save(q)}>{busy === `save:${q}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Plus className="h-3.5 w-3.5" aria-hidden />} Save</Button>}
             </Card>
           )}
 
@@ -398,7 +461,7 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
         </div>
       )}
 
-      <CustomInstall onJob={(id) => { setInstallJobId(id); setBusy('install:custom'); }} />
+      <CustomInstall busy={Boolean(busy)} onInstall={customInstall} />
     </>
   );
 }
@@ -407,12 +470,15 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
  *  allowlist as catalog installs (npm -g / brew / uv tool / pipx / pip
  *  --user / git clone https — no sudo, no pipes); "remember" saves the
  *  binary name to the roster once the install succeeds. */
-function CustomInstall({ onJob }: { onJob: (jobId: string) => void }) {
+function CustomInstall({ busy, onInstall }: { busy: boolean; onInstall: (command: string, saveAs?: string) => Promise<boolean> }) {
   const [open, setOpen] = useState(false);
   const [command, setCommand] = useState('');
   const [remember, setRemember] = useState(true);
   const [saveAs, setSaveAs] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const active = useRef(true);
+  useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
   const [error, setError] = useState('');
 
   const guessedName = (() => {
@@ -423,22 +489,24 @@ function CustomInstall({ onJob }: { onJob: (jobId: string) => void }) {
   })();
 
   const submit = async () => {
+    if (busy || submittingRef.current || !command.trim() || !active.current) return;
+    submittingRef.current = true;
     setSubmitting(true); setError('');
     try {
       const name = remember ? (saveAs.trim() || guessedName) : '';
-      const { job } = await runInstallCommand(command.trim(), name || undefined);
-      onJob(job.id);
+      const accepted = await onInstall(command.trim(), name || undefined);
+      if (!accepted || !active.current) return;
       setCommand(''); setSaveAs(''); setOpen(false);
     } catch (e) {
-      setError((e as Error).message);
+      if (active.current) setError((e as Error).message);
     } finally {
-      setSubmitting(false);
+      submittingRef.current = false; if (active.current) setSubmitting(false);
     }
   };
 
   if (!open) {
     return (
-      <button type="button" onClick={() => setOpen(true)}
+      <button type="button" disabled={busy} onClick={() => { if (!busy) setOpen(true); }}
         className="mt-3 cursor-pointer text-small text-muted underline-offset-2 hover:text-fg hover:underline">
         Have an install command? Paste it to review and run it here.
       </button>
@@ -448,13 +516,13 @@ function CustomInstall({ onJob }: { onJob: (jobId: string) => void }) {
     <Card className="mt-3 p-3.5">
       <div className="mb-2 text-small font-medium text-fg">Paste an install command</div>
       <div className="mb-2 flex items-center gap-2">
-        <input value={command} onChange={(e) => { setCommand(e.target.value); setError(''); }}
+        <input value={command} disabled={busy || submitting} onChange={(e) => { setCommand(e.target.value); setError(''); }}
           placeholder={isMac() ? 'npm install -g some-cli   ·   brew install some-tool' : 'npm install -g some-cli'} aria-label="Install command"
           className="min-w-0 flex-1 rounded border border-border bg-canvas px-2.5 py-1.5 font-mono text-caption text-fg outline-none focus-visible:ring-2 focus-visible:ring-primary" />
-        <Button size="sm" disabled={!command.trim() || submitting} onClick={() => void submit()}>
+        <Button size="sm" disabled={!command.trim() || submitting || busy} onClick={() => void submit()}>
           {submitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Download className="h-3.5 w-3.5" aria-hidden />} Install
         </Button>
-        <Button size="sm" variant="ghost" onClick={() => { setOpen(false); setError(''); }} aria-label="Close"><X className="h-3.5 w-3.5" aria-hidden /></Button>
+        <Button size="sm" variant="ghost" disabled={submitting} onClick={() => { if (!submittingRef.current) { setOpen(false); setError(''); } }} aria-label="Close"><X className="h-3.5 w-3.5" aria-hidden /></Button>
       </div>
       <label className="flex items-center gap-2 text-caption text-muted">
         <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />

@@ -205,3 +205,30 @@ test('request reader retains a private-file refusal and never retries or falls b
   assert.deepEqual(read({ INLINE: 'still-inline' }).values, { INLINE: 'still-inline' });
   assert.equal(reads, 1);
 });
+
+test('Windows inherited snapshots retain case-insensitive lookup while POSIX remains exact', () => {
+  const inherited = { Api_Token: 'synthetic-inherited-value' };
+  const windows = createMcpServerEnvReader('/synthetic/absent', inherited, () => undefined, 'win32');
+  const posix = createMcpServerEnvReader('/synthetic/absent', inherited, () => undefined, 'linux');
+  inherited.Api_Token = 'changed-after-snapshot';
+  assert.equal(windows({ API_TOKEN: '' }).values.API_TOKEN, 'synthetic-inherited-value');
+  assert.deepEqual(windows(['api_token']).unsetEnvKeys, []);
+  assert.equal(posix({ API_TOKEN: '' }).values.API_TOKEN, '');
+  assert.equal(posix({ Api_Token: '' }).values.Api_Token, 'synthetic-inherited-value');
+});
+
+test('Windows inherited lookup preserves daemon and inline priority without accepting prototype keys', () => {
+  const inherited = Object.assign(Object.create({ GHOST_KEY: 'must-not-inherit' }), {
+    Api_Token: 'synthetic-case-alias', API_TOKEN: 'synthetic-exact', EMPTY_KEY: 'must-stay-masked',
+  });
+  const read = createMcpServerEnvReader('/synthetic/daemon.env', inherited,
+    () => 'EMPTY_KEY=""\nFILE_KEY=synthetic-file\ninline_key=must-not-replace\napi_token=lowercase-file-is-not-the-declared-key\n', 'win32');
+  const result = read({ API_TOKEN: '', EMPTY_KEY: '', FILE_KEY: '', INLINE_KEY: 'synthetic-inline', GHOST_KEY: '' });
+  assert.deepEqual(result.values, { API_TOKEN: 'synthetic-exact', EMPTY_KEY: '', FILE_KEY: 'synthetic-file', INLINE_KEY: 'synthetic-inline', GHOST_KEY: '' });
+  assert.deepEqual(result.unsetEnvKeys, ['EMPTY_KEY', 'GHOST_KEY']);
+  assert.deepEqual(result.editableEnvKeys, ['API_TOKEN', 'EMPTY_KEY', 'FILE_KEY', 'GHOST_KEY']);
+  assert.deepEqual(resolveMcpServerEnv(['api_token'], source({}, inherited), 'win32').values,
+    { api_token: 'synthetic-case-alias' });
+  const status = serverEnvStatus({ env: { API_TOKEN: '', EMPTY_KEY: '' } }, source(result.values));
+  assert.equal(JSON.stringify(status).includes('synthetic-'), false, 'metadata returns names only');
+});
