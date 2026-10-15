@@ -20,8 +20,8 @@ import {
   type CapabilityEffectProvenance,
   type CapabilityOperationRow,
 } from '../../memory/capability-index.js';
-import { composioSlugEffectEvidence, composioSlugHasCuratedReadRule } from './slug-effect.js';
-import { documentedComposioOperationSemantic } from './operation-semantics.js';
+import { composioOperationDeclaredRead, composioSlugEffectEvidence } from './slug-effect.js';
+import { learnedComposioOperationEffect } from './learned-operation-effect-store.js';
 
 /** Operations enumerated per toolkit. Bounded: this is a catalog, not a dump. */
 const MAX_OPERATIONS_PER_TOOLKIT = 200;
@@ -36,15 +36,12 @@ function effectFor(slug: string): {
   effectClass: CapabilityEffectClass;
   effectProvenance: CapabilityEffectProvenance;
 } {
-  const documented = documentedComposioOperationSemantic(slug);
-  if (documented) {
-    return {
-      effectClass: documented.effect === 'write' ? 'write' : 'read',
-      effectProvenance: 'curated',
-    };
+  const declared = learnedComposioOperationEffect(slug.trim().toUpperCase());
+  if (declared) {
+    return { effectClass: declared.effect, effectProvenance: 'declared' };
   }
-  if (composioSlugHasCuratedReadRule(slug)) {
-    return { effectClass: 'read', effectProvenance: 'curated' };
+  if (composioOperationDeclaredRead(slug)) {
+    return { effectClass: 'read', effectProvenance: 'declared' };
   }
   const evidence = composioSlugEffectEvidence(slug);
   if (evidence === 'read') return { effectClass: 'read', effectProvenance: 'inferred' };

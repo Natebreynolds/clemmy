@@ -1,19 +1,30 @@
 /**
- * Decide, once, whether a noun-shaped Composio operation only reads, from the
- * operation's own description and input schema, with a model. The verdict is
- * persisted (learned-operation-effect-store.ts) and consulted by the pure slug
- * classifier from then on. Only a confident read verdict changes behavior; an
- * unsure or absent verdict leaves the conservative write default in place.
+ * Decide, once, whether a Composio operation only reads, from the operation's
+ * own definition. The provider's declared hints decide when they can (a
+ * read-only operation reads; a destructive or updating one writes). Where
+ * they leave it open, as for an operation that only "creates" (a record, a
+ * message, or a provider-side job that gathers data), a model reads the
+ * description and input schema. The verdict is persisted
+ * (learned-operation-effect-store.ts) and the slug classifier consults it
+ * before the name. An unsure or absent verdict leaves the conservative write
+ * default in place.
  */
 import { createHash } from 'node:crypto';
 import { captureTurnLearningScope, readTurnLearningPolicyForScope, type TurnLearningScope } from '../../memory/turn-learning-policy.js';
 import { composioSlugVerbEvidence } from './slug-effect.js';
-import { learnedComposioOperationEffect, rememberComposioOperationEffect } from './learned-operation-effect-store.js';
+import {
+  learnedComposioOperationEffect,
+  providerDeclaredEffect,
+  rememberComposioOperationEffect,
+  rememberProviderDeclaredEffects,
+} from './learned-operation-effect-store.js';
 
 export interface OperationDefinitionForEffect {
   slug: string;
   description?: string | null;
   inputSchema?: unknown;
+  /** The provider's tags for this definition, effect hints included. */
+  tags?: readonly string[];
 }
 
 export type OperationEffectEvaluate = (input: {
@@ -35,10 +46,10 @@ async function evaluateWithJev(input: { slug: string; description: string; schem
     questions: {
       readOnly: {
         type: 'noul',
-        instructions: 'Judge from the description and input schema whether calling this operation only retrieves data from the provider.',
+        instructions: 'Judge from the description and input schema whether calling this operation only gathers or computes information and returns it.',
         criteria: {
-          true: 'It only reads or lists or searches existing data; it creates, updates, deletes, sends, posts, archives, moves or triggers nothing.',
-          false: 'It can change provider state or send anything, or the description leaves that open.',
+          true: 'It only retrieves, lists, searches or computes information and returns it, including a provider-side search, scrape, crawl or research job whose only product is data returned to the caller. It creates, changes, archives, moves or deletes none of the user\'s records, files, settings or content, and sends or posts nothing to anyone.',
+          false: 'It can create, change, archive, move or delete the user\'s records, files, settings or content, or send or post anything to anyone, or the description leaves that open.',
         },
       },
     },
@@ -65,6 +76,9 @@ export async function learnComposioOperationEffects(
   definitions: readonly OperationDefinitionForEffect[],
   options: { sessionId?: string; sourceUserSeq?: number; evaluate?: OperationEffectEvaluate; deadlineAt?: number } = {},
 ): Promise<string[]> {
+  // What the provider declares is a fact about the operation, not something
+  // learned from this turn: record it whatever the turn's learning policy.
+  rememberProviderDeclaredEffects(definitions);
   const scope = captureTurnLearningScope(options);
   if (readTurnLearningPolicyForScope(scope).status !== 'allowed') return [];
   const sessionId = options.sessionId;
@@ -76,7 +90,12 @@ export async function learnComposioOperationEffects(
     if (!slug || seen.has(slug)) continue;
     seen.add(slug);
     if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) break;
-    if (composioSlugVerbEvidence(slug) !== 'unknown') continue;
+    // The provider decided it: nothing for a model to read. When its hints
+    // are known but leave the effect open, the model reads whatever the name
+    // says; without hints, only a name with no verb at all is asked.
+    if (learnedComposioOperationEffect(slug)?.source === 'provider') continue;
+    const hinted = Array.isArray(definition.tags) && definition.tags.length > 0;
+    if (hinted ? providerDeclaredEffect(definition.tags) !== null : composioSlugVerbEvidence(slug) !== 'unknown') continue;
     const description = String(definition.description ?? '').replace(/\s+/g, ' ').trim().slice(0, 1_200);
     if (!description) continue;
     let schemaText = '';

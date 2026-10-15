@@ -1,8 +1,10 @@
 /**
- * Durable, per-operation effect verdicts learned from the operation's own
- * definition (description and input schema), decided by a model once and then
- * consulted by the pure slug classifier for operations whose name carries no
- * verb at all.
+ * Durable, per-operation effect verdicts from the operation's own definition:
+ * what the provider declares about it (its read-only / destructive / update
+ * hints), or, when the provider leaves that open, what a model read in its
+ * description and input schema. The pure slug classifier consults this first
+ * for every operation; the name is only a fallback until a definition has
+ * been seen.
  *
  * Live 2026-09-24 (source 299433): a project board listing on a freshly
  * connected toolkit retrieves data, but
@@ -16,6 +18,7 @@
  * Composio client, so nothing here may import the harness, the registry or a
  * model client. A missing or unreadable store is the empty store.
  */
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
@@ -24,8 +27,9 @@ export type LearnedComposioEffect = 'read' | 'write';
 
 export interface LearnedComposioOperationEffect {
   effect: LearnedComposioEffect;
-  /** Which authority decided it; only a model verdict is written today. */
-  source: 'model';
+  /** Which authority decided it: the provider's own declaration, or a model
+   * reading the definition where the provider left it open. */
+  source: 'model' | 'provider';
   model: string;
   confidence: number;
   /** sha256 of the description + schema the verdict was made from. */
@@ -39,7 +43,7 @@ interface StoreFile {
 }
 
 const STORE_FILE = path.join(BASE_DIR, 'state', 'composio-operation-effects.json');
-const MAX_ENTRIES = 2_000;
+const MAX_ENTRIES = 10_000;
 
 let cache: { mtimeMs: number; file: StoreFile } | null = null;
 
@@ -77,8 +81,48 @@ export function learnedComposioOperationEffect(slug: string | null | undefined):
 export function rememberComposioOperationEffect(slug: string, verdict: LearnedComposioOperationEffect): void {
   const key = slug.trim().toUpperCase();
   if (!key) return;
+  writeEffects({ ...readStore().effects, [key]: verdict });
+}
+
+/** The effect a provider's own hints declare, when they decide it: a
+ * read-only operation reads; a destructive or updating one writes. An
+ * operation that only creates (a record, a message, or a provider-side job
+ * that gathers data) is left for a model to read; contradictory hints decide
+ * nothing. */
+export function providerDeclaredEffect(tags: readonly unknown[] | null | undefined): LearnedComposioEffect | null {
+  const hints = new Set((tags ?? []).filter((tag): tag is string => typeof tag === 'string'));
+  const readOnly = hints.has('readOnlyHint');
+  const changes = hints.has('destructiveHint') || hints.has('updateHint');
+  if (readOnly === changes) return null;
+  return readOnly ? 'read' : 'write';
+}
+
+/** Record what providers declare about operations whose definitions just
+ * arrived. One write for the batch, and only when something changed. */
+export function rememberProviderDeclaredEffects(
+  definitions: ReadonlyArray<{ slug?: unknown; tags?: unknown }>,
+): void {
   const file = readStore();
-  const effects = { ...file.effects, [key]: verdict };
+  let effects: Record<string, LearnedComposioOperationEffect> | null = null;
+  const at = new Date().toISOString();
+  for (const definition of definitions) {
+    const key = typeof definition.slug === 'string' ? definition.slug.trim().toUpperCase() : '';
+    const tags = Array.isArray(definition.tags) ? definition.tags : null;
+    if (!key || !tags) continue;
+    const effect = providerDeclaredEffect(tags);
+    if (!effect) continue;
+    const definitionDigest = createHash('sha256')
+      .update(tags.filter((tag) => typeof tag === 'string' && tag.endsWith('Hint')).sort().join('\0'))
+      .digest('hex');
+    const current = (effects ?? file.effects)[key];
+    if (current?.source === 'provider' && current.effect === effect && current.definitionDigest === definitionDigest) continue;
+    effects ??= { ...file.effects };
+    effects[key] = { effect, source: 'provider', model: '', confidence: 1, definitionDigest, at };
+  }
+  if (effects) writeEffects(effects);
+}
+
+function writeEffects(effects: Record<string, LearnedComposioOperationEffect>): void {
   const keys = Object.keys(effects);
   if (keys.length > MAX_ENTRIES) {
     for (const stale of keys.sort((a, b) => effects[a]!.at.localeCompare(effects[b]!.at)).slice(0, keys.length - MAX_ENTRIES)) delete effects[stale];

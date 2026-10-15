@@ -7,24 +7,22 @@ import {
   composioSlugEffectEvidence,
 } from './slug-effect.js';
 
-test('provider-side research jobs remain reads', () => {
+test('a research job\'s name alone proves nothing: before its definition is seen it stays a conservative write', () => {
   for (const slug of [
     'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST',
-    'DATAFORSEO_GET_SERP_GOOGLE_ORGANIC_TASK_ADVANCED_BY_ID',
-    'DATAFORSEO_SERP_GOOGLE_ORGANIC_TASKS_READY',
-    'DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED',
-    'DATAFORSEO_LABS_GOOGLE_KEYWORDS_FOR_SITE',
-    'DATAFORSEO_BACKLINKS_SUMMARY_LIVE',
     'FIRECRAWL_SCRAPE',
     'FIRECRAWL_BATCH_SCRAPE',
-    'FIRECRAWL_SEARCH_WEB',
     'FIRECRAWL_CRAWL_URLS',
+    'APIFY_SCRAPE_LINKEDIN_PROFILES',
   ]) {
-    assert.equal(classifyComposioSlugEffect(slug), 'read', slug);
+    assert.equal(classifyComposioSlugEffect(slug), 'external_write', slug);
   }
+  // A plain read verb in action position still reads by name.
+  assert.equal(classifyComposioSlugEffect('DATAFORSEO_GET_SERP_GOOGLE_ORGANIC_TASK_ADVANCED_BY_ID'), 'read');
+  assert.equal(classifyComposioSlugEffect('FIRECRAWL_SEARCH_WEB'), 'read');
 });
 
-test('DataForSEO family membership never exempts mutations or unfamiliar actions', () => {
+test('a write verb is a write and an unfamiliar action stays unknown, whatever the provider', () => {
   for (const slug of [
     'DATAFORSEO_SET_CREDENTIALS',
     'DATAFORSEO_ENABLE_WEBHOOK',
@@ -40,7 +38,7 @@ test('DataForSEO family membership never exempts mutations or unfamiliar actions
   assert.equal(classifyComposioSlugEffect('DATAFORSEO_ACCOUNT_SERP_SNAPSHOT'), 'external_write');
 });
 
-test('Firecrawl read-job family membership never exempts an explicit mutation', () => {
+test('a read-job word never exempts an explicit mutation in the same name', () => {
   for (const slug of [
     'FIRECRAWL_SCRAPE_AND_PUBLISH',
     'FIRECRAWL_CRAWL_AND_DELETE',

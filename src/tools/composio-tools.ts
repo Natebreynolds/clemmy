@@ -4994,6 +4994,8 @@ export interface ComposioBrokerCandidate {
   description?: string;
   score: number;
   inputParameters: unknown;
+  /** The provider's tags for this definition, effect hints included. */
+  tags?: string[];
 }
 
 /** Read-only provider adapter for the federated tool_search broker. It returns
@@ -5099,6 +5101,7 @@ export async function searchComposioBrokerCandidates(
         queryTerms,
       ),
       inputParameters: candidate.inputParameters,
+      ...(candidate.tags ? { tags: candidate.tags } : {}),
       providerRecommendedSuccessor: composioToolIsProviderRecommendedSuccessor(candidate),
     }))
     .filter((candidate) => (

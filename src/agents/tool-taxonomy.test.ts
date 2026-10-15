@@ -274,11 +274,24 @@ test('classifyTool: native comm-object sends the verb list misses are SEND (re-h
   assert.equal(classifyTool('mcp__vapi__get_call'), 'read');
 });
 
-test('classifyTool: composio_execute_tool routes through tool_slug', () => {
+test('classifyTool: composio_execute_tool routes through tool_slug', async () => {
   assert.equal(
     classifyTool('composio_execute_tool', { args: { tool_slug: 'GOOGLESHEETS_BATCH_GET' } }),
     'read',
   );
+  // A provider-side research job reads once its own definition says so (here
+  // a model's reading of a job its provider only marks as "creates"); its
+  // name alone never decides it.
+  assert.equal(
+    classifyTool('composio_execute_tool', { args: { tool_slug: 'FIRECRAWL_BATCH_SCRAPE' } }),
+    'send',
+  );
+  const effects = await import('../integrations/composio/learned-operation-effect-store.js');
+  for (const slug of ['FIRECRAWL_BATCH_SCRAPE', 'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST']) {
+    effects.rememberComposioOperationEffect(slug, {
+      effect: 'read', source: 'model', model: 'fixture', confidence: 0.97, definitionDigest: 'fixture', at: new Date(0).toISOString(),
+    });
+  }
   assert.equal(
     classifyTool('composio_execute_tool', { args: { tool_slug: 'FIRECRAWL_BATCH_SCRAPE' } }),
     'read',

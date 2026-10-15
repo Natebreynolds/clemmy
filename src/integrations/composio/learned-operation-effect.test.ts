@@ -147,3 +147,54 @@ test('Composio default screen checks the captured policy after its lazy import',
     jev._setTypesafeKeyForTests(undefined);
   }
 });
+
+test('what a provider declares decides for any provider, whatever its name says', () => {
+  store._resetLearnedComposioOperationEffectsForTests();
+  // The name says write (SCHEDULE) but the provider declares a read; the name
+  // says nothing (SCRAPE) but the provider declares a destructive action.
+  assert.equal(classifyComposioSlugEffect('ACME_GET_SCHEDULE'), 'external_write');
+  store.rememberProviderDeclaredEffects([
+    { slug: 'ACME_GET_SCHEDULE', tags: ['readOnlyHint', 'idempotentHint', 'openWorldHint'] },
+    { slug: 'ACME_SCRAPE_AND_PURGE', tags: ['destructiveHint'] },
+    { slug: 'ACME_RECORD_UPDATE', tags: ['updateHint'] },
+    { slug: 'ACME_RUN_RESEARCH', tags: ['createHint', 'openWorldHint'] },
+    { slug: 'ACME_CONFUSED', tags: ['readOnlyHint', 'destructiveHint'] },
+    { slug: 'ACME_UNTAGGED' },
+  ]);
+  assert.equal(classifyComposioSlugEffect('ACME_GET_SCHEDULE'), 'read');
+  assert.equal(classifyComposioSlugEffect('ACME_SCRAPE_AND_PURGE'), 'external_write');
+  assert.equal(composioSlugEffectEvidence('ACME_RECORD_UPDATE'), 'write');
+  assert.equal(store.learnedComposioOperationEffect('ACME_GET_SCHEDULE')?.source, 'provider');
+  assert.equal(store.learnedComposioOperationEffect('ACME_RUN_RESEARCH'), null, 'create alone leaves it open');
+  assert.equal(store.learnedComposioOperationEffect('ACME_CONFUSED'), null, 'contradictory hints decide nothing');
+  assert.equal(store.learnedComposioOperationEffect('ACME_UNTAGGED'), null);
+});
+
+test('an operation its provider leaves open is read by a model whatever its name; a declared one never is', async () => {
+  store._resetLearnedComposioOperationEffectsForTests();
+  const asked: string[] = [];
+  const learned = await learnComposioOperationEffects([
+    { slug: 'ACME_CREATE_SERP_TASK', description: 'Starts a search job and returns the result pages it found.', inputSchema: {}, tags: ['createHint', 'openWorldHint'] },
+    { slug: 'ACME_SCRAPE_PROFILES', description: 'Scrapes public profiles and returns them.', inputSchema: {}, tags: ['createHint'] },
+    { slug: 'ACME_LIST_ROWS', description: 'Lists rows.', inputSchema: {}, tags: ['readOnlyHint'] },
+    { slug: 'ACME_DELETE_ROW', description: 'Deletes a row.', inputSchema: {}, tags: ['destructiveHint'] },
+  ], { evaluate: async ({ slug }) => { asked.push(slug); return { ok: true, readOnly: 0.96, model: 'jev-fixture' }; } });
+  assert.deepEqual(asked, ['ACME_CREATE_SERP_TASK', 'ACME_SCRAPE_PROFILES']);
+  assert.deepEqual(learned, ['ACME_CREATE_SERP_TASK', 'ACME_SCRAPE_PROFILES']);
+  assert.equal(classifyComposioSlugEffect('ACME_CREATE_SERP_TASK'), 'read', 'the definition outranks the CREATE in its name');
+  assert.equal(classifyComposioSlugEffect('ACME_LIST_ROWS'), 'read');
+  assert.equal(classifyComposioSlugEffect('ACME_DELETE_ROW'), 'external_write');
+});
+
+test('a provider declaration is recorded even from a turn excluded from learning', async () => {
+  store._resetLearnedComposioOperationEffectsForTests();
+  let calls = 0;
+  const excluded = learningSource(EXCLUDED_LEARNING);
+  await learnComposioOperationEffects([
+    { slug: 'ACME_GET_SCHEDULE', description: 'Reads free/busy.', inputSchema: {}, tags: ['readOnlyHint'] },
+    { slug: 'ACME_SCRAPE_PROFILES', description: 'Scrapes public profiles.', inputSchema: {}, tags: ['createHint'] },
+  ], { ...excluded, evaluate: async () => { calls += 1; return { ok: true, readOnly: 1, model: 'fixture' }; } });
+  assert.equal(calls, 0, 'no model reads anything for an excluded turn');
+  assert.equal(store.learnedComposioOperationEffect('ACME_GET_SCHEDULE')?.source, 'provider');
+  assert.equal(store.learnedComposioOperationEffect('ACME_SCRAPE_PROFILES'), null);
+});

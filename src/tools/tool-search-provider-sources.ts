@@ -1690,6 +1690,7 @@ async function materializeExactProviderBatch(input: {
       ...(tool.description ? { description: tool.description } : {}),
       score: 0,
       inputParameters: tool.inputParameters,
+      ...(tool.tags ? { tags: tool.tags } : {}),
     });
   }
   return discoveryStillActive(input) ? materialized : [];
@@ -1885,7 +1886,7 @@ export async function provisionExactWorkflowProviderOperations(input: {
     await learnComposioOperationEffects(
       operationIds.map((operation) => {
         const candidate = materializedBySlug.get(operation);
-        return { slug: operation, description: candidate?.description, inputSchema: candidate?.inputParameters };
+        return { slug: operation, description: candidate?.description, inputSchema: candidate?.inputParameters, ...(candidate?.tags ? { tags: candidate.tags } : {}) };
       }),
       { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, deadlineAt: Date.now() + Math.max(2_000, Math.min(totalDeadlineMs, 8_000)) },
     );
@@ -2981,7 +2982,7 @@ export function buildAuthorizedToolSearchCandidateSources(
       // a board listing, a read, was reviewed and refused as a write).
       try {
         await learnComposioOperationEffects(
-          merged.slice(0, 20).map((candidate) => ({ slug: candidate.slug, description: candidate.description, inputSchema: candidate.inputParameters })),
+          merged.slice(0, 20).map((candidate) => ({ slug: candidate.slug, description: candidate.description, inputSchema: candidate.inputParameters, ...(candidate.tags ? { tags: candidate.tags } : {}) })),
           { ...learningIdentity, ...(deadlineAt !== undefined ? { deadlineAt } : {}) },
         );
       } catch { /* the conservative write default stands */ }

@@ -98,58 +98,6 @@ export function actionTargetsUnsentDraft(slug: string | null | undefined): boole
   return !tokens.includes('SEND') && !tokens.includes('PUBLISH');
 }
 
-const DATAFORSEO_RESEARCH_NAMESPACES: ReadonlySet<string> = new Set([
-  'SERP',
-  'LABS',
-  'BACKLINK',
-  'BACKLINKS',
-]);
-
-/** DataForSEO exposes research through both synchronous reads and provider-side
- * TASK_POST jobs. Exempt only those structural research namespaces: the old
- * `DATAFORSEO_*` blanket let unfamiliar mutations such as SET_CREDENTIALS and
- * ENABLE_WEBHOOK bypass every external-write boundary. CREATE/POST are read-job
- * transport vocabulary only for a terminal TASK(S)_POST shape; every other
- * affirmative write token wins. */
-export function dataForSeoResearchActionIsReadOnly(slug: string | null | undefined): boolean {
-  const upper = String(slug ?? '')
-    .trim()
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .toUpperCase();
-  if (!/^DATAFORSEO_(?:DATAFORSEO_)?/.test(upper)) return false;
-  const tokens = actionTokens(upper);
-  while (tokens[0] === 'DATAFORSEO') tokens.shift();
-  const namespaceIndex = tokens.findIndex((token) => DATAFORSEO_RESEARCH_NAMESPACES.has(token));
-  const structurallyResearch = namespaceIndex === 0
-    || (
-      namespaceIndex === 1
-      && (READ_ACTIONS.has(tokens[0] ?? '') || tokens[0] === 'CREATE')
-    );
-  if (!structurallyResearch) return false;
-
-  const writeTokens = tokens.filter((token) => WRITE_ACTIONS.has(token));
-  if (writeTokens.length === 0) return true;
-  const taskPost = tokens.at(-1) === 'POST'
-    && tokens.some((token) => token === 'TASK' || token === 'TASKS');
-  return taskPost && writeTokens.every((token) => token === 'CREATE' || token === 'POST');
-}
-
-const FIRECRAWL_READ_JOB_FAMILY = /^FIRECRAWL_(?:FIRECRAWL_)?(?:BATCH_)?(?:SCRAPE|MAP|SEARCH|CRAWL)(?:_|$)/;
-
-/** Firecrawl's scrape/map/search/crawl actions are external reads, including
- * BATCH_SCRAPE provider jobs. Family membership alone is not authority to
- * downgrade a mutation: mixed names such as SCRAPE_AND_PUBLISH and
- * CRAWL_AND_DELETE must retain their external-write effect everywhere this
- * shared classifier is consumed (approval, retries, and dispatch). */
-export function firecrawlResearchActionIsReadOnly(slug: string | null | undefined): boolean {
-  const upper = String(slug ?? '')
-    .trim()
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .toUpperCase();
-  if (!FIRECRAWL_READ_JOB_FAMILY.test(upper)) return false;
-  return !actionTokens(upper).some((token) => WRITE_ACTIONS.has(token));
-}
-
 /** `CALL` is ambiguous: it can be the action (place a call) or the object being
  * read (`GONG_GET_CALL_TRANSCRIPT`). A concrete read verb wins only when CALL
  * is the sole write-shaped token. Mixed actions such as FIND_OR_CREATE_CALL
@@ -194,13 +142,13 @@ const STATE_NOUN_READ_TOKENS: ReadonlySet<string> = new Set([
 /**
  * Classify the user-visible effect of a Composio action slug.
  *
- * Provider-side research jobs are reads even when their implementation uses a
- * CREATE/POST endpoint. For every other toolkit, an unambiguous write token
- * wins so mixed actions such as FIND_OR_CREATE cannot bypass mutation
- * controls; a read token is trusted only in ACTION position (fold 2026-07-17,
- * Workflow effect-classification review: `GMAIL_MARK_AS_READ` must never classify read
- * — MARK is not a known write verb and READ is a trailing state word — while
- * `TWITTER_GET_POST` must never classify write — POST there is the object).
+ * The operation's own definition decides: what its provider declares, or
+ * what a model read in its description (a provider-side search, scrape or
+ * research job that only returns data is a read). Before a definition has
+ * been seen, the name is the fallback: an unambiguous write token wins so
+ * mixed actions such as FIND_OR_CREATE cannot bypass mutation controls; a
+ * read token is trusted only in ACTION position (`GMAIL_MARK_AS_READ` must
+ * never classify read, `TWITTER_GET_POST` must never classify write).
  * Missing and unfamiliar action names remain conservative writes.
  */
 export function classifyComposioSlugEffect(slug: string | null | undefined): ComposioSlugEffect {
@@ -215,56 +163,37 @@ export function classifyComposioSlugEffect(slug: string | null | undefined): Com
  * 2026-07-09 send-gate incident rule.
  */
 /**
- * Whether a READ verdict for this exact slug comes from a CURATED provider
- * rule rather than generic verb inference.
- *
- * Curated rules (documented semantics, the DataForSEO/Firecrawl research
- * families, ephemeral compute) are exact provider knowledge and legitimately
- * key on the provider-qualified slug — `DATAFORSEO_SERP_*` is only meaningful
- * with its toolkit token. Generic verb inference is different: it must never
- * see a namespace the user chose, because a read verb in an arbitrary MCP
- * server name would prove its destructive tools read-only (2026-08-21).
+ * Whether this exact operation is a read on affirmative evidence rather than
+ * on how its name reads: the provider declared it read-only, a model reading
+ * its definition found it only retrieves, or it is ephemeral compute that
+ * produces a response and keeps no record. Name vocabulary never counts here,
+ * so a read-sounding name in a server the user named proves nothing.
  */
-export function composioSlugHasCuratedReadRule(slug: string | null | undefined): boolean {
+export function composioOperationDeclaredRead(slug: string | null | undefined): boolean {
   const upper = String(slug ?? '').trim().toUpperCase();
   if (!upper) return false;
-  if (documentedComposioOperationSemantic(upper)?.effect === 'read') return true;
-  return dataForSeoResearchActionIsReadOnly(upper)
-    || firecrawlResearchActionIsReadOnly(upper)
-    || composioActionIsEphemeralCompute(upper);
+  if (learnedComposioOperationEffect(upper)?.effect === 'read') return true;
+  return composioActionIsEphemeralCompute(upper);
 }
 
 export function composioSlugEffectEvidence(slug: string | null | undefined): ComposioSlugEffectEvidence {
-  const verb = composioSlugVerbEvidence(slug);
-  if (verb !== 'unknown') return verb;
-  // A verdict a model reached from the operation's own description and schema
-  // (learned-operation-effect.ts) is affirmative evidence for that exact slug.
+  // What the operation's own definition says decides: the provider's declared
+  // hints, or a model's reading of the description where the provider left
+  // it open (learned-operation-effect.ts). The name is only a fallback until
+  // a definition has been seen; it guesses, and it guesses wrong for names
+  // such as GET_SCHEDULE or GET_DUPLICATE_TAGS.
   const learned = learnedComposioOperationEffect(String(slug ?? '').trim().toUpperCase());
-  return learned ? learned.effect : 'unknown';
+  if (learned) return learned.effect;
+  return composioSlugVerbEvidence(slug);
 }
 
-/** Verb evidence from the slug alone, without the learned layer. The learner
- * uses this to decide which operations still need a model's reading. */
+/** Evidence from the slug's words alone: the fallback for an operation
+ * whose definition has not been seen yet. */
 export function composioSlugVerbEvidence(slug: string | null | undefined): ComposioSlugEffectEvidence {
   const upper = String(slug ?? '').trim().toUpperCase();
   if (!upper) return 'unknown';
 
-  const documented = documentedComposioOperationSemantic(upper);
-  // A documented noun-shaped WRITE is affirmative effect evidence. Keep a
-  // noun-shaped READ at `unknown` in this low-level verb-evidence API: callers
-  // that accept author-declared reads depend on that distinction, while the
-  // canonical external-effect classifier consumes the full documented
-  // descriptor and can affirm the read directly.
-  if (documented?.effect === 'write') return 'write';
-
-  if (dataForSeoResearchActionIsReadOnly(upper)) {
-    return 'read';
-  }
-
   const tokens = actionTokens(upper);
-  if (firecrawlResearchActionIsReadOnly(upper)) {
-    return 'read';
-  }
   // EPHEMERAL COMPUTE (live 2026-07-24): "CREATE" + a compute noun creates no
   // durable external state — OPENAI_CREATE_CHAT_COMPLETION produces a model
   // RESPONSE, not a record. Treating it as a write dragged the execution-wrap

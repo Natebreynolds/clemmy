@@ -6,6 +6,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { rememberProviderDeclaredEffects } from './learned-operation-effect-store.js';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -178,6 +179,29 @@ export interface CatalogToolkit {
   categories: { slug: string; name: string }[];
 }
 
+/**
+ * Every provider definition that passes through this client records what its
+ * provider declares about its effect (read-only, destructive, update hints),
+ * so effect decisions read the operation's own definition, not its name.
+ * Supply only: a store failure never fails the fetch.
+ */
+function providerTags(item: { tags?: unknown } | null | undefined): { tags?: string[] } {
+  const tags = Array.isArray(item?.tags) ? item!.tags.filter((tag): tag is string => typeof tag === 'string') : [];
+  return tags.length > 0 ? { tags } : {};
+}
+
+function noteProviderDeclaredEffects(raw: unknown): void {
+  try {
+    const list: unknown[] = Array.isArray(raw)
+      ? raw
+      : (Array.isArray((raw as { items?: unknown[] } | null)?.items) ? (raw as { items: unknown[] }).items : []);
+    rememberProviderDeclaredEffects(list.map((item) => {
+      const row = (item ?? {}) as { slug?: unknown; tags?: unknown };
+      return { slug: row.slug, tags: row.tags };
+    }));
+  } catch { /* the name fallback stands */ }
+}
+
 export interface ComposioToolkitTool {
   slug: string;
   name: string;
@@ -190,6 +214,9 @@ export interface ComposioToolkitTool {
   outputParameters?: unknown;
   /** Exact operation version returned with this provider definition. */
   version?: string;
+  /** The provider's own tags for this definition, including its effect hints
+   * (readOnlyHint, destructiveHint, updateHint, createHint). */
+  tags?: string[];
 }
 
 // Process-local provenance for provider definitions hydrated only because a
@@ -2632,6 +2659,7 @@ export async function getExactComposioToolBySlug(slug: string): Promise<Composio
 
   const observedAt = Date.now();
   const raw = await composio.tools.getRawComposioTools({ tools: [wanted], limit: 1 });
+  noteProviderDeclaredEffects(raw);
   const list = Array.isArray(raw)
     ? raw
     : (Array.isArray(raw?.items) ? raw.items : []);
@@ -2648,6 +2676,7 @@ export async function getExactComposioToolBySlug(slug: string): Promise<Composio
     description: item.description ?? '',
     ...(toolkitSlug ? { toolkitSlug } : {}),
     inputParameters: item.inputParameters ?? item.input_parameters,
+    ...providerTags(item),
     ...(hasCamelOutput
       ? { outputParameters: item.outputParameters }
       : hasSnakeOutput
@@ -2699,6 +2728,7 @@ export async function getExactComposioToolsBySlugs(
     tools: requested,
     limit: requested.length,
   });
+  noteProviderDeclaredEffects(raw);
   const list = Array.isArray(raw) ? raw : (Array.isArray(raw?.items) ? raw.items : []);
   for (const item of list) {
     const slug = String(item?.slug ?? '').toUpperCase();
@@ -2715,6 +2745,7 @@ export async function getExactComposioToolsBySlugs(
       description: item.description ?? '',
       ...(toolkitSlug ? { toolkitSlug } : {}),
       inputParameters: item.inputParameters ?? item.input_parameters,
+      ...providerTags(item),
       ...(hasCamelOutput
         ? { outputParameters: item.outputParameters }
         : hasSnakeOutput
@@ -2749,6 +2780,7 @@ export async function getComposioToolBySlug(slug: string): Promise<ComposioToolk
     // never look newer and roll schema authority back.
     const observedAt = Date.now();
     const raw = await composio.tools.getRawComposioTools({ tools: [wanted] });
+    noteProviderDeclaredEffects(raw);
     const list = Array.isArray(raw) ? raw : (raw?.items ?? []);
     for (const item of list) {
       if (String(item?.slug ?? '').toUpperCase() === wanted) {
@@ -2757,6 +2789,7 @@ export async function getComposioToolBySlug(slug: string): Promise<ComposioToolk
           name: item.name ?? item.slug,
           description: item.description ?? '',
           inputParameters: item.inputParameters ?? item.input_parameters,
+          ...providerTags(item),
           outputParameters: item.outputParameters ?? item.output_parameters,
           version: str(item.version),
         } as ComposioToolkitTool;
@@ -2812,6 +2845,7 @@ export async function listComposioToolkitTools(
         description: str(item.description),
         toolkitSlug: str(toolkit.slug) ?? slug,
         inputParameters: item.inputParameters ?? item.input_parameters ?? item.parameters,
+        ...providerTags(item),
         outputParameters: item.outputParameters ?? item.output_parameters,
         version: str(item.version),
       };
@@ -2856,6 +2890,7 @@ export async function listComposioToolkitTools(
   // RAW set ("latest") for full OpenAPI coverage + any user custom tools.
   try {
     const raw = await composio.tools.getRawComposioTools({ toolkits: [slug], limit });
+    noteProviderDeclaredEffects(raw);
     ingest(raw);
   } catch (err) {
     if (tools.length === 0) throw err; // only surface if we got nothing at all
@@ -3029,6 +3064,7 @@ export async function searchConnectedComposioTools(
       : (Array.isArray((raw as { items?: unknown[] } | null)?.items)
           ? (raw as { items: unknown[] }).items
           : []);
+    noteProviderDeclaredEffects(items);
     if (items.length > COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT) {
       throw new ComposioSearchProviderContractError();
     }
@@ -3071,6 +3107,7 @@ export async function searchConnectedComposioTools(
         ?? item.parameters,
       outputParameters: item.outputParameters ?? item.output_parameters,
       version: str(item.version),
+      ...providerTags(item),
     };
     if (preferredIdentities.has(identity)) {
       providerRecommendedSuccessorDefinitions.add(tool);

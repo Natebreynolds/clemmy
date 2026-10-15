@@ -559,6 +559,13 @@ for (const post of data.posts) {
 
 const clarificationRevision = await import('../runtime/semantic-boundary/clarification-revision.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
+const operationEffects = await import('../integrations/composio/learned-operation-effect-store.js');
+// The provider marks its batch scrape only as "creates" (a job that gathers
+// pages); a model reading its definition found it only returns data. That
+// verdict is what production holds after the first discovery.
+operationEffects.rememberComposioOperationEffect('FIRECRAWL_BATCH_SCRAPE', {
+  effect: 'read', source: 'model', model: 'fixture', confidence: 0.97, definitionDigest: 'fixture', at: new Date(0).toISOString(),
+});
 const brackets = await import('../runtime/harness/brackets.js');
 const continuity = await import('../runtime/harness/task-continuity-runtime.js');
 const semantic = await import('../runtime/semantic-boundary/admit-and-compile-accepted-source.js');
@@ -930,6 +937,7 @@ function configureResearchProvider(
             // Freeze the production exact-slug definition, not the merged
             // curated/public v00000000_00 row (`query`, root data[]).
             version: NEWS_OPERATION_VERSION,
+            tags: ['readOnlyHint'],
           },
           ...(options.includeBatchDefinitions
             ? [
@@ -941,6 +949,7 @@ function configureResearchProvider(
                   inputParameters: FIRECRAWL_BATCH_SCRAPE_INPUT_SCHEMA,
                   outputParameters: FIRECRAWL_BATCH_SCRAPE_OUTPUT_SCHEMA,
                   version: BATCH_SCRAPE_VERSION,
+                  tags: ['openWorldHint', 'createHint'],
                 },
                 {
                   slug: BATCH_SCRAPE_GET_OPERATION,
@@ -950,6 +959,7 @@ function configureResearchProvider(
                   inputParameters: FIRECRAWL_BATCH_SCRAPE_GET_INPUT_SCHEMA,
                   outputParameters: FIRECRAWL_BATCH_SCRAPE_GET_OUTPUT_SCHEMA,
                   version: BATCH_SCRAPE_VERSION,
+                  tags: ['openWorldHint', 'readOnlyHint'],
                 },
               ]
             : []),
