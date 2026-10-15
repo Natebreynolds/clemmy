@@ -603,6 +603,11 @@ export function scriptedJevFetch(neededTools: readonly string[], log: string[]):
     const turnStartQuestion = 'select' in body.questions || 'run_0' in body.questions;
     const routing = turnStartQuestion || 'which' in body.questions;
     const lane = turnStartQuestion ? 'turn_start' : routing ? 'rank' : Object.keys(body.questions).slice(0, 3).join('+');
+    // The completion check of a scripted turn that answered with its planted
+    // facts: delivered, nothing unaddressed, unsupported, computed or asked.
+    // A read is checked by Jev alone, so an unsure fake would leave every
+    // read unreviewed.
+    const completionCheck = 'delivered' in body.questions && 'unaddressed' in body.questions;
     for (const [id, question] of Object.entries(body.questions)) {
       const criteria = question.criteria ?? {};
       const keys = Object.keys(criteria);
@@ -612,7 +617,8 @@ export function scriptedJevFetch(neededTools: readonly string[], log: string[]):
         const confidence = hit ? 0.9 : 0.3;
         answers[id] = { type: 'choice', choice, confidence, probabilities: Object.fromEntries(keys.map((key) => [key, key === choice ? confidence : (1 - confidence) / Math.max(1, keys.length - 1)])) };
       } else if (question.type === 'noul') {
-        answers[id] = { type: 'noul', noul: routing && names(question.instructions ?? '') ? 0.95 : 0.5 };
+        answers[id] = { type: 'noul', noul: completionCheck ? (id === 'delivered' ? 0.97 : 0.03)
+          : routing && names(question.instructions ?? '') ? 0.95 : 0.5 };
       } else {
         const legend = question.legend ?? { '0': 'unsure' };
         const first = Object.keys(legend)[0] ?? '0';

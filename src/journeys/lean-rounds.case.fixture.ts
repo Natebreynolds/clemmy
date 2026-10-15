@@ -448,9 +448,12 @@ async function runTurn(sessionId: string, options: { jevMayAbstain?: boolean } =
 // starts from the same learned state.
 // ---------------------------------------------------------------------------
 if (script.warmUp) {
+  const armJev = process.env.CLEMMY_JEV;
+  process.env.CLEMMY_JEV = 'on';
   jevClient._setTypesafeKeyForTests('fixture-jev-key');
   jevClient._setSystemOneFetchForTests(scriptedJevFetch(script.steps.map((step) => step.tool), []));
   const warm = await runTurn(`lean-${scenario}-${arm}-warmup`);
+  process.env.CLEMMY_JEV = armJev;
   assert.equal(scoreAcceptedTurnRounds(HOME, warm.sessionId, warm.sourceUserSeq).terminal?.status, 'done',
     'the warm-up turn completes');
   providerCalls.length = 0;
