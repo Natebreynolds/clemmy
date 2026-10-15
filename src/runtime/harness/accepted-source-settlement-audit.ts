@@ -104,6 +104,9 @@ interface SettlementRow {
   argument_digest: string;
   outcome_kind: string;
   outcome_detail: string | null;
+  /** Physical dispatches of this call that returned a value, and that did not. */
+  returned_dispatches?: number;
+  unreturned_dispatches?: number;
   execution_kind: string;
   mutating: number;
   requirement_id: string | null;
@@ -506,7 +509,13 @@ export function auditAcceptedSourceSettlementTruth(input: {
     const settlements = db.prepare(`
       SELECT s.logical_tool_call_id, l.tool_name, l.argument_digest,
              s.outcome_kind, s.outcome_detail, s.execution_kind, s.mutating, s.requirement_id,
-             s.settled_at
+             s.settled_at,
+             (SELECT COUNT(*) FROM physical_dispatches p
+               WHERE p.session_id = s.session_id AND p.source_user_seq = s.source_user_seq
+                 AND p.logical_tool_call_id = s.logical_tool_call_id AND p.state = 'returned') AS returned_dispatches,
+             (SELECT COUNT(*) FROM physical_dispatches p
+               WHERE p.session_id = s.session_id AND p.source_user_seq = s.source_user_seq
+                 AND p.logical_tool_call_id = s.logical_tool_call_id AND p.state <> 'returned') AS unreturned_dispatches
       FROM logical_call_settlements s
       JOIN logical_tool_calls l
         ON l.session_id = s.session_id
@@ -728,6 +737,21 @@ export function auditAcceptedSourceSettlementTruth(input: {
       // expected-work gates, which judge coverage rather than blame.
       if (row.execution_kind === 'refused_pre_dispatch') return false;
       if (answeredRefusalCallIds.has(row.logical_tool_call_id)) return false;
+      // AN UNCONFIRMED READ IS NOT A FAILED READ. `unknown` with no failure
+      // detail, from a call that returned, is a reply the host could not
+      // classify: most often a tool that answers in plain text (a user's MCP
+      // server, or a local tool reached through one). It is inert by
+      // construction, spending no budget and eliminating nothing, and a read
+      // changed nothing, so there is nothing for this audit to reconcile.
+      // Whether the data arrived is the terminal gates' question. A call that
+      // threw, or a failure the host observed, still counts.
+      // Live 2026-10-15: a workflow step read its file and returned the rows,
+      // and was still reported "1 business call failure(s) have no successful
+      // recovery" because its one read settled `unknown`.
+      if (
+        row.mutating === 0 && row.outcome_kind === 'unknown' && !row.outcome_detail
+        && (row.returned_dispatches ?? 0) > 0 && (row.unreturned_dispatches ?? 0) === 0
+      ) return false;
       // A FAILED READ THAT WAS WORKED AROUND IS NOT AN UNRECOVERED FAILURE.
       // Recovery identity is the exact call (requirement, or tool+arguments),
       // so trying a query, having it rejected, and getting the same facts from

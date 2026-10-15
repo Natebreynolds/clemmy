@@ -1318,3 +1318,40 @@ test('a DISPATCHED write failure is still an unrecovered failure', () => {
   );
   assert.notEqual(audit.status, 'clean', JSON.stringify(audit));
 });
+
+test('a read that returned a reply the host could not classify does not veto its step; a read that threw still does', () => {
+  // Live 2026-10-15: a workflow step on a bring-your-own model read its file,
+  // returned the rows, and was reported "1 business call failure(s) have no
+  // successful recovery" because the plain-text reply settled `unknown`.
+  for (const returned of [true, false]) {
+    const runId = `unconfirmed-read-${returned ? 'returned' : 'threw'}`;
+    const sessionId = `workflow:${runId}:read_rows`;
+    eventlog.createSession({ id: sessionId, kind: 'workflow' });
+    const source = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Read the rows.' } });
+    recordSemanticParticipation(sessionId, source.seq, 'participated');
+    assert.ok(shadow.recordTurnGraphShadow({ identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq } }));
+    const acceptedTaskId = identities.acceptedTaskIdFor(sessionId, source.seq);
+    const begun = dispatch.beginPhysicalDispatch({
+      identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn, acceptedTaskId,
+        logicalToolCallId: 'logical:read', physicalDispatchId: 'dispatch:read', ordinal: 0 },
+      tool: 'alpha_rows_read',
+      args: { path: 'rows.csv' },
+    });
+    assert.equal(begun.status, 'inserted');
+    if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
+    assert.equal(dispatch.settlePhysicalDispatch({
+      identity: begun.identity, tool: 'alpha_rows_read', args: { path: 'rows.csv' },
+      outcome: returned ? 'returned' : 'threw',
+    }).status, 'inserted');
+    settlements.commitLogicalCallSettlement({
+      identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn, acceptedTaskId, logicalToolCallId: 'logical:read' },
+      contract: { toolName: 'alpha_rows_read', args: { path: 'rows.csv' } },
+      execution: { kind: 'provider_execution' },
+      outcome: outcomes.classifyAttemptOutcome({}),
+      recovery: { businessCall: true, mutating: false },
+      observer: { lane: 'byo', turn: source.turn },
+    });
+    const audit = auditAcceptedSourceSettlementTruth({ sessionId, sourceUserSeq: source.seq });
+    assert.equal(audit.facts.unrecoveredBusinessFailures, returned ? 0 : 1, `${runId}: ${JSON.stringify(audit)}`);
+  }
+});
