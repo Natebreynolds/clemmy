@@ -25,29 +25,88 @@ const MANAGED_IDS = new Set(['gh', 'github', 'composio']);
 type ObservedJob = { id: string; status: string; title: string; output: string };
 const JOB_STATES = new Set(['running', 'succeeded', 'failed', 'cancelled', 'interrupted']);
 
+type SetupOwner = { id: string; prefix: string; action: string; generation: number };
+let setupGeneration = 0;
+
+/** Only the acknowledged ID and action survive Connect navigation. The normal
+ * job cache may expire; clearing the QueryClient also revokes pending callbacks. */
+function useCliSetupOwnership(section: 'managed' | 'catalog') {
+  const qc = useQueryClient();
+  const key = ['cli-setup-owner', section];
+  useQuery<SetupOwner | null>({ queryKey: key, enabled: false, initialData: null, gcTime: Infinity, queryFn: async () => null });
+  const [local, setLocal] = useState<{ generation: number; action: string } | null>(null);
+  const operation = useRef<typeof local>(null);
+  const active = useRef(true);
+  const epoch = useRef(0);
+  const [, setRevision] = useState(0);
+  useEffect(() => {
+    active.current = true;
+    const unsubscribe = qc.getQueryCache().subscribe(event => {
+      if (event.type === 'removed' && event.query.queryKey[0] === key[0] && event.query.queryKey[1] === section) {
+        epoch.current += 1; operation.current = null; setLocal(null); setRevision(value => value + 1);
+      }
+    });
+    return () => { active.current = false; operation.current = null; unsubscribe(); };
+  }, [qc, section]);
+  const renderEpoch = epoch.current;
+  const current = () => qc.getQueryData<SetupOwner | null>(key) ?? null;
+  const owner = current();
+  const isCurrent = (generation: number, id: string, prefix: string) => {
+    const saved = current();
+    return active.current && saved?.generation === generation && saved.id === id && saved.prefix === prefix;
+  };
+  const begin = (action: string) => {
+    if (!active.current || epoch.current !== renderEpoch || operation.current || current()) return null;
+    // A removable sentinel fences even an in-flight, not-yet-acknowledged POST.
+    if (qc.getQueryData(key) === undefined) qc.setQueryData(key, null);
+    const next = { generation: ++setupGeneration, action };
+    operation.current = next; setLocal(next); return next.generation;
+  };
+  const owns = (generation: number) => active.current && operation.current?.generation === generation;
+  const finish = (generation: number) => {
+    if (owns(generation)) { operation.current = null; setLocal(null); }
+  };
+  const acknowledge = (id: string, prefix: string, generation: number) => {
+    if (!owns(generation) || qc.getQueryData(key) === undefined) return false;
+    qc.setQueryData<SetupOwner>(key, { id, prefix, action: operation.current!.action, generation }); return true;
+  };
+  const complete = (generation: number, id: string, prefix: string) => {
+    if (!isCurrent(generation, id, prefix)) return false;
+    qc.setQueryData(key, null); finish(generation); return true;
+  };
+  return { owner, busy: owner?.action ?? local?.action ?? null, epoch, begin, owns, finish, acknowledge, isCurrent, complete };
+}
+
 /** A lost observation never authorizes another install or sign-in. Retain the
  * acknowledged job, observe only its exact ID, and bound automatic recovery. */
-function useCliJobObservation<T extends ObservedJob>(prefix: string, read: (id: string) => Promise<{ job: T }>) {
+function useCliJobObservation<T extends ObservedJob>(prefix: string, read: (id: string) => Promise<{ job: T }>, ownership: ReturnType<typeof useCliSetupOwnership>) {
   const qc = useQueryClient();
-  type Entry = { job: T; token: object; errorBaseline: number; observedErrors: number };
-  const [entry, setEntry] = useState<Entry | null>(null);
-  const selected = useRef<Entry | null>(null);
+  type Entry = { job: ObservedJob; token: number; epoch: number; fresh: boolean; errorBaseline: number; observedErrors: number };
+  const [entry, setEntry] = useState<Entry | null>(() => ownership.owner?.prefix === prefix ? {
+    job: { id: ownership.owner.id, status: 'running', title: 'Checking setup status', output: '' },
+    token: ownership.owner.generation, epoch: ownership.epoch.current, fresh: false, errorBaseline: 0, observedErrors: 0,
+  } : null);
+  const selected = useRef<Entry | null>(entry);
   const active = useRef(true);
   const retrying = useRef<Entry | null>(null);
-  useEffect(() => { active.current = true; return () => { active.current = false; selected.current = null; }; }, []);
-  const query = useQuery<{ job: T }>({
-    queryKey: [prefix, entry?.job.id ?? null], enabled: Boolean(entry), retry: false,
+  useEffect(() => { active.current = true; selected.current = entry; return () => { active.current = false; selected.current = null; }; }, []);
+  const current = (candidate: Entry) => active.current && selected.current === candidate && candidate.epoch === ownership.epoch.current
+    && ownership.isCurrent(candidate.token, candidate.job.id, prefix);
+  const query = useQuery<{ job: ObservedJob }>({
+    queryKey: [prefix, entry?.job.id ?? null], enabled: Boolean(entry && current(entry)), retry: false,
     initialData: entry ? { job: entry.job } : undefined,
     queryFn: async () => {
-      if (!entry) throw new Error('No acknowledged job.');
+      if (!entry || !current(entry)) throw new Error('No acknowledged job.');
       const result = await read(entry.job.id);
       if (!result?.job || result.job.id !== entry.job.id || !JOB_STATES.has(result.job.status)
         || typeof result.job.title !== 'string' || typeof result.job.output !== 'string') throw new Error('Job status unavailable.');
+      if (!current(entry)) throw new Error('Job observation retired.');
+      entry.fresh = true;
       return result;
     },
     refetchInterval: q => {
-      if (!entry || !active.current || selected.current !== entry) return false;
-      const job = q.state.data?.job ?? entry.job;
+      if (!entry || !current(entry)) return false;
+      const job = entry.fresh ? q.state.data?.job ?? entry.job : entry.job;
       if (job.id !== entry.job.id || job.status !== 'running') return false;
       entry.observedErrors = q.state.errorUpdateCount;
       if (q.state.status === 'error') return q.state.errorUpdateCount - entry.errorBaseline < 3 ? 5000 : false;
@@ -55,21 +114,22 @@ function useCliJobObservation<T extends ObservedJob>(prefix: string, read: (id: 
       return 1500;
     },
   });
-  const accept = (job: T, token: object) => {
-    if (!active.current) return;
-    const next = { job, token, errorBaseline: 0, observedErrors: 0 };
+  const accept = (job: T, token: number) => {
+    if (!active.current || !ownership.acknowledge(job.id, prefix, token)) return;
+    const next = { job, token, epoch: ownership.epoch.current, fresh: true, errorBaseline: 0, observedErrors: 0 };
     selected.current = next;
     qc.setQueryData([prefix, job.id], { job });
     setEntry(next);
   };
   const retryStatus = async () => {
-    if (!entry || !active.current || selected.current !== entry || retrying.current === entry) return;
+    if (!entry || !current(entry) || retrying.current === entry) return;
     retrying.current = entry; entry.errorBaseline = entry.observedErrors;
     try { await query.refetch(); } catch { /* Query state retains observation failure; never re-dispatch work. */ }
     finally { if (retrying.current === entry) retrying.current = null; }
   };
-  const job = query.data?.job?.id === entry?.job.id ? query.data?.job : entry?.job;
-  return { job, token: entry?.token, accept, unavailable: Boolean(entry && query.isError), checking: query.isFetching, retryStatus };
+  const retained = entry?.epoch === ownership.epoch.current;
+  const job = retained ? (entry.fresh && query.data?.job?.id === entry.job.id ? query.data.job : entry.job) : undefined;
+  return { job, token: entry?.token, accept, unavailable: Boolean(retained && entry && query.isError), checking: query.isFetching, retryStatus };
 }
 
 function JobStatusRecovery({ unavailable, checking, onRetry }: { unavailable: boolean; checking: boolean; onRetry: () => Promise<unknown> }) {
@@ -109,26 +169,23 @@ export function CliTools() {
 function ManagedClis({ connections, unavailable }: { connections?: CliConnectionSnapshot; unavailable: boolean }) {
   const qc = useQueryClient();
   const managed = usePoll(['managed-clis'], getManagedClis, 0);
-  const [pending, setPending] = useState<string | null>(null);
+  const ownership = useCliSetupOwnership('managed');
+  const pending = ownership.busy;
   const [error, setError] = useState('');
-  const operation = useRef<object | null>(null);
-  useEffect(() => () => { operation.current = null; }, []);
-  const observation = useCliJobObservation<ManagedCliJob>('managed-cli-job', getManagedCliJob);
+  const observation = useCliJobObservation<ManagedCliJob>('managed-cli-job', getManagedCliJob, ownership);
   const job = observation.job;
   useEffect(() => {
-    if (job && job.status !== 'running' && observation.token && operation.current === observation.token) {
+    if (job && job.status !== 'running' && observation.token && ownership.complete(observation.token, job.id, 'managed-cli-job')) {
       void qc.invalidateQueries({ queryKey: ['managed-clis'] });
       void qc.invalidateQueries({ queryKey: ['cli-connections'] });
-      operation.current = null; setPending(null);
     }
   }, [job?.id, job?.status, observation.token, qc]);
 
   const run = async (kind: ManagedCliKind, action: ManagedCliAction) => {
-    if (operation.current) return;
-    const token = {}; operation.current = token;
-    setPending(`${kind}:${action}`); setError('');
-    try { const { job } = await startManagedCliJob(kind, action); if (operation.current === token) observation.accept(job, token); }
-    catch { if (operation.current === token) { operation.current = null; setPending(null); setError('The setup could not be started. Check the tool status before trying again.'); } }
+    const token = ownership.begin(`${kind}:${action}`); if (!token) return;
+    setError('');
+    try { const { job } = await startManagedCliJob(kind, action); if (ownership.owns(token)) observation.accept(job, token); }
+    catch { if (ownership.owns(token)) { ownership.finish(token); setError('The setup could not be started. Check the tool status before trying again.'); } }
   };
 
   return (
@@ -244,13 +301,12 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
   const savedOnly = saved.filter((name) => !connectedCmds.has(name));
 
   const [query, setQuery] = useState('');
-  const [busy, setBusy] = useState<string | null>(null);
+  const ownership = useCliSetupOwnership('catalog');
+  const busy = ownership.busy;
   const [error, setError] = useState('');
   const [reveal, setReveal] = useState<string | null>(null);
-  const operation = useRef<object | null>(null);
-  useEffect(() => () => { operation.current = null; }, []);
-  const installObservation = useCliJobObservation<InstallJob>('install-job', getInstallJob);
-  const authObservation = useCliJobObservation<ManagedCliJob>('catalog-auth-job', getManagedCliJob);
+  const installObservation = useCliJobObservation<InstallJob>('install-job', getInstallJob, ownership);
+  const authObservation = useCliJobObservation<ManagedCliJob>('catalog-auth-job', getManagedCliJob, ownership);
 
   const healthFor = (id: string, command: string) => cliConnectionHealth(connections?.health, id, command);
   const authRequiredFor = (id: string, command: string) => connections?.authRequired[id] ?? connections?.authRequired[command];
@@ -274,51 +330,48 @@ function CatalogTools({ connections, unavailable }: { connections?: CliConnectio
 
   const installJob = installObservation.job;
   useEffect(() => {
-    if (installJob && installJob.status !== 'running' && installObservation.token && operation.current === installObservation.token) {
+    if (installJob && installJob.status !== 'running' && installObservation.token && ownership.complete(installObservation.token, installJob.id, 'install-job')) {
       void qc.invalidateQueries({ queryKey: ['cli-catalog'] });
       void qc.invalidateQueries({ queryKey: ['clis'] });
       void qc.invalidateQueries({ queryKey: ['cli-connections'] });
-      operation.current = null; setBusy(null);
     }
   }, [installJob?.id, installJob?.status, installObservation.token, qc]);
 
   const authJob = authObservation.job;
   useEffect(() => {
-    if (authJob && authJob.status !== 'running' && authObservation.token && operation.current === authObservation.token) {
+    if (authJob && authJob.status !== 'running' && authObservation.token && ownership.complete(authObservation.token, authJob.id, 'catalog-auth-job')) {
       void qc.invalidateQueries({ queryKey: ['cli-catalog'] });
       void qc.invalidateQueries({ queryKey: ['cli-connections'] });
-      operation.current = null; setBusy(null);
     }
   }, [authJob?.id, authJob?.status, authObservation.token, qc]);
 
   const begin = (label: string) => {
-    if (operation.current) return null;
-    const token = {}; operation.current = token; setBusy(label); setError(''); return token;
+    const token = ownership.begin(label); if (token) setError(''); return token;
   };
-  const finish = (token: object) => { if (operation.current === token) { operation.current = null; setBusy(null); } };
+  const finish = ownership.finish;
 
   const signIn = async (id: string) => {
     const token = begin(`auth:${id}`); if (!token) return;
-    try { const { job } = await authCatalogCli(id); if (operation.current === token) authObservation.accept(job, token); }
-    catch { if (operation.current === token) { setError('Sign-in could not be started. Check the tool status before trying again.'); finish(token); } }
+    try { const { job } = await authCatalogCli(id); if (ownership.owns(token)) authObservation.accept(job, token); }
+    catch { if (ownership.owns(token)) { setError('Sign-in could not be started. Check the tool status before trying again.'); finish(token); } }
   };
 
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['cli-catalog'] }); void qc.invalidateQueries({ queryKey: ['cli-connections'] }); };
   const install = async (id: string) => {
     const token = begin(`install:${id}`); if (!token) return;
-    try { const { job } = await installCatalogCli(id); if (operation.current === token) installObservation.accept(job, token); }
-    catch { if (operation.current === token) { setError('Installation could not be started. Check the tool status before trying again.'); finish(token); } }
+    try { const { job } = await installCatalogCli(id); if (ownership.owns(token)) installObservation.accept(job, token); }
+    catch { if (ownership.owns(token)) { setError('Installation could not be started. Check the tool status before trying again.'); finish(token); } }
   };
-  const forget = async (id: string) => { const token = begin(`forget:${id}`); if (!token) return; try { await forgetCatalogCli(id); if (operation.current === token) refresh(); } catch { if (operation.current === token) setError('The saved tool could not be changed. Refresh its status before trying again.'); } finally { finish(token); } };
-  const save = async (command: string) => { const token = begin(`save:${command}`); if (!token) return; try { await saveCli(command); if (operation.current === token) void qc.invalidateQueries({ queryKey: ['cli-connections'] }); } catch { if (operation.current === token) setError('The tool could not be saved. Refresh its status before trying again.'); } finally { finish(token); } };
-  const unsave = async (command: string) => { const token = begin(`save:${command}`); if (!token) return; try { await removeSavedCli(command); if (operation.current === token) void qc.invalidateQueries({ queryKey: ['cli-connections'] }); } catch { if (operation.current === token) setError('The saved tool could not be changed. Refresh its status before trying again.'); } finally { finish(token); } };
+  const forget = async (id: string) => { const token = begin(`forget:${id}`); if (!token) return; try { await forgetCatalogCli(id); if (ownership.owns(token)) refresh(); } catch { if (ownership.owns(token)) setError('The saved tool could not be changed. Refresh its status before trying again.'); } finally { finish(token); } };
+  const save = async (command: string) => { const token = begin(`save:${command}`); if (!token) return; try { await saveCli(command); if (ownership.owns(token)) void qc.invalidateQueries({ queryKey: ['cli-connections'] }); } catch { if (ownership.owns(token)) setError('The tool could not be saved. Refresh its status before trying again.'); } finally { finish(token); } };
+  const unsave = async (command: string) => { const token = begin(`save:${command}`); if (!token) return; try { await removeSavedCli(command); if (ownership.owns(token)) void qc.invalidateQueries({ queryKey: ['cli-connections'] }); } catch { if (ownership.owns(token)) setError('The saved tool could not be changed. Refresh its status before trying again.'); } finally { finish(token); } };
   const customInstall = async (command: string, name?: string) => {
     const token = begin('install:custom'); if (!token) return false;
     try {
       const { job } = await runInstallCommand(command, name);
-      if (operation.current !== token) return false;
+      if (!ownership.owns(token)) return false;
       installObservation.accept(job, token); return true;
-    } catch { if (operation.current === token) finish(token); throw new Error('Installation could not be started. Check the tool status before trying again.'); }
+    } catch { if (ownership.owns(token)) finish(token); throw new Error('Installation could not be started. Check the tool status before trying again.'); }
   };
 
   return (
