@@ -515,7 +515,6 @@ import { judgeFallbackSettingsSnapshot, JudgeFallbackSettingError, persistJudgeF
 import { listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { modelRoleOptionCatalogSnapshot, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
-import { CodexRescueSettingsError, persistCodexRescueModel } from '../runtime/harness/codex-rescue-settings.js';
 import { modelDiscoveryStatus, refreshModelDiscoveryNow } from '../runtime/harness/model-discovery.js';
 import { getRateLimitSnapshot, classifyCodexQuota } from '../runtime/harness/rate-limit-store.js';
 import { getClaudeUsageSnapshot } from '../runtime/harness/claude-usage.js';
@@ -9000,7 +8999,7 @@ export function registerConsoleRoutes(
       const proactivity = getProactivityPolicySnapshot();
       const auth = getAuthStatus();
       const memory = readMemoryIndexStatus();
-      const models = getModelSettingsSnapshot(resolveProvider);
+      const models = getModelSettingsSnapshot();
       const runtimeBudget = getHarnessBudgetSnapshot();
       const byo = getByoBackendConfig();
       const modelBackend = {
@@ -9689,29 +9688,9 @@ export function registerConsoleRoutes(
         updateEnvKey(MODEL_ENV_KEYS[tier], next);
       }
       clearAutonomyAgentCache();
-      res.json({ models: getModelSettingsSnapshot(resolveProvider) });
+      res.json({ models: getModelSettingsSnapshot() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  // Explicit last-resort Codex lane for all-in BYO brains. This is deliberately
-  // independent of OPENAI_MODEL_PRIMARY: all-in routing may point that tier at
-  // GLM (or the operator may simply want a cheaper rescue model). Clearing the
-  // setting preserves the historical "follow primary" behavior.
-  app.patch('/api/console/settings/models/codex-rescue', (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    try {
-      const body = (req.body ?? {}) as { modelId?: unknown; clear?: unknown };
-      const rawModelId = typeof body.modelId === 'string' ? body.modelId.trim() : '';
-      const clear = body.clear === true || rawModelId === '';
-      persistCodexRescueModel(clear ? null : rawModelId);
-      resetHarnessRuntimeConfig();
-      clearAutonomyAgentCache();
-      res.json({ models: getModelSettingsSnapshot(resolveProvider) });
-    } catch (err) {
-      const status = err instanceof CodexRescueSettingsError ? 400 : 500;
-      res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
@@ -9803,7 +9782,7 @@ export function registerConsoleRoutes(
           hasKey: Boolean(byo.apiKey),
           configured: byo.configured,
         },
-        models: getModelSettingsSnapshot(resolveProvider),
+        models: getModelSettingsSnapshot(),
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

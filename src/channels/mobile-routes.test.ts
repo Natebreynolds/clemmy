@@ -4887,7 +4887,7 @@ test('mobile settings routes are session-gated: anon requests get 401 at every d
       const anon = await fetch(`${h.url}${p}`);
       assert.equal(anon.status, 401, `GET ${p} must demand a mobile session`);
     }
-    for (const p of ['/m/api/settings/models/brain', '/m/api/settings/models/role', '/m/api/settings/models/codex-rescue', '/m/api/tidy/apply', '/m/api/devices/dev-x/revoke', '/m/api/devices/revoke-all']) {
+    for (const p of ['/m/api/settings/models/brain', '/m/api/settings/models/role', '/m/api/tidy/apply', '/m/api/devices/dev-x/revoke', '/m/api/devices/revoke-all']) {
       const anon = await fetch(`${h.url}${p}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -4936,105 +4936,6 @@ test('brain switch serves the live catalog and rejects anything not a known mode
   } finally { await h.close(); }
 });
 
-test('Codex rescue route exposes exact connected options, persists one id, refreshes immediately, and clears to primary', async () => {
-  const previousPrimary = process.env.OPENAI_MODEL_PRIMARY;
-  const previousRescue = process.env.OPENAI_MODEL_RESCUE;
-  const authFile = path.join(TMP_ROOT, 'state', 'auth.json');
-  mkdirSync(path.dirname(authFile), { recursive: true });
-  writeFileSync(authFile, JSON.stringify({
-    source: 'native',
-    codexOauth: {
-      accessToken: 'mobile-route-test-access',
-      refreshToken: 'mobile-route-test-refresh',
-      accountId: 'mobile-route-test-account',
-      lastRefresh: new Date().toISOString(),
-    },
-  }), 'utf-8');
-  process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.6-sol';
-  delete process.env.OPENAI_MODEL_RESCUE;
-
-  const h = await startHarness();
-  try {
-    const cookie = await loginMobile(h, 'Rescue settings phone');
-    const initial = await fetch(`${h.url}/m/api/settings/models`, { headers: { cookie } });
-    assert.equal(initial.status, 200);
-    const initialBody = (await initial.json()) as {
-      codexRescue?: {
-        modelId?: string;
-        inheritedModelId?: string;
-        configured?: boolean;
-        options?: Array<{ id: string; label: string; available: boolean }>;
-      };
-    };
-    assert.equal(initialBody.codexRescue?.configured, false);
-    assert.equal(initialBody.codexRescue?.modelId, 'gpt-5.6-sol');
-    assert.ok((initialBody.codexRescue?.options?.length ?? 0) >= 2,
-      'the phone receives a meaningful connected Codex rescue catalog');
-    assert.ok(initialBody.codexRescue?.options?.every((option) => option.available),
-      'the initial picker catalog contains connected options, not hardcoded unavailable rows');
-    const selected = initialBody.codexRescue?.options
-      ?.find((option) => option.id !== initialBody.codexRescue?.inheritedModelId);
-    assert.ok(selected, 'a cheaper/different exact Codex option is available');
-
-    for (const invalid of ['glm-5.2', 'gpt-5.999-not-in-catalog']) {
-      const rejected = await fetch(`${h.url}/m/api/settings/models/codex-rescue`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', cookie },
-        body: JSON.stringify({ modelId: invalid }),
-      });
-      assert.equal(rejected.status, 400, `${invalid} must not enter the persisted Codex rescue setting`);
-      assert.equal(process.env.OPENAI_MODEL_RESCUE, undefined);
-    }
-
-    const saved = await fetch(`${h.url}/m/api/settings/models/codex-rescue`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', cookie },
-      body: JSON.stringify({ modelId: selected.id }),
-    });
-    assert.equal(saved.status, 200, await saved.clone().text());
-    const savedBody = (await saved.json()) as {
-      codexRescue?: { modelId?: string; inheritedModelId?: string; configured?: boolean };
-    };
-    assert.equal(savedBody.codexRescue?.modelId, selected.id);
-    assert.equal(savedBody.codexRescue?.configured, true);
-    assert.equal(process.env.OPENAI_MODEL_RESCUE, selected.id, 'the live process sees the persisted choice immediately');
-    const persisted = await readFile(path.join(TMP_ROOT, '.env'), 'utf-8');
-    assert.ok(persisted.split(/\r?\n/).includes(`OPENAI_MODEL_RESCUE=${selected.id}`));
-
-    const refreshed = await fetch(`${h.url}/m/api/settings/models`, { headers: { cookie } });
-    const refreshedBody = (await refreshed.json()) as { codexRescue?: { modelId?: string; configured?: boolean } };
-    assert.equal(refreshedBody.codexRescue?.modelId, selected.id);
-    assert.equal(refreshedBody.codexRescue?.configured, true);
-
-    const cleared = await fetch(`${h.url}/m/api/settings/models/codex-rescue`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', cookie },
-      body: JSON.stringify({ clear: true }),
-    });
-    assert.equal(cleared.status, 200, await cleared.clone().text());
-    const clearedBody = (await cleared.json()) as {
-      codexRescue?: { modelId?: string; inheritedModelId?: string; configured?: boolean };
-    };
-    assert.equal(clearedBody.codexRescue?.configured, false);
-    assert.equal(clearedBody.codexRescue?.modelId, 'gpt-5.6-sol');
-    assert.equal(clearedBody.codexRescue?.inheritedModelId, 'gpt-5.6-sol');
-    assert.equal(process.env.OPENAI_MODEL_RESCUE, undefined);
-    assert.doesNotMatch(await readFile(path.join(TMP_ROOT, '.env'), 'utf-8'), /^OPENAI_MODEL_RESCUE=/m);
-  } finally {
-    await h.close();
-    const { removeEnvKey } = await import('../tools/shared.js');
-    removeEnvKey('OPENAI_MODEL_RESCUE');
-    rmSync(authFile, { force: true });
-    if (previousPrimary === undefined) delete process.env.OPENAI_MODEL_PRIMARY;
-    else process.env.OPENAI_MODEL_PRIMARY = previousPrimary;
-    if (previousRescue === undefined) delete process.env.OPENAI_MODEL_RESCUE;
-    else process.env.OPENAI_MODEL_RESCUE = previousRescue;
-  }
-});
-
-// The phone sets who writes the final answer, who checks the work and who helps
-// in parallel through the same owner as desktop Settings: exact connected ids,
-// refusals that write nothing, and clear back to automatic.
 test('phone fallback judge setting shares the desktop policy and requires authentication', async () => {
   const keys = ['AUTH_MODE', 'MODEL_ROUTING_MODE', 'BYO_MODEL_BASE_URL', 'BYO_MODEL_API_KEY', 'BYO_MODEL_ID',
     'CLEMMY_JUDGE_FALLBACK', 'CLEMMY_JUDGE_CHAIN'];

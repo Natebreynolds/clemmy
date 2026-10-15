@@ -402,12 +402,6 @@ export const MODEL_PRESETS = [
   { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol (frontier)' },
 ];
 
-/** A Codex-only last-resort lane for cross-provider brain fallover. This stays
- * separate from OPENAI_MODEL_PRIMARY because all-in BYO routing may repurpose
- * the primary tier while an operator still wants a specific, cheaper Codex
- * rescue. Unset deliberately preserves the legacy "follow primary" behavior. */
-export const CODEX_RESCUE_MODEL_ENV_KEY = 'OPENAI_MODEL_RESCUE';
-
 export function normalizeModelId(value: unknown, fallback: string): string {
   const raw = typeof value === 'string' ? value.trim() : '';
   if (!raw) return fallback;
@@ -425,50 +419,12 @@ export const MODELS: Models = {
   get deep() { return getModelForTier('deep'); },
 };
 
-export interface CodexRescueModelSelection {
-  modelId: string;
-  inheritedModelId: string;
-  envKey: typeof CODEX_RESCUE_MODEL_ENV_KEY;
-  configured: boolean;
-}
-
-export type ModelProviderResolver = (modelId: string) => 'codex' | 'claude' | 'byo';
-
-function codexSafeRescueInheritedModelId(resolveModelProvider: ModelProviderResolver): string {
-  const primary = MODELS.primary;
-  try {
-    return resolveModelProvider(primary) === 'codex' ? primary : DEFAULT_CODEX_MODEL;
-  } catch {
-    return DEFAULT_CODEX_MODEL;
-  }
-}
-
-/** Resolve the explicit Codex rescue setting without guessing from a display
- * label. Provider ownership is validated at the settings/router edges. The
- * inherited lane is also provider-attested here so a primary slot repurposed
- * for GLM/another BYO model cannot make a "Codex rescue" claim that the Codex
- * adapter later and silently rewrites to its own default. */
-export function getCodexRescueModelSelection(
-  resolveModelProvider: ModelProviderResolver,
-): CodexRescueModelSelection {
-  const inheritedModelId = codexSafeRescueInheritedModelId(resolveModelProvider);
-  const raw = (getRuntimeEnv(CODEX_RESCUE_MODEL_ENV_KEY, '') || '').trim();
-  const configuredModelId = normalizeModelId(raw, '');
-  return {
-    modelId: configuredModelId || inheritedModelId,
-    inheritedModelId,
-    envKey: CODEX_RESCUE_MODEL_ENV_KEY,
-    configured: Boolean(configuredModelId),
-  };
-}
-
-export function getModelSettingsSnapshot(resolveModelProvider: ModelProviderResolver): {
+export function getModelSettingsSnapshot(): {
   models: Models;
   defaults: Models;
   envKeys: Record<ModelTier, string>;
   presets: typeof MODEL_PRESETS;
   processEnvOverrides: Record<ModelTier, boolean>;
-  codexRescue: CodexRescueModelSelection;
 } {
   return {
     models: {
@@ -484,7 +440,6 @@ export function getModelSettingsSnapshot(resolveModelProvider: ModelProviderReso
       primary: process.env[MODEL_ENV_KEYS.primary] !== undefined,
       deep: process.env[MODEL_ENV_KEYS.deep] !== undefined,
     },
-    codexRescue: getCodexRescueModelSelection(resolveModelProvider),
   };
 }
 

@@ -161,30 +161,24 @@ test('the Models card names each part of a request and picks only from the live 
   assert.doesNotMatch(sheet, /<input/i, 'the role picker is taps only');
 });
 
-test('the mobile model API owns an exact rescue snapshot and credential-free save call', () => {
+test('the mobile model API saves the owner\'s backup order with exact ids and no credentials', () => {
   const api = read('../lib/api.ts');
-  assert.match(api, /codexRescue\?: CodexRescueSettings/,
-    'the model-settings response carries the daemon-owned rescue snapshot');
-  assert.match(api, /setCodexRescueModel\(modelId: string \| null\)/);
-  assert.match(api, /\/m\/api\/settings\/models\/codex-rescue/);
-  assert.match(api, /modelId === null \? \{ clear: true \} : \{ modelId \}/,
-    'the only mobile write is an exact model id or a clear request');
-  assert.doesNotMatch(api, /codexRescue[\s\S]{0,500}(apiKey|accessToken|refreshToken|password)/i,
-    'the rescue API never carries credentials');
+  assert.match(api, /brainBackups\?: BrainBackupsSettings/,
+    'the model-settings response carries the daemon-owned backup list');
+  assert.match(api, /setBrainBackups\(modelIds: string\[\]\)/);
+  assert.match(api, /\/m\/api\/settings\/models\/brain-backups/);
+  assert.doesNotMatch(api, /brainBackups[\s\S]{0,500}(apiKey|accessToken|refreshToken|password)/i,
+    'the backup API never carries credentials');
 });
 
-test('Settings shows rescue only for a meaningful live catalog and refreshes after save', () => {
+test('Settings offers backups only from the connected catalog and refreshes after save', () => {
   const settings = read('../screens/Settings.tsx');
-  assert.match(settings, /settings\.options\.filter\(\(option\) => option\.available\)\.length < 2\) return null/,
-    'one/no connected Codex choice does not create a meaningless selector');
-  assert.match(settings, /settings\.options\.map\(\(option\)/,
-    'every concrete option is rendered from the daemon response');
-  assert.match(settings, /value=\{option\.id\}/,
+  assert.match(settings, /option\.available && option\.modelId && option\.modelId !== settings\.brain\.modelId/,
+    'only connected models other than the one doing the work are offered');
+  assert.match(settings, /value=\{option\.modelId\}/,
     'the selected value is the exact catalog id, never a label heuristic');
-  assert.match(settings, /await setCodexRescueModel[\s\S]*?await onChanged\(\)/,
+  assert.match(settings, /await setBrainBackups[\s\S]*?await onChanged\(\)/,
     'a successful save refreshes the parent model snapshot before settling');
-  assert.match(settings, /Follow primary \(\{settings\.inheritedModelId\}\)/,
-    'the clear choice displays the live inherited primary rather than a hardcoded model');
 });
 
 test('the keyboard stays in daylight: color-scheme meta + shell trait override', () => {

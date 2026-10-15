@@ -17,12 +17,11 @@ import {
   revokeAllDevices,
   revokeDevice,
   setApprovalMode,
-  setCodexRescueModel,
+  setBrainBackups,
   setHeartbeatNotify,
   setJudgeFallback,
   type ApprovalModeSettings,
   type JudgeFallbackSetting,
-  type CodexRescueSettings,
   type MobileDeviceRow,
   type ModelRoleName,
   type ModelSettings,
@@ -620,8 +619,6 @@ function ModelsCard({ loaded, onRefresh }: {
     }
   };
 
-  const rescue = settings?.codexRescue;
-  const rescueMeaningful = (rescue?.options.filter((option) => option.available).length ?? 0) >= 2;
   const warning = settings ? sameFamilyWarning(settings) : null;
   const reviewOff = review.data ? !review.data.enabled : false;
 
@@ -639,6 +636,7 @@ function ModelsCard({ loaded, onRefresh }: {
             warning={inactiveNote(settings.brain, settings)}
             onOpen={() => setBrainOpen(true)}
           />
+          <BrainBackupsRow settings={settings} onChanged={onRefresh} />
           {(['writer', 'judge', 'worker', 'memory', 'quick'] as const).map((role) => settings.roles?.[role] ? (
             <Fragment key={role}>
               <RoleRow
@@ -658,12 +656,6 @@ function ModelsCard({ loaded, onRefresh }: {
             </Fragment>
           ) : null)}
           {warning ? <p class="warning card-note model-roles-warning">{warning}</p> : null}
-          {rescue && rescueMeaningful ? (
-            <details class="settings-advanced">
-              <summary>Advanced</summary>
-              <CodexRescueRow settings={rescue} onChanged={onRefresh} />
-            </details>
-          ) : null}
         </>
       )}
       <BrainSheet open={brainOpen} onClose={() => setBrainOpen(false)} onChanged={() => void onRefresh()} />
@@ -709,7 +701,7 @@ function FallbackJudgeRow({ settings, onChanged }: {
     }
   };
   return (
-    <div class="settings-rescue settings-fallback">
+    <div class="settings-fallback">
       <label class="settings-row" for="judge-fallback-model">
         <span class="settings-row-main">
           <span class="settings-row-label">Backup checker</span>
@@ -820,53 +812,71 @@ function clockTime(epochMs: number): string {
     : d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
-/** Shown only when there is a meaningful choice. Every option id and label is
- * supplied by the daemon's connected Codex catalog; the phone never guesses a
- * provider from text or exposes a credential field. */
-function CodexRescueRow({ settings, onChanged }: {
-  settings: CodexRescueSettings;
+/** The owner's backup brains, in order: tried only when the model doing the
+ * work stops answering. Every option comes from the daemon's connected brain
+ * catalog; the phone never guesses a provider or exposes a credential field. */
+function BrainBackupsRow({ settings, onChanged }: {
+  settings: ModelSettings;
   onChanged: () => Promise<void> | void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  if (settings.options.filter((option) => option.available).length < 2) return null;
+  const backups = settings.brainBackups;
+  if (!backups) return null;
+  const choices = settings.options.filter((option) => option.available && option.modelId && option.modelId !== settings.brain.modelId);
+  const label = (id: string) => settings.options.find((option) => option.modelId === id)?.label ?? id;
 
-  const save = async (value: string) => {
+  const save = async (slot: number, value: string) => {
+    const current = backups.modelIds;
+    const next = value === '__none__' ? current.slice(0, slot) : [...current.slice(0, slot), value, ...current.slice(slot + 1)];
     setBusy(true);
     setError(null);
     try {
-      await setCodexRescueModel(value === '__primary__' ? null : value);
+      await setBrainBackups(next.filter((id, index) => next.indexOf(id) === index));
       haptic('light');
       await onChanged();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not save the rescue model');
+      setError(err instanceof Error ? err.message : 'Could not save the backups');
     } finally {
       setBusy(false);
     }
   };
 
+  const outage = backups.outage;
+  const note = outage
+    ? outage.status === 'recovered'
+      ? `${label(outage.downModelId)} answers again. ${label(outage.standInModelId)} keeps answering until you choose on Home.`
+      : `${label(outage.downModelId)} stopped answering, so ${label(outage.standInModelId)} is answering for now.`
+    : backups.modelIds.length === 0
+      ? 'No backup: if it stops answering, Clem waits for it.'
+      : 'Tried in order. Clem switches every chat, then tells you.';
+
   return (
-    <div class="settings-rescue">
-      <label class="settings-row" for="codex-rescue-model">
-        <span class="brain-dot ok" aria-hidden="true" />
+    <div class="settings-backups">
+      <div class="settings-row">
         <span class="settings-row-main">
-          <span class="settings-row-label">Codex backup</span>
-          <span class="settings-row-note">Answers only if an API-key model doing the work fails before replying.</span>
+          <span class="settings-row-label">If it stops answering</span>
+          <span class={outage ? 'settings-row-note warning' : 'settings-row-note'}>{note}</span>
         </span>
+      </div>
+      {[0, 1, 2].filter((slot) => slot <= backups.modelIds.length).map((slot) => (
         <select
-          id="codex-rescue-model"
+          key={`backup-${slot}`}
           class="settings-select"
-          aria-label="Codex rescue model"
+          aria-label={`Backup model ${slot + 1}`}
           disabled={busy}
-          value={settings.configured ? settings.modelId : '__primary__'}
-          onChange={(event) => void save(event.currentTarget.value)}
+          value={backups.modelIds[slot] ?? '__none__'}
+          onChange={(event) => void save(slot, event.currentTarget.value)}
         >
-          <option value="__primary__">Follow primary ({settings.inheritedModelId})</option>
-          {settings.options.map((option) => (
-            <option key={option.id} value={option.id} disabled={!option.available}>{option.label}</option>
+          <option value="__none__">{slot === 0 ? 'No backup' : 'No more backups'}</option>
+          {choices.map((option) => (
+            <option key={option.value} value={option.modelId}
+              disabled={backups.modelIds.includes(option.modelId!) && backups.modelIds[slot] !== option.modelId}>
+              {slot + 1}. {option.label}
+            </option>
           ))}
         </select>
-      </label>
+      ))}
       {error ? <p class="error card-note">{error}</p> : null}
     </div>
   );

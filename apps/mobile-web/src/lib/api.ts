@@ -1882,18 +1882,17 @@ export interface BrainOptionRow {
   providerId?: string;
 }
 
-export interface CodexRescueModelOption {
-  id: string;
-  label: string;
-  available: boolean;
-}
-
-export interface CodexRescueSettings {
-  modelId: string;
-  inheritedModelId: string;
-  envKey: 'OPENAI_MODEL_RESCUE';
-  configured: boolean;
-  options: CodexRescueModelOption[];
+/** The owner's backup brains, in order, and an outage they are covering. */
+export interface BrainBackupsSettings {
+  modelIds: string[];
+  /** Listed models no connected account serves right now. */
+  unavailable: string[];
+  outage: {
+    id: string;
+    downModelId: string;
+    standInModelId: string;
+    status: 'open' | 'recovered';
+  } | null;
 }
 
 /** The roles the phone can bind to a model. The brain has its own switch.
@@ -1917,7 +1916,7 @@ export interface ModelSettings {
   effectiveValue: string;
   activeBrain: string;
   /** Optional for cached PWAs talking briefly to an older daemon. */
-  codexRescue?: CodexRescueSettings;
+  brainBackups?: BrainBackupsSettings;
   /** Who writes the final answer, checks the work, helps in parallel and
    *  keeps your memory, as the daemon resolves them. Each is optional for an
    *  older daemon, and a role it leaves out is not shown. */
@@ -2041,12 +2040,12 @@ export async function setModelRole(role: ModelRoleName, modelId: string | null):
   });
 }
 
-/** Pick an exact server-catalogued Codex rescue id, or null to follow the
- * primary again. No credential material crosses this mobile API. */
-export async function setCodexRescueModel(modelId: string | null): Promise<{ ok: boolean; codexRescue: CodexRescueSettings }> {
-  return api('/m/api/settings/models/codex-rescue', {
-    method: 'POST',
-    body: JSON.stringify(modelId === null ? { clear: true } : { modelId }),
+/** Save the backup order: exact connected model ids from the daemon's brain
+ * catalog; an empty list turns backups off. No credential crosses this API. */
+export async function setBrainBackups(modelIds: string[]): Promise<{ brainBackups: BrainBackupsSettings }> {
+  return api('/m/api/settings/models/brain-backups', {
+    method: 'PATCH',
+    body: JSON.stringify({ modelIds }),
   });
 }
 

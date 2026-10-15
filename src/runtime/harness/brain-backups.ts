@@ -133,7 +133,6 @@ export interface BrainBackupsSnapshot {
   modelIds: string[];
   /** Listed models no connected account serves right now. */
   unavailable: string[];
-  options: Array<{ modelId: string; label: string; value: string }>;
   outage: BrainOutageV1 | null;
 }
 
@@ -145,9 +144,6 @@ export function brainBackupsSnapshot(): BrainBackupsSnapshot {
   return {
     modelIds,
     unavailable: modelIds.filter((id) => !available.has(id)),
-    options: options
-      .filter((o) => o.available && o.modelId)
-      .map((o) => ({ modelId: o.modelId as string, label: o.label, value: o.value })),
     outage: currentBrainOutage(),
   };
 }

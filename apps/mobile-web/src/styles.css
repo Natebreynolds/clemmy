@@ -3123,10 +3123,13 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .settings-row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
 .settings-row-label { font-size: var(--t-body); font-weight: 650; }
 .settings-row-note { font-size: var(--t-xs); color: var(--fg-3); }
-.settings-rescue {
-  border-top: 1px solid var(--line);
-  margin-top: var(--sp-1);
+.settings-backups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding-bottom: var(--sp-2);
 }
+.settings-backups .settings-select { flex: 1 1 auto; width: 100%; }
 .settings-select {
   flex: 0 1 min(48%, 210px);
   min-width: 0;
@@ -3140,6 +3143,10 @@ input, textarea, select { font: inherit; font-size: 16px; }
   font-size: var(--t-sm);
 }
 .settings-select:disabled { color: var(--fg-3); }
+.settings-fallback {
+  border-top: 1px solid var(--line);
+  margin-top: var(--sp-1);
+}
 .settings-fallback .settings-row { flex-wrap: wrap; }
 .settings-fallback .settings-select { flex: 1 1 100%; }
 .settings-row-action {
@@ -3373,35 +3380,10 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .brain-note.switched { color: var(--accent-2); font-weight: 650; }
 
 /* Models card: one row per part of a request, each opening a picker over the
-   connected catalog. Rarely changed options fold under Advanced. */
+   connected catalog. */
 .model-role-row + .model-role-row { border-top: 1px solid var(--line); }
 .model-role-row .settings-row-note.warning { color: var(--accent-warn); }
 .model-roles-warning { margin: var(--sp-2) 0 0; }
-.settings-advanced { border-top: 1px solid var(--line); margin-top: var(--sp-1); }
-.settings-advanced > summary {
-  display: flex;
-  align-items: center;
-  min-height: 44px;
-  list-style: none;
-  cursor: pointer;
-  font-size: var(--t-sm);
-  font-weight: 650;
-  color: var(--fg-2);
-}
-.settings-advanced > summary::-webkit-details-marker { display: none; }
-.settings-advanced > summary::after {
-  content: '›';
-  margin-left: auto;
-  font-size: 18px;
-  color: var(--fg-3);
-  transition: transform 0.2s var(--ease-out);
-}
-.settings-advanced[open] > summary::after { transform: rotate(90deg); }
-.settings-advanced .settings-rescue { border-top: 0; margin-top: 0; }
-/* Under Advanced the backup's menu gets its own line, so its choice is legible. */
-.settings-advanced .settings-rescue .settings-row { flex-wrap: wrap; }
-.settings-advanced .settings-rescue .settings-select { flex: 1 1 100%; }
-.settings-advanced .settings-rescue .brain-dot { display: none; }
 
 .role-explain { margin: var(--sp-1) 0 var(--sp-2); font-size: var(--t-sm); color: var(--fg-2); }
 .role-review { border-bottom: 1px solid var(--line); }
@@ -3415,9 +3397,6 @@ input, textarea, select { font: inherit; font-size: 16px; }
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--fg-3);
-}
-@media (prefers-reduced-motion: reduce) {
-  .settings-advanced > summary::after { transition: none; }
 }
 
 

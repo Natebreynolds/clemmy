@@ -6392,7 +6392,6 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   const modelSettingsSnapshot = async () => {
     const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
     const { effectiveBrainValue, modelRoleOptionCatalogSnapshot } = await import('../runtime/harness/model-role-options.js');
-    const { codexRescueSettingsSnapshot } = await import('../runtime/harness/codex-rescue-settings.js');
     const { judgeFallbackSettingsSnapshot } = await import('../runtime/harness/judge-fallback-settings.js');
     const { checkerSettingsFacts, judgeReviewsOwnFamily } = await import('../runtime/harness/debate-model.js');
     const { memoryRoleSettingsView } = await import('../memory/memory-model-route.js');
@@ -6423,10 +6422,6 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       judgeReviewsOwnFamily: judgeReviewsOwnFamily(),
       // The desktop's checker facts: independence, and what Automatic backs up with.
       checker: checkerSettingsFacts(),
-      // Exact connected Codex ids only. The phone never derives provider
-      // identity or accepts credentials; console and mobile share one
-      // validation + persistence owner for OPENAI_MODEL_RESCUE.
-      codexRescue: codexRescueSettingsSnapshot(catalog),
       // The owner's backup brains, in order, and an outage they are covering.
       brainBackups: (await import('../runtime/harness/brain-backups.js')).brainBackupsSnapshot(),
     };
@@ -6523,39 +6518,6 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const status = err instanceof ModelRoleSettingError ? 400 : 500;
       res.status(status).json({
         error: err instanceof ModelRoleSettingError ? err.code : 'MODEL_ROLE_SAVE_FAILED',
-        message: err instanceof Error ? err.message : String(err),
-      });
-    }
-  });
-
-  router.post('/api/settings/models/codex-rescue', requireMobileSession, async (req, res) => {
-    try {
-      const {
-        CodexRescueSettingsError,
-        persistCodexRescueModel,
-      } = await import('../runtime/harness/codex-rescue-settings.js');
-      const rawModelId = typeof req.body?.modelId === 'string' ? req.body.modelId.trim() : '';
-      const clear = req.body?.clear === true;
-      if (!clear && !rawModelId) {
-        res.status(400).json({
-          error: 'INVALID_CODEX_RESCUE_MODEL',
-          message: 'Choose an exact Codex model id, or clear the rescue override.',
-        });
-        return;
-      }
-      const codexRescue = persistCodexRescueModel(clear ? null : rawModelId);
-
-      // Apply on the next turn without restarting, matching the console door.
-      const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
-      const { clearAutonomyAgentCache } = await import('../agents/autonomy-v2.js');
-      resetHarnessRuntimeConfig();
-      clearAutonomyAgentCache();
-      res.json({ ok: true, codexRescue });
-    } catch (err) {
-      const { CodexRescueSettingsError } = await import('../runtime/harness/codex-rescue-settings.js');
-      const status = err instanceof CodexRescueSettingsError ? 400 : 500;
-      res.status(status).json({
-        error: err instanceof CodexRescueSettingsError ? err.code : 'CODEX_RESCUE_SAVE_FAILED',
         message: err instanceof Error ? err.message : String(err),
       });
     }
