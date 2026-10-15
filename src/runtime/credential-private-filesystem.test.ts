@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { chmodSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs';
+import { chmodSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -176,4 +178,162 @@ test('optional absent public sources do not require private parent ACL while pre
   assert.throws(() => policy.readCredentialSourceFileSync(target), CredentialStoragePrivacyError);
   const alias = path.join(root, 'dangling'); symlinkSync(path.join(root, 'absent'), alias, 'junction');
   assert.throws(() => policy.readCredentialSourceFileSync(path.join(alias, '.env')), CredentialStoragePrivacyError);
+}));
+
+test('explicit private text writes create and repeatedly rotate .env bytes through the Windows policy', () => fixture(root => {
+  const hardened: string[] = [];
+  const policy = createCredentialFilePolicy({ platform: 'win32', checkAcl: (file, _identity, kind, harden) => {
+    if (harden && kind === 'file') {
+      assert.equal(readFileSync(file).length, 0, 'private hardening precedes any credential bytes');
+      hardened.push(file);
+    }
+  } });
+  for (const existing of [false, true]) {
+    const target = path.join(root, existing ? 'existing.env' : 'new', '.env');
+    if (existing) { mkdirSync(path.dirname(target)); writeFileSync(target, 'CONTROLLED_KEY=old\n'); }
+    for (const value of ['CONTROLLED_KEY="synthetic first"\n', 'CONTROLLED_KEY=" second with spaces "\n']) {
+      policy.writeCredentialTextFileSync(target, value);
+      assert.equal(policy.readCredentialSourceFileSync(target), value);
+      if (process.platform !== 'win32') assert.equal(lstatSync(target).mode & 0o777, 0o600);
+    }
+  }
+  assert.equal(hardened.length, 4, 'every text publication hardens an exclusive empty temporary file');
+}));
+
+test('the JSON writer still rejects malformed and non-object existing text without publication', () => fixture(root => {
+  const policy = createCredentialFilePolicy({ platform: 'win32', checkAcl: () => {} });
+  const target = path.join(root, 'vault.json');
+  for (const before of ['CONTROLLED_KEY=synthetic-private-marker\n', '{"synthetic-private-marker": malformed}', '[]', 'null', '42', '"synthetic-private-marker"']) {
+    writeFileSync(target, before);
+    const identity = lstatSync(target, { bigint: true });
+    assert.throws(() => policy.writeCredentialFileSync(target, '{"replacement":true}'), (error: unknown) => {
+      assert.ok(error instanceof CredentialStoragePrivacyError);
+      assert.equal(error.cause, undefined);
+      assert.doesNotMatch(String(error.stack), /synthetic-private-marker/);
+      return true;
+    });
+    assert.equal(readFileSync(target, 'utf8'), before);
+    assert.equal(lstatSync(target, { bigint: true }).ino, identity.ino);
+    assert.deepEqual(readdirSync(root), ['vault.json'], 'a refusal leaves no temporary file');
+  }
+}));
+
+test('private text mode retains weak ACL, symlink, hardlink and directory refusals', () => fixture(root => {
+  const target = path.join(root, 'retained.env'); const retained = 'CONTROLLED_KEY=synthetic-private-marker\n';
+  writeFileSync(target, retained);
+  const weak = createCredentialFilePolicy({ platform: 'win32', checkAcl: file => {
+    if (file === target) throw new Error('synthetic-private-marker');
+  } });
+  assert.throws(() => weak.writeCredentialTextFileSync(target, 'CONTROLLED_KEY=replacement\n'), (error: unknown) => {
+    assert.ok(error instanceof CredentialStoragePrivacyError);
+    assert.equal(error.cause, undefined); assert.doesNotMatch(String(error.stack), /synthetic-private-marker/);
+    return true;
+  });
+  assert.equal(readFileSync(target, 'utf8'), retained);
+  const policy = createCredentialFilePolicy({ platform: 'win32', checkAcl: () => {} });
+  const alias = path.join(root, 'hardlink.env'); linkSync(target, alias);
+  for (const entry of [target, alias, root]) {
+    assert.throws(() => policy.writeCredentialTextFileSync(entry, 'CONTROLLED_KEY=replacement\n'), CredentialStoragePrivacyError);
+  }
+  if (process.platform !== 'win32') {
+    const symlink = path.join(root, 'symlink.env'); symlinkSync(target, symlink);
+    assert.throws(() => policy.writeCredentialTextFileSync(symlink, 'CONTROLLED_KEY=replacement\n'), CredentialStoragePrivacyError);
+    assert.equal(lstatSync(symlink).isSymbolicLink(), true);
+  }
+  assert.equal(readFileSync(target, 'utf8'), retained);
+  assert.equal(readFileSync(alias, 'utf8'), retained);
+}));
+
+for (const race of ['replaced', 'changed-in-place'] as const) {
+  test(`private text publication refuses a target ${race} during temporary-file hardening`, () => fixture(root => {
+    const target = path.join(root, '.env'); const prior = 'CONTROLLED_KEY=retained\n'; writeFileSync(target, prior);
+    const raced = 'CONTROLLED_KEY=synthetic-external-replacement\n'; let crossed = false;
+    const policy = createCredentialFilePolicy({ platform: 'win32', checkAcl: (file, _identity, kind, harden) => {
+      if (kind === 'file' && harden && !crossed) {
+        crossed = true;
+        assert.equal(readFileSync(file).length, 0);
+        if (race === 'replaced') {
+          const replacement = path.join(root, 'replacement.env'); writeFileSync(replacement, raced);
+          renameSync(target, path.join(root, 'retained-aside.env')); renameSync(replacement, target);
+        } else writeFileSync(target, raced);
+      }
+    } });
+    assert.throws(() => policy.writeCredentialTextFileSync(target, 'CONTROLLED_KEY=must-not-publish\n', { expectedPrior: prior }), CredentialStoragePrivacyError);
+    assert.equal(crossed, true);
+    assert.equal(readFileSync(target, 'utf8'), raced, 'never overwrite or delete the other writer’s current bytes');
+    assert.equal(readdirSync(root).some(name => name.endsWith('.tmp')), false, 'only this write’s owned temporary file is removed');
+  }));
+}
+
+test('private text mode retains the bounded-size refusal and static error', () => fixture(root => {
+  const target = path.join(root, '.env'); const retained = 'CONTROLLED_KEY=retained\n'; writeFileSync(target, retained);
+  const policy = createCredentialFilePolicy({ platform: 'win32', checkAcl: () => {} });
+  assert.throws(() => policy.writeCredentialTextFileSync(target, 'x'.repeat(8 * 1024 * 1024 + 1)), CredentialStoragePrivacyError);
+  assert.equal(readFileSync(target, 'utf8'), retained);
+  assert.deepEqual(readdirSync(root), ['.env']);
+}));
+
+for (const platform of ['win32', 'darwin'] as const) {
+  test(`${platform} text composition refuses a source changed before the writer's first read`, () => fixture(root => {
+    const target = path.join(root, '.env');
+    const composedPrior = 'UNRELATED=synthetic-composed-prior\nCONTROLLED_KEY=old\n';
+    writeFileSync(target, composedPrior);
+    const replacement = 'UNRELATED=synthetic-other-writer\nCONTROLLED_KEY=other\n';
+    writeFileSync(target, replacement);
+    const before = lstatSync(target, { bigint: true });
+    let hardened = false;
+    const policy = createCredentialFilePolicy({ platform, checkAcl: (_file, _identity, _kind, harden) => { hardened ||= Boolean(harden); } });
+    assert.throws(() => policy.writeCredentialTextFileSync(target, 'CONTROLLED_KEY=must-not-publish\n', {
+      expectedPrior: composedPrior,
+    }), (error: unknown) => {
+      assert.ok(error instanceof CredentialStoragePrivacyError);
+      assert.equal(error.cause, undefined);
+      assert.doesNotMatch(String(error.stack), /synthetic-(?:composed-prior|other-writer)/);
+      return true;
+    });
+    assert.equal(hardened, false, 'a stale composition is rejected before staging');
+    assert.equal(readFileSync(target, 'utf8'), replacement);
+    assert.equal(lstatSync(target, { bigint: true }).ino, before.ino);
+    assert.deepEqual(readdirSync(root), ['.env']);
+  }));
+
+  test(`${platform} text composition distinguishes expected absence from an omitted or inherited precondition`, () => fixture(root => {
+    const target = path.join(root, '.env');
+    const policy = createCredentialFilePolicy({ platform, checkAcl: () => {} });
+    policy.writeCredentialTextFileSync(target, 'CONTROLLED_KEY=created\n', { expectedPrior: undefined });
+    assert.throws(() => policy.writeCredentialTextFileSync(target, 'CONTROLLED_KEY=must-not-publish\n', {
+      expectedPrior: undefined,
+    }), CredentialStoragePrivacyError);
+    assert.equal(readFileSync(target, 'utf8'), 'CONTROLLED_KEY=created\n');
+    policy.writeCredentialTextFileSync(target, 'CONTROLLED_KEY=no-pin\n');
+    assert.equal(readFileSync(target, 'utf8'), 'CONTROLLED_KEY=no-pin\n');
+    policy.writeCredentialTextFileSync(target, 'CONTROLLED_KEY=inherited-is-not-a-pin\n',
+      Object.create({ expectedPrior: 'not-the-current-value' }));
+    assert.equal(readFileSync(target, 'utf8'), 'CONTROLLED_KEY=inherited-is-not-a-pin\n');
+  }));
+}
+
+test('POSIX text composition checks again after staging and preserves another writer’s bytes', (t) => fixture(root => {
+  const target = path.join(root, '.env'); const prior = 'CONTROLLED_KEY=retained\n';
+  const replacement = 'CONTROLLED_KEY=other-writer\n'; writeFileSync(target, prior);
+  const policy = createCredentialFilePolicy({ platform: 'darwin' });
+  const realWrite = fs.writeFileSync; let raced = false;
+  t.mock.method(fs, 'writeFileSync', (...args: Parameters<typeof fs.writeFileSync>) => {
+    const result = Reflect.apply(realWrite, fs, args);
+    if (!raced && typeof args[0] === 'string' && args[0].endsWith('.tmp')) {
+      raced = true; realWrite(target, replacement);
+    }
+    return result;
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => policy.writeCredentialTextFileSync(target, 'CONTROLLED_KEY=must-not-publish\n', {
+      expectedPrior: prior,
+    }), CredentialStoragePrivacyError);
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+  }
+  assert.equal(raced, true);
+  assert.equal(readFileSync(target, 'utf8'), replacement);
+  assert.deepEqual(readdirSync(root), ['.env'], 'owned temporary bytes are cleaned after stale composition refusal');
 }));

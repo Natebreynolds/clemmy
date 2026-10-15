@@ -124,14 +124,27 @@ export function createCredentialFilePolicy(dependencies: { platform?: NodeJS.Pla
     } catch (cause) { throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause); }
     finally { if (fd !== undefined) closeSync(fd); }
   };
-  const write = (target: string, content: string): void => {
+  const write = (target: string, content: string, format: 'json-object' | 'text',
+    options?: { expectedPrior: string | undefined }): void => {
+    const pinsPrior = format === 'text' && options !== undefined && Object.hasOwn(options, 'expectedPrior');
+    const assertExpectedPrior = (observed: string | undefined): void => {
+      if (pinsPrior && observed !== options!.expectedPrior) throw new CredentialStoragePrivacyError();
+    };
     if (!windows) {
+      if (pinsPrior) {
+        try { assertExpectedPrior(read(target)); }
+        catch (cause) { throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause); }
+      }
       mkdirSync(path.dirname(target), { recursive: true });
       const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
       try {
         writeFileSync(temporary, content, { encoding: 'utf8', mode: 0o600 });
+        if (pinsPrior) assertExpectedPrior(read(target));
         renameSync(temporary, target);
         try { chmodSync(target, 0o600); } catch { /* preserve existing POSIX best-effort semantics */ }
+      } catch (cause) {
+        if (pinsPrior) throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
+        throw cause;
       } finally { try { unlinkSync(temporary); } catch { /* already published */ } }
       return;
     }
@@ -141,9 +154,11 @@ export function createCredentialFilePolicy(dependencies: { platform?: NodeJS.Pla
     try {
       if (Buffer.byteLength(content) > MAX_CREDENTIAL_BYTES) throw new CredentialStoragePrivacyError();
       const prior = read(target);
-      // An invalid-present file must not become an empty writable store. The
-      // caller additionally checks its own wallet/vault schema before writing.
-      if (prior !== undefined) {
+      assertExpectedPrior(prior);
+      // An invalid-present JSON store must not become an empty writable store.
+      // Wallet/vault callers additionally check their own schema. The explicit
+      // text entry point accepts .env bytes with every filesystem check intact.
+      if (prior !== undefined && format === 'json-object') {
         const parsed: unknown = JSON.parse(prior);
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new CredentialStoragePrivacyError();
       }
@@ -162,7 +177,9 @@ export function createCredentialFilePolicy(dependencies: { platform?: NodeJS.Pla
       if (!regular(written) || written.dev !== empty.dev || written.ino !== empty.ino || !same(written, lstatSync(temporary, { bigint: true }))) throw new CredentialStoragePrivacyError();
       checkAcl(temporary, written, 'file');
       privateDirectory(directory);
-      if (read(target) !== prior || (priorIdentity && !same(priorIdentity, lstatSync(target, { bigint: true })))) throw new CredentialStoragePrivacyError();
+      const current = read(target);
+      assertExpectedPrior(current);
+      if (current !== prior || (priorIdentity && !same(priorIdentity, lstatSync(target, { bigint: true })))) throw new CredentialStoragePrivacyError();
       closeSync(fd); fd = undefined;
       renameSync(temporary, target); temporary = undefined;
       syncDirectoryMetadata(directory);
@@ -184,7 +201,11 @@ export function createCredentialFilePolicy(dependencies: { platform?: NodeJS.Pla
     // need no private ACL on public package/cwd parents. Present files use the
     // same current parent/file ACL, no-follow and exact identity checks.
     readCredentialSourceFileSync: (target: string): string | undefined => read(target, true),
-    writeCredentialFileSync: write,
+    writeCredentialFileSync: (target: string, content: string): void => write(target, content, 'json-object'),
+    /** Optional exact prior bytes bind a caller's read-modify-write composition.
+     * An own expectedPrior:undefined requires absence; omitting it pins nothing. */
+    writeCredentialTextFileSync: (target: string, content: string,
+      options?: { expectedPrior: string | undefined }): void => write(target, content, 'text', options),
     assertCredentialFileReadable: (target: string): void => { read(target); },
   };
 }
@@ -193,4 +214,5 @@ const policy = createCredentialFilePolicy();
 export const readCredentialFileSync = policy.readCredentialFileSync;
 export const readCredentialSourceFileSync = policy.readCredentialSourceFileSync;
 export const writeCredentialFileSync = policy.writeCredentialFileSync;
+export const writeCredentialTextFileSync = policy.writeCredentialTextFileSync;
 export const assertCredentialFileReadable = policy.assertCredentialFileReadable;

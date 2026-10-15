@@ -2,7 +2,7 @@
  * remote server, or open/change the owner's environment/configuration. */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { declareMcpServerEnvKeys, readMcpServerEnv, resolveMcpServerEnv, type McpServerEnvSources } from './mcp-server-env.js';
+import { createMcpServerEnvReader, declareMcpServerEnvKeys, readMcpServerEnv, resolveMcpServerEnv, type McpServerEnvSources } from './mcp-server-env.js';
 import type { ManagedMcpServer } from '../types.js';
 
 assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1', 'Use scripts/run-tests-isolated.mjs before importing the runtime graph.');
@@ -25,7 +25,7 @@ test('stdio argv expands declared credential references literally and leaves unk
   assert.deepEqual(mcpServersTestHooks.stdioLaunchArgs(configured, sources),
     ['--token= synthetic $& value ', 'inline-$&-${OTHER}', '${UNDECLARED_KEY}', '$CONTROLLED_KEY', '%CONTROLLED_KEY%', '$(literal)', '']);
   assert.deepEqual(configured.args, original, 'the saved template stays unchanged');
-  assert.deepEqual(serverEnvStatus(configured, sources), { declaredEnvKeys: ['CONTROLLED_KEY', 'INLINE'], unsetEnvKeys: [] });
+  assert.deepEqual(serverEnvStatus(configured, sources), { declaredEnvKeys: ['CONTROLLED_KEY', 'INLINE'], unsetEnvKeys: [], editableEnvKeys: ['CONTROLLED_KEY'] });
   assert.equal(JSON.stringify(serverEnvStatus(configured, sources)).includes('synthetic $& value'), false);
 });
 
@@ -78,13 +78,14 @@ for (const [label, declaration, sources, expected, unset] of [
     assert.equal(resolved.values.CONTROLLED_KEY, expected);
     assert.equal(launched.CONTROLLED_KEY, expected);
     assert.equal(launched.PATH, '/fixture/bin');
-    assert.deepEqual(status, { declaredEnvKeys: ['CONTROLLED_KEY'], unsetEnvKeys: unset ? ['CONTROLLED_KEY'] : [] });
+    const editable = Array.isArray(declaration) || !declaration.CONTROLLED_KEY.trim();
+    assert.deepEqual(status, { declaredEnvKeys: ['CONTROLLED_KEY'], unsetEnvKeys: unset ? ['CONTROLLED_KEY'] : [], editableEnvKeys: editable ? ['CONTROLLED_KEY'] : [] });
     for (const type of ['http', 'sse'] as const) {
       assert.deepEqual(mcpServersTestHooks.expandedHeaders(server(declaration, type), sources, syntheticMerge), {
         Authorization: `Bearer ${expected}`, 'X-Unresolved': '${UNDECLARED_KEY}', 'X-Plain': 'unchanged',
       });
     }
-    assert.deepEqual(Object.keys(status).sort(), ['declaredEnvKeys', 'unsetEnvKeys']);
+    assert.deepEqual(Object.keys(status).sort(), ['declaredEnvKeys', 'editableEnvKeys', 'unsetEnvKeys']);
     if (expected.trim()) assert.equal(JSON.stringify(status).includes(expected), false, 'status never returns a credential value');
   });
 }
@@ -133,4 +134,74 @@ test('no declaration or an entirely inline configuration opens no daemon credent
   for (const declaration of [undefined, {}, [], { CONTROLLED_KEY: 'explicit-inline' }]) {
     assert.doesNotThrow(() => readMcpServerEnv(declaration, '/synthetic/not-opened', {}, () => { throw new Error('unneeded credential file read'); }));
   }
+});
+
+test('request reader is lazy and shares one file view across different declared keys', () => {
+  let reads = 0;
+  let text = 'FIRST="current-first"\nSECOND=current-second\n';
+  const read = createMcpServerEnvReader('/synthetic/daemon.env', {}, file => {
+    reads++;
+    assert.equal(file, '/synthetic/daemon.env');
+    return text;
+  });
+  assert.equal(reads, 0);
+  for (const raw of [undefined, {}, [], { INLINE: 'retained-inline' }]) read(raw);
+  assert.equal(reads, 0, 'metadata without pass-through declarations opens no file');
+  assert.equal(read({ FIRST: '' }).values.FIRST, 'current-first');
+  text = 'FIRST=changed-mid-request\nSECOND=changed-mid-request\n';
+  assert.equal(read(['SECOND']).values.SECOND, 'current-second', 'later rows use the same private file snapshot');
+  assert.equal(read({ FIRST: '' }).values.FIRST, 'current-first');
+  assert.equal(reads, 1);
+});
+
+test('a fresh reader observes changed file and inherited values without cross-request caching', () => {
+  let reads = 0;
+  let text = 'FILE_KEY=original\n';
+  const inherited = { INHERITED_KEY: 'original-inherited' };
+  const reader = () => createMcpServerEnvReader('/synthetic/daemon.env', inherited, () => { reads++; return text; });
+  const first = reader();
+  assert.equal(first({ FILE_KEY: '', INHERITED_KEY: '' }).values.FILE_KEY, 'original');
+  text = 'FILE_KEY=changed\n'; inherited.INHERITED_KEY = 'changed-inherited';
+  assert.deepEqual(first({ FILE_KEY: '', INHERITED_KEY: '' }).values,
+    { FILE_KEY: 'original', INHERITED_KEY: 'original-inherited' });
+  assert.deepEqual(reader()({ FILE_KEY: '', INHERITED_KEY: '' }).values,
+    { FILE_KEY: 'changed', INHERITED_KEY: 'changed-inherited' });
+  assert.equal(reads, 2);
+});
+
+for (const [label, text] of [['absent', undefined], ['empty file', '']] as const) {
+  test(`request reader retains ${label} once while allowing declared inherited fallback`, () => {
+    let reads = 0;
+    const read = createMcpServerEnvReader('/synthetic/daemon.env', { INHERITED_KEY: 'inherited' }, () => { reads++; return text; });
+    assert.deepEqual(read({ INHERITED_KEY: '', MISSING: '' }).values, { INHERITED_KEY: 'inherited', MISSING: '' });
+    assert.equal(read(['INHERITED_KEY']).values.INHERITED_KEY, 'inherited');
+    assert.equal(reads, 1);
+  });
+}
+
+test('request reader preserves explicit daemon blanks, inline values and prototype-looking own keys', () => {
+  const inherited = Object.assign(Object.create({ GHOST: 'must-not-inherit' }), { EMPTY: 'masked-inherited', SPACE: 'masked-space' });
+  let reads = 0;
+  const read = createMcpServerEnvReader('/synthetic/daemon.env', inherited, () => {
+    reads++;
+    return 'EMPTY=""\nSPACE=" \t"\nINLINE=must-not-replace\n__proto__=literal-private\nconstructor=literal-constructor\n';
+  });
+  const result = read(JSON.parse('{"EMPTY":"","SPACE":" ","INLINE":" inline-value ","__proto__":"","constructor":"","GHOST":""}'));
+  assert.deepEqual(result.values, { EMPTY: '', SPACE: ' \t', INLINE: ' inline-value ',
+    ...JSON.parse('{"__proto__":"literal-private","constructor":"literal-constructor","GHOST":""}') });
+  assert.deepEqual(result.editableEnvKeys, ['EMPTY', 'SPACE', '__proto__', 'constructor', 'GHOST']);
+  assert.deepEqual(result.unsetEnvKeys, ['EMPTY', 'SPACE', 'GHOST']);
+  assert.equal(Object.getPrototypeOf(result.values), Object.prototype);
+  assert.equal(Object.hasOwn({}, 'literal-private'), false);
+  assert.equal(reads, 1);
+});
+
+test('request reader retains a private-file refusal and never retries or falls back', () => {
+  let reads = 0;
+  const failure = new Error('controlled private file refusal');
+  const read = createMcpServerEnvReader('/synthetic/daemon.env', { FIRST: 'must-not-fallback', SECOND: 'must-not-fallback' }, () => { reads++; throw failure; });
+  for (const raw of [{ FIRST: '' }, ['SECOND']]) assert.throws(() => read(raw), error => error === failure);
+  assert.equal(reads, 1);
+  assert.deepEqual(read({ INLINE: 'still-inline' }).values, { INLINE: 'still-inline' });
+  assert.equal(reads, 1);
 });

@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { validateMcpServerConfig, serverEnvStatus, registerMcpServerTools } from './mcp-server-tools.js';
+import { createMcpServerEnvStatusReader, validateMcpServerConfig, serverEnvStatus, registerMcpServerTools } from './mcp-server-tools.js';
 import { rankMcpToolInventory } from './mcp-status-tools.js';
 import { classifyTool } from '../agents/tool-taxonomy.js';
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -118,6 +118,54 @@ test('serverEnvStatus: returns key NAMES only — never a value (no secret leak)
   const blob = JSON.stringify(s);
   assert.ok(!blob.includes('super-secret-value'), 'value must never appear in the status');
   assert.ok(blob.includes('SECRET_KEY'), 'key name is fine');
+});
+
+test('editable credential metadata preserves inline overrides independently of availability', () => {
+  const configured = { env: { INLINE: 'synthetic-private-inline', CURRENT: '', MISSING: ' \t' } };
+  const result = serverEnvStatus(configured, { daemon: { CURRENT: 'synthetic-private-current' }, inherited: {} });
+  assert.deepEqual(result, { declaredEnvKeys: ['INLINE', 'CURRENT', 'MISSING'], unsetEnvKeys: ['MISSING'], editableEnvKeys: ['CURRENT', 'MISSING'] });
+  assert.deepEqual(serverEnvStatus({ env: ['CURRENT', 'CURRENT', 'MISSING'] as unknown as Record<string, string> },
+    { daemon: { CURRENT: 'synthetic-private-current' }, inherited: {} }),
+  { declaredEnvKeys: ['CURRENT', 'MISSING'], unsetEnvKeys: ['MISSING'], editableEnvKeys: ['CURRENT', 'MISSING'] });
+  assert.doesNotMatch(JSON.stringify(result), /synthetic-private/);
+});
+
+test('one metadata reader shares a lazy names-only snapshot across servers and user overrides', () => {
+  let reads = 0;
+  let text = 'SHARED=synthetic-private-shared\nSECOND=synthetic-private-second\nEMPTY=""\n';
+  const options = { daemonEnvFile: '/synthetic/metadata.env', inherited: { EMPTY: 'masked-inherited' }, readText: (file: string) => {
+    reads++; assert.equal(file, '/synthetic/metadata.env'); return text;
+  } };
+  const readStatus = createMcpServerEnvStatusReader(options);
+  const inline = readStatus({ env: { INLINE: 'synthetic-private-inline' } });
+  assert.deepEqual(inline, { declaredEnvKeys: ['INLINE'], unsetEnvKeys: [], editableEnvKeys: [] });
+  assert.deepEqual(readStatus({}), { declaredEnvKeys: [], unsetEnvKeys: [], editableEnvKeys: [] });
+  assert.equal(reads, 0);
+  const first = readStatus({ env: { SHARED: '', EMPTY: '', INLINE: 'synthetic-private-inline' } });
+  text = 'SHARED=\nSECOND=\nEMPTY=now-present\n';
+  const second = readStatus({ env: ['SECOND', 'SHARED'] as unknown as Record<string, string> });
+  const override = readStatus({ env: { SHARED: '' } });
+  assert.deepEqual(first, { declaredEnvKeys: ['SHARED', 'EMPTY', 'INLINE'], unsetEnvKeys: ['EMPTY'], editableEnvKeys: ['SHARED', 'EMPTY'] });
+  assert.deepEqual(second, { declaredEnvKeys: ['SECOND', 'SHARED'], unsetEnvKeys: [], editableEnvKeys: ['SECOND', 'SHARED'] });
+  assert.deepEqual(override, { declaredEnvKeys: ['SHARED'], unsetEnvKeys: [], editableEnvKeys: ['SHARED'] });
+  assert.equal(reads, 1);
+  for (const status of [inline, first, second, override]) {
+    assert.deepEqual(Object.keys(status).sort(), ['declaredEnvKeys', 'editableEnvKeys', 'unsetEnvKeys']);
+    assert.ok(Object.values(status).every(keys => Array.isArray(keys) && keys.every(key => typeof key === 'string')));
+    assert.doesNotMatch(JSON.stringify(status), /synthetic-private|masked-inherited|now-present/);
+  }
+  assert.deepEqual(createMcpServerEnvStatusReader(options)({ env: { SHARED: '' } }).unsetEnvKeys, ['SHARED']);
+  assert.equal(reads, 2, 'the next request observes changed credential availability');
+});
+
+test('metadata snapshot preserves exact refusal without exposing file contents or selecting inherited credentials', () => {
+  let reads = 0;
+  const failure = new Error('synthetic private-file refusal');
+  const status = createMcpServerEnvStatusReader({ daemonEnvFile: '/synthetic/refused.env', inherited: { FIRST: 'must-not-fallback' },
+    readText: () => { reads++; throw failure; } });
+  assert.throws(() => status({ env: { FIRST: '' } }), error => error === failure);
+  assert.throws(() => status({ env: { SECOND: '' } }), error => error === failure);
+  assert.equal(reads, 1);
 });
 
 test('GATING: mcp_add / mcp_configure are admin; reconnect/status/inventory are read', () => {

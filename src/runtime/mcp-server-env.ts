@@ -5,10 +5,15 @@ export interface McpServerEnvSources {
   inherited: Readonly<Record<string, string | undefined>>;
 }
 
-interface ResolvedMcpServerEnv {
-  values: Record<string, string>;
+export interface McpServerEnvStatus {
   declaredEnvKeys: string[];
   unsetEnvKeys: string[];
+  /** Human entry can supply these declarations without replacing an inline value. */
+  editableEnvKeys: string[];
+}
+
+interface ResolvedMcpServerEnv extends McpServerEnvStatus {
+  values: Record<string, string>;
 }
 
 /** Add credential names without replacing existing inline human values or
@@ -39,7 +44,29 @@ export function resolveMcpServerEnv(raw: unknown, sources: McpServerEnvSources):
     return [key, typeof inline === 'string' && inline.trim() ? inline : daemon ?? inherited ?? ''];
   }));
   return { values, declaredEnvKeys: entries.map(([key]) => key),
-    unsetEnvKeys: entries.filter(([key]) => !values[key]?.trim()).map(([key]) => key) };
+    unsetEnvKeys: entries.filter(([key]) => !values[key]?.trim()).map(([key]) => key),
+    editableEnvKeys: entries.filter(([, inline]) => typeof inline !== 'string' || !inline.trim()).map(([key]) => key) };
+}
+
+/** One request's environment view, shared across server rows and overrides.
+ * The private file stays unopened until a declaration needs it. Missing files
+ * and failures are retained too, so one snapshot never retries a failed read
+ * or silently selects a different credential. Create a new reader next request. */
+export function createMcpServerEnvReader(daemonEnvFile: string,
+  inherited: McpServerEnvSources['inherited'] = process.env,
+  readText: (file: string) => string | undefined = readCredentialSourceFileSync,
+): (raw: unknown) => ResolvedMcpServerEnv {
+  const inheritedSnapshot = Object.fromEntries(Object.entries(inherited));
+  let snapshot: { kind: 'read'; text: string | undefined } | { kind: 'failed'; error: unknown } | undefined;
+  const readOnce = (file: string): string | undefined => {
+    if (!snapshot) {
+      try { snapshot = { kind: 'read', text: readText(file) }; }
+      catch (error) { snapshot = { kind: 'failed', error }; }
+    }
+    if (snapshot.kind === 'failed') throw snapshot.error;
+    return snapshot.text;
+  };
+  return raw => readMcpServerEnv(raw, daemonEnvFile, inheritedSnapshot, readOnce);
 }
 
 /** Same .env value syntax as config.ts:parseEnvText, including matched outer
