@@ -304,3 +304,27 @@ test('a turn marked not to learn from never becomes memory, and memory already m
   assert.match(summaries.join('\n'), /Find the quarterly report/, 'the mixed chat is remembered again');
   assert.doesNotMatch(summaries.join('\n'), /probe|testonly/, 'the model never sees an excluded turn');
 });
+
+test('a memory model that stops answering pauses learning, and the next pass waits instead of asking it again', async () => {
+  const reflection = await import('./reflection.js');
+  reflection.setReflectionExtractorPauseForTest(null);
+  chat('outage-a', 12);
+  chat('outage-b', 12);
+  let asked = 0;
+  conversationMemory._setConversationMemorySummarizerForTests(async () => {
+    asked += 1;
+    throw Object.assign(new Error('upstream 503'), { statusCode: 503 });
+  }, 'fixture-memory-model');
+  try {
+    const first = await conversationMemory.consolidateIdleConversations({ now: NOW, rememberLimit: 500 });
+    assert.equal(first.remembered, 0);
+    assert.equal(asked, 1, 'the pass stops at the first failure');
+    const pause = reflection.reflectionExtractorPause();
+    assert.ok(pause, 'the failure starts the backoff the Memory tab names');
+    const second = await conversationMemory.consolidateIdleConversations({ now: NOW, rememberLimit: 500 });
+    assert.equal(second.waiting, true);
+    assert.equal(asked, 1, 'a paused model is not asked again');
+  } finally {
+    reflection.setReflectionExtractorPauseForTest(null);
+  }
+});

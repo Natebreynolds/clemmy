@@ -1056,6 +1056,18 @@ export function reflectionExtractorAvailable(): boolean {
   return Date.now() >= extractorPausedUntil;
 }
 
+/** A retryable failure of the memory model, from any memory job, starts the
+ *  one backoff window every memory model call honors and the Memory tab
+ *  names (honoring a provider's reset hint, capped). True when it did. */
+export function pauseMemoryModelAfter(err: unknown): boolean {
+  const cls = classifyMemoryModelError(err);
+  if (!cls.retryable) return false;
+  const pauseMs = Math.min(quotaResetHintMs(err) ?? cls.retryAfterMs ?? EXTRACTOR_PAUSE_DEFAULT_MS, EXTRACTOR_PAUSE_MAX_MS);
+  extractorPausedUntil = Date.now() + pauseMs;
+  extractorPauseProblem = extractorPauseProblemFor(err);
+  return true;
+}
+
 /** The extractor's backoff window while one is active: until when, and why.
  *  Null when the extractor may run. In-process, like the pause itself. */
 export function reflectionExtractorPause(now: number = Date.now()): { until: number; problem: MemoryModelProblem } | null {
@@ -1143,14 +1155,7 @@ async function runExtractor(
     );
     if (!cls.retryable || !options.allowHedge) {
       noteMemoryModelFailure(err);
-      if (cls.retryable) {
-        const pauseMs = Math.min(
-          quotaResetHintMs(err) ?? cls.retryAfterMs ?? EXTRACTOR_PAUSE_DEFAULT_MS,
-          EXTRACTOR_PAUSE_MAX_MS,
-        );
-        extractorPausedUntil = Date.now() + pauseMs;
-        extractorPauseProblem = extractorPauseProblemFor(err);
-      }
+      pauseMemoryModelAfter(err);
       return null;
     }
     // Quota/auth/transient on the primary judge family — memory must not stop
@@ -1177,13 +1182,9 @@ async function runExtractor(
     // No working family right now: honor the provider's reset hint and stop
     // grinding. The failed-receipt replay drain re-runs these once the pause
     // lifts, from the durable raw in tool_outputs.
-    const pauseMs = Math.min(
-      quotaResetHintMs(err) ?? cls.retryAfterMs ?? EXTRACTOR_PAUSE_DEFAULT_MS,
-      EXTRACTOR_PAUSE_MAX_MS,
-    );
-    extractorPausedUntil = Date.now() + pauseMs;
-    extractorPauseProblem = extractorPauseProblemFor(err);
-    logger.warn({ pauseMs, kind: cls.kind }, 'reflection extractor paused — provider backoff window');
+    if (pauseMemoryModelAfter(err)) {
+      logger.warn({ until: new Date(extractorPausedUntil).toISOString(), kind: cls.kind }, 'reflection extractor paused — provider backoff window');
+    }
     return null;
   }
 }

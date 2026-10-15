@@ -35,6 +35,7 @@ import { openMemoryDb } from './db.js';
 import { memoryJobFailed, memoryJobRoute, memoryTidyOutcome, noteMemoryModelFailure, runMemoryModelJob } from './memory-job-context.js';
 import { recordMemoryEpisode } from './temporal-memory.js';
 import { parseTurnLearningPolicy } from './turn-learning-policy.js';
+import { pauseMemoryModelAfter, reflectionExtractorAvailable } from './reflection.js';
 import { WORK_EPISODE_SUBTYPE } from './work-episodes.js';
 
 const logger = pino({ name: 'clementine.conversation-memory' });
@@ -312,7 +313,8 @@ export async function consolidateIdleConversations(input: {
   await runMemoryModelJob('learn', { source: { kind: 'schedule' } }, async () => {
     const route = modelOverrideForTest ? null : memoryJobRoute('learn');
     const model = modelOverrideForTest ?? route?.model ?? null;
-    if (!model) { result.waiting = true; return; }
+    // The memory model is chosen, unreachable, or in its backoff window: wait.
+    if (!model || !reflectionExtractorAvailable()) { result.waiting = true; return; }
     const candidates = listConversationLifecycleCandidates({ idleBefore: weekAgo, fidelity: ['full', 'compacted'],
       kinds: ['chat'], limit: input.rememberLimit ?? 15, newestFirst: true,
       withoutMemory: { retryUnusableBefore: now.toISOString().slice(0, 10) } });
@@ -325,6 +327,9 @@ export async function consolidateIdleConversations(input: {
         if (noted && kept.kind === 'kept') result.remembered += 1;
       } catch (error) {
         noteMemoryModelFailure(error);
+        // The same backoff every memory job honors, which the Memory tab
+        // names while learning waits.
+        pauseMemoryModelAfter(error);
         logger.warn({ err: error instanceof Error ? error.message : error, sessionId: candidate.sessionId }, 'conversation memory failed');
         break;
       }
