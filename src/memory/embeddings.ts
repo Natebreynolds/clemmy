@@ -8,7 +8,7 @@ import { BASE_DIR, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { CUTOVER_HOLD } from '../runtime/cutover-hold.js';
 import { noteCreditAnswered, noteCreditRefused, OPENAI_KEY_ACCOUNT_ID } from '../runtime/provider-credit.js';
 import { openMemoryDb, STATE_DIR } from './db.js';
-import { startEmbeddingWorker } from './embedding-worker.js';
+import { startEmbeddingWorker, EmbeddingWorkSkippedError, type EmbeddingWorkOptions, type EmbeddingWorkControl } from './embedding-worker.js';
 
 /**
  * Provider-backed embeddings for semantic recall rerank.
@@ -430,14 +430,14 @@ export interface EmbeddingProvider {
   /** Output dimensionality. */
   readonly dim: number;
   /** Embed a batch; returns vectors in input order. Throws on hard failure. */
-  embed(texts: string[]): Promise<Float32Array[]>;
+  embed(texts: string[], options?: EmbeddingWorkOptions): Promise<Float32Array[]>;
 }
 
 const OPENAI_PROVIDER: EmbeddingProvider = {
   name: 'openai',
   model: EMBEDDING_MODEL,
   dim: EMBEDDING_DIM,
-  embed: (texts) => openaiEmbedBatch(texts),
+  embed: (texts, options) => openaiEmbedBatch(texts, options),
 };
 
 // Local provider is loaded lazily (the Transformers.js / onnxruntime dependency
@@ -473,13 +473,13 @@ const LOCAL_PROVIDER_DESCRIPTOR: EmbeddingProvider = {
   name: 'local',
   model: LOCAL_EMBEDDING_MODEL,
   dim: LOCAL_EMBEDDING_DIM,
-  async embed(texts: string[]): Promise<Float32Array[]> {
+  async embed(texts: string[], options?: EmbeddingWorkOptions): Promise<Float32Array[]> {
     const loaded = await loadLocalProvider();
     // Only reachable if the weights turn out to be unusable. Throwing is right:
     // the caller is writing vectors, and a silent empty result would persist
     // rows that claim this model without being in its space.
     if (!loaded) throw new Error('local embedding model is unavailable');
-    return loaded.embed(texts);
+    return loaded.embed(texts, options);
   },
 };
 
@@ -619,7 +619,7 @@ async function loadLocalProvider(): Promise<EmbeddingProvider | null> {
           name: 'local',
           model: LOCAL_EMBEDDING_MODEL,
           dim: LOCAL_EMBEDDING_DIM,
-          embed: (texts) => worker.embed(texts),
+          embed: (texts, options) => worker.embed(texts, options),
         };
         localProvider = provider;
         logger.info(
@@ -638,9 +638,10 @@ async function loadLocalProvider(): Promise<EmbeddingProvider | null> {
         name: 'local',
         model: LOCAL_EMBEDDING_MODEL,
         dim: LOCAL_EMBEDDING_DIM,
-        async embed(texts) {
+        async embed(texts, options) {
           const out: Float32Array[] = [];
           for (const t of texts) {
+            requireEmbeddingBudget(options);
             const res = await extractor([t], { pooling: 'mean', normalize: true });
             out.push(Float32Array.from(res.data as ArrayLike<number>));
           }
@@ -670,13 +671,13 @@ async function loadLocalProvider(): Promise<EmbeddingProvider | null> {
  * provider round trip (measured at ~1.6s); the local model is ~3ms once warm.
  */
 export async function getLocalEmbeddingProvider(): Promise<EmbeddingProvider | null> {
-  if (embeddingsDisabledByEnv() || !localEmbeddingsAllowed()) return null;
+  if (embeddingsDisabledByEnv() || providerOverride() === 'off' || !localEmbeddingsAllowed()) return null;
   return loadLocalProvider();
 }
 
 /** The local provider IF it is already warm — never triggers a model load. */
 export function localEmbeddingProviderSync(): EmbeddingProvider | null {
-  if (embeddingsDisabledByEnv() || !localEmbeddingsAllowed()) return null;
+  if (embeddingsDisabledByEnv() || providerOverride() === 'off' || !localEmbeddingsAllowed()) return null;
   return localProvider ?? null;
 }
 
@@ -809,6 +810,7 @@ export function isEmbeddingsEnabled(): boolean {
 /** Test-only: inject (or clear with `null`) a deterministic provider. */
 export function _setEmbeddingProviderForTest(p: EmbeddingProvider | null | undefined): void {
   injectedProvider = p;
+  selectionSerial++;
   embedQueryInflight.clear();
 }
 /** Test-only: reset the lazily-probed local provider. */
@@ -894,7 +896,7 @@ interface EmbeddingsApiResponse {
  * Embed a batch of texts via the OpenAI API. The OpenAI provider's `embed`.
  * Returns vectors in input order. Throws on hard failure — callers decide.
  */
-async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
+async function openaiEmbedBatch(texts: string[], options?: EmbeddingWorkOptions): Promise<Float32Array[]> {
   const apiKey = getOpenAiApiKey();
   if (!apiKey) {
     throw new Error('OPENAI_API_KEY is not set');
@@ -910,6 +912,7 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
   // means every embedding call does a fresh DNS lookup + TCP connect.
   // That's a few-ms tax per call but avoids the multi-hour outage.
   const attempt = async (): Promise<Float32Array[]> => {
+    requireEmbeddingBudget(options);
     const response = await fetch('https://api.openai.com/v1/embeddings', {
       method: 'POST',
       headers: {
@@ -921,6 +924,8 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
         input: safeInputs,
       }),
       keepalive: false,
+      // This is a shared wire request. A later subscriber can outlive the first
+      // caller, so caller budgets bound awaits; only the transport owns abort.
       signal: AbortSignal.timeout(fetchTimeoutMs()),
     });
 
@@ -944,6 +949,7 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
     // persistent CLIENT error (400 oversized-input / 404 bad-model) — those fail
     // identically on retry and just DOUBLE the synchronous JIT/recall latency on
     // this pre-turn path (07-06 ship-review finding).
+    requireEmbeddingBudget(options);
     if (embedErrorIsRetryable(err)) {
       await new Promise((r) => setTimeout(r, 300));
       return await attempt();
@@ -965,7 +971,67 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
 // failures (null) are evicted so a transient miss never sticks.
 const EMBED_QUERY_CACHE_TTL_MS = 60_000;
 const EMBED_QUERY_CACHE_MAX = 256;
-const embedQueryInflight = new Map<string, { at: number; p: Promise<Float32Array | null> }>();
+export interface EmbeddingSpace {
+  readonly spaceKey: string;
+  /** New adapters must include revision/preprocessing/quantization in this identity. */
+  readonly model: string;
+  readonly dim: number;
+}
+export interface EmbeddedQuery extends EmbeddingSpace { readonly vector: Float32Array }
+export interface EmbeddedTexts extends EmbeddingSpace { readonly vectors: Float32Array[] }
+export type EmbeddingRequestOptions = Pick<EmbeddingWorkOptions, 'priority' | 'deadlineAtMs'>;
+type EmbeddingProducerLease = { provider: EmbeddingProvider; primary: boolean };
+const queryProducers = new WeakMap<EmbeddedQuery, EmbeddingProducerLease>();
+type SharedEmbeddingWork = { work: EmbeddingWorkOptions; control?: EmbeddingWorkControl };
+type QueryEmbeddingEntry = SharedEmbeddingWork & { at: number; p: Promise<EmbeddedQuery | null> };
+const embedQueryInflight = new Map<string, QueryEmbeddingEntry>();
+let selectionSerial = 0;
+let lastSelectionKey: string | undefined;
+/** Cache admission fence. It is not authority to relabel a produced vector. */
+export function embeddingSelectionRevision(): string {
+  const key = activeEmbeddingSpaceKey();
+  if (key !== lastSelectionKey) { selectionSerial++; lastSelectionKey = key; }
+  return `${selectionSerial}:${key}`;
+}
+function producerSpace(provider: EmbeddingProvider): EmbeddingSpace {
+  return { spaceKey: embeddingProviderCacheKey(provider), model: provider.model, dim: provider.dim };
+}
+export function isUsableEmbeddingVector(vector: Float32Array, dim: number): boolean {
+  return vector.length === dim && vector.some(value => value !== 0) && vector.every(Number.isFinite);
+}
+function validateProducedVectors(provider: EmbeddingProvider, texts: string[], vectors: Float32Array[]): Float32Array[] {
+  if (vectors.length !== texts.length || vectors.some(vector => !isUsableEmbeddingVector(vector, provider.dim))) {
+    throw new Error('Embedding provider returned incompatible vectors.');
+  }
+  return vectors;
+}
+function requireEmbeddingBudget(options?: EmbeddingRequestOptions): void {
+  if (options?.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs) throw new EmbeddingWorkSkippedError('expired');
+}
+function skippedEmbeddingWork(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === 'EMBEDDING_WORK_SKIPPED';
+}
+async function withinEmbeddingDeadline<T>(promise: Promise<T | null>, options?: EmbeddingRequestOptions): Promise<T | null> {
+  if (options?.deadlineAtMs === undefined) return promise;
+  const remaining = options.deadlineAtMs - Date.now();
+  if (remaining <= 0) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const value = await Promise.race([promise, new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), remaining); })]);
+    // Native fallback can hold the event loop past the deadline, letting a
+    // resolved microtask win before its timer runs. Reject that late value too.
+    return Date.now() >= options.deadlineAtMs ? null : value;
+  }
+  finally { if (timer) clearTimeout(timer); }
+}
+function extendQueryWork(entry: SharedEmbeddingWork, options: EmbeddingRequestOptions): void {
+  if (options.priority !== 'background') entry.work.priority = 'foreground';
+  if (entry.work.deadlineAtMs !== undefined) {
+    entry.work.deadlineAtMs = options.deadlineAtMs === undefined ? undefined : Math.max(entry.work.deadlineAtMs, options.deadlineAtMs);
+  }
+  entry.control?.update({ priority: entry.work.priority, deadlineAtMs: entry.work.deadlineAtMs });
+}
+
 
 function urgentFactEmbeddingBusyWaitMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_EMBED_URGENT_BUSY_WAIT_MS', '1000') || '1000', 10);
@@ -1006,13 +1072,14 @@ async function waitForProviderIdle(provider: EmbeddingProvider, timeoutMs: numbe
   }
 }
 
-async function callProviderEmbed(provider: EmbeddingProvider, texts: string[]): Promise<Float32Array[]> {
-  if (!providerUsesRemoteSingleFlight(provider)) return provider.embed(texts);
+async function callProviderEmbed(provider: EmbeddingProvider, texts: string[], options?: EmbeddingWorkOptions): Promise<Float32Array[]> {
+  requireEmbeddingBudget(options);
+  if (!providerUsesRemoteSingleFlight(provider)) return validateProducedVectors(provider, texts, await provider.embed(texts, options));
   const key = embeddingProviderCacheKey(provider);
   providerInFlightSince.set(key, Date.now());
   let call: Promise<Float32Array[]>;
   try {
-    call = provider.embed(texts);
+    call = provider.embed(texts, options);
   } catch (err) {
     providerInFlightSince.delete(key);
     throw err;
@@ -1020,7 +1087,7 @@ async function callProviderEmbed(provider: EmbeddingProvider, texts: string[]): 
   const done = call.then(() => undefined, () => undefined);
   providerInFlightDone.set(key, done);
   try {
-    return await call;
+    return validateProducedVectors(provider, texts, await call);
   } finally {
     if (providerInFlightDone.get(key) === done) {
       providerInFlightDone.delete(key);
@@ -1068,7 +1135,7 @@ async function embedBatchWithProviderFailover(
   provider: EmbeddingProvider,
   texts: string[],
   logContext: Record<string, unknown>,
-  options: { busyWaitMs?: number } = {},
+  options: EmbeddingWorkOptions & { busyWaitMs?: number } = {},
 ): Promise<EmbedBatchResult | null> {
   if (inCooldown()) return null;
   if (options.busyWaitMs && providerBusyReason(provider)) {
@@ -1077,16 +1144,17 @@ async function embedBatchWithProviderFailover(
   const busy = providerBusyReason(provider);
   if (busy) return { skipped: true, reason: busy };
   try {
-    const vectors = await callProviderEmbed(provider, texts);
+    const vectors = await callProviderEmbed(provider, texts, options);
     recordSuccess(provider);
     return { provider, vectors };
   } catch (err) {
+    if (skippedEmbeddingWork(err) || (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs)) return { skipped: true, reason: 'embedding work budget ended' };
     const failure = recordFailure(err);
     if (failure.opened) markProviderCooldown(provider, failure.cls, failure.untilMs, failure.failures);
     const fallback = await fallbackProviderAfterFailure(provider);
     if (fallback) {
       try {
-        const vectors = await callProviderEmbed(fallback, texts);
+        const vectors = await callProviderEmbed(fallback, texts, options);
         // Deliberately NOT recordSuccess(fallback): this is a one-off rescue
         // of the call in front of us, not a use of the process's preferred
         // provider (getEmbeddingProvider() still returns `provider`, unchanged,
@@ -1105,6 +1173,7 @@ async function embedBatchWithProviderFailover(
         );
         return { provider: fallback, vectors };
       } catch (fallbackErr) {
+        if (skippedEmbeddingWork(fallbackErr)) return { skipped: true, reason: 'embedding work budget ended' };
         const fallbackFailure = recordFailure(fallbackErr);
         if (fallbackFailure.opened) markProviderCooldown(fallback, fallbackFailure.cls, fallbackFailure.untilMs, fallbackFailure.failures);
         logger.warn(
@@ -1121,44 +1190,188 @@ async function embedBatchWithProviderFailover(
   }
 }
 
-async function embedQueryWithProvider(provider: EmbeddingProvider, query: string): Promise<Float32Array | null> {
-  const result = await embedBatchWithProviderFailover(provider, [query], { operation: 'embedQuery' });
-  if (result && 'skipped' in result) return null;
-  return result?.vectors[0] ?? null;
+async function embedQueryWithProvider(provider: EmbeddingProvider, query: string, options: EmbeddingWorkOptions): Promise<EmbeddedQuery | null> {
+  const result = await embedBatchWithProviderFailover(provider, [query], { operation: 'embedQuery' }, options);
+  if (!result || 'skipped' in result || !result.vectors[0]) return null;
+  const bound: EmbeddedQuery = Object.freeze({ ...producerSpace(result.provider), vector: result.vectors[0] });
+  queryProducers.set(bound, { provider: result.provider, primary: result.provider === provider });
+  return bound;
 }
 
-export async function embedQuery(query: string): Promise<Float32Array | null> {
-  const provider = await getEmbeddingProvider();
-  if (!provider) return null;
+/** Returns the actual producing space, including a same-call local rescue. */
+export async function embedQueryWithSpace(query: string, options: EmbeddingRequestOptions = {}): Promise<EmbeddedQuery | null> {
+  if (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs) return null;
+  const provider = await withinEmbeddingDeadline(getEmbeddingProvider(), options);
+  if (!provider || (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs)) return null;
   const now = Date.now();
   const key = `${embeddingProviderCacheKey(provider)}\n${query}`;
   const hit = embedQueryInflight.get(key);
-  if (hit && now - hit.at < EMBED_QUERY_CACHE_TTL_MS) return hit.p;
-  const p = embedQueryWithProvider(provider, query);
-  embedQueryInflight.set(key, { at: now, p });
-  // Evict a null/failed result so a transient miss is never served from cache.
-  p.then((v) => { if (v == null) embedQueryInflight.delete(key); }).catch(() => embedQueryInflight.delete(key));
-  // Bound: drop the oldest entry (Map preserves insertion order) past the cap.
+  if (hit && now - hit.at < EMBED_QUERY_CACHE_TTL_MS) {
+    extendQueryWork(hit, options);
+    return withinEmbeddingDeadline(hit.p, options);
+  }
+  const entry: QueryEmbeddingEntry = {
+    at: now, p: Promise.resolve(null), work: { priority: options.priority ?? 'foreground', deadlineAtMs: options.deadlineAtMs },
+  };
+  entry.work.onQueued = control => { entry.control = control; control.update({ priority: entry.work.priority, deadlineAtMs: entry.work.deadlineAtMs }); };
+  entry.p = embedQueryWithProvider(provider, query, entry.work);
+  embedQueryInflight.set(key, entry);
+  // Only the producer's outcome evicts shared work, never an earlier caller's deadline.
+  const evict = () => { if (embedQueryInflight.get(key) === entry) embedQueryInflight.delete(key); };
+  entry.p.then(value => { if (!value) evict(); }, evict);
   if (embedQueryInflight.size > EMBED_QUERY_CACHE_MAX) {
     const oldest = embedQueryInflight.keys().next().value;
     if (oldest !== undefined) embedQueryInflight.delete(oldest);
   }
-  return p;
+  return withinEmbeddingDeadline(entry.p, options);
 }
 
-/**
- * Public API: embed a batch of texts in one call. Convenience for rankers that
- * need many vectors at once (e.g. semantic tool retrieval). Returns vectors in
- * input order, or null if embeddings are disabled / in cooldown / the call
- * fails — callers fall back to a non-semantic path. Never throws.
- */
-export async function embedTexts(texts: string[]): Promise<Float32Array[] | null> {
-  if (texts.length === 0) return [];
-  const provider = await getEmbeddingProvider();
+export async function embedQuery(query: string, options?: EmbeddingRequestOptions): Promise<Float32Array | null> {
+  return (await embedQueryWithSpace(query, options))?.vector ?? null;
+}
+
+/** One physical pinned batch. Its work budget can be extended by subscribers;
+ * individual callers must bound their own wait outside this producer promise. */
+async function embedPinnedTexts(
+  lease: EmbeddingProducerLease, texts: string[], options: EmbeddingWorkOptions,
+): Promise<EmbeddedTexts | null> {
+  const { provider } = lease;
+  if (inCooldown() || providerBusyReason(provider)
+    || (injectedProvider === undefined && (embeddingsDisabledByEnv() || providerOverride() === 'off'))) return null;
+  try {
+    const vectors = await callProviderEmbed(provider, texts, options);
+    if (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs) return null;
+    // Count health once per physical batch. A local rescue must not erase a
+    // preferred remote provider's failure streak.
+    if (lease.primary) recordSuccess(provider);
+    return { ...producerSpace(provider), vectors };
+  } catch (error) {
+    if (!skippedEmbeddingWork(error) && (options.deadlineAtMs === undefined || Date.now() < options.deadlineAtMs)) {
+      const failure = recordFailure(error);
+      if (failure.opened) markProviderCooldown(provider, failure.cls, failure.untilMs, failure.failures);
+    }
+    return null;
+  }
+}
+
+/** A query result is a lease on its real producer. Pinned document work cannot
+ * silently fall over into a different space or relabel its output. */
+export async function embedTextsWithSpace(texts: string[], options: EmbeddingRequestOptions & { space?: EmbeddedQuery } = {}): Promise<EmbeddedTexts | null> {
+  if (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs) return null;
+  const lease = options.space ? queryProducers.get(options.space) : undefined;
+  const provider = options.space ? lease?.provider : await withinEmbeddingDeadline(getEmbeddingProvider(), options);
   if (!provider) return null;
-  const result = await embedBatchWithProviderFailover(provider, texts, { operation: 'embedTexts', count: texts.length });
-  if (result && 'skipped' in result) return null;
-  return result?.vectors ?? null;
+  if (texts.length === 0) return { ...producerSpace(provider), vectors: [] };
+  if (lease) return withinEmbeddingDeadline(embedPinnedTexts(lease, texts, options), options);
+  const result = await withinEmbeddingDeadline(embedBatchWithProviderFailover(provider, texts, { operation: 'embedTexts', count: texts.length }, options), options);
+  return result && !('skipped' in result) ? { ...producerSpace(result.provider), vectors: result.vectors } : null;
+}
+
+export interface SharedEmbeddingTextCache {
+  embed(texts: string[], options: EmbeddingRequestOptions & { space: EmbeddedQuery }): Promise<EmbeddedTexts | null>;
+  /** Retire cache admission, without cancelling another caller's producer. */
+  clear(): void;
+}
+
+/** Advisory vector reuse only: exact producer object, space and text determine
+ * identity. Neither the cache nor a similarity score grants tool authority. */
+export function createSharedEmbeddingTextCache(options: {
+  maxEntries?: number; maxTextCharacters?: number; ttlMs?: number;
+} = {}): SharedEmbeddingTextCache {
+  const bounded = (value: number | undefined, fallback: number, cap: number) =>
+    value !== undefined && Number.isSafeInteger(value) && value > 0 ? Math.min(value, cap) : fallback;
+  const maxEntries = bounded(options.maxEntries, 512, 4096);
+  const maxCharacters = bounded(options.maxTextCharacters, 2_000_000, 4_000_000);
+  const ttlMs = bounded(options.ttlMs, 60 * 60_000, 24 * 60 * 60_000);
+  type Entry = {
+    text: string; promise: Promise<Float32Array | null>; settle(vector: Float32Array | null): void;
+    batch: SharedEmbeddingWork; pending: boolean; expiresAt: number;
+  };
+  const cache = new Map<string, Entry>();
+  const producerIds = new WeakMap<EmbeddingProvider, number>();
+  let nextProducerId = 0, characters = 0, generation = 0;
+  const remove = (key: string, entry: Entry) => {
+    if (cache.get(key) === entry) { cache.delete(key); characters -= entry.text.length; }
+  };
+  return {
+    clear() { generation++; cache.clear(); characters = 0; },
+    async embed(texts, request) {
+      if (request.deadlineAtMs !== undefined && Date.now() >= request.deadlineAtMs) return null;
+      // Bound input before constructing JSON keys, unique maps or vector arrays.
+      // Duplicate normal texts can still share one retained cache entry.
+      if (!Array.isArray(texts) || texts.length > 4096) return null;
+      let inputCharacters = 0;
+      for (const text of texts) {
+        if (typeof text !== 'string') return null;
+        inputCharacters += text.length;
+        if (inputCharacters > maxCharacters) return null;
+      }
+      const lease = queryProducers.get(request.space);
+      if (!lease || (injectedProvider === undefined && (embeddingsDisabledByEnv() || providerOverride() === 'off'))) return null;
+      const space = producerSpace(lease.provider);
+      if (space.spaceKey !== request.space.spaceKey || space.model !== request.space.model || space.dim !== request.space.dim) return null;
+      if (texts.length === 0) return { ...space, vectors: [] };
+      const epoch = generation;
+      let id = producerIds.get(lease.provider);
+      if (id === undefined) { id = ++nextProducerId; producerIds.set(lease.provider, id); }
+      const keyOf = (text: string) => JSON.stringify([id, space.spaceKey, text]);
+      const now = Date.now();
+      for (const [key, entry] of cache) if (!entry.pending && entry.expiresAt <= now) remove(key, entry);
+      const unique = new Map(texts.map(text => [keyOf(text), text]));
+      const missing = [...unique].filter(([key]) => !cache.has(key));
+      const addedCharacters = missing.reduce((sum, [, text]) => sum + text.length, 0);
+      // Pending entries are never evicted into duplicate work. If a complete
+      // requested set cannot fit, leave callers on their ordinary fallback.
+      if (unique.size > maxEntries || addedCharacters > maxCharacters) return null;
+      const requestedKeys = new Set(unique.keys());
+      for (const [key, entry] of cache) {
+        if (cache.size + missing.length <= maxEntries && characters + addedCharacters <= maxCharacters) break;
+        if (!entry.pending && !requestedKeys.has(key)) remove(key, entry);
+      }
+      if (cache.size + missing.length > maxEntries || characters + addedCharacters > maxCharacters) return null;
+      const batch: SharedEmbeddingWork = {
+        work: { priority: request.priority ?? 'foreground', deadlineAtMs: request.deadlineAtMs },
+      };
+      batch.work.onQueued = control => {
+        batch.control = control;
+        control.update({ priority: batch.work.priority, deadlineAtMs: batch.work.deadlineAtMs });
+      };
+      const owned: Array<[string, Entry]> = [];
+      for (const [key, text] of missing) {
+        let settle!: Entry['settle'];
+        const promise = new Promise<Float32Array | null>(resolve => { settle = resolve; });
+        const entry: Entry = { text, promise, settle, batch, pending: true, expiresAt: 0 };
+        cache.set(key, entry); characters += text.length; owned.push([key, entry]);
+      }
+      const entries = texts.map(text => cache.get(keyOf(text))!);
+      for (const shared of new Set(entries.filter(entry => entry.pending).map(entry => entry.batch))) extendQueryWork(shared, request);
+      for (const entry of new Set(entries)) {
+        // LRU without changing ownership of a pending promise.
+        const key = keyOf(entry.text); cache.delete(key); cache.set(key, entry);
+      }
+      if (owned.length) {
+        const publish = (result: EmbeddedTexts | null) => {
+          const valid = result?.spaceKey === space.spaceKey && result.vectors.length === owned.length;
+          for (const [index, [key, entry]] of owned.entries()) {
+            const vector = valid ? result.vectors[index] : null;
+            if (generation !== epoch || !vector) remove(key, entry);
+            else { entry.pending = false; entry.expiresAt = Date.now() + ttlMs; }
+            entry.settle(vector);
+          }
+        };
+        void embedPinnedTexts(lease, owned.map(([, entry]) => entry.text), batch.work).then(publish, () => publish(null));
+      }
+      const vectors = await withinEmbeddingDeadline(Promise.all(entries.map(entry => entry.promise)), request);
+      if (generation !== epoch || !vectors || vectors.some(vector => !vector || !isUsableEmbeddingVector(vector, space.dim))) return null;
+      // Cache vectors stay private so one consumer cannot poison another's reuse.
+      return { ...space, vectors: vectors.map(vector => vector!.slice()) };
+    },
+  };
+}
+
+export async function embedTexts(texts: string[], options?: EmbeddingRequestOptions): Promise<Float32Array[] | null> {
+  if (texts.length === 0) return [];
+  return (await embedTextsWithSpace(texts, options))?.vectors ?? null;
 }
 
 export interface EmbedBackfillStats {
@@ -1237,7 +1450,7 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
       operation: 'embedMissingChunks',
       batchStart: i,
       batchSize: batch.length,
-    });
+    }, { priority: 'background', deadlineAtMs: Date.now() + 60_000 });
     if (result && 'skipped' in result) {
       stats.reason = result.reason;
       break;
@@ -1280,10 +1493,10 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
  * Load embeddings for a set of chunk ids. Returns a Map for O(1)
  * lookup during the rerank scan.
  */
-export function loadEmbeddingsForChunks(chunkIds: number[]): Map<number, Float32Array> {
+export function loadEmbeddingsForChunks(chunkIds: number[], space?: Pick<EmbeddingSpace, 'model' | 'dim'>): Map<number, Float32Array> {
   const out = new Map<number, Float32Array>();
   if (chunkIds.length === 0) return out;
-  const active = activeEmbeddingSelector();
+  const active = space ?? activeEmbeddingSelector();
   if (!active) return out;
   const db = openMemoryDb();
   const placeholders = chunkIds.map(() => '?').join(',');
@@ -1374,6 +1587,8 @@ export async function embedMissingFacts(options: { maxChunks?: number; newestFir
       batchSize: batch.length,
     }, {
       busyWaitMs: options.newestFirst ? urgentFactEmbeddingBusyWaitMs() : 0,
+      priority: options.newestFirst ? 'foreground' : 'background',
+      deadlineAtMs: Date.now() + 60_000,
     });
     if (result && 'skipped' in result) {
       stats.reason = result.reason;
@@ -1415,10 +1630,10 @@ export async function embedMissingFacts(options: { maxChunks?: number; newestFir
  * during the semantic findSimilarFacts rerank. Mirrors
  * `loadEmbeddingsForChunks`.
  */
-export function loadFactEmbeddings(factIds: number[]): Map<number, Float32Array> {
+export function loadFactEmbeddings(factIds: number[], space?: Pick<EmbeddingSpace, 'model' | 'dim'>): Map<number, Float32Array> {
   const out = new Map<number, Float32Array>();
   if (factIds.length === 0) return out;
-  const active = activeEmbeddingSelector();
+  const active = space ?? activeEmbeddingSelector();
   if (!active) return out;
   const db = openMemoryDb();
   const placeholders = factIds.map(() => '?').join(',');
@@ -1444,8 +1659,8 @@ let activeFactEmbeddingCacheDb: object | null = null;
 /** Load the complete active fact-vector set in the current embedding space.
  * Cached by the DB's semantic generation, provider model, and dimension so
  * recall does not trade correctness for an updated_at prefilter. */
-export function loadActiveFactEmbeddings(kind?: string): Map<number, Float32Array> {
-  const active = activeEmbeddingSelector();
+export function loadActiveFactEmbeddings(kind?: string, space?: Pick<EmbeddingSpace, 'model' | 'dim'>): Map<number, Float32Array> {
+  const active = space ?? activeEmbeddingSelector();
   if (!active) return new Map();
   const db = openMemoryDb();
   const generation = (db.prepare(
@@ -1496,8 +1711,8 @@ export function activeFactEmbeddingCoverage(): { embedded: number; active: numbe
  * rows stay out — they were REPLACED, not merely stale, and resurfacing a
  * contradicted claim is worse than silence. Deliberately uncached: this only
  * runs when live recall came back thin. */
-export function loadArchivedFactEmbeddings(kind?: string): Map<number, Float32Array> {
-  const active = activeEmbeddingSelector();
+export function loadArchivedFactEmbeddings(kind?: string, space?: Pick<EmbeddingSpace, 'model' | 'dim'>): Map<number, Float32Array> {
+  const active = space ?? activeEmbeddingSelector();
   if (!active) return new Map();
   const db = openMemoryDb();
   const rows = db.prepare(`

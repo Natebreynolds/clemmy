@@ -6,7 +6,7 @@
  * ~18.5K tok) is rarely needed on a given turn (workflow authoring, spaces, admin
  * writes…). This module retrieves only the tools a turn plausibly needs: a generous
  * always-loaded CORE plus the top-K built-in tools semantically relevant to the
- * user's input, reusing the existing embedding infra (embedQuery/embedTexts/cosine).
+ * user's input, reusing the existing producer-bound embedding infrastructure.
  *
  * Design constraints (mirrors mcp-tool-rank.ts):
  *  - DEFAULT ON (CLEMMY_TOOL_JIT; =off exposes everything, byte-identical surface).
@@ -16,15 +16,17 @@
  *    (execution lane, memory recall, the composio discovery escape-hatch) is never
  *    dropped — the model can always discover+call any tool even when its specific
  *    wrapper wasn't pre-loaded.
- *  - Tool vectors cached in-memory by content hash (daemon lifetime).
+ *  - Tool vectors cached by exact producing space and text with bounded reuse.
  *
  * NOT YET BUILT (Phase 1.2): mid-run acquisition of a JIT-dropped BUILT-IN tool
  * (composio_* already covers external acquisition). Until then the CORE is the
  * safety floor — keep it generous.
  */
-import { createHash } from 'node:crypto';
 import pino from 'pino';
-import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
+import {
+  cosine, createSharedEmbeddingTextCache, embeddingSelectionRevision,
+  embedQueryWithSpace, isEmbeddingsEnabled,
+} from '../memory/embeddings.js';
 import { getRuntimeEnv } from '../config.js';
 import { WORKSPACE_DOCK_TOOLS } from '../spaces/workspace-context.js';
 import { deriveJitCore } from '../tools/tool-registry.js';
@@ -219,14 +221,9 @@ export interface ToolJitSelection {
 /** Ranker seam: name → cosine in [0,1]. Returns undefined to signal "no signal". */
 export type JitRankFn = (query: string, tools: JitTool[]) => Promise<Map<string, number> | undefined>;
 
-// Tool text → vector, content-hashed (daemon lifetime). Only new/changed tools embed.
-const toolVecCache = new Map<string, Float32Array>();
-const QUERY_TTL_MS = 60_000;
-let queryCache: { key: string; vec: Float32Array | null; at: number } | null = null;
-
-function hashText(text: string): string {
-  return createHash('sha1').update(text).digest('hex');
-}
+const toolVectors = createSharedEmbeddingTextCache();
+const JIT_EMBEDDING_BUDGET_MS = 900;
+let cacheGeneration = 0;
 function clamp01(n: number): number {
   if (!Number.isFinite(n) || n < 0) return 0;
   return n > 1 ? 1 : n;
@@ -237,30 +234,21 @@ function toolText(t: JitTool): string {
 
 /** The real semantic ranker — embeds the query + each tool, returns cosine map.
  *  Graceful: undefined whenever embeddings are off/unhealthy. Never throws. */
-async function semanticRank(query: string, tools: JitTool[], now: number): Promise<Map<string, number> | undefined> {
+async function semanticRank(query: string, tools: JitTool[], deadlineAtMs: number): Promise<Map<string, number> | undefined> {
   if (!isEmbeddingsEnabled() || tools.length === 0) return undefined;
   try {
-    if (!(queryCache && queryCache.key === query && now - queryCache.at < QUERY_TTL_MS)) {
-      queryCache = { key: query, vec: await embedQuery(query), at: now };
-    }
-    const queryVec = queryCache.vec;
-    if (!queryVec) return undefined;
-
-    const entries = tools.map((t) => ({ name: t.name, hash: hashText(toolText(t)), text: toolText(t) }));
-    const missing = entries.filter((e) => !toolVecCache.has(e.hash));
-    if (missing.length > 0) {
-      const vectors = await embedTexts(missing.map((e) => e.text));
-      if (!vectors) return undefined;
-      missing.forEach((e, i) => {
-        const v = vectors[i];
-        if (v) toolVecCache.set(e.hash, v);
-      });
-    }
+    const generation = cacheGeneration, revision = embeddingSelectionRevision();
+    const isCurrent = () => generation === cacheGeneration && revision === embeddingSelectionRevision()
+      && Date.now() < deadlineAtMs;
+    const entries = tools.map(tool => ({ name: tool.name, text: toolText(tool) }));
+    const binding = await embedQueryWithSpace(query, { priority: 'foreground', deadlineAtMs });
+    if (!binding || !isCurrent()) return undefined;
+    const result = await toolVectors.embed(entries.map(entry => entry.text), { space: binding, priority: 'foreground', deadlineAtMs });
+    if (!result || !isCurrent() || result.spaceKey !== binding.spaceKey || result.dim !== binding.dim
+      || result.vectors.length !== entries.length) return undefined;
     const scores = new Map<string, number>();
-    for (const e of entries) {
-      const vec = toolVecCache.get(e.hash);
-      if (vec) scores.set(e.name, clamp01(cosine(queryVec, vec)));
-    }
+    entries.forEach((entry, index) => scores.set(entry.name, clamp01(cosine(binding.vector, result.vectors[index]!))));
+    if (!isCurrent()) return undefined;
     return scores.size > 0 ? scores : undefined;
   } catch (err) {
     logger.warn({ err }, 'tool-jit semantic rank failed; exposing full surface');
@@ -279,6 +267,8 @@ export async function selectToolsForTurn(opts: {
   tools: JitTool[];
   rankFn?: JitRankFn;
   now?: number;
+  /** Absolute foreground budget; expiry preserves the full available surface. */
+  deadlineAtMs?: number;
   /** Built-in tool names memory says are PROVEN for this prompt (from the tool-choice
    *  store) — pinned like the intent set so a remembered-good tool survives pruning
    *  even if its semantic score falls below the floor. Mirrors the MCP-side
@@ -330,7 +320,8 @@ export async function selectToolsForTurn(opts: {
   // there's nothing to gain.
   if (estimateToolsetTokens(opts.tools) <= toolJitBudgetTokens()) return exposeAll('within-budget');
 
-  const ranker = opts.rankFn ?? ((q, t) => semanticRank(q, t, opts.now ?? Date.now()));
+  const deadlineAtMs = opts.deadlineAtMs ?? Date.now() + JIT_EMBEDDING_BUDGET_MS;
+  const ranker = opts.rankFn ?? ((q, t) => semanticRank(q, t, deadlineAtMs));
   const scores = await ranker(query, candidates);
   if (!scores) return exposeAll('no-semantic-signal');
 
@@ -393,6 +384,6 @@ export function recallPinnedBuiltinTools(userInput?: string | null): string[] {
 
 /** Test-only: clear the in-memory caches. */
 export function _resetToolJitCachesForTest(): void {
-  toolVecCache.clear();
-  queryCache = null;
+  cacheGeneration++;
+  toolVectors.clear();
 }

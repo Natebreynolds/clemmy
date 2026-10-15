@@ -46,6 +46,7 @@ import {
   MODEL_ENV_KEYS,
   getModelSettingsSnapshot,
   getRuntimeEnv,
+  invalidateRuntimeConfigSnapshot,
   withRuntimeConfigSnapshot,
   normalizeModelId,
   getByoBackendConfig,
@@ -230,8 +231,9 @@ import {
   revokeSessionByDeviceId as revokeMobileSessionByDeviceId,
 } from '../runtime/mobile-sessions.js';
 import { getManagedCliJob, startManagedCliJob, type ManagedCliAction, type ManagedCliKind } from '../runtime/managed-cli-jobs.js';
-import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
+import { discoverMcpServers, invalidateMcpServerDiscoveryCache, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { mcpServerCreateSummary, prepareMcpServerCreateRequest, validateMcpWorkingDirectory } from '../runtime/mcp-server-request.js';
+import { validMcpCredentialInput, writeMcpServerCredential } from '../runtime/mcp-server-credential.js';
 import { buildDevFlagsSnapshot, setDevFlag, clearDevFlag, setDevMode, isDevModeEnabled } from '../runtime/dev-flags.js';
 import {
   getOrCreateExternalMcpServers,
@@ -588,7 +590,7 @@ import {
   parseNamespacedTool,
   slugifyServerName,
 } from '../runtime/mcp-namespace-shim.js';
-import { serverEnvStatus } from '../tools/mcp-server-tools.js';
+import { createMcpServerEnvStatusReader, serverEnvStatus } from '../tools/mcp-server-tools.js';
 import { getLocalToolCatalog } from '../tools/local-runtime-tools.js';
 import { collectDiagnostics } from './diagnostics.js';
 import { collectHarnessAudit } from './harness-audit.js';
@@ -11582,6 +11584,9 @@ export function registerConsoleRoutes(
   app.get('/api/console/mcp-servers', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
+      // One lazy credential-file observation per authorized response. The next
+      // request gets a fresh reader, so saved access details are never cached.
+      const envStatusFor = createMcpServerEnvStatusReader();
       const discovered = discoverMcpServers();
       const user = loadUserMcpServers();
       // Enrich each server with connection state + which declared credential keys
@@ -11590,7 +11595,7 @@ export function registerConsoleRoutes(
       const health = listMcpServerHealth();
       const externalServers = discovered.map((s) => {
         const h = health.find((x) => x.slug === slugifyServerName(s.name) || x.name === s.name);
-        const { declaredEnvKeys, unsetEnvKeys } = serverEnvStatus(s);
+        const envStatus = envStatusFor(s);
         return {
           ...mcpServerCreateSummary(s),
           source: s.source,
@@ -11598,8 +11603,7 @@ export function registerConsoleRoutes(
           toolCount: h?.toolCount,
           failureCount: h?.failureCount ?? 0,
           lastError: h?.lastError ? 'The server could not connect. Check its setup and try again.' : undefined,
-          declaredEnvKeys,
-          unsetEnvKeys,
+          ...envStatus,
         };
       });
       const localTools = getLocalToolCatalog();
@@ -11615,6 +11619,7 @@ export function registerConsoleRoutes(
           failureCount: 0,
           declaredEnvKeys: [],
           unsetEnvKeys: [],
+          editableEnvKeys: [],
           builtin: true,
         },
         ...externalServers.filter((server) => slugifyServerName(server.name) !== 'clementine-local'),
@@ -11624,7 +11629,7 @@ export function registerConsoleRoutes(
           name, type: server.type ?? 'stdio', enabled: server.enabled !== false, description: server.description,
         }),
         source: 'user',
-        ...serverEnvStatus(server),
+        ...envStatusFor(server),
       }]));
       res.json({ servers, userOverrides });
     } catch {
@@ -11889,8 +11894,8 @@ export function registerConsoleRoutes(
   /**
    * Human-only credential entry for an MCP server. The brain can CREATE/flag a
    * server (mcp_add) but never writes secrets; this is where the human supplies
-   * the value. Writes to the daemon .env via updateEnvKey (mirrors process.env +
-   * persists 0600) — where the MCP subprocess resolves its declared env keys —
+   * the value. Uses the private credential writer for the daemon .env and
+   * mirrors process.env, where the MCP subprocess resolves declared env keys,
    * then reconnects so the server picks it up. Scoped to the server's DECLARED
    * env keys (no arbitrary env writes). The value is never logged or echoed back.
    */
@@ -11903,19 +11908,34 @@ export function registerConsoleRoutes(
     try {
       if (!key) { res.status(400).json({ error: 'key required' }); return; }
       if (!value) { res.status(400).json({ error: 'value required' }); return; }
+      if (!validMcpCredentialInput(key, value)) {
+        res.status(400).json({ error: 'Use a valid environment key and a nonempty single-line access value.' });
+        return;
+      }
+      // Credential admission must use the current declaration even if another
+      // editor changed the configuration since the last status poll.
+      invalidateMcpServerDiscoveryCache();
       const server = discoverMcpServers().find((s) => s.name === name);
       if (!server) { res.status(404).json({ error: 'server not found' }); return; }
-      const { declaredEnvKeys } = serverEnvStatus(server);
+      // Admission depends only on declaration shape. Do not open credential
+      // storage just to reject an undeclared key or an inline override.
+      const { declaredEnvKeys, editableEnvKeys } = serverEnvStatus(server, { daemon: {}, inherited: {} });
       if (!declaredEnvKeys.includes(key)) {
         res.status(400).json({ error: `"${key}" is not a declared env key for "${name}". Declared: ${declaredEnvKeys.join(', ') || '(none)'}` });
         return;
       }
-      updateEnvKey(key, value); // writes .env + mirrors process.env (value never logged)
+      if (!editableEnvKeys.includes(key)) {
+        res.status(409).json({ code: 'inline_credential_override',
+          error: 'This value is supplied by the server configuration. Update that configuration or use a named credential reference before changing it here.' });
+        return;
+      }
+      writeMcpServerCredential(path.join(BASE_DIR, '.env'), key, value);
+      invalidateRuntimeConfigSnapshot('environment');
       await invalidateConfiguredMcpServers(); // reconnect picks up the new credential
       const setup = await observeConfiguredMcpServerSetup(server.name);
       res.json({ ok: true, server: name, key, set: true, ...setup });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    } catch {
+      res.status(500).json({ error: 'The access detail could not be saved or its connection checked. Refresh the server status before trying again.' });
     }
   });
 

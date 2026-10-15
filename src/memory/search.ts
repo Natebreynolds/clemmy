@@ -58,6 +58,7 @@ export function searchVault(query: string, limit = 5): MemorySearchHit[] {
 }
 
 export interface VaultSearchOptions {
+  deadlineAtMs?: number;
   limit?: number;
   /** Scope ranking toward this objective (focus + current message). */
   objective?: string;
@@ -87,6 +88,7 @@ export async function searchVaultAsync(
     const hits = await recallHybrid(query, {
       limit,
       objective: options.objective,
+      deadlineAtMs: options.deadlineAtMs,
       recencyHalfLifeDays: options.recencyHalfLifeDays,
     });
     if (hits.length > 0) return hits;

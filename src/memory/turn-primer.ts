@@ -123,7 +123,7 @@ async function recallWithin(
   timeoutMs: number,
 ): Promise<{ kind: 'result'; result: UnifiedRecallResult } | { kind: 'timeout' } | { kind: 'error'; error: unknown }> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const recallPromise = recallEverythingImpl(query, options)
+  const recallPromise = recallEverythingImpl(query, { ...options, deadlineAtMs: Math.min(options?.deadlineAtMs ?? Infinity, Date.now() + timeoutMs) })
     .then((result) => ({ kind: 'result' as const, result }))
     .catch((error: unknown) => ({ kind: 'error' as const, error }));
   try {

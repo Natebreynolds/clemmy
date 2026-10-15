@@ -213,6 +213,9 @@ export interface McpServer {
   failureCount?: number;
   lastError?: string;
   declaredEnvKeys?: string[];
+  /** Names the human may replace through the credential endpoint. Inline
+   * configuration values are excluded; absence grants no replacement UI. */
+  editableEnvKeys?: string[];
   unsetEnvKeys?: string[];
   builtin?: boolean;
   type?: string;
@@ -393,7 +396,7 @@ export const deleteMcpServer = (name: string) =>
 // Human-only credential entry for an MCP server's declared env key. The value is
 // written to the daemon env + the server reconnects. Never echoed back.
 export const setMcpCredential = (name: string, key: string, value: string) =>
-  apiPost<{ ok: boolean; state?: 'disabled' | 'needs_credentials' | 'connecting' | 'connected' | 'unavailable'; toolCount?: number }>(
+  apiPost<{ ok: boolean; state?: 'disabled' | 'needs_credentials' | 'connecting' | 'connected' | 'unavailable'; toolCount?: number; unsetEnvKeys?: string[] }>(
     `/api/console/mcp-servers/${encodeURIComponent(name)}/credential`, { key, value });
 export const getClis = () => apiGet<{ clis?: CliRow[]; cliCount?: number; detectedCount?: number }>('/api/console/clis');
 // User-saved CLIs the user explicitly told Clementine they use.

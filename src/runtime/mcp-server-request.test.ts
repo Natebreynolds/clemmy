@@ -410,6 +410,90 @@ test('registered MCP create route protects real config and discovery without lau
     }
   });
 
+  await t.test('configured access details remain editable and rotate the effective value without changing server configuration', async () => {
+    seed();
+    const name = 'replace-credential-fixture';
+    const key = 'CLEMMY_MCP_REPLACE_ROUTE_FIXTURE_TOKEN';
+    const inlineKey = 'CLEMMY_MCP_INLINE_ROUTE_FIXTURE_TOKEN';
+    const envFile = path.join(config.BASE_DIR, '.env');
+    const previousEnv = existsSync(envFile) ? readFileSync(envFile, 'utf8') : undefined;
+    const previousValue = process.env[key];
+    const definition = { name, type: 'stdio', command: 'must-not-start-disabled-fixture', enabled: false,
+      env: { [key]: '', [inlineKey]: 'synthetic-inline-private-marker' } };
+    writeFileSync(config.MCP_SERVERS_FILE, JSON.stringify({ [name]: definition }));
+    mcp.invalidateMcpServerDiscoveryCache();
+    writeFileSync(envFile, `UNRELATED_FIXTURE=keep\n${key}=synthetic-old-private-marker\n ${key} = synthetic-stale-private-marker\n`, { mode: 0o600 });
+    process.env[key] = 'synthetic-inherited-private-marker';
+    try {
+      const listed = await request(undefined, 'get');
+      const row = (listed.payload as any).servers.find((server: any) => server.name === name);
+      assert.deepEqual(row.unsetEnvKeys, []);
+      assert.deepEqual(row.editableEnvKeys, [key]);
+      assert.deepEqual((listed.payload as any).userOverrides[name].editableEnvKeys, [key]);
+      assert.doesNotMatch(JSON.stringify(listed.payload), /synthetic-(?:old|stale|inline|inherited)-private-marker/);
+      const configBytes = readFileSync(config.MCP_SERVERS_FILE, 'utf8');
+      const beforeRejected = readFileSync(envFile, 'utf8');
+      const inline = await request({ key: inlineKey, value: 'must-not-save-this-marker' }, 'post', name, true);
+      assert.equal(inline.status, 409);
+      assert.equal((inline.payload as any).code, 'inline_credential_override');
+      assert.equal(readFileSync(envFile, 'utf8'), beforeRejected);
+      for (const body of [{ key: 'UNDECLARED_FIXTURE', value: 'must-not-save-this-marker' },
+        { key, value: 'line\nbreak' }, { key, value: 'line\rbreak' }, { key, value: 'null\0byte' }, { key, value: ' \t' }]) {
+        const rejected = await request(body, 'post', name, true);
+        assert.equal(rejected.status, 400);
+        assert.equal(readFileSync(envFile, 'utf8'), beforeRejected);
+      }
+      authorized = false;
+      assert.equal((await request({ key, value: 'must-not-save-this-marker' }, 'post', name, true)).status, 401);
+      authorized = true;
+      assert.equal(readFileSync(envFile, 'utf8'), beforeRejected);
+      const value = ' "new synthetic private marker" ';
+      const rotated = await request({ key, value }, 'post', name, true);
+      assert.equal(rotated.status, 200);
+      assert.equal((rotated.payload as any).state, 'disabled');
+      assert.doesNotMatch(JSON.stringify(rotated.payload), /new synthetic private marker/);
+      assert.equal(readFileSync(config.MCP_SERVERS_FILE, 'utf8'), configBytes);
+      assert.equal(process.env[key], value);
+      const { readMcpServerEnv } = await import('./mcp-server-env.js');
+      assert.equal(readMcpServerEnv({ [key]: '' }, envFile, {}).values[key], value);
+      assert.equal(readFileSync(envFile, 'utf8').split('\n').filter(line => line.startsWith(`${key}=`)).length, 1);
+      assert.match(readFileSync(envFile, 'utf8'), /^UNRELATED_FIXTURE=keep\n/);
+    } finally {
+      authorized = true;
+      if (previousValue === undefined) delete process.env[key]; else process.env[key] = previousValue;
+      if (previousEnv === undefined) rmSync(envFile, { force: true }); else writeFileSync(envFile, previousEnv, { mode: 0o600 });
+    }
+  });
+
+  await t.test('credential admission refreshes cached declarations before a replacement', async () => {
+    seed();
+    const name = 'fresh-credential-declaration-fixture';
+    const key = 'CLEMMY_MCP_FRESH_ROUTE_FIXTURE_TOKEN';
+    const envFile = path.join(config.BASE_DIR, '.env');
+    const priorEnv = existsSync(envFile) ? readFileSync(envFile, 'utf8') : undefined;
+    const priorValue = process.env[key];
+    const definition = { name, type: 'stdio', command: 'must-not-start-disabled-fixture', enabled: false, env: { [key]: '' } };
+    try {
+      writeFileSync(envFile, 'UNRELATED_FIXTURE=preserve\n', { mode: 0o600 });
+      for (const [env, expected] of [[{ [key]: 'inline-private-marker' }, 409], [{}, 400]] as const) {
+        writeFileSync(config.MCP_SERVERS_FILE, JSON.stringify({ [name]: definition }));
+        mcp.invalidateMcpServerDiscoveryCache();
+        assert.equal(mcp.discoverMcpServers().find(server => server.name === name)?.env?.[key], '');
+        const currentConfig = JSON.stringify({ [name]: { ...definition, env } });
+        writeFileSync(config.MCP_SERVERS_FILE, currentConfig);
+        const rejected = await request({ key, value: 'must-not-save-private-marker' }, 'post', name, true);
+        assert.equal(rejected.status, expected);
+        assert.equal(readFileSync(envFile, 'utf8'), 'UNRELATED_FIXTURE=preserve\n');
+        assert.equal(process.env[key], priorValue);
+        assert.equal(readFileSync(config.MCP_SERVERS_FILE, 'utf8'), currentConfig);
+        assert.doesNotMatch(JSON.stringify(rejected.payload), /inline-private-marker|must-not-save-private-marker/);
+      }
+    } finally {
+      if (priorEnv === undefined) rmSync(envFile, { force: true }); else writeFileSync(envFile, priorEnv, { mode: 0o600 });
+      mcp.invalidateMcpServerDiscoveryCache();
+    }
+  });
+
   await t.test('persistence failures return a generic error without raw paths or submitted connection values', async () => {
     seed();
     rmSync(config.MCP_SERVERS_FILE);
