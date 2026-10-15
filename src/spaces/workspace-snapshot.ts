@@ -185,6 +185,12 @@ export function recoverWorkspaceSnapshotUnderOwner(slug: string): WorkspaceUpdat
   return recoverUnlocked(slug);
 }
 
+/** Whether a Workspace has an update that a locked read would first complete.
+ * Without one, its committed files are what that read would return. */
+export function workspaceSnapshotRecoveryPending(slug: string): boolean {
+  return existsSync(path.join(rootFor(slug), JOURNAL));
+}
+
 /** Only synchronous reads may re-enter their current writer. Writes remain
  * non-reentrant, and independent processes always acquire the same strict lock. */
 export function withWorkspaceSnapshotRead<T>(slug: string, read: () => T): T {

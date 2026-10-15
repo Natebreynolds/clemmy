@@ -46,6 +46,7 @@ import {
   MODEL_ENV_KEYS,
   getModelSettingsSnapshot,
   getRuntimeEnv,
+  withRuntimeConfigSnapshot,
   normalizeModelId,
   getByoBackendConfig,
   getByoProviderApiKey,
@@ -1144,9 +1145,6 @@ function workflowCertificationSummary(cert: WorkflowCertification) {
   };
 }
 
-function workflowCertificationSummaryFor(def: WorkflowDefinition, workflowSlug: string) {
-  return workflowCertificationSummary(workflowCertificationFor(def, workflowSlug));
-}
 
 function workflowConsoleStatePayload(def: WorkflowDefinition, workflowSlug: string) {
   const certification = workflowCertificationFor(def, workflowSlug);
@@ -5700,7 +5698,9 @@ export function registerConsoleRoutes(
 
   // ─── Workflow Studio ──────────────────────────────────────────
 
-  app.get('/api/console/workflows', (req, res) => {
+  // One coherent runtime-config view per request: certification reads model
+  // and provider settings for every step of every workflow.
+  app.get('/api/console/workflows', (req, res) => withRuntimeConfigSnapshot(() => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       // Latest run per workflow (records are newest-first) → a status dot
@@ -5757,9 +5757,9 @@ export function registerConsoleRoutes(
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
-  });
+  }));
 
-  app.get('/api/console/workflows/home', (req, res) => {
+  app.get('/api/console/workflows/home', (req, res) => withRuntimeConfigSnapshot(() => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const workflows = listWorkflows()
@@ -5832,8 +5832,12 @@ export function registerConsoleRoutes(
       const workflowSummaries = workflows.map((entry) => {
         const runs = runRecords.filter((run) => run.workflow === entry.data.name || run.workflow === entry.name);
         const activeRun = activeRuns.find((run) => run.workflowName === entry.data.name || run.workflowSlug === entry.name) ?? null;
-        const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
-        const certification = workflowCertificationSummaryFor(entry.data, entry.name);
+        // The list route's memo identity (its newest run by name, then by
+        // slug), so either screen warms the other instead of recertifying
+        // every workflow on each visit.
+        const memoRun = runs.find((run) => run.workflow === entry.data.name) ?? runs[0] ?? null;
+        const { proof, certification: certified } = memoizedWorkflowListDerivations(entry, runRecords, memoRun?.id ?? null);
+        const certification = workflowCertificationSummary(certified);
         return {
           name: entry.data.name,
           file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
@@ -5868,7 +5872,7 @@ export function registerConsoleRoutes(
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
-  });
+  }));
 
   app.post('/api/console/workflows/import', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }

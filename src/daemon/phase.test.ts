@@ -325,3 +325,13 @@ test('a contained loop step that throws yields its fallback after its phase has 
   const ok = await withContainedDaemonRuntimePhase('daemon.loop.next', {}, () => 7, () => -1);
   assert.equal(ok, 7, 'a step that succeeds returns its own value and never calls contain');
 });
+
+test('synchronous work under its own phase is the running phase, and the caller gets the label back', async () => {
+  const phase = await import('./phase.js');
+  await phase.withDaemonRuntimePhase('test.outer_async', {}, async () => {
+    const seen = phase.withDaemonRuntimePhaseSync('test.inner_sync', { step: 'one' }, () => phase.getDaemonRuntimePhase());
+    assert.equal(seen.name, 'test.inner_sync');
+    assert.equal(phase.getDaemonRuntimePhase().name, 'test.outer_async', 'the enclosing phase owns the code after the sync work');
+    assert.ok(!phase.listInFlightDaemonPhases().some((entry) => entry.name === 'test.inner_sync'), 'the sync phase is no longer in flight');
+  });
+});

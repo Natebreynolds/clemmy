@@ -858,9 +858,11 @@ export function listPendingRuns(): PendingRun[] {
     for (const runId of readdirSync(runsDir)) {
       const evFile = path.join(runsDir, runId, 'events.jsonl');
       if (!existsSync(evFile)) continue;
+      // The run record answers for most finished runs; replaying the whole
+      // event log is only needed for a run its record still calls live.
+      if (terminalRunRecordStatus(runId)) continue;
       const state = computeResumeState(workflowDir, runId);
       if (state.terminal) continue;
-      if (terminalRunRecordStatus(runId)) continue;
       pending.push({
         workflowName: workflowDir,
         runId,

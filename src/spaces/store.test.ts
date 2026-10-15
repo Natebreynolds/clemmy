@@ -1030,3 +1030,23 @@ test('manifest-only snapshot preserves data and distinguishes an absent view fro
   mkdirSync(file);
   assert.throws(() => store.spaceStore.snapshot(slug), (error: unknown) => (error as NodeJS.ErrnoException).code === 'EISDIR', 'non-absence I/O errors must not masquerade as a missing view');
 });
+
+test('listWhere returns exactly the matching Spaces that list would, and archived ones only when asked', () => {
+  store.spaceStore.save({ id: 'lw-match', title: 'Match: pipeline' });
+  store.spaceStore.save({ id: 'lw-other', title: 'Unrelated board' });
+  store.spaceStore.save({ id: 'lw-archived', title: 'Match: old pipeline' });
+  store.spaceStore.archive('lw-archived');
+  const isMatch = (space: { title: string }) => space.title.startsWith('Match:');
+
+  const expected = store.spaceStore.list().filter(isMatch).map((space) => space.id);
+  assert.deepEqual(store.spaceStore.listWhere(isMatch).map((space) => space.id), expected);
+  assert.deepEqual(expected, ['lw-match']);
+  assert.deepEqual(
+    store.spaceStore.listWhere(isMatch, true).map((space) => space.id).sort(),
+    ['lw-archived', 'lw-match'],
+    'an archived match is listed when archived Spaces are asked for',
+  );
+  // A match is the current locked record, not the passed-over committed read.
+  store.spaceStore.save({ id: 'lw-other', title: 'Match: renamed' });
+  assert.deepEqual(store.spaceStore.listWhere(isMatch).map((space) => space.title).sort(), ['Match: pipeline', 'Match: renamed']);
+});
