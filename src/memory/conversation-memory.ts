@@ -106,12 +106,14 @@ function parseMemory(value: unknown): ConversationMemory | null {
   };
 }
 
-async function summarize(transcript: string, model: Model | string): Promise<ConversationMemory | null> {
+export async function summarizeConversationForMemory(transcript: string, model: Model | string): Promise<ConversationMemory | null> {
   if (summarizerOverrideForTest) return summarizerOverrideForTest(transcript, model);
   const agent = new Agent({
     name: 'ConversationMemory',
     model,
-    modelSettings: { reasoning: { effort: 'low' } },
+    // A summary of a transcript needs no extended thinking; it only made the
+    // answer several times longer than the summary.
+    modelSettings: { reasoning: { effort: 'none' }, maxTokens: 1_200 },
     instructions: [
       'You write the memory Clem keeps of one finished conversation between the owner and Clem, from its transcript alone.',
       'summary: what the owner asked for, what Clem did and found, what was decided, and how it ended, in plain past-tense sentences, at most 900 characters. Keep exact names, numbers, dates, ids, file paths and links the transcript states. Never add anything the transcript does not say.',
@@ -167,7 +169,7 @@ async function rememberConversation(sessionId: string, model: Model | string): P
   if (!session) return { kind: 'empty' };
   const transcript = conversationTranscript(sessionId);
   if (transcript.turns === 0) return { kind: 'empty' };
-  const memory = await summarize(transcript.text, model);
+  const memory = await summarizeConversationForMemory(transcript.text, model);
   if (!memory) return { kind: 'unusable' };
   const content = memoryText(memory);
   const episode = recordMemoryEpisode({
