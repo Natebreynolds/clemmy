@@ -2887,8 +2887,10 @@ function renderTemplate(
       return value === undefined || value === null ? '' : String(value);
     })
     .replace(/\{\{input\.([a-zA-Z0-9_-]+)\}\}/g, (_m, key: string) => inputs[key] ?? '')
-    .replace(/\{\{steps\.([a-zA-Z0-9_-]+)\.output\}\}/g, (_m, key: string) => {
-      const out = stepOutputs[key];
+    .replace(/\{\{steps\.([a-zA-Z0-9_-]+)\.output(?:\.([a-zA-Z0-9_.-]+))?\}\}/g, (_m, key: string, field?: string) => {
+      // A field of a step's output ("{{steps.x.output.title}}") fills in
+      // inside text the same way it does as a whole argument.
+      const out = field ? pathGet(stepOutputs[key], field) : stepOutputs[key];
       if (out === undefined || out === null) return '';
       return typeof out === 'string' ? out : JSON.stringify(out, null, 2);
     })
@@ -2917,12 +2919,37 @@ const CALL_FULL_TOKEN_RE = /^\s*\{\{\s*(input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_
 
 function pathGet(value: unknown, dotted: string): unknown {
   if (!dotted) return value;
-  let cursor = value;
+  // A step that answered with JSON text has those fields too.
+  let cursor = typeof value === 'string' ? parseJsonObjectText(value) ?? value : value;
   for (const part of dotted.split('.')) {
     if (!cursor || typeof cursor !== 'object') return undefined;
     cursor = (cursor as Record<string, unknown>)[part];
   }
   return cursor;
+}
+
+function parseJsonObjectText(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return undefined;
+  try { return JSON.parse(trimmed) as unknown; } catch { return undefined; }
+}
+
+/** Field references ("{{steps.x.output.title}}") in a step's arguments that
+ *  name a field the referenced step's real output does not have. */
+function missingStepOutputFields(value: unknown, stepOutputs: Record<string, unknown>, found: string[] = []): string[] {
+  if (typeof value === 'string') {
+    for (const match of value.matchAll(/\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output\.([a-zA-Z0-9_.-]+)\s*\}\}/g)) {
+      const [, stepId, field] = match;
+      const out = stepOutputs[stepId!];
+      const previewed = !!out && typeof out === 'object' && (out as { previewed?: unknown }).previewed === true;
+      if (out !== undefined && !previewed && pathGet(out, field!) === undefined) found.push(`steps.${stepId}.output.${field}`);
+    }
+  } else if (Array.isArray(value)) {
+    for (const entry of value) missingStepOutputFields(entry, stepOutputs, found);
+  } else if (value && typeof value === 'object') {
+    for (const entry of Object.values(value)) missingStepOutputFields(entry, stepOutputs, found);
+  }
+  return found;
 }
 
 function resolveCallToken(token: string, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item: unknown, project?: WorkflowStepProjectContext): unknown {
@@ -14483,6 +14510,10 @@ async function rehearsedCallArgumentProblem(
 ): Promise<string | null> {
   const call = step.call;
   if (!call?.tool || step.forEach || step.invocationPlan) return null;
+  const missing = [...new Set(missingStepOutputFields(call.args, ctx.stepOutputs))];
+  if (missing.length > 0) {
+    return `its arguments refer to ${missing.map((ref) => `{{${ref}}}`).join(', ')}, which the step's real output does not have, so the run would write them empty`;
+  }
   let rendered: Record<string, unknown>;
   try {
     rendered = normalizeReviewedLocalWorkflowArguments(call.tool, renderCallArgs(

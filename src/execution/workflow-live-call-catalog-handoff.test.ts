@@ -505,3 +505,36 @@ test('a step\'s whole output saved to a file is written as its JSON text, not re
     { respond: async () => { throw new Error('no model runs in this rehearsal'); } } as never);
   assert.equal(result.steps.find((step) => step.stepId === 'save_note')?.status, 'previewed', JSON.stringify(result.steps));
 });
+
+test('a field of a step\'s output fills in inside text, and a field the real output lacks is caught by the rehearsal', async () => {
+  const filled = runner.renderCallArgs(
+    { content: '{{steps.gather.output.title}}: {{steps.gather.output.tips.0}}', whole: '{{steps.gather.output.title}}' },
+    {},
+    { gather: '{"title":"Care","tips":["water weekly","bright light"]}' },
+  );
+  assert.equal(filled.content, 'Care: water weekly', 'JSON text output has its fields too, inside text');
+  assert.equal(filled.whole, 'Care');
+
+  runner._setWorkflowCallNodeForTests(async (step) => (
+    step.id === 'gather' ? { title: 'Care', tips: ['water weekly', 'bright light'] } : { ok: true }
+  ));
+  try {
+    const saved = workflows.writeWorkflow('rehearsed-missing-field', {
+      name: 'Rehearsed missing field', description: 'Saves a note from a field the step does not return.',
+      enabled: false, trigger: { manual: true },
+      steps: [
+        { id: 'gather', sideEffect: 'read', call: { tool: 'FIXTURE_TIPS_LIST_TIPS', args: {} } },
+        { id: 'save_note', dependsOn: ['gather'], sideEffect: 'write',
+          call: { tool: 'write_file', args: { path: 'notes/field.md', content: '{{steps.gather.output.headline}}', mode: 'overwrite' } } },
+      ],
+    });
+    const result = await runner.runCreationTest(saved.data, saved.name, 'creation-rehearsed-missing-field', {},
+      { respond: async () => { throw new Error('legacy responder must not execute'); } } as never);
+    const save = result.steps.find((step) => step.stepId === 'save_note');
+    assert.equal(result.steps.find((step) => step.stepId === 'gather')?.status, 'ok', JSON.stringify(result.steps));
+    assert.equal(save?.status, 'error', JSON.stringify(result.steps));
+    assert.match(save?.detail ?? '', /steps\.gather\.output\.headline/);
+  } finally {
+    runner._setWorkflowCallNodeForTests();
+  }
+});
