@@ -214,7 +214,7 @@ import { cancelledSuccessorReadReviewEvidence, cancelledSuccessorReadReviewIsAut
   cancelledSuccessorReadReviewRequired } from './cancelled-successor-retained-read.js';
 import {
   acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceHasNoCompletionWork, sourceEvidenceLookup, sourceWritesAtStake,
-  sourceAttemptedWrites, historicalReadCompletionEvidence, historicalReadClosureIsAuthentic,
+  sourceAttemptedWrites, sourceProducedOutput, historicalReadCompletionEvidence, historicalReadClosureIsAuthentic,
   sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence, sourceSucceededResultCount,
   earlierTurnsEvidence,
 } from './host-completion-work.js';
@@ -4956,6 +4956,8 @@ const runHostTurnBody = async (
         reviewStakes: reviewStakesForTurn,
         // Every write it attempted still sets the review's deadline.
         attemptedWrites: sourceAttemptedWrites(identity),
+        // An answer that wrote or created nothing is checked by Jev alone.
+        ...(!planCandidate && !sourceProducedOutput(identity) ? { producedNoOutput: true } : {}),
         verifiedReads: readEvidence.summary,
         verifiedReadResults: readEvidence.results,
         ...(inheritedReads ? { inheritedReadCoverage: inheritedReads.coverage } : {}),

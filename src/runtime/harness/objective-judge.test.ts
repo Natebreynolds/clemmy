@@ -1651,3 +1651,54 @@ test('round17 execution restrictions: the existing hedged entry sends one comple
   for (const retained of [fixture.objective, fixture.candidate, fixture.evidence, context.agentInstructions]) assert.ok(sent.includes(retained));
   assert.match(String(captured.requests[0]!.systemInstructions), /prohibited action that already occurred/);
 });
+
+test('an answer that wrote or created nothing is checked by Jev alone, with partial evidence too', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let reviewerCalls = 0;
+  _setCompletionJudgeForTests(async () => {
+    reviewerCalls += 1;
+    return { verdict: { done: true, reason: 'reviewer: the answer stands' }, failure: null };
+  });
+  // A page read the reply was only partly shown: the case that used to fall to the second model.
+  const partialRead = [{ toolName: 'cloud_browser_read', outcome: 'succeeded' as const, status: 'verified' as const,
+    contentComplete: false, evidenceKind: 'source_result' as const }];
+  const judge = (sessionId: string) => judgeObjectiveComplete('Find me a pokemon pillow on Target.',
+    'The Poké Ball decorative throw pillow is $16.99 among the listings I inspected.',
+    { sessionId, skills: [], toolCallSummary: 'none', reviewStakes: 'read', producedNoOutput: true,
+      verifiedReadResults: partialRead });
+  for (const [kind, expectDone] of [['done', true], ['incomplete', false]] as const) {
+    const jev = { count: 0 };
+    _setSystemOneFetchForTests(async () => {
+      jev.count += 1;
+      return { status: 200, ok: true, text: async () => JSON.stringify(jevCompletionReading(kind)) };
+    });
+    const v = await judge(`probe-jev-only-${kind}`);
+    assert.equal(jev.count, 1, `Jev reads the ${kind} answer`);
+    assert.equal(v.fast, true);
+    assert.equal(v.done, expectDone, `Jev's ${kind} reading decides`);
+    assert.notEqual(v.failedOpen, true, 'a check did complete');
+  }
+  _setSystemOneFetchForTests(async () => { throw new Error('jev unreachable'); });
+  const unread = await judge('probe-jev-only-unreachable');
+  assert.equal(unread.done, true, 'the answer ships');
+  assert.equal(unread.failedOpen, true, 'and is recorded as unreviewed, never as reviewed');
+  assert.equal(reviewerCalls, 0, 'the second model never reviews an answer that produced nothing');
+  _setCompletionJudgeForTests(unavailableSettingsJudge);
+  _setTypesafeKeyForTests(undefined);
+});
+
+test('an answer that wrote a local file keeps the second-model review', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({ status: 200, ok: true, text: async () => JSON.stringify(jevCompletionReading('done')) }));
+  let reviewerCalls = 0;
+  _setCompletionJudgeForTests(async () => {
+    reviewerCalls += 1;
+    return { verdict: { done: true, reason: 'reviewer: the brief has the new sentence' }, failure: null };
+  });
+  const v = await judgeObjectiveComplete('Change one sentence in the brief.', 'I changed the sentence in the brief.',
+    { sessionId: 'probe-local-write', skills: [], toolCallSummary: 'none', reviewStakes: 'read', attemptedWrites: 1 });
+  assert.equal(reviewerCalls, 1, 'a creation is reviewed by the second model');
+  assert.equal(v.done, true);
+  _setCompletionJudgeForTests(unavailableSettingsJudge);
+  _setTypesafeKeyForTests(undefined);
+});

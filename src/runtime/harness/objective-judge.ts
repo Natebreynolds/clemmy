@@ -778,6 +778,9 @@ export interface SkillExecutionContext {
    *  reviewer reads every one of their receipts, so even a read-depth review
    *  of a turn that wrote waits the write deadline, not the read one. */
   attemptedWrites?: number;
+  /** The turn wrote or created nothing (a browser page visit is not output).
+   *  Such an answer is checked by Jev alone. */
+  producedNoOutput?: boolean;
 }
 
 /** Select the same options in their original read order, including both
@@ -2510,6 +2513,51 @@ export async function judgeObjectiveComplete(
   // Jev cannot open/attest exact origin-qualified inherited-read coverage.
   // A complete current read does not discharge the stopped parent's evidence.
   const reviewsInherited = skillContext?.inheritedReadCoverage !== undefined;
+  // The owner's rule: an answer that wrote or created nothing is checked by
+  // Jev alone; a second model reviews only output. Jev's DONE ships, its
+  // NOT-DONE drives the ordinary bounded revision, and a reply that closes on
+  // a real question waits for the owner. With no verdict from Jev the answer
+  // ships recorded as unreviewed, never as reviewed.
+  if (skillContext?.producedNoOutput === true && !reviewsPlan && !reviewsWrite
+    && !reviewsMemory && !reviewsInherited) {
+    const fast = await askJev(true);
+    callerSignal?.throwIfAborted();
+    const settled = Boolean(fast) && ((fast!.done && !fast!.awaitingUser && !fast!.blocked)
+      || (fast!.awaitingUser === true && directionQuestion));
+    if (fast) noteJev(fast, settled);
+    if (fast && settled) {
+      return {
+        done: fast.done,
+        reason: fast.reason,
+        judgeModelId: fast.judgeModelId,
+        fast: true,
+        ...UNAVAILABLE_JUDGE_COMPARISON,
+        ...(fast.historicalEvidence ? { historicalEvidence: fast.historicalEvidence } : {}),
+        ...(jevAttempt ? { jevAttempt } : {}),
+        ...(fast.awaitingUser ? { awaitingUser: true } : {}),
+      };
+    }
+    if (fast && !fast.done && !fast.awaitingUser) {
+      return {
+        done: false,
+        reason: fast.reason?.trim() ? fast.reason : 'The fast check found the objective unmet.',
+        judgeModelId: fast.judgeModelId,
+        fast: true,
+        ...UNAVAILABLE_JUDGE_COMPARISON,
+        ...(fast.blocked ? { blocked: true } : {}),
+        ...(fast.repairScope ? { repairScope: fast.repairScope } : {}),
+        ...(jevAttempt ? { jevAttempt } : {}),
+      };
+    }
+    return {
+      done: true,
+      failedOpen: true,
+      reviewFailure: 'unavailable',
+      ...UNAVAILABLE_JUDGE_COMPARISON,
+      reason: 'An answer that produced nothing is checked by Jev alone, and Jev gave no verdict; no review was completed.',
+      ...(jevAttempt ? { jevAttempt } : {}),
+    };
+  }
   if (!reviewsPlan && !reviewsWrite && !reviewsMemory && !reviewsInherited
     && (coverage.complete || directionQuestion || historicalEligible)) {
     const jevPromise = askJev(true);

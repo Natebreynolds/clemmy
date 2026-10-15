@@ -200,26 +200,49 @@ export function sourceWritesAtStake(input: {
   sourceUserSeq: number;
 }): number {
   try {
-    const rows = openEventLog().prepare(`
-      SELECT s.execution_kind AS executionKind, s.outcome_kind AS outcomeKind,
-             s.requirement_id AS requirementId, l.tool_name AS toolName
-        FROM logical_call_settlements s
-        LEFT JOIN logical_tool_calls l
-          ON l.session_id = s.session_id
-         AND l.source_user_seq = s.source_user_seq
-         AND l.logical_tool_call_id = s.logical_tool_call_id
-       WHERE s.session_id = ? AND s.source_user_seq = ? AND s.mutating = 1
-    `).all(input.sessionId, input.sourceUserSeq) as Array<{
-      executionKind: string | null; outcomeKind: string | null; requirementId: string | null; toolName: string | null;
-    }>;
-    return rows.filter((row) => !(row.toolName && ((row.executionKind === 'local_execution'
+    return mutatingSettlements(input).filter((row) => !(row.toolName && ((row.executionKind === 'local_execution'
       && row.outcomeKind === 'succeeded'
       && undoableLocalArtifactWrite(row.toolName, row.requirementId))
-      || (row.outcomeKind !== 'uncertain_write'
-        && restorableLocalExecution(row.toolName, row.requirementId))))).length;
+      || isRestorableExecution(row)))).length;
   } catch {
     return 1;
   }
+}
+
+/** Whether this source wrote or created anything: any write other than a
+ *  restorable local execution such as a browser page visit, local file edits
+ *  included. An unreadable ledger counts as output. */
+export function sourceProducedOutput(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  try {
+    return mutatingSettlements(input).some((row) => !isRestorableExecution(row));
+  } catch {
+    return true;
+  }
+}
+
+interface MutatingSettlementRow {
+  executionKind: string | null; outcomeKind: string | null; requirementId: string | null; toolName: string | null;
+}
+
+function mutatingSettlements(input: { sessionId: string; sourceUserSeq: number }): MutatingSettlementRow[] {
+  return openEventLog().prepare(`
+    SELECT s.execution_kind AS executionKind, s.outcome_kind AS outcomeKind,
+           s.requirement_id AS requirementId, l.tool_name AS toolName
+      FROM logical_call_settlements s
+      LEFT JOIN logical_tool_calls l
+        ON l.session_id = s.session_id
+       AND l.source_user_seq = s.source_user_seq
+       AND l.logical_tool_call_id = s.logical_tool_call_id
+     WHERE s.session_id = ? AND s.source_user_seq = ? AND s.mutating = 1
+  `).all(input.sessionId, input.sourceUserSeq) as MutatingSettlementRow[];
+}
+
+function isRestorableExecution(row: MutatingSettlementRow): boolean {
+  return Boolean(row.toolName && row.outcomeKind !== 'uncertain_write'
+    && restorableLocalExecution(row.toolName, row.requirementId));
 }
 
 export interface CompletionReadEvidence {
