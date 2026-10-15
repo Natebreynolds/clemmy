@@ -56,6 +56,12 @@ export function normalizeReviewedLocalWorkflowArguments(
   }
   if (observed?.execution.adapter !== 'local_file_revision_v1') return args;
   const normalized: Record<string, unknown> = { ...args, mode: args.mode ?? 'create' };
+  // A file holds text. A step's whole output placed in `content` arrives as
+  // the structured value it is; its JSON text is that same value, losslessly,
+  // and is what saving it to a file means.
+  if (normalized.content !== null && typeof normalized.content === 'object') {
+    normalized.content = JSON.stringify(normalized.content, null, 2);
+  }
   // null means "use mode" on the registered tool. The workflow plan carries
   // concrete JSON values, so omit this optional no-op flag rather than freeze
   // a null binding that its argument language cannot represent.

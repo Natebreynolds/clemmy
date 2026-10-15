@@ -461,10 +461,10 @@ test('a step naming an app this setup has not connected is a dependency to conne
 
 test('a rehearsal checks a previewed write step\'s filled-in arguments the way the run will, without making the change', async () => {
   const broken = workflows.writeWorkflow('rehearsed-write-arguments', {
-    name: 'Rehearsed write arguments', description: 'Saves a note whose content is not text.',
+    name: 'Rehearsed write arguments', description: 'Saves a note to a path that is not text.',
     enabled: false, trigger: { manual: true },
     steps: [
-      { id: 'save_note', sideEffect: 'write', call: { tool: 'write_file', args: { path: 'notes/rehearsal-canary.md', content: { not: 'text' }, mode: 'overwrite' } } },
+      { id: 'save_note', sideEffect: 'write', call: { tool: 'write_file', args: { path: { not: 'a path' }, content: 'hello', mode: 'overwrite' } } },
     ],
   });
   const refused = await runner.runCreationTest(broken.data, broken.name, 'creation-rehearsed-write-args', {},
@@ -473,7 +473,7 @@ test('a rehearsal checks a previewed write step\'s filled-in arguments the way t
   const save = refused.steps.find((step) => step.stepId === 'save_note');
   assert.equal(save?.status, 'error', JSON.stringify(refused.steps));
   assert.match(save?.detail ?? '', /run would stop here/);
-  assert.match(save?.detail ?? '', /content/);
+  assert.match(save?.detail ?? '', /path/);
 
   const fine = workflows.writeWorkflow('rehearsed-write-arguments-ok', {
     name: 'Rehearsed write arguments ok', description: 'Saves a note.',
@@ -485,4 +485,23 @@ test('a rehearsal checks a previewed write step\'s filled-in arguments the way t
   const previewed = await runner.runCreationTest(fine.data, fine.name, 'creation-rehearsed-write-args-ok', {},
     { respond: async () => { throw new Error('no model runs in this rehearsal'); } } as never);
   assert.equal(previewed.steps.find((step) => step.stepId === 'save_note')?.status, 'previewed', JSON.stringify(previewed.steps));
+});
+
+test('a step\'s whole output saved to a file is written as its JSON text, not refused', async () => {
+  const { normalizeReviewedLocalWorkflowArguments } = await import('../runtime/harness/reviewed-local-workflow-capability.js');
+  const normalized = normalizeReviewedLocalWorkflowArguments('write_file', {
+    path: 'notes/out.md', content: { title: 'Care', tips: ['water', 'light'] }, mode: 'overwrite',
+  });
+  assert.equal(typeof normalized.content, 'string');
+  assert.deepEqual(JSON.parse(String(normalized.content)), { title: 'Care', tips: ['water', 'light'] });
+  const fine = workflows.writeWorkflow('rehearsed-write-object-content', {
+    name: 'Rehearsed write object content', description: 'Saves a structured note.',
+    enabled: false, trigger: { manual: true },
+    steps: [
+      { id: 'save_note', sideEffect: 'write', call: { tool: 'write_file', args: { path: 'notes/object.md', content: { a: 1 }, mode: 'overwrite' } } },
+    ],
+  });
+  const result = await runner.runCreationTest(fine.data, fine.name, 'creation-rehearsed-object-content', {},
+    { respond: async () => { throw new Error('no model runs in this rehearsal'); } } as never);
+  assert.equal(result.steps.find((step) => step.stepId === 'save_note')?.status, 'previewed', JSON.stringify(result.steps));
 });
