@@ -39,10 +39,12 @@ import {
 import {
   composioToolOperationVersion,
   composioToolSchemaObservedAt,
+  composioConnectionsProblem,
   getExactComposioToolsBySlugs,
   listCachedToolkits,
   listUsableConnectedToolkits,
   peekConnectedToolkits,
+  peekCurrentConnectedToolkits,
   searchConnectedComposioTools,
   selectToolkitConnection,
 } from '../integrations/composio/client.js';
@@ -2688,28 +2690,36 @@ export function buildAuthorizedToolSearchCandidateSources(
     query: string,
     signal: AbortSignal | undefined,
     deadlineAt: number | undefined,
+    observeConnections: () => Promise<ReturnType<typeof peekCurrentConnectedToolkits>>,
   ): Promise<ToolSearchBrokerCandidate[]> {
     try {
-      const connected = new Set(peekConnectedToolkits()
-        .filter((connection) => /active|enabled|initiat/i.test(connection.status ?? ''))
-        .map((connection) => connection.slug.trim().toLowerCase()));
       const lower = query.toLowerCase();
       const words = new Set(lower.split(/[^a-z0-9]+/).filter(Boolean));
       const compactQuery = lower.replace(/[^a-z0-9]/g, '');
       const named = listCachedToolkits().filter((toolkit) => {
         const slug = toolkit.slug.trim().toLowerCase();
-        if (!slug || connected.has(slug)) return false;
+        if (!slug) return false;
         const name = toolkit.name.toLowerCase().replace(/[^a-z0-9]/g, '');
         return words.has(slug) || words.has(name) || (name.length >= 6 && compactQuery.includes(name));
-      }).slice(0, 2);
+      });
       if (named.length === 0 || signal?.aborted) return [];
+      const observation = await observeConnections();
+      // A missing/last-good registry is unknown, never evidence that an app
+      // is disconnected. Keep the exact current observation for publication.
+      if (!observation || signal?.aborted) return [];
+      const connected = new Set(observation
+        .filter((connection) => /active|enabled|initiat/i.test(connection.status ?? ''))
+        .map((connection) => connection.slug.trim().toLowerCase()));
+      const unconnected = named.filter(toolkit => !connected.has(toolkit.slug.trim().toLowerCase())).slice(0, 2);
+      if (unconnected.length === 0) return [];
       const outcome = await awaitBounded({
-        start: () => searchConnectedComposioTools(named.map((toolkit) => toolkit.slug), query, 8),
+        start: () => searchConnectedComposioTools(unconnected.map((toolkit) => toolkit.slug), query, 8),
         signal,
         ...(deadlineAt !== undefined ? { deadlineAt: deadlineAt - PROVIDER_SOURCE_RETURN_MARGIN_MS } : {}),
       });
-      if (outcome.kind !== 'settled') return [];
-      const appNames = new Map(named.map((toolkit) => [toolkit.slug.trim().toLowerCase(), toolkit.name]));
+      if (outcome.kind !== 'settled' || signal?.aborted || composioConnectionsProblem()
+        || peekCurrentConnectedToolkits() !== observation) return [];
+      const appNames = new Map(unconnected.map((toolkit) => [toolkit.slug.trim().toLowerCase(), toolkit.name]));
       return outcome.value.filter((tool) => tool.inputParameters !== undefined).slice(0, 4).map((tool): ToolSearchBrokerCandidate => {
         const toolkit = (tool.toolkitSlug ?? registeredToolkitOfSlug(tool.slug)).trim().toLowerCase();
         const app = appNames.get(toolkit) ?? toolkit;
@@ -2730,12 +2740,25 @@ export function buildAuthorizedToolSearchCandidateSources(
     }
   }
   async function searchLive(input: Parameters<ToolSearchCandidateSource['search']>[0]): Promise<ToolSearchBrokerCandidate[]> {
-    const [connected, unconnected] = await Promise.all([
-      searchConnectedLive(input),
+    let connectionObservation: Promise<ReturnType<typeof peekCurrentConnectedToolkits>> | undefined;
+    const observeConnections = () => connectionObservation ??= (async () => {
+      const observed = await freshConnectionsWithin({ signal: input.signal, deadlineAt: exactDiscoveryDeadline(input.deadlineAt) });
+      return observed && !composioConnectionsProblem() ? peekCurrentConnectedToolkits() : null;
+    })();
+    const [connectedOutcome, unconnected] = await Promise.all([
+      searchConnectedLive(input).then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error })),
       exactComposioOperationsFromQuery(input.query).length > 0
         ? Promise.resolve([] as ToolSearchBrokerCandidate[])
-        : namedUnconnectedCandidates(input.query, input.signal, input.deadlineAt),
+        : namedUnconnectedCandidates(input.query, input.signal, input.deadlineAt, observeConnections),
     ]);
+    if (!connectedOutcome.ok) {
+      // A confirmed empty registry can still answer with setup-only metadata.
+      // Keep every other failure, and no_connections without such evidence.
+      if (connectedOutcome.error instanceof CandidateSourceUnavailableError
+        && connectedOutcome.error.code === 'no_connections' && unconnected.length > 0) return unconnected;
+      throw connectedOutcome.error;
+    }
+    const connected = connectedOutcome.value;
     const seen = new Set(connected.map((candidate) => candidate.name.trim().toUpperCase()));
     return [...connected, ...unconnected.filter((candidate) => !seen.has(candidate.name.trim().toUpperCase()))];
   }
