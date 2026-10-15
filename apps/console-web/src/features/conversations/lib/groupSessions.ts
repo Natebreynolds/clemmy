@@ -3,6 +3,17 @@ import type { Session } from '../types';
 export interface SessionGroup {
   label: string;
   items: Session[];
+  /** The Pinned section: dropping a chat here pins it. */
+  pinned?: true;
+}
+
+/** The drag payload a chat row carries: its session id. */
+export const CHAT_DRAG_TYPE = 'application/x-clementine-chat';
+
+/** The pin state a chat dropped on a section takes, or null when the drop
+ *  changes nothing: on Pinned it pins, anywhere else it unpins. */
+export function pinChangeForDrop(chat: Pick<Session, 'pinned'>, ontoPinned: boolean): boolean | null {
+  return Boolean(chat.pinned) === ontoPinned ? null : ontoPinned;
 }
 
 function dayBucket(iso: string, now: number): string {
@@ -37,7 +48,7 @@ export function groupSessions(sessions: Session[], now: number): SessionGroup[] 
   }
 
   const groups: SessionGroup[] = [];
-  if (pinned.length) groups.push({ label: 'Pinned', items: pinned });
+  if (pinned.length) groups.push({ label: 'Pinned', items: pinned, pinned: true });
   for (const label of ORDER) {
     const items = buckets.get(label);
     if (items?.length) groups.push({ label, items });

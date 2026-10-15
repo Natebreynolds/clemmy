@@ -13,7 +13,7 @@ import {
 } from '@/lib/run-presentation';
 import { useSessions } from '../hooks/useSessions';
 import { useSessionMutations } from '../hooks/useSessionMutations';
-import { groupSessions, collectTags } from '../lib/groupSessions';
+import { groupSessions, collectTags, CHAT_DRAG_TYPE, pinChangeForDrop } from '../lib/groupSessions';
 import { ConversationListItem } from './ConversationListItem';
 import type { SessionFilters } from '../types';
 
@@ -110,6 +110,31 @@ export function ConversationSidebar({
     if (open && !open.running) markChatSeen(open.id, open.updatedAt);
   }, [open?.id, open?.updatedAt, open?.running]);
   const tags = useMemo(() => collectTags(sessions), [sessions]);
+  // Drag a chat onto Pinned to pin it, or out of Pinned onto any other
+  // section to unpin it. The menu's Pin/Unpin stays for keyboard use.
+  const [dragging, setDragging] = useState<{ id: string; pinned: boolean } | null>(null);
+  const [dropOnto, setDropOnto] = useState<string | null>(null);
+  const dropProps = (ontoPinned: boolean, section: string) => ({
+    onDragOver: (event: React.DragEvent) => {
+      if (!dragging || !event.dataTransfer.types.includes(CHAT_DRAG_TYPE)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = pinChangeForDrop(dragging, ontoPinned) === null ? 'none' : 'move';
+      setDropOnto(section);
+    },
+    onDragLeave: (event: React.DragEvent) => {
+      if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropOnto(null);
+    },
+    onDrop: (event: React.DragEvent) => {
+      const id = event.dataTransfer.getData(CHAT_DRAG_TYPE);
+      if (!id || !dragging || dragging.id !== id) return;
+      event.preventDefault();
+      const next = pinChangeForDrop(dragging, ontoPinned);
+      if (next !== null) mutations.setPinned(id, next);
+      setDragging(null);
+      setDropOnto(null);
+    },
+  });
+  const hasPinnedGroup = groups.some((group) => group.pinned);
 
   const setParam = (key: string, value: string | null) => {
     if (embedded) {
@@ -241,21 +266,54 @@ export function ConversationSidebar({
             })}
           </p>
         ) : (
-          groups.map((group) => (
-            <div key={group.label} className="mb-3">
-              <div className="px-3 py-1 text-caption font-semibold text-faint">{group.label}</div>
-              <div className="space-y-0.5">
-                {group.items.map((s) => (
-                  <ConversationListItem
-                    key={s.id}
-                    session={s}
-                    actions={actions}
-                    news={s.id !== activeId && chatHasNews({ id: s.id, updatedAt: Date.parse(s.updatedAt), running: s.running }, seen)}
-                  />
-                ))}
+          <>
+            {dragging && !dragging.pinned && !hasPinnedGroup && (
+              <div
+                {...dropProps(true, 'pin-zone')}
+                className={cn('mb-3 rounded-md border border-dashed px-3 py-3 text-center text-caption transition-colors',
+                  dropOnto === 'pin-zone' ? 'border-primary bg-primary-tint text-primary' : 'border-border-strong text-muted')}
+              >
+                Drop here to pin
               </div>
-            </div>
-          ))
+            )}
+            {groups.map((group) => {
+              const highlighted = dragging && pinChangeForDrop(dragging, Boolean(group.pinned)) !== null
+                && dropOnto === group.label;
+              return (
+                <div
+                  key={group.label}
+                  {...dropProps(Boolean(group.pinned), group.label)}
+                  className={cn('mb-3 rounded-md transition-colors', highlighted && 'bg-primary-tint ring-1 ring-primary')}
+                >
+                  <div className="px-3 py-1 text-caption font-semibold text-faint">
+                    {group.label}
+                    {group.pinned && dragging && !dragging.pinned ? <span className="ml-1 font-normal">· drop to pin</span> : null}
+                  </div>
+                  <div className="space-y-0.5">
+                    {group.items.map((s) => (
+                      <div
+                        key={s.id}
+                        draggable
+                        onDragStart={(event) => {
+                          event.dataTransfer.setData(CHAT_DRAG_TYPE, s.id);
+                          event.dataTransfer.effectAllowed = 'move';
+                          setDragging({ id: s.id, pinned: Boolean(s.pinned) });
+                        }}
+                        onDragEnd={() => { setDragging(null); setDropOnto(null); }}
+                        className={cn(dragging?.id === s.id && 'opacity-50')}
+                      >
+                        <ConversationListItem
+                          session={s}
+                          actions={actions}
+                          news={s.id !== activeId && chatHasNews({ id: s.id, updatedAt: Date.parse(s.updatedAt), running: s.running }, seen)}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </>
         )}
       </div>
     </aside>
