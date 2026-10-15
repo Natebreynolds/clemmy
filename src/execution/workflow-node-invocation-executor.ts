@@ -949,8 +949,10 @@ export async function executeWorkflowNodeRead(
 
 /** Refresh the crossing-time observation for an exact plan's binding when
  * this process holds none or a stale one (a scheduled or background run's
- * first crossing). Admission still decides; this only supplies. */
-async function ensureFreshObservationForPlan(plan: unknown): Promise<void> {
+ * first crossing). Admission still decides; this only supplies. Every path
+ * that admits an exact workflow call supplies it first: reads here, and the
+ * runner's call nodes (each forEach item included) before they prepare. */
+export async function ensureFreshObservationForPlan(plan: unknown): Promise<void> {
   try {
     const binding = (plan as { binding?: { manifestId?: unknown; capabilityId?: unknown } } | null)?.binding;
     const manifestId = typeof binding?.manifestId === 'string' ? binding.manifestId : '';

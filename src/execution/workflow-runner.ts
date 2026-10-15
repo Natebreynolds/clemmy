@@ -315,6 +315,7 @@ import {
 import { ensureReviewedLocalWorkflowCapability, normalizeReviewedLocalWorkflowArguments } from '../runtime/harness/reviewed-local-workflow-capability.js';
 import {
   activatePreparedWorkflowNodeCall,
+  ensureFreshObservationForPlan,
   executeActivatedWorkflowNodeCall,
   executeWorkflowNodeRead,
   prepareWorkflowNodeCall,
@@ -3618,6 +3619,10 @@ async function executeExactWorkflowV3CallNode(
       reason: `workflow_exact_call_identity_invalid: ${error instanceof Error ? error.message : String(error)}`,
     });
   }
+  // A scheduled or background run has no crossing-time observation in this
+  // process until something refreshes it; without this every call node, each
+  // forEach item included, was refused live_observation_missing.
+  await ensureFreshObservationForPlan(plan);
   const preparation = prepareWorkflowNodeCall({
     plan,
     identity,
