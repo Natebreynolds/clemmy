@@ -480,7 +480,7 @@ export function reconcileSilentAcceptedInputSessions(
   // was a chat session). Work sessions (workflow/execution/agent) have their
   // own reconcilers with owner stores this sweep does not join; widening here
   // would let a missing local harness row fabricate failure authority for them.
-  const active = listSessions({ kind: ['chat'], status: ['active'], limit: 2_000 });
+  const active = listSessions({ kind: ['chat'], status: ['active'], limit: 2_000, withoutConversationState: true });
   for (const session of active) {
     if (records.length >= limit) break;
     if (pendingSessionIds.has(session.id)) continue;

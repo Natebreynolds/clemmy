@@ -479,8 +479,11 @@ export function reconcileRevokedHostToolInvocations(
       SELECT lease.session_id, lease.source_user_seq, lease.accepted_task_id,
              lease.logical_tool_call_id, lease.scope_id, lease.lease_id,
              lease.run_attempt_id, lease.parent_scope_id, lease.parent_lease_id
-        FROM run_dispatch_leases lease
-        JOIN logical_tool_calls call
+        -- Open calls are few and revoked leases accumulate: walk the open
+        -- calls and seek their leases (CROSS JOIN fixes that order), never
+        -- the whole revoked history with a probe per lease.
+        FROM logical_tool_calls call
+        CROSS JOIN run_dispatch_leases lease
           ON call.session_id = lease.session_id
          AND call.source_user_seq = lease.source_user_seq
          AND call.logical_tool_call_id = lease.logical_tool_call_id

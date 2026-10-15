@@ -131,8 +131,8 @@ const productionRecoverySeam: RecoverySweepSeam = {
     try {
       const row = openEventLog().prepare(`
         SELECT COUNT(*) AS n
-          FROM run_dispatch_leases lease
-          JOIN logical_tool_calls call
+          FROM logical_tool_calls call
+          CROSS JOIN run_dispatch_leases lease
             ON call.session_id = lease.session_id
            AND call.source_user_seq = lease.source_user_seq
            AND call.logical_tool_call_id = lease.logical_tool_call_id

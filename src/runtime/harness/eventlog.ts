@@ -1283,14 +1283,25 @@ function addListFilter(
  * the full table's metadata on every poll of the conversation rail, the
  * largest steady hold on the daemon's main loop. A row is re-read only when it
  * changed. Changes made through this process's connection are counted by
- * temporary triggers that live only on that connection; a commit by any other
- * connection changes SQLite's data_version and drops every reused row. Rows
- * are shared across lists and must not be mutated.
+ * temporary triggers that live only on that connection. A commit by any other
+ * connection changes SQLite's data_version; each row is then compared by what
+ * can be read without its metadata blob (updated time, status, title, tokens
+ * and the metadata's byte length) and only a row that differs is read again.
+ * Dropping every row there re-read the whole table's conversation state on
+ * nearly every rail poll. Rows are shared across lists and must not be
+ * mutated.
  */
 interface DisplaySessionRowCache {
   db: Database.Database;
   dataVersion: number;
-  rows: Map<string, { version: number; row: SessionRow }>;
+  rows: Map<string, { version: number; outside: string; row: SessionRow }>;
+}
+
+/** What another connection's change to a session row can be seen by without
+ *  reading the metadata blob: octet_length reads the record header only. */
+function displayRowOutsideFingerprint(table: string): string {
+  return `${table}.updated_at || char(0) || ${table}.status || char(0) || COALESCE(${table}.title, '')
+    || char(0) || COALESCE(${table}.tokens_used, 0) || char(0) || COALESCE(octet_length(${table}.metadata_json), -1)`;
 }
 let displaySessionRowCache: DisplaySessionRowCache | null = null;
 const DISPLAY_ROW_FETCH_CHUNK = 400;
@@ -1322,20 +1333,28 @@ export function listSessionRowsForDisplay(): SessionRow[] | null {
   if (!cache) return null;
   return db.transaction(() => {
     const dataVersion = Number(db.pragma('data_version', { simple: true }));
-    if (dataVersion !== cache.dataVersion) {
-      cache.rows.clear();
-      cache.dataVersion = dataVersion;
-    }
-    const index = prepareCached(db, `SELECT s.id AS id, COALESCE(v.version, 0) AS version
-        FROM sessions s LEFT JOIN temp.session_display_versions v ON v.session_id = s.id
-       ORDER BY s.updated_at DESC, s.id DESC`).all() as Array<{ id: string; version: number }>;
-    const stale = index.filter((entry) => cache.rows.get(entry.id)?.version !== entry.version);
+    const outsideCommit = dataVersion !== cache.dataVersion;
+    cache.dataVersion = dataVersion;
+    const index = (outsideCommit
+      ? prepareCached(db, `SELECT s.id AS id, COALESCE(v.version, 0) AS version, ${displayRowOutsideFingerprint('s')} AS outside
+          FROM sessions s LEFT JOIN temp.session_display_versions v ON v.session_id = s.id
+         ORDER BY s.updated_at DESC, s.id DESC`)
+      : prepareCached(db, `SELECT s.id AS id, COALESCE(v.version, 0) AS version
+          FROM sessions s LEFT JOIN temp.session_display_versions v ON v.session_id = s.id
+         ORDER BY s.updated_at DESC, s.id DESC`)).all() as Array<{ id: string; version: number; outside?: string }>;
+    const stale = index.filter((entry) => {
+      const held = cache.rows.get(entry.id);
+      return !held || held.version !== entry.version || (entry.outside !== undefined && held.outside !== entry.outside);
+    });
     for (let start = 0; start < stale.length; start += DISPLAY_ROW_FETCH_CHUNK) {
       const chunk = stale.slice(start, start + DISPLAY_ROW_FETCH_CHUNK);
-      const rows = db.prepare(`SELECT ${SESSION_COLUMNS_WITHOUT_STATE} FROM sessions WHERE id IN (${chunk.map(() => '?').join(', ')})`)
-        .all(...chunk.map((entry) => entry.id)) as RawSessionRow[];
+      const rows = db.prepare(`SELECT ${SESSION_COLUMNS_WITHOUT_STATE}, ${displayRowOutsideFingerprint('sessions')} AS display_outside
+          FROM sessions WHERE id IN (${chunk.map(() => '?').join(', ')})`)
+        .all(...chunk.map((entry) => entry.id)) as Array<RawSessionRow & { display_outside: string }>;
       const versions = new Map(chunk.map((entry) => [entry.id, entry.version]));
-      for (const raw of rows) cache.rows.set(raw.id, { version: versions.get(raw.id)!, row: rowToSession(raw) });
+      for (const raw of rows) {
+        cache.rows.set(raw.id, { version: versions.get(raw.id)!, outside: raw.display_outside, row: rowToSession(raw) });
+      }
     }
     if (cache.rows.size > index.length) {
       const present = new Set(index.map((entry) => entry.id));

@@ -963,10 +963,22 @@ test('the display list re-reads only changed rows: an own write, a pin, a delete
   assert.equal(afterOwn[0]!.id, b.id, 'order follows the update time');
   eventlogModule.openEventLog().prepare('DELETE FROM sessions WHERE id = ?').run(b.id);
   assert.equal(eventlogModule.listSessionRowsForDisplay()!.some((row) => row.id === b.id), false, 'a deleted row leaves the list');
+  const c = eventlogModule.createSession({ id: 'display-cache-c', kind: 'chat', channel: 'desktop', title: 'Charlie' });
+  const beforeOther = eventlogModule.listSessionRowsForDisplay()!;
+  const heldC = beforeOther.find((row) => row.id === c.id)!;
   const other = new Database(HARNESS_DB_PATH);
   try {
     other.prepare(`UPDATE sessions SET title = 'Renamed elsewhere' WHERE id = ?`).run(a.id);
   } finally { other.close(); }
-  assert.equal(eventlogModule.listSessionRowsForDisplay()!.find((row) => row.id === a.id)!.title, 'Renamed elsewhere',
-    'another connection\'s commit drops every reused row');
+  const afterOther = eventlogModule.listSessionRowsForDisplay()!;
+  assert.equal(afterOther.find((row) => row.id === a.id)!.title, 'Renamed elsewhere',
+    'another connection\'s change to a row is seen');
+  assert.equal(afterOther.find((row) => row.id === c.id), heldC,
+    'a row another connection did not change is reused, not re-read with its conversation state');
+  const metadataElsewhere = new Database(HARNESS_DB_PATH);
+  try {
+    metadataElsewhere.prepare(`UPDATE sessions SET metadata_json = json_set(metadata_json, '$.tags', json('["moved"]')) WHERE id = ?`).run(c.id);
+  } finally { metadataElsewhere.close(); }
+  assert.deepEqual(eventlogModule.listSessionRowsForDisplay()!.find((row) => row.id === c.id)!.metadata.tags, ['moved'],
+    'another connection\'s metadata write without an update-time bump is seen by its size');
 });
