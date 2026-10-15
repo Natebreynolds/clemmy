@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-stop-identity-'));
 process.env.CLEMENTINE_HOME = home;
-const { createSession, appendEvent, listEvents, updateSession } = await import('./harness/eventlog.js');
+const { createSession, appendEvent, getSessionConversationState, listEvents, updateSession } = await import('./harness/eventlog.js');
 const { HarnessSession } = await import('./harness/session.js');
 const { deliverOutcomeWithAcknowledgement, publishProactiveOutcome, renderOutcomeText } = await import('./outcome.js');
 after(() => rmSync(home, { recursive: true, force: true }));
@@ -114,7 +114,7 @@ test('stale model, completion and compaction writers retain only reports injecte
     if (mode !== 'completed') {
       // A current-history write need not call toInputItems first (which would
       // advance the reader's basis); it must not append the arrival twice.
-      const current = (writer.sessionRow.metadata.__conversation as { items: typeof before }).items;
+      const current = (getSessionConversationState(writer.id)!.state as { items: typeof before }).items;
       writer.updateConversationSnapshot(current);
       assert.equal(HarnessSession.load(id)!.toInputItems().length, 2, 'writing already-merged history does not duplicate the arrival');
       write();
@@ -160,7 +160,7 @@ test('approval checkpoint resume retains reports arriving after its model replay
   assert.equal(restarted.loadInterruptState(), 'fixture-approval-state');
   restarted.recordTurnResult({ history, lastResponseId: undefined, turn: 1 });
   assert.equal(HarnessSession.load(id)!.toInputItems().length, 2);
-  const current = (restarted.sessionRow.metadata.__conversation as { items: typeof history }).items;
+  const current = (getSessionConversationState(restarted.id)!.state as { items: typeof history }).items;
   restarted.updateConversationSnapshot(current);
   assert.equal(HarnessSession.load(id)!.toInputItems().length, 2);
   restarted.recordTurnResult({ history, lastResponseId: undefined, turn: 1 });

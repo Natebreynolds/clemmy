@@ -3776,7 +3776,10 @@ test('workflow discovery construction reads current kind without hydrating retai
       sourceUserSeq: source.seq }).status, variant === 'excluded' ? 'excluded' : 'allowed');
     const current = eventlog.getSession(session.id);
     assert.equal(current?.kind, 'workflow');
-    assert.deepEqual(current?.metadata, metadata, 'full retained context stays available to its actual readers');
+    const { __conversation: conversation, ...rowMetadata } = metadata;
+    assert.deepEqual(current?.metadata, rowMetadata, 'full retained context stays available to its actual readers');
+    assert.deepEqual(eventlog.getSessionConversationState(session.id)?.state, conversation,
+      'the conversation state is kept whole in its own table');
     assert.equal(listEvents(session.id, { types: ['tool_called', 'model_resilience_observed'] }).length, 0,
       'agent construction performs no model or tool execution');
     const db = eventlog.openEventLog();

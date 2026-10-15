@@ -108,7 +108,7 @@ test('v93 preserves its V1 receipt alongside unrelated missing-source run histor
       .map(table => db.prepare(`SELECT * FROM ${table}`).all());
     const beforeObjects = objects(db);
     schema.applyHarnessMigrations(db);
-    assert.equal((db.prepare('SELECT MAX(version) v FROM schema_version').get() as {v:number}).v,93);
+    assert.equal((db.prepare('SELECT MAX(version) v FROM schema_version').get() as {v:number}).v,HARNESS_SCHEMA_VERSION);
     assert.deepEqual(['run_attempts','durable_memory_intake_receipts','accepted_task_authority','events']
       .map(table => db.prepare(`SELECT * FROM ${table}`).all()),before);
     assert.deepEqual(objects(db),beforeObjects);

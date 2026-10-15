@@ -861,8 +861,11 @@ test('workflow controller-owned discovery can replace metadata without freezing 
       eventlog.updateSession(fixture.session.id, { metadata });
       assert.ok(Buffer.byteLength(JSON.stringify(privateState)) > 512 * 1024,
         'the fixture carries substantial retained state, not just empty private keys');
-      assert.deepEqual(eventlog.getSession(fixture.session.id)?.metadata, metadata,
+      const { __conversation: retainedConversation, ...rowMetadata } = metadata;
+      assert.deepEqual(eventlog.getSession(fixture.session.id)?.metadata, rowMetadata,
         'ordinary readers still receive every retained state value');
+      assert.deepEqual(eventlog.getSessionConversationState(fixture.session.id)?.state, retainedConversation,
+        'the conversation state is kept whole in its own table');
       const manifest = capabilityManifests.attachSemanticContract({
         version: 1, manifestId: 'cap:fixture:workflow-existing-read',
         providerKind: 'native_mcp', operationId: 'fixture__read_records',
@@ -934,7 +937,9 @@ test('workflow controller-owned discovery can replace metadata without freezing 
         const current = eventlog.getSession(fixture.session.id);
         assert.ok(current);
         assert.equal(current.kind, 'workflow');
-        assert.deepEqual(current.metadata, metadata, 'the narrower read does not alter persisted context or public metadata');
+        assert.deepEqual(current.metadata, rowMetadata, 'the narrower read does not alter persisted context or public metadata');
+        assert.deepEqual(eventlog.getSessionConversationState(fixture.session.id)?.state, retainedConversation,
+          'the narrower read does not alter the stored conversation');
         const policy = await import('../../memory/turn-learning-policy.js');
         assert.equal(policy.readTurnLearningPolicyForSource({ sessionId: fixture.session.id,
           sourceUserSeq: fixture.source.seq }).status, variant === 'excluded' ? 'excluded' : 'allowed');
@@ -2811,7 +2816,8 @@ test('production builder executes one explicitly declared pure-local read and cl
     const metadata = eventlog.getSession(session.id)?.metadata ?? {};
     assert.equal(Object.prototype.hasOwnProperty.call(metadata, '__run_in_flight'), false);
     assert.equal(Object.prototype.hasOwnProperty.call(metadata, '__run_in_flight_owner'), false);
-    const snapshot = metadata.__conversation as {
+    assert.equal(Object.prototype.hasOwnProperty.call(metadata, '__conversation'), false);
+    const snapshot = eventlog.getSessionConversationState(session.id)?.state as {
       items?: Array<Record<string, unknown>>;
       lastResponseId?: unknown;
     } | undefined;

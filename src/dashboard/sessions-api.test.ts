@@ -34,6 +34,7 @@ const {
   appendEvent,
   beginRunAttempt,
   getSession,
+  getSessionConversationState,
   listSessions,
   openEventLog,
   reapStaleSessions,
@@ -825,8 +826,10 @@ test('the list reads session rows without conversation state; every other key su
   assert.deepEqual(light.metadata.tags, ['kept']);
 
   const full = listSessions({ status: 'any', limit: 500 }).find((row) => row.id === chat.id);
-  assert.equal((full?.metadata.__conversation as { items: string[] }).items[0].length, 200_000,
+  assert.equal((full?.metadata.__interrupt_state as { big: string }).big.length, 200_000,
     'the default listing still returns the whole row');
+  assert.equal((getSessionConversationState(chat.id)?.state as { items: string[] }).items[0].length, 200_000,
+    'the conversation state is kept whole in its own table');
 
   const summary = buildUnifiedSessionList({ q: 'State-heavy chat' }).find((row) => row.id === `harness:${chat.id}`);
   assert.equal(summary?.pinned, true);
@@ -846,7 +849,7 @@ test('pinning a workflow run after a list build keeps each step\'s conversation 
   for (const step of [stepA, stepB]) {
     const row = getSession(step.id);
     assert.equal(row?.metadata.pinned, true);
-    assert.deepEqual(row?.metadata.__conversation, state, 'a patch must never write back a display row');
+    assert.deepEqual(getSessionConversationState(step.id)?.state, state, 'a patch must never write back a display row');
   }
 });
 

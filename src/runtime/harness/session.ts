@@ -6,6 +6,8 @@ import {
   appendEvent,
   createSession,
   getSession,
+  getSessionConversationState,
+  putSessionConversationState,
   insertInternalEventInTransaction,
   listEvents,
   openEventLog,
@@ -52,7 +54,6 @@ import { SOURCE_APPROVAL_CHECKPOINTS_KEY, hostApprovalCheckpointSource, sourceAp
  * are the semantic audit log.
  */
 
-const META_CONVERSATION = '__conversation';
 const META_INTERRUPT = '__interrupt_state';
 // Kept beside the replay snapshot so compaction/protocol repair cannot erase
 // exact synthetic-report delivery identities. Never passed to a provider.
@@ -146,6 +147,12 @@ export interface RecordCompletedTurnResultInput extends RecordTurnResultInput {
   toolCalls: number;
 }
 
+/** The stored shape of a conversation snapshot: exactly what the session row
+ * used to carry under `__conversation`. */
+function persistedState(snapshot: PersistedConversation): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(snapshot)) as Record<string, unknown>;
+}
+
 export class HarnessSession {
   private observedSyntheticTurnIds: Set<string>;
   private constructor(private row: SessionRow) {
@@ -185,7 +192,7 @@ export class HarnessSession {
     if (!Array.isArray(snapshot.items)) return snapshot;
     const observed = new Set(observation.observedIds);
     const unseen = syntheticUserTurns(current).filter(entry => !observed.has(entry.id));
-    const currentItems = (current.metadata[META_CONVERSATION] as Partial<PersistedConversation> | undefined)?.items;
+    const currentItems = (getSessionConversationState(this.row.id)?.state as Partial<PersistedConversation> | undefined)?.items;
     // Exact current-snapshot provenance, not report-word equivalence. A writer
     // may reuse an already-merged snapshot (plus a new suffix) without another
     // read. An older basis is still older even if its reports use the same words.
@@ -200,10 +207,10 @@ export class HarnessSession {
     if (active) { active.conversation = snapshot; return; }
     openEventLog().transaction(() => {
       const merged = this.preserveUnobservedSyntheticTurns(snapshot);
-      const written = openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(
-        metadata_json, '$.__conversation', json(?)), updated_at = ? WHERE id = ?`)
-        .run(JSON.stringify(merged), snapshot.updatedAt, this.row.id);
+      const db = openEventLog();
+      const written = db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(snapshot.updatedAt, this.row.id);
       if (written.changes !== 1) throw new Error(`session not found: ${this.row.id}`);
+      putSessionConversationState(db, this.row.id, persistedState(merged), snapshot.updatedAt);
     }).immediate();
     this.refresh();
   }
@@ -267,12 +274,24 @@ export class HarnessSession {
   refresh(): void {
     const row = getSession(this.row.id);
     if (row) this.row = row;
+    this.storedConversationCache = undefined;
+  }
+
+  /** The stored conversation state, read once per row snapshot: refresh()
+   * drops it with the row, so a reader sees what the row it holds saw. */
+  private storedConversationCache?: { updatedAt: string; state: Record<string, unknown> | null };
+
+  private storedConversation(): Record<string, unknown> | null {
+    if (this.storedConversationCache?.updatedAt === this.row.updatedAt) return this.storedConversationCache.state;
+    const state = getSessionConversationState(this.row.id)?.state ?? null;
+    this.storedConversationCache = { updatedAt: this.row.updatedAt, state };
+    return state;
   }
 
   private conversation(): PersistedConversation {
     const active = workflowParentActivation(this.row.id);
     if (active) return active.conversation;
-    const raw = this.row.metadata[META_CONVERSATION];
+    const raw = this.storedConversation();
     if (!raw || typeof raw !== 'object') {
       return { items: [], lastResponseId: undefined, updatedAt: this.row.createdAt };
     }
@@ -385,10 +404,12 @@ export class HarnessSession {
           syntheticTurnIds: identity ? [...ids, identity] : ids, updatedAt: new Date().toISOString() };
       } else {
         const snapshot: PersistedConversation = { ...this.conversation(), items: nextItems, updatedAt: new Date().toISOString() };
-        const written = openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(
-          metadata_json, '$.__conversation', json(?), '$.__synthetic_user_turns', json(?)), updated_at = ? WHERE id = ?`)
-          .run(JSON.stringify(snapshot), JSON.stringify(identity ? [...reports, { id: identity, text }] : reports), snapshot.updatedAt, this.row.id);
+        const db = openEventLog();
+        const written = db.prepare(`UPDATE sessions SET metadata_json = json_set(
+          metadata_json, '$.__synthetic_user_turns', json(?)), updated_at = ? WHERE id = ?`)
+          .run(JSON.stringify(identity ? [...reports, { id: identity, text }] : reports), snapshot.updatedAt, this.row.id);
         if (written.changes !== 1) throw new Error(`session not found: ${this.row.id}`);
+        putSessionConversationState(db, this.row.id, persistedState(snapshot), snapshot.updatedAt);
         this.refresh();
       }
       return true;
@@ -473,9 +494,8 @@ export class HarnessSession {
       if (active) active.conversation = snapshot;
       else {
         const merged = this.preserveUnobservedSyntheticTurns(snapshot);
-        db.prepare(`UPDATE sessions SET metadata_json = json_set(
-          metadata_json, '$.__conversation', json(?)), updated_at = ? WHERE id = ?`)
-          .run(JSON.stringify(merged), snapshot.updatedAt, this.row.id);
+        db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(snapshot.updatedAt, this.row.id);
+        putSessionConversationState(db, this.row.id, persistedState(merged), snapshot.updatedAt);
       }
 
       turnEnded = insertInternalEventInTransaction(db, {
@@ -990,7 +1010,7 @@ export class HarnessSession {
       const written = db.prepare(`
       UPDATE sessions
          SET metadata_json = json_remove(
-               json_set(metadata_json, '$.__conversation', json(?)),
+               metadata_json,
                '$.__host_recovery_state',
                '$.__host_recovery_mcp_scope',
                '$.__host_recovery_synthetic_turns'
@@ -999,11 +1019,13 @@ export class HarnessSession {
        WHERE id = ?
          AND json_extract(metadata_json, '$.__host_recovery_state') = ?
     `).run(
-      JSON.stringify(merged),
       snapshot.updatedAt,
       this.row.id,
       input.serializedState,
     );
+      // The recovery state is adopted exactly once: the history moves only
+      // with the compare-and-swap that consumed it.
+      if (written.changes === 1) putSessionConversationState(db, this.row.id, persistedState(merged), snapshot.updatedAt);
       return written;
     }).immediate();
     this.refresh();

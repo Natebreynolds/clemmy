@@ -11530,6 +11530,38 @@ const MIGRATIONS: EventLogMigration[] = [
       if (!Array.isArray(violations) || violations.length > 0) throw new Error('schema v93 memory receipt foreign-key validation failed');
     },
   },
+  {
+    version: 94,
+    // A session's conversation state (the model-input history a later turn
+    // resumes from) leaves the session row for its own table. In the row it
+    // was nearly all of every session's metadata, so any metadata predicate
+    // (boot reconcilers, display lists) read every conversation in full.
+    // Moved byte-for-byte; `fidelity` and `memory_episode_id` carry the
+    // conversation's later life in memory (compacted, then memory only).
+    sql: `
+      CREATE TABLE IF NOT EXISTS session_conversation_state (
+        session_id        TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        state_json        TEXT NOT NULL CHECK (json_valid(state_json) AND json_type(state_json) = 'object'),
+        fidelity          TEXT NOT NULL DEFAULT 'full' CHECK (fidelity IN ('full', 'compacted', 'memory')),
+        memory_episode_id TEXT,
+        updated_at        TEXT NOT NULL,
+        compacted_at      TEXT
+      );
+    `,
+    backfill: (db) => {
+      if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").get()) return;
+      db.exec(`
+        INSERT INTO session_conversation_state (session_id, state_json, fidelity, updated_at)
+        SELECT id, json_extract(metadata_json, '$.__conversation'), 'full',
+               COALESCE(json_extract(metadata_json, '$.__conversation.updatedAt'), updated_at)
+          FROM sessions
+         WHERE json_valid(metadata_json) AND json_type(metadata_json, '$.__conversation') = 'object'
+        ON CONFLICT(session_id) DO NOTHING;
+        UPDATE sessions SET metadata_json = json_remove(metadata_json, '$.__conversation')
+         WHERE json_valid(metadata_json) AND json_type(metadata_json, '$.__conversation') IS NOT NULL;
+      `);
+    },
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

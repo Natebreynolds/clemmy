@@ -1,7 +1,7 @@
 import { SOURCE_APPROVAL_CHECKPOINTS_KEY, sourceApprovalSnapshotFromMetadata } from './source-approval-checkpoints.js';
 import { createHash } from 'node:crypto';
 import type { AgentInputItem } from '@openai/agents';
-import { openEventLog } from './eventlog.js';
+import { getSessionConversationState, openEventLog, putSessionConversationState } from './eventlog.js';
 import {
   ConversationProtocolMigrationError,
   CONVERSATION_PROTOCOL_SYNTHETIC_RESULT,
@@ -15,7 +15,6 @@ import {
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 
-const META_CONVERSATION = '__conversation';
 const META_INTERRUPT = '__interrupt_state';
 const META_QUARANTINE = '__conversation_protocol_quarantine';
 const QUARANTINE_PROTOCOL = 'clementine.conversation_protocol_quarantine.v1' as const;
@@ -81,8 +80,8 @@ function parseMetadata(raw: string): ItemRecord {
   return metadata;
 }
 
-function snapshotFromMetadata(metadata: ItemRecord, createdAt: string): ConversationSnapshot {
-  const raw = record(metadata[META_CONVERSATION]);
+function snapshotFromState(state: ItemRecord | null, createdAt: string): ConversationSnapshot {
+  const raw = record(state);
   return {
     items: Array.isArray(raw?.items) ? raw.items as AgentInputItem[] : [],
     ...(typeof raw?.lastResponseId === 'string' ? { lastResponseId: raw.lastResponseId } : {}),
@@ -388,7 +387,8 @@ function projectPersistedSessionConversationProtocol(input: {
     `).get(input.sessionId) as { created_at: string; metadata_json: string } | undefined;
     if (!row) throw new Error(`session not found: ${input.sessionId}`);
     const metadata = parseMetadata(row.metadata_json);
-    const snapshot = snapshotFromMetadata(metadata, row.created_at);
+    const stored = getSessionConversationState(input.sessionId, db);
+    const snapshot = snapshotFromState(stored?.state ?? null, row.created_at);
 
     // Approval ownership is independent of whether the pre-pause SDK/host
     // history was copied into __conversation. Never start a second provider
@@ -419,7 +419,7 @@ function projectPersistedSessionConversationProtocol(input: {
     if (historyChanged && input.persistChanges) {
       const now = input.now?.() ?? new Date().toISOString();
       const nextMetadata: ItemRecord = { ...metadata };
-      nextMetadata[META_CONVERSATION] = {
+      const nextState = {
         items: migrated.history,
         // A repaired/truncated transcript cannot continue a provider-owned
         // previous-response chain whose hidden history predates the repair.
@@ -439,7 +439,9 @@ function projectPersistedSessionConversationProtocol(input: {
            SET metadata_json = ?, updated_at = ?
          WHERE id = ? AND metadata_json = ?
       `).run(JSON.stringify(nextMetadata), now, input.sessionId, row.metadata_json);
-      if (updated.changes !== 1) {
+      // The repaired history replaces exactly the history that was read.
+      if (updated.changes !== 1 || !putSessionConversationState(db, input.sessionId, nextState, now,
+        { expectStateJson: stored?.stateJson ?? null })) {
         throw new Error('conversation protocol session compare-and-swap lost');
       }
     }

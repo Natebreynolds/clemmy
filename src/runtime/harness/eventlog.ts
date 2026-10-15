@@ -1220,25 +1220,97 @@ export function createSession(input: CreateSessionInput): SessionRow {
   const db = openEventLog();
   const id = input.id ?? `sess-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
   const now = nowIso();
-  db.prepare(
-    `INSERT INTO sessions
-       (id, kind, channel, user_id, created_at, updated_at, status,
-        title, objective, token_budget, tokens_used, current_plan_id, metadata_json)
-     VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 0, NULL, ?)`,
-  ).run(
-    id,
-    input.kind,
-    input.channel ?? null,
-    input.userId ?? null,
-    now,
-    now,
-    input.title ?? null,
-    input.objective ?? null,
-    input.tokenBudget ?? null,
-    JSON.stringify(input.metadata ?? {}),
-  );
+  const { metadata, conversation } = splitConversationState(input.metadata ?? {});
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO sessions
+         (id, kind, channel, user_id, created_at, updated_at, status,
+          title, objective, token_budget, tokens_used, current_plan_id, metadata_json)
+       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 0, NULL, ?)`,
+    ).run(
+      id,
+      input.kind,
+      input.channel ?? null,
+      input.userId ?? null,
+      now,
+      now,
+      input.title ?? null,
+      input.objective ?? null,
+      input.tokenBudget ?? null,
+      JSON.stringify(metadata),
+    );
+    if (conversation) putSessionConversationState(db, id, conversation, now);
+  })();
   const row = prepareCached(db, 'SELECT * FROM sessions WHERE id = ?').get(id) as RawSessionRow;
   return rowToSession(row);
+}
+
+/**
+ * A session's conversation state: the model-input history (`items`,
+ * `lastResponseId`, `updatedAt`) a later turn resumes from. It lives in
+ * `session_conversation_state`, never in the session row, so a listing, a
+ * boot scan or a metadata predicate never reads it. A caller that still hands
+ * it over inside metadata under `__conversation` has it routed here.
+ */
+export const CONVERSATION_STATE_METADATA_KEY = '__conversation';
+
+export interface SessionConversationStateRow {
+  state: Record<string, unknown>;
+  /** The exact stored text, for a compare-and-swap write. */
+  stateJson: string;
+  fidelity: 'full' | 'compacted' | 'memory';
+  memoryEpisodeId: string | null;
+  updatedAt: string;
+}
+
+function splitConversationState(metadata: Record<string, unknown>): {
+  metadata: Record<string, unknown>; conversation: Record<string, unknown> | null;
+} {
+  if (!Object.hasOwn(metadata, CONVERSATION_STATE_METADATA_KEY)) return { metadata, conversation: null };
+  const { [CONVERSATION_STATE_METADATA_KEY]: raw, ...rest } = metadata;
+  const conversation = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+  return { metadata: rest, conversation };
+}
+
+export function getSessionConversationState(sessionId: string, db: Database.Database = openEventLog()): SessionConversationStateRow | null {
+  const row = prepareCached(db, `SELECT state_json, fidelity, memory_episode_id, updated_at
+      FROM session_conversation_state WHERE session_id = ?`).get(sessionId) as
+    { state_json: string; fidelity: SessionConversationStateRow['fidelity']; memory_episode_id: string | null; updated_at: string } | undefined;
+  if (!row) return null;
+  const parsed = JSON.parse(row.state_json) as unknown;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  return { state: parsed as Record<string, unknown>, stateJson: row.state_json, fidelity: row.fidelity,
+    memoryEpisodeId: row.memory_episode_id, updatedAt: row.updated_at };
+}
+
+/**
+ * Write one session's conversation state as a full-fidelity snapshot. With
+ * `expectStateJson`, the write lands only over exactly that stored text (null:
+ * only when none is stored) and returns false otherwise. Callers own the
+ * transaction that also moves the session row.
+ */
+export function putSessionConversationState(
+  db: Database.Database,
+  sessionId: string,
+  state: Record<string, unknown>,
+  updatedAt: string,
+  options: { expectStateJson?: string | null } = {},
+): boolean {
+  const stateJson = JSON.stringify(state);
+  if (options.expectStateJson === undefined) {
+    prepareCached(db, `INSERT INTO session_conversation_state (session_id, state_json, fidelity, memory_episode_id, updated_at, compacted_at)
+        VALUES (?, ?, 'full', NULL, ?, NULL)
+        ON CONFLICT(session_id) DO UPDATE SET state_json = excluded.state_json, fidelity = 'full',
+          memory_episode_id = NULL, updated_at = excluded.updated_at, compacted_at = NULL`).run(sessionId, stateJson, updatedAt);
+    return true;
+  }
+  if (options.expectStateJson === null) {
+    return prepareCached(db, `INSERT INTO session_conversation_state (session_id, state_json, fidelity, updated_at)
+        VALUES (?, ?, 'full', ?) ON CONFLICT(session_id) DO NOTHING`).run(sessionId, stateJson, updatedAt).changes === 1;
+  }
+  return prepareCached(db, `UPDATE session_conversation_state
+      SET state_json = ?, fidelity = 'full', memory_episode_id = NULL, updated_at = ?, compacted_at = NULL
+      WHERE session_id = ? AND state_json = ?`).run(stateJson, updatedAt, sessionId, options.expectStateJson).changes === 1;
 }
 
 export function getSession(sessionId: string, options: { withoutConversationState?: boolean } = {}): SessionRow | null {
@@ -1520,10 +1592,14 @@ export function updateSession(sessionId: string, patch: SessionPatch): SessionRo
   if (!current.metadata || typeof current.metadata !== 'object' || Array.isArray(current.metadata)) {
     throw new Error('Session metadata is not a valid object; publication ownership is unknown.');
   }
+  // Only a plain object can carry conversation state; anything else reaches
+  // the replacement check below unchanged.
+  const routed = patch.metadata && typeof patch.metadata === 'object' && !Array.isArray(patch.metadata)
+    ? splitConversationState(patch.metadata) : null;
   const next: SessionRow = {
     ...current,
     ...patch,
-    metadata: patch.metadata ?? current.metadata,
+    metadata: routed ? routed.metadata : (patch.metadata ?? current.metadata),
     updatedAt: nowIso(),
   };
   const nextMetadataJson = JSON.stringify(next.metadata);
@@ -1561,6 +1637,7 @@ export function updateSession(sessionId: string, patch: SessionPatch): SessionRo
     next.updatedAt,
     sessionId,
   );
+  if (routed?.conversation) putSessionConversationState(db, sessionId, routed.conversation, next.updatedAt);
   // The protected namespace and concurrent token counter come from the write,
   // never from the caller's potentially stale metadata snapshot.
   return getSession(sessionId)!;

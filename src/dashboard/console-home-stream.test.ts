@@ -30,6 +30,7 @@ const {
   createSession,
   finishRunAttempt,
   getSession,
+  getSessionConversationState,
   listEvents,
   resetEventLog,
   updateSession,
@@ -415,7 +416,7 @@ test('command center keeps limit-exceeded harness sessions working until complet
     assert.equal(activeBody.presence.status, 'working');
     assert.equal(activeBody.counts.active, 1);
     assert.equal(JSON.stringify(activeBody).includes('HOME-RECOVERY-STATE-ONLY'), false);
-    assert.deepEqual(getSession(session.id)?.metadata.__conversation, recoveryState,
+    assert.deepEqual(getSessionConversationState(session.id)?.state, recoveryState,
       'Home does not write its lightweight session row back over recovery state');
     const activeActivity = await (
       await fetch(`${h.url}/api/console/activity/v2?workingNow=1`)
@@ -442,7 +443,7 @@ test('command center keeps limit-exceeded harness sessions working until complet
     assert.ok(completedCard, 'the metadata-only Home list retains the completed session');
     assert.equal(completedCard.title, session.title);
     assert.match(completedCard.meta, /desktop.*done/);
-    assert.deepEqual(getSession(session.id)?.metadata.__conversation, recoveryState,
+    assert.deepEqual(getSessionConversationState(session.id)?.state, recoveryState,
       'completed Home reads also leave recovery state intact');
     const completedActivity = await (
       await fetch(`${h.url}/api/console/activity/v2?workingNow=1`)
