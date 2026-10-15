@@ -25,7 +25,7 @@ import { hostStructuralPlanningControlLookup } from './structural-control-lookup
 import { maybeDiscoveryAdvisory } from '../runtime/harness/discovery-advisory.js';
 import { invalidArgumentsTextResult, textResult } from './shared.js';
 import { isEffectDecidedPerCall } from './tool-registry.js';
-import { mcpToolEffectApprovalOpen } from '../runtime/mcp-tool-effect-labels.js';
+import { mcpToolAwaitsEffectLabel, mcpToolEffectApprovalOpen } from '../runtime/mcp-tool-effect-labels.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalogEntriesLexically, toolSchemaSearchText, type RankedCatalogEntry } from '../agents/tool-catalog.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
@@ -441,12 +441,24 @@ function sayCallableNow(names: readonly string[], carriedByWorkCall: (name: stri
 /** Said on the row of a built-in whose effect is decided per call. */
 export const AWAITING_OWNER_TOOL_LABELS_NOTE = 'This tool\'s server does not declare what its tools do, so the owner has a card asking them to approve how each of its tools is used. It becomes callable once they approve. Tell the owner the work is waiting on that card; do not repeat discovery or substitute another provider.';
 
+/** Said on the row of a connected server's tool nobody has been asked about
+ *  yet: listing it is not choosing it, so the owner is asked only when Clem
+ *  names it. */
+export const UNLABELED_SERVER_TOOL_NOTE = 'This tool\'s server does not say what its tools do, so it is not callable until the owner approves how they are used. If a tool that is ready does the same job, use that. If this is the right tool for the work, search its exact name once: the owner gets one card naming it and what it is for, and it becomes callable when they approve.';
+
 /** A connected server's tool that waits on the owner's approval of what its
  *  server's tools do. */
 function awaitsOwnerToolLabels(name: string): boolean {
   const bare = name.startsWith('mcp__') ? name.slice('mcp__'.length) : name;
   const separator = bare.indexOf('__');
   return separator > 0 && mcpToolEffectApprovalOpen(bare.slice(0, separator));
+}
+
+/** A connected server's undeclared tool the owner has not been asked about. */
+function unlabeledServerTool(name: string): boolean {
+  const bare = name.startsWith('mcp__') ? name.slice('mcp__'.length) : name;
+  const separator = bare.indexOf('__');
+  return separator > 0 && mcpToolAwaitsEffectLabel(bare.slice(0, separator), bare.slice(separator + 2));
 }
 
 export const PER_CALL_EFFECT_DISPATCH_NOTE = 'A call that only reads or computes runs now: invoke it as the inner name and args_json of work_call, with the tool\'s own name as requirement_id. A call that changes files, or that leaves this machine, is a different effect and is not carried by this example.';
@@ -1756,7 +1768,9 @@ export function registerToolSearchTool(
         return {
           planningRefStatus: 'unsupported_unmaterialized' as const,
           ...reason,
-          ...(awaitsOwnerToolLabels(name) ? { dispatchNote: AWAITING_OWNER_TOOL_LABELS_NOTE } : {}),
+          ...(awaitsOwnerToolLabels(name)
+            ? { dispatchNote: AWAITING_OWNER_TOOL_LABELS_NOTE }
+            : unlabeledServerTool(name) ? { dispatchNote: UNLABELED_SERVER_TOOL_NOTE } : {}),
         };
       };
 

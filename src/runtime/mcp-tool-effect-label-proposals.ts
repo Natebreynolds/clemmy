@@ -179,6 +179,7 @@ function projectPendingProposal(row: approvalRegistry.PendingApprovalRow): void 
 async function propose(input: {
   serverSlug: string;
   sessionId: string;
+  wantedTool?: string;
 }): Promise<McpToolEffectProposalResult> {
   const tools = undeclaredMcpTools(input.serverSlug);
   if (tools.length === 0) return { status: 'nothing_to_propose' };
@@ -244,18 +245,27 @@ async function propose(input: {
   });
 
   const asking = labels.some((entry) => entry.label === 'delete' || entry.label === 'send');
-  const subject = `Let Clem use ${serverName}'s tools`;
+  // The tool Clem chose for the work in front of her is the reason for the
+  // card; without it the owner sees a request to trust a server and no cause.
+  const wanted = input.wantedTool && labels.some((entry) => entry.tool === input.wantedTool)
+    ? words(input.wantedTool)
+    : null;
+  const subject = wanted
+    ? `Let Clem use ${serverName} (${wanted})`
+    : `Let Clem use ${serverName}'s tools`;
   const args = cardArgs(labels, incompleteTools);
   const preview = {
     // The card's own shape: what is asked, why, and exactly what approving does.
     operation: `use ${serverName} tools`,
     fields: Object.entries(args).map(([name, value]) => ({ name, value })),
-    ask: `Can I start using ${serverName}?`,
-    why: clipped(incompleteTools.size > 0
+    ask: wanted
+      ? `Can I use ${serverName}'s "${wanted}" for this?`
+      : `Can I start using ${serverName}?`,
+    why: clipped(`${wanted ? `I picked "${wanted}" for the work I'm doing here. ` : ''}${incompleteTools.size > 0
       ? `${incompleteTools.size} of ${labels.length} tools could not be fully checked. Each still asks you each time; its effects need a full check. The others were checked and sorted from their definitions.`
       : `${serverName} doesn't say which of its ${labels.length} tools only look things up and which change things, so I read each one and sorted them.${
         asking ? ' Anything that deletes or sends still asks you each time.' : ''
-      }`, 260),
+      }`}`, 320),
   };
   // The decision is about a server, not a step of the conversation it came up
   // in. The approval belongs to its own session and the chat only shows the
@@ -298,6 +308,8 @@ async function propose(input: {
 export function proposeMcpToolEffectLabels(input: {
   serverSlug: string;
   sessionId: string;
+  /** The tool Clem chose, which the card names as its reason. */
+  wantedTool?: string;
 }): Promise<McpToolEffectProposalResult> {
   const running = inFlight.get(input.serverSlug);
   if (running) return running;

@@ -2413,7 +2413,7 @@ export function buildAuthorizedToolSearchCandidateSources(
     sourceUserSeq: planningIdentity?.sourceUserSeq ?? 0,
   });
   const prepareExternalMcpCandidates: NonNullable<ToolSearchCandidateSource['prepareCandidates']> = async ({
-    candidates, signal, deadlineAt,
+    candidates, query, signal, deadlineAt,
   }) => {
     const guard = { signal, deadlineAt };
     if (!planningIdentity || !discoveryStillActive(guard)) return [];
@@ -2454,10 +2454,18 @@ export function buildAuthorizedToolSearchCandidateSources(
           });
           // A server that never says what its tools do: Clem proposes how to
           // read them and the owner approves once. The search does not wait.
-          if (materialized.status === 'blocked' && materialized.reason === 'unknown_effect') {
+          // Only a tool the search names exactly is one Clem chose; a tool
+          // that merely ranked among the results is not a reason to ask the
+          // owner, and a card raised for it could not say why it was needed.
+          if (
+            materialized.status === 'blocked'
+            && materialized.reason === 'unknown_effect'
+            && exactExternalMcpOperationFromQuery(query) === operation
+          ) {
             const sessionId = planningIdentity.sessionId;
+            const wantedTool = operation.slice(operation.indexOf('__') + 2);
             void import('../runtime/mcp-tool-effect-label-proposals.js')
-              .then((proposals) => proposals.proposeMcpToolEffectLabels({ serverSlug: serverName, sessionId }))
+              .then((proposals) => proposals.proposeMcpToolEffectLabels({ serverSlug: serverName, sessionId, wantedTool }))
               .catch(() => undefined);
           }
           if (!discoveryStillActive(guard)) return null;

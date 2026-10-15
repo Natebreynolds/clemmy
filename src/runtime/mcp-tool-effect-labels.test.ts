@@ -415,3 +415,25 @@ test('the durable recovery payload stays out of the public approval card', async
   assert.equal(projected.data.approvalId, id);
   assert.ok(projected.data.preview);
 });
+
+test('the card names the tool Clem chose, as its reason', async () => {
+  reset();
+  const session = eventlog.createSession({ kind: 'chat' });
+  list('sites', [listSites, createSite]);
+  assert.equal(labels.mcpToolAwaitsEffectLabel('sites', 'create_site'), true);
+  assert.equal(labels.mcpToolAwaitsEffectLabel('sites', 'not_listed'), false);
+  proposals._setMcpToolEffectLabelReaderForTests(async ({ user }) => ({
+    labels: [
+      { id: idsByName(user).get('list_sites')!, effect: 'read' },
+      { id: idsByName(user).get('create_site')!, effect: 'change' },
+    ],
+  }));
+  const proposed = await proposals.proposeMcpToolEffectLabels({ serverSlug: 'sites', sessionId: session.id, wantedTool: 'create_site' });
+  assert.equal(proposed.status, 'proposed');
+  const cardEvents = eventlog.openEventLog().prepare(
+    `SELECT data_json FROM events WHERE session_id = ? AND type = 'approval_requested'`,
+  ).all(session.id) as Array<{ data_json: string }>;
+  const preview = (JSON.parse(cardEvents[0]!.data_json) as { preview?: { ask?: string; why?: string } }).preview;
+  assert.match(preview?.ask ?? '', /"create site"/);
+  assert.match(preview?.why ?? '', /I picked "create site"/);
+});

@@ -201,6 +201,12 @@ export function undeclaredMcpTools(serverSlug: string): Array<{
     .sort((a, b) => a.tool.localeCompare(b.tool));
 }
 
+/** Whether this exact tool of the server declares no effect and has no
+ *  approved label, as of its server's last listing. */
+export function mcpToolAwaitsEffectLabel(serverSlug: string, tool: string): boolean {
+  return undeclared.get(serverSlug)?.has(tool) === true;
+}
+
 /** How long a label card stays open for the owner. */
 export const MCP_TOOL_EFFECT_PROPOSAL_OPEN_MS = 7 * 24 * 60 * 60_000;
 
