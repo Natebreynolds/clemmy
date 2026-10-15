@@ -580,12 +580,14 @@ function observedConnectionPresentationForSource(input: {
     const results = Array.isArray(body.results)
       ? body.results as ToolSearchResultProjection[]
       : [];
-    if (results.some((entry) => (
+    // An executable external result means the gap is not the whole answer:
+    // any for a provider outage, one of the named app's own for that app.
+    const executable = results.filter((entry) => (
       entry
       && typeof entry.capabilityRef === 'string'
       && entry.capabilityRef.trim().length > 0
       && entry.planningProvenance !== 'authorized_local_registry'
-    ))) continue;
+    ));
     const subjects: ConnectionDependencyObservedSubject[] = [];
     for (const unavailable of Array.isArray(body.unavailable)
       ? body.unavailable as ToolSearchUnavailableProjection[]
@@ -611,7 +613,7 @@ function observedConnectionPresentationForSource(input: {
         ...(discoveryRole ? { discoveryRole } : {}),
       };
       if (projected.kind === 'provider_reconnect_and_rerun') {
-        subjects.push({ ...common, kind: 'provider_reconnect_and_rerun' });
+        if (executable.length === 0) subjects.push({ ...common, kind: 'provider_reconnect_and_rerun' });
         continue;
       }
       const toolkit = typeof projected.toolkit === 'string'
@@ -630,6 +632,12 @@ function observedConnectionPresentationForSource(input: {
         || !capability.startsWith(`${toolkit.toUpperCase()}_`)
         || capabilityRef !== `cap:resolved:${capability.toLowerCase()}`
       ) continue;
+      // Another provider's result can answer a generic search, so it
+      // disproves the gap; a search that names the app asked for that app,
+      // and only the app's own result disproves it.
+      const namesApp = discoveryQuery.toLowerCase().replace(/[^a-z0-9]/g, '').includes(toolkit.replace(/_/g, ''));
+      if (executable.some((entry) => !namesApp || (typeof entry.name === 'string'
+        && entry.name.trim().toUpperCase().startsWith(`${toolkit.toUpperCase()}_`)))) continue;
       subjects.push({
         ...common,
         kind: 'exact_capability_connection',

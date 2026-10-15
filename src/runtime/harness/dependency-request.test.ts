@@ -262,6 +262,41 @@ test('model prose, another source, and a usable external ref cannot mint connect
   }), null, 'a current executable external ref disproves a global connection dependency');
 });
 
+test('a search that names a disconnected app keeps its gap beside other providers\' results, never beside its own', () => {
+  const search = (sessionId: string, results: unknown[]) => {
+    const named = source(sessionId, 'Can I connect Firecrawl here?');
+    const output = JSON.stringify({
+      query: 'can I connect firecrawl',
+      role_key: 'source',
+      results,
+      unavailable: [{
+        source: 'authorized_composio',
+        code: 'no_connections',
+        reason: 'Firecrawl is not connected.',
+        dependencySubject: unavailableConnectionSubject({ query: 'can I connect firecrawl' }),
+      }],
+      brokerCoverage: 'authorized_external_v1',
+    });
+    eventlog.writeToolOutput({ sessionId, callId: `${sessionId}-search`, tool: 'tool_search', output });
+    eventlog.appendEvent({
+      sessionId, turn: 1, role: 'Clem', type: 'tool_returned',
+      data: { sourceUserSeq: named.seq, tool: 'tool_search', callId: `${sessionId}-search`, accounting: 'top_level', topologyRole: 'control', result: output },
+    });
+    return dependencies.observedConnectionDependencyPresentationForSource({ sessionId, sourceUserSeq: named.seq });
+  };
+  const projection = search('dep-named-app', [{
+    name: 'kernel__manage_auth_connections',
+    capabilityRef: 'cap:live:v1:kernel',
+    planningProvenance: 'authorized_external_mcp',
+  }]);
+  assert.equal(projection?.subject.kind === 'exact_capability_connection' ? projection.subject.toolkit : null, 'firecrawl');
+  assert.equal(search('dep-named-app-own', [{
+    name: 'FIRECRAWL_SCRAPE',
+    capabilityRef: 'cap:resolved:firecrawl_scrape',
+    planningProvenance: 'authorized_composio',
+  }]), null, 'the app\'s own executable result disproves its gap');
+});
+
 function consumedConnectionContinuation(
   sessionId: string,
   resolution: {

@@ -2286,9 +2286,35 @@ export function registerToolSearchTool(
             if (entry.operations.length < 3) entry.operations.push(candidate.name);
             byToolkit.set(required.toolkit, entry);
           }
-          return [...byToolkit.values()].map((entry) => ({ ...entry,
-            next: `${entry.app} is not connected. If the owner means ${entry.app}, call tool_search with one of these exact operation names to offer them the card to connect it.` }));
+          return [...byToolkit.entries()].map(([toolkit, entry]) => ({ toolkit, ...entry,
+            next: `${entry.app} is not connected. If the owner wants to connect or use ${entry.app}, ask them whether to connect it (ask_user_question); the card that connects it is attached to that question.` }));
         })() : [];
+        // One named app that is not connected is a connection gap the host
+        // can present: the same typed subject an exact-operation search
+        // raises, so the owner's question carries the card that connects it.
+        const namedAppGap = appsNotConnected.length === 1 && appsNotConnected[0]!.operations[0]
+          ? (() => {
+              const app = appsNotConnected[0]!;
+              const capability = app.operations[0]!.trim().toUpperCase();
+              const dependencySubject = canonicalUnavailableConnectionSubject({
+                source: 'authorized_composio',
+                code: 'no_connections',
+                query,
+                roleKey: role_key,
+                hint: {
+                  kind: 'exact_capability_connection',
+                  toolkit: app.toolkit,
+                  capability,
+                  capabilityRef: `cap:resolved:${capability.toLowerCase()}`,
+                },
+              });
+              return dependencySubject?.kind === 'exact_capability_connection'
+                ? [{ source: 'authorized_composio' as const, code: 'no_connections' as const,
+                    reason: `${app.app} is not connected.`, dependencySubject }]
+                : [];
+            })()
+          : [];
+        const renderedUnavailable = [...unavailable, ...namedAppGap];
         const discoveryAdvisory = page === 1 && advisoryToolkit
           ? maybeDiscoveryAdvisory({
               kind: 'search',
@@ -2325,8 +2351,10 @@ export function registerToolSearchTool(
           ...(Object.keys(guidance).length > 0 ? { guidance } : {}),
           // A source that could not answer this query — a provider/connection
           // fact, distinct from and never implied by an empty `results`.
-          ...(unavailable.length > 0 ? { unavailable } : {}),
-          ...(appsNotConnected.length > 0 ? { apps_not_connected: appsNotConnected } : {}),
+          ...(renderedUnavailable.length > 0 ? { unavailable: renderedUnavailable } : {}),
+          ...(appsNotConnected.length > 0
+            ? { apps_not_connected: appsNotConnected.map(({ toolkit: _toolkit, ...entry }) => entry) }
+            : {}),
           brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
           hint: hintForRows(rows, schemaReadRequired.size > 0),
           ...(discoveryAdvisory ? { discovery_advisory: discoveryAdvisory } : {}),

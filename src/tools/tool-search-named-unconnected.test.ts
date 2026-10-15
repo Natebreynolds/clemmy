@@ -118,7 +118,17 @@ test('the real broker reports a confirmed disconnected app on page one even belo
   assert.equal(body.page, 1); assert.equal(body.results.length, 1);
   assert.notEqual(body.results[0].name, operation, 'the disconnected row is genuinely below this page');
   assert.deepEqual(body.apps_not_connected.map((entry: { app: string; operations: string[] }) => [entry.app, entry.operations]), [['Quillboard', [operation]]]);
-  assert.match(body.apps_not_connected[0].next, /exact operation names/);
+  assert.match(body.apps_not_connected[0].next, /ask_user_question/);
+  assert.equal(body.apps_not_connected[0].toolkit, undefined, 'the toolkit slug stays host-side');
+  // The same typed subject an exact-operation search raises, so the owner's
+  // question carries the card that connects the app.
+  const gap = body.unavailable.find((entry: { dependencySubject?: { kind?: string } }) => entry.dependencySubject?.kind === 'exact_capability_connection');
+  assert.ok(gap, 'one named disconnected app is a typed connection gap');
+  assert.equal(gap.source, 'authorized_composio');
+  assert.equal(gap.code, 'no_connections');
+  assert.equal(gap.dependencySubject.capability, operation);
+  assert.equal(gap.dependencySubject.capabilityRef, `cap:resolved:${operation.toLowerCase()}`);
+  assert.equal(gap.dependencySubject.query, query);
   assert.equal(business, 0);
 });
 
