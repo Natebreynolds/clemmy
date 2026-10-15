@@ -132,6 +132,7 @@ const TOOLCHOICE_AUDIT_EVERY_N_TICKS = 1440; // ~6h with a 15s tick
 // cheap (single DELETE with index on created_at). Each row is 4KB-200KB
 // so even on a busy day the delete-set is bounded.
 const EVENTLOG_REAPER_EVERY_N_TICKS = 240; // ~1h with a 15s tick
+const CONVERSATION_MEMORY_FIRST_TICK = 20; // ~5min after start with a 15s tick
 // Recall stuck-recording reaper. Some captures (notably the
 // desktop-audio fallback, which isn't tied to a meeting window) never
 // get the SDK's recording-ended event, so they hang in 'recording'
@@ -772,6 +773,21 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     logger.warn({ err }, 'memory work retention tick failed');
   }
 
+  // Idle conversations fold into memory and their stored working state
+  // shrinks (conversation-memory.ts): first a few minutes after start, since
+  // an app quit often may never reach the hour, then hourly. Bounded per
+  // pass; never while the machine is busy.
+  if ((tickCount === CONVERSATION_MEMORY_FIRST_TICK || tickCount % EVENTLOG_REAPER_EVERY_N_TICKS === 0)
+    && !shouldDeferDiscretionaryWork('conversation-memory')) {
+    try {
+      const { consolidateIdleConversations } = await import('./conversation-memory.js');
+      const folded = await consolidateIdleConversations();
+      if (folded.compacted + folded.remembered + folded.retired + folded.faded > 0) logger.info({ folded }, 'conversation memory tick');
+    } catch (err) {
+      logger.warn({ err }, 'conversation memory tick failed');
+    }
+  }
+
   // Keep conversation, result and Stop history unless the operator explicitly
   // configured an age policy. Context compaction does not delete source data.
   if (tickCount % EVENTLOG_REAPER_EVERY_N_TICKS === 0) {
@@ -787,6 +803,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         onError: (store, err) => logger.warn({ store, err }, 'configured conversation retention failed') }),
       (result) => memoryTidyOutcome([], result.workEpisodes));
     if (Object.values(reaped).some(count => count > 0)) logger.info({ reaped }, 'configured conversation retention tick');
+
     // Disposable operational metrics keep their separate storage policy.
     try {
       const { reapStaleOperationalEvents } = await import('../runtime/operational-telemetry.js');
