@@ -66,3 +66,37 @@ test('a nullable number compiled from JSON Schema takes the same canonical text'
   } as Parameters<typeof z.fromJSONSchema>[0]);
   assert.deepEqual(repairNativeArguments(schema, { slug: 'my-day', limit: '25' }, { sideEffect: 'read' })?.args, { slug: 'my-day', limit: 25 });
 });
+
+test('an object whose strict schema types it as text moves whole into its JSON-text sibling, nothing coerced', () => {
+  // Live 2026-10-15: workflow_update with steps[].call.args {max_chars: 20000,
+  // formats: ["markdown"]} was refused "expected string, received number"
+  // because the strict schema can only type the open object's values as text.
+  const schema = z.strictObject({
+    name: z.string(),
+    steps: z.array(z.strictObject({
+      id: z.string(),
+      call: z.strictObject({
+        tool: z.string(),
+        args: z.record(z.string(), z.string()).optional(),
+        args_json: z.string().optional(),
+      }).optional(),
+    })),
+  });
+  const input = {
+    name: 'research-outreach',
+    steps: [
+      { id: 'load', call: { tool: 'read_file', args: { path: '/tmp/p.csv', max_chars: 20000 } } },
+      { id: 'search', call: { tool: 'FIRECRAWL_SEARCH', args: { q: '{{item.company}}', limit: 3, formats: ['markdown'] } } },
+    ],
+  };
+  const repaired = repairNativeArguments(schema, input, { sideEffect: 'write' });
+  assert.ok(repaired, 'repaired');
+  assert.equal(repaired.repair, 'json_text_sibling');
+  const steps = repaired.args.steps as Array<{ call: { args?: unknown; args_json?: string } }>;
+  assert.equal(steps[0]!.call.args, undefined);
+  assert.deepEqual(JSON.parse(steps[0]!.call.args_json!), { path: '/tmp/p.csv', max_chars: 20000 });
+  assert.deepEqual(JSON.parse(steps[1]!.call.args_json!), { q: '{{item.company}}', limit: 3, formats: ['markdown'] });
+  // A field with no JSON-text sibling is not touched.
+  const noSibling = z.strictObject({ options: z.record(z.string(), z.string()) });
+  assert.equal(repairNativeArguments(noSibling, { options: { limit: 3 } }, { sideEffect: 'write' }), null);
+});

@@ -26,7 +26,7 @@ import type { ToolSideEffect } from './tool-registry.js';
 
 export type NativeArgumentRepair = {
   args: Record<string, unknown>;
-  repair: 'wrapped_single_item' | 'renamed_field' | 'canonical_scalar';
+  repair: 'wrapped_single_item' | 'renamed_field' | 'canonical_scalar' | 'json_text_sibling';
   detail: string;
 };
 
@@ -61,6 +61,62 @@ function withValueAt(root: unknown, path: readonly PropertyKey[], value: unknown
   return root;
 }
 
+/**
+ * An object sent in a field whose schema also offers a JSON-text sibling
+ * (`args` beside `args_json`) moves into that sibling whole, encoded once. A
+ * strict schema cannot type an open object's values, so the object form
+ * arrives typed as text and its numbers and lists are refused; the JSON-text
+ * sibling carries every nested type losslessly. Nothing is coerced, and the
+ * move stands only if the whole call then validates.
+ */
+function moveObjectsToJsonTextSiblings(
+  schema: z.ZodTypeAny,
+  input: Record<string, unknown>,
+  issues: readonly { path: readonly PropertyKey[] }[],
+): { args: Record<string, unknown>; detail: string } | null {
+  let args: unknown = input;
+  const moved: string[] = [];
+  const startsWith = (path: readonly PropertyKey[], prefix: readonly PropertyKey[]) => (
+    prefix.length <= path.length && prefix.every((part, index) => path[index] === part));
+  const movedPaths: PropertyKey[][] = [];
+  for (const issue of issues) {
+    // Several failures inside one object are one move.
+    if (movedPaths.some((path) => startsWith(issue.path, path))) continue;
+    // The innermost object on the failing path whose JSON-text sibling the
+    // schema accepts: moving it must clear the failure there without the
+    // sibling itself being refused.
+    for (let index = issue.path.length - 1; index >= 0; index -= 1) {
+      const key = issue.path[index];
+      if (typeof key !== 'string') continue;
+      const parentPath = issue.path.slice(0, index);
+      const parent = valueAt(args, parentPath);
+      if (!plainObject(parent)) continue;
+      const value = parent[key];
+      const sibling = `${key}_json`;
+      if (!plainObject(value) || (parent[sibling] !== undefined && parent[sibling] !== null)) continue;
+      const { [key]: _object, ...rest } = parent;
+      const candidate = withValueAt(args, parentPath, { ...rest, [sibling]: JSON.stringify(value) });
+      const after = schema.safeParse(candidate);
+      const stillFailing = !after.success && after.error.issues.some((left) => (
+        startsWith(left.path, [...parentPath, key])
+        || startsWith(left.path, [...parentPath, sibling])
+        || (left.code === 'unrecognized_keys' && startsWith(left.path, parentPath) && left.path.length === parentPath.length
+          && (left as { keys?: string[] }).keys?.includes(sibling))
+      ));
+      if (stillFailing) continue;
+      args = candidate;
+      movedPaths.push([...parentPath, key]);
+      moved.push([...parentPath, key].join('.'));
+      break;
+    }
+  }
+  if (moved.length === 0 || !plainObject(args) || !schema.safeParse(args).success) return null;
+  return {
+    args,
+    detail: `${moved.map((path) => `"${path}"`).join(', ')} sent as JSON text in ${moved.length === 1 ? 'its' : 'their'} _json field`,
+  };
+}
+
 function valueAt(root: unknown, path: readonly PropertyKey[]): unknown {
   let current = root;
   for (const key of path) {
@@ -80,6 +136,8 @@ export function repairNativeArguments(
   if (options.sideEffect !== 'read' && options.sideEffect !== 'write') return null;
   let first = schema.safeParse(input);
   if (first.success) return null;
+  const jsonText = moveObjectsToJsonTextSiblings(schema, input, first.error.issues);
+  if (jsonText) return { args: jsonText.args, repair: 'json_text_sibling', detail: jsonText.detail };
 
   let args: Record<string, unknown> = input;
   const coerced: string[] = [];
