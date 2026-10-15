@@ -35,22 +35,23 @@ function fixture(options: { sdkTimeoutMs: number; wireDelayMs: number; throwOnWi
   let requestUrl = '';
   let markStarted!: () => void;
   const started = new Promise<void>(resolve => { markStarted = resolve; });
-  const sdkDeadlines: number[] = [];
-  const inputSignals: Array<AbortSignal | null | undefined> = [];
+  // Observed at the wire, the only boundary every client version shares: did
+  // the request carry a cancellation signal, and how long after it started
+  // was it ended.
+  let wireSignals = 0;
+  let wireStartedAt = 0;
+  let abortedAfterMs: number | null = null;
   const transportOptions: Array<Partial<ClientOptions>> = [];
   class ObservedRawClient extends RawComposio {
     override withOptions(overrides: Partial<ClientOptions>): this {
       transportOptions.push(overrides);
       return super.withOptions(overrides);
     }
-    override async fetchWithTimeout(...args: Parameters<RawComposio['fetchWithTimeout']>): Promise<Response> {
-      sdkDeadlines.push(args[2]);
-      inputSignals.push(args[1]?.signal);
-      return super.fetchWithTimeout(...args);
-    }
   }
   const fetchWire: typeof fetch = async (input, init) => {
     calls += 1;
+    wireStartedAt = Date.now();
+    if (init?.signal) wireSignals += 1;
     requestUrl = String(input);
     body = typeof init?.body === 'string' ? JSON.parse(init.body) : init?.body;
     markStarted();
@@ -58,7 +59,12 @@ function fixture(options: { sdkTimeoutMs: number; wireDelayMs: number; throwOnWi
     return new Promise<Response>((resolve, reject) => {
       const signal = init?.signal;
       const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); };
-      const onAbort = () => { aborts += 1; cleanup(); reject(new DOMException('mock wire aborted', 'AbortError')); };
+      const onAbort = () => {
+        aborts += 1;
+        abortedAfterMs = Date.now() - wireStartedAt;
+        cleanup();
+        reject(new DOMException('mock wire aborted', 'AbortError'));
+      };
       const timer = setTimeout(() => {
         cleanup();
         resolve(new Response(JSON.stringify({ data: { items: [{ id: 'current-result' }] }, successful: true, error: null }),
@@ -79,8 +85,9 @@ function fixture(options: { sdkTimeoutMs: number; wireDelayMs: number; throwOnWi
     args: { timeout: 0, waitForFinish: 1, query: 'exact source' },
     providerOperationVersion: '20260907_01',
   });
-  return { prepare, started, sdkDeadlines, inputSignals, transportOptions,
-    calls: () => calls, aborts: () => aborts, body: () => body, url: () => requestUrl };
+  return { prepare, started, transportOptions,
+    calls: () => calls, aborts: () => aborts, body: () => body, url: () => requestUrl,
+    wireSignals: () => wireSignals, abortedAfterMs: () => abortedAfterMs };
 }
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -97,10 +104,9 @@ test('prepared SDK wire uses the remaining owner window beyond its shorter defau
   assert.equal((result as { successful: boolean }).successful, true);
   assert.deepEqual((result as { data: unknown }).data, { items: [{ id: 'current-result' }] });
   assert.equal(f.calls(), 1);
-  assert.equal(f.aborts(), 0);
+  assert.equal(f.aborts(), 0, 'the wire outlived the 20 ms SDK default: the remaining owner window governed');
   assert.deepEqual(f.transportOptions, [{ maxRetries: 0 }]);
-  assert.equal(f.inputSignals[0], controller.signal);
-  assert.ok(f.sdkDeadlines[0]! > 60_000 && f.sdkDeadlines[0]! <= 119_970, 'uses remaining invocation time at dispatch');
+  assert.equal(f.wireSignals(), 1, 'the request carries a cancellation signal');
   assert.equal(f.url(), 'https://provider.test.invalid/api/v3.1/tools/execute/ACME_READ_RECORDS');
   assert.deepEqual((f.body() as { arguments: unknown }).arguments, { timeout: 0, waitForFinish: 1, query: 'exact source' });
   await assert.rejects(client.executePreparedComposioTool(prepared), client.ComposioPreDispatchError);
@@ -112,7 +118,7 @@ test('an owner deadline shorter than the SDK default ends exactly one pending wi
   const controller = new AbortController();
   await assert.rejects(abortContext.runWithToolAbortSignal(controller.signal,
     () => client.executePreparedComposioTool(f.prepare()), Date.now() + 30), APIConnectionTimeoutError);
-  assert.ok(f.sdkDeadlines[0]! > 0 && f.sdkDeadlines[0]! <= 30);
+  assert.ok(f.abortedAfterMs()! <= 60, `the 30 ms owner window ended the wire, not the 100 ms reply or 500 ms default (${f.abortedAfterMs()} ms)`);
   assert.equal(f.calls(), 1);
   assert.equal(f.aborts(), 1);
   assert.deepEqual(f.transportOptions, [{ maxRetries: 0 }]);
@@ -124,10 +130,9 @@ for (const withSignal of [false, true]) {
     const invoke = () => client.executePreparedComposioTool(f.prepare());
     const controller = new AbortController();
     await assert.rejects(withSignal ? abortContext.runWithToolAbortSignal(controller.signal, invoke) : invoke(), APIConnectionTimeoutError);
-    assert.deepEqual(f.sdkDeadlines, [20]);
+    assert.ok(f.abortedAfterMs()! < 70, `the 20 ms SDK default ended the 80 ms wire (${f.abortedAfterMs()} ms)`);
     assert.equal(f.calls(), 1);
     assert.equal(f.aborts(), 1);
-    if (withSignal) assert.equal(f.inputSignals[0], controller.signal);
   });
 }
 
@@ -139,7 +144,6 @@ test('an already elapsed owner deadline is refused before any HTTP request and c
     () => client.executePreparedComposioTool(prepared), Date.now() - 1),
   (error: unknown) => error instanceof DOMException && error.name === 'TimeoutError');
   assert.equal(f.calls(), 0);
-  assert.deepEqual(f.sdkDeadlines, []);
   await assert.rejects(client.executePreparedComposioTool(prepared), client.ComposioPreDispatchError);
   assert.equal(f.calls(), 0);
 });
@@ -153,7 +157,6 @@ test('already cancelled invocation preserves its exact reason and makes zero HTT
     () => client.executePreparedComposioTool(f.prepare()), Date.now() + 120_000),
   (error: unknown) => error === reason);
   assert.equal(f.calls(), 0);
-  assert.deepEqual(f.sdkDeadlines, []);
 });
 
 test('owner cancellation reaches a pending write; it throws without replay or fabricated success', async () => {
@@ -167,8 +170,8 @@ test('owner cancellation reaches a pending write; it throws without replay or fa
   controller.abort(new Error('owner stopped this exact invocation'));
   await rejected;
   assert.equal(f.calls(), 1);
-  assert.equal(f.aborts(), 1);
-  assert.equal(f.inputSignals[0], controller.signal);
+  assert.equal(f.aborts(), 1, 'the owner stop reached the pending wire request');
+  assert.ok(f.abortedAfterMs()! < 500, 'it ended before the provider replied');
   assert.deepEqual(f.transportOptions, [{ maxRetries: 0 }]);
   await assert.rejects(client.executePreparedComposioTool(prepared), client.ComposioPreDispatchError);
   assert.equal(f.calls(), 1);
