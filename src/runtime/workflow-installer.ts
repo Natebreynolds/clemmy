@@ -20,7 +20,8 @@ import {
   readWorkflowDefinitionFile,
   type WorkflowDefinition,
 } from '../memory/workflow-store.js';
-import { prepareWorkflowCreateForWrite } from '../execution/workflow-authoring.js';
+import { prepareWorkflowCreateForWrite, prepareWorkflowVerification } from '../execution/workflow-authoring.js';
+import { queueWorkflowCreationTest } from '../tools/workflow-run-queue.js';
 import { syncWorkflowTriggersBestEffort, writeWorkflowAndSyncTriggers } from '../execution/workflow-write.js';
 
 export type WorkflowImportStatus = 'queued' | 'cloning' | 'discovering' | 'installing' | 'succeeded' | 'failed';
@@ -36,7 +37,15 @@ export interface WorkflowImportJob {
   dryRun: boolean;
   overwrite: boolean;
   discovered: Array<{ name: string; pathInSource: string; description: string }>;
-  installed: Array<{ name: string; pathInSource: string; filePath: string }>;
+  installed: Array<{
+    name: string;
+    pathInSource: string;
+    filePath: string;
+    /** The author's choices this setup does not inherit. */
+    removed?: string[];
+    /** The rehearsal in this setup that decides whether it turns on. */
+    rehearsal?: { status: 'queued'; runId: string } | { status: 'needs_inputs'; missing: string[] } | { status: 'not_queued'; reason: string };
+  }>;
   skipped: Array<{ name: string; pathInSource: string; reason: string }>;
   error?: string;
   sha?: string;
@@ -178,6 +187,37 @@ function copyDirFiltered(src: string, dst: string): void {
   }
 }
 
+/**
+ * A workflow imported from someone else's setup carries their choices: the
+ * accounts its steps were bound to, the connections its resources name, the
+ * models its author pinned. None of those belong to this setup. It lands off,
+ * without them, and a rehearsal here decides whether it turns on: a step that
+ * asks for something generically uses what this setup has, and a provider the
+ * workflow names that is not connected here comes back from the rehearsal as
+ * a dependency to connect. Step model pins are dropped by the portable-model
+ * preparation the caller applies.
+ */
+export function workflowForThisSetup(def: WorkflowDefinition): { def: WorkflowDefinition; removed: string[] } {
+  const removed: string[] = [];
+  const steps = def.steps.map((step) => {
+    if (!step.call?.account) return step;
+    removed.push(`the account step "${step.id}" was bound to`);
+    const { account: _authorAccount, ...call } = step.call;
+    return { ...step, call };
+  });
+  const resources = def.resources
+    ? Object.fromEntries(Object.entries(def.resources).map(([key, binding]) => {
+        if (binding.connectionId === undefined && binding.account === undefined) return [key, binding];
+        removed.push(`the connection resource "${key}" named`);
+        const { connectionId: _authorConnection, account: _authorAccount, ...rest } = binding;
+        return [key, rest];
+      }))
+    : undefined;
+  const { models: authorModels, ...rest } = def;
+  if (authorModels && (authorModels.brain || authorModels.worker)) removed.push('the workflow\'s pinned models');
+  return { def: { ...rest, enabled: false, steps, ...(resources ? { resources } : {}) }, removed };
+}
+
 function writeSourceMeta(targetDir: string, meta: Record<string, unknown>): void {
   writeFileSync(path.join(targetDir, SOURCE_FILE), JSON.stringify(meta, null, 2), 'utf-8');
 }
@@ -219,7 +259,9 @@ export function importWorkflowFrameworkFromDirectory(
       continue;
     }
 
-    const prepared = prepareWorkflowCreateForWrite(candidate.definition);
+    const authorWantedItOn = candidate.definition.enabled === true;
+    const local = workflowForThisSetup(candidate.definition);
+    const prepared = prepareWorkflowCreateForWrite(local.def, { modelPortability: 'portable' });
     if (prepared.status === 'invalid') {
       skipped.push({
         name: candidate.name,
@@ -242,8 +284,34 @@ export function importWorkflowFrameworkFromDirectory(
       repairs: prepared.repairs,
       warnings: prepared.warnings,
       codifyNotes: prepared.codifyNotes,
+      removedForThisSetup: local.removed,
     });
-    installed.push({ name: candidate.name, pathInSource: candidate.pathInSource, filePath: installedEntry.filePath });
+    // Rehearse it here. It turns on only if the author had it on and it
+    // passes in this setup; until then its triggers stay quiet.
+    let rehearsal: WorkflowImportJob['installed'][number]['rehearsal'];
+    try {
+      const verification = prepareWorkflowVerification(prepared.def);
+      if (verification.missing.length > 0) {
+        rehearsal = { status: 'needs_inputs', missing: verification.missing };
+      } else {
+        const queued = queueWorkflowCreationTest(candidate.name, verification.inputs, {
+          activateAfterCreationTest: authorWantedItOn,
+          source: 'workflow-import',
+        });
+        rehearsal = queued.status === 'queued' && queued.id
+          ? { status: 'queued', runId: queued.id }
+          : { status: 'not_queued', reason: queued.message };
+      }
+    } catch (error) {
+      rehearsal = { status: 'not_queued', reason: error instanceof Error ? error.message : String(error) };
+    }
+    installed.push({
+      name: candidate.name,
+      pathInSource: candidate.pathInSource,
+      filePath: installedEntry.filePath,
+      ...(local.removed.length > 0 ? { removed: local.removed } : {}),
+      rehearsal,
+    });
   }
 
   if (installed.length > 0) syncWorkflowTriggersBestEffort();

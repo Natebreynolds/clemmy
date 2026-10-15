@@ -89,7 +89,7 @@ test('importWorkflowFrameworkFromDirectory installs workflow files and skips run
   assert.equal(sourceMeta.kind, 'workflow-framework');
 });
 
-test('importWorkflowFrameworkFromDirectory syncs imported event triggers immediately', () => {
+test('an imported workflow lands off and is rehearsed here; its triggers wait until it passes and turns on', async () => {
   closeWorkflowTriggerDbForTest();
   const source = path.join(tmp, 'event-source');
   const workflowDir = path.join(source, '.clementine', 'workflows', 'imported-event-flow');
@@ -117,11 +117,66 @@ test('importWorkflowFrameworkFromDirectory syncs imported event triggers immedia
 
   const result = importWorkflowFrameworkFromDirectory(source);
   assert.equal(result.installed.length, 1);
+  assert.equal(readWorkflow('imported-event-flow')?.data.enabled, false, 'another setup\'s workflow is not trusted here until it is rehearsed');
+  const rehearsal = result.installed[0]!.rehearsal;
+  assert.equal(rehearsal?.status, 'queued', JSON.stringify(rehearsal));
+  const run = JSON.parse(readFileSync(path.join(process.env.CLEMENTINE_HOME!, 'workflows', 'runs', `${(rehearsal as { runId: string }).runId}.json`), 'utf-8'));
+  assert.equal(run.status, 'creation_test');
+  assert.equal(run.activateAfterCreationTest, undefined, 'the author had it on, so passing here turns it on');
+  assert.equal(fireWorkflowSystemEvent('imported.lead.created', { id: 'L-100' })
+    .filter((entry) => entry.workflowName === 'imported-event-flow').length, 0);
 
-  const fired = fireWorkflowSystemEvent('imported.lead.created', { id: 'L-100' })
+  // Passing the rehearsal turns it on; then its own triggers fire.
+  const { writeWorkflowAndSyncTriggers } = await import('../execution/workflow-write.js');
+  writeWorkflowAndSyncTriggers('imported-event-flow', { ...readWorkflow('imported-event-flow')!.data, enabled: true });
+  const fired = fireWorkflowSystemEvent('imported.lead.created', { id: 'L-101' })
     .filter((entry) => entry.workflowName === 'imported-event-flow');
   assert.equal(fired.length, 1);
   assert.equal(fired[0].status, 'queued');
+});
+
+test('an imported workflow keeps none of its author\'s accounts, connections or models', () => {
+  const source = path.join(tmp, 'bound-source');
+  const workflowDir = path.join(source, '.clementine', 'workflows', 'bound-flow');
+  mkdirSync(workflowDir, { recursive: true });
+  writeFileSync(
+    path.join(workflowDir, 'SKILL.md'),
+    [
+      '---',
+      'name: bound-flow',
+      'description: A workflow bound to its author\'s setup',
+      'enabled: false',
+      'trigger:',
+      '  manual: true',
+      'models:',
+      '  brain: author-brain-model',
+      'resources:',
+      '  lead_sheet:',
+      '    id: lead_sheet',
+      '    kind: sheet',
+      '    toolkit: googlesheets',
+      '    connectionId: author-connection',
+      '    account: author@example.com',
+      '    resourceId: sheet-123',
+      'steps:',
+      '  - id: summarize',
+      '    model: author-step-model',
+      '    prompt: Summarize the lead sheet.',
+      '---',
+      'Summarize leads.',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  const result = importWorkflowFrameworkFromDirectory(source);
+  assert.equal(result.installed.length, 1, JSON.stringify(result.skipped));
+  const saved = readWorkflow('bound-flow')!.data;
+  assert.equal(saved.models, undefined);
+  assert.equal(saved.steps[0]!.model, undefined);
+  assert.equal(saved.resources?.lead_sheet?.connectionId, undefined);
+  assert.equal(saved.resources?.lead_sheet?.account, undefined);
+  assert.equal(saved.resources?.lead_sheet?.resourceId, 'sheet-123', 'what the workflow works on is kept; whose account reaches it is not');
+  assert.ok(result.installed[0]!.removed?.length);
 });
 
 test('importWorkflowFrameworkFromDirectory protects existing workflow unless overwrite is true', () => {
