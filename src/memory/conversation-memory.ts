@@ -17,10 +17,11 @@ import { Agent, Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
 import pino from 'pino';
 import { z } from 'zod';
-import { listEvents, getSession } from '../runtime/harness/eventlog.js';
+import { listEvents } from '../runtime/harness/eventlog.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import {
   compactConversationState,
+  captureConversationMemorySnapshot,
   CONVERSATION_COMPACT_IDLE_DAYS,
   CONVERSATION_MEMORY_ONLY_IDLE_DAYS,
   listCompactedSessionsNeedingRepair,
@@ -28,6 +29,7 @@ import {
   noteConversationMemory,
   repairCompactedProvenanceResults,
   retireConversationStateToMemory,
+  type ConversationMemorySnapshot,
 } from '../runtime/harness/conversation-state-lifecycle.js';
 import { openMemoryDb } from './db.js';
 import { memoryJobFailed, memoryJobRoute, memoryTidyOutcome, noteMemoryModelFailure, runMemoryModelJob } from './memory-job-context.js';
@@ -68,9 +70,9 @@ function clipped(text: string, max: number): string {
 }
 
 /** The visible transcript, the owner's words and Clem's replies, in order. */
-export function conversationTranscript(sessionId: string): { text: string; turns: number } {
+export function conversationTranscript(sessionId: string, throughSeq?: number): { text: string; turns: number } {
   const lines: string[] = [];
-  for (const event of listEvents(sessionId, { types: ['user_input_received', 'conversation_completed'] })) {
+  for (const event of listEvents(sessionId, { types: ['user_input_received', 'conversation_completed'], throughSeq })) {
     const data = event.data as Record<string, unknown>;
     if (event.type === 'user_input_received') {
       const text = typeof data.displayText === 'string' ? data.displayText : typeof data.text === 'string' ? data.text : '';
@@ -176,30 +178,31 @@ const NOTHING_TO_REMEMBER = 'none:empty-transcript';
 const NOT_REMEMBERED = 'none:unusable-summary';
 
 /** Remember one idle chat. */
-async function rememberConversation(sessionId: string, model: Model | string): Promise<
-  { kind: 'kept'; episodeId: string; summary: string } | { kind: 'empty' } | { kind: 'unusable' }
+async function rememberConversation(sessionId: string, model: Model | string, expectedUpdatedAt: string): Promise<
+  { kind: 'raced' } | ({ snapshot: ConversationMemorySnapshot } & (
+    { kind: 'kept'; persist: () => string } | { kind: 'empty' } | { kind: 'unusable' }
+  ))
 > {
-  const session = getSession(sessionId, { withoutConversationState: true });
-  if (!session) return { kind: 'empty' };
-  const transcript = conversationTranscript(sessionId);
-  if (transcript.turns === 0) return { kind: 'empty' };
+  const snapshot = captureConversationMemorySnapshot(sessionId);
+  if (!snapshot || snapshot.sessionUpdatedAt !== expectedUpdatedAt) return { kind: 'raced' };
+  const transcript = conversationTranscript(sessionId, snapshot.eventSeq);
+  if (transcript.turns === 0) return { kind: 'empty', snapshot };
   const memory = await summarizeConversationForMemory(transcript.text, model);
-  if (!memory) return { kind: 'unusable' };
+  if (!memory) return { kind: 'unusable', snapshot };
   const content = memoryText(memory);
-  const episode = recordMemoryEpisode({
+  return { kind: 'kept', snapshot, persist: () => recordMemoryEpisode({
     kind: 'reflection',
     subtype: CONVERSATION_MEMORY_SUBTYPE,
     title: memory.title,
     sourceApp: 'clementine',
     sessionId,
     callId: CONVERSATION_MEMORY_CALL_ID,
-    occurredAt: session.updatedAt,
+    occurredAt: snapshot.sessionUpdatedAt,
     content,
-    rawRetainedUntil: addDays(session.updatedAt, CONVERSATION_MEMORY_FULL_DAYS),
-    metadata: { since: session.createdAt, until: session.updatedAt, messages: transcript.turns,
+    rawRetainedUntil: addDays(snapshot.sessionUpdatedAt, CONVERSATION_MEMORY_FULL_DAYS),
+    metadata: { since: snapshot.createdAt, until: snapshot.sessionUpdatedAt, messages: transcript.turns,
       openThreads: memory.openThreads, references: memory.references },
-  });
-  return { kind: 'kept', episodeId: episode.id, summary: content };
+  }).id };
 }
 
 /** A year after its conversation ended, a conversation memory keeps its first line. */
@@ -245,9 +248,11 @@ export async function consolidateIdleConversations(input: {
       withoutMemory: { retryUnusableBefore: now.toISOString().slice(0, 10) } });
     for (const candidate of candidates) {
       try {
-        const kept = await rememberConversation(candidate.sessionId, model);
-        if (kept.kind === 'kept') { noteConversationMemory(candidate.sessionId, kept.episodeId); result.remembered += 1; }
-        else noteConversationMemory(candidate.sessionId, kept.kind === 'empty' ? NOTHING_TO_REMEMBER : `${NOT_REMEMBERED}:${now.toISOString().slice(0, 10)}`);
+        const kept = await rememberConversation(candidate.sessionId, model, candidate.updatedAt);
+        if (kept.kind === 'raced') continue;
+        const noted = noteConversationMemory(candidate.sessionId, kept.kind === 'kept' ? kept.persist
+          : kept.kind === 'empty' ? NOTHING_TO_REMEMBER : `${NOT_REMEMBERED}:${now.toISOString().slice(0, 10)}`, kept.snapshot);
+        if (noted && kept.kind === 'kept') result.remembered += 1;
       } catch (error) {
         noteMemoryModelFailure(error);
         logger.warn({ err: error instanceof Error ? error.message : error, sessionId: candidate.sessionId }, 'conversation memory failed');
@@ -273,7 +278,12 @@ export async function consolidateIdleConversations(input: {
     for (const candidate of listConversationLifecycleCandidates({ idleBefore: monthAgo, fidelity: ['full', 'compacted'], limit: input.retireLimit ?? 150 })) {
       // A chat retires only to its memory; a workflow or execution step's
       // record of its work lives with its run.
-      const memory = candidate.kind === 'chat' ? conversationMemoryFor(candidate.sessionId) : null;
+      const keptMemory = candidate.kind === 'chat' ? conversationMemoryFor(candidate.sessionId) : null;
+      // Old episodes remain useful history, but only the episode noted on the
+      // current working state may replace that state. A resumed conversation
+      // clears the marker; an unusable new summary must not revive the old one.
+      const memory = keptMemory && captureConversationMemorySnapshot(candidate.sessionId)?.memoryEpisodeId === keptMemory.episodeId
+        ? keptMemory : null;
       if (candidate.kind === 'chat' && !memory && conversationTranscript(candidate.sessionId).turns > 0) continue;
       const step = retireConversationStateToMemory(candidate.sessionId, { memory, nowMs });
       if (step === 'changed') result.retired += 1;

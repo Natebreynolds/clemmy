@@ -39,10 +39,12 @@ import {
 import {
   composioToolOperationVersion,
   composioToolSchemaObservedAt,
+  composioConnectionsProblem,
   getExactComposioToolsBySlugs,
   listCachedToolkits,
   listUsableConnectedToolkits,
   peekConnectedToolkits,
+  peekCurrentConnectedToolkits,
   searchConnectedComposioTools,
   selectToolkitConnection,
 } from '../integrations/composio/client.js';
@@ -2654,24 +2656,45 @@ export function buildAuthorizedToolSearchCandidateSources(
     kind: 'authorized_composio',
     async search(input) {
       const { query, deadlineAt } = input;
+      let connectionObservation: Promise<ReturnType<typeof peekCurrentConnectedToolkits>> | undefined;
+      let observedConnections: ReturnType<typeof peekCurrentConnectedToolkits> = null;
+      const observeConnections = () => connectionObservation ??= (async () => {
+        const observed = await freshConnectionsWithin({ signal: input.signal, deadlineAt: exactDiscoveryDeadline(deadlineAt) });
+        observedConnections = observed && !composioConnectionsProblem() ? peekCurrentConnectedToolkits() : null;
+        return observedConnections;
+      })();
       // Started first and joined on every answer below, so a live search that
       // answers late (the cached fallback holds connected apps only) cannot
       // drop the apps the query named that are not connected.
       const unconnected = exactComposioOperationsFromQuery(query).length > 0
         ? Promise.resolve([] as ToolSearchBrokerCandidate[])
-        : namedUnconnectedCandidates(query, input.signal, deadlineAt);
-      // First, not last: the broker keeps a source's first twenty rows, and
-      // these (at most four) are the only sign the named app exists at all.
-      // Relevance still orders every row downstream.
-      const withUnconnected = async (rows: ToolSearchBrokerCandidate[]): Promise<ToolSearchBrokerCandidate[]> => {
-        const named = await unconnected;
+        : namedUnconnectedCandidates(query, input.signal, deadlineAt, observeConnections);
+      type ConnectedOutcome = { ok: true; value: ToolSearchBrokerCandidate[] } | { ok: false; error: unknown };
+      const withUnconnected = async (outcome: ConnectedOutcome): Promise<ToolSearchBrokerCandidate[]> => {
+        const completed = await unconnected;
+        // The named lookup can finish before a slow connected search. Its
+        // exact observation must still be current when this answer is joined.
+        const named = discoveryStillActive(input) && observedConnections && !composioConnectionsProblem()
+          && peekCurrentConnectedToolkits() === observedConnections ? completed : [];
+        if (!outcome.ok) {
+          // Confirmed absence can still answer with setup-only metadata;
+          // unknown registry state and every other error stay unavailable.
+          if (outcome.error instanceof CandidateSourceUnavailableError
+            && outcome.error.code === 'no_connections' && named.length > 0) return named;
+          throw outcome.error;
+        }
+        // First, not last: the broker keeps a source's first twenty rows, and
+        // these (at most four) are the only sign the named app exists at all.
+        // Relevance still orders every row downstream.
         const seen = new Set(named.map((candidate) => candidate.name.trim().toUpperCase()));
-        return [...named, ...rows.filter((candidate) => !seen.has(candidate.name.trim().toUpperCase()))];
+        return [...named, ...outcome.value.filter((candidate) => !seen.has(candidate.name.trim().toUpperCase()))];
       };
-      if (deadlineAt === undefined || exactComposioOperationsFromQuery(query).length > 0) return withUnconnected(await searchLive(input));
+      const observeLive = () => searchLive(input).then<ConnectedOutcome, ConnectedOutcome>(
+        value => ({ ok: true, value }), error => ({ ok: false, error }));
+      if (deadlineAt === undefined || exactComposioOperationsFromQuery(query).length > 0) return withUnconnected(await observeLive());
       const fallbackMs = deadlineAt - Date.now() - COMPOSIO_LEASED_FALLBACK_MARGIN_MS;
-      if (fallbackMs <= 0) return withUnconnected(leasedIndexedComposioCandidates(query));
-      const live = searchLive(input);
+      if (fallbackMs <= 0) return withUnconnected({ ok: true, value: leasedIndexedComposioCandidates(query) });
+      const live = observeLive();
       // A query that names a connected app with current contracts that match
       // it is answered from them after a short wait, not the whole budget.
       const budgetMs = leasedIndexedComposioCandidates(query, true).length > 0
@@ -2688,7 +2711,7 @@ export function buildAuthorizedToolSearchCandidateSources(
       // The live search keeps going and teaches what it learns; this answer
       // uses what is already proven current.
       live.catch(() => undefined);
-      return withUnconnected(leasedIndexedComposioCandidates(query));
+      return withUnconnected({ ok: true, value: leasedIndexedComposioCandidates(query) });
     },
     prepareCandidates: (input) => prepareCandidatesLive(input),
   };
@@ -2702,28 +2725,36 @@ export function buildAuthorizedToolSearchCandidateSources(
     query: string,
     signal: AbortSignal | undefined,
     deadlineAt: number | undefined,
+    observeConnections: () => Promise<ReturnType<typeof peekCurrentConnectedToolkits>>,
   ): Promise<ToolSearchBrokerCandidate[]> {
     try {
-      const connected = new Set(peekConnectedToolkits()
-        .filter((connection) => /active|enabled|initiat/i.test(connection.status ?? ''))
-        .map((connection) => connection.slug.trim().toLowerCase()));
       const lower = query.toLowerCase();
       const words = new Set(lower.split(/[^a-z0-9]+/).filter(Boolean));
       const compactQuery = lower.replace(/[^a-z0-9]/g, '');
       const named = listCachedToolkits().filter((toolkit) => {
         const slug = toolkit.slug.trim().toLowerCase();
-        if (!slug || connected.has(slug)) return false;
+        if (!slug) return false;
         const name = toolkit.name.toLowerCase().replace(/[^a-z0-9]/g, '');
         return words.has(slug) || words.has(name) || (name.length >= 6 && compactQuery.includes(name));
-      }).slice(0, 2);
+      });
       if (named.length === 0 || signal?.aborted) return [];
+      const observation = await observeConnections();
+      // A missing/last-good registry is unknown, never evidence that an app
+      // is disconnected. Keep the exact current observation for publication.
+      if (!observation || signal?.aborted) return [];
+      const connected = new Set(observation
+        .filter((connection) => /active|enabled|initiat/i.test(connection.status ?? ''))
+        .map((connection) => connection.slug.trim().toLowerCase()));
+      const unconnected = named.filter(toolkit => !connected.has(toolkit.slug.trim().toLowerCase())).slice(0, 2);
+      if (unconnected.length === 0) return [];
       const outcome = await awaitBounded({
-        start: () => searchConnectedComposioTools(named.map((toolkit) => toolkit.slug), query, 8),
+        start: () => searchConnectedComposioTools(unconnected.map((toolkit) => toolkit.slug), query, 8),
         signal,
         ...(deadlineAt !== undefined ? { deadlineAt: deadlineAt - PROVIDER_SOURCE_RETURN_MARGIN_MS } : {}),
       });
-      if (outcome.kind !== 'settled') return [];
-      const appNames = new Map(named.map((toolkit) => [toolkit.slug.trim().toLowerCase(), toolkit.name]));
+      if (outcome.kind !== 'settled' || signal?.aborted || composioConnectionsProblem()
+        || peekCurrentConnectedToolkits() !== observation) return [];
+      const appNames = new Map(unconnected.map((toolkit) => [toolkit.slug.trim().toLowerCase(), toolkit.name]));
       return outcome.value.filter((tool) => tool.inputParameters !== undefined).slice(0, 4).map((tool): ToolSearchBrokerCandidate => {
         const toolkit = (tool.toolkitSlug ?? registeredToolkitOfSlug(tool.slug)).trim().toLowerCase();
         const app = appNames.get(toolkit) ?? toolkit;

@@ -168,3 +168,93 @@ test('a chat the model gave nothing usable for is asked again a day later, not o
   await conversationMemory.consolidateIdleConversations({ now: new Date(NOW.getTime() + 86_400_000) });
   assert.equal(calls, 2, 'asked again the next day');
 });
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+for (const unusable of [false, true]) {
+  test(`late ${unusable ? 'unusable' : 'usable'} conversation summary cannot mark a resumed turn remembered`, { timeout: 5_000 }, async () => {
+    const tag = unusable ? 'race-unusable' : 'race-usable';
+    const sessionId = chat(tag, 8);
+    const started = deferred<void>(), release = deferred<void>();
+    let targetCalls = 0;
+    conversationMemory._setConversationMemorySummarizerForTests(async (transcript) => {
+      const target = transcript.includes(`Find the ${tag} report`);
+      if (target && ++targetCalls === 1) { started.resolve(); await release.promise; if (unusable) return null; }
+      return { title: tag, summary: transcript.includes('NEW-WORK-4812')
+        ? 'The resumed conversation added NEW-WORK-4812.' : 'Only the previous report was discussed.', openThreads: [], references: [] };
+    }, 'fixture-memory-model');
+    const pending = conversationMemory.consolidateIdleConversations({ now: NOW });
+    try {
+      await started.promise;
+      eventlog.appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Please also complete NEW-WORK-4812.' } });
+      const resumed = HarnessSession.load(sessionId)!;
+      resumed.updateConversationSnapshot([...resumed.toInputItems(), { role: 'user', content: 'Please also complete NEW-WORK-4812.' }] as never);
+      const resumedState = state(sessionId).stateJson;
+      release.resolve();
+      await pending;
+      assert.equal(state(sessionId).stateJson, resumedState, 'the resumed state is not rewritten by idle upkeep');
+      assert.equal(state(sessionId).memoryEpisodeId, null, 'late completion cannot restore a memory/sentinel marker');
+      assert.equal(conversationMemory.conversationMemoryFor(sessionId), null, 'a stale usable summary is not published either');
+
+      eventlog.openEventLog().prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(daysAgo(8), sessionId);
+      await conversationMemory.consolidateIdleConversations({ now: NOW });
+      assert.equal(targetCalls, 2, 'new work remains eligible at its next idle pass, including after an unusable old answer');
+      const memory = conversationMemory.conversationMemoryFor(sessionId);
+      assert.ok(memory); assert.match(memory.summary, /NEW-WORK-4812/);
+      assert.equal(state(sessionId).memoryEpisodeId, memory.episodeId);
+    } finally { release.resolve(); await pending; }
+  });
+}
+
+test('memory publication compares the event frontier even when state bytes and timestamps match', () => {
+  const sessionId = chat('race-frontier', 8);
+  const snapshot = lifecycle.captureConversationMemorySnapshot(sessionId)!;
+  assert.ok(snapshot);
+  eventlog.appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'NEW-EVENT-9117 arrives before its snapshot.' } });
+  // A timestamp alone cannot serve as a revision, even if two updates share a
+  // clock tick (or an older writer restores it). The sequence still advances.
+  eventlog.openEventLog().prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(snapshot.sessionUpdatedAt, sessionId);
+  assert.equal(state(sessionId).stateJson, snapshot.stateJson);
+  let writes = 0;
+  assert.equal(lifecycle.noteConversationMemory(sessionId, () => { writes++; return 'should-not-publish'; }, snapshot), false);
+  assert.equal(writes, 0, 'a stale summary cannot even overwrite the durable episode');
+  assert.equal(lifecycle.noteConversationMemory(sessionId, 'none:empty-transcript', snapshot), false, 'empty markers use the same fence');
+  assert.equal(state(sessionId).memoryEpisodeId, null);
+});
+
+test('a resumed chat with an unusable summary retains working state instead of retiring to its old episode', async () => {
+  const tag = 'retire-current-marker';
+  const sessionId = chat(tag, 8);
+  await conversationMemory.consolidateIdleConversations({ now: NOW });
+  const oldMemory = conversationMemory.conversationMemoryFor(sessionId)!;
+  assert.ok(oldMemory);
+  assert.equal(state(sessionId).memoryEpisodeId, oldMemory.episodeId);
+
+  eventlog.appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Please preserve NEW-RETIRE-WORK-9321.' } });
+  const resumed = HarnessSession.load(sessionId)!;
+  resumed.updateConversationSnapshot([...resumed.toInputItems(), { role: 'user', content: 'Please preserve NEW-RETIRE-WORK-9321.' }] as never);
+  assert.equal(state(sessionId).memoryEpisodeId, null);
+  assert.equal(lifecycle.retireConversationStateToMemory(sessionId, { memory: oldMemory, nowMs: NOW.getTime() }), 'raced',
+    'a selected old episode cannot replace a state whose marker has since cleared');
+
+  eventlog.openEventLog().prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(daysAgo(40), sessionId);
+  conversationMemory._setConversationMemorySummarizerForTests(async () => null, 'fixture-memory-model');
+  await conversationMemory.consolidateIdleConversations({ now: NOW });
+  assert.equal(state(sessionId).fidelity, 'compacted', 'new work is retained when no current usable summary exists');
+  assert.match(String(state(sessionId).memoryEpisodeId), /^none:unusable-summary:/);
+  assert.match(JSON.stringify(state(sessionId).state), /NEW-RETIRE-WORK-9321/);
+  assert.deepEqual(conversationMemory.conversationMemoryFor(sessionId), oldMemory, 'the previous episode remains history');
+
+  conversationMemory._setConversationMemorySummarizerForTests(async () => ({ title: tag,
+    summary: 'The resumed chat included NEW-RETIRE-WORK-9321.', openThreads: [], references: [] }), 'fixture-memory-model');
+  await conversationMemory.consolidateIdleConversations({ now: new Date(NOW.getTime() + 86_400_000) });
+  const currentMemory = conversationMemory.conversationMemoryFor(sessionId)!;
+  assert.equal(state(sessionId).fidelity, 'memory', 'a legitimate current summary still permits retirement');
+  assert.equal(state(sessionId).memoryEpisodeId, currentMemory.episodeId);
+  assert.match(currentMemory.summary, /NEW-RETIRE-WORK-9321/);
+  assert.match(JSON.stringify(state(sessionId).state), /NEW-RETIRE-WORK-9321/);
+});

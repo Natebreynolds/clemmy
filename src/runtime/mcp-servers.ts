@@ -89,25 +89,47 @@ function applyNpmConfigPair(
   env[upperKey] = value;
 }
 
-function declaredServerEnv(server: ManagedMcpServer, sources?: McpServerEnvSources): Record<string, string> {
-  return (sources ? resolveMcpServerEnv(server.env, sources)
-    : readMcpServerEnv(server.env, path.join(BASE_DIR, '.env'))).values;
+function declaredServerEnv(server: ManagedMcpServer, sources?: McpServerEnvSources,
+  platform: NodeJS.Platform = process.platform): Record<string, string> {
+  return (sources ? resolveMcpServerEnv(server.env, sources, platform)
+    : readMcpServerEnv(server.env, path.join(BASE_DIR, '.env'), undefined, undefined, platform)).values;
 }
 
 /** Literal argv substitution for explicitly declared keys only. This is not a
  * shell: unknown references, `$NAME`, `%NAME%` and command syntax stay literal.
  * Values belong only to the child launch and never to setup/status output. */
-function stdioLaunchArgs(server: ManagedMcpServer, sources?: McpServerEnvSources): string[] {
-  const declared = declaredServerEnv(server, sources);
+function stdioLaunchArgs(server: ManagedMcpServer, sources?: McpServerEnvSources,
+  platform: NodeJS.Platform = process.platform): string[] {
+  const declared = declaredServerEnv(server, sources, platform);
   return (server.args ?? []).map(arg => arg.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g,
     (match, key: string) => Object.hasOwn(declared, key) ? declared[key]! : match));
 }
 
+/** The MCP SDK prepends an uppercase PATH before spreading its supplied env.
+ * Windows children accept only one case-insensitive spelling; publish PATH
+ * after all overrides so a stale SDK default cannot shadow our augmentation.
+ * A declared server override wins over merged values. If a configuration has
+ * conflicting spellings, exact PATH wins, then the last own case variant. */
+function stdioTransportEnv(env: Record<string, string>, declared: Record<string, string>,
+  platform: NodeJS.Platform): Record<string, string> {
+  if (platform !== 'win32') return env;
+  const pathValue = (values: Record<string, string>): string | undefined => {
+    const key = Object.hasOwn(values, 'PATH') ? 'PATH'
+      : Object.keys(values).reverse().find(name => name.toUpperCase() === 'PATH');
+    return key === undefined ? undefined : values[key];
+  };
+  const value = pathValue(declared) ?? pathValue(env);
+  const canonical = Object.fromEntries(Object.entries(env).filter(([key]) => key.toUpperCase() !== 'PATH'));
+  if (value !== undefined) canonical.PATH = value;
+  return canonical;
+}
+
 function stdioLaunchEnv(server: ManagedMcpServer, sources?: McpServerEnvSources,
-  merge: typeof mergedEnv = mergedEnv): Record<string, string> {
-  const env = merge(declaredServerEnv(server, sources));
-  if (!server.command || !isNpxCommand(server.command)) return env;
-  if (!runtimeFlagEnabled('CLEMMY_MCP_NPX_ISOLATED_CACHE', true)) return env;
+  merge: typeof mergedEnv = mergedEnv, platform: NodeJS.Platform = process.platform): Record<string, string> {
+  const declared = declaredServerEnv(server, sources, platform);
+  const env = { ...merge(declared) };
+  if (!server.command || !isNpxCommand(server.command)) return stdioTransportEnv(env, declared, platform);
+  if (!runtimeFlagEnabled('CLEMMY_MCP_NPX_ISOLATED_CACHE', true)) return stdioTransportEnv(env, declared, platform);
 
   const ownedCacheDir = mcpNpxCacheDir(server.name);
   const cacheDir = explicitServerEnvValue(server, ['npm_config_cache', 'NPM_CONFIG_CACHE'])
@@ -135,7 +157,7 @@ function stdioLaunchEnv(server: ManagedMcpServer, sources?: McpServerEnvSources,
   applyNpmConfigPair(env, server, 'npm_config_audit', 'NPM_CONFIG_AUDIT', 'false');
   applyNpmConfigPair(env, server, 'npm_config_fund', 'NPM_CONFIG_FUND', 'false');
   applyNpmConfigPair(env, server, 'npm_config_yes', 'NPM_CONFIG_YES', 'true');
-  return env;
+  return stdioTransportEnv(env, declared, platform);
 }
 
 function localNodeCommand(): string {
@@ -159,9 +181,9 @@ function createLocalServer(): MCPServerStdio | null {
       args: [distEntry],
       clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
       timeout: MCP_REQUEST_TIMEOUT_MS,
-      env: mergedEnv({
+      env: stdioTransportEnv(mergedEnv({
         CLEMENTINE_HOME: BASE_DIR,
-      }),
+      }), {}, process.platform),
       cwd: BASE_DIR,
     });
   }
@@ -172,9 +194,9 @@ function createLocalServer(): MCPServerStdio | null {
     args: ['tsx', srcEntry],
     clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
     timeout: MCP_REQUEST_TIMEOUT_MS,
-    env: mergedEnv({
+    env: stdioTransportEnv(mergedEnv({
       CLEMENTINE_HOME: BASE_DIR,
-    }),
+    }), {}, process.platform),
     cwd: PKG_DIR,
   });
 }
@@ -193,17 +215,26 @@ function expandedHeaders(server: ManagedMcpServer, sources?: McpServerEnvSources
   return expanded;
 }
 
-function createExternalServer(server: ManagedMcpServer): MCPServer | null {
+function createExternalServer(server: ManagedMcpServer, launch: {
+  sources?: McpServerEnvSources; merge?: typeof mergedEnv; platform?: NodeJS.Platform;
+} = {}): MCPServer | null {
   if (!server.enabled) return null;
 
   if (server.type === 'stdio' && server.command) {
-    const env = stdioLaunchEnv(server);
+    const platform = launch.platform ?? process.platform;
+    const env = stdioLaunchEnv(server, launch.sources, launch.merge, platform);
+    const declaredKeys = Array.isArray(server.env)
+      ? server.env.filter((key): key is string => typeof key === 'string') : Object.keys(server.env ?? {});
+    // Read the effective child values rather than applying inline declarations
+    // twice. This also keeps Path/PATH argv references coherent after Windows
+    // canonicalization while leaving undeclared references literal.
+    const argumentServer = { ...server, env: Object.fromEntries(declaredKeys.map(key => [key, ''])) };
     const transport = new MCPServerStdio({
       name: server.name,
       command: server.command,
       // Reuse the launch's resolved values so argv and env cannot observe two
       // different credential-file snapshots during one child construction.
-      args: stdioLaunchArgs(server, { daemon: env, inherited: {} }),
+      args: stdioLaunchArgs(argumentServer, { daemon: {}, inherited: env }, platform),
       clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
       timeout: MCP_REQUEST_TIMEOUT_MS,
       env,
@@ -1195,6 +1226,7 @@ export const mcpServersTestHooks = {
    * child, network or credential/config read is needed by these controls. */
   stdioLaunchEnv,
   stdioLaunchArgs,
+  createExternalServer,
   expandedHeaders,
   scopedView(
     base: MCPServer,

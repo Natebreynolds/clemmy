@@ -9,6 +9,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import type { ManagedMcpServer } from '../types.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-mcp-servers-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -121,6 +124,71 @@ test('an existing explicit working directory reaches the SDK connection once wit
   transport.underlying.connect = async () => { childConnections++; };
   await transport.connect();
   assert.equal(childConnections, 1);
+});
+
+test('Windows final MCP environment keeps one uppercase PATH after overrides without mutating inputs', () => {
+  const server = { name: 'controlled-path', type: 'stdio', command: 'controlled-mcp', enabled: true, source: 'user' } as ManagedMcpServer;
+  const inherited = { Path: 'C:\\Inherited' };
+  const merged = { Path: 'C:\\Augmented;C:\\Inherited', KEEP: 'synthetic-other' };
+  const windows = mcpServersTestHooks.stdioLaunchEnv(server, { daemon: {}, inherited }, () => merged, 'win32');
+  assert.deepEqual(windows, { PATH: 'C:\\Augmented;C:\\Inherited', KEEP: 'synthetic-other' });
+  assert.deepEqual(merged, { Path: 'C:\\Augmented;C:\\Inherited', KEEP: 'synthetic-other' });
+  assert.deepEqual(inherited, { Path: 'C:\\Inherited' });
+  assert.deepEqual(mcpServersTestHooks.stdioLaunchEnv(server, { daemon: {}, inherited }, () => merged, 'linux'), merged);
+
+  for (const spelling of ['PATH', 'Path', 'pAtH']) {
+    const configured = { ...server, env: { [spelling]: 'C:\\Configured' } };
+    const output = mcpServersTestHooks.stdioLaunchEnv(configured, { daemon: {}, inherited }, extra => ({ ...merged, ...extra }), 'win32');
+    assert.equal(output.PATH, 'C:\\Configured', `the explicitly declared ${spelling} overrides the merged PATH`);
+    assert.deepEqual(Object.keys(output).filter(key => key.toUpperCase() === 'PATH'), ['PATH']);
+    assert.deepEqual(configured.env, { [spelling]: 'C:\\Configured' });
+  }
+  const conflicting = { ...server, env: { Path: 'C:\\LowerCaseOverride', PATH: 'C:\\UpperCaseOverride' } };
+  const conflictResult = mcpServersTestHooks.stdioLaunchEnv(conflicting, { daemon: {}, inherited }, extra => ({ ...merged, ...extra }), 'win32');
+  assert.equal(conflictResult.PATH, 'C:\\UpperCaseOverride', 'an exact uppercase declaration resolves an otherwise ambiguous config');
+  const blank = mcpServersTestHooks.stdioLaunchEnv({ ...server, env: { Path: '' } },
+    { daemon: { Path: '' }, inherited: {} }, extra => ({ ...merged, ...extra }), 'win32');
+  assert.equal(blank.PATH, '', 'an explicit empty override does not fall back to an inherited PATH');
+});
+
+test('actual SDK stdio spawn receives canonical Windows PATH and coherent case-varied argv without a child', async t => {
+  const captured: Array<{ command: unknown; args: unknown; options: Record<string, unknown> }> = [];
+  const stopped = new Error('controlled transport spawn capture: no child started');
+  t.mock.method(childProcess, 'spawn', (...args: unknown[]) => {
+    captured.push({ command: args[0], args: args[1], options: args[2] as Record<string, unknown> });
+    throw stopped;
+  });
+  syncBuiltinESMExports();
+  try {
+    const cases: Array<{ env?: ManagedMcpServer['env']; args: string[]; path: string; expanded: string[] }> = [
+      { args: ['${Path}', '${UNDECLARED_KEY}'], path: 'C:\\Augmented;C:\\Inherited', expanded: ['${Path}', '${UNDECLARED_KEY}'] },
+      { env: { Path: '' }, args: ['${Path}'], path: 'C:\\DaemonOverride', expanded: ['C:\\DaemonOverride'] },
+      { env: { Path: 'C:\\InlineOverride' }, args: ['${Path}'], path: 'C:\\InlineOverride', expanded: ['C:\\InlineOverride'] },
+      { env: { Path: 'C:\\LowerCaseOverride', PATH: 'C:\\UpperCaseOverride' }, args: ['${Path}', '${PATH}'],
+        path: 'C:\\UpperCaseOverride', expanded: ['C:\\UpperCaseOverride', 'C:\\UpperCaseOverride'] },
+    ];
+    let merges = 0;
+    for (const fixture of cases) {
+      const configured: ManagedMcpServer = { name: 'controlled-sdk-path', type: 'stdio', command: 'controlled-mcp',
+        args: fixture.args, enabled: true, source: 'user', env: fixture.env };
+      const transport = mcpServersTestHooks.createExternalServer(configured, {
+        sources: { daemon: { Path: 'C:\\DaemonOverride' }, inherited: {} },
+        merge: extra => { merges++; return { Path: 'C:\\Augmented;C:\\Inherited', ...extra }; }, platform: 'win32',
+      });
+      assert.ok(transport);
+      await assert.rejects(transport.connect(), error => error === stopped);
+      const call = captured.at(-1)!;
+      assert.equal(call.command, 'controlled-mcp');
+      assert.deepEqual(call.args, fixture.expanded);
+      const env = call.options.env as Record<string, string>;
+      assert.deepEqual(Object.keys(env).filter(key => key.toUpperCase() === 'PATH'), ['PATH']);
+      assert.equal(env.PATH, fixture.path, 'the SDK default PATH cannot shadow the configured value');
+      assert.equal(call.options.shell, false);
+      assert.equal(call.options.cwd, TMP_HOME);
+    }
+    assert.equal(captured.length, cases.length, 'every attempt stops at the mocked spawn boundary');
+    assert.equal(merges, cases.length, 'each construction takes one environment snapshot');
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
 });
 
 for (const ambient of [null, { reason: 'owner withheld external access', authority: 'none' as const }]) {

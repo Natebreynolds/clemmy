@@ -19,7 +19,7 @@ import { textResult } from './shared.js';
 import type { ManagedMcpServer } from '../types.js';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
-import { declareMcpServerEnvKeys, readMcpServerEnv, resolveMcpServerEnv, type McpServerEnvSources } from '../runtime/mcp-server-env.js';
+import { createMcpServerEnvReader, declareMcpServerEnvKeys, readMcpServerEnv, resolveMcpServerEnv, type McpServerEnvSources, type McpServerEnvStatus } from '../runtime/mcp-server-env.js';
 import { prepareMcpServerCreateRequest, validateMcpWorkingDirectory } from '../runtime/mcp-server-request.js';
 import { prepareAgentMcpHeaderTemplates } from '../runtime/mcp-server-setup.js';
 
@@ -28,13 +28,29 @@ import { prepareAgentMcpHeaderTemplates } from '../runtime/mcp-server-setup.js';
  * both config shapes: an ARRAY of pass-through key names (value lives in the
  * daemon env), or an OBJECT key→value (value inline). A key is "unset" when it
  * has no inline value AND no value in the daemon env. NEVER returns values —
- * only names + a boolean. Exported so mcp_status reuses the exact same logic.
+ * only names. Editable keys have no nonempty inline override, independently of
+ * whether the daemon already has a value. Exported so mcp_status reuses the
+ * exact same logic.
  */
 export function serverEnvStatus(server: Pick<ManagedMcpServer, 'env'>,
-  sources?: McpServerEnvSources): { declaredEnvKeys: string[]; unsetEnvKeys: string[] } {
-  const { declaredEnvKeys, unsetEnvKeys } = sources ? resolveMcpServerEnv(server.env, sources)
+  sources?: McpServerEnvSources): McpServerEnvStatus {
+  const { declaredEnvKeys, unsetEnvKeys, editableEnvKeys } = sources ? resolveMcpServerEnv(server.env, sources)
     : readMcpServerEnv(server.env, path.join(BASE_DIR, '.env'));
-  return { declaredEnvKeys, unsetEnvKeys };
+  return { declaredEnvKeys, unsetEnvKeys, editableEnvKeys };
+}
+
+/** Instantiate once inside an authorized metadata request, then share across
+ * all rows. Values remain private and the next request gets a fresh snapshot. */
+export function createMcpServerEnvStatusReader(options: {
+  daemonEnvFile?: string;
+  inherited?: McpServerEnvSources['inherited'];
+  readText?: (file: string) => string | undefined;
+} = {}): (server: Pick<ManagedMcpServer, 'env'>) => McpServerEnvStatus {
+  const read = createMcpServerEnvReader(options.daemonEnvFile ?? path.join(BASE_DIR, '.env'), options.inherited, options.readText);
+  return server => {
+    const { declaredEnvKeys, unsetEnvKeys, editableEnvKeys } = read(server.env);
+    return { declaredEnvKeys, unsetEnvKeys, editableEnvKeys };
+  };
 }
 
 const NAME_RE = /^[a-zA-Z0-9_.-]{2,40}$/;

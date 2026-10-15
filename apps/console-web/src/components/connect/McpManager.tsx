@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Server, Plus, Trash2, Loader2, ChevronDown, Wrench, MessageCircle, RefreshCw } from 'lucide-react';
@@ -180,76 +180,138 @@ function McpSetupForm({ servers, unavailable, onAdded, onCancel }: {
 
 function McpServerCard({ server, refresh }: { server: McpServer; refresh: () => Promise<unknown> }) {
   const label = String(server.name || server.slug || '');
-  const unset = server.unsetEnvKeys ?? [];
-  const [values, setValues] = useState<Record<string, string>>({});
+  const names = (value: unknown): string[] => Array.isArray(value)
+    ? [...new Set(value.filter((key): key is string => typeof key === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)))] : [];
+  const ownerRef = useRef({ label, active: true });
+  if (ownerRef.current.label !== label) ownerRef.current = { label, active: true };
+  const owner = ownerRef.current;
+  const operation = useRef<object | null>(null);
+  const [draft, setDraft] = useState({ owner, values: {} as Record<string, string>, editing: false });
+  const values = draft.owner === owner ? draft.values : {};
+  const valueFor = (key: string) => Object.hasOwn(values, key) && typeof values[key] === 'string' ? values[key] : '';
+  const editingAccess = draft.owner === owner && draft.editing;
+  const accessId = useId();
+  const [checkedUnset, setCheckedUnset] = useState<string[] | undefined>();
+  const unset = checkedUnset ?? names(server.unsetEnvKeys);
+  // Missing fields retain old-daemon compatibility. Existing values are only
+  // replaceable when the daemon explicitly certifies their declaration type.
+  const replaceable = names(server.editableEnvKeys).filter(key => !unset.includes(key));
   const [savingKey, setSavingKey] = useState('');
   const [changing, setChanging] = useState(false);
   const [checking, setChecking] = useState(false);
-  const checkingRef = useRef(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [connectionError, setConnectionError] = useState('');
   const [toolsOpen, setToolsOpen] = useState(false);
   const [inventory, setInventory] = useState<Inventory | null>(null);
   const [checkedState, setCheckedState] = useState<string | undefined>();
   const [removeConfirm, setRemoveConfirm] = useState(false);
-  useEffect(() => { setInventory(null); setCheckedState(undefined); setConnectionError(''); setToolsOpen(false); }, [server.enabled, unset.join('\0')]);
+  useEffect(() => {
+    owner.active = true; operation.current = null;
+    setDraft({ owner, values: {}, editing: false }); setSavingKey(''); setChanging(false); setChecking(false);
+    setError(''); setNotice(''); setInventory(null); setCheckedState(undefined); setCheckedUnset(undefined);
+    setConnectionError(''); setToolsOpen(false); setRemoveConfirm(false);
+    return () => { owner.active = false; };
+  }, [owner]);
+  useEffect(() => { setInventory(null); setCheckedState(undefined); setCheckedUnset(undefined); setConnectionError(''); setToolsOpen(false); }, [server.enabled, names(server.unsetEnvKeys).join('\0')]);
   useEffect(() => {
     setCheckedState(undefined); setConnectionError('');
     if (server.state !== 'connected') setInventory(null);
   }, [server.state, server.failureCount]);
-  const presentation = mcpConnectionPresentation({ ...server, state: checking ? 'connecting' : checkedState ?? server.state });
+  const enabled = checkedState === 'disabled' ? false : server.enabled;
+  const state = checking ? 'connecting' : checkedState ?? server.state;
+  const presentation = enabled === false ? mcpConnectionPresentation({ enabled: false })
+    : state === 'needs_credentials' ? { label: 'Needs setup', tone: 'warning' as const }
+      : mcpConnectionPresentation({ ...server, state, unsetEnvKeys: unset });
   const failed = presentation.tone === 'danger';
   const toolCount = inventory?.toolCount ?? server.toolCount;
   const locked = changing || checking || !!savingKey;
+  const begin = () => {
+    if (operation.current || !owner.active || ownerRef.current !== owner) return null;
+    const token = {}; operation.current = token; return token;
+  };
+  const current = (token: object) => owner.active && ownerRef.current === owner && operation.current === token;
+  const finish = (token: object) => {
+    if (current(token)) { setSavingKey(''); setChecking(false); setChanging(false); }
+    if (operation.current === token) operation.current = null;
+  };
+  const applyReadiness = (result: { state?: string; unsetEnvKeys?: string[] }) => {
+    const next = result.state && ['disabled', 'needs_credentials', 'connecting', 'connected', 'unavailable', 'degraded'].includes(result.state) ? result.state : 'unknown';
+    setCheckedState(next);
+    setCheckedUnset(result.unsetEnvKeys ? names(result.unsetEnvKeys) : next === 'connected' ? [] : undefined);
+    setConnectionError(next === 'unavailable' || next === 'degraded' ? mcpConnectionHelp() : '');
+    return next;
+  };
+  const readConnection = async (token: object, retry: boolean) => {
+    setChecking(true); setToolsOpen(true); setConnectionError(''); setInventory(null); setCheckedState('connecting');
+    if (retry) await reconnectMcpServer(label);
+    if (!current(token)) return;
+    const result = await getMcpServerTools(label);
+    if (!current(token)) return;
+    setInventory(result); applyReadiness(result);
+    await refresh();
+  };
 
   const check = async (retry = failed, afterCredential = false) => {
-    if (checkingRef.current || (unset.length > 0 && !afterCredential)) return;
-    checkingRef.current = true; setChecking(true); setToolsOpen(true); setConnectionError(''); setInventory(null); setCheckedState('connecting');
+    if (unset.length > 0 && !afterCredential) return;
+    const token = begin(); if (!token) return;
     try {
-      if (retry) await reconnectMcpServer(label);
-      const result = await getMcpServerTools(label);
-      setInventory(result);
-      setCheckedState(result.state ?? 'unknown');
-      if (result.state === 'unavailable' || result.state === 'degraded') setConnectionError(mcpConnectionHelp(result.lastError));
-      await refresh();
+      await readConnection(token, retry);
     } catch (e) {
+      if (!current(token)) return;
       setCheckedState('unavailable');
       setConnectionError(mcpConnectionHelp((e as Error).message));
-    } finally { checkingRef.current = false; setChecking(false); }
+    } finally { finish(token); }
   };
   const saveCred = async (key: string) => {
-    const value = values[key] ?? '';
-    if (!value.trim() || locked) return;
-    setError(''); setSavingKey(key);
+    const value = valueFor(key);
+    if (!value.trim() || (!unset.includes(key) && !replaceable.includes(key))) return;
+    const token = begin(); if (!token) return;
+    setError(''); setNotice(''); setConnectionError(''); setSavingKey(key); setInventory(null); setCheckedState('unknown');
     try {
       const result = await setMcpCredential(label, key, value);
-      setValues(v => ({ ...v, [key]: '' }));
-      await refresh();
-      if (result.state === 'unavailable') { setCheckedState('unavailable'); setConnectionError(mcpConnectionHelp()); }
+      if (!current(token)) return;
+      if (result.ok !== true) throw new Error('Credential save was not confirmed.');
+      setDraft(d => d.owner === owner ? { ...d, values: { ...d.values, [key]: '' } } : d);
+      const next = applyReadiness(result);
+      setNotice(next === 'connected' ? 'Value saved. The server answered its tool-discovery check.'
+        : next === 'needs_credentials' ? 'Value saved. Enter the remaining access details, then check the connection.'
+          : next === 'disabled' ? 'Value saved. This connection is turned off; enable it when you are ready.'
+            : next === 'unavailable' ? 'Value saved. The connection still needs attention; check its access details, then retry.'
+              : 'Value saved. Check connection to confirm the server is ready.');
+      try { await refresh(); } catch { if (current(token)) setError('The value was saved, but the connection list could not refresh. Reload the list before saving again.'); }
+      if (!current(token)) return;
       // Older daemons return no readiness; retain a single exact-server check
       // for that compatibility path, not a second handshake on current builds.
-      if (!result.state && unset.length === 1) await check(false, true);
-    } catch { setError('The key could not be saved or the connection checked. Check the server status before retrying.'); }
-    finally { setSavingKey(''); }
+      if (!result.state && unset.length === 1 && unset[0] === key) await readConnection(token, false);
+    } catch { if (current(token)) setError('The key save or connection check could not be confirmed. Check the connection status before saving again.'); }
+    finally { finish(token); }
   };
   const toggleEnabled = async () => {
-    if (locked) return;
+    const token = begin(); if (!token) return;
     setChanging(true); setError('');
-    try { await setMcpServerEnabled(label, server.enabled === false); setInventory(null); await refresh(); }
-    catch { setError('Clem could not change this connection. Try again.'); }
-    finally { setChanging(false); }
+    try { await setMcpServerEnabled(label, enabled === false); if (current(token)) { setInventory(null); await refresh(); } }
+    catch { if (current(token)) setError('Clem could not change this connection. Check its status before retrying.'); }
+    finally { finish(token); }
   };
   const remove = async () => {
-    if (locked) return;
+    const token = begin(); if (!token) return;
     setChanging(true); setError('');
-    try { await deleteMcpServer(label); await refresh(); }
-    catch { setError('Clem could not remove this server. Check the connection list before retrying.'); }
-    finally { setChanging(false); }
+    try { await deleteMcpServer(label); if (current(token)) await refresh(); }
+    catch { if (current(token)) setError('Clem could not remove this server. Check the connection list before retrying.'); }
+    finally { finish(token); }
   };
   const showTools = () => {
+    if (operation.current || ownerRef.current !== owner || !owner.active) return;
     if (presentation.label === 'Connected' && inventory?.state === 'connected') setToolsOpen(v => !v);
     else void check();
   };
+  const fields = (keys: string[], replacing = false) => <div className="space-y-2">{keys.map(key => <div key={key} className="flex flex-wrap gap-2">
+    <Input type="password" autoComplete="new-password" value={valueFor(key)} onChange={e => {
+      if (ownerRef.current === owner && owner.active && !operation.current) setDraft(d => ({ owner, editing: d.owner === owner && d.editing, values: { ...(d.owner === owner ? d.values : {}), [key]: e.target.value } }));
+    }} placeholder={key} aria-label={`${key} for ${label}`} className="min-w-0 flex-1 basis-40" disabled={locked} />
+    <Button size="sm" variant="secondary" disabled={locked || !valueFor(key).trim()} onClick={() => { void saveCred(key); }}>{savingKey === key ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : replacing ? 'Save & check' : keys.length === 1 ? 'Save & connect' : 'Save'}</Button>
+  </div>)}</div>;
 
   return (
     <Card className="flex min-w-0 flex-col gap-3 p-4">
@@ -266,30 +328,39 @@ function McpServerCard({ server, refresh }: { server: McpServer; refresh: () => 
         <p className="mb-2 text-small text-fg">Remove this connection from Clem? This does not uninstall the server.</p>
         <div className="flex flex-wrap gap-2"><Button variant="danger" size="sm" disabled={locked} onClick={() => { void remove(); }}>Remove server</Button><Button variant="ghost" size="sm" disabled={locked} onClick={() => setRemoveConfirm(false)}>Keep server</Button></div>
       </div>}
-      {unset.length > 0 && server.enabled !== false && <div className="border-t border-border pt-3">
+      {unset.length > 0 && enabled !== false && <div className="border-t border-border pt-3">
         <p className="mb-2 text-small text-fg">Clem needs these values to finish connecting. Enter them here, not in chat.</p>
-        <div className="space-y-2">{unset.map(key => <div key={key} className="flex flex-wrap gap-2">
-          <Input type="password" autoComplete="new-password" value={values[key] ?? ''} onChange={e => setValues(v => ({ ...v, [key]: e.target.value }))} placeholder={key} aria-label={`${key} for ${label}`} className="min-w-0 flex-1 basis-40" disabled={locked} />
-          <Button size="sm" variant="secondary" disabled={locked || !(values[key] ?? '').trim()} onClick={() => { void saveCred(key); }}>{savingKey === key ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : unset.length === 1 ? 'Save & connect' : 'Save'}</Button>
-        </div>)}</div>
+        {fields(unset)}
         <p className="mt-2 text-caption text-muted">Saved on this computer. Values are not shown in the tool list.</p>
       </div>}
+      {replaceable.length > 0 && enabled !== false && <div className="border-t border-border pt-3">
+        {!editingAccess ? <Button variant="ghost" size="sm" disabled={locked} aria-expanded={false} aria-controls={accessId} onClick={() => {
+          if (!operation.current && ownerRef.current === owner && owner.active) setDraft({ owner, values: {}, editing: true });
+        }}>Update access details</Button> : <div id={accessId}>
+          <p className="mb-2 text-small text-fg">Enter a replacement here, not in chat. Stored values are never shown. Connections using the same key name will use its replacement.</p>
+          {fields(replaceable, true)}
+          <Button variant="ghost" size="sm" className="mt-2" disabled={locked} onClick={() => {
+            if (!operation.current && ownerRef.current === owner && owner.active) setDraft({ owner, values: {}, editing: false });
+          }}>Cancel</Button>
+        </div>}
+      </div>}
+      {notice && <p role="status" className="text-small text-muted">{notice}</p>}
       {error && <p role="alert" className="text-small text-danger">{error}</p>}
       {connectionError && <p role="alert" className="text-small text-danger">{connectionError}</p>}
       {!checking && !connectionError && failed && <p className="text-small text-danger">{mcpConnectionHelp(server.lastError)}</p>}
       <div className="mt-auto flex flex-wrap items-center justify-between gap-2">
         <span className="text-caption text-muted">{typeof toolCount === 'number' ? `${presentation.label !== 'Connected' ? 'Last seen: ' : ''}${toolCount.toLocaleString()} ${toolCount === 1 ? 'tool' : 'tools'}` : 'Tools not checked yet'}</span>
-        {server.enabled !== false && <Button variant="ghost" size="sm" onClick={showTools} disabled={locked || unset.length > 0} aria-expanded={toolsOpen}>
+        {enabled !== false && <Button variant="ghost" size="sm" onClick={showTools} disabled={locked || unset.length > 0} aria-expanded={toolsOpen}>
           {checking ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : failed ? <RefreshCw className="h-3.5 w-3.5" aria-hidden /> : <Wrench className="h-3.5 w-3.5" aria-hidden />}
           {checking ? 'Checking…' : failed || connectionError ? 'Retry connection' : inventory?.state === 'connected' ? toolsOpen ? 'Hide tools' : 'View tools' : presentation.label === 'Connected' ? 'View tools' : 'Check connection'}
         </Button>}
-        {!server.builtin && <Button variant="ghost" size="sm" disabled={locked} onClick={() => { void toggleEnabled(); }}>{server.enabled === false ? 'Enable' : 'Turn off'}</Button>}
+        {!server.builtin && <Button variant="ghost" size="sm" disabled={locked} onClick={() => { void toggleEnabled(); }}>{enabled === false ? 'Enable' : 'Turn off'}</Button>}
       </div>
       {toolsOpen && <div className="border-t border-border pt-3">
         {checking ? <p role="status" className="text-small text-muted">Starting the server and discovering its tools…</p>
           : inventory?.state === 'connected' ? inventory.tools.length ? <ul className="max-h-64 space-y-2 overflow-y-auto pr-1">{inventory.tools.map(tool => <li key={tool.name}><p className="break-all text-small font-medium text-fg">{tool.name}</p>{tool.description && <p className="line-clamp-2 text-caption text-muted">{tool.description}</p>}</li>)}</ul>
           : <p className="text-small text-muted">The server connected, but did not offer any tools.</p>
-          : !connectionError && <p className="text-small text-muted">The server is still starting. Check again in a moment.</p>}
+          : !connectionError && <p className="text-small text-muted">{state === 'connecting' ? 'The server is still starting. Check again in a moment.' : 'Connection readiness is not confirmed. Check the connection again.'}</p>}
       </div>}
     </Card>
   );

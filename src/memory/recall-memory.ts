@@ -15,7 +15,7 @@ import {
   searchFactsByTextAt,
   type ConsolidatedFact,
 } from './facts.js';
-import { recallHybrid, resolveRecallTimeZone, resolveTemporalMeetingDate } from './recall.js';
+import { recall, recallHybrid, resolveRecallTimeZone, resolveTemporalMeetingDate } from './recall.js';
 import {
   getFactIdsForEntity,
   getFactIdsForResource,
@@ -63,6 +63,8 @@ export interface MemoryRecallResult {
 }
 
 export interface MemoryRecallContext {
+  /** Absolute foreground embedding deadline; no shared request is cancelled for another caller. */
+  deadlineAtMs?: number;
   /** Whole-task contextual priors versus a targeted evidence question.
    * Omitted preserves the existing targeted retrieval contract. */
   purpose?: 'ambient' | 'targeted';
@@ -750,20 +752,26 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   // PER-LEG TIMEOUTS (COMPOUNDING wave): a hanging embedding provider or a
   // slow vault pass must degrade to the legs that answered — measured live,
   // ~8% of primers lost EVERYTHING to the single outer timeout. 900ms per
-  // async leg keeps the whole recall under the primer deadline.
-  const legTimeout = <T>(promise: Promise<T>, empty: T): Promise<T> => {
+  // async leg leaves room inside the primer deadline. Synchronous database
+  // work and a native item already running are not timer-preemptible.
+  const embeddingDeadline = Math.min(context.deadlineAtMs ?? Infinity, Date.now() + 900);
+  const legTimeout = <T>(promise: Promise<T>, empty: T, fallback?: () => T): Promise<T> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const recover = () => { try { return fallback?.() ?? empty; } catch { return empty; } };
     return Promise.race([
-      promise.catch(() => empty),
-      new Promise<T>((resolve) => { timer = setTimeout(() => resolve(empty), 900); }),
+      promise.catch(recover),
+      new Promise<T>((resolve) => { timer = setTimeout(() => resolve(recover()), Math.max(0, embeddingDeadline - Date.now())); }),
     ]).finally(() => { if (timer) clearTimeout(timer); });
   };
   const [semanticFacts, notes] = await Promise.all([
     searchFactsAsGraphBridge
-      ? legTimeout(findSimilarFactsScored(objective, { topK: perStore, asOf: historicalAsOf }), [])
+      ? legTimeout(findSimilarFactsScored(objective, { topK: perStore, asOf: historicalAsOf, deadlineAtMs: embeddingDeadline }), [])
       : Promise.resolve([]),
     wanted.has('note')
-      ? legTimeout(recallHybrid(objective, { limit: perStore, nowMs, timeZone, purpose: context.purpose }), [])
+      ? legTimeout(recallHybrid(objective, { limit: perStore, nowMs, timeZone, purpose: context.purpose, deadlineAtMs: embeddingDeadline }), [],
+          // The leg timer may win before the inner provider deadline resumes.
+          // Keep available local evidence; do not replace it with an empty leg.
+          () => recall(objective, { limit: perStore, nowMs, timeZone, purpose: context.purpose }))
       : Promise.resolve([]),
   ]);
 

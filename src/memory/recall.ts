@@ -5,9 +5,10 @@ import { openMemoryDb } from './db.js';
 import {
   bufferToVector,
   cosine,
-  embedQuery,
+  embedQueryWithSpace,
+  isUsableEmbeddingVector,
+  type EmbeddedQuery,
   isEmbeddingsEnabled,
-  loadEmbeddingsForChunks,
 } from './embeddings.js';
 import type { MemorySearchHit } from '../types.js';
 import { loadUserProfile } from '../runtime/user-profile.js';
@@ -17,8 +18,8 @@ import { loadUserProfile } from '../runtime/user-profile.js';
  *
  * Two entry points:
  *   - recall()        — sync, FTS5 + BM25 only. Snappy, no network.
- *   - recallHybrid()  — async, FTS narrows the candidate pool, then
- *                       cosine similarity against query embedding reranks
+ *   - recallHybrid()  — async, bounded lexical and independent dense candidates
+ *                       share a producing vector space and combine
  *                       via reciprocal rank fusion. Falls back to FTS
  *                       cleanly when embeddings are disabled or fail.
  *
@@ -189,6 +190,8 @@ export interface RecallOptions {
   purpose?: 'ambient' | 'targeted';
   /** Maximum hits to return. */
   limit?: number;
+  /** Foreground caller budget; expired queued embedding work is dispensable. */
+  deadlineAtMs?: number;
   /** Optional path prefix filter (e.g. only /vault/02-People). */
   pathPrefix?: string;
   /**
@@ -485,55 +488,55 @@ function rowsToHits(rows: RecallChunkRow[]): MemorySearchHit[] {
   });
 }
 
-async function semanticFallback(query: string, options: RecallOptions, limit: number): Promise<MemorySearchHit[]> {
-  if (!isEmbeddingsEnabled()) return [];
+/** One bounded independent dense arm. The query's actual producer determines
+ * which rows may participate, even when a request was rescued by a fallback. */
+function semanticCandidates(binding: EmbeddedQuery, options: RecallOptions, lexical: RecallChunkRow[]): Array<{ row: RecallChunkRow; sim: number }> {
+  const expired = () => options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs;
+  if (expired()) return [];
   const db = openMemoryDb();
-  let sql = `
-    SELECT
-      vc.id      AS id,
-      vc.path    AS path,
-      vc.title   AS title,
-      vc.content AS content,
-      vc.mtime   AS mtime,
-      e.vector   AS vector
-    FROM embeddings e
-    JOIN vault_chunks vc ON vc.id = e.chunk_id
-  `;
-  const params: unknown[] = [];
-  if (options.pathPrefix) {
-    sql += ' WHERE vc.path LIKE ?';
-    params.push(`${options.pathPrefix}%`);
-  }
-  sql += ' ORDER BY vc.id DESC LIMIT ?';
-  params.push(SEMANTIC_FALLBACK_MAX_SCAN);
-
-  let rows: SemanticChunkRow[] = [];
+  const select = `SELECT vc.id, vc.path, vc.title, vc.content, vc.mtime, e.vector
+    FROM embeddings e JOIN vault_chunks vc ON vc.id = e.chunk_id
+    WHERE e.model = ? AND e.dim = ? AND length(e.vector) = ?`;
+  const params: unknown[] = [binding.model, binding.dim, binding.dim * Float32Array.BYTES_PER_ELEMENT];
+  const scope = options.pathPrefix ? ' AND vc.path LIKE ?' : '';
+  if (options.pathPrefix) params.push(`${options.pathPrefix}%`);
   try {
-    rows = db.prepare(sql).all(...params) as SemanticChunkRow[];
+    const snapshots = new Map(lexical.map(row => [row.id, row]));
+    // Fetch the small lexical pool by primary key separately. An ORDER BY CASE
+    // over the whole index would sort all vectors before applying the limit.
+    const selected = lexical.length ? db.prepare(`${select}${scope} AND e.chunk_id IN (${lexical.map(() => '?').join(',')})`)
+      .all(...params, ...lexical.map(row => row.id)) as SemanticChunkRow[] : [];
+    // Bound the index walk itself to the newest stored rows (any space), then
+    // admit only matching space/scope rows. This is a window, not a full ANN
+    // index: older semantic-only notes outside it remain a known limit.
+    const sql = `${select}${scope} AND e.chunk_id IN (
+      SELECT chunk_id FROM embeddings ORDER BY chunk_id DESC LIMIT ?)`;
+    const rows = db.prepare(sql).iterate(...params, SEMANTIC_FALLBACK_MAX_SCAN) as IterableIterator<SemanticChunkRow>;
+    const seen = new Set<number>();
+    const scored: Array<{ row: RecallChunkRow; sim: number }> = [];
+    for (const row of (function* () { yield* selected; yield* rows; })()) {
+      if (expired()) return [];
+      if (seen.has(row.id)) continue;
+      seen.add(row.id);
+      const before = snapshots.get(row.id);
+      // Never score old selected bytes using a vector from a newer index row.
+      if (before && (before.content !== row.content || before.mtime !== row.mtime)) continue;
+      const vector = bufferToVector(row.vector);
+      if (!isUsableEmbeddingVector(vector, binding.dim)) continue;
+      const sim = cosine(binding.vector, vector);
+      if (Number.isFinite(sim) && sim > 0) scored.push({ row: before ?? { ...row, rank: 0, snip: row.content }, sim });
+    }
+    return scored.sort((a, b) => b.sim - a.sim).slice(0, RERANK_CANDIDATE_POOL);
   } catch (err) {
-    logger.warn({ err, query }, 'semantic fallback query failed');
-    return [];
+    logger.warn({ err }, 'semantic candidate query failed'); return [];
   }
-  if (rows.length === 0) return [];
+}
 
-  const queryVector = await embedQuery(query);
-  if (!queryVector) return [];
-
-  const scored = rows
-    .map((row) => ({
-      row,
-      score: cosine(queryVector, bufferToVector(row.vector)),
-    }))
-    .filter((entry) => Number.isFinite(entry.score))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
-
-  const noteChunks = new Map<string, IndexedNoteChunk[]>();
-  return scored.map((entry) => ({
-    filePath: entry.row.path,
-    ...selectedNoteEvidence(entry.row, noteChunks),
-    score: Number((Math.max(0, entry.score) * 10).toFixed(3)),
-  }));
+function hasStoredSemanticCandidates(options: RecallOptions): boolean {
+  try {
+    return Boolean(openMemoryDb().prepare(`SELECT 1 FROM embeddings e JOIN vault_chunks vc ON vc.id = e.chunk_id
+      ${options.pathPrefix ? 'WHERE vc.path LIKE ?' : ''} LIMIT 1`).get(...(options.pathPrefix ? [`${options.pathPrefix}%`] : [])));
+  } catch { return false; }
 }
 
 /**
@@ -549,8 +552,8 @@ export function recall(query: string, options: RecallOptions = {}): MemorySearch
 }
 
 /**
- * Hybrid recall: FTS narrows the candidate pool, optional embedding
- * rerank merges via Reciprocal Rank Fusion. Falls back to FTS-only
+ * Hybrid recall: independent dense and lexical candidates merge via
+ * Reciprocal Rank Fusion. Falls back to FTS-only
  * silently if embeddings are disabled, the query embedding fails, or
  * no candidates in the pool have stored embeddings.
  */
@@ -562,75 +565,31 @@ export async function recallHybrid(query: string, options: RecallOptions = {}): 
 
 async function recallHybridImpl(query: string, options: RecallOptions = {}): Promise<MemorySearchHit[]> {
   const limit = Math.max(1, options.limit ?? 6);
-  // An exact calendar-date meeting match is stronger than a semantic guess and
-  // needs no embedding call. Returning it immediately also keeps automatic
-  // primer assembly comfortably inside its first-token latency budget.
   const exactMeetings = temporalMeetingHits(query, options, limit);
   if (exactMeetings.length > 0) return exactMeetings;
-  const poolSize = Math.max(limit, RERANK_CANDIDATE_POOL);
-  const candidates = fetchFtsCandidates(query, options, poolSize);
-  if (candidates.length === 0) {
-    return mergeTemporalMeetingHits(query, options, await semanticFallback(query, options, limit), limit);
-  }
+  const candidates = fetchFtsCandidates(query, options, Math.max(limit, RERANK_CANDIDATE_POOL));
+  const lexicalOnly = () => mergeTemporalMeetingHits(query, options, rowsToHits(reRankByScope(candidates, options).slice(0, limit)), limit);
+  if (!isEmbeddingsEnabled() || !hasStoredSemanticCandidates(options)) return lexicalOnly();
+  const binding = await embedQueryWithSpace(query, { priority: 'foreground', deadlineAtMs: options.deadlineAtMs });
+  if (!binding) return lexicalOnly();
+  const dense = semanticCandidates(binding, options, candidates);
+  if (!dense.length) return lexicalOnly();
 
-  // FTS-only fast path when embeddings aren't available.
-  if (!isEmbeddingsEnabled()) {
-    return mergeTemporalMeetingHits(query, options, rowsToHits(reRankByScope(candidates, options).slice(0, limit)), limit);
-  }
-
-  const stored = loadEmbeddingsForChunks(candidates.map((c) => c.id));
-  if (stored.size === 0) {
-    // Pool has no embeddings yet — return FTS order. The backfill task
-    // will fill them in over time and the next call benefits.
-    return mergeTemporalMeetingHits(query, options, rowsToHits(reRankByScope(candidates, options).slice(0, limit)), limit);
-  }
-
-  const queryVector = await embedQuery(query);
-  if (!queryVector) {
-    return mergeTemporalMeetingHits(query, options, rowsToHits(reRankByScope(candidates, options).slice(0, limit)), limit);
-  }
-
-  // Rank by FTS (already ordered) and by semantic similarity. Then fuse
-  // with reciprocal rank fusion. Chunks missing an embedding still
-  // participate via their FTS rank alone — they just don't get a
-  // semantic boost.
-  const ftsRankByChunk = new Map<number, number>();
-  candidates.forEach((c, idx) => ftsRankByChunk.set(c.id, idx + 1));
-
-  const semanticScored: Array<{ id: number; sim: number }> = [];
-  for (const candidate of candidates) {
-    const vec = stored.get(candidate.id);
-    if (!vec) continue;
-    semanticScored.push({ id: candidate.id, sim: cosine(queryVector, vec) });
-  }
-  semanticScored.sort((a, b) => b.sim - a.sim);
-
-  const semanticRankByChunk = new Map<number, number>();
-  semanticScored.forEach((entry, idx) => semanticRankByChunk.set(entry.id, idx + 1));
-
+  const lexicalRanks = new Map(candidates.map((row, index) => [row.id, index + 1]));
+  const semanticRanks = new Map(dense.map((entry, index) => [entry.row.id, { rank: index + 1, sim: entry.sim }]));
+  const union = new Map(candidates.map(row => [row.id, row]));
+  for (const { row } of dense) if (!union.has(row.id)) union.set(row.id, row);
   const tokens = scopeTokens(options.objective);
-  const fused = candidates.map((candidate) => {
-    const ftsRank = ftsRankByChunk.get(candidate.id) ?? candidates.length + 1;
-    const semRank = semanticRankByChunk.get(candidate.id);
-    const ftsScore = 1 / (RRF_K + ftsRank);
-    const semScore = semRank !== undefined ? 1 / (RRF_K + semRank) : 0;
-    // Recency + objective scope. Both are identity no-ops when their options are
-    // unset (multiplier 1, overlap 0), so the default fused order is unchanged.
-    const base = ftsScore + semScore;
+  const fused = [...union.values()].map(candidate => {
+    const lexical = lexicalRanks.get(candidate.id), semantic = semanticRanks.get(candidate.id);
+    const base = (lexical ? 1 / (RRF_K + lexical) : 0) + (semantic ? 1 / (RRF_K + semantic.rank) : 0);
     const score = base * recencyMultiplier(candidate.mtime, options.recencyHalfLifeDays)
       + OBJECTIVE_BONUS_WEIGHT * objectiveOverlap(tokens, candidate);
-    return { candidate, score };
-  });
-
-  fused.sort((a, b) => b.score - a.score);
-  const top = fused.slice(0, limit).map((entry) => entry.candidate);
-  const hits = rowsToHits(top);
-
-  // Rescale scores using the fused order so callers see a sensible 0..10
-  // gradient consistent with the FTS-only path.
-  return mergeTemporalMeetingHits(query, options, hits.map((hit, idx) => ({
-    ...hit,
-    score: Number((10 - (idx * (10 / Math.max(1, hits.length)))).toFixed(3)),
+    return { candidate, score, sim: semantic?.sim ?? 0 };
+  }).sort((a, b) => b.score - a.score || b.sim - a.sim || a.candidate.id - b.candidate.id);
+  const hits = rowsToHits(fused.slice(0, limit).map(entry => entry.candidate));
+  return mergeTemporalMeetingHits(query, options, hits.map((hit, index) => ({
+    ...hit, score: Number((10 - index * (10 / Math.max(1, hits.length))).toFixed(3)),
   })), limit);
 }
 
