@@ -153,3 +153,18 @@ test('a call whose result is provenance-bound keeps its call and result whole, a
   const unretained = lifecycle.restoreProvenanceBoundResults('no-such-session', shortened, new Set(['call_bound']));
   assert.deepEqual([unretained.restored, unretained.missing], [0, 1], 'without a retained original nothing is guessed');
 });
+
+test('a chat the model gave nothing usable for is asked again a day later, not on every pass', async () => {
+  const sessionId = chat('unusable', 10);
+  let calls = 0;
+  conversationMemory._setConversationMemorySummarizerForTests(async (transcript) => {
+    if (transcript.includes('Find the unusable report')) calls += 1;
+    return null;
+  }, 'fixture-memory-model');
+  await conversationMemory.consolidateIdleConversations({ now: NOW });
+  await conversationMemory.consolidateIdleConversations({ now: NOW });
+  assert.equal(calls, 1, 'not asked again the same day');
+  assert.match(String(state(sessionId).memoryEpisodeId), /^none:unusable-summary:2026-10-15$/);
+  await conversationMemory.consolidateIdleConversations({ now: new Date(NOW.getTime() + 86_400_000) });
+  assert.equal(calls, 2, 'asked again the next day');
+});

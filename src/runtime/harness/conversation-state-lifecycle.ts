@@ -156,8 +156,10 @@ export function listConversationLifecycleCandidates(input: {
   kinds?: readonly string[];
   limit: number;
   newestFirst?: boolean;
-  /** Only conversations with no memory noted since their last turn. */
-  withoutMemory?: boolean;
+  /** Only conversations with no memory noted since their last turn; one the
+   * model gave nothing usable for is asked again once its noted day is
+   * before `retryUnusableBefore`. */
+  withoutMemory?: { retryUnusableBefore: string };
 }): ConversationLifecycleCandidate[] {
   const db = openEventLog();
   const kinds = input.kinds ?? [];
@@ -166,11 +168,13 @@ export function listConversationLifecycleCandidates(input: {
       FROM session_conversation_state c JOIN sessions s ON s.id = c.session_id
      WHERE c.fidelity IN (${input.fidelity.map(() => '?').join(', ')})
        AND s.updated_at < ?
-       ${input.withoutMemory ? 'AND c.memory_episode_id IS NULL' : ''}
+       ${input.withoutMemory ? `AND (c.memory_episode_id IS NULL
+         OR (c.memory_episode_id LIKE 'none:unusable-summary%' AND substr(c.memory_episode_id, 23) < ?))` : ''}
        ${kinds.length > 0 ? `AND s.kind IN (${kinds.map(() => '?').join(', ')})` : ''}
      ORDER BY s.updated_at ${input.newestFirst ? 'DESC' : 'ASC'}
      LIMIT ?
-  `).all(...input.fidelity, input.idleBefore, ...kinds, Math.max(1, Math.min(1_000, Math.floor(input.limit)))) as ConversationLifecycleCandidate[];
+  `).all(...input.fidelity, input.idleBefore, ...(input.withoutMemory ? [input.withoutMemory.retryUnusableBefore] : []),
+    ...kinds, Math.max(1, Math.min(1_000, Math.floor(input.limit)))) as ConversationLifecycleCandidate[];
 }
 
 /** Calls of this session whose results carry a provenance receipt. */
