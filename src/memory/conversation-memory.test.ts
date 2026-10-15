@@ -134,3 +134,22 @@ test('without a memory model the pass waits to remember and still compacts', asy
   assert.equal(result.waiting, true);
   assert.equal(state(idle).fidelity, 'compacted', 'a chat is never retired without its memory');
 });
+
+test('a call whose result is provenance-bound keeps its call and result whole, and a shortened one is restored byte for byte', () => {
+  const items = history('bound') as never[];
+  const kept = lifecycle.compactConversationItems(items, 9, (callId) => callId === 'call_bound');
+  assert.deepEqual(kept.items.filter((item) => (item as { callId?: string }).callId === 'call_bound'),
+    items.filter((item) => (item as { callId?: string }).callId === 'call_bound'), 'the bound pair is untouched');
+
+  const sessionId = eventlog.createSession({ kind: 'chat', title: 'restore' }).id;
+  const original = `found rh_boundabcdef ${BIG}`;
+  eventlog.writeToolOutput({ sessionId, callId: 'call_bound', tool: 'search_files', output: original });
+  const shortened = lifecycle.compactConversationItems(items, 9).items;
+  const restored = lifecycle.restoreProvenanceBoundResults(sessionId, shortened, new Set(['call_bound']));
+  assert.equal(restored.restored, 1);
+  const result = restored.items.find((item) => (item as { type?: string }).type === 'function_call_result') as { output: { type: string; text: string } };
+  assert.deepEqual(result.output, { type: 'text', text: original }, 'the exact original bytes, in the shape they had');
+  assert.equal(lifecycle.restoreProvenanceBoundResults(sessionId, shortened, new Set()).restored, 0, 'an unbound result stays compacted');
+  const unretained = lifecycle.restoreProvenanceBoundResults('no-such-session', shortened, new Set(['call_bound']));
+  assert.deepEqual([unretained.restored, unretained.missing], [0, 1], 'without a retained original nothing is guessed');
+});

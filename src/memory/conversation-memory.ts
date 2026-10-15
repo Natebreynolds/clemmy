@@ -22,8 +22,10 @@ import {
   compactConversationState,
   CONVERSATION_COMPACT_IDLE_DAYS,
   CONVERSATION_MEMORY_ONLY_IDLE_DAYS,
+  listCompactedSessionsNeedingRepair,
   listConversationLifecycleCandidates,
   noteConversationMemory,
+  repairCompactedProvenanceResults,
   retireConversationStateToMemory,
 } from '../runtime/harness/conversation-state-lifecycle.js';
 import { openMemoryDb } from './db.js';
@@ -152,6 +154,8 @@ export interface ConversationConsolidation {
   retired: number;
   held: number;
   faded: number;
+  /** Provenance-bound results restored from their retained outputs. */
+  repaired: number;
   waiting: boolean;
 }
 
@@ -216,7 +220,7 @@ export async function consolidateIdleConversations(input: {
 } = {}): Promise<ConversationConsolidation> {
   const now = input.now ?? new Date();
   const nowMs = now.getTime();
-  const result: ConversationConsolidation = { compacted: 0, remembered: 0, retired: 0, held: 0, faded: 0, waiting: false };
+  const result: ConversationConsolidation = { compacted: 0, remembered: 0, retired: 0, held: 0, faded: 0, repaired: 0, waiting: false };
   const weekAgo = new Date(nowMs - CONVERSATION_COMPACT_IDLE_DAYS * 86_400_000).toISOString();
   const monthAgo = new Date(nowMs - CONVERSATION_MEMORY_ONLY_IDLE_DAYS * 86_400_000).toISOString();
 
@@ -247,6 +251,9 @@ export async function consolidateIdleConversations(input: {
 
   // Compacting and retiring stored state is upkeep (`tidy`): no model.
   await runMemoryModelJob('tidy', { source: { kind: 'schedule' } }, async () => {
+    for (const sessionId of listCompactedSessionsNeedingRepair(200)) {
+      result.repaired += repairCompactedProvenanceResults(sessionId).restored;
+    }
     for (const candidate of listConversationLifecycleCandidates({ idleBefore: weekAgo, fidelity: ['full'], limit: input.compactLimit ?? 150 })) {
       const step = compactConversationState(candidate.sessionId, nowMs);
       if (step === 'changed') result.compacted += 1;

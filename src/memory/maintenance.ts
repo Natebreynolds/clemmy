@@ -782,7 +782,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     try {
       const { consolidateIdleConversations } = await import('./conversation-memory.js');
       const folded = await consolidateIdleConversations();
-      if (folded.compacted + folded.remembered + folded.retired + folded.faded > 0) logger.info({ folded }, 'conversation memory tick');
+      if (folded.compacted + folded.remembered + folded.retired + folded.faded + folded.repaired > 0) logger.info({ folded }, 'conversation memory tick');
     } catch (err) {
       logger.warn({ err }, 'conversation memory tick failed');
     }

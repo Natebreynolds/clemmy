@@ -13,6 +13,10 @@
  *   the owner's memory model) and its last few messages. A chat retires only
  *   once its memory exists; a workflow or execution step needs none.
  *
+ * A call whose result carries a provenance receipt (the model-visible bytes a
+ * later request is checked against) keeps its call and result whole: request
+ * provenance fails closed on any form of that result it cannot reverse.
+ *
  * Nothing is lowered while the conversation could still be picked up where it
  * stopped: a pending approval, an unfinished run, parked or recovery state, a
  * held publication, or a pin. A history the protocol inspector does not read
@@ -21,7 +25,7 @@
  */
 import type { AgentInputItem } from '@openai/agents';
 import { inspectConversationProtocol } from './conversation-protocol.js';
-import { getSessionConversationState, openEventLog } from './eventlog.js';
+import { getSessionConversationState, getToolOutput, openEventLog } from './eventlog.js';
 
 export const CONVERSATION_COMPACT_IDLE_DAYS = 7;
 export const CONVERSATION_MEMORY_ONLY_IDLE_DAYS = 30;
@@ -60,7 +64,11 @@ function isProtocolSynthetic(text: string): boolean {
  * The compacted form of a history: same messages, same call pairs, smaller
  * results. Pure; `changed` is false when nothing was larger than its keep.
  */
-export function compactConversationItems(items: readonly AgentInputItem[], idleDays = CONVERSATION_COMPACT_IDLE_DAYS): {
+export function compactConversationItems(
+  items: readonly AgentInputItem[],
+  idleDays = CONVERSATION_COMPACT_IDLE_DAYS,
+  keepWhole: (callId: string) => boolean = () => false,
+): {
   items: AgentInputItem[];
   changed: boolean;
 } {
@@ -69,6 +77,7 @@ export function compactConversationItems(items: readonly AgentInputItem[], idleD
   for (const item of items) {
     const value = record(item);
     if (!value) { out.push(item); continue; }
+    if (typeof value.callId === 'string' && keepWhole(value.callId)) { out.push(item); continue; }
     if (value.type === 'reasoning') { changed = true; continue; }
     if (value.type === 'function_call' && typeof value.arguments === 'string'
       && value.arguments.length > ARGUMENTS_KEEP_WHOLE_CHARS) {
@@ -164,6 +173,45 @@ export function listConversationLifecycleCandidates(input: {
   `).all(...input.fidelity, input.idleBefore, ...kinds, Math.max(1, Math.min(1_000, Math.floor(input.limit)))) as ConversationLifecycleCandidate[];
 }
 
+/** Calls of this session whose results carry a provenance receipt. */
+export function provenanceBoundCallIds(sessionId: string): Set<string> {
+  const rows = openEventLog().prepare(`
+    SELECT call_id FROM logical_model_result_projection_receipts WHERE session_id = ?
+    UNION SELECT call_id FROM host_model_result_receipts WHERE session_id = ?
+  `).all(sessionId, sessionId) as Array<{ call_id: string }>;
+  return new Set(rows.map((row) => row.call_id));
+}
+
+const COMPACTED_RESULT_MARK = 'left out after this conversation sat idle';
+
+/**
+ * Put back, byte for byte from the retained tool output, any result of a
+ * provenance-bound call that an earlier compaction shortened. Null when there
+ * is nothing to restore or an original is no longer retained.
+ */
+export function restoreProvenanceBoundResults(sessionId: string, items: readonly AgentInputItem[], bound: ReadonlySet<string>): {
+  items: AgentInputItem[];
+  restored: number;
+  missing: number;
+} {
+  let restored = 0;
+  let missing = 0;
+  const out = items.map((item) => {
+    const value = record(item);
+    if (!value || value.type !== 'function_call_result' || typeof value.callId !== 'string' || !bound.has(value.callId)) return item;
+    const output = value.output;
+    const text = typeof output === 'string' ? output : record(output)?.type === 'text' ? record(output)!.text : null;
+    if (typeof text !== 'string' || !text.includes(COMPACTED_RESULT_MARK)) return item;
+    const retained = getToolOutput(sessionId, value.callId);
+    if (!retained || retained.truncatedAtWrite) { missing += 1; return item; }
+    restored += 1;
+    return (typeof output === 'string'
+      ? { ...value, output: retained.output }
+      : { ...value, output: { ...record(output)!, text: retained.output } }) as AgentInputItem;
+  });
+  return { items: out, restored, missing };
+}
+
 /** Note the memory kept for this conversation. A later turn writes a new
  * snapshot and clears it, so a resumed conversation is remembered again. */
 export function noteConversationMemory(sessionId: string, episodeId: string): void {
@@ -225,11 +273,42 @@ function lower(sessionId: string, input: {
 
 /** Compact one idle conversation's stored state. */
 export function compactConversationState(sessionId: string, nowMs = Date.now()): ConversationLifecycleStep {
+  const bound = provenanceBoundCallIds(sessionId);
   return lower(sessionId, { fidelity: 'compacted', nowMs, build: (items, session) => {
-    const compacted = compactConversationItems(items, idleDaysOf(session.updatedAt, nowMs));
+    const compacted = compactConversationItems(items, idleDaysOf(session.updatedAt, nowMs), (callId) => bound.has(callId));
     // Marked compacted even when nothing was large: the tier is the record.
     return compacted.items;
   } });
+}
+
+/** Compacted states that may hold a shortened provenance-bound result. */
+export function listCompactedSessionsNeedingRepair(limit: number): string[] {
+  return (openEventLog().prepare(`
+    SELECT c.session_id FROM session_conversation_state c
+     WHERE c.fidelity = 'compacted' AND instr(c.state_json, ?) > 0
+       AND (EXISTS (SELECT 1 FROM logical_model_result_projection_receipts p WHERE p.session_id = c.session_id)
+         OR EXISTS (SELECT 1 FROM host_model_result_receipts h WHERE h.session_id = c.session_id))
+     LIMIT ?
+  `).all(COMPACTED_RESULT_MARK, Math.max(1, Math.min(1_000, Math.floor(limit)))) as Array<{ session_id: string }>)
+    .map((row) => row.session_id);
+}
+
+/**
+ * Restore every provenance-bound result an earlier compaction shortened in
+ * this session's stored state. The tier stays; only those results change.
+ */
+export function repairCompactedProvenanceResults(sessionId: string): { restored: number; missing: number } {
+  const db = openEventLog();
+  return db.transaction(() => {
+    const stored = getSessionConversationState(sessionId, db);
+    if (!stored || stored.fidelity !== 'compacted' || !Array.isArray(stored.state.items)) return { restored: 0, missing: 0 };
+    const repaired = restoreProvenanceBoundResults(sessionId, stored.state.items as AgentInputItem[], provenanceBoundCallIds(sessionId));
+    if (repaired.restored > 0) {
+      db.prepare('UPDATE session_conversation_state SET state_json = ? WHERE session_id = ? AND state_json = ?')
+        .run(JSON.stringify({ ...stored.state, items: repaired.items }), sessionId, stored.stateJson);
+    }
+    return { restored: repaired.restored, missing: repaired.missing };
+  }).immediate();
 }
 
 /** Retire one idle conversation's stored state to what memory kept. */
