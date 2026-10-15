@@ -116,6 +116,10 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   // of a workflow step grinding through its prompt.
   'cli_setup',
   'browser_harness_setup',
+  // A project's own MCP tool setup is configured with the owner in the
+  // conversation; a step neither connects it nor inspects it for that purpose.
+  'project_tools_connect',
+  'project_tools_inspect',
   // Coding agents in the user's projects: dispatching one is a user-approved
   // conversational act, and a step has no way yet to park on a run that can
   // outlive its wall clock — letting it launch open-ended agents is unbounded
