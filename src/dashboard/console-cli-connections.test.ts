@@ -75,7 +75,18 @@ function guardPolling(t: TestContext) {
     t.mock.method(fsPromises, method, deny(method));
   }
   // Scanning or auto-promotion must not hide behind a harmless-looking GET.
-  for (const method of ['readdirSync', 'realpathSync'] as const) t.mock.method(fs, method, deny(method));
+  t.mock.method(fs, 'readdirSync', deny('readdirSync'));
+  // Module resolution of an already-shipped source (a handler's lazy import)
+  // realpaths it on some platforms; a CLI binary or vendor path still fails.
+  const realpathSync = fs.realpathSync;
+  t.mock.method(fs, 'realpathSync', (...args: Parameters<typeof fs.realpathSync>) => {
+    const filename = String(args[0]);
+    if (filename.startsWith(`${process.cwd()}${path.sep}`) && /\.(?:[cm]?js|tsx?|json)$/.test(filename)) {
+      return Reflect.apply(realpathSync, fs, args);
+    }
+    forbidden.push('realpathSync');
+    throw new Error('Fixture forbids realpathSync');
+  });
   const statSync = fs.statSync;
   t.mock.method(fs, 'statSync', (...args: Parameters<typeof fs.statSync>) => {
     const filename = String(args[0]);

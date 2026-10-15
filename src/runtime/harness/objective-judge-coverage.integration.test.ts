@@ -1044,13 +1044,18 @@ async function lateFormatFixture(t: TestContext, options: {
   const { createAgentRecord, deleteAgentRecord } = await import('../../agents/agent-record.js');
   const { setSessionAgent } = await import('../../agents/session-agent.js');
   const { sessionAgentReviewContext } = await import('./session-composition.js');
-  const previous = Object.fromEntries(['CLAUDE_MODEL', 'OPENAI_MODEL_PRIMARY', 'CLEMMY_BRAIN_FALLOVER', 'CLEMMY_MODEL_ROLES', 'HARNESS_TOOL_BRACKETS']
+  const backups = await import('./brain-backups.js');
+  const previous = Object.fromEntries(['CLAUDE_MODEL', 'OPENAI_MODEL_PRIMARY', 'CLEMMY_BRAIN_FALLOVER', 'CLEMMY_MODEL_ROLES', 'HARNESS_TOOL_BRACKETS', backups.BRAIN_BACKUPS_ENV]
     .map(key => [key, process.env[key]]));
   t.after(() => { for (const [key, value] of Object.entries(previous)) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
-  } });
+  } backups.__brainBackupsTest__.setOptions(null); });
   process.env.CLAUDE_MODEL = 'claude-opus-5.5';
   process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  // The brain is the Codex model; the owner listed the Claude model as its backup.
+  process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.6-terra';
+  process.env[backups.BRAIN_BACKUPS_ENV] = JSON.stringify(['claude-opus-5.5']);
+  backups.__brainBackupsTest__.setOptions(() => [{ id: 'claude_oauth', value: 'claude_oauth:claude-opus-5.5', label: 'Claude — Opus', available: true, modelId: 'claude-opus-5.5' }]);
   const primaryRequests: ModelRequest[] = [], rescueRequests: ModelRequest[] = [], unrelatedRequests: ModelRequest[] = [];
   stubFormatWorker('UNEXPECTED CONFIGURED WORKER', unrelatedRequests);
   let f: Awaited<ReturnType<typeof inheritedAskFixture>>;
@@ -1147,7 +1152,7 @@ async function lateFormatFixture(t: TestContext, options: {
   let routed: Model | undefined;
   const route = () => routed ??= new RouterModelProvider({
     codex: { getModel: () => primary }, claude: { getModel: () => rescue },
-    resolveEffectiveProvider: () => 'codex', codexAvailable: () => true, claudeAvailable: () => true,
+    resolveEffectiveProvider: (id) => (id.startsWith('claude') ? 'claude' : 'codex'), codexAvailable: () => true, claudeAvailable: () => true,
   }).getModel('gpt-5.6-terra');
   const model: Model = { getResponse: request => route().getResponse(request),
     getStreamedResponse: request => route().getStreamedResponse(request) };

@@ -163,10 +163,11 @@ test('NEGATIVE: unique-run is host-dispatched before the model loop', () => {
 
 test('NEGATIVE: a prepared unique-run cannot fall through a swallowed projection failure', () => {
   const src = readFileSync(HOST, 'utf8');
-  const owner = src.slice(
-    src.indexOf('if (hostProduction && !resumedHostState && !resumedRecoveryState)'),
-    src.indexOf('let remainingPreContentStallRetries'),
-  );
+  // From the unique-run guard (which may gain further conditions) to the
+  // answer stream section that follows it.
+  const start = src.indexOf('if (hostProduction && !resumedHostState && !resumedRecoveryState');
+  const owner = src.slice(start, src.indexOf('// THE ANSWER STREAM', start));
+  assert.ok(start >= 0 && owner.length > 0, 'the unique-run block is found');
   const probeCatch = owner.indexOf('} catch {');
   const dispatch = owner.indexOf('tryHostDispatchNamedWorkflow');
   const completion = owner.indexOf('return await completedOutcome(uniqueDispatch.message)');
