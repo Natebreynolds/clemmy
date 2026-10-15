@@ -1,5 +1,6 @@
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { isSensitivePath } from '../runtime/security.js';
@@ -27,8 +28,18 @@ export function registerPagePreviewTools(server: McpServer): void {
       offset_y: z.number().int().min(0).max(20000).nullish().describe('Start the screenshot this many CSS pixels down the page, to check a lower part of a long page (default 0).'),
     },
     async ({ path: requested, width, height, offset_y }) => {
+      // A web address is not a path: resolving it as one looked for a file
+      // named after the URL and reported that nothing was there.
+      let local = requested;
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(requested.trim())) {
+        if (!/^file:\/\//i.test(requested.trim())) {
+          return refusal(`Not a local file: ${requested.trim()} is a web address. page_preview renders HTML files on this computer; read a web page with a web read or the browser. Nothing was read.`);
+        }
+        try { local = fileURLToPath(requested.trim()); }
+        catch { return refusal(`Not a readable file address: ${requested.trim()}. Nothing was read.`); }
+      }
       let file: string;
-      try { file = resolveAllowedPath(requested); }
+      try { file = resolveAllowedPath(local); }
       catch (error) { return refusal(error instanceof Error ? error.message : String(error)); }
       if (isSensitivePath(file)) return refusal('Refused: that file holds credential material. Nothing was read.');
       // No page at the path is what the look found, not a failed look: the

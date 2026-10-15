@@ -132,3 +132,16 @@ test('reading a page\'s source says where its picture is, and reading anything e
   const plain = String(await executeLocalFileRead({ path: notes, max_chars: null } as never, undefined, undefined, { completeOutput: true }));
   assert.equal(plain, 'plain');
 });
+
+test('page_preview refuses a web address as one instead of looking for a file named after it, and opens a file address', async () => {
+  for (const requested of ['https://example.com', 'http://localhost:3000/index.html']) {
+    const refused = await tool().invoke(context(), JSON.stringify({ path: requested }));
+    assert.ok(refused instanceof HostLocalExecutionFailureResult, `${requested}: a refusal, never a completed empty look`);
+    assert.match(JSON.stringify(refused), /is a web address/, requested);
+  }
+  const file = path.join(dir, 'file-url', 'index.html');
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, '<!doctype html><html><body>file url</body></html>', 'utf8');
+  const output = await tool().invoke(context(), JSON.stringify({ path: `file://${file}` }));
+  assert.ok(Array.isArray(output) && output.some((row) => row.type === 'image'), JSON.stringify(output));
+});
