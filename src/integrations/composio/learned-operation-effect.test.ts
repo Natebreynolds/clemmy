@@ -198,3 +198,34 @@ test('a provider declaration is recorded even from a turn excluded from learning
   assert.equal(store.learnedComposioOperationEffect('ACME_GET_SCHEDULE')?.source, 'provider');
   assert.equal(store.learnedComposioOperationEffect('ACME_SCRAPE_PROFILES'), null);
 });
+
+test('a verdict belongs to the definition it was made from: a changed or dropped declaration retires it', async () => {
+  store._resetLearnedComposioOperationEffectsForTests();
+  store.rememberProviderDeclaredEffects([{ slug: 'ACME_GET_SCHEDULE', tags: ['readOnlyHint'] }], { fromProvider: true });
+  assert.equal(classifyComposioSlugEffect('ACME_GET_SCHEDULE'), 'read');
+  // The same declaration again changes nothing.
+  store.rememberProviderDeclaredEffects([{ slug: 'ACME_GET_SCHEDULE', tags: ['readOnlyHint'] }], { fromProvider: true });
+  assert.equal(store.learnedComposioOperationEffect('ACME_GET_SCHEDULE')?.source, 'provider');
+  // The provider now declares only that it creates: the read no longer stands.
+  store.rememberProviderDeclaredEffects([{ slug: 'ACME_GET_SCHEDULE', tags: ['createHint'] }], { fromProvider: true });
+  assert.equal(store.learnedComposioOperationEffect('ACME_GET_SCHEDULE'), null);
+  assert.equal(classifyComposioSlugEffect('ACME_GET_SCHEDULE'), 'external_write');
+  // The provider drops its hints entirely: the same.
+  store.rememberProviderDeclaredEffects([{ slug: 'ACME_LIST_ROWS', tags: ['readOnlyHint'] }], { fromProvider: true });
+  store.rememberProviderDeclaredEffects([{ slug: 'ACME_LIST_ROWS' }], { fromProvider: true });
+  assert.equal(store.learnedComposioOperationEffect('ACME_LIST_ROWS'), null);
+  // A caller that simply did not carry tags retires nothing.
+  store.rememberProviderDeclaredEffects([{ slug: 'ACME_COUNT_ROWS', tags: ['readOnlyHint'] }], { fromProvider: true });
+  store.rememberProviderDeclaredEffects([{ slug: 'ACME_COUNT_ROWS' }]);
+  assert.equal(store.learnedComposioOperationEffect('ACME_COUNT_ROWS')?.effect, 'read');
+
+  // A model's read stands only for the description and schema it read.
+  const job = { slug: 'ACME_SCRAPE_PROFILES', description: 'Scrapes public profiles and returns them.', inputSchema: { type: 'object' }, tags: ['createHint'] };
+  await learnComposioOperationEffects([job], { evaluate: async () => ({ ok: true, readOnly: 0.97, model: 'fixture' }) });
+  assert.equal(classifyComposioSlugEffect('ACME_SCRAPE_PROFILES'), 'read');
+  store.rememberProviderDeclaredEffects([{ slug: job.slug, tags: job.tags, description: job.description, inputSchema: job.inputSchema }], { fromProvider: true });
+  assert.equal(classifyComposioSlugEffect('ACME_SCRAPE_PROFILES'), 'read', 'the same definition keeps it');
+  store.rememberProviderDeclaredEffects([{ slug: job.slug, tags: job.tags, description: 'Scrapes profiles and posts a summary to the team channel.', inputParameters: job.inputSchema }], { fromProvider: true });
+  assert.equal(store.learnedComposioOperationEffect('ACME_SCRAPE_PROFILES'), null, 'a changed description is read again');
+  assert.equal(classifyComposioSlugEffect('ACME_SCRAPE_PROFILES'), 'external_write');
+});

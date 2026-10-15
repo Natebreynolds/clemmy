@@ -97,27 +97,60 @@ export function providerDeclaredEffect(tags: readonly unknown[] | null | undefin
   return readOnly ? 'read' : 'write';
 }
 
-/** Record what providers declare about operations whose definitions just
- * arrived. One write for the batch, and only when something changed. */
+/** The identity of the definition a model verdict reads: its description and
+ * input schema, bounded the way the model is shown them. Null when there is
+ * no description to reason from. */
+export function operationDefinitionDigest(description: unknown, inputSchema: unknown): string | null {
+  const text = typeof description === 'string' ? description.replace(/\s+/g, ' ').trim().slice(0, 1_200) : '';
+  if (!text) return null;
+  let schemaText = '';
+  try { schemaText = JSON.stringify(inputSchema ?? null).slice(0, 2_000); } catch { schemaText = ''; }
+  return createHash('sha256').update(text).update('\0').update(schemaText).digest('hex');
+}
+
+function providerHintDigest(tags: readonly unknown[]): string {
+  return createHash('sha256')
+    .update(tags.filter((tag): tag is string => typeof tag === 'string' && tag.endsWith('Hint')).sort().join('\0'))
+    .digest('hex');
+}
+
+/**
+ * Bring stored verdicts in line with definitions that just arrived. A verdict
+ * belongs to the exact definition it was made from: what the provider now
+ * declares is recorded; a provider verdict whose declaration changed so it no
+ * longer decides, or (from the provider itself) disappeared, is retired; a
+ * model verdict whose description or schema changed is retired so the model
+ * reads the new one. One write for the batch, and only when something
+ * changed. `fromProvider` marks rows exactly as the provider returned them,
+ * where an absent tag list means the provider declares nothing.
+ */
 export function rememberProviderDeclaredEffects(
-  definitions: ReadonlyArray<{ slug?: unknown; tags?: unknown }>,
+  definitions: ReadonlyArray<{ slug?: unknown; tags?: unknown; description?: unknown; inputSchema?: unknown; inputParameters?: unknown }>,
+  options: { fromProvider?: boolean } = {},
 ): void {
   const file = readStore();
   let effects: Record<string, LearnedComposioOperationEffect> | null = null;
   const at = new Date().toISOString();
+  const current = (key: string) => (effects ?? file.effects)[key];
+  const retire = (key: string) => { effects ??= { ...file.effects }; delete effects[key]; };
   for (const definition of definitions) {
     const key = typeof definition.slug === 'string' ? definition.slug.trim().toUpperCase() : '';
-    const tags = Array.isArray(definition.tags) ? definition.tags : null;
-    if (!key || !tags) continue;
-    const effect = providerDeclaredEffect(tags);
-    if (!effect) continue;
-    const definitionDigest = createHash('sha256')
-      .update(tags.filter((tag) => typeof tag === 'string' && tag.endsWith('Hint')).sort().join('\0'))
-      .digest('hex');
-    const current = (effects ?? file.effects)[key];
-    if (current?.source === 'provider' && current.effect === effect && current.definitionDigest === definitionDigest) continue;
-    effects ??= { ...file.effects };
-    effects[key] = { effect, source: 'provider', model: '', confidence: 1, definitionDigest, at };
+    if (!key) continue;
+    const tags = Array.isArray(definition.tags) ? definition.tags : options.fromProvider ? [] : null;
+    const effect = tags ? providerDeclaredEffect(tags) : null;
+    const stored = current(key);
+    if (tags && effect) {
+      const definitionDigest = providerHintDigest(tags);
+      if (stored?.source === 'provider' && stored.effect === effect && stored.definitionDigest === definitionDigest) continue;
+      effects ??= { ...file.effects };
+      effects[key] = { effect, source: 'provider', model: '', confidence: 1, definitionDigest, at };
+      continue;
+    }
+    if (stored?.source === 'provider' && tags) { retire(key); continue; }
+    if (stored?.source === 'model') {
+      const digest = operationDefinitionDigest(definition.description, definition.inputSchema ?? definition.inputParameters);
+      if (digest && digest !== stored.definitionDigest) retire(key);
+    }
   }
   if (effects) writeEffects(effects);
 }

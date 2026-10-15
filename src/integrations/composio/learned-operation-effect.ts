@@ -14,6 +14,7 @@ import { captureTurnLearningScope, readTurnLearningPolicyForScope, type TurnLear
 import { composioSlugVerbEvidence } from './slug-effect.js';
 import {
   learnedComposioOperationEffect,
+  operationDefinitionDigest,
   providerDeclaredEffect,
   rememberComposioOperationEffect,
   rememberProviderDeclaredEffects,
@@ -63,14 +64,11 @@ async function evaluateWithJev(input: { slug: string; description: string; schem
   return { ok: true as const, readOnly: answer.noul, model: result.model };
 }
 
-function definitionDigest(description: string, schemaText: string): string {
-  return createHash('sha256').update(description).update('\0').update(schemaText).digest('hex');
-}
-
 /**
- * Learn the effect of every noun-shaped operation in `definitions` that has no
- * verdict yet. Bounded per operation; failures leave no record. Returns the
- * slugs whose verdict was written this call.
+ * Learn the effect of every operation in `definitions` whose provider leaves
+ * it open and that has no verdict for its current definition yet. Bounded per
+ * operation; failures leave no record. Returns the slugs whose verdict was
+ * written this call.
  */
 export async function learnComposioOperationEffects(
   definitions: readonly OperationDefinitionForEffect[],
@@ -100,7 +98,7 @@ export async function learnComposioOperationEffects(
     if (!description) continue;
     let schemaText = '';
     try { schemaText = JSON.stringify(definition.inputSchema ?? null).slice(0, 2_000); } catch { schemaText = ''; }
-    const digest = definitionDigest(description, schemaText);
+    const digest = operationDefinitionDigest(description, definition.inputSchema) ?? '';
     const existing = learnedComposioOperationEffect(slug);
     if (existing && existing.definitionDigest === digest) continue;
     try {

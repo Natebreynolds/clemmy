@@ -196,9 +196,9 @@ function noteProviderDeclaredEffects(raw: unknown): void {
       ? raw
       : (Array.isArray((raw as { items?: unknown[] } | null)?.items) ? (raw as { items: unknown[] }).items : []);
     rememberProviderDeclaredEffects(list.map((item) => {
-      const row = (item ?? {}) as { slug?: unknown; tags?: unknown };
-      return { slug: row.slug, tags: row.tags };
-    }));
+      const row = (item ?? {}) as { slug?: unknown; tags?: unknown; description?: unknown; inputParameters?: unknown; input_parameters?: unknown };
+      return { slug: row.slug, tags: row.tags, description: row.description, inputParameters: row.inputParameters ?? row.input_parameters };
+    }), { fromProvider: true });
   } catch { /* the name fallback stands */ }
 }
 

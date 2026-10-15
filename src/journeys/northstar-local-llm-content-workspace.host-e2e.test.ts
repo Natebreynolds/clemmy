@@ -560,12 +560,6 @@ for (const post of data.posts) {
 const clarificationRevision = await import('../runtime/semantic-boundary/clarification-revision.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const operationEffects = await import('../integrations/composio/learned-operation-effect-store.js');
-// The provider marks its batch scrape only as "creates" (a job that gathers
-// pages); a model reading its definition found it only returns data. That
-// verdict is what production holds after the first discovery.
-operationEffects.rememberComposioOperationEffect('FIRECRAWL_BATCH_SCRAPE', {
-  effect: 'read', source: 'model', model: 'fixture', confidence: 0.97, definitionDigest: 'fixture', at: new Date(0).toISOString(),
-});
 const brackets = await import('../runtime/harness/brackets.js');
 const continuity = await import('../runtime/harness/task-continuity-runtime.js');
 const semantic = await import('../runtime/semantic-boundary/admit-and-compile-accepted-source.js');
@@ -827,6 +821,18 @@ const FIRECRAWL_BATCH_SCRAPE_INPUT_SCHEMA = Object.freeze({
       items: { type: 'string', enum: ['markdown', 'html', 'rawHtml'] },
     },
   },
+});
+
+// The provider marks its batch scrape only as "creates" (a job that gathers
+// pages); a model reading this exact definition found it only returns data.
+// That verdict, bound to the definition it read, is what production holds
+// after the first discovery.
+operationEffects.rememberComposioOperationEffect('FIRECRAWL_BATCH_SCRAPE', {
+  effect: 'read', source: 'model', model: 'fixture', confidence: 0.97, at: new Date(0).toISOString(),
+  definitionDigest: operationEffects.operationDefinitionDigest(
+    'Starts one bounded Firecrawl batch scrape for exact URLs and selected response formats.',
+    FIRECRAWL_BATCH_SCRAPE_INPUT_SCHEMA,
+  )!,
 });
 
 const FIRECRAWL_BATCH_SCRAPE_OUTPUT_SCHEMA = Object.freeze({
