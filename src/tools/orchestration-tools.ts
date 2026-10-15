@@ -1113,6 +1113,7 @@ export function registerOrchestrationTools(server: McpServer): void {
     'Create directly under a new name; duplicates leave the existing workflow unchanged. '
       + WORKFLOW_TRANSFORM_INPUT_GUIDANCE
       + 'Create a reusable workflow from the step graph you author. '
+      + 'An app a step needs that is not connected yet is no reason to stop: save the workflow anyway; it stays off, its rehearsal names the app to connect, and you offer the owner that connection. '
       + "Saved goals apply to EVERY future run: express correctness against current inputs, not today's example answer. Verify example-specific expected values after the current run. "
       + "For absolute-path file work, omit project unless the user selected a verified configured workspace. A file's parent directory is not a project binding. "
       + "Choose the executor for each job: exact known tool/arguments use `call`; parsing, filtering, counts, sums and data shaping use `transform`; use a model prompt for reasoning that those executors cannot express. An operation this turn already proved or discovered (its id and args are in the PROVEN OPERATION note or the tool_search result) IS known: author it as `call` with that exact operation id, literal args and time tokens ({{now}}, {{now+24h}}, {{date}}), not as a prompt step that re-describes the read; the host binds the account. Do not turn deterministic arithmetic into a model step. Transforms are closed v1 JSON expressions; their schema lists the operations. Raw script runners are legacy and refused. "
@@ -1810,8 +1811,49 @@ export function registerOrchestrationTools(server: McpServer): void {
   );
 
   server.tool(
+    'workflow_test',
+    'Rehearse a saved workflow in this setup without turning it on or off. Steps that read run for real against the connected tools; steps that make changes are previewed, never run; nothing is run for real. The answer gives each step\'s result and, for a flagged step, what to fix. Use it to check any workflow, including one that is off.',
+    {
+      name: z.string().min(1).describe('Exact saved name or slug.'),
+      test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the rehearsal, e.g. {"url":"https://example.com"}. Needed only for inputs without defaults.'),
+    },
+    async ({ name, test_inputs }) => {
+      let provided: Record<string, string> = {};
+      try {
+        provided = parseWorkflowRunInputsJson(test_inputs);
+      } catch (error) {
+        return nonWriteTextResult('invalid_test_inputs', error instanceof Error ? error.message : String(error));
+      }
+      const exactMatches = listWorkflowFiles().filter((w) => w.data.name === name || w.name === name);
+      if (exactMatches.length > 1) {
+        return nonWriteTextResult('ambiguous_identity', `Workflow identity "${name}" is ambiguous. Use a unique exact saved name or slug.`);
+      }
+      const entry = exactMatches[0];
+      if (!entry) return nonWriteTextResult('not_found', `Workflow "${name}" not found. Use its exact saved name or slug.`);
+      const verification = prepareWorkflowVerification(entry.data, provided);
+      if (verification.missing.length > 0) {
+        return nonWriteTextResult('invalid_test_inputs', renderMissingSmokeInputs(name, verification.missing));
+      }
+      const queued = queueWorkflowCreationTest(entry.name, verification.inputs, {
+        activateAfterCreationTest: false,
+        originSessionId: getToolOutputContext()?.sessionId,
+        source: 'workflow_test',
+      });
+      const state = entry.data.enabled ? 'still on' : 'still off';
+      const settled = queued.id ? await awaitWorkflowCreationTestSettlement(queued.id, entry.name) : null;
+      if (!settled) {
+        return textResult(`Rehearsing "${name}" (run ${queued.id ?? 'not queued'}); it stays ${entry.data.enabled ? 'on' : 'off'} either way, and the result arrives as a notification.`);
+      }
+      return textResult(
+        `${settled.pass ? 'Rehearsal passed' : 'Rehearsal found issues'} for "${name}"; it is ${state}.\n\n`
+        + renderCreationTestSettlementReceipt(settled, readWorkflow(entry.name)?.data ?? entry.data, name),
+      );
+    },
+  );
+
+  server.tool(
     'workflow_set_enabled',
-    'Approve or disable a workflow by exact saved name or slug (the created workflow ID). Sub-agents (Executor / Deployer) only fire approved workflows. Use enabled=true to approve a workflow for autonomous execution; enabled=false to pause it without deleting.',
+    'Approve or disable a workflow by exact saved name or slug (the created workflow ID). Sub-agents (Executor / Deployer) only fire approved workflows. Use enabled=true to approve a workflow for autonomous execution: it first rehearses the workflow (reads run for real, steps that make changes are previewed, nothing is run for real) and turns it on only if that passes. enabled=false pauses it without deleting. To check a workflow without turning it on, use workflow_test.',
     {
       name: z.string().min(1),
       enabled: z.boolean(),
@@ -2745,7 +2787,8 @@ export function renderCreationTestSettlementReceipt(
   if (settled.pass) return lines.join('\n');
   const flagged = settled.steps.filter((row) => !CREATION_TEST_STEP_OK.has(row.status));
   const choices = flagged.filter((row) => row.status === 'needs_choice');
-  const broken = flagged.filter((row) => row.status !== 'needs_choice');
+  const connections = flagged.filter((row) => row.status === 'needs_connection');
+  const broken = flagged.filter((row) => row.status !== 'needs_choice' && row.status !== 'needs_connection');
   if (broken.length > 0) {
     lines.push('', 'Flagged steps as currently saved (authorable fields only):');
     for (const row of broken) {
@@ -2762,6 +2805,9 @@ export function renderCreationTestSettlementReceipt(
   }
   if (choices.length > 0) {
     lines.push('', 'A step is waiting on an account choice: answer it as the test asks and the host binds it and re-tests.');
+  }
+  if (connections.length > 0) {
+    lines.push('', `Not a fix to the workflow: ${connections.map((row) => `"${row.stepId}" ${row.detail ?? 'needs an app connected here'}`).join('; ')}. Offer the owner the connection; once it is connected, workflow_test re-checks it and workflow_set_enabled turns it on.`);
   }
   return lines.join('\n');
 }

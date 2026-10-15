@@ -660,7 +660,7 @@ export function timeoutForTool(toolName: string): number {
   // exactly the external-work shape this bucket exists for. The default 60 s
   // budget would kill the tool while its own test is still running.
   if (toolName === 'workflow_create' || toolName === 'workflow_update' || toolName === 'workflow_reshape'
-    || toolName === 'workflow_edit_step' || toolName === 'workflow_set_enabled') {
+    || toolName === 'workflow_edit_step' || toolName === 'workflow_set_enabled' || toolName === 'workflow_test') {
     return DEFAULT_TIMEOUTS_MS.externalApi;
   }
   // MCP namespace shim separator is "__" (src/runtime/mcp-namespace-shim.ts).
