@@ -613,56 +613,28 @@ test('brainOptions offers SPECIFIC Codex models (codex_oauth:<id>) so the brain 
   });
 });
 
-test('falloverBrainModelIds — Claude→Codex→GLM order, excludes current, [] in all_in', () => {
+test('falloverBrainModelIds — only the owner\'s listed backups, in their order, never the serving model', () => {
   writeAuthFiles(); // codex + claude OAuth present
   const byoEnv = {
     BYO_MODEL_BASE_URL: 'https://api.z.ai/api/paas/v4',
     BYO_MODEL_API_KEY: 'k',
     BYO_MODEL_ID: 'glm-5.2',
   };
-
-  // Brain = Claude, overload → next targets are Codex then GLM (claude excluded).
-  withEnv({ ...byoEnv, MODEL_ROUTING_MODE: 'off', AUTH_MODE: 'claude_oauth' }, () => {
-    const chain = falloverBrainModelIds('claude');
-    assert.deepEqual(chain.map((c) => c.provider), ['codex', 'byo'], 'Claude falls to Codex then GLM');
-    assert.equal(chain.find((c) => c.provider === 'byo')?.modelId, 'glm-5.2');
-    assert.equal(chain.some((c) => c.provider === 'claude'), false, 'never includes the current brain');
+  // Nothing listed: no brain is a backup, however many are connected.
+  withEnv({ ...byoEnv, MODEL_ROUTING_MODE: 'off', AUTH_MODE: 'claude_oauth', CLEMMY_BRAIN_BACKUPS: '' }, () => {
+    assert.deepEqual(falloverBrainModelIds('claude', 'claude-opus-4-8'), []);
   });
-
-  // Brain = Codex → Claude then GLM.
-  withEnv({ ...byoEnv, MODEL_ROUTING_MODE: 'off', AUTH_MODE: 'codex_oauth' }, () => {
-    assert.deepEqual(falloverBrainModelIds('codex').map((c) => c.provider), ['claude', 'byo']);
+  // The owner's order is kept; the serving model is left out; providers are resolved per id.
+  withEnv({ ...byoEnv, MODEL_ROUTING_MODE: 'off', AUTH_MODE: 'claude_oauth', CLEMMY_BRAIN_BACKUPS: JSON.stringify(['glm-5.2', 'gpt-5.6-terra']) }, () => {
+    assert.deepEqual(falloverBrainModelIds('claude', 'claude-opus-4-8'), [
+      { provider: 'byo', modelId: 'glm-5.2' },
+      { provider: 'codex', modelId: 'gpt-5.6-terra' },
+    ]);
+    assert.deepEqual(falloverBrainModelIds('byo', 'glm-5.2').map((c) => c.modelId), ['gpt-5.6-terra']);
   });
-
-  // all_in (BYO-only) → no cross-provider targets.
-  withEnv({ ...byoEnv, MODEL_ROUTING_MODE: 'all_in', AUTH_MODE: 'codex_oauth' }, () => {
-    assert.deepEqual(falloverBrainModelIds('byo'), []);
-  });
-
-  // No BYO configured → Claude falls to Codex only.
-  withEnv({ BYO_MODEL_BASE_URL: '', BYO_MODEL_API_KEY: '', BYO_MODEL_ID: '', MODEL_ROUTING_MODE: 'off', AUTH_MODE: 'claude_oauth' }, () => {
-    assert.deepEqual(falloverBrainModelIds('claude').map((c) => c.provider), ['codex']);
-  });
-});
-
-test('falloverBrainModelIds — a repurposed OPENAI_MODEL_PRIMARY (BYO id) cannot knock connected Codex out of the chain', () => {
-  writeAuthFiles(); // codex + claude OAuth present
-  // Alexander's real config class: OPENAI_MODEL_PRIMARY repurposed to glm-5.2. The
-  // codex slot used to borrow that id verbatim, resolve to BYO, and get dropped
-  // by the mis-route guard — Codex silently vanished from claude→X recovery
-  // (observed 2026-07-02: every recovery went straight to glm-5.2).
-  withEnv({
-    BYO_MODEL_BASE_URL: 'https://api.z.ai/api/paas/v4',
-    BYO_MODEL_API_KEY: 'k',
-    BYO_MODEL_ID: 'glm-5.2',
-    OPENAI_MODEL_PRIMARY: 'glm-5.2',
-    MODEL_ROUTING_MODE: 'off',
-    AUTH_MODE: 'claude_oauth',
-  }, () => {
-    const chain = falloverBrainModelIds('claude');
-    assert.deepEqual(chain.map((c) => c.provider), ['codex', 'byo'], 'Codex must survive the repurposed primary slot');
-    const codex = chain.find((c) => c.provider === 'codex');
-    assert.notEqual(codex?.modelId, 'glm-5.2', 'the codex entry must not carry a BYO id');
+  // A listed model no connected account serves is skipped, never substituted.
+  withEnv({ ...byoEnv, MODEL_ROUTING_MODE: 'off', AUTH_MODE: 'claude_oauth', CLEMMY_BRAIN_BACKUPS: JSON.stringify(['not-a-connected-model', 'glm-5.2']) }, () => {
+    assert.deepEqual(falloverBrainModelIds('claude', 'claude-opus-4-8').map((c) => c.modelId), ['glm-5.2']);
   });
 });
 

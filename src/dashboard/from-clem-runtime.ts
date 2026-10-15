@@ -400,6 +400,8 @@ export interface FromClemReplyDeps {
    *  untouched. */
   later: (key: string, forever?: boolean) => void;
   startTurn: (input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string }) => string;
+  /** The owner's answer to "switch back?" after a brain outage. */
+  resolveBrainOutage?: (outageId: string, choice: 'switch_back' | 'stay') => Promise<boolean>;
 }
 
 /** The facts behind a row, as Clem would cite them. */
@@ -481,6 +483,14 @@ async function replyOnce(
   if (current.voiceDigest !== row.voiceDigest) return { outcome: 'changed' };
   const planId = row.answer?.kind === 'yes_no' ? row.answer.planProposalId : null;
   const notificationId = row.done?.notificationId ?? null;
+  const outageId = row.answer?.kind === 'brain_outage' ? row.answer.outageId : null;
+  if (outageId && deps.resolveBrainOutage && !read.instruction
+    && (read.decision === 'do_it' || read.decision === 'done' || read.decision === 'never')) {
+    const yes = read.decision === 'do_it';
+    return await deps.resolveBrainOutage(outageId, yes ? 'switch_back' : 'stay')
+      ? { outcome: yes ? 'approved' : 'declined', decision: read.decision }
+      : { outcome: 'gone' };
+  }
   switch (read.decision) {
     case 'do_it': {
       if (planId && !read.instruction) {

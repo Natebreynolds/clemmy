@@ -54,7 +54,7 @@ export const DEV_FLAG_REGISTRY: DevFlagDef[] = [
   { key: 'CLEMMY_PARALLEL_PREWRITE_GATES', label: 'Parallel pre-write gates', category: 'Gates & safety', type: 'boolean', default: 'on', description: 'Run the pre-write judges concurrently (latency win, lossless).' },
 
   // ── Brain & judges ──
-  { key: 'CLEMMY_BRAIN_FALLOVER', label: 'Brain fallover', category: 'Brain & judges', type: 'boolean', default: 'on', description: 'Fall over to an alternate brain provider on a transient/overload failure.' },
+  { key: 'CLEMMY_BRAIN_FALLOVER', label: 'Brain fallover', category: 'Brain & judges', type: 'boolean', default: 'on', description: 'Re-run a turn that died before a safe answer, and let workers fall over to the small subscription models. The brain\'s backups are the list under Settings → Models.' },
   { key: 'CLEMMY_JUDGE_CROSS_FAMILY', label: 'Cross-family judge', category: 'Brain & judges', type: 'boolean', default: 'on', description: 'Force the judge/checker to a different LLM family than the brain (never self-grade).' },
   { key: 'CLEMMY_DEBATE_MODE', label: 'Debate / verify mode', category: 'Brain & judges', type: 'boolean', default: 'off', description: 'Multi-brain debate + verify-checker on high-stakes turns.' },
   { key: 'CLEMMY_RUBRIC_VARIANT', label: 'Orchestrator rubric variant', category: 'Brain & judges', type: 'string', default: 'lean', description: 'Which orchestrator rubric to inject. Lean is the production default; legacy is the rollback.', options: ['lean', 'legacy'] },

@@ -264,6 +264,19 @@ export function pinSessionBrain(sessionId: string): SessionBrainPin | null {
   return stampSessionBrainPin(clean, global);
 }
 
+/** Every conversation pinned to `fromModelId` moves to the current global
+ *  brain: when the owner keeps a backup after an outage, all chats move. */
+export function repinSessionsFrom(fromModelId: string): number {
+  const global = resolveRoleModel('brain');
+  let moved = 0;
+  for (const [sessionId, pin] of sessionBrainPins) {
+    if (pin.modelId !== fromModelId) continue;
+    sessionBrainPins.set(sessionId, { modelId: global.modelId, provider: global.provider, pinnedAt: Date.now() });
+    moved += 1;
+  }
+  return moved;
+}
+
 /** Session lifecycle end (terminal/reaped): drop the pin. */
 export function releaseSessionBrainPin(sessionId: string): void {
   sessionBrainPins.delete(sessionId);

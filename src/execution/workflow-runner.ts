@@ -1,4 +1,5 @@
 import { workerStandingInstructions } from './workflow-worker-standing-instructions.js';
+import { brainBackupsConfigured } from '../runtime/harness/brain-backups.js';
 import { workflowVerificationDependencyState } from '../tools/workflow-verification-state.js';
 import { withWorkflowCommit as activationWorkflowCommit } from './workflow-commit.js';
 import { parseHostLocalWriteCommitFacts as activationCommitFacts } from '../runtime/harness/host-local-write-commit.js';
@@ -6958,11 +6959,13 @@ export async function runWithContractLoop<T>(
 /** Brain-fallover opt-in — shared with the harness's CLEMMY_BRAIN_FALLOVER.
  *  Default off: a step runs on its resolved brain only. */
 function workflowBrainFalloverEnabled(): boolean {
-  // Default ON (kill-switch CLEMMY_BRAIN_FALLOVER=off) — parity with the router +
-  // chat lanes. A workflow step whose brain is expired/overloaded/hung re-runs on
-  // the next connected brain (canSwitchBrainForStep still blocks re-running a step
-  // that already recorded an external write, so a switch can never double-act).
-  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+  // A workflow step whose brain is expired/overloaded/hung re-runs on the
+  // owner's next listed backup (canSwitchBrainForStep still blocks re-running a
+  // step that already recorded an external write, so a switch can never
+  // double-act). No list, no other model; a listed backup turns this on even
+  // under the old switch.
+  return brainBackupsConfigured()
+    || (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
 /** Step-boundary cross-provider fallover. Runs the step on its resolved brain
@@ -7228,10 +7231,9 @@ async function executeStepVerifiedInner(
   if (!workflowBrainFalloverEnabled() || step.deterministic) {
     return runStepVerifiedAttempt(step, ctx);
   }
-  const currentProvider = resolveEffectiveProviderForModel(
-    resolveWorkflowStepModel(step, ctx.workflow).model ?? defaultForRole('brain'),
-  ) as BrainProviderClass;
-  const nextBrains = falloverBrainModelIds(currentProvider);
+  const currentModel = resolveWorkflowStepModel(step, ctx.workflow).model ?? defaultForRole('brain');
+  const currentProvider = resolveEffectiveProviderForModel(currentModel) as BrainProviderClass;
+  const nextBrains = falloverBrainModelIds(currentProvider, currentModel);
   if (nextBrains.length === 0) return runStepVerifiedAttempt(step, ctx);
 
   let lastErr: unknown;
@@ -11895,10 +11897,9 @@ async function executeWorkflow(
       // Step-boundary brain fallover, mirroring executeStepVerified. Synthesis
       // is read-only, so there is no external-write guard to respect.
       if (workflowBrainFalloverEnabled() && (isTransientStepError(err) || isUnparseableToolCallError(err) || isWorkflowStepStructuralResultError(err))) {
-        const currentProvider = resolveEffectiveProviderForModel(
-          synthesisStep.model ?? defaultForRole('brain'),
-        ) as BrainProviderClass;
-        for (const target of falloverBrainModelIds(currentProvider)) {
+        const currentModel = synthesisStep.model ?? defaultForRole('brain');
+        const currentProvider = resolveEffectiveProviderForModel(currentModel) as BrainProviderClass;
+        for (const target of falloverBrainModelIds(currentProvider, currentModel)) {
           appendWorkflowEvent(workflowSlug, runId, {
             kind: 'step_advisory',
             stepId: '__synthesis__',

@@ -106,7 +106,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
               <button key={choice} type="button" class={index === 0 ? 'home-btn home-btn-primary' : 'home-btn'} disabled={busy !== null}
                 onClick={() => void reply(row, choice, undefined, index)}>{choice}</button>
             ))}
-            {!row.choices?.length && row.answer?.kind === 'yes_no' ? (
+            {!row.choices?.length && (row.answer?.kind === 'yes_no' || row.answer?.kind === 'brain_outage') ? (
               <>
                 <button type="button" class="home-btn home-btn-primary" disabled={busy !== null} onClick={() => void reply(row, 'Yes, do it', 'do_it')}>Yes</button>
                 <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void reply(row, 'No', 'done')}>No</button>

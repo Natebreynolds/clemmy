@@ -3663,6 +3663,15 @@ export async function startDaemon(
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Calendar watch heartbeat failed to arm');
   }
+  try {
+    // A brain outage reaches Home: one update when the owner's backups take
+    // over, one question when the chosen brain answers again; an outage that
+    // outlived a restart keeps its check running.
+    const { startBrainOutageCards } = await import('../dashboard/brain-outage.js');
+    startBrainOutageCards();
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Brain outage cards failed to arm');
+  }
 
   // RELEASE BOUNDARY: listeners must not accept a fresh mutation while the
   // previous process's logical turns are still being fenced/reconciled or

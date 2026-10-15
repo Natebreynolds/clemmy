@@ -7,13 +7,12 @@ import { cn } from '@/lib/cn';
 import { getModelScorecard, judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, ROLE_WORDS, useModelRoles } from '@/lib/model-roles';
 import { CHECKER_ROLE_WORDS, QUICK_ROLE_WORDS, modelScoreLine, checkerAutomaticText, checkerBackupAutomaticLabel, checkerSameFamilyWarning, jevFirstChecksText, memoryModelUnavailableText, memoryRoleAutomaticText, modelDisplayName } from '@clem/chat-engine';
 import { memoryTimeFormat } from '@/lib/memory-work';
-import { Field, Select, Input } from '@/components/ui/Field';
+import { Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { getRecentFusionTraces, fusionOutcomeLabel } from '@/lib/fusion';
 import { relativeTime } from '@/lib/inbox';
 import {
-  patchCodexRescueModel,
   patchModelRole,
   patchFusion,
   type JudgeMetricsSnapshot,
@@ -113,11 +112,19 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const fallbackChoices = judgeFallbackChoices(mr);
   const fallbackUnavailable = fallback?.mode === 'model'
     && fallbackChoices.some((model) => model.id === (fallback.modelId ?? '') && !model.available);
-  const codexRescue = settings?.models?.codexRescue;
-  const codexRescueOptions = [...(mr.available.find((p) => p.provider === 'codex')?.models ?? [])];
-  if (codexRescue?.configured && !codexRescueOptions.some((model) => model.id === codexRescue.modelId)) {
-    codexRescueOptions.push({ id: codexRescue.modelId, label: `${codexRescue.modelId} (saved)` });
-  }
+  const backups = mr.brainBackups;
+  const backupChoices = (mr.brainOptions ?? []).filter((o) => o.available && o.modelId);
+  const backupLabel = (id: string) => backupChoices.find((o) => o.modelId === id)?.label ?? modelDisplayName(id);
+  const outage = backups?.outage ?? null;
+  const backupNote = !backups ? '' : outage
+    ? outage.status === 'recovered'
+      ? `${backupLabel(outage.downModelId)} answers again. ${backupLabel(outage.standInModelId)} keeps answering until you choose on Home.`
+      : `${backupLabel(outage.downModelId)} stopped answering, so ${backupLabel(outage.standInModelId)} is answering for now.`
+    : backups.unavailable.length > 0
+      ? `${backups.unavailable.map(backupLabel).join(', ')} ${backups.unavailable.length === 1 ? 'is' : 'are'} not connected right now and will be skipped.`
+      : backups.modelIds.length === 0
+        ? 'No backup: if it stops answering, Clem waits for it.'
+        : 'Applies to new requests.';
   const discovery = mr.discovery;
   const discoveryProviders = discovery ? Object.values(discovery.providers) : [];
   const discoveryDegraded = discoveryProviders.some((provider) => provider.phase === 'degraded');
@@ -161,7 +168,6 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const memoryWaits = Boolean(memory?.inactiveBinding && !memory.modelId);
   // "Quick checks": Settings-only, shown when the daemon knows the role.
   const quick = mr.roles.quick;
-  const onCodexRescue = (value: string) => r.run('codex-rescue', () => patchCodexRescueModel(value === '__primary__' ? { clear: true } : { modelId: value }));
   const workerIntents = mr.bindings.filter((b) => b.role === 'worker' && b.whenIntent);
   const modelLabel = (id: string) => workerFlat.find((m) => m.id === id)?.label ?? id;
   const onAddIntent = () => {
@@ -206,6 +212,24 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
           <Select disabled={busy === 'brain'} value={r.brainValue} onChange={(e) => void r.onBrain(e.target.value)} aria-label="Model that does the work">
             {r.brains.map((o) => <option key={o.value} value={o.value} disabled={!o.available}>{o.label}{o.note ? ` (${o.note})` : ''}</option>)}
           </Select>, <>{score('brain', mr.roles.brain.modelId)}{inactive('brain')}</>)}
+        {backups && row(ROLE_WORDS.backups.title, ROLE_WORDS.backups.hint,
+          <div className="flex w-full flex-col gap-2">
+            {[0, 1, 2].filter((slot) => slot <= backups.modelIds.length).map((slot) => (
+              <Select key={`backup-${slot}`} disabled={busy === 'brain-backups'} value={backups.modelIds[slot] ?? '__none__'}
+                onChange={(e) => void r.onBrainBackup(slot, e.target.value)} aria-label={`Backup model ${slot + 1}`}>
+                <option value="__none__">{slot === 0 ? 'No backup' : 'No more backups'}</option>
+                {backupChoices.map((o) => (
+                  <option key={`b${slot}-${o.value}`} value={o.modelId}
+                    disabled={o.modelId === mr.roles.brain.modelId || (backups.modelIds.includes(o.modelId!) && backups.modelIds[slot] !== o.modelId)}>
+                    {slot + 1}. {o.label}
+                  </option>
+                ))}
+              </Select>
+            ))}
+          </div>,
+          <div className={cn('mt-1 text-caption', outage ? 'text-warning' : 'text-muted')} role={busy === 'brain-backups' ? 'status' : undefined}>
+            {busy === 'brain-backups' ? 'Saving…' : backupNote}
+          </div>)}
         {row(ROLE_WORDS.worker.title, ROLE_WORDS.worker.hint,
           <Select disabled={busy === 'worker'} value={mr.roles.worker.source === 'default' ? '__default__' : mr.roles.worker.modelId} onChange={(e) => void r.onRole('worker', e.target.value)} aria-label="Model that helps in parallel">
             <option value="__default__">Same model that does the work</option>
@@ -310,7 +334,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
         <details className="group border-t border-border">
           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-small text-muted hover:text-fg">
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" aria-hidden />
-            Rescue model, routing by task, completion review, judge numbers
+            Routing by task, completion review, judge numbers
             <span className="ml-auto text-caption text-faint">Advanced</span>
           </summary>
           <div className="space-y-4 border-t border-border bg-canvas px-4 py-4">
@@ -319,16 +343,6 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
                 <Sparkles className={cn('mt-0.5 h-3.5 w-3.5 shrink-0', discovery.refreshing && 'animate-pulse text-primary')} aria-hidden />
                 <span>{discoveryMessage}</span>
               </div>
-            )}
-            {codexRescue && (
-              <Field label="Codex rescue" hint="Last-resort Codex model when an all-in BYO brain fails before producing content.">
-                {(id) => (
-                  <Select id={id} disabled={busy === 'codex-rescue'} value={codexRescue.configured ? codexRescue.modelId : '__primary__'} onChange={(event) => void onCodexRescue(event.target.value)}>
-                    <option value="__primary__">Follow Codex primary ({codexRescue.inheritedModelId})</option>
-                    {codexRescueOptions.map((model) => <option key={`rescue-${model.id}`} value={model.id}>{model.label}</option>)}
-                  </Select>
-                )}
-              </Field>
             )}
             <div>
               <div className="mb-1 text-label text-fg">Routing by task</div>

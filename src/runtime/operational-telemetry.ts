@@ -52,6 +52,9 @@ export const MODEL_OPERATIONAL_EVENT_TYPES = [
   'model_fallover',
   'brain_auth_dead',
   'brain_silent_cooldown',
+  'brain_outage_opened',
+  'brain_outage_recovered',
+  'brain_outage_closed',
   'route_policy_updated',
 ] as const;
 

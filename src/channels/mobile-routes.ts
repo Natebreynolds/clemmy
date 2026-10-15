@@ -6427,6 +6427,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // identity or accepts credentials; console and mobile share one
       // validation + persistence owner for OPENAI_MODEL_RESCUE.
       codexRescue: codexRescueSettingsSnapshot(catalog),
+      // The owner's backup brains, in order, and an outage they are covering.
+      brainBackups: (await import('../runtime/harness/brain-backups.js')).brainBackupsSnapshot(),
     };
   };
 
@@ -6445,6 +6447,16 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.json(await readModelScorecard(req.query.days === '30' ? 30 : 7));
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.patch('/api/settings/models/brain-backups', requireMobileSession, async (req, res) => {
+    const { persistBrainBackups, BrainBackupsSettingError } = await import('../runtime/harness/brain-backups.js');
+    try {
+      res.json({ brainBackups: persistBrainBackups(req.body) });
+    } catch (err) {
+      res.status(err instanceof BrainBackupsSettingError ? 400 : 500)
+        .json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
@@ -6676,6 +6688,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         // agent's pinned model (session-agent-model.ts).
         recordBrainChosenForSession(switchSessionId);
       }
+
+      // The owner chose a brain themselves: an outage card about the old one
+      // has nothing left to ask.
+      (await import('../runtime/harness/brain-backups.js')).closeBrainOutage('brain_changed');
 
       const resolvedBrain = resolveRoleModel('brain');
       const effectiveValue = effectiveBrainValue();

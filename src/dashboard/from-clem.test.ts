@@ -122,3 +122,25 @@ test('a report a workflow run sent the owner is hers to say as written, with its
   assert.ok(stream.covers.notificationIds.includes('fresh'));
   assert.ok(!stream.covers.notificationIds.includes('stale'), 'an old report stays in the inbox');
 });
+
+test('a brain-outage question answers yes or no through its own route, never through her wording', () => {
+  const outageAsk = notification('brain-outage-bo1-back', {
+    heartbeatId: 'brain-health', sourceTitle: 'Your brain', itemKey: 'bo1:back', brainOutageId: 'bo1', needsAttention: true,
+  }, { kind: 'system', title: 'Chosen model is answering again' });
+  const outageTell = notification('brain-outage-bo1-switched', {
+    heartbeatId: 'brain-health', sourceTitle: 'Your brain', itemKey: 'bo1:switched', brainOutageId: 'bo1', inboxOnly: true,
+  }, { kind: 'system', title: 'Chosen model stopped answering' });
+  const out = buildFromClem(input({
+    notifications: [outageAsk, outageTell],
+    asksOwner: (n) => n.metadata?.needsAttention === true,
+    voiced: () => ({ message: 'It is answering again. Switch back?', choices: ['Switch back', 'Keep the backup'] }),
+  }));
+  const ask = out.rows.find((row) => row.key === 'notif:brain-outage-bo1-back')!;
+  assert.deepEqual(ask.answer, { kind: 'brain_outage', outageId: 'bo1' });
+  assert.equal(ask.choices, undefined, 'the yes/no is the host\'s, so her wording cannot pick an outcome');
+  assert.equal(ask.say, 'It is answering again. Switch back?');
+  assert.equal(ask.heartbeatTitle, 'Your brain', 'a source outside the heartbeat list names itself');
+  const tell = out.rows.find((row) => row.key === 'notif:brain-outage-bo1-switched')!;
+  assert.equal(tell.asks, false);
+  assert.equal(tell.answer, undefined, 'telling asks nothing');
+});

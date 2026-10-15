@@ -2210,7 +2210,7 @@ export interface FromClemRow {
   text: string;
   detail?: string;
   voiceDigest: string;
-  answer?: { kind: 'words'; questionId: string } | { kind: 'yes_no'; planProposalId: string };
+  answer?: { kind: 'words'; questionId: string } | { kind: 'yes_no'; planProposalId: string } | { kind: 'brain_outage'; outageId: string };
   done?: { notificationId: string };
   /** A part of Clementine Clem offers to help set up, and where it lives. */
   setup?: { ability: string; place: string; placeName: string };

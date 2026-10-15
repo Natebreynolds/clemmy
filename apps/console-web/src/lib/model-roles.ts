@@ -15,6 +15,7 @@ import {
   getSettings,
   patchModelRole,
   patchJudgeFallback,
+  patchBrainBackups,
   setActiveBrain,
   type ActiveBrain,
   type ModelRolesSnapshot,
@@ -42,6 +43,7 @@ export const ROLE_WORDS = {
   writer: { title: 'Writes the final answer', hint: 'When a request gathers a lot of material, this model writes your reply from it. Short replies come from the model that does the work.' },
   judge: { title: 'Checks the work', hint: 'Reviews finished work before Clem calls it done.' },
   fallback: { title: 'Backup checker', hint: 'Used only when the checker cannot complete a review. A completed verdict is kept.' },
+  backups: { title: 'If it stops answering', hint: 'Backup models, tried in order. Clem switches every chat to the first one that answers, then tells you.' },
   // The memory words are the shared contract's, so the phone's Models card and
   // the Memory tab say exactly this.
   memory: { title: MEMORY_ROLE_WORDS.title, hint: MEMORY_ROLE_WORDS.explain },
@@ -207,6 +209,12 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     });
   const onJudgeFallback = (value: string) =>
     run('judge-fallback', () => patchJudgeFallback(judgeFallbackSelection(value)));
+  /** Set one place in the backup order; "none" ends the list there. */
+  const onBrainBackup = (slot: number, value: string) => run('brain-backups', () => {
+    const current = mr?.brainBackups?.modelIds ?? [];
+    const next = value === '__none__' ? current.slice(0, slot) : [...current.slice(0, slot), value, ...current.slice(slot + 1)];
+    return patchBrainBackups(next.filter((id, index) => next.indexOf(id) === index));
+  });
 
   return {
     settings: settings.data,
@@ -216,7 +224,7 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     mr,
     claudeAuth,
     busy, saved, error, claudeSignInFor,
-    run, refresh, onBrain, onRole, onJudgeFallback,
+    run, refresh, onBrain, onRole, onJudgeFallback, onBrainBackup,
     brainValue: mr ? currentBrainValue(mr) : '',
     brains: mr ? brainChoices(mr, claudeAuth) : [],
     workers: mr ? flatChoices(mr.roleOptions?.worker ?? mr.available) : [],

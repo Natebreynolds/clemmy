@@ -70,6 +70,7 @@ export async function handleFromClemReply(
     snoozePlan: (planProposalId) => { void snoozeHomeItem(`plan:${planProposalId}`, DEFAULT_SNOOZE_HOURS); },
     later: (rowKey, forever) => moveFromClemRowToLater(rowKey, Date.now(), forever),
     startTurn: (turn) => startFromClemTurn(turn),
+    resolveBrainOutage: async (outageId, choice) => (await import('./brain-outage.js')).resolveBrainOutage(outageId, choice),
   }, { ...(requestId ? { requestId } : {}), ...(seenDigest ? { seenDigest } : {}), ...(decision ? { decision } : {}),
     ...(choiceIndex !== undefined ? { choiceIndex } : {}) });
   return { status: 200, json: result };

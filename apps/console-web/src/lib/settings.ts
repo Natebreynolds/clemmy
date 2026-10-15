@@ -204,8 +204,23 @@ export type MemoryResolvedRole = ResolvedRole & {
    *  used-up plan, a provider backoff), with its end when known. */
   unavailable?: { problem: MemoryModelProblem; until?: string } | null;
 };
+export interface BrainOutage {
+  id: string;
+  downModelId: string;
+  standInModelId: string;
+  openedAt: number;
+  status: 'open' | 'recovered';
+  recoveredAt?: number;
+}
+/** The owner's backup brains, in order; absent on older daemons. */
+export interface BrainBackupsSetting {
+  modelIds: string[];
+  unavailable: string[];
+  outage: BrainOutage | null;
+}
 export interface ModelRolesSnapshot {
   judgeFallback?: JudgeFallbackSetting;
+  brainBackups?: BrainBackupsSetting;
   /** Whether the checker is independent of the work, whether it could be, and
    *  what an Automatic backup would use. Absent on older daemons. */
   checker?: CheckerFacts;
@@ -264,6 +279,9 @@ export interface JudgeFallbackSetting {
 export type JudgeFallbackSelection = Pick<JudgeFallbackSetting, 'mode' | 'modelId'>;
 export const patchJudgeFallback = (selection: JudgeFallbackSelection) =>
   patch<{ judgeFallback: JudgeFallbackSetting }>('/api/console/settings/models/judge-fallback', selection);
+
+export const patchBrainBackups = (modelIds: string[]) =>
+  patch<{ brainBackups: BrainBackupsSetting }>('/api/console/settings/models/brain-backups', { modelIds });
 
 export const getSettings = () => apiGet<SettingsSnapshot>('/api/console/settings');
 

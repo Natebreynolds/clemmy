@@ -204,6 +204,33 @@ test('a suggestion: do it approves it, with an instruction it becomes a conversa
   assert.equal((await replyToFromClem('plan:plan1', 'no thanks', run.all)).outcome, 'declined');
 });
 
+test('a brain-outage question: yes switches back, no keeps the backup, words with a new instruction become a conversation', async () => {
+  const { buildFromClem } = await import('./from-clem.js');
+  const outageStream = () => buildFromClem({
+    heartbeats: [], noticingProposals: [], planProposals: [],
+    notifications: [{ id: 'brain-outage-bo1-back', kind: 'system', title: 'The chosen model is answering again', body: 'Waiting on the owner: switch back?',
+      createdAt: '2026-10-15T08:00:00.000Z', read: false,
+      metadata: { heartbeatId: 'brain-health', itemKey: 'bo1:back', brainOutageId: 'bo1', needsAttention: true } }],
+    asksOwner: () => true,
+  });
+  const answers: string[] = [];
+  const outageDeps = (decision: { decision: string; instruction?: string }, resolved = true) => deps({
+    read: async () => outageStream(),
+    resolveBrainOutage: async (id, choice) => { answers.push(`${id}:${choice}`); return resolved; },
+  }, decision);
+  assert.equal((await replyToFromClem('notif:brain-outage-bo1-back', 'Yes, switch back', outageDeps({ decision: 'do_it' }).all, { decision: 'do_it' })).outcome, 'approved');
+  assert.equal((await replyToFromClem('notif:brain-outage-bo1-back', 'No, keep the backup', outageDeps({ decision: 'done' }).all, { decision: 'done' })).outcome, 'declined');
+  assert.deepEqual(answers, ['bo1:switch_back', 'bo1:stay']);
+  const later = outageDeps({ decision: 'not_now' });
+  assert.equal((await replyToFromClem('notif:brain-outage-bo1-back', 'ask me tomorrow', later.all)).outcome, 'later');
+  assert.ok(later.log.includes('later:notif:brain-outage-bo1-back'));
+  assert.equal(answers.length, 2, 'later decides nothing');
+  const other = outageDeps({ decision: 'do_it', instruction: 'switch to the Claude model instead' });
+  assert.equal((await replyToFromClem('notif:brain-outage-bo1-back', 'switch to the Claude model instead', other.all)).outcome, 'started');
+  assert.equal(answers.length, 2, 'a new instruction is hers to carry out in a turn');
+  assert.deepEqual(await replyToFromClem('notif:brain-outage-bo1-back', 'Yes', outageDeps({ decision: 'do_it' }, false).all, { decision: 'do_it' }), { outcome: 'gone' });
+});
+
 test('unclear words change nothing, and a row that is gone says so', async () => {
   const run = deps({}, { decision: 'unclear' });
   assert.deepEqual(await replyToFromClem('notif:cal', 'hmm', run.all), { outcome: 'unclear', decision: 'unclear' });

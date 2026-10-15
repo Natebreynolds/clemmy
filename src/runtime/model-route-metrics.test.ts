@@ -25,7 +25,7 @@ import {
   withModelRouteObserver,
   type ObservedModelRoute,
 } from './model-route-metrics.js';
-import { withModelFallback } from './harness/fallback-model.js';
+import { clearRateLimitedBrainsForTest, withModelFallback } from './harness/fallback-model.js';
 
 function metricsDb(): Database.Database {
   const db = new Database(':memory:');
@@ -715,6 +715,9 @@ test('a job reads the route that served it, and a fallback lane is a stand-in by
 // rather than preventing all existing tests from loading for a missing export.
 import * as authorMetrics from './model-route-metrics.js';
 import { RouterModelProvider } from './harness/router-model.js';
+import { __brainBackupsTest__, BRAIN_BACKUPS_ENV } from './harness/brain-backups.js';
+import os from 'node:os';
+import path from 'node:path';
 
 type CapturedResponseAuthor = Readonly<{ model: Model; modelId: string; provider: string; providerId?: string }>;
 function completedAuthor(response: unknown): CapturedResponseAuthor | undefined {
@@ -744,14 +747,21 @@ async function collectAuthorStream(model: Model, request = requestWithSentinel()
 }
 
 test('completed response author: actual router primary failure retains the exact rescue leaf on both transports', async () => {
-  const keys = ['AUTH_MODE', 'MODEL_ROUTING_MODE', 'CLEMMY_BRAIN_FALLOVER', 'CLAUDE_MODEL',
+  const keys = ['AUTH_MODE', 'MODEL_ROUTING_MODE', 'CLAUDE_MODEL', BRAIN_BACKUPS_ENV,
     'BYO_MODEL_BASE_URL', 'BYO_MODEL_ID', 'BYO_MODEL_API_KEY', 'BYO_PROVIDERS'] as const;
   const before = new Map(keys.map(key => [key, process.env[key]]));
   for (const key of keys) delete process.env[key];
+  // The owner listed the Claude model as the brain's backup.
   Object.assign(process.env, { AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: 'off',
-    CLEMMY_BRAIN_FALLOVER: 'on', CLAUDE_MODEL: 'claude-sonnet-5' });
+    CLAUDE_MODEL: 'claude-sonnet-5', [BRAIN_BACKUPS_ENV]: JSON.stringify(['claude-sonnet-5']) });
+  __brainBackupsTest__.reset(path.join(os.tmpdir(), `author-route-outage-${process.pid}.json`));
+  __brainBackupsTest__.setOptions(() => [{ id: 'claude_oauth', value: 'claude_oauth:claude-sonnet-5', label: 'Claude — Sonnet 5', available: true, modelId: 'claude-sonnet-5' }]);
   try {
     for (const stream of [false, true]) {
+      // Each transport starts with the brain unbenched and no outage counted.
+      clearRateLimitedBrainsForTest();
+      __brainBackupsTest__.reset(path.join(os.tmpdir(), `author-route-outage-${process.pid}.json`));
+      __brainBackupsTest__.setOptions(() => [{ id: 'claude_oauth', value: 'claude_oauth:claude-sonnet-5', label: 'Claude — Sonnet 5', available: true, modelId: 'claude-sonnet-5' }]);
       const calls: string[] = [];
       const response = authorResponse(`author-router-${stream}`);
       const bytesBefore = JSON.stringify(response);
@@ -770,9 +780,10 @@ test('completed response author: actual router primary failure retains the exact
       const router = new RouterModelProvider({
         codex: { getModel: () => primary },
         claude: { getModel(id) { rescueModelId = id; return rescue; } },
-        resolveEffectiveProvider: () => 'codex', codexAvailable: () => true, claudeAvailable: () => true,
+        resolveEffectiveProvider: (id) => (id.startsWith('claude') ? 'claude' : 'codex'), codexAvailable: () => true, claudeAvailable: () => true,
       });
-      const routed = router.getModel(stream ? 'gpt-5.6-luna' : 'gpt-5.6-sol');
+      // The default model is the brain; its backup is the owner's listed one.
+      const routed = router.getModel();
       const routes: ObservedModelRoute[] = [];
       if (stream) {
         const events = await withModelRouteObserver(routes, () => collectAuthorStream(routed));
@@ -798,6 +809,7 @@ test('completed response author: actual router primary failure retains the exact
       assert.deepEqual(calls, ['primary', 'rescue', 'rescue']);
     }
   } finally {
+    __brainBackupsTest__.reset();
     for (const [key, value] of before) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }

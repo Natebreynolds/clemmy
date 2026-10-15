@@ -1,4 +1,5 @@
 import { debateBrainsAvailable } from './judge-family.js';
+import { brainBackupModelIds } from './brain-backups.js';
 import {
   CLAUDE_MODEL_PRESETS,
   DEFAULT_CODEX_MODEL,
@@ -20,6 +21,7 @@ import { resolveProvider, type ModelProviderClass } from './model-wire-registry.
 import {
   captureByoRoutingSnapshot,
   getByoProviderSnapshotsFromRoutingSnapshot,
+  resolveEffectiveProviderForModel,
   resolveEffectiveProviderForModelFromSnapshot,
   type ByoProviderSnapshot,
   type ByoRoutingSnapshot,
@@ -217,20 +219,6 @@ export type BrainProviderClass = 'codex' | 'claude' | 'byo';
  * mid-run, where in-stream fallover can't fire (FallbackModel only switches
  * before the first byte). `all_in` mode returns [] (one provider, nowhere to go).
  */
-/** The model id a fallover-to-codex should run on. Normally MODELS.primary —
- *  but when that slot is repurposed to a BYO id (OPENAI_MODEL_PRIMARY=glm-*),
- *  it routes to BYO, the mis-route guard below drops the entry, and Codex is
- *  SILENTLY excluded from the chain even though its OAuth is connected (the
- *  claude→glm-only recoveries, 2026-07-02 daemon.log). Fall back to the
- *  canonical Codex default so a connected Codex always stays reachable.
- *  Mirrors codexSafePrimary()/codexSafeFast() in model-roles.ts. */
-function falloverCodexModelId(): string {
-  try {
-    if (resolveProvider(MODELS.primary) === 'codex') return MODELS.primary;
-  } catch { /* unknown id → use the canonical default */ }
-  return DEFAULT_CODEX_MODEL;
-}
-
 /** Commit-safe worker rescue must retain a small worker role, independent of
  * foreground model settings. all_in preserves subscription isolation. */
 export function falloverWorkerModelIds(current: BrainProviderClass): Array<{ provider: BrainProviderClass; modelId: string }> {
@@ -241,27 +229,21 @@ export function falloverWorkerModelIds(current: BrainProviderClass): Array<{ pro
   return out;
 }
 
-export function falloverBrainModelIds(current: BrainProviderClass): Array<{ provider: BrainProviderClass; modelId: string }> {
-  if (getModelRoutingMode() === 'all_in') return [];
+/** The owner's backup brains for a brain on `current` (model `currentModelId`
+ *  when known), in their order, without that model. Only listed models are
+ *  ever a brain's backup; an empty list means none. */
+export function falloverBrainModelIds(
+  current: BrainProviderClass,
+  currentModelId?: string,
+): Array<{ provider: BrainProviderClass; modelId: string }> {
+  void current;
   const out: Array<{ provider: BrainProviderClass; modelId: string }> = [];
-  if (current !== 'codex' && codexModelsAvailable()) out.push({ provider: 'codex', modelId: falloverCodexModelId() });
-  if (current !== 'claude' && claudeModelsAvailable()) out.push({ provider: 'claude', modelId: getClaudeBrainModel() });
-  const byo = getByoBackendConfig();
-  if (current !== 'byo' && byo.configured) out.push({ provider: 'byo', modelId: byo.primaryId || MODELS.primary });
-  // Correctness guard (backstop): every entry's modelId must actually ROUTE to
-  // its claimed provider, and no two entries may collapse to the same wire
-  // provider — a mis-routed entry would be a redundant same-brain "fallover"
-  // that re-hits the failing provider. The codex entry is already repurpose-safe
-  // via falloverCodexModelId(); this guard still protects the other slots.
-  const seen = new Set<string>([current]);
-  return out.filter((e) => {
-    let resolved: string;
-    try { resolved = resolveProvider(e.modelId); } catch { return false; }
-    if (resolved !== e.provider) return false; // modelId doesn't actually route to its provider
-    if (seen.has(resolved)) return false;       // already covered by an earlier (or current) brain
-    seen.add(resolved);
-    return true;
-  });
+  for (const modelId of brainBackupModelIds(currentModelId)) {
+    let provider: BrainProviderClass;
+    try { provider = resolveEffectiveProviderForModel(modelId) as BrainProviderClass; } catch { continue; }
+    out.push({ provider, modelId });
+  }
+  return out;
 }
 
 export function claudeModelsAvailable(): boolean {

@@ -93,6 +93,16 @@ export function FromClemPane({
         </Button>
       ));
     }
+    if (row.answer?.kind === 'brain_outage') {
+      return [
+        <Button key="yes" size="sm" className="h-8 px-3 text-small" disabled={busy} onClick={() => reply(row, 'Yes, switch back', 'do_it')}>
+          {state.busy === 'answer' ? 'Sending…' : 'Yes'}
+        </Button>,
+        <Button key="no" size="sm" variant="secondary" className="h-8 px-3 text-small" disabled={busy} onClick={() => reply(row, 'No, keep the backup', 'done')}>
+          No
+        </Button>,
+      ];
+    }
     if (row.answer?.kind === 'yes_no') {
       const id = row.answer.planProposalId;
       return [

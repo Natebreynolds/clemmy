@@ -112,6 +112,7 @@ import {
 import { sessionAgentFields, sessionProjectFields } from './session-composition.js';
 import { turnFactsFor } from './turn-facts.js';
 import { projectPendingApprovalUserDependency } from './approval-registry.js';
+import { brainBackupsConfigured } from './brain-backups.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkUnparseableToolCall } from './claude-agent-brain.js';
 import { buildContinueInput } from './continue-directive.js';
 import { ClaudeSdkCapacityExhaustedError, ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
@@ -2269,7 +2270,7 @@ export async function respondViaHarness(
             const usedModel = modelForRun ?? resolveRoleModel('brain').modelId;
             const currentBrain = providerFor(usedModel) as BrainProviderClass | undefined;
             if (!currentBrain) throw new Error(`Could not resolve provider for ${usedModel}.`);
-            const next = falloverBrainModelIds(currentBrain)[0];
+            const next = falloverBrainModelIds(currentBrain, usedModel)[0];
             if (next) {
               bridgeLogger.warn({ surface, currentBrain, recoveryModel: next.modelId },
                 'harness brain exhausted structured-decision retries — re-running the turn once on the next brain instead of shipping the apology');
@@ -2990,15 +2991,16 @@ function blockedWholeTurnRecoveryResponse(
 }
 
 function chatBrainFalloverEnabled(): boolean {
-  // Default ON (kill-switch CLEMMY_BRAIN_FALLOVER=off) — parity with the router +
-  // workflow lanes. A terminal Claude-brain failure (overload, hang, expired auth)
-  // can re-run on a connected non-Claude brain only when the per-attempt write
-  // ledger proves that no external action occurred.
-  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+  // Whole-turn recovery re-runs a turn that died before a safe answer, only
+  // when the per-attempt write ledger proves that no external action occurred.
+  // It re-runs on the owner's next listed backup, or on the same brain when
+  // none is listed; a listed backup turns it on even under the old switch.
+  return brainBackupsConfigured()
+    || (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
 function recoveryHarnessModelAfterClaudeFailure(): string | undefined {
-  return falloverBrainModelIds('claude')[0]?.modelId;
+  return falloverBrainModelIds('claude', resolveRoleModel('brain').modelId)[0]?.modelId;
 }
 
 /**
@@ -3224,9 +3226,10 @@ export function buildChatFalloverWiring(opts: {
         },
       };
     }
-    const currentProvider = providerFor(resolveRoleModel('brain').modelId) as BrainProviderClass | undefined;
+    const currentModel = resolveRoleModel('brain').modelId;
+    const currentProvider = providerFor(currentModel) as BrainProviderClass | undefined;
     if (!currentProvider) return {};
-    const nextBrains = falloverBrainModelIds(currentProvider);
+    const nextBrains = falloverBrainModelIds(currentProvider, currentModel);
     if (nextBrains.length === 0) return {};
     return {
       falloverModelIds: nextBrains.map((b) => b.modelId),

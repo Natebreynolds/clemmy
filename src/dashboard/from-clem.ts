@@ -38,7 +38,10 @@ export interface FromClemRow {
   /** Changes whenever what she would be speaking about changes. */
   voiceDigest: string;
   /** How the owner answers, through the route that already settles it. */
-  answer?: { kind: 'words'; questionId: string } | { kind: 'yes_no'; planProposalId: string };
+  answer?: { kind: 'words'; questionId: string } | { kind: 'yes_no'; planProposalId: string }
+    /** The chosen brain answers again after an outage: yes switches back, no
+     *  keeps the backup as the brain. */
+    | { kind: 'brain_outage'; outageId: string };
   /** Marks a finding seen; its heartbeat counts it acknowledged. */
   done?: { notificationId: string };
   /** A part of Clementine Clem offers to help set up, and where it lives. */
@@ -175,11 +178,16 @@ export function buildFromClem(input: FromClemInput): FromClem {
     const heartbeat = heartbeatOf(notification);
     if (!heartbeat) continue;
     const ref = refOf(notification.metadata as Record<string, unknown> | undefined);
+    const meta = notification.metadata ?? {};
+    const asks = input.asksOwner(notification);
+    const outageId = str(meta.brainOutageId).trim();
     rows.push({
-      key: `notif:${notification.id}`, heartbeat, heartbeatTitle: title(heartbeat),
-      at: notification.createdAt, asks: input.asksOwner(notification), text: notification.title,
+      key: `notif:${notification.id}`, heartbeat,
+      heartbeatTitle: titleOf.get(heartbeat) ?? (str(meta.sourceTitle).trim() || heartbeat),
+      at: notification.createdAt, asks, text: notification.title,
       ...(notification.body.trim() ? { detail: notification.body.trim() } : {}),
       done: { notificationId: notification.id },
+      ...(asks && outageId ? { answer: { kind: 'brain_outage' as const, outageId } } : {}),
       ...(ref ? { ref } : {}),
     });
     covers.notificationIds.push(notification.id);
@@ -216,7 +224,9 @@ export function buildFromClem(input: FromClemInput): FromClem {
     const said = input.voiced?.(row.key, voiceDigest);
     return { ...row, voiceDigest,
       ...(said && !row.authored ? { say: said.message } : {}),
-      ...(said?.choices?.length && row.asks ? { choices: said.choices } : {}) };
+      // A brain-outage ask keeps its yes/no: two outcomes the host carries
+      // out exactly, never read back from her wording.
+      ...(said?.choices?.length && row.asks && row.answer?.kind !== 'brain_outage' ? { choices: said.choices } : {}) };
   });
   // A check that failed says when it looked, never what went wrong: the
   // reason is the heartbeat's own page's to explain, in its own words, and a

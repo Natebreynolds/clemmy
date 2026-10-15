@@ -16,13 +16,11 @@
  * than whichever brain happened to be active.
  */
 import type { Model, ModelProvider, ModelRequest } from '@openai/agents-core';
+import { Agent, Runner } from '@openai/agents';
 import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
 import {
   assertUnambiguousModelRouting,
-  configuredByoProvidersForModel,
-  getByoProviders,
-  providerToBackendConfig,
   resolveByoProviderForModel,
   resolveDeclaredByoProviderForModel,
   resolveEffectiveProviderForModel,
@@ -34,6 +32,9 @@ import { withModelFallback, type FallbackTarget } from './fallback-model.js';
 import { isPinnedWorkerModel } from './pinned-worker-model.js';
 import { maybeWrapWithFaultInjection } from './fault-inject.js';
 import { harnessRunContextStorage } from './brackets.js';
+import { brainBackupModelIds } from './brain-backups.js';
+import { resolvedBrainForSession } from './model-roles.js';
+import { modelUsageAttributionStorage } from '../usage-log.js';
 import type { ByoBackendConfig } from '../../config.js';
 import {
   DEFAULT_CODEX_FAST_MODEL,
@@ -41,7 +42,6 @@ import {
   getActiveAuthMode,
   getByoBackendConfig,
   getClaudeBrainModel,
-  getCodexRescueModelSelection,
   getModelRoutingMode,
   getRuntimeEnv,
   MODELS,
@@ -78,14 +78,9 @@ export interface RouterModelProviderOptions {
   claudeAvailable?: () => boolean;
 }
 
-/** Cross-provider brain fallover is an explicit recovery mode. Default off:
- *  each selected provider owns its request unless the operator opts into a
- *  compatible provider switch. */
+/** Worker rescue onto the small subscription models. The brain's backups are
+ *  the owner's list (brain-backups.ts), never this switch. */
 function brainFalloverEnabled(): boolean {
-  // Default ON (kill-switch CLEMMY_BRAIN_FALLOVER=off). A connected fallback brain
-  // that only works after setting an undocumented env var is a rollout flag on
-  // validated behavior — cross-brain fallover IS the default now, so an expired /
-  // overloaded / hung brain routes to the next connected one instead of failing.
   return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 /** First-byte fallover budget — set BELOW the loop's stall watchdog (modelFirstByteStallMs,
@@ -248,6 +243,7 @@ export class RouterModelProvider implements ModelProvider {
     const requested = typeof modelName === 'string' && modelName.trim().length > 0 ? modelName.trim() : MODELS.primary;
     const runContext = harnessRunContextStorage.getStore();
     const sessionId = runContext?.sessionId;
+    const backups = exactWorker ? null : this.brainBackupTargets(modelName, primary.label);
     const primarySource = routeSourceForModelName(modelName);
     const primaryMetricsContext: ModelRouteMetricsContext = {
       sessionId,
@@ -283,11 +279,11 @@ export class RouterModelProvider implements ModelProvider {
         },
       }),
     }));
+    const workerRescue = !exactWorker && backups === null && brainFalloverEnabled() && workerScoped(runContext);
     let resolved: Model;
-    if (exactWorker || !brainFalloverEnabled()) {
-      // The kill-switch disables cross-brain switching, not the completion
-      // invariant. Keep the lone primary behind the same graph boundary so a
-      // reasoning-only completion becomes a typed failure instead of an
+    if (exactWorker || (!backups?.length && !workerRescue)) {
+      // No backup: the lone primary still sits behind the same graph boundary
+      // so a reasoning-only completion becomes a typed failure instead of an
       // unbounded Agents SDK run-again loop.
       resolved = withModelFallback(instrumentTargets([{
         label: primary.label,
@@ -295,14 +291,16 @@ export class RouterModelProvider implements ModelProvider {
         model: primary.label,
         getModel: () => primary.model,
         ...(primary.provider === 'claude' ? { supportsRequest: claudeHarnessSupportsRequest } : {}),
-      }]));
+      }]), backups ? { brainLabel: primary.label, sessionId } : {});
     } else {
-      // Wrap in a cross-provider fallover chain (primary -> other connected brains)
-      // so an overloaded/rate-limited/HUNG provider switches brains instead of
-      // dead-ending. falloverOn429: a 429 on one provider is irrelevant to the
-      // next, so switch. firstByteTimeoutMs: a silent provider falls over before
-      // the loop's stall watchdog fires.
-      const chain = instrumentTargets(this.buildBrainChain(primary));
+      // A brain request falls over to the owner's backups, in their order; a
+      // worker keeps its role on the small subscription models. falloverOn429:
+      // a 429 on one provider is irrelevant to the next, so switch.
+      // firstByteTimeoutMs: a silent provider falls over before the loop's
+      // stall watchdog fires.
+      const chain = instrumentTargets(backups?.length
+        ? [this.primaryTarget(primary), ...backups]
+        : this.workerChain(primary));
       // Correlate a fallover to the run that triggered it. getModel runs inside
       // the harness run ALS (the loop wraps runner.run), so the active sessionId
       // is available here; workflow step sessions encode the run id in the id.
@@ -321,6 +319,7 @@ export class RouterModelProvider implements ModelProvider {
         sessionId,
         workflowRunId: workflowRunIdFromSessionId(sessionId),
         runSilencedLabels,
+        ...(backups ? { brainLabel: primary.label } : {}),
       });
     }
     // Preserve the router's existing read-only introspection surface without
@@ -366,163 +365,100 @@ export class RouterModelProvider implements ModelProvider {
     }
   }
 
-  /** Build the cross-provider fallover chain: the primary first, then every OTHER
-   *  connected brain (deduped by provider), most-reliable first. Lazy targets —
-   *  a fallback brain is only constructed if reached. */
-  /**
-   * Every OTHER configured BYO backend, as a rescue for this primary. The chain
-   * used to treat all BYO backends as one bucket — appended only when the
-   * primary was NOT BYO — so a grok primary could never fall over to GLM even
-   * with both backends live in memory (2026-09-02). The primary's own provider
-   * is excluded; the user's pinned choice is never swapped by this list, it
-   * only gains somewhere to go when it dies. Lazy: an unreached sibling is
-   * never constructed. Capped so six connected providers do not build a
-   * six-deep chain.
-   */
-  private byoSiblingTargets(primary: { provider: BrainProvider; label: string }): FallbackTarget[] {
-    if ((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER_BYO_SIBLINGS', 'on') ?? 'on').trim().toLowerCase() === 'off') return [];
-    let owners = new Set<string>();
-    try {
-      owners = new Set(configuredByoProvidersForModel(primary.label).map((provider) => provider.id));
-    } catch {
-      // An identity collision means the primary's owner is ambiguous; fall
-      // back to excluding by base URL below.
-    }
-    let primaryBaseUrl = '';
-    try {
-      primaryBaseUrl = (resolveByoProviderForModel(primary.label)?.baseURL ?? '').trim().toLowerCase();
-    } catch { /* no resolvable primary backend */ }
-    const targets: FallbackTarget[] = [];
-    for (const provider of getByoProviders()) {
-      if (targets.length >= 2) break;
-      if (owners.has(provider.id)) continue;
-      if (primaryBaseUrl && provider.baseURL.trim().toLowerCase() === primaryBaseUrl) continue;
-      const modelId = provider.modelIds[0];
-      if (!modelId || modelId === primary.label) continue;
-      const backend = providerToBackendConfig(provider);
-      if (!backend.configured) continue;
-      targets.push({
-        label: `byo:${provider.id}:${modelId}`,
-        provider: 'byo',
-        model: modelId,
-        getModel: () => this.resolveByoModel(modelId, backend),
-      });
-    }
-    return targets;
+  /** The model, alone: no backup, no rescue. The outage check asks a down
+   *  brain through this, so a backup can never answer for it. */
+  getModelAlone(modelName: string): Model {
+    const primary = this.resolvePrimary(modelName);
+    return withModelFallback([this.primaryTarget(primary)]);
   }
 
-  private buildBrainChain(primary: { model: Model; provider: BrainProvider; label: string }): FallbackTarget[] {
-    const chain: FallbackTarget[] = [{
+  private primaryTarget(primary: { model: Model; provider: BrainProvider; label: string }): FallbackTarget {
+    return {
       label: primary.label,
       provider: primary.provider,
       model: primary.label,
       getModel: () => primary.model,
       ...(primary.provider === 'claude' ? { supportsRequest: claudeHarnessSupportsRequest } : {}),
-    }];
-    // all_in keeps BYO primary — but a CONVERSATION must complete (owner
-    // question, 2026-07-24: kimi rate-limited and the turn died with "go
-    // change your settings" instead of falling back). Connected subscription
-    // brains join as LAST-RESORT rescue targets for the ORCHESTRATOR surface
-    // only: worker fan-outs stay isolated (guardrailScopeId set), so a 429
-    // storm across 100 workers can never silently drain a subscription — a
-    // single user-facing turn rescuing onto Codex/Claude is exactly what the
-    // user wants instead of an error card. No connected subscription → the
-    // original isolation holds by construction.
-    if (getModelRoutingMode() === 'all_in') {
-      const context = harnessRunContextStorage.getStore();
-      const workerScope = context?.workerScope === true || Boolean(context?.guardrailScopeId);
-      if (workerScope) return chain;
-      // Sibling BYO backends first: all_in means subscriptions are last resort.
-      if (primary.provider === 'byo') chain.push(...this.byoSiblingTargets(primary));
-      if (primary.provider !== 'codex' && this.codexAvailable()) {
-        const model = codexRescueModelId();
-        chain.push({
-          label: 'codex:rescue',
-          provider: 'codex',
-          model,
-          getModel: () => this.codex.getModel(model),
-        });
-      }
-      if (primary.provider !== 'claude' && this.claudeAvailable()) {
-        const model = getClaudeBrainModel();
-        chain.push({
-          label: 'claude:rescue',
-          provider: 'claude',
-          model,
-          getModel: () => this.claude.getModel(model),
-          supportsRequest: claudeHarnessSupportsRequest,
-        });
-      }
-      return chain;
-    }
-    // Workers retain their role on provider failure. Foreground brain settings
-    // (and arbitrary BYO siblings of unknown size) must not silently promote a
-    // small delegated task to a large model. Explicit primary pins stay intact.
-    if (harnessRunContextStorage.getStore()?.workerScope === true) {
-      if (primary.provider !== 'codex' && this.codexAvailable()) {
-        chain.push({ label: DEFAULT_CODEX_FAST_MODEL, provider: 'codex', model: DEFAULT_CODEX_FAST_MODEL,
-          getModel: () => this.codex.getModel(DEFAULT_CODEX_FAST_MODEL) });
-      }
-      if (primary.provider !== 'claude' && this.claudeAvailable()) {
-        chain.push({ label: DEFAULT_CLAUDE_FAST_MODEL, provider: 'claude', model: DEFAULT_CLAUDE_FAST_MODEL,
-          getModel: () => this.claude.getModel(DEFAULT_CLAUDE_FAST_MODEL, { allowOverloadFallback: false }),
-          supportsRequest: claudeHarnessSupportsRequest });
-      }
-      return chain;
-    }
-    // Codex (OpenAI) — generally the steadiest fallback.
+    };
+  }
+
+  /**
+   * The owner's backup brains for a brain request, in their order; null when
+   * this is not a brain request. A brain request is one the chosen brain
+   * serves — the default model, the brain of the turn's conversation, or a
+   * brain in an outage — outside a worker and outside a background job (a
+   * memory job keeps waiting for its own model). Lazy: an unreached backup is
+   * never built.
+   */
+  private brainBackupTargets(modelName: string | undefined, primaryLabel: string): FallbackTarget[] | null {
+    const runContext = harnessRunContextStorage.getStore();
+    if (workerScoped(runContext)) return null;
+    if (modelUsageAttributionStorage.getStore()?.usageJobId) return null;
+    const explicit = typeof modelName === 'string' && modelName.trim().length > 0;
+    if (explicit && !isBrainModel(primaryLabel, runContext?.sessionId)) return null;
+    return brainBackupModelIds(primaryLabel).map((modelId) => ({
+      label: modelId,
+      provider: resolveEffectiveProviderSafe(this.resolveEffectiveProvider, modelId),
+      model: modelId,
+      getModel: () => this.resolvePrimary(modelId).model,
+      ...(resolveEffectiveProviderSafe(this.resolveEffectiveProvider, modelId) === 'claude'
+        ? { supportsRequest: claudeHarnessSupportsRequest } : {}),
+    }));
+  }
+
+  /** Workers retain their role on provider failure. Foreground brain settings
+   *  must not silently promote a small delegated task to a large model, and
+   *  all_in keeps a worker fan-out off the subscriptions entirely. */
+  private workerChain(primary: { model: Model; provider: BrainProvider; label: string }): FallbackTarget[] {
+    const chain = [this.primaryTarget(primary)];
+    if (getModelRoutingMode() === 'all_in') return chain;
+    if (harnessRunContextStorage.getStore()?.workerScope !== true) return chain;
     if (primary.provider !== 'codex' && this.codexAvailable()) {
-      chain.push({
-        label: 'codex',
-        provider: 'codex',
-        model: MODELS.primary,
-        getModel: () => this.codex.getModel(MODELS.primary),
-      });
+      chain.push({ label: DEFAULT_CODEX_FAST_MODEL, provider: 'codex', model: DEFAULT_CODEX_FAST_MODEL,
+        getModel: () => this.codex.getModel(DEFAULT_CODEX_FAST_MODEL) });
     }
-    // Claude subscription.
     if (primary.provider !== 'claude' && this.claudeAvailable()) {
-      const model = getClaudeBrainModel();
-      chain.push({
-        label: 'claude',
-        provider: 'claude',
-        model,
-        getModel: () => this.claude.getModel(model),
-        supportsRequest: claudeHarnessSupportsRequest,
-      });
+      chain.push({ label: DEFAULT_CLAUDE_FAST_MODEL, provider: 'claude', model: DEFAULT_CLAUDE_FAST_MODEL,
+        getModel: () => this.claude.getModel(DEFAULT_CLAUDE_FAST_MODEL, { allowOverloadFallback: false }),
+        supportsRequest: claudeHarnessSupportsRequest });
     }
-    // The configured BYO/OpenAI-compatible backend (GLM/DeepSeek/…), if it isn't
-    // already the primary.
-    const byo = getByoBackendConfig();
-    if (primary.provider !== 'byo' && byo.configured) {
-      const model = byo.primaryId || MODELS.primary;
-      chain.push({
-        label: `byo:${byo.primaryId || 'default'}`,
-        provider: 'byo',
-        model,
-        getModel: () => this.resolveByoModel(model, byo),
-      });
-    }
-    // A BYO primary gets its sibling BYO backends as rescues too.
-    if (primary.provider === 'byo') chain.push(...this.byoSiblingTargets(primary));
     return chain;
   }
 }
 
-/** The settings write path only accepts exact Codex catalog ids. Keep a final
- * registry check here too for hand-edited env files; an invalid explicit value
- * falls back to the legacy primary route rather than changing provider by name
- * or display-label heuristics. */
-function codexRescueModelId(): string {
-  const selection = getCodexRescueModelSelection(resolveProvider);
-  if (!selection.configured) return selection.modelId;
+function workerScoped(context: ReturnType<typeof harnessRunContextStorage.getStore>): boolean {
+  return context?.workerScope === true || Boolean(context?.guardrailScopeId);
+}
+
+/** The brain this conversation is served on (its pin, else the chosen brain). */
+function isBrainModel(label: string, sessionId?: string): boolean {
   try {
-    if (resolveProvider(selection.modelId) === 'codex') return selection.modelId;
+    return resolvedBrainForSession(sessionId).modelId === label;
   } catch {
-    // Fall through to the inherited legacy route.
+    return false;
   }
-  logger.warn({ configuredModel: selection.modelId, inheritedModel: selection.inheritedModelId },
-    'ignoring non-Codex rescue model');
-  return selection.inheritedModelId;
+}
+
+function resolveEffectiveProviderSafe(resolve: (modelId: string) => BrainProvider, modelId: string): BrainProvider {
+  try { return resolve(modelId); } catch { return 'byo'; }
+}
+
+/** The outage check: one short question to exactly the down model. */
+export async function probeBrainModel(modelId: string): Promise<void> {
+  const agent = new Agent({
+    name: 'BrainCheck',
+    model: new RouterModelProvider().getModelAlone(modelId),
+    modelSettings: { maxTokens: 64 },
+    instructions: 'Reply with the word OK.',
+    tools: [],
+  });
+  const result = await modelUsageAttributionStorage.run(
+    { sessionId: 'brain-check', sourceUserSeq: 0, role: 'brain', usageJobId: `brain-check:${modelId}` },
+    () => new Runner({ workflowName: 'clementine-brain-check' })
+      .run(agent, 'Are you there?', { maxTurns: 1, signal: AbortSignal.timeout(90_000) }),
+  );
+  const answer = (result as { finalOutput?: unknown }).finalOutput;
+  if (typeof answer !== 'string' || answer.trim().length === 0) throw new Error('no answer');
 }
 
 function routeSourceForModelName(modelName?: string): ModelRouteDecisionSource {

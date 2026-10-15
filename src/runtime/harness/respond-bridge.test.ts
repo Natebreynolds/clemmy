@@ -109,6 +109,7 @@ const { finalizePreparedWorkflowDispatchForSource } = await import('./loop.js');
 const runtimeConfig = await import('../../config.js');
 // eslint-disable-next-line import/first
 const acceptedCallAuthority = await import('./accepted-turn-call-authority.js');
+const { __brainBackupsTest__: brainBackupsTest } = await import('./brain-backups.js');
 // eslint-disable-next-line import/first
 // eslint-disable-next-line import/first
 const {
@@ -382,6 +383,8 @@ beforeEach(() => {
   delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
   delete process.env.CLEMMY_BRAIN_FALLOVER;
+  delete process.env.CLEMMY_BRAIN_BACKUPS;
+  brainBackupsTest.setOptions(null);
   delete process.env.CLEMMY_CHAT_AUTO_RESUME;
   delete process.env.MODEL_ROUTING_MODE;
   delete process.env.BYO_MODEL_BASE_URL;
@@ -3495,6 +3498,8 @@ test('legacy standalone Claude reducer: fallover forces a non-Claude host model 
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  // The owner listed the BYO model as the brain's backup.
+  process.env.CLEMMY_BRAIN_BACKUPS = JSON.stringify(['glm-bridge-fallback']);
   const oldByoUrl = process.env.BYO_MODEL_BASE_URL;
   const oldByoKey = process.env.BYO_MODEL_API_KEY;
   const oldByoId = process.env.BYO_MODEL_ID;
@@ -5227,8 +5232,19 @@ test('isChatBrainFalloverEligible: ANY genuine Claude-brain failure switches bra
   }
 });
 
+/** The owner listed one connected backup brain (catalog availability pinned,
+ *  so other tests' sign-in fixtures cannot change it). */
+async function listBackupBrain(modelId: string): Promise<void> {
+  process.env.CLEMMY_BRAIN_BACKUPS = JSON.stringify([modelId]);
+  (await import('./brain-backups.js')).__brainBackupsTest__.setOptions(() => [
+    { id: 'claude_oauth', value: `claude_oauth:${modelId}`, label: modelId, available: true, modelId },
+  ]);
+}
+
 test('parse-exhaustion completion re-runs ONCE on the next brain instead of shipping the apology', async () => {
   process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  // The owner listed the connected Claude model as the brain's backup.
+  await listBackupBrain((await import('../../config.js')).getClaudeBrainModel());
   // Seed a connected Claude so falloverBrainModelIds('codex') has a target
   // (the harness brain under AUTH_MODE=api_key resolves to the codex class).
   const { mkdirSync, writeFileSync } = await import('node:fs');
@@ -5487,6 +5503,7 @@ test('awaiting_user_input surfaces THE QUESTION (+ numbered options), never the 
 
 test('parse-exhaustion recovery is GATED on external writes — a run that committed a write ships the honest completion, never a blind re-run', async () => {
   process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  await listBackupBrain((await import('../../config.js')).getClaudeBrainModel());
   // The invariant (mirror of loop.ts step-boundary canSwitch): only rerun
   // across brains when the external_write count did not increase during the
   // run. If anything was sent/updated/created, re-driving the turn on another

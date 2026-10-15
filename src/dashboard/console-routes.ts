@@ -505,6 +505,8 @@ const CONSOLE_PROCESS_IDENTITY = Object.freeze({
 
 /** The xAI OpenAI-compatible endpoint the OAuth grant is minted against. */
 const XAI_BASE_URL = 'https://api.x.ai/v1';
+import { activeBrainClass, switchActiveBrain } from './active-brain-switch.js';
+import { BrainBackupsSettingError, brainBackupsSnapshot, closeBrainOutage, persistBrainBackups } from '../runtime/harness/brain-backups.js';
 import { resolveRoleModel, readDurableBindings, pinSessionBrain } from '../runtime/harness/model-roles.js';
 import { BrainSelectionError, CODEX_BRAIN_SLOTS, codexBrainSlotUpdates, brainSelectionReceipt, type CodexBrainSlot } from '../runtime/harness/brain-selection.js';
 import { memoryRoleSettingsView } from '../memory/memory-model-route.js';
@@ -8978,6 +8980,8 @@ export function registerConsoleRoutes(
       available: catalog.available,
       roleOptions: catalog.roleOptions,
       judgeFallback: judgeFallbackSettingsSnapshot(catalog),
+      // The owner's backup brains, in order, and an outage they are covering.
+      brainBackups: brainBackupsSnapshot(),
       // Whether the checker is independent of the work, whether it could be,
       // and what an Automatic backup would really use.
       checker: checkerSettingsFacts(),
@@ -16722,158 +16726,20 @@ export function registerConsoleRoutes(
   // stranded on an unusable brain nor silently pay-per-token billed.
   app.patch('/api/console/settings/active-brain', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    try {
-      const raw = typeof req.body?.brain === 'string' ? req.body.brain : '';
-      const brain = raw === 'claude_oauth' ? 'claude_oauth' : raw === 'codex_oauth' ? 'codex_oauth' : raw === 'api_key' ? 'api_key' : '';
-      if (!brain) { res.status(400).json({ error: 'brain must be "codex_oauth", "claude_oauth", or "api_key" (a BYO model).' }); return; }
-      // Optional: which SPECIFIC connected BYO model orchestrates (so any provider's
-      // model — e.g. a Together AI model in an extra slot — can be the brain, not
-      // just the default slot). The router routes this id to its owning provider.
-      const brainModelId = typeof req.body?.modelId === 'string' ? req.body.modelId.trim() : '';
-      // Optional: the chat session the user switched FROM. Session brain pins
-      // (B6) mean the global flip alone no longer re-routes an already-served
-      // conversation — so a switch made from inside a conversation carries its
-      // sessionId and re-pins THAT session below, keeping "applies to your next
-      // message" true where it was promised. A Settings-context switch has no
-      // session and stays global-only (new sessions + unpinned resolutions).
-      const switchSessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
-
-      // Validate the selected model before moving any routing state.
-      const codexUpdates = brain === 'codex_oauth' ? codexBrainSlotUpdates(brainModelId,
-        Object.fromEntries(CODEX_BRAIN_SLOTS.map((key) => [key, (getRuntimeEnv(key, '') || '').trim()])) as Record<CodexBrainSlot, string>,
-        resolveProvider, DEFAULT_CODEX_MODEL) : [];
-
-      // Only a connected model can be the brain: Codex needs its sign-in, checked
-      // before any routing state moves, as Claude's is below.
-      if (brain === 'codex_oauth') {
-        let codexSignedIn = false;
-        try { codexSignedIn = Boolean(getStoredCodexOAuthTokens()?.accessToken); } catch { codexSignedIn = false; }
-        if (!codexSignedIn) {
-          res.status(409).json({ error: 'Codex is not signed in. Sign in with ChatGPT under Settings → Models first.', needsLogin: true });
-          return;
-        }
-      }
-
-      // A BYO brain runs all-in (every role on the BYO backend unless a role is
-      // bound elsewhere); a Codex/Claude brain cannot coexist with all-in, so step
-      // it down to 'off' (BYO providers stay connected and routable via role pins).
-      if (brain === 'api_key') {
-        if (!getByoBackendConfig().configured) {
-          res.status(409).json({ error: 'No BYO model is configured. Add one under Settings → Models → Connected models first.', needsLogin: true });
-          return;
-        }
-        // Pin the chosen model as the brain. Validate it against the eligible set
-        // (every connected, configured BYO model) so a stale/unknown id can't be
-        // written. Empty modelId → clear the override (default slot is the brain).
-        if (brainModelId) {
-          const eligible = brainOptions().some((o) => o.id === 'api_key' && o.modelId === brainModelId);
-          if (!eligible) {
-            res.status(400).json({ error: `Model "${brainModelId}" is not a connected BYO model. Add it to a provider in Settings → Models first.` });
-            return;
-          }
-          updateEnvKey('BYO_BRAIN_MODEL_ID', brainModelId);
-          process.env.BYO_BRAIN_MODEL_ID = brainModelId;
-        } else {
-          removeEnvKey('BYO_BRAIN_MODEL_ID');
-          delete process.env.BYO_BRAIN_MODEL_ID;
-        }
-        // Keep the legacy worker slot aligned with the all-in BYO backend,
-        // matching the older model-backend route. Durable worker bindings stay
-        // untouched: an active BYO binding still wins, while an inactive
-        // subscription-family binding continues to be reported as inactive.
-        // Without this sync, switching brains through the newer picker could
-        // leave gpt-* here and spend a whole failed fan-out wave probing a
-        // single-family BYO endpoint before the runtime self-healed.
-        const allInWorkerModel = getByoBackendConfig().primaryId;
-        updateEnvKey('OPENAI_MODEL_WORKER', allInWorkerModel);
-        process.env.OPENAI_MODEL_WORKER = allInWorkerModel;
-        updateEnvKey('MODEL_ROUTING_MODE', 'all_in');
-        process.env.MODEL_ROUTING_MODE = 'all_in';
-      } else {
-        // Switching to a Codex/Claude brain: drop the BYO brain-model override so a
-        // later switch back to a BYO brain doesn't silently reuse a stale model.
-        removeEnvKey('BYO_BRAIN_MODEL_ID');
-        delete process.env.BYO_BRAIN_MODEL_ID;
-        if (getModelRoutingMode() === 'all_in') {
-          updateEnvKey('MODEL_ROUTING_MODE', 'off');
-          process.env.MODEL_ROUTING_MODE = 'off';
-        }
-        if (brain === 'codex_oauth') {
-          for (const { key, value: next } of codexUpdates) {
-            updateEnvKey(key, next);
-            process.env[key] = next;
-          }
-        }
-      }
-
-      if (brain === 'claude_oauth') {
-        // A Claude brain orchestrates with a specific Claude model. Honor an
-        // explicit pick from the brain dropdown (value `claude_oauth:<id>` →
-        // brainModelId, e.g. claude-sonnet-5) by persisting CLAUDE_MODEL, which
-        // getClaudeBrainModel() reads. Validate it's a real Claude model so a
-        // stale/unknown id can't be written; an empty/non-Claude id leaves the
-        // current CLAUDE_MODEL (default Opus) untouched.
-        if (brainModelId && resolveProvider(brainModelId) === 'claude') {
-          const eligible = brainOptions().some((o) => o.id === 'claude_oauth' && o.modelId === brainModelId);
-          if (!eligible) {
-            res.status(400).json({ error: `Model "${brainModelId}" is not a connected Claude model.` });
-            return;
-          }
-          updateEnvKey('CLAUDE_MODEL', brainModelId);
-          process.env.CLAUDE_MODEL = brainModelId;
-        }
-        // Preflight BEFORE persisting; refresh a near-expiry vault token so the
-        // harness' own sync check at configure-time also passes next turn.
-        try {
-          await loadFreshClaudeAccessToken();
-        } catch (err) {
-          const kind = err instanceof ClaudeAuthError ? err.kind : 'missing';
-          res.status(409).json({
-            error: err instanceof Error ? err.message : 'Claude subscription auth is not ready.',
-            kind,
-            needsLogin: true,
-          });
-          return;
-        }
-      }
-
-      updateEnvKey('AUTH_MODE', brain);
-      process.env.AUTH_MODE = brain; // so getActiveAuthMode() reflects it THIS session
-
-      // Force the next harness turn to re-register the chosen provider, and drop
-      // brain-specific caches so a Codex→Claude→Codex round-trip leaves no stale
-      // provider/client behind.
-      resetHarnessRuntimeConfig();
-      resetClaudeModelCache();
-      resetByoModelCache();
-      clearAutonomyAgentCache();
-
-      // Re-pin the conversation the switch was made from (after the env writes
-      // + cache resets above, so the pin stamps the NEW global resolution). No
-      // sessionId ⇒ no pin is touched: other live conversations keep theirs.
-      let sessionPin = null;
-      if (switchSessionId) {
-        sessionPin = pinSessionBrain(switchSessionId);
-        // The owner chose this conversation's model: it now answers over an
-        // agent's pinned model (session-agent-model.ts).
-        recordBrainChosenForSession(switchSessionId);
-      }
-
-      const resolvedBrain = resolveRoleModel('brain');
-      const effectiveValue = effectiveBrainValue();
-      const selection = brainSelectionReceipt({
-        requestedValue: brainModelId ? `${brain}:${brainModelId}` : brain,
-        effectiveValue, brain: resolvedBrain,
-        ...(switchSessionId ? { sessionId: switchSessionId, sessionPin } : {}),
-      });
-      res.json({ ok: true, activeBrain: getActiveAuthMode(), claudeAuth: getClaudeAuthSnapshot(),
-        brain: resolvedBrain, effectiveValue, selection });
-    } catch (err) {
-      res.status(err instanceof BrainSelectionError ? err.status : 500).json({
-        error: err instanceof Error ? err.message : String(err),
-        ...(err instanceof BrainSelectionError ? { code: err.code } : {}),
-      });
-    }
+    const brain = activeBrainClass(req.body?.brain);
+    if (!brain) { res.status(400).json({ error: 'brain must be "codex_oauth", "claude_oauth", or "api_key" (a BYO model).' }); return; }
+    // Optional: which SPECIFIC connected model orchestrates, and the chat
+    // session the owner switched FROM (re-pinned so "applies to your next
+    // message" stays true there; a Settings switch has none).
+    const result = await switchActiveBrain({
+      brain,
+      modelId: typeof req.body?.modelId === 'string' ? req.body.modelId : '',
+      sessionId: typeof req.body?.sessionId === 'string' ? req.body.sessionId : '',
+    });
+    // The owner chose a brain themselves: an outage card about the old one
+    // has nothing left to ask.
+    if (result.ok) closeBrainOutage('brain_changed');
+    res.status(result.ok ? 200 : result.status).json(result.body);
   });
 
   // Role→model binding write path (worker + judge). The BRAIN is a provider
@@ -16921,6 +16787,16 @@ export function registerConsoleRoutes(
         judgeSource: resolveRoleModel('judge').source,
       },
     });
+  });
+
+  app.patch('/api/console/settings/models/brain-backups', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json({ brainBackups: persistBrainBackups(req.body) });
+    } catch (err) {
+      res.status(err instanceof BrainBackupsSettingError ? 400 : 500)
+        .json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.patch('/api/console/settings/models/judge-fallback', (req, res) => {

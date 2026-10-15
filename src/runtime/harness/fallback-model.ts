@@ -39,6 +39,7 @@ import { recordOperationalEvent } from '../operational-telemetry.js';
 import { addNotification } from '../notifications.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { isHarnessDeadlineAbortReason } from './model-stall-policy.js';
+import { brainOutageSkips, noteBrainAnswered, noteBrainNoAnswer } from './brain-backups.js';
 import pino from 'pino';
 import {
   sizedBrainFalloverFirstByteMs,
@@ -117,6 +118,10 @@ export interface FallbackOptions {
    * naturally resetting for the user's next turn.
    */
   runSilencedLabels?: Set<string>;
+  /** The chosen brain's label when this chain serves a brain request: its
+   *  no-answer failures and answers feed the outage record, and while that
+   *  record holds it the chain starts on the owner's backups. */
+  brainLabel?: string;
 }
 
 export interface FallbackRouteResolution {
@@ -909,6 +914,9 @@ export class FallbackModel implements Model {
       throw new Error('fallback chain has no provider compatible with this request');
     }
     const exclusionReason = (target: FallbackTarget): string | null => {
+      // The chosen brain stopped answering and the owner listed backups:
+      // every brain request goes to them until the owner decides.
+      if (this.opts.brainLabel === target.label && brainOutageSkips(target.label)) return 'preselected-brain-outage';
       // GROK STAYS GROK (live 2026-08-19 daemon 32025): the brain the USER
       // pinned is never silently skipped for a rescue brain on an auth
       // cooldown — try it (a refreshed grant may have revived it); if its
@@ -950,6 +958,13 @@ export class FallbackModel implements Model {
       if (reason) return { chain, preselected: { from, to, reason } };
     }
     return { chain };
+  }
+
+  /** Feed the outage record: only the chosen brain's own attempts count. */
+  private noteBrainOutcome(label: string, err?: unknown): void {
+    if (this.opts.brainLabel !== label) return;
+    if (err === undefined) noteBrainAnswered(label);
+    else noteBrainNoAnswer(label, this.falloverReason(err), { sessionId: this.opts.sessionId });
   }
 
   private rememberRunSilent(label: string, err: unknown): void {
@@ -1005,6 +1020,7 @@ export class FallbackModel implements Model {
         }
         cleanup(false);
         clearBrainSilentFailure(chain[i].label);
+        this.noteBrainOutcome(chain[i].label);
         this.tagRouteResolution(result, chain[i], falloverReason);
         retainCompletedDeadlineRescue(result, request, req);
         return result;
@@ -1018,6 +1034,7 @@ export class FallbackModel implements Model {
         this.rememberRunSilent(chain[i].label, err);
         recordBrainSilentFailure(chain[i].label, err, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
         markBrainRateLimited(chain[i].label, err);
+        if (!callerAborted) this.noteBrainOutcome(chain[i].label, err);
         // An auth failure on the USER-PINNED brain is a credential edge the
         // user owns — surface it; never silently substitute a brain they did
         // not choose (live 2026-08-19: grok-4.6 401 → codex:rescue steal).
@@ -1137,6 +1154,7 @@ export class FallbackModel implements Model {
         }
         cleanup(false);
         clearBrainSilentFailure(chain[i].label);
+        this.noteBrainOutcome(chain[i].label);
         return; // streamed to completion
       } catch (err) {
         const retiredReason = (req as { signal?: AbortSignal }).signal?.reason;
@@ -1148,6 +1166,7 @@ export class FallbackModel implements Model {
         this.rememberRunSilent(chain[i].label, err);
         recordBrainSilentFailure(chain[i].label, err, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
         markBrainRateLimited(chain[i].label, err);
+        if (!callerAborted && !committedActionable) this.noteBrainOutcome(chain[i].label, err);
         // The pinned-brain credential edge is the user's to fix, on the
         // streamed path exactly as on the buffered one: never silently
         // substitute a brain they did not choose (the guard existed only in
