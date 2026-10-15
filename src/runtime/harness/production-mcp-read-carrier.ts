@@ -130,6 +130,8 @@ interface ClosedConfiguredServer {
   enabled: true;
   command?: string;
   args?: string[];
+  /** A stdio server's working directory is part of which server it is. */
+  cwd?: string;
   url?: string;
   headers?: Record<string, string>;
   env?: Record<string, string>;
@@ -270,7 +272,7 @@ function closeConfiguredServer(value: unknown): ClosedConfiguredServer {
     throw new Error('configured MCP server is not a closed object');
   }
   const allowed = new Set([
-    'name', 'type', 'command', 'args', 'url', 'headers', 'env',
+    'name', 'type', 'command', 'args', 'cwd', 'url', 'headers', 'env',
     'description', 'enabled', 'source',
   ]);
   if (Object.getOwnPropertyNames(value).some((key) => !allowed.has(key))) {
@@ -290,6 +292,10 @@ function closeConfiguredServer(value: unknown): ClosedConfiguredServer {
   if (url !== undefined && !boundedIdentity(url)) {
     throw new Error('configured MCP URL identity is invalid');
   }
+  const cwd = ownDataValue(value, 'cwd');
+  if (cwd !== undefined && (type !== 'stdio' || !boundedIdentity(cwd))) {
+    throw new Error('configured MCP working directory identity is invalid');
+  }
   const rawArgs = ownDataValue(value, 'args');
   let args: string[] | undefined;
   if (rawArgs !== undefined) {
@@ -308,6 +314,7 @@ function closeConfiguredServer(value: unknown): ClosedConfiguredServer {
     enabled: true,
     ...(command !== undefined ? { command } : {}),
     ...(args !== undefined ? { args } : {}),
+    ...(cwd !== undefined ? { cwd } : {}),
     ...(url !== undefined ? { url } : {}),
     ...(headers !== undefined ? { headers } : {}),
     ...(env !== undefined ? { env } : {}),

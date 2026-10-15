@@ -1421,3 +1421,26 @@ test('authoritative carrier enumeration reports connection failure rather than a
   try { await assert.rejects(carrier.carrier.enumerate(), /authoritative tool inventory is unavailable/); }
   finally { await shim.close(); }
 });
+
+test('a stdio server materializes with or without a working directory, and the directory is part of which server it is', async () => {
+  const objective = generated('objective').toLowerCase();
+  const generatedMcp = generatedRuntime({ objective });
+  const base = generatedMcp.runtime.configuredServers()[0]!;
+  const identities = new Map<string, string>();
+  // The key present but undefined is how a config without a directory reaches the carrier.
+  for (const cwd of [undefined, '/generated/project-a', '/generated/project-b']) {
+    resetAuthoritySurfaces();
+    const runtime = { ...generatedMcp.runtime, configuredServers: () => [{ ...base, cwd }] };
+    const adapter = mcp.createProductionMcpReadCarrier({ serverName: generatedMcp.server, runtime });
+    const installed = await adapter.materialize(`retrieve ${objective}`);
+    assert.equal(installed.status, 'installed', JSON.stringify(installed));
+    if (installed.status === 'installed') identities.set(String(cwd), installed.manifest.providerIdentity);
+  }
+  assert.notEqual(identities.get('/generated/project-a'), identities.get('/generated/project-b'),
+    'two working directories are two different servers');
+
+  resetAuthoritySurfaces();
+  const remote = { ...generatedMcp.runtime, configuredServers: () => [{ ...base, type: 'http' as const, url: 'https://generated.invalid/mcp', cwd: '/generated/project-a' }] };
+  const refused = await mcp.createProductionMcpReadCarrier({ serverName: generatedMcp.server, runtime: remote }).materialize(`retrieve ${objective}`);
+  assert.notEqual(refused.status, 'installed', 'a working directory on a remote server is not a valid identity');
+});

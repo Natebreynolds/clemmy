@@ -64,7 +64,7 @@ function addServer(servers: Map<string, ManagedMcpServer>, name: string, config:
     type: config.type === 'http' || config.type === 'sse' ? config.type : 'stdio',
     command: typeof config.command === 'string' ? config.command : undefined,
     args: Array.isArray(config.args) ? config.args.filter((item): item is string => typeof item === 'string') : undefined,
-    cwd: typeof config.cwd === 'string' ? config.cwd : undefined,
+    ...(typeof config.cwd === 'string' ? { cwd: config.cwd } : {}),
     url: typeof config.url === 'string' ? config.url : undefined,
     headers: typeof config.headers === 'object' && config.headers ? (config.headers as Record<string, string>) : undefined,
     env: typeof config.env === 'object' && config.env ? (config.env as Record<string, string>) : undefined,
