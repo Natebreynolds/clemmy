@@ -12,6 +12,7 @@ import {
   readWorkflowState,
   setWorkflowStateValues,
 } from '../execution/workflow-run-state.js';
+import { currentCallRehearsal } from '../execution/workflow-rehearsal.js';
 import { textResult } from './shared.js';
 
 export function registerWorkflowStateTools(server: McpServer): void {
@@ -49,6 +50,9 @@ export function registerWorkflowStateTools(server: McpServer): void {
           if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
             return textResult('ERROR: `values` must be a JSON object of key/value pairs.');
           }
+          if (currentCallRehearsal()) {
+            return textResult('Test run: these values were not saved, so the workflow\'s memory is unchanged. Real runs save them.');
+          }
           const state = setWorkflowStateValues(workflow, patch as Record<string, unknown>);
           return textResult(`Saved. State now has ${Object.keys(state.values).length} value key(s); persists across runs.`);
         }
@@ -56,6 +60,9 @@ export function registerWorkflowStateTools(server: McpServer): void {
           return textResult(`ERROR: action "${action}" needs \`keys\` — the item ids.`);
         }
         if (action === 'mark_processed') {
+          if (currentCallRehearsal()) {
+            return textResult(`Test run: ${keys.length} key(s) were not marked, so the next real run still sees them as new. Real runs mark them.`);
+          }
           const state = markProcessed(workflow, keys);
           return textResult(`Marked ${keys.length} key(s) processed (${Object.keys(state.processed).length} total in the ledger).`);
         }

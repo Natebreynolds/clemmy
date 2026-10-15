@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { forEachSourceInputKey, forEachSourceStepId } from './workflow-foreach-source.js';
 import { WORKFLOW_STEP_RESULT_CHANNEL } from '../runtime/harness/tool-effect.js';
 import { irreversibleBoundaryViolations } from './workflow-graph-boundaries.js';
 import {
@@ -382,10 +383,11 @@ function validateWorkflowGraphWithAuthoredBareCalls(
     if (node.sideEffect === 'send' && node.invocationPlan === undefined && node.requiresApproval !== true) {
       warnings.push(`Send-class node "${id}" has no declarative approval gate.`);
     }
-    const forEachUsesInput = typeof node.forEach === 'string'
-      && /^(?:input\.[A-Za-z0-9_-]+|\{\{\s*input\.[A-Za-z0-9_-]+\s*\}\})$/.test(node.forEach.trim());
-    if (node.forEach && !forEachUsesInput && !nodeIds.has(node.forEach) && !nodes.some((candidate) => candidate.id === node.forEach)) {
-      errors.push(`Node "${id}" has forEach "${node.forEach}" but no such node exists.`);
+    if (node.forEach && forEachSourceInputKey(node.forEach) === null) {
+      const sourceId = forEachSourceStepId(node.forEach);
+      if (!sourceId || (!nodeIds.has(sourceId) && !nodes.some((candidate) => candidate.id === sourceId))) {
+        errors.push(`Node "${id}" has forEach "${node.forEach}" but no such node exists.`);
+      }
     }
   }
   for (const id of duplicateNodeIds) errors.push(`Duplicate graph node id "${id}".`);

@@ -4601,7 +4601,11 @@ const runHostTurnBody = async (
       { sessionId: identity.sessionId, sourceEventId: `user-source:${identity.sourceUserSeq}` })) return false;
     const display = typeof source.data.displayText === 'string' ? source.data.displayText : '';
     const text = display.trim() ? display : (typeof source.data.text === 'string' ? source.data.text : '');
-    return explicitMemoryInstructionFor(text) !== null;
+    if (explicitMemoryInstructionFor(text) === null) return false;
+    // A workflow step's source is the step prompt its author saved, replayed
+    // on every run; it is not the owner asking for a memory now. "Remember
+    // which ones you saw" there means the workflow's own state.
+    return getSession(identity.sessionId, { withoutConversationState: true })?.kind !== 'workflow';
   };
 
   // This is only a negative floor for the demonstrated zero-work failure.

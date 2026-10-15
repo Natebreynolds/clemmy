@@ -373,6 +373,24 @@ export function writeWorkflowRunRecordDurablyUnlocked(
   }
 }
 
+/**
+ * The one answer to "may this run act on its admitted definition right now".
+ * A running run may. So may a creation test that has not finished: a test is
+ * the same run rehearsed, its reads executed for real and its writes
+ * previewed, so every gate that admits a live run admits it too and only the
+ * write boundary treats it differently. Anything else is not live.
+ */
+export type WorkflowRunPhase = 'run' | 'rehearsal';
+
+export function workflowRunPhase(
+  record: { status?: unknown; finishedAt?: unknown } | null | undefined,
+): WorkflowRunPhase | null {
+  if (!record) return null;
+  if (record.status === 'running') return 'run';
+  if (record.status === 'creation_test' && typeof record.finishedAt !== 'string') return 'rehearsal';
+  return null;
+}
+
 /** Test/diagnostic read serialized with every correctness-critical writer. */
 export function readWorkflowRunRecord<T extends object>(filePath: string): T | null {
   return withWorkflowRunRecordLock(filePath, () => readWorkflowRunRecordUnlocked<T>(filePath));

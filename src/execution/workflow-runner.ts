@@ -1,4 +1,5 @@
 import { workerStandingInstructions } from './workflow-worker-standing-instructions.js';
+import { forEachSourceStepId } from './workflow-foreach-source.js';
 import { brainBackupsConfigured } from '../runtime/harness/brain-backups.js';
 import { workflowVerificationDependencyState } from '../tools/workflow-verification-state.js';
 import { withWorkflowCommit as activationWorkflowCommit } from './workflow-commit.js';
@@ -4440,16 +4441,6 @@ function coerceToArray(value: unknown): unknown[] | null {
     if (arrayProps.length === 1) return arrayProps[0][1] as unknown[];
   }
   return null;
-}
-
-function forEachSourceStepId(expr: string | undefined): string | null {
-  const raw = (expr ?? '').trim();
-  if (!raw) return null;
-  const templated = /^\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?\s*\}\}$/.exec(raw);
-  if (templated) return templated[1];
-  const directPath = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?$/.exec(raw);
-  if (directPath) return directPath[1];
-  return /^[a-zA-Z0-9_-]+$/.test(raw) ? raw : null;
 }
 
 function resolveForEachSource(
@@ -14414,29 +14405,28 @@ export async function runCreationTest(
   const stepOutputs: Record<string, unknown> = {};
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
   const qualityAdvisories: WorkflowQualityAdvisory[] = [];
-  let steps = workflow.steps;
-  if (workflowHasReadParallelSubgraph(workflow.steps)) {
-    // Creation tests must verify the same executable topology that a scheduled
-    // run will use. Running only the authored parent would falsely certify a
-    // reducer that had never received either specialist result.
-    const graph = compileWorkflowStepsToGraph(workflow.steps, {
-      id: `${workflowSlug}:${runId}:creation-test`,
-      name: workflow.name,
-      metadata: { workflowSlug, runId, creationTest: true },
-    });
-    const materialized = materializeWorkflowGraphSteps(workflow.steps, graph);
-    if (!materialized.ok) {
-      return {
-        pass: false,
-        steps: [{
-          stepId: '(graph)',
-          status: 'error',
-          detail: materialized.errors.join('; ').slice(0, 500),
-        }],
-      };
-    }
-    steps = materialized.steps;
+  // A creation test rehearses the run: it compiles and materializes the same
+  // graph every run executes, so a rule the run enforces fails here, before
+  // the workflow is turned on, never on its first real run. Running only the
+  // authored steps would also certify a reducer that never received its
+  // specialists' results.
+  const graph = compileWorkflowStepsToGraph(workflow.steps, {
+    id: `${workflowSlug}:${runId}:creation-test`,
+    name: workflow.name,
+    metadata: { workflowSlug, runId, creationTest: true },
+  });
+  const materialized = materializeWorkflowGraphSteps(workflow.steps, graph);
+  if (!materialized.ok) {
+    return {
+      pass: false,
+      steps: [{
+        stepId: '(graph)',
+        status: 'error',
+        detail: materialized.errors.join('; ').slice(0, 500),
+      }],
+    };
   }
+  const steps = materialized.steps;
   const results: CreationTestStepResult[] = [];
   const completed = new Set<string>();
   // Steps whose result depends on a mutation that was deliberately not

@@ -1,4 +1,5 @@
 import type { WorkflowDefinition, WorkflowInputDef, WorkflowStepInput } from '../memory/workflow-store.js';
+import { forEachSourceStepId } from './workflow-foreach-source.js';
 import { structuredCallSideEffectClass } from './workflow-step-effect.js';
 import {
   validateWorkflowDefinition,
@@ -596,16 +597,6 @@ export function checkDependencyBinding(def: WorkflowDefinition): string[] {
 export interface WorkflowAutoRepair {
   def: WorkflowDefinition;
   repairs: string[];
-}
-
-function forEachSourceStepId(expr: string | undefined): string | null {
-  const raw = (expr ?? '').trim();
-  if (!raw) return null;
-  const templated = /^\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?\s*\}\}$/.exec(raw);
-  if (templated) return templated[1];
-  const directPath = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?$/.exec(raw);
-  if (directPath) return directPath[1];
-  return /^[a-zA-Z0-9_-]+$/.test(raw) ? raw : null;
 }
 
 export function autoRepairWorkflowDefinition(

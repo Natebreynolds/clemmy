@@ -16,6 +16,7 @@
  * prose — that's what makes it "provable". The structured result is also the
  * data contract the visual dry-run preview renders from.
  */
+import { forEachSourceStepId } from './workflow-foreach-source.js';
 import type { WorkflowDefinition, WorkflowStepInput } from '../memory/workflow-store.js';
 import { shortStepLabel } from './workflow-describe.js';
 import { classifyStepSideEffect, type StepSideEffectClass } from './workflow-enforce.js';
@@ -95,17 +96,14 @@ function uniqueTrimmed(items: Array<string | undefined | null>): string[] {
   return Array.from(new Set(items.map((i) => i?.trim()).filter((i): i is string => Boolean(i))));
 }
 
-function forEachSourceStepId(expr: string | undefined, ids: Set<string>): string | null {
-  if (!expr) return null;
-  const raw = expr.trim();
-  if (!raw || raw.startsWith('input.') || raw === 'items') return null;
-  const head = raw.split('.')[0] || null;
-  return head && ids.has(head) ? head : null;
+function knownForEachSourceStepId(expr: string | undefined, ids: Set<string>): string | null {
+  const source = forEachSourceStepId(expr);
+  return source && ids.has(source) ? source : null;
 }
 
 function stepReads(step: WorkflowStepInput, ids: Set<string>): string[] {
   const deps = Array.isArray(step.dependsOn) ? step.dependsOn.filter((d) => ids.has(d)) : [];
-  const forEachSource = forEachSourceStepId(step.forEach, ids);
+  const forEachSource = knownForEachSourceStepId(step.forEach, ids);
   return uniqueTrimmed([...deps, forEachSource]);
 }
 

@@ -21,6 +21,7 @@
  * milliseconds; no LLM calls, no network. Errors block save; warnings
  * surface as soft signals the user can override.
  */
+import { forEachSourceStepId, forEachSourceInputKey } from './workflow-foreach-source.js';
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { operationIdentity } from '../tools/operation-name-identity.js';
 import { registryToolHasNoExactCallContract } from '../tools/tool-registry.js';
@@ -288,24 +289,6 @@ function checkSideEffectCoherence(step: WorkflowStepShape): string | null {
     `Step "${step.id}" declares sideEffect: ${declared}, but its structured call is classified as ${inferred.toUpperCase()}. `
     + 'Align the declared effect with the structured operation. Execution and recovery use the operation classification.'
   );
-}
-
-function forEachSourceStepId(expr: string | undefined): string | null {
-  const raw = (expr ?? '').trim();
-  if (!raw) return null;
-  const templated = /^\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?\s*\}\}$/.exec(raw);
-  if (templated) return templated[1];
-  const directPath = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?$/.exec(raw);
-  if (directPath) return directPath[1];
-  return /^[a-zA-Z0-9_-]+$/.test(raw) ? raw : null;
-}
-
-function forEachSourceInputKey(expr: string | undefined): string | null {
-  const raw = (expr ?? '').trim();
-  const templated = /^\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}$/.exec(raw);
-  if (templated) return templated[1];
-  const direct = /^input\.([a-zA-Z0-9_-]+)$/.exec(raw);
-  return direct?.[1] ?? null;
 }
 
 function invocationPlanSourceReferences(

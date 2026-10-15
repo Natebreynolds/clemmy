@@ -35,6 +35,7 @@ writeFileSync(path.join(TEST_HOME, 'state', 'machine-id'), 'machine-authored-loc
 
 const { hostRunRunner } = await import('./host-turn-runner.js');
 const eventlog = await import('./eventlog.js');
+const toolEffect = await import('./tool-effect.js');
 const brackets = await import('./brackets.js');
 const capabilityEnvelopes = await import('../../agents/capability-envelope.js');
 const planScopes = await import('../../agents/plan-scope.js');
@@ -145,7 +146,22 @@ interface FixtureTool {
   parameters: Record<string, unknown>;
 }
 
-const TOOLS: Record<'task_hygiene' | 'goal_upsert' | 'write_file' | 'workflow_delete', FixtureTool> = {
+const TOOLS: Record<'task_hygiene' | 'goal_upsert' | 'write_file' | 'workflow_delete' | 'workflow_state', FixtureTool> = {
+  // The workflow's own memory across runs: reads by action, keyed by workflow.
+  workflow_state: {
+    name: 'workflow_state',
+    parameters: {
+      type: 'object',
+      properties: {
+        workflow: { type: 'string' },
+        action: { type: 'string', enum: ['get', 'set', 'mark_processed', 'filter_unprocessed'] },
+        values: { type: ['string', 'null'] },
+        keys: { type: ['array', 'null'], items: { type: 'string' } },
+      },
+      required: ['workflow', 'action', 'values', 'keys'],
+      additionalProperties: false,
+    },
+  },
   task_hygiene: {
     name: 'task_hygiene',
     parameters: {
@@ -222,6 +238,8 @@ function createStepFixture(input: {
   /** This run is a pinned-goal follow-up continuing the named steps of an
    *  earlier attempt whose writes landed. */
   followUp?: { fromRunId: string; continuedStepIds: string[] };
+  /** The run is a creation test (a rehearsal), still running or finished. */
+  rehearsal?: 'running' | 'finished';
 }) {
   const suffix = String(++serial);
   const workflowRunId = `run-local-write-${suffix}`;
@@ -254,7 +272,8 @@ function createStepFixture(input: {
     id: workflowRunId,
     workflow: workflowName,
     workflowDefinitionSnapshot: snapshot,
-    status: 'running',
+    status: input.rehearsal ? 'creation_test' : 'running',
+    ...(input.rehearsal === 'finished' ? { finishedAt: '2026-08-31T00:00:09.000Z' } : {}),
     inputs: {},
     createdAt: '2026-08-31T00:00:00.000Z',
     startedAt: '2026-08-31T00:00:01.000Z',
@@ -1087,4 +1106,59 @@ test('the landed-write refusal is scoped to a follow-up continuing that step: a 
   });
   const otherRun = await appendOnce(other, 'append-other', APPEND);
   assert.equal(otherRun.bodies.write_file, 1, 'only the continued step\'s own landed writes are held');
+});
+
+test('a creation test is the run rehearsed: its read step keeps its own workflow memory, and nothing else it writes is covered', async () => {
+  // Live 2026-10-15: a monitor's creation test read the comments, then its
+  // own "already seen" memory was refused as coverage_missing and the step
+  // was reported as an error with the data in hand.
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'read', rehearsal: 'running',
+    prompt: 'Check for new items, remember which ones you saw with workflow_state, then return a structured result.' });
+  assert.equal(fixture.recorded.status, 'ready', JSON.stringify(fixture.recorded));
+  const { bodies, tools } = fixtureTools(['workflow_state', 'task_hygiene']);
+  const model = stubModel([
+    [toolCall('own-1', 'workflow_state', { workflow: fixture.workflowSlug, action: 'mark_processed', values: null, keys: ['item-1'] })],
+    [toolCall('other-2', 'workflow_state', { workflow: 'another-workflow', action: 'mark_processed', values: null, keys: ['item-1'] })],
+    [textMsg('one new item, remembered')],
+  ]);
+  const agent = { model, tools };
+  bindSurface(fixture, agent, tools);
+
+  const outcome = await runProductionHost(fixture, agent);
+  assert.equal(outcome.finalOutput, 'one new item, remembered', JSON.stringify({ ...outcome, history: undefined }));
+  assert.deepEqual(bodies, { workflow_state: 1, task_hygiene: 0 }, 'its own memory proceeds; another workflow\'s does not');
+  // Reading any workflow's memory is a read, never a write to cover.
+  assert.equal(toolEffect.classifyRuntimeToolEffect('workflow_state', { workflow: 'another-workflow', action: 'get' }).effect, 'read');
+  assert.equal(toolEffect.classifyRuntimeToolEffect('workflow_state', { workflow: 'another-workflow', action: 'filter_unprocessed', keys: ['a'] }).effect, 'read');
+  assert.equal(toolEffect.classifyRuntimeToolEffect('workflow_state', { workflow: 'another-workflow', action: 'set' }).effect, 'local_write');
+  assert.deepEqual(dispositionMarkers(outcome.history), [
+    { disposition: 'refused_pre_dispatch', retry: 'replan' },
+  ]);
+  assert.equal(pendingApprovalCount(fixture), 0);
+});
+
+test('a real run\'s read step keeps its own workflow memory too', async () => {
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'read',
+    prompt: 'Check for new items, remember which ones you saw with workflow_state, then return a structured result.' });
+  assert.equal(fixture.recorded.status, 'ready', JSON.stringify(fixture.recorded));
+  const { bodies, tools } = fixtureTools(['workflow_state']);
+  const model = stubModel([
+    [toolCall('own-1', 'workflow_state', { workflow: fixture.workflowName, action: 'set', values: '{"cursor":"c-2"}', keys: null })],
+    [textMsg('cursor saved')],
+  ]);
+  const agent = { model, tools };
+  bindSurface(fixture, agent, tools);
+  const outcome = await runProductionHost(fixture, agent);
+  assert.equal(outcome.finalOutput, 'cursor saved', JSON.stringify(outcome.history));
+  assert.deepEqual(bodies, { workflow_state: 1 });
+  assert.deepEqual(dispositionMarkers(outcome.history), []);
+});
+
+test('a creation test grants no write or send authority, and a finished one grants nothing', () => {
+  for (const sideEffect of ['write', 'send'] as const) {
+    const fixture = createStepFixture({ kind: 'workflow', sideEffect, rehearsal: 'running' });
+    assert.deepEqual(fixture.recorded, { status: 'refused', reason: 'rehearsal_previews_writes' }, sideEffect);
+  }
+  const finished = createStepFixture({ kind: 'workflow', sideEffect: 'read', rehearsal: 'finished' });
+  assert.deepEqual(finished.recorded, { status: 'refused', reason: 'workflow_definition_authority_missing_or_changed' });
 });

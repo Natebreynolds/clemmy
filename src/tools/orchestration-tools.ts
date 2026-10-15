@@ -1164,13 +1164,14 @@ export function registerOrchestrationTools(server: McpServer): void {
       synthesis_prompt: z.string().optional(),
       portable_models: z.boolean().optional().describe('True removes per-step model pins, using intent/default routing. Omit/false preserves pins.'),
       allowSends: z.boolean().optional().describe('Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false for strict mode: any send-looking step must then carry requiresApproval: true or the save is refused.'),
+      allowedTools: z.array(z.string()).optional().describe('Workflow-wide tool scope: discovered tool names every step without its own allowedTools may use.'),
       goal: z.object({
         objective: z.string().min(4).describe('What a completed run must achieve — judged externally at run completion.'),
         success_criteria: z.array(z.string()).optional().describe('Reusable pass/fail rules for each run against its current inputs. Keep sample-specific expected values in the current acceptance check, not the saved goal, unless the user requires that constant on every run. File paths are checked deterministically; other criteria by a judge. Empty means judge the objective.'),
         max_attempts: z.number().min(1).max(3).optional().describe('Total run attempts (original + automatic re-pursuits). Default 2, ceiling 3 — re-pursuit re-runs the whole workflow.'),
       }).optional().describe('External completion check. Failure re-runs with feedback, bounded by max_attempts; never after an irreversible step. Exhaustion reports criterion evidence.'),
     },
-    async ({ name, description, enabled, steps, project, trigger_schedule, trigger_once_at, trigger_timezone, trigger_webhook_path, trigger_events, inputs, resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal }) => {
+    async ({ name, description, enabled, steps, project, trigger_schedule, trigger_once_at, trigger_timezone, trigger_webhook_path, trigger_events, inputs, resources, test_inputs, synthesis_prompt, portable_models, allowSends, allowedTools, goal }) => {
       // The already-running primary model owns semantic topology. Refuse a
       // missing graph even for direct/internal callers that bypass the tool
       // schema; keyword synthesis here would be a second, less-informed author.
@@ -1244,6 +1245,9 @@ export function registerOrchestrationTools(server: McpServer): void {
         trigger: triggerResult.trigger,
         steps: normalizedSteps,
         ...(allowSends !== undefined ? { allowSends } : {}),
+        ...(allowedTools && allowedTools.some((tool) => tool.trim())
+          ? { allowedTools: allowedTools.map((tool) => tool.trim()).filter(Boolean) }
+          : {}),
         ...(goal ? { goal: { objective: goal.objective, successCriteria: goal.success_criteria, maxAttempts: goal.max_attempts } } : {}),
         resources: Object.keys(resourceBindings).length > 0 ? resourceBindings : undefined,
         inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,

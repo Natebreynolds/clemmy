@@ -264,3 +264,22 @@ test('applyWorkflowGraphBranchDecision disables unselected condition edges', () 
   assert.equal(result.graph.edges.find((edge) => edge.target === 'skip')?.disabled, true);
   assert.deepEqual(getReadyWorkflowGraphNodes(result.graph, ['decide']).map((node) => node.id), ['send']);
 });
+
+test('every forEach spelling authoring accepts is a source the run graph accepts', () => {
+  // Live 2026-10-15: authoring and the creation test accepted
+  // "steps.parse_rows.output"; the first real run refused the persisted graph
+  // with "no such node exists".
+  for (const forEach of ['steps.parse_rows.output', '{{steps.parse_rows.output}}', 'steps.parse_rows.output.rows', 'parse_rows', 'input.rows', '{{input.rows}}']) {
+    const steps = [
+      { id: 'parse_rows', prompt: 'Parse the rows.', sideEffect: 'read' as const },
+      { id: 'research', prompt: 'Research {{item}}.', dependsOn: ['parse_rows'], forEach, sideEffect: 'read' as const },
+    ];
+    const graph = compileWorkflowStepsToGraph(steps);
+    assert.deepEqual(validateWorkflowGraph(graph).errors, [], forEach);
+    assert.deepEqual(validateWorkflowGraphAgainstAuthoredSteps(graph, steps).errors, [], forEach);
+  }
+  const missing = compileWorkflowStepsToGraph([
+    { id: 'research', prompt: 'Research {{item}}.', forEach: 'steps.nowhere.output', sideEffect: 'read' },
+  ]);
+  assert.match(validateWorkflowGraph(missing).errors.join('; '), /forEach "steps\.nowhere\.output" but no such node exists/);
+});

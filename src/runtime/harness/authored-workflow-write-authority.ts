@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { resolveWorkflowRunDefinitionSnapshot } from '../../execution/workflow-run-definition.js';
-import { readWorkflowRunRecord } from '../../execution/workflow-run-record.js';
+import { readWorkflowRunRecord, workflowRunPhase } from '../../execution/workflow-run-record.js';
 import { validateArgsAgainstSchema } from '../../tools/composio-batch-validator.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { WORKFLOW_RUNS_DIR } from '../../tools/shared.js';
@@ -387,10 +387,11 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
       path.join(WORKFLOW_RUNS_DIR, `${input.workflowRunId}.json`),
     );
     const resolved = resolveWorkflowRunDefinitionSnapshot(run?.workflowDefinitionSnapshot);
+    const phase = workflowRunPhase(run);
     if (
       !run
       || run.id !== input.workflowRunId
-      || run.status !== 'running'
+      || phase === null
       || resolved.status !== 'valid'
       || resolved.snapshot.workflowSlug !== input.workflowSlug
       || !resolved.snapshot.admissionHash
@@ -426,6 +427,11 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
       || (declared === 'read' && (step.requiresApproval === true || externalWrites.length > 0))
     ) {
       return { status: 'none' };
+    }
+    // A rehearsal executes only the steps that read; every step that writes
+    // is previewed. Nothing it runs may carry write or send authority.
+    if (phase === 'rehearsal' && declared !== 'read') {
+      return { status: 'refused', reason: 'rehearsal_previews_writes' };
     }
     const inheritedAllowed = step.allowedTools && step.allowedTools.length > 0
       ? step.allowedTools
@@ -634,10 +640,12 @@ function reopenAuthoredStepAuthority(
     path.join(WORKFLOW_RUNS_DIR, `${receipt.workflowRunId}.json`),
   );
   const resolved = resolveWorkflowRunDefinitionSnapshot(run?.workflowDefinitionSnapshot);
+  const phase = workflowRunPhase(run);
   if (
     !run
     || run.id !== receipt.workflowRunId
-    || run.status !== 'running'
+    || phase === null
+    || (phase === 'rehearsal' && receipt.stepSideEffect !== 'read')
     || resolved.status !== 'valid'
     || resolved.snapshot.workflowSlug !== receipt.workflowSlug
     || resolved.snapshot.definitionHash !== receipt.definitionHash
@@ -1447,10 +1455,25 @@ async function authoredLocalWriteRisk(input: {
       semanticBasis: { kind: 'local_registry', digest: definition.envelopeFingerprint },
     };
   }
-  // Clementine's own ledgers are a write step's accepted work, never a read
-  // step's: a read step gets no control-plane coverage.
-  if (input.receipt.stepSideEffect === 'read') return null;
-  if (actionTopologyRoleForRuntimeCall(attestation.toolName, input.args) !== 'control') return null;
+  // A workflow's own memory (its watermarks and processed-item ledger) is run
+  // bookkeeping: keeping it is part of every step's accepted work, a read
+  // step's included, because a monitor that cannot remember what it already
+  // saw repeats itself every run. Only a call naming this step's own workflow
+  // binds; any other workflow's memory stays uncovered.
+  const memory = row.workflowScopedMemory;
+  if (memory) {
+    const named = effective.args && typeof effective.args === 'object' && !Array.isArray(effective.args)
+      ? (effective.args as Record<string, unknown>)[memory.workflowArg]
+      : undefined;
+    const own = typeof named === 'string' && [input.receipt.workflowSlug, input.receipt.workflowName]
+      .some((name) => name.trim().toLowerCase() === named.trim().toLowerCase());
+    if (!own) return null;
+  } else {
+    // Clementine's other ledgers are a write step's accepted work, never a
+    // read step's: a read step gets no control-plane coverage.
+    if (input.receipt.stepSideEffect === 'read') return null;
+    if (actionTopologyRoleForRuntimeCall(attestation.toolName, input.args) !== 'control') return null;
+  }
   return {
     risk: { reversibility: 'reversible', consequence: 'update', destructive: false },
     destination: {
