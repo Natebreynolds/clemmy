@@ -225,6 +225,13 @@ function usageMatchesAttempt(scope: ModelTransportAttempt, usage: CapturedModelU
   const value = current && identity(current.sessionId) && current.sessionId !== 'unknown'
     && Number.isSafeInteger(current.sourceUserSeq) && current.sourceUserSeq > 0 ? current : current?.usageParentTurn;
   const owner = scope.owner;
+  // A background job outside any turn (a scheduled memory job) has no turn
+  // tuple: its attempt has no owner and the usage it captured at entry names
+  // only the job. That entry capture is its own accounting, never a later
+  // drainer's.
+  if (!owner && current && !value && identity(current.usageJobId)) {
+    return scope.purpose === (current.role ?? 'unknown');
+  }
   return !!owner && !!value && owner.sessionId === value.sessionId
     && owner.sourceUserSeq === value.sourceUserSeq && owner.runAttemptId === value.attemptId
     && owner.accountingParent === (value !== current) && owner.usageJobId === current?.usageJobId

@@ -426,3 +426,22 @@ test('BYO public retry, failed fallback, cancel and missing usage keep distinct 
     assert.ok(local.some(row => row.phase === 'adapter_attempt_finished' && row.outcome === 'failed'));
   } finally { log.finishRunAttempt(a.attempt, 'completed'); log.finishRunAttempt(b.attempt, 'completed'); }
 });
+
+test('a background job outside any turn keeps its own job accounting, and invents no turn', async () => {
+  const transport = await import('./model-transport-observation.js');
+  const { runMemoryJob } = await import('../../memory/memory-work-journal.js');
+  const id = `background-job-${++count}`;
+  const create = wrapCompletionsCreate(async () => completion(id), { backendId: 'zai-fixture' });
+  await runMemoryJob('learn', { source: { kind: 'schedule' } }, async () => {
+    const scope = transport.createModelTransportAttempt(`background-local-${count}`, 1, transport.captureModelTransportUsageOwner());
+    await transport.withModelTransportAttempt(scope, () => create(body()));
+  }, () => ({ outcome: 'nothing_new' }));
+  const matches = readUsageEventsForDate().filter(row => row.responseId === id);
+  assert.equal(matches.length, 1);
+  const [row] = matches;
+  assert.equal(row.channel, 'memory:learn');
+  assert.equal(row.kind, 'background');
+  assert.match(String(row.source), /^memory:learn:/);
+  assert.equal(row.trace?.acceptedSource, undefined, 'no turn is invented');
+  assert.equal(row.inputTokens, 100); assert.equal(row.outputTokens, 7);
+});
