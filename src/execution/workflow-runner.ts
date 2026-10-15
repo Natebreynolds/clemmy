@@ -364,6 +364,7 @@ import {
   readWorkflowRunRecordUnlocked,
   scanWorkflowRunRecordSnapshot,
   withWorkflowRunRecordLock,
+  workflowRunPhase,
   writeWorkflowRunRecordDurablyUnlocked,
 } from './workflow-run-record.js';
 import {
@@ -15473,10 +15474,56 @@ async function processOneRunFile(
           if (requeued.status === 'queued' && requeued.id) autoRetestRunId = requeued.id;
         } catch { /* self-heal is additive — fall back to the manual message */ }
       }
+      // Activation is settled before the report is written: the report is
+      // this test's one immutable account, so it says only what happened. Only
+      // a rehearsal that is still live may turn the workflow on, and if a
+      // cancellation wins publication below, the workflow is put back exactly
+      // as it was.
+      type ActivationOutcome =
+        | {
+            activated: true;
+            wasEnabled: boolean;
+            before: ReturnType<typeof activationCommitFacts>;
+            after: ReturnType<typeof activationCommitFacts>;
+          }
+        | { activated: false; reason: string };
+      let activation: ActivationOutcome | null = null;
+      if (creationReady && activateAfterCreationTest) {
+        try {
+          const latest = readWorkflow(workflow.name);
+          if (workflowRunPhase(readRunRecord(filePath)) !== 'rehearsal') {
+            activation = { activated: false, reason: 'the test was stopped before it could turn the workflow on' };
+          } else if (catalogSnapshot && !(
+            latest
+            && workflowDefinitionMatchesSnapshotIgnoringEnabled(catalogSnapshot, latest.data)
+            && workflowCodeRevisionMatchesSnapshot(catalogSnapshot, latest.data)
+          )) {
+            activation = { activated: false, reason: 'the saved workflow changed while its test was finishing' };
+          } else {
+            const before = activationCommitFacts(activationWorkflowCommit(workflow.name, ''));
+            writeWorkflowAndSyncTriggers(
+              workflow.name,
+              activationDefinition ?? { ...(latest?.data ?? workflow.data), enabled: true },
+            );
+            const after = activationCommitFacts(activationWorkflowCommit(workflow.name, ''));
+            activation = readWorkflow(workflow.name)?.data.enabled === true
+              ? { activated: true, wasEnabled: latest?.data.enabled === true, before, after }
+              : { activated: false, reason: 'turning it on did not take' };
+          }
+        } catch (error) {
+          activation = {
+            activated: false,
+            reason: `turning it on failed (${(error instanceof Error ? error.message : String(error)).slice(0, 200)})`,
+          };
+        }
+      }
+      const activationFailed = activation !== null && !activation.activated;
       const lines = creationTestStepLines(result.steps);
       const body = creationReady
         ? activateAfterCreationTest
-          ? `Creation test passed for "${workflow.data.name}" — the read steps returned real data, so I turned it on.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run. It will run on its schedule or when you start it.`
+          ? activation && !activation.activated
+            ? `Creation test passed for "${workflow.data.name}" — the read steps returned real data — but it is still off: ${activation.reason}.\n\n${lines.join('\n')}\n\nAsk me to turn it on and I'll test the saved version first.`
+            : `Creation test passed for "${workflow.data.name}" — the read steps returned real data, so I turned it on.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run. It will run on its schedule or when you start it.`
           : `Creation test passed for "${workflow.data.name}" — the read steps returned real data. It stays off, as you asked.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run.`
         : result.pass
           ? autoRetestRunId
@@ -15488,9 +15535,10 @@ async function processOneRunFile(
           // happens next, so answering is the whole of the owner's part.
           ? `"${workflow.data.name}" is ready except for one thing I can't decide for you, so it stays off until you answer.\n\n${lines.join('\n')}\n\nAnswer that and I'll save it on the step, test again, and turn it on if it passes.`
           : `The creation test for "${workflow.data.name}" found problems, so it stays off rather than run broken.\n\n${lines.join('\n')}\n\nTell me to fix the flagged steps and I'll rework and re-test them. If you'd rather run it as it is, say so and I'll turn it on.`;
+      const ready = creationReady && !activationFailed;
       const report = {
         workflowName: workflow.data.name,
-        outcome: creationReady ? 'done' as const : 'blocked' as const,
+        outcome: ready ? 'done' as const : 'blocked' as const,
         detail: body,
       };
       const terminalRecord = writeRunRecord(
@@ -15504,57 +15552,42 @@ async function processOneRunFile(
         },
         report,
       );
-      if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
+      if (!terminalPublicationMatches(filePath, terminalRecord, report)) {
+        // Another terminal won (a cancellation): this test turns nothing on.
+        if (activation?.activated && !activation.wasEnabled) {
+          try {
+            const current = readWorkflow(workflow.name);
+            if (current?.data.enabled) writeWorkflowAndSyncTriggers(workflow.name, { ...current.data, enabled: false });
+          } catch { /* the cancellation's own report stands */ }
+        }
+        return;
+      }
       // The owner's account answer outlives this test: save it on the step so
       // the next test and every scheduled run start from it instead of
-      // asking again. Best-effort and exact — same step id, same tool, and the
-      // compiler still revalidates the choice-set digest before any dispatch.
+      // asking again. Saved after activation so it cannot strand it. Best-effort
+      // and exact — same step id, same tool, and the compiler still
+      // revalidates the choice-set digest before any dispatch.
       if (creationTestResume?.accountSelection) {
         try {
           persistStepAccountBinding(workflow.name, creationTestResume);
         } catch { /* the run's own selection already governed this test */ }
       }
       startWorkflowActivityRun(run, workflow.data.name, `Creation-testing workflow "${workflow.data.name}"`);
-      // Only the process that published this creation-test terminal may enable
-      // the draft or clear its failure history. A cancellation/other terminal
-      // winner leaves workflow state untouched.
-      if (creationReady && activateAfterCreationTest) {
-        try {
-          const latest = readWorkflow(workflow.name);
-          if (
-            !catalogSnapshot
-            || (
-              latest
-              && workflowDefinitionMatchesSnapshotIgnoringEnabled(catalogSnapshot, latest.data)
-              && workflowCodeRevisionMatchesSnapshot(catalogSnapshot, latest.data)
-            )
-          ) {
-            const before = activationCommitFacts(activationWorkflowCommit(workflow.name, ''));
-            writeWorkflowAndSyncTriggers(
-              workflow.name,
-              activationDefinition ?? { ...(latest?.data ?? workflow.data), enabled: true },
-            );
-            const after = activationCommitFacts(activationWorkflowCommit(workflow.name, ''));
-            const activated = readWorkflow(workflow.name);
-            if (run.creationTestSource && before && after && catalogSnapshot && activated
-              && latest?.data.enabled === false && activated.data.enabled === true
-              && workflowDefinitionMatchesSnapshotIgnoringEnabled(catalogSnapshot, activated.data)
-              && workflowCodeRevisionMatchesSnapshot(catalogSnapshot, activated.data)) {
-              appendHarnessEvent({
-                sessionId: run.creationTestSource.sessionId, turn: 0, role: 'system',
-                type: 'workflow_activation_committed',
-                data: { ...run.creationTestSource, runId: run.id,
-                  priorDigest: before.contentDigest, facts: after },
-              });
-            }
-          }
-        } catch { /* best-effort */ }
+      if (activation?.activated) {
+        if (run.creationTestSource && activation.before && activation.after && catalogSnapshot && !activation.wasEnabled) {
+          appendHarnessEvent({
+            sessionId: run.creationTestSource.sessionId, turn: 0, role: 'system',
+            type: 'workflow_activation_committed',
+            data: { ...run.creationTestSource, runId: run.id,
+              priorDigest: activation.before.contentDigest, facts: activation.after },
+          });
+        }
         try { clearWorkflowFailures(workflow.name); } catch { /* best-effort */ }
       }
       addNotification({
         id: `workflow-${run.id}-creationtest`,
         kind: 'workflow',
-        title: creationReady ? `Workflow ready: ${workflow.data.name}` : `Workflow needs review: ${workflow.data.name}`,
+        title: ready ? `Workflow ready: ${workflow.data.name}` : `Workflow needs review: ${workflow.data.name}`,
         body,
         createdAt: new Date().toISOString(),
         read: false,
@@ -15579,15 +15612,11 @@ async function processOneRunFile(
       markRunNotified(filePath);
       finishWorkflowActivityRun(run.id, {
         status: 'completed',
-        message: creationReady ? 'Workflow creation test passed' : 'Workflow creation test needs review',
+        message: ready ? 'Workflow creation test passed' : 'Workflow creation test needs review',
         outputPreview: body,
-        needsAttention: !creationReady,
+        needsAttention: !ready,
       });
-      recordAndAttemptWorkflowRunReportBack(filePath, {
-        workflowName: workflow.data.name,
-        outcome: creationReady ? 'done' : 'blocked',
-        detail: body,
-      });
+      recordAndAttemptWorkflowRunReportBack(filePath, report);
       return;
     }
     // TRY (single-step) runs bypass the workflow enabled gate — they're
