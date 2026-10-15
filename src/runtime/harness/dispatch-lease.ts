@@ -377,11 +377,18 @@ export function reconcileTerminalRunAttemptDispatchLeasesAtBoot(
   nowMs = Date.now(),
 ): number {
   const revokedAt = new Date(nowMs).toISOString();
+  // The session filter is implied by the EXISTS below; it lets the
+  // (session_id, revoked_at) index find the few live leases instead of
+  // reading every retained lease row, argument cipher included.
   return openEventLog().prepare(`
     UPDATE run_dispatch_leases
        SET revoked_at = ?,
            revocation_reason = ?
-     WHERE revoked_at IS NULL
+     WHERE session_id IN (
+             SELECT session_id FROM run_attempts
+              WHERE finished_at IS NOT NULL AND status != 'active'
+           )
+       AND revoked_at IS NULL
        AND run_attempt_id IS NOT NULL
        AND EXISTS (
          SELECT 1

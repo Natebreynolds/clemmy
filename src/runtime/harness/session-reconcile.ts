@@ -3,6 +3,7 @@ import {
   configuredSessionRetentionDays,
   finishRunAttempt,
   listEvents,
+  listEventsAtSequences,
   listSessions,
   openEventLog,
   updateSession,
@@ -64,12 +65,14 @@ function latestSessionEvent(sessionId: string): EventRow | undefined {
 }
 
 export function latestWorkLifecycleEvent(sessionId: string): EventRow | undefined {
-  const events = listEvents(sessionId, {
-    types: WORK_LIFECYCLE_EVENT_TYPES,
-    desc: true,
-    limit: 1,
-  });
-  return events[events.length - 1];
+  // The newest lifecycle sequence comes from the (session_id, type) index
+  // alone; only that one row is read, never the session's history before it.
+  const placeholders = WORK_LIFECYCLE_EVENT_TYPES.map(() => '?').join(',');
+  const newest = openEventLog().prepare(
+    `SELECT max(seq) AS seq FROM events WHERE session_id = ? AND type IN (${placeholders})`,
+  ).get(sessionId, ...WORK_LIFECYCLE_EVENT_TYPES) as { seq: number | null } | undefined;
+  if (!newest?.seq) return undefined;
+  return listEventsAtSequences(sessionId, [newest.seq])[0];
 }
 
 export function terminalStatusForWorkLifecycleEvent(
