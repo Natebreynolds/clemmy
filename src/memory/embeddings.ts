@@ -980,8 +980,10 @@ export interface EmbeddingSpace {
 export interface EmbeddedQuery extends EmbeddingSpace { readonly vector: Float32Array }
 export interface EmbeddedTexts extends EmbeddingSpace { readonly vectors: Float32Array[] }
 export type EmbeddingRequestOptions = Pick<EmbeddingWorkOptions, 'priority' | 'deadlineAtMs'>;
-const queryProducers = new WeakMap<EmbeddedQuery, { provider: EmbeddingProvider; primary: boolean }>();
-type QueryEmbeddingEntry = { at: number; p: Promise<EmbeddedQuery | null>; work: EmbeddingWorkOptions; control?: EmbeddingWorkControl };
+type EmbeddingProducerLease = { provider: EmbeddingProvider; primary: boolean };
+const queryProducers = new WeakMap<EmbeddedQuery, EmbeddingProducerLease>();
+type SharedEmbeddingWork = { work: EmbeddingWorkOptions; control?: EmbeddingWorkControl };
+type QueryEmbeddingEntry = SharedEmbeddingWork & { at: number; p: Promise<EmbeddedQuery | null> };
 const embedQueryInflight = new Map<string, QueryEmbeddingEntry>();
 let selectionSerial = 0;
 let lastSelectionKey: string | undefined;
@@ -1022,7 +1024,7 @@ async function withinEmbeddingDeadline<T>(promise: Promise<T | null>, options?: 
   }
   finally { if (timer) clearTimeout(timer); }
 }
-function extendQueryWork(entry: QueryEmbeddingEntry, options: EmbeddingRequestOptions): void {
+function extendQueryWork(entry: SharedEmbeddingWork, options: EmbeddingRequestOptions): void {
   if (options.priority !== 'background') entry.work.priority = 'foreground';
   if (entry.work.deadlineAtMs !== undefined) {
     entry.work.deadlineAtMs = options.deadlineAtMs === undefined ? undefined : Math.max(entry.work.deadlineAtMs, options.deadlineAtMs);
@@ -1228,6 +1230,30 @@ export async function embedQuery(query: string, options?: EmbeddingRequestOption
   return (await embedQueryWithSpace(query, options))?.vector ?? null;
 }
 
+/** One physical pinned batch. Its work budget can be extended by subscribers;
+ * individual callers must bound their own wait outside this producer promise. */
+async function embedPinnedTexts(
+  lease: EmbeddingProducerLease, texts: string[], options: EmbeddingWorkOptions,
+): Promise<EmbeddedTexts | null> {
+  const { provider } = lease;
+  if (inCooldown() || providerBusyReason(provider)
+    || (injectedProvider === undefined && (embeddingsDisabledByEnv() || providerOverride() === 'off'))) return null;
+  try {
+    const vectors = await callProviderEmbed(provider, texts, options);
+    if (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs) return null;
+    // Count health once per physical batch. A local rescue must not erase a
+    // preferred remote provider's failure streak.
+    if (lease.primary) recordSuccess(provider);
+    return { ...producerSpace(provider), vectors };
+  } catch (error) {
+    if (!skippedEmbeddingWork(error) && (options.deadlineAtMs === undefined || Date.now() < options.deadlineAtMs)) {
+      const failure = recordFailure(error);
+      if (failure.opened) markProviderCooldown(provider, failure.cls, failure.untilMs, failure.failures);
+    }
+    return null;
+  }
+}
+
 /** A query result is a lease on its real producer. Pinned document work cannot
  * silently fall over into a different space or relabel its output. */
 export async function embedTextsWithSpace(texts: string[], options: EmbeddingRequestOptions & { space?: EmbeddedQuery } = {}): Promise<EmbeddedTexts | null> {
@@ -1236,24 +1262,111 @@ export async function embedTextsWithSpace(texts: string[], options: EmbeddingReq
   const provider = options.space ? lease?.provider : await withinEmbeddingDeadline(getEmbeddingProvider(), options);
   if (!provider) return null;
   if (texts.length === 0) return { ...producerSpace(provider), vectors: [] };
-  if (options.space) {
-    if (inCooldown() || providerBusyReason(provider) || (injectedProvider === undefined && (embeddingsDisabledByEnv() || providerOverride() === 'off'))) return null;
-    try {
-      const vectors = await withinEmbeddingDeadline(callProviderEmbed(provider, texts, options), options);
-      // A successful primary document call ends a consecutive failure streak.
-      // A local rescue must not erase failures of the preferred remote model.
-      if (vectors && lease?.primary) recordSuccess(provider);
-      return vectors ? { ...producerSpace(provider), vectors } : null;
-    } catch (error) {
-      if (!skippedEmbeddingWork(error) && (options.deadlineAtMs === undefined || Date.now() < options.deadlineAtMs)) {
-        const failure = recordFailure(error);
-        if (failure.opened) markProviderCooldown(provider, failure.cls, failure.untilMs, failure.failures);
-      }
-      return null;
-    }
-  }
+  if (lease) return withinEmbeddingDeadline(embedPinnedTexts(lease, texts, options), options);
   const result = await withinEmbeddingDeadline(embedBatchWithProviderFailover(provider, texts, { operation: 'embedTexts', count: texts.length }, options), options);
   return result && !('skipped' in result) ? { ...producerSpace(result.provider), vectors: result.vectors } : null;
+}
+
+export interface SharedEmbeddingTextCache {
+  embed(texts: string[], options: EmbeddingRequestOptions & { space: EmbeddedQuery }): Promise<EmbeddedTexts | null>;
+  /** Retire cache admission, without cancelling another caller's producer. */
+  clear(): void;
+}
+
+/** Advisory vector reuse only: exact producer object, space and text determine
+ * identity. Neither the cache nor a similarity score grants tool authority. */
+export function createSharedEmbeddingTextCache(options: {
+  maxEntries?: number; maxTextCharacters?: number; ttlMs?: number;
+} = {}): SharedEmbeddingTextCache {
+  const bounded = (value: number | undefined, fallback: number, cap: number) =>
+    value !== undefined && Number.isSafeInteger(value) && value > 0 ? Math.min(value, cap) : fallback;
+  const maxEntries = bounded(options.maxEntries, 512, 4096);
+  const maxCharacters = bounded(options.maxTextCharacters, 2_000_000, 4_000_000);
+  const ttlMs = bounded(options.ttlMs, 60 * 60_000, 24 * 60 * 60_000);
+  type Entry = {
+    text: string; promise: Promise<Float32Array | null>; settle(vector: Float32Array | null): void;
+    batch: SharedEmbeddingWork; pending: boolean; expiresAt: number;
+  };
+  const cache = new Map<string, Entry>();
+  const producerIds = new WeakMap<EmbeddingProvider, number>();
+  let nextProducerId = 0, characters = 0, generation = 0;
+  const remove = (key: string, entry: Entry) => {
+    if (cache.get(key) === entry) { cache.delete(key); characters -= entry.text.length; }
+  };
+  return {
+    clear() { generation++; cache.clear(); characters = 0; },
+    async embed(texts, request) {
+      if (request.deadlineAtMs !== undefined && Date.now() >= request.deadlineAtMs) return null;
+      // Bound input before constructing JSON keys, unique maps or vector arrays.
+      // Duplicate normal texts can still share one retained cache entry.
+      if (!Array.isArray(texts) || texts.length > 4096) return null;
+      let inputCharacters = 0;
+      for (const text of texts) {
+        if (typeof text !== 'string') return null;
+        inputCharacters += text.length;
+        if (inputCharacters > maxCharacters) return null;
+      }
+      const lease = queryProducers.get(request.space);
+      if (!lease || (injectedProvider === undefined && (embeddingsDisabledByEnv() || providerOverride() === 'off'))) return null;
+      const space = producerSpace(lease.provider);
+      if (space.spaceKey !== request.space.spaceKey || space.model !== request.space.model || space.dim !== request.space.dim) return null;
+      if (texts.length === 0) return { ...space, vectors: [] };
+      const epoch = generation;
+      let id = producerIds.get(lease.provider);
+      if (id === undefined) { id = ++nextProducerId; producerIds.set(lease.provider, id); }
+      const keyOf = (text: string) => JSON.stringify([id, space.spaceKey, text]);
+      const now = Date.now();
+      for (const [key, entry] of cache) if (!entry.pending && entry.expiresAt <= now) remove(key, entry);
+      const unique = new Map(texts.map(text => [keyOf(text), text]));
+      const missing = [...unique].filter(([key]) => !cache.has(key));
+      const addedCharacters = missing.reduce((sum, [, text]) => sum + text.length, 0);
+      // Pending entries are never evicted into duplicate work. If a complete
+      // requested set cannot fit, leave callers on their ordinary fallback.
+      if (unique.size > maxEntries || addedCharacters > maxCharacters) return null;
+      const requestedKeys = new Set(unique.keys());
+      for (const [key, entry] of cache) {
+        if (cache.size + missing.length <= maxEntries && characters + addedCharacters <= maxCharacters) break;
+        if (!entry.pending && !requestedKeys.has(key)) remove(key, entry);
+      }
+      if (cache.size + missing.length > maxEntries || characters + addedCharacters > maxCharacters) return null;
+      const batch: SharedEmbeddingWork = {
+        work: { priority: request.priority ?? 'foreground', deadlineAtMs: request.deadlineAtMs },
+      };
+      batch.work.onQueued = control => {
+        batch.control = control;
+        control.update({ priority: batch.work.priority, deadlineAtMs: batch.work.deadlineAtMs });
+      };
+      const owned: Array<[string, Entry]> = [];
+      for (const [key, text] of missing) {
+        let settle!: Entry['settle'];
+        const promise = new Promise<Float32Array | null>(resolve => { settle = resolve; });
+        const entry: Entry = { text, promise, settle, batch, pending: true, expiresAt: 0 };
+        cache.set(key, entry); characters += text.length; owned.push([key, entry]);
+      }
+      const entries = texts.map(text => cache.get(keyOf(text))!);
+      for (const shared of new Set(entries.filter(entry => entry.pending).map(entry => entry.batch))) extendQueryWork(shared, request);
+      for (const entry of new Set(entries)) {
+        // LRU without changing ownership of a pending promise.
+        const key = keyOf(entry.text); cache.delete(key); cache.set(key, entry);
+      }
+      if (owned.length) {
+        const publish = (result: EmbeddedTexts | null) => {
+          const valid = result?.spaceKey === space.spaceKey && result.vectors.length === owned.length;
+          for (const [index, [key, entry]] of owned.entries()) {
+            const vector = valid ? result.vectors[index] : null;
+            if (generation !== epoch || !vector) remove(key, entry);
+            else { entry.pending = false; entry.expiresAt = Date.now() + ttlMs; }
+            entry.settle(vector);
+          }
+        };
+        void embedPinnedTexts(lease, owned.map(([, entry]) => entry.text), batch.work).then(publish, () => publish(null));
+      }
+      const vectors = await withinEmbeddingDeadline(Promise.all(entries.map(entry => entry.promise)), request);
+      if (generation !== epoch || !vectors || vectors.some(vector => !vector || !isUsableEmbeddingVector(vector, space.dim))) return null;
+      // Cache vectors stay private so one consumer cannot poison another's reuse.
+      return { ...space, vectors: vectors.map(vector => vector!.slice()) };
+    },
+  };
 }
 
 export async function embedTexts(texts: string[], options?: EmbeddingRequestOptions): Promise<Float32Array[] | null> {
