@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import { mcpConnectionHelp, mcpConnectionPresentation, mcpServerNameConflict } from '../../lib/mcp-setup-view.js';
+import { connectionSetupChatNavigation } from '../../lib/connection-setup-draft.js';
 import type { McpServer } from '../../lib/connect.js';
 
 // Execute the actual card and its rendered event callbacks without a DOM,
@@ -75,6 +76,7 @@ function mount(initial: McpServer, replies: { save?: (name: string, key: string,
     '@/components/ui/Field': { Field: 'field', Input: 'input', Select: 'select', Textarea: 'textarea' },
     '@/components/ui/StatusPill': { StatusPill: 'status' }, '@/components/ui/Skeleton': { Skeleton: 'skeleton' },
     '@/components/ui/QueryUnavailable': { QueryUnavailable: 'unavailable' }, '@/lib/poll': {},
+    '@/lib/connection-setup-draft': { connectionSetupChatNavigation },
     '@/lib/connect': transport, '@/lib/mcp-setup': {},
     '@/lib/mcp-setup-view': { mcpConnectionHelp, mcpConnectionPresentation, mcpServerNameConflict },
     '@/lib/cn': { cn: (...args: unknown[]) => args.filter(Boolean).join(' ') },

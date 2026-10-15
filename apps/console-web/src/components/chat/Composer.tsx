@@ -13,6 +13,8 @@ import { claimArtifactDiscussionSeed, prepareArtifactDiscussion, readArtifactDis
 import { prepareSessionFileContext } from '@/lib/session-files';
 import { useFileDock } from '@/components/chat/FileDock';
 import { seedProjectToolsComposerDraft } from '@/lib/project-tools-draft';
+import { seedConnectionSetupComposerDraft } from '@/lib/connection-setup-draft';
+import { COMPOSER_EXAMPLES, seedComposerExample } from '@/lib/composer-examples';
 
 const MAX_BYTES = 30 * 1024 * 1024;
 
@@ -57,6 +59,7 @@ export function Composer({
   agentId,
   applyAgent,
   voiceMessages,
+  gettingStarted = false,
 }: {
   busy: boolean;
   mode?: ComposerMode;
@@ -88,6 +91,8 @@ export function Composer({
   /** This composer's conversation, for voice mode: when given, the owner can
    *  talk to Clem here and hear what she says back in it. */
   voiceMessages?: readonly VoiceChatMessage[];
+  /** Optional guidance only for an empty, unassigned new conversation. */
+  gettingStarted?: boolean;
 }) {
   const location = useLocation();
   const dock = useFileDock();
@@ -106,10 +111,22 @@ export function Composer({
     draftOwner.current = next;
   }, [routeDraftKey, draftConversationId]);
   const draft = useSyncExternalStore(subscribeComposerDraft, () => readComposerDraft(draftKey));
+  const setupDraftFocus = useRef<string | null>(null);
   useEffect(() => {
     if (activeScope.current !== draftKey) return;
-    seedProjectToolsComposerDraft({ pathname: location.pathname, navigationKey: location.key, state: location.state,
+    const projectSeeded = seedProjectToolsComposerDraft({ pathname: location.pathname, navigationKey: location.key, state: location.state,
       routeDraftKey, draftKey, executionSessionId: sessionId, conversationSessionId: draftConversationId, busy });
+    const connectionSeeded = seedConnectionSetupComposerDraft({ pathname: location.pathname, navigationKey: location.key, state: location.state,
+      routeDraftKey, draftKey, executionSessionId: sessionId, conversationSessionId: draftConversationId, busy });
+    if (projectSeeded || connectionSeeded) setupDraftFocus.current = draftKey;
+    if (setupDraftFocus.current !== draftKey || busy) return;
+    const frame = requestAnimationFrame(() => {
+      if (!mounted.current || activeScope.current !== draftKey) return;
+      setupDraftFocus.current = null;
+      autoGrow();
+      textarea.current?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
   }, [location.pathname, location.key, location.state, routeDraftKey, draftKey, sessionId, draftConversationId, busy]);
   useEffect(() => {
     const selection = readArtifactDiscussion((location.state as { artifactDiscussion?: unknown } | null)?.artifactDiscussion);
@@ -247,6 +264,18 @@ export function Composer({
 
   const uploading = attachments.some((a) => a.status === 'uploading');
   const hasDraft = value.trim().length > 0 || attachments.length > 0 || Boolean(draft.artifact);
+  const showStartGuidance = gettingStarted && !busy && !pendingPost && !sessionId && !draftConversationId && draftKey === routeDraftKey;
+  const canChooseExample = showStartGuidance && !preparing && !voiceOn && !listening && !transcribing
+    && !value && !attachments.length && !draft.artifact;
+  const examplePermission = useRef(canChooseExample);
+  examplePermission.current = canChooseExample;
+  const chooseExample = (id: string) => {
+    if (!seedComposerExample({ id, draftKey, routeDraftKey, activeDraftKey: activeScope.current,
+      allowed: examplePermission.current && mounted.current && !submitting.current,
+      executionSessionId: sessionId, conversationSessionId: draftConversationId })) return;
+    textarea.current?.focus({ preventScroll: true });
+    requestAnimationFrame(() => { if (mounted.current && activeScope.current === draftKey) autoGrow(); });
+  };
   // Like the send button's other face: offered on an empty composer, gone
   // once the owner types or dictates.
   const voiceAvailable = Boolean(dictation && voiceMessages) && !listening && !transcribing;
@@ -316,6 +345,17 @@ export function Composer({
 
   return (
     <div>
+    {showStartGuidance && <section className="mb-7" aria-labelledby="conversation-start-heading">
+      <h2 id="conversation-start-heading" className="text-h1 text-fg">What would you like to get done?</h2>
+      <p className="mt-3 max-w-prose text-body text-muted">Describe your goal in your own words. Add a file if it helps.</p>
+      {canChooseExample && <><div className="mt-5 flex flex-wrap gap-2" aria-label="Examples to edit">
+        {COMPOSER_EXAMPLES.map(example => <button key={example.id} type="button" onClick={() => chooseExample(example.id)}
+          className="cursor-pointer rounded-lg border border-border bg-surface px-3 py-2 text-small text-fg hover:bg-subtle">
+          {example.label}
+        </button>)}
+      </div>
+      <p className="mt-2 text-caption text-muted">Choose an example to edit before sending.</p></>}
+    </section>}
     <div
       // One capsule floats over the thread: the box, its mode and model, and
       // its send. The focus ring lives HERE, on the wrapper: the textarea sets

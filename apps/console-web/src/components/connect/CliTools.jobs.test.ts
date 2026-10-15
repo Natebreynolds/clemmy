@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import { cliConnectionHealth, cliConnectionPresentation } from '../../lib/cli-connection-view.js';
+import { connectionSetupChatNavigation } from '../../lib/connection-setup-draft.js';
 
 type Node = { type: any; props: Record<string, any> };
 type Slot = { value?: any; deps?: unknown[]; cleanup?: () => void; effect?: () => void | (() => void) };
@@ -103,6 +104,7 @@ function mount(component = 'ManagedClis', controls: { start?: () => Promise<any>
     '@/lib/poll': { usePoll(key: unknown[]) { return { data: key[0] === 'managed-clis' ? { github: { installed: false }, composio: { installed: false } }
       : key[0] === 'cli-catalog' ? { connected } : key[0] === 'clis' ? { clis: [] } : {}, isLoading: false }; } },
     '@/lib/connect': transport, '@/lib/platform': { isMac: () => true },
+    '@/lib/connection-setup-draft': { connectionSetupChatNavigation },
     '@/lib/cli-connection-view': { cliConnectionHealth, cliConnectionPresentation },
     '@/components/ui/Card': { Card: 'section' }, '@/components/ui/Button': { Button: 'button' }, '@/components/ui/StatusPill': { StatusPill: 'status' },
     'lucide-react': new Proxy({}, { get: () => 'svg' }),

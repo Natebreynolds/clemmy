@@ -6,6 +6,7 @@ import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { usePoll } from '@/lib/poll';
+import { connectionSetupChatNavigation } from '@/lib/connection-setup-draft';
 import {
   getClis, getCliConnections, saveCli, removeSavedCli, probeCli,
   getManagedClis, startManagedCliJob, getManagedCliJob,
@@ -151,7 +152,7 @@ export function CliTools() {
           <h3 id="cli-tools-heading" className="text-h3 text-fg">Command-line tools</h3>
           <p className="max-w-prose text-small text-muted">Tell Clem which tool you need. She can install it, remember tools already on your computer, and check access. Finish any browser or private sign-in prompts when asked.</p>
         </div>
-        <Button variant="secondary" size="sm" onClick={() => navigate('/chat')}>
+        <Button variant="secondary" size="sm" onClick={() => { const target = connectionSetupChatNavigation('cli'); if (target) navigate(target.pathname, { state: target.state }); }}>
           <MessageCircle className="h-4 w-4" aria-hidden /> Ask Clem
         </Button>
       </div>
@@ -233,7 +234,7 @@ function ManagedCard({ label, command, icon: Icon, status, health, unavailable, 
           {presentation.state === 'not_installed' && <Button size="sm" disabled={anyBusy} onClick={() => onRun('install')}>{isBusy('install') ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Download className="h-3.5 w-3.5" aria-hidden />} Install</Button>}
           {presentation.state === 'signed_out' && <Button size="sm" disabled={anyBusy} onClick={() => onRun('auth')}>{isBusy('auth') ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <KeyRound className="h-3.5 w-3.5" aria-hidden />} Sign in</Button>}
           {presentation.state === 'connected' && <Button size="sm" variant="secondary" disabled={anyBusy} onClick={() => onRun('repair')}>{isBusy('repair') ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RotateCw className="h-3.5 w-3.5" aria-hidden />} Re-auth</Button>}
-          {!['not_installed', 'signed_out', 'connected'].includes(presentation.state) && <Button size="sm" variant="secondary" disabled={anyBusy} onClick={() => navigate('/chat')}><MessageCircle className="h-3.5 w-3.5" aria-hidden /> Ask Clem to check</Button>}
+          {!['not_installed', 'signed_out', 'connected'].includes(presentation.state) && <Button size="sm" variant="secondary" disabled={anyBusy} onClick={() => { const target = connectionSetupChatNavigation('cli', command); if (target) navigate(target.pathname, { state: target.state }); }}><MessageCircle className="h-3.5 w-3.5" aria-hidden /> Ask Clem to check</Button>}
         </div>
       )}
     </Card>

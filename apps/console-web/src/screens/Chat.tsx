@@ -196,10 +196,9 @@ export function Chat() {
     // lives on Home — Chat is the thread and the composer.
     return (
       <FileDockWorkspace conversationId={chat.sessionId.current ?? undefined}>
-      <div className="flex h-full min-h-0 flex-col">
-        <div className="min-h-0 flex-1" />
-        <div className={CHAT_COMPOSER_WRAP}>
-          <Composer inputRef={composerRef} voiceMessages={chat.messages} sessionId={chat.sessionId.current ?? undefined} draftSessionId={chat.conversationSessionId.current} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} placeholder={agent ? `Message ${agent.name}…` : undefined} agentSlot={agentSlot} agentId={agent?.id ?? null} applyAgent={applyAgent} />
+      <div className="flex h-full min-h-0 flex-col overflow-y-auto py-8">
+        <div className={`${CHAT_COMPOSER_WRAP} my-auto shrink-0`}>
+          <Composer gettingStarted inputRef={composerRef} voiceMessages={chat.messages} sessionId={chat.sessionId.current ?? undefined} draftSessionId={chat.conversationSessionId.current} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} placeholder={agent ? `Message ${agent.name}…` : undefined} agentSlot={agentSlot} agentId={agent?.id ?? null} applyAgent={applyAgent} />
         </div>
       </div>
       </FileDockWorkspace>
