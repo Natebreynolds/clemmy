@@ -21,11 +21,13 @@ export const TECHNICAL_CONTENT_MARKETING_RULE_MARKER =
   'SOURCE-DATED-CALENDAR-ONE-IDEA-PER-POST' as const;
 export const WORKSPACE_BUILDER_SKILL = 'workspace-builder' as const;
 export const PEOPLE_LOOKUP_SKILL = 'people-lookup' as const;
+export const WORKFLOW_BUILDER_SKILL = 'workflow-builder' as const;
 
 const BUILTIN_SKILLS = Object.freeze([
   TECHNICAL_CONTENT_MARKETING_SKILL,
   WORKSPACE_BUILDER_SKILL,
   PEOPLE_LOOKUP_SKILL,
+  WORKFLOW_BUILDER_SKILL,
 ]);
 
 /**
