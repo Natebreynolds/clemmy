@@ -17,6 +17,7 @@ import {
   openEventLog,
 } from './eventlog.js';
 import { readConsumedTaskContinuityPacket } from '../../memory/task-continuity.js';
+import { listCachedToolkits } from '../../integrations/composio/client.js';
 import { renderTypedControlState } from './typed-control-state.js';
 import { completionEvidenceSource } from './recovery-activation.js';
 
@@ -477,7 +478,13 @@ export interface ConnectionDependencyPresentation {
   subject: ConnectionDependencySubject;
 }
 
+/** The app's own name from the provider catalog ("ElevenLabs"), else the
+ *  slug read as words. */
 function toolkitDisplayName(toolkit: string): string {
+  try {
+    const named = listCachedToolkits().find((entry) => entry.slug.trim().toLowerCase() === toolkit)?.name?.trim();
+    if (named) return named;
+  } catch { /* the slug reads well enough on its own */ }
   return toolkit.split('_')
     .filter(Boolean)
     .map((part) => `${part[0]?.toUpperCase() ?? ''}${part.slice(1)}`)
