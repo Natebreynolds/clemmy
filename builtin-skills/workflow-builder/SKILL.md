@@ -48,18 +48,17 @@ Before saving, work out what one run does and say it plainly, in your own words:
 - **What it changes and where**, and whether any step will stop to ask the user first.
 - **How often it runs.** A per-run cost repeats on every scheduled run.
 
-Then suggest the improvement that matters, if there is one. For example:
+Then, in the same message, offer the improvement that matters. When a step starts an agent for every item and the list can run past about ten, or a run takes more than a few minutes, always offer one concrete alternative and say what it saves. Do this even when you are also asking the user something else; one message can carry both. For example:
 
-> "research_angles starts a research agent for every account. With 50 accounts that's 50 agents per run, about 10 minutes. I can cap it at the 10 most recent, or research them in one batched step."
+> "research_angles starts a research agent for every account. With 50 accounts that's 50 agents per run, about 10 minutes, every weekday. I can cap it at the 10 most recent accounts (about 2 minutes), only research accounts that are new since the last run, or research them all in one batched step. Which would you like, or keep all 50?"
 
-Other common improvements:
+Other alternatives worth offering when they fit:
 
 - Use a `call` step instead of an agent for a fixed read or write.
-- Use `forEachNewOnly` on recurring runs.
 - Merge two agent steps that only pass text between them.
 - Put `requiresApproval` on a send the user wants to see first.
 
-Offer one to three; don't lecture.
+Offer one to three. Let the user choose, and build what they pick; don't lecture.
 
 ## 3. Missing apps, accounts and inputs
 
