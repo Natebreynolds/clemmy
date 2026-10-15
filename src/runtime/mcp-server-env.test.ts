@@ -15,6 +15,43 @@ const server = (env: unknown, type: ManagedMcpServer['type'] = 'stdio'): Managed
 });
 const source = (daemon: McpServerEnvSources['daemon'] = {}, inherited: McpServerEnvSources['inherited'] = {}): McpServerEnvSources => ({ daemon, inherited });
 const syntheticMerge = (extra: Record<string, string> = {}): Record<string, string> => ({ PATH: '/fixture/bin', ...extra });
+const { observeMcpServerSetup } = await import('./mcp-server-setup.js');
+
+test('stdio argv expands declared credential references literally and leaves unknown and shell spellings unchanged', () => {
+  const configured = { ...server({ CONTROLLED_KEY: '', INLINE: 'inline-$&-${OTHER}' }),
+    args: ['--token=${CONTROLLED_KEY}', '${INLINE}', '${UNDECLARED_KEY}', '$CONTROLLED_KEY', '%CONTROLLED_KEY%', '$(literal)', ''] };
+  const original = [...configured.args];
+  const sources = source({ CONTROLLED_KEY: ' synthetic $& value ', UNDECLARED_KEY: 'must-not-expand' }, {});
+  assert.deepEqual(mcpServersTestHooks.stdioLaunchArgs(configured, sources),
+    ['--token= synthetic $& value ', 'inline-$&-${OTHER}', '${UNDECLARED_KEY}', '$CONTROLLED_KEY', '%CONTROLLED_KEY%', '$(literal)', '']);
+  assert.deepEqual(configured.args, original, 'the saved template stays unchanged');
+  assert.deepEqual(serverEnvStatus(configured, sources), { declaredEnvKeys: ['CONTROLLED_KEY', 'INLINE'], unsetEnvKeys: [] });
+  assert.equal(JSON.stringify(serverEnvStatus(configured, sources)).includes('synthetic $& value'), false);
+});
+
+test('stdio argv and launch env share the same resolved values, with no undeclared credential expansion', () => {
+  const configured = { ...server(['CONTROLLED_KEY']), args: ['${CONTROLLED_KEY}', '${PRIVATE_UNRELATED}'] };
+  const env = mcpServersTestHooks.stdioLaunchEnv(configured, source({ CONTROLLED_KEY: 'synthetic-current' }), syntheticMerge);
+  env.PRIVATE_UNRELATED = 'synthetic-private';
+  assert.deepEqual(mcpServersTestHooks.stdioLaunchArgs(configured, source(env)), ['synthetic-current', '${PRIVATE_UNRELATED}']);
+});
+
+for (const [label, sources] of [
+  ['absent', source()], ['explicit empty daemon', source({ CONTROLLED_KEY: '' }, { CONTROLLED_KEY: 'stale-value' })],
+  ['whitespace daemon', source({ CONTROLLED_KEY: '  ' })],
+] as const) test(`a declared argv credential remains needs-credentials before any connection when ${label}`, async () => {
+  const configured = { ...server({ CONTROLLED_KEY: '' }), args: ['--token', '${CONTROLLED_KEY}', '${UNDECLARED_KEY}'] };
+  const status = serverEnvStatus(configured, sources);
+  let connections = 0;
+  const readiness = await observeMcpServerSetup({ enabled: true, allowed: true, unsetEnvKeys: status.unsetEnvKeys,
+    serverSlug: 'controlled-env', isCurrent: () => true, indexTools() {},
+    async listTools() { connections++; throw new Error('a missing credential must not start a child'); } });
+  assert.deepEqual(readiness, { state: 'needs_credentials', unsetEnvKeys: ['CONTROLLED_KEY'] });
+  assert.equal(connections, 0);
+  const args = mcpServersTestHooks.stdioLaunchArgs(configured, sources);
+  assert.equal(args[1], label === 'whitespace daemon' ? '  ' : '');
+  assert.equal(args[2], '${UNDECLARED_KEY}');
+});
 
 test('adding declared header keys preserves existing inline values and legacy pass-through names', () => {
   assert.deepEqual(declareMcpServerEnvKeys({ EXISTING: ' inline human value ', BLANK: '' }, ['EXISTING', 'NEW_KEY']),

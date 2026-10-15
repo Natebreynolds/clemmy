@@ -82,11 +82,17 @@ export interface ProjectLinkedLocalProject {
   toolServers?: ProjectLocalToolServer[];
 }
 
-/** A tool server a local project declares, and whether Clem is connected to
- * one of the same name. Declaring one connects nothing. */
+export type ProjectLocalToolServerState = 'unconfigured' | 'disabled' | 'needs_credentials'
+  | 'connecting' | 'connected' | 'unavailable' | 'not_checked';
+
+/** A declared name and passive readiness of Clem's own associated connection.
+ * This does not attest the project's intended endpoint or account. */
 export interface ProjectLocalToolServer {
   name: string;
   connected: boolean;
+  /** Absent from older services, whose name-only marker proves no connection. */
+  state?: ProjectLocalToolServerState;
+  toolCount?: number;
 }
 
 /** A page made in a project: an HTML file written into a linked local project. */
@@ -487,10 +493,17 @@ function toolServers(value: unknown): ProjectLocalToolServer[] {
   const kept: ProjectLocalToolServer[] = [];
   for (const entry of value) {
     if (!entry || typeof entry !== 'object') continue;
-    const raw = entry as { name?: unknown; connected?: unknown };
+    const raw = entry as { name?: unknown; connected?: unknown; state?: unknown; toolCount?: unknown };
     const name = typeof raw.name === 'string' ? raw.name.trim() : '';
-    // Only an explicit yes says Clem can reach it.
-    if (name && !kept.some((row) => row.name === name)) kept.push({ name, connected: raw.connected === true });
+    const known = typeof raw.state === 'string'
+      && ['unconfigured', 'disabled', 'needs_credentials', 'connecting', 'connected', 'unavailable', 'not_checked'].includes(raw.state);
+    let state: ProjectLocalToolServerState = known ? raw.state as ProjectLocalToolServerState : 'not_checked';
+    // An older service's enabled-name boolean is not a connection observation.
+    if (state === 'connected' && raw.connected !== true) state = 'not_checked';
+    const connected = state === 'connected';
+    if (name && !kept.some((row) => row.name === name)) kept.push({ name, connected, state,
+      ...(connected && Number.isSafeInteger(raw.toolCount) && Number(raw.toolCount) > 0 ? { toolCount: Number(raw.toolCount) } : {}),
+    });
   }
   return kept;
 }
@@ -508,6 +521,23 @@ export function projectLocalProjectMissingLine(localProject: Pick<ProjectLinkedL
 export const PROJECT_LOCAL_COMMANDS_LABEL = 'Commands it offers';
 export const PROJECT_LOCAL_COMMANDS_HINT = 'Ask for one by name in a conversation in this project.';
 export const PROJECT_LOCAL_TOOL_SERVERS_LABEL = 'Tools it expects';
+export const PROJECT_LOCAL_TOOL_SERVERS_HINT = 'A matching name does not confirm the same service or account. Clem checks what the work needs.';
+
+/** Plain-language readiness, never raw transport codes or vendor errors. */
+export function projectLocalToolServerReadiness(server: ProjectLocalToolServer): {
+  label: string; hint: string; tone: 'success' | 'warning' | 'neutral';
+} {
+  const state = toolServers([server])[0]?.state ?? 'not_checked';
+  switch (state) {
+    case 'unconfigured': return { label: 'Setup needed', tone: 'neutral', hint: 'Clem has no connection configured under this name. Ask her to set it up.' };
+    case 'disabled': return { label: 'Turned off', tone: 'neutral', hint: 'This connection is turned off. Clem can review its setup with you.' };
+    case 'needs_credentials': return { label: 'Access details needed', tone: 'warning', hint: 'Enter the required values privately in Connect. Do not paste passwords or keys into chat.' };
+    case 'connecting': return { label: 'Connecting', tone: 'neutral', hint: 'The connection is starting; readiness has not been confirmed yet.' };
+    case 'connected': return { label: 'Connected in Clem', tone: 'success', hint: 'Clem can reach a server under this name. Its service and account still need to match the project.' };
+    case 'unavailable': return { label: 'Connection needs attention', tone: 'warning', hint: 'The last connection check did not succeed. Clem can help check its setup.' };
+    default: return { label: 'Not checked', tone: 'neutral', hint: 'A saved name alone does not verify a connection. Ask Clem to check it.' };
+  }
+}
 
 /** The commands a local project names, in its own order; empty when it names none. */
 export function projectLocalProjectCommands(localProject: Pick<ProjectLinkedLocalProject, 'commands'>): string[] {
@@ -527,14 +557,8 @@ export function projectLocalProjectToolServers(localProject: Pick<ProjectLinkedL
   const servers = [...all.filter((row) => row.connected), ...all.filter((row) => !row.connected)];
   const missing = servers.filter((row) => !row.connected).map((row) => row.name);
   const missingLine = missing.length === 0 ? null
-    : missing.length === 1
-      ? `${missing[0]} is not connected. Work here that needs it will say so until it is connected in Connect.`
-      : `${listOf(missing)} are not connected. Work here that needs them will say so until they are connected in Connect.`;
+    : 'Clem can check these connections and guide any setup that is still needed.';
   return { servers, missing, missingLine };
-}
-
-function listOf(items: string[]): string {
-  return items.length <= 2 ? items.join(' and ') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
 }
 
 /** Said when the folder is there and is not a repository; null otherwise. */

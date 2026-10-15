@@ -204,7 +204,7 @@ import { ExecutionStore } from '../execution/store.js';
 import { isReservedProjectWorkflowRunRecord } from '../execution/compiled-project-run-contract.js';
 import { closeCheckIn } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
-import type { AssistantRequest, ExecutionRecord, PendingApproval } from '../types.js';
+import type { AssistantRequest, ExecutionRecord, ManagedMcpServer, PendingApproval } from '../types.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import {
@@ -230,7 +230,7 @@ import {
 } from '../runtime/mobile-sessions.js';
 import { getManagedCliJob, startManagedCliJob, type ManagedCliAction, type ManagedCliKind } from '../runtime/managed-cli-jobs.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
-import { mcpServerCreateSummary, prepareMcpServerCreateRequest } from '../runtime/mcp-server-request.js';
+import { mcpServerCreateSummary, prepareMcpServerCreateRequest, validateMcpWorkingDirectory } from '../runtime/mcp-server-request.js';
 import { buildDevFlagsSnapshot, setDevFlag, clearDevFlag, setDevMode, isDevModeEnabled } from '../runtime/dev-flags.js';
 import {
   getOrCreateExternalMcpServers,
@@ -11832,35 +11832,44 @@ export function registerConsoleRoutes(
     try {
       const current = loadUserMcpServers();
       const existing = current[name];
+      let server: Partial<ManagedMcpServer>;
       if (!existing) {
-        // Allow toggling an auto-detected server by writing a minimal
-        // override that ONLY sets the enabled flag. The discoverer
-        // honors user-file values when both exist.
+        // A per-machine override can toggle an imported definition. Preserve
+        // its complete launch context, including the working directory.
         const discovered = discoverMcpServers().find((s) => s.name === name);
         if (!discovered) { res.status(404).json({ error: 'server not found' }); return; }
-        current[name] = {
+        server = {
           name,
           type: discovered.type,
           enabled: typeof body.enabled === 'boolean' ? body.enabled : discovered.enabled,
           description: discovered.description,
           command: discovered.command,
           args: discovered.args,
+          cwd: discovered.cwd,
           url: discovered.url,
           headers: discovered.headers,
           env: discovered.env,
         };
       } else {
-        if (typeof body.enabled === 'boolean') existing.enabled = body.enabled;
-        if (typeof body.description === 'string') existing.description = body.description;
-        if (typeof body.command === 'string') existing.command = body.command;
-        if (Array.isArray(body.args)) existing.args = body.args.filter((a: unknown): a is string => typeof a === 'string');
-        if (typeof body.url === 'string') existing.url = body.url;
-        if (body.type === 'http' || body.type === 'sse' || body.type === 'stdio') existing.type = body.type;
+        // Prepare a copy so an invalid combined transport/directory edit does
+        // not mutate the loaded definition before validation.
+        server = { ...existing };
+        if (typeof body.enabled === 'boolean') server.enabled = body.enabled;
+        if (typeof body.description === 'string') server.description = body.description;
+        if (typeof body.command === 'string') server.command = body.command;
+        if (Array.isArray(body.args)) server.args = body.args.filter((a: unknown): a is string => typeof a === 'string');
+        if (typeof body.url === 'string') server.url = body.url;
+        if (body.type === 'http' || body.type === 'sse' || body.type === 'stdio') server.type = body.type;
       }
+      const cwd = body.cwd === null ? undefined : body.cwd === undefined ? server.cwd : body.cwd;
+      const cwdError = validateMcpWorkingDirectory(cwd, server.type ?? 'stdio');
+      if (cwdError) { res.status(400).json({ error: cwdError, code: 'invalid_mcp_server' }); return; }
+      if (cwd === undefined) delete server.cwd;
+      else server.cwd = cwd as string;
+      current[name] = server;
       saveUserMcpServers(current);
       await invalidateConfiguredMcpServers();
       clearAutonomyAgentCache();
-      const server = current[name];
       res.json({ server: {
         ...mcpServerCreateSummary({
           name, type: server.type ?? 'stdio', enabled: server.enabled !== false, description: server.description,

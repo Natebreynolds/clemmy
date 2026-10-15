@@ -18,6 +18,7 @@ import {
   PROJECT_LOCAL_COMMANDS_HINT,
   PROJECT_LOCAL_COMMANDS_LABEL,
   PROJECT_LOCAL_TOOL_SERVERS_LABEL,
+  PROJECT_LOCAL_TOOL_SERVERS_HINT,
   PROJECT_PAGES_EMPTY,
   PROJECT_PAGES_HINT,
   PROJECT_PAGES_LABEL,
@@ -26,6 +27,7 @@ import {
   projectLocalProjectGitLine,
   projectLocalProjectMissingLine,
   projectLocalProjectToolServers,
+  projectLocalToolServerReadiness,
   projectPagePlace,
   projectPages,
   projectPageTitle,
@@ -40,6 +42,7 @@ import {
   type ProjectOverview,
   type ProjectPageView,
   type ProjectResourceView,
+  type ProjectLocalToolServer,
 } from '@clem/chat-engine';
 import { listApprovals, type ApprovalRow } from '../lib/api';
 import { Decisions, relativeTime } from '../components/Approvals';
@@ -592,6 +595,21 @@ function ProjectEditor({ overview, onCancel, onSaved }: {
   );
 }
 
+/** The phone uses the same readiness words as the desktop, including older
+ * services whose name-only boolean does not prove a connection. */
+export function ProjectToolServerStatus({ server }: { server: ProjectLocalToolServer }) {
+  const row = projectLocalProjectToolServers({ toolServers: [server] }).servers[0];
+  if (!row) return null;
+  const status = projectLocalToolServerReadiness(row);
+  return (
+    <span role="listitem" class={`project-offer${row.connected ? ' is-connected' : status.tone === 'warning' ? ' is-missing' : ''}`}
+      title={status.hint} style={{ flexWrap: 'wrap' }}>
+      <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>{row.name}</span>
+      <span class="project-offer-state">{status.label}{row.toolCount ? ` · ${row.toolCount} ${row.toolCount === 1 ? 'tool' : 'tools'}` : ''}</span>
+    </span>
+  );
+}
+
 /** One thing the project uses, with whether it was checked and a way to take it off. */
 function ResourceRow({ resource, onRemoved }: {
   resource: ProjectResourceView;
@@ -653,13 +671,9 @@ function ResourceRow({ resource, onRemoved }: {
           <span class="project-offers">
             <span class="project-offers-label">{PROJECT_LOCAL_TOOL_SERVERS_LABEL}</span>
             <span class="project-offers-list" role="list" aria-label={`${PROJECT_LOCAL_TOOL_SERVERS_LABEL} in ${name}`}>
-              {tools.servers.map((server) => (
-                <span key={server.name} role="listitem" class={`project-offer${server.connected ? ' is-connected' : ' is-missing'}`}>
-                  {server.name}
-                  <span class="project-offer-state">{server.connected ? 'connected' : 'not connected'}</span>
-                </span>
-              ))}
+              {tools.servers.map((server) => <ProjectToolServerStatus key={server.name} server={server} />)}
             </span>
+            <span class="project-line-note">{PROJECT_LOCAL_TOOL_SERVERS_HINT}</span>
             {tools.missingLine ? <span class="project-line-note" role="note">{tools.missingLine}</span> : null}
           </span>
         ) : null}

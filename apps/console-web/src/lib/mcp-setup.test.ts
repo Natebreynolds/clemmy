@@ -102,7 +102,7 @@ test('malformed field types are refused rather than filtered or coerced', () => 
 
 test('unknown launch, authentication and wrapper fields are never silently dropped', () => {
   for (const config of [
-    { command: 'node', cwd: '/tmp' }, { command: 'node', transport: 'stdio' }, { command: 'node', timeout: 30 },
+    { command: 'node', transport: 'stdio' }, { command: 'node', timeout: 30 },
     { command: 'node', auth: { token: 'private' } }, { command: 'node', oauth: true },
     { command: 'node', headers: { Authorization: 'private' } },
     { type: 'http', url: 'https://example.test', args: ['unexpected'] },
@@ -124,10 +124,20 @@ test('header injection, NUL payloads and conflicting header names are refused pr
 });
 
 test('multi-server validation completes before exposing any server to submission', () => {
-  rejects('{"mcpServers":{"first":{"command":"node"},"second":{"command":"node","cwd":"/tmp"}}}');
+  rejects('{"mcpServers":{"first":{"command":"node"},"second":{"command":"node","cwd":"relative/path"}}}');
   rejects('{"first":{"command":"node"},"bad name":{"command":"node"}}');
   rejects('{"__proto__":{"command":"node"}}');
   rejects('{"constructor":{"command":"node"}}');
+});
+
+test('stdio JSON retains absolute working directories with spaces without shell interpretation', () => {
+  for (const cwd of ['/tmp/Project Files', 'C:\\Users\\Test Person\\project', '\\\\server\\share\\project']) {
+    assert.equal(server(JSON.stringify({ local: { command: 'node', args: ['./server.js'], cwd } })).cwd, cwd);
+  }
+  for (const cwd of ['', ' ', '.', './project', 'C:project', '\\project', null, 4, '/tmp/line\nbreak']) {
+    rejects(JSON.stringify({ local: { command: 'node', cwd } }));
+  }
+  for (const type of ['http', 'sse']) rejects(JSON.stringify({ remote: { type, url: 'https://example.test/mcp', cwd: '/tmp' } }));
 });
 
 test('duplicate JSON names and settings are rejected instead of overwriting prior input', () => {

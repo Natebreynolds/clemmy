@@ -18,7 +18,10 @@ import { localProjectAt } from './local-projects.js';
 import { localProjectOffers } from './local-project-offers.js';
 import { pagesMadeInProject, type ProjectPageView } from './local-pages.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
-import { slugifyServerName } from '../runtime/mcp-namespace-shim.js';
+import { listMcpServerHealth, slugifyServerName } from '../runtime/mcp-namespace-shim.js';
+import { readMcpServerEnv } from '../runtime/mcp-server-env.js';
+import { BASE_DIR } from '../config.js';
+import path from 'node:path';
 import { listCodingRuns } from '../execution/coding-run-store.js';
 import { listEvents, openEventLog } from '../runtime/harness/eventlog.js';
 import { summarizeWorkManifest } from '../runtime/harness/work-manifest.js';
@@ -520,6 +523,18 @@ export function projectSummaries(options: { includeArchived?: boolean } = {}): P
     conversations.get(project.id) ?? [], pendingApprovals));
 }
 
+export type ProjectToolServerState = 'unconfigured' | 'disabled' | 'needs_credentials'
+  | 'connecting' | 'connected' | 'unavailable' | 'not_checked';
+
+/** A declaration is associated by name with Clem's own configuration. Even a
+ * live connection is not proof of the project's endpoint or account identity. */
+export interface ProjectToolServerView {
+  name: string;
+  connected: boolean;
+  state: ProjectToolServerState;
+  toolCount?: number;
+}
+
 export type ProjectResourceView = ProjectResource & {
   /** For an account: the app's name as a person writes it. */
   appName: string | null;
@@ -528,11 +543,10 @@ export type ProjectResourceView = ProjectResource & {
   localProject: {
     name: string; path: string; present: boolean; git: boolean;
     /** What the folder offers: its instruction files, the commands it names,
-     * and the tool servers it declares with whether Clem is connected to one
-     * of the same name. */
+     * and passive readiness of Clem's own server associated by name. */
     instructions: string[];
     commands: string[];
-    toolServers: Array<{ name: string; connected: boolean }>;
+    toolServers: ProjectToolServerView[];
   } | null;
 };
 
@@ -553,30 +567,62 @@ export interface ProjectCodingRunView {
 type ConnectedToolServers = () => string[];
 let connectedToolServersForTests: ConnectedToolServers | null = null;
 
-/** Test seam. Null restores Clem's own connections. */
+/** Legacy names-only test seam. Names establish configured membership, never
+ * a live connection. Null restores Clem's own metadata. */
 export function _setConnectedToolServersForTests(list: ConnectedToolServers | null): void {
   connectedToolServersForTests = list;
 }
 
-function connectedToolServers(): Set<string> {
+function projectToolServerViews(names: string[]): ProjectToolServerView[] {
+  const show = (name: string, state: ProjectToolServerState, toolCount?: number): ProjectToolServerView => ({
+    name, connected: state === 'connected', state,
+    ...(toolCount === undefined ? {} : { toolCount }),
+  });
   try {
-    const names = connectedToolServersForTests
-      ? connectedToolServersForTests()
-      : discoverMcpServers().filter((server) => server.enabled !== false).map((server) => server.name);
-    return new Set(names.map(slugifyServerName));
+    if (connectedToolServersForTests) {
+      const configured = new Set(connectedToolServersForTests().map(slugifyServerName));
+      return names.map(name => show(name, configured.has(slugifyServerName(name)) ? 'not_checked' : 'unconfigured'));
+    }
+    const configured = discoverMcpServers();
+    const health = listMcpServerHealth();
+    return names.map(name => {
+      const slug = slugifyServerName(name);
+      const matches = configured.filter(server => slugifyServerName(server.name) === slug);
+      if (matches.length === 0) return show(name, 'unconfigured');
+      // A colliding name does not select a server or confer its readiness.
+      if (matches.length !== 1) return show(name, 'unavailable');
+      const server = matches[0]!;
+      if (!server.enabled) return show(name, 'disabled');
+      try {
+        if (readMcpServerEnv(server.env, path.join(BASE_DIR, '.env')).unsetEnvKeys.length > 0) {
+          return show(name, 'needs_credentials');
+        }
+      } catch {
+        return show(name, 'not_checked');
+      }
+      const observations = health.filter(row => row.name === server.name && row.slug === slug);
+      if (observations.length > 1) return show(name, 'unavailable');
+      const observed = observations[0];
+      if (!observed) return show(name, 'not_checked');
+      if (observed.state === 'connecting') return show(name, 'connecting');
+      if (observed.state === 'degraded' || observed.state === 'unavailable') return show(name, 'unavailable');
+      if (observed.state !== 'connected') return show(name, 'not_checked');
+      // Registry zero also means no tools/list has finished yet, so it cannot
+      // certify an empty inventory. Preserve only an observed positive count.
+      const count = Number.isSafeInteger(observed.toolCount) && observed.toolCount > 0 ? observed.toolCount : undefined;
+      return show(name, 'connected', count);
+    });
   } catch {
-    // Unknown is shown as not connected: the page never claims a connection it could not read.
-    return new Set();
+    return names.map(name => show(name, 'not_checked'));
   }
 }
 
-function offersView(folder: string): { instructions: string[]; commands: string[]; toolServers: Array<{ name: string; connected: boolean }> } {
+function offersView(folder: string): { instructions: string[]; commands: string[]; toolServers: ProjectToolServerView[] } {
   const offers = localProjectOffers(folder);
-  const connected = offers.toolServers.length > 0 ? connectedToolServers() : new Set<string>();
   return {
     instructions: offers.instructions,
     commands: offers.commands.map((row) => row.name),
-    toolServers: offers.toolServers.map((name) => ({ name, connected: connected.has(slugifyServerName(name)) })),
+    toolServers: offers.toolServers.length > 0 ? projectToolServerViews(offers.toolServers) : [],
   };
 }
 

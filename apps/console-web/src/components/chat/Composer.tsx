@@ -12,6 +12,7 @@ import { acceptComposerDraft, composerDraftForRetry, composerDraftKey, readCompo
 import { claimArtifactDiscussionSeed, prepareArtifactDiscussion, readArtifactDiscussion, sameArtifactDiscussion } from '@/lib/artifact-discussion';
 import { prepareSessionFileContext } from '@/lib/session-files';
 import { useFileDock } from '@/components/chat/FileDock';
+import { seedProjectToolsComposerDraft } from '@/lib/project-tools-draft';
 
 const MAX_BYTES = 30 * 1024 * 1024;
 
@@ -105,6 +106,11 @@ export function Composer({
     draftOwner.current = next;
   }, [routeDraftKey, draftConversationId]);
   const draft = useSyncExternalStore(subscribeComposerDraft, () => readComposerDraft(draftKey));
+  useEffect(() => {
+    if (activeScope.current !== draftKey) return;
+    seedProjectToolsComposerDraft({ pathname: location.pathname, navigationKey: location.key, state: location.state,
+      routeDraftKey, draftKey, executionSessionId: sessionId, conversationSessionId: draftConversationId, busy });
+  }, [location.pathname, location.key, location.state, routeDraftKey, draftKey, sessionId, draftConversationId, busy]);
   useEffect(() => {
     const selection = readArtifactDiscussion((location.state as { artifactDiscussion?: unknown } | null)?.artifactDiscussion);
     if (selection && claimArtifactDiscussionSeed(location.key)) writeComposerDraft(draftKey, current => ({ ...current, artifact: selection }));

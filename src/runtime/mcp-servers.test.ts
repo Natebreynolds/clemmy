@@ -20,6 +20,7 @@ const {
   getOrCreateExternalMcpServers,
   getOrCreateExternalMcpServerForTool,
   invalidateConfiguredMcpServers,
+  listRawMcpServers,
   mcpServersTestHooks,
   prewarmMcpServers,
   resolveMcpPrewarmSelection,
@@ -82,6 +83,44 @@ after(async () => {
   invalidateMcpServerDiscoveryCache();
   clearToolChoices();
   rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+test('external stdio passes its exact configured directory to the SDK and keeps the default when omitted', () => {
+  const cwd = path.join(TMP_HOME, 'Project Files');
+  writeMcpServers({
+    explicit: { type: 'stdio', command: '/synthetic/must-not-launch', cwd, enabled: true,
+      args: ['--token=${CONTROLLED_LAUNCH_KEY}', '${UNDECLARED_KEY}'], env: { CONTROLLED_LAUNCH_KEY: 'synthetic-literal-$&' } },
+    defaulted: { type: 'stdio', command: '/synthetic/must-not-launch', enabled: true },
+  });
+  invalidateMcpServerDiscoveryCache();
+  const transports = listRawMcpServers() as Array<{ name: string; underlying?: { params?: { cwd?: string; args?: string[] } } }>;
+  assert.equal(transports.find(server => server.name === 'explicit')?.underlying?.params?.cwd, cwd);
+  assert.deepEqual(transports.find(server => server.name === 'explicit')?.underlying?.params?.args,
+    ['--token=synthetic-literal-$&', '${UNDECLARED_KEY}']);
+  assert.equal(transports.find(server => server.name === 'defaulted')?.underlying?.params?.cwd, TMP_HOME);
+});
+
+test('a missing explicit working directory refuses before invoking the SDK child connection and never falls back', async () => {
+  const cwd = path.join(TMP_HOME, 'missing-controlled-project');
+  writeMcpServers({ missing: { type: 'stdio', command: '/synthetic/must-not-launch', cwd, enabled: true } });
+  invalidateMcpServerDiscoveryCache();
+  const transport = listRawMcpServers().find(server => server.name === 'missing')! as { connect: () => Promise<void>; underlying: { connect: () => Promise<void> } };
+  let childConnections = 0;
+  transport.underlying.connect = async () => { childConnections++; };
+  await assert.rejects(transport.connect(), /working directory is unavailable.*existing local project folder.*reconnect/);
+  assert.equal(childConnections, 0);
+});
+
+test('an existing explicit working directory reaches the SDK connection once without rewriting paths', async () => {
+  const cwd = path.join(TMP_HOME, 'Controlled Existing Project');
+  mkdirSync(cwd, { recursive: true });
+  writeMcpServers({ existing: { type: 'stdio', command: '/synthetic/must-not-launch', cwd, enabled: true } });
+  invalidateMcpServerDiscoveryCache();
+  const transport = listRawMcpServers().find(server => server.name === 'existing')! as { connect: () => Promise<void>; underlying: { connect: () => Promise<void> } };
+  let childConnections = 0;
+  transport.underlying.connect = async () => { childConnections++; };
+  await transport.connect();
+  assert.equal(childConnections, 1);
 });
 
 for (const ambient of [null, { reason: 'owner withheld external access', authority: 'none' as const }]) {

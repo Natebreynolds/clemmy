@@ -55,6 +55,44 @@ test('validateMcpServerConfig: accepts well-formed stdio/http, rejects malformed
   assert.match(validateMcpServerConfig({ name: 'ok', type: 'sse' }) ?? '', /requires a `url`/);
 });
 
+test('agent MCP create/configure preserve, replace and explicitly clear an absolute cwd without launching a child', async () => {
+  assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1', 'Use the isolated runner for configuration controls.');
+  const original = existsSync(MCP_SERVERS_FILE) ? readFileSync(MCP_SERVERS_FILE) : undefined;
+  const handlers = new Map<string, (args: unknown) => Promise<unknown>>();
+  registerMcpServerTools({ tool(name: string, ...args: unknown[]) {
+    handlers.set(name, args.at(-1) as (args: unknown) => Promise<unknown>);
+  } } as unknown as Parameters<typeof registerMcpServerTools>[0]);
+  const cwd = path.resolve(path.dirname(MCP_SERVERS_FILE), 'Controlled Project Files');
+  const secondCwd = path.resolve(path.dirname(MCP_SERVERS_FILE), 'Controlled Other Project');
+  mkdirSync(path.dirname(MCP_SERVERS_FILE), { recursive: true });
+  const read = () => JSON.parse(readFileSync(MCP_SERVERS_FILE, 'utf8'));
+  try {
+    writeFileSync(MCP_SERVERS_FILE, '{}');
+    invalidateMcpServerDiscoveryCache();
+    const created = await handlers.get('mcp_add')!({ name: 'controlled-cwd', type: 'stdio',
+      command: '/synthetic/must-not-launch', args: ['./server.js'], cwd,
+      required_env_keys: ['CONTROLLED_WORKING_DIRECTORY_CREDENTIAL_NOT_SET'] });
+    assert.match(JSON.stringify(created), /needs_credentials/);
+    assert.equal(read()['controlled-cwd'].cwd, cwd);
+    assert.equal(discoverMcpServers().find(server => server.name === 'controlled-cwd')?.cwd, cwd);
+    assert.equal(JSON.stringify(created).includes(cwd), false, 'setup status does not repeat machine-local paths');
+    await handlers.get('mcp_configure')!({ server_name: 'controlled-cwd', enabled: false, description: 'Keep current directory' });
+    assert.equal(read()['controlled-cwd'].cwd, cwd);
+    await handlers.get('mcp_configure')!({ server_name: 'controlled-cwd', cwd: secondCwd });
+    assert.equal(read()['controlled-cwd'].cwd, secondCwd);
+    const before = readFileSync(MCP_SERVERS_FILE, 'utf8');
+    const refused = await handlers.get('mcp_configure')!({ server_name: 'controlled-cwd', cwd: './relative' });
+    assert.match(JSON.stringify(refused), /mcp_configure refused/);
+    assert.equal(readFileSync(MCP_SERVERS_FILE, 'utf8'), before, 'invalid edits do not save or reconnect');
+    await handlers.get('mcp_configure')!({ server_name: 'controlled-cwd', cwd: null, type: 'http', url: 'https://example.test/mcp' });
+    assert.equal(Object.hasOwn(read()['controlled-cwd'], 'cwd'), false);
+    assert.equal(read()['controlled-cwd'].type, 'http');
+  } finally {
+    if (original) writeFileSync(MCP_SERVERS_FILE, original); else unlinkSync(MCP_SERVERS_FILE);
+    invalidateMcpServerDiscoveryCache();
+  }
+});
+
 test('serverEnvStatus: array form (pass-through keys) — unset when no daemon env value', () => {
   const KEY = 'CLEMMY_TEST_MCP_CRED_XYZ';
   delete process.env[KEY];

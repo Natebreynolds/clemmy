@@ -378,6 +378,7 @@ export interface McpServerInput {
   description?: string;
   command?: string;
   args?: string[];
+  cwd?: string;
   url?: string;
   env?: Record<string, string>;
   headers?: Record<string, string>;

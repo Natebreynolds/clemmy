@@ -6,6 +6,7 @@ import test from 'node:test';
 import {
   mcpServerCreateSummary,
   prepareMcpServerCreateRequest,
+  validateMcpWorkingDirectory,
   type McpServerCreatePreparation,
 } from './mcp-server-request.js';
 
@@ -83,6 +84,24 @@ test('remote URL validation rejects unsupported, relative, missing, or malformed
   }
 });
 
+test('stdio working directory is explicit, native absolute syntax; remote and malformed directories refuse privately', () => {
+  const cwd = path.join(os.tmpdir(), 'Controlled Project Files');
+  assert.equal(accepted({ name: 'fixture', command: 'node', args: ['./server.js'], cwd }).cwd, cwd);
+  for (const value of ['', ' ', null, 42, '.', './project', 'C:relative', '/line\nbreak', '/private\0directory']) {
+    rejected({ name: 'fixture', command: 'node', cwd: value });
+  }
+  for (const type of ['http', 'sse']) rejected({ name: 'fixture', type, url: 'https://example.test/mcp', cwd });
+  assert.equal(validateMcpWorkingDirectory(undefined, 'http'), null);
+  for (const value of ['C:\\Users\\Test Person\\project', 'd:/project', '\\\\server\\share', '\\\\server\\share\\project']) {
+    assert.equal(validateMcpWorkingDirectory(value, 'stdio', 'win32'), null, value);
+  }
+  for (const value of ['project', 'C:project', '\\project', '/project', '\\\\server', '\\\\?\\C:\\project', '\\\\.\\pipe\\project']) {
+    assert.notEqual(validateMcpWorkingDirectory(value, 'stdio', 'win32'), null, value);
+  }
+  assert.notEqual(validateMcpWorkingDirectory('C:\\Users\\project', 'stdio', 'darwin'), null);
+  assert.equal(validateMcpWorkingDirectory('/tmp/Project Files', 'stdio', 'darwin'), null);
+});
+
 test('conflicts return a static actionable 409 for any current/discovered identity or reserved builtin', () => {
   for (const existingNames of [['fixture'], ['FIXTURE']]) {
     const result = prepareMcpServerCreateRequest({ name: 'fixture', command: 'node' }, { ...options, existingNames });
@@ -153,6 +172,7 @@ test('registered MCP create route protects real config and discovery without lau
     'Existing__Server': {
       name: 'Existing__Server', type: 'stdio', command: 'not-executed-existing-command',
       enabled: false, args: ['keep'], env: { TOKEN: 'existing-secret' },
+      cwd: path.join(fixtureHome, 'Existing Project Files'),
       headers: { Authorization: 'existing-header' }, description: 'Keep description', customField: { keep: true },
     },
   };
@@ -263,7 +283,7 @@ test('registered MCP create route protects real config and discovery without lau
     assert.ok(body.servers.some((server) => server.name === 'clementine-local' && server.builtin === true));
     assert.deepEqual(body.userOverrides.Existing__Server.declaredEnvKeys, ['TOKEN']);
     for (const summary of [external, body.userOverrides.Existing__Server]) {
-      for (const key of ['command', 'args', 'url', 'env', 'headers', 'customField']) {
+      for (const key of ['command', 'args', 'cwd', 'url', 'env', 'headers', 'customField']) {
         assert.ok(!Object.hasOwn(summary, key), `must omit connection field ${key}`);
       }
     }
@@ -284,12 +304,75 @@ test('registered MCP create route protects real config and discovery without lau
     assert.equal(summary.name, 'Existing__Server');
     assert.equal(summary.enabled, false);
     assert.equal(summary.description, 'Updated safe description');
-    for (const key of ['command', 'args', 'url', 'env', 'headers', 'customField']) assert.ok(!Object.hasOwn(summary, key));
+    for (const key of ['command', 'args', 'cwd', 'url', 'env', 'headers', 'customField']) assert.ok(!Object.hasOwn(summary, key));
     assert.deepEqual(summary.declaredEnvKeys, ['TOKEN']);
     assert.ok(!JSON.stringify(response.payload).includes('existing-secret'));
     assert.deepEqual(JSON.parse(readFileSync(config.MCP_SERVERS_FILE, 'utf8')), {
       Existing__Server: { ...original.Existing__Server, description: 'Updated safe description' },
     });
+  });
+
+  await t.test('patch validates the combined transport and cwd before saving and never discloses paths', async () => {
+    seed();
+    const cwd = path.join(fixtureHome, 'Updated Project Files');
+    const response = await request({ cwd }, 'patch', 'Existing__Server');
+    assert.equal(response.status, 200);
+    assert.equal(JSON.parse(readFileSync(config.MCP_SERVERS_FILE, 'utf8')).Existing__Server.cwd, cwd);
+    assert.equal(JSON.stringify(response.payload).includes(cwd), false);
+    let before = readFileSync(config.MCP_SERVERS_FILE, 'utf8');
+    const discovered = mcp.discoverMcpServers();
+    authorized = false;
+    assert.deepEqual(await request({ cwd: null }, 'patch', 'Existing__Server'), { status: 401, payload: { error: 'unauthorized' } });
+    authorized = true;
+    for (const fields of [
+      { cwd: './relative' }, { cwd: '' }, { cwd: 4 }, { cwd: {} }, { cwd: `${cwd}\nprivate` },
+      { type: 'http', url: 'https://example.test/mcp', description: 'must not save' },
+      { type: 'sse', url: 'https://example.test/sse', cwd },
+    ]) {
+      const refused = await request(fields, 'patch', 'Existing__Server');
+      assert.equal(refused.status, 400);
+      assert.equal((refused.payload as { code: string }).code, 'invalid_mcp_server');
+      assert.equal(JSON.stringify(refused.payload).includes(cwd), false);
+      assert.equal(readFileSync(config.MCP_SERVERS_FILE, 'utf8'), before, 'invalid directory or transport cannot partially save another field');
+      assert.equal(mcp.discoverMcpServers(), discovered, 'invalid edits do not invalidate discovery or reconnect');
+    }
+    assert.equal((await request({ cwd: null }, 'patch', 'Existing__Server')).status, 200);
+    assert.equal(Object.hasOwn(JSON.parse(readFileSync(config.MCP_SERVERS_FILE, 'utf8')).Existing__Server, 'cwd'), false);
+    assert.equal((await request({ cwd }, 'patch', 'Existing__Server')).status, 200);
+    assert.equal((await request({ cwd: null, type: 'http', url: 'https://example.test/mcp' }, 'patch', 'Existing__Server')).status, 200);
+    const transitioned = JSON.parse(readFileSync(config.MCP_SERVERS_FILE, 'utf8')).Existing__Server;
+    assert.equal(transitioned.type, 'http');
+    assert.equal(Object.hasOwn(transitioned, 'cwd'), false);
+    before = readFileSync(config.MCP_SERVERS_FILE, 'utf8');
+    assert.equal((await request({ cwd }, 'patch', 'Existing__Server')).status, 400, 'an existing remote server cannot acquire a working directory');
+    assert.equal(readFileSync(config.MCP_SERVERS_FILE, 'utf8'), before);
+  });
+
+  await t.test('toggling an imported disabled server preserves its working directory in the user override', async () => {
+    seed();
+    const claudeDir = path.join(os.homedir(), '.claude');
+    const settingsFile = path.join(claudeDir, 'settings.json');
+    assert.equal(existsSync(settingsFile), false, 'outer runner provides a disposable home');
+    const cwd = path.join(fixtureHome, 'Imported Project Files');
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(settingsFile, JSON.stringify({ mcpServers: {
+      'imported-cwd-fixture': { type: 'stdio', command: 'not-executed-import-cwd', args: ['./server.js'], cwd, enabled: false },
+    } }));
+    process.env.MCP_AUTO_IMPORT_ENABLED = 'true';
+    mcp.invalidateMcpServerDiscoveryCache();
+    try {
+      const response = await request({ enabled: false }, 'patch', 'imported-cwd-fixture');
+      assert.equal(response.status, 200);
+      const saved = JSON.parse(readFileSync(config.MCP_SERVERS_FILE, 'utf8'))['imported-cwd-fixture'];
+      assert.equal(saved.cwd, cwd);
+      assert.deepEqual(saved.args, ['./server.js']);
+      assert.equal(JSON.stringify(response.payload).includes(cwd), false);
+      assert.equal(mcp.discoverMcpServers().find(server => server.name === 'imported-cwd-fixture')?.cwd, cwd);
+    } finally {
+      rmSync(settingsFile);
+      process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
+      mcp.invalidateMcpServerDiscoveryCache();
+    }
   });
 
   await t.test('saving a declared credential on a disabled server resolves the value without starting or claiming connection', async () => {

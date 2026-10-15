@@ -93,6 +93,7 @@ const ALWAYS_ADMIN = new Set<string>([
   // infra change — ALWAYS confirm-first (no secret VALUES pass through these).
   'mcp_add',
   'mcp_configure',
+  'project_tools_connect',
 ]);
 
 /**

@@ -12,6 +12,7 @@ import { registerAgentRunsTools } from './agent-runs-tools.js';
 import { registerAutonomyActionTools } from './autonomy-action-tools.js';
 import { registerBackgroundTaskTools } from './background-task-tools.js';
 import { registerProjectRecordTools } from './project-record-tools.js';
+import { registerProjectToolSetupTools } from './project-tool-setup-tools.js';
 import { registerBatchTools } from './batch-tools.js';
 import { registerCloudBrowserTools } from './cloud-browser-tools.js';
 import { registerBrowserHarnessTools } from './browser-harness-tools.js';
@@ -231,6 +232,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerAgentRunsTools(server);
   registerBackgroundTaskTools(server);
   registerProjectRecordTools(server);
+  registerProjectToolSetupTools(server);
   registerBatchTools(server);
   registerAutonomyActionTools(server);
   registerExecutionTools(server);

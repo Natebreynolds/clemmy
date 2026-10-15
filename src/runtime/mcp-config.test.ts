@@ -20,6 +20,7 @@ function writeClaudeMcpConfig(): void {
         [IMPORTED_NAME]: {
           command: 'node',
           args: ['server.js'],
+          cwd: path.join(TMP_HOME, 'Project Files'),
         },
       },
     }),
@@ -58,6 +59,7 @@ test('auto-imported Claude MCP configs are opt-in', () => {
     const imported = discoverMcpServers().find((server) => server.name === IMPORTED_NAME);
     assert.equal(imported?.source, 'auto-detected');
     assert.equal(imported?.enabled, true);
+    assert.equal(imported?.cwd, path.join(TMP_HOME, 'Project Files'), 'discovery retains the machine-local working directory');
   } finally {
     restoreEnv();
     rmSync(TMP_HOME, { recursive: true, force: true });

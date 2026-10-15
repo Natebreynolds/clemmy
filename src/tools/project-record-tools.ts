@@ -56,7 +56,7 @@ function describeAssignment(row: ProjectAssignment): Record<string, unknown> {
 function describeResource(row: ProjectResource): Record<string, unknown> {
   return row.kind === 'account'
     ? { kind: 'account', toolkit: row.toolkit, account: row.label || row.accountId, accountId: row.accountId, verified: Boolean(row.verifiedAt) }
-    : { kind: row.kind, ref: row.ref, ...(row.label ? { label: row.label } : {}) };
+    : { ...(row.kind === 'folder' ? { id: row.id } : {}), kind: row.kind, ref: row.ref, ...(row.label ? { label: row.label } : {}) };
 }
 
 /** Tasks delegated into a project, newest first, as the owner would read them. */

@@ -20,7 +20,7 @@ import type { ManagedMcpServer } from '../types.js';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { declareMcpServerEnvKeys, readMcpServerEnv, resolveMcpServerEnv, type McpServerEnvSources } from '../runtime/mcp-server-env.js';
-import { prepareMcpServerCreateRequest } from '../runtime/mcp-server-request.js';
+import { prepareMcpServerCreateRequest, validateMcpWorkingDirectory } from '../runtime/mcp-server-request.js';
 import { prepareAgentMcpHeaderTemplates } from '../runtime/mcp-server-setup.js';
 
 /**
@@ -42,11 +42,13 @@ const NAME_RE = /^[a-zA-Z0-9_.-]{2,40}$/;
 /** Validation mirrored from the dashboard POST/PATCH handlers
  *  (console-routes.ts) so a brain-created config can't be malformed. Returns an
  *  error string, or null when valid. */
-export function validateMcpServerConfig(cfg: { name: string; type: string; command?: string; url?: string }): string | null {
+export function validateMcpServerConfig(cfg: { name: string; type: string; command?: string; url?: string; cwd?: string }): string | null {
   if (!NAME_RE.test(cfg.name)) return `Invalid name "${cfg.name}" — use 2-40 chars: letters, digits, _ . -`;
   if (cfg.type !== 'stdio' && cfg.type !== 'http' && cfg.type !== 'sse') return `Invalid type "${cfg.type}" — must be stdio | http | sse`;
   if (cfg.type === 'stdio' && !cfg.command?.trim()) return 'A stdio server requires a `command`.';
   if ((cfg.type === 'http' || cfg.type === 'sse') && !cfg.url?.trim()) return `A ${cfg.type} server requires a \`url\`.`;
+  const cwdError = validateMcpWorkingDirectory(cfg.cwd, cfg.type);
+  if (cwdError) return cwdError;
   return null;
 }
 
@@ -66,7 +68,7 @@ async function finishApprovedSetup(name: string, verb: 'Created' | 'Updated') {
         : readiness.state === 'connected' ? 'The server handshake and tool inventory were verified. Normal tool discovery, scope and effect approvals still apply.'
           : readiness.state === 'disabled' ? 'The server is saved and disabled.'
             : readiness.reason === 'turn_scope' ? 'The server is saved, but this turn does not authorize its full connection inventory. Verify it through a normally authorized discovery or Connect → MCP servers.'
-              : 'The configuration is saved, but its connection was not verified. Check the local command or endpoint before retrying setup.';
+              : 'The configuration is saved, but its connection was not verified. Check its executable, working directory or endpoint in Connect → MCP servers before reconnecting.';
     return textResult(`${verb} MCP server "${name}". ${JSON.stringify({ server: name, ...readiness })}\n${next}`);
   } catch {
     return textResult(`${verb} MCP server "${name}". Its configuration is saved, but connection readiness could not be verified. No vendor operation was run.`);
@@ -125,16 +127,17 @@ export function registerMcpServerTools(server: McpServer): void {
       type: z.enum(['stdio', 'http', 'sse']).describe('stdio (local command) | http | sse (remote URL).'),
       command: z.string().optional().describe('Required for stdio (e.g. "npx").'),
       args: z.array(z.string()).optional().describe('Args for a stdio command (e.g. ["-y","some-mcp-server"]).'),
+      cwd: z.string().optional().describe('Absolute existing local working directory for a stdio server. Use the authorized project folder; never a shell command or a relative path.'),
       url: z.string().optional().describe('Required for http/sse.'),
       description: z.string().optional().describe('Short human description of what the server provides.'),
       headers: z.record(z.string(), z.string()).optional().describe('Non-secret HTTP header templates, e.g. {"Authorization":"Bearer ${API_KEY}"}. Referenced keys are declared for human entry. Never put a secret value here.'),
       required_env_keys: z.array(z.string()).optional().describe('NAMES of env/credential keys this server needs (e.g. ["DATAFORSEO_USERNAME","DATAFORSEO_PASSWORD"]). Values are entered by the user in the dashboard — never here.'),
     },
-    async ({ name, type, command, args, url, description, headers, required_env_keys }) => {
+    async ({ name, type, command, args, cwd, url, description, headers, required_env_keys }) => {
       const templates = prepareAgentMcpHeaderTemplates(headers, required_env_keys);
       if (!templates.ok) return textResult(`mcp_add refused: ${templates.error}`);
       const existing = loadUserMcpServers();
-      const prepared = prepareMcpServerCreateRequest({ name, type, command, args, url, description,
+      const prepared = prepareMcpServerCreateRequest({ name, type, command, args, cwd, url, description,
         headers: templates.headers, env: Object.fromEntries(templates.requiredEnvKeys.map(key => [key, ''])), enabled: true },
       { existingNames: [...Object.keys(existing), ...discoverMcpServers().map(server => server.name)], slugifyName: slugifyServerName });
       if (!prepared.ok) return textResult(`mcp_add refused: ${prepared.error}`);
@@ -151,7 +154,7 @@ export function registerMcpServerTools(server: McpServer): void {
   server.tool(
     'mcp_configure',
     [
-      'Edit an EXISTING external MCP server\'s NON-SECRET fields (description/command/args/url/headers/type/enabled). APPROVAL-GATED (admin).',
+      'Edit an EXISTING external MCP server\'s NON-SECRET fields (description/command/args/cwd/url/headers/type/enabled). APPROVAL-GATED (admin).',
       'Does NOT set credentials — env/secret values are entered by the user in the dashboard. Passing env here is refused.',
       'Use mcp_add to create a server, mcp_reconnect to recover one.',
     ].join(' '),
@@ -161,12 +164,13 @@ export function registerMcpServerTools(server: McpServer): void {
       type: z.enum(['stdio', 'http', 'sse']).optional(),
       command: z.string().optional(),
       args: z.array(z.string()).optional(),
+      cwd: z.string().nullable().optional().describe('Absolute local working directory for a stdio server. Omit to retain it; null clears the saved directory and restores the default.'),
       url: z.string().optional(),
       enabled: z.boolean().optional().describe('Enable or disable the server.'),
       headers: z.record(z.string(), z.string()).optional().describe('Non-secret HTTP header templates, e.g. {"Authorization":"Bearer ${API_KEY}"}; never literal secrets.'),
       required_env_keys: z.array(z.string()).optional().describe('Additional credential key NAMES to declare for human entry. Never credential values.'),
     },
-    async ({ server_name, description, type, command, args, url, enabled, headers, required_env_keys }) => {
+    async ({ server_name, description, type, command, args, cwd, url, enabled, headers, required_env_keys }) => {
       const existing = loadUserMcpServers();
       const current = existing[server_name];
       if (!current) return textResult(`mcp_configure refused: no server named "${server_name}". Use mcp_status to list servers, or mcp_add to create one.`);
@@ -178,11 +182,13 @@ export function registerMcpServerTools(server: McpServer): void {
         ...(type !== undefined ? { type } : {}),
         ...(command !== undefined ? { command } : {}),
         ...(args !== undefined ? { args } : {}),
+        ...(typeof cwd === 'string' ? { cwd } : {}),
         ...(url !== undefined ? { url } : {}),
         ...(enabled !== undefined ? { enabled } : {}),
         ...(templates.headers !== undefined ? { headers: templates.headers } : {}),
         env: declareMcpServerEnvKeys(current.env, templates.requiredEnvKeys),
       };
+      if (cwd === null) delete merged.cwd;
       const prepared = prepareMcpServerCreateRequest({ ...merged, name: server_name }, { existingNames: [], slugifyName: slugifyServerName });
       if (!prepared.ok) return textResult(`mcp_configure refused: ${prepared.error}`);
       saveUserMcpServers({ ...existing, [server_name]: { ...merged, ...prepared.server } }, { deferIndex: true });

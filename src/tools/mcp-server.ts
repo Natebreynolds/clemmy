@@ -30,6 +30,7 @@ import { registerAgentRunsTools } from './agent-runs-tools.js';
 import { registerAutonomyActionTools } from './autonomy-action-tools.js';
 import { registerBackgroundTaskTools } from './background-task-tools.js';
 import { registerProjectRecordTools } from './project-record-tools.js';
+import { registerProjectToolSetupTools } from './project-tool-setup-tools.js';
 import { registerWorkerTools } from './worker-tools.js';
 import { registerWorkflowStateTools } from './workflow-state-tools.js';
 import { registerTableOpsTools } from './table-ops-tools.js';
@@ -546,6 +547,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerAgentRunsTools(server);
   registerBackgroundTaskTools(server);
   registerProjectRecordTools(server);
+  registerProjectToolSetupTools(server);
   registerWorkerTools(server);
   registerWorkflowStateTools(server);
   registerTableOpsTools(server);

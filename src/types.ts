@@ -735,6 +735,8 @@ export interface ManagedMcpServer {
   type: 'stdio' | 'http' | 'sse';
   command?: string;
   args?: string[];
+  /** Absolute local working directory for a stdio server. Omitted uses Clementine's home. */
+  cwd?: string;
   url?: string;
   headers?: Record<string, string>;
   env?: Record<string, string>;

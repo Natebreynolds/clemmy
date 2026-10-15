@@ -4,7 +4,7 @@ export type McpSetupResult =
   | { ok: true; servers: McpServerInput[] }
   | { ok: false; error: string };
 
-const SERVER_FIELDS = new Set(['name', 'type', 'description', 'enabled', 'command', 'args', 'url', 'env', 'headers']);
+const SERVER_FIELDS = new Set(['name', 'type', 'description', 'enabled', 'command', 'args', 'cwd', 'url', 'env', 'headers']);
 const NAME = /^[A-Za-z0-9_.-]{2,40}$/;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
@@ -103,7 +103,7 @@ function launchTokens(text: string): string[] | null {
 function parseServer(raw: unknown, named?: string): McpServerInput | string {
   if (!record(raw)) return 'Each server must be a JSON object.';
   if (Object.keys(raw).some((key) => !SERVER_FIELDS.has(key))) {
-    return 'This setup includes unsupported settings. Use only name, type, command, args, env, url, headers, description and enabled; working-directory and authentication options need a supported setup first.';
+    return 'This setup includes unsupported settings. Use only name, type, command, args, cwd, env, url, headers, description and enabled; authentication options need a supported setup first.';
   }
   if ('name' in raw && typeof raw.name !== 'string') return 'The server name must be text.';
   const supplied = typeof raw.name === 'string' ? raw.name.trim() : undefined;
@@ -120,6 +120,14 @@ function parseServer(raw: unknown, named?: string): McpServerInput | string {
   }
   if ('args' in raw && (!Array.isArray(raw.args) || raw.args.some((arg) => typeof arg !== 'string' || arg.includes('\u0000')))) {
     return 'Arguments must be a JSON array of strings without NUL characters.';
+  }
+  // Preview accepts absolute POSIX and fully-qualified Windows spellings. The
+  // daemon validates against its own OS before saving; this parser never expands
+  // a project-relative path or decides that the directory actually exists.
+  if ('cwd' in raw && (typeof raw.cwd !== 'string' || !raw.cwd.trim() || /[\u0000-\u001f\u007f]/.test(raw.cwd)
+    || !(raw.cwd.startsWith('/') || /^[A-Za-z]:[\\/]/.test(raw.cwd)
+      || /^[\\/]{2}[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.test(raw.cwd)))) {
+    return 'Use an absolute local working directory. Project-relative paths need to be resolved before setup.';
   }
   if ('env' in raw && (!record(raw.env) || Object.entries(raw.env).some(([key, value]) => !ENV_KEY.test(key) || typeof value !== 'string' || value.includes('\u0000')))) {
     return 'Environment variables must be an object with valid variable names and string values.';
@@ -148,8 +156,9 @@ function parseServer(raw: unknown, named?: string): McpServerInput | string {
     if (shellExecutable(command)) return SHELL_ERROR;
     result.command = command;
     if ('args' in raw) result.args = [...raw.args as string[]];
+    if ('cwd' in raw) result.cwd = raw.cwd as string;
   } else {
-    if ('command' in raw || 'args' in raw) return 'A remote server uses a URL. Remove local command and arguments.';
+    if ('command' in raw || 'args' in raw || 'cwd' in raw) return 'A remote server uses a URL. Remove local command, arguments and working directory.';
     if (typeof raw.url !== 'string' || !/^https?:\/\//i.test(raw.url) || /[\\\s\u0000-\u001f\u007f]/.test(raw.url)) {
       return 'A remote server needs a valid http:// or https:// URL without spaces or control characters.';
     }

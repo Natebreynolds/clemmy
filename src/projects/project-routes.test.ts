@@ -286,13 +286,13 @@ test('a linked local project says what it offers, to the work and on both surfac
       name: 'fixture-audits', path: folder, present: true, git: false,
       instructions: ['AGENTS.md'], commands: ['build-report'],
       // 'Fixture Search' is not a name a server can have here, so it is not listed at all.
-      toolServers: [{ name: 'fixture-hosting', connected: true }],
+      toolServers: [{ name: 'fixture-hosting', connected: false, state: 'not_checked' }],
     };
     assert.deepEqual(linked.body.overview.resources[0].localProject, expected);
     assert.deepEqual((await desktop('get', `/api/console/project-records/${id}`)).body.overview.resources[0].localProject, expected);
     views._setConnectedToolServersForTests(() => []);
     assert.deepEqual((await desktop('get', `/api/console/project-records/${id}`)).body.overview.resources[0].localProject.toolServers,
-      [{ name: 'fixture-hosting', connected: false }], 'a server Clem is not connected to is said to be missing');
+      [{ name: 'fixture-hosting', connected: false, state: 'unconfigured' }], 'an absent configuration is said to need setup');
 
     const bound = bindProject(projects.getProject(id)!, { agentId: null });
     assert.match(bound.context, /- local project: fixture-audits at .*fixture-audits\n  its own instructions, to read before working in it: AGENTS\.md\n  commands it names.*build-report \(\.claude\/commands\/build-report\.md\)\n  tool servers it declares: fixture-hosting\./);

@@ -20,6 +20,10 @@ const aliases = new Map<string, string>();
 const listeners = new Set<() => void>();
 function resolve(key: string): string { return aliases.get(key) ?? key; }
 export function readComposerDraft(key: string): ComposerDraft { return drafts.get(resolve(key)) ?? empty; }
+/** A creation-route alias already belongs to its assigned conversation. */
+export function composerDraftIsUnassigned(key: string): boolean {
+  return key.startsWith('new:') && !aliases.has(key);
+}
 export function writeComposerDraft(key: string, update: (draft: ComposerDraft) => ComposerDraft): void {
   drafts.set(resolve(key), update(readComposerDraft(key)));
   for (const listener of listeners) listener();

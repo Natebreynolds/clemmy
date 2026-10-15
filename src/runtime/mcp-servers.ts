@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { stat } from 'node:fs/promises';
 import { MCPServerSSE, MCPServerStdio, MCPServerStreamableHttp, type MCPServer } from '@openai/agents';
 import { BASE_DIR, LOCAL_MCP_ENABLED, PKG_DIR, getRuntimeEnv } from '../config.js';
 import { discoverMcpServers } from './mcp-config.js';
@@ -24,6 +25,7 @@ import {
 import type { ManagedMcpServer } from '../types.js';
 import { readMcpServerEnv, resolveMcpServerEnv, type McpServerEnvSources } from './mcp-server-env.js';
 import { observeMcpServerSetup, type McpSetupReadiness } from './mcp-server-setup.js';
+import { validateMcpWorkingDirectory } from './mcp-server-request.js';
 
 function positiveIntEnv(key: string, fallback: number): number {
   const raw = process.env[key];
@@ -90,6 +92,15 @@ function applyNpmConfigPair(
 function declaredServerEnv(server: ManagedMcpServer, sources?: McpServerEnvSources): Record<string, string> {
   return (sources ? resolveMcpServerEnv(server.env, sources)
     : readMcpServerEnv(server.env, path.join(BASE_DIR, '.env'))).values;
+}
+
+/** Literal argv substitution for explicitly declared keys only. This is not a
+ * shell: unknown references, `$NAME`, `%NAME%` and command syntax stay literal.
+ * Values belong only to the child launch and never to setup/status output. */
+function stdioLaunchArgs(server: ManagedMcpServer, sources?: McpServerEnvSources): string[] {
+  const declared = declaredServerEnv(server, sources);
+  return (server.args ?? []).map(arg => arg.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g,
+    (match, key: string) => Object.hasOwn(declared, key) ? declared[key]! : match));
 }
 
 function stdioLaunchEnv(server: ManagedMcpServer, sources?: McpServerEnvSources,
@@ -186,15 +197,35 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
   if (!server.enabled) return null;
 
   if (server.type === 'stdio' && server.command) {
-    return new MCPServerStdio({
+    const env = stdioLaunchEnv(server);
+    const transport = new MCPServerStdio({
       name: server.name,
       command: server.command,
-      args: server.args ?? [],
+      // Reuse the launch's resolved values so argv and env cannot observe two
+      // different credential-file snapshots during one child construction.
+      args: stdioLaunchArgs(server, { daemon: env, inherited: {} }),
       clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
       timeout: MCP_REQUEST_TIMEOUT_MS,
-      env: stdioLaunchEnv(server),
-      cwd: BASE_DIR,
+      env,
+      cwd: server.cwd ?? BASE_DIR,
     });
+    // A linked project's directory may have moved since setup. Keep the server
+    // visible to the normal unavailable/reconnect path and report the concrete
+    // repair before starting any child; never fall back to another directory.
+    if (server.cwd !== undefined) {
+      const connect = transport.connect.bind(transport);
+      transport.connect = async () => {
+        const error = validateMcpWorkingDirectory(server.cwd, server.type);
+        if (error) throw new Error(error);
+        try {
+          if (!(await stat(server.cwd!)).isDirectory()) throw new Error('not a directory');
+        } catch {
+          throw new Error('The MCP working directory is unavailable. Choose an existing local project folder in Connect → MCP servers, then reconnect.');
+        }
+        return connect();
+      };
+    }
+    return transport;
   }
 
   if (server.type === 'http' && server.url) {
@@ -1163,6 +1194,7 @@ export const mcpServersTestHooks = {
   /** Real launch/header construction with synthetic environment sources; no
    * child, network or credential/config read is needed by these controls. */
   stdioLaunchEnv,
+  stdioLaunchArgs,
   expandedHeaders,
   scopedView(
     base: MCPServer,
@@ -1228,7 +1260,7 @@ export const mcpServersTestHooks = {
         name: server.name,
         command: server.command!,
         args: server.args ?? [],
-        cwd: BASE_DIR,
+        cwd: server.cwd ?? BASE_DIR,
         env: stdioLaunchEnv(server),
       }));
   },

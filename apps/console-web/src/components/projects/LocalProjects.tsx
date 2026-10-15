@@ -10,12 +10,12 @@
  * connected to marked. Unlinking leaves the folder exactly where it is.
  */
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
-import { CheckCircle2, CircleAlert, FolderGit2, FolderX } from 'lucide-react';
+import { Link, useNavigate } from 'react-router-dom';
+import { CheckCircle2, CircleAlert, CircleDashed, FolderGit2, FolderX, Loader2, MessageCircle } from 'lucide-react';
 import {
-  PROJECT_LOCAL_COMMANDS_HINT, PROJECT_LOCAL_COMMANDS_LABEL, PROJECT_LOCAL_TOOL_SERVERS_LABEL,
+  PROJECT_LOCAL_COMMANDS_HINT, PROJECT_LOCAL_COMMANDS_LABEL, PROJECT_LOCAL_TOOL_SERVERS_LABEL, PROJECT_LOCAL_TOOL_SERVERS_HINT,
   middleTruncatePath, projectLinkedLocalProject, projectLocalProjectChoices, projectLocalProjectCommands,
-  projectLocalProjectGitLine, projectLocalProjectMissingLine, projectLocalProjectRefusal, projectLocalProjectToolServers,
+  projectLocalProjectGitLine, projectLocalProjectMissingLine, projectLocalProjectRefusal, projectLocalProjectToolServers, projectLocalToolServerReadiness,
 } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -23,17 +23,20 @@ import { Skeleton } from '@/components/ui/Skeleton';
 // one kind), so a name's size and colour are joined as plain strings here.
 import { cn } from '@/lib/cn';
 import { usePoll } from '@/lib/poll';
+import { projectToolsChatNavigation } from '@/lib/project-tools-draft';
 import {
   getLocalProjects, linkLocalProject, projectKeys, refusalText, removeResource,
   type ProjectLocalProject, type ProjectOverview, type ProjectResourceView,
 } from '@/lib/projects';
 
-export function LocalProjectRow({ projectId, resource, readOnly, onSaved }: {
+export function LocalProjectRow({ projectId, projectName, resource, readOnly, onSaved }: {
   projectId: string;
+  projectName: string;
   resource: ProjectResourceView;
   readOnly: boolean;
   onSaved: (overview: ProjectOverview) => void;
 }) {
+  const navigate = useNavigate();
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -43,6 +46,13 @@ export function LocalProjectRow({ projectId, resource, readOnly, onSaved }: {
   const noGit = projectLocalProjectGitLine(local);
   const commands = missing ? [] : projectLocalProjectCommands(local);
   const tools = projectLocalProjectToolServers(missing ? {} : local);
+  const setup = () => {
+    if (readOnly || !local.known || !local.present || tools.servers.length === 0) return;
+    setError('');
+    const target = projectToolsChatNavigation(projectId, projectName, local.name);
+    if (target) navigate(target.pathname, { state: target.state });
+    else setError('This folder could not be added to a setup request. Open a chat in this project and describe the folder.');
+  };
 
   const remove = async () => {
     setBusy(true);
@@ -58,7 +68,7 @@ export function LocalProjectRow({ projectId, resource, readOnly, onSaved }: {
           ? <FolderX className="mt-1 h-4 w-4 shrink-0 text-warning" aria-hidden />
           : <FolderGit2 className="mt-1 h-4 w-4 shrink-0 text-faint" aria-hidden />}
         <div className="min-w-0 flex-1">
-          <div className={`truncate text-body font-semibold ${missing ? 'text-muted' : 'text-fg'}`}>{local.name}</div>
+          <div className={`break-words text-body font-semibold ${missing ? 'text-muted' : 'text-fg'}`}>{local.name}</div>
           {local.path && (
             <p className="truncate font-mono text-caption text-faint" title={local.path}>
               <span className="sr-only">Folder: </span>
@@ -82,24 +92,39 @@ export function LocalProjectRow({ projectId, resource, readOnly, onSaved }: {
             <div className="mt-2">
               <p className="text-caption text-muted">{PROJECT_LOCAL_TOOL_SERVERS_LABEL}</p>
               <ul className="mt-1 flex flex-wrap gap-1.5" aria-label={`${PROJECT_LOCAL_TOOL_SERVERS_LABEL} in ${local.name}`}>
-                {tools.servers.map((server) => (
+                {tools.servers.map((server) => {
+                  const status = projectLocalToolServerReadiness(server);
+                  return (
                   <li
                     key={server.name}
-                    className={`flex items-center gap-1 rounded-md border px-2 py-0.5 text-caption ${server.connected ? 'border-border bg-subtle text-fg' : 'border-warning/40 bg-warning-tint text-fg'}`}
+                    title={status.hint}
+                    className={`flex max-w-full items-start gap-1.5 rounded-md border px-2 py-1 text-caption ${status.tone === 'warning' ? 'border-warning/40 bg-warning-tint text-fg' : 'border-border bg-subtle text-fg'}`}
                   >
                     {server.connected
-                      ? <CheckCircle2 className="h-3 w-3 shrink-0 text-success" aria-hidden />
-                      : <CircleAlert className="h-3 w-3 shrink-0 text-warning" aria-hidden />}
-                    <span className="font-mono">{server.name}</span>
-                    <span className="sr-only">{server.connected ? 'connected' : 'not connected'}</span>
+                      ? <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" aria-hidden />
+                      : server.state === 'connecting' ? <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 motion-safe:animate-spin text-muted" aria-hidden />
+                        : status.tone === 'warning' ? <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden />
+                          : <CircleDashed className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted" aria-hidden />}
+                    <span className="min-w-0">
+                      <span className="block break-all font-mono">{server.name}</span>
+                      <span className="block text-muted">{status.label}{server.toolCount ? ` · ${server.toolCount} ${server.toolCount === 1 ? 'tool' : 'tools'}` : ''}</span>
+                    </span>
                   </li>
-                ))}
+                  );
+                })}
               </ul>
+              <p className="mt-1 text-caption text-faint">{PROJECT_LOCAL_TOOL_SERVERS_HINT}</p>
               {tools.missingLine && (
                 <p className="mt-1 text-caption text-muted" role="status">
                   {tools.missingLine}{' '}
                   <Link to="/connect" className="font-semibold text-primary hover:underline">Open Connect</Link>
                 </p>
+              )}
+              {!readOnly && local.known && local.present && projectName.trim() && (
+                <div className="mt-2">
+                  <Button size="sm" variant="secondary" onClick={setup}><MessageCircle className="h-3.5 w-3.5" aria-hidden /> Set up project tools</Button>
+                  <p className="mt-1 text-caption text-faint">Opens a request you can edit before sending. Setup and sign-in follow Clem’s normal approvals.</p>
+                </div>
               )}
             </div>
           )}

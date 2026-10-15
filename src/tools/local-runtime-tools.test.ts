@@ -11,6 +11,7 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const {
   getLocalToolCatalog,
+  getLocalToolSchemas,
   getLocalRuntimeTools,
   getLocalDeferredDispatchTools,
   describeInvalidToolInput,
@@ -143,6 +144,53 @@ test('local tool catalog is the exact loaded surface without schemas', () => {
     tools.map((entry) => entry.name),
   );
   assert.ok(catalog.every((entry) => typeof entry.description === 'string'));
+});
+
+test('ordinary local tool maps register exact project setup schemas and normal read/admin approval', async () => {
+  const { classifyTool } = await import('../agents/tool-taxonomy.js');
+  const { registeredToolSideEffect } = await import('./tool-registry.js');
+  const schemas = getLocalToolSchemas();
+  const catalog = getLocalToolCatalog();
+  const maps = [['direct', getLocalRuntimeTools()], ['deferred', getLocalDeferredDispatchTools()]] as const;
+  const context = new RunContext({ sessionId: 'project-setup-registration-no-source' });
+  for (const [name, keys, input, sideEffect, approval] of [
+    ['project_tools_inspect', ['resource_id'], {}, 'read', false],
+    ['project_tools_connect', ['resource_id', 'server_name', 'preview_token'],
+      { resource_id: 'synthetic-folder', server_name: 'synthetic-server', preview_token: 'synthetic-not-admitted' }, 'admin', true],
+  ] as const) {
+    assert.equal(catalog.filter(tool => tool.name === name).length, 1, `${name} is advertised once`);
+    const schema = schemas.get(name);
+    assert.ok(schema, `${name} has its canonical callable schema`);
+    assert.equal(schema.safeParse(input).success, true);
+    assert.equal(schema.safeParse({ ...input, unexpected: true }).success, false, 'setup never admits unknown fields');
+    if (name === 'project_tools_inspect') assert.equal(schema.safeParse({ resource_id: 7 }).success, false);
+    else assert.equal(schema.safeParse({ resource_id: 'synthetic-folder', server_name: 'synthetic-server' }).success, false,
+      'connect requires the exact inspected preview token');
+    assert.equal(classifyTool(name), sideEffect);
+    assert.equal(registeredToolSideEffect(name), sideEffect);
+    for (const [lane, tools] of maps) {
+      const matches = tools.filter(tool => tool.name === name);
+      assert.equal(matches.length, 1, `${name} has exactly one captured handler in each ordinary map`);
+      const tool = matches[0]!;
+      assert.equal(tool.type, 'function');
+      if (tool.type !== 'function') throw new Error('Expected the registered local function tool.');
+      assert.equal(typeof tool.invoke, 'function');
+      assert.equal(await tool.needsApproval(context, input), approval, `${name} retains its normal approval boundary`);
+      // No accepted source identity is present: the registered handler must
+      // refuse here before reading a project or attempting any connection.
+      const output = await tool.invoke(context, JSON.stringify(name === 'project_tools_inspect'
+        ? { resource_id: null } : input));
+      assert.equal(typeof output, 'string');
+      const payload = JSON.parse(String(output));
+      assert.equal(payload.ok, false);
+      assert.equal(payload.code, 'select_project', 'a real project-scoped handler ran, rather than a name-only registry entry');
+      if (lane === 'direct') {
+        const shape = tool.parameters as { properties?: Record<string, unknown> };
+        assert.ok(shape.properties);
+        for (const key of keys) assert.ok(Object.hasOwn(shape.properties!, key), `${name} exposes ${key}`);
+      }
+    }
+  }
 });
 
 test('local MCP isError survives text flattening as a nominal execution failure', async () => {

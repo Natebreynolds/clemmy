@@ -1,8 +1,9 @@
 import { validateHeaderName, validateHeaderValue } from 'node:http';
+import path from 'node:path';
 import type { ManagedMcpServer } from '../types.js';
 
 export type McpServerCreateConfig = Pick<ManagedMcpServer,
-  'name' | 'type' | 'enabled' | 'command' | 'args' | 'url' | 'headers' | 'env'>
+  'name' | 'type' | 'enabled' | 'command' | 'args' | 'cwd' | 'url' | 'headers' | 'env'>
   & { description?: string };
 
 export type McpServerCreatePreparation =
@@ -16,6 +17,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function stringMap(value: unknown): value is Record<string, string> {
   return isRecord(value) && Object.values(value).every((entry) => typeof entry === 'string');
+}
+
+/** Configuration syntax only. Directory availability is checked at connection
+ * time, on the machine that will actually start the server. Windows paths must
+ * include a drive or UNC share: `\\folder` and `C:folder` depend on ambient state. */
+export function validateMcpWorkingDirectory(cwd: unknown, type: string,
+  platform: NodeJS.Platform = process.platform): string | null {
+  if (cwd === undefined) return null;
+  if (type !== 'stdio') return 'A working directory is supported only for a local stdio server.';
+  if (typeof cwd !== 'string' || !cwd.trim() || /[\u0000-\u001f\u007f]/.test(cwd)) {
+    return 'Use a nonempty absolute local working directory without control characters.';
+  }
+  const absolute = platform === 'win32'
+    ? !/^[\\/]{2}[?.][\\/]/.test(cwd) && path.win32.isAbsolute(cwd) && (/^[A-Za-z]:[\\/]/.test(cwd)
+      || /^[\\/]{2}[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.test(cwd))
+    : path.posix.isAbsolute(cwd);
+  return absolute ? null : 'Use an absolute working directory for this computer. Project-relative paths must be resolved before setup.';
 }
 
 /** Prepare a new definition without changing configuration or starting a server.
@@ -48,6 +66,8 @@ export function prepareMcpServerCreateRequest(
     return invalid('Choose a supported transport: stdio, http, or sse.');
   }
   const type = body.type ?? 'stdio';
+  const cwdError = validateMcpWorkingDirectory(body.cwd, type);
+  if (cwdError) return invalid(cwdError);
   if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
     return invalid('Enabled must be true or false.');
   }
@@ -101,6 +121,7 @@ export function prepareMcpServerCreateRequest(
       ...(body.description !== undefined ? { description: body.description as string } : {}),
       ...(body.command !== undefined ? { command: body.command as string } : {}),
       ...(body.args !== undefined ? { args: [...body.args as string[]] } : {}),
+      ...(body.cwd !== undefined ? { cwd: body.cwd as string } : {}),
       ...(body.url !== undefined ? { url: body.url as string } : {}),
       ...(body.headers !== undefined ? { headers: { ...body.headers as Record<string, string> } } : {}),
       ...(body.env !== undefined ? { env: { ...body.env as Record<string, string> } } : {}),

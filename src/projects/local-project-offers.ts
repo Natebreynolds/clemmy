@@ -98,7 +98,7 @@ export function describeLocalProjectOffers(offers: LocalProjectOffers): string[]
     lines.push(`  commands it names, each a procedure to read and follow when the owner asks for it: ${offers.commands.map((row) => `${row.name} (${row.file})`).join(', ')}`);
   }
   if (offers.toolServers.length > 0) {
-    lines.push(`  tool servers it declares: ${offers.toolServers.join(', ')}. Declared is not connected: use your own connection to the same service, and say which one is missing when there is none`);
+    lines.push(`  tool servers it declares: ${offers.toolServers.join(', ')}. Declared is not connected. When asked to set up this project, use project_tools_inspect then project_tools_connect for exact inspected declarations; use normal CLI setup for missing software and private Connect entry for credentials. Never overwrite or assume a same-name connection is the correct account. Ordinary work still uses normal discovery, scope and effect approvals`);
   }
   return lines;
 }

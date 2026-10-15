@@ -382,6 +382,7 @@ export function ProjectResources({ overview, onSaved }: {
               <LocalProjectRow
                 key={resource.id}
                 projectId={overview.project.id}
+                projectName={overview.project.name}
                 resource={resource}
                 readOnly={archived}
                 onSaved={onSaved}

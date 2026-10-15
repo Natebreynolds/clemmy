@@ -8,7 +8,7 @@ import {
   projectAgentsLine, projectDecisionConsequence, projectDecisionSource, projectNeedsYouLabel,
   middleTruncatePath, projectCodingRunPhase, projectCodingRunPlace, projectLinkedLocalProject, projectLocalProjectChoices,
   projectLocalProjectGitLine, projectLocalProjectMissingLine, projectLocalProjectRefusal, PROJECT_LOCAL_PROJECTS_HINT,
-  projectLocalProjectCommands, projectLocalProjectToolServers,
+  projectLocalProjectCommands, projectLocalProjectToolServers, projectLocalToolServerReadiness,
   PROJECT_LOCAL_COMMANDS_HINT, PROJECT_LOCAL_COMMANDS_LABEL, PROJECT_LOCAL_TOOL_SERVERS_LABEL,
   projectPages, projectPageTitle, projectPagePlace, projectPageNextOffset, projectPageRefusal,
   PROJECT_PAGES_LABEL, PROJECT_PAGE_FRAME_SANDBOX, PROJECT_PAGE_MOST_PARTS,
@@ -174,7 +174,7 @@ test('a linked local project says which commands it offers and which of its tool
     instructions: ['AGENTS.md'],
     commands: ['build-report', ' seo-audit ', 'build-report', '', 7 as unknown as string],
     toolServers: [
-      { name: 'hosting', connected: false }, { name: 'search', connected: true },
+      { name: 'hosting', connected: false, state: 'unconfigured' }, { name: 'search', connected: true, state: 'connected', toolCount: 2 },
       { name: 'scraper', connected: 'yes' as unknown as boolean }, { name: 'search', connected: false },
       null as unknown as { name: string; connected: boolean },
     ],
@@ -182,20 +182,58 @@ test('a linked local project says which commands it offers and which of its tool
   assert.deepEqual(projectLocalProjectCommands(local), ['build-report', 'seo-audit']);
   const tools = projectLocalProjectToolServers(local);
   assert.deepEqual(tools.servers, [
-    { name: 'search', connected: true }, { name: 'hosting', connected: false }, { name: 'scraper', connected: false },
-  ], 'connected first; only an explicit yes is a connection');
+    { name: 'search', connected: true, state: 'connected', toolCount: 2 },
+    { name: 'hosting', connected: false, state: 'unconfigured' }, { name: 'scraper', connected: false, state: 'not_checked' },
+  ], 'observed connections first; an old or malformed name-only marker is not live proof');
   assert.deepEqual(tools.missing, ['hosting', 'scraper']);
-  assert.equal(tools.missingLine, 'hosting and scraper are not connected. Work here that needs them will say so until they are connected in Connect.');
+  assert.equal(tools.missingLine, 'Clem can check these connections and guide any setup that is still needed.');
   assert.equal(projectLocalProjectToolServers({ toolServers: [{ name: 'hosting', connected: false }] }).missingLine,
-    'hosting is not connected. Work here that needs it will say so until it is connected in Connect.');
-  assert.match(projectLocalProjectToolServers({ toolServers: ['a', 'b', 'c'].map((name) => ({ name, connected: false })) }).missingLine!, /^a, b and c are not connected/);
-  assert.equal(projectLocalProjectToolServers({ toolServers: [{ name: 'search', connected: true }] }).missingLine, null);
+    'Clem can check these connections and guide any setup that is still needed.');
+  assert.deepEqual(projectLocalProjectToolServers({ toolServers: ['a', 'b', 'c'].map((name) => ({ name, connected: false })) }).missing, ['a', 'b', 'c']);
+  assert.equal(projectLocalProjectToolServers({ toolServers: [{ name: 'search', connected: true, state: 'connected' }] }).missingLine, null);
   // A server that does not describe what a folder offers claims nothing.
   assert.deepEqual(projectLocalProjectCommands({}), []);
   assert.deepEqual(projectLocalProjectToolServers({}), { servers: [], missing: [], missingLine: null });
   assert.equal(PROJECT_LOCAL_COMMANDS_LABEL, 'Commands it offers');
   assert.equal(PROJECT_LOCAL_TOOL_SERVERS_LABEL, 'Tools it expects');
   assert.equal(PROJECT_LOCAL_COMMANDS_HINT, 'Ask for one by name in a conversation in this project.');
+});
+
+test('project tool readiness labels preserve states and never promote a legacy connected-name boolean', () => {
+  for (const [state, label, tone] of [
+    ['unconfigured', 'Setup needed', 'neutral'], ['disabled', 'Turned off', 'neutral'],
+    ['needs_credentials', 'Access details needed', 'warning'], ['connecting', 'Connecting', 'neutral'],
+    ['connected', 'Connected in Clem', 'success'], ['unavailable', 'Connection needs attention', 'warning'],
+    ['not_checked', 'Not checked', 'neutral'],
+  ] as const) {
+    const server = { name: 'fixture', connected: state === 'connected', state };
+    assert.deepEqual(projectLocalProjectToolServers({ toolServers: [server] }).servers, [server]);
+    const status = projectLocalToolServerReadiness(server);
+    assert.equal(status.label, label);
+    assert.equal(status.tone, tone);
+    assert.ok(status.hint);
+  }
+  for (const server of [
+    { name: 'legacy', connected: true },
+    { name: 'contrary', connected: false, state: 'connected' as const },
+    { name: 'unknown', connected: true, state: 'future-state' as 'not_checked' },
+    { name: 'object', connected: true, state: { toString: 'not callable' } as unknown as 'not_checked' },
+  ]) {
+    const projected = projectLocalProjectToolServers({ toolServers: [server] }).servers[0]!;
+    assert.equal(projected.connected, false);
+    assert.equal(projected.state, 'not_checked');
+    assert.equal(projectLocalToolServerReadiness(projected).label, 'Not checked');
+  }
+  assert.match(projectLocalToolServerReadiness({ name: 'fixture', connected: true, state: 'connected' }).hint, /service and account/);
+});
+
+test('only an observed positive tool count accompanies an explicit connection state', () => {
+  for (const toolCount of [0, -1, Number.NaN, Infinity, 1.2, '2' as unknown as number]) {
+    const row = projectLocalProjectToolServers({ toolServers: [{ name: 'fixture', connected: true, state: 'connected', toolCount }] }).servers[0]!;
+    assert.equal(row.toolCount, undefined);
+  }
+  assert.equal(projectLocalProjectToolServers({ toolServers: [{ name: 'fixture', connected: true, state: 'connected', toolCount: 3 }] }).servers[0]!.toolCount, 3);
+  assert.equal(projectLocalProjectToolServers({ toolServers: [{ name: 'fixture', connected: true, state: 'connecting', toolCount: 3 }] }).servers[0]!.toolCount, undefined);
 });
 
 test('a page made in a project is named by its folder when its file is only an index', () => {
