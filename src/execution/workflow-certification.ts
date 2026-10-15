@@ -41,6 +41,8 @@ export interface WorkflowCertificationOptions {
   runInputs?: Record<string, string>;
   testInputs?: Record<string, string>;
   planOptions?: WorkflowDryRunPlanOptions;
+  /** A rehearsal of this exact version passed: it does not need another. */
+  rehearsalPassed?: boolean;
 }
 
 export interface WorkflowCertification {
@@ -100,7 +102,7 @@ export function certifyWorkflow(
   const hasResourceGaps = resourceGaps.length > 0;
   const hasGaps = readinessGaps.length > 0;
   const enabled = def.enabled !== false;
-  const needsCreationTest = verification.needsTest;
+  const needsCreationTest = verification.needsTest && options.rehearsalPassed !== true;
   // F2 (live 2026-07-23, guardrails-inform-not-override): readiness gaps are
   // QUESTIONS, not walls. They used to gate all three capability bits, which
   // produced an exitless needs_info state — the card refused BOTH the toggle

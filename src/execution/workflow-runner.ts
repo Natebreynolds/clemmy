@@ -355,6 +355,7 @@ import {
   workflowDefinitionHash,
   workflowCodeRevisionMatchesSnapshot,
   workflowDefinitionMatchesSnapshotIgnoringEnabled,
+  workflowRehearsalKey,
   type AnyWorkflowRunDefinitionSnapshot,
   type WorkflowRunDefinitionSnapshot,
 } from './workflow-run-definition.js';
@@ -1078,6 +1079,9 @@ export interface QueuedRunRecord {
    * snapshot is content-hashed and immutable; legacy runs omit it and retain
    * the pre-v2 behavior of resolving the current workflow definition. */
   workflowDefinitionSnapshot?: unknown;
+  /** A finished rehearsal's verdict and the version it covers
+   * (workflowRehearsalKey). */
+  rehearsal?: { passed: boolean; definitionKey: string };
   /** Auto-retest lineage: how many chained creation tests were auto-queued
    * because the definition drifted mid-test. Bounds the self-heal loop when
    * the author is editing faster than tests complete. */
@@ -3798,8 +3802,8 @@ async function executeWorkflowCallNode(
       throw new WorkflowHarnessBlockedSignal({
         stepId: step.id,
         sessionId: callSessionId,
-        reason: `workflow_reviewed_local_capability_${reviewedLocal.reason}`
-          + (reviewedLocal.detail ? `: ${reviewedLocal.detail}` : ''),
+        reason: `workflow_reviewed_local_capability_${reviewedLocal.reason}: `
+          + await reviewedLocalRefusalDetail(call.tool, renderedArgs, reviewedLocal),
       });
     }
     const runLevelAccountSelection = (
@@ -14436,6 +14440,66 @@ function creationTestCapabilityQuestion(
   return (question || presentation.detail.trim() || error.message).slice(0, 1_200);
 }
 
+/** What a value is, said for a person fixing the step that produced it. */
+function argumentValueKind(value: unknown): string {
+  if (value === null) return 'empty (null)';
+  if (Array.isArray(value)) return `a list of ${value.length}`;
+  if (typeof value === 'string') return value.trim() ? 'text' : 'empty text';
+  return typeof value === 'object' ? 'an object' : typeof value;
+}
+
+/**
+ * Why one of Clementine's own tools would refuse a step's filled-in
+ * arguments, in words the author can act on: the tool's own schema violations
+ * when it reports them, otherwise what each argument turned out to be once
+ * its templates were filled.
+ */
+async function reviewedLocalRefusalDetail(
+  tool: string,
+  args: Record<string, unknown>,
+  refusal: { reason: string; detail?: string },
+): Promise<string> {
+  if (refusal.reason !== 'arguments_invalid') {
+    return refusal.detail ?? `${tool} could not be prepared (${refusal.reason.replace(/_/g, ' ')})`;
+  }
+  try {
+    const { prepareNativeToolArguments } = await import('../tools/call-tool.js');
+    const prepared = await prepareNativeToolArguments(tool, args);
+    if (prepared.status === 'invalid') return `${tool} refuses these arguments: ${prepared.detail}`;
+  } catch { /* fall back to what each argument became */ }
+  const shapes = Object.entries(args).map(([key, value]) => `${key} = ${argumentValueKind(value)}`).join(', ');
+  return `${tool} refuses these arguments as filled in (${shapes || 'none'})`;
+}
+
+/**
+ * What would stop a write step the rehearsal only previews, checked the way
+ * the run checks it: its arguments filled from the rehearsal's real upstream
+ * output and validated by the tool, with nothing dispatched. A run must never
+ * be the first to find out a step's own arguments are wrong.
+ */
+async function rehearsedCallArgumentProblem(
+  step: WorkflowStepInput,
+  ctx: { workflow: WorkflowDefinition; inputs: Record<string, string>; stepOutputs: Record<string, unknown> },
+): Promise<string | null> {
+  const call = step.call;
+  if (!call?.tool || step.forEach || step.invocationPlan) return null;
+  let rendered: Record<string, unknown>;
+  try {
+    rendered = normalizeReviewedLocalWorkflowArguments(call.tool, renderCallArgs(
+      call.args,
+      ctx.inputs,
+      ctx.stepOutputs,
+      undefined,
+      resolveWorkflowStepProjectContext(step, ctx.workflow),
+    ));
+  } catch (error) {
+    return `its arguments could not be filled in: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  const reviewed = ensureReviewedLocalWorkflowCapability({ operationId: call.tool, args: rendered });
+  if (reviewed.ok || reviewed.reason === 'not_reviewed') return null;
+  return reviewedLocalRefusalDetail(call.tool, rendered, reviewed);
+}
+
 export async function runCreationTest(
   workflow: WorkflowDefinition,
   workflowSlug: string,
@@ -14494,9 +14558,15 @@ export async function runCreationTest(
       throwIfWorkflowRunCancelled(runId);
       if (stepLooksMutating(step)) {
         // Never execute a send/write while authoring — preview it. Downstream
-        // read-only steps still get a stub so they can run.
+        // read-only steps still get a stub so they can run. A preview still
+        // fills in and checks the step's arguments the way the run will.
+        const problem = dependsOnPreview(step)
+          ? null
+          : await rehearsedCallArgumentProblem(step, { workflow, inputs, stepOutputs });
         stepOutputs[step.id] = { previewed: true, reason: 'mutating step — previewed, not executed in the creation test' };
-        results.push({ stepId: step.id, status: 'previewed' });
+        results.push(problem
+          ? { stepId: step.id, status: 'error', detail: `the run would stop here before making the change: ${problem}`.slice(0, 600) }
+          : { stepId: step.id, status: 'previewed' });
         previewTainted.add(step.id);
       } else if (dependsOnChoiceBlock(step)) {
         choiceBlocked.add(step.id);
@@ -15623,6 +15693,12 @@ async function processOneRunFile(
           status: 'creation_test',
           finishedAt: new Date().toISOString(),
           output: result.pass ? 'creation test passed' : 'creation test found issues',
+          // Which version this rehearsal vouches for, so the Workflows page
+          // and turning it on later know it was tested without testing again.
+          rehearsal: {
+            passed: result.pass,
+            definitionKey: workflowRehearsalKey(catalogSnapshot?.definition ?? workflow.data),
+          },
           ...(run.capabilityBlock ? { capabilityBlock: { ...run.capabilityBlock, state: 'consumed' as const } } : {}),
         },
         report,
@@ -17352,7 +17428,9 @@ async function processOneRunFile(
       // on the blocked lane and never enters generic failure/self-heal logic.
       if (error instanceof WorkflowHarnessBlockedSignal) {
         const finishedAt = new Date().toISOString();
-        const detail = `Workflow "${workflow.data.name}" was blocked at step "${error.stepId}": ${error.reason}`;
+        // The reason code stays on the record; a person reads what it says.
+        const said = /^[a-z0-9_]+: ([\s\S]+)$/.exec(error.reason)?.[1]?.trim() || error.reason;
+        const detail = `Workflow "${workflow.data.name}" stopped at step "${error.stepId}": ${said}`;
         const report = {
           workflowName: workflow.data.name,
           outcome: 'blocked' as const,

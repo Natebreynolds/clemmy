@@ -228,3 +228,35 @@ test('renderWorkflowCertification shows the one-door next action and evidence', 
   assert.match(rendered, /Missing creation-test inputs:\n- url/);
   assert.match(rendered, /Dry-run:/);
 });
+
+test('a rehearsal that passed for this exact version makes it ready to turn on, and an edit undoes that', async () => {
+  const { passedWorkflowRehearsal } = await import('../tools/workflow-run-queue.js');
+  const { workflowRehearsalKey } = await import('./workflow-run-definition.js');
+  const tested = def({
+    inputs: { url: { type: 'string', description: 'URL to inspect' } },
+    steps: [{ id: 'fetch', prompt: 'Fetch the website data for {{input.url}}.', allowedTools: ['web_search'] }],
+  });
+  const writeRun = (id: string, passed: boolean, definition: WorkflowDefinition) => {
+    mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${id}.json`), JSON.stringify({
+      id, workflow: 'cert-wf', status: 'creation_test', finishedAt: '2026-10-15T22:37:22.089Z',
+      rehearsal: { passed, definitionKey: workflowRehearsalKey(definition) },
+    }));
+  };
+
+  assert.equal(certifyWorkflow(tested, { testInputs: { url: 'https://example.com' } }).state, 'needs_creation_test');
+  const vouched = certifyWorkflow(tested, { testInputs: { url: 'https://example.com' }, rehearsalPassed: true });
+  assert.equal(vouched.state, 'ready_to_enable');
+  assert.equal(vouched.canEnableDirectly, true);
+
+  writeRun('1792103765373-aaaaaa', true, tested);
+  assert.equal(passedWorkflowRehearsal('cert-wf', tested), '1792103765373-aaaaaa');
+  // Turning it on or off is not an edit: the same rehearsal still covers it.
+  assert.equal(passedWorkflowRehearsal('cert-wf', { ...tested, enabled: true }), '1792103765373-aaaaaa');
+  // Any other edit is a version no rehearsal has covered.
+  const edited = { ...tested, steps: [{ ...tested.steps[0]!, prompt: 'Fetch it twice.' }] };
+  assert.equal(passedWorkflowRehearsal('cert-wf', edited), undefined);
+  // The newest rehearsal of a version decides it.
+  writeRun('1792103765999-bbbbbb', false, tested);
+  assert.equal(passedWorkflowRehearsal('cert-wf', tested), undefined);
+});

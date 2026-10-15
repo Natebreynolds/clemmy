@@ -458,3 +458,31 @@ test('a step naming an app this setup has not connected is a dependency to conne
   assert.doesNotMatch(lines, /needs your answer|hit an error|failed/);
   assert.match(lines, /connected here/);
 });
+
+test('a rehearsal checks a previewed write step\'s filled-in arguments the way the run will, without making the change', async () => {
+  const broken = workflows.writeWorkflow('rehearsed-write-arguments', {
+    name: 'Rehearsed write arguments', description: 'Saves a note whose content is not text.',
+    enabled: false, trigger: { manual: true },
+    steps: [
+      { id: 'save_note', sideEffect: 'write', call: { tool: 'write_file', args: { path: 'notes/rehearsal-canary.md', content: { not: 'text' }, mode: 'overwrite' } } },
+    ],
+  });
+  const refused = await runner.runCreationTest(broken.data, broken.name, 'creation-rehearsed-write-args', {},
+    { respond: async () => { throw new Error('no model runs in this rehearsal'); } } as never);
+  assert.equal(refused.pass, false, 'a write the run would refuse is found before it is turned on');
+  const save = refused.steps.find((step) => step.stepId === 'save_note');
+  assert.equal(save?.status, 'error', JSON.stringify(refused.steps));
+  assert.match(save?.detail ?? '', /run would stop here/);
+  assert.match(save?.detail ?? '', /content/);
+
+  const fine = workflows.writeWorkflow('rehearsed-write-arguments-ok', {
+    name: 'Rehearsed write arguments ok', description: 'Saves a note.',
+    enabled: false, trigger: { manual: true },
+    steps: [
+      { id: 'save_note', sideEffect: 'write', call: { tool: 'write_file', args: { path: 'notes/rehearsal-canary.md', content: 'hello', mode: 'overwrite' } } },
+    ],
+  });
+  const previewed = await runner.runCreationTest(fine.data, fine.name, 'creation-rehearsed-write-args-ok', {},
+    { respond: async () => { throw new Error('no model runs in this rehearsal'); } } as never);
+  assert.equal(previewed.steps.find((step) => step.stepId === 'save_note')?.status, 'previewed', JSON.stringify(previewed.steps));
+});

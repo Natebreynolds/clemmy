@@ -168,6 +168,7 @@ import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js'
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
 import { resolveWorkflowRunConcurrency } from '../execution/workflow-run-concurrency.js';
 import { certifyWorkflow, type WorkflowCertification } from '../execution/workflow-certification.js';
+import { rehearsalVerdictFromRunRecord, workflowRehearsalKey } from '../execution/workflow-run-definition.js';
 import { workflowCodeRevisionFingerprint } from '../execution/workflow-code-certification.js';
 import { buildWorkflowResourceBindingReportFromRuntime } from '../execution/workflow-resource-binding.js';
 import { applyLearnedQualityCriteria, workflowQualityCriteria } from '../execution/workflow-quality-contract.js';
@@ -604,6 +605,7 @@ import {
   requeueWorkflowFailedItemsFromRun,
   requeueWorkflowFromRun,
   resumeWorkflowRun,
+  passedWorkflowRehearsal,
   pendingWorkflowVerification,
   type QueueWorkflowRunRecoveryIntentInput,
 } from '../tools/workflow-run-queue.js';
@@ -1016,11 +1018,28 @@ function workflowExecutionPlanFor(def: WorkflowDefinition, workflowSlug?: string
   return buildWorkflowExecutionPlanWithReadiness(def, workflowSlug, workflowExecutionPlanOptions());
 }
 
-function workflowCertificationFor(def: WorkflowDefinition, workflowSlug: string) {
+function workflowCertificationFor(
+  def: WorkflowDefinition,
+  workflowSlug: string,
+  runRecords?: readonly WorkflowRunRecordSummary[],
+) {
   return certifyWorkflow(def, {
     workflowSlug,
     planOptions: workflowExecutionPlanOptions(),
+    ...(runRecords ? { rehearsalPassed: latestRehearsalPassed(runRecords, workflowSlug, def) } : {}),
   });
+}
+
+/** Whether the newest finished rehearsal of this exact version passed. Runs
+ *  arrive newest first. */
+function latestRehearsalPassed(
+  runRecords: readonly WorkflowRunRecordSummary[],
+  workflowSlug: string,
+  def: WorkflowDefinition,
+): boolean {
+  const key = workflowRehearsalKey(def);
+  const latest = runRecords.find((run) => run.workflow === workflowSlug && run.rehearsal?.definitionKey === key);
+  return latest?.rehearsal?.passed === true;
 }
 
 // ─── Workflow list memo ──────────────────────────────────────────────────────
@@ -1053,7 +1072,7 @@ function memoizedWorkflowListDerivations(
   const hit = workflowListMemo.get(entry.name);
   if (hit && hit.key === key) return { proof: hit.proof, certification: hit.certification };
   const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
-  const certification = workflowCertificationFor(entry.data, entry.name);
+  const certification = workflowCertificationFor(entry.data, entry.name, runRecords);
   workflowListMemo.set(entry.name, { key, proof, certification });
   return { proof, certification };
 }
@@ -1150,9 +1169,10 @@ function workflowCertificationSummary(cert: WorkflowCertification) {
 
 
 function workflowConsoleStatePayload(def: WorkflowDefinition, workflowSlug: string) {
-  const certification = workflowCertificationFor(def, workflowSlug);
+  const runRecords = readWorkflowRunRecords();
+  const certification = workflowCertificationFor(def, workflowSlug, runRecords);
   const executionPlan = certification.dryRun.plan;
-  const proof = buildWorkflowProof(def, readWorkflowRunRecords(), [workflowSlug]);
+  const proof = buildWorkflowProof(def, runRecords, [workflowSlug]);
   return {
     name: def.name,
     enabled: def.enabled,
@@ -2354,6 +2374,7 @@ function workflowGoalFromDashboardBody(raw: unknown): WorkflowGoal | undefined {
 
 interface WorkflowRunRecordSummary extends WorkflowProofRun {
   recoveryIntent?: WorkflowRunRecoveryIntentOverlay | null;
+  rehearsal?: { passed: boolean; definitionKey: string };
 }
 
 function stringField(value: unknown): string | null {
@@ -2496,6 +2517,7 @@ function normalizeWorkflowRunRecord(raw: Record<string, unknown>): WorkflowRunRe
   const workflow = stringField(raw.workflow);
   if (!id || !workflow) return null;
   const recoveryIntent = normalizeWorkflowRunRecoveryIntent(raw.recoveryIntent);
+  const rehearsal = rehearsalVerdictFromRunRecord(raw);
   const terminalOutcome = deriveWorkflowTerminalOutcome({
     status: raw.status,
     finishedAt: raw.finishedAt,
@@ -2524,6 +2546,7 @@ function normalizeWorkflowRunRecord(raw: Record<string, unknown>): WorkflowRunRe
     ...(stringField(raw.goalOutcome) ? { goalOutcome: stringField(raw.goalOutcome)! } : {}),
     ...(stringField(raw.goalReason) ? { goalReason: stringField(raw.goalReason)!.slice(0, 300) } : {}),
     ...(recoveryIntent ? { recoveryIntent } : {}),
+    ...(rehearsal ? { rehearsal } : {}),
   };
 }
 
@@ -6007,8 +6030,9 @@ export function registerConsoleRoutes(
       const target = req.params.name;
       const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
       if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
-      const proof = buildWorkflowProof(entry.data, readWorkflowRunRecords(), [entry.name]);
-      const certification = workflowCertificationFor(entry.data, entry.name);
+      const runRecords = readWorkflowRunRecords();
+      const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
+      const certification = workflowCertificationFor(entry.data, entry.name, runRecords);
       const executionPlan = certification.dryRun.plan;
       const resourceBinding = await buildWorkflowResourceBindingReportFromRuntime(entry.data);
       res.json({
@@ -6276,7 +6300,7 @@ export function registerConsoleRoutes(
     const executionChangedWhileLive = workflowUpdateNeedsVerification(entry.data, patchPrep.def);
     if (patchPrep.def.enabled && (activationRequested || executionChangedWhileLive)) {
       const verification = prepareWorkflowVerification(patchPrep.def, dashboardWorkflowSmokeInputs(body));
-      if (verification.needsTest) {
+      if (verification.needsTest && !passedWorkflowRehearsal(entry.name, patchPrep.def)) {
         const disabledDef = { ...patchPrep.def, enabled: false };
         writeWorkflowAndSyncTriggers(entry.name, disabledDef);
         clearWorkflowFailures(entry.name);
@@ -6702,7 +6726,8 @@ export function registerConsoleRoutes(
         return;
       }
       const verification = prepareWorkflowVerification(prep.def, dashboardWorkflowSmokeInputs(body));
-      if (verification.needsTest) {
+      // A rehearsal that already passed for this exact version is the test.
+      if (verification.needsTest && !passedWorkflowRehearsal(entry.name, prep.def)) {
         writeWorkflowAndSyncTriggers(entry.name, { ...prep.def, enabled: false });
         clearWorkflowFailures(entry.name);
         if (verification.missing.length > 0) {

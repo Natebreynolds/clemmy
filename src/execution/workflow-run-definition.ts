@@ -222,6 +222,13 @@ export function workflowCodeRevisionMatchesSnapshot(
  * the current definition to the admitted one while neutralizing that single
  * control-plane bit; any step/input/resource/trigger edit still counts as
  * drift and requires a fresh test. */
+/** What a rehearsal vouches for: everything a run executes, whether the
+ * workflow is on or off. Turning it on or off never makes a passed rehearsal
+ * stale; any other edit does. */
+export function workflowRehearsalKey(definition: WorkflowDefinition): string {
+  return workflowDefinitionHash({ ...cloneDefinition(definition), enabled: false });
+}
+
 export function workflowDefinitionMatchesSnapshotIgnoringEnabled(
   snapshot: WorkflowRunDefinitionSnapshot,
   current: WorkflowDefinition,
@@ -429,4 +436,14 @@ export function resolveWorkflowRunDefinitionSnapshot(
       definition: cloneDefinition(definition),
     },
   };
+}
+
+/** A finished rehearsal's verdict for one version, read from a run record. */
+export function rehearsalVerdictFromRunRecord(raw: unknown): { passed: boolean; definitionKey: string } | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  if (record.status !== 'creation_test' || typeof record.finishedAt !== 'string') return null;
+  const rehearsal = record.rehearsal as Record<string, unknown> | undefined;
+  if (!rehearsal || typeof rehearsal.passed !== 'boolean' || typeof rehearsal.definitionKey !== 'string') return null;
+  return { passed: rehearsal.passed, definitionKey: rehearsal.definitionKey };
 }

@@ -169,7 +169,7 @@ function guidanceFor(status: OutcomeStatus, statusHint?: string): string {
     case 'failed':
       return `This run stopped and did NOT complete the full objective. Preserve and report any execution evidence above; do not describe proven work as lost, and do not replay side effects.${ref}`;
     case 'blocked':
-      return `This needs attention. Preserve and report the completed work above, name only the remaining dependency, and resume this saved work after it is resolved instead of starting over.${ref}`;
+      return `This needs attention. Preserve and report the completed work above. If what stopped it is a defect in the work's own setup that you can correct (a saved workflow step's arguments, instructions or output), correct it, check it, and run it again: that is yours to fix, not the user's. Otherwise name only the remaining dependency, and resume this saved work after it is resolved instead of starting over.${ref}`;
     case 'needs_input':
       return `This needs user input to continue. Preserve and report the completed work above, ask for the exact remaining action, then resume this saved work; do not guess or restart.${ref}`;
   }

@@ -1,8 +1,8 @@
 ---
 name: workflow-builder
-description: Build, change, test, fix, or explain a saved workflow — a reusable, step-by-step job that runs on a schedule, on an event, or when asked. Covers shaping the steps, wiring data between them, choosing tools, telling the user what a run will cost before saving, rehearsing it without running it for real, reading the result, and fixing what it flags. Use for any request to automate a recurring task, create or edit a workflow, job, automation, routine, or pipeline, or find out why one failed.
+description: Build, change, optimize, test, fix, or explain a saved workflow — a reusable, step-by-step job that runs on a schedule, on an event, or when asked. Covers shaping the steps, wiring data between them, choosing tools, telling the user what a run will cost before saving, reviewing an existing workflow for a better way to run it, rehearsing it without running it for real, reading the result, and fixing what it flags. Use for any request to automate a recurring task, create, edit, improve or optimize a workflow, job, automation, routine, or pipeline, or find out why one failed.
 applicability:
-  toolFamilies: [workflow, workflows, automation, automate, automated, recurring, scheduled, job, routine, schedule, pipeline]
+  toolFamilies: [workflow, workflows, automation, automate, automated, recurring, scheduled, job, routine, schedule, pipeline, optimize, optimise, improve]
   entitySlots: [step, trigger, schedule, forEach, input, test]
 ---
 
@@ -90,11 +90,36 @@ Each step comes back with one of these results:
 
 To fix a step, use `workflow_edit_step` with a patch of only the fields that change. Then run `workflow_test`. Don't resend the whole workflow with `workflow_update` to change one step.
 
-## 6. Workflows from someone else
+## 6. Improve or optimize a workflow that exists
+
+When the user asks you to optimize, improve, review or clean up a workflow, look at all of it before changing anything:
+
+1. **Read the whole definition** with `workflow_get`: every step's prompt or call, its `allowedTools`, the skills it uses, its inputs, resources, trigger and goal.
+2. **Read how it has actually run.** Look at its recent runs: which steps take the time, which fail, which come back empty, and what each run costs.
+3. **Question every step and every tool it names**, against what this setup actually has connected:
+   - Is this the best tool here, or does a connected tool do the job more directly? Examples: an API instead of driving a browser, one batched call instead of one per item, a `call` step instead of an agent for a fixed read or write.
+   - Does the step name a tool or app this setup doesn't have or doesn't use? Workflows written elsewhere often do. Replace it with what is here, and tell the user.
+   - Is each attached skill and allowed tool still needed? An unused tool is a wider door than the step needs.
+   - Could two agent steps be one? Does a per-item step need to run for every item, or only new ones?
+4. **Apply the changes** with `workflow_edit_step`, one step at a time, then run `workflow_test`. Fix anything it flags and test again.
+5. **Report what changed, step by step:** what it was, what it is now, why, and what that does to a run (agents, time, cost). Include the rehearsal result.
+
+Finish the work before you report. Never end on "let me check X next": check it, change it, test it, then report.
+
+When the user also asks you to make sure it works end to end, the rehearsal is not the end. Writes and sends are only previewed there. Offer one real run with the smallest input that exercises every step, run it once they agree, and fix what it shows.
+
+## 7. When a real run stops
+
+- **The cause is the workflow's own setup** (a step's arguments, its instructions, or its output not matching what the next step needs). That is yours to fix: correct the step with `workflow_edit_step`, run `workflow_test`, then run it again. Tell the user what was wrong and what you changed.
+- **The cause is outside the workflow** (an app to connect, an account to choose, a person's decision). Name that one thing and wait for it.
+
+Never hand the user a reason code. Say what happened in plain words.
+
+## 8. Workflows from someone else
 
 A workflow imported from another person's setup arrives off. It arrives without their accounts, connections or chosen models, and it's rehearsed here before it can turn on. Treat its first rehearsal's result like any other.
 
-## 7. Report like a colleague
+## 9. Report like a colleague
 
 When it's saved, tell the user five things:
 

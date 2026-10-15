@@ -44,6 +44,8 @@ import {
   resolveWorkflowRunDefinitionSnapshot,
   workflowDefinitionHash,
   workflowDefinitionMatchesSnapshotIgnoringEnabled,
+  rehearsalVerdictFromRunRecord,
+  workflowRehearsalKey,
   type CompiledWorkflowRunDefinitionSnapshot,
   type WorkflowRunDefinitionSnapshot,
 } from '../execution/workflow-run-definition.js';
@@ -3206,6 +3208,27 @@ export function pendingWorkflowVerification(name: string, definition: WorkflowDe
       const record: unknown = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf8'));
       if (matchingPendingWorkflowVerification(record, { runId, workflowName: name, definitionHash })) return runId;
     } catch { /* Unreadable records cannot prove pending verification. */ }
+  }
+  return undefined;
+}
+
+/**
+ * The rehearsal that vouches for this exact version of the workflow, if the
+ * newest finished rehearsal of it passed. A later rehearsal of the same
+ * version that failed, or any edit since (other than turning it on or off),
+ * means there is none. Read-only lifecycle evidence.
+ */
+export function passedWorkflowRehearsal(name: string, definition: WorkflowDefinition): string | undefined {
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return undefined;
+  const key = workflowRehearsalKey(definition);
+  for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).sort().reverse()) {
+    try {
+      const record: unknown = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf8'));
+      if ((record as { workflow?: unknown }).workflow !== name) continue;
+      const verdict = rehearsalVerdictFromRunRecord(record);
+      if (!verdict || verdict.definitionKey !== key) continue;
+      return verdict.passed ? file.slice(0, -5) : undefined;
+    } catch { /* an unreadable record vouches for nothing */ }
   }
   return undefined;
 }

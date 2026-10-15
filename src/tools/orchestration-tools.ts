@@ -81,6 +81,7 @@ import { listFinalFailedItems } from '../execution/workflow-events.js';
 import {
   awaitWorkflowCreationTestSettlement,
   type WorkflowCreationTestSettlement,
+  passedWorkflowRehearsal,
   queueWorkflowCreationTest,
   requeueWorkflowFailedItemsFromRun,
 } from './workflow-run-queue.js';
@@ -1902,7 +1903,12 @@ export function registerOrchestrationTools(server: McpServer): void {
         // let the PASS enable it, instead of trusting the config. Same strict
         // input policy as create: no bindable smoke inputs means stay disabled.
         const enableVerification = prepareWorkflowVerification(prep.def, providedSmokeInputs);
-        if (enableVerification.needsTest) {
+        // A rehearsal that already passed for this exact version is the test;
+        // running it again only makes the owner wait for the same answer.
+        const alreadyRehearsed = enableVerification.needsTest
+          ? passedWorkflowRehearsal(entry.name, prep.def)
+          : undefined;
+        if (enableVerification.needsTest && !alreadyRehearsed) {
           writeWorkflowAndSyncTriggers(entry.name, { ...prep.def, enabled: false });
           clearWorkflowFailures(entry.name);
           if (enableVerification.missing.length > 0) {
@@ -1947,8 +1953,11 @@ export function registerOrchestrationTools(server: McpServer): void {
         const gapTail = prep.gaps.length > 0
           ? `\n\nWorth tightening when you have a minute (advisory, not blocking):${renderWorkflowGapQuestions(prep.gaps)}`
           : '';
+        const rehearsedTail = alreadyRehearsed
+          ? ` It already passed its creation test for this exact version (run ${alreadyRehearsed}), so it was turned on without testing again.`
+          : '';
         return textResult(withWorkflowCommit(entry.name,
-          `Workflow "${name}" is now approved (enabled).${gapTail}`
+          `Workflow "${name}" is now approved (enabled).${rehearsedTail}${gapTail}`
             + (prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : ''),
         ));
       }
