@@ -2656,10 +2656,43 @@ export function buildAuthorizedToolSearchCandidateSources(
     kind: 'authorized_composio',
     async search(input) {
       const { query, deadlineAt } = input;
-      if (deadlineAt === undefined || exactComposioOperationsFromQuery(query).length > 0) return searchLive(input);
+      let connectionObservation: Promise<ReturnType<typeof peekCurrentConnectedToolkits>> | undefined;
+      let observedConnections: ReturnType<typeof peekCurrentConnectedToolkits> = null;
+      const observeConnections = () => connectionObservation ??= (async () => {
+        const observed = await freshConnectionsWithin({ signal: input.signal, deadlineAt: exactDiscoveryDeadline(deadlineAt) });
+        observedConnections = observed && !composioConnectionsProblem() ? peekCurrentConnectedToolkits() : null;
+        return observedConnections;
+      })();
+      // Started first and joined on every answer below, so a live search that
+      // answers late (the cached fallback holds connected apps only) cannot
+      // drop the apps the query named that are not connected.
+      const unconnected = exactComposioOperationsFromQuery(query).length > 0
+        ? Promise.resolve([] as ToolSearchBrokerCandidate[])
+        : namedUnconnectedCandidates(query, input.signal, deadlineAt, observeConnections);
+      type ConnectedOutcome = { ok: true; value: ToolSearchBrokerCandidate[] } | { ok: false; error: unknown };
+      const withUnconnected = async (outcome: ConnectedOutcome): Promise<ToolSearchBrokerCandidate[]> => {
+        const completed = await unconnected;
+        // The named lookup can finish before a slow connected search. Its
+        // exact observation must still be current when this answer is joined.
+        const named = discoveryStillActive(input) && observedConnections && !composioConnectionsProblem()
+          && peekCurrentConnectedToolkits() === observedConnections ? completed : [];
+        if (!outcome.ok) {
+          // Confirmed absence can still answer with setup-only metadata;
+          // unknown registry state and every other error stay unavailable.
+          if (outcome.error instanceof CandidateSourceUnavailableError
+            && outcome.error.code === 'no_connections' && named.length > 0) return named;
+          throw outcome.error;
+        }
+        const rows = outcome.value;
+        const seen = new Set(rows.map((candidate) => candidate.name.trim().toUpperCase()));
+        return [...rows, ...named.filter((candidate) => !seen.has(candidate.name.trim().toUpperCase()))];
+      };
+      const observeLive = () => searchLive(input).then<ConnectedOutcome, ConnectedOutcome>(
+        value => ({ ok: true, value }), error => ({ ok: false, error }));
+      if (deadlineAt === undefined || exactComposioOperationsFromQuery(query).length > 0) return withUnconnected(await observeLive());
       const fallbackMs = deadlineAt - Date.now() - COMPOSIO_LEASED_FALLBACK_MARGIN_MS;
-      if (fallbackMs <= 0) return leasedIndexedComposioCandidates(query);
-      const live = searchLive(input);
+      if (fallbackMs <= 0) return withUnconnected({ ok: true, value: leasedIndexedComposioCandidates(query) });
+      const live = observeLive();
       // A query that names a connected app with current contracts that match
       // it is answered from them after a short wait, not the whole budget.
       const budgetMs = leasedIndexedComposioCandidates(query, true).length > 0
@@ -2669,14 +2702,14 @@ export function buildAuthorizedToolSearchCandidateSources(
       const late = new Promise<'late'>((resolve) => { timer = setTimeout(() => resolve('late'), budgetMs); });
       try {
         const raced = await Promise.race([live, late]);
-        if (raced !== 'late') return raced;
+        if (raced !== 'late') return withUnconnected(raced);
       } finally {
         if (timer) clearTimeout(timer);
       }
       // The live search keeps going and teaches what it learns; this answer
       // uses what is already proven current.
       live.catch(() => undefined);
-      return leasedIndexedComposioCandidates(query);
+      return withUnconnected({ ok: true, value: leasedIndexedComposioCandidates(query) });
     },
     prepareCandidates: (input) => prepareCandidatesLive(input),
   };
@@ -2740,27 +2773,7 @@ export function buildAuthorizedToolSearchCandidateSources(
     }
   }
   async function searchLive(input: Parameters<ToolSearchCandidateSource['search']>[0]): Promise<ToolSearchBrokerCandidate[]> {
-    let connectionObservation: Promise<ReturnType<typeof peekCurrentConnectedToolkits>> | undefined;
-    const observeConnections = () => connectionObservation ??= (async () => {
-      const observed = await freshConnectionsWithin({ signal: input.signal, deadlineAt: exactDiscoveryDeadline(input.deadlineAt) });
-      return observed && !composioConnectionsProblem() ? peekCurrentConnectedToolkits() : null;
-    })();
-    const [connectedOutcome, unconnected] = await Promise.all([
-      searchConnectedLive(input).then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error })),
-      exactComposioOperationsFromQuery(input.query).length > 0
-        ? Promise.resolve([] as ToolSearchBrokerCandidate[])
-        : namedUnconnectedCandidates(input.query, input.signal, input.deadlineAt, observeConnections),
-    ]);
-    if (!connectedOutcome.ok) {
-      // A confirmed empty registry can still answer with setup-only metadata.
-      // Keep every other failure, and no_connections without such evidence.
-      if (connectedOutcome.error instanceof CandidateSourceUnavailableError
-        && connectedOutcome.error.code === 'no_connections' && unconnected.length > 0) return unconnected;
-      throw connectedOutcome.error;
-    }
-    const connected = connectedOutcome.value;
-    const seen = new Set(connected.map((candidate) => candidate.name.trim().toUpperCase()));
-    return [...connected, ...unconnected.filter((candidate) => !seen.has(candidate.name.trim().toUpperCase()))];
+    return searchConnectedLive(input);
   }
   async function searchConnectedLive({ query, signal, deadlineAt, accountSelection, deferPreparation }: Parameters<ToolSearchCandidateSource['search']>[0]): Promise<ToolSearchBrokerCandidate[]> {
       preparedSearchCandidates.clear();

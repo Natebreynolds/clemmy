@@ -121,3 +121,43 @@ test('the real broker reports a confirmed disconnected app on page one even belo
   assert.match(body.apps_not_connected[0].next, /exact operation names/);
   assert.equal(business, 0);
 });
+
+for (const retireBeforeJoin of [false, true]) test(`a late connected search keeps cached contracts and ${retireBeforeJoin ? 'drops a retired named-app observation' : 'joins one authoritative named-app lookup'}`, async () => {
+  const connectedEntered = deferred<void>(), namedFinished = deferred<void>(), release = deferred<unknown[]>();
+  const controller = new AbortController();
+  const cachedOperation = 'PAPERPLANE_GET_SENTINEL_PAGE';
+  const connection = { id: 'fixture-paperplane-account', status: 'ACTIVE', user_id: 'fixture-owner', toolkit: { slug: 'paperplane' } };
+  composio.__test__.setConnectedAccountsLoader(async () => [connection]);
+  schemas.rememberToolSchema(cachedOperation, schema, Date.now(), 'fixture-v1');
+  index.recordCapabilityOperations([{ identifier: cachedOperation, carrierKind: 'composio', carrier: 'paperplane',
+    displayName: query, description: query, effectClass: 'read', effectProvenance: 'declared' }]);
+  let connectedLookups = 0, namedLookups = 0;
+  installProvider(async input => {
+    if ((input.toolkits as string[] | undefined)?.includes('quillboard')) {
+      namedLookups++; namedFinished.resolve(); return [row()];
+    }
+    connectedLookups++; connectedEntered.resolve(); return release.promise;
+  });
+  const pending = source().search({ query, limit: 8, deferPreparation: true,
+    signal: controller.signal, deadlineAt: Date.now() + 2_000 });
+  try {
+    await Promise.all([connectedEntered.promise, namedFinished.promise]);
+    // The named lookup is complete while the connected transport stays held.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (retireBeforeJoin) composio._setConnectedToolkitsSnapshotForTests([
+      { slug: 'paperplane', connectionId: connection.id, status: 'ACTIVE' },
+      { slug: 'quillboard', connectionId: 'new-quillboard-account', status: 'ACTIVE' },
+    ]);
+    const found = await pending;
+    assert.ok(found.some(candidate => candidate.name === cachedOperation), 'the ordinary cached connected fallback remains available');
+    const named = found.filter(candidate => candidate.connectionRequired);
+    assert.equal(named.length, retireBeforeJoin ? 0 : 1);
+    if (!retireBeforeJoin) assert.deepEqual(named[0]!.connectionRequired, { toolkit: 'quillboard', app: 'Quillboard' });
+    assert.equal(namedLookups, 1, 'the fallback reuses the already completed named lookup');
+    assert.equal(connectedLookups, 1, 'the connected transport was still held when the cached answer returned');
+    assert.equal(business, 0);
+  } finally {
+    controller.abort(); release.resolve([]);
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+});
