@@ -216,10 +216,53 @@ export function restoreProvenanceBoundResults(sessionId: string, items: readonly
   return { items: out, restored, missing };
 }
 
-/** Note the memory kept for this conversation. A later turn writes a new
- * snapshot and clears it, so a resumed conversation is remembered again. */
-export function noteConversationMemory(sessionId: string, episodeId: string): void {
-  openEventLog().prepare('UPDATE session_conversation_state SET memory_episode_id = ? WHERE session_id = ?').run(episodeId, sessionId);
+/** Exact conversation revision whose transcript a memory job read. Event seq
+ * also catches a new accepted message before its state snapshot is written. */
+export interface ConversationMemorySnapshot {
+  sessionId: string;
+  createdAt: string;
+  sessionUpdatedAt: string;
+  stateJson: string;
+  stateUpdatedAt: string;
+  fidelity: 'full' | 'compacted' | 'memory';
+  memoryEpisodeId: string | null;
+  eventSeq: number;
+}
+
+export function captureConversationMemorySnapshot(sessionId: string): ConversationMemorySnapshot | null {
+  return openEventLog().prepare(`
+    SELECT s.id AS sessionId, s.created_at AS createdAt, s.updated_at AS sessionUpdatedAt,
+           c.state_json AS stateJson, c.updated_at AS stateUpdatedAt, c.fidelity,
+           c.memory_episode_id AS memoryEpisodeId,
+           COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.session_id = s.id), 0) AS eventSeq
+      FROM sessions s JOIN session_conversation_state c ON c.session_id = s.id
+     WHERE s.id = ?
+  `).get(sessionId) as ConversationMemorySnapshot | undefined ?? null;
+}
+
+/** Publish memory only for the revision summarized. The synchronous factory
+ * writes its episode after the revision check while the harness write lock is
+ * held; a late summary cannot overwrite memory or mark a newer turn remembered.
+ * The memory database is separate: an episode write surviving a later harness
+ * failure is harmless retained evidence, never a marker that suppresses retry. */
+export function noteConversationMemory(
+  sessionId: string,
+  episode: string | (() => string),
+  expected: ConversationMemorySnapshot,
+): boolean {
+  if (expected.sessionId !== sessionId) return false;
+  const db = openEventLog();
+  return db.transaction(() => {
+    const current = captureConversationMemorySnapshot(sessionId);
+    if (!current || current.createdAt !== expected.createdAt
+      || current.sessionUpdatedAt !== expected.sessionUpdatedAt || current.stateJson !== expected.stateJson
+      || current.stateUpdatedAt !== expected.stateUpdatedAt || current.fidelity !== expected.fidelity
+      || current.memoryEpisodeId !== expected.memoryEpisodeId || current.eventSeq !== expected.eventSeq) return false;
+    const episodeId = typeof episode === 'function' ? episode() : episode;
+    return db.prepare(`UPDATE session_conversation_state SET memory_episode_id = ?
+      WHERE session_id = ? AND state_json = ? AND updated_at = ? AND fidelity = ? AND memory_episode_id IS ?`)
+      .run(episodeId, sessionId, expected.stateJson, expected.stateUpdatedAt, expected.fidelity, expected.memoryEpisodeId).changes === 1;
+  }).immediate();
 }
 
 /** Why this conversation must keep its state as it is, or null. */
@@ -258,6 +301,9 @@ function lower(sessionId: string, input: {
       .get(sessionId) as { createdAt: string; updatedAt: string } | undefined;
     const stored = getSessionConversationState(sessionId, db);
     if (!session || !stored) return 'missing';
+    // Retirement's selected episode must still belong to this state when the
+    // write lock is acquired, rather than a previous turn of the same chat.
+    if (input.memoryEpisodeId != null && stored.memoryEpisodeId !== input.memoryEpisodeId) return 'raced';
     if (conversationLifecycleHold(sessionId)) return 'held';
     const items = Array.isArray(stored.state.items) ? stored.state.items as AgentInputItem[] : [];
     if (inspectConversationProtocol(items).status !== 'valid') return 'invalid';
