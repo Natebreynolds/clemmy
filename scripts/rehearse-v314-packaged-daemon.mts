@@ -1455,7 +1455,7 @@ function preservedPreexistingFiles(
 /** Shipped first-party instruction skills that setup seeds into `skills/` on
  * first boot (src/setup/builtin-skills.ts). Closed on purpose: the pin proves
  * this list equals the package's `builtin-skills/` directory. */
-export const BUILTIN_SKILL_SEED_IDS = Object.freeze(['people-lookup', 'technical-content-marketing', 'workspace-builder'] as const);
+export const BUILTIN_SKILL_SEED_IDS = Object.freeze(['people-lookup', 'technical-content-marketing', 'workflow-builder', 'workspace-builder'] as const);
 
 /** The provisioner's record beside each seeded built-in: the digest of the exact
  * SKILL.md bytes it published, so a later release can tell its own untouched
