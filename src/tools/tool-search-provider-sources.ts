@@ -2660,9 +2660,13 @@ export function buildAuthorizedToolSearchCandidateSources(
       const unconnected = exactComposioOperationsFromQuery(query).length > 0
         ? Promise.resolve([] as ToolSearchBrokerCandidate[])
         : namedUnconnectedCandidates(query, input.signal, deadlineAt);
+      // First, not last: the broker keeps a source's first twenty rows, and
+      // these (at most four) are the only sign the named app exists at all.
+      // Relevance still orders every row downstream.
       const withUnconnected = async (rows: ToolSearchBrokerCandidate[]): Promise<ToolSearchBrokerCandidate[]> => {
-        const seen = new Set(rows.map((candidate) => candidate.name.trim().toUpperCase()));
-        return [...rows, ...(await unconnected).filter((candidate) => !seen.has(candidate.name.trim().toUpperCase()))];
+        const named = await unconnected;
+        const seen = new Set(named.map((candidate) => candidate.name.trim().toUpperCase()));
+        return [...named, ...rows.filter((candidate) => !seen.has(candidate.name.trim().toUpperCase()))];
       };
       if (deadlineAt === undefined || exactComposioOperationsFromQuery(query).length > 0) return withUnconnected(await searchLive(input));
       const fallbackMs = deadlineAt - Date.now() - COMPOSIO_LEASED_FALLBACK_MARGIN_MS;
