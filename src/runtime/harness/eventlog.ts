@@ -1356,12 +1356,12 @@ function addListFilter(
  * largest steady hold on the daemon's main loop. A row is re-read only when it
  * changed. Changes made through this process's connection are counted by
  * temporary triggers that live only on that connection. A commit by any other
- * connection changes SQLite's data_version; each row is then compared by what
- * can be read without its metadata blob (updated time, status, title, tokens
- * and the metadata's byte length) and only a row that differs is read again.
- * Dropping every row there re-read the whole table's conversation state on
- * nearly every rail poll. Rows are shared across lists and must not be
- * mutated.
+ * connection changes SQLite's data_version; each row is then compared by its
+ * display fields and exact metadata bytes. A byte count cannot detect an
+ * equal-length replacement. Schema94 keeps conversation state separately, so
+ * this comparison no longer reads that large state blob. Only a differing row
+ * is parsed again; unchanged rows retain their shared identity. Rows are
+ * shared across lists and must not be mutated.
  */
 interface DisplaySessionRowCache {
   db: Database.Database;
@@ -1369,11 +1369,11 @@ interface DisplaySessionRowCache {
   rows: Map<string, { version: number; outside: string; row: SessionRow }>;
 }
 
-/** What another connection's change to a session row can be seen by without
- *  reading the metadata blob: octet_length reads the record header only. */
+/** Exact foreign-write observation. Reading metadata is needed only after an
+ *  external commit; local writes use the temporary version counters. */
 function displayRowOutsideFingerprint(table: string): string {
-  return `${table}.updated_at || char(0) || ${table}.status || char(0) || COALESCE(${table}.title, '')
-    || char(0) || COALESCE(${table}.tokens_used, 0) || char(0) || COALESCE(octet_length(${table}.metadata_json), -1)`;
+  return `json_array(${table}.updated_at, ${table}.status, ${table}.title,
+    ${table}.tokens_used, ${table}.metadata_json)`;
 }
 let displaySessionRowCache: DisplaySessionRowCache | null = null;
 const DISPLAY_ROW_FETCH_CHUNK = 400;
