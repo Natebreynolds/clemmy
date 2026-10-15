@@ -28,8 +28,10 @@ import { appendEvent, openEventLog } from './eventlog.js';
 import { canonicalExternalInputSchemaDigestV1 } from './external-capability-risk-loader.js';
 
 export const OPERATION_VARIANT_READ_VERSION = 1 as const;
-/** Jev's probability that such a call changes anything, at most. */
-export const OPERATION_VARIANT_READ_SCREEN_MAX = 0.2;
+/** Jev's probability that such a call changes anything, at most. The screen
+ * only turns away the clear writes, which it scores far above this; clear
+ * reads still score well above zero. The judge's confirmation decides. */
+export const OPERATION_VARIANT_READ_SCREEN_MAX = 0.35;
 /** The judge's confidence that it changes nothing, at least. */
 export const OPERATION_VARIANT_READ_CONFIRM_MIN = 0.9;
 
