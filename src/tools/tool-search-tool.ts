@@ -510,6 +510,8 @@ export interface ToolSearchBrokerCandidate {
   carrier: ToolSearchDispatchCarrier;
   score?: number;
   guidance?: string;
+  /** An operation of an app the query named that the owner has not connected. */
+  connectionRequired?: { toolkit: string; app: string };
   invocation?: {
     name: string;
     fixedArgs?: Record<string, unknown>;
@@ -2272,6 +2274,21 @@ export function registerToolSearchTool(
           }
           return '';
         })();
+        // Apps the search named that are not connected, from every candidate
+        // the sources returned, not just this page: a low-ranked row must not
+        // hide that the owner can be offered the app.
+        const appsNotConnected = page === 1 && !deferredPage ? (() => {
+          const byToolkit = new Map<string, { app: string; operations: string[] }>();
+          for (const candidate of sourceCandidates) {
+            const required = (candidate as ToolSearchBrokerCandidate).connectionRequired;
+            if (!required) continue;
+            const entry = byToolkit.get(required.toolkit) ?? { app: required.app, operations: [] };
+            if (entry.operations.length < 3) entry.operations.push(candidate.name);
+            byToolkit.set(required.toolkit, entry);
+          }
+          return [...byToolkit.values()].map((entry) => ({ ...entry,
+            next: `${entry.app} is not connected. If the owner means ${entry.app}, call tool_search with one of these exact operation names to offer them the card to connect it.` }));
+        })() : [];
         const discoveryAdvisory = page === 1 && advisoryToolkit
           ? maybeDiscoveryAdvisory({
               kind: 'search',
@@ -2309,6 +2326,7 @@ export function registerToolSearchTool(
           // A source that could not answer this query — a provider/connection
           // fact, distinct from and never implied by an empty `results`.
           ...(unavailable.length > 0 ? { unavailable } : {}),
+          ...(appsNotConnected.length > 0 ? { apps_not_connected: appsNotConnected } : {}),
           brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
           hint: hintForRows(rows, schemaReadRequired.size > 0),
           ...(discoveryAdvisory ? { discovery_advisory: discoveryAdvisory } : {}),

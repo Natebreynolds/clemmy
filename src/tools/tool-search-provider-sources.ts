@@ -2722,6 +2722,7 @@ export function buildAuthorizedToolSearchCandidateSources(
           score: composioDiscoveryScore(0.5, toolkit, slug),
           invocation: { name: 'composio_execute_tool', fixedArgs: { tool_slug: slug }, payloadField: 'arguments' },
           guidance: `${app} is not connected for the owner, so this cannot run yet. If the owner means ${app}, search tool_search for this exact operation name, ${slug}: that offers them the card to connect ${app}.`,
+          connectionRequired: { toolkit, app },
         };
       });
     } catch {
