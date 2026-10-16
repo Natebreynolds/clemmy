@@ -94,7 +94,10 @@ test.after(async () => {
 });
 
 test('J4: converse → decide → fan out → steer one branch → reconcile both', async () => {
-  setProactiveReportFireForTest(async () => { /* passive report-back is the assertion target */ });
+  // The report-back is published by the canonical committer, as in the app: a
+  // retained result is delivered only once it is published, and an async
+  // callback is never proof of delivery.
+  setProactiveReportFireForTest(null);
   closeEventLog();
   resetEventLog();
   resetMemoryDb();
