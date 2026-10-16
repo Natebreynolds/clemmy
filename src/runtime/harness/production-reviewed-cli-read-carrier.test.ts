@@ -9,7 +9,9 @@ import {
   mkdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
@@ -559,13 +561,25 @@ test('the pinned reviewed process receives current host CLI declarations without
     `inherited: process.env[${JSON.stringify(inheritedKey)}], privateDaemon: process.env[${JSON.stringify(privateKey)}] ?? null,`,
     "argv: process.argv.slice(1), n }));",
   ].join('\n');
-  let declarationRevision = 0;
+  let declaredProfile = false;
   const declareProfile = (profile: string): void => {
-    writeFileSync(cliEnvFile, JSON.stringify({ [profileKey]: profile, [caseKey.toLowerCase()]: 'declared-case' }));
-    // The declaration reader caches by mtime; make both controlled snapshots
-    // distinct even on filesystems whose ordinary write timestamp is coarse.
-    const stamp = new Date(Date.now() + ++declarationRevision * 1_000);
-    utimesSync(cliEnvFile, stamp, stamp);
+    const text = JSON.stringify({ [profileKey]: profile, [caseKey.toLowerCase()]: 'declared-case' });
+    if (!declaredProfile) {
+      writeFileSync(cliEnvFile, text);
+      const fixed = new Date('2026-10-16T01:00:00.000Z');
+      utimesSync(cliEnvFile, fixed, fixed);
+      declaredProfile = true;
+      return;
+    }
+    // A common atomic settings edit preserves timestamps. The fresh emitted
+    // crossing must notice the replacement, not rely on a forced mtime tick.
+    const before = statSync(cliEnvFile);
+    const replacement = `${cliEnvFile}.replacement-${nonce}`;
+    writeFileSync(replacement, text);
+    utimesSync(replacement, before.atime, before.mtime);
+    renameSync(replacement, cliEnvFile);
+    assert.equal(statSync(cliEnvFile).size, before.size);
+    assert.equal(statSync(cliEnvFile).mtimeMs, before.mtimeMs);
   };
   try {
     process.env[profileKey] = 'inherited-profile';

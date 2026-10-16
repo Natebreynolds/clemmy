@@ -73,6 +73,7 @@ function stepUsesModel(step: WorkflowStepInput): boolean {
 export function analyzeWorkflowRouting(
   def: Pick<WorkflowDefinition, 'steps'>,
   bindings: RoleBinding[] = readDurableBindings(),
+  capturedDefaultWorkerModel?: string,
 ): WorkflowRoutingAdvisory[] {
   const workerIntents = bindings
     .filter((b) => b.role === 'worker' && typeof b.whenIntent === 'string' && (b.whenIntent as string).trim().length > 0)
@@ -86,7 +87,7 @@ export function analyzeWorkflowRouting(
   // The default worker model this workflow's untagged/mismatched steps fall back
   // to. Env-derived (same source the runtime uses) — display only; the advisory
   // DECISIONS below depend solely on the passed bindings so they stay testable.
-  const defaultWorkerModel = resolveRoleModel('worker').modelId;
+  const defaultWorkerModel = capturedDefaultWorkerModel ?? resolveRoleModel('worker').modelId;
 
   const advisories: WorkflowRoutingAdvisory[] = [];
   for (const step of def.steps ?? []) {
@@ -147,6 +148,7 @@ export function renderWorkflowRoutingAdvisories(advisories: WorkflowRoutingAdvis
 export function resolveStepDisplayModel(
   step: Pick<WorkflowStepInput, 'model' | 'intent' | 'prompt' | 'deterministic' | 'call'>,
   workflow?: { models?: { brain?: string } },
+  workerModel: (intent?: string) => string = (intent) => resolveRoleModel('worker', intent).modelId,
 ): string | null {
   if (step.deterministic || step.call || !step.prompt?.trim()) return null;
   if (step.model) return step.model;
@@ -155,6 +157,5 @@ export function resolveStepDisplayModel(
   // while the step chips still claimed the global worker default.
   const pinned = workflow?.models?.brain?.trim();
   if (pinned) return pinned;
-  if (step.intent) return resolveRoleModel('worker', step.intent).modelId;
-  return resolveRoleModel('worker').modelId;
+  return workerModel(step.intent || undefined);
 }

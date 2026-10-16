@@ -10,6 +10,7 @@ import {
 } from './workflow-dry-run-simulation.js';
 import { classifyWorkflowExecutionMode, type WorkflowExecutionMode, type WorkflowCodifyCandidate } from './workflow-execution-mode.js';
 import { workflowResourceBindingGaps } from './workflow-resource-binding.js';
+import { workflowCertificationDisplayInputs, type WorkflowCertificationDisplayView } from './workflow-certification-view.js';
 import {
   certifyWorkflowCode,
   type WorkflowCodeCertification,
@@ -43,6 +44,8 @@ export interface WorkflowCertificationOptions {
   planOptions?: WorkflowDryRunPlanOptions;
   /** A rehearsal of this exact version passed: it does not need another. */
   rehearsalPassed?: boolean;
+  /** Host-issued display inputs; never an authored workflow or run option. */
+  displayView?: WorkflowCertificationDisplayView;
 }
 
 export interface WorkflowCertification {
@@ -81,10 +84,12 @@ export function certifyWorkflow(
 ): WorkflowCertification {
   const runInputs = normalizeWorkflowRunInputs(options.runInputs ?? {});
   const testInputs = normalizeWorkflowRunInputs(options.testInputs ?? {});
+  const displayInputs = workflowCertificationDisplayInputs(options.displayView, def, options.workflowSlug, options.planOptions);
   const dryRun = simulateWorkflowDryRun(def, {
     workflowSlug: options.workflowSlug,
     inputs: runInputs,
     planOptions: options.planOptions,
+    displayView: options.displayView,
   });
   const execution = classifyWorkflowExecutionMode(def);
   const code = certifyWorkflowCode(def, options.workflowSlug ?? def.name);
@@ -92,7 +97,7 @@ export function certifyWorkflow(
   // Model-routing advisories (silent no-op tag / missed routing) ride the
   // contract-advisory channel so the Automate UI surfaces them alongside other
   // advisories. Advisory only — they never flip canRun/canEnable.
-  const routingAdvisories = renderWorkflowRoutingAdvisories(analyzeWorkflowRouting(def));
+  const routingAdvisories = displayInputs?.routingAdvisories ?? renderWorkflowRoutingAdvisories(analyzeWorkflowRouting(def));
   const contractAdvisories = [...dryRun.contractAdvisories, ...routingAdvisories, ...code.advisories];
   const verification = prepareWorkflowVerification(def, testInputs);
   const missingRunInputs = missingWorkflowRunInputs(def, runInputs);

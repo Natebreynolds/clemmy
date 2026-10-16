@@ -25,6 +25,7 @@ import { resolveStepDisplayModel } from './workflow-routing-check.js';
 import { preflightWorkflow } from './workflow-preflight.js';
 import { checkWorkflowRunReadiness } from './workflow-run-readiness.js';
 import { workflowQualityCriteria } from './workflow-quality-contract.js';
+import { workflowCertificationDisplayInputs, type WorkflowCertificationDisplayView } from './workflow-certification-view.js';
 import type {
   WorkflowExecutionPlan,
   WorkflowExecutionPlanOptions,
@@ -83,6 +84,8 @@ export interface SimulateWorkflowDryRunOptions {
   workflowSlug?: string;
   inputs?: Record<string, string>;
   planOptions?: WorkflowDryRunPlanOptions;
+  /** Host-issued catalog view only; a copied or mismatched value reads fresh. */
+  displayView?: WorkflowCertificationDisplayView;
 }
 
 function effectFor(sideEffect: StepSideEffectClass): WorkflowDryRunEffect {
@@ -135,7 +138,8 @@ export function simulateWorkflowDryRun(
 
   // One call gives us the built plan (waves, fanout, gates, tool surface,
   // visual contract) AND the readiness blocker/warning partition.
-  const readiness = checkWorkflowRunReadiness(def, options.workflowSlug, options.planOptions ?? {});
+  const displayInputs = workflowCertificationDisplayInputs(options.displayView, def, options.workflowSlug, options.planOptions);
+  const readiness = displayInputs?.readiness ?? checkWorkflowRunReadiness(def, options.workflowSlug, options.planOptions ?? {});
   const plan = readiness.plan;
   const preflight = preflightWorkflow(def, options.inputs ?? {});
 
@@ -145,7 +149,7 @@ export function simulateWorkflowDryRun(
   }
   const fanoutByStep = new Map(plan.fanout.map((f) => [f.stepId, f]));
 
-  const traced: WorkflowDryRunStep[] = steps.map((step) => {
+  const traced: WorkflowDryRunStep[] = steps.map((step, index) => {
     const sideEffect = classifyStepSideEffect(step);
     const touches = {
       tools: uniqueTrimmed([...(step.allowedTools ?? []), step.call?.tool]),
@@ -168,7 +172,7 @@ export function simulateWorkflowDryRun(
       fanout: fan ? { source: fan.source, newOnly: fan.newOnly } : null,
       // The model this step ACTUALLY runs on (pinned, intent-routed, or the
       // worker default) — not just an explicit pin. Null for non-LLM steps.
-      model: resolveStepDisplayModel(step, def),
+      model: displayInputs ? displayInputs.stepModels[index] ?? null : resolveStepDisplayModel(step, def),
     };
   });
 

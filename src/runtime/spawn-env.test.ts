@@ -3,15 +3,37 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync,
+  statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { augmentPath, mergedSpawnEnv, userManagedExecutableDirs } from './spawn-env.js';
+import { augmentPath, mergedSpawnEnv, userDeclaredCliEnv, userManagedExecutableDirs } from './spawn-env.js';
 import { childEnvValue } from './child-env-layers.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+function withCliEnvFile(work: (file: string, home: string) => void): void {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clem-cli-env-generation-'));
+  const previousHome = process.env.CLEMENTINE_HOME;
+  process.env.CLEMENTINE_HOME = home;
+  mkdirSync(path.join(home, 'state'), { recursive: true });
+  try { work(path.join(home, 'state', 'cli-env.json'), home); }
+  finally {
+    if (previousHome === undefined) delete process.env.CLEMENTINE_HOME; else process.env.CLEMENTINE_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+function replaceCliEnvPreservingMtime(file: string, text: string): void {
+  const before = statSync(file);
+  const replacement = file + '.replacement';
+  writeFileSync(replacement, text);
+  utimesSync(replacement, before.atime, before.mtime);
+  renameSync(replacement, file);
+}
 
 test('augmentPath prepends Homebrew + the running node binary dir', () => {
   const out = augmentPath('/usr/bin:/bin');
@@ -378,6 +400,176 @@ test('an explicitly empty user npm cache setting receives no default on POSIX', 
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('CLI declarations refresh after same-sized atomic replacement preserving mtime', () => withCliEnvFile(file => {
+  writeFileSync(file, JSON.stringify({ CLI_PROFILE: 'profile-a' }));
+  const fixed = new Date('2026-10-16T01:00:00.000Z');
+  utimesSync(file, fixed, fixed);
+  const before = statSync(file);
+  assert.deepEqual(userDeclaredCliEnv(), { CLI_PROFILE: 'profile-a' });
+  replaceCliEnvPreservingMtime(file, JSON.stringify({ CLI_PROFILE: 'profile-b' }));
+  assert.equal(statSync(file).size, before.size);
+  assert.equal(statSync(file).mtimeMs, before.mtimeMs);
+  assert.deepEqual(userDeclaredCliEnv(), { CLI_PROFILE: 'profile-b' });
+  assert.equal(mergedSpawnEnv({}, { inherited: {}, platform: 'win32' }).CLI_PROFILE, 'profile-b');
+}));
+
+test('CLI declarations refresh after in-place edit with restored mtime', () => withCliEnvFile(file => {
+  writeFileSync(file, JSON.stringify({ CLI_PROFILE: 'profile-a' }));
+  const fixed = new Date('2026-10-16T01:00:00.000Z');
+  utimesSync(file, fixed, fixed);
+  const before = statSync(file);
+  assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-a');
+  writeFileSync(file, JSON.stringify({ CLI_PROFILE: 'profile-b' }));
+  utimesSync(file, before.atime, before.mtime);
+  assert.equal(statSync(file).size, before.size);
+  assert.equal(statSync(file).mtimeMs, before.mtimeMs);
+  assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-b');
+}));
+
+test('CLI declaration warm cache returns isolated own-key copies without rereading bytes', t => withCliEnvFile(file => {
+  writeFileSync(file, '{"CLI_PROFILE":"controlled","NUMBER":7,"BOOL":false,"__proto__":"literal",'
+    + '"constructor":"literal-constructor","Path":"refused","nested":{},"bad key":"refused"}');
+  const reads = t.mock.method(fs, 'readFileSync');
+  syncBuiltinESMExports();
+  try {
+    const first = userDeclaredCliEnv();
+    assert.equal(reads.mock.calls.length, 1);
+    assert.equal(first.CLI_PROFILE, 'controlled');
+    assert.equal(first.NUMBER, '7');
+    assert.equal(first.BOOL, 'false');
+    assert.equal(Object.getPrototypeOf(first), Object.prototype);
+    assert.equal(Object.hasOwn(first, '__proto__'), true);
+    assert.equal(first.__proto__, 'literal');
+    assert.equal(first.constructor, 'literal-constructor');
+    first.CLI_PROFILE = 'caller-mutation';
+    first.Path = 'caller-path';
+    delete first.NUMBER;
+    const next = userDeclaredCliEnv();
+    assert.notEqual(next, first);
+    assert.equal(next.CLI_PROFILE, 'controlled');
+    assert.equal(next.NUMBER, '7');
+    assert.equal(next.Path, undefined);
+    assert.equal(next.nested, undefined);
+    assert.equal(next['bad key'], undefined);
+    assert.equal(next.__proto__, 'literal');
+    assert.equal(reads.mock.calls.length, 1, 'unchanged generation reuses sanitized data, not the caller object');
+  } finally { reads.mock.restore(); syncBuiltinESMExports(); }
+}));
+
+test('CLI declarations discard corrupt or nonobject replacements and recover without old cached values', () => withCliEnvFile(file => {
+  const first = JSON.stringify({ CLI_PROFILE: 'profile-a' });
+  writeFileSync(file, first);
+  const fixed = new Date('2026-10-16T01:00:00.000Z');
+  utimesSync(file, fixed, fixed);
+  assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-a');
+  for (const invalid of ['{'.padEnd(first.length, ' '), '[]', 'null', 'false', '"not an env object"']) {
+    replaceCliEnvPreservingMtime(file, invalid);
+    assert.deepEqual(userDeclaredCliEnv(), {});
+    replaceCliEnvPreservingMtime(file, JSON.stringify({ CLI_PROFILE: 'profile-b' }));
+    assert.deepEqual(userDeclaredCliEnv(), { CLI_PROFILE: 'profile-b' });
+  }
+}));
+
+test('CLI declaration failed read evicts prior settings and permits same-generation recovery', t => withCliEnvFile(file => {
+  writeFileSync(file, JSON.stringify({ CLI_PROFILE: 'profile-a' }));
+  assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-a');
+  replaceCliEnvPreservingMtime(file, JSON.stringify({ CLI_PROFILE: 'profile-b' }));
+  const originalRead = fs.readFileSync;
+  let refused = false;
+  const reads = t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+    if (!refused && (typeof args[0] === 'number' || args[0] === file)) {
+      refused = true;
+      throw Object.assign(new Error('controlled read refusal'), { code: 'EACCES' });
+    }
+    return Reflect.apply(originalRead, fs, args);
+  });
+  syncBuiltinESMExports();
+  try { assert.deepEqual(userDeclaredCliEnv(), {}); assert.equal(refused, true); }
+  finally { reads.mock.restore(); syncBuiltinESMExports(); }
+  assert.deepEqual(userDeclaredCliEnv(), { CLI_PROFILE: 'profile-b' });
+}));
+
+test('CLI declaration absence, nonfile and stat failure evict cache and recover', t => withCliEnvFile(file => {
+  writeFileSync(file, JSON.stringify({ CLI_PROFILE: 'profile-a' }));
+  const fixed = new Date('2026-10-16T01:00:00.000Z');
+  utimesSync(file, fixed, fixed);
+  assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-a');
+  unlinkSync(file);
+  assert.deepEqual(userDeclaredCliEnv(), {});
+  mkdirSync(file);
+  utimesSync(file, fixed, fixed);
+  assert.deepEqual(userDeclaredCliEnv(), {});
+  rmSync(file, { recursive: true });
+  writeFileSync(file, JSON.stringify({ CLI_PROFILE: 'profile-b' }));
+  utimesSync(file, fixed, fixed);
+  assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-b');
+  const originalStat = fs.statSync;
+  const stats = t.mock.method(fs, 'statSync', (...args: Parameters<typeof fs.statSync>) => {
+    if (args[0] === file) throw Object.assign(new Error('controlled stat refusal'), { code: 'EACCES' });
+    return Reflect.apply(originalStat, fs, args);
+  });
+  syncBuiltinESMExports();
+  try { assert.deepEqual(userDeclaredCliEnv(), {}); }
+  finally { stats.mock.restore(); syncBuiltinESMExports(); }
+  assert.deepEqual(userDeclaredCliEnv(), { CLI_PROFILE: 'profile-b' });
+}));
+
+for (const phase of ['before-open', 'during-read'] as const) {
+  test(`CLI declaration ${phase} replacement cannot publish bytes under another generation`, t => withCliEnvFile(file => {
+    writeFileSync(file, JSON.stringify({ CLI_PROFILE: 'profile-a' }));
+    let replaced = false;
+    const originalStat = fs.statSync;
+    const originalRead = fs.readFileSync;
+    if (phase === 'before-open') t.mock.method(fs, 'statSync', (...args: Parameters<typeof fs.statSync>) => {
+      const stat = Reflect.apply(originalStat, fs, args);
+      if (!replaced && args[0] === file) {
+        replaced = true;
+        replaceCliEnvPreservingMtime(file, JSON.stringify({ CLI_PROFILE: 'profile-b' }));
+      }
+      return stat;
+    });
+    else t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+      const text = Reflect.apply(originalRead, fs, args);
+      if (!replaced && (typeof args[0] === 'number' || args[0] === file)) {
+        replaced = true;
+        replaceCliEnvPreservingMtime(file, JSON.stringify({ CLI_PROFILE: 'profile-b' }));
+      }
+      return text;
+    });
+    syncBuiltinESMExports();
+    try { assert.deepEqual(userDeclaredCliEnv(), {}); assert.equal(replaced, true); }
+    finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+    assert.deepEqual(userDeclaredCliEnv(), { CLI_PROFILE: 'profile-b' });
+  }));
+}
+
+test('CLI declaration generations stay isolated when the Clementine home changes', () => withCliEnvFile((file, firstHome) => {
+  writeFileSync(file, JSON.stringify({ CLI_PROFILE: 'profile-a' }));
+  const fixed = new Date('2026-10-16T01:00:00.000Z');
+  utimesSync(file, fixed, fixed);
+  assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-a');
+  const secondHome = mkdtempSync(path.join(os.tmpdir(), 'clem-cli-env-other-home-'));
+  try {
+    mkdirSync(path.join(secondHome, 'state'), { recursive: true });
+    const secondFile = path.join(secondHome, 'state', 'cli-env.json');
+    writeFileSync(secondFile, JSON.stringify({ CLI_PROFILE: 'profile-b' }));
+    utimesSync(secondFile, fixed, fixed);
+    process.env.CLEMENTINE_HOME = secondHome;
+    assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-b');
+    process.env.CLEMENTINE_HOME = firstHome;
+    assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-a');
+  } finally { process.env.CLEMENTINE_HOME = firstHome; rmSync(secondHome, { recursive: true, force: true }); }
+}));
+
+test('CLI declaration coherent reads preserve user symlink support', { skip: process.platform === 'win32' }, () => withCliEnvFile(file => {
+  const target = file + '.target';
+  writeFileSync(target, JSON.stringify({ CLI_PROFILE: 'profile-a' }));
+  symlinkSync(target, file);
+  assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-a');
+  replaceCliEnvPreservingMtime(target, JSON.stringify({ CLI_PROFILE: 'profile-b' }));
+  assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-b');
+}));
 
 test("nvm's default install leads, not the highest-numbered one", () => {
   const home = mkdtempSync(path.join(os.tmpdir(), 'clem-spawn-nvm-default-'));

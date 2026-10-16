@@ -172,6 +172,7 @@ import { certifyWorkflow, type WorkflowCertification } from '../execution/workfl
 import { rehearsalVerdictFromRunRecord, workflowRehearsalKey } from '../execution/workflow-run-definition.js';
 import { captureWorkflowRunInventory, workflowRunInventory, type WorkflowRunInventoryEntry } from '../execution/workflow-run-inventory.js';
 import { workflowCodeRevisionFingerprint } from '../execution/workflow-code-certification.js';
+import { captureWorkflowCertificationView, type WorkflowCertificationDisplayView } from '../execution/workflow-certification-view.js';
 import { buildWorkflowResourceBindingReportFromRuntime } from '../execution/workflow-resource-binding.js';
 import { applyLearnedQualityCriteria, workflowQualityCriteria } from '../execution/workflow-quality-contract.js';
 import { readRunGoal, readWorkspaceManifest, workspaceArtifactBytes, readWorkspaceCheckerReport, writeWorkspaceCheckerReport } from '../execution/workflow-run-workspace.js';
@@ -1024,10 +1025,13 @@ function workflowCertificationFor(
   def: WorkflowDefinition,
   workflowSlug: string,
   runRecords?: readonly WorkflowRunRecordSummary[],
+  displayView?: WorkflowCertificationDisplayView,
+  planOptions = workflowExecutionPlanOptions(),
 ) {
   return certifyWorkflow(def, {
     workflowSlug,
-    planOptions: workflowExecutionPlanOptions(),
+    planOptions,
+    displayView,
     ...(runRecords ? { rehearsalPassed: latestRehearsalPassed(runRecords, workflowSlug, def) } : {}),
   });
 }
@@ -1066,18 +1070,20 @@ function memoizedWorkflowListDerivations(
   runRecords: WorkflowRunRecordSummary[],
   lastRunId: string | null,
   runsKey: string,
+  displayView: WorkflowCertificationDisplayView,
+  planOptions: ReturnType<typeof workflowExecutionPlanOptions>,
 ): { proof: unknown; certification: ReturnType<typeof workflowCertificationFor> } {
   // Plan settings are live-readable. Include the effective values in the memo
   // identity so Console truth changes with runtime truth instead of waiting for
   // a workflow edit, new run, or daemon restart to invalidate certification.
-  const planOptionsKey = JSON.stringify(workflowExecutionPlanOptions());
+  const planOptionsKey = JSON.stringify(planOptions);
   // The caller's captured generation covers every run of this workflow, not
   // only a new id. Never consult mutable inventory state after reading records.
-  const key = `${djb2(JSON.stringify(entry.data))}::${workflowCodeRevisionFingerprint(entry.data, entry.name)}::${lastRunId ?? 'none'}::${runsKey}::${planOptionsKey}`;
+  const key = `${djb2(JSON.stringify(entry.data))}::${workflowCodeRevisionFingerprint(entry.data, entry.name)}::${lastRunId ?? 'none'}::${runsKey}::${planOptionsKey}::${displayView.key}`;
   const hit = workflowListMemo.get(entry.name);
   if (hit && hit.key === key) return { proof: hit.proof, certification: hit.certification };
   const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
-  const certification = workflowCertificationFor(entry.data, entry.name, runRecords);
+  const certification = workflowCertificationFor(entry.data, entry.name, runRecords, displayView, planOptions);
   workflowListMemo.set(entry.name, { key, proof, certification });
   return { proof, certification };
 }
@@ -1100,13 +1106,15 @@ function armWorkflowListMemoWarm(): void {
         if (!latestByWorkflow.has(run.workflow)) latestByWorkflow.set(run.workflow, run.id);
       }
       const entries = listWorkflows();
+      const planOptions = workflowExecutionPlanOptions();
+      const display = captureWorkflowCertificationView(entries, planOptions);
       const warmNext = (index: number): void => {
         if (index >= entries.length) return;
         const entry = entries[index];
         try {
           memoizedWorkflowListDerivations(entry, runRecords,
             latestByWorkflow.get(entry.data.name) ?? latestByWorkflow.get(entry.name) ?? null,
-            inventory.signatureFor([entry.name, entry.data.name]));
+            inventory.signatureFor([entry.name, entry.data.name]), display.forWorkflow(entry.name)!, planOptions);
         } catch { /* per-entry warm is best-effort */ }
         setImmediate(() => warmNext(index + 1));
       };
@@ -5738,15 +5746,17 @@ export function registerConsoleRoutes(
       for (const run of runRecords) {
         if (!latestRunByWorkflow.has(run.workflow)) latestRunByWorkflow.set(run.workflow, run);
       }
-      const items = listWorkflows()
+      const entries = listWorkflows()
         .filter((entry) => workflowOrigin(entry.data) !== 'dev')
-        .sort((a, b) => a.data.name.localeCompare(b.data.name))
-        .map((entry) => {
+        .sort((a, b) => a.data.name.localeCompare(b.data.name));
+      const planOptions = workflowExecutionPlanOptions();
+      const display = captureWorkflowCertificationView(entries, planOptions);
+      const items = entries.map((entry) => {
           const lastRun = latestRunByWorkflow.get(entry.data.name) ?? latestRunByWorkflow.get(entry.name) ?? null;
           const lastRunFailedItems = lastRun ? listFinalFailedItems(entry.name, lastRun.id) : [];
           const lastRunFailedItemStepIds = Array.from(new Set(lastRunFailedItems.map((item) => item.stepId)));
           const { proof, certification } = memoizedWorkflowListDerivations(entry, runRecords, lastRun?.id ?? null,
-            inventory.signatureFor([entry.name, entry.data.name]));
+            inventory.signatureFor([entry.name, entry.data.name]), display.forWorkflow(entry.name)!, planOptions);
           return {
           name: entry.data.name,
           file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
@@ -5794,6 +5804,8 @@ export function registerConsoleRoutes(
       const workflows = listWorkflows()
         .filter((entry) => workflowOrigin(entry.data) !== 'dev')
         .sort((a, b) => a.data.name.localeCompare(b.data.name));
+      const planOptions = workflowExecutionPlanOptions();
+      const display = captureWorkflowCertificationView(workflows, planOptions);
       const workflowByIdentity = new Map<string, (typeof workflows)[number]>();
       for (const entry of workflows) {
         workflowByIdentity.set(entry.name, entry);
@@ -5867,7 +5879,7 @@ export function registerConsoleRoutes(
         // every workflow on each visit.
         const memoRun = runs.find((run) => run.workflow === entry.data.name) ?? runs[0] ?? null;
         const { proof, certification: certified } = memoizedWorkflowListDerivations(entry, runRecords, memoRun?.id ?? null,
-          inventory.signatureFor([entry.name, entry.data.name]));
+          inventory.signatureFor([entry.name, entry.data.name]), display.forWorkflow(entry.name)!, planOptions);
         const certification = workflowCertificationSummary(certified);
         return {
           name: entry.data.name,
