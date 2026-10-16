@@ -97,6 +97,9 @@ export interface DeliveryCommitResult {
 const DELIVERY_METADATA_KEYS: ReadonlySet<string> = new Set([
   // Private checkpoint identity; validated atomically with terminal publication.
   'connectionExecutionPause',
+  // Private, exact-source receipt from a successful decision-only host path.
+  // The public boundary reopens the source/card/terminal before projecting it.
+  'approvalDecisionAck',
   'steps',
   'missingReply',
   'blockedReason',

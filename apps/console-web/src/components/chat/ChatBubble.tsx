@@ -5,7 +5,7 @@ import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { steerReceiptLabel, answerDraftStatus, canContinueTerminal, cardDecisionNoticeOnly, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
+import { steerReceiptLabel, answerDraftStatus, canContinueTerminal, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
 import type { ApprovalConfirm, ApprovalResolution, TerminalNoticeLine } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
@@ -245,8 +245,8 @@ function ApprovalOutcomePill({ resolution }: { resolution: ApprovalResolution })
     : resolution === 'changed' ? 'bg-info-tint text-info'
       : resolution === 'expired' ? 'bg-warning-tint text-warning'
         : 'bg-subtle text-muted';
-  const label = resolution === 'approved' ? 'Done · you said yes'
-    : resolution === 'declined' ? 'Skipped · nothing ran'
+  const label = resolution === 'approved' ? 'Approved'
+    : resolution === 'declined' ? 'Declined'
       : resolution === 'changed' ? 'Changed · the revised version is below'
         : 'Expired · it did not run';
   return (
@@ -513,11 +513,19 @@ export function ChatBubble({
 
   // A card tap sent from the phone and the host's reply to it belong to the
   // card, not the conversation; only one that failed to land is shown. A
-  // decided card has done its job and leaves the conversation.
+  // decided card keeps its own receipt, without claiming its work finished.
   if (hiddenCardDecision(message)) return null;
-  if (cardDecisionNoticeOnly(message)) return null;
   if (message.status === 'awaiting-approval'
-    && (message.approval?.resolution === 'approved' || message.approval?.resolution === 'declined')) return null;
+    && !message.approval?.pendingAction && !message.approval?.pendingActionId
+    && exec.phase === 'idle' && !exec.note && !decisionError && !trustNote
+    && (message.approval?.resolution === 'approved' || message.approval?.resolution === 'declined')) return (
+    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-surface px-4 py-3" role="status">
+      <span className="text-body text-muted">{message.approval.subject}</span>
+      <StatusPill tone="neutral" icon={message.approval.resolution === 'approved' ? Check : X}>
+        {message.approval.resolution === 'approved' ? 'Approved' : 'Declined'}
+      </StatusPill>
+    </div>
+  );
 
   if (isUser) {
     return (
@@ -772,7 +780,10 @@ export function ChatBubble({
             {message.approval?.confirm && !resolved && !message.approval.resolution && (
               <ApprovalConfirmStrip confirm={message.approval.confirm} />
             )}
-            {canOfferStandingSendTrust(pendingAction) && !resolved && (
+            {pendingAction && (message.approval?.resolution === 'approved' || message.approval?.resolution === 'declined') && (
+              <ApprovalOutcomePill resolution={message.approval.resolution} />
+            )}
+            {canOfferStandingSendTrust(pendingAction) && !resolved && !message.approval?.resolution && (
               <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-caption text-muted">
                 <input
                   type="checkbox"
@@ -810,14 +821,14 @@ export function ChatBubble({
             <div className="mt-2.5 flex items-center gap-2">
               <Button
                 size="sm"
-                disabled={resolved || decisionBusy !== null || exec.phase === 'running'}
+                disabled={resolved || Boolean(message.approval?.resolution) || decisionBusy !== null || exec.phase === 'running'}
                 onClick={pendingAction ? runExecute : () => { void resolvePlainDecision('approve'); }}
               >
                 {pendingAction ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
                 {pendingAction ? (voicedPendingAction ? 'Yes, go ahead' : 'Execute queued action') : message.approval?.preview?.items ? `Approve all ${message.approval.preview.items.length}` : 'Approve'}
               </Button>
-              <Button size="sm" variant="secondary" disabled={resolved || decisionBusy !== null} onClick={() => { void resolvePlainDecision('reject'); }}><X className="h-4 w-4" aria-hidden /> {voicedPendingAction ? 'No, skip it' : 'Decline'}</Button>
-              {!resolved && exec.phase === 'idle' && (
+              <Button size="sm" variant="secondary" disabled={resolved || Boolean(message.approval?.resolution) || decisionBusy !== null} onClick={() => { void resolvePlainDecision('reject'); }}><X className="h-4 w-4" aria-hidden /> {voicedPendingAction ? 'No, skip it' : 'Decline'}</Button>
+              {!resolved && !message.approval?.resolution && exec.phase === 'idle' && (
                 <Button size="sm" variant="ghost" disabled={decisionBusy !== null} onClick={() => { void setAsideForLater(); }}>Not now</Button>
               )}
               {/* Truth, not a latch: for a pending-action card the label reflects

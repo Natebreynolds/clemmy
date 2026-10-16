@@ -230,7 +230,7 @@ export interface UnifiedSessionTurn {
     revises?: { approvalId: string; changeRequest?: string; fields?: Array<{ name: string; value: string; label?: string }> };
     /** Present when nobody answered before the card's lifetime ran out: the
      *  card renders settled, without controls. */
-    resolution?: 'expired';
+    resolution?: 'approved' | 'declined' | 'changed' | 'expired';
   };
 }
 

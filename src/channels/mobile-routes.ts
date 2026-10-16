@@ -18,6 +18,7 @@ import { patchUnifiedSession } from '../dashboard/sessions-api.js';
 import { needsYouKey, needsYouReferents, notificationActionItemId, notificationNeedsYou, summarizeNeedsYou, type NeedsYouReferents } from '../dashboard/needs-you.js';
 import { extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import { ApprovalControlBindingUnavailable, commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
+import { approvalDecisionAckMetadata } from '../runtime/harness/approval-decision-ack.js';
 import { createMobileChatAdmission, prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
 import { registerMobileMemoryWorkRoutes } from './mobile-memory-work-routes.js';
 import { registerMobileNativeVoiceAuth } from './mobile-native-voice-auth.js';
@@ -3143,9 +3144,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
                 const resolved = resolveDecision(id, decision === 'approve' ? 'approved' : 'rejected', 'mobile-inbox');
                 if (!resolved.ok) throw new Error(`Approval control could not resolve its exact card: ${resolved.reason}`);
                 commitMobileApprovalTerminal({
-                  source, text: `${decision === 'approve' ? 'Approved' : 'Rejected'} ${id}.`,
+                  source, text: decision === 'approve' ? 'Approved.' : 'Declined.',
                   status: 'done', reason: 'mobile_approval_resolved',
-                  metadata: { approvalId: id, decision, status: 'resolved-live', liveApprovalControl: source.data.liveApprovalControl },
+                  metadata: { approvalId: id, decision, status: 'resolved-live', liveApprovalControl: source.data.liveApprovalControl,
+                    ...approvalDecisionAckMetadata(source, id, decision) },
                 });
               },
             };
@@ -3368,13 +3370,14 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       }
     }
     if (queued) {
-      const text = `${decision === 'approve' ? 'Approved' : 'Rejected'} ${id}; queued background task ${queued.id}.`;
+      const text = decision === 'approve' ? 'Approved.' : 'Declined.';
       commitMobileApprovalTerminal({
         source: acceptedApprovalSource,
         text,
         status: 'done',
         reason: 'mobile_background_approval_queued',
-        metadata: { approvalId: id, decision, queuedTaskId: queued.id },
+        metadata: { approvalId: id, decision, queuedTaskId: queued.id,
+          ...approvalDecisionAckMetadata(acceptedApprovalSource, id, decision) },
       });
       settleMobileApprovalAttempt(approvalAttempt);
       if (acceptedRunId) {
@@ -3411,17 +3414,19 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         : pendingActionPreflight.kind === 'ok'
           ? 'resolved-pending-action-approval-only'
           : 'resolved-stale';
-      const message = pendingActionPreflight.kind === 'ok'
-        ? decision === 'approve'
-          ? `Approved ${id}; the exact queued action is authorized, but execution is not confirmed and remains with its runtime owner.`
-          : `Rejected ${id}; the exact queued action will not execute.`
-        : `${decision === 'approve' ? 'Approved' : 'Rejected'} ${id}.`;
+      // Approval is a card decision, not proof the saved action ran. Keep a
+      // real execution uncertainty visible instead of hiding it as an echo.
+      const awaitingExecutionConfirmation = pendingActionPreflight.kind === 'ok' && decision === 'approve';
+      const message = awaitingExecutionConfirmation
+        ? 'Approved. I’m still waiting for confirmation that the action ran.'
+        : decision === 'approve' ? 'Approved.' : 'Declined.';
       commitMobileApprovalTerminal({
         source: acceptedApprovalSource,
         text: message,
         status: 'done',
         reason: 'mobile_approval_resolved',
-        metadata: { approvalId: id, decision, status },
+        metadata: { approvalId: id, decision, status,
+          ...(!awaitingExecutionConfirmation ? approvalDecisionAckMetadata(acceptedApprovalSource, id, decision) : {}) },
       });
       settleMobileApprovalAttempt(approvalAttempt);
       if (acceptedRunId) {

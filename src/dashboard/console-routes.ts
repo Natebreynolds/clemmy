@@ -9,6 +9,7 @@ import { captureFreshSourceSessionContext } from '../runtime/harness/source-sess
 import { activateConnectionExecution } from '../runtime/harness/connection-execution-activation.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
 import { ApprovalControlBindingUnavailable, commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
+import { approvalDecisionAckMetadata } from '../runtime/harness/approval-decision-ack.js';
 import { claimPlanExecutionIngress, inspectPlanExecutionIngress, preflightPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, withReviewedPlanExecuteAdmission, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
@@ -3722,11 +3723,12 @@ function tryCommitLiveApprovalControl(input: {
               const text = !result.ok
                 ? 'That approval was no longer pending. Nothing else was approved or rejected.'
                 : intent.decision === 'approve'
-                  ? 'Approved — running it now.'
-                  : 'Understood — I won’t run it.';
+                  ? 'Approved.'
+                  : 'Declined.';
               commitConsoleTerminal({ identity: { sessionId: input.sessionId, turn: source.turn, sourceUserSeq: source.seq },
                 text, status: 'done', legacyReason: 'queued_action_decision_resolved',
-                metadata: { steps: 0, liveApprovalControl: source.data.liveApprovalControl } });
+                metadata: { steps: 0, liveApprovalControl: source.data.liveApprovalControl,
+                  ...(result.ok ? approvalDecisionAckMetadata(source, row.approvalId, intent.decision) : {}) } });
             },
           };
         }
@@ -3742,6 +3744,7 @@ function tryCommitLiveApprovalControl(input: {
           let text: string;
           let status: ConsoleTerminalStatus = 'done';
           let reason = 'sdk_approval_resolved';
+          let decisionMetadata: Record<string, unknown> = {};
           if (selection.kind === 'ambiguous' || selection.kind === 'missing') {
             text = selection.kind === 'ambiguous'
               ? [`You have ${selection.rows.length} pending approvals. Choose the exact card; I did not approve or reject any of them.`, ...choices].join('\n')
@@ -3754,21 +3757,17 @@ function tryCommitLiveApprovalControl(input: {
           } else {
             const result = resolveDecision(selection.row.approvalId,
               intent.decision === 'approve' ? 'approved' : 'rejected', 'chat-dock-user');
+            if (result.ok) decisionMetadata = approvalDecisionAckMetadata(source, selection.row.approvalId, intent.decision);
             const approvedRunner = result.ok && intent.decision === 'approve'
               && (row?.tool === SAVED_SOURCE_SCRIPT_CONSENT_TOOL || row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL);
             text = !result.ok
               ? 'That approval was no longer pending. Nothing else was approved or rejected.'
-              : approvedRunner
-                ? `Approved ${row!.approvalId}. The Workspace refresh will resume through its saved execution; its result will report whether the data was saved.`
-                // Clem's words, not a card id: the person answered the card's
-                // own question and reads the decision back in the same voice.
-                : intent.decision === 'approve'
-                  ? 'Approved — doing that now.'
-                  : 'Understood — I won’t do that.';
+              : intent.decision === 'approve' ? 'Approved.' : 'Declined.';
             if (standalone) reason = approvedRunner ? 'workspace_runner_approval_refresh_started' : 'workspace_approval_resolved';
           }
           commitConsoleTerminal({ identity: { sessionId: input.sessionId, turn: source.turn, sourceUserSeq: source.seq },
-            text, status, legacyReason: reason, metadata: { steps: 0, liveApprovalControl: source.data.liveApprovalControl } });
+            text, status, legacyReason: reason, metadata: { steps: 0,
+              liveApprovalControl: source.data.liveApprovalControl, ...decisionMetadata } });
         },
       };
     },
@@ -18475,11 +18474,12 @@ export function registerConsoleRoutes(
           commitConsoleTerminal({
             identity: requestTurnIdentity,
             text: resolved
-              ? `${resolution === 'approved' ? 'Approved' : 'Rejected'} ${addressedApprovalId} — the workflow picks this up and resumes by itself.`
+              ? resolution === 'approved' ? 'Approved.' : 'Declined.'
               : 'That approval was no longer pending. Nothing else was approved or rejected.',
             status: 'done',
             legacyReason: 'workflow_approval_resolved',
-            metadata: { steps: 0 },
+            metadata: { steps: 0, ...(resolved && row
+              ? approvalDecisionAckMetadata(requestAcceptedUserEvent, row.approvalId, intent.decision) : {}) },
           });
           return;
         }
@@ -18514,11 +18514,7 @@ export function registerConsoleRoutes(
               && (row?.tool === SAVED_SOURCE_SCRIPT_CONSENT_TOOL || row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL);
             const reply = !resolved
               ? 'That approval was no longer pending. Nothing else was approved or rejected.'
-              : approvedRunner
-                ? `Approved ${addressedApprovalId}. The Workspace refresh will resume through its saved execution; its result will report whether the data was saved.`
-                : resolution === 'approved'
-                  ? `Approved ${addressedApprovalId}. The exact Workspace action is now authorized and its runtime is executing it.`
-                  : `Rejected ${addressedApprovalId}. The Workspace runner or action remains blocked and was not executed.`;
+              : resolution === 'approved' ? 'Approved.' : 'Declined.';
             // The approval click/message is a complete control turn. The
             // standalone Workspace runtime reports its later data refresh as
             // separate work; leaving this accepted edge on conversation_step
@@ -18530,7 +18526,8 @@ export function registerConsoleRoutes(
               legacyReason: approvedRunner
                 ? 'workspace_runner_approval_refresh_started'
                 : 'workspace_approval_resolved',
-              metadata: { steps: 0 },
+              metadata: { steps: 0, ...(resolved && row
+              ? approvalDecisionAckMetadata(requestAcceptedUserEvent, row.approvalId, intent.decision) : {}) },
             });
             return;
           }
@@ -18542,7 +18539,7 @@ export function registerConsoleRoutes(
             ].join('\n');
           } else {
           const reply = resolved
-            ? `${resolution === 'approved' ? 'Approved' : 'Rejected'} ${addressedApprovalId}${parkedSdkApproval && resolution === 'approved' ? ' — resuming the parked turn.' : ' — continuing.'}`
+            ? resolution === 'approved' ? 'Approved.' : 'Declined.'
             : 'That approval was no longer pending. Nothing was approved or rejected.';
           if (resolved && parkedSdkApproval && resolution === 'approved') {
             // A parked SDK query already committed its original source as
@@ -18572,7 +18569,8 @@ export function registerConsoleRoutes(
               text: reply,
               status: 'done',
               legacyReason: 'sdk_approval_resolved',
-              metadata: { steps: 0 },
+              metadata: { steps: 0, ...(resolved && row
+              ? approvalDecisionAckMetadata(requestAcceptedUserEvent, row.approvalId, intent.decision) : {}) },
             });
           }
           return;

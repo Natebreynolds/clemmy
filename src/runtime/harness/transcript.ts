@@ -294,7 +294,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
         planProposalId: planProposalIdFrom(event.data),
         planArtifactRef: publicPlanArtifactRef(event.data.planArtifactRef),
         ...(presentation.kind === 'approval' && presentation.approvalId ? { pausedOnApprovalId: presentation.approvalId } : {}),
-        terminal: publicTerminalFacts(event.data, event.sessionId),
+        terminal: publicTerminalFacts(event.data, event.sessionId, event),
       });
     }
   }

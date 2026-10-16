@@ -91,6 +91,9 @@ export interface ConfiguredBrainSemanticComplete {
     purpose: ConfiguredSemanticPurpose;
     system: string;
     user: string;
+    signal?: AbortSignal;
+    deadlineAt?: number;
+    checkActive?: () => void;
     schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1';
   }): Promise<{
     raw: unknown;
@@ -334,12 +337,17 @@ export function _setQuickCheckDeadlineMsForTests(ms: number | null): void {
 
 /** The work, or the deadline's reason once it passes, whichever comes first,
  *  so a client that ignores the abort cannot hold the turn. */
-function withinDeadline<T>(work: Promise<T>, deadline: AbortController | null): Promise<T> {
-  if (!deadline) return work;
-  return Promise.race([work, new Promise<never>((_, reject) => {
-    if (deadline.signal.aborted) reject(deadline.signal.reason);
-    deadline.signal.addEventListener('abort', () => reject(deadline.signal.reason), { once: true });
-  })]);
+function withinDeadline<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    if (signal.aborted) { reject(signal.reason); void work.catch(() => {}); return; }
+    signal.addEventListener('abort', abort, { once: true });
+    void work.then(value => {
+      signal.removeEventListener('abort', abort);
+      signal.aborted ? reject(signal.reason) : resolve(value);
+    }, error => { signal.removeEventListener('abort', abort); reject(error); });
+  });
 }
 
 export function semanticModelRoleForPurpose(
@@ -402,6 +410,9 @@ async function completeStructured(input: {
   system: string;
   user: string;
   schema: z.ZodTypeAny;
+  signal?: AbortSignal;
+  deadlineAt?: number;
+  checkActive?: () => void;
 }): Promise<{
   raw: unknown;
   modelIdentity: string;
@@ -411,12 +422,26 @@ async function completeStructured(input: {
   latencyMs: number;
   usageRecorded?: boolean;
 }> {
+  // Optional preparation owner: one absolute budget survives Quick -> brain
+  // fallback, and cancellation cannot start a replacement model request.
+  const total = input.deadlineAt === undefined ? null : new AbortController();
+  const totalTimer = total ? setTimeout(() => total.abort(new Error('Semantic preparation deadline reached.')),
+    Math.max(0, input.deadlineAt! - Date.now())) : null;
+  const commonSignal = input.signal && total ? AbortSignal.any([input.signal, total.signal])
+    : input.signal ?? total?.signal;
+  const checkActive = () => {
+    input.checkActive?.();
+    if (total && input.deadlineAt! <= Date.now()) total.abort(new Error('Semantic preparation deadline reached.'));
+    commonSignal?.throwIfAborted();
+  };
+  const reasoning = semanticReasoningForPurpose(input.purpose);
+  try {
+  checkActive();
   // Interpretation follows the configured brain. Consequential source/effect
   // review follows the configured judge role, which is cross-family when the
   // user's available model stack permits it. Calling the brain for both made
   // the supposedly independent gate self-approval by construction.
   const wantedRole = semanticModelRoleForPurpose(input.purpose);
-  const reasoning = semanticReasoningForPurpose(input.purpose);
   let firstRole: ReturnType<typeof resolveRoleModel>;
   try {
     firstRole = resolveRoleModel(wantedRole);
@@ -431,7 +456,8 @@ async function completeStructured(input: {
   }
   // A quick check that runs long is no quicker than the brain: past its
   // deadline it is cancelled and the call falls back like any other failure.
-  return runOnRole(firstRole, wantedRole === 'quick' ? quickCheckDeadlineMs : undefined).catch(async (error) => {
+  return await runOnRole(firstRole, wantedRole === 'quick' ? quickCheckDeadlineMs : undefined).catch(async (error) => {
+    checkActive();
     // A nonexecuting clarification repair has one selected Quick call. Failure
     // stays unavailable; an unrequested brain retry changes identity and cost.
     if (input.purpose === 'clarification_revision') throw error;
@@ -454,6 +480,9 @@ async function completeStructured(input: {
       'semantic review on the judge model failed — retrying this call on the brain');
     return runOnRole(brain);
   });
+  } finally {
+    if (totalTimer) clearTimeout(totalTimer);
+  }
 
   async function runOnRole(role: ReturnType<typeof resolveRoleModel>, deadlineMs?: number) {
   const started = Date.now();
@@ -468,7 +497,11 @@ async function completeStructured(input: {
     deadlineFired = true;
     deadline.abort(new Error(`quick check passed its ${deadlineMs} ms deadline`));
   }, deadlineMs) : null;
+  const signal = commonSignal && deadline ? AbortSignal.any([commonSignal, deadline.signal])
+    : commonSignal ?? deadline?.signal;
   try {
+  checkActive();
+  signal?.throwIfAborted();
   const agent = new Agent({
     name: input.purpose === 'clarification_revision'
       ? 'clarification-revision'
@@ -502,10 +535,12 @@ async function completeStructured(input: {
       },
     }, () => withPinnedWorkerModel(input.purpose === 'clarification_revision' ? role.modelId : undefined,
       () => {
+        checkActive();
+        signal?.throwIfAborted();
         phase = 'sdk_run';
         sdkRunStarted = true;
         return withinDeadline(runner.run(agent, input.user, {
-          maxTurns: 1, ...(deadline ? { signal: deadline.signal } : {}),
+          maxTurns: 1, ...(signal ? { signal } : {}),
           ...(input.purpose === 'clarification_revision' ? { errorHandlers: {
             invalidFinalOutput: () => {
               // Observe the SDK's typed boundary without reading output/runData.
@@ -514,7 +549,7 @@ async function completeStructured(input: {
               phase = 'sdk_output_validation';
             },
           } } : {}),
-        }), deadline);
+        }), signal);
       }));
       sdkRunReturned = true;
       return { ok: true as const, value };
@@ -523,6 +558,8 @@ async function completeStructured(input: {
   usageRecordedAtFailure = observed.recorded;
   if (!observed.value.ok) throw observed.value.error;
   const result = observed.value.value;
+  checkActive();
+  signal?.throwIfAborted();
   const usageRecorded = observed.recorded;
   const tokens = tokensFromAgentRun(result);
   const latencyMs = Date.now() - started;
@@ -722,6 +759,9 @@ export async function completeViaConfiguredBrain(input: {
   purpose: ConfiguredSemanticPurpose;
   system: string;
   user: string;
+  signal?: AbortSignal;
+  deadlineAt?: number;
+  checkActive?: () => void;
   schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1';
 }): Promise<{
   raw: unknown;
@@ -735,6 +775,9 @@ export async function completeViaConfiguredBrain(input: {
   const clarificationWire = input.schemaName === 'ClarificationRevisionV1';
   const result = await completeStructured({
     purpose: input.purpose,
+    signal: input.signal,
+    deadlineAt: input.deadlineAt,
+    checkActive: input.checkActive,
     system: clarificationWire
       ? `${input.system}\nFor this structured transport, put the ClarificationRevisionV1 value in the sole top-level "result" field.`
       : input.system,

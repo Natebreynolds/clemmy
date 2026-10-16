@@ -39,6 +39,7 @@ import {
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
 import { parseRetainedWorkCheckpoint, type RetainedOutsideChange } from './retained-work-checkpoint.js';
 import { normalizeTerminalNotice, type TerminalNotice } from './terminal-notice.js';
+import { publicApprovalDecisionAck } from './approval-decision-ack.js';
 import {
   isSettledReadReplayReturnData,
   settledReadReplayCallId,
@@ -784,7 +785,8 @@ function publicTerminalRetained(
  * a known code passes; every string beside it is bounded again here. */
 function publicTerminalNotice(data: Record<string, unknown>): { notice?: TerminalNotice } {
   const notice = normalizeTerminalNotice(data.hostNotice);
-  return notice ? { notice } : {};
+  // A card-only receipt needs an exact retained decision, not a copied notice.
+  return notice && notice.code !== 'card_decision' ? { notice } : {};
 }
 
 /**
@@ -847,8 +849,10 @@ function completionSourceKey(event: EventRow): string | null {
  * Drawn from the same projection as live delivery, so a reopened reply shows
  * the same status line, pill and chip, never a sentence written for Clem.
  */
-export function publicTerminalFacts(data: Record<string, unknown>, eventSessionId: string): Record<string, unknown> {
+export function publicTerminalFacts(data: Record<string, unknown>, eventSessionId: string, event?: EventRow): Record<string, unknown> {
   const projected = terminalData(data, eventSessionId);
+  const approvalDecisionAck = event && event.sessionId === eventSessionId && isDeepStrictEqual(event.data, data)
+    ? publicApprovalDecisionAck(event) : null;
   const presentation = projected.presentation && typeof projected.presentation === 'object'
     ? projected.presentation as Record<string, unknown> : {};
   const outcome = projected.turnOutcome && typeof projected.turnOutcome === 'object'
@@ -857,6 +861,9 @@ export function publicTerminalFacts(data: Record<string, unknown>, eventSessionI
     presentation: { status: presentation.status, kind: presentation.kind },
     ...(outcome ? { turnOutcome: selected(outcome, ['status', 'resumable', 'needs']) } : {}),
     ...selected(projected, ['review', 'reviewNote', 'retained', 'notice']),
+    ...(approvalDecisionAck ? { approvalDecisionAck, notice: { code: 'card_decision' },
+      sourceUserSeq: approvalDecisionAck.sourceUserSeq, terminalSeq: event!.seq,
+      presentation: projected.presentation, turnOutcome: projected.turnOutcome } : {}),
   };
 }
 
@@ -1353,7 +1360,9 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'conversation_completed': {
       const liveApprovalControl = publicLiveApprovalControl(event);
       const backgroundOutcomeReport = publicBackgroundOutcomeReport(event);
+      const approvalDecisionAck = publicApprovalDecisionAck(event);
       return { ...terminalData(data, event.sessionId), ...(liveApprovalControl ? { liveApprovalControl } : {}),
+        ...(approvalDecisionAck ? { approvalDecisionAck, notice: { code: 'card_decision' } } : {}),
         ...(backgroundOutcomeReport ? { backgroundOutcomeReport } : {}) };
     }
     case 'conversation_preamble':

@@ -60,7 +60,6 @@ import {
   terminalStatusPill,
   canContinueTerminal,
   sameTerminalContinuation,
-  cardDecisionNoticeOnly,
   NOTICE_ACTION_LABEL,
   type TerminalNoticeLine,
   type TurnReview,
@@ -1113,11 +1112,16 @@ function MessageRow({
   // A card tap and the host's reply to it are the card's business, not the
   // conversation's; only a decision that failed to land is shown.
   if (hiddenCardDecision(message)) return null;
-  if (cardDecisionNoticeOnly(message)) return null;
 
   if (message.approval) {
-    // A decided card has done its job and leaves the conversation.
-    if (message.approval.resolution === 'approved' || message.approval.resolution === 'declined') return null;
+    // The decision stays on its card; it does not claim execution finished.
+    if (!message.approval.queued
+      && (message.approval.resolution === 'approved' || message.approval.resolution === 'declined')) return (
+      <div class="turn turn-approval" role="status">
+        <div class="approval-head">{message.approval.subject}</div>
+        <div class="approval-reason">{message.approval.resolution === 'approved' ? 'Approved' : 'Declined'}</div>
+      </div>
+    );
     const approvalId = message.approval.approvalId;
     // Clem's own question, when her checker wrote one: the card reads like a
     // question card — her words, why, the exact content, answers to tap.
@@ -1271,6 +1275,8 @@ function MessageRow({
           <div class="approval-reason">You asked for a change — the revised version is below. Nothing was sent from this one.</div>
         ) : message.approval.resolution === 'expired' ? (
           <div class="approval-reason">Expired without an answer — it did not run.</div>
+        ) : message.approval.resolution === 'approved' || message.approval.resolution === 'declined' ? (
+          <div class="approval-reason" role="status">{message.approval.resolution === 'approved' ? 'Approved' : 'Declined'}</div>
         ) : null}
       </div>
     );
