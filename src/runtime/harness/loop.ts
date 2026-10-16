@@ -6450,10 +6450,10 @@ const MAX_THROWN_RECOVERY_ACTIVATIONS = 6;
  * source's checkpoint, publish the stop once, finish the attempt, and consume
  * the exact stop latch, as a running turn does when it is killed.
  */
-function endStoppedHeldTurn(options: RunConversationOptions, sourceUserSeq: number, recoveryBlob?: string): void {
+function endStoppedHeldTurn(options: RunConversationOptions, sourceUserSeq: number, recoveryBlob?: string, attempt = 0): void {
   try {
     const session = HarnessSession.load(options.sessionId);
-    if (session && recoveryBlob) session.clearRecoveryState(recoveryBlob);
+    if (session && recoveryBlob && attempt === 0) session.clearRecoveryState(recoveryBlob);
     session?.markStatus('cancelled');
     const answered = listEvents(options.sessionId, { types: ['conversation_completed'], sinceSeq: sourceUserSeq })
       .some((event) => event.data.sourceUserSeq === sourceUserSeq);
@@ -6472,9 +6472,18 @@ function endStoppedHeldTurn(options: RunConversationOptions, sourceUserSeq: numb
         lastTurn: accepted.turn, publicPresentation: presentation });
     }
     clearRunInFlightAfterTerminal(options.sessionId, options.runAttemptId, sourceUserSeq);
+    // The stop latch is consumed only once its result exists, so a restart
+    // before publication still finds the stop and publishes it.
     consumeObservedKill(options.sessionId, { sourceUserSeq });
   } catch (error) {
-    logger.warn({ err: error, sessionId: options.sessionId, sourceUserSeq }, 'stopped held turn could not publish its stop');
+    if (attempt + 1 >= UNOWNED_STOP_PUBLISH_ATTEMPTS) {
+      logger.error({ err: error, sessionId: options.sessionId, sourceUserSeq, attempts: attempt + 1 },
+        'stopped held turn ended without a published stop; the retained stop latch publishes it at restart');
+      return;
+    }
+    const timer = setTimeout(() => endStoppedHeldTurn(options, sourceUserSeq, recoveryBlob, attempt + 1),
+      Math.min(30_000, 1_000 * (2 ** attempt)));
+    timer.unref?.();
   }
 }
 

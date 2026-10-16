@@ -437,6 +437,97 @@ test('a recovery that meets a permanent activation failure stops at once and pub
   assert.equal(builds, 2, 'the permanent failure is met once and never retried');
 });
 
+async function heldAttemptForRestart(id: string, options: { leaseMs?: number } = {}) {
+  const session = eventlog.createSession({ id, kind: 'chat', channel: 'discord' });
+  const sourceText = 'Read the one exact local task and report it back.';
+  const runId = `${id}-run`;
+  const attempt = options.leaseMs === undefined
+    ? eventlog.beginRunAttempt(session.id, { runId })
+    : eventlog.claimRunAttemptLease({ sessionId: session.id, runId, ownerId: `${id}-owner`, leaseMs: options.leaseMs }).attempt!;
+  const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: sourceText } }, { armRunInFlight: true });
+  const callId = `${id}-read`;
+  let bodies = 0;
+  const configuredTool = brackets.wrapToolForHarness({
+    type: 'function',
+    name: 'task_list',
+    description: 'Return one exact local task record.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    needsApproval: async () => false,
+    invoke: async () => { bodies += 1; return { records: [{ id: 'task-1' }] }; },
+  });
+  const model = recordingModel([
+    [functionCall(callId, 'task_list', {})],
+    [textMessage('This continuation must never run after a stop.')],
+  ]);
+  const agent = { model, instructions: 'Continue from exact recovered history.', tools: [configuredTool] };
+  bindSurface(session.id, agent, [configuredTool]);
+  const db = eventlog.openEventLog();
+  const trigger = `reject_${id.replace(/-/g, '_')}_receipt`;
+  db.exec(`CREATE TEMP TRIGGER ${trigger} BEFORE INSERT ON logical_model_result_projection_receipts
+    WHEN NEW.session_id = '${session.id}' AND NEW.call_id = '${callId}'
+    BEGIN SELECT RAISE(ABORT, 'fixture projection receipt unavailable'); END`);
+  let held: Awaited<ReturnType<typeof runTurn>>;
+  try {
+    held = await runTurn({ sessionId: session.id, input: sourceText, sourceUserSeq: source.seq,
+      reuseRecordedUserInput: true, suppressMemoryCapture: true, turnEngine: 'host_v1', agent: agent as never,
+      makeRunner: () => throwingRunner() as never, maxTurns: 4 } as never);
+  } finally {
+    db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+  }
+  return { session, attempt, source, model, held, bodies: () => bodies };
+}
+
+for (const variant of ['restart', 'expired lease'] as const) {
+  test(`Stop then ${variant}: one stopped result, the attempt finished, no model work and no repeated body`, async () => {
+    const fixture = await heldAttemptForRestart(`host-stop-${variant.replace(' ', '-')}`,
+      variant === 'expired lease' ? { leaseMs: 1000 } : {});
+    assert.equal(fixture.held.status, 'held', JSON.stringify(fixture.held));
+    if (variant === 'expired lease') await new Promise((resolve) => setTimeout(resolve, 1_100));
+    eventlog.requestKill(fixture.session.id, 'stopped by the person', { attemptId: fixture.attempt.attemptId });
+    let dispatches = 0;
+    // As the daemon wires it: an exact checkpoint that is not an async-read
+    // owner is finalized by the ordinary cancelled terminal.
+    restartRecovery.recoverInterruptedChatRuns(Date.now, async () => { dispatches += 1; },
+      { finalizeExactCheckpointStop: () => ({ status: 'not_applicable' }) } as never);
+    await waitFor(
+      () => eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length >= 1,
+      'the stopped turn to publish one result after restart',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(dispatches, 0, 'a stopped turn is never dispatched again');
+    assert.equal(fixture.model.calls(), 1, 'no model activation after the stop');
+    assert.equal(fixture.bodies(), 1, 'the settled read is not repeated');
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 1, 'one terminal result');
+    const latest = eventlog.getRunAttemptBySourceUserSeq(fixture.session.id, fixture.source.seq);
+    assert.ok(latest?.finishedAt, `the attempt is finished: ${JSON.stringify(latest)}`);
+  });
+}
+
+test('Stop during recovery when publishing the stopped result fails once: it still ends with exactly one result', async () => {
+  const fixture = await heldTurnFixture('host-stop-publish-fails');
+  assert.equal(fixture.held.status, 'held', JSON.stringify(fixture.held));
+  const db = eventlog.openEventLog();
+  db.exec(`CREATE TEMP TRIGGER reject_stop_publication BEFORE INSERT ON events
+    WHEN NEW.session_id = '${fixture.session.id}' AND NEW.type = 'conversation_completed'
+    BEGIN SELECT RAISE(ABORT, 'fixture terminal publication unavailable'); END`);
+  eventlog.requestKill(fixture.session.id, 'stopped by the person');
+  try {
+    await waitFor(() => HarnessSession.load(fixture.session.id)?.loadRecoveryState() === null,
+      'the stop to take the checkpoint even though publication fails');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 0);
+    assert.equal(eventlog.isKillRequested(fixture.session.id), true, 'the stop latch is kept until its result exists');
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS reject_stop_publication');
+  }
+  await waitFor(() => eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length === 1,
+    'the retried publication to land once');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(fixture.model.calls(), 1, 'no model activation after the stop');
+  assert.equal(eventlog.isKillRequested(fixture.session.id), false);
+});
+
 test('a real focus_set stays host-only through production host_v1 and reaches the next model once', async () => {
   const session = eventlog.createSession({
     id: 'host-only-focus-set-lifecycle',
