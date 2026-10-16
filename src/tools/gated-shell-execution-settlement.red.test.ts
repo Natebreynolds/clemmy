@@ -140,6 +140,45 @@ test("a command timeout settles as a typed timeout outcome — never 'unknown', 
   assert.notEqual(row.outcome_kind, 'succeeded', 'a timed-out command is never a success');
 });
 
+test('a read that fails but prints its answer gives the governor new evidence; stderr alone and a repeat give none', async () => {
+  const { createHash } = await import('node:crypto');
+  const { projectHostNoProgressAuthority } = await import('../runtime/harness/host-no-progress-projection.js');
+  const fixture = register();
+  const evidence = () => {
+    const projected = projectHostNoProgressAuthority({
+      sessionId: fixture.sessionId,
+      sourceUserSeq: fixture.sourceUserSeq,
+    });
+    assert.equal(projected.status, 'ok');
+    return projected.status === 'ok' ? [...projected.authority.evidence] : [];
+  };
+  const details = () => (openEventLog().prepare(`
+    SELECT outcome_kind, outcome_detail, mutating FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? ORDER BY rowid
+  `).all(fixture.sessionId, fixture.sourceUserSeq) as Array<{
+    outcome_kind: string; outcome_detail: string | null; mutating: number;
+  }>);
+
+  const before = evidence();
+  await fixture.shell({ command: "printf 'repo-a\\nrepo-b\\n'; exit 1" });
+  const answered = details().at(-1)!;
+  assert.equal(answered.outcome_kind, 'unknown', 'the command still failed');
+  assert.equal(answered.mutating, 0);
+  assert.equal(
+    answered.outcome_detail,
+    `read_answered:${createHash('sha256').update('repo-a\nrepo-b').digest('hex')}`,
+  );
+  const afterAnswer = evidence();
+  assert.equal(afterAnswer.length, before.length + 1, 'what it printed is new evidence');
+
+  await fixture.shell({ command: "printf 'repo-a\\nrepo-b\\n'; exit 1" });
+  assert.deepEqual(evidence(), afterAnswer, 'the same answer again is not new');
+
+  await fixture.shell({ command: 'echo "unrecognized subcommand" >&2; exit 2' });
+  assert.equal(details().at(-1)!.outcome_detail, 'execution_failed');
+  assert.deepEqual(evidence(), afterAnswer, 'a failure with nothing on stdout brings nothing back');
+});
+
 test.after(() => {
   closeEventLog();
   rmSync(TMP, { recursive: true, force: true });

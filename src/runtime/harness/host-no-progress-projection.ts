@@ -769,6 +769,32 @@ function settledReadResultTokens(
   }
 }
 
+/** A business read that failed but returned its answer (a command's stdout
+ * beside its non-zero exit) brought something back the model can act on: a
+ * repo list printed before a later `&&` step failed, an API's not-found body.
+ * A new answer is evidence exactly as a returned read's bytes are; the same
+ * answer again is the same token and earns nothing. */
+function answeredReadTokens(
+  db: Database.Database,
+  identity: HostNoProgressIdentity,
+  tokens: Record<AuthorityProgressKind, Set<string>>,
+): void {
+  const columns = new Set(
+    (db.prepare('PRAGMA table_info(logical_call_settlements)').all() as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!['outcome_kind', 'outcome_detail', 'mutating', 'business_call'].every((column) => columns.has(column))) return;
+  for (const row of rows<{ outcome_detail: string | null }>(db, `
+    SELECT outcome_detail FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ?
+       AND outcome_kind = 'unknown' AND mutating = 0 AND business_call = 1
+       AND outcome_detail LIKE 'read_answered:%'
+  `, [identity.sessionId, identity.sourceUserSeq])) {
+    const digest = /^read_answered:([a-f0-9]{64})$/.exec(row.outcome_detail ?? '')?.[1];
+    if (digest) tokens.evidence.add(token('evidence', 'answered_read', [digest]));
+  }
+}
+
 export function projectHostNoProgressAuthority(
   input: HostNoProgressIdentity,
   database: Database.Database = openEventLog(),
@@ -788,6 +814,7 @@ export function projectHostNoProgressAuthority(
     eventCapabilityTokens(events, exposedAt, tokens);
     durableAuthorityTokens(database, identity, tokens);
     settledReadResultTokens(database, identity, events, tokens);
+    answeredReadTokens(database, identity, tokens);
     durableRoleBoundDiscoveryStageTokens(database, identity, events, pages, tokens);
     return { status: 'ok', authority: sortedSnapshot(tokens) };
   } catch (error) {

@@ -214,6 +214,11 @@ export interface AttemptSignals {
    * command's own failure in its reply (an exit code, an error flag, a
    * refusal status). Answered, not dark: the reply can be read. */
   providerAnsweredFailure?: boolean;
+  /** A read that ran to completion and failed but still returned its answer
+   * (a command's stdout beside its non-zero exit): the sha256 of that answer.
+   * The outcome stays a failure; the digest names what came back so a new
+   * answer counts as evidence and the same answer again does not. */
+  answeredReadDigest?: string;
   /** The lane already knows the connection is missing/expired (nominal). */
   connectionMissing?: boolean;
   /** A local policy/approval layer refused (nominal). */
@@ -477,7 +482,11 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
     }
   }
   if (signals.executionFailed === true) {
-    return outcome('unknown', 'nominal', 'execution_failed');
+    const answer = signals.mutating !== true && typeof signals.answeredReadDigest === 'string'
+      && /^[a-f0-9]{64}$/.test(signals.answeredReadDigest)
+      ? signals.answeredReadDigest
+      : null;
+    return outcome('unknown', 'nominal', answer ? `read_answered:${answer}` : 'execution_failed');
   }
 
   // The host ran it itself and it returned. This sits below every nominal and

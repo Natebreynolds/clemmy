@@ -309,6 +309,9 @@ export function attemptSignalsFromShellExecutionOutcome(
       executionFailed: true,
       mutating: shell.externalMutation,
       ...(answered ? { providerAnsweredFailure: true } : shell.externalMutation ? { acknowledged: false } : {}),
+      ...(!shell.externalMutation && shell.answeredStdoutDigest
+        ? { answeredReadDigest: shell.answeredStdoutDigest }
+        : {}),
     };
   }
   if (shell.exitCode === 0) {

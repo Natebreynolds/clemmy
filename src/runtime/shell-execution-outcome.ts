@@ -7,6 +7,7 @@
  * external mutation did not land. Only a typed local spawn failure is safe
  * no-dispatch evidence.
  */
+import { createHash } from 'node:crypto';
 import { classifyShellProviderFailure } from './shell-provider-outcome-adapters.js';
 
 /**
@@ -65,6 +66,11 @@ export interface ShellExecutionOutcome {
   providerAdapterId?: string;
   /** Exact host cleanup receipt after a Windows shell timeout or Stop. */
   timeoutCleanup?: 'complete' | 'incomplete';
+  /** A read-only command that ran to completion, exited non-zero, and still
+   * printed its answer on stdout: the sha256 of those bytes. The answer is
+   * evidence like any returned read; stderr alone (a usage error, a typo)
+   * carries none. */
+  answeredStdoutDigest?: string;
 }
 
 export interface ClassifyShellExecutionInput {
@@ -192,6 +198,9 @@ export function classifyShellExecutionOutcome(input: ClassifyShellExecutionInput
       exitCode,
       errorKind: 'nonzero_exit',
       executable,
+      ...(typeof exitCode === 'number' && stdout.trim()
+        ? { answeredStdoutDigest: createHash('sha256').update(stdout.trim(), 'utf8').digest('hex') }
+        : {}),
     };
   }
 
