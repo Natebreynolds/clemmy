@@ -9984,8 +9984,13 @@ export function settlementGuardedStepOutput(input: {
   // valid result for a write too (weekly-review with no active goals ran 13
   // times into "no business evidence", 2026-09-01). A step that never looked,
   // or that tried a write which failed, still owes its evidence.
+  // A SEND step is different: the send is its deliverable. Composing the
+  // message and stopping is not "nothing to change" (live 2026-10-14 and
+  // 10-15: a daily standup read the calendar, returned the brief, sent
+  // nothing, and both runs were reported completed).
   if (
     audit.status === 'no_business_evidence'
+    && sideEffect !== 'send'
     && outputSatisfiesDeclaredContract
     && audit.facts.successfulReads > 0
     && audit.facts.attemptedMutations === 0
