@@ -69,6 +69,7 @@ import { loadPersistedCallAuthority, loadPhysicalRequestEvidence } from './dispa
 import { normalizeWorkflowGoalFollowUpLineage } from '../../execution/workflow-run-write-facts.js';
 import type { reviewWorkflowMutation } from './workflow-mutation-review.js';
 import { classifyStepSideEffect } from '../../execution/workflow-enforce.js';
+import { cachedIdentityEmail } from '../../integrations/composio/identity-cache.js';
 
 let mutationReviewerOverride: typeof reviewWorkflowMutation | null = null;
 export function _setWorkflowMutationReviewerForTests(review: typeof reviewWorkflowMutation | null): void {
@@ -906,10 +907,17 @@ async function reviewAuthoredWriteConstraints(input: {
     });
     const review = mutationReviewerOverride ?? (await import('./workflow-mutation-review.js')).reviewWorkflowMutation;
     const toolLabel = reviewedToolLabel(input);
+    // Which connected account this write runs through, as the host bound it:
+    // a reviewer asked to confirm the sending mailbox otherwise saw only the
+    // reads' accounts (live 2026-10-16, a standup refused twice for it).
+    const boundAccount = input.attestation.accountId?.trim() ?? '';
+    const boundEmail = boundAccount ? cachedIdentityEmail(boundAccount) : undefined;
+    const account = boundAccount ? `${boundAccount}${boundEmail ? ` (mailbox ${boundEmail})` : ''}` : undefined;
     let result = await review({
       sessionId: input.attestation.sessionId,
       instructions: input.reopened.step.prompt,
       tool: toolLabel,
+      ...(account ? { account } : {}),
       schema,
       args: input.args,
       observations: { summary: evidence.summary, complete: evidence.available, evidence: evidence.evidence },
@@ -929,6 +937,7 @@ async function reviewAuthoredWriteConstraints(input: {
         sessionId: input.attestation.sessionId,
         instructions: input.reopened.step.prompt,
         tool: toolLabel,
+        ...(account ? { account } : {}),
         schema,
         args: input.args,
         observations: { summary: full.summary, complete: full.available, evidence: full.evidence },
