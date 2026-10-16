@@ -1,4 +1,5 @@
 import { matchingPendingWorkflowVerification, disabledWorkflowRunMessage } from './workflow-verification-state.js';
+import { workflowRunInventory } from '../execution/workflow-run-inventory.js';
 import { currentDispatchLease } from '../runtime/harness/dispatch-lease.js';
 import {
   closeSync,
@@ -3200,14 +3201,10 @@ export async function awaitWorkflowCreationTestSettlement(
 
 /** Read-only lifecycle evidence; never grants execution authority. */
 export function pendingWorkflowVerification(name: string, definition: WorkflowDefinition): string | undefined {
-  if (!existsSync(WORKFLOW_RUNS_DIR)) return undefined;
   const definitionHash = workflowDefinitionHash(definition);
-  for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).sort().reverse()) {
+  for (const { file, record } of workflowRunInventory()) {
     const runId = file.slice(0, -5);
-    try {
-      const record: unknown = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf8'));
-      if (matchingPendingWorkflowVerification(record, { runId, workflowName: name, definitionHash })) return runId;
-    } catch { /* Unreadable records cannot prove pending verification. */ }
+    if (matchingPendingWorkflowVerification(record, { runId, workflowName: name, definitionHash })) return runId;
   }
   return undefined;
 }
@@ -3219,16 +3216,12 @@ export function pendingWorkflowVerification(name: string, definition: WorkflowDe
  * means there is none. Read-only lifecycle evidence.
  */
 export function passedWorkflowRehearsal(name: string, definition: WorkflowDefinition): string | undefined {
-  if (!existsSync(WORKFLOW_RUNS_DIR)) return undefined;
   const key = workflowRehearsalKey(definition);
-  for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).sort().reverse()) {
-    try {
-      const record: unknown = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf8'));
-      if ((record as { workflow?: unknown }).workflow !== name) continue;
-      const verdict = rehearsalVerdictFromRunRecord(record);
-      if (!verdict || verdict.definitionKey !== key) continue;
-      return verdict.passed ? file.slice(0, -5) : undefined;
-    } catch { /* an unreadable record vouches for nothing */ }
+  for (const { file, record } of workflowRunInventory()) {
+    if (record.workflow !== name) continue;
+    const verdict = rehearsalVerdictFromRunRecord(record);
+    if (!verdict || verdict.definitionKey !== key) continue;
+    return verdict.passed ? file.slice(0, -5) : undefined;
   }
   return undefined;
 }

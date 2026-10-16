@@ -169,6 +169,7 @@ import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type 
 import { resolveWorkflowRunConcurrency } from '../execution/workflow-run-concurrency.js';
 import { certifyWorkflow, type WorkflowCertification } from '../execution/workflow-certification.js';
 import { rehearsalVerdictFromRunRecord, workflowRehearsalKey } from '../execution/workflow-run-definition.js';
+import { workflowRunInventory, workflowRunInventorySignature } from '../execution/workflow-run-inventory.js';
 import { workflowCodeRevisionFingerprint } from '../execution/workflow-code-certification.js';
 import { buildWorkflowResourceBindingReportFromRuntime } from '../execution/workflow-resource-binding.js';
 import { applyLearnedQualityCriteria, workflowQualityCriteria } from '../execution/workflow-quality-contract.js';
@@ -1068,7 +1069,10 @@ function memoizedWorkflowListDerivations(
   // identity so Console truth changes with runtime truth instead of waiting for
   // a workflow edit, new run, or daemon restart to invalidate certification.
   const planOptionsKey = JSON.stringify(workflowExecutionPlanOptions());
-  const key = `${djb2(JSON.stringify(entry.data))}::${workflowCodeRevisionFingerprint(entry.data, entry.name)}::${lastRunId ?? 'none'}::${planOptionsKey}`;
+  // Every run of this workflow, as it stands now: a run that finishes or
+  // changes moves the key, not only a newer run arriving.
+  const runsKey = workflowRunInventorySignature([entry.name, entry.data.name]);
+  const key = `${djb2(JSON.stringify(entry.data))}::${workflowCodeRevisionFingerprint(entry.data, entry.name)}::${lastRunId ?? 'none'}::${runsKey}::${planOptionsKey}`;
   const hit = workflowListMemo.get(entry.name);
   if (hit && hit.key === key) return { proof: hit.proof, certification: hit.certification };
   const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
@@ -2783,20 +2787,15 @@ function readWorkflowRunRecoveryIntent(runId: string, workflowNames: string[]): 
 }
 
 function readWorkflowRunRecords(): WorkflowRunRecordSummary[] {
-  if (!fs.existsSync(WORKFLOW_RUNS_DIR)) return [];
+  // The shared inventory re-reads only run files that changed and carries no
+  // step outputs or definition snapshot; it arrives newest first.
   const records: WorkflowRunRecordSummary[] = [];
-  for (const file of fs.readdirSync(WORKFLOW_RUNS_DIR)) {
-    if (!file.endsWith('.json')) continue;
-    try {
-      const raw = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
-      if (isCompiledProjectWorkflowRunRecord(raw)) continue;
-      const normalized = normalizeWorkflowRunRecord(raw);
-      if (normalized) records.push(normalized);
-    } catch {
-      // Malformed run records should not break the Workflows home page.
-    }
+  for (const entry of workflowRunInventory()) {
+    const raw = entry.record as Record<string, unknown>;
+    if (isCompiledProjectWorkflowRunRecord(raw)) continue;
+    const normalized = normalizeWorkflowRunRecord(raw);
+    if (normalized) records.push(normalized);
   }
-  records.sort((a, b) => String(b.createdAt ?? b.startedAt ?? '').localeCompare(String(a.createdAt ?? a.startedAt ?? '')));
   return records;
 }
 

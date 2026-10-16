@@ -1,4 +1,5 @@
 import { withWorkflowDispatchCommit } from '../runtime/harness/workflow-dispatch-commit.js';
+import { workflowRunInventory } from '../execution/workflow-run-inventory.js';
 import { workflowProjectCreationErrors } from '../execution/workflow-project-preflight.js';
 import { requestsToolkitUse } from './workflow-toolkit-intent.js';
 import { randomBytes } from 'node:crypto';
@@ -727,11 +728,8 @@ export function renderWorkflowRunHistory(workflow: string, limit = 10): string {
   const displayName = entry?.data.name ?? workflow;
   if (!existsSync(WORKFLOW_RUNS_DIR)) return `"${displayName}" has no runs yet.`;
   const lines: string[] = [];
-  const files = readdirSync(WORKFLOW_RUNS_DIR).filter((file) => file.endsWith('.json')).sort().reverse();
-  for (const file of files.slice(0, 5_000)) {
+  for (const { record: r } of workflowRunInventory()) {
     if (lines.length >= limit) break;
-    let r: Record<string, unknown>;
-    try { r = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>; } catch { continue; }
     if (typeof r.id !== 'string' || typeof r.workflow !== 'string' || !names.has(r.workflow)) continue;
     const terminalOutcome = deriveWorkflowTerminalOutcome({
       status: r.status,
@@ -749,9 +747,7 @@ export function renderWorkflowRunHistory(workflow: string, limit = 10): string {
       : '';
     const kind = r.status === 'creation_test' ? 'test' : 'run';
     const outcome = terminalOutcome ? workflowTerminalOutcomeLabel(terminalOutcome) : String(r.status ?? 'unknown');
-    const steps = r.stepOutputs && typeof r.stepOutputs === 'object' && !Array.isArray(r.stepOutputs)
-      ? Object.keys(r.stepOutputs as Record<string, unknown>)
-      : [];
+    const steps = Array.isArray(r.stepOutputKeys) ? r.stepOutputKeys.map(String) : [];
     const why = typeof r.needsAttentionReason === 'string' ? r.needsAttentionReason
       : typeof r.error === 'string' ? r.error : '';
     lines.push(`- ${r.id} · ${kind} · ${String(r.createdAt ?? '')} · ${outcome}${took ? ` · ${took}` : ''}`
@@ -776,10 +772,8 @@ export function renderWorkflowRunsOverview(limit = 15): string {
     terminalOutcome?: WorkflowTerminalOutcome;
   }
   const rows: RunRow[] = [];
-  for (const file of readdirSync(WORKFLOW_RUNS_DIR)) {
-    if (!file.endsWith('.json')) continue;
+  for (const { record: r } of workflowRunInventory()) {
     try {
-      const r = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
       if (typeof r.id !== 'string') continue;
       const terminalOutcome = deriveWorkflowTerminalOutcome({
         status: r.status,
