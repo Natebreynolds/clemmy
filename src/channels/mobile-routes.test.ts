@@ -4644,6 +4644,95 @@ test('delegated chat run control cancels only the exact canonical workflow run i
   }
 });
 
+for (const route of ['named', 'exact', 'batch'] as const) {
+  test(`mobile ${route} cancellation refuses retained identity drift without a false stopped result`, async () => {
+    const runId = `mobile-${route}-identity-drift`;
+    const siblingId = `mobile-${route}-identity-sibling`;
+    const slug = `mobile-${route}-identity-workflow`;
+    const entry = writeWorkflow(slug, { name: slug, description: 'Controlled cancellation identity fixture.', enabled: true,
+      trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read controlled fixture.', sideEffect: 'read' }] });
+    mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+    const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    const sibling = path.join(WORKFLOW_RUNS_DIR, `${siblingId}.json`);
+    writeFileSync(file, JSON.stringify({ id: runId, workflow: slug, status: 'running', stepOutputs: { first: 'retained' } }));
+    writeFileSync(sibling, JSON.stringify({ id: siblingId, workflow: slug, status: 'running' }));
+    const siblingBefore = readFileSync(sibling, 'utf8');
+    const cancellation = await import('../execution/workflow-run-cancellation.js');
+    const { registerWorkflowRunDrainKick } = await import('../execution/workflow-origin-group.js');
+    const { readWorkflowEvents } = await import('../execution/workflow-events.js');
+    const kicks: string[][] = [];
+    const unregister = registerWorkflowRunDrainKick(ids => kicks.push([...ids]));
+    let driftedBytes = '';
+    cancellation._setWorkflowRunCancellationBeforeLockForTests(() => {
+      if (driftedBytes) return;
+      const current = JSON.parse(readFileSync(file, 'utf8'));
+      driftedBytes = JSON.stringify({ ...current, id: 'another-retained-occurrence' });
+      writeFileSync(file, driftedBytes);
+    });
+    const h = await startHarness();
+    try {
+      const cookie = await loginMobile(h, 'Cancellation identity fixture phone');
+      const endpoint = route === 'named' ? `/m/api/workflows/${slug}/runs/${runId}/cancel`
+        : route === 'exact' ? `/m/api/workflow-runs/${runId}/cancel` : '/m/api/workflow-runs/cancel';
+      const response = await fetch(h.url + endpoint, { method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+        ...(route === 'batch' ? { body: JSON.stringify({ runIds: [runId, siblingId] }) } : {}) });
+      assert.equal(response.status, 409);
+      assert.deepEqual(await response.json(), { error: 'RUN_IDENTITY_CHANGED', ...(route === 'batch' ? { runId } : {}) });
+      assert.ok(driftedBytes);
+      assert.equal(readFileSync(file, 'utf8'), driftedBytes, 'the replacement result is not cancelled or rewritten');
+      assert.equal(readFileSync(sibling, 'utf8'), siblingBefore, 'a refusal does not cancel later siblings');
+      assert.equal(cancellation.workflowRunCancellationRequested(runId), false);
+      assert.equal(cancellation.workflowRunCancellationRequested(siblingId), false);
+      assert.deepEqual(readWorkflowEvents(entry.name, runId), [], 'refusal cannot publish run_cancelled');
+      assert.deepEqual(kicks, [], 'no refused occurrence is nudged as if it stopped');
+    } finally {
+      cancellation._setWorkflowRunCancellationBeforeLockForTests();
+      unregister();
+      await h.close();
+      rmSync(file, { force: true }); rmSync(sibling, { force: true });
+    }
+  });
+}
+
+test('mobile group cancellation reports a later identity refusal and nudges only earlier durable cancellations', async () => {
+  const runId = 'mobile-partial-identity-stopped';
+  const refusedId = 'mobile-partial-identity-refused';
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const refusedFile = path.join(WORKFLOW_RUNS_DIR, `${refusedId}.json`);
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(file, JSON.stringify({ id: runId, workflow: 'Controlled group', status: 'running' }));
+  writeFileSync(refusedFile, JSON.stringify({ id: refusedId, workflow: 'Controlled group', status: 'running' }));
+  const cancellation = await import('../execution/workflow-run-cancellation.js');
+  const { registerWorkflowRunDrainKick } = await import('../execution/workflow-origin-group.js');
+  const kicks: string[][] = [];
+  const unregister = registerWorkflowRunDrainKick(ids => kicks.push([...ids]));
+  let boundaryCalls = 0;
+  let refusedBytes = '';
+  cancellation._setWorkflowRunCancellationBeforeLockForTests(() => {
+    if (++boundaryCalls !== 2) return;
+    refusedBytes = JSON.stringify({ id: 'another-occurrence', workflow: 'Controlled group', status: 'running', output: 'kept' });
+    writeFileSync(refusedFile, refusedBytes);
+  });
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Partial cancellation identity fixture phone');
+    const response = await fetch(h.url + '/m/api/workflow-runs/cancel', { method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ runIds: [runId, refusedId] }) });
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), { error: 'RUN_IDENTITY_CHANGED', runId: refusedId });
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).status, 'cancelled', 'a later refusal cannot undo an earlier exact cancellation');
+    assert.equal(readFileSync(refusedFile, 'utf8'), refusedBytes);
+    assert.equal(cancellation.workflowRunCancellationRequested(runId), true);
+    assert.equal(cancellation.workflowRunCancellationRequested(refusedId), false);
+    assert.deepEqual(kicks, [[runId]], 'only the occurrence with durable stopped truth gets immediate report delivery');
+  } finally {
+    cancellation._setWorkflowRunCancellationBeforeLockForTests();
+    unregister();
+    await h.close();
+    rmSync(file, { force: true }); rmSync(refusedFile, { force: true });
+  }
+});
+
 test('delegated group Stop treats an already-terminal member as a no-op and cancels the live member', async () => {
   const key = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const completedId = `mobile-delegated-done-${key}`;

@@ -126,11 +126,14 @@ export function workflowRunInventoryEntry(runId: string): WorkflowRunInventoryEn
  * when its filesystem generation changed; a record caught mid-write is
  * left out this time and read on the next call.
  */
-export function workflowRunInventory(): readonly WorkflowRunInventoryEntry[] {
+export function workflowRunInventory(options: { throwOnDirectoryReadError?: boolean } = {}): readonly WorkflowRunInventoryEntry[] {
   ensureCacheDirectory();
   let files: string[];
-  try { files = readdirSync(WORKFLOW_RUNS_DIR); } catch {
+  try { files = readdirSync(WORKFLOW_RUNS_DIR); } catch (error) {
     cache.clear();
+    // History routes distinguish an unreadable directory from an empty one.
+    // Existing best-effort status readers retain their prior empty projection.
+    if (options.throwOnDirectoryReadError) throw error;
     return [];
   }
   const present = new Set<string>();

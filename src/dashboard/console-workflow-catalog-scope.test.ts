@@ -15,7 +15,10 @@ mkdirSync(path.join(testHome, 'state'), { recursive: true });
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
-const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
+const { appendWorkflowEvent, readWorkflowEvents } = await import('../execution/workflow-events.js');
+const { _setWorkflowRunCancellationBeforeLockForTests, readWorkflowRunCancellation } = await import('../execution/workflow-run-cancellation.js');
+const { readWorkflowRunRecordUnlocked, withWorkflowRunRecordLock, writeWorkflowRunRecordDurablyUnlocked } = await import('../execution/workflow-run-record.js');
+const { startRun, getRun } = await import('../runtime/run-events.js');
 const { workflowDefinitionHash } = await import('../execution/workflow-run-definition.js');
 const { compileProjectPlan } = await import('../execution/project-compiler.js');
 const { canonicalProjectPlan } = await import('../execution/project-plan-ir.js');
@@ -45,6 +48,85 @@ async function boot(): Promise<{ url: string; close: () => Promise<void> }> {
     url: `http://127.0.0.1:${port}`,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
+}
+
+function replaceRunIdentityAtCancellationLock(runId: string): () => string {
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  let replaced = '';
+  _setWorkflowRunCancellationBeforeLockForTests(() => {
+    withWorkflowRunRecordLock(file, () => {
+      const current = readWorkflowRunRecordUnlocked<Record<string, unknown>>(file)!;
+      writeWorkflowRunRecordDurablyUnlocked(file, { ...current, id: `${runId}-foreign` });
+      replaced = readFileSync(file, 'utf8');
+    });
+  });
+  return () => replaced;
+}
+
+test('desktop named Stop refuses retained run identity drift without a cancellation receipt or event', async () => {
+  const slug = 'cancel-identity-catalog';
+  const name = 'Cancel identity catalog';
+  const runId = 'cancel-identity-catalog-run';
+  writeWorkflow(slug, { name, description: 'Controlled cancellation race.', enabled: true,
+    trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read the fixture.', sideEffect: 'read' }] });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(file, JSON.stringify({ id: runId, workflow: name, status: 'running' }));
+  const h = await boot();
+  const replaced = replaceRunIdentityAtCancellationLock(runId);
+  try {
+    const response = await fetch(`${h.url}/api/console/workflows/${slug}/runs/${runId}/cancel`, { method: 'POST' });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json() as { ok?: boolean }).ok, false);
+    assert.ok(replaced());
+    assert.equal(readFileSync(file, 'utf8'), replaced());
+    assert.equal(readWorkflowRunCancellation(runId), null);
+    assert.equal(readWorkflowEvents(slug, runId).some(event => event.kind === 'run_cancelled'), false);
+  } finally { _setWorkflowRunCancellationBeforeLockForTests(); await h.close(); }
+});
+
+test('Tasks-board Stop refuses retained workflow identity drift without closing its run card', async () => {
+  const runId = 'cancel-identity-board-run';
+  const run = startRun({ id: runId, sessionId: 'controlled-stop-board-session', source: 'workflow', message: 'Controlled Stop race.' });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(file, JSON.stringify({ id: runId, workflow: 'Controlled board workflow', status: 'running' }));
+  const h = await boot();
+  const replaced = replaceRunIdentityAtCancellationLock(runId);
+  try {
+    const response = await fetch(`${h.url}/api/console/board/run/${runId}/cancel`, { method: 'POST' });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json() as { ok?: boolean }).ok, false);
+    assert.equal(readFileSync(file, 'utf8'), replaced());
+    assert.equal(readWorkflowRunCancellation(runId), null);
+    assert.equal(getRun(runId)?.status, run.status);
+  } finally { _setWorkflowRunCancellationBeforeLockForTests(); await h.close(); }
+});
+
+for (const surface of ['named-project', 'project-card'] as const) {
+  test(`${surface} Stop refuses retained root identity drift without settling the project`, async () => {
+    const compiled = seedCompiledControlRun(`identity-${surface}`);
+    const store = new ExecutionStore();
+    const execution = store.list().find(entry => entry.graphAdmission?.rootWorkflowRunId === compiled.runId)!;
+    const file = path.join(WORKFLOW_RUNS_DIR, `${compiled.runId}.json`);
+    const h = await boot();
+    const replaced = replaceRunIdentityAtCancellationLock(compiled.runId);
+    try {
+      const url = surface === 'named-project'
+        ? `${h.url}/api/console/workflows/${compiled.workflowSlug}/runs/${compiled.runId}/cancel`
+        : `${h.url}/api/console/board/execution/${execution.id}/transition`;
+      const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ to: 'cancelled' }) });
+      assert.equal(response.status, 409);
+      assert.equal((await response.json() as { ok?: boolean }).ok, false);
+      assert.ok(replaced());
+      assert.equal(readFileSync(file, 'utf8'), replaced());
+      assert.equal(readWorkflowRunCancellation(compiled.runId), null);
+      assert.equal(store.get(execution.id)?.status, execution.status);
+      assert.deepEqual(store.get(execution.id)?.graphAdmission?.rootWorkflowTerminal, execution.graphAdmission?.rootWorkflowTerminal);
+      assert.equal(readWorkflowEvents(compiled.workflowSlug, compiled.runId).some(event => event.kind === 'run_cancelled'), false);
+    } finally { _setWorkflowRunCancellationBeforeLockForTests(); await h.close(); }
+  });
 }
 
 function seedCompiledControlRun(label: string): {

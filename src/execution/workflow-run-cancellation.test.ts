@@ -1,6 +1,7 @@
 import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -52,6 +53,91 @@ test('a corrupt cancellation receipt still fails closed', () => {
 
   assert.equal(workflowRunCancellationRequested('run-corrupt'), true);
   assert.match(readWorkflowRunCancellation('run-corrupt')?.reason ?? '', /unreadable/);
+});
+
+test('cancellation refuses foreign, missing and malformed retained identities before terminal or notification settlement', () => {
+  for (const status of ['running', 'completed', 'cancelled']) {
+    for (const [label, id] of [['foreign', 'another-run'], ['missing', undefined], ['malformed', 42]] as const) {
+      const runId = `identity-${status}-${label}`;
+      const file = writeRun(runId, {
+        id, status, finishedAt: status === 'running' ? undefined : '2026-10-16T01:00:00.000Z',
+        output: 'Retained result remains exact.', stepOutputs: { first: 'kept' },
+        reportBack: { version: 1, workflowName: 'Race Workflow', outcome: status === 'cancelled' ? 'failed' : 'done',
+          detail: 'Original report.', acknowledgedOriginSessionIds: [] },
+      });
+      const before = readFileSync(file, 'utf8');
+      const notificationId = `workflow-${runId}-capability-fixture`;
+      addNotification({ id: notificationId, kind: 'workflow', title: 'Controlled pending capability', body: 'Controlled fixture.',
+        createdAt: '2026-10-16T01:00:00.000Z', read: false,
+        metadata: { runId, status: 'blocked_capability', needsAttention: true } });
+      const beforeNotification = getNotification(notificationId);
+      const result = cancelWorkflowRunAtBoundary({ runId, reason: 'Controlled Stop.', source: 'test-identity', expectedWorkflow: 'Race Workflow' });
+      assert.equal(result.status, 'refused', `${status}/${label} cannot be treated as the selected occurrence`);
+      assert.equal(result.status === 'refused' && result.reason, 'ownership_unproved');
+      assert.equal(readFileSync(file, 'utf8'), before, 'no terminal, report or root-settlement marker is rewritten');
+      assert.equal(readWorkflowRunCancellation(runId), null, 'no cancellation authority is installed');
+      assert.deepEqual(getNotification(notificationId), beforeNotification, 'unowned terminal truth cannot settle a notification');
+      assert.equal(existsSync(`${file}.record-lock`), false);
+    }
+  }
+});
+
+test('retained run identity drift after an optimistic read is refused under the canonical lock', () => {
+  const runId = 'identity-drift-after-read';
+  const file = writeRun(runId, { status: 'running' });
+  let driftedBytes = '';
+  _setWorkflowRunCancellationBeforeLockForTests(() => {
+    withWorkflowRunRecordLock(file, () => {
+      const record = readWorkflowRunRecordUnlocked<Record<string, unknown>>(file)!;
+      writeWorkflowRunRecordDurablyUnlocked(file, { ...record, id: 'replacement-occurrence' });
+      driftedBytes = readFileSync(file, 'utf8');
+    });
+  });
+  const result = cancelWorkflowRunAtBoundary({ runId, reason: 'Stale Stop.', source: 'test-identity', expectedWorkflow: 'Race Workflow' });
+  assert.equal(result.status, 'refused');
+  assert.equal(readFileSync(file, 'utf8'), driftedBytes);
+  assert.equal(workflowRunCancellationRequested(runId), false);
+});
+
+test('low-level cancellation checks existing exact identity under lock but preserves record-absent pre-cancel', (t) => {
+  const originalRead = fs.readFileSync;
+  const lockedReads: string[] = [];
+  t.mock.method(fs, 'readFileSync', (...args) => {
+    if (typeof args[0] === 'string' && args[0].endsWith('.json') && path.dirname(args[0]) === WORKFLOW_RUNS_DIR
+      && existsSync(`${args[0]}.record-lock`)) lockedReads.push(args[0]);
+    return Reflect.apply(originalRead, fs, args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  for (const status of ['running', 'completed']) for (const [label, id] of [['foreign', 'another-run'], ['missing', undefined], ['malformed', { id: 'not-a-string' }]] as const) {
+    const runId = `low-level-${status}-${label}`;
+    const file = writeRun(runId, { id, status, stepOutputs: { first: 'kept' } });
+    const before = readFileSync(file, 'utf8');
+    assert.throws(() => requestWorkflowRunCancellation(runId, 'Controlled Stop.', 'test-identity'),
+      { name: 'WorkflowRunIdentityMismatchError' });
+    assert.ok(lockedReads.includes(file), 'the retained identity is inspected under the shared lock');
+    assert.equal(readFileSync(file, 'utf8'), before);
+    assert.equal(workflowRunCancellationRequested(runId), false);
+  }
+  const absent = requestWorkflowRunCancellation('pre-admission-identity', 'Stop before admission.', 'test-identity');
+  assert.equal(absent.runId, 'pre-admission-identity');
+  const matching = writeRun('low-level-exact', { status: 'running' });
+  const request = requestWorkflowRunCancellation('low-level-exact', 'Exact Stop.', 'test-identity');
+  assert.equal(request.runId, 'low-level-exact');
+  assert.ok(lockedReads.includes(matching));
+  assert.equal(readWorkflowRunCancellation('low-level-exact')?.reason, 'Exact Stop.');
+});
+
+test('identity refusal preserves an earlier immutable cancellation receipt without adopting foreign report bytes', () => {
+  const runId = 'identity-earlier-stop';
+  const first = requestWorkflowRunCancellation(runId, 'First exact Stop.', 'first-owner');
+  const file = writeRun(runId, { id: 'another-run', status: 'cancelled', error: 'Foreign terminal.',
+    reportBack: { version: 1, workflowName: 'Race Workflow', outcome: 'failed', detail: 'Foreign terminal.', acknowledgedOriginSessionIds: [] } });
+  const before = readFileSync(file, 'utf8');
+  assert.throws(() => requestWorkflowRunCancellation(runId, 'A later Stop.', 'later-owner'), { name: 'WorkflowRunIdentityMismatchError' });
+  assert.equal(cancelWorkflowRunAtBoundary({ runId, reason: 'A later Stop.', source: 'later-owner' }).status, 'refused');
+  assert.deepEqual(readWorkflowRunCancellation(runId), first);
+  assert.equal(readFileSync(file, 'utf8'), before);
 });
 
 test('exact ownership precondition is read under the canonical lock and refusal writes no cancellation authority', () => {

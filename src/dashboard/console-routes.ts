@@ -6866,17 +6866,16 @@ export function registerConsoleRoutes(
         res.json({ runs: [] });
         return;
       }
-      const files = fs.readdirSync(WORKFLOW_RUNS_DIR).filter((f) => f.endsWith('.json'));
       const runs: Array<Record<string, unknown>> = [];
-      for (const file of files) {
-        try {
-          const data = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
-          if (isCompiledProjectWorkflowRunRecord(data)) continue;
-          const workflow = stringField(data.workflow);
-          if (!workflow || !workflowIdentities.has(workflow)) continue;
-          const projected = projectWorkflowRunRecord(data);
-          if (projected) runs.push(projected);
-        } catch { /* skip malformed */ }
+      // This page needs only the existing whitelisted projection. Keep heavy
+      // execution bytes out of warm history polls as well as the catalog.
+      for (const item of workflowRunInventory({ throwOnDirectoryReadError: true })) {
+        const data = item.record;
+        if (isCompiledProjectWorkflowRunRecord(data)) continue;
+        const workflow = stringField(data.workflow);
+        if (!workflow || !workflowIdentities.has(workflow)) continue;
+        const projected = projectWorkflowRunRecord(data);
+        if (projected) runs.push(projected);
       }
       runs.sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
       res.json({ runs: runs.slice(0, limit) });
@@ -7281,6 +7280,10 @@ export function registerConsoleRoutes(
       }
       if (cancellation.status === 'workflow_mismatch') {
         res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+        return;
+      }
+      if (cancellation.status === 'refused') {
+        res.status(409).json({ ok: false, error: 'workflow run identity or ownership changed; refresh before stopping it' });
         return;
       }
       if (cancellation.status === 'already_terminal') {
@@ -13691,7 +13694,7 @@ export function registerConsoleRoutes(
             source: 'tasks-board-execution-card',
             expectedWorkflow: projectCancellation.workflow,
           });
-          if (cancellation.status === 'not_found' || cancellation.status === 'workflow_mismatch') {
+          if (cancellation.status === 'not_found' || cancellation.status === 'workflow_mismatch' || cancellation.status === 'refused') {
             res.status(409).json({ ok: false, reason: 'the bound project root changed or is unavailable; refresh the board' });
             return;
           }
@@ -13751,7 +13754,7 @@ export function registerConsoleRoutes(
             res.status(409).json({ ok: false, reason: 'this workflow run is already terminal; refresh the board' });
             return;
           }
-          if (cancellation.status === 'not_found' || cancellation.status === 'workflow_mismatch') {
+          if (cancellation.status === 'not_found' || cancellation.status === 'workflow_mismatch' || cancellation.status === 'refused') {
             res.status(409).json({ ok: false, reason: 'this workflow run changed; refresh the board' });
             return;
           }

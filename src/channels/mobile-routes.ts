@@ -5842,6 +5842,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         res.status(404).json({ error: 'RUN_NOT_FOUND' });
         return;
       }
+      if (outcome.status === 'refused') {
+        res.status(409).json({ error: 'RUN_IDENTITY_CHANGED' });
+        return;
+      }
       if (outcome.status === 'already_terminal') {
         res.status(409).json({ error: 'ALREADY_FINISHED', status: outcome.terminalStatus });
         return;
@@ -5925,7 +5929,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       }
 
       const { cancelWorkflowRunAtBoundary } = await import('../execution/workflow-run-cancellation.js');
-      const results = resolved.map((entry) => {
+      const results: Array<{ runId: string; outcome: ReturnType<typeof cancelWorkflowRunAtBoundary> }> = [];
+      for (const entry of resolved) {
         const exact = entry!;
         const outcome = cancelWorkflowRunAtBoundary({
           runId: exact.runId,
@@ -5933,14 +5938,17 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           source: 'mobile-chat-delegated',
           expectedWorkflow: exact.workflow,
         });
-        return { runId: exact.runId, outcome };
-      });
-      const conflict = results.find(({ outcome }) => (
-        outcome.status === 'not_found' || outcome.status === 'workflow_mismatch'
-      ));
-      if (conflict) {
-        res.status(409).json({ error: 'RUN_IDENTITY_CHANGED', runId: conflict.runId });
-        return;
+        results.push({ runId: exact.runId, outcome });
+        if (outcome.status === 'not_found' || outcome.status === 'workflow_mismatch' || outcome.status === 'refused') {
+          // Earlier exact members may already have stopped. Deliver only those
+          // durable outcomes; a later refusal cannot roll them back or claim
+          // that this whole group was stopped.
+          requestWorkflowRunDrainKick(results
+            .filter(({ outcome: settled }) => settled.status === 'cancelled' || settled.status === 'already_cancelled')
+            .map(({ runId }) => runId));
+          res.status(409).json({ error: 'RUN_IDENTITY_CHANGED', runId: exact.runId });
+          return;
+        }
       }
       const kickRunIds = results
         .filter(({ outcome }) => outcome.status === 'cancelled' || outcome.status === 'already_cancelled')
@@ -5993,6 +6001,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       });
       if (outcome.status === 'not_found' || outcome.status === 'workflow_mismatch') {
         res.status(404).json({ error: 'RUN_NOT_FOUND' });
+        return;
+      }
+      if (outcome.status === 'refused') {
+        res.status(409).json({ error: 'RUN_IDENTITY_CHANGED' });
         return;
       }
       if (outcome.status === 'already_terminal') {
