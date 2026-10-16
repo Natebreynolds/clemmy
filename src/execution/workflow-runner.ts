@@ -14467,6 +14467,17 @@ function creationTestCapabilityQuestion(
   return (question || presentation.detail.trim() || error.message).slice(0, 1_200);
 }
 
+/** A step's own account of what stopped it, kept whole enough to act on:
+ *  up to 800 characters, ended at a sentence or word, never mid-word. */
+function boundedStepDetail(text: string, max = 800): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= max) return trimmed;
+  const head = trimmed.slice(0, max);
+  const sentence = Math.max(head.lastIndexOf('. '), head.lastIndexOf('.\n'), head.lastIndexOf('\n\n'));
+  const cut = sentence > max * 0.5 ? sentence + 1 : Math.max(head.lastIndexOf(' '), max * 0.5);
+  return `${head.slice(0, cut).trimEnd()}…`;
+}
+
 /** What a value is, said for a person fixing the step that produced it. */
 function argumentValueKind(value: unknown): string {
   if (value === null) return 'empty (null)';
@@ -14666,7 +14677,7 @@ export async function runCreationTest(
             });
           } else {
             stepOutputs[step.id] = { blocked: true, reason: 'creation-test error' };
-            results.push({ stepId: step.id, status: 'error', detail: (err instanceof Error ? err.message : String(err)).slice(0, 200) });
+            results.push({ stepId: step.id, status: 'error', detail: boundedStepDetail(err instanceof Error ? err.message : String(err)) });
           }
         }
       }
