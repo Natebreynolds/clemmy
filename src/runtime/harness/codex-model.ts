@@ -1622,6 +1622,30 @@ function normalizeContentPart(part: unknown): unknown {
   return part;
 }
 
+/** String formats a strict function schema may carry on this wire. */
+const STRICT_SCHEMA_FORMATS = new Set([
+  'date-time', 'time', 'date', 'duration', 'email', 'hostname', 'ipv4', 'ipv6', 'uuid',
+]);
+
+/**
+ * A strict function schema with a string `format` the provider does not
+ * support is rejected before the model runs, and the whole request fails
+ * with it (live 2026-10-16: `http_read`'s url field advertised "uri", every
+ * call in a chat that had promoted it failed four times, and the owner was
+ * told the connection kept dropping). Only the advertisement loses the
+ * keyword; the tool still validates its arguments against its own schema.
+ */
+export function strictWireParameters(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(strictWireParameters);
+  if (!schema || typeof schema !== 'object') return schema;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
+    if (key === 'format' && typeof value === 'string' && !STRICT_SCHEMA_FORMATS.has(value)) continue;
+    out[key] = strictWireParameters(value);
+  }
+  return out;
+}
+
 function serializeTools(
   tools: SerializedTool[],
   handoffs: SerializedHandoff[],
@@ -1641,7 +1665,7 @@ function serializeTools(
         type: 'function',
         name: f.name,
         description: f.description,
-        parameters: f.parameters,
+        parameters: f.strict ? strictWireParameters(f.parameters) : f.parameters,
         strict: f.strict,
       });
       continue;
@@ -1656,7 +1680,7 @@ function serializeTools(
       type: 'function',
       name: handoff.toolName,
       description: handoff.toolDescription,
-      parameters: handoff.inputJsonSchema,
+      parameters: handoff.strictJsonSchema ? strictWireParameters(handoff.inputJsonSchema) : handoff.inputJsonSchema,
       strict: handoff.strictJsonSchema,
     });
   }
@@ -1765,6 +1789,18 @@ export function codexFailedResponseError(events: readonly AnyCodexEvent[]): Boun
       userMessage: 'This request was larger than the model accepts, so it was not retried.',
       operatorMessage: `Codex failed the response as too large (${stated}, responseId=${responseId ?? 'none'})`,
       context: { failedCode: code || null, failedMessage: message || null, responseId, requestTooLarge: true, lastEventType: failed.type ?? null },
+    });
+  }
+  // The provider rejected the request itself (a tool schema it does not
+  // accept, an invalid value): the identical request fails the same way, so
+  // it is never replayed and never reported as a dropped connection.
+  if (/^invalid_/.test(code)) {
+    return new BoundaryError({
+      kind: 'codex.http_4xx',
+      retryable: false,
+      userMessage: 'The model service rejected this request as invalid, so it was not retried.',
+      operatorMessage: `Codex rejected the request (${stated}, responseId=${responseId ?? 'none'})`,
+      context: { failedCode: code, failedMessage: message || null, responseId, requestInvalid: true, lastEventType: failed.type ?? null },
     });
   }
   return new BoundaryError({
