@@ -781,7 +781,11 @@ function binaryIsNetworkMutation(binary: string, rest: string): boolean {
       // command was stripped above, so `ssh user@host "…"` is just the host.
       return rest.trim().split(/\s+/).some((token) => token.length > 0 && !token.startsWith('-'));
     case 'railway':
-      return /^\s*(ssh|run|up|deploy|redeploy|link|unlink|rollback|down|delete)\b/i.test(rest)
+      // `link` / `unlink` only record, on this computer, which project this
+      // folder means; every command that then acts on that project is gated
+      // here. Gating the link put a card in front of reading a site's status
+      // (live 2026-10-16), against "local work asks nothing".
+      return /^\s*(ssh|run|up|deploy|redeploy|rollback|down|delete)\b/i.test(rest)
         || /^\s*(variables?|vars?)\s+(set|delete|unset)\b/i.test(rest)
         || /^\s*service\s+(delete|create)\b/i.test(rest);
     case 'fly':
