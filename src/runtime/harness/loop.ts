@@ -1056,15 +1056,23 @@ export function terminalQuestionEventForAcceptedSource(input: {
 export const _terminalQuestionTextForTest = (result: RunConversationResult, sourceUserSeq: number): string =>
   terminalQuestionText(result, sourceUserSeq);
 
-/** Whether the turn's question is Clem's own structured ask: her words and
- * options through ask_user_question, posted with no host source. An observed
- * connection gap never replaces it (live 2026-10-16 a speculative contacts
- * search turned her three-option question into the host's "connect
- * Contacts+" template); a plain ASK pause still parks the gap and resumes. */
+/** Whether the turn's question keeps its own words. Only a plain ASK pause
+ * (or the host's own connection question) parks an observed connection gap
+ * and resumes after it. Clem's structured ask (her words and options through
+ * ask_user_question) and a question about something else, such as a model
+ * connection that kept dropping, are never replaced by it (live 2026-10-16 a
+ * speculative contacts search turned her three-option question into the
+ * host's "connect Contacts+", and a dropped-model question into "connect
+ * Specific"). */
 function clemsOwnAskForTurn(input: { sessionId: string; sourceUserSeq: number; turn: number }): boolean {
   const event = terminalQuestionEventForAcceptedSource(input);
-  return Boolean(event && event.data.source === undefined && publicReplyText(event.data.question, ''));
+  if (!event || !publicReplyText(event.data.question, '')) return false;
+  const source = event.data.source;
+  return !PARKS_OBSERVED_CONNECTION_SOURCES.has(String(source));
 }
+const PARKS_OBSERVED_CONNECTION_SOURCES = new Set([
+  'decision_awaiting', 'decision_awaiting_handoff_terminal', 'host_connection_dependency_projection',
+]);
 
 function terminalQuestionText(result: RunConversationResult, sourceUserSeq: number): string {
   const event = terminalQuestionEventForAcceptedSource({ sessionId: result.sessionId, sourceUserSeq, turn: result.lastTurn });
