@@ -73,7 +73,7 @@ function resolveTargetPath(toolName: string, input: unknown): string | null {
     : (typeof obj.cwd === 'string' && obj.cwd ? obj.cwd : process.cwd());
   if (!target) return null;
   try {
-    return path.resolve(expandHome(target));
+    return path.resolve(relativePathBase(), expandHome(target));
   } catch {
     return null;
   }
@@ -350,7 +350,7 @@ function userWorkspaceRoots(): string[] {
   // (workspaceRoots) so explicit "write to ~/Documents" still works
   // with approval, but auto-approve under "workspace" scope is limited
   // to dirs the user actually declared.
-  const roots = [process.cwd(), BASE_DIR, ...getWorkspaceDirs()]
+  const roots = [relativePathBase(), BASE_DIR, ...getWorkspaceDirs()]
     .map((entry) => path.resolve(expandHome(entry)));
   return [...new Set(roots)];
 }
@@ -374,8 +374,30 @@ function isInside(parent: string, child: string): boolean {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
+/**
+ * Where a relative path lands. The daemon's working directory is the
+ * installed app's own code: on a packaged install it sits inside the signed
+ * app, where a written file changes the app and is lost at the next update.
+ * There, relative paths resolve under Clementine's home, in a folder of their
+ * own clear of its internal state. A development checkout keeps resolving
+ * against its working directory.
+ */
+let relativeBaseMemo: { key: string; insideApp: boolean } | null = null;
+
+export function relativePathBase(): string {
+  const cwd = process.cwd();
+  const resources = process.env.CLEMENTINE_RESOURCES_PATH;
+  if (!resources) return cwd;
+  const key = `${resources}\0${cwd}`;
+  if (relativeBaseMemo?.key !== key) {
+    const real = (entry: string): string => { try { return realpathSync(entry); } catch { return path.resolve(entry); } };
+    relativeBaseMemo = { key, insideApp: isInside(real(resources), real(cwd)) };
+  }
+  return relativeBaseMemo.insideApp ? path.join(BASE_DIR, 'files') : cwd;
+}
+
 export function resolveAllowedPath(input: string): string {
-  const resolved = path.resolve(expandHome(input));
+  const resolved = path.resolve(relativePathBase(), expandHome(input));
   // Local work is the same in both modes (2026-09-30): the agent may act
   // anywhere the owner can. The mode is about changes in connected apps,
   // not about paths. The guards inside the tool (the hard command denylist,

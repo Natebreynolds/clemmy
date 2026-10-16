@@ -741,3 +741,28 @@ test('convert_to_markdown and list_files answer an absent path as a read result 
   assert.equal(await invokeTool('list_files', { directory: file, limit: null }),
     `${file} is a file, not a folder; read_file reads it.`);
 });
+
+test('a relative path never lands inside the installed app: it resolves under the Clementine home', async () => {
+  const { relativePathBase, resolveAllowedPath } = await import('./computer-tools.js');
+  const { BASE_DIR } = await import('./shared.js');
+  const priorCwd = process.cwd();
+  const priorResources = process.env.CLEMENTINE_RESOURCES_PATH;
+  const resources = mkdtempSync(path.join(os.tmpdir(), 'clem-app-resources-'));
+  const daemonDir = path.join(resources, 'daemon');
+  mkdirSync(daemonDir, { recursive: true });
+  try {
+    process.env.CLEMENTINE_RESOURCES_PATH = resources;
+    process.chdir(daemonDir);
+    assert.equal(relativePathBase(), path.join(BASE_DIR, 'files'));
+    assert.equal(resolveAllowedPath('notes/out.md'), path.join(BASE_DIR, 'files', 'notes', 'out.md'));
+    assert.equal(resolveAllowedPath('/tmp/abs.md'), '/tmp/abs.md', 'an absolute path is left as written');
+    // A development checkout (working directory outside the app's resources) is unchanged.
+    process.chdir(priorCwd);
+    assert.equal(relativePathBase(), process.cwd());
+  } finally {
+    process.chdir(priorCwd);
+    if (priorResources === undefined) delete process.env.CLEMENTINE_RESOURCES_PATH;
+    else process.env.CLEMENTINE_RESOURCES_PATH = priorResources;
+    rmSync(resources, { recursive: true, force: true });
+  }
+});

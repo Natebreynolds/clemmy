@@ -11,7 +11,7 @@ export async function executeReviewedLocalFile(
   args: Extract<PreparedReviewedLocalToolExecution, { adapter: 'local_file_revision_v1' }>['args'],
   recoveryOnly = false,
 ) {
-  const { executeLocalFileWrite } = await import('../../tools/computer-tools.js');
+  const { executeLocalFileWrite, resolveAllowedPath } = await import('../../tools/computer-tools.js');
   const lease = currentDispatchLease();
   const operationKey = lease?.sourceUserSeq && lease.acceptedTaskId && lease.logicalToolCallId
     ? JSON.stringify({ sessionId: lease.sessionId, sourceUserSeq: lease.sourceUserSeq,
@@ -32,9 +32,11 @@ export async function executeReviewedLocalFile(
     // — the natural shape for "save the summary to <path>" — failed a write
     // that had physically succeeded (live 2026-09-22, "Handoff review
     // fixture": file on disk, run reported failed for a missing "path").
-    path: args.path,
+    // The full path the file landed at, so a check of it and a person
+    // looking for it find the same file a relative path resolved to.
+    path: resolveAllowedPath(args.path),
     // Stable payload for both original execution and receipt-only recovery.
-    result: `Committed file at ${args.path} (${args.content.length} chars).\n${facts.receipt}`,
+    result: `Committed file at ${resolveAllowedPath(args.path)} (${args.content.length} chars).\n${facts.receipt}`,
   };
 }
 
