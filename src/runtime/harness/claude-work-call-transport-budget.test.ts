@@ -38,6 +38,7 @@ const acceptedAuthority = await import('./accepted-task-authority.js');
 const expectedWork = await import('./expected-work-contract.js');
 const actionBoundary = await import('./action-expected-work-boundary.js');
 const sdk = await import('./claude-agent-sdk.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
 
 after(() => {
   sdk.setClaudeAgentSdkQueryForTest(null);
@@ -99,7 +100,8 @@ function resultMessage(): SDKMessage {
 const FILE_TEXT = Array.from({ length: 60 }, (_, i) => `[line ${String(i).padStart(2, '0')}] ${'f'.repeat(988)}`).join('\n');
 const PREVIEW_CHARS = 40_000;
 
-test('an explicit large read preview through the registered work_call MCP transport is not re-clipped', async () => {
+for (const nativeArguments of [false, true]) {
+test(`an explicit large read preview through registered work_call MCP is not re-clipped (${nativeArguments ? 'object' : 'legacy text'} args)`, async () => {
   writeClaudeToken();
   const filePath = path.join(TMP_HOME, 'fixture-large-read.txt');
   writeFileSync(filePath, FILE_TEXT, 'utf8');
@@ -110,8 +112,11 @@ test('an explicit large read preview through the registered work_call MCP transp
     universe_item_id: null,
     universe_selector: null,
     name: 'read_file',
-    args_json: JSON.stringify({ path: filePath, max_chars: PREVIEW_CHARS }),
+    args_json: nativeArguments
+      ? { path: filePath, max_chars: PREVIEW_CHARS }
+      : JSON.stringify({ path: filePath, max_chars: PREVIEW_CHARS }),
   };
+  const originalInput = JSON.stringify(input);
   let permission: { behavior?: string } | undefined;
   let admitted: { content?: Array<{ text?: string }>; isError?: boolean } | undefined;
   sdk.setClaudeAgentSdkQueryForTest(((params: any) => {
@@ -123,7 +128,14 @@ test('an explicit large read preview through the registered work_call MCP transp
         { signal: new AbortController().signal, toolUseID: 'toolu-transport-budget-read' },
       );
       const registered = params.options.mcpServers['clementine-local'].instance._registeredTools as Record<string, any>;
+      assert.equal(registered.work_call.inputSchema.safeParse(input).success, true);
+      assert.equal(registered.work_call.inputSchema.safeParse({ ...input, unexpected_authority: true }).success, false,
+        'the MCP registration must preserve the complete closed outer schema');
       admitted = await registered.work_call.handler(input);
+      assert.equal(JSON.stringify(input), originalInput, 'permission correlation retains the original representation');
+      const replay = await registered.work_call.handler(input);
+      assert.equal(replay.isError, true, 'one permission admission cannot be claimed twice');
+      assert.match(replay.content[0].text, /work_authority_unavailable/);
       yield resultMessage();
     })();
     return Object.assign(generator, {
@@ -133,7 +145,13 @@ test('an explicit large read preview through the registered work_call MCP transp
     }) as Query;
   }) as never);
 
-  await sdk.runClaudeAgentSdk({
+  // The injected SDK invokes the in-process handler directly instead of the
+  // real child transport. Retain the exact accepted source as that transport
+  // does; otherwise the wrapper cannot settle even a successful local read.
+  await withHarnessRunContext({
+    sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: 1,
+    counter: new ToolCallsCounter(20),
+  }, () => sdk.runClaudeAgentSdk({
     prompt: 'Read the alpha source and write every record into a new report.',
     sessionId: task.sessionId,
     sourceUserSeq: task.sourceUserSeq,
@@ -143,7 +161,7 @@ test('an explicit large read preview through the registered work_call MCP transp
     directOrchestrator: false,
     allowedLocalMcpTools: ['mcp_list_tools', 'read_file'],
     localMcpToolUniverse: ['mcp_list_tools', 'read_file'],
-  });
+  }));
 
   assert.equal(permission?.behavior, 'allow');
   const shown = String(admitted?.content?.[0]?.text ?? '');
@@ -159,3 +177,4 @@ test('an explicit large read preview through the registered work_call MCP transp
   assert.match(shown, /recall_tool_result \{"call_id":"toolu-transport-budget-read"\}/,
     'the child\'s own preview, with its recall handle, is what arrives');
 });
+}

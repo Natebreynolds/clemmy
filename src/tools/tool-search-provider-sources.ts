@@ -3127,7 +3127,7 @@ export function buildAuthorizedToolSearchCandidateSources(
   const throughCallTool = (candidate: ToolSearchBrokerCandidate): ToolSearchBrokerCandidate => ({
     ...candidate,
     carrier,
-    guidance: 'Use call_tool with the invocation name and wrapper shown in this result. Fill the selected operation schema; args_json is one JSON object string. Discovery does not authorize execution.',
+    guidance: 'Use call_tool with the invocation name and wrapper shown in this result. Fill the selected operation schema; supply args_json as a JSON object, or a legacy JSON object string. Preserve the shown wrapper and its nested arguments. Discovery does not authorize execution.',
   });
   return sources.map(source => ({
     ...source,

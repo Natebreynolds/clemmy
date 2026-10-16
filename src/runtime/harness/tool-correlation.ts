@@ -17,7 +17,10 @@ function normalizedCorrelationInput(value: unknown): unknown {
   }
   if (Array.isArray(value)) return value.map(normalizedCorrelationInput);
   if (!value || typeof value !== 'object') return value;
-  const normalized: Record<string, unknown> = {};
+  // JSON keys are data. A normal object's __proto__ setter would otherwise
+  // erase that own key from the permission fingerprint while execution still
+  // receives it, allowing distinct documents to share one correlation key.
+  const normalized: Record<string, unknown> = Object.create(null);
   for (const key of Object.keys(value as Record<string, unknown>).sort()) {
     const child = (value as Record<string, unknown>)[key];
     // Strict MCP wrappers materialize omitted optional fields as null. They are

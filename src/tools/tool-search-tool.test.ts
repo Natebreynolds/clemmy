@@ -319,7 +319,7 @@ test('native write disclosures expose their exact host effect and direct carrier
     assert.equal(row.example.tool, 'work_call');
     assert.equal(row.example.args.name, name);
     assert.equal(row.example.args.requirement_id, row.capabilityRef);
-    assert.deepEqual(JSON.parse(row.example.args.args_json), { '<argument>': '<value>' });
+    assert.deepEqual(row.example.args.args_json, { '<argument>': '<value>' });
     assert.deepEqual(row.invocation, { name, payloadField: null });
     assert.ok(body.schemas[name]);
     assert.doesNotMatch(body.hint, /args_json is ONE JSON string of.*tool_slug/);
@@ -331,7 +331,7 @@ test('provider invocation examples retain their explicit adapter wrapper', async
   const example = renderCarrierInvocationExample('work_call', {
     name: 'provider_executor', fixedArgs: { tool_slug: 'EXAMPLE_CREATE' }, payloadField: 'arguments',
   }, 'cap:example:create');
-  assert.deepEqual(JSON.parse(example.args.args_json), {
+  assert.deepEqual(example.args.args_json, {
     tool_slug: 'EXAMPLE_CREATE', arguments: { '<argument>': '<value>' },
   });
   assert.equal(example.args.requirement_id, 'cap:example:create');

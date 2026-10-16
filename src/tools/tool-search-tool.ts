@@ -477,14 +477,14 @@ export function renderCarrierInvocationExample(
     source_call_ids?: null;
     source_record_ids?: null;
     name: string;
-    args_json: string;
+    args_json: Record<string, unknown>;
   };
 } {
   const payloadField = invocation.payloadField ?? 'arguments';
   const inner = invocation.payloadField === null
     ? { ...(invocation.fixedArgs ?? {}), '<argument>': '<value>' }
     : { ...(invocation.fixedArgs ?? {}), [payloadField]: { '<argument>': '<value>' } };
-  const base = { name: invocation.name, args_json: JSON.stringify(inner) };
+  const base = { name: invocation.name, args_json: inner };
   // Direct tool-edge nomination is keyed by the opaque capability ref that
   // tool_search just disclosed. Keeping that ref beside the literal carrier
   // example prevents a second, contradictory grammar in
@@ -2007,7 +2007,7 @@ export function registerToolSearchTool(
         if (exactCarrier) return dispatchHint(exactCarrier) + handleReadingGuidance(hasSchemaHandles);
         if (opts.dispatchCarrierForName) {
           return 'Each result includes its required carrier. Invoke control/recovery results with call_tool(name, args_json); invoke business results as the inner name/args_json of work_call. Never send a business result through call_tool. '
-            + 'Copy each result\'s invocation example and fill its exact schema: native operations take their arguments directly, while provider adapters may require the wrapper shown in that row. args_json is one JSON string; do not serialize a nested arguments object a second time. For each independent proposal-free write, keep example.requirement_id equal to that result\'s exact capabilityRef, never role_key; the tool edge owns allow/deny/ask. If a graph is already frozen, use its exact open operation id instead. When planning, copy the disclosed effect exactly.' + handleReadingGuidance(hasSchemaHandles);
+            + 'Copy each result\'s invocation example and fill its exact schema: native operations take their arguments directly, while provider adapters may require the wrapper shown in that row. Supply args_json as a JSON object; a legacy JSON object string is also accepted. Preserve the shown wrapper and its nested arguments object. For each independent proposal-free write, keep example.requirement_id equal to that result\'s exact capabilityRef, never role_key; the tool edge owns allow/deny/ask. If a graph is already frozen, use its exact open operation id instead. When planning, copy the disclosed effect exactly.' + handleReadingGuidance(hasSchemaHandles);
         }
         const fixedCarrier = opts.dispatchCarrier
           ?? (opts.dispatchViaCallTool ? 'call_tool' : null);

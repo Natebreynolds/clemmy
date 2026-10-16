@@ -1108,7 +1108,12 @@ export function proveHostLocalWorkspaceDerivation(input: {
     let workspaceArgs: Record<string, unknown>;
     try {
       carrier = JSON.parse(call.arguments) as Record<string, unknown>;
-      workspaceArgs = JSON.parse(String(carrier.args_json ?? '')) as Record<string, unknown>;
+      // The accepted frame keeps the model's original transport spelling.
+      // Object-valued args_json and its JSON text name the same document;
+      // read either without rewriting the immutable admitted frame.
+      workspaceArgs = (typeof carrier.args_json === 'string'
+        ? JSON.parse(carrier.args_json)
+        : carrier.args_json) as Record<string, unknown>;
     } catch {
       return unavailable('compound Workspace authoring arguments are unreadable');
     }

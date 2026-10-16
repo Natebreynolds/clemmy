@@ -9,16 +9,17 @@ const { renderCarrierInvocationExample } = await import('./tool-search-tool.js')
 test('every disclosed business result carries a literal example call with only the action arguments left to fill', () => {
   const example = renderCarrierInvocationExample('work_call', {
     name: 'composio_execute_tool',
-    fixedArgs: { tool_slug: 'SLACK_FETCH_CONVERSATION_HISTORY' },
+    fixedArgs: { tool_slug: 'SLACK_FETCH_CONVERSATION_HISTORY', connected_account_id: 'account-fixture' },
     payloadField: 'arguments',
   });
   assert.equal(example.tool, 'work_call');
   assert.equal(example.args.name, 'composio_execute_tool');
-  assert.deepEqual(JSON.parse(example.args.args_json), {
+  assert.deepEqual(example.args.args_json, {
     tool_slug: 'SLACK_FETCH_CONVERSATION_HISTORY',
+    connected_account_id: 'account-fixture',
     arguments: { '<argument>': '<value>' },
   });
-  assert.equal(typeof example.args.args_json, 'string', 'exactly one level of string encoding');
+  assert.equal(typeof example.args.args_json, 'object', 'the example uses native JSON without string encoding');
 });
 
 test('an exact business capability keeps its direct tool-edge binding inside the literal example', () => {
@@ -35,10 +36,10 @@ test('an exact business capability keeps its direct tool-edge binding inside the
       source_call_ids: null,
       source_record_ids: null,
       name: 'composio_execute_tool',
-      args_json: JSON.stringify({
+      args_json: {
         tool_slug: 'GOOGLESHEETS_UPDATE_VALUES_BATCH',
         arguments: { '<argument>': '<value>' },
-      }),
+      },
     },
   });
 });
@@ -100,6 +101,19 @@ test('call_tool and undisclosed work_call examples never invent a requirement bi
   assert.equal(undisclosed.args.requirement_id, undefined);
 });
 
+test('native examples keep direct input fields while preserving the exact callable and capability', () => {
+  const capabilityRef = 'cap:local:fixture_native:ordinary';
+  const example = renderCarrierInvocationExample('work_call', {
+    name: 'fixture_native', fixedArgs: { name: 'a target data field', account: 'account-fixture' }, payloadField: null,
+  }, capabilityRef);
+  assert.equal(example.args.name, 'fixture_native');
+  assert.equal(example.args.requirement_id, capabilityRef);
+  assert.deepEqual(example.args.args_json, {
+    name: 'a target data field', account: 'account-fixture', '<argument>': '<value>',
+  });
+  assert.equal(example.args.args_json.arguments, undefined, 'native input is not placed in a provider wrapper');
+});
+
 test('a write whose account review is still running is callable by its operation, with no ref to copy', async () => {
   const { registerToolSearchTool } = await import('./tool-search-tool.js');
   const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
@@ -153,7 +167,7 @@ test('a write whose account review is still running is callable by its operation
   assert.match(row?.accountCheck ?? '', /can be called now/);
   assert.equal(row?.example?.tool, 'work_call');
   assert.equal(row?.example?.args.requirement_id, 'cap:resolved:crm_update_record');
-  assert.deepEqual(JSON.parse(String(row?.example?.args.args_json)), {
+  assert.deepEqual(row?.example?.args.args_json, {
     tool_slug: 'CRM_UPDATE_RECORD',
     arguments: { '<argument>': '<value>' },
   });
