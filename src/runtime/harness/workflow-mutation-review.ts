@@ -15,6 +15,11 @@ export type WorkflowMutationReview = {
    * an error). A caller must not send the model to "reconcile" evidence the
    * reviewer never weighed. */
   checkerFailure?: 'timeout' | 'invalid' | 'error';
+  /** On a conflict the reviewer could fix by changing values alone: the
+   * complete proposed arguments with exactly its corrections applied. The
+   * model resubmits them and they are reviewed again; a model that cannot
+   * rewrite a whole message correctly can still send a corrected one. */
+  correctedArguments?: Record<string, unknown>;
 };
 export interface WorkflowMutationReviewInput {
   sessionId: string;
@@ -43,7 +48,8 @@ const SYSTEM = [
   'compatible means this exact proposed write respects the applicable saved constraints. conflict means it contradicts them.',
   'uncertain means required facts are missing or ambiguous. Never resolve uncertainty by assuming a safe destination or unchanged contents.',
   'Name every conflict and every missing piece of evidence you can see in this one answer, each as a specific correction or the exact read that would settle it. A corrected write is reviewed once more, not again for what could have been said now.',
-  'Return JSON with verdict (compatible, conflict, uncertain), reason (specific correction or missing evidence), and the supplied proposalDigest exactly.',
+  'When the verdict is conflict and every correction is a change to the proposed values themselves (no missing read), also return correctedArguments: the complete proposed arguments with exactly those corrections applied and nothing else changed, same fields and shape. Otherwise return correctedArguments as null.',
+  'Return JSON with verdict (compatible, conflict, uncertain), reason (specific correction or missing evidence), correctedArguments, and the supplied proposalDigest exactly.',
 ].join(' ');
 
 const PROVENANCE_MIN_CHARS = 6;
@@ -83,7 +89,37 @@ export function valueProvenance(args: unknown, evidence: JudgeEvidenceSource | u
   return out;
 }
 
-export function parseWorkflowMutationReview(value: unknown, expectedDigest: string): WorkflowMutationReview | null {
+/** Corrected arguments stay small enough to reach the model whole. */
+const CORRECTED_ARGUMENTS_MAX_CHARS = 6_000;
+
+function correctedArgumentsOf(
+  value: unknown,
+  original: Record<string, unknown> | undefined,
+  schema: unknown,
+): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const corrected = value as Record<string, unknown>;
+  let text = '';
+  try { text = JSON.stringify(corrected); } catch { return undefined; }
+  if (!text || text.length > CORRECTED_ARGUMENTS_MAX_CHARS) return undefined;
+  // Only fields the call already had or its schema declares: a correction
+  // changes values, it does not invent new inputs.
+  const properties = schema && typeof schema === 'object' && !Array.isArray(schema)
+    ? (schema as { properties?: unknown }).properties : undefined;
+  const allowed = new Set([
+    ...Object.keys(original ?? {}),
+    ...(properties && typeof properties === 'object' ? Object.keys(properties as Record<string, unknown>) : []),
+  ]);
+  if (Object.keys(corrected).some((key) => !allowed.has(key))) return undefined;
+  if (original && JSON.stringify(original) === text) return undefined;
+  return corrected;
+}
+
+export function parseWorkflowMutationReview(
+  value: unknown,
+  expectedDigest: string,
+  proposal?: { args?: Record<string, unknown>; schema?: unknown },
+): WorkflowMutationReview | null {
   let parsed: unknown = value;
   if (typeof parsed === 'string') {
     try { parsed = JSON.parse(parsed); } catch { return null; }
@@ -92,7 +128,15 @@ export function parseWorkflowMutationReview(value: unknown, expectedDigest: stri
   const row = parsed as Record<string, unknown>;
   if (typeof row.verdict !== 'string' || !['compatible', 'conflict', 'uncertain'].includes(row.verdict)
     || row.proposalDigest !== expectedDigest || typeof row.reason !== 'string' || !row.reason.trim()) return null;
-  return { verdict: row.verdict as WorkflowMutationReview['verdict'], reason: row.reason.trim(), proposalDigest: expectedDigest };
+  const correctedArguments = row.verdict === 'conflict'
+    ? correctedArgumentsOf(row.correctedArguments, proposal?.args, proposal?.schema)
+    : undefined;
+  return {
+    verdict: row.verdict as WorkflowMutationReview['verdict'],
+    reason: row.reason.trim(),
+    proposalDigest: expectedDigest,
+    ...(correctedArguments ? { correctedArguments } : {}),
+  };
 }
 
 /** A semantic constraint check, never a grant. Callers still require exact
@@ -180,7 +224,7 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   // circles until its clock ran out. A timed-out review is retried once as a
   // plain read of the proposal, and a checker that still cannot answer says so.
   const judge = deps.judge ?? runHedgedJudge;
-  const parse = (output: unknown) => parseWorkflowMutationReview(output, proposalDigest);
+  const parse = (output: unknown) => parseWorkflowMutationReview(output, proposalDigest, { args: input.args, schema: input.schema });
   const pass = (value: WorkflowMutationReview) => value.verdict === 'compatible';
   let failure: WorkflowMutationReview['checkerFailure'] = 'error';
   // Depth by stakes. Live 2026-09-30: every proposed write of one workflow

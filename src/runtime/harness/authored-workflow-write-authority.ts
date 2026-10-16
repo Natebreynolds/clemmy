@@ -950,8 +950,14 @@ async function reviewAuthoredWriteConstraints(input: {
       return { status: 'hold', retryable: true, reason: `workflow_write_checker_unavailable: ${result.reason}` };
     }
     constraintRefusalRounds.set(roundsKey, { count: (rounds?.count ?? 0) + 1, lastReason: result.reason });
+    // The reviewer's own corrected arguments, when it could make the fix by
+    // changing values alone: resubmitting them exactly is a repair any model
+    // can make, and the resubmission is reviewed again before it runs.
+    const corrected = result.verdict === 'conflict' && result.correctedArguments
+      ? ` Resubmit this same call with exactly these corrected arguments, which apply the corrections above and change nothing else: ${JSON.stringify(result.correctedArguments)}`
+      : '';
     return result.verdict === 'conflict'
-      ? { status: 'repair', retryable: true, reason: `workflow_write_constraint_conflict: ${result.reason}` }
+      ? { status: 'repair', retryable: true, reason: `workflow_write_constraint_conflict: ${result.reason}${corrected}` }
       : { status: 'hold', retryable: true, reason: `workflow_write_constraints_unverified: ${result.reason}` };
   } catch {
     return { status: 'hold', retryable: true, reason: 'workflow_write_constraints_unavailable' };
