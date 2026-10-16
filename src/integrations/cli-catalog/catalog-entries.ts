@@ -1,0 +1,572 @@
+/** The curated CLI catalog as plain data: entry types, declared reviewed reads
+ * and repairs, and the entries themselves. Storage-free so a physical
+ * transport artifact can read it without reaching the connected-CLI state or
+ * the event log; catalog.ts re-exports it with the stateful helpers. */
+
+/**
+ * Curated catalog of installable CLIs that Clementine knows how to:
+ *   1. install in one click (via the existing approved-install runner)
+ *   2. point the user at the right auth flow afterward
+ *   3. surface to the agent as a "connected" CLI (vs random $PATH noise)
+ *
+ * The UI is search-first — entries here aren't displayed in a grid. The
+ * user types "salesforce", "railway", etc., and we filter against name +
+ * command + vendor + tags. This file is the only place the catalog lives;
+ * adding a new entry here is the entire change.
+ *
+ * Adding rules of thumb:
+ *   - Install commands MUST match the allowlist in
+ *     integrations/browser-harness.validateInstallCommand. Today that
+ *     means npm/brew/uv/pipx/git-clone forms.
+ *   - Provide an `installFallback` only if the primary form isn't
+ *     universally available (e.g. brew-only formulae get a curl fallback
+ *     in the doc text, not as a run-it command).
+ *   - Auth flow is best linked, not scripted — `authDocsUrl` is required.
+ *     `authCommand` is optional and only useful when there's a clean
+ *     one-liner like `gh auth login`.
+ */
+
+export type CliInstallSource = 'npm' | 'brew' | 'uv' | 'pipx';
+
+/**
+ * Read-only auth-state probe for a catalog CLI. By contract the probe
+ * command must be a pure status read (whoami/status/list shapes) — the
+ * catalog test pins that no probe carries a mutating verb. Output is
+ * ANSI-stripped before classification (netlify colors its status output).
+ *
+ * Classification order (auth-health.ts): signedOutPattern match →
+ * signed_out; exit 0 with output → ok; otherwise → error. The pattern is
+ * checked FIRST because some CLIs report signed-out states with exit 0
+ * (verified live: `gcloud auth list --filter=status:ACTIVE` prints `[]`
+ * and exits 0 with no active account).
+ */
+export interface CliAuthProbe {
+  /** argv appended to the entry's command, e.g. ['whoami']. */
+  args: string[];
+  /** Regex source (case-insensitive) marking a signed-out result. */
+  signedOutPattern?: string;
+  /** Regex source whose first capture group extracts the account name. */
+  usernameCapture?: string;
+  /** Public HTTPS origin field in JSON stdout. Only this exact field is projected; never the full auth document. */
+  connectionOriginPath?: readonly string[];
+  /** Probe timeout; default 5s in auth-health. */
+  timeoutMs?: number;
+  /** Known failures that are not evidence the user is signed out. */
+  failurePatterns?: Array<{ pattern: string; kind: 'credential_store_unavailable' | 'configuration_required' }>;
+}
+
+export interface CliCatalogEntry {
+  /** Stable id used by the UI + connected-clis record. kebab-case. */
+  id: string;
+  /** Display name. */
+  name: string;
+  /** Bare command the user would run. Used for $PATH lookup. */
+  command: string;
+  /** Vendor / company so the user can recognize it. */
+  vendor: string;
+  /** Short pitch — one sentence. */
+  description: string;
+  /** Search aliases. Include nicknames, abbreviations, common typos. */
+  tags: string[];
+  /** Install command, must match the install allowlist. */
+  installCommand: string;
+  installSource: CliInstallSource;
+  /** Docs URL the "Configure" button opens. Required. */
+  authDocsUrl: string;
+  /** Optional auth-bootstrap command shown post-install. */
+  authCommand?: string;
+  /** Optional project / product homepage shown on the card. */
+  homepage?: string;
+  /** Optional read-only auth-state probe. Absent → auth status 'unknown'. */
+  authProbe?: CliAuthProbe;
+  /**
+   * True ONLY when authCommand completes without TTY input (opens a
+   * browser / device-code flow and waits on a localhost callback). Gates
+   * the one-click Sign in job — a wrong `true` means a hung job, so this
+   * is set per-entry only after the flow is verified by hand. Entries
+   * whose login prompts in the terminal (aws configure, gcloud init,
+   * vercel's method picker, stripe's press-Enter pairing) stay absent.
+   */
+  authHeadless?: boolean;
+  /**
+   * Closed reviewed-read contract. Presence means a human reviewed this
+   * exact argv prefix and structured arguments in source control. The
+   * harness provisioner may install it only for a currently connected
+   * catalog row; PATH discovery never becomes authority.
+   */
+  reviewedRead?: CatalogReviewedReadV1;
+  /**
+   * Further reviewed reads for the same executable, reviewed on the same
+   * terms. A CLI's own diagnosis (which accounts it holds, which is the
+   * default) is a read like any other: without it the model cannot tell an
+   * unauthenticated tool from an authenticated one that was never made the
+   * default, and it has to ask the user to run commands for it.
+   */
+  reviewedReads?: readonly CatalogReviewedReadV1[];
+  /** Bounded local repairs this CLI can perform on its own configuration. */
+  repairs?: readonly CatalogCliRepairV1[];
+}
+
+/** Host-reviewed CLI read. Bytes must match ReviewedCliArgumentV1 exactly. */
+export interface CatalogReviewedReadV1 {
+  descriptorId: string;
+  operationId: string;
+  displayName: string;
+  description: string;
+  argvPrefix: readonly string[];
+  arguments: readonly {
+    name: string;
+    kind: 'option' | 'positional' | 'switch';
+    token: string | null;
+    valueType: 'string' | 'number' | 'integer' | 'boolean';
+    required: boolean;
+  }[];
+  limits: {
+    timeoutMs: number;
+    maxStdoutBytes: number;
+    maxStderrBytes: number;
+    maxArgumentBytes: number;
+  };
+}
+
+/**
+ * A bounded, reviewed repair a CLI can perform on its own local configuration.
+ *
+ * The failure this exists for is generic: a tool is authenticated but has no
+ * default account, project, org or app selected, so every command fails and
+ * the model has to tell the user "I cannot run commands to fix this." A repair
+ * is declared here, in source, exactly like a reviewed read: a fixed argv with
+ * named substitutions, no shell, no free-form arguments. It changes only the
+ * tool's own local configuration, so it is preparation rather than an external
+ * effect, and a planning turn may run it.
+ */
+export interface CatalogCliRepairV1 {
+  /** Stable id, unique within the catalog. */
+  id: string;
+  /** One line the model and the user both read before it runs. */
+  title: string;
+  description: string;
+  /**
+   * Exact argv after the executable. A token of the form `{name}` is replaced
+   * by that named argument's value; every other token is literal.
+   */
+  argv: readonly string[];
+  arguments: readonly {
+    name: string;
+    description: string;
+    required: boolean;
+  }[];
+  /** Operation id of the reviewed read that shows whether the repair is needed. */
+  diagnosis?: string;
+  /**
+   * Case-insensitive substrings of a failure that this repair addresses. A
+   * failing call that matches names this repair as its next step.
+   */
+  failureSignals: readonly string[];
+  limits: { timeoutMs: number; maxStdoutBytes: number; maxStderrBytes: number };
+}
+
+/**
+ * Curated entries. Order doesn't matter — search ranks by relevance.
+ * Keep this list deliberately small and well-tested rather than chasing
+ * coverage; better to ship 15 reliable links than 50 broken ones.
+ */
+/** The declared repair this exact call names, or null. Pure catalog data: the
+ *  harness uses it to admit a bounded local repair without knowing any tool. */
+export function declaredCliRepair(catalogId: unknown, repairId: unknown): {
+  entry: CliCatalogEntry; repair: CatalogCliRepairV1;
+} | null {
+  const id = typeof catalogId === 'string' ? catalogId.trim().toLowerCase() : '';
+  const repairId_ = typeof repairId === 'string' ? repairId.trim() : '';
+  if (!id || !repairId_) return null;
+  const entry = CLI_CATALOG.find((candidate) => candidate.id === id);
+  const repair = entry?.repairs?.find((candidate) => candidate.id === repairId_);
+  return entry && repair ? { entry, repair } : null;
+}
+
+/** Repairs whose declared failure signals appear in this failure text. */
+export function declaredCliRepairsForFailure(catalogId: string, failure: string): readonly CatalogCliRepairV1[] {
+  const entry = CLI_CATALOG.find((candidate) => candidate.id === catalogId.trim().toLowerCase());
+  const haystack = failure.toLowerCase();
+  return Object.freeze((entry?.repairs ?? []).filter((repair) => (
+    repair.failureSignals.some((signal) => haystack.includes(signal.trim().toLowerCase()))
+  )));
+}
+
+/** The exact argv for a declared repair, or the reason it cannot be built.
+ *  Values are substituted into `{name}` tokens only, and every value must be a
+ *  single plain argument — no shell, no separators, no expansion. */
+export function resolveDeclaredCliRepairArgv(
+  repair: CatalogCliRepairV1,
+  values: Record<string, unknown>,
+): { ok: true; argv: string[] } | { ok: false; error: string } {
+  const resolved: Record<string, string> = {};
+  for (const argument of repair.arguments) {
+    const raw = values[argument.name];
+    if (raw === undefined || raw === null || String(raw).trim() === '') {
+      if (argument.required) return { ok: false, error: `"${argument.name}" is required: ${argument.description}` };
+      continue;
+    }
+    const value = String(raw).trim();
+    if (!/^[A-Za-z0-9._@:+\/-]{1,200}$/.test(value)) {
+      return { ok: false, error: `"${argument.name}" must be one plain value (letters, digits and . _ @ : + / -).` };
+    }
+    resolved[argument.name] = value;
+  }
+  const argv: string[] = [];
+  for (const token of repair.argv) {
+    const substituted = token.replace(/\{([A-Za-z0-9_]+)\}/g, (_match, name: string) => resolved[name] ?? '\u0000');
+    if (substituted.includes('\u0000')) return { ok: false, error: `the repair needs a value for "${token}"` };
+    argv.push(substituted);
+  }
+  return { ok: true, argv };
+}
+
+/** Every reviewed read a catalog entry declares, primary first. */
+export function catalogReviewedReadsOf(entry: CliCatalogEntry): readonly CatalogReviewedReadV1[] {
+  return Object.freeze([
+    ...(entry.reviewedRead ? [entry.reviewedRead] : []),
+    ...(entry.reviewedReads ?? []),
+  ]);
+}
+
+export const CLI_CATALOG: readonly CliCatalogEntry[] = [
+  {
+    id: 'salesforce',
+    name: 'Salesforce CLI',
+    command: 'sf',
+    vendor: 'Salesforce',
+    description: 'Manage Salesforce orgs, deploy metadata, run SOQL, and automate Apex.',
+    tags: ['salesforce', 'sf', 'sfdx', 'crm', 'apex', 'soql'],
+    installCommand: 'npm install -g @salesforce/cli',
+    installSource: 'npm',
+    authDocsUrl: 'https://developer.salesforce.com/docs/atlas.en-us.sfdx_setup.meta/sfdx_setup/sfdx_setup_auth_intro.htm',
+    authCommand: 'sf org login web -a default',
+    homepage: 'https://developer.salesforce.com/tools/salesforcecli',
+    // Default-org only. `sf org list` would classify a second inactive org
+    // as signed-out even when the default org is Connected.
+    authProbe: {
+      args: ['org', 'display', '--json'],
+      failurePatterns: [
+        { pattern: 'SecKeychain|keychain.*(?:locked|incorrect|not correct)|user name or passphrase you entered is not correct', kind: 'credential_store_unavailable' },
+        { pattern: 'NoDefault(?:Env|OrgFound)Error|no default (?:environment|org)', kind: 'configuration_required' },
+      ],
+      signedOutPattern: 'No default org found|NoAuthInfoFound|no default org|Not authenticated|No org found|unable to refresh session',
+      usernameCapture: '"username"\\s*:\\s*"([^"]+)"',
+      connectionOriginPath: ['result', 'instanceUrl'],
+      timeoutMs: 15_000,
+    },
+    reviewedRead: {
+      descriptorId: 'salesforce.data.query',
+      operationId: 'salesforce_sf_soql_query',
+      displayName: 'Salesforce CLI SOQL query',
+      description: 'Read-only SOQL via the local Salesforce sf CLI (sf data query --json). Query Salesforce opportunities, accounts, contacts, leads, and deals. If it fails because no default org is set, read salesforce_sf_org_list and fix it with cli_setup {action:"repairs", catalogId:"salesforce"} — never report that you cannot run the command.',
+      argvPrefix: ['data', 'query', '--json'],
+      arguments: [
+        { name: 'query', kind: 'option', token: '--query', valueType: 'string', required: true },
+        { name: 'target_org', kind: 'option', token: '--target-org', valueType: 'string', required: false },
+      ],
+      limits: {
+        timeoutMs: 60_000,
+        maxStdoutBytes: 1_048_576,
+        maxStderrBytes: 65_536,
+        maxArgumentBytes: 32_768,
+      },
+    },
+    repairs: [
+      {
+        id: 'salesforce.default-org',
+        title: 'Set the default Salesforce org',
+        description: 'Point the Salesforce CLI at one of its authenticated orgs, so commands that do not name an org stop failing (sf config set target-org=<org> --global).',
+        argv: ['config', 'set', 'target-org={org}', '--global'],
+        arguments: [
+          { name: 'org', description: 'Username or alias of an authenticated org, exactly as the org list reports it.', required: true },
+        ],
+        diagnosis: 'salesforce_sf_org_list',
+        failureSignals: [
+          'NoDefaultEnvError',
+          'No default environment',
+          'No default org',
+          'no default org',
+        ],
+        limits: { timeoutMs: 30_000, maxStdoutBytes: 65_536, maxStderrBytes: 65_536 },
+      },
+    ],
+    reviewedReads: [
+      {
+        descriptorId: 'salesforce.org.list',
+        operationId: 'salesforce_sf_org_list',
+        displayName: 'Salesforce CLI org list',
+        description: 'List the Salesforce orgs this machine is authenticated to (sf org list --json): each org\'s username, alias, connection status, and which one is the default target-org. Read this before reporting a Salesforce CLI authentication problem.',
+        argvPrefix: ['org', 'list', '--json'],
+        arguments: [],
+        limits: {
+          timeoutMs: 30_000,
+          maxStdoutBytes: 262_144,
+          maxStderrBytes: 65_536,
+          maxArgumentBytes: 1_024,
+        },
+      },
+    ],
+  },
+  {
+    id: 'higgsfield',
+    name: 'Higgsfield CLI',
+    command: 'higgsfield',
+    vendor: 'Higgsfield',
+    description: 'Run Higgsfield image, video, and Marketing Studio generative workflows from the terminal.',
+    tags: ['higgsfield', 'higgs', 'hf', 'video', 'image', 'generative', 'ai', 'marketing studio', 'soul-id', 'product-photoshoot'],
+    installCommand: 'npm install -g @higgsfield/cli',
+    installSource: 'npm',
+    authDocsUrl: 'https://higgsfield.ai/cli',
+    // Note: subcommand `auth login`, not bare `login` (verified against
+    // higgsfield 0.1.33). Surfaces as the post-install bootstrap step
+    // so the user knows the exact handshake command.
+    authCommand: 'higgsfield auth login',
+    homepage: 'https://higgsfield.ai',
+  },
+  {
+    id: 'railway',
+    name: 'Railway CLI',
+    command: 'railway',
+    vendor: 'Railway',
+    description: 'Deploy services, manage environments, and tail logs on Railway.',
+    tags: ['railway', 'deploy', 'paas'],
+    installCommand: 'npm install -g @railway/cli',
+    installSource: 'npm',
+    authDocsUrl: 'https://docs.railway.com/guides/cli',
+    authCommand: 'railway login',
+    // Verified live: exit 0 + "Logged in as user@host 👋"; signed out
+    // reports "Unauthorized. Please login with `railway login`".
+    authProbe: { args: ['whoami'], signedOutPattern: 'unauthorized|not logged in', usernameCapture: 'Logged in as (\\S+)' },
+    // `railway login` opens the browser and waits on a callback — no TTY
+    // input. Job runner enforces a hard timeout as the safety net.
+    authHeadless: true,
+    homepage: 'https://railway.com',
+  },
+  {
+    id: 'vercel',
+    name: 'Vercel CLI',
+    command: 'vercel',
+    vendor: 'Vercel',
+    description: 'Deploy front-end and edge functions to Vercel, manage projects + domains.',
+    tags: ['vercel', 'deploy', 'next.js', 'nextjs', 'edge'],
+    installCommand: 'npm install -g vercel',
+    installSource: 'npm',
+    authDocsUrl: 'https://vercel.com/docs/cli',
+    authCommand: 'vercel login',
+    homepage: 'https://vercel.com',
+  },
+  {
+    id: 'supabase',
+    name: 'Supabase CLI',
+    command: 'supabase',
+    vendor: 'Supabase',
+    description: 'Local dev + migrations + Edge Functions for Supabase projects.',
+    tags: ['supabase', 'postgres', 'database', 'edge functions'],
+    installCommand: 'brew install supabase/tap/supabase',
+    installSource: 'brew',
+    authDocsUrl: 'https://supabase.com/docs/guides/local-development/cli/getting-started',
+    authCommand: 'supabase login',
+    homepage: 'https://supabase.com',
+  },
+  {
+    id: 'github',
+    name: 'GitHub CLI',
+    command: 'gh',
+    vendor: 'GitHub',
+    description: 'Work with PRs, issues, releases, and Actions from the terminal.',
+    tags: ['github', 'gh', 'git', 'pr', 'pull request'],
+    installCommand: 'brew install gh',
+    installSource: 'brew',
+    authDocsUrl: 'https://docs.github.com/en/github-cli/github-cli/quickstart',
+    authCommand: 'gh auth login',
+    homepage: 'https://cli.github.com',
+  },
+  {
+    id: 'aws',
+    name: 'AWS CLI',
+    command: 'aws',
+    vendor: 'Amazon Web Services',
+    description: 'Manage every AWS service from S3 to IAM to Lambda.',
+    tags: ['aws', 'amazon', 's3', 'iam', 'lambda', 'ec2'],
+    installCommand: 'brew install awscli',
+    installSource: 'brew',
+    authDocsUrl: 'https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-quickstart.html',
+    authCommand: 'aws configure',
+    homepage: 'https://aws.amazon.com/cli/',
+  },
+  {
+    id: 'gcloud',
+    name: 'Google Cloud CLI',
+    command: 'gcloud',
+    vendor: 'Google Cloud',
+    description: 'Manage GCP projects, services, and resources.',
+    tags: ['gcloud', 'gcp', 'google cloud', 'firebase'],
+    installCommand: 'brew install --cask google-cloud-sdk',
+    installSource: 'brew',
+    authDocsUrl: 'https://cloud.google.com/sdk/docs/initializing',
+    authCommand: 'gcloud init',
+    // Verified live: active account as a JSON array; with NO active
+    // account it prints `[]` and still exits 0 — the pattern carries the
+    // signed-out truth, not the exit code.
+    authProbe: { args: ['auth', 'list', '--format=json', '--filter=status:ACTIVE'], signedOutPattern: '^\\s*\\[\\s*\\]\\s*$', usernameCapture: '"account":\\s*"([^"]+)"', timeoutMs: 10_000 },
+    homepage: 'https://cloud.google.com/sdk',
+  },
+  {
+    id: 'heroku',
+    name: 'Heroku CLI (manual)',
+    // Note: Heroku is intentionally omitted from auto-install because
+    // the canonical brew form is `brew tap heroku/brew && brew install
+    // heroku`, which is a two-step command our installer allowlist
+    // rejects. Listed here so search finds it, but installCommand
+    // points the user at the docs rather than running a broken cmd.
+    command: 'heroku',
+    vendor: 'Heroku',
+    description: 'Manage Heroku apps, dynos, addons, and releases. Install via the linked docs.',
+    tags: ['heroku', 'paas', 'deploy'],
+    installCommand: 'brew install heroku',
+    installSource: 'brew',
+    authDocsUrl: 'https://devcenter.heroku.com/articles/heroku-cli',
+    authCommand: 'heroku login',
+    homepage: 'https://devcenter.heroku.com/articles/heroku-cli',
+  },
+  {
+    id: 'stripe',
+    name: 'Stripe CLI',
+    command: 'stripe',
+    vendor: 'Stripe',
+    description: 'Trigger events, tail webhook logs, manage products and prices.',
+    tags: ['stripe', 'payments', 'webhooks'],
+    installCommand: 'brew install stripe/stripe-cli/stripe',
+    installSource: 'brew',
+    authDocsUrl: 'https://docs.stripe.com/stripe-cli',
+    authCommand: 'stripe login',
+    homepage: 'https://stripe.com/docs/stripe-cli',
+  },
+  {
+    id: 'wrangler',
+    name: 'Cloudflare Wrangler',
+    command: 'wrangler',
+    vendor: 'Cloudflare',
+    description: 'Build, deploy, and tail Workers; manage Pages, KV, R2, D1.',
+    tags: ['cloudflare', 'wrangler', 'workers', 'pages', 'kv', 'r2', 'd1'],
+    installCommand: 'npm install -g wrangler',
+    installSource: 'npm',
+    authDocsUrl: 'https://developers.cloudflare.com/workers/wrangler/get-started/',
+    authCommand: 'wrangler login',
+    homepage: 'https://developers.cloudflare.com/workers/',
+  },
+  {
+    id: 'flyio',
+    name: 'Fly.io CLI',
+    command: 'flyctl',
+    vendor: 'Fly.io',
+    description: 'Deploy apps globally on Fly.io machines.',
+    tags: ['fly', 'flyio', 'fly.io', 'flyctl', 'deploy'],
+    installCommand: 'brew install flyctl',
+    installSource: 'brew',
+    authDocsUrl: 'https://fly.io/docs/flyctl/auth-login/',
+    authCommand: 'flyctl auth login',
+    homepage: 'https://fly.io',
+  },
+  {
+    id: 'netlify',
+    name: 'Netlify CLI',
+    command: 'netlify',
+    vendor: 'Netlify',
+    description: 'Deploy sites, run local dev, manage Netlify Functions.',
+    tags: ['netlify', 'jamstack', 'deploy'],
+    installCommand: 'npm install -g netlify-cli',
+    installSource: 'npm',
+    authDocsUrl: 'https://docs.netlify.com/cli/get-started/',
+    authCommand: 'netlify login',
+    // Verified live: exit 0 with a "Current Netlify User" block (ANSI
+    // colored — auth-health strips escapes) even outside a linked
+    // project; signed out prints "Not logged in".
+    authProbe: { args: ['status'], signedOutPattern: 'not logged in', usernameCapture: 'Email:\\s*(\\S+)', timeoutMs: 10_000 },
+    authHeadless: true,
+    homepage: 'https://www.netlify.com',
+  },
+  {
+    id: 'doppler',
+    name: 'Doppler CLI',
+    command: 'doppler',
+    vendor: 'Doppler',
+    description: 'Sync secrets across environments without checking them into source.',
+    tags: ['doppler', 'secrets', 'env'],
+    installCommand: 'brew install dopplerhq/cli/doppler',
+    installSource: 'brew',
+    authDocsUrl: 'https://docs.doppler.com/docs/install-cli',
+    authCommand: 'doppler login',
+    homepage: 'https://www.doppler.com',
+  },
+  {
+    id: 'ngrok',
+    name: 'ngrok',
+    command: 'ngrok',
+    vendor: 'ngrok',
+    description: 'Expose local servers to the public internet via secure tunnels.',
+    tags: ['ngrok', 'tunnel', 'webhook'],
+    installCommand: 'brew install ngrok/ngrok/ngrok',
+    installSource: 'brew',
+    authDocsUrl: 'https://ngrok.com/docs/getting-started/',
+    authCommand: 'ngrok config add-authtoken <your-token>',
+    homepage: 'https://ngrok.com',
+  },
+  {
+    id: 'doctl',
+    name: 'DigitalOcean CLI',
+    command: 'doctl',
+    vendor: 'DigitalOcean',
+    description: 'Manage Droplets, Apps, Kubernetes, and Spaces on DigitalOcean.',
+    tags: ['digitalocean', 'doctl', 'do'],
+    installCommand: 'brew install doctl',
+    installSource: 'brew',
+    authDocsUrl: 'https://docs.digitalocean.com/reference/doctl/how-to/install/',
+    authCommand: 'doctl auth init',
+    homepage: 'https://www.digitalocean.com/products/tools',
+  },
+  // Guest agent harnesses — these two are what project_run drives inside the
+  // user's local projects. They cannot ship bundled with the app (Claude Code
+  // is proprietary; both self-update and carry per-user subscription auth),
+  // so install-on-demand through this catalog IS the distribution story.
+  {
+    id: 'claude-code',
+    name: 'Claude Code',
+    command: 'claude',
+    vendor: 'Anthropic',
+    description: 'Anthropic’s coding agent — runs your projects’ slash commands and skills on your Claude subscription.',
+    tags: ['claude', 'claude code', 'anthropic', 'agent', 'harness', 'coding'],
+    installCommand: 'npm install -g @anthropic-ai/claude-code',
+    installSource: 'npm',
+    authDocsUrl: 'https://docs.anthropic.com/en/docs/claude-code/setup',
+    authCommand: 'claude auth login',
+    // Verified live (claude 2.1.220): `claude auth status` exits 0 with JSON
+    // {"loggedIn":true,...,"email":"..."}. Signed-out shape not exercised
+    // (would require logging the user out) — pattern targets the documented
+    // loggedIn:false field, and pattern-first classification covers an
+    // exit-0 signed-out report, same trap class as gcloud.
+    authProbe: { args: ['auth', 'status'], signedOutPattern: '"loggedIn"\\s*:\\s*false', usernameCapture: '"email"\\s*:\\s*"([^"]+)"' },
+    homepage: 'https://www.anthropic.com/claude-code',
+  },
+  {
+    id: 'codex',
+    name: 'Codex CLI',
+    command: 'codex',
+    vendor: 'OpenAI',
+    description: 'OpenAI’s coding agent — works in your projects on your ChatGPT subscription.',
+    tags: ['codex', 'openai', 'chatgpt', 'agent', 'harness', 'coding'],
+    installCommand: 'npm install -g @openai/codex',
+    installSource: 'npm',
+    authDocsUrl: 'https://developers.openai.com/codex/cli',
+    authCommand: 'codex login',
+    // Verified live (codex-cli 0.144.3): `codex login status` exits 0 with
+    // "Logged in using ChatGPT". Signed-out shape not exercised — the CLI
+    // reports "Not logged in" per its own docs/help.
+    authProbe: { args: ['login', 'status'], signedOutPattern: 'not logged in', usernameCapture: 'Logged in using (\\S+)' },
+    homepage: 'https://developers.openai.com/codex',
+  },
+];
+
+// ─── Search ─────────────────────────────────────────────────────────

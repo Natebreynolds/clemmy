@@ -21,7 +21,7 @@ import {
 import path from 'node:path';
 
 import { BASE_DIR } from '../../config.js';
-import { CLI_CATALOG, catalogReviewedReadsOf } from '../../integrations/cli-catalog/catalog.js';
+import { CLI_CATALOG, catalogReviewedReadsOf } from '../../integrations/cli-catalog/catalog-entries.js';
 import { cliHealthExecutableIdentity } from '../../integrations/cli-catalog/cli-executable-identity.js';
 import { readConnectedCliExecutableSelection, reviewedCliExecutablePathIsSupported, reviewedCliExecutableFileIsSupported }
   from '../../integrations/cli-catalog/connected-cli-executable-selection.js';
