@@ -96,7 +96,8 @@ test('manual refresh keeps approved runner and CLI declarations zero-process', a
 
   const cliResult = await runner.refreshSpaceData(cliSlug, cliSource.id, { cause: 'manual' });
   assert.equal(cliResult[0]?.ok, false);
-  assert.match(cliResult[0]?.error ?? '', /no shared durable call authority|Nothing has executed/i);
+  // An unreviewed command is refused as a direct source before it starts.
+  assert.match(cliResult[0]?.error ?? '', /no shared durable call authority|Nothing has executed|The process was not started/i);
   assert.equal(existsSync(cliMarker), false);
 });
 

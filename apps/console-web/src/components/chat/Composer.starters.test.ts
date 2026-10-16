@@ -61,6 +61,8 @@ function mount(initial = fresh(), supplied: Record<string, any> = {}) {
     '@/lib/cn': { cn: (...values: any[]) => values.filter(Boolean).join(' ') },
     '@/lib/composer-drafts': drafts, '@/lib/artifact-discussion': artifact,
     '@/lib/project-tools-draft': project, '@/lib/connection-setup-draft': connections, '@/lib/composer-examples': examples,
+    // A stylesheet import carries no behavior.
+    './composer.css': {},
   };
   const source = readFileSync(new URL('./Composer.tsx', import.meta.url), 'utf8');
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX } }).outputText;

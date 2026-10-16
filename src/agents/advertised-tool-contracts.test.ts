@@ -72,7 +72,9 @@ test('session_search advertises its call contract; paging, coverage and authorit
 
 test('the proposal-free work_call states its call contract; planning policy stays with its one owner', () => {
   // 4,427 -> 2,969 B.
-  const tool = withinCeiling(wireOf([buildWorkCall({ requireHostPlan: true })]).get('work_call'), 'work_call', 3_050);
+  // 3,050 → 3,070 (2026-10-16): args_json accepts the target's JSON object as
+  // well as JSON text, and the invocation shape says so; call contract only.
+  const tool = withinCeiling(wireOf([buildWorkCall({ requireHostPlan: true })]).get('work_call'), 'work_call', 3_070);
   assert.match(tool.description, /consent and dispatch boundary/);
   assert.match(tool.description, /plan_task/, 'a pre-plan carrier names where graph work goes');
   assert.match(tool.description, /plan_step_result/);

@@ -62,7 +62,9 @@ test('a notice is the app’s status line with its action, and pills carry what 
   assert.match(chat, /const notice = terminalNoticeLine\(t\);/);
   assert.match(chat, /terminalStatusPill\(t, \{ wordless: !turnText\.showReply \}\)/);
   assert.match(chat, /retainedOutsideChange\(t\)/);
-  assert.match(chat, /if \(cardDecisionNoticeOnly\(message\)\) return null;/);
+  // A decided card keeps its decision on the card; it no longer vanishes.
+  assert.doesNotMatch(chat, /cardDecisionNoticeOnly\(message\)\) return null/);
+  assert.match(chat, /message\.approval\.resolution === 'approved' \? 'Approved' : 'Declined'/);
   assert.match(chat, /onAnswer\(NOTICE_ACTION_LABEL\.try_again\)/);
   assert.match(chat, /onChangeModel=\{\(\) => setConversationPanel\('model'\)\}/);
   assert.doesNotMatch(chat, /'Stopped here — your work is kept'/, 'the hand-written typed pills are gone');

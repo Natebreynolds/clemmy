@@ -45,17 +45,21 @@ function modelRequest(input: ModelRequest['input'] = []): ModelRequest {
   } as unknown as ModelRequest;
 }
 
-test('buildCodexRequestBody keys EVERY call by its prompt role', () => {
+test('buildCodexRequestBody keys EVERY call by its prompt role, and a conversation by its own id', () => {
   // An unkeyed call is never routed to a warm node, so every call carries a
   // key, inside a run context or not.
   const outside = buildCodexRequestBody('gpt-5.5', modelRequest([{ role: 'user', content: 'hi' }]));
   assert.match(String(outside.prompt_cache_key), /^clem:[0-9a-f]{12}$/);
 
+  // Inside a conversation the key adds the conversation's own id, as the
+  // service's own client does: a conversation's growing history caches only
+  // on the node that keeps it.
   const inside = harnessRunContextStorage.run({ sessionId: 'sess-abc' } as never, () =>
     buildCodexRequestBody('gpt-5.5', modelRequest([{ role: 'user', content: 'hi' }])),
   );
-  assert.equal(inside.prompt_cache_key, outside.prompt_cache_key,
-    'the key follows the prompt, not the conversation: a new session starts on the warm node');
+  assert.match(String(inside.prompt_cache_key), /^clem:[0-9a-f]{12}:[0-9a-f]{16}$/);
+  assert.ok(String(inside.prompt_cache_key).startsWith(`${outside.prompt_cache_key}:`),
+    'the role part is the same; the conversation part is appended');
 });
 
 test('prompt roles shard apart; one role keeps its key as its tool list grows', () => {
@@ -84,8 +88,9 @@ test('prompt roles shard apart; one role keeps its key as its tool list grows', 
   const firstFrame = run('AGENT ONE RUBRIC', [tool('tool_search')]);
   const laterFrame = run('AGENT ONE RUBRIC', [tool('tool_search'), tool('work_call')]);
   assert.equal(laterFrame.prompt_cache_key, firstFrame.prompt_cache_key);
-  assert.equal(run('AGENT ONE RUBRIC', [], 'another-session').prompt_cache_key, a.prompt_cache_key,
-    'another conversation of the same role shares the node');
+  const other = String(run('AGENT ONE RUBRIC', [], 'another-session').prompt_cache_key);
+  assert.notEqual(other, a.prompt_cache_key, 'another conversation of the same role keeps its own key');
+  assert.equal(other.split(':')[1], String(a.prompt_cache_key).split(':')[1], 'with the same role part');
 });
 
 function requestWithInstructions(systemInstructions: string, input: ModelRequest['input'] = [{ role: 'user', content: 'hi' }]): ModelRequest {

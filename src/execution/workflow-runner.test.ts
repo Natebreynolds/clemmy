@@ -2204,7 +2204,7 @@ test('pre-start missing-input workflow failure is recorded in Activity runs', as
     enabled: true,
     trigger: { manual: true },
     inputs: { url: { description: 'Target URL' } },
-    steps: [{ id: 'fetch', prompt: 'Fetch {{input.url}}' }],
+    steps: [{ id: 'fetch', prompt: 'Fetch {{input.url}}', sideEffect: 'read' }],
   });
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
@@ -2278,10 +2278,12 @@ test('fresh workflow run records a sanitized graph snapshot event', async () => 
       {
         id: 'pull',
         prompt: 'Return the first fixture value.',
+        sideEffect: 'read',
       },
       {
         id: 'summarize',
         prompt: 'Return the dependent fixture value.',
+        sideEffect: 'read',
         dependsOn: ['pull'],
       },
     ],
@@ -2345,6 +2347,7 @@ test('fresh workflow run records ready batch metadata for parallel scheduler lan
     steps: Array.from({ length: 6 }, (_, index) => ({
       id: `root_${index + 1}`,
       prompt: `Return fixture value ${index + 1}.`,
+      sideEffect: 'read',
     })),
   });
 
@@ -7308,9 +7311,9 @@ test('workflow watcher: drift at a step boundary records a steer advisory with t
     enabled: true,
     trigger: { manual: true },
     steps: [
-      { id: 'a', prompt: 'Return fixture A.' },
-      { id: 'b', prompt: 'Return fixture B.', dependsOn: ['a'] },
-      { id: 'c', prompt: 'Return fixture C.', dependsOn: ['b'] },
+      { id: 'a', prompt: 'Return fixture A.', sideEffect: 'read' },
+      { id: 'b', prompt: 'Return fixture B.', sideEffect: 'read', dependsOn: ['a'] },
+      { id: 'c', prompt: 'Return fixture C.', sideEffect: 'read', dependsOn: ['b'] },
     ],
   });
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });

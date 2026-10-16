@@ -967,11 +967,21 @@ test('explicit checkpoint clipping of a nested projected result survives the nex
       layer1RetainTurns: 1,
     });
     assert.ok(compacted.result.beforeTokens > 6_000);
-    assert.ok(compacted.result.beforeTokens < 1_000_000 * 0.3, 'the explicit checkpoint, not token pressure, triggers clipping');
-    assert.equal(compacted.result.layer1.clipped, 1);
+    assert.ok(compacted.result.beforeTokens < 1_000_000 * 0.3, 'the explicit checkpoint, not token pressure, triggers compaction');
+    // Recall of this call returns the INNER tool's raw bytes, not what the
+    // model saw, so the session's own compaction keeps the projection
+    // verbatim: a clip must lead back to the bytes it replaced.
+    assert.equal(compacted.result.layer1.clipped, 0, 'a result whose recall returns another tool\'s bytes is not clipped');
     assert.equal(compacted.result.layer2.applied, false);
     assert.equal(compacted.result.layer2.error, 'summarizer unavailable');
     nextItems = compacted.nextItems;
+    // A canonical stub for it is still bound to the immutable receipt, never
+    // to recall bytes: clip it outside the session and prove the receipt holds.
+    assert.equal(compaction.clipOldToolResults(nextItems, 1, {}), 1);
+    eventlog.appendEvent({
+      sessionId: task.sessionId, turn: 0, role: 'system', type: 'condenser_applied',
+      data: { layer1: { applied: true, clipped: 1, collapsedToolPairs: 0 } },
+    });
     session.updateConversationSnapshot(nextItems);
   } finally {
     compaction._setCompactionSummarizerForTests(null);

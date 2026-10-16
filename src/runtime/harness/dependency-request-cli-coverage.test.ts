@@ -1,6 +1,9 @@
 /** Run: node scripts/run-tests-isolated.mjs src/runtime/harness/dependency-request-cli-coverage.test.ts
  *
- * CLI metadata must not satisfy an exact provider operation/account gap.
+ * A signed-out CLI never satisfies an exact provider gap. A CLI whose sign-in
+ * was confirmed in its latest check reaches its app, so the host never asks
+ * the owner to connect that app (owner, 2026-10-16: with gh signed in, Clem
+ * uses it and never asks to connect GitHub).
  */
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -80,14 +83,45 @@ recordConnectedCli(CLI_CATALOG.find((entry) => entry.id === 'github')!);
 
 after(() => { eventlog.closeEventLog(); rmSync(HOME, { recursive: true, force: true }); });
 
-for (const status of ['ok', 'signed_out'] as const) test(`a ${status} same-vendor CLI remains a candidate without satisfying the exact dependency`, () => {
+function searchFoundNoGithubConnection(sessionId: string, parent: number, callId: string): void {
+  const query = 'site repository on GitHub';
+  const output = JSON.stringify({ query, brokerCoverage: 'authorized_external_v1', results: [], unavailable: [{
+    source: 'authorized_composio', code: 'no_connections', dependencySubject: {
+      version: 1, kind: 'exact_capability_connection', source: 'authorized_composio', query,
+      toolkit: 'github', capability: 'GITHUB_GET_A_REPOSITORY', capabilityRef: 'cap:resolved:github_get_a_repository',
+    },
+  }] });
+  eventlog.writeToolOutput({ sessionId, callId, tool: 'tool_search', output });
+  eventlog.appendEvent({ sessionId, turn: 1, role: 'tool', type: 'tool_returned',
+    data: { sourceUserSeq: parent, tool: 'tool_search', callId, accounting: 'top_level', topologyRole: 'control', result: output } });
+}
+
+test('a signed-in same-vendor CLI reaches its app: a search that found no connection asks the owner nothing', () => {
+  health('ok');
+  const sessionId = 'sess-cli-reaches-provider-ok';
+  eventlog.createSession({ id: sessionId, kind: 'chat', userId: 'user' });
+  const parent = eventlog.appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Build a Space for the site and its repository.' },
+  }).seq;
+  const candidates = connectedCliCandidatesForApp('github');
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.authentication.state, 'confirmed');
+  searchFoundNoGithubConnection(sessionId, parent, 'search-ok');
+  assert.equal(dependencies.observedConnectionDependencyPresentationForSource({ sessionId, sourceUserSeq: parent }) ?? null, null,
+    'the connection question is never put to the owner');
+  assert.equal(dependencies.parkObservedConnectionDependencyForSource({ sessionId, sourceUserSeq: parent, turn: 1 }) ?? null, null,
+    'nothing is parked');
+});
+
+for (const status of ['signed_out'] as const) test(`a ${status} same-vendor CLI remains a candidate without satisfying the exact dependency`, () => {
   health(status);
   const sessionId = `sess-cli-does-not-prove-provider-${status}`;
   const parent = parkedConnectionQuestion(sessionId);
   const before = continuity.peekTaskContinuityPacket({ sessionId });
   const candidates = connectedCliCandidatesForApp('github');
   assert.equal(candidates.length, 1);
-  assert.equal(candidates[0]?.authentication.state, status === 'ok' ? 'confirmed' : 'signed_out');
+  assert.equal(candidates[0]?.authentication.state, 'signed_out');
   assert.equal(candidates[0]?.operationReadiness, 'unverified');
   assert.equal(candidates[0]?.intendedAccount, 'unverified');
   const query = 'site repository on GitHub';

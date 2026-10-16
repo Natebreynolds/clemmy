@@ -365,8 +365,8 @@ test('a tool reached for during a turn joins the tools block at the owner\'s nex
   const opening = await buildFor(sessionId, first.seq, TARGETED, idleModel);
   const names = (agent: unknown) => agentTools(agent).map((entry) => entry.name);
   assert.equal(names(opening).includes('view_image'), false, 'the fixture tool is not on the opening surface');
-  // The turn reaches for it (through the dispatcher), then restarts.
-  hotset.recordToolHit(sessionId, 'view_image');
+  // The turn reaches for it (through the dispatcher) and it works, then restarts.
+  hotset.recordToolHit(sessionId, 'view_image', first.seq);
   const restarted = await buildFor(sessionId, first.seq, TARGETED, idleModel);
   assert.equal(toolsBytes(restarted), toolsBytes(opening), 'the same turn re-sends its exact tools block');
   // The owner's next message promotes it.
@@ -393,7 +393,7 @@ test('a tool reached for joins later when the cached conversation is large and w
   const first = routed();
   const opening = await buildFor(sessionId, first.seq, TARGETED, idleModel);
   assert.equal(names(opening).includes('view_image'), false);
-  hotset.recordToolHit(sessionId, 'view_image');
+  hotset.recordToolHit(sessionId, 'view_image', first.seq);
   reading(first.seq, 64_000, sent(opening));
   const second = routed();
   const held = await buildFor(sessionId, second.seq, TARGETED, idleModel);
@@ -402,6 +402,9 @@ test('a tool reached for joins later when the cached conversation is large and w
   const scope = eventlog.listEvents(sessionId, { sinceSeq: second.seq, types: ['tool_search_scope'] }).at(-1);
   assert.deepEqual((scope?.data as { heldPromotions?: string[] }).heldPromotions, ['view_image']);
   assert.ok(names(held).includes('call_tool'), 'the held tool stays reachable through call_tool');
+  // It is used again through call_tool and works; only a tool that worked in
+  // this request or the one before it is carried.
+  hotset.recordToolHit(sessionId, 'view_image', second.seq);
   // A later request is small (the conversation was compacted): it joins.
   reading(second.seq, 9_000, sent(held));
   const third = routed();

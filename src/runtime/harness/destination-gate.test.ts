@@ -461,7 +461,6 @@ test('classifyShellNetworkMutation: commands that run on another machine are sen
   // reached a production service through the shell with no card.
   for (const cmd of [
     "railway ssh --service vertical-sales 'node scripts/backup.js'",
-    'railway link --project vertical-sales --environment production --service vertical-sales',
     'railway up', 'railway redeploy --service api',
     'ssh deploy@prod.example.com "systemctl restart api"', 'ssh prod ./rotate.sh',
     'fly deploy', 'flyctl ssh console', 'heroku run rake db:migrate', 'kubectl exec -it web -- sh',
@@ -469,6 +468,9 @@ test('classifyShellNetworkMutation: commands that run on another machine are sen
   ]) assert.equal(classifyShellNetworkMutation(cmd).isNetworkMutation, true, `should flag: ${cmd}`);
   for (const cmd of [
     'railway status', 'railway logs --service api', 'railway service', 'railway --version', 'railway link --help',
+    // Pointing a local folder at a project writes only local config; what it
+    // then runs (ssh, up, run) is still a send. Live 2026-10-16.
+    'railway link --project vertical-sales --environment production --service vertical-sales', 'railway unlink',
     'ssh -V', 'fly status', 'heroku logs --tail', 'kubectl get pods', 'gcloud config list', 'aws s3 ls s3://bucket',
   ]) assert.equal(classifyShellNetworkMutation(cmd).isNetworkMutation, false, `should pass: ${cmd}`);
   assert.equal(classifyShellNetworkMutation("railway ssh --service api 'uptime'").shapeKey, 'shell:railway');

@@ -57,7 +57,8 @@ test('an agent pinned to a model: the chip names it on every composer, and a pic
     'a pending agent switch lands before the pick, so the pick is the later choice');
   assert.match(read('../../lib/model-roles.ts'), /invalidateQueries\(\{ queryKey: \['answering-model'\] \}\)/,
     'a pick re-reads what answers next');
-  assert.match(read('./Composer.tsx'), /<ModelPicker sessionId=\{sessionId\} agentId=\{agentId\} applyAgent=\{applyAgent\} \/>/);
+  // Layout props may follow; the session, agent and apply wiring is the pin.
+  assert.match(read('./Composer.tsx'), /<ModelPicker sessionId=\{sessionId\} agentId=\{agentId\} applyAgent=\{applyAgent\}(?: className="[^"]*")? \/>/);
   for (const site of ['../../features/conversations/chat/ConversationThread.tsx', '../../screens/Chat.tsx', '../../screens/Home.tsx', '../../screens/AgentWorkspace.tsx']) {
     assert.match(read(site), /agentId=\{/, `${site} tells the chip which agent answers`);
   }
