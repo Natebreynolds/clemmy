@@ -1,4 +1,5 @@
 import { observeHeldStopPublicationOwner, sealHeldStopPublication, drainHeldStopPublication, drainHeldStopPublications, heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_TEXT, HeldStopPublicationSupersededError, type HeldStopPublicationTicket } from './held-stop-publication.js';
+import { isPermanentActivationError } from './permanent-activation-error.js';
 import { priorTerminalDeliveryResumes } from './terminal-delivery-resume-ledger.js';
 import { approvalCardAsk } from './approval-card-voice.js';
 import { MODEL_REFUSED_BLOCKED_REASON, refusedModelPublicText, refusedRequestedModel } from './model-refusal.js';
@@ -3984,6 +3985,13 @@ export interface RunConversationOptions {
    * changes the pre-history digest the accepted-batch chain verifies and every
    * later admission is refused. Carry any directive as `continuationSteer`. */
   hostOwnedContinuation?: true;
+  /**
+   * The caller re-drives a held turn through its own owner. Its options carry
+   * callbacks bound to that owner's lease, which the caller releases when the
+   * activation returns, so the in-process checkpoint recovery must never adopt
+   * them; the held checkpoint stays for the caller's next claim.
+   */
+  callerOwnsRecovery?: true;
   /** Runtime-authored accepted source (for example a proactive outcome
    * directive). Suppresses automatic memory on the first physical turn too. */
   suppressMemoryCapture?: true;
@@ -6477,6 +6485,9 @@ function scheduleHostCheckpointRecovery(
   thrown = 0,
 ): void {
   if (options.runRunner !== undefined) return;
+  // The caller's own owner re-drives this source; its lease-bound callbacks
+  // must not outlive the activation that released them.
+  if (options.callerOwnsRecovery) return;
   const key = `${options.sessionId}:${sourceUserSeq}`;
   if (scheduledHostRecoveries.has(key)) return;
   const delayMs = Math.min(30_000, 250 * (2 ** Math.min(attempt, 7)));
@@ -6541,6 +6552,8 @@ function scheduleHostCheckpointRecovery(
         try {
           if (isKillRequested(options.sessionId, { sourceUserSeq })) { stopped = true; retry = false; failed = false; }
         } catch { /* an unreadable latch is not a stop */ }
+        // Ownership, source or evidence that is gone does not come back.
+        if (retry && isPermanentActivationError(error)) { retry = false; gaveUp = true; }
         // An activation that cannot even start keeps failing the same way;
         // re-trying it forever spends a model call each time and answers no one.
         if (retry && thrown + 1 >= MAX_THROWN_RECOVERY_ACTIVATIONS) { retry = false; gaveUp = true; }
@@ -7282,7 +7295,10 @@ async function runConversationWithinRuntimeConfig(
         } catch { /* Observing an await cannot change preparation or execution. */ }
       };
       let provenOperationText: string | undefined;
-      if (!hostPlainConversation && !isUnattendedSession(options.sessionId)) {
+      // A continuation resumes an accepted request whose tools are rebuilt
+      // from its own checkpoint; choosing proven operations again is a model
+      // call that changes nothing it will use.
+      if (!hostPlainConversation && !isUnattendedSession(options.sessionId) && !options.hostOwnedContinuation) {
         const started = performance.now();
         let ended: number | undefined;
         let outcome: 'selected' | 'empty' | 'error' = 'error';

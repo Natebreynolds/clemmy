@@ -340,6 +340,103 @@ test('a person\'s stop wins over the recovery timer: the held turn ends stopped 
   assert.equal(eventlog.isKillRequested(session.id), false, 'the stop latch is consumed');
 });
 
+async function heldTurnFixture(id: string, extra: Record<string, unknown> = {}) {
+  const session = eventlog.createSession({ id, kind: 'chat' });
+  const callId = `${id}-read`;
+  let bodies = 0;
+  const configuredTool = brackets.wrapToolForHarness({
+    type: 'function',
+    name: 'task_list',
+    description: 'Return one exact local task record.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    needsApproval: async () => false,
+    invoke: async () => {
+      bodies += 1;
+      return { records: [{ id: 'task-1', title: 'Owned recovery' }] };
+    },
+  });
+  const finalReply = 'I found the task and finished.';
+  const model = recordingModel([
+    [functionCall(callId, 'task_list', {})],
+    [textMessage(JSON.stringify({ summary: finalReply, reply: finalReply, done: true, nextAction: 'completed', reason: null }))],
+  ]);
+  const agent = { model, instructions: 'Use the exact configured tool.', tools: [configuredTool] };
+  bindSurface(session.id, agent, [configuredTool]);
+  const db = eventlog.openEventLog();
+  db.exec(`
+    CREATE TEMP TRIGGER reject_${id.replace(/-/g, '_')}_receipt
+    BEFORE INSERT ON logical_model_result_projection_receipts
+    WHEN NEW.session_id = '${session.id}' AND NEW.call_id = '${callId}'
+    BEGIN
+      SELECT RAISE(ABORT, 'fixture projection receipt unavailable');
+    END
+  `);
+  const options = {
+    sessionId: session.id,
+    input: 'List the one exact local task and report it back.',
+    turnEngine: 'host_v1' as const,
+    judgeCompletion: false,
+    makeRunner: () => throwingRunner() as never,
+    maxTurns: 4,
+    maxSteps: 2,
+    suppressMemoryCapture: true as const,
+    ...extra,
+  };
+  let held: Awaited<ReturnType<typeof runConversation>>;
+  try {
+    const surface = typeof extra.makeBuildAgent === 'function'
+      ? { buildAgent: (extra.makeBuildAgent as (agent: unknown) => unknown)(agent) }
+      : { agent };
+    const { makeBuildAgent: _omit, ...rest } = options as typeof options & { makeBuildAgent?: unknown };
+    held = await runConversation({ ...surface, ...rest } as never);
+  } finally {
+    db.exec(`DROP TRIGGER IF EXISTS reject_${id.replace(/-/g, '_')}_receipt`);
+  }
+  return { session, agent, model, held, options, finalReply, bodies: () => bodies };
+}
+
+test('a held turn whose caller owns recovery is never re-activated by the in-process timer; the caller\'s re-drive finishes it once', async () => {
+  const fixture = await heldTurnFixture('host-checkpoint-caller-owned', { callerOwnsRecovery: true });
+  assert.equal(fixture.held.status, 'held', JSON.stringify(fixture.held));
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.equal(fixture.model.calls(), 1, 'no timer re-activated the lease-bound options');
+  assert.ok(HarnessSession.load(fixture.session.id)?.loadRecoveryState(), 'the checkpoint stays for the caller');
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 0);
+
+  // The caller re-drives with fresh ownership.
+  const redriven = await runConversation({ agent: fixture.agent as never, ...fixture.options,
+    sourceUserSeq: eventlog.listEvents(fixture.session.id, { types: ['user_input_received'] })[0]!.seq,
+    reuseRecordedUserInput: true } as never);
+  assert.notEqual(redriven.status, 'held', JSON.stringify(redriven));
+  assert.equal(fixture.bodies(), 1, 'the settled read is never repeated');
+  assert.equal(fixture.model.calls(), 2);
+  const terminals = eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1, 'one terminal result');
+  assert.equal(terminals[0]?.data.reply, fixture.finalReply);
+});
+
+test('a recovery that meets a permanent activation failure stops at once and publishes one stop', async () => {
+  const { PermanentActivationError } = await import('./permanent-activation-error.js');
+  let builds = 0;
+  // The first activation owns its surface; every later one finds its owner gone.
+  const fixture = await heldTurnFixture('host-checkpoint-permanent-failure', {
+    makeBuildAgent: (agent: unknown) => async () => {
+      builds += 1;
+      if (builds > 1) throw new PermanentActivationError('owner gone');
+      return agent;
+    },
+  });
+  assert.equal(fixture.held.status, 'held', JSON.stringify(fixture.held));
+  await waitFor(
+    () => HarnessSession.load(fixture.session.id)?.loadRecoveryState() === null
+      && eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length === 1,
+    'the permanent failure to end the held turn with one stop',
+  );
+  assert.equal(fixture.model.calls(), 1, 'no model continuation after the permanent failure');
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(builds, 2, 'the permanent failure is met once and never retried');
+});
+
 test('a real focus_set stays host-only through production host_v1 and reaches the next model once', async () => {
   const session = eventlog.createSession({
     id: 'host-only-focus-set-lifecycle',

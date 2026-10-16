@@ -2,6 +2,7 @@ import { appendEvent, getRunAttemptBySourceUserSeq, listEvents } from '../runtim
 import { publicUserInputText } from '../runtime/harness/public-presentation.js';
 import { recoverAcceptedModelBatchForRestart } from '../runtime/harness/accepted-model-batch-checkpoint.js';
 import { withWorkflowParentActivation } from '../runtime/harness/workflow-parent-activation.js';
+import { PermanentActivationError } from '../runtime/harness/permanent-activation-error.js';
 import { boundAgentCapabilityEnvelope } from '../agents/capability-envelope.js';
 import type { RunConversationOptions, RunConversationResult } from '../runtime/harness/loop.js';
 import type { WorkflowOriginTerminalInput } from './workflow-origin-terminal.js';
@@ -34,7 +35,7 @@ export async function driveWorkflowParentContinuation(
   let lost = false;
   const assertOwned = () => {
     if (lost || !readOwnedWorkflowParentContinuation(lease, input, reply)) {
-      throw new Error('workflow parent continuation no longer owns its original source and evidence');
+      throw new PermanentActivationError('workflow parent continuation no longer owns its original source and evidence');
     }
   };
   const renew = setInterval(() => {
@@ -54,6 +55,10 @@ export async function driveWorkflowParentContinuation(
       sessionId: lease.sessionId, sourceUserSeq: lease.sourceUserSeq,
       runAttemptId: lease.attemptId, input: userInput, reuseRecordedUserInput: true,
       hostOwnedContinuation: true, suppressMemoryCapture: true,
+      // This driver re-claims and re-drives a held parent itself (the
+      // report-back retries a pending one); its buildAgent is bound to the
+      // lease released below and must not outlive this activation.
+      callerOwnsRecovery: true,
       mcpToolScope: checkpoint.mcpToolScope,
       continuationSteer: [
         'The workflows dispatched by this accepted request have finished. Continue the remaining requested work using their settled results; do not repeat their execution.',
@@ -85,7 +90,7 @@ export async function driveWorkflowParentContinuation(
         return agent;
       },
     };
-    await withWorkflowParentActivation({ ...lease, assertOwned,
+    const result = await withWorkflowParentActivation({ ...lease, assertOwned,
       completionEvidence: () => {
         const current = readOwnedWorkflowParentContinuation(lease, input, reply);
         if (!current) throw new Error('workflow completion evidence lost its exact parent owner');
@@ -97,9 +102,11 @@ export async function driveWorkflowParentContinuation(
         updatedAt: new Date().toISOString() },
     }, async () => {
       const activate = options.activate ?? (await import('../runtime/harness/loop.js')).runConversation;
-      await activate(runOptions);
+      return activate(runOptions);
     });
-    return 'activated';
+    // A parent that is held again keeps its checkpoint for the next claim,
+    // made with fresh ownership when the report-back retries.
+    return result?.status === 'held' ? 'pending' : 'activated';
   } catch (error) {
     appendEvent({ sessionId: lease.sessionId, turn: sourceTurn(input), role: 'system',
       type: 'restart_recovery_decision', data: { sourceUserSeq: lease.sourceUserSeq,
