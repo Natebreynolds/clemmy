@@ -8,8 +8,9 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
 import { createHash } from 'node:crypto';
@@ -34,6 +35,7 @@ const {
 } = await import('./mobile-routes.js');
 const { _clearIdempotencyForTests } = await import('../runtime/idempotency.js');
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('../runtime/harness/public-presentation.js');
+const { publicApprovalDecisionAck } = await import('../runtime/harness/approval-decision-ack.js');
 const { _setBridgeImplsForTests } = await import('../runtime/harness/respond-bridge.js');
 const { setPin } = await import('../runtime/mobile-pin.js');
 const { createMobilePairingCode } = await import('../runtime/mobile-pairing.js');
@@ -1267,6 +1269,10 @@ test('live mobile exact approvals preserve the executor through approve, reject,
       data: { text: 'Prepare the account report.', displayText: 'Prepare the account report.' } }, { armRunInFlight: true });
     const first = approvalRegistry.register({ sessionId: session.id, tool: 'request_approval', subject: 'First exact action' });
     const second = approvalRegistry.register({ sessionId: session.id, tool: 'request_approval', subject: 'Second exact action' });
+    for (const card of [first, second]) appendEvent({ sessionId: session.id, turn: originalSource.turn,
+      role: 'Clem', type: 'approval_requested', data: {
+        approvalId: card.approvalId, tool: card.tool, args: card.args, sourceUserSeq: originalSource.seq,
+      } });
     const unrelated = approvalRegistry.register({ sessionId: createHarnessSession({ kind: 'chat' }).id,
       tool: 'request_approval', subject: 'Unrelated session action' });
     const wakeProof: boolean[] = [];
@@ -1297,7 +1303,16 @@ test('live mobile exact approvals preserve the executor through approve, reject,
     assert.equal(approved.status, 200);
     const accepted = await approved.json() as { sessionId: string; runId: string; reply: string };
     assert.equal(accepted.sessionId, session.id);
-    assert.match(accepted.reply, new RegExp(first.approvalId));
+    assert.equal(accepted.reply, 'Approved.');
+    const approvedSource = listEvents(session.id, { types: ['user_input_received'] })
+      .find(event => event.data.runId === accepted.runId)!;
+    assert.equal(approvedSource.data.approvalId, first.approvalId, 'the exact card remains in durable control identity');
+    assert.equal(approvedSource.data.decision, 'approve');
+    const approvedTerminal = listEvents(session.id, { types: ['conversation_completed'] })
+      .find(event => event.data.sourceUserSeq === approvedSource.seq)!;
+    assert.deepEqual(publicApprovalDecisionAck(approvedTerminal), {
+      version: 1, sourceUserSeq: approvedSource.seq, approvalId: first.approvalId, decision: 'approve',
+    }, 'the retained card, accepted source and terminal form one exact decision receipt');
     assert.equal(approvalRegistry.get(first.approvalId)?.resolution, 'approved');
     assert.equal(approvalRegistry.get(second.approvalId)?.status, 'pending');
     assert.equal(approvalRegistry.get(unrelated.approvalId)?.status, 'pending');
@@ -1667,7 +1682,18 @@ test('mobile keeps an exact pending-action owner inert when its session has a ma
     assert.equal(res.status, 200, 'mobile must not enter the SDK resume path');
     const body = await res.json() as { status: string; message?: string };
     assert.equal(body.status, 'resolved-pending-action-approval-only');
-    assert.match(body.message ?? '', /execution (?:is )?not confirmed/i);
+    assert.equal(body.message, 'Approved. I’m still waiting for confirmation that the action ran.');
+    assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, 'approved');
+    const approvedSource = listEvents(session.id, { types: ['user_input_received'] })
+      .find(event => event.data.approvalId === approval.approvalId)!;
+    assert.equal(approvedSource.data.decision, 'approve');
+    const approvedTerminal = listEvents(session.id, { types: ['conversation_completed'] })
+      .find(event => event.data.sourceUserSeq === approvedSource.seq)!;
+    assert.deepEqual((approvedTerminal.data.presentation as { identity: unknown }).identity, {
+      sessionId: session.id, turn: approvedSource.turn, sourceUserSeq: approvedSource.seq,
+    }, 'the uncertainty belongs to the exact source that approved this card');
+    assert.equal((approvedTerminal.data.presentation as { text: string }).text, body.message);
+    assert.equal(approvedTerminal.data.approvalDecisionAck, undefined, 'execution uncertainty stays an ordinary visible reply');
 
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(
@@ -2484,6 +2510,10 @@ test('mobile typed exact approval, cancel, and new controls execute on their bou
       tool: 'request_approval',
       args: { reason: 'Confirm the exact older action.' },
     });
+    // This case starts at an existing card rather than a running human turn.
+    // Retain the actual requested-card surface without inventing a new source.
+    appendEvent({ sessionId: parent.id, turn: 0, role: 'Clem', type: 'approval_requested',
+      data: { approvalId: approval.approvalId, tool: approval.tool, args: approval.args } });
     assert.deepEqual(classifyMobileTypedChatControl(`Approve ${approval.approvalId}`), {
       kind: 'formal_approval',
       decision: 'approve',
@@ -2512,7 +2542,16 @@ test('mobile typed exact approval, cancel, and new controls execute on their bou
     assert.equal(approved.status, 200);
     const approvedBody = await approved.json() as { sessionId: string; runId: string; reply: string };
     assert.equal(approvedBody.sessionId, parent.id);
-    assert.match(approvedBody.reply, new RegExp(approval.approvalId));
+    assert.equal(approvedBody.reply, 'Approved.');
+    const approvedSource = listEvents(parent.id, { types: ['user_input_received'] })
+      .find(event => event.data.runId === approvedBody.runId)!;
+    assert.equal(approvedSource.data.approvalId, approval.approvalId);
+    assert.equal(approvedSource.data.decision, 'approve');
+    const approvedTerminal = listEvents(parent.id, { types: ['conversation_completed'] })
+      .find(event => event.data.sourceUserSeq === approvedSource.seq)!;
+    assert.deepEqual(publicApprovalDecisionAck(approvedTerminal), {
+      version: 1, sourceUserSeq: approvedSource.seq, approvalId: approval.approvalId, decision: 'approve',
+    });
     assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, 'approved');
     const approvalReplay = await send(
       `approve ${approval.approvalId}`,
@@ -5585,6 +5624,122 @@ test('mobile ordinary workflow Run rejoins same-input active and uncertain-write
       .map(name => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, name), 'utf8')))
       .filter(run => run.workflow === slug);
     assert.equal(matching.length, 1, 'same-input replay never installs a sibling write attempt');
+  } finally { await h.close(); }
+});
+
+test('mobile workflow history and lists share light inventory without losing terminal truth or ordering', async (t) => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Workflow history projection fixture');
+    const slug = 'mobile-history-projection';
+    const name = 'Mobile history projection';
+    writeWorkflow(slug, { name, description: 'Controlled history fixture', enabled: true,
+      trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read only fixture.', sideEffect: 'read' }] });
+    mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+    const records = [
+      { id: `${slug}-old`, workflow: name, status: 'completed', createdAt: '2026-10-16T01:00:00.000Z', completedAt: '2026-10-16T01:01:00.000Z' },
+      { id: `${slug}-middle`, workflow: name, status: 'cancelled', createdAt: '2026-10-16T02:00:00.000Z' },
+      { id: `${slug}-new`, workflow: name, status: 'completed_with_errors', createdAt: '2026-10-16T03:00:00.000Z',
+        needsAttention: true, reportBack: { outcome: 'done', detail: 'Large private report.' }, error: 'Controlled partial result' },
+    ];
+    const files = records.map(record => path.join(WORKFLOW_RUNS_DIR, `${record.id}.json`));
+    for (const [i, record] of records.entries()) writeFileSync(files[i], JSON.stringify({ ...record,
+      stepOutputs: { read: 'controlled-heavy-output'.repeat(2_000) }, output: 'not a summary',
+      workflowDefinitionSnapshot: { definition: { private: 'not a summary' } },
+    }));
+    const corrupt = path.join(WORKFLOW_RUNS_DIR, `${slug}-corrupt.json`);
+    writeFileSync(corrupt, '{invalid');
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${slug}-array.json`), '[]');
+    const reads = t.mock.method(fs, 'readFileSync');
+    syncBuiltinESMExports();
+    t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+    const recordReads = () => reads.mock.calls.filter(call => files.includes(String(call.arguments[0]))).length;
+    const getHistory = async () => {
+      const response = await fetch(`${h.url}/m/api/workflows/${slug}/runs`, { headers: { cookie } });
+      assert.equal(response.status, 200);
+      return response.json() as Promise<{ runs: Array<Record<string, unknown>> }>;
+    };
+    const first = await getHistory();
+    assert.deepEqual(first.runs.map(run => run.id), [...records].reverse().map(run => run.id));
+    assert.deepEqual(first.runs.map(run => run.terminalOutcome), ['partial', 'cancelled', 'succeeded']);
+    assert.equal(first.runs[0].needsAttention, true);
+    assert.equal(first.runs[0].error, 'Controlled partial result');
+    assert.equal(first.runs[2].finishedAt, records[0].completedAt, 'legacy completion time is preserved');
+    assert.equal(first.runs[0].stepOutputs, undefined);
+    assert.equal(first.runs[0].output, undefined);
+    assert.equal(first.runs[0].reportBack, undefined);
+    assert.equal(recordReads(), records.length);
+    await getHistory();
+    const list = await fetch(`${h.url}/m/api/workflows`, { headers: { cookie } });
+    const listed = (await list.json() as { workflows: Array<Record<string, unknown>> }).workflows.find(workflow => workflow.name === name)!;
+    assert.equal(listed.lastRunId, records[2].id);
+    assert.equal(listed.lastRunStatus, 'completed_with_errors');
+    assert.equal(listed.lastRunOutcome, 'partial');
+    assert.equal(recordReads(), records.length, 'warm history and list polls do not reparse unchanged heavy runs');
+    writeFileSync(files[2], '{now corrupt');
+    assert.deepEqual((await getHistory()).runs.map(run => run.id), [records[1].id, records[0].id]);
+    writeFileSync(files[2], JSON.stringify({ ...records[2], status: 'error', reportBack: { outcome: 'blocked' } }));
+    assert.equal((await getHistory()).runs[0].terminalOutcome, 'blocked', 'report outcome survives light projection');
+    unlinkSync(files[1]);
+    assert.deepEqual((await getHistory()).runs.map(run => run.id), [records[2].id, records[0].id]);
+  } finally { await h.close(); }
+});
+
+test('mobile viewed-run events check only the selected file and reject another workflow or path identity', async (t) => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Workflow exact event projection fixture');
+    const slug = 'mobile-event-projection';
+    const name = 'Mobile event projection';
+    const runId = `${slug}-selected`;
+    const workflow = writeWorkflow(slug, { name, description: 'Controlled event fixture', enabled: true,
+      trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read only fixture.', sideEffect: 'read' }] });
+    mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+    const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    writeFileSync(file, JSON.stringify({ id: runId, workflow: name, status: 'running', stepOutputs: { read: 'large'.repeat(10_000) } }));
+    for (let i = 0; i < 24; i++) writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${slug}-other-${i}.json`), JSON.stringify({
+      id: `${slug}-other-${i}`, workflow: name, status: 'completed', output: 'unrelated'.repeat(2_000),
+    }));
+    const eventDir = path.join(workflow.dir, 'runs', runId);
+    mkdirSync(eventDir, { recursive: true });
+    const output = { exact: 'Controlled full event output', text: 'event'.repeat(80) };
+    writeFileSync(path.join(eventDir, 'events.jsonl'), JSON.stringify({ t: '2026-10-16T01:00:00.000Z', kind: 'step_completed', stepId: 'read', output }) + '\n');
+    const reads = t.mock.method(fs, 'readFileSync');
+    const stats = t.mock.method(fs, 'statSync');
+    const listings = t.mock.method(fs, 'readdirSync');
+    syncBuiltinESMExports();
+    t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+    const runCalls = (calls: ReadonlyArray<{ arguments: readonly unknown[] }>) => calls.filter(call => typeof call.arguments[0] === 'string'
+      && path.dirname(call.arguments[0]) === WORKFLOW_RUNS_DIR && call.arguments[0].endsWith('.json'));
+    const getEvents = async (id = runId) => {
+      const response = await fetch(`${h.url}/m/api/workflows/${slug}/runs/${encodeURIComponent(id)}/events?full=1`, { headers: { cookie } });
+      assert.equal(response.status, 200);
+      return response.json() as Promise<{ status: string | null; terminalOutcome: string | null; events: Array<{ output?: unknown }> }>;
+    };
+    const first = await getEvents();
+    assert.equal(first.status, 'running');
+    assert.deepEqual(first.events[0].output, output, 'selected event full output remains exact');
+    await getEvents();
+    assert.deepEqual(runCalls(reads.mock.calls).map(call => call.arguments[0]), [file], 'cold plus warm poll reads just the selected run once');
+    assert.equal(runCalls(stats.mock.calls).length, 3, 'cold stable read then warm poll stat only the selected file');
+    assert.ok(runCalls(stats.mock.calls).every(call => call.arguments[0] === file));
+    assert.equal(listings.mock.calls.filter(call => call.arguments[0] === WORKFLOW_RUNS_DIR).length, 0, 'event polling never enumerates run records');
+    const replacement = `${file}.replacement`;
+    writeFileSync(replacement, JSON.stringify({ id: runId, workflow: slug, status: 'completed', terminalOutcome: 'partial' }));
+    renameSync(replacement, file);
+    assert.equal((await getEvents()).terminalOutcome, 'partial', 'slug ownership is accepted and current terminal truth replaces active status');
+    writeFileSync(file, JSON.stringify({ id: runId, workflow: 'another-workflow', status: 'completed' }));
+    assert.equal((await getEvents()).status, null, 'another workflow cannot supply selected status');
+    writeFileSync(file, JSON.stringify({ id: 'wrong-id', workflow: name, status: 'completed' }));
+    assert.equal((await getEvents()).status, null, 'record identity must match the selected filename');
+    writeFileSync(file, '{broken');
+    assert.equal((await getEvents()).status, null, 'corrupt status does not reuse the prior terminal projection');
+    unlinkSync(file);
+    assert.equal((await getEvents()).status, null);
+    const before = runCalls(reads.mock.calls).length;
+    const invalid = await fetch(`${h.url}/m/api/workflows/${slug}/runs/${encodeURIComponent('../foreign')}/events`, { headers: { cookie } });
+    assert.equal(invalid.status, 400);
+    assert.equal(runCalls(reads.mock.calls).length, before, 'invalid paths do not touch run storage');
   } finally { await h.close(); }
 });
 

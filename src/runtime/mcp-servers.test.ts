@@ -151,6 +151,45 @@ test('Windows final MCP environment keeps one uppercase PATH after overrides wit
   assert.equal(blank.PATH, '', 'an explicit empty override does not fall back to an inherited PATH');
 });
 
+test('Windows MCP declared profile and credential casing overrides inherited aliases once', () => {
+  const configured = { name: 'controlled-env-case', type: 'stdio', command: 'controlled-mcp', enabled: true, source: 'user',
+    env: { cli_profile: 'declared-profile', controlled_token: '' } } as ManagedMcpServer;
+  const inherited = { CLI_PROFILE: 'inherited-profile', CONTROLLED_TOKEN: 'old-token', PATH: 'C:\\Inherited' };
+  const env = mcpServersTestHooks.stdioLaunchEnv(configured,
+    { daemon: { controlled_token: 'current-token' }, inherited }, extra => ({ ...inherited, ...extra }), 'win32');
+  assert.equal(env.CLI_PROFILE, 'declared-profile');
+  assert.equal(env.cli_profile, undefined);
+  assert.equal(env.CONTROLLED_TOKEN, 'current-token');
+  assert.equal(env.controlled_token, undefined);
+  assert.deepEqual(Object.keys(env).filter(key => key.toUpperCase() === 'PATH'), ['PATH']);
+  assert.deepEqual(inherited, { CLI_PROFILE: 'inherited-profile', CONTROLLED_TOKEN: 'old-token', PATH: 'C:\\Inherited' });
+});
+
+test('Windows npx cache honors nonempty resolved aliases and keeps blank passthrough isolation policy', () => {
+  for (const cache of [path.join(TMP_HOME, 'Controlled Npm Cache'), '']) {
+    const configured = { name: 'controlled-npx-env-case', type: 'stdio', command: 'npx', enabled: true, source: 'user',
+      args: ['--cache=${Npm_Config_Cache}', '${UNDECLARED_KEY}', 'literal & value'],
+      env: { Npm_Config_Cache: '', cli_profile: 'declared-profile' } } as ManagedMcpServer;
+    const sources = { daemon: { Npm_Config_Cache: cache },
+      inherited: { NPM_CONFIG_CACHE: 'inherited-cache', CLI_PROFILE: 'inherited-profile' } };
+    const env = mcpServersTestHooks.stdioLaunchEnv(configured, sources,
+      extra => ({ PATH: 'C:\\ControlledBin', ...sources.inherited, ...extra }), 'win32');
+    const effectiveCache = cache || path.join(TMP_HOME, 'state', 'mcp-npx-cache', 'controlled-npx-env-case');
+    assert.equal(env.NPM_CONFIG_CACHE, effectiveCache);
+    assert.equal(Object.keys(env).filter(key => key.toUpperCase() === 'NPM_CONFIG_CACHE').length, 1);
+    assert.equal(env.CLI_PROFILE, 'declared-profile');
+    assert.equal(env.cli_profile, undefined);
+    assert.deepEqual(mcpServersTestHooks.stdioLaunchArgs(configured, { daemon: {}, inherited: env }, 'win32'),
+      [`--cache=${effectiveCache}`, '${UNDECLARED_KEY}', 'literal & value']);
+  }
+  const configured = { name: 'controlled-posix-cache', type: 'stdio', command: 'npx', enabled: true, source: 'user',
+    env: { npm_config_cache: '' } } as ManagedMcpServer;
+  const posix = mcpServersTestHooks.stdioLaunchEnv(configured,
+    { daemon: { npm_config_cache: '' }, inherited: {} }, extra => ({ PATH: '/fixture/bin', ...extra }), 'linux');
+  assert.equal(posix.npm_config_cache, path.join(TMP_HOME, 'state', 'mcp-npx-cache', 'controlled-posix-cache'));
+  assert.equal(posix.NPM_CONFIG_CACHE, posix.npm_config_cache);
+});
+
 test('actual SDK stdio spawn receives canonical Windows PATH and coherent case-varied argv without a child', async t => {
   const captured: Array<{ command: unknown; args: unknown; options: Record<string, unknown> }> = [];
   const stopped = new Error('controlled transport spawn capture: no child started');
@@ -160,12 +199,18 @@ test('actual SDK stdio spawn receives canonical Windows PATH and coherent case-v
   });
   syncBuiltinESMExports();
   try {
-    const cases: Array<{ env?: ManagedMcpServer['env']; args: string[]; path: string; expanded: string[] }> = [
+    const cases: Array<{ env?: ManagedMcpServer['env']; args: string[]; path: string; expanded: string[];
+      profile?: string; home?: string; userProfile?: string }> = [
       { args: ['${Path}', '${UNDECLARED_KEY}'], path: 'C:\\Augmented;C:\\Inherited', expanded: ['${Path}', '${UNDECLARED_KEY}'] },
       { env: { Path: '' }, args: ['${Path}'], path: 'C:\\DaemonOverride', expanded: ['C:\\DaemonOverride'] },
       { env: { Path: 'C:\\InlineOverride' }, args: ['${Path}'], path: 'C:\\InlineOverride', expanded: ['C:\\InlineOverride'] },
       { env: { Path: 'C:\\LowerCaseOverride', PATH: 'C:\\UpperCaseOverride' }, args: ['${Path}', '${PATH}'],
         path: 'C:\\UpperCaseOverride', expanded: ['C:\\UpperCaseOverride', 'C:\\UpperCaseOverride'] },
+      { env: { cli_profile: 'declared-profile' }, args: ['${cli_profile}'], path: 'C:\\Augmented;C:\\Inherited',
+        expanded: ['declared-profile'], profile: 'declared-profile' },
+      { env: { home: '/controlled-home', userprofile: 'C:\\ControlledUser' }, args: ['${home}', '${userprofile}'],
+        path: 'C:\\Augmented;C:\\Inherited', expanded: ['/controlled-home', 'C:\\ControlledUser'],
+        home: '/controlled-home', userProfile: 'C:\\ControlledUser' },
     ];
     let merges = 0;
     for (const fixture of cases) {
@@ -173,7 +218,7 @@ test('actual SDK stdio spawn receives canonical Windows PATH and coherent case-v
         args: fixture.args, enabled: true, source: 'user', env: fixture.env };
       const transport = mcpServersTestHooks.createExternalServer(configured, {
         sources: { daemon: { Path: 'C:\\DaemonOverride' }, inherited: {} },
-        merge: extra => { merges++; return { Path: 'C:\\Augmented;C:\\Inherited', ...extra }; }, platform: 'win32',
+        merge: extra => { merges++; return { Path: 'C:\\Augmented;C:\\Inherited', CLI_PROFILE: 'inherited-profile', ...extra }; }, platform: 'win32',
       });
       assert.ok(transport);
       await assert.rejects(transport.connect(), error => error === stopped);
@@ -183,6 +228,17 @@ test('actual SDK stdio spawn receives canonical Windows PATH and coherent case-v
       const env = call.options.env as Record<string, string>;
       assert.deepEqual(Object.keys(env).filter(key => key.toUpperCase() === 'PATH'), ['PATH']);
       assert.equal(env.PATH, fixture.path, 'the SDK default PATH cannot shadow the configured value');
+      if (fixture.profile) {
+        assert.equal(env.CLI_PROFILE, fixture.profile);
+        assert.equal(env.cli_profile, undefined);
+        assert.equal(Object.keys(env).filter(key => key.toUpperCase() === 'CLI_PROFILE').length, 1);
+      }
+      if (fixture.home) {
+        assert.equal(env.HOME, fixture.home, 'the SDK default HOME cannot shadow a case-varied Windows declaration');
+        assert.equal(env.home, undefined);
+        assert.equal(env.USERPROFILE, fixture.userProfile);
+        assert.equal(env.userprofile, undefined);
+      }
       assert.equal(call.options.shell, false);
       assert.equal(call.options.cwd, TMP_HOME);
     }

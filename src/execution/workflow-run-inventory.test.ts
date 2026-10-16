@@ -2,7 +2,8 @@
  * Run: node scripts/run-tests-isolated.mjs src/execution/workflow-run-inventory.test.ts
  */
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import fs, { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -15,6 +16,10 @@ const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const inventory = await import('./workflow-run-inventory.js');
 
 test.after(() => rmSync(TEST_HOME, { recursive: true, force: true }));
+test.beforeEach(() => {
+  rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
+  inventory._resetWorkflowRunInventoryForTests();
+});
 
 function write(id: string, record: Record<string, unknown>): void {
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
@@ -46,4 +51,119 @@ test('the inventory keeps light fields, newest first, and a run that finishes ch
 
   unlinkSync(path.join(WORKFLOW_RUNS_DIR, 'run-b.json'));
   assert.deepEqual(inventory.workflowRunInventory().map((entry) => entry.record.id), ['run-a']);
+});
+
+test('warm history and exact-run polling parse no unchanged records; changing one record parses only that record', (t) => {
+  for (let i = 0; i < 32; i++) write(`parse-${i}`, {
+    workflow: 'parse-count', status: 'running', createdAt: `2026-10-16T01:00:${String(i).padStart(2, '0')}.000Z`,
+    stepOutputs: { read: 'heavy-output'.repeat(2_000) },
+  });
+  const reads = t.mock.method(fs, 'readFileSync');
+  const stats = t.mock.method(fs, 'statSync');
+  const listings = t.mock.method(fs, 'readdirSync');
+  const parses = t.mock.method(JSON, 'parse');
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const runReads = () => reads.mock.calls.filter(call => typeof call.arguments[0] === 'string'
+    && path.dirname(call.arguments[0]) === WORKFLOW_RUNS_DIR && call.arguments[0].endsWith('.json')).length;
+  const runParses = () => parses.mock.calls.filter(call => typeof call.arguments[0] === 'string'
+    && call.arguments[0].includes('"workflow":"parse-count"')).length;
+  assert.equal(inventory.workflowRunInventory().length, 32);
+  assert.equal(runReads(), 32);
+  assert.equal(runParses(), 32);
+  inventory.workflowRunInventorySignature(['parse-count']);
+  inventory.workflowRunInventory();
+  assert.equal(runReads(), 32, 'warm list/signature polls retain only the light projection');
+  assert.equal(runParses(), 32);
+  const listingCount = listings.mock.calls.length;
+  const statCount = stats.mock.calls.length;
+  assert.equal(inventory.workflowRunInventoryEntry('parse-8')?.record.status, 'running');
+  assert.equal(listings.mock.calls.length, listingCount, 'viewed run does not enumerate the corpus');
+  assert.equal(stats.mock.calls.length, statCount + 1, 'viewed run checks exactly one generation');
+  assert.equal(runReads(), 32);
+  write('parse-8', { workflow: 'parse-count', status: 'completed', needsAttention: true,
+    reportBack: { outcome: 'blocked', detail: 'not retained' } });
+  const changed = inventory.workflowRunInventoryEntry('parse-8')!.record;
+  assert.equal(changed.status, 'completed');
+  assert.equal(changed.needsAttention, true);
+  assert.deepEqual(changed.reportBack, { outcome: 'blocked' });
+  inventory.workflowRunInventory();
+  assert.equal(runReads(), 33);
+  assert.equal(runParses(), 33, 'one changed record is parsed exactly once across both consumers');
+});
+
+test('same-size atomic replacement with preserved mtime changes the projection and signature', () => {
+  write('atomic', { workflow: 'atomic-flow', status: 'queued' });
+  const file = path.join(WORKFLOW_RUNS_DIR, 'atomic.json');
+  const fixed = new Date('2026-10-16T01:00:00.000Z');
+  utimesSync(file, fixed, fixed);
+  const beforeStat = statSync(file);
+  const before = inventory.workflowRunInventorySignature(['atomic-flow']);
+  const replacement = `${file}.replacement`;
+  writeFileSync(replacement, JSON.stringify({ id: 'atomic', workflow: 'atomic-flow', status: 'failed' }));
+  utimesSync(replacement, fixed, fixed);
+  renameSync(replacement, file);
+  assert.equal(statSync(file).size, beforeStat.size);
+  assert.equal(statSync(file).mtimeMs, beforeStat.mtimeMs);
+  assert.equal(inventory.workflowRunInventoryEntry('atomic')?.record.status, 'failed');
+  assert.notEqual(inventory.workflowRunInventorySignature(['atomic-flow']), before);
+});
+
+test('a record replaced during the read is omitted until a stable generation can be read', (t) => {
+  write('racing', { workflow: 'race-flow', status: 'running' });
+  const file = path.join(WORKFLOW_RUNS_DIR, 'racing.json');
+  const original = fs.readFileSync;
+  let replace = true;
+  t.mock.method(fs, 'readFileSync', (...args) => {
+    const bytes = Reflect.apply(original, fs, args);
+    if (args[0] === file && replace) {
+      replace = false;
+      const replacement = `${file}.replacement`;
+      writeFileSync(replacement, JSON.stringify({ id: 'racing', workflow: 'race-flow', status: 'completed' }));
+      renameSync(replacement, file);
+    }
+    return bytes;
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  assert.equal(inventory.workflowRunInventoryEntry('racing'), null, 'unproven bytes never enter the cache');
+  assert.equal(inventory.workflowRunInventoryEntry('racing')?.record.status, 'completed');
+});
+
+test('corruption, deletion and unreadable generations remove old projections and repairs return', (t) => {
+  write('repair', { workflow: 'repair-flow', status: 'running' });
+  const file = path.join(WORKFLOW_RUNS_DIR, 'repair.json');
+  assert.equal(inventory.workflowRunInventoryEntry('repair')?.record.status, 'running');
+  writeFileSync(file, '{broken');
+  assert.deepEqual(inventory.workflowRunInventory(), []);
+  write('repair', { workflow: 'repair-flow', status: 'completed' });
+  assert.equal(inventory.workflowRunInventory().length, 1);
+  const original = fs.statSync;
+  const mocked = t.mock.method(fs, 'statSync', (...args) => {
+    if (args[0] === file) throw Object.assign(new Error('controlled unreadable generation'), { code: 'EACCES' });
+    return Reflect.apply(original, fs, args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  assert.deepEqual(inventory.workflowRunInventory(), [], 'a failed stat cannot retain old status');
+  mocked.mock.restore();
+  syncBuiltinESMExports();
+  assert.equal(inventory.workflowRunInventory().length, 1);
+  unlinkSync(file);
+  assert.equal(inventory.workflowRunInventoryEntry('repair'), null);
+  assert.deepEqual(inventory.workflowRunInventory(), []);
+});
+
+test('exact-run lookup rejects paths without touching storage', (t) => {
+  const reads = t.mock.method(fs, 'readFileSync');
+  const stats = t.mock.method(fs, 'statSync');
+  const listings = t.mock.method(fs, 'readdirSync');
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  for (const runId of ['', '../foreign', 'nested/run', 'nested\\run']) {
+    assert.equal(inventory.workflowRunInventoryEntry(runId), null);
+  }
+  assert.equal(reads.mock.calls.length, 0);
+  assert.equal(stats.mock.calls.length, 0);
+  assert.equal(listings.mock.calls.length, 0);
 });

@@ -167,13 +167,13 @@ import type { GatewayResponse } from '../gateway/router.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { lookupIdempotent, rememberIdempotent } from '../runtime/idempotency.js';
 import { createHash, randomBytes } from 'node:crypto';
-import { readdirSync } from 'node:fs';
 import { recallMemory } from '../memory/recall-memory.js';
 import { listActiveFacts } from '../memory/facts.js';
 type ConsolidatedFactKind = 'user' | 'project' | 'feedback' | 'reference';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { workflowResourceBindingGaps } from '../execution/workflow-resource-binding.js';
 import { readWorkflowEvents } from '../execution/workflow-events.js';
+import { workflowRunInventory, workflowRunInventoryEntry } from '../execution/workflow-run-inventory.js';
 import {
   deriveWorkflowTerminalOutcome,
   type WorkflowTerminalOutcome,
@@ -778,52 +778,43 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value ? value : null;
 }
 
-/**
- * Read every workflow run file off disk, sort newest-first, and group
- * by workflow name. Same on-disk layout the dashboard uses
- * (`WORKFLOW_RUNS_DIR/<id>.json`); we just reshape to the mobile view.
- */
+function mobileWorkflowRunSummary(raw: Readonly<Record<string, unknown>>): MobileWorkflowRunSummary | null {
+  const id = typeof raw.id === 'string' ? raw.id : '';
+  const workflow = typeof raw.workflow === 'string' ? raw.workflow : '';
+  if (!id || !workflow) return null;
+  return {
+    id,
+    workflow,
+    status: typeof raw.status === 'string' ? raw.status : 'unknown',
+    terminalOutcome: deriveWorkflowTerminalOutcome({
+      status: raw.status,
+      finishedAt: raw.finishedAt,
+      needsAttention: raw.needsAttention,
+      terminalOutcome: raw.terminalOutcome,
+      reportBack: raw.reportBack && typeof raw.reportBack === 'object' && !Array.isArray(raw.reportBack)
+        ? { outcome: (raw.reportBack as Record<string, unknown>).outcome }
+        : undefined,
+    }),
+    createdAt: stringOrNull(raw.createdAt),
+    startedAt: stringOrNull(raw.startedAt),
+    finishedAt: stringOrNull(raw.finishedAt) ?? stringOrNull(raw.completedAt),
+    source: stringOrNull(raw.source),
+    error: stringOrNull(raw.error),
+    needsAttention: raw.needsAttention === true,
+  };
+}
+
+/** Status/history projections share the lightweight, generation-checked inventory. */
 function readMobileWorkflowRuns(): Map<string, MobileWorkflowRunSummary[]> {
   const grouped = new Map<string, MobileWorkflowRunSummary[]>();
-  let files: string[] = [];
-  try {
-    files = readdirSync(WORKFLOW_RUNS_DIR);
-  } catch {
-    return grouped;
-  }
-  for (const file of files) {
-    if (!file.endsWith('.json')) continue;
-    try {
-      const raw = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
-      const id = typeof raw.id === 'string' ? raw.id : '';
-      const workflow = typeof raw.workflow === 'string' ? raw.workflow : '';
-      if (!id || !workflow) continue;
-      const summary: MobileWorkflowRunSummary = {
-        id,
-        workflow,
-        status: typeof raw.status === 'string' ? raw.status : 'unknown',
-        terminalOutcome: deriveWorkflowTerminalOutcome({
-          status: raw.status,
-          finishedAt: raw.finishedAt,
-          needsAttention: raw.needsAttention,
-          terminalOutcome: raw.terminalOutcome,
-          reportBack: raw.reportBack && typeof raw.reportBack === 'object' && !Array.isArray(raw.reportBack)
-            ? { outcome: (raw.reportBack as Record<string, unknown>).outcome }
-            : undefined,
-        }),
-        createdAt: stringOrNull(raw.createdAt),
-        startedAt: stringOrNull(raw.startedAt),
-        finishedAt: stringOrNull(raw.finishedAt) ?? stringOrNull(raw.completedAt),
-        source: stringOrNull(raw.source),
-        error: stringOrNull(raw.error),
-        needsAttention: raw.needsAttention === true,
-      };
-      const list = grouped.get(workflow) ?? [];
-      list.push(summary);
-      grouped.set(workflow, list);
-    } catch {
-      /* malformed run file — skip */
-    }
+  // Preserve filename order for equal timestamps, then the existing newest-first
+  // mobile ordering. No full outputs or definitions are needed for these views.
+  for (const { record } of [...workflowRunInventory()].sort((a, b) => a.file.localeCompare(b.file))) {
+    const summary = mobileWorkflowRunSummary(record);
+    if (!summary) continue;
+    const list = grouped.get(summary.workflow) ?? [];
+    list.push(summary);
+    grouped.set(summary.workflow, list);
   }
   for (const list of grouped.values()) {
     list.sort((a, b) =>
@@ -831,6 +822,17 @@ function readMobileWorkflowRuns(): Map<string, MobileWorkflowRunSummary[]> {
     );
   }
   return grouped;
+}
+
+function validMobileWorkflowRunId(runId: string): boolean {
+  return runId.length > 0 && /^[a-zA-Z0-9_.:-]+$/.test(runId);
+}
+
+/** One viewed run checks only its own generation, never the user's run corpus. */
+function readMobileWorkflowRun(runId: string, workflowNames: readonly string[]): MobileWorkflowRunSummary | null {
+  const raw = workflowRunInventoryEntry(runId)?.record;
+  if (!raw || raw.id !== runId || !workflowNames.includes(String(raw.workflow ?? ''))) return null;
+  return mobileWorkflowRunSummary(raw);
 }
 
 function truncateOutput(value: unknown): string {
@@ -5530,6 +5532,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const runId = Array.isArray(req.params.runId) ? req.params.runId[0] : req.params.runId;
     const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
     if (!entry) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+    if (!validMobileWorkflowRunId(runId)) { res.status(400).json({ error: 'INVALID_RUN_ID' }); return; }
     try {
       const events = readWorkflowEvents(entry.name, runId);
       const limit = clampInt(req.query.limit, 200, 1, 500);
@@ -5553,7 +5556,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // The run's own status rides along: without it the phone had to infer
       // "is this still going?" from the last event kind, which is wrong the
       // moment a run parks or is cancelled elsewhere.
-      const summary = (readMobileWorkflowRuns().get(entry.data.name) ?? []).find((run) => run.id === runId);
+      const summary = readMobileWorkflowRun(runId, [entry.name, entry.data.name]);
       res.json({
         runId,
         workflow: entry.data.name,

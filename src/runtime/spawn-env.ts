@@ -1,6 +1,7 @@
 import path from 'node:path';
 import os from 'node:os';
 import { accessSync, mkdirSync, readdirSync, readFileSync, statSync, constants as fsConstants } from 'node:fs';
+import { childEnvValue, mergeChildEnvLayers, type ChildEnvLayer } from './child-env-layers.js';
 
 function existingDirectory(candidate: string): boolean {
   try {
@@ -71,10 +72,11 @@ export function userManagedExecutableDirs(home: string): string[] {
   return [...new Set(candidates.filter(existingDirectory))];
 }
 
-function isolatedNpmCache(env: Record<string, string>): string | undefined {
+function isolatedNpmCache(env: Record<string, string>, platform: NodeJS.Platform): string | undefined {
   // An explicit user/operator override is authoritative, including the lowercase
   // spelling npm itself supports.
-  if (env.NPM_CONFIG_CACHE?.trim() || env.npm_config_cache?.trim()) return undefined;
+  if (childEnvValue(env, 'NPM_CONFIG_CACHE', platform) !== undefined
+    || childEnvValue(env, 'npm_config_cache', platform) !== undefined) return undefined;
   let base: string;
   try {
     base = process.env.CLEMENTINE_HOME?.trim() || path.join(os.homedir(), '.clementine-next');
@@ -263,29 +265,19 @@ export function childExecutablePath(inheritedPath: string | undefined): string {
   return withConnectedCliBin(augmentPath(inheritedPath));
 }
 
-export function mergedSpawnEnv(extra: Record<string, string> = {}): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === 'string') {
-      env[key] = value;
-    }
-  }
-  const pathKey = process.platform === 'win32'
-    ? Object.keys(env).find((key) => key.toLowerCase() === 'path') ?? 'Path'
-    : 'PATH';
-  const currentPath = env[pathKey] ?? env.PATH;
-  if (process.platform === 'win32') {
-    for (const key of Object.keys(env)) {
-      if (key.toLowerCase() === 'path' && key !== pathKey) delete env[key];
-    }
-  }
-  env[pathKey] = childExecutablePath(currentPath);
-  // Consider per-call overrides before choosing a default, otherwise a lowercase
-  // `extra.npm_config_cache` would coexist with (and potentially lose to) our
-  // uppercase default.
-  const npmCache = isolatedNpmCache({ ...env, ...extra });
-  if (npmCache) env.NPM_CONFIG_CACHE = npmCache;
+export function mergedSpawnEnv(extra: Record<string, string> = {}, options: {
+  inherited?: ChildEnvLayer; platform?: NodeJS.Platform;
+} = {}): Record<string, string> {
+  const platform = options.platform ?? process.platform;
+  const inherited = options.inherited ?? process.env;
+  const env = mergeChildEnvLayers([inherited,
+    { PATH: childExecutablePath(childEnvValue(inherited, 'PATH', platform)) }], platform);
   // User declarations win over the inherited environment (that is the point of
-  // declaring them) but never over an explicit per-call override.
-  return { ...env, ...userDeclaredCliEnv(), ...extra };
+  // declaring them) but never over an explicit per-call override. An explicit
+  // per-call PATH remains verbatim, even empty; declarations cannot set PATH.
+  const merged = mergeChildEnvLayers([env, userDeclaredCliEnv(), extra], platform);
+  // Evaluate the effective declarations first: an explicit empty cache setting
+  // is still an override, not permission to synthesize a second alias.
+  const npmCache = isolatedNpmCache(merged, platform);
+  return npmCache ? mergeChildEnvLayers([merged, { NPM_CONFIG_CACHE: npmCache }], platform) : merged;
 }

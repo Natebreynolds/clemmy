@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { augmentPath, mergedSpawnEnv, userManagedExecutableDirs } from './spawn-env.js';
+import { childEnvValue } from './child-env-layers.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -327,6 +328,53 @@ test('a malformed cli-env file is ignored rather than breaking every CLI spawn',
   } finally {
     if (previousHome === undefined) delete process.env.CLEMENTINE_HOME;
     else process.env.CLEMENTINE_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Windows CLI declarations and per-call layers win across casing before npm defaults', () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clem-windows-env-layers-'));
+  const previousHome = process.env.CLEMENTINE_HOME;
+  process.env.CLEMENTINE_HOME = home;
+  const inherited = Object.freeze({ PATH: 'inherited-path', CLI_PROFILE: 'inherited-profile',
+    NPM_CONFIG_CACHE: 'inherited-cache' });
+  try {
+    mkdirSync(path.join(home, 'state'), { recursive: true });
+    writeFileSync(path.join(home, 'state', 'cli-env.json'), JSON.stringify({
+      cli_profile: 'declared-profile', npm_config_cache: '', Path: 'refused-user-path',
+    }));
+    const declared = mergedSpawnEnv({}, { inherited, platform: 'win32' });
+    assert.equal(childEnvValue(declared, 'CLI_PROFILE', 'win32'), 'declared-profile');
+    assert.equal(childEnvValue(declared, 'NPM_CONFIG_CACHE', 'win32'), '');
+    assert.equal(declared.NPM_CONFIG_CACHE, undefined, 'no synthesized uppercase cache shadows an explicit blank');
+    assert.notEqual(declared.PATH, 'refused-user-path');
+    const extra = Object.freeze({ Cli_Profile: 'per-call-profile', pAtH: '', npm_CONFIG_CACHE: 'per-call-cache' });
+    const effective = mergedSpawnEnv(extra, { inherited, platform: 'win32' });
+    assert.equal(childEnvValue(effective, 'CLI_PROFILE', 'win32'), 'per-call-profile');
+    assert.equal(childEnvValue(effective, 'NPM_CONFIG_CACHE', 'win32'), 'per-call-cache');
+    assert.equal(effective.PATH, '', 'explicit empty PATH is kept verbatim');
+    assert.equal(new Set(Object.keys(effective).map(key => key.toUpperCase())).size, Object.keys(effective).length);
+    assert.equal(inherited.PATH, 'inherited-path');
+    assert.equal(extra.pAtH, '');
+  } finally {
+    if (previousHome === undefined) delete process.env.CLEMENTINE_HOME; else process.env.CLEMENTINE_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('an explicitly empty user npm cache setting receives no default on POSIX', () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clem-empty-npm-env-'));
+  const previousHome = process.env.CLEMENTINE_HOME;
+  process.env.CLEMENTINE_HOME = home;
+  try {
+    mkdirSync(path.join(home, 'state'), { recursive: true });
+    writeFileSync(path.join(home, 'state', 'cli-env.json'), JSON.stringify({ npm_config_cache: '' }));
+    const env = mergedSpawnEnv({ PATH: 'literal-per-call-path' }, { inherited: {}, platform: 'linux' });
+    assert.equal(env.npm_config_cache, '');
+    assert.equal(env.NPM_CONFIG_CACHE, undefined);
+    assert.equal(env.PATH, 'literal-per-call-path');
+  } finally {
+    if (previousHome === undefined) delete process.env.CLEMENTINE_HOME; else process.env.CLEMENTINE_HOME = previousHome;
     rmSync(home, { recursive: true, force: true });
   }
 });
