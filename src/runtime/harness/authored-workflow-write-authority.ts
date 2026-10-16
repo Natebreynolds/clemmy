@@ -805,7 +805,10 @@ function journalConstraintCheckerUnavailable(attestation: HostCallAttestation, r
  * objection rides to the model so the report says it; a high-stakes write
  * stops truthfully, with the objection, as not done. */
 const MAX_CONSTRAINT_REVIEW_REFUSALS = 2;
-const constraintRefusalRounds = new Map<string, { count: number; lastReason: string }>();
+/** Refusals of one step's write so far. `correctedDigest` is the reviewer's
+ * own corrected call from the latest refusal; resubmitting exactly that call
+ * earns one review past the cap (`correctedReviewed` marks it spent). */
+const constraintRefusalRounds = new Map<string, { count: number; lastReason: string; correctedDigest?: string; correctedReviewed?: boolean }>();
 const boundedConstraintNotes = new Map<string, string>();
 
 function constraintReviewKey(reopened: ReopenedAuthoredStep, toolName: string): string {
@@ -878,7 +881,11 @@ async function reviewAuthoredWriteConstraints(input: {
     const stakes = input.stakes ?? 'high';
     const roundsKey = constraintReviewKey(input.reopened, input.attestation.toolName);
     const rounds = constraintRefusalRounds.get(roundsKey);
-    if (rounds && rounds.count >= MAX_CONSTRAINT_REVIEW_REFUSALS) {
+    // The reviewer's own fix, resubmitted exactly, is reviewed once more
+    // even at the cap: "a corrected write is reviewed once more" (live
+    // 2026-10-16 a standup's corrected send was stopped unreviewed).
+    const correctedResubmission = Boolean(rounds?.correctedDigest && rounds.correctedDigest === argsDigest && !rounds.correctedReviewed);
+    if (rounds && rounds.count >= MAX_CONSTRAINT_REVIEW_REFUSALS && !correctedResubmission) {
       const decision = stakes === 'ordinary' ? 'proceeded_with_note' : 'stopped_as_not_done';
       journalConstraintReviewBounded(input.attestation, { refusals: rounds.count, lastReason: rounds.lastReason, stakes, decision });
       constraintRefusalRounds.delete(roundsKey);
@@ -949,16 +956,21 @@ async function reviewAuthoredWriteConstraints(input: {
       if (input.ownerApprovedExactly) return null;
       return { status: 'hold', retryable: true, reason: `workflow_write_checker_unavailable: ${result.reason}` };
     }
-    constraintRefusalRounds.set(roundsKey, { count: (rounds?.count ?? 0) + 1, lastReason: result.reason });
-    // The reviewer's own corrected arguments, when it could make the fix by
-    // changing values alone: resubmitting them exactly is a repair any model
-    // can make, and the resubmission is reviewed again before it runs.
-    const corrected = result.verdict === 'conflict' && result.correctedArguments
+    constraintRefusalRounds.set(roundsKey, {
+      count: (rounds?.count ?? 0) + 1,
+      lastReason: result.reason,
+      ...(result.correctedArguments ? { correctedDigest: digest(result.correctedArguments) } : {}),
+      correctedReviewed: Boolean(rounds?.correctedReviewed || correctedResubmission),
+    });
+    // The reviewer's own corrected arguments, when values alone make the
+    // write acceptable: resubmitting them exactly is a repair any model can
+    // make, and the resubmission is reviewed again before it runs.
+    const corrected = result.correctedArguments
       ? ` Resubmit this same call with exactly these corrected arguments, which apply the corrections above and change nothing else: ${JSON.stringify(result.correctedArguments)}`
       : '';
     return result.verdict === 'conflict'
       ? { status: 'repair', retryable: true, reason: `workflow_write_constraint_conflict: ${result.reason}${corrected}` }
-      : { status: 'hold', retryable: true, reason: `workflow_write_constraints_unverified: ${result.reason}` };
+      : { status: 'hold', retryable: true, reason: `workflow_write_constraints_unverified: ${result.reason}${corrected}` };
   } catch {
     return { status: 'hold', retryable: true, reason: 'workflow_write_constraints_unavailable' };
   }

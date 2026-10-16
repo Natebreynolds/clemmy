@@ -48,7 +48,7 @@ const SYSTEM = [
   'compatible means this exact proposed write respects the applicable saved constraints. conflict means it contradicts them.',
   'uncertain means required facts are missing or ambiguous. Never resolve uncertainty by assuming a safe destination or unchanged contents.',
   'Name every conflict and every missing piece of evidence you can see in this one answer, each as a specific correction or the exact read that would settle it. A corrected write is reviewed once more, not again for what could have been said now.',
-  'When the verdict is conflict and every correction is a change to the proposed values themselves (no missing read), also return correctedArguments: the complete proposed arguments with exactly those corrections applied and nothing else changed, same fields and shape. Otherwise return correctedArguments as null.',
+  'When the verdict is conflict or uncertain and the write becomes acceptable by changing the proposed values alone (correcting a value, removing a claim the evidence does not support, or stating an assumption explicitly instead of a read), also return correctedArguments: the complete proposed arguments with exactly those corrections applied and nothing else changed, same fields and shape. Otherwise return correctedArguments as null.',
   'Return JSON with verdict (compatible, conflict, uncertain), reason (specific correction or missing evidence), correctedArguments, and the supplied proposalDigest exactly.',
 ].join(' ');
 
@@ -128,7 +128,7 @@ export function parseWorkflowMutationReview(
   const row = parsed as Record<string, unknown>;
   if (typeof row.verdict !== 'string' || !['compatible', 'conflict', 'uncertain'].includes(row.verdict)
     || row.proposalDigest !== expectedDigest || typeof row.reason !== 'string' || !row.reason.trim()) return null;
-  const correctedArguments = row.verdict === 'conflict'
+  const correctedArguments = row.verdict !== 'compatible'
     ? correctedArgumentsOf(row.correctedArguments, proposal?.args, proposal?.schema)
     : undefined;
   return {
