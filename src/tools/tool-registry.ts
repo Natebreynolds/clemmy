@@ -828,6 +828,15 @@ export function isEffectDecidedPerCall(toolName: string): boolean {
   ));
 }
 
+/** The built-in whose input is a local command line, so connected CLIs run
+ * through it. */
+export function runsLocalCommandLines(toolName: string): boolean {
+  return TOOL_REGISTRY.some((declaration) => (
+    declaration.name === toolName
+    && declaration.localPlanning?.inputKind === 'shell_command'
+  ));
+}
+
 /** Registry membership for PRESENTATION: only a host-declared name may be
  * echoed into user-facing terminal copy — an unknown name is model input and
  * is never repeated back (value-opaque terminal rule). */

@@ -24,7 +24,8 @@ import { SourceAccountNominationSchema, type SourceAccountNomination } from './s
 import { hostStructuralPlanningControlLookup } from './structural-control-lookup.js';
 import { maybeDiscoveryAdvisory } from '../runtime/harness/discovery-advisory.js';
 import { invalidArgumentsTextResult, textResult } from './shared.js';
-import { isEffectDecidedPerCall } from './tool-registry.js';
+import { isEffectDecidedPerCall, runsLocalCommandLines } from './tool-registry.js';
+import { connectedCliRunnerText } from '../integrations/cli-catalog/connected-cli-coverage.js';
 import { mcpToolAwaitsEffectLabel, mcpToolEffectApprovalOpen } from '../runtime/mcp-tool-effect-labels.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalogEntriesLexically, toolSchemaSearchText, type RankedCatalogEntry } from '../agents/tool-catalog.js';
@@ -1220,6 +1221,7 @@ export function registerToolSearchTool(
       for (const [name, metadata] of opts.runtimeToolMetadata?.() ?? []) {
         metadataMap.set(name, metadata);
       }
+      const cliRunnerText = connectedCliRunnerText();
       const scopedCatalog = catalogEntries({ allowedNames: opts.allowedNames }).map((entry) => {
         const metadata = metadataMap.get(entry.name);
         const properties = (metadata?.schema as { properties?: object } | undefined)?.properties;
@@ -1227,7 +1229,10 @@ export function registerToolSearchTool(
         // Registry one-liners are display summaries, sometimes clipped in the
         // middle of a word. Retrieval needs the actual registered operation's
         // meaning just as provider rows use their full discovery metadata.
+        // The command runner also carries the connected CLIs it can reach, so
+        // a search naming that vendor finds it instead of an unconnected app.
           oneLiner: [metadata?.description || entry.oneLiner,
+            ...(cliRunnerText && runsLocalCommandLines(entry.name) ? [cliRunnerText] : []),
             ...Object.keys(properties ?? {})].join('\n'),
         };
       });

@@ -6,6 +6,7 @@
  * compiler failure, and author timeout are not connection_missing.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import { connectedCliCoveringApp } from '../../integrations/cli-catalog/connected-cli-coverage.js';
 import {
   appendEvent,
   getEvent,
@@ -639,6 +640,8 @@ function observedConnectionPresentationForSource(input: {
         || !capability.startsWith(`${toolkit.toUpperCase()}_`)
         || capabilityRef !== `cap:resolved:${capability.toLowerCase()}`
       ) continue;
+      // A connected CLI reaches this app now, so the app is not missing.
+      if (connectedCliCoveringApp(toolkit)) continue;
       // Another provider's result can answer a generic search, so it
       // disproves the gap; a search that names the app asked for that app,
       // and only the app's own result disproves it.
