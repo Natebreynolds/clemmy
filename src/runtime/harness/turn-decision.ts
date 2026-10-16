@@ -192,6 +192,10 @@ function decisionFromObject(value: Record<string, unknown>): OrchestratorDecisio
 // output (the 2026-07-08 landing-page D_decision_unparsed failure class). Empty /
 // recovery-sentinel output returns null → the existing stall-retry path (unchanged).
 const ASK_DECISION_MARKER = /^\s*ASK:\s*([\s\S]+)$/i;
+/** The same marker after context the model wrote first, at a sentence end or
+ *  a line break ("…site health.ASK: Can you link…"). Live 2026-10-16 that
+ *  marker reached the owner verbatim inside the reply. */
+const EMBEDDED_ASK_DECISION_MARKER = /([.!?\u2026)\]"'\u2019]|\n)[ \t]*ASK:[ \t]*(?=\S)/i;
 const CONTINUE_DECISION_MARKER = /^\s*CONTINUE:\s*([\s\S]*)$/i;
 
 /** How still-forming output reads under the same contract, for text shown
@@ -495,6 +499,19 @@ function parseDecisionText(text: string): OrchestratorDecisionShape | null {
   // A recognized zero-work punt (no explicit marker) defers to the stall path.
   // Explicit ASK:/CONTINUE: markers are intentional and always honored.
   if (!ask && !cont && looksLikeZeroWorkStallText(trimmed)) return null;
+  const embedded = !ask && !cont ? EMBEDDED_ASK_DECISION_MARKER.exec(trimmed) : null;
+  if (embedded) {
+    const context = trimmed.slice(0, embedded.index + embedded[1].length).trim();
+    const question = trimmed.slice(embedded.index + embedded[0].length).trim();
+    const reply = context ? `${context}\n\n${question}` : question;
+    return {
+      summary: deriveDecisionSummary(question),
+      reply: scrubInternalNarration(reply) || reply,
+      done: false,
+      nextAction: 'awaiting_user_input',
+      reason: 'ask',
+    };
+  }
   if (ask && ask[1].trim()) {
     const question = ask[1].trim();
     return {
