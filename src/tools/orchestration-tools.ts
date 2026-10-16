@@ -1219,7 +1219,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         approvalPreview: z.string().optional(),
         inputs: z.record(z.string(), WorkflowStepInputBindingSchema).optional().describe(STEP_INPUT_CONTRACT_DESC),
         output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
-        sideEffect: z.enum(['read', 'write', 'send']).optional().describe("Declare effect: read gathers data; write reversibly mutates local/remote state; send is irreversible email/publish/post. Sends never auto-retry; interrupted writes/sends halt on resume. Omission uses prose heuristics."),
+        sideEffect: z.enum(['read', 'write', 'send']).optional().describe("Declare effect: read gathers data; write reversibly mutates local/remote state; send is irreversible email/publish/post. Sends never auto-retry; interrupted writes/sends halt on resume. For an unmarked prompt step, omission requires an exact instruction/skill/tool effect check before execution; an unavailable check leaves it unrun. A saved effect reading is planning metadata, never permission."),
         loopUntil: WorkflowLoopUntilSchema.optional().describe(LOOP_UNTIL_DESC),
         loopSafe: z.boolean().optional().describe('Assert this write is idempotent (e.g. stable-key upsert). Required for write loops; permits goal re-pursuit past it.'),
       })).min(1).describe('REQUIRED model-authored semantic graph. Include every business step in execution order/dependency form; the host validates and compiles this graph but does not invent missing steps.'),

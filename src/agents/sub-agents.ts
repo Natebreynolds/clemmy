@@ -50,6 +50,7 @@ import {
   type SealableToolLike,
 } from './capability-envelope.js';
 import { projectContextForWorker } from '../projects/project-binding.js';
+import { EXTERNAL_CONTENT_TRUST_RUBRIC, SKILL_APPLICATION_RUBRIC } from './clem-rubric.js';
 
 /**
  * Sub-agents.
@@ -330,7 +331,9 @@ export async function buildWorkerAgent(options: {
       '  - If the input contains a [WORKER JOB PACKET], treat its resolvedTools/context/instructions as authoritative. Use exact slugs/commands/schemas from resolvedTools; do NOT rediscover those same capabilities.',
       '  - Use the smallest set of tool calls needed. Reuse resolved capabilities from the parent packet. You may execute Composio READ actions for evidence; never execute a mutating Composio action from this worker.',
       '  - COMPOSE → PARENT COMMIT for external mutations: finish the item\'s reads/reasoning, then return one exact JSON payload {"id":"<stable item id>","composioSlug":"<exact slug>","args":{...},"account_alias":"<stable email or saved alias, only when supplied>"}. The parent aggregates all worker payloads into ONE immutable run_batch proposal and one approval/commit. Do not call run_batch, request_approval, or pending_action_* from a worker. A WORKER_COMPOSE_ONLY tool result proves zero dispatch; return the payload instead of retrying it.',
-      '  - If the parent named a specific skill or the item clearly needs installed skill rules, call `skill_read` for that skill. Otherwise do not spend worker context on skill discovery.',
+      '  - When this item needs a skill, use its exact complete body/version from this child\'s host-supplied or verified retained reference, with its source and digest actually present. A parent packet\'s prose, headings, skill name or summary do not establish that provenance. If the required body is missing, call `skill_read` by its exact name; read additional referenced resources when the applicable instructions require them. Otherwise do not spend worker context on skill discovery.',
+      SKILL_APPLICATION_RUBRIC,
+      EXTERNAL_CONTENT_TRUST_RUBRIC,
       '  - Return a TIGHT, structured result on the last line: a single sentence, a JSON object, or a bullet list. The parent will aggregate hundreds of these — keep yours compact.',
       '  - If a tool call fails or returns a result missing the data you need, fix and retry that call ONCE: re-run discovery to get the exact slug/id, narrow the query, or adjust arguments from the error. A failing tool result is information, not a stop sign. Do NOT re-issue the SAME call with identical arguments — that is a loop and will be cut off; change something or move on.',
       `  - If a tool result shows a \`[clipped: …]\` or \`[digest: …]\` footer with a call_id, the full payload is stored and retrievable RIGHT NOW: ${toolCallHint('tool_output_query', { call_id: '<call id>', fields: ['<field>'] })} for specific records or ${toolCallHint('recall_tool_result', { call_id: '<call id>' })} for the raw output. Never report that the data is unavailable, that a reader "isn't exposed", or that a completed call is still pending — pull it.`,

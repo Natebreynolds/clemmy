@@ -189,10 +189,12 @@ const GOLDEN = {
   // 2026-10-11: shared inline-result and logical-effect reasoning. Raw tool
   // bytes stay unchanged; past-tense claims can cite authenticated retained
   // successes without replay. Full exact Stop policy remains context-bound.
-  instructions: { len: 33537, sha16: '7af63d9a516f349a' },
-  native: { len: 32644, sha16: '64d47a0e8d56f47f' },
-  claudeBrain: { len: 10935, sha16: '43f559fc19fd1c3e' },
-  lean: { len: 12940, sha16: 'bd9122f8feca1d2f' },
+  // 2026-10-15: exact skill reuse within accepted scope, evidence-only source
+  // recovery, and settled/uncertain effect continuity in the rollback rubric.
+  instructions: { len: 33485, sha16: '150f4d586d4d5938' },
+  native: { len: 32592, sha16: 'ee5ef1318873009c' },
+  claudeBrain: { len: 11138, sha16: 'a39b0a56e5c2d61f' },
+  lean: { len: 13143, sha16: '6dad16d104c60ae1' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

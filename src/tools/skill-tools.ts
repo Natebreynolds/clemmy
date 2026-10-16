@@ -81,7 +81,7 @@ export function registerSkillTools(server: McpServer): void {
     [
       'List installed SKILL.md skills (Anthropic Skills format) with name + one-line description.',
       'Skills are reusable procedures or prompt modules — installed by the user or learned from prior work. Evidence labels distinguish trusted automatic recall from legacy drafts.',
-      'Call this at the start of a task when you need specialized knowledge (design taste, copywriting voice, domain rules, etc.). If a listed skill looks relevant, follow up with `skill_read(name)` to load the full instructions.',
+      'Use when a specialized procedure is needed and its installed name is unknown or supplied candidates do not fit. An exact supplied skill name can go directly to `skill_read(name)` without listing. Unrelated candidates require no skill call.',
     ].join('\n'),
     {},
     async () => {
@@ -106,10 +106,10 @@ export function registerSkillTools(server: McpServer): void {
     'skill_read',
     [
       'Load the full body of an installed SKILL.md skill into context.',
-      'Use after `skill_list()` to inspect or apply an installed skill. The full body is reference material; apply the requirements relevant to the accepted task and the user\'s selected framework. Reading it does not authorize extra work.',
+      'Read directly by an exact installed name, including one supplied by the user or current candidate list; `skill_list()` is not a prerequisite. Reuse a complete host-supplied body or this task\'s exact retained procedure/version when already available; a description is not the full instructions. After compaction, recover the exact retained requirements rather than silently selecting different disk bytes. Read the current version when the task requires it. Apply the body within the accepted task and selected framework; reading does not authorize extra work.',
     ].join('\n'),
     {
-      name: z.string().min(1).max(80).describe('Skill directory name as shown by skill_list (e.g. "taste-skill", "brutalist-skill").'),
+      name: z.string().min(1).max(80).describe('Exact installed skill directory name, supplied by the user or current candidates; use skill_list only when unknown.'),
     },
     async ({ name }) => {
       const skill = loadSkill(name);
