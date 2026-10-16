@@ -1056,6 +1056,16 @@ export function terminalQuestionEventForAcceptedSource(input: {
 export const _terminalQuestionTextForTest = (result: RunConversationResult, sourceUserSeq: number): string =>
   terminalQuestionText(result, sourceUserSeq);
 
+/** Whether the turn's question is Clem's own structured ask: her words and
+ * options through ask_user_question, posted with no host source. An observed
+ * connection gap never replaces it (live 2026-10-16 a speculative contacts
+ * search turned her three-option question into the host's "connect
+ * Contacts+" template); a plain ASK pause still parks the gap and resumes. */
+function clemsOwnAskForTurn(input: { sessionId: string; sourceUserSeq: number; turn: number }): boolean {
+  const event = terminalQuestionEventForAcceptedSource(input);
+  return Boolean(event && event.data.source === undefined && publicReplyText(event.data.question, ''));
+}
+
 function terminalQuestionText(result: RunConversationResult, sourceUserSeq: number): string {
   const event = terminalQuestionEventForAcceptedSource({ sessionId: result.sessionId, sourceUserSeq, turn: result.lastTurn });
   return (event ? publicReplyText(event.data.question, '') : '')
@@ -1287,13 +1297,15 @@ function reduceStandardConversationTerminal(input: {
     }
     case 'awaiting_user_input': {
       const question = terminalQuestionText(result, sourceUserSeq);
-      const parked = parkObservedConnectionWithCheckpoint({
-        sessionId: result.sessionId,
-        sourceUserSeq,
-        agent: input.agent,
-        turn: result.lastTurn,
-        text: question,
-      });
+      const parked = clemsOwnAskForTurn({ sessionId: result.sessionId, sourceUserSeq, turn: result.lastTurn })
+        ? null
+        : parkObservedConnectionWithCheckpoint({
+          sessionId: result.sessionId,
+          sourceUserSeq,
+          agent: input.agent,
+          turn: result.lastTurn,
+          text: question,
+        });
       const publicQuestion = parked?.text ?? question;
       if (parked) connectionExecutionPause = prepareConnectionExecutionPause({
         sessionId: result.sessionId, sourceUserSeq, requestId: parked.requestId,
@@ -2359,7 +2371,8 @@ function commitStandardPauseTerminal(input: {
   const proposedText = publicReplyText(input.reply, '') || publicReplyText(input.summary, '');
   let publicText = proposedText;
   let connectionExecutionPause: ConnectionExecutionPauseV1 | undefined;
-  if (Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0) {
+  if (Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
+    && !clemsOwnAskForTurn({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq as number, turn: input.turn })) {
     const parked = parkObservedConnectionWithCheckpoint({
       sessionId: input.sessionId,
       sourceUserSeq: input.sourceUserSeq as number,
