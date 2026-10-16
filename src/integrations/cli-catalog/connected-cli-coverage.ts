@@ -1,5 +1,6 @@
 import { findCatalogEntry, readConnectedClis, type ConnectedCliRecord } from './catalog.js';
 import { cliHealthExecutableIdentity, readPersistedHealth } from './auth-health.js';
+import { cliHealthMatchesConnection } from './cli-connection-revision.js';
 
 /** One nominal 30-minute health sweep. This is observation freshness, not the
  * 45-second request memo and never a grant to use an operation or account. */
@@ -18,6 +19,7 @@ export interface UsableConnectedCli {
 export type CliAuthenticationObservationReason =
   | 'fresh_authentication' | 'signed_out' | 'not_installed' | 'not_checked'
   | 'health_identity_mismatch' | 'invalid_timestamp' | 'future_timestamp'
+  | 'connection_revision_mismatch'
   | 'observation_expired' | 'probe_incomplete' | 'missing_executable_identity'
   | 'authentication_unknown' | 'authentication_error' | 'malformed_health';
 
@@ -58,6 +60,8 @@ function authenticationObservation(record: ConnectedCliRecord, row: unknown, now
   if (row === undefined) return unverified('not_checked');
   if (!object(row)) return unverified('malformed_health');
   if (row.id !== record.id || row.command !== record.command) return unverified('health_identity_mismatch');
+  if ((Object.hasOwn(record, 'connectionRevision') || Object.hasOwn(row, 'connectionRevision'))
+    && !cliHealthMatchesConnection(record, row)) return unverified('connection_revision_mismatch');
   const checked = typeof row.checkedAt === 'string' ? Date.parse(row.checkedAt) : NaN;
   if (!Number.isFinite(checked) || !Number.isFinite(now)
     || new Date(checked).toISOString() !== row.checkedAt) return unverified('invalid_timestamp');

@@ -2,12 +2,13 @@ import path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { BASE_DIR } from '../../config.js';
 import { cliHealthExecutableIdentity } from './cli-executable-identity.js';
+import { cliHealthMatchesConnection } from './cli-connection-revision.js';
 
 export type ConnectedCliExecutableSelection =
   | { status: 'unbound'; reason: 'not_connected' | 'not_observed' }
   | { status: 'selected'; executablePath: string; executableIdentity: string }
   | { status: 'blocked'; reason: 'forgotten' | 'malformed_roster' | 'roster_identity_mismatch'
-    | 'malformed_health' | 'health_identity_mismatch' | 'not_installed'
+    | 'malformed_health' | 'health_identity_mismatch' | 'connection_revision_mismatch' | 'not_installed'
     | 'missing_executable_identity' | 'unsupported_windows_launcher' };
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -67,6 +68,9 @@ export function selectConnectedCliExecutable(
   if (!Object.hasOwn(health, 'id') || !Object.hasOwn(health, 'command')
     || health.id !== target.id || health.command !== target.command) {
     return { status: 'blocked', reason: 'health_identity_mismatch' };
+  }
+  if (!cliHealthMatchesConnection(connected, health)) {
+    return { status: 'blocked', reason: 'connection_revision_mismatch' };
   }
   if (health.installed === false) return { status: 'blocked', reason: 'not_installed' };
   if (!Object.hasOwn(health, 'installed') || health.installed !== true) return { status: 'blocked', reason: 'malformed_health' };

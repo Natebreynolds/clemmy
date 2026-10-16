@@ -16,7 +16,8 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { CLI_CATALOG, recordConnectedCli } = await import('./catalog.js');
-const { syncConnectedCliBin } = await import('./connected-cli-bin.js');
+const { syncConnectedCliBin, syncConnectedCliBinLocked } = await import('./connected-cli-bin.js');
+const { withConnectedCliStateLock } = await import('./connected-cli-state.js');
 const { connectedCliBinDir, mergedSpawnEnv } = await import('../../runtime/spawn-env.js');
 
 function fakeCli(dir: string, says: string): string {
@@ -29,10 +30,11 @@ function fakeCli(dir: string, says: string): string {
 
 const decoy = fakeCli(path.join(TMP_HOME, 'node-bin'), 'decoy');
 const verified = fakeCli(path.join(TMP_HOME, 'brew-bin'), 'verified');
-recordConnectedCli(CLI_CATALOG.find((entry) => entry.id === 'github')!);
+const connection = recordConnectedCli(CLI_CATALOG.find((entry) => entry.id === 'github')!);
 
 function health(authStatus: 'ok' | 'signed_out' | 'unknown', binaryPath = verified) {
-  return { github: { id: 'github', command: 'gh', installed: true, authStatus, binaryPath, checkedAt: new Date().toISOString() } };
+  return { github: { id: 'github', command: 'gh', installed: true, authStatus, binaryPath,
+    connectionRevision: connection.connectionRevision, checkedAt: new Date().toISOString() } };
 }
 
 function runGh(): string {
@@ -61,11 +63,12 @@ test('a recorded binary that is gone gets no link', { skip: process.platform ===
 });
 
 test('a transient on an unverified binary cannot replace a previously verified link', { skip: process.platform === 'win32' }, () => {
-  syncConnectedCliBin(health('ok'));
+  const previous = health('ok');
+  syncConnectedCliBin(previous);
   const candidate = health('unknown', decoy);
-  syncConnectedCliBin({ github: { ...candidate.github,
+  withConnectedCliStateLock(() => syncConnectedCliBinLocked({ github: { ...candidate.github,
     lastProbeError: { exitCode: null, timedOut: true, stderrHead: '' },
-  } });
+  } }, previous));
   assert.equal(existsSync(path.join(connectedCliBinDir()!, 'gh')), false,
     'unknown candidate B is not installed as if A account had verified it');
 });
@@ -78,8 +81,9 @@ test('a stale ok verdict for the same executable keeps the exact verified link',
   assert.equal(runGh(), 'verified', 'a transient is not an instruction to sign in again or choose another binary');
 });
 
-test('a CLI that is not connected gets no link', { skip: process.platform === 'win32' }, () => {
+test('a missing roster does not authorize removal of an unproved orphan link', { skip: process.platform === 'win32' }, () => {
   writeFileSync(path.join(TMP_HOME, 'state', 'connected-clis.json'), JSON.stringify({ version: 'v1', entries: {} }));
   syncConnectedCliBin(health('ok'));
-  assert.equal(existsSync(path.join(connectedCliBinDir()!, 'gh')), false);
+  assert.equal(existsSync(path.join(connectedCliBinDir()!, 'gh')), true,
+    'actual disconnect owns exact retirement; a later empty-roster sweep cannot prove ownership');
 });

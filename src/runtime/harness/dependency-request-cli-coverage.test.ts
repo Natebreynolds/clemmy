@@ -15,7 +15,7 @@ mkdirSync(path.join(HOME, 'state'), { recursive: true });
 const eventlog = await import('./eventlog.js');
 const dependencies = await import('./dependency-request.js');
 const continuity = await import('../../memory/task-continuity.js');
-const { CLI_CATALOG, recordConnectedCli } = await import('../../integrations/cli-catalog/catalog.js');
+const { CLI_CATALOG, recordConnectedCli, readConnectedClis } = await import('../../integrations/cli-catalog/catalog.js');
 const { connectedCliCandidatesForApp } = await import('../../integrations/cli-catalog/connected-cli-coverage.js');
 
 const QUESTION = 'GitHub needs to be connected before I can continue this task. Connect it in Clementine, or pause to change the request.';
@@ -24,7 +24,9 @@ const OPTIONS = ['I’ve connected GitHub — continue this same task', 'Pause s
 function health(authStatus: 'ok' | 'signed_out'): void {
   writeFileSync(path.join(HOME, 'state', 'cli-auth-health.json'), JSON.stringify({
     version: 'v1',
-    entries: { github: { id: 'github', command: 'gh', installed: true, authStatus, binaryPath: '/controlled/bin/gh', username: 'fixture-owner', checkedAt: new Date().toISOString() } },
+    entries: { github: { id: 'github', command: 'gh', installed: true, authStatus, binaryPath: '/controlled/bin/gh',
+      connectionRevision: readConnectedClis().github?.connectionRevision,
+      username: 'fixture-owner', checkedAt: new Date().toISOString() } },
   }));
 }
 

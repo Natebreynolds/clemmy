@@ -6,7 +6,8 @@
  */
 import { test, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -14,7 +15,7 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-cli-coverage-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
-const { CLI_CATALOG } = await import('./catalog.js');
+const { CLI_CATALOG, recordConnectedCli, reconnectCli } = await import('./catalog.js');
 const { connectedCliCandidates, connectedCliCandidatesForApp, connectedCliCoveringApp,
   connectedCliRunnerText, usableConnectedClis, CLI_AUTH_OBSERVATION_MAX_AGE_MS } = await import('./connected-cli-coverage.js');
 const { runsLocalCommandLines } = await import('../../tools/tool-registry.js');
@@ -61,6 +62,46 @@ test('fresh exact health confirms authentication only, with explicit unverified 
   // Search aliases are not identities: a generic tag never covers an app.
   assert.deepEqual(connectedCliCandidatesForApp('deploy', NOW), []);
   assert.deepEqual(connectedCliCandidatesForApp('git-hub', NOW), [], 'similar punctuation is not an identity');
+});
+
+test('a reconnect between public consumer reads cannot attach B authentication to retained incarnation A', () => {
+  const first = recordConnectedCli(CLI_CATALOG.find(entry => entry.id === 'github')!);
+  writeHealth({ github: { command: 'gh', authStatus: 'ok', username: 'incarnation-a',
+    connectionRevision: first.connectionRevision } });
+  const rosterFile = path.join(TMP_HOME, 'state', 'connected-clis.json');
+  const original = fs.readFileSync;
+  let interposed = false;
+  let secondRevision: string | undefined;
+  fs.readFileSync = ((...args: Parameters<typeof fs.readFileSync>) => {
+    const value = original(...args);
+    if (String(args[0]) === rosterFile && !interposed) {
+      // The consumer retains A's exact bytes; the following public health
+      // read sees an actual reconnect and its independent exact B observation.
+      interposed = true;
+      const second = reconnectCli('github')!;
+      secondRevision = second.connectionRevision;
+      writeHealth({ github: { command: 'gh', authStatus: 'ok', username: 'incarnation-b',
+        connectionRevision: second.connectionRevision } });
+    }
+    return value;
+  }) as typeof fs.readFileSync;
+  syncBuiltinESMExports();
+  try {
+    const retained = connectedCliCandidates(NOW).find(candidate => candidate.id === 'github')!;
+    assert.equal(interposed, true);
+    assert.notEqual(first.connectionRevision, secondRevision);
+    assert.equal(retained.authentication.state, 'unverified');
+    assert.equal(retained.authentication.reason, 'connection_revision_mismatch');
+    assert.deepEqual(retained.account, { state: 'unverified' });
+    assert.equal(retained.signedInAs, undefined);
+    assert.equal(retained.intendedAccount, 'unverified');
+    assert.equal(retained.operationReadiness, 'unverified');
+    const fresh = connectedCliCandidates(NOW).find(candidate => candidate.id === 'github')!;
+    assert.equal(fresh.authentication.state, 'confirmed');
+    assert.deepEqual(fresh.account, { state: 'observed', label: 'incarnation-b' });
+    assert.equal(fresh.intendedAccount, 'unverified');
+    assert.equal(fresh.operationReadiness, 'unverified');
+  } finally { fs.readFileSync = original; syncBuiltinESMExports(); }
 });
 
 test('signed-out and uninstalled CLIs remain visible without being usable authentication observations', () => {

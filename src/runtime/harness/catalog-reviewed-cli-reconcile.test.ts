@@ -352,6 +352,7 @@ function selectedSf(name: string): string {
 function selectSf(binaryPath: string, patch: Record<string, unknown> = {}): void {
   writeFileSync(healthFile, JSON.stringify({ version: 'v1', entries: {
     salesforce: { id: 'salesforce', command: 'sf', installed: true, authStatus: 'unknown',
+      connectionRevision: catalog.readConnectedClis().salesforce?.connectionRevision,
       binaryPath, checkedAt: new Date().toISOString(), ...patch },
   } }));
 }

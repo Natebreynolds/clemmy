@@ -35,6 +35,20 @@ test('only absent connected/health observations allow bootstrap fallback', () =>
     { status: 'unbound', reason: 'not_connected' });
 });
 
+test('new connection incarnations require their own retained executable observation while legacy/bootstrap remains compatible', () => {
+  const connected = { fixture: { ...roster.fixture, connectionRevision: 'new-incarnation' } };
+  for (const connectionRevision of [undefined, 'old-incarnation', '', null]) {
+    const health = { fixture: { ...observed, ...(connectionRevision === undefined ? {} : { connectionRevision }) } };
+    assert.deepEqual(selectConnectedCliExecutable(target, { connected, health, forgotten: [] }),
+      { status: 'blocked', reason: 'connection_revision_mismatch' });
+  }
+  assert.equal(selectConnectedCliExecutable(target, { connected,
+    health: { fixture: { ...observed, connectionRevision: 'new-incarnation' } }, forgotten: [] }).status, 'selected');
+  assert.deepEqual(selectConnectedCliExecutable(target, { connected, health: {}, forgotten: [] }),
+    { status: 'unbound', reason: 'not_observed' }, 'missing-observation bootstrap is unchanged');
+  assert.equal(selectConnectedCliExecutable(target, { connected: roster, health: { fixture: observed }, forgotten: [] }).status, 'selected');
+});
+
 test('forgotten or mismatched observations cannot silently become another PATH executable', () => {
   assert.deepEqual(selectConnectedCliExecutable(target, { connected: roster, health: {}, forgotten: ['fixture'] }),
     { status: 'blocked', reason: 'forgotten' });

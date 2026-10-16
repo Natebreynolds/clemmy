@@ -694,6 +694,30 @@ function formatRunAge(iso?: string): string {
  */
 const STEP_OUTPUT_PAGE_CHARS = 12_000;
 
+/** Exact status evidence comes from one safe run file, never a neighboring
+ * JSON document or a record whose retained identity belongs to another run. */
+function readExactWorkflowRunForStatus(runId: string):
+  | { ok: true; record: Record<string, unknown> }
+  | { ok: false; message: string } {
+  if (!runId || !/^[a-zA-Z0-9_.:-]+$/.test(runId)) {
+    return { ok: false, message: 'Cannot read workflow run: the run id must be a safe exact basename.' };
+  }
+  try {
+    const record: unknown = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8'));
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      return { ok: false, message: `Cannot verify workflow run "${runId}": its saved record is not an object. No run evidence was returned.` };
+    }
+    if ((record as Record<string, unknown>).id !== runId) {
+      return { ok: false, message: `Cannot verify workflow run "${runId}": its saved identity does not match. No run evidence was returned.` };
+    }
+    return { ok: true, record: record as Record<string, unknown> };
+  } catch (err) {
+    return { ok: false, message: (err as NodeJS.ErrnoException)?.code === 'ENOENT'
+      ? `Workflow run "${runId}" not found.`
+      : `Failed to read workflow run "${runId}": its saved record is unavailable or invalid. No run evidence was returned.` };
+  }
+}
+
 /**
  * One step's output from a run, whole and paged: what the step actually
  * produced, so a conversation about a run reads the work itself rather than
@@ -2663,24 +2687,23 @@ export function registerOrchestrationTools(server: McpServer): void {
       offset: z.number().int().min(0).optional().describe('With step_id: the character to continue reading from.'),
     },
     async ({ run_id, workflow, step_id, offset }) => {
-      if (run_id && run_id.trim() && step_id && step_id.trim()) {
-        const filePath = path.join(WORKFLOW_RUNS_DIR, `${run_id}.json`);
-        if (!existsSync(filePath)) return textResult(`Workflow run "${run_id}" not found.`);
+      // Preserve blank optional inputs as the existing overview/history form.
+      // Every nonempty supplied identity must still pass the exact-file fence.
+      const exactRun = run_id?.trim() ? readExactWorkflowRunForStatus(run_id) : undefined;
+      if (exactRun && !exactRun.ok) return textResult(exactRun.message);
+      if (run_id !== undefined && exactRun?.ok && step_id && step_id.trim()) {
         try {
-          const record = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-          return textResult(renderWorkflowRunStepOutput(record, run_id, step_id.trim(), offset ?? 0));
+          return textResult(renderWorkflowRunStepOutput(exactRun.record, run_id, step_id.trim(), offset ?? 0));
         } catch (err) {
           return textResult(`Failed to read run ${run_id}: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-      if ((!run_id || !run_id.trim()) && workflow && workflow.trim()) {
+      if (!exactRun && workflow && workflow.trim()) {
         return textResult(renderWorkflowRunHistory(workflow.trim()));
       }
-      if (run_id && run_id.trim()) {
-        const filePath = path.join(WORKFLOW_RUNS_DIR, `${run_id}.json`);
-        if (!existsSync(filePath)) return textResult(`Workflow run "${run_id}" not found.`);
+      if (run_id !== undefined && exactRun?.ok) {
         try {
-          const record = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+          const record = exactRun.record;
           // Per-step ledger: which steps produced what / which blocked — the
           // detail a user actually needs to diagnose "step 3 of 7 failed"
           // without opening the console. Values truncated; the run record on

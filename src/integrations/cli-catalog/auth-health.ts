@@ -1,11 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../../config.js';
 import { withDaemonRuntimePhase } from '../../daemon/phase.js';
 import { findSafeCliCommand } from '../../runtime/cli-discovery.js';
 import { mergedSpawnEnv } from '../../runtime/spawn-env.js';
-import { syncConnectedCliBin } from './connected-cli-bin.js';
+import { connectedCliPinTarget, retireConnectedCliPin, syncConnectedCliBinLocked } from './connected-cli-bin.js';
+import { cliHealthMatchesConnection, connectedCliRevision, readCliHealthEntries,
+  readConnectedCliState, withConnectedCliStateLock, writeCliHealthEntries } from './connected-cli-state.js';
 import { runCliProbeProcess } from '../../runtime/cli-probe-process.js';
 import { cliHealthExecutableIdentity } from './cli-executable-identity.js';
 export { cliHealthExecutableIdentity } from './cli-executable-identity.js';
@@ -13,7 +13,6 @@ import { getSavedClis } from '../../runtime/saved-clis.js';
 import {
   CLI_CATALOG,
   findCatalogEntry,
-  readConnectedClis,
   type CliAuthProbe,
   type CliCatalogEntry,
 } from './catalog.js';
@@ -58,6 +57,8 @@ export interface CliHealth {
   /** The executable this check ran, so the shell runs the same one. */
   binaryPath?: string;
   checkedAt: string;
+  /** Exact host connection incarnation observed before this check began. */
+  connectionRevision?: string;
   /**
    * Present when `authStatus` is a KEPT verdict: the latest probe failed
    * transiently (timeout, non-zero exit without the signed-out pattern, an
@@ -72,19 +73,13 @@ export interface CliHealth {
 
 const PROBE_ERROR_HEAD_CHARS = 200;
 
-const HEALTH_FILE = path.join(BASE_DIR, 'state', 'cli-auth-health.json');
 /** Mirror of composio's CLI_STATUS_TTL_MS — probes are cheap but not free. */
 const HEALTH_MEMO_TTL_MS = 45_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
 const SWEEP_CONCURRENCY = 3;
 
-interface HealthFile {
-  version: 'v1';
-  entries: Record<string, CliHealth>;
-}
-
-const memo = new Map<string, { at: number; value: CliHealth }>();
-const inFlight = new Map<string, Promise<CliHealth>>();
+const memo = new Map<string, { at: number; ownership: string; value: CliHealth }>();
+const inFlight = new Map<string, { ownership: string; promise: Promise<CliHealth> }>();
 type RecoveredListener = (health: CliHealth) => void;
 const recoveredListeners = new Set<RecoveredListener>();
 const signedOutListeners = new Set<RecoveredListener>();
@@ -96,29 +91,19 @@ export function stripAnsi(text: string): string {
   return text.replace(/\u001B\[[0-9;]*[A-Za-z]/g, '');
 }
 
-function readHealthFile(): Record<string, CliHealth> {
-  if (!existsSync(HEALTH_FILE)) return {};
-  try {
-    const parsed = JSON.parse(readFileSync(HEALTH_FILE, 'utf-8')) as HealthFile;
-    return parsed && parsed.entries ? parsed.entries : {};
-  } catch {
-    // A cache, not evidence — a corrupt file resets to empty and the next
-    // sweep rebuilds it. Transition dedupe degrades to at-most-one-extra
-    // event, which the notification id-bucketing absorbs.
-    return {};
-  }
-}
-
-function writeHealthFile(entries: Record<string, CliHealth>): void {
-  mkdirSync(path.dirname(HEALTH_FILE), { recursive: true });
-  const tmp = `${HEALTH_FILE}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ version: 'v1', entries } satisfies HealthFile, null, 2), 'utf-8');
-  renameSync(tmp, HEALTH_FILE);
-}
-
 /** Last persisted health, no probes — safe for request paths. */
 export function readPersistedHealth(): Record<string, CliHealth> {
-  return readHealthFile();
+  const entries = readCliHealthEntries();
+  const state = readConnectedCliState();
+  for (const id of Object.keys(entries)) {
+    const connected = state.entries[id];
+    const observed = entries[id];
+    const revisioned = connected && typeof connected === 'object' && Object.hasOwn(connected, 'connectionRevision')
+      || observed && typeof observed === 'object' && Object.hasOwn(observed, 'connectionRevision');
+    if (state.forgotten.includes(id) || Object.hasOwn(state.entries, id) && revisioned
+      && !cliHealthMatchesConnection(connected, observed)) delete entries[id];
+  }
+  return entries;
 }
 
 export function invalidateCliHealth(id?: string): void {
@@ -235,7 +220,9 @@ interface RosterItem {
 
 function rosterItems(): RosterItem[] {
   const items = new Map<string, RosterItem>();
-  const connected = readConnectedClis();
+  const state = readConnectedCliState();
+  const connected = state.entries;
+  const forgotten = new Set(state.forgotten);
   for (const record of Object.values(connected)) {
     const catalog = findCatalogEntry(record.id);
     items.set(record.id, {
@@ -253,8 +240,9 @@ function rosterItems(): RosterItem[] {
     if (connectedCommands.has(command)) continue;
     const catalog = byCommand.get(command);
     if (catalog && items.has(catalog.id)) continue;
-    items.set(catalog?.id ?? `saved:${command}`, {
-      id: catalog?.id ?? `saved:${command}`,
+    const id = catalog && !forgotten.has(catalog.id) ? catalog.id : `saved:${command}`;
+    items.set(id, {
+      id,
       command,
       probe: catalog?.authProbe,
     });
@@ -388,6 +376,7 @@ function settleTransientProbe(next: CliHealth, previous: CliHealth | undefined):
     // executable's account under a different or missing path.
     ...(next.binaryPath ? { binaryPath: next.binaryPath } : {}),
     checkedAt: next.checkedAt,
+    ...(next.connectionRevision ? { connectionRevision: next.connectionRevision } : {}),
     ...(staleSince ? { staleSince } : {}),
     lastProbeError: next.lastProbeError,
   };
@@ -423,17 +412,46 @@ export function cliHealthStaleNote(health: CliHealth, now: number = Date.now()):
 /** Persist + fire the recovered event on a signed_out→ok transition.
  *  The persisted previous state is the transition authority so a daemon
  *  restart can neither double-fire nor swallow a recovery. */
-function commitHealth(probed: CliHealth): CliHealth {
-  const entries = readHealthFile();
-  const previous = entries[probed.id];
-  const next = settleTransientProbe(probed, previous);
-  entries[next.id] = next;
-  writeHealthFile(entries);
-  try {
-    syncConnectedCliBin(entries);
-  } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'connected CLI links not updated');
-  }
+function probeOwnership(id: string, command: string): string | null {
+  const state = readConnectedCliState();
+  if (state.forgotten.includes(id)) return null;
+  if (!Object.hasOwn(state.entries, id)) return `unconnected:${id}:${command}`;
+  const row = state.entries[id];
+  return row?.id === id && row.command === command ? connectedCliRevision(row) : null;
+}
+
+function commitHealth(probed: CliHealth, ownership: string): { health: CliHealth; committed: boolean } {
+  const publication = withConnectedCliStateLock(() => {
+    if (probeOwnership(probed.id, probed.command) !== ownership) {
+      // A completed old check is not a current account/path observation. Its
+      // caller receives neutral inventory, without memo/pin/listener effects.
+      return null;
+    }
+    const entries = readCliHealthEntries();
+    const previousEntries = { ...entries };
+    const state = readConnectedCliState();
+    const previous = Object.hasOwn(state.entries, probed.id)
+      && !cliHealthMatchesConnection(state.entries[probed.id], entries[probed.id]) ? undefined : entries[probed.id];
+    const next = settleTransientProbe(probed, previous);
+    // Retire A before replacing its only durable ownership observation with B.
+    // An unlink failure leaves A's health available for an exact safe retry.
+    if (previous && Object.hasOwn(state.entries, next.id)
+      && connectedCliPinTarget(next) !== previous.binaryPath) {
+      retireConnectedCliPin(state.entries[next.id], previous);
+    }
+    entries[next.id] = next;
+    writeCliHealthEntries(entries);
+    try { syncConnectedCliBinLocked(entries, previousEntries); }
+    catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'connected CLI links not updated');
+    }
+    return { previous, next };
+  });
+  if (!publication) return { committed: false, health: {
+    id: probed.id, command: probed.command, installed: probed.installed,
+    authStatus: 'unknown', checkedAt: probed.checkedAt,
+  } };
+  const { previous, next } = publication;
   const recoveredKnownFailure = previous?.authStatus === 'signed_out'
     || previous?.issue === 'configuration_required' || previous?.issue === 'credential_store_unavailable';
   if (recoveredKnownFailure && next.authStatus === 'ok' && !next.lastProbeError && !next.staleSince) {
@@ -454,7 +472,7 @@ function commitHealth(probed: CliHealth): CliHealth {
       }
     }
   }
-  return next;
+  return { health: next, committed: true };
 }
 
 /** Resolve metadata only: a unique command name is an alias for its registered
@@ -472,27 +490,34 @@ export async function getCliHealth(id: string, opts: { force?: boolean } = {}): 
   const canonicalId = resolveCliHealthId(id);
   if (!canonicalId) throw new Error(`Unknown or ambiguous CLI scope ${JSON.stringify(id)}; use a registered catalog or saved CLI id.`);
   id = canonicalId;
+  const { item, ownership } = withConnectedCliStateLock(() => {
+    const item = rosterItems().find((candidate) => candidate.id === id)
+      ?? ((): RosterItem | undefined => {
+        const catalog = findCatalogEntry(id);
+        return catalog ? { id, command: catalog.command, probe: catalog.authProbe } : undefined;
+      })();
+    if (!item) throw new Error(`CLI scope ${JSON.stringify(id)} is no longer registered; inspect the current roster.`);
+    return { item, ownership: probeOwnership(id, item.command) };
+  });
+  if (!ownership) throw new Error(`CLI scope ${JSON.stringify(id)} was disconnected or changed; inspect the current connection.`);
   const cached = memo.get(id);
-  if (!opts.force && cached && Date.now() - cached.at < HEALTH_MEMO_TTL_MS) return cached.value;
+  if (!opts.force && cached?.ownership === ownership && Date.now() - cached.at < HEALTH_MEMO_TTL_MS) return cached.value;
   const running = inFlight.get(id);
-  if (running && !opts.force) return running;
+  if (running?.ownership === ownership && !opts.force) return running.promise;
 
-  const item = rosterItems().find((candidate) => candidate.id === id)
-    ?? ((): RosterItem | undefined => {
-      const catalog = findCatalogEntry(id);
-      return catalog ? { id, command: catalog.command, probe: catalog.authProbe } : undefined;
-    })();
-  if (!item) throw new Error(`CLI scope ${JSON.stringify(id)} is no longer registered; inspect the current roster.`);
   const promise = probeHealth(item)
     .then((probed) => {
       // Memoize the SETTLED record: a transient must not be served for 45s
       // as 'error' while the persisted truth kept the last verdict.
-      const health = commitHealth(probed);
-      memo.set(id, { at: Date.now(), value: health });
+      if (!ownership.startsWith('unconnected:')) probed.connectionRevision = ownership;
+      const { health, committed } = commitHealth(probed, ownership);
+      if (committed) memo.set(id, { at: Date.now(), ownership, value: health });
       return health;
     })
-    .finally(() => inFlight.delete(id));
-  inFlight.set(id, promise);
+    .finally(() => {
+      if (inFlight.get(id)?.promise === promise) inFlight.delete(id);
+    });
+  inFlight.set(id, { ownership, promise });
   return promise;
 }
 
