@@ -1115,7 +1115,8 @@ function MessageRow({
 
   if (message.approval) {
     // The decision stays on its card; it does not claim execution finished.
-    if (message.approval.resolution === 'approved' || message.approval.resolution === 'declined') return (
+    if (!message.approval.queued
+      && (message.approval.resolution === 'approved' || message.approval.resolution === 'declined')) return (
       <div class="turn turn-approval" role="status">
         <div class="approval-head">{message.approval.subject}</div>
         <div class="approval-reason">{message.approval.resolution === 'approved' ? 'Approved' : 'Declined'}</div>
@@ -1274,6 +1275,8 @@ function MessageRow({
           <div class="approval-reason">You asked for a change — the revised version is below. Nothing was sent from this one.</div>
         ) : message.approval.resolution === 'expired' ? (
           <div class="approval-reason">Expired without an answer — it did not run.</div>
+        ) : message.approval.resolution === 'approved' || message.approval.resolution === 'declined' ? (
+          <div class="approval-reason" role="status">{message.approval.resolution === 'approved' ? 'Approved' : 'Declined'}</div>
         ) : null}
       </div>
     );
