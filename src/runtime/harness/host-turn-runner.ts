@@ -13114,7 +13114,11 @@ export function hostStopNarrationDirective(
     fact,
     ...(detail ? [`Machine detail: ${detail}`] : []),
     ...(kept ? [kept] : []),
-    'Write your reply to the owner now, as yourself, from the conversation above and this fact: what you did, what did not happen or is not certain, what is kept, and the one next step (what you need from them, or what you will do when they say go).',
+    'Write your reply to the owner now, as yourself, from the conversation above and this fact: what you did, what did not happen or is not certain, and what is kept.',
+    // A stop ends in the owner's hands, never in a statement they cannot
+    // answer (owner 2026-10-16: "if she stops she asks for clarification vs
+    // just stopping or looping"). Their answer resumes this same task.
+    'End with ONE specific question the owner can answer to move this forward: a value only they know, a choice between two or three concrete ways to proceed (name them), or whether to try again with a stated change. Never end on a statement.',
     'Do not call tools. Claim nothing the conversation does not show. Do not mention the harness, checkpoints, reconciliation, tool names, ids or handles.',
   ].join('\n');
 }
