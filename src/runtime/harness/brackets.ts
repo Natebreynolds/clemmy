@@ -3109,6 +3109,21 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // it ends the turn (handleRunError → limit_exceeded) instead of
       // letting the model retry a call it cannot vary (the 84×/3-min hang).
       if (decision.action === 'escalate') {
+        // On the host lane the host owns each call's settlement and the turn's
+        // stop. An escalation thrown from inside a carried call was settled
+        // one way for the carrier and another for its operation, the step's
+        // checkpoint could not be saved, and the owner read a canned
+        // "could not reopen the saved checkpoint" instead of Clem (live
+        // 2026-10-16). There it is the same pre-dispatch refusal a block is,
+        // telling the model to stop and report; a model that keeps calling
+        // meets the host's refused-step bound and Clem's own stop.
+        if (ctx.hostOwnsToolDeadlineAndSettlement) {
+          throw new ToolGuardrailBlocked({
+            ...decision,
+            action: 'block',
+            reason: `${decision.reason} Do not call it again: report what was and was not done.`,
+          });
+        }
         throw new ToolGuardrailEscalated(decision);
       }
       if (decision.action === 'block' || decision.action === 'halt') {
