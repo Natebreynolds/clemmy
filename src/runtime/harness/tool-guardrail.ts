@@ -1350,7 +1350,18 @@ export function evaluateToolCall(
   // first-class local read 150× with identical args and identical retained
   // bytes while unmetered task_work kept continuing.
   const controlPlaneRepeat = actionTopologyRoleFor(toolName) === 'control';
-  if ((isMut || controlPlaneRepeat) && exactCount >= thresholds.exactArgsHardStopAt) {
+  // A control-plane READ of state the turn is changing is the exception: a
+  // Workspace view re-read after each edit has identical arguments and a new
+  // answer every time (live 2026-10-16: a build checked its view twelve times
+  // across eight edits and the turn was ended as a runaway). Its last two
+  // results differing is the same changing-world proof the polling exemption
+  // below uses; a byte-identical answer still reaches the backstop.
+  const controlReadChanging = controlPlaneRepeat
+    && !isMut
+    && !toolReadsRetainedOutput(toolName)
+    && Boolean(trackerScopeId)
+    && identicalCallResultsAreChanging(trackerScopeId!, signature);
+  if ((isMut || (controlPlaneRepeat && !controlReadChanging)) && exactCount >= thresholds.exactArgsHardStopAt) {
     return {
       action: 'escalate',
       signature,
