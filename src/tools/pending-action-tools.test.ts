@@ -142,9 +142,10 @@ test('pending_action_queue accepts the exact source-backed recipient set', async
     }));
 
   assert.match(response.content[0].text, /Pending action queued/);
-  assert.match(response.content[0].text, /^NEXT: end this turn with one plain question/m);
-  assert.match(response.content[0].text, /opens the one card from this record/);
-  assert.match(response.content[0].text, /pending_action_execute/);
+  // No intent on an approval-bound action asks now: the card opens at this
+  // turn's boundary, so the reply promises only what the host will do.
+  assert.match(response.content[0].text, /^QUEUED FOR APPROVAL:/m);
+  assert.match(response.content[0].text, /host turn boundary handles registration/);
   assert.equal(listPendingActions({ sessionId: session.id }).length, 1);
 });
 

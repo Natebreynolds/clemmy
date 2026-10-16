@@ -290,6 +290,12 @@ export function registerPendingActionTools(server: McpServer): void {
       if (needsFormalApproval && !sessionId) {
         return textResult('pending_action_queue refused: an approval-bound action requires an authoritative harness session.');
       }
+      // An approval-bound action queued now is the one the owner is about to
+      // be asked about, so its one card opens at this turn's boundary unless
+      // the caller asked only to stage it. The no-intent prose bridge remains
+      // for edges recorded before the intent existed.
+      const requestedIntent: PendingActionApprovalIntent | undefined = approvalIntent
+        ?? (needsFormalApproval ? 'request_now' : undefined);
       if (sessionId && shape.mutating && shape.irreversible && isRecipientIntegrityGateEnabled()) {
         const recipientResult = evaluateRecipientSetIntegrity(sessionId, payload);
         if (recipientResult.action === 'block') {
@@ -353,9 +359,9 @@ export function registerPendingActionTools(server: McpServer): void {
           toolName: record.toolName,
           actionKind: record.kind,
           approvalRequired: needsFormalApproval,
-          ...(approvalIntent ? {
-            approvalIntent,
-            autoMaterialize: approvalIntent === 'request_now',
+          ...(requestedIntent ? {
+            approvalIntent: requestedIntent,
+            autoMaterialize: requestedIntent === 'request_now',
           } : {}),
           payloadHash: record.payloadHash,
           targetSummary: record.targetSummary,
@@ -371,16 +377,16 @@ export function registerPendingActionTools(server: McpServer): void {
             'pending_action_queue failed safely: the approval-bound payload was not accepted because its durable request edge could not be recorded. Nothing is authorized or executable; retry the queue once.',
           );
         }
-      } else if (approvalIntent && attribution.sourceUserSeq) {
+      } else if (requestedIntent && attribution.sourceUserSeq) {
         const currentIntent = requestOwnedApprovalIntentState({
           sessionId,
           sourceUserSeq: attribution.sourceUserSeq,
           pendingActionId: record.id,
           payloadHash: record.payloadHash,
         });
-        const shouldPromote = approvalIntent === 'request_now'
+        const shouldPromote = requestedIntent === 'request_now'
           && currentIntent !== 'request_now';
-        const shouldRecordQueueOnly = approvalIntent === 'queue_only'
+        const shouldRecordQueueOnly = requestedIntent === 'queue_only'
           && currentIntent !== 'request_now'
           && currentIntent !== 'queue_only';
         if (
@@ -390,8 +396,8 @@ export function registerPendingActionTools(server: McpServer): void {
             toolName: record.toolName,
             actionKind: record.kind,
             approvalRequired: needsFormalApproval,
-            approvalIntent,
-            autoMaterialize: approvalIntent === 'request_now',
+            approvalIntent: requestedIntent,
+            autoMaterialize: requestedIntent === 'request_now',
             payloadHash: record.payloadHash,
             targetSummary: record.targetSummary,
             ...attribution,
@@ -411,7 +417,7 @@ export function registerPendingActionTools(server: McpServer): void {
       const effectiveApprovalIntent = persistedIntent === 'request_now'
         || persistedIntent === 'queue_only'
         ? persistedIntent
-        : approvalIntent;
+        : requestedIntent;
       const nextStep = queuedActionNextStep(
         record,
         needsFormalApproval,
@@ -454,7 +460,13 @@ export function registerPendingActionTools(server: McpServer): void {
     async ({ id }) => {
       const record = getPendingAction(id);
       if (!record || !activeContextOwns(record)) return textResult(`No pending action found with id ${id}.`);
-      return textResult(`${formatPendingAction(record, { verbose: true })}\n\nPayload:\n${JSON.stringify(record.payload, null, 2)}`);
+      // Queued with no card means the owner was never asked: nothing can run
+      // it yet, and a yes typed in chat approves nothing.
+      const unasked = record.status === 'queued' && !record.approvalId
+        ? '\n\nNEXT: no card is open for this action, so it is not approved and pending_action_execute cannot run it. '
+          + 'To ask the owner, call pending_action_queue again with the same toolName and payloadJson; its one card opens when this turn ends.'
+        : '';
+      return textResult(`${formatPendingAction(record, { verbose: true })}\n\nPayload:\n${JSON.stringify(record.payload, null, 2)}${unasked}`);
     },
   );
 
