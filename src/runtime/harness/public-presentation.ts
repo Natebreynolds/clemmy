@@ -16,6 +16,7 @@
  * The returned rows deliberately keep the legacy EventRow wire shape so the
  * desktop clients can adopt the boundary without a protocol rewrite.
  */
+import { withoutHostReceiptLines } from '../host-receipt-lines.js';
 import { getRunAttemptSourceUserEvent, listEvents, openEventLog, type EventRow } from './eventlog.js';
 import { BoundaryError } from '../boundary-error.js';
 import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
@@ -519,7 +520,9 @@ function projectReplyText(value: unknown, fallback: string, depth: number): stri
     const record = value as Record<string, unknown>;
     return projectReplyText(record.reply, fallback, depth + 1);
   }
-  const candidate = stripLeakedDecisionAssignment(text(value) ?? '');
+  // A write tool's machine receipt (its marker, JSON facts and artifact
+  // lines) is the host's evidence, never words for a person.
+  const candidate = stripLeakedDecisionAssignment(withoutHostReceiptLines(text(value) ?? '').trim());
   if (!candidate) return fallback;
 
   // Preserve the compatibility contract for a whole legacy JSON decision that

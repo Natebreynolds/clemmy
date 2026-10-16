@@ -1252,3 +1252,9 @@ test('the model-facing durable completion text keeps the checkpoint that every p
   assert.equal(projected!.data.reply, head);
   assert.doesNotMatch(JSON.stringify(projected!.data), /rh_|landed:/);
 });
+
+test('a public reply never carries a write tool\'s machine receipt', async () => {
+  const { publicReplyText: project } = await import('./public-presentation.js');
+  const reply = project('Committed file at /tmp/notes/out.md (12 chars). [clementine:host-local-write-commit:v1] {"version":1,"createdId":"file-1","handle":"h","contentDigest":"abc"}\nartifactId: local-file-receipt:v1:W2Nsg\nhandle: h\ncontentDigest: abc\npath: /tmp/notes/out.md');
+  assert.equal(reply, 'Committed file at /tmp/notes/out.md (12 chars).\npath: /tmp/notes/out.md');
+});
