@@ -1,7 +1,7 @@
 /** Run: node scripts/run-tests-isolated.mjs src/execution/workflow-runner-v3-call.integration.red.test.ts */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -839,6 +839,37 @@ test('BARE CALL CONSENT — a human-triggered run is the approval for its ordina
     'the harness recorded the human-run decision itself; no autonomous default and no queue-source resolver',
   );
   assert.equal(eventlog.listEvents(sessionId, { types: ['user_input_received'] }).length, 0);
+});
+
+test('BARE CALL CONSENT — a run resumed after a stop carries the authority of the run it continues', async () => {
+  // Stop and resume is the same work continued: the resumed run must not
+  // park an ordinary write the person already approved by starting the run.
+  const installed = bareFixture('bare-resumed-run-authority', 'external_write');
+  installed.workflow.enabled = true;
+  workflowStore.writeWorkflow(installed.workflow.name, installed.workflow);
+  const started = workflowQueue.queueWorkflowRun(installed.workflow.name, installed.ctx.inputs, { source: 'mobile', dedupe: false });
+  assert.equal(started.status, 'queued', started.message);
+  // The person stopped it before its write.
+  const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+  const startedFile = path.join(WORKFLOW_RUNS_DIR, `${started.id}.json`);
+  writeFileSync(startedFile, JSON.stringify({ ...JSON.parse(readFileSync(startedFile, 'utf8')),
+    status: 'cancelled', finishedAt: new Date().toISOString(), error: 'Cancelled from the desktop dashboard.',
+    mutationContractSnapshot: (await import('./workflow-enforce.js')).buildWorkflowMutationContractSnapshot(installed.workflow.steps) }));
+  const resumed = workflowQueue.requeueWorkflowFromRun(started.id!, {
+    source: 'board',
+    recoveryIntent: { kind: 'safe_rerun', sourceRunId: started.id!, requestedFrom: 'board', reason: 'continue after stop' },
+  });
+  assert.equal(resumed.status, 'queued', JSON.stringify(resumed));
+  installed.ctx.runId = resumed.id!;
+  const sessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
+
+  await runner.executeStep(installed.step, installed.ctx);
+  assert.equal(installed.bodies(), 1, 'the ordinary write crossed exactly once');
+  assert.equal(approvals.listPending({ sessionId, status: 'pending' }).length, 0, 'nothing parked on a human card');
+  assert.deepEqual(
+    approvals.listPending({ sessionId, status: 'any' }).map((row) => row.resolver),
+    ['system:workflow-manual_run_authority'],
+  );
 });
 
 test('BARE CALL CONSENT — exact scheduled-send authority still crosses once and settled replay adds zero bodies', async () => {

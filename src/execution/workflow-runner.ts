@@ -3449,10 +3449,15 @@ function goalFollowUpRootRunId(workflowSlug: string, runId: string): string | nu
   for (let hop = 0; hop < 4 && current; hop += 1) {
     if (seen.has(current.id) || recordedWorkflowSlug(current) !== workflowSlug) return null;
     seen.add(current.id);
+    // A goal follow-up, or a run resumed or rerun from a stopped one, is the
+    // same work continued: it carries the authority of the run it continues.
     const lineage = normalizeWorkflowGoalFollowUpLineage(current.goalFollowUp);
-    if (!lineage) return hop === 0 ? null : current.id;
-    if (current.requeuedFromRunId !== lineage.fromRunId || !/^[a-zA-Z0-9_.:-]+$/.test(lineage.fromRunId)) return null;
-    current = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${lineage.fromRunId}.json`));
+    const recovery = (current as QueuedRunRecord & { recoveryIntent?: { sourceRunId?: unknown } }).recoveryIntent;
+    const fromRunId = lineage?.fromRunId
+      ?? (typeof recovery?.sourceRunId === 'string' ? recovery.sourceRunId : undefined);
+    if (!fromRunId) return hop === 0 ? null : current.id;
+    if (current.requeuedFromRunId !== fromRunId || !/^[a-zA-Z0-9_.:-]+$/.test(fromRunId)) return null;
+    current = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${fromRunId}.json`));
   }
   return null;
 }
@@ -3618,9 +3623,9 @@ async function resolveWorkflowBareCallV3Consent(
   const scheduledDefinition = ctx.workflow.enabled === true
     && typeof ctx.workflow.trigger?.schedule === 'string'
     && ctx.workflow.trigger.schedule.trim().length > 0;
-  // A goal follow-up is the same occurrence's next attempt, so its non-send
-  // writes carry the authority of the run that started the lineage. Sends
-  // are never re-run by a follow-up and keep their own floor above.
+  // A goal follow-up, or a run resumed or rerun after a stop, is the same
+  // occurrence continued, so its non-send writes carry the authority of the
+  // run that started the lineage. Sends keep their own floor above.
   const followUpRootRunId = prepared.binding.effect !== 'host_only'
     ? goalFollowUpRootRunId(ctx.workflowSlug, ctx.runId)
     : null;
