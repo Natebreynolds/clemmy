@@ -2015,36 +2015,6 @@ test('ask_user_question preserves exact source provenance and a single typed cla
   assert.equal(events[0].data.sourceUserSeq, 41);
 });
 
-test('an observed connection gap never replaces Clem\'s own structured question', async () => {
-  // Live 2026-10-16: a speculative contacts search found an app that was not
-  // connected, and the host replaced Clem's three-option question with its
-  // "connect the app" template. Her own ask is what the owner sees.
-  resetEventLog();
-  const sess = createSession({ kind: 'chat' });
-  const parent = appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received',
-    data: { text: 'Summarize the fixture runs to a note, then send it to the fixture reviewer.' } });
-  const query = 'find the fixture reviewer contact';
-  const output = JSON.stringify({ query, brokerCoverage: 'authorized_external_v1', results: [], unavailable: [{
-    source: 'authorized_composio', code: 'no_connections', dependencySubject: {
-      version: 1, kind: 'exact_capability_connection', source: 'authorized_composio', query,
-      toolkit: 'fixturecontacts', capability: 'FIXTURECONTACTS_SEARCH', capabilityRef: 'cap:resolved:fixturecontacts_search',
-    },
-  }] });
-  writeToolOutput({ sessionId: sess.id, callId: 'search-contacts', tool: 'tool_search', output });
-  appendEvent({ sessionId: sess.id, turn: 1, role: 'tool', type: 'tool_returned',
-    data: { sourceUserSeq: parent.seq, tool: 'tool_search', callId: 'search-contacts', accounting: 'top_level', topologyRole: 'control', result: output } });
-  const { terminal } = await invokeAskWithArbitration(
-    buildAskUserQuestionTool(),
-    { question: 'Who is the fixture reviewer?', options: ['Use my manager', 'I will give you the address'], purpose: 'clarification' },
-    { sessionId: sess.id, turn: 1, sourceUserSeq: parent.seq },
-  );
-  assert.equal(terminal.finalOutput, '[clementine:awaiting-user-input:final]\nWho is the fixture reviewer?');
-  const asked = listEvents(sess.id, { types: ['awaiting_user_input'] }).at(-1);
-  assert.equal(asked?.data.question, 'Who is the fixture reviewer?');
-  assert.deepEqual(asked?.data.options, ['Use my manager', 'I will give you the address']);
-  assert.equal(asked?.data.source, undefined, 'the host did not speak for her');
-});
-
 test('a unique tool_search account-selection write asks instead of continuing to plan', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

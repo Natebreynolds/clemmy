@@ -1110,11 +1110,6 @@ export function userChoiceToolUseBehavior(
     seenCandidates.add(key);
     candidates.push(candidate);
   }
-  // Clem asked in her own words this batch. Her question is what the owner
-  // sees; an observed connection gap never replaces it (live 2026-10-16 a
-  // speculative contacts search turned her three-option question into the
-  // host's "connect Contacts+" template).
-  const clemAsked = candidates.length > 0;
   if (candidates.length === 0 && haltContext.actionExpectedWork !== false) {
     // Which connected account is a fact only the user has, but an incidental
     // provider row is not proof that this task needs that fact. Keep the fast
@@ -1188,7 +1183,7 @@ export function userChoiceToolUseBehavior(
         finalOutput: rendered.question,
       };
     }
-    const connectionProjection = sourceUserSeq && !clemAsked
+    const connectionProjection = sourceUserSeq
       ? observedConnectionDependencyPresentationForSource({ sessionId, sourceUserSeq })
       : null;
     const publicAsk = connectionProjection

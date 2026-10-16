@@ -1056,14 +1056,12 @@ export function terminalQuestionEventForAcceptedSource(input: {
 export const _terminalQuestionTextForTest = (result: RunConversationResult, sourceUserSeq: number): string =>
   terminalQuestionText(result, sourceUserSeq);
 
-/** Whether the turn's question keeps its own words. Only a plain ASK pause
- * (or the host's own connection question) parks an observed connection gap
- * and resumes after it. Clem's structured ask (her words and options through
- * ask_user_question) and a question about something else, such as a model
- * connection that kept dropping, are never replaced by it (live 2026-10-16 a
- * speculative contacts search turned her three-option question into the
- * host's "connect Contacts+", and a dropped-model question into "connect
- * Specific"). */
+/** Whether the turn's question keeps its own words. A plain ASK pause and
+ * the host's own connection question park an observed connection gap and
+ * resume after it; a question about something else, such as a model
+ * connection that kept dropping, an approval or a verdict, is never replaced
+ * by it (live 2026-10-16 a dropped-model question became "connect Specific"
+ * from an unrelated search). */
 function clemsOwnAskForTurn(input: { sessionId: string; sourceUserSeq: number; turn: number }): boolean {
   const event = terminalQuestionEventForAcceptedSource(input);
   if (!event || !publicReplyText(event.data.question, '')) return false;
