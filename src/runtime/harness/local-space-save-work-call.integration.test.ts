@@ -1500,6 +1500,136 @@ test('search -> plan -> work_call reaches workflow_create once with provider-nat
   `).get(session.id, source.seq) as { n: number }).n, 2, 'terminal replay mints no duplicate receipt');
 });
 
+test('with a plan active, steps whose every call is refused before it runs stop the turn at the bound, saying why', async () => {
+  eventlog.resetEventLog();
+  capabilityCatalogs.installHostCapabilityCatalogFactory(
+    capabilityCatalogs.createHostCapabilityCatalogFactory(),
+  );
+  capabilityManifestStores.installCapabilityManifestStore(
+    capabilityManifestStores.createCapabilityManifestStore(),
+  );
+  const { HOST_NO_DISPATCH_STREAK_LIMIT } = await import('./dispatch-streak.js');
+
+  const session = eventlog.createSession({ id: 'workflow-create-refusal-streak', kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create one disabled manual Outlook inbox read canary.' },
+  });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  const search = buildScopedLocalToolSearch(
+    new Set(['workflow_create']),
+    'work_call',
+    undefined,
+    undefined,
+    (candidates) => semantic.disclosePrimaryModelPlanningCapabilities({
+      authority: primed.planning.authority,
+      candidates,
+    }),
+  );
+  const searchBody = JSON.parse(String(await search.invoke(
+    new RunContext({ sessionId: session.id }),
+    JSON.stringify({ query: 'workflow_create', role_key: null, limit: 8, account_selection: null }),
+  ))) as { results: Array<{ name: string; capabilityRef?: string }> };
+  const capabilityRef = searchBody.results.find((row) => row.name === 'workflow_create')?.capabilityRef;
+  assert.equal(capabilityRef, 'cap:local:workflow_create:reversible');
+
+  const planTask = brackets.wrapToolForHarness(
+    planTools.buildPlanTaskTool({ planning: primed.planning }) as never,
+  );
+  const workCall = brackets.wrapToolForHarness(workCallTools.buildWorkCall({
+    requireHostPlan: true,
+    reachableBuiltinNames: new Set(['workflow_create']),
+    firstClassNames: new Set<string>(),
+    catalogIdentifiers: ['workflow_create'],
+    settlementLane: 'byo',
+    hostPlanningReady: () => true,
+  }) as never);
+  const planArgs = {
+    preamble: 'I’ll create the disabled manual read canary now.',
+    draft: {
+      criteria: ['One disabled manual workflow contains exactly one structured inbox read step.'],
+      cardinality: null,
+      destination: { posture: 'create_new', family: 'workflow', handleRequired: true },
+      topology: {
+        version: 1,
+        operations: [{
+          id: 'create_workflow', effect: 'local_write', coverage: null,
+          dependsOn: [], dataFrom: [], cardinality: { kind: 'once' },
+        }],
+        universes: [],
+      },
+      bindings: [{
+        operationId: 'create_workflow', role: 'destination', capabilityRef, evidence: ['local_commit_receipt'],
+      }],
+      deliverables: [{ id: 'workflow_deliverable', kind: 'workflow' }],
+      evidenceRequirements: ['local_commit_receipt'],
+    },
+  };
+  // Every attempt is a different call (its own name) whose steps are not a
+  // list, so no frame repeats and every one is refused before it runs.
+  const refusedAttempt = (index: number) => [toolCall(`create-broken-${index}`, 'work_call', {
+    requirement_id: 'create_workflow',
+    universe_item_id: null,
+    universe_selector: null,
+    seal_amendment: null,
+    name: 'workflow_create',
+    args_json: JSON.stringify({ name: `Broken Canary ${index}`, description: 'Never valid.', steps: 'not a list' }),
+  })];
+  const attempts = HOST_NO_DISPATCH_STREAK_LIMIT + 3;
+  const model = stubModel([
+    [toolCall('plan-broken-canary', 'plan_task', planArgs)],
+    ...Array.from({ length: attempts }, (_, index) => refusedAttempt(index)),
+    [textMessage('Created it.')],
+  ]);
+  const agent = { model, tools: [planTask, workCall] };
+  const tools = [planTask, workCall];
+  const budget = attempts + 4;
+  const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({
+    sessionId: session.id,
+    universeTools: tools,
+    activeToolNames: tools.map((entry) => entry.name),
+    policyHash: 'workflow-create-refusal-streak-v1',
+    budget: { maxUncachedTokens: 20_000, maxModelCalls: budget, maxToolCalls: budget, maxElapsedMs: 120_000 },
+  });
+  assert.equal(sealed.ok, true, JSON.stringify(sealed));
+  if (!sealed.ok) return;
+  capabilityEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+  capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+
+  const outcome = await brackets.withHarnessRunContext({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    turn: source.turn,
+    counter: new brackets.ToolCallsCounter(budget),
+    behaviorScopeId: `${session.id}::turn:1`,
+  }, () => hostRunRunner(
+    throwingRunner() as never,
+    agent as never,
+    [{ type: 'message', role: 'user', content: 'Create one disabled manual Outlook inbox read canary.' }] as never,
+    {
+      maxTurns: budget,
+      hostTurnEngine: 'host_v1',
+      context: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+    } as never,
+  ));
+
+  const steps = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+    .filter((event) => event.data.kind === 'no_dispatch_step');
+  assert.equal(steps.length, HOST_NO_DISPATCH_STREAK_LIMIT, JSON.stringify(outcome.terminal));
+  assert.ok(steps.every((event) => typeof event.data.refusalDetail === 'string' && event.data.refusalDetail.length > 0),
+    'each refused step records why it was refused');
+  assert.match(JSON.stringify(outcome.terminal), /control_no_progress_exhausted/);
+  assert.match(JSON.stringify(outcome), new RegExp(`refused_before_dispatch:${HOST_NO_DISPATCH_STREAK_LIMIT}`));
+  assert.notEqual(outcome.finalOutput, 'Created it.', 'the scripted success after the bound is never reached');
+  assert.equal(workflowStore.readWorkflow('broken-canary-0'), null);
+});
+
 test('accepted workflow_update commits reopened bytes once and frozen-work replay adds zero', async () => {
   eventlog.resetEventLog();
   capabilityCatalogs.installHostCapabilityCatalogFactory(
