@@ -5,6 +5,7 @@ import { BASE_DIR } from '../../config.js';
 import { withDaemonRuntimePhase } from '../../daemon/phase.js';
 import { findSafeCliCommand } from '../../runtime/cli-discovery.js';
 import { mergedSpawnEnv } from '../../runtime/spawn-env.js';
+import { syncConnectedCliBin } from './connected-cli-bin.js';
 import { runCliProbeProcess } from '../../runtime/cli-probe-process.js';
 import { getSavedClis } from '../../runtime/saved-clis.js';
 import {
@@ -52,6 +53,8 @@ export interface CliHealth {
   username?: string;
   /** Public connection origin from the same successful probe/account; not retained through failed refreshes. */
   connectionOrigin?: string;
+  /** The executable this check ran, so the shell runs the same one. */
+  binaryPath?: string;
   checkedAt: string;
   /**
    * Present when `authStatus` is a KEPT verdict: the latest probe failed
@@ -263,12 +266,14 @@ async function delegatedHealth(item: RosterItem): Promise<CliHealth | null> {
   const checkedAt = new Date().toISOString();
   try {
     if (item.id === 'github') {
-      const { getGitHubCliStatus } = await import('../github-cli.js');
+      const { findGitHubCli, getGitHubCliStatus } = await import('../github-cli.js');
       const status = await getGitHubCliStatus();
+      const binaryPath = status.installed ? findGitHubCli() : null;
       return {
         id: item.id,
         command: item.command,
         installed: status.installed,
+        ...(binaryPath ? { binaryPath } : {}),
         authStatus: !status.installed ? 'unknown'
           : status.authStatus === 'ok' ? 'ok'
           : status.authStatus === 'invalid' ? 'signed_out'
@@ -326,7 +331,7 @@ async function probeHealth(item: RosterItem): Promise<CliHealth> {
     return { id: item.id, command: item.command, installed: false, authStatus: 'unknown', checkedAt };
   }
   if (!item.probe) {
-    return { id: item.id, command: item.command, installed: true, authStatus: 'unknown', checkedAt };
+    return { id: item.id, command: item.command, installed: true, authStatus: 'unknown', binaryPath: safe.path, checkedAt };
   }
   const result = await execImpl(safe.path, item.probe.args, item.probe.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS);
   const verdict = classifyProbeOutput(item.probe, result);
@@ -334,6 +339,7 @@ async function probeHealth(item: RosterItem): Promise<CliHealth> {
     id: item.id,
     command: item.command,
     installed: true,
+    binaryPath: safe.path,
     ...verdict,
     checkedAt,
     // 'error' from the classifier means "no verdict" — a timeout, a non-zero
@@ -371,6 +377,7 @@ function settleTransientProbe(next: CliHealth, previous: CliHealth | undefined):
     installed: next.installed,
     authStatus: kept,
     ...(kept === 'ok' && previous?.username ? { username: previous.username } : {}),
+    ...((next.binaryPath ?? previous?.binaryPath) ? { binaryPath: next.binaryPath ?? previous?.binaryPath } : {}),
     checkedAt: next.checkedAt,
     ...(staleSince ? { staleSince } : {}),
     lastProbeError: next.lastProbeError,
@@ -413,6 +420,11 @@ function commitHealth(probed: CliHealth): CliHealth {
   const next = settleTransientProbe(probed, previous);
   entries[next.id] = next;
   writeHealthFile(entries);
+  try {
+    syncConnectedCliBin(entries);
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'connected CLI links not updated');
+  }
   const recoveredKnownFailure = previous?.authStatus === 'signed_out'
     || previous?.issue === 'configuration_required' || previous?.issue === 'credential_store_unavailable';
   if (recoveredKnownFailure && next.authStatus === 'ok' && !next.lastProbeError && !next.staleSince) {

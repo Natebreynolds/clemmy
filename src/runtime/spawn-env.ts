@@ -233,6 +233,29 @@ export function userDeclaredCliEnv(): Record<string, string> {
  * an augmented PATH, so binaries resolve on a packaged `.app` launch.
  * `extra` overrides win (matching the prior MCP-spawn behavior).
  */
+/**
+ * Links that pin each connected CLI's command to the executable its health
+ * check verified (kept by the CLI auth-health commit). It leads a child's PATH,
+ * so a same-named package elsewhere on PATH cannot shadow the CLI the owner
+ * connected. Absent until a check verifies a binary.
+ */
+export function connectedCliBinDir(): string | undefined {
+  try {
+    const base = process.env.CLEMENTINE_HOME?.trim() || path.join(os.homedir(), '.clementine-next');
+    return path.join(base, 'state', 'connected-cli-bin');
+  } catch {
+    return undefined;
+  }
+}
+
+function withConnectedCliBin(pathValue: string): string {
+  if (process.platform === 'win32') return pathValue;
+  const dir = connectedCliBinDir();
+  if (!dir || !existingDirectory(dir)) return pathValue;
+  const rest = pathValue.split(path.delimiter).filter((part) => part && part !== dir);
+  return [dir, ...rest].join(path.delimiter);
+}
+
 export function mergedSpawnEnv(extra: Record<string, string> = {}): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -249,7 +272,7 @@ export function mergedSpawnEnv(extra: Record<string, string> = {}): Record<strin
       if (key.toLowerCase() === 'path' && key !== pathKey) delete env[key];
     }
   }
-  env[pathKey] = augmentPath(currentPath);
+  env[pathKey] = withConnectedCliBin(augmentPath(currentPath));
   // Consider per-call overrides before choosing a default, otherwise a lowercase
   // `extra.npm_config_cache` would coexist with (and potentially lose to) our
   // uppercase default.
